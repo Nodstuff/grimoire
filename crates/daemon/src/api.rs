@@ -21,8 +21,19 @@ async fn docs(State(st): State<ApiState>) -> Json<Value> {
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let canvases: std::collections::HashSet<String> =
+        s.canvas_doc_ids().unwrap_or_default().into_iter().collect();
     match s.list_docs() {
-        Ok(d) => Json(json!(d)),
+        Ok(d) => Json(json!(
+            d.into_iter()
+                .map(|doc| {
+                    let is_canvas = canvases.contains(&doc.id.to_string());
+                    let mut v = json!(doc);
+                    v["is_canvas"] = json!(is_canvas);
+                    v
+                })
+                .collect::<Vec<_>>()
+        )),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
