@@ -75,8 +75,8 @@ export default function App() {
             <div className="home-hints">
               <span><kbd>⌘K</kbd> commands</span>
               <span><kbd>⌘S</kbd> search</span>
-              <span><kbd>⌘B</kbd> tree</span>
-              <span><kbd>⌘E</kbd> new doc</span>
+              <span><kbd>⌘T</kbd> tree</span>
+              <span><kbd>⌘N</kbd> new doc</span>
             </div>
           </div>
         )}
@@ -168,9 +168,9 @@ function CommandPalette({
   type Item = { label: string; hint?: string; run: () => void }
   const commands: Item[] = [
     { label: `Review queue`, hint: queueCount ? `${queueCount} open` : 'empty', run: () => onAction('review') },
-    { label: 'New doc…', hint: '⌘E', run: () => onAction('newdoc') },
+    { label: 'New doc…', hint: '⌘N', run: () => onAction('newdoc') },
     { label: 'Gardener runs', run: () => onAction('runs') },
-    { label: 'Toggle file tree', hint: '⌘B', run: () => onAction('tree') },
+    { label: 'Toggle file tree', hint: '⌘T', run: () => onAction('tree') },
     { label: 'Home', run: () => onAction('home') },
   ]
 
