@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DocEditor from './editor/DocEditor'
+import GraphView from './GraphView'
 import {
   api,
   Block,
@@ -12,7 +13,12 @@ import {
   GardenerRun,
 } from './types'
 
-type View = { kind: 'doc'; id: string } | { kind: 'review' } | { kind: 'runs' } | { kind: 'home' }
+type View =
+  | { kind: 'doc'; id: string }
+  | { kind: 'review' }
+  | { kind: 'runs' }
+  | { kind: 'graph' }
+  | { kind: 'home' }
 type Palette = null | 'commands' | 'search' | 'newdoc'
 
 export default function App() {
@@ -95,6 +101,7 @@ export default function App() {
           />
         )}
         {view.kind === 'runs' && <Runs />}
+        {view.kind === 'graph' && <GraphView onOpenDoc={openDoc} />}
       </main>
 
       {queueCount > 0 && view.kind !== 'review' && (
@@ -111,6 +118,7 @@ export default function App() {
           onAction={(a) => {
             if (a === 'review') setView({ kind: 'review' })
             if (a === 'runs') setView({ kind: 'runs' })
+            if (a === 'graph') setView({ kind: 'graph' })
             if (a === 'tree') setTreeOpen((t) => !t)
             if (a === 'home') setView({ kind: 'home' })
             if (a === 'newdoc') {
@@ -164,7 +172,7 @@ function CommandPalette({
   docs: Doc[]
   queueCount: number
   onOpenDoc: (id: string) => void
-  onAction: (a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc') => void
+  onAction: (a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'graph') => void
   onClose: () => void
 }) {
   const [q, setQ] = useState('')
@@ -177,6 +185,7 @@ function CommandPalette({
     { label: `Review queue`, hint: queueCount ? `${queueCount} open` : 'empty', run: () => onAction('review') },
     { label: 'New doc…', hint: '⌘N', run: () => onAction('newdoc') },
     { label: 'Gardener runs', run: () => onAction('runs') },
+    { label: 'Graph view', run: () => onAction('graph') },
     { label: 'Toggle file tree', hint: '⌘T', run: () => onAction('tree') },
     { label: 'Home', run: () => onAction('home') },
   ]
