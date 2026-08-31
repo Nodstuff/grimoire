@@ -11,6 +11,7 @@ export interface Gardener {
   principal: string
   scope_doc: string | null
   task_prompt: string
+  bindings: (string | { path: string })[]
   schedule: string
   confidence_policy: 'review' | 'gate'
   enabled: boolean
@@ -104,11 +105,16 @@ function GardenerCard({
   const [schedule, setSchedule] = useState(g.schedule)
   const [policy, setPolicy] = useState(g.confidence_policy)
   const [enabled, setEnabled] = useState(g.enabled)
+  const initialBindings = (g.bindings ?? [])
+    .map((b) => (typeof b === 'string' ? b : b.path))
+    .join(', ')
+  const [bindings, setBindings] = useState(initialBindings)
   const dirty =
     prompt !== g.task_prompt ||
     schedule !== g.schedule ||
     policy !== g.confidence_policy ||
-    enabled !== g.enabled
+    enabled !== g.enabled ||
+    bindings !== initialBindings
 
   const save = async () => {
     await api('/admin/gardeners/update', {
@@ -121,6 +127,10 @@ function GardenerCard({
         confidence_policy: policy,
         scope_doc: g.scope_doc,
         enabled,
+        bindings: bindings
+          .split(',')
+          .map((b) => b.trim())
+          .filter(Boolean),
       }),
     }).catch((e) => alert(String(e)))
     onSaved()
@@ -144,6 +154,17 @@ function GardenerCard({
         onChange={(e) => setPrompt(e.target.value)}
         rows={2}
       />
+      {g.kind === 'auditor' && (
+        <label className="bindings-label">
+          authoritative sources (repo paths, comma-separated) — corrections allowed only when bound
+          <input
+            className="bindings-input"
+            placeholder="/Users/you/code/repo, /another/repo"
+            value={bindings}
+            onChange={(e) => setBindings(e.target.value)}
+          />
+        </label>
+      )}
       <div className="gardener-row">
         <label>
           schedule

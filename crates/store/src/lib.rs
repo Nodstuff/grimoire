@@ -167,6 +167,7 @@ pub trait BlockStore {
         confidence_policy: ConfidencePolicy,
         scope_doc: Option<Uuid>,
         enabled: bool,
+        bindings: serde_json::Value,
     ) -> Result<()>;
 
     fn start_run(&mut self, gardener: Uuid) -> Result<Uuid>;
