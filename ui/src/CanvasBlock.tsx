@@ -11,10 +11,12 @@ export default function CanvasBlock({
   block,
   epoch,
   onSaved,
+  full = false,
 }: {
   block: Block
   epoch: number
   onSaved: () => void
+  full?: boolean
 }) {
   const epochRef = useRef(epoch)
   epochRef.current = epoch
@@ -72,7 +74,7 @@ export default function CanvasBlock({
   )
 
   return (
-    <div className="canvas-block">
+    <div className={full ? 'canvas-full' : 'canvas-block'}>
       <Tldraw onMount={onMount} />
     </div>
   )
