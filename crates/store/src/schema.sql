@@ -116,7 +116,7 @@ END;
 CREATE TABLE IF NOT EXISTS gardeners (
     id            TEXT PRIMARY KEY,
     name          TEXT NOT NULL UNIQUE,
-    kind          TEXT NOT NULL DEFAULT 'tagging' CHECK (kind IN ('tagging', 'reviewer')),
+    kind          TEXT NOT NULL DEFAULT 'tagging' CHECK (kind IN ('tagging', 'reviewer', 'auditor')),
     principal     TEXT NOT NULL REFERENCES principals (id),
     -- null scope = whole corpus; else this doc's subtree
     scope_doc     TEXT REFERENCES docs (id),
@@ -154,3 +154,11 @@ CREATE TABLE IF NOT EXISTS doc_tags (
 
 CREATE INDEX IF NOT EXISTS doc_tags_by_tag ON doc_tags (tag);
 CREATE INDEX IF NOT EXISTS doc_tags_by_doc ON doc_tags (doc_id);
+
+-- Veracity sweep bookkeeping: which auditor covered which doc, when.
+CREATE TABLE IF NOT EXISTS audits (
+    doc_id     TEXT NOT NULL REFERENCES docs (id),
+    principal  TEXT NOT NULL REFERENCES principals (id),
+    audited_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (doc_id, principal)
+);
