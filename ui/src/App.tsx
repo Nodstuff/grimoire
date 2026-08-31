@@ -36,10 +36,10 @@ export default function App() {
       if (mod && e.key === 'k') {
         e.preventDefault()
         setPalette((p) => (p === 'commands' ? null : 'commands'))
-      } else if (mod && (e.key === 'b' || e.key === 't')) {
+      } else if (mod && e.key === 't') {
         e.preventDefault()
         setTreeOpen((t) => !t)
-      } else if (mod && (e.key === 'e' || e.key === 'n')) {
+      } else if (mod && e.key === 'n') {
         e.preventDefault()
         setPalette((p) => (p === 'newdoc' ? null : 'newdoc'))
       } else if (mod && e.key === 's' && !e.shiftKey) {
