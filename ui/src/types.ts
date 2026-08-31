@@ -6,6 +6,7 @@ export interface Doc {
   current_epoch: number
   created_by: string
   status: 'draft' | 'in-review' | 'decided' | 'superseded' | null
+  sort_key: string | null
   is_canvas?: boolean
 }
 

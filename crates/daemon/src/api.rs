@@ -456,6 +456,38 @@ async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -
     }
 }
 
+#[derive(Deserialize)]
+struct MoveDocReq {
+    parent_id: Option<Uuid>,
+    sort_key: Option<String>,
+}
+
+async fn move_doc(
+    State(st): State<ApiState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<MoveDocReq>,
+) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.move_doc(id, req.parent_id, req.sort_key.as_deref()) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn delete_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.delete_doc(id) {
+        Ok(n) => Json(json!({"ok": true, "deleted": n})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/docs", get(docs).post(create_doc))
@@ -468,6 +500,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/principals", get(principals))
         .route("/api/doc/{id}/history", get(history))
         .route("/api/doc/{id}/status", post(set_status))
+        .route("/api/doc/{id}/move", post(move_doc))
+        .route("/api/doc/{id}/delete", post(delete_doc))
         .route("/api/comment", post(add_comment))
         .route("/api/resolve", post(resolve))
         .route("/api/resolve_bulk", post(resolve_bulk))

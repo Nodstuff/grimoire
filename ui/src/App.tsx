@@ -84,6 +84,7 @@ export default function App() {
           selected={view.kind === 'doc' ? view.id : null}
           onSelect={openDoc}
           onClose={() => setTreeOpen(false)}
+          onChanged={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
         />
       )}
       <main className="stage" onClick={() => palette && setPalette(null)}>
@@ -384,16 +385,20 @@ function NewDocPalette({
 
 /* ---------- tree ---------- */
 
+type Drop = { id: string; mode: 'into' | 'before' | 'after' } | null
+
 function DocTreeNav({
   docs,
   selected,
   onSelect,
   onClose,
+  onChanged,
 }: {
   docs: Doc[]
   selected: string | null
   onSelect: (id: string) => void
   onClose: () => void
+  onChanged: () => void
 }) {
   const childrenOf = useMemo(() => {
     const m = new Map<string | null, Doc[]>()
@@ -406,32 +411,120 @@ function DocTreeNav({
   }, [docs])
 
   const [openDirs, setOpenDirs] = useState<Set<string>>(new Set())
+  const [dragging, setDragging] = useState<string | null>(null)
+  const [drop, setDrop] = useState<Drop>(null)
+
+  const doMove = async (dragged: string, target: Doc, mode: 'into' | 'before' | 'after') => {
+    if (dragged === target.id) return
+    let parent: string | null
+    let sortKey: string | null
+    if (mode === 'into') {
+      parent = target.id
+      const kids = childrenOf.get(target.id) ?? []
+      const last = kids[kids.length - 1]
+      sortKey = keyBetween(last?.sort_key ?? null, null)
+      setOpenDirs((s) => new Set(s).add(target.id))
+    } else {
+      parent = target.parent_id
+      const siblings = (childrenOf.get(parent) ?? []).filter((d) => d.id !== dragged)
+      const i = siblings.findIndex((d) => d.id === target.id)
+      const before = mode === 'before' ? siblings[i - 1] : siblings[i]
+      const after = mode === 'before' ? siblings[i] : siblings[i + 1]
+      sortKey = keyBetween(before?.sort_key ?? null, after?.sort_key ?? null)
+    }
+    await api(`/api/doc/${dragged}/move`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ parent_id: parent, sort_key: sortKey }),
+    }).catch((e) => alert(String(e)))
+    onChanged()
+  }
+
+  const doDelete = async (d: Doc) => {
+    if (!confirm(`Delete "${d.title}"${childrenOf.get(d.id)?.length ? ' and everything inside it' : ''}?`))
+      return
+    await api(`/api/doc/${d.id}/delete`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      .catch((e) => alert(String(e)))
+    onChanged()
+  }
 
   const renderLevel = (parent: string | null, depth: number): React.ReactNode =>
     (childrenOf.get(parent) ?? []).map((d) => {
       const isDir = !!childrenOf.get(d.id)?.length
       const isOpen = openDirs.has(d.id)
+      const dropHere = drop?.id === d.id ? drop.mode : null
       return (
         <div key={d.id}>
           <div
-            className={`tree-item ${selected === d.id ? 'sel' : ''}`}
-            style={{ paddingLeft: 10 + depth * 14 }}
+            className={[
+              'tree-item',
+              selected === d.id ? 'sel' : '',
+              dragging === d.id ? 'dragging' : '',
+              dropHere === 'into' ? 'drop-into' : '',
+              dropHere === 'before' ? 'drop-before' : '',
+              dropHere === 'after' ? 'drop-after' : '',
+            ].join(' ')}
+            style={{ paddingLeft: 8 }}
+            draggable
+            onDragStart={(e) => {
+              setDragging(d.id)
+              e.dataTransfer.effectAllowed = 'move'
+            }}
+            onDragEnd={() => {
+              setDragging(null)
+              setDrop(null)
+            }}
+            onDragOver={(e) => {
+              if (!dragging || dragging === d.id) return
+              e.preventDefault()
+              const r = e.currentTarget.getBoundingClientRect()
+              const y = (e.clientY - r.top) / r.height
+              setDrop({ id: d.id, mode: y < 0.3 ? 'before' : y > 0.7 ? 'after' : 'into' })
+            }}
+            onDragLeave={() => setDrop((cur) => (cur?.id === d.id ? null : cur))}
+            onDrop={(e) => {
+              e.preventDefault()
+              if (dragging && drop?.id === d.id) doMove(dragging, d, drop.mode)
+              setDrop(null)
+              setDragging(null)
+            }}
             onClick={() => {
               if (isDir)
                 setOpenDirs((s) => {
                   const n = new Set(s)
-                  n.has(d.id) ? n.delete(d.id) : n.add(d.id)
+                  if (n.has(d.id)) n.delete(d.id)
+                  else n.add(d.id)
                   return n
                 })
-              else onSelect(d.id)
+              onSelect(d.id)
             }}
           >
             <span className={`tree-icon ${d.is_canvas ? 'canvas' : ''}`}>
-              {isDir ? (isOpen ? '▾' : '▸') : d.is_canvas ? '▨' : ''}
+              {isDir ? (
+                <svg width="10" height="10" viewBox="0 0 10 10" className={isOpen ? 'chev open' : 'chev'}>
+                  <path d="M3 1.5 L7 5 L3 8.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+                </svg>
+              ) : d.is_canvas ? (
+                '▨'
+              ) : (
+                ''
+              )}
             </span>
-            {d.title}
+            <span className="tree-title">{d.title}</span>
+            <button
+              className="tree-delete"
+              title="delete"
+              onClick={(e) => {
+                e.stopPropagation()
+                doDelete(d)
+              }}
+            >
+              ×
+            </button>
           </div>
-          {isDir && isOpen && renderLevel(d.id, depth + 1)}
+          {isDir && isOpen && (
+            <div className="tree-children">{renderLevel(d.id, depth + 1)}</div>
+          )}
         </div>
       )
     })
@@ -442,9 +535,51 @@ function DocTreeNav({
         <span>files</span>
         <button onClick={onClose}>⌘T</button>
       </div>
-      {renderLevel(null, 0)}
+      <div
+        className="tree-root"
+        onDragOver={(e) => {
+          // dropping on empty space = move to root
+          if (dragging && e.target === e.currentTarget) e.preventDefault()
+        }}
+        onDrop={(e) => {
+          if (dragging && e.target === e.currentTarget) {
+            api(`/api/doc/${dragging}/move`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ parent_id: null, sort_key: null }),
+            }).then(onChanged)
+          }
+        }}
+      >
+        {renderLevel(null, 0)}
+      </div>
     </aside>
   )
+}
+
+const DIGITS = '0123456789abcdefghijklmnopqrstuvwxyz'
+function keyBetween(a: string | null, b: string | null): string {
+  const av = a ?? ''
+  let out = ''
+  let i = 0
+  for (;;) {
+    const da = i < av.length ? DIGITS.indexOf(av[i]) : 0
+    const db = b == null ? 36 : i < b.length ? DIGITS.indexOf(b[i]) : 0
+    if (da === db) {
+      out += DIGITS[da]
+      i++
+      continue
+    }
+    if (db - da > 1) return out + DIGITS[(da + db) >> 1]
+    out += DIGITS[da]
+    i++
+    for (;;) {
+      const d = i < av.length ? DIGITS.indexOf(av[i]) : 0
+      if (36 - d > 1) return out + DIGITS[(d + 36) >> 1]
+      out += DIGITS[d]
+      i++
+    }
+  }
 }
 
 /* ---------- doc view ---------- */

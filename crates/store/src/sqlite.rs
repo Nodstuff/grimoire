@@ -66,6 +66,18 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
         if has_status == 0 {
             conn.execute("ALTER TABLE docs ADD COLUMN status TEXT", [])?;
         }
+        let has_sort: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('docs') WHERE name = 'sort_key'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_sort == 0 {
+            conn.execute("ALTER TABLE docs ADD COLUMN sort_key TEXT", [])?;
+            conn.execute(
+                "ALTER TABLE docs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
     }
     let has_gardeners: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'gardeners'",
@@ -212,6 +224,7 @@ type RawDoc = (
     i64,
     String,
     Option<String>,
+    Option<String>,
 );
 
 fn row_to_doc(row: &rusqlite::Row) -> rusqlite::Result<RawDoc> {
@@ -223,11 +236,12 @@ fn row_to_doc(row: &rusqlite::Row) -> rusqlite::Result<RawDoc> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
     ))
 }
 
 fn build_doc(raw: RawDoc) -> Result<Doc> {
-    let (id, parent, title, policy, epoch, created_by, status) = raw;
+    let (id, parent, title, policy, epoch, created_by, status, sort_key) = raw;
     Ok(Doc {
         id: uuid_col(id, "docs.id")?,
         parent_id: parent.map(|p| uuid_col(p, "docs.parent_id")).transpose()?,
@@ -246,6 +260,7 @@ fn build_doc(raw: RawDoc) -> Result<Doc> {
                     .ok_or_else(|| StoreError::InvalidOp(format!("bad status: {st}")))
             })
             .transpose()?,
+        sort_key,
     })
 }
 
@@ -608,8 +623,8 @@ impl BlockStore for SqliteStore {
 
     fn list_docs(&self) -> Result<Vec<Doc>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status
-             FROM docs ORDER BY title",
+            "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status, sort_key
+             FROM docs WHERE deleted = 0 ORDER BY sort_key IS NULL, sort_key, title",
         )?;
         let rows = stmt.query_map([], row_to_doc)?;
         rows.map(|r| build_doc(r?)).collect()
@@ -619,7 +634,7 @@ impl BlockStore for SqliteStore {
         let raw = self
             .conn
             .query_row(
-                "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status
+                "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status, sort_key
                  FROM docs WHERE id = ?1",
                 params![id.to_string()],
                 row_to_doc,
@@ -754,6 +769,60 @@ impl BlockStore for SqliteStore {
                 None => return Ok(crate::DEFAULT_REVIEW_POLICY),
             }
         }
+    }
+
+    fn move_doc(
+        &mut self,
+        doc_id: Uuid,
+        new_parent: Option<Uuid>,
+        sort_key: Option<&str>,
+    ) -> Result<()> {
+        let mut cursor = new_parent;
+        while let Some(p) = cursor {
+            if p == doc_id {
+                return Err(StoreError::InvalidOp(
+                    "move: doc cannot nest under itself".into(),
+                ));
+            }
+            cursor = self.get_doc(p)?.parent_id;
+        }
+        let n = self.conn.execute(
+            "UPDATE docs SET parent_id = ?1, sort_key = ?2 WHERE id = ?3 AND deleted = 0",
+            params![new_parent.map(|p| p.to_string()), sort_key, doc_id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("doc {doc_id}")));
+        }
+        Ok(())
+    }
+
+    fn delete_doc(&mut self, doc_id: Uuid) -> Result<usize> {
+        let mut to_delete = vec![doc_id];
+        let mut i = 0;
+        while i < to_delete.len() {
+            let kids: Vec<String> = {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT id FROM docs WHERE parent_id = ?1 AND deleted = 0")?;
+                let rows = stmt.query_map(params![to_delete[i].to_string()], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            for k in kids {
+                to_delete.push(uuid_col(k, "docs.id")?);
+            }
+            i += 1;
+        }
+        let mut n = 0;
+        for d in &to_delete {
+            n += self.conn.execute(
+                "UPDATE docs SET deleted = 1 WHERE id = ?1",
+                params![d.to_string()],
+            )?;
+        }
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("doc {doc_id}")));
+        }
+        Ok(n)
     }
 
     fn set_doc_status(&mut self, doc_id: Uuid, status: Option<DocStatus>) -> Result<()> {
@@ -1134,7 +1203,7 @@ impl BlockStore for SqliteStore {
 
     fn docs_by_tag(&self, tag: &str) -> Result<Vec<Doc>> {
         let mut stmt = self.conn.prepare(
-            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status
+            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status, d.sort_key
              FROM docs d JOIN doc_tags t ON t.doc_id = d.id
              WHERE t.tag = ?1 GROUP BY d.id ORDER BY d.title",
         )?;
@@ -1144,7 +1213,7 @@ impl BlockStore for SqliteStore {
 
     fn untagged_docs(&self, limit: usize) -> Result<Vec<Doc>> {
         let mut stmt = self.conn.prepare(
-            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status
+            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status, d.sort_key
              FROM docs d
              WHERE EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0)
                AND NOT EXISTS (SELECT 1 FROM doc_tags t WHERE t.doc_id = d.id)
