@@ -54,6 +54,7 @@ export function inferBlockType(content: string): string {
   if (content.startsWith('```d2')) return 'diagram_d2'
   if (content.startsWith('```') || content.startsWith('---')) return 'code'
   if (/^#{1,6} /.test(content)) return 'heading'
+  if (content.startsWith('DECISION:')) return 'decision'
   return 'paragraph'
 }
 

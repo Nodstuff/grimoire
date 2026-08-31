@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS docs (
     title         TEXT NOT NULL,
     -- null inherits parent's policy via one recursive lookup (ticket 2.10)
     review_policy TEXT CHECK (review_policy IN ('human-review', 'agent-review', 'auto')),
+    -- doc lifecycle (ticket 5.6); null = plain doc, no status
+    status        TEXT CHECK (status IN ('draft', 'in-review', 'decided', 'superseded')),
     -- per-document, never global (federation tax §6); one epoch = one committed transaction
     current_epoch INTEGER NOT NULL DEFAULT 0,
     created_by    TEXT NOT NULL REFERENCES principals (id),

@@ -4,7 +4,7 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ks_store::{BlockStore, OpInput, ReviewDecision, SqliteStore};
+use ks_store::{BlockStore, DocStatus, OpInput, ReviewDecision, SqliteStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -291,6 +291,30 @@ async fn render_d2(Json(req): Json<D2Req>) -> Json<Value> {
     }
 }
 
+#[derive(Deserialize)]
+struct StatusReq {
+    status: Option<String>,
+}
+
+async fn set_status(
+    State(st): State<ApiState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<StatusReq>,
+) -> Json<Value> {
+    let status = match req.status.as_deref() {
+        None => None,
+        Some(v) => match DocStatus::parse(v) {
+            Some(v) => Some(v),
+            None => return Json(json!({"error": format!("bad status: {v}")})),
+        },
+    };
+    let mut s = st.store.lock().unwrap();
+    match s.set_doc_status(id, status) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/docs", get(docs).post(create_doc))
@@ -300,6 +324,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/queue", get(queue))
         .route("/api/principals", get(principals))
         .route("/api/doc/{id}/history", get(history))
+        .route("/api/doc/{id}/status", post(set_status))
         .route("/api/comment", post(add_comment))
         .route("/api/resolve", post(resolve))
         .route("/api/search", get(search))

@@ -515,3 +515,11 @@ kbd {
   margin: -10px 0 16px;
   opacity: 0.8;
 }
+
+/* ---------- doc status ---------- */
+
+.chip.status-none { opacity: 0.5; }
+.chip.status-draft { color: var(--fg-dim); }
+.chip.status-in-review { color: var(--yellow); border-color: var(--yellow); }
+.chip.status-decided { color: var(--green); border-color: var(--green); }
+.chip.status-superseded { color: var(--red); border-color: var(--red); text-decoration: line-through; }

@@ -63,6 +63,37 @@ impl ReviewPolicy {
     }
 }
 
+/// Doc lifecycle (ticket 5.6): dogfooding the decision-doc format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DocStatus {
+    Draft,
+    InReview,
+    Decided,
+    Superseded,
+}
+
+impl DocStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DocStatus::Draft => "draft",
+            DocStatus::InReview => "in-review",
+            DocStatus::Decided => "decided",
+            DocStatus::Superseded => "superseded",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "draft" => Some(DocStatus::Draft),
+            "in-review" => Some(DocStatus::InReview),
+            "decided" => Some(DocStatus::Decided),
+            "superseded" => Some(DocStatus::Superseded),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Doc {
     pub id: Uuid,
@@ -71,6 +102,7 @@ pub struct Doc {
     pub review_policy: Option<ReviewPolicy>,
     pub current_epoch: i64,
     pub created_by: Uuid,
+    pub status: Option<DocStatus>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
