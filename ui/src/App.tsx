@@ -42,23 +42,34 @@ export default function App() {
     refreshQueue()
   }, [refreshQueue])
 
-  // hot reload: poll the daemon's UI build stamp; a deploy reloads the app
-  // (deferred while an editor has unsaved changes)
+  // live data: poll the store's change stamp; when it moves, every mounted
+  // view refreshes (dataVersion threads down). Cheap — one local SQLite read.
+  const [dataVersion, setDataVersion] = useState(0)
   useEffect(() => {
+    let stamp: number | null = null
     let build: number | null = null
     const t = setInterval(async () => {
       try {
-        const r = await api<{ build: number }>('/api/buildinfo')
-        if (build === null) build = r.build
-        else if (r.build !== build && !document.querySelector('.save-state.dirty, .save-state.saving')) {
+        const r = await api<{ stamp: number }>('/api/stamp')
+        if (stamp === null) stamp = r.stamp
+        else if (r.stamp !== stamp) {
+          stamp = r.stamp
+          setDataVersion((v) => v + 1)
+          api<Doc[]>('/api/docs').then(setDocs).catch(() => {})
+          refreshQueue()
+        }
+        // deploy landed → reload the bundle (deferred while an editor is dirty)
+        const b = await api<{ build: number }>('/api/buildinfo')
+        if (build === null) build = b.build
+        else if (b.build !== build && !document.querySelector('.save-state.dirty, .save-state.saving')) {
           location.reload()
         }
       } catch {
-        // daemon restarting mid-deploy — next tick catches the new build
+        // daemon restarting mid-deploy — next tick catches up
       }
-    }, 3000)
+    }, 2500)
     return () => clearInterval(t)
-  }, [])
+  }, [refreshQueue])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -117,14 +128,17 @@ export default function App() {
             </div>
           </div>
         )}
-        {view.kind === 'doc' && <DocView docId={view.id} onOpenDoc={openDoc} docs={docs} />}
+        {view.kind === 'doc' && (
+          <DocView docId={view.id} onOpenDoc={openDoc} docs={docs} dataVersion={dataVersion} />
+        )}
         {view.kind === 'review' && (
           <ReviewQueue
             onChange={setQueueCount}
             onOpenDoc={openDoc}
+            dataVersion={dataVersion}
           />
         )}
-        {view.kind === 'runs' && <Gardeners />}
+        {view.kind === 'runs' && <Gardeners dataVersion={dataVersion} />}
         {view.kind === 'graph' && <GraphView onOpenDoc={openDoc} />}
       </main>
 
@@ -618,10 +632,12 @@ function DocView({
   docId,
   onOpenDoc,
   docs,
+  dataVersion,
 }: {
   docId: string
   onOpenDoc: (id: string) => void
   docs: Doc[]
+  dataVersion: number
 }) {
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
@@ -629,6 +645,9 @@ function DocView({
   const [selBlock, setSelBlock] = useState<string | null>(null)
   const [selRect, setSelRect] = useState<{ x: number; y: number } | null>(null)
   const [commentTarget, setCommentTarget] = useState<string | null>(null)
+  // epochs this editor produced itself — external changes are anything above
+  const ownEpoch = useRef(0)
+  const [editorGen, setEditorGen] = useState(0)
 
   // anchor the comment bubble just above the selected text
   const onSelectionBlock = useCallback((blockId: string | null) => {
@@ -657,8 +676,30 @@ function DocView({
     setTree(null)
     setPanel('none')
     setCommentTarget(null)
+    ownEpoch.current = 0
     loadTree()
   }, [loadTree])
+
+  // live refresh: when the store changed and this doc moved past what our own
+  // saves produced, reload it and remount the editor with the fresh content
+  // (skipped while dirty — the pending autosave lands first, next tick catches up)
+  useEffect(() => {
+    if (dataVersion === 0 || !tree) return
+    api<DocTree>(`/api/doc/${docId}`)
+      .then((fresh) => {
+        const known = Math.max(tree.doc.current_epoch, ownEpoch.current)
+        const dirty = document.querySelector('.save-state.dirty, .save-state.saving')
+        if (fresh.doc.current_epoch > known && !dirty) {
+          setTree(fresh)
+          setEditorGen((g) => g + 1)
+        } else if (fresh.doc.status !== tree.doc.status) {
+          setTree(fresh)
+        }
+        api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => {})
+      })
+      .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataVersion])
 
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
 
@@ -746,7 +787,14 @@ function DocView({
           </button>
         </span>
       </div>
-      <DocEditor doc={editable} onSaved={() => {}} onSelectionBlock={onSelectionBlock} />
+      <DocEditor
+        key={`${docId}:${editorGen}`}
+        doc={editable}
+        onSaved={(e) => {
+          ownEpoch.current = Math.max(ownEpoch.current, e)
+        }}
+        onSelectionBlock={onSelectionBlock}
+      />
       {selBlock && selRect && panel !== 'comments' && (
         <button
           className="sel-comment"
@@ -968,9 +1016,11 @@ interface FlagRow {
 function ReviewQueue({
   onChange,
   onOpenDoc,
+  dataVersion,
 }: {
   onChange: (n: number) => void
   onOpenDoc: (id: string) => void
+  dataVersion: number
 }) {
   const [rows, setRows] = useState<QueueRow[]>([])
   const [flags, setFlags] = useState<FlagRow[]>([])
@@ -987,7 +1037,7 @@ function ReviewQueue({
     })
   }, [onChange])
 
-  useEffect(load, [load])
+  useEffect(load, [load, dataVersion])
 
   const resolve = async (annotationId: string, decision: 'accept' | 'decline') => {
     setBusy(annotationId)

@@ -1576,6 +1576,25 @@ impl SqliteStore {
         .collect()
     }
 
+    /// Cheap fingerprint of everything the UI renders: changes whenever ops
+    /// land, docs are created/moved/deleted/statused, annotations resolve, or
+    /// gardener runs progress. The app polls this to live-refresh.
+    pub fn change_stamp(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT (SELECT COALESCE(max(rowid), 0) FROM ops)
+                      + (SELECT count(*) FROM docs WHERE deleted = 0) * 1000003
+                      + (SELECT COALESCE(sum(current_epoch), 0) FROM docs)
+                      + (SELECT count(*) FROM annotations WHERE status != 'open') * 7919
+                      + (SELECT COALESCE(max(rowid), 0) FROM gardener_runs) * 104729
+                      + (SELECT count(*) FROM gardener_runs WHERE status != 'running') * 31
+                      + (SELECT COALESCE(sum(length(coalesce(sort_key,'')) + length(coalesce(parent_id,''))), 0) FROM docs WHERE deleted = 0)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     /// Docs whose content is a canvas scene (for tree/type badges).
     pub fn canvas_doc_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(

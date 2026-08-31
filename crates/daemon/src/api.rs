@@ -456,6 +456,20 @@ async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -
     }
 }
 
+/// Data change stamp: the app polls this and live-refreshes whatever view is
+/// open when it moves — gardener writes, MCP proposals from other sessions,
+/// queue resolutions all appear without a reload.
+async fn stamp(State(st): State<ApiState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.change_stamp() {
+        Ok(v) => Json(json!({"stamp": v})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 /// UI build stamp: mtime of the served index.html. The app polls this and
 /// reloads itself when a deploy lands — no manual ⌘R.
 async fn buildinfo() -> Json<Value> {
@@ -516,6 +530,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/doc/{id}/status", post(set_status))
         .route("/api/doc/{id}/move", post(move_doc))
         .route("/api/buildinfo", get(buildinfo))
+        .route("/api/stamp", get(stamp))
         .route("/api/doc/{id}/delete", post(delete_doc))
         .route("/api/comment", post(add_comment))
         .route("/api/resolve", post(resolve))
