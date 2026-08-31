@@ -21,7 +21,7 @@ type View =
   | { kind: 'runs' }
   | { kind: 'graph' }
   | { kind: 'home' }
-type Palette = null | 'commands' | 'search' | 'newdoc'
+type Palette = null | 'commands' | 'search' | 'newdoc' | 'newcanvas'
 
 export default function App() {
   const [view, setView] = useState<View>({ kind: 'home' })
@@ -130,14 +130,19 @@ export default function App() {
               setPalette('newdoc')
               return
             }
+            if (a === 'newcanvas') {
+              setPalette('newcanvas')
+              return
+            }
             setPalette(null)
           }}
           onClose={() => setPalette(null)}
         />
       )}
       {palette === 'search' && <SearchPalette onOpenDoc={openDoc} onClose={() => setPalette(null)} />}
-      {palette === 'newdoc' && (
+      {(palette === 'newdoc' || palette === 'newcanvas') && (
         <NewDocPalette
+          canvas={palette === 'newcanvas'}
           onCreated={(id) => {
             api<Doc[]>('/api/docs').then(setDocs).catch(() => {})
             openDoc(id)
@@ -177,7 +182,7 @@ function CommandPalette({
   docs: Doc[]
   queueCount: number
   onOpenDoc: (id: string) => void
-  onAction: (a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'graph') => void
+  onAction: (a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph') => void
   onClose: () => void
 }) {
   const [q, setQ] = useState('')
@@ -189,6 +194,7 @@ function CommandPalette({
   const commands: Item[] = [
     { label: `Review queue`, hint: queueCount ? `${queueCount} open` : 'empty', run: () => onAction('review') },
     { label: 'New doc…', hint: '⌘N', run: () => onAction('newdoc') },
+    { label: 'New canvas…', run: () => onAction('newcanvas') },
     { label: 'Gardeners', run: () => onAction('runs') },
     { label: 'Graph view', run: () => onAction('graph') },
     { label: 'Toggle file tree', hint: '⌘T', run: () => onAction('tree') },
@@ -310,9 +316,11 @@ function SearchPalette({
 }
 
 function NewDocPalette({
+  canvas = false,
   onCreated,
   onClose,
 }: {
+  canvas?: boolean
   onCreated: (id: string) => void
   onClose: () => void
 }) {
@@ -327,6 +335,30 @@ function NewDocPalette({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: title.trim() }),
     })
+    if (canvas) {
+      await api('/api/propose', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          doc_id: d.id,
+          base_epoch: 0,
+          ops: [
+            {
+              kind: {
+                op: 'insert',
+                block_id: crypto.randomUUID(),
+                parent_id: null,
+                order_key: 'i',
+                block_type: 'canvas_scene',
+                content: '{}',
+                refers_to: null,
+              },
+              source_refs: ['canvas:created'],
+            },
+          ],
+        }),
+      })
+    }
     onCreated(d.id)
   }
 
@@ -334,7 +366,7 @@ function NewDocPalette({
     <PaletteShell onClose={onClose}>
       <input
         ref={inputRef}
-        placeholder="New doc title…"
+        placeholder={canvas ? 'New canvas title…' : 'New doc title…'}
         value={title}
         onChange={(e) => setTitle(e.target.value)}
         onKeyDown={(e) => {
@@ -509,6 +541,19 @@ function DocView({
 
   if (!tree || !editable) return <div className="empty">…</div>
 
+  // a canvas doc IS the canvas: full-stage tldraw, its own experience
+  if (canvases.length > 0 && editable.blocks.length === 0) {
+    return (
+      <div className="canvas-doc">
+        <div className="canvas-doc-head">
+          <h1>{tree.doc.title}</h1>
+          <span className="meta">canvas · epoch {tree.doc.current_epoch}</span>
+        </div>
+        <CanvasBlock block={canvases[0]} epoch={tree.doc.current_epoch} onSaved={loadTree} full />
+      </div>
+    )
+  }
+
   return (
     <article className="doc" onClick={onStageClick}>
       <div className="doc-head">
@@ -528,45 +573,9 @@ function DocView({
           >
             comments{comments.length > 0 ? ` ${comments.length}` : ''}
           </button>
-          {canvases.length === 0 && (
-            <button
-              className="chip"
-              onClick={() =>
-                api('/api/propose', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    doc_id: docId,
-                    base_epoch: tree.doc.current_epoch,
-                    ops: [
-                      {
-                        kind: {
-                          op: 'insert',
-                          block_id: crypto.randomUUID(),
-                          parent_id: null,
-                          order_key: 'zz',
-                          block_type: 'canvas_scene',
-                          content: '{}',
-                          refers_to: null,
-                        },
-                        source_refs: ['canvas:created'],
-                      },
-                    ],
-                  }),
-                })
-                  .then(loadTree)
-                  .catch((e) => alert(String(e)))
-              }
-            >
-              + canvas
-            </button>
-          )}
         </span>
       </div>
       <DocEditor doc={editable} onSaved={() => {}} onSelectionBlock={onSelectionBlock} />
-      {canvases.map((c) => (
-        <CanvasBlock key={c.id} block={c} epoch={tree.doc.current_epoch} onSaved={loadTree} />
-      ))}
       {selBlock && selRect && panel !== 'comments' && (
         <button
           className="sel-comment"
