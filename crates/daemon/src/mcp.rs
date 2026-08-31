@@ -104,6 +104,27 @@ pub struct CreateDocParams {
     pub parent_doc_id: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct BacklinksParams {
+    /// Doc UUID whose inbound [[wikilinks]] you want.
+    pub doc_id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AddCommentParams {
+    /// Content block UUID the comment anchors to.
+    pub block_id: String,
+    pub text: String,
+    /// Comment UUID to reply to (same thread); omit for a new thread.
+    pub reply_to: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ListCommentsParams {
+    /// Content block UUID.
+    pub block_id: String,
+}
+
 #[derive(Serialize)]
 struct FlatBlock {
     id: Uuid,
@@ -299,6 +320,67 @@ impl KsMcp {
         let mut store = self.store.lock().unwrap();
         match store.resolve(id, self.agent, decision) {
             Ok(receipt) => ok_json(&json!({ "resolved": true, "receipt": receipt })),
+            Err(e) => err(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Blocks anywhere in the corpus that [[wikilink]] to this doc — reviewer context for 'what links here'."
+    )]
+    async fn backlinks(
+        &self,
+        Parameters(p): Parameters<BacklinksParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let store = self.store.lock().unwrap();
+        match store.backlinks(doc_id) {
+            Ok(hits) => ok_json(&hits),
+            Err(e) => err(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Attach a comment to a content block (or reply within a thread via reply_to). Comments are blocks: provenance applies, threads survive edits."
+    )]
+    async fn add_comment(
+        &self,
+        Parameters(p): Parameters<AddCommentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let block_id = match parse_uuid(&p.block_id, "block_id") {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let reply_to = match p
+            .reply_to
+            .as_deref()
+            .map(|s| parse_uuid(s, "reply_to"))
+            .transpose()
+        {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let mut store = self.store.lock().unwrap();
+        match store.add_comment(block_id, self.agent, &p.text, reply_to) {
+            Ok(c) => ok_json(&c),
+            Err(e) => err(e.to_string()),
+        }
+    }
+
+    #[tool(description = "All comments anchored to a content block (threads via parent_id).")]
+    async fn list_comments(
+        &self,
+        Parameters(p): Parameters<ListCommentsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let block_id = match parse_uuid(&p.block_id, "block_id") {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let store = self.store.lock().unwrap();
+        match store.list_comments(block_id) {
+            Ok(c) => ok_json(&c),
             Err(e) => err(e.to_string()),
         }
     }

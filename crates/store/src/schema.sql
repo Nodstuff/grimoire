@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS blocks (
     created_by TEXT NOT NULL REFERENCES principals (id),
     -- epoch of last modification
     epoch      INTEGER NOT NULL,
-    deleted    INTEGER NOT NULL DEFAULT 0
+    deleted    INTEGER NOT NULL DEFAULT 0,
+    -- comment blocks: the content block this comment thread anchors to
+    refers_to  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS blocks_by_doc ON blocks (doc_id, parent_id, order_key);
@@ -76,3 +78,34 @@ CREATE TABLE IF NOT EXISTS annotations (
 );
 
 CREATE INDEX IF NOT EXISTS annotations_open ON annotations (doc_id, status);
+
+-- [[wikilink]] edges (ticket 2.11): to_target is the raw link text, resolved
+-- to docs at query time (Octarine links are workspace paths; match by title).
+CREATE TABLE IF NOT EXISTS edges (
+    from_block TEXT NOT NULL REFERENCES blocks (id),
+    to_target  TEXT NOT NULL,
+    PRIMARY KEY (from_block, to_target)
+);
+
+CREATE INDEX IF NOT EXISTS edges_by_target ON edges (to_target);
+
+-- FTS5 trigram index over live block content (ticket 3.4), trigger-synced.
+CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(
+    content,
+    content='blocks',
+    content_rowid='rowid',
+    tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS blocks_fts_ai AFTER INSERT ON blocks BEGIN
+    INSERT INTO blocks_fts (rowid, content) VALUES (new.rowid, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS blocks_fts_ad AFTER DELETE ON blocks BEGIN
+    INSERT INTO blocks_fts (blocks_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS blocks_fts_au AFTER UPDATE OF content ON blocks BEGIN
+    INSERT INTO blocks_fts (blocks_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+    INSERT INTO blocks_fts (rowid, content) VALUES (new.rowid, new.content);
+END;

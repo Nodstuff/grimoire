@@ -24,13 +24,97 @@ impl SqliteStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        migrate_pre_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        backfill(&conn)?;
         Ok(Self { conn })
     }
 }
 
 fn uuid_col(s: String, ctx: &str) -> Result<Uuid> {
     Uuid::parse_str(&s).map_err(|_| StoreError::InvalidOp(format!("bad uuid in {ctx}: {s}")))
+}
+
+/// Additive column migrations that must run before the IF-NOT-EXISTS schema.
+fn migrate_pre_schema(conn: &Connection) -> Result<()> {
+    let has_blocks: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'blocks'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_blocks > 0 {
+        let has_refers: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('blocks') WHERE name = 'refers_to'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_refers == 0 {
+            conn.execute("ALTER TABLE blocks ADD COLUMN refers_to TEXT", [])?;
+        }
+    }
+    Ok(())
+}
+
+/// Populate FTS and edges for rows that predate their triggers/extraction.
+/// Gated on user_version: count(*) on an external-content FTS table proxies
+/// the content table, so emptiness is unobservable — version it instead.
+const SCHEMA_VERSION: i64 = 2;
+
+fn backfill(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    conn.execute("INSERT INTO blocks_fts (blocks_fts) VALUES ('rebuild')", [])?;
+    let edges: i64 = conn.query_row("SELECT count(*) FROM edges", [], |r| r.get(0))?;
+    if edges == 0 {
+        let mut stmt = conn
+            .prepare("SELECT id, content FROM blocks WHERE deleted = 0 AND content LIKE '%[[%'")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, content) in rows {
+            for target in wikilinks(&content) {
+                conn.execute(
+                    "INSERT OR IGNORE INTO edges (from_block, to_target) VALUES (?1, ?2)",
+                    params![id, target],
+                )?;
+            }
+        }
+    }
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// `[[target]]` / `[[target|alias]]` / `[[target#section]]`; `.md` optional.
+fn wikilinks(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("[[") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("]]") else { break };
+        let target = after[..end].split(['|', '#']).next().unwrap_or("").trim();
+        let target = target.strip_suffix(".md").unwrap_or(target);
+        if !target.is_empty() {
+            out.push(target.to_string());
+        }
+        rest = &after[end + 2..];
+    }
+    out
+}
+
+fn set_edges(tx: &Transaction, block_id: Uuid, content: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM edges WHERE from_block = ?1",
+        params![block_id.to_string()],
+    )?;
+    for target in wikilinks(content) {
+        tx.execute(
+            "INSERT OR IGNORE INTO edges (from_block, to_target) VALUES (?1, ?2)",
+            params![block_id.to_string(), target],
+        )?;
+    }
+    Ok(())
 }
 
 type RawDoc = (String, Option<String>, String, Option<String>, i64, String);
@@ -73,6 +157,7 @@ type RawBlock = (
     String,
     i64,
     bool,
+    Option<String>,
 );
 
 fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<RawBlock> {
@@ -86,11 +171,23 @@ fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<RawBlock> {
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
     ))
 }
 
 fn build_block(raw: RawBlock) -> Result<Block> {
-    let (id, doc_id, parent_id, order_key, block_type, content, created_by, epoch, deleted) = raw;
+    let (
+        id,
+        doc_id,
+        parent_id,
+        order_key,
+        block_type,
+        content,
+        created_by,
+        epoch,
+        deleted,
+        refers_to,
+    ) = raw;
     Ok(Block {
         id: uuid_col(id, "blocks.id")?,
         doc_id: uuid_col(doc_id, "blocks.doc_id")?,
@@ -104,11 +201,14 @@ fn build_block(raw: RawBlock) -> Result<Block> {
         created_by: uuid_col(created_by, "blocks.created_by")?,
         epoch,
         deleted,
+        refers_to: refers_to
+            .map(|r| uuid_col(r, "blocks.refers_to"))
+            .transpose()?,
     })
 }
 
 const BLOCK_COLS: &str =
-    "id, doc_id, parent_id, order_key, block_type, content, created_by, epoch, deleted";
+    "id, doc_id, parent_id, order_key, block_type, content, created_by, epoch, deleted, refers_to";
 
 /// Fetch a block by id within a doc, tombstoned ones included.
 fn block_by_id(tx: &Transaction, doc_id: Uuid, id: Uuid) -> Result<Option<Block>> {
@@ -235,13 +335,14 @@ fn project(tx: &Transaction, doc_id: Uuid, epoch: i64, principal: Uuid, op: &OpK
             order_key,
             block_type,
             content,
+            refers_to,
         } => {
             if let Some(p) = parent_id {
                 live_block(tx, doc_id, *p, "parent")?;
             }
             let n = tx.execute(
-                "INSERT INTO blocks (id, doc_id, parent_id, order_key, block_type, content, created_by, epoch)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO blocks (id, doc_id, parent_id, order_key, block_type, content, created_by, epoch, refers_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT (id) DO NOTHING",
                 params![
                     block_id.to_string(),
@@ -251,7 +352,8 @@ fn project(tx: &Transaction, doc_id: Uuid, epoch: i64, principal: Uuid, op: &OpK
                     block_type.as_str(),
                     content,
                     principal.to_string(),
-                    epoch
+                    epoch,
+                    refers_to.map(|r| r.to_string()),
                 ],
             )?;
             if n == 0 {
@@ -259,6 +361,7 @@ fn project(tx: &Transaction, doc_id: Uuid, epoch: i64, principal: Uuid, op: &OpK
                     "insert: block {block_id} already exists"
                 )));
             }
+            set_edges(tx, *block_id, content)?;
         }
         OpKind::Replace { target, content } => {
             live_block(tx, doc_id, *target, "replace target")?;
@@ -266,12 +369,17 @@ fn project(tx: &Transaction, doc_id: Uuid, epoch: i64, principal: Uuid, op: &OpK
                 "UPDATE blocks SET content = ?1, epoch = ?2 WHERE id = ?3",
                 params![content, epoch, target.to_string()],
             )?;
+            set_edges(tx, *target, content)?;
         }
         OpKind::Delete { target } => {
             live_block(tx, doc_id, *target, "delete target")?;
             tx.execute(
                 "UPDATE blocks SET deleted = 1, epoch = ?1 WHERE id = ?2",
                 params![epoch, target.to_string()],
+            )?;
+            tx.execute(
+                "DELETE FROM edges WHERE from_block = ?1",
+                params![target.to_string()],
             )?;
         }
         OpKind::Move {
@@ -526,7 +634,133 @@ impl BlockStore for SqliteStore {
         rows.map(|r| build_op(r?)).collect()
     }
 
+    fn effective_policy(&self, doc_id: Uuid) -> Result<ReviewPolicy> {
+        let mut cursor = doc_id;
+        loop {
+            let doc = self.get_doc(cursor)?;
+            if let Some(p) = doc.review_policy {
+                return Ok(p);
+            }
+            match doc.parent_id {
+                Some(parent) => cursor = parent,
+                None => return Ok(crate::DEFAULT_REVIEW_POLICY),
+            }
+        }
+    }
+
+    fn set_review_policy(&mut self, doc_id: Uuid, policy: Option<ReviewPolicy>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE docs SET review_policy = ?1 WHERE id = ?2",
+            params![policy.map(|p| p.as_str()), doc_id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("doc {doc_id}")));
+        }
+        Ok(())
+    }
+
+    fn backlinks(&self, doc_id: Uuid) -> Result<Vec<SearchHit>> {
+        let doc = self.get_doc(doc_id)?;
+        let sql = format!(
+            "SELECT DISTINCT {}, d.title FROM edges e
+             JOIN blocks b ON b.id = e.from_block
+             JOIN docs d ON d.id = b.doc_id
+             WHERE b.deleted = 0 AND (e.to_target = ?1 OR e.to_target LIKE '%/' || ?1)
+             ORDER BY d.title, b.order_key",
+            b_cols()
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![doc.title], |r| {
+            let raw = row_to_block(r)?;
+            let title: String = r.get(10)?;
+            Ok((raw, title))
+        })?;
+        rows.map(|r| {
+            let (raw, doc_title) = r?;
+            Ok(SearchHit {
+                block: build_block(raw)?,
+                doc_title,
+            })
+        })
+        .collect()
+    }
+
+    fn add_comment(
+        &mut self,
+        target_block: Uuid,
+        principal: Uuid,
+        text: &str,
+        reply_to: Option<Uuid>,
+    ) -> Result<Block> {
+        let target = self.read_block(target_block)?;
+        if let Some(r) = reply_to {
+            let parent = self.read_block(r)?;
+            if parent.block_type != BlockType::Comment || parent.refers_to != Some(target_block) {
+                return Err(StoreError::InvalidOp(
+                    "reply_to must be a comment on the same block".into(),
+                ));
+            }
+        }
+        let epoch = self.get_doc(target.doc_id)?.current_epoch;
+        let comment_id = Uuid::now_v7();
+        self.apply(
+            target.doc_id,
+            epoch,
+            principal,
+            vec![OpInput {
+                kind: OpKind::Insert {
+                    block_id: comment_id,
+                    parent_id: reply_to,
+                    order_key: crate::order_key::between(None, None),
+                    block_type: BlockType::Comment,
+                    content: text.into(),
+                    refers_to: Some(target_block),
+                },
+                source_refs: vec![],
+            }],
+        )?;
+        self.read_block(comment_id)
+    }
+
+    fn list_comments(&self, target_block: Uuid) -> Result<Vec<Block>> {
+        let sql = format!(
+            "SELECT {BLOCK_COLS} FROM blocks
+             WHERE refers_to = ?1 AND deleted = 0 ORDER BY id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![target_block.to_string()], row_to_block)?;
+        rows.map(|r| build_block(r?)).collect()
+    }
+
     fn search_blocks(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        // FTS5 trigram with OR-of-trigrams: typo-tolerant ("gardnr" shares
+        // trigrams with "gardener"), bm25-ranked. Sub-trigram queries fall
+        // back to LIKE.
+        if let Some(match_q) = fts_query(query) {
+            let sql = format!(
+                "SELECT {}, d.title FROM blocks_fts f
+                 JOIN blocks b ON b.rowid = f.rowid
+                 JOIN docs d ON d.id = b.doc_id
+                 WHERE blocks_fts MATCH ?1 AND b.deleted = 0
+                 ORDER BY bm25(blocks_fts) LIMIT ?2",
+                b_cols()
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![match_q, limit as i64], |r| {
+                let raw = row_to_block(r)?;
+                let title: String = r.get(10)?;
+                Ok((raw, title))
+            })?;
+            return rows
+                .map(|r| {
+                    let (raw, doc_title) = r?;
+                    Ok(SearchHit {
+                        block: build_block(raw)?,
+                        doc_title,
+                    })
+                })
+                .collect();
+        }
         let escaped = query
             .replace('\\', "\\\\")
             .replace('%', "\\%")
@@ -536,16 +770,12 @@ impl BlockStore for SqliteStore {
             "SELECT {}, d.title FROM blocks b JOIN docs d ON d.id = b.doc_id
              WHERE b.deleted = 0 AND b.content LIKE ?1 ESCAPE '\\'
              ORDER BY d.title, b.order_key LIMIT ?2",
-            BLOCK_COLS
-                .split(", ")
-                .map(|c| format!("b.{c}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            b_cols()
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![pattern, limit as i64], |r| {
             let raw = row_to_block(r)?;
-            let title: String = r.get(9)?;
+            let title: String = r.get(10)?;
             Ok((raw, title))
         })?;
         rows.map(|r| {
@@ -568,6 +798,7 @@ impl BlockStore for SqliteStore {
         if ops.is_empty() {
             return Err(StoreError::InvalidOp("propose: empty op list".into()));
         }
+        let policy = self.effective_policy(doc_id)?;
         let tx = self.conn.transaction()?;
         let current = doc_epoch(&tx, doc_id)?;
         if base_epoch > current {
@@ -628,7 +859,12 @@ impl BlockStore for SqliteStore {
             match scored.verdict {
                 Verdict::Green => {}
                 Verdict::Yellow => {
-                    insert_annotation(&tx, doc_id, op_id, AnnotationKind::Review)?;
+                    // auto policy self-applies high-confidence yellows: no flag
+                    let auto_clean = policy == ReviewPolicy::Auto
+                        && scored.confidence >= crate::gate::HIGH_CONFIDENCE;
+                    if !auto_clean {
+                        insert_annotation(&tx, doc_id, op_id, AnnotationKind::Review)?;
+                    }
                 }
                 Verdict::Red => {
                     insert_annotation(&tx, doc_id, op_id, AnnotationKind::Parked)?;
@@ -912,5 +1148,35 @@ fn parse_annotation_status(s: &str) -> Result<AnnotationStatus> {
         "accepted" => Ok(AnnotationStatus::Accepted),
         "declined" => Ok(AnnotationStatus::Declined),
         _ => Err(StoreError::InvalidOp(format!("bad annotation status: {s}"))),
+    }
+}
+
+fn b_cols() -> String {
+    BLOCK_COLS
+        .split(", ")
+        .map(|c| format!("b.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// OR-of-trigrams FTS query for typo-tolerant matching; None below 3 chars.
+fn fts_query(q: &str) -> Option<String> {
+    let mut tris: Vec<String> = Vec::new();
+    for token in q.split_whitespace() {
+        let chars: Vec<char> = token
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect();
+        for w in chars.windows(3) {
+            tris.push(format!("\"{}\"", w.iter().collect::<String>()));
+        }
+    }
+    tris.dedup();
+    tris.truncate(30);
+    if tris.is_empty() {
+        None
+    } else {
+        Some(tris.join(" OR "))
     }
 }

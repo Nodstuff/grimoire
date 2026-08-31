@@ -3,6 +3,7 @@
 //! Ledger (`ops`) is the primary write record; `blocks` is the projection,
 //! written in the same transaction. One committed `apply` = one epoch.
 
+pub mod export;
 pub mod gate;
 pub mod import;
 pub mod order_key;
@@ -31,6 +32,10 @@ pub enum StoreError {
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// Policy when a doc and all its ancestors leave review_policy null.
+/// Human-review until the reviewer agent (4.8) exists; flip to AgentReview then.
+pub const DEFAULT_REVIEW_POLICY: ReviewPolicy = ReviewPolicy::HumanReview;
 
 /// Storage boundary (ADR 0001). No SQL above this trait.
 pub trait BlockStore {
@@ -71,10 +76,37 @@ pub trait BlockStore {
     /// Ledger ops applied after `since_epoch`, oldest first (tool 3.6's SELECT).
     fn ops_since(&self, doc_id: Uuid, since_epoch: i64) -> Result<Vec<LedgerOp>>;
 
+    /// The doc's effective review policy: its own column, else the nearest
+    /// ancestor's (one recursive lookup, ticket 2.10), else DEFAULT_REVIEW_POLICY.
+    /// Consulted by propose: under Auto, yellows at/above gate::HIGH_CONFIDENCE
+    /// self-apply without an annotation; reds always park regardless.
+    fn effective_policy(&self, doc_id: Uuid) -> Result<ReviewPolicy>;
+
+    /// Set or clear (None = inherit) a doc's review policy. Deliberately NOT
+    /// exposed over MCP: an agent that can flip a doc to `auto` weakens the
+    /// gate — policy changes are a human/UI surface.
+    fn set_review_policy(&mut self, doc_id: Uuid, policy: Option<ReviewPolicy>) -> Result<()>;
+
     /// Substring search over live block content (ticket 3.4's v0: LIKE;
     /// FTS5+trigram replaces the internals without changing the signature).
     /// Results are blocks, not docs — the editable unit (§3.3).
     fn search_blocks(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>>;
+
+    /// Blocks anywhere that [[wikilink]] to this doc (ticket 2.11) — matched
+    /// by title against raw link targets (Octarine links are workspace paths).
+    fn backlinks(&self, doc_id: Uuid) -> Result<Vec<SearchHit>>;
+
+    /// Comments are blocks (ticket 3.5): block_type=comment, refers_to = the
+    /// anchored content block; threads are trees via parent_id.
+    fn add_comment(
+        &mut self,
+        target_block: Uuid,
+        principal: Uuid,
+        text: &str,
+        reply_to: Option<Uuid>,
+    ) -> Result<Block>;
+
+    fn list_comments(&self, target_block: Uuid) -> Result<Vec<Block>>;
 
     /// The propose gate (ticket 2.5): the write path for agents and for any
     /// stale base. Current base → all green, applied. Stale base → per-op
