@@ -574,6 +574,7 @@ async fn run_auditor(
     let allowed: std::collections::HashSet<Uuid> = doc_ids.iter().copied().collect();
     let mut lines = Vec::new();
     let mut flagged = 0usize;
+    let mut corrected = 0usize;
     {
         let mut s = store
             .lock()
