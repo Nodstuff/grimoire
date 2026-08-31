@@ -9,15 +9,24 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@tiptap/core": "^3.30.6",
+    "@tiptap/pm": "^3.30.6",
+    "@tiptap/react": "^3.30.6",
+    "@tiptap/starter-kit": "^3.30.6",
+    "markdown-it": "^15.0.1",
+    "prosemirror-markdown": "^1.13.7",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/markdown-it": "^14.2.0",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^5.0.0",
     "typescript": "^5.8.0",
-    "vite": "^7.1.0"
+    "vite": "^7.1.0",
+    "vitest": "^4.1.11"
   }
 }

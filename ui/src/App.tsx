@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import Markdown from 'react-markdown'
+import DocEditor from './editor/DocEditor'
 import {
   api,
+  Block,
   Doc,
   DocTree,
   BlockNode,
@@ -35,13 +36,13 @@ export default function App() {
       if (mod && e.key === 'k') {
         e.preventDefault()
         setPalette((p) => (p === 'commands' ? null : 'commands'))
-      } else if (mod && e.key === 'b') {
+      } else if (mod && (e.key === 'b' || e.key === 't')) {
         e.preventDefault()
         setTreeOpen((t) => !t)
-      } else if (mod && e.key === 'e') {
+      } else if (mod && (e.key === 'e' || e.key === 'n')) {
         e.preventDefault()
         setPalette((p) => (p === 'newdoc' ? null : 'newdoc'))
-      } else if (mod && e.key === 's') {
+      } else if (mod && e.key === 's' && !e.shiftKey) {
         e.preventDefault()
         setPalette((p) => (p === 'search' ? null : 'search'))
       } else if (e.key === 'Escape') {
@@ -324,34 +325,6 @@ function NewDocPalette({
   )
 }
 
-/* ---------- order keys (mirror of the store's base-36 fractions) ---------- */
-
-const DIGITS = '0123456789abcdefghijklmnopqrstuvwxyz'
-
-function keyBetween(a: string | null, b: string | null): string {
-  const av = a ?? ''
-  let out = ''
-  let i = 0
-  for (;;) {
-    const da = i < av.length ? DIGITS.indexOf(av[i]) : 0
-    const db = b == null ? 36 : i < b.length ? DIGITS.indexOf(b[i]) : 0
-    if (da === db) {
-      out += DIGITS[da]
-      i++
-      continue
-    }
-    if (db - da > 1) return out + DIGITS[(da + db) >> 1]
-    out += DIGITS[da]
-    i++
-    for (;;) {
-      const d = i < av.length ? DIGITS.indexOf(av[i]) : 0
-      if (36 - d > 1) return out + DIGITS[(d + 36) >> 1]
-      out += DIGITS[d]
-      i++
-    }
-  }
-}
-
 /* ---------- tree ---------- */
 
 function DocTreeNav({
@@ -417,13 +390,6 @@ function DocTreeNav({
 
 /* ---------- doc view ---------- */
 
-const PRINCIPAL_TINTS = ['#3d59a1', '#33635c', '#8f5e15', '#5a4a78', '#8c4351', '#166775']
-
-function tintFor(principal: string, map: Map<string, string>): string {
-  if (!map.has(principal)) map.set(principal, PRINCIPAL_TINTS[map.size % PRINCIPAL_TINTS.length])
-  return map.get(principal)!
-}
-
 function DocView({
   docId,
   onOpenDoc,
@@ -435,72 +401,26 @@ function DocView({
 }) {
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
-  const [editing, setEditing] = useState<string | null>(null)
-  const tints = useMemo(() => new Map<string, string>(), [docId])
 
-  const load = useCallback(() => {
+  useEffect(() => {
+    setTree(null)
     api<DocTree>(`/api/doc/${docId}`).then(setTree).catch(console.error)
     api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => setBacklinks([]))
   }, [docId])
 
-  useEffect(() => {
-    setTree(null)
-    setEditing(null)
-    load()
-  }, [load])
-
-  // every human edit goes through the same gate as agents, as the tom principal
-  const submit = useCallback(
-    async (ops: unknown[]) => {
-      if (!tree) return
-      try {
-        await api('/api/propose', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ doc_id: docId, base_epoch: tree.doc.current_epoch, ops }),
-        })
-      } catch (e) {
-        alert(String(e))
-      }
-      setEditing(null)
-      load()
-    },
-    [tree, docId, load],
-  )
-
-  const saveBlock = (blockId: string, content: string) => {
-    const trimmed = content.trimEnd()
-    if (trimmed === '') {
-      submit([{ kind: { op: 'delete', target: blockId }, source_refs: [] }])
-    } else {
-      submit([{ kind: { op: 'replace', target: blockId, content: trimmed }, source_refs: [] }])
-    }
-  }
-
-  const addBlock = () => {
-    if (!tree) return
-    const lastKey = tree.roots.length ? tree.roots[tree.roots.length - 1].block.order_key : null
-    const id = crypto.randomUUID()
-    submit([
-      {
-        kind: {
-          op: 'insert',
-          block_id: id,
-          parent_id: null,
-          order_key: keyBetween(lastKey, null),
-          block_type: 'paragraph',
-          content: 'new block',
-          refers_to: null,
-        },
-        source_refs: [],
-      },
-    ]).then(() => setEditing(id))
-  }
-
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
 
-  const openWikilink = useCallback(
-    (target: string) => {
+  // wikilink click-through: ⌘-click anywhere in the editor text
+  const onStageClick = useCallback(
+    (e: React.MouseEvent) => {
+      if (!(e.metaKey || e.ctrlKey)) return
+      const sel = window.getSelection()
+      const text = sel?.anchorNode?.textContent ?? ''
+      const offset = sel?.anchorOffset ?? 0
+      const open = text.lastIndexOf('[[', offset)
+      const close = text.indexOf(']]', offset)
+      if (open === -1 || close === -1) return
+      const target = text.slice(open + 2, close).split(/[|#]/)[0].trim()
       const name = target.split('/').pop() ?? target
       const id = byTitle.get(name)
       if (id) onOpenDoc(id)
@@ -508,40 +428,30 @@ function DocView({
     [byTitle, onOpenDoc],
   )
 
-  if (!tree) return <div className="empty">…</div>
+  const editable = useMemo(() => {
+    if (!tree) return null
+    const blocks: Block[] = []
+    const walk = (nodes: BlockNode[]) => {
+      for (const n of nodes) {
+        if (n.block.block_type !== 'comment' && !n.block.content.startsWith('---')) {
+          blocks.push(n.block)
+        }
+        walk(n.children)
+      }
+    }
+    walk(tree.roots)
+    return { docId, epoch: tree.doc.current_epoch, blocks }
+  }, [tree, docId])
 
-  const renderNode = (n: BlockNode): React.ReactNode => {
-    if (n.block.block_type === 'comment') return null
-    return (
-      <div key={n.block.id}>
-        {editing === n.block.id ? (
-          <BlockEditor
-            initial={n.block.content}
-            onSave={(c) => saveBlock(n.block.id, c)}
-            onCancel={() => setEditing(null)}
-          />
-        ) : (
-          <BlockView
-            block={n.block}
-            tint={tintFor(n.block.created_by, tints)}
-            onWikilink={openWikilink}
-            onEdit={() => setEditing(n.block.id)}
-          />
-        )}
-        {n.children.map(renderNode)}
-      </div>
-    )
-  }
+  if (!tree || !editable) return <div className="empty">…</div>
 
   return (
-    <article className="doc">
+    <article className="doc" onClick={onStageClick}>
       <div className="doc-head">
         <h1>{tree.doc.title}</h1>
-        <span className="meta">epoch {tree.doc.current_epoch}</span>
         {tree.doc.review_policy && <span className="meta policy">{tree.doc.review_policy}</span>}
       </div>
-      {tree.roots.map(renderNode)}
-      <div className="add-block" onClick={addBlock}>+</div>
+      <DocEditor doc={editable} onSaved={() => {}} />
       {backlinks.length > 0 && (
         <div className="backlinks">
           <span className="meta">linked from</span>
@@ -553,89 +463,6 @@ function DocView({
         </div>
       )}
     </article>
-  )
-}
-
-function BlockView({
-  block,
-  tint,
-  onWikilink,
-  onEdit,
-}: {
-  block: { id: string; block_type: string; content: string; created_by: string }
-  tint: string
-  onWikilink: (t: string) => void
-  onEdit: () => void
-}) {
-  const isFrontmatter = block.content.startsWith('---')
-  if (isFrontmatter) return null // presentation mode: metadata stays out of the page
-  if (block.block_type === 'code' || block.block_type.startsWith('diagram')) {
-    return (
-      <pre
-        className="block code"
-        data-tint={tint}
-        style={{ ['--tint' as never]: tint }}
-        onDoubleClick={onEdit}
-      >
-        {block.content}
-      </pre>
-    )
-  }
-  const parts = block.content.split(/(\[\[[^\]]+\]\])/g)
-  return (
-    <div className="block" style={{ ['--tint' as never]: tint }} onDoubleClick={onEdit}>
-      {parts.map((p, i) => {
-        const m = p.match(/^\[\[([^\]|#]+)/)
-        if (m)
-          return (
-            <span key={i} className="wikilink" onClick={() => onWikilink(m[1].trim())}>
-              {p.replace(/^\[\[|\]\]$/g, '')}
-            </span>
-          )
-        return <Markdown key={i}>{p}</Markdown>
-      })}
-    </div>
-  )
-}
-
-function BlockEditor({
-  initial,
-  onSave,
-  onCancel,
-}: {
-  initial: string
-  onSave: (content: string) => void
-  onCancel: () => void
-}) {
-  const [value, setValue] = useState(initial)
-  const ref = useRef<HTMLTextAreaElement>(null)
-  useEffect(() => {
-    const el = ref.current
-    if (el) {
-      el.focus()
-      el.setSelectionRange(el.value.length, el.value.length)
-      el.style.height = el.scrollHeight + 'px'
-    }
-  }, [])
-  return (
-    <textarea
-      ref={ref}
-      className="block-editor"
-      value={value}
-      onChange={(e) => {
-        setValue(e.target.value)
-        e.target.style.height = 'auto'
-        e.target.style.height = e.target.scrollHeight + 'px'
-      }}
-      onKeyDown={(e) => {
-        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') onSave(value)
-        if (e.key === 'Escape') {
-          e.stopPropagation()
-          onCancel()
-        }
-      }}
-      onBlur={() => (value === initial ? onCancel() : onSave(value))}
-    />
   )
 }
 
