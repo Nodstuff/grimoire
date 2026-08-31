@@ -7,7 +7,7 @@ import { api, GardenerRun } from './types'
 export interface Gardener {
   id: string
   name: string
-  kind: 'tagging' | 'reviewer'
+  kind: 'tagging' | 'reviewer' | 'auditor'
   principal: string
   scope_doc: string | null
   task_prompt: string
@@ -173,7 +173,7 @@ function GardenerCard({
 
 function CreateCard({ onCreated }: { onCreated: () => void }) {
   const [name, setName] = useState('')
-  const [kind, setKind] = useState<'tagging' | 'reviewer'>('tagging')
+  const [kind, setKind] = useState<'tagging' | 'reviewer' | 'auditor'>('tagging')
   const [prompt, setPrompt] = useState('')
 
   const create = async () => {
@@ -195,9 +195,10 @@ function CreateCard({ onCreated }: { onCreated: () => void }) {
         </label>
         <label>
           kind
-          <select value={kind} onChange={(e) => setKind(e.target.value as 'tagging' | 'reviewer')}>
+          <select value={kind} onChange={(e) => setKind(e.target.value as 'tagging' | 'reviewer' | 'auditor')}>
             <option value="tagging">tagging (sweeps docs)</option>
             <option value="reviewer">reviewer (clears the queue)</option>
+            <option value="auditor">auditor (flags stale/suspect claims)</option>
           </select>
         </label>
       </div>

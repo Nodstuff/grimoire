@@ -1,6 +1,7 @@
 #!/bin/zsh
 # Full deploy: UI dist + daemon (launchd) + app bundle w/ sidecar. One command, no drift.
 set -e
+set -o pipefail
 cd "$(dirname "$0")"
 echo "→ ui build"
 (cd ui && npm run build --silent | tail -1)

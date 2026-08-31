@@ -1405,6 +1405,34 @@ fn parse_annotation_status(s: &str) -> Result<AnnotationStatus> {
 }
 
 impl SqliteStore {
+    /// Stalest docs first (oldest last-op), excluding docs this auditor
+    /// already commented on — the veracity sweep's worklist.
+    pub fn audit_candidates(&self, auditor: Uuid, limit: usize) -> Result<Vec<Doc>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status
+             FROM docs d
+             JOIN (SELECT doc_id, max(created_at) AS last FROM ops
+                   WHERE epoch_applied IS NOT NULL GROUP BY doc_id) o ON o.doc_id = d.id
+             WHERE EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0
+                           AND b.block_type != 'comment')
+               AND NOT EXISTS (SELECT 1 FROM audits a WHERE a.doc_id = d.id AND a.principal = ?1)
+             ORDER BY o.last ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![auditor.to_string(), limit as i64], row_to_doc)?;
+        rows.map(|r| build_doc(r?)).collect()
+    }
+
+    /// Mark docs as covered by an auditor (re-audit = delete the rows).
+    pub fn record_audits(&mut self, principal: Uuid, doc_ids: &[Uuid]) -> Result<()> {
+        for d in doc_ids {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO audits (doc_id, principal) VALUES (?1, ?2)",
+                params![d.to_string(), principal.to_string()],
+            )?;
+        }
+        Ok(())
+    }
+
     /// (doc_id, principal) of each doc's last applied op — "who tends this".
     pub fn raw_tending(&self) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(

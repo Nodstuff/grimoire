@@ -393,6 +393,9 @@ pub enum GardenerKind {
     Tagging,
     /// Reads the review queue on agent-review docs and resolves it (4.8).
     Reviewer,
+    /// Veracity sweeps: reads the stalest docs and flags suspect claims
+    /// as comments on the offending blocks. Flags, never edits.
+    Auditor,
 }
 
 impl GardenerKind {
@@ -400,6 +403,7 @@ impl GardenerKind {
         match self {
             GardenerKind::Tagging => "tagging",
             GardenerKind::Reviewer => "reviewer",
+            GardenerKind::Auditor => "auditor",
         }
     }
 
@@ -407,6 +411,7 @@ impl GardenerKind {
         match s {
             "tagging" => Some(GardenerKind::Tagging),
             "reviewer" => Some(GardenerKind::Reviewer),
+            "auditor" => Some(GardenerKind::Auditor),
             _ => None,
         }
     }
