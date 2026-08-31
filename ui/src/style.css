@@ -579,3 +579,34 @@ kbd {
 
 .card.flag { border-left: 3px solid var(--accent); }
 .flag-text { font-size: 13px; margin: 6px 0; white-space: pre-wrap; }
+
+.bulk-bar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 14px;
+}
+.bulk-decline {
+  background: none;
+  color: var(--red);
+  border: 1px solid var(--red);
+  border-radius: 7px;
+  padding: 4px 14px;
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* ---------- canvas block ---------- */
+
+.canvas-block {
+  height: 520px;
+  margin: 24px 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  position: relative;
+}
