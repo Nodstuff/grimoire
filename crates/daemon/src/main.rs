@@ -4,6 +4,7 @@
 //! MCP over streamable HTTP at /mcp. Web UI routes come later (M5).
 
 mod admin;
+mod api;
 mod garden;
 mod mcp;
 
@@ -199,7 +200,18 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve { port } => {
             let store = Arc::new(Mutex::new(store));
             tokio::spawn(admin::daily_loop(store.clone()));
-            let app = mcp::router(store.clone(), claude).merge(admin::router(store));
+            // ui/dist next to the binary's repo root; fall back to cwd
+            let ui_dist = std::env::var("KSD_UI_DIST")
+                .unwrap_or_else(|_| "/Users/tmeaney/personal/knowledge-system/ui/dist".into());
+            let app = mcp::router(store.clone(), claude)
+                .merge(admin::router(store.clone()))
+                .merge(api::router(api::ApiState { store, human: tom }))
+                .fallback_service(
+                    tower_http::services::ServeDir::new(&ui_dist)
+                        .fallback(tower_http::services::ServeFile::new(
+                            format!("{ui_dist}/index.html"),
+                        )),
+                );
             let addr = format!("127.0.0.1:{port}");
             tracing::info!("ksd serving MCP (streamable HTTP) at http://{addr}/mcp");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
