@@ -76,3 +76,25 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   if (j && typeof j === 'object' && 'error' in j) throw new Error(String(j.error))
   return j as T
 }
+
+export interface Principal {
+  id: string
+  kind: 'human' | 'agent' | 'remote'
+  display_name: string
+}
+
+export interface HistoryRow {
+  op: {
+    id: string
+    kind: Record<string, unknown> & { op: string }
+    principal: string
+    base_epoch: number
+    epoch_applied: number | null
+    verdict: 'green' | 'yellow' | 'red' | null
+    confidence: number | null
+    prior: Block | null
+    source_refs: string[]
+  }
+  principal_name: string
+  principal_kind: string
+}

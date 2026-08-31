@@ -154,6 +154,56 @@ async fn create_doc(State(st): State<ApiState>, Json(req): Json<CreateDocReq>) -
     }
 }
 
+async fn principals(State(st): State<ApiState>) -> Json<Value> {
+    let s = st.store.lock().unwrap();
+    match s.list_principals() {
+        Ok(p) => Json(json!(p)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+/// Per-doc op history, newest first — the provenance panel (5.4).
+async fn history(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
+    let s = st.store.lock().unwrap();
+    match s.ops_since(id, 0) {
+        Ok(mut ops) => {
+            ops.reverse();
+            ops.truncate(100);
+            let rows: Vec<Value> = ops
+                .into_iter()
+                .map(|op| {
+                    let principal = s
+                        .get_principal(op.principal)
+                        .map(|p| (p.display_name, p.kind.as_str().to_string()))
+                        .unwrap_or_default();
+                    json!({
+                        "op": op,
+                        "principal_name": principal.0,
+                        "principal_kind": principal.1,
+                    })
+                })
+                .collect();
+            Json(json!(rows))
+        }
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+struct CommentReq {
+    block_id: Uuid,
+    text: String,
+    reply_to: Option<Uuid>,
+}
+
+async fn add_comment(State(st): State<ApiState>, Json(req): Json<CommentReq>) -> Json<Value> {
+    let mut s = st.store.lock().unwrap();
+    match s.add_comment(req.block_id, st.human, &req.text, req.reply_to) {
+        Ok(c) => Json(json!(c)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/docs", get(docs).post(create_doc))
@@ -161,6 +211,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/doc/{id}", get(doc))
         .route("/api/doc/{id}/backlinks", get(backlinks))
         .route("/api/queue", get(queue))
+        .route("/api/principals", get(principals))
+        .route("/api/doc/{id}/history", get(history))
+        .route("/api/comment", post(add_comment))
         .route("/api/resolve", post(resolve))
         .route("/api/search", get(search))
         .route("/api/tags", get(tags))

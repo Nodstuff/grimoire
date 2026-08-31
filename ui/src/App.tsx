@@ -6,6 +6,7 @@ import {
   Doc,
   DocTree,
   BlockNode,
+  HistoryRow,
   QueueRow,
   SearchHit,
   GardenerRun,
@@ -407,12 +408,21 @@ function DocView({
 }) {
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
+  const [panel, setPanel] = useState<'none' | 'history' | 'comments'>('none')
+  const [selBlock, setSelBlock] = useState<string | null>(null)
+  const [commentTarget, setCommentTarget] = useState<string | null>(null)
 
-  useEffect(() => {
-    setTree(null)
+  const loadTree = useCallback(() => {
     api<DocTree>(`/api/doc/${docId}`).then(setTree).catch(console.error)
     api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => setBacklinks([]))
   }, [docId])
+
+  useEffect(() => {
+    setTree(null)
+    setPanel('none')
+    setCommentTarget(null)
+    loadTree()
+  }, [loadTree])
 
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
 
@@ -434,19 +444,21 @@ function DocView({
     [byTitle, onOpenDoc],
   )
 
-  const editable = useMemo(() => {
-    if (!tree) return null
+  const { editable, comments, allBlocks } = useMemo(() => {
+    if (!tree) return { editable: null, comments: [] as Block[], allBlocks: [] as Block[] }
     const blocks: Block[] = []
+    const comments: Block[] = []
+    const allBlocks: Block[] = []
     const walk = (nodes: BlockNode[]) => {
       for (const n of nodes) {
-        if (n.block.block_type !== 'comment' && !n.block.content.startsWith('---')) {
-          blocks.push(n.block)
-        }
+        allBlocks.push(n.block)
+        if (n.block.block_type === 'comment') comments.push(n.block)
+        else if (!n.block.content.startsWith('---')) blocks.push(n.block)
         walk(n.children)
       }
     }
     walk(tree.roots)
-    return { docId, epoch: tree.doc.current_epoch, blocks }
+    return { editable: { docId, epoch: tree.doc.current_epoch, blocks }, comments, allBlocks }
   }, [tree, docId])
 
   if (!tree || !editable) return <div className="empty">…</div>
@@ -456,8 +468,45 @@ function DocView({
       <div className="doc-head">
         <h1>{tree.doc.title}</h1>
         {tree.doc.review_policy && <span className="meta policy">{tree.doc.review_policy}</span>}
+        <span className="head-actions">
+          <button
+            className={`chip ${panel === 'history' ? 'on' : ''}`}
+            onClick={() => setPanel(panel === 'history' ? 'none' : 'history')}
+          >
+            history
+          </button>
+          <button
+            className={`chip ${panel === 'comments' ? 'on' : ''}`}
+            onClick={() => setPanel(panel === 'comments' ? 'none' : 'comments')}
+          >
+            comments{comments.length > 0 ? ` ${comments.length}` : ''}
+          </button>
+        </span>
       </div>
-      <DocEditor doc={editable} onSaved={() => {}} />
+      <DocEditor doc={editable} onSaved={() => {}} onSelectionBlock={setSelBlock} />
+      {selBlock && panel !== 'comments' && (
+        <button
+          className="sel-comment"
+          onMouseDown={(e) => {
+            e.preventDefault()
+            setCommentTarget(selBlock)
+            setPanel('comments')
+          }}
+        >
+          comment on selection
+        </button>
+      )}
+      {panel === 'history' && <HistoryPanel docId={docId} onClose={() => setPanel('none')} />}
+      {panel === 'comments' && (
+        <CommentsPanel
+          comments={comments}
+          allBlocks={allBlocks}
+          target={commentTarget}
+          setTarget={setCommentTarget}
+          onPosted={loadTree}
+          onClose={() => setPanel('none')}
+        />
+      )}
       {backlinks.length > 0 && (
         <div className="backlinks">
           <span className="meta">linked from</span>
@@ -469,6 +518,152 @@ function DocView({
         </div>
       )}
     </article>
+  )
+}
+
+/* ---------- provenance & comments panels (5.4 / 5.5) ---------- */
+
+function opSnippet(kind: Record<string, unknown> & { op: string }): string {
+  const c = typeof kind.content === 'string' ? (kind.content as string) : ''
+  return c ? c.split('\n')[0].slice(0, 90) : `${kind.op} ${String(kind.target ?? '').slice(0, 8)}`
+}
+
+function HistoryPanel({ docId, onClose }: { docId: string; onClose: () => void }) {
+  const [rows, setRows] = useState<HistoryRow[]>([])
+  useEffect(() => {
+    api<HistoryRow[]>(`/api/doc/${docId}/history`).then(setRows).catch(console.error)
+  }, [docId])
+
+  // one entry per epoch (a save/run), ops grouped beneath
+  const epochs = useMemo(() => {
+    const m = new Map<number, HistoryRow[]>()
+    for (const r of rows) {
+      const e = r.op.epoch_applied ?? -1
+      if (!m.has(e)) m.set(e, [])
+      m.get(e)!.push(r)
+    }
+    return [...m.entries()].sort((a, b) => b[0] - a[0])
+  }, [rows])
+
+  return (
+    <aside className="panel">
+      <div className="panel-head">
+        <span>history</span>
+        <button onClick={onClose}>esc</button>
+      </div>
+      {epochs.map(([epoch, ops]) => (
+        <div key={epoch} className="epoch-group">
+          <div className="epoch-line">
+            <span className="meta">epoch {epoch}</span>
+            <span className={`who ${ops[0].principal_kind}`}>{ops[0].principal_name}</span>
+            {ops[0].op.verdict && ops[0].op.verdict !== 'green' && (
+              <span className={`verdict v-${ops[0].op.verdict}`}>{ops[0].op.verdict}</span>
+            )}
+          </div>
+          {ops.map((r) => (
+            <div key={r.op.id} className="op-line">
+              <span className="op-type">{r.op.kind.op}</span>
+              <span className="op-snippet">{opSnippet(r.op.kind)}</span>
+            </div>
+          ))}
+          {ops[0].op.source_refs.length > 0 && (
+            <div className="refs">{ops[0].op.source_refs.join(' · ')}</div>
+          )}
+        </div>
+      ))}
+      {rows.length === 0 && <div className="palette-empty">no history</div>}
+    </aside>
+  )
+}
+
+function CommentsPanel({
+  comments,
+  allBlocks,
+  target,
+  setTarget,
+  onPosted,
+  onClose,
+}: {
+  comments: Block[]
+  allBlocks: Block[]
+  target: string | null
+  setTarget: (t: string | null) => void
+  onPosted: () => void
+  onClose: () => void
+}) {
+  const [text, setText] = useState('')
+  const [replyTo, setReplyTo] = useState<Block | null>(null)
+  const byId = useMemo(() => new Map(allBlocks.map((b) => [b.id, b])), [allBlocks])
+
+  const roots = comments.filter((c) => !c.parent_id || !byId.get(c.parent_id)?.refers_to)
+  const repliesOf = (id: string) => comments.filter((c) => c.parent_id === id)
+
+  const post = async () => {
+    const blockId = replyTo ? replyTo.refers_to : target
+    if (!text.trim() || !blockId) return
+    await api('/api/comment', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ block_id: blockId, text: text.trim(), reply_to: replyTo?.id ?? null }),
+    }).catch((e) => alert(String(e)))
+    setText('')
+    setReplyTo(null)
+    setTarget(null)
+    onPosted()
+  }
+
+  const snippet = (id: string | null) =>
+    id ? (byId.get(id)?.content ?? '').split('\n')[0].slice(0, 70) : ''
+
+  return (
+    <aside className="panel">
+      <div className="panel-head">
+        <span>comments</span>
+        <button onClick={onClose}>esc</button>
+      </div>
+      {roots.map((c) => (
+        <div key={c.id} className="thread">
+          <div className="thread-target">{snippet(c.refers_to)}</div>
+          <CommentRow c={c} />
+          {repliesOf(c.id).map((r) => (
+            <div key={r.id} className="reply">
+              <CommentRow c={r} />
+            </div>
+          ))}
+          <button className="chip" onClick={() => setReplyTo(c)}>
+            reply
+          </button>
+        </div>
+      ))}
+      {roots.length === 0 && !target && (
+        <div className="palette-empty">no comments — select text to start a thread</div>
+      )}
+      {(target || replyTo) && (
+        <div className="composer">
+          <div className="meta">
+            {replyTo ? `replying in thread` : `on: ${snippet(target)}`}
+          </div>
+          <textarea
+            autoFocus
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') post()
+            }}
+            placeholder="⌘Enter to post"
+          />
+        </div>
+      )}
+    </aside>
+  )
+}
+
+function CommentRow({ c }: { c: Block }) {
+  return (
+    <div className="comment">
+      <span className="comment-text">{c.content}</span>
+      <span className="meta">epoch {c.epoch}</span>
+    </div>
   )
 }
 
