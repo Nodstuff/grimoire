@@ -4,7 +4,7 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ks_store::{BlockStore, DocStatus, OpInput, ReviewDecision, SqliteStore};
+use grimoire_store::{BlockStore, DocStatus, OpInput, ReviewDecision, SqliteStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -436,7 +436,7 @@ async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let block = match s.read_block(req.comment_id) {
-        Ok(b) if b.block_type == ks_store::BlockType::Comment => b,
+        Ok(b) if b.block_type == grimoire_store::BlockType::Comment => b,
         Ok(_) => return Json(json!({"error": "not a comment block"})),
         Err(e) => return Json(json!({"error": e.to_string()})),
     };
@@ -445,7 +445,7 @@ async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -
         Err(e) => return Json(json!({"error": e.to_string()})),
     };
     let op = OpInput {
-        kind: ks_store::OpKind::Delete {
+        kind: grimoire_store::OpKind::Delete {
             target: req.comment_id,
         },
         source_refs: vec!["flag:dismissed".into()],

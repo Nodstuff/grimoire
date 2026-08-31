@@ -1,7 +1,7 @@
 //! Acceptance tests for #13/#14: propose gate verdicts, stale-op confidence,
 //! yellow/red annotation lifecycle, proposer ≠ approver, resolved-red provenance.
 
-use ks_store::*;
+use grimoire_store::*;
 use uuid::Uuid;
 
 struct Fixture {

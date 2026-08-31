@@ -10,12 +10,12 @@ mod mcp;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use ks_store::{BlockStore, PrincipalKind, SqliteStore};
+use grimoire_store::{BlockStore, PrincipalKind, SqliteStore};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[derive(Parser)]
-#[command(name = "ksd", about = "knowledge-system daemon")]
+#[command(name = "grimoire", about = "knowledge-system daemon")]
 struct Cli {
     /// Path to the SQLite database.
     #[arg(long, default_value_os_t = default_db())]
@@ -69,7 +69,7 @@ enum Cmd {
 }
 
 fn default_db() -> PathBuf {
-    dirs_home().join(".knowledge-system/ks.db")
+    dirs_home().join(".grimoire/ks.db")
 }
 
 fn dirs_home() -> PathBuf {
@@ -123,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Import { dir } => {
-            let report = ks_store::import::import_vault(&mut store, &dir, tom)?;
+            let report = grimoire_store::import::import_vault(&mut store, &dir, tom)?;
             println!(
                 "imported {} docs, {} blocks; skipped {} files",
                 report.docs,
@@ -135,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Export { dir } => {
-            let report = ks_store::export::export_vault(&store, &dir)?;
+            let report = grimoire_store::export::export_vault(&store, &dir)?;
             println!("exported {} files to {}", report.files, dir.display());
         }
         Cmd::Gardener { cmd } => {
@@ -201,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
             let store = Arc::new(Mutex::new(store));
             tokio::spawn(admin::daily_loop(store.clone()));
             // ui/dist next to the binary's repo root; fall back to cwd
-            let ui_dist = std::env::var("KSD_UI_DIST")
+            let ui_dist = std::env::var("GRIMOIRE_UI_DIST")
                 .unwrap_or_else(|_| "/Users/tmeaney/personal/knowledge-system/ui/dist".into());
             let app = mcp::router(store.clone(), claude)
                 .merge(admin::router(store.clone()))

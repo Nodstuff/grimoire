@@ -3,7 +3,7 @@
 //! All writes act as the `claude` agent principal and go through the propose
 //! gate — the MCP surface has no direct-write path by design.
 
-use ks_store::{BlockNode, BlockStore, OpInput, ReviewDecision, SqliteStore, StoreError};
+use grimoire_store::{BlockNode, BlockStore, OpInput, ReviewDecision, SqliteStore, StoreError};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
