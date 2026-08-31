@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "knowledge-system",
+  "productName": "Grimoire",
   "version": "0.1.0",
   "identifier": "ie.null.knowledge-system.shell",
   "build": {
