@@ -57,10 +57,14 @@ type SaveState = 'clean' | 'dirty' | 'saving'
 export default function DocEditor({
   doc,
   onSaved,
+  onSelectionBlock,
 }: {
   doc: EditableDoc
   onSaved: (epoch: number) => void
+  onSelectionBlock?: (blockId: string | null) => void
 }) {
+  const selCb = useRef(onSelectionBlock)
+  selCb.current = onSelectionBlock
   const [saveState, setSaveState] = useState<SaveState>('clean')
   const [epoch, setEpoch] = useState(doc.epoch)
 
@@ -103,6 +107,18 @@ export default function DocEditor({
         content: initial.nodes.map((n) => n.toJSON()),
       },
       onUpdate: () => setSaveState('dirty'),
+      onSelectionUpdate: ({ editor }) => {
+        const sel = editor.state.selection
+        if (sel.empty) {
+          selCb.current?.(null)
+          return
+        }
+        try {
+          selCb.current?.(sel.$from.node(1)?.attrs?.blockId ?? null)
+        } catch {
+          selCb.current?.(null)
+        }
+      },
     },
     [doc.docId],
   )
