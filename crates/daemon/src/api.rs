@@ -456,6 +456,20 @@ async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -
     }
 }
 
+/// UI build stamp: mtime of the served index.html. The app polls this and
+/// reloads itself when a deploy lands — no manual ⌘R.
+async fn buildinfo() -> Json<Value> {
+    let dist = std::env::var("GRIMOIRE_UI_DIST")
+        .unwrap_or_else(|_| "/Users/tmeaney/personal/knowledge-system/ui/dist".into());
+    let stamp = std::fs::metadata(format!("{dist}/index.html"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Json(json!({"build": stamp}))
+}
+
 #[derive(Deserialize)]
 struct MoveDocReq {
     parent_id: Option<Uuid>,
@@ -501,6 +515,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/doc/{id}/history", get(history))
         .route("/api/doc/{id}/status", post(set_status))
         .route("/api/doc/{id}/move", post(move_doc))
+        .route("/api/buildinfo", get(buildinfo))
         .route("/api/doc/{id}/delete", post(delete_doc))
         .route("/api/comment", post(add_comment))
         .route("/api/resolve", post(resolve))
