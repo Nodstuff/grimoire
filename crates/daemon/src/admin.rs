@@ -5,7 +5,7 @@ use crate::garden;
 use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ks_store::{BlockStore, ConfidencePolicy, GardenerKind, ReviewPolicy, SqliteStore};
+use grimoire_store::{BlockStore, ConfidencePolicy, GardenerKind, ReviewPolicy, SqliteStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};

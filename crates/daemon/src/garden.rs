@@ -7,7 +7,7 @@
 //! proposals, which land as reviewable verdicts with provenance (the
 //! injection firewall is the gate, §3.4).
 
-use ks_store::{
+use grimoire_store::{
     BlockStore, ConfidencePolicy, Gardener, GardenerKind, OpInput, OpKind, ReviewDecision,
     ReviewItem, SqliteStore, order_key,
 };
@@ -75,7 +75,7 @@ pub struct RunOutcome {
 }
 
 /// Compose the tagging gardener's prompt: untagged docs + existing vocabulary.
-fn compose_tagging(store: &SqliteStore, g: &Gardener) -> ks_store::Result<(String, usize)> {
+fn compose_tagging(store: &SqliteStore, g: &Gardener) -> grimoire_store::Result<(String, usize)> {
     let vocab: Vec<String> = store.list_tags()?.into_iter().map(|(t, _)| t).collect();
     let docs = store.untagged_docs(DOCS_PER_RUN)?;
     let mut sections = Vec::new();
@@ -88,8 +88,8 @@ fn compose_tagging(store: &SqliteStore, g: &Gardener) -> ks_store::Result<(Strin
         }
         let tree = store.read_doc(doc.id)?;
         let mut preview = String::new();
-        let mut walk = |nodes: &[ks_store::BlockNode]| {
-            fn rec(nodes: &[ks_store::BlockNode], out: &mut String) {
+        let mut walk = |nodes: &[grimoire_store::BlockNode]| {
+            fn rec(nodes: &[grimoire_store::BlockNode], out: &mut String) {
                 for n in nodes {
                     for line in n.block.content.lines().take(3) {
                         out.push_str(line);
@@ -134,7 +134,7 @@ async fn invoke_claude_with_dirs(
     prompt: &str,
     read_dirs: &[String],
 ) -> Result<(String, i64), String> {
-    let bin = std::env::var("KSD_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    let bin = std::env::var("GRIMOIRE_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
     let mut args: Vec<String> = vec![
         "-p".into(),
         prompt.into(),
@@ -217,7 +217,7 @@ fn parse_proposals(result: &str) -> Result<Vec<TagProposal>, String> {
 }
 
 /// Turn one accepted proposal into frontmatter ops for the doc.
-fn tag_ops(store: &SqliteStore, doc_id: Uuid, add: &[String]) -> ks_store::Result<Vec<OpInput>> {
+fn tag_ops(store: &SqliteStore, doc_id: Uuid, add: &[String]) -> grimoire_store::Result<Vec<OpInput>> {
     let tree = store.read_doc(doc_id)?;
     let refs = vec!["gardener:tagging".to_string()];
     let tags_yaml = |tags: &[String]| {
@@ -251,7 +251,7 @@ fn tag_ops(store: &SqliteStore, doc_id: Uuid, add: &[String]) -> ks_store::Resul
                 block_id: Uuid::now_v7(),
                 parent_id: None,
                 order_key: order_key::between(None, first_key),
-                block_type: ks_store::BlockType::Code,
+                block_type: grimoire_store::BlockType::Code,
                 content: format!("---\ntags:\n{}\n---", tags_yaml(add)),
                 refers_to: None,
             },
@@ -274,13 +274,13 @@ const REVIEWER_PREAMBLE: &str = "You are the reviewer agent in a personal knowle
 fn reviewable_items(
     store: &SqliteStore,
     reviewer_principal: Uuid,
-) -> ks_store::Result<Vec<ReviewItem>> {
+) -> grimoire_store::Result<Vec<ReviewItem>> {
     let mut out = Vec::new();
     for item in store.review_queue(None)? {
         if item.op.principal == reviewer_principal {
             continue;
         }
-        if store.effective_policy(item.annotation.doc_id)? != ks_store::ReviewPolicy::AgentReview {
+        if store.effective_policy(item.annotation.doc_id)? != grimoire_store::ReviewPolicy::AgentReview {
             continue;
         }
         out.push(item);
@@ -371,7 +371,7 @@ pub fn apply_review_decisions(
     let mut red_per_doc: HashMap<Uuid, usize> = HashMap::new();
     for (ann, _, _) in &decisions {
         if let Some(item) = presented.get(ann)
-            && item.annotation.kind == ks_store::AnnotationKind::Parked
+            && item.annotation.kind == grimoire_store::AnnotationKind::Parked
         {
             *red_per_doc.entry(item.annotation.doc_id).or_default() += 1;
         }
@@ -389,7 +389,7 @@ pub fn apply_review_decisions(
             lines.push(format!("ignored invented annotation_id {ann}"));
             continue;
         };
-        if item.annotation.kind == ks_store::AnnotationKind::Parked
+        if item.annotation.kind == grimoire_store::AnnotationKind::Parked
             && escalated.contains(&item.annotation.doc_id)
         {
             lines.push(format!(
@@ -522,7 +522,7 @@ fn binding_dirs(g: &Gardener) -> Vec<String> {
 fn compose_audit(
     store: &SqliteStore,
     g: &Gardener,
-) -> ks_store::Result<(String, usize, Vec<Uuid>)> {
+) -> grimoire_store::Result<(String, usize, Vec<Uuid>)> {
     let docs = store.audit_candidates(g.principal, AUDIT_DOCS_PER_RUN)?;
     let mut sections = Vec::new();
     let mut doc_ids = Vec::new();
@@ -535,9 +535,9 @@ fn compose_audit(
         }
         let tree = store.read_doc(doc.id)?;
         let mut body = String::new();
-        fn rec(nodes: &[ks_store::BlockNode], out: &mut String) {
+        fn rec(nodes: &[grimoire_store::BlockNode], out: &mut String) {
             for n in nodes {
-                if n.block.block_type != ks_store::BlockType::Comment {
+                if n.block.block_type != grimoire_store::BlockType::Comment {
                     out.push_str(&format!(
                         "[block {}]
 {}
@@ -844,9 +844,9 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
                 Ok(out) => {
                     for v in &out.verdicts {
                         match v.verdict {
-                            ks_store::Verdict::Green => counts.0 += 1,
-                            ks_store::Verdict::Yellow => counts.1 += 1,
-                            ks_store::Verdict::Red => counts.2 += 1,
+                            grimoire_store::Verdict::Green => counts.0 += 1,
+                            grimoire_store::Verdict::Yellow => counts.1 += 1,
+                            grimoire_store::Verdict::Red => counts.2 += 1,
                         }
                     }
                     lines.push(format!(
@@ -874,7 +874,7 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ks_store::{BlockType, PrincipalKind, ReviewPolicy};
+    use grimoire_store::{BlockType, PrincipalKind, ReviewPolicy};
 
     /// Doc under agent-review with `n` parked reds from a proposer agent.
     fn seed_reds(n: usize) -> (SqliteStore, Uuid, Vec<ReviewItem>) {
@@ -940,7 +940,7 @@ mod tests {
         assert!(
             out.verdicts
                 .iter()
-                .all(|v| v.verdict == ks_store::Verdict::Red)
+                .all(|v| v.verdict == grimoire_store::Verdict::Red)
         );
         let items = reviewable_items(&s, reviewer.id).unwrap();
         assert_eq!(items.len(), n);

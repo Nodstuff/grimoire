@@ -17,7 +17,7 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 const DAEMON_ADDR: &str = "127.0.0.1:7425";
 const DAEMON_URL: &str = "http://127.0.0.1:7425/";
-const LAUNCHD_LABEL: &str = "ie.null.knowledge-system";
+const LAUNCHD_LABEL: &str = "ie.null.grimoire";
 
 fn daemon_up() -> bool {
     TcpStream::connect_timeout(&DAEMON_ADDR.parse().unwrap(), Duration::from_millis(300)).is_ok()
@@ -72,17 +72,17 @@ fn spawn_sidecar() {
         return;
     };
     let Some(dir) = exe.parent() else { return };
-    let ksd = dir.join("ksd");
+    let ksd = dir.join("grimoire");
     if !ksd.exists() {
         return;
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let _ = std::fs::create_dir_all(format!("{home}/.knowledge-system"));
+    let _ = std::fs::create_dir_all(format!("{home}/.grimoire"));
     let log = || {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(format!("{home}/.knowledge-system/ksd.log"))
+            .open(format!("{home}/.grimoire/ksd.log"))
             .ok()
     };
     let mut cmd = Command::new(&ksd);
