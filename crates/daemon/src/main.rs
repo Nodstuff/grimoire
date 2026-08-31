@@ -25,6 +25,8 @@ struct Cli {
 enum Cmd {
     /// Import a markdown vault (one-shot).
     Import { dir: PathBuf },
+    /// Export all docs to a markdown directory tree.
+    Export { dir: PathBuf },
     /// Serve MCP over streamable HTTP.
     Serve {
         #[arg(long, default_value_t = 7425)]
@@ -97,6 +99,10 @@ async fn main() -> anyhow::Result<()> {
             for p in report.skipped {
                 println!("  skipped: {}", p.display());
             }
+        }
+        Cmd::Export { dir } => {
+            let report = ks_store::export::export_vault(&store, &dir)?;
+            println!("exported {} files to {}", report.files, dir.display());
         }
         Cmd::Serve { port } => {
             let store = Arc::new(Mutex::new(store));

@@ -161,6 +161,7 @@ mod tests {
             created_by: Uuid::now_v7(),
             epoch,
             deleted,
+            refers_to: None,
         }
     }
 
@@ -218,6 +219,7 @@ mod tests {
             order_key: "i".into(),
             block_type: BlockType::Paragraph,
             content: "x".into(),
+            refers_to: None,
         };
         let s = score_stale_op(&op, 5, &mut |_| None);
         assert_eq!(s.verdict, Verdict::Green);

@@ -23,6 +23,7 @@ fn insert(parent: Option<Uuid>, key: &str, ty: BlockType, content: &str) -> (Uui
             order_key: key.into(),
             block_type: ty,
             content: content.into(),
+            refers_to: None,
         },
         source_refs: vec![],
     };

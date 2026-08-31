@@ -34,6 +34,7 @@ fn fixture() -> Fixture {
                 order_key: "i".into(),
                 block_type: BlockType::Paragraph,
                 content: "original".into(),
+                refers_to: None,
             },
             source_refs: vec![],
         }],
@@ -93,6 +94,7 @@ fn stale_replace_on_unchanged_block_greens() {
                 order_key: "j".into(),
                 block_type: BlockType::Paragraph,
                 content: "unrelated".into(),
+                refers_to: None,
             },
             source_refs: vec![],
         }],
@@ -178,6 +180,7 @@ fn stale_move_on_changed_target_yellows_and_applies() {
                 order_key: "j".into(),
                 block_type: BlockType::Paragraph,
                 content: "movable".into(),
+                refers_to: None,
             },
             source_refs: vec![],
         }],
@@ -246,6 +249,7 @@ fn accept_yellow_clears_annotation_without_editing() {
                 order_key: "j".into(),
                 block_type: BlockType::Paragraph,
                 content: "movable".into(),
+                refers_to: None,
             },
             source_refs: vec![],
         }],
@@ -294,6 +298,7 @@ fn decline_yellow_reverts_via_pre_image() {
                 order_key: "j".into(),
                 block_type: BlockType::Paragraph,
                 content: "movable".into(),
+                refers_to: None,
             },
             source_refs: vec![],
         }],
@@ -398,6 +403,7 @@ fn mixed_batch_bumps_epoch_once_and_scores_per_op() {
                         order_key: "j".into(),
                         block_type: BlockType::Paragraph,
                         content: "new section".into(),
+                        refers_to: None,
                     },
                     source_refs: vec![],
                 },
@@ -419,4 +425,95 @@ fn base_epoch_ahead_of_doc_is_rejected() {
     let err =
         f.s.propose(f.doc.id, 99, f.agent.id, vec![replace(f.para, "x")]);
     assert!(matches!(err, Err(StoreError::InvalidOp(_))));
+}
+
+#[test]
+fn review_policy_inherits_from_parent_and_defaults_human() {
+    let mut f = fixture();
+    assert_eq!(
+        f.s.effective_policy(f.doc.id).unwrap(),
+        DEFAULT_REVIEW_POLICY
+    );
+    let child = f.s.create_doc("child", Some(f.doc.id), f.tom.id).unwrap();
+    f.s.set_review_policy(f.doc.id, Some(ReviewPolicy::Auto))
+        .unwrap();
+    assert_eq!(
+        f.s.effective_policy(child.id).unwrap(),
+        ReviewPolicy::Auto,
+        "null inherits parent"
+    );
+    f.s.set_review_policy(child.id, Some(ReviewPolicy::HumanReview))
+        .unwrap();
+    assert_eq!(
+        f.s.effective_policy(child.id).unwrap(),
+        ReviewPolicy::HumanReview,
+        "own column wins"
+    );
+}
+
+#[test]
+fn auto_policy_still_flags_low_confidence_yellows_and_parks_reds() {
+    let mut f = fixture();
+    f.s.set_review_policy(f.doc.id, Some(ReviewPolicy::Auto))
+        .unwrap();
+    // low-confidence yellow: move-on-changed (0.6 < HIGH_CONFIDENCE)
+    let other = Uuid::now_v7();
+    f.s.apply(
+        f.doc.id,
+        1,
+        f.tom.id,
+        vec![OpInput {
+            kind: OpKind::Insert {
+                block_id: other,
+                parent_id: None,
+                order_key: "j".into(),
+                block_type: BlockType::Paragraph,
+                content: "movable".into(),
+                refers_to: None,
+            },
+            source_refs: vec![],
+        }],
+    )
+    .unwrap();
+    f.s.apply(f.doc.id, 2, f.tom.id, vec![replace(other, "movable v2")])
+        .unwrap();
+    f.s.propose(
+        f.doc.id,
+        2,
+        f.agent.id,
+        vec![OpInput {
+            kind: OpKind::Move {
+                target: other,
+                new_parent: Some(f.para),
+                new_order_key: "i".into(),
+            },
+            source_refs: vec![],
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        f.s.review_queue(None).unwrap().len(),
+        1,
+        "low-confidence yellow flagged even under auto"
+    );
+    // red still parks under auto
+    f.s.apply(f.doc.id, 4, f.tom.id, vec![replace(f.para, "tom again")])
+        .unwrap();
+    f.s.propose(f.doc.id, 4, f.tom.id, vec![]).err(); // no-op guard
+    f.s.propose(
+        f.doc.id,
+        3,
+        f.agent.id,
+        vec![replace(f.para, "stale agent")],
+    )
+    .unwrap();
+    assert_eq!(
+        f.s.review_queue(None)
+            .unwrap()
+            .iter()
+            .filter(|i| i.annotation.kind == AnnotationKind::Parked)
+            .count(),
+        1,
+        "reds always park regardless of policy"
+    );
 }

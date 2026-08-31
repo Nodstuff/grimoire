@@ -139,6 +139,7 @@ fn to_ops(segs: Vec<Segment>) -> Vec<OpInput> {
                 order_key: key,
                 block_type: seg.block_type,
                 content: seg.content,
+                refers_to: None,
             },
             source_refs: vec![],
         });

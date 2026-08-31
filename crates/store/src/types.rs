@@ -126,6 +126,9 @@ pub struct Block {
     pub created_by: Uuid,
     pub epoch: i64,
     pub deleted: bool,
+    /// Comment blocks: the content block this thread anchors to.
+    #[serde(default)]
+    pub refers_to: Option<Uuid>,
 }
 
 /// A doc's blocks as a tree, children ordered by `order_key`.
@@ -151,6 +154,9 @@ pub enum OpKind {
         order_key: String,
         block_type: BlockType,
         content: String,
+        /// Comment anchor (comment blocks only).
+        #[serde(default)]
+        refers_to: Option<Uuid>,
     },
     Replace {
         target: Uuid,
