@@ -5,7 +5,7 @@ use crate::garden;
 use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ks_store::{BlockStore, ConfidencePolicy, SqliteStore};
+use ks_store::{BlockStore, ConfidencePolicy, GardenerKind, ReviewPolicy, SqliteStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -16,6 +16,8 @@ pub type Store = Arc<Mutex<SqliteStore>>;
 #[derive(Deserialize)]
 pub struct CreateGardener {
     pub name: String,
+    /// "tagging" (default) or "reviewer"
+    pub kind: Option<String>,
     pub task_prompt: String,
     pub scope_doc: Option<Uuid>,
     /// "review" (default) or "gate"
@@ -51,8 +53,15 @@ async fn create_gardener(
             None => return Json(json!({"error": format!("bad confidence_policy: {p}")})),
         },
     };
+    let kind = match req.kind.as_deref() {
+        None => GardenerKind::Tagging,
+        Some(k) => match GardenerKind::parse(k) {
+            Some(k) => k,
+            None => return Json(json!({"error": format!("bad kind: {k}")})),
+        },
+    };
     let mut s = store.lock().unwrap();
-    match s.create_gardener(&req.name, &req.task_prompt, req.scope_doc, policy) {
+    match s.create_gardener(&req.name, kind, &req.task_prompt, req.scope_doc, policy) {
         Ok(g) => Json(json!(g)),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
@@ -99,6 +108,28 @@ async fn list_runs(State(store): State<Store>, Query(q): Query<RunsQuery>) -> Js
     }
 }
 
+#[derive(Deserialize)]
+pub struct PolicyReq {
+    pub doc_id: Uuid,
+    /// "human-review" | "agent-review" | "auto" | null to clear (inherit)
+    pub policy: Option<String>,
+}
+
+async fn set_policy(State(store): State<Store>, Json(req): Json<PolicyReq>) -> Json<Value> {
+    let policy = match req.policy.as_deref() {
+        None => None,
+        Some(p) => match ReviewPolicy::parse(p) {
+            Some(p) => Some(p),
+            None => return Json(json!({"error": format!("bad policy: {p}")})),
+        },
+    };
+    let mut s = store.lock().unwrap();
+    match s.set_review_policy(req.doc_id, policy) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 pub fn router(store: Store) -> Router {
     Router::new()
         .route(
@@ -107,6 +138,7 @@ pub fn router(store: Store) -> Router {
         )
         .route("/admin/garden", post(run_now))
         .route("/admin/runs", get(list_runs))
+        .route("/admin/policy", post(set_policy))
         .with_state(store)
 }
 

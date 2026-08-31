@@ -28,6 +28,9 @@ enum GardenerCmd {
     Add {
         name: String,
         task_prompt: String,
+        /// tagging (default) or reviewer
+        #[arg(long)]
+        kind: Option<String>,
         #[arg(long)]
         scope_doc: Option<String>,
         /// review (default: everything lands as reviewable yellows) or gate
@@ -55,6 +58,8 @@ enum Cmd {
     },
     /// Recent gardener runs (talks to the running daemon).
     Runs,
+    /// Set a doc's review policy: human-review | agent-review | auto | clear.
+    Policy { doc_id: String, policy: String },
     /// Serve MCP over streamable HTTP.
     Serve {
         #[arg(long, default_value_t = 7425)]
@@ -139,11 +144,13 @@ async fn main() -> anyhow::Result<()> {
                 GardenerCmd::Add {
                     name,
                     task_prompt,
+                    kind,
                     scope_doc,
                     policy,
                 } => {
                     let body = serde_json::json!({
                         "name": name,
+                        "kind": kind,
                         "task_prompt": task_prompt,
                         "scope_doc": scope_doc,
                         "confidence_policy": policy,
@@ -168,6 +175,19 @@ async fn main() -> anyhow::Result<()> {
             let r = client
                 .post("http://127.0.0.1:7425/admin/garden")
                 .json(&serde_json::json!({ "name": name }))
+                .send()
+                .await?;
+            println!("{}", r.text().await?);
+        }
+        Cmd::Policy { doc_id, policy } => {
+            let body = serde_json::json!({
+                "doc_id": doc_id,
+                "policy": if policy == "clear" { serde_json::Value::Null } else { policy.clone().into() },
+            });
+            let client = reqwest::Client::new();
+            let r = client
+                .post("http://127.0.0.1:7425/admin/policy")
+                .json(&body)
                 .send()
                 .await?;
             println!("{}", r.text().await?);

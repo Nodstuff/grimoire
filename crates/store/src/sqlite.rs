@@ -52,6 +52,24 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
             conn.execute("ALTER TABLE blocks ADD COLUMN refers_to TEXT", [])?;
         }
     }
+    let has_gardeners: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'gardeners'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_gardeners > 0 {
+        let has_kind: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('gardeners') WHERE name = 'kind'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_kind == 0 {
+            conn.execute(
+                "ALTER TABLE gardeners ADD COLUMN kind TEXT NOT NULL DEFAULT 'tagging'",
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -871,6 +889,7 @@ impl BlockStore for SqliteStore {
     fn create_gardener(
         &mut self,
         name: &str,
+        kind: GardenerKind,
         task_prompt: &str,
         scope_doc: Option<Uuid>,
         confidence_policy: ConfidencePolicy,
@@ -879,11 +898,12 @@ impl BlockStore for SqliteStore {
         let principal = self.create_principal(PrincipalKind::Agent, name, None)?;
         let id = Uuid::now_v7();
         self.conn.execute(
-            "INSERT INTO gardeners (id, name, principal, scope_doc, task_prompt, confidence_policy)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO gardeners (id, name, kind, principal, scope_doc, task_prompt, confidence_policy)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 id.to_string(),
                 name,
+                kind.as_str(),
                 principal.id.to_string(),
                 scope_doc.map(|d| d.to_string()),
                 task_prompt,
@@ -893,6 +913,7 @@ impl BlockStore for SqliteStore {
         Ok(Gardener {
             id,
             name: name.into(),
+            kind,
             principal: principal.id,
             scope_doc,
             task_prompt: task_prompt.into(),
@@ -906,7 +927,7 @@ impl BlockStore for SqliteStore {
 
     fn list_gardeners(&self) -> Result<Vec<Gardener>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, principal, scope_doc, task_prompt, bindings, creds_ref,
+            "SELECT id, name, kind, principal, scope_doc, task_prompt, bindings, creds_ref,
                     schedule, confidence_policy, enabled
              FROM gardeners ORDER BY name",
         )?;
@@ -915,19 +936,21 @@ impl BlockStore for SqliteStore {
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, String>(4)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
                 r.get::<_, String>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, String>(7)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
                 r.get::<_, String>(8)?,
-                r.get::<_, bool>(9)?,
+                r.get::<_, String>(9)?,
+                r.get::<_, bool>(10)?,
             ))
         })?;
         rows.map(|r| {
             let (
                 id,
                 name,
+                kind,
                 principal,
                 scope,
                 task_prompt,
@@ -940,6 +963,8 @@ impl BlockStore for SqliteStore {
             Ok(Gardener {
                 id: uuid_col(id, "gardeners.id")?,
                 name,
+                kind: GardenerKind::parse(&kind)
+                    .ok_or_else(|| StoreError::InvalidOp(format!("bad gardener kind: {kind}")))?,
                 principal: uuid_col(principal, "gardeners.principal")?,
                 scope_doc: scope
                     .map(|d| uuid_col(d, "gardeners.scope_doc"))

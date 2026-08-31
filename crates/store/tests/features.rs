@@ -192,7 +192,13 @@ fn propose_reviewed_caps_greens_at_yellow_and_is_batch_declinable() {
 fn gardener_registry_crud_and_runs() {
     let (mut s, _tom) = seed();
     let g = s
-        .create_gardener("tagging", "tag the docs", None, ConfidencePolicy::Review)
+        .create_gardener(
+            "tagging",
+            GardenerKind::Tagging,
+            "tag the docs",
+            None,
+            ConfidencePolicy::Review,
+        )
         .unwrap();
     assert_eq!(s.list_gardeners().unwrap().len(), 1);
     // distinct principal per gardener

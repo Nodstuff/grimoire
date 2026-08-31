@@ -354,11 +354,38 @@ impl ConfidencePolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GardenerKind {
+    /// Sweeps docs, proposes content (tags, updates).
+    Tagging,
+    /// Reads the review queue on agent-review docs and resolves it (4.8).
+    Reviewer,
+}
+
+impl GardenerKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GardenerKind::Tagging => "tagging",
+            GardenerKind::Reviewer => "reviewer",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "tagging" => Some(GardenerKind::Tagging),
+            "reviewer" => Some(GardenerKind::Reviewer),
+            _ => None,
+        }
+    }
+}
+
 /// A gardener is config, not construction (PROJECT.md §3.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gardener {
     pub id: Uuid,
     pub name: String,
+    pub kind: GardenerKind,
     pub principal: Uuid,
     pub scope_doc: Option<Uuid>,
     pub task_prompt: String,
