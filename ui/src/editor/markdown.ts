@@ -12,8 +12,32 @@ import MarkdownIt from 'markdown-it'
 
 // token map for tiptap's camelCase node names (prosemirror-markdown's
 // defaults target snake_case names from its own schema)
+/** markdown-it emits bare inline tokens inside th/td; the schema wants a
+ * paragraph there. Wrap them so tableCell content is always block-shaped. */
+function wrapCellInlines(md: ReturnType<typeof MarkdownIt>) {
+  md.core.ruler.push('cell_paragraphs', (state) => {
+    const out: typeof state.tokens = []
+    for (let i = 0; i < state.tokens.length; i++) {
+      const tok = state.tokens[i]
+      out.push(tok)
+      if (
+        (tok.type === 'th_open' || tok.type === 'td_open') &&
+        state.tokens[i + 1]?.type === 'inline'
+      ) {
+        const pOpen = new state.Token('paragraph_open', 'p', 1)
+        const pClose = new state.Token('paragraph_close', 'p', -1)
+        out.push(pOpen, state.tokens[i + 1], pClose)
+        i++
+      }
+    }
+    state.tokens = out
+  })
+}
+
 export function makeParser(schema: Schema): MarkdownParser {
-  return new MarkdownParser(schema, MarkdownIt('commonmark', { html: false }), {
+  const md = MarkdownIt({ html: false })
+  wrapCellInlines(md)
+  return new MarkdownParser(schema, md, {
     blockquote: { block: 'blockquote' },
     paragraph: { block: 'paragraph' },
     list_item: { block: 'listItem' },
@@ -41,6 +65,13 @@ export function makeParser(schema: Schema): MarkdownParser {
       getAttrs: (tok) => ({ href: tok.attrGet('href'), title: tok.attrGet('title') }),
     },
     code_inline: { mark: 'code', noCloseToken: true },
+    s: { mark: 'strike' },
+    table: { block: 'table' },
+    thead: { ignore: true },
+    tbody: { ignore: true },
+    tr: { block: 'tableRow' },
+    th: { block: 'tableHeader' },
+    td: { block: 'tableCell' },
   })
 }
 
@@ -85,6 +116,36 @@ export function makeSerializer(): MarkdownSerializer {
         state.renderInline(node)
         state.closeBlock(node)
       },
+      table(state: MarkdownSerializerState, node: PMNode) {
+        const rows: string[][] = []
+        let headerCols = 0
+        node.forEach((row) => {
+          const cells: string[] = []
+          row.forEach((cell) => {
+            // cells hold paragraphs; take their text with pipes escaped
+            let text = ''
+            cell.forEach((p) => {
+              if (text) text += '<br>'
+              text += p.textContent
+            })
+            cells.push(text.replace(/\|/g, '\\|'))
+            if (cell.type.name === 'tableHeader') headerCols = cells.length
+          })
+          rows.push(cells)
+        })
+        if (rows.length === 0) return
+        const width = Math.max(...rows.map((r) => r.length))
+        const line = (cells: string[]) =>
+          '| ' + Array.from({ length: width }, (_, i) => cells[i] ?? '').join(' | ') + ' |'
+        state.write(line(rows[0]) + '\n')
+        state.write('|' + Array.from({ length: width }, () => ' --- |').join('') + '\n')
+        for (const r of rows.slice(1)) state.write(line(r) + '\n')
+        state.closeBlock(node)
+        void headerCols
+      },
+      tableRow() {},
+      tableHeader() {},
+      tableCell() {},
       hardBreak(state: MarkdownSerializerState, node: PMNode, parent: PMNode, index: number) {
         for (let i = index + 1; i < parent.childCount; i++)
           if (parent.child(i).type !== node.type) {

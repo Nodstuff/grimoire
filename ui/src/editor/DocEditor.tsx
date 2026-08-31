@@ -7,6 +7,7 @@ import { EditorContent, ReactNodeViewRenderer, useEditor } from '@tiptap/react'
 import { Extension, getSchema } from '@tiptap/core'
 import StarterKit from '@tiptap/starter-kit'
 import CodeBlock from '@tiptap/extension-code-block'
+import { TableKit } from '@tiptap/extension-table'
 import CodeBlockView from './CodeBlockView'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block } from '../types'
@@ -21,6 +22,7 @@ const TOP_LEVEL_TYPES = [
   'bulletList',
   'orderedList',
   'horizontalRule',
+  'table',
 ]
 
 /** blockId rides on every top-level node; splits/new nodes get null. */
@@ -49,6 +51,7 @@ const extensions = [
       return ReactNodeViewRenderer(CodeBlockView)
     },
   }),
+  TableKit.configure({ table: { resizable: false } }),
   BlockId,
 ]
 const schema = getSchema(extensions)
