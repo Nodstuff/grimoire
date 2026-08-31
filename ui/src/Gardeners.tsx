@@ -17,7 +17,7 @@ export interface Gardener {
   enabled: boolean
 }
 
-export default function Gardeners() {
+export default function Gardeners({ dataVersion = 0 }: { dataVersion?: number }) {
   const [gardeners, setGardeners] = useState<Gardener[]>([])
   const [runs, setRuns] = useState<GardenerRun[]>([])
   const [running, setRunning] = useState<string | null>(null)
@@ -28,7 +28,7 @@ export default function Gardeners() {
     api<GardenerRun[]>('/api/runs').then(setRuns).catch(console.error)
   }, [])
 
-  useEffect(load, [load])
+  useEffect(load, [load, dataVersion])
 
   const runNow = async (name: string) => {
     setRunning(name)
