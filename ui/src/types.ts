@@ -5,6 +5,7 @@ export interface Doc {
   review_policy: string | null
   current_epoch: number
   created_by: string
+  status: 'draft' | 'in-review' | 'decided' | 'superseded' | null
 }
 
 export interface Block {

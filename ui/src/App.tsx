@@ -496,6 +496,7 @@ function DocView({
       <div className="doc-head">
         <h1>{tree.doc.title}</h1>
         {tree.doc.review_policy && <span className="meta policy">{tree.doc.review_policy}</span>}
+        <StatusChip doc={tree.doc} onChanged={loadTree} />
         <span className="head-actions">
           <button
             className={`chip ${panel === 'history' ? 'on' : ''}`}
@@ -549,6 +550,29 @@ function DocView({
         </div>
       )}
     </article>
+  )
+}
+
+/* ---------- doc status (5.6) ---------- */
+
+const STATUS_CYCLE = [null, 'draft', 'in-review', 'decided', 'superseded'] as const
+
+function StatusChip({ doc, onChanged }: { doc: Doc; onChanged: () => void }) {
+  const next = () => {
+    const i = STATUS_CYCLE.indexOf(doc.status as (typeof STATUS_CYCLE)[number])
+    const nextStatus = STATUS_CYCLE[(i + 1) % STATUS_CYCLE.length]
+    api(`/api/doc/${doc.id}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: nextStatus }),
+    })
+      .then(onChanged)
+      .catch((e) => alert(String(e)))
+  }
+  return (
+    <button className={`chip status-${doc.status ?? 'none'}`} onClick={next} title="cycle status">
+      {doc.status ?? 'no status'}
+    </button>
   )
 }
 

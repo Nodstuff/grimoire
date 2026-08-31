@@ -87,6 +87,10 @@ pub trait BlockStore {
     /// gate — policy changes are a human/UI surface.
     fn set_review_policy(&mut self, doc_id: Uuid, policy: Option<ReviewPolicy>) -> Result<()>;
 
+    /// Doc lifecycle status (5.6): draft | in-review | decided | superseded;
+    /// None clears. "All decided docs touching X" = search + status filter.
+    fn set_doc_status(&mut self, doc_id: Uuid, status: Option<DocStatus>) -> Result<()>;
+
     /// Substring search over live block content (ticket 3.4's v0: LIKE;
     /// FTS5+trigram replaces the internals without changing the signature).
     /// Results are blocks, not docs — the editable unit (§3.3).

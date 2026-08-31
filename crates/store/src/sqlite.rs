@@ -52,6 +52,21 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
             conn.execute("ALTER TABLE blocks ADD COLUMN refers_to TEXT", [])?;
         }
     }
+    let has_docs: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'docs'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_docs > 0 {
+        let has_status: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('docs') WHERE name = 'status'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_status == 0 {
+            conn.execute("ALTER TABLE docs ADD COLUMN status TEXT", [])?;
+        }
+    }
     let has_gardeners: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'gardeners'",
         [],
@@ -189,7 +204,15 @@ fn set_edges(tx: &Transaction, block_id: Uuid, content: &str) -> Result<()> {
     Ok(())
 }
 
-type RawDoc = (String, Option<String>, String, Option<String>, i64, String);
+type RawDoc = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    i64,
+    String,
+    Option<String>,
+);
 
 fn row_to_doc(row: &rusqlite::Row) -> rusqlite::Result<RawDoc> {
     Ok((
@@ -199,11 +222,12 @@ fn row_to_doc(row: &rusqlite::Row) -> rusqlite::Result<RawDoc> {
         row.get(3)?,
         row.get(4)?,
         row.get(5)?,
+        row.get(6)?,
     ))
 }
 
 fn build_doc(raw: RawDoc) -> Result<Doc> {
-    let (id, parent, title, policy, epoch, created_by) = raw;
+    let (id, parent, title, policy, epoch, created_by, status) = raw;
     Ok(Doc {
         id: uuid_col(id, "docs.id")?,
         parent_id: parent.map(|p| uuid_col(p, "docs.parent_id")).transpose()?,
@@ -216,6 +240,12 @@ fn build_doc(raw: RawDoc) -> Result<Doc> {
             .transpose()?,
         current_epoch: epoch,
         created_by: uuid_col(created_by, "docs.created_by")?,
+        status: status
+            .map(|st| {
+                DocStatus::parse(&st)
+                    .ok_or_else(|| StoreError::InvalidOp(format!("bad status: {st}")))
+            })
+            .transpose()?,
     })
 }
 
@@ -578,7 +608,7 @@ impl BlockStore for SqliteStore {
 
     fn list_docs(&self) -> Result<Vec<Doc>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, parent_id, title, review_policy, current_epoch, created_by
+            "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status
              FROM docs ORDER BY title",
         )?;
         let rows = stmt.query_map([], row_to_doc)?;
@@ -589,7 +619,7 @@ impl BlockStore for SqliteStore {
         let raw = self
             .conn
             .query_row(
-                "SELECT id, parent_id, title, review_policy, current_epoch, created_by
+                "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status
                  FROM docs WHERE id = ?1",
                 params![id.to_string()],
                 row_to_doc,
@@ -724,6 +754,17 @@ impl BlockStore for SqliteStore {
                 None => return Ok(crate::DEFAULT_REVIEW_POLICY),
             }
         }
+    }
+
+    fn set_doc_status(&mut self, doc_id: Uuid, status: Option<DocStatus>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE docs SET status = ?1 WHERE id = ?2",
+            params![status.map(|st| st.as_str()), doc_id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("doc {doc_id}")));
+        }
+        Ok(())
     }
 
     fn set_review_policy(&mut self, doc_id: Uuid, policy: Option<ReviewPolicy>) -> Result<()> {
@@ -1058,7 +1099,7 @@ impl BlockStore for SqliteStore {
 
     fn docs_by_tag(&self, tag: &str) -> Result<Vec<Doc>> {
         let mut stmt = self.conn.prepare(
-            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by
+            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status
              FROM docs d JOIN doc_tags t ON t.doc_id = d.id
              WHERE t.tag = ?1 GROUP BY d.id ORDER BY d.title",
         )?;
@@ -1068,7 +1109,7 @@ impl BlockStore for SqliteStore {
 
     fn untagged_docs(&self, limit: usize) -> Result<Vec<Doc>> {
         let mut stmt = self.conn.prepare(
-            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by
+            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status
              FROM docs d
              WHERE EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0)
                AND NOT EXISTS (SELECT 1 FROM doc_tags t WHERE t.doc_id = d.id)

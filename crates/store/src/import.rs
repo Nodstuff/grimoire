@@ -102,10 +102,16 @@ fn segment(md: &str) -> Vec<Segment> {
             }
             i += 1;
         }
+        let content = lines[start..i].join("\n");
         segs.push(Segment {
-            block_type: BlockType::Paragraph,
+            // decision blocks (5.6): a paragraph declaring itself a decision
+            block_type: if content.starts_with("DECISION:") {
+                BlockType::Decision
+            } else {
+                BlockType::Paragraph
+            },
             level: 0,
-            content: lines[start..i].join("\n"),
+            content,
         });
     }
     segs
