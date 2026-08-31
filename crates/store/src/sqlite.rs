@@ -1430,7 +1430,9 @@ impl SqliteStore {
 
     /// doc_id → tags (graph clustering).
     pub fn raw_doc_tags(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
-        let mut stmt = self.conn.prepare("SELECT doc_id, tag FROM doc_tags ORDER BY doc_id")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT doc_id, tag FROM doc_tags ORDER BY doc_id")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
         for r in rows {

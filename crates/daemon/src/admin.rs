@@ -35,7 +35,9 @@ pub struct RunsQuery {
 }
 
 async fn list_gardeners(State(store): State<Store>) -> Json<Value> {
-    let s = store.lock().unwrap();
+    let s = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.list_gardeners() {
         Ok(g) => Json(json!(g)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -60,7 +62,9 @@ async fn create_gardener(
             None => return Json(json!({"error": format!("bad kind: {k}")})),
         },
     };
-    let mut s = store.lock().unwrap();
+    let mut s = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.create_gardener(&req.name, kind, &req.task_prompt, req.scope_doc, policy) {
         Ok(g) => Json(json!(g)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -69,7 +73,9 @@ async fn create_gardener(
 
 async fn run_now(State(store): State<Store>, Json(req): Json<RunReq>) -> Json<Value> {
     let gardeners = {
-        let s = store.lock().unwrap();
+        let s = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match s.list_gardeners() {
             Ok(g) => g,
             Err(e) => return Json(json!({"error": e.to_string()})),
@@ -101,7 +107,9 @@ async fn run_now(State(store): State<Store>, Json(req): Json<RunReq>) -> Json<Va
 }
 
 async fn list_runs(State(store): State<Store>, Query(q): Query<RunsQuery>) -> Json<Value> {
-    let s = store.lock().unwrap();
+    let s = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.list_runs(q.limit.unwrap_or(20)) {
         Ok(r) => Json(json!(r)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -125,9 +133,17 @@ async fn update_gardener(
     let Some(policy) = ConfidencePolicy::parse(&req.confidence_policy) else {
         return Json(json!({"error": format!("bad confidence_policy: {}", req.confidence_policy)}));
     };
-    let mut s = store.lock().unwrap();
-    match s.update_gardener(req.id, &req.task_prompt, &req.schedule, policy, req.scope_doc, req.enabled)
-    {
+    let mut s = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.update_gardener(
+        req.id,
+        &req.task_prompt,
+        &req.schedule,
+        policy,
+        req.scope_doc,
+        req.enabled,
+    ) {
         Ok(()) => Json(json!({"ok": true})),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
@@ -148,7 +164,9 @@ async fn set_policy(State(store): State<Store>, Json(req): Json<PolicyReq>) -> J
             None => return Json(json!({"error": format!("bad policy: {p}")})),
         },
     };
-    let mut s = store.lock().unwrap();
+    let mut s = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.set_review_policy(req.doc_id, policy) {
         Ok(()) => Json(json!({"ok": true})),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -185,7 +203,9 @@ pub async fn daily_loop(store: Store) {
         tokio::time::sleep(wait).await;
 
         let gardeners = {
-            let s = store.lock().unwrap();
+            let s = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.list_gardeners().unwrap_or_default()
         };
         for g in gardeners.into_iter().filter(|g| g.enabled) {
