@@ -130,7 +130,7 @@ fn show_window(app: &AppHandle) {
         "main",
         WebviewUrl::External(DAEMON_URL.parse().unwrap()),
     )
-    .title("knowledge-system")
+    .title("Grimoire")
     .inner_size(1240.0, 860.0)
     .hidden_title(true)
     .title_bar_style(tauri::TitleBarStyle::Overlay)
@@ -142,7 +142,7 @@ fn main() {
         .setup(|app| {
             ensure_daemon();
 
-            let open = MenuItemBuilder::with_id("open", "Open knowledge-system").build(app)?;
+            let open = MenuItemBuilder::with_id("open", "Open Grimoire").build(app)?;
             let garden = MenuItemBuilder::with_id("garden", "Run gardeners now").build(app)?;
             let restart = MenuItemBuilder::with_id("restart", "Restart daemon").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
