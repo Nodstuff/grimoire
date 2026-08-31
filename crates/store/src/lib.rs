@@ -127,6 +127,54 @@ pub trait BlockStore {
     /// date it *is* the daily digest (§3.5). `None` = across all docs.
     fn review_queue(&self, doc_id: Option<Uuid>) -> Result<Vec<ReviewItem>>;
 
+    /// Propose with every verdict capped at yellow: greens become applied,
+    /// flagged yellows (confidence kept). "Auto-tagging that lands as
+    /// reviewable yellows, declinable as a batch" — gardener confidence_policy
+    /// 'review' (§5).
+    fn propose_reviewed(
+        &mut self,
+        doc_id: Uuid,
+        base_epoch: i64,
+        principal: Uuid,
+        ops: Vec<OpInput>,
+    ) -> Result<ProposeOutcome>;
+
+    // --- gardener registry (4.1) + run log (4.5) ---
+
+    fn create_gardener(
+        &mut self,
+        name: &str,
+        task_prompt: &str,
+        scope_doc: Option<Uuid>,
+        confidence_policy: ConfidencePolicy,
+    ) -> Result<Gardener>;
+
+    fn list_gardeners(&self) -> Result<Vec<Gardener>>;
+
+    fn set_gardener_enabled(&mut self, id: Uuid, enabled: bool) -> Result<()>;
+
+    fn start_run(&mut self, gardener: Uuid) -> Result<Uuid>;
+
+    fn finish_run(
+        &mut self,
+        run: Uuid,
+        status: &str,
+        summary: &str,
+        tokens_used: Option<i64>,
+        tool_calls: Option<i64>,
+    ) -> Result<()>;
+
+    fn list_runs(&self, limit: usize) -> Result<Vec<GardenerRun>>;
+
+    // --- tags (2.12): extracted from frontmatter, queryable ---
+
+    fn list_tags(&self) -> Result<Vec<(String, i64)>>;
+
+    fn docs_by_tag(&self, tag: &str) -> Result<Vec<Doc>>;
+
+    /// Leaf docs (≥1 block) with no tags — the tagging gardener's worklist.
+    fn untagged_docs(&self, limit: usize) -> Result<Vec<Doc>>;
+
     /// Resolve one annotation. Invariant enforced here: proposer ≠ approver.
     /// - accept yellow: clear the annotation (the edit is already live)
     /// - decline yellow: revert via the op's pre-image, as a new green op by

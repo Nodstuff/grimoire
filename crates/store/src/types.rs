@@ -327,3 +327,54 @@ pub struct SearchHit {
     pub block: Block,
     pub doc_title: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfidencePolicy {
+    /// Every proposal lands as a reviewable yellow (declinable as a batch).
+    Review,
+    /// Normal gate verdicts (greens auto-apply).
+    Gate,
+}
+
+impl ConfidencePolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConfidencePolicy::Review => "review",
+            ConfidencePolicy::Gate => "gate",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "review" => Some(ConfidencePolicy::Review),
+            "gate" => Some(ConfidencePolicy::Gate),
+            _ => None,
+        }
+    }
+}
+
+/// A gardener is config, not construction (PROJECT.md §3.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gardener {
+    pub id: Uuid,
+    pub name: String,
+    pub principal: Uuid,
+    pub scope_doc: Option<Uuid>,
+    pub task_prompt: String,
+    pub bindings: serde_json::Value,
+    pub creds_ref: Option<String>,
+    pub schedule: String,
+    pub confidence_policy: ConfidencePolicy,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GardenerRun {
+    pub id: Uuid,
+    pub gardener: Uuid,
+    pub status: String,
+    pub summary: Option<String>,
+    pub tokens_used: Option<i64>,
+    pub tool_calls: Option<i64>,
+}

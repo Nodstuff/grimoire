@@ -109,3 +109,45 @@ CREATE TRIGGER IF NOT EXISTS blocks_fts_au AFTER UPDATE OF content ON blocks BEG
     INSERT INTO blocks_fts (blocks_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
     INSERT INTO blocks_fts (rowid, content) VALUES (new.rowid, new.content);
 END;
+
+-- Gardener registry (ticket 4.1): a gardener is config, not construction.
+CREATE TABLE IF NOT EXISTS gardeners (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,
+    principal     TEXT NOT NULL REFERENCES principals (id),
+    -- null scope = whole corpus; else this doc's subtree
+    scope_doc     TEXT REFERENCES docs (id),
+    task_prompt   TEXT NOT NULL,
+    -- e.g. [{"kind":"github","repo":"o/r","cursor_sha":null}] (ticket 4.7)
+    bindings      TEXT NOT NULL DEFAULT '[]',
+    creds_ref     TEXT,
+    schedule      TEXT NOT NULL DEFAULT 'daily',
+    -- 'review' = all proposals land as reviewable yellows; 'gate' = normal verdicts
+    confidence_policy TEXT NOT NULL DEFAULT 'review' CHECK (confidence_policy IN ('review', 'gate')),
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Run log (ticket 4.5): epoch cut provenance + budget accounting.
+CREATE TABLE IF NOT EXISTS gardener_runs (
+    id          TEXT PRIMARY KEY,
+    gardener    TEXT NOT NULL REFERENCES gardeners (id),
+    started_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    finished_at TEXT,
+    status      TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'ok', 'failed', 'budget-killed')),
+    summary     TEXT,
+    tokens_used INTEGER,
+    tool_calls  INTEGER
+);
+
+-- Tags (ticket 2.12): extracted from frontmatter blocks, per block like edges.
+CREATE TABLE IF NOT EXISTS doc_tags (
+    doc_id   TEXT NOT NULL REFERENCES docs (id),
+    block_id TEXT NOT NULL REFERENCES blocks (id),
+    tag      TEXT NOT NULL,
+    PRIMARY KEY (block_id, tag)
+);
+
+CREATE INDEX IF NOT EXISTS doc_tags_by_tag ON doc_tags (tag);
+CREATE INDEX IF NOT EXISTS doc_tags_by_doc ON doc_tags (doc_id);

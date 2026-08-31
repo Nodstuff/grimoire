@@ -58,7 +58,7 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 fn backfill(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -82,6 +82,23 @@ fn backfill(conn: &Connection) -> Result<()> {
             }
         }
     }
+    // v3: tags for frontmatter blocks that predate extraction
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, doc_id, content FROM blocks WHERE deleted = 0 AND content LIKE '---%'",
+        )?;
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, doc_id, content) in rows {
+            for tag in frontmatter_tags(&content) {
+                conn.execute(
+                    "INSERT OR IGNORE INTO doc_tags (doc_id, block_id, tag) VALUES (?1, ?2, ?3)",
+                    params![doc_id, id, tag],
+                )?;
+            }
+        }
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -101,6 +118,43 @@ fn wikilinks(content: &str) -> Vec<String> {
         rest = &after[end + 2..];
     }
     out
+}
+
+/// Tags from a frontmatter block: `tags:` followed by `- item` lines.
+fn frontmatter_tags(content: &str) -> Vec<String> {
+    if !content.starts_with("---") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut in_tags = false;
+    for line in content.lines() {
+        if in_tags {
+            let t = line.trim_start();
+            if let Some(item) = t.strip_prefix("- ") {
+                out.push(item.trim().trim_matches(['"', '\'']).to_lowercase());
+                continue;
+            }
+            in_tags = false;
+        }
+        if line.trim_end() == "tags:" {
+            in_tags = true;
+        }
+    }
+    out
+}
+
+fn set_tags(tx: &Transaction, doc_id: Uuid, block_id: Uuid, content: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM doc_tags WHERE block_id = ?1",
+        params![block_id.to_string()],
+    )?;
+    for tag in frontmatter_tags(content) {
+        tx.execute(
+            "INSERT OR IGNORE INTO doc_tags (doc_id, block_id, tag) VALUES (?1, ?2, ?3)",
+            params![doc_id.to_string(), block_id.to_string(), tag],
+        )?;
+    }
+    Ok(())
 }
 
 fn set_edges(tx: &Transaction, block_id: Uuid, content: &str) -> Result<()> {
@@ -362,6 +416,7 @@ fn project(tx: &Transaction, doc_id: Uuid, epoch: i64, principal: Uuid, op: &OpK
                 )));
             }
             set_edges(tx, *block_id, content)?;
+            set_tags(tx, doc_id, *block_id, content)?;
         }
         OpKind::Replace { target, content } => {
             live_block(tx, doc_id, *target, "replace target")?;
@@ -370,6 +425,7 @@ fn project(tx: &Transaction, doc_id: Uuid, epoch: i64, principal: Uuid, op: &OpK
                 params![content, epoch, target.to_string()],
             )?;
             set_edges(tx, *target, content)?;
+            set_tags(tx, doc_id, *target, content)?;
         }
         OpKind::Delete { target } => {
             live_block(tx, doc_id, *target, "delete target")?;
@@ -379,6 +435,10 @@ fn project(tx: &Transaction, doc_id: Uuid, epoch: i64, principal: Uuid, op: &OpK
             )?;
             tx.execute(
                 "DELETE FROM edges WHERE from_block = ?1",
+                params![target.to_string()],
+            )?;
+            tx.execute(
+                "DELETE FROM doc_tags WHERE block_id = ?1",
                 params![target.to_string()],
             )?;
         }
@@ -795,108 +855,202 @@ impl BlockStore for SqliteStore {
         principal: Uuid,
         ops: Vec<OpInput>,
     ) -> Result<ProposeOutcome> {
-        if ops.is_empty() {
-            return Err(StoreError::InvalidOp("propose: empty op list".into()));
-        }
-        let policy = self.effective_policy(doc_id)?;
-        let tx = self.conn.transaction()?;
-        let current = doc_epoch(&tx, doc_id)?;
-        if base_epoch > current {
-            return Err(StoreError::InvalidOp(format!(
-                "propose: base epoch {base_epoch} is ahead of doc epoch {current}"
-            )));
-        }
+        self.propose_impl(doc_id, base_epoch, principal, ops, false)
+    }
 
-        let candidate_epoch = current + 1;
-        let mut verdicts = Vec::with_capacity(ops.len());
-        let mut applied_any = false;
-        for op in &ops {
-            let op_id = Uuid::now_v7();
-            let mut scored = if base_epoch == current {
-                Scored {
-                    verdict: Verdict::Green,
-                    confidence: 1.0,
-                    note: "current base".into(),
-                }
-            } else {
-                let mut lookup = |id: Uuid| block_by_id(&tx, doc_id, id).ok().flatten();
-                score_stale_op(&op.kind, base_epoch, &mut lookup)
-            };
+    fn propose_reviewed(
+        &mut self,
+        doc_id: Uuid,
+        base_epoch: i64,
+        principal: Uuid,
+        ops: Vec<OpInput>,
+    ) -> Result<ProposeOutcome> {
+        self.propose_impl(doc_id, base_epoch, principal, ops, true)
+    }
 
-            let prior = match op.kind.target_block() {
-                Some(t) => block_by_id(&tx, doc_id, t)?,
-                None => None,
-            };
-
-            let mut applied = false;
-            if scored.verdict != Verdict::Red {
-                match project(&tx, doc_id, candidate_epoch, principal, &op.kind) {
-                    Ok(()) => applied = true,
-                    // content-level failure downgrades to a parked red;
-                    // the gate never errors on content
-                    Err(e @ (StoreError::InvalidOp(_) | StoreError::NotFound(_))) => {
-                        scored = Scored {
-                            verdict: Verdict::Red,
-                            confidence: 0.0,
-                            note: format!("projection failed: {e}"),
-                        };
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            insert_op_row(
-                &tx,
-                op_id,
-                doc_id,
-                op,
-                principal,
-                base_epoch,
-                applied.then_some(candidate_epoch),
-                scored.verdict,
-                scored.confidence,
-                &prior,
-            )?;
-            match scored.verdict {
-                Verdict::Green => {}
-                Verdict::Yellow => {
-                    // auto policy self-applies high-confidence yellows: no flag
-                    let auto_clean = policy == ReviewPolicy::Auto
-                        && scored.confidence >= crate::gate::HIGH_CONFIDENCE;
-                    if !auto_clean {
-                        insert_annotation(&tx, doc_id, op_id, AnnotationKind::Review)?;
-                    }
-                }
-                Verdict::Red => {
-                    insert_annotation(&tx, doc_id, op_id, AnnotationKind::Parked)?;
-                }
-            }
-            applied_any |= applied;
-            verdicts.push(ProposeVerdict {
-                op_id,
-                verdict: scored.verdict,
-                confidence: scored.confidence,
-                applied,
-                note: scored.note,
-            });
-        }
-
-        let epoch = if applied_any {
-            candidate_epoch
-        } else {
-            current
-        };
-        if applied_any {
-            tx.execute(
-                "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
-                params![epoch, doc_id.to_string()],
-            )?;
-        }
-        tx.commit()?;
-        Ok(ProposeOutcome {
-            doc_id,
-            epoch,
-            verdicts,
+    fn create_gardener(
+        &mut self,
+        name: &str,
+        task_prompt: &str,
+        scope_doc: Option<Uuid>,
+        confidence_policy: ConfidencePolicy,
+    ) -> Result<Gardener> {
+        // each gardener is its own principal: provenance is per-gardener
+        let principal = self.create_principal(PrincipalKind::Agent, name, None)?;
+        let id = Uuid::now_v7();
+        self.conn.execute(
+            "INSERT INTO gardeners (id, name, principal, scope_doc, task_prompt, confidence_policy)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id.to_string(),
+                name,
+                principal.id.to_string(),
+                scope_doc.map(|d| d.to_string()),
+                task_prompt,
+                confidence_policy.as_str(),
+            ],
+        )?;
+        Ok(Gardener {
+            id,
+            name: name.into(),
+            principal: principal.id,
+            scope_doc,
+            task_prompt: task_prompt.into(),
+            bindings: serde_json::json!([]),
+            creds_ref: None,
+            schedule: "daily".into(),
+            confidence_policy,
+            enabled: true,
         })
+    }
+
+    fn list_gardeners(&self) -> Result<Vec<Gardener>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, principal, scope_doc, task_prompt, bindings, creds_ref,
+                    schedule, confidence_policy, enabled
+             FROM gardeners ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, bool>(9)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (
+                id,
+                name,
+                principal,
+                scope,
+                task_prompt,
+                bindings,
+                creds_ref,
+                schedule,
+                cp,
+                enabled,
+            ) = r?;
+            Ok(Gardener {
+                id: uuid_col(id, "gardeners.id")?,
+                name,
+                principal: uuid_col(principal, "gardeners.principal")?,
+                scope_doc: scope
+                    .map(|d| uuid_col(d, "gardeners.scope_doc"))
+                    .transpose()?,
+                task_prompt,
+                bindings: serde_json::from_str(&bindings)?,
+                creds_ref,
+                schedule,
+                confidence_policy: ConfidencePolicy::parse(&cp)
+                    .ok_or_else(|| StoreError::InvalidOp(format!("bad confidence_policy: {cp}")))?,
+                enabled,
+            })
+        })
+        .collect()
+    }
+
+    fn set_gardener_enabled(&mut self, id: Uuid, enabled: bool) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE gardeners SET enabled = ?1 WHERE id = ?2",
+            params![enabled, id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("gardener {id}")));
+        }
+        Ok(())
+    }
+
+    fn start_run(&mut self, gardener: Uuid) -> Result<Uuid> {
+        let id = Uuid::now_v7();
+        self.conn.execute(
+            "INSERT INTO gardener_runs (id, gardener) VALUES (?1, ?2)",
+            params![id.to_string(), gardener.to_string()],
+        )?;
+        Ok(id)
+    }
+
+    fn finish_run(
+        &mut self,
+        run: Uuid,
+        status: &str,
+        summary: &str,
+        tokens_used: Option<i64>,
+        tool_calls: Option<i64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE gardener_runs
+             SET status = ?1, summary = ?2, tokens_used = ?3, tool_calls = ?4,
+                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?5",
+            params![status, summary, tokens_used, tool_calls, run.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn list_runs(&self, limit: usize) -> Result<Vec<GardenerRun>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, gardener, status, summary, tokens_used, tool_calls
+             FROM gardener_runs ORDER BY started_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (id, gardener, status, summary, tokens_used, tool_calls) = r?;
+            Ok(GardenerRun {
+                id: uuid_col(id, "runs.id")?,
+                gardener: uuid_col(gardener, "runs.gardener")?,
+                status,
+                summary,
+                tokens_used,
+                tool_calls,
+            })
+        })
+        .collect()
+    }
+
+    fn list_tags(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tag, count(DISTINCT doc_id) FROM doc_tags GROUP BY tag ORDER BY 2 DESC, tag",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.map(|r| Ok(r?)).collect()
+    }
+
+    fn docs_by_tag(&self, tag: &str) -> Result<Vec<Doc>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by
+             FROM docs d JOIN doc_tags t ON t.doc_id = d.id
+             WHERE t.tag = ?1 GROUP BY d.id ORDER BY d.title",
+        )?;
+        let rows = stmt.query_map(params![tag.to_lowercase()], row_to_doc)?;
+        rows.map(|r| build_doc(r?)).collect()
+    }
+
+    fn untagged_docs(&self, limit: usize) -> Result<Vec<Doc>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by
+             FROM docs d
+             WHERE EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0)
+               AND NOT EXISTS (SELECT 1 FROM doc_tags t WHERE t.doc_id = d.id)
+             ORDER BY d.title LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], row_to_doc)?;
+        rows.map(|r| build_doc(r?)).collect()
     }
 
     fn review_queue(&self, doc_id: Option<Uuid>) -> Result<Vec<ReviewItem>> {
@@ -1178,5 +1332,126 @@ fn fts_query(q: &str) -> Option<String> {
         None
     } else {
         Some(tris.join(" OR "))
+    }
+}
+
+impl SqliteStore {
+    fn propose_impl(
+        &mut self,
+        doc_id: Uuid,
+        base_epoch: i64,
+        principal: Uuid,
+        ops: Vec<OpInput>,
+        cap_review: bool,
+    ) -> Result<ProposeOutcome> {
+        if ops.is_empty() {
+            return Err(StoreError::InvalidOp("propose: empty op list".into()));
+        }
+        let policy = self.effective_policy(doc_id)?;
+        let tx = self.conn.transaction()?;
+        let current = doc_epoch(&tx, doc_id)?;
+        if base_epoch > current {
+            return Err(StoreError::InvalidOp(format!(
+                "propose: base epoch {base_epoch} is ahead of doc epoch {current}"
+            )));
+        }
+
+        let candidate_epoch = current + 1;
+        let mut verdicts = Vec::with_capacity(ops.len());
+        let mut applied_any = false;
+        for op in &ops {
+            let op_id = Uuid::now_v7();
+            let mut scored = if base_epoch == current {
+                Scored {
+                    verdict: Verdict::Green,
+                    confidence: 1.0,
+                    note: "current base".into(),
+                }
+            } else {
+                let mut lookup = |id: Uuid| block_by_id(&tx, doc_id, id).ok().flatten();
+                score_stale_op(&op.kind, base_epoch, &mut lookup)
+            };
+            // review cap: greens land as applied, flagged yellows (§5:
+            // auto-tagging as reviewable yellows, declinable as a batch)
+            if cap_review && scored.verdict == Verdict::Green {
+                scored.verdict = Verdict::Yellow;
+                scored.note = format!("review requested by proposer; {}", scored.note);
+            }
+
+            let prior = match op.kind.target_block() {
+                Some(t) => block_by_id(&tx, doc_id, t)?,
+                None => None,
+            };
+
+            let mut applied = false;
+            if scored.verdict != Verdict::Red {
+                match project(&tx, doc_id, candidate_epoch, principal, &op.kind) {
+                    Ok(()) => applied = true,
+                    // content-level failure downgrades to a parked red;
+                    // the gate never errors on content
+                    Err(e @ (StoreError::InvalidOp(_) | StoreError::NotFound(_))) => {
+                        scored = Scored {
+                            verdict: Verdict::Red,
+                            confidence: 0.0,
+                            note: format!("projection failed: {e}"),
+                        };
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            insert_op_row(
+                &tx,
+                op_id,
+                doc_id,
+                op,
+                principal,
+                base_epoch,
+                applied.then_some(candidate_epoch),
+                scored.verdict,
+                scored.confidence,
+                &prior,
+            )?;
+            match scored.verdict {
+                Verdict::Green => {}
+                Verdict::Yellow => {
+                    // auto policy self-applies high-confidence yellows: no flag
+                    let auto_clean = !cap_review
+                        && policy == ReviewPolicy::Auto
+                        && scored.confidence >= crate::gate::HIGH_CONFIDENCE;
+                    if !auto_clean {
+                        insert_annotation(&tx, doc_id, op_id, AnnotationKind::Review)?;
+                    }
+                }
+                Verdict::Red => {
+                    insert_annotation(&tx, doc_id, op_id, AnnotationKind::Parked)?;
+                }
+            }
+            applied_any |= applied;
+            verdicts.push(ProposeVerdict {
+                op_id,
+                verdict: scored.verdict,
+                confidence: scored.confidence,
+                applied,
+                note: scored.note,
+            });
+        }
+
+        let epoch = if applied_any {
+            candidate_epoch
+        } else {
+            current
+        };
+        if applied_any {
+            tx.execute(
+                "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
+                params![epoch, doc_id.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ProposeOutcome {
+            doc_id,
+            epoch,
+            verdicts,
+        })
     }
 }

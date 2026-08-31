@@ -129,3 +129,84 @@ fn comments_anchor_thread_and_stay_out_of_export() {
     let err = s.add_comment(other_para, tom.id, "cross-thread", Some(c1.id));
     assert!(matches!(err, Err(StoreError::InvalidOp(_))));
 }
+
+#[test]
+fn frontmatter_tags_extract_and_query() {
+    let (mut s, tom) = seed();
+    let d1 = add_doc(
+        &mut s,
+        &tom,
+        "daily",
+        "---\ntags:\n  - daily\n  - work\n---\n\n# Log\n",
+    );
+    add_doc(&mut s, &tom, "untagged", "# Plain\n\ncontent\n");
+
+    let tags = s.list_tags().unwrap();
+    assert!(tags.contains(&("daily".into(), 1)) && tags.contains(&("work".into(), 1)));
+    assert_eq!(s.docs_by_tag("daily").unwrap()[0].id, d1);
+    let untagged = s.untagged_docs(10).unwrap();
+    assert_eq!(untagged.len(), 1);
+    assert_eq!(untagged[0].title, "untagged");
+}
+
+#[test]
+fn propose_reviewed_caps_greens_at_yellow_and_is_batch_declinable() {
+    let (mut s, tom) = seed();
+    let agent = s
+        .create_principal(PrincipalKind::Agent, "tagger", None)
+        .unwrap();
+    let doc = add_doc(&mut s, &tom, "d", "# T\n\npara\n");
+    let epoch = s.get_doc(doc).unwrap().current_epoch;
+    let para = s.read_doc(doc).unwrap().roots[0].children[0].block.id;
+
+    let out = s
+        .propose_reviewed(
+            doc,
+            epoch,
+            agent.id,
+            vec![OpInput {
+                kind: OpKind::Replace {
+                    target: para,
+                    content: "para v2".into(),
+                },
+                source_refs: vec!["gardener:test".into()],
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        out.verdicts[0].verdict,
+        Verdict::Yellow,
+        "green capped to yellow"
+    );
+    assert!(out.verdicts[0].applied, "still applied — yellow semantics");
+    assert_eq!(s.read_block(para).unwrap().content, "para v2");
+
+    // declining reverts via pre-image: 'declined batch leaves no trace'
+    let ann = s.review_queue(Some(doc)).unwrap()[0].annotation.id;
+    s.resolve(ann, tom.id, ReviewDecision::Decline).unwrap();
+    assert_eq!(s.read_block(para).unwrap().content, "para");
+    assert!(s.review_queue(Some(doc)).unwrap().is_empty());
+}
+
+#[test]
+fn gardener_registry_crud_and_runs() {
+    let (mut s, _tom) = seed();
+    let g = s
+        .create_gardener("tagging", "tag the docs", None, ConfidencePolicy::Review)
+        .unwrap();
+    assert_eq!(s.list_gardeners().unwrap().len(), 1);
+    // distinct principal per gardener
+    let p = s.get_principal(g.principal).unwrap();
+    assert_eq!(p.kind, PrincipalKind::Agent);
+    assert_eq!(p.display_name, "tagging");
+
+    let run = s.start_run(g.id).unwrap();
+    s.finish_run(run, "ok", "verdicts: 3 yellow", Some(1200), Some(0))
+        .unwrap();
+    let runs = s.list_runs(5).unwrap();
+    assert_eq!(runs[0].status, "ok");
+    assert_eq!(runs[0].tokens_used, Some(1200));
+
+    s.set_gardener_enabled(g.id, false).unwrap();
+    assert!(!s.list_gardeners().unwrap()[0].enabled);
+}
