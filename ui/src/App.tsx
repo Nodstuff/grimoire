@@ -419,7 +419,26 @@ function DocView({
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
   const [panel, setPanel] = useState<'none' | 'history' | 'comments'>('none')
   const [selBlock, setSelBlock] = useState<string | null>(null)
+  const [selRect, setSelRect] = useState<{ x: number; y: number } | null>(null)
   const [commentTarget, setCommentTarget] = useState<string | null>(null)
+
+  // anchor the comment bubble just above the selected text
+  const onSelectionBlock = useCallback((blockId: string | null) => {
+    setSelBlock(blockId)
+    if (!blockId) {
+      setSelRect(null)
+      return
+    }
+    requestAnimationFrame(() => {
+      const sel = window.getSelection()
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+        setSelRect(null)
+        return
+      }
+      const r = sel.getRangeAt(0).getBoundingClientRect()
+      setSelRect({ x: r.left + r.width / 2, y: r.top })
+    })
+  }, [])
 
   const loadTree = useCallback(() => {
     api<DocTree>(`/api/doc/${docId}`).then(setTree).catch(console.error)
@@ -492,17 +511,20 @@ function DocView({
           </button>
         </span>
       </div>
-      <DocEditor doc={editable} onSaved={() => {}} onSelectionBlock={setSelBlock} />
-      {selBlock && panel !== 'comments' && (
+      <DocEditor doc={editable} onSaved={() => {}} onSelectionBlock={onSelectionBlock} />
+      {selBlock && selRect && panel !== 'comments' && (
         <button
           className="sel-comment"
+          style={{ left: selRect.x, top: selRect.y }}
+          title="comment on selection"
           onMouseDown={(e) => {
             e.preventDefault()
             setCommentTarget(selBlock)
             setPanel('comments')
+            setSelRect(null)
           }}
         >
-          comment on selection
+          💬
         </button>
       )}
       {panel === 'history' && <HistoryPanel docId={docId} onClose={() => setPanel('none')} />}

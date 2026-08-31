@@ -455,17 +455,23 @@ kbd {
 
 .sel-comment {
   position: fixed;
-  bottom: 16px;
-  left: 50%;
-  transform: translateX(-50%);
+  transform: translate(-50%, calc(-100% - 8px));
   background: var(--panel);
   border: 1px solid var(--border);
-  color: var(--accent);
-  border-radius: 16px;
-  padding: 5px 16px;
-  font-size: 12px;
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  font-size: 14px;
+  line-height: 1;
   cursor: pointer;
   z-index: 25;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+  animation: bubble-in 0.12s ease-out;
+}
+.sel-comment:hover { border-color: var(--accent); }
+@keyframes bubble-in {
+  from { opacity: 0; transform: translate(-50%, calc(-100% - 2px)); }
+  to { opacity: 1; transform: translate(-50%, calc(-100% - 8px)); }
 }
 
 /* ---------- graph view ---------- */
@@ -487,4 +493,25 @@ kbd {
   height: 9px;
   border-radius: 50%;
   margin-right: 5px;
+}
+
+/* ---------- diagram previews ---------- */
+
+.codeblock-view { position: relative; }
+.diagram {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  margin: -8px 0 16px;
+  overflow-x: auto;
+  display: flex;
+  justify-content: center;
+}
+.diagram svg { max-width: 100%; height: auto; }
+.diagram-err {
+  color: var(--red);
+  font-size: 11px;
+  margin: -10px 0 16px;
+  opacity: 0.8;
 }
