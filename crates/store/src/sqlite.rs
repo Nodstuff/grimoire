@@ -1330,6 +1330,43 @@ fn parse_annotation_status(s: &str) -> Result<AnnotationStatus> {
     }
 }
 
+impl SqliteStore {
+    /// (doc_id, principal) of each doc's last applied op — "who tends this".
+    pub fn raw_tending(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT doc_id, principal, max(epoch_applied) FROM ops
+             WHERE epoch_applied IS NOT NULL GROUP BY doc_id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.map(|r| Ok(r?)).collect()
+    }
+
+    /// Doc-to-doc edges: wikilinks resolved by title (graph view, 5.10).
+    pub fn raw_links(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT b.doc_id, d2.id
+             FROM edges e
+             JOIN blocks b ON b.id = e.from_block AND b.deleted = 0
+             JOIN docs d2 ON (e.to_target = d2.title OR e.to_target LIKE '%/' || d2.title)
+             WHERE b.doc_id != d2.id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.map(|r| Ok(r?)).collect()
+    }
+
+    /// doc_id → tags (graph clustering).
+    pub fn raw_doc_tags(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let mut stmt = self.conn.prepare("SELECT doc_id, tag FROM doc_tags ORDER BY doc_id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for r in rows {
+            let (d, t) = r?;
+            out.entry(d).or_default().push(t);
+        }
+        Ok(out)
+    }
+}
+
 fn b_cols() -> String {
     BLOCK_COLS
         .split(", ")

@@ -204,6 +204,49 @@ async fn add_comment(State(st): State<ApiState>, Json(req): Json<CommentReq>) ->
     }
 }
 
+/// Graph view data (5.10): nodes = docs (tinted by tending principal —
+/// the principal of the doc's last applied op), links = resolved wikilinks.
+async fn graph(State(st): State<ApiState>) -> Json<Value> {
+    let s = st.store.lock().unwrap();
+    let docs = match s.list_docs() {
+        Ok(d) => d,
+        Err(e) => return Json(json!({"error": e.to_string()})),
+    };
+    let mut tenders: std::collections::HashMap<String, String> = Default::default();
+    let mut names: std::collections::HashMap<String, String> = Default::default();
+    if let Ok(principals) = s.list_principals() {
+        for p in principals {
+            names.insert(p.id.to_string(), p.display_name);
+        }
+    }
+    // last applied op per doc = who tends it
+    if let Ok(rows) = s.raw_tending() {
+        for (doc, principal) in rows {
+            if let Some(name) = names.get(&principal) {
+                tenders.insert(doc, name.clone());
+            }
+        }
+    }
+    let links = s.raw_links().unwrap_or_default();
+    let tags = s.raw_doc_tags().unwrap_or_default();
+    let nodes: Vec<Value> = docs
+        .iter()
+        .map(|d| {
+            json!({
+                "id": d.id,
+                "title": d.title,
+                "tender": tenders.get(&d.id.to_string()),
+                "tags": tags.get(&d.id.to_string()).cloned().unwrap_or_default(),
+            })
+        })
+        .collect();
+    let links: Vec<Value> = links
+        .into_iter()
+        .map(|(a, b)| json!({"source": a, "target": b}))
+        .collect();
+    Json(json!({"nodes": nodes, "links": links}))
+}
+
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/docs", get(docs).post(create_doc))
@@ -218,5 +261,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/search", get(search))
         .route("/api/tags", get(tags))
         .route("/api/runs", get(runs))
+        .route("/api/graph", get(graph))
         .with_state(state)
 }
