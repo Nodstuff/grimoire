@@ -610,3 +610,20 @@ kbd {
   overflow: hidden;
   position: relative;
 }
+
+/* ---------- tables ---------- */
+
+.ProseMirror table {
+  border-collapse: collapse;
+  margin: 0 0 16px;
+  width: 100%;
+  font-size: 13px;
+}
+.ProseMirror th, .ProseMirror td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.ProseMirror th { background: var(--panel); font-weight: 600; }
+.ProseMirror .selectedCell { background: rgba(139, 157, 195, 0.12); }
