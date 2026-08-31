@@ -1,0 +1,235 @@
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrincipalKind {
+    Human,
+    Agent,
+    Remote,
+}
+
+impl PrincipalKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PrincipalKind::Human => "human",
+            PrincipalKind::Agent => "agent",
+            PrincipalKind::Remote => "remote",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "human" => Some(PrincipalKind::Human),
+            "agent" => Some(PrincipalKind::Agent),
+            "remote" => Some(PrincipalKind::Remote),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Principal {
+    pub id: Uuid,
+    pub kind: PrincipalKind,
+    pub display_name: String,
+    pub pubkey: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewPolicy {
+    HumanReview,
+    AgentReview,
+    Auto,
+}
+
+impl ReviewPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewPolicy::HumanReview => "human-review",
+            ReviewPolicy::AgentReview => "agent-review",
+            ReviewPolicy::Auto => "auto",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "human-review" => Some(ReviewPolicy::HumanReview),
+            "agent-review" => Some(ReviewPolicy::AgentReview),
+            "auto" => Some(ReviewPolicy::Auto),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Doc {
+    pub id: Uuid,
+    pub parent_id: Option<Uuid>,
+    pub title: String,
+    pub review_policy: Option<ReviewPolicy>,
+    pub current_epoch: i64,
+    pub created_by: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockType {
+    Paragraph,
+    Heading,
+    Code,
+    DiagramD2,
+    DiagramMermaid,
+    CanvasScene,
+    Comment,
+    Decision,
+}
+
+impl BlockType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BlockType::Paragraph => "paragraph",
+            BlockType::Heading => "heading",
+            BlockType::Code => "code",
+            BlockType::DiagramD2 => "diagram_d2",
+            BlockType::DiagramMermaid => "diagram_mermaid",
+            BlockType::CanvasScene => "canvas_scene",
+            BlockType::Comment => "comment",
+            BlockType::Decision => "decision",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "paragraph" => Some(BlockType::Paragraph),
+            "heading" => Some(BlockType::Heading),
+            "code" => Some(BlockType::Code),
+            "diagram_d2" => Some(BlockType::DiagramD2),
+            "diagram_mermaid" => Some(BlockType::DiagramMermaid),
+            "canvas_scene" => Some(BlockType::CanvasScene),
+            "comment" => Some(BlockType::Comment),
+            "decision" => Some(BlockType::Decision),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Block {
+    pub id: Uuid,
+    pub doc_id: Uuid,
+    pub parent_id: Option<Uuid>,
+    pub order_key: String,
+    pub block_type: BlockType,
+    pub content: String,
+    pub created_by: Uuid,
+    pub epoch: i64,
+    pub deleted: bool,
+}
+
+/// A doc's blocks as a tree, children ordered by `order_key`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockNode {
+    pub block: Block,
+    pub children: Vec<BlockNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DocTree {
+    pub doc: Doc,
+    pub roots: Vec<BlockNode>,
+}
+
+/// The block-level operations — exactly these, never finer (PROJECT.md §3.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum OpKind {
+    Insert {
+        block_id: Uuid,
+        parent_id: Option<Uuid>,
+        order_key: String,
+        block_type: BlockType,
+        content: String,
+    },
+    Replace {
+        target: Uuid,
+        content: String,
+    },
+    Delete {
+        target: Uuid,
+    },
+    Move {
+        target: Uuid,
+        new_parent: Option<Uuid>,
+        new_order_key: String,
+    },
+}
+
+impl OpKind {
+    pub fn op_type(&self) -> &'static str {
+        match self {
+            OpKind::Insert { .. } => "insert",
+            OpKind::Replace { .. } => "replace",
+            OpKind::Delete { .. } => "delete",
+            OpKind::Move { .. } => "move",
+        }
+    }
+
+    pub fn target_block(&self) -> Option<Uuid> {
+        match self {
+            OpKind::Insert { block_id, .. } => Some(*block_id),
+            OpKind::Replace { target, .. }
+            | OpKind::Delete { target }
+            | OpKind::Move { target, .. } => Some(*target),
+        }
+    }
+}
+
+/// One proposed/applied operation with its provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpInput {
+    pub kind: OpKind,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    Green,
+    Yellow,
+    Red,
+}
+
+impl Verdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Verdict::Green => "green",
+            Verdict::Yellow => "yellow",
+            Verdict::Red => "red",
+        }
+    }
+}
+
+/// A ledger row: the primary write record.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LedgerOp {
+    pub id: Uuid,
+    pub doc_id: Uuid,
+    pub kind: OpKind,
+    pub principal: Uuid,
+    pub base_epoch: i64,
+    pub epoch_applied: Option<i64>,
+    pub verdict: Option<Verdict>,
+    pub confidence: Option<f64>,
+    pub source_refs: Vec<String>,
+}
+
+/// Result of a committed `apply`: one transaction, one epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApplyReceipt {
+    pub doc_id: Uuid,
+    pub epoch: i64,
+    pub op_ids: Vec<Uuid>,
+}
