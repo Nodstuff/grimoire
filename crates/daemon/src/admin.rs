@@ -109,6 +109,31 @@ async fn list_runs(State(store): State<Store>, Query(q): Query<RunsQuery>) -> Js
 }
 
 #[derive(Deserialize)]
+pub struct UpdateGardener {
+    pub id: Uuid,
+    pub task_prompt: String,
+    pub schedule: String,
+    pub confidence_policy: String,
+    pub scope_doc: Option<Uuid>,
+    pub enabled: bool,
+}
+
+async fn update_gardener(
+    State(store): State<Store>,
+    Json(req): Json<UpdateGardener>,
+) -> Json<Value> {
+    let Some(policy) = ConfidencePolicy::parse(&req.confidence_policy) else {
+        return Json(json!({"error": format!("bad confidence_policy: {}", req.confidence_policy)}));
+    };
+    let mut s = store.lock().unwrap();
+    match s.update_gardener(req.id, &req.task_prompt, &req.schedule, policy, req.scope_doc, req.enabled)
+    {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct PolicyReq {
     pub doc_id: Uuid,
     /// "human-review" | "agent-review" | "auto" | null to clear (inherit)
@@ -137,6 +162,7 @@ pub fn router(store: Store) -> Router {
             get(list_gardeners).post(create_gardener),
         )
         .route("/admin/garden", post(run_now))
+        .route("/admin/gardeners/update", post(update_gardener))
         .route("/admin/runs", get(list_runs))
         .route("/admin/policy", post(set_policy))
         .with_state(store)

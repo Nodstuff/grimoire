@@ -1033,6 +1033,34 @@ impl BlockStore for SqliteStore {
         Ok(())
     }
 
+    fn update_gardener(
+        &mut self,
+        id: Uuid,
+        task_prompt: &str,
+        schedule: &str,
+        confidence_policy: ConfidencePolicy,
+        scope_doc: Option<Uuid>,
+        enabled: bool,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE gardeners SET task_prompt = ?1, schedule = ?2, confidence_policy = ?3,
+                    scope_doc = ?4, enabled = ?5
+             WHERE id = ?6",
+            params![
+                task_prompt,
+                schedule,
+                confidence_policy.as_str(),
+                scope_doc.map(|d| d.to_string()),
+                enabled,
+                id.to_string(),
+            ],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("gardener {id}")));
+        }
+        Ok(())
+    }
+
     fn start_run(&mut self, gardener: Uuid) -> Result<Uuid> {
         let id = Uuid::now_v7();
         self.conn.execute(
@@ -1062,24 +1090,29 @@ impl BlockStore for SqliteStore {
 
     fn list_runs(&self, limit: usize) -> Result<Vec<GardenerRun>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, gardener, status, summary, tokens_used, tool_calls
-             FROM gardener_runs ORDER BY started_at DESC LIMIT ?1",
+            "SELECT r.id, r.gardener, g.name, r.started_at, r.status, r.summary, r.tokens_used, r.tool_calls
+             FROM gardener_runs r JOIN gardeners g ON g.id = r.gardener
+             ORDER BY r.started_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<i64>>(4)?,
-                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
             ))
         })?;
         rows.map(|r| {
-            let (id, gardener, status, summary, tokens_used, tool_calls) = r?;
+            let (id, gardener, gardener_name, started_at, status, summary, tokens_used, tool_calls) = r?;
             Ok(GardenerRun {
                 id: uuid_col(id, "runs.id")?,
                 gardener: uuid_col(gardener, "runs.gardener")?,
+                gardener_name,
+                started_at,
                 status,
                 summary,
                 tokens_used,

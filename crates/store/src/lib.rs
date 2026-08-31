@@ -158,6 +158,17 @@ pub trait BlockStore {
 
     fn set_gardener_enabled(&mut self, id: Uuid, enabled: bool) -> Result<()>;
 
+    /// Update a gardener's config (4.1: create/edit/disable without code changes).
+    fn update_gardener(
+        &mut self,
+        id: Uuid,
+        task_prompt: &str,
+        schedule: &str,
+        confidence_policy: ConfidencePolicy,
+        scope_doc: Option<Uuid>,
+        enabled: bool,
+    ) -> Result<()>;
+
     fn start_run(&mut self, gardener: Uuid) -> Result<Uuid>;
 
     fn finish_run(

@@ -160,8 +160,22 @@ fn parse_json_result<T: serde::de::DeserializeOwned>(result: &str) -> Result<T, 
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```"))
         .map(|s| s.trim_end_matches("```"))
-        .unwrap_or(trimmed);
-    serde_json::from_str(json.trim()).map_err(|e| format!("proposals did not parse: {e}"))
+        .unwrap_or(trimmed)
+        .trim();
+    if let Ok(v) = serde_json::from_str(json) {
+        return Ok(v);
+    }
+    // salvage: models sometimes append prose after the JSON — parse the first
+    // JSON value and ignore trailing characters
+    let start = json
+        .find(['[', '{'])
+        .ok_or_else(|| "no JSON in model output".to_string())?;
+    let mut stream = serde_json::Deserializer::from_str(&json[start..]).into_iter::<T>();
+    match stream.next() {
+        Some(Ok(v)) => Ok(v),
+        Some(Err(e)) => Err(format!("proposals did not parse: {e}")),
+        None => Err("no JSON in model output".to_string()),
+    }
 }
 
 fn parse_proposals(result: &str) -> Result<Vec<TagProposal>, String> {
