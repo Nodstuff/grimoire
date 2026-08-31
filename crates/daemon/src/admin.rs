@@ -124,6 +124,8 @@ pub struct UpdateGardener {
     pub confidence_policy: String,
     pub scope_doc: Option<Uuid>,
     pub enabled: bool,
+    #[serde(default)]
+    pub bindings: serde_json::Value,
 }
 
 async fn update_gardener(
@@ -136,6 +138,11 @@ async fn update_gardener(
     let mut s = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let bindings = if req.bindings.is_null() {
+        serde_json::json!([])
+    } else {
+        req.bindings
+    };
     match s.update_gardener(
         req.id,
         &req.task_prompt,
@@ -143,6 +150,7 @@ async fn update_gardener(
         policy,
         req.scope_doc,
         req.enabled,
+        bindings,
     ) {
         Ok(()) => Json(json!({"ok": true})),
         Err(e) => Json(json!({"error": e.to_string()})),

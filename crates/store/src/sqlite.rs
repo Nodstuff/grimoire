@@ -1041,17 +1041,19 @@ impl BlockStore for SqliteStore {
         confidence_policy: ConfidencePolicy,
         scope_doc: Option<Uuid>,
         enabled: bool,
+        bindings: serde_json::Value,
     ) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE gardeners SET task_prompt = ?1, schedule = ?2, confidence_policy = ?3,
-                    scope_doc = ?4, enabled = ?5
-             WHERE id = ?6",
+                    scope_doc = ?4, enabled = ?5, bindings = ?6
+             WHERE id = ?7",
             params![
                 task_prompt,
                 schedule,
                 confidence_policy.as_str(),
                 scope_doc.map(|d| d.to_string()),
                 enabled,
+                serde_json::to_string(&bindings)?,
                 id.to_string(),
             ],
         )?;
