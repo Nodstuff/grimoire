@@ -247,6 +247,50 @@ async fn graph(State(st): State<ApiState>) -> Json<Value> {
     Json(json!({"nodes": nodes, "links": links}))
 }
 
+#[derive(Deserialize)]
+struct D2Req {
+    source: String,
+}
+
+/// Render D2 to SVG by shelling to the d2 binary (5.7). Text-to-diagram
+/// only — the diagram block's content stays the source of truth.
+async fn render_d2(Json(req): Json<D2Req>) -> Json<Value> {
+    let bin = ["d2", "/opt/homebrew/bin/d2", "/usr/local/bin/d2"]
+        .iter()
+        .find(|b| {
+            std::process::Command::new(b)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+        .copied();
+    let Some(bin) = bin else {
+        return Json(json!({"error": "d2 binary not installed (brew install d2)"}));
+    };
+    let out = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut child = std::process::Command::new(bin)
+            .args(["--theme", "200", "-", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(req.source.as_bytes())?;
+        child.wait_with_output()
+    })
+    .await;
+    match out {
+        Ok(Ok(o)) if o.status.success() => {
+            Json(json!({"svg": String::from_utf8_lossy(&o.stdout)}))
+        }
+        Ok(Ok(o)) => Json(json!({"error": String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>()})),
+        _ => Json(json!({"error": "d2 render failed"})),
+    }
+}
+
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/docs", get(docs).post(create_doc))
@@ -262,5 +306,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/tags", get(tags))
         .route("/api/runs", get(runs))
         .route("/api/graph", get(graph))
+        .route("/api/render/d2", post(render_d2))
         .with_state(state)
 }

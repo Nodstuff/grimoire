@@ -3,9 +3,11 @@
 // against the loaded baseline and proposes block ops through the gate.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { EditorContent, useEditor } from '@tiptap/react'
+import { EditorContent, ReactNodeViewRenderer, useEditor } from '@tiptap/react'
 import { Extension, getSchema } from '@tiptap/core'
 import StarterKit from '@tiptap/starter-kit'
+import CodeBlock from '@tiptap/extension-code-block'
+import CodeBlockView from './CodeBlockView'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block } from '../types'
 import { BaselineBlock, Entry, computeOps } from './diff'
@@ -40,7 +42,15 @@ const BlockId = Extension.create({
   },
 })
 
-const extensions = [StarterKit.configure({ link: { openOnClick: false } }), BlockId]
+const extensions = [
+  StarterKit.configure({ link: { openOnClick: false }, codeBlock: false }),
+  CodeBlock.extend({
+    addNodeView() {
+      return ReactNodeViewRenderer(CodeBlockView)
+    },
+  }),
+  BlockId,
+]
 const schema = getSchema(extensions)
 const parser = makeParser(schema)
 const serializer = makeSerializer()
