@@ -576,3 +576,6 @@ kbd {
   font: 12px ui-monospace, monospace;
   outline: none;
 }
+
+.card.flag { border-left: 3px solid var(--accent); }
+.flag-text { font-size: 13px; margin: 6px 0; white-space: pre-wrap; }

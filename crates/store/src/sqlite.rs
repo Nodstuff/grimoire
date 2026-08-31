@@ -1435,6 +1435,36 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Open agent flags: comment blocks authored by agent principals, with
+    /// doc title, author name, and the anchored block's content.
+    pub fn agent_flags(&self) -> Result<Vec<(Block, String, String, Option<String>)>> {
+        let sql = format!(
+            "SELECT {}, d.title, p.display_name, t.content
+             FROM blocks b
+             JOIN docs d ON d.id = b.doc_id
+             JOIN principals p ON p.id = b.created_by AND p.kind = 'agent'
+             LEFT JOIN blocks t ON t.id = b.refers_to
+             WHERE b.block_type = 'comment' AND b.deleted = 0
+             ORDER BY b.id DESC",
+            b_cols()
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| {
+            let raw = row_to_block(r)?;
+            Ok((
+                raw,
+                r.get::<_, String>(10)?,
+                r.get::<_, String>(11)?,
+                r.get::<_, Option<String>>(12)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (raw, title, author, target) = r?;
+            Ok((build_block(raw)?, title, author, target))
+        })
+        .collect()
+    }
+
     /// (doc_id, principal) of each doc's last applied op — "who tends this".
     pub fn raw_tending(&self) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(

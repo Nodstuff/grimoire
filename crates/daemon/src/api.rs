@@ -364,6 +364,59 @@ async fn set_status(
     }
 }
 
+/// Agent audit flags: comments by agent principals, queue-adjacent surface.
+async fn flags(State(st): State<ApiState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.agent_flags() {
+        Ok(rows) => Json(json!(
+            rows.into_iter()
+                .map(|(block, doc_title, author, target_content)| json!({
+                    "block": block,
+                    "doc_title": doc_title,
+                    "author": author,
+                    "target_content": target_content,
+                }))
+                .collect::<Vec<_>>()
+        )),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+struct DismissReq {
+    comment_id: Uuid,
+}
+
+/// Dismiss a flag: delete the comment block through the gate as the human.
+async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let block = match s.read_block(req.comment_id) {
+        Ok(b) if b.block_type == ks_store::BlockType::Comment => b,
+        Ok(_) => return Json(json!({"error": "not a comment block"})),
+        Err(e) => return Json(json!({"error": e.to_string()})),
+    };
+    let epoch = match s.get_doc(block.doc_id) {
+        Ok(d) => d.current_epoch,
+        Err(e) => return Json(json!({"error": e.to_string()})),
+    };
+    let op = OpInput {
+        kind: ks_store::OpKind::Delete {
+            target: req.comment_id,
+        },
+        source_refs: vec!["flag:dismissed".into()],
+    };
+    match s.propose(block.doc_id, epoch, st.human, vec![op]) {
+        Ok(_) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/docs", get(docs).post(create_doc))
@@ -371,6 +424,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/doc/{id}", get(doc))
         .route("/api/doc/{id}/backlinks", get(backlinks))
         .route("/api/queue", get(queue))
+        .route("/api/flags", get(flags))
+        .route("/api/flags/dismiss", post(dismiss_flag))
         .route("/api/principals", get(principals))
         .route("/api/doc/{id}/history", get(history))
         .route("/api/doc/{id}/status", post(set_status))
