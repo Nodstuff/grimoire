@@ -3,6 +3,8 @@
 //! One process owns the SQLite file and serves every surface. Tonight:
 //! MCP over streamable HTTP at /mcp. Web UI routes come later (M5).
 
+mod admin;
+mod garden;
 mod mcp;
 
 use anyhow::Context;
@@ -22,11 +24,37 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum GardenerCmd {
+    Add {
+        name: String,
+        task_prompt: String,
+        #[arg(long)]
+        scope_doc: Option<String>,
+        /// review (default: everything lands as reviewable yellows) or gate
+        #[arg(long)]
+        policy: Option<String>,
+    },
+    List,
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Import a markdown vault (one-shot).
     Import { dir: PathBuf },
     /// Export all docs to a markdown directory tree.
     Export { dir: PathBuf },
+    /// Manage gardeners (talks to the running daemon).
+    Gardener {
+        #[command(subcommand)]
+        cmd: GardenerCmd,
+    },
+    /// Run gardeners now (talks to the running daemon).
+    Garden {
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Recent gardener runs (talks to the running daemon).
+    Runs,
     /// Serve MCP over streamable HTTP.
     Serve {
         #[arg(long, default_value_t = 7425)]
@@ -104,9 +132,54 @@ async fn main() -> anyhow::Result<()> {
             let report = ks_store::export::export_vault(&store, &dir)?;
             println!("exported {} files to {}", report.files, dir.display());
         }
+        Cmd::Gardener { cmd } => {
+            let client = reqwest::Client::new();
+            let base = "http://127.0.0.1:7425";
+            match cmd {
+                GardenerCmd::Add {
+                    name,
+                    task_prompt,
+                    scope_doc,
+                    policy,
+                } => {
+                    let body = serde_json::json!({
+                        "name": name,
+                        "task_prompt": task_prompt,
+                        "scope_doc": scope_doc,
+                        "confidence_policy": policy,
+                    });
+                    let r = client
+                        .post(format!("{base}/admin/gardeners"))
+                        .json(&body)
+                        .send()
+                        .await?;
+                    println!("{}", r.text().await?);
+                }
+                GardenerCmd::List => {
+                    let r = client.get(format!("{base}/admin/gardeners")).send().await?;
+                    println!("{}", r.text().await?);
+                }
+            }
+        }
+        Cmd::Garden { name } => {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(600))
+                .build()?;
+            let r = client
+                .post("http://127.0.0.1:7425/admin/garden")
+                .json(&serde_json::json!({ "name": name }))
+                .send()
+                .await?;
+            println!("{}", r.text().await?);
+        }
+        Cmd::Runs => {
+            let r = reqwest::get("http://127.0.0.1:7425/admin/runs").await?;
+            println!("{}", r.text().await?);
+        }
         Cmd::Serve { port } => {
             let store = Arc::new(Mutex::new(store));
-            let app = mcp::router(store, claude);
+            tokio::spawn(admin::daily_loop(store.clone()));
+            let app = mcp::router(store.clone(), claude).merge(admin::router(store));
             let addr = format!("127.0.0.1:{port}");
             tracing::info!("ksd serving MCP (streamable HTTP) at http://{addr}/mcp");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
