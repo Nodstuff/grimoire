@@ -52,8 +52,27 @@ CREATE TABLE IF NOT EXISTS ops (
     epoch_applied INTEGER,
     verdict       TEXT CHECK (verdict IN ('green', 'yellow', 'red')),
     confidence    REAL,
+    -- pre-image of the affected block as JSON (NULL for inserts):
+    -- powers decline-revert, red parking with verbatim originals, and history
+    prior         TEXT,
     source_refs   TEXT NOT NULL DEFAULT '[]',
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS ops_by_doc_epoch ON ops (doc_id, epoch_applied);
+
+-- Review state lives as annotations referencing ops — never baked into content
+-- (PROJECT.md §2). Accepting a yellow is clearing an annotation, not an edit.
+CREATE TABLE IF NOT EXISTS annotations (
+    id          TEXT PRIMARY KEY,
+    doc_id      TEXT NOT NULL REFERENCES docs (id),
+    op_id       TEXT NOT NULL REFERENCES ops (id),
+    -- review = applied yellow awaiting review; parked = red, not applied
+    kind        TEXT NOT NULL CHECK (kind IN ('review', 'parked')),
+    status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'accepted', 'declined')),
+    resolved_by TEXT REFERENCES principals (id),
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    resolved_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS annotations_open ON annotations (doc_id, status);

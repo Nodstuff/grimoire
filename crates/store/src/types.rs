@@ -223,6 +223,9 @@ pub struct LedgerOp {
     pub epoch_applied: Option<i64>,
     pub verdict: Option<Verdict>,
     pub confidence: Option<f64>,
+    /// Pre-image of the affected block (None for inserts): powers
+    /// decline-revert, verbatim red parking, and before/after diffs.
+    pub prior: Option<Block>,
     pub source_refs: Vec<String>,
 }
 
@@ -232,4 +235,82 @@ pub struct ApplyReceipt {
     pub doc_id: Uuid,
     pub epoch: i64,
     pub op_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnnotationKind {
+    /// Applied yellow awaiting review.
+    Review,
+    /// Red: parked, never applied.
+    Parked,
+}
+
+impl AnnotationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AnnotationKind::Review => "review",
+            AnnotationKind::Parked => "parked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnnotationStatus {
+    Open,
+    Accepted,
+    Declined,
+}
+
+impl AnnotationStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AnnotationStatus::Open => "open",
+            AnnotationStatus::Accepted => "accepted",
+            AnnotationStatus::Declined => "declined",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Annotation {
+    pub id: Uuid,
+    pub doc_id: Uuid,
+    pub op_id: Uuid,
+    pub kind: AnnotationKind,
+    pub status: AnnotationStatus,
+    pub resolved_by: Option<Uuid>,
+}
+
+/// Per-op outcome of a `propose` call: structured, no prose parsing (§3.3).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProposeVerdict {
+    pub op_id: Uuid,
+    pub verdict: Verdict,
+    pub confidence: f64,
+    pub applied: bool,
+    /// Placement context for the reviewer/agent, e.g. why an op went red.
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProposeOutcome {
+    pub doc_id: Uuid,
+    /// Doc epoch after the call (unchanged when nothing applied).
+    pub epoch: i64,
+    pub verdicts: Vec<ProposeVerdict>,
+}
+
+/// A review-queue entry: the annotation plus the op it references.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReviewItem {
+    pub annotation: Annotation,
+    pub op: LedgerOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Accept,
+    Decline,
 }

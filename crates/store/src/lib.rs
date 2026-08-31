@@ -3,6 +3,7 @@
 //! Ledger (`ops`) is the primary write record; `blocks` is the projection,
 //! written in the same transaction. One committed `apply` = one epoch.
 
+pub mod gate;
 pub mod order_key;
 mod sqlite;
 mod types;
@@ -66,4 +67,36 @@ pub trait BlockStore {
 
     /// Ledger ops applied after `since_epoch`, oldest first (tool 3.6's SELECT).
     fn ops_since(&self, doc_id: Uuid, since_epoch: i64) -> Result<Vec<LedgerOp>>;
+
+    /// The propose gate (ticket 2.5): the write path for agents and for any
+    /// stale base. Current base → all green, applied. Stale base → per-op
+    /// verdicts via `gate::score_stale_op`: greens apply; yellows apply with
+    /// an open `review` annotation; reds park unapplied with a `parked`
+    /// annotation, payload preserving the proposed text verbatim. One epoch
+    /// bump iff anything applied. Never errors on content — a projection
+    /// failure parks the op red instead.
+    fn propose(
+        &mut self,
+        doc_id: Uuid,
+        base_epoch: i64,
+        principal: Uuid,
+        ops: Vec<OpInput>,
+    ) -> Result<ProposeOutcome>;
+
+    /// Open annotations (yellows + parked reds), oldest first — sorted by
+    /// date it *is* the daily digest (§3.5). `None` = across all docs.
+    fn review_queue(&self, doc_id: Option<Uuid>) -> Result<Vec<ReviewItem>>;
+
+    /// Resolve one annotation. Invariant enforced here: proposer ≠ approver.
+    /// - accept yellow: clear the annotation (the edit is already live)
+    /// - decline yellow: revert via the op's pre-image, as a new green op by
+    ///   the reviewer (a receipt is returned)
+    /// - accept red: apply the parked op now, at the current epoch (receipt)
+    /// - decline red: park closed, never applied
+    fn resolve(
+        &mut self,
+        annotation_id: Uuid,
+        reviewer: Uuid,
+        decision: ReviewDecision,
+    ) -> Result<Option<ApplyReceipt>>;
 }

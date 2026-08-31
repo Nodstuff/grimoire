@@ -1,3 +1,4 @@
+use crate::gate::{Scored, score_stale_op};
 use crate::types::*;
 use crate::{BlockStore, Result, StoreError};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -108,6 +109,107 @@ fn build_block(raw: RawBlock) -> Result<Block> {
 
 const BLOCK_COLS: &str =
     "id, doc_id, parent_id, order_key, block_type, content, created_by, epoch, deleted";
+
+/// Fetch a block by id within a doc, tombstoned ones included.
+fn block_by_id(tx: &Transaction, doc_id: Uuid, id: Uuid) -> Result<Option<Block>> {
+    tx.query_row(
+        &format!("SELECT {BLOCK_COLS} FROM blocks WHERE id = ?1 AND doc_id = ?2"),
+        params![id.to_string(), doc_id.to_string()],
+        row_to_block,
+    )
+    .optional()?
+    .map(build_block)
+    .transpose()
+}
+
+fn doc_epoch(tx: &Transaction, doc_id: Uuid) -> Result<i64> {
+    tx.query_row(
+        "SELECT current_epoch FROM docs WHERE id = ?1",
+        params![doc_id.to_string()],
+        |r| r.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| StoreError::NotFound(format!("doc {doc_id}")))
+}
+
+#[expect(clippy::too_many_arguments)]
+fn insert_op_row(
+    tx: &Transaction,
+    op_id: Uuid,
+    doc_id: Uuid,
+    op: &OpInput,
+    principal: Uuid,
+    base_epoch: i64,
+    epoch_applied: Option<i64>,
+    verdict: Verdict,
+    confidence: f64,
+    prior: &Option<Block>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO ops (id, doc_id, op_type, target_block, payload, principal,
+                          base_epoch, epoch_applied, verdict, confidence, prior, source_refs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            op_id.to_string(),
+            doc_id.to_string(),
+            op.kind.op_type(),
+            op.kind.target_block().map(|t| t.to_string()),
+            serde_json::to_string(&op.kind)?,
+            principal.to_string(),
+            base_epoch,
+            epoch_applied,
+            verdict.as_str(),
+            confidence,
+            prior.as_ref().map(serde_json::to_string).transpose()?,
+            serde_json::to_string(&op.source_refs)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_annotation(
+    tx: &Transaction,
+    doc_id: Uuid,
+    op_id: Uuid,
+    kind: AnnotationKind,
+) -> Result<Uuid> {
+    let id = Uuid::now_v7();
+    tx.execute(
+        "INSERT INTO annotations (id, doc_id, op_id, kind) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            id.to_string(),
+            doc_id.to_string(),
+            op_id.to_string(),
+            kind.as_str()
+        ],
+    )?;
+    Ok(id)
+}
+
+/// The inverse of an applied yellow, built from its pre-image (decline path).
+fn inverse_of(kind: &OpKind, prior: Option<&Block>) -> Result<OpKind> {
+    let need_prior = || {
+        prior.ok_or_else(|| StoreError::InvalidOp("cannot invert: no pre-image recorded".into()))
+    };
+    match kind {
+        OpKind::Insert { block_id, .. } => Ok(OpKind::Delete { target: *block_id }),
+        OpKind::Replace { target, .. } => Ok(OpKind::Replace {
+            target: *target,
+            content: need_prior()?.content.clone(),
+        }),
+        OpKind::Move { target, .. } => {
+            let p = need_prior()?;
+            Ok(OpKind::Move {
+                target: *target,
+                new_parent: p.parent_id,
+                new_order_key: p.order_key.clone(),
+            })
+        }
+        OpKind::Delete { .. } => Err(StoreError::InvalidOp(
+            "cannot invert a delete (deletes never yellow — gate bias)".into(),
+        )),
+    }
+}
 
 /// Fetch a live (non-deleted) block within a doc, for projection checks.
 fn live_block(tx: &Transaction, doc_id: Uuid, id: Uuid, role: &str) -> Result<Block> {
@@ -358,23 +460,23 @@ impl BlockStore for SqliteStore {
         let mut op_ids = Vec::with_capacity(ops.len());
         for op in &ops {
             let op_id = Uuid::now_v7();
-            tx.execute(
-                "INSERT INTO ops (id, doc_id, op_type, target_block, payload, principal,
-                                  base_epoch, epoch_applied, verdict, source_refs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'green', ?9)",
-                params![
-                    op_id.to_string(),
-                    doc_id.to_string(),
-                    op.kind.op_type(),
-                    op.kind.target_block().map(|t| t.to_string()),
-                    serde_json::to_string(&op.kind)?,
-                    principal.to_string(),
-                    base_epoch,
-                    epoch,
-                    serde_json::to_string(&op.source_refs)?,
-                ],
-            )?;
+            let prior = match op.kind.target_block() {
+                Some(t) => block_by_id(&tx, doc_id, t)?,
+                None => None,
+            };
             project(&tx, doc_id, epoch, principal, &op.kind)?;
+            insert_op_row(
+                &tx,
+                op_id,
+                doc_id,
+                op,
+                principal,
+                base_epoch,
+                Some(epoch),
+                Verdict::Green,
+                1.0,
+                &prior,
+            )?;
             op_ids.push(op_id);
         }
         tx.execute(
@@ -390,55 +492,368 @@ impl BlockStore for SqliteStore {
     }
 
     fn ops_since(&self, doc_id: Uuid, since_epoch: i64) -> Result<Vec<LedgerOp>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, doc_id, payload, principal, base_epoch, epoch_applied, verdict, confidence, source_refs
-             FROM ops
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {OP_COLS} FROM ops
              WHERE doc_id = ?1 AND epoch_applied IS NOT NULL AND epoch_applied > ?2
-             ORDER BY epoch_applied, id",
-        )?;
-        let rows = stmt.query_map(params![doc_id.to_string(), since_epoch], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, Option<i64>>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, Option<f64>>(7)?,
-                r.get::<_, String>(8)?,
-            ))
-        })?;
-        rows.map(|r| {
-            let (
-                id,
+             ORDER BY epoch_applied, id"
+        ))?;
+        let rows = stmt.query_map(params![doc_id.to_string(), since_epoch], row_to_op)?;
+        rows.map(|r| build_op(r?)).collect()
+    }
+
+    fn propose(
+        &mut self,
+        doc_id: Uuid,
+        base_epoch: i64,
+        principal: Uuid,
+        ops: Vec<OpInput>,
+    ) -> Result<ProposeOutcome> {
+        if ops.is_empty() {
+            return Err(StoreError::InvalidOp("propose: empty op list".into()));
+        }
+        let tx = self.conn.transaction()?;
+        let current = doc_epoch(&tx, doc_id)?;
+        if base_epoch > current {
+            return Err(StoreError::InvalidOp(format!(
+                "propose: base epoch {base_epoch} is ahead of doc epoch {current}"
+            )));
+        }
+
+        let candidate_epoch = current + 1;
+        let mut verdicts = Vec::with_capacity(ops.len());
+        let mut applied_any = false;
+        for op in &ops {
+            let op_id = Uuid::now_v7();
+            let mut scored = if base_epoch == current {
+                Scored {
+                    verdict: Verdict::Green,
+                    confidence: 1.0,
+                    note: "current base".into(),
+                }
+            } else {
+                let mut lookup = |id: Uuid| block_by_id(&tx, doc_id, id).ok().flatten();
+                score_stale_op(&op.kind, base_epoch, &mut lookup)
+            };
+
+            let prior = match op.kind.target_block() {
+                Some(t) => block_by_id(&tx, doc_id, t)?,
+                None => None,
+            };
+
+            let mut applied = false;
+            if scored.verdict != Verdict::Red {
+                match project(&tx, doc_id, candidate_epoch, principal, &op.kind) {
+                    Ok(()) => applied = true,
+                    // content-level failure downgrades to a parked red;
+                    // the gate never errors on content
+                    Err(e @ (StoreError::InvalidOp(_) | StoreError::NotFound(_))) => {
+                        scored = Scored {
+                            verdict: Verdict::Red,
+                            confidence: 0.0,
+                            note: format!("projection failed: {e}"),
+                        };
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            insert_op_row(
+                &tx,
+                op_id,
                 doc_id,
-                payload,
+                op,
                 principal,
                 base_epoch,
-                epoch_applied,
-                verdict,
-                confidence,
-                source_refs,
-            ) = r?;
-            Ok(LedgerOp {
-                id: uuid_col(id, "ops.id")?,
-                doc_id: uuid_col(doc_id, "ops.doc_id")?,
-                kind: serde_json::from_str(&payload)?,
-                principal: uuid_col(principal, "ops.principal")?,
-                base_epoch,
-                epoch_applied,
-                verdict: match verdict.as_deref() {
-                    None => None,
-                    Some("green") => Some(Verdict::Green),
-                    Some("yellow") => Some(Verdict::Yellow),
-                    Some("red") => Some(Verdict::Red),
-                    Some(v) => return Err(StoreError::InvalidOp(format!("bad verdict: {v}"))),
+                applied.then_some(candidate_epoch),
+                scored.verdict,
+                scored.confidence,
+                &prior,
+            )?;
+            match scored.verdict {
+                Verdict::Green => {}
+                Verdict::Yellow => {
+                    insert_annotation(&tx, doc_id, op_id, AnnotationKind::Review)?;
+                }
+                Verdict::Red => {
+                    insert_annotation(&tx, doc_id, op_id, AnnotationKind::Parked)?;
+                }
+            }
+            applied_any |= applied;
+            verdicts.push(ProposeVerdict {
+                op_id,
+                verdict: scored.verdict,
+                confidence: scored.confidence,
+                applied,
+                note: scored.note,
+            });
+        }
+
+        let epoch = if applied_any {
+            candidate_epoch
+        } else {
+            current
+        };
+        if applied_any {
+            tx.execute(
+                "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
+                params![epoch, doc_id.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ProposeOutcome {
+            doc_id,
+            epoch,
+            verdicts,
+        })
+    }
+
+    fn review_queue(&self, doc_id: Option<Uuid>) -> Result<Vec<ReviewItem>> {
+        let sql = format!(
+            "SELECT a.id, a.doc_id, a.op_id, a.kind, a.status, a.resolved_by,
+                    {}
+             FROM annotations a JOIN ops o ON o.id = a.op_id
+             WHERE a.status = 'open' AND (?1 IS NULL OR a.doc_id = ?1)
+             ORDER BY a.created_at, a.id",
+            OP_COLS
+                .split(", ")
+                .map(|c| format!("o.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![doc_id.map(|d| d.to_string())], |r| {
+            let ann: (String, String, String, String, String, Option<String>) = (
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            );
+            let op = row_to_op_offset(r, 6)?;
+            Ok((ann, op))
+        })?;
+        rows.map(|r| {
+            let ((id, a_doc, op_id, kind, status, resolved_by), raw_op) = r?;
+            Ok(ReviewItem {
+                annotation: Annotation {
+                    id: uuid_col(id, "annotations.id")?,
+                    doc_id: uuid_col(a_doc, "annotations.doc_id")?,
+                    op_id: uuid_col(op_id, "annotations.op_id")?,
+                    kind: parse_annotation_kind(&kind)?,
+                    status: parse_annotation_status(&status)?,
+                    resolved_by: resolved_by
+                        .map(|p| uuid_col(p, "annotations.resolved_by"))
+                        .transpose()?,
                 },
-                confidence,
-                source_refs: serde_json::from_str(&source_refs)?,
+                op: build_op(raw_op)?,
             })
         })
         .collect()
+    }
+
+    fn resolve(
+        &mut self,
+        annotation_id: Uuid,
+        reviewer: Uuid,
+        decision: ReviewDecision,
+    ) -> Result<Option<ApplyReceipt>> {
+        let tx = self.conn.transaction()?;
+        let raw: Option<(String, String, String, String)> = tx
+            .query_row(
+                "SELECT a.doc_id, a.kind, a.status, a.op_id
+                 FROM annotations a WHERE a.id = ?1",
+                params![annotation_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (doc_id_s, kind_s, status_s, op_id_s) =
+            raw.ok_or_else(|| StoreError::NotFound(format!("annotation {annotation_id}")))?;
+        let doc_id = uuid_col(doc_id_s, "annotations.doc_id")?;
+        let kind = parse_annotation_kind(&kind_s)?;
+        if parse_annotation_status(&status_s)? != AnnotationStatus::Open {
+            return Err(StoreError::InvalidOp(format!(
+                "annotation {annotation_id} already {status_s}"
+            )));
+        }
+
+        let raw_op = tx.query_row(
+            &format!("SELECT {OP_COLS} FROM ops WHERE id = ?1"),
+            params![op_id_s],
+            row_to_op,
+        )?;
+        let op = build_op(raw_op)?;
+
+        // the trust invariant (§3.4): proposer ≠ approver, enforced at the gate
+        if op.principal == reviewer {
+            return Err(StoreError::InvalidOp(
+                "proposer cannot resolve their own proposal".into(),
+            ));
+        }
+
+        let mut receipt = None;
+        match (kind, decision) {
+            // yellow accepted: the edit is already live — just clear the flag
+            (AnnotationKind::Review, ReviewDecision::Accept) => {}
+            // yellow declined: revert via pre-image, as a green op by the reviewer
+            (AnnotationKind::Review, ReviewDecision::Decline) => {
+                let inverse = inverse_of(&op.kind, op.prior.as_ref())?;
+                let current = doc_epoch(&tx, doc_id)?;
+                let epoch = current + 1;
+                let inv_id = Uuid::now_v7();
+                let inv_input = OpInput {
+                    kind: inverse,
+                    source_refs: vec![format!("review:decline:{annotation_id}")],
+                };
+                let prior = match inv_input.kind.target_block() {
+                    Some(t) => block_by_id(&tx, doc_id, t)?,
+                    None => None,
+                };
+                project(&tx, doc_id, epoch, reviewer, &inv_input.kind)?;
+                insert_op_row(
+                    &tx,
+                    inv_id,
+                    doc_id,
+                    &inv_input,
+                    reviewer,
+                    current,
+                    Some(epoch),
+                    Verdict::Green,
+                    1.0,
+                    &prior,
+                )?;
+                tx.execute(
+                    "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
+                    params![epoch, doc_id.to_string()],
+                )?;
+                receipt = Some(ApplyReceipt {
+                    doc_id,
+                    epoch,
+                    op_ids: vec![inv_id],
+                });
+            }
+            // red accepted: apply the parked op now, at the current epoch;
+            // verdict stays red — distinct provenance for resolved reds (§3.4)
+            (AnnotationKind::Parked, ReviewDecision::Accept) => {
+                let current = doc_epoch(&tx, doc_id)?;
+                let epoch = current + 1;
+                project(&tx, doc_id, epoch, op.principal, &op.kind)?;
+                tx.execute(
+                    "UPDATE ops SET epoch_applied = ?1 WHERE id = ?2",
+                    params![epoch, op.id.to_string()],
+                )?;
+                tx.execute(
+                    "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
+                    params![epoch, doc_id.to_string()],
+                )?;
+                receipt = Some(ApplyReceipt {
+                    doc_id,
+                    epoch,
+                    op_ids: vec![op.id],
+                });
+            }
+            // red declined: parked closed, never applied
+            (AnnotationKind::Parked, ReviewDecision::Decline) => {}
+        }
+
+        let status = match decision {
+            ReviewDecision::Accept => AnnotationStatus::Accepted,
+            ReviewDecision::Decline => AnnotationStatus::Declined,
+        };
+        tx.execute(
+            "UPDATE annotations SET status = ?1, resolved_by = ?2,
+                    resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?3",
+            params![
+                status.as_str(),
+                reviewer.to_string(),
+                annotation_id.to_string()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+}
+
+const OP_COLS: &str = "id, doc_id, payload, principal, base_epoch, epoch_applied, verdict, confidence, prior, source_refs";
+
+type RawOp = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Option<String>,
+    Option<f64>,
+    Option<String>,
+    String,
+);
+
+fn row_to_op(row: &rusqlite::Row) -> rusqlite::Result<RawOp> {
+    row_to_op_offset(row, 0)
+}
+
+fn row_to_op_offset(row: &rusqlite::Row, o: usize) -> rusqlite::Result<RawOp> {
+    Ok((
+        row.get(o)?,
+        row.get(o + 1)?,
+        row.get(o + 2)?,
+        row.get(o + 3)?,
+        row.get(o + 4)?,
+        row.get(o + 5)?,
+        row.get(o + 6)?,
+        row.get(o + 7)?,
+        row.get(o + 8)?,
+        row.get(o + 9)?,
+    ))
+}
+
+fn build_op(raw: RawOp) -> Result<LedgerOp> {
+    let (
+        id,
+        doc_id,
+        payload,
+        principal,
+        base_epoch,
+        epoch_applied,
+        verdict,
+        confidence,
+        prior,
+        source_refs,
+    ) = raw;
+    Ok(LedgerOp {
+        id: uuid_col(id, "ops.id")?,
+        doc_id: uuid_col(doc_id, "ops.doc_id")?,
+        kind: serde_json::from_str(&payload)?,
+        principal: uuid_col(principal, "ops.principal")?,
+        base_epoch,
+        epoch_applied,
+        verdict: match verdict.as_deref() {
+            None => None,
+            Some("green") => Some(Verdict::Green),
+            Some("yellow") => Some(Verdict::Yellow),
+            Some("red") => Some(Verdict::Red),
+            Some(v) => return Err(StoreError::InvalidOp(format!("bad verdict: {v}"))),
+        },
+        confidence,
+        prior: prior.map(|p| serde_json::from_str(&p)).transpose()?,
+        source_refs: serde_json::from_str(&source_refs)?,
+    })
+}
+
+fn parse_annotation_kind(s: &str) -> Result<AnnotationKind> {
+    match s {
+        "review" => Ok(AnnotationKind::Review),
+        "parked" => Ok(AnnotationKind::Parked),
+        _ => Err(StoreError::InvalidOp(format!("bad annotation kind: {s}"))),
+    }
+}
+
+fn parse_annotation_status(s: &str) -> Result<AnnotationStatus> {
+    match s {
+        "open" => Ok(AnnotationStatus::Open),
+        "accepted" => Ok(AnnotationStatus::Accepted),
+        "declined" => Ok(AnnotationStatus::Declined),
+        _ => Err(StoreError::InvalidOp(format!("bad annotation status: {s}"))),
     }
 }
