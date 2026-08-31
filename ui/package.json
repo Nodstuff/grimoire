@@ -20,7 +20,8 @@
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-force-graph-2d": "^1.29.1",
-    "react-markdown": "^10.1.0"
+    "react-markdown": "^10.1.0",
+    "tldraw": "^5.3.2"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",

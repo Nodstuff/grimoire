@@ -1154,6 +1154,48 @@ impl BlockStore for SqliteStore {
         rows.map(|r| build_doc(r?)).collect()
     }
 
+    fn park(
+        &mut self,
+        doc_id: Uuid,
+        principal: Uuid,
+        ops: Vec<OpInput>,
+        note: &str,
+    ) -> Result<Vec<Uuid>> {
+        if ops.is_empty() {
+            return Err(StoreError::InvalidOp("park: empty op list".into()));
+        }
+        let tx = self.conn.transaction()?;
+        let base = doc_epoch(&tx, doc_id)?;
+        let mut op_ids = Vec::with_capacity(ops.len());
+        for op in &ops {
+            let op_id = Uuid::now_v7();
+            let mut op = op.clone();
+            if !note.is_empty() {
+                op.source_refs.push(format!("note:{note}"));
+            }
+            let prior = match op.kind.target_block() {
+                Some(t) => block_by_id(&tx, doc_id, t)?,
+                None => None,
+            };
+            insert_op_row(
+                &tx,
+                op_id,
+                doc_id,
+                &op,
+                principal,
+                base,
+                None,
+                Verdict::Red,
+                0.5,
+                &prior,
+            )?;
+            insert_annotation(&tx, doc_id, op_id, AnnotationKind::Parked)?;
+            op_ids.push(op_id);
+        }
+        tx.commit()?;
+        Ok(op_ids)
+    }
+
     fn review_queue(&self, doc_id: Option<Uuid>) -> Result<Vec<ReviewItem>> {
         let sql = format!(
             "SELECT a.id, a.doc_id, a.op_id, a.kind, a.status, a.resolved_by,

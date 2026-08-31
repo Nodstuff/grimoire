@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DocEditor from './editor/DocEditor'
 import GraphView from './GraphView'
 import Gardeners from './Gardeners'
+import CanvasBlock from './CanvasBlock'
 import {
   api,
   Block,
@@ -476,21 +477,34 @@ function DocView({
     [byTitle, onOpenDoc],
   )
 
-  const { editable, comments, allBlocks } = useMemo(() => {
-    if (!tree) return { editable: null, comments: [] as Block[], allBlocks: [] as Block[] }
+  const { editable, comments, allBlocks, canvases } = useMemo(() => {
+    if (!tree)
+      return {
+        editable: null,
+        comments: [] as Block[],
+        allBlocks: [] as Block[],
+        canvases: [] as Block[],
+      }
     const blocks: Block[] = []
     const comments: Block[] = []
     const allBlocks: Block[] = []
+    const canvases: Block[] = []
     const walk = (nodes: BlockNode[]) => {
       for (const n of nodes) {
         allBlocks.push(n.block)
         if (n.block.block_type === 'comment') comments.push(n.block)
+        else if (n.block.block_type === 'canvas_scene') canvases.push(n.block)
         else if (!n.block.content.startsWith('---')) blocks.push(n.block)
         walk(n.children)
       }
     }
     walk(tree.roots)
-    return { editable: { docId, epoch: tree.doc.current_epoch, blocks }, comments, allBlocks }
+    return {
+      editable: { docId, epoch: tree.doc.current_epoch, blocks },
+      comments,
+      allBlocks,
+      canvases,
+    }
   }, [tree, docId])
 
   if (!tree || !editable) return <div className="empty">…</div>
@@ -514,9 +528,45 @@ function DocView({
           >
             comments{comments.length > 0 ? ` ${comments.length}` : ''}
           </button>
+          {canvases.length === 0 && (
+            <button
+              className="chip"
+              onClick={() =>
+                api('/api/propose', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    doc_id: docId,
+                    base_epoch: tree.doc.current_epoch,
+                    ops: [
+                      {
+                        kind: {
+                          op: 'insert',
+                          block_id: crypto.randomUUID(),
+                          parent_id: null,
+                          order_key: 'zz',
+                          block_type: 'canvas_scene',
+                          content: '{}',
+                          refers_to: null,
+                        },
+                        source_refs: ['canvas:created'],
+                      },
+                    ],
+                  }),
+                })
+                  .then(loadTree)
+                  .catch((e) => alert(String(e)))
+              }
+            >
+              + canvas
+            </button>
+          )}
         </span>
       </div>
       <DocEditor doc={editable} onSaved={() => {}} onSelectionBlock={onSelectionBlock} />
+      {canvases.map((c) => (
+        <CanvasBlock key={c.id} block={c} epoch={tree.doc.current_epoch} onSaved={loadTree} />
+      ))}
       {selBlock && selRect && panel !== 'comments' && (
         <button
           className="sel-comment"
@@ -785,12 +835,54 @@ function ReviewQueue({
     load()
   }
 
+  const bulk = async (ids: string[], decision: 'accept' | 'decline') => {
+    if (ids.length === 0) return
+    setBusy('bulk')
+    await api('/api/resolve_bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ annotation_ids: ids, decision }),
+    }).catch((e) => alert(String(e)))
+    setBusy(null)
+    load()
+  }
+
+  // group proposals by proposer for bulk actions
+  const byProposer = new Map<string, QueueRow[]>()
+  for (const r of rows) {
+    if (!byProposer.has(r.proposer)) byProposer.set(r.proposer, [])
+    byProposer.get(r.proposer)!.push(r)
+  }
+
   if (rows.length === 0 && flags.length === 0)
     return <div className="empty">review queue is empty ✓</div>
 
   return (
     <div className="queue">
       <h1 className="queue-title">review</h1>
+      {rows.length > 1 &&
+        [...byProposer.entries()].map(([who, group]) => (
+          <div key={who} className="bulk-bar">
+            <span className="who agent">{who}</span>
+            <span className="meta">{group.length} proposals</span>
+            <span className="gardener-actions">
+              <button
+                className="accept"
+                disabled={busy !== null}
+                onClick={() => bulk(group.map((r) => r.item.annotation.id), 'accept')}
+              >
+                accept all
+              </button>
+              <button
+                className="bulk-decline"
+                disabled={busy !== null}
+                onClick={() => bulk(group.map((r) => r.item.annotation.id), 'decline')}
+              >
+                decline all
+              </button>
+            </span>
+          </div>
+        ))}
       {rows.map((r) => {
         const op = r.item.op
         const proposed =

@@ -111,6 +111,34 @@ async fn resolve(State(st): State<ApiState>, Json(req): Json<ResolveReq>) -> Jso
 }
 
 #[derive(Deserialize)]
+struct ResolveBulkReq {
+    annotation_ids: Vec<Uuid>,
+    decision: String,
+}
+
+/// Bulk resolve as the human: one request, per-item outcomes. Errors on
+/// individual items (already resolved, proposer==approver) don't stop the rest.
+async fn resolve_bulk(State(st): State<ApiState>, Json(req): Json<ResolveBulkReq>) -> Json<Value> {
+    let decision = match req.decision.as_str() {
+        "accept" => ReviewDecision::Accept,
+        "decline" => ReviewDecision::Decline,
+        other => return Json(json!({"error": format!("bad decision: {other}")})),
+    };
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut done, mut failed) = (0usize, Vec::new());
+    for id in req.annotation_ids {
+        match s.resolve(id, st.human, decision) {
+            Ok(_) => done += 1,
+            Err(e) => failed.push(json!({"id": id, "error": e.to_string()})),
+        }
+    }
+    Json(json!({"resolved": done, "failed": failed}))
+}
+
+#[derive(Deserialize)]
 struct SearchQuery {
     q: String,
 }
@@ -431,6 +459,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/doc/{id}/status", post(set_status))
         .route("/api/comment", post(add_comment))
         .route("/api/resolve", post(resolve))
+        .route("/api/resolve_bulk", post(resolve_bulk))
         .route("/api/search", get(search))
         .route("/api/tags", get(tags))
         .route("/api/runs", get(runs))

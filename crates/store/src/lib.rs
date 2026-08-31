@@ -127,6 +127,18 @@ pub trait BlockStore {
         ops: Vec<OpInput>,
     ) -> Result<ProposeOutcome>;
 
+    /// Park ops as unapplied reds with `parked` annotations — a drafted
+    /// change awaiting judgment (the auditor's unverified-fix path). Nothing
+    /// touches the projection; accepting later applies at the then-current
+    /// epoch via resolve().
+    fn park(
+        &mut self,
+        doc_id: Uuid,
+        principal: Uuid,
+        ops: Vec<OpInput>,
+        note: &str,
+    ) -> Result<Vec<Uuid>>;
+
     /// Open annotations (yellows + parked reds), oldest first — sorted by
     /// date it *is* the daily digest (§3.5). `None` = across all docs.
     fn review_queue(&self, doc_id: Option<Uuid>) -> Result<Vec<ReviewItem>>;
