@@ -144,6 +144,7 @@ pub trait BlockStore {
     fn create_gardener(
         &mut self,
         name: &str,
+        kind: GardenerKind,
         task_prompt: &str,
         scope_doc: Option<Uuid>,
         confidence_policy: ConfidencePolicy,

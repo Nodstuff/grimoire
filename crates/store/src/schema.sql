@@ -114,6 +114,7 @@ END;
 CREATE TABLE IF NOT EXISTS gardeners (
     id            TEXT PRIMARY KEY,
     name          TEXT NOT NULL UNIQUE,
+    kind          TEXT NOT NULL DEFAULT 'tagging' CHECK (kind IN ('tagging', 'reviewer')),
     principal     TEXT NOT NULL REFERENCES principals (id),
     -- null scope = whole corpus; else this doc's subtree
     scope_doc     TEXT REFERENCES docs (id),
