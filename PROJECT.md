@@ -1,6 +1,6 @@
 # PROJECT.md — Personal Knowledge System That Maintains Itself
 
-**Context document for Claude Code.** This captures the full design conversation (Aug 2026) that produced the backlog in this repo. Read this before touching any ticket. The backlog (`backlog.md` / GitHub issues) says *what*; this says *why* and *how*.
+**Context document for Claude Code.** This captures the full design conversation (Aug 2026) that produced the backlog in this repo. Read this before touching any ticket. The backlog (GitHub issues — the source of truth) says *what*; this says *why* and *how*.
 
 ---
 
@@ -11,7 +11,9 @@
 
 ## 1. Vision
 
-A **personal knowledge system that maintains itself**: local-first, owned data (in the spirit of Obsidian/Octarine/ATLAS:Face), but where AI agents are not a chat sidebar bolted on — they are **first-class principals living inside the merge semantics**. Documents bound to external sources (GitHub repos) update themselves daily via agents whose writes flow through a merge/review gate. The eternal wiki disease is rot; this is the first architecture where docs can plausibly stop being lies, because agent writes are cheap, safe, attributed, and reviewable.
+A **personal knowledge system that maintains itself**: local-first, owned data (in the spirit of Obsidian/Octarine/ATLAS:Face), but where AI agents are not a chat sidebar bolted on — they are **first-class principals living inside the merge semantics**.
+
+**The bar**: the best docs platform for humans *and* agents to coexist on — fast, efficient, and good-feeling for humans; token-cheap, structurally addressable, and safely writable for agents. Confluence is good for neither; every other tool picks one side. Blocks themselves are commodity (Notion/AnyType/ADF all have them) — the differentiator is treating *writes* as first-class objects: base epochs, confidence-scored merge, principal provenance. Documents bound to external sources (GitHub repos) update themselves daily via agents whose writes flow through a merge/review gate. The eternal wiki disease is rot; this is the first architecture where docs can plausibly stop being lies, because agent writes are cheap, safe, attributed, and reviewable.
 
 Current state being replaced: Tom's Octarine markdown vault, which agents write to, but which is single-laptop, has no merge semantics, no provenance, no review, and no self-maintenance.
 
@@ -48,23 +50,41 @@ These concepts underpin every design decision. Tom understands them; Claude shou
 ### 3.1 Block store (the substrate — M2)
 
 - **Block** = `{id, doc_id, parent_id, order_key, block_type, content, created_by, epoch, deleted}`. Types: paragraph, heading, code, diagram_d2, diagram_mermaid, canvas_scene, comment, decision. Docs are trees of blocks. Ordering scheme (fractional index vs sibling list) decided in ticket 2.2.
+- **The ledger (primary write record)**: an append-only `ops` table — `{id, doc_id, op: insert|replace|delete|move, target_block, payload, principal, base_epoch, epoch_applied?, verdict, confidence, source_refs[]}`. The `blocks` table is the *projection* of applied ops, written in the same transaction, and stays authoritative for reads — no replay machinery, no event-sourcing framework. Everything the design needs falls out of this one structure: parked reds = unapplied ops (original text preserved by construction), yellows = annotations referencing ops, provenance = op metadata, history/time-travel = a query, federation sync (§6) = "ship ops since cursor" — the gardener cursor pattern reused. Op granularity is **exactly** the block-level operations above, never finer; if the ops table burned down, the blocks table still works as a plain wiki.
 - **Why blocks, not characters**: agents edit in semantic units (replace paragraph, insert section). Block-level merge is dramatically simpler than sequence CRDTs, confidence scoring is easier because blocks carry meaning, and two humans rarely wordsmith one sentence simultaneously — and there's only one human anyway.
 - **Principals**: `{id, kind: human|agent|remote, display_name, pubkey?}`. Every block version records `(principal, epoch, source_refs[])`. Provenance is a native property — "which principal tends this region" is queryable and renderable. `remote`/`pubkey` unused in v1 (federation tax, §6).
-- **Epochs**: monotonic **per-document** (never global — federation-critical). Reads return the epoch; writes declare their base epoch. Stale base → routed through the propose gate. Epochs serialise writes above the storage layer.
+- **Epochs**: monotonic **per-document** (never global — federation-critical). Reads return the epoch; writes declare their base epoch. Stale base → routed through the propose gate. Epochs serialise writes above the storage layer. **One epoch = one committed transaction**, which may contain many ops: a gardener's daily batch lands as one epoch (hence the changelog line "epoch 214: updated deploy runbook"), a human edit session commits as one. This resolves per-write vs per-batch — there is no tension, the unit is the transaction.
+- **Human write path**: a human editing at the *current* epoch writes directly — the gate is for agent principals and stale bases, not a toll booth on typing. (Their ops still land in the ledger for provenance/history.) `proposer ≠ approver` binds gate traffic only.
 - **Propose gate**: `propose(doc, ops[], base_epoch) → per-op {green|yellow|red, confidence, placement_context}`. Semantics as in §2. **Invariant: proposer ≠ approver**, enforced at the gate.
-- **Confidence scoring**: context matching at block granularity (diff-match-patch spirit): surrounding context of the stale op found exactly once → high; fuzzy/multiple matches → medium; gone or overlapping another's edit → low. One hardcoded threshold constant.
-- **Review policy**: nullable column per doc — `human-review | agent-review | auto`; null inherits parent via one recursive lookup. Auto self-applies greens + high-confidence yellows; **reds always park** for some reviewer.
+- **Confidence scoring**: ops target block IDs, so the fast path is exact, not fuzzy — target block unchanged since `base_epoch` → green with no matching at all. The fuzzy machinery (diff-match-patch spirit) is the *rare* path, engaged only when the target was edited/split/deleted since base: surrounding context found exactly once → high; fuzzy/multiple matches → medium; gone or overlapping another's edit → low. One hardcoded threshold constant.
+- **Review policy**: nullable column per doc — `human-review | agent-review | auto`; null inherits parent via one recursive lookup. Auto self-applies greens + high-confidence yellows; **reds always park** for some reviewer. **Expected steady state: most docs are `agent-review`**, with the reviewer agent (4.8) as the default queue consumer; `human-review` is the exception reserved for high-stakes docs. Queue rot is designed away by making an agent, not Tom, the primary reviewer.
 - **Links**: `[[wikilink]]` → first-class edge rows `{from_block, to_target}`; backlinks are an index query. Feeds reviewer-agent context ("what links here").
 - **Tags**: metadata + a taxonomy doc that is *itself just a doc*, maintained by the tagging gardener via its own proposals — so tagging converges on Tom's vocabulary.
 - **Import/export**: Octarine markdown vault → block trees (headings→structure, fences→code/diagram blocks, wikilinks→edges) and back out. Escape-hatch honesty.
 
 ### 3.2 Storage (ADR, decided in principle — ticket 2.1)
 
-**SQLite** (WAL mode, busy_timeout) behind a `BlockStore` **trait**. Rationale: single-writer is a non-issue because (a) epochs + the gate already serialise writes architecturally, (b) one server process owns the file, (c) write load is comical (a few humans' worth at most, gardeners once daily, live-session traffic never touches the store mid-flight). Postgres arguments (LISTEN/NOTIFY, pgvector, multi-process) are real but not v1 — the trait bounds the swap cost at "reimplement the trait." Do not start on Postgres out of concurrency fear the design already engineered away. FTS5 for search; sqlite-vec if embeddings ever happen.
+**SQLite** (WAL mode, busy_timeout) behind a `BlockStore` **trait**. Ledger (`ops`) and projection (`blocks`) are both plain tables written in one transaction — no queue, no replay, no framework. Rationale: single-writer is a non-issue because (a) epochs + the gate already serialise writes architecturally, (b) one daemon process owns the file (§3.2a) — within one process the "single writer" is a mutex around a µs-scale commit, (c) write load is comical (a few humans' worth at most, gardeners once daily, live-session traffic never touches the store mid-flight). Postgres arguments (LISTEN/NOTIFY, pgvector, multi-process) are real but not v1 — the trait bounds the swap cost at "reimplement the trait." Do not start on Postgres out of concurrency fear the design already engineered away. Alternatives audited and rejected for v1: libSQL (server-mode SQLite — the credible upgrade path if multi-writer ever becomes real; the trait is the escape hatch), DuckDB (OLAP, wrong shape), embedded KV stores (redb/RocksDB — lose SQL, FTS5, and the plain-tables honesty). FTS5 for search; sqlite-vec if embeddings ever happen.
+
+### 3.2a Process topology (the daemon)
+
+**One Rust daemon process** owns the SQLite file — literally, not aspirationally — and serves every surface:
+
+- **MCP over streamable HTTP** (latest spec, stateless) at `localhost:<port>` — every Claude session's MCP config points here. **Never stdio**: stdio spawns one server process per session, which multi-writes the file and deletes the storage rationale.
+- **Web UI (M5)** — same process, same HTTP server, different routes.
+- Kept alive by launchd; started on demand is fine for v1.
+
+Consequences: the 3.1 mini-ADR (Rust vs TS shim) mostly dissolves — the MCP surface is routes on the daemon, so Rust wins by default. And the daemon is exactly the thing federation (§6) eventually exposes — the phase-2 shape falls out of the v1 topology for free.
 
 ### 3.3 MCP surface (M3)
 
-Tools: `list_docs`, `read_doc` (returns epoch), `read_block`, `propose` (returns structured verdicts — agents act on them without prose parsing), `search`, `add_comment`/`list_comments`. **Stale-epoch protocol**: propose against an old epoch returns `{current_epoch, resync_required}` with context to re-read and re-propose — a scripted stale agent must recover unaided. This kills the classic bug: agent clobbers edits made mid-task.
+Tools: `list_docs`, `read_doc` (returns epoch), `read_block`, `propose` (returns structured verdicts — agents act on them without prose parsing), `search`, `add_comment`/`list_comments`, `diff_since`. The read path is designed to the same bar as the write gate — token-cheap, structurally addressable:
+
+- **`diff_since(doc, epoch)`**: the ops since that epoch — a single SELECT off the ledger. One primitive, three hats: stale-agent recovery, gardener "what changed since my cursor", federation sync (§6) later.
+- **`read_doc` outline mode**: structure + block IDs + heading/first-line per block within a token budget; the agent fetches full blocks by ID only where it needs them. Never pay full-doc tokens to edit one paragraph.
+- **`search` returns blocks**, not docs — each hit with doc + heading breadcrumb, so the agent lands on the editable unit directly.
+
+**Stale-epoch protocol**: propose against an old epoch returns `{current_epoch, missed_ops}` (via `diff_since`) — not "resync required, re-read everything," but "here are the 3 ops you missed." A scripted stale agent must recover unaided. This kills the classic bug: agent clobbers edits made mid-task.
 
 First demo target (end of M3): an agent reads the imported vault and proposes an edit Tom reviews as a diff.
 
@@ -76,7 +96,7 @@ A gardener is **config, not construction**: a registry row `{id, scope (doc/sect
 - **Scheduling**: once daily, 16:00 cutoff. **Pull, not push** — no webhooks; GitHub compare API against a stored cursor (`cursor_sha` per binding), advanced **only on successful run** (failed Tuesday → Wednesday covers both days). Daily batching = the 4pm run *is* the epoch cut; provenance reads like a changelog ("epoch 214: updated deploy runbook, citing PRs #341, #344"); and review arrives as one digest, not a trickle humans learn to ignore. Debounce/settle-window machinery deliberately deleted by this design.
 - **Budgets**: two hardcoded constants (tokens, tool calls). Overrun → kill + red "couldn't complete" note with partial context. Never a hang, never silent.
 - **Security model**: the propose gate is the injection firewall. Threat = hostile content in sources (malicious PR descriptions/commit messages). Blast radius of a compromised gardener = weird yellow/red proposals with provenance, declined by a human. Creds: fine-grained scoped PATs in OS keychain or chmod-600 file, injected as tool auth, **never in prompt text**. One injection canary test in CI-spirit (ticket 4.9).
-- **Reviewer agent** (4.8): a gardener variant reading the review queue instead of GitHub. Skeptic prompt, distinct principal, verifies placement by re-reading context, accepts/rejects/re-places yellows *and* reds on `agent-review` docs. Agent-resolved reds carry a distinct provenance mark.
+- **Reviewer agent** (4.8): a gardener variant reading the review queue instead of GitHub. Skeptic prompt, distinct principal, verifies placement by re-reading context, accepts/rejects/re-places yellows *and* reds on `agent-review` docs. Agent-resolved reds carry a distinct provenance mark. **Build order: immediately after the tagging gardener (4.4)** — it is the default queue consumer for the whole system (most docs are `agent-review`), not a late add-on. Ticket numbering unchanged; sequencing is.
 - **Escalation tripwire** (4.9): volume-based, one hardcoded threshold — >N reds resolved on one doc in one run escalates the batch to human regardless of policy. An agent resolving one red is working; twenty on one doc means something upstream broke (mangled import, hostile diff).
 - **First gardener = tagging gardener** (4.4): needs no external creds, exercises the entire propose→review loop before GitHub integration exists.
 - **Trust invariants (hold these three and tiered autonomy stays auditable)**: proposer ≠ approver; distinct provenance for agent-resolved reds; volume escalation.
@@ -146,8 +166,9 @@ This is where the project is going: teammate collaboration — co-editing docs, 
 ## 8. Development environment & conventions
 
 - **Repo**: github.com/Nodstuff/knowledge-system (private). Personal account `Nodstuff`; work account `tmeaney-qumulo` also in gh keyring — **never mix**. Known footgun: `git push` over HTTPS follows the OS credential helper's cached creds, not gh's active account. Recommended: direnv `.envrc` in the project root with `GH_TOKEN` (personal fine-grained PAT) so any shell/Claude Code session in this directory is automatically the personal identity. Scoped PATs per purpose — the gardener creds story starts here.
-- **Tickets**: GitHub Issues, labels `epic:*`/`type:*`/`phase-2`, milestones M1–M5. `backlog.md` in repo root is the readable plan. Close issues from commit messages — provenance-flavoured workflow, fittingly.
+- **Tickets**: GitHub Issues are the source of truth, labels `epic:*`/`type:*`/`phase-2`, milestones M1–M5. Close issues from commit messages — provenance-flavoured workflow, fittingly.
 - **Dependencies flow** M1 → M2 → M3 → M4; M5 can start after M2 in parallel.
+- **Cutover bar (defines "viable")**: full one-shot cutover from the Octarine vault as soon as these four hold — 2.8 import (vault in, links intact) · 5.1 editor spike passing (daily notes get written here or nowhere) · M3 MCP surface (the real cutover moment is `~/.claude/CLAUDE.md` pointing Claude sessions at this system instead of the vault) · 5.9 quick-switcher. **Gardeners (M4) are explicitly not on the cutover path** — they are the essential fast-follow: quality upgrades to a system already inhabited, not the reason to move in. Crossover period is short by design; nothing else in M5 blocks cutover.
 - **ADRs**: written as docs, dogfooding the decision-block format by hand until 5.6 exists. Two decisions flagged expensive to reverse: storage (2.1, made) and editor (5.1, spike pending).
 - **Tooling**: Claude Code as the primary build tool across all milestones. Zed with the agent panel as the alternative surface when Tom wants to drive (buffer + rust-analyzer diagnostics visible live).
 - **De-gilding rule (v1)**: anywhere a spec says "configurable / per-X policy / encrypted vault / digest pipeline," the v1 answer is a constant, a column, a keychain entry, or a sorted list. Re-gild when phase 2 makes it real — but only then.
@@ -155,8 +176,8 @@ This is where the project is going: teammate collaboration — co-editing docs, 
 ## 9. Ticket map (details in issues)
 
 - **M1**: 1.1 setup · 1.2 G-Counter · 1.3 Merge trait · 1.4 PN-Counter · 1.5 LWW-Register · 1.6 OR-Set · 1.7 proptest laws · 1.8 (stretch) baby RGA
-- **M2**: 2.1 storage ADR/trait · 2.2 block model (UUIDs) · 2.3 principals/provenance · 2.4 per-doc epochs · 2.5 propose gate · 2.6 confidence · 2.7 annotations · 2.8 md import · 2.9 md export · 2.10 review-policy column · 2.11 links/backlinks · 2.12 tags model
-- **M3**: 3.1 MCP skeleton (mini-ADR: Rust vs TS shim) · 3.2 propose tool · 3.3 stale-epoch protocol · 3.4 FTS5+trigram search (stretch: sqlite-vec) · 3.5 comment tools
+- **M2**: 2.1 storage ADR/trait · 2.2 block model (UUIDs) + ops ledger · 2.3 principals/provenance · 2.4 per-doc epochs · 2.5 propose gate · 2.6 confidence · 2.7 annotations · 2.8 md import · 2.9 md export · 2.10 review-policy column · 2.11 links/backlinks · 2.12 tags model
+- **M3**: 3.1 daemon skeleton + MCP over streamable HTTP (mini-ADR resolved: Rust, routes on the daemon) · 3.2 propose tool · 3.3 stale-epoch protocol (`diff_since`-based) · 3.4 FTS5+trigram search, block-granular results (stretch: sqlite-vec) · 3.5 comment tools · 3.6 `diff_since` tool · 3.7 `read_doc` outline mode
 - **M4**: 4.1 registry · 4.2 prompt split · 4.3 creds · 4.4 tagging gardener (first) · 4.5 daily runner+cursors · 4.6 budgets · 4.7 GitHub binding · 4.8 reviewer agent · 4.9 tripwire+canary
 - **M5**: 5.1 editor spike · 5.2 nav · 5.3 review queue · 5.4 provenance UI · 5.5 comments UI · 5.6 decisions/status · 5.7 D2/Mermaid · 5.8 canvas embed · 5.9 quick-switcher · 5.10 graph view
 - **Parked**: P2.1–P2.7 (§7)
