@@ -42,6 +42,9 @@ export default function App() {
       } else if (mod && e.key === 'n') {
         e.preventDefault()
         setPalette((p) => (p === 'newdoc' ? null : 'newdoc'))
+      } else if (mod && e.key === 'w') {
+        e.preventDefault()
+        setView({ kind: 'home' })
       } else if (mod && e.key === 's' && !e.shiftKey) {
         e.preventDefault()
         setPalette((p) => (p === 'search' ? null : 'search'))
