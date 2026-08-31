@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "knowledge-system",
+  "version": "0.1.0",
+  "identifier": "ie.null.knowledge-system.shell",
+  "build": {
+    "frontendDist": "http://127.0.0.1:7425"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "knowledge-system",
+        "url": "http://127.0.0.1:7425/",
+        "width": 1240,
+        "height": 860,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "theme": "Dark"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": ["icons/icon.icns", "icons/icon.png"]
+  }
+}
