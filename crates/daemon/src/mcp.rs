@@ -167,7 +167,10 @@ impl KsMcp {
 
     #[tool(description = "List all docs: id, title, parent_id, current_epoch, review_policy.")]
     async fn list_docs(&self) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().unwrap();
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match store.list_docs() {
             Ok(docs) => ok_json(&docs),
             Err(e) => err(e.to_string()),
@@ -186,7 +189,10 @@ impl KsMcp {
             Err(m) => return err(m),
         };
         let full = p.mode.as_deref() == Some("full");
-        let store = self.store.lock().unwrap();
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match store.read_doc(doc_id) {
             Ok(tree) => {
                 let mut blocks = Vec::new();
@@ -211,7 +217,10 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let store = self.store.lock().unwrap();
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match store.read_block(id) {
             Ok(b) => ok_json(&b),
             Err(e) => err(e.to_string()),
@@ -233,7 +242,10 @@ impl KsMcp {
             Ok(o) => o,
             Err(e) => return err(format!("ops did not parse: {e}")),
         };
-        let mut store = self.store.lock().unwrap();
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match store.propose(doc_id, p.base_epoch, self.agent, ops) {
             Ok(out) => ok_json(&out),
             Err(StoreError::StaleBase { base, current }) => ok_json(&json!({
@@ -257,7 +269,10 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let store = self.store.lock().unwrap();
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match store.ops_since(doc_id, p.since_epoch) {
             Ok(ops) => ok_json(&ops),
             Err(e) => err(e.to_string()),
@@ -271,7 +286,10 @@ impl KsMcp {
         &self,
         Parameters(p): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.store.lock().unwrap();
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match store.search_blocks(&p.query, p.limit.unwrap_or(20) as usize) {
             Ok(hits) => ok_json(&hits),
             Err(e) => err(e.to_string()),
@@ -294,7 +312,10 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let store = self.store.lock().unwrap();
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match store.review_queue(doc_id) {
             Ok(q) => ok_json(&q),
             Err(e) => err(e.to_string()),
@@ -317,7 +338,10 @@ impl KsMcp {
             "decline" => ReviewDecision::Decline,
             other => return err(format!("decision must be accept|decline, got {other}")),
         };
-        let mut store = self.store.lock().unwrap();
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match store.resolve(id, self.agent, decision) {
             Ok(receipt) => ok_json(&json!({ "resolved": true, "receipt": receipt })),
             Err(e) => err(e.to_string()),
@@ -335,7 +359,10 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let store = self.store.lock().unwrap();
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match store.backlinks(doc_id) {
             Ok(hits) => ok_json(&hits),
             Err(e) => err(e.to_string()),
@@ -362,7 +389,10 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let mut store = self.store.lock().unwrap();
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match store.add_comment(block_id, self.agent, &p.text, reply_to) {
             Ok(c) => ok_json(&c),
             Err(e) => err(e.to_string()),
@@ -378,7 +408,10 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let store = self.store.lock().unwrap();
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match store.list_comments(block_id) {
             Ok(c) => ok_json(&c),
             Err(e) => err(e.to_string()),
@@ -399,7 +432,10 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let mut store = self.store.lock().unwrap();
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match store.create_doc(&p.title, parent, self.agent) {
             Ok(doc) => ok_json(&doc),
             Err(e) => err(e.to_string()),

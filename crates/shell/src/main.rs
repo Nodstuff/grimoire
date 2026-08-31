@@ -68,7 +68,9 @@ fn ensure_daemon() {
 }
 
 fn spawn_sidecar() {
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
     let Some(dir) = exe.parent() else { return };
     let ksd = dir.join("ksd");
     if !ksd.exists() {
@@ -123,12 +125,16 @@ fn show_window(app: &AppHandle) {
         let _ = w.set_focus();
         return;
     }
-    let _ = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(DAEMON_URL.parse().unwrap()))
-        .title("knowledge-system")
-        .inner_size(1240.0, 860.0)
-        .hidden_title(true)
-        .title_bar_style(tauri::TitleBarStyle::Overlay)
-        .build();
+    let _ = WebviewWindowBuilder::new(
+        app,
+        "main",
+        WebviewUrl::External(DAEMON_URL.parse().unwrap()),
+    )
+    .title("knowledge-system")
+    .inner_size(1240.0, 860.0)
+    .hidden_title(true)
+    .title_bar_style(tauri::TitleBarStyle::Overlay)
+    .build();
 }
 
 fn main() {
@@ -144,8 +150,7 @@ fn main() {
                 .items(&[&open, &garden, &restart, &quit])
                 .build()?;
 
-            let tray_icon =
-                tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
+            let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
             TrayIconBuilder::with_id("main-tray")
                 .icon(tray_icon)
                 .icon_as_template(true)

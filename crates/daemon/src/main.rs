@@ -206,12 +206,9 @@ async fn main() -> anyhow::Result<()> {
             let app = mcp::router(store.clone(), claude)
                 .merge(admin::router(store.clone()))
                 .merge(api::router(api::ApiState { store, human: tom }))
-                .fallback_service(
-                    tower_http::services::ServeDir::new(&ui_dist)
-                        .fallback(tower_http::services::ServeFile::new(
-                            format!("{ui_dist}/index.html"),
-                        )),
-                );
+                .fallback_service(tower_http::services::ServeDir::new(&ui_dist).fallback(
+                    tower_http::services::ServeFile::new(format!("{ui_dist}/index.html")),
+                ));
             let addr = format!("127.0.0.1:{port}");
             tracing::info!("ksd serving MCP (streamable HTTP) at http://{addr}/mcp");
             let listener = tokio::net::TcpListener::bind(&addr).await?;

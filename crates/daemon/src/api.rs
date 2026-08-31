@@ -17,7 +17,10 @@ pub struct ApiState {
 }
 
 async fn docs(State(st): State<ApiState>) -> Json<Value> {
-    let s = st.store.lock().unwrap();
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.list_docs() {
         Ok(d) => Json(json!(d)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -25,7 +28,10 @@ async fn docs(State(st): State<ApiState>) -> Json<Value> {
 }
 
 async fn doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let s = st.store.lock().unwrap();
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.read_doc(id) {
         Ok(t) => Json(json!(t)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -33,7 +39,10 @@ async fn doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
 }
 
 async fn backlinks(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let s = st.store.lock().unwrap();
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.backlinks(id) {
         Ok(b) => Json(json!(b)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -41,7 +50,10 @@ async fn backlinks(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Val
 }
 
 async fn queue(State(st): State<ApiState>) -> Json<Value> {
-    let s = st.store.lock().unwrap();
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.review_queue(None) {
         Ok(q) => {
             // decorate with doc titles + principal names for rendering
@@ -88,7 +100,10 @@ async fn resolve(State(st): State<ApiState>, Json(req): Json<ResolveReq>) -> Jso
         "decline" => ReviewDecision::Decline,
         other => return Json(json!({"error": format!("bad decision: {other}")})),
     };
-    let mut s = st.store.lock().unwrap();
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.resolve(req.annotation_id, st.human, decision) {
         Ok(receipt) => Json(json!({"ok": true, "receipt": receipt})),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -101,7 +116,10 @@ struct SearchQuery {
 }
 
 async fn search(State(st): State<ApiState>, Query(p): Query<SearchQuery>) -> Json<Value> {
-    let s = st.store.lock().unwrap();
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.search_blocks(&p.q, 20) {
         Ok(h) => Json(json!(h)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -109,7 +127,10 @@ async fn search(State(st): State<ApiState>, Query(p): Query<SearchQuery>) -> Jso
 }
 
 async fn tags(State(st): State<ApiState>) -> Json<Value> {
-    let s = st.store.lock().unwrap();
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.list_tags() {
         Ok(t) => Json(json!(t)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -117,7 +138,10 @@ async fn tags(State(st): State<ApiState>) -> Json<Value> {
 }
 
 async fn runs(State(st): State<ApiState>) -> Json<Value> {
-    let s = st.store.lock().unwrap();
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.list_runs(20) {
         Ok(r) => Json(json!(r)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -133,7 +157,10 @@ struct ProposeReq {
 
 /// Human writes: propose as tom — current-epoch ops green and apply directly.
 async fn propose(State(st): State<ApiState>, Json(req): Json<ProposeReq>) -> Json<Value> {
-    let mut s = st.store.lock().unwrap();
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.propose(req.doc_id, req.base_epoch, st.human, req.ops) {
         Ok(out) => Json(json!(out)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -147,7 +174,10 @@ struct CreateDocReq {
 }
 
 async fn create_doc(State(st): State<ApiState>, Json(req): Json<CreateDocReq>) -> Json<Value> {
-    let mut s = st.store.lock().unwrap();
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.create_doc(&req.title, req.parent_doc_id, st.human) {
         Ok(d) => Json(json!(d)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -155,7 +185,10 @@ async fn create_doc(State(st): State<ApiState>, Json(req): Json<CreateDocReq>) -
 }
 
 async fn principals(State(st): State<ApiState>) -> Json<Value> {
-    let s = st.store.lock().unwrap();
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.list_principals() {
         Ok(p) => Json(json!(p)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -164,7 +197,10 @@ async fn principals(State(st): State<ApiState>) -> Json<Value> {
 
 /// Per-doc op history, newest first — the provenance panel (5.4).
 async fn history(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let s = st.store.lock().unwrap();
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.ops_since(id, 0) {
         Ok(mut ops) => {
             ops.reverse();
@@ -197,7 +233,10 @@ struct CommentReq {
 }
 
 async fn add_comment(State(st): State<ApiState>, Json(req): Json<CommentReq>) -> Json<Value> {
-    let mut s = st.store.lock().unwrap();
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.add_comment(req.block_id, st.human, &req.text, req.reply_to) {
         Ok(c) => Json(json!(c)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -207,7 +246,10 @@ async fn add_comment(State(st): State<ApiState>, Json(req): Json<CommentReq>) ->
 /// Graph view data (5.10): nodes = docs (tinted by tending principal —
 /// the principal of the doc's last applied op), links = resolved wikilinks.
 async fn graph(State(st): State<ApiState>) -> Json<Value> {
-    let s = st.store.lock().unwrap();
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let docs = match s.list_docs() {
         Ok(d) => d,
         Err(e) => return Json(json!({"error": e.to_string()})),
@@ -278,15 +320,19 @@ async fn render_d2(Json(req): Json<D2Req>) -> Json<Value> {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
-        child.stdin.take().unwrap().write_all(req.source.as_bytes())?;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(req.source.as_bytes())?;
         child.wait_with_output()
     })
     .await;
     match out {
-        Ok(Ok(o)) if o.status.success() => {
-            Json(json!({"svg": String::from_utf8_lossy(&o.stdout)}))
-        }
-        Ok(Ok(o)) => Json(json!({"error": String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>()})),
+        Ok(Ok(o)) if o.status.success() => Json(json!({"svg": String::from_utf8_lossy(&o.stdout)})),
+        Ok(Ok(o)) => Json(
+            json!({"error": String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>()}),
+        ),
         _ => Json(json!({"error": "d2 render failed"})),
     }
 }
@@ -308,7 +354,10 @@ async fn set_status(
             None => return Json(json!({"error": format!("bad status: {v}")})),
         },
     };
-    let mut s = st.store.lock().unwrap();
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.set_doc_status(id, status) {
         Ok(()) => Json(json!({"ok": true})),
         Err(e) => Json(json!({"error": e.to_string()})),

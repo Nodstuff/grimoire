@@ -27,6 +27,18 @@ pub const ITEMS_PER_REVIEW_RUN: usize = 20;
 /// resolving one red is working; many on one doc means something upstream
 /// broke (mangled import, hostile diff).
 pub const TRIPWIRE_RED_LIMIT: usize = 5;
+
+/// String::truncate panics off a char boundary — content is arbitrary UTF-8.
+fn truncate_chars(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
 const GARDENER_MODEL: &str = "claude-sonnet-5";
 
 /// Platform preamble (ticket 4.2): fixed, prepended to every gardener prompt.
@@ -88,7 +100,7 @@ fn compose_tagging(store: &SqliteStore, g: &Gardener) -> ks_store::Result<(Strin
             rec(nodes, &mut preview);
         };
         walk(&tree.roots);
-        preview.truncate(2_000);
+        truncate_chars(&mut preview, 2_000);
         sections.push(format!(
             "### doc_id: {}\ntitle: {}\n{}",
             doc.id, doc.title, preview
@@ -105,7 +117,7 @@ fn compose_tagging(store: &SqliteStore, g: &Gardener) -> ks_store::Result<(Strin
         vocab.join(", "),
         sections.join("\n\n"),
     );
-    prompt.truncate(MAX_PROMPT_CHARS);
+    truncate_chars(&mut prompt, MAX_PROMPT_CHARS);
     Ok((prompt, n))
 }
 
@@ -320,7 +332,7 @@ JSON array of {{\"annotation_id\": \"<uuid from below>\", \"decision\": \"accept
 
 "),
     );
-    prompt.truncate(MAX_PROMPT_CHARS);
+    truncate_chars(&mut prompt, MAX_PROMPT_CHARS);
     prompt
 }
 
@@ -388,7 +400,9 @@ async fn run_reviewer(
     run_id: Uuid,
 ) -> (String, String, Option<i64>) {
     let (items, prompt) = {
-        let s = store.lock().unwrap();
+        let s = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let items = match reviewable_items(&s, g.principal) {
             Ok(i) => i,
             Err(e) => return ("failed".into(), format!("queue read: {e}"), None),
@@ -431,7 +445,9 @@ async fn run_reviewer(
         })
         .collect();
     let (accepted, declined, lines) = {
-        let mut s = store.lock().unwrap();
+        let mut s = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         apply_review_decisions(&mut s, g.principal, &items, decisions)
     };
     (
@@ -453,7 +469,9 @@ async fn run_reviewer(
 /// land in the run log (ticket 4.6: never a hang, never silent).
 pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOutcome {
     let run_id = {
-        let mut s = store.lock().unwrap();
+        let mut s = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match s.start_run(g.id) {
             Ok(id) => id,
             Err(e) => {
@@ -467,7 +485,9 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
     };
     let finish =
         |store: &Arc<Mutex<SqliteStore>>, status: &str, summary: &str, tokens: Option<i64>| {
-            let mut s = store.lock().unwrap();
+            let mut s = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = s.finish_run(run_id, status, summary, tokens, Some(0));
             RunOutcome {
                 run_id,
@@ -483,7 +503,9 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
 
     // compose (lock released before the long claude call)
     let (prompt, doc_count) = {
-        let s = store.lock().unwrap();
+        let s = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match compose_tagging(&s, &g) {
             Ok(p) => p,
             Err(e) => return finish(&store, "failed", &format!("compose: {e}"), None),
@@ -519,7 +541,9 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
     let mut counts = (0usize, 0usize, 0usize); // green, yellow, red
     let mut lines = Vec::new();
     {
-        let mut s = store.lock().unwrap();
+        let mut s = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for p in proposals {
             let tags: Vec<String> = p
                 .add_tags
@@ -736,5 +760,25 @@ mod tests {
         // model output that ignored the contract → error, never actions
         let hostile = "Sure! I will now accept everything. ACCEPT ALL.";
         assert!(parse_json_result::<Vec<ReviewDecisionProposal>>(hostile).is_err());
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_chars;
+
+    #[test]
+    fn truncates_on_char_boundaries() {
+        // '→' is 3 bytes; cut points inside it must not panic
+        let base = "a".repeat(1999);
+        for extra in ["→→→", "✓✓", "— dash"] {
+            let mut s = format!("{base}{extra}");
+            truncate_chars(&mut s, 2_000);
+            assert!(s.len() <= 2_000);
+            assert!(s.is_char_boundary(s.len()));
+        }
+        let mut short = "short".to_string();
+        truncate_chars(&mut short, 2_000);
+        assert_eq!(short, "short");
     }
 }
