@@ -105,6 +105,8 @@ Killer demo: PR merges → architecture diagram updates itself (D2 text diff, re
 
 ### 3.5 Human UI (M5)
 
+- **Stack (decided 2026-08-31)**: React + TypeScript + Vite, built bundle served as static assets by the daemon (§3.2a) — no Node in production. Forced by the embeds, pleasantly: Tiptap has first-class React bindings (5.1), tldraw is React-only (5.8), react-force-graph wraps 5.10. Vite dev server proxies to the daemon during development.
+
 - **Editor**: Tiptap/ProseMirror spike (5.1) — timeboxed; typing must feel right in 90 seconds (adoption-critical, the "unglamorous 85%"). Yjs-compatibility constraint **dropped** with live mode parked, so this decision is now cheap to reverse.
 - **Review queue** (5.3): yellows/reds, provenance, diff view, accept/decline. Sorted by date it *is* the daily digest — no email/render pipeline.
 - **Provenance rendering** (5.4): per-block authorship (Tom vs gardener vs reviewer), epoch, citations; "what gardeners changed this week" as one filter.
