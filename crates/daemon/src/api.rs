@@ -4,7 +4,7 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ks_store::{BlockStore, ReviewDecision, SqliteStore};
+use ks_store::{BlockStore, OpInput, ReviewDecision, SqliteStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -124,9 +124,40 @@ async fn runs(State(st): State<ApiState>) -> Json<Value> {
     }
 }
 
+#[derive(Deserialize)]
+struct ProposeReq {
+    doc_id: Uuid,
+    base_epoch: i64,
+    ops: Vec<OpInput>,
+}
+
+/// Human writes: propose as tom — current-epoch ops green and apply directly.
+async fn propose(State(st): State<ApiState>, Json(req): Json<ProposeReq>) -> Json<Value> {
+    let mut s = st.store.lock().unwrap();
+    match s.propose(req.doc_id, req.base_epoch, st.human, req.ops) {
+        Ok(out) => Json(json!(out)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateDocReq {
+    title: String,
+    parent_doc_id: Option<Uuid>,
+}
+
+async fn create_doc(State(st): State<ApiState>, Json(req): Json<CreateDocReq>) -> Json<Value> {
+    let mut s = st.store.lock().unwrap();
+    match s.create_doc(&req.title, req.parent_doc_id, st.human) {
+        Ok(d) => Json(json!(d)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 pub fn router(state: ApiState) -> Router {
     Router::new()
-        .route("/api/docs", get(docs))
+        .route("/api/docs", get(docs).post(create_doc))
+        .route("/api/propose", post(propose))
         .route("/api/doc/{id}", get(doc))
         .route("/api/doc/{id}/backlinks", get(backlinks))
         .route("/api/queue", get(queue))

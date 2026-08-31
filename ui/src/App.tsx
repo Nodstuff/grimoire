@@ -11,7 +11,7 @@ import {
 } from './types'
 
 type View = { kind: 'doc'; id: string } | { kind: 'review' } | { kind: 'runs' } | { kind: 'home' }
-type Palette = null | 'commands' | 'search'
+type Palette = null | 'commands' | 'search' | 'newdoc'
 
 export default function App() {
   const [view, setView] = useState<View>({ kind: 'home' })
@@ -35,9 +35,12 @@ export default function App() {
       if (mod && e.key === 'k') {
         e.preventDefault()
         setPalette((p) => (p === 'commands' ? null : 'commands'))
-      } else if (mod && e.key === 't') {
+      } else if (mod && e.key === 'b') {
         e.preventDefault()
         setTreeOpen((t) => !t)
+      } else if (mod && e.key === 'e') {
+        e.preventDefault()
+        setPalette((p) => (p === 'newdoc' ? null : 'newdoc'))
       } else if (mod && e.key === 's') {
         e.preventDefault()
         setPalette((p) => (p === 'search' ? null : 'search'))
@@ -71,7 +74,8 @@ export default function App() {
             <div className="home-hints">
               <span><kbd>⌘K</kbd> commands</span>
               <span><kbd>⌘S</kbd> search</span>
-              <span><kbd>⌘T</kbd> tree</span>
+              <span><kbd>⌘B</kbd> tree</span>
+              <span><kbd>⌘E</kbd> new doc</span>
             </div>
           </div>
         )}
@@ -101,12 +105,25 @@ export default function App() {
             if (a === 'runs') setView({ kind: 'runs' })
             if (a === 'tree') setTreeOpen((t) => !t)
             if (a === 'home') setView({ kind: 'home' })
+            if (a === 'newdoc') {
+              setPalette('newdoc')
+              return
+            }
             setPalette(null)
           }}
           onClose={() => setPalette(null)}
         />
       )}
       {palette === 'search' && <SearchPalette onOpenDoc={openDoc} onClose={() => setPalette(null)} />}
+      {palette === 'newdoc' && (
+        <NewDocPalette
+          onCreated={(id) => {
+            api<Doc[]>('/api/docs').then(setDocs).catch(() => {})
+            openDoc(id)
+          }}
+          onClose={() => setPalette(null)}
+        />
+      )}
     </div>
   )
 }
@@ -139,7 +156,7 @@ function CommandPalette({
   docs: Doc[]
   queueCount: number
   onOpenDoc: (id: string) => void
-  onAction: (a: 'review' | 'runs' | 'tree' | 'home') => void
+  onAction: (a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc') => void
   onClose: () => void
 }) {
   const [q, setQ] = useState('')
@@ -150,8 +167,9 @@ function CommandPalette({
   type Item = { label: string; hint?: string; run: () => void }
   const commands: Item[] = [
     { label: `Review queue`, hint: queueCount ? `${queueCount} open` : 'empty', run: () => onAction('review') },
+    { label: 'New doc…', hint: '⌘E', run: () => onAction('newdoc') },
     { label: 'Gardener runs', run: () => onAction('runs') },
-    { label: 'Toggle file tree', hint: '⌘T', run: () => onAction('tree') },
+    { label: 'Toggle file tree', hint: '⌘B', run: () => onAction('tree') },
     { label: 'Home', run: () => onAction('home') },
   ]
 
@@ -269,6 +287,71 @@ function SearchPalette({
   )
 }
 
+function NewDocPalette({
+  onCreated,
+  onClose,
+}: {
+  onCreated: (id: string) => void
+  onClose: () => void
+}) {
+  const [title, setTitle] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+  useEffect(() => inputRef.current?.focus(), [])
+
+  const create = async () => {
+    if (!title.trim()) return
+    const d = await api<Doc>('/api/docs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: title.trim() }),
+    })
+    onCreated(d.id)
+  }
+
+  return (
+    <PaletteShell onClose={onClose}>
+      <input
+        ref={inputRef}
+        placeholder="New doc title…"
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') create().catch((err) => alert(String(err)))
+        }}
+      />
+      <div className="palette-empty">Enter to create</div>
+    </PaletteShell>
+  )
+}
+
+/* ---------- order keys (mirror of the store's base-36 fractions) ---------- */
+
+const DIGITS = '0123456789abcdefghijklmnopqrstuvwxyz'
+
+function keyBetween(a: string | null, b: string | null): string {
+  const av = a ?? ''
+  let out = ''
+  let i = 0
+  for (;;) {
+    const da = i < av.length ? DIGITS.indexOf(av[i]) : 0
+    const db = b == null ? 36 : i < b.length ? DIGITS.indexOf(b[i]) : 0
+    if (da === db) {
+      out += DIGITS[da]
+      i++
+      continue
+    }
+    if (db - da > 1) return out + DIGITS[(da + db) >> 1]
+    out += DIGITS[da]
+    i++
+    for (;;) {
+      const d = i < av.length ? DIGITS.indexOf(av[i]) : 0
+      if (36 - d > 1) return out + DIGITS[(d + 36) >> 1]
+      out += DIGITS[d]
+      i++
+    }
+  }
+}
+
 /* ---------- tree ---------- */
 
 function DocTreeNav({
@@ -352,13 +435,67 @@ function DocView({
 }) {
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
+  const [editing, setEditing] = useState<string | null>(null)
   const tints = useMemo(() => new Map<string, string>(), [docId])
 
-  useEffect(() => {
-    setTree(null)
+  const load = useCallback(() => {
     api<DocTree>(`/api/doc/${docId}`).then(setTree).catch(console.error)
     api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => setBacklinks([]))
   }, [docId])
+
+  useEffect(() => {
+    setTree(null)
+    setEditing(null)
+    load()
+  }, [load])
+
+  // every human edit goes through the same gate as agents, as the tom principal
+  const submit = useCallback(
+    async (ops: unknown[]) => {
+      if (!tree) return
+      try {
+        await api('/api/propose', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ doc_id: docId, base_epoch: tree.doc.current_epoch, ops }),
+        })
+      } catch (e) {
+        alert(String(e))
+      }
+      setEditing(null)
+      load()
+    },
+    [tree, docId, load],
+  )
+
+  const saveBlock = (blockId: string, content: string) => {
+    const trimmed = content.trimEnd()
+    if (trimmed === '') {
+      submit([{ kind: { op: 'delete', target: blockId }, source_refs: [] }])
+    } else {
+      submit([{ kind: { op: 'replace', target: blockId, content: trimmed }, source_refs: [] }])
+    }
+  }
+
+  const addBlock = () => {
+    if (!tree) return
+    const lastKey = tree.roots.length ? tree.roots[tree.roots.length - 1].block.order_key : null
+    const id = crypto.randomUUID()
+    submit([
+      {
+        kind: {
+          op: 'insert',
+          block_id: id,
+          parent_id: null,
+          order_key: keyBetween(lastKey, null),
+          block_type: 'paragraph',
+          content: 'new block',
+          refers_to: null,
+        },
+        source_refs: [],
+      },
+    ]).then(() => setEditing(id))
+  }
 
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
 
@@ -377,11 +514,20 @@ function DocView({
     if (n.block.block_type === 'comment') return null
     return (
       <div key={n.block.id}>
-        <BlockView
-          block={n.block}
-          tint={tintFor(n.block.created_by, tints)}
-          onWikilink={openWikilink}
-        />
+        {editing === n.block.id ? (
+          <BlockEditor
+            initial={n.block.content}
+            onSave={(c) => saveBlock(n.block.id, c)}
+            onCancel={() => setEditing(null)}
+          />
+        ) : (
+          <BlockView
+            block={n.block}
+            tint={tintFor(n.block.created_by, tints)}
+            onWikilink={openWikilink}
+            onEdit={() => setEditing(n.block.id)}
+          />
+        )}
         {n.children.map(renderNode)}
       </div>
     )
@@ -395,6 +541,7 @@ function DocView({
         {tree.doc.review_policy && <span className="meta policy">{tree.doc.review_policy}</span>}
       </div>
       {tree.roots.map(renderNode)}
+      <div className="add-block" onClick={addBlock}>+</div>
       {backlinks.length > 0 && (
         <div className="backlinks">
           <span className="meta">linked from</span>
@@ -413,23 +560,30 @@ function BlockView({
   block,
   tint,
   onWikilink,
+  onEdit,
 }: {
   block: { id: string; block_type: string; content: string; created_by: string }
   tint: string
   onWikilink: (t: string) => void
+  onEdit: () => void
 }) {
   const isFrontmatter = block.content.startsWith('---')
   if (isFrontmatter) return null // presentation mode: metadata stays out of the page
   if (block.block_type === 'code' || block.block_type.startsWith('diagram')) {
     return (
-      <pre className="block code" data-tint={tint} style={{ ['--tint' as never]: tint }}>
+      <pre
+        className="block code"
+        data-tint={tint}
+        style={{ ['--tint' as never]: tint }}
+        onDoubleClick={onEdit}
+      >
         {block.content}
       </pre>
     )
   }
   const parts = block.content.split(/(\[\[[^\]]+\]\])/g)
   return (
-    <div className="block" style={{ ['--tint' as never]: tint }}>
+    <div className="block" style={{ ['--tint' as never]: tint }} onDoubleClick={onEdit}>
       {parts.map((p, i) => {
         const m = p.match(/^\[\[([^\]|#]+)/)
         if (m)
@@ -441,6 +595,47 @@ function BlockView({
         return <Markdown key={i}>{p}</Markdown>
       })}
     </div>
+  )
+}
+
+function BlockEditor({
+  initial,
+  onSave,
+  onCancel,
+}: {
+  initial: string
+  onSave: (content: string) => void
+  onCancel: () => void
+}) {
+  const [value, setValue] = useState(initial)
+  const ref = useRef<HTMLTextAreaElement>(null)
+  useEffect(() => {
+    const el = ref.current
+    if (el) {
+      el.focus()
+      el.setSelectionRange(el.value.length, el.value.length)
+      el.style.height = el.scrollHeight + 'px'
+    }
+  }, [])
+  return (
+    <textarea
+      ref={ref}
+      className="block-editor"
+      value={value}
+      onChange={(e) => {
+        setValue(e.target.value)
+        e.target.style.height = 'auto'
+        e.target.style.height = e.target.scrollHeight + 'px'
+      }}
+      onKeyDown={(e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') onSave(value)
+        if (e.key === 'Escape') {
+          e.stopPropagation()
+          onCancel()
+        }
+      }}
+      onBlur={() => (value === initial ? onCancel() : onSave(value))}
+    />
   )
 }
 
