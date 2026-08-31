@@ -91,6 +91,13 @@ pub trait BlockStore {
     /// None clears. "All decided docs touching X" = search + status filter.
     fn set_doc_status(&mut self, doc_id: Uuid, status: Option<DocStatus>) -> Result<()>;
 
+    /// Reparent/reorder a doc in the tree (cycle-checked; fractional sort_key).
+    fn move_doc(&mut self, doc_id: Uuid, new_parent: Option<Uuid>, sort_key: Option<&str>)
+    -> Result<()>;
+
+    /// Soft-delete a doc and its descendants; returns count. Reversible.
+    fn delete_doc(&mut self, doc_id: Uuid) -> Result<usize>;
+
     /// Substring search over live block content (ticket 3.4's v0: LIKE;
     /// FTS5+trigram replaces the internals without changing the signature).
     /// Results are blocks, not docs — the editable unit (§3.3).

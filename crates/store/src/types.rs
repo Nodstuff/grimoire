@@ -103,6 +103,7 @@ pub struct Doc {
     pub current_epoch: i64,
     pub created_by: Uuid,
     pub status: Option<DocStatus>,
+    pub sort_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
