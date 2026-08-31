@@ -699,3 +699,12 @@ kbd {
 .canvas-full { flex: 1; position: relative; }
 
 .tree-icon.canvas { color: var(--accent); opacity: 0.9; }
+
+.tree-delete.armed {
+  opacity: 1 !important;
+  color: var(--red);
+  background: var(--bg);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+}

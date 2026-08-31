@@ -42,6 +42,24 @@ export default function App() {
     refreshQueue()
   }, [refreshQueue])
 
+  // hot reload: poll the daemon's UI build stamp; a deploy reloads the app
+  // (deferred while an editor has unsaved changes)
+  useEffect(() => {
+    let build: number | null = null
+    const t = setInterval(async () => {
+      try {
+        const r = await api<{ build: number }>('/api/buildinfo')
+        if (build === null) build = r.build
+        else if (r.build !== build && !document.querySelector('.save-state.dirty, .save-state.saving')) {
+          location.reload()
+        }
+      } catch {
+        // daemon restarting mid-deploy — next tick catches the new build
+      }
+    }, 3000)
+    return () => clearInterval(t)
+  }, [])
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey
@@ -440,11 +458,23 @@ function DocTreeNav({
     onChanged()
   }
 
+  // window.confirm is a silent no-op in Tauri's webview — arm-then-confirm
+  // inline instead: first click arms the ×, second click within 2.5s deletes
+  const [armed, setArmed] = useState<string | null>(null)
+  const armTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const doDelete = async (d: Doc) => {
-    if (!confirm(`Delete "${d.title}"${childrenOf.get(d.id)?.length ? ' and everything inside it' : ''}?`))
+    if (armed !== d.id) {
+      setArmed(d.id)
+      if (armTimer.current) clearTimeout(armTimer.current)
+      armTimer.current = setTimeout(() => setArmed(null), 2500)
       return
-    await api(`/api/doc/${d.id}/delete`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
-      .catch((e) => alert(String(e)))
+    }
+    setArmed(null)
+    await api(`/api/doc/${d.id}/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    }).catch((e) => console.error(e))
     onChanged()
   }
 
@@ -512,14 +542,14 @@ function DocTreeNav({
             </span>
             <span className="tree-title">{d.title}</span>
             <button
-              className="tree-delete"
-              title="delete"
+              className={`tree-delete ${armed === d.id ? 'armed' : ''}`}
+              title={armed === d.id ? 'click again to delete' : 'delete'}
               onClick={(e) => {
                 e.stopPropagation()
                 doDelete(d)
               }}
             >
-              ×
+              {armed === d.id ? 'sure?' : '×'}
             </button>
           </div>
           {isDir && isOpen && (
