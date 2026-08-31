@@ -645,3 +645,5 @@ kbd {
 }
 .canvas-doc-head h1 { margin: 0; font-size: 17px; font-weight: 650; }
 .canvas-full { flex: 1; position: relative; }
+
+.tree-icon.canvas { color: var(--accent); opacity: 0.9; }

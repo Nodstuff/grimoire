@@ -209,7 +209,11 @@ function CommandPalette({
       : docs.slice(0, 0)
     )
       .slice(0, 12)
-      .map((d) => ({ label: d.title, hint: 'doc', run: () => onOpenDoc(d.id) }))
+      .map((d) => ({
+        label: d.is_canvas ? `▨ ${d.title}` : d.title,
+        hint: d.is_canvas ? 'canvas' : 'doc',
+        run: () => onOpenDoc(d.id),
+      }))
     return [...cmds, ...docItems]
   }, [q, docs, queueCount])
 
@@ -422,7 +426,9 @@ function DocTreeNav({
               else onSelect(d.id)
             }}
           >
-            <span className="tree-icon">{isDir ? (isOpen ? '▾' : '▸') : ''}</span>
+            <span className={`tree-icon ${d.is_canvas ? 'canvas' : ''}`}>
+              {isDir ? (isOpen ? '▾' : '▸') : d.is_canvas ? '▨' : ''}
+            </span>
             {d.title}
           </div>
           {isDir && isOpen && renderLevel(d.id, depth + 1)}

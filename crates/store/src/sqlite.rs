@@ -1507,6 +1507,15 @@ impl SqliteStore {
         .collect()
     }
 
+    /// Docs whose content is a canvas scene (for tree/type badges).
+    pub fn canvas_doc_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT doc_id FROM blocks WHERE block_type = 'canvas_scene' AND deleted = 0",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.map(|r| Ok(r?)).collect()
+    }
+
     /// (doc_id, principal) of each doc's last applied op — "who tends this".
     pub fn raw_tending(&self) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(

@@ -6,6 +6,7 @@ export interface Doc {
   current_epoch: number
   created_by: string
   status: 'draft' | 'in-review' | 'decided' | 'superseded' | null
+  is_canvas?: boolean
 }
 
 export interface Block {
