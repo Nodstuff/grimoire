@@ -4,6 +4,7 @@
 //! written in the same transaction. One committed `apply` = one epoch.
 
 pub mod gate;
+pub mod import;
 pub mod order_key;
 mod sqlite;
 mod types;
@@ -42,6 +43,8 @@ pub trait BlockStore {
 
     fn get_principal(&self, id: Uuid) -> Result<Principal>;
 
+    fn list_principals(&self) -> Result<Vec<Principal>>;
+
     fn create_doc(&mut self, title: &str, parent: Option<Uuid>, created_by: Uuid) -> Result<Doc>;
 
     fn list_docs(&self) -> Result<Vec<Doc>>;
@@ -67,6 +70,11 @@ pub trait BlockStore {
 
     /// Ledger ops applied after `since_epoch`, oldest first (tool 3.6's SELECT).
     fn ops_since(&self, doc_id: Uuid, since_epoch: i64) -> Result<Vec<LedgerOp>>;
+
+    /// Substring search over live block content (ticket 3.4's v0: LIKE;
+    /// FTS5+trigram replaces the internals without changing the signature).
+    /// Results are blocks, not docs — the editable unit (§3.3).
+    fn search_blocks(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>>;
 
     /// The propose gate (ticket 2.5): the write path for agents and for any
     /// stale base. Current base → all green, applied. Stale base → per-op

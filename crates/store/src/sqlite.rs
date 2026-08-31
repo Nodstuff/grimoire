@@ -351,6 +351,31 @@ impl BlockStore for SqliteStore {
         })
     }
 
+    fn list_principals(&self) -> Result<Vec<Principal>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, display_name, pubkey FROM principals ORDER BY display_name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (id, kind, display_name, pubkey) = r?;
+            Ok(Principal {
+                id: uuid_col(id, "principals.id")?,
+                kind: PrincipalKind::parse(&kind)
+                    .ok_or_else(|| StoreError::InvalidOp(format!("bad principal kind: {kind}")))?,
+                display_name,
+                pubkey,
+            })
+        })
+        .collect()
+    }
+
     fn create_doc(&mut self, title: &str, parent: Option<Uuid>, created_by: Uuid) -> Result<Doc> {
         let id = Uuid::now_v7();
         self.conn.execute(
@@ -499,6 +524,38 @@ impl BlockStore for SqliteStore {
         ))?;
         let rows = stmt.query_map(params![doc_id.to_string(), since_epoch], row_to_op)?;
         rows.map(|r| build_op(r?)).collect()
+    }
+
+    fn search_blocks(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let sql = format!(
+            "SELECT {}, d.title FROM blocks b JOIN docs d ON d.id = b.doc_id
+             WHERE b.deleted = 0 AND b.content LIKE ?1 ESCAPE '\\'
+             ORDER BY d.title, b.order_key LIMIT ?2",
+            BLOCK_COLS
+                .split(", ")
+                .map(|c| format!("b.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |r| {
+            let raw = row_to_block(r)?;
+            let title: String = r.get(9)?;
+            Ok((raw, title))
+        })?;
+        rows.map(|r| {
+            let (raw, doc_title) = r?;
+            Ok(SearchHit {
+                block: build_block(raw)?,
+                doc_title,
+            })
+        })
+        .collect()
     }
 
     fn propose(

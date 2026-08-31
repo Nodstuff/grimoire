@@ -314,3 +314,10 @@ pub enum ReviewDecision {
     Accept,
     Decline,
 }
+
+/// A search hit: the block plus its doc breadcrumb.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SearchHit {
+    pub block: Block,
+    pub doc_title: String,
+}
