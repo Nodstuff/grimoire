@@ -432,6 +432,8 @@ pub struct Gardener {
 pub struct GardenerRun {
     pub id: Uuid,
     pub gardener: Uuid,
+    pub gardener_name: String,
+    pub started_at: String,
     pub status: String,
     pub summary: Option<String>,
     pub tokens_used: Option<i64>,

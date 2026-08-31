@@ -65,6 +65,8 @@ export interface SearchHit {
 export interface GardenerRun {
   id: string
   gardener: string
+  gardener_name: string
+  started_at: string
   status: string
   summary: string | null
   tokens_used: number | null

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DocEditor from './editor/DocEditor'
 import GraphView from './GraphView'
+import Gardeners from './Gardeners'
 import {
   api,
   Block,
@@ -100,7 +101,7 @@ export default function App() {
             onOpenDoc={openDoc}
           />
         )}
-        {view.kind === 'runs' && <Runs />}
+        {view.kind === 'runs' && <Gardeners />}
         {view.kind === 'graph' && <GraphView onOpenDoc={openDoc} />}
       </main>
 
@@ -184,7 +185,7 @@ function CommandPalette({
   const commands: Item[] = [
     { label: `Review queue`, hint: queueCount ? `${queueCount} open` : 'empty', run: () => onAction('review') },
     { label: 'New doc…', hint: '⌘N', run: () => onAction('newdoc') },
-    { label: 'Gardener runs', run: () => onAction('runs') },
+    { label: 'Gardeners', run: () => onAction('runs') },
     { label: 'Graph view', run: () => onAction('graph') },
     { label: 'Toggle file tree', hint: '⌘T', run: () => onAction('tree') },
     { label: 'Home', run: () => onAction('home') },
@@ -818,30 +819,6 @@ function ReviewQueue({
           </div>
         )
       })}
-    </div>
-  )
-}
-
-/* ---------- runs ---------- */
-
-function Runs() {
-  const [runs, setRuns] = useState<GardenerRun[]>([])
-  useEffect(() => {
-    api<GardenerRun[]>('/api/runs').then(setRuns).catch(console.error)
-  }, [])
-  if (runs.length === 0) return <div className="empty">no gardener runs yet</div>
-  return (
-    <div className="runs">
-      <h1 className="queue-title">gardeners</h1>
-      {runs.map((r) => (
-        <div key={r.id} className="run">
-          <div className="run-head">
-            <span className={`status ${r.status}`}>{r.status}</span>
-            {r.tokens_used != null && <span className="meta">{r.tokens_used} tokens</span>}
-          </div>
-          <pre>{r.summary}</pre>
-        </div>
-      ))}
     </div>
   )
 }

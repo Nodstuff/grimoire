@@ -523,3 +523,45 @@ kbd {
 .chip.status-in-review { color: var(--yellow); border-color: var(--yellow); }
 .chip.status-decided { color: var(--green); border-color: var(--green); }
 .chip.status-superseded { color: var(--red); border-color: var(--red); text-decoration: line-through; }
+
+/* ---------- gardener management ---------- */
+
+.gardeners-head { display: flex; justify-content: space-between; align-items: baseline; }
+.runs-title { font-size: 15px; color: var(--fg-dim); margin: 24px 0 4px; font-weight: 600; }
+.gardener-card.disabled { opacity: 0.55; }
+.prompt-edit {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  padding: 8px 10px;
+  font: 13px/1.5 inherit;
+  resize: vertical;
+  outline: none;
+  margin: 6px 0;
+}
+.prompt-edit:focus { border-color: var(--accent); }
+.gardener-row { display: flex; gap: 16px; align-items: flex-end; }
+.gardener-row label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--fg-dim); }
+.gardener-row input, .gardener-row select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  padding: 4px 8px;
+  font-size: 13px;
+  outline: none;
+}
+.gardener-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.gardener-actions .accept {
+  background: var(--green);
+  color: #101014;
+  border: none;
+  border-radius: 7px;
+  padding: 4px 14px;
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+}
+.toggle { display: flex; gap: 5px; align-items: center; font-size: 12px; color: var(--fg-dim); cursor: pointer; }
