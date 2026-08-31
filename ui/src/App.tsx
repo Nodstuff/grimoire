@@ -30,7 +30,10 @@ export default function App() {
   const [queueCount, setQueueCount] = useState(0)
 
   const refreshQueue = useCallback(() => {
-    api<QueueRow[]>('/api/queue').then((q) => setQueueCount(q.length)).catch(() => {})
+    Promise.all([
+      api<QueueRow[]>('/api/queue').then((q) => q.length).catch(() => 0),
+      api<{ block: { id: string } }[]>('/api/flags').then((f) => f.length).catch(() => 0),
+    ]).then(([q, f]) => setQueueCount(q + f))
   }, [])
 
   useEffect(() => {
@@ -725,6 +728,13 @@ function CommentRow({ c }: { c: Block }) {
 
 /* ---------- review queue ---------- */
 
+interface FlagRow {
+  block: Block
+  doc_title: string
+  author: string
+  target_content: string | null
+}
+
 function ReviewQueue({
   onChange,
   onOpenDoc,
@@ -733,15 +743,18 @@ function ReviewQueue({
   onOpenDoc: (id: string) => void
 }) {
   const [rows, setRows] = useState<QueueRow[]>([])
+  const [flags, setFlags] = useState<FlagRow[]>([])
   const [busy, setBusy] = useState<string | null>(null)
 
   const load = useCallback(() => {
-    api<QueueRow[]>('/api/queue')
-      .then((q) => {
-        setRows(q)
-        onChange(q.length)
-      })
-      .catch(console.error)
+    Promise.all([
+      api<QueueRow[]>('/api/queue').catch(() => [] as QueueRow[]),
+      api<FlagRow[]>('/api/flags').catch(() => [] as FlagRow[]),
+    ]).then(([q, f]) => {
+      setRows(q)
+      setFlags(f)
+      onChange(q.length + f.length)
+    })
   }, [onChange])
 
   useEffect(load, [load])
@@ -761,7 +774,19 @@ function ReviewQueue({
     load()
   }
 
-  if (rows.length === 0) return <div className="empty">review queue is empty ✓</div>
+  const dismiss = async (commentId: string) => {
+    setBusy(commentId)
+    await api('/api/flags/dismiss', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ comment_id: commentId }),
+    }).catch((e) => alert(String(e)))
+    setBusy(null)
+    load()
+  }
+
+  if (rows.length === 0 && flags.length === 0)
+    return <div className="empty">review queue is empty ✓</div>
 
   return (
     <div className="queue">
@@ -819,6 +844,37 @@ function ReviewQueue({
           </div>
         )
       })}
+      {flags.length > 0 && (
+        <>
+          <h2 className="runs-title">audit flags</h2>
+          {flags.map((f) => (
+            <div key={f.block.id} className="card flag">
+              <div className="card-head">
+                <span className="who agent">{f.author}</span>
+                <span className="card-doc" onClick={() => onOpenDoc(f.block.doc_id)}>
+                  {f.doc_title}
+                </span>
+              </div>
+              {f.target_content && (
+                <div className="thread-target">{f.target_content.split('\n')[0].slice(0, 110)}</div>
+              )}
+              <div className="flag-text">{f.block.content}</div>
+              <div className="actions">
+                <button
+                  className="decline"
+                  disabled={busy === f.block.id}
+                  onClick={() => dismiss(f.block.id)}
+                >
+                  dismiss
+                </button>
+                <button className="chip" onClick={() => onOpenDoc(f.block.doc_id)}>
+                  open doc
+                </button>
+              </div>
+            </div>
+          ))}
+        </>
+      )}
     </div>
   )
 }
