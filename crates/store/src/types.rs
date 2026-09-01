@@ -562,3 +562,16 @@ pub struct PendingJoin {
     pub last_error: Option<String>,
     pub created_at: String,
 }
+
+/// A block on the federation wire / in a mirror replace: the projection
+/// fields only — provenance is assigned by the receiving side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirrorBlock {
+    pub id: Uuid,
+    pub parent_id: Option<Uuid>,
+    pub order_key: String,
+    pub block_type: BlockType,
+    pub content: String,
+    #[serde(default)]
+    pub refers_to: Option<Uuid>,
+}

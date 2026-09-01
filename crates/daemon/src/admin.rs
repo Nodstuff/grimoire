@@ -312,6 +312,21 @@ async fn join(State(st): State<FedState>, Json(req): Json<JoinReq>) -> Json<Valu
     }
 }
 
+async fn pull_now(State(st): State<FedState>) -> Json<Value> {
+    let Some(endpoint) = &st.ctx.endpoint else {
+        return Json(json!({"error": "federation disabled: no instance identity"}));
+    };
+    let results = crate::fed::pull_all_once(endpoint, &st.store).await;
+    let out: Vec<Value> = results
+        .into_iter()
+        .map(|(share, res)| match res {
+            Ok(s) => json!({"share": share, "changed": s.changed, "removed": s.removed}),
+            Err(e) => json!({"share": share, "error": format!("{e:#}")}),
+        })
+        .collect();
+    Json(json!(out))
+}
+
 async fn list_joins(State(st): State<FedState>) -> Json<Value> {
     let s = st
         .store
@@ -331,6 +346,7 @@ pub fn router(store: Store, fed: FedCtx) -> Router {
         .route("/admin/contacts/revoke", post(revoke_contact))
         .route("/admin/join", post(join))
         .route("/admin/joins", get(list_joins))
+        .route("/admin/pull", post(pull_now))
         .with_state(FedState {
             store: store.clone(),
             ctx: fed,

@@ -836,6 +836,7 @@ impl BlockStore for SqliteStore {
         principal: Uuid,
         ops: Vec<OpInput>,
     ) -> Result<ApplyReceipt> {
+        self.reject_if_mirror(doc_id)?;
         if ops.is_empty() {
             return Err(StoreError::InvalidOp("apply: empty op list".into()));
         }
@@ -1397,6 +1398,7 @@ impl BlockStore for SqliteStore {
         ops: Vec<OpInput>,
         note: &str,
     ) -> Result<Vec<Uuid>> {
+        self.reject_if_mirror(doc_id)?;
         if ops.is_empty() {
             return Err(StoreError::InvalidOp("park: empty op list".into()));
         }
@@ -1847,6 +1849,81 @@ impl BlockStore for SqliteStore {
             .into_iter()
             .map(finish_mirror)
             .collect()
+    }
+
+    fn remove_mirror(&mut self, doc_id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM mirrors WHERE doc_id = ?1",
+            params![doc_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn doc_blocks_flat(&self, doc_id: Uuid) -> Result<Vec<Block>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {BLOCK_COLS} FROM blocks
+             WHERE doc_id = ?1 AND deleted = 0 ORDER BY order_key"
+        ))?;
+        let rows = stmt.query_map(params![doc_id.to_string()], row_to_block)?;
+        rows.map(|r| build_block(r?)).collect()
+    }
+
+    fn mirror_replace_blocks(
+        &mut self,
+        doc_id: Uuid,
+        blocks: Vec<MirrorBlock>,
+        owner_epoch: i64,
+        principal: Uuid,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        // clear the old projection outright: a mirror is a replica, not a
+        // ledger — tombstones and ops describe the OWNER's history, which
+        // lives on the owner's instance
+        {
+            let mut stmt =
+                tx.prepare("SELECT id FROM blocks WHERE doc_id = ?1")?;
+            let old_ids: Vec<String> = stmt
+                .query_map(params![doc_id.to_string()], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for id in old_ids {
+                tx.execute("DELETE FROM edges WHERE from_block = ?1", params![id])?;
+                tx.execute("DELETE FROM doc_tags WHERE block_id = ?1", params![id])?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM blocks WHERE doc_id = ?1",
+            params![doc_id.to_string()],
+        )?;
+        for b in &blocks {
+            tx.execute(
+                "INSERT INTO blocks (id, doc_id, parent_id, order_key, block_type,
+                                     content, created_by, epoch, refers_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    b.id.to_string(),
+                    doc_id.to_string(),
+                    b.parent_id.map(|p| p.to_string()),
+                    b.order_key,
+                    b.block_type.as_str(),
+                    b.content,
+                    principal.to_string(),
+                    owner_epoch,
+                    b.refers_to.map(|r| r.to_string()),
+                ],
+            )?;
+            set_edges(&tx, b.id, &b.content)?;
+            set_tags(&tx, doc_id, b.id, &b.content)?;
+        }
+        tx.execute(
+            "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
+            params![owner_epoch, doc_id.to_string()],
+        )?;
+        tx.execute(
+            "UPDATE mirrors SET synced_epoch = ?1 WHERE doc_id = ?2",
+            params![owner_epoch, doc_id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn resolve(
@@ -2326,6 +2403,20 @@ fn fts_query(q: &str) -> Option<String> {
 }
 
 impl SqliteStore {
+    /// Mirror docs are read-only replicas at the store layer (#59): every
+    /// local content write is refused, whatever the surface. The propose
+    /// permission (#60) ships edits UPSTREAM instead — it never writes the
+    /// local projection directly. The sync path itself uses
+    /// mirror_replace_blocks, which bypasses this by construction.
+    fn reject_if_mirror(&self, doc_id: Uuid) -> Result<()> {
+        if self.get_mirror(doc_id)?.is_some() {
+            return Err(StoreError::InvalidOp(
+                "mirror doc is read-only: it is synced from a remote owner".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn propose_impl(
         &mut self,
         doc_id: Uuid,
@@ -2334,6 +2425,7 @@ impl SqliteStore {
         ops: Vec<OpInput>,
         cap_review: bool,
     ) -> Result<ProposeOutcome> {
+        self.reject_if_mirror(doc_id)?;
         if ops.is_empty() {
             return Err(StoreError::InvalidOp("propose: empty op list".into()));
         }
