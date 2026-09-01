@@ -1,3 +1,12 @@
+> **Status (2026-09-01):** this is the founding design record, kept as written. Since
+> then everything in it has been built, including all of §6 and §7: v1 (M1–M5),
+> federation over iroh with trust tiers (M6/M7, ADR 0002), hot docs with presence,
+> auto-hot and comments-as-chat (M8, ADR 0003), a signed + notarized dmg, and the
+> React Flow canvas with live collab (M9). Where this file says "parked" or "design
+> constraints only", read the ADRs in `docs/adr/` and the `[[Grimoire]]` doc tree in
+> Grimoire itself for what exists. The repo is `Nodstuff/grimoire` (renamed from
+> `knowledge-system`).
+
 # PROJECT.md — Personal Knowledge System That Maintains Itself
 
 **Context document for Claude Code.** This captures the full design conversation (Aug 2026) that produced the backlog in this repo. Read this before touching any ticket. The backlog (GitHub issues — the source of truth) says *what*; this says *why* and *how*.
