@@ -264,6 +264,27 @@ async fn list_contacts(State(st): State<FedState>) -> Json<Value> {
 }
 
 #[derive(Deserialize)]
+pub struct TrustReq {
+    pub id: Uuid,
+    /// "review" (park for review, default) or "yellow" (trusted: apply flagged)
+    pub trust: String,
+}
+
+async fn set_share_trust(State(st): State<FedState>, Json(req): Json<TrustReq>) -> Json<Value> {
+    let Some(trust) = grimoire_store::ShareTrust::parse(&req.trust) else {
+        return Json(json!({"error": format!("bad trust: {}", req.trust)}));
+    };
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.set_share_trust(req.id, trust) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct VerifyReq {
     pub id: Uuid,
     pub verified: bool,
@@ -414,6 +435,7 @@ pub fn router(store: Store, fed: FedCtx) -> Router {
     let fed_routes = Router::new()
         .route("/admin/shares", get(list_shares).post(create_share))
         .route("/admin/shares/revoke", post(revoke_share))
+        .route("/admin/shares/trust", post(set_share_trust))
         .route("/admin/contacts", get(list_contacts))
         .route("/admin/contacts/revoke", post(revoke_contact))
         .route("/admin/contacts/verify", post(verify_contact))

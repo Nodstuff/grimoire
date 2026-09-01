@@ -191,6 +191,9 @@ CREATE TABLE IF NOT EXISTS shares (
     state      TEXT NOT NULL DEFAULT 'offered' CHECK (state IN ('offered', 'active', 'revoked')),
     -- overrides the doc's review policy for proposals arriving via this share
     policy_override TEXT CHECK (policy_override IN ('human-review', 'agent-review', 'auto')),
+    -- trust tier (#62): review = remote proposals park red (default);
+    -- yellow = they apply immediately as flagged yellows (reds still park)
+    trust      TEXT NOT NULL DEFAULT 'review' CHECK (trust IN ('review', 'yellow')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 

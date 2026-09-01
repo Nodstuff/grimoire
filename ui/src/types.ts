@@ -35,6 +35,8 @@ export interface Share {
   state: 'offered' | 'active' | 'revoked'
   policy_override: string | null
   created_at: string
+  /** review = proposals park (default); yellow = trusted, edits apply flagged */
+  trust: 'review' | 'yellow'
 }
 
 export interface PendingJoin {
@@ -69,6 +71,7 @@ export interface DocFederation {
     permission: 'view' | 'propose'
     state: string
     petname: string | null
+    trust: 'review' | 'yellow'
   }[]
   outbound: OutboundProposal[]
 }

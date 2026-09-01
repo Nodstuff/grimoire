@@ -258,6 +258,9 @@ pub trait BlockStore {
 
     fn set_share_permission(&mut self, id: Uuid, permission: SharePermission) -> Result<()>;
 
+    /// Trust tier (#62). Human surface only — never MCP, never the remote side.
+    fn set_share_trust(&mut self, id: Uuid, trust: ShareTrust) -> Result<()>;
+
     /// Record a minted invite. Only the secret's hash is stored; the secret
     /// itself lives in the `grimoire://` link and is never persisted.
     fn create_invite(&mut self, share_id: Uuid, secret_hash: &str, expires_at: &str) -> Result<Uuid>;

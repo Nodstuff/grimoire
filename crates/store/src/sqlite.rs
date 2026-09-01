@@ -79,6 +79,24 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
             )?;
         }
     }
+    let has_shares: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'shares'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_shares > 0 {
+        let has_trust: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('shares') WHERE name = 'trust'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_trust == 0 {
+            conn.execute(
+                "ALTER TABLE shares ADD COLUMN trust TEXT NOT NULL DEFAULT 'review'",
+                [],
+            )?;
+        }
+    }
     let has_mirrors: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'mirrors'",
         [],
@@ -319,6 +337,7 @@ type RawShare = (
     String,
     Option<String>,
     String,
+    String,
 );
 
 fn share_row(row: &rusqlite::Row) -> rusqlite::Result<RawShare> {
@@ -330,11 +349,12 @@ fn share_row(row: &rusqlite::Row) -> rusqlite::Result<RawShare> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
     ))
 }
 
 fn finish_share(raw: RawShare) -> Result<Share> {
-    let (id, root_doc, contact, permission, state, policy_override, created_at) = raw;
+    let (id, root_doc, contact, permission, state, policy_override, created_at, trust) = raw;
     Ok(Share {
         id: uuid_col(id, "shares.id")?,
         root_doc: uuid_col(root_doc, "shares.root_doc")?,
@@ -350,6 +370,8 @@ fn finish_share(raw: RawShare) -> Result<Share> {
             })
             .transpose()?,
         created_at,
+        trust: ShareTrust::parse(&trust)
+            .ok_or_else(|| StoreError::InvalidOp(format!("bad trust: {trust}")))?,
     })
 }
 
@@ -1600,7 +1622,7 @@ impl BlockStore for SqliteStore {
 
     fn list_shares(&self) -> Result<Vec<Share>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, root_doc, contact, permission, state, policy_override, created_at
+            "SELECT id, root_doc, contact, permission, state, policy_override, created_at, trust
              FROM shares ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], share_row)?;
@@ -1613,7 +1635,7 @@ impl BlockStore for SqliteStore {
     fn get_share(&self, id: Uuid) -> Result<Share> {
         self.conn
             .query_row(
-                "SELECT id, root_doc, contact, permission, state, policy_override, created_at
+                "SELECT id, root_doc, contact, permission, state, policy_override, created_at, trust
                  FROM shares WHERE id = ?1",
                 params![id.to_string()],
                 share_row,
@@ -1639,6 +1661,17 @@ impl BlockStore for SqliteStore {
         let n = self.conn.execute(
             "UPDATE shares SET permission = ?1 WHERE id = ?2",
             params![permission.as_str(), id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("share {id}")));
+        }
+        Ok(())
+    }
+
+    fn set_share_trust(&mut self, id: Uuid, trust: ShareTrust) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE shares SET trust = ?1 WHERE id = ?2",
+            params![trust.as_str(), id.to_string()],
         )?;
         if n == 0 {
             return Err(StoreError::NotFound(format!("share {id}")));
@@ -1739,7 +1772,7 @@ impl BlockStore for SqliteStore {
                  WHERE d.parent_id IS NOT NULL
              )
              SELECT s.id, s.root_doc, s.contact, s.permission, s.state,
-                    s.policy_override, s.created_at
+                    s.policy_override, s.created_at, s.trust
              FROM shares s JOIN ancestors a ON s.root_doc = a.id
              WHERE s.state != 'revoked'
              ORDER BY s.created_at",
