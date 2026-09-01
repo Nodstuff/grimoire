@@ -78,6 +78,16 @@ pub enum Request {
     },
     /// Status of previously proposed ops (only your own are disclosed).
     ProposalStatus { op_ids: Vec<String> },
+    /// The comment channel (#64, ADR 0003 §1). Applies DIRECTLY — comments
+    /// are conversation, not content; block-type is restricted owner-side.
+    /// `view` permission suffices: commenting is not editing.
+    Comment {
+        share: String,
+        target_block: String,
+        text: String,
+        #[serde(default)]
+        reply_to: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -120,6 +130,9 @@ pub enum Response {
     },
     ProposalStatuses {
         statuses: Vec<grimoire_store::OpStatus>,
+    },
+    Commented {
+        block_id: String,
     },
     Refused {
         reason: String,
@@ -376,6 +389,27 @@ fn dispatch(req: Request, peer: &str, store: &Arc<Mutex<SqliteStore>>, dedupe: &
             }
             res
         }
+        Request::Comment {
+            share,
+            target_block,
+            text,
+            reply_to,
+        } => {
+            let Some(contact) = contact else {
+                return Response::Refused {
+                    reason: "unknown peer: redeem an invite first".into(),
+                };
+            };
+            match handle_comment(&mut store, &contact, &share, &target_block, &text, reply_to) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(peer, share, "comment refused: {e}");
+                    Response::Refused {
+                        reason: e.to_string(),
+                    }
+                }
+            }
+        }
         Request::ProposalStatus { op_ids } => {
             let Some(contact) = contact else {
                 return Response::Refused {
@@ -397,6 +431,52 @@ fn dispatch(req: Request, peer: &str, store: &Arc<Mutex<SqliteStore>>, dedupe: &
             }
         }
     }
+}
+
+/// Owner side of the comment channel (#64): authorize, then apply directly.
+/// The ONLY thing this can create is a comment block anchored to an in-share
+/// block — add_comment enforces the block type and threading by construction.
+fn handle_comment(
+    store: &mut grimoire_store::SqliteStore,
+    contact: &grimoire_store::Contact,
+    share_id: &str,
+    target_block: &str,
+    text: &str,
+    reply_to: Option<String>,
+) -> Result<Response> {
+    let share_uuid: uuid::Uuid = share_id.parse().context("bad share id")?;
+    let target_uuid: uuid::Uuid = target_block.parse().context("bad block id")?;
+    let share = store.get_share(share_uuid)?;
+    if share.contact != Some(contact.id) {
+        anyhow::bail!("share is not bound to this contact");
+    }
+    if share.state != grimoire_store::ShareState::Active {
+        anyhow::bail!("share is {}", share.state.as_str());
+    }
+    if text.trim().is_empty() || text.len() > 16 * 1024 {
+        anyhow::bail!("comment must be 1..16k chars");
+    }
+    let block = store.read_block(target_uuid)?;
+    if !store
+        .docs_in_share(share_uuid)?
+        .iter()
+        .any(|d| d.id == block.doc_id)
+    {
+        anyhow::bail!("block is not in this share");
+    }
+    let reply_to = reply_to
+        .map(|r| r.parse::<uuid::Uuid>())
+        .transpose()
+        .context("bad reply_to id")?;
+    let comment = store.add_comment(target_uuid, contact.principal, text, reply_to)?;
+    tracing::info!(
+        peer = contact.pubkey,
+        doc = %block.doc_id,
+        "remote comment applied"
+    );
+    Ok(Response::Commented {
+        block_id: comment.id.to_string(),
+    })
 }
 
 /// Owner side of the write-back (#60): authorize, then PARK. The gate's red
@@ -832,6 +912,46 @@ pub async fn propose_upstream(
     let ids: Vec<uuid::Uuid> = op_ids.iter().filter_map(|s| s.parse().ok()).collect();
     let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
     Ok(s.record_outbound_proposal(doc_id, mirror.share_id, owner.id, &ids, note)?)
+}
+
+/// Post a comment on a mirror doc upstream (#64). Applied immediately on the
+/// owner; arrives back (and reaches other grantees) via the pull loop.
+pub async fn comment_upstream(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    target_block: uuid::Uuid,
+    text: &str,
+    reply_to: Option<uuid::Uuid>,
+) -> Result<String> {
+    let (mirror, owner) = {
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let block = s.read_block(target_block)?;
+        let mirror = s
+            .get_mirror(block.doc_id)?
+            .context("doc is not a mirror — comment locally")?;
+        let owner = s
+            .list_contacts()?
+            .into_iter()
+            .find(|c| c.id == mirror.owner)
+            .context("mirror's owner contact is gone")?;
+        (mirror, owner)
+    };
+    let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
+    let res = request(
+        endpoint,
+        EndpointAddr::from(owner_id),
+        Request::Comment {
+            share: mirror.share_id.to_string(),
+            target_block: target_block.to_string(),
+            text: text.to_string(),
+            reply_to: reply_to.map(|r| r.to_string()),
+        },
+    )
+    .await?;
+    let Response::Commented { block_id } = res else {
+        anyhow::bail!("owner refused comment: {res:?}");
+    };
+    Ok(block_id)
 }
 
 /// Refresh the state of pending outbound proposals from their owners; any
@@ -1646,6 +1766,157 @@ mod tests {
             assert_eq!(queue.len(), 1);
             assert_eq!(queue[0].annotation.kind, grimoire_store::AnnotationKind::Parked);
         }
+    }
+
+    #[tokio::test]
+    async fn comments_apply_directly_and_thread_over_the_wire() {
+        use grimoire_store::{BlockType, OpInput, OpKind};
+
+        let mut owner_store = SqliteStore::open_in_memory().unwrap();
+        let tom = owner_store
+            .create_principal(PrincipalKind::Human, "tom", None)
+            .unwrap();
+        let doc = owner_store.create_doc("Notes", None, tom.id).unwrap();
+        let block_id = uuid::Uuid::now_v7();
+        owner_store
+            .apply(
+                doc.id,
+                0,
+                tom.id,
+                vec![OpInput {
+                    kind: OpKind::Insert {
+                        block_id,
+                        parent_id: None,
+                        order_key: "i".into(),
+                        block_type: BlockType::Paragraph,
+                        content: "discuss me".into(),
+                        refers_to: None,
+                    },
+                    source_refs: vec![],
+                }],
+            )
+            .unwrap();
+        let outside = owner_store.create_doc("Private", None, tom.id).unwrap();
+        let outside_block = uuid::Uuid::now_v7();
+        owner_store
+            .apply(
+                outside.id,
+                0,
+                tom.id,
+                vec![OpInput {
+                    kind: OpKind::Insert {
+                        block_id: outside_block,
+                        parent_id: None,
+                        order_key: "i".into(),
+                        block_type: BlockType::Paragraph,
+                        content: "private".into(),
+                        refers_to: None,
+                    },
+                    source_refs: vec![],
+                }],
+            )
+            .unwrap();
+
+        let owner_ep = local_endpoint().await;
+        // view-only on purpose: commenting is not editing
+        let (share, link) = mint_invite(
+            &mut owner_store,
+            &owner_ep.id().to_string(),
+            doc.id,
+            SharePermission::View,
+        )
+        .unwrap();
+        let owner_store = Arc::new(Mutex::new(owner_store));
+        let addr = direct_addr(&owner_ep);
+        tokio::spawn(serve(owner_ep, owner_store.clone()));
+
+        let mut alice_store = SqliteStore::open_in_memory().unwrap();
+        alice_store
+            .create_principal(PrincipalKind::Human, "alice", None)
+            .unwrap();
+        let alice_store = Arc::new(Mutex::new(alice_store));
+        let alice_ep = local_endpoint().await;
+        let ticket = Ticket::parse(&link).unwrap();
+        join_at(&alice_ep, &alice_store, &ticket, addr.clone())
+            .await
+            .unwrap();
+
+        // comment applies directly — no review queue entry
+        let res = request(
+            &alice_ep,
+            addr.clone(),
+            Request::Comment {
+                share: share.id.to_string(),
+                target_block: block_id.to_string(),
+                text: "what about tuesday?".into(),
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+        let Response::Commented { block_id: comment_id } = res else {
+            panic!("expected Commented, got {res:?}");
+        };
+        {
+            let s = owner_store.lock().unwrap();
+            assert!(s.review_queue(Some(doc.id)).unwrap().is_empty());
+            let c = s.read_block(comment_id.parse().unwrap()).unwrap();
+            assert_eq!(c.block_type, grimoire_store::BlockType::Comment);
+            assert_eq!(c.refers_to, Some(block_id));
+            // provenance: the remote contact's principal, not tom
+            assert_ne!(c.created_by, tom.id);
+        }
+
+        // owner replies locally; alice's reply threads onto the same anchor
+        let owner_reply = {
+            let mut s = owner_store.lock().unwrap();
+            let alice_contact = s.list_contacts().unwrap()[0].clone();
+            let _ = alice_contact;
+            s.add_comment(block_id, tom.id, "tuesday works", Some(comment_id.parse().unwrap()))
+                .unwrap()
+        };
+        let res = request(
+            &alice_ep,
+            addr.clone(),
+            Request::Comment {
+                share: share.id.to_string(),
+                target_block: block_id.to_string(),
+                text: "booked".into(),
+                reply_to: Some(owner_reply.id.to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(res, Response::Commented { .. }));
+
+        // the thread reaches alice through a normal pull
+        let owner_contact = {
+            let s = alice_store.lock().unwrap();
+            s.list_contacts().unwrap().into_iter().next().unwrap()
+        };
+        pull_share(&alice_ep, &alice_store, addr.clone(), &owner_contact, share.id)
+            .await
+            .unwrap();
+        {
+            let s = alice_store.lock().unwrap();
+            let comments = s.list_comments(block_id).unwrap();
+            assert_eq!(comments.len(), 3);
+        }
+
+        // a block outside the share is not commentable
+        let res = request(
+            &alice_ep,
+            addr,
+            Request::Comment {
+                share: share.id.to_string(),
+                target_block: outside_block.to_string(),
+                text: "sneaky".into(),
+                reply_to: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(res, Response::Refused { .. }));
     }
 
     #[tokio::test]

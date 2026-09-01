@@ -1098,6 +1098,7 @@ function DocView({
           allBlocks={allBlocks}
           target={commentTarget}
           setTarget={setCommentTarget}
+          upstream={!!mirror}
           onPosted={loadTree}
           onClose={() => setPanel('none')}
         />
@@ -1199,6 +1200,7 @@ function CommentsPanel({
   allBlocks,
   target,
   setTarget,
+  upstream = false,
   onPosted,
   onClose,
 }: {
@@ -1206,6 +1208,8 @@ function CommentsPanel({
   allBlocks: Block[]
   target: string | null
   setTarget: (t: string | null) => void
+  /** mirror docs: comments post to the owner and echo back via pull */
+  upstream?: boolean
   onPosted: () => void
   onClose: () => void
 }) {
@@ -1219,7 +1223,9 @@ function CommentsPanel({
   const post = async () => {
     const blockId = replyTo ? replyTo.refers_to : target
     if (!text.trim() || !blockId) return
-    await api('/api/comment', {
+    // mirror docs: the comment channel — applied on the owner, echoed back
+    const endpoint = upstream ? '/admin/comment_upstream' : '/api/comment'
+    await api(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ block_id: blockId, text: text.trim(), reply_to: replyTo?.id ?? null }),
