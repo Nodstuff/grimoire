@@ -1316,6 +1316,10 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
                 ConfidencePolicy::Review => {
                     s.propose_reviewed(doc.id, doc.current_epoch, g.principal, ops)
                 }
+                _ if crate::hot::doc_is_hot(doc.id) => {
+                    tracing::info!(doc = %doc.id, "gardener proposal deferred: doc is hot (P2.3)");
+                    continue;
+                }
                 ConfidencePolicy::Gate => s.propose(doc.id, doc.current_epoch, g.principal, ops),
             };
             match outcome {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DocEditor from './editor/DocEditor'
+import HotEditor, { HotDoc } from './editor/HotEditor'
 import GraphView from './GraphView'
 import TendPanel from './TendPanel'
 import Gardeners from './Gardeners'
@@ -825,6 +826,8 @@ function DocView({
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
   const [fed, setFed] = useState<DocFederation | null>(null)
+  const [hot, setHot] = useState<HotDoc | null>(null)
+  const mirrorRef = useRef<unknown>(null)
   const [panel, setPanel] = useState<'none' | 'history' | 'comments' | 'tend' | 'share'>('none')
   const [selBlock, setSelBlock] = useState<string | null>(null)
   const [selRect, setSelRect] = useState<{ x: number; y: number } | null>(null)
@@ -861,6 +864,7 @@ function DocView({
     setTree(null)
     setPanel('none')
     setCommentTarget(null)
+    setHot(null)
     ownEpoch.current = 0
     loadTree()
   }, [loadTree])
@@ -888,6 +892,25 @@ function DocView({
   }, [dataVersion])
 
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
+
+  // a live session started elsewhere (second window, recovered journal):
+  // join it rather than editing cold
+  useEffect(() => {
+    if (!tree || hot || mirrorRef.current) return
+    api<{ hot: boolean; frozen_epoch?: number }>(`/api/doc/${docId}/hot/status`)
+      .then((st) => {
+        if (st.hot && editable) {
+          setHot({
+            docId,
+            frozenEpoch: st.frozen_epoch ?? tree.doc.current_epoch,
+            seed: false,
+            blocks: editable.blocks,
+          })
+        }
+      })
+      .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tree, dataVersion])
 
   // anchor from a link: [[Doc#^block-uuid]] finds the block by stable id,
   // [[Doc#Heading]] falls back to text match. Scroll + flash.
@@ -981,6 +1004,7 @@ function DocView({
   }
 
   const mirror = fed?.mirror ?? null
+  mirrorRef.current = mirror
   const pendingProposals = (fed?.outbound ?? []).filter((o) => o.state === 'pending')
 
   return (
@@ -1036,8 +1060,43 @@ function DocView({
               {(fed?.shares.length ?? 0) > 0 ? '↗ shared' : 'share'}
             </button>
           )}
+          {!mirror && !hot && editable && (
+            <button
+              className="chip"
+              title="start a live co-editing session"
+              onClick={async () => {
+                try {
+                  const r = await api<{ frozen_epoch: number; seed: boolean }>(
+                    `/api/doc/${docId}/hot/start`,
+                    { method: 'POST' },
+                  )
+                  setHot({
+                    docId,
+                    frozenEpoch: r.frozen_epoch,
+                    seed: r.seed,
+                    blocks: editable.blocks,
+                  })
+                } catch (e) {
+                  alert(String(e))
+                }
+              }}
+            >
+              ⚡ go live
+            </button>
+          )}
         </span>
       </div>
+      {hot ? (
+        <HotEditor
+          key={`hot:${docId}`}
+          doc={hot}
+          onEnded={() => {
+            setHot(null)
+            setEditorGen((g) => g + 1)
+            loadTree()
+          }}
+        />
+      ) : (
       <DocEditor
         key={`${docId}:${editorGen}`}
         doc={editable}
@@ -1053,6 +1112,7 @@ function DocView({
         }}
         onSelectionBlock={onSelectionBlock}
       />
+      )}
       {selBlock && selRect && panel !== 'comments' && (
         <span className="sel-actions" style={{ left: selRect.x, top: selRect.y }}>
           <button

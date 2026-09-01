@@ -48,7 +48,7 @@ const BlockId = Extension.create({
   },
 })
 
-const extensions = [
+export const extensions = [
   StarterKit.configure({ link: { openOnClick: false }, codeBlock: false }),
   CodeBlock.extend({
     addNodeView() {
@@ -59,9 +59,9 @@ const extensions = [
   WikilinkDeco,
   BlockId,
 ]
-const schema = getSchema(extensions)
-const parser = makeParser(schema)
-const serializer = makeSerializer()
+export const schema = getSchema(extensions)
+export const parser = makeParser(schema)
+export const serializer = makeSerializer()
 
 export interface EditableDoc {
   docId: string
