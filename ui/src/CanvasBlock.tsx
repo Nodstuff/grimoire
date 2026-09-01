@@ -26,12 +26,28 @@ import {
   type Node,
   type NodeProps,
 } from '@xyflow/react'
+import {
+  BaseEdge,
+  EdgeLabelRenderer,
+  getSmoothStepPath,
+  type EdgeProps,
+} from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { api, Block } from './types'
 
 /* ---------- storage format ---------- */
 
-type ShapeKind = 'box' | 'sticky' | 'diamond' | 'cylinder' | 'frame'
+type ShapeKind =
+  | 'box'
+  | 'pill'
+  | 'ellipse'
+  | 'diamond'
+  | 'parallelogram'
+  | 'hexagon'
+  | 'cylinder'
+  | 'sticky'
+  | 'text'
+  | 'frame'
 
 interface KsNode {
   id: string
@@ -61,10 +77,25 @@ interface KsDiagram {
 const COLORS = ['#8b9dc3', '#95c99b', '#d9b47a', '#d98a94', '#a88bd4', '#7bc4c4', '#6b6b7b']
 const DEFAULT_SIZE: Record<ShapeKind, [number, number]> = {
   box: [180, 64],
+  pill: [170, 56],
+  ellipse: [160, 90],
+  diamond: [170, 110],
+  parallelogram: [190, 70],
+  hexagon: [180, 80],
+  cylinder: [150, 100],
   sticky: [160, 140],
-  diamond: [160, 100],
-  cylinder: [150, 90],
+  text: [160, 40],
   frame: [420, 300],
+}
+
+/** Real geometry in a 0..100 space, stroked crisply at any aspect ratio via
+ * vector-effect. The CSS-rotation diamond of v2.0 looked like an off-kilter
+ * rectangle — never again. */
+const SVG_SHAPES: Partial<Record<ShapeKind, string>> = {
+  diamond: 'M 50 1 L 99 50 L 50 99 L 1 50 Z',
+  parallelogram: 'M 18 1 L 99 1 L 82 99 L 1 99 Z',
+  hexagon: 'M 22 1 L 78 1 L 99 50 L 78 99 L 22 99 L 1 50 Z',
+  cylinder: 'M 1 14 A 49 13 0 0 1 99 14 L 99 86 A 49 13 0 0 1 1 86 Z M 1 14 A 49 13 0 0 0 99 14',
 }
 
 /* ---------- layered fallback layout (agent diagrams ship without x/y) ---------- */
@@ -247,19 +278,34 @@ function ShapeNode({ id, data, selected }: NodeProps<Node<CanvasNodeData>>) {
       </div>
     )
   }
+  const svgPath = SVG_SHAPES[kind]
   return (
     <div
-      className={`cnode cnode-${kind} ${selected ? 'sel' : ''}`}
+      className={`cnode cnode-${kind} ${selected ? 'sel' : ''} ${svgPath ? 'cnode-svg' : ''}`}
       style={
         kind === 'sticky'
           ? { background: data.color, color: '#101014' }
-          : { borderColor: data.color }
+          : svgPath
+            ? undefined
+            : { borderColor: data.color }
       }
     >
-      <NodeResizer isVisible={!!selected} minWidth={80} minHeight={40} />
-      {kind === 'diamond' && <div className="cnode-diamond-bg" style={{ borderColor: data.color }} />}
-      {kind === 'cylinder' && (
-        <div className="cnode-cyl-top" style={{ borderColor: data.color }} />
+      <NodeResizer isVisible={!!selected} minWidth={60} minHeight={36} />
+      {svgPath && (
+        <svg
+          className="cnode-shape"
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          aria-hidden
+        >
+          <path
+            d={svgPath}
+            fill="var(--panel)"
+            stroke={data.color}
+            strokeWidth={1.5}
+            vectorEffect="non-scaling-stroke"
+          />
+        </svg>
       )}
       {label}
       {handles}
@@ -268,6 +314,66 @@ function ShapeNode({ id, data, selected }: NodeProps<Node<CanvasNodeData>>) {
 }
 
 const nodeTypes = { shape: ShapeNode }
+
+/** Connector with a double-click-editable label, Lucid-style. */
+function LabelEdge(props: EdgeProps) {
+  const { setEdges } = useReactFlow()
+  const [editing, setEditing] = useState(false)
+  const [path, labelX, labelY] = getSmoothStepPath(props)
+  const label = typeof props.label === 'string' ? props.label : ''
+
+  const commit = (v: string) => {
+    setEditing(false)
+    setEdges((es) => es.map((e) => (e.id === props.id ? { ...e, label: v || undefined } : e)))
+  }
+
+  return (
+    <>
+      <BaseEdge
+        id={props.id}
+        path={path}
+        markerEnd={props.markerEnd}
+        style={props.style}
+      />
+      {/* generous invisible hit area for the double-click */}
+      <path
+        d={path}
+        fill="none"
+        strokeWidth={16}
+        stroke="transparent"
+        onDoubleClick={() => setEditing(true)}
+      />
+      <EdgeLabelRenderer>
+        <div
+          className={`cedge-label ${props.selected ? 'sel' : ''}`}
+          style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
+        >
+          {editing ? (
+            <input
+              className="cedge-label-edit nodrag nopan"
+              autoFocus
+              defaultValue={label}
+              onBlur={(e) => commit(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') commit((e.target as HTMLInputElement).value)
+                if (e.key === 'Escape') setEditing(false)
+              }}
+            />
+          ) : (
+            <span
+              className={label ? 'cedge-label-text nopan' : 'cedge-label-empty nopan'}
+              onDoubleClick={() => setEditing(true)}
+            >
+              {label}
+            </span>
+          )}
+        </div>
+      </EdgeLabelRenderer>
+    </>
+  )
+}
+
+const edgeTypes = { label: LabelEdge }
 
 /* ---------- ks_diagram ↔ react flow ---------- */
 
@@ -310,7 +416,7 @@ function toFlow(d: KsDiagram): { nodes: Node<CanvasNodeData>[]; edges: Edge[] } 
       sourceHandle: e.fromSide && SIDE_POS[e.fromSide] ? e.fromSide : autoFrom,
       targetHandle: e.toSide && SIDE_POS[e.toSide] ? e.toSide : autoTo,
       label: e.label,
-      type: 'smoothstep' as const,
+      type: 'label' as const,
     }
   })
   return { nodes, edges }
@@ -420,7 +526,7 @@ function CanvasFlow({
   }, [nodes, edges, initial, scheduleSave])
 
   const onConnect = useCallback(
-    (c: Connection) => setEdges((es) => addEdge({ ...c, type: 'smoothstep' }, es)),
+    (c: Connection) => setEdges((es) => addEdge({ ...c, type: 'label' }, es)),
     [setEdges],
   )
 
@@ -460,11 +566,6 @@ function CanvasFlow({
     )
   }
 
-  const labelSelectedEdge = (label: string) => {
-    setEdges((es) => es.map((e) => (e.selected ? { ...e, label } : e)))
-  }
-  const selectedEdge = edges.find((e) => e.selected)
-
   const tidy = () => {
     const d = fromFlow(nodes, edges)
     const pos = layout({ nodes: d.nodes.map((n) => ({ ...n, x: undefined, y: undefined })), edges: d.edges })
@@ -479,30 +580,25 @@ function CanvasFlow({
   return (
     <>
       <div className="canvas-toolbar">
-        <button onClick={() => addNode('box')} title="box">▭</button>
-        <button onClick={() => addNode('sticky')} title="sticky note">🗒</button>
+        <button onClick={() => addNode('box')} title="process">▭</button>
+        <button onClick={() => addNode('pill')} title="start / end">⬭</button>
         <button onClick={() => addNode('diamond')} title="decision">◇</button>
+        <button onClick={() => addNode('parallelogram')} title="input / output">▱</button>
+        <button onClick={() => addNode('hexagon')} title="preparation">⬡</button>
         <button onClick={() => addNode('cylinder')} title="datastore">⛁</button>
+        <button onClick={() => addNode('ellipse')} title="ellipse">◯</button>
+        <button onClick={() => addNode('sticky')} title="sticky note">🗒</button>
+        <button onClick={() => addNode('text')} title="text label">T</button>
         <button onClick={() => addNode('frame')} title="frame">⬚</button>
         <span className="canvas-toolbar-sep" />
         <button onClick={recolor} title="cycle color of selection">🎨</button>
         <button onClick={tidy} title="auto-layout">✨</button>
-        {selectedEdge && (
-          <input
-            className="canvas-edge-label"
-            placeholder="edge label…"
-            defaultValue={typeof selectedEdge.label === 'string' ? selectedEdge.label : ''}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') labelSelectedEdge((e.target as HTMLInputElement).value)
-            }}
-            onBlur={(e) => labelSelectedEdge(e.target.value)}
-          />
-        )}
       </div>
       <ReactFlow
         nodes={nodes}
         edges={edges}
         nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
@@ -512,7 +608,7 @@ function CanvasFlow({
         snapGrid={[10, 10]}
         proOptions={{ hideAttribution: true }}
         colorMode="dark"
-        defaultEdgeOptions={{ type: 'smoothstep' }}
+        defaultEdgeOptions={{ type: 'label' }}
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={1} />
         <Controls showInteractive={false} />

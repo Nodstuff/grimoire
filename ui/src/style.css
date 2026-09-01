@@ -1056,25 +1056,6 @@ kbd {
 }
 .cnode.sel { box-shadow: 0 0 0 2px var(--accent); }
 .cnode-sticky { border: none; border-radius: 4px; box-shadow: 2px 3px 8px rgba(0,0,0,0.35); font-size: 13px; align-items: flex-start; text-align: left; }
-.cnode-diamond { background: none; border: none; }
-.cnode-diamond-bg {
-  position: absolute;
-  inset: 8%;
-  border: 1.5px solid;
-  background: var(--panel);
-  transform: rotate(45deg);
-  border-radius: 6px;
-  z-index: -1;
-}
-.cnode-cylinder { border-radius: 10px / 26px; }
-.cnode-cyl-top {
-  position: absolute;
-  top: 0; left: 0; right: 0;
-  height: 18px;
-  border-bottom: 1.5px solid;
-  border-radius: 50%;
-  opacity: 0.6;
-}
 .cnode-frame {
   border-style: dashed;
   border-radius: 12px;
@@ -1116,3 +1097,40 @@ kbd {
 .react-flow__controls { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .react-flow__controls-button { background: var(--panel); border-bottom: 1px solid var(--border); fill: var(--fg); }
 .react-flow__minimap { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+
+/* canvas v2.1: svg shapes + inline edge labels */
+.cnode-svg { border: none; background: none; padding: 12px 14px; }
+.cnode-svg.sel { box-shadow: none; outline: 1.5px dashed var(--accent); outline-offset: 3px; border-radius: 4px; }
+.cnode-shape { position: absolute; inset: 0; width: 100%; height: 100%; z-index: -1; }
+.cnode-diamond { padding: 18px 26px; }
+.cnode-cylinder { padding-top: 26px; }
+.cnode-pill { border-radius: 999px; }
+.cnode-ellipse { border-radius: 50%; padding: 14px 20px; }
+.cnode-text { border: none; background: none; }
+.cnode-text.sel { box-shadow: none; outline: 1.5px dashed var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+.cedge-label { position: absolute; pointer-events: all; z-index: 1; }
+.cedge-label-text {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 7px;
+  font-size: 11px;
+  color: var(--fg);
+  cursor: text;
+  user-select: none;
+}
+.cedge-label.sel .cedge-label-text { border-color: var(--accent); }
+/* empty label: an invisible but clickable hotspot at the midpoint */
+.cedge-label-empty { display: inline-block; width: 26px; height: 16px; cursor: text; }
+.cedge-label-edit {
+  background: var(--panel2);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--fg);
+  font-size: 11px;
+  padding: 1px 7px;
+  width: 110px;
+  outline: none;
+  text-align: center;
+}
