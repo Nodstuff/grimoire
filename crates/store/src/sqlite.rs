@@ -788,7 +788,11 @@ impl BlockStore for SqliteStore {
         }
         let n = self.conn.execute(
             "UPDATE docs SET parent_id = ?1, sort_key = ?2 WHERE id = ?3 AND deleted = 0",
-            params![new_parent.map(|p| p.to_string()), sort_key, doc_id.to_string()],
+            params![
+                new_parent.map(|p| p.to_string()),
+                sort_key,
+                doc_id.to_string()
+            ],
         )?;
         if n == 0 {
             return Err(StoreError::NotFound(format!("doc {doc_id}")));
@@ -1533,6 +1537,28 @@ fn parse_annotation_status(s: &str) -> Result<AnnotationStatus> {
 }
 
 impl SqliteStore {
+    /// Live progress on a still-running gardener run (status untouched).
+    pub fn update_run_progress(&mut self, run: Uuid, summary: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE gardener_runs SET summary = ?1 WHERE id = ?2 AND status = 'running'",
+            params![summary, run.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Runs left 'running' by a dead daemon (restarts kill in-flight work).
+    /// Called at startup; returns how many were marked.
+    pub fn mark_orphaned_runs(&mut self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE gardener_runs
+             SET status = 'failed',
+                 summary = COALESCE(summary, '') || char(10) || 'orphaned: daemon restarted mid-run',
+                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE status = 'running'",
+            [],
+        )?)
+    }
+
     /// All live docs in a subtree, the scope root included — the opt-in
     /// boundary every scoped gardener works within.
     pub fn doc_subtree(&self, root: Uuid) -> Result<Vec<Doc>> {
@@ -1631,6 +1657,7 @@ impl SqliteStore {
                       + (SELECT count(*) FROM annotations WHERE status != 'open') * 7919
                       + (SELECT COALESCE(max(rowid), 0) FROM gardener_runs) * 104729
                       + (SELECT count(*) FROM gardener_runs WHERE status != 'running') * 31
+                      + (SELECT COALESCE(sum(length(coalesce(summary,''))), 0) FROM gardener_runs)
                       + (SELECT COALESCE(sum(length(coalesce(sort_key,'')) + length(coalesce(parent_id,'')) + length(title)), 0) FROM docs WHERE deleted = 0)",
                 [],
                 |r| r.get(0),

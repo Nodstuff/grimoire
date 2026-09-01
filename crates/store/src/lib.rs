@@ -92,8 +92,12 @@ pub trait BlockStore {
     fn set_doc_status(&mut self, doc_id: Uuid, status: Option<DocStatus>) -> Result<()>;
 
     /// Reparent/reorder a doc in the tree (cycle-checked; fractional sort_key).
-    fn move_doc(&mut self, doc_id: Uuid, new_parent: Option<Uuid>, sort_key: Option<&str>)
-    -> Result<()>;
+    fn move_doc(
+        &mut self,
+        doc_id: Uuid,
+        new_parent: Option<Uuid>,
+        sort_key: Option<&str>,
+    ) -> Result<()>;
 
     /// Soft-delete a doc and its descendants; returns count. Reversible.
     fn delete_doc(&mut self, doc_id: Uuid) -> Result<usize>;

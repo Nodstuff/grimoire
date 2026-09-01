@@ -134,12 +134,25 @@ async fn invoke_claude_with_dirs(
     prompt: &str,
     read_dirs: &[String],
 ) -> Result<(String, i64), String> {
+    invoke_claude_streaming(prompt, read_dirs, |_| {}).await
+}
+
+/// Stream the model's activity (stream-json): every tool call ticks the
+/// progress callback so a running gardener is visibly alive in the UI.
+async fn invoke_claude_streaming(
+    prompt: &str,
+    read_dirs: &[String],
+    mut on_progress: impl FnMut(String),
+) -> Result<(String, i64), String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
     let bin = std::env::var("GRIMOIRE_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
     let mut args: Vec<String> = vec![
         "-p".into(),
         prompt.into(),
         "--output-format".into(),
-        "json".into(),
+        "stream-json".into(),
+        "--verbose".into(),
         "--model".into(),
         GARDENER_MODEL.into(),
     ];
@@ -153,39 +166,94 @@ async fn invoke_claude_with_dirs(
             args.push(d.clone());
         }
     }
-    let child = tokio::process::Command::new(bin)
+    let mut child = tokio::process::Command::new(bin)
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(MAX_WALL_CLOCK, child)
-        .await
-        .map_err(|_| format!("budget: wall clock exceeded {}s", MAX_WALL_CLOCK.as_secs()))?
+        .spawn()
         .map_err(|e| format!("spawn claude: {e}"))?;
-    if !out.status.success() {
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let started = std::time::Instant::now();
+    let mut tool_calls = 0usize;
+    let mut final_result: Option<(String, i64)> = None;
+
+    let read_all = async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("assistant") => {
+                    let blocks = v
+                        .pointer("/message/content")
+                        .and_then(|c| c.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    for b in blocks {
+                        if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            tool_calls += 1;
+                            let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                            let arg = b
+                                .pointer("/input/file_path")
+                                .or_else(|| b.pointer("/input/pattern"))
+                                .or_else(|| b.pointer("/input/path"))
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("");
+                            on_progress(format!(
+                                "working… {}s · {} tool calls · last: {} {}",
+                                started.elapsed().as_secs(),
+                                tool_calls,
+                                name,
+                                arg.chars()
+                                    .rev()
+                                    .take(60)
+                                    .collect::<String>()
+                                    .chars()
+                                    .rev()
+                                    .collect::<String>(),
+                            ));
+                        }
+                    }
+                }
+                Some("result") => {
+                    let text = v
+                        .get("result")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let usage = v.get("usage").cloned().unwrap_or(serde_json::json!({}));
+                    let tokens = usage
+                        .get("output_tokens")
+                        .and_then(|t| t.as_i64())
+                        .unwrap_or(0)
+                        + usage
+                            .get("input_tokens")
+                            .and_then(|t| t.as_i64())
+                            .unwrap_or(0);
+                    final_result = Some((text, tokens));
+                }
+                _ => {}
+            }
+        }
+    };
+    if tokio::time::timeout(MAX_WALL_CLOCK, read_all)
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
         return Err(format!(
-            "claude exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-                .chars()
-                .take(400)
-                .collect::<String>()
+            "budget: wall clock exceeded {}s",
+            MAX_WALL_CLOCK.as_secs()
         ));
     }
-    let parsed: ClaudeResult = serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("claude output did not parse: {e}"))?;
-    let tokens = parsed
-        .usage
-        .get("output_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        + parsed
-            .usage
-            .get("input_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-    Ok((parsed.result, tokens))
+    let status = child.wait().await.map_err(|e| format!("wait: {e}"))?;
+    match final_result {
+        Some(r) => Ok(r),
+        None => Err(format!("claude exited {status} with no result event")),
+    }
 }
 
 fn parse_json_result<T: serde::de::DeserializeOwned>(result: &str) -> Result<T, String> {
@@ -217,7 +285,11 @@ fn parse_proposals(result: &str) -> Result<Vec<TagProposal>, String> {
 }
 
 /// Turn one accepted proposal into frontmatter ops for the doc.
-fn tag_ops(store: &SqliteStore, doc_id: Uuid, add: &[String]) -> grimoire_store::Result<Vec<OpInput>> {
+fn tag_ops(
+    store: &SqliteStore,
+    doc_id: Uuid,
+    add: &[String],
+) -> grimoire_store::Result<Vec<OpInput>> {
     let tree = store.read_doc(doc_id)?;
     let refs = vec!["gardener:tagging".to_string()];
     let tags_yaml = |tags: &[String]| {
@@ -280,7 +352,9 @@ fn reviewable_items(
         if item.op.principal == reviewer_principal {
             continue;
         }
-        if store.effective_policy(item.annotation.doc_id)? != grimoire_store::ReviewPolicy::AgentReview {
+        if store.effective_policy(item.annotation.doc_id)?
+            != grimoire_store::ReviewPolicy::AgentReview
+        {
             continue;
         }
         out.push(item);
@@ -528,7 +602,11 @@ fn binding_style_docs(g: &Gardener) -> Vec<String> {
     g.bindings
         .get("style_docs")
         .and_then(|r| r.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -587,6 +665,8 @@ title: {}
     let mut prompt = format!(
         "{preamble}
 
+{GRIMOIRE_PRIMER}
+
 ## Task
 {}
 
@@ -604,15 +684,36 @@ JSON array of          {{\"doc_id\": \"<uuid>\", \"block_id\": \"<uuid from a [b
     Ok((prompt, n, doc_ids))
 }
 
+/// Progress reporter: streams the model's tool activity into the run row so
+/// a running gardener is visibly alive (the UI live-refreshes off the stamp).
+fn progress_to_run(store: &Arc<Mutex<SqliteStore>>, run_id: Uuid) -> impl FnMut(String) {
+    let store = store.clone();
+    let mut last = std::time::Instant::now() - std::time::Duration::from_secs(10);
+    move |msg: String| {
+        if last.elapsed() < std::time::Duration::from_secs(2) {
+            return;
+        }
+        last = std::time::Instant::now();
+        let mut s = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = s.update_run_progress(run_id, &msg);
+    }
+}
+
 async fn run_auditor(
     store: Arc<Mutex<SqliteStore>>,
     g: &Gardener,
+    run_id: Uuid,
 ) -> (String, String, Option<i64>) {
     // scoped-only: the opt-in boundary — no scope, no touching anything
     let Some(scope) = g.scope_doc else {
         return (
             "failed".into(),
-            format!("{} requires a scope doc — attach it to a doc/folder (tend panel)", g.kind.as_str()),
+            format!(
+                "{} requires a scope doc — attach it to a doc/folder (tend panel)",
+                g.kind.as_str()
+            ),
             None,
         );
     };
@@ -645,17 +746,18 @@ async fn run_auditor(
             dirs.join(", ")
         )
     };
-    let (result, tokens) = match invoke_claude_with_dirs(&prompt, &dirs).await {
-        Ok(r) => r,
-        Err(e) => {
-            let status = if e.starts_with("budget:") {
-                "budget-killed"
-            } else {
-                "failed"
-            };
-            return (status.into(), e, None);
-        }
-    };
+    let (result, tokens) =
+        match invoke_claude_streaming(&prompt, &dirs, progress_to_run(&store, run_id)).await {
+            Ok(r) => r,
+            Err(e) => {
+                let status = if e.starts_with("budget:") {
+                    "budget-killed"
+                } else {
+                    "failed"
+                };
+                return (status.into(), e, None);
+            }
+        };
     let findings: Vec<AuditFinding> = match parse_json_result(&result) {
         Ok(f) => f,
         Err(e) => return ("failed".into(), e, Some(tokens)),
@@ -762,6 +864,19 @@ async fn run_auditor(
     )
 }
 
+/// Injected into every doc-writing gardener prompt: the house rules.
+const GRIMOIRE_PRIMER: &str = "## How Grimoire works (follow exactly)\n\
+- Docs are trees of markdown blocks; a paragraph separated by blank lines is one block.\n\
+- Link between docs with [[Exact Doc Title]] — resolved by full title. No other link syntax counts.\n\
+- Tags live ONLY in YAML frontmatter as the doc's first block:\n---\ntags:\n  - kebab-case-tag\n---\n\
+- Inline #hashtags do NOTHING here — never use them. Frontmatter is optional; a tagging agent can add it later.\n\
+- Headings (##, ###) nest the blocks that follow them; use them for structure.\n\
+- ``` fences are code blocks; ```mermaid and ```d2 fences render as live diagrams.\n\
+- A paragraph starting 'DECISION:' becomes a queryable decision record.\n\
+- Titles are identity and link targets: short, stable, specific; never duplicate an existing title.\n\
+- Every write is attributed to you and reviewable — write nothing you cannot ground.\n\
+- Prose stays dense and factual; prefer tight bullets and tables to long paragraphs.";
+
 const SCRIBE_PREAMBLE: &str = "You are the scribe of a documentation scope in a personal \
 knowledge system: you write NEW manuscripts from nothing. You are given bound source \
 repositories (readable with your tools), style exemplar docs to imitate, instructions on \
@@ -803,7 +918,11 @@ fn scope_outline(store: &SqliteStore, scope: Uuid) -> grimoire_store::Result<Str
         if d.id == scope {
             continue;
         }
-        out.push_str(&format!("{}- {}\n", "  ".repeat(depth.saturating_sub(1)), d.title));
+        out.push_str(&format!(
+            "{}- {}\n",
+            "  ".repeat(depth.saturating_sub(1)),
+            d.title
+        ));
     }
     if out.is_empty() {
         out = "(empty — nothing exists yet)".into();
@@ -814,6 +933,7 @@ fn scope_outline(store: &SqliteStore, scope: Uuid) -> grimoire_store::Result<Str
 async fn run_scribe(
     store: Arc<Mutex<SqliteStore>>,
     g: &Gardener,
+    run_id: Uuid,
 ) -> (String, String, Option<i64>) {
     let Some(scope) = g.scope_doc else {
         return (
@@ -867,7 +987,7 @@ async fn run_scribe(
             exemplars = "(none provided — use clean, dense technical markdown)".into();
         }
         let mut p = format!(
-            "{SCRIBE_PREAMBLE}\n\n## Instructions for this scope\n{}\n\n\
+            "{SCRIBE_PREAMBLE}\n\n{GRIMOIRE_PRIMER}\n\n## Instructions for this scope\n{}\n\n\
              ## Source repositories (read with your tools)\n{}\n\n\
              ## Style exemplars — imitate these\n{}\n\
              ## What already exists in the scope (do NOT recreate)\n{}\n\n\
@@ -884,13 +1004,18 @@ async fn run_scribe(
         p
     };
 
-    let (result, tokens) = match invoke_claude_with_dirs(&prompt, &dirs).await {
-        Ok(r) => r,
-        Err(e) => {
-            let status = if e.starts_with("budget:") { "budget-killed" } else { "failed" };
-            return (status.into(), e, None);
-        }
-    };
+    let (result, tokens) =
+        match invoke_claude_streaming(&prompt, &dirs, progress_to_run(&store, run_id)).await {
+            Ok(r) => r,
+            Err(e) => {
+                let status = if e.starts_with("budget:") {
+                    "budget-killed"
+                } else {
+                    "failed"
+                };
+                return (status.into(), e, None);
+            }
+        };
     let new_docs: Vec<ScribeDoc> = match parse_json_result(&result) {
         Ok(d) => d,
         Err(e) => return ("failed".into(), e, Some(tokens)),
@@ -907,10 +1032,10 @@ async fn run_scribe(
             let mut parent = scope;
             let mut bad = false;
             for seg in &nd.path {
-                let existing = s
-                    .doc_subtree(scope)
-                    .ok()
-                    .and_then(|ds| ds.into_iter().find(|d| d.parent_id == Some(parent) && &d.title == seg));
+                let existing = s.doc_subtree(scope).ok().and_then(|ds| {
+                    ds.into_iter()
+                        .find(|d| d.parent_id == Some(parent) && &d.title == seg)
+                });
                 parent = match existing {
                     Some(d) => d.id,
                     None => match s.create_doc(seg, Some(parent), g.principal) {
@@ -930,14 +1055,22 @@ async fn run_scribe(
             let dup = s
                 .doc_subtree(scope)
                 .ok()
-                .map(|ds| ds.iter().any(|d| d.parent_id == Some(parent) && d.title == nd.title))
+                .map(|ds| {
+                    ds.iter()
+                        .any(|d| d.parent_id == Some(parent) && d.title == nd.title)
+                })
                 .unwrap_or(false);
             if dup {
                 lines.push(format!("skipped existing: {}", nd.title));
                 continue;
             }
-            match grimoire_store::import::import_markdown(&mut *s, &nd.title, Some(parent), g.principal, &nd.markdown)
-            {
+            match grimoire_store::import::import_markdown(
+                &mut *s,
+                &nd.title,
+                Some(parent),
+                g.principal,
+                &nd.markdown,
+            ) {
                 Ok((_, blocks)) => {
                     written += 1;
                     lines.push(format!("wrote {} ({} blocks)", nd.title, blocks));
@@ -989,11 +1122,11 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
         return finish(&store, &status, &summary, tokens);
     }
     if g.kind == GardenerKind::Scribe {
-        let (status, summary, tokens) = run_scribe(store.clone(), &g).await;
+        let (status, summary, tokens) = run_scribe(store.clone(), &g, run_id).await;
         return finish(&store, &status, &summary, tokens);
     }
     if g.kind == GardenerKind::Auditor || g.kind == GardenerKind::Keeper {
-        let (status, summary, tokens) = run_auditor(store.clone(), &g).await;
+        let (status, summary, tokens) = run_auditor(store.clone(), &g, run_id).await;
         return finish(&store, &status, &summary, tokens);
     }
 
