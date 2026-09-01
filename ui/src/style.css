@@ -975,3 +975,29 @@ kbd {
   font-size: 11px;
   cursor: pointer;
 }
+
+/* collaboration carets (#66 presence) — tiptap v3 caret extension */
+.collaboration-carets__caret {
+  border-left: 1px solid;
+  border-right: 1px solid;
+  margin-left: -1px;
+  margin-right: -1px;
+  position: relative;
+  word-break: normal;
+  pointer-events: none;
+}
+.collaboration-carets__label {
+  border-radius: 3px 3px 3px 0;
+  color: #101014;
+  font-size: 10px;
+  font-weight: 600;
+  left: -1px;
+  line-height: 1;
+  padding: 1px 4px;
+  position: absolute;
+  top: -1.3em;
+  user-select: none;
+  white-space: nowrap;
+}
+/* selection highlight from remote peers */
+.ProseMirror .selection, .ProseMirror ::selection { }

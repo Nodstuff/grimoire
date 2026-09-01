@@ -893,24 +893,6 @@ function DocView({
 
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
 
-  // a live session started elsewhere (second window, another instance,
-  // recovered journal): join it rather than editing cold
-  useEffect(() => {
-    if (!tree || hot) return
-    api<{ hot: boolean; frozen_epoch?: number }>(`/api/doc/${docId}/hot/status`)
-      .then((st) => {
-        if (st.hot && editable) {
-          setHot({
-            docId,
-            frozenEpoch: st.frozen_epoch ?? tree.doc.current_epoch,
-            seed: false,
-            blocks: editable.blocks,
-          })
-        }
-      })
-      .catch(() => {})
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tree, dataVersion])
 
   // anchor from a link: [[Doc#^block-uuid]] finds the block by stable id,
   // [[Doc#Heading]] falls back to text match. Scroll + flash.
@@ -988,6 +970,68 @@ function DocView({
     }
   }, [tree, docId])
 
+  // go live: shared by the ⚡ chip, auto-join, and auto-hot escalation.
+  // The seeder NEVER seeds from in-memory state — it fetches the doc fresh
+  // and requires the fetched epoch to match the frozen epoch, so a save that
+  // landed moments before the session started can't be lost.
+  const goLive = useCallback(async () => {
+    if (!editable) return
+    try {
+      const r = await api<{ frozen_epoch: number; seed: boolean }>(
+        `/api/doc/${docId}/hot/start`,
+        { method: 'POST' },
+      )
+      let blocks = editable.blocks
+      if (r.seed) {
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const fresh = await api<DocTree>(`/api/doc/${docId}`)
+          // freshest content wins even on epoch mismatch (a save that raced
+          // the freeze); the gate scores the flatten against the stale base
+          // rather than anything being silently lost
+          blocks = editableBlocksOf(fresh)
+          if (fresh.doc.current_epoch === r.frozen_epoch) break
+          await new Promise((res) => setTimeout(res, 300))
+        }
+      }
+      setHot({
+        docId,
+        frozenEpoch: r.frozen_epoch,
+        seed: r.seed,
+        blocks,
+      })
+    } catch (e) {
+      console.error(e)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [docId, editable])
+
+  // a live session started elsewhere (second window, another instance,
+  // recovered journal): join it rather than editing cold. And when TWO
+  // editors are typing the same cold doc, escalate to a live session
+  // (P2.1 auto-hot) — only from a clean editor, so no keystrokes are lost.
+  useEffect(() => {
+    if (!tree || hot) return
+    api<{ hot: boolean; frozen_epoch?: number; editors?: number }>(
+      `/api/doc/${docId}/hot/status`,
+    )
+      .then((st) => {
+        if (!editable) return
+        if (st.hot) {
+          setHot({
+            docId,
+            frozenEpoch: st.frozen_epoch ?? tree.doc.current_epoch,
+            seed: false,
+            blocks: editable.blocks,
+          })
+        } else if ((st.editors ?? 0) >= 2) {
+          const dirty = document.querySelector('.save-state.dirty, .save-state.saving')
+          if (!dirty) goLive()
+        }
+      })
+      .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tree, dataVersion])
+
   if (!tree || !editable) return <div className="empty">…</div>
 
   // a canvas doc IS the canvas: full-stage tldraw, its own experience
@@ -1064,22 +1108,7 @@ function DocView({
             <button
               className="chip"
               title="start a live co-editing session"
-              onClick={async () => {
-                try {
-                  const r = await api<{ frozen_epoch: number; seed: boolean }>(
-                    `/api/doc/${docId}/hot/start`,
-                    { method: 'POST' },
-                  )
-                  setHot({
-                    docId,
-                    frozenEpoch: r.frozen_epoch,
-                    seed: r.seed,
-                    blocks: editable.blocks,
-                  })
-                } catch (e) {
-                  alert(String(e))
-                }
-              }}
+              onClick={goLive}
             >
               ⚡ go live
             </button>
@@ -1175,6 +1204,26 @@ function DocView({
       )}
     </article>
   )
+}
+
+/** The blocks the editor works on: content flow only — comments, frontmatter
+ * and canvases excluded (the same walk as DocView's editable memo). */
+function editableBlocksOf(tree: DocTree): Block[] {
+  const blocks: Block[] = []
+  const walk = (nodes: BlockNode[]) => {
+    for (const n of nodes) {
+      if (
+        n.block.block_type !== 'comment' &&
+        n.block.block_type !== 'canvas_scene' &&
+        !n.block.content.startsWith('---')
+      ) {
+        blocks.push(n.block)
+      }
+      walk(n.children)
+    }
+  }
+  walk(tree.roots)
+  return blocks
 }
 
 /* ---------- doc status (5.6) ---------- */
