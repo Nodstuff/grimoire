@@ -561,6 +561,22 @@ struct RenameReq {
     title: String,
 }
 
+/// Rewrite [[Old Title]] / [[Path/Old|alias]] / [[Old#anchor]] link forms.
+fn rewrite_links(content: &str, old: &str, new: &str) -> String {
+    let mut out = content.to_string();
+    for (from, to) in [
+        (format!("[[{old}]]"), format!("[[{new}]]")),
+        (format!("[[{old}|"), format!("[[{new}|")),
+        (format!("[[{old}#"), format!("[[{new}#")),
+        (format!("/{old}]]"), format!("/{new}]]")),
+        (format!("/{old}|"), format!("/{new}|")),
+        (format!("/{old}#"), format!("/{new}#")),
+    ] {
+        out = out.replace(&from, &to);
+    }
+    out
+}
+
 async fn rename_doc(
     State(st): State<ApiState>,
     Path(id): Path<Uuid>,
@@ -570,10 +586,47 @@ async fn rename_doc(
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.rename_doc(id, &req.title) {
-        Ok(()) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": e.to_string()})),
+    let old_title = match s.get_doc(id) {
+        Ok(d) => d.title,
+        Err(e) => return Json(json!({"error": e.to_string()})),
+    };
+    if let Err(e) = s.rename_doc(id, &req.title) {
+        return Json(json!({"error": e.to_string()}));
     }
+    // no more link-rot: rewrite every inbound [[wikilink]] through the gate
+    let new_title = req.title.trim();
+    let mut rewritten = 0usize;
+    if old_title != new_title {
+        let linkers = s.linking_blocks(&old_title).unwrap_or_default();
+        // group by doc so each doc gets one epoch
+        let mut by_doc: std::collections::HashMap<Uuid, Vec<(Uuid, String)>> = Default::default();
+        for (block, doc, content) in linkers {
+            by_doc.entry(doc).or_default().push((block, content));
+        }
+        for (doc, blocks) in by_doc {
+            let Ok(d) = s.get_doc(doc) else { continue };
+            let ops: Vec<OpInput> = blocks
+                .into_iter()
+                .filter_map(|(block, content)| {
+                    let new_content = rewrite_links(&content, &old_title, new_title);
+                    (new_content != content).then(|| OpInput {
+                        kind: ks_store_op_replace(block, new_content),
+                        source_refs: vec![format!("rename:{old_title} → {new_title}")],
+                    })
+                })
+                .collect();
+            if ops.is_empty() {
+                continue;
+            }
+            rewritten += ops.len();
+            let _ = s.propose(doc, d.current_epoch, st.human, ops);
+        }
+    }
+    Json(json!({"ok": true, "links_rewritten": rewritten}))
+}
+
+fn ks_store_op_replace(target: Uuid, content: String) -> grimoire_store::OpKind {
+    grimoire_store::OpKind::Replace { target, content }
 }
 
 async fn delete_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
