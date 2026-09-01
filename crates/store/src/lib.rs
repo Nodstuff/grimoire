@@ -51,6 +51,10 @@ pub trait BlockStore {
 
     fn list_principals(&self) -> Result<Vec<Principal>>;
 
+    /// Attach a pubkey to a principal — links the local human to the
+    /// instance's federation identity on first serve (ADR 0002, #54).
+    fn set_principal_pubkey(&mut self, id: Uuid, pubkey: &str) -> Result<()>;
+
     fn create_doc(&mut self, title: &str, parent: Option<Uuid>, created_by: Uuid) -> Result<Doc>;
 
     fn list_docs(&self) -> Result<Vec<Doc>>;
@@ -219,6 +223,71 @@ pub trait BlockStore {
 
     /// Leaf docs (≥1 block) with no tags — the tagging gardener's worklist.
     fn untagged_docs(&self, limit: usize) -> Result<Vec<Doc>>;
+
+    // --- federation (ADR 0002): contacts, shares, invites, mirrors ---
+
+    /// Pair a peer: creates (or revives) the contact and its remote principal.
+    /// Idempotent on pubkey — re-pairing an existing key updates the petname.
+    fn pair_contact(&mut self, pubkey: &str, petname: &str) -> Result<Contact>;
+
+    fn list_contacts(&self) -> Result<Vec<Contact>>;
+
+    fn contact_by_pubkey(&self, pubkey: &str) -> Result<Option<Contact>>;
+
+    fn set_contact_verified(&mut self, id: Uuid, verified: bool) -> Result<()>;
+
+    /// Revoke a contact: marks it revoked and revokes every share bound to it.
+    /// The row (and its principal) survive — provenance outlives trust.
+    fn revoke_contact(&mut self, id: Uuid) -> Result<()>;
+
+    /// Create a share of `root_doc`'s subtree. `contact: None` = awaiting an
+    /// invite redeem to bind one.
+    fn create_share(
+        &mut self,
+        root_doc: Uuid,
+        contact: Option<Uuid>,
+        permission: SharePermission,
+        policy_override: Option<ReviewPolicy>,
+    ) -> Result<Share>;
+
+    fn list_shares(&self) -> Result<Vec<Share>>;
+
+    fn get_share(&self, id: Uuid) -> Result<Share>;
+
+    fn set_share_state(&mut self, id: Uuid, state: ShareState) -> Result<()>;
+
+    fn set_share_permission(&mut self, id: Uuid, permission: SharePermission) -> Result<()>;
+
+    /// Record a minted invite. Only the secret's hash is stored; the secret
+    /// itself lives in the `grimoire://` link and is never persisted.
+    fn create_invite(&mut self, share_id: Uuid, secret_hash: &str, expires_at: &str) -> Result<Uuid>;
+
+    /// Burn-on-redeem: matches an unexpired, unredeemed invite by secret hash,
+    /// pairs the presenting pubkey as a contact, binds it to the share, and
+    /// activates the share. A second redeem (or an expired one) is an error.
+    fn redeem_invite(
+        &mut self,
+        secret_hash: &str,
+        pubkey: &str,
+        petname: &str,
+    ) -> Result<(Contact, Share)>;
+
+    /// Live docs in the share's subtree — recursive containment from root_doc,
+    /// the same rule as tend scopes. This is the entire universe a grantee
+    /// can ever see through this share.
+    fn docs_in_share(&self, share_id: Uuid) -> Result<Vec<Doc>>;
+
+    /// Non-revoked shares whose subtree contains this doc (enforcement + the
+    /// owner-side "you are sharing this" badge / move-into-share warning).
+    fn shares_containing(&self, doc_id: Uuid) -> Result<Vec<Share>>;
+
+    // Grantee-side mirror bookkeeping. The mirror doc keeps its origin UUID.
+
+    fn upsert_mirror(&mut self, doc_id: Uuid, owner: Uuid, share_id: Uuid, synced_epoch: i64) -> Result<()>;
+
+    fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>>;
+
+    fn list_mirrors(&self) -> Result<Vec<Mirror>>;
 
     /// Resolve one annotation. Invariant enforced here: proposer ≠ approver.
     /// - accept yellow: clear the annotation (the edit is already live)
