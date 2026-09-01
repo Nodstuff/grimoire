@@ -20,6 +20,9 @@ use uuid::Uuid;
 // Budgets (ticket 4.6): hardcoded constants — you are the config file.
 pub const MAX_PROMPT_CHARS: usize = 60_000;
 pub const MAX_WALL_CLOCK: Duration = Duration::from_secs(300);
+/// Scoped gardeners read whole repos before acting — they earn more clock.
+pub const SCOPED_WALL_CLOCK: Duration = Duration::from_secs(600);
+pub const SCRIBE_WALL_CLOCK: Duration = Duration::from_secs(1200);
 pub const DOCS_PER_RUN: usize = 10;
 pub const ITEMS_PER_REVIEW_RUN: usize = 20;
 pub const AUDIT_DOCS_PER_RUN: usize = 5;
@@ -134,7 +137,7 @@ async fn invoke_claude_with_dirs(
     prompt: &str,
     read_dirs: &[String],
 ) -> Result<(String, i64), String> {
-    invoke_claude_streaming(prompt, read_dirs, |_| {}).await
+    invoke_claude_streaming(prompt, read_dirs, MAX_WALL_CLOCK, |_| {}).await
 }
 
 /// Stream the model's activity (stream-json): every tool call ticks the
@@ -142,6 +145,7 @@ async fn invoke_claude_with_dirs(
 async fn invoke_claude_streaming(
     prompt: &str,
     read_dirs: &[String],
+    wall_clock: Duration,
     mut on_progress: impl FnMut(String),
 ) -> Result<(String, i64), String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -239,14 +243,11 @@ async fn invoke_claude_streaming(
             }
         }
     };
-    if tokio::time::timeout(MAX_WALL_CLOCK, read_all)
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(wall_clock, read_all).await.is_err() {
         let _ = child.kill().await;
         return Err(format!(
             "budget: wall clock exceeded {}s",
-            MAX_WALL_CLOCK.as_secs()
+            wall_clock.as_secs()
         ));
     }
     let status = child.wait().await.map_err(|e| format!("wait: {e}"))?;
@@ -794,18 +795,24 @@ async fn run_auditor(
             dirs.join(", ")
         )
     };
-    let (result, tokens) =
-        match invoke_claude_streaming(&prompt, &dirs, progress_to_run(&store, run_id)).await {
-            Ok(r) => r,
-            Err(e) => {
-                let status = if e.starts_with("budget:") {
-                    "budget-killed"
-                } else {
-                    "failed"
-                };
-                return (status.into(), e, None);
-            }
-        };
+    let (result, tokens) = match invoke_claude_streaming(
+        &prompt,
+        &dirs,
+        SCOPED_WALL_CLOCK,
+        progress_to_run(&store, run_id),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let status = if e.starts_with("budget:") {
+                "budget-killed"
+            } else {
+                "failed"
+            };
+            return (status.into(), e, None);
+        }
+    };
     let findings: Vec<AuditFinding> = match parse_json_result(&result) {
         Ok(f) => f,
         Err(e) => return ("failed".into(), e, Some(tokens)),
@@ -1052,18 +1059,24 @@ async fn run_scribe(
         p
     };
 
-    let (result, tokens) =
-        match invoke_claude_streaming(&prompt, &dirs, progress_to_run(&store, run_id)).await {
-            Ok(r) => r,
-            Err(e) => {
-                let status = if e.starts_with("budget:") {
-                    "budget-killed"
-                } else {
-                    "failed"
-                };
-                return (status.into(), e, None);
-            }
-        };
+    let (result, tokens) = match invoke_claude_streaming(
+        &prompt,
+        &dirs,
+        SCRIBE_WALL_CLOCK,
+        progress_to_run(&store, run_id),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let status = if e.starts_with("budget:") {
+                "budget-killed"
+            } else {
+                "failed"
+            };
+            return (status.into(), e, None);
+        }
+    };
     let new_docs: Vec<ScribeDoc> = match parse_json_result(&result) {
         Ok(d) => d,
         Err(e) => return ("failed".into(), e, Some(tokens)),

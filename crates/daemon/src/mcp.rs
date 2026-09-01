@@ -20,10 +20,23 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct KsMcp {
     store: Arc<Mutex<SqliteStore>>,
+    /// Default principal for un-identified sessions.
     agent: Uuid,
+    /// Per-session identity set via the `identify` tool — distinct provenance
+    /// for concurrent agent sessions.
+    identity: Arc<Mutex<Option<Uuid>>>,
     // referenced only through the #[tool_handler] macro's generated code
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+}
+
+impl KsMcp {
+    fn principal(&self) -> Uuid {
+        self.identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or(self.agent)
+    }
 }
 
 fn ok_json<T: Serialize>(v: &T) -> Result<CallToolResult, McpError> {
@@ -125,6 +138,29 @@ pub struct ListCommentsParams {
     pub block_id: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct IdentifyParams {
+    /// Session name, e.g. "claude:qompass-refactor".
+    pub name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MyProposalsParams {
+    /// Max ops to return (default 20).
+    pub limit: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DocsByTagParams {
+    pub tag: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ListDocsParams {
+    /// Restrict to this doc's subtree (UUID); omit for the whole corpus.
+    pub parent_doc_id: Option<String>,
+}
+
 #[derive(Serialize)]
 struct FlatBlock {
     id: Uuid,
@@ -161,19 +197,124 @@ impl KsMcp {
         Self {
             store,
             agent,
+            identity: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
     }
 
-    #[tool(description = "List all docs: id, title, parent_id, current_epoch, review_policy.")]
-    async fn list_docs(&self) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Identify this session with a name (e.g. 'claude:qompass-refactor'). Your writes are then attributed to that principal instead of the shared 'claude' — do this first in any session that writes, so provenance distinguishes concurrent agents."
+    )]
+    async fn identify(
+        &self,
+        Parameters(p): Parameters<IdentifyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = p.name.trim();
+        if name.is_empty() || name.len() > 60 {
+            return err("name must be 1-60 chars".into());
+        }
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let existing = store
+            .list_principals()
+            .ok()
+            .and_then(|ps| ps.into_iter().find(|pr| pr.display_name == name));
+        let principal = match existing {
+            Some(pr) => pr,
+            None => {
+                match store.create_principal(grimoire_store::PrincipalKind::Agent, name, None) {
+                    Ok(pr) => pr,
+                    Err(e) => return err(e.to_string()),
+                }
+            }
+        };
+        *self
+            .identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(principal.id);
+        ok_json(&json!({"identified_as": name, "principal": principal.id}))
+    }
+
+    #[tool(
+        description = "What happened to this session's recent proposals: each op with its verdict, whether its review annotation was accepted/declined/open, and who resolved it. Use to learn from declines."
+    )]
+    async fn my_proposals(
+        &self,
+        Parameters(p): Parameters<MyProposalsParams>,
+    ) -> Result<CallToolResult, McpError> {
         let store = self
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.list_docs() {
-            Ok(docs) => ok_json(&docs),
+        match store.proposal_outcomes(self.principal(), p.limit.unwrap_or(20) as usize) {
+            Ok(rows) => ok_json(
+                &rows
+                    .into_iter()
+                    .map(|(op, status, resolver)| {
+                        json!({
+                            "op": op,
+                            "review_status": status,
+                            "resolved_by": resolver,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
             Err(e) => err(e.to_string()),
+        }
+    }
+
+    #[tool(description = "All tags with doc counts — the vocabulary.")]
+    async fn list_tags(&self) -> Result<CallToolResult, McpError> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match store.list_tags() {
+            Ok(t) => ok_json(&t),
+            Err(e) => err(e.to_string()),
+        }
+    }
+
+    #[tool(description = "Docs carrying a tag.")]
+    async fn docs_by_tag(
+        &self,
+        Parameters(p): Parameters<DocsByTagParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match store.docs_by_tag(&p.tag) {
+            Ok(d) => ok_json(&d),
+            Err(e) => err(e.to_string()),
+        }
+    }
+
+    #[tool(
+        description = "List docs: id, title, parent_id, current_epoch, review_policy. Pass parent_doc_id to list only that subtree — cheaper than the whole corpus."
+    )]
+    async fn list_docs(
+        &self,
+        Parameters(p): Parameters<ListDocsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match p.parent_doc_id.as_deref() {
+            Some(root) => match parse_uuid(root, "parent_doc_id") {
+                Ok(root) => match store.doc_subtree(root) {
+                    Ok(docs) => ok_json(&docs),
+                    Err(e) => err(e.to_string()),
+                },
+                Err(m) => err(m),
+            },
+            None => match store.list_docs() {
+                Ok(docs) => ok_json(&docs),
+                Err(e) => err(e.to_string()),
+            },
         }
     }
 
@@ -228,7 +369,7 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Propose block edits through the review gate. Returns per-op structured verdicts: green = applied; yellow = applied, flagged for review; red = parked unapplied (your text is preserved for a reviewer). A stale base_epoch is fine — ops against unchanged blocks still green. Never guess base_epoch: read_doc first and quote its epoch."
+        description = "Propose block edits through the review gate. Returns per-op structured verdicts: green = applied; yellow = applied, flagged for review; red = parked unapplied (your text is preserved for a reviewer). A stale base_epoch is fine — ops against unchanged blocks still green. Never guess base_epoch: read_doc first and quote its epoch. For inserts, set order_key to \"\" to append after the last sibling, or \"after:<block-uuid>\" to insert after a specific block — the server assigns the real key; never compute keys yourself."
     )]
     async fn propose(
         &self,
@@ -246,7 +387,7 @@ impl KsMcp {
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.propose(doc_id, p.base_epoch, self.agent, ops) {
+        match store.propose(doc_id, p.base_epoch, self.principal(), ops) {
             Ok(out) => ok_json(&out),
             Err(StoreError::StaleBase { base, current }) => ok_json(&json!({
                 "error": "stale_base",
@@ -342,7 +483,7 @@ impl KsMcp {
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.resolve(id, self.agent, decision) {
+        match store.resolve(id, self.principal(), decision) {
             Ok(receipt) => ok_json(&json!({ "resolved": true, "receipt": receipt })),
             Err(e) => err(e.to_string()),
         }
@@ -393,7 +534,7 @@ impl KsMcp {
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.add_comment(block_id, self.agent, &p.text, reply_to) {
+        match store.add_comment(block_id, self.principal(), &p.text, reply_to) {
             Ok(c) => ok_json(&c),
             Err(e) => err(e.to_string()),
         }
@@ -436,7 +577,7 @@ impl KsMcp {
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.create_doc(&p.title, parent, self.agent) {
+        match store.create_doc(&p.title, parent, self.principal()) {
             Ok(doc) => ok_json(&doc),
             Err(e) => err(e.to_string()),
         }
