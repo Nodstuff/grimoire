@@ -98,6 +98,10 @@ pub trait BlockStore {
     /// Soft-delete a doc and its descendants; returns count. Reversible.
     fn delete_doc(&mut self, doc_id: Uuid) -> Result<usize>;
 
+    /// Rename a doc. NOTE: inbound [[wikilinks]] resolve by title and are not
+    /// rewritten — they dangle until edited (or an agent fixes them).
+    fn rename_doc(&mut self, doc_id: Uuid, title: &str) -> Result<()>;
+
     /// Substring search over live block content (ticket 3.4's v0: LIKE;
     /// FTS5+trigram replaces the internals without changing the signature).
     /// Results are blocks, not docs — the editable unit (§3.3).
