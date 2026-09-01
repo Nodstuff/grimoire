@@ -15,14 +15,28 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["grimoire"]
+        "schemes": [
+          "grimoire"
+        ]
       }
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
-    "icon": ["icons/icon.icns", "icons/icon.png"],
-    "externalBin": ["binaries/grimoire"]
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "icon": [
+      "icons/icon.icns",
+      "icons/icon.png"
+    ],
+    "externalBin": [
+      "binaries/grimoire"
+    ],
+    "macOS": {
+      "hardenedRuntime": true,
+      "minimumSystemVersion": "12.0"
+    }
   }
 }
