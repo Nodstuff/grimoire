@@ -1716,6 +1716,92 @@ impl BlockStore for SqliteStore {
             .collect()
     }
 
+    fn create_doc_with_id(
+        &mut self,
+        id: Uuid,
+        title: &str,
+        parent: Option<Uuid>,
+        created_by: Uuid,
+    ) -> Result<Doc> {
+        self.conn.execute(
+            "INSERT INTO docs (id, parent_id, title, created_by) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                id.to_string(),
+                parent.map(|p| p.to_string()),
+                title,
+                created_by.to_string()
+            ],
+        )?;
+        self.get_doc(id)
+    }
+
+    fn queue_join(&mut self, ticket: &str) -> Result<Uuid> {
+        if let Some(existing) = self
+            .conn
+            .query_row(
+                "SELECT id FROM pending_joins WHERE ticket = ?1",
+                params![ticket],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return uuid_col(existing, "pending_joins.id");
+        }
+        let id = Uuid::now_v7();
+        self.conn.execute(
+            "INSERT INTO pending_joins (id, ticket) VALUES (?1, ?2)",
+            params![id.to_string(), ticket],
+        )?;
+        Ok(id)
+    }
+
+    fn list_pending_joins(&self) -> Result<Vec<PendingJoin>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ticket, attempts, last_error, created_at
+             FROM pending_joins ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|(id, ticket, attempts, last_error, created_at)| {
+                Ok(PendingJoin {
+                    id: uuid_col(id, "pending_joins.id")?,
+                    ticket,
+                    attempts,
+                    last_error,
+                    created_at,
+                })
+            })
+            .collect()
+    }
+
+    fn record_join_attempt(&mut self, id: Uuid, error: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE pending_joins SET attempts = attempts + 1, last_error = ?1 WHERE id = ?2",
+            params![error, id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("pending join {id}")));
+        }
+        Ok(())
+    }
+
+    fn remove_pending_join(&mut self, id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pending_joins WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        Ok(())
+    }
+
     fn upsert_mirror(
         &mut self,
         doc_id: Uuid,

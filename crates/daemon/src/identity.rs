@@ -26,7 +26,12 @@ pub struct Identity {
 impl Identity {
     /// Load the instance identity, minting one on first run. `db_dir` is the
     /// directory holding ks.db — the file fallback lives beside it.
+    /// `GRIMOIRE_IDENTITY_FILE` bypasses the keychain entirely — the seam for
+    /// running a second instance on one machine (testing federation locally).
     pub fn load_or_create(db_dir: &Path) -> Result<Self> {
+        if let Some(path) = std::env::var_os("GRIMOIRE_IDENTITY_FILE") {
+            return Self::load_or_create_file(Path::new(&path));
+        }
         match keychain_entry() {
             Ok(entry) => match entry.get_password() {
                 Ok(hex_seed) => Self::from_hex(&hex_seed),

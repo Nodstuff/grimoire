@@ -283,11 +283,33 @@ pub trait BlockStore {
 
     // Grantee-side mirror bookkeeping. The mirror doc keeps its origin UUID.
 
+    /// Create a doc under a caller-chosen UUID — the mirror path (#57):
+    /// mirrors keep their origin UUIDs so deep links and ops line up across
+    /// instances. Everything else must use create_doc.
+    fn create_doc_with_id(
+        &mut self,
+        id: Uuid,
+        title: &str,
+        parent: Option<Uuid>,
+        created_by: Uuid,
+    ) -> Result<Doc>;
+
     fn upsert_mirror(&mut self, doc_id: Uuid, owner: Uuid, share_id: Uuid, synced_epoch: i64) -> Result<()>;
 
     fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>>;
 
     fn list_mirrors(&self) -> Result<Vec<Mirror>>;
+
+    // Grantee-side join queue: redeems that will retry until the owner is up.
+
+    /// Queue a join ticket for background retry. Idempotent on ticket text.
+    fn queue_join(&mut self, ticket: &str) -> Result<Uuid>;
+
+    fn list_pending_joins(&self) -> Result<Vec<PendingJoin>>;
+
+    fn record_join_attempt(&mut self, id: Uuid, error: &str) -> Result<()>;
+
+    fn remove_pending_join(&mut self, id: Uuid) -> Result<()>;
 
     /// Resolve one annotation. Invariant enforced here: proposer ≠ approver.
     /// - accept yellow: clear the annotation (the edit is already live)

@@ -216,3 +216,15 @@ CREATE TABLE IF NOT EXISTS mirrors (
     share_id     TEXT NOT NULL,
     synced_epoch INTEGER NOT NULL DEFAULT 0
 );
+
+-- Grantee-side: joins that could not complete because the owner was offline.
+-- A background loop retries; success removes the row (async redeem, ADR 0002
+-- decision 6). The ticket contains the secret, so this table is as sensitive
+-- as the link itself — local-only, like everything here.
+CREATE TABLE IF NOT EXISTS pending_joins (
+    id         TEXT PRIMARY KEY,
+    ticket     TEXT NOT NULL UNIQUE,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
