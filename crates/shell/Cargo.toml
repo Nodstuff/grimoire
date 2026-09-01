@@ -8,4 +8,6 @@ license = "MIT"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+serde_json.workspace = true
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-deep-link = "2"

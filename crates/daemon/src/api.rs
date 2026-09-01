@@ -30,6 +30,21 @@ async fn docs(State(st): State<ApiState>) -> Json<Value> {
         .filter(|g| g.enabled)
         .filter_map(|g| g.scope_doc.map(|d| d.to_string()))
         .collect();
+    // federation decorations: mirror docs ("shared with me") and the roots
+    // of active shares ("you are sharing this")
+    let mirrors: std::collections::HashMap<String, String> = s
+        .list_mirrors()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| (m.doc_id.to_string(), m.permission.as_str().to_string()))
+        .collect();
+    let share_roots: std::collections::HashSet<String> = s
+        .list_shares()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|sh| sh.state != grimoire_store::ShareState::Revoked)
+        .map(|sh| sh.root_doc.to_string())
+        .collect();
     match s.list_docs() {
         Ok(d) => Json(json!(
             d.into_iter()
@@ -38,12 +53,64 @@ async fn docs(State(st): State<ApiState>) -> Json<Value> {
                     let mut v = json!(doc);
                     v["is_canvas"] = json!(canvases.contains(&id));
                     v["is_tended"] = json!(tended.contains(&id));
+                    if let Some(perm) = mirrors.get(&id) {
+                        v["mirror_permission"] = json!(perm);
+                    }
+                    v["is_shared"] = json!(share_roots.contains(&id));
                     v
                 })
                 .collect::<Vec<_>>()
         )),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
+}
+
+/// Everything the doc view needs to render federation state for one doc:
+/// its mirror origin (if it is shared WITH us), the shares exposing it (if
+/// we are sharing it), and our pending upstream proposals against it.
+async fn doc_federation(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let contacts = s.list_contacts().unwrap_or_default();
+    let petname_of = |cid: Uuid| {
+        contacts
+            .iter()
+            .find(|c| c.id == cid)
+            .map(|c| c.petname.clone())
+            .unwrap_or_else(|| "?".into())
+    };
+    let mirror = s.get_mirror(id).ok().flatten().map(|m| {
+        json!({
+            "owner": m.owner,
+            "owner_petname": petname_of(m.owner),
+            "permission": m.permission,
+            "synced_epoch": m.synced_epoch,
+        })
+    });
+    let shares: Vec<Value> = s
+        .shares_containing(id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|sh| {
+            json!({
+                "id": sh.id,
+                "root_doc": sh.root_doc,
+                "permission": sh.permission,
+                "state": sh.state,
+                "petname": sh.contact.map(&petname_of),
+            })
+        })
+        .collect();
+    let outbound: Vec<Value> = s
+        .list_outbound_proposals(false)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.doc_id == id)
+        .map(|p| json!(p))
+        .collect();
+    Json(json!({"mirror": mirror, "shares": shares, "outbound": outbound}))
 }
 
 async fn doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
@@ -658,6 +725,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/doc/{id}/delete", post(delete_doc))
         .route("/api/doc/{id}/rename", post(rename_doc))
         .route("/api/doc/{id}/tendings", get(tendings))
+        .route("/api/doc/{id}/federation", get(doc_federation))
         .route("/api/comment", post(add_comment))
         .route("/api/resolve", post(resolve))
         .route("/api/resolve_bulk", post(resolve_bulk))

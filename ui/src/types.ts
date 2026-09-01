@@ -9,6 +9,68 @@ export interface Doc {
   sort_key: string | null
   is_canvas?: boolean
   is_tended?: boolean
+  /** present when this doc is a mirror synced from a remote owner */
+  mirror_permission?: 'view' | 'propose'
+  /** true when this doc is the root of an active share we own */
+  is_shared?: boolean
+}
+
+/* ---------- federation (ADR 0002) ---------- */
+
+export interface Contact {
+  id: string
+  pubkey: string
+  petname: string
+  principal: string
+  verified: boolean
+  revoked: boolean
+  paired_at: string
+}
+
+export interface Share {
+  id: string
+  root_doc: string
+  contact: string | null
+  permission: 'view' | 'propose'
+  state: 'offered' | 'active' | 'revoked'
+  policy_override: string | null
+  created_at: string
+}
+
+export interface PendingJoin {
+  id: string
+  ticket: string
+  attempts: number
+  last_error: string | null
+  created_at: string
+}
+
+export interface OutboundProposal {
+  id: string
+  doc_id: string
+  share_id: string
+  owner: string
+  op_ids: string[]
+  note: string
+  state: 'pending' | 'accepted' | 'declined' | 'mixed'
+  created_at: string
+}
+
+export interface DocFederation {
+  mirror: {
+    owner: string
+    owner_petname: string
+    permission: 'view' | 'propose'
+    synced_epoch: number
+  } | null
+  shares: {
+    id: string
+    root_doc: string
+    permission: 'view' | 'propose'
+    state: string
+    petname: string | null
+  }[]
+  outbound: OutboundProposal[]
 }
 
 export interface Block {

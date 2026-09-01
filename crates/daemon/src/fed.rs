@@ -610,7 +610,9 @@ pub async fn join_at(
         };
         s.create_doc_with_id(root_uuid, &title, None, owner_contact.principal)?;
     }
-    s.upsert_mirror(root_uuid, owner_contact.id, share_uuid, 0)?;
+    let perm = grimoire_store::SharePermission::parse(&permission)
+        .unwrap_or(grimoire_store::SharePermission::View);
+    s.upsert_mirror(root_uuid, owner_contact.id, share_uuid, 0, perm)?;
     tracing::info!(
         owner = ticket.node,
         root = root_doc,
@@ -722,12 +724,32 @@ pub async fn pull_share(
         }
     }
 
-    // 3. blocks + cursors for everything that changed
+    // 3. claim a mirror row for EVERY in-share doc (permission from the
+    // share's existing rows) — this is what lets an active share reclaim
+    // docs from a superseded one — then land blocks for what changed
+    let share_perm = s
+        .list_mirrors()?
+        .into_iter()
+        .find(|m| m.share_id == share_id)
+        .map(|m| m.permission)
+        .unwrap_or(grimoire_store::SharePermission::View);
+    let changed_ids: std::collections::HashSet<&str> =
+        changed.iter().map(|wd| wd.meta.id.as_str()).collect();
+    for m in &metas {
+        let Ok(id) = m.id.parse::<uuid::Uuid>() else {
+            continue;
+        };
+        let cursor = if changed_ids.contains(m.id.as_str()) {
+            0 // block replace below sets the real epoch
+        } else {
+            m.epoch
+        };
+        s.upsert_mirror(id, owner.id, share_id, cursor, share_perm)?;
+    }
     for wd in &changed {
         let Ok(id) = wd.meta.id.parse::<uuid::Uuid>() else {
             continue;
         };
-        s.upsert_mirror(id, owner.id, share_id, 0)?;
         s.mirror_replace_blocks(id, wd.blocks.clone(), wd.meta.epoch, owner.principal)?;
     }
 
@@ -858,12 +880,37 @@ pub async fn pull_all_once(
             .collect()
     };
     let mut out = Vec::new();
+    let mut dead_shares = Vec::new();
     for (owner, share_id) in groups {
         let res = match owner.pubkey.parse::<iroh::EndpointId>() {
             Ok(id) => pull_share(endpoint, store, EndpointAddr::from(id), &owner, share_id).await,
             Err(_) => Err(anyhow::anyhow!("contact has a malformed pubkey")),
         };
+        if let Err(e) = &res
+            && format!("{e:#}").contains("share is revoked")
+        {
+            dead_shares.push(share_id);
+        }
         out.push((share_id, res));
+    }
+    // cleanup: docs still claimed only by a revoked share (active shares
+    // reclaimed theirs during the pulls above) are gone from our view
+    if !dead_shares.is_empty() {
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        for share_id in dead_shares {
+            let orphans: Vec<uuid::Uuid> = s
+                .list_mirrors()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| m.share_id == share_id)
+                .map(|m| m.doc_id)
+                .collect();
+            for doc in orphans {
+                tracing::info!(%doc, %share_id, "share revoked upstream; dropping mirror");
+                s.remove_mirror(doc).ok();
+                s.delete_doc(doc).ok();
+            }
+        }
     }
     out
 }

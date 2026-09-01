@@ -137,10 +137,35 @@ fn show_window(app: &AppHandle) {
     .build();
 }
 
+/// A clicked grimoire://join/… link lands here (#57): route it into the UI
+/// as a query param — App.tsx prefills the join box on the sharing screen.
+fn handle_deep_link(app: &AppHandle, urls: Vec<tauri::Url>) {
+    let Some(link) = urls.first() else { return };
+    let link = link.as_str();
+    // only the payload travels as the query value — base64url is query-safe
+    let Some(payload) = link.strip_prefix("grimoire://join/") else {
+        return;
+    };
+    show_window(app);
+    if let Some(w) = app.get_webview_window("main") {
+        let target = format!("{DAEMON_URL}?join={payload}");
+        let _ = w.navigate(target.parse().unwrap());
+    }
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
             ensure_daemon();
+
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    handle_deep_link(&handle, event.urls());
+                });
+            }
 
             let open = MenuItemBuilder::with_id("open", "Open Grimoire").build(app)?;
             let garden = MenuItemBuilder::with_id("garden", "Run gardeners now").build(app)?;

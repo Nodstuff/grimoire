@@ -214,7 +214,10 @@ CREATE TABLE IF NOT EXISTS mirrors (
     doc_id       TEXT PRIMARY KEY REFERENCES docs (id),
     owner        TEXT NOT NULL REFERENCES contacts (id),
     share_id     TEXT NOT NULL,
-    synced_epoch INTEGER NOT NULL DEFAULT 0
+    synced_epoch INTEGER NOT NULL DEFAULT 0,
+    -- what the owner granted us: drives the editor mode (read-only vs
+    -- propose-upstream); the owner enforces regardless
+    permission   TEXT NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'propose'))
 );
 
 -- Grantee-side: joins that could not complete because the owner was offline.
