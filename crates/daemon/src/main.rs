@@ -100,6 +100,11 @@ enum ShareCmd {
     Revoke {
         share_id: String,
     },
+    /// Set a share's trust tier: review (park, default) or yellow (trusted).
+    Trust {
+        share_id: String,
+        trust: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -266,6 +271,14 @@ async fn main() -> anyhow::Result<()> {
                     let r = client
                         .post(format!("{base}/admin/shares/revoke"))
                         .json(&serde_json::json!({"id": share_id}))
+                        .send()
+                        .await?;
+                    println!("{}", r.text().await?);
+                }
+                ShareCmd::Trust { share_id, trust } => {
+                    let r = client
+                        .post(format!("{base}/admin/shares/trust"))
+                        .json(&serde_json::json!({"id": share_id, "trust": trust}))
                         .send()
                         .await?;
                     println!("{}", r.text().await?);

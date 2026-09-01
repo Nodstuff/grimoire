@@ -67,6 +67,10 @@ pub enum Request {
         doc: String,
         ops: Vec<grimoire_store::OpInput>,
         note: String,
+        /// The grantee's synced epoch for the doc — the base the gate scores
+        /// against on trusted (yellow) shares. Absent = park regardless.
+        #[serde(default)]
+        base_epoch: Option<i64>,
         /// Retry-safety: the same id returns the original outcome instead of
         /// parking twice (mirrors the MCP propose contract).
         #[serde(default)]
@@ -337,6 +341,7 @@ fn dispatch(req: Request, peer: &str, store: &Arc<Mutex<SqliteStore>>, dedupe: &
             doc,
             ops,
             note,
+            base_epoch,
             request_id,
         } => {
             let Some(contact) = contact else {
@@ -353,7 +358,7 @@ fn dispatch(req: Request, peer: &str, store: &Arc<Mutex<SqliteStore>>, dedupe: &
                     return prior.clone();
                 }
             }
-            let res = match handle_propose(&mut store, &contact, &share, &doc, ops, &note) {
+            let res = match handle_propose(&mut store, &contact, &share, &doc, ops, &note, base_epoch) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(peer, share, doc, "propose refused: {e}");
@@ -405,6 +410,7 @@ fn handle_propose(
     doc_id: &str,
     ops: Vec<grimoire_store::OpInput>,
     note: &str,
+    base_epoch: Option<i64>,
 ) -> Result<Response> {
     let share_uuid: uuid::Uuid = share_id.parse().context("bad share id")?;
     let doc_uuid: uuid::Uuid = doc_id.parse().context("bad doc id")?;
@@ -425,6 +431,27 @@ fn handle_propose(
         anyhow::bail!("empty proposal");
     }
     let note = format!("via share from {}: {note}", contact.petname);
+    // trust tier (#62): a trusted share's edits apply immediately as flagged
+    // yellows (revertible via pre-image); reds (overlaps, gone targets) still
+    // park through the same scoring. Untrusted (default): everything parks.
+    if share.trust == grimoire_store::ShareTrust::Yellow
+        && let Some(base) = base_epoch
+    {
+        let outcome = store.propose_reviewed(doc_uuid, base, contact.principal, ops)?;
+        tracing::info!(
+            peer = contact.pubkey,
+            doc = doc_id,
+            ops = outcome.verdicts.len(),
+            "trusted remote proposal applied as flagged yellows"
+        );
+        return Ok(Response::Proposed {
+            op_ids: outcome
+                .verdicts
+                .into_iter()
+                .map(|v| v.op_id.to_string())
+                .collect(),
+        });
+    }
     let op_ids = store.park(doc_uuid, contact.principal, ops, &note)?;
     tracing::info!(
         peer = contact.pubkey,
@@ -794,6 +821,7 @@ pub async fn propose_upstream(
             doc: doc_id.to_string(),
             ops,
             note: note.to_string(),
+            base_epoch: Some(mirror.synced_epoch),
             request_id: Some(uuid::Uuid::now_v7().to_string()),
         },
     )
@@ -837,7 +865,9 @@ pub async fn refresh_outbound(endpoint: &Endpoint, store: &Arc<Mutex<SqliteStore
         let Ok(Response::ProposalStatuses { statuses }) = res else {
             continue; // owner offline or refused: stays pending
         };
-        // resolved = the annotation is no longer open
+        // resolved = the annotation is no longer open. Key acceptance off the
+        // annotation status, NOT the applied flag — a declined yellow was
+        // applied and then reverted, and must read as declined.
         let resolved: Vec<_> = statuses
             .iter()
             .filter(|s| s.review.as_deref() != Some("open"))
@@ -845,7 +875,16 @@ pub async fn refresh_outbound(endpoint: &Endpoint, store: &Arc<Mutex<SqliteStore
         if resolved.len() < prop.op_ids.len() {
             continue; // partially reviewed: wait for the rest
         }
-        let accepted = resolved.iter().filter(|s| s.applied).count();
+        let accepted = resolved
+            .iter()
+            .filter(|s| match s.review.as_deref() {
+                Some("accepted") => true,
+                Some("declined") => false,
+                // no annotation ever existed (a green under auto policy):
+                // applied is the truth
+                _ => s.applied,
+            })
+            .count();
         let state = if accepted == resolved.len() {
             "accepted"
         } else if accepted == 0 {
@@ -1387,6 +1426,7 @@ mod tests {
                 doc: doc.id.to_string(),
                 ops: ops.clone(),
                 note: "typo fix".into(),
+                base_epoch: None,
                 request_id: Some("retry-me".into()),
             },
         )
@@ -1405,6 +1445,7 @@ mod tests {
                 doc: doc.id.to_string(),
                 ops: ops.clone(),
                 note: "typo fix".into(),
+                base_epoch: None,
                 request_id: Some("retry-me".into()),
             },
         )
@@ -1484,12 +1525,127 @@ mod tests {
                 doc: doc.id.to_string(),
                 ops,
                 note: String::new(),
+                base_epoch: None,
                 request_id: None,
             },
         )
         .await
         .unwrap();
         assert!(matches!(res, Response::Refused { .. }));
+    }
+
+    #[tokio::test]
+    async fn trusted_share_applies_as_yellow_and_decline_reads_declined() {
+        use grimoire_store::{BlockType, OpInput, OpKind, ReviewDecision, ShareTrust};
+
+        let mut owner_store = SqliteStore::open_in_memory().unwrap();
+        let tom = owner_store
+            .create_principal(PrincipalKind::Human, "tom", None)
+            .unwrap();
+        let doc = owner_store.create_doc("Notes", None, tom.id).unwrap();
+        let owner_ep = local_endpoint().await;
+        let (share, link) = mint_invite(
+            &mut owner_store,
+            &owner_ep.id().to_string(),
+            doc.id,
+            SharePermission::Propose,
+        )
+        .unwrap();
+        owner_store.set_share_trust(share.id, ShareTrust::Yellow).unwrap();
+        let owner_store = Arc::new(Mutex::new(owner_store));
+        let addr = direct_addr(&owner_ep);
+        tokio::spawn(serve(owner_ep, owner_store.clone()));
+
+        let mut alice_store = SqliteStore::open_in_memory().unwrap();
+        alice_store
+            .create_principal(PrincipalKind::Human, "alice", None)
+            .unwrap();
+        let alice_store = Arc::new(Mutex::new(alice_store));
+        let alice_ep = local_endpoint().await;
+        let ticket = Ticket::parse(&link).unwrap();
+        join_at(&alice_ep, &alice_store, &ticket, addr.clone())
+            .await
+            .unwrap();
+
+        let mk_op = |content: &str| OpInput {
+            kind: OpKind::Insert {
+                block_id: uuid::Uuid::now_v7(),
+                parent_id: None,
+                order_key: "i".into(),
+                block_type: BlockType::Paragraph,
+                content: content.into(),
+                refers_to: None,
+            },
+            source_refs: vec![],
+        };
+        let propose = |ops: Vec<OpInput>| Request::Propose {
+            share: share.id.to_string(),
+            doc: doc.id.to_string(),
+            ops,
+            note: String::new(),
+            base_epoch: Some(0),
+            request_id: None,
+        };
+
+        // trusted: applies IMMEDIATELY as a flagged yellow
+        let res = request(&alice_ep, addr.clone(), propose(vec![mk_op("trusted edit")]))
+            .await
+            .unwrap();
+        let Response::Proposed { op_ids } = res else {
+            panic!("expected Proposed, got {res:?}");
+        };
+        let first_ids: Vec<uuid::Uuid> = op_ids.iter().map(|s| s.parse().unwrap()).collect();
+        {
+            let s = owner_store.lock().unwrap();
+            let tree = s.read_doc(doc.id).unwrap();
+            assert_eq!(tree.roots[0].block.content, "trusted edit"); // live
+            let queue = s.review_queue(Some(doc.id)).unwrap();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].annotation.kind, grimoire_store::AnnotationKind::Review); // yellow, not parked
+            let st = &s.op_statuses(&first_ids).unwrap()[0];
+            assert!(st.applied);
+            assert_eq!(st.review.as_deref(), Some("open"));
+        }
+
+        // owner declines → reverted via pre-image; status must read DECLINED
+        // even though the op was once applied
+        {
+            let mut s = owner_store.lock().unwrap();
+            let ann = s.review_queue(Some(doc.id)).unwrap()[0].annotation.id;
+            s.resolve(ann, tom.id, ReviewDecision::Decline).unwrap();
+            assert!(s.read_doc(doc.id).unwrap().roots.is_empty()); // reverted
+        }
+        let res = request(
+            &alice_ep,
+            addr.clone(),
+            Request::ProposalStatus {
+                op_ids: op_ids.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let Response::ProposalStatuses { statuses } = res else {
+            panic!("expected statuses");
+        };
+        assert_eq!(statuses[0].review.as_deref(), Some("declined"));
+
+        // an untrusted share still parks: flip trust back, propose again
+        {
+            let mut s = owner_store.lock().unwrap();
+            s.set_share_trust(share.id, ShareTrust::Review).unwrap();
+        }
+        let res = request(&alice_ep, addr, propose(vec![mk_op("now untrusted")]))
+            .await
+            .unwrap();
+        assert!(matches!(res, Response::Proposed { .. }));
+        {
+            let s = owner_store.lock().unwrap();
+            // parked: nothing live (doc was emptied by the revert above)
+            assert!(s.read_doc(doc.id).unwrap().roots.is_empty());
+            let queue = s.review_queue(Some(doc.id)).unwrap();
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].annotation.kind, grimoire_store::AnnotationKind::Parked);
+        }
     }
 
     #[tokio::test]

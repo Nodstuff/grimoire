@@ -532,6 +532,33 @@ pub struct Contact {
     pub paired_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShareTrust {
+    /// Remote proposals park red for review (default).
+    Review,
+    /// Trusted: remote edits apply immediately as flagged yellows; reds
+    /// (overlaps, gone targets) still park.
+    Yellow,
+}
+
+impl ShareTrust {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ShareTrust::Review => "review",
+            ShareTrust::Yellow => "yellow",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "review" => Some(ShareTrust::Review),
+            "yellow" => Some(ShareTrust::Yellow),
+            _ => None,
+        }
+    }
+}
+
 /// An owner-side grant: this subtree, this contact, this permission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Share {
@@ -542,6 +569,7 @@ pub struct Share {
     pub state: ShareState,
     pub policy_override: Option<ReviewPolicy>,
     pub created_at: String,
+    pub trust: ShareTrust,
 }
 
 /// Grantee-side origin + pull cursor for a mirror doc (same UUID as upstream).

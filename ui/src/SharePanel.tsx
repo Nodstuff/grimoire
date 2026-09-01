@@ -87,6 +87,28 @@ export default function SharePanel({
               <span className="meta">
                 {s.permission} · {s.state}
               </span>
+              {s.state === 'active' && s.permission === 'propose' && (
+                <button
+                  className={`chip ${s.trust === 'yellow' ? 'trusted' : ''}`}
+                  title={
+                    s.trust === 'yellow'
+                      ? 'trusted: their edits apply immediately, flagged for review'
+                      : 'their edits wait in your review queue'
+                  }
+                  onClick={() =>
+                    api('/admin/shares/trust', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        id: s.id,
+                        trust: s.trust === 'yellow' ? 'review' : 'yellow',
+                      }),
+                    }).then(onChanged, (e) => alert(String(e)))
+                  }
+                >
+                  {s.trust === 'yellow' ? '★ trusted' : 'trust'}
+                </button>
+              )}
               {s.state !== 'revoked' && (
                 <button
                   className="decline"

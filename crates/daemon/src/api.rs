@@ -100,6 +100,7 @@ async fn doc_federation(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Jso
                 "permission": sh.permission,
                 "state": sh.state,
                 "petname": sh.contact.map(&petname_of),
+                "trust": sh.trust,
             })
         })
         .collect();
