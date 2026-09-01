@@ -6,6 +6,7 @@
 mod admin;
 mod api;
 mod garden;
+mod identity;
 mod mcp;
 
 use anyhow::Context;
@@ -66,6 +67,20 @@ enum Cmd {
         #[arg(long, default_value_t = 7425)]
         port: u16,
     },
+    /// Show the instance's federation identity (ADR 0002); export/import
+    /// move it between machines.
+    Identity {
+        #[command(subcommand)]
+        cmd: Option<IdentityCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdentityCmd {
+    /// Write the identity key to a file (0600) for machine migration.
+    Export { path: PathBuf },
+    /// Adopt an exported identity, replacing this machine's key.
+    Import { path: PathBuf },
 }
 
 fn default_db() -> PathBuf {
@@ -197,8 +212,37 @@ async fn main() -> anyhow::Result<()> {
             let r = reqwest::get("http://127.0.0.1:7425/admin/runs").await?;
             println!("{}", r.text().await?);
         }
+        Cmd::Identity { cmd } => {
+            let db_dir = cli.db.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+            match cmd {
+                None => {
+                    let id = identity::Identity::load_or_create(&db_dir)?;
+                    println!("node id:     {}", id.node_id());
+                    println!("fingerprint: {}", id.fingerprint());
+                }
+                Some(IdentityCmd::Export { path }) => {
+                    let id = identity::Identity::load_or_create(&db_dir)?;
+                    id.export(&path)?;
+                    println!("identity exported to {} (0600)", path.display());
+                }
+                Some(IdentityCmd::Import { path }) => {
+                    let id = identity::Identity::import(&path, &db_dir)?;
+                    println!("identity imported; node id: {}", id.node_id());
+                }
+            }
+        }
         Cmd::Serve { port } => {
             let mut store = store;
+            // federation identity: minted silently on first serve, linked to
+            // the human principal so provenance and pubkey agree (#54)
+            let db_dir = cli.db.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+            match identity::Identity::load_or_create(&db_dir) {
+                Ok(id) => {
+                    store.set_principal_pubkey(tom, &id.node_id())?;
+                    tracing::info!("federation identity: {}", id.fingerprint());
+                }
+                Err(e) => tracing::warn!("no federation identity available: {e:#}"),
+            }
             if let Ok(n) = store.mark_orphaned_runs()
                 && n > 0
             {

@@ -264,6 +264,93 @@ fn build_doc(raw: RawDoc) -> Result<Doc> {
     })
 }
 
+// --- federation row mapping (ADR 0002) ---
+
+type RawContact = (String, String, String, String, bool, bool, String);
+
+fn contact_row(row: &rusqlite::Row) -> rusqlite::Result<RawContact> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn finish_contact(raw: RawContact) -> Result<Contact> {
+    let (id, pubkey, petname, principal, verified, revoked, paired_at) = raw;
+    Ok(Contact {
+        id: uuid_col(id, "contacts.id")?,
+        pubkey,
+        petname,
+        principal: uuid_col(principal, "contacts.principal")?,
+        verified,
+        revoked,
+        paired_at,
+    })
+}
+
+type RawShare = (
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    String,
+);
+
+fn share_row(row: &rusqlite::Row) -> rusqlite::Result<RawShare> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn finish_share(raw: RawShare) -> Result<Share> {
+    let (id, root_doc, contact, permission, state, policy_override, created_at) = raw;
+    Ok(Share {
+        id: uuid_col(id, "shares.id")?,
+        root_doc: uuid_col(root_doc, "shares.root_doc")?,
+        contact: contact.map(|c| uuid_col(c, "shares.contact")).transpose()?,
+        permission: SharePermission::parse(&permission)
+            .ok_or_else(|| StoreError::InvalidOp(format!("bad permission: {permission}")))?,
+        state: ShareState::parse(&state)
+            .ok_or_else(|| StoreError::InvalidOp(format!("bad share state: {state}")))?,
+        policy_override: policy_override
+            .map(|p| {
+                ReviewPolicy::parse(&p)
+                    .ok_or_else(|| StoreError::InvalidOp(format!("bad policy_override: {p}")))
+            })
+            .transpose()?,
+        created_at,
+    })
+}
+
+type RawMirror = (String, String, String, i64);
+
+fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+}
+
+fn finish_mirror(raw: RawMirror) -> Result<Mirror> {
+    let (doc_id, owner, share_id, synced_epoch) = raw;
+    Ok(Mirror {
+        doc_id: uuid_col(doc_id, "mirrors.doc_id")?,
+        owner: uuid_col(owner, "mirrors.owner")?,
+        share_id: uuid_col(share_id, "mirrors.share_id")?,
+        synced_epoch,
+    })
+}
+
 type RawBlock = (
     String,
     String,
@@ -627,6 +714,17 @@ impl BlockStore for SqliteStore {
             display_name,
             pubkey,
         })
+    }
+
+    fn set_principal_pubkey(&mut self, id: Uuid, pubkey: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE principals SET pubkey = ?1 WHERE id = ?2",
+            params![pubkey, id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("principal {id}")));
+        }
+        Ok(())
     }
 
     fn list_principals(&self) -> Result<Vec<Principal>> {
@@ -1378,6 +1476,291 @@ impl BlockStore for SqliteStore {
             })
         })
         .collect()
+    }
+
+    // --- federation (ADR 0002) ---
+
+    fn pair_contact(&mut self, pubkey: &str, petname: &str) -> Result<Contact> {
+        if let Some(existing) = self.contact_by_pubkey(pubkey)? {
+            self.conn.execute(
+                "UPDATE contacts SET petname = ?1, revoked = 0 WHERE id = ?2",
+                params![petname, existing.id.to_string()],
+            )?;
+            return Ok(Contact {
+                petname: petname.into(),
+                revoked: false,
+                ..existing
+            });
+        }
+        let principal = self.create_principal(PrincipalKind::Remote, petname, Some(pubkey))?;
+        let id = Uuid::now_v7();
+        self.conn.execute(
+            "INSERT INTO contacts (id, pubkey, petname, principal) VALUES (?1, ?2, ?3, ?4)",
+            params![id.to_string(), pubkey, petname, principal.id.to_string()],
+        )?;
+        self.contact_by_pubkey(pubkey)?
+            .ok_or_else(|| StoreError::NotFound(format!("contact {id}")))
+    }
+
+    fn list_contacts(&self) -> Result<Vec<Contact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, pubkey, petname, principal, verified, revoked, paired_at
+             FROM contacts ORDER BY paired_at",
+        )?;
+        let rows = stmt.query_map([], contact_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(finish_contact)
+            .collect()
+    }
+
+    fn contact_by_pubkey(&self, pubkey: &str) -> Result<Option<Contact>> {
+        self.conn
+            .query_row(
+                "SELECT id, pubkey, petname, principal, verified, revoked, paired_at
+                 FROM contacts WHERE pubkey = ?1",
+                params![pubkey],
+                contact_row,
+            )
+            .optional()?
+            .map(finish_contact)
+            .transpose()
+    }
+
+    fn set_contact_verified(&mut self, id: Uuid, verified: bool) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE contacts SET verified = ?1 WHERE id = ?2",
+            params![verified, id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("contact {id}")));
+        }
+        Ok(())
+    }
+
+    fn revoke_contact(&mut self, id: Uuid) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE contacts SET revoked = 1 WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("contact {id}")));
+        }
+        self.conn.execute(
+            "UPDATE shares SET state = 'revoked' WHERE contact = ?1",
+            params![id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn create_share(
+        &mut self,
+        root_doc: Uuid,
+        contact: Option<Uuid>,
+        permission: SharePermission,
+        policy_override: Option<ReviewPolicy>,
+    ) -> Result<Share> {
+        self.get_doc(root_doc)?; // must exist
+        let id = Uuid::now_v7();
+        self.conn.execute(
+            "INSERT INTO shares (id, root_doc, contact, permission, policy_override)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id.to_string(),
+                root_doc.to_string(),
+                contact.map(|c| c.to_string()),
+                permission.as_str(),
+                policy_override.map(|p| p.as_str()),
+            ],
+        )?;
+        self.get_share(id)
+    }
+
+    fn list_shares(&self) -> Result<Vec<Share>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, root_doc, contact, permission, state, policy_override, created_at
+             FROM shares ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], share_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(finish_share)
+            .collect()
+    }
+
+    fn get_share(&self, id: Uuid) -> Result<Share> {
+        self.conn
+            .query_row(
+                "SELECT id, root_doc, contact, permission, state, policy_override, created_at
+                 FROM shares WHERE id = ?1",
+                params![id.to_string()],
+                share_row,
+            )
+            .optional()?
+            .map(finish_share)
+            .transpose()?
+            .ok_or_else(|| StoreError::NotFound(format!("share {id}")))
+    }
+
+    fn set_share_state(&mut self, id: Uuid, state: ShareState) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE shares SET state = ?1 WHERE id = ?2",
+            params![state.as_str(), id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("share {id}")));
+        }
+        Ok(())
+    }
+
+    fn set_share_permission(&mut self, id: Uuid, permission: SharePermission) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE shares SET permission = ?1 WHERE id = ?2",
+            params![permission.as_str(), id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("share {id}")));
+        }
+        Ok(())
+    }
+
+    fn create_invite(&mut self, share_id: Uuid, secret_hash: &str, expires_at: &str) -> Result<Uuid> {
+        self.get_share(share_id)?;
+        let id = Uuid::now_v7();
+        self.conn.execute(
+            "INSERT INTO share_invites (id, share_id, secret_hash, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id.to_string(), share_id.to_string(), secret_hash, expires_at],
+        )?;
+        Ok(id)
+    }
+
+    fn redeem_invite(
+        &mut self,
+        secret_hash: &str,
+        pubkey: &str,
+        petname: &str,
+    ) -> Result<(Contact, Share)> {
+        // ISO-8601 UTC strings compare lexicographically; 'now' matches the
+        // strftime format used everywhere else in this schema.
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, share_id FROM share_invites
+                 WHERE secret_hash = ?1
+                   AND redeemed_at IS NULL
+                   AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                params![secret_hash],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((invite_id, share_id)) = row else {
+            return Err(StoreError::InvalidOp(
+                "invite invalid: unknown, already redeemed, or expired".into(),
+            ));
+        };
+        let share_id = uuid_col(share_id, "share_invites.share_id")?;
+        let contact = self.pair_contact(pubkey, petname)?;
+        // burn first: even if binding fails, the secret is single-use
+        self.conn.execute(
+            "UPDATE share_invites SET redeemed_by = ?1,
+                 redeemed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?2",
+            params![contact.id.to_string(), invite_id],
+        )?;
+        self.conn.execute(
+            "UPDATE shares SET contact = ?1, state = 'active' WHERE id = ?2",
+            params![contact.id.to_string(), share_id.to_string()],
+        )?;
+        Ok((contact, self.get_share(share_id)?))
+    }
+
+    fn docs_in_share(&self, share_id: Uuid) -> Result<Vec<Doc>> {
+        let share = self.get_share(share_id)?;
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE subtree (id) AS (
+                 SELECT id FROM docs WHERE id = ?1 AND deleted = 0
+                 UNION ALL
+                 SELECT d.id FROM docs d JOIN subtree s ON d.parent_id = s.id
+                 WHERE d.deleted = 0
+             )
+             SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch,
+                    d.created_by, d.status, d.sort_key
+             FROM docs d JOIN subtree s ON d.id = s.id
+             ORDER BY d.sort_key IS NULL, d.sort_key, d.title",
+        )?;
+        let rows = stmt.query_map(params![share.root_doc.to_string()], row_to_doc)?;
+        rows.map(|r| build_doc(r?)).collect()
+    }
+
+    fn shares_containing(&self, doc_id: Uuid) -> Result<Vec<Share>> {
+        // walk up from the doc; any non-revoked share rooted at an ancestor
+        // (or the doc itself) contains it
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE ancestors (id) AS (
+                 SELECT id FROM docs WHERE id = ?1
+                 UNION ALL
+                 SELECT d.parent_id FROM docs d JOIN ancestors a ON d.id = a.id
+                 WHERE d.parent_id IS NOT NULL
+             )
+             SELECT s.id, s.root_doc, s.contact, s.permission, s.state,
+                    s.policy_override, s.created_at
+             FROM shares s JOIN ancestors a ON s.root_doc = a.id
+             WHERE s.state != 'revoked'
+             ORDER BY s.created_at",
+        )?;
+        let rows = stmt.query_map(params![doc_id.to_string()], share_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(finish_share)
+            .collect()
+    }
+
+    fn upsert_mirror(
+        &mut self,
+        doc_id: Uuid,
+        owner: Uuid,
+        share_id: Uuid,
+        synced_epoch: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO mirrors (doc_id, owner, share_id, synced_epoch)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (doc_id) DO UPDATE SET
+                 owner = excluded.owner,
+                 share_id = excluded.share_id,
+                 synced_epoch = excluded.synced_epoch",
+            params![
+                doc_id.to_string(),
+                owner.to_string(),
+                share_id.to_string(),
+                synced_epoch
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>> {
+        self.conn
+            .query_row(
+                "SELECT doc_id, owner, share_id, synced_epoch FROM mirrors WHERE doc_id = ?1",
+                params![doc_id.to_string()],
+                mirror_row,
+            )
+            .optional()?
+            .map(finish_mirror)
+            .transpose()
+    }
+
+    fn list_mirrors(&self) -> Result<Vec<Mirror>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT doc_id, owner, share_id, synced_epoch FROM mirrors ORDER BY doc_id")?;
+        let rows = stmt.query_map([], mirror_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(finish_mirror)
+            .collect()
     }
 
     fn resolve(

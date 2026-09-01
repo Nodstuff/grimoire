@@ -465,3 +465,90 @@ pub struct GardenerRun {
     pub tokens_used: Option<i64>,
     pub tool_calls: Option<i64>,
 }
+
+// --- federation (ADR 0002) ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SharePermission {
+    View,
+    Propose,
+}
+
+impl SharePermission {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SharePermission::View => "view",
+            SharePermission::Propose => "propose",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "view" => Some(SharePermission::View),
+            "propose" => Some(SharePermission::Propose),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShareState {
+    Offered,
+    Active,
+    Revoked,
+}
+
+impl ShareState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ShareState::Offered => "offered",
+            ShareState::Active => "active",
+            ShareState::Revoked => "revoked",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "offered" => Some(ShareState::Offered),
+            "active" => Some(ShareState::Active),
+            "revoked" => Some(ShareState::Revoked),
+            _ => None,
+        }
+    }
+}
+
+/// A paired peer: pubkey identifies the actor, the linked remote principal
+/// carries provenance for everything they propose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Contact {
+    pub id: Uuid,
+    pub pubkey: String,
+    pub petname: String,
+    pub principal: Uuid,
+    pub verified: bool,
+    pub revoked: bool,
+    pub paired_at: String,
+}
+
+/// An owner-side grant: this subtree, this contact, this permission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Share {
+    pub id: Uuid,
+    pub root_doc: Uuid,
+    pub contact: Option<Uuid>,
+    pub permission: SharePermission,
+    pub state: ShareState,
+    pub policy_override: Option<ReviewPolicy>,
+    pub created_at: String,
+}
+
+/// Grantee-side origin + pull cursor for a mirror doc (same UUID as upstream).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Mirror {
+    pub doc_id: Uuid,
+    pub owner: Uuid,
+    pub share_id: Uuid,
+    pub synced_epoch: i64,
+}

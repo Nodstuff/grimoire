@@ -166,3 +166,53 @@ CREATE TABLE IF NOT EXISTS audits (
     audited_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (doc_id, principal)
 );
+
+-- Federation (ADR 0002): pair-once contacts, subtree shares, one-time invites,
+-- grantee-side mirror cursors. Owner-authoritative; a remote peer is
+-- gardener-shaped — its writes arrive through the propose gate.
+CREATE TABLE IF NOT EXISTS contacts (
+    id        TEXT PRIMARY KEY,
+    -- iroh node id = ed25519 public key, hex — keys identify actors, UUIDs data
+    pubkey    TEXT NOT NULL UNIQUE,
+    petname   TEXT NOT NULL,
+    principal TEXT NOT NULL REFERENCES principals (id),
+    verified  INTEGER NOT NULL DEFAULT 0,
+    revoked   INTEGER NOT NULL DEFAULT 0,
+    paired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS shares (
+    id         TEXT PRIMARY KEY,
+    root_doc   TEXT NOT NULL REFERENCES docs (id),
+    -- NULL until an invite is redeemed and binds a contact
+    contact    TEXT REFERENCES contacts (id),
+    permission TEXT NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'propose')),
+    -- offered = minted/awaiting grantee accept; active = syncing; revoked = refused on dial
+    state      TEXT NOT NULL DEFAULT 'offered' CHECK (state IN ('offered', 'active', 'revoked')),
+    -- overrides the doc's review policy for proposals arriving via this share
+    policy_override TEXT CHECK (policy_override IN ('human-review', 'agent-review', 'auto')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS shares_by_contact ON shares (contact);
+
+-- One-time invite secrets (hash only, never the secret), burned on redeem.
+CREATE TABLE IF NOT EXISTS share_invites (
+    id          TEXT PRIMARY KEY,
+    share_id    TEXT NOT NULL REFERENCES shares (id),
+    secret_hash TEXT NOT NULL UNIQUE,
+    expires_at  TEXT NOT NULL,
+    redeemed_by TEXT REFERENCES contacts (id),
+    redeemed_at TEXT,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Grantee-side: a mirror doc's origin + pull cursor. Mirrors keep their origin
+-- UUIDs (federation tax), so doc_id is the same id the owner holds. share_id
+-- is the owner-side share id — a foreign instance's id, deliberately no FK.
+CREATE TABLE IF NOT EXISTS mirrors (
+    doc_id       TEXT PRIMARY KEY REFERENCES docs (id),
+    owner        TEXT NOT NULL REFERENCES contacts (id),
+    share_id     TEXT NOT NULL,
+    synced_epoch INTEGER NOT NULL DEFAULT 0
+);
