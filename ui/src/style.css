@@ -708,3 +708,24 @@ kbd {
   font-weight: 700;
   padding: 1px 6px;
 }
+
+/* ---------- rename ---------- */
+
+.doc-title { cursor: text; border-radius: 6px; padding: 0 4px; margin-left: -4px !important; }
+.doc-title:hover { background: var(--panel); }
+.doc-title-edit {
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--fg);
+  font-size: 26px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  padding: 0 4px;
+  margin-left: -5px;
+  outline: none;
+  font-family: inherit;
+  min-width: 320px;
+}
+.canvas-doc-head .doc-title { font-size: 17px; margin: 0; }
+.canvas-doc-head .doc-title-edit { font-size: 17px; }

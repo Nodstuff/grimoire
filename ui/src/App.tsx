@@ -628,6 +628,57 @@ function keyBetween(a: string | null, b: string | null): string {
 
 /* ---------- doc view ---------- */
 
+/** Click-to-rename doc title. Inbound [[wikilinks]] resolve by title and are
+ * not rewritten on rename — they dangle until edited. */
+function DocTitle({ doc, onRenamed }: { doc: Doc; onRenamed: () => void }) {
+  const [editing, setEditing] = useState(false)
+  const [value, setValue] = useState(doc.title)
+
+  const save = async () => {
+    setEditing(false)
+    const title = value.trim()
+    if (!title || title === doc.title) {
+      setValue(doc.title)
+      return
+    }
+    await api(`/api/doc/${doc.id}/rename`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    }).catch((e) => {
+      console.error(e)
+      setValue(doc.title)
+    })
+    onRenamed()
+  }
+
+  if (!editing)
+    return (
+      <h1 className="doc-title" title="click to rename" onClick={() => {
+        setValue(doc.title)
+        setEditing(true)
+      }}>
+        {doc.title}
+      </h1>
+    )
+  return (
+    <input
+      className="doc-title-edit"
+      autoFocus
+      value={value}
+      onChange={(e) => setValue(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') save()
+        if (e.key === 'Escape') {
+          setValue(doc.title)
+          setEditing(false)
+        }
+      }}
+      onBlur={save}
+    />
+  )
+}
+
 function DocView({
   docId,
   onOpenDoc,
@@ -758,7 +809,7 @@ function DocView({
     return (
       <div className="canvas-doc">
         <div className="canvas-doc-head">
-          <h1>{tree.doc.title}</h1>
+          <DocTitle doc={tree.doc} onRenamed={loadTree} />
           <span className="meta">canvas · epoch {tree.doc.current_epoch}</span>
         </div>
         <CanvasBlock block={canvases[0]} epoch={tree.doc.current_epoch} onSaved={loadTree} full />
@@ -769,7 +820,7 @@ function DocView({
   return (
     <article className="doc" onClick={onStageClick}>
       <div className="doc-head">
-        <h1>{tree.doc.title}</h1>
+        <DocTitle doc={tree.doc} onRenamed={loadTree} />
         {tree.doc.review_policy && <span className="meta policy">{tree.doc.review_policy}</span>}
         <StatusChip doc={tree.doc} onChanged={loadTree} />
         <span className="head-actions">

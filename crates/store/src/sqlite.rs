@@ -825,6 +825,21 @@ impl BlockStore for SqliteStore {
         Ok(n)
     }
 
+    fn rename_doc(&mut self, doc_id: Uuid, title: &str) -> Result<()> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(StoreError::InvalidOp("rename: empty title".into()));
+        }
+        let n = self.conn.execute(
+            "UPDATE docs SET title = ?1 WHERE id = ?2 AND deleted = 0",
+            params![title, doc_id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("doc {doc_id}")));
+        }
+        Ok(())
+    }
+
     fn set_doc_status(&mut self, doc_id: Uuid, status: Option<DocStatus>) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE docs SET status = ?1 WHERE id = ?2",
@@ -1588,7 +1603,7 @@ impl SqliteStore {
                       + (SELECT count(*) FROM annotations WHERE status != 'open') * 7919
                       + (SELECT COALESCE(max(rowid), 0) FROM gardener_runs) * 104729
                       + (SELECT count(*) FROM gardener_runs WHERE status != 'running') * 31
-                      + (SELECT COALESCE(sum(length(coalesce(sort_key,'')) + length(coalesce(parent_id,''))), 0) FROM docs WHERE deleted = 0)",
+                      + (SELECT COALESCE(sum(length(coalesce(sort_key,'')) + length(coalesce(parent_id,'')) + length(title)), 0) FROM docs WHERE deleted = 0)",
                 [],
                 |r| r.get(0),
             )

@@ -505,6 +505,26 @@ async fn move_doc(
     }
 }
 
+#[derive(Deserialize)]
+struct RenameReq {
+    title: String,
+}
+
+async fn rename_doc(
+    State(st): State<ApiState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<RenameReq>,
+) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.rename_doc(id, &req.title) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 async fn delete_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
     let mut s = st
         .store
@@ -532,6 +552,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/buildinfo", get(buildinfo))
         .route("/api/stamp", get(stamp))
         .route("/api/doc/{id}/delete", post(delete_doc))
+        .route("/api/doc/{id}/rename", post(rename_doc))
         .route("/api/comment", post(add_comment))
         .route("/api/resolve", post(resolve))
         .route("/api/resolve_bulk", post(resolve_bulk))
