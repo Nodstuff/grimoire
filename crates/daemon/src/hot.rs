@@ -46,6 +46,9 @@ pub struct HotSession {
 pub struct HotState {
     pub sessions: Arc<Mutex<HashMap<Uuid, HotSession>>>,
     pub journal_dir: Arc<std::path::PathBuf>,
+    /// Cold-editor heartbeats (auto-hot, P2.1): doc → editor key → last ping.
+    /// Two live keys on a cold doc = concurrent editing = the UIs go live.
+    pub editing: Arc<Mutex<HashMap<Uuid, HashMap<Uuid, std::time::Instant>>>>,
 }
 
 impl HotState {
@@ -54,6 +57,30 @@ impl HotState {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             journal_dir: Arc::new(journal_dir),
+            editing: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Record a cold-editor heartbeat; returns how many distinct editors
+    /// pinged within the liveness window.
+    pub fn edit_ping(&self, doc_id: Uuid, editor_key: Uuid) -> usize {
+        const LIVE: std::time::Duration = std::time::Duration::from_secs(10);
+        let mut editing = self.editing.lock().unwrap_or_else(|p| p.into_inner());
+        let keys = editing.entry(doc_id).or_default();
+        keys.insert(editor_key, std::time::Instant::now());
+        keys.retain(|_, t| t.elapsed() < LIVE);
+        keys.len()
+    }
+
+    pub fn editors(&self, doc_id: Uuid) -> usize {
+        const LIVE: std::time::Duration = std::time::Duration::from_secs(10);
+        let mut editing = self.editing.lock().unwrap_or_else(|p| p.into_inner());
+        match editing.get_mut(&doc_id) {
+            Some(keys) => {
+                keys.retain(|_, t| t.elapsed() < LIVE);
+                keys.len()
+            }
+            None => 0,
         }
     }
 
@@ -391,23 +418,51 @@ async fn hot_confirm(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Jso
 async fn hot_status(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<Value> {
     if mirror_of(&ctx, doc_id) {
         let Some(ep) = &ctx.endpoint else {
-            return Json(json!({"hot": false}));
+            return Json(json!({"hot": false, "editors": 0}));
         };
         return match crate::fed::hot_status_upstream(ep, &ctx.store, doc_id).await {
-            Ok((hot, frozen_epoch)) => Json(json!({"hot": hot, "frozen_epoch": frozen_epoch})),
+            Ok((hot, frozen_epoch, editors)) => {
+                Json(json!({"hot": hot, "frozen_epoch": frozen_epoch, "editors": editors}))
+            }
             // owner offline etc: not joinable, so not hot
-            Err(_) => Json(json!({"hot": false})),
+            Err(_) => Json(json!({"hot": false, "editors": 0})),
         };
     }
+    let editors = ctx.hot.editors(doc_id);
     let sessions = ctx.hot.sessions.lock().unwrap_or_else(|p| p.into_inner());
     match sessions.get(&doc_id) {
         Some(s) => Json(json!({
             "hot": !s.ending,
             "frozen_epoch": s.frozen_epoch,
             "participants": s.tx.receiver_count(),
+            "editors": editors,
         })),
-        None => Json(json!({"hot": false})),
+        None => Json(json!({"hot": false, "editors": editors})),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct EditPing {
+    key: Uuid,
+}
+
+/// Cold-editor heartbeat. Mirrors relay to the owner so cross-instance
+/// concurrent editing also escalates.
+async fn editing_ping(
+    State(ctx): State<HotCtx>,
+    Path(doc_id): Path<Uuid>,
+    Json(req): Json<EditPing>,
+) -> Json<Value> {
+    if mirror_of(&ctx, doc_id) {
+        let Some(ep) = &ctx.endpoint else {
+            return Json(json!({"editors": 1}));
+        };
+        return match crate::fed::edit_ping_upstream(ep, &ctx.store, doc_id, req.key).await {
+            Ok(editors) => Json(json!({"editors": editors})),
+            Err(_) => Json(json!({"editors": 1})),
+        };
+    }
+    Json(json!({"editors": ctx.hot.edit_ping(doc_id, req.key)}))
 }
 
 async fn ws_hot(
@@ -525,6 +580,7 @@ pub fn router(ctx: HotCtx) -> Router {
         .route("/api/doc/{id}/hot/end", post(hot_end))
         .route("/api/doc/{id}/hot/confirm", post(hot_confirm))
         .route("/api/doc/{id}/hot/status", get(hot_status))
+        .route("/api/doc/{id}/editing", post(editing_ping))
         .route("/ws/hot/{id}", any(ws_hot))
         .with_state(ctx)
 }

@@ -259,6 +259,25 @@ export default function DocEditor({
   saveRef.current = save
   const modeRef = useRef(mode)
   modeRef.current = mode
+
+  // cold-editor heartbeat (auto-hot): while someone is actively in this
+  // editor, tell the daemon — two concurrent editors escalate to a live
+  // session (the DocView owns the escalation; we just ping)
+  const editorKey = useRef(crypto.randomUUID())
+  useEffect(() => {
+    if (mode === 'readonly') return
+    const t = setInterval(() => {
+      if (!editor) return
+      const active = editor.isFocused || saveState !== 'clean'
+      if (!active) return
+      api(`/api/doc/${doc.docId}/editing`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: editorKey.current }),
+      }).catch(() => {})
+    }, 4000)
+    return () => clearInterval(t)
+  }, [editor, mode, doc.docId, saveState])
   useEffect(() => {
     if (saveState !== 'dirty' || mode !== 'direct') return
     const t = setTimeout(() => saveRef.current(), 1200)

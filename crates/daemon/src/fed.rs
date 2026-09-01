@@ -91,6 +91,13 @@ pub enum Request {
         share: String,
         doc: String,
     },
+    /// Cold-editor heartbeat from a grantee (auto-hot). Requires propose —
+    /// only someone who could edit can escalate.
+    EditPing {
+        share: String,
+        doc: String,
+        key: String,
+    },
     /// End + daemon-flatten a hot session (#67). Requires propose.
     HotEnd {
         share: String,
@@ -155,6 +162,8 @@ pub enum Response {
     HotStatusIs {
         hot: bool,
         frozen_epoch: Option<i64>,
+        #[serde(default)]
+        editors: usize,
     },
     HotStarted {
         frozen_epoch: i64,
@@ -433,7 +442,8 @@ fn dispatch(req: Request, peer: &str, store_arc: &Arc<Mutex<SqliteStore>>, dedup
                     let (hot, frozen_epoch) = crate::hot::global()
                         .map(|h| h.status(doc_id))
                         .unwrap_or((false, None));
-                    Response::HotStatusIs { hot, frozen_epoch }
+                    let editors = crate::hot::global().map(|h| h.editors(doc_id)).unwrap_or(0);
+                    Response::HotStatusIs { hot, frozen_epoch, editors }
                 }
                 Err(e) => Response::Refused { reason: e.to_string() },
             }
@@ -457,6 +467,26 @@ fn dispatch(req: Request, peer: &str, store_arc: &Arc<Mutex<SqliteStore>>, dedup
                             Response::HotStarted { frozen_epoch, seed }
                         }
                         Err(e) => Response::Refused { reason: e.to_string() },
+                    }
+                }
+                Err(e) => Response::Refused { reason: e.to_string() },
+            }
+        }
+        Request::EditPing { share, doc, key } => {
+            let Some(contact) = contact else {
+                return Response::Refused { reason: "unknown peer".into() };
+            };
+            match authorize_hot(&store, &contact, &share, &doc, true) {
+                Ok(doc_id) => {
+                    let editors = key
+                        .parse::<uuid::Uuid>()
+                        .ok()
+                        .and_then(|k| crate::hot::global().map(|h| h.edit_ping(doc_id, k)))
+                        .unwrap_or(1);
+                    Response::HotStatusIs {
+                        hot: crate::hot::doc_is_hot(doc_id),
+                        frozen_epoch: None,
+                        editors,
                     }
                 }
                 Err(e) => Response::Refused { reason: e.to_string() },
@@ -892,7 +922,7 @@ pub async fn hot_status_upstream(
     endpoint: &Endpoint,
     store: &Arc<Mutex<SqliteStore>>,
     doc_id: uuid::Uuid,
-) -> Result<(bool, Option<i64>)> {
+) -> Result<(bool, Option<i64>, usize)> {
     let (mirror, owner) = mirror_owner(store, doc_id)?;
     let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
     let res = request(
@@ -905,8 +935,32 @@ pub async fn hot_status_upstream(
     )
     .await?;
     match res {
-        Response::HotStatusIs { hot, frozen_epoch } => Ok((hot, frozen_epoch)),
+        Response::HotStatusIs { hot, frozen_epoch, editors } => Ok((hot, frozen_epoch, editors)),
         other => anyhow::bail!("owner refused hot status: {other:?}"),
+    }
+}
+
+pub async fn edit_ping_upstream(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    doc_id: uuid::Uuid,
+    key: uuid::Uuid,
+) -> Result<usize> {
+    let (mirror, owner) = mirror_owner(store, doc_id)?;
+    let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
+    let res = request(
+        endpoint,
+        EndpointAddr::from(owner_id),
+        Request::EditPing {
+            share: mirror.share_id.to_string(),
+            doc: doc_id.to_string(),
+            key: key.to_string(),
+        },
+    )
+    .await?;
+    match res {
+        Response::HotStatusIs { editors, .. } => Ok(editors),
+        other => anyhow::bail!("owner refused edit ping: {other:?}"),
     }
 }
 

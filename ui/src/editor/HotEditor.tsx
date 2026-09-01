@@ -8,12 +8,20 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { EditorContent, useEditor } from '@tiptap/react'
 import Collaboration from '@tiptap/extension-collaboration'
+import CollaborationCaret from '@tiptap/extension-collaboration-caret'
 import * as Y from 'yjs'
 import { WebsocketProvider } from 'y-websocket'
 import { prosemirrorJSONToYDoc } from 'y-prosemirror'
 import type { Node as PMNode } from '@tiptap/pm/model'
-import { api, Block } from '../types'
+import { api, Block, Principal } from '../types'
 import { extensions, parser, schema } from './DocEditor'
+
+const CARET_COLORS = ['#8b9dc3', '#95c99b', '#d9b47a', '#d98a94', '#a88bd4', '#7bc4c4']
+function colorFor(name: string): string {
+  let h = 0
+  for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0
+  return CARET_COLORS[h % CARET_COLORS.length]
+}
 
 export interface HotDoc {
   docId: string
@@ -31,7 +39,8 @@ export default function HotEditor({
   /** session over (we ended it, or the daemon dropped it) — reload cold */
   onEnded: () => void
 }) {
-  const [peers, setPeers] = useState(1)
+  const [peerNames, setPeerNames] = useState<string[]>([])
+  const [me, setMe] = useState<string>('me')
   const [connected, setConnected] = useState(false)
   const [ending, setEnding] = useState(false)
   const endedRef = useRef(false)
@@ -63,9 +72,30 @@ export default function HotEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [doc.docId])
 
+  // identify ourselves in awareness: petname + stable color drive the carets
+  useEffect(() => {
+    api<Principal[]>('/api/principals')
+      .then((ps) => {
+        const human = ps.find((p) => p.kind === 'human')
+        if (human) setMe(human.display_name)
+      })
+      .catch(() => {})
+  }, [])
+  useEffect(() => {
+    provider.awareness.setLocalStateField('user', { name: me, color: colorFor(me) })
+  }, [provider, me])
+
   useEffect(() => {
     const onStatus = ({ status }: { status: string }) => setConnected(status === 'connected')
-    const onAwareness = () => setPeers(provider.awareness.getStates().size)
+    const onAwareness = () => {
+      const names: string[] = []
+      provider.awareness.getStates().forEach((state, clientId) => {
+        if (clientId === provider.awareness.clientID) return
+        const n = (state as { user?: { name?: string } }).user?.name
+        names.push(n || 'someone')
+      })
+      setPeerNames(names)
+    }
     provider.on('status', onStatus)
     provider.awareness.on('change', onAwareness)
     // daemon dropped the session (someone else ended it): the provider just
@@ -97,10 +127,14 @@ export default function HotEditor({
       extensions: [
         ...extensions.filter((e) => e.name !== 'undoRedo'), // Yjs owns history
         Collaboration.configure({ document: ydoc, field: 'default' }),
+        CollaborationCaret.configure({
+          provider,
+          user: { name: me, color: colorFor(me) },
+        }),
       ],
       // content comes exclusively from the Yjs doc
     },
-    [doc.docId],
+    [doc.docId, me],
   )
 
   // ending is one call: the daemon renders the Yjs doc to markdown, diffs
@@ -122,7 +156,12 @@ export default function HotEditor({
     <>
       <div className="hot-banner">
         <span className="hot-dot" />
-        live session · {peers} here · {connected ? 'synced' : 'connecting…'}
+        live
+        {peerNames.length > 0
+          ? ` with ${peerNames.join(', ')}`
+          : ' — waiting for others'}
+        {' · '}
+        {connected ? 'synced' : 'connecting…'}
         <button className="hot-end" disabled={ending} onClick={endSession}>
           {ending ? 'saving…' : 'end session'}
         </button>
