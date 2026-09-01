@@ -801,3 +801,13 @@ kbd {
 }
 .tend-lastrun { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
 .tend-lastrun pre { white-space: pre-wrap; font: 11px/1.5 ui-monospace, monospace; color: var(--fg-dim); margin: 4px 0 0; }
+
+/* ---------- wikilink decorations in the editor ---------- */
+
+.wl-dim { opacity: 0.3; font-size: 0.85em; }
+.wl-target {
+  color: var(--accent);
+  cursor: pointer;
+  border-bottom: 1px dotted color-mix(in srgb, var(--accent) 60%, transparent);
+}
+.wl-target:hover { border-bottom-style: solid; background: color-mix(in srgb, var(--accent) 10%, transparent); }
