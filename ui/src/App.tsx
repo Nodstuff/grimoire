@@ -893,10 +893,10 @@ function DocView({
 
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
 
-  // a live session started elsewhere (second window, recovered journal):
-  // join it rather than editing cold
+  // a live session started elsewhere (second window, another instance,
+  // recovered journal): join it rather than editing cold
   useEffect(() => {
-    if (!tree || hot || mirrorRef.current) return
+    if (!tree || hot) return
     api<{ hot: boolean; frozen_epoch?: number }>(`/api/doc/${docId}/hot/status`)
       .then((st) => {
         if (st.hot && editable) {
@@ -1060,7 +1060,7 @@ function DocView({
               {(fed?.shares.length ?? 0) > 0 ? '↗ shared' : 'share'}
             </button>
           )}
-          {!mirror && !hot && editable && (
+          {!hot && editable && (!mirror || mirror.permission === 'propose') && (
             <button
               className="chip"
               title="start a live co-editing session"
@@ -1090,6 +1090,7 @@ function DocView({
         <HotEditor
           key={`hot:${docId}`}
           doc={hot}
+          canEnd={!mirror}
           onEnded={() => {
             setHot(null)
             setEditorGen((g) => g + 1)

@@ -386,18 +386,22 @@ async fn main() -> anyhow::Result<()> {
             }
             tokio::spawn(admin::daily_loop(store.clone()));
             // hot sessions (#65): journal-backed live co-editing state
-            let hot = hot::HotState::new(dirs_home().join(".grimoire/hot"));
+            // journals live beside the db so multiple instances never share
+            let hot = hot::HotState::new(
+                cli.db.parent().unwrap_or(std::path::Path::new(".")).join("hot"),
+            );
             hot.recover(&store);
             hot::set_global(hot.clone());
             // ui/dist next to the binary's repo root; fall back to cwd
             let ui_dist = std::env::var("GRIMOIRE_UI_DIST")
                 .unwrap_or_else(|_| "/Users/tmeaney/personal/knowledge-system/ui/dist".into());
             let app = mcp::router(store.clone(), claude)
-                .merge(admin::router(store.clone(), fed_ctx))
                 .merge(hot::router(hot::HotCtx {
                     hot: hot.clone(),
                     store: store.clone(),
+                    endpoint: fed_ctx.endpoint.clone(),
                 }))
+                .merge(admin::router(store.clone(), fed_ctx))
                 .merge(api::router(api::ApiState { store, human: tom }))
                 .fallback_service(tower_http::services::ServeDir::new(&ui_dist).fallback(
                     tower_http::services::ServeFile::new(format!("{ui_dist}/index.html")),
