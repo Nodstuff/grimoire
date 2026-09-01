@@ -312,6 +312,41 @@ async fn join(State(st): State<FedState>, Json(req): Json<JoinReq>) -> Json<Valu
     }
 }
 
+#[derive(Deserialize)]
+pub struct ProposeUpstreamReq {
+    pub doc_id: Uuid,
+    pub ops: Vec<grimoire_store::OpInput>,
+    #[serde(default)]
+    pub note: String,
+}
+
+async fn propose_upstream(
+    State(st): State<FedState>,
+    Json(req): Json<ProposeUpstreamReq>,
+) -> Json<Value> {
+    let Some(endpoint) = &st.ctx.endpoint else {
+        return Json(json!({"error": "federation disabled: no instance identity"}));
+    };
+    match crate::fed::propose_upstream(endpoint, &st.store, req.doc_id, req.ops, &req.note).await {
+        Ok(id) => Json(json!({"proposal": id, "state": "pending"})),
+        Err(e) => Json(json!({"error": format!("{e:#}")})),
+    }
+}
+
+async fn list_proposals(State(st): State<FedState>) -> Json<Value> {
+    if let Some(endpoint) = &st.ctx.endpoint {
+        crate::fed::refresh_outbound(endpoint, &st.store).await;
+    }
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.list_outbound_proposals(false) {
+        Ok(p) => Json(json!(p)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 async fn pull_now(State(st): State<FedState>) -> Json<Value> {
     let Some(endpoint) = &st.ctx.endpoint else {
         return Json(json!({"error": "federation disabled: no instance identity"}));
@@ -347,6 +382,8 @@ pub fn router(store: Store, fed: FedCtx) -> Router {
         .route("/admin/join", post(join))
         .route("/admin/joins", get(list_joins))
         .route("/admin/pull", post(pull_now))
+        .route("/admin/propose_upstream", post(propose_upstream))
+        .route("/admin/proposals", get(list_proposals))
         .with_state(FedState {
             store: store.clone(),
             ctx: fed,

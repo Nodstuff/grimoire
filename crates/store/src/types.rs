@@ -575,3 +575,27 @@ pub struct MirrorBlock {
     #[serde(default)]
     pub refers_to: Option<Uuid>,
 }
+
+/// A proposal shipped upstream (grantee-side bookkeeping, #60).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutboundProposal {
+    pub id: Uuid,
+    pub doc_id: Uuid,
+    pub share_id: Uuid,
+    pub owner: Uuid,
+    pub op_ids: Vec<Uuid>,
+    pub note: String,
+    pub state: String,
+    pub created_at: String,
+}
+
+/// Owner-side status of one ledger op, for federation status checks (#60).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpStatus {
+    pub op_id: Uuid,
+    pub principal: Uuid,
+    pub applied: bool,
+    /// Open annotation state: "open" | "accepted" | "declined"; None when
+    /// the op never had one.
+    pub review: Option<String>,
+}

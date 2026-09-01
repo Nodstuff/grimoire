@@ -1737,6 +1737,120 @@ impl BlockStore for SqliteStore {
         self.get_doc(id)
     }
 
+    fn record_outbound_proposal(
+        &mut self,
+        doc_id: Uuid,
+        share_id: Uuid,
+        owner: Uuid,
+        op_ids: &[Uuid],
+        note: &str,
+    ) -> Result<Uuid> {
+        let id = Uuid::now_v7();
+        let ids_json = serde_json::to_string(
+            &op_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        )?;
+        self.conn.execute(
+            "INSERT INTO outbound_proposals (id, doc_id, share_id, owner, op_ids, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id.to_string(),
+                doc_id.to_string(),
+                share_id.to_string(),
+                owner.to_string(),
+                ids_json,
+                note
+            ],
+        )?;
+        Ok(id)
+    }
+
+    fn list_outbound_proposals(&self, pending_only: bool) -> Result<Vec<OutboundProposal>> {
+        let sql = if pending_only {
+            "SELECT id, doc_id, share_id, owner, op_ids, note, state, created_at
+             FROM outbound_proposals WHERE state = 'pending' ORDER BY created_at"
+        } else {
+            "SELECT id, doc_id, share_id, owner, op_ids, note, state, created_at
+             FROM outbound_proposals ORDER BY created_at"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(
+                |(id, doc_id, share_id, owner, op_ids, note, state, created_at)| {
+                    let raw_ids: Vec<String> = serde_json::from_str(&op_ids)?;
+                    Ok(OutboundProposal {
+                        id: uuid_col(id, "outbound_proposals.id")?,
+                        doc_id: uuid_col(doc_id, "outbound_proposals.doc_id")?,
+                        share_id: uuid_col(share_id, "outbound_proposals.share_id")?,
+                        owner: uuid_col(owner, "outbound_proposals.owner")?,
+                        op_ids: raw_ids
+                            .into_iter()
+                            .map(|s| uuid_col(s, "outbound_proposals.op_ids"))
+                            .collect::<Result<_>>()?,
+                        note,
+                        state,
+                        created_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    fn set_outbound_state(&mut self, id: Uuid, state: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE outbound_proposals SET state = ?1 WHERE id = ?2",
+            params![state, id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("outbound proposal {id}")));
+        }
+        Ok(())
+    }
+
+    fn op_statuses(&self, ids: &[Uuid]) -> Result<Vec<OpStatus>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let row = self
+                .conn
+                .query_row(
+                    "SELECT o.principal, o.epoch_applied,
+                            (SELECT a.status FROM annotations a
+                             WHERE a.op_id = o.id ORDER BY a.created_at DESC LIMIT 1)
+                     FROM ops o WHERE o.id = ?1",
+                    params![id.to_string()],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((principal, epoch_applied, review)) = row {
+                out.push(OpStatus {
+                    op_id: *id,
+                    principal: uuid_col(principal, "ops.principal")?,
+                    applied: epoch_applied.is_some(),
+                    review,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     fn queue_join(&mut self, ticket: &str) -> Result<Uuid> {
         if let Some(existing) = self
             .conn
