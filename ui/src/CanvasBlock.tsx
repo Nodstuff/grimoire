@@ -36,6 +36,8 @@ import {
   type EdgeProps,
 } from '@xyflow/react'
 import { toPng, toSvg } from 'html-to-image'
+import * as Y from 'yjs'
+import { WebsocketProvider } from 'y-websocket'
 import '@xyflow/react/dist/style.css'
 import { api, Block } from './types'
 
@@ -530,6 +532,168 @@ function CanvasFlow({
     epochRef.current = epoch
   }, [epoch])
 
+  /* ---- live canvas (P2.5): shape-level LWW over the hot-session ws ----
+   * Shapes live in Y.Maps (canvas_nodes / canvas_edges, values = JSON
+   * strings): concurrent editors merge per shape; the daemon flattens the
+   * maps back to ks_diagram at session end. */
+  const [live, setLive] = useState<{ seed: boolean } | null>(null)
+  const liveRef = useRef(live)
+  liveRef.current = live
+  const yRef = useRef<{
+    ydoc: Y.Doc
+    provider: WebsocketProvider
+    nodesMap: Y.Map<string>
+    edgesMap: Y.Map<string>
+  } | null>(null)
+  const lastPushed = useRef<{ nodes: Map<string, string>; edges: Map<string, string> }>({
+    nodes: new Map(),
+    edges: new Map(),
+  })
+  const [peerCount, setPeerCount] = useState(1)
+
+  const goLiveCanvas = async () => {
+    try {
+      const r = await api<{ seed: boolean }>(`/api/doc/${block.doc_id}/hot/start`, {
+        method: 'POST',
+      })
+      setLive({ seed: r.seed })
+    } catch (e) {
+      alert(String(e))
+    }
+  }
+  const endLiveCanvas = async () => {
+    try {
+      await api(`/api/doc/${block.doc_id}/hot/end`, { method: 'POST' })
+    } catch (e) {
+      console.error(e)
+    }
+    setLive(null)
+    onSaved()
+  }
+
+  // auto-join a session someone else started
+  useEffect(() => {
+    if (live) return
+    const t = setInterval(() => {
+      api<{ hot: boolean }>(`/api/doc/${block.doc_id}/hot/status`)
+        .then((st) => {
+          if (st.hot && !liveRef.current) setLive({ seed: false })
+        })
+        .catch(() => {})
+    }, 5000)
+    return () => clearInterval(t)
+  }, [live, block.doc_id])
+
+  useEffect(() => {
+    if (!live) return
+    const ydoc = new Y.Doc()
+    const nodesMap = ydoc.getMap<string>('canvas_nodes')
+    const edgesMap = ydoc.getMap<string>('canvas_edges')
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    const provider = new WebsocketProvider(`${proto}://${location.host}/ws/hot`, block.doc_id, ydoc)
+    yRef.current = { ydoc, provider, nodesMap, edgesMap }
+
+    const serialize = () => {
+      const d = fromFlow(nodesRef.current, edgesRef.current)
+      return {
+        nodes: new Map(d.nodes.map((n) => [n.id, JSON.stringify(n)])),
+        edges: new Map(d.edges.map((e) => [e.id ?? '', JSON.stringify(e)])),
+      }
+    }
+
+    provider.on('sync', (isSynced: boolean) => {
+      if (isSynced && live.seed && nodesMap.size === 0) {
+        const cur = serialize()
+        ydoc.transact(() => {
+          cur.nodes.forEach((v, k) => nodesMap.set(k, v))
+          cur.edges.forEach((v, k) => edgesMap.set(k, v))
+        }, 'local')
+        lastPushed.current = cur
+      }
+    })
+
+    const applyRemote = () => {
+      const kd: KsDiagram = { nodes: [], edges: [] }
+      const np = new Map<string, string>()
+      const ep = new Map<string, string>()
+      nodesMap.forEach((v, k) => {
+        try {
+          kd.nodes.push(JSON.parse(v))
+          np.set(k, v)
+        } catch {}
+      })
+      edgesMap.forEach((v, k) => {
+        try {
+          kd.edges.push(JSON.parse(v))
+          ep.set(k, v)
+        } catch {}
+      })
+      lastPushed.current = { nodes: np, edges: ep }
+      const flow = toFlow(kd)
+      const selected = new Set(nodesRef.current.filter((n) => n.selected).map((n) => n.id))
+      const selectedE = new Set(edgesRef.current.filter((e) => e.selected).map((e) => e.id))
+      restoring.current = true // remote apply is not an undo step of ours
+      setNodes(flow.nodes.map((n) => ({ ...n, selected: selected.has(n.id) })))
+      setEdges(flow.edges.map((e) => ({ ...e, selected: selectedE.has(e.id) })))
+    }
+    const onMaps = (_e: unknown, txn: Y.Transaction) => {
+      if (txn.origin === 'local') return
+      applyRemote()
+    }
+    nodesMap.observe(onMaps)
+    edgesMap.observe(onMaps)
+
+    const onAwareness = () => setPeerCount(provider.awareness.getStates().size)
+    provider.awareness.on('change', onAwareness)
+    provider.awareness.setLocalStateField('user', { kind: 'canvas' })
+
+    // session ended elsewhere: fall back to cold and reload
+    const onClose = () => {
+      api<{ hot: boolean }>(`/api/doc/${block.doc_id}/hot/status`)
+        .then((st) => {
+          if (!st.hot && liveRef.current) {
+            setLive(null)
+            onSaved()
+          }
+        })
+        .catch(() => {})
+    }
+    provider.on('connection-close', onClose)
+
+    return () => {
+      provider.awareness.off('change', onAwareness)
+      provider.off('connection-close', onClose)
+      provider.destroy()
+      ydoc.destroy()
+      yRef.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [live, block.doc_id])
+
+  // local structural changes while live: push per-shape LWW updates
+  const pushLive = useCallback(() => {
+    const y = yRef.current
+    if (!y) return
+    const d = fromFlow(nodesRef.current, edgesRef.current)
+    const nodesNow = new Map(d.nodes.map((n) => [n.id, JSON.stringify(n)]))
+    const edgesNow = new Map(d.edges.map((e) => [e.id ?? '', JSON.stringify(e)]))
+    y.ydoc.transact(() => {
+      nodesNow.forEach((v, k) => {
+        if (lastPushed.current.nodes.get(k) !== v) y.nodesMap.set(k, v)
+      })
+      lastPushed.current.nodes.forEach((_, k) => {
+        if (!nodesNow.has(k)) y.nodesMap.delete(k)
+      })
+      edgesNow.forEach((v, k) => {
+        if (lastPushed.current.edges.get(k) !== v) y.edgesMap.set(k, v)
+      })
+      lastPushed.current.edges.forEach((_, k) => {
+        if (!edgesNow.has(k)) y.edgesMap.delete(k)
+      })
+    }, 'local')
+    lastPushed.current = { nodes: nodesNow, edges: edgesNow }
+  }, [])
+
   // debounced save through the gate, same as everything else
   const scheduleSave = useCallback(() => {
     dirty.current = true
@@ -582,13 +746,15 @@ function CanvasFlow({
   const snapTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const restoring = useRef(false)
 
-  // any structural change: checkpoint for undo + schedule a save
+  // any structural change: checkpoint for undo + persist (live sessions
+  // stream per-shape updates instead of proposing — the epoch is frozen)
   useEffect(() => {
     if (nodes === initial.nodes && edges === initial.edges) return
     if (restoring.current) {
       restoring.current = false
       lastSnap.current = { nodes, edges }
-      scheduleSave()
+      if (liveRef.current) pushLive()
+      else scheduleSave()
       return
     }
     if (snapTimer.current) clearTimeout(snapTimer.current)
@@ -599,8 +765,9 @@ function CanvasFlow({
       future.current = []
       lastSnap.current = { nodes: nodesRef.current, edges: edgesRef.current }
     }, 400)
-    scheduleSave()
-  }, [nodes, edges, initial, scheduleSave])
+    if (liveRef.current) pushLive()
+    else scheduleSave()
+  }, [nodes, edges, initial, scheduleSave, pushLive])
 
   const undo = useCallback(() => {
     // a pending checkpoint means changes newer than lastSnap: flush it first
@@ -915,6 +1082,16 @@ function CanvasFlow({
         <span className="canvas-toolbar-sep" />
         <button onClick={() => exportAs('png')} title="export PNG">🖼</button>
         <button onClick={() => exportAs('svg')} title="export SVG">⬇</button>
+        <span className="canvas-toolbar-sep" />
+        {live ? (
+          <button className="canvas-live-btn on" onClick={endLiveCanvas} title="end live session">
+            ⏹ live · {peerCount}
+          </button>
+        ) : (
+          <button className="canvas-live-btn" onClick={goLiveCanvas} title="start live co-drawing">
+            ⚡
+          </button>
+        )}
       </div>
       <ReactFlow
         nodes={nodes}

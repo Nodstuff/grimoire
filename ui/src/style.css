@@ -1142,3 +1142,4 @@ kbd {
 .cnode-triangle { padding-top: 40px; }
 .cnode-cloud { padding: 24px 30px; }
 .cnode-document { padding-bottom: 22px; }
+.canvas-live-btn.on { color: var(--green); border: 1px solid var(--green); border-radius: 8px; }
