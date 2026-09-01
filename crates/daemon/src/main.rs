@@ -5,6 +5,7 @@
 
 mod admin;
 mod api;
+mod fed;
 mod garden;
 mod identity;
 mod mcp;
@@ -236,19 +237,33 @@ async fn main() -> anyhow::Result<()> {
             // federation identity: minted silently on first serve, linked to
             // the human principal so provenance and pubkey agree (#54)
             let db_dir = cli.db.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
-            match identity::Identity::load_or_create(&db_dir) {
+            let fed_identity = match identity::Identity::load_or_create(&db_dir) {
                 Ok(id) => {
                     store.set_principal_pubkey(tom, &id.node_id())?;
                     tracing::info!("federation identity: {}", id.fingerprint());
+                    Some(id)
                 }
-                Err(e) => tracing::warn!("no federation identity available: {e:#}"),
-            }
+                Err(e) => {
+                    tracing::warn!("no federation identity; federation disabled: {e:#}");
+                    None
+                }
+            };
             if let Ok(n) = store.mark_orphaned_runs()
                 && n > 0
             {
                 tracing::warn!("marked {n} orphaned gardener runs (daemon restarted mid-run)");
             }
             let store = Arc::new(Mutex::new(store));
+            // federation listener: separate iroh surface, deny-by-default
+            // (ADR 0002 decision 7); the HTTP router below never sees it
+            if let Some(id) = fed_identity {
+                match fed::bind(id.secret_bytes()).await {
+                    Ok(ep) => {
+                        tokio::spawn(fed::serve(ep, store.clone()));
+                    }
+                    Err(e) => tracing::warn!("federation endpoint failed to bind: {e:#}"),
+                }
+            }
             tokio::spawn(admin::daily_loop(store.clone()));
             // ui/dist next to the binary's repo root; fall back to cwd
             let ui_dist = std::env::var("GRIMOIRE_UI_DIST")
