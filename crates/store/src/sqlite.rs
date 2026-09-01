@@ -1605,6 +1605,37 @@ impl BlockStore for SqliteStore {
         policy_override: Option<ReviewPolicy>,
     ) -> Result<Share> {
         self.get_doc(root_doc)?; // must exist
+        // re-share guard: a subtree containing mirrors is someone ELSE's
+        // content — serving it onward would leak their docs to a third party
+        // without their gate ever seeing it. Share your own docs only.
+        let mirrors: std::collections::HashSet<Uuid> = self
+            .list_mirrors()?
+            .into_iter()
+            .map(|m| m.doc_id)
+            .collect();
+        if !mirrors.is_empty() {
+            let mut stmt = self.conn.prepare(
+                "WITH RECURSIVE subtree (id) AS (
+                     SELECT id FROM docs WHERE id = ?1 AND deleted = 0
+                     UNION ALL
+                     SELECT d.id FROM docs d JOIN subtree s ON d.parent_id = s.id
+                     WHERE d.deleted = 0
+                 )
+                 SELECT id FROM subtree",
+            )?;
+            let ids: Vec<String> = stmt
+                .query_map(params![root_doc.to_string()], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for id in ids {
+                let id = uuid_col(id, "docs.id")?;
+                if mirrors.contains(&id) {
+                    return Err(StoreError::InvalidOp(
+                        "cannot share a subtree containing docs shared TO you —                          only the owner can share those"
+                            .into(),
+                    ));
+                }
+            }
+        }
         let id = Uuid::now_v7();
         self.conn.execute(
             "INSERT INTO shares (id, root_doc, contact, permission, policy_override)

@@ -201,3 +201,29 @@ fn reinvite_supersedes_older_active_share_for_same_contact() {
     // exactly one active share exposes the doc now
     assert_eq!(s.shares_containing(doc.id).unwrap().len(), 1);
 }
+
+#[test]
+fn resharing_a_mirror_is_refused() {
+    let (mut s, tom) = store_with_tom();
+    let folder = s.create_doc("Shared with me", None, tom.id).unwrap();
+    let mirror_doc = s
+        .create_doc_with_id(uuid::Uuid::now_v7(), "their-doc", Some(folder.id), tom.id)
+        .unwrap();
+    let owner = s.pair_contact(ALICE_KEY, "alice").unwrap();
+    s.upsert_mirror(mirror_doc.id, owner.id, uuid::Uuid::now_v7(), 3, SharePermission::View)
+        .unwrap();
+
+    // sharing the mirror itself: refused
+    assert!(matches!(
+        s.create_share(mirror_doc.id, None, SharePermission::View, None),
+        Err(StoreError::InvalidOp(_))
+    ));
+    // sharing an ancestor folder that contains it: also refused
+    assert!(matches!(
+        s.create_share(folder.id, None, SharePermission::View, None),
+        Err(StoreError::InvalidOp(_))
+    ));
+    // a sibling subtree with no mirrors is fine
+    let own = s.create_doc("my own", None, tom.id).unwrap();
+    assert!(s.create_share(own.id, None, SharePermission::View, None).is_ok());
+}
