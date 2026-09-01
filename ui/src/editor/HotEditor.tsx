@@ -13,9 +13,7 @@ import { WebsocketProvider } from 'y-websocket'
 import { prosemirrorJSONToYDoc } from 'y-prosemirror'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block } from '../types'
-import { BaselineBlock, Entry, computeOps } from './diff'
-import { extensions, parser, schema, serializer } from './DocEditor'
-import { nodesToMarkdown } from './markdown'
+import { extensions, parser, schema } from './DocEditor'
 
 export interface HotDoc {
   docId: string
@@ -27,13 +25,9 @@ export interface HotDoc {
 
 export default function HotEditor({
   doc,
-  canEnd = true,
   onEnded,
 }: {
   doc: HotDoc
-  /** grantees on mirrors can't flatten (their propose path is upstream);
-   * v1: the owner ends the session */
-  canEnd?: boolean
   /** session over (we ended it, or the daemon dropped it) — reload cold */
   onEnded: () => void
 }) {
@@ -42,26 +36,18 @@ export default function HotEditor({
   const [ending, setEnding] = useState(false)
   const endedRef = useRef(false)
 
-  // parse current blocks exactly like the cold editor: nodes + baseline
+  // parse current blocks exactly like the cold editor (seeding only — the
+  // flatten is the daemon's job now, #67)
   const initial = useMemo(() => {
     const nodes: PMNode[] = []
-    const baseline: BaselineBlock[] = []
     for (const b of doc.blocks) {
       const parsed = parser.parse(b.content)
       if (!parsed || parsed.childCount === 0) continue
-      const children: PMNode[] = []
       parsed.forEach((child) => {
-        children.push(child.type.create({ ...child.attrs, blockId: b.id }, child.content, child.marks))
-      })
-      nodes.push(...children)
-      baseline.push({
-        id: b.id,
-        content: nodesToMarkdown(serializer, schema, children),
-        parent: b.parent_id,
-        order_key: b.order_key,
+        nodes.push(child.type.create({ ...child.attrs, blockId: b.id }, child.content, child.marks))
       })
     }
-    return { nodes, baseline }
+    return { nodes }
   }, [doc.docId])
 
   const { ydoc, provider } = useMemo(() => {
@@ -117,65 +103,15 @@ export default function HotEditor({
     [doc.docId],
   )
 
-  // the ender flattens: final editor state → entries → ops vs the frozen
-  // baseline → one propose at the frozen epoch → confirm drops the journal
+  // ending is one call: the daemon renders the Yjs doc to markdown, diffs
+  // it against the blocks (mddiff), lands one commit at the frozen epoch,
+  // and drops the session + journal (#67)
   const endSession = async () => {
-    if (!editor || ending) return
+    if (ending) return
     setEnding(true)
     endedRef.current = true
     try {
       await api(`/api/doc/${doc.docId}/hot/end`, { method: 'POST' })
-      const entries: Entry[] = []
-      let run: { id: string; nodes: PMNode[] } | null = null
-      const flush = () => {
-        if (run) {
-          entries.push({
-            id: run.id,
-            content: nodesToMarkdown(serializer, schema, run.nodes),
-            level: run.nodes[0].type.name === 'heading' ? run.nodes[0].attrs.level : 0,
-          })
-          run = null
-        }
-      }
-      editor.state.doc.forEach((node) => {
-        if (node.type.name === 'paragraph' && node.content.size === 0 && !node.attrs.blockId) return
-        const id: string | null = node.attrs.blockId ?? null
-        if (id && run && run.id === id) {
-          run.nodes.push(node)
-          return
-        }
-        flush()
-        if (id) run = { id, nodes: [node] }
-        else
-          entries.push({
-            id: null,
-            content: nodesToMarkdown(serializer, schema, [node]),
-            level: node.type.name === 'heading' ? node.attrs.level : 0,
-          })
-      })
-      flush()
-      // safety: an empty editor against a non-empty baseline means the
-      // session never got seeded (creator crashed before seeding) — a
-      // flatten here would mass-delete real content. Bail out.
-      if (entries.length === 0 && initial.baseline.length > 0) {
-        alert('live session was empty — no changes saved (doc kept as it was)')
-        await api(`/api/doc/${doc.docId}/hot/confirm`, { method: 'POST' })
-        onEnded()
-        return
-      }
-      const ops = computeOps(initial.baseline, entries, () => crypto.randomUUID())
-      if (ops.length > 0) {
-        await api('/api/propose', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            doc_id: doc.docId,
-            base_epoch: doc.frozenEpoch,
-            ops,
-          }),
-        })
-      }
-      await api(`/api/doc/${doc.docId}/hot/confirm`, { method: 'POST' })
     } catch (e) {
       alert(String(e))
     }
@@ -187,13 +123,9 @@ export default function HotEditor({
       <div className="hot-banner">
         <span className="hot-dot" />
         live session · {peers} here · {connected ? 'synced' : 'connecting…'}
-        {canEnd ? (
-          <button className="hot-end" disabled={ending} onClick={endSession}>
-            {ending ? 'saving…' : 'end session'}
-          </button>
-        ) : (
-          <span className="meta">the owner ends the session</span>
-        )}
+        <button className="hot-end" disabled={ending} onClick={endSession}>
+          {ending ? 'saving…' : 'end session'}
+        </button>
       </div>
       <EditorContent editor={editor} />
     </>

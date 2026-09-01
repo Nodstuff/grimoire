@@ -9,6 +9,7 @@ mod fed;
 mod garden;
 mod hot;
 mod identity;
+mod yrender;
 mod mcp;
 
 use anyhow::Context;
@@ -392,6 +393,7 @@ async fn main() -> anyhow::Result<()> {
             );
             hot.recover(&store);
             hot::set_global(hot.clone());
+            tokio::spawn(hot::idle_loop(hot.clone(), store.clone()));
             // ui/dist next to the binary's repo root; fall back to cwd
             let ui_dist = std::env::var("GRIMOIRE_UI_DIST")
                 .unwrap_or_else(|_| "/Users/tmeaney/personal/knowledge-system/ui/dist".into());

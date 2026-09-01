@@ -36,6 +36,7 @@ pub struct HotSession {
     pub frozen_epoch: i64,
     pub journal: std::fs::File,
     pub started_at: std::time::Instant,
+    pub last_activity: std::time::Instant,
     /// Guard against a session that was ended but never confirmed.
     pub ending: bool,
     _doc_sub: yrs::Subscription,
@@ -151,6 +152,7 @@ impl HotState {
                 frozen_epoch,
                 journal,
                 started_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
                 ending: false,
                 _doc_sub: sub,
             },
@@ -183,6 +185,7 @@ impl HotState {
         if session.ending {
             return false;
         }
+        session.last_activity = std::time::Instant::now();
         journal_updates(&mut session.journal, data);
         let replies = DefaultProtocol.handle(&mut session.awareness, data);
         rebroadcast_awareness(&session.tx, data);
@@ -201,6 +204,96 @@ impl HotState {
         match sessions.get(&doc_id) {
             Some(s) if !s.ending => (true, Some(s.frozen_epoch)),
             _ => (false, None),
+        }
+    }
+}
+
+impl HotState {
+    /// The one flatten (#67): render the session's Yjs doc to markdown,
+    /// LCS-diff it against the live blocks (mddiff — unchanged blocks keep
+    /// ids, comments and canvases untouched), land ONE propose at the frozen
+    /// epoch, drop the session and its journal. Every ending path — owner
+    /// end, grantee relay, idle timeout, recovery — comes through here.
+    pub fn flatten_and_close(
+        &self,
+        store: &Arc<Mutex<grimoire_store::SqliteStore>>,
+        doc_id: Uuid,
+        reason: &str,
+    ) -> anyhow::Result<usize> {
+        use grimoire_store::BlockStore;
+        // 1. mark ending (stops new frames) and render under the lock
+        let (markdown, frozen_epoch, secs) = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            let session = sessions
+                .get_mut(&doc_id)
+                .ok_or_else(|| anyhow::anyhow!("doc is not hot"))?;
+            session.ending = true;
+            let frag = session.awareness.doc().get_or_insert_xml_fragment("default");
+            let txn = session.awareness.doc().transact();
+            let md = crate::yrender::fragment_to_markdown(&txn, &frag);
+            (md, session.frozen_epoch, session.started_at.elapsed().as_secs())
+        };
+        // 2. diff + propose OUTSIDE the session lock
+        let applied = {
+            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+            let tree = s.read_doc(doc_id)?;
+            let has_content = !tree.roots.is_empty();
+            if markdown.trim().is_empty() && has_content {
+                // never-seeded session: a flatten would mass-delete
+                tracing::warn!(%doc_id, "hot session empty at flatten; doc kept as-is");
+                0
+            } else {
+                let mut ops =
+                    grimoire_store::mddiff::markdown_to_ops(&tree.roots, &markdown);
+                for op in &mut ops {
+                    op.source_refs
+                        .push(format!("hot-session: {reason}, {secs}s"));
+                }
+                if ops.is_empty() {
+                    0
+                } else {
+                    let human = s
+                        .list_principals()?
+                        .into_iter()
+                        .find(|p| p.kind == grimoire_store::PrincipalKind::Human)
+                        .ok_or_else(|| anyhow::anyhow!("no human principal"))?;
+                    let n = ops.len();
+                    s.propose(doc_id, frozen_epoch, human.id, ops)?;
+                    n
+                }
+            }
+        };
+        // 3. drop the session (ends every socket/bridge) and the journal
+        {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            sessions.remove(&doc_id);
+        }
+        std::fs::remove_file(self.journal_path(doc_id)).ok();
+        tracing::info!(%doc_id, reason, applied, "hot session flattened");
+        Ok(applied)
+    }
+
+    /// Sessions with no frames for `idle` get flattened automatically —
+    /// covers abandoned and crash-recovered sessions (ADR 0003 §5-6).
+    pub fn idle_candidates(&self, idle: std::time::Duration) -> Vec<Uuid> {
+        let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        sessions
+            .iter()
+            .filter(|(_, s)| !s.ending && s.last_activity.elapsed() > idle)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+}
+
+/// The idle reaper: one scan a minute; ten quiet minutes end a session.
+pub async fn idle_loop(hot: HotState, store: Arc<Mutex<grimoire_store::SqliteStore>>) {
+    const IDLE: std::time::Duration = std::time::Duration::from_secs(600);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        for doc_id in hot.idle_candidates(IDLE) {
+            if let Err(e) = hot.flatten_and_close(&store, doc_id, "idle timeout") {
+                tracing::error!(%doc_id, "idle flatten failed: {e:#}");
+            }
         }
     }
 }
@@ -271,37 +364,27 @@ async fn hot_start(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<
     }
 }
 
-/// End the session: sockets close, the epoch un-freezes so the ending client
-/// can land the flatten through the normal propose path. The journal stays
-/// until `confirm`.
+/// End the session: the DAEMON flattens (#67) — one propose at the frozen
+/// epoch, session and journal dropped. Mirrors relay the end to the owner.
 async fn hot_end(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<Value> {
-    let mut sessions = ctx
-        .hot
-        .sessions
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let Some(session) = sessions.get_mut(&doc_id) else {
-        return Json(json!({"error": "doc is not hot"}));
-    };
-    session.ending = true;
-    let frozen = session.frozen_epoch;
-    // closing the broadcast channel ends every socket's send loop
-    let secs = session.started_at.elapsed().as_secs();
-    Json(json!({"frozen_epoch": frozen, "session_secs": secs}))
+    if mirror_of(&ctx, doc_id) {
+        let Some(ep) = &ctx.endpoint else {
+            return Json(json!({"error": "federation disabled"}));
+        };
+        return match crate::fed::hot_end_upstream(ep, &ctx.store, doc_id).await {
+            Ok(applied) => Json(json!({"flattened_ops": applied})),
+            Err(e) => Json(json!({"error": format!("{e:#}")})),
+        };
+    }
+    match ctx.hot.flatten_and_close(&ctx.store, doc_id, "ended") {
+        Ok(applied) => Json(json!({"flattened_ops": applied})),
+        Err(e) => Json(json!({"error": format!("{e:#}")})),
+    }
 }
 
-/// The flatten landed (or nothing changed): drop the session and journal.
+/// Compat no-op: hot/end flattens and closes in one step now (#67).
 async fn hot_confirm(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<Value> {
-    let mut sessions = ctx
-        .hot
-        .sessions
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if sessions.remove(&doc_id).is_none() {
-        return Json(json!({"error": "doc is not hot"}));
-    }
-    drop(sessions);
-    std::fs::remove_file(ctx.hot.journal_path(doc_id)).ok();
+    let _ = (&ctx, doc_id);
     Json(json!({"ok": true}))
 }
 
@@ -444,4 +527,162 @@ pub fn router(ctx: HotCtx) -> Router {
         .route("/api/doc/{id}/hot/status", get(hot_status))
         .route("/ws/hot/{id}", any(ws_hot))
         .with_state(ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grimoire_store::{BlockStore, BlockType, OpInput, OpKind, PrincipalKind, SqliteStore};
+    use yrs::{Text as _, Xml, XmlFragment as _};
+
+    fn scratch_hot() -> HotState {
+        let dir = std::env::temp_dir().join(format!("grimoire-hot-test-{}", Uuid::now_v7()));
+        HotState::new(dir)
+    }
+
+    /// Build the y-prosemirror shape a client would have produced.
+    fn seed_session(hot: &HotState, doc_id: Uuid, paragraphs: &[(&str, Option<&str>)]) {
+        let sessions = hot.sessions.lock().unwrap();
+        let session = sessions.get(&doc_id).unwrap();
+        let frag = session.awareness.doc().get_or_insert_xml_fragment("default");
+        let mut txn = session.awareness.doc().transact_mut();
+        for (i, (text, heading)) in paragraphs.iter().enumerate() {
+            let tag = if heading.is_some() { "heading" } else { "paragraph" };
+            let el = frag.insert(&mut txn, i as u32, yrs::XmlElementPrelim::empty(tag));
+            if let Some(level) = heading {
+                el.insert_attribute(&mut txn, "level", *level);
+            }
+            let t = el.insert(&mut txn, 0, yrs::XmlTextPrelim::new(""));
+            t.insert(&mut txn, 0, text);
+        }
+    }
+
+    #[test]
+    fn flatten_lands_one_commit_and_preserves_unchanged_ids() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let doc = s.create_doc("Doc", None, tom.id).unwrap();
+        let keep_id = Uuid::now_v7();
+        s.apply(
+            doc.id,
+            0,
+            tom.id,
+            vec![
+                OpInput {
+                    kind: OpKind::Insert {
+                        block_id: keep_id,
+                        parent_id: None,
+                        order_key: "i".into(),
+                        block_type: BlockType::Paragraph,
+                        content: "unchanged paragraph".into(),
+                        refers_to: None,
+                    },
+                    source_refs: vec![],
+                },
+                OpInput {
+                    kind: OpKind::Insert {
+                        block_id: Uuid::now_v7(),
+                        parent_id: None,
+                        order_key: "r".into(),
+                        block_type: BlockType::Paragraph,
+                        content: "will be edited".into(),
+                        refers_to: None,
+                    },
+                    source_refs: vec![],
+                },
+            ],
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(s));
+        let hot = scratch_hot();
+        hot.start(doc.id, 1).unwrap();
+        seed_session(
+            &hot,
+            doc.id,
+            &[
+                ("unchanged paragraph", None),
+                ("edited live in session", None),
+                ("Session Notes", Some("2")),
+            ],
+        );
+
+        let applied = hot.flatten_and_close(&store, doc.id, "test").unwrap();
+        assert!(applied >= 2, "expected replace+insert, got {applied}");
+
+        let s = store.lock().unwrap();
+        let tree = s.read_doc(doc.id).unwrap();
+        assert_eq!(tree.doc.current_epoch, 2); // exactly one commit
+        let contents: Vec<_> = tree.roots.iter().map(|n| n.block.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["unchanged paragraph", "edited live in session", "## Session Notes"]
+        );
+        // unchanged block kept its id — comment anchors survive
+        assert_eq!(tree.roots[0].block.id, keep_id);
+        assert!(!hot.is_hot(doc.id));
+        assert!(!hot.journal_path(doc.id).exists());
+    }
+
+    #[test]
+    fn empty_session_never_deletes_content() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let doc = s.create_doc("Doc", None, tom.id).unwrap();
+        s.apply(
+            doc.id,
+            0,
+            tom.id,
+            vec![OpInput {
+                kind: OpKind::Insert {
+                    block_id: Uuid::now_v7(),
+                    parent_id: None,
+                    order_key: "i".into(),
+                    block_type: BlockType::Paragraph,
+                    content: "precious".into(),
+                    refers_to: None,
+                },
+                source_refs: vec![],
+            }],
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(s));
+        let hot = scratch_hot();
+        hot.start(doc.id, 1).unwrap();
+        // never seeded: flatten must keep the doc as it was
+        let applied = hot.flatten_and_close(&store, doc.id, "test").unwrap();
+        assert_eq!(applied, 0);
+        let s = store.lock().unwrap();
+        let tree = s.read_doc(doc.id).unwrap();
+        assert_eq!(tree.roots.len(), 1);
+        assert_eq!(tree.doc.current_epoch, 1); // untouched
+    }
+
+    #[test]
+    fn yrender_marks_lists_and_code() {
+        let ydoc = Doc::new();
+        let frag = ydoc.get_or_insert_xml_fragment("default");
+        {
+            let mut txn = ydoc.transact_mut();
+            let p = frag.insert(&mut txn, 0, yrs::XmlElementPrelim::empty("paragraph"));
+            let t = p.insert(&mut txn, 0, yrs::XmlTextPrelim::new(""));
+            t.insert(&mut txn, 0, "plain ");
+            let mut attrs = std::collections::HashMap::new();
+            attrs.insert("bold".into(), yrs::Any::Bool(true));
+            t.insert_with_attributes(&mut txn, 6, "bold", attrs);
+
+            let code = frag.insert(&mut txn, 1, yrs::XmlElementPrelim::empty("codeBlock"));
+            code.insert_attribute(&mut txn, "language", "rust");
+            let ct = code.insert(&mut txn, 0, yrs::XmlTextPrelim::new(""));
+            ct.insert(&mut txn, 0, "fn main() {}");
+
+            let list = frag.insert(&mut txn, 2, yrs::XmlElementPrelim::empty("bulletList"));
+            let item = list.insert(&mut txn, 0, yrs::XmlElementPrelim::empty("listItem"));
+            let ip = item.insert(&mut txn, 0, yrs::XmlElementPrelim::empty("paragraph"));
+            let it = ip.insert(&mut txn, 0, yrs::XmlTextPrelim::new(""));
+            it.insert(&mut txn, 0, "first item");
+        }
+        let txn = ydoc.transact();
+        let md = crate::yrender::fragment_to_markdown(&txn, &frag);
+        assert_eq!(md, "plain **bold**\n\n```rust\nfn main() {}\n```\n\n- first item");
+    }
 }

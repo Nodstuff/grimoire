@@ -1090,7 +1090,6 @@ function DocView({
         <HotEditor
           key={`hot:${docId}`}
           doc={hot}
-          canEnd={!mirror}
           onEnded={() => {
             setHot(null)
             setEditorGen((g) => g + 1)
