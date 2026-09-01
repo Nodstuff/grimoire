@@ -14,7 +14,7 @@ launchctl load ~/Library/LaunchAgents/ie.null.grimoire.plist
 sleep 1
 curl -sf -o /dev/null http://127.0.0.1:7425/api/docs && echo "  daemon up"
 echo "→ app bundle"
-(cd crates/shell && ../../ui/node_modules/.bin/tauri build 2>&1 | rg "Finished 1 bundle" || true)
+(cd crates/shell && ../../ui/node_modules/.bin/tauri build --bundles app 2>&1 | rg "Finished 1 bundle" || true)
 osascript -e 'quit app "Grimoire"' 2>/dev/null; osascript -e 'quit app "knowledge-system"' 2>/dev/null || true
 sleep 1; pkill -f grimoire-shell 2>/dev/null || true; sleep 0.5
 rm -rf /Applications/knowledge-system.app /Applications/Grimoire.app
