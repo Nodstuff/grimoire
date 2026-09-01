@@ -955,6 +955,58 @@ struct ScribeDoc {
     markdown: String,
 }
 
+/// Parse the scribe's delimited output. Markdown travels raw between
+/// ===DOC=== headers and ===END=== — nothing to escape, nothing to malform.
+/// Header: `path :: title` (path '.' or empty = scope root, '/'-separated).
+fn parse_scribe_docs(result: &str) -> Result<Vec<ScribeDoc>, String> {
+    let mut docs = Vec::new();
+    let mut lines = result.lines().peekable();
+    while let Some(line) = lines.next() {
+        let t = line.trim();
+        let Some(header) = t.strip_prefix("===DOC===") else {
+            continue;
+        };
+        let header = header.trim();
+        let (path_s, title) = header
+            .split_once("::")
+            .ok_or_else(|| format!("bad ===DOC=== header (need 'path :: title'): {header}"))?;
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(format!("empty title in header: {header}"));
+        }
+        let path: Vec<String> = {
+            let p = path_s.trim();
+            if p.is_empty() || p == "." {
+                Vec::new()
+            } else {
+                p.split('/')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+        };
+        let mut body = String::new();
+        let mut closed = false;
+        for line in lines.by_ref() {
+            if line.trim() == "===END===" {
+                closed = true;
+                break;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        if !closed {
+            return Err(format!("unterminated ===DOC=== section: {title}"));
+        }
+        docs.push(ScribeDoc {
+            path,
+            title: title.to_string(),
+            markdown: body.trim().to_string(),
+        });
+    }
+    Ok(docs)
+}
+
 fn scope_outline(store: &SqliteStore, scope: Uuid) -> grimoire_store::Result<String> {
     let docs = store.doc_subtree(scope)?;
     let by_id: std::collections::HashMap<Uuid, &grimoire_store::Doc> =
@@ -1047,10 +1099,14 @@ async fn run_scribe(
              ## Source repositories (read with your tools)\n{}\n\n\
              ## Style exemplars — imitate these\n{}\n\
              ## What already exists in the scope (do NOT recreate)\n{}\n\n\
-             ## Output contract\nJSON array of {{\"path\": [\"Sub\", \"Folder\"], \
-             \"title\": \"Doc Title\", \"markdown\": \"full doc content\"}} — at most \
-             {SCRIBE_DOCS_PER_RUN} docs per run; pick the most foundational missing ones \
-             first. path is relative to the scope root; [] puts the doc at the root.",
+             ## Output contract\nEmit each doc as a delimited section — the markdown \
+             travels RAW, never inside JSON strings:\n\
+             ===DOC=== Sub/Folder :: Doc Title\n<the doc's full markdown>\n\
+             ===END===\n\
+             The header line after ===DOC=== is 'path :: title' (path relative to the \
+             scope root; use '.' for the root). At most {SCRIBE_DOCS_PER_RUN} docs per \
+             run; pick the most foundational missing ones first. Output nothing outside \
+             the ===DOC===/===END=== sections; no docs to write = empty output.",
             g.task_prompt,
             dirs.join(", "),
             exemplars,
@@ -1078,7 +1134,7 @@ async fn run_scribe(
             return (status.into(), e, None);
         }
     };
-    let new_docs: Vec<ScribeDoc> = match parse_json_result(&result) {
+    let new_docs = match parse_scribe_docs(&result) {
         Ok(d) => d,
         Err(e) => return ("failed".into(), e, Some(tokens)),
     };
@@ -1490,5 +1546,42 @@ mod parse_tests {
         let raw = "Sure, here you go:\n[{\"a\": 1}] hope that helps!";
         let v: Vec<serde_json::Value> = parse_json_result(raw).unwrap();
         assert_eq!(v[0]["a"], 1);
+    }
+}
+
+#[cfg(test)]
+mod scribe_parse_tests {
+    use super::parse_scribe_docs;
+
+    #[test]
+    fn parses_delimited_docs_with_hostile_content() {
+        // quotes, backslashes, JSON-looking text, nested code fences — all raw
+        let out = "===DOC=== Subsystems/Storage :: ClickHouse Schema\n\
+# ClickHouse Schema\n\nHe said \"quotes\" and C:\\paths and {\"json\": true}.\n\n\
+```sql\nSELECT 1; -- ===not a delimiter===\n```\n\
+===END===\n\
+===DOC=== . :: Overview\nroot doc body\n===END===\n";
+        let docs = parse_scribe_docs(out).unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].path, vec!["Subsystems", "Storage"]);
+        assert_eq!(docs[0].title, "ClickHouse Schema");
+        assert!(docs[0].markdown.contains("{\"json\": true}"));
+        assert!(docs[0].markdown.contains("===not a delimiter==="));
+        assert!(docs[1].path.is_empty());
+    }
+
+    #[test]
+    fn empty_output_means_done() {
+        assert!(parse_scribe_docs("").unwrap().is_empty());
+        assert!(
+            parse_scribe_docs("Nothing left to write.")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unterminated_section_fails_closed() {
+        assert!(parse_scribe_docs("===DOC=== . :: X\nbody with no end").is_err());
     }
 }
