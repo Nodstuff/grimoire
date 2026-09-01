@@ -25,7 +25,12 @@
    sibling order; concurrent inserts need no repair pass. Resolves the 2.2 in-ticket
    decision.
 7. **Deletes are tombstones** (`deleted` flag), never row deletion — ops reference blocks
-   forever, and provenance/history must survive.
+   forever, and provenance/history must survive. **One deliberate exception**: a mirror
+   doc (federation, ADR 0002) is a *replica* of another instance's doc, not a ledger — it
+   carries no local ops and its history lives on the owner. `mirror_replace_blocks` therefore
+   hard-deletes and re-inserts the mirror's block rows on each pull. This never touches an
+   owned doc: the store's mirror guard (`reject_if_mirror`) and the daemon's move refusals
+   keep owned and mirrored docs disjoint.
 
 ## Alternatives
 

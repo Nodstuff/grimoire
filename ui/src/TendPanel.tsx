@@ -6,6 +6,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import { api, Doc, GardenerRun } from './types'
+import { notify } from './Notice'
 
 interface Tending {
   id: string
@@ -60,7 +61,7 @@ export default function TendPanel({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name }),
-    }).catch((e) => alert(String(e)))
+    }).catch((e) => notify(String(e)))
     setRunning(null)
     load()
   }
@@ -148,7 +149,7 @@ function TendingCard({
           style_docs: styleDocs.split(',').map((s) => s.trim()).filter(Boolean),
         },
       }),
-    }).catch((e) => alert(String(e)))
+    }).catch((e) => notify(String(e)))
     onSaved()
   }
 
@@ -230,7 +231,7 @@ function NewTending({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, kind, task_prompt: prompt.trim(), scope_doc: docId }),
     }).catch((e) => {
-      alert(String(e))
+      notify(String(e))
       return null
     })
     if (!g) return
@@ -249,7 +250,7 @@ function NewTending({
           style_docs: styleDocs.split(',').map((s) => s.trim()).filter(Boolean),
         },
       }),
-    }).catch((e) => alert(String(e)))
+    }).catch((e) => notify(String(e)))
     onDone()
   }
 

@@ -365,6 +365,15 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!("marked {n} orphaned gardener runs (daemon restarted mid-run)");
             }
             let store = Arc::new(Mutex::new(store));
+            // hot sessions (#65): journal-backed live co-editing state, created
+            // first because every write surface (fed, gardeners, api, mcp)
+            // consults it for the freeze. Journals live beside the db so
+            // multiple instances never share.
+            let hot = hot::HotState::new(
+                cli.db.parent().unwrap_or(std::path::Path::new(".")).join("hot"),
+            );
+            hot.recover(&store);
+            tokio::spawn(hot::idle_loop(hot.clone(), store.clone()));
             // federation listener: separate iroh surface, deny-by-default
             // (ADR 0002 decision 7); the HTTP router below never sees it —
             // the admin routes only get the endpoint handle for outbound
@@ -378,33 +387,25 @@ async fn main() -> anyhow::Result<()> {
                     Ok(ep) => {
                         fed_ctx.node_id = Some(id.node_id());
                         fed_ctx.endpoint = Some(ep.clone());
-                        tokio::spawn(fed::serve(ep.clone(), store.clone()));
+                        tokio::spawn(fed::serve(ep.clone(), store.clone(), hot.clone()));
                         tokio::spawn(fed::join_retry_loop(ep.clone(), store.clone()));
                         tokio::spawn(fed::pull_loop(ep, store.clone()));
                     }
                     Err(e) => tracing::warn!("federation endpoint failed to bind: {e:#}"),
                 }
             }
-            tokio::spawn(admin::daily_loop(store.clone()));
-            // hot sessions (#65): journal-backed live co-editing state
-            // journals live beside the db so multiple instances never share
-            let hot = hot::HotState::new(
-                cli.db.parent().unwrap_or(std::path::Path::new(".")).join("hot"),
-            );
-            hot.recover(&store);
-            hot::set_global(hot.clone());
-            tokio::spawn(hot::idle_loop(hot.clone(), store.clone()));
+            tokio::spawn(admin::daily_loop(store.clone(), hot.clone()));
             // ui/dist next to the binary's repo root; fall back to cwd
             let ui_dist = std::env::var("GRIMOIRE_UI_DIST")
                 .unwrap_or_else(|_| "/Users/tmeaney/personal/knowledge-system/ui/dist".into());
-            let app = mcp::router(store.clone(), claude)
+            let app = mcp::router(store.clone(), claude, hot.clone())
                 .merge(hot::router(hot::HotCtx {
                     hot: hot.clone(),
                     store: store.clone(),
                     endpoint: fed_ctx.endpoint.clone(),
                 }))
-                .merge(admin::router(store.clone(), fed_ctx))
-                .merge(api::router(api::ApiState { store, human: tom }))
+                .merge(admin::router(store.clone(), fed_ctx, hot.clone()))
+                .merge(api::router(api::ApiState { store, human: tom, hot }))
                 .fallback_service(tower_http::services::ServeDir::new(&ui_dist).fallback(
                     tower_http::services::ServeFile::new(format!("{ui_dist}/index.html")),
                 ));

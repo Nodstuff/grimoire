@@ -2,9 +2,8 @@
 // the block's content — one format for humans AND agents (the primer already
 // teaches gardeners to write it). Lucid-grade behavior: shapes from a palette,
 // connectors anchored to handles that never detach, snap grid, tidy-up layout.
-// Old tldraw snapshots convert best-effort on load; the first save persists
-// ks_diagram and the tldraw era is over. No live sync yet (P2.5 rides the
-// hot-session transport when it comes).
+// Live co-drawing (P2.5) rides the hot-session transport: shape-level LWW.
+// The pure format/conversion logic lives in ./canvas/convert.ts.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -29,7 +28,6 @@ import {
 import {
   BaseEdge,
   EdgeLabelRenderer,
-  MarkerType,
   getNodesBounds,
   getSmoothStepPath,
   getViewportForBounds,
@@ -40,70 +38,23 @@ import * as Y from 'yjs'
 import { WebsocketProvider } from 'y-websocket'
 import '@xyflow/react/dist/style.css'
 import { api, Block } from './types'
+import { notify } from './Notice'
 
-/* ---------- storage format ---------- */
-
-type ShapeKind =
-  | 'box'
-  | 'pill'
-  | 'ellipse'
-  | 'diamond'
-  | 'parallelogram'
-  | 'hexagon'
-  | 'cylinder'
-  | 'document'
-  | 'cloud'
-  | 'actor'
-  | 'triangle'
-  | 'sticky'
-  | 'text'
-  | 'frame'
-
-interface KsNode {
-  id: string
-  label: string
-  x?: number
-  y?: number
-  w?: number
-  h?: number
-  shape?: ShapeKind
-  color?: string
-}
-
-interface KsEdge {
-  id?: string
-  from: string
-  to: string
-  label?: string
-  fromSide?: string
-  toSide?: string
-  arrow?: 'none' | 'end' | 'both'
-  dash?: boolean
-  color?: string
-}
-
-interface KsDiagram {
-  nodes: KsNode[]
-  edges: KsEdge[]
-}
-
-const COLORS = ['#8b9dc3', '#95c99b', '#d9b47a', '#d98a94', '#a88bd4', '#7bc4c4', '#6b6b7b']
-const DEFAULT_SIZE: Record<ShapeKind, [number, number]> = {
-  box: [180, 64],
-  pill: [170, 56],
-  ellipse: [160, 90],
-  diamond: [170, 110],
-  parallelogram: [190, 70],
-  hexagon: [180, 80],
-  cylinder: [150, 100],
-  document: [170, 90],
-  cloud: [190, 110],
-  actor: [80, 110],
-  triangle: [150, 110],
-  sticky: [160, 140],
-  text: [160, 40],
-  frame: [420, 300],
-}
+import {
+  COLORS,
+  DEFAULT_SIZE,
+  decorate,
+  diffShapes,
+  fromFlow,
+  layout,
+  mergeShapes,
+  parseContent,
+  serializeShapes,
+  toFlow,
+  type CanvasEdgeData,
+  type CanvasNodeData,
+  type ShapeKind,
+} from './canvas/convert'
 
 /** Real geometry in a 0..100 space, stroked crisply at any aspect ratio via
  * vector-effect. The CSS-rotation diamond of v2.0 looked like an off-kilter
@@ -123,103 +74,6 @@ const SVG_SHAPES: Partial<Record<ShapeKind, string>> = {
 /** Shapes whose path is line-art, not a fillable outline. */
 const OPEN_SHAPES = new Set<ShapeKind>(['actor'])
 
-/* ---------- layered fallback layout (agent diagrams ship without x/y) ---------- */
-
-function layout(d: KsDiagram): Map<string, { x: number; y: number }> {
-  const pos = new Map<string, { x: number; y: number }>()
-  const indeg = new Map<string, number>()
-  for (const n of d.nodes) indeg.set(n.id, 0)
-  for (const e of d.edges) indeg.set(e.to, (indeg.get(e.to) ?? 0) + 1)
-  const depth = new Map<string, number>()
-  let frontier = d.nodes.filter((n) => (indeg.get(n.id) ?? 0) === 0).map((n) => n.id)
-  if (frontier.length === 0 && d.nodes.length > 0) frontier = [d.nodes[0].id]
-  frontier.forEach((id) => depth.set(id, 0))
-  let guard = 0
-  while (frontier.length && guard++ < 100) {
-    const next: string[] = []
-    for (const e of d.edges) {
-      if (frontier.includes(e.from) && !depth.has(e.to)) {
-        depth.set(e.to, (depth.get(e.from) ?? 0) + 1)
-        next.push(e.to)
-      }
-    }
-    frontier = next
-  }
-  const perCol = new Map<number, number>()
-  for (const n of d.nodes) {
-    const col = depth.get(n.id) ?? 0
-    const row = perCol.get(col) ?? 0
-    perCol.set(col, row + 1)
-    pos.set(n.id, { x: col * 300, y: row * 130 })
-  }
-  return pos
-}
-
-/* ---------- tldraw snapshot → ks_diagram (one-way, best effort) ---------- */
-
-function convertTldraw(snapshot: Record<string, unknown>): KsDiagram {
-  const store = (snapshot.document as { store?: Record<string, unknown> })?.store ?? {}
-  const nodes: KsNode[] = []
-  const edges: KsEdge[] = []
-  const rich = (rt: unknown): string => {
-    // tldraw richText: walk for text leaves
-    const out: string[] = []
-    const walk = (v: unknown) => {
-      if (!v || typeof v !== 'object') return
-      const o = v as Record<string, unknown>
-      if (typeof o.text === 'string') out.push(o.text)
-      if (Array.isArray(o.content)) o.content.forEach(walk)
-    }
-    walk(rt)
-    return out.join(' ')
-  }
-  for (const rec of Object.values(store)) {
-    const r = rec as Record<string, unknown>
-    if (r.typeName !== 'shape') continue
-    const props = (r.props ?? {}) as Record<string, unknown>
-    if (r.type === 'geo' || r.type === 'text' || r.type === 'note') {
-      nodes.push({
-        id: String(r.id),
-        label: rich(props.richText) || String(props.text ?? ''),
-        x: Number(r.x ?? 0),
-        y: Number(r.y ?? 0),
-        w: Number(props.w ?? 180) || 180,
-        h: Number(props.h ?? 64) || 64,
-        shape: r.type === 'note' ? 'sticky' : props.geo === 'diamond' ? 'diamond' : 'box',
-      })
-    }
-  }
-  // arrows: match endpoints to nearest node centers
-  const center = (n: KsNode) => ({ x: (n.x ?? 0) + (n.w ?? 180) / 2, y: (n.y ?? 0) + (n.h ?? 64) / 2 })
-  const nearest = (p: { x: number; y: number }): KsNode | null => {
-    let best: KsNode | null = null
-    let bd = 200 * 200
-    for (const n of nodes) {
-      const c = center(n)
-      const d = (c.x - p.x) ** 2 + (c.y - p.y) ** 2
-      if (d < bd) {
-        bd = d
-        best = n
-      }
-    }
-    return best
-  }
-  for (const rec of Object.values(store)) {
-    const r = rec as Record<string, unknown>
-    if (r.typeName !== 'shape' || r.type !== 'arrow') continue
-    const props = (r.props ?? {}) as Record<string, unknown>
-    const s = props.start as { x?: number; y?: number } | undefined
-    const e = props.end as { x?: number; y?: number } | undefined
-    if (!s || !e) continue
-    const ax = Number(r.x ?? 0)
-    const ay = Number(r.y ?? 0)
-    const from = nearest({ x: ax + Number(s.x ?? 0), y: ay + Number(s.y ?? 0) })
-    const to = nearest({ x: ax + Number(e.x ?? 0), y: ay + Number(e.y ?? 0) })
-    if (from && to && from.id !== to.id) edges.push({ from: from.id, to: to.id })
-  }
-  return { nodes, edges }
-}
-
 /* ---------- custom nodes ---------- */
 
 function wikiSplit(label: string): (string | { link: string })[] {
@@ -237,8 +91,6 @@ function wikiSplit(label: string): (string | { link: string })[] {
   if (rest) parts.push(rest)
   return parts
 }
-
-type CanvasNodeData = { label: string; color: string; kind: ShapeKind }
 
 function ShapeNode({ id, data, selected }: NodeProps<Node<CanvasNodeData>>) {
   const { setNodes } = useReactFlow()
@@ -402,115 +254,7 @@ function LabelEdge(props: EdgeProps) {
 
 const edgeTypes = { label: LabelEdge }
 
-type ArrowKind = 'none' | 'end' | 'both'
-type CanvasEdgeData = { arrow?: ArrowKind; dash?: boolean; color?: string }
-
-/** Derive React Flow marker/style props from our edge data. */
-function decorate(e: Edge): Edge {
-  const d = (e.data ?? {}) as CanvasEdgeData
-  const arrow = d.arrow ?? 'end'
-  const color = d.color ?? '#6b6b7b'
-  const marker = { type: MarkerType.ArrowClosed, width: 16, height: 16, color }
-  return {
-    ...e,
-    markerEnd: arrow === 'end' || arrow === 'both' ? marker : undefined,
-    markerStart: arrow === 'both' ? marker : undefined,
-    style: {
-      stroke: d.color,
-      strokeDasharray: d.dash ? '6 4' : undefined,
-    },
-  }
-}
-
-/* ---------- ks_diagram ↔ react flow ---------- */
-
-const SIDE_POS: Record<string, string> = { t: 't', b: 'b', l: 'l', r: 'r' }
-
-function toFlow(d: KsDiagram): { nodes: Node<CanvasNodeData>[]; edges: Edge[] } {
-  const needLayout = d.nodes.some((n) => n.x === undefined || n.y === undefined)
-  const pos = needLayout ? layout(d) : new Map()
-  const nodes = d.nodes.map((n) => {
-    const kind: ShapeKind = n.shape ?? 'box'
-    const [dw, dh] = DEFAULT_SIZE[kind]
-    return {
-      id: n.id,
-      type: 'shape' as const,
-      position: { x: n.x ?? pos.get(n.id)?.x ?? 0, y: n.y ?? pos.get(n.id)?.y ?? 0 },
-      width: n.w ?? dw,
-      height: n.h ?? dh,
-      zIndex: kind === 'frame' ? -1 : 0,
-      data: { label: n.label ?? '', color: n.color ?? COLORS[0], kind },
-    }
-  })
-  // side-less edges (agent diagrams) get geometrically sensible handles:
-  // mostly-horizontal pairs connect left↔right, vertical pairs top↔bottom
-  const byId = new Map(nodes.map((n) => [n.id, n]))
-  const pickSides = (from: string, to: string): [string, string] => {
-    const a = byId.get(from)
-    const b = byId.get(to)
-    if (!a || !b) return ['r', 'l']
-    const dx = b.position.x - a.position.x
-    const dy = b.position.y - a.position.y
-    if (Math.abs(dx) >= Math.abs(dy)) return dx >= 0 ? ['r', 'l'] : ['l', 'r']
-    return dy >= 0 ? ['b', 't'] : ['t', 'b']
-  }
-  const edges = d.edges.map((e, i) => {
-    const [autoFrom, autoTo] = pickSides(e.from, e.to)
-    return decorate({
-      id: e.id ?? `e${i}-${e.from}-${e.to}`,
-      source: e.from,
-      target: e.to,
-      sourceHandle: e.fromSide && SIDE_POS[e.fromSide] ? e.fromSide : autoFrom,
-      targetHandle: e.toSide && SIDE_POS[e.toSide] ? e.toSide : autoTo,
-      label: e.label,
-      type: 'label' as const,
-      data: { arrow: e.arrow ?? 'end', dash: e.dash ?? false, color: e.color },
-    })
-  })
-  return { nodes, edges }
-}
-
-function fromFlow(nodes: Node<CanvasNodeData>[], edges: Edge[]): KsDiagram {
-  return {
-    nodes: nodes.map((n) => ({
-      id: n.id,
-      label: n.data.label,
-      x: Math.round(n.position.x),
-      y: Math.round(n.position.y),
-      w: Math.round(n.width ?? n.measured?.width ?? 180),
-      h: Math.round(n.height ?? n.measured?.height ?? 64),
-      shape: n.data.kind,
-      color: n.data.color,
-    })),
-    edges: edges.map((e) => {
-      const d = (e.data ?? {}) as CanvasEdgeData
-      return {
-        id: e.id,
-        from: e.source,
-        to: e.target,
-        label: typeof e.label === 'string' ? e.label : undefined,
-        fromSide: e.sourceHandle ?? undefined,
-        toSide: e.targetHandle ?? undefined,
-        arrow: d.arrow ?? 'end',
-        dash: d.dash || undefined,
-        color: d.color,
-      }
-    }),
-  }
-}
-
 /* ---------- the editor ---------- */
-
-function parseContent(content: string): KsDiagram {
-  try {
-    const parsed = JSON.parse(content)
-    if (parsed?.ks_diagram) return parsed.ks_diagram as KsDiagram
-    if (parsed?.document) return convertTldraw(parsed) // tldraw-era canvas
-  } catch {
-    // empty/new canvas
-  }
-  return { nodes: [], edges: [] }
-}
 
 function CanvasFlow({
   block,
@@ -558,14 +302,15 @@ function CanvasFlow({
       })
       setLive({ seed: r.seed })
     } catch (e) {
-      alert(String(e))
+      notify(String(e))
     }
   }
   const endLiveCanvas = async () => {
     try {
       await api(`/api/doc/${block.doc_id}/hot/end`, { method: 'POST' })
     } catch (e) {
-      console.error(e)
+      notify(String(e)) // session still open on the daemon: stay live
+      return
     }
     setLive(null)
     onSaved()
@@ -593,13 +338,7 @@ function CanvasFlow({
     const provider = new WebsocketProvider(`${proto}://${location.host}/ws/hot`, block.doc_id, ydoc)
     yRef.current = { ydoc, provider, nodesMap, edgesMap }
 
-    const serialize = () => {
-      const d = fromFlow(nodesRef.current, edgesRef.current)
-      return {
-        nodes: new Map(d.nodes.map((n) => [n.id, JSON.stringify(n)])),
-        edges: new Map(d.edges.map((e) => [e.id ?? '', JSON.stringify(e)])),
-      }
-    }
+    const serialize = () => serializeShapes(fromFlow(nodesRef.current, edgesRef.current))
 
     provider.on('sync', (isSynced: boolean) => {
       if (isSynced && live.seed && nodesMap.size === 0) {
@@ -613,23 +352,9 @@ function CanvasFlow({
     })
 
     const applyRemote = () => {
-      const kd: KsDiagram = { nodes: [], edges: [] }
-      const np = new Map<string, string>()
-      const ep = new Map<string, string>()
-      nodesMap.forEach((v, k) => {
-        try {
-          kd.nodes.push(JSON.parse(v))
-          np.set(k, v)
-        } catch {}
-      })
-      edgesMap.forEach((v, k) => {
-        try {
-          kd.edges.push(JSON.parse(v))
-          ep.set(k, v)
-        } catch {}
-      })
-      lastPushed.current = { nodes: np, edges: ep }
-      const flow = toFlow(kd)
+      const merged = mergeShapes(nodesMap.entries(), edgesMap.entries())
+      lastPushed.current = merged.pushed
+      const flow = toFlow(merged.diagram)
       const selected = new Set(nodesRef.current.filter((n) => n.selected).map((n) => n.id))
       const selectedE = new Set(edgesRef.current.filter((e) => e.selected).map((e) => e.id))
       restoring.current = true // remote apply is not an undo step of ours
@@ -674,24 +399,15 @@ function CanvasFlow({
   const pushLive = useCallback(() => {
     const y = yRef.current
     if (!y) return
-    const d = fromFlow(nodesRef.current, edgesRef.current)
-    const nodesNow = new Map(d.nodes.map((n) => [n.id, JSON.stringify(n)]))
-    const edgesNow = new Map(d.edges.map((e) => [e.id ?? '', JSON.stringify(e)]))
+    const now = serializeShapes(fromFlow(nodesRef.current, edgesRef.current))
+    const delta = diffShapes(lastPushed.current, now)
     y.ydoc.transact(() => {
-      nodesNow.forEach((v, k) => {
-        if (lastPushed.current.nodes.get(k) !== v) y.nodesMap.set(k, v)
-      })
-      lastPushed.current.nodes.forEach((_, k) => {
-        if (!nodesNow.has(k)) y.nodesMap.delete(k)
-      })
-      edgesNow.forEach((v, k) => {
-        if (lastPushed.current.edges.get(k) !== v) y.edgesMap.set(k, v)
-      })
-      lastPushed.current.edges.forEach((_, k) => {
-        if (!edgesNow.has(k)) y.edgesMap.delete(k)
-      })
+      for (const [k, v] of delta.nodes.set) y.nodesMap.set(k, v)
+      for (const k of delta.nodes.del) y.nodesMap.delete(k)
+      for (const [k, v] of delta.edges.set) y.edgesMap.set(k, v)
+      for (const k of delta.edges.del) y.edgesMap.delete(k)
     }, 'local')
-    lastPushed.current = { nodes: nodesNow, edges: edgesNow }
+    lastPushed.current = now
   }, [])
 
   // debounced save through the gate, same as everything else
@@ -957,9 +673,9 @@ function CanvasFlow({
           data_url: dataUrl,
         }),
       })
-      alert(`saved to ${r.path}`)
+      notify(`saved to ${r.path}`, 'ok')
     } catch (e) {
-      alert(String(e))
+      notify(String(e))
     }
   }
 

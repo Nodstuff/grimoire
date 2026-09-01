@@ -5,6 +5,7 @@
 import { useEffect, useState } from 'react'
 import QRCode from 'qrcode'
 import { api, Doc, DocFederation, Share } from './types'
+import { notify } from './Notice'
 
 export default function SharePanel({
   doc,
@@ -103,7 +104,7 @@ export default function SharePanel({
                         id: s.id,
                         trust: s.trust === 'yellow' ? 'review' : 'yellow',
                       }),
-                    }).then(onChanged, (e) => alert(String(e)))
+                    }).then(onChanged, (e) => notify(String(e)))
                   }
                 >
                   {s.trust === 'yellow' ? '★ trusted' : 'trust'}
@@ -117,7 +118,7 @@ export default function SharePanel({
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({ id: s.id }),
-                    }).then(onChanged, (e) => alert(String(e)))
+                    }).then(onChanged, (e) => notify(String(e)))
                   }
                 >
                   revoke

@@ -2,17 +2,27 @@
 //!
 //! The daemon hosts a yrs doc per hot session and speaks the y-sync protocol
 //! over `/ws/hot/{doc}` — wire-compatible with y-websocket clients. While a
-//! doc is hot its epoch is FROZEN: the daemon-level hot set gates every
-//! propose surface, and the collab session is the only writer. Cool-down:
-//! the ending client flattens the final editor state through the existing
-//! diff/propose machinery at the frozen epoch (block ids ride the Yjs doc as
-//! node attrs, so unchanged blocks keep ids and comment anchors survive);
-//! `confirm` drops the session and its journal.
+//! doc is hot its epoch is FROZEN for content writes: every content-writing
+//! surface (api/mcp propose, resolve, gardeners, remote proposals) asks
+//! `HotState::assert_cold` first, and the collab session is the only writer.
+//! Comments stay allowed (conversation, not content — ADR 0003 §1); they bump
+//! the epoch, which is why the flatten diffs against and proposes at the
+//! doc's CURRENT epoch, recording the frozen one in provenance.
+//!
+//! Cool-down: the daemon renders the Yjs doc to markdown (`yrender`) and
+//! lands ONE propose through `mddiff::markdown_to_ops_editor` — the editor's
+//! view of the doc (frontmatter, comments, canvases excluded, exactly as the
+//! UI seeded it), so unchanged blocks keep ids and hidden blocks are never
+//! touched. A failed flatten leaves the session hot (not a zombie) so it can
+//! be retried; the journal dies only after the commit lands.
 //!
 //! Crash safety: every incoming update frame is appended (length-prefixed)
-//! to a journal under ~/.grimoire/hot/. A daemon restart with a journal
-//! present re-hydrates the session — the doc simply stays hot until someone
-//! ends it properly. Journals die only on confirmed flatten.
+//! to a journal beside the db. A daemon restart with a journal present
+//! re-hydrates the session — the doc simply stays hot until someone ends it
+//! or the idle reaper does.
+//!
+//! `HotState` is plain state threaded into every surface that needs it
+//! (api, mcp, admin/garden, fed) — there is no process-global.
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -27,7 +37,7 @@ use uuid::Uuid;
 use yrs::sync::{Awareness, DefaultProtocol, Message as YMessage, Protocol, SyncMessage};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::{Doc, ReadTxn, Transact, Update};
+use yrs::{Doc, Transact, Update};
 
 pub struct HotSession {
     pub awareness: Awareness,
@@ -37,7 +47,8 @@ pub struct HotSession {
     pub journal: std::fs::File,
     pub started_at: std::time::Instant,
     pub last_activity: std::time::Instant,
-    /// Guard against a session that was ended but never confirmed.
+    /// Set while a flatten is in flight: refuses new frames/joins. Cleared
+    /// again if the flatten fails, so the session is never stranded.
     pub ending: bool,
     _doc_sub: yrs::Subscription,
 }
@@ -84,10 +95,21 @@ impl HotState {
         }
     }
 
-    /// Is this doc in a live session? Consulted by every propose surface.
+    /// Is this doc in a live session? Consulted by every content-writing
+    /// surface via `assert_cold`.
     pub fn is_hot(&self, doc: Uuid) -> bool {
         let s = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         s.get(&doc).map(|h| !h.ending).unwrap_or(false)
+    }
+
+    /// The freeze (ADR 0003 §4): Err with the user-facing reason when the doc
+    /// is live. Every content write path calls this before touching the store.
+    pub fn assert_cold(&self, doc: Uuid) -> Result<(), String> {
+        if self.is_hot(doc) {
+            Err("doc is in a live session — edits go through the session; retry after it ends (P2.3)".into())
+        } else {
+            Ok(())
+        }
     }
 
     fn journal_path(&self, doc: Uuid) -> std::path::PathBuf {
@@ -129,8 +151,12 @@ impl HotState {
     /// the caller that created it seeds the Yjs doc from the current content.
     pub fn start(&self, doc_id: Uuid, frozen_epoch: i64) -> std::io::Result<bool> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(existing) = sessions.get_mut(&doc_id) {
-            existing.ending = false; // an aborted end re-opens
+        if let Some(existing) = sessions.get(&doc_id) {
+            if existing.ending {
+                // a flatten is in flight; it either lands (session gone) or
+                // fails (session re-opened) — never flip its flag from here
+                return Err(std::io::Error::other("session is closing; retry in a moment"));
+            }
             return Ok(false);
         }
         let path = self.journal_path(doc_id);
@@ -237,11 +263,32 @@ impl HotState {
 
 impl HotState {
     /// The one flatten (#67): render the session's Yjs doc to markdown,
-    /// LCS-diff it against the live blocks (mddiff — unchanged blocks keep
-    /// ids, comments and canvases untouched), land ONE propose at the frozen
-    /// epoch, drop the session and its journal. Every ending path — owner
-    /// end, grantee relay, idle timeout, recovery — comes through here.
+    /// LCS-diff it against the editor-visible blocks (mddiff — unchanged
+    /// blocks keep ids; frontmatter, comments and canvases untouched), land
+    /// ONE propose at the doc's current epoch, drop the session and its
+    /// journal. Every ending path — owner end, grantee relay, idle timeout,
+    /// recovery — comes through here. On error the session is re-opened
+    /// (`ending = false`) and the journal kept, so nothing is stranded.
     pub fn flatten_and_close(
+        &self,
+        store: &Arc<Mutex<grimoire_store::SqliteStore>>,
+        doc_id: Uuid,
+        reason: &str,
+    ) -> anyhow::Result<usize> {
+        match self.flatten_inner(store, doc_id, reason) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(s) = sessions.get_mut(&doc_id) {
+                    s.ending = false; // stays live; retryable (idle reaper too)
+                }
+                tracing::error!(%doc_id, reason, "flatten failed; session kept live: {e:#}");
+                Err(e)
+            }
+        }
+    }
+
+    fn flatten_inner(
         &self,
         store: &Arc<Mutex<grimoire_store::SqliteStore>>,
         doc_id: Uuid,
@@ -294,7 +341,15 @@ impl HotState {
             })
         };
 
-        // 2. diff + propose OUTSIDE the session lock
+        // 2. diff + propose OUTSIDE the session lock. Base = the epoch of the
+        // tree we diff against (comments may have moved it while hot); the
+        // frozen epoch is provenance.
+        let provenance = |kind: &str| {
+            vec![
+                format!("hot-session: {reason}, {secs}s, frozen at epoch {frozen_epoch}"),
+                kind.to_string(),
+            ]
+        };
         let applied = if let Some(content) = canvas {
             let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
             let tree = s.read_doc(doc_id)?;
@@ -316,9 +371,9 @@ impl HotState {
                     target,
                     content: content.to_string(),
                 },
-                source_refs: vec![format!("hot-session: {reason}, {secs}s"), "canvas:live".into()],
+                source_refs: provenance("canvas:live"),
             };
-            s.propose(doc_id, frozen_epoch, human.id, vec![op])?;
+            s.propose(doc_id, tree.doc.current_epoch, human.id, vec![op])?;
             1
         } else {
             let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
@@ -329,11 +384,12 @@ impl HotState {
                 tracing::warn!(%doc_id, "hot session empty at flatten; doc kept as-is");
                 0
             } else {
+                // the editor's view: hidden blocks (frontmatter, comments,
+                // canvases) were never seeded and must never be diffed away
                 let mut ops =
-                    grimoire_store::mddiff::markdown_to_ops(&tree.roots, &markdown);
+                    grimoire_store::mddiff::markdown_to_ops_editor(&tree.roots, &markdown);
                 for op in &mut ops {
-                    op.source_refs
-                        .push(format!("hot-session: {reason}, {secs}s"));
+                    op.source_refs = provenance("text:live");
                 }
                 if ops.is_empty() {
                     0
@@ -344,7 +400,7 @@ impl HotState {
                         .find(|p| p.kind == grimoire_store::PrincipalKind::Human)
                         .ok_or_else(|| anyhow::anyhow!("no human principal"))?;
                     let n = ops.len();
-                    s.propose(doc_id, frozen_epoch, human.id, ops)?;
+                    s.propose(doc_id, tree.doc.current_epoch, human.id, ops)?;
                     n
                 }
             }
@@ -384,22 +440,16 @@ pub async fn idle_loop(hot: HotState, store: Arc<Mutex<grimoire_store::SqliteSto
     }
 }
 
-static GLOBAL: std::sync::OnceLock<HotState> = std::sync::OnceLock::new();
-
-/// Install the daemon-wide hot set (called once at serve start).
-pub fn set_global(state: HotState) {
-    GLOBAL.set(state).ok();
-}
-
-/// Is this doc in a live session? Safe from any propose surface; false when
-/// the daemon isn't serving (CLI paths).
-pub fn doc_is_hot(doc: Uuid) -> bool {
-    GLOBAL.get().map(|h| h.is_hot(doc)).unwrap_or(false)
-}
-
-/// The daemon-wide hot set, for the federation surface (#66).
-pub fn global() -> Option<&'static HotState> {
-    GLOBAL.get()
+/// Which doc an open annotation belongs to — so resolve surfaces can honour
+/// the freeze (accepting a red / declining a yellow writes content).
+pub fn annotation_doc(store: &grimoire_store::SqliteStore, annotation_id: Uuid) -> Option<Uuid> {
+    use grimoire_store::BlockStore;
+    store
+        .review_queue(None)
+        .ok()?
+        .into_iter()
+        .find(|i| i.annotation.id == annotation_id)
+        .map(|i| i.annotation.doc_id)
 }
 
 #[derive(Clone)]
@@ -466,12 +516,6 @@ async fn hot_end(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<Va
         Ok(applied) => Json(json!({"flattened_ops": applied})),
         Err(e) => Json(json!({"error": format!("{e:#}")})),
     }
-}
-
-/// Compat no-op: hot/end flattens and closes in one step now (#67).
-async fn hot_confirm(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<Value> {
-    let _ = (&ctx, doc_id);
-    Json(json!({"ok": true}))
 }
 
 async fn hot_status(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<Value> {
@@ -637,7 +681,6 @@ pub fn router(ctx: HotCtx) -> Router {
     Router::new()
         .route("/api/doc/{id}/hot/start", post(hot_start))
         .route("/api/doc/{id}/hot/end", post(hot_end))
-        .route("/api/doc/{id}/hot/confirm", post(hot_confirm))
         .route("/api/doc/{id}/hot/status", get(hot_status))
         .route("/api/doc/{id}/editing", post(editing_ping))
         .route("/ws/hot/{id}", any(ws_hot))
@@ -736,6 +779,125 @@ mod tests {
         assert_eq!(tree.roots[0].block.id, keep_id);
         assert!(!hot.is_hot(doc.id));
         assert!(!hot.journal_path(doc.id).exists());
+    }
+
+    #[test]
+    fn flatten_preserves_frontmatter_and_only_diffs_editor_blocks() {
+        // C1: the UI seeds the session WITHOUT frontmatter/comment/canvas
+        // blocks; the flatten must diff only those same editor blocks, so a
+        // frontmatter block and a comment survive untouched.
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let doc = s.create_doc("Doc", None, tom.id).unwrap();
+        let fm = Uuid::now_v7();
+        let para = Uuid::now_v7();
+        s.apply(
+            doc.id,
+            0,
+            tom.id,
+            vec![
+                OpInput {
+                    kind: OpKind::Insert {
+                        block_id: fm,
+                        parent_id: None,
+                        order_key: "i".into(),
+                        block_type: BlockType::Code,
+                        content: "---\ntags:\n  - keep\n---".into(),
+                        refers_to: None,
+                    },
+                    source_refs: vec![],
+                },
+                OpInput {
+                    kind: OpKind::Insert {
+                        block_id: para,
+                        parent_id: None,
+                        order_key: "r".into(),
+                        block_type: BlockType::Paragraph,
+                        content: "body".into(),
+                        refers_to: None,
+                    },
+                    source_refs: vec![],
+                },
+            ],
+        )
+        .unwrap();
+        // a comment anchored to the paragraph must also survive
+        s.add_comment(para, tom.id, "a note", None).unwrap();
+        let tags_before = s.list_tags().unwrap();
+        assert_eq!(tags_before, vec![("keep".to_string(), 1)]);
+
+        let store = Arc::new(Mutex::new(s));
+        let hot = scratch_hot();
+        let base = { store.lock().unwrap().get_doc(doc.id).unwrap().current_epoch };
+        hot.start(doc.id, base).unwrap();
+        // the editor only ever saw the one paragraph
+        seed_session(&hot, doc.id, &[("body edited", None)]);
+        let applied = hot.flatten_and_close(&store, doc.id, "test").unwrap();
+        assert_eq!(applied, 1, "one replace of the paragraph, nothing else");
+
+        let s = store.lock().unwrap();
+        let tree = s.read_doc(doc.id).unwrap();
+        // frontmatter block still there, same id, same content
+        let fm_block = tree.roots.iter().find(|n| n.block.id == fm).expect("frontmatter kept");
+        assert!(fm_block.block.content.starts_with("---"));
+        assert_eq!(s.list_tags().unwrap(), tags_before, "tags survive");
+        // paragraph edited in place, same id (comment anchor survives)
+        let para_block = tree.roots.iter().find(|n| n.block.id == para).expect("paragraph kept");
+        assert_eq!(para_block.block.content, "body edited");
+        assert_eq!(s.list_comments(para).unwrap().len(), 1, "comment survives");
+    }
+
+    #[test]
+    fn assert_cold_gates_only_while_live() {
+        let hot = scratch_hot();
+        let doc = Uuid::now_v7();
+        assert!(hot.assert_cold(doc).is_ok());
+        hot.start(doc, 0).unwrap();
+        assert!(hot.assert_cold(doc).is_err());
+    }
+
+    #[test]
+    fn failed_flatten_keeps_session_live_not_zombie() {
+        // a canvas session on a doc with NO canvas block makes the flatten
+        // bail (M1): the session must stay hot and retryable, not stranded
+        // with ending=true (which would leave the doc unfrozen but unjoinable)
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let doc = s.create_doc("Doc", None, tom.id).unwrap();
+        s.apply(
+            doc.id,
+            0,
+            tom.id,
+            vec![OpInput {
+                kind: OpKind::Insert {
+                    block_id: Uuid::now_v7(),
+                    parent_id: None,
+                    order_key: "i".into(),
+                    block_type: BlockType::Paragraph,
+                    content: "prose, not a canvas".into(),
+                    refers_to: None,
+                },
+                source_refs: vec![],
+            }],
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(s));
+        let hot = scratch_hot();
+        hot.start(doc.id, 1).unwrap();
+        // seed canvas maps → flatten takes the canvas branch → no canvas block → bail
+        {
+            use yrs::Map as _;
+            let sessions = hot.sessions.lock().unwrap();
+            let ydoc = sessions.get(&doc.id).unwrap().awareness.doc();
+            let nodes = ydoc.get_or_insert_map("canvas_nodes");
+            let mut txn = ydoc.transact_mut();
+            nodes.insert(&mut txn, "a", r#"{"id":"a","label":"x"}"#);
+        }
+        assert!(hot.flatten_and_close(&store, doc.id, "test").is_err());
+        // NOT a zombie: still hot, still joinable, journal intact
+        assert!(hot.is_hot(doc.id));
+        assert!(hot.connect(doc.id).is_some());
+        assert!(hot.journal_path(doc.id).exists());
     }
 
     #[test]

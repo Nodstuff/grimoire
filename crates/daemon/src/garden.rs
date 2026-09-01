@@ -64,13 +64,6 @@ struct TagProposal {
     rationale: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ClaudeResult {
-    result: String,
-    #[serde(default)]
-    usage: serde_json::Value,
-}
-
 pub struct RunOutcome {
     pub run_id: Uuid,
     pub status: String,
@@ -482,14 +475,27 @@ JSON array of {{\"annotation_id\": \"<uuid from below>\", \"decision\": \"accept
 }
 
 /// Apply reviewer decisions with the tripwire. Pure enough to test directly.
+/// Apply a reviewer gardener's decisions. Decisions on docs that are hot are
+/// skipped (the freeze, P2.3): resolving applies/reverts content, which the
+/// live session owns. Pass `|_| false` for the un-gated behaviour.
 pub fn apply_review_decisions(
     store: &mut SqliteStore,
     reviewer_principal: Uuid,
     items: &[ReviewItem],
     decisions: Vec<(Uuid, ReviewDecision, String)>,
+    is_hot: impl Fn(Uuid) -> bool,
 ) -> (usize, usize, Vec<String>) {
     let presented: HashMap<Uuid, &ReviewItem> =
         items.iter().map(|i| (i.annotation.id, i)).collect();
+    let (decisions, deferred): (Vec<_>, Vec<_>) = decisions.into_iter().partition(|(ann, _, _)| {
+        presented
+            .get(ann)
+            .map(|i| !is_hot(i.annotation.doc_id))
+            .unwrap_or(true)
+    });
+    if !deferred.is_empty() {
+        tracing::info!(n = deferred.len(), "review decisions deferred: docs are hot (P2.3)");
+    }
     // tripwire: count requested red resolutions per doc first
     let mut red_per_doc: HashMap<Uuid, usize> = HashMap::new();
     for (ann, _, _) in &decisions {
@@ -541,6 +547,7 @@ pub fn apply_review_decisions(
 
 async fn run_reviewer(
     store: Arc<Mutex<SqliteStore>>,
+    hot: &crate::hot::HotState,
     g: &Gardener,
     run_id: Uuid,
 ) -> (String, String, Option<i64>) {
@@ -593,7 +600,7 @@ async fn run_reviewer(
         let mut s = store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        apply_review_decisions(&mut s, g.principal, &items, decisions)
+        apply_review_decisions(&mut s, g.principal, &items, decisions, |d| hot.is_hot(d))
     };
     (
         "ok".into(),
@@ -752,6 +759,7 @@ fn progress_to_run(store: &Arc<Mutex<SqliteStore>>, run_id: Uuid) -> impl FnMut(
 
 async fn run_auditor(
     store: Arc<Mutex<SqliteStore>>,
+    hot: &crate::hot::HotState,
     g: &Gardener,
     run_id: Uuid,
 ) -> (String, String, Option<i64>) {
@@ -865,6 +873,10 @@ async fn run_auditor(
                     format!("audit:{}", f.comment.chars().take(200).collect::<String>()),
                 ],
             };
+            if hot.is_hot(f.doc_id) {
+                lines.push(format!("{}: deferred, doc is in a live session", f.block_id));
+                continue;
+            }
             if verified {
                 let epoch = match s.get_doc(f.doc_id) {
                     Ok(d) => d.current_epoch,
@@ -1206,7 +1218,11 @@ async fn run_scribe(
 
 /// Run one gardener end to end. Never panics the daemon; all failure modes
 /// land in the run log (ticket 4.6: never a hang, never silent).
-pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOutcome {
+pub async fn run_gardener(
+    store: Arc<Mutex<SqliteStore>>,
+    hot: crate::hot::HotState,
+    g: Gardener,
+) -> RunOutcome {
     let run_id = {
         let mut s = store
             .lock()
@@ -1236,7 +1252,7 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
         };
 
     if g.kind == GardenerKind::Reviewer {
-        let (status, summary, tokens) = run_reviewer(store.clone(), &g, run_id).await;
+        let (status, summary, tokens) = run_reviewer(store.clone(), &hot, &g, run_id).await;
         return finish(&store, &status, &summary, tokens);
     }
     if g.kind == GardenerKind::Scribe {
@@ -1244,7 +1260,7 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
         return finish(&store, &status, &summary, tokens);
     }
     if g.kind == GardenerKind::Auditor || g.kind == GardenerKind::Keeper {
-        let (status, summary, tokens) = run_auditor(store.clone(), &g, run_id).await;
+        let (status, summary, tokens) = run_auditor(store.clone(), &hot, &g, run_id).await;
         return finish(&store, &status, &summary, tokens);
     }
 
@@ -1312,13 +1328,15 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
                     continue;
                 }
             };
+            // the freeze applies regardless of confidence policy (P2.3)
+            if hot.is_hot(doc.id) {
+                tracing::info!(doc = %doc.id, "gardener proposal deferred: doc is hot (P2.3)");
+                lines.push(format!("{}: deferred, doc is in a live session", doc.title));
+                continue;
+            }
             let outcome = match g.confidence_policy {
                 ConfidencePolicy::Review => {
                     s.propose_reviewed(doc.id, doc.current_epoch, g.principal, ops)
-                }
-                _ if crate::hot::doc_is_hot(doc.id) => {
-                    tracing::info!(doc = %doc.id, "gardener proposal deferred: doc is hot (P2.3)");
-                    continue;
                 }
                 ConfidencePolicy::Gate => s.propose(doc.id, doc.current_epoch, g.principal, ops),
             };
@@ -1437,7 +1455,7 @@ mod tests {
             .map(|i| (i.annotation.id, ReviewDecision::Accept, "looks fine".into()))
             .collect();
         let (accepted, declined, lines) =
-            apply_review_decisions(&mut s, reviewer, &items, decisions);
+            apply_review_decisions(&mut s, reviewer, &items, decisions, |_| false);
         assert_eq!((accepted, declined), (0, 0), "whole batch escalated");
         assert!(lines.iter().all(|l| l.contains("TRIPWIRE")));
         assert_eq!(
@@ -1454,7 +1472,7 @@ mod tests {
             .iter()
             .map(|i| (i.annotation.id, ReviewDecision::Accept, String::new()))
             .collect();
-        let (accepted, _, _) = apply_review_decisions(&mut s, reviewer, &items, decisions);
+        let (accepted, _, _) = apply_review_decisions(&mut s, reviewer, &items, decisions, |_| false);
         assert_eq!(accepted, TRIPWIRE_RED_LIMIT);
         assert!(s.review_queue(None).unwrap().is_empty());
     }
@@ -1464,7 +1482,7 @@ mod tests {
         let (mut s, reviewer, items) = seed_reds(1);
         let decisions = vec![(Uuid::now_v7(), ReviewDecision::Accept, "injected".into())];
         let (accepted, declined, lines) =
-            apply_review_decisions(&mut s, reviewer, &items, decisions);
+            apply_review_decisions(&mut s, reviewer, &items, decisions, |_| false);
         assert_eq!((accepted, declined), (0, 0));
         assert!(lines[0].contains("ignored invented"));
     }

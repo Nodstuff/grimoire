@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import { api, GardenerRun } from './types'
+import { notify } from './Notice'
 
 export interface Gardener {
   id: string
@@ -39,7 +40,7 @@ export default function Gardeners({ dataVersion = 0 }: { dataVersion?: number })
         body: JSON.stringify({ name }),
       })
     } catch (e) {
-      alert(String(e))
+      notify(String(e))
     }
     setRunning(null)
     load()
@@ -155,7 +156,7 @@ function GardenerCard({
           .map((b) => b.trim())
           .filter(Boolean),
       }),
-    }).catch((e) => alert(String(e)))
+    }).catch((e) => notify(String(e)))
     onSaved()
   }
 
@@ -226,7 +227,7 @@ function CreateCard({ onCreated }: { onCreated: () => void }) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: name.trim(), kind, task_prompt: prompt.trim() }),
-    }).catch((e) => alert(String(e)))
+    }).catch((e) => notify(String(e)))
     onCreated()
   }
 

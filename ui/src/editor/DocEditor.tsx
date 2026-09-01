@@ -12,6 +12,7 @@ import CodeBlockView from './CodeBlockView'
 import { WikilinkDeco } from './WikilinkDeco'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block } from '../types'
+import { notify } from '../Notice'
 import { BaselineBlock, Entry, computeOps } from './diff'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
 
@@ -215,7 +216,7 @@ export default function DocEditor({
         onProposed?.()
       } catch (e) {
         setSaveState('dirty')
-        alert(String(e))
+        notify(String(e))
       }
       return
     }
@@ -326,7 +327,7 @@ export default function DocEditor({
 }
 
 /** After a successful save the written entries ARE the new baseline. */
-function rebuildBaseline(
+export function rebuildBaseline(
   old: BaselineBlock[],
   entries: Entry[],
   ops: { kind: Record<string, unknown> & { op: string } }[],
