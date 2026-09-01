@@ -811,3 +811,13 @@ kbd {
   border-bottom: 1px dotted color-mix(in srgb, var(--accent) 60%, transparent);
 }
 .wl-target:hover { border-bottom-style: solid; background: color-mix(in srgb, var(--accent) 10%, transparent); }
+
+.wl-hide { display: none; }
+.anchor-flash {
+  animation: anchor-glow 1.5s ease-out;
+  border-radius: 4px;
+}
+@keyframes anchor-glow {
+  0% { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+  100% { background: transparent; }
+}

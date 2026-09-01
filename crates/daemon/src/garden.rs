@@ -267,17 +267,65 @@ fn parse_json_result<T: serde::de::DeserializeOwned>(result: &str) -> Result<T, 
     if let Ok(v) = serde_json::from_str(json) {
         return Ok(v);
     }
-    // salvage: models sometimes append prose after the JSON — parse the first
-    // JSON value and ignore trailing characters
+    // salvage 1: models sometimes append prose after the JSON — parse the
+    // first JSON value and ignore trailing characters
     let start = json
         .find(['[', '{'])
         .ok_or_else(|| "no JSON in model output".to_string())?;
     let mut stream = serde_json::Deserializer::from_str(&json[start..]).into_iter::<T>();
     match stream.next() {
+        Some(Ok(v)) => return Ok(v),
+        Some(Err(e)) if !e.to_string().contains("control character") => {
+            return Err(format!("proposals did not parse: {e}"));
+        }
+        _ => {}
+    }
+    // salvage 2: raw control characters inside string literals (models emit
+    // literal newlines in long markdown values) — escape them and retry
+    let sanitized = escape_ctrl_in_strings(&json[start..]);
+    let mut stream = serde_json::Deserializer::from_str(&sanitized).into_iter::<T>();
+    match stream.next() {
         Some(Ok(v)) => Ok(v),
         Some(Err(e)) => Err(format!("proposals did not parse: {e}")),
         None => Err("no JSON in model output".to_string()),
     }
+}
+
+/// Escape raw control characters that appear inside JSON string literals.
+fn escape_ctrl_in_strings(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 64);
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if in_str {
+            if escaped {
+                out.push(c);
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' => {
+                    out.push(c);
+                    escaped = true;
+                }
+                '"' => {
+                    out.push(c);
+                    in_str = false;
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        } else {
+            if c == '"' {
+                in_str = true;
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn parse_proposals(result: &str) -> Result<Vec<TagProposal>, String> {
@@ -1409,5 +1457,24 @@ mod truncate_tests {
         let mut short = "short".to_string();
         truncate_chars(&mut short, 2_000);
         assert_eq!(short, "short");
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn salvages_control_chars_in_strings() {
+        let raw = "[{\"title\": \"Doc\", \"markdown\": \"line one\nline two\ttabbed\"}]";
+        let v: Vec<serde_json::Value> = parse_json_result(raw).unwrap();
+        assert_eq!(v[0]["markdown"], "line one\nline two\ttabbed");
+    }
+
+    #[test]
+    fn salvages_prose_wrapping() {
+        let raw = "Sure, here you go:\n[{\"a\": 1}] hope that helps!";
+        let v: Vec<serde_json::Value> = parse_json_result(raw).unwrap();
+        assert_eq!(v[0]["a"], 1);
     }
 }
