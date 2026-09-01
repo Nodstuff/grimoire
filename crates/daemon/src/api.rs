@@ -713,6 +713,69 @@ async fn delete_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Va
     }
 }
 
+#[derive(Deserialize)]
+struct ExportReq {
+    filename: String,
+    /// data:image/png;base64,… or data:image/svg+xml;…
+    data_url: String,
+}
+
+/// Save a canvas export to ~/Downloads (#68 v2.2). WKWebView downloads are
+/// unreliable in Tauri, so the daemon writes the file — human surface only.
+async fn export_file(Json(req): Json<ExportReq>) -> Json<Value> {
+    let name: String = req
+        .filename
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    if name.is_empty() || name.starts_with('.') {
+        return Json(json!({"error": "bad filename"}));
+    }
+    let Some((_, payload)) = req.data_url.split_once(',') else {
+        return Json(json!({"error": "not a data url"}));
+    };
+    let bytes = if req.data_url.contains(";base64,") {
+        use base64::Engine;
+        match base64::engine::general_purpose::STANDARD.decode(payload) {
+            Ok(b) => b,
+            Err(e) => return Json(json!({"error": format!("bad base64: {e}")})),
+        }
+    } else {
+        match urlencoding_decode(payload) {
+            Ok(s) => s.into_bytes(),
+            Err(e) => return Json(json!({"error": e})),
+        }
+    };
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let dir = std::path::PathBuf::from(home).join("Downloads");
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join(&name);
+    match std::fs::write(&path, bytes) {
+        Ok(()) => Json(json!({"path": path.to_string_lossy()})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+fn urlencoding_decode(s: &str) -> Result<String, String> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|e| e.to_string())?;
+                out.push(u8::from_str_radix(hex, 16).map_err(|e| e.to_string())?);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|e| e.to_string())
+}
+
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/docs", get(docs).post(create_doc))
@@ -740,5 +803,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/runs", get(runs))
         .route("/api/graph", get(graph))
         .route("/api/render/d2", post(render_d2))
+        .route("/api/export", post(export_file))
         .with_state(state)
 }

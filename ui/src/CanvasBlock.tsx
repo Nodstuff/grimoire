@@ -29,9 +29,13 @@ import {
 import {
   BaseEdge,
   EdgeLabelRenderer,
+  MarkerType,
+  getNodesBounds,
   getSmoothStepPath,
+  getViewportForBounds,
   type EdgeProps,
 } from '@xyflow/react'
+import { toPng, toSvg } from 'html-to-image'
 import '@xyflow/react/dist/style.css'
 import { api, Block } from './types'
 
@@ -45,6 +49,10 @@ type ShapeKind =
   | 'parallelogram'
   | 'hexagon'
   | 'cylinder'
+  | 'document'
+  | 'cloud'
+  | 'actor'
+  | 'triangle'
   | 'sticky'
   | 'text'
   | 'frame'
@@ -67,6 +75,9 @@ interface KsEdge {
   label?: string
   fromSide?: string
   toSide?: string
+  arrow?: 'none' | 'end' | 'both'
+  dash?: boolean
+  color?: string
 }
 
 interface KsDiagram {
@@ -83,6 +94,10 @@ const DEFAULT_SIZE: Record<ShapeKind, [number, number]> = {
   parallelogram: [190, 70],
   hexagon: [180, 80],
   cylinder: [150, 100],
+  document: [170, 90],
+  cloud: [190, 110],
+  actor: [80, 110],
+  triangle: [150, 110],
   sticky: [160, 140],
   text: [160, 40],
   frame: [420, 300],
@@ -96,7 +111,15 @@ const SVG_SHAPES: Partial<Record<ShapeKind, string>> = {
   parallelogram: 'M 18 1 L 99 1 L 82 99 L 1 99 Z',
   hexagon: 'M 22 1 L 78 1 L 99 50 L 78 99 L 22 99 L 1 50 Z',
   cylinder: 'M 1 14 A 49 13 0 0 1 99 14 L 99 86 A 49 13 0 0 1 1 86 Z M 1 14 A 49 13 0 0 0 99 14',
+  document: 'M 1 1 L 99 1 L 99 82 C 75 70 60 98 38 90 C 22 84 10 92 1 84 Z',
+  cloud:
+    'M 25 90 C 8 90 1 78 1 66 C 1 54 10 46 20 46 C 22 30 34 20 48 22 C 58 8 82 10 88 28 C 97 32 99 44 97 54 C 104 68 94 90 78 90 Z',
+  actor:
+    'M 50 1 A 13 13 0 1 1 49.9 1 M 50 27 L 50 62 M 50 36 L 18 30 M 50 36 L 82 30 M 50 62 L 24 99 M 50 62 L 76 99',
+  triangle: 'M 50 1 L 99 99 L 1 99 Z',
 }
+/** Shapes whose path is line-art, not a fillable outline. */
+const OPEN_SHAPES = new Set<ShapeKind>(['actor'])
 
 /* ---------- layered fallback layout (agent diagrams ship without x/y) ---------- */
 
@@ -300,9 +323,10 @@ function ShapeNode({ id, data, selected }: NodeProps<Node<CanvasNodeData>>) {
         >
           <path
             d={svgPath}
-            fill="var(--panel)"
+            fill={OPEN_SHAPES.has(kind) ? 'none' : 'var(--panel)'}
             stroke={data.color}
             strokeWidth={1.5}
+            strokeLinecap="round"
             vectorEffect="non-scaling-stroke"
           />
         </svg>
@@ -333,6 +357,7 @@ function LabelEdge(props: EdgeProps) {
         id={props.id}
         path={path}
         markerEnd={props.markerEnd}
+        markerStart={props.markerStart}
         style={props.style}
       />
       {/* generous invisible hit area for the double-click */}
@@ -375,6 +400,26 @@ function LabelEdge(props: EdgeProps) {
 
 const edgeTypes = { label: LabelEdge }
 
+type ArrowKind = 'none' | 'end' | 'both'
+type CanvasEdgeData = { arrow?: ArrowKind; dash?: boolean; color?: string }
+
+/** Derive React Flow marker/style props from our edge data. */
+function decorate(e: Edge): Edge {
+  const d = (e.data ?? {}) as CanvasEdgeData
+  const arrow = d.arrow ?? 'end'
+  const color = d.color ?? '#6b6b7b'
+  const marker = { type: MarkerType.ArrowClosed, width: 16, height: 16, color }
+  return {
+    ...e,
+    markerEnd: arrow === 'end' || arrow === 'both' ? marker : undefined,
+    markerStart: arrow === 'both' ? marker : undefined,
+    style: {
+      stroke: d.color,
+      strokeDasharray: d.dash ? '6 4' : undefined,
+    },
+  }
+}
+
 /* ---------- ks_diagram ↔ react flow ---------- */
 
 const SIDE_POS: Record<string, string> = { t: 't', b: 'b', l: 'l', r: 'r' }
@@ -409,7 +454,7 @@ function toFlow(d: KsDiagram): { nodes: Node<CanvasNodeData>[]; edges: Edge[] } 
   }
   const edges = d.edges.map((e, i) => {
     const [autoFrom, autoTo] = pickSides(e.from, e.to)
-    return {
+    return decorate({
       id: e.id ?? `e${i}-${e.from}-${e.to}`,
       source: e.from,
       target: e.to,
@@ -417,7 +462,8 @@ function toFlow(d: KsDiagram): { nodes: Node<CanvasNodeData>[]; edges: Edge[] } 
       targetHandle: e.toSide && SIDE_POS[e.toSide] ? e.toSide : autoTo,
       label: e.label,
       type: 'label' as const,
-    }
+      data: { arrow: e.arrow ?? 'end', dash: e.dash ?? false, color: e.color },
+    })
   })
   return { nodes, edges }
 }
@@ -434,14 +480,20 @@ function fromFlow(nodes: Node<CanvasNodeData>[], edges: Edge[]): KsDiagram {
       shape: n.data.kind,
       color: n.data.color,
     })),
-    edges: edges.map((e) => ({
-      id: e.id,
-      from: e.source,
-      to: e.target,
-      label: typeof e.label === 'string' ? e.label : undefined,
-      fromSide: e.sourceHandle ?? undefined,
-      toSide: e.targetHandle ?? undefined,
-    })),
+    edges: edges.map((e) => {
+      const d = (e.data ?? {}) as CanvasEdgeData
+      return {
+        id: e.id,
+        from: e.source,
+        to: e.target,
+        label: typeof e.label === 'string' ? e.label : undefined,
+        fromSide: e.sourceHandle ?? undefined,
+        toSide: e.targetHandle ?? undefined,
+        arrow: d.arrow ?? 'end',
+        dash: d.dash || undefined,
+        color: d.color,
+      }
+    }),
   }
 }
 
@@ -520,13 +572,243 @@ function CanvasFlow({
   nodesRef.current = nodes
   const edgesRef = useRef(edges)
   edgesRef.current = edges
-  // any structural change schedules a save
+
+  // undo/redo: checkpoint snapshots, coalescing bursts (drags emit dozens of
+  // changes — one checkpoint per ~400ms quiet gap is what a human calls a step)
+  type Snap = { nodes: Node<CanvasNodeData>[]; edges: Edge[] }
+  const past = useRef<Snap[]>([])
+  const future = useRef<Snap[]>([])
+  const lastSnap = useRef<Snap>({ nodes: initial.nodes, edges: initial.edges })
+  const snapTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const restoring = useRef(false)
+
+  // any structural change: checkpoint for undo + schedule a save
   useEffect(() => {
-    if (nodes !== initial.nodes || edges !== initial.edges) scheduleSave()
+    if (nodes === initial.nodes && edges === initial.edges) return
+    if (restoring.current) {
+      restoring.current = false
+      lastSnap.current = { nodes, edges }
+      scheduleSave()
+      return
+    }
+    if (snapTimer.current) clearTimeout(snapTimer.current)
+    snapTimer.current = setTimeout(() => {
+      snapTimer.current = null
+      past.current.push(lastSnap.current)
+      if (past.current.length > 100) past.current.shift()
+      future.current = []
+      lastSnap.current = { nodes: nodesRef.current, edges: edgesRef.current }
+    }, 400)
+    scheduleSave()
   }, [nodes, edges, initial, scheduleSave])
 
+  const undo = useCallback(() => {
+    // a pending checkpoint means changes newer than lastSnap: flush it first
+    if (snapTimer.current) {
+      clearTimeout(snapTimer.current)
+      snapTimer.current = null
+      past.current.push(lastSnap.current)
+      lastSnap.current = { nodes: nodesRef.current, edges: edgesRef.current }
+    }
+    const prev = past.current.pop()
+    if (!prev) return
+    future.current.push({ nodes: nodesRef.current, edges: edgesRef.current })
+    restoring.current = true
+    lastSnap.current = prev
+    setNodes(prev.nodes)
+    setEdges(prev.edges)
+  }, [setNodes, setEdges])
+
+  const redo = useCallback(() => {
+    const next = future.current.pop()
+    if (!next) return
+    past.current.push({ nodes: nodesRef.current, edges: edgesRef.current })
+    restoring.current = true
+    lastSnap.current = next
+    setNodes(next.nodes)
+    setEdges(next.edges)
+  }, [setNodes, setEdges])
+
+  // clipboard: selected nodes + the edges fully inside the selection
+  const clipboard = useRef<Snap | null>(null)
+  const copySelection = useCallback(() => {
+    const ns = nodesRef.current.filter((n) => n.selected)
+    if (ns.length === 0) return
+    const ids = new Set(ns.map((n) => n.id))
+    const es = edgesRef.current.filter((e) => ids.has(e.source) && ids.has(e.target))
+    clipboard.current = { nodes: ns, edges: es }
+  }, [])
+  const pasteClipboard = useCallback(
+    (offset = 28) => {
+      const clip = clipboard.current
+      if (!clip) return
+      const idMap = new Map(clip.nodes.map((n) => [n.id, crypto.randomUUID()]))
+      const newNodes = clip.nodes.map((n) => ({
+        ...n,
+        id: idMap.get(n.id)!,
+        position: { x: n.position.x + offset, y: n.position.y + offset },
+        selected: true,
+      }))
+      const newEdges = clip.edges.map((e) => ({
+        ...e,
+        id: crypto.randomUUID(),
+        source: idMap.get(e.source)!,
+        target: idMap.get(e.target)!,
+        selected: false,
+      }))
+      setNodes((ns) => [...ns.map((n) => ({ ...n, selected: false })), ...newNodes])
+      setEdges((es) => [...es, ...newEdges])
+    },
+    [setNodes, setEdges],
+  )
+  const duplicate = useCallback(() => {
+    copySelection()
+    pasteClipboard()
+  }, [copySelection, pasteClipboard])
+
+  const onCanvasKey = useCallback(
+    (e: React.KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey
+      if (!mod) return
+      const inField = /INPUT|TEXTAREA/.test((e.target as HTMLElement).tagName)
+      if (inField) return
+      const k = e.key.toLowerCase()
+      if (k === 'z') {
+        e.preventDefault()
+        e.stopPropagation()
+        if (e.shiftKey) redo()
+        else undo()
+      } else if (k === 'c') {
+        e.preventDefault()
+        copySelection()
+      } else if (k === 'v') {
+        e.preventDefault()
+        pasteClipboard()
+      } else if (k === 'd') {
+        e.preventDefault()
+        e.stopPropagation()
+        duplicate()
+      } else if (k === 'a') {
+        e.preventDefault()
+        e.stopPropagation()
+        setNodes((ns) => ns.map((n) => ({ ...n, selected: true })))
+      }
+    },
+    [undo, redo, copySelection, pasteClipboard, duplicate, setNodes],
+  )
+
+  // edge styling: operate on the selected edges
+  const restyleEdges = useCallback(
+    (f: (d: CanvasEdgeData) => CanvasEdgeData) => {
+      setEdges((es) =>
+        es.map((e) =>
+          e.selected ? decorate({ ...e, data: f((e.data ?? {}) as CanvasEdgeData) }) : e,
+        ),
+      )
+    },
+    [setEdges],
+  )
+  const cycleArrow = () =>
+    restyleEdges((d) => ({
+      ...d,
+      arrow: d.arrow === 'end' ? 'both' : d.arrow === 'both' ? 'none' : 'end',
+    }))
+  const toggleDash = () => restyleEdges((d) => ({ ...d, dash: !d.dash }))
+  const anyEdgeSelected = edges.some((e) => e.selected)
+  const selectedNodes = nodes.filter((n) => n.selected && n.data.kind !== 'frame')
+
+  // align/distribute the selection
+  const align = (axis: 'h' | 'v') => {
+    const sel = selectedNodes
+    if (sel.length < 2) return
+    if (axis === 'h') {
+      const cy =
+        sel.reduce((a, n) => a + n.position.y + (n.height ?? 64) / 2, 0) / sel.length
+      setNodes((ns) =>
+        ns.map((n) =>
+          n.selected && n.data.kind !== 'frame'
+            ? { ...n, position: { ...n.position, y: cy - (n.height ?? 64) / 2 } }
+            : n,
+        ),
+      )
+    } else {
+      const cx =
+        sel.reduce((a, n) => a + n.position.x + (n.width ?? 180) / 2, 0) / sel.length
+      setNodes((ns) =>
+        ns.map((n) =>
+          n.selected && n.data.kind !== 'frame'
+            ? { ...n, position: { ...n.position, x: cx - (n.width ?? 180) / 2 } }
+            : n,
+        ),
+      )
+    }
+  }
+  const distribute = (axis: 'h' | 'v') => {
+    const sel = [...selectedNodes]
+    if (sel.length < 3) return
+    const key = axis === 'h' ? 'x' : 'y'
+    sel.sort((a, b) => a.position[key] - b.position[key])
+    const first = sel[0].position[key]
+    const last = sel[sel.length - 1].position[key]
+    const step = (last - first) / (sel.length - 1)
+    const target = new Map(sel.map((n, i) => [n.id, first + i * step]))
+    setNodes((ns) =>
+      ns.map((n) =>
+        target.has(n.id)
+          ? { ...n, position: { ...n.position, [key]: target.get(n.id)! } }
+          : n,
+      ),
+    )
+  }
+
+  // export: render the flow viewport to an image, save via the daemon
+  const exportAs = async (format: 'png' | 'svg') => {
+    const el = document.querySelector('.react-flow__viewport') as HTMLElement | null
+    if (!el) return
+    const bounds = getNodesBounds(nodesRef.current)
+    const W = Math.min(4096, Math.max(640, Math.ceil(bounds.width + 120)))
+    const H = Math.min(4096, Math.max(480, Math.ceil(bounds.height + 120)))
+    const vp = getViewportForBounds(bounds, W, H, 0.2, 2, 0.06)
+    const opts = {
+      backgroundColor: '#101014',
+      width: W,
+      height: H,
+      style: {
+        width: `${W}px`,
+        height: `${H}px`,
+        transform: `translate(${vp.x}px, ${vp.y}px) scale(${vp.zoom})`,
+      },
+    }
+    try {
+      const dataUrl =
+        format === 'png' ? await toPng(el, opts) : await toSvg(el, opts)
+      const r = await api<{ path: string }>('/api/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: `canvas-${new Date().toISOString().slice(0, 10)}.${format}`,
+          data_url: dataUrl,
+        }),
+      })
+      alert(`saved to ${r.path}`)
+    } catch (e) {
+      alert(String(e))
+    }
+  }
+
   const onConnect = useCallback(
-    (c: Connection) => setEdges((es) => addEdge({ ...c, type: 'label' }, es)),
+    (c: Connection) =>
+      setEdges((es) =>
+        addEdge(
+          decorate({
+            ...c,
+            id: crypto.randomUUID(),
+            type: 'label',
+            data: { arrow: 'end' },
+          } as Edge),
+          es,
+        ),
+      ),
     [setEdges],
   )
 
@@ -564,6 +846,14 @@ function CanvasFlow({
           : n,
       ),
     )
+    setEdges((es) =>
+      es.map((e) => {
+        if (!e.selected) return e
+        const d = (e.data ?? {}) as CanvasEdgeData
+        const color = COLORS[(COLORS.indexOf(d.color ?? '') + 1) % COLORS.length]
+        return decorate({ ...e, data: { ...d, color } })
+      }),
+    )
   }
 
   const tidy = () => {
@@ -578,7 +868,11 @@ function CanvasFlow({
   }
 
   return (
-    <>
+    <div
+      className="canvas-wrap"
+      tabIndex={0}
+      onKeyDownCapture={onCanvasKey}
+    >
       <div className="canvas-toolbar">
         <button onClick={() => addNode('box')} title="process">▭</button>
         <button onClick={() => addNode('pill')} title="start / end">⬭</button>
@@ -591,8 +885,36 @@ function CanvasFlow({
         <button onClick={() => addNode('text')} title="text label">T</button>
         <button onClick={() => addNode('frame')} title="frame">⬚</button>
         <span className="canvas-toolbar-sep" />
+        <button onClick={() => addNode('document')} title="document">🗎</button>
+        <button onClick={() => addNode('cloud')} title="cloud">☁</button>
+        <button onClick={() => addNode('actor')} title="actor">🧍</button>
+        <button onClick={() => addNode('triangle')} title="triangle">△</button>
+        <span className="canvas-toolbar-sep" />
         <button onClick={recolor} title="cycle color of selection">🎨</button>
         <button onClick={tidy} title="auto-layout">✨</button>
+        {anyEdgeSelected && (
+          <>
+            <span className="canvas-toolbar-sep" />
+            <button onClick={cycleArrow} title="arrowheads: end → both → none">➔</button>
+            <button onClick={toggleDash} title="toggle dashed">┄</button>
+          </>
+        )}
+        {selectedNodes.length >= 2 && (
+          <>
+            <span className="canvas-toolbar-sep" />
+            <button onClick={() => align('h')} title="align horizontally">⭤</button>
+            <button onClick={() => align('v')} title="align vertically">⭥</button>
+            {selectedNodes.length >= 3 && (
+              <>
+                <button onClick={() => distribute('h')} title="distribute horizontally">⋯</button>
+                <button onClick={() => distribute('v')} title="distribute vertically">⋮</button>
+              </>
+            )}
+          </>
+        )}
+        <span className="canvas-toolbar-sep" />
+        <button onClick={() => exportAs('png')} title="export PNG">🖼</button>
+        <button onClick={() => exportAs('svg')} title="export SVG">⬇</button>
       </div>
       <ReactFlow
         nodes={nodes}
@@ -614,7 +936,7 @@ function CanvasFlow({
         <Controls showInteractive={false} />
         <MiniMap pannable zoomable />
       </ReactFlow>
-    </>
+    </div>
   )
 }
 

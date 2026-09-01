@@ -1134,3 +1134,11 @@ kbd {
   outline: none;
   text-align: center;
 }
+
+/* canvas v2.2 */
+.canvas-wrap { position: relative; width: 100%; height: 100%; outline: none; }
+.cnode-actor { background: none; border: none; align-items: flex-end; padding-bottom: 0; font-size: 11px; }
+.cnode-actor .cnode-label { transform: translateY(100%); position: absolute; bottom: -4px; }
+.cnode-triangle { padding-top: 40px; }
+.cnode-cloud { padding: 24px 30px; }
+.cnode-document { padding-bottom: 22px; }
