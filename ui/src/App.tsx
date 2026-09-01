@@ -156,6 +156,17 @@ export default function App() {
     [setView],
   )
 
+  // canvas nodes fire wikilink clicks as events (CanvasBlock has no doc list)
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const title = (e as CustomEvent<string>).detail
+      const target = docs.find((d) => d.title === title)
+      if (target) openDoc(target.id)
+    }
+    window.addEventListener('grimoire:open-doc', onOpen)
+    return () => window.removeEventListener('grimoire:open-doc', onOpen)
+  }, [docs, openDoc])
+
   return (
     <div className="app">
       {treeOpen && (
