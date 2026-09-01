@@ -61,16 +61,39 @@ export default function Gardeners({ dataVersion = 0 }: { dataVersion?: number })
           }}
         />
       )}
-      {gardeners.map((g) => (
-        <GardenerCard
-          key={g.id}
-          g={g}
-          running={running === g.name}
-          anyRunning={running !== null}
-          onRun={() => runNow(g.name)}
-          onSaved={load}
-        />
-      ))}
+      <h2 className="runs-title">global workers</h2>
+      {gardeners
+        .filter((g) => !g.scope_doc)
+        .map((g) => (
+          <GardenerCard
+            key={g.id}
+            g={g}
+            running={running === g.name}
+            anyRunning={running !== null}
+            onRun={() => runNow(g.name)}
+            onSaved={load}
+          />
+        ))}
+      {gardeners.some((g) => g.scope_doc) && (
+        <>
+          <h2 className="runs-title">tended scopes</h2>
+          <div className="meta" style={{ marginBottom: 8 }}>
+            configured on each doc — open the doc and use its tend panel
+          </div>
+          {gardeners
+            .filter((g) => g.scope_doc)
+            .map((g) => (
+              <div key={g.id} className={`run ${g.enabled ? '' : 'disabled'}`}>
+                <div className="run-head">
+                  <span className={`kind-badge kind-${g.kind}`}>{g.kind}</span>
+                  <span className="who agent">{g.name}</span>
+                  <span className="meta">{g.schedule}</span>
+                  {!g.enabled && <span className="meta">disabled</span>}
+                </div>
+              </div>
+            ))}
+        </>
+      )}
       <h2 className="runs-title">runs</h2>
       {runs.map((r) => (
         <div key={r.id} className="run">

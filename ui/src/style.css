@@ -729,3 +729,75 @@ kbd {
 }
 .canvas-doc-head .doc-title { font-size: 17px; margin: 0; }
 .canvas-doc-head .doc-title-edit { font-size: 17px; }
+
+/* ---------- tending ---------- */
+
+.tend-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  flex-shrink: 0;
+  margin-right: 2px;
+  opacity: 0.8;
+}
+.chip.tended { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
+.tend-panel { width: 400px; }
+.tend-empty p { margin: 0 0 8px; font-size: 13px; }
+.tend-add { width: 100%; margin-top: 10px; padding: 8px; }
+.tending {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+.tending.disabled { opacity: 0.55; }
+.tending-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.tending-head .toggle { margin-left: auto; }
+.tending-head select, .tending-foot select {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  padding: 4px 8px;
+  font-size: 12px;
+  outline: none;
+}
+.kind-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+.kind-scribe { color: var(--accent); background: color-mix(in srgb, var(--accent) 15%, transparent); }
+.kind-keeper { color: var(--green); background: color-mix(in srgb, var(--green) 15%, transparent); }
+.kind-auditor { color: var(--yellow); background: color-mix(in srgb, var(--yellow) 15%, transparent); }
+.kind-blurb { margin-bottom: 8px; }
+.tend-field { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--fg-dim); margin: 6px 0; }
+.tend-field input {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  padding: 5px 8px;
+  font: 12px ui-monospace, monospace;
+  outline: none;
+}
+.tend-field input:focus { border-color: var(--accent); }
+.tending-foot { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.tending-foot .accept {
+  background: var(--green);
+  color: #101014;
+  border: none;
+  border-radius: 7px;
+  padding: 4px 14px;
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+  margin-left: auto;
+}
+.tend-lastrun { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+.tend-lastrun pre { white-space: pre-wrap; font: 11px/1.5 ui-monospace, monospace; color: var(--fg-dim); margin: 4px 0 0; }

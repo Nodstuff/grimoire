@@ -396,7 +396,14 @@ pub enum GardenerKind {
     Reviewer,
     /// Veracity sweeps: reads the stalest docs and flags suspect claims
     /// as comments on the offending blocks. Flags, never edits.
+    /// SCOPED ONLY: must be tied to a doc subtree.
     Auditor,
+    /// Writes new docs from nothing: style exemplars + bound repos +
+    /// instructions → a doc tree under its scope. SCOPED ONLY.
+    Scribe,
+    /// Keeps its scope true to its bound sources: proposes updates as
+    /// reviewable yellows when the repo and the docs disagree. SCOPED ONLY.
+    Keeper,
 }
 
 impl GardenerKind {
@@ -405,7 +412,15 @@ impl GardenerKind {
             GardenerKind::Tagging => "tagging",
             GardenerKind::Reviewer => "reviewer",
             GardenerKind::Auditor => "auditor",
+            GardenerKind::Scribe => "scribe",
+            GardenerKind::Keeper => "keeper",
         }
+    }
+
+    /// Kinds that require a scope doc — the opt-in boundary: docs outside
+    /// every scoped tending are never touched by these.
+    pub fn scoped_only(&self) -> bool {
+        matches!(self, GardenerKind::Auditor | GardenerKind::Scribe | GardenerKind::Keeper)
     }
 
     pub fn parse(s: &str) -> Option<Self> {
@@ -413,6 +428,8 @@ impl GardenerKind {
             "tagging" => Some(GardenerKind::Tagging),
             "reviewer" => Some(GardenerKind::Reviewer),
             "auditor" => Some(GardenerKind::Auditor),
+            "scribe" => Some(GardenerKind::Scribe),
+            "keeper" => Some(GardenerKind::Keeper),
             _ => None,
         }
     }

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DocEditor from './editor/DocEditor'
 import GraphView from './GraphView'
+import TendPanel from './TendPanel'
 import Gardeners from './Gardeners'
 import CanvasBlock from './CanvasBlock'
 import {
@@ -555,6 +556,7 @@ function DocTreeNav({
               )}
             </span>
             <span className="tree-title">{d.title}</span>
+            {d.is_tended && <span className="tend-dot" title="tended by agents" />}
             <button
               className={`tree-delete ${armed === d.id ? 'armed' : ''}`}
               title={armed === d.id ? 'click again to delete' : 'delete'}
@@ -692,7 +694,7 @@ function DocView({
 }) {
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
-  const [panel, setPanel] = useState<'none' | 'history' | 'comments'>('none')
+  const [panel, setPanel] = useState<'none' | 'history' | 'comments' | 'tend'>('none')
   const [selBlock, setSelBlock] = useState<string | null>(null)
   const [selRect, setSelRect] = useState<{ x: number; y: number } | null>(null)
   const [commentTarget, setCommentTarget] = useState<string | null>(null)
@@ -836,6 +838,12 @@ function DocView({
           >
             comments{comments.length > 0 ? ` ${comments.length}` : ''}
           </button>
+          <button
+            className={`chip ${panel === 'tend' ? 'on' : ''} ${docs.find((d) => d.id === docId)?.is_tended ? 'tended' : ''}`}
+            onClick={() => setPanel(panel === 'tend' ? 'none' : 'tend')}
+          >
+            {docs.find((d) => d.id === docId)?.is_tended ? '🌿 tended' : 'tend'}
+          </button>
         </span>
       </div>
       <DocEditor
@@ -862,6 +870,9 @@ function DocView({
         </button>
       )}
       {panel === 'history' && <HistoryPanel docId={docId} onClose={() => setPanel('none')} />}
+      {panel === 'tend' && (
+        <TendPanel doc={tree.doc} onClose={() => setPanel('none')} dataVersion={dataVersion} />
+      )}
       {panel === 'comments' && (
         <CommentsPanel
           comments={comments}
