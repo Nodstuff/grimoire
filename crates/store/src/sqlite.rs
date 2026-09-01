@@ -428,6 +428,53 @@ fn inverse_of(kind: &OpKind, prior: Option<&Block>) -> Result<OpKind> {
     }
 }
 
+/// Resolve agent-friendly order_key specs before anything is persisted:
+/// "" = append after the last sibling; "after:<uuid>" = between that block
+/// and its next sibling. Real keys pass through untouched, and the ledger
+/// stores the resolved op.
+fn resolve_order_keys(tx: &Transaction, doc_id: Uuid, kind: &mut OpKind) -> Result<()> {
+    let OpKind::Insert {
+        parent_id,
+        order_key,
+        ..
+    } = kind
+    else {
+        return Ok(());
+    };
+    let spec = order_key.clone();
+    if !spec.is_empty() && !spec.starts_with("after:") {
+        return Ok(());
+    }
+    let siblings: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, order_key FROM blocks
+             WHERE doc_id = ?1 AND deleted = 0
+               AND ((?2 IS NULL AND parent_id IS NULL) OR parent_id = ?2)
+             ORDER BY order_key",
+        )?;
+        let rows = stmt.query_map(
+            params![doc_id.to_string(), parent_id.map(|p| p.to_string())],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let new_key = if let Some(after_id) = spec.strip_prefix("after:") {
+        let after_id = after_id.trim();
+        let idx = siblings
+            .iter()
+            .position(|(id, _)| id == after_id)
+            .ok_or_else(|| {
+                StoreError::InvalidOp(format!("after:{after_id} is not a sibling in this doc"))
+            })?;
+        let next = siblings.get(idx + 1).map(|(_, k)| k.as_str());
+        crate::order_key::between(Some(&siblings[idx].1), next)
+    } else {
+        crate::order_key::between(siblings.last().map(|(_, k)| k.as_str()), None)
+    };
+    *order_key = new_key;
+    Ok(())
+}
+
 /// Fetch a live (non-deleted) block within a doc, for projection checks.
 fn live_block(tx: &Transaction, doc_id: Uuid, id: Uuid, role: &str) -> Result<Block> {
     let raw = tx
@@ -716,6 +763,9 @@ impl BlockStore for SqliteStore {
         let mut op_ids = Vec::with_capacity(ops.len());
         for op in &ops {
             let op_id = Uuid::now_v7();
+            let mut op = op.clone();
+            resolve_order_keys(&tx, doc_id, &mut op.kind)?;
+            let op = &op;
             let prior = match op.kind.target_block() {
                 Some(t) => block_by_id(&tx, doc_id, t)?,
                 None => None,
@@ -1258,6 +1308,7 @@ impl BlockStore for SqliteStore {
         for op in &ops {
             let op_id = Uuid::now_v7();
             let mut op = op.clone();
+            resolve_order_keys(&tx, doc_id, &mut op.kind)?;
             if !note.is_empty() {
                 op.source_refs.push(format!("note:{note}"));
             }
@@ -1537,6 +1588,43 @@ fn parse_annotation_status(s: &str) -> Result<AnnotationStatus> {
 }
 
 impl SqliteStore {
+    /// Outcome feedback for an agent: its recent ops with the annotation
+    /// verdicts — (op, annotation_status, resolver_name). "What happened to
+    /// my proposals, and who decided?"
+    pub fn proposal_outcomes(
+        &self,
+        principal: Uuid,
+        limit: usize,
+    ) -> Result<Vec<(LedgerOp, Option<String>, Option<String>)>> {
+        let sql = format!(
+            "SELECT {}, a.status, p.display_name
+             FROM ops o
+             LEFT JOIN annotations a ON a.op_id = o.id
+             LEFT JOIN principals p ON p.id = a.resolved_by
+             WHERE o.principal = ?1
+             ORDER BY o.id DESC LIMIT ?2",
+            OP_COLS
+                .split(", ")
+                .map(|c| format!("o.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![principal.to_string(), limit as i64], |r| {
+            let raw = row_to_op(r)?;
+            Ok((
+                raw,
+                r.get::<_, Option<String>>(10)?,
+                r.get::<_, Option<String>>(11)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (raw, status, resolver) = r?;
+            Ok((build_op(raw)?, status, resolver))
+        })
+        .collect()
+    }
+
     /// Live progress on a still-running gardener run (status untouched).
     pub fn update_run_progress(&mut self, run: Uuid, summary: &str) -> Result<()> {
         self.conn.execute(
@@ -1768,6 +1856,9 @@ impl SqliteStore {
         let mut applied_any = false;
         for op in &ops {
             let op_id = Uuid::now_v7();
+            let mut op = op.clone();
+            resolve_order_keys(&tx, doc_id, &mut op.kind)?;
+            let op = &op;
             let mut scored = if base_epoch == current {
                 Scored {
                     verdict: Verdict::Green,
