@@ -319,6 +319,25 @@ pub trait BlockStore {
         principal: Uuid,
     ) -> Result<()>;
 
+    // Upstream proposals (#60): grantee bookkeeping + owner status answers.
+
+    fn record_outbound_proposal(
+        &mut self,
+        doc_id: Uuid,
+        share_id: Uuid,
+        owner: Uuid,
+        op_ids: &[Uuid],
+        note: &str,
+    ) -> Result<Uuid>;
+
+    fn list_outbound_proposals(&self, pending_only: bool) -> Result<Vec<OutboundProposal>>;
+
+    fn set_outbound_state(&mut self, id: Uuid, state: &str) -> Result<()>;
+
+    /// Status of specific ledger ops (owner side): applied? still under an
+    /// open annotation? Caller filters by principal before disclosing.
+    fn op_statuses(&self, ids: &[Uuid]) -> Result<Vec<OpStatus>>;
+
     // Grantee-side join queue: redeems that will retry until the owner is up.
 
     /// Queue a join ticket for background retry. Idempotent on ticket text.

@@ -228,3 +228,19 @@ CREATE TABLE IF NOT EXISTS pending_joins (
     last_error TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Grantee-side: proposals shipped upstream through a propose share (#60).
+-- op_ids are OWNER-side op ids (JSON array) — the handle for status checks.
+-- Pessimistic mirror: the local doc never changes until the owner accepts
+-- and the next pull lands it.
+CREATE TABLE IF NOT EXISTS outbound_proposals (
+    id         TEXT PRIMARY KEY,
+    doc_id     TEXT NOT NULL REFERENCES docs (id),
+    share_id   TEXT NOT NULL,
+    owner      TEXT NOT NULL REFERENCES contacts (id),
+    op_ids     TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    state      TEXT NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'accepted', 'declined', 'mixed')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);

@@ -57,6 +57,23 @@ pub enum Request {
         /// (doc_id, synced_epoch) for every mirror doc we hold.
         cursors: Vec<(String, i64)>,
     },
+    /// The write-back (#60). Requires a `propose` share. Ops PARK on the
+    /// owner as unapplied reds — a remote edit is a proposal request, never
+    /// a write; the owner's review queue is where it becomes real. Trust
+    /// tiers (auto-applying yellows for trusted peers) are a later policy
+    /// upgrade, not a protocol change.
+    Propose {
+        share: String,
+        doc: String,
+        ops: Vec<grimoire_store::OpInput>,
+        note: String,
+        /// Retry-safety: the same id returns the original outcome instead of
+        /// parking twice (mirrors the MCP propose contract).
+        #[serde(default)]
+        request_id: Option<String>,
+    },
+    /// Status of previously proposed ops (only your own are disclosed).
+    ProposalStatus { op_ids: Vec<String> },
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -69,13 +86,13 @@ pub struct WireDocMeta {
     pub epoch: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WireDoc {
     pub meta: WireDocMeta,
     pub blocks: Vec<grimoire_store::MirrorBlock>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Redeemed {
@@ -92,6 +109,13 @@ pub enum Response {
         metas: Vec<WireDocMeta>,
         changed: Vec<WireDoc>,
         removed: Vec<String>,
+    },
+    /// Ops parked on the owner; these ids are the status handle.
+    Proposed {
+        op_ids: Vec<String>,
+    },
+    ProposalStatuses {
+        statuses: Vec<grimoire_store::OpStatus>,
     },
     Refused {
         reason: String,
@@ -162,10 +186,15 @@ pub async fn bind(secret: [u8; 32]) -> Result<Endpoint> {
 }
 
 /// Accept loop. Spawned once per daemon; lives until the endpoint closes.
+/// Bounded propose dedupe: request_id → original outcome (retry safety).
+type Dedupe = Arc<Mutex<std::collections::HashMap<String, Response>>>;
+
 pub async fn serve(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>) {
     tracing::info!("federation endpoint listening (node id {})", endpoint.id());
+    let dedupe: Dedupe = Default::default();
     while let Some(incoming) = endpoint.accept().await {
         let store = store.clone();
+        let dedupe = dedupe.clone();
         tokio::spawn(async move {
             let conn = match incoming.accept() {
                 Ok(accepting) => match accepting.await {
@@ -181,7 +210,7 @@ pub async fn serve(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>) {
                 }
             };
             let peer = conn.remote_id().to_string();
-            if let Err(e) = handle_conn(conn, &peer, store).await {
+            if let Err(e) = handle_conn(conn, &peer, store, dedupe).await {
                 tracing::debug!(peer, "federation connection ended: {e:#}");
             }
         });
@@ -192,6 +221,7 @@ async fn handle_conn(
     conn: iroh::endpoint::Connection,
     peer: &str,
     store: Arc<Mutex<SqliteStore>>,
+    dedupe: Dedupe,
 ) -> Result<()> {
     // authed = peer is a non-revoked contact. Checked once per request, not
     // once per connection: a successful redeem upgrades the session, and a
@@ -213,7 +243,7 @@ async fn handle_conn(
                     frame.v, PROTOCOL_VERSION
                 ),
             },
-            Ok(frame) => dispatch(frame.msg, peer, &store),
+            Ok(frame) => dispatch(frame.msg, peer, &store, &dedupe),
         };
         let out = serde_json::to_vec(&Frame {
             v: PROTOCOL_VERSION,
@@ -224,7 +254,7 @@ async fn handle_conn(
     }
 }
 
-fn dispatch(req: Request, peer: &str, store: &Arc<Mutex<SqliteStore>>) -> Response {
+fn dispatch(req: Request, peer: &str, store: &Arc<Mutex<SqliteStore>>, dedupe: &Dedupe) -> Response {
     let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
     let contact = match store.contact_by_pubkey(peer) {
         Ok(c) => c.filter(|c| !c.revoked),
@@ -302,7 +332,109 @@ fn dispatch(req: Request, peer: &str, store: &Arc<Mutex<SqliteStore>>) -> Respon
                 }
             }
         }
+        Request::Propose {
+            share,
+            doc,
+            ops,
+            note,
+            request_id,
+        } => {
+            let Some(contact) = contact else {
+                tracing::warn!(peer, "unauthenticated propose refused");
+                return Response::Refused {
+                    reason: "unknown peer: redeem an invite first".into(),
+                };
+            };
+            // retry safety: the same request_id returns the original outcome
+            let dedupe_key = request_id.map(|r| format!("{peer}:{r}"));
+            if let Some(key) = &dedupe_key {
+                let cache = dedupe.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(prior) = cache.get(key) {
+                    return prior.clone();
+                }
+            }
+            let res = match handle_propose(&mut store, &contact, &share, &doc, ops, &note) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(peer, share, doc, "propose refused: {e}");
+                    Response::Refused {
+                        reason: e.to_string(),
+                    }
+                }
+            };
+            if let (Some(key), Response::Proposed { .. }) = (&dedupe_key, &res) {
+                let mut cache = dedupe.lock().unwrap_or_else(|p| p.into_inner());
+                if cache.len() >= 512 {
+                    cache.clear(); // crude but bounded
+                }
+                cache.insert(key.clone(), res.clone());
+            }
+            res
+        }
+        Request::ProposalStatus { op_ids } => {
+            let Some(contact) = contact else {
+                return Response::Refused {
+                    reason: "unknown peer: redeem an invite first".into(),
+                };
+            };
+            let ids: Vec<uuid::Uuid> = op_ids.iter().filter_map(|s| s.parse().ok()).collect();
+            match store.op_statuses(&ids) {
+                // disclose only the asker's own ops
+                Ok(statuses) => Response::ProposalStatuses {
+                    statuses: statuses
+                        .into_iter()
+                        .filter(|s| s.principal == contact.principal)
+                        .collect(),
+                },
+                Err(e) => Response::Refused {
+                    reason: e.to_string(),
+                },
+            }
+        }
     }
+}
+
+/// Owner side of the write-back (#60): authorize, then PARK. The gate's red
+/// path preserves the payload verbatim; accepting applies at the then-current
+/// epoch; declining never touches the doc. Proposer ≠ approver holds because
+/// the parking principal is the remote contact.
+fn handle_propose(
+    store: &mut grimoire_store::SqliteStore,
+    contact: &grimoire_store::Contact,
+    share_id: &str,
+    doc_id: &str,
+    ops: Vec<grimoire_store::OpInput>,
+    note: &str,
+) -> Result<Response> {
+    let share_uuid: uuid::Uuid = share_id.parse().context("bad share id")?;
+    let doc_uuid: uuid::Uuid = doc_id.parse().context("bad doc id")?;
+    let share = store.get_share(share_uuid)?;
+    if share.contact != Some(contact.id) {
+        anyhow::bail!("share is not bound to this contact");
+    }
+    if share.state != grimoire_store::ShareState::Active {
+        anyhow::bail!("share is {}", share.state.as_str());
+    }
+    if share.permission != grimoire_store::SharePermission::Propose {
+        anyhow::bail!("share is view-only");
+    }
+    if !store.docs_in_share(share_uuid)?.iter().any(|d| d.id == doc_uuid) {
+        anyhow::bail!("doc is not in this share");
+    }
+    if ops.is_empty() {
+        anyhow::bail!("empty proposal");
+    }
+    let note = format!("via share from {}: {note}", contact.petname);
+    let op_ids = store.park(doc_uuid, contact.principal, ops, &note)?;
+    tracing::info!(
+        peer = contact.pubkey,
+        doc = doc_id,
+        ops = op_ids.len(),
+        "remote proposal parked for review"
+    );
+    Ok(Response::Proposed {
+        op_ids: op_ids.into_iter().map(|u| u.to_string()).collect(),
+    })
 }
 
 /// Owner side of the read protocol (#58). The share's recursive containment
@@ -609,6 +741,102 @@ pub async fn pull_share(
     Ok(summary)
 }
 
+/// Ship a local edit of a mirror doc upstream as a proposal (#60). The
+/// pessimistic mirror never changes here — the edit becomes real locally
+/// only when the owner accepts and a pull lands it.
+pub async fn propose_upstream(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    doc_id: uuid::Uuid,
+    ops: Vec<grimoire_store::OpInput>,
+    note: &str,
+) -> Result<uuid::Uuid> {
+    let (mirror, owner) = {
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let mirror = s
+            .get_mirror(doc_id)?
+            .context("doc is not a mirror — edit it directly")?;
+        let owner = s
+            .list_contacts()?
+            .into_iter()
+            .find(|c| c.id == mirror.owner)
+            .context("mirror's owner contact is gone")?;
+        (mirror, owner)
+    };
+    let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
+    let res = request(
+        endpoint,
+        EndpointAddr::from(owner_id),
+        Request::Propose {
+            share: mirror.share_id.to_string(),
+            doc: doc_id.to_string(),
+            ops,
+            note: note.to_string(),
+            request_id: Some(uuid::Uuid::now_v7().to_string()),
+        },
+    )
+    .await?;
+    let Response::Proposed { op_ids } = res else {
+        anyhow::bail!("owner refused proposal: {res:?}");
+    };
+    let ids: Vec<uuid::Uuid> = op_ids.iter().filter_map(|s| s.parse().ok()).collect();
+    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+    Ok(s.record_outbound_proposal(doc_id, mirror.share_id, owner.id, &ids, note)?)
+}
+
+/// Refresh the state of pending outbound proposals from their owners; any
+/// accepted content arrives via the normal pull.
+pub async fn refresh_outbound(endpoint: &Endpoint, store: &Arc<Mutex<SqliteStore>>) {
+    let pending = {
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        s.list_outbound_proposals(true).unwrap_or_default()
+    };
+    for prop in pending {
+        let owner = {
+            let s = store.lock().unwrap_or_else(|p| p.into_inner());
+            s.list_contacts()
+                .ok()
+                .and_then(|cs| cs.into_iter().find(|c| c.id == prop.owner))
+        };
+        let Some(owner) = owner.filter(|o| !o.revoked) else {
+            continue;
+        };
+        let Ok(owner_id) = owner.pubkey.parse::<iroh::EndpointId>() else {
+            continue;
+        };
+        let res = request(
+            endpoint,
+            EndpointAddr::from(owner_id),
+            Request::ProposalStatus {
+                op_ids: prop.op_ids.iter().map(|u| u.to_string()).collect(),
+            },
+        )
+        .await;
+        let Ok(Response::ProposalStatuses { statuses }) = res else {
+            continue; // owner offline or refused: stays pending
+        };
+        // resolved = the annotation is no longer open
+        let resolved: Vec<_> = statuses
+            .iter()
+            .filter(|s| s.review.as_deref() != Some("open"))
+            .collect();
+        if resolved.len() < prop.op_ids.len() {
+            continue; // partially reviewed: wait for the rest
+        }
+        let accepted = resolved.iter().filter(|s| s.applied).count();
+        let state = if accepted == resolved.len() {
+            "accepted"
+        } else if accepted == 0 {
+            "declined"
+        } else {
+            "mixed"
+        };
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        s.set_outbound_state(prop.id, state).ok();
+        tracing::info!(doc = %prop.doc_id, state, "outbound proposal resolved");
+    }
+}
+
 /// Pull every share we hold mirrors for. Groups mirrors by (owner, share),
 /// skips revoked owners, dials by node id (discovery).
 pub async fn pull_all_once(
@@ -645,6 +873,7 @@ pub async fn pull_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>) {
     const PULL_EVERY: std::time::Duration = std::time::Duration::from_secs(120);
     loop {
         tokio::time::sleep(PULL_EVERY).await;
+        refresh_outbound(&endpoint, &store).await;
         for (share, res) in pull_all_once(&endpoint, &store).await {
             match res {
                 Ok(s) if s.changed > 0 || s.removed > 0 => {
@@ -1051,6 +1280,169 @@ mod tests {
             // soft-deleted locally: no longer in the live listing
             assert!(!s.list_docs().unwrap().iter().any(|d| d.id == child.id));
         }
+    }
+
+    #[tokio::test]
+    async fn propose_upstream_parks_then_accept_flows_back_via_pull() {
+        use grimoire_store::{BlockType, OpInput, OpKind, ReviewDecision};
+
+        let mut owner_store = SqliteStore::open_in_memory().unwrap();
+        let tom = owner_store
+            .create_principal(PrincipalKind::Human, "tom", None)
+            .unwrap();
+        let doc = owner_store.create_doc("Notes", None, tom.id).unwrap();
+        let owner_ep = local_endpoint().await;
+        let (share, link) = mint_invite(
+            &mut owner_store,
+            &owner_ep.id().to_string(),
+            doc.id,
+            SharePermission::Propose,
+        )
+        .unwrap();
+        let owner_store = Arc::new(Mutex::new(owner_store));
+        let addr = direct_addr(&owner_ep);
+        tokio::spawn(serve(owner_ep, owner_store.clone()));
+
+        let mut alice_store = SqliteStore::open_in_memory().unwrap();
+        alice_store
+            .create_principal(PrincipalKind::Human, "alice", None)
+            .unwrap();
+        let alice_store = Arc::new(Mutex::new(alice_store));
+        let alice_ep = local_endpoint().await;
+        let ticket = Ticket::parse(&link).unwrap();
+        join_at(&alice_ep, &alice_store, &ticket, addr.clone())
+            .await
+            .unwrap();
+        let owner_contact = {
+            let s = alice_store.lock().unwrap();
+            s.list_contacts().unwrap().into_iter().next().unwrap()
+        };
+        // alice needs a direct addr (no discovery in tests): patch request
+        // path by using propose via wire directly is what propose_upstream
+        // does with discovery; here we test the protocol + bookkeeping by
+        // sending the same messages at the known addr.
+        let ops = vec![OpInput {
+            kind: OpKind::Insert {
+                block_id: uuid::Uuid::now_v7(),
+                parent_id: None,
+                order_key: "i".into(),
+                block_type: BlockType::Paragraph,
+                content: "alice's suggestion".into(),
+                refers_to: None,
+            },
+            source_refs: vec![],
+        }];
+        let res = request(
+            &alice_ep,
+            addr.clone(),
+            Request::Propose {
+                share: share.id.to_string(),
+                doc: doc.id.to_string(),
+                ops: ops.clone(),
+                note: "typo fix".into(),
+                request_id: Some("retry-me".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let Response::Proposed { op_ids } = res else {
+            panic!("expected Proposed, got {res:?}");
+        };
+
+        // retry with the same request_id: same outcome, nothing double-parked
+        let retry = request(
+            &alice_ep,
+            addr.clone(),
+            Request::Propose {
+                share: share.id.to_string(),
+                doc: doc.id.to_string(),
+                ops: ops.clone(),
+                note: "typo fix".into(),
+                request_id: Some("retry-me".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry, Response::Proposed { op_ids: op_ids.clone() });
+        let parked_ids: Vec<uuid::Uuid> = op_ids.iter().map(|s| s.parse().unwrap()).collect();
+        {
+            let s = alice_store.lock().unwrap();
+            let mut s = s;
+            s.record_outbound_proposal(doc.id, share.id, owner_contact.id, &parked_ids, "typo fix")
+                .unwrap();
+        }
+
+        // owner: doc untouched (pessimistic!), one parked red in the queue
+        let annotation_id = {
+            let s = owner_store.lock().unwrap();
+            assert!(s.read_doc(doc.id).unwrap().roots.is_empty());
+            let queue = s.review_queue(Some(doc.id)).unwrap();
+            assert_eq!(queue.len(), 1);
+            // status reads as open for the proposer
+            let statuses = s.op_statuses(&parked_ids).unwrap();
+            assert!(!statuses[0].applied);
+            assert_eq!(statuses[0].review.as_deref(), Some("open"));
+            queue[0].annotation.id
+        };
+
+        // owner accepts → applied at current epoch
+        {
+            let mut s = owner_store.lock().unwrap();
+            s.resolve(annotation_id, tom.id, ReviewDecision::Accept)
+                .unwrap();
+            assert_eq!(
+                s.read_doc(doc.id).unwrap().roots[0].block.content,
+                "alice's suggestion"
+            );
+        }
+
+        // alice: status flips on refresh, content arrives on pull
+        refresh_outbound(&alice_ep, &alice_store).await; // discovery-less: may no-op
+        // discovery isn't available in tests, so check the status by wire:
+        let res = request(
+            &alice_ep,
+            addr.clone(),
+            Request::ProposalStatus {
+                op_ids: op_ids.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let Response::ProposalStatuses { statuses } = res else {
+            panic!("expected statuses");
+        };
+        assert!(statuses[0].applied);
+        assert_eq!(statuses[0].review.as_deref(), Some("accepted"));
+
+        pull_share(&alice_ep, &alice_store, addr.clone(), &owner_contact, share.id)
+            .await
+            .unwrap();
+        {
+            let s = alice_store.lock().unwrap();
+            let tree = s.read_doc(doc.id).unwrap();
+            assert_eq!(tree.roots[0].block.content, "alice's suggestion");
+        }
+
+        // view-only share refuses proposes outright
+        {
+            let mut s = owner_store.lock().unwrap();
+            s.set_share_permission(share.id, SharePermission::View)
+                .unwrap();
+        }
+        let res = request(
+            &alice_ep,
+            addr,
+            Request::Propose {
+                share: share.id.to_string(),
+                doc: doc.id.to_string(),
+                ops,
+                note: String::new(),
+                request_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(res, Response::Refused { .. }));
     }
 
     #[tokio::test]
