@@ -452,6 +452,9 @@ pub async fn pull_share(
             m.epoch
         };
         s.upsert_mirror(id, owner.id, share_id, cursor, share_perm)?;
+        // reflect the owner's tend status so the grantee can show it and
+        // refuse to tend the doc locally (one side's agents own it)
+        s.set_mirror_tended(id, m.tended)?;
     }
     for wd in &changed {
         let Ok(id) = wd.meta.id.parse::<uuid::Uuid>() else {

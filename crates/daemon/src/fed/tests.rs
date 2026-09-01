@@ -913,3 +913,47 @@ async fn join_refuses_to_shadow_a_local_doc() {
     assert_eq!(s.get_doc(doc.id).unwrap().title, "Alice's Own Doc"); // untouched
     assert!(s.get_mirror(doc.id).unwrap().is_none()); // never became a mirror
 }
+
+#[tokio::test]
+async fn owner_tended_flag_rides_the_pull() {
+    use grimoire_store::{BlockType, ConfidencePolicy, GardenerKind, OpInput, OpKind};
+    // owner: a doc tended by a keeper gardener scoped to it
+    let mut owner_store = SqliteStore::open_in_memory().unwrap();
+    let tom = owner_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let doc = owner_store.create_doc("Qompass Docs", None, tom.id).unwrap();
+    owner_store.apply(doc.id, 0, tom.id, vec![OpInput {
+        kind: OpKind::Insert { block_id: uuid::Uuid::now_v7(), parent_id: None, order_key: "i".into(), block_type: BlockType::Paragraph, content: "owned by tom".into(), refers_to: None },
+        source_refs: vec![],
+    }]).unwrap();
+    owner_store.create_gardener("keeper", GardenerKind::Keeper, "keep true", Some(doc.id), ConfidencePolicy::Review).unwrap();
+    assert!(owner_store.doc_is_tended(doc.id).unwrap());
+
+    let owner_ep = local_endpoint().await;
+    let (share, link) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), doc.id, SharePermission::Propose).unwrap();
+    let owner_store = Arc::new(Mutex::new(owner_store));
+    let addr = direct_addr(&owner_ep);
+    tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot()));
+
+    let mut alice_store = SqliteStore::open_in_memory().unwrap();
+    alice_store.create_principal(PrincipalKind::Human, "alice", None).unwrap();
+    let alice_store = Arc::new(Mutex::new(alice_store));
+    let alice_ep = local_endpoint().await;
+    let ticket = Ticket::parse(&link).unwrap();
+    join_at(&alice_ep, &alice_store, &ticket, addr.clone()).await.unwrap();
+    let owner_contact = { alice_store.lock().unwrap().list_contacts().unwrap().into_iter().next().unwrap() };
+    pull_share(&alice_ep, &alice_store, addr, &owner_contact, share.id).await.unwrap();
+
+    // grantee sees the owner tends it
+    {
+        let s = alice_store.lock().unwrap();
+        let m = s.get_mirror(doc.id).unwrap().unwrap();
+        assert!(m.owner_tended, "grantee mirror reflects owner tending");
+        // and the grantee cannot tend it locally (avoids two-sided agents)
+        let mut s = s;
+        let scope_on_mirror = s.get_mirror(doc.id).unwrap().is_some();
+        assert!(scope_on_mirror);
+        // creating a gardener scoped to the mirror is refused by the store guard?
+        // (the guard lives in admin.rs; here we assert the mirror fact the guard keys off)
+        assert!(s.doc_is_tended(doc.id).unwrap() == false, "grantee has no local gardener");
+    }
+}

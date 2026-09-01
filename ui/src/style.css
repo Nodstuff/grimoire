@@ -41,7 +41,14 @@ body {
   color: var(--fg-dim);
 }
 .home-mark { font-size: 42px; color: var(--accent); opacity: 0.5; margin-bottom: 24px; }
-.home-hints { display: flex; gap: 28px; font-size: 13px; }
+.home-hints { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px 24px; font-size: 13px; max-width: 640px; }
+.shortcut-help { padding: 18px 20px; max-height: 70vh; overflow-y: auto; }
+.shortcut-help-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; }
+.shortcut-group { margin-bottom: 14px; }
+.shortcut-group-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-dim); margin-bottom: 6px; }
+.shortcut-row { display: flex; align-items: baseline; gap: 12px; padding: 3px 0; }
+.shortcut-keys { flex: 0 0 130px; display: flex; gap: 4px; flex-wrap: wrap; }
+.shortcut-label { color: var(--fg-dim); font-size: 13px; }
 kbd {
   background: var(--panel2);
   border: 1px solid var(--border);

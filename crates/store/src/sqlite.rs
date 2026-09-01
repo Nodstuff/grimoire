@@ -114,6 +114,17 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
                 [],
             )?;
         }
+        let has_tended: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('mirrors') WHERE name = 'owner_tended'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_tended == 0 {
+            conn.execute(
+                "ALTER TABLE mirrors ADD COLUMN owner_tended INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
     }
     let has_gardeners: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'gardeners'",
@@ -407,7 +418,7 @@ fn finish_share(raw: RawShare) -> Result<Share> {
     })
 }
 
-type RawMirror = (String, String, String, i64, String);
+type RawMirror = (String, String, String, i64, String, bool);
 
 fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
     Ok((
@@ -416,11 +427,12 @@ fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
         row.get(2)?,
         row.get(3)?,
         row.get(4)?,
+        row.get(5)?,
     ))
 }
 
 fn finish_mirror(raw: RawMirror) -> Result<Mirror> {
-    let (doc_id, owner, share_id, synced_epoch, permission) = raw;
+    let (doc_id, owner, share_id, synced_epoch, permission, owner_tended) = raw;
     Ok(Mirror {
         doc_id: uuid_col(doc_id, "mirrors.doc_id")?,
         owner: uuid_col(owner, "mirrors.owner")?,
@@ -428,6 +440,7 @@ fn finish_mirror(raw: RawMirror) -> Result<Mirror> {
         synced_epoch,
         permission: SharePermission::parse(&permission)
             .ok_or_else(|| StoreError::InvalidOp(format!("bad mirror permission: {permission}")))?,
+        owner_tended,
     })
 }
 
@@ -2171,7 +2184,7 @@ impl BlockStore for SqliteStore {
     fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>> {
         self.conn
             .query_row(
-                "SELECT doc_id, owner, share_id, synced_epoch, permission FROM mirrors WHERE doc_id = ?1",
+                "SELECT doc_id, owner, share_id, synced_epoch, permission, owner_tended FROM mirrors WHERE doc_id = ?1",
                 params![doc_id.to_string()],
                 mirror_row,
             )
@@ -2180,9 +2193,40 @@ impl BlockStore for SqliteStore {
             .transpose()
     }
 
+    fn set_mirror_tended(&mut self, doc_id: Uuid, tended: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE mirrors SET owner_tended = ?1 WHERE doc_id = ?2",
+            params![tended, doc_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// True if a gardener tends this doc or any ancestor (recursive
+    /// containment, the same rule the tend panel uses). Disabled gardeners
+    /// don't count.
+    fn doc_is_tended(&self, doc_id: Uuid) -> Result<bool> {
+        let scopes: std::collections::HashSet<Uuid> = self
+            .list_gardeners()?
+            .into_iter()
+            .filter(|g| g.enabled)
+            .filter_map(|g| g.scope_doc)
+            .collect();
+        if scopes.is_empty() {
+            return Ok(false);
+        }
+        let mut cur = Some(doc_id);
+        while let Some(id) = cur {
+            if scopes.contains(&id) {
+                return Ok(true);
+            }
+            cur = self.get_doc(id).ok().and_then(|d| d.parent_id);
+        }
+        Ok(false)
+    }
+
     fn list_mirrors(&self) -> Result<Vec<Mirror>> {
         let mut stmt = self.conn.prepare(
-            "SELECT doc_id, owner, share_id, synced_epoch, permission FROM mirrors ORDER BY doc_id",
+            "SELECT doc_id, owner, share_id, synced_epoch, permission, owner_tended FROM mirrors ORDER BY doc_id",
         )?;
         let rows = stmt.query_map([], mirror_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?

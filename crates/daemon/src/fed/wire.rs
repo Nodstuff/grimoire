@@ -106,6 +106,11 @@ pub struct WireDocMeta {
     pub parent: Option<String>,
     pub title: String,
     pub epoch: i64,
+    /// The owner tends this doc (a gardener over it or an ancestor). The
+    /// grantee shows it and refuses local tending. Default false so pre-field
+    /// peers still deserialize.
+    #[serde(default)]
+    pub tended: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

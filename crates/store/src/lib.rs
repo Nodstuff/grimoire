@@ -338,6 +338,13 @@ pub trait BlockStore {
 
     fn remove_mirror(&mut self, doc_id: Uuid) -> Result<()>;
 
+    /// Record whether the owner tends this mirror doc (from the pull meta).
+    fn set_mirror_tended(&mut self, doc_id: Uuid, tended: bool) -> Result<()>;
+
+    /// True if a gardener tends this doc or an ancestor (recursive, enabled
+    /// only) — the owner-side signal shipped in the pull meta.
+    fn doc_is_tended(&self, doc_id: Uuid) -> Result<bool>;
+
     /// Live blocks of a doc, flat (parent/order fields carry the tree) — the
     /// owner-side snapshot read for the federation wire (#58).
     fn doc_blocks_flat(&self, doc_id: Uuid) -> Result<Vec<Block>>;
