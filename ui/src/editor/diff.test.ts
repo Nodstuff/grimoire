@@ -16,6 +16,41 @@ describe('keyBetween', () => {
     expect(a < b).toBe(true)
     expect(a < c && c < b).toBe(true)
   })
+
+  // Fixed vectors shared with the Rust reference (crates/store/src/order_key.rs
+  // `between`); both sides assert the same table so the two ports cannot drift.
+  it('matches the Rust order_key::between vectors', () => {
+    const vectors: [string | null, string | null, string][] = [
+      [null, null, 'i'], // (0+36)/2 = 18
+      ['i', null, 'r'], // (18+36)/2 = 27
+      [null, 'i', '9'], // (0+18)/2 = 9
+      ['i', 'r', 'm'], // (18+27)/2 = 22
+      ['i', 'j', 'ii'], // adjacent digits: keep 'i', bisect (0, 36) → 'i'
+      ['z', null, 'zi'], // 35 vs open end 36: keep 'z', bisect → 'i'
+    ]
+    for (const [a, b, want] of vectors) {
+      expect(keyBetween(a, b), `keyBetween(${a}, ${b})`).toBe(want)
+    }
+  })
+
+  it('never emits a key ending in 0 and stays strictly inside the bounds', () => {
+    const cases: [string | null, string | null][] = [
+      [null, null],
+      ['i', null],
+      [null, 'i'],
+      ['i', 'r'],
+      ['i', 'j'],
+      ['z', null],
+      ['ii', 'ij'],
+      ['zz', null],
+    ]
+    for (const [a, b] of cases) {
+      const k = keyBetween(a, b)
+      expect(k.endsWith('0')).toBe(false)
+      if (a != null) expect(a < k).toBe(true)
+      if (b != null) expect(k < b).toBe(true)
+    }
+  })
 })
 
 describe('computeOps', () => {

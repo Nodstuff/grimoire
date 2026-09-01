@@ -14,6 +14,20 @@ use uuid::Uuid;
 pub struct ApiState {
     pub store: Arc<Mutex<SqliteStore>>,
     pub human: Uuid,
+    /// The freeze: content writes against a live doc are refused (P2.3).
+    pub hot: crate::hot::HotState,
+}
+
+/// Mirror docs are the owner's: no local rename/delete/status/policy — and
+/// no move except of the share root, which the grantee may file where they
+/// like. Returns the user-facing refusal.
+fn refuse_if_mirror(s: &SqliteStore, id: Uuid, what: &str) -> Option<String> {
+    match s.get_mirror(id) {
+        Ok(Some(_)) => Some(format!(
+            "this doc is shared with you by its owner — {what} is the owner's call"
+        )),
+        _ => None,
+    }
 }
 
 async fn docs(State(st): State<ApiState>) -> Json<Value> {
@@ -191,6 +205,11 @@ async fn resolve(State(st): State<ApiState>, Json(req): Json<ResolveReq>) -> Jso
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(doc) = crate::hot::annotation_doc(&s, req.annotation_id)
+        && let Err(m) = st.hot.assert_cold(doc)
+    {
+        return Json(json!({"error": m}));
+    }
     match s.resolve(req.annotation_id, st.human, decision) {
         Ok(receipt) => Json(json!({"ok": true, "receipt": receipt})),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -217,6 +236,12 @@ async fn resolve_bulk(State(st): State<ApiState>, Json(req): Json<ResolveBulkReq
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (mut done, mut failed) = (0usize, Vec::new());
     for id in req.annotation_ids {
+        if let Some(doc) = crate::hot::annotation_doc(&s, id)
+            && let Err(m) = st.hot.assert_cold(doc)
+        {
+            failed.push(json!({"id": id, "error": m}));
+            continue;
+        }
         match s.resolve(id, st.human, decision) {
             Ok(_) => done += 1,
             Err(e) => failed.push(json!({"id": id, "error": e.to_string()})),
@@ -272,10 +297,8 @@ struct ProposeReq {
 
 /// Human writes: propose as tom — current-epoch ops green and apply directly.
 async fn propose(State(st): State<ApiState>, Json(req): Json<ProposeReq>) -> Json<Value> {
-    if crate::hot::doc_is_hot(req.doc_id) {
-        return Json(json!({
-            "error": "doc is in a live session — edits go through the session"
-        }));
+    if let Err(m) = st.hot.assert_cold(req.doc_id) {
+        return Json(json!({"error": m}));
     }
     let mut s = st
         .store
@@ -478,6 +501,9 @@ async fn set_status(
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(e) = refuse_if_mirror(&s, id, "status") {
+        return Json(json!({"error": e}));
+    }
     match s.set_doc_status(id, status) {
         Ok(()) => Json(json!({"ok": true})),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -623,10 +649,73 @@ async fn move_doc(
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(e) = refuse_move(&s, id, req.parent_id) {
+        return Json(json!({"error": e}));
+    }
     match s.move_doc(id, req.parent_id, req.sort_key.as_deref()) {
         Ok(()) => Json(json!({"ok": true})),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
+}
+
+/// Tree-move rules at the boundary between my docs and mirrors (ADR 0002):
+/// - a mirror may move only if it is a share ROOT (its parent is not part of
+///   the same share) — the grantee files it, the owner shapes the inside;
+/// - nothing lands INSIDE a mirror subtree (that tree is the owner's; a pull
+///   would strand or delete it);
+/// - no doc whose subtree contains a mirror moves INTO one of my shares —
+///   the re-share guard at create time would otherwise be bypassed and the
+///   pull would ship someone else's content onward.
+fn refuse_move(s: &SqliteStore, id: Uuid, new_parent: Option<Uuid>) -> Option<String> {
+    let mirrors: std::collections::HashMap<Uuid, grimoire_store::Mirror> = s
+        .list_mirrors()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| (m.doc_id, m))
+        .collect();
+    if mirrors.is_empty() {
+        return None;
+    }
+    if let Some(m) = mirrors.get(&id) {
+        let parent_in_same_share = s
+            .get_doc(id)
+            .ok()
+            .and_then(|d| d.parent_id)
+            .and_then(|p| mirrors.get(&p))
+            .is_some_and(|pm| pm.share_id == m.share_id);
+        if parent_in_same_share {
+            return Some("this doc sits inside a shared tree — only its owner can move it".into());
+        }
+    }
+    if let Some(p) = new_parent
+        && mirrors.contains_key(&p)
+    {
+        return Some("cannot file a doc inside a tree shared with you — that tree is the owner's".into());
+    }
+    // does the moved subtree contain a mirror, and is the destination inside one of my shares?
+    let subtree_has_mirror = {
+        let mut stack = vec![id];
+        let docs = s.list_docs().unwrap_or_default();
+        let mut found = false;
+        while let Some(d) = stack.pop() {
+            if mirrors.contains_key(&d) {
+                found = true;
+                break;
+            }
+            stack.extend(docs.iter().filter(|c| c.parent_id == Some(d)).map(|c| c.id));
+        }
+        found
+    };
+    if subtree_has_mirror
+        && let Some(p) = new_parent
+        && !s.shares_containing(p).unwrap_or_default().is_empty()
+    {
+        return Some(
+            "cannot move a doc shared TO you into a tree you share — only the owner can share it onward"
+                .into(),
+        );
+    }
+    None
 }
 
 #[derive(Deserialize)]
@@ -663,6 +752,9 @@ async fn rename_doc(
         Ok(d) => d.title,
         Err(e) => return Json(json!({"error": e.to_string()})),
     };
+    if let Some(e) = refuse_if_mirror(&s, id, "renaming") {
+        return Json(json!({"error": e}));
+    }
     if let Err(e) = s.rename_doc(id, &req.title) {
         return Json(json!({"error": e.to_string()}));
     }
@@ -676,8 +768,19 @@ async fn rename_doc(
         for (block, doc, content) in linkers {
             by_doc.entry(doc).or_default().push((block, content));
         }
+        let mut deferred = 0usize;
         for (doc, blocks) in by_doc {
             let Ok(d) = s.get_doc(doc) else { continue };
+            // mirrors are the owner's (their pull will bring the new title);
+            // hot docs are the session's — their links get fixed on the next
+            // rename or by a gardener, never by writing under a live session
+            if s.get_mirror(doc).ok().flatten().is_some() {
+                continue;
+            }
+            if st.hot.is_hot(doc) {
+                deferred += blocks.len();
+                continue;
+            }
             let ops: Vec<OpInput> = blocks
                 .into_iter()
                 .filter_map(|(block, content)| {
@@ -694,6 +797,9 @@ async fn rename_doc(
             rewritten += ops.len();
             let _ = s.propose(doc, d.current_epoch, st.human, ops);
         }
+        if deferred > 0 {
+            return Json(json!({"ok": true, "links_rewritten": rewritten, "links_deferred_hot": deferred}));
+        }
     }
     Json(json!({"ok": true, "links_rewritten": rewritten}))
 }
@@ -707,6 +813,9 @@ async fn delete_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Va
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(e) = refuse_if_mirror(&s, id, "deleting") {
+        return Json(json!({"error": e}));
+    }
     match s.delete_doc(id) {
         Ok(n) => Json(json!({"ok": true, "deleted": n})),
         Err(e) => Json(json!({"error": e.to_string()})),

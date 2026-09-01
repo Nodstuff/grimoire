@@ -34,6 +34,17 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// Blocks the editor never sees. Mirrors the UI's block-list filter
+/// (`ui/src/App.tsx`, the `editable.blocks` walk): comments and canvas scenes are not
+/// content flow, and anything starting with `---` (frontmatter, horizontal
+/// rules) is never seeded into the editor. A markdown diff taken against the
+/// editor's view (`mddiff::markdown_to_ops_editor`) must therefore skip these
+/// or it would delete what the editor merely could not show.
+pub fn is_editor_hidden(b: &Block) -> bool {
+    matches!(b.block_type, BlockType::Comment | BlockType::CanvasScene)
+        || b.content.starts_with("---")
+}
+
 /// Policy when a doc and all its ancestors leave review_policy null.
 /// Human-review until the reviewer agent (4.8) exists; flip to AgentReview then.
 pub const DEFAULT_REVIEW_POLICY: ReviewPolicy = ReviewPolicy::HumanReview;
@@ -226,8 +237,10 @@ pub trait BlockStore {
 
     // --- federation (ADR 0002): contacts, shares, invites, mirrors ---
 
-    /// Pair a peer: creates (or revives) the contact and its remote principal.
-    /// Idempotent on pubkey — re-pairing an existing key updates the petname.
+    /// Pair a peer: creates the contact and its remote principal. Idempotent
+    /// on pubkey — an existing contact is returned as-is: its petname (the
+    /// owner's chosen name; see rename_contact) and revoked flag (see
+    /// unrevoke_contact) are never touched by a re-pair.
     fn pair_contact(&mut self, pubkey: &str, petname: &str) -> Result<Contact>;
 
     fn list_contacts(&self) -> Result<Vec<Contact>>;
@@ -239,6 +252,11 @@ pub trait BlockStore {
     /// Revoke a contact: marks it revoked and revokes every share bound to it.
     /// The row (and its principal) survive — provenance outlives trust.
     fn revoke_contact(&mut self, id: Uuid) -> Result<()>;
+
+    /// Lift a revocation: the contact may redeem invites again. Shares
+    /// revoked alongside it stay revoked — re-inviting is a separate,
+    /// deliberate act. Human surface only; never MCP, never the remote side.
+    fn unrevoke_contact(&mut self, id: Uuid) -> Result<()>;
 
     /// Create a share of `root_doc`'s subtree. `contact: None` = awaiting an
     /// invite redeem to bind one.
@@ -263,7 +281,12 @@ pub trait BlockStore {
 
     /// Record a minted invite. Only the secret's hash is stored; the secret
     /// itself lives in the `grimoire://` link and is never persisted.
-    fn create_invite(&mut self, share_id: Uuid, secret_hash: &str, expires_at: &str) -> Result<Uuid>;
+    fn create_invite(
+        &mut self,
+        share_id: Uuid,
+        secret_hash: &str,
+        expires_at: &str,
+    ) -> Result<Uuid>;
 
     /// Burn-on-redeem: matches an unexpired, unredeemed invite by secret hash,
     /// pairs the presenting pubkey as a contact, binds it to the share, and

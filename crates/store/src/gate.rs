@@ -10,6 +10,15 @@
 //! - target gone → red; the op's payload preserves the text verbatim
 //! - deletes biased aggressively to red: a wrong insert annoys, a wrong
 //!   delete destroys (PROJECT.md §2)
+//!
+//! Every yellow the gate itself produces is a position-only conflict against
+//! an exact block id (insert under an edited parent; move of an edited
+//! target; move into an edited parent) — no content is overwritten, so they
+//! score at [`HIGH_CONFIDENCE`]: under the `auto` review policy they
+//! self-apply without an annotation, under `human`/`agent` review they apply
+//! flagged. Review-capped yellows from `propose_reviewed` keep their green
+//! confidence but are always flagged, even under `auto` — a gardener that
+//! asked for review gets it. Reds park regardless of policy.
 
 use crate::types::{Block, OpKind, Verdict};
 use uuid::Uuid;
@@ -79,7 +88,7 @@ pub fn score_stale_op(
             Some(p) => match target_state(lookup, *p, base_epoch) {
                 TargetState::Unchanged => green(0.9, "parent anchor unchanged since base"),
                 TargetState::Changed(b) => yellow(
-                    0.6,
+                    HIGH_CONFIDENCE,
                     format!(
                         "parent anchor edited at epoch {} since base {base_epoch}",
                         b.epoch
@@ -124,14 +133,14 @@ pub fn score_stale_op(
                 (TargetState::Gone, _) => red(0.1, format!("move target {target} is gone")),
                 (_, Some(TargetState::Gone)) => red(0.15, "move destination parent is gone".into()),
                 (TargetState::Changed(b), _) => yellow(
-                    0.6,
+                    HIGH_CONFIDENCE,
                     format!(
                         "position-only conflict: target edited at epoch {} since base {base_epoch}",
                         b.epoch
                     ),
                 ),
                 (_, Some(TargetState::Changed(b))) => yellow(
-                    0.55,
+                    HIGH_CONFIDENCE,
                     format!(
                         "destination parent edited at epoch {} since base {base_epoch}",
                         b.epoch
@@ -208,7 +217,10 @@ mod tests {
         };
         let s = score_stale_op(&op, 5, &mut |id| (id == t).then(|| block(t, 7, false)));
         assert_eq!(s.verdict, Verdict::Yellow);
-        assert!(s.confidence < HIGH_CONFIDENCE);
+        assert!(
+            s.confidence >= HIGH_CONFIDENCE,
+            "position-only conflicts self-apply under auto"
+        );
     }
 
     #[test]

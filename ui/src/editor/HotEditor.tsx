@@ -14,6 +14,7 @@ import { WebsocketProvider } from 'y-websocket'
 import { prosemirrorJSONToYDoc } from 'y-prosemirror'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block, Principal } from '../types'
+import { notify } from '../Notice'
 import { extensions, parser, schema } from './DocEditor'
 
 const CARET_COLORS = ['#8b9dc3', '#95c99b', '#d9b47a', '#d98a94', '#a88bd4', '#7bc4c4']
@@ -147,7 +148,12 @@ export default function HotEditor({
     try {
       await api(`/api/doc/${doc.docId}/hot/end`, { method: 'POST' })
     } catch (e) {
-      alert(String(e))
+      // the daemon session is still open: stay live so the button can be
+      // retried instead of exiting the UI while the doc is still hot
+      notify(String(e))
+      endedRef.current = false
+      setEnding(false)
+      return
     }
     onEnded()
   }

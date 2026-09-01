@@ -452,11 +452,12 @@ fn review_policy_inherits_from_parent_and_defaults_human() {
 }
 
 #[test]
-fn auto_policy_still_flags_low_confidence_yellows_and_parks_reds() {
+fn auto_policy_self_applies_position_yellows_flags_reviewed_and_parks_reds() {
     let mut f = fixture();
     f.s.set_review_policy(f.doc.id, Some(ReviewPolicy::Auto))
         .unwrap();
-    // low-confidence yellow: move-on-changed (0.6 < HIGH_CONFIDENCE)
+    // position-only yellow: move-on-changed target. Exact id, no content
+    // overwritten → HIGH_CONFIDENCE → applies WITHOUT an annotation under auto.
     let other = Uuid::now_v7();
     f.s.apply(
         f.doc.id,
@@ -477,32 +478,52 @@ fn auto_policy_still_flags_low_confidence_yellows_and_parks_reds() {
     .unwrap();
     f.s.apply(f.doc.id, 2, f.tom.id, vec![replace(other, "movable v2")])
         .unwrap();
-    f.s.propose(
-        f.doc.id,
-        2,
-        f.agent.id,
-        vec![OpInput {
-            kind: OpKind::Move {
-                target: other,
-                new_parent: Some(f.para),
-                new_order_key: "i".into(),
-            },
-            source_refs: vec![],
-        }],
-    )
-    .unwrap();
-    assert_eq!(
-        f.s.review_queue(None).unwrap().len(),
-        1,
-        "low-confidence yellow flagged even under auto"
-    );
-    // red still parks under auto
-    f.s.apply(f.doc.id, 4, f.tom.id, vec![replace(f.para, "tom again")])
+    let out =
+        f.s.propose(
+            f.doc.id,
+            2,
+            f.agent.id,
+            vec![OpInput {
+                kind: OpKind::Move {
+                    target: other,
+                    new_parent: Some(f.para),
+                    new_order_key: "i".into(),
+                },
+                source_refs: vec![],
+            }],
+        )
         .unwrap();
-    f.s.propose(f.doc.id, 4, f.tom.id, vec![]).err(); // no-op guard
+    assert_eq!(out.verdicts[0].verdict, Verdict::Yellow);
+    assert!(out.verdicts[0].confidence >= gate::HIGH_CONFIDENCE);
+    assert!(out.verdicts[0].applied);
+    assert_eq!(f.s.read_block(other).unwrap().parent_id, Some(f.para));
+    assert!(
+        f.s.review_queue(None).unwrap().is_empty(),
+        "position-only yellow self-applies under auto: no annotation"
+    );
+
+    // review-capped yellow (propose_reviewed) keeps its flag even under auto
+    let out =
+        f.s.propose_reviewed(f.doc.id, 4, f.agent.id, vec![replace(other, "tagged")])
+            .unwrap();
+    assert_eq!(out.verdicts[0].verdict, Verdict::Yellow);
+    assert!(out.verdicts[0].applied);
+    assert_eq!(
+        f.s.review_queue(None)
+            .unwrap()
+            .iter()
+            .filter(|i| i.annotation.kind == AnnotationKind::Review)
+            .count(),
+        1,
+        "review requested by the proposer is honoured regardless of policy"
+    );
+
+    // red still parks under auto
+    f.s.apply(f.doc.id, 5, f.tom.id, vec![replace(f.para, "tom again")])
+        .unwrap();
     f.s.propose(
         f.doc.id,
-        3,
+        4,
         f.agent.id,
         vec![replace(f.para, "stale agent")],
     )
@@ -516,4 +537,143 @@ fn auto_policy_still_flags_low_confidence_yellows_and_parks_reds() {
         1,
         "reds always park regardless of policy"
     );
+}
+
+#[test]
+fn declining_a_reviewed_delete_resurrects_the_block_in_place() {
+    let mut f = fixture();
+    let before = f.s.read_block(f.para).unwrap();
+    // a review-policy gardener deletes: green capped to yellow, applied
+    let out =
+        f.s.propose_reviewed(
+            f.doc.id,
+            1,
+            f.agent.id,
+            vec![OpInput {
+                kind: OpKind::Delete { target: f.para },
+                source_refs: vec![],
+            }],
+        )
+        .unwrap();
+    assert_eq!(out.verdicts[0].verdict, Verdict::Yellow);
+    assert!(out.verdicts[0].applied);
+    assert_eq!(out.epoch, 2);
+    assert!(f.s.read_block(f.para).unwrap().deleted);
+
+    let ann = f.s.review_queue(None).unwrap()[0].annotation.id;
+    let receipt =
+        f.s.resolve(ann, f.tom.id, ReviewDecision::Decline)
+            .unwrap()
+            .expect("decline of an applied yellow yields a revert receipt");
+    assert_eq!(receipt.epoch, 3, "epoch bumped exactly once by the revert");
+
+    let after = f.s.read_block(f.para).unwrap();
+    assert!(!after.deleted, "block is live again");
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.content, before.content);
+    assert_eq!(after.parent_id, before.parent_id);
+    assert_eq!(after.order_key, before.order_key);
+    assert_eq!(after.block_type, before.block_type);
+    assert_eq!(f.s.get_doc(f.doc.id).unwrap().current_epoch, 3);
+    assert!(f.s.review_queue(None).unwrap().is_empty());
+    // the doc tree shows it in its original position
+    let tree = f.s.read_doc(f.doc.id).unwrap();
+    assert_eq!(tree.roots.len(), 1);
+    assert_eq!(tree.roots[0].block.id, f.para);
+}
+
+#[test]
+fn insert_over_a_live_id_still_fails() {
+    let mut f = fixture();
+    let out =
+        f.s.propose(
+            f.doc.id,
+            1,
+            f.agent.id,
+            vec![OpInput {
+                kind: OpKind::Insert {
+                    block_id: f.para,
+                    parent_id: None,
+                    order_key: "j".into(),
+                    block_type: BlockType::Paragraph,
+                    content: "dup".into(),
+                    refers_to: None,
+                },
+                source_refs: vec![],
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        out.verdicts[0].verdict,
+        Verdict::Red,
+        "projection failure parks red"
+    );
+    assert!(!out.verdicts[0].applied);
+    assert_eq!(f.s.read_block(f.para).unwrap().content, "original");
+}
+
+#[test]
+fn replace_retypes_content_blocks_but_not_comments() {
+    let mut f = fixture();
+    // paragraph → heading
+    f.s.propose(f.doc.id, 1, f.agent.id, vec![replace(f.para, "## Heading")])
+        .unwrap();
+    assert_eq!(
+        f.s.read_block(f.para).unwrap().block_type,
+        BlockType::Heading
+    );
+    // heading → mermaid → bullet list (paragraph)
+    f.s.propose(
+        f.doc.id,
+        2,
+        f.agent.id,
+        vec![replace(
+            f.para,
+            "```mermaid
+graph TD
+```",
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        f.s.read_block(f.para).unwrap().block_type,
+        BlockType::DiagramMermaid
+    );
+    f.s.propose(
+        f.doc.id,
+        3,
+        f.agent.id,
+        vec![replace(
+            f.para, "- a
+- b",
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        f.s.read_block(f.para).unwrap().block_type,
+        BlockType::Paragraph
+    );
+    // decision
+    f.s.propose(
+        f.doc.id,
+        4,
+        f.agent.id,
+        vec![replace(f.para, "DECISION: go")],
+    )
+    .unwrap();
+    assert_eq!(
+        f.s.read_block(f.para).unwrap().block_type,
+        BlockType::Decision
+    );
+    // comments keep their type whatever the content
+    let c = f.s.add_comment(f.para, f.tom.id, "note", None).unwrap();
+    let epoch = f.s.get_doc(f.doc.id).unwrap().current_epoch;
+    f.s.propose(
+        f.doc.id,
+        epoch,
+        f.agent.id,
+        vec![replace(c.id, "## still a comment")],
+    )
+    .unwrap();
+    assert_eq!(f.s.read_block(c.id).unwrap().block_type, BlockType::Comment);
 }

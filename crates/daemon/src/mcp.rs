@@ -3,7 +3,7 @@
 //! All writes act as the `claude` agent principal and go through the propose
 //! gate — the MCP surface has no direct-write path by design.
 
-use grimoire_store::{BlockNode, BlockStore, OpInput, ReviewDecision, SqliteStore, StoreError};
+use grimoire_store::{BlockNode, BlockStore, OpInput, ReviewDecision, SqliteStore};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
@@ -17,33 +17,36 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-/// Idempotency cache: request_id → serialized outcome. Bounded, in-memory;
-/// a retried propose with the same request_id returns the stored outcome
-/// instead of double-applying.
-pub type DedupeCache = Arc<Mutex<std::collections::HashMap<Uuid, serde_json::Value>>>;
+/// Idempotency cache: (principal, request_id) → serialized outcome. Bounded,
+/// in-memory; a retried propose with the same request_id returns the stored
+/// outcome instead of double-applying. Keyed by principal so one session's
+/// request_id can never replay another session's outcome.
+pub type DedupeCache = Arc<Mutex<std::collections::HashMap<(Uuid, Uuid), serde_json::Value>>>;
 
-pub fn dedupe_get(cache: &DedupeCache, id: Uuid) -> Option<serde_json::Value> {
+pub fn dedupe_get(cache: &DedupeCache, principal: Uuid, id: Uuid) -> Option<serde_json::Value> {
     cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&id)
+        .get(&(principal, id))
         .cloned()
 }
 
-pub fn dedupe_put(cache: &DedupeCache, id: Uuid, v: serde_json::Value) {
+pub fn dedupe_put(cache: &DedupeCache, principal: Uuid, id: Uuid, v: serde_json::Value) {
     let mut c = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if c.len() >= 512 {
         c.clear(); // crude LRU: dedupe only needs to survive the retry window
     }
-    c.insert(id, v);
+    c.insert((principal, id), v);
 }
 
 #[derive(Clone)]
 pub struct KsMcp {
     store: Arc<Mutex<SqliteStore>>,
     dedupe: DedupeCache,
+    /// The freeze: content writes against a live doc are refused (P2.3).
+    hot: crate::hot::HotState,
     /// Default principal for un-identified sessions.
     agent: Uuid,
     /// Per-session identity set via the `identify` tool — distinct provenance
@@ -233,10 +236,16 @@ fn flatten(nodes: &[BlockNode], depth: usize, full: bool, out: &mut Vec<FlatBloc
 
 #[tool_router]
 impl KsMcp {
-    pub fn new(store: Arc<Mutex<SqliteStore>>, agent: Uuid, dedupe: DedupeCache) -> Self {
+    pub fn new(
+        store: Arc<Mutex<SqliteStore>>,
+        agent: Uuid,
+        dedupe: DedupeCache,
+        hot: crate::hot::HotState,
+    ) -> Self {
         Self {
             store,
             dedupe,
+            hot,
             agent,
             identity: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
@@ -429,35 +438,35 @@ impl KsMcp {
             Some(Err(m)) => return err(m),
             None => None,
         };
+        let principal = self.principal();
         if let Some(rid) = request_id
-            && let Some(prev) = dedupe_get(&self.dedupe, rid)
+            && let Some(prev) = dedupe_get(&self.dedupe, principal, rid)
         {
             return ok_json(&prev);
+        }
+        if let Err(m) = self.hot.assert_cold(doc_id) {
+            return err(m);
         }
         let mut store = self
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if crate::hot::doc_is_hot(doc_id) {
-            return err("doc is in a live session — retry after it ends (P2.3)".to_string());
-        }
-        match store.propose(doc_id, p.base_epoch, self.principal(), ops) {
+        // block ops against a stale base are SCORED per op (the gate's whole
+        // point: unchanged targets still green, conflicts yellow/red) — a
+        // stale base is not an error here; see propose_markdown for the
+        // whole-doc path, where it is.
+        match store.propose(doc_id, p.base_epoch, principal, ops) {
             Ok(out) => {
                 if let Some(rid) = request_id {
                     dedupe_put(
                         &self.dedupe,
+                        principal,
                         rid,
                         serde_json::to_value(&out).unwrap_or_default(),
                     );
                 }
                 ok_json(&out)
             }
-            Err(StoreError::StaleBase { base, current }) => ok_json(&json!({
-                "error": "stale_base",
-                "base_epoch": base,
-                "current_epoch": current,
-                "recover": "call diff_since with your base_epoch, re-read touched blocks, re-propose at the current epoch",
-            })),
             Err(e) => err(e.to_string()),
         }
     }
@@ -478,10 +487,14 @@ impl KsMcp {
             Some(Err(m)) => return err(m),
             None => None,
         };
+        let principal = self.principal();
         if let Some(rid) = request_id
-            && let Some(prev) = dedupe_get(&self.dedupe, rid)
+            && let Some(prev) = dedupe_get(&self.dedupe, principal, rid)
         {
             return ok_json(&prev);
+        }
+        if let Err(m) = self.hot.assert_cold(doc_id) {
+            return err(m);
         }
         let mut store = self
             .store
@@ -491,32 +504,40 @@ impl KsMcp {
             Ok(t) => t,
             Err(e) => return err(e.to_string()),
         };
+        // Whole-doc semantics: the markdown was written against base_epoch,
+        // but the diff can only be taken against the CURRENT blocks. If the
+        // doc moved on, that diff would silently re-apply the agent's stale
+        // view over others' edits (scored red, parked, invisible to the
+        // caller). So a stale base is an error here, with the missed ops
+        // attached — re-read, re-apply, re-send.
+        if p.base_epoch != tree.doc.current_epoch {
+            let missed = store.ops_since(doc_id, p.base_epoch).unwrap_or_default();
+            return ok_json(&json!({
+                "error": "stale_base",
+                "base_epoch": p.base_epoch,
+                "current_epoch": tree.doc.current_epoch,
+                "missed_ops": missed,
+                "recover": "re-read the doc (mode full), re-apply your edit to the fresh markdown, re-send with the current epoch",
+            }));
+        }
         let ops = grimoire_store::mddiff::markdown_to_ops(&tree.roots, &p.markdown);
         if ops.is_empty() {
             return ok_json(
                 &json!({"doc_id": doc_id, "epoch": tree.doc.current_epoch, "verdicts": [], "note": "no changes"}),
             );
         }
-        if crate::hot::doc_is_hot(doc_id) {
-            return err("doc is in a live session — retry after it ends (P2.3)".to_string());
-        }
-        match store.propose(doc_id, p.base_epoch, self.principal(), ops) {
+        match store.propose(doc_id, p.base_epoch, principal, ops) {
             Ok(out) => {
                 if let Some(rid) = request_id {
                     dedupe_put(
                         &self.dedupe,
+                        principal,
                         rid,
                         serde_json::to_value(&out).unwrap_or_default(),
                     );
                 }
                 ok_json(&out)
             }
-            Err(StoreError::StaleBase { base, current }) => ok_json(&json!({
-                "error": "stale_base",
-                "base_epoch": base,
-                "current_epoch": current,
-                "recover": "re-read the doc, re-apply your edit to the fresh markdown, re-send",
-            })),
             Err(e) => err(e.to_string()),
         }
     }
@@ -605,6 +626,11 @@ impl KsMcp {
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(doc) = crate::hot::annotation_doc(&store, id)
+            && let Err(m) = self.hot.assert_cold(doc)
+        {
+            return err(m);
+        }
         match store.resolve(id, self.principal(), decision) {
             Ok(receipt) => ok_json(&json!({ "resolved": true, "receipt": receipt })),
             Err(e) => err(e.to_string()),
@@ -718,10 +744,14 @@ impl ServerHandler for KsMcp {
     }
 }
 
-pub fn router(store: Arc<Mutex<SqliteStore>>, agent: Uuid) -> axum::Router {
+pub fn router(
+    store: Arc<Mutex<SqliteStore>>,
+    agent: Uuid,
+    hot: crate::hot::HotState,
+) -> axum::Router {
     let dedupe: DedupeCache = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let service = StreamableHttpService::new(
-        move || Ok(KsMcp::new(store.clone(), agent, dedupe.clone())),
+        move || Ok(KsMcp::new(store.clone(), agent, dedupe.clone(), hot.clone())),
         LocalSessionManager::default().into(),
         Default::default(),
     );

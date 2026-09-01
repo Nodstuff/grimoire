@@ -18,15 +18,61 @@ pub struct ImportReport {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct Segment {
-    pub(crate) block_type: BlockType,
+pub struct Segment {
+    pub block_type: BlockType,
     /// Heading level for headings, 0 otherwise.
-    pub(crate) level: u8,
-    pub(crate) content: String,
+    pub level: u8,
+    pub content: String,
+}
+
+/// True when `content` is a frontmatter block: a `---` first line closed by
+/// a later `---` line. A lone `---` (horizontal rule) is not frontmatter.
+pub fn is_frontmatter(content: &str) -> bool {
+    let mut lines = content.lines();
+    lines.next() == Some("---") && lines.any(|l| l == "---")
+}
+
+/// Heading level (1..=6) if `content` is an ATX heading (`#`{1,6} + space).
+pub fn heading_level(content: &str) -> Option<u8> {
+    let first = content.lines().next().unwrap_or("");
+    let level = first.chars().take_while(|c| *c == '#').count();
+    ((1..=6).contains(&level) && first[level..].starts_with(' ')).then_some(level as u8)
+}
+
+/// The single source of truth for typing a content block from its markdown.
+/// `segment` and the store's Replace projection both use it, so a block's
+/// type can never drift from what its content says it is.
+///
+/// - frontmatter (`---` first line, later closing `---`) → Code
+/// - fenced ```` ```mermaid ```` → DiagramMermaid, ```` ```d2 ```` → DiagramD2,
+///   any other ``` / ~~~ fence → Code
+/// - `#`{1..6} + space → Heading
+/// - starts with `DECISION:` → Decision
+/// - else Paragraph
+pub fn infer_block_type(content: &str) -> BlockType {
+    if is_frontmatter(content) {
+        return BlockType::Code;
+    }
+    let first = content.lines().next().unwrap_or("").trim_start();
+    if let Some(fence) = ["```", "~~~"].iter().find(|f| first.starts_with(**f)) {
+        let lang = first.trim_start_matches(*fence).trim().to_lowercase();
+        return match lang.as_str() {
+            "mermaid" => BlockType::DiagramMermaid,
+            "d2" => BlockType::DiagramD2,
+            _ => BlockType::Code,
+        };
+    }
+    if heading_level(content).is_some() {
+        return BlockType::Heading;
+    }
+    if content.starts_with("DECISION:") {
+        return BlockType::Decision;
+    }
+    BlockType::Paragraph
 }
 
 /// Split raw markdown into flat segments (headings carry their level).
-pub(crate) fn segment(md: &str) -> Vec<Segment> {
+pub fn segment(md: &str) -> Vec<Segment> {
     let lines: Vec<&str> = md.lines().collect();
     let mut segs = Vec::new();
     let mut i = 0;
@@ -35,10 +81,11 @@ pub(crate) fn segment(md: &str) -> Vec<Segment> {
     if lines.first() == Some(&"---")
         && let Some(end) = lines.iter().skip(1).position(|l| *l == "---")
     {
+        let content = lines[..=end + 1].join("\n");
         segs.push(Segment {
-            block_type: BlockType::Code,
+            block_type: infer_block_type(&content),
             level: 0,
-            content: lines[..=end + 1].join("\n"),
+            content,
         });
         i = end + 2;
     }
@@ -54,7 +101,6 @@ pub(crate) fn segment(md: &str) -> Vec<Segment> {
 
         // fenced block
         if let Some(fence) = ["```", "~~~"].iter().find(|f| trimmed.starts_with(**f)) {
-            let lang = trimmed.trim_start_matches(*fence).trim().to_lowercase();
             let start = i;
             i += 1;
             while i < lines.len() && !lines[i].trim_start().starts_with(*fence) {
@@ -62,31 +108,24 @@ pub(crate) fn segment(md: &str) -> Vec<Segment> {
             }
             let end = i.min(lines.len() - 1);
             i = (i + 1).min(lines.len());
-            let block_type = match lang.as_str() {
-                "mermaid" => BlockType::DiagramMermaid,
-                "d2" => BlockType::DiagramD2,
-                _ => BlockType::Code,
-            };
+            let content = lines[start..=end].join("\n");
             segs.push(Segment {
-                block_type,
+                block_type: infer_block_type(&content),
                 level: 0,
-                content: lines[start..=end].join("\n"),
+                content,
             });
             continue;
         }
 
         // heading
-        if line.starts_with('#') {
-            let level = line.chars().take_while(|c| *c == '#').count();
-            if (1..=6).contains(&level) && line[level..].starts_with(' ') {
-                segs.push(Segment {
-                    block_type: BlockType::Heading,
-                    level: level as u8,
-                    content: line.to_string(),
-                });
-                i += 1;
-                continue;
-            }
+        if let Some(level) = heading_level(line) {
+            segs.push(Segment {
+                block_type: BlockType::Heading,
+                level,
+                content: line.to_string(),
+            });
+            i += 1;
+            continue;
         }
 
         // paragraph: run until blank line, fence, or heading
@@ -105,11 +144,7 @@ pub(crate) fn segment(md: &str) -> Vec<Segment> {
         let content = lines[start..i].join("\n");
         segs.push(Segment {
             // decision blocks (5.6): a paragraph declaring itself a decision
-            block_type: if content.starts_with("DECISION:") {
-                BlockType::Decision
-            } else {
-                BlockType::Paragraph
-            },
+            block_type: infer_block_type(&content),
             level: 0,
             content,
         });
@@ -118,7 +153,9 @@ pub(crate) fn segment(md: &str) -> Vec<Segment> {
 }
 
 /// Segments → insert ops with heading-level nesting and fractional order keys.
-fn to_ops(segs: Vec<Segment>) -> Vec<OpInput> {
+/// Public so the daemon's scribe can route new-doc content through the gate
+/// (`propose`) instead of `apply`.
+pub fn to_ops(segs: Vec<Segment>) -> Vec<OpInput> {
     // stack of (heading level, block id) — parents for what follows
     let mut stack: Vec<(u8, Uuid)> = Vec::new();
     let mut last_key: HashMap<Option<Uuid>, String> = HashMap::new();
@@ -273,6 +310,43 @@ mod tests {
         assert_eq!(parents[3], Some(ids[2])); // para b under B
         assert_eq!(parents[4], None); // C at root
         assert_eq!(parents[5], Some(ids[4])); // para c under C
+    }
+
+    #[test]
+    fn infer_block_type_matrix() {
+        let cases = [
+            ("---\ntags:\n  - x\n---", BlockType::Code),
+            ("---", BlockType::Paragraph), // horizontal rule, not frontmatter
+            ("```mermaid\ngraph TD\n```", BlockType::DiagramMermaid),
+            ("```MERMAID\ngraph TD\n```", BlockType::DiagramMermaid),
+            ("```d2\na -> b\n```", BlockType::DiagramD2),
+            ("```rust\nfn x() {}\n```", BlockType::Code),
+            ("```\nplain\n```", BlockType::Code),
+            ("~~~\ntilde\n~~~", BlockType::Code),
+            ("# Title", BlockType::Heading),
+            ("###### Six", BlockType::Heading),
+            ("####### Seven", BlockType::Paragraph),
+            ("#hashtag", BlockType::Paragraph),
+            ("DECISION: ship it", BlockType::Decision),
+            ("plain para\nsecond line", BlockType::Paragraph),
+            ("", BlockType::Paragraph),
+        ];
+        for (content, want) in cases {
+            assert_eq!(infer_block_type(content), want, "content {content:?}");
+        }
+    }
+
+    #[test]
+    fn segment_types_agree_with_infer_block_type() {
+        let md = "---\ntags:\n  - daily\n---\n\n# Title\n\nDECISION: yes\n\n```d2\na\n```\n\n~~~\nx\n~~~\n\ntail";
+        for seg in segment(md) {
+            assert_eq!(
+                seg.block_type,
+                infer_block_type(&seg.content),
+                "{:?}",
+                seg.content
+            );
+        }
     }
 
     #[test]

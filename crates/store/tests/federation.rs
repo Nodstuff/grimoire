@@ -24,12 +24,77 @@ fn pair_contact_is_idempotent_on_pubkey_and_creates_remote_principal() {
     assert_eq!(principal.kind, PrincipalKind::Remote);
     assert_eq!(principal.pubkey.as_deref(), Some(ALICE_KEY));
 
-    // re-pair: same contact and principal, petname updated
+    // re-pair: same contact and principal; the owner's petname wins — a
+    // peer's self-description never overwrites it
     let again = s.pair_contact(ALICE_KEY, "alice-work").unwrap();
     assert_eq!(again.id, alice.id);
     assert_eq!(again.principal, alice.principal);
-    assert_eq!(again.petname, "alice-work");
+    assert_eq!(again.petname, "alice");
+    assert_eq!(
+        s.contact_by_pubkey(ALICE_KEY).unwrap().unwrap().petname,
+        "alice"
+    );
     assert_eq!(s.list_contacts().unwrap().len(), 1);
+    // rename_contact is the way to change it
+    s.rename_contact(alice.id, "alice-work").unwrap();
+    assert_eq!(
+        s.pair_contact(ALICE_KEY, "whatever").unwrap().petname,
+        "alice-work"
+    );
+}
+
+#[test]
+fn revoked_contact_cannot_redeem_until_unrevoked() {
+    let (mut s, tom) = store_with_tom();
+    let doc = s.create_doc("runbook", None, tom.id).unwrap();
+    let share = s
+        .create_share(doc.id, None, SharePermission::View, None)
+        .unwrap();
+    s.create_invite(share.id, "h1", "2099-01-01T00:00:00.000Z")
+        .unwrap();
+    let (alice, _) = s.redeem_invite("h1", ALICE_KEY, "alice").unwrap();
+    s.revoke_contact(alice.id).unwrap();
+
+    // owner mints a fresh invite; the revoked peer tries to redeem it
+    let share2 = s
+        .create_share(doc.id, None, SharePermission::Propose, None)
+        .unwrap();
+    s.create_invite(share2.id, "h2", "2099-01-01T00:00:00.000Z")
+        .unwrap();
+    let err = s.redeem_invite("h2", ALICE_KEY, "alice-again");
+    match err {
+        Err(StoreError::InvalidOp(msg)) => assert!(msg.contains("revoked"), "{msg}"),
+        other => panic!("expected InvalidOp, got {other:?}"),
+    }
+    // nothing changed: still revoked, petname intact, share still offered
+    let alice = s.contact_by_pubkey(ALICE_KEY).unwrap().unwrap();
+    assert!(alice.revoked);
+    assert_eq!(alice.petname, "alice");
+    let share2_now = s.get_share(share2.id).unwrap();
+    assert_eq!(share2_now.state, ShareState::Offered);
+    assert!(share2_now.contact.is_none());
+    // and the invite was NOT burned: it redeems fine once un-revoked
+    s.unrevoke_contact(alice.id).unwrap();
+    assert!(!s.contact_by_pubkey(ALICE_KEY).unwrap().unwrap().revoked);
+    // un-revoke does not touch the shares revoked alongside the contact
+    assert_eq!(s.get_share(share.id).unwrap().state, ShareState::Revoked);
+    let (alice2, share2_now) = s.redeem_invite("h2", ALICE_KEY, "alice-again").unwrap();
+    assert_eq!(alice2.id, alice.id);
+    assert_eq!(
+        alice2.petname, "alice",
+        "redeem never renames an existing contact"
+    );
+    assert_eq!(share2_now.state, ShareState::Active);
+    assert_eq!(share2_now.contact, Some(alice.id));
+}
+
+#[test]
+fn unrevoke_unknown_contact_is_not_found() {
+    let (mut s, _) = store_with_tom();
+    assert!(matches!(
+        s.unrevoke_contact(uuid::Uuid::now_v7()),
+        Err(StoreError::NotFound(_))
+    ));
 }
 
 #[test]
@@ -163,8 +228,14 @@ fn mirror_cursor_upserts() {
 
     s.upsert_mirror(mirror_doc.id, owner.id, share_id, 0, SharePermission::View)
         .unwrap();
-    s.upsert_mirror(mirror_doc.id, owner.id, share_id, 42, SharePermission::Propose)
-        .unwrap();
+    s.upsert_mirror(
+        mirror_doc.id,
+        owner.id,
+        share_id,
+        42,
+        SharePermission::Propose,
+    )
+    .unwrap();
 
     let m = s.get_mirror(mirror_doc.id).unwrap().unwrap();
     assert_eq!(m.synced_epoch, 42);
@@ -210,8 +281,14 @@ fn resharing_a_mirror_is_refused() {
         .create_doc_with_id(uuid::Uuid::now_v7(), "their-doc", Some(folder.id), tom.id)
         .unwrap();
     let owner = s.pair_contact(ALICE_KEY, "alice").unwrap();
-    s.upsert_mirror(mirror_doc.id, owner.id, uuid::Uuid::now_v7(), 3, SharePermission::View)
-        .unwrap();
+    s.upsert_mirror(
+        mirror_doc.id,
+        owner.id,
+        uuid::Uuid::now_v7(),
+        3,
+        SharePermission::View,
+    )
+    .unwrap();
 
     // sharing the mirror itself: refused
     assert!(matches!(
@@ -225,5 +302,8 @@ fn resharing_a_mirror_is_refused() {
     ));
     // a sibling subtree with no mirrors is fine
     let own = s.create_doc("my own", None, tom.id).unwrap();
-    assert!(s.create_share(own.id, None, SharePermission::View, None).is_ok());
+    assert!(
+        s.create_share(own.id, None, SharePermission::View, None)
+            .is_ok()
+    );
 }

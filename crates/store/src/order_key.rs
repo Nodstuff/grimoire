@@ -94,6 +94,24 @@ mod tests {
         }
     }
 
+    /// Fixed vectors — shared with ui/src/editor/diff.test.ts so the UI's
+    /// mirror of `between` stays bit-identical to the store's.
+    #[test]
+    fn fixed_vectors_shared_with_ui() {
+        // shared with ui/src/editor/diff.test.ts
+        let vectors: [(Option<&str>, Option<&str>, &str); 6] = [
+            (None, None, "i"),
+            (Some("i"), None, "r"),
+            (None, Some("i"), "9"),
+            (Some("i"), Some("r"), "m"),
+            (Some("i"), Some("j"), "ii"),
+            (Some("z"), None, "zi"),
+        ];
+        for (a, b, want) in vectors {
+            assert_eq!(between(a, b), want, "between({a:?}, {b:?})");
+        }
+    }
+
     #[test]
     fn adjacent_digits() {
         // "i" and "j" are adjacent at digit 0: must recurse

@@ -5,6 +5,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import { api, Contact, Doc, PendingJoin, Share } from './types'
+import { notify } from './Notice'
 
 function fingerprint(pubkey: string): string {
   return (pubkey.slice(0, 16).match(/.{1,4}/g) ?? []).join(' ')
@@ -140,7 +141,7 @@ export default function Sharing({
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ id: sh.id }),
-                  }).then(load, (e) => alert(String(e)))
+                  }).then(load, (e) => notify(String(e)))
                 }
               >
                 revoke
@@ -166,7 +167,7 @@ function ContactRow({ c, onChanged }: { c: Contact; onChanged: () => void }) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: c.id, petname }),
-    }).catch((e) => alert(String(e)))
+    }).catch((e) => notify(String(e)))
     onChanged()
   }
 
@@ -211,7 +212,7 @@ function ContactRow({ c, onChanged }: { c: Contact; onChanged: () => void }) {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ id: c.id, verified: !c.verified }),
-                }).then(onChanged, (e) => alert(String(e)))
+                }).then(onChanged, (e) => notify(String(e)))
               }
             >
               {c.verified ? '✓ verified' : 'verify'}
@@ -228,7 +229,7 @@ function ContactRow({ c, onChanged }: { c: Contact; onChanged: () => void }) {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ id: c.id }),
-                }).then(onChanged, (e) => alert(String(e)))
+                }).then(onChanged, (e) => notify(String(e)))
               }}
             >
               {armed ? 'sure?' : 'revoke'}

@@ -13,6 +13,14 @@ use uuid::Uuid;
 
 pub type Store = Arc<Mutex<SqliteStore>>;
 
+/// Gardener/admin route state: the store plus the hot set (gardener runs
+/// must honour the freeze on live docs, P2.3).
+#[derive(Clone)]
+pub struct AdminState {
+    pub store: Store,
+    pub hot: crate::hot::HotState,
+}
+
 #[derive(Deserialize)]
 pub struct CreateGardener {
     pub name: String,
@@ -34,7 +42,7 @@ pub struct RunsQuery {
     pub limit: Option<usize>,
 }
 
-async fn list_gardeners(State(store): State<Store>) -> Json<Value> {
+async fn list_gardeners(State(AdminState { store, .. }): State<AdminState>) -> Json<Value> {
     let s = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -45,7 +53,7 @@ async fn list_gardeners(State(store): State<Store>) -> Json<Value> {
 }
 
 async fn create_gardener(
-    State(store): State<Store>,
+    State(AdminState { store, .. }): State<AdminState>,
     Json(req): Json<CreateGardener>,
 ) -> Json<Value> {
     let policy = match req.confidence_policy.as_deref() {
@@ -71,7 +79,10 @@ async fn create_gardener(
     }
 }
 
-async fn run_now(State(store): State<Store>, Json(req): Json<RunReq>) -> Json<Value> {
+async fn run_now(
+    State(AdminState { store, hot }): State<AdminState>,
+    Json(req): Json<RunReq>,
+) -> Json<Value> {
     let gardeners = {
         let s = store
             .lock()
@@ -92,7 +103,7 @@ async fn run_now(State(store): State<Store>, Json(req): Json<RunReq>) -> Json<Va
             continue;
         }
         let name = g.name.clone();
-        let out = garden::run_gardener(store.clone(), g).await;
+        let out = garden::run_gardener(store.clone(), hot.clone(), g).await;
         outcomes.push(json!({
             "gardener": name,
             "run_id": out.run_id,
@@ -106,7 +117,7 @@ async fn run_now(State(store): State<Store>, Json(req): Json<RunReq>) -> Json<Va
     Json(json!(outcomes))
 }
 
-async fn list_runs(State(store): State<Store>, Query(q): Query<RunsQuery>) -> Json<Value> {
+async fn list_runs(State(AdminState { store, .. }): State<AdminState>, Query(q): Query<RunsQuery>) -> Json<Value> {
     let s = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -129,7 +140,7 @@ pub struct UpdateGardener {
 }
 
 async fn update_gardener(
-    State(store): State<Store>,
+    State(AdminState { store, .. }): State<AdminState>,
     Json(req): Json<UpdateGardener>,
 ) -> Json<Value> {
     let Some(policy) = ConfidencePolicy::parse(&req.confidence_policy) else {
@@ -164,7 +175,7 @@ pub struct PolicyReq {
     pub policy: Option<String>,
 }
 
-async fn set_policy(State(store): State<Store>, Json(req): Json<PolicyReq>) -> Json<Value> {
+async fn set_policy(State(AdminState { store, .. }): State<AdminState>, Json(req): Json<PolicyReq>) -> Json<Value> {
     let policy = match req.policy.as_deref() {
         None => None,
         Some(p) => match ReviewPolicy::parse(p) {
@@ -175,6 +186,9 @@ async fn set_policy(State(store): State<Store>, Json(req): Json<PolicyReq>) -> J
     let mut s = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if s.get_mirror(req.doc_id).ok().flatten().is_some() {
+        return Json(json!({"error": "this doc is shared with you by its owner — review policy is the owner's call"}));
+    }
     match s.set_review_policy(req.doc_id, policy) {
         Ok(()) => Json(json!({"ok": true})),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -332,6 +346,19 @@ async fn revoke_contact(State(st): State<FedState>, Json(req): Json<IdReq>) -> J
     }
 }
 
+/// Re-enable a revoked contact (human surface only, never MCP). Shares stay
+/// revoked; the owner re-shares deliberately.
+async fn unrevoke_contact(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.unrevoke_contact(req.id) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct JoinReq {
     pub link: String,
@@ -458,13 +485,14 @@ async fn list_joins(State(st): State<FedState>) -> Json<Value> {
     }
 }
 
-pub fn router(store: Store, fed: FedCtx) -> Router {
+pub fn router(store: Store, fed: FedCtx, hot: crate::hot::HotState) -> Router {
     let fed_routes = Router::new()
         .route("/admin/shares", get(list_shares).post(create_share))
         .route("/admin/shares/revoke", post(revoke_share))
         .route("/admin/shares/trust", post(set_share_trust))
         .route("/admin/contacts", get(list_contacts))
         .route("/admin/contacts/revoke", post(revoke_contact))
+        .route("/admin/contacts/unrevoke", post(unrevoke_contact))
         .route("/admin/contacts/verify", post(verify_contact))
         .route("/admin/contacts/rename", post(rename_contact))
         .route("/admin/join", post(join))
@@ -486,12 +514,12 @@ pub fn router(store: Store, fed: FedCtx) -> Router {
         .route("/admin/gardeners/update", post(update_gardener))
         .route("/admin/runs", get(list_runs))
         .route("/admin/policy", post(set_policy))
-        .with_state(store)
+        .with_state(AdminState { store, hot })
         .merge(fed_routes)
 }
 
 /// The 16:00 daily cut (§3.4): the daemon self-schedules; no external cron.
-pub async fn daily_loop(store: Store) {
+pub async fn daily_loop(store: Store, hot: crate::hot::HotState) {
     loop {
         let now = chrono::Local::now();
         let today_four = now.date_naive().and_hms_opt(16, 0, 0).unwrap();
@@ -518,7 +546,7 @@ pub async fn daily_loop(store: Store) {
             .filter(|g| g.enabled && g.schedule != "manual")
         {
             let name = g.name.clone();
-            let out = garden::run_gardener(store.clone(), g).await;
+            let out = garden::run_gardener(store.clone(), hot.clone(), g).await;
             tracing::info!("gardener {name}: {} — {}", out.status, out.summary);
         }
     }

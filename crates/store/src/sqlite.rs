@@ -139,11 +139,19 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 fn backfill(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version < 4 {
+        backfill_block_types(conn)?;
+    }
+    if version >= 3 {
+        // only the v4 step was outstanding
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(());
     }
     conn.execute("INSERT INTO blocks_fts (blocks_fts) VALUES ('rebuild')", [])?;
@@ -181,6 +189,30 @@ fn backfill(conn: &Connection) -> Result<()> {
         }
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// v4: Replace used to leave `block_type` untouched, so a paragraph edited
+/// into a heading (or a mermaid block edited into prose) kept its stale type.
+/// Retype every live content block from its content, once. Comments and
+/// canvases are not markdown and are left alone.
+fn backfill_block_types(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT id, block_type, content FROM blocks
+         WHERE deleted = 0 AND block_type NOT IN ('comment', 'canvas_scene')",
+    )?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, stored, content) in rows {
+        let want = crate::import::infer_block_type(&content).as_str();
+        if want != stored {
+            conn.execute(
+                "UPDATE blocks SET block_type = ?1 WHERE id = ?2",
+                params![want, id],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -378,7 +410,13 @@ fn finish_share(raw: RawShare) -> Result<Share> {
 type RawMirror = (String, String, String, i64, String);
 
 fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
 }
 
 fn finish_mirror(raw: RawMirror) -> Result<Mirror> {
@@ -551,9 +589,19 @@ fn inverse_of(kind: &OpKind, prior: Option<&Block>) -> Result<OpKind> {
                 new_order_key: p.order_key.clone(),
             })
         }
-        OpKind::Delete { .. } => Err(StoreError::InvalidOp(
-            "cannot invert a delete (deletes never yellow — gate bias)".into(),
-        )),
+        // the gate never yellows a delete, but `propose_reviewed` caps a green
+        // delete to yellow — declining it must resurrect the block in place
+        OpKind::Delete { target } => {
+            let p = need_prior()?;
+            Ok(OpKind::Insert {
+                block_id: *target,
+                parent_id: p.parent_id,
+                order_key: p.order_key.clone(),
+                block_type: p.block_type,
+                content: p.content.clone(),
+                refers_to: p.refers_to,
+            })
+        }
     }
 }
 
@@ -633,35 +681,81 @@ fn project(tx: &Transaction, doc_id: Uuid, epoch: i64, principal: Uuid, op: &OpK
             if let Some(p) = parent_id {
                 live_block(tx, doc_id, *p, "parent")?;
             }
-            let n = tx.execute(
-                "INSERT INTO blocks (id, doc_id, parent_id, order_key, block_type, content, created_by, epoch, refers_to)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT (id) DO NOTHING",
-                params![
-                    block_id.to_string(),
-                    doc_id.to_string(),
-                    parent_id.map(|p| p.to_string()),
-                    order_key,
-                    block_type.as_str(),
-                    content,
-                    principal.to_string(),
-                    epoch,
-                    refers_to.map(|r| r.to_string()),
-                ],
-            )?;
-            if n == 0 {
-                return Err(StoreError::InvalidOp(format!(
-                    "insert: block {block_id} already exists"
-                )));
+            // An insert under an id that already exists is a conflict — unless
+            // the row is a tombstone, in which case this is a resurrection
+            // (declining a reviewed delete) and the block comes back in place
+            // under its original id, so deep links and comment anchors hold.
+            let existing: Option<(String, bool)> = tx
+                .query_row(
+                    "SELECT doc_id, deleted FROM blocks WHERE id = ?1",
+                    params![block_id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match existing {
+                Some((_, false)) => {
+                    return Err(StoreError::InvalidOp(format!(
+                        "insert: block {block_id} already exists"
+                    )));
+                }
+                Some((other_doc, true)) if other_doc != doc_id.to_string() => {
+                    return Err(StoreError::InvalidOp(format!(
+                        "insert: block {block_id} is a tombstone in another doc"
+                    )));
+                }
+                Some((_, true)) => {
+                    tx.execute(
+                        "UPDATE blocks SET deleted = 0, parent_id = ?1, order_key = ?2,
+                                block_type = ?3, content = ?4, epoch = ?5, refers_to = ?6
+                         WHERE id = ?7",
+                        params![
+                            parent_id.map(|p| p.to_string()),
+                            order_key,
+                            block_type.as_str(),
+                            content,
+                            epoch,
+                            refers_to.map(|r| r.to_string()),
+                            block_id.to_string(),
+                        ],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO blocks (id, doc_id, parent_id, order_key, block_type, content, created_by, epoch, refers_to)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            block_id.to_string(),
+                            doc_id.to_string(),
+                            parent_id.map(|p| p.to_string()),
+                            order_key,
+                            block_type.as_str(),
+                            content,
+                            principal.to_string(),
+                            epoch,
+                            refers_to.map(|r| r.to_string()),
+                        ],
+                    )?;
+                }
             }
             set_edges(tx, *block_id, content)?;
             set_tags(tx, doc_id, *block_id, content)?;
         }
         OpKind::Replace { target, content } => {
-            live_block(tx, doc_id, *target, "replace target")?;
+            let existing = live_block(tx, doc_id, *target, "replace target")?;
+            // the type follows the content: a paragraph edited into `## x`
+            // becomes a heading. Comments and canvases keep their type — they
+            // are not markdown and the editor never retypes them.
+            let block_type = if matches!(
+                existing.block_type,
+                BlockType::Comment | BlockType::CanvasScene
+            ) {
+                existing.block_type
+            } else {
+                crate::import::infer_block_type(content)
+            };
             tx.execute(
-                "UPDATE blocks SET content = ?1, epoch = ?2 WHERE id = ?3",
-                params![content, epoch, target.to_string()],
+                "UPDATE blocks SET content = ?1, epoch = ?2, block_type = ?3 WHERE id = ?4",
+                params![content, epoch, block_type.as_str(), target.to_string()],
             )?;
             set_edges(tx, *target, content)?;
             set_tags(tx, doc_id, *target, content)?;
@@ -1525,16 +1619,13 @@ impl BlockStore for SqliteStore {
     // --- federation (ADR 0002) ---
 
     fn pair_contact(&mut self, pubkey: &str, petname: &str) -> Result<Contact> {
+        // Idempotent on pubkey. An existing contact is returned untouched:
+        // the petname is the owner's chosen name (rename_contact is the way
+        // to change it, never a peer's self-description), and revocation is
+        // only lifted by the explicit unrevoke_contact — re-pairing must not
+        // quietly restore trust.
         if let Some(existing) = self.contact_by_pubkey(pubkey)? {
-            self.conn.execute(
-                "UPDATE contacts SET petname = ?1, revoked = 0 WHERE id = ?2",
-                params![petname, existing.id.to_string()],
-            )?;
-            return Ok(Contact {
-                petname: petname.into(),
-                revoked: false,
-                ..existing
-            });
+            return Ok(existing);
         }
         let principal = self.create_principal(PrincipalKind::Remote, petname, Some(pubkey))?;
         let id = Uuid::now_v7();
@@ -1597,6 +1688,17 @@ impl BlockStore for SqliteStore {
         Ok(())
     }
 
+    fn unrevoke_contact(&mut self, id: Uuid) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE contacts SET revoked = 0 WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("contact {id}")));
+        }
+        Ok(())
+    }
+
     fn create_share(
         &mut self,
         root_doc: Uuid,
@@ -1608,11 +1710,8 @@ impl BlockStore for SqliteStore {
         // re-share guard: a subtree containing mirrors is someone ELSE's
         // content — serving it onward would leak their docs to a third party
         // without their gate ever seeing it. Share your own docs only.
-        let mirrors: std::collections::HashSet<Uuid> = self
-            .list_mirrors()?
-            .into_iter()
-            .map(|m| m.doc_id)
-            .collect();
+        let mirrors: std::collections::HashSet<Uuid> =
+            self.list_mirrors()?.into_iter().map(|m| m.doc_id).collect();
         if !mirrors.is_empty() {
             let mut stmt = self.conn.prepare(
                 "WITH RECURSIVE subtree (id) AS (
@@ -1710,13 +1809,23 @@ impl BlockStore for SqliteStore {
         Ok(())
     }
 
-    fn create_invite(&mut self, share_id: Uuid, secret_hash: &str, expires_at: &str) -> Result<Uuid> {
+    fn create_invite(
+        &mut self,
+        share_id: Uuid,
+        secret_hash: &str,
+        expires_at: &str,
+    ) -> Result<Uuid> {
         self.get_share(share_id)?;
         let id = Uuid::now_v7();
         self.conn.execute(
             "INSERT INTO share_invites (id, share_id, secret_hash, expires_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![id.to_string(), share_id.to_string(), secret_hash, expires_at],
+            params![
+                id.to_string(),
+                share_id.to_string(),
+                secret_hash,
+                expires_at
+            ],
         )?;
         Ok(id)
     }
@@ -1746,6 +1855,13 @@ impl BlockStore for SqliteStore {
             ));
         };
         let share_id = uuid_col(share_id, "share_invites.share_id")?;
+        // a revoked peer cannot redeem their way back in: nothing is burned,
+        // nothing is revived — the owner un-revokes first, deliberately
+        if self.contact_by_pubkey(pubkey)?.is_some_and(|c| c.revoked) {
+            return Err(StoreError::InvalidOp(
+                "contact is revoked; un-revoke before re-inviting".into(),
+            ));
+        }
         let contact = self.pair_contact(pubkey, petname)?;
         // burn first: even if binding fails, the secret is single-use
         self.conn.execute(
@@ -1843,9 +1959,8 @@ impl BlockStore for SqliteStore {
         note: &str,
     ) -> Result<Uuid> {
         let id = Uuid::now_v7();
-        let ids_json = serde_json::to_string(
-            &op_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
-        )?;
+        let ids_json =
+            serde_json::to_string(&op_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>())?;
         self.conn.execute(
             "INSERT INTO outbound_proposals (id, doc_id, share_id, owner, op_ids, note)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -2066,9 +2181,9 @@ impl BlockStore for SqliteStore {
     }
 
     fn list_mirrors(&self) -> Result<Vec<Mirror>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT doc_id, owner, share_id, synced_epoch, permission FROM mirrors ORDER BY doc_id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT doc_id, owner, share_id, synced_epoch, permission FROM mirrors ORDER BY doc_id",
+        )?;
         let rows = stmt.query_map([], mirror_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
@@ -2105,8 +2220,7 @@ impl BlockStore for SqliteStore {
         // ledger — tombstones and ops describe the OWNER's history, which
         // lives on the owner's instance
         {
-            let mut stmt =
-                tx.prepare("SELECT id FROM blocks WHERE doc_id = ?1")?;
+            let mut stmt = tx.prepare("SELECT id FROM blocks WHERE doc_id = ?1")?;
             let old_ids: Vec<String> = stmt
                 .query_map(params![doc_id.to_string()], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
@@ -2763,5 +2877,85 @@ impl SqliteStore {
             epoch,
             verdicts,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v4 backfill: a row whose stored type disagrees with its content is
+    /// retyped on migration; comments are never touched.
+    #[test]
+    fn backfill_v4_retypes_mistyped_blocks_once() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "t", None).unwrap();
+        let doc = s.create_doc("d", None, tom.id).unwrap();
+        let (heading, para, mermaid) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let ins = |id, key: &str, bt, content: &str| OpInput {
+            kind: OpKind::Insert {
+                block_id: id,
+                parent_id: None,
+                order_key: key.into(),
+                block_type: bt,
+                content: content.into(),
+                refers_to: None,
+            },
+            source_refs: vec![],
+        };
+        s.apply(
+            doc.id,
+            0,
+            tom.id,
+            vec![
+                ins(heading, "i", BlockType::Heading, "## H"),
+                ins(para, "j", BlockType::Paragraph, "p"),
+                ins(
+                    mermaid,
+                    "k",
+                    BlockType::DiagramMermaid,
+                    "```mermaid\ng\n```",
+                ),
+            ],
+        )
+        .unwrap();
+        let comment = s.add_comment(para, tom.id, "note", None).unwrap();
+
+        // simulate pre-v4 damage: stale types left behind by old Replace
+        for (id, wrong) in [
+            (heading, "paragraph"),
+            (mermaid, "paragraph"),
+            (para, "heading"),
+        ] {
+            s.conn
+                .execute(
+                    "UPDATE blocks SET block_type = ?1 WHERE id = ?2",
+                    params![wrong, id.to_string()],
+                )
+                .unwrap();
+        }
+        s.conn.pragma_update(None, "user_version", 3).unwrap();
+        backfill(&s.conn).unwrap();
+
+        assert_eq!(
+            s.read_block(heading).unwrap().block_type,
+            BlockType::Heading
+        );
+        assert_eq!(s.read_block(para).unwrap().block_type, BlockType::Paragraph);
+        assert_eq!(
+            s.read_block(mermaid).unwrap().block_type,
+            BlockType::DiagramMermaid
+        );
+        assert_eq!(
+            s.read_block(comment.id).unwrap().block_type,
+            BlockType::Comment
+        );
+        let v: i64 = s
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        // idempotent: a second open-time backfill is a no-op
+        backfill(&s.conn).unwrap();
     }
 }

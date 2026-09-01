@@ -7,6 +7,7 @@ import Gardeners from './Gardeners'
 import CanvasBlock from './CanvasBlock'
 import Sharing from './Sharing'
 import SharePanel from './SharePanel'
+import { notify, Notices } from './Notice'
 import {
   api,
   Block,
@@ -169,6 +170,7 @@ export default function App() {
 
   return (
     <div className="app">
+      <Notices />
       {treeOpen && (
         <DocTreeNav
           docs={docs}
@@ -486,7 +488,7 @@ function NewDocPalette({
         value={title}
         onChange={(e) => setTitle(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === 'Enter') create().catch((err) => alert(String(err)))
+          if (e.key === 'Enter') create().catch((err) => notify(String(err)))
         }}
       />
       <div className="palette-empty">Enter to create</div>
@@ -543,16 +545,19 @@ function DocTreeNav({
     return null
   }
 
+  // the actual move; the server may refuse (e.g. a mirror into a shared
+  // subtree) — its error string surfaces as a notice
   const commitMove = async (dragged: string, parent: string | null, sortKey: string | null) => {
-    // moving INTO a shared subtree makes the doc visible to its grantees on
-    // their next pull — loud, explicit confirm (ADR 0002 edge semantics)
-    const wasShared = sharedRootOf(byId.get(dragged)?.parent_id ?? null)
-    const nowShared = sharedRootOf(parent)
-    if (nowShared && nowShared.id !== wasShared?.id) {
-      setPendingMove({ dragged, parent, sortKey, sharedRoot: nowShared.title })
-      return
+    try {
+      await api(`/api/doc/${dragged}/move`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parent_id: parent, sort_key: sortKey }),
+      })
+      onChanged()
+    } catch (e) {
+      notify(String(e))
     }
-    await commitMove(dragged, parent, sortKey)
   }
 
   const doMove = async (dragged: string, target: Doc, mode: 'into' | 'before' | 'after') => {
@@ -729,11 +734,7 @@ function DocTreeNav({
         }}
         onDrop={(e) => {
           if (dragging && e.target === e.currentTarget) {
-            api(`/api/doc/${dragging}/move`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ parent_id: null, sort_key: null }),
-            }).then(onChanged)
+            commitMove(dragging, null, null)
           }
         }}
       >
@@ -1045,7 +1046,7 @@ function DocView({
 
   if (!tree || !editable) return <div className="empty">…</div>
 
-  // a canvas doc IS the canvas: full-stage tldraw, its own experience
+  // a canvas doc IS the canvas: full-stage React Flow editor, its own experience
   if (canvases.length > 0 && editable.blocks.length === 0) {
     return (
       <div className="canvas-doc">
@@ -1251,7 +1252,7 @@ function StatusChip({ doc, onChanged }: { doc: Doc; onChanged: () => void }) {
       body: JSON.stringify({ status: nextStatus }),
     })
       .then(onChanged)
-      .catch((e) => alert(String(e)))
+      .catch((e) => notify(String(e)))
   }
   return (
     <button className={`chip status-${doc.status ?? 'none'}`} onClick={next} title="cycle status">
@@ -1349,7 +1350,7 @@ function CommentsPanel({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ block_id: blockId, text: text.trim(), reply_to: replyTo?.id ?? null }),
-    }).catch((e) => alert(String(e)))
+    }).catch((e) => notify(String(e)))
     setText('')
     setReplyTo(null)
     setTarget(null)
@@ -1455,7 +1456,7 @@ function ReviewQueue({
         body: JSON.stringify({ annotation_id: annotationId, decision }),
       })
     } catch (e) {
-      alert(String(e))
+      notify(String(e))
     }
     setBusy(null)
     load()
@@ -1467,7 +1468,7 @@ function ReviewQueue({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ comment_id: commentId }),
-    }).catch((e) => alert(String(e)))
+    }).catch((e) => notify(String(e)))
     setBusy(null)
     load()
   }
@@ -1479,7 +1480,7 @@ function ReviewQueue({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ annotation_ids: ids, decision }),
-    }).catch((e) => alert(String(e)))
+    }).catch((e) => notify(String(e)))
     setBusy(null)
     load()
   }
