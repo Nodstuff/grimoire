@@ -551,6 +551,7 @@ pub struct Mirror {
     pub owner: Uuid,
     pub share_id: Uuid,
     pub synced_epoch: i64,
+    pub permission: SharePermission,
 }
 
 /// A queued join (grantee-side): a redeem that waits for the owner to be up.

@@ -263,6 +263,43 @@ async fn list_contacts(State(st): State<FedState>) -> Json<Value> {
     }
 }
 
+#[derive(Deserialize)]
+pub struct VerifyReq {
+    pub id: Uuid,
+    pub verified: bool,
+}
+
+async fn verify_contact(State(st): State<FedState>, Json(req): Json<VerifyReq>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.set_contact_verified(req.id, req.verified) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RenameContactReq {
+    pub id: Uuid,
+    pub petname: String,
+}
+
+async fn rename_contact(
+    State(st): State<FedState>,
+    Json(req): Json<RenameContactReq>,
+) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.rename_contact(req.id, req.petname.trim()) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 async fn revoke_contact(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
     let mut s = st
         .store
@@ -379,6 +416,8 @@ pub fn router(store: Store, fed: FedCtx) -> Router {
         .route("/admin/shares/revoke", post(revoke_share))
         .route("/admin/contacts", get(list_contacts))
         .route("/admin/contacts/revoke", post(revoke_contact))
+        .route("/admin/contacts/verify", post(verify_contact))
+        .route("/admin/contacts/rename", post(rename_contact))
         .route("/admin/join", post(join))
         .route("/admin/joins", get(list_joins))
         .route("/admin/pull", post(pull_now))

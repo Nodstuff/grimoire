@@ -4,10 +4,13 @@ import GraphView from './GraphView'
 import TendPanel from './TendPanel'
 import Gardeners from './Gardeners'
 import CanvasBlock from './CanvasBlock'
+import Sharing from './Sharing'
+import SharePanel from './SharePanel'
 import {
   api,
   Block,
   Doc,
+  DocFederation,
   DocTree,
   BlockNode,
   HistoryRow,
@@ -21,11 +24,17 @@ type View =
   | { kind: 'review' }
   | { kind: 'runs' }
   | { kind: 'graph' }
+  | { kind: 'sharing' }
   | { kind: 'home' }
 type Palette = null | 'commands' | 'search' | 'newdoc' | 'newcanvas'
 
 export default function App() {
   const [view, setViewRaw] = useState<View>({ kind: 'home' })
+  // a clicked grimoire://join/… link arrives from the shell as ?join=<payload>
+  const [joinPrefill, setJoinPrefill] = useState<string | null>(() => {
+    const payload = new URLSearchParams(location.search).get('join')
+    return payload ? `grimoire://join/${payload}` : null
+  })
   const [anchor, setAnchor] = useState<string | null>(null)
 
   // ⌘[ / ⌘] history over views, browser-style
@@ -66,6 +75,11 @@ export default function App() {
   useEffect(() => {
     api<Doc[]>('/api/docs').then(setDocs).catch(console.error)
     refreshQueue()
+    if (joinPrefill) {
+      setViewRaw({ kind: 'sharing' })
+      window.history.replaceState(null, '', '/') // don't re-trigger on reload
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshQueue])
 
   // live data: poll the store's change stamp; when it moves, every mounted
@@ -181,6 +195,15 @@ export default function App() {
           />
         )}
         {view.kind === 'runs' && <Gardeners dataVersion={dataVersion} />}
+        {view.kind === 'sharing' && (
+          <Sharing
+            docs={docs}
+            dataVersion={dataVersion}
+            onOpenDoc={openDoc}
+            prefillLink={joinPrefill}
+            onPrefillConsumed={() => setJoinPrefill(null)}
+          />
+        )}
         {view.kind === 'graph' && <GraphView onOpenDoc={openDoc} />}
       </main>
 
@@ -199,6 +222,7 @@ export default function App() {
             if (a === 'review') setView({ kind: 'review' })
             if (a === 'runs') setView({ kind: 'runs' })
             if (a === 'graph') setView({ kind: 'graph' })
+            if (a === 'sharing') setView({ kind: 'sharing' })
             if (a === 'tree') setTreeOpen((t) => !t)
             if (a === 'home') setView({ kind: 'home' })
             if (a === 'newdoc') {
@@ -257,7 +281,7 @@ function CommandPalette({
   docs: Doc[]
   queueCount: number
   onOpenDoc: (id: string) => void
-  onAction: (a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph') => void
+  onAction: (a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph' | 'sharing') => void
   onClose: () => void
 }) {
   const [q, setQ] = useState('')
@@ -271,6 +295,7 @@ function CommandPalette({
     { label: 'New doc…', hint: '⌘N', run: () => onAction('newdoc') },
     { label: 'New canvas…', run: () => onAction('newcanvas') },
     { label: 'Gardeners', run: () => onAction('runs') },
+    { label: 'Sharing & contacts', run: () => onAction('sharing') },
     { label: 'Graph view', run: () => onAction('graph') },
     { label: 'Toggle file tree', hint: '⌘T', run: () => onAction('tree') },
     { label: 'Home', run: () => onAction('home') },
@@ -488,6 +513,36 @@ function DocTreeNav({
   const [dragging, setDragging] = useState<string | null>(null)
   const [drop, setDrop] = useState<Drop>(null)
 
+  const [pendingMove, setPendingMove] = useState<{
+    dragged: string
+    parent: string | null
+    sortKey: string | null
+    sharedRoot: string
+  } | null>(null)
+
+  const byId = useMemo(() => new Map(docs.map((d) => [d.id, d])), [docs])
+  // the nearest shared ancestor (incl. self) of a doc, if any
+  const sharedRootOf = (id: string | null): Doc | null => {
+    let cur = id ? byId.get(id) : undefined
+    while (cur) {
+      if (cur.is_shared) return cur
+      cur = cur.parent_id ? byId.get(cur.parent_id) : undefined
+    }
+    return null
+  }
+
+  const commitMove = async (dragged: string, parent: string | null, sortKey: string | null) => {
+    // moving INTO a shared subtree makes the doc visible to its grantees on
+    // their next pull — loud, explicit confirm (ADR 0002 edge semantics)
+    const wasShared = sharedRootOf(byId.get(dragged)?.parent_id ?? null)
+    const nowShared = sharedRootOf(parent)
+    if (nowShared && nowShared.id !== wasShared?.id) {
+      setPendingMove({ dragged, parent, sortKey, sharedRoot: nowShared.title })
+      return
+    }
+    await commitMove(dragged, parent, sortKey)
+  }
+
   const doMove = async (dragged: string, target: Doc, mode: 'into' | 'before' | 'after') => {
     if (dragged === target.id) return
     let parent: string | null
@@ -506,12 +561,15 @@ function DocTreeNav({
       const after = mode === 'before' ? siblings[i] : siblings[i + 1]
       sortKey = keyBetween(before?.sort_key ?? null, after?.sort_key ?? null)
     }
-    await api(`/api/doc/${dragged}/move`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ parent_id: parent, sort_key: sortKey }),
-    }).catch((e) => alert(String(e)))
-    onChanged()
+    // moving INTO a shared subtree makes the doc visible to its grantees on
+    // their next pull — loud, explicit confirm (ADR 0002 edge semantics)
+    const wasShared = sharedRootOf(byId.get(dragged)?.parent_id ?? null)
+    const nowShared = sharedRootOf(parent)
+    if (nowShared && nowShared.id !== wasShared?.id) {
+      setPendingMove({ dragged, parent, sortKey, sharedRoot: nowShared.title })
+      return
+    }
+    await commitMove(dragged, parent, sortKey)
   }
 
   // window.confirm is a silent no-op in Tauri's webview — arm-then-confirm
@@ -598,6 +656,11 @@ function DocTreeNav({
             </span>
             <span className="tree-title">{d.title}</span>
             {d.is_tended && <span className="tend-dot" title="tended by agents" />}
+            {d.mirror_permission && (
+              <span className="mirror-badge" title={`shared with you (${d.mirror_permission})`}>⇄</span>
+            )}
+            {d.is_shared && <span className="shared-badge" title="you share this subtree">↗</span>}
+            {!d.mirror_permission && (
             <button
               className={`tree-delete ${armed === d.id ? 'armed' : ''}`}
               title={armed === d.id ? 'click again to delete' : 'delete'}
@@ -608,6 +671,7 @@ function DocTreeNav({
             >
               {armed === d.id ? 'sure?' : '×'}
             </button>
+            )}
           </div>
           {isDir && isOpen && (
             <div className="tree-children">{renderLevel(d.id, depth + 1)}</div>
@@ -622,6 +686,29 @@ function DocTreeNav({
         <span>files</span>
         <button onClick={onClose}>⌘T</button>
       </div>
+      {pendingMove && (
+        <div className="move-confirm">
+          <div>
+            “{byId.get(pendingMove.dragged)?.title ?? '?'}” will become visible to
+            everyone “{pendingMove.sharedRoot}” is shared with
+          </div>
+          <div className="move-confirm-actions">
+            <button
+              className="accept"
+              onClick={() => {
+                const m = pendingMove
+                setPendingMove(null)
+                commitMove(m.dragged, m.parent, m.sortKey)
+              }}
+            >
+              share it
+            </button>
+            <button className="decline" onClick={() => setPendingMove(null)}>
+              cancel
+            </button>
+          </div>
+        </div>
+      )}
       <div
         className="tree-root"
         onDragOver={(e) => {
@@ -737,7 +824,8 @@ function DocView({
 }) {
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
-  const [panel, setPanel] = useState<'none' | 'history' | 'comments' | 'tend'>('none')
+  const [fed, setFed] = useState<DocFederation | null>(null)
+  const [panel, setPanel] = useState<'none' | 'history' | 'comments' | 'tend' | 'share'>('none')
   const [selBlock, setSelBlock] = useState<string | null>(null)
   const [selRect, setSelRect] = useState<{ x: number; y: number } | null>(null)
   const [commentTarget, setCommentTarget] = useState<string | null>(null)
@@ -766,6 +854,7 @@ function DocView({
   const loadTree = useCallback(() => {
     api<DocTree>(`/api/doc/${docId}`).then(setTree).catch(console.error)
     api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => setBacklinks([]))
+    api<DocFederation>(`/api/doc/${docId}/federation`).then(setFed).catch(() => setFed(null))
   }, [docId])
 
   useEffect(() => {
@@ -792,6 +881,7 @@ function DocView({
           setTree(fresh)
         }
         api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => {})
+        api<DocFederation>(`/api/doc/${docId}/federation`).then(setFed).catch(() => {})
       })
       .catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -890,12 +980,33 @@ function DocView({
     )
   }
 
+  const mirror = fed?.mirror ?? null
+  const pendingProposals = (fed?.outbound ?? []).filter((o) => o.state === 'pending')
+
   return (
     <article className="doc" onClick={onStageClick}>
+      {mirror && (
+        <div className="mirror-banner">
+          ⇄ shared by <b>{mirror.owner_petname}</b>
+          {mirror.permission === 'view'
+            ? ' · view only'
+            : ' · your edits go to them as suggestions'}
+          {pendingProposals.length > 0 && (
+            <span className="pending-chip">
+              {pendingProposals.length} suggestion{pendingProposals.length > 1 ? 's' : ''} awaiting{' '}
+              {mirror.owner_petname}
+            </span>
+          )}
+        </div>
+      )}
       <div className="doc-head">
-        <DocTitle doc={tree.doc} onRenamed={loadTree} />
+        {mirror ? (
+          <h1 className="doc-title readonly">{tree.doc.title}</h1>
+        ) : (
+          <DocTitle doc={tree.doc} onRenamed={loadTree} />
+        )}
         {tree.doc.review_policy && <span className="meta policy">{tree.doc.review_policy}</span>}
-        <StatusChip doc={tree.doc} onChanged={loadTree} />
+        {!mirror && <StatusChip doc={tree.doc} onChanged={loadTree} />}
         <span className="head-actions">
           <button
             className={`chip ${panel === 'history' ? 'on' : ''}`}
@@ -909,19 +1020,36 @@ function DocView({
           >
             comments{comments.length > 0 ? ` ${comments.length}` : ''}
           </button>
-          <button
-            className={`chip ${panel === 'tend' ? 'on' : ''} ${docs.find((d) => d.id === docId)?.is_tended ? 'tended' : ''}`}
-            onClick={() => setPanel(panel === 'tend' ? 'none' : 'tend')}
-          >
-            {docs.find((d) => d.id === docId)?.is_tended ? '🌿 tended' : 'tend'}
-          </button>
+          {!mirror && (
+            <button
+              className={`chip ${panel === 'tend' ? 'on' : ''} ${docs.find((d) => d.id === docId)?.is_tended ? 'tended' : ''}`}
+              onClick={() => setPanel(panel === 'tend' ? 'none' : 'tend')}
+            >
+              {docs.find((d) => d.id === docId)?.is_tended ? '🌿 tended' : 'tend'}
+            </button>
+          )}
+          {!mirror && (
+            <button
+              className={`chip ${panel === 'share' ? 'on' : ''} ${(fed?.shares.length ?? 0) > 0 ? 'shared' : ''}`}
+              onClick={() => setPanel(panel === 'share' ? 'none' : 'share')}
+            >
+              {(fed?.shares.length ?? 0) > 0 ? '↗ shared' : 'share'}
+            </button>
+          )}
         </span>
       </div>
       <DocEditor
         key={`${docId}:${editorGen}`}
         doc={editable}
+        mode={mirror ? (mirror.permission === 'propose' ? 'propose' : 'readonly') : 'direct'}
         onSaved={(e) => {
           ownEpoch.current = Math.max(ownEpoch.current, e)
+        }}
+        onProposed={() => {
+          // pessimistic mirror: reset the editor to the pristine mirror and
+          // show the pending chip
+          setEditorGen((g) => g + 1)
+          loadTree()
         }}
         onSelectionBlock={onSelectionBlock}
       />
@@ -953,6 +1081,14 @@ function DocView({
         </span>
       )}
       {panel === 'history' && <HistoryPanel docId={docId} onClose={() => setPanel('none')} />}
+      {panel === 'share' && (
+        <SharePanel
+          doc={tree.doc}
+          fed={fed ?? { mirror: null, shares: [], outbound: [] }}
+          onChanged={loadTree}
+          onClose={() => setPanel('none')}
+        />
+      )}
       {panel === 'tend' && (
         <TendPanel doc={tree.doc} onClose={() => setPanel('none')} dataVersion={dataVersion} />
       )}

@@ -12,6 +12,13 @@
       "csp": null
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["grimoire"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["app"],

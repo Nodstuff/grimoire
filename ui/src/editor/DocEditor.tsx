@@ -72,13 +72,22 @@ export interface EditableDoc {
 
 type SaveState = 'clean' | 'dirty' | 'saving'
 
+/** direct = normal gate save; readonly = view-only mirror; propose = mirror
+ * with propose permission — edits ship UPSTREAM as a proposal (no autosave,
+ * explicit action), then the editor resets to the pristine mirror. */
+export type EditorMode = 'direct' | 'readonly' | 'propose'
+
 export default function DocEditor({
   doc,
+  mode = 'direct',
   onSaved,
+  onProposed,
   onSelectionBlock,
 }: {
   doc: EditableDoc
+  mode?: EditorMode
   onSaved: (epoch: number) => void
+  onProposed?: () => void
   onSelectionBlock?: (blockId: string | null) => void
 }) {
   const selCb = useRef(onSelectionBlock)
@@ -120,6 +129,7 @@ export default function DocEditor({
   const editor = useEditor(
     {
       extensions,
+      editable: mode !== 'readonly',
       content: {
         type: 'doc',
         content: initial.nodes.map((n) => n.toJSON()),
@@ -179,7 +189,7 @@ export default function DocEditor({
   }
 
   const save = async () => {
-    if (!editor || saveState === 'saving') return
+    if (!editor || saveState === 'saving' || mode === 'readonly') return
     const entries = extractEntries()
     const assigned: string[] = []
     const ops = computeOps(baselineRef.current, entries, () => {
@@ -189,6 +199,24 @@ export default function DocEditor({
     })
     if (ops.length === 0) {
       setSaveState('clean')
+      return
+    }
+    if (mode === 'propose') {
+      // pessimistic mirror: the edit becomes an upstream proposal; the local
+      // doc never changes until the owner accepts and a pull lands it
+      setSaveState('saving')
+      try {
+        await api('/admin/propose_upstream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ doc_id: doc.docId, ops, note: '' }),
+        })
+        setSaveState('clean')
+        onProposed?.()
+      } catch (e) {
+        setSaveState('dirty')
+        alert(String(e))
+      }
       return
     }
     setSaveState('saving')
@@ -229,11 +257,13 @@ export default function DocEditor({
   // debounce autosave; flush on unmount/navigation
   const saveRef = useRef(save)
   saveRef.current = save
+  const modeRef = useRef(mode)
+  modeRef.current = mode
   useEffect(() => {
-    if (saveState !== 'dirty') return
+    if (saveState !== 'dirty' || mode !== 'direct') return
     const t = setTimeout(() => saveRef.current(), 1200)
     return () => clearTimeout(t)
-  }, [saveState, editor?.state.doc])
+  }, [saveState, editor?.state.doc, mode])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -242,16 +272,36 @@ export default function DocEditor({
     window.addEventListener('keydown', onKey)
     return () => {
       window.removeEventListener('keydown', onKey)
-      saveRef.current()
+      if (modeRef.current === 'direct') saveRef.current()
     }
   }, [])
 
+  if (mode === 'propose') {
+    return (
+      <>
+        <EditorContent editor={editor} />
+        {saveState !== 'clean' ? (
+          <button
+            className="propose-cta"
+            disabled={saveState === 'saving'}
+            onClick={() => saveRef.current()}
+          >
+            {saveState === 'saving' ? 'sending…' : 'suggest changes ⌘⏎'}
+          </button>
+        ) : (
+          <span className="save-state clean">epoch {epoch}</span>
+        )}
+      </>
+    )
+  }
   return (
     <>
       <EditorContent editor={editor} />
-      <span className={`save-state ${saveState}`}>
-        {saveState === 'clean' ? `epoch ${epoch}` : saveState === 'dirty' ? '·' : '…'}
-      </span>
+      {mode === 'direct' && (
+        <span className={`save-state ${saveState}`}>
+          {saveState === 'clean' ? `epoch ${epoch}` : saveState === 'dirty' ? '·' : '…'}
+        </span>
+      )}
     </>
   )
 }

@@ -161,13 +161,43 @@ fn mirror_cursor_upserts() {
     let owner = s.pair_contact(ALICE_KEY, "alice").unwrap();
     let share_id = uuid::Uuid::now_v7(); // owner-side id, foreign to us
 
-    s.upsert_mirror(mirror_doc.id, owner.id, share_id, 0).unwrap();
-    s.upsert_mirror(mirror_doc.id, owner.id, share_id, 42).unwrap();
+    s.upsert_mirror(mirror_doc.id, owner.id, share_id, 0, SharePermission::View)
+        .unwrap();
+    s.upsert_mirror(mirror_doc.id, owner.id, share_id, 42, SharePermission::Propose)
+        .unwrap();
 
     let m = s.get_mirror(mirror_doc.id).unwrap().unwrap();
     assert_eq!(m.synced_epoch, 42);
+    assert_eq!(m.permission, SharePermission::Propose);
     assert_eq!(m.owner, owner.id);
     assert_eq!(m.share_id, share_id);
     assert_eq!(s.list_mirrors().unwrap().len(), 1);
     assert!(s.get_mirror(uuid::Uuid::now_v7()).unwrap().is_none());
+}
+
+#[test]
+fn reinvite_supersedes_older_active_share_for_same_contact() {
+    let (mut s, tom) = store_with_tom();
+    let doc = s.create_doc("runbook", None, tom.id).unwrap();
+    let first = s
+        .create_share(doc.id, None, SharePermission::View, None)
+        .unwrap();
+    s.create_invite(first.id, "h1", "2099-01-01T00:00:00.000Z")
+        .unwrap();
+    s.redeem_invite("h1", ALICE_KEY, "alice").unwrap();
+
+    // second invite for the same subtree, upgraded permission
+    let second = s
+        .create_share(doc.id, None, SharePermission::Propose, None)
+        .unwrap();
+    s.create_invite(second.id, "h2", "2099-01-01T00:00:00.000Z")
+        .unwrap();
+    s.redeem_invite("h2", ALICE_KEY, "alice").unwrap();
+
+    assert_eq!(s.get_share(first.id).unwrap().state, ShareState::Revoked);
+    let second = s.get_share(second.id).unwrap();
+    assert_eq!(second.state, ShareState::Active);
+    assert_eq!(second.permission, SharePermission::Propose);
+    // exactly one active share exposes the doc now
+    assert_eq!(s.shares_containing(doc.id).unwrap().len(), 1);
 }

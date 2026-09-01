@@ -79,6 +79,24 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
             )?;
         }
     }
+    let has_mirrors: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'mirrors'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_mirrors > 0 {
+        let has_perm: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('mirrors') WHERE name = 'permission'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_perm == 0 {
+            conn.execute(
+                "ALTER TABLE mirrors ADD COLUMN permission TEXT NOT NULL DEFAULT 'view'",
+                [],
+            )?;
+        }
+    }
     let has_gardeners: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'gardeners'",
         [],
@@ -335,19 +353,21 @@ fn finish_share(raw: RawShare) -> Result<Share> {
     })
 }
 
-type RawMirror = (String, String, String, i64);
+type RawMirror = (String, String, String, i64, String);
 
 fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
 }
 
 fn finish_mirror(raw: RawMirror) -> Result<Mirror> {
-    let (doc_id, owner, share_id, synced_epoch) = raw;
+    let (doc_id, owner, share_id, synced_epoch, permission) = raw;
     Ok(Mirror {
         doc_id: uuid_col(doc_id, "mirrors.doc_id")?,
         owner: uuid_col(owner, "mirrors.owner")?,
         share_id: uuid_col(share_id, "mirrors.share_id")?,
         synced_epoch,
+        permission: SharePermission::parse(&permission)
+            .ok_or_else(|| StoreError::InvalidOp(format!("bad mirror permission: {permission}")))?,
     })
 }
 
@@ -1674,7 +1694,20 @@ impl BlockStore for SqliteStore {
             "UPDATE shares SET contact = ?1, state = 'active' WHERE id = ?2",
             params![contact.id.to_string(), share_id.to_string()],
         )?;
-        Ok((contact, self.get_share(share_id)?))
+        // supersede: a re-invite of the same subtree to the same person
+        // replaces the old grant — one active share per (root_doc, contact),
+        // so grantee mirror rows never tug-of-war over permission
+        let share = self.get_share(share_id)?;
+        self.conn.execute(
+            "UPDATE shares SET state = 'revoked'
+             WHERE root_doc = ?1 AND contact = ?2 AND id != ?3 AND state = 'active'",
+            params![
+                share.root_doc.to_string(),
+                contact.id.to_string(),
+                share_id.to_string()
+            ],
+        )?;
+        Ok((contact, share))
     }
 
     fn docs_in_share(&self, share_id: Uuid) -> Result<Vec<Doc>> {
@@ -1924,28 +1957,42 @@ impl BlockStore for SqliteStore {
         owner: Uuid,
         share_id: Uuid,
         synced_epoch: i64,
+        permission: SharePermission,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO mirrors (doc_id, owner, share_id, synced_epoch)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO mirrors (doc_id, owner, share_id, synced_epoch, permission)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT (doc_id) DO UPDATE SET
                  owner = excluded.owner,
                  share_id = excluded.share_id,
-                 synced_epoch = excluded.synced_epoch",
+                 synced_epoch = excluded.synced_epoch,
+                 permission = excluded.permission",
             params![
                 doc_id.to_string(),
                 owner.to_string(),
                 share_id.to_string(),
-                synced_epoch
+                synced_epoch,
+                permission.as_str()
             ],
         )?;
+        Ok(())
+    }
+
+    fn rename_contact(&mut self, id: Uuid, petname: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE contacts SET petname = ?1 WHERE id = ?2",
+            params![petname, id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("contact {id}")));
+        }
         Ok(())
     }
 
     fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>> {
         self.conn
             .query_row(
-                "SELECT doc_id, owner, share_id, synced_epoch FROM mirrors WHERE doc_id = ?1",
+                "SELECT doc_id, owner, share_id, synced_epoch, permission FROM mirrors WHERE doc_id = ?1",
                 params![doc_id.to_string()],
                 mirror_row,
             )
@@ -1957,7 +2004,7 @@ impl BlockStore for SqliteStore {
     fn list_mirrors(&self) -> Result<Vec<Mirror>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT doc_id, owner, share_id, synced_epoch FROM mirrors ORDER BY doc_id")?;
+            .prepare("SELECT doc_id, owner, share_id, synced_epoch, permission FROM mirrors ORDER BY doc_id")?;
         let rows = stmt.query_map([], mirror_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()

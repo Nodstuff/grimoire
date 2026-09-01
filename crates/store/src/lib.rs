@@ -294,7 +294,17 @@ pub trait BlockStore {
         created_by: Uuid,
     ) -> Result<Doc>;
 
-    fn upsert_mirror(&mut self, doc_id: Uuid, owner: Uuid, share_id: Uuid, synced_epoch: i64) -> Result<()>;
+    fn upsert_mirror(
+        &mut self,
+        doc_id: Uuid,
+        owner: Uuid,
+        share_id: Uuid,
+        synced_epoch: i64,
+        permission: SharePermission,
+    ) -> Result<()>;
+
+    /// Rename a contact's petname (human surface).
+    fn rename_contact(&mut self, id: Uuid, petname: &str) -> Result<()>;
 
     fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>>;
 
