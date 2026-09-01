@@ -405,6 +405,33 @@ async fn list_proposals(State(st): State<FedState>) -> Json<Value> {
     }
 }
 
+#[derive(Deserialize)]
+pub struct CommentUpstreamReq {
+    pub block_id: Uuid,
+    pub text: String,
+    #[serde(default)]
+    pub reply_to: Option<Uuid>,
+}
+
+async fn comment_upstream(
+    State(st): State<FedState>,
+    Json(req): Json<CommentUpstreamReq>,
+) -> Json<Value> {
+    let Some(endpoint) = &st.ctx.endpoint else {
+        return Json(json!({"error": "federation disabled: no instance identity"}));
+    };
+    match crate::fed::comment_upstream(endpoint, &st.store, req.block_id, &req.text, req.reply_to)
+        .await
+    {
+        Ok(id) => {
+            // bring the thread home immediately rather than waiting a pull tick
+            crate::fed::pull_all_once(endpoint, &st.store).await;
+            Json(json!({"comment": id}))
+        }
+        Err(e) => Json(json!({"error": format!("{e:#}")})),
+    }
+}
+
 async fn pull_now(State(st): State<FedState>) -> Json<Value> {
     let Some(endpoint) = &st.ctx.endpoint else {
         return Json(json!({"error": "federation disabled: no instance identity"}));
@@ -444,6 +471,7 @@ pub fn router(store: Store, fed: FedCtx) -> Router {
         .route("/admin/joins", get(list_joins))
         .route("/admin/pull", post(pull_now))
         .route("/admin/propose_upstream", post(propose_upstream))
+        .route("/admin/comment_upstream", post(comment_upstream))
         .route("/admin/proposals", get(list_proposals))
         .with_state(FedState {
             store: store.clone(),
