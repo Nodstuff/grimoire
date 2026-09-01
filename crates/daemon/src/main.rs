@@ -74,6 +74,30 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<IdentityCmd>,
     },
+    /// Manage shares (talks to the running daemon).
+    Share {
+        #[command(subcommand)]
+        cmd: ShareCmd,
+    },
+    /// Join a share from a grimoire://join/… invite link.
+    Join { link: String },
+    /// List paired contacts.
+    Contacts,
+}
+
+#[derive(Subcommand)]
+enum ShareCmd {
+    /// Share a doc's subtree: mints a one-time invite link (7-day validity).
+    Invite {
+        doc_id: String,
+        /// view (default) or propose
+        #[arg(long, default_value = "view")]
+        permission: String,
+    },
+    List,
+    Revoke {
+        share_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -213,6 +237,66 @@ async fn main() -> anyhow::Result<()> {
             let r = reqwest::get("http://127.0.0.1:7425/admin/runs").await?;
             println!("{}", r.text().await?);
         }
+        Cmd::Share { cmd } => {
+            let client = reqwest::Client::new();
+            let base = "http://127.0.0.1:7425";
+            match cmd {
+                ShareCmd::Invite { doc_id, permission } => {
+                    let r = client
+                        .post(format!("{base}/admin/shares"))
+                        .json(&serde_json::json!({"root_doc": doc_id, "permission": permission}))
+                        .send()
+                        .await?;
+                    let v: serde_json::Value = r.json().await?;
+                    match v.get("link").and_then(|l| l.as_str()) {
+                        Some(link) => {
+                            println!("{link}");
+                            println!("(one-time, expires in 7 days — send it over a private channel)");
+                        }
+                        None => println!("{v}"),
+                    }
+                }
+                ShareCmd::List => {
+                    let r = client.get(format!("{base}/admin/shares")).send().await?;
+                    println!("{}", r.text().await?);
+                }
+                ShareCmd::Revoke { share_id } => {
+                    let r = client
+                        .post(format!("{base}/admin/shares/revoke"))
+                        .json(&serde_json::json!({"id": share_id}))
+                        .send()
+                        .await?;
+                    println!("{}", r.text().await?);
+                }
+            }
+        }
+        Cmd::Join { link } => {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?;
+            let r = client
+                .post("http://127.0.0.1:7425/admin/join")
+                .json(&serde_json::json!({"link": link}))
+                .send()
+                .await?;
+            let v: serde_json::Value = r.json().await?;
+            if let Some(j) = v.get("joined") {
+                println!(
+                    "joined \"{}\" from {} ({})",
+                    j["root_title"].as_str().unwrap_or("?"),
+                    j["owner_name"].as_str().unwrap_or("?"),
+                    j["permission"].as_str().unwrap_or("?"),
+                );
+            } else if v.get("queued").is_some() {
+                println!("owner unreachable — join queued, will retry in the background");
+            } else {
+                println!("{v}");
+            }
+        }
+        Cmd::Contacts => {
+            let r = reqwest::get("http://127.0.0.1:7425/admin/contacts").await?;
+            println!("{}", r.text().await?);
+        }
         Cmd::Identity { cmd } => {
             let db_dir = cli.db.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
             match cmd {
@@ -255,11 +339,20 @@ async fn main() -> anyhow::Result<()> {
             }
             let store = Arc::new(Mutex::new(store));
             // federation listener: separate iroh surface, deny-by-default
-            // (ADR 0002 decision 7); the HTTP router below never sees it
+            // (ADR 0002 decision 7); the HTTP router below never sees it —
+            // the admin routes only get the endpoint handle for outbound
+            // joins and the node id for minting links
+            let mut fed_ctx = admin::FedCtx {
+                node_id: None,
+                endpoint: None,
+            };
             if let Some(id) = fed_identity {
                 match fed::bind(id.secret_bytes()).await {
                     Ok(ep) => {
-                        tokio::spawn(fed::serve(ep, store.clone()));
+                        fed_ctx.node_id = Some(id.node_id());
+                        fed_ctx.endpoint = Some(ep.clone());
+                        tokio::spawn(fed::serve(ep.clone(), store.clone()));
+                        tokio::spawn(fed::join_retry_loop(ep, store.clone()));
                     }
                     Err(e) => tracing::warn!("federation endpoint failed to bind: {e:#}"),
                 }
@@ -269,7 +362,7 @@ async fn main() -> anyhow::Result<()> {
             let ui_dist = std::env::var("GRIMOIRE_UI_DIST")
                 .unwrap_or_else(|_| "/Users/tmeaney/personal/knowledge-system/ui/dist".into());
             let app = mcp::router(store.clone(), claude)
-                .merge(admin::router(store.clone()))
+                .merge(admin::router(store.clone(), fed_ctx))
                 .merge(api::router(api::ApiState { store, human: tom }))
                 .fallback_service(tower_http::services::ServeDir::new(&ui_dist).fallback(
                     tower_http::services::ServeFile::new(format!("{ui_dist}/index.html")),

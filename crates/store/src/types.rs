@@ -552,3 +552,13 @@ pub struct Mirror {
     pub share_id: Uuid,
     pub synced_epoch: i64,
 }
+
+/// A queued join (grantee-side): a redeem that waits for the owner to be up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingJoin {
+    pub id: Uuid,
+    pub ticket: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub created_at: String,
+}

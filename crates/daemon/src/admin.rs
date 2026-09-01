@@ -181,7 +181,160 @@ async fn set_policy(State(store): State<Store>, Json(req): Json<PolicyReq>) -> J
     }
 }
 
-pub fn router(store: Store) -> Router {
+// --- federation admin (ADR 0002; #57). Human surface only, never MCP. ---
+
+/// Federation context for the admin routes; both None when the instance has
+/// no identity (federation disabled).
+#[derive(Clone)]
+pub struct FedCtx {
+    pub node_id: Option<String>,
+    pub endpoint: Option<iroh::Endpoint>,
+}
+
+#[derive(Clone)]
+pub struct FedState {
+    pub store: Store,
+    pub ctx: FedCtx,
+}
+
+#[derive(Deserialize)]
+pub struct CreateShare {
+    pub root_doc: Uuid,
+    /// "view" (default) or "propose"
+    pub permission: Option<String>,
+}
+
+async fn create_share(State(st): State<FedState>, Json(req): Json<CreateShare>) -> Json<Value> {
+    let Some(node_id) = &st.ctx.node_id else {
+        return Json(json!({"error": "federation disabled: no instance identity"}));
+    };
+    let permission = match req.permission.as_deref() {
+        None => grimoire_store::SharePermission::View,
+        Some(p) => match grimoire_store::SharePermission::parse(p) {
+            Some(p) => p,
+            None => return Json(json!({"error": format!("bad permission: {p}")})),
+        },
+    };
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match crate::fed::mint_invite(&mut s, node_id, req.root_doc, permission) {
+        Ok((share, link)) => Json(json!({"share": share, "link": link})),
+        Err(e) => Json(json!({"error": format!("{e:#}")})),
+    }
+}
+
+async fn list_shares(State(st): State<FedState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.list_shares() {
+        Ok(shares) => Json(json!(shares)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct IdReq {
+    pub id: Uuid,
+}
+
+async fn revoke_share(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.set_share_state(req.id, grimoire_store::ShareState::Revoked) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn list_contacts(State(st): State<FedState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.list_contacts() {
+        Ok(c) => Json(json!(c)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn revoke_contact(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.revoke_contact(req.id) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct JoinReq {
+    pub link: String,
+}
+
+/// Join now if the owner is reachable; otherwise queue for the retry loop.
+/// Either way the caller learns which happened (async redeem, ADR 0002).
+async fn join(State(st): State<FedState>, Json(req): Json<JoinReq>) -> Json<Value> {
+    let ticket = match crate::fed::Ticket::parse(&req.link) {
+        Ok(t) => t,
+        Err(e) => return Json(json!({"error": format!("{e:#}")})),
+    };
+    let Some(endpoint) = &st.ctx.endpoint else {
+        return Json(json!({"error": "federation disabled: no instance identity"}));
+    };
+    let attempt = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        crate::fed::join_once(endpoint, &st.store, &ticket),
+    )
+    .await;
+    let err = match attempt {
+        Ok(Ok(outcome)) => return Json(json!({"joined": outcome})),
+        Ok(Err(e)) => format!("{e:#}"),
+        Err(_) => "owner unreachable (timed out)".into(),
+    };
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.queue_join(&req.link) {
+        Ok(id) => {
+            s.record_join_attempt(id, &err).ok();
+            Json(json!({"queued": true, "pending_join": id, "last_error": err}))
+        }
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn list_joins(State(st): State<FedState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.list_pending_joins() {
+        Ok(j) => Json(json!(j)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+pub fn router(store: Store, fed: FedCtx) -> Router {
+    let fed_routes = Router::new()
+        .route("/admin/shares", get(list_shares).post(create_share))
+        .route("/admin/shares/revoke", post(revoke_share))
+        .route("/admin/contacts", get(list_contacts))
+        .route("/admin/contacts/revoke", post(revoke_contact))
+        .route("/admin/join", post(join))
+        .route("/admin/joins", get(list_joins))
+        .with_state(FedState {
+            store: store.clone(),
+            ctx: fed,
+        });
     Router::new()
         .route(
             "/admin/gardeners",
@@ -192,6 +345,7 @@ pub fn router(store: Store) -> Router {
         .route("/admin/runs", get(list_runs))
         .route("/admin/policy", post(set_policy))
         .with_state(store)
+        .merge(fed_routes)
 }
 
 /// The 16:00 daily cut (§3.4): the daemon self-schedules; no external cron.
