@@ -438,6 +438,9 @@ impl KsMcp {
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if crate::hot::doc_is_hot(doc_id) {
+            return err("doc is in a live session — retry after it ends (P2.3)".to_string());
+        }
         match store.propose(doc_id, p.base_epoch, self.principal(), ops) {
             Ok(out) => {
                 if let Some(rid) = request_id {
@@ -493,6 +496,9 @@ impl KsMcp {
             return ok_json(
                 &json!({"doc_id": doc_id, "epoch": tree.doc.current_epoch, "verdicts": [], "note": "no changes"}),
             );
+        }
+        if crate::hot::doc_is_hot(doc_id) {
+            return err("doc is in a live session — retry after it ends (P2.3)".to_string());
         }
         match store.propose(doc_id, p.base_epoch, self.principal(), ops) {
             Ok(out) => {

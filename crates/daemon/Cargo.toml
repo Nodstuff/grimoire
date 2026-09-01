@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 grimoire-store = { path = "../store" }
 rmcp = { version = "3.1", features = ["server", "transport-streamable-http-server"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "time"] }
 uuid.workspace = true
@@ -27,4 +27,5 @@ keyring = { version = "3", features = ["apple-native"] }
 iroh = "1.1.0"
 sha2 = "0.11"
 data-encoding = "2"
-yrs = "0.27"
+yrs = { version = "0.27", features = ["sync"] }
+futures-util = "0.3.34"

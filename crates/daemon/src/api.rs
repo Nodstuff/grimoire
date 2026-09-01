@@ -272,6 +272,11 @@ struct ProposeReq {
 
 /// Human writes: propose as tom — current-epoch ops green and apply directly.
 async fn propose(State(st): State<ApiState>, Json(req): Json<ProposeReq>) -> Json<Value> {
+    if crate::hot::doc_is_hot(req.doc_id) {
+        return Json(json!({
+            "error": "doc is in a live session — edits go through the session"
+        }));
+    }
     let mut s = st
         .store
         .lock()
