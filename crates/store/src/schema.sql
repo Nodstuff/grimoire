@@ -220,7 +220,11 @@ CREATE TABLE IF NOT EXISTS mirrors (
     synced_epoch INTEGER NOT NULL DEFAULT 0,
     -- what the owner granted us: drives the editor mode (read-only vs
     -- propose-upstream); the owner enforces regardless
-    permission   TEXT NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'propose'))
+    permission   TEXT NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'propose')),
+    -- the owner tends this doc (a gardener over it or an ancestor). Shipped in
+    -- the pull meta so the grantee can show "tended by owner" and refuse to
+    -- tend it locally — one side's agents own a shared doc, never both.
+    owner_tended INTEGER NOT NULL DEFAULT 0
 );
 
 -- Grantee-side: joins that could not complete because the owner was offline.

@@ -8,6 +8,7 @@ import CanvasBlock from './CanvasBlock'
 import Sharing from './Sharing'
 import SharePanel from './SharePanel'
 import { notify, Notices } from './Notice'
+import { resolveShortcut } from './shortcuts'
 import {
   api,
   Block,
@@ -28,7 +29,7 @@ type View =
   | { kind: 'graph' }
   | { kind: 'sharing' }
   | { kind: 'home' }
-type Palette = null | 'commands' | 'search' | 'newdoc' | 'newcanvas'
+type Palette = null | 'commands' | 'open' | 'search' | 'newdoc' | 'newcanvas' | 'help'
 
 export default function App() {
   const [view, setViewRaw] = useState<View>({ kind: 'home' })
@@ -115,33 +116,65 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const mod = e.metaKey || e.ctrlKey
-      if (mod && e.key === 'k') {
-        e.preventDefault()
-        setPalette((p) => (p === 'commands' ? null : 'commands'))
-      } else if (mod && e.key === 't') {
-        e.preventDefault()
-        setTreeOpen((t) => !t)
-      } else if (mod && e.key === 'n') {
-        e.preventDefault()
-        setPalette((p) => (p === 'newdoc' ? null : 'newdoc'))
-      } else if (mod && e.key === 'r') {
-        e.preventDefault()
-        location.reload()
-      } else if (mod && e.key === '[') {
-        e.preventDefault()
-        goBack()
-      } else if (mod && e.key === ']') {
-        e.preventDefault()
-        goForward()
-      } else if (mod && e.key === 'w') {
-        e.preventDefault()
-        setView({ kind: 'home' })
-      } else if (mod && e.key === 's' && !e.shiftKey) {
-        e.preventDefault()
-        setPalette((p) => (p === 'search' ? null : 'search'))
-      } else if (e.key === 'Escape') {
+      const action = resolveShortcut(e)
+      if (!action) return
+      // Esc isn't a combo — leave its default (blur inputs etc.) intact.
+      if (action === 'escape') {
         setPalette(null)
+        return
+      }
+      // `?` has no modifier: ignore it while typing so it still inserts a `?`.
+      if (action === 'help') {
+        const el = e.target as HTMLElement | null
+        const typing =
+          !!el &&
+          (el.tagName === 'INPUT' ||
+            el.tagName === 'TEXTAREA' ||
+            el.isContentEditable)
+        if (typing) return
+        e.preventDefault()
+        setPalette((p) => (p === 'help' ? null : 'help'))
+        return
+      }
+      // every mod combo: ⌘P is webview Print, ⌘O the open-file dialog, etc.
+      e.preventDefault()
+      switch (action) {
+        case 'commands':
+          setPalette((p) => (p === 'commands' ? null : 'commands'))
+          break
+        case 'open':
+          setPalette((p) => (p === 'open' ? null : 'open'))
+          break
+        case 'search':
+          setPalette((p) => (p === 'search' ? null : 'search'))
+          break
+        case 'tree':
+          setTreeOpen((t) => !t)
+          break
+        case 'newdoc':
+          setPalette((p) => (p === 'newdoc' ? null : 'newdoc'))
+          break
+        case 'newcanvas':
+          setPalette((p) => (p === 'newcanvas' ? null : 'newcanvas'))
+          break
+        case 'review':
+          setView({ kind: 'review' })
+          break
+        case 'gardeners':
+          setView({ kind: 'runs' })
+          break
+        case 'reload':
+          location.reload()
+          break
+        case 'back':
+          goBack()
+          break
+        case 'forward':
+          goForward()
+          break
+        case 'home':
+          setView({ kind: 'home' })
+          break
       }
     }
     window.addEventListener('keydown', onKey)
@@ -186,9 +219,16 @@ export default function App() {
             <div className="home-mark">◈</div>
             <div className="home-hints">
               <span><kbd>⌘K</kbd> commands</span>
-              <span><kbd>⌘S</kbd> search</span>
+              <span><kbd>⌘O</kbd> open</span>
+              <span><kbd>⌘P</kbd> search</span>
               <span><kbd>⌘T</kbd> tree</span>
               <span><kbd>⌘N</kbd> new doc</span>
+              <span><kbd>⌘⇧N</kbd> canvas</span>
+              <span><kbd>⌘⇧R</kbd> review</span>
+              <span><kbd>⌘G</kbd> gardeners</span>
+              <span><kbd>⌘W</kbd> home</span>
+              <span><kbd>⌘[</kbd> <kbd>⌘]</kbd> history</span>
+              <span><kbd>?</kbd> all shortcuts</span>
             </div>
           </div>
         )}
@@ -229,9 +269,7 @@ export default function App() {
 
       {palette === 'commands' && (
         <CommandPalette
-          docs={docs}
           queueCount={queueCount}
-          onOpenDoc={openDoc}
           onAction={(a) => {
             if (a === 'review') setView({ kind: 'review' })
             if (a === 'runs') setView({ kind: 'runs' })
@@ -252,7 +290,11 @@ export default function App() {
           onClose={() => setPalette(null)}
         />
       )}
+      {palette === 'open' && (
+        <OpenDocPalette docs={docs} onOpenDoc={openDoc} onClose={() => setPalette(null)} />
+      )}
       {palette === 'search' && <SearchPalette onOpenDoc={openDoc} onClose={() => setPalette(null)} />}
+      {palette === 'help' && <ShortcutHelp onClose={() => setPalette(null)} />}
       {(palette === 'newdoc' || palette === 'newcanvas') && (
         <NewDocPalette
           canvas={palette === 'newcanvas'}
@@ -285,16 +327,75 @@ function PaletteShell({
   )
 }
 
+/** The full shortcut cheatsheet (opened with `?`). The home hint bar shows the
+ * common few; this is the complete list, including the editor-only marks. */
+function ShortcutHelp({ onClose }: { onClose: () => void }) {
+  const groups: [string, [string, string][]][] = [
+    [
+      'Navigate',
+      [
+        ['⌘K', 'commands'],
+        ['⌘O', 'open a doc'],
+        ['⌘P', 'search (⌘S, ⌘F too)'],
+        ['⌘T', 'toggle file tree'],
+        ['⌘W', 'home'],
+        ['⌘[ / ⌘]', 'history back / forward'],
+        ['⌘R', 'reload'],
+      ],
+    ],
+    [
+      'Create & act',
+      [
+        ['⌘N', 'new doc'],
+        ['⌘⇧N', 'new canvas'],
+        ['⌘⇧R', 'review queue'],
+        ['⌘G', 'gardeners'],
+      ],
+    ],
+    [
+      'In a doc',
+      [
+        ['⌘B / ⌘I / ⌘E', 'bold / italic / code'],
+        ['⌘↵', 'save now / post comment'],
+        ['Esc', 'close panel'],
+        ['?', 'this cheatsheet'],
+      ],
+    ],
+  ]
+  return (
+    <PaletteShell onClose={onClose}>
+      <div className="shortcut-help">
+        <div className="shortcut-help-title">Keyboard shortcuts</div>
+        {groups.map(([title, rows]) => (
+          <div className="shortcut-group" key={title}>
+            <div className="shortcut-group-title">{title}</div>
+            {rows.map(([keys, label]) => (
+              <div className="shortcut-row" key={keys}>
+                <span className="shortcut-keys">
+                  {keys.split(' ').map((k, i) =>
+                    k === '/' ? (
+                      <span key={i}> / </span>
+                    ) : (
+                      <kbd key={i}>{k}</kbd>
+                    ),
+                  )}
+                </span>
+                <span className="shortcut-label">{label}</span>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </PaletteShell>
+  )
+}
+
 function CommandPalette({
-  docs,
   queueCount,
-  onOpenDoc,
   onAction,
   onClose,
 }: {
-  docs: Doc[]
   queueCount: number
-  onOpenDoc: (id: string) => void
   onAction: (a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph' | 'sharing') => void
   onClose: () => void
 }) {
@@ -305,31 +406,29 @@ function CommandPalette({
 
   type Item = { label: string; hint?: string; run: () => void }
   const commands: Item[] = [
-    { label: `Review queue`, hint: queueCount ? `${queueCount} open` : 'empty', run: () => onAction('review') },
+    { label: `Review queue`, hint: '⌘⇧R', run: () => onAction('review') },
     { label: 'New doc…', hint: '⌘N', run: () => onAction('newdoc') },
-    { label: 'New canvas…', run: () => onAction('newcanvas') },
-    { label: 'Gardeners', run: () => onAction('runs') },
+    { label: 'New canvas…', hint: '⌘⇧N', run: () => onAction('newcanvas') },
+    { label: 'Gardeners', hint: '⌘G', run: () => onAction('runs') },
     { label: 'Sharing & contacts', run: () => onAction('sharing') },
     { label: 'Graph view', run: () => onAction('graph') },
     { label: 'Toggle file tree', hint: '⌘T', run: () => onAction('tree') },
     { label: 'Home', run: () => onAction('home') },
   ]
 
+  // ⌘K is operations only — docs live under ⌘O. Filter the commands, and
+  // surface the live review count as a hint on that row.
   const items: Item[] = useMemo(() => {
     const needle = q.trim().toLowerCase()
-    const cmds = commands.filter((c) => !needle || c.label.toLowerCase().includes(needle))
-    const docItems = (needle
-      ? docs.filter((d) => fuzzyMatch(needle, d.title.toLowerCase()))
-      : docs.slice(0, 0)
-    )
-      .slice(0, 12)
-      .map((d) => ({
-        label: d.is_canvas ? `▨ ${d.title}` : d.title,
-        hint: d.is_canvas ? 'canvas' : 'doc',
-        run: () => onOpenDoc(d.id),
-      }))
-    return [...cmds, ...docItems]
-  }, [q, docs, queueCount])
+    return commands
+      .map((c) =>
+        c.label === 'Review queue'
+          ? { ...c, hint: queueCount ? `${queueCount} open` : c.hint }
+          : c,
+      )
+      .filter((c) => !needle || c.label.toLowerCase().includes(needle))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q, queueCount])
 
   useEffect(() => setSel(0), [q])
 
@@ -337,7 +436,7 @@ function CommandPalette({
     <PaletteShell onClose={onClose}>
       <input
         ref={inputRef}
-        placeholder="Type a command or doc name…"
+        placeholder="Type a command…"
         value={q}
         onChange={(e) => setQ(e.target.value)}
         onKeyDown={(e) => {
@@ -358,6 +457,63 @@ function CommandPalette({
             {it.hint && <span className="hint">{it.hint}</span>}
           </div>
         ))}
+      </div>
+    </PaletteShell>
+  )
+}
+
+/** ⌘O — open a doc by title. Fuzzy over doc TITLES only (operations live under
+ * ⌘K, block-content search under ⌘P). */
+function OpenDocPalette({
+  docs,
+  onOpenDoc,
+  onClose,
+}: {
+  docs: Doc[]
+  onOpenDoc: (id: string) => void
+  onClose: () => void
+}) {
+  const [q, setQ] = useState('')
+  const [sel, setSel] = useState(0)
+  const inputRef = useRef<HTMLInputElement>(null)
+  useEffect(() => inputRef.current?.focus(), [])
+
+  const hits = useMemo(() => {
+    const needle = q.trim().toLowerCase()
+    const matched = needle
+      ? docs.filter((d) => fuzzyMatch(needle, d.title.toLowerCase()))
+      : docs
+    return matched.slice(0, 12)
+  }, [q, docs])
+
+  useEffect(() => setSel(0), [q])
+
+  return (
+    <PaletteShell onClose={onClose}>
+      <input
+        ref={inputRef}
+        placeholder="Open a doc…"
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowDown') setSel((s) => Math.min(s + 1, hits.length - 1))
+          if (e.key === 'ArrowUp') setSel((s) => Math.max(s - 1, 0))
+          if (e.key === 'Enter' && hits[sel]) onOpenDoc(hits[sel].id)
+        }}
+      />
+      <div className="palette-list">
+        {hits.map((d, i) => (
+          <div
+            key={d.id}
+            className={`palette-item ${i === sel ? 'sel' : ''}`}
+            onMouseEnter={() => setSel(i)}
+            onClick={() => onOpenDoc(d.id)}
+          >
+            <span>{d.is_canvas ? `▨ ${d.title}` : d.title}</span>
+            <span className="hint">{d.is_canvas ? 'canvas' : 'doc'}</span>
+          </div>
+        ))}
+        {docs.length === 0 && <div className="palette-empty">no docs</div>}
       </div>
     </PaletteShell>
   )
@@ -1071,6 +1227,7 @@ function DocView({
           {mirror.permission === 'view'
             ? ' · view only'
             : ' · your edits go to them as suggestions'}
+          {mirror.owner_tended && ` · 🌿 tended by ${mirror.owner_petname}`}
           {pendingProposals.length > 0 && (
             <span className="pending-chip">
               {pendingProposals.length} suggestion{pendingProposals.length > 1 ? 's' : ''} awaiting{' '}

@@ -46,11 +46,17 @@ async fn docs(State(st): State<ApiState>) -> Json<Value> {
         .collect();
     // federation decorations: mirror docs ("shared with me") and the roots
     // of active shares ("you are sharing this")
-    let mirrors: std::collections::HashMap<String, String> = s
-        .list_mirrors()
-        .unwrap_or_default()
-        .into_iter()
+    let mirror_rows = s.list_mirrors().unwrap_or_default();
+    let mirrors: std::collections::HashMap<String, String> = mirror_rows
+        .iter()
         .map(|m| (m.doc_id.to_string(), m.permission.as_str().to_string()))
+        .collect();
+    // mirrors tended on the owner's side: shown as tended locally, and the
+    // tend panel refuses to configure them (avoids two-sided agent edits)
+    let owner_tended: std::collections::HashSet<String> = mirror_rows
+        .iter()
+        .filter(|m| m.owner_tended)
+        .map(|m| m.doc_id.to_string())
         .collect();
     let share_roots: std::collections::HashSet<String> = s
         .list_shares()
@@ -66,7 +72,9 @@ async fn docs(State(st): State<ApiState>) -> Json<Value> {
                     let id = doc.id.to_string();
                     let mut v = json!(doc);
                     v["is_canvas"] = json!(canvases.contains(&id));
-                    v["is_tended"] = json!(tended.contains(&id));
+                    let owner_t = owner_tended.contains(&id);
+                    v["is_tended"] = json!(tended.contains(&id) || owner_t);
+                    v["owner_tended"] = json!(owner_t);
                     if let Some(perm) = mirrors.get(&id) {
                         v["mirror_permission"] = json!(perm);
                     }
@@ -101,6 +109,7 @@ async fn doc_federation(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Jso
             "owner_petname": petname_of(m.owner),
             "permission": m.permission,
             "synced_epoch": m.synced_epoch,
+            "owner_tended": m.owner_tended,
         })
     });
     let shares: Vec<Value> = s

@@ -13,6 +13,25 @@ use uuid::Uuid;
 
 pub type Store = Arc<Mutex<SqliteStore>>;
 
+/// A gardener scope must be your OWN doc, never a mirror or anything under one:
+/// a shared doc is tended by its owner's agents, and letting the grantee tend
+/// it too means two agents editing both copies. Returns a refusal message when
+/// the scope (or an ancestor) is a mirror.
+fn scope_on_mirror(s: &SqliteStore, scope_doc: Option<Uuid>) -> Option<String> {
+    let mut cur = scope_doc;
+    while let Some(id) = cur {
+        if s.get_mirror(id).ok().flatten().is_some() {
+            return Some(
+                "this doc is shared with you by its owner — it is tended on their side; \
+                 tending it here would have two agents editing both copies"
+                    .into(),
+            );
+        }
+        cur = s.get_doc(id).ok().and_then(|d| d.parent_id);
+    }
+    None
+}
+
 /// Gardener/admin route state: the store plus the hot set (gardener runs
 /// must honour the freeze on live docs, P2.3).
 #[derive(Clone)]
@@ -73,6 +92,9 @@ async fn create_gardener(
     let mut s = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(e) = scope_on_mirror(&s, req.scope_doc) {
+        return Json(json!({"error": e}));
+    }
     match s.create_gardener(&req.name, kind, &req.task_prompt, req.scope_doc, policy) {
         Ok(g) => Json(json!(g)),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -149,6 +171,9 @@ async fn update_gardener(
     let mut s = store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(e) = scope_on_mirror(&s, req.scope_doc) {
+        return Json(json!({"error": e}));
+    }
     let bindings = if req.bindings.is_null() {
         serde_json::json!([])
     } else {

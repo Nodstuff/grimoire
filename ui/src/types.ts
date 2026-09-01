@@ -9,6 +9,8 @@ export interface Doc {
   sort_key: string | null
   is_canvas?: boolean
   is_tended?: boolean
+  /** true when this doc is a mirror tended by agents on the OWNER's side */
+  owner_tended?: boolean
   /** present when this doc is a mirror synced from a remote owner */
   mirror_permission?: 'view' | 'propose'
   /** true when this doc is the root of an active share we own */
@@ -64,6 +66,8 @@ export interface DocFederation {
     owner_petname: string
     permission: 'view' | 'propose'
     synced_epoch: number
+    /** true when the owner has agents tending their copy */
+    owner_tended?: boolean
   } | null
   shares: {
     id: string

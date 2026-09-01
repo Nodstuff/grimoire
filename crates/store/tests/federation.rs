@@ -307,3 +307,41 @@ fn resharing_a_mirror_is_refused() {
             .is_ok()
     );
 }
+
+#[test]
+fn doc_is_tended_walks_ancestors_and_ignores_disabled() {
+    let (mut s, tom) = store_with_tom();
+    let root = s.create_doc("Runbook", None, tom.id).unwrap();
+    let child = s.create_doc("Deploys", Some(root.id), tom.id).unwrap();
+    let grandchild = s.create_doc("Rollback", Some(child.id), tom.id).unwrap();
+    let other = s.create_doc("Notes", None, tom.id).unwrap();
+    // no gardeners yet
+    assert!(!s.doc_is_tended(root.id).unwrap());
+    // a gardener scoped to root tends the whole subtree
+    let g = s
+        .create_gardener("keeper", GardenerKind::Keeper, "keep", Some(root.id), ConfidencePolicy::Review)
+        .unwrap();
+    assert!(s.doc_is_tended(root.id).unwrap());
+    assert!(s.doc_is_tended(child.id).unwrap());
+    assert!(s.doc_is_tended(grandchild.id).unwrap());
+    assert!(!s.doc_is_tended(other.id).unwrap(), "sibling subtree untended");
+    // disabling the gardener untends the subtree
+    s.set_gardener_enabled(g.id, false).unwrap();
+    assert!(!s.doc_is_tended(grandchild.id).unwrap());
+}
+
+#[test]
+fn mirror_tended_flag_round_trips() {
+    let (mut s, _tom) = store_with_tom();
+    let owner = s.pair_contact(&"cd".repeat(32), "owner").unwrap();
+    let doc = uuid::Uuid::now_v7();
+    s.create_doc_with_id(doc, "Shared", None, owner.principal).unwrap();
+    let share = uuid::Uuid::now_v7();
+    s.upsert_mirror(doc, owner.id, share, 1, SharePermission::View).unwrap();
+    assert!(!s.get_mirror(doc).unwrap().unwrap().owner_tended);
+    s.set_mirror_tended(doc, true).unwrap();
+    assert!(s.get_mirror(doc).unwrap().unwrap().owner_tended);
+    // upsert (a re-pull) must not clobber the tended flag
+    s.upsert_mirror(doc, owner.id, share, 2, SharePermission::View).unwrap();
+    assert!(s.get_mirror(doc).unwrap().unwrap().owner_tended, "tended survives re-upsert");
+}

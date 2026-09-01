@@ -580,6 +580,9 @@ pub struct Mirror {
     pub share_id: Uuid,
     pub synced_epoch: i64,
     pub permission: SharePermission,
+    /// The owner tends this doc on their side; the grantee shows it and is
+    /// refused local tending (avoids two agents editing both copies).
+    pub owner_tended: bool,
 }
 
 /// A queued join (grantee-side): a redeem that waits for the owner to be up.

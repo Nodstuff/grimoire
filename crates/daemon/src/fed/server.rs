@@ -526,6 +526,7 @@ fn handle_pull(
                 .map(|p| p.to_string()),
             title: d.title.clone(),
             epoch: d.current_epoch,
+            tended: store.doc_is_tended(d.id).unwrap_or(false),
         };
         let unchanged = cursor_map
             .get(&meta.id)
