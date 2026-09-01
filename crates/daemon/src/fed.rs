@@ -91,6 +91,11 @@ pub enum Request {
         share: String,
         doc: String,
     },
+    /// End + daemon-flatten a hot session (#67). Requires propose.
+    HotEnd {
+        share: String,
+        doc: String,
+    },
     /// The comment channel (#64, ADR 0003 §1). Applies DIRECTLY — comments
     /// are conversation, not content; block-type is restricted owner-side.
     /// `view` permission suffices: commenting is not editing.
@@ -154,6 +159,9 @@ pub enum Response {
     HotStarted {
         frozen_epoch: i64,
         seed: bool,
+    },
+    HotEnded {
+        flattened_ops: usize,
     },
     Refused {
         reason: String,
@@ -298,8 +306,8 @@ async fn handle_conn(
     }
 }
 
-fn dispatch(req: Request, peer: &str, store: &Arc<Mutex<SqliteStore>>, dedupe: &Dedupe) -> Response {
-    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+fn dispatch(req: Request, peer: &str, store_arc: &Arc<Mutex<SqliteStore>>, dedupe: &Dedupe) -> Response {
+    let mut store = store_arc.lock().unwrap_or_else(|p| p.into_inner());
     let contact = match store.contact_by_pubkey(peer) {
         Ok(c) => c.filter(|c| !c.revoked),
         Err(e) => {
@@ -449,6 +457,25 @@ fn dispatch(req: Request, peer: &str, store: &Arc<Mutex<SqliteStore>>, dedupe: &
                             Response::HotStarted { frozen_epoch, seed }
                         }
                         Err(e) => Response::Refused { reason: e.to_string() },
+                    }
+                }
+                Err(e) => Response::Refused { reason: e.to_string() },
+            }
+        }
+        Request::HotEnd { share, doc } => {
+            let Some(contact) = contact else {
+                return Response::Refused { reason: "unknown peer".into() };
+            };
+            match authorize_hot(&store, &contact, &share, &doc, true) {
+                Ok(doc_id) => {
+                    let Some(hot) = crate::hot::global() else {
+                        return Response::Refused { reason: "hot sessions unavailable".into() };
+                    };
+                    // flatten needs the store WITHOUT this dispatch holding it
+                    drop(store);
+                    match hot.flatten_and_close(store_arc, doc_id, "ended by peer") {
+                        Ok(applied) => Response::HotEnded { flattened_ops: applied },
+                        Err(e) => Response::Refused { reason: format!("{e:#}") },
                     }
                 }
                 Err(e) => Response::Refused { reason: e.to_string() },
@@ -880,6 +907,28 @@ pub async fn hot_status_upstream(
     match res {
         Response::HotStatusIs { hot, frozen_epoch } => Ok((hot, frozen_epoch)),
         other => anyhow::bail!("owner refused hot status: {other:?}"),
+    }
+}
+
+pub async fn hot_end_upstream(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    doc_id: uuid::Uuid,
+) -> Result<usize> {
+    let (mirror, owner) = mirror_owner(store, doc_id)?;
+    let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
+    let res = request(
+        endpoint,
+        EndpointAddr::from(owner_id),
+        Request::HotEnd {
+            share: mirror.share_id.to_string(),
+            doc: doc_id.to_string(),
+        },
+    )
+    .await?;
+    match res {
+        Response::HotEnded { flattened_ops } => Ok(flattened_ops),
+        other => anyhow::bail!("owner refused hot end: {other:?}"),
     }
 }
 
