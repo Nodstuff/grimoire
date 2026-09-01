@@ -37,7 +37,10 @@ const BlockId = Extension.create({
           blockId: {
             default: null,
             keepOnSplit: false,
-            rendered: false,
+            // rendered into the DOM so [[Doc#^uuid]] anchors can find blocks
+            parseHTML: (el: HTMLElement) => el.getAttribute('data-block-id'),
+            renderHTML: (attrs: Record<string, unknown>) =>
+              attrs.blockId ? { 'data-block-id': String(attrs.blockId) } : {},
           },
         },
       },
