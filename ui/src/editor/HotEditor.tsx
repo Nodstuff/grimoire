@@ -27,9 +27,13 @@ export interface HotDoc {
 
 export default function HotEditor({
   doc,
+  canEnd = true,
   onEnded,
 }: {
   doc: HotDoc
+  /** grantees on mirrors can't flatten (their propose path is upstream);
+   * v1: the owner ends the session */
+  canEnd?: boolean
   /** session over (we ended it, or the daemon dropped it) — reload cold */
   onEnded: () => void
 }) {
@@ -150,6 +154,15 @@ export default function HotEditor({
           })
       })
       flush()
+      // safety: an empty editor against a non-empty baseline means the
+      // session never got seeded (creator crashed before seeding) — a
+      // flatten here would mass-delete real content. Bail out.
+      if (entries.length === 0 && initial.baseline.length > 0) {
+        alert('live session was empty — no changes saved (doc kept as it was)')
+        await api(`/api/doc/${doc.docId}/hot/confirm`, { method: 'POST' })
+        onEnded()
+        return
+      }
       const ops = computeOps(initial.baseline, entries, () => crypto.randomUUID())
       if (ops.length > 0) {
         await api('/api/propose', {
@@ -174,9 +187,13 @@ export default function HotEditor({
       <div className="hot-banner">
         <span className="hot-dot" />
         live session · {peers} here · {connected ? 'synced' : 'connecting…'}
-        <button className="hot-end" disabled={ending} onClick={endSession}>
-          {ending ? 'saving…' : 'end session'}
-        </button>
+        {canEnd ? (
+          <button className="hot-end" disabled={ending} onClick={endSession}>
+            {ending ? 'saving…' : 'end session'}
+          </button>
+        ) : (
+          <span className="meta">the owner ends the session</span>
+        )}
       </div>
       <EditorContent editor={editor} />
     </>

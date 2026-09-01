@@ -159,6 +159,52 @@ impl HotState {
     }
 }
 
+impl HotState {
+    /// Subscribe to a live session: returns the fan-out receiver plus the
+    /// y-sync handshake frames to send first. None when the doc isn't hot.
+    pub fn connect(&self, doc_id: Uuid) -> Option<(broadcast::Receiver<Vec<u8>>, Vec<u8>)> {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let session = sessions.get_mut(&doc_id)?;
+        if session.ending {
+            return None;
+        }
+        let mut enc = EncoderV1::new();
+        DefaultProtocol.start(&session.awareness, &mut enc).ok()?;
+        Some((session.tx.subscribe(), enc.to_vec()))
+    }
+
+    /// One incoming y-sync frame from any transport: journal, apply, fan out
+    /// replies + awareness. Returns false when the session is gone/ending.
+    pub fn handle_frame(&self, doc_id: Uuid, data: &[u8]) -> bool {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(session) = sessions.get_mut(&doc_id) else {
+            return false;
+        };
+        if session.ending {
+            return false;
+        }
+        journal_updates(&mut session.journal, data);
+        let replies = DefaultProtocol.handle(&mut session.awareness, data);
+        rebroadcast_awareness(&session.tx, data);
+        if let Ok(msgs) = replies {
+            for m in msgs {
+                let mut enc = EncoderV1::new();
+                m.encode(&mut enc);
+                session.tx.send(enc.to_vec()).ok();
+            }
+        }
+        true
+    }
+
+    pub fn status(&self, doc_id: Uuid) -> (bool, Option<i64>) {
+        let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        match sessions.get(&doc_id) {
+            Some(s) if !s.ending => (true, Some(s.frozen_epoch)),
+            _ => (false, None),
+        }
+    }
+}
+
 static GLOBAL: std::sync::OnceLock<HotState> = std::sync::OnceLock::new();
 
 /// Install the daemon-wide hot set (called once at serve start).
@@ -172,14 +218,42 @@ pub fn doc_is_hot(doc: Uuid) -> bool {
     GLOBAL.get().map(|h| h.is_hot(doc)).unwrap_or(false)
 }
 
+/// The daemon-wide hot set, for the federation surface (#66).
+pub fn global() -> Option<&'static HotState> {
+    GLOBAL.get()
+}
+
 #[derive(Clone)]
 pub struct HotCtx {
     pub hot: HotState,
     pub store: Arc<Mutex<grimoire_store::SqliteStore>>,
+    /// Federation endpoint for mirror docs (#66): status/start/ws relay to
+    /// the owner's session. None = federation disabled.
+    pub endpoint: Option<iroh::Endpoint>,
+}
+
+fn mirror_of(ctx: &HotCtx, doc_id: Uuid) -> bool {
+    use grimoire_store::BlockStore;
+    let s = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
+    s.get_mirror(doc_id).ok().flatten().is_some()
 }
 
 async fn hot_start(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<Value> {
     use grimoire_store::BlockStore;
+    // mirror docs: the session lives on the OWNER's daemon (#66)
+    if mirror_of(&ctx, doc_id) {
+        let Some(ep) = &ctx.endpoint else {
+            return Json(json!({"error": "federation disabled"}));
+        };
+        return match crate::fed::hot_start_upstream(ep, &ctx.store, doc_id).await {
+            Ok((frozen_epoch, seed)) => Json(json!({
+                "ws": format!("/ws/hot/{doc_id}"),
+                "frozen_epoch": frozen_epoch,
+                "seed": seed,
+            })),
+            Err(e) => Json(json!({"error": format!("{e:#}")})),
+        };
+    }
     let frozen_epoch = {
         let s = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
         match s.get_doc(doc_id) {
@@ -232,6 +306,16 @@ async fn hot_confirm(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Jso
 }
 
 async fn hot_status(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<Value> {
+    if mirror_of(&ctx, doc_id) {
+        let Some(ep) = &ctx.endpoint else {
+            return Json(json!({"hot": false}));
+        };
+        return match crate::fed::hot_status_upstream(ep, &ctx.store, doc_id).await {
+            Ok((hot, frozen_epoch)) => Json(json!({"hot": hot, "frozen_epoch": frozen_epoch})),
+            // owner offline etc: not joinable, so not hot
+            Err(_) => Json(json!({"hot": false})),
+        };
+    }
     let sessions = ctx.hot.sessions.lock().unwrap_or_else(|p| p.into_inner());
     match sessions.get(&doc_id) {
         Some(s) => Json(json!({
@@ -252,22 +336,46 @@ async fn ws_hot(
 }
 
 async fn ws_session(mut socket: WebSocket, ctx: HotCtx, doc_id: Uuid) {
-    // handshake + subscribe under one short lock (no awaits while held)
-    let handshake = {
-        let mut sessions = ctx
-            .hot
-            .sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        sessions.get_mut(&doc_id).and_then(|session| {
-            let mut enc = EncoderV1::new();
-            DefaultProtocol
-                .start(&session.awareness, &mut enc)
-                .ok()
-                .map(|_| (session.tx.subscribe(), enc.to_vec()))
-        })
-    };
-    let Some((mut rx, hello)) = handshake else {
+    // mirror docs: pure byte pipe to the owner's session over iroh (#66) —
+    // the UI speaks y-sync to the owner's daemon through us
+    if mirror_of(&ctx, doc_id) {
+        let Some(ep) = ctx.endpoint.clone() else {
+            socket.send(WsMessage::Close(None)).await.ok();
+            return;
+        };
+        match crate::fed::open_hot_bridge(&ep, &ctx.store, doc_id).await {
+            Ok((to_owner, mut from_owner)) => {
+                use futures_util::{SinkExt, StreamExt};
+                let (mut ws_tx, mut ws_rx) = socket.split();
+                let down = tokio::spawn(async move {
+                    while let Some(frame) = from_owner.recv().await {
+                        if ws_tx.send(WsMessage::Binary(frame.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    ws_tx.send(WsMessage::Close(None)).await.ok();
+                });
+                while let Some(Ok(msg)) = ws_rx.next().await {
+                    match msg {
+                        WsMessage::Binary(b) => {
+                            if to_owner.send(b.to_vec()).await.is_err() {
+                                break;
+                            }
+                        }
+                        WsMessage::Close(_) => break,
+                        _ => {}
+                    }
+                }
+                down.abort();
+            }
+            Err(e) => {
+                tracing::debug!(%doc_id, "hot bridge failed: {e:#}");
+                socket.send(WsMessage::Close(None)).await.ok();
+            }
+        }
+        return;
+    }
+    let Some((mut rx, hello)) = ctx.hot.connect(doc_id) else {
         socket.send(WsMessage::Close(None)).await.ok();
         return;
     };
@@ -292,45 +400,8 @@ async fn ws_session(mut socket: WebSocket, ctx: HotCtx, doc_id: Uuid) {
             WsMessage::Close(_) => break,
             _ => continue,
         };
-        let mut sessions = ctx
-            .hot
-            .sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let Some(session) = sessions.get_mut(&doc_id) else {
+        if !ctx.hot.handle_frame(doc_id, &data) {
             break;
-        };
-        if session.ending {
-            break;
-        }
-        // journal update frames before applying: crash-safe by construction
-        journal_updates(&mut session.journal, &data);
-        // apply; direct replies (sync step 2 etc.) go to this socket only —
-        // but we can't await while holding the lock, so buffer them
-        let replies = DefaultProtocol.handle(&mut session.awareness, &data);
-        // awareness frames don't trigger doc observers: rebroadcast them here
-        rebroadcast_awareness(&session.tx, &data);
-        let out: Vec<Vec<u8>> = match replies {
-            Ok(msgs) => msgs
-                .into_iter()
-                .map(|m| {
-                    let mut enc = EncoderV1::new();
-                    m.encode(&mut enc);
-                    enc.to_vec()
-                })
-                .collect(),
-            Err(e) => {
-                tracing::debug!(%doc_id, "y-sync handle error: {e}");
-                Vec::new()
-            }
-        };
-        let tx = session.tx.clone();
-        drop(sessions);
-        for frame in out {
-            // replies route through the fan-out subscription of THIS socket
-            // too; sending direct would need the split sink — broadcast is
-            // fine (idempotent for peers, required answer for the asker)
-            tx.send(frame).ok();
         }
     }
     fan_out.abort();

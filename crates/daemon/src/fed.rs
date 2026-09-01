@@ -22,6 +22,8 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 
 pub const ALPN: &[u8] = b"grimoire/fed/0";
+/// Long-lived hot-session bridge streams (#66).
+pub const HOT_ALPN: &[u8] = b"grimoire/hot/0";
 pub const PROTOCOL_VERSION: u32 = 0;
 /// Frame cap. Snapshots (#58) will stream doc-by-doc, not grow this.
 const MAX_FRAME: usize = 32 * 1024 * 1024;
@@ -78,6 +80,17 @@ pub enum Request {
     },
     /// Status of previously proposed ops (only your own are disclosed).
     ProposalStatus { op_ids: Vec<String> },
+    /// Hot-session queries (#66): is the doc live / start one remotely.
+    HotStatus {
+        share: String,
+        doc: String,
+    },
+    /// Requires propose permission. Starting remotely seeds from the
+    /// GRANTEE's mirror (same content — the epoch is the owner's current).
+    HotStart {
+        share: String,
+        doc: String,
+    },
     /// The comment channel (#64, ADR 0003 §1). Applies DIRECTLY — comments
     /// are conversation, not content; block-type is restricted owner-side.
     /// `view` permission suffices: commenting is not editing.
@@ -133,6 +146,14 @@ pub enum Response {
     },
     Commented {
         block_id: String,
+    },
+    HotStatusIs {
+        hot: bool,
+        frozen_epoch: Option<i64>,
+    },
+    HotStarted {
+        frozen_epoch: i64,
+        seed: bool,
     },
     Refused {
         reason: String,
@@ -196,7 +217,7 @@ impl Ticket {
 pub async fn bind(secret: [u8; 32]) -> Result<Endpoint> {
     Endpoint::builder(presets::N0)
         .secret_key(SecretKey::from_bytes(&secret))
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), HOT_ALPN.to_vec()])
         .bind()
         .await
         .context("binding federation endpoint")
@@ -227,6 +248,12 @@ pub async fn serve(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>) {
                 }
             };
             let peer = conn.remote_id().to_string();
+            if conn.alpn() == HOT_ALPN {
+                if let Err(e) = handle_hot_bridge(conn, &peer, store).await {
+                    tracing::debug!(peer, "hot bridge ended: {e:#}");
+                }
+                return;
+            }
             if let Err(e) = handle_conn(conn, &peer, store, dedupe).await {
                 tracing::debug!(peer, "federation connection ended: {e:#}");
             }
@@ -389,6 +416,44 @@ fn dispatch(req: Request, peer: &str, store: &Arc<Mutex<SqliteStore>>, dedupe: &
             }
             res
         }
+        Request::HotStatus { share, doc } => {
+            let Some(contact) = contact else {
+                return Response::Refused { reason: "unknown peer".into() };
+            };
+            match authorize_hot(&store, &contact, &share, &doc, false) {
+                Ok(doc_id) => {
+                    let (hot, frozen_epoch) = crate::hot::global()
+                        .map(|h| h.status(doc_id))
+                        .unwrap_or((false, None));
+                    Response::HotStatusIs { hot, frozen_epoch }
+                }
+                Err(e) => Response::Refused { reason: e.to_string() },
+            }
+        }
+        Request::HotStart { share, doc } => {
+            let Some(contact) = contact else {
+                return Response::Refused { reason: "unknown peer".into() };
+            };
+            match authorize_hot(&store, &contact, &share, &doc, true) {
+                Ok(doc_id) => {
+                    let Some(hot) = crate::hot::global() else {
+                        return Response::Refused { reason: "hot sessions unavailable".into() };
+                    };
+                    let frozen_epoch = match store.get_doc(doc_id) {
+                        Ok(d) => d.current_epoch,
+                        Err(e) => return Response::Refused { reason: e.to_string() },
+                    };
+                    match hot.start(doc_id, frozen_epoch) {
+                        Ok(seed) => {
+                            tracing::info!(peer = contact.pubkey, %doc_id, "remote hot start");
+                            Response::HotStarted { frozen_epoch, seed }
+                        }
+                        Err(e) => Response::Refused { reason: e.to_string() },
+                    }
+                }
+                Err(e) => Response::Refused { reason: e.to_string() },
+            }
+        }
         Request::Comment {
             share,
             target_block,
@@ -431,6 +496,33 @@ fn dispatch(req: Request, peer: &str, store: &Arc<Mutex<SqliteStore>>, dedupe: &
             }
         }
     }
+}
+
+/// Shared hot-session authorization: active share bound to this contact,
+/// doc inside it; `need_propose` for anything beyond looking.
+fn authorize_hot(
+    store: &grimoire_store::SqliteStore,
+    contact: &grimoire_store::Contact,
+    share_id: &str,
+    doc_id: &str,
+    need_propose: bool,
+) -> Result<uuid::Uuid> {
+    let share_uuid: uuid::Uuid = share_id.parse().context("bad share id")?;
+    let doc_uuid: uuid::Uuid = doc_id.parse().context("bad doc id")?;
+    let share = store.get_share(share_uuid)?;
+    if share.contact != Some(contact.id) {
+        anyhow::bail!("share is not bound to this contact");
+    }
+    if share.state != grimoire_store::ShareState::Active {
+        anyhow::bail!("share is {}", share.state.as_str());
+    }
+    if need_propose && share.permission != grimoire_store::SharePermission::Propose {
+        anyhow::bail!("share is view-only");
+    }
+    if !store.docs_in_share(share_uuid)?.iter().any(|d| d.id == doc_uuid) {
+        anyhow::bail!("doc is not in this share");
+    }
+    Ok(doc_uuid)
 }
 
 /// Owner side of the comment channel (#64): authorize, then apply directly.
@@ -638,6 +730,193 @@ pub async fn request(
     let raw = recv.read_to_end(MAX_FRAME).await?;
     let frame: Frame<Response> = serde_json::from_slice(&raw).context("bad response frame")?;
     Ok(frame.msg)
+}
+
+/// Owner side of the hot bridge (#66): one bi-stream per remote participant.
+/// Header frame (JSON {share, doc}) authorizes; then raw y-sync frames flow
+/// both ways, length-prefixed (4-byte LE), through the SAME session paths as
+/// local websockets.
+async fn handle_hot_bridge(
+    conn: iroh::endpoint::Connection,
+    peer: &str,
+    store: Arc<Mutex<SqliteStore>>,
+) -> Result<()> {
+    let (mut send, mut recv) = conn.accept_bi().await?;
+    let header = read_frame(&mut recv).await?.context("bridge closed before header")?;
+    #[derive(Deserialize)]
+    struct Header {
+        share: String,
+        doc: String,
+    }
+    let header: Header = serde_json::from_slice(&header).context("bad bridge header")?;
+    let doc_id = {
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let contact = s
+            .contact_by_pubkey(peer)?
+            .filter(|c| !c.revoked)
+            .context("unknown peer")?;
+        // joining a live session is editing: propose required
+        authorize_hot(&s, &contact, &header.share, &header.doc, true)?
+    };
+    let Some(hot) = crate::hot::global() else {
+        anyhow::bail!("hot sessions unavailable");
+    };
+    let Some((mut rx, hello)) = hot.connect(doc_id) else {
+        anyhow::bail!("doc is not hot");
+    };
+    write_frame(&mut send, &hello).await?;
+    tracing::info!(peer, %doc_id, "hot bridge joined");
+
+    let fan_out = tokio::spawn(async move {
+        while let Ok(frame) = rx.recv().await {
+            if write_frame(&mut send, &frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    while let Some(frame) = read_frame(&mut recv).await? {
+        if !hot.handle_frame(doc_id, &frame) {
+            break;
+        }
+    }
+    fan_out.abort();
+    Ok(())
+}
+
+async fn write_frame(send: &mut iroh::endpoint::SendStream, data: &[u8]) -> Result<()> {
+    send.write_all(&(data.len() as u32).to_le_bytes()).await?;
+    send.write_all(data).await?;
+    Ok(())
+}
+
+async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> Result<Option<Vec<u8>>> {
+    let mut len = [0u8; 4];
+    match recv.read_exact(&mut len).await {
+        Ok(()) => {}
+        Err(_) => return Ok(None), // stream closed
+    }
+    let len = u32::from_le_bytes(len) as usize;
+    if len > 8 * 1024 * 1024 {
+        anyhow::bail!("bridge frame too large");
+    }
+    let mut buf = vec![0u8; len];
+    recv.read_exact(&mut buf).await.context("torn frame")?;
+    Ok(Some(buf))
+}
+
+/// Grantee side (#66): a raw duplex to the owner's session. The caller pumps
+/// ws-binary ↔ these channels.
+pub async fn open_hot_bridge(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    doc_id: uuid::Uuid,
+) -> Result<(
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+    tokio::sync::mpsc::Receiver<Vec<u8>>,
+)> {
+    let (mirror, owner) = {
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let mirror = s.get_mirror(doc_id)?.context("doc is not a mirror")?;
+        let owner = s
+            .list_contacts()?
+            .into_iter()
+            .find(|c| c.id == mirror.owner)
+            .context("mirror's owner contact is gone")?;
+        (mirror, owner)
+    };
+    let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
+    let conn = endpoint
+        .connect(EndpointAddr::from(owner_id), HOT_ALPN)
+        .await
+        .context("dialing owner for hot bridge")?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let header = serde_json::json!({
+        "share": mirror.share_id.to_string(),
+        "doc": doc_id.to_string(),
+    });
+    write_frame(&mut send, &serde_json::to_vec(&header)?).await?;
+
+    let (to_owner_tx, mut to_owner_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (from_owner_tx, from_owner_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    tokio::spawn(async move {
+        while let Some(frame) = to_owner_rx.recv().await {
+            if write_frame(&mut send, &frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        loop {
+            match read_frame(&mut recv).await {
+                Ok(Some(frame)) => {
+                    if from_owner_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break, // closed: dropping from_owner_tx ends the ws side
+            }
+        }
+    });
+    Ok((to_owner_tx, from_owner_rx))
+}
+
+/// Grantee-side one-shots for the UI surface (#66).
+pub async fn hot_status_upstream(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    doc_id: uuid::Uuid,
+) -> Result<(bool, Option<i64>)> {
+    let (mirror, owner) = mirror_owner(store, doc_id)?;
+    let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
+    let res = request(
+        endpoint,
+        EndpointAddr::from(owner_id),
+        Request::HotStatus {
+            share: mirror.share_id.to_string(),
+            doc: doc_id.to_string(),
+        },
+    )
+    .await?;
+    match res {
+        Response::HotStatusIs { hot, frozen_epoch } => Ok((hot, frozen_epoch)),
+        other => anyhow::bail!("owner refused hot status: {other:?}"),
+    }
+}
+
+pub async fn hot_start_upstream(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    doc_id: uuid::Uuid,
+) -> Result<(i64, bool)> {
+    let (mirror, owner) = mirror_owner(store, doc_id)?;
+    let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
+    let res = request(
+        endpoint,
+        EndpointAddr::from(owner_id),
+        Request::HotStart {
+            share: mirror.share_id.to_string(),
+            doc: doc_id.to_string(),
+        },
+    )
+    .await?;
+    match res {
+        Response::HotStarted { frozen_epoch, seed } => Ok((frozen_epoch, seed)),
+        other => anyhow::bail!("owner refused hot start: {other:?}"),
+    }
+}
+
+fn mirror_owner(
+    store: &Arc<Mutex<SqliteStore>>,
+    doc_id: uuid::Uuid,
+) -> Result<(grimoire_store::Mirror, grimoire_store::Contact)> {
+    let s = store.lock().unwrap_or_else(|p| p.into_inner());
+    let mirror = s.get_mirror(doc_id)?.context("doc is not a mirror")?;
+    let owner = s
+        .list_contacts()?
+        .into_iter()
+        .find(|c| c.id == mirror.owner)
+        .context("mirror's owner contact is gone")?;
+    Ok((mirror, owner))
 }
 
 /// The outcome of a completed join, for the UI/CLI.
