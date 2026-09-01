@@ -1588,6 +1588,32 @@ fn parse_annotation_status(s: &str) -> Result<AnnotationStatus> {
 }
 
 impl SqliteStore {
+    /// Blocks whose [[wikilinks]] point at this title (exact or path form),
+    /// for rewrite-on-rename. Returns (block_id, doc_id, content).
+    pub fn linking_blocks(&self, title: &str) -> Result<Vec<(Uuid, Uuid, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT b.id, b.doc_id, b.content
+             FROM edges e JOIN blocks b ON b.id = e.from_block
+             WHERE b.deleted = 0 AND (e.to_target = ?1 OR e.to_target LIKE '%/' || ?1)",
+        )?;
+        let rows = stmt.query_map(params![title], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (b, d, c) = r?;
+            Ok((
+                uuid_col(b, "edges.from_block")?,
+                uuid_col(d, "blocks.doc_id")?,
+                c,
+            ))
+        })
+        .collect()
+    }
+
     /// Outcome feedback for an agent: its recent ops with the annotation
     /// verdicts — (op, annotation_status, resolver_name). "What happened to
     /// my proposals, and who decided?"

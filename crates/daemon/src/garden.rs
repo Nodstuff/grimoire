@@ -928,6 +928,7 @@ const GRIMOIRE_PRIMER: &str = "## How Grimoire works (follow exactly)\n\
 - Headings (##, ###) nest the blocks that follow them; use them for structure.\n\
 - ``` fences are code blocks; ```mermaid and ```d2 fences render as live diagrams.\n\
 - A paragraph starting 'DECISION:' becomes a queryable decision record.\n\
+- A whiteboard is a doc whose only block is canvas_scene; agents draw by making its content {\"ks_diagram\": {\"nodes\": [{\"id\",\"label\",\"color\"}], \"edges\": [{\"from\",\"to\"}]}} — rendered as editable shapes.\n\
 - Titles are identity and link targets: short, stable, specific; never duplicate an existing title.\n\
 - Every write is attributed to you and reviewable — write nothing you cannot ground.\n\
 - Prose stays dense and factual; prefer tight bullets and tables to long paragraphs.";

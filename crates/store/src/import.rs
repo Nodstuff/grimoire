@@ -18,15 +18,15 @@ pub struct ImportReport {
 }
 
 #[derive(Debug, PartialEq)]
-struct Segment {
-    block_type: BlockType,
+pub(crate) struct Segment {
+    pub(crate) block_type: BlockType,
     /// Heading level for headings, 0 otherwise.
-    level: u8,
-    content: String,
+    pub(crate) level: u8,
+    pub(crate) content: String,
 }
 
 /// Split raw markdown into flat segments (headings carry their level).
-fn segment(md: &str) -> Vec<Segment> {
+pub(crate) fn segment(md: &str) -> Vec<Segment> {
     let lines: Vec<&str> = md.lines().collect();
     let mut segs = Vec::new();
     let mut i = 0;
