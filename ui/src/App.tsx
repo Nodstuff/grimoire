@@ -1237,14 +1237,9 @@ function DocView({
         </div>
       )}
       <div className="doc-head">
-        {mirror ? (
-          <h1 className="doc-title readonly">{tree.doc.title}</h1>
-        ) : (
-          <DocTitle doc={tree.doc} onRenamed={loadTree} />
-        )}
-        {tree.doc.review_policy && <span className="meta policy">{tree.doc.review_policy}</span>}
-        {!mirror && <StatusChip doc={tree.doc} onChanged={loadTree} />}
         <span className="head-actions">
+          {tree.doc.review_policy && <span className="meta policy">{tree.doc.review_policy}</span>}
+          {!mirror && <StatusChip doc={tree.doc} onChanged={loadTree} />}
           <button
             className={`chip ${panel === 'history' ? 'on' : ''}`}
             onClick={() => setPanel(panel === 'history' ? 'none' : 'history')}
@@ -1283,6 +1278,11 @@ function DocView({
             </button>
           )}
         </span>
+        {mirror ? (
+          <h1 className="doc-title readonly">{tree.doc.title}</h1>
+        ) : (
+          <DocTitle doc={tree.doc} onRenamed={loadTree} />
+        )}
       </div>
       {hot ? (
         <HotEditor

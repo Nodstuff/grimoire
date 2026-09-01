@@ -64,7 +64,7 @@ kbd {
 /* ---------- doc ---------- */
 
 .doc { max-width: 680px; width: 100%; }
-.doc-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 28px; }
+.doc-head { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom: 24px; }
 .doc-head h1 { margin: 0; font-size: 26px; font-weight: 650; letter-spacing: -0.01em; }
 .meta { font-size: 11px; color: var(--fg-dim); }
 .policy { color: var(--yellow); }
@@ -428,14 +428,15 @@ kbd {
 
 /* ---------- side panel (history / comments) ---------- */
 
-.head-actions { margin-left: auto; display: flex; gap: 6px; }
+.head-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
 .chip {
   background: none;
   border: 1px solid var(--border);
   color: var(--fg-dim);
-  border-radius: 12px;
-  padding: 2px 10px;
-  font-size: 11px;
+  border-radius: 10px;
+  padding: 1px 8px;
+  font-size: 10px;
+  line-height: 1.5;
   cursor: pointer;
 }
 .chip.on, .chip:hover { color: var(--fg); background: var(--panel); }
