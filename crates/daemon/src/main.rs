@@ -198,6 +198,12 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", r.text().await?);
         }
         Cmd::Serve { port } => {
+            let mut store = store;
+            if let Ok(n) = store.mark_orphaned_runs()
+                && n > 0
+            {
+                tracing::warn!("marked {n} orphaned gardener runs (daemon restarted mid-run)");
+            }
             let store = Arc::new(Mutex::new(store));
             tokio::spawn(admin::daily_loop(store.clone()));
             // ui/dist next to the binary's repo root; fall back to cwd

@@ -420,7 +420,10 @@ impl GardenerKind {
     /// Kinds that require a scope doc — the opt-in boundary: docs outside
     /// every scoped tending are never touched by these.
     pub fn scoped_only(&self) -> bool {
-        matches!(self, GardenerKind::Auditor | GardenerKind::Scribe | GardenerKind::Keeper)
+        matches!(
+            self,
+            GardenerKind::Auditor | GardenerKind::Scribe | GardenerKind::Keeper
+        )
     }
 
     pub fn parse(s: &str) -> Option<Self> {
