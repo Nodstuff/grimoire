@@ -81,6 +81,8 @@ enum Cmd {
     },
     /// Join a share from a grimoire://join/… invite link.
     Join { link: String },
+    /// Pull all shared mirrors from their owners now.
+    Pull,
     /// List paired contacts.
     Contacts,
 }
@@ -297,6 +299,16 @@ async fn main() -> anyhow::Result<()> {
             let r = reqwest::get("http://127.0.0.1:7425/admin/contacts").await?;
             println!("{}", r.text().await?);
         }
+        Cmd::Pull => {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()?;
+            let r = client
+                .post("http://127.0.0.1:7425/admin/pull")
+                .send()
+                .await?;
+            println!("{}", r.text().await?);
+        }
         Cmd::Identity { cmd } => {
             let db_dir = cli.db.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
             match cmd {
@@ -352,7 +364,8 @@ async fn main() -> anyhow::Result<()> {
                         fed_ctx.node_id = Some(id.node_id());
                         fed_ctx.endpoint = Some(ep.clone());
                         tokio::spawn(fed::serve(ep.clone(), store.clone()));
-                        tokio::spawn(fed::join_retry_loop(ep, store.clone()));
+                        tokio::spawn(fed::join_retry_loop(ep.clone(), store.clone()));
+                        tokio::spawn(fed::pull_loop(ep, store.clone()));
                     }
                     Err(e) => tracing::warn!("federation endpoint failed to bind: {e:#}"),
                 }

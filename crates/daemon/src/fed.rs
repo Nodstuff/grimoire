@@ -47,6 +47,32 @@ pub enum Request {
     Redeem { secret: String, petname: String },
     /// Authenticated no-op: proves the allowlist path end to end.
     Ping,
+    /// The read protocol (#58). Empty cursors = initial snapshot. The owner
+    /// answers with metas for every in-share doc (renames/moves don't bump
+    /// epochs, so metas always ship), full blocks for docs the cursor has
+    /// never seen or that changed, and removals for cursor docs that left
+    /// the share.
+    Pull {
+        share: String,
+        /// (doc_id, synced_epoch) for every mirror doc we hold.
+        cursors: Vec<(String, i64)>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct WireDocMeta {
+    pub id: String,
+    /// Parent doc id if the parent is inside the shared subtree; None for
+    /// the share root (its real parent is private to the owner).
+    pub parent: Option<String>,
+    pub title: String,
+    pub epoch: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct WireDoc {
+    pub meta: WireDocMeta,
+    pub blocks: Vec<grimoire_store::MirrorBlock>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -62,6 +88,11 @@ pub enum Response {
         owner_name: String,
     },
     Pong,
+    Pulled {
+        metas: Vec<WireDocMeta>,
+        changed: Vec<WireDoc>,
+        removed: Vec<String>,
+    },
     Refused {
         reason: String,
     },
@@ -254,7 +285,96 @@ fn dispatch(req: Request, peer: &str, store: &Arc<Mutex<SqliteStore>>) -> Respon
                 }
             }
         },
+        Request::Pull { share, cursors } => {
+            let Some(contact) = contact else {
+                tracing::warn!(peer, "unauthenticated pull refused");
+                return Response::Refused {
+                    reason: "unknown peer: redeem an invite first".into(),
+                };
+            };
+            match handle_pull(&store, &contact, &share, &cursors) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(peer, share, "pull refused: {e}");
+                    Response::Refused {
+                        reason: e.to_string(),
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Owner side of the read protocol (#58). The share's recursive containment
+/// is the entire universe this peer can see: docs outside it are never
+/// enumerated, wikilinks pointing out of it simply won't resolve downstream.
+fn handle_pull(
+    store: &grimoire_store::SqliteStore,
+    contact: &grimoire_store::Contact,
+    share_id: &str,
+    cursors: &[(String, i64)],
+) -> Result<Response> {
+    let share_uuid: uuid::Uuid = share_id.parse().context("bad share id")?;
+    let share = store.get_share(share_uuid)?;
+    if share.contact != Some(contact.id) {
+        anyhow::bail!("share is not bound to this contact");
+    }
+    if share.state != grimoire_store::ShareState::Active {
+        anyhow::bail!("share is {}", share.state.as_str());
+    }
+    let docs = store.docs_in_share(share_uuid)?;
+    let in_share: std::collections::HashSet<uuid::Uuid> = docs.iter().map(|d| d.id).collect();
+    let cursor_map: std::collections::HashMap<String, i64> = cursors.iter().cloned().collect();
+
+    let mut metas = Vec::new();
+    let mut changed = Vec::new();
+    for d in &docs {
+        let meta = WireDocMeta {
+            id: d.id.to_string(),
+            parent: d
+                .parent_id
+                .filter(|p| in_share.contains(p))
+                .map(|p| p.to_string()),
+            title: d.title.clone(),
+            epoch: d.current_epoch,
+        };
+        let unchanged = cursor_map
+            .get(&meta.id)
+            .is_some_and(|c| *c >= d.current_epoch);
+        if !unchanged {
+            let blocks = store
+                .doc_blocks_flat(d.id)?
+                .into_iter()
+                .map(|b| grimoire_store::MirrorBlock {
+                    id: b.id,
+                    parent_id: b.parent_id,
+                    order_key: b.order_key,
+                    block_type: b.block_type,
+                    content: b.content,
+                    refers_to: b.refers_to,
+                })
+                .collect();
+            changed.push(WireDoc {
+                meta: meta.clone(),
+                blocks,
+            });
+        }
+        metas.push(meta);
+    }
+    let removed = cursor_map
+        .keys()
+        .filter(|id| {
+            uuid::Uuid::parse_str(id)
+                .map(|u| !in_share.contains(&u))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    Ok(Response::Pulled {
+        metas,
+        changed,
+        removed,
+    })
 }
 
 /// One request against a remote instance (grantee-side; the pull loop and
@@ -372,6 +492,169 @@ pub async fn join_at(
         root_title,
         permission,
     })
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct PullSummary {
+    pub changed: usize,
+    pub removed: usize,
+}
+
+/// Pull one share from its owner and apply the response (#59).
+pub async fn pull_share(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    addr: EndpointAddr,
+    owner: &grimoire_store::Contact,
+    share_id: uuid::Uuid,
+) -> Result<PullSummary> {
+    let cursors: Vec<(String, i64)> = {
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        s.list_mirrors()?
+            .into_iter()
+            .filter(|m| m.share_id == share_id)
+            .map(|m| (m.doc_id.to_string(), m.synced_epoch))
+            .collect()
+    };
+    let res = request(
+        endpoint,
+        addr,
+        Request::Pull {
+            share: share_id.to_string(),
+            cursors,
+        },
+    )
+    .await?;
+    let Response::Pulled {
+        metas,
+        changed,
+        removed,
+    } = res
+    else {
+        anyhow::bail!("owner refused pull: {res:?}");
+    };
+
+    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+    let summary = PullSummary {
+        changed: changed.len(),
+        removed: removed.len(),
+    };
+
+    // 1. create any docs we've never seen, parents before children
+    let mut pending: Vec<&WireDoc> = changed.iter().collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        pending.retain(|wd| {
+            let id: uuid::Uuid = match wd.meta.id.parse() {
+                Ok(u) => u,
+                Err(_) => return false, // malformed: drop
+            };
+            if s.get_doc(id).is_ok() {
+                return false; // exists
+            }
+            let parent = wd.meta.parent.as_ref().and_then(|p| p.parse().ok());
+            // parent not materialized yet → retry next round
+            if let Some(p) = parent
+                && s.get_doc(p).is_err()
+            {
+                return true;
+            }
+            s.create_doc_with_id(id, &wd.meta.title, parent, owner.principal)
+                .is_err()
+        });
+        if pending.len() == before {
+            // cycle or missing parent that never arrives: root the rest
+            for wd in pending.drain(..) {
+                if let Ok(id) = wd.meta.id.parse::<uuid::Uuid>()
+                    && s.get_doc(id).is_err()
+                {
+                    s.create_doc_with_id(id, &wd.meta.title, None, owner.principal)
+                        .ok();
+                }
+            }
+        }
+    }
+
+    // 2. metas: renames and moves don't bump epochs, so reconcile them always
+    for m in &metas {
+        let Ok(id) = m.id.parse::<uuid::Uuid>() else {
+            continue;
+        };
+        let Ok(local) = s.get_doc(id) else { continue };
+        if local.title != m.title {
+            s.rename_doc(id, &m.title).ok();
+        }
+        let parent: Option<uuid::Uuid> = m.parent.as_ref().and_then(|p| p.parse().ok());
+        if local.parent_id != parent {
+            s.move_doc(id, parent, None).ok();
+        }
+    }
+
+    // 3. blocks + cursors for everything that changed
+    for wd in &changed {
+        let Ok(id) = wd.meta.id.parse::<uuid::Uuid>() else {
+            continue;
+        };
+        s.upsert_mirror(id, owner.id, share_id, 0)?;
+        s.mirror_replace_blocks(id, wd.blocks.clone(), wd.meta.epoch, owner.principal)?;
+    }
+
+    // 4. docs that left the share: gone from our view, mirror row dropped
+    for id in &removed {
+        if let Ok(u) = id.parse::<uuid::Uuid>() {
+            s.remove_mirror(u).ok();
+            s.delete_doc(u).ok();
+        }
+    }
+    Ok(summary)
+}
+
+/// Pull every share we hold mirrors for. Groups mirrors by (owner, share),
+/// skips revoked owners, dials by node id (discovery).
+pub async fn pull_all_once(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+) -> Vec<(uuid::Uuid, Result<PullSummary>)> {
+    let groups: Vec<(grimoire_store::Contact, uuid::Uuid)> = {
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let mirrors = s.list_mirrors().unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+        mirrors
+            .into_iter()
+            .filter(|m| seen.insert((m.owner, m.share_id)))
+            .filter_map(|m| {
+                let contacts = s.list_contacts().ok()?;
+                let c = contacts.into_iter().find(|c| c.id == m.owner)?;
+                (!c.revoked).then_some((c, m.share_id))
+            })
+            .collect()
+    };
+    let mut out = Vec::new();
+    for (owner, share_id) in groups {
+        let res = match owner.pubkey.parse::<iroh::EndpointId>() {
+            Ok(id) => pull_share(endpoint, store, EndpointAddr::from(id), &owner, share_id).await,
+            Err(_) => Err(anyhow::anyhow!("contact has a malformed pubkey")),
+        };
+        out.push((share_id, res));
+    }
+    out
+}
+
+/// Background sync: external owner edits appear within one interval (#59).
+pub async fn pull_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>) {
+    const PULL_EVERY: std::time::Duration = std::time::Duration::from_secs(120);
+    loop {
+        tokio::time::sleep(PULL_EVERY).await;
+        for (share, res) in pull_all_once(&endpoint, &store).await {
+            match res {
+                Ok(s) if s.changed > 0 || s.removed > 0 => {
+                    tracing::info!(%share, changed = s.changed, removed = s.removed, "pulled");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!(%share, "pull failed (owner offline?): {e:#}"),
+            }
+        }
+    }
 }
 
 /// Background retry for joins whose owner was offline (async redeem,
@@ -646,6 +929,154 @@ mod tests {
             let share = s.get_share(share.id).unwrap();
             assert_eq!(share.contact, Some(alice_contact.id));
         }
+    }
+
+    #[tokio::test]
+    async fn pull_syncs_subtree_edits_renames_moves_and_removals() {
+        use grimoire_store::{BlockType, OpInput, OpKind};
+
+        // owner: root with a child doc, each with a block
+        let mut owner_store = SqliteStore::open_in_memory().unwrap();
+        let tom = owner_store
+            .create_principal(PrincipalKind::Human, "tom", None)
+            .unwrap();
+        let root = owner_store.create_doc("Runbook", None, tom.id).unwrap();
+        let child = owner_store
+            .create_doc("Deploys", Some(root.id), tom.id)
+            .unwrap();
+        let block_op = |content: &str| OpInput {
+            kind: OpKind::Insert {
+                block_id: uuid::Uuid::now_v7(),
+                parent_id: None,
+                order_key: "i".into(),
+                block_type: BlockType::Paragraph,
+                content: content.into(),
+                refers_to: None,
+            },
+            source_refs: vec![],
+        };
+        owner_store
+            .apply(root.id, 0, tom.id, vec![block_op("root text")])
+            .unwrap();
+        owner_store
+            .apply(child.id, 0, tom.id, vec![block_op("child text")])
+            .unwrap();
+
+        let owner_ep = local_endpoint().await;
+        let (share, link) = mint_invite(
+            &mut owner_store,
+            &owner_ep.id().to_string(),
+            root.id,
+            SharePermission::View,
+        )
+        .unwrap();
+        let owner_store = Arc::new(Mutex::new(owner_store));
+        let addr = direct_addr(&owner_ep);
+        tokio::spawn(serve(owner_ep, owner_store.clone()));
+
+        // grantee joins, then pulls the snapshot
+        let mut alice_store = SqliteStore::open_in_memory().unwrap();
+        alice_store
+            .create_principal(PrincipalKind::Human, "alice", None)
+            .unwrap();
+        let alice_store = Arc::new(Mutex::new(alice_store));
+        let alice_ep = local_endpoint().await;
+        let ticket = Ticket::parse(&link).unwrap();
+        join_at(&alice_ep, &alice_store, &ticket, addr.clone())
+            .await
+            .unwrap();
+        let owner_contact = {
+            let s = alice_store.lock().unwrap();
+            s.list_contacts().unwrap().into_iter().next().unwrap()
+        };
+        let sum = pull_share(&alice_ep, &alice_store, addr.clone(), &owner_contact, share.id)
+            .await
+            .unwrap();
+        assert_eq!(sum.changed, 2); // root + child
+
+        {
+            let s = alice_store.lock().unwrap();
+            let tree = s.read_doc(child.id).unwrap();
+            assert_eq!(tree.doc.title, "Deploys");
+            assert_eq!(tree.doc.parent_id, Some(root.id));
+            assert_eq!(tree.roots[0].block.content, "child text");
+            // mirror is read-only at the store layer
+            let mut s = s;
+            let err = s.apply(child.id, tree.doc.current_epoch, owner_contact.principal,
+                vec![block_op("local vandalism")]);
+            assert!(matches!(err, Err(grimoire_store::StoreError::InvalidOp(_))));
+        }
+
+        // owner: edit root, rename child, add grandchild, then pull again
+        {
+            let mut s = owner_store.lock().unwrap();
+            let epoch = s.get_doc(root.id).unwrap().current_epoch;
+            s.apply(root.id, epoch, tom.id, vec![block_op("more root text")])
+                .unwrap();
+            s.rename_doc(child.id, "Deploy Runbook").unwrap();
+            let gc = s.create_doc("Rollbacks", Some(child.id), tom.id).unwrap();
+            s.apply(gc.id, 0, tom.id, vec![block_op("rollback text")])
+                .unwrap();
+        }
+        let sum = pull_share(&alice_ep, &alice_store, addr.clone(), &owner_contact, share.id)
+            .await
+            .unwrap();
+        assert_eq!(sum.changed, 2); // root (edited) + grandchild (new)
+        {
+            let s = alice_store.lock().unwrap();
+            assert_eq!(s.get_doc(child.id).unwrap().title, "Deploy Runbook");
+            let gc = s
+                .list_docs()
+                .unwrap()
+                .into_iter()
+                .find(|d| d.title == "Rollbacks")
+                .expect("grandchild mirrored");
+            assert_eq!(gc.parent_id, Some(child.id));
+            let root_tree = s.read_doc(root.id).unwrap();
+            assert_eq!(root_tree.roots.len(), 2);
+        }
+
+        // owner moves child (and its subtree) out of the share
+        {
+            let mut s = owner_store.lock().unwrap();
+            s.move_doc(child.id, None, None).unwrap();
+        }
+        let sum = pull_share(&alice_ep, &alice_store, addr, &owner_contact, share.id)
+            .await
+            .unwrap();
+        assert_eq!(sum.removed, 2); // child + grandchild left the share
+        {
+            let s = alice_store.lock().unwrap();
+            assert!(s.get_mirror(child.id).unwrap().is_none());
+            // soft-deleted locally: no longer in the live listing
+            assert!(!s.list_docs().unwrap().iter().any(|d| d.id == child.id));
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_of_unbound_share_is_refused() {
+        let store = owner_store("secret");
+        let share_id = {
+            let s = store.lock().unwrap();
+            s.list_shares().unwrap()[0].id
+        };
+        let owner = local_endpoint().await;
+        let addr = direct_addr(&owner);
+        tokio::spawn(serve(owner, store.clone()));
+
+        // mallory redeems nothing but tries to pull the share
+        let mallory = local_endpoint().await;
+        let res = request(
+            &mallory,
+            addr,
+            Request::Pull {
+                share: share_id.to_string(),
+                cursors: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(res, Response::Refused { .. }));
     }
 
     #[tokio::test]

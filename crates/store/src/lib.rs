@@ -300,6 +300,25 @@ pub trait BlockStore {
 
     fn list_mirrors(&self) -> Result<Vec<Mirror>>;
 
+    fn remove_mirror(&mut self, doc_id: Uuid) -> Result<()>;
+
+    /// Live blocks of a doc, flat (parent/order fields carry the tree) — the
+    /// owner-side snapshot read for the federation wire (#58).
+    fn doc_blocks_flat(&self, doc_id: Uuid) -> Result<Vec<Block>>;
+
+    /// Wholesale-replace a mirror doc's blocks and pin its epoch to the
+    /// owner's (#58). v1 read path: the wire detects change by epoch compare
+    /// and ships whole docs; op-granular shipping is the later upgrade, and
+    /// this method is what it would replace. Block ids are the owner's, so
+    /// deep links and comment anchors survive syncs.
+    fn mirror_replace_blocks(
+        &mut self,
+        doc_id: Uuid,
+        blocks: Vec<MirrorBlock>,
+        owner_epoch: i64,
+        principal: Uuid,
+    ) -> Result<()>;
+
     // Grantee-side join queue: redeems that will retry until the owner is up.
 
     /// Queue a join ticket for background retry. Idempotent on ticket text.
