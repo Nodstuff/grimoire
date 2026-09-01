@@ -260,8 +260,67 @@ impl HotState {
             let md = crate::yrender::fragment_to_markdown(&txn, &frag);
             (md, session.frozen_epoch, session.started_at.elapsed().as_secs())
         };
+        // canvas sessions (#68/P2.5): shapes live in Y.Maps ("canvas_nodes"/
+        // "canvas_edges", values = JSON strings, LWW per shape). Non-empty
+        // maps mean this was a canvas session — flatten to ks_diagram.
+        let canvas: Option<serde_json::Value> = {
+            let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            sessions.get(&doc_id).and_then(|session| {
+                use yrs::Map as _;
+                let ydoc = session.awareness.doc();
+                let nodes_map = ydoc.get_or_insert_map("canvas_nodes");
+                let edges_map = ydoc.get_or_insert_map("canvas_edges");
+                let txn = ydoc.transact();
+                let parse_map = |m: &yrs::MapRef| -> Vec<serde_json::Value> {
+                    let mut out: Vec<(String, serde_json::Value)> = m
+                        .iter(&txn)
+                        .filter_map(|(k, v)| {
+                            let s = match v {
+                                yrs::Out::Any(yrs::Any::String(s)) => s.to_string(),
+                                _ => return None,
+                            };
+                            serde_json::from_str(&s).ok().map(|j| (k.to_string(), j))
+                        })
+                        .collect();
+                    out.sort_by(|a, b| a.0.cmp(&b.0));
+                    out.into_iter().map(|(_, v)| v).collect()
+                };
+                let nodes = parse_map(&nodes_map);
+                if nodes.is_empty() {
+                    return None;
+                }
+                let edges = parse_map(&edges_map);
+                Some(serde_json::json!({"ks_diagram": {"nodes": nodes, "edges": edges}}))
+            })
+        };
+
         // 2. diff + propose OUTSIDE the session lock
-        let applied = {
+        let applied = if let Some(content) = canvas {
+            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+            let tree = s.read_doc(doc_id)?;
+            let target = tree
+                .roots
+                .iter()
+                .find(|n| n.block.block_type == grimoire_store::BlockType::CanvasScene)
+                .map(|n| n.block.id);
+            let Some(target) = target else {
+                anyhow::bail!("canvas session on a doc with no canvas block");
+            };
+            let human = s
+                .list_principals()?
+                .into_iter()
+                .find(|p| p.kind == grimoire_store::PrincipalKind::Human)
+                .ok_or_else(|| anyhow::anyhow!("no human principal"))?;
+            let op = grimoire_store::OpInput {
+                kind: grimoire_store::OpKind::Replace {
+                    target,
+                    content: content.to_string(),
+                },
+                source_refs: vec![format!("hot-session: {reason}, {secs}s"), "canvas:live".into()],
+            };
+            s.propose(doc_id, frozen_epoch, human.id, vec![op])?;
+            1
+        } else {
             let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
             let tree = s.read_doc(doc_id)?;
             let has_content = !tree.roots.is_empty();
@@ -711,6 +770,59 @@ mod tests {
         let tree = s.read_doc(doc.id).unwrap();
         assert_eq!(tree.roots.len(), 1);
         assert_eq!(tree.doc.current_epoch, 1); // untouched
+    }
+
+    #[test]
+    fn canvas_session_flattens_maps_to_ks_diagram() {
+        use yrs::Map as _;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let doc = s.create_doc("Canvas", None, tom.id).unwrap();
+        let canvas_block = Uuid::now_v7();
+        s.apply(
+            doc.id,
+            0,
+            tom.id,
+            vec![OpInput {
+                kind: OpKind::Insert {
+                    block_id: canvas_block,
+                    parent_id: None,
+                    order_key: "i".into(),
+                    block_type: BlockType::CanvasScene,
+                    content: r#"{"ks_diagram":{"nodes":[{"id":"a","label":"old"}],"edges":[]}}"#.into(),
+                    refers_to: None,
+                },
+                source_refs: vec![],
+            }],
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(s));
+        let hot = scratch_hot();
+        hot.start(doc.id, 1).unwrap();
+        // what the client's Y.Map.set(id, JSON.stringify(shape)) produces
+        {
+            let sessions = hot.sessions.lock().unwrap();
+            let session = sessions.get(&doc.id).unwrap();
+            let ydoc = session.awareness.doc();
+            let nodes = ydoc.get_or_insert_map("canvas_nodes");
+            let edges = ydoc.get_or_insert_map("canvas_edges");
+            let mut txn = ydoc.transact_mut();
+            nodes.insert(&mut txn, "a", r#"{"id":"a","label":"daemon","x":0,"y":0,"shape":"box"}"#);
+            nodes.insert(&mut txn, "b", r#"{"id":"b","label":"gate","x":300,"y":0,"shape":"diamond"}"#);
+            edges.insert(&mut txn, "e1", r#"{"id":"e1","from":"a","to":"b","arrow":"end"}"#);
+        }
+        let applied = hot.flatten_and_close(&store, doc.id, "test").unwrap();
+        assert_eq!(applied, 1);
+        let s = store.lock().unwrap();
+        let tree = s.read_doc(doc.id).unwrap();
+        assert_eq!(tree.doc.current_epoch, 2);
+        let content: serde_json::Value =
+            serde_json::from_str(&tree.roots[0].block.content).unwrap();
+        let kd = &content["ks_diagram"];
+        assert_eq!(kd["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(kd["nodes"][1]["label"], "gate");
+        assert_eq!(kd["edges"][0]["from"], "a");
+        assert_eq!(tree.roots[0].block.id, canvas_block); // same block, replaced
     }
 
     #[test]
