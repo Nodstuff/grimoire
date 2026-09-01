@@ -9,6 +9,7 @@ import StarterKit from '@tiptap/starter-kit'
 import CodeBlock from '@tiptap/extension-code-block'
 import { TableKit } from '@tiptap/extension-table'
 import CodeBlockView from './CodeBlockView'
+import { WikilinkDeco } from './WikilinkDeco'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block } from '../types'
 import { BaselineBlock, Entry, computeOps } from './diff'
@@ -52,6 +53,7 @@ const extensions = [
     },
   }),
   TableKit.configure({ table: { resizable: false } }),
+  WikilinkDeco,
   BlockId,
 ]
 const schema = getSchema(extensions)

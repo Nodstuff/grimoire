@@ -756,20 +756,18 @@ function DocView({
 
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
 
-  // wikilink click-through: ⌘-click anywhere in the editor text
+  // wikilink click-through: decorated targets carry data-target
   const onStageClick = useCallback(
     (e: React.MouseEvent) => {
-      if (!(e.metaKey || e.ctrlKey)) return
-      const sel = window.getSelection()
-      const text = sel?.anchorNode?.textContent ?? ''
-      const offset = sel?.anchorOffset ?? 0
-      const open = text.lastIndexOf('[[', offset)
-      const close = text.indexOf(']]', offset)
-      if (open === -1 || close === -1) return
-      const target = text.slice(open + 2, close).split(/[|#]/)[0].trim()
-      const name = target.split('/').pop() ?? target
+      const el = (e.target as HTMLElement).closest('.wl-target') as HTMLElement | null
+      if (!el) return
+      const target = el.dataset.target ?? ''
+      const name = target.split('/').pop()?.split('#')[0].trim() ?? target
       const id = byTitle.get(name)
-      if (id) onOpenDoc(id)
+      if (id) {
+        e.preventDefault()
+        onOpenDoc(id)
+      }
     },
     [byTitle, onOpenDoc],
   )
