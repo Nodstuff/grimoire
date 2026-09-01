@@ -57,7 +57,7 @@ impl Identity {
 
     fn generate() -> Self {
         let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed).expect("OS entropy");
+        getrandom::fill(&mut seed).expect("OS entropy");
         Self {
             signing: SigningKey::from_bytes(&seed),
         }
