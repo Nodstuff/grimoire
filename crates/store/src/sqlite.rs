@@ -1533,20 +1533,48 @@ fn parse_annotation_status(s: &str) -> Result<AnnotationStatus> {
 }
 
 impl SqliteStore {
-    /// Stalest docs first (oldest last-op), excluding docs this auditor
-    /// already commented on — the veracity sweep's worklist.
-    pub fn audit_candidates(&self, auditor: Uuid, limit: usize) -> Result<Vec<Doc>> {
+    /// All live docs in a subtree, the scope root included — the opt-in
+    /// boundary every scoped gardener works within.
+    pub fn doc_subtree(&self, root: Uuid) -> Result<Vec<Doc>> {
         let mut stmt = self.conn.prepare(
-            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status
+            "WITH RECURSIVE sub(id) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT d.id FROM docs d JOIN sub ON d.parent_id = sub.id WHERE d.deleted = 0
+             )
+             SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status, d.sort_key
+             FROM docs d JOIN sub ON sub.id = d.id
+             WHERE d.deleted = 0
+             ORDER BY d.sort_key IS NULL, d.sort_key, d.title",
+        )?;
+        let rows = stmt.query_map(params![root.to_string()], row_to_doc)?;
+        rows.map(|r| build_doc(r?)).collect()
+    }
+
+    /// Stalest docs first (oldest last-op) within a scope, excluding docs
+    /// this gardener already covered — the scoped sweep worklist.
+    pub fn audit_candidates(&self, auditor: Uuid, scope: Uuid, limit: usize) -> Result<Vec<Doc>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE sub(id) AS (
+                 SELECT ?3
+                 UNION
+                 SELECT d.id FROM docs d JOIN sub ON d.parent_id = sub.id WHERE d.deleted = 0
+             )
+             SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status, d.sort_key
              FROM docs d
+             JOIN sub ON sub.id = d.id
              JOIN (SELECT doc_id, max(created_at) AS last FROM ops
                    WHERE epoch_applied IS NOT NULL GROUP BY doc_id) o ON o.doc_id = d.id
-             WHERE EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0
+             WHERE d.deleted = 0
+               AND EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0
                            AND b.block_type != 'comment')
                AND NOT EXISTS (SELECT 1 FROM audits a WHERE a.doc_id = d.id AND a.principal = ?1)
              ORDER BY o.last ASC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![auditor.to_string(), limit as i64], row_to_doc)?;
+        let rows = stmt.query_map(
+            params![auditor.to_string(), limit as i64, scope.to_string()],
+            row_to_doc,
+        )?;
         rows.map(|r| build_doc(r?)).collect()
     }
 

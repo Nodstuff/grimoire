@@ -216,7 +216,11 @@ pub async fn daily_loop(store: Store) {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.list_gardeners().unwrap_or_default()
         };
-        for g in gardeners.into_iter().filter(|g| g.enabled) {
+        // manual-cadence tendings only run via run-now; the daily cut skips them
+        for g in gardeners
+            .into_iter()
+            .filter(|g| g.enabled && g.schedule != "manual")
+        {
             let name = g.name.clone();
             let out = garden::run_gardener(store.clone(), g).await;
             tracing::info!("gardener {name}: {} — {}", out.status, out.summary);

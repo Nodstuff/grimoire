@@ -23,13 +23,21 @@ async fn docs(State(st): State<ApiState>) -> Json<Value> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let canvases: std::collections::HashSet<String> =
         s.canvas_doc_ids().unwrap_or_default().into_iter().collect();
+    let tended: std::collections::HashSet<String> = s
+        .list_gardeners()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|g| g.enabled)
+        .filter_map(|g| g.scope_doc.map(|d| d.to_string()))
+        .collect();
     match s.list_docs() {
         Ok(d) => Json(json!(
             d.into_iter()
                 .map(|doc| {
-                    let is_canvas = canvases.contains(&doc.id.to_string());
+                    let id = doc.id.to_string();
                     let mut v = json!(doc);
-                    v["is_canvas"] = json!(is_canvas);
+                    v["is_canvas"] = json!(canvases.contains(&id));
+                    v["is_tended"] = json!(tended.contains(&id));
                     v
                 })
                 .collect::<Vec<_>>()
@@ -456,6 +464,49 @@ async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -
     }
 }
 
+/// Tendings covering a doc: gardeners scoped to it or to any ancestor.
+/// The opt-in surface — configure agents where the docs live.
+async fn tendings(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // ancestor chain of this doc, self first
+    let mut chain = vec![id];
+    let mut cur = id;
+    while let Ok(d) = s.get_doc(cur) {
+        match d.parent_id {
+            Some(p) => {
+                chain.push(p);
+                cur = p;
+            }
+            None => break,
+        }
+    }
+    match s.list_gardeners() {
+        Ok(gs) => {
+            let rows: Vec<Value> = gs
+                .into_iter()
+                .filter(|g| g.scope_doc.map(|sd| chain.contains(&sd)).unwrap_or(false))
+                .map(|g| {
+                    let scope_title = g
+                        .scope_doc
+                        .and_then(|sd| s.get_doc(sd).ok())
+                        .map(|d| d.title)
+                        .unwrap_or_default();
+                    let inherited = g.scope_doc != Some(id);
+                    let mut v = json!(g);
+                    v["scope_title"] = json!(scope_title);
+                    v["inherited"] = json!(inherited);
+                    v
+                })
+                .collect();
+            Json(json!(rows))
+        }
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 /// Data change stamp: the app polls this and live-refreshes whatever view is
 /// open when it moves — gardener writes, MCP proposals from other sessions,
 /// queue resolutions all appear without a reload.
@@ -553,6 +604,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/stamp", get(stamp))
         .route("/api/doc/{id}/delete", post(delete_doc))
         .route("/api/doc/{id}/rename", post(rename_doc))
+        .route("/api/doc/{id}/tendings", get(tendings))
         .route("/api/comment", post(add_comment))
         .route("/api/resolve", post(resolve))
         .route("/api/resolve_bulk", post(resolve_bulk))

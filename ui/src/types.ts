@@ -8,6 +8,7 @@ export interface Doc {
   status: 'draft' | 'in-review' | 'decided' | 'superseded' | null
   sort_key: string | null
   is_canvas?: boolean
+  is_tended?: boolean
 }
 
 export interface Block {
