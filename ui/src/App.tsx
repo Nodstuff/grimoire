@@ -799,20 +799,33 @@ function DocView({
 
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
 
-  // heading anchor from a [[Doc#Heading]] link: scroll + flash once loaded
+  // anchor from a link: [[Doc#^block-uuid]] finds the block by stable id,
+  // [[Doc#Heading]] falls back to text match. Scroll + flash.
   useEffect(() => {
     if (!anchor || !tree) return
-    const t = setTimeout(() => {
-      const needle = anchor.toLowerCase()
-      const el = [...document.querySelectorAll('.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4, .ProseMirror p')]
-        .find((n) => n.textContent?.toLowerCase().includes(needle))
+    // retry across editor remounts (live refresh can race the first attempt)
+    const attempt = () => {
+      let el: Element | null = null
+      if (anchor.startsWith('^')) {
+        el = document.querySelector(`[data-block-id="${anchor.slice(1)}"]`)
+      }
+      if (!el) {
+        const needle = anchor.replace(/^\^/, '').toLowerCase()
+        el =
+          [...document.querySelectorAll(
+            '.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4, .ProseMirror p',
+          )].find((n) => n.textContent?.toLowerCase().includes(needle)) ?? null
+      }
       if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        el.scrollIntoView({ block: 'start' })
         el.classList.add('anchor-flash')
         setTimeout(() => el.classList.remove('anchor-flash'), 1600)
+        return true
       }
-    }, 250)
-    return () => clearTimeout(t)
+      return false
+    }
+    const timers = [250, 900, 1800].map((ms) => setTimeout(attempt, ms))
+    return () => timers.forEach(clearTimeout)
   }, [anchor, tree])
 
   // wikilink click-through: decorated targets carry data-target
@@ -826,7 +839,7 @@ function DocView({
       const id = byTitle.get(name)
       if (id) {
         e.preventDefault()
-        onOpenDoc(id, fragment?.trim().replace(/^\^/, ''))
+        onOpenDoc(id, fragment?.trim())
       }
     },
     [byTitle, onOpenDoc],
@@ -913,19 +926,31 @@ function DocView({
         onSelectionBlock={onSelectionBlock}
       />
       {selBlock && selRect && panel !== 'comments' && (
-        <button
-          className="sel-comment"
-          style={{ left: selRect.x, top: selRect.y }}
-          title="comment on selection"
-          onMouseDown={(e) => {
-            e.preventDefault()
-            setCommentTarget(selBlock)
-            setPanel('comments')
-            setSelRect(null)
-          }}
-        >
-          💬
-        </button>
+        <span className="sel-actions" style={{ left: selRect.x, top: selRect.y }}>
+          <button
+            title="comment on selection"
+            onMouseDown={(e) => {
+              e.preventDefault()
+              setCommentTarget(selBlock)
+              setPanel('comments')
+              setSelRect(null)
+            }}
+          >
+            💬
+          </button>
+          <button
+            title="copy block link"
+            onMouseDown={(e) => {
+              e.preventDefault()
+              navigator.clipboard
+                .writeText(`[[${tree.doc.title}#^${selBlock}]]`)
+                .catch(() => {})
+              setSelRect(null)
+            }}
+          >
+            🔗
+          </button>
+        </span>
       )}
       {panel === 'history' && <HistoryPanel docId={docId} onClose={() => setPanel('none')} />}
       {panel === 'tend' && (

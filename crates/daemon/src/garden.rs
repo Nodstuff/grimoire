@@ -915,7 +915,7 @@ async fn run_auditor(
 /// Injected into every doc-writing gardener prompt: the house rules.
 const GRIMOIRE_PRIMER: &str = "## How Grimoire works (follow exactly)\n\
 - Docs are trees of markdown blocks; a paragraph separated by blank lines is one block.\n\
-- Link between docs with [[Exact Doc Title]] — resolved by full title. No other link syntax counts.\n\
+- Link between docs with [[Exact Doc Title]] — resolved by full title. Deep-link a specific block with [[Doc Title#^block-uuid]] (block ids appear as [block <uuid>] markers when you are shown doc content). No other link syntax counts.\n\
 - Tags live ONLY in YAML frontmatter as the doc's first block:\n---\ntags:\n  - kebab-case-tag\n---\n\
 - Inline #hashtags do NOTHING here — never use them. Frontmatter is optional; a tagging agent can add it later.\n\
 - Headings (##, ###) nest the blocks that follow them; use them for structure.\n\
