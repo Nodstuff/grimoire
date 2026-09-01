@@ -25,7 +25,32 @@ type View =
 type Palette = null | 'commands' | 'search' | 'newdoc' | 'newcanvas'
 
 export default function App() {
-  const [view, setView] = useState<View>({ kind: 'home' })
+  const [view, setViewRaw] = useState<View>({ kind: 'home' })
+  const [anchor, setAnchor] = useState<string | null>(null)
+
+  // ⌘[ / ⌘] history over views, browser-style
+  const history = useRef<View[]>([{ kind: 'home' }])
+  const historyIdx = useRef(0)
+  const setView = useCallback((v: View) => {
+    history.current = history.current.slice(0, historyIdx.current + 1)
+    history.current.push(v)
+    historyIdx.current = history.current.length - 1
+    setViewRaw(v)
+  }, [])
+  const goBack = useCallback(() => {
+    if (historyIdx.current > 0) {
+      historyIdx.current -= 1
+      setAnchor(null)
+      setViewRaw(history.current[historyIdx.current])
+    }
+  }, [])
+  const goForward = useCallback(() => {
+    if (historyIdx.current < history.current.length - 1) {
+      historyIdx.current += 1
+      setAnchor(null)
+      setViewRaw(history.current[historyIdx.current])
+    }
+  }, [])
   const [docs, setDocs] = useState<Doc[]>([])
   const [treeOpen, setTreeOpen] = useState(false)
   const [palette, setPalette] = useState<Palette>(null)
@@ -87,6 +112,12 @@ export default function App() {
       } else if (mod && e.key === 'r') {
         e.preventDefault()
         location.reload()
+      } else if (mod && e.key === '[') {
+        e.preventDefault()
+        goBack()
+      } else if (mod && e.key === ']') {
+        e.preventDefault()
+        goForward()
       } else if (mod && e.key === 'w') {
         e.preventDefault()
         setView({ kind: 'home' })
@@ -99,12 +130,16 @@ export default function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [])
+  }, [goBack, goForward, setView])
 
-  const openDoc = useCallback((id: string) => {
-    setView({ kind: 'doc', id })
-    setPalette(null)
-  }, [])
+  const openDoc = useCallback(
+    (id: string, toAnchor?: string) => {
+      setAnchor(toAnchor ?? null)
+      setView({ kind: 'doc', id })
+      setPalette(null)
+    },
+    [setView],
+  )
 
   return (
     <div className="app">
@@ -130,7 +165,13 @@ export default function App() {
           </div>
         )}
         {view.kind === 'doc' && (
-          <DocView docId={view.id} onOpenDoc={openDoc} docs={docs} dataVersion={dataVersion} />
+          <DocView
+            docId={view.id}
+            onOpenDoc={openDoc}
+            docs={docs}
+            dataVersion={dataVersion}
+            anchor={anchor}
+          />
         )}
         {view.kind === 'review' && (
           <ReviewQueue
@@ -686,11 +727,13 @@ function DocView({
   onOpenDoc,
   docs,
   dataVersion,
+  anchor,
 }: {
   docId: string
-  onOpenDoc: (id: string) => void
+  onOpenDoc: (id: string, anchor?: string) => void
   docs: Doc[]
   dataVersion: number
+  anchor?: string | null
 }) {
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
@@ -756,17 +799,34 @@ function DocView({
 
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
 
+  // heading anchor from a [[Doc#Heading]] link: scroll + flash once loaded
+  useEffect(() => {
+    if (!anchor || !tree) return
+    const t = setTimeout(() => {
+      const needle = anchor.toLowerCase()
+      const el = [...document.querySelectorAll('.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4, .ProseMirror p')]
+        .find((n) => n.textContent?.toLowerCase().includes(needle))
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        el.classList.add('anchor-flash')
+        setTimeout(() => el.classList.remove('anchor-flash'), 1600)
+      }
+    }, 250)
+    return () => clearTimeout(t)
+  }, [anchor, tree])
+
   // wikilink click-through: decorated targets carry data-target
   const onStageClick = useCallback(
     (e: React.MouseEvent) => {
       const el = (e.target as HTMLElement).closest('.wl-target') as HTMLElement | null
       if (!el) return
       const target = el.dataset.target ?? ''
-      const name = target.split('/').pop()?.split('#')[0].trim() ?? target
+      const [path, fragment] = target.split('#')
+      const name = path.split('/').pop()?.trim() ?? path
       const id = byTitle.get(name)
       if (id) {
         e.preventDefault()
-        onOpenDoc(id)
+        onOpenDoc(id, fragment?.trim().replace(/^\^/, ''))
       }
     },
     [byTitle, onOpenDoc],
