@@ -14,6 +14,7 @@ import { ReviewHighlight, ReviewMap, setReviewMap } from './ReviewHighlight'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block } from '../types'
 import { notify } from '../Notice'
+import { proposeErrorText, saveErrorText } from '../hints'
 import { BaselineBlock, Entry, computeOps } from './diff'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
 
@@ -92,22 +93,6 @@ type SaveState = 'clean' | 'dirty' | 'saving'
  * with propose permission — edits ship UPSTREAM as a proposal (no autosave,
  * explicit action), then the editor resets to the pristine mirror. */
 export type EditorMode = 'direct' | 'readonly' | 'propose'
-
-/** Save failures in words a user can act on. The daemon's messages are
- * precise but internal; the editor keeps the text either way. */
-function saveErrorText(e: unknown): string {
-  const raw = e instanceof Error ? e.message : String(e)
-  if (/live session/i.test(raw)) {
-    return 'this doc is in a live session — your edit is kept here and will save when it ends'
-  }
-  if (/fetch|network|Failed to fetch|ECONN/i.test(raw)) {
-    return 'not saved: Grimoire is not responding — your edit is kept here and will retry'
-  }
-  if (/stale base|ahead of doc epoch/i.test(raw)) {
-    return 'not saved: this doc changed underneath you — retrying against the new version'
-  }
-  return `not saved: ${raw} — your edit is kept here and will retry`
-}
 
 export default function DocEditor({
   doc,
@@ -256,7 +241,7 @@ export default function DocEditor({
         onProposed?.()
       } catch (e) {
         setSaveState('dirty')
-        notify(String(e))
+        notify(proposeErrorText(e), 'warn')
       }
       return
     }
@@ -367,7 +352,7 @@ export default function DocEditor({
             {saveState === 'saving' ? 'sending…' : 'suggest changes ⌘⏎'}
           </button>
         ) : (
-          <span className="save-state clean">epoch {epoch}</span>
+          <span className="save-state clean" title={`version ${epoch}`}>up to date</span>
         )}
       </>
     )
@@ -377,7 +362,7 @@ export default function DocEditor({
       <EditorContent editor={editor} />
       {mode === 'direct' && (
         <span className={`save-state ${saveState}`}>
-          {saveState === 'clean' ? `epoch ${epoch}` : saveState === 'dirty' ? '·' : '…'}
+          {saveState === 'clean' ? 'saved' : saveState === 'dirty' ? 'unsaved' : 'saving…'}
         </span>
       )}
     </>

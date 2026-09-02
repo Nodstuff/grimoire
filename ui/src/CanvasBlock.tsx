@@ -324,7 +324,7 @@ function CanvasFlow({
         .then((st) => {
           if (st.hot && !liveRef.current) setLive({ seed: false })
         })
-        .catch(() => {})
+        .catch((e) => console.warn('canvas live check failed', block.doc_id, e))
     }, 5000)
     return () => clearInterval(t)
   }, [live, block.doc_id])
@@ -381,7 +381,7 @@ function CanvasFlow({
             onSaved()
           }
         })
-        .catch(() => {})
+        .catch((e) => console.warn('canvas session status failed', block.doc_id, e))
     }
     provider.on('connection-close', onClose)
 

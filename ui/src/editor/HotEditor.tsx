@@ -142,7 +142,7 @@ export default function HotEditor({
           }
         })
         .catch((e) => {
-          // daemon unreachable: say so rather than retrying silently forever
+          // Grimoire unreachable: say so rather than retrying silently forever
           if (endedRef.current) return
           endedRef.current = true
           notify(`lost the live session: ${errText(e)}`)
@@ -165,7 +165,7 @@ export default function HotEditor({
           endedRef.current = true
           notify(
             st.hot
-              ? 'could not join the live session (the owner’s daemon did not accept the connection) — showing the last saved version'
+              ? 'could not join the live session (the owner’s Grimoire did not accept the connection) — showing the last saved version'
               : 'the live session ended before we could join — showing the last saved version',
           )
           onEnded()

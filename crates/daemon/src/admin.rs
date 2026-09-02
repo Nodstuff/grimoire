@@ -4,6 +4,7 @@
 use crate::garden;
 use axum::extract::{Query, State};
 use axum::routing::{get, post};
+use axum::response::IntoResponse;
 use axum::{Json, Router};
 use grimoire_store::{BlockStore, ConfidencePolicy, GardenerKind, ReviewPolicy, SqliteStore};
 use serde::Deserialize;
@@ -234,6 +235,81 @@ pub struct FedCtx {
 pub struct FedState {
     pub store: Store,
     pub ctx: FedCtx,
+    pub hot: crate::hot::HotState,
+}
+
+/// The local trust boundary for `/admin/*` (shares, trust, gardeners,
+/// policies — every gate-weakening surface). A per-boot random token: the
+/// Tauri shell reads it from `<db_dir>/admin.token` (0600) and hands it to
+/// the page; the CLI reads the same file. Any other local process — a
+/// browser tab, a sandboxed app, another user — is refused. A process
+/// running AS the user can read the file; that is the honest boundary.
+#[derive(Clone)]
+pub struct AdminToken(Arc<str>);
+
+pub const ADMIN_TOKEN_FILE: &str = "admin.token";
+pub const ADMIN_HEADER: &str = "x-grimoire-admin";
+
+impl AdminToken {
+    /// Mint a fresh token and write it beside the db (overwriting the last
+    /// boot's), so a stale copy in an old tab never works.
+    pub fn mint(db_dir: &std::path::Path) -> anyhow::Result<Self> {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("OS entropy: {e}"))?;
+        let token = hex::encode(bytes);
+        crate::identity::write_secret_file(&db_dir.join(ADMIN_TOKEN_FILE), &token)?;
+        Ok(Self(token.into()))
+    }
+
+    /// A fixed token (tests).
+    #[cfg(test)]
+    pub fn fixed(token: &str) -> Self {
+        Self(token.into())
+    }
+
+    /// The token the CLI should send: read from the file the daemon wrote.
+    pub fn read_from(db_dir: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(db_dir.join(ADMIN_TOKEN_FILE))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn matches(&self, presented: Option<&str>) -> bool {
+        // constant-time compare: the token is a secret
+        let Some(p) = presented else { return false };
+        let a = self.0.as_bytes();
+        let b = p.as_bytes();
+        if a.len() != b.len() {
+            return false;
+        }
+        a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
+}
+
+/// axum middleware: refuse `/admin/*` without the header. Same JSON error
+/// shape as every other refusal, with a typed `code` the UI branches on.
+async fn require_admin(
+    State(token): State<AdminToken>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let presented = req
+        .headers()
+        .get(ADMIN_HEADER)
+        .and_then(|v| v.to_str().ok());
+    if token.matches(presented) {
+        return next.run(req).await;
+    }
+    tracing::warn!(path = %req.uri().path(), "admin request without a valid token refused");
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "this action needs the app's admin token — open Grimoire from the app, or add ?admin_token=<contents of ~/.grimoire/admin.token> to the URL",
+            "code": "admin_token",
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -454,7 +530,11 @@ async fn revoke_share(State(st): State<FedState>, Json(req): Json<IdReq>) -> Jso
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.set_share_state(req.id, grimoire_store::ShareState::Revoked) {
-        Ok(()) => Json(json!({"ok": true})),
+        Ok(()) => {
+            // a live bridge on this share is cut now, not at the next re-auth
+            let cut = st.hot.drop_bridges_for_share(req.id);
+            Json(json!({"ok": true, "bridges_cut": cut}))
+        }
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
@@ -533,8 +613,17 @@ async fn revoke_contact(State(st): State<FedState>, Json(req): Json<IdReq>) -> J
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pubkey = s
+        .list_contacts()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|c| c.id == req.id)
+        .map(|c| c.pubkey);
     match s.revoke_contact(req.id) {
-        Ok(()) => Json(json!({"ok": true})),
+        Ok(()) => {
+            let cut = pubkey.map(|pk| st.hot.drop_bridges_for_peer(&pk)).unwrap_or(0);
+            Json(json!({"ok": true, "bridges_cut": cut}))
+        }
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
@@ -678,7 +767,17 @@ async fn list_joins(State(st): State<FedState>) -> Json<Value> {
     }
 }
 
-pub fn router(store: Store, fed: FedCtx, hot: crate::hot::HotState) -> Router {
+pub fn router(store: Store, fed: FedCtx, hot: crate::hot::HotState, token: AdminToken) -> Router {
+    let fed_state = FedState {
+        store: store.clone(),
+        ctx: fed,
+        hot: hot.clone(),
+    };
+    // the profile is not gate-weakening (your own name + public identity):
+    // it stays open so the first-run prompt works from any local client
+    let open_routes = Router::new()
+        .route("/api/profile", get(get_profile).post(set_profile))
+        .with_state(fed_state.clone());
     let fed_routes = Router::new()
         .route("/admin/shares", get(list_shares).post(create_share))
         .route("/admin/shares/revoke", post(revoke_share))
@@ -686,7 +785,6 @@ pub fn router(store: Store, fed: FedCtx, hot: crate::hot::HotState) -> Router {
         .route("/admin/mirrors", get(list_mirrors))
         .route("/admin/mirrors/leave", post(leave_share))
         .route("/admin/joins/clear", post(clear_joins))
-        .route("/api/profile", get(get_profile).post(set_profile))
         .route("/admin/shares/trust", post(set_share_trust))
         .route("/admin/contacts", get(list_contacts))
         .route("/admin/contacts/revoke", post(revoke_contact))
@@ -699,10 +797,8 @@ pub fn router(store: Store, fed: FedCtx, hot: crate::hot::HotState) -> Router {
         .route("/admin/propose_upstream", post(propose_upstream))
         .route("/admin/comment_upstream", post(comment_upstream))
         .route("/admin/proposals", get(list_proposals))
-        .with_state(FedState {
-            store: store.clone(),
-            ctx: fed,
-        });
+        .route_layer(axum::middleware::from_fn_with_state(token.clone(), require_admin))
+        .with_state(fed_state);
     Router::new()
         .route(
             "/admin/gardeners",
@@ -712,8 +808,105 @@ pub fn router(store: Store, fed: FedCtx, hot: crate::hot::HotState) -> Router {
         .route("/admin/gardeners/update", post(update_gardener))
         .route("/admin/runs", get(list_runs))
         .route("/admin/policy", post(set_policy))
+        .route_layer(axum::middleware::from_fn_with_state(token, require_admin))
         .with_state(AdminState { store, hot })
         .merge(fed_routes)
+        .merge(open_routes)
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        let store: Store = Arc::new(Mutex::new(SqliteStore::open_in_memory().unwrap()));
+        let hot = crate::hot::HotState::new(std::env::temp_dir().join(format!("grimoire-admin-test-{}", Uuid::now_v7())));
+        router(
+            store,
+            FedCtx {
+                node_id: None,
+                endpoint: None,
+            },
+            hot,
+            AdminToken::fixed("s3cret"),
+        )
+    }
+
+    #[tokio::test]
+    async fn admin_routes_need_the_token_and_profile_does_not() {
+        let app = app();
+        // no header → 401 with the typed code
+        let res = app
+            .clone()
+            .oneshot(Request::get("/admin/shares").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], "admin_token");
+        // wrong token → 401
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/admin/gardeners")
+                    .header(ADMIN_HEADER, "nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // right token → the handler runs
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/admin/gardeners")
+                    .header(ADMIN_HEADER, "s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        // the profile is open: no token needed (first-run name prompt)
+        let res = app
+            .oneshot(Request::get("/api/profile").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn token_compare_is_exact() {
+        let t = AdminToken::fixed("abc");
+        assert!(t.matches(Some("abc")));
+        assert!(!t.matches(Some("abd")));
+        assert!(!t.matches(Some("ab")));
+        assert!(!t.matches(Some("abcd")));
+        assert!(!t.matches(None));
+    }
+
+    #[test]
+    fn mint_writes_a_0600_file_and_read_from_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = AdminToken::mint(dir.path()).unwrap();
+        let on_disk = AdminToken::read_from(dir.path()).unwrap();
+        assert!(t.matches(Some(&on_disk)));
+        assert_eq!(on_disk.len(), 64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(ADMIN_TOKEN_FILE)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // a second boot replaces it
+        let t2 = AdminToken::mint(dir.path()).unwrap();
+        assert!(!t2.matches(Some(&on_disk)));
+    }
 }
 
 /// The 16:00 daily cut (§3.4): the daemon self-schedules; no external cron.

@@ -69,7 +69,7 @@ fn revoked_contact_cannot_redeem_until_unrevoked() {
     // nothing changed: still revoked, petname intact, share still offered
     let alice = s.contact_by_pubkey(ALICE_KEY).unwrap().unwrap();
     assert!(alice.revoked);
-    assert_eq!(alice.petname, "alice");
+    assert_eq!(alice.petname, format!("alice · {}", &ALICE_KEY[..4]), "first-seen suffix, untouched by the refused redeem");
     let share2_now = s.get_share(share2.id).unwrap();
     assert_eq!(share2_now.state, ShareState::Offered);
     assert!(share2_now.contact.is_none());
@@ -81,7 +81,7 @@ fn revoked_contact_cannot_redeem_until_unrevoked() {
     let (alice2, share2_now) = s.redeem_invite("h2", ALICE_KEY, "alice-again").unwrap();
     assert_eq!(alice2.id, alice.id);
     assert_eq!(
-        alice2.petname, "alice",
+        alice2.petname, alice.petname,
         "redeem never renames an existing contact"
     );
     assert_eq!(share2_now.state, ShareState::Active);

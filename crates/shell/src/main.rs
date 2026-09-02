@@ -1,70 +1,59 @@
-// ks-shell: native chrome over the daemon's UI (PROJECT.md §3.2a).
+// grimoire-shell: native chrome over the daemon's UI (PROJECT.md §3.2a).
 //
-// The shell ensures the daemon by any means available: already up (a
-// launchd agent on power-user machines — always-on for MCP sessions and
-// the 16:00 cut even when this app is quit) or a bundled sidecar spawned
-// as a child for install-and-run users (dies on Quit). Closing the window
-// keeps the ◈ in the menu bar either way.
+// The sidecar model: the daemon (`grimoire`) is bundled inside the .app and
+// the shell owns it. On launch the shell attaches to a daemon already
+// answering on 127.0.0.1:7425 (another shell instance, or one started by
+// hand) or spawns the bundled binary as a child, which dies with the app on
+// Quit. No launchd, no install step: download, open, done. Closing the
+// window keeps the ◈ in the menu bar; only the tray's Quit exits.
+//
+// The daemon owns its log (~/.grimoire/ksd.<date>.log, rotated daily) — the
+// shell no longer redirects stdout into a second file.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
 use std::time::Duration;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 const DAEMON_ADDR: &str = "127.0.0.1:7425";
 const DAEMON_URL: &str = "http://127.0.0.1:7425/";
-const LAUNCHD_LABEL: &str = "ie.null.grimoire";
 
 fn daemon_up() -> bool {
     TcpStream::connect_timeout(&DAEMON_ADDR.parse().unwrap(), Duration::from_millis(300)).is_ok()
 }
 
-/// A daemon we spawned ourselves (no launchd on this machine) — killed on quit.
+/// The daemon we spawned — killed on quit. None when we attached to one
+/// that was already running.
 static SPAWNED: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
 
-fn uid() -> String {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+fn home() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| ".".into())
 }
 
-fn launchd_agent_present(uid: &str) -> bool {
-    Command::new("launchctl")
-        .args(["print", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+fn data_dir() -> String {
+    format!("{}/.grimoire", home())
 }
 
-/// Ensure the daemon by any means available, in order of preference:
-/// already up (whoever owns it) → kick the launchd agent (power users) →
-/// spawn the bundled ksd as a child (install-and-run users).
-fn ensure_daemon() {
+/// Ensure the daemon: already up (whoever owns it) → spawn the bundled
+/// binary. Returns whether it answers.
+fn ensure_daemon() -> bool {
     if daemon_up() {
-        return;
+        return true;
     }
-    let uid = uid();
-    if !uid.is_empty() && launchd_agent_present(&uid) {
-        let _ = Command::new("launchctl")
-            .args(["kickstart", "-k", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
-            .status();
-    } else {
-        spawn_sidecar();
-    }
+    spawn_sidecar();
     for _ in 0..20 {
         if daemon_up() {
-            return;
+            return true;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    false
 }
 
 fn spawn_sidecar() {
@@ -76,29 +65,19 @@ fn spawn_sidecar() {
     if !ksd.exists() {
         return;
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let _ = std::fs::create_dir_all(format!("{home}/.grimoire"));
-    let log = || {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(format!("{home}/.grimoire/ksd.log"))
-            .ok()
-    };
+    let home = home();
+    let _ = std::fs::create_dir_all(data_dir());
     let mut cmd = Command::new(&ksd);
     cmd.args(["serve", "--port", "7425"]);
     // gardeners shell out to `claude`; GUI apps get a bare PATH
     let path = std::env::var("PATH").unwrap_or_default();
     cmd.env(
         "PATH",
-        format!("{path}:{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin"),
+        format!("{path}:{home}/.claude/local/bin:{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin"),
     );
-    if let Some(f) = log() {
-        cmd.stdout(f);
-    }
-    if let Some(f) = log() {
-        cmd.stderr(f);
-    }
+    // the daemon writes its own rotating log; a GUI child has no terminal
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
     if let Ok(child) = cmd.spawn() {
         *SPAWNED.lock().unwrap() = Some(child);
     }
@@ -109,13 +88,93 @@ fn restart_daemon() {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let uid = uid();
-    if !uid.is_empty() && launchd_agent_present(&uid) {
-        let _ = Command::new("launchctl")
-            .args(["kickstart", "-k", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
-            .status();
+    spawn_sidecar();
+}
+
+/// The daemon mints a per-boot admin token (0600, `<data_dir>/admin.token`)
+/// that gates the /admin surface; the shell hands it to the UI on the URL so
+/// the webview — and only the webview — can use it. Absent on older daemons.
+fn admin_token() -> Option<String> {
+    let raw = std::fs::read_to_string(format!("{}/admin.token", data_dir())).ok()?;
+    let tok = raw.trim();
+    (!tok.is_empty() && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .then(|| tok.to_string())
+}
+
+/// The URL the window loads: the daemon UI, with the admin token and any
+/// extra query params (`join=`) attached.
+fn ui_url(extra: &[(&str, &str)]) -> String {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(tok) = admin_token() {
+        params.push(format!("admin_token={tok}"));
+    }
+    for (k, v) in extra {
+        params.push(format!("{k}={v}"));
+    }
+    if params.is_empty() {
+        DAEMON_URL.to_string()
     } else {
-        spawn_sidecar();
+        format!("{DAEMON_URL}?{}", params.join("&"))
+    }
+}
+
+/// What the window shows when the daemon is not answering: no white screen.
+/// Self-contained (data: URL); the button probes the daemon from the page
+/// and the shell keeps retrying `ensure_daemon` behind it.
+fn error_page() -> String {
+    let log_dir = data_dir();
+    let html = format!(
+        r#"<!doctype html><meta charset="utf-8"><title>Grimoire</title>
+<style>
+:root{{color-scheme:light dark}}
+body{{margin:0;min-height:100vh;display:grid;place-items:center;font:14px -apple-system,system-ui,sans-serif;background:#111;color:#ddd}}
+main{{max-width:460px;padding:32px;text-align:center}}
+h1{{font-size:16px;margin:0 0 12px;font-weight:600}}
+p{{margin:8px 0;color:#aaa;line-height:1.5}}
+code{{font:12px ui-monospace,Menlo,monospace;color:#ddd;background:#222;padding:2px 6px;border-radius:6px;word-break:break-all}}
+button{{margin-top:18px;padding:8px 18px;border-radius:10px;border:1px solid #444;background:#1c1c1c;color:#eee;font-size:13px;cursor:pointer}}
+button:hover{{background:#262626}}
+#s{{min-height:1.4em;margin-top:10px;font-size:12px;color:#c9a35a}}
+</style>
+<main>
+<div style="font-size:36px;opacity:.5;margin-bottom:16px">◈</div>
+<h1>Grimoire’s background service did not start</h1>
+<p>Your notes are safe. The service that stores and serves them is not answering on port 7425.</p>
+<p>Its log is in <code>{log_dir}/ksd.&lt;date&gt;.log</code></p>
+<button onclick="retry()">Try again</button>
+<div id="s"></div>
+</main>
+<script>
+const url='{DAEMON_URL}';
+const s=document.getElementById('s');
+function probe(){{return fetch(url+'api/stamp',{{mode:'no-cors',cache:'no-store'}})}}
+function go(){{location.replace('grimoire-shell://ui')}}
+function retry(){{
+  s.textContent='checking…';
+  probe().then(go).catch(()=>{{s.textContent='still not running — quit Grimoire from the ◈ menu and open it again, or check the log'}});
+}}
+setInterval(()=>probe().then(go).catch(()=>{{}}),3000);
+</script>"#
+    );
+    format!("data:text/html;charset=utf-8,{}", urlencode(&html))
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn navigate(app: &AppHandle, target: &str) {
+    if let Some(w) = app.get_webview_window("main") {
+        if let Ok(url) = target.parse() {
+            let _ = w.navigate(url);
+        }
     }
 }
 
@@ -125,16 +184,32 @@ fn show_window(app: &AppHandle) {
         let _ = w.set_focus();
         return;
     }
-    let _ = WebviewWindowBuilder::new(
-        app,
-        "main",
-        WebviewUrl::External(DAEMON_URL.parse().unwrap()),
-    )
-    .title("Grimoire")
-    .inner_size(1240.0, 860.0)
-    .hidden_title(true)
-    .title_bar_style(tauri::TitleBarStyle::Overlay)
-    .build();
+    let target = if daemon_up() { ui_url(&[]) } else { error_page() };
+    let _ = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(target.parse().unwrap()))
+        .title("Grimoire")
+        .inner_size(1240.0, 860.0)
+        .hidden_title(true)
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .on_navigation(|url| {
+            // the error page asks to be replaced by the UI once the daemon
+            // answers; everything else navigates normally
+            url.scheme() != "grimoire-shell"
+        })
+        .build();
+    if !daemon_up() {
+        // keep trying behind the error page; swap in the UI the moment it answers
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            // a failed connect returns in 300ms; this costs nothing while idle
+            loop {
+                if ensure_daemon() {
+                    navigate(&handle, &ui_url(&[]));
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+    }
 }
 
 /// A clicked grimoire://join/… link lands here (#57): route it into the UI
@@ -147,15 +222,59 @@ fn handle_deep_link(app: &AppHandle, urls: Vec<tauri::Url>) {
         return;
     };
     show_window(app);
-    if let Some(w) = app.get_webview_window("main") {
-        let target = format!("{DAEMON_URL}?join={payload}");
-        let _ = w.navigate(target.parse().unwrap());
+    navigate(app, &ui_url(&[("join", payload)]));
+}
+
+/// One HTTP/1.1 POST to the daemon without pulling in an HTTP client: the
+/// tray's "Run gardeners now". Returns the status code.
+fn post_admin(path: &str) -> Result<u16, String> {
+    let mut s = TcpStream::connect_timeout(&DAEMON_ADDR.parse().unwrap(), Duration::from_secs(2))
+        .map_err(|e| format!("not running ({e})"))?;
+    // gardener runs take minutes; wait for the reply so failures surface
+    s.set_read_timeout(Some(Duration::from_secs(30 * 60))).ok();
+    let token = admin_token().map(|t| format!("X-Grimoire-Admin: {t}\r\n")).unwrap_or_default();
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {DAEMON_ADDR}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n{token}Connection: close\r\n\r\n{{}}"
+    );
+    s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let head = String::from_utf8_lossy(&buf);
+    let code = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| "bad reply".to_string())?;
+    // the daemon answers 200 with {"error": …} on failure
+    if head.contains("\"error\"") {
+        let msg = head.split("\"error\"").nth(1).unwrap_or("").chars().take(160).collect::<String>();
+        return Err(format!("the daemon reported an error: {msg}"));
+    }
+    Ok(code)
+}
+
+fn run_gardeners_now(app: AppHandle) {
+    match post_admin("/admin/garden") {
+        Ok(200..=299) => {}
+        Ok(code) => app
+            .dialog()
+            .message(format!("Grimoire refused the request (HTTP {code}). Open the app and check Gardeners."))
+            .kind(MessageDialogKind::Warning)
+            .title("Gardeners did not run")
+            .show(|_| {}),
+        Err(e) => app
+            .dialog()
+            .message(format!("{e}\n\nLog: {}/ksd.<date>.log", data_dir()))
+            .kind(MessageDialogKind::Error)
+            .title("Gardeners did not run")
+            .show(|_| {}),
     }
 }
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             ensure_daemon();
 
@@ -169,7 +288,7 @@ fn main() {
 
             let open = MenuItemBuilder::with_id("open", "Open Grimoire").build(app)?;
             let garden = MenuItemBuilder::with_id("garden", "Run gardeners now").build(app)?;
-            let restart = MenuItemBuilder::with_id("restart", "Restart daemon").build(app)?;
+            let restart = MenuItemBuilder::with_id("restart", "Restart background service").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
             let menu = MenuBuilder::new(app)
                 .items(&[&open, &garden, &restart, &quit])
@@ -184,23 +303,19 @@ fn main() {
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => show_window(app),
                     "garden" => {
-                        std::thread::spawn(|| {
-                            let _ = Command::new("curl")
-                                .args([
-                                    "-s",
-                                    "-X",
-                                    "POST",
-                                    &format!("http://{DAEMON_ADDR}/admin/garden"),
-                                    "-H",
-                                    "Content-Type: application/json",
-                                    "-d",
-                                    "{}",
-                                ])
-                                .status();
-                        });
+                        let handle = app.clone();
+                        std::thread::spawn(move || run_gardeners_now(handle));
                     }
                     "restart" => {
-                        std::thread::spawn(restart_daemon);
+                        let handle = app.clone();
+                        std::thread::spawn(move || {
+                            restart_daemon();
+                            if ensure_daemon() {
+                                navigate(&handle, &ui_url(&[]));
+                            } else {
+                                navigate(&handle, &error_page());
+                            }
+                        });
                     }
                     "quit" => app.exit(0),
                     _ => {}
@@ -227,7 +342,7 @@ fn main() {
                         api.prevent_exit();
                     }
                 }
-                // a daemon we spawned dies with us; a launchd daemon does not
+                // the daemon we spawned dies with us
                 tauri::RunEvent::Exit => {
                     if let Some(mut child) = SPAWNED.lock().unwrap().take() {
                         let _ = child.kill();

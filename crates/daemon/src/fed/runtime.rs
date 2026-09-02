@@ -29,6 +29,9 @@ struct Inner {
     focus: HashMap<Uuid, Instant>,
     events: VecDeque<Event>,
     seq: u64,
+    /// Shares with a nudged pull in flight → whether another nudge arrived
+    /// meanwhile (pull again when this one finishes).
+    pulling: HashMap<Uuid, bool>,
 }
 
 /// Cheap to clone; shared across the API, the fed server, and the loops.
@@ -69,6 +72,38 @@ impl Runtime {
             g.events.pop_front();
         }
         seq
+    }
+
+    /// Claim the nudged pull of a share. `true` = go ahead; `false` = one is
+    /// already running (it will run again when done — the burst coalesces).
+    pub fn begin_pull(&self, share_id: Uuid) -> bool {
+        let mut g = self.lock();
+        match g.pulling.get_mut(&share_id) {
+            Some(again) => {
+                *again = true;
+                false
+            }
+            None => {
+                g.pulling.insert(share_id, false);
+                true
+            }
+        }
+    }
+
+    /// Release the claim. `true` = a nudge arrived while pulling: pull again
+    /// (the claim is kept so the caller loops without a gap).
+    pub fn finish_pull(&self, share_id: Uuid) -> bool {
+        let mut g = self.lock();
+        match g.pulling.get_mut(&share_id) {
+            Some(again) if *again => {
+                *again = false;
+                true
+            }
+            _ => {
+                g.pulling.remove(&share_id);
+                false
+            }
+        }
     }
 
     /// Events after `since` (a previous `next`), plus the new cursor. A fresh
@@ -121,5 +156,23 @@ mod tests {
             rt.push_event("doc_changed", d, "Doc".into(), "tom".into());
         }
         assert_eq!(rt.lock().events.len(), EVENT_RING);
+    }
+
+    #[test]
+    fn nudged_pulls_coalesce_per_share_while_one_is_in_flight() {
+        let rt = Runtime::default();
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        assert!(rt.begin_pull(a), "first claim runs");
+        assert!(!rt.begin_pull(a), "second nudge does not start a second pull");
+        assert!(!rt.begin_pull(a), "nor a third");
+        assert!(rt.begin_pull(b), "other shares are independent");
+        // finishing a: exactly one re-run is owed, however many nudges arrived
+        assert!(rt.finish_pull(a), "re-run owed");
+        assert!(!rt.finish_pull(a), "then released");
+        assert!(rt.begin_pull(a), "claimable again");
+        assert!(!rt.finish_pull(a));
+        assert!(!rt.finish_pull(b));
+        assert!(rt.lock().pulling.is_empty(), "nothing leaks");
     }
 }

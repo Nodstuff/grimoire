@@ -12,6 +12,7 @@ import { InviteLink, mintInvite, TrustControl } from './SharePanel'
 import { EventsResponse, LiveEvent, mergeActivity } from './live'
 import { groupShares, mirrorStatusLine, shareTitle, shareWho, shortFingerprint } from './shares'
 import { relTime } from './time'
+import { refusalHint } from './hints'
 import { loadProfile } from './Profile'
 
 function when(iso: string): string {
@@ -336,9 +337,8 @@ export default function Sharing({
                     />
                   </span>
                 </div>
-                <div className={`meta sync-line ${st.kind}`}>
-                  {st.text}
-                  {m.synced_epoch_max != null && st.kind !== 'failing' ? ` · epoch ${m.synced_epoch_max}` : ''}
+                <div className={`meta sync-line ${st.kind}`} title={m.last_error ?? undefined}>
+                  {st.kind === 'failing' ? (refusalHint(m.last_error) ?? st.text) : st.text}
                 </div>
               </div>
             )
@@ -369,7 +369,11 @@ export default function Sharing({
                   <ArmedButton label="clear" onFire={() => act(post('/admin/joins/clear', { id: j.id }))} />
                 </span>
               </div>
-              {j.last_error && <div className="meta sync-line failing">{j.last_error}</div>}
+              {j.last_error && (
+                <div className="meta sync-line failing" title={j.last_error}>
+                  {refusalHint(j.last_error) ?? j.last_error}
+                </div>
+              )}
             </div>
           ))}
         </>

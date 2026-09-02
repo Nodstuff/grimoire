@@ -142,7 +142,7 @@ fn keychain_entry() -> Result<keyring::Entry> {
     Ok(keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER)?)
 }
 
-fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

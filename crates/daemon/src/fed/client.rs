@@ -274,6 +274,11 @@ pub struct JoinOutcome {
     pub root_doc: String,
     pub root_title: String,
     pub permission: String,
+    /// Set when this share's root was already mirrored from a DIFFERENT
+    /// node: the owner re-installed / changed identity. The old contact is
+    /// revoked (its pubkey will never answer again) and named here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_changed_from: Option<String>,
 }
 
 /// One join attempt (grantee-side): dial the ticket's node, redeem, pair the
@@ -370,6 +375,28 @@ pub async fn join_at(
     }
     let perm = grimoire_store::SharePermission::parse(&permission)
         .unwrap_or(grimoire_store::SharePermission::View);
+    // the same root from a different node = the owner changed identity
+    // (re-install, restored keychain). The old pubkey will never answer
+    // again: revoke that contact so the loops stop dialing it, and say so.
+    let owner_changed_from = match s.get_mirror(root_uuid)? {
+        Some(m) if m.owner != owner_contact.id => {
+            let old = s
+                .list_contacts()?
+                .into_iter()
+                .find(|c| c.id == m.owner);
+            if let Some(old) = &old {
+                s.revoke_contact(old.id)?;
+                tracing::warn!(
+                    root = %root_uuid,
+                    old = old.petname,
+                    new = owner_contact.petname,
+                    "share root re-joined from a new node: owner changed identity; old contact revoked"
+                );
+            }
+            old.map(|c| c.petname)
+        }
+        _ => None,
+    };
     s.upsert_mirror(root_uuid, owner_contact.id, share_uuid, 0, perm)?;
     tracing::info!(
         owner = ticket.node,
@@ -383,6 +410,7 @@ pub async fn join_at(
         root_doc,
         root_title,
         permission,
+        owner_changed_from,
     })
 }
 

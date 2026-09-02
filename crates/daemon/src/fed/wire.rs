@@ -116,6 +116,20 @@ pub enum Request {
         title: String,
         kind: NotifyKind,
     },
+    /// The coalesced nudge: everything that changed in ONE share during one
+    /// detector tick, in one dial. Replaces N `Notify` dials with one; old
+    /// peers still receive `Notify` (see `loops::send_nudges`).
+    NotifyBatch {
+        share: String,
+        items: Vec<NotifyItem>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotifyItem {
+    pub doc: String,
+    pub title: String,
+    pub kind: NotifyKind,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -249,6 +263,11 @@ pub enum RefusalCode {
     /// The caller's copy of the doc is behind the owner's epoch: pull first,
     /// then retry (a seed from a stale mirror would overwrite newer edits).
     StaleBase,
+    /// Authenticated and in the share, but this action is not theirs to take
+    /// (e.g. ending a live session someone else started).
+    NotAllowed,
+    /// The owner does not understand this request variant (older peer).
+    Unsupported,
     /// Malformed ids / payload.
     BadRequest,
     /// Protocol version mismatch.

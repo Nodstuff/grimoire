@@ -216,13 +216,40 @@ export class ApiError extends Error {
   }
 }
 
+/** The per-boot admin token (picked up from the URL at boot by main.tsx). */
+export function adminToken(): string | null {
+  try {
+    return sessionStorage.getItem('grimoire.admin_token')
+  } catch {
+    return null
+  }
+}
+
+const ADMIN_HEADER = 'X-Grimoire-Admin'
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  // gate-weakening surfaces live under /admin/ and need the token
+  if (path.startsWith('/admin/')) {
+    const token = adminToken()
+    if (token) {
+      const headers = new Headers(init?.headers)
+      headers.set(ADMIN_HEADER, token)
+      init = { ...init, headers }
+    }
+  }
   const r = await fetch(path, init)
-  const j = await r.json()
+  const j = await r.json().catch(() => null)
+  if (r.status === 401 && path.startsWith('/admin/')) {
+    throw new ApiError(
+      'open Grimoire from the app (or add ?admin_token=… from ~/.grimoire/admin.token to the URL)',
+      'admin_token',
+    )
+  }
   if (j && typeof j === 'object' && 'error' in j) {
     const code = 'code' in j && typeof j.code === 'string' ? j.code : undefined
     throw new ApiError(String(j.error), code)
   }
+  if (j === null) throw new ApiError(`${r.status} ${r.statusText}`.trim())
   return j as T
 }
 

@@ -13,7 +13,7 @@ use grimoire_store::{BlockStore, SqliteStore};
     /// Local-only endpoint: no relays, no discovery, explicit addressing.
     async fn local_endpoint() -> Endpoint {
         Endpoint::builder(presets::Minimal)
-            .alpns(vec![ALPN.to_vec()])
+            .alpns(vec![ALPN.to_vec(), super::wire::HOT_ALPN.to_vec()])
             .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
             .unwrap()
             .bind()
@@ -97,7 +97,8 @@ use grimoire_store::{BlockStore, SqliteStore};
         {
             let s = store.lock().unwrap();
             let c = s.contact_by_pubkey(&alice_id).unwrap().unwrap();
-            assert_eq!(c.petname, "alice");
+            // peer-supplied name carries a fingerprint suffix until renamed
+            assert_eq!(c.petname, format!("alice · {}", &alice_id[..4]));
         }
 
         // session upgraded: authenticated requests now work
@@ -217,7 +218,7 @@ use grimoire_store::{BlockStore, SqliteStore};
                 .contact_by_pubkey(&alice_ep.id().to_string())
                 .unwrap()
                 .unwrap();
-            assert_eq!(alice_contact.petname, "alice");
+            assert!(alice_contact.petname.starts_with("alice · "), "{}", alice_contact.petname);
             let share = s.get_share(share.id).unwrap();
             assert_eq!(share.contact, Some(alice_contact.id));
         }
@@ -999,7 +1000,7 @@ async fn maintainer_trust_applies_green_with_no_review_annotation() {
     assert_eq!(st.review, None, "no annotation at all");
     let feed = s.recent_remote_ops(10).unwrap();
     assert_eq!(feed.len(), 1);
-    assert_eq!(feed[0].principal_name, "alice");
+    assert!(feed[0].principal_name.starts_with("alice · "), "{}", feed[0].principal_name);
     assert_eq!(feed[0].doc_title, "Notes");
 }
 
@@ -1025,13 +1026,13 @@ async fn view_share_bridge_is_read_only_and_propose_share_is_not() {
     join_at(&alice_ep, &alice_store, &ticket, addr).await.unwrap();
 
     // a VIEW share may join the bridge, read-only
-    let (d, read_only) = bridge_authorized(&owner_store, &alice_pub, &share.id.to_string(), &doc.id.to_string()).unwrap();
+    let (d, read_only, _) = bridge_authorized(&owner_store, &alice_pub, &share.id.to_string(), &doc.id.to_string()).unwrap();
     assert_eq!(d, doc.id);
     assert!(read_only, "view share watches read-only");
 
     // upgrade to propose: full participant
     owner_store.lock().unwrap().set_share_permission(share.id, SharePermission::Propose).unwrap();
-    let (_, read_only) = bridge_authorized(&owner_store, &alice_pub, &share.id.to_string(), &doc.id.to_string()).unwrap();
+    let (_, read_only, _) = bridge_authorized(&owner_store, &alice_pub, &share.id.to_string(), &doc.id.to_string()).unwrap();
     assert!(!read_only, "propose share edits");
 
     // an unknown peer is refused outright
@@ -1384,4 +1385,373 @@ async fn pull_pages_large_shares_until_every_doc_lands() {
     // and a follow-up pull is a no-op (cursors current, nothing paged)
     let summary = pull_share(&alice_ep, &alice_store, addr, &owner_contact, share.id).await.unwrap();
     assert_eq!(summary.changed, 0);
+}
+
+// ── federation hardening (2026-09-02) ───────────────────────────────────
+
+/// Owner + grantee pair with a live listener on the owner. Returns
+/// (owner_store, owner_addr, hot, alice_ep, alice_store, alice_pubkey, share, doc).
+async fn paired(
+    permission: SharePermission,
+) -> (
+    Arc<Mutex<SqliteStore>>,
+    EndpointAddr,
+    crate::hot::HotState,
+    Endpoint,
+    Arc<Mutex<SqliteStore>>,
+    String,
+    grimoire_store::Share,
+    grimoire_store::Doc,
+) {
+    let mut owner_store = SqliteStore::open_in_memory().unwrap();
+    let tom = owner_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let doc = owner_store.create_doc("Room", None, tom.id).unwrap();
+    owner_store.apply(doc.id, 0, tom.id, vec![grimoire_store::OpInput {
+        kind: grimoire_store::OpKind::Insert {
+            block_id: uuid::Uuid::now_v7(), parent_id: None, order_key: "a".into(),
+            block_type: grimoire_store::BlockType::Paragraph, content: "seed".into(), refers_to: None,
+        },
+        source_refs: vec![],
+    }]).unwrap();
+    let owner_ep = local_endpoint().await;
+    let (share, link) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), doc.id, permission).unwrap();
+    let owner_store = Arc::new(Mutex::new(owner_store));
+    let addr = direct_addr(&owner_ep);
+    let hot = scratch_hot();
+    tokio::spawn(serve(owner_ep, owner_store.clone(), hot.clone(), Runtime::default()));
+
+    let mut alice_store = SqliteStore::open_in_memory().unwrap();
+    alice_store.create_principal(PrincipalKind::Human, "alice", None).unwrap();
+    let alice_store = Arc::new(Mutex::new(alice_store));
+    let alice_ep = local_endpoint().await;
+    let alice_pub = alice_ep.id().to_string();
+    let ticket = Ticket::parse(&link).unwrap();
+    join_at(&alice_ep, &alice_store, &ticket, addr.clone()).await.unwrap();
+    (owner_store, addr, hot, alice_ep, alice_store, alice_pub, share, doc)
+}
+
+/// A raw y-sync Update frame inserting one paragraph — what a client sends.
+fn paragraph_update(text: &str) -> Vec<u8> {
+    use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+    use yrs::{ReadTxn, Text as _, Transact, XmlFragment as _};
+    let ydoc = yrs::Doc::new();
+    let frag = ydoc.get_or_insert_xml_fragment("default");
+    {
+        let mut txn = ydoc.transact_mut();
+        let el = frag.insert(&mut txn, 0, yrs::XmlElementPrelim::empty("paragraph"));
+        let t = el.insert(&mut txn, 0, yrs::XmlTextPrelim::new(""));
+        t.insert(&mut txn, 0, text);
+    }
+    let update = ydoc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+    let mut enc = EncoderV1::new();
+    yrs::sync::Message::Sync(yrs::sync::SyncMessage::Update(update)).encode(&mut enc);
+    enc.to_vec()
+}
+
+fn paragraphs_in_session(hot: &crate::hot::HotState, doc: uuid::Uuid) -> u32 {
+    use yrs::{Transact, XmlFragment as _};
+    let sessions = hot.sessions.lock().unwrap();
+    let s = sessions.get(&doc).unwrap();
+    let frag = s.awareness.doc().get_or_insert_xml_fragment("default");
+    let txn = s.awareness.doc().transact();
+    frag.len(&txn)
+}
+
+/// Open a raw owner-side bridge (what `open_hot_bridge` does, minus retries),
+/// returning the streams after the hello frame.
+async fn raw_bridge(
+    ep: &Endpoint,
+    addr: EndpointAddr,
+    share: uuid::Uuid,
+    doc: uuid::Uuid,
+) -> (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) {
+    use super::server::{read_frame, write_frame};
+    let conn = ep.connect(addr, super::wire::HOT_ALPN).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let header = serde_json::json!({"share": share.to_string(), "doc": doc.to_string()});
+    write_frame(&mut send, &serde_json::to_vec(&header).unwrap()).await.unwrap();
+    let hello = read_frame(&mut recv).await.unwrap();
+    assert!(hello.is_some(), "bridge refused before hello");
+    (send, recv)
+}
+
+async fn settle() {
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+}
+
+#[tokio::test]
+async fn bridge_permission_downgrade_applies_to_the_live_bridge() {
+    use super::server::write_frame;
+    let (owner_store, addr, hot, alice_ep, _alice_store, _alice_pub, share, doc) = paired(SharePermission::Propose).await;
+    hot.start(doc.id, 1).unwrap();
+    let (mut send, _recv) = raw_bridge(&alice_ep, addr, share.id, doc.id).await;
+    // propose: writes land
+    write_frame(&mut send, &paragraph_update("one")).await.unwrap();
+    settle().await;
+    assert_eq!(paragraphs_in_session(&hot, doc.id), 1);
+    // owner downgrades to view AND flips watch-only; the bridge re-reads its
+    // permission at the next re-auth (200ms under test) — no reconnect needed
+    owner_store.lock().unwrap().set_share_permission(share.id, SharePermission::View).unwrap();
+    hot.set_viewers_write(doc.id, false).unwrap();
+    tokio::time::sleep(super::server::BRIDGE_REAUTH * 3).await;
+    write_frame(&mut send, &paragraph_update("two")).await.unwrap();
+    settle().await;
+    assert_eq!(paragraphs_in_session(&hot, doc.id), 1, "downgraded participant's update filtered");
+    // session = consent: the owner opening it up again lets the viewer write
+    hot.set_viewers_write(doc.id, true).unwrap();
+    write_frame(&mut send, &paragraph_update("three")).await.unwrap();
+    settle().await;
+    assert_eq!(paragraphs_in_session(&hot, doc.id), 2);
+}
+
+#[tokio::test]
+async fn revoke_cuts_a_live_bridge_immediately_and_later_frames_are_dropped() {
+    use super::server::{read_frame, write_frame};
+    let (owner_store, addr, hot, alice_ep, _alice_store, alice_pub, share, doc) = paired(SharePermission::Propose).await;
+    hot.start(doc.id, 1).unwrap();
+    let (mut send, mut recv) = raw_bridge(&alice_ep, addr.clone(), share.id, doc.id).await;
+    write_frame(&mut send, &paragraph_update("one")).await.unwrap();
+    settle().await;
+    assert_eq!(paragraphs_in_session(&hot, doc.id), 1);
+    // what the admin revoke handler does: flip the store, then cut bridges
+    {
+        let mut s = owner_store.lock().unwrap();
+        let contact = s.contact_by_pubkey(&alice_pub).unwrap().unwrap();
+        s.revoke_contact(contact.id).unwrap();
+    }
+    assert_eq!(hot.drop_bridges_for_peer(&alice_pub), 1);
+    // the owner closes the stream well inside the re-auth interval (frames
+    // already fanned out — the echo of "one" — may still be buffered first)
+    let deadline = tokio::time::Instant::now() + super::server::BRIDGE_REAUTH / 2;
+    loop {
+        let r = tokio::time::timeout_at(deadline, read_frame(&mut recv)).await;
+        match r {
+            Ok(Ok(Some(_))) => continue,
+            Ok(Ok(None)) | Ok(Err(_)) => break,
+            Err(_) => panic!("bridge still open after the revoke"),
+        }
+    }
+    // frames after the cut never reach the session
+    let _ = write_frame(&mut send, &paragraph_update("two")).await;
+    settle().await;
+    assert_eq!(paragraphs_in_session(&hot, doc.id), 1);
+    // and a fresh bridge is refused outright (unknown peer)
+    let conn = alice_ep.connect(addr, super::wire::HOT_ALPN).await.unwrap();
+    let (mut s2, mut r2) = conn.open_bi().await.unwrap();
+    let header = serde_json::json!({"share": share.id.to_string(), "doc": doc.id.to_string()});
+    write_frame(&mut s2, &serde_json::to_vec(&header).unwrap()).await.unwrap();
+    let hello = tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(&mut r2)).await.unwrap();
+    assert!(matches!(hello, Ok(None) | Err(_)), "revoked peer got a hello: {hello:?}");
+}
+
+#[tokio::test]
+async fn only_the_owner_or_the_starter_may_end_a_remote_session() {
+    let (owner_store, addr, hot, alice_ep, _alice_store, alice_pub, share, doc) = paired(SharePermission::Propose).await;
+    // a second propose grantee on the same root
+    let bob_ep = local_endpoint().await;
+    let (bob_share, link) = {
+        let mut s = owner_store.lock().unwrap();
+        let owner_node = s.list_principals().unwrap().into_iter().find(|p| p.kind == PrincipalKind::Human).unwrap();
+        mint_invite(&mut s, owner_node.pubkey.as_deref().unwrap_or("00"), doc.id, SharePermission::Propose).unwrap()
+    };
+    let mut bob_store = SqliteStore::open_in_memory().unwrap();
+    bob_store.create_principal(PrincipalKind::Human, "bob", None).unwrap();
+    let bob_store = Arc::new(Mutex::new(bob_store));
+    join_at(&bob_ep, &bob_store, &Ticket::parse(&link).unwrap(), addr.clone()).await.unwrap();
+
+    // alice starts (her copy is current: epoch 1)
+    let res = request(&alice_ep, addr.clone(), Request::HotStart { share: share.id.to_string(), doc: doc.id.to_string(), base_epoch: Some(1) }).await.unwrap();
+    assert!(matches!(res, Response::HotStarted { seed: true, .. }), "{res:?}");
+    assert!(hot.can_end(doc.id, &alice_pub));
+    // bob joins, then tries to end: refused, session still live
+    let res = request(&bob_ep, addr.clone(), Request::HotStart { share: bob_share.id.to_string(), doc: doc.id.to_string(), base_epoch: None }).await.unwrap();
+    assert!(matches!(res, Response::HotStarted { seed: false, .. }));
+    let res = request(&bob_ep, addr.clone(), Request::HotEnd { share: bob_share.id.to_string(), doc: doc.id.to_string() }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
+    assert!(hot.is_hot(doc.id));
+    // alice ends: flattened
+    let res = request(&alice_ep, addr, Request::HotEnd { share: share.id.to_string(), doc: doc.id.to_string() }).await.unwrap();
+    assert!(matches!(res, Response::HotEnded { .. }), "{res:?}");
+    assert!(!hot.is_hot(doc.id));
+}
+
+#[tokio::test]
+async fn two_grantees_on_one_live_doc_each_keep_their_own_permission() {
+    use super::server::bridge_authorized;
+    let (owner_store, addr, hot, _alice_ep, _alice_store, alice_pub, share, doc) = paired(SharePermission::View).await;
+    let bob_ep = local_endpoint().await;
+    let (bob_share, link) = {
+        let mut s = owner_store.lock().unwrap();
+        let owner_node = s.list_principals().unwrap().into_iter().find(|p| p.kind == PrincipalKind::Human).unwrap();
+        mint_invite(&mut s, owner_node.pubkey.as_deref().unwrap_or("00"), doc.id, SharePermission::Propose).unwrap()
+    };
+    let mut bob_store = SqliteStore::open_in_memory().unwrap();
+    bob_store.create_principal(PrincipalKind::Human, "bob", None).unwrap();
+    let bob_store = Arc::new(Mutex::new(bob_store));
+    join_at(&bob_ep, &bob_store, &Ticket::parse(&link).unwrap(), addr.clone()).await.unwrap();
+    let bob_pub = bob_ep.id().to_string();
+    hot.start(doc.id, 1).unwrap();
+
+    let (_, alice_ro, _) = bridge_authorized(&owner_store, &alice_pub, &share.id.to_string(), &doc.id.to_string()).unwrap();
+    let (_, bob_ro, _) = bridge_authorized(&owner_store, &bob_pub, &bob_share.id.to_string(), &doc.id.to_string()).unwrap();
+    assert!(alice_ro && !bob_ro, "permission is per participant");
+    // both connect; the session records both
+    hot.connect_as(doc.id, Some(&alice_pub)).unwrap();
+    hot.connect_as(doc.id, Some(&bob_pub)).unwrap();
+    // the owner's watch-only flip affects the viewer only (HotStatus can_write)
+    hot.set_viewers_write(doc.id, false).unwrap();
+    let status = |ep: &Endpoint, sh: uuid::Uuid| {
+        let ep = ep.clone();
+        let addr = addr.clone();
+        let req = Request::HotStatus { share: sh.to_string(), doc: doc.id.to_string() };
+        async move { request(&ep, addr, req).await.unwrap() }
+    };
+    let Response::HotStatusIs { can_write: bob_w, .. } = status(&bob_ep, bob_share.id).await else { panic!() };
+    assert_eq!(bob_w, Some(true));
+    // alice's own endpoint is not in this scope; her permission is view, so
+    // watch-only makes her read-only: checked through the pure filter rule
+    assert!(alice_ro && !hot.viewers_write(doc.id).unwrap());
+}
+
+#[tokio::test]
+async fn owner_identity_change_on_rejoin_revokes_the_old_contact() {
+    let (owner_store, _addr, _hot, alice_ep, alice_store, _alice_pub, _share, doc) = paired(SharePermission::View).await;
+    let old_owner_pub = alice_store.lock().unwrap().list_contacts().unwrap()[0].pubkey.clone();
+    drop(owner_store);
+    // the owner re-installs: new node key, same docs (restored vault)
+    let mut owner2 = SqliteStore::open_in_memory().unwrap();
+    let tom2 = owner2.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    owner2.create_doc_with_id(doc.id, "Room", None, tom2.id).unwrap();
+    let owner2_ep = local_endpoint().await;
+    let (_share2, link2) = mint_invite(&mut owner2, &owner2_ep.id().to_string(), doc.id, SharePermission::View).unwrap();
+    let owner2_store = Arc::new(Mutex::new(owner2));
+    let addr2 = direct_addr(&owner2_ep);
+    tokio::spawn(serve(owner2_ep, owner2_store, scratch_hot(), Runtime::default()));
+
+    let out = join_at(&alice_ep, &alice_store, &Ticket::parse(&link2).unwrap(), addr2).await.unwrap();
+    assert_eq!(out.owner_changed_from.as_deref(), Some("tom"), "{out:?}");
+    let s = alice_store.lock().unwrap();
+    let contacts = s.list_contacts().unwrap();
+    let old = contacts.iter().find(|c| c.pubkey == old_owner_pub).unwrap();
+    assert!(old.revoked, "old identity revoked so the loops stop dialing it");
+    let mirror = s.get_mirror(doc.id).unwrap().unwrap();
+    let new = contacts.iter().find(|c| c.id == mirror.owner).unwrap();
+    assert!(!new.revoked && new.pubkey != old_owner_pub);
+}
+
+#[tokio::test]
+async fn unknown_peer_on_pull_is_a_typed_refusal_that_does_not_drop_mirrors_on_first_sight() {
+    use super::client::pull_share;
+    use super::loops::pull_all_once;
+    let (owner_store, addr, _hot, alice_ep, alice_store, alice_pub, share, doc) = paired(SharePermission::View).await;
+    let owner_contact = alice_store.lock().unwrap().list_contacts().unwrap().into_iter().next().unwrap();
+    pull_share(&alice_ep, &alice_store, addr.clone(), &owner_contact, share.id).await.unwrap();
+    assert!(alice_store.lock().unwrap().get_mirror(doc.id).unwrap().is_some());
+    // the owner drops alice as a contact (or restored a db without her)
+    {
+        let mut s = owner_store.lock().unwrap();
+        let c = s.contact_by_pubkey(&alice_pub).unwrap().unwrap();
+        s.revoke_contact(c.id).unwrap();
+    }
+    let err = pull_share(&alice_ep, &alice_store, addr, &owner_contact, share.id).await.unwrap_err();
+    assert_eq!(err.downcast_ref::<super::wire::Refusal>().map(|r| r.code), Some(RefusalCode::UnknownPeer));
+    // a sweep sees it once: mirrors stay (a second sighting ≥ one sweep later drops them)
+    let results = pull_all_once(&alice_ep, &alice_store).await;
+    assert_eq!(results.len(), 1);
+    assert!(results[0].1.is_err());
+    let s = alice_store.lock().unwrap();
+    assert!(s.get_mirror(doc.id).unwrap().is_some(), "not dropped on first UnknownPeer");
+    assert!(!s.doc_is_tombstoned(doc.id).unwrap());
+    assert!(s.get_mirror(doc.id).unwrap().unwrap().last_error.is_some(), "but the failure is recorded");
+}
+
+#[tokio::test]
+async fn a_burned_invite_is_a_dead_join_and_an_unreachable_owner_is_not() {
+    use super::loops::join_failure_is_dead;
+    let mut owner_store = SqliteStore::open_in_memory().unwrap();
+    let tom = owner_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let doc = owner_store.create_doc("D", None, tom.id).unwrap();
+    let owner_ep = local_endpoint().await;
+    let (_share, link) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), doc.id, SharePermission::View).unwrap();
+    let owner_store = Arc::new(Mutex::new(owner_store));
+    let addr = direct_addr(&owner_ep);
+    tokio::spawn(serve(owner_ep, owner_store, scratch_hot(), Runtime::default()));
+    let mut alice_store = SqliteStore::open_in_memory().unwrap();
+    alice_store.create_principal(PrincipalKind::Human, "alice", None).unwrap();
+    let alice_store = Arc::new(Mutex::new(alice_store));
+    let alice_ep = local_endpoint().await;
+    let ticket = Ticket::parse(&link).unwrap();
+    join_at(&alice_ep, &alice_store, &ticket, addr.clone()).await.unwrap();
+    // same link pasted twice: the secret is burned
+    let err = join_at(&alice_ep, &alice_store, &ticket, addr).await.unwrap_err();
+    assert!(join_failure_is_dead(&err), "{err:#}");
+    // an owner that is simply unreachable is a retry, not a drop
+    let nobody = EndpointAddr::from(local_endpoint().await.id());
+    let err = tokio::time::timeout(std::time::Duration::from_secs(12), join_at(&alice_ep, &alice_store, &ticket, nobody)).await.unwrap().unwrap_err();
+    assert!(!join_failure_is_dead(&err), "{err:#}");
+}
+
+#[tokio::test]
+async fn redeemed_petnames_carry_a_fingerprint_suffix_until_the_owner_renames() {
+    let (owner_store, _addr, _hot, _alice_ep, alice_store, alice_pub, _share, _doc) = paired(SharePermission::View).await;
+    let s = owner_store.lock().unwrap();
+    let c = s.contact_by_pubkey(&alice_pub).unwrap().unwrap();
+    let expected = format!("alice · {}", &alice_pub[..4]);
+    assert_eq!(c.petname, expected, "peer-supplied name is marked until verified");
+    assert_eq!(s.get_principal(c.principal).unwrap().display_name, expected, "provenance shows the same");
+    drop(s);
+    // the owner renames: contact AND principal follow
+    let mut s = owner_store.lock().unwrap();
+    s.rename_contact(c.id, "Alice (work)").unwrap();
+    assert_eq!(s.contact_by_pubkey(&alice_pub).unwrap().unwrap().petname, "Alice (work)");
+    assert_eq!(s.get_principal(c.principal).unwrap().display_name, "Alice (work)");
+    assert!(s.rename_contact(c.id, "   ").is_err());
+    // the grantee side names the owner by the owner's own profile name: no suffix
+    let a = alice_store.lock().unwrap();
+    assert_eq!(a.list_contacts().unwrap()[0].petname, "tom");
+}
+
+#[tokio::test]
+async fn notify_batch_lands_one_event_per_item_and_one_pull() {
+    use super::wire::{NotifyItem, NotifyKind};
+    let mut a_store = SqliteStore::open_in_memory().unwrap();
+    let tom = a_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let doc = a_store.create_doc("Nudged", None, tom.id).unwrap();
+    let kid = a_store.create_doc("Kid", Some(doc.id), tom.id).unwrap();
+    let a_ep = local_endpoint().await;
+    let (share, link) = mint_invite(&mut a_store, &a_ep.id().to_string(), doc.id, SharePermission::View).unwrap();
+    let a_store = Arc::new(Mutex::new(a_store));
+    let a_addr = direct_addr(&a_ep);
+    tokio::spawn(serve(a_ep.clone(), a_store.clone(), scratch_hot(), Runtime::default()));
+
+    let mut b_store = SqliteStore::open_in_memory().unwrap();
+    b_store.create_principal(PrincipalKind::Human, "bob", None).unwrap();
+    let b_store = Arc::new(Mutex::new(b_store));
+    let b_ep = local_endpoint().await;
+    let b_addr = direct_addr(&b_ep);
+    let b_runtime = Runtime::default();
+    tokio::spawn(serve(b_ep.clone(), b_store.clone(), scratch_hot(), b_runtime.clone()));
+    join_at(&b_ep, &b_store, &Ticket::parse(&link).unwrap(), a_addr).await.unwrap();
+
+    let res = request(&a_ep, b_addr.clone(), Request::NotifyBatch {
+        share: share.id.to_string(),
+        items: vec![
+            NotifyItem { doc: doc.id.to_string(), title: "Nudged".into(), kind: NotifyKind::DocChanged },
+            NotifyItem { doc: kid.id.to_string(), title: "Kid".into(), kind: NotifyKind::DocAdded },
+        ],
+    }).await.unwrap();
+    assert_eq!(res, Response::Noted);
+    let (_, events) = b_runtime.events_since(0);
+    assert_eq!(events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), vec!["doc_changed", "doc_added"]);
+    // the nudged pull ran (the dial back to A works: A's address is known from the join)
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let b = b_store.lock().unwrap();
+    assert!(b.get_mirror(kid.id).unwrap().is_some(), "batch nudge triggered the pull");
+    // a bad doc id in the batch is refused as a whole
+    drop(b);
+    let res = request(&a_ep, b_addr, Request::NotifyBatch {
+        share: share.id.to_string(),
+        items: vec![NotifyItem { doc: "nope".into(), title: String::new(), kind: NotifyKind::DocChanged }],
+    }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::BadRequest);
 }

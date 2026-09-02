@@ -119,6 +119,32 @@ fn compose_tagging(store: &SqliteStore, g: &Gardener) -> grimoire_store::Result<
 }
 
 /// One shot of `claude -p`, wall-clock bounded. Returns (result_text, tokens).
+/// Where Claude Code is. `GRIMOIRE_CLAUDE_BIN` wins; otherwise `claude` is
+/// looked up on PATH and in the usual install dirs a GUI-launched daemon's
+/// bare PATH misses. One resolver for the preflight route AND the spawn, so
+/// the UI can never say "installed" and the run then fail to find it.
+pub fn claude_bin() -> Option<std::path::PathBuf> {
+    if let Some(explicit) = std::env::var_os("GRIMOIRE_CLAUDE_BIN") {
+        let p = std::path::PathBuf::from(explicit);
+        return p.is_file().then_some(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    for extra in [
+        format!("{home}/.claude/local/bin"),
+        format!("{home}/.local/bin"),
+        "/opt/homebrew/bin".to_string(),
+        "/usr/local/bin".to_string(),
+    ] {
+        dirs.push(extra.into());
+    }
+    dirs.into_iter()
+        .map(|d| d.join("claude"))
+        .find(|p| p.is_file())
+}
+
 async fn invoke_claude(prompt: &str) -> Result<(String, i64), String> {
     invoke_claude_with_dirs(prompt, &[]).await
 }
@@ -143,7 +169,10 @@ async fn invoke_claude_streaming(
 ) -> Result<(String, i64), String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let bin = std::env::var("GRIMOIRE_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    let bin = claude_bin().ok_or_else(|| {
+        "Claude Code is not installed on this Mac (no `claude` on PATH) — gardeners need it"
+            .to_string()
+    })?;
     let mut args: Vec<String> = vec![
         "-p".into(),
         prompt.into(),

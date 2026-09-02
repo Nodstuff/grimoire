@@ -2206,7 +2206,13 @@ impl BlockStore for SqliteStore {
                 "contact is revoked; un-revoke before re-inviting".into(),
             ));
         }
-        let contact = self.pair_contact(pubkey, petname)?;
+        // The petname is PEER-SUPPLIED. A first-seen contact carries a short
+        // fingerprint suffix ("alice · 3f9a") so two peers claiming the same
+        // name are distinguishable until the owner renames or verifies them.
+        // An existing contact keeps the owner's chosen name (pair_contact).
+        let suffix: String = pubkey.chars().take(4).collect();
+        let shown = format!("{} · {suffix}", petname.trim());
+        let contact = self.pair_contact(pubkey, &shown)?;
         // burn first: even if binding fails, the secret is single-use
         self.conn.execute(
             "UPDATE share_invites SET redeemed_by = ?1,
@@ -2502,6 +2508,10 @@ impl BlockStore for SqliteStore {
     }
 
     fn rename_contact(&mut self, id: Uuid, petname: &str) -> Result<()> {
+        let petname = petname.trim();
+        if petname.is_empty() || petname.chars().count() > 64 {
+            return Err(StoreError::InvalidOp("petname must be 1..64 characters".into()));
+        }
         let n = self.conn.execute(
             "UPDATE contacts SET petname = ?1 WHERE id = ?2",
             params![petname, id.to_string()],
@@ -2509,7 +2519,34 @@ impl BlockStore for SqliteStore {
         if n == 0 {
             return Err(StoreError::NotFound(format!("contact {id}")));
         }
+        // the contact's Remote principal is how they appear in provenance and
+        // the review queue; it follows the owner's chosen name
+        self.conn.execute(
+            "UPDATE principals SET display_name = ?1
+             WHERE id = (SELECT principal FROM contacts WHERE id = ?2)",
+            params![petname, id.to_string()],
+        )?;
         Ok(())
+    }
+
+    fn change_signature(&self) -> Result<ChangeSignature> {
+        // one cheap aggregate over docs + shares: enough to say "nothing an
+        // owner-side nudge could care about moved since last tick"
+        let (max_epoch, doc_count): (i64, i64) = self.conn.query_row(
+            "SELECT coalesce(max(current_epoch), 0), count(*) FROM docs WHERE deleted = 0",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let active_shares: i64 = self.conn.query_row(
+            "SELECT count(*) FROM shares WHERE state = 'active'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(ChangeSignature {
+            max_epoch,
+            doc_count,
+            active_shares,
+        })
     }
 
     fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>> {

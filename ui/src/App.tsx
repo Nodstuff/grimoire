@@ -120,6 +120,9 @@ export default function App() {
   // live data: poll the store's change stamp; when it moves, every mounted
   // view refreshes (dataVersion threads down). Cheap — one local SQLite read.
   const [dataVersion, setDataVersion] = useState(0)
+  // the stamp poll doubles as the liveness check: three misses in a row
+  // (7.5s) = the background service is down; one hit clears it
+  const [daemonDown, setDaemonDown] = useState(false)
   // owner→grantee nudges (GET /api/events): a doc_changed for the doc that is
   // open makes DocView reload at once instead of waiting for the next pull
   const [liveChange, setLiveChange] = useState<{ docId: string; n: number } | null>(null)
@@ -144,9 +147,12 @@ export default function App() {
     }
     // don't wait a whole tick for the first nudge check
     pollEvents().catch(() => {})
+    let misses = 0
     const t = setInterval(async () => {
       try {
         const r = await api<{ stamp: number }>('/api/stamp')
+        misses = 0
+        setDaemonDown(false)
         if (stamp === null) stamp = r.stamp
         else if (r.stamp !== stamp) {
           stamp = r.stamp
@@ -162,7 +168,9 @@ export default function App() {
           location.reload()
         }
       } catch {
-        // daemon restarting mid-deploy — next tick catches up
+        // restarting mid-deploy, or actually down — say so after 3 misses
+        misses += 1
+        if (misses >= 3) setDaemonDown(true)
       }
     }, 2500)
     return () => clearInterval(t)
@@ -217,6 +225,12 @@ export default function App() {
           setPalette((p) => (p === 'open' ? null : 'open'))
           break
         case 'search':
+          // ⌘S while writing means "save" to every editor user: the doc
+          // autosaves, so just say so instead of opening search
+          if (e.key.toLowerCase() === 's' && (e.target as HTMLElement | null)?.closest('.ProseMirror')) {
+            notify('autosaved', 'ok', { ttlMs: 1500 })
+            break
+          }
           setPalette((p) => (p === 'search' ? null : 'search'))
           break
         case 'tree':
@@ -278,6 +292,11 @@ export default function App() {
   return (
     <div className="app">
       <Notices />
+      {daemonDown && (
+        <div className="daemon-banner" role="status">
+          Grimoire’s background service is not responding — edits are kept in the editor and will save when it is back
+        </div>
+      )}
       {treeOpen && (
         <DocTreeNav
           docs={docs}
@@ -291,6 +310,14 @@ export default function App() {
         {view.kind === 'home' && (
           <div className="home">
             <div className="home-mark">◈</div>
+            {docs.length === 0 ? (
+              <div className="home-start">
+                <div className="home-start-title">Welcome to Grimoire</div>
+                <div><kbd>⌘N</kbd> create your first doc</div>
+                <div><kbd>⌘K</kbd> → Shares &amp; contacts to join a share someone sent you</div>
+                <div><kbd>?</kbd> all shortcuts</div>
+              </div>
+            ) : (
             <div className="home-hints">
               <span><kbd>⌘K</kbd> commands</span>
               <span><kbd>⌘O</kbd> open</span>
@@ -304,6 +331,7 @@ export default function App() {
               <span><kbd>⌘[</kbd> <kbd>⌘]</kbd> history</span>
               <span><kbd>?</kbd> all shortcuts</span>
             </div>
+            )}
           </div>
         )}
         {view.kind === 'doc' && (
@@ -409,7 +437,7 @@ function ShortcutHelp({ onClose }: { onClose: () => void }) {
       [
         ['⌘K', 'commands'],
         ['⌘O', 'open a doc'],
-        ['⌘P', 'search (⌘S, ⌘F too)'],
+        ['⌘P', 'search (⌘F too; ⌘S in an editor just confirms autosave)'],
         ['⌘T', 'toggle file tree'],
         ['⌘W', 'home'],
         ['⌘[ / ⌘]', 'history back / forward'],
@@ -610,7 +638,7 @@ function OpenDocPalette({
             <span className="hint">{d.is_canvas ? 'canvas' : 'doc'}</span>
           </div>
         ))}
-        {docs.length === 0 && <div className="palette-empty">no docs</div>}
+        {docs.length === 0 && <div className="palette-empty">no docs yet — ⌘N creates one</div>}
       </div>
     </PaletteShell>
   )
@@ -1240,7 +1268,7 @@ function DocView({
         api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => {})
         api<DocFederation>(`/api/doc/${docId}/federation`).then(setFed).catch(() => {})
       })
-      .catch(() => {})
+      .catch((e) => console.warn('doc refresh failed', docId, e))
   }, [docId])
   useEffect(() => {
     if (dataVersion === 0) return

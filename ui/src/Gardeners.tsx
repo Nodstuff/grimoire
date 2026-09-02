@@ -23,10 +23,18 @@ export default function Gardeners({ dataVersion = 0 }: { dataVersion?: number })
   const [runs, setRuns] = useState<GardenerRun[]>([])
   const [running, setRunning] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
+  // Claude Code present on this Mac? null = older daemon without the route
+  // (assume yes, as before); false hides "+ new gardener" behind an explainer
+  const [claude, setClaude] = useState<boolean | null>(null)
 
   const load = useCallback(() => {
     api<Gardener[]>('/admin/gardeners').then(setGardeners).catch(console.error)
     api<GardenerRun[]>('/api/runs').then(setRuns).catch(console.error)
+  }, [])
+  useEffect(() => {
+    api<{ claude: boolean }>('/api/gardeners/preflight')
+      .then((p) => setClaude(p.claude))
+      .catch(() => setClaude(null))
   }, [])
 
   useEffect(load, [load, dataVersion])
@@ -50,10 +58,26 @@ export default function Gardeners({ dataVersion = 0 }: { dataVersion?: number })
     <div className="runs">
       <div className="gardeners-head">
         <h1 className="queue-title">gardeners</h1>
-        <button className="chip" onClick={() => setCreating(!creating)}>
-          {creating ? 'cancel' : '+ new gardener'}
-        </button>
+        {claude !== false && (
+          <button className="chip" onClick={() => setCreating(!creating)}>
+            {creating ? 'cancel' : '+ new gardener'}
+          </button>
+        )}
       </div>
+      {claude === false && (
+        <div className="gardeners-empty">
+          Gardeners run on Claude Code, which is not installed on this Mac.{' '}
+          <a href="https://docs.anthropic.com/en/docs/claude-code" target="_blank" rel="noreferrer">
+            Install Claude Code
+          </a>
+          , then reopen this page.
+        </div>
+      )}
+      {claude !== false && gardeners.length === 0 && !creating && (
+        <div className="gardeners-empty">
+          gardeners only act on docs you have opted in — open a doc → tend
+        </div>
+      )}
       {creating && (
         <CreateCard
           onCreated={() => {

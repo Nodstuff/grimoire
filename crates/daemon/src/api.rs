@@ -708,7 +708,54 @@ async fn buildinfo() -> Json<Value> {
             .unwrap_or(0),
         Err(_) => crate::ui_build_stamp(),
     };
-    Json(json!({"build": stamp}))
+    Json(json!({"build": stamp, "version": env!("CARGO_PKG_VERSION")}))
+}
+
+/// Last `n` lines of a file, reading only its tail (the daily log can be a
+/// few MB; never slurp it whole for 200 lines).
+fn tail_lines(path: &std::path::Path, n: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    const WINDOW: u64 = 256 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(WINDOW);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut buf = String::new();
+    if f.read_to_string(&mut buf).is_err() {
+        return String::new();
+    }
+    let lines: Vec<&str> = buf.lines().collect();
+    let skip = lines.len().saturating_sub(n);
+    // a window cut mid-line leaves a partial first line; drop it when we skipped
+    let from = if start > 0 && skip == 0 { 1.min(lines.len()) } else { skip };
+    lines[from..].join("\n")
+}
+
+/// What to paste into a bug report: version, log location and the last 200
+/// log lines. The UI adds node id + fingerprint from /api/profile.
+async fn diagnostics() -> Json<Value> {
+    let path = crate::log_path();
+    let tail = path.as_deref().map(|p| tail_lines(p, 200)).unwrap_or_default();
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "log_path": path.map(|p| p.to_string_lossy().to_string()),
+        "log_tail": tail,
+    }))
+}
+
+/// Gardeners shell out to Claude Code; a fresh Mac may not have it. The UI
+/// asks before offering to create one, so the first run never fails with a
+/// bare "spawn claude: No such file or directory".
+async fn gardeners_preflight() -> Json<Value> {
+    let path = crate::garden::claude_bin();
+    Json(json!({
+        "claude": path.is_some(),
+        "path": path.map(|p| p.to_string_lossy().to_string()),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1056,6 +1103,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/doc/{id}/status", post(set_status))
         .route("/api/doc/{id}/move", post(move_doc))
         .route("/api/buildinfo", get(buildinfo))
+        .route("/api/diagnostics", get(diagnostics))
+        .route("/api/gardeners/preflight", get(gardeners_preflight))
         .route("/api/stamp", get(stamp))
         .route("/api/doc/{id}/delete", post(delete_doc))
         .route("/api/doc/{id}/restore", post(restore_doc))

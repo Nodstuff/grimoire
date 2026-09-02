@@ -98,6 +98,23 @@
   a user-visible step kills adoption; the secret-over-existing-channel model already
   bounds security at the channel, so visible keys add friction without adding trust.
 
+## Local trust boundary (added 2026-09-02)
+
+Localhost is no longer trusted absolutely. Every gate-weakening route — shares,
+trust tiers, contact revoke/unrevoke, gardeners, review policy, joins — lives under
+`/admin/*` and requires a per-boot random token (`X-Grimoire-Admin`). The daemon
+writes it to `<db dir>/admin.token` (mode 0600, replaced on every start); the Tauri
+shell reads it and hands it to the page as `?admin_token=` (stripped from the URL at
+boot, held in `sessionStorage`), and the CLI reads the same file. `/api/*` and `/mcp`
+stay open on 127.0.0.1: reading, proposing through the gate, and the profile are the
+"local agent" surface and are not gate-weakening. MCP still exposes no admin tool.
+
+Honest boundary: any process running **as the same user** can read the token file, so
+the token does not protect against a compromised user account. What it does refuse is
+everything else that can reach 127.0.0.1 — browser tabs and web content (which cannot
+read files), sandboxed apps, and other users on a shared machine. That is the same
+boundary the identity key already has.
+
 ## The one scary thing
 
 A write-accepting network surface on a daemon that currently trusts localhost

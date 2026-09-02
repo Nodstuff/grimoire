@@ -257,19 +257,108 @@ fn bootstrap_principals(store: &mut SqliteStore) -> anyhow::Result<(uuid::Uuid, 
     Ok((tom, claude))
 }
 
+/// Where the daemon's log files live (the db directory). Set once by
+/// `init_logging`; `log_path` and the diagnostics route read it.
+static LOG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Log file name parts: `ksd.YYYY-MM-DD.log`, rotated daily, 7 kept.
+const LOG_PREFIX: &str = "ksd";
+const LOG_SUFFIX: &str = "log";
+const LOG_KEEP: usize = 7;
+
+/// The current log file (newest `ksd.*.log` in the log dir), if any.
+pub fn log_path() -> Option<PathBuf> {
+    let dir = LOG_DIR.get()?;
+    // dates sort lexically; the greatest name is the newest file
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| {
+                    n.starts_with(&format!("{LOG_PREFIX}.")) && n.ends_with(&format!(".{LOG_SUFFIX}"))
+                })
+        })
+        .max()
+}
+
+/// One log, owned by the daemon: a daily-rolled file beside the db (the
+/// shell used to redirect stdout into a second, never-rotating file), plus
+/// stdout when run from a terminal. Level: RUST_LOG, else the `log.level`
+/// setting, else info. Returns the non-blocking writer's guard — drop it and
+/// buffered lines are lost, so `main` holds it until exit.
+fn init_logging(db_dir: &std::path::Path, level: Option<String>) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use std::io::IsTerminal;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .or_else(|_| tracing_subscriber::EnvFilter::try_new(level.as_deref().unwrap_or("info")))
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let stdout_layer = std::io::stdout()
+        .is_terminal()
+        .then(tracing_subscriber::fmt::layer);
+    let file = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(LOG_PREFIX)
+        .filename_suffix(LOG_SUFFIX)
+        .max_log_files(LOG_KEEP)
+        .build(db_dir);
+    match file {
+        Ok(appender) => {
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            let _ = LOG_DIR.set(db_dir.to_path_buf());
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer))
+                .with(stdout_layer)
+                .init();
+            Some(guard)
+        }
+        Err(e) => {
+            // no writable log dir: stderr is better than silence
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .init();
+            tracing::warn!("log file unavailable ({e}); logging to stderr only");
+            None
+        }
+    }
+}
+
+
+/// CLI → daemon: every `/admin/*` call carries the per-boot admin token the
+/// daemon wrote beside the db (see `admin::AdminToken`). Missing file = the
+/// daemon is not running; the request fails with a clear 401 either way.
+fn admin_client(db: &std::path::Path, timeout: Option<std::time::Duration>) -> anyhow::Result<reqwest::Client> {
+    let db_dir = db.parent().unwrap_or(std::path::Path::new("."));
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(tok) = admin::AdminToken::read_from(db_dir) {
+        headers.insert(admin::ADMIN_HEADER, reqwest::header::HeaderValue::from_str(&tok)?);
+    }
+    let mut b = reqwest::Client::builder().default_headers(headers);
+    if let Some(t) = timeout {
+        b = b.timeout(t);
+    }
+    Ok(b.build()?)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
-    if let Some(parent) = cli.db.parent() {
-        std::fs::create_dir_all(parent).context("creating db directory")?;
-    }
+    let db_dir = cli
+        .db
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&db_dir).context("creating db directory")?;
     let mut store = SqliteStore::open(&cli.db).context("opening store")?;
+    // logging waits for the store: the level may live in settings (log.level)
+    let level = store.get_setting("log.level").ok().flatten();
+    let _log_guard = init_logging(&db_dir, level);
     let (tom, claude) = bootstrap_principals(&mut store)?;
 
     match cli.cmd {
@@ -290,7 +379,7 @@ async fn main() -> anyhow::Result<()> {
             println!("exported {} files to {}", report.files, dir.display());
         }
         Cmd::Gardener { cmd } => {
-            let client = reqwest::Client::new();
+            let client = admin_client(&cli.db, None)?;
             let base = "http://127.0.0.1:7425";
             match cmd {
                 GardenerCmd::Add {
@@ -321,9 +410,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Garden { name } => {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(600))
-                .build()?;
+            let client = admin_client(&cli.db, Some(std::time::Duration::from_secs(600)))?;
             let r = client
                 .post("http://127.0.0.1:7425/admin/garden")
                 .json(&serde_json::json!({ "name": name }))
@@ -336,7 +423,7 @@ async fn main() -> anyhow::Result<()> {
                 "doc_id": doc_id,
                 "policy": if policy == "clear" { serde_json::Value::Null } else { policy.clone().into() },
             });
-            let client = reqwest::Client::new();
+            let client = admin_client(&cli.db, None)?;
             let r = client
                 .post("http://127.0.0.1:7425/admin/policy")
                 .json(&body)
@@ -345,11 +432,11 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", r.text().await?);
         }
         Cmd::Runs => {
-            let r = reqwest::get("http://127.0.0.1:7425/admin/runs").await?;
+            let r = admin_client(&cli.db, None)?.get("http://127.0.0.1:7425/admin/runs").send().await?;
             println!("{}", r.text().await?);
         }
         Cmd::Share { cmd } => {
-            let client = reqwest::Client::new();
+            let client = admin_client(&cli.db, None)?;
             let base = "http://127.0.0.1:7425";
             match cmd {
                 ShareCmd::Invite { doc_id, permission } => {
@@ -390,9 +477,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Join { link } => {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?;
+            let client = admin_client(&cli.db, Some(std::time::Duration::from_secs(30)))?;
             let r = client
                 .post("http://127.0.0.1:7425/admin/join")
                 .json(&serde_json::json!({"link": link}))
@@ -413,13 +498,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Contacts => {
-            let r = reqwest::get("http://127.0.0.1:7425/admin/contacts").await?;
+            let r = admin_client(&cli.db, None)?.get("http://127.0.0.1:7425/admin/contacts").send().await?;
             println!("{}", r.text().await?);
         }
         Cmd::Pull => {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()?;
+            let client = admin_client(&cli.db, Some(std::time::Duration::from_secs(120)))?;
             let r = client
                 .post("http://127.0.0.1:7425/admin/pull")
                 .send()
@@ -500,6 +583,10 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => tracing::warn!("federation endpoint failed to bind: {e:#}"),
                 }
             }
+            // the local trust boundary for /admin/*: a per-boot token beside the
+            // db; the shell and CLI read it, any other local process is refused
+            let admin_token = admin::AdminToken::mint(&db_dir)
+                .context("minting admin token")?;
             tokio::spawn(admin::daily_loop(store.clone(), hot.clone()));
             // daily self-contained db snapshot beside the db (backups/), keep 7
             tokio::spawn(backup::backup_loop(store.clone(), cli.db.clone()));
@@ -509,7 +596,7 @@ async fn main() -> anyhow::Result<()> {
                     store: store.clone(),
                     endpoint: fed_ctx.endpoint.clone(),
                 }))
-                .merge(admin::router(store.clone(), fed_ctx, hot.clone()))
+                .merge(admin::router(store.clone(), fed_ctx, hot.clone(), admin_token))
                 .merge(api::router(api::ApiState {
                     store,
                     human: tom,

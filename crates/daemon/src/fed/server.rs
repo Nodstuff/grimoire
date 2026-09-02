@@ -9,7 +9,6 @@
 //! Refusals carry a typed `RefusalCode` beside the human reason — the
 //! grantee's loops branch on the code, never on the text.
 
-use super::client::pull_share;
 use super::runtime::Runtime;
 use super::wire::{
     ALPN, Frame, HOT_ALPN, MAX_FRAME, PROTOCOL_VERSION, PULL_BUDGET, Refusal, RefusalCode,
@@ -38,8 +37,48 @@ pub async fn bind(secret: [u8; 32]) -> Result<Endpoint> {
         .context("binding federation endpoint")
 }
 
-/// Bounded propose dedupe: (peer, request_id) → original outcome (retry safety).
-type Dedupe = Arc<Mutex<std::collections::HashMap<String, Response>>>;
+/// Bounded propose dedupe: (peer, request_id) → original outcome (retry
+/// safety). Insertion-ordered eviction: the oldest entry goes when full, so
+/// a retry straddling the cap still finds its original (the clear-everything
+/// it replaces made exactly that retry park twice).
+pub(super) struct DedupeCache {
+    map: std::collections::HashMap<String, Response>,
+    order: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl DedupeCache {
+    pub(super) fn new(cap: usize) -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    pub(super) fn get(&self, key: &str) -> Option<&Response> {
+        self.map.get(key)
+    }
+
+    pub(super) fn insert(&mut self, key: String, value: Response) {
+        if self.map.insert(key.clone(), value).is_none() {
+            self.order.push_back(key);
+            while self.order.len() > self.cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+type Dedupe = Arc<Mutex<DedupeCache>>;
+const DEDUPE_CAP: usize = 512;
 
 /// Accept loop. Spawned once per daemon; lives until the endpoint closes.
 pub async fn serve(
@@ -49,7 +88,7 @@ pub async fn serve(
     runtime: Runtime,
 ) {
     tracing::info!("federation endpoint listening (node id {})", endpoint.id());
-    let dedupe: Dedupe = Default::default();
+    let dedupe: Dedupe = Arc::new(Mutex::new(DedupeCache::new(DEDUPE_CAP)));
     while let Some(incoming) = endpoint.accept().await {
         let store = store.clone();
         let dedupe = dedupe.clone();
@@ -238,9 +277,6 @@ fn dispatch(
             };
             if let (Some(key), Response::Proposed { .. }) = (&dedupe_key, &res) {
                 let mut cache = dedupe.lock().unwrap_or_else(|p| p.into_inner());
-                if cache.len() >= 512 {
-                    cache.clear(); // crude but bounded
-                }
                 cache.insert(key.clone(), res.clone());
             }
             res
@@ -293,9 +329,10 @@ fn dispatch(
                         ),
                     );
                 }
-                match hot.start(doc_id, frozen_epoch) {
+                // the creator is recorded: only they (or the owner) may end it
+                match hot.start_by(doc_id, frozen_epoch, Some(peer)) {
                     Ok(seed) => {
-                        tracing::info!(peer = contact.pubkey, %doc_id, "remote hot start");
+                        tracing::info!(peer = contact.pubkey, %doc_id, seed, "remote hot start");
                         Response::HotStarted { frozen_epoch, seed }
                     }
                     Err(e) => Response::refused(RefusalCode::Other, e.to_string()),
@@ -323,6 +360,14 @@ fn dispatch(
         }
         Request::HotEnd { share, doc } => match authorize_hot(&store, &contact, &share, &doc, true) {
             Ok(doc_id) => {
+                // ending flattens for EVERYONE in the room: the owner (locally)
+                // or the participant who started the session — not any peer
+                if !hot.can_end(doc_id, peer) {
+                    return Response::refused(
+                        RefusalCode::NotAllowed,
+                        "only the owner or whoever started the session can end it",
+                    );
+                }
                 // flatten needs the store WITHOUT this dispatch holding it
                 drop(store);
                 match hot.flatten_and_close(store_arc, doc_id, "ended by peer") {
@@ -351,34 +396,17 @@ fn dispatch(
             doc,
             title,
             kind,
-        } => {
-            // grantee side: accept a nudge only for a share we hold FROM this
-            // contact — anyone else is told nothing useful
-            let (Ok(share_uuid), Ok(doc_uuid)) =
-                (share.parse::<uuid::Uuid>(), doc.parse::<uuid::Uuid>())
-            else {
-                return Response::refused(RefusalCode::BadRequest, "bad ids");
-            };
-            let holds = store
-                .list_mirrors()
-                .map(|ms| ms.iter().any(|m| m.share_id == share_uuid && m.owner == contact.id))
-                .unwrap_or(false);
-            if !holds {
-                return Response::refused(RefusalCode::NotInShare, "no mirror of that share from you");
-            }
-            runtime.push_event(kind.as_str(), doc_uuid, title, contact.petname.clone());
-            // pull that share NOW — off this thread (dispatch holds the store lock)
-            let ep = endpoint.clone();
-            let st = store_arc.clone();
-            let owner = contact.clone();
-            tokio::spawn(async move {
-                let Ok(id) = owner.pubkey.parse::<iroh::EndpointId>() else { return };
-                match pull_share(&ep, &st, iroh::EndpointAddr::from(id), &owner, share_uuid).await {
-                    Ok(s) => tracing::debug!(%share_uuid, changed = s.changed, "nudged pull"),
-                    Err(e) => tracing::warn!(%share_uuid, "nudged pull failed: {e:#}"),
-                }
-            });
-            Response::Noted
+        } => accept_nudges(
+            &store,
+            store_arc,
+            endpoint,
+            runtime,
+            &contact,
+            &share,
+            vec![super::wire::NotifyItem { doc, title, kind }],
+        ),
+        Request::NotifyBatch { share, items } => {
+            accept_nudges(&store, store_arc, endpoint, runtime, &contact, &share, items)
         }
         Request::ProposalStatus { op_ids } => {
             let ids: Vec<uuid::Uuid> = op_ids.iter().filter_map(|s| s.parse().ok()).collect();
@@ -394,6 +422,46 @@ fn dispatch(
             }
         }
     }
+}
+
+/// Grantee side of a nudge (single or batched): accept only for a share we
+/// hold FROM this contact, surface every item as a UI event, and pull that
+/// share once — a burst of nudges while a pull is in flight collapses into
+/// one follow-up pull (`Runtime::begin_pull`).
+fn accept_nudges(
+    store: &SqliteStore,
+    store_arc: &Arc<Mutex<SqliteStore>>,
+    endpoint: &Endpoint,
+    runtime: &Runtime,
+    contact: &grimoire_store::Contact,
+    share: &str,
+    items: Vec<super::wire::NotifyItem>,
+) -> Response {
+    let Ok(share_uuid) = share.parse::<uuid::Uuid>() else {
+        return Response::refused(RefusalCode::BadRequest, "bad share id");
+    };
+    let holds = store
+        .list_mirrors()
+        .map(|ms| ms.iter().any(|m| m.share_id == share_uuid && m.owner == contact.id))
+        .unwrap_or(false);
+    if !holds {
+        return Response::refused(RefusalCode::NotInShare, "no mirror of that share from you");
+    }
+    for item in items {
+        let Ok(doc_uuid) = item.doc.parse::<uuid::Uuid>() else {
+            return Response::refused(RefusalCode::BadRequest, "bad doc id");
+        };
+        runtime.push_event(item.kind.as_str(), doc_uuid, item.title, contact.petname.clone());
+    }
+    // pull that share NOW — off this thread (dispatch holds the store lock)
+    super::loops::spawn_nudged_pull(
+        endpoint.clone(),
+        store_arc.clone(),
+        runtime.clone(),
+        contact.clone(),
+        share_uuid,
+    );
+    Response::Noted
 }
 
 /// The share must exist, be bound to THIS contact, and be active. Every
@@ -720,20 +788,25 @@ fn handle_pull(
 }
 
 /// How often a live bridge re-checks that the peer is still a contact with
-/// an active propose share on this doc.
-const BRIDGE_REAUTH: std::time::Duration = std::time::Duration::from_secs(10);
+/// an active share on this doc (and re-reads its permission). A revoke does
+/// not wait for this: `HotState::drop_bridges_*` cuts the stream at once.
+#[cfg(not(test))]
+pub(super) const BRIDGE_REAUTH: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+pub(super) const BRIDGE_REAUTH: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Authorize a bridge participant. Returns the doc and whether the peer holds
-/// only a `view` share. Session = consent: a view participant may still write
-/// while the session's `viewers_write` is on (the owner opened the doc up);
-/// when the owner flips to "watch only", their frames are filtered to
-/// presence + sync requests. `propose` participates fully regardless.
+/// Authorize a bridge participant. Returns the doc, whether the peer holds
+/// only a `view` share, and the share id. Session = consent: a view
+/// participant may still write while the session's `viewers_write` is on
+/// (the owner opened the doc up); when the owner flips to "watch only",
+/// their frames are filtered to presence + sync requests. `propose`
+/// participates fully regardless.
 pub(super) fn bridge_authorized(
     store: &Arc<Mutex<SqliteStore>>,
     peer: &str,
     share: &str,
     doc: &str,
-) -> Result<(uuid::Uuid, bool)> {
+) -> Result<(uuid::Uuid, bool, uuid::Uuid)> {
     let s = store.lock().unwrap_or_else(|p| p.into_inner());
     let contact = s
         .contact_by_pubkey(peer)?
@@ -742,7 +815,7 @@ pub(super) fn bridge_authorized(
     let sh = authorize_share(&s, &contact, share)?;
     let doc_id = authorize_hot(&s, &contact, share, doc, false)?;
     let read_only = sh.permission != grimoire_store::SharePermission::Propose;
-    Ok((doc_id, read_only))
+    Ok((doc_id, read_only, sh.id))
 }
 
 /// Owner side of the hot bridge (#66): one bi-stream per remote participant.
@@ -767,12 +840,22 @@ async fn handle_hot_bridge(
         doc: String,
     }
     let header: Header = serde_json::from_slice(&header).context("bad bridge header")?;
-    let (doc_id, view_share) = bridge_authorized(&store, peer, &header.share, &header.doc)?;
-    let Some((mut rx, hello)) = hot.connect(doc_id) else {
-        anyhow::bail!("doc is not hot");
-    };
+    let (doc_id, mut view_share, share_id) =
+        bridge_authorized(&store, peer, &header.share, &header.doc)?;
+    let (mut rx, hello) = hot
+        .connect_as(doc_id, Some(peer))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     write_frame(&mut send, &hello).await?;
     tracing::info!(peer, %doc_id, view_share, "hot bridge joined");
+    // registered so a revoke cuts this stream now, not at the next re-auth
+    let (bridge_id, cancel) = hot.register_bridge(doc_id, peer, share_id);
+    struct Unregister<'a>(&'a HotState, u64);
+    impl Drop for Unregister<'_> {
+        fn drop(&mut self) {
+            self.0.unregister_bridge(self.1);
+        }
+    }
+    let _unregister = Unregister(&hot, bridge_id);
 
     let fan_out = tokio::spawn(async move {
         while let Ok(frame) = rx.recv().await {
@@ -781,13 +864,27 @@ async fn handle_hot_bridge(
             }
         }
     });
+    // re-auth re-reads the permission too: a propose→view downgrade applies
+    // to the live bridge, not only to the next one
+    let reauth = |view_share: &mut bool| -> Result<()> {
+        let (_, ro, _) = bridge_authorized(&store, peer, &header.share, &header.doc)
+            .context("bridge authorization lapsed")?;
+        if ro != *view_share {
+            tracing::info!(peer, %doc_id, read_only = ro, "bridge permission changed");
+            *view_share = ro;
+        }
+        Ok(())
+    };
     let mut last_auth = std::time::Instant::now();
     let result = loop {
         let frame = tokio::select! {
             f = read_frame(&mut recv) => f,
+            _ = cancel.notified() => {
+                break Err(anyhow::anyhow!("bridge cut: share or contact revoked"));
+            }
             _ = tokio::time::sleep(BRIDGE_REAUTH) => {
-                if let Err(e) = bridge_authorized(&store, peer, &header.share, &header.doc) {
-                    break Err(e.context("bridge authorization lapsed"));
+                if let Err(e) = reauth(&mut view_share) {
+                    break Err(e);
                 }
                 last_auth = std::time::Instant::now();
                 continue;
@@ -796,8 +893,8 @@ async fn handle_hot_bridge(
         match frame {
             Ok(Some(frame)) => {
                 if last_auth.elapsed() > BRIDGE_REAUTH {
-                    if let Err(e) = bridge_authorized(&store, peer, &header.share, &header.doc) {
-                        break Err(e.context("bridge authorization lapsed"));
+                    if let Err(e) = reauth(&mut view_share) {
+                        break Err(e);
                     }
                     last_auth = std::time::Instant::now();
                 }
@@ -845,4 +942,28 @@ pub(super) async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> Result<
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf).await.context("torn frame")?;
     Ok(Some(buf))
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use super::*;
+
+    #[test]
+    fn dedupe_evicts_oldest_first_and_keeps_a_retry_findable() {
+        let mut c = DedupeCache::new(3);
+        for i in 0..3 {
+            c.insert(format!("k{i}"), Response::Pong);
+        }
+        assert_eq!(c.len(), 3);
+        c.insert("k3".into(), Response::Pong);
+        assert_eq!(c.len(), 3, "bounded");
+        assert!(c.get("k0").is_none(), "oldest evicted");
+        assert!(c.get("k1").is_some() && c.get("k3").is_some(), "the rest survive — the clear-all did not");
+        // re-inserting a live key does not grow the order queue
+        c.insert("k1".into(), Response::Noted);
+        assert!(matches!(c.get("k1"), Some(Response::Noted)));
+        c.insert("k4".into(), Response::Pong);
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.order.len(), 3);
+    }
 }

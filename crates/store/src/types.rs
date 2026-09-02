@@ -595,6 +595,14 @@ pub struct Share {
     pub trust: ShareTrust,
 }
 
+/// Owner-side change detector signal (see `BlockStore::change_signature`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChangeSignature {
+    pub max_epoch: i64,
+    pub doc_count: i64,
+    pub active_shares: i64,
+}
+
 /// One row of the Trash: a deleted subtree root, when it fell, and how many
 /// descendants fell with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

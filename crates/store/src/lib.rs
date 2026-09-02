@@ -368,6 +368,11 @@ pub trait BlockStore {
     /// Rename a contact's petname (human surface).
     fn rename_contact(&mut self, id: Uuid, petname: &str) -> Result<()>;
 
+    /// A cheap "did anything move?" aggregate for owner-side change
+    /// detection: max doc epoch, live doc count, active share count. Equal
+    /// signatures on two ticks mean no nudge is due — no per-share walk needed.
+    fn change_signature(&self) -> Result<ChangeSignature>;
+
     fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>>;
 
     fn list_mirrors(&self) -> Result<Vec<Mirror>>;

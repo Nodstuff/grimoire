@@ -54,7 +54,31 @@ pub struct HotSession {
     /// owner opened the doc up). The owner can flip this off for a
     /// "watch only" presentation; `propose` grantees always write.
     pub viewers_write: bool,
+    /// Who created the session: `None` = this instance (the owner), `Some`
+    /// = the remote peer's pubkey. Only the owner or the starter may end it.
+    pub starter: Option<String>,
+    /// Everyone who joined: `None` = a local (owner) socket, `Some(pubkey)`
+    /// = a remote bridge. Recorded into the flatten's provenance.
+    pub participants: std::collections::HashSet<Option<String>>,
+    /// First journal write failure (disk full, permissions). The session
+    /// stays live — the text is in memory and flattens normally — but the
+    /// crash-safety guarantee is gone, so the UI is told.
+    pub journal_error: Option<String>,
     _doc_sub: yrs::Subscription,
+}
+
+/// Bounded fan-in per session: each participant holds a broadcast receiver
+/// and (remotely) a QUIC stream; beyond this a session is a broadcast, not
+/// a collaboration.
+pub const MAX_PARTICIPANTS: usize = 32;
+
+/// A live owner-side bridge to a remote participant, registered so a
+/// revoke can cut it immediately instead of waiting for the re-auth timer.
+pub struct BridgeHandle {
+    pub doc: Uuid,
+    pub peer: String,
+    pub share: Uuid,
+    pub cancel: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone, Default)]
@@ -68,6 +92,11 @@ pub struct HotState {
     /// per mirror doc — surfaced in hot/status so the UI can say WHY instead
     /// of showing "connecting…" forever. Cleared when a bridge succeeds.
     pub bridge_errors: Arc<Mutex<HashMap<Uuid, String>>>,
+    /// Owner side: live bridges by registration id (see `BridgeHandle`).
+    pub bridges: Arc<Mutex<HashMap<u64, BridgeHandle>>>,
+    /// Bumped whenever a session starts or ends — a cheap "did hotness
+    /// change?" signal for the owner-side nudge detector.
+    pub generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl HotState {
@@ -78,7 +107,83 @@ impl HotState {
             journal_dir: Arc::new(journal_dir),
             editing: Arc::new(Mutex::new(HashMap::new())),
             bridge_errors: Arc::new(Mutex::new(HashMap::new())),
+            bridges: Arc::new(Mutex::new(HashMap::new())),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Current hotness generation (changes on every start/end).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn bump_generation(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Register a live owner-side bridge; returns the id to unregister with.
+    pub fn register_bridge(&self, doc: Uuid, peer: &str, share: Uuid) -> (u64, Arc<tokio::sync::Notify>) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        self.bridges
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                id,
+                BridgeHandle {
+                    doc,
+                    peer: peer.to_string(),
+                    share,
+                    cancel: cancel.clone(),
+                },
+            );
+        (id, cancel)
+    }
+
+    pub fn unregister_bridge(&self, id: u64) {
+        self.bridges
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+    }
+
+    /// Cut every live bridge matching the predicate NOW (revoke). Returns how
+    /// many were signalled. The bridge task removes its own registration.
+    pub fn drop_bridges_where(&self, pred: impl Fn(&BridgeHandle) -> bool) -> usize {
+        let bridges = self.bridges.lock().unwrap_or_else(|p| p.into_inner());
+        let mut n = 0;
+        for b in bridges.values().filter(|b| pred(b)) {
+            tracing::info!(doc = %b.doc, peer = b.peer, share = %b.share, "bridge cut by revoke");
+            b.cancel.notify_one();
+            n += 1;
+        }
+        n
+    }
+
+    pub fn drop_bridges_for_peer(&self, peer: &str) -> usize {
+        self.drop_bridges_where(|b| b.peer == peer)
+    }
+
+    pub fn drop_bridges_for_share(&self, share: Uuid) -> usize {
+        self.drop_bridges_where(|b| b.share == share)
+    }
+
+    /// May this remote peer end the session? Only its starter (the owner
+    /// ends locally and is never asked).
+    pub fn can_end(&self, doc: Uuid, peer: &str) -> bool {
+        let s = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        s.get(&doc)
+            .is_some_and(|h| h.starter.as_deref() == Some(peer))
+    }
+
+    /// The journal failure for a live session, if any (hot/status reads the
+    /// field directly under its own lock; this is the standalone accessor).
+    #[cfg(test)]
+    pub fn journal_error(&self, doc: Uuid) -> Option<String> {
+        let s = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        s.get(&doc).and_then(|h| h.journal_error.clone())
     }
 
     pub fn set_bridge_error(&self, doc: Uuid, err: Option<String>) {
@@ -194,9 +299,19 @@ impl HotState {
         }
     }
 
-    /// Create (or join) the session. Returns true when this call created it —
-    /// the caller that created it seeds the Yjs doc from the current content.
+    /// Create (or join) the session as the owner. Returns true when this call
+    /// created it — the creator seeds the Yjs doc from the current content.
     pub fn start(&self, doc_id: Uuid, frozen_epoch: i64) -> std::io::Result<bool> {
+        self.start_by(doc_id, frozen_epoch, None)
+    }
+
+    /// `start` with the creator recorded: `Some(pubkey)` for a remote peer.
+    pub fn start_by(
+        &self,
+        doc_id: Uuid,
+        frozen_epoch: i64,
+        starter: Option<&str>,
+    ) -> std::io::Result<bool> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(existing) = sessions.get(&doc_id) {
             if existing.ending {
@@ -255,9 +370,13 @@ impl HotState {
                 last_activity: std::time::Instant::now(),
                 ending: false,
                 viewers_write: true,
+                starter: starter.map(str::to_string),
+                participants: std::collections::HashSet::new(),
+                journal_error: None,
                 _doc_sub: sub,
             },
         );
+        self.bump_generation();
         Ok(!had_journal)
     }
 }
@@ -266,14 +385,32 @@ impl HotState {
     /// Subscribe to a live session: returns the fan-out receiver plus the
     /// y-sync handshake frames to send first. None when the doc isn't hot.
     pub fn connect(&self, doc_id: Uuid) -> Option<(broadcast::Receiver<Vec<u8>>, Vec<u8>)> {
+        self.connect_as(doc_id, None).ok()
+    }
+
+    /// `connect` with the participant recorded (`None` = a local owner
+    /// socket) and the fan-in cap enforced. Err carries the reason.
+    pub fn connect_as(
+        &self,
+        doc_id: Uuid,
+        peer: Option<&str>,
+    ) -> Result<(broadcast::Receiver<Vec<u8>>, Vec<u8>), String> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let session = sessions.get_mut(&doc_id)?;
+        let session = sessions.get_mut(&doc_id).ok_or("doc is not hot")?;
         if session.ending {
-            return None;
+            return Err("session is closing".into());
+        }
+        if session.tx.receiver_count() >= MAX_PARTICIPANTS {
+            return Err(format!(
+                "session is full ({MAX_PARTICIPANTS} participants)"
+            ));
         }
         let mut enc = EncoderV1::new();
-        DefaultProtocol.start(&session.awareness, &mut enc).ok()?;
-        Some((session.tx.subscribe(), enc.to_vec()))
+        DefaultProtocol
+            .start(&session.awareness, &mut enc)
+            .map_err(|e| format!("sync handshake failed: {e}"))?;
+        session.participants.insert(peer.map(str::to_string));
+        Ok((session.tx.subscribe(), enc.to_vec()))
     }
 
     /// One incoming y-sync frame from any transport: journal, apply, fan out
@@ -287,7 +424,14 @@ impl HotState {
             return false;
         }
         session.last_activity = std::time::Instant::now();
-        journal_updates(&mut session.journal, data);
+        if let Err(e) = journal_updates(&mut session.journal, data)
+            && session.journal_error.is_none()
+        {
+            // once per session: the session stays live (text is in memory
+            // and flattens normally) but crash recovery is no longer covered
+            tracing::error!(%doc_id, "hot journal write failed; session kept live without crash safety: {e}");
+            session.journal_error = Some(e.to_string());
+        }
         let replies = DefaultProtocol.handle(&mut session.awareness, data);
         rebroadcast_awareness(&session.tx, data);
         if let Ok(msgs) = replies {
@@ -344,7 +488,7 @@ impl HotState {
     ) -> anyhow::Result<usize> {
         use grimoire_store::BlockStore;
         // 1. mark ending (stops new frames) and render under the lock
-        let (markdown, frozen_epoch, secs) = {
+        let (markdown, frozen_epoch, secs, participants) = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
             let session = sessions
                 .get_mut(&doc_id)
@@ -353,7 +497,38 @@ impl HotState {
             let frag = session.awareness.doc().get_or_insert_xml_fragment("default");
             let txn = session.awareness.doc().transact();
             let md = crate::yrender::fragment_to_markdown(&txn, &frag);
-            (md, session.frozen_epoch, session.started_at.elapsed().as_secs())
+            // the starter was in the room even if their socket never connected
+            let mut who = session.participants.clone();
+            who.insert(session.starter.clone());
+            (md, session.frozen_epoch, session.started_at.elapsed().as_secs(), who)
+        };
+        // who was in the room, by petname (the owner by their own name): the
+        // flatten lands under the owner's principal, so this is the only
+        // record that a remote peer's keystrokes are in it
+        let participants_line = {
+            let s = store.lock().unwrap_or_else(|p| p.into_inner());
+            let contacts = s.list_contacts().unwrap_or_default();
+            let owner_name = s
+                .list_principals()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|p| p.kind == grimoire_store::PrincipalKind::Human)
+                .map(|p| p.display_name)
+                .unwrap_or_else(|| "owner".into());
+            let mut names: Vec<String> = participants
+                .iter()
+                .map(|p| match p {
+                    None => owner_name.clone(),
+                    Some(pk) => contacts
+                        .iter()
+                        .find(|c| &c.pubkey == pk)
+                        .map(|c| c.petname.clone())
+                        .unwrap_or_else(|| format!("peer {}", pk.chars().take(8).collect::<String>())),
+                })
+                .collect();
+            names.sort();
+            names.dedup();
+            format!("participants: {}", names.join(", "))
         };
         // canvas sessions (#68/P2.5): shapes live in Y.Maps ("canvas_nodes"/
         // "canvas_edges", values = JSON strings, LWW per shape). Non-empty
@@ -396,6 +571,7 @@ impl HotState {
             vec![
                 format!("hot-session: {reason}, {secs}s, frozen at epoch {frozen_epoch}"),
                 kind.to_string(),
+                participants_line.clone(),
             ]
         };
         let applied = if let Some(content) = canvas {
@@ -458,6 +634,7 @@ impl HotState {
             let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
             sessions.remove(&doc_id);
         }
+        self.bump_generation();
         std::fs::remove_file(self.journal_path(doc_id)).ok();
         tracing::info!(%doc_id, reason, applied, "hot session flattened");
         Ok(applied)
@@ -654,6 +831,7 @@ async fn hot_status(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json
             "editors": editors,
             "can_write": true, // owned doc: always writable
             "viewers_write": s.viewers_write,
+            "journal_error": s.journal_error,
         })),
         None => Json(json!({"hot": false, "editors": editors})),
     }
@@ -769,17 +947,19 @@ async fn ws_session(mut socket: WebSocket, ctx: HotCtx, doc_id: Uuid) {
 }
 
 /// Append every sync Update in the frame to the journal, length-prefixed.
-fn journal_updates(journal: &mut std::fs::File, data: &[u8]) {
+/// Err on the first failed write (the caller flags the session).
+fn journal_updates(journal: &mut std::fs::File, data: &[u8]) -> std::io::Result<()> {
     use yrs::updates::decoder::DecoderV1;
     let mut decoder = DecoderV1::new(yrs::encoding::read::Cursor::new(data));
     let mut reader = yrs::sync::MessageReader::new(&mut decoder);
     while let Some(Ok(msg)) = reader.next() {
         if let YMessage::Sync(SyncMessage::Update(u) | SyncMessage::SyncStep2(u)) = msg {
             let len = (u.len() as u32).to_le_bytes();
-            journal.write_all(&len).ok();
-            journal.write_all(&u).ok();
+            journal.write_all(&len)?;
+            journal.write_all(&u)?;
         }
     }
+    Ok(())
 }
 
 /// Strip a client frame down to what a READ-ONLY participant may send:
@@ -1334,7 +1514,7 @@ mod crash_tests {
         // was (append-only log of the same frames) and restart the daemon
         {
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(hot.journal_path(doc.id)).unwrap();
-            journal_updates(&mut f, &frame);
+            journal_updates(&mut f, &frame).unwrap();
         }
         let hot2 = HotState::new(dir);
         hot2.recover(&store);
@@ -1351,5 +1531,147 @@ mod crash_tests {
         assert_eq!(texts, vec!["typed live"]);
         assert!(!hot2.is_hot(doc.id));
         assert!(!hot2.journal_path(doc.id).exists());
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use grimoire_store::{BlockStore, BlockType, OpInput, OpKind, PrincipalKind, SqliteStore};
+    use yrs::{ReadTxn, Text as _, XmlFragment as _};
+
+    fn scratch() -> HotState {
+        HotState::new(std::env::temp_dir().join(format!("grimoire-hot-hard-{}", Uuid::now_v7())))
+    }
+
+    fn update_frame(text: &str) -> Vec<u8> {
+        let ydoc = Doc::new();
+        let frag = ydoc.get_or_insert_xml_fragment("default");
+        {
+            let mut txn = ydoc.transact_mut();
+            let el = frag.insert(&mut txn, 0, yrs::XmlElementPrelim::empty("paragraph"));
+            let t = el.insert(&mut txn, 0, yrs::XmlTextPrelim::new(""));
+            t.insert(&mut txn, 0, text);
+        }
+        let update = ydoc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let mut enc = EncoderV1::new();
+        YMessage::Sync(SyncMessage::Update(update)).encode(&mut enc);
+        enc.to_vec()
+    }
+
+    #[test]
+    fn participant_cap_refuses_the_thirty_third_connection_with_a_reason() {
+        let hot = scratch();
+        let doc = Uuid::now_v7();
+        hot.start(doc, 0).unwrap();
+        let mut held = Vec::new();
+        for i in 0..MAX_PARTICIPANTS {
+            let (rx, _) = hot.connect_as(doc, Some(&format!("peer{i}"))).unwrap();
+            held.push(rx);
+        }
+        let err = hot.connect_as(doc, Some("late")).unwrap_err();
+        assert!(err.contains("full"), "{err}");
+        // a participant leaving frees a slot
+        held.pop();
+        assert!(hot.connect_as(doc, Some("late")).is_ok());
+        // not hot → its own reason
+        assert_eq!(hot.connect_as(Uuid::now_v7(), None).unwrap_err(), "doc is not hot");
+    }
+
+    #[test]
+    fn only_the_starter_may_end_a_remote_started_session() {
+        let hot = scratch();
+        let doc = Uuid::now_v7();
+        assert!(hot.start_by(doc, 0, Some("alice")).unwrap());
+        assert!(hot.can_end(doc, "alice"));
+        assert!(!hot.can_end(doc, "bob"));
+        // owner-started: no remote peer may end it
+        let doc2 = Uuid::now_v7();
+        hot.start(doc2, 0).unwrap();
+        assert!(!hot.can_end(doc2, "alice"));
+        // joining does not change the starter
+        assert!(!hot.start_by(doc, 0, Some("bob")).unwrap());
+        assert!(hot.can_end(doc, "alice"));
+        assert!(!hot.can_end(doc, "bob"));
+    }
+
+    #[test]
+    fn revoke_cuts_registered_bridges_by_peer_or_share_and_generation_tracks_sessions() {
+        let hot = scratch();
+        let doc = Uuid::now_v7();
+        let share_a = Uuid::now_v7();
+        let share_b = Uuid::now_v7();
+        let g0 = hot.generation();
+        hot.start(doc, 0).unwrap();
+        assert_eq!(hot.generation(), g0 + 1, "start bumps");
+        let (id1, c1) = hot.register_bridge(doc, "alice", share_a);
+        let (_id2, c2) = hot.register_bridge(doc, "bob", share_b);
+        let (_id3, c3) = hot.register_bridge(doc, "alice", share_b);
+        assert_eq!(hot.drop_bridges_for_peer("alice"), 2);
+        assert_eq!(hot.drop_bridges_for_share(share_b), 2);
+        assert_eq!(hot.drop_bridges_for_peer("nobody"), 0);
+        // the notifies are armed for their tasks
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(50), c1.notified()).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_millis(50), c2.notified()).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_millis(50), c3.notified()).await.unwrap();
+        });
+        hot.unregister_bridge(id1);
+        assert_eq!(hot.drop_bridges_for_share(share_a), 0, "unregistered bridges are gone");
+    }
+
+    #[test]
+    fn journal_write_failure_flags_the_session_once_and_keeps_it_live() {
+        let hot = scratch();
+        let doc = Uuid::now_v7();
+        hot.start(doc, 0).unwrap();
+        // swap the journal for a read-only handle: every write fails
+        {
+            let mut sessions = hot.sessions.lock().unwrap();
+            let s = sessions.get_mut(&doc).unwrap();
+            s.journal = std::fs::File::open(hot.journal_path(doc)).unwrap();
+        }
+        assert!(hot.handle_frame(doc, &update_frame("one")));
+        let first = hot.journal_error(doc).expect("flagged");
+        assert!(hot.handle_frame(doc, &update_frame("two")), "session stays live");
+        assert_eq!(hot.journal_error(doc).as_deref(), Some(first.as_str()), "flag set once");
+        assert!(hot.is_hot(doc));
+        // the text is in memory regardless
+        let sessions = hot.sessions.lock().unwrap();
+        let s = sessions.get(&doc).unwrap();
+        let frag = s.awareness.doc().get_or_insert_xml_fragment("default");
+        let txn = s.awareness.doc().transact();
+        assert_eq!(frag.len(&txn), 2);
+    }
+
+    #[test]
+    fn flatten_records_who_was_in_the_room() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let doc = s.create_doc("Doc", None, tom.id).unwrap();
+        s.apply(doc.id, 0, tom.id, vec![OpInput {
+            kind: OpKind::Insert {
+                block_id: Uuid::now_v7(), parent_id: None, order_key: "a".into(),
+                block_type: BlockType::Paragraph, content: "before".into(), refers_to: None,
+            },
+            source_refs: vec![],
+        }]).unwrap();
+        let alice = s.pair_contact(&"ab".repeat(32), "alice").unwrap();
+        let store = Arc::new(Mutex::new(s));
+        let hot = scratch();
+        // alice started it remotely; tom (local socket) and an unknown peer joined
+        hot.start_by(doc.id, 1, Some(&alice.pubkey)).unwrap();
+        hot.connect_as(doc.id, None).unwrap();
+        hot.connect_as(doc.id, Some(&"cd".repeat(32))).unwrap();
+        assert!(hot.handle_frame(doc.id, &update_frame("typed together")));
+        hot.flatten_and_close(&store, doc.id, "ended").unwrap();
+        let s = store.lock().unwrap();
+        let ops = s.ops_since(doc.id, 1).unwrap();
+        assert!(!ops.is_empty());
+        let refs = &ops[0].source_refs;
+        let line = refs.iter().find(|r| r.starts_with("participants:")).expect("participants ref");
+        assert_eq!(line, "participants: alice, peer cdcdcdcd, tom");
+        assert!(refs.iter().any(|r| r.starts_with("hot-session: ended")));
     }
 }
