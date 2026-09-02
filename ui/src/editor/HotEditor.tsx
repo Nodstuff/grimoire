@@ -66,6 +66,9 @@ export default function HotEditor({
   const [connected, setConnected] = useState(false)
   const [ending, setEnding] = useState(false)
   const endedRef = useRef(false)
+  /** last bridge-failure reason we already told the user (avoid toast spam
+   * while the provider retries) */
+  const bridgeErrRef = useRef<string | null>(null)
 
   // parse current blocks exactly like the cold editor (seeding only — the
   // flatten is the daemon's job now, #67)
@@ -124,11 +127,18 @@ export default function HotEditor({
     // retries forever, so ask the daemon whether the doc is still hot
     const onClose = () => {
       if (endedRef.current) return
-      api<{ hot: boolean }>(`/api/doc/${doc.docId}/hot/status`)
+      api<{ hot: boolean; bridge_error?: string }>(`/api/doc/${doc.docId}/hot/status`)
         .then((st) => {
           if (!st.hot && !endedRef.current) {
             endedRef.current = true
             onEnded()
+            return
+          }
+          // the owner IS live but our daemon could not reach their session:
+          // say why (once per distinct reason) instead of spinning silently
+          if (st.hot && st.bridge_error && st.bridge_error !== bridgeErrRef.current) {
+            bridgeErrRef.current = st.bridge_error
+            notify(`can’t reach the owner’s live session — ${st.bridge_error}. Retrying…`)
           }
         })
         .catch((e) => {

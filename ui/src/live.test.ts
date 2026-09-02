@@ -16,10 +16,27 @@ function ev(seq: number, kind: LiveEvent['kind'] = 'live_started'): LiveEvent {
 }
 
 describe('advanceEvents', () => {
-  it('baselines silently on the first response, even with queued events', () => {
-    const r = advanceEvents(INITIAL_CURSOR, { next: 7, events: [ev(5), ev(6)] })
+  it('baselines silently on the first response for old/history events', () => {
+    // ev() timestamps are 2026-09-02T10:00Z; "now" is an hour later → history
+    const now = Date.parse('2026-09-02T11:00:00Z')
+    const r = advanceEvents(INITIAL_CURSOR, { next: 7, events: [ev(5), ev(6), ev(4, 'doc_added')] }, now)
     expect(r.fresh).toEqual([])
     expect(r.cursor).toEqual({ since: 7, baselined: true })
+  })
+  it('still surfaces a live_started from the last 90s on the baseline poll', () => {
+    // the owner went live 20s before the app finished loading — that session
+    // is almost certainly still live, so the join toast must not be swallowed
+    const now = Date.parse('2026-09-02T10:00:20Z')
+    const r = advanceEvents(
+      INITIAL_CURSOR,
+      { next: 3, events: [ev(1, 'doc_changed'), ev(2, 'doc_added'), ev(3)] },
+      now,
+    )
+    expect(r.fresh.map((e) => e.seq)).toEqual([3]) // only the recent live_started
+    expect(r.cursor).toEqual({ since: 3, baselined: true })
+    // but a live_started older than the window is history
+    const old = advanceEvents(INITIAL_CURSOR, { next: 3, events: [ev(3)] }, now + 100_000)
+    expect(old.fresh).toEqual([])
   })
   it('surfaces only events past the cursor, in seq order, once', () => {
     const cur = { since: 7, baselined: true }
