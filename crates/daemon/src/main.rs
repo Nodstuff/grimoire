@@ -18,6 +18,68 @@ use grimoire_store::{BlockStore, PrincipalKind, SqliteStore};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// The built frontend, compiled INTO the binary (release) so the app is
+/// self-contained — no external `ui/dist` path to go missing on another
+/// machine. In debug builds rust-embed reads the folder off disk, which keeps
+/// the dev loop live. `ui/dist` must exist at compile time; `release.sh` and
+/// `deploy.sh` build it first.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../../ui/dist"]
+struct EmbeddedUi;
+
+/// Serve the embedded SPA: exact asset by path, else fall back to index.html
+/// (client-side routing). Returns 503 only if the binary was built with no
+/// frontend at all.
+async fn serve_embedded_ui(uri: axum::http::Uri) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    let (body, name) = match EmbeddedUi::get(path) {
+        Some(f) => (f.data, path.to_string()),
+        None => match EmbeddedUi::get("index.html") {
+            Some(f) => (f.data, "index.html".to_string()),
+            None => {
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "frontend not built into this binary",
+                )
+                    .into_response();
+            }
+        },
+    };
+    let ctype = content_type_for(&name);
+    (
+        [(axum::http::header::CONTENT_TYPE, ctype)],
+        body.into_owned(),
+    )
+        .into_response()
+}
+
+/// Content type from a file extension — the handful Vite emits. Kept local to
+/// avoid a mime dependency.
+fn content_type_for(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "wasm" => "application/wasm",
+        "map" => "application/json",
+        "webmanifest" => "application/manifest+json",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "grimoire", about = "knowledge-system daemon")]
 struct Cli {
@@ -395,9 +457,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             tokio::spawn(admin::daily_loop(store.clone(), hot.clone()));
-            // ui/dist next to the binary's repo root; fall back to cwd
-            let ui_dist = std::env::var("GRIMOIRE_UI_DIST")
-                .unwrap_or_else(|_| "/Users/tmeaney/personal/knowledge-system/ui/dist".into());
             let app = mcp::router(store.clone(), claude, hot.clone())
                 .merge(hot::router(hot::HotCtx {
                     hot: hot.clone(),
@@ -405,10 +464,17 @@ async fn main() -> anyhow::Result<()> {
                     endpoint: fed_ctx.endpoint.clone(),
                 }))
                 .merge(admin::router(store.clone(), fed_ctx, hot.clone()))
-                .merge(api::router(api::ApiState { store, human: tom, hot }))
-                .fallback_service(tower_http::services::ServeDir::new(&ui_dist).fallback(
-                    tower_http::services::ServeFile::new(format!("{ui_dist}/index.html")),
-                ));
+                .merge(api::router(api::ApiState { store, human: tom, hot }));
+            // The frontend is EMBEDDED in this binary (rust-embed over ui/dist),
+            // so the app is self-contained on any machine. GRIMOIRE_UI_DIST is a
+            // dev override: set it to serve a live build off disk instead.
+            let app = match std::env::var("GRIMOIRE_UI_DIST") {
+                Ok(dir) => app.fallback_service(
+                    tower_http::services::ServeDir::new(&dir)
+                        .fallback(tower_http::services::ServeFile::new(format!("{dir}/index.html"))),
+                ),
+                Err(_) => app.fallback(serve_embedded_ui),
+            };
             let addr = format!("127.0.0.1:{port}");
             tracing::info!("ksd serving MCP (streamable HTTP) at http://{addr}/mcp");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
