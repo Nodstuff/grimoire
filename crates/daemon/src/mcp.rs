@@ -183,7 +183,7 @@ pub struct ListCommentsParams {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct IdentifyParams {
-    /// Session name, e.g. "claude:qompass-refactor".
+    /// Session name, e.g. "claude:myproject-refactor".
     pub name: String,
 }
 
@@ -253,7 +253,7 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Identify this session with a name (e.g. 'claude:qompass-refactor'). Your writes are then attributed to that principal instead of the shared 'claude' — do this first in any session that writes, so provenance distinguishes concurrent agents."
+        description = "Identify this session with a name (e.g. 'claude:myproject-refactor'). Your writes are then attributed to that principal instead of the shared 'claude' — do this first in any session that writes, so provenance distinguishes concurrent agents."
     )]
     async fn identify(
         &self,

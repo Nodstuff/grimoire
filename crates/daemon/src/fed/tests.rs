@@ -922,7 +922,7 @@ async fn owner_tended_flag_rides_the_pull() {
     // owner: a doc tended by a keeper gardener scoped to it
     let mut owner_store = SqliteStore::open_in_memory().unwrap();
     let tom = owner_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
-    let doc = owner_store.create_doc("Qompass Docs", None, tom.id).unwrap();
+    let doc = owner_store.create_doc("Team Docs", None, tom.id).unwrap();
     owner_store.apply(doc.id, 0, tom.id, vec![OpInput {
         kind: OpKind::Insert { block_id: uuid::Uuid::now_v7(), parent_id: None, order_key: "i".into(), block_type: BlockType::Paragraph, content: "owned by tom".into(), refers_to: None },
         source_refs: vec![],
