@@ -351,7 +351,7 @@ fn dispatch(
                 let Ok(id) = owner.pubkey.parse::<iroh::EndpointId>() else { return };
                 match pull_share(&ep, &st, iroh::EndpointAddr::from(id), &owner, share_uuid).await {
                     Ok(s) => tracing::debug!(%share_uuid, changed = s.changed, "nudged pull"),
-                    Err(e) => tracing::debug!(%share_uuid, "nudged pull failed: {e:#}"),
+                    Err(e) => tracing::warn!(%share_uuid, "nudged pull failed: {e:#}"),
                 }
             });
             Response::Noted

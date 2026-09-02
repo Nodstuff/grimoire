@@ -305,14 +305,26 @@ pub async fn join_at(
     let owner_contact = s.pair_contact(&ticket.node, &owner_name)?;
     let root_uuid: uuid::Uuid = root_doc.parse().context("owner sent a bad doc id")?;
     let share_uuid: uuid::Uuid = share_id.parse().context("owner sent a bad share id")?;
-    // same UUID = same doc; if a mirror root already exists (re-join), keep
-    // it. But a LOCAL doc under that id is mine — an owner naming it (a bug
-    // or a hostile peer who learned the id from a share I gave them) must
-    // never turn my doc into their mirror.
+    // same UUID = same doc. Three cases for a root id we already have:
+    // - it is a mirror (re-join): keep it;
+    // - it is a TOMBSTONE left by a dropped mirror (the owner revoked, we
+    //   soft-deleted; now they share again): revive it — refusing here was
+    //   the "revoking blocks future shares of that subtree" bug;
+    // - it is a LIVE doc of my own: refuse — an owner naming my doc id (a bug
+    //   or a hostile peer who learned it from a share I gave them) must never
+    //   turn my doc into their mirror.
     if s.get_doc(root_uuid).is_ok() && s.get_mirror(root_uuid)?.is_none() {
-        anyhow::bail!(
-            "owner's share root {root_uuid} collides with a doc of your own — refusing to join"
-        );
+        if s.doc_is_tombstoned(root_uuid)? {
+            s.undelete_doc(root_uuid)?;
+            if !root_title.is_empty() {
+                s.rename_doc(root_uuid, &root_title).ok();
+            }
+            tracing::info!(root = %root_uuid, "revived tombstoned mirror root on re-join");
+        } else {
+            anyhow::bail!(
+                "owner's share root {root_uuid} collides with a doc of your own — refusing to join"
+            );
+        }
     }
     if s.get_doc(root_uuid).is_err() {
         let title = if root_title.is_empty() {
@@ -385,19 +397,34 @@ pub async fn pull_share(
 
     let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
 
-    // 0. the hijack guard: any id the owner names that is one of MY docs
-    // (exists locally, not a mirror) is ignored in every step below
+    // 0. the hijack guard: any id the owner names that is one of MY LIVE docs
+    // (exists locally, not a mirror, not a tombstone) is ignored in every
+    // step below. Tombstones are leftovers of a mirror we dropped when a
+    // share was revoked — those REVIVE (step 0b), they don't collide.
     let foreign_ids: std::collections::HashSet<String> = metas
         .iter()
         .map(|m| m.id.as_str())
         .chain(changed.iter().map(|wd| wd.meta.id.as_str()))
         .filter(|id| {
-            id.parse::<uuid::Uuid>()
-                .ok()
-                .is_some_and(|u| s.get_doc(u).is_ok() && s.get_mirror(u).ok().flatten().is_none())
+            id.parse::<uuid::Uuid>().ok().is_some_and(|u| {
+                s.get_doc(u).is_ok()
+                    && s.get_mirror(u).ok().flatten().is_none()
+                    && !s.doc_is_tombstoned(u).unwrap_or(false)
+            })
         })
         .map(str::to_string)
         .collect();
+    // 0b. revive tombstoned docs the owner still shares (a re-granted share)
+    for m in &metas {
+        if let Ok(u) = m.id.parse::<uuid::Uuid>()
+            && !foreign_ids.contains(&m.id)
+            && s.get_doc(u).is_ok()
+            && s.doc_is_tombstoned(u).unwrap_or(false)
+        {
+            s.undelete_doc(u)?;
+            tracing::info!(doc = %u, "revived tombstoned mirror doc on pull");
+        }
+    }
     for id in &foreign_ids {
         tracing::warn!(doc = %id, owner = %owner.pubkey, "owner named one of OUR docs; ignored");
     }

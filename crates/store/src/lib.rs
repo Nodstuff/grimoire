@@ -346,6 +346,16 @@ pub trait BlockStore {
     /// Record whether the owner tends this mirror doc (from the pull meta).
     fn set_mirror_tended(&mut self, doc_id: Uuid, tended: bool) -> Result<()>;
 
+    /// Is this doc row a tombstone (soft-deleted)? `get_doc` returns
+    /// tombstones too, so callers that must distinguish "mine and live" from
+    /// "left behind by a dropped mirror" ask this. NotFound if no row at all.
+    fn doc_is_tombstoned(&self, id: Uuid) -> Result<bool>;
+
+    /// Bring a soft-deleted doc back (deleted = 0). Used when a share of a
+    /// subtree we previously mirrored and dropped is granted again: the same
+    /// origin UUIDs return, and they must revive rather than collide.
+    fn undelete_doc(&mut self, id: Uuid) -> Result<()>;
+
     /// True if a gardener tends this doc or an ancestor (recursive, enabled
     /// only) — the owner-side signal shipped in the pull meta.
     fn doc_is_tended(&self, doc_id: Uuid) -> Result<bool>;
