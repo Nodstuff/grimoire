@@ -4,8 +4,22 @@
 // (SharePanel) — this screen is the overview.
 
 import { useCallback, useEffect, useState } from 'react'
-import { api, Contact, Doc, PendingJoin, Share } from './types'
-import { notify } from './Notice'
+import { ActivityItem, api, Contact, Doc, PendingJoin, Share } from './types'
+import { errText, notify } from './Notice'
+import { TrustControl } from './SharePanel'
+import { trustLabel } from './trust'
+import { EventsResponse, LiveEvent, mergeActivity } from './live'
+
+function when(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
 
 function fingerprint(pubkey: string): string {
   return (pubkey.slice(0, 16).match(/.{1,4}/g) ?? []).join(' ')
@@ -27,6 +41,8 @@ export default function Sharing({
   const [contacts, setContacts] = useState<Contact[]>([])
   const [shares, setShares] = useState<Share[]>([])
   const [joins, setJoins] = useState<PendingJoin[]>([])
+  const [activity, setActivity] = useState<ActivityItem[]>([])
+  const [events, setEvents] = useState<LiveEvent[]>([])
   const [joinLink, setJoinLink] = useState(prefillLink ?? '')
   useEffect(() => {
     if (prefillLink) onPrefillConsumed?.()
@@ -39,8 +55,16 @@ export default function Sharing({
     api<Contact[]>('/admin/contacts').then(setContacts).catch(() => setContacts([]))
     api<Share[]>('/admin/shares').then(setShares).catch(() => setShares([]))
     api<PendingJoin[]>('/admin/joins').then(setJoins).catch(() => setJoins([]))
+    api<ActivityItem[]>('/api/activity?limit=20')
+      .then((a) => setActivity(Array.isArray(a) ? a : []))
+      .catch(() => setActivity([]))
+    // owner nudges received by this instance; older daemon → no route → []
+    api<EventsResponse>('/api/events?since=0')
+      .then((r) => setEvents(Array.isArray(r?.events) ? r.events : []))
+      .catch(() => setEvents([]))
   }, [])
   useEffect(load, [load, dataVersion])
+  const rows = mergeActivity(activity, events)
 
   const join = async () => {
     const link = joinLink.trim()
@@ -129,6 +153,7 @@ export default function Sharing({
             </span>
             <span className="meta">
               {sh.permission} · {sh.state}
+              {sh.permission === 'propose' && sh.state === 'active' && ` · ${trustLabel(sh.trust)}`}
               {sh.contact
                 ? ` · with ${contacts.find((c) => c.id === sh.contact)?.petname ?? '?'}`
                 : ' · invite not yet redeemed'}
@@ -141,15 +166,39 @@ export default function Sharing({
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ id: sh.id }),
-                  }).then(load, (e) => notify(String(e)))
+                  }).then(load, (e) => notify(errText(e)))
                 }
               >
                 revoke
               </button>
             )}
           </div>
+          {sh.permission === 'propose' && sh.state === 'active' && (
+            <TrustControl shareId={sh.id} trust={sh.trust} onChanged={load} />
+          )}
         </div>
       ))}
+
+      <h2 className="runs-title">recent activity</h2>
+      <div className="meta activity-blurb">
+        edits maintainers applied directly to your docs, and owners going live on or adding
+        to docs shared with you — you were notified as they landed
+      </div>
+      {rows.length === 0 && <div className="palette-empty">nothing yet</div>}
+      {rows.length > 0 && (
+        <div className="card activity-list">
+          {rows.map((a) => (
+            <div key={a.key} className="activity-row">
+              <span className="who remote">{a.who}</span>
+              <span className="activity-verb">{a.verb}</span>
+              <span className="card-doc" onClick={() => onOpenDoc(a.doc_id)}>
+                {a.doc_title}
+              </span>
+              <span className="meta activity-when">{when(a.at)}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

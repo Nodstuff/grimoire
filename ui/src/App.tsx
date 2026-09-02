@@ -7,10 +7,15 @@ import Gardeners from './Gardeners'
 import CanvasBlock from './CanvasBlock'
 import Sharing from './Sharing'
 import SharePanel from './SharePanel'
-import { notify, Notices } from './Notice'
+import ReviewRail from './ReviewRail'
+import { notify, errText, Notices } from './Notice'
 import { resolveShortcut } from './shortcuts'
+import { buildHighlightMap, targetBlockOf } from './review'
+import { activityLine, loadLastSeen, storeLastSeen, unseenActivity } from './activity'
+import { advanceEvents, EventsCursor, EventsResponse, INITIAL_CURSOR, liveEventLine } from './live'
 import {
   api,
+  ActivityItem,
   Block,
   Doc,
   DocFederation,
@@ -31,6 +36,16 @@ type View =
   | { kind: 'home' }
 type Palette = null | 'commands' | 'open' | 'search' | 'newdoc' | 'newcanvas' | 'help'
 
+/** How a doc is opened: `anchor` is a [[Doc#fragment]] target (`^uuid` for a
+ * block); `review` opens the in-editor review rail; `blockId` scrolls to that
+ * block (sugar for anchor `^blockId`). */
+export interface OpenDocOpts {
+  anchor?: string
+  review?: boolean
+  blockId?: string
+}
+export type OpenDoc = (id: string, opts?: string | OpenDocOpts) => void
+
 export default function App() {
   const [view, setViewRaw] = useState<View>({ kind: 'home' })
   // a clicked grimoire://join/… link arrives from the shell as ?join=<payload>
@@ -39,6 +54,8 @@ export default function App() {
     return payload ? `grimoire://join/${payload}` : null
   })
   const [anchor, setAnchor] = useState<string | null>(null)
+  // opened FROM the review queue (or with { review: true }): DocView opens its rail
+  const [reviewIntent, setReviewIntent] = useState(false)
 
   // ⌘[ / ⌘] history over views, browser-style
   const history = useRef<View[]>([{ kind: 'home' }])
@@ -53,6 +70,7 @@ export default function App() {
     if (historyIdx.current > 0) {
       historyIdx.current -= 1
       setAnchor(null)
+      setReviewIntent(false)
       setViewRaw(history.current[historyIdx.current])
     }
   }, [])
@@ -60,6 +78,7 @@ export default function App() {
     if (historyIdx.current < history.current.length - 1) {
       historyIdx.current += 1
       setAnchor(null)
+      setReviewIntent(false)
       setViewRaw(history.current[historyIdx.current])
     }
   }, [])
@@ -88,9 +107,28 @@ export default function App() {
   // live data: poll the store's change stamp; when it moves, every mounted
   // view refreshes (dataVersion threads down). Cheap — one local SQLite read.
   const [dataVersion, setDataVersion] = useState(0)
+  // owner→grantee nudges (GET /api/events): a doc_changed for the doc that is
+  // open makes DocView reload at once instead of waiting for the next pull
+  const [liveChange, setLiveChange] = useState<{ docId: string; n: number } | null>(null)
+  const openDocRef = useRef<OpenDoc>(() => {})
   useEffect(() => {
     let stamp: number | null = null
     let build: number | null = null
+    let cursor: EventsCursor = INITIAL_CURSOR
+    const pollEvents = async () => {
+      // older daemon without the route: api() throws, cursor stays put
+      const resp = await api<EventsResponse>(`/api/events?since=${cursor.since}`).catch(() => null)
+      const r = advanceEvents(cursor, resp)
+      cursor = r.cursor
+      for (const ev of r.fresh) {
+        const line = liveEventLine(ev)
+        if (line) {
+          notify(line, 'ok', { onClick: () => openDocRef.current(ev.doc_id) })
+        } else if (ev.kind === 'doc_changed' && ev.doc_id) {
+          setLiveChange((c) => ({ docId: ev.doc_id, n: (c?.n ?? 0) + 1 }))
+        }
+      }
+    }
     const t = setInterval(async () => {
       try {
         const r = await api<{ stamp: number }>('/api/stamp')
@@ -101,6 +139,7 @@ export default function App() {
           api<Doc[]>('/api/docs').then(setDocs).catch(() => {})
           refreshQueue()
         }
+        await pollEvents()
         // deploy landed → reload the bundle (deferred while an editor is dirty)
         const b = await api<{ build: number }>('/api/buildinfo')
         if (build === null) build = b.build
@@ -113,6 +152,23 @@ export default function App() {
     }, 2500)
     return () => clearInterval(t)
   }, [refreshQueue])
+
+  // owner notifications: maintainer-tier (green) edits land directly, so the
+  // activity feed is the only signal. Poll on data changes; toast each
+  // unseen item once; remember the newest seen op across launches.
+  const lastSeenOp = useRef<string | null>(loadLastSeen())
+  useEffect(() => {
+    api<ActivityItem[]>('/api/activity?limit=20')
+      .then((items) => {
+        if (!Array.isArray(items) || items.length === 0) return
+        for (const it of unseenActivity(items, lastSeenOp.current).reverse()) {
+          notify(activityLine(it), 'ok')
+        }
+        lastSeenOp.current = items[0].op_id
+        storeLastSeen(items[0].op_id)
+      })
+      .catch(() => {})
+  }, [dataVersion])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -181,14 +237,17 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [goBack, goForward, setView])
 
-  const openDoc = useCallback(
-    (id: string, toAnchor?: string) => {
-      setAnchor(toAnchor ?? null)
+  const openDoc = useCallback<OpenDoc>(
+    (id, opts) => {
+      const o: OpenDocOpts = typeof opts === 'string' ? { anchor: opts } : (opts ?? {})
+      setAnchor(o.anchor ?? (o.blockId ? `^${o.blockId}` : null))
+      setReviewIntent(!!o.review)
       setView({ kind: 'doc', id })
       setPalette(null)
     },
     [setView],
   )
+  openDocRef.current = openDoc
 
   // canvas nodes fire wikilink clicks as events (CanvasBlock has no doc list)
   useEffect(() => {
@@ -238,7 +297,9 @@ export default function App() {
             onOpenDoc={openDoc}
             docs={docs}
             dataVersion={dataVersion}
+            liveChange={liveChange}
             anchor={anchor}
+            reviewIntent={reviewIntent}
           />
         )}
         {view.kind === 'review' && (
@@ -978,25 +1039,50 @@ function DocTitle({ doc, onRenamed }: { doc: Doc; onRenamed: () => void }) {
   )
 }
 
+/** GET /api/doc/{id}/hot/status — newer fields are optional (older daemons). */
+interface HotStatus {
+  hot: boolean
+  frozen_epoch?: number
+  editors?: number
+  /** may THIS participant write in the session (authoritative when present) */
+  can_write?: boolean
+  /** owned docs only: session-wide "everyone can edit" vs "watch only" */
+  viewers_write?: boolean
+}
+
 function DocView({
   docId,
   onOpenDoc,
   docs,
   dataVersion,
+  liveChange = null,
   anchor,
+  reviewIntent = false,
 }: {
   docId: string
-  onOpenDoc: (id: string, anchor?: string) => void
+  onOpenDoc: OpenDoc
   docs: Doc[]
   dataVersion: number
+  /** owner nudged us that a doc changed (GET /api/events doc_changed);
+   * bumps `n` each time so the same doc can nudge twice */
+  liveChange?: { docId: string; n: number } | null
   anchor?: string | null
+  /** opened from the review queue: open the rail on load */
+  reviewIntent?: boolean
 }) {
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
   const [fed, setFed] = useState<DocFederation | null>(null)
   const [hot, setHot] = useState<HotDoc | null>(null)
   const mirrorRef = useRef<unknown>(null)
-  const [panel, setPanel] = useState<'none' | 'history' | 'comments' | 'tend' | 'share'>('none')
+  const [panel, setPanel] = useState<'none' | 'history' | 'comments' | 'tend' | 'share' | 'review'>('none')
+  // open review items for THIS doc (yellow = applied+flagged, red = parked)
+  const [reviewItems, setReviewItems] = useState<QueueRow[]>([])
+  const loadReview = useCallback(() => {
+    api<QueueRow[]>(`/api/doc/${docId}/review`)
+      .then((r) => setReviewItems(Array.isArray(r) ? r : []))
+      .catch(() => setReviewItems([]))
+  }, [docId])
   const [selBlock, setSelBlock] = useState<string | null>(null)
   const [selRect, setSelRect] = useState<{ x: number; y: number } | null>(null)
   const [commentTarget, setCommentTarget] = useState<string | null>(null)
@@ -1030,34 +1116,93 @@ function DocView({
 
   useEffect(() => {
     setTree(null)
-    setPanel('none')
+    setPanel(reviewIntent ? 'review' : 'none')
     setCommentTarget(null)
     setHot(null)
+    setHotCanWrite(undefined)
+    setViewersWrite(undefined)
+    setReviewItems([])
     ownEpoch.current = 0
     loadTree()
-  }, [loadTree])
+    loadReview()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadTree, loadReview])
+
+  // focus heartbeat (adaptive sync): while this doc is open, tell the daemon
+  // every 5s so a mirrored share is pulled at 5s instead of 120s. Owned docs
+  // are a server-side no-op; an older daemon 404s — either way, ignore.
+  useEffect(() => {
+    const beat = () => api(`/api/doc/${docId}/focus`, { method: 'POST' }).catch(() => {})
+    beat()
+    const t = setInterval(beat, 5000)
+    return () => clearInterval(t)
+  }, [docId])
+
+  // a later { review: true } open of the SAME doc still opens the rail
+  useEffect(() => {
+    if (reviewIntent) setPanel('review')
+  }, [reviewIntent, anchor])
+
+  useEffect(() => {
+    if (dataVersion === 0) return
+    loadReview()
+  }, [dataVersion, loadReview])
+
+  // after a resolve: content may have moved (yellow decline reverts, red
+  // accept applies) — refetch, remount the editor if the epoch moved
+  const treeRef = useRef<DocTree | null>(null)
+  treeRef.current = tree
+  const afterResolve = useCallback(() => {
+    loadReview()
+    api<DocTree>(`/api/doc/${docId}`)
+      .then((fresh) => {
+        const cur = treeRef.current
+        if (!cur || fresh.doc.current_epoch !== cur.doc.current_epoch) {
+          ownEpoch.current = Math.max(ownEpoch.current, fresh.doc.current_epoch)
+          setEditorGen((g) => g + 1)
+        }
+        setTree(fresh)
+      })
+      .catch(() => {})
+  }, [docId, loadReview])
+
+  const highlightMap = useMemo(() => buildHighlightMap(reviewItems), [reviewItems])
 
   // live refresh: when the store changed and this doc moved past what our own
   // saves produced, reload it and remount the editor with the fresh content
   // (skipped while dirty — the pending autosave lands first, next tick catches up)
-  useEffect(() => {
-    if (dataVersion === 0 || !tree) return
+  const refreshFromStore = useCallback(() => {
+    const cur = treeRef.current
+    if (!cur) return
     api<DocTree>(`/api/doc/${docId}`)
       .then((fresh) => {
-        const known = Math.max(tree.doc.current_epoch, ownEpoch.current)
+        const known = Math.max(cur.doc.current_epoch, ownEpoch.current)
         const dirty = document.querySelector('.save-state.dirty, .save-state.saving')
         if (fresh.doc.current_epoch > known && !dirty) {
           setTree(fresh)
           setEditorGen((g) => g + 1)
-        } else if (fresh.doc.status !== tree.doc.status) {
+        } else if (fresh.doc.status !== cur.doc.status) {
           setTree(fresh)
         }
         api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => {})
         api<DocFederation>(`/api/doc/${docId}/federation`).then(setFed).catch(() => {})
       })
       .catch(() => {})
+  }, [docId])
+  useEffect(() => {
+    if (dataVersion === 0) return
+    refreshFromStore()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dataVersion])
+
+  // an owner nudge (doc_changed) for THIS doc: the grantee daemon has already
+  // pulled it, so refresh now rather than on the next stamp tick. The pull may
+  // still be in flight — the stamp poll catches that case a tick later.
+  useEffect(() => {
+    if (!liveChange || liveChange.docId !== docId) return
+    refreshFromStore()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveChange])
 
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
 
@@ -1161,6 +1306,7 @@ function DocView({
           await new Promise((res) => setTimeout(res, 300))
         }
       }
+      setHotCanWrite(true) // we started it; the next status poll may refine
       setHot({
         docId,
         frozenEpoch: r.frozen_epoch,
@@ -1168,30 +1314,65 @@ function DocView({
         blocks,
       })
     } catch (e) {
-      console.error(e)
+      notify(errText(e))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docId, editable])
 
+  // view-share mirrors watch the owner's live session read-only: they join
+  // when it is hot but never start or end one
+  const isViewMirror = fed?.mirror?.permission === 'view'
+  // whether THIS participant may write in the current live session. The
+  // daemon's hot/status `can_write` is authoritative when present (and is
+  // re-evaluated on every poll — a session can flip it); absent (older
+  // daemon) we fall back to the mirror permission; owned docs are writable.
+  const [hotCanWrite, setHotCanWrite] = useState<boolean | undefined>(undefined)
+  const hotReadOnly = hotCanWrite !== undefined ? !hotCanWrite : isViewMirror
+  // session = consent: on an OWNED doc, whether every share participant may
+  // edit the live session (true) or only watch (false). Reported by
+  // hot/status for owned docs; undefined for mirrors and older daemons.
+  const [viewersWrite, setViewersWrite] = useState<boolean | undefined>(undefined)
+  const toggleViewersWrite = useCallback(
+    async (enabled: boolean) => {
+      setViewersWrite(enabled) // optimistic; the status poll re-reads the truth
+      try {
+        const r = await api<{ ok?: boolean; viewers_write?: boolean }>(
+          `/api/doc/${docId}/hot/viewers_write`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled }),
+          },
+        )
+        if (typeof r.viewers_write === 'boolean') setViewersWrite(r.viewers_write)
+      } catch (e) {
+        setViewersWrite(!enabled)
+        notify(errText(e))
+      }
+    },
+    [docId],
+  )
+
   // a live session started elsewhere (second window, another instance,
-  // recovered journal): join it rather than editing cold. And when TWO
-  // editors are typing the same cold doc, escalate to a live session
-  // (P2.1 auto-hot) — only from a clean editor, so no keystrokes are lost.
+  // recovered journal, or the OWNER of a doc mirrored to us): join it rather
+  // than editing cold. And when TWO editors are typing the same cold doc,
+  // escalate to a live session (P2.1 auto-hot) — only from a clean editor,
+  // so no keystrokes are lost.
   useEffect(() => {
     if (!tree || hot) return
-    api<{ hot: boolean; frozen_epoch?: number; editors?: number }>(
-      `/api/doc/${docId}/hot/status`,
-    )
+    api<HotStatus>(`/api/doc/${docId}/hot/status`)
       .then((st) => {
         if (!editable) return
         if (st.hot) {
+          setHotCanWrite(typeof st.can_write === 'boolean' ? st.can_write : undefined)
+          setViewersWrite(typeof st.viewers_write === 'boolean' ? st.viewers_write : undefined)
           setHot({
             docId,
             frozenEpoch: st.frozen_epoch ?? tree.doc.current_epoch,
             seed: false,
             blocks: editable.blocks,
           })
-        } else if ((st.editors ?? 0) >= 2) {
+        } else if ((st.editors ?? 0) >= 2 && !isViewMirror) {
           const dirty = document.querySelector('.save-state.dirty, .save-state.saving')
           if (!dirty) goLive()
         }
@@ -1199,6 +1380,41 @@ function DocView({
       .catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tree, dataVersion])
+
+  // while live: poll hot/status on its own clock (session state such as the
+  // owner's "watch only" toggle lives in memory and never moves the store
+  // stamp). If the daemon says the session is gone (the owner ended it and
+  // our socket close was missed), fall back to the cold view.
+  useEffect(() => {
+    if (!hot) return
+    let cancelled = false
+    const poll = () =>
+      api<HotStatus>(`/api/doc/${docId}/hot/status`)
+        .then((st) => {
+          if (cancelled) return
+          if (!st.hot) {
+            setHot(null)
+            setHotCanWrite(undefined)
+            setViewersWrite(undefined)
+            setEditorGen((g) => g + 1)
+            loadTree()
+            loadReview()
+            return
+          }
+          // both flip live mid-session: can_write re-renders HotEditor's
+          // editable state (it calls editor.setEditable), viewers_write the chip
+          if (typeof st.can_write === 'boolean') setHotCanWrite(st.can_write)
+          if (typeof st.viewers_write === 'boolean') setViewersWrite(st.viewers_write)
+        })
+        .catch(() => {})
+    poll()
+    const t = setInterval(poll, 2500)
+    return () => {
+      cancelled = true
+      clearInterval(t)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hot?.docId, hot?.frozenEpoch])
 
   if (!tree || !editable) return <div className="empty">…</div>
 
@@ -1277,6 +1493,16 @@ function DocView({
               ⚡ go live
             </button>
           )}
+          {reviewItems.length > 0 && (
+            <button
+              className={`chip review-chip ${panel === 'review' ? 'on' : ''}`}
+              title={hot ? 'review after the live session ends' : 'review changes in this doc'}
+              disabled={!!hot}
+              onClick={() => setPanel(panel === 'review' ? 'none' : 'review')}
+            >
+              ⚠ {reviewItems.length} to review
+            </button>
+          )}
         </span>
         {mirror ? (
           <h1 className="doc-title readonly">{tree.doc.title}</h1>
@@ -1284,20 +1510,33 @@ function DocView({
           <DocTitle doc={tree.doc} onRenamed={loadTree} />
         )}
       </div>
+      {hot && reviewItems.length > 0 && (
+        <div className="meta review-hot-note">
+          ⚠ {reviewItems.length} change{reviewItems.length === 1 ? '' : 's'} to review · review after the live session ends
+        </div>
+      )}
       {hot ? (
         <HotEditor
           key={`hot:${docId}`}
           doc={hot}
+          readOnly={hotReadOnly}
+          canEnd={!isViewMirror}
+          viewersWrite={mirror ? undefined : viewersWrite}
+          onToggleViewersWrite={mirror ? undefined : toggleViewersWrite}
           onEnded={() => {
             setHot(null)
+            setHotCanWrite(undefined)
+            setViewersWrite(undefined)
             setEditorGen((g) => g + 1)
             loadTree()
+            loadReview()
           }}
         />
       ) : (
       <DocEditor
         key={`${docId}:${editorGen}`}
         doc={editable}
+        reviewMap={highlightMap}
         mode={mirror ? (mirror.permission === 'propose' ? 'propose' : 'readonly') : 'direct'}
         onSaved={(e) => {
           ownEpoch.current = Math.max(ownEpoch.current, e)
@@ -1339,6 +1578,9 @@ function DocView({
         </span>
       )}
       {panel === 'history' && <HistoryPanel docId={docId} onClose={() => setPanel('none')} />}
+      {panel === 'review' && !hot && (
+        <ReviewRail items={reviewItems} onChanged={afterResolve} onClose={() => setPanel('none')} />
+      )}
       {panel === 'share' && (
         <SharePanel
           doc={tree.doc}
@@ -1584,10 +1826,13 @@ function ReviewQueue({
   dataVersion,
 }: {
   onChange: (n: number) => void
-  onOpenDoc: (id: string) => void
+  onOpenDoc: OpenDoc
   dataVersion: number
 }) {
   const [rows, setRows] = useState<QueueRow[]>([])
+  // open the doc with its review rail up, scrolled to the op's block
+  const openInDoc = (r: QueueRow) =>
+    onOpenDoc(r.item.annotation.doc_id, { review: true, blockId: targetBlockOf(r) ?? undefined })
   const [flags, setFlags] = useState<FlagRow[]>([])
   const [busy, setBusy] = useState<string | null>(null)
 
@@ -1613,7 +1858,7 @@ function ReviewQueue({
         body: JSON.stringify({ annotation_id: annotationId, decision }),
       })
     } catch (e) {
-      notify(String(e))
+      notify(errText(e))
     }
     setBusy(null)
     load()
@@ -1684,14 +1929,17 @@ function ReviewQueue({
           typeof op.kind.content === 'string' ? (op.kind.content as string) : JSON.stringify(op.kind)
         const parked = r.item.annotation.kind === 'parked'
         return (
-          <div key={r.item.annotation.id} className={`card ${parked ? 'red' : 'yellow'}`}>
+          <div
+            key={r.item.annotation.id}
+            className={`card ${parked ? 'red' : 'yellow'} clickable`}
+            title="open in doc"
+            onClick={() => openInDoc(r)}
+          >
             <div className="card-head">
               <span className={`verdict ${parked ? 'v-red' : 'v-yellow'}`}>
                 {parked ? 'parked' : 'applied'}
               </span>
-              <span className="card-doc" onClick={() => onOpenDoc(r.item.annotation.doc_id)}>
-                {r.doc_title}
-              </span>
+              <span className="card-doc">{r.doc_title}</span>
               <span className="card-meta">
                 {op.kind.op} · {r.proposer}
                 {op.confidence != null && ` · ${op.confidence.toFixed(2)}`}
@@ -1712,7 +1960,7 @@ function ReviewQueue({
               </div>
             </div>
             {op.source_refs.length > 0 && <div className="refs">{op.source_refs.join(' · ')}</div>}
-            <div className="actions">
+            <div className="actions" onClick={(e) => e.stopPropagation()}>
               <button
                 className="accept"
                 disabled={busy === r.item.annotation.id}
@@ -1726,6 +1974,9 @@ function ReviewQueue({
                 onClick={() => resolve(r.item.annotation.id, 'decline')}
               >
                 {parked ? 'discard' : 'revert'}
+              </button>
+              <button className="chip open-in-doc" onClick={() => openInDoc(r)}>
+                open in doc →
               </button>
             </div>
           </div>

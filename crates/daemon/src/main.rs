@@ -440,6 +440,8 @@ async fn main() -> anyhow::Result<()> {
             // (ADR 0002 decision 7); the HTTP router below never sees it —
             // the admin routes only get the endpoint handle for outbound
             // joins and the node id for minting links
+            // federation runtime state: focus heartbeats + received nudges
+            let runtime = fed::Runtime::default();
             let mut fed_ctx = admin::FedCtx {
                 node_id: None,
                 endpoint: None,
@@ -449,9 +451,11 @@ async fn main() -> anyhow::Result<()> {
                     Ok(ep) => {
                         fed_ctx.node_id = Some(id.node_id());
                         fed_ctx.endpoint = Some(ep.clone());
-                        tokio::spawn(fed::serve(ep.clone(), store.clone(), hot.clone()));
+                        tokio::spawn(fed::serve(ep.clone(), store.clone(), hot.clone(), runtime.clone()));
                         tokio::spawn(fed::join_retry_loop(ep.clone(), store.clone()));
-                        tokio::spawn(fed::pull_loop(ep, store.clone()));
+                        // grantee side: adaptive pull; owner side: nudge grantees on change
+                        tokio::spawn(fed::pull_loop(ep.clone(), store.clone(), runtime.clone()));
+                        tokio::spawn(fed::notify_loop(ep, store.clone(), hot.clone()));
                     }
                     Err(e) => tracing::warn!("federation endpoint failed to bind: {e:#}"),
                 }
@@ -464,7 +468,12 @@ async fn main() -> anyhow::Result<()> {
                     endpoint: fed_ctx.endpoint.clone(),
                 }))
                 .merge(admin::router(store.clone(), fed_ctx, hot.clone()))
-                .merge(api::router(api::ApiState { store, human: tom, hot }));
+                .merge(api::router(api::ApiState {
+                    store,
+                    human: tom,
+                    hot,
+                    runtime,
+                }));
             // The frontend is EMBEDDED in this binary (rust-embed over ui/dist),
             // so the app is self-contained on any machine. GRIMOIRE_UI_DIST is a
             // dev override: set it to serve a live build off disk instead.

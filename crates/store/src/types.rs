@@ -540,6 +540,12 @@ pub enum ShareTrust {
     /// Trusted: remote edits apply immediately as flagged yellows; reds
     /// (overlaps, gone targets) still park.
     Yellow,
+    /// Maintainer: remote edits go through the gate's normal scoring — clean
+    /// ops land GREEN with no review annotation; conflicts still yellow/red.
+    /// Every op is ledgered with a pre-image (revertible from history) and
+    /// surfaces in the owner's activity feed. Trust the person, keep the
+    /// receipt. Human-set only, never over MCP.
+    Green,
 }
 
 impl ShareTrust {
@@ -547,6 +553,7 @@ impl ShareTrust {
         match self {
             ShareTrust::Review => "review",
             ShareTrust::Yellow => "yellow",
+            ShareTrust::Green => "green",
         }
     }
 
@@ -554,9 +561,25 @@ impl ShareTrust {
         match s {
             "review" => Some(ShareTrust::Review),
             "yellow" => Some(ShareTrust::Yellow),
+            "green" | "maintainer" => Some(ShareTrust::Green),
             _ => None,
         }
     }
+}
+
+/// One entry in the owner's activity feed: a content edit applied directly
+/// by a REMOTE principal (a maintainer-tier share). The notification that
+/// replaces the review annotation for trusted peers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActivityItem {
+    pub op_id: Uuid,
+    pub doc_id: Uuid,
+    pub doc_title: String,
+    pub principal: Uuid,
+    pub principal_name: String,
+    pub op_type: String,
+    pub epoch: i64,
+    pub created_at: String,
 }
 
 /// An owner-side grant: this subtree, this contact, this permission.

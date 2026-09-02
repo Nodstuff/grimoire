@@ -96,6 +96,34 @@ pub enum Request {
         #[serde(default)]
         reply_to: Option<String>,
     },
+    /// The nudge (OWNER → grantee): something you hold a mirror of just
+    /// changed / appeared / went live — pull now instead of waiting for the
+    /// sweep. Best-effort; a missed nudge is caught by the poll. The grantee
+    /// only accepts it from a contact it holds that share from.
+    Notify {
+        share: String,
+        doc: String,
+        title: String,
+        kind: NotifyKind,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyKind {
+    LiveStarted,
+    DocAdded,
+    DocChanged,
+}
+
+impl NotifyKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NotifyKind::LiveStarted => "live_started",
+            NotifyKind::DocAdded => "doc_added",
+            NotifyKind::DocChanged => "doc_changed",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -132,6 +160,8 @@ pub enum Response {
         owner_name: String,
     },
     Pong,
+    /// Nudge acknowledged.
+    Noted,
     Pulled {
         metas: Vec<WireDocMeta>,
         changed: Vec<WireDoc>,
@@ -152,6 +182,11 @@ pub enum Response {
         frozen_epoch: Option<i64>,
         #[serde(default)]
         editors: usize,
+        /// Whether THIS peer may write in the session (today: has `propose`).
+        /// None from pre-field owners → the grantee UI falls back to the share
+        /// permission.
+        #[serde(default)]
+        can_write: Option<bool>,
     },
     HotStarted {
         frozen_epoch: i64,

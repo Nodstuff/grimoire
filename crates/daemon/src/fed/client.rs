@@ -100,7 +100,7 @@ pub async fn hot_status_upstream(
     endpoint: &Endpoint,
     store: &Arc<Mutex<SqliteStore>>,
     doc_id: uuid::Uuid,
-) -> Result<(bool, Option<i64>, usize)> {
+) -> Result<(bool, Option<i64>, usize, Option<bool>)> {
     let (mirror, owner) = mirror_owner(store, doc_id)?;
     let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
     let res = request(
@@ -113,7 +113,12 @@ pub async fn hot_status_upstream(
     )
     .await?;
     match res {
-        Response::HotStatusIs { hot, frozen_epoch, editors } => Ok((hot, frozen_epoch, editors)),
+        Response::HotStatusIs {
+            hot,
+            frozen_epoch,
+            editors,
+            can_write,
+        } => Ok((hot, frozen_epoch, editors, can_write)),
         other => anyhow::bail!("owner refused hot status: {other:?}"),
     }
 }

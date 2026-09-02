@@ -1,3 +1,4 @@
+use super::runtime::Runtime;
 use super::client::{join_at, mint_invite, pull_share, request};
 use super::loops::{drop_dead_share, refresh_outbound};
 use super::server::serve;
@@ -47,7 +48,7 @@ use grimoire_store::{BlockStore, SqliteStore};
         let store = owner_store("the-secret");
         let owner = local_endpoint().await;
         let addr = direct_addr(&owner);
-        tokio::spawn(serve(owner, store.clone(), scratch_hot()));
+        tokio::spawn(serve(owner, store.clone(), scratch_hot(), Runtime::default()));
 
         let stranger = local_endpoint().await;
         let res = request(&stranger, addr, Request::Ping).await.unwrap();
@@ -59,7 +60,7 @@ use grimoire_store::{BlockStore, SqliteStore};
         let store = owner_store("the-secret");
         let owner = local_endpoint().await;
         let addr = direct_addr(&owner);
-        tokio::spawn(serve(owner, store.clone(), scratch_hot()));
+        tokio::spawn(serve(owner, store.clone(), scratch_hot(), Runtime::default()));
 
         let alice = local_endpoint().await;
         let alice_id = alice.id().to_string();
@@ -123,7 +124,7 @@ use grimoire_store::{BlockStore, SqliteStore};
         let store = owner_store("the-secret");
         let owner = local_endpoint().await;
         let addr = direct_addr(&owner);
-        tokio::spawn(serve(owner, store.clone(), scratch_hot()));
+        tokio::spawn(serve(owner, store.clone(), scratch_hot(), Runtime::default()));
 
         let alice = local_endpoint().await;
         let alice_id = alice.id().to_string();
@@ -181,7 +182,7 @@ use grimoire_store::{BlockStore, SqliteStore};
         .unwrap();
         let owner_store = Arc::new(Mutex::new(owner_store));
         let addr = direct_addr(&owner_ep);
-        tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot()));
+        tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot(), Runtime::default()));
 
         // grantee side
         let mut alice_store = SqliteStore::open_in_memory().unwrap();
@@ -263,7 +264,7 @@ use grimoire_store::{BlockStore, SqliteStore};
         .unwrap();
         let owner_store = Arc::new(Mutex::new(owner_store));
         let addr = direct_addr(&owner_ep);
-        tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot()));
+        tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot(), Runtime::default()));
 
         // grantee joins, then pulls the snapshot
         let mut alice_store = SqliteStore::open_in_memory().unwrap();
@@ -363,7 +364,7 @@ use grimoire_store::{BlockStore, SqliteStore};
         .unwrap();
         let owner_store = Arc::new(Mutex::new(owner_store));
         let addr = direct_addr(&owner_ep);
-        tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot()));
+        tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot(), Runtime::default()));
 
         let mut alice_store = SqliteStore::open_in_memory().unwrap();
         alice_store
@@ -530,7 +531,7 @@ use grimoire_store::{BlockStore, SqliteStore};
         owner_store.set_share_trust(share.id, ShareTrust::Yellow).unwrap();
         let owner_store = Arc::new(Mutex::new(owner_store));
         let addr = direct_addr(&owner_ep);
-        tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot()));
+        tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot(), Runtime::default()));
 
         let mut alice_store = SqliteStore::open_in_memory().unwrap();
         alice_store
@@ -684,7 +685,7 @@ use grimoire_store::{BlockStore, SqliteStore};
         .unwrap();
         let owner_store = Arc::new(Mutex::new(owner_store));
         let addr = direct_addr(&owner_ep);
-        tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot()));
+        tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot(), Runtime::default()));
 
         let mut alice_store = SqliteStore::open_in_memory().unwrap();
         alice_store
@@ -784,7 +785,7 @@ use grimoire_store::{BlockStore, SqliteStore};
         };
         let owner = local_endpoint().await;
         let addr = direct_addr(&owner);
-        tokio::spawn(serve(owner, store.clone(), scratch_hot()));
+        tokio::spawn(serve(owner, store.clone(), scratch_hot(), Runtime::default()));
 
         // mallory redeems nothing but tries to pull the share
         let mallory = local_endpoint().await;
@@ -806,7 +807,7 @@ use grimoire_store::{BlockStore, SqliteStore};
         let store = owner_store("s");
         let owner = local_endpoint().await;
         let addr = direct_addr(&owner);
-        tokio::spawn(serve(owner, store, scratch_hot()));
+        tokio::spawn(serve(owner, store, scratch_hot(), Runtime::default()));
 
         let client = local_endpoint().await;
         let conn = client.connect(addr, ALPN).await.unwrap();
@@ -842,7 +843,7 @@ async fn refusals_carry_typed_codes() {
     let owner = local_endpoint().await;
     let addr = direct_addr(&owner);
     let share_id = { store.lock().unwrap().list_shares().unwrap()[0].id };
-    tokio::spawn(serve(owner, store.clone(), scratch_hot()));
+    tokio::spawn(serve(owner, store.clone(), scratch_hot(), Runtime::default()));
 
     // unknown peer → UnknownPeer (not a text match)
     let stranger = local_endpoint().await;
@@ -897,7 +898,7 @@ async fn join_refuses_to_shadow_a_local_doc() {
     let (_share, link) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), doc.id, SharePermission::View).unwrap();
     let owner_store = Arc::new(Mutex::new(owner_store));
     let addr = direct_addr(&owner_ep);
-    tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot()));
+    tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot(), Runtime::default()));
 
     let mut alice_store = SqliteStore::open_in_memory().unwrap();
     let alice = alice_store.create_principal(PrincipalKind::Human, "alice", None).unwrap();
@@ -932,7 +933,7 @@ async fn owner_tended_flag_rides_the_pull() {
     let (share, link) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), doc.id, SharePermission::Propose).unwrap();
     let owner_store = Arc::new(Mutex::new(owner_store));
     let addr = direct_addr(&owner_ep);
-    tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot()));
+    tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot(), Runtime::default()));
 
     let mut alice_store = SqliteStore::open_in_memory().unwrap();
     alice_store.create_principal(PrincipalKind::Human, "alice", None).unwrap();
@@ -949,11 +950,187 @@ async fn owner_tended_flag_rides_the_pull() {
         let m = s.get_mirror(doc.id).unwrap().unwrap();
         assert!(m.owner_tended, "grantee mirror reflects owner tending");
         // and the grantee cannot tend it locally (avoids two-sided agents)
-        let mut s = s;
+        let s = s;
         let scope_on_mirror = s.get_mirror(doc.id).unwrap().is_some();
         assert!(scope_on_mirror);
         // creating a gardener scoped to the mirror is refused by the store guard?
         // (the guard lives in admin.rs; here we assert the mirror fact the guard keys off)
         assert!(s.doc_is_tended(doc.id).unwrap() == false, "grantee has no local gardener");
     }
+}
+
+#[tokio::test]
+async fn maintainer_trust_applies_green_with_no_review_annotation() {
+    use grimoire_store::{BlockType, OpInput, OpKind, ShareTrust};
+    let mut owner_store = SqliteStore::open_in_memory().unwrap();
+    let tom = owner_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let doc = owner_store.create_doc("Notes", None, tom.id).unwrap();
+    let owner_ep = local_endpoint().await;
+    let (share, link) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), doc.id, SharePermission::Propose).unwrap();
+    owner_store.set_share_trust(share.id, ShareTrust::Green).unwrap();
+    let owner_store = Arc::new(Mutex::new(owner_store));
+    let addr = direct_addr(&owner_ep);
+    tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot(), Runtime::default()));
+
+    let mut alice_store = SqliteStore::open_in_memory().unwrap();
+    alice_store.create_principal(PrincipalKind::Human, "alice", None).unwrap();
+    let alice_store = Arc::new(Mutex::new(alice_store));
+    let alice_ep = local_endpoint().await;
+    let ticket = Ticket::parse(&link).unwrap();
+    join_at(&alice_ep, &alice_store, &ticket, addr.clone()).await.unwrap();
+
+    let op = OpInput {
+        kind: OpKind::Insert { block_id: uuid::Uuid::now_v7(), parent_id: None, order_key: "i".into(), block_type: BlockType::Paragraph, content: "maintainer edit".into(), refers_to: None },
+        source_refs: vec![],
+    };
+    let res = request(&alice_ep, addr, Request::Propose {
+        share: share.id.to_string(), doc: doc.id.to_string(), ops: vec![op], note: String::new(), base_epoch: Some(0), request_id: None,
+    }).await.unwrap();
+    let Response::Proposed { op_ids } = res else { panic!("expected Proposed, got {res:?}") };
+    let ids: Vec<uuid::Uuid> = op_ids.iter().map(|s| s.parse().unwrap()).collect();
+
+    let s = owner_store.lock().unwrap();
+    // live immediately
+    assert_eq!(s.read_doc(doc.id).unwrap().roots[0].block.content, "maintainer edit");
+    // GREEN: no review annotation, queue empty — the receipt is the ledger + activity feed
+    assert!(s.review_queue(Some(doc.id)).unwrap().is_empty(), "maintainer edits are not queued");
+    let st = &s.op_statuses(&ids).unwrap()[0];
+    assert!(st.applied);
+    assert_eq!(st.review, None, "no annotation at all");
+    let feed = s.recent_remote_ops(10).unwrap();
+    assert_eq!(feed.len(), 1);
+    assert_eq!(feed[0].principal_name, "alice");
+    assert_eq!(feed[0].doc_title, "Notes");
+}
+
+#[tokio::test]
+async fn view_share_bridge_is_read_only_and_propose_share_is_not() {
+    // bridge_authorized is what handle_hot_bridge keys the read-only filter on
+    use super::server::bridge_authorized;
+    let mut owner_store = SqliteStore::open_in_memory().unwrap();
+    let tom = owner_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let doc = owner_store.create_doc("Live Doc", None, tom.id).unwrap();
+    let owner_ep = local_endpoint().await;
+    let (share, link) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), doc.id, SharePermission::View).unwrap();
+    let owner_store = Arc::new(Mutex::new(owner_store));
+    let addr = direct_addr(&owner_ep);
+    tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot(), Runtime::default()));
+
+    let mut alice_store = SqliteStore::open_in_memory().unwrap();
+    alice_store.create_principal(PrincipalKind::Human, "alice", None).unwrap();
+    let alice_store = Arc::new(Mutex::new(alice_store));
+    let alice_ep = local_endpoint().await;
+    let alice_pub = alice_ep.id().to_string();
+    let ticket = Ticket::parse(&link).unwrap();
+    join_at(&alice_ep, &alice_store, &ticket, addr).await.unwrap();
+
+    // a VIEW share may join the bridge, read-only
+    let (d, read_only) = bridge_authorized(&owner_store, &alice_pub, &share.id.to_string(), &doc.id.to_string()).unwrap();
+    assert_eq!(d, doc.id);
+    assert!(read_only, "view share watches read-only");
+
+    // upgrade to propose: full participant
+    owner_store.lock().unwrap().set_share_permission(share.id, SharePermission::Propose).unwrap();
+    let (_, read_only) = bridge_authorized(&owner_store, &alice_pub, &share.id.to_string(), &doc.id.to_string()).unwrap();
+    assert!(!read_only, "propose share edits");
+
+    // an unknown peer is refused outright
+    assert!(bridge_authorized(&owner_store, &"00".repeat(32), &share.id.to_string(), &doc.id.to_string()).is_err());
+}
+
+#[tokio::test]
+async fn session_consent_lets_view_grantee_write_until_owner_says_watch_only() {
+    // owner hosts a live session; a VIEW grantee asks HotStatus: writable by
+    // default (session = consent), read-only once the owner flips watch-only
+    let mut owner_store = SqliteStore::open_in_memory().unwrap();
+    let tom = owner_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let doc = owner_store.create_doc("Riff", None, tom.id).unwrap();
+    let owner_ep = local_endpoint().await;
+    let (share, link) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), doc.id, SharePermission::View).unwrap();
+    let owner_store = Arc::new(Mutex::new(owner_store));
+    let addr = direct_addr(&owner_ep);
+    let hot = scratch_hot();
+    tokio::spawn(serve(owner_ep, owner_store.clone(), hot.clone(), Runtime::default()));
+
+    let mut alice_store = SqliteStore::open_in_memory().unwrap();
+    alice_store.create_principal(PrincipalKind::Human, "alice", None).unwrap();
+    let alice_store = Arc::new(Mutex::new(alice_store));
+    let alice_ep = local_endpoint().await;
+    let ticket = Ticket::parse(&link).unwrap();
+    join_at(&alice_ep, &alice_store, &ticket, addr.clone()).await.unwrap();
+
+    let status = |ep: &Endpoint, addr: EndpointAddr| {
+        let ep = ep.clone();
+        let req = Request::HotStatus { share: share.id.to_string(), doc: doc.id.to_string() };
+        async move { request(&ep, addr, req).await.unwrap() }
+    };
+    // cold: not hot, and a view grantee can't write (nothing to write into)
+    let Response::HotStatusIs { hot: h, can_write, .. } = status(&alice_ep, addr.clone()).await else { panic!() };
+    assert!(!h);
+    assert_eq!(can_write, Some(false));
+    // owner goes live → session = consent → the viewer may write
+    hot.start(doc.id, 0).unwrap();
+    let Response::HotStatusIs { hot: h, can_write, .. } = status(&alice_ep, addr.clone()).await else { panic!() };
+    assert!(h);
+    assert_eq!(can_write, Some(true), "view grantee writes in an owner-opened session");
+    assert_eq!(hot.viewers_write(doc.id), Some(true));
+    // owner flips to watch-only → viewer is read-only, live
+    hot.set_viewers_write(doc.id, false).unwrap();
+    let Response::HotStatusIs { can_write, .. } = status(&alice_ep, addr.clone()).await else { panic!() };
+    assert_eq!(can_write, Some(false), "watch only");
+    // and back
+    hot.set_viewers_write(doc.id, true).unwrap();
+    let Response::HotStatusIs { can_write, .. } = status(&alice_ep, addr).await else { panic!() };
+    assert_eq!(can_write, Some(true));
+    // toggling a doc that isn't hot is an error, not a silent no-op
+    assert!(hot.set_viewers_write(uuid::Uuid::now_v7(), false).is_err());
+}
+
+#[tokio::test]
+async fn nudge_is_accepted_from_the_owner_for_a_held_share_and_refused_otherwise() {
+    use super::wire::NotifyKind;
+    // owner A shares to grantee B; B runs a listener too (both are daemons)
+    let mut a_store = SqliteStore::open_in_memory().unwrap();
+    let tom = a_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let doc = a_store.create_doc("Nudged", None, tom.id).unwrap();
+    let a_ep = local_endpoint().await;
+    let (share, link) = mint_invite(&mut a_store, &a_ep.id().to_string(), doc.id, SharePermission::View).unwrap();
+    let a_store = Arc::new(Mutex::new(a_store));
+    let a_addr = direct_addr(&a_ep);
+    tokio::spawn(serve(a_ep.clone(), a_store.clone(), scratch_hot(), Runtime::default()));
+
+    let mut b_store = SqliteStore::open_in_memory().unwrap();
+    b_store.create_principal(PrincipalKind::Human, "bob", None).unwrap();
+    let b_store = Arc::new(Mutex::new(b_store));
+    let b_ep = local_endpoint().await;
+    let b_addr = direct_addr(&b_ep);
+    let b_runtime = Runtime::default();
+    tokio::spawn(serve(b_ep.clone(), b_store.clone(), scratch_hot(), b_runtime.clone()));
+    let ticket = Ticket::parse(&link).unwrap();
+    join_at(&b_ep, &b_store, &ticket, a_addr).await.unwrap();
+
+    // A nudges B about the shared doc → accepted, event recorded on B
+    let res = request(&a_ep, b_addr.clone(), Request::Notify {
+        share: share.id.to_string(), doc: doc.id.to_string(), title: "Nudged".into(), kind: NotifyKind::LiveStarted,
+    }).await.unwrap();
+    assert_eq!(res, Response::Noted);
+    let (next, events) = b_runtime.events_since(0);
+    assert_eq!(next, 1);
+    assert_eq!(events[0].kind, "live_started");
+    assert_eq!(events[0].doc_id, doc.id);
+    assert_eq!(events[0].from, "tom");
+
+    // A nudges about a share B does NOT hold → refused, no event
+    let res = request(&a_ep, b_addr.clone(), Request::Notify {
+        share: uuid::Uuid::now_v7().to_string(), doc: doc.id.to_string(), title: "x".into(), kind: NotifyKind::DocChanged,
+    }).await.unwrap();
+    assert!(matches!(res, Response::Refused { code: RefusalCode::NotInShare, .. }), "{res:?}");
+    assert_eq!(b_runtime.events_since(0).1.len(), 1);
+
+    // a stranger nudging B → unknown peer
+    let mallory = local_endpoint().await;
+    let res = request(&mallory, b_addr, Request::Notify {
+        share: share.id.to_string(), doc: doc.id.to_string(), title: "x".into(), kind: NotifyKind::DocChanged,
+    }).await.unwrap();
+    assert!(matches!(res, Response::Refused { code: RefusalCode::UnknownPeer, .. }));
 }

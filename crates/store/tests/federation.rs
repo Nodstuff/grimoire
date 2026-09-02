@@ -345,3 +345,48 @@ fn mirror_tended_flag_round_trips() {
     s.upsert_mirror(doc, owner.id, share, 2, SharePermission::View).unwrap();
     assert!(s.get_mirror(doc).unwrap().unwrap().owner_tended, "tended survives re-upsert");
 }
+
+#[test]
+fn maintainer_trust_round_trips_and_parses_alias() {
+    let (mut s, tom) = store_with_tom();
+    let doc = s.create_doc("Shared", None, tom.id).unwrap();
+    let share = s.create_share(doc.id, None, SharePermission::Propose, None).unwrap();
+    assert_eq!(share.trust, ShareTrust::Review);
+    s.set_share_trust(share.id, ShareTrust::Green).unwrap();
+    assert_eq!(s.get_share(share.id).unwrap().trust, ShareTrust::Green);
+    assert_eq!(ShareTrust::parse("maintainer"), Some(ShareTrust::Green));
+    assert_eq!(ShareTrust::parse("green"), Some(ShareTrust::Green));
+    assert_eq!(ShareTrust::Green.as_str(), "green");
+}
+
+#[test]
+fn recent_remote_ops_lists_only_applied_remote_edits() {
+    let (mut s, tom) = store_with_tom();
+    let doc = s.create_doc("Runbook", None, tom.id).unwrap();
+    let alice = s.pair_contact(&"ef".repeat(32), "alice").unwrap();
+    let mk = |content: &str| OpInput {
+        kind: OpKind::Insert {
+            block_id: uuid::Uuid::now_v7(),
+            parent_id: None,
+            order_key: "".into(),
+            block_type: BlockType::Paragraph,
+            content: content.into(),
+            refers_to: None,
+        },
+        source_refs: vec![],
+    };
+    // a human edit: not remote, excluded
+    s.apply(doc.id, 0, tom.id, vec![mk("tom wrote this")]).unwrap();
+    // a maintainer (remote) edit that APPLIED: included
+    let e = s.get_doc(doc.id).unwrap().current_epoch;
+    s.propose(doc.id, e, alice.principal, vec![mk("alice wrote this")]).unwrap();
+    // a parked (unapplied) remote proposal: excluded
+    s.park(doc.id, alice.principal, vec![mk("alice proposed this")], "").unwrap();
+
+    let feed = s.recent_remote_ops(10).unwrap();
+    assert_eq!(feed.len(), 1, "only the applied remote edit: {feed:?}");
+    assert_eq!(feed[0].principal_name, "alice");
+    assert_eq!(feed[0].doc_title, "Runbook");
+    assert_eq!(feed[0].op_type, "insert");
+    assert_eq!(feed[0].principal, alice.principal);
+}

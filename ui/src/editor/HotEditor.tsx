@@ -14,8 +14,12 @@ import { WebsocketProvider } from 'y-websocket'
 import { prosemirrorJSONToYDoc } from 'y-prosemirror'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block, Principal } from '../types'
-import { notify } from '../Notice'
-import { extensions, parser, schema } from './DocEditor'
+import { errText, notify } from '../Notice'
+import { viewersWriteChip } from '../live'
+import { makeExtensions, parser, schema } from './DocEditor'
+
+/** How long a join may sit on "connecting…" before we give up and explain. */
+const JOIN_GRACE_MS = 10_000
 
 const CARET_COLORS = ['#8b9dc3', '#95c99b', '#d9b47a', '#d98a94', '#a88bd4', '#7bc4c4']
 function colorFor(name: string): string {
@@ -35,10 +39,27 @@ export interface HotDoc {
 export default function HotEditor({
   doc,
   onEnded,
+  readOnly = false,
+  canEnd = true,
+  viewersWrite,
+  onToggleViewersWrite,
 }: {
   doc: HotDoc
   /** session over (we ended it, or the daemon dropped it) — reload cold */
   onEnded: () => void
+  /** this participant may not write in the session (the owner set "watch
+   * only", or an older daemon's view share): no typing, no ending — the
+   * owner's daemon drops any writes anyway. Flips live mid-session. */
+  readOnly?: boolean
+  /** May this participant END the session? Owners and `propose` grantees
+   * can; a `view` grantee riffing under session = consent cannot (the owner's
+   * daemon refuses), so the button is hidden even while they can type. */
+  canEnd?: boolean
+  /** OWNED docs only: whether every share participant may edit this session
+   * (session = consent) or just watch. Undefined hides the chip (mirror, or
+   * a daemon that doesn't report it). */
+  viewersWrite?: boolean
+  onToggleViewersWrite?: (enabled: boolean) => void
 }) {
   const [peerNames, setPeerNames] = useState<string[]>([])
   const [me, setMe] = useState<string>('me')
@@ -110,10 +131,45 @@ export default function HotEditor({
             onEnded()
           }
         })
-        .catch(() => {})
+        .catch((e) => {
+          // daemon unreachable: say so rather than retrying silently forever
+          if (endedRef.current) return
+          endedRef.current = true
+          notify(`lost the live session: ${errText(e)}`)
+          onEnded()
+        })
     }
     provider.on('connection-close', onClose)
+    // never sit on "connecting…" forever: if the socket has not synced within
+    // the grace period, ask the daemon why and fall back to the cold view
+    let everConnected = false
+    const onStatusOnce = ({ status }: { status: string }) => {
+      if (status === 'connected') everConnected = true
+    }
+    provider.on('status', onStatusOnce)
+    const joinTimer = setTimeout(() => {
+      if (everConnected || endedRef.current) return
+      api<{ hot: boolean }>(`/api/doc/${doc.docId}/hot/status`)
+        .then((st) => {
+          if (endedRef.current) return
+          endedRef.current = true
+          notify(
+            st.hot
+              ? 'could not join the live session (the owner’s daemon did not accept the connection) — showing the last saved version'
+              : 'the live session ended before we could join — showing the last saved version',
+          )
+          onEnded()
+        })
+        .catch((e) => {
+          if (endedRef.current) return
+          endedRef.current = true
+          notify(`could not join the live session: ${errText(e)}`)
+          onEnded()
+        })
+    }, JOIN_GRACE_MS)
     return () => {
+      clearTimeout(joinTimer)
+      provider.off('status', onStatusOnce)
       provider.off('status', onStatus)
       provider.off('connection-close', onClose)
       provider.awareness.off('change', onAwareness)
@@ -126,17 +182,30 @@ export default function HotEditor({
   const editor = useEditor(
     {
       extensions: [
-        ...extensions.filter((e) => e.name !== 'undoRedo'), // Yjs owns history
+        // Yjs owns history in collab mode: StarterKit's nested undo/redo is
+        // switched off at configure time (a name filter never matched it)
+        ...makeExtensions({ history: false }),
         Collaboration.configure({ document: ydoc, field: 'default' }),
         CollaborationCaret.configure({
           provider,
           user: { name: me, color: colorFor(me) },
         }),
       ],
+      editable: !readOnly,
       // content comes exclusively from the Yjs doc
     },
+    // readOnly is deliberately NOT a dep: rebuilding the editor would re-bind
+    // the Yjs binding and drop the caret; setEditable below flips it live
     [doc.docId, me],
   )
+
+  // a mid-session flip of can_write (owner toggled "watch only") must take
+  // effect at once, without a remount
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return
+    if (editor.isEditable === !readOnly) return
+    editor.setEditable(!readOnly)
+  }, [editor, readOnly])
 
   // ending is one call: the daemon renders the Yjs doc to markdown, diffs
   // it against the blocks (mddiff), lands one commit at the frozen epoch,
@@ -160,17 +229,30 @@ export default function HotEditor({
 
   return (
     <>
-      <div className="hot-banner">
+      <div className={`hot-banner ${readOnly ? 'readonly' : ''}`}>
         <span className="hot-dot" />
-        live
+        {readOnly ? '👁 watching live · read-only' : 'live'}
         {peerNames.length > 0
           ? ` with ${peerNames.join(', ')}`
-          : ' — waiting for others'}
+          : readOnly
+            ? ''
+            : ' — waiting for others'}
         {' · '}
         {connected ? 'synced' : 'connecting…'}
-        <button className="hot-end" disabled={ending} onClick={endSession}>
-          {ending ? 'saving…' : 'end session'}
-        </button>
+        {typeof viewersWrite === 'boolean' && onToggleViewersWrite && (
+          <button
+            className={`chip viewers-write ${viewersWrite ? 'on' : ''}`}
+            title={viewersWriteChip(viewersWrite).title}
+            onClick={() => onToggleViewersWrite(!viewersWrite)}
+          >
+            {viewersWriteChip(viewersWrite).label}
+          </button>
+        )}
+        {!readOnly && canEnd && (
+          <button className="hot-end" disabled={ending} onClick={endSession}>
+            {ending ? 'saving…' : 'end session'}
+          </button>
+        )}
       </div>
       <EditorContent editor={editor} />
     </>

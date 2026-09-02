@@ -4,8 +4,53 @@
 
 import { useEffect, useState } from 'react'
 import QRCode from 'qrcode'
-import { api, Doc, DocFederation, Share } from './types'
-import { notify } from './Notice'
+import { api, Doc, DocFederation, Share, ShareTrust } from './types'
+import { errText, notify } from './Notice'
+import { TRUST_TIERS, trustHint } from './trust'
+
+/** Three-state trust control for an active propose share. */
+export function TrustControl({
+  shareId,
+  trust,
+  onChanged,
+}: {
+  shareId: string
+  trust: ShareTrust | string | null | undefined
+  onChanged: () => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const set = (next: ShareTrust) => {
+    if (busy || next === trust) return
+    setBusy(true)
+    api('/admin/shares/trust', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: shareId, trust: next }),
+    })
+      .then(onChanged, (e) => notify(errText(e)))
+      .finally(() => setBusy(false))
+  }
+  return (
+    <div className="trust-control">
+      <div className="trust-seg" role="radiogroup" aria-label="trust">
+        {TRUST_TIERS.map((t) => (
+          <button
+            key={t.value}
+            role="radio"
+            aria-checked={trust === t.value}
+            className={`trust-opt ${t.value} ${trust === t.value ? 'on' : ''}`}
+            disabled={busy}
+            title={t.hint}
+            onClick={() => set(t.value)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <div className="meta trust-hint">{trustHint(trust)}</div>
+    </div>
+  )
+}
 
 export default function SharePanel({
   doc,
@@ -83,46 +128,29 @@ export default function SharePanel({
         <div className="share-list">
           <div className="meta">this subtree is shared with</div>
           {rootedHere.map((s) => (
-            <div key={s.id} className="share-row">
-              <span>{s.petname ?? 'invite pending'}</span>
-              <span className="meta">
-                {s.permission} · {s.state}
-              </span>
+            <div key={s.id} className="share-row-block">
+              <div className="share-row">
+                <span>{s.petname ?? 'invite pending'}</span>
+                <span className="meta">
+                  {s.permission} · {s.state}
+                </span>
+                {s.state !== 'revoked' && (
+                  <button
+                    className="decline"
+                    onClick={() =>
+                      api('/admin/shares/revoke', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ id: s.id }),
+                      }).then(onChanged, (e) => notify(errText(e)))
+                    }
+                  >
+                    revoke
+                  </button>
+                )}
+              </div>
               {s.state === 'active' && s.permission === 'propose' && (
-                <button
-                  className={`chip ${s.trust === 'yellow' ? 'trusted' : ''}`}
-                  title={
-                    s.trust === 'yellow'
-                      ? 'trusted: their edits apply immediately, flagged for review'
-                      : 'their edits wait in your review queue'
-                  }
-                  onClick={() =>
-                    api('/admin/shares/trust', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        id: s.id,
-                        trust: s.trust === 'yellow' ? 'review' : 'yellow',
-                      }),
-                    }).then(onChanged, (e) => notify(String(e)))
-                  }
-                >
-                  {s.trust === 'yellow' ? '★ trusted' : 'trust'}
-                </button>
-              )}
-              {s.state !== 'revoked' && (
-                <button
-                  className="decline"
-                  onClick={() =>
-                    api('/admin/shares/revoke', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ id: s.id }),
-                    }).then(onChanged, (e) => notify(String(e)))
-                  }
-                >
-                  revoke
-                </button>
+                <TrustControl shareId={s.id} trust={s.trust} onChanged={onChanged} />
               )}
             </div>
           ))}

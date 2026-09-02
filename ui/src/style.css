@@ -980,7 +980,114 @@ kbd {
   word-break: break-word;
 }
 .notice-ok { border-color: var(--green); }
+.notice-action { text-decoration: underline dotted; text-underline-offset: 3px; }
+.notice-action:hover { background: var(--panel); }
 .chip.trusted { color: var(--yellow); border-color: var(--yellow); }
+
+/* ---------- trust tiers: review / trusted / maintainer ---------- */
+.share-row-block { border-bottom: 1px solid var(--border); padding: 6px 0; }
+.share-row-block:last-child { border-bottom: none; }
+.trust-control { margin-top: 6px; }
+.trust-seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.trust-opt {
+  background: none;
+  border: none;
+  border-right: 1px solid var(--border);
+  color: var(--fg-dim);
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+.trust-opt:last-child { border-right: none; }
+.trust-opt:hover { color: var(--fg); background: var(--panel2); }
+.trust-opt.on.review { color: var(--fg); background: var(--panel2); }
+.trust-opt.on.yellow { color: #101014; background: var(--yellow); }
+.trust-opt.on.green { color: #101014; background: var(--green); }
+.trust-hint { margin-top: 3px; }
+.card .trust-control { margin-top: 8px; }
+
+/* ---------- activity feed (maintainer edits) ---------- */
+.activity-blurb { margin: -6px 0 10px; }
+.activity-list { padding: 6px 14px; }
+.activity-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.activity-row:last-child { border-bottom: none; }
+.activity-verb { color: var(--fg-dim); font-size: 12px; }
+.activity-when { margin-left: auto; white-space: nowrap; }
+
+/* ---------- in-editor review: block marks + rail ---------- */
+.ProseMirror .review-yellow,
+.ProseMirror .review-red,
+.ProseMirror .review-red-delete {
+  border-left: 3px solid;
+  padding-left: 10px;
+  margin-left: -13px;
+  border-radius: 0 4px 4px 0;
+}
+.ProseMirror .review-yellow {
+  border-left-color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 9%, transparent);
+}
+.ProseMirror .review-red {
+  border-left-color: var(--red);
+  background: color-mix(in srgb, var(--red) 9%, transparent);
+}
+.ProseMirror .review-red-delete {
+  border-left-color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--red) 70%, transparent);
+  opacity: 0.75;
+}
+.chip.review-chip { color: var(--yellow); border-color: var(--yellow); }
+.chip.review-chip.on { background: color-mix(in srgb, var(--yellow) 15%, transparent); }
+.chip.review-chip:disabled { opacity: 0.55; cursor: default; }
+.review-hot-note { color: var(--yellow); margin-bottom: 10px; }
+
+.review-rail .rail-bulk { display: flex; gap: 6px; margin-bottom: 12px; }
+.rail-card {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  background: var(--panel2);
+}
+.rail-card.linked { cursor: pointer; }
+.rail-card.linked:hover { border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+.rail-card.yellow { border-left-color: var(--yellow); }
+.rail-card.red { border-left-color: var(--red); }
+.rail-head { display: flex; align-items: baseline; gap: 8px; }
+.rail-head .card-meta { margin-left: auto; }
+.rail-headline { font-size: 12px; color: var(--fg); margin: 4px 0 6px; }
+.rail-col { margin-top: 4px; }
+.rail-col pre {
+  margin: 2px 0 0;
+  font: 11px/1.5 ui-monospace, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #b8b8c4;
+  max-height: 160px;
+  overflow: auto;
+}
+.rail-card .actions { display: flex; gap: 6px; margin-top: 8px; }
+.card.clickable { cursor: pointer; }
+.card.clickable:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+.open-in-doc { margin-left: auto; }
+.hot-banner.readonly { border-color: var(--accent); }
+.hot-banner.readonly .hot-dot { background: var(--accent); }
 
 /* ---------- hot sessions (#65) ---------- */
 .hot-banner {
@@ -1001,6 +1108,9 @@ kbd {
   animation: hotpulse 1.6s ease-in-out infinite;
 }
 @keyframes hotpulse { 0%,100% { opacity: 1 } 50% { opacity: 0.35 } }
+/* owner's "session = consent" toggle: everyone can edit ⇄ watch only */
+.hot-banner .chip.viewers-write { margin-left: auto; font-size: 11px; padding: 1px 8px; }
+.hot-banner .chip.viewers-write + .hot-end { margin-left: 0; }
 .hot-end {
   margin-left: auto;
   background: none;

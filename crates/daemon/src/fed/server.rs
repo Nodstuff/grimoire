@@ -9,6 +9,8 @@
 //! Refusals carry a typed `RefusalCode` beside the human reason — the
 //! grantee's loops branch on the code, never on the text.
 
+use super::client::pull_share;
+use super::runtime::Runtime;
 use super::wire::{
     ALPN, Frame, HOT_ALPN, MAX_FRAME, PROTOCOL_VERSION, Refusal, RefusalCode, Request, Response,
     WireDoc, WireDocMeta, hash_secret,
@@ -35,13 +37,20 @@ pub async fn bind(secret: [u8; 32]) -> Result<Endpoint> {
 type Dedupe = Arc<Mutex<std::collections::HashMap<String, Response>>>;
 
 /// Accept loop. Spawned once per daemon; lives until the endpoint closes.
-pub async fn serve(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot: HotState) {
+pub async fn serve(
+    endpoint: Endpoint,
+    store: Arc<Mutex<SqliteStore>>,
+    hot: HotState,
+    runtime: Runtime,
+) {
     tracing::info!("federation endpoint listening (node id {})", endpoint.id());
     let dedupe: Dedupe = Default::default();
     while let Some(incoming) = endpoint.accept().await {
         let store = store.clone();
         let dedupe = dedupe.clone();
         let hot = hot.clone();
+        let runtime = runtime.clone();
+        let ep = endpoint.clone();
         tokio::spawn(async move {
             let conn = match incoming.accept() {
                 Ok(accepting) => match accepting.await {
@@ -63,7 +72,7 @@ pub async fn serve(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot: HotS
                 }
                 return;
             }
-            if let Err(e) = handle_conn(conn, &peer, store, dedupe, hot).await {
+            if let Err(e) = handle_conn(conn, &peer, store, dedupe, hot, ep, runtime).await {
                 tracing::debug!(peer, "federation connection ended: {e:#}");
             }
         });
@@ -76,6 +85,8 @@ async fn handle_conn(
     store: Arc<Mutex<SqliteStore>>,
     dedupe: Dedupe,
     hot: HotState,
+    endpoint: Endpoint,
+    runtime: Runtime,
 ) -> Result<()> {
     // authed = peer is a non-revoked contact. Checked once per request, not
     // once per connection: a successful redeem upgrades the session, and a
@@ -96,7 +107,7 @@ async fn handle_conn(
                     frame.v, PROTOCOL_VERSION
                 ),
             ),
-            Ok(frame) => dispatch(frame.msg, peer, &store, &dedupe, &hot),
+            Ok(frame) => dispatch(frame.msg, peer, &store, &dedupe, &hot, &endpoint, &runtime),
         };
         let out = serde_json::to_vec(&Frame {
             v: PROTOCOL_VERSION,
@@ -129,6 +140,8 @@ fn dispatch(
     store_arc: &Arc<Mutex<SqliteStore>>,
     dedupe: &Dedupe,
     hot: &HotState,
+    endpoint: &Endpoint,
+    runtime: &Runtime,
 ) -> Response {
     let mut store = store_arc.lock().unwrap_or_else(|p| p.into_inner());
     let contact = match store.contact_by_pubkey(peer) {
@@ -228,10 +241,17 @@ fn dispatch(
         Request::HotStatus { share, doc } => match authorize_hot(&store, &contact, &share, &doc, false) {
             Ok(doc_id) => {
                 let (is_hot, frozen_epoch) = hot.status(doc_id);
+                // session = consent: propose always writes; a view grantee
+                // writes too while the owner leaves the session open to all
+                let has_propose = authorize_share(&store, &contact, &share)
+                    .map(|s| s.permission == grimoire_store::SharePermission::Propose)
+                    .unwrap_or(false);
+                let can_write = has_propose || hot.viewers_write(doc_id).unwrap_or(false);
                 Response::HotStatusIs {
                     hot: is_hot,
                     frozen_epoch,
                     editors: hot.editors(doc_id),
+                    can_write: Some(can_write),
                 }
             }
             Err(e) => refuse(e),
@@ -264,6 +284,7 @@ fn dispatch(
                         hot: hot.is_hot(doc_id),
                         frozen_epoch: None,
                         editors,
+                        can_write: Some(true), // EditPing already required propose
                     }
                 }
                 Err(e) => refuse(e),
@@ -294,6 +315,40 @@ fn dispatch(
                 refuse(e)
             }
         },
+        Request::Notify {
+            share,
+            doc,
+            title,
+            kind,
+        } => {
+            // grantee side: accept a nudge only for a share we hold FROM this
+            // contact — anyone else is told nothing useful
+            let (Ok(share_uuid), Ok(doc_uuid)) =
+                (share.parse::<uuid::Uuid>(), doc.parse::<uuid::Uuid>())
+            else {
+                return Response::refused(RefusalCode::BadRequest, "bad ids");
+            };
+            let holds = store
+                .list_mirrors()
+                .map(|ms| ms.iter().any(|m| m.share_id == share_uuid && m.owner == contact.id))
+                .unwrap_or(false);
+            if !holds {
+                return Response::refused(RefusalCode::NotInShare, "no mirror of that share from you");
+            }
+            runtime.push_event(kind.as_str(), doc_uuid, title, contact.petname.clone());
+            // pull that share NOW — off this thread (dispatch holds the store lock)
+            let ep = endpoint.clone();
+            let st = store_arc.clone();
+            let owner = contact.clone();
+            tokio::spawn(async move {
+                let Ok(id) = owner.pubkey.parse::<iroh::EndpointId>() else { return };
+                match pull_share(&ep, &st, iroh::EndpointAddr::from(id), &owner, share_uuid).await {
+                    Ok(s) => tracing::debug!(%share_uuid, changed = s.changed, "nudged pull"),
+                    Err(e) => tracing::debug!(%share_uuid, "nudged pull failed: {e:#}"),
+                }
+            });
+            Response::Noted
+        }
         Request::ProposalStatus { op_ids } => {
             let ids: Vec<uuid::Uuid> = op_ids.iter().filter_map(|s| s.parse().ok()).collect();
             match store.op_statuses(&ids) {
@@ -342,7 +397,7 @@ fn authorize_share(
 /// The docs a share exposes: its subtree MINUS any mirror (content shared TO
 /// this instance is never served onward — belt and braces with the API-level
 /// move refusal and the create-time re-share guard).
-fn served_docs(store: &SqliteStore, share_id: uuid::Uuid) -> Result<Vec<grimoire_store::Doc>> {
+pub(super) fn served_docs(store: &SqliteStore, share_id: uuid::Uuid) -> Result<Vec<grimoire_store::Doc>> {
     let mirrors: std::collections::HashSet<uuid::Uuid> = store
         .list_mirrors()?
         .into_iter()
@@ -467,9 +522,30 @@ fn handle_propose(
         return Err(Refusal::new(RefusalCode::DocHot, m).into());
     }
     let note = format!("via share from {}: {note}", contact.petname);
-    // trust tier (#62): a trusted share's edits apply immediately as flagged
-    // yellows (revertible via pre-image); reds (overlaps, gone targets) still
-    // park through the same scoring. Untrusted (default): everything parks.
+    // trust tiers (#62 + maintainer):
+    // - green (maintainer): the gate's normal scoring — clean ops land GREEN
+    //   with no review annotation; conflicts still yellow/red. Ledgered with
+    //   pre-images and surfaced in the owner's activity feed.
+    // - yellow (trusted): edits apply immediately as flagged yellows.
+    // - review (default): everything parks red.
+    if share.trust == grimoire_store::ShareTrust::Green
+        && let Some(base) = base_epoch
+    {
+        let outcome = store.propose(doc_uuid, base, contact.principal, ops)?;
+        tracing::info!(
+            peer = contact.pubkey,
+            doc = doc_id,
+            ops = outcome.verdicts.len(),
+            "maintainer remote edit applied through the gate"
+        );
+        return Ok(Response::Proposed {
+            op_ids: outcome
+                .verdicts
+                .into_iter()
+                .map(|v| v.op_id.to_string())
+                .collect(),
+        });
+    }
     if share.trust == grimoire_store::ShareTrust::Yellow
         && let Some(base) = base_epoch
     {
@@ -571,26 +647,36 @@ fn handle_pull(
 /// an active propose share on this doc.
 const BRIDGE_REAUTH: std::time::Duration = std::time::Duration::from_secs(10);
 
-fn bridge_authorized(
+/// Authorize a bridge participant. Returns the doc and whether the peer holds
+/// only a `view` share. Session = consent: a view participant may still write
+/// while the session's `viewers_write` is on (the owner opened the doc up);
+/// when the owner flips to "watch only", their frames are filtered to
+/// presence + sync requests. `propose` participates fully regardless.
+pub(super) fn bridge_authorized(
     store: &Arc<Mutex<SqliteStore>>,
     peer: &str,
     share: &str,
     doc: &str,
-) -> Result<uuid::Uuid> {
+) -> Result<(uuid::Uuid, bool)> {
     let s = store.lock().unwrap_or_else(|p| p.into_inner());
     let contact = s
         .contact_by_pubkey(peer)?
         .filter(|c| !c.revoked)
         .ok_or_else(|| Refusal::new(RefusalCode::UnknownPeer, "unknown peer"))?;
-    // joining a live session is editing: propose required
-    authorize_hot(&s, &contact, share, doc, true)
+    let sh = authorize_share(&s, &contact, share)?;
+    let doc_id = authorize_hot(&s, &contact, share, doc, false)?;
+    let read_only = sh.permission != grimoire_store::SharePermission::Propose;
+    Ok((doc_id, read_only))
 }
 
 /// Owner side of the hot bridge (#66): one bi-stream per remote participant.
 /// Header frame (JSON {share, doc}) authorizes; then raw y-sync frames flow
 /// both ways, length-prefixed (4-byte LE), through the SAME session paths as
 /// local websockets. Authorization is re-checked every `BRIDGE_REAUTH` so a
-/// revoke ends the stream instead of living on until it closes.
+/// revoke ends the stream instead of living on until it closes. A `view`
+/// participant is read-only: inbound frames are filtered to presence and
+/// sync requests only (`hot::readonly_filter`), so they can never inject
+/// content.
 async fn handle_hot_bridge(
     conn: iroh::endpoint::Connection,
     peer: &str,
@@ -605,12 +691,12 @@ async fn handle_hot_bridge(
         doc: String,
     }
     let header: Header = serde_json::from_slice(&header).context("bad bridge header")?;
-    let doc_id = bridge_authorized(&store, peer, &header.share, &header.doc)?;
+    let (doc_id, view_share) = bridge_authorized(&store, peer, &header.share, &header.doc)?;
     let Some((mut rx, hello)) = hot.connect(doc_id) else {
         anyhow::bail!("doc is not hot");
     };
     write_frame(&mut send, &hello).await?;
-    tracing::info!(peer, %doc_id, "hot bridge joined");
+    tracing::info!(peer, %doc_id, view_share, "hot bridge joined");
 
     let fan_out = tokio::spawn(async move {
         while let Ok(frame) = rx.recv().await {
@@ -639,6 +725,19 @@ async fn handle_hot_bridge(
                     }
                     last_auth = std::time::Instant::now();
                 }
+                // a view participant writes only while the owner leaves the
+                // session open to everyone; under "watch only" their frames
+                // are cut to presence + sync requests (evaluated per frame so
+                // an owner's flip takes effect immediately)
+                let read_only = view_share && !hot.viewers_write(doc_id).unwrap_or(false);
+                let frame = if read_only {
+                    match crate::hot::readonly_filter(&frame) {
+                        Some(f) => f,
+                        None => continue, // nothing allowed in this frame
+                    }
+                } else {
+                    frame
+                };
                 if !hot.handle_frame(doc_id, &frame) {
                     break Ok(());
                 }
