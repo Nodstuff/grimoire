@@ -33,7 +33,7 @@ if [[ ! -f "$UPDATER_KEY" ]]; then
   echo "✗ updater signing key missing at $UPDATER_KEY (see comment above)"
   exit 1
 fi
-export TAURI_SIGNING_PRIVATE_KEY_PATH="$UPDATER_KEY"
+export TAURI_SIGNING_PRIVATE_KEY="$(cat "$UPDATER_KEY")"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
 VERSION=$(python3 -c 'import json;print(json.load(open("crates/shell/tauri.conf.json"))["version"])')
 
@@ -67,6 +67,10 @@ spctl -a -vv -t install "$DMG" 2>&1 | head -3 || true
 # newest release's file is the live one.
 TARBALL=$(ls -t target/release/bundle/macos/*.app.tar.gz | head -1)
 SIG="$TARBALL.sig"
+if [[ ! -f "$SIG" ]]; then
+  echo "→ bundler did not sign the updater artifact; signing explicitly"
+  ui/node_modules/.bin/tauri signer sign -f "$UPDATER_KEY" -p "" "$TARBALL" > /dev/null
+fi
 [[ -f "$SIG" ]] || { echo "✗ no updater signature next to $TARBALL"; exit 1 }
 FEED=target/release/bundle/latest.json
 python3 - "$VERSION" "$SIG" "$FEED" "$TARBALL" <<'PY'
