@@ -192,8 +192,9 @@ CREATE TABLE IF NOT EXISTS shares (
     -- overrides the doc's review policy for proposals arriving via this share
     policy_override TEXT CHECK (policy_override IN ('human-review', 'agent-review', 'auto')),
     -- trust tier (#62): review = remote proposals park red (default);
-    -- yellow = they apply immediately as flagged yellows (reds still park)
-    trust      TEXT NOT NULL DEFAULT 'review' CHECK (trust IN ('review', 'yellow')),
+    -- yellow = they apply immediately as flagged yellows (reds still park);
+    -- green = maintainer: clean edits land green, no review, owner notified
+    trust      TEXT NOT NULL DEFAULT 'review' CHECK (trust IN ('review', 'yellow', 'green')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 

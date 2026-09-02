@@ -96,6 +96,23 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
                 [],
             )?;
         }
+        // Fresh installs from before the maintainer tier created `shares` with
+        // a CHECK that only allows review|yellow; SQLite can't widen a CHECK in
+        // place, so rebuild the table once when we see the old constraint.
+        // (DBs that got `trust` via ALTER have no CHECK and need nothing.)
+        let shares_sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'shares'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(sql) = shares_sql
+            && sql.contains("trust IN ('review', 'yellow'))")
+            && !sql.contains("'green'")
+        {
+            widen_shares_trust_check(conn)?;
+        }
     }
     let has_mirrors: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'mirrors'",
@@ -143,6 +160,50 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
                 [],
             )?;
         }
+    }
+    Ok(())
+}
+
+/// The SQLite "rebuild a table to change a constraint" dance for `shares`:
+/// copy into a table with the widened trust CHECK, swap, recreate the index.
+/// Foreign keys are switched off for the swap (share_invites references
+/// shares by id; the ids are preserved, so integrity holds afterwards).
+fn widen_shares_trust_check(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = (|| -> Result<()> {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE shares_new (
+                 id         TEXT PRIMARY KEY,
+                 root_doc   TEXT NOT NULL REFERENCES docs (id),
+                 contact    TEXT REFERENCES contacts (id),
+                 permission TEXT NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'propose')),
+                 state      TEXT NOT NULL DEFAULT 'offered' CHECK (state IN ('offered', 'active', 'revoked')),
+                 policy_override TEXT CHECK (policy_override IN ('human-review', 'agent-review', 'auto')),
+                 trust      TEXT NOT NULL DEFAULT 'review' CHECK (trust IN ('review', 'yellow', 'green')),
+                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             );
+             INSERT INTO shares_new (id, root_doc, contact, permission, state, policy_override, trust, created_at)
+                 SELECT id, root_doc, contact, permission, state, policy_override, trust, created_at FROM shares;
+             DROP TABLE shares;
+             ALTER TABLE shares_new RENAME TO shares;
+             CREATE INDEX IF NOT EXISTS shares_by_contact ON shares (contact);
+             COMMIT;",
+        )?;
+        Ok(())
+    })();
+    conn.pragma_update(None, "foreign_keys", true)?;
+    result?;
+    // belt and braces: nothing dangling after the swap
+    let violations: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check('share_invites')",
+        [],
+        |r| r.get(0),
+    )?;
+    if violations > 0 {
+        return Err(StoreError::InvalidOp(format!(
+            "shares rebuild left {violations} dangling share_invites rows"
+        )));
     }
     Ok(())
 }
@@ -1822,6 +1883,46 @@ impl BlockStore for SqliteStore {
         Ok(())
     }
 
+    fn recent_remote_ops(&self, limit: usize) -> Result<Vec<ActivityItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT o.id, o.doc_id, d.title, o.principal, p.display_name, o.op_type,
+                    o.epoch_applied, o.created_at
+             FROM ops o
+             JOIN docs d ON d.id = o.doc_id
+             JOIN principals p ON p.id = o.principal
+             WHERE p.kind = 'remote' AND o.epoch_applied IS NOT NULL
+             ORDER BY o.created_at DESC, o.id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (op_id, doc_id, doc_title, principal, principal_name, op_type, epoch, created_at) =
+                r?;
+            Ok(ActivityItem {
+                op_id: uuid_col(op_id, "ops.id")?,
+                doc_id: uuid_col(doc_id, "ops.doc_id")?,
+                doc_title,
+                principal: uuid_col(principal, "ops.principal")?,
+                principal_name,
+                op_type,
+                epoch,
+                created_at,
+            })
+        })
+        .collect()
+    }
+
     fn create_invite(
         &mut self,
         share_id: Uuid,
@@ -2927,6 +3028,62 @@ impl SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fresh installs from before the maintainer tier created `shares` with a
+    /// CHECK allowing only review|yellow; opening such a DB must widen it so
+    /// `green` is accepted, without losing rows or the share_invites FK.
+    #[test]
+    fn opening_a_db_with_the_old_trust_check_widens_it_for_green() {
+        use crate::{PrincipalKind, SharePermission, ShareTrust};
+        use rusqlite::params;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let doc = s.create_doc("D", None, tom.id).unwrap();
+        // recreate `shares` exactly as the OLD schema did (strict CHECK)
+        s.conn.pragma_update(None, "foreign_keys", false).unwrap();
+        s.conn
+            .execute_batch(
+                "DROP TABLE shares;
+                 CREATE TABLE shares (
+                     id TEXT PRIMARY KEY,
+                     root_doc TEXT NOT NULL REFERENCES docs (id),
+                     contact TEXT REFERENCES contacts (id),
+                     permission TEXT NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'propose')),
+                     state TEXT NOT NULL DEFAULT 'offered' CHECK (state IN ('offered', 'active', 'revoked')),
+                     policy_override TEXT CHECK (policy_override IN ('human-review', 'agent-review', 'auto')),
+                     trust TEXT NOT NULL DEFAULT 'review' CHECK (trust IN ('review', 'yellow')),
+                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                 );",
+            )
+            .unwrap();
+        s.conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let share = s.create_share(doc.id, None, SharePermission::Propose, None).unwrap();
+        s.create_invite(share.id, "hash", "2099-01-01T00:00:00.000Z").unwrap();
+        // the old CHECK refuses green
+        assert!(s.set_share_trust(share.id, ShareTrust::Green).is_err());
+        // the migration open() runs widens it
+        migrate_pre_schema(&s.conn).unwrap();
+        s.set_share_trust(share.id, ShareTrust::Green).unwrap();
+        assert_eq!(s.get_share(share.id).unwrap().trust, ShareTrust::Green);
+        // row + invite FK survived the rebuild; idempotent on a second run
+        assert_eq!(s.list_shares().unwrap().len(), 1);
+        let n: i64 = s
+            .conn
+            .query_row(
+                "SELECT count(*) FROM share_invites WHERE share_id = ?1",
+                params![share.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        let fk: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 0);
+        migrate_pre_schema(&s.conn).unwrap();
+        assert_eq!(s.list_shares().unwrap().len(), 1);
+    }
 
     /// v4 backfill: a row whose stored type disagrees with its content is
     /// retyped on migration; comments are never touched.

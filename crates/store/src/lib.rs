@@ -279,6 +279,11 @@ pub trait BlockStore {
     /// Trust tier (#62). Human surface only — never MCP, never the remote side.
     fn set_share_trust(&mut self, id: Uuid, trust: ShareTrust) -> Result<()>;
 
+    /// The owner's activity feed: the most recent content edits APPLIED by
+    /// remote principals (maintainer-tier shares land green with no review
+    /// annotation, so this is how the owner hears about them). Newest first.
+    fn recent_remote_ops(&self, limit: usize) -> Result<Vec<ActivityItem>>;
+
     /// Record a minted invite. Only the secret's hash is stored; the secret
     /// itself lives in the `grimoire://` link and is never persisted.
     fn create_invite(

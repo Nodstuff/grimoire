@@ -50,6 +50,10 @@ pub struct HotSession {
     /// Set while a flatten is in flight: refuses new frames/joins. Cleared
     /// again if the flatten fails, so the session is never stranded.
     pub ending: bool,
+    /// Session = consent: while live, `view` grantees may write too (the
+    /// owner opened the doc up). The owner can flip this off for a
+    /// "watch only" presentation; `propose` grantees always write.
+    pub viewers_write: bool,
     _doc_sub: yrs::Subscription,
 }
 
@@ -109,6 +113,24 @@ impl HotState {
             Err("doc is in a live session — edits go through the session; retry after it ends (P2.3)".into())
         } else {
             Ok(())
+        }
+    }
+
+    /// May `view` grantees write in this live session? None when not hot.
+    pub fn viewers_write(&self, doc: Uuid) -> Option<bool> {
+        let s = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        s.get(&doc).filter(|h| !h.ending).map(|h| h.viewers_write)
+    }
+
+    /// Owner toggle: "everyone can edit" ↔ "watch only". Err when not hot.
+    pub fn set_viewers_write(&self, doc: Uuid, enabled: bool) -> Result<bool, String> {
+        let mut s = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        match s.get_mut(&doc).filter(|h| !h.ending) {
+            Some(h) => {
+                h.viewers_write = enabled;
+                Ok(enabled)
+            }
+            None => Err("doc is not in a live session".into()),
         }
     }
 
@@ -207,6 +229,7 @@ impl HotState {
                 started_at: std::time::Instant::now(),
                 last_activity: std::time::Instant::now(),
                 ending: false,
+                viewers_write: true,
                 _doc_sub: sub,
             },
         );
@@ -524,8 +547,12 @@ async fn hot_status(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json
             return Json(json!({"hot": false, "editors": 0}));
         };
         return match crate::fed::hot_status_upstream(ep, &ctx.store, doc_id).await {
-            Ok((hot, frozen_epoch, editors)) => {
-                Json(json!({"hot": hot, "frozen_epoch": frozen_epoch, "editors": editors}))
+            Ok((hot, frozen_epoch, editors, can_write)) => {
+                let mut v = json!({"hot": hot, "frozen_epoch": frozen_epoch, "editors": editors});
+                if let Some(w) = can_write {
+                    v["can_write"] = json!(w);
+                }
+                Json(v)
             }
             // owner offline etc: not joinable, so not hot
             Err(_) => Json(json!({"hot": false, "editors": 0})),
@@ -539,6 +566,8 @@ async fn hot_status(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json
             "frozen_epoch": s.frozen_epoch,
             "participants": s.tx.receiver_count(),
             "editors": editors,
+            "can_write": true, // owned doc: always writable
+            "viewers_write": s.viewers_write,
         })),
         None => Json(json!({"hot": false, "editors": editors})),
     }
@@ -662,6 +691,29 @@ fn journal_updates(journal: &mut std::fs::File, data: &[u8]) {
     }
 }
 
+/// Strip a client frame down to what a READ-ONLY participant may send:
+/// awareness (presence/carets) and SyncStep1 (a state-vector request, so the
+/// server replies with the doc). Anything that would change the doc — Update
+/// and SyncStep2 — is dropped. Returns None when nothing survives.
+pub fn readonly_filter(data: &[u8]) -> Option<Vec<u8>> {
+    use yrs::updates::decoder::DecoderV1;
+    let mut decoder = DecoderV1::new(yrs::encoding::read::Cursor::new(data));
+    let mut reader = yrs::sync::MessageReader::new(&mut decoder);
+    let mut enc = EncoderV1::new();
+    let mut kept = 0usize;
+    while let Some(Ok(msg)) = reader.next() {
+        let allowed = matches!(
+            msg,
+            YMessage::Awareness(_) | YMessage::Sync(SyncMessage::SyncStep1(_))
+        );
+        if allowed {
+            msg.encode(&mut enc);
+            kept += 1;
+        }
+    }
+    (kept > 0).then(|| enc.to_vec())
+}
+
 /// Awareness updates must reach the other participants; doc observers only
 /// cover content updates.
 fn rebroadcast_awareness(tx: &broadcast::Sender<Vec<u8>>, data: &[u8]) {
@@ -677,10 +729,33 @@ fn rebroadcast_awareness(tx: &broadcast::Sender<Vec<u8>>, data: &[u8]) {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ViewersWriteReq {
+    enabled: bool,
+}
+
+/// Owner toggle for a live session on an OWNED doc: let `view` grantees write
+/// ("everyone can edit", the default) or make it "watch only". Mirrors can't
+/// toggle — the owner hosts the session.
+async fn hot_viewers_write(
+    State(ctx): State<HotCtx>,
+    Path(doc_id): Path<Uuid>,
+    Json(req): Json<ViewersWriteReq>,
+) -> Json<Value> {
+    if mirror_of(&ctx, doc_id) {
+        return Json(json!({"error": "only the owner can change who may edit a live session"}));
+    }
+    match ctx.hot.set_viewers_write(doc_id, req.enabled) {
+        Ok(v) => Json(json!({"ok": true, "viewers_write": v})),
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
 pub fn router(ctx: HotCtx) -> Router {
     Router::new()
         .route("/api/doc/{id}/hot/start", post(hot_start))
         .route("/api/doc/{id}/hot/end", post(hot_end))
+        .route("/api/doc/{id}/hot/viewers_write", post(hot_viewers_write))
         .route("/api/doc/{id}/hot/status", get(hot_status))
         .route("/api/doc/{id}/editing", post(editing_ping))
         .route("/ws/hot/{id}", any(ws_hot))
@@ -985,6 +1060,100 @@ mod tests {
         assert_eq!(kd["nodes"][1]["label"], "gate");
         assert_eq!(kd["edges"][0]["from"], "a");
         assert_eq!(tree.roots[0].block.id, canvas_block); // same block, replaced
+    }
+
+    /// Decode a y-sync frame into its message variants (for asserting what a
+    /// filter kept).
+    fn frame_kinds(data: &[u8]) -> Vec<&'static str> {
+        use yrs::updates::decoder::DecoderV1;
+        let mut decoder = DecoderV1::new(yrs::encoding::read::Cursor::new(data));
+        let mut reader = yrs::sync::MessageReader::new(&mut decoder);
+        let mut out = Vec::new();
+        while let Some(Ok(msg)) = reader.next() {
+            out.push(match msg {
+                YMessage::Awareness(_) => "awareness",
+                YMessage::Sync(SyncMessage::SyncStep1(_)) => "step1",
+                YMessage::Sync(SyncMessage::SyncStep2(_)) => "step2",
+                YMessage::Sync(SyncMessage::Update(_)) => "update",
+                _ => "other",
+            });
+        }
+        out
+    }
+
+    fn awareness_msg() -> YMessage {
+        let mut a = Awareness::new(Doc::new());
+        a.set_local_state(serde_json::json!({"user": {"name": "viewer"}}).to_string()).unwrap();
+        YMessage::Awareness(a.update().unwrap())
+    }
+
+    #[test]
+    fn readonly_filter_drops_content_writes_keeps_presence_and_sync_requests() {
+        // a viewer frame carrying presence + a content Update + a state request
+        let mut enc = EncoderV1::new();
+        awareness_msg().encode(&mut enc);
+        YMessage::Sync(SyncMessage::Update(vec![1, 2, 3])).encode(&mut enc);
+        YMessage::Sync(SyncMessage::SyncStep1(yrs::StateVector::default())).encode(&mut enc);
+        YMessage::Sync(SyncMessage::SyncStep2(vec![4, 5])).encode(&mut enc);
+        let mixed = enc.to_vec();
+        assert_eq!(frame_kinds(&mixed), vec!["awareness", "update", "step1", "step2"]);
+
+        let filtered = readonly_filter(&mixed).expect("presence + step1 survive");
+        assert_eq!(frame_kinds(&filtered), vec!["awareness", "step1"], "writes dropped");
+
+        // a frame that is ONLY content writes yields nothing at all
+        let mut enc = EncoderV1::new();
+        YMessage::Sync(SyncMessage::Update(vec![9])).encode(&mut enc);
+        YMessage::Sync(SyncMessage::SyncStep2(vec![9])).encode(&mut enc);
+        assert!(readonly_filter(&enc.to_vec()).is_none());
+
+        // presence alone passes untouched
+        let mut enc = EncoderV1::new();
+        awareness_msg().encode(&mut enc);
+        assert_eq!(frame_kinds(&readonly_filter(&enc.to_vec()).unwrap()), vec!["awareness"]);
+    }
+
+    #[test]
+    fn readonly_participant_cannot_change_the_session_doc() {
+        use yrs::ReadTxn as _;
+        // end-to-end at the session layer: a viewer's Update, once filtered,
+        // must leave the hot doc's content untouched
+        let hot = scratch_hot();
+        let doc_id = Uuid::now_v7();
+        hot.start(doc_id, 0).unwrap();
+        seed_session(&hot, doc_id, &[("original", None)]);
+        let before = {
+            let s = hot.sessions.lock().unwrap();
+            let sess = s.get(&doc_id).unwrap();
+            let frag = sess.awareness.doc().get_or_insert_xml_fragment("default");
+            crate::yrender::fragment_to_markdown(&sess.awareness.doc().transact(), &frag)
+        };
+        // craft a real Yjs update that would append text, as a client would
+        let attacker = Doc::new();
+        let upd = {
+            let frag = attacker.get_or_insert_xml_fragment("default");
+            let mut txn = attacker.transact_mut();
+            let p = frag.insert(&mut txn, 0, yrs::XmlElementPrelim::empty("paragraph"));
+            let t = p.insert(&mut txn, 0, yrs::XmlTextPrelim::new(""));
+            t.insert(&mut txn, 0, "INJECTED");
+            drop(txn);
+            attacker.transact().encode_state_as_update_v1(&yrs::StateVector::default())
+        };
+        let mut enc = EncoderV1::new();
+        YMessage::Sync(SyncMessage::Update(upd)).encode(&mut enc);
+        let frame = enc.to_vec();
+        // through the read-only filter: nothing to apply
+        assert!(readonly_filter(&frame).is_none());
+        // (sanity: unfiltered, the same frame WOULD change the doc)
+        assert!(hot.handle_frame(doc_id, &frame));
+        let after_unfiltered = {
+            let s = hot.sessions.lock().unwrap();
+            let sess = s.get(&doc_id).unwrap();
+            let frag = sess.awareness.doc().get_or_insert_xml_fragment("default");
+            crate::yrender::fragment_to_markdown(&sess.awareness.doc().transact(), &frag)
+        };
+        assert_ne!(before, after_unfiltered, "unfiltered update changes the doc");
+        assert!(after_unfiltered.contains("INJECTED"));
     }
 
     #[test]

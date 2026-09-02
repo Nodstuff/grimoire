@@ -11,9 +11,18 @@ export interface Notice {
   id: number
   message: string
   kind: NoticeKind
+  /** clicking the notice runs this (then dismisses) — e.g. "click to join" */
+  onClick?: () => void
+}
+
+export interface NotifyOpts {
+  onClick?: () => void
+  /** ok notices with an action linger longer than plain ones */
+  ttlMs?: number
 }
 
 const OK_TTL_MS = 4000
+const OK_ACTION_TTL_MS = 12000
 
 let seq = 0
 let notices: Notice[] = []
@@ -29,11 +38,13 @@ export function errText(e: unknown): string {
   return String(e).replace(/^Error:\s*/, '')
 }
 
-export function notify(message: string, kind: NoticeKind = 'error'): number {
+export function notify(message: string, kind: NoticeKind = 'error', opts: NotifyOpts = {}): number {
   const id = ++seq
-  notices = [...notices, { id, message: message.replace(/^Error:\s*/, ''), kind }]
+  notices = [...notices, { id, message: message.replace(/^Error:\s*/, ''), kind, onClick: opts.onClick }]
   emit()
-  if (kind === 'ok') setTimeout(() => dismiss(id), OK_TTL_MS)
+  if (kind === 'ok') {
+    setTimeout(() => dismiss(id), opts.ttlMs ?? (opts.onClick ? OK_ACTION_TTL_MS : OK_TTL_MS))
+  }
   return id
 }
 
@@ -63,9 +74,12 @@ export function Notices() {
       {list.map((n) => (
         <div
           key={n.id}
-          className={`notice notice-${n.kind}`}
-          onClick={() => dismiss(n.id)}
-          title={n.kind === 'error' ? 'click to dismiss' : undefined}
+          className={`notice notice-${n.kind} ${n.onClick ? 'notice-action' : ''}`}
+          onClick={() => {
+            dismiss(n.id)
+            n.onClick?.()
+          }}
+          title={n.onClick ? 'click to open' : n.kind === 'error' ? 'click to dismiss' : undefined}
         >
           {n.message}
         </div>

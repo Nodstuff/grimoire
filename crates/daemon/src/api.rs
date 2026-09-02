@@ -16,6 +16,36 @@ pub struct ApiState {
     pub human: Uuid,
     /// The freeze: content writes against a live doc are refused (P2.3).
     pub hot: crate::hot::HotState,
+    /// Federation runtime: focus heartbeats (adaptive pull) + owner nudges.
+    pub runtime: crate::fed::Runtime,
+}
+
+/// UI heartbeat: this doc is open. For a mirror, its share joins the fast
+/// (5s) pull tier for the focus window; owned docs are a harmless no-op.
+async fn focus_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
+    let share = {
+        let s = st
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.get_mirror(id).ok().flatten().map(|m| m.share_id)
+    };
+    if let Some(share) = share {
+        st.runtime.focus_share(share);
+    }
+    Json(json!({"ok": true, "focused_share": share}))
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    since: Option<u64>,
+}
+
+/// Nudges received from owners (live_started / doc_added / doc_changed),
+/// cursor-paginated: pass the previous `next`.
+async fn events(State(st): State<ApiState>, Query(q): Query<EventsQuery>) -> Json<Value> {
+    let (next, events) = st.runtime.events_since(q.since.unwrap_or(0));
+    Json(json!({"next": next, "events": events}))
 }
 
 /// Mirror docs are the owner's: no local rename/delete/status/policy — and
@@ -159,41 +189,73 @@ async fn backlinks(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Val
     }
 }
 
+/// Decorate review items for rendering: doc titles, proposer names, and the
+/// live content of the target block (what a red would replace).
+fn decorate_review_items(s: &SqliteStore, q: Vec<grimoire_store::ReviewItem>) -> Vec<Value> {
+    q.into_iter()
+        .map(|item| {
+            let doc_title = s
+                .get_doc(item.annotation.doc_id)
+                .map(|d| d.title)
+                .unwrap_or_default();
+            let proposer = s
+                .get_principal(item.op.principal)
+                .map(|p| p.display_name)
+                .unwrap_or_default();
+            let current = item
+                .op
+                .kind
+                .target_block()
+                .and_then(|t| s.read_block(t).ok())
+                .map(|b| b.content);
+            json!({
+                "item": item,
+                "doc_title": doc_title,
+                "proposer": proposer,
+                "current_content": current,
+            })
+        })
+        .collect()
+}
+
+/// Open review items for ONE doc — the in-editor review rail's data source.
+/// Same item shape as /api/queue.
+async fn doc_review(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.review_queue(Some(id)) {
+        Ok(q) => Json(json!(decorate_review_items(&s, q))),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+struct ActivityQuery {
+    limit: Option<usize>,
+}
+
+/// The owner's notification feed: content edits applied directly by remote
+/// principals (maintainer-tier shares). Newest first.
+async fn activity(State(st): State<ApiState>, Query(q): Query<ActivityQuery>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.recent_remote_ops(q.limit.unwrap_or(20).min(200)) {
+        Ok(items) => Json(json!(items)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 async fn queue(State(st): State<ApiState>) -> Json<Value> {
     let s = st
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.review_queue(None) {
-        Ok(q) => {
-            // decorate with doc titles + principal names for rendering
-            let rows: Vec<Value> = q
-                .into_iter()
-                .map(|item| {
-                    let doc_title = s
-                        .get_doc(item.annotation.doc_id)
-                        .map(|d| d.title)
-                        .unwrap_or_default();
-                    let proposer = s
-                        .get_principal(item.op.principal)
-                        .map(|p| p.display_name)
-                        .unwrap_or_default();
-                    let current = item
-                        .op
-                        .kind
-                        .target_block()
-                        .and_then(|t| s.read_block(t).ok())
-                        .map(|b| b.content);
-                    json!({
-                        "item": item,
-                        "doc_title": doc_title,
-                        "proposer": proposer,
-                        "current_content": current,
-                    })
-                })
-                .collect();
-            Json(json!(rows))
-        }
+        Ok(q) => Json(json!(decorate_review_items(&s, q))),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
@@ -901,6 +963,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/doc/{id}", get(doc))
         .route("/api/doc/{id}/backlinks", get(backlinks))
         .route("/api/queue", get(queue))
+        .route("/api/doc/{id}/review", get(doc_review))
+        .route("/api/activity", get(activity))
+        .route("/api/doc/{id}/focus", post(focus_doc))
+        .route("/api/events", get(events))
         .route("/api/flags", get(flags))
         .route("/api/flags/dismiss", post(dismiss_flag))
         .route("/api/principals", get(principals))

@@ -10,6 +10,7 @@ import CodeBlock from '@tiptap/extension-code-block'
 import { TableKit } from '@tiptap/extension-table'
 import CodeBlockView from './CodeBlockView'
 import { WikilinkDeco } from './WikilinkDeco'
+import { ReviewHighlight, ReviewMap, setReviewMap } from './ReviewHighlight'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block } from '../types'
 import { notify } from '../Notice'
@@ -49,17 +50,31 @@ const BlockId = Extension.create({
   },
 })
 
-export const extensions = [
-  StarterKit.configure({ link: { openOnClick: false }, codeBlock: false }),
-  CodeBlock.extend({
-    addNodeView() {
-      return ReactNodeViewRenderer(CodeBlockView)
-    },
-  }),
-  TableKit.configure({ table: { resizable: false } }),
-  WikilinkDeco,
-  BlockId,
-]
+/** The editor extension set. `history: false` builds the variant for the live
+ * (Yjs) editor: StarterKit bundles undo/redo as a nested extension, so it must
+ * be switched off at configure time — filtering the array by name never
+ * matches it (the top-level name is 'starterKit'). Yjs owns history in
+ * collab mode; two history plugins would fight. Schema is identical either
+ * way (undo/redo adds no nodes or marks). */
+export function makeExtensions({ history }: { history: boolean }) {
+  return [
+    StarterKit.configure({
+      link: { openOnClick: false },
+      codeBlock: false,
+      ...(history ? {} : { undoRedo: false }),
+    }),
+    CodeBlock.extend({
+      addNodeView() {
+        return ReactNodeViewRenderer(CodeBlockView)
+      },
+    }),
+    TableKit.configure({ table: { resizable: false } }),
+    WikilinkDeco,
+    BlockId,
+    ReviewHighlight,
+  ]
+}
+export const extensions = makeExtensions({ history: true })
 export const schema = getSchema(extensions)
 export const parser = makeParser(schema)
 export const serializer = makeSerializer()
@@ -84,12 +99,15 @@ export default function DocEditor({
   onSaved,
   onProposed,
   onSelectionBlock,
+  reviewMap,
 }: {
   doc: EditableDoc
   mode?: EditorMode
   onSaved: (epoch: number) => void
   onProposed?: () => void
   onSelectionBlock?: (blockId: string | null) => void
+  /** blocks under review → tone; painted as node decorations, no remount */
+  reviewMap?: ReviewMap
 }) {
   const selCb = useRef(onSelectionBlock)
   selCb.current = onSelectionBlock
@@ -151,6 +169,12 @@ export default function DocEditor({
     },
     [doc.docId],
   )
+
+  // review marks follow the map from DocView; an empty map clears them
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return
+    setReviewMap(editor, reviewMap ?? {})
+  }, [editor, reviewMap])
 
   // extract entries (grouping consecutive nodes that share a blockId)
   const extractEntries = (): Entry[] => {

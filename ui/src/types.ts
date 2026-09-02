@@ -37,8 +37,24 @@ export interface Share {
   state: 'offered' | 'active' | 'revoked'
   policy_override: string | null
   created_at: string
-  /** review = proposals park (default); yellow = trusted, edits apply flagged */
-  trust: 'review' | 'yellow'
+  /** review = proposals park (default); yellow = trusted, edits apply flagged;
+   * green = maintainer, edits apply directly and the owner is notified */
+  trust: ShareTrust
+}
+
+export type ShareTrust = 'review' | 'yellow' | 'green'
+
+/** One maintainer-tier (green) edit applied directly by a remote principal —
+ * the owner's notification feed (GET /api/activity). */
+export interface ActivityItem {
+  op_id: string
+  doc_id: string
+  doc_title: string
+  principal: string
+  principal_name: string
+  op_type: string
+  epoch: number
+  created_at: string
 }
 
 export interface PendingJoin {
@@ -75,7 +91,7 @@ export interface DocFederation {
     permission: 'view' | 'propose'
     state: string
     petname: string | null
-    trust: 'review' | 'yellow'
+    trust: ShareTrust
   }[]
   outbound: OutboundProposal[]
 }
@@ -103,6 +119,19 @@ export interface DocTree {
   roots: BlockNode[]
 }
 
+/** A block op as the gate stores it. Fields are per-variant and optional so
+ * callers can read them defensively. */
+export type OpKind = Record<string, unknown> & {
+  op: 'insert' | 'replace' | 'delete' | 'move' | string
+  target?: string
+  content?: string
+  block_id?: string
+  parent_id?: string | null
+  order_key?: string
+  new_parent?: string | null
+  new_order_key?: string
+}
+
 export interface QueueRow {
   item: {
     annotation: {
@@ -111,10 +140,11 @@ export interface QueueRow {
       op_id: string
       kind: 'review' | 'parked'
       status: string
+      resolved_by?: string | null
     }
     op: {
       id: string
-      kind: Record<string, unknown> & { op: string }
+      kind: OpKind
       principal: string
       base_epoch: number
       epoch_applied: number | null

@@ -21,8 +21,11 @@
 
 pub mod client;
 pub mod loops;
+pub mod runtime;
 pub mod server;
 pub mod wire;
+
+pub use runtime::Runtime;
 
 // The facade the rest of the daemon calls as `fed::…`. `request`, `join_at`,
 // `pull_share`, and the wire types are used within the fed modules and their
@@ -31,7 +34,7 @@ pub use client::{
     comment_upstream, edit_ping_upstream, hot_end_upstream, hot_start_upstream, hot_status_upstream,
     join_once, mint_invite, open_hot_bridge, propose_upstream,
 };
-pub use loops::{join_retry_loop, pull_all_once, pull_loop, refresh_outbound};
+pub use loops::{join_retry_loop, notify_loop, pull_all_once, pull_loop, refresh_outbound};
 pub use server::{bind, serve};
 pub use wire::Ticket; // admin parses invite links
 
