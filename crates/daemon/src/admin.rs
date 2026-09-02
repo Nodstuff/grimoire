@@ -417,6 +417,8 @@ async fn list_mirrors(State(st): State<FedState>) -> Json<Value> {
                 "root_title": root.as_ref().map(|d| d.title.clone()).unwrap_or_else(|| "(shared docs)".into()),
                 "doc_count": ms.len(),
                 "synced_epoch_max": ms.iter().map(|m| m.synced_epoch).max().unwrap_or(0),
+                // docs whose owner epoch (from the last meta) is past what we landed
+                "behind": ms.iter().filter(|m| m.owner_epoch > m.synced_epoch).count(),
                 "last_pulled_at": ms.iter().filter_map(|m| m.last_pulled_at.clone()).max(),
                 "last_error": ms.iter().find_map(|m| m.last_error.clone()),
                 "owner_tended": ms.iter().any(|m| m.owner_tended),

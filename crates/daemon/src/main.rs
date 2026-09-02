@@ -590,19 +590,24 @@ async fn main() -> anyhow::Result<()> {
             tokio::spawn(admin::daily_loop(store.clone(), hot.clone()));
             // daily self-contained db snapshot beside the db (backups/), keep 7
             tokio::spawn(backup::backup_loop(store.clone(), cli.db.clone()));
+            let fed_ctx_node_id: Option<String>;
             let app = mcp::router(store.clone(), claude, hot.clone())
                 .merge(hot::router(hot::HotCtx {
                     hot: hot.clone(),
                     store: store.clone(),
                     endpoint: fed_ctx.endpoint.clone(),
                 }))
-                .merge(admin::router(store.clone(), fed_ctx, hot.clone(), admin_token))
+                .merge({
+                    fed_ctx_node_id = fed_ctx.node_id.clone();
+                    admin::router(store.clone(), fed_ctx, hot.clone(), admin_token)
+                })
                 .merge(api::router(api::ApiState {
                     store,
                     human: tom,
                     hot,
                     runtime,
                     db_path: cli.db.clone(),
+                    node_id: fed_ctx_node_id,
                 }));
             // The frontend is EMBEDDED in this binary (rust-embed over ui/dist),
             // so the app is self-contained on any machine. GRIMOIRE_UI_DIST is a

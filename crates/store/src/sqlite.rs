@@ -174,6 +174,7 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
         for (col, ddl) in [
             ("last_pulled_at", "ALTER TABLE mirrors ADD COLUMN last_pulled_at TEXT"),
             ("last_error", "ALTER TABLE mirrors ADD COLUMN last_error TEXT"),
+            ("owner_epoch", "ALTER TABLE mirrors ADD COLUMN owner_epoch INTEGER NOT NULL DEFAULT 0"),
         ] {
             let has: i64 = conn.query_row(
                 "SELECT count(*) FROM pragma_table_info('mirrors') WHERE name = ?1",
@@ -521,7 +522,7 @@ fn finish_share(raw: RawShare) -> Result<Share> {
     })
 }
 
-type RawMirror = (String, String, String, i64, String, bool, Option<String>, Option<String>);
+type RawMirror = (String, String, String, i64, String, bool, Option<String>, Option<String>, i64);
 
 fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
     Ok((
@@ -533,11 +534,12 @@ fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
     ))
 }
 
 fn finish_mirror(raw: RawMirror) -> Result<Mirror> {
-    let (doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error) = raw;
+    let (doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error, owner_epoch) = raw;
     Ok(Mirror {
         doc_id: uuid_col(doc_id, "mirrors.doc_id")?,
         owner: uuid_col(owner, "mirrors.owner")?,
@@ -548,6 +550,7 @@ fn finish_mirror(raw: RawMirror) -> Result<Mirror> {
         owner_tended,
         last_pulled_at,
         last_error,
+        owner_epoch,
     })
 }
 
@@ -2552,7 +2555,7 @@ impl BlockStore for SqliteStore {
     fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>> {
         self.conn
             .query_row(
-                "SELECT doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error FROM mirrors WHERE doc_id = ?1",
+                "SELECT doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error, owner_epoch FROM mirrors WHERE doc_id = ?1",
                 params![doc_id.to_string()],
                 mirror_row,
             )
@@ -2580,6 +2583,14 @@ impl BlockStore for SqliteStore {
         if n == 0 {
             return Err(StoreError::NotFound(format!("doc {id}")));
         }
+        Ok(())
+    }
+
+    fn set_mirror_owner_epoch(&mut self, doc_id: Uuid, owner_epoch: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE mirrors SET owner_epoch = ?1 WHERE doc_id = ?2",
+            params![owner_epoch, doc_id.to_string()],
+        )?;
         Ok(())
     }
 
@@ -2616,7 +2627,7 @@ impl BlockStore for SqliteStore {
 
     fn list_mirrors(&self) -> Result<Vec<Mirror>> {
         let mut stmt = self.conn.prepare(
-            "SELECT doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error FROM mirrors ORDER BY doc_id",
+            "SELECT doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error, owner_epoch FROM mirrors ORDER BY doc_id",
         )?;
         let rows = stmt.query_map([], mirror_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?

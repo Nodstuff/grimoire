@@ -234,7 +234,9 @@ CREATE TABLE IF NOT EXISTS mirrors (
     -- page shows these — a mirror that is "titles but no content" MUST read
     -- as a red row saying why, never as a silent doc.
     last_pulled_at TEXT,
-    last_error     TEXT
+    last_error     TEXT,
+    -- the owner's epoch from the last pull meta; > synced_epoch = "behind"
+    owner_epoch  INTEGER NOT NULL DEFAULT 0
 );
 
 -- Instance-level key/value settings (profile confirmation etc.). Tiny and

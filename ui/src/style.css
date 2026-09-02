@@ -1335,6 +1335,7 @@ kbd {
 .sync-line { margin-top: 4px; }
 .sync-line.failing { color: var(--red); word-break: break-word; }
 .sync-line.never { color: var(--yellow); }
+.sync-line.behind { color: var(--yellow); }
 .revoked-bar { display: flex; align-items: center; gap: 10px; padding: 4px 0; }
 .reinvite { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
 .join-ticket { font-size: 12px; }

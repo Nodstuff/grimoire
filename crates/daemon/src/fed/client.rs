@@ -615,6 +615,7 @@ async fn pull_page(
         // reflect the owner's tend status so the grantee can show it and
         // refuse to tend the doc locally (one side's agents own it)
         s.set_mirror_tended(id, m.tended)?;
+        s.set_mirror_owner_epoch(id, m.epoch)?;
     }
     for wd in &changed {
         let Ok(id) = wd.meta.id.parse::<uuid::Uuid>() else {

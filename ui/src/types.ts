@@ -59,6 +59,8 @@ export interface MirrorRow {
   root_title: string
   doc_count?: number
   synced_epoch_max?: number
+  /** docs whose owner epoch is past what we landed (paged / failed) */
+  behind?: number
   last_pulled_at?: string | null
   last_error?: string | null
   owner_tended?: boolean

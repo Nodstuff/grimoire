@@ -627,6 +627,11 @@ pub struct Mirror {
     pub last_pulled_at: Option<String>,
     /// The last pull error for this mirror's share; None once a pull succeeds.
     pub last_error: Option<String>,
+    /// The owner's epoch for this doc as of the last pull META (metas always
+    /// ship). `> synced_epoch` = content we know exists but haven't landed
+    /// (paged out, or the block replace failed): "behind".
+    #[serde(default)]
+    pub owner_epoch: i64,
 }
 
 /// A queued join (grantee-side): a redeem that waits for the owner to be up.

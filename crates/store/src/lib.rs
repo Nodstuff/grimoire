@@ -382,6 +382,10 @@ pub trait BlockStore {
     /// Record whether the owner tends this mirror doc (from the pull meta).
     fn set_mirror_tended(&mut self, doc_id: Uuid, tended: bool) -> Result<()>;
 
+    /// Record the owner's epoch for a mirror doc from the pull meta, so the
+    /// grantee can tell "up to date" from "behind" without another round-trip.
+    fn set_mirror_owner_epoch(&mut self, doc_id: Uuid, owner_epoch: i64) -> Result<()>;
+
     /// Is this doc row a tombstone (soft-deleted)? `get_doc` returns
     /// tombstones too, so callers that must distinguish "mine and live" from
     /// "left behind by a dropped mirror" ask this. NotFound if no row at all.

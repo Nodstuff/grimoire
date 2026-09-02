@@ -68,9 +68,15 @@ describe('mirrorStatusLine', () => {
     root_title: 'Plan',
     ...extra,
   })
+  it('reports docs behind before saying up to date', () => {
+    const r = mirrorStatusLine(row({ behind: 3, last_pulled_at: new Date(NOW - 5_000).toISOString() }), NOW)
+    expect(r.kind).toBe('behind')
+    expect(r.text).toMatch(/^3 docs behind/)
+  })
+
   it('synced <rel time> when the last pull succeeded', () => {
     const r = mirrorStatusLine(row({ last_pulled_at: new Date(NOW - 12_000).toISOString() }), NOW)
-    expect(r).toEqual({ kind: 'ok', text: 'synced 12s ago' })
+    expect(r).toEqual({ kind: 'ok', text: 'up to date · synced 12s ago' })
   })
   it('sync failing wins over a stale successful pull', () => {
     const r = mirrorStatusLine(

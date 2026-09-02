@@ -42,7 +42,7 @@ export function shareTitle(s: Share, titleOf?: (docId: string) => string | undef
   return s.root_title ?? titleOf?.(s.root_doc) ?? s.root_doc.slice(0, 8)
 }
 
-export type MirrorStatus = { kind: 'ok' | 'failing' | 'never'; text: string }
+export type MirrorStatus = { kind: 'ok' | 'behind' | 'failing' | 'never'; text: string }
 
 /** "synced 12s ago" / "sync failing: <err>" / "never synced". A last_error
  * wins over a stale last_pulled_at — that is the row that used to read
@@ -50,7 +50,14 @@ export type MirrorStatus = { kind: 'ok' | 'failing' | 'never'; text: string }
 export function mirrorStatusLine(row: MirrorRow, now: number = Date.now()): MirrorStatus {
   const err = row.last_error?.trim()
   if (err) return { kind: 'failing', text: `sync failing: ${err}` }
-  if (row.last_pulled_at) return { kind: 'ok', text: `synced ${relTime(row.last_pulled_at, now)}` }
+  if (row.behind && row.behind > 0) {
+    const n = row.behind
+    return {
+      kind: 'behind',
+      text: `${n} doc${n === 1 ? '' : 's'} behind · synced ${row.last_pulled_at ? relTime(row.last_pulled_at, now) : 'never'}`,
+    }
+  }
+  if (row.last_pulled_at) return { kind: 'ok', text: `up to date · synced ${relTime(row.last_pulled_at, now)}` }
   return { kind: 'never', text: 'never synced' }
 }
 

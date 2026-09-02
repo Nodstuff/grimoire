@@ -10,6 +10,7 @@ import SharePanel from './SharePanel'
 import PaletteShell from './PaletteShell'
 import Profile, { FirstRunName, loadProfile } from './Profile'
 import Trash, { restoreDoc } from './Trash'
+import ImportFolder from './ImportFolder'
 import ReviewRail from './ReviewRail'
 import { notify, errText, Notices } from './Notice'
 import { resolveShortcut } from './shortcuts'
@@ -315,6 +316,12 @@ export default function App() {
                 <div className="home-start-title">Welcome to Grimoire</div>
                 <div><kbd>⌘N</kbd> create your first doc</div>
                 <div><kbd>⌘K</kbd> → Shares &amp; contacts to join a share someone sent you</div>
+                <div>
+                  <ImportFolder
+                    label="Already have notes? Import a folder of Markdown…"
+                    onDone={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
+                  />
+                </div>
                 <div><kbd>?</kbd> all shortcuts</div>
               </div>
             ) : (
@@ -375,6 +382,11 @@ export default function App() {
       </main>
 
       {profile && !profile.confirmed && <FirstRunName profile={profile} onSaved={setProfile} />}
+      <ImportFolder
+        hiddenButton
+        inputId="import-folder-input"
+        onDone={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
+      />
 
       {queueCount > 0 && view.kind !== 'review' && (
         <button className="queue-chip" onClick={() => setView({ kind: 'review' })}>
@@ -517,6 +529,14 @@ function CommandPalette({
     { label: 'Profile', hint: 'your name, node id, fingerprint', run: () => onAction('profile') },
     { label: 'Graph view', run: () => onAction('graph') },
     { label: 'Trash', hint: 'restore deleted docs', run: () => onAction('trash') },
+    {
+      label: 'Import a folder of Markdown…',
+      hint: 'files become docs, folders become sections',
+      run: () => {
+        onAction('close')
+        document.getElementById('import-folder-input')?.click()
+      },
+    },
     {
       label: 'Export all docs as Markdown…',
       hint: 'a folder in ~/Downloads',

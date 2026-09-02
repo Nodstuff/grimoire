@@ -1,6 +1,6 @@
 [package]
 name = "grimoire-shell"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 license = "MIT"
 
@@ -13,3 +13,4 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = "2.7.3"
 tauri-plugin-updater = "2.11.0"
+tauri-plugin-notification = "2.4.0"

@@ -20,6 +20,8 @@ pub struct ApiState {
     pub runtime: crate::fed::Runtime,
     /// The live database file — backups live beside it.
     pub db_path: std::path::PathBuf,
+    /// Federation identity (node id), None when federation is disabled.
+    pub node_id: Option<String>,
 }
 
 /// UI heartbeat: this doc is open. For a mirror, its share joins the fast
@@ -737,11 +739,13 @@ fn tail_lines(path: &std::path::Path, n: usize) -> String {
 
 /// What to paste into a bug report: version, log location and the last 200
 /// log lines. The UI adds node id + fingerprint from /api/profile.
-async fn diagnostics() -> Json<Value> {
+async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
     let path = crate::log_path();
     let tail = path.as_deref().map(|p| tail_lines(p, 200)).unwrap_or_default();
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "node_id": st.node_id,
+        "fingerprint": st.node_id.as_deref().map(crate::identity::fingerprint_of),
         "log_path": path.map(|p| p.to_string_lossy().to_string()),
         "log_tail": tail,
     }))
@@ -1000,6 +1004,78 @@ async fn export_vault(State(st): State<ApiState>) -> Json<Value> {
     }
 }
 
+#[derive(Deserialize)]
+struct ImportFile {
+    /// Relative path inside the chosen folder (`notes/2026/a.md`).
+    path: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct ImportReq {
+    files: Vec<ImportFile>,
+}
+
+/// Import a folder of markdown from the app. The browser can't hand the
+/// daemon a directory path (WKWebView uploads file contents), so the UI
+/// sends `{path, content}` pairs; we materialise them under a scratch dir
+/// and run the same `import_vault` the CLI uses — folders become docs with
+/// children, files become docs. Non-markdown files are skipped client-side.
+async fn import_markdown(State(st): State<ApiState>, Json(req): Json<ImportReq>) -> Json<Value> {
+    const MAX_FILES: usize = 5000;
+    const MAX_BYTES: usize = 200 * 1024 * 1024;
+    if req.files.is_empty() {
+        return Json(json!({"error": "no markdown files in that folder"}));
+    }
+    if req.files.len() > MAX_FILES {
+        return Json(json!({"error": format!("too many files ({}); import in smaller folders", req.files.len())}));
+    }
+    let total: usize = req.files.iter().map(|f| f.content.len()).sum();
+    if total > MAX_BYTES {
+        return Json(json!({"error": "that folder is over 200 MB; import in smaller folders"}));
+    }
+    let scratch = std::env::temp_dir().join(format!("grimoire-import-{}", Uuid::now_v7()));
+    for f in &req.files {
+        // no absolute paths, no traversal: every component must be a plain name
+        let rel = std::path::Path::new(&f.path);
+        if rel.is_absolute()
+            || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Json(json!({"error": format!("refusing path {:?}", f.path)}));
+        }
+        let dest = scratch.join(rel);
+        if let Some(parent) = dest.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Json(json!({"error": e.to_string()}));
+        }
+        if let Err(e) = std::fs::write(&dest, &f.content) {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Json(json!({"error": e.to_string()}));
+        }
+    }
+    let store = st.store.clone();
+    let human = st.human;
+    let dir = scratch.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        grimoire_store::import::import_vault(&mut *s, &dir, human)
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    match res {
+        Ok(Ok(report)) => Json(json!({
+            "docs": report.docs,
+            "blocks": report.blocks,
+            "skipped": report.skipped.iter().map(|p| p.strip_prefix(&scratch).unwrap_or(p).to_string_lossy().to_string()).collect::<Vec<_>>(),
+        })),
+        Ok(Err(e)) => Json(json!({"error": e.to_string()})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 async fn trash(State(st): State<ApiState>) -> Json<Value> {
     let s = st
         .store
@@ -1111,6 +1187,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/trash", get(trash))
         .route("/api/backups", get(backups).post(backup_now))
         .route("/api/export_vault", post(export_vault))
+        .route("/api/import", post(import_markdown))
         .route("/api/doc/{id}/rename", post(rename_doc))
         .route("/api/doc/{id}/tendings", get(tendings))
         .route("/api/doc/{id}/federation", get(doc_federation))

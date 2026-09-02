@@ -20,6 +20,7 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
 
 const DAEMON_ADDR: &str = "127.0.0.1:7425";
@@ -39,6 +40,22 @@ fn home() -> String {
 
 fn data_dir() -> String {
     format!("{}/.grimoire", home())
+}
+
+/// The daemon's newest log file (`ksd.<date>.log`, rotated daily), or the
+/// pattern when none exists yet — for error pages and dialogs.
+fn log_path() -> String {
+    let dir = data_dir();
+    let newest = std::fs::read_dir(&dir).ok().and_then(|rd| {
+        rd.flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("ksd.") && n.ends_with(".log"))
+            .max()
+    });
+    match newest {
+        Some(n) => format!("{dir}/{n}"),
+        None => format!("{dir}/ksd.<date>.log"),
+    }
 }
 
 /// Ensure the daemon: already up (whoever owns it) → spawn the bundled
@@ -123,7 +140,7 @@ fn ui_url(extra: &[(&str, &str)]) -> String {
 /// Self-contained (data: URL); the button probes the daemon from the page
 /// and the shell keeps retrying `ensure_daemon` behind it.
 fn error_page() -> String {
-    let log_dir = data_dir();
+    let log_path = log_path();
     let html = format!(
         r#"<!doctype html><meta charset="utf-8"><title>Grimoire</title>
 <style>
@@ -141,7 +158,7 @@ button:hover{{background:#262626}}
 <div style="font-size:36px;opacity:.5;margin-bottom:16px">◈</div>
 <h1>Grimoire’s background service did not start</h1>
 <p>Your notes are safe. The service that stores and serves them is not answering on port 7425.</p>
-<p>Its log is in <code>{log_dir}/ksd.&lt;date&gt;.log</code></p>
+<p>Its log is in <code>{log_path}</code></p>
 <button onclick="retry()">Try again</button>
 <div id="s"></div>
 </main>
@@ -256,7 +273,15 @@ fn post_admin(path: &str) -> Result<u16, String> {
 
 fn run_gardeners_now(app: AppHandle) {
     match post_admin("/admin/garden") {
-        Ok(200..=299) => {}
+        Ok(200..=299) => {
+            // one line, no dialog: the run happened; results are in the app
+            let _ = app
+                .notification()
+                .builder()
+                .title("Gardeners ran")
+                .body("Proposals, if any, are in the review queue.")
+                .show();
+        }
         Ok(code) => app
             .dialog()
             .message(format!("Grimoire refused the request (HTTP {code}). Open the app and check Gardeners."))
@@ -265,7 +290,7 @@ fn run_gardeners_now(app: AppHandle) {
             .show(|_| {}),
         Err(e) => app
             .dialog()
-            .message(format!("{e}\n\nLog: {}/ksd.<date>.log", data_dir()))
+            .message(format!("{e}\n\nLog: {}", log_path()))
             .kind(MessageDialogKind::Error)
             .title("Gardeners did not run")
             .show(|_| {}),
@@ -349,6 +374,7 @@ fn main() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             ensure_daemon();
 
