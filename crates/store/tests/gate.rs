@@ -233,6 +233,34 @@ fn proposer_cannot_resolve_own_proposal() {
     assert_eq!(f.s.review_queue(None).unwrap().len(), 1, "still open");
 }
 
+/// The invariant bounds AGENTS. The human owner's own stale edit that the
+/// gate parked red (autosave racing a live session, a second window) must be
+/// resolvable by that human — otherwise it is stuck in the queue forever.
+#[test]
+fn human_owner_can_resolve_their_own_parked_edit() {
+    let mut f = fixture();
+    tom_edits(&mut f); // epoch 2: para changed since epoch 1
+    // tom's stale autosave against base 1 targets the changed block → red
+    let out = f
+        .s
+        .propose(f.doc.id, 1, f.tom.id, vec![replace(f.para, "tom's stale edit")])
+        .unwrap();
+    assert_eq!(out.verdicts[0].verdict, Verdict::Red);
+    let ann = f.s.review_queue(Some(f.doc.id)).unwrap()[0].annotation.id;
+    // tom declines his own red: allowed, queue drains, doc untouched
+    f.s.resolve(ann, f.tom.id, ReviewDecision::Decline).unwrap();
+    assert!(f.s.review_queue(Some(f.doc.id)).unwrap().is_empty());
+    // and accepting his own works too
+    f.s.propose(f.doc.id, 1, f.tom.id, vec![replace(f.para, "tom accepts this")])
+        .unwrap();
+    let ann = f.s.review_queue(Some(f.doc.id)).unwrap()[0].annotation.id;
+    f.s.resolve(ann, f.tom.id, ReviewDecision::Accept).unwrap();
+    assert_eq!(
+        f.s.read_block(f.para).unwrap().content,
+        "tom accepts this"
+    );
+}
+
 #[test]
 fn accept_yellow_clears_annotation_without_editing() {
     let mut f = fixture();

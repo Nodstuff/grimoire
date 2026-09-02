@@ -2442,11 +2442,23 @@ impl BlockStore for SqliteStore {
         )?;
         let op = build_op(raw_op)?;
 
-        // the trust invariant (§3.4): proposer ≠ approver, enforced at the gate
+        // the trust invariant (§3.4): proposer ≠ approver, enforced at the
+        // gate — for AGENT and REMOTE principals, whose autonomy it bounds.
+        // The instance's human owner is exempt: their own stale edit that the
+        // gate parked red (an autosave that raced a live session, a second
+        // window) is theirs to accept or drop, and there is no one else to
+        // do it — without this exemption those items are stuck forever.
         if op.principal == reviewer {
-            return Err(StoreError::InvalidOp(
-                "proposer cannot resolve their own proposal".into(),
-            ));
+            let kind: String = tx.query_row(
+                "SELECT kind FROM principals WHERE id = ?1",
+                params![op.principal.to_string()],
+                |r| r.get(0),
+            )?;
+            if kind != "human" {
+                return Err(StoreError::InvalidOp(
+                    "proposer cannot resolve their own proposal".into(),
+                ));
+            }
         }
 
         let mut receipt = None;
