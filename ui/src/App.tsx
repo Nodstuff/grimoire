@@ -1360,6 +1360,20 @@ function DocView({
   // than editing cold. And when TWO editors are typing the same cold doc,
   // escalate to a live session (P2.1 auto-hot) — only from a clean editor,
   // so no keystrokes are lost.
+  // While COLD, re-check on a 5s clock too (not only when the store changes):
+  // for a mirror the status is a federation round-trip that can time out on a
+  // bad path, and a single missed answer used to mean "toast, click, no
+  // banner, nothing ever retried". Now a missed join self-heals.
+  const [coldTick, setColdTick] = useState(0)
+  useEffect(() => {
+    if (hot) return
+    const t = setInterval(() => setColdTick((x) => x + 1), 5000)
+    return () => clearInterval(t)
+  }, [hot, docId])
+  // auto-hot is OPT-IN: when two editors sit on the same cold doc we offer to
+  // go live together (once per doc-open) instead of silently switching the
+  // editor out from under both of them
+  const autoHotOffered = useRef<string | null>(null)
   useEffect(() => {
     if (!tree || hot) return
     api<HotStatus>(`/api/doc/${docId}/hot/status`)
@@ -1374,14 +1388,21 @@ function DocView({
             seed: false,
             blocks: editable.blocks,
           })
-        } else if ((st.editors ?? 0) >= 2 && !isViewMirror) {
-          const dirty = document.querySelector('.save-state.dirty, .save-state.saving')
-          if (!dirty) goLive()
+        } else if ((st.editors ?? 0) >= 2 && !isViewMirror && autoHotOffered.current !== docId) {
+          autoHotOffered.current = docId
+          notify('someone else is editing this doc too — go live together?', 'ok', {
+            onClick: () => {
+              const dirty = document.querySelector('.save-state.dirty, .save-state.saving')
+              if (dirty) notify('finish saving first, then try again')
+              else goLive()
+            },
+            ttlMs: 20_000,
+          })
         }
       })
       .catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tree, dataVersion])
+  }, [tree, dataVersion, coldTick])
 
   // while live: poll hot/status on its own clock (session state such as the
   // owner's "watch only" toggle lives in memory and never moves the store
