@@ -23,11 +23,16 @@ use iroh::{Endpoint, SecretKey};
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 
-/// Bind the production endpoint: n0 relays + discovery, our identity.
+/// Bind the production endpoint: n0 relays + DNS/pkarr discovery, PLUS local
+/// mDNS discovery so two instances on the same LAN find each other directly
+/// — no relay, no public DNS in the path. That matters on office networks
+/// where the relay connection flaps (observed: 80+ resets in a day) and
+/// would otherwise make a colleague across the desk "unreachable".
 pub async fn bind(secret: [u8; 32]) -> Result<Endpoint> {
     Endpoint::builder(presets::N0)
         .secret_key(SecretKey::from_bytes(&secret))
         .alpns(vec![ALPN.to_vec(), HOT_ALPN.to_vec()])
+        .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder())
         .bind()
         .await
         .context("binding federation endpoint")

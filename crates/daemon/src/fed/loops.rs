@@ -360,7 +360,19 @@ pub async fn join_retry_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>)
                 }
                 Err(e) => {
                     let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                    s.record_join_attempt(join.id, &format!("{e:#}")).ok();
+                    // a DEAD invite (already redeemed — e.g. the same link
+                    // pasted twice — expired, or unknown) can never succeed:
+                    // drop it instead of hammering the owner every 60s forever
+                    let dead = matches!(
+                        e.downcast_ref::<Refusal>().map(|r| r.code),
+                        Some(RefusalCode::InviteInvalid)
+                    );
+                    if dead {
+                        tracing::warn!("dropping pending join: {e:#}");
+                        s.remove_pending_join(join.id).ok();
+                    } else {
+                        s.record_join_attempt(join.id, &format!("{e:#}")).ok();
+                    }
                 }
             }
         }

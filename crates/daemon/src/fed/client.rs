@@ -293,6 +293,11 @@ pub async fn join_at(
         owner_name,
     } = res
     else {
+        // typed so the retry loop can tell a DEAD invite (already redeemed,
+        // expired, unknown → stop retrying) from "owner offline, try later"
+        if let Response::Refused { reason, code } = res {
+            return Err(Refusal::new(code, format!("owner refused the invite: {reason}")).into());
+        }
         anyhow::bail!("owner refused the invite: {res:?}");
     };
 
