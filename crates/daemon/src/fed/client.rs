@@ -60,11 +60,39 @@ pub async fn open_hot_bridge(
         (mirror, owner)
     };
     let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
-    let conn = endpoint
-        .connect(EndpointAddr::from(owner_id), HOT_ALPN)
+    // The bridge is a fresh QUIC connection on its own ALPN; across NATs it
+    // may need a relay round or a hole-punch to settle, so retry the dial a
+    // few times before declaring the session unreachable.
+    let mut last_err = None;
+    let mut conn = None;
+    for attempt in 1..=4u32 {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            endpoint.connect(EndpointAddr::from(owner_id), HOT_ALPN),
+        )
         .await
-        .context("dialing owner for hot bridge")?;
-    let (mut send, mut recv) = conn.open_bi().await?;
+        {
+            Ok(Ok(c)) => {
+                conn = Some(c);
+                break;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(%doc_id, attempt, "hot bridge dial failed: {e:#}");
+                last_err = Some(anyhow::Error::from(e));
+            }
+            Err(_) => {
+                tracing::warn!(%doc_id, attempt, "hot bridge dial timed out");
+                last_err = Some(anyhow::anyhow!("dial timed out after 8s"));
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
+    }
+    let conn = conn.ok_or_else(|| {
+        last_err
+            .unwrap_or_else(|| anyhow::anyhow!("no attempts"))
+            .context("dialing owner for hot bridge (4 attempts)")
+    })?;
+    let (mut send, mut recv) = conn.open_bi().await.context("opening bridge stream")?;
     let header = serde_json::json!({
         "share": mirror.share_id.to_string(),
         "doc": doc_id.to_string(),

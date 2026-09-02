@@ -129,6 +129,8 @@ export default function App() {
         }
       }
     }
+    // don't wait a whole tick for the first nudge check
+    pollEvents().catch(() => {})
     const t = setInterval(async () => {
       try {
         const r = await api<{ stamp: number }>('/api/stamp')
@@ -1524,12 +1526,28 @@ function DocView({
           viewersWrite={mirror ? undefined : viewersWrite}
           onToggleViewersWrite={mirror ? undefined : toggleViewersWrite}
           onEnded={() => {
-            setHot(null)
+            // Fetch the flattened tree FIRST, then swap it in and remount the
+            // cold editor in the same tick. Remounting before the fetch
+            // resolved froze the editor on the pre-session content (its
+            // initial content is memoised per doc), so the owner saw the
+            // grantee's live text "vanish" even though the flatten landed.
             setHotCanWrite(undefined)
             setViewersWrite(undefined)
-            setEditorGen((g) => g + 1)
-            loadTree()
             loadReview()
+            api<DocTree>(`/api/doc/${docId}`)
+              .then((fresh) => {
+                ownEpoch.current = Math.max(ownEpoch.current, fresh.doc.current_epoch)
+                setTree(fresh)
+                setHot(null)
+                setEditorGen((g) => g + 1)
+                api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => {})
+                api<DocFederation>(`/api/doc/${docId}/federation`).then(setFed).catch(() => {})
+              })
+              .catch((e) => {
+                notify(`session ended but the doc could not be reloaded: ${errText(e)}`)
+                setHot(null)
+                loadTree()
+              })
           }}
         />
       ) : (

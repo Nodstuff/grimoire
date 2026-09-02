@@ -64,6 +64,10 @@ pub struct HotState {
     /// Cold-editor heartbeats (auto-hot, P2.1): doc → editor key → last ping.
     /// Two live keys on a cold doc = concurrent editing = the UIs go live.
     pub editing: Arc<Mutex<HashMap<Uuid, HashMap<Uuid, std::time::Instant>>>>,
+    /// Grantee side: the last reason a bridge to the owner's session failed,
+    /// per mirror doc — surfaced in hot/status so the UI can say WHY instead
+    /// of showing "connecting…" forever. Cleared when a bridge succeeds.
+    pub bridge_errors: Arc<Mutex<HashMap<Uuid, String>>>,
 }
 
 impl HotState {
@@ -73,7 +77,28 @@ impl HotState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             journal_dir: Arc::new(journal_dir),
             editing: Arc::new(Mutex::new(HashMap::new())),
+            bridge_errors: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn set_bridge_error(&self, doc: Uuid, err: Option<String>) {
+        let mut m = self.bridge_errors.lock().unwrap_or_else(|p| p.into_inner());
+        match err {
+            Some(e) => {
+                m.insert(doc, e);
+            }
+            None => {
+                m.remove(&doc);
+            }
+        }
+    }
+
+    pub fn bridge_error(&self, doc: Uuid) -> Option<String> {
+        self.bridge_errors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&doc)
+            .cloned()
     }
 
     /// Record a cold-editor heartbeat; returns how many distinct editors
@@ -552,6 +577,9 @@ async fn hot_status(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json
                 if let Some(w) = can_write {
                     v["can_write"] = json!(w);
                 }
+                if let Some(err) = ctx.hot.bridge_error(doc_id) {
+                    v["bridge_error"] = json!(err);
+                }
                 Json(v)
             }
             // owner offline etc: not joinable, so not hot
@@ -616,6 +644,8 @@ async fn ws_session(mut socket: WebSocket, ctx: HotCtx, doc_id: Uuid) {
         match crate::fed::open_hot_bridge(&ep, &ctx.store, doc_id).await {
             Ok((to_owner, mut from_owner)) => {
                 use futures_util::{SinkExt, StreamExt};
+                ctx.hot.set_bridge_error(doc_id, None);
+                tracing::info!(%doc_id, "hot bridge to owner open");
                 let (mut ws_tx, mut ws_rx) = socket.split();
                 let down = tokio::spawn(async move {
                     while let Some(frame) = from_owner.recv().await {
@@ -639,7 +669,10 @@ async fn ws_session(mut socket: WebSocket, ctx: HotCtx, doc_id: Uuid) {
                 down.abort();
             }
             Err(e) => {
-                tracing::debug!(%doc_id, "hot bridge failed: {e:#}");
+                // the grantee's "text never shows up": make it loud and
+                // queryable (hot/status carries bridge_error to the UI)
+                tracing::warn!(%doc_id, "hot bridge to owner failed: {e:#}");
+                ctx.hot.set_bridge_error(doc_id, Some(format!("{e:#}")));
                 socket.send(WsMessage::Close(None)).await.ok();
             }
         }

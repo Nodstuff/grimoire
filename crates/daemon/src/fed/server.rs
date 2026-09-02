@@ -67,8 +67,10 @@ pub async fn serve(
             };
             let peer = conn.remote_id().to_string();
             if conn.alpn() == HOT_ALPN {
+                // a failed/refused bridge is the #1 "text never shows up"
+                // symptom for grantees — always visible in the log
                 if let Err(e) = handle_hot_bridge(conn, &peer, store, hot).await {
-                    tracing::debug!(peer, "hot bridge ended: {e:#}");
+                    tracing::warn!(peer, "hot bridge ended/refused: {e:#}");
                 }
                 return;
             }

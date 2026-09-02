@@ -32,18 +32,34 @@ export interface EventsCursor {
 
 export const INITIAL_CURSOR: EventsCursor = { since: 0, baselined: false }
 
+/** A `live_started` younger than this still toasts on the baseline poll: the
+ * app may have loaded a few seconds after the owner went live (slow launch,
+ * tunnel), and "X is live — join" is exactly the nudge you want then. */
+export const BASELINE_LIVE_WINDOW_MS = 90_000
+
 /** Advance the cursor and pick the events worth surfacing.
- * - first response: baseline silently (nothing surfaced), regardless of content
+ * - first response: baseline — history is silent, EXCEPT a live_started from
+ *   the last BASELINE_LIVE_WINDOW_MS (a session that is probably still live)
  * - later responses: everything with seq > since, de-duplicated by seq
  * - a malformed response leaves the cursor untouched */
 export function advanceEvents(
   cur: EventsCursor,
   resp: Partial<EventsResponse> | null | undefined,
+  now: number = Date.now(),
 ): { cursor: EventsCursor; fresh: LiveEvent[] } {
   if (!resp || typeof resp.next !== 'number') return { cursor: cur, fresh: [] }
   const events = Array.isArray(resp.events) ? resp.events : []
   const next = Math.max(cur.since, resp.next)
-  if (!cur.baselined) return { cursor: { since: next, baselined: true }, fresh: [] }
+  if (!cur.baselined) {
+    const recentLive = events
+      .filter((ev) => ev?.kind === 'live_started' && typeof ev.seq === 'number')
+      .filter((ev) => {
+        const t = Date.parse(liveEventIso(ev.at))
+        return Number.isFinite(t) && now - t >= 0 && now - t < BASELINE_LIVE_WINDOW_MS
+      })
+      .sort((a, b) => a.seq - b.seq)
+    return { cursor: { since: next, baselined: true }, fresh: recentLive }
+  }
   const seen = new Set<number>()
   const fresh: LiveEvent[] = []
   for (const ev of events) {
