@@ -1,6 +1,6 @@
 [package]
 name = "grimoire"
-version = "0.2.1"
+version = "0.2.2"
 edition.workspace = true
 license.workspace = true
 
@@ -30,3 +30,4 @@ data-encoding = "2"
 yrs = { version = "0.27", features = ["sync"] }
 futures-util = "0.3.34"
 base64 = "0.23.1"
+rust-embed = "8.12"
