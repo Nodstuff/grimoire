@@ -5,9 +5,11 @@ markdown blocks in a SQLite file on your Mac; humans and agents write through th
 same **review gate**; you can share a folder with another Grimoire over the open
 internet and edit it live together.
 
-**Download:** [v0.5.0 dmg](https://github.com/Nodstuff/grimoire/releases/tag/v0.5.0)
-(macOS, Apple Silicon, signed + notarized) — SHA-256 `12551dc09364a3c3b9d7a9470155935fe75fa19d7305cf8cc1fa195ebf709809`.
+**Download:** [latest release](https://github.com/Nodstuff/grimoire/releases/latest)
+(macOS, Apple Silicon, signed + notarized; SHA-256 in each release’s notes).
 Open the dmg, drag Grimoire to Applications. Data lives in `~/.grimoire`.
+The app checks for updates daily (◈ menu → *Check for updates…*); updates are
+minisign-verified against the key in `crates/shell/tauri.conf.json`.
 
 ## What it is
 

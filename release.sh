@@ -25,6 +25,18 @@ fi
 echo "→ signing as: $IDENTITY"
 export APPLE_SIGNING_IDENTITY="$IDENTITY"
 
+# Updater artifacts (Grimoire.app.tar.gz + .sig) are minisign-signed with a
+# key that lives OUTSIDE the repo; the matching pubkey is in tauri.conf.json.
+# Generate once: ui/node_modules/.bin/tauri signer generate -w ~/.grimoire-release/updater.key
+UPDATER_KEY="$HOME/.grimoire-release/updater.key"
+if [[ ! -f "$UPDATER_KEY" ]]; then
+  echo "✗ updater signing key missing at $UPDATER_KEY (see comment above)"
+  exit 1
+fi
+export TAURI_SIGNING_PRIVATE_KEY_PATH="$UPDATER_KEY"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+VERSION=$(python3 -c 'import json;print(json.load(open("crates/shell/tauri.conf.json"))["version"])')
+
 echo "→ ui build"
 (cd ui && npm run build --silent | tail -1)
 echo "→ daemon release build"
@@ -49,4 +61,45 @@ xcrun notarytool submit "$DMG" --keychain-profile grimoire-notary --wait
 xcrun stapler staple "$DMG"
 
 spctl -a -vv -t install "$DMG" 2>&1 | head -3 || true
-echo "✓ shareable: $DMG"
+
+# The updater feed: one latest.json per release, pointing at the tar.gz asset
+# of THIS release. The app checks releases/latest/download/latest.json, so the
+# newest release's file is the live one.
+TARBALL=$(ls -t target/release/bundle/macos/*.app.tar.gz | head -1)
+SIG="$TARBALL.sig"
+[[ -f "$SIG" ]] || { echo "✗ no updater signature next to $TARBALL"; exit 1 }
+FEED=target/release/bundle/latest.json
+python3 - "$VERSION" "$SIG" "$FEED" "$TARBALL" <<'PY'
+import json, sys, datetime, os
+version, sig, feed, tarball = sys.argv[1:]
+name = os.path.basename(tarball)
+json.dump({
+  "version": version,
+  "notes": f"Grimoire {version} — see the release page for details.",
+  "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": open(sig).read().strip(),
+      "url": f"https://github.com/Nodstuff/grimoire/releases/download/v{version}/{name}",
+    }
+  },
+}, open(feed, "w"), indent=2)
+PY
+echo "✓ dmg:       $DMG"
+echo "✓ updater:   $TARBALL (+ .sig)"
+echo "✓ feed:      $FEED"
+echo "  sha256:    $(shasum -a 256 "$DMG" | cut -d' ' -f1)"
+
+# --publish [notes.md]: create the GitHub release with all four assets as
+# the personal account. Without it, upload by hand:
+#   gh release create v$VERSION "$DMG" "$TARBALL" "$SIG" "$FEED" --repo Nodstuff/grimoire
+if [[ "${1:-}" == "--publish" ]]; then
+  NOTES="${2:-}"
+  export GH_TOKEN=$(gh auth token --user Nodstuff)
+  if [[ -n "$NOTES" ]]; then
+    gh release create "v$VERSION" "$DMG" "$TARBALL" "$SIG" "$FEED" --repo Nodstuff/grimoire --title "v$VERSION" --notes-file "$NOTES"
+  else
+    gh release create "v$VERSION" "$DMG" "$TARBALL" "$SIG" "$FEED" --repo Nodstuff/grimoire --title "v$VERSION" --generate-notes
+  fi
+  echo "✓ published https://github.com/Nodstuff/grimoire/releases/tag/v$VERSION"
+fi

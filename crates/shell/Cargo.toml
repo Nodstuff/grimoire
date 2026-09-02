@@ -1,6 +1,6 @@
 [package]
 name = "grimoire-shell"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "MIT"
 
@@ -12,3 +12,4 @@ serde_json.workspace = true
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = "2.7.3"
+tauri-plugin-updater = "2.11.0"

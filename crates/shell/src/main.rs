@@ -19,7 +19,8 @@ use std::time::Duration;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
-use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_updater::UpdaterExt;
 
 const DAEMON_ADDR: &str = "127.0.0.1:7425";
 const DAEMON_URL: &str = "http://127.0.0.1:7425/";
@@ -271,10 +272,83 @@ fn run_gardeners_now(app: AppHandle) {
     }
 }
 
+/// Check the GitHub release feed (`latest.json`, minisign-verified against
+/// the pubkey in tauri.conf.json). `interactive` = the user asked from the
+/// tray, so "you're up to date" and errors get a dialog; the background check
+/// only speaks when there is something to install. Installing replaces the
+/// .app and relaunches; the spawned daemon dies with us and the new one
+/// starts with the new app (RunEvent::Exit kills the child).
+fn check_for_updates(app: AppHandle, interactive: bool) {
+    let result = tauri::async_runtime::block_on(async {
+        let updater = app.updater().map_err(|e| e.to_string())?;
+        updater.check().await.map_err(|e| e.to_string())
+    });
+    let update = match result {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            if interactive {
+                app.dialog()
+                    .message(format!("Grimoire {} is the latest version.", app.package_info().version))
+                    .kind(MessageDialogKind::Info)
+                    .title("Up to date")
+                    .blocking_show();
+            }
+            return;
+        }
+        Err(e) => {
+            eprintln!("update check failed: {e}");
+            if interactive {
+                app.dialog()
+                    .message(format!("Could not check for updates.\n\n{e}"))
+                    .kind(MessageDialogKind::Warning)
+                    .title("Update check failed")
+                    .blocking_show();
+            }
+            return;
+        }
+    };
+    let notes = update
+        .body
+        .as_deref()
+        .map(|b| b.trim())
+        .filter(|b| !b.is_empty())
+        .map(|b| format!("\n\n{}", b.chars().take(600).collect::<String>()))
+        .unwrap_or_default();
+    let install = app
+        .dialog()
+        .message(format!(
+            "Grimoire {} is available (you have {}).{notes}\n\nInstall and relaunch now? Your notes are untouched.",
+            update.version, update.current_version
+        ))
+        .kind(MessageDialogKind::Info)
+        .title("Update available")
+        .buttons(MessageDialogButtons::OkCancelCustom("Install".into(), "Later".into()))
+        .blocking_show();
+    if !install {
+        return;
+    }
+    let res = tauri::async_runtime::block_on(async {
+        update
+            .download_and_install(|_chunk, _total| {}, || {})
+            .await
+            .map_err(|e| e.to_string())
+    });
+    if let Err(e) = res {
+        app.dialog()
+            .message(format!("The update could not be installed.\n\n{e}\n\nDownload it from github.com/Nodstuff/grimoire/releases instead."))
+            .kind(MessageDialogKind::Error)
+            .title("Update failed")
+            .blocking_show();
+        return;
+    }
+    app.restart()
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             ensure_daemon();
 
@@ -289,9 +363,10 @@ fn main() {
             let open = MenuItemBuilder::with_id("open", "Open Grimoire").build(app)?;
             let garden = MenuItemBuilder::with_id("garden", "Run gardeners now").build(app)?;
             let restart = MenuItemBuilder::with_id("restart", "Restart background service").build(app)?;
+            let update = MenuItemBuilder::with_id("update", "Check for updates…").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
             let menu = MenuBuilder::new(app)
-                .items(&[&open, &garden, &restart, &quit])
+                .items(&[&open, &garden, &restart, &update, &quit])
                 .build()?;
 
             let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
@@ -317,10 +392,25 @@ fn main() {
                             }
                         });
                     }
+                    "update" => {
+                        let handle = app.clone();
+                        std::thread::spawn(move || check_for_updates(handle, true));
+                    }
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
+
+            // quiet update check: a minute after launch, then daily. Only an
+            // available update ever produces UI; failures go to stderr.
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                    check_for_updates(handle.clone(), false);
+                    std::thread::sleep(Duration::from_secs(24 * 60 * 60 - 60));
+                });
+            }
 
             show_window(app.handle());
             Ok(())
