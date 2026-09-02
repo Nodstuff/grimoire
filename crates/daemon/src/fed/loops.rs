@@ -211,7 +211,9 @@ pub async fn pull_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, runti
                     tracing::info!(%share, changed = s.changed, removed = s.removed, sweep, "pulled");
                 }
                 Ok(_) => {}
-                Err(e) => tracing::debug!(%share, "pull failed (owner offline?): {e:#}"),
+                // WARN, not debug: a pull that keeps failing is how a grantee
+                // ends up with titles but no content — it must be visible
+                Err(e) => tracing::warn!(%share, "pull failed: {e:#}"),
             }
         }
     }

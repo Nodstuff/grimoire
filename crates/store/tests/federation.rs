@@ -390,3 +390,47 @@ fn recent_remote_ops_lists_only_applied_remote_edits() {
     assert_eq!(feed[0].op_type, "insert");
     assert_eq!(feed[0].principal, alice.principal);
 }
+
+/// Field bug: real docs nest paragraphs under headings, and the wire order is
+/// per-sibling order_key — so a child can arrive before its parent. With
+/// blocks.parent_id a FK, the naive insert failed and left mirrors as titles
+/// with no content. The replace must succeed whatever order blocks arrive in.
+#[test]
+fn mirror_replace_blocks_accepts_children_before_parents() {
+    let (mut s, _tom) = store_with_tom();
+    let owner = s.pair_contact(&"ab".repeat(32), "owner").unwrap();
+    let doc = uuid::Uuid::now_v7();
+    s.create_doc_with_id(doc, "Nested", None, owner.principal).unwrap();
+    s.upsert_mirror(doc, owner.id, uuid::Uuid::now_v7(), 0, SharePermission::View).unwrap();
+    let h1 = uuid::Uuid::now_v7();
+    let h2 = uuid::Uuid::now_v7();
+    let p_under_h2 = uuid::Uuid::now_v7();
+    let p_under_h1 = uuid::Uuid::now_v7();
+    let mk = |id, parent, key: &str, ty, content: &str| MirrorBlock {
+        id,
+        parent_id: parent,
+        order_key: key.into(),
+        block_type: ty,
+        content: content.into(),
+        refers_to: None,
+    };
+    // deliberately WORST order: deepest children first, parents last
+    let blocks = vec![
+        mk(p_under_h2, Some(h2), "i", BlockType::Paragraph, "deep paragraph"),
+        mk(p_under_h1, Some(h1), "r", BlockType::Paragraph, "para under h1"),
+        mk(h2, Some(h1), "i", BlockType::Heading, "## Sub"),
+        mk(h1, None, "i", BlockType::Heading, "# Top"),
+    ];
+    s.mirror_replace_blocks(doc, blocks, 7, owner.principal)
+        .expect("children-before-parents must not fail the FK");
+    let tree = s.read_doc(doc).unwrap();
+    assert_eq!(tree.doc.current_epoch, 7);
+    assert_eq!(tree.roots.len(), 1);
+    assert_eq!(tree.roots[0].block.content, "# Top");
+    let kids: Vec<_> = tree.roots[0].children.iter().map(|n| n.block.content.as_str()).collect();
+    assert_eq!(kids, vec!["## Sub", "para under h1"]);
+    assert_eq!(tree.roots[0].children[0].children[0].block.content, "deep paragraph");
+    // a second replace (a later pull) works too — the DELETE + reinsert path
+    s.mirror_replace_blocks(doc, vec![mk(h1, None, "i", BlockType::Heading, "# Top v2")], 8, owner.principal).unwrap();
+    assert_eq!(s.read_doc(doc).unwrap().roots[0].block.content, "# Top v2");
+}

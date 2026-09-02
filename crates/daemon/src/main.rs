@@ -189,7 +189,28 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// The two v1 principals, created on first run.
+/// The display name a fresh install starts with: the macOS account's full
+/// name, else the login name, else "me". It is the petname others see when
+/// this instance pairs with them, so it must never be a hardcoded placeholder
+/// — a network of instances all called "tom" is indistinguishable.
+fn default_human_name() -> String {
+    if let Ok(out) = std::process::Command::new("id").arg("-F").output()
+        && out.status.success()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    std::env::var("USER")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "me".into())
+}
+
+/// The two v1 principals, created on first run. The human is found by KIND
+/// (there is exactly one per instance), never by name — the name is the
+/// user's to change.
 fn bootstrap_principals(store: &mut SqliteStore) -> anyhow::Result<(uuid::Uuid, uuid::Uuid)> {
     let existing = store.list_principals()?;
     let find = |name: &str| {
@@ -198,14 +219,15 @@ fn bootstrap_principals(store: &mut SqliteStore) -> anyhow::Result<(uuid::Uuid, 
             .find(|p| p.display_name == name)
             .map(|p| p.id)
     };
-    let tom = match find("tom") {
-        Some(id) => id,
+    let human = match existing.iter().find(|p| p.kind == PrincipalKind::Human) {
+        Some(p) => p.id,
         None => {
-            store
-                .create_principal(PrincipalKind::Human, "tom", None)?
-                .id
+            let name = default_human_name();
+            tracing::info!(name, "first run: human principal created (rename it in the app)");
+            store.create_principal(PrincipalKind::Human, &name, None)?.id
         }
     };
+    let tom = human;
     let claude = match find("claude") {
         Some(id) => id,
         None => {

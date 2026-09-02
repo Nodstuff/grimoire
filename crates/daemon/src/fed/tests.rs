@@ -1134,3 +1134,97 @@ async fn nudge_is_accepted_from_the_owner_for_a_held_share_and_refused_otherwise
     }).await.unwrap();
     assert!(matches!(res, Response::Refused { code: RefusalCode::UnknownPeer, .. }));
 }
+
+#[tokio::test]
+async fn rejoining_docs_already_mirrored_under_an_older_share_still_lands_content() {
+    // Scenario from the field: the grantee already mirrors these docs (an
+    // earlier share of the same subtree), the owner mints a NEW share and the
+    // grantee joins it. Titles must exist AND content must land — a stale
+    // mirror row or leftover block rows must never leave empty docs behind.
+    use grimoire_store::{BlockType, OpInput, OpKind};
+    let mut owner_store = SqliteStore::open_in_memory().unwrap();
+    let tom = owner_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let root = owner_store.create_doc("Grimoire", None, tom.id).unwrap();
+    let child = owner_store.create_doc("Architecture", Some(root.id), tom.id).unwrap();
+    let mk = |c: &str| OpInput { kind: OpKind::Insert { block_id: uuid::Uuid::now_v7(), parent_id: None, order_key: "".into(), block_type: BlockType::Paragraph, content: c.into(), refers_to: None }, source_refs: vec![] };
+    owner_store.apply(root.id, 0, tom.id, vec![mk("root body")]).unwrap();
+    owner_store.apply(child.id, 0, tom.id, vec![mk("child body")]).unwrap();
+    let owner_ep = local_endpoint().await;
+    let (share1, link1) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), root.id, SharePermission::View).unwrap();
+    let owner_store = Arc::new(Mutex::new(owner_store));
+    let addr = direct_addr(&owner_ep);
+    tokio::spawn(serve(owner_ep.clone(), owner_store.clone(), scratch_hot(), Runtime::default()));
+
+    let mut g = SqliteStore::open_in_memory().unwrap();
+    g.create_principal(PrincipalKind::Human, "home", None).unwrap();
+    let g = Arc::new(Mutex::new(g));
+    let g_ep = local_endpoint().await;
+    join_at(&g_ep, &g, &Ticket::parse(&link1).unwrap(), addr.clone()).await.unwrap();
+    let owner_contact = { g.lock().unwrap().list_contacts().unwrap()[0].clone() };
+    pull_share(&g_ep, &g, addr.clone(), &owner_contact, share1.id).await.unwrap();
+    { let s = g.lock().unwrap(); assert_eq!(s.read_doc(child.id).unwrap().roots[0].block.content, "child body"); }
+
+    // owner edits, then mints a SECOND share of the same subtree; grantee joins it
+    { let mut s = owner_store.lock().unwrap(); let e = s.get_doc(child.id).unwrap().current_epoch; s.apply(child.id, e, tom.id, vec![mk("child body v2")]).unwrap(); }
+    let (share2, link2) = { let mut s = owner_store.lock().unwrap(); mint_invite(&mut s, &owner_ep.id().to_string(), root.id, SharePermission::View).unwrap() };
+    join_at(&g_ep, &g, &Ticket::parse(&link2).unwrap(), addr.clone()).await.unwrap();
+    // share1 was superseded (revoked) on the owner by the redeem
+    { let s = owner_store.lock().unwrap(); assert_eq!(s.get_share(share1.id).unwrap().state, grimoire_store::ShareState::Revoked); }
+    let sum = pull_share(&g_ep, &g, addr, &owner_contact, share2.id).await.unwrap();
+    assert!(sum.changed >= 1, "{sum:?}");
+    let s = g.lock().unwrap();
+    let t = s.read_doc(child.id).unwrap();
+    assert_eq!(t.doc.title, "Architecture");
+    let contents: Vec<_> = t.roots.iter().map(|n| n.block.content.as_str()).collect();
+    assert_eq!(contents, vec!["child body", "child body v2"], "content landed after re-join");
+    assert_eq!(s.get_mirror(child.id).unwrap().unwrap().share_id, share2.id, "mirror re-pointed at the new share");
+    assert_eq!(s.read_doc(root.id).unwrap().roots[0].block.content, "root body");
+}
+
+#[tokio::test]
+async fn revoke_then_reshare_same_subtree_rejoins_cleanly() {
+    // Field bug: owner revokes a share; grantee drops the mirror (soft-deletes
+    // the docs); owner re-shares the same subtree; grantee must be able to
+    // join again and get full content — not a collision or a PK conflict on
+    // the tombstoned doc ids.
+    use grimoire_store::{BlockType, OpInput, OpKind, ShareState};
+    let mut owner_store = SqliteStore::open_in_memory().unwrap();
+    let tom = owner_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let root = owner_store.create_doc("Grimoire", None, tom.id).unwrap();
+    let child = owner_store.create_doc("Arch", Some(root.id), tom.id).unwrap();
+    let mk = |c: &str| OpInput { kind: OpKind::Insert { block_id: uuid::Uuid::now_v7(), parent_id: None, order_key: "".into(), block_type: BlockType::Paragraph, content: c.into(), refers_to: None }, source_refs: vec![] };
+    owner_store.apply(child.id, 0, tom.id, vec![mk("body")]).unwrap();
+    let owner_ep = local_endpoint().await;
+    let (share1, link1) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), root.id, SharePermission::View).unwrap();
+    let owner_store = Arc::new(Mutex::new(owner_store));
+    let addr = direct_addr(&owner_ep);
+    tokio::spawn(serve(owner_ep.clone(), owner_store.clone(), scratch_hot(), Runtime::default()));
+
+    let mut g = SqliteStore::open_in_memory().unwrap();
+    g.create_principal(PrincipalKind::Human, "home", None).unwrap();
+    let g = Arc::new(Mutex::new(g));
+    let g_ep = local_endpoint().await;
+    join_at(&g_ep, &g, &Ticket::parse(&link1).unwrap(), addr.clone()).await.unwrap();
+    let owner_contact = { g.lock().unwrap().list_contacts().unwrap()[0].clone() };
+    pull_share(&g_ep, &g, addr.clone(), &owner_contact, share1.id).await.unwrap();
+    assert_eq!(g.lock().unwrap().read_doc(child.id).unwrap().roots[0].block.content, "body");
+
+    // owner revokes; grantee's next pull drops the mirror
+    owner_store.lock().unwrap().set_share_state(share1.id, ShareState::Revoked).unwrap();
+    let r = pull_share(&g_ep, &g, addr.clone(), &owner_contact, share1.id).await;
+    assert!(r.is_err());
+    { let mut s = g.lock().unwrap(); drop_dead_share(&mut s, share1.id); assert!(!s.list_docs().unwrap().iter().any(|d| d.id == root.id), "mirror gone"); }
+
+    // owner re-shares the SAME subtree; grantee joins and pulls again
+    let (share2, link2) = { let mut s = owner_store.lock().unwrap(); mint_invite(&mut s, &owner_ep.id().to_string(), root.id, SharePermission::Propose).unwrap() };
+    join_at(&g_ep, &g, &Ticket::parse(&link2).unwrap(), addr.clone()).await.expect("re-join after revoke must succeed");
+    let sum = pull_share(&g_ep, &g, addr, &owner_contact, share2.id).await.expect("pull after re-join");
+    // root has no blocks (epoch 0 = cursor) so only the child ships
+    assert_eq!(sum.changed, 1, "{sum:?}");
+    let s = g.lock().unwrap();
+    assert!(s.list_docs().unwrap().iter().any(|d| d.id == root.id && d.title == "Grimoire"), "root revived");
+    assert_eq!(s.read_doc(child.id).unwrap().roots[0].block.content, "body", "content back");
+    let m = s.get_mirror(child.id).unwrap().unwrap();
+    assert_eq!(m.share_id, share2.id);
+    assert_eq!(m.permission, SharePermission::Propose, "new grant honoured");
+}

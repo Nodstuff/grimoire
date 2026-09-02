@@ -2294,6 +2294,28 @@ impl BlockStore for SqliteStore {
             .transpose()
     }
 
+    fn doc_is_tombstoned(&self, id: Uuid) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT deleted FROM docs WHERE id = ?1",
+                params![id.to_string()],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("doc {id}")))
+    }
+
+    fn undelete_doc(&mut self, id: Uuid) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE docs SET deleted = 0 WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("doc {id}")));
+        }
+        Ok(())
+    }
+
     fn set_mirror_tended(&mut self, doc_id: Uuid, tended: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE mirrors SET owner_tended = ?1 WHERE doc_id = ?2",
@@ -2378,7 +2400,39 @@ impl BlockStore for SqliteStore {
             "DELETE FROM blocks WHERE doc_id = ?1",
             params![doc_id.to_string()],
         )?;
-        for b in &blocks {
+        // blocks.parent_id REFERENCES blocks(id): parents must exist before
+        // their children. The wire order is order_key (per-sibling), which
+        // says nothing about depth — a paragraph under a heading can arrive
+        // before the heading and fail the FK, leaving a doc with a title and
+        // no content. Insert in topological order; defer FK checks to commit
+        // so a genuinely dangling parent still fails loudly rather than by
+        // accident of ordering.
+        tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+        let ids: std::collections::HashSet<Uuid> = blocks.iter().map(|b| b.id).collect();
+        let mut placed: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let mut ordered: Vec<&MirrorBlock> = Vec::with_capacity(blocks.len());
+        let mut remaining: Vec<&MirrorBlock> = blocks.iter().collect();
+        while !remaining.is_empty() {
+            let before = remaining.len();
+            remaining.retain(|b| {
+                let ready = match b.parent_id {
+                    None => true,
+                    // parent outside this doc's block set: treat as root-ready
+                    Some(p) => placed.contains(&p) || !ids.contains(&p),
+                };
+                if ready {
+                    placed.insert(b.id);
+                    ordered.push(b);
+                }
+                !ready
+            });
+            if remaining.len() == before {
+                // cycle in parent links: never valid; insert what's left as-is
+                // and let the deferred FK check report it
+                ordered.extend(remaining.drain(..));
+            }
+        }
+        for b in ordered {
             tx.execute(
                 "INSERT INTO blocks (id, doc_id, parent_id, order_key, block_type,
                                      content, created_by, epoch, refers_to)
