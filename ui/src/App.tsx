@@ -7,6 +7,8 @@ import Gardeners from './Gardeners'
 import CanvasBlock from './CanvasBlock'
 import Sharing from './Sharing'
 import SharePanel from './SharePanel'
+import PaletteShell from './PaletteShell'
+import Profile, { FirstRunName, loadProfile } from './Profile'
 import ReviewRail from './ReviewRail'
 import { notify, errText, Notices } from './Notice'
 import { resolveShortcut } from './shortcuts'
@@ -25,6 +27,7 @@ import {
   QueueRow,
   SearchHit,
   GardenerRun,
+  Profile as ProfileRow,
 } from './types'
 
 type View =
@@ -33,6 +36,7 @@ type View =
   | { kind: 'runs' }
   | { kind: 'graph' }
   | { kind: 'sharing' }
+  | { kind: 'profile' }
   | { kind: 'home' }
 type Palette = null | 'commands' | 'open' | 'search' | 'newdoc' | 'newcanvas' | 'help'
 
@@ -86,6 +90,12 @@ export default function App() {
   const [treeOpen, setTreeOpen] = useState(false)
   const [palette, setPalette] = useState<Palette>(null)
   const [queueCount, setQueueCount] = useState(0)
+  // first-run name prompt: shown until the install-default name is confirmed.
+  // null = no profile route (older daemon) or not loaded yet → no prompt.
+  const [profile, setProfile] = useState<ProfileRow | null>(null)
+  useEffect(() => {
+    loadProfile().then(setProfile)
+  }, [])
 
   const refreshQueue = useCallback(() => {
     Promise.all([
@@ -319,10 +329,14 @@ export default function App() {
             onOpenDoc={openDoc}
             prefillLink={joinPrefill}
             onPrefillConsumed={() => setJoinPrefill(null)}
+            onOpenProfile={() => setView({ kind: 'profile' })}
           />
         )}
+        {view.kind === 'profile' && <Profile dataVersion={dataVersion} onChanged={setProfile} />}
         {view.kind === 'graph' && <GraphView onOpenDoc={openDoc} />}
       </main>
+
+      {profile && !profile.confirmed && <FirstRunName profile={profile} onSaved={setProfile} />}
 
       {queueCount > 0 && view.kind !== 'review' && (
         <button className="queue-chip" onClick={() => setView({ kind: 'review' })}>
@@ -338,6 +352,7 @@ export default function App() {
             if (a === 'runs') setView({ kind: 'runs' })
             if (a === 'graph') setView({ kind: 'graph' })
             if (a === 'sharing') setView({ kind: 'sharing' })
+            if (a === 'profile') setView({ kind: 'profile' })
             if (a === 'tree') setTreeOpen((t) => !t)
             if (a === 'home') setView({ kind: 'home' })
             if (a === 'newdoc') {
@@ -372,23 +387,7 @@ export default function App() {
   )
 }
 
-/* ---------- palettes ---------- */
-
-function PaletteShell({
-  children,
-  onClose,
-}: {
-  children: React.ReactNode
-  onClose: () => void
-}) {
-  return (
-    <div className="palette-backdrop" onMouseDown={onClose}>
-      <div className="palette" onMouseDown={(e) => e.stopPropagation()}>
-        {children}
-      </div>
-    </div>
-  )
-}
+/* ---------- palettes (PaletteShell lives in ./PaletteShell) ---------- */
 
 /** The full shortcut cheatsheet (opened with `?`). The home hint bar shows the
  * common few; this is the complete list, including the editor-only marks. */
@@ -459,7 +458,7 @@ function CommandPalette({
   onClose,
 }: {
   queueCount: number
-  onAction: (a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph' | 'sharing') => void
+  onAction: (a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph' | 'sharing' | 'profile') => void
   onClose: () => void
 }) {
   const [q, setQ] = useState('')
@@ -473,7 +472,8 @@ function CommandPalette({
     { label: 'New doc…', hint: '⌘N', run: () => onAction('newdoc') },
     { label: 'New canvas…', hint: '⌘⇧N', run: () => onAction('newcanvas') },
     { label: 'Gardeners', hint: '⌘G', run: () => onAction('runs') },
-    { label: 'Sharing & contacts', run: () => onAction('sharing') },
+    { label: 'Shares & contacts', run: () => onAction('sharing') },
+    { label: 'Profile', hint: 'your name, node id, fingerprint', run: () => onAction('profile') },
     { label: 'Graph view', run: () => onAction('graph') },
     { label: 'Toggle file tree', hint: '⌘T', run: () => onAction('tree') },
     { label: 'Home', run: () => onAction('home') },

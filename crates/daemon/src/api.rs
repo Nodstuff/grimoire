@@ -691,17 +691,21 @@ async fn stamp(State(st): State<ApiState>) -> Json<Value> {
     }
 }
 
-/// UI build stamp: mtime of the served index.html. The app polls this and
-/// reloads itself when a deploy lands — no manual ⌘R.
+/// UI build stamp. The app polls this and reloads itself when it changes —
+/// no manual ⌘R after a deploy. With the embedded frontend the stamp is a
+/// hash of the bundled index.html (changes exactly when the UI does); under
+/// the GRIMOIRE_UI_DIST dev override it is that file's mtime. Never a
+/// machine-specific path.
 async fn buildinfo() -> Json<Value> {
-    let dist = std::env::var("GRIMOIRE_UI_DIST")
-        .unwrap_or_else(|_| "/Users/tmeaney/personal/knowledge-system/ui/dist".into());
-    let stamp = std::fs::metadata(format!("{dist}/index.html"))
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let stamp = match std::env::var("GRIMOIRE_UI_DIST") {
+        Ok(dist) => std::fs::metadata(format!("{dist}/index.html"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        Err(_) => crate::ui_build_stamp(),
+    };
     Json(json!({"build": stamp}))
 }
 

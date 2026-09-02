@@ -1,14 +1,18 @@
-// Sharing & contacts (#61): the human surface for federation. Contacts are
-// petnames over pubkeys; shares are grants we own; pending joins are redeems
-// waiting for an offline owner. Minting an invite lives on the doc itself
-// (SharePanel) — this screen is the overview.
+// Shares page (#61): the human surface for federation, both directions.
+// "Shared by me" = grants we own (GET /admin/shares); "Shared with me" =
+// mirrors others granted us (GET /admin/mirrors); pending joins are redeems
+// waiting for an offline owner; contacts are petnames over pubkeys. Minting a
+// first invite lives on the doc itself (SharePanel) — re-inviting a revoked
+// share lives here.
 
 import { useCallback, useEffect, useState } from 'react'
-import { ActivityItem, api, Contact, Doc, PendingJoin, Share } from './types'
+import { ActivityItem, api, Contact, Doc, MirrorRow, PendingJoin, Profile, Share } from './types'
 import { errText, notify } from './Notice'
-import { TrustControl } from './SharePanel'
-import { trustLabel } from './trust'
+import { InviteLink, mintInvite, TrustControl } from './SharePanel'
 import { EventsResponse, LiveEvent, mergeActivity } from './live'
+import { groupShares, mirrorStatusLine, shareTitle, shareWho, shortFingerprint } from './shares'
+import { relTime } from './time'
+import { loadProfile } from './Profile'
 
 function when(iso: string): string {
   const d = new Date(iso)
@@ -21,28 +25,76 @@ function when(iso: string): string {
   })
 }
 
-function fingerprint(pubkey: string): string {
-  return (pubkey.slice(0, 16).match(/.{1,4}/g) ?? []).join(' ')
+const post = (path: string, body?: unknown) =>
+  api(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body ?? {}),
+  })
+
+/** Two-click destructive button: first click arms ("sure?"), second fires;
+ * disarms itself after 2.5s. Never window.confirm. */
+function ArmedButton({
+  label,
+  onFire,
+  className = 'decline',
+  title,
+}: {
+  label: string
+  onFire: () => void
+  className?: string
+  title?: string
+}) {
+  const [armed, setArmed] = useState(false)
+  return (
+    <button
+      className={`${className} ${armed ? 'armed' : ''}`}
+      title={armed ? 'click again to confirm' : title}
+      onClick={() => {
+        if (!armed) {
+          setArmed(true)
+          setTimeout(() => setArmed(false), 2500)
+          return
+        }
+        setArmed(false)
+        onFire()
+      }}
+    >
+      {armed ? 'sure?' : label}
+    </button>
+  )
+}
+
+function PermBadge({ p }: { p: string }) {
+  return <span className={`badge perm-${p}`}>{p === 'propose' ? 'can propose' : 'view only'}</span>
+}
+
+function StateBadge({ s }: { s: string }) {
+  return <span className={`badge state-${s}`}>{s}</span>
 }
 
 export default function Sharing({
   docs,
   dataVersion,
   onOpenDoc,
+  onOpenProfile,
   prefillLink,
   onPrefillConsumed,
 }: {
   docs: Doc[]
   dataVersion: number
   onOpenDoc: (id: string) => void
+  onOpenProfile?: () => void
   prefillLink?: string | null
   onPrefillConsumed?: () => void
 }) {
   const [contacts, setContacts] = useState<Contact[]>([])
   const [shares, setShares] = useState<Share[]>([])
+  const [mirrors, setMirrors] = useState<MirrorRow[] | null>(null)
   const [joins, setJoins] = useState<PendingJoin[]>([])
   const [activity, setActivity] = useState<ActivityItem[]>([])
   const [events, setEvents] = useState<LiveEvent[]>([])
+  const [profile, setProfile] = useState<Profile | null>(null)
   const [joinLink, setJoinLink] = useState(prefillLink ?? '')
   useEffect(() => {
     if (prefillLink) onPrefillConsumed?.()
@@ -50,11 +102,19 @@ export default function Sharing({
   }, [])
   const [joinMsg, setJoinMsg] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [pulling, setPulling] = useState(false)
+  const [showRevoked, setShowRevoked] = useState(false)
+  // re-invite result: which share row it belongs to, and the fresh link
+  const [reinvite, setReinvite] = useState<{ shareId: string; link: string } | null>(null)
+  const [now, setNow] = useState(() => Date.now())
 
   const load = useCallback(() => {
+    setNow(Date.now())
     api<Contact[]>('/admin/contacts').then(setContacts).catch(() => setContacts([]))
-    api<Share[]>('/admin/shares').then(setShares).catch(() => setShares([]))
-    api<PendingJoin[]>('/admin/joins').then(setJoins).catch(() => setJoins([]))
+    api<Share[]>('/admin/shares').then((s) => setShares(Array.isArray(s) ? s : [])).catch(() => setShares([]))
+    // older daemon → no route → null (section hides itself)
+    api<MirrorRow[]>('/admin/mirrors').then((m) => setMirrors(Array.isArray(m) ? m : [])).catch(() => setMirrors(null))
+    api<PendingJoin[]>('/admin/joins').then((j) => setJoins(Array.isArray(j) ? j : [])).catch(() => setJoins([]))
     api<ActivityItem[]>('/api/activity?limit=20')
       .then((a) => setActivity(Array.isArray(a) ? a : []))
       .catch(() => setActivity([]))
@@ -62,9 +122,19 @@ export default function Sharing({
     api<EventsResponse>('/api/events?since=0')
       .then((r) => setEvents(Array.isArray(r?.events) ? r.events : []))
       .catch(() => setEvents([]))
+    loadProfile().then(setProfile)
   }, [])
   useEffect(load, [load, dataVersion])
   const rows = mergeActivity(activity, events)
+
+  const act = (p: Promise<unknown>, okMsg?: string) =>
+    p.then(
+      () => {
+        if (okMsg) notify(okMsg, 'ok')
+        load()
+      },
+      (e) => notify(errText(e)),
+    )
 
   const join = async () => {
     const link = joinLink.trim()
@@ -90,17 +160,100 @@ export default function Sharing({
         setJoinLink('')
       }
     } catch (e) {
-      setJoinMsg(String(e))
+      setJoinMsg(errText(e))
     }
     setBusy(false)
     load()
   }
 
-  const titleOf = (id: string) => docs.find((d) => d.id === id)?.title ?? id.slice(0, 8)
+  const pullNow = () => {
+    if (pulling) return
+    setPulling(true)
+    api('/admin/pull', { method: 'POST' })
+      .then(() => notify('pulled', 'ok'), (e) => notify(errText(e)))
+      .finally(() => {
+        setPulling(false)
+        load()
+      })
+  }
+
+  const reinviteShare = async (sh: Share) => {
+    try {
+      const link = await mintInvite(sh.root_doc, sh.permission)
+      setReinvite({ shareId: sh.id, link })
+      setShowRevoked(true)
+      load()
+    } catch (e) {
+      notify(errText(e))
+    }
+  }
+
+  const titleOf = (id: string) => docs.find((d) => d.id === id)?.title
+  const petnameOf = (id: string) => contacts.find((c) => c.id === id)?.petname
+  const groups = groupShares(shares)
+
+  const shareRow = (sh: Share) => (
+    <div key={sh.id} className={`card share-card ${sh.state === 'revoked' ? 'revoked' : ''}`}>
+      <div className="card-head">
+        <span className="card-doc" onClick={() => onOpenDoc(sh.root_doc)}>
+          {shareTitle(sh, titleOf)}
+        </span>
+        {sh.doc_count != null && (
+          <span className="meta">{sh.doc_count} doc{sh.doc_count === 1 ? '' : 's'}</span>
+        )}
+        <span className="meta share-who">
+          {sh.state === 'offered' ? 'not yet joined' : `with ${shareWho(sh, petnameOf)}`}
+        </span>
+        <PermBadge p={sh.permission} />
+        <StateBadge s={sh.state} />
+        <span className="gardener-actions">
+          {sh.state !== 'revoked' && (
+            <ArmedButton label="revoke" onFire={() => act(post('/admin/shares/revoke', { id: sh.id }), 'revoked')} />
+          )}
+          {sh.state === 'revoked' && (
+            <>
+              <button className="chip" title="mint a fresh invite link for the same subtree" onClick={() => reinviteShare(sh)}>
+                re-invite
+              </button>
+              <ArmedButton
+                label="clear"
+                title="permanently remove this row and its invites"
+                onFire={() => {
+                  if (reinvite?.shareId === sh.id) setReinvite(null)
+                  act(post('/admin/shares/delete', { id: sh.id }))
+                }}
+              />
+            </>
+          )}
+        </span>
+      </div>
+      <div className="meta share-dates">
+        created {relTime(sh.created_at, now)}
+        {sh.redeemed_at ? ` · joined ${relTime(sh.redeemed_at, now)}` : ''}
+      </div>
+      {sh.permission === 'propose' && sh.state === 'active' && (
+        <TrustControl shareId={sh.id} trust={sh.trust} onChanged={load} />
+      )}
+      {reinvite?.shareId === sh.id && (
+        <div className="reinvite">
+          <div className="meta">new invite for this subtree — the old row stays for history</div>
+          <InviteLink link={reinvite.link} />
+        </div>
+      )}
+    </div>
+  )
 
   return (
     <div className="queue">
-      <h1 className="queue-title">sharing</h1>
+      <div className="shares-head">
+        <h1 className="queue-title">shares</h1>
+        {profile && (
+          <button className="chip name-chip" title="your profile — the name contacts see" onClick={onOpenProfile}>
+            {profile.name}
+            {!profile.confirmed && <span className="meta"> · unset</span>}
+          </button>
+        )}
+      </div>
 
       <div className="card">
         <div className="card-head">
@@ -119,16 +272,110 @@ export default function Sharing({
           </button>
         </div>
         {joinMsg && <div className="meta">{joinMsg}</div>}
-        {joins.map((j) => (
-          <div key={j.id} className="pending-join">
-            <span className="meta">
-              queued join · {j.attempts} attempts
-              {j.last_error ? ` · ${j.last_error.slice(0, 80)}` : ''}
-            </span>
-          </div>
-        ))}
       </div>
 
+      {/* ---- shared by me: GET /admin/shares ---- */}
+      <h2 className="runs-title">shared by me</h2>
+      {shares.length === 0 && (
+        <div className="palette-empty">
+          none — open a doc and use its <b>share</b> chip
+        </div>
+      )}
+      {groups.active.map(shareRow)}
+      {groups.offered.map(shareRow)}
+      {groups.revoked.length > 0 && (
+        <div className="revoked-bar">
+          <button className="chip" onClick={() => setShowRevoked((v) => !v)}>
+            {showRevoked ? '▾' : '▸'} {groups.revoked.length} revoked
+          </button>
+          <ArmedButton
+            label="clear all"
+            title="permanently remove every revoked share"
+            onFire={() => {
+              setReinvite(null)
+              act(Promise.all(groups.revoked.map((sh) => post('/admin/shares/delete', { id: sh.id }))), 'cleared')
+            }}
+          />
+        </div>
+      )}
+      {showRevoked && groups.revoked.map(shareRow)}
+
+      {/* ---- shared with me: GET /admin/mirrors ---- */}
+      {mirrors !== null && (
+        <>
+          <div className="section-head">
+            <h2 className="runs-title">shared with me</h2>
+            {mirrors.length > 0 && (
+              <button className="chip" disabled={pulling} onClick={pullNow} title="pull every mirror now">
+                {pulling ? 'pulling…' : 'pull now'}
+              </button>
+            )}
+          </div>
+          {mirrors.length === 0 && <div className="palette-empty">nothing yet — paste an invite link above</div>}
+          {mirrors.map((m) => {
+            const st = mirrorStatusLine(m, now)
+            return (
+              <div key={m.share_id} className={`card share-card ${st.kind === 'failing' ? 'red' : ''}`}>
+                <div className="card-head">
+                  <span className="card-doc" onClick={() => onOpenDoc(m.root_doc_id)}>
+                    {m.root_title}
+                  </span>
+                  {m.doc_count != null && (
+                    <span className="meta">{m.doc_count} doc{m.doc_count === 1 ? '' : 's'}</span>
+                  )}
+                  <span className="meta share-who" title={m.owner_pubkey}>
+                    from {m.owner_petname}
+                  </span>
+                  <PermBadge p={m.permission} />
+                  {m.owner_tended && <span className="badge tended" title="the owner has agents tending this">tended</span>}
+                  <span className="gardener-actions">
+                    <ArmedButton
+                      label="leave"
+                      title="remove this share and its mirrored docs from this install"
+                      onFire={() => act(post('/admin/mirrors/leave', { share_id: m.share_id }), `left “${m.root_title}”`)}
+                    />
+                  </span>
+                </div>
+                <div className={`meta sync-line ${st.kind}`}>
+                  {st.text}
+                  {m.synced_epoch_max != null && st.kind !== 'failing' ? ` · epoch ${m.synced_epoch_max}` : ''}
+                </div>
+              </div>
+            )
+          })}
+        </>
+      )}
+
+      {/* ---- pending joins: GET /admin/joins ---- */}
+      {joins.length > 0 && (
+        <>
+          <div className="section-head">
+            <h2 className="runs-title">pending joins</h2>
+            <ArmedButton label="clear all" onFire={() => act(post('/admin/joins/clear', {}), 'cleared')} />
+          </div>
+          <div className="meta activity-blurb">
+            invites whose owner was unreachable — retried in the background until they succeed or you clear them
+          </div>
+          {joins.map((j) => (
+            <div key={j.id} className="card share-card">
+              <div className="card-head">
+                <span className="mono join-ticket" title={j.ticket}>
+                  {j.ticket.slice(0, 12)}…
+                </span>
+                <span className="meta">
+                  {j.attempts} attempt{j.attempts === 1 ? '' : 's'} · queued {relTime(j.created_at, now)}
+                </span>
+                <span className="gardener-actions">
+                  <ArmedButton label="clear" onFire={() => act(post('/admin/joins/clear', { id: j.id }))} />
+                </span>
+              </div>
+              {j.last_error && <div className="meta sync-line failing">{j.last_error}</div>}
+            </div>
+          ))}
+        </>
+      )}
+
+      {/* ---- contacts ---- */}
       <h2 className="runs-title">contacts</h2>
       {contacts.length === 0 && (
         <div className="palette-empty">
@@ -139,46 +386,7 @@ export default function Sharing({
         <ContactRow key={c.id} c={c} onChanged={load} />
       ))}
 
-      <h2 className="runs-title">shares I own</h2>
-      {shares.length === 0 && (
-        <div className="palette-empty">
-          none — open a doc and use its <b>share</b> chip
-        </div>
-      )}
-      {shares.map((sh) => (
-        <div key={sh.id} className={`card ${sh.state === 'revoked' ? 'revoked' : ''}`}>
-          <div className="card-head">
-            <span className="card-doc" onClick={() => onOpenDoc(sh.root_doc)}>
-              {titleOf(sh.root_doc)}
-            </span>
-            <span className="meta">
-              {sh.permission} · {sh.state}
-              {sh.permission === 'propose' && sh.state === 'active' && ` · ${trustLabel(sh.trust)}`}
-              {sh.contact
-                ? ` · with ${contacts.find((c) => c.id === sh.contact)?.petname ?? '?'}`
-                : ' · invite not yet redeemed'}
-            </span>
-            {sh.state !== 'revoked' && (
-              <button
-                className="decline"
-                onClick={() =>
-                  api('/admin/shares/revoke', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id: sh.id }),
-                  }).then(load, (e) => notify(errText(e)))
-                }
-              >
-                revoke
-              </button>
-            )}
-          </div>
-          {sh.permission === 'propose' && sh.state === 'active' && (
-            <TrustControl shareId={sh.id} trust={sh.trust} onChanged={load} />
-          )}
-        </div>
-      ))}
-
+      {/* ---- recent activity ---- */}
       <h2 className="runs-title">recent activity</h2>
       <div className="meta activity-blurb">
         edits maintainers applied directly to your docs, and owners going live on or adding
@@ -206,7 +414,6 @@ export default function Sharing({
 function ContactRow({ c, onChanged }: { c: Contact; onChanged: () => void }) {
   const [editing, setEditing] = useState(false)
   const [name, setName] = useState(c.petname)
-  const [armed, setArmed] = useState(false)
 
   const rename = async () => {
     setEditing(false)
@@ -216,7 +423,7 @@ function ContactRow({ c, onChanged }: { c: Contact; onChanged: () => void }) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: c.id, petname }),
-    }).catch((e) => notify(String(e)))
+    }).catch((e) => notify(errText(e)))
     onChanged()
   }
 
@@ -248,7 +455,7 @@ function ContactRow({ c, onChanged }: { c: Contact; onChanged: () => void }) {
           </span>
         )}
         <span className="meta mono" title={c.pubkey}>
-          {fingerprint(c.pubkey)}
+          {shortFingerprint(c.pubkey)}
         </span>
         {c.revoked && <span className="verdict v-red">revoked</span>}
         {!c.revoked && (
@@ -261,28 +468,12 @@ function ContactRow({ c, onChanged }: { c: Contact; onChanged: () => void }) {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ id: c.id, verified: !c.verified }),
-                }).then(onChanged, (e) => notify(String(e)))
+                }).then(onChanged, (e) => notify(errText(e)))
               }
             >
               {c.verified ? '✓ verified' : 'verify'}
             </button>
-            <button
-              className={`decline ${armed ? 'armed' : ''}`}
-              onClick={() => {
-                if (!armed) {
-                  setArmed(true)
-                  setTimeout(() => setArmed(false), 2500)
-                  return
-                }
-                api('/admin/contacts/revoke', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ id: c.id }),
-                }).then(onChanged, (e) => notify(String(e)))
-              }}
-            >
-              {armed ? 'sure?' : 'revoke'}
-            </button>
+            <ArmedButton label="revoke" onFire={() => post('/admin/contacts/revoke', { id: c.id }).then(onChanged, (e) => notify(errText(e)))} />
           </span>
         )}
       </div>

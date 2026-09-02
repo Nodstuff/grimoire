@@ -225,7 +225,20 @@ CREATE TABLE IF NOT EXISTS mirrors (
     -- the owner tends this doc (a gardener over it or an ancestor). Shipped in
     -- the pull meta so the grantee can show "tended by owner" and refuse to
     -- tend it locally — one side's agents own a shared doc, never both.
-    owner_tended INTEGER NOT NULL DEFAULT 0
+    owner_tended INTEGER NOT NULL DEFAULT 0,
+    -- sync health, per mirror doc: when the last pull that touched it
+    -- succeeded, and the last pull error (cleared on success). The shares
+    -- page shows these — a mirror that is "titles but no content" MUST read
+    -- as a red row saying why, never as a silent doc.
+    last_pulled_at TEXT,
+    last_error     TEXT
+);
+
+-- Instance-level key/value settings (profile confirmation etc.). Tiny and
+-- deliberately schemaless: anything bigger deserves its own table.
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 
 -- Grantee-side: joins that could not complete because the owner was offline.

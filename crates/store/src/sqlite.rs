@@ -142,6 +142,19 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
                 [],
             )?;
         }
+        for (col, ddl) in [
+            ("last_pulled_at", "ALTER TABLE mirrors ADD COLUMN last_pulled_at TEXT"),
+            ("last_error", "ALTER TABLE mirrors ADD COLUMN last_error TEXT"),
+        ] {
+            let has: i64 = conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('mirrors') WHERE name = ?1",
+                params![col],
+                |r| r.get(0),
+            )?;
+            if has == 0 {
+                conn.execute(ddl, [])?;
+            }
+        }
     }
     let has_gardeners: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'gardeners'",
@@ -479,7 +492,7 @@ fn finish_share(raw: RawShare) -> Result<Share> {
     })
 }
 
-type RawMirror = (String, String, String, i64, String, bool);
+type RawMirror = (String, String, String, i64, String, bool, Option<String>, Option<String>);
 
 fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
     Ok((
@@ -489,11 +502,13 @@ fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
         row.get(3)?,
         row.get(4)?,
         row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
     ))
 }
 
 fn finish_mirror(raw: RawMirror) -> Result<Mirror> {
-    let (doc_id, owner, share_id, synced_epoch, permission, owner_tended) = raw;
+    let (doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error) = raw;
     Ok(Mirror {
         doc_id: uuid_col(doc_id, "mirrors.doc_id")?,
         owner: uuid_col(owner, "mirrors.owner")?,
@@ -502,6 +517,8 @@ fn finish_mirror(raw: RawMirror) -> Result<Mirror> {
         permission: SharePermission::parse(&permission)
             .ok_or_else(|| StoreError::InvalidOp(format!("bad mirror permission: {permission}")))?,
         owner_tended,
+        last_pulled_at,
+        last_error,
     })
 }
 
@@ -934,6 +951,66 @@ impl BlockStore for SqliteStore {
         if n == 0 {
             return Err(StoreError::NotFound(format!("principal {id}")));
         }
+        Ok(())
+    }
+
+    fn rename_principal(&mut self, id: Uuid, display_name: &str) -> Result<()> {
+        let name = display_name.trim();
+        if name.is_empty() || name.chars().count() > 64 {
+            return Err(StoreError::InvalidOp("display name must be 1..64 characters".into()));
+        }
+        let n = self.conn.execute(
+            "UPDATE principals SET display_name = ?1 WHERE id = ?2",
+            params![name, id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("principal {id}")));
+        }
+        Ok(())
+    }
+
+    fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
+            .optional()?)
+    }
+
+    fn set_setting(&mut self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    fn set_mirror_sync_result(&mut self, share_id: Uuid, error: Option<&str>) -> Result<()> {
+        match error {
+            None => self.conn.execute(
+                "UPDATE mirrors SET last_pulled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), last_error = NULL
+                 WHERE share_id = ?1",
+                params![share_id.to_string()],
+            )?,
+            Some(e) => self.conn.execute(
+                "UPDATE mirrors SET last_error = ?2 WHERE share_id = ?1",
+                params![share_id.to_string(), e],
+            )?,
+        };
+        Ok(())
+    }
+
+    fn delete_share(&mut self, id: Uuid) -> Result<()> {
+        let share = self.get_share(id)?;
+        if share.state != ShareState::Revoked {
+            return Err(StoreError::InvalidOp(
+                "only a revoked share can be cleared — revoke it first".into(),
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM share_invites WHERE share_id = ?1", params![id.to_string()])?;
+        tx.execute("DELETE FROM shares WHERE id = ?1", params![id.to_string()])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2285,7 +2362,7 @@ impl BlockStore for SqliteStore {
     fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>> {
         self.conn
             .query_row(
-                "SELECT doc_id, owner, share_id, synced_epoch, permission, owner_tended FROM mirrors WHERE doc_id = ?1",
+                "SELECT doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error FROM mirrors WHERE doc_id = ?1",
                 params![doc_id.to_string()],
                 mirror_row,
             )
@@ -2349,7 +2426,7 @@ impl BlockStore for SqliteStore {
 
     fn list_mirrors(&self) -> Result<Vec<Mirror>> {
         let mut stmt = self.conn.prepare(
-            "SELECT doc_id, owner, share_id, synced_epoch, permission, owner_tended FROM mirrors ORDER BY doc_id",
+            "SELECT doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error FROM mirrors ORDER BY doc_id",
         )?;
         let rows = stmt.query_map([], mirror_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?

@@ -1289,3 +1289,49 @@ kbd {
 .cnode-cloud { padding: 24px 30px; }
 .cnode-document { padding-bottom: 22px; }
 .canvas-live-btn.on { color: var(--green); border: 1px solid var(--green); border-radius: 8px; }
+
+/* ---------- shares page (both directions) + profile ---------- */
+.shares-head { display: flex; align-items: baseline; gap: 12px; }
+.shares-head .queue-title { margin-bottom: 0; }
+.name-chip { margin-left: auto; }
+.section-head { display: flex; align-items: baseline; gap: 10px; }
+.section-head .runs-title { flex: 1; }
+.share-card .card-head { flex-wrap: wrap; row-gap: 6px; margin-bottom: 4px; }
+.share-who { white-space: nowrap; }
+.share-dates { margin-top: 2px; }
+.badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 1px 7px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.badge.perm-propose { color: var(--yellow); border-color: var(--yellow); }
+.badge.state-active { color: var(--green); border-color: var(--green); }
+.badge.state-offered { color: var(--accent); border-color: var(--accent); }
+.badge.state-revoked { color: var(--red); border-color: var(--red); }
+.badge.tended { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
+.sync-line { margin-top: 4px; }
+.sync-line.failing { color: var(--red); word-break: break-word; }
+.sync-line.never { color: var(--yellow); }
+.revoked-bar { display: flex; align-items: center; gap: 10px; padding: 4px 0; }
+.reinvite { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+.join-ticket { font-size: 12px; }
+.chip.armed, .decline.armed { background: var(--red); color: var(--bg); border-color: var(--red); }
+
+.first-run { padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; }
+.first-run-title { font-size: 16px; font-weight: 650; }
+.palette .first-run input {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: var(--panel2);
+}
+.first-run-actions { display: flex; align-items: center; gap: 12px; justify-content: flex-end; }
+.profile-name-row { display: flex; gap: 8px; align-items: center; }
+.profile-name { font-family: inherit; font-size: 14px; }
+.profile-kv { display: grid; grid-template-columns: 90px 1fr auto; gap: 10px; align-items: center; padding: 4px 0; font-size: 13px; }

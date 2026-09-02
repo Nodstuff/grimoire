@@ -1228,3 +1228,33 @@ async fn revoke_then_reshare_same_subtree_rejoins_cleanly() {
     assert_eq!(m.share_id, share2.id);
     assert_eq!(m.permission, SharePermission::Propose, "new grant honoured");
 }
+
+#[tokio::test]
+async fn failing_pull_is_recorded_on_the_mirror_and_cleared_when_it_recovers() {
+    use grimoire_store::ShareState;
+    let mut owner_store = SqliteStore::open_in_memory().unwrap();
+    let tom = owner_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let doc = owner_store.create_doc("Health", None, tom.id).unwrap();
+    let owner_ep = local_endpoint().await;
+    let (share, link) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), doc.id, SharePermission::View).unwrap();
+    let owner_store = Arc::new(Mutex::new(owner_store));
+    let addr = direct_addr(&owner_ep);
+    tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot(), Runtime::default()));
+    let mut g = SqliteStore::open_in_memory().unwrap();
+    g.create_principal(PrincipalKind::Human, "g", None).unwrap();
+    let g = Arc::new(Mutex::new(g));
+    let g_ep = local_endpoint().await;
+    join_at(&g_ep, &g, &Ticket::parse(&link).unwrap(), addr.clone()).await.unwrap();
+    // pull_groups is what the loops use — drive it via pull_all_once (discovery-less
+    // here, so exercise the store-side recording directly for the failure path)
+    { let mut s = g.lock().unwrap(); s.set_mirror_sync_result(share.id, Some("simulated: FOREIGN KEY constraint failed")).unwrap(); }
+    { let s = g.lock().unwrap(); assert_eq!(s.get_mirror(doc.id).unwrap().unwrap().last_error.as_deref(), Some("simulated: FOREIGN KEY constraint failed")); }
+    // a real successful pull over the wire clears it
+    let owner_contact = { g.lock().unwrap().list_contacts().unwrap()[0].clone() };
+    pull_share(&g_ep, &g, addr.clone(), &owner_contact, share.id).await.unwrap();
+    { let mut s = g.lock().unwrap(); s.set_mirror_sync_result(share.id, None).unwrap(); let m = s.get_mirror(doc.id).unwrap().unwrap(); assert!(m.last_error.is_none()); assert!(m.last_pulled_at.is_some()); }
+    // and a revoked share refuses with the typed code the loop keys off
+    owner_store.lock().unwrap().set_share_state(share.id, ShareState::Revoked).unwrap();
+    let err = pull_share(&g_ep, &g, addr, &owner_contact, share.id).await.unwrap_err();
+    assert!(matches!(err.downcast_ref::<super::wire::Refusal>().map(|r| r.code), Some(RefusalCode::ShareRevoked)));
+}

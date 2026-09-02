@@ -52,6 +52,53 @@ export function TrustControl({
   )
 }
 
+/** A freshly minted invite: the link (click to copy), a QR, and the warning
+ * that the link is the secret. Shared by the per-doc panel and the Shares
+ * page's re-invite action. */
+export function InviteLink({ link }: { link: string }) {
+  const [qr, setQr] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
+
+  useEffect(() => {
+    QRCode.toDataURL(link, { margin: 1, width: 220, color: { dark: '#d6d6dd', light: '#17171d' } })
+      .then(setQr)
+      .catch(() => setQr(null))
+  }, [link])
+
+  const copy = () => {
+    navigator.clipboard.writeText(link).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1800)
+    })
+  }
+
+  return (
+    <div className="share-link">
+      <div className="link-box mono" onClick={copy} title="click to copy">
+        {link.slice(0, 52)}…
+      </div>
+      <button className="chip" onClick={copy}>
+        {copied ? 'copied ✓' : 'copy link'}
+      </button>
+      {qr && <img className="share-qr" src={qr} alt="invite QR" />}
+      <div className="meta">
+        one-time use · expires in 7 days · the link IS the secret — send
+        it over a private channel
+      </div>
+    </div>
+  )
+}
+
+/** POST /admin/shares — mint a one-time invite for a subtree. */
+export async function mintInvite(rootDoc: string, permission: 'view' | 'propose'): Promise<string> {
+  const r = await api<{ share: Share; link: string }>('/admin/shares', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ root_doc: rootDoc, permission }),
+  })
+  return r.link
+}
+
 export default function SharePanel({
   doc,
   fed,
@@ -65,41 +112,16 @@ export default function SharePanel({
 }) {
   const [permission, setPermission] = useState<'view' | 'propose'>('view')
   const [link, setLink] = useState<string | null>(null)
-  const [qr, setQr] = useState<string | null>(null)
-  const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (!link) {
-      setQr(null)
-      return
-    }
-    QRCode.toDataURL(link, { margin: 1, width: 220, color: { dark: '#d6d6dd', light: '#17171d' } })
-      .then(setQr)
-      .catch(() => setQr(null))
-  }, [link])
 
   const mint = async () => {
     setError(null)
     try {
-      const r = await api<{ share: Share; link: string }>('/admin/shares', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ root_doc: doc.id, permission }),
-      })
-      setLink(r.link)
+      setLink(await mintInvite(doc.id, permission))
       onChanged()
     } catch (e) {
-      setError(String(e))
+      setError(errText(e))
     }
-  }
-
-  const copy = () => {
-    if (!link) return
-    navigator.clipboard.writeText(link).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1800)
-    })
   }
 
   // shares rooted here vs inherited from an ancestor
@@ -174,21 +196,7 @@ export default function SharePanel({
           </button>
         </div>
         {error && <div className="meta err">{error}</div>}
-        {link && (
-          <div className="share-link">
-            <div className="link-box mono" onClick={copy} title="click to copy">
-              {link.slice(0, 52)}…
-            </div>
-            <button className="chip" onClick={copy}>
-              {copied ? 'copied ✓' : 'copy link'}
-            </button>
-            {qr && <img className="share-qr" src={qr} alt="invite QR" />}
-            <div className="meta">
-              one-time use · expires in 7 days · the link IS the secret — send
-              it over a private channel
-            </div>
-          </div>
-        )}
+        {link && <InviteLink link={link} />}
       </div>
     </aside>
   )

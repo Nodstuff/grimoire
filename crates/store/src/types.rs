@@ -606,6 +606,10 @@ pub struct Mirror {
     /// The owner tends this doc on their side; the grantee shows it and is
     /// refused local tending (avoids two agents editing both copies).
     pub owner_tended: bool,
+    /// When the last successful pull touched this mirror (ISO), if ever.
+    pub last_pulled_at: Option<String>,
+    /// The last pull error for this mirror's share; None once a pull succeeds.
+    pub last_error: Option<String>,
 }
 
 /// A queued join (grantee-side): a redeem that waits for the owner to be up.

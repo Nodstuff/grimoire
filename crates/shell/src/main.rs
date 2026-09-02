@@ -218,7 +218,7 @@ fn main() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("error building knowledge-system shell")
+        .expect("error building Grimoire shell")
         .run(|_app, event| {
             match event {
                 // keep running with zero windows; only the tray Quit exits

@@ -66,6 +66,24 @@ pub trait BlockStore {
     /// instance's federation identity on first serve (ADR 0002, #54).
     fn set_principal_pubkey(&mut self, id: Uuid, pubkey: &str) -> Result<()>;
 
+    /// Change a principal's display name (1..64 chars). For the human owner
+    /// this is the petname every contact sees — never a hardcoded default.
+    fn rename_principal(&mut self, id: Uuid, display_name: &str) -> Result<()>;
+
+    /// Instance-level settings (tiny kv): e.g. `profile.confirmed`.
+    fn get_setting(&self, key: &str) -> Result<Option<String>>;
+    fn set_setting(&mut self, key: &str, value: &str) -> Result<()>;
+
+    /// Record the outcome of a pull for every mirror of a share: success
+    /// stamps last_pulled_at and clears last_error; failure stores the error.
+    /// The shares page reads these so a failing mirror is a red row, not a
+    /// silent doc.
+    fn set_mirror_sync_result(&mut self, share_id: Uuid, error: Option<&str>) -> Result<()>;
+
+    /// Permanently remove a REVOKED share and its invites (the "clear" action
+    /// on the shares page). Active/offered shares must be revoked first.
+    fn delete_share(&mut self, id: Uuid) -> Result<()>;
+
     fn create_doc(&mut self, title: &str, parent: Option<Uuid>, created_by: Uuid) -> Result<Doc>;
 
     fn list_docs(&self) -> Result<Vec<Doc>>;

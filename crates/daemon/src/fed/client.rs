@@ -24,10 +24,16 @@ pub async fn request(
     addr: impl Into<EndpointAddr>,
     req: Request,
 ) -> Result<Response> {
-    let conn = endpoint
-        .connect(addr, ALPN)
-        .await
-        .context("dialing federation peer")?;
+    // iroh's own give-up on an unreachable peer is ~30s; an interactive
+    // "pull now" or join should not hang that long — 10s is plenty for a
+    // relay round-trip, and the background loops retry anyway.
+    let conn = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        endpoint.connect(addr, ALPN),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("dial timed out after 10s (peer offline or unreachable)"))?
+    .context("dialing federation peer")?;
     let (mut send, mut recv) = conn.open_bi().await?;
     let out = serde_json::to_vec(&Frame {
         v: PROTOCOL_VERSION,

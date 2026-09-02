@@ -264,13 +264,181 @@ async fn create_share(State(st): State<FedState>, Json(req): Json<CreateShare>) 
     }
 }
 
+/// Owner side of the shares page: every share with what the UI needs to
+/// render it in one row — title, size, who, grant, trust, state.
 async fn list_shares(State(st): State<FedState>) -> Json<Value> {
     let s = st
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let contacts = s.list_contacts().unwrap_or_default();
     match s.list_shares() {
-        Ok(shares) => Json(json!(shares)),
+        Ok(shares) => Json(json!(
+            shares
+                .into_iter()
+                .map(|sh| {
+                    let root = s.get_doc(sh.root_doc).ok();
+                    let doc_count = s.docs_in_share(sh.id).map(|d| d.len()).unwrap_or(0);
+                    let petname = sh
+                        .contact
+                        .and_then(|c| contacts.iter().find(|x| x.id == c))
+                        .map(|c| c.petname.clone());
+                    let mut v = json!(sh);
+                    v["root_title"] = json!(root.as_ref().map(|d| d.title.clone()).unwrap_or_default());
+                    v["doc_count"] = json!(doc_count);
+                    v["contact_petname"] = json!(petname);
+                    v
+                })
+                .collect::<Vec<_>>()
+        )),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+/// Permanently clear a REVOKED share (and its invites) — the shares page's
+/// "clear". Active/offered shares must be revoked first (store enforces).
+async fn delete_share(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.delete_share(req.id) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+/// Grantee side of the shares page: one row per share we hold mirrors of,
+/// with sync health — a failing pull is a red row saying WHY, never a doc
+/// that silently has titles and no content.
+async fn list_mirrors(State(st): State<FedState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let contacts = s.list_contacts().unwrap_or_default();
+    let mirrors = s.list_mirrors().unwrap_or_default();
+    let mut by_share: std::collections::BTreeMap<Uuid, Vec<&grimoire_store::Mirror>> = Default::default();
+    for m in &mirrors {
+        by_share.entry(m.share_id).or_default().push(m);
+    }
+    let rows: Vec<Value> = by_share
+        .into_iter()
+        .map(|(share_id, ms)| {
+            let ids: std::collections::HashSet<Uuid> = ms.iter().map(|m| m.doc_id).collect();
+            // the root: the mirror whose parent is not a mirror of this share
+            let root = ms
+                .iter()
+                .filter_map(|m| s.get_doc(m.doc_id).ok())
+                .find(|d| d.parent_id.map(|p| !ids.contains(&p)).unwrap_or(true));
+            let owner = contacts.iter().find(|c| c.id == ms[0].owner);
+            json!({
+                "share_id": share_id,
+                "owner_petname": owner.map(|c| c.petname.clone()).unwrap_or_else(|| "?".into()),
+                "owner_pubkey": owner.map(|c| c.pubkey.clone()).unwrap_or_default(),
+                "permission": ms[0].permission,
+                "root_doc_id": root.as_ref().map(|d| d.id),
+                "root_title": root.as_ref().map(|d| d.title.clone()).unwrap_or_else(|| "(shared docs)".into()),
+                "doc_count": ms.len(),
+                "synced_epoch_max": ms.iter().map(|m| m.synced_epoch).max().unwrap_or(0),
+                "last_pulled_at": ms.iter().filter_map(|m| m.last_pulled_at.clone()).max(),
+                "last_error": ms.iter().find_map(|m| m.last_error.clone()),
+                "owner_tended": ms.iter().any(|m| m.owner_tended),
+            })
+        })
+        .collect();
+    Json(json!(rows))
+}
+
+#[derive(Deserialize)]
+pub struct ShareIdReq {
+    pub share_id: Uuid,
+}
+
+/// Leave a share we were granted: drop every mirror of it locally (soft-
+/// deleted docs, mirror rows removed). The owner's share is untouched — it is
+/// theirs to revoke; a later re-join revives the docs.
+async fn leave_share(State(st): State<FedState>, Json(req): Json<ShareIdReq>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dropped = crate::fed::loops::drop_dead_share(&mut s, req.share_id);
+    Json(json!({"ok": true, "dropped": dropped.len()}))
+}
+
+#[derive(Deserialize)]
+pub struct ClearJoinsReq {
+    pub id: Option<Uuid>,
+}
+
+/// Clear pending join attempts: one by id, or all of them.
+async fn clear_joins(State(st): State<FedState>, Json(req): Json<ClearJoinsReq>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ids: Vec<Uuid> = match req.id {
+        Some(id) => vec![id],
+        None => s.list_pending_joins().unwrap_or_default().into_iter().map(|j| j.id).collect(),
+    };
+    let mut n = 0;
+    for id in ids {
+        if s.remove_pending_join(id).is_ok() {
+            n += 1;
+        }
+    }
+    Json(json!({"ok": true, "cleared": n}))
+}
+
+/// The instance owner's profile: display name (the petname contacts see),
+/// identity, and whether the name was ever confirmed by the user.
+async fn get_profile(State(st): State<FedState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let human = s
+        .list_principals()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|p| p.kind == grimoire_store::PrincipalKind::Human);
+    let Some(human) = human else {
+        return Json(json!({"error": "no human principal"}));
+    };
+    let confirmed = s.get_setting("profile.confirmed").ok().flatten().as_deref() == Some("1");
+    Json(json!({
+        "name": human.display_name,
+        "principal_id": human.id,
+        "node_id": st.ctx.node_id,
+        "fingerprint": st.ctx.node_id.as_deref().map(crate::identity::fingerprint_of),
+        "confirmed": confirmed,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct ProfileReq {
+    pub name: String,
+}
+
+async fn set_profile(State(st): State<FedState>, Json(req): Json<ProfileReq>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let human = s
+        .list_principals()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|p| p.kind == grimoire_store::PrincipalKind::Human);
+    let Some(human) = human else {
+        return Json(json!({"error": "no human principal"}));
+    };
+    match s.rename_principal(human.id, &req.name) {
+        Ok(()) => {
+            s.set_setting("profile.confirmed", "1").ok();
+            Json(json!({"ok": true, "name": req.name.trim()}))
+        }
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
@@ -514,6 +682,11 @@ pub fn router(store: Store, fed: FedCtx, hot: crate::hot::HotState) -> Router {
     let fed_routes = Router::new()
         .route("/admin/shares", get(list_shares).post(create_share))
         .route("/admin/shares/revoke", post(revoke_share))
+        .route("/admin/shares/delete", post(delete_share))
+        .route("/admin/mirrors", get(list_mirrors))
+        .route("/admin/mirrors/leave", post(leave_share))
+        .route("/admin/joins/clear", post(clear_joins))
+        .route("/api/profile", get(get_profile).post(set_profile))
         .route("/admin/shares/trust", post(set_share_trust))
         .route("/admin/contacts", get(list_contacts))
         .route("/admin/contacts/revoke", post(revoke_contact))
