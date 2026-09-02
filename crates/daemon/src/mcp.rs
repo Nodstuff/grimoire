@@ -736,7 +736,7 @@ impl KsMcp {
 impl ServerHandler for KsMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "knowledge-system: docs as block trees with a review gate. Read \
+            "Grimoire: docs as block trees with a review gate. Read \
                  (read_doc returns the epoch), then propose edits quoting that epoch \
                  as base_epoch. Verdicts: green applied, yellow applied+flagged, red \
                  parked for review. If told stale_base, call diff_since and re-propose.",

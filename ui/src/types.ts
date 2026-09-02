@@ -40,9 +40,39 @@ export interface Share {
   /** review = proposals park (default); yellow = trusted, edits apply flagged;
    * green = maintainer, edits apply directly and the owner is notified */
   trust: ShareTrust
+  /* newer daemons enrich GET /admin/shares; every field below is optional */
+  root_title?: string
+  doc_count?: number
+  contact_petname?: string | null
+  redeemed_at?: string | null
 }
 
 export type ShareTrust = 'review' | 'yellow' | 'green'
+
+/** A share someone else granted us — GET /admin/mirrors. */
+export interface MirrorRow {
+  share_id: string
+  owner_petname: string
+  owner_pubkey: string
+  permission: 'view' | 'propose'
+  root_doc_id: string
+  root_title: string
+  doc_count?: number
+  synced_epoch_max?: number
+  last_pulled_at?: string | null
+  last_error?: string | null
+  owner_tended?: boolean
+}
+
+/** GET /api/profile — who this install is to its contacts. */
+export interface Profile {
+  name: string
+  principal_id: string
+  node_id?: string
+  fingerprint?: string
+  /** false = still the install default; the user has never chosen a name */
+  confirmed: boolean
+}
 
 /** One maintainer-tier (green) edit applied directly by a remote principal —
  * the owner's notification feed (GET /api/activity). */

@@ -434,3 +434,61 @@ fn mirror_replace_blocks_accepts_children_before_parents() {
     s.mirror_replace_blocks(doc, vec![mk(h1, None, "i", BlockType::Heading, "# Top v2")], 8, owner.principal).unwrap();
     assert_eq!(s.read_doc(doc).unwrap().roots[0].block.content, "# Top v2");
 }
+
+#[test]
+fn profile_rename_and_settings() {
+    let (mut s, tom) = store_with_tom();
+    s.rename_principal(tom.id, "  Tom M  ").unwrap();
+    assert_eq!(s.get_principal(tom.id).unwrap().display_name, "Tom M", "trimmed");
+    assert!(s.rename_principal(tom.id, "   ").is_err(), "empty refused");
+    assert!(s.rename_principal(tom.id, &"x".repeat(65)).is_err(), "too long refused");
+    assert!(s.rename_principal(uuid::Uuid::now_v7(), "ghost").is_err(), "unknown principal");
+    assert_eq!(s.get_setting("profile.confirmed").unwrap(), None);
+    s.set_setting("profile.confirmed", "1").unwrap();
+    assert_eq!(s.get_setting("profile.confirmed").unwrap().as_deref(), Some("1"));
+    s.set_setting("profile.confirmed", "0").unwrap(); // upsert
+    assert_eq!(s.get_setting("profile.confirmed").unwrap().as_deref(), Some("0"));
+}
+
+#[test]
+fn mirror_sync_result_records_errors_and_clears_on_success() {
+    let (mut s, _tom) = store_with_tom();
+    let owner = s.pair_contact(&"12".repeat(32), "owner").unwrap();
+    let share = uuid::Uuid::now_v7();
+    let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    for (d, t) in [(a, "A"), (b, "B")] {
+        s.create_doc_with_id(d, t, None, owner.principal).unwrap();
+        s.upsert_mirror(d, owner.id, share, 1, SharePermission::View).unwrap();
+    }
+    let m = s.get_mirror(a).unwrap().unwrap();
+    assert!(m.last_pulled_at.is_none() && m.last_error.is_none(), "fresh mirror: never synced");
+    s.set_mirror_sync_result(share, Some("FOREIGN KEY constraint failed")).unwrap();
+    for d in [a, b] {
+        let m = s.get_mirror(d).unwrap().unwrap();
+        assert_eq!(m.last_error.as_deref(), Some("FOREIGN KEY constraint failed"));
+        assert!(m.last_pulled_at.is_none(), "a failure is not a pull");
+    }
+    s.set_mirror_sync_result(share, None).unwrap();
+    for d in [a, b] {
+        let m = s.get_mirror(d).unwrap().unwrap();
+        assert!(m.last_error.is_none(), "success clears the error");
+        assert!(m.last_pulled_at.is_some(), "success stamps the time");
+    }
+    // upsert (a pull re-claiming the row) must not wipe sync health
+    s.upsert_mirror(a, owner.id, share, 2, SharePermission::View).unwrap();
+    assert!(s.get_mirror(a).unwrap().unwrap().last_pulled_at.is_some());
+}
+
+#[test]
+fn delete_share_clears_only_revoked_shares_and_their_invites() {
+    let (mut s, tom) = store_with_tom();
+    let doc = s.create_doc("D", None, tom.id).unwrap();
+    let share = s.create_share(doc.id, None, SharePermission::View, None).unwrap();
+    s.create_invite(share.id, "h1", "2099-01-01T00:00:00.000Z").unwrap();
+    assert!(s.delete_share(share.id).is_err(), "offered share must be revoked first");
+    s.set_share_state(share.id, ShareState::Revoked).unwrap();
+    s.delete_share(share.id).unwrap();
+    assert!(s.get_share(share.id).is_err(), "row gone");
+    assert!(s.redeem_invite("h1", &"34".repeat(32), "x").is_err(), "its invite is gone too");
+    assert!(s.list_shares().unwrap().is_empty());
+}

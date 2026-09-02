@@ -55,6 +55,22 @@ async fn serve_embedded_ui(uri: axum::http::Uri) -> axum::response::Response {
         .into_response()
 }
 
+/// A stable stamp for the embedded frontend: FNV-1a over the bundled
+/// index.html (its asset names carry Vite's content hashes, so any UI change
+/// changes this). Computed once.
+pub fn ui_build_stamp() -> u64 {
+    static STAMP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *STAMP.get_or_init(|| {
+        let Some(f) = EmbeddedUi::get("index.html") else { return 0 };
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in f.data.iter() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    })
+}
+
 /// Content type from a file extension — the handful Vite emits. Kept local to
 /// avoid a mime dependency.
 fn content_type_for(name: &str) -> &'static str {
@@ -81,7 +97,7 @@ fn content_type_for(name: &str) -> &'static str {
 }
 
 #[derive(Parser)]
-#[command(name = "grimoire", about = "knowledge-system daemon")]
+#[command(name = "grimoire", about = "Grimoire daemon")]
 struct Cli {
     /// Path to the SQLite database.
     #[arg(long, default_value_os_t = default_db())]
@@ -164,7 +180,8 @@ enum ShareCmd {
     Revoke {
         share_id: String,
     },
-    /// Set a share's trust tier: review (park, default) or yellow (trusted).
+    /// Set a share's trust tier: review (park, default), yellow (trusted:
+    /// applies flagged) or green (maintainer: applies directly, you're notified).
     Trust {
         share_id: String,
         trust: String,

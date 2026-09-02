@@ -154,6 +154,14 @@ async fn pull_groups(
             Ok(id) => pull_share(endpoint, store, EndpointAddr::from(id), &owner, share_id).await,
             Err(_) => Err(anyhow::anyhow!("contact has a malformed pubkey")),
         };
+        // sync health for the shares page: success clears, failure records
+        {
+            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+            match &res {
+                Ok(_) => s.set_mirror_sync_result(share_id, None).ok(),
+                Err(e) => s.set_mirror_sync_result(share_id, Some(&format!("{e:#}"))).ok(),
+            };
+        }
         if let Err(e) = &res
             && share_is_dead(e)
         {
