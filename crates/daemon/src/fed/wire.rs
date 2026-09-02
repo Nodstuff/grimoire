@@ -8,8 +8,12 @@ pub const ALPN: &[u8] = b"grimoire/fed/0";
 /// Long-lived hot-session bridge streams (#66).
 pub const HOT_ALPN: &[u8] = b"grimoire/hot/0";
 pub const PROTOCOL_VERSION: u32 = 0;
-/// Frame cap. Snapshots (#58) will stream doc-by-doc, not grow this.
+/// Frame cap: a single frame is never larger than this, in either direction.
 pub const MAX_FRAME: usize = 32 * 1024 * 1024;
+/// Pull paging: the owner stops adding `changed` docs once their serialized
+/// blocks pass this (at least one doc always ships), sets `more`, and the
+/// grantee pulls again. Well under MAX_FRAME so metas + JSON overhead fit.
+pub const PULL_BUDGET: usize = 4 * 1024 * 1024;
 
 /// Invite secrets are stored hashed (share_invites.secret_hash); the secret
 /// itself only ever exists inside the grimoire:// link. Mint (#57) and
@@ -69,10 +73,16 @@ pub enum Request {
         doc: String,
     },
     /// Requires propose permission. Starting remotely seeds from the
-    /// GRANTEE's mirror (same content — the epoch is the owner's current).
+    /// GRANTEE's mirror, so the owner only CREATES a session when the
+    /// grantee's copy is at the owner's current epoch (`base_epoch`); a
+    /// behind copy is refused with `RefusalCode::StaleBase` — otherwise the
+    /// flatten would land the stale text over the owner's newer edits.
+    /// Joining an already-live session needs no epoch.
     HotStart {
         share: String,
         doc: String,
+        #[serde(default)]
+        base_epoch: Option<i64>,
     },
     /// Cold-editor heartbeat from a grantee (auto-hot). Requires propose —
     /// only someone who could edit can escalate.
@@ -166,6 +176,11 @@ pub enum Response {
         metas: Vec<WireDocMeta>,
         changed: Vec<WireDoc>,
         removed: Vec<String>,
+        /// The owner capped `changed` to stay under the frame budget; docs
+        /// still behind were left out of `changed` (their metas still ship).
+        /// The grantee pulls again with updated cursors until this is false.
+        #[serde(default)]
+        more: bool,
     },
     /// Ops parked on the owner; these ids are the status handle.
     Proposed {
@@ -231,6 +246,9 @@ pub enum RefusalCode {
     ViewOnly,
     /// The doc is in a live session (P2.3); retry after it ends.
     DocHot,
+    /// The caller's copy of the doc is behind the owner's epoch: pull first,
+    /// then retry (a seed from a stale mirror would overwrite newer edits).
+    StaleBase,
     /// Malformed ids / payload.
     BadRequest,
     /// Protocol version mismatch.

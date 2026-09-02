@@ -20,6 +20,22 @@ impl SqliteStore {
         Self::init(Connection::open_in_memory()?)
     }
 
+    /// A consistent single-file copy of the database at `path` (no -wal/-shm
+    /// pair to keep together), via `VACUUM INTO`. Runs inside SQLite's own
+    /// read transaction, so concurrent writers are neither blocked nor
+    /// captured half-way. The target must not exist.
+    pub fn backup_to(&self, path: &Path) -> Result<()> {
+        if path.exists() {
+            return Err(StoreError::InvalidOp(format!(
+                "backup target exists: {}",
+                path.display()
+            )));
+        }
+        self.conn
+            .execute("VACUUM INTO ?1", params![path.to_string_lossy()])?;
+        Ok(())
+    }
+
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
@@ -75,6 +91,19 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
             conn.execute("ALTER TABLE docs ADD COLUMN sort_key TEXT", [])?;
             conn.execute(
                 "ALTER TABLE docs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let has_deleted_at: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('docs') WHERE name = 'deleted_at'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_deleted_at == 0 {
+            conn.execute("ALTER TABLE docs ADD COLUMN deleted_at TEXT", [])?;
+            // pre-Trash tombstones: give them a stamp so they show and restore
+            conn.execute(
+                "UPDATE docs SET deleted_at = created_at WHERE deleted = 1 AND deleted_at IS NULL",
                 [],
             )?;
         }
@@ -1252,17 +1281,141 @@ impl BlockStore for SqliteStore {
             }
             i += 1;
         }
+        // one stamp for the whole subtree: restore_doc revives exactly the
+        // docs that fell together, not a child tombstoned earlier on its own
+        let stamp: String = self.conn.query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            [],
+            |r| r.get(0),
+        )?;
+        let tx = self.conn.transaction()?;
         let mut n = 0;
         for d in &to_delete {
-            n += self.conn.execute(
-                "UPDATE docs SET deleted = 1 WHERE id = ?1",
-                params![d.to_string()],
+            n += tx.execute(
+                "UPDATE docs SET deleted = 1, deleted_at = ?2 WHERE id = ?1 AND deleted = 0",
+                params![d.to_string(), stamp],
             )?;
         }
         if n == 0 {
             return Err(StoreError::NotFound(format!("doc {doc_id}")));
         }
+        tx.commit()?;
         Ok(n)
+    }
+
+    fn list_trash(&self) -> Result<Vec<TrashEntry>> {
+        // roots of tombstoned subtrees: deleted, and the parent is live or
+        // absent. Docs a remote owner created are dropped mirrors of a revoked
+        // share, not the user's own deletions — they revive via re-join.
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by,
+                    d.status, d.sort_key, d.deleted_at,
+                    (SELECT count(*) FROM docs c
+                      WHERE c.deleted = 1 AND c.deleted_at = d.deleted_at AND c.id != d.id
+                        AND c.id IN (WITH RECURSIVE sub(id) AS (
+                              SELECT id FROM docs WHERE parent_id = d.id
+                              UNION ALL
+                              SELECT docs.id FROM docs JOIN sub ON docs.parent_id = sub.id)
+                            SELECT id FROM sub)) AS descendants
+             FROM docs d
+             JOIN principals p ON p.id = d.created_by
+             WHERE d.deleted = 1
+               AND p.kind != 'remote'
+               AND (d.parent_id IS NULL
+                    OR NOT EXISTS (SELECT 1 FROM docs pd WHERE pd.id = d.parent_id AND pd.deleted = 1))
+             ORDER BY d.deleted_at DESC, d.title",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let raw: RawDoc = (
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            );
+            let deleted_at: Option<String> = r.get(8)?;
+            let descendants: i64 = r.get(9)?;
+            Ok((raw, deleted_at, descendants))
+        })?;
+        rows.map(|r| {
+            let (raw, deleted_at, descendants) = r?;
+            Ok(TrashEntry {
+                doc: build_doc(raw)?,
+                deleted_at: deleted_at.unwrap_or_default(),
+                descendants: descendants as usize,
+            })
+        })
+        .collect()
+    }
+
+    fn restore_doc(&mut self, doc_id: Uuid) -> Result<usize> {
+        let (stamp, parent): (Option<String>, Option<String>) = self
+            .conn
+            .query_row(
+                "SELECT deleted_at, parent_id FROM docs WHERE id = ?1 AND deleted = 1",
+                params![doc_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("doc {doc_id} is not in the trash")))?;
+        let tx = self.conn.transaction()?;
+        // the subtree that fell with it: descendants sharing the stamp
+        let mut to_restore = vec![doc_id];
+        let mut i = 0;
+        while i < to_restore.len() {
+            let kids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM docs WHERE parent_id = ?1 AND deleted = 1
+                       AND ((?2 IS NULL AND deleted_at IS NULL) OR deleted_at = ?2)",
+                )?;
+                let rows = stmt.query_map(params![to_restore[i].to_string(), stamp], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            for k in kids {
+                to_restore.push(uuid_col(k, "docs.id")?);
+            }
+            i += 1;
+        }
+        let mut n = 0;
+        for d in &to_restore {
+            n += tx.execute(
+                "UPDATE docs SET deleted = 0, deleted_at = NULL WHERE id = ?1",
+                params![d.to_string()],
+            )?;
+        }
+        // a parent that is itself still in the trash would hide the restored
+        // doc again: surface it at the root instead
+        if let Some(p) = parent {
+            let parent_deleted: i64 = tx.query_row(
+                "SELECT coalesce((SELECT deleted FROM docs WHERE id = ?1), 1)",
+                params![p],
+                |r| r.get(0),
+            )?;
+            if parent_deleted == 1 {
+                tx.execute(
+                    "UPDATE docs SET parent_id = NULL WHERE id = ?1",
+                    params![doc_id.to_string()],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    fn doc_subtree_ids(&self, doc_id: Uuid) -> Result<Vec<Uuid>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE sub(id) AS (
+                 SELECT id FROM docs WHERE id = ?1
+                 UNION ALL
+                 SELECT docs.id FROM docs JOIN sub ON docs.parent_id = sub.id
+                 WHERE docs.deleted = 0)
+             SELECT id FROM sub",
+        )?;
+        let rows = stmt.query_map(params![doc_id.to_string()], |r| r.get::<_, String>(0))?;
+        rows.map(|r| uuid_col(r?, "docs.id")).collect()
     }
 
     fn rename_doc(&mut self, doc_id: Uuid, title: &str) -> Result<()> {
@@ -3301,5 +3454,55 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
         // idempotent: a second open-time backfill is a no-op
         backfill(&s.conn).unwrap();
+    }
+
+    /// Trash: a delete tombstones the subtree under one stamp; the trash lists
+    /// the root only; restore revives exactly that subtree — a child that was
+    /// deleted separately, earlier, stays deleted.
+    #[test]
+    fn delete_lists_in_trash_and_restore_revives_only_what_fell_together() {
+        use crate::PrincipalKind;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let root = s.create_doc("root", None, tom.id).unwrap();
+        let kid = s.create_doc("kid", Some(root.id), tom.id).unwrap();
+        let grandkid = s.create_doc("grandkid", Some(kid.id), tom.id).unwrap();
+        let old = s.create_doc("old", Some(root.id), tom.id).unwrap();
+
+        // `old` deleted on its own first
+        assert_eq!(s.delete_doc(old.id).unwrap(), 1);
+        // distinct stamps need distinct millis
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        assert_eq!(s.delete_doc(root.id).unwrap(), 3);
+
+        let trash = s.list_trash().unwrap();
+        // one root row: `old` is under a trashed parent, so it is not a root
+        // while `root` is in the trash; its own stamp keeps it out of root's
+        // descendant count
+        let titles: Vec<&str> = trash.iter().map(|t| t.doc.title.as_str()).collect();
+        assert_eq!(titles, vec!["root"]);
+        assert_eq!(trash[0].descendants, 2);
+
+        // restore root: kid + grandkid come back, `old` stays in the trash
+        assert_eq!(s.restore_doc(root.id).unwrap(), 3);
+        let live: Vec<String> = s.list_docs().unwrap().into_iter().map(|d| d.title).collect();
+        assert!(live.contains(&"root".to_string()));
+        assert!(live.contains(&"kid".to_string()));
+        assert!(live.contains(&"grandkid".to_string()));
+        assert!(!live.contains(&"old".to_string()));
+        assert!(s.doc_is_tombstoned(old.id).unwrap());
+        assert!(!s.doc_is_tombstoned(grandkid.id).unwrap());
+        let trash = s.list_trash().unwrap();
+        assert_eq!(trash.len(), 1);
+        assert_eq!(trash[0].doc.title, "old");
+
+        // restoring a child whose parent is still trashed surfaces it at the root
+        s.delete_doc(root.id).unwrap();
+        assert_eq!(s.restore_doc(kid.id).unwrap(), 2);
+        assert_eq!(s.get_doc(kid.id).unwrap().parent_id, None);
+        assert!(s.doc_is_tombstoned(root.id).unwrap());
+
+        // not in the trash → NotFound
+        assert!(matches!(s.restore_doc(kid.id), Err(StoreError::NotFound(_))));
     }
 }

@@ -9,6 +9,7 @@ import Sharing from './Sharing'
 import SharePanel from './SharePanel'
 import PaletteShell from './PaletteShell'
 import Profile, { FirstRunName, loadProfile } from './Profile'
+import Trash, { restoreDoc } from './Trash'
 import ReviewRail from './ReviewRail'
 import { notify, errText, Notices } from './Notice'
 import { resolveShortcut } from './shortcuts'
@@ -17,6 +18,7 @@ import { activityLine, loadLastSeen, storeLastSeen, unseenActivity } from './act
 import { advanceEvents, EventsCursor, EventsResponse, INITIAL_CURSOR, liveEventLine } from './live'
 import {
   api,
+  ApiError,
   ActivityItem,
   Block,
   Doc,
@@ -37,6 +39,7 @@ type View =
   | { kind: 'graph' }
   | { kind: 'sharing' }
   | { kind: 'profile' }
+  | { kind: 'trash' }
   | { kind: 'home' }
 type Palette = null | 'commands' | 'open' | 'search' | 'newdoc' | 'newcanvas' | 'help'
 
@@ -333,6 +336,13 @@ export default function App() {
           />
         )}
         {view.kind === 'profile' && <Profile dataVersion={dataVersion} onChanged={setProfile} />}
+        {view.kind === 'trash' && (
+          <Trash
+            dataVersion={dataVersion}
+            onOpenDoc={openDoc}
+            onChanged={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
+          />
+        )}
         {view.kind === 'graph' && <GraphView onOpenDoc={openDoc} />}
       </main>
 
@@ -353,6 +363,7 @@ export default function App() {
             if (a === 'graph') setView({ kind: 'graph' })
             if (a === 'sharing') setView({ kind: 'sharing' })
             if (a === 'profile') setView({ kind: 'profile' })
+            if (a === 'trash') setView({ kind: 'trash' })
             if (a === 'tree') setTreeOpen((t) => !t)
             if (a === 'home') setView({ kind: 'home' })
             if (a === 'newdoc') {
@@ -458,7 +469,9 @@ function CommandPalette({
   onClose,
 }: {
   queueCount: number
-  onAction: (a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph' | 'sharing' | 'profile') => void
+  onAction: (
+    a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph' | 'sharing' | 'profile' | 'trash' | 'close',
+  ) => void
   onClose: () => void
 }) {
   const [q, setQ] = useState('')
@@ -475,6 +488,27 @@ function CommandPalette({
     { label: 'Shares & contacts', run: () => onAction('sharing') },
     { label: 'Profile', hint: 'your name, node id, fingerprint', run: () => onAction('profile') },
     { label: 'Graph view', run: () => onAction('graph') },
+    { label: 'Trash', hint: 'restore deleted docs', run: () => onAction('trash') },
+    {
+      label: 'Export all docs as Markdown…',
+      hint: 'a folder in ~/Downloads',
+      run: () => {
+        onAction('close')
+        api<{ path: string; files: number }>('/api/export_vault', { method: 'POST' })
+          .then((r) => notify(`exported ${r.files} files to ${r.path}`, 'ok', { ttlMs: 12_000 }))
+          .catch((e) => notify(errText(e)))
+      },
+    },
+    {
+      label: 'Back up database now',
+      hint: 'daily snapshot, kept beside your notes',
+      run: () => {
+        onAction('close')
+        api<{ path: string; bytes: number }>('/api/backups', { method: 'POST' })
+          .then((r) => notify(`backup written: ${r.path} (${(r.bytes / 1_048_576).toFixed(1)} MB)`, 'ok', { ttlMs: 12_000 }))
+          .catch((e) => notify(errText(e)))
+      },
+    },
     { label: 'Toggle file tree', hint: '⌘T', run: () => onAction('tree') },
     { label: 'Home', run: () => onAction('home') },
   ]
@@ -820,11 +854,28 @@ function DocTreeNav({
       return
     }
     setArmed(null)
-    await api(`/api/doc/${d.id}/delete`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{}',
-    }).catch((e) => console.error(e))
+    try {
+      const out = await api<{ deleted: number }>(`/api/doc/${d.id}/delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      // nothing is gone for good (Trash), but the undo should be one click
+      const inside = out.deleted > 1 ? ` and ${out.deleted - 1} inside it` : ''
+      notify(`deleted “${d.title}”${inside} — click to undo`, 'ok', {
+        ttlMs: 10_000,
+        onClick: () => {
+          restoreDoc(d.id)
+            .then(() => {
+              notify(`restored “${d.title}”`, 'ok')
+              onChanged()
+            })
+            .catch((e) => notify(errText(e)))
+        },
+      })
+    } catch (e) {
+      notify(errText(e))
+    }
     onChanged()
   }
 
@@ -1291,29 +1342,47 @@ function DocView({
   // landed moments before the session started can't be lost.
   const goLive = useCallback(async () => {
     if (!editable) return
+    // unsaved cold edits: the autosave lands within ~1.2s — wait for it
+    // rather than starting a session that would freeze it out
+    for (let i = 0; i < 12; i++) {
+      if (!document.querySelector('.save-state.dirty, .save-state.saving')) break
+      await new Promise((res) => setTimeout(res, 250))
+    }
+    if (document.querySelector('.save-state.dirty, .save-state.saving')) {
+      notify('your last edit has not saved yet — try again in a moment', 'warn')
+      return
+    }
     try {
-      const r = await api<{ frozen_epoch: number; seed: boolean }>(
-        `/api/doc/${docId}/hot/start`,
-        { method: 'POST' },
-      )
-      let blocks = editable.blocks
-      if (r.seed) {
-        for (let attempt = 0; attempt < 5; attempt++) {
-          const fresh = await api<DocTree>(`/api/doc/${docId}`)
-          // freshest content wins even on epoch mismatch (a save that raced
-          // the freeze); the gate scores the flatten against the stale base
-          // rather than anything being silently lost
-          blocks = editableBlocksOf(fresh)
-          if (fresh.doc.current_epoch === r.frozen_epoch) break
-          await new Promise((res) => setTimeout(res, 300))
+      // fetch → start(base_epoch) → seed from that same tree. The daemon
+      // refuses to CREATE a session from any epoch but the current one
+      // (code stale_base) — for a mirror it pulls the owner first — so a
+      // save or pull that races us means "refetch and retry", never "seed
+      // stale text that the flatten then lands over newer edits".
+      let fresh = await api<DocTree>(`/api/doc/${docId}`)
+      let r: { frozen_epoch: number; seed: boolean } | null = null
+      for (let attempt = 0; attempt < 4 && !r; attempt++) {
+        try {
+          r = await api<{ frozen_epoch: number; seed: boolean }>(
+            `/api/doc/${docId}/hot/start`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ base_epoch: fresh.doc.current_epoch }),
+            },
+          )
+        } catch (e) {
+          if (!(e instanceof ApiError) || e.code !== 'stale_base' || attempt === 3) throw e
+          await new Promise((res) => setTimeout(res, 400))
+          fresh = await api<DocTree>(`/api/doc/${docId}`)
         }
       }
+      if (!r) return
       setHotCanWrite(true) // we started it; the next status poll may refine
       setHot({
         docId,
         frozenEpoch: r.frozen_epoch,
         seed: r.seed,
-        blocks,
+        blocks: r.seed ? editableBlocksOf(fresh) : editable.blocks,
       })
     } catch (e) {
       notify(errText(e))
@@ -1374,12 +1443,29 @@ function DocView({
   // go live together (once per doc-open) instead of silently switching the
   // editor out from under both of them
   const autoHotOffered = useRef<string | null>(null)
+  const liveHeldOff = useRef<string | null>(null)
   useEffect(() => {
     if (!tree || hot) return
     api<HotStatus>(`/api/doc/${docId}/hot/status`)
       .then((st) => {
         if (!editable) return
         if (st.hot) {
+          // someone else went live while this cold editor holds unsaved text.
+          // Swapping editors now would fire the cold save into the freeze and
+          // lose it — stay cold; the editor keeps retrying and lands the save
+          // when the session ends, and the next tick joins.
+          if (document.querySelector('.save-state.dirty, .save-state.saving')) {
+            if (liveHeldOff.current !== docId) {
+              liveHeldOff.current = docId
+              notify(
+                'a live session started on this doc — your unsaved edits will save when it ends',
+                'warn',
+                { ttlMs: 10_000 },
+              )
+            }
+            return
+          }
+          liveHeldOff.current = null
           setHotCanWrite(typeof st.can_write === 'boolean' ? st.can_write : undefined)
           setViewersWrite(typeof st.viewers_write === 'boolean' ? st.viewers_write : undefined)
           setHot({

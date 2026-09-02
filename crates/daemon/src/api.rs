@@ -18,6 +18,8 @@ pub struct ApiState {
     pub hot: crate::hot::HotState,
     /// Federation runtime: focus heartbeats (adaptive pull) + owner nudges.
     pub runtime: crate::fed::Runtime,
+    /// The live database file — backups live beside it.
+    pub db_path: std::path::PathBuf,
 }
 
 /// UI heartbeat: this doc is open. For a mirror, its share joins the fast
@@ -891,8 +893,84 @@ async fn delete_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Va
     if let Some(e) = refuse_if_mirror(&s, id, "deleting") {
         return Json(json!({"error": e}));
     }
+    // a live session anywhere in the subtree would flatten into a tombstone
+    // (and the session would outlive the doc): end it first
+    match s.doc_subtree_ids(id) {
+        Ok(ids) => {
+            if let Some(hot) = ids.iter().find(|d| st.hot.is_hot(**d)) {
+                let title = s.get_doc(*hot).map(|d| d.title).unwrap_or_default();
+                return Json(json!({
+                    "error": format!("“{title}” is in a live session — end it before deleting"),
+                    "code": "doc_hot",
+                }));
+            }
+        }
+        Err(e) => return Json(json!({"error": e.to_string()})),
+    }
     match s.delete_doc(id) {
         Ok(n) => Json(json!({"ok": true, "deleted": n})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+/// Backups: list snapshots (GET) or take one now (POST).
+async fn backups(State(st): State<ApiState>) -> Json<Value> {
+    Json(json!({
+        "dir": crate::backup::backup_dir(&st.db_path).to_string_lossy(),
+        "backups": crate::backup::list_backups(&st.db_path),
+    }))
+}
+
+async fn backup_now(State(st): State<ApiState>) -> Json<Value> {
+    let store = st.store.clone();
+    let path = st.db_path.clone();
+    match tokio::task::spawn_blocking(move || crate::backup::backup_now(&store, &path, true)).await {
+        Ok(Ok(info)) => Json(json!(info)),
+        Ok(Err(e)) => Json(json!({"error": format!("{e:#}")})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+/// Export every doc as a markdown tree under ~/Downloads (the escape hatch,
+/// in-app). Titles become file names; docs with children become folders.
+async fn export_vault(State(st): State<ApiState>) -> Json<Value> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let stamp = chrono::Local::now().format("%Y-%m-%d-%H%M").to_string();
+    let dir = std::path::PathBuf::from(home)
+        .join("Downloads")
+        .join(format!("grimoire-export-{stamp}"));
+    let store = st.store.clone();
+    let out = dir.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        grimoire_store::export::export_vault(&*s, &out)
+    })
+    .await;
+    match res {
+        Ok(Ok(report)) => Json(json!({"path": dir.to_string_lossy(), "files": report.files})),
+        Ok(Err(e)) => Json(json!({"error": e.to_string()})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn trash(State(st): State<ApiState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.list_trash() {
+        Ok(rows) => Json(json!(rows)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn restore_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.restore_doc(id) {
+        Ok(n) => Json(json!({"ok": true, "restored": n})),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
@@ -980,6 +1058,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/buildinfo", get(buildinfo))
         .route("/api/stamp", get(stamp))
         .route("/api/doc/{id}/delete", post(delete_doc))
+        .route("/api/doc/{id}/restore", post(restore_doc))
+        .route("/api/trash", get(trash))
+        .route("/api/backups", get(backups).post(backup_now))
+        .route("/api/export_vault", post(export_vault))
         .route("/api/doc/{id}/rename", post(rename_doc))
         .route("/api/doc/{id}/tendings", get(tendings))
         .route("/api/doc/{id}/federation", get(doc_federation))

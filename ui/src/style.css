@@ -980,6 +980,7 @@ kbd {
   word-break: break-word;
 }
 .notice-ok { border-color: var(--green); }
+.notice-warn { border-color: var(--yellow); }
 .notice-action { text-decoration: underline dotted; text-underline-offset: 3px; }
 .notice-action:hover { background: var(--panel); }
 .chip.trusted { color: var(--yellow); border-color: var(--yellow); }
@@ -1335,3 +1336,5 @@ kbd {
 .profile-name-row { display: flex; gap: 8px; align-items: center; }
 .profile-name { font-family: inherit; font-size: 14px; }
 .profile-kv { display: grid; grid-template-columns: 90px 1fr auto; gap: 10px; align-items: center; padding: 4px 0; font-size: 13px; }
+.trash-row { grid-template-columns: minmax(120px, 1fr) auto auto; }
+.trash-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

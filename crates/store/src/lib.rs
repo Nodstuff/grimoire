@@ -133,8 +133,21 @@ pub trait BlockStore {
         sort_key: Option<&str>,
     ) -> Result<()>;
 
-    /// Soft-delete a doc and its descendants; returns count. Reversible.
+    /// Soft-delete a doc and its descendants; returns count. Reversible via
+    /// `restore_doc` — every doc of one delete shares a `deleted_at` stamp.
     fn delete_doc(&mut self, doc_id: Uuid) -> Result<usize>;
+
+    /// The Trash: roots of tombstoned subtrees the user deleted (dropped
+    /// mirrors of revoked shares are excluded — they revive via re-join).
+    fn list_trash(&self) -> Result<Vec<TrashEntry>>;
+
+    /// Undo a delete: revive the doc and the descendants that fell with it
+    /// (same stamp). If its parent is still in the trash, the doc surfaces at
+    /// the root. Returns how many docs came back.
+    fn restore_doc(&mut self, doc_id: Uuid) -> Result<usize>;
+
+    /// The doc and every live descendant (the delete/hot-check universe).
+    fn doc_subtree_ids(&self, doc_id: Uuid) -> Result<Vec<Uuid>>;
 
     /// Rename a doc. NOTE: inbound [[wikilinks]] resolve by title and are not
     /// rewritten — they dangle until edited (or an agent fixes them).

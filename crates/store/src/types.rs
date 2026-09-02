@@ -595,6 +595,15 @@ pub struct Share {
     pub trust: ShareTrust,
 }
 
+/// One row of the Trash: a deleted subtree root, when it fell, and how many
+/// descendants fell with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrashEntry {
+    pub doc: Doc,
+    pub deleted_at: String,
+    pub descendants: usize,
+}
+
 /// Grantee-side origin + pull cursor for a mirror doc (same UUID as upstream).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Mirror {

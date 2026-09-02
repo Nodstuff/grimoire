@@ -93,6 +93,22 @@ type SaveState = 'clean' | 'dirty' | 'saving'
  * explicit action), then the editor resets to the pristine mirror. */
 export type EditorMode = 'direct' | 'readonly' | 'propose'
 
+/** Save failures in words a user can act on. The daemon's messages are
+ * precise but internal; the editor keeps the text either way. */
+function saveErrorText(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e)
+  if (/live session/i.test(raw)) {
+    return 'this doc is in a live session — your edit is kept here and will save when it ends'
+  }
+  if (/fetch|network|Failed to fetch|ECONN/i.test(raw)) {
+    return 'not saved: Grimoire is not responding — your edit is kept here and will retry'
+  }
+  if (/stale base|ahead of doc epoch/i.test(raw)) {
+    return 'not saved: this doc changed underneath you — retrying against the new version'
+  }
+  return `not saved: ${raw} — your edit is kept here and will retry`
+}
+
 export default function DocEditor({
   doc,
   mode = 'direct',
@@ -272,12 +288,22 @@ export default function DocEditor({
       epochRef.current = out.epoch
       setEpoch(out.epoch)
       setSaveState('clean')
+      lastSaveError.current = null
       onSaved(out.epoch)
     } catch (e) {
+      // the text is still in the editor and stays dirty; the retry clock
+      // below keeps trying. Say so ONCE per distinct cause — a silent
+      // failure here was how unsaved edits used to vanish.
       setSaveState('dirty')
+      const msg = saveErrorText(e)
+      if (lastSaveError.current !== msg) {
+        lastSaveError.current = msg
+        notify(msg, 'warn')
+      }
       console.error(e)
     }
   }
+  const lastSaveError = useRef<string | null>(null)
 
   // debounce autosave; flush on unmount/navigation
   const saveRef = useRef(save)
@@ -308,6 +334,14 @@ export default function DocEditor({
     const t = setTimeout(() => saveRef.current(), 1200)
     return () => clearTimeout(t)
   }, [saveState, editor?.state.doc, mode])
+  // a failed save leaves the doc dirty with no new keystrokes to re-arm the
+  // debounce: retry on a slow clock until it lands (daemon back, live
+  // session over, …)
+  useEffect(() => {
+    if (saveState !== 'dirty' || mode !== 'direct') return
+    const t = setInterval(() => saveRef.current(), 5000)
+    return () => clearInterval(t)
+  }, [saveState, mode])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

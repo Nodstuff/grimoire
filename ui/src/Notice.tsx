@@ -5,7 +5,9 @@
 
 import { useEffect, useState } from 'react'
 
-export type NoticeKind = 'error' | 'ok'
+/** error: sticky until clicked. ok: auto-dismiss. warn: auto-dismiss (longer) —
+ * "something happened you should know, nothing is broken". */
+export type NoticeKind = 'error' | 'ok' | 'warn'
 
 export interface Notice {
   id: number
@@ -23,6 +25,7 @@ export interface NotifyOpts {
 
 const OK_TTL_MS = 4000
 const OK_ACTION_TTL_MS = 12000
+const WARN_TTL_MS = 8000
 
 let seq = 0
 let notices: Notice[] = []
@@ -44,6 +47,8 @@ export function notify(message: string, kind: NoticeKind = 'error', opts: Notify
   emit()
   if (kind === 'ok') {
     setTimeout(() => dismiss(id), opts.ttlMs ?? (opts.onClick ? OK_ACTION_TTL_MS : OK_TTL_MS))
+  } else if (kind === 'warn') {
+    setTimeout(() => dismiss(id), opts.ttlMs ?? WARN_TTL_MS)
   }
   return id
 }

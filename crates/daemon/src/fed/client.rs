@@ -203,10 +203,15 @@ pub async fn hot_end_upstream(
     }
 }
 
+/// Start (or join) the owner's session for a mirror doc. `base_epoch` is the
+/// epoch of the copy the UI will seed from — the mirror's synced epoch. The
+/// owner refuses with `RefusalCode::StaleBase` when it is behind; the error
+/// carries the typed `Refusal` so the caller can pull and retry.
 pub async fn hot_start_upstream(
     endpoint: &Endpoint,
     store: &Arc<Mutex<SqliteStore>>,
     doc_id: uuid::Uuid,
+    base_epoch: i64,
 ) -> Result<(i64, bool)> {
     let (mirror, owner) = mirror_owner(store, doc_id)?;
     let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
@@ -216,13 +221,36 @@ pub async fn hot_start_upstream(
         Request::HotStart {
             share: mirror.share_id.to_string(),
             doc: doc_id.to_string(),
+            base_epoch: Some(base_epoch),
         },
     )
     .await?;
     match res {
         Response::HotStarted { frozen_epoch, seed } => Ok((frozen_epoch, seed)),
+        Response::Refused { reason, code } => {
+            Err(Refusal::new(code, format!("owner refused hot start: {reason}")).into())
+        }
         other => anyhow::bail!("owner refused hot start: {other:?}"),
     }
+}
+
+/// Pull one share from a mirror doc's owner right now (the "my copy is
+/// behind" recovery path: hot start refused stale, nudge received).
+pub async fn pull_owner_of(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    doc_id: uuid::Uuid,
+) -> Result<PullSummary> {
+    let (mirror, owner) = mirror_owner(store, doc_id)?;
+    let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
+    pull_share(
+        endpoint,
+        store,
+        EndpointAddr::from(owner_id),
+        &owner,
+        mirror.share_id,
+    )
+    .await
 }
 
 fn mirror_owner(
@@ -364,7 +392,10 @@ pub struct PullSummary {
     pub removed: usize,
 }
 
-/// Pull one share from its owner and apply the response (#59).
+/// Pull one share from its owner and apply the response (#59). Paged: the
+/// owner caps each response by `PULL_BUDGET` and says `more`; we loop with
+/// refreshed cursors until it doesn't (bounded — a peer that never stops
+/// saying `more` cannot spin us).
 pub async fn pull_share(
     endpoint: &Endpoint,
     store: &Arc<Mutex<SqliteStore>>,
@@ -372,6 +403,28 @@ pub async fn pull_share(
     owner: &grimoire_store::Contact,
     share_id: uuid::Uuid,
 ) -> Result<PullSummary> {
+    const MAX_PAGES: usize = 64;
+    let mut total = PullSummary::default();
+    for page in 1..=MAX_PAGES {
+        let (summary, more) = pull_page(endpoint, store, addr.clone(), owner, share_id).await?;
+        total.changed += summary.changed;
+        total.removed += summary.removed;
+        if !more {
+            return Ok(total);
+        }
+        tracing::debug!(share = %share_id, page, "pull paged; fetching next");
+    }
+    tracing::warn!(share = %share_id, "pull still paging after {MAX_PAGES} pages; stopping");
+    Ok(total)
+}
+
+async fn pull_page(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    addr: EndpointAddr,
+    owner: &grimoire_store::Contact,
+    share_id: uuid::Uuid,
+) -> Result<(PullSummary, bool)> {
     let cursors: Vec<(String, i64)> = {
         let s = store.lock().unwrap_or_else(|p| p.into_inner());
         s.list_mirrors()?
@@ -389,12 +442,13 @@ pub async fn pull_share(
         },
     )
     .await?;
-    let (metas, changed, removed) = match res {
+    let (metas, changed, removed, more) = match res {
         Response::Pulled {
             metas,
             changed,
             removed,
-        } => (metas, changed, removed),
+            more,
+        } => (metas, changed, removed, more),
         Response::Refused { reason, code } => {
             return Err(Refusal::new(code, format!("owner refused pull: {reason}")).into());
         }
@@ -517,10 +571,17 @@ pub async fn pull_share(
         let Ok(id) = m.id.parse::<uuid::Uuid>() else {
             continue;
         };
+        // The cursor only advances when blocks land (mirror_replace_blocks
+        // below). A doc whose meta shipped but whose blocks were paged out
+        // of this response keeps its old cursor so the next page fetches it;
+        // an unchanged doc keeps a cursor the owner already judged current.
+        if s.get_doc(id).is_err() {
+            continue; // never seen and paged out: created when its blocks arrive
+        }
         let cursor = if changed_ids.contains(m.id.as_str()) {
-            0 // block replace below sets the real epoch
+            0
         } else {
-            m.epoch
+            s.get_mirror(id)?.map(|m| m.synced_epoch).unwrap_or(0)
         };
         s.upsert_mirror(id, owner.id, share_id, cursor, share_perm)?;
         // reflect the owner's tend status so the grantee can show it and
@@ -548,7 +609,7 @@ pub async fn pull_share(
             s.delete_doc(u).ok();
         }
     }
-    Ok(summary)
+    Ok((summary, more))
 }
 
 /// Ship a local edit of a mirror doc upstream as a proposal (#60). The

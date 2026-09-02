@@ -515,20 +515,66 @@ fn mirror_of(ctx: &HotCtx, doc_id: Uuid) -> bool {
     s.get_mirror(doc_id).ok().flatten().is_some()
 }
 
-async fn hot_start(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<Value> {
+/// `POST /api/doc/{id}/hot/start` body. `base_epoch` is the epoch of the tree
+/// the UI will seed the session from; creating a session from any other
+/// epoch is refused (`code: "stale_base"`), because the seed becomes the
+/// doc at flatten. Joining a live session ignores it.
+#[derive(serde::Deserialize, Default)]
+struct StartReq {
+    #[serde(default)]
+    base_epoch: Option<i64>,
+}
+
+async fn hot_start(
+    State(ctx): State<HotCtx>,
+    Path(doc_id): Path<Uuid>,
+    body: axum::body::Bytes,
+) -> Json<Value> {
     use grimoire_store::BlockStore;
+    let req: StartReq = if body.is_empty() {
+        StartReq::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => return Json(json!({"error": format!("bad request: {e}")})),
+        }
+    };
     // mirror docs: the session lives on the OWNER's daemon (#66)
     if mirror_of(&ctx, doc_id) {
         let Some(ep) = &ctx.endpoint else {
             return Json(json!({"error": "federation disabled"}));
         };
-        return match crate::fed::hot_start_upstream(ep, &ctx.store, doc_id).await {
+        let base = req.base_epoch.unwrap_or_else(|| {
+            let s = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
+            s.get_mirror(doc_id).ok().flatten().map(|m| m.synced_epoch).unwrap_or(-1)
+        });
+        return match crate::fed::hot_start_upstream(ep, &ctx.store, doc_id, base).await {
             Ok((frozen_epoch, seed)) => Json(json!({
                 "ws": format!("/ws/hot/{doc_id}"),
                 "frozen_epoch": frozen_epoch,
                 "seed": seed,
             })),
-            Err(e) => Json(json!({"error": format!("{e:#}")})),
+            Err(e) => {
+                let stale = e
+                    .downcast_ref::<crate::fed::Refusal>()
+                    .is_some_and(|r| r.code == crate::fed::RefusalCode::StaleBase);
+                if stale {
+                    // our copy is behind: pull it now so the UI's retry seeds
+                    // from the owner's current text
+                    match crate::fed::pull_owner_of(ep, &ctx.store, doc_id).await {
+                        Ok(_) => Json(json!({
+                            "error": "your copy was behind the owner's — synced; try again",
+                            "code": "stale_base",
+                        })),
+                        Err(pe) => Json(json!({
+                            "error": format!("your copy is behind the owner's and syncing failed: {pe:#}"),
+                            "code": "stale_base",
+                        })),
+                    }
+                } else {
+                    Json(json!({"error": format!("{e:#}")}))
+                }
+            }
         };
     }
     let frozen_epoch = {
@@ -538,6 +584,18 @@ async fn hot_start(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<
             Err(e) => return Json(json!({"error": e.to_string()})),
         }
     };
+    // Creating a session seeds it from the caller's tree; a caller holding
+    // an older tree (a save landed between its fetch and this call) would
+    // roll that save back at flatten. Refuse; the UI refetches and retries.
+    if !ctx.hot.is_hot(doc_id)
+        && let Some(base) = req.base_epoch
+        && base != frozen_epoch
+    {
+        return Json(json!({
+            "error": format!("the doc moved to epoch {frozen_epoch} while you were at {base}; reloading"),
+            "code": "stale_base",
+        }));
+    }
     match ctx.hot.start(doc_id, frozen_epoch) {
         Ok(seed) => Json(json!({
             "ws": format!("/ws/hot/{doc_id}"),
@@ -1216,5 +1274,82 @@ mod tests {
         let txn = ydoc.transact();
         let md = crate::yrender::fragment_to_markdown(&txn, &frag);
         assert_eq!(md, "plain **bold**\n\n```rust\nfn main() {}\n```\n\n- first item");
+    }
+}
+
+#[cfg(test)]
+mod crash_tests {
+    use super::*;
+    use grimoire_store::{BlockStore, BlockType, OpInput, OpKind, PrincipalKind, SqliteStore};
+    use yrs::{ReadTxn, Text as _, XmlFragment as _};
+
+    /// Crash-mid-flatten: the propose committed but the process died before
+    /// the session/journal were dropped. On restart the journal is replayed,
+    /// the doc is hot again with the same text, and the second flatten is a
+    /// no-op — no duplicate paragraphs, no lost text, journal gone.
+    #[test]
+    fn journal_recovery_after_a_crash_between_commit_and_cleanup_is_idempotent() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let doc = s.create_doc("Doc", None, tom.id).unwrap();
+        s.apply(doc.id, 0, tom.id, vec![OpInput {
+            kind: OpKind::Insert {
+                block_id: Uuid::now_v7(), parent_id: None, order_key: "a".into(),
+                block_type: BlockType::Paragraph, content: "before".into(), refers_to: None,
+            },
+            source_refs: vec![],
+        }]).unwrap();
+        let store = Arc::new(Mutex::new(s));
+        let dir = std::env::temp_dir().join(format!("grimoire-hot-crash-{}", Uuid::now_v7()));
+        let hot = HotState::new(dir.clone());
+        hot.start(doc.id, 1).unwrap();
+
+        // a client frame arrives (journaled) — the live text
+        let frame = {
+            let ydoc = Doc::new();
+            let frag = ydoc.get_or_insert_xml_fragment("default");
+            {
+                let mut txn = ydoc.transact_mut();
+                let el = frag.insert(&mut txn, 0, yrs::XmlElementPrelim::empty("paragraph"));
+                let t = el.insert(&mut txn, 0, yrs::XmlTextPrelim::new(""));
+                t.insert(&mut txn, 0, "typed live");
+            }
+            let update = ydoc.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+            let mut enc = EncoderV1::new();
+            YMessage::Sync(SyncMessage::Update(update)).encode(&mut enc);
+            enc.to_vec()
+        };
+        assert!(hot.handle_frame(doc.id, &frame));
+        assert!(hot.journal_path(doc.id).exists());
+
+        // flatten commits…
+        let applied = hot.flatten_and_close(&store, doc.id, "ended").unwrap();
+        assert!(applied >= 1);
+        let after_first = store.lock().unwrap().read_doc(doc.id).unwrap();
+        assert_eq!(after_first.doc.current_epoch, 2);
+        let texts: Vec<_> = after_first.roots.iter().map(|n| n.block.content.clone()).collect();
+        assert_eq!(texts, vec!["typed live"]);
+
+        // …but "the process died" before cleanup: put the journal back as it
+        // was (append-only log of the same frames) and restart the daemon
+        {
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(hot.journal_path(doc.id)).unwrap();
+            journal_updates(&mut f, &frame);
+        }
+        let hot2 = HotState::new(dir);
+        hot2.recover(&store);
+        assert!(hot2.is_hot(doc.id), "recovered session is live again");
+        assert_eq!(hot2.status(doc.id).1, Some(2), "frozen at the post-commit epoch");
+
+        // the second flatten (idle reaper / owner end) changes nothing
+        let applied = hot2.flatten_and_close(&store, doc.id, "recovered").unwrap();
+        assert_eq!(applied, 0);
+        let s = store.lock().unwrap();
+        let tree = s.read_doc(doc.id).unwrap();
+        assert_eq!(tree.doc.current_epoch, 2, "no second commit");
+        let texts: Vec<_> = tree.roots.iter().map(|n| n.block.content.clone()).collect();
+        assert_eq!(texts, vec!["typed live"]);
+        assert!(!hot2.is_hot(doc.id));
+        assert!(!hot2.journal_path(doc.id).exists());
     }
 }

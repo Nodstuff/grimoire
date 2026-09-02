@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS docs (
     -- manual tree ordering (fractional, like blocks); null sorts after keyed, by title
     sort_key      TEXT,
     deleted       INTEGER NOT NULL DEFAULT 0,
+    -- when the tombstone was set; one value for every doc of a single delete,
+    -- so restore can revive exactly that subtree (Trash)
+    deleted_at    TEXT,
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 

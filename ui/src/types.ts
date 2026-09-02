@@ -205,10 +205,24 @@ export interface GardenerRun {
   tool_calls: number | null
 }
 
+/** An `{error, code?}` reply from the daemon. `code` is the machine-readable
+ * cause when there is one (e.g. `stale_base`); branch on it, never on text. */
+export class ApiError extends Error {
+  code?: string
+  constructor(message: string, code?: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.code = code
+  }
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(path, init)
   const j = await r.json()
-  if (j && typeof j === 'object' && 'error' in j) throw new Error(String(j.error))
+  if (j && typeof j === 'object' && 'error' in j) {
+    const code = 'code' in j && typeof j.code === 'string' ? j.code : undefined
+    throw new ApiError(String(j.error), code)
+  }
   return j as T
 }
 

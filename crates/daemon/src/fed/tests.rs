@@ -1258,3 +1258,130 @@ async fn failing_pull_is_recorded_on_the_mirror_and_cleared_when_it_recovers() {
     let err = pull_share(&g_ep, &g, addr, &owner_contact, share.id).await.unwrap_err();
     assert!(matches!(err.downcast_ref::<super::wire::Refusal>().map(|r| r.code), Some(RefusalCode::ShareRevoked)));
 }
+
+// ── data-safety audit (2026-09-02) regression tests ─────────────────────
+
+/// A grantee whose mirror is BEHIND the owner must not be able to create a
+/// live session: its seed would become the doc at flatten, silently reverting
+/// the owner's newer edits with a green verdict. Joining a session that is
+/// already live needs no epoch.
+#[tokio::test]
+async fn remote_hot_start_from_a_stale_mirror_is_refused_until_pulled() {
+    use super::client::pull_share;
+    let mut owner_store = SqliteStore::open_in_memory().unwrap();
+    let tom = owner_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let doc = owner_store.create_doc("Live", None, tom.id).unwrap();
+    let owner_ep = local_endpoint().await;
+    let (share, link) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), doc.id, SharePermission::Propose).unwrap();
+    let owner_store = Arc::new(Mutex::new(owner_store));
+    let addr = direct_addr(&owner_ep);
+    let hot = scratch_hot();
+    tokio::spawn(serve(owner_ep, owner_store.clone(), hot.clone(), Runtime::default()));
+
+    let mut alice_store = SqliteStore::open_in_memory().unwrap();
+    alice_store.create_principal(PrincipalKind::Human, "alice", None).unwrap();
+    let alice_store = Arc::new(Mutex::new(alice_store));
+    let alice_ep = local_endpoint().await;
+    let ticket = Ticket::parse(&link).unwrap();
+    let joined = join_at(&alice_ep, &alice_store, &ticket, addr.clone()).await.unwrap();
+    let owner_contact = alice_store.lock().unwrap().list_contacts().unwrap().into_iter().find(|c| c.pubkey == joined.owner).unwrap();
+    pull_share(&alice_ep, &alice_store, addr.clone(), &owner_contact, share.id).await.unwrap();
+
+    // owner edits after alice's pull: alice's mirror is now behind (epoch 0 vs 1)
+    owner_store.lock().unwrap().apply(doc.id, 0, tom.id, vec![grimoire_store::OpInput {
+        kind: grimoire_store::OpKind::Insert {
+            block_id: uuid::Uuid::now_v7(), parent_id: None, order_key: "a".into(),
+            block_type: grimoire_store::BlockType::Paragraph, content: "owner's newer paragraph".into(), refers_to: None,
+        },
+        source_refs: vec![],
+    }]).unwrap();
+    let stale_epoch = alice_store.lock().unwrap().get_mirror(doc.id).unwrap().unwrap().synced_epoch;
+    assert_eq!(stale_epoch, 0);
+
+    let start = |base: Option<i64>| {
+        let ep = alice_ep.clone();
+        let addr = addr.clone();
+        let req = Request::HotStart { share: share.id.to_string(), doc: doc.id.to_string(), base_epoch: base };
+        async move { request(&ep, addr, req).await.unwrap() }
+    };
+    // stale → typed refusal, no session
+    let res = start(Some(stale_epoch)).await;
+    assert_eq!(refusal_code(&res), RefusalCode::StaleBase);
+    assert!(!hot.is_hot(doc.id));
+    // no epoch at all (pre-field client) → also refused: we cannot know it is current
+    assert_eq!(refusal_code(&start(None).await), RefusalCode::StaleBase);
+
+    // pull → current → allowed and creates the session (seed = true)
+    pull_share(&alice_ep, &alice_store, addr.clone(), &owner_contact, share.id).await.unwrap();
+    let now = alice_store.lock().unwrap().get_mirror(doc.id).unwrap().unwrap().synced_epoch;
+    assert_eq!(now, 1);
+    let Response::HotStarted { frozen_epoch, seed } = start(Some(now)).await else { panic!("expected HotStarted") };
+    assert_eq!(frozen_epoch, 1);
+    assert!(seed);
+    assert!(hot.is_hot(doc.id));
+
+    // a second participant JOINS the live session with any/no epoch
+    let Response::HotStarted { seed, .. } = start(None).await else { panic!("join should not need an epoch") };
+    assert!(!seed);
+}
+
+/// A share bigger than one frame budget pages: the owner caps `changed`,
+/// says `more`, and the grantee's pull loops until every doc has landed.
+#[tokio::test]
+async fn pull_pages_large_shares_until_every_doc_lands() {
+    use super::client::pull_share;
+    let mut owner_store = SqliteStore::open_in_memory().unwrap();
+    let tom = owner_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let root = owner_store.create_doc("Big", None, tom.id).unwrap();
+    // 6 docs × ~1.5 MB each = 9 MB of content, over two PULL_BUDGET pages
+    let big = "x".repeat(1_500_000);
+    let mut ids = vec![root.id];
+    for i in 0..5 {
+        let d = owner_store.create_doc(&format!("part {i}"), Some(root.id), tom.id).unwrap();
+        ids.push(d.id);
+    }
+    for id in &ids {
+        owner_store.apply(*id, 0, tom.id, vec![grimoire_store::OpInput {
+            kind: grimoire_store::OpKind::Insert {
+                block_id: uuid::Uuid::now_v7(), parent_id: None, order_key: "a".into(),
+                block_type: grimoire_store::BlockType::Paragraph, content: big.clone(), refers_to: None,
+            },
+            source_refs: vec![],
+        }]).unwrap();
+    }
+    let owner_ep = local_endpoint().await;
+    let (share, link) = mint_invite(&mut owner_store, &owner_ep.id().to_string(), root.id, SharePermission::View).unwrap();
+    let owner_store = Arc::new(Mutex::new(owner_store));
+    let addr = direct_addr(&owner_ep);
+    tokio::spawn(serve(owner_ep, owner_store.clone(), scratch_hot(), Runtime::default()));
+
+    let mut alice_store = SqliteStore::open_in_memory().unwrap();
+    alice_store.create_principal(PrincipalKind::Human, "alice", None).unwrap();
+    let alice_store = Arc::new(Mutex::new(alice_store));
+    let alice_ep = local_endpoint().await;
+    let ticket = Ticket::parse(&link).unwrap();
+    let joined = join_at(&alice_ep, &alice_store, &ticket, addr.clone()).await.unwrap();
+    let owner_contact = alice_store.lock().unwrap().list_contacts().unwrap().into_iter().find(|c| c.pubkey == joined.owner).unwrap();
+
+    // one raw page: capped, and it says so
+    let cursors: Vec<(String, i64)> = alice_store.lock().unwrap().list_mirrors().unwrap().into_iter().map(|m| (m.doc_id.to_string(), m.synced_epoch)).collect();
+    let Response::Pulled { changed, metas, more, .. } = request(&alice_ep, addr.clone(), Request::Pull { share: share.id.to_string(), cursors }).await.unwrap() else { panic!() };
+    assert_eq!(metas.len(), 6, "metas always ship in full");
+    assert!(changed.len() < 6, "one page must not carry every doc, got {}", changed.len());
+    assert!(more);
+
+    // the client loop drains the pages
+    let summary = pull_share(&alice_ep, &alice_store, addr.clone(), &owner_contact, share.id).await.unwrap();
+    assert_eq!(summary.changed, 6);
+    let s = alice_store.lock().unwrap();
+    for id in &ids {
+        let tree = s.read_doc(*id).unwrap();
+        assert_eq!(tree.roots.len(), 1, "doc {id} has no content");
+        assert_eq!(tree.roots[0].block.content.len(), big.len());
+        assert_eq!(s.get_mirror(*id).unwrap().unwrap().synced_epoch, 1);
+    }
+    drop(s);
+    // and a follow-up pull is a no-op (cursors current, nothing paged)
+    let summary = pull_share(&alice_ep, &alice_store, addr, &owner_contact, share.id).await.unwrap();
+    assert_eq!(summary.changed, 0);
+}

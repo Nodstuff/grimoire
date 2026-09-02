@@ -12,8 +12,8 @@
 use super::client::pull_share;
 use super::runtime::Runtime;
 use super::wire::{
-    ALPN, Frame, HOT_ALPN, MAX_FRAME, PROTOCOL_VERSION, Refusal, RefusalCode, Request, Response,
-    WireDoc, WireDocMeta, hash_secret,
+    ALPN, Frame, HOT_ALPN, MAX_FRAME, PROTOCOL_VERSION, PULL_BUDGET, Refusal, RefusalCode,
+    Request, Response, WireDoc, WireDocMeta, hash_secret,
 };
 use crate::hot::HotState;
 use anyhow::{Context, Result};
@@ -263,12 +263,36 @@ fn dispatch(
             }
             Err(e) => refuse(e),
         },
-        Request::HotStart { share, doc } => match authorize_hot(&store, &contact, &share, &doc, true) {
+        Request::HotStart {
+            share,
+            doc,
+            base_epoch,
+        } => match authorize_hot(&store, &contact, &share, &doc, true) {
             Ok(doc_id) => {
                 let frozen_epoch = match store.get_doc(doc_id) {
                     Ok(d) => d.current_epoch,
                     Err(e) => return Response::refused(RefusalCode::Other, e.to_string()),
                 };
+                // Joining a live session is always fine — the seed already
+                // happened. CREATING one seeds from the grantee's mirror, so
+                // that mirror must be at our epoch or the flatten would land
+                // stale text over newer edits (with a green verdict).
+                if !hot.is_hot(doc_id) && base_epoch != Some(frozen_epoch) {
+                    tracing::warn!(
+                        peer = contact.pubkey,
+                        %doc_id,
+                        ?base_epoch,
+                        frozen_epoch,
+                        "remote hot start refused: grantee copy is behind"
+                    );
+                    return Response::refused(
+                        RefusalCode::StaleBase,
+                        format!(
+                            "your copy is at epoch {}, the owner is at {frozen_epoch}: pull first",
+                            base_epoch.map(|e| e.to_string()).unwrap_or_else(|| "?".into())
+                        ),
+                    );
+                }
                 match hot.start(doc_id, frozen_epoch) {
                     Ok(seed) => {
                         tracing::info!(peer = contact.pubkey, %doc_id, "remote hot start");
@@ -598,8 +622,40 @@ fn handle_pull(
     let in_share: std::collections::HashSet<uuid::Uuid> = docs.iter().map(|d| d.id).collect();
     let cursor_map: std::collections::HashMap<String, i64> = cursors.iter().cloned().collect();
 
+    // tended-ness is a gardener-scope walk per doc; compute the scope set
+    // once per pull rather than re-listing gardeners for every doc
+    let tended_scopes: std::collections::HashSet<uuid::Uuid> = store
+        .list_gardeners()?
+        .into_iter()
+        .filter(|g| g.enabled)
+        .filter_map(|g| g.scope_doc)
+        .collect();
+    let parent_of: std::collections::HashMap<uuid::Uuid, Option<uuid::Uuid>> =
+        docs.iter().map(|d| (d.id, d.parent_id)).collect();
+    let is_tended = |mut cur: uuid::Uuid| -> bool {
+        if tended_scopes.is_empty() {
+            return false;
+        }
+        loop {
+            if tended_scopes.contains(&cur) {
+                return true;
+            }
+            // walk out of the share too: an ancestor above the root may be tended
+            let next = match parent_of.get(&cur) {
+                Some(p) => *p,
+                None => store.get_doc(cur).ok().and_then(|d| d.parent_id),
+            };
+            match next {
+                Some(p) => cur = p,
+                None => return false,
+            }
+        }
+    };
+
     let mut metas = Vec::new();
     let mut changed = Vec::new();
+    let mut budget_used = 0usize;
+    let mut more = false;
     for d in &docs {
         let meta = WireDocMeta {
             id: d.id.to_string(),
@@ -609,28 +665,40 @@ fn handle_pull(
                 .map(|p| p.to_string()),
             title: d.title.clone(),
             epoch: d.current_epoch,
-            tended: store.doc_is_tended(d.id).unwrap_or(false),
+            tended: is_tended(d.id),
         };
         let unchanged = cursor_map
             .get(&meta.id)
             .is_some_and(|c| *c >= d.current_epoch);
         if !unchanged {
-            let blocks = store
-                .doc_blocks_flat(d.id)?
-                .into_iter()
-                .map(|b| grimoire_store::MirrorBlock {
-                    id: b.id,
-                    parent_id: b.parent_id,
-                    order_key: b.order_key,
-                    block_type: b.block_type,
-                    content: b.content,
-                    refers_to: b.refers_to,
-                })
-                .collect();
-            changed.push(WireDoc {
-                meta: meta.clone(),
-                blocks,
-            });
+            // page: once the budget is spent, later changed docs wait for the
+            // next pull (the grantee keeps their cursors, so they stay "changed")
+            if budget_used >= PULL_BUDGET && !changed.is_empty() {
+                more = true;
+            } else {
+                let blocks: Vec<grimoire_store::MirrorBlock> = store
+                    .doc_blocks_flat(d.id)?
+                    .into_iter()
+                    .map(|b| grimoire_store::MirrorBlock {
+                        id: b.id,
+                        parent_id: b.parent_id,
+                        order_key: b.order_key,
+                        block_type: b.block_type,
+                        content: b.content,
+                        refers_to: b.refers_to,
+                    })
+                    .collect();
+                // content dominates the serialized size; ~120 bytes of ids,
+                // keys and JSON punctuation per block
+                budget_used += blocks
+                    .iter()
+                    .map(|b| b.content.len() + 120)
+                    .sum::<usize>();
+                changed.push(WireDoc {
+                    meta: meta.clone(),
+                    blocks,
+                });
+            }
         }
         metas.push(meta);
     }
@@ -647,6 +715,7 @@ fn handle_pull(
         metas,
         changed,
         removed,
+        more,
     })
 }
 
