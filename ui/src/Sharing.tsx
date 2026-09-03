@@ -461,7 +461,25 @@ function ContactRow({ c, onChanged }: { c: Contact; onChanged: () => void }) {
         <span className="meta mono" title={c.pubkey}>
           {shortFingerprint(c.pubkey)}
         </span>
-        {c.revoked && <span className="verdict v-red">revoked</span>}
+        {c.revoked && (
+          <>
+            <span className="verdict v-red" title="blocked: a new invite from them is refused until you unblock">blocked</span>
+            <span className="gardener-actions">
+              <button
+                className="chip"
+                title="let this person pair again with a fresh invite"
+                onClick={() => post('/admin/contacts/unrevoke', { id: c.id }).then(onChanged, (e) => notify(errText(e)))}
+              >
+                unblock
+              </button>
+              <ArmedButton
+                label="remove"
+                title="forget this contact entirely (their past edits keep their name)"
+                onFire={() => post('/admin/contacts/remove', { id: c.id }).then(onChanged, (e) => notify(errText(e)))}
+              />
+            </span>
+          </>
+        )}
         {!c.revoked && (
           <span className="gardener-actions">
             <button
@@ -477,7 +495,16 @@ function ContactRow({ c, onChanged }: { c: Contact; onChanged: () => void }) {
             >
               {c.verified ? '✓ verified' : 'verify'}
             </button>
-            <ArmedButton label="revoke" onFire={() => post('/admin/contacts/revoke', { id: c.id }).then(onChanged, (e) => notify(errText(e)))} />
+            <ArmedButton
+              label="remove"
+              title="revoke every share to them and forget the contact — they can pair again with a fresh invite"
+              onFire={() => post('/admin/contacts/remove', { id: c.id }).then(onChanged, (e) => notify(errText(e)))}
+            />
+            <ArmedButton
+              label="block"
+              title="revoke every share to them AND refuse any future invite from this Mac until unblocked"
+              onFire={() => post('/admin/contacts/revoke', { id: c.id }).then(onChanged, (e) => notify(errText(e)))}
+            />
           </span>
         )}
       </div>

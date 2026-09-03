@@ -630,6 +630,28 @@ async fn revoke_contact(State(st): State<FedState>, Json(req): Json<IdReq>) -> J
     }
 }
 
+/// Remove a contact without blocking: their shares are revoked, live bridges
+/// cut, the contact row gone. A fresh invite pairs them again like anyone.
+async fn remove_contact(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pubkey = s
+        .list_contacts()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|c| c.id == req.id)
+        .map(|c| c.pubkey);
+    match s.remove_contact(req.id) {
+        Ok(()) => {
+            let cut = pubkey.map(|pk| st.hot.drop_bridges_for_peer(&pk)).unwrap_or(0);
+            Json(json!({"ok": true, "bridges_cut": cut}))
+        }
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 /// Re-enable a revoked contact (human surface only, never MCP). Shares stay
 /// revoked; the owner re-shares deliberately.
 async fn unrevoke_contact(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
@@ -791,6 +813,7 @@ pub fn router(store: Store, fed: FedCtx, hot: crate::hot::HotState, token: Admin
         .route("/admin/contacts", get(list_contacts))
         .route("/admin/contacts/revoke", post(revoke_contact))
         .route("/admin/contacts/unrevoke", post(unrevoke_contact))
+        .route("/admin/contacts/remove", post(remove_contact))
         .route("/admin/contacts/verify", post(verify_contact))
         .route("/admin/contacts/rename", post(rename_contact))
         .route("/admin/join", post(join))

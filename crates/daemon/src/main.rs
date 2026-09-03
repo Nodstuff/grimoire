@@ -588,6 +588,17 @@ async fn main() -> anyhow::Result<()> {
             }
             // the local trust boundary for /admin/*: a per-boot token beside the
             // db; the shell and CLI read it, any other local process is refused
+            // Win the port BEFORE minting the admin token: a second daemon
+            // (a double launch, a stale sidecar racing a new one) must die at
+            // bind, not overwrite the live daemon's token file on its way out.
+            let addr = format!("127.0.0.1:{port}");
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("port {port} is taken ({e}); another Grimoire is already serving — exiting");
+                    return Err(anyhow::anyhow!("port {port} in use: {e}"));
+                }
+            };
             let admin_token = admin::AdminToken::mint(&db_dir)
                 .context("minting admin token")?;
             tokio::spawn(admin::daily_loop(store.clone(), hot.clone()));
@@ -646,9 +657,7 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 Err(_) => app.fallback(serve_embedded_ui),
             };
-            let addr = format!("127.0.0.1:{port}");
             tracing::info!("ksd serving MCP (streamable HTTP) at http://{addr}/mcp");
-            let listener = tokio::net::TcpListener::bind(&addr).await?;
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
                     tokio::signal::ctrl_c().await.ok();

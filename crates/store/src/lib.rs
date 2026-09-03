@@ -289,6 +289,13 @@ pub trait BlockStore {
     /// deliberate act. Human surface only; never MCP, never the remote side.
     fn unrevoke_contact(&mut self, id: Uuid) -> Result<()>;
 
+    /// Remove a contact WITHOUT blocking them: every share to them is revoked
+    /// and the contact row is deleted, so a fresh invite pairs them again like
+    /// anyone else. Their principal stays (provenance of past edits).
+    /// `revoke_contact` is the BLOCK: the row stays with revoked=1 and any
+    /// redeem from that pubkey is refused until un-revoked.
+    fn remove_contact(&mut self, id: Uuid) -> Result<()>;
+
     /// Create a share of `root_doc`'s subtree. `contact: None` = awaiting an
     /// invite redeem to bind one.
     fn create_share(

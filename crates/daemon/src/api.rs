@@ -866,6 +866,7 @@ async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "node_id": st.node_id,
         "fingerprint": st.node_id.as_deref().map(crate::identity::fingerprint_of),
+        "embedded_blocks": st.embedder.as_ref().map(|e| e.indexed()),
         "log_path": path.map(|p| p.to_string_lossy().to_string()),
         "log_tail": tail,
     }))

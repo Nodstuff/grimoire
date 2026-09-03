@@ -1995,6 +1995,46 @@ impl BlockStore for SqliteStore {
         Ok(())
     }
 
+    fn remove_contact(&mut self, id: Uuid) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let n = tx.execute(
+            "UPDATE shares SET state = 'revoked' WHERE contact = ?1 AND state != 'revoked'",
+            params![id.to_string()],
+        )?;
+        let _ = n;
+        // shares keep pointing at the contact row for history → null the FK
+        // rather than cascade-deleting the audit trail
+        tx.execute("UPDATE shares SET contact = NULL WHERE contact = ?1", params![id.to_string()])?;
+        tx.execute(
+            "UPDATE share_invites SET redeemed_by = NULL WHERE redeemed_by = ?1",
+            params![id.to_string()],
+        )?;
+        // mirrors we hold FROM this contact reference the row: the user must
+        // leave those shares first (that path drops the mirrors deliberately)
+        let held: i64 = tx.query_row(
+            "SELECT count(*) FROM mirrors WHERE owner = ?1",
+            params![id.to_string()],
+            |r| r.get(0),
+        )?;
+        if held > 0 {
+            return Err(StoreError::InvalidOp(format!(
+                "you still hold {held} doc{} shared by this contact — leave those shares first",
+                if held == 1 { "" } else { "s" }
+            )));
+        }
+        // proposals we sent THEM (grantee side) are history too
+        tx.execute(
+            "DELETE FROM outbound_proposals WHERE owner = ?1",
+            params![id.to_string()],
+        )?;
+        let deleted = tx.execute("DELETE FROM contacts WHERE id = ?1", params![id.to_string()])?;
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("contact {id}")));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn unrevoke_contact(&mut self, id: Uuid) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE contacts SET revoked = 0 WHERE id = ?1",
@@ -3573,6 +3613,42 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
         // idempotent: a second open-time backfill is a no-op
         backfill(&s.conn).unwrap();
+    }
+
+    /// Remove forgets a contact (shares revoked, row gone, a new redeem from
+    /// the same key pairs afresh); block keeps the row with revoked=1 and the
+    /// redeem is refused. Holding mirrors from the contact blocks removal.
+    #[test]
+    fn remove_contact_forgets_without_blocking_and_block_refuses_redeem() {
+        use crate::{PrincipalKind, SharePermission};
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let doc = s.create_doc("D", None, tom.id).unwrap();
+        let pk = "ab".repeat(32);
+        // pair via redeem
+        let share = s.create_share(doc.id, None, SharePermission::View, None).unwrap();
+        s.create_invite(share.id, "h1", "2099-01-01T00:00:00.000Z").unwrap();
+        let (c, _) = s.redeem_invite("h1", &pk, "alice").unwrap();
+        assert_eq!(s.get_share(share.id).unwrap().state, crate::ShareState::Active);
+        // remove: share revoked, contact gone, redeem works again
+        s.remove_contact(c.id).unwrap();
+        assert_eq!(s.get_share(share.id).unwrap().state, crate::ShareState::Revoked);
+        assert!(s.contact_by_pubkey(&pk).unwrap().is_none());
+        let share2 = s.create_share(doc.id, None, SharePermission::View, None).unwrap();
+        s.create_invite(share2.id, "h2", "2099-01-01T00:00:00.000Z").unwrap();
+        let (c2, _) = s.redeem_invite("h2", &pk, "alice").unwrap();
+        // block: row stays, redeem refused, unrevoke lifts it
+        s.revoke_contact(c2.id).unwrap();
+        let share3 = s.create_share(doc.id, None, SharePermission::View, None).unwrap();
+        s.create_invite(share3.id, "h3", "2099-01-01T00:00:00.000Z").unwrap();
+        assert!(s.redeem_invite("h3", &pk, "alice").is_err());
+        s.unrevoke_contact(c2.id).unwrap();
+        s.redeem_invite("h3", &pk, "alice").unwrap();
+        // a contact we hold mirrors FROM cannot be removed
+        let owner = s.pair_contact(&"cd".repeat(32), "bob").unwrap();
+        let root = s.create_doc_with_id(uuid::Uuid::now_v7(), "theirs", None, owner.principal).unwrap();
+        s.upsert_mirror(root.id, owner.id, uuid::Uuid::now_v7(), 0, SharePermission::View).unwrap();
+        assert!(matches!(s.remove_contact(owner.id), Err(StoreError::InvalidOp(_))));
     }
 
     /// Trash: a delete tombstones the subtree under one stamp; the trash lists

@@ -6,6 +6,7 @@
 export function refusalHint(raw: string | null | undefined): string | null {
   const s = (raw ?? '').toLowerCase()
   if (!s) return null
+  if (s.includes('contact is revoked') || s.includes('un-revoke')) return 'the owner has blocked this Mac — only they can unblock it'
   if (s.includes('revoked')) return 'the owner revoked this share — ask for a fresh link'
   if (s.includes('unknown peer')) return 'the owner no longer recognises this Mac — ask for a fresh link'
   if (s.includes('expired') || s.includes('already redeemed') || s.includes('invite')) {
