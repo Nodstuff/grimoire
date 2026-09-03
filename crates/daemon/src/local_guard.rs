@@ -52,9 +52,10 @@ fn port_ok(p: &str) -> bool {
 }
 
 /// Is `origin` (an `Origin` header) acceptable: `http://<loopback>[:port]`,
-/// `ws://<loopback>[:port]`, or the shell's own scheme. `null` (opaque
-/// origins, e.g. the shell's data: error page probing `/api/stamp`) is
-/// refused: a rebinding attacker's page can also be sandboxed into `null`.
+/// `ws://<loopback>[:port]`, or the shell's own scheme. `null` (an opaque
+/// origin) is NOT local: a rebinding attacker's page can sandbox itself into
+/// one. `check_request` carves out the two read-only build-metadata GETs the
+/// shell's `data:` error page probes; see `NULL_ORIGIN_GETS`.
 pub fn origin_is_local(origin: &str) -> bool {
     let origin = origin.trim();
     if origin == "tauri://localhost" || origin.starts_with("grimoire-shell://") {
@@ -69,11 +70,24 @@ pub fn origin_is_local(origin: &str) -> bool {
     }
 }
 
-/// The pure decision over a request's headers: Ok to pass, Err(reason) to
-/// refuse. A missing Host is refused (HTTP/1.1 requires one; HTTP/2 puts the
-/// authority in the URI, which hyper maps into Host for us). A missing Origin
-/// is fine — same-origin GETs, curl and MCP clients send none.
-pub fn check_headers(headers: &HeaderMap) -> Result<(), &'static str> {
+/// The two read-only endpoints a GET may reach from an opaque (`null`) origin.
+/// The shell's error page is a `data:` document, so every fetch it makes is
+/// `Origin: null`; it probes these to tell "daemon still starting" from
+/// "daemon died". Both are constant build metadata — no user content, no
+/// secret, nothing to mutate — so an attacker's sandboxed frame learns only
+/// the version, which the UI serves to any local page anyway. Everything else
+/// still refuses `null`, since a rebinding page can sandbox itself into one.
+const NULL_ORIGIN_GETS: [&str; 2] = ["/api/stamp", "/api/buildinfo"];
+
+/// The pure decision over a request: Ok to pass, Err(reason) to refuse. A
+/// missing Host is refused (HTTP/1.1 requires one; HTTP/2 puts the authority
+/// in the URI, which hyper maps into Host for us). A missing Origin is fine —
+/// same-origin GETs, curl and MCP clients send none.
+pub fn check_request(
+    method: &axum::http::Method,
+    path: &str,
+    headers: &HeaderMap,
+) -> Result<(), &'static str> {
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
     match host {
         Some(h) if host_is_loopback(h) => {}
@@ -81,8 +95,11 @@ pub fn check_headers(headers: &HeaderMap) -> Result<(), &'static str> {
         None => return Err("missing Host header"),
     }
     if let Some(o) = headers.get(header::ORIGIN) {
+        let exempt =
+            method == axum::http::Method::GET && NULL_ORIGIN_GETS.contains(&path);
         match o.to_str() {
             Ok(o) if origin_is_local(o) => {}
+            Ok("null") if exempt => {}
             _ => return Err("Origin is not a local page"),
         }
     }
@@ -93,7 +110,7 @@ pub fn check_headers(headers: &HeaderMap) -> Result<(), &'static str> {
 /// on the whole router. Websocket upgrades are ordinary GETs at this point,
 /// so their Origin is checked here too.
 pub async fn require_loopback(req: Request, next: Next) -> Response {
-    match check_headers(req.headers()) {
+    match check_request(req.method(), req.uri().path(), req.headers()) {
         Ok(()) => next.run(req).await,
         Err(why) => {
             tracing::warn!(
@@ -181,6 +198,10 @@ mod tests {
         h
     }
 
+    fn check_headers(headers: &HeaderMap) -> Result<(), &'static str> {
+        check_request(&axum::http::Method::GET, "/api/docs", headers)
+    }
+
     #[test]
     fn header_decision() {
         // what the shell, the browser UI, curl and Claude Code's MCP client send
@@ -204,6 +225,28 @@ mod tests {
             .is_err()
         );
         assert!(check_headers(&hm(&[])).is_err());
+    }
+
+    /// The shell's error page is a `data:` document: its probes carry
+    /// `Origin: null`. Only GETs of the two build-metadata endpoints may pass.
+    #[test]
+    fn null_origin_only_on_the_two_read_only_stamps() {
+        use axum::http::Method;
+        let h = hm(&[("host", "127.0.0.1:7425"), ("origin", "null")]);
+        for p in ["/api/stamp", "/api/buildinfo"] {
+            assert!(check_request(&Method::GET, p, &h).is_ok(), "{p}");
+            // the same path with a writing method is still refused
+            assert!(check_request(&Method::POST, p, &h).is_err(), "POST {p}");
+        }
+        for p in ["/api/docs", "/api/stamp/x", "/mcp", "/admin/gardeners", "/ws/hot"] {
+            assert!(check_request(&Method::GET, p, &h).is_err(), "{p}");
+        }
+        // the exemption is for `null` only, not for a foreign origin
+        let evil = hm(&[("host", "127.0.0.1:7425"), ("origin", "http://evil.example")]);
+        assert!(check_request(&Method::GET, "/api/stamp", &evil).is_err());
+        // and Host is still checked
+        let rebound = hm(&[("host", "evil.example"), ("origin", "null")]);
+        assert!(check_request(&Method::GET, "/api/stamp", &rebound).is_err());
     }
 
     #[tokio::test]
