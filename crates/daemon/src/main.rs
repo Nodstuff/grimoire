@@ -7,6 +7,7 @@ mod admin;
 mod api;
 mod ask;
 mod backup;
+mod embed;
 mod fed;
 mod garden;
 mod hot;
@@ -592,6 +593,26 @@ async fn main() -> anyhow::Result<()> {
             tokio::spawn(admin::daily_loop(store.clone(), hot.clone()));
             // daily self-contained db snapshot beside the db (backups/), keep 7
             tokio::spawn(backup::backup_loop(store.clone(), cli.db.clone()));
+            // block embeddings (ask the vault): model compiled in, index kept
+            // current block-by-block; a load failure degrades to keyword search
+            let embedder = match embed::Embedder::load() {
+                Ok(e) => {
+                    let e = Arc::new(e);
+                    {
+                        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+                        match e.load_index(&s) {
+                            Ok(n) => tracing::info!(vectors = n, dim = e.dim, "embedding index loaded"),
+                            Err(err) => tracing::warn!("embedding index load failed: {err}"),
+                        }
+                    }
+                    tokio::spawn(embed::embed_loop(e.clone(), store.clone()));
+                    Some(e)
+                }
+                Err(err) => {
+                    tracing::warn!("embedding model unavailable; ask-the-vault uses keywords only: {err:#}");
+                    None
+                }
+            };
             let fed_ctx_node_id: Option<String>;
             let app = mcp::router(store.clone(), claude, hot.clone())
                 .merge(hot::router(hot::HotCtx {
@@ -610,6 +631,7 @@ async fn main() -> anyhow::Result<()> {
                     runtime,
                     db_path: cli.db.clone(),
                     node_id: fed_ctx_node_id,
+                    embedder,
                 }));
             // The frontend is EMBEDDED in this binary (rust-embed over ui/dist),
             // so the app is self-contained on any machine. GRIMOIRE_UI_DIST is a

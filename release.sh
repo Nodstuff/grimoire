@@ -37,6 +37,8 @@ export TAURI_SIGNING_PRIVATE_KEY="$(cat "$UPDATER_KEY")"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
 VERSION=$(python3 -c 'import json;print(json.load(open("crates/shell/tauri.conf.json"))["version"])')
 
+echo "→ embedding model"
+./scripts/fetch-model.sh | tail -1
 echo "→ ui build"
 (cd ui && npm run build --silent | tail -1)
 echo "→ daemon release build"

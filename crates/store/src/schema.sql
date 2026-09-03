@@ -273,3 +273,13 @@ CREATE TABLE IF NOT EXISTS outbound_proposals (
         CHECK (state IN ('pending', 'accepted', 'declined', 'mixed')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Block embeddings (ask the vault, 2026-09-03): one static-model vector per
+-- live content block, f32 little-endian BLOB. `epoch` is the block epoch the
+-- vector was computed at; a newer block epoch = stale = re-embed that block.
+CREATE TABLE IF NOT EXISTS block_vec (
+    block_id TEXT PRIMARY KEY REFERENCES blocks (id),
+    epoch    INTEGER NOT NULL,
+    dim      INTEGER NOT NULL,
+    vec      BLOB NOT NULL
+);

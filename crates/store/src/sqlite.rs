@@ -2532,6 +2532,77 @@ impl BlockStore for SqliteStore {
         Ok(())
     }
 
+    fn stale_block_vectors(&self, limit: usize) -> Result<Vec<(Uuid, i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT b.id, b.epoch, b.content FROM blocks b
+             LEFT JOIN block_vec v ON v.block_id = b.id
+             WHERE b.deleted = 0 AND b.block_type != 'comment'
+               AND (v.block_id IS NULL OR v.epoch < b.epoch)
+             ORDER BY b.epoch DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        })?;
+        rows.map(|r| {
+            let (id, epoch, content) = r?;
+            Ok((uuid_col(id, "blocks.id")?, epoch, content))
+        })
+        .collect()
+    }
+
+    fn set_block_vec(&mut self, block_id: Uuid, epoch: i64, vec: &[f32]) -> Result<()> {
+        let mut blob = Vec::with_capacity(vec.len() * 4);
+        for f in vec {
+            blob.extend_from_slice(&f.to_le_bytes());
+        }
+        self.conn.execute(
+            "INSERT INTO block_vec (block_id, epoch, dim, vec) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(block_id) DO UPDATE SET epoch = excluded.epoch, dim = excluded.dim, vec = excluded.vec",
+            params![block_id.to_string(), epoch, vec.len() as i64, blob],
+        )?;
+        Ok(())
+    }
+
+    fn block_vecs(&self) -> Result<Vec<(Uuid, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT v.block_id, v.vec FROM block_vec v JOIN blocks b ON b.id = v.block_id
+             WHERE b.deleted = 0 AND v.dim > 0",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+        rows.map(|r| {
+            let (id, blob) = r?;
+            let vec = blob
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            Ok((uuid_col(id, "block_vec.block_id")?, vec))
+        })
+        .collect()
+    }
+
+    fn purge_block_vecs(&mut self) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM block_vec WHERE block_id IN (
+                 SELECT v.block_id FROM block_vec v LEFT JOIN blocks b ON b.id = v.block_id
+                 WHERE b.id IS NULL OR b.deleted = 1)",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    fn blocks_as_hits(&self, ids: &[Uuid]) -> Result<Vec<SearchHit>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Ok(block) = self.read_block(*id) else { continue };
+            if block.deleted {
+                continue;
+            }
+            let doc_title = self.get_doc(block.doc_id).map(|d| d.title).unwrap_or_default();
+            out.push(SearchHit { block, doc_title });
+        }
+        Ok(out)
+    }
+
     fn change_signature(&self) -> Result<ChangeSignature> {
         // one cheap aggregate over docs + shares: enough to say "nothing an
         // owner-side nudge could care about moved since last tick"

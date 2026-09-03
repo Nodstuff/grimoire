@@ -45,9 +45,103 @@ pub fn keywords(question: &str) -> Vec<String> {
     out
 }
 
-/// Ranked excerpts: blocks hit by the most distinct keywords first; ties by
-/// shorter content (denser). Frontmatter/comment blocks never make the cut.
-pub fn retrieve(store: &SqliteStore, question: &str) -> Vec<SearchHit> {
+/// Ranked excerpts, hybrid: dense cosine neighbours (paraphrase-robust)
+/// fused with keyword hits (exact terms) by reciprocal rank fusion, then cut
+/// to the char budget. Frontmatter/comment blocks never make the cut. Works
+/// without an embedder (keyword-only) so the feature never depends on the
+/// model loading.
+pub fn retrieve(store: &SqliteStore, embedder: Option<&crate::embed::Embedder>, question: &str) -> Vec<SearchHit> {
+    let answers = answers_folder_id(store);
+    let usable = |h: &SearchHit| {
+        h.block.block_type != grimoire_store::BlockType::Comment
+            && !grimoire_store::import::is_frontmatter(&h.block.content)
+            && !is_bare_heading(&h.block.content)
+            && !under_answers(store, h.block.doc_id, answers)
+    };
+    let keyword: Vec<SearchHit> = retrieve_keyword(store, question).into_iter().filter(usable).collect();
+    let Some(emb) = embedder else { return budget(keyword) };
+    // dense neighbours, cut where they stop being neighbours: a static model
+    // puts genuinely related prose well above ~0.3 cosine and unrelated
+    // prose below; a relative cut against the best hit handles both a sharp
+    // question (one clear winner) and a broad one (several good excerpts)
+    let scored = emb.search(question, 60);
+    let top = scored.first().map(|(_, s)| *s).unwrap_or(0.0);
+    let dense_ids: Vec<Uuid> = scored
+        .into_iter()
+        .filter(|(_, s)| *s >= DENSE_FLOOR && *s >= top * DENSE_RELATIVE)
+        .map(|(id, _)| id)
+        .collect();
+    let dense: Vec<SearchHit> = store
+        .blocks_as_hits(&dense_ids)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(usable)
+        .collect();
+    budget(rrf(&[dense, keyword]))
+}
+
+/// Cosine below this is noise for potion-class static models.
+const DENSE_FLOOR: f32 = 0.30;
+/// …and anything much weaker than the best hit is padding, not evidence.
+const DENSE_RELATIVE: f32 = 0.70;
+
+/// `# Title` alone carries no fact worth citing.
+fn is_bare_heading(content: &str) -> bool {
+    let t = content.trim();
+    t.starts_with('#') && !t.contains('\n')
+}
+
+fn answers_folder_id(store: &SqliteStore) -> Option<Uuid> {
+    store
+        .list_docs()
+        .ok()?
+        .into_iter()
+        .find(|d| d.parent_id.is_none() && d.title == ANSWERS_FOLDER)
+        .map(|d| d.id)
+}
+
+/// Answer docs must never be evidence for the next answer (they'd echo).
+fn under_answers(store: &SqliteStore, doc_id: Uuid, answers: Option<Uuid>) -> bool {
+    let Some(a) = answers else { return false };
+    let mut cur = Some(doc_id);
+    while let Some(id) = cur {
+        if id == a {
+            return true;
+        }
+        cur = store.get_doc(id).ok().and_then(|d| d.parent_id);
+    }
+    false
+}
+
+/// Reciprocal rank fusion over ranked lists (k = 60, the textbook value).
+pub fn rrf(lists: &[Vec<SearchHit>]) -> Vec<SearchHit> {
+    let mut score: HashMap<Uuid, (f32, SearchHit)> = HashMap::new();
+    for list in lists {
+        for (rank, h) in list.iter().enumerate() {
+            let e = score.entry(h.block.id).or_insert((0.0, h.clone()));
+            e.0 += 1.0 / (60.0 + rank as f32 + 1.0);
+        }
+    }
+    let mut out: Vec<(f32, SearchHit)> = score.into_values().collect();
+    out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    out.into_iter().map(|(_, h)| h).collect()
+}
+
+fn budget(ranked: Vec<SearchHit>) -> Vec<SearchHit> {
+    let mut out = Vec::new();
+    let mut chars = 0usize;
+    for h in ranked {
+        if out.len() >= MAX_BLOCKS || chars + h.block.content.len() > MAX_CHARS {
+            break;
+        }
+        chars += h.block.content.len();
+        out.push(h);
+    }
+    out
+}
+
+/// Keyword leg: blocks hit by the most distinct question words first.
+pub fn retrieve_keyword(store: &SqliteStore, question: &str) -> Vec<SearchHit> {
     let words = keywords(question);
     let mut score: HashMap<Uuid, (usize, SearchHit)> = HashMap::new();
     // the trigram index is deliberately fuzzy (typos welcome); for grounding
@@ -82,17 +176,33 @@ pub fn retrieve(store: &SqliteStore, question: &str) -> Vec<SearchHit> {
     }
     let mut ranked: Vec<(usize, SearchHit)> = score.into_values().collect();
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.block.content.len().cmp(&b.1.block.content.len())));
-    let mut out = Vec::new();
-    let mut chars = 0usize;
-    for (_, h) in ranked {
-        if out.len() >= MAX_BLOCKS || chars + h.block.content.len() > MAX_CHARS {
-            break;
-        }
-        chars += h.block.content.len();
-        out.push(h);
-    }
-    out
+    ranked.into_iter().map(|(_, h)| h).collect()
 }
+
+/// The receipts: excerpts grouped by doc, each a deep link. Instant, free,
+/// nothing invented — for "where did we say X" this IS the answer.
+pub fn receipts_markdown(excerpts: &[SearchHit]) -> String {
+    let mut by_doc: Vec<(String, Vec<&SearchHit>)> = Vec::new();
+    for h in excerpts {
+        match by_doc.iter_mut().find(|(t, _)| *t == h.doc_title) {
+            Some((_, v)) => v.push(h),
+            None => by_doc.push((h.doc_title.clone(), vec![h])),
+        }
+    }
+    let mut md = String::new();
+    for (title, hits) in by_doc {
+        md.push_str(&format!("## {title}\n\n"));
+        for h in hits {
+            let one_line = h.block.content.trim().replace('\n', " ");
+            let shown: String = one_line.chars().take(400).collect();
+            let ell = if one_line.chars().count() > 400 { "…" } else { "" };
+            md.push_str(&format!("> {shown}{ell}\n>\n> — [[{title}#^{}]]\n\n", h.block.id));
+        }
+    }
+    md
+}
+
+pub const SYNTH_PLACEHOLDER: &str = "*✨ Writing a synthesis from the excerpts below…*";
 
 pub fn compose(question: &str, excerpts: &[SearchHit]) -> String {
     let mut ex = String::new();
@@ -150,6 +260,7 @@ pub struct Answer {
 
 pub async fn ask(
     store: Arc<Mutex<SqliteStore>>,
+    embedder: Option<Arc<crate::embed::Embedder>>,
     human: Uuid,
     question: String,
 ) -> Result<Answer, String> {
@@ -159,35 +270,71 @@ pub async fn ask(
     }
     let excerpts = {
         let s = store.lock().unwrap_or_else(|p| p.into_inner());
-        retrieve(&s, &question)
+        retrieve(&s, embedder.as_deref(), &question)
     };
     let docs: std::collections::HashSet<Uuid> = excerpts.iter().map(|h| h.block.doc_id).collect();
     if excerpts.is_empty() {
         // nothing to ground an answer in: say so, leave no doc behind
         return Ok(Answer { doc_id: None, title: title_for(&question), sources: 0, docs: 0 });
     }
-    let prompt = compose(&question, &excerpts);
-    let (text, _tokens) = crate::garden::invoke_claude_bounded(&prompt, WALL_CLOCK).await?;
-    let answer_md = text.trim().to_string();
+    let synthesise = crate::garden::claude_bin().is_some();
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let md = format!(
-        "# {q}\n\n{answer_md}\n\n---\n\n*Asked {date} · answered from {n} block{s} across {d} doc{ds}.*\n",
+        "# {q}\n\n{synth}{receipts}---\n\n*Asked {date} · {n} block{s} across {d} doc{ds}.*\n",
         q = question,
+        synth = if synthesise { format!("{SYNTH_PLACEHOLDER}\n\n") } else { String::new() },
+        receipts = receipts_markdown(&excerpts),
         n = excerpts.len(),
         s = if excerpts.len() == 1 { "" } else { "s" },
         d = docs.len(),
         ds = if docs.len() == 1 { "" } else { "s" },
     );
     let title = title_for(&question);
-    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-    let folder = answers_folder(&mut s, human).map_err(|e| e.to_string())?;
-    let agent = crate::room::agent_principal(&mut s).map_err(|e| e.to_string())?;
-    let (doc_id, _) = grimoire_store::import::import_markdown(&mut *s, &title, Some(folder), agent, &md)
-        .map_err(|e| e.to_string())?;
+    let (doc_id, agent) = {
+        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let folder = answers_folder(&mut s, human).map_err(|e| e.to_string())?;
+        let agent = crate::room::agent_principal(&mut s).map_err(|e| e.to_string())?;
+        let (doc_id, _) = grimoire_store::import::import_markdown(&mut *s, &title, Some(folder), agent, &md)
+            .map_err(|e| e.to_string())?;
+        (doc_id, agent)
+    };
+    let sources = excerpts.len();
+    if synthesise {
+        // the prose lands a few seconds later in the same doc, replacing the
+        // placeholder block through the gate under the agent principal
+        let store = store.clone();
+        let q = question.clone();
+        tokio::spawn(async move {
+            let prompt = compose(&q, &excerpts);
+            let text = match crate::garden::invoke_claude_bounded(&prompt, WALL_CLOCK).await {
+                Ok((t, _)) => t.trim().to_string(),
+                Err(e) => {
+                    tracing::warn!(%doc_id, "ask synthesis failed: {e}");
+                    format!("*The synthesis could not be written ({e}); the excerpts below stand on their own.*")
+                }
+            };
+            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+            let Ok(tree) = s.read_doc(doc_id) else { return };
+            let placeholder = tree
+                .roots
+                .iter()
+                .flat_map(|n| std::iter::once(&n.block).chain(n.children.iter().map(|c| &c.block)))
+                .find(|b| b.content == SYNTH_PLACEHOLDER)
+                .map(|b| b.id);
+            let Some(target) = placeholder else { return };
+            let op = grimoire_store::OpInput {
+                kind: grimoire_store::OpKind::Replace { target, content: text },
+                source_refs: vec!["ask-the-vault: synthesis".into()],
+            };
+            if let Err(e) = s.propose(doc_id, tree.doc.current_epoch, agent, vec![op]) {
+                tracing::warn!(%doc_id, "ask synthesis could not land: {e}");
+            }
+        });
+    }
     Ok(Answer {
         doc_id: Some(doc_id),
         title,
-        sources: excerpts.len(),
+        sources,
         docs: docs.len(),
     })
 }
@@ -212,7 +359,7 @@ mod tests {
         import_markdown(&mut s, "Grants", None, tom.id,
             "---\ntags:\n  - grant\n---\n\nThe grant flow uses temporary delegation.\n\nUnrelated paragraph about lunch.\n").unwrap();
         import_markdown(&mut s, "Other", None, tom.id, "Delegation is mentioned here alone.\n").unwrap();
-        let hits = retrieve(&s, "how does the grant flow use delegation?");
+        let hits = retrieve(&s, None, "how does the grant flow use delegation?");
         assert!(!hits.is_empty());
         assert!(hits[0].block.content.contains("grant flow uses temporary delegation"));
         assert!(hits.iter().all(|h| !h.block.content.starts_with("---")));
@@ -224,11 +371,55 @@ mod tests {
         let mut s = SqliteStore::open_in_memory().unwrap();
         let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
         import_markdown(&mut s, "Doc A", None, tom.id, "alpha fact\n").unwrap();
-        let hits = retrieve(&s, "alpha fact");
+        let hits = retrieve(&s, None, "alpha fact");
         let p = compose("what is alpha?", &hits);
         assert!(p.contains("[1] doc: Doc A · id: "));
         assert!(p.contains("[[<doc title>#^<id>]]"));
         assert!(p.contains("Question: what is alpha?"));
+    }
+
+    #[test]
+    fn receipts_group_by_doc_and_deep_link_every_excerpt() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        import_markdown(&mut s, "Doc A", None, tom.id, "alpha one\n\nalpha two\n").unwrap();
+        import_markdown(&mut s, "Doc B", None, tom.id, "alpha three\n").unwrap();
+        let hits = retrieve(&s, None, "alpha");
+        let md = receipts_markdown(&hits);
+        assert_eq!(md.matches("## ").count(), 2);
+        assert_eq!(md.matches("#^").count(), 3);
+        for h in &hits {
+            assert!(md.contains(&format!("[[{}#^{}]]", h.doc_title, h.block.id)));
+        }
+    }
+
+    #[test]
+    fn rrf_puts_blocks_high_in_both_lists_first() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        import_markdown(&mut s, "D", None, tom.id, "alpha\n\nbravo\n\ncharlie\n").unwrap();
+        let all = retrieve(&s, None, "alpha bravo charlie");
+        assert_eq!(all.len(), 3);
+        // present in both lists beats top of one list: the dense leg says
+        // [bravo, alpha], the keyword leg says [bravo, charlie]
+        let a = vec![all[1].clone(), all[0].clone()];
+        let b = vec![all[1].clone(), all[2].clone()];
+        let fused = rrf(&[a, b]);
+        assert_eq!(fused[0].block.id, all[1].block.id);
+        assert_eq!(fused.len(), 3);
+    }
+
+    #[test]
+    fn retrieval_skips_bare_headings_and_earlier_answers() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        import_markdown(&mut s, "Grants", None, tom.id, "# Grants\n\nThe grant flow uses delegation.\n").unwrap();
+        let answers = s.create_doc(ANSWERS_FOLDER, None, tom.id).unwrap();
+        import_markdown(&mut s, "old answer", Some(answers.id), tom.id, "Earlier we said the grant flow uses delegation.\n").unwrap();
+        let hits = retrieve(&s, None, "grant flow delegation");
+        assert_eq!(hits.len(), 1, "{:?}", hits.iter().map(|h| &h.block.content).collect::<Vec<_>>());
+        assert_eq!(hits[0].doc_title, "Grants");
+        assert!(!hits[0].block.content.starts_with('#'));
     }
 
     #[test]

@@ -3,6 +3,8 @@
 set -e
 set -o pipefail
 cd "$(dirname "$0")"
+echo "→ embedding model"
+./scripts/fetch-model.sh | tail -1
 echo "→ ui build"
 (cd ui && npm run build --silent | tail -1)
 echo "→ daemon release build"

@@ -22,6 +22,9 @@ pub struct ApiState {
     pub db_path: std::path::PathBuf,
     /// Federation identity (node id), None when federation is disabled.
     pub node_id: Option<String>,
+    /// Block embeddings for ask-the-vault; None if the model failed to load
+    /// (retrieval falls back to keywords).
+    pub embedder: Option<Arc<crate::embed::Embedder>>,
 }
 
 /// UI heartbeat: this doc is open. For a mirror, its share joins the fast
@@ -1084,10 +1087,7 @@ struct AskReq {
 /// Ask the vault: question → answer doc with block-level citations. Waits
 /// for the model (a minute at most); the UI shows "thinking…" meanwhile.
 async fn ask_vault(State(st): State<ApiState>, Json(req): Json<AskReq>) -> Json<Value> {
-    if crate::garden::claude_bin().is_none() {
-        return Json(json!({"error": "Claude Code is not installed on this Mac — asking the vault needs it", "code": "no_claude"}));
-    }
-    match crate::ask::ask(st.store.clone(), st.human, req.question).await {
+    match crate::ask::ask(st.store.clone(), st.embedder.clone(), st.human, req.question).await {
         Ok(a) => Json(json!(a)),
         Err(e) => Json(json!({"error": e})),
     }

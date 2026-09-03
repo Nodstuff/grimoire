@@ -373,6 +373,23 @@ pub trait BlockStore {
     /// signatures on two ticks mean no nudge is due — no per-share walk needed.
     fn change_signature(&self) -> Result<ChangeSignature>;
 
+    /// Live content blocks whose embedding is missing or older than the
+    /// block (`block_vec.epoch < blocks.epoch`): (id, epoch, content).
+    fn stale_block_vectors(&self, limit: usize) -> Result<Vec<(Uuid, i64, String)>>;
+
+    /// Store a block's embedding at the given block epoch (empty vec = "this
+    /// block is deliberately not embedded", e.g. frontmatter).
+    fn set_block_vec(&mut self, block_id: Uuid, epoch: i64, vec: &[f32]) -> Result<()>;
+
+    /// Every stored embedding of a LIVE block (deleted blocks excluded).
+    fn block_vecs(&self) -> Result<Vec<(Uuid, Vec<f32>)>>;
+
+    /// Drop embeddings whose block is gone or tombstoned. Returns how many.
+    fn purge_block_vecs(&mut self) -> Result<usize>;
+
+    /// Search hits for specific block ids (live only), in the given order.
+    fn blocks_as_hits(&self, ids: &[Uuid]) -> Result<Vec<SearchHit>>;
+
     fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>>;
 
     fn list_mirrors(&self) -> Result<Vec<Mirror>>;
