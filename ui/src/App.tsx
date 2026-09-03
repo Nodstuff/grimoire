@@ -376,6 +376,7 @@ export default function App() {
         )}
         {view.kind === 'doc' && (
           <DocView
+            key={view.id}
             docId={view.id}
             onOpenDoc={openDoc}
             docs={docs}
@@ -1277,13 +1278,29 @@ function DocView({
   const [hot, setHot] = useState<HotDoc | null>(null)
   const mirrorRef = useRef<unknown>(null)
   const [panel, setPanel] = useState<'none' | 'history' | 'comments' | 'tend' | 'share' | 'review'>('none')
+  // stale guard: DocView is keyed by docId (one instance per open doc), so a
+  // fetch that resolves after unmount — or after a doc switch — is for a doc
+  // that is no longer on screen. `gen` bumps on every docId change too, in
+  // case a caller ever reuses the instance.
+  const gen = useRef(0)
+  useEffect(() => {
+    const g = ++gen.current
+    return () => {
+      if (gen.current === g) gen.current++
+    }
+  }, [docId])
+  const fresh = useCallback(
+    (g: number) => gen.current === g,
+    [],
+  )
   // open review items for THIS doc (yellow = applied+flagged, red = parked)
   const [reviewItems, setReviewItems] = useState<QueueRow[]>([])
   const loadReview = useCallback(() => {
+    const g = gen.current
     api<QueueRow[]>(`/api/doc/${docId}/review`)
-      .then((r) => setReviewItems(Array.isArray(r) ? r : []))
-      .catch(() => setReviewItems([]))
-  }, [docId])
+      .then((r) => fresh(g) && setReviewItems(Array.isArray(r) ? r : []))
+      .catch(() => fresh(g) && setReviewItems([]))
+  }, [docId, fresh])
   const [selBlock, setSelBlock] = useState<string | null>(null)
   const [selRect, setSelRect] = useState<{ x: number; y: number } | null>(null)
   const [commentTarget, setCommentTarget] = useState<string | null>(null)
@@ -1310,10 +1327,17 @@ function DocView({
   }, [])
 
   const loadTree = useCallback(() => {
-    api<DocTree>(`/api/doc/${docId}`).then(setTree).catch(console.error)
-    api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => setBacklinks([]))
-    api<DocFederation>(`/api/doc/${docId}/federation`).then(setFed).catch(() => setFed(null))
-  }, [docId])
+    const g = gen.current
+    api<DocTree>(`/api/doc/${docId}`)
+      .then((t) => fresh(g) && setTree(t))
+      .catch(console.error)
+    api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
+      .then((b) => fresh(g) && setBacklinks(b))
+      .catch(() => fresh(g) && setBacklinks([]))
+    api<DocFederation>(`/api/doc/${docId}/federation`)
+      .then((f) => fresh(g) && setFed(f))
+      .catch(() => fresh(g) && setFed(null))
+  }, [docId, fresh])
 
   useEffect(() => {
     setTree(null)
@@ -1355,17 +1379,19 @@ function DocView({
   treeRef.current = tree
   const afterResolve = useCallback(() => {
     loadReview()
+    const g = gen.current
     api<DocTree>(`/api/doc/${docId}`)
-      .then((fresh) => {
+      .then((next) => {
+        if (!fresh(g)) return
         const cur = treeRef.current
-        if (!cur || fresh.doc.current_epoch !== cur.doc.current_epoch) {
-          ownEpoch.current = Math.max(ownEpoch.current, fresh.doc.current_epoch)
+        if (!cur || next.doc.current_epoch !== cur.doc.current_epoch) {
+          ownEpoch.current = Math.max(ownEpoch.current, next.doc.current_epoch)
           setEditorGen((g) => g + 1)
         }
-        setTree(fresh)
+        setTree(next)
       })
       .catch(() => {})
-  }, [docId, loadReview])
+  }, [docId, loadReview, fresh])
 
   const highlightMap = useMemo(() => buildHighlightMap(reviewItems), [reviewItems])
 
@@ -1375,21 +1401,27 @@ function DocView({
   const refreshFromStore = useCallback(() => {
     const cur = treeRef.current
     if (!cur) return
+    const g = gen.current
     api<DocTree>(`/api/doc/${docId}`)
-      .then((fresh) => {
+      .then((next) => {
+        if (!fresh(g)) return
         const known = Math.max(cur.doc.current_epoch, ownEpoch.current)
         const dirty = document.querySelector('.save-state.dirty, .save-state.saving')
-        if (fresh.doc.current_epoch > known && !dirty) {
-          setTree(fresh)
+        if (next.doc.current_epoch > known && !dirty) {
+          setTree(next)
           setEditorGen((g) => g + 1)
-        } else if (fresh.doc.status !== cur.doc.status) {
-          setTree(fresh)
+        } else if (next.doc.status !== cur.doc.status) {
+          setTree(next)
         }
-        api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => {})
-        api<DocFederation>(`/api/doc/${docId}/federation`).then(setFed).catch(() => {})
+        api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
+          .then((b) => fresh(g) && setBacklinks(b))
+          .catch(() => {})
+        api<DocFederation>(`/api/doc/${docId}/federation`)
+          .then((f) => fresh(g) && setFed(f))
+          .catch(() => {})
       })
       .catch((e) => console.warn('doc refresh failed', docId, e))
-  }, [docId])
+  }, [docId, fresh])
   useEffect(() => {
     if (dataVersion === 0) return
     refreshFromStore()
@@ -1595,9 +1627,10 @@ function DocView({
   const liveHeldOff = useRef<string | null>(null)
   useEffect(() => {
     if (!tree || hot) return
+    const g = gen.current
     api<HotStatus>(`/api/doc/${docId}/hot/status`)
       .then((st) => {
-        if (!editable) return
+        if (!editable || !fresh(g)) return
         if (st.hot) {
           // someone else went live while this cold editor holds unsaved text.
           // Swapping editors now would fire the cold save into the freeze and
@@ -1833,16 +1866,23 @@ function DocView({
             setHotCanWrite(undefined)
             setViewersWrite(undefined)
             loadReview()
+            const g = gen.current
             api<DocTree>(`/api/doc/${docId}`)
-              .then((fresh) => {
-                ownEpoch.current = Math.max(ownEpoch.current, fresh.doc.current_epoch)
-                setTree(fresh)
+              .then((next) => {
+                if (!fresh(g)) return
+                ownEpoch.current = Math.max(ownEpoch.current, next.doc.current_epoch)
+                setTree(next)
                 setHot(null)
                 setEditorGen((g) => g + 1)
-                api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => {})
-                api<DocFederation>(`/api/doc/${docId}/federation`).then(setFed).catch(() => {})
+                api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
+                  .then((b) => fresh(g) && setBacklinks(b))
+                  .catch(() => {})
+                api<DocFederation>(`/api/doc/${docId}/federation`)
+                  .then((f) => fresh(g) && setFed(f))
+                  .catch(() => {})
               })
               .catch((e) => {
+                if (!fresh(g)) return
                 notify(`session ended but the doc could not be reloaded: ${errText(e)}`)
                 setHot(null)
                 loadTree()
@@ -1856,7 +1896,9 @@ function DocView({
         reviewMap={highlightMap}
         // a relayed doc proposes through the hub, which carries it to the owner
         mode={mirror ? (mirror.permission === 'propose' ? 'propose' : 'readonly') : 'direct'}
-        onSaved={(e) => {
+        onSaved={(e, savedDocId) => {
+          // the unmount flush of a PREVIOUS doc's editor reports its own id
+          if (savedDocId !== docId) return
           ownEpoch.current = Math.max(ownEpoch.current, e)
         }}
         onProposed={() => {

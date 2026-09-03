@@ -919,31 +919,24 @@ fn inverse_of(kind: &OpKind, prior: Option<&Block>) -> Result<OpKind> {
 /// and its next sibling. Real keys pass through untouched, and the ledger
 /// stores the resolved op.
 fn resolve_order_keys(tx: &Transaction, doc_id: Uuid, kind: &mut OpKind) -> Result<()> {
-    let OpKind::Insert {
-        parent_id,
-        order_key,
-        ..
-    } = kind
-    else {
-        return Ok(());
+    let (parent_id, order_key) = match kind {
+        OpKind::Insert {
+            parent_id,
+            order_key,
+            ..
+        } => (parent_id, order_key),
+        // a move carries a real key: validate, never resolve
+        OpKind::Move { new_order_key, .. } => {
+            check_order_key(new_order_key)?;
+            return Ok(());
+        }
+        _ => return Ok(()),
     };
     let spec = order_key.clone();
     if !spec.is_empty() && !spec.starts_with("after:") {
-        return Ok(());
+        return check_order_key(&spec);
     }
-    let siblings: Vec<(String, String)> = {
-        let mut stmt = tx.prepare(
-            "SELECT id, order_key FROM blocks
-             WHERE doc_id = ?1 AND deleted = 0
-               AND ((?2 IS NULL AND parent_id IS NULL) OR parent_id = ?2)
-             ORDER BY order_key",
-        )?;
-        let rows = stmt.query_map(
-            params![doc_id.to_string(), parent_id.map(|p| p.to_string())],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        )?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
+    let siblings = live_sibling_keys(tx, doc_id, *parent_id)?;
     let new_key = if let Some(after_id) = spec.strip_prefix("after:") {
         let after_id = after_id.trim();
         let idx = siblings
@@ -959,6 +952,67 @@ fn resolve_order_keys(tx: &Transaction, doc_id: Uuid, kind: &mut OpKind) -> Resu
     };
     *order_key = new_key;
     Ok(())
+}
+
+/// Client-supplied keys must be real fractional keys (base36, non-empty, no
+/// trailing 0): anything else is rejected as a normal error, never a panic.
+fn check_order_key(key: &str) -> Result<()> {
+    if crate::order_key::is_valid(key) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidOp(format!(
+            "order_key {key:?}: must be non-empty base36 digits (or \"\" / \"after:<id>\" on insert)"
+        )))
+    }
+}
+
+/// (id, order_key) of the live blocks under `parent_id`, in key order.
+fn live_sibling_keys(
+    tx: &Transaction,
+    doc_id: Uuid,
+    parent_id: Option<Uuid>,
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT id, order_key FROM blocks
+         WHERE doc_id = ?1 AND deleted = 0
+           AND ((?2 IS NULL AND parent_id IS NULL) OR parent_id = ?2)
+         ORDER BY order_key",
+    )?;
+    let rows = stmt.query_map(
+        params![doc_id.to_string(), parent_id.map(|p| p.to_string())],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// A parked insert resolved its key when it was parked; by the time it is
+/// accepted a sibling may have taken that key. Re-resolve to a fresh key just
+/// after the collision so live siblings never share a key. Returns whether
+/// the key changed.
+fn dedupe_insert_key(tx: &Transaction, doc_id: Uuid, kind: &mut OpKind) -> Result<bool> {
+    let OpKind::Insert {
+        block_id,
+        parent_id,
+        order_key,
+        ..
+    } = kind
+    else {
+        return Ok(false);
+    };
+    let siblings = live_sibling_keys(tx, doc_id, *parent_id)?;
+    let me = block_id.to_string();
+    let taken = siblings
+        .iter()
+        .any(|(id, k)| *id != me && k == order_key);
+    if !taken {
+        return Ok(false);
+    }
+    let next = siblings
+        .iter()
+        .map(|(_, k)| k.as_str())
+        .find(|k| *k > order_key.as_str());
+    *order_key = crate::order_key::between(Some(order_key), next);
+    Ok(true)
 }
 
 /// Fetch a live (non-deleted) block within a doc, for projection checks.
@@ -3598,7 +3652,15 @@ impl BlockStore for SqliteStore {
             (AnnotationKind::Parked, ReviewDecision::Accept) => {
                 let current = doc_epoch(&tx, doc_id)?;
                 let epoch = current + 1;
-                project(&tx, doc_id, epoch, op.principal, &op.kind)?;
+                // the key was resolved at park time; a sibling may hold it now
+                let mut kind = op.kind.clone();
+                if dedupe_insert_key(&tx, doc_id, &mut kind)? {
+                    tx.execute(
+                        "UPDATE ops SET payload = ?1 WHERE id = ?2",
+                        params![serde_json::to_string(&kind)?, op.id.to_string()],
+                    )?;
+                }
+                project(&tx, doc_id, epoch, op.principal, &kind)?;
                 tx.execute(
                     "UPDATE ops SET epoch_applied = ?1 WHERE id = ?2",
                     params![epoch, op.id.to_string()],

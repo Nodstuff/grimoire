@@ -106,7 +106,9 @@ export default function DocEditor({
 }: {
   doc: EditableDoc
   mode?: EditorMode
-  onSaved: (epoch: number) => void
+  /** `docId` names the doc the save landed on: the unmount flush can fire
+   * after the parent has moved to another doc, which must ignore it */
+  onSaved: (epoch: number, docId: string) => void
   onProposed?: () => void
   onSelectionBlock?: (blockId: string | null) => void
   /** blocks under review → tone; painted as node decorations, no remount */
@@ -276,7 +278,7 @@ export default function DocEditor({
       setEpoch(out.epoch)
       setSaveState('clean')
       lastSaveError.current = null
-      onSaved(out.epoch)
+      onSaved(out.epoch, doc.docId)
     } catch (e) {
       // the text is still in the editor and stays dirty; the retry clock
       // below keeps trying. Say so ONCE per distinct cause — a silent
