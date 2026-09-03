@@ -315,6 +315,7 @@ Wire-additive; a 0.7.1 peer parses and redeems every 0.7.2 link and frame.
   half-done flip is finished by the retry.
 - **Loops.** `pull_loop`, `notify_loop`, `join_retry_loop` run under `loops::supervise` (restart on
   panic/exit, ERROR log, 1–60 s backoff). Hub publication accepts are gated by
-  `hub::PUBLICATION_GATE` (8 concurrent). The notify tick is incremental (`loops::notify_tick`):
+  `hub::PUBLICATION_GATE` (8 concurrent). A hub prunes `hub_forwards` rows older than
+  `HUB_FORWARD_RETENTION_DAYS` (7) on the 120 s sweep (`SqliteStore::prune_hub_forwards`). The notify tick is incremental (`loops::notify_tick`):
   an idle tick is still two trivial reads; a changed tick lists docs once, names the changed set
   (epoch rose / new / hotness flipped), and walks only the shares containing them.

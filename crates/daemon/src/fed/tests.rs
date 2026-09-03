@@ -3126,3 +3126,24 @@ async fn supervised_loop_is_restarted_after_a_panic() {
     assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2, "restarted exactly once and kept running");
     sup.abort();
 }
+
+/// 0.7.2 hardening: hub forward records are pruned by age on the sweep;
+/// fresh rows (a member may still ask about them) stay, and a non-hub skips.
+#[tokio::test]
+async fn hub_forward_records_are_pruned_by_age_on_the_sweep() {
+    use super::loops::{HUB_FORWARD_RETENTION_DAYS, prune_hub_forwards};
+    let (h, _cfg, alice, bob) = team().await;
+    let (alice_on_hub, bob_on_hub) = (h.contact_of(&alice), h.contact_of(&bob));
+    let (op, share, doc) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    h.store.lock().unwrap().add_hub_forward(op, alice_on_hub.id, bob_on_hub.id, share, doc).unwrap();
+    assert_eq!(prune_hub_forwards(&h.store), 0, "a fresh row is kept");
+    assert_eq!(h.store.lock().unwrap().hub_forwards_for(&[op]).unwrap().len(), 1);
+    // the store's own cut-off: everything older than the retention window goes
+    // (created_at has ms precision; make sure "now" has moved past it)
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(h.store.lock().unwrap().prune_hub_forwards(0).unwrap(), 1);
+    assert!(h.store.lock().unwrap().hub_forwards_for(&[op]).unwrap().is_empty());
+    assert!(HUB_FORWARD_RETENTION_DAYS >= 7);
+    // a plain daemon holds no rows and runs no delete
+    assert_eq!(prune_hub_forwards(&alice.store), 0);
+}

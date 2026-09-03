@@ -305,6 +305,7 @@ async fn pull_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, run
             refresh_outbound(&endpoint, &store).await;
             // 0.7.2: a flipped transfer whose Ready reply was lost is re-announced
             super::transfer::resend_ready(&endpoint, &store, None).await;
+            prune_hub_forwards(&store);
             pull_groups(&endpoint, &store, share_groups(&store), &dead).await
         } else {
             let focused = runtime.focused_shares();
@@ -589,6 +590,33 @@ async fn notify_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, h
                 batch.items,
                 batch.contact.petname.clone(),
             ));
+        }
+    }
+}
+
+/// Hub forward records older than this are pruned on the sweep.
+pub const HUB_FORWARD_RETENTION_DAYS: u32 = 7;
+
+/// 0.7.2: `hub_forwards` grew forever (one row per forwarded op, never
+/// pruned). A hub drops rows older than `HUB_FORWARD_RETENTION_DAYS` on the
+/// 120s sweep; the owner's op/annotation carries the verdict, so an old row
+/// is only needed while a member may still ask `ProposalStatus` about it.
+/// Non-hubs hold no rows and skip the query.
+pub fn prune_hub_forwards(store: &Arc<Mutex<SqliteStore>>) -> usize {
+    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+    if super::hub::config(&s).is_none() {
+        return 0;
+    }
+    match s.prune_hub_forwards(HUB_FORWARD_RETENTION_DAYS) {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!(pruned = n, days = HUB_FORWARD_RETENTION_DAYS, "hub: old forward records pruned");
+            }
+            n
+        }
+        Err(e) => {
+            tracing::warn!("hub: pruning forward records failed: {e}");
+            0
         }
     }
 }
