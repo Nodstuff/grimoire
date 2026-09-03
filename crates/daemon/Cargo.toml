@@ -8,7 +8,7 @@ license.workspace = true
 grimoire-store = { path = "../store" }
 rmcp = { version = "3.1", features = ["server", "transport-streamable-http-server"] }
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs", "limit"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "time"] }
 uuid.workspace = true
 serde.workspace = true

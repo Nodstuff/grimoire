@@ -767,5 +767,9 @@ pub fn router(
         LocalSessionManager::default().into(),
         Default::default(),
     );
-    axum::Router::new().nest_service("/mcp", service)
+    // rmcp reads the body itself, so axum's DefaultBodyLimit never applies;
+    // cap it at the transport with tower-http (propose_markdown-sized payloads)
+    axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(16 * 1024 * 1024))
 }

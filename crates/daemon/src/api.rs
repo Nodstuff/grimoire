@@ -1419,7 +1419,12 @@ pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/docs", get(docs).post(create_doc))
         .route("/api/propose", post(propose))
-        .route("/api/propose_markdown", post(propose_markdown))
+        // axum's default body cap is 2 MiB: whole-doc markdown and folder
+        // imports need more, and the import's own 200 MB guard must be reachable
+        .route(
+            "/api/propose_markdown",
+            post(propose_markdown).layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
         .route("/api/doc/{id}", get(doc))
         .route("/api/doc/{id}/backlinks", get(backlinks))
         .route("/api/queue", get(queue))
@@ -1442,7 +1447,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/trash", get(trash))
         .route("/api/backups", get(backups).post(backup_now))
         .route("/api/export_vault", post(export_vault))
-        .route("/api/import", post(import_markdown))
+        .route(
+            "/api/import",
+            post(import_markdown).layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024)),
+        )
         .route("/api/ask", post(ask_vault))
         .route("/api/memory/sync", post(memory_sync))
         .route("/api/doc/{id}/rename", post(rename_doc))
@@ -1506,6 +1514,51 @@ mod http_client_tests {
 
     async fn new_doc(app: &Router, headers: &[(&str, &str)]) -> Value {
         call(app, "POST", "/api/docs", headers, Some(json!({"title": "T", "parent_doc_id": null}))).await
+    }
+
+    #[tokio::test]
+    async fn body_limits_are_per_route() {
+        let (app, _) = app();
+        let doc = new_doc(&app, &[]).await;
+        let id = doc["id"].as_str().unwrap().to_string();
+        // 3 MiB is over axum's 2 MiB default: propose_markdown must still take it
+        let big = "x".repeat(3 * 1024 * 1024);
+        let body = serde_json::to_vec(&json!({"doc_id": id, "base_epoch": 0, "markdown": big})).unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/propose_markdown")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        // the import route takes far more (its own guard says 200 MB)
+        let files = json!({"files": [{"path": "a.md", "content": "x".repeat(3 * 1024 * 1024)}]});
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&files).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        // every other route keeps the default
+        let res = app
+            .oneshot(
+                Request::post("/api/docs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
