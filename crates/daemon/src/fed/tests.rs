@@ -2917,3 +2917,46 @@ async fn hub_forward_retry_parks_one_proposal_and_owner_refusals_are_cached() {
     assert!(matches!(propose("r3", "later").await, Response::Proposed { .. }));
     assert_eq!(alice.store.lock().unwrap().review_queue(Some(notes)).unwrap().len(), 2);
 }
+
+/// 0.7.2 hardening: a fan-out subscriber that falls behind the broadcast
+/// depth is not left silently stale — it gets one full-state SyncStep2 and
+/// the stream continues. (Before, `Lagged` ended the fan-out loop with the
+/// socket still open.) Empty SyncStep2 frames (every join) are not journaled.
+#[tokio::test]
+async fn lagged_hot_subscriber_is_resynced_with_the_full_doc_state() {
+    use yrs::sync::{Message as YMessage, SyncMessage};
+    use yrs::updates::decoder::{Decode, DecoderV1};
+    use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+    use yrs::{GetString, ReadTxn, Text, Transact};
+    let hot = scratch_hot();
+    let doc = uuid::Uuid::now_v7();
+    hot.start(doc, 0).unwrap();
+    let (mut rx, _hello) = hot.connect_as(doc, Some("peer")).unwrap();
+    // a real edit lands in the session
+    let edit = {
+        let d = yrs::Doc::new();
+        let t = d.get_or_insert_text("t");
+        t.insert(&mut d.transact_mut(), 0, "hello");
+        let u = d.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let mut enc = EncoderV1::new();
+        YMessage::Sync(SyncMessage::Update(u)).encode(&mut enc);
+        enc.to_vec()
+    };
+    assert!(hot.handle_frame(doc, &edit));
+    // the subscriber sleeps through far more frames than the channel holds
+    for _ in 0..(crate::hot::FAN_OUT_DEPTH + 64) {
+        assert!(hot.broadcast_raw(doc, vec![0, 0]));
+    }
+    let frame = hot.next_fan_out(&mut rx, doc, "peer").await.expect("resync, not end of stream");
+    let mut decoder = DecoderV1::new(yrs::encoding::read::Cursor::new(&frame));
+    let msg = yrs::sync::MessageReader::new(&mut decoder).next().unwrap().unwrap();
+    let YMessage::Sync(SyncMessage::SyncStep2(u)) = msg else { panic!("{msg:?}") };
+    let fresh = yrs::Doc::new();
+    fresh.transact_mut().apply_update(yrs::Update::decode_v1(&u).unwrap()).unwrap();
+    assert_eq!(fresh.get_or_insert_text("t").get_string(&fresh.transact()), "hello");
+    // and the stream goes on: the frames that survived the lag still arrive
+    assert!(hot.next_fan_out(&mut rx, doc, "peer").await.is_some());
+    // journal hygiene: the empty step-2 is skipped, a real update is not
+    assert!(crate::hot::update_is_empty(&[0, 0]));
+    assert!(!crate::hot::update_is_empty(&edit));
+}

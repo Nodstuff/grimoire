@@ -1651,8 +1651,10 @@ async fn handle_hot_bridge(
     }
     let _unregister = Unregister(&hot, bridge_id);
 
+    let fan_hot = hot.clone();
+    let fan_peer = peer.to_string();
     let fan_out = tokio::spawn(async move {
-        while let Ok(frame) = rx.recv().await {
+        while let Some(frame) = fan_hot.next_fan_out(&mut rx, doc_id, &fan_peer).await {
             if write_frame(&mut send, &frame).await.is_err() {
                 break;
             }

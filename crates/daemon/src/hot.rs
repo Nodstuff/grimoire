@@ -37,7 +37,7 @@ use uuid::Uuid;
 use yrs::sync::{Awareness, DefaultProtocol, Message as YMessage, Protocol, SyncMessage};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::{Doc, Transact, Update};
+use yrs::{Doc, ReadTxn, Transact, Update};
 
 pub struct HotSession {
     pub awareness: Awareness,
@@ -74,6 +74,10 @@ pub struct HotSession {
 /// and (remotely) a QUIC stream; beyond this a session is a broadcast, not
 /// a collaboration.
 pub const MAX_PARTICIPANTS: usize = 32;
+/// Frames a slow subscriber may fall behind before the broadcast channel
+/// drops the oldest for it (`Lagged`). A lagged subscriber is resynced with
+/// the full doc state (`next_fan_out`) rather than left silently stale.
+pub const FAN_OUT_DEPTH: usize = 1024;
 
 /// A live owner-side bridge to a remote participant, registered so a
 /// revoke can cut it immediately instead of waiting for the re-auth timer.
@@ -399,7 +403,7 @@ impl HotState {
             .create(true)
             .append(true)
             .open(&path)?;
-        let (tx, _) = broadcast::channel::<Vec<u8>>(256);
+        let (tx, _) = broadcast::channel::<Vec<u8>>(FAN_OUT_DEPTH);
         // fan out every doc change as a y-sync Update frame; clients ignore
         // their own (Yjs updates apply idempotently)
         let fan = tx.clone();
@@ -438,6 +442,55 @@ impl HotState {
     /// y-sync handshake frames to send first. None when the doc isn't hot.
     pub fn connect(&self, doc_id: Uuid) -> Option<(broadcast::Receiver<Vec<u8>>, Vec<u8>)> {
         self.connect_as(doc_id, None).ok()
+    }
+
+    /// The next frame for one fan-out subscriber. Before 0.7.2 a subscriber
+    /// that fell `FAN_OUT_DEPTH` frames behind got `Lagged` and the fan-out
+    /// loop ended: the socket stayed open and simply never received another
+    /// edit. Now a lag is logged and answered with a full-state `SyncStep2`
+    /// (Yjs applies it idempotently, so the client catches up in one frame);
+    /// `None` only when the session is gone.
+    pub async fn next_fan_out(
+        &self,
+        rx: &mut broadcast::Receiver<Vec<u8>>,
+        doc_id: Uuid,
+        who: &str,
+    ) -> Option<Vec<u8>> {
+        loop {
+            match rx.recv().await {
+                Ok(frame) => return Some(frame),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(%doc_id, who, skipped = n, "hot fan-out lagged; resyncing the subscriber");
+                    match self.resync_frame(doc_id) {
+                        Some(f) => return Some(f),
+                        None => continue, // session ending: drain to Closed
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    /// The whole doc as one `SyncStep2` frame (what a lagged subscriber is
+    /// sent). None when the doc is not hot.
+    pub fn resync_frame(&self, doc_id: Uuid) -> Option<Vec<u8>> {
+        let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let session = sessions.get(&doc_id)?;
+        let update = session
+            .awareness
+            .doc()
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        let mut enc = EncoderV1::new();
+        YMessage::Sync(SyncMessage::SyncStep2(update)).encode(&mut enc);
+        Some(enc.to_vec())
+    }
+
+    /// Test seam: push a raw frame to every subscriber of a session.
+    #[cfg(test)]
+    pub fn broadcast_raw(&self, doc_id: Uuid, frame: Vec<u8>) -> bool {
+        let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        sessions.get(&doc_id).is_some_and(|s| s.tx.send(frame).is_ok())
     }
 
     /// `connect` with the participant recorded (`None` = a local owner
@@ -982,8 +1035,9 @@ async fn ws_session(mut socket: WebSocket, ctx: HotCtx, doc_id: Uuid) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     use futures_util::{SinkExt, StreamExt};
 
+    let fan_hot = ctx.hot.clone();
     let fan_out = tokio::spawn(async move {
-        while let Ok(frame) = rx.recv().await {
+        while let Some(frame) = fan_hot.next_fan_out(&mut rx, doc_id, "local socket").await {
             if ws_tx.send(WsMessage::Binary(frame.into())).await.is_err() {
                 break;
             }
@@ -1012,12 +1066,24 @@ fn journal_updates(journal: &mut std::fs::File, data: &[u8]) -> std::io::Result<
     let mut reader = yrs::sync::MessageReader::new(&mut decoder);
     while let Some(Ok(msg)) = reader.next() {
         if let YMessage::Sync(SyncMessage::Update(u) | SyncMessage::SyncStep2(u)) = msg {
+            // 0.7.2: every join answers our SyncStep1 with a SyncStep2 that
+            // is usually EMPTY (the joiner has nothing we lack); journaling
+            // those grew the file by a record per join for no recoverable
+            // state. An empty v1 update is exactly two zero bytes.
+            if update_is_empty(&u) {
+                continue;
+            }
             let len = (u.len() as u32).to_le_bytes();
             journal.write_all(&len)?;
             journal.write_all(&u)?;
         }
     }
     Ok(())
+}
+
+/// A v1 update that carries no structs and no deletions (`[0, 0]`).
+pub fn update_is_empty(u: &[u8]) -> bool {
+    u.iter().all(|b| *b == 0)
 }
 
 /// Strip a client frame down to what a READ-ONLY participant may send:
