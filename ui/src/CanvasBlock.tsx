@@ -38,6 +38,8 @@ import * as Y from 'yjs'
 import { WebsocketProvider } from 'y-websocket'
 import '@xyflow/react/dist/style.css'
 import { api, Block } from './types'
+import { debounce, throttle } from './timing'
+import { saveErrorText } from './hints'
 import { notify } from './Notice'
 
 import {
@@ -270,8 +272,8 @@ function CanvasFlow({
   const [edges, setEdges, onEdgesChange] = useEdgesState(initial.edges)
   const { screenToFlowPosition, fitView } = useReactFlow()
   const epochRef = useRef(epoch)
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const dirty = useRef(false)
+  const fitTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
     epochRef.current = epoch
   }, [epoch])
@@ -386,6 +388,7 @@ function CanvasFlow({
     provider.on('connection-close', onClose)
 
     return () => {
+      liveThrottle.current.flush()
       provider.awareness.off('change', onAwareness)
       provider.off('connection-close', onClose)
       provider.destroy()
@@ -395,8 +398,10 @@ function CanvasFlow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [live, block.doc_id])
 
-  // local structural changes while live: push per-shape LWW updates
-  const pushLive = useCallback(() => {
+  // local structural changes while live: push per-shape LWW updates. A drag
+  // emits a change per frame; the throttle collapses that to ~16 pushes/s
+  // with a trailing call so the final position always lands.
+  const pushLiveNow = useCallback(() => {
     const y = yRef.current
     if (!y) return
     const now = serializeShapes(fromFlow(nodesRef.current, edgesRef.current))
@@ -409,44 +414,87 @@ function CanvasFlow({
     }, 'local')
     lastPushed.current = now
   }, [])
+  const pushLiveRef = useRef(pushLiveNow)
+  pushLiveRef.current = pushLiveNow
+  const liveThrottle = useRef(throttle(60, () => pushLiveRef.current()))
+  const pushLive = useCallback(() => liveThrottle.current.call(), [])
 
-  // debounced save through the gate, same as everything else
+  // save through the gate, same as everything else. Mirrors DocEditor: a
+  // failure keeps the canvas dirty, says so ONCE per distinct cause, and a
+  // slow clock retries until it lands — a swallowed failure here was how
+  // canvas edits used to vanish.
+  const saving = useRef(false)
+  const lastSaveError = useRef<string | null>(null)
+  const saveNow = useCallback(async () => {
+    if (!dirty.current || saving.current || liveRef.current) return
+    const snapshot = { nodes: nodesRef.current, edges: edgesRef.current }
+    const d = fromFlow(
+      (snapshot.nodes ?? []) as Node<CanvasNodeData>[],
+      snapshot.edges ?? [],
+    )
+    saving.current = true
+    try {
+      const out = await api<{ epoch: number }>('/api/propose', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          doc_id: block.doc_id,
+          base_epoch: epochRef.current,
+          ops: [
+            {
+              kind: {
+                op: 'replace',
+                target: block.id,
+                content: JSON.stringify({ ks_diagram: d }),
+              },
+              source_refs: ['canvas:edit'],
+            },
+          ],
+        }),
+      })
+      epochRef.current = out.epoch
+      lastSaveError.current = null
+      // edits during the request are not in what landed: stay dirty
+      const editedMeanwhile =
+        nodesRef.current !== snapshot.nodes || edgesRef.current !== snapshot.edges
+      dirty.current = editedMeanwhile
+      if (editedMeanwhile) autosave.current.arm()
+      onSaved()
+    } catch (e) {
+      const msg = saveErrorText(e)
+      if (lastSaveError.current !== msg) {
+        lastSaveError.current = msg
+        notify(msg, 'warn')
+      }
+      console.error('canvas save failed', e)
+    } finally {
+      saving.current = false
+    }
+  }, [block.id, block.doc_id, onSaved])
+  const saveRef = useRef(saveNow)
+  saveRef.current = saveNow
+  const autosave = useRef(debounce(1200, () => saveRef.current()))
   const scheduleSave = useCallback(() => {
     dirty.current = true
-    if (timer.current) clearTimeout(timer.current)
-    timer.current = setTimeout(async () => {
-      if (!dirty.current) return
-      dirty.current = false
-      const d = fromFlow(
-        (nodesRef.current ?? []) as Node<CanvasNodeData>[],
-        edgesRef.current ?? [],
-      )
-      try {
-        const out = await api<{ epoch: number }>('/api/propose', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            doc_id: block.doc_id,
-            base_epoch: epochRef.current,
-            ops: [
-              {
-                kind: {
-                  op: 'replace',
-                  target: block.id,
-                  content: JSON.stringify({ ks_diagram: d }),
-                },
-                source_refs: ['canvas:edit'],
-              },
-            ],
-          }),
-        })
-        epochRef.current = out.epoch
-        onSaved()
-      } catch (e) {
-        console.error('canvas save failed', e)
-      }
-    }, 1200)
-  }, [block.id, block.doc_id, onSaved])
+    autosave.current.arm()
+  }, [])
+  // retry clock while dirty (daemon back, live session over, …)
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (dirty.current && !autosave.current.pending()) saveRef.current()
+    }, 5000)
+    return () => clearInterval(t)
+  }, [])
+  // unmount/navigation: land whatever is pending, drop the undo coalescer
+  useEffect(() => {
+    const pending = autosave.current
+    return () => {
+      pending.cancel()
+      if (snapTimer.current) clearTimeout(snapTimer.current)
+      if (fitTimer.current) clearTimeout(fitTimer.current)
+      if (dirty.current) saveRef.current()
+    }
+  }, [])
 
   const nodesRef = useRef(nodes)
   nodesRef.current = nodes
@@ -747,7 +795,8 @@ function CanvasFlow({
         n.data.kind === 'frame' ? n : { ...n, position: pos.get(n.id) ?? n.position },
       ),
     )
-    setTimeout(() => fitView({ padding: 0.15 }), 50)
+    if (fitTimer.current) clearTimeout(fitTimer.current)
+    fitTimer.current = setTimeout(() => fitView({ padding: 0.15 }), 50)
   }
 
   return (
