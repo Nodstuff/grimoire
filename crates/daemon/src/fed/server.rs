@@ -1071,7 +1071,16 @@ fn handle_hub_admin(
         HubAction::ReviewQueue => {
             // every open item on a hub is on a hub-owned doc: mirrors take no
             // proposals (relayed edits are forwarded, never parked here)
-            let items = crate::api::decorate_review_items(store, store.review_queue(None)?);
+            let mut items = crate::api::decorate_review_items(store, store.review_queue(None)?);
+            // name members the way the member list does (no fingerprint
+            // suffix unless two share a name)
+            let contacts = store.list_contacts()?;
+            for item in &mut items {
+                let principal = item["item"]["op"]["principal"].as_str().and_then(|p| p.parse::<uuid::Uuid>().ok());
+                if let Some(c) = principal.and_then(|p| contacts.iter().find(|c| c.principal == p)) {
+                    item["proposer"] = serde_json::Value::String(hub::display_name(&contacts, c));
+                }
+            }
             Ok(Response::HubQueue { items })
         }
         HubAction::Resolve { annotation_id, decision } => {
