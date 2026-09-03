@@ -83,6 +83,12 @@ impl Embedder {
         scored
     }
 
+    /// Cosine of a query vector against one indexed block (None = not indexed).
+    pub fn score(&self, q: &[f32], id: Uuid) -> Option<f32> {
+        let index = self.index.read().unwrap_or_else(|p| p.into_inner());
+        index.get(&id).map(|v| v.iter().zip(q).map(|(a, b)| a * b).sum())
+    }
+
     /// Bring the in-memory index in line with the table (start-up).
     pub fn load_index(&self, store: &SqliteStore) -> grimoire_store::Result<usize> {
         let rows = store.block_vecs()?;

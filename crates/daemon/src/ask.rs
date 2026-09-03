@@ -45,12 +45,17 @@ pub fn keywords(question: &str) -> Vec<String> {
     out
 }
 
-/// Ranked excerpts, hybrid: dense cosine neighbours (paraphrase-robust)
-/// fused with keyword hits (exact terms) by reciprocal rank fusion, then cut
-/// to the char budget. Frontmatter/comment blocks never make the cut. Works
-/// without an embedder (keyword-only) so the feature never depends on the
-/// model loading.
+/// Ranked excerpts, hybrid. On a real vault (10k+ blocks) neither leg is
+/// trustworthy alone: a static embedding's cosine is flat across the top 20
+/// (0.44–0.52, mostly noise), and a single common question word matches a
+/// hundred blocks by keyword. So: candidates = keyword hits carrying at least
+/// half the question's content words ∪ the dense top-20; each scored by
+/// cosine + a coverage bonus for the fraction of content words it contains;
+/// cut at a gap below the best, capped, then the char budget. Works without
+/// an embedder (coverage only). Bare headings, comments, frontmatter and
+/// earlier Answers are never evidence.
 pub fn retrieve(store: &SqliteStore, embedder: Option<&crate::embed::Embedder>, question: &str) -> Vec<SearchHit> {
+    let words = keywords(question);
     let answers = answers_folder_id(store);
     let usable = |h: &SearchHit| {
         h.block.block_type != grimoire_store::BlockType::Comment
@@ -58,32 +63,95 @@ pub fn retrieve(store: &SqliteStore, embedder: Option<&crate::embed::Embedder>, 
             && !is_bare_heading(&h.block.content)
             && !under_answers(store, h.block.doc_id, answers)
     };
-    let keyword: Vec<SearchHit> = retrieve_keyword(store, question).into_iter().filter(usable).collect();
-    let Some(emb) = embedder else { return budget(keyword) };
-    // dense neighbours, cut where they stop being neighbours: a static model
-    // puts genuinely related prose well above ~0.3 cosine and unrelated
-    // prose below; a relative cut against the best hit handles both a sharp
-    // question (one clear winner) and a broad one (several good excerpts)
-    let scored = emb.search(question, 60);
-    let top = scored.first().map(|(_, s)| *s).unwrap_or(0.0);
-    let dense_ids: Vec<Uuid> = scored
-        .into_iter()
-        .filter(|(_, s)| *s >= DENSE_FLOOR && *s >= top * DENSE_RELATIVE)
-        .map(|(id, _)| id)
+    let stems: Vec<String> = words.iter().map(|w| stem(w)).collect();
+    // the doc title is part of what a block says ("Review Gate" → its body
+    // never repeats "gate"); match on crude stems so pin/pinning, version/
+    // versions count as the same word
+    let coverage = |h: &SearchHit| -> f32 {
+        if stems.is_empty() {
+            return 0.0;
+        }
+        let lc = format!("{} {}", h.doc_title, h.block.content).to_lowercase();
+        stems.iter().filter(|st| lc.contains(st.as_str())).count() as f32 / stems.len() as f32
+    };
+    let need = ((words.len() + 1) / 2).max(1) as f32 / words.len().max(1) as f32;
+
+    let mut cands: HashMap<Uuid, SearchHit> = HashMap::new();
+    for h in retrieve_keyword(store, question) {
+        if usable(&h) && coverage(&h) >= need {
+            cands.entry(h.block.id).or_insert(h);
+        }
+    }
+    let q_vec = embedder.map(|e| e.encode_one(question));
+    if let Some(e) = embedder {
+        let ids: Vec<Uuid> = e.search(question, DENSE_TOP).into_iter().map(|(id, _)| id).collect();
+        for h in store.blocks_as_hits(&ids).unwrap_or_default() {
+            // a dense neighbour sharing NO content word with a multi-word
+            // question is the model being generous to a long block
+            if usable(&h) && (stems.len() < 2 || coverage(&h) > 0.0) {
+                cands.entry(h.block.id).or_insert(h);
+            }
+        }
+    }
+    let mut scored: Vec<(f32, SearchHit)> = cands
+        .into_values()
+        .map(|h| {
+            let dense = match (&q_vec, embedder) {
+                (Some(q), Some(e)) => e.score(q, h.block.id).unwrap_or(0.0),
+                _ => 0.0,
+            };
+            // long blocks mention every word by accident of size: scale
+            // coverage by sqrt(300/len) past 300 chars (1,200 chars → half)
+            let len = h.block.content.chars().count().max(LEN_NORM) as f32;
+            let len_factor = (LEN_NORM as f32 / len).sqrt();
+            (DENSE_WEIGHT * dense + COVERAGE_WEIGHT * coverage(&h) * len_factor, h)
+        })
         .collect();
-    let dense: Vec<SearchHit> = store
-        .blocks_as_hits(&dense_ids)
-        .unwrap_or_default()
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let top = scored.first().map(|(s, _)| *s).unwrap_or(0.0);
+    let ranked: Vec<SearchHit> = scored
         .into_iter()
-        .filter(usable)
+        .enumerate()
+        .take_while(|(i, (s, _))| *i < MIN_KEEP || *s >= top - GAP)
+        .map(|(_, (_, h))| h)
+        .take(MAX_KEEP)
         .collect();
-    budget(rrf(&[dense, keyword]))
+    budget(ranked)
 }
 
-/// Cosine below this is noise for potion-class static models.
-const DENSE_FLOOR: f32 = 0.30;
-/// …and anything much weaker than the best hit is padding, not evidence.
-const DENSE_RELATIVE: f32 = 0.70;
+/// Crude English stem for containment tests: strip a common suffix when
+/// enough of the word is left. `pinning`→`pin`, `versions`→`version`,
+/// `decided`→`decid` (matches decide/decided/deciding).
+pub fn stem(w: &str) -> String {
+    for suf in ["ing", "ies", "ed", "es", "s"] {
+        if let Some(base) = w.strip_suffix(suf)
+            && base.len() >= 3
+        {
+            // pinning → pinn → pin
+            if suf == "ing" && base.len() >= 4 && base.as_bytes()[base.len() - 1] == base.as_bytes()[base.len() - 2] {
+                return base[..base.len() - 1].to_string();
+            }
+            return base.to_string();
+        }
+    }
+    w.to_string()
+}
+
+/// Dense candidates considered per question.
+const DENSE_TOP: usize = 20;
+/// A static embedding rewards long, word-rich blocks (a daily-log bullet
+/// scores 0.45+ against almost any question) while a terse, exactly-right
+/// note sits at 0.3. So coverage carries the ranking and cosine breaks ties:
+/// full coverage is worth about twice the whole useful cosine range.
+const COVERAGE_WEIGHT: f32 = 0.8;
+const DENSE_WEIGHT: f32 = 0.5;
+/// Blocks longer than this have their coverage discounted by sqrt(300/len).
+const LEN_NORM: usize = 300;
+/// Keep everything within this of the best combined score…
+const GAP: f32 = 0.15;
+/// …but always at least this many (if available) and never more than this.
+const MIN_KEEP: usize = 3;
+const MAX_KEEP: usize = 12;
 
 /// `# Title` alone carries no fact worth citing.
 fn is_bare_heading(content: &str) -> bool {
@@ -420,6 +488,15 @@ mod tests {
         assert_eq!(hits.len(), 1, "{:?}", hits.iter().map(|h| &h.block.content).collect::<Vec<_>>());
         assert_eq!(hits[0].doc_title, "Grants");
         assert!(!hits[0].block.content.starts_with('#'));
+    }
+
+    #[test]
+    fn stems_collapse_common_suffixes() {
+        assert_eq!(stem("pinning"), "pin");
+        assert_eq!(stem("versions"), "version");
+        assert_eq!(stem("dependencies"), "dependenc");
+        assert_eq!(stem("gate"), "gate");
+        assert_eq!(stem("bus"), "bus");
     }
 
     #[test]

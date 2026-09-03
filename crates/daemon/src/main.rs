@@ -14,7 +14,10 @@ mod hot;
 mod identity;
 mod yrender;
 mod mcp;
+mod memory;
 mod room;
+#[cfg(test)]
+mod retrieval_probe;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -604,6 +607,9 @@ async fn main() -> anyhow::Result<()> {
             tokio::spawn(admin::daily_loop(store.clone(), hot.clone()));
             // daily self-contained db snapshot beside the db (backups/), keep 7
             tokio::spawn(backup::backup_loop(store.clone(), cli.db.clone()));
+            // Claude Code's per-project memory → `Claude Memory` docs, kept in
+            // sync through the gate (changed memories arrive as reviewable)
+            tokio::spawn(memory::memory_loop(store.clone(), tom));
             // block embeddings (ask the vault): model compiled in, index kept
             // current block-by-block; a load failure degrades to keyword search
             let embedder = match embed::Embedder::load() {

@@ -1211,6 +1211,21 @@ async fn ask_vault(State(st): State<ApiState>, Json(req): Json<AskReq>) -> Json<
     }
 }
 
+/// Sync Claude Code's memory files into `Claude Memory` now.
+async fn memory_sync(State(st): State<ApiState>) -> Json<Value> {
+    let store = st.store.clone();
+    let human = st.human;
+    let root = crate::memory::memory_root();
+    if !root.is_dir() {
+        return Json(json!({"error": format!("no Claude Code memory found at {}", root.display())}));
+    }
+    match tokio::task::spawn_blocking(move || crate::memory::sync(&store, &root, human)).await {
+        Ok(Ok(r)) => Json(json!(r)),
+        Ok(Err(e)) => Json(json!({"error": e.to_string()})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 async fn trash(State(st): State<ApiState>) -> Json<Value> {
     let s = st
         .store
@@ -1325,6 +1340,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/export_vault", post(export_vault))
         .route("/api/import", post(import_markdown))
         .route("/api/ask", post(ask_vault))
+        .route("/api/memory/sync", post(memory_sync))
         .route("/api/doc/{id}/rename", post(rename_doc))
         .route("/api/doc/{id}/tendings", get(tendings))
         .route("/api/doc/{id}/federation", get(doc_federation))

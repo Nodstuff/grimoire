@@ -566,6 +566,22 @@ function CommandPalette({
       },
     },
     {
+      label: 'Sync Claude Code memory now',
+      hint: '~/.claude/projects/*/memory → Claude Memory (also runs every 10 min)',
+      run: () => {
+        onAction('close')
+        api<{ files: number; imported: number; updated: number; unchanged: number; projects: number }>('/api/memory/sync', { method: 'POST' })
+          .then((r) =>
+            notify(
+              `memory: ${r.files} files across ${r.projects} projects — ${r.imported} imported, ${r.updated} updated (in review), ${r.unchanged} unchanged`,
+              'ok',
+              { ttlMs: 10_000 },
+            ),
+          )
+          .catch((e) => notify(errText(e)))
+      },
+    },
+    {
       label: 'Export all docs as Markdown…',
       hint: 'a folder in ~/Downloads',
       run: () => {
