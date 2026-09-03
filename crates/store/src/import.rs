@@ -198,12 +198,8 @@ pub fn import_markdown(
     principal: Uuid,
     md: &str,
 ) -> Result<(Uuid, usize)> {
-    let doc = store.create_doc(title, parent_doc, principal)?;
-    let ops = to_ops(segment(md));
-    let n = ops.len();
-    if n > 0 {
-        store.apply(doc.id, 0, principal, ops)?;
-    }
+    // one transaction: a failed apply leaves no empty doc behind
+    let (doc, n) = store.create_doc_with_ops(title, parent_doc, principal, to_ops(segment(md)))?;
     Ok((doc.id, n))
 }
 

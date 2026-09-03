@@ -86,6 +86,25 @@ pub trait BlockStore {
 
     fn create_doc(&mut self, title: &str, parent: Option<Uuid>, created_by: Uuid) -> Result<Doc>;
 
+    /// Create a doc and apply its first ops (epoch 0 → 1) as one unit, so a
+    /// failed import never leaves an empty doc behind. Returns the doc and
+    /// the number of ops applied. The default is the two-step form; stores
+    /// that can make it a single transaction override it.
+    fn create_doc_with_ops(
+        &mut self,
+        title: &str,
+        parent: Option<Uuid>,
+        created_by: Uuid,
+        ops: Vec<OpInput>,
+    ) -> Result<(Doc, usize)> {
+        let doc = self.create_doc(title, parent, created_by)?;
+        let n = ops.len();
+        if n > 0 {
+            self.apply(doc.id, 0, created_by, ops)?;
+        }
+        Ok((doc, n))
+    }
+
     fn list_docs(&self) -> Result<Vec<Doc>>;
 
     fn get_doc(&self, id: Uuid) -> Result<Doc>;
