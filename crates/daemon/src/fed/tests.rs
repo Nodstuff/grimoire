@@ -2813,3 +2813,45 @@ async fn is_hub_comes_from_the_hub_marked_invite_not_the_reply() {
     assert!(out.is_hub);
     assert!(alice.contact_of(&h).is_hub);
 }
+
+/// 0.7.2 hardening: a peer that is not a contact is read under
+/// `PRE_AUTH_FRAME`; an oversized frame is refused before it is parsed. The
+/// same frame from a paired contact is read under `MAX_FRAME` and served.
+#[tokio::test]
+async fn unknown_peer_frame_over_the_pre_auth_cap_is_refused_before_parse() {
+    use super::server::PRE_AUTH_FRAME;
+    let store = owner_store("the-secret");
+    let owner = local_endpoint().await;
+    let addr = direct_addr(&owner);
+    tokio::spawn(serve(owner, store.clone(), scratch_hot(), Runtime::default()));
+    // a valid Ping frame padded with 1 MB of whitespace: parses fine, but
+    // only a contact is allowed to make us read that much
+    let mut padded = serde_json::to_vec(&Frame { v: super::wire::PROTOCOL_VERSION, msg: Request::Ping }).unwrap();
+    padded.extend(std::iter::repeat_n(b' ', 1024 * 1024));
+    assert!(padded.len() > PRE_AUTH_FRAME && padded.len() < MAX_FRAME);
+    let raw_request = |ep: Endpoint, addr: EndpointAddr, body: Vec<u8>| async move {
+        let conn = ep.connect(addr, ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&body).await.unwrap();
+        send.finish().unwrap();
+        let raw = recv.read_to_end(MAX_FRAME).await.unwrap();
+        serde_json::from_slice::<Frame<Response>>(&raw).unwrap().msg
+    };
+    let stranger = local_endpoint().await;
+    let res = raw_request(stranger.clone(), addr.clone(), padded.clone()).await;
+    match &res {
+        Response::Refused { reason, code } => {
+            assert_eq!(*code, RefusalCode::BadRequest);
+            assert!(reason.contains("too large") && reason.contains("before authentication"), "{reason}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // a stranger's small frame is still read and dispatched (refused as unknown, not as oversized)
+    let res = request(&stranger, addr.clone(), Request::Ping).await.unwrap();
+    assert!(matches!(&res, Response::Refused { reason, .. } if !reason.contains("too large")), "{res:?}");
+    // once paired, the same padded frame is under MAX_FRAME and answered
+    let res = request(&stranger, addr.clone(), Request::Redeem { secret: "the-secret".into(), petname: "alice".into() }).await.unwrap();
+    assert!(matches!(res, Response::Redeemed { .. }), "{res:?}");
+    let res = raw_request(stranger, addr, padded).await;
+    assert_eq!(res, Response::Pong);
+}

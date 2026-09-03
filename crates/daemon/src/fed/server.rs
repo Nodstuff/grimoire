@@ -111,6 +111,19 @@ impl DedupeCache {
 type Dedupe = Arc<Mutex<DedupeCache>>;
 const DEDUPE_CAP: usize = 512;
 
+/// 0.7.2 frame limits. A peer that is not (yet) a contact may only ever be
+/// redeeming an invite — a few hundred bytes — so its frame is read under
+/// this cap; `MAX_FRAME` applies once the peer is a known, live contact.
+/// Before this an unknown node could make the daemon buffer and parse 32 MB
+/// per connection, unbounded in connections and in time.
+pub const PRE_AUTH_FRAME: usize = 64 * 1024;
+/// How long one request frame (handshake, or bytes after `accept_bi`) may
+/// take to arrive; also the idle wait for the next stream on a connection.
+pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Concurrent federation connections (requests + hot bridges) this daemon
+/// services; the rest are dropped at accept with a warning.
+pub const MAX_CONNECTIONS: usize = 256;
+
 /// Accept loop. Spawned once per daemon; lives until the endpoint closes.
 pub async fn serve(
     endpoint: Endpoint,
@@ -120,18 +133,32 @@ pub async fn serve(
 ) {
     tracing::info!("federation endpoint listening (node id {})", endpoint.id());
     let dedupe: Dedupe = Arc::new(Mutex::new(DedupeCache::new(DEDUPE_CAP)));
+    let gate = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     while let Some(incoming) = endpoint.accept().await {
+        let Ok(permit) = gate.clone().try_acquire_owned() else {
+            tracing::warn!(
+                cap = MAX_CONNECTIONS,
+                "federation: connection cap reached; dropping an incoming connection"
+            );
+            drop(incoming);
+            continue;
+        };
         let store = store.clone();
         let dedupe = dedupe.clone();
         let hot = hot.clone();
         let runtime = runtime.clone();
         let ep = endpoint.clone();
         tokio::spawn(async move {
+            let _permit = permit; // held for the life of the connection
             let conn = match incoming.accept() {
-                Ok(accepting) => match accepting.await {
-                    Ok(conn) => conn,
-                    Err(e) => {
+                Ok(accepting) => match tokio::time::timeout(READ_TIMEOUT, accepting).await {
+                    Ok(Ok(conn)) => conn,
+                    Ok(Err(e)) => {
                         tracing::debug!("federation handshake failed: {e:#}");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::debug!("federation handshake timed out");
                         return;
                     }
                 },
@@ -169,12 +196,39 @@ async fn handle_conn(
     // once per connection: a successful redeem upgrades the session, and a
     // mid-session revoke takes effect on the next request.
     loop {
-        let (mut send, mut recv) = match conn.accept_bi().await {
-            Ok(s) => s,
-            // peer closed: normal end of conversation
-            Err(_) => return Ok(()),
+        let (mut send, mut recv) = match tokio::time::timeout(READ_TIMEOUT, conn.accept_bi()).await {
+            Ok(Ok(s)) => s,
+            // peer closed: normal end of conversation; idle too long: ours
+            Ok(Err(_)) | Err(_) => return Ok(()),
         };
-        let raw = recv.read_to_end(MAX_FRAME).await?;
+        // the cap is decided per request from the store, never from what the
+        // peer says about itself: a stranger gets `PRE_AUTH_FRAME` until a
+        // redeem has paired it, and a revoke shrinks it again
+        let authed = {
+            let s = store.lock().unwrap_or_else(|p| p.into_inner());
+            s.contact_by_pubkey(peer).ok().flatten().is_some_and(|c| !c.revoked)
+        };
+        let limit = if authed { MAX_FRAME } else { PRE_AUTH_FRAME };
+        let raw = match tokio::time::timeout(READ_TIMEOUT, recv.read_to_end(limit)).await {
+            Ok(Ok(raw)) => raw,
+            Ok(Err(iroh::endpoint::ReadToEndError::TooLong)) => {
+                // refused without parsing a byte of it (the reply is flushed
+                // by the normal close: the peer hangs up after reading it)
+                tracing::warn!(peer, authed, limit, "federation: frame over the cap; refused");
+                let out = serde_json::to_vec(&Frame {
+                    v: PROTOCOL_VERSION,
+                    msg: Response::refused(
+                        RefusalCode::BadRequest,
+                        format!("frame too large ({limit} bytes max{})", if authed { "" } else { " before authentication" }),
+                    ),
+                })?;
+                send.write_all(&out).await?;
+                send.finish()?;
+                continue;
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!("request frame timed out after {}s", READ_TIMEOUT.as_secs()),
+        };
         let response = match serde_json::from_slice::<Frame<Request>>(&raw) {
             Err(e) => Response::refused(RefusalCode::BadRequest, format!("bad frame: {e}")),
             Ok(frame) if frame.v != PROTOCOL_VERSION => Response::refused(
@@ -1538,8 +1592,15 @@ async fn handle_hot_bridge(
     store: Arc<Mutex<SqliteStore>>,
     hot: HotState,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn.accept_bi().await?;
-    let header = read_frame(&mut recv).await?.context("bridge closed before header")?;
+    // 0.7.2: the header is read under the pre-auth cap and a deadline — the
+    // peer is not authorized until `bridge_authorized` says so
+    let (mut send, mut recv) = tokio::time::timeout(READ_TIMEOUT, conn.accept_bi())
+        .await
+        .context("bridge: no stream opened in time")??;
+    let header = tokio::time::timeout(READ_TIMEOUT, read_frame_capped(&mut recv, PRE_AUTH_FRAME))
+        .await
+        .context("bridge: header timed out")??
+        .context("bridge closed before header")?;
     #[derive(Deserialize)]
     struct Header {
         share: String,
@@ -1635,15 +1696,22 @@ pub(super) async fn write_frame(send: &mut iroh::endpoint::SendStream, data: &[u
     Ok(())
 }
 
+/// Largest length-prefixed bridge frame (a full Yjs state of a big doc).
+const BRIDGE_FRAME_MAX: usize = 8 * 1024 * 1024;
+
 pub(super) async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> Result<Option<Vec<u8>>> {
+    read_frame_capped(recv, BRIDGE_FRAME_MAX).await
+}
+
+async fn read_frame_capped(recv: &mut iroh::endpoint::RecvStream, cap: usize) -> Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
     match recv.read_exact(&mut len).await {
         Ok(()) => {}
         Err(_) => return Ok(None), // stream closed
     }
     let len = u32::from_le_bytes(len) as usize;
-    if len > 8 * 1024 * 1024 {
-        anyhow::bail!("bridge frame too large");
+    if len > cap {
+        anyhow::bail!("bridge frame too large ({len} > {cap})");
     }
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf).await.context("torn frame")?;
