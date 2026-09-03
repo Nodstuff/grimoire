@@ -17,6 +17,7 @@ use super::wire::{
     Refusal, RefusalCode, Request, Response, WireDoc, WireDocMeta, hash_secret,
 };
 use crate::hot::HotState;
+use crate::store_ext::{blocking, with_store};
 use anyhow::{Context, Result};
 use grimoire_store::{BlockStore, Contact, OpStatus, SqliteStore};
 use iroh::endpoint::presets;
@@ -205,8 +206,8 @@ async fn handle_conn(
         // peer says about itself: a stranger gets `PRE_AUTH_FRAME` until a
         // redeem has paired it, and a revoke shrinks it again
         let authed = {
-            let s = store.lock().unwrap_or_else(|p| p.into_inner());
-            s.contact_by_pubkey(peer).ok().flatten().is_some_and(|c| !c.revoked)
+            let peer = peer.to_string();
+            with_store(&store, move |s| s.contact_by_pubkey(&peer).ok().flatten().is_some_and(|c| !c.revoked)).await
         };
         let limit = if authed { MAX_FRAME } else { PRE_AUTH_FRAME };
         let raw = match tokio::time::timeout(READ_TIMEOUT, recv.read_to_end(limit)).await {
@@ -301,7 +302,14 @@ async fn dispatch(
     endpoint: &Endpoint,
     runtime: &Runtime,
 ) -> Response {
-    match dispatch_sync(req, peer, store_arc, dedupe, hot, endpoint, runtime) {
+    // the planner holds the store lock for its whole body: run it on the
+    // blocking pool, not on the async worker
+    let step = {
+        let (peer, store, dedupe, hot, endpoint, runtime) =
+            (peer.to_string(), store_arc.clone(), dedupe.clone(), hot.clone(), endpoint.clone(), runtime.clone());
+        blocking(move || dispatch_sync(req, &peer, &store, &dedupe, &hot, &endpoint, &runtime)).await
+    };
+    match step {
         Step::Reply(r) => r,
         Step::ForwardPropose(f) => forward_propose(endpoint, store_arc, dedupe, *f).await,
         Step::ForwardStatus { local, remote } => forward_status(endpoint, local, remote).await,
@@ -373,11 +381,16 @@ async fn forward_propose(
     let response = match res {
         Ok(Ok(Response::Proposed { op_ids })) => {
             let ids: Vec<uuid::Uuid> = op_ids.iter().filter_map(|s| s.parse().ok()).collect();
-            let mut s = store_arc.lock().unwrap_or_else(|p| p.into_inner());
-            for id in &ids {
-                if let Err(e) = s.add_hub_forward(*id, f.owner.id, f.member.id, f.owner_share, f.doc) {
-                    tracing::warn!(op = %id, "hub: forward record failed: {e}");
-                }
+            {
+                let (ids, owner, member, owner_share, doc) = (ids.clone(), f.owner.id, f.member.id, f.owner_share, f.doc);
+                with_store(store_arc, move |s| {
+                    for id in &ids {
+                        if let Err(e) = s.add_hub_forward(*id, owner, member, owner_share, doc) {
+                            tracing::warn!(op = %id, "hub: forward record failed: {e}");
+                        }
+                    }
+                })
+                .await;
             }
             tracing::info!(
                 member = f.member_name,
@@ -1660,8 +1673,10 @@ async fn handle_hot_bridge(
         doc: String,
     }
     let header: Header = serde_json::from_slice(&header).context("bad bridge header")?;
-    let (doc_id, mut view_share, share_id) =
-        bridge_authorized(&store, peer, &header.share, &header.doc)?;
+    let (doc_id, mut view_share, share_id) = {
+        let (store, peer, share, doc) = (store.clone(), peer.to_string(), header.share.clone(), header.doc.clone());
+        blocking(move || bridge_authorized(&store, &peer, &share, &doc)).await?
+    };
     let (mut rx, hello) = hot
         .connect_as(doc_id, Some(peer))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1688,8 +1703,10 @@ async fn handle_hot_bridge(
     });
     // re-auth re-reads the permission too: a propose→view downgrade applies
     // to the live bridge, not only to the next one
-    let reauth = |view_share: &mut bool| -> Result<()> {
-        let (_, ro, _) = bridge_authorized(&store, peer, &header.share, &header.doc)
+    let reauth = async |view_share: &mut bool| -> Result<()> {
+        let (store, who, share, doc) = (store.clone(), peer.to_string(), header.share.clone(), header.doc.clone());
+        let (_, ro, _) = blocking(move || bridge_authorized(&store, &who, &share, &doc))
+            .await
             .context("bridge authorization lapsed")?;
         if ro != *view_share {
             tracing::info!(peer, %doc_id, read_only = ro, "bridge permission changed");
@@ -1705,7 +1722,7 @@ async fn handle_hot_bridge(
                 break Err(anyhow::anyhow!("bridge cut: share or contact revoked"));
             }
             _ = tokio::time::sleep(BRIDGE_REAUTH) => {
-                if let Err(e) = reauth(&mut view_share) {
+                if let Err(e) = reauth(&mut view_share).await {
                     break Err(e);
                 }
                 last_auth = std::time::Instant::now();
@@ -1715,7 +1732,7 @@ async fn handle_hot_bridge(
         match frame {
             Ok(Some(frame)) => {
                 if last_auth.elapsed() > BRIDGE_REAUTH {
-                    if let Err(e) = reauth(&mut view_share) {
+                    if let Err(e) = reauth(&mut view_share).await {
                         break Err(e);
                     }
                     last_auth = std::time::Instant::now();

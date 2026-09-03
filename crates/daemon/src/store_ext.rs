@@ -18,12 +18,17 @@ pub async fn with_store<T: Send + 'static>(
     f: impl FnOnce(&mut SqliteStore) -> T + Send + 'static,
 ) -> T {
     let store = Arc::clone(store);
-    match tokio::task::spawn_blocking(move || {
+    blocking(move || {
         let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut s)
     })
     .await
-    {
+}
+
+/// `spawn_blocking` that re-raises a panic in `f` on the caller instead of
+/// handing back a `JoinError`. For sync fns that lock the store themselves.
+pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(f).await {
         Ok(v) => v,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         Err(e) => panic!("store task cancelled: {e}"),
