@@ -22,6 +22,22 @@ if ! xcrun notarytool history --keychain-profile grimoire-notary > /dev/null 2>&
   exit 1
 fi
 
+# Refs discipline: this checkout is shared with other sessions that may switch
+# branches. A release is built from HEAD, so HEAD must be main and main must
+# be what origin has — otherwise gh tags the wrong commit (it did, 0.6.2–0.6.4).
+BRANCH=$(git branch --show-current)
+if [[ "$BRANCH" != "main" ]]; then
+  echo "✗ on branch '$BRANCH', not main — switch (or fast-forward main) before releasing"; exit 1
+fi
+if [[ -n "$(git status --short --untracked-files=no)" ]]; then
+  echo "✗ uncommitted changes — commit first so the tag matches the build"; git status --short; exit 1
+fi
+git fetch -q origin
+if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+  echo "✗ HEAD $(git rev-parse --short HEAD) != origin/main $(git rev-parse --short origin/main) — push first"; exit 1
+fi
+HEAD_SHA=$(git rev-parse HEAD)
+
 echo "→ signing as: $IDENTITY"
 export APPLE_SIGNING_IDENTITY="$IDENTITY"
 
@@ -103,9 +119,9 @@ if [[ "${1:-}" == "--publish" ]]; then
   NOTES="${2:-}"
   export GH_TOKEN=$(gh auth token --user Nodstuff)
   if [[ -n "$NOTES" ]]; then
-    gh release create "v$VERSION" "$DMG" "$TARBALL" "$SIG" "$FEED" --repo Nodstuff/grimoire --title "v$VERSION" --notes-file "$NOTES"
+    gh release create "v$VERSION" "$DMG" "$TARBALL" "$SIG" "$FEED" --repo Nodstuff/grimoire --title "v$VERSION" --notes-file "$NOTES" --target "$HEAD_SHA"
   else
-    gh release create "v$VERSION" "$DMG" "$TARBALL" "$SIG" "$FEED" --repo Nodstuff/grimoire --title "v$VERSION" --generate-notes
+    gh release create "v$VERSION" "$DMG" "$TARBALL" "$SIG" "$FEED" --repo Nodstuff/grimoire --title "v$VERSION" --generate-notes --target "$HEAD_SHA"
   fi
   echo "✓ published https://github.com/Nodstuff/grimoire/releases/tag/v$VERSION"
 fi
