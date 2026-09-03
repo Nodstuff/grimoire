@@ -222,6 +222,7 @@ mod tests {
         }]).ok();
         let purged = embedder.purge(&store).unwrap();
         assert!(purged >= 1, "purged {purged}");
-        assert_eq!(embedder.indexed(), 1);
+        // 0.7.2: blocks of a tombstoned doc leave block_vecs (never searchable)
+        assert_eq!(embedder.indexed(), 0);
     }
 }
