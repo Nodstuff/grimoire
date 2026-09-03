@@ -5,7 +5,7 @@
 // editor uses (block ids ride along as node attrs, so unchanged blocks keep
 // their identity and comment anchors survive).
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { EditorContent, useEditor } from '@tiptap/react'
 import Collaboration from '@tiptap/extension-collaboration'
 import CollaborationCaret from '@tiptap/extension-collaboration-caret'
@@ -44,16 +44,7 @@ export interface HotDoc {
   blocks: Block[]
 }
 
-export default function HotEditor({
-  doc,
-  onEnded,
-  readOnly = false,
-  canEnd = true,
-  viewersWrite,
-  onToggleViewersWrite,
-  agent,
-  onAsk,
-}: {
+interface HotEditorProps {
   doc: HotDoc
   /** session over (we ended it, or the daemon dropped it) — reload cold */
   onEnded: () => void
@@ -73,7 +64,62 @@ export default function HotEditor({
   /** Agents in the room: present on owned docs. `agent` mirrors hot/status. */
   agent?: AgentStatus
   onAsk?: (instruction: string) => Promise<void>
-}) {
+}
+
+/** Owns the Yjs doc + websocket: created in an effect (not a memo, which
+ * React may discard and re-run, leaking a socket) and destroyed on unmount
+ * or docId change. The session body mounts once the pair exists. */
+export default function HotEditor(props: HotEditorProps) {
+  const { doc } = props
+  const [conn, setConn] = useState<{ docId: string; ydoc: Y.Doc; provider: WebsocketProvider } | null>(null)
+  useEffect(() => {
+    const ydoc = new Y.Doc()
+    if (doc.seed) {
+      const nodes: PMNode[] = []
+      for (const b of doc.blocks) {
+        const parsed = parser.parse(b.content)
+        if (!parsed || parsed.childCount === 0) continue
+        parsed.forEach((child) => {
+          nodes.push(child.type.create({ ...child.attrs, blockId: b.id }, child.content, child.marks))
+        })
+      }
+      const pmJson = { type: 'doc', content: nodes.map((n) => n.toJSON()) }
+      const seeded = prosemirrorJSONToYDoc(schema, pmJson, 'default')
+      Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(seeded))
+    }
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    const provider = new WebsocketProvider(`${proto}://${location.host}/ws/hot`, doc.docId, ydoc)
+    setConn({ docId: doc.docId, ydoc, provider })
+    return () => {
+      provider.destroy()
+      ydoc.destroy()
+      setConn(null)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doc.docId])
+  if (!conn || conn.docId !== doc.docId) {
+    return (
+      <div className={`hot-banner ${props.readOnly ? 'readonly' : ''}`}>
+        <span className="hot-dot" />
+        live · connecting…
+      </div>
+    )
+  }
+  return <HotSession key={conn.docId} {...props} ydoc={conn.ydoc} provider={conn.provider} />
+}
+
+function HotSession({
+  doc,
+  ydoc,
+  provider,
+  onEnded,
+  readOnly = false,
+  canEnd = true,
+  viewersWrite,
+  onToggleViewersWrite,
+  agent,
+  onAsk,
+}: HotEditorProps & { ydoc: Y.Doc; provider: WebsocketProvider }) {
   const [ask, setAsk] = useState('')
   const [asking, setAsking] = useState(false)
   const submitAsk = async () => {
@@ -89,39 +135,18 @@ export default function HotEditor({
   }
   const [peerNames, setPeerNames] = useState<string[]>([])
   const [me, setMe] = useState<string>('me')
+  // the caret extension reads the name at configure time only; keeping it in
+  // a ref means /api/principals resolving does not rebuild the editor (which
+  // re-binds Yjs and drops the caret). The awareness effect below carries
+  // the real name to peers.
+  const meRef = useRef(me)
+  meRef.current = me
   const [connected, setConnected] = useState(false)
   const [ending, setEnding] = useState(false)
   const endedRef = useRef(false)
   /** last bridge-failure reason we already told the user (avoid toast spam
    * while the provider retries) */
   const bridgeErrRef = useRef<string | null>(null)
-
-  // parse current blocks exactly like the cold editor (seeding only — the
-  // flatten is the daemon's job now, #67)
-  const initial = useMemo(() => {
-    const nodes: PMNode[] = []
-    for (const b of doc.blocks) {
-      const parsed = parser.parse(b.content)
-      if (!parsed || parsed.childCount === 0) continue
-      parsed.forEach((child) => {
-        nodes.push(child.type.create({ ...child.attrs, blockId: b.id }, child.content, child.marks))
-      })
-    }
-    return { nodes }
-  }, [doc.docId])
-
-  const { ydoc, provider } = useMemo(() => {
-    const ydoc = new Y.Doc()
-    if (doc.seed) {
-      const pmJson = { type: 'doc', content: initial.nodes.map((n) => n.toJSON()) }
-      const seeded = prosemirrorJSONToYDoc(schema, pmJson, 'default')
-      Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(seeded))
-    }
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    const provider = new WebsocketProvider(`${proto}://${location.host}/ws/hot`, doc.docId, ydoc)
-    return { ydoc, provider }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [doc.docId])
 
   // identify ourselves in awareness: petname + stable color drive the carets
   useEffect(() => {
@@ -209,8 +234,6 @@ export default function HotEditor({
       provider.off('status', onStatus)
       provider.off('connection-close', onClose)
       provider.awareness.off('change', onAwareness)
-      provider.destroy()
-      ydoc.destroy()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider])
@@ -224,15 +247,16 @@ export default function HotEditor({
         Collaboration.configure({ document: ydoc, field: 'default' }),
         CollaborationCaret.configure({
           provider,
-          user: { name: me, color: colorFor(me) },
+          user: { name: meRef.current, color: colorFor(meRef.current) },
         }),
       ],
       editable: !readOnly,
       // content comes exclusively from the Yjs doc
     },
-    // readOnly is deliberately NOT a dep: rebuilding the editor would re-bind
-    // the Yjs binding and drop the caret; setEditable below flips it live
-    [doc.docId, me],
+    // readOnly and me are deliberately NOT deps: rebuilding the editor would
+    // re-bind the Yjs binding and drop the caret; setEditable below flips
+    // readOnly live and the awareness effect carries the name
+    [doc.docId, ydoc, provider],
   )
 
   // a mid-session flip of can_write (owner toggled "watch only") must take

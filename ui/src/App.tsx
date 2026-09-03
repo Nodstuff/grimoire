@@ -179,9 +179,13 @@ export default function App() {
     // don't wait a whole tick for the first nudge check
     pollEvents().catch(() => {})
     let misses = 0
+    let inFlight = false
     const t = setInterval(async () => {
+      // a slow daemon must not stack ticks (each one is up to three requests)
+      if (inFlight) return
+      inFlight = true
       try {
-        const r = await api<{ stamp: number }>('/api/stamp')
+        const r = await api<{ stamp: number; build?: number; version?: string }>('/api/stamp')
         misses = 0
         setDaemonDown(false)
         if (stamp === null) stamp = r.stamp
@@ -192,16 +196,20 @@ export default function App() {
           refreshQueue()
         }
         await pollEvents()
-        // deploy landed → reload the bundle (deferred while an editor is dirty)
-        const b = await api<{ build: number }>('/api/buildinfo')
-        if (build === null) build = b.build
-        else if (b.build !== build && !document.querySelector('.save-state.dirty, .save-state.saving')) {
+        // deploy landed → reload the bundle (deferred while an editor is dirty).
+        // Newer daemons carry the build on the stamp; fall back to the
+        // dedicated route only when it is absent.
+        const b = typeof r.build === 'number' ? r.build : (await api<{ build: number }>('/api/buildinfo')).build
+        if (build === null) build = b
+        else if (b !== build && !document.querySelector('.save-state.dirty, .save-state.saving')) {
           location.reload()
         }
       } catch {
         // restarting mid-deploy, or actually down — say so after 3 misses
         misses += 1
         if (misses >= 3) setDaemonDown(true)
+      } finally {
+        inFlight = false
       }
     }, 2500)
     return () => clearInterval(t)
@@ -787,6 +795,9 @@ function fuzzyMatch(needle: string, hay: string): boolean {
   return false
 }
 
+/** rows rendered in the search palette; arrow keys clamp to these */
+const PALETTE_MAX = 12
+
 function SearchPalette({
   onOpenDoc,
   onClose,
@@ -805,15 +816,26 @@ function SearchPalette({
       setHits([])
       return
     }
+    // latest wins: a slow response for an older query must not overwrite
+    // the hits for what is in the box now
+    let stale = false
     const t = setTimeout(() => {
       api<SearchHit[]>(`/api/search?q=${encodeURIComponent(q)}`)
-        .then(setHits)
-        .catch(() => setHits([]))
+        .then((hs) => {
+          if (!stale) setHits(hs)
+        })
+        .catch(() => {
+          if (!stale) setHits([])
+        })
     }, 120)
-    return () => clearTimeout(t)
+    return () => {
+      stale = true
+      clearTimeout(t)
+    }
   }, [q])
 
   useEffect(() => setSel(0), [hits])
+  const shown = hits.slice(0, PALETTE_MAX)
 
   return (
     <PaletteShell onClose={onClose}>
@@ -823,13 +845,13 @@ function SearchPalette({
         value={q}
         onChange={(e) => setQ(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === 'ArrowDown') setSel((s) => Math.min(s + 1, hits.length - 1))
+          if (e.key === 'ArrowDown') setSel((s) => Math.min(s + 1, shown.length - 1))
           if (e.key === 'ArrowUp') setSel((s) => Math.max(s - 1, 0))
-          if (e.key === 'Enter' && hits[sel]) onOpenDoc(hits[sel].block.doc_id)
+          if (e.key === 'Enter' && shown[sel]) onOpenDoc(shown[sel].block.doc_id)
         }}
       />
       <div className="palette-list">
-        {hits.slice(0, 12).map((h, i) => (
+        {shown.map((h, i) => (
           <div
             key={h.block.id}
             className={`palette-item ${i === sel ? 'sel' : ''}`}
