@@ -2721,6 +2721,36 @@ async fn transfer_is_refused_while_a_doc_is_live_or_has_edits_waiting_and_declin
     assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
 }
 
+/// `request_with_timeout` is the only thing standing between a loop and a
+/// peer that accepts the dial and then never answers: the call must come back
+/// with a timeout error, not hang, and not be mistaken for a refusal.
+#[tokio::test]
+async fn a_peer_that_accepts_and_never_answers_times_out() {
+    use super::client::request_with_timeout;
+    let stalled = local_endpoint().await;
+    let addr = direct_addr(&stalled);
+    // accept the connection and the stream, read the request, answer nothing
+    tokio::spawn(async move {
+        while let Some(incoming) = stalled.accept().await {
+            tokio::spawn(async move {
+                let Ok(conn) = incoming.await else { return };
+                let Ok((_send, mut recv)) = conn.accept_bi().await else { return };
+                let _ = recv.read_to_end(MAX_FRAME).await;
+                // hold the connection open forever
+                std::future::pending::<()>().await
+            });
+        }
+    });
+    let caller = local_endpoint().await;
+    let started = std::time::Instant::now();
+    let err = request_with_timeout(&caller, addr, Request::Ping, std::time::Duration::from_millis(300))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("timed out"), "{err:#}");
+    assert!(err.downcast_ref::<super::wire::Refusal>().is_none(), "a stall is not a refusal");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "returned promptly: {:?}", started.elapsed());
+}
+
 /// 0.7.2 hardening: a member offering a share whose root is ALREADY a mirror
 /// the hub holds from another member is refused (`RootConflict`) on the
 /// automatic hub path; the first member's mirror and contact are untouched.
@@ -2766,6 +2796,24 @@ async fn hub_refuses_a_publication_that_names_another_members_root() {
     assert!(!contacts.iter().find(|c| c.id == alice_on_hub.id).unwrap().revoked, "alice's contact intact");
     assert!(!contacts.iter().find(|c| c.id == bob_on_hub.id).unwrap().revoked);
     assert_eq!(s.list_hub_publications().unwrap().len(), 1);
+    let before = contacts.len();
+    drop(s);
+
+    // 0.7.2: the conflict is settled BEFORE pairing, so a stranger's refused
+    // automatic join leaves no contact row behind at all
+    let carol = peer("carol").await;
+    let (carol_share, carol_minted) = {
+        let mut s = carol.store.lock().unwrap();
+        s.create_doc_with_id(notes, "Notes", None, carol.human).unwrap();
+        super::client::mint_invite_full(&mut s, &carol.pubkey(), notes, SharePermission::Propose).unwrap()
+    };
+    let ticket = Ticket::new(carol.pubkey(), carol_share.id.to_string(), carol_minted.secret.clone());
+    let err = join_at_from(&h.ep, &h.store, &ticket, carol.addr.clone(), JoinOrigin::HubRelay).await.unwrap_err();
+    assert_eq!(err.downcast_ref::<super::wire::Refusal>().map(|r| r.code), Some(RefusalCode::RootConflict), "{err:#}");
+    let s = h.store.lock().unwrap();
+    assert_eq!(s.list_contacts().unwrap().len(), before, "the refused join paired nobody");
+    assert!(!s.list_contacts().unwrap().iter().any(|c| c.pubkey == carol.pubkey()));
+    assert_eq!(s.get_mirror(notes).unwrap().unwrap().owner, alice_on_hub.id, "still alice's mirror");
 }
 
 /// 0.7.2 hardening: `is_hub` on a contact comes from the hub marker on the

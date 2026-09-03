@@ -431,6 +431,39 @@ pub async fn join_at_from(
     };
     let ticket = ticket.clone();
     with_store(store, move |s| -> Result<JoinOutcome> {
+        let root_uuid: uuid::Uuid = root_doc.parse().context("owner sent a bad doc id")?;
+        let share_uuid: uuid::Uuid = share_id.parse().context("owner sent a bad share id")?;
+        // 0.7.2: settle the root conflict BEFORE pairing, so a refused
+        // automatic join leaves nothing behind — no contact row, no root doc.
+        // The peer may be a stranger, in which case any existing mirror of
+        // this root is by definition held from someone else.
+        if origin != JoinOrigin::Interactive {
+            let known = s.list_contacts()?.into_iter().find(|c| c.pubkey == ticket.node);
+            if let Some(m) = s.get_mirror(root_uuid)?
+                && known.as_ref().is_none_or(|c| c.id != m.owner)
+            {
+                let old_name = s
+                    .list_contacts()?
+                    .into_iter()
+                    .find(|c| c.id == m.owner)
+                    .map(|c| c.petname)
+                    .unwrap_or_else(|| "another contact".into());
+                tracing::warn!(
+                    root = %root_uuid,
+                    held_from = old_name,
+                    claimed_by = ticket.node,
+                    ?origin,
+                    "share root belongs to a mirror from another contact; refusing to rebind it"
+                );
+                return Err(Refusal::new(
+                    RefusalCode::RootConflict,
+                    format!(
+                        "share root {root_uuid} belongs to a mirror from {old_name}; not rebinding it to {owner_name}"
+                    ),
+                )
+                .into());
+            }
+        }
         let owner_contact = s.pair_contact(&ticket.node, &owner_name)?;
         // hub: remember what it is and where we stand with it (the contact row
         // carries MY role/membership at that hub)
@@ -459,8 +492,6 @@ pub async fn join_at_from(
                 });
             }
         }
-        let root_uuid: uuid::Uuid = root_doc.parse().context("owner sent a bad doc id")?;
-        let share_uuid: uuid::Uuid = share_id.parse().context("owner sent a bad share id")?;
         // same UUID = same doc. Three cases for a root id we already have:
         // - it is a mirror (re-join): keep it;
         // - it is a TOMBSTONE left by a dropped mirror (the owner revoked, we
@@ -505,27 +536,8 @@ pub async fn join_at_from(
                     .list_contacts()?
                     .into_iter()
                     .find(|c| c.id == m.owner);
-                let old_name = old
-                    .as_ref()
-                    .map(|c| c.petname.clone())
-                    .unwrap_or_else(|| "another contact".into());
-                if origin != JoinOrigin::Interactive {
-                    tracing::warn!(
-                        root = %root_uuid,
-                        held_from = old_name,
-                        claimed_by = owner_contact.petname,
-                        ?origin,
-                        "share root belongs to a mirror from another contact; refusing to rebind it"
-                    );
-                    return Err(Refusal::new(
-                        RefusalCode::RootConflict,
-                        format!(
-                            "share root {root_uuid} belongs to a mirror from {old_name}; not rebinding it to {}",
-                            owner_contact.petname
-                        ),
-                    )
-                    .into());
-                }
+                // an automatic join never reaches here: the conflict was
+                // refused above, before anything was written
                 if let Some(old) = &old {
                     s.revoke_contact(old.id)?;
                     tracing::warn!(
