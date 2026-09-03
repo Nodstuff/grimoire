@@ -201,15 +201,21 @@ async fn invoke_claude_streaming(
             args.push(d.clone());
         }
     }
-    let mut child = tokio::process::Command::new(bin)
-        .args(&args)
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawn claude: {e}"))?;
+        .kill_on_drop(true);
+    // own process group: a budget kill takes claude's helpers with it
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(|e| format!("spawn claude: {e}"))?;
+    let registered = child.id().map(crate::children::register);
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let mut lines = BufReader::new(stdout).lines();
+    // drain stderr concurrently: an undrained pipe fills and wedges the child.
+    // Only the tail survives, for the run log.
+    let stderr_tail = tokio::spawn(drain_tail(child.stderr.take(), STDERR_TAIL_BYTES));
 
     let started = std::time::Instant::now();
     let mut tool_calls = 0usize;
@@ -275,17 +281,55 @@ async fn invoke_claude_streaming(
         }
     };
     if tokio::time::timeout(wall_clock, read_all).await.is_err() {
+        if let Some(r) = &registered {
+            crate::children::kill_group(r.pid(), libc::SIGKILL);
+        }
         let _ = child.kill().await;
+        stderr_tail.abort();
         return Err(format!(
             "budget: wall clock exceeded {}s",
             wall_clock.as_secs()
         ));
     }
     let status = child.wait().await.map_err(|e| format!("wait: {e}"))?;
+    drop(registered);
     match final_result {
         Some(r) => Ok(r),
-        None => Err(format!("claude exited {status} with no result event")),
+        None => {
+            let tail = stderr_tail.await.unwrap_or_default();
+            let tail = tail.trim();
+            if tail.is_empty() {
+                Err(format!("claude exited {status} with no result event"))
+            } else {
+                Err(format!("claude exited {status} with no result event; stderr: {tail}"))
+            }
+        }
     }
+}
+
+/// Keep the last `keep` bytes of stderr for the run log.
+const STDERR_TAIL_BYTES: usize = 16 * 1024;
+
+/// Read a pipe to EOF keeping only its last `keep` bytes (lossy UTF-8 at the
+/// cut). Never errors: a broken pipe just ends the tail early.
+async fn drain_tail(pipe: Option<tokio::process::ChildStderr>, keep: usize) -> String {
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else { return String::new() };
+    let mut tail: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > keep {
+                    let cut = tail.len() - keep;
+                    tail.drain(..cut);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&tail).into_owned()
 }
 
 pub(crate) fn parse_json_result<T: serde::de::DeserializeOwned>(result: &str) -> Result<T, String> {

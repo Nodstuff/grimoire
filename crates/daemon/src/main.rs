@@ -7,6 +7,7 @@ mod admin;
 mod api;
 mod ask;
 mod backup;
+mod children;
 mod embed;
 mod fed;
 mod garden;
@@ -379,6 +380,29 @@ fn admin_client(db: &std::path::Path, timeout: Option<std::time::Duration>) -> a
         b = b.timeout(t);
     }
     Ok(b.build()?)
+}
+
+/// Ctrl-C from a terminal, or SIGTERM from the shell / launchd / `kill`.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("no SIGTERM handler ({e}); ctrl-c only");
+                tokio::signal::ctrl_c().await.ok();
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("ctrl-c: shutting down"),
+            _ = term.recv() => tracing::info!("SIGTERM: shutting down"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+    }
 }
 
 #[tokio::main]
@@ -774,7 +798,10 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("ksd serving MCP (streamable HTTP) at http://{addr}/mcp");
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
-                    tokio::signal::ctrl_c().await.ok();
+                    shutdown_signal().await;
+                    // children first: a slow connection drain must never
+                    // leave a `claude -p` running past the daemon
+                    children::kill_all().await;
                 })
                 .await?;
         }

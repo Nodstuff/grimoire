@@ -33,6 +33,7 @@ futures-util = "0.3.34"
 base64 = "0.23.1"
 rust-embed = "8.12"
 iroh-mdns-address-lookup = "0.5.0"
+libc = "0.2"
 model2vec-rs = { version = "0.2.1", default-features = false, features = ["onig", "local-only"] }
 
 [build-dependencies]
