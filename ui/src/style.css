@@ -127,57 +127,86 @@ kbd {
 }
 .backlink:hover { background: var(--panel2); }
 
-/* ---------- sidebar tree (⌘T) ---------- */
+/* ---------- sidebar tree (⌘T): a quiet library ---------- */
 
 .sidebar {
   width: 270px;
   flex-shrink: 0;
   overflow-y: auto;
-  background: var(--panel);
+  /* one barely visible step lighter than the panel */
+  background: color-mix(in srgb, var(--panel) 70%, var(--panel2) 30%);
   border-right: 1px solid var(--border);
-  padding-bottom: 24px;
+  padding: 14px 0 24px;
 }
-.sidebar-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 12px 14px 8px;
-  color: var(--fg-dim);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+.sidebar-head { padding: 0 10px 8px; }
+.tree-filter {
+  width: 100%;
+  height: 26px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 6px;
+  background: var(--panel2);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
 }
-.sidebar-head button {
-  background: none;
-  border: 1px solid var(--border);
-  color: var(--fg-dim);
-  border-radius: 5px;
-  font-size: 10px;
-  padding: 1px 6px;
-  cursor: pointer;
-}
+.tree-filter::placeholder { color: var(--fg-dim); opacity: 0.8; }
+.tree-filter:focus { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent); }
 .tree-root { padding: 2px 0 24px; }
+.tree-empty { padding: 12px 10px; font-size: 12px; color: var(--fg-dim); }
+
+/* sections */
+.tree-section { margin-top: 10px; }
+.tree-section:first-child { margin-top: 2px; }
+.tree-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 22px;
+  padding: 0 10px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 11px;
+  font-variant: small-caps;
+  letter-spacing: 0.06em;
+  text-align: left;
+  user-select: none;
+}
+.tree-section-head .chev { opacity: 0.6; }
+.tree-section-head:hover { color: var(--fg); }
+.tree-section-head .tree-count { margin-left: auto; }
+
+/* rows: typography does the work */
 .tree-item {
   display: flex;
   align-items: center;
-  gap: 2px;
-  height: 26px;
+  gap: 5px;
+  height: 24px;
   padding-right: 6px;
   cursor: pointer;
   color: var(--fg-dim);
   font-size: 13px;
-  border-radius: 6px;
-  margin: 1px 6px;
+  line-height: 24px;
+  border-radius: 5px;
+  margin: 0 6px 0 0;
   position: relative;
   border-top: 2px solid transparent;
   border-bottom: 2px solid transparent;
   user-select: none;
 }
+.tree-item.dir { color: var(--fg); font-weight: 500; }
+.tree-item.leaf { font-weight: 400; }
 .tree-item:hover { color: var(--fg); background: var(--panel2); }
 .tree-item.sel {
   color: var(--fg);
   background: color-mix(in srgb, var(--accent) 14%, transparent);
 }
+.tree-item.match .tree-title { color: var(--fg); }
 .tree-item.dragging { opacity: 0.35; }
 .tree-item.drop-into {
   background: color-mix(in srgb, var(--accent) 22%, transparent);
@@ -185,6 +214,11 @@ kbd {
 }
 .tree-item.drop-before { border-top-color: var(--accent); }
 .tree-item.drop-after { border-bottom-color: var(--accent); }
+.tree-item .chev { flex-shrink: 0; opacity: 0.55; transition: transform 0.12s ease; }
+.tree-item .chev.open { transform: rotate(90deg); }
+.chev { transition: transform 0.12s ease; }
+.chev.open { transform: rotate(90deg); }
+.tree-canvas { color: var(--accent); font-size: 11px; opacity: 0.9; flex-shrink: 0; }
 .tree-title {
   flex: 1;
   min-width: 0;
@@ -192,22 +226,21 @@ kbd {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.tree-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  flex-shrink: 0;
-  opacity: 0.55;
-  font-size: 11px;
+
+/* one right-aligned badge cluster: now-state always, ownership on hover/sel */
+.tree-badges { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; }
+.tree-badges .tend-dot { margin: 0 2px; }
+.tree-badges .quiet { margin-left: 0; opacity: 0; transition: opacity 0.12s; }
+.tree-item:hover .quiet, .tree-item.sel .quiet { opacity: 1; }
+.tree-count {
+  font-size: 10px;
+  color: var(--fg-dim);
+  opacity: 0;
+  font-variant-numeric: tabular-nums;
+  font-weight: 400;
+  transition: opacity 0.12s;
 }
-.chev { transition: transform 0.12s ease; }
-.chev.open { transform: rotate(90deg); }
-.tree-children {
-  border-left: 1px solid var(--border);
-  margin-left: 18px;
-}
-.tree-children .tree-item { margin-left: 0; }
+.tree-item:hover .tree-count, .tree-section-head:hover .tree-count { opacity: 0.8; }
 .tree-delete {
   background: none;
   border: none;
@@ -222,6 +255,28 @@ kbd {
 }
 .tree-item:hover .tree-delete { opacity: 0.6; }
 .tree-delete:hover { opacity: 1 !important; color: var(--red); background: var(--bg); }
+
+/* nesting: a faint guide per depth instead of a hard border */
+.tree-children { position: relative; }
+.tree-children::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--guide, 15px);
+  width: 1px;
+  background: color-mix(in srgb, var(--border) 60%, transparent);
+  pointer-events: none;
+}
+
+/* expand/collapse: grid-rows animation, ~120ms */
+.tree-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.12s ease;
+}
+.tree-collapse.open { grid-template-rows: 1fr; }
+.tree-collapse-inner { overflow: hidden; min-height: 0; }
 
 /* ---------- palettes (⌘K / ⌘S) ---------- */
 
@@ -700,7 +755,6 @@ kbd {
 .canvas-doc-head h1 { margin: 0; font-size: 17px; font-weight: 650; }
 .canvas-full { flex: 1; position: relative; }
 
-.tree-icon.canvas { color: var(--accent); opacity: 0.9; }
 
 .tree-delete.armed {
   opacity: 1 !important;

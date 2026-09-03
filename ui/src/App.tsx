@@ -7,9 +7,10 @@ import Sharing from './Sharing'
 import SharePanel from './SharePanel'
 import PaletteShell from './PaletteShell'
 import Profile, { FirstRunName, loadProfile } from './Profile'
-import Trash, { restoreDoc } from './Trash'
+import Trash from './Trash'
 import ImportFolder from './ImportFolder'
 import ReviewRail from './ReviewRail'
+import DocTreePanel from './DocTree'
 import { notify, errText, Notices } from './Notice'
 
 // heavy views load on first use: xyflow + html-to-image (canvas) and
@@ -23,7 +24,6 @@ import { buildHighlightMap, targetBlockOf } from './review'
 import { activityLine, loadLastSeen, storeLastSeen, unseenActivity } from './activity'
 import { advanceEvents, EventsCursor, EventsResponse, INITIAL_CURSOR, liveEventLine } from './live'
 import { chipText } from './shares'
-import { compareSortKey, keyForPosition } from './editor/diff'
 import {
   api,
   ApiError,
@@ -346,7 +346,7 @@ export default function App() {
         </div>
       )}
       {treeOpen && (
-        <DocTreeNav
+        <DocTreePanel
           docs={docs}
           selected={view.kind === 'doc' ? view.id : null}
           onSelect={openDoc}
@@ -944,285 +944,6 @@ function NewDocPalette({
 }
 
 /* ---------- tree ---------- */
-
-type Drop = { id: string; mode: 'into' | 'before' | 'after' } | null
-
-function DocTreeNav({
-  docs,
-  selected,
-  onSelect,
-  onClose,
-  onChanged,
-}: {
-  docs: Doc[]
-  selected: string | null
-  onSelect: (id: string) => void
-  onClose: () => void
-  onChanged: () => void
-}) {
-  const childrenOf = useMemo(() => {
-    const m = new Map<string | null, Doc[]>()
-    for (const d of docs) {
-      const k = d.parent_id
-      if (!m.has(k)) m.set(k, [])
-      m.get(k)!.push(d)
-    }
-    // the server's order: sort_key, NULL last (stable → ties keep its order)
-    for (const kids of m.values()) kids.sort((a, b) => compareSortKey(a.sort_key, b.sort_key))
-    return m
-  }, [docs])
-
-  const [openDirs, setOpenDirs] = useState<Set<string>>(new Set())
-  const [dragging, setDragging] = useState<string | null>(null)
-  const [drop, setDrop] = useState<Drop>(null)
-
-  const [pendingMove, setPendingMove] = useState<{
-    dragged: string
-    parent: string | null
-    sortKey: string | null
-    sharedRoot: string
-  } | null>(null)
-
-  const byId = useMemo(() => new Map(docs.map((d) => [d.id, d])), [docs])
-  // the nearest shared ancestor (incl. self) of a doc, if any
-  const sharedRootOf = (id: string | null): Doc | null => {
-    let cur = id ? byId.get(id) : undefined
-    while (cur) {
-      if (cur.is_shared) return cur
-      cur = cur.parent_id ? byId.get(cur.parent_id) : undefined
-    }
-    return null
-  }
-
-  // the actual move; the server may refuse (e.g. a mirror into a shared
-  // subtree) — its error string surfaces as a notice
-  const commitMove = async (dragged: string, parent: string | null, sortKey: string | null) => {
-    try {
-      await api(`/api/doc/${dragged}/move`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ parent_id: parent, sort_key: sortKey }),
-      })
-      onChanged()
-    } catch (e) {
-      notify(String(e))
-    }
-  }
-
-  const doMove = async (dragged: string, target: Doc, mode: 'into' | 'before' | 'after') => {
-    if (dragged === target.id) return
-    let parent: string | null
-    let sortKey: string | null
-    if (mode === 'into') {
-      parent = target.id
-      const kids = (childrenOf.get(target.id) ?? []).filter((d) => d.id !== dragged)
-      sortKey = keyForPosition(kids, kids.length)
-      setOpenDirs((s) => new Set(s).add(target.id))
-    } else {
-      parent = target.parent_id
-      const siblings = (childrenOf.get(parent) ?? []).filter((d) => d.id !== dragged)
-      const i = siblings.findIndex((d) => d.id === target.id)
-      sortKey = keyForPosition(siblings, mode === 'before' ? i : i + 1)
-    }
-    // moving INTO a shared subtree makes the doc visible to its grantees on
-    // their next pull — loud, explicit confirm (ADR 0002 edge semantics)
-    const wasShared = sharedRootOf(byId.get(dragged)?.parent_id ?? null)
-    const nowShared = sharedRootOf(parent)
-    if (nowShared && nowShared.id !== wasShared?.id) {
-      setPendingMove({ dragged, parent, sortKey, sharedRoot: nowShared.title })
-      return
-    }
-    await commitMove(dragged, parent, sortKey)
-  }
-
-  // window.confirm is a silent no-op in Tauri's webview — arm-then-confirm
-  // inline instead: first click arms the ×, second click within 2.5s deletes
-  const [armed, setArmed] = useState<string | null>(null)
-  const armTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  useEffect(
-    () => () => {
-      if (armTimer.current) clearTimeout(armTimer.current)
-    },
-    [],
-  )
-  const doDelete = async (d: Doc) => {
-    if (armed !== d.id) {
-      setArmed(d.id)
-      if (armTimer.current) clearTimeout(armTimer.current)
-      armTimer.current = setTimeout(() => setArmed(null), 2500)
-      return
-    }
-    setArmed(null)
-    try {
-      const out = await api<{ deleted: number }>(`/api/doc/${d.id}/delete`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}',
-      })
-      // nothing is gone for good (Trash), but the undo should be one click
-      const inside = out.deleted > 1 ? ` and ${out.deleted - 1} inside it` : ''
-      notify(`deleted “${d.title}”${inside} — click to undo`, 'ok', {
-        ttlMs: 10_000,
-        onClick: () => {
-          restoreDoc(d.id)
-            .then(() => {
-              notify(`restored “${d.title}”`, 'ok')
-              onChanged()
-            })
-            .catch((e) => notify(errText(e)))
-        },
-      })
-    } catch (e) {
-      notify(errText(e))
-    }
-    onChanged()
-  }
-
-  const renderLevel = (parent: string | null, depth: number): React.ReactNode =>
-    (childrenOf.get(parent) ?? []).map((d) => {
-      const isDir = !!childrenOf.get(d.id)?.length
-      const isOpen = openDirs.has(d.id)
-      const dropHere = drop?.id === d.id ? drop.mode : null
-      return (
-        <div key={d.id}>
-          <div
-            className={[
-              'tree-item',
-              selected === d.id ? 'sel' : '',
-              dragging === d.id ? 'dragging' : '',
-              dropHere === 'into' ? 'drop-into' : '',
-              dropHere === 'before' ? 'drop-before' : '',
-              dropHere === 'after' ? 'drop-after' : '',
-            ].join(' ')}
-            style={{ paddingLeft: 8 }}
-            draggable
-            onDragStart={(e) => {
-              setDragging(d.id)
-              e.dataTransfer.effectAllowed = 'move'
-            }}
-            onDragEnd={() => {
-              setDragging(null)
-              setDrop(null)
-            }}
-            onDragOver={(e) => {
-              if (!dragging || dragging === d.id) return
-              e.preventDefault()
-              const r = e.currentTarget.getBoundingClientRect()
-              const y = (e.clientY - r.top) / r.height
-              setDrop({ id: d.id, mode: y < 0.3 ? 'before' : y > 0.7 ? 'after' : 'into' })
-            }}
-            onDragLeave={() => setDrop((cur) => (cur?.id === d.id ? null : cur))}
-            onDrop={(e) => {
-              e.preventDefault()
-              if (dragging && drop?.id === d.id) doMove(dragging, d, drop.mode)
-              setDrop(null)
-              setDragging(null)
-            }}
-            onClick={() => {
-              if (isDir)
-                setOpenDirs((s) => {
-                  const n = new Set(s)
-                  if (n.has(d.id)) n.delete(d.id)
-                  else n.add(d.id)
-                  return n
-                })
-              onSelect(d.id)
-            }}
-          >
-            <span className={`tree-icon ${d.is_canvas ? 'canvas' : ''}`}>
-              {isDir ? (
-                <svg width="10" height="10" viewBox="0 0 10 10" className={isOpen ? 'chev open' : 'chev'}>
-                  <path d="M3 1.5 L7 5 L3 8.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-                </svg>
-              ) : d.is_canvas ? (
-                '▨'
-              ) : (
-                ''
-              )}
-            </span>
-            <span className="tree-title">{d.title}</span>
-            {d.is_tended && <span className="tend-dot" title="tended by agents" />}
-            {d.mirror_permission && !d.from_hub && (
-              <span className="mirror-badge" title={`shared with you (${d.mirror_permission})`}>⇄</span>
-            )}
-            {d.from_hub && (
-              <span
-                className="mirror-badge hub"
-                title={d.origin_owner_name ? `relayed by the hub · owned by ${d.origin_owner_name}` : 'a hub folder'}
-              >
-                ⌂
-              </span>
-            )}
-            {d.is_shared && !d.published_to && <span className="shared-badge" title="you share this subtree">↗</span>}
-            {d.published_to && !d.mirror_permission && (
-              <span className="shared-badge hub" title={`published to ${d.published_to}`}>⌂</span>
-            )}
-            {!d.mirror_permission && (
-            <button
-              className={`tree-delete ${armed === d.id ? 'armed' : ''}`}
-              title={armed === d.id ? 'click again to delete' : 'delete'}
-              onClick={(e) => {
-                e.stopPropagation()
-                doDelete(d)
-              }}
-            >
-              {armed === d.id ? 'sure?' : '×'}
-            </button>
-            )}
-          </div>
-          {isDir && isOpen && (
-            <div className="tree-children">{renderLevel(d.id, depth + 1)}</div>
-          )}
-        </div>
-      )
-    })
-
-  return (
-    <aside className="sidebar">
-      <div className="sidebar-head">
-        <span>files</span>
-        <button onClick={onClose}>⌘T</button>
-      </div>
-      {pendingMove && (
-        <div className="move-confirm">
-          <div>
-            “{byId.get(pendingMove.dragged)?.title ?? '?'}” will become visible to
-            everyone “{pendingMove.sharedRoot}” is shared with
-          </div>
-          <div className="move-confirm-actions">
-            <button
-              className="accept"
-              onClick={() => {
-                const m = pendingMove
-                setPendingMove(null)
-                commitMove(m.dragged, m.parent, m.sortKey)
-              }}
-            >
-              share it
-            </button>
-            <button className="decline" onClick={() => setPendingMove(null)}>
-              cancel
-            </button>
-          </div>
-        </div>
-      )}
-      <div
-        className="tree-root"
-        onDragOver={(e) => {
-          // dropping on empty space = move to root
-          if (dragging && e.target === e.currentTarget) e.preventDefault()
-        }}
-        onDrop={(e) => {
-          if (dragging && e.target === e.currentTarget) {
-            commitMove(dragging, null, null)
-          }
-        }}
-      >
-        {renderLevel(null, 0)}
-      </div>
-    </aside>
-  )
-}
 
 /* ---------- doc view ---------- */
 
