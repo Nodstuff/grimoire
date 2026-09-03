@@ -1,0 +1,24 @@
+# systemd unit for a Grimoire hub (ADR 0002 § Hub). Install with deploy/hub/install.sh.
+[Unit]
+Description=Grimoire hub (team Grimoire)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=grimoire
+Group=grimoire
+Environment=HOME=/var/lib/grimoire
+Environment=RUST_LOG=info
+# identity key falls back to a 0600 file beside the db on machines without a keychain
+ExecStart=/usr/local/bin/grimoire --db /var/lib/grimoire/.grimoire/ks.db --port 7425 serve --hub
+Restart=on-failure
+RestartSec=5
+# the daemon binds 127.0.0.1 only; federation is UDP via iroh (no inbound rule needed
+# beyond what the relay/hole-punching negotiates). Keep the box minimal.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/grimoire
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
