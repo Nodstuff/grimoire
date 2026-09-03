@@ -11,6 +11,7 @@ use super::wire::{
     ALPN, Frame, HOT_ALPN, MAX_FRAME, PROTOCOL_VERSION, Refusal, RefusalCode, Request, Response,
     Ticket, WireDoc, hash_secret,
 };
+use crate::store_ext::with_store;
 use anyhow::{Context, Result};
 use grimoire_store::{BlockStore, SqliteStore};
 use iroh::{Endpoint, EndpointAddr};
@@ -87,16 +88,7 @@ pub async fn open_hot_bridge(
     tokio::sync::mpsc::Sender<Vec<u8>>,
     tokio::sync::mpsc::Receiver<Vec<u8>>,
 )> {
-    let (mirror, owner) = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
-        let mirror = s.get_mirror(doc_id)?.context("doc is not a mirror")?;
-        let owner = s
-            .list_contacts()?
-            .into_iter()
-            .find(|c| c.id == mirror.owner)
-            .context("mirror's owner contact is gone")?;
-        (mirror, owner)
-    };
+    let (mirror, owner) = mirror_owner(store, doc_id).await?;
     let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
     // The bridge is a fresh QUIC connection on its own ALPN; across NATs it
     // may need a relay round or a hole-punch to settle, so retry the dial a
@@ -167,7 +159,7 @@ pub async fn hot_status_upstream(
     store: &Arc<Mutex<SqliteStore>>,
     doc_id: uuid::Uuid,
 ) -> Result<(bool, Option<i64>, usize, Option<bool>)> {
-    let (mirror, owner) = mirror_owner(store, doc_id)?;
+    let (mirror, owner) = mirror_owner(store, doc_id).await?;
     let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
     let res = request(
         endpoint,
@@ -195,7 +187,7 @@ pub async fn edit_ping_upstream(
     doc_id: uuid::Uuid,
     key: uuid::Uuid,
 ) -> Result<usize> {
-    let (mirror, owner) = mirror_owner(store, doc_id)?;
+    let (mirror, owner) = mirror_owner(store, doc_id).await?;
     let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
     let res = request(
         endpoint,
@@ -218,7 +210,7 @@ pub async fn hot_end_upstream(
     store: &Arc<Mutex<SqliteStore>>,
     doc_id: uuid::Uuid,
 ) -> Result<usize> {
-    let (mirror, owner) = mirror_owner(store, doc_id)?;
+    let (mirror, owner) = mirror_owner(store, doc_id).await?;
     let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
     let res = request(
         endpoint,
@@ -245,7 +237,7 @@ pub async fn hot_start_upstream(
     doc_id: uuid::Uuid,
     base_epoch: i64,
 ) -> Result<(i64, bool)> {
-    let (mirror, owner) = mirror_owner(store, doc_id)?;
+    let (mirror, owner) = mirror_owner(store, doc_id).await?;
     let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
     let res = request(
         endpoint,
@@ -286,7 +278,7 @@ pub async fn pull_owner_of(
     store: &Arc<Mutex<SqliteStore>>,
     doc_id: uuid::Uuid,
 ) -> Result<PullSummary> {
-    let (mirror, owner) = mirror_owner(store, doc_id)?;
+    let (mirror, owner) = mirror_owner(store, doc_id).await?;
     let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
     pull_share(
         endpoint,
@@ -298,18 +290,20 @@ pub async fn pull_owner_of(
     .await
 }
 
-fn mirror_owner(
+async fn mirror_owner(
     store: &Arc<Mutex<SqliteStore>>,
     doc_id: uuid::Uuid,
 ) -> Result<(grimoire_store::Mirror, grimoire_store::Contact)> {
-    let s = store.lock().unwrap_or_else(|p| p.into_inner());
-    let mirror = s.get_mirror(doc_id)?.context("doc is not a mirror")?;
-    let owner = s
-        .list_contacts()?
-        .into_iter()
-        .find(|c| c.id == mirror.owner)
-        .context("mirror's owner contact is gone")?;
-    Ok((mirror, owner))
+    with_store(store, move |s| {
+        let mirror = s.get_mirror(doc_id)?.context("doc is not a mirror")?;
+        let owner = s
+            .list_contacts()?
+            .into_iter()
+            .find(|c| c.id == mirror.owner)
+            .context("mirror's owner contact is gone")?;
+        Ok((mirror, owner))
+    })
+    .await
 }
 /// The outcome of a completed join, for the UI/CLI.
 #[derive(Debug, Serialize)]
@@ -383,8 +377,7 @@ pub async fn join_at_from(
     addr: EndpointAddr,
     origin: JoinOrigin,
 ) -> Result<JoinOutcome> {
-    let my_name = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+    let my_name = with_store(store, |s| {
         s.list_principals()
             .ok()
             .and_then(|ps| {
@@ -393,7 +386,8 @@ pub async fn join_at_from(
             })
             .map(|p| p.display_name)
             .unwrap_or_else(|| "someone".into())
-    };
+    })
+    .await;
     let res = request(
         endpoint,
         addr,
@@ -435,132 +429,135 @@ pub async fn join_at_from(
     } else {
         is_hub
     };
-    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-    let owner_contact = s.pair_contact(&ticket.node, &owner_name)?;
-    // hub: remember what it is and where we stand with it (the contact row
-    // carries MY role/membership at that hub)
-    if is_hub {
-        if !owner_contact.is_hub {
-            s.set_contact_is_hub(owner_contact.id, true)?;
-        }
-        if let Some(m) = membership.as_deref().and_then(grimoire_store::Membership::parse) {
-            s.set_contact_membership(owner_contact.id, m)?;
-        }
-        if let Some(r) = role.as_deref().and_then(grimoire_store::ContactRole::parse) {
-            s.set_contact_role(owner_contact.id, r)?;
-        }
-        if membership.as_deref() == Some("pending") {
-            // paired, but no share until an admin approves: nothing to mirror
-            tracing::info!(hub = owner_name, "joined a hub; waiting for an admin to approve");
-            return Ok(JoinOutcome {
-                owner: ticket.node.clone(),
-                owner_name,
-                root_doc,
-                root_title,
-                permission,
-                owner_changed_from: None,
-                is_hub: true,
-                membership,
-            });
-        }
-    }
-    let root_uuid: uuid::Uuid = root_doc.parse().context("owner sent a bad doc id")?;
-    let share_uuid: uuid::Uuid = share_id.parse().context("owner sent a bad share id")?;
-    // same UUID = same doc. Three cases for a root id we already have:
-    // - it is a mirror (re-join): keep it;
-    // - it is a TOMBSTONE left by a dropped mirror (the owner revoked, we
-    //   soft-deleted; now they share again): revive it — refusing here was
-    //   the "revoking blocks future shares of that subtree" bug;
-    // - it is a LIVE doc of my own: refuse — an owner naming my doc id (a bug
-    //   or a hostile peer who learned it from a share I gave them) must never
-    //   turn my doc into their mirror.
-    if s.get_doc(root_uuid).is_ok() && s.get_mirror(root_uuid)?.is_none() {
-        if s.doc_is_tombstoned(root_uuid)? {
-            s.undelete_doc(root_uuid)?;
-            if !root_title.is_empty() {
-                s.rename_doc(root_uuid, &root_title).ok();
+    let ticket = ticket.clone();
+    with_store(store, move |s| -> Result<JoinOutcome> {
+        let owner_contact = s.pair_contact(&ticket.node, &owner_name)?;
+        // hub: remember what it is and where we stand with it (the contact row
+        // carries MY role/membership at that hub)
+        if is_hub {
+            if !owner_contact.is_hub {
+                s.set_contact_is_hub(owner_contact.id, true)?;
             }
-            tracing::info!(root = %root_uuid, "revived tombstoned mirror root on re-join");
-        } else {
-            anyhow::bail!(
-                "owner's share root {root_uuid} collides with a doc of your own — refusing to join"
-            );
+            if let Some(m) = membership.as_deref().and_then(grimoire_store::Membership::parse) {
+                s.set_contact_membership(owner_contact.id, m)?;
+            }
+            if let Some(r) = role.as_deref().and_then(grimoire_store::ContactRole::parse) {
+                s.set_contact_role(owner_contact.id, r)?;
+            }
+            if membership.as_deref() == Some("pending") {
+                // paired, but no share until an admin approves: nothing to mirror
+                tracing::info!(hub = owner_name, "joined a hub; waiting for an admin to approve");
+                return Ok(JoinOutcome {
+                    owner: ticket.node.clone(),
+                    owner_name,
+                    root_doc,
+                    root_title,
+                    permission,
+                    owner_changed_from: None,
+                    is_hub: true,
+                    membership,
+                });
+            }
         }
-    }
-    if s.get_doc(root_uuid).is_err() {
-        let title = if root_title.is_empty() {
-            "(shared doc)".to_string()
-        } else {
-            root_title.clone()
+        let root_uuid: uuid::Uuid = root_doc.parse().context("owner sent a bad doc id")?;
+        let share_uuid: uuid::Uuid = share_id.parse().context("owner sent a bad share id")?;
+        // same UUID = same doc. Three cases for a root id we already have:
+        // - it is a mirror (re-join): keep it;
+        // - it is a TOMBSTONE left by a dropped mirror (the owner revoked, we
+        //   soft-deleted; now they share again): revive it — refusing here was
+        //   the "revoking blocks future shares of that subtree" bug;
+        // - it is a LIVE doc of my own: refuse — an owner naming my doc id (a bug
+        //   or a hostile peer who learned it from a share I gave them) must never
+        //   turn my doc into their mirror.
+        if s.get_doc(root_uuid).is_ok() && s.get_mirror(root_uuid)?.is_none() {
+            if s.doc_is_tombstoned(root_uuid)? {
+                s.undelete_doc(root_uuid)?;
+                if !root_title.is_empty() {
+                    s.rename_doc(root_uuid, &root_title).ok();
+                }
+                tracing::info!(root = %root_uuid, "revived tombstoned mirror root on re-join");
+            } else {
+                anyhow::bail!(
+                    "owner's share root {root_uuid} collides with a doc of your own — refusing to join"
+                );
+            }
+        }
+        if s.get_doc(root_uuid).is_err() {
+            let title = if root_title.is_empty() {
+                "(shared doc)".to_string()
+            } else {
+                root_title.clone()
+            };
+            s.create_doc_with_id(root_uuid, &title, None, owner_contact.principal)?;
+        }
+        let perm = grimoire_store::SharePermission::parse(&permission)
+            .unwrap_or(grimoire_store::SharePermission::View);
+        // the same root from a different node = EITHER the owner changed identity
+        // (re-install, restored keychain — the old pubkey will never answer
+        // again: revoke that contact so the loops stop dialing it, and say so)
+        // OR a peer naming someone else's root to capture their mirror. 0.7.2:
+        // rebinding needs a person's action (`JoinOrigin::Interactive` — they
+        // pasted the link or accepted the request); an automatic join naming a
+        // root held from another contact is refused, typed, and logged.
+        let owner_changed_from = match s.get_mirror(root_uuid)? {
+            Some(m) if m.owner != owner_contact.id => {
+                let old = s
+                    .list_contacts()?
+                    .into_iter()
+                    .find(|c| c.id == m.owner);
+                let old_name = old
+                    .as_ref()
+                    .map(|c| c.petname.clone())
+                    .unwrap_or_else(|| "another contact".into());
+                if origin != JoinOrigin::Interactive {
+                    tracing::warn!(
+                        root = %root_uuid,
+                        held_from = old_name,
+                        claimed_by = owner_contact.petname,
+                        ?origin,
+                        "share root belongs to a mirror from another contact; refusing to rebind it"
+                    );
+                    return Err(Refusal::new(
+                        RefusalCode::RootConflict,
+                        format!(
+                            "share root {root_uuid} belongs to a mirror from {old_name}; not rebinding it to {}",
+                            owner_contact.petname
+                        ),
+                    )
+                    .into());
+                }
+                if let Some(old) = &old {
+                    s.revoke_contact(old.id)?;
+                    tracing::warn!(
+                        root = %root_uuid,
+                        old = old.petname,
+                        new = owner_contact.petname,
+                        "share root re-joined from a new node: owner changed identity; old contact revoked"
+                    );
+                }
+                old.map(|c| c.petname)
+            }
+            _ => None,
         };
-        s.create_doc_with_id(root_uuid, &title, None, owner_contact.principal)?;
-    }
-    let perm = grimoire_store::SharePermission::parse(&permission)
-        .unwrap_or(grimoire_store::SharePermission::View);
-    // the same root from a different node = EITHER the owner changed identity
-    // (re-install, restored keychain — the old pubkey will never answer
-    // again: revoke that contact so the loops stop dialing it, and say so)
-    // OR a peer naming someone else's root to capture their mirror. 0.7.2:
-    // rebinding needs a person's action (`JoinOrigin::Interactive` — they
-    // pasted the link or accepted the request); an automatic join naming a
-    // root held from another contact is refused, typed, and logged.
-    let owner_changed_from = match s.get_mirror(root_uuid)? {
-        Some(m) if m.owner != owner_contact.id => {
-            let old = s
-                .list_contacts()?
-                .into_iter()
-                .find(|c| c.id == m.owner);
-            let old_name = old
-                .as_ref()
-                .map(|c| c.petname.clone())
-                .unwrap_or_else(|| "another contact".into());
-            if origin != JoinOrigin::Interactive {
-                tracing::warn!(
-                    root = %root_uuid,
-                    held_from = old_name,
-                    claimed_by = owner_contact.petname,
-                    ?origin,
-                    "share root belongs to a mirror from another contact; refusing to rebind it"
-                );
-                return Err(Refusal::new(
-                    RefusalCode::RootConflict,
-                    format!(
-                        "share root {root_uuid} belongs to a mirror from {old_name}; not rebinding it to {}",
-                        owner_contact.petname
-                    ),
-                )
-                .into());
-            }
-            if let Some(old) = &old {
-                s.revoke_contact(old.id)?;
-                tracing::warn!(
-                    root = %root_uuid,
-                    old = old.petname,
-                    new = owner_contact.petname,
-                    "share root re-joined from a new node: owner changed identity; old contact revoked"
-                );
-            }
-            old.map(|c| c.petname)
-        }
-        _ => None,
-    };
-    s.upsert_mirror(root_uuid, owner_contact.id, share_uuid, 0, perm)?;
-    tracing::info!(
-        owner = ticket.node,
-        root = root_doc,
-        permission,
-        "joined share"
-    );
-    Ok(JoinOutcome {
-        owner: ticket.node.clone(),
-        owner_name,
-        root_doc,
-        root_title,
-        permission,
-        owner_changed_from,
-        is_hub,
-        membership,
+        s.upsert_mirror(root_uuid, owner_contact.id, share_uuid, 0, perm)?;
+        tracing::info!(
+            owner = ticket.node,
+            root = root_doc,
+            permission,
+            "joined share"
+        );
+        Ok(JoinOutcome {
+            owner: ticket.node.clone(),
+            owner_name,
+            root_doc,
+            root_title,
+            permission,
+            owner_changed_from,
+            is_hub,
+            membership,
+        })
     })
+    .await
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -602,14 +599,14 @@ async fn pull_page(
     owner: &grimoire_store::Contact,
     share_id: uuid::Uuid,
 ) -> Result<(PullSummary, bool)> {
-    let cursors: Vec<(String, i64)> = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
-        s.list_mirrors()?
+    let cursors: Vec<(String, i64)> = with_store(store, move |s| -> Result<_> {
+        Ok(s.list_mirrors()?
             .into_iter()
             .filter(|m| m.share_id == share_id)
             .map(|m| (m.doc_id.to_string(), m.synced_epoch))
-            .collect()
-    };
+            .collect())
+    })
+    .await?;
     let res = request(
         endpoint,
         addr,
@@ -632,206 +629,209 @@ async fn pull_page(
         other => anyhow::bail!("owner refused pull: {other:?}"),
     };
 
-    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+    let owner = owner.clone();
+    with_store(store, move |s| -> Result<(PullSummary, bool)> {
 
-    // 0. the hijack guard: any id the owner names that is one of MY LIVE docs
-    // (exists locally, not a mirror, not a tombstone) is ignored in every
-    // step below. Tombstones are leftovers of a mirror we dropped when a
-    // share was revoked — those REVIVE (step 0b), they don't collide.
-    let foreign_ids: std::collections::HashSet<String> = metas
-        .iter()
-        .map(|m| m.id.as_str())
-        .chain(changed.iter().map(|wd| wd.meta.id.as_str()))
-        .filter(|id| {
-            id.parse::<uuid::Uuid>().ok().is_some_and(|u| {
-                s.get_doc(u).is_ok()
-                    && s.get_mirror(u).ok().flatten().is_none()
-                    && !s.doc_is_tombstoned(u).unwrap_or(false)
+        // 0. the hijack guard: any id the owner names that is one of MY LIVE docs
+        // (exists locally, not a mirror, not a tombstone) is ignored in every
+        // step below. Tombstones are leftovers of a mirror we dropped when a
+        // share was revoked — those REVIVE (step 0b), they don't collide.
+        let foreign_ids: std::collections::HashSet<String> = metas
+            .iter()
+            .map(|m| m.id.as_str())
+            .chain(changed.iter().map(|wd| wd.meta.id.as_str()))
+            .filter(|id| {
+                id.parse::<uuid::Uuid>().ok().is_some_and(|u| {
+                    s.get_doc(u).is_ok()
+                        && s.get_mirror(u).ok().flatten().is_none()
+                        && !s.doc_is_tombstoned(u).unwrap_or(false)
+                })
             })
-        })
-        .map(str::to_string)
-        .collect();
-    // 0b. revive tombstoned docs the owner still shares (a re-granted share)
-    for m in &metas {
-        if let Ok(u) = m.id.parse::<uuid::Uuid>()
-            && !foreign_ids.contains(&m.id)
-            && s.get_doc(u).is_ok()
-            && s.doc_is_tombstoned(u).unwrap_or(false)
-        {
-            s.undelete_doc(u)?;
-            tracing::info!(doc = %u, "revived tombstoned mirror doc on pull");
-        }
-    }
-    for id in &foreign_ids {
-        tracing::warn!(doc = %id, owner = %owner.pubkey, "owner named one of OUR docs; ignored");
-    }
-    let changed: Vec<&WireDoc> = changed
-        .iter()
-        .filter(|wd| !foreign_ids.contains(&wd.meta.id))
-        .collect();
-    let metas: Vec<_> = metas
-        .iter()
-        .filter(|m| !foreign_ids.contains(&m.id))
-        .collect();
-    let summary = PullSummary {
-        changed: changed.len(),
-        removed: removed.len(),
-    };
-
-    // 0c. 0.7.2: a parent the owner names is honoured only if it is inside
-    // THIS share (an id in this response, or already a mirror of this
-    // share). Anything else — the grantee's own doc, another share's doc —
-    // would let the owner file their docs inside the grantee's tree; such a
-    // doc goes under the share root instead, with a warning.
-    let in_share: std::collections::HashSet<uuid::Uuid> = metas
-        .iter()
-        .filter_map(|m| m.id.parse().ok())
-        .chain(changed.iter().filter_map(|wd| wd.meta.id.parse().ok()))
-        .chain(
-            s.list_mirrors()?
-                .into_iter()
-                .filter(|m| m.share_id == share_id)
-                .map(|m| m.doc_id),
-        )
-        .collect();
-    let share_root: Option<uuid::Uuid> = metas
-        .iter()
-        .find(|m| m.parent.is_none())
-        .and_then(|m| m.id.parse().ok())
-        .or_else(|| {
-            s.list_mirrors().ok()?.into_iter().find(|m| m.share_id == share_id && {
-                s.get_doc(m.doc_id).ok().is_some_and(|d| !d.parent_id.is_some_and(|p| in_share.contains(&p)))
-            }).map(|m| m.doc_id)
-        });
-    let sanitize_parent = |id: uuid::Uuid, wire_parent: Option<&String>| -> Option<uuid::Uuid> {
-        let p: uuid::Uuid = wire_parent.and_then(|p| p.parse().ok())?;
-        if in_share.contains(&p) {
-            return Some(p);
-        }
-        tracing::warn!(
-            doc = %id,
-            parent = %p,
-            owner = %owner.pubkey,
-            "owner named a parent outside the share; filing the doc under the share root"
-        );
-        share_root.filter(|r| *r != id)
-    };
-
-    // 1. create any docs we've never seen, parents before children
-    let mut pending: Vec<&WireDoc> = changed.clone();
-    while !pending.is_empty() {
-        let before = pending.len();
-        pending.retain(|wd| {
-            let id: uuid::Uuid = match wd.meta.id.parse() {
-                Ok(u) => u,
-                Err(_) => return false, // malformed: drop
-            };
-            if s.get_doc(id).is_ok() {
-                return false; // exists
-            }
-            let parent = sanitize_parent(id, wd.meta.parent.as_ref());
-            // parent not materialized yet → retry next round
-            if let Some(p) = parent
-                && s.get_doc(p).is_err()
+            .map(str::to_string)
+            .collect();
+        // 0b. revive tombstoned docs the owner still shares (a re-granted share)
+        for m in &metas {
+            if let Ok(u) = m.id.parse::<uuid::Uuid>()
+                && !foreign_ids.contains(&m.id)
+                && s.get_doc(u).is_ok()
+                && s.doc_is_tombstoned(u).unwrap_or(false)
             {
-                return true;
+                s.undelete_doc(u)?;
+                tracing::info!(doc = %u, "revived tombstoned mirror doc on pull");
             }
-            s.create_doc_with_id(id, &wd.meta.title, parent, owner.principal)
-                .is_err()
-        });
-        if pending.len() == before {
-            // cycle or missing parent that never arrives: root the rest
-            for wd in pending.drain(..) {
-                if let Ok(id) = wd.meta.id.parse::<uuid::Uuid>()
-                    && s.get_doc(id).is_err()
+        }
+        for id in &foreign_ids {
+            tracing::warn!(doc = %id, owner = %owner.pubkey, "owner named one of OUR docs; ignored");
+        }
+        let changed: Vec<&WireDoc> = changed
+            .iter()
+            .filter(|wd| !foreign_ids.contains(&wd.meta.id))
+            .collect();
+        let metas: Vec<_> = metas
+            .iter()
+            .filter(|m| !foreign_ids.contains(&m.id))
+            .collect();
+        let summary = PullSummary {
+            changed: changed.len(),
+            removed: removed.len(),
+        };
+
+        // 0c. 0.7.2: a parent the owner names is honoured only if it is inside
+        // THIS share (an id in this response, or already a mirror of this
+        // share). Anything else — the grantee's own doc, another share's doc —
+        // would let the owner file their docs inside the grantee's tree; such a
+        // doc goes under the share root instead, with a warning.
+        let in_share: std::collections::HashSet<uuid::Uuid> = metas
+            .iter()
+            .filter_map(|m| m.id.parse().ok())
+            .chain(changed.iter().filter_map(|wd| wd.meta.id.parse().ok()))
+            .chain(
+                s.list_mirrors()?
+                    .into_iter()
+                    .filter(|m| m.share_id == share_id)
+                    .map(|m| m.doc_id),
+            )
+            .collect();
+        let share_root: Option<uuid::Uuid> = metas
+            .iter()
+            .find(|m| m.parent.is_none())
+            .and_then(|m| m.id.parse().ok())
+            .or_else(|| {
+                s.list_mirrors().ok()?.into_iter().find(|m| m.share_id == share_id && {
+                    s.get_doc(m.doc_id).ok().is_some_and(|d| !d.parent_id.is_some_and(|p| in_share.contains(&p)))
+                }).map(|m| m.doc_id)
+            });
+        let sanitize_parent = |id: uuid::Uuid, wire_parent: Option<&String>| -> Option<uuid::Uuid> {
+            let p: uuid::Uuid = wire_parent.and_then(|p| p.parse().ok())?;
+            if in_share.contains(&p) {
+                return Some(p);
+            }
+            tracing::warn!(
+                doc = %id,
+                parent = %p,
+                owner = %owner.pubkey,
+                "owner named a parent outside the share; filing the doc under the share root"
+            );
+            share_root.filter(|r| *r != id)
+        };
+
+        // 1. create any docs we've never seen, parents before children
+        let mut pending: Vec<&WireDoc> = changed.clone();
+        while !pending.is_empty() {
+            let before = pending.len();
+            pending.retain(|wd| {
+                let id: uuid::Uuid = match wd.meta.id.parse() {
+                    Ok(u) => u,
+                    Err(_) => return false, // malformed: drop
+                };
+                if s.get_doc(id).is_ok() {
+                    return false; // exists
+                }
+                let parent = sanitize_parent(id, wd.meta.parent.as_ref());
+                // parent not materialized yet → retry next round
+                if let Some(p) = parent
+                    && s.get_doc(p).is_err()
                 {
-                    s.create_doc_with_id(id, &wd.meta.title, None, owner.principal)
-                        .ok();
+                    return true;
+                }
+                s.create_doc_with_id(id, &wd.meta.title, parent, owner.principal)
+                    .is_err()
+            });
+            if pending.len() == before {
+                // cycle or missing parent that never arrives: root the rest
+                for wd in pending.drain(..) {
+                    if let Ok(id) = wd.meta.id.parse::<uuid::Uuid>()
+                        && s.get_doc(id).is_err()
+                    {
+                        s.create_doc_with_id(id, &wd.meta.title, None, owner.principal)
+                            .ok();
+                    }
                 }
             }
         }
-    }
 
-    // 2. metas: renames and moves don't bump epochs, so reconcile them always.
-    // The share ROOT's parent is the owner's private business (wire parent =
-    // None) — the grantee files the root wherever they like, so its local
-    // parent is never touched; only in-share moves are mirrored.
-    for m in &metas {
-        let Ok(id) = m.id.parse::<uuid::Uuid>() else {
-            continue;
-        };
-        let Ok(local) = s.get_doc(id) else { continue };
-        if local.title != m.title {
-            s.rename_doc(id, &m.title).ok();
+        // 2. metas: renames and moves don't bump epochs, so reconcile them always.
+        // The share ROOT's parent is the owner's private business (wire parent =
+        // None) — the grantee files the root wherever they like, so its local
+        // parent is never touched; only in-share moves are mirrored.
+        for m in &metas {
+            let Ok(id) = m.id.parse::<uuid::Uuid>() else {
+                continue;
+            };
+            let Ok(local) = s.get_doc(id) else { continue };
+            if local.title != m.title {
+                s.rename_doc(id, &m.title).ok();
+            }
+            if m.parent.is_none() {
+                continue; // share root: keep the grantee's filing
+            }
+            let Some(parent) = sanitize_parent(id, m.parent.as_ref()) else {
+                continue; // outside the share and no root to fall back to
+            };
+            if local.parent_id != Some(parent) && s.get_doc(parent).is_ok() {
+                s.move_doc(id, Some(parent), None).ok();
+            }
         }
-        if m.parent.is_none() {
-            continue; // share root: keep the grantee's filing
-        }
-        let Some(parent) = sanitize_parent(id, m.parent.as_ref()) else {
-            continue; // outside the share and no root to fall back to
-        };
-        if local.parent_id != Some(parent) && s.get_doc(parent).is_ok() {
-            s.move_doc(id, Some(parent), None).ok();
-        }
-    }
 
-    // 3. claim a mirror row for EVERY in-share doc (permission from the
-    // share's existing rows) — this is what lets an active share reclaim
-    // docs from a superseded one — then land blocks for what changed
-    let share_perm = s
-        .list_mirrors()?
-        .into_iter()
-        .find(|m| m.share_id == share_id)
-        .map(|m| m.permission)
-        .unwrap_or(grimoire_store::SharePermission::View);
-    let changed_ids: std::collections::HashSet<&str> =
-        changed.iter().map(|wd| wd.meta.id.as_str()).collect();
-    for m in &metas {
-        let Ok(id) = m.id.parse::<uuid::Uuid>() else {
-            continue;
-        };
-        // The cursor only advances when blocks land (mirror_replace_blocks
-        // below). A doc whose meta shipped but whose blocks were paged out
-        // of this response keeps its old cursor so the next page fetches it;
-        // an unchanged doc keeps a cursor the owner already judged current.
-        if s.get_doc(id).is_err() {
-            continue; // never seen and paged out: created when its blocks arrive
+        // 3. claim a mirror row for EVERY in-share doc (permission from the
+        // share's existing rows) — this is what lets an active share reclaim
+        // docs from a superseded one — then land blocks for what changed
+        let share_perm = s
+            .list_mirrors()?
+            .into_iter()
+            .find(|m| m.share_id == share_id)
+            .map(|m| m.permission)
+            .unwrap_or(grimoire_store::SharePermission::View);
+        let changed_ids: std::collections::HashSet<&str> =
+            changed.iter().map(|wd| wd.meta.id.as_str()).collect();
+        for m in &metas {
+            let Ok(id) = m.id.parse::<uuid::Uuid>() else {
+                continue;
+            };
+            // The cursor only advances when blocks land (mirror_replace_blocks
+            // below). A doc whose meta shipped but whose blocks were paged out
+            // of this response keeps its old cursor so the next page fetches it;
+            // an unchanged doc keeps a cursor the owner already judged current.
+            if s.get_doc(id).is_err() {
+                continue; // never seen and paged out: created when its blocks arrive
+            }
+            let cursor = if changed_ids.contains(m.id.as_str()) {
+                0
+            } else {
+                s.get_mirror(id)?.map(|m| m.synced_epoch).unwrap_or(0)
+            };
+            s.upsert_mirror(id, owner.id, share_id, cursor, share_perm)?;
+            // reflect the owner's tend status so the grantee can show it and
+            // refuse to tend the doc locally (one side's agents own it)
+            s.set_mirror_tended(id, m.tended)?;
+            s.set_mirror_owner_epoch(id, m.epoch)?;
+            // hub relay provenance: who really owns this doc (None = the owner we pull from)
+            s.set_mirror_origin(id, m.origin_owner.as_deref(), m.origin_owner_name.as_deref())?;
         }
-        let cursor = if changed_ids.contains(m.id.as_str()) {
-            0
-        } else {
-            s.get_mirror(id)?.map(|m| m.synced_epoch).unwrap_or(0)
-        };
-        s.upsert_mirror(id, owner.id, share_id, cursor, share_perm)?;
-        // reflect the owner's tend status so the grantee can show it and
-        // refuse to tend the doc locally (one side's agents own it)
-        s.set_mirror_tended(id, m.tended)?;
-        s.set_mirror_owner_epoch(id, m.epoch)?;
-        // hub relay provenance: who really owns this doc (None = the owner we pull from)
-        s.set_mirror_origin(id, m.origin_owner.as_deref(), m.origin_owner_name.as_deref())?;
-    }
-    for wd in &changed {
-        let Ok(id) = wd.meta.id.parse::<uuid::Uuid>() else {
-            continue;
-        };
-        // belt and braces: only ever replace blocks of a doc that IS a mirror
-        if s.get_mirror(id)?.is_none() {
-            continue;
+        for wd in &changed {
+            let Ok(id) = wd.meta.id.parse::<uuid::Uuid>() else {
+                continue;
+            };
+            // belt and braces: only ever replace blocks of a doc that IS a mirror
+            if s.get_mirror(id)?.is_none() {
+                continue;
+            }
+            s.mirror_replace_blocks(id, wd.blocks.clone(), wd.meta.epoch, owner.principal)?;
         }
-        s.mirror_replace_blocks(id, wd.blocks.clone(), wd.meta.epoch, owner.principal)?;
-    }
 
-    // 4. docs that left the share: gone from our view, mirror row dropped.
-    // Only mirrors of THIS share are ever deleted here.
-    for id in &removed {
-        if let Ok(u) = id.parse::<uuid::Uuid>()
-            && s.get_mirror(u)?.is_some_and(|m| m.share_id == share_id)
-        {
-            s.remove_mirror(u).ok();
-            s.delete_doc(u).ok();
+        // 4. docs that left the share: gone from our view, mirror row dropped.
+        // Only mirrors of THIS share are ever deleted here.
+        for id in &removed {
+            if let Ok(u) = id.parse::<uuid::Uuid>()
+                && s.get_mirror(u)?.is_some_and(|m| m.share_id == share_id)
+            {
+                s.remove_mirror(u).ok();
+                s.delete_doc(u).ok();
+            }
         }
-    }
-    Ok((summary, more))
+        Ok((summary, more))
+    })
+    .await
 }
 
 /// Ship a local edit of a mirror doc upstream as a proposal (#60). The
@@ -844,8 +844,7 @@ pub async fn propose_upstream(
     ops: Vec<grimoire_store::OpInput>,
     note: &str,
 ) -> Result<uuid::Uuid> {
-    let (mirror, owner) = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+    let (mirror, owner) = with_store(store, move |s| -> Result<_> {
         let mirror = s
             .get_mirror(doc_id)?
             .context("doc is not a mirror — edit it directly")?;
@@ -854,8 +853,9 @@ pub async fn propose_upstream(
             .into_iter()
             .find(|c| c.id == mirror.owner)
             .context("mirror's owner contact is gone")?;
-        (mirror, owner)
-    };
+        Ok((mirror, owner))
+    })
+    .await?;
     let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
     let res = request(
         endpoint,
@@ -878,8 +878,8 @@ pub async fn propose_upstream(
         anyhow::bail!("owner refused proposal: {res:?}");
     };
     let ids: Vec<uuid::Uuid> = op_ids.iter().filter_map(|s| s.parse().ok()).collect();
-    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-    Ok(s.record_outbound_proposal(doc_id, mirror.share_id, owner.id, &ids, note)?)
+    let (share, owner_id, note) = (mirror.share_id, owner.id, note.to_string());
+    with_store(store, move |s| Ok(s.record_outbound_proposal(doc_id, share, owner_id, &ids, &note)?)).await
 }
 
 /// Post a comment on a mirror doc upstream (#64). Applied immediately on the
@@ -891,8 +891,7 @@ pub async fn comment_upstream(
     text: &str,
     reply_to: Option<uuid::Uuid>,
 ) -> Result<String> {
-    let (mirror, owner) = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+    let (mirror, owner) = with_store(store, move |s| -> Result<_> {
         let block = s.read_block(target_block)?;
         let mirror = s
             .get_mirror(block.doc_id)?
@@ -902,8 +901,9 @@ pub async fn comment_upstream(
             .into_iter()
             .find(|c| c.id == mirror.owner)
             .context("mirror's owner contact is gone")?;
-        (mirror, owner)
-    };
+        Ok((mirror, owner))
+    })
+    .await?;
     let owner_id: iroh::EndpointId = owner.pubkey.parse().context("owner pubkey malformed")?;
     let res = request(
         endpoint,
