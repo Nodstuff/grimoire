@@ -45,6 +45,7 @@ describe('resolveShortcut', () => {
   it('a plain letter without a modifier is not a shortcut', () => {
     expect(resolveShortcut({ key: 'n', shiftKey: false, metaKey: false, ctrlKey: false })).toBeNull()
     expect(resolveShortcut({ key: '/', shiftKey: false, metaKey: false, ctrlKey: false })).toBeNull()
+    expect(resolveShortcut({ key: '/', shiftKey: false, metaKey: true, ctrlKey: false })).toBe('ask')
   })
 
   it('shift disambiguates N and R without collision', () => {

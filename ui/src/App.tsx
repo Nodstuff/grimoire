@@ -42,7 +42,7 @@ type View =
   | { kind: 'profile' }
   | { kind: 'trash' }
   | { kind: 'home' }
-type Palette = null | 'commands' | 'open' | 'search' | 'newdoc' | 'newcanvas' | 'help'
+type Palette = null | 'commands' | 'open' | 'search' | 'newdoc' | 'newcanvas' | 'help' | 'ask'
 
 /** How a doc is opened: `anchor` is a [[Doc#fragment]] target (`^uuid` for a
  * block); `review` opens the in-editor review rail; `blockId` scrolls to that
@@ -234,6 +234,9 @@ export default function App() {
           }
           setPalette((p) => (p === 'search' ? null : 'search'))
           break
+        case 'ask':
+          setPalette((p) => (p === 'ask' ? null : 'ask'))
+          break
         case 'tree':
           setTreeOpen((t) => !t)
           break
@@ -404,6 +407,10 @@ export default function App() {
             if (a === 'sharing') setView({ kind: 'sharing' })
             if (a === 'profile') setView({ kind: 'profile' })
             if (a === 'trash') setView({ kind: 'trash' })
+            if (a === 'ask') {
+              setPalette('ask')
+              return
+            }
             if (a === 'tree') setTreeOpen((t) => !t)
             if (a === 'home') setView({ kind: 'home' })
             if (a === 'newdoc') {
@@ -424,6 +431,7 @@ export default function App() {
       )}
       {palette === 'search' && <SearchPalette onOpenDoc={openDoc} onClose={() => setPalette(null)} />}
       {palette === 'help' && <ShortcutHelp onClose={() => setPalette(null)} />}
+      {palette === 'ask' && <AskPalette onOpenDoc={openDoc} onClose={() => setPalette(null)} />}
       {(palette === 'newdoc' || palette === 'newcanvas') && (
         <NewDocPalette
           canvas={palette === 'newcanvas'}
@@ -450,6 +458,7 @@ function ShortcutHelp({ onClose }: { onClose: () => void }) {
         ['⌘K', 'commands'],
         ['⌘O', 'open a doc'],
         ['⌘P', 'search (⌘F too; ⌘S in an editor just confirms autosave)'],
+        ['⌘/', 'ask the vault — an answer doc with block citations'],
         ['⌘T', 'toggle file tree'],
         ['⌘W', 'home'],
         ['⌘[ / ⌘]', 'history back / forward'],
@@ -510,7 +519,7 @@ function CommandPalette({
 }: {
   queueCount: number
   onAction: (
-    a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph' | 'sharing' | 'profile' | 'trash' | 'close',
+    a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph' | 'sharing' | 'profile' | 'trash' | 'close' | 'ask',
   ) => void
   onClose: () => void
 }) {
@@ -528,6 +537,7 @@ function CommandPalette({
     { label: 'Shares & contacts', run: () => onAction('sharing') },
     { label: 'Profile', hint: 'your name, node id, fingerprint', run: () => onAction('profile') },
     { label: 'Graph view', run: () => onAction('graph') },
+    { label: 'Ask the vault…', hint: '⌘/ — an answer with citations', run: () => onAction('ask') },
     { label: 'Trash', hint: 'restore deleted docs', run: () => onAction('trash') },
     {
       label: 'Import a folder of Markdown…',
@@ -659,6 +669,59 @@ function OpenDocPalette({
           </div>
         ))}
         {docs.length === 0 && <div className="palette-empty">no docs yet — ⌘N creates one</div>}
+      </div>
+    </PaletteShell>
+  )
+}
+
+/** Ask the vault (⌘/): a question becomes an answer doc under Answers whose
+ * every claim links [[Doc#^block]]. One round trip; the palette waits. */
+function AskPalette({ onOpenDoc, onClose }: { onOpenDoc: OpenDoc; onClose: () => void }) {
+  const [q, setQ] = useState('')
+  const [busy, setBusy] = useState(false)
+  const inputRef = useRef<HTMLInputElement>(null)
+  useEffect(() => inputRef.current?.focus(), [])
+  const submit = async () => {
+    const question = q.trim()
+    if (!question || busy) return
+    setBusy(true)
+    try {
+      const a = await api<{ doc_id: string | null; title: string; sources: number; docs: number }>('/api/ask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question }),
+      })
+      if (!a.doc_id) {
+        notify('nothing in your notes matches that yet', 'warn')
+        setBusy(false)
+        return
+      }
+      notify(`answered from ${a.sources} block${a.sources === 1 ? '' : 's'} across ${a.docs} doc${a.docs === 1 ? '' : 's'}`, 'ok')
+      onOpenDoc(a.doc_id)
+    } catch (e) {
+      notify(errText(e))
+      setBusy(false)
+    }
+  }
+  return (
+    <PaletteShell onClose={onClose} locked={busy}>
+      <input
+        ref={inputRef}
+        placeholder="Ask your notes a question… every claim in the answer cites the block it came from"
+        value={q}
+        disabled={busy}
+        onChange={(e) => setQ(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault()
+            submit()
+          }
+        }}
+      />
+      <div className="palette-list">
+        <div className="palette-empty">
+          {busy ? '🌿 reading your notes and writing the answer… (up to a minute)' : 'Enter to ask · the answer lands as a doc under Answers'}
+        </div>
       </div>
     </PaletteShell>
   )

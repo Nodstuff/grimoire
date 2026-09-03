@@ -5,6 +5,7 @@
 
 mod admin;
 mod api;
+mod ask;
 mod backup;
 mod fed;
 mod garden;

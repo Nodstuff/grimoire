@@ -1076,6 +1076,23 @@ async fn import_markdown(State(st): State<ApiState>, Json(req): Json<ImportReq>)
     }
 }
 
+#[derive(Deserialize)]
+struct AskReq {
+    question: String,
+}
+
+/// Ask the vault: question → answer doc with block-level citations. Waits
+/// for the model (a minute at most); the UI shows "thinking…" meanwhile.
+async fn ask_vault(State(st): State<ApiState>, Json(req): Json<AskReq>) -> Json<Value> {
+    if crate::garden::claude_bin().is_none() {
+        return Json(json!({"error": "Claude Code is not installed on this Mac — asking the vault needs it", "code": "no_claude"}));
+    }
+    match crate::ask::ask(st.store.clone(), st.human, req.question).await {
+        Ok(a) => Json(json!(a)),
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
 async fn trash(State(st): State<ApiState>) -> Json<Value> {
     let s = st
         .store
@@ -1188,6 +1205,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/backups", get(backups).post(backup_now))
         .route("/api/export_vault", post(export_vault))
         .route("/api/import", post(import_markdown))
+        .route("/api/ask", post(ask_vault))
         .route("/api/doc/{id}/rename", post(rename_doc))
         .route("/api/doc/{id}/tendings", get(tendings))
         .route("/api/doc/{id}/federation", get(doc_federation))

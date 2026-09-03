@@ -16,6 +16,7 @@ export type ShortcutAction =
   | 'back' // ⌘[ — history back
   | 'forward' // ⌘] — history forward
   | 'home' // ⌘W — home
+  | 'ask' // ⌘/ — ask the vault
   | 'help' // ? — shortcut cheatsheet (no modifier; caller ignores it in inputs)
   | 'escape' // Esc — dismiss palette
 
@@ -59,6 +60,8 @@ export function resolveShortcut(e: KeyLike): ShortcutAction | null {
       return 'forward'
     case 'w':
       return 'home'
+    case '/':
+      return 'ask'
     default:
       return null
   }
