@@ -15,6 +15,12 @@ export interface Doc {
   mirror_permission?: 'view' | 'propose'
   /** true when this doc is the root of an active share we own */
   is_shared?: boolean
+  /** hub (slice 1): this mirror comes from a hub (a team folder) */
+  from_hub?: boolean
+  /** hub: relayed doc — the name of its true owner (read-only for now) */
+  origin_owner_name?: string
+  /** hub: this doc (or an ancestor) is published to the named hub */
+  published_to?: string
 }
 
 /* ---------- federation (ADR 0002) ---------- */
@@ -27,6 +33,47 @@ export interface Contact {
   verified: boolean
   revoked: boolean
   paired_at: string
+  /** hub (slice 1): on a hub, the member's role; for a hub contact, MY role there */
+  role?: HubRole
+  membership?: HubMembership
+  /** this contact is a hub (grimoire serve --hub) */
+  is_hub?: boolean
+}
+
+export type HubRole = 'member' | 'admin'
+export type HubMembership = 'pending' | 'active' | 'ejected'
+
+/** GET /admin/hubs — a hub I belong to (local rows; members are fetched on expand). */
+export interface HubRow {
+  contact_id: string
+  name: string
+  pubkey: string
+  role: HubRole
+  membership: HubMembership
+  /** the hub folder in my tree, once I hold it */
+  root_doc_id: string | null
+  /** docs relayed to me for other members */
+  relayed_docs: number
+  /** my subtrees published to this hub (propose shares to the hub contact) */
+  publications: { share_id: string; root_doc: string; root_title: string; doc_count: number; state: string }[]
+}
+
+/** One row of a hub's member list (GET /admin/hubs/members, admins only). */
+export interface HubMember {
+  contact_id: string
+  petname: string
+  pubkey: string
+  role: HubRole
+  membership: HubMembership
+  paired_at: string
+  publications: { share_id: string; root_doc: string; root_title: string; doc_count: number; published_at: string }[]
+}
+
+export interface HubMembersResponse {
+  status: { name: string; role: HubRole; membership: HubMembership; members: number; pending: number }
+  /** null when I am not an admin */
+  members: HubMember[] | null
+  error?: string
 }
 
 export interface Share {
@@ -91,6 +138,9 @@ export interface MirrorRow {
   last_pulled_at?: string | null
   last_error?: string | null
   owner_tended?: boolean
+  /** hub (slice 1): the share is a hub's folder; N docs relayed for other members */
+  from_hub?: boolean
+  relayed_docs?: number
 }
 
 /** GET /api/profile — who this install is to its contacts. */
@@ -143,6 +193,11 @@ export interface DocFederation {
     synced_epoch: number
     /** true when the owner has agents tending their copy */
     owner_tended?: boolean
+    /** hub (slice 1): the share comes from a hub */
+    from_hub?: boolean
+    /** hub: relayed doc — its true owner (pubkey + name); read-only in this slice */
+    origin_owner?: string | null
+    origin_owner_name?: string | null
   } | null
   shares: {
     id: string
@@ -151,6 +206,8 @@ export interface DocFederation {
     state: string
     petname: string | null
     trust: ShareTrust
+    /** hub: this share publishes the subtree to a hub */
+    to_hub?: boolean
   }[]
   outbound: OutboundProposal[]
 }

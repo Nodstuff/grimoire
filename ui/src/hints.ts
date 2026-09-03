@@ -13,6 +13,8 @@ export function refusalHint(raw: string | null | undefined): string | null {
     return 'this link is no longer valid — ask for a fresh one'
   }
   if (s.includes('did not accept the request')) return 'their Grimoire refused the request — they may need to unblock you'
+  if (s.includes('waiting for an admin')) return 'your request to join is waiting for a hub admin'
+  if (s.includes('not the hub (coming soon)')) return 'this doc is owned by another member — read-only through the hub for now'
   if (s.includes('timed out') || s.includes('unreachable') || s.includes('offline')) {
     return 'the owner’s Mac is offline or unreachable — will keep trying'
   }
@@ -49,6 +51,9 @@ export function proposeErrorText(e: unknown): string {
   }
   if (/revoked|view-only|unknown peer/i.test(raw)) {
     return 'not sent: you no longer have permission to suggest changes to this doc'
+  }
+  if (/not the hub \(coming soon\)/i.test(raw)) {
+    return 'not sent: this doc is owned by another member — the hub cannot take edits for them yet'
   }
   return `not sent: ${raw}`
 }

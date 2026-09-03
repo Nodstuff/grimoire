@@ -154,6 +154,18 @@ enum Cmd {
     Serve {
         #[arg(long, default_value_t = 7425)]
         port: u16,
+        /// Run as a hub: a team Grimoire members join, publish to, and read
+        /// from. Persisted — later plain `serve` runs stay a hub.
+        #[arg(long)]
+        hub: bool,
+        /// The hub's name (its root folder and the name members see).
+        #[arg(long, requires = "hub")]
+        name: Option<String>,
+    },
+    /// Hub administration on the hub box (talks to the running daemon).
+    Hub {
+        #[command(subcommand)]
+        cmd: HubCmd,
     },
     /// Show the instance's federation identity (ADR 0002); export/import
     /// move it between machines.
@@ -193,6 +205,20 @@ enum ShareCmd {
         share_id: String,
         trust: String,
     },
+}
+
+#[derive(Subcommand)]
+enum HubCmd {
+    /// List members and pending requests.
+    Members,
+    /// Approve a pending member (offers them the hub folder).
+    Approve { contact_id: String },
+    /// Remove a member: their publications and access go, and they are blocked.
+    Eject { contact_id: String },
+    /// Set a member's role: member | admin.
+    Role { contact_id: String, role: String },
+    /// Mint a one-time invite link to the hub (7-day validity).
+    Invite,
 }
 
 #[derive(Subcommand)]
@@ -534,8 +560,64 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Serve { port } => {
+        Cmd::Hub { cmd } => {
+            let client = admin_client(&cli.db, Some(std::time::Duration::from_secs(30)))?;
+            let base = "http://127.0.0.1:7425";
+            let text = match cmd {
+                HubCmd::Members => client.get(format!("{base}/admin/hub/members")).send().await?.text().await?,
+                HubCmd::Approve { contact_id } => {
+                    client
+                        .post(format!("{base}/admin/hub/approve"))
+                        .json(&serde_json::json!({"contact_id": contact_id}))
+                        .send()
+                        .await?
+                        .text()
+                        .await?
+                }
+                HubCmd::Eject { contact_id } => {
+                    client
+                        .post(format!("{base}/admin/hub/eject"))
+                        .json(&serde_json::json!({"contact_id": contact_id}))
+                        .send()
+                        .await?
+                        .text()
+                        .await?
+                }
+                HubCmd::Role { contact_id, role } => {
+                    client
+                        .post(format!("{base}/admin/hub/role"))
+                        .json(&serde_json::json!({"contact_id": contact_id, "role": role}))
+                        .send()
+                        .await?
+                        .text()
+                        .await?
+                }
+                HubCmd::Invite => {
+                    let v: serde_json::Value = client
+                        .post(format!("{base}/admin/hub/invite"))
+                        .send()
+                        .await?
+                        .json()
+                        .await?;
+                    match v.get("link").and_then(|l| l.as_str()) {
+                        Some(link) => format!("{link}\n(one-time, expires in 7 days — the first person to join becomes admin)"),
+                        None => v.to_string(),
+                    }
+                }
+            };
+            println!("{text}");
+        }
+        Cmd::Serve { port, hub, name } => {
             let mut store = store;
+            // hub mode (slice 1): persisted; `--hub` turns it on (and renames)
+            if hub {
+                let cfg = fed::hub::enable(&mut store, name.as_deref(), tom).context("enabling hub mode")?;
+                tracing::info!(name = cfg.name, root = %cfg.root_doc, "hub mode enabled");
+            }
+            let hub_mode = fed::hub::config(&store);
+            if let Some(h) = &hub_mode {
+                tracing::info!(name = h.name, "serving as a hub: gardener schedule and memory sync are off");
+            }
             // federation identity: minted silently on first serve, linked to
             // the human principal so provenance and pubkey agree (#54)
             let db_dir = cli.db.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
@@ -620,12 +702,15 @@ async fn main() -> anyhow::Result<()> {
             };
             let admin_token = admin::AdminToken::mint(&db_dir)
                 .context("minting admin token")?;
-            tokio::spawn(admin::daily_loop(store.clone(), hot.clone()));
+            // a hub has no gardeners to schedule and no Claude memory to mirror
+            if hub_mode.is_none() {
+                tokio::spawn(admin::daily_loop(store.clone(), hot.clone()));
+                // Claude Code's per-project memory → `Claude Memory` docs, kept in
+                // sync through the gate (changed memories arrive as reviewable)
+                tokio::spawn(memory::memory_loop(store.clone(), tom));
+            }
             // daily self-contained db snapshot beside the db (backups/), keep 7
             tokio::spawn(backup::backup_loop(store.clone(), cli.db.clone()));
-            // Claude Code's per-project memory → `Claude Memory` docs, kept in
-            // sync through the gate (changed memories arrive as reviewable)
-            tokio::spawn(memory::memory_loop(store.clone(), tom));
             // block embeddings (ask the vault): model compiled in, index kept
             // current block-by-block; a load failure degrades to keyword search
             let embedder = match embed::Embedder::load() {

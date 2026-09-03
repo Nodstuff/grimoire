@@ -112,3 +112,16 @@ describe('invites v2 seams', () => {
     expect(chipText(2, 2)).toBe('2 to review · 2 share requests')
   })
 })
+
+describe('hub lines', () => {
+  it('says where I stand at a hub', async () => {
+    const { hubStandingLine, publishedLine, relayedLine } = await import('./shares')
+    expect(hubStandingLine('member', 'pending')).toBe('waiting for an admin to approve you')
+    expect(hubStandingLine('admin', 'pending')).toBe('waiting for an admin to approve you')
+    expect(hubStandingLine('member', 'active')).toBe('you are a member')
+    expect(hubStandingLine('admin', 'active')).toBe('you are an admin')
+    expect(hubStandingLine('member', 'ejected')).toBe('you were removed')
+    expect(publishedLine('Team', 2)).toBe('published to Team: 2')
+    expect(relayedLine('Team', 'alice')).toBe('⌂ Team · owned by alice · read-only for now')
+  })
+})

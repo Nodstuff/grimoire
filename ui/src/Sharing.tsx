@@ -6,11 +6,11 @@
 // share lives here.
 
 import { useCallback, useEffect, useState } from 'react'
-import { ActivityItem, api, Contact, Doc, MirrorRow, Neighbour, PendingJoin, Profile, Share, ShareOffer } from './types'
+import { ActivityItem, api, Contact, Doc, HubMember, HubMembersResponse, HubRow, MirrorRow, Neighbour, PendingJoin, Profile, Share, ShareOffer } from './types'
 import { errText, notify } from './Notice'
 import { InviteLink, mintInvite, TrustControl } from './SharePanel'
 import { EventsResponse, LiveEvent, mergeActivity } from './live'
-import { groupShares, mirrorStatusLine, offerLine, shareTitle, shareWho, shortFingerprint } from './shares'
+import { groupShares, hubStandingLine, mirrorStatusLine, offerLine, publishedLine, shareTitle, shareWho, shortFingerprint } from './shares'
 import { relTime } from './time'
 import { refusalHint } from './hints'
 import { loadProfile } from './Profile'
@@ -95,6 +95,8 @@ export default function Sharing({
   const [joins, setJoins] = useState<PendingJoin[]>([])
   const [offers, setOffers] = useState<ShareOffer[]>([])
   const [neighbours, setNeighbours] = useState<Neighbour[]>([])
+  // hubs I belong to (local rows; members fetched when a card is expanded)
+  const [hubs, setHubs] = useState<HubRow[]>([])
   const [offerBusy, setOfferBusy] = useState<string | null>(null)
   const [activity, setActivity] = useState<ActivityItem[]>([])
   const [events, setEvents] = useState<LiveEvent[]>([])
@@ -122,6 +124,7 @@ export default function Sharing({
     // invites v2: requests to join someone's share, and Grimoires nearby
     api<ShareOffer[]>('/admin/offers').then((o) => setOffers(Array.isArray(o) ? o : [])).catch(() => setOffers([]))
     api<Neighbour[]>('/admin/neighbours').then((n) => setNeighbours(Array.isArray(n) ? n : [])).catch(() => setNeighbours([]))
+    api<HubRow[]>('/admin/hubs').then((h) => setHubs(Array.isArray(h) ? h : [])).catch(() => setHubs([]))
     api<ActivityItem[]>('/api/activity?limit=20')
       .then((a) => setActivity(Array.isArray(a) ? a : []))
       .catch(() => setActivity([]))
@@ -150,10 +153,11 @@ export default function Sharing({
     setJoinMsg('connecting to owner…')
     try {
       const r = await api<{
-        joined?: { root_title: string; owner_name: string; permission: string; root_doc: string }
+        joined?: { root_title: string; owner_name: string; permission: string; root_doc: string; is_hub?: boolean; membership?: string }
         docs?: number
         pull_error?: string
         queued?: boolean
+        pending?: boolean
       }>(
         '/admin/join',
         {
@@ -162,7 +166,10 @@ export default function Sharing({
           body: JSON.stringify({ link }),
         },
       )
-      if (r.joined) {
+      if (r.joined && r.pending) {
+        setJoinMsg(`asked to join ${r.joined.owner_name} — an admin has to approve you; the team folder arrives as a share request`)
+        setJoinLink('')
+      } else if (r.joined) {
         // the daemon pulls the tree before answering, so we can say how much arrived
         const got =
           typeof r.docs === 'number'
@@ -355,6 +362,16 @@ export default function Sharing({
           </div>
         )}
       </div>
+
+      {/* ---- hubs: GET /admin/hubs (members on expand, never polled) ---- */}
+      {hubs.length > 0 && (
+        <>
+          <h2 className="runs-title">hubs</h2>
+          {hubs.map((h) => (
+            <HubCard key={h.contact_id} hub={h} onOpenDoc={onOpenDoc} onChanged={load} now={now} />
+          ))}
+        </>
+      )}
 
       {/* ---- shared by me: GET /admin/shares ---- */}
       <h2 className="runs-title">shared by me</h2>
@@ -589,6 +606,211 @@ function ContactRow({ c, onChanged }: { c: Contact; onChanged: () => void }) {
           </span>
         )}
       </div>
+    </div>
+  )
+}
+
+/** One hub I belong to: my standing, what I published (with unpublish), and —
+ * once expanded — the member list (approve / eject for admins). */
+function HubCard({
+  hub,
+  onOpenDoc,
+  onChanged,
+  now,
+}: {
+  hub: HubRow
+  onOpenDoc: (id: string) => void
+  onChanged: () => void
+  now: number
+}) {
+  const [open, setOpen] = useState(false)
+  const [members, setMembers] = useState<HubMember[] | null | undefined>(undefined)
+  const [status, setStatus] = useState<HubMembersResponse['status'] | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [invite, setInvite] = useState<string | null>(null)
+
+  const fetchMembers = () => {
+    setErr(null)
+    api<HubMembersResponse>(`/admin/hubs/members?hub=${hub.contact_id}`)
+      .then((r) => {
+        setStatus(r.status)
+        setMembers(r.members)
+        if (r.error) setErr(r.error)
+      })
+      .catch((e) => {
+        setErr(errText(e))
+        setMembers(null)
+      })
+  }
+  const toggle = () => {
+    const next = !open
+    setOpen(next)
+    if (next && members === undefined) fetchMembers()
+  }
+  const act = (path: string, body: unknown, okMsg: string, key: string) => {
+    if (busy) return
+    setBusy(key)
+    post(path, body)
+      .then(() => {
+        notify(okMsg, 'ok')
+        fetchMembers()
+        onChanged()
+      }, (e) => notify(errText(e)))
+      .finally(() => setBusy(null))
+  }
+  const mintInviteLink = () => {
+    if (busy) return
+    setBusy('invite')
+    api<{ link?: string }>('/admin/hubs/invite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hub: hub.contact_id }),
+    })
+      .then((r) => setInvite(r.link ?? null), (e) => notify(errText(e)))
+      .finally(() => setBusy(null))
+  }
+
+  const role = status?.role ?? hub.role
+  const membership = status?.membership ?? hub.membership
+  const isAdmin = role === 'admin' && membership === 'active'
+  const pending = (members ?? []).filter((m) => m.membership === 'pending')
+  const active = (members ?? []).filter((m) => m.membership === 'active')
+
+  return (
+    <div className="card share-card hub-card">
+      <div className="card-head">
+        <span className="hub-mark" title="a hub: a team Grimoire">⌂</span>
+        {hub.root_doc_id ? (
+          <span className="card-doc" onClick={() => onOpenDoc(hub.root_doc_id!)}>
+            {hub.name}
+          </span>
+        ) : (
+          <span>{hub.name}</span>
+        )}
+        <span className="meta">{hubStandingLine(role, membership)}</span>
+        {hub.relayed_docs > 0 && (
+          <span className="meta" title="docs other members published, relayed to you">
+            {hub.relayed_docs} relayed doc{hub.relayed_docs === 1 ? '' : 's'}
+          </span>
+        )}
+        <span className="gardener-actions">
+          {membership === 'active' && (
+            <button className="chip" onClick={toggle}>
+              {open ? '▾ members' : '▸ members'}
+            </button>
+          )}
+        </span>
+      </div>
+      {hub.publications.length > 0 && (
+        <div className="hub-pubs">
+          <div className="meta">{publishedLine(hub.name, hub.publications.length)}</div>
+          {hub.publications.map((p) => (
+            <div key={p.share_id} className="share-row">
+              <span className="card-doc" onClick={() => onOpenDoc(p.root_doc)}>
+                {p.root_title || '(untitled)'}
+              </span>
+              <span className="meta">
+                {p.doc_count} doc{p.doc_count === 1 ? '' : 's'}
+                {p.state === 'offered' ? ' · sending…' : ''}
+              </span>
+              <ArmedButton
+                label="unpublish"
+                title={`stop publishing this subtree to ${hub.name} — members lose it on their next sync`}
+                onFire={() => act('/admin/shares/revoke', { id: p.share_id }, `unpublished “${p.root_title}”`, p.share_id)}
+              />
+            </div>
+          ))}
+        </div>
+      )}
+      {open && (
+        <div className="hub-members">
+          {err && <div className="meta err">{err}</div>}
+          {members === undefined && !err && <div className="meta">asking {hub.name}…</div>}
+          {members === null && !err && status && (
+            <div className="meta">
+              {status.members} member{status.members === 1 ? '' : 's'}
+              {status.pending > 0 ? ` · ${status.pending} waiting` : ''} — only admins see who
+            </div>
+          )}
+          {members && (
+            <>
+              {pending.length > 0 && (
+                <>
+                  <div className="meta">waiting to join</div>
+                  {pending.map((m) => (
+                    <div key={m.contact_id} className="share-row">
+                      <span>{m.petname}</span>
+                      <span className="meta mono" title={m.pubkey}>{shortFingerprint(m.pubkey)}</span>
+                      <span className="meta">asked {relTime(m.paired_at, now)}</span>
+                      {isAdmin && (
+                        <>
+                          <button
+                            className="accept"
+                            disabled={!!busy}
+                            onClick={() => act('/admin/hubs/approve', { hub: hub.contact_id, contact_id: m.contact_id }, `${m.petname} approved — ${hub.name} is being sent to them`, m.contact_id)}
+                          >
+                            {busy === m.contact_id ? 'approving…' : 'approve'}
+                          </button>
+                          <ArmedButton
+                            label="reject"
+                            onFire={() => act('/admin/hubs/eject', { hub: hub.contact_id, contact_id: m.contact_id }, `${m.petname} rejected`, m.contact_id)}
+                          />
+                        </>
+                      )}
+                    </div>
+                  ))}
+                </>
+              )}
+              <div className="meta">members</div>
+              {active.map((m) => (
+                <div key={m.contact_id} className="share-row">
+                  <span>{m.petname}</span>
+                  <span className="meta mono" title={m.pubkey}>{shortFingerprint(m.pubkey)}</span>
+                  {m.role === 'admin' && <span className="badge state-active">admin</span>}
+                  {m.publications.length > 0 && (
+                    <span className="meta">
+                      published {m.publications.length}: {m.publications.map((p) => p.root_title).join(', ')}
+                    </span>
+                  )}
+                  {isAdmin && (
+                    <span className="gardener-actions">
+                      <button
+                        className="chip"
+                        disabled={!!busy}
+                        title={m.role === 'admin' ? 'make a plain member' : 'make an admin (can approve and remove members)'}
+                        onClick={() =>
+                          act(
+                            '/admin/hubs/role',
+                            { hub: hub.contact_id, contact_id: m.contact_id, role: m.role === 'admin' ? 'member' : 'admin' },
+                            `${m.petname} is now ${m.role === 'admin' ? 'a member' : 'an admin'}`,
+                            m.contact_id,
+                          )
+                        }
+                      >
+                        {m.role === 'admin' ? 'make member' : 'make admin'}
+                      </button>
+                      <ArmedButton
+                        label="remove"
+                        title={`remove ${m.petname} from ${hub.name}: their published docs go, and they cannot rejoin until unblocked on the hub`}
+                        onFire={() => act('/admin/hubs/eject', { hub: hub.contact_id, contact_id: m.contact_id }, `${m.petname} removed`, m.contact_id)}
+                      />
+                    </span>
+                  )}
+                </div>
+              ))}
+              {isAdmin && (
+                <div className="hub-invite">
+                  <button className="chip" disabled={!!busy} onClick={mintInviteLink}>
+                    invite someone
+                  </button>
+                  {invite && <InviteLink link={invite} />}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
     </div>
   )
 }

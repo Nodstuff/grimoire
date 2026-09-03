@@ -1103,10 +1103,21 @@ function DocTreeNav({
             </span>
             <span className="tree-title">{d.title}</span>
             {d.is_tended && <span className="tend-dot" title="tended by agents" />}
-            {d.mirror_permission && (
+            {d.mirror_permission && !d.from_hub && (
               <span className="mirror-badge" title={`shared with you (${d.mirror_permission})`}>⇄</span>
             )}
-            {d.is_shared && <span className="shared-badge" title="you share this subtree">↗</span>}
+            {d.from_hub && (
+              <span
+                className="mirror-badge hub"
+                title={d.origin_owner_name ? `relayed by the hub · owned by ${d.origin_owner_name}` : 'a hub folder'}
+              >
+                ⌂
+              </span>
+            )}
+            {d.is_shared && !d.published_to && <span className="shared-badge" title="you share this subtree">↗</span>}
+            {d.published_to && !d.mirror_permission && (
+              <span className="shared-badge hub" title={`published to ${d.published_to}`}>⌂</span>
+            )}
             {!d.mirror_permission && (
             <button
               className={`tree-delete ${armed === d.id ? 'armed' : ''}`}
@@ -1707,12 +1718,20 @@ function DocView({
   const mirror = fed?.mirror ?? null
   mirrorRef.current = mirror
   const pendingProposals = (fed?.outbound ?? []).filter((o) => o.state === 'pending')
+  // hub (slice 1): this doc is inside a subtree published to a hub
+  const publishedHub = fed?.shares.find((s) => s.to_hub && s.state === 'active')?.petname ?? null
 
   return (
     <article className="doc" onClick={onStageClick}>
-      {mirror && (
+      {mirror && mirror.origin_owner_name && (
         <div className="mirror-banner">
-          ⇄ shared by <b>{mirror.owner_petname}</b>
+          ⌂ <b>{mirror.owner_petname}</b> · owned by <b>{mirror.origin_owner_name}</b> · read-only for now — edits to their docs will
+          reach them in a coming release
+        </div>
+      )}
+      {mirror && !mirror.origin_owner_name && (
+        <div className="mirror-banner">
+          {mirror.from_hub ? '⌂' : '⇄'} shared by <b>{mirror.owner_petname}</b>
           {mirror.permission === 'view'
             ? ' · view only'
             : ' · your edits go to them as suggestions'}
@@ -1753,11 +1772,12 @@ function DocView({
             <button
               className={`chip ${panel === 'share' ? 'on' : ''} ${(fed?.shares.length ?? 0) > 0 ? 'shared' : ''}`}
               onClick={() => setPanel(panel === 'share' ? 'none' : 'share')}
+              title={publishedHub ? `published to ${publishedHub}` : undefined}
             >
-              {(fed?.shares.length ?? 0) > 0 ? '↗ shared' : 'share'}
+              {publishedHub ? `⌂ published to ${publishedHub}` : (fed?.shares.length ?? 0) > 0 ? '↗ shared' : 'share'}
             </button>
           )}
-          {!hot && editable && (!mirror || mirror.permission === 'propose') && (
+          {!hot && editable && (!mirror || (mirror.permission === 'propose' && !mirror.origin_owner_name)) && (
             <button
               className="chip"
               title="start a live co-editing session"
@@ -1843,7 +1863,8 @@ function DocView({
         key={`${docId}:${editorGen}`}
         doc={editable}
         reviewMap={highlightMap}
-        mode={mirror ? (mirror.permission === 'propose' ? 'propose' : 'readonly') : 'direct'}
+        // a doc relayed through a hub is read-only in this slice whatever the share says
+        mode={mirror ? (mirror.permission === 'propose' && !mirror.origin_owner_name ? 'propose' : 'readonly') : 'direct'}
         onSaved={(e) => {
           ownEpoch.current = Math.max(ownEpoch.current, e)
         }}

@@ -530,6 +530,87 @@ pub struct Contact {
     pub verified: bool,
     pub revoked: bool,
     pub paired_at: String,
+    /// Hub membership (slice 1). On a HUB these describe the contact as a
+    /// member; on a member's own instance, for a contact that `is_hub`, they
+    /// describe MY standing at that hub (copied from the hub's answers).
+    /// Plain peer-to-peer contacts sit at the defaults (member, active).
+    #[serde(default)]
+    pub role: ContactRole,
+    #[serde(default)]
+    pub membership: Membership,
+    /// This contact is a hub (`grimoire serve --hub`): its shares are team
+    /// folders, relayed docs under them carry an origin owner.
+    #[serde(default)]
+    pub is_hub: bool,
+}
+
+/// A hub member's role. Admins approve joins, eject, and change roles — over
+/// the wire, so an admin never needs the hub's own UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContactRole {
+    #[default]
+    Member,
+    Admin,
+}
+
+impl ContactRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContactRole::Member => "member",
+            ContactRole::Admin => "admin",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "member" => Some(ContactRole::Member),
+            "admin" => Some(ContactRole::Admin),
+            _ => None,
+        }
+    }
+}
+
+/// Where a contact stands with a hub: pending = redeemed an invite, waiting
+/// for an admin; active = full member; ejected = removed by an admin (the
+/// contact is also blocked, so a fresh invite is refused until unblocked).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Membership {
+    Pending,
+    #[default]
+    Active,
+    Ejected,
+}
+
+impl Membership {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Membership::Pending => "pending",
+            Membership::Active => "active",
+            Membership::Ejected => "ejected",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Membership::Pending),
+            "active" => Some(Membership::Active),
+            "ejected" => Some(Membership::Ejected),
+            _ => None,
+        }
+    }
+}
+
+/// Hub side: a member's subtree the hub accepted and relays to every member
+/// (slice 1). `share_id` is the MEMBER's share id (the hub holds mirrors of
+/// it); `root_doc` is the mirror root, filed under `<hub root>/<member>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HubPublication {
+    pub share_id: Uuid,
+    pub member_contact: Uuid,
+    pub root_doc: Uuid,
+    pub published_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -632,6 +713,14 @@ pub struct Mirror {
     /// (paged out, or the block replace failed): "behind".
     #[serde(default)]
     pub owner_epoch: i64,
+    /// Hub relay provenance (slice 1): when the owner we pull from is a hub
+    /// relaying someone else's doc, the TRUE owner's pubkey (hex) and the
+    /// name the hub knows them by. None = the doc belongs to the contact we
+    /// pull from. Relayed docs are read-only in this slice.
+    #[serde(default)]
+    pub origin_owner: Option<String>,
+    #[serde(default)]
+    pub origin_owner_name: Option<String>,
 }
 
 /// Invites v2: a share OFFER received from a contact over the wire (recipient

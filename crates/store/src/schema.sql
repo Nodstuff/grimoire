@@ -181,7 +181,13 @@ CREATE TABLE IF NOT EXISTS contacts (
     principal TEXT NOT NULL REFERENCES principals (id),
     verified  INTEGER NOT NULL DEFAULT 0,
     revoked   INTEGER NOT NULL DEFAULT 0,
-    paired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    paired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- hub membership (slice 1). On a hub: the member's role/standing. On a
+    -- member's instance, for a contact that is_hub: MY role/standing there.
+    role       TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('member', 'admin')),
+    membership TEXT NOT NULL DEFAULT 'active' CHECK (membership IN ('pending', 'active', 'ejected')),
+    -- the contact is a hub (grimoire serve --hub)
+    is_hub     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS shares (
@@ -257,7 +263,21 @@ CREATE TABLE IF NOT EXISTS mirrors (
     last_pulled_at TEXT,
     last_error     TEXT,
     -- the owner's epoch from the last pull meta; > synced_epoch = "behind"
-    owner_epoch  INTEGER NOT NULL DEFAULT 0
+    owner_epoch  INTEGER NOT NULL DEFAULT 0,
+    -- hub relay provenance (slice 1): the TRUE owner of a doc relayed through
+    -- a hub (pubkey hex + the hub's name for them); NULL = owned by `owner`
+    origin_owner      TEXT,
+    origin_owner_name TEXT
+);
+
+-- Hub side (slice 1): member subtrees the hub accepted and relays to every
+-- member. share_id is the MEMBER's share id (a foreign id, no FK); root_doc
+-- is the hub's mirror root of it, filed under <hub root>/<member>.
+CREATE TABLE IF NOT EXISTS hub_publications (
+    share_id       TEXT PRIMARY KEY,
+    member_contact TEXT NOT NULL REFERENCES contacts (id),
+    root_doc       TEXT NOT NULL,
+    published_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 -- Instance-level key/value settings (profile confirmation etc.). Tiny and

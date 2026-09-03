@@ -431,6 +431,10 @@ async fn list_mirrors(State(st): State<FedState>) -> Json<Value> {
                 "last_pulled_at": ms.iter().filter_map(|m| m.last_pulled_at.clone()).max(),
                 "last_error": ms.iter().find_map(|m| m.last_error.clone()),
                 "owner_tended": ms.iter().any(|m| m.owner_tended),
+                // hub relay (slice 1): the share comes from a hub; how many of its
+                // docs are relayed for other members (each names its true owner)
+                "from_hub": owner.map(|c| c.is_hub).unwrap_or(false),
+                "relayed_docs": ms.iter().filter(|m| m.origin_owner.is_some()).count(),
             })
         })
         .collect();
@@ -695,6 +699,10 @@ async fn join(State(st): State<FedState>, Json(req): Json<JoinReq>) -> Json<Valu
     )
     .await;
     let err = match attempt {
+        // hub: paired but waiting for an admin — nothing to pull yet
+        Ok(Ok(outcome)) if outcome.membership.as_deref() == Some("pending") => {
+            return Json(json!({"joined": outcome, "pending": true}));
+        }
         Ok(Ok(outcome)) => {
             // fetch the tree NOW so the reply can say "45 docs", not "1 placeholder"
             let pulled = tokio::time::timeout(
@@ -1012,6 +1020,270 @@ async fn list_neighbours(State(st): State<FedState>) -> Json<Value> {
     Json(json!(rows))
 }
 
+// --- hubs (slice 1) ---------------------------------------------------------
+
+/// A hub contact as the Shares page lists it, from LOCAL rows only (no dial):
+/// my standing there (as last told by the hub), the hub folder if I hold it,
+/// and the subtrees I have published (my `propose` shares to the hub).
+async fn list_hubs(State(st): State<FedState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let contacts = s.list_contacts().unwrap_or_default();
+    let shares = s.list_shares().unwrap_or_default();
+    let mirrors = s.list_mirrors().unwrap_or_default();
+    let rows: Vec<Value> = contacts
+        .iter()
+        .filter(|c| c.is_hub && !c.revoked)
+        .map(|c| {
+            let ids: std::collections::HashSet<Uuid> =
+                mirrors.iter().filter(|m| m.owner == c.id).map(|m| m.doc_id).collect();
+            let root = mirrors
+                .iter()
+                .filter(|m| m.owner == c.id)
+                .filter_map(|m| s.get_doc(m.doc_id).ok())
+                .find(|d| d.parent_id.map(|p| !ids.contains(&p)).unwrap_or(true));
+            let publications: Vec<Value> = shares
+                .iter()
+                .filter(|sh| sh.contact == Some(c.id) && sh.state != grimoire_store::ShareState::Revoked)
+                .map(|sh| {
+                    json!({
+                        "share_id": sh.id,
+                        "root_doc": sh.root_doc,
+                        "root_title": s.get_doc(sh.root_doc).map(|d| d.title).unwrap_or_default(),
+                        "doc_count": s.docs_in_share(sh.id).map(|d| d.len()).unwrap_or(0),
+                        "state": sh.state,
+                    })
+                })
+                .collect();
+            json!({
+                "contact_id": c.id,
+                "name": c.petname,
+                "pubkey": c.pubkey,
+                "role": c.role,
+                "membership": c.membership,
+                "root_doc_id": root.as_ref().map(|d| d.id),
+                "relayed_docs": mirrors.iter().filter(|m| m.owner == c.id && m.origin_owner.is_some()).count(),
+                "publications": publications,
+            })
+        })
+        .collect();
+    Json(json!(rows))
+}
+
+/// Dial a hub I belong to with one request (15s cap).
+async fn dial_hub(st: &FedState, hub: Uuid, req: crate::fed::wire::Request) -> Result<crate::fed::wire::Response, String> {
+    let endpoint = st
+        .ctx
+        .endpoint
+        .as_ref()
+        .ok_or_else(|| "sharing is off: this Grimoire has no identity yet".to_string())?;
+    let contact = {
+        let s = st
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.list_contacts()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| c.id == hub && c.is_hub && !c.revoked)
+            .ok_or_else(|| "that hub is not one of your contacts".to_string())?
+    };
+    let id: iroh::EndpointId = contact.pubkey.parse().map_err(|_| "hub pubkey malformed".to_string())?;
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        crate::fed::client::request(endpoint, iroh::EndpointAddr::from(id), req),
+    )
+    .await
+    {
+        Ok(Ok(r)) => Ok(r),
+        Ok(Err(e)) => Err(format!("{} is unreachable: {e:#}", contact.petname)),
+        Err(_) => Err(format!("{} is offline or unreachable right now", contact.petname)),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct HubQuery {
+    pub hub: Uuid,
+}
+
+/// Members of a hub I belong to. First asks where I stand (and records it
+/// locally, so a role change reaches the UI), then lists members if I am an
+/// admin — `members: null` otherwise. Fetched when the UI section opens;
+/// never polled.
+async fn hub_members(State(st): State<FedState>, Query(q): Query<HubQuery>) -> Json<Value> {
+    use crate::fed::wire::{HubAction, Request, Response};
+    let status = match dial_hub(&st, q.hub, Request::HubStatus).await {
+        Ok(Response::HubStatusIs { name, role, membership, members, pending }) => {
+            let mut s = st
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(r) = grimoire_store::ContactRole::parse(&role) {
+                s.set_contact_role(q.hub, r).ok();
+            }
+            if let Some(m) = grimoire_store::Membership::parse(&membership) {
+                s.set_contact_membership(q.hub, m).ok();
+            }
+            json!({"name": name, "role": role, "membership": membership, "members": members, "pending": pending})
+        }
+        Ok(Response::Refused { reason, .. }) => return Json(json!({"error": reason})),
+        Ok(other) => return Json(json!({"error": format!("unexpected reply: {other:?}")})),
+        Err(e) => return Json(json!({"error": e})),
+    };
+    if status["role"] != "admin" {
+        return Json(json!({"status": status, "members": Value::Null}));
+    }
+    match dial_hub(&st, q.hub, Request::HubAdmin { action: HubAction::ListMembers }).await {
+        Ok(Response::HubMembers { members }) => Json(json!({"status": status, "members": members})),
+        Ok(Response::Refused { reason, .. }) => Json(json!({"status": status, "members": Value::Null, "error": reason})),
+        Ok(other) => Json(json!({"error": format!("unexpected reply: {other:?}")})),
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct HubMemberReq {
+    pub hub: Uuid,
+    pub contact_id: Uuid,
+    pub role: Option<String>,
+}
+
+async fn hub_action(st: &FedState, hub: Uuid, action: crate::fed::wire::HubAction) -> Json<Value> {
+    use crate::fed::wire::{Request, Response};
+    match dial_hub(st, hub, Request::HubAdmin { action }).await {
+        Ok(Response::Noted) => Json(json!({"ok": true})),
+        Ok(Response::HubInvite { link }) => Json(json!({"ok": true, "link": link})),
+        Ok(Response::Refused { reason, .. }) => Json(json!({"error": reason})),
+        Ok(other) => Json(json!({"error": format!("unexpected reply: {other:?}")})),
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
+async fn hub_approve(State(st): State<FedState>, Json(req): Json<HubMemberReq>) -> Json<Value> {
+    hub_action(&st, req.hub, crate::fed::wire::HubAction::Approve { contact_id: req.contact_id.to_string() }).await
+}
+
+async fn hub_eject(State(st): State<FedState>, Json(req): Json<HubMemberReq>) -> Json<Value> {
+    hub_action(&st, req.hub, crate::fed::wire::HubAction::Eject { contact_id: req.contact_id.to_string() }).await
+}
+
+async fn hub_role(State(st): State<FedState>, Json(req): Json<HubMemberReq>) -> Json<Value> {
+    let Some(role) = req.role else {
+        return Json(json!({"error": "role is required: member or admin"}));
+    };
+    hub_action(&st, req.hub, crate::fed::wire::HubAction::SetRole { contact_id: req.contact_id.to_string(), role }).await
+}
+
+#[derive(Deserialize)]
+pub struct HubReq {
+    pub hub: Uuid,
+}
+
+/// Ask a hub I administer for a fresh invite link (to onboard someone).
+async fn hub_invite(State(st): State<FedState>, Json(req): Json<HubReq>) -> Json<Value> {
+    hub_action(&st, req.hub, crate::fed::wire::HubAction::Invite).await
+}
+
+// --- the hub box itself: local routes for the CLI over an SSH tunnel -------
+
+async fn local_hub_members(State(st): State<FedState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if crate::fed::hub::config(&s).is_none() {
+        return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
+    }
+    match crate::fed::hub::members(&s) {
+        Ok(m) => Json(json!(m)),
+        Err(e) => Json(json!({"error": format!("{e:#}")})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ContactIdReq {
+    pub contact_id: Uuid,
+    pub role: Option<String>,
+}
+
+async fn local_hub_approve(State(st): State<FedState>, Json(req): Json<ContactIdReq>) -> Json<Value> {
+    let (Some(node_id), Some(endpoint)) = (&st.ctx.node_id, &st.ctx.endpoint) else {
+        return Json(json!({"error": "sharing is off: this Grimoire has no identity yet"}));
+    };
+    let minted = {
+        let mut s = st
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::fed::hub::approve(&mut s, node_id, req.contact_id)
+    };
+    match minted {
+        Ok((hub, member, share, minted)) => {
+            Json(crate::fed::hub::deliver_membership(endpoint, &hub, &member, &share, &minted).await)
+        }
+        Err(e) => Json(json!({"error": format!("{e:#}")})),
+    }
+}
+
+async fn local_hub_eject(State(st): State<FedState>, Json(req): Json<ContactIdReq>) -> Json<Value> {
+    let pubkey;
+    let res = {
+        let mut s = st
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pubkey = s
+            .list_contacts()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| c.id == req.contact_id)
+            .map(|c| c.pubkey);
+        crate::fed::hub::eject(&mut s, req.contact_id)
+    };
+    match res {
+        Ok(dropped) => {
+            let cut = pubkey.map(|pk| st.hot.drop_bridges_for_peer(&pk)).unwrap_or(0);
+            Json(json!({"ok": true, "dropped": dropped, "bridges_cut": cut}))
+        }
+        Err(e) => Json(json!({"error": format!("{e:#}")})),
+    }
+}
+
+async fn local_hub_role(State(st): State<FedState>, Json(req): Json<ContactIdReq>) -> Json<Value> {
+    let Some(role) = req.role.as_deref().and_then(grimoire_store::ContactRole::parse) else {
+        return Json(json!({"error": "role must be member or admin"}));
+    };
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match crate::fed::hub::set_role(&mut s, req.contact_id, role) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": format!("{e:#}")})),
+    }
+}
+
+/// Mint a one-time `propose` invite for the hub root (how the first admin,
+/// and anyone onboarding from the box, gets a link).
+async fn local_hub_invite(State(st): State<FedState>) -> Json<Value> {
+    let Some(node_id) = &st.ctx.node_id else {
+        return Json(json!({"error": "sharing is off: this Grimoire has no identity yet"}));
+    };
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(hub) = crate::fed::hub::config(&s) else {
+        return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
+    };
+    match crate::fed::mint_invite(&mut s, node_id, hub.root_doc, grimoire_store::SharePermission::Propose) {
+        Ok((share, link)) => Json(json!({"share": share, "link": link, "hub": hub.name})),
+        Err(e) => Json(json!({"error": format!("{e:#}")})),
+    }
+}
+
 pub fn router(
     store: Store,
     fed: FedCtx,
@@ -1056,6 +1328,19 @@ pub fn router(
         .route("/admin/propose_upstream", post(propose_upstream))
         .route("/admin/comment_upstream", post(comment_upstream))
         .route("/admin/proposals", get(list_proposals))
+        // hubs I belong to (dials the hub) …
+        .route("/admin/hubs", get(list_hubs))
+        .route("/admin/hubs/members", get(hub_members))
+        .route("/admin/hubs/approve", post(hub_approve))
+        .route("/admin/hubs/eject", post(hub_eject))
+        .route("/admin/hubs/role", post(hub_role))
+        .route("/admin/hubs/invite", post(hub_invite))
+        // … and THIS Grimoire as a hub (the CLI on the box)
+        .route("/admin/hub/members", get(local_hub_members))
+        .route("/admin/hub/approve", post(local_hub_approve))
+        .route("/admin/hub/eject", post(local_hub_eject))
+        .route("/admin/hub/role", post(local_hub_role))
+        .route("/admin/hub/invite", post(local_hub_invite))
         .route_layer(axum::middleware::from_fn_with_state(token.clone(), require_admin))
         .with_state(fed_state);
     Router::new()

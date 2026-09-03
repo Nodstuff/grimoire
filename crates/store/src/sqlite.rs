@@ -193,9 +193,34 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
             ("last_pulled_at", "ALTER TABLE mirrors ADD COLUMN last_pulled_at TEXT"),
             ("last_error", "ALTER TABLE mirrors ADD COLUMN last_error TEXT"),
             ("owner_epoch", "ALTER TABLE mirrors ADD COLUMN owner_epoch INTEGER NOT NULL DEFAULT 0"),
+            // hub relay provenance (slice 1)
+            ("origin_owner", "ALTER TABLE mirrors ADD COLUMN origin_owner TEXT"),
+            ("origin_owner_name", "ALTER TABLE mirrors ADD COLUMN origin_owner_name TEXT"),
         ] {
             let has: i64 = conn.query_row(
                 "SELECT count(*) FROM pragma_table_info('mirrors') WHERE name = ?1",
+                params![col],
+                |r| r.get(0),
+            )?;
+            if has == 0 {
+                conn.execute(ddl, [])?;
+            }
+        }
+    }
+    // hub membership columns on contacts (slice 1)
+    let has_contacts: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'contacts'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_contacts > 0 {
+        for (col, ddl) in [
+            ("role", "ALTER TABLE contacts ADD COLUMN role TEXT NOT NULL DEFAULT 'member'"),
+            ("membership", "ALTER TABLE contacts ADD COLUMN membership TEXT NOT NULL DEFAULT 'active'"),
+            ("is_hub", "ALTER TABLE contacts ADD COLUMN is_hub INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let has: i64 = conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('contacts') WHERE name = ?1",
                 params![col],
                 |r| r.get(0),
             )?;
@@ -467,7 +492,10 @@ fn build_doc(raw: RawDoc) -> Result<Doc> {
 
 // --- federation row mapping (ADR 0002) ---
 
-type RawContact = (String, String, String, String, bool, bool, String);
+type RawContact = (String, String, String, String, bool, bool, String, String, String, bool);
+
+const CONTACT_COLS: &str =
+    "id, pubkey, petname, principal, verified, revoked, paired_at, role, membership, is_hub";
 
 fn contact_row(row: &rusqlite::Row) -> rusqlite::Result<RawContact> {
     Ok((
@@ -478,11 +506,14 @@ fn contact_row(row: &rusqlite::Row) -> rusqlite::Result<RawContact> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
     ))
 }
 
 fn finish_contact(raw: RawContact) -> Result<Contact> {
-    let (id, pubkey, petname, principal, verified, revoked, paired_at) = raw;
+    let (id, pubkey, petname, principal, verified, revoked, paired_at, role, membership, is_hub) = raw;
     Ok(Contact {
         id: uuid_col(id, "contacts.id")?,
         pubkey,
@@ -491,6 +522,11 @@ fn finish_contact(raw: RawContact) -> Result<Contact> {
         verified,
         revoked,
         paired_at,
+        role: ContactRole::parse(&role)
+            .ok_or_else(|| StoreError::InvalidOp(format!("bad contact role: {role}")))?,
+        membership: Membership::parse(&membership)
+            .ok_or_else(|| StoreError::InvalidOp(format!("bad contact membership: {membership}")))?,
+        is_hub,
     })
 }
 
@@ -575,7 +611,21 @@ fn finish_share(raw: RawShare) -> Result<Share> {
     })
 }
 
-type RawMirror = (String, String, String, i64, String, bool, Option<String>, Option<String>, i64);
+type RawMirror = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    bool,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+);
+
+const MIRROR_COLS: &str = "doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error, owner_epoch, origin_owner, origin_owner_name";
 
 fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
     Ok((
@@ -588,11 +638,25 @@ fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
     ))
 }
 
 fn finish_mirror(raw: RawMirror) -> Result<Mirror> {
-    let (doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error, owner_epoch) = raw;
+    let (
+        doc_id,
+        owner,
+        share_id,
+        synced_epoch,
+        permission,
+        owner_tended,
+        last_pulled_at,
+        last_error,
+        owner_epoch,
+        origin_owner,
+        origin_owner_name,
+    ) = raw;
     Ok(Mirror {
         doc_id: uuid_col(doc_id, "mirrors.doc_id")?,
         owner: uuid_col(owner, "mirrors.owner")?,
@@ -604,6 +668,8 @@ fn finish_mirror(raw: RawMirror) -> Result<Mirror> {
         last_pulled_at,
         last_error,
         owner_epoch,
+        origin_owner,
+        origin_owner_name,
     })
 }
 
@@ -1998,10 +2064,9 @@ impl BlockStore for SqliteStore {
     }
 
     fn list_contacts(&self) -> Result<Vec<Contact>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, pubkey, petname, principal, verified, revoked, paired_at
-             FROM contacts ORDER BY paired_at",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {CONTACT_COLS} FROM contacts ORDER BY paired_at"))?;
         let rows = stmt.query_map([], contact_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
@@ -2012,8 +2077,7 @@ impl BlockStore for SqliteStore {
     fn contact_by_pubkey(&self, pubkey: &str) -> Result<Option<Contact>> {
         self.conn
             .query_row(
-                "SELECT id, pubkey, petname, principal, verified, revoked, paired_at
-                 FROM contacts WHERE pubkey = ?1",
+                &format!("SELECT {CONTACT_COLS} FROM contacts WHERE pubkey = ?1"),
                 params![pubkey],
                 contact_row,
             )
@@ -2088,6 +2152,10 @@ impl BlockStore for SqliteStore {
             "UPDATE share_invites SET offered_to = NULL WHERE offered_to = ?1",
             params![id.to_string()],
         )?;
+        tx.execute(
+            "DELETE FROM hub_publications WHERE member_contact = ?1",
+            params![id.to_string()],
+        )?;
         let deleted = tx.execute("DELETE FROM contacts WHERE id = ?1", params![id.to_string()])?;
         if deleted == 0 {
             return Err(StoreError::NotFound(format!("contact {id}")));
@@ -2118,8 +2186,31 @@ impl BlockStore for SqliteStore {
         // re-share guard: a subtree containing mirrors is someone ELSE's
         // content — serving it onward would leak their docs to a third party
         // without their gate ever seeing it. Share your own docs only.
-        let mirrors: std::collections::HashSet<Uuid> =
-            self.list_mirrors()?.into_iter().map(|m| m.doc_id).collect();
+        // The one exception (hub, slice 1): a hub sharing its ROOT may contain
+        // members' publications — mirrors the members asked it to relay.
+        let relayed: std::collections::HashSet<Uuid> = {
+            let hub_root: Option<Uuid> = match self.get_setting("hub.enabled")?.as_deref() {
+                Some("1") => self.get_setting("hub.root_doc")?.and_then(|r| r.parse().ok()),
+                _ => None,
+            };
+            if hub_root == Some(root_doc) {
+                let pubs: std::collections::HashSet<Uuid> =
+                    self.list_hub_publications()?.into_iter().map(|p| p.share_id).collect();
+                self.list_mirrors()?
+                    .into_iter()
+                    .filter(|m| pubs.contains(&m.share_id))
+                    .map(|m| m.doc_id)
+                    .collect()
+            } else {
+                Default::default()
+            }
+        };
+        let mirrors: std::collections::HashSet<Uuid> = self
+            .list_mirrors()?
+            .into_iter()
+            .map(|m| m.doc_id)
+            .filter(|id| !relayed.contains(id))
+            .collect();
         if !mirrors.is_empty() {
             let mut stmt = self.conn.prepare(
                 "WITH RECURSIVE subtree (id) AS (
@@ -2841,7 +2932,7 @@ impl BlockStore for SqliteStore {
     fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>> {
         self.conn
             .query_row(
-                "SELECT doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error, owner_epoch FROM mirrors WHERE doc_id = ?1",
+                &format!("SELECT {MIRROR_COLS} FROM mirrors WHERE doc_id = ?1"),
                 params![doc_id.to_string()],
                 mirror_row,
             )
@@ -2888,6 +2979,98 @@ impl BlockStore for SqliteStore {
         Ok(())
     }
 
+    fn set_mirror_origin(
+        &mut self,
+        doc_id: Uuid,
+        origin_owner: Option<&str>,
+        origin_owner_name: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE mirrors SET origin_owner = ?1, origin_owner_name = ?2 WHERE doc_id = ?3",
+            params![origin_owner, origin_owner_name, doc_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    // --- hub membership + publications (slice 1) ---
+
+    fn set_contact_role(&mut self, id: Uuid, role: ContactRole) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE contacts SET role = ?1 WHERE id = ?2",
+            params![role.as_str(), id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("contact {id}")));
+        }
+        Ok(())
+    }
+
+    fn set_contact_membership(&mut self, id: Uuid, membership: Membership) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE contacts SET membership = ?1 WHERE id = ?2",
+            params![membership.as_str(), id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("contact {id}")));
+        }
+        Ok(())
+    }
+
+    fn set_contact_is_hub(&mut self, id: Uuid, is_hub: bool) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE contacts SET is_hub = ?1 WHERE id = ?2",
+            params![is_hub, id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("contact {id}")));
+        }
+        Ok(())
+    }
+
+    fn add_hub_publication(&mut self, share_id: Uuid, member_contact: Uuid, root_doc: Uuid) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO hub_publications (share_id, member_contact, root_doc) VALUES (?1, ?2, ?3)
+             ON CONFLICT (share_id) DO UPDATE SET
+                 member_contact = excluded.member_contact,
+                 root_doc = excluded.root_doc",
+            params![share_id.to_string(), member_contact.to_string(), root_doc.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn list_hub_publications(&self) -> Result<Vec<HubPublication>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT share_id, member_contact, root_doc, published_at
+             FROM hub_publications ORDER BY published_at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (share_id, member_contact, root_doc, published_at) = r?;
+            Ok(HubPublication {
+                share_id: uuid_col(share_id, "hub_publications.share_id")?,
+                member_contact: uuid_col(member_contact, "hub_publications.member_contact")?,
+                root_doc: uuid_col(root_doc, "hub_publications.root_doc")?,
+                published_at,
+            })
+        })
+        .collect()
+    }
+
+    fn remove_hub_publication(&mut self, share_id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM hub_publications WHERE share_id = ?1",
+            params![share_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// True if a gardener tends this doc or any ancestor (recursive
     /// containment, the same rule the tend panel uses). Disabled gardeners
     /// don't count.
@@ -2912,9 +3095,9 @@ impl BlockStore for SqliteStore {
     }
 
     fn list_mirrors(&self) -> Result<Vec<Mirror>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error, owner_epoch FROM mirrors ORDER BY doc_id",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {MIRROR_COLS} FROM mirrors ORDER BY doc_id"))?;
         let rows = stmt.query_map([], mirror_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
@@ -3824,6 +4007,87 @@ mod tests {
         let root = s.create_doc_with_id(uuid::Uuid::now_v7(), "theirs", None, owner.principal).unwrap();
         s.upsert_mirror(root.id, owner.id, uuid::Uuid::now_v7(), 0, SharePermission::View).unwrap();
         assert!(matches!(s.remove_contact(owner.id), Err(StoreError::InvalidOp(_))));
+    }
+
+    /// Hub (slice 1): contacts carry role/membership/is_hub with safe defaults,
+    /// mirrors carry relay provenance, publications upsert on share id and go
+    /// with their member — and a pre-hub `contacts` table gains the columns.
+    #[test]
+    fn hub_columns_default_and_round_trip_and_migrate_onto_old_tables() {
+        use crate::{ContactRole, Membership, PrincipalKind, SharePermission};
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let alice = s.pair_contact(&"ab".repeat(32), "alice").unwrap();
+        assert_eq!((alice.role, alice.membership, alice.is_hub), (ContactRole::Member, Membership::Active, false));
+        s.set_contact_role(alice.id, ContactRole::Admin).unwrap();
+        s.set_contact_membership(alice.id, Membership::Pending).unwrap();
+        s.set_contact_is_hub(alice.id, true).unwrap();
+        let a = s.contact_by_pubkey(&alice.pubkey).unwrap().unwrap();
+        assert_eq!((a.role, a.membership, a.is_hub), (ContactRole::Admin, Membership::Pending, true));
+        assert!(matches!(s.set_contact_role(Uuid::now_v7(), ContactRole::Admin), Err(StoreError::NotFound(_))));
+
+        // mirror provenance
+        let root = s.create_doc_with_id(Uuid::now_v7(), "theirs", None, alice.principal).unwrap();
+        let share = Uuid::now_v7();
+        s.upsert_mirror(root.id, alice.id, share, 0, SharePermission::Propose).unwrap();
+        let m = s.get_mirror(root.id).unwrap().unwrap();
+        assert_eq!((m.origin_owner, m.origin_owner_name), (None, None));
+        s.set_mirror_origin(root.id, Some("cd"), Some("bob")).unwrap();
+        let m = s.get_mirror(root.id).unwrap().unwrap();
+        assert_eq!((m.origin_owner.as_deref(), m.origin_owner_name.as_deref()), (Some("cd"), Some("bob")));
+        // a re-upsert (every pull) keeps the provenance until it is re-set
+        s.upsert_mirror(root.id, alice.id, share, 3, SharePermission::Propose).unwrap();
+        assert_eq!(s.get_mirror(root.id).unwrap().unwrap().origin_owner.as_deref(), Some("cd"));
+        s.set_mirror_origin(root.id, None, None).unwrap();
+        assert_eq!(s.list_mirrors().unwrap()[0].origin_owner, None);
+
+        // publications: upsert on share id, listed, removed with the member
+        s.add_hub_publication(share, alice.id, root.id).unwrap();
+        s.add_hub_publication(share, alice.id, root.id).unwrap();
+        let pubs = s.list_hub_publications().unwrap();
+        assert_eq!(pubs.len(), 1);
+        assert_eq!((pubs[0].share_id, pubs[0].member_contact, pubs[0].root_doc), (share, alice.id, root.id));
+        s.remove_hub_publication(share).unwrap();
+        assert!(s.list_hub_publications().unwrap().is_empty());
+        s.add_hub_publication(share, alice.id, root.id).unwrap();
+        s.remove_mirror(root.id).unwrap();
+        s.remove_contact(alice.id).unwrap();
+        assert!(s.list_hub_publications().unwrap().is_empty(), "publications go with the member");
+        let _ = tom;
+
+        // migration: a pre-hub contacts table gains the three columns with defaults
+        let old = SqliteStore::open_in_memory().unwrap();
+        old.conn.pragma_update(None, "foreign_keys", false).unwrap();
+        old.conn
+            .execute_batch(
+                "DROP TABLE contacts;
+                 CREATE TABLE contacts (
+                     id TEXT PRIMARY KEY,
+                     pubkey TEXT NOT NULL UNIQUE,
+                     petname TEXT NOT NULL,
+                     principal TEXT NOT NULL REFERENCES principals (id),
+                     verified INTEGER NOT NULL DEFAULT 0,
+                     revoked INTEGER NOT NULL DEFAULT 0,
+                     paired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                 );
+                 INSERT INTO principals (id, kind, display_name) VALUES ('p1', 'remote', 'x');
+                 INSERT INTO contacts (id, pubkey, petname, principal) VALUES ('c1', 'k', 'x', 'p1');",
+            )
+            .unwrap();
+        old.conn.pragma_update(None, "foreign_keys", true).unwrap();
+        assert!(old.list_contacts().is_err(), "old table lacks the columns");
+        migrate_pre_schema(&old.conn).unwrap();
+        migrate_pre_schema(&old.conn).unwrap(); // idempotent
+        let cs = old.list_contacts();
+        // ids in this hand-made row are not uuids, so mapping fails on id — check columns directly
+        let _ = cs;
+        let (role, membership, is_hub): (String, String, bool) = old
+            .conn
+            .query_row("SELECT role, membership, is_hub FROM contacts WHERE id = 'c1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((role.as_str(), membership.as_str(), is_hub), ("member", "active", false));
     }
 
     /// Trash: a delete tombstones the subtree under one stamp; the trash lists

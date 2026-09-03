@@ -406,6 +406,30 @@ pub trait BlockStore {
     /// Record whether the owner tends this mirror doc (from the pull meta).
     fn set_mirror_tended(&mut self, doc_id: Uuid, tended: bool) -> Result<()>;
 
+    /// Hub relay provenance from the pull meta (slice 1): the TRUE owner of a
+    /// doc a hub relays to us. None/None = owned by the contact we pull from.
+    fn set_mirror_origin(
+        &mut self,
+        doc_id: Uuid,
+        origin_owner: Option<&str>,
+        origin_owner_name: Option<&str>,
+    ) -> Result<()>;
+
+    // Hub membership (slice 1). Human/admin surfaces only — never MCP.
+
+    fn set_contact_role(&mut self, id: Uuid, role: ContactRole) -> Result<()>;
+
+    fn set_contact_membership(&mut self, id: Uuid, membership: Membership) -> Result<()>;
+
+    fn set_contact_is_hub(&mut self, id: Uuid, is_hub: bool) -> Result<()>;
+
+    /// Hub side: record a member's published subtree (upsert on share_id).
+    fn add_hub_publication(&mut self, share_id: Uuid, member_contact: Uuid, root_doc: Uuid) -> Result<()>;
+
+    fn list_hub_publications(&self) -> Result<Vec<HubPublication>>;
+
+    fn remove_hub_publication(&mut self, share_id: Uuid) -> Result<()>;
+
     /// Record the owner's epoch for a mirror doc from the pull meta, so the
     /// grantee can tell "up to date" from "behind" without another round-trip.
     fn set_mirror_owner_epoch(&mut self, doc_id: Uuid, owner_epoch: i64) -> Result<()>;

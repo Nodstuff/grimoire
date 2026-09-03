@@ -1885,3 +1885,474 @@ async fn share_offer_round_trip_accept_joins_and_strangers_are_refused() {
     assert_eq!(b_store.lock().unwrap().clear_share_offers().unwrap(), 1);
     assert_eq!(b_store.lock().unwrap().list_share_offers(false).unwrap().len(), 1);
 }
+
+// ── hub (slice 1) ───────────────────────────────────────────────────────
+
+/// A test peer: store (one human principal), endpoint, address, and a live
+/// listener (members receive Offers, so everyone serves).
+struct Peer {
+    store: Arc<Mutex<SqliteStore>>,
+    ep: Endpoint,
+    addr: EndpointAddr,
+    runtime: Runtime,
+    human: uuid::Uuid,
+}
+
+async fn peer(name: &str) -> Peer {
+    let mut s = SqliteStore::open_in_memory().unwrap();
+    let human = s.create_principal(PrincipalKind::Human, name, None).unwrap().id;
+    let store = Arc::new(Mutex::new(s));
+    let ep = local_endpoint().await;
+    let addr = direct_addr(&ep);
+    let runtime = Runtime::default();
+    tokio::spawn(serve(ep.clone(), store.clone(), scratch_hot(), runtime.clone()));
+    Peer { store, ep, addr, runtime, human }
+}
+
+impl Peer {
+    fn pubkey(&self) -> String {
+        self.ep.id().to_string()
+    }
+    fn contact_of(&self, other: &Peer) -> grimoire_store::Contact {
+        self.store.lock().unwrap().contact_by_pubkey(&other.pubkey()).unwrap().unwrap()
+    }
+    /// One paragraph doc of my own (returns the doc id).
+    fn doc(&self, title: &str, parent: Option<uuid::Uuid>, text: &str) -> uuid::Uuid {
+        let mut s = self.store.lock().unwrap();
+        let d = s.create_doc(title, parent, self.human).unwrap();
+        s.apply(d.id, 0, self.human, vec![grimoire_store::OpInput {
+            kind: grimoire_store::OpKind::Insert {
+                block_id: uuid::Uuid::now_v7(), parent_id: None, order_key: "a".into(),
+                block_type: grimoire_store::BlockType::Paragraph, content: text.into(), refers_to: None,
+            },
+            source_refs: vec![],
+        }]).unwrap();
+        d.id
+    }
+}
+
+/// A hub named `name` with an invite link minted for its root.
+async fn hub(name: &str) -> (Peer, super::hub::HubConfig) {
+    let p = peer("box").await;
+    let cfg = {
+        let mut s = p.store.lock().unwrap();
+        super::hub::enable(&mut s, Some(name), p.human).unwrap()
+    };
+    (p, cfg)
+}
+
+fn hub_invite(h: &Peer, cfg: &super::hub::HubConfig) -> Ticket {
+    let mut s = h.store.lock().unwrap();
+    let (_, link) = mint_invite(&mut s, &h.pubkey(), cfg.root_doc, SharePermission::Propose).unwrap();
+    Ticket::parse(&link).unwrap()
+}
+
+/// Wait up to ~10s for `pred` to hold.
+async fn eventually(what: &str, mut pred: impl FnMut() -> bool) {
+    for _ in 0..200 {
+        if pred() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for: {what}");
+}
+
+/// Hub + alice (first contact → admin, active) + bob (approved by alice over
+/// the wire, accepted the hub's offer). Both hold the hub folder.
+async fn team() -> (Peer, super::hub::HubConfig, Peer, Peer) {
+    let (h, cfg) = hub("Team").await;
+    let alice = peer("alice").await;
+    let bob = peer("bob").await;
+    let out = join_at(&alice.ep, &alice.store, &hub_invite(&h, &cfg), h.addr.clone()).await.unwrap();
+    assert_eq!((out.is_hub, out.membership.as_deref()), (true, Some("active")));
+    let out = join_at(&bob.ep, &bob.store, &hub_invite(&h, &cfg), h.addr.clone()).await.unwrap();
+    assert_eq!(out.membership.as_deref(), Some("pending"));
+    let bob_on_hub = h.contact_of(&bob);
+    let res = request(&alice.ep, h.addr.clone(), Request::HubAdmin {
+        action: super::wire::HubAction::Approve { contact_id: bob_on_hub.id.to_string() },
+    }).await.unwrap();
+    assert_eq!(res, Response::Noted);
+    // the hub dials bob (by pubkey: it has just been talking to him) with the offer
+    eventually("bob receives the hub's offer", || !bob.store.lock().unwrap().list_share_offers(true).unwrap().is_empty()).await;
+    let offer = bob.store.lock().unwrap().list_share_offers(true).unwrap().remove(0);
+    let out = join_at(&bob.ep, &bob.store, &super::client::ticket_for_offer(&offer), h.addr.clone()).await.unwrap();
+    assert_eq!((out.is_hub, out.membership.as_deref(), out.permission.as_str()), (true, Some("active"), "propose"));
+    bob.store.lock().unwrap().set_share_offer_state(offer.id, grimoire_store::ShareOfferState::Accepted).unwrap();
+    (h, cfg, alice, bob)
+}
+
+/// Pull the hub's folder into a member (explicit address — tests have no discovery).
+async fn pull_hub(member: &Peer, h: &Peer, cfg: &super::hub::HubConfig) -> super::client::PullSummary {
+    let (owner, share) = {
+        let s = member.store.lock().unwrap();
+        let m = s.get_mirror(cfg.root_doc).unwrap().expect("member holds the hub folder");
+        let owner = s.list_contacts().unwrap().into_iter().find(|c| c.id == m.owner).unwrap();
+        (owner, m.share_id)
+    };
+    pull_share(&member.ep, &member.store, h.addr.clone(), &owner, share).await.unwrap()
+}
+
+#[tokio::test]
+async fn hub_first_contact_is_admin_later_ones_wait_and_approval_offers_the_folder() {
+    use grimoire_store::{ContactRole, Membership};
+    let (h, cfg) = hub("Team").await;
+    // hub mode: root doc named after the hub, profile name = hub name
+    {
+        let s = h.store.lock().unwrap();
+        assert_eq!(s.get_doc(cfg.root_doc).unwrap().title, "Team");
+        let human = s.list_principals().unwrap().into_iter().find(|p| p.kind == PrincipalKind::Human).unwrap();
+        assert_eq!(human.display_name, "Team");
+    }
+    let alice = peer("alice").await;
+    let out = join_at(&alice.ep, &alice.store, &hub_invite(&h, &cfg), h.addr.clone()).await.unwrap();
+    assert_eq!(out.owner_name, "Team");
+    assert!(out.is_hub);
+    assert_eq!(out.membership.as_deref(), Some("active"));
+    // hub side: first contact = admin, active, holds the root share (propose)
+    let a = h.contact_of(&alice);
+    assert_eq!((a.role, a.membership), (ContactRole::Admin, Membership::Active));
+    let shares = h.store.lock().unwrap().list_shares().unwrap();
+    assert_eq!(shares.iter().filter(|s| s.contact == Some(a.id) && s.state == grimoire_store::ShareState::Active).count(), 1);
+    // alice side: the hub is flagged, her standing recorded, the folder mirrored
+    {
+        let s = alice.store.lock().unwrap();
+        let hc = s.contact_by_pubkey(&h.pubkey()).unwrap().unwrap();
+        assert!(hc.is_hub);
+        assert_eq!((hc.role, hc.membership), (ContactRole::Admin, Membership::Active));
+        assert!(s.get_mirror(cfg.root_doc).unwrap().is_some());
+    }
+    // (the root has no content yet, so nothing is "changed" — the pull itself must work)
+    assert_eq!(pull_hub(&alice, &h, &cfg).await.changed, 0);
+
+    // bob: second contact → pending, NO share, nothing mirrored
+    let bob = peer("bob").await;
+    let out = join_at(&bob.ep, &bob.store, &hub_invite(&h, &cfg), h.addr.clone()).await.unwrap();
+    assert_eq!(out.membership.as_deref(), Some("pending"));
+    assert_eq!(out.permission, "none");
+    let b = h.contact_of(&bob);
+    assert_eq!((b.role, b.membership), (ContactRole::Member, Membership::Pending));
+    {
+        let s = h.store.lock().unwrap();
+        assert!(s.list_shares().unwrap().iter().all(|sh| sh.contact != Some(b.id)), "pending members hold no shares");
+        let s2 = bob.store.lock().unwrap();
+        assert!(s2.get_mirror(cfg.root_doc).unwrap().is_none(), "nothing mirrored while pending");
+        let hc = s2.contact_by_pubkey(&h.pubkey()).unwrap().unwrap();
+        assert!(hc.is_hub);
+        assert_eq!(hc.membership, Membership::Pending);
+    }
+    // a pending member may only ask where they stand
+    let res = request(&bob.ep, h.addr.clone(), Request::Ping).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
+    let res = request(&bob.ep, h.addr.clone(), Request::HubStatus).await.unwrap();
+    assert_eq!(res, Response::HubStatusIs { name: "Team".into(), role: "member".into(), membership: "pending".into(), members: 1, pending: 1 });
+    let res = request(&bob.ep, h.addr.clone(), Request::HubAdmin { action: super::wire::HubAction::ListMembers }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
+
+    // alice (admin) lists members, then approves bob
+    let res = request(&alice.ep, h.addr.clone(), Request::HubAdmin { action: super::wire::HubAction::ListMembers }).await.unwrap();
+    let Response::HubMembers { members } = res else { panic!("{res:?}") };
+    assert_eq!(members.len(), 2);
+    assert_eq!(members.iter().find(|m| m.pubkey == alice.pubkey()).unwrap().role, "admin");
+    assert_eq!(members.iter().find(|m| m.pubkey == bob.pubkey()).unwrap().membership, "pending");
+    assert_eq!(members.iter().find(|m| m.pubkey == bob.pubkey()).unwrap().petname, "bob", "fingerprint suffix dropped when unique");
+    let res = request(&alice.ep, h.addr.clone(), Request::HubAdmin {
+        action: super::wire::HubAction::Approve { contact_id: b.id.to_string() },
+    }).await.unwrap();
+    assert_eq!(res, Response::Noted);
+    assert_eq!(h.contact_of(&bob).membership, Membership::Active);
+    // the approval minted a propose share of the root, offered to bob …
+    {
+        let s = h.store.lock().unwrap();
+        let offered: Vec<_> = s.list_shares().unwrap().into_iter()
+            .filter(|sh| sh.state == grimoire_store::ShareState::Offered && sh.root_doc == cfg.root_doc).collect();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].permission, SharePermission::Propose);
+        assert_eq!(s.invite_offered_to(offered[0].id).unwrap(), Some(b.id));
+    }
+    // … and delivered to bob's Grimoire as a share request
+    eventually("bob receives the hub's offer", || !bob.store.lock().unwrap().list_share_offers(true).unwrap().is_empty()).await;
+    let offer = bob.store.lock().unwrap().list_share_offers(true).unwrap().remove(0);
+    assert_eq!((offer.root_title.as_str(), offer.permission), ("Team", SharePermission::Propose));
+    let out = join_at(&bob.ep, &bob.store, &super::client::ticket_for_offer(&offer), h.addr.clone()).await.unwrap();
+    assert_eq!((out.is_hub, out.membership.as_deref(), out.permission.as_str()), (true, Some("active"), "propose"));
+    assert_eq!(bob.store.lock().unwrap().contact_by_pubkey(&h.pubkey()).unwrap().unwrap().membership, Membership::Active);
+    pull_hub(&bob, &h, &cfg).await;
+    assert_eq!(bob.store.lock().unwrap().get_doc(cfg.root_doc).unwrap().title, "Team");
+
+    // bob is a plain member: admin actions refused; alice can promote him
+    let res = request(&bob.ep, h.addr.clone(), Request::HubAdmin { action: super::wire::HubAction::ListMembers }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
+    let res = request(&alice.ep, h.addr.clone(), Request::HubAdmin {
+        action: super::wire::HubAction::SetRole { contact_id: b.id.to_string(), role: "admin".into() },
+    }).await.unwrap();
+    assert_eq!(res, Response::Noted);
+    let res = request(&bob.ep, h.addr.clone(), Request::HubAdmin { action: super::wire::HubAction::Invite }).await.unwrap();
+    let Response::HubInvite { link } = res else { panic!("{res:?}") };
+    // the minted link admits a third member (pending)
+    let carol = peer("carol").await;
+    let out = join_at(&carol.ep, &carol.store, &Ticket::parse(&link).unwrap(), h.addr.clone()).await.unwrap();
+    assert_eq!(out.membership.as_deref(), Some("pending"));
+    // status from a plain owner is Unsupported; HubAdmin on a non-hub too
+    let res = request(&h.ep, alice.addr.clone(), Request::HubStatus).await;
+    // (the hub is not alice's contact → unknown peer; use bob, whom alice never paired) — so pair first:
+    let _ = res;
+    let (_, link) = mint_invite(&mut alice.store.lock().unwrap(), &alice.pubkey(), alice.doc("A", None, "a"), SharePermission::View).unwrap();
+    join_at(&carol.ep, &carol.store, &Ticket::parse(&link).unwrap(), alice.addr.clone()).await.unwrap();
+    let res = request(&carol.ep, alice.addr.clone(), Request::HubStatus).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::Unsupported);
+    let res = request(&carol.ep, alice.addr.clone(), Request::HubAdmin { action: super::wire::HubAction::ListMembers }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::Unsupported);
+    let _ = &alice.runtime;
+}
+
+#[tokio::test]
+async fn hub_publish_relays_with_provenance_refuses_edits_and_unpublish_drops() {
+    let (h, cfg, alice, bob) = team().await;
+    pull_hub(&alice, &h, &cfg).await;
+    pull_hub(&bob, &h, &cfg).await;
+
+    // alice publishes "Notes" (a subtree) to the hub: a propose share offered to it
+    let notes = alice.doc("Notes", None, "alice's notes");
+    let sub = alice.doc("Sub", Some(notes), "deeper");
+    let hub_on_alice = alice.contact_of(&h);
+    let (share, minted) = {
+        let mut s = alice.store.lock().unwrap();
+        let (share, minted) = super::client::mint_invite_full(&mut s, &alice.pubkey(), notes, SharePermission::Propose).unwrap();
+        s.set_invite_offered_to(share.id, hub_on_alice.id).unwrap();
+        (share, minted)
+    };
+    let res = request(&alice.ep, h.addr.clone(), Request::Offer {
+        share: share.id.to_string(), root_title: "Notes".into(), permission: "propose".into(),
+        secret: minted.secret.clone(), expires_at: minted.expires_at.clone(),
+    }).await.unwrap();
+    assert_eq!(res, Response::Noted);
+    // the hub accepts on its own: redeems, files under Team/alice, pulls
+    eventually("hub accepts the publication", || {
+        let s = h.store.lock().unwrap();
+        s.list_hub_publications().unwrap().len() == 1 && s.get_mirror(sub).unwrap().is_some_and(|m| m.synced_epoch > 0)
+    }).await;
+    let alice_on_hub = h.contact_of(&alice);
+    {
+        let s = h.store.lock().unwrap();
+        let p = &s.list_hub_publications().unwrap()[0];
+        assert_eq!((p.share_id, p.member_contact, p.root_doc), (share.id, alice_on_hub.id, notes));
+        let folder = s.get_doc(s.get_doc(notes).unwrap().parent_id.unwrap()).unwrap();
+        assert_eq!(folder.title, "alice");
+        assert_eq!(folder.parent_id, Some(cfg.root_doc));
+        assert!(s.get_mirror(folder.id).unwrap().is_none(), "the folder is the hub's own doc");
+        assert_eq!(s.get_share(share.id).is_err(), true, "member's share id is not a hub share");
+        // alice's own share on her side is active and bound to the hub
+        let a = alice.store.lock().unwrap();
+        let sh = a.get_share(share.id).unwrap();
+        assert_eq!((sh.state, sh.contact), (grimoire_store::ShareState::Active, Some(hub_on_alice.id)));
+        // the hub knows alice's shares as its publications
+        let members = super::hub::members(&s).unwrap();
+        let am = members.iter().find(|m| m.pubkey == alice.pubkey()).unwrap();
+        assert_eq!(am.publications.len(), 1);
+        assert_eq!((am.publications[0].root_title.as_str(), am.publications[0].doc_count), ("Notes", 2));
+    }
+
+    // served_docs: the hub-root share now includes alice's mirrored docs …
+    let hub_share_for_bob = {
+        let s = h.store.lock().unwrap();
+        let bob_id = s.contact_by_pubkey(&bob.pubkey()).unwrap().unwrap().id;
+        s.list_shares().unwrap().into_iter().find(|sh| sh.contact == Some(bob_id) && sh.state == grimoire_store::ShareState::Active).unwrap()
+    };
+    {
+        let s = h.store.lock().unwrap();
+        let ids: Vec<_> = super::server::served_docs(&s, hub_share_for_bob.id).unwrap().into_iter().map(|d| d.id).collect();
+        assert!(ids.contains(&notes) && ids.contains(&sub) && ids.contains(&cfg.root_doc));
+        // … but NOT for a share of some other hub-owned doc, and not to alice herself
+        let other = s.get_doc(cfg.root_doc).unwrap();
+        let _ = other;
+        let for_alice = super::server::served_docs_for(&s, hub_share_for_bob.id, Some(&alice.pubkey())).unwrap();
+        assert!(for_alice.iter().all(|d| d.id != notes && d.id != sub), "a member never gets their own docs relayed back");
+    }
+
+    // bob pulls: alice's docs arrive under Team/alice with their true owner
+    let sum = pull_hub(&bob, &h, &cfg).await;
+    assert_eq!(sum.changed, 3, "folder + notes + sub");
+    {
+        let s = bob.store.lock().unwrap();
+        let m = s.get_mirror(notes).unwrap().unwrap();
+        assert_eq!(m.origin_owner.as_deref(), Some(alice.pubkey().as_str()));
+        assert_eq!(m.origin_owner_name.as_deref(), Some("alice"));
+        assert_eq!(s.get_mirror(sub).unwrap().unwrap().origin_owner_name.as_deref(), Some("alice"));
+        assert_eq!(s.get_mirror(cfg.root_doc).unwrap().unwrap().origin_owner, None, "hub-owned docs carry no origin");
+        let folder = s.get_doc(s.get_doc(notes).unwrap().parent_id.unwrap()).unwrap();
+        assert_eq!((folder.title.as_str(), folder.parent_id), ("alice", Some(cfg.root_doc)));
+        assert_eq!(s.get_mirror(folder.id).unwrap().unwrap().origin_owner, None);
+        assert_eq!(s.read_doc(sub).unwrap().roots[0].block.content, "deeper");
+    }
+    // alice pulls: her own docs are not touched (no mirror rows for them)
+    pull_hub(&alice, &h, &cfg).await;
+    {
+        let s = alice.store.lock().unwrap();
+        assert!(s.get_mirror(notes).unwrap().is_none());
+        assert_eq!(s.get_doc(notes).unwrap().parent_id, None, "her filing is hers");
+    }
+
+    // slice 1: relayed docs take no edits through the hub
+    let bob_share = hub_share_for_bob.id.to_string();
+    let op = grimoire_store::OpInput {
+        kind: grimoire_store::OpKind::Insert {
+            block_id: uuid::Uuid::now_v7(), parent_id: None, order_key: "b".into(),
+            block_type: grimoire_store::BlockType::Paragraph, content: "bob's edit".into(), refers_to: None,
+        },
+        source_refs: vec![],
+    };
+    let res = request(&bob.ep, h.addr.clone(), Request::Propose {
+        share: bob_share.clone(), doc: sub.to_string(), ops: vec![op.clone()], note: String::new(), base_epoch: None, request_id: None,
+    }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::RelayedReadOnly);
+    let Response::Refused { reason, .. } = res else { unreachable!() };
+    assert_eq!(reason, "this doc is owned by alice — edits go to them, not the hub (coming soon)");
+    let res = request(&bob.ep, h.addr.clone(), Request::HotStart { share: bob_share.clone(), doc: sub.to_string(), base_epoch: Some(1) }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::RelayedReadOnly);
+    let res = request(&bob.ep, h.addr.clone(), Request::EditPing { share: bob_share.clone(), doc: sub.to_string(), key: uuid::Uuid::now_v7().to_string() }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::RelayedReadOnly);
+    let res = request(&bob.ep, h.addr.clone(), Request::HotEnd { share: bob_share.clone(), doc: sub.to_string() }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::RelayedReadOnly);
+    let block = bob.store.lock().unwrap().read_doc(sub).unwrap().roots[0].block.id;
+    let res = request(&bob.ep, h.addr.clone(), Request::Comment { share: bob_share.clone(), target_block: block.to_string(), text: "hi".into(), reply_to: None }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::RelayedReadOnly);
+    // reading is fine; and a HUB-OWNED doc behaves like any owner's (parks)
+    let res = request(&bob.ep, h.addr.clone(), Request::HotStatus { share: bob_share.clone(), doc: sub.to_string() }).await.unwrap();
+    assert!(matches!(res, Response::HotStatusIs { hot: false, .. }));
+    let res = request(&bob.ep, h.addr.clone(), Request::Propose {
+        share: bob_share.clone(), doc: cfg.root_doc.to_string(), ops: vec![op], note: String::new(), base_epoch: None, request_id: None,
+    }).await.unwrap();
+    assert!(matches!(res, Response::Proposed { .. }), "{res:?}");
+
+    // unpublish: alice revokes her share → the hub's pull says so → it drops
+    // the mirrors and forgets the publication → bob loses the docs on his pull
+    alice.store.lock().unwrap().set_share_state(share.id, grimoire_store::ShareState::Revoked).unwrap();
+    let alice_on_hub = h.contact_of(&alice);
+    let res = pull_share(&h.ep, &h.store, alice.addr.clone(), &alice_on_hub, share.id).await;
+    assert!(matches!(res.as_ref().err().and_then(|e| e.downcast_ref::<super::wire::Refusal>()).map(|r| r.code), Some(RefusalCode::ShareRevoked)));
+    {
+        let mut s = h.store.lock().unwrap();
+        assert_eq!(drop_dead_share(&mut s, share.id).len(), 2);
+        assert!(s.list_hub_publications().unwrap().is_empty(), "unpublish forgets the publication");
+        assert!(s.doc_is_tombstoned(notes).unwrap());
+    }
+    let sum = pull_hub(&bob, &h, &cfg).await;
+    assert_eq!(sum.removed, 2);
+    assert!(bob.store.lock().unwrap().get_mirror(notes).unwrap().is_none());
+    assert!(bob.store.lock().unwrap().doc_is_tombstoned(notes).unwrap());
+}
+
+#[tokio::test]
+async fn hub_eject_revokes_access_and_drops_the_members_publications() {
+    let (h, cfg, alice, bob) = team().await;
+    pull_hub(&bob, &h, &cfg).await;
+    // bob publishes one doc
+    let plan = bob.doc("Plan", None, "bob's plan");
+    let hub_on_bob = bob.contact_of(&h);
+    let (share, minted) = {
+        let mut s = bob.store.lock().unwrap();
+        let (share, minted) = super::client::mint_invite_full(&mut s, &bob.pubkey(), plan, SharePermission::Propose).unwrap();
+        s.set_invite_offered_to(share.id, hub_on_bob.id).unwrap();
+        (share, minted)
+    };
+    request(&bob.ep, h.addr.clone(), Request::Offer {
+        share: share.id.to_string(), root_title: "Plan".into(), permission: "propose".into(),
+        secret: minted.secret, expires_at: minted.expires_at,
+    }).await.unwrap();
+    eventually("hub relays bob's plan", || h.store.lock().unwrap().get_mirror(plan).unwrap().is_some_and(|m| m.synced_epoch > 0)).await;
+    pull_hub(&alice, &h, &cfg).await;
+    assert_eq!(alice.store.lock().unwrap().get_mirror(plan).unwrap().unwrap().origin_owner_name.as_deref(), Some("bob"));
+
+    // a view-only offer to a hub is not a publication
+    let res = request(&bob.ep, h.addr.clone(), Request::Offer {
+        share: uuid::Uuid::now_v7().to_string(), root_title: "X".into(), permission: "view".into(),
+        secret: "s".into(), expires_at: "2099-01-01T00:00:00.000Z".into(),
+    }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::BadRequest);
+
+    // alice ejects bob (not herself)
+    let bob_on_hub = h.contact_of(&bob);
+    let alice_on_hub = h.contact_of(&alice);
+    let res = request(&alice.ep, h.addr.clone(), Request::HubAdmin {
+        action: super::wire::HubAction::Eject { contact_id: alice_on_hub.id.to_string() },
+    }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
+    let res = request(&alice.ep, h.addr.clone(), Request::HubAdmin {
+        action: super::wire::HubAction::Eject { contact_id: bob_on_hub.id.to_string() },
+    }).await.unwrap();
+    assert_eq!(res, Response::Noted);
+    {
+        let s = h.store.lock().unwrap();
+        let b = s.contact_by_pubkey(&bob.pubkey()).unwrap().unwrap();
+        assert_eq!((b.membership, b.revoked), (grimoire_store::Membership::Ejected, true));
+        assert!(s.list_shares().unwrap().iter().filter(|sh| sh.contact == Some(b.id)).all(|sh| sh.state == grimoire_store::ShareState::Revoked));
+        assert!(s.list_hub_publications().unwrap().is_empty());
+        assert!(s.get_mirror(plan).unwrap().is_none());
+        assert!(s.doc_is_tombstoned(plan).unwrap());
+        // the member list still shows him, as ejected
+        let m = super::hub::members(&s).unwrap();
+        assert_eq!(m.iter().find(|m| m.pubkey == bob.pubkey()).unwrap().membership, "ejected");
+    }
+    // bob is out: refused as an unknown peer; alice's next pull drops his doc
+    let res = request(&bob.ep, h.addr.clone(), Request::Ping).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::UnknownPeer);
+    let sum = pull_hub(&alice, &h, &cfg).await;
+    assert_eq!(sum.removed, 2, "his doc and his folder");
+    assert!(alice.store.lock().unwrap().get_mirror(plan).unwrap().is_none());
+    // and a pending member cannot publish at all
+    let carol = peer("carol").await;
+    join_at(&carol.ep, &carol.store, &hub_invite(&h, &cfg), h.addr.clone()).await.unwrap();
+    let res = request(&carol.ep, h.addr.clone(), Request::Offer {
+        share: uuid::Uuid::now_v7().to_string(), root_title: "X".into(), permission: "propose".into(),
+        secret: "s".into(), expires_at: "2099-01-01T00:00:00.000Z".into(),
+    }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
+    assert!(h.store.lock().unwrap().list_share_offers(false).unwrap().iter().all(|o| o.root_title != "X"));
+}
+
+/// The re-share guard stands everywhere except the one hub case: a share
+/// never serves mirrors — not on a plain instance, not for a hub's other
+/// shares — only the hub root's share serves docs that are hub publications.
+#[test]
+fn served_docs_excludes_mirrors_unless_they_are_hub_publications_under_the_hub_root() {
+    let mut s = SqliteStore::open_in_memory().unwrap();
+    let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let root = s.create_doc("Root", None, tom.id).unwrap();
+    let share = s.create_share(root.id, None, SharePermission::View, None).unwrap();
+    // a mirror that later lands under the shared root (e.g. moved there)
+    let owner = s.pair_contact(&"ab".repeat(32), "alice · abab").unwrap();
+    let theirs = s.create_doc_with_id(uuid::Uuid::now_v7(), "theirs", Some(root.id), owner.principal).unwrap();
+    let kid = s.create_doc_with_id(uuid::Uuid::now_v7(), "kid", Some(theirs.id), owner.principal).unwrap();
+    let their_share = uuid::Uuid::now_v7();
+    s.upsert_mirror(theirs.id, owner.id, their_share, 1, SharePermission::Propose).unwrap();
+    s.upsert_mirror(kid.id, owner.id, their_share, 1, SharePermission::Propose).unwrap();
+    let ids = |docs: Vec<grimoire_store::Doc>| docs.into_iter().map(|d| d.id).collect::<Vec<_>>();
+    // plain instance: mirror + its children hidden
+    assert_eq!(ids(super::server::served_docs(&s, share.id).unwrap()), vec![root.id]);
+    // even a recorded publication changes nothing when not a hub
+    s.add_hub_publication(their_share, owner.id, theirs.id).unwrap();
+    assert_eq!(ids(super::server::served_docs(&s, share.id).unwrap()), vec![root.id]);
+    // hub mode, but this share is not the hub root's: still hidden
+    let cfg = super::hub::enable(&mut s, Some("Team"), tom.id).unwrap();
+    assert_eq!(ids(super::server::served_docs(&s, share.id).unwrap()), vec![root.id]);
+    // the hub root's share, with the publication filed under it: relayed —
+    // and the re-share guard lets the hub mint that share AFTER publications landed
+    s.move_doc(theirs.id, Some(cfg.root_doc), None).unwrap();
+    let hub_share = s.create_share(cfg.root_doc, None, SharePermission::Propose, None).unwrap();
+    // …while a share of the member folder's parent that is NOT the hub root is still refused
+    let other_root = s.create_doc("Other", None, tom.id).unwrap();
+    s.move_doc(theirs.id, Some(other_root.id), None).unwrap();
+    assert!(s.create_share(other_root.id, None, SharePermission::View, None).is_err());
+    s.move_doc(theirs.id, Some(cfg.root_doc), None).unwrap();
+    let served = ids(super::server::served_docs(&s, hub_share.id).unwrap());
+    assert_eq!(served.len(), 3);
+    assert!(served.contains(&theirs.id) && served.contains(&kid.id));
+    // never back to its owner
+    let for_owner = ids(super::server::served_docs_for(&s, hub_share.id, Some(&owner.pubkey)).unwrap());
+    assert_eq!(for_owner, vec![cfg.root_doc]);
+    // a mirror under the hub root that is NOT a publication stays hidden
+    let stray = s.create_doc_with_id(uuid::Uuid::now_v7(), "stray", Some(cfg.root_doc), owner.principal).unwrap();
+    s.upsert_mirror(stray.id, owner.id, uuid::Uuid::now_v7(), 1, SharePermission::View).unwrap();
+    assert!(!ids(super::server::served_docs(&s, hub_share.id).unwrap()).contains(&stray.id));
+}

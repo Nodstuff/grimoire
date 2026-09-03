@@ -1,7 +1,7 @@
 // Pure seams for the Shares page: grouping/ordering of the shares we own, and
 // the one-line status of a mirror someone shared with us.
 
-import type { MirrorRow, Share, ShareOffer } from './types'
+import type { HubMembership, HubRole, MirrorRow, Share, ShareOffer } from './types'
 import { relTime } from './time'
 
 export interface ShareGroups {
@@ -79,4 +79,21 @@ export function mirrorStatusLine(row: MirrorRow, now: number = Date.now()): Mirr
 /** Short, spaced fingerprint of a hex pubkey for display. */
 export function shortFingerprint(pubkey: string): string {
   return (pubkey.slice(0, 16).match(/.{1,4}/g) ?? []).join(' ')
+}
+
+/** My standing at a hub, in words. */
+export function hubStandingLine(role: HubRole, membership: HubMembership): string {
+  if (membership === 'pending') return 'waiting for an admin to approve you'
+  if (membership === 'ejected') return 'you were removed'
+  return role === 'admin' ? 'you are an admin' : 'you are a member'
+}
+
+/** "published to Team: 2" */
+export function publishedLine(hubName: string, n: number): string {
+  return `published to ${hubName}: ${n}`
+}
+
+/** The banner line for a doc relayed through a hub: who really owns it. */
+export function relayedLine(hubName: string, ownerName: string): string {
+  return `⌂ ${hubName} · owned by ${ownerName} · read-only for now`
 }

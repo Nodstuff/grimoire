@@ -11,7 +11,7 @@
 
 use super::client::{join_once, pull_share, request};
 use super::runtime::Runtime;
-use super::server::served_docs;
+use super::server::served_docs_for;
 use super::wire::{NotifyItem, NotifyKind, Refusal, RefusalCode, Request, Response, Ticket};
 use crate::hot::HotState;
 use anyhow::Result;
@@ -147,6 +147,9 @@ pub fn drop_dead_share(store: &mut SqliteStore, share_id: Uuid) -> Vec<Uuid> {
         store.remove_mirror(*doc).ok();
         store.delete_doc(*doc).ok();
     }
+    // hub: a member unpublished (revoked their share) — the relay forgets it
+    // too, so other members lose those docs on their next pull
+    store.remove_hub_publication(share_id).ok();
     orphans
 }
 
@@ -446,7 +449,7 @@ pub async fn notify_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot
                 .filter(|sh| sh.state == grimoire_store::ShareState::Active)
                 .filter_map(|sh| {
                     let c = contacts.iter().find(|c| Some(c.id) == sh.contact && !c.revoked)?.clone();
-                    let docs = served_docs(&s, sh.id).ok()?;
+                    let docs = served_docs_for(&s, sh.id, Some(&c.pubkey)).ok()?;
                     let view: Vec<(Uuid, String, DocMark)> = docs
                         .into_iter()
                         .map(|d| {

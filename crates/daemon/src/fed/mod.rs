@@ -14,12 +14,14 @@
 //! - `client` — grantee side: request, join, pull, propose/comment upstream,
 //!              hot relay one-shots, mint_invite (owner CLI/admin helper)
 //! - `loops`  — background pull / outbound-status / join-retry loops
+//! - `hub`    — hub mode: membership, publish (auto-accept), relay provenance
 //!
 //! Wire format: one request per bi-stream. The opener writes one JSON frame
 //! and finishes; the acceptor replies with one JSON frame. Every frame
 //! carries `v` (protocol version) — refused loudly on mismatch.
 
 pub mod client;
+pub mod hub;
 pub mod loops;
 pub mod runtime;
 pub mod server;

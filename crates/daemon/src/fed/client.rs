@@ -292,6 +292,13 @@ pub struct JoinOutcome {
     /// revoked (its pubkey will never answer again) and named here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_changed_from: Option<String>,
+    /// Hub (slice 1): the owner is a hub.
+    #[serde(default)]
+    pub is_hub: bool,
+    /// Hub: "pending" = we are paired but hold nothing until an admin
+    /// approves (no mirror was created); "active" = a member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub membership: Option<String>,
 }
 
 /// One join attempt (grantee-side): dial the ticket's node, redeem, pair the
@@ -343,6 +350,9 @@ pub async fn join_at(
         root_title,
         permission,
         owner_name,
+        is_hub,
+        membership,
+        role,
     } = res
     else {
         // typed so the retry loop can tell a DEAD invite (already redeemed,
@@ -355,6 +365,33 @@ pub async fn join_at(
 
     let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
     let owner_contact = s.pair_contact(&ticket.node, &owner_name)?;
+    // hub: remember what it is and where we stand with it (the contact row
+    // carries MY role/membership at that hub)
+    if is_hub {
+        if !owner_contact.is_hub {
+            s.set_contact_is_hub(owner_contact.id, true)?;
+        }
+        if let Some(m) = membership.as_deref().and_then(grimoire_store::Membership::parse) {
+            s.set_contact_membership(owner_contact.id, m)?;
+        }
+        if let Some(r) = role.as_deref().and_then(grimoire_store::ContactRole::parse) {
+            s.set_contact_role(owner_contact.id, r)?;
+        }
+        if membership.as_deref() == Some("pending") {
+            // paired, but no share until an admin approves: nothing to mirror
+            tracing::info!(hub = owner_name, "joined a hub; waiting for an admin to approve");
+            return Ok(JoinOutcome {
+                owner: ticket.node.clone(),
+                owner_name,
+                root_doc,
+                root_title,
+                permission,
+                owner_changed_from: None,
+                is_hub: true,
+                membership,
+            });
+        }
+    }
     let root_uuid: uuid::Uuid = root_doc.parse().context("owner sent a bad doc id")?;
     let share_uuid: uuid::Uuid = share_id.parse().context("owner sent a bad share id")?;
     // same UUID = same doc. Three cases for a root id we already have:
@@ -424,6 +461,8 @@ pub async fn join_at(
         root_title,
         permission,
         owner_changed_from,
+        is_hub,
+        membership,
     })
 }
 
@@ -629,6 +668,8 @@ async fn pull_page(
         // refuse to tend the doc locally (one side's agents own it)
         s.set_mirror_tended(id, m.tended)?;
         s.set_mirror_owner_epoch(id, m.epoch)?;
+        // hub relay provenance: who really owns this doc (None = the owner we pull from)
+        s.set_mirror_origin(id, m.origin_owner.as_deref(), m.origin_owner_name.as_deref())?;
     }
     for wd in &changed {
         let Ok(id) = wd.meta.id.parse::<uuid::Uuid>() else {

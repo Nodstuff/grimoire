@@ -9,10 +9,11 @@
 //! Refusals carry a typed `RefusalCode` beside the human reason — the
 //! grantee's loops branch on the code, never on the text.
 
+use super::hub;
 use super::runtime::Runtime;
 use super::wire::{
-    ALPN, Frame, HOT_ALPN, MAX_FRAME, PROTOCOL_VERSION, PULL_BUDGET, Refusal, RefusalCode,
-    Request, Response, WireDoc, WireDocMeta, hash_secret,
+    ALPN, Frame, HOT_ALPN, HubAction, MAX_FRAME, PROTOCOL_VERSION, PULL_BUDGET, Refusal,
+    RefusalCode, Request, Response, WireDoc, WireDocMeta, hash_secret,
 };
 use crate::hot::HotState;
 use anyhow::{Context, Result};
@@ -227,6 +228,7 @@ fn dispatch(
     };
     // the one request an unknown peer may make
     if let Request::Redeem { secret, petname } = req {
+        let was_new = contact.is_none();
         return match store.redeem_invite(&hash_secret(&secret), peer, &petname) {
             Ok((contact, share)) => {
                 tracing::info!(
@@ -248,12 +250,42 @@ fn dispatch(
                     })
                     .map(|p| p.display_name)
                     .unwrap_or_else(|| "owner".into());
+                // hub: first contact = first admin; later ones wait for approval
+                let hub_cfg = hub::config(&store);
+                let decision = match &hub_cfg {
+                    Some(h) => match hub::on_redeem(&mut store, h, was_new, &contact, &share) {
+                        Ok(d) => Some(d),
+                        Err(e) => {
+                            tracing::warn!(peer, "hub membership decision failed: {e:#}");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                if let Some(d) = &decision {
+                    tracing::info!(
+                        peer,
+                        petname = contact.petname,
+                        membership = d.membership.as_str(),
+                        role = d.role.as_str(),
+                        "hub: membership decided"
+                    );
+                }
+                // a pending member gets the share taken back: say so
+                let permission = match &decision {
+                    Some(d) if d.membership == grimoire_store::Membership::Active => "propose".to_string(),
+                    Some(_) => "none".to_string(),
+                    None => share.permission.as_str().to_string(),
+                };
                 Response::Redeemed {
                     share_id: share.id.to_string(),
                     root_doc: share.root_doc.to_string(),
                     root_title,
-                    permission: share.permission.as_str().to_string(),
+                    permission,
                     owner_name,
+                    is_hub: hub_cfg.is_some(),
+                    membership: decision.as_ref().map(|d| d.membership.as_str().to_string()),
+                    role: decision.as_ref().map(|d| d.role.as_str().to_string()),
                 }
             }
             Err(e) => {
@@ -267,8 +299,44 @@ fn dispatch(
         tracing::warn!(peer, "unauthenticated request refused");
         return unknown_peer();
     };
+    // hub: a member who is not (yet) active may only ask where they stand
+    let hub_cfg = hub::config(&store);
+    if let Some(h) = &hub_cfg
+        && contact.membership != grimoire_store::Membership::Active
+    {
+        return match req {
+            Request::HubStatus => hub_status(&store, h, &contact),
+            _ => Response::refused(
+                RefusalCode::NotAllowed,
+                format!("your request to join {} is waiting for an admin", h.name),
+            ),
+        };
+    }
     match req {
         Request::Redeem { .. } => unreachable!("handled above"),
+        Request::HubStatus => match &hub_cfg {
+            Some(h) => hub_status(&store, h, &contact),
+            None => Response::refused(RefusalCode::Unsupported, "this Grimoire is not a hub"),
+        },
+        Request::HubAdmin { action } => {
+            let Some(h) = &hub_cfg else {
+                return Response::refused(RefusalCode::Unsupported, "this Grimoire is not a hub");
+            };
+            if contact.role != grimoire_store::ContactRole::Admin {
+                tracing::warn!(peer, petname = contact.petname, ?action, "hub admin action from a non-admin refused");
+                return Response::refused(
+                    RefusalCode::NotAllowed,
+                    format!("only an admin of {} can do that", h.name),
+                );
+            }
+            match handle_hub_admin(&mut store, h, &contact, action, endpoint) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(peer, "hub admin action refused: {e:#}");
+                    refuse(e)
+                }
+            }
+        }
         Request::Ping => {
             tracing::debug!(peer, petname = contact.petname, "ping");
             Response::Pong
@@ -454,6 +522,12 @@ fn dispatch(
             if secret.is_empty() || secret.len() > 128 || root_title.chars().count() > 300 {
                 return Response::refused(RefusalCode::BadRequest, "bad offer");
             }
+            if hub_cfg.is_some() && perm != grimoire_store::SharePermission::Propose {
+                return Response::refused(
+                    RefusalCode::BadRequest,
+                    "publishing to a hub needs a share that can propose edits",
+                );
+            }
             match store.add_share_offer(
                 contact.id,
                 peer,
@@ -465,7 +539,24 @@ fn dispatch(
             ) {
                 Ok(offer) => {
                     tracing::info!(peer, petname = contact.petname, share, "share offer received");
-                    runtime.push_event("share_offered", offer.id, root_title, contact.petname.clone());
+                    if hub_cfg.is_some() {
+                        // hub: an active member publishing — accept without a human,
+                        // off this thread (dispatch holds the store lock). The member
+                        // just dialed us, so their address is known to the endpoint.
+                        if let Ok(id) = peer.parse::<iroh::EndpointId>() {
+                            let endpoint = endpoint.clone();
+                            let store_arc = store_arc.clone();
+                            let offer_id = offer.id;
+                            tokio::spawn(async move {
+                                match hub::accept_publication(&endpoint, &store_arc, offer_id, iroh::EndpointAddr::from(id)).await {
+                                    Ok(root) => tracing::info!(%root, "hub: publication relayed"),
+                                    Err(e) => tracing::warn!("hub: publication not accepted: {e:#}"),
+                                }
+                            });
+                        }
+                    } else {
+                        runtime.push_event("share_offered", offer.id, root_title, contact.petname.clone());
+                    }
                     Response::Noted
                 }
                 Err(e) => Response::refused(RefusalCode::Other, e.to_string()),
@@ -559,11 +650,33 @@ fn authorize_share(
 /// The docs a share exposes: its subtree MINUS any mirror (content shared TO
 /// this instance is never served onward — belt and braces with the API-level
 /// move refusal and the create-time re-share guard).
+///
+/// The ONE exception is a hub relaying publications (slice 1): for the share
+/// of the hub root, mirrors that are hub publications ARE served — with their
+/// true owner in the wire meta (`relay_origins`). Nothing else changes: a
+/// hub's other shares, and every non-hub instance, still hide mirrors.
 pub(super) fn served_docs(store: &SqliteStore, share_id: uuid::Uuid) -> Result<Vec<grimoire_store::Doc>> {
+    served_docs_for(store, share_id, None)
+}
+
+/// `served_docs` for one viewer: a member never receives their OWN docs back
+/// through the relay (they would only be ignored by the hijack guard).
+pub(super) fn served_docs_for(
+    store: &SqliteStore,
+    share_id: uuid::Uuid,
+    viewer_pubkey: Option<&str>,
+) -> Result<Vec<grimoire_store::Doc>> {
+    let relay = relay_origins(store, share_id);
     let mirrors: std::collections::HashSet<uuid::Uuid> = store
         .list_mirrors()?
         .into_iter()
         .map(|m| m.doc_id)
+        .filter(|id| match (relay.get(id), viewer_pubkey) {
+            // relayed, and not the viewer's own: served
+            (Some((owner, _)), Some(v)) => owner == v,
+            (Some(_), None) => false,
+            _ => true,
+        })
         .collect();
     let mut docs = store.docs_in_share(share_id)?;
     if !mirrors.is_empty() {
@@ -587,11 +700,108 @@ pub(super) fn served_docs(store: &SqliteStore, share_id: uuid::Uuid) -> Result<V
     Ok(docs)
 }
 
+/// Relay provenance for a share: doc → (true owner pubkey, display name),
+/// non-empty only on a hub for the share of its root.
+fn relay_origins(store: &SqliteStore, share_id: uuid::Uuid) -> std::collections::HashMap<uuid::Uuid, (String, String)> {
+    match hub::config(store) {
+        Some(h) if store.get_share(share_id).map(|sh| sh.root_doc == h.root_doc).unwrap_or(false) => {
+            hub::relay_set(store)
+        }
+        _ => Default::default(),
+    }
+}
+
 fn require_in_share(store: &SqliteStore, share_id: uuid::Uuid, doc_id: uuid::Uuid) -> Result<()> {
     if served_docs(store, share_id)?.iter().any(|d| d.id == doc_id) {
         Ok(())
     } else {
         Err(Refusal::new(RefusalCode::NotInShare, "doc is not in this share").into())
+    }
+}
+
+/// Slice 1: a relayed doc is not the hub's to change. Writes (propose, hot
+/// start/end, edit pings, comments) are refused with a typed code; routing
+/// them to the owner is the next slice.
+fn require_not_relayed(store: &SqliteStore, share_id: uuid::Uuid, doc_id: uuid::Uuid) -> Result<()> {
+    if let Some((_, name)) = relay_origins(store, share_id).get(&doc_id) {
+        return Err(Refusal::new(
+            RefusalCode::RelayedReadOnly,
+            format!("this doc is owned by {name} — edits go to them, not the hub (coming soon)"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// `HubStatus`: where the asking contact stands.
+fn hub_status(store: &SqliteStore, h: &hub::HubConfig, contact: &grimoire_store::Contact) -> Response {
+    let contacts = store.list_contacts().unwrap_or_default();
+    let live: Vec<_> = contacts.iter().filter(|c| !c.revoked && !c.is_hub).collect();
+    Response::HubStatusIs {
+        name: h.name.clone(),
+        role: contact.role.as_str().into(),
+        membership: contact.membership.as_str().into(),
+        members: live.iter().filter(|c| c.membership == grimoire_store::Membership::Active).count(),
+        pending: live.iter().filter(|c| c.membership == grimoire_store::Membership::Pending).count(),
+    }
+}
+
+/// `HubAdmin`: the caller is already known to be an admin. Delivery of a
+/// membership offer happens off-thread (dispatch holds the store lock).
+fn handle_hub_admin(
+    store: &mut SqliteStore,
+    h: &hub::HubConfig,
+    admin: &grimoire_store::Contact,
+    action: HubAction,
+    endpoint: &Endpoint,
+) -> Result<Response> {
+    let parse = |id: &str| -> Result<uuid::Uuid> {
+        id.parse()
+            .map_err(|_| Refusal::new(RefusalCode::BadRequest, "bad contact id").into())
+    };
+    match action {
+        HubAction::ListMembers => Ok(Response::HubMembers {
+            members: hub::members(store)?,
+        }),
+        HubAction::Approve { contact_id } => {
+            let node_id = endpoint.id().to_string();
+            let (hub_cfg, member, share, minted) = hub::approve(store, &node_id, parse(&contact_id)?)?;
+            tracing::info!(admin = admin.petname, member = member.petname, "hub: approved over the wire");
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move {
+                hub::deliver_membership(&endpoint, &hub_cfg, &member, &share, &minted).await;
+            });
+            Ok(Response::Noted)
+        }
+        HubAction::Eject { contact_id } => {
+            let id = parse(&contact_id)?;
+            if id == admin.id {
+                return Err(Refusal::new(RefusalCode::NotAllowed, "you cannot eject yourself").into());
+            }
+            hub::eject(store, id)?;
+            tracing::info!(admin = admin.petname, member = %id, "hub: ejected over the wire");
+            Ok(Response::Noted)
+        }
+        HubAction::SetRole { contact_id, role } => {
+            let role = grimoire_store::ContactRole::parse(&role)
+                .ok_or_else(|| Refusal::new(RefusalCode::BadRequest, "role must be member or admin"))?;
+            let id = parse(&contact_id)?;
+            if id == admin.id && role != grimoire_store::ContactRole::Admin {
+                return Err(Refusal::new(RefusalCode::NotAllowed, "you cannot demote yourself").into());
+            }
+            hub::set_role(store, id, role)?;
+            Ok(Response::Noted)
+        }
+        HubAction::Invite => {
+            let node_id = endpoint.id().to_string();
+            let (_share, link) = super::client::mint_invite(
+                store,
+                &node_id,
+                h.root_doc,
+                grimoire_store::SharePermission::Propose,
+            )?;
+            Ok(Response::HubInvite { link })
+        }
     }
 }
 
@@ -612,6 +822,9 @@ fn authorize_hot(
         return Err(Refusal::new(RefusalCode::ViewOnly, "share is view-only").into());
     }
     require_in_share(store, share.id, doc_uuid)?;
+    if need_propose {
+        require_not_relayed(store, share.id, doc_uuid)?;
+    }
     Ok(doc_uuid)
 }
 
@@ -639,6 +852,8 @@ fn handle_comment(
         .map_err(|_| Refusal::new(RefusalCode::NotInShare, "block is not in this share"))?;
     require_in_share(store, share.id, block.doc_id)
         .map_err(|_| Refusal::new(RefusalCode::NotInShare, "block is not in this share"))?;
+    // a relayed doc's blocks are wiped on the next pull: a comment here would vanish
+    require_not_relayed(store, share.id, block.doc_id)?;
     let reply_to = reply_to
         .map(|r| r.parse::<uuid::Uuid>())
         .transpose()
@@ -677,6 +892,7 @@ fn handle_propose(
         return Err(Refusal::new(RefusalCode::ViewOnly, "share is view-only").into());
     }
     require_in_share(store, share.id, doc_uuid)?;
+    require_not_relayed(store, share.id, doc_uuid)?;
     if ops.is_empty() {
         return Err(Refusal::new(RefusalCode::BadRequest, "empty proposal").into());
     }
@@ -749,7 +965,8 @@ fn handle_pull(
     cursors: &[(String, i64)],
 ) -> Result<Response> {
     let share = authorize_share(store, contact, share_id)?;
-    let docs = served_docs(store, share.id)?;
+    let docs = served_docs_for(store, share.id, Some(&contact.pubkey))?;
+    let relay = relay_origins(store, share.id);
     let in_share: std::collections::HashSet<uuid::Uuid> = docs.iter().map(|d| d.id).collect();
     let cursor_map: std::collections::HashMap<String, i64> = cursors.iter().cloned().collect();
 
@@ -797,6 +1014,8 @@ fn handle_pull(
             title: d.title.clone(),
             epoch: d.current_epoch,
             tended: is_tended(d.id),
+            origin_owner: relay.get(&d.id).map(|(pk, _)| pk.clone()),
+            origin_owner_name: relay.get(&d.id).map(|(_, name)| name.clone()),
         };
         let unchanged = cursor_map
             .get(&meta.id)

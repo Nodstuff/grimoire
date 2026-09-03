@@ -135,6 +135,55 @@ pub enum Request {
         share: String,
         items: Vec<NotifyItem>,
     },
+    /// Hub (slice 1): an admin acting on the hub's membership from their OWN
+    /// Grimoire. Authorized iff the caller's contact row on the hub has role
+    /// admin. Refused with `Unsupported` by a peer that is not a hub.
+    HubAdmin { action: HubAction },
+    /// Hub (slice 1): "what am I to you?" — any contact (even pending) may
+    /// ask, so a member waiting for approval can see that they are waiting.
+    HubStatus,
+}
+
+/// What a hub admin can do over the wire.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum HubAction {
+    ListMembers,
+    /// Pending → active: the hub mints a `propose` share of its root to the
+    /// member and offers it.
+    Approve { contact_id: String },
+    /// Active/pending → ejected: their hub-root share and every publication
+    /// of theirs are revoked; the contact is blocked.
+    Eject { contact_id: String },
+    /// "member" | "admin".
+    SetRole { contact_id: String, role: String },
+    /// Mint a one-time invite (propose, hub root) and return the link — how
+    /// an admin onboards someone without touching the hub box.
+    Invite,
+}
+
+/// One row of a hub's member list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HubMember {
+    pub contact_id: String,
+    pub petname: String,
+    pub pubkey: String,
+    /// "member" | "admin"
+    pub role: String,
+    /// "pending" | "active" | "ejected"
+    pub membership: String,
+    pub paired_at: String,
+    /// Subtrees this member has published to the hub.
+    pub publications: Vec<HubPublicationInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HubPublicationInfo {
+    pub share_id: String,
+    pub root_doc: String,
+    pub root_title: String,
+    pub doc_count: usize,
+    pub published_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +224,13 @@ pub struct WireDocMeta {
     /// peers still deserialize.
     #[serde(default)]
     pub tended: bool,
+    /// Hub relay provenance (slice 1): set ONLY by a hub, ONLY on docs it
+    /// relays for a member — the true owner's pubkey (hex) and the name the
+    /// hub knows them by. None for the serving peer's own docs.
+    #[serde(default)]
+    pub origin_owner: Option<String>,
+    #[serde(default)]
+    pub origin_owner_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -194,6 +250,16 @@ pub enum Response {
         /// The owner's self-chosen display name — the grantee's default
         /// petname for them (renameable, like any petname).
         owner_name: String,
+        /// Hub (slice 1): the owner is a hub. Absent from pre-hub peers.
+        #[serde(default)]
+        is_hub: bool,
+        /// Hub: the redeemer's standing — "pending" (no share yet; wait for
+        /// an admin) or "active". None from a plain owner.
+        #[serde(default)]
+        membership: Option<String>,
+        /// Hub: "member" | "admin". None from a plain owner.
+        #[serde(default)]
+        role: Option<String>,
     },
     Pong,
     /// Nudge acknowledged.
@@ -243,6 +309,18 @@ pub enum Response {
         #[serde(default)]
         code: RefusalCode,
     },
+    /// Hub (slice 1): the member list, admins only.
+    HubMembers { members: Vec<HubMember> },
+    /// Hub (slice 1): a minted invite link (admin `Invite`).
+    HubInvite { link: String },
+    /// Hub (slice 1): the caller's standing at this hub.
+    HubStatusIs {
+        name: String,
+        role: String,
+        membership: String,
+        members: usize,
+        pending: usize,
+    },
 }
 
 impl Response {
@@ -284,6 +362,9 @@ pub enum RefusalCode {
     BadRequest,
     /// Protocol version mismatch.
     Version,
+    /// Hub (slice 1): the doc is relayed for another member; the hub is not
+    /// its home, so it takes no edits — they will route to the owner later.
+    RelayedReadOnly,
     #[default]
     #[serde(other)]
     Other,

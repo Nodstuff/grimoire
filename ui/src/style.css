@@ -878,6 +878,14 @@ kbd {
 
 .mirror-badge { color: var(--accent); font-size: 10px; margin-left: 6px; }
 .shared-badge { color: var(--green); font-size: 10px; margin-left: 6px; }
+/* hub (slice 1) */
+.mirror-badge.hub, .shared-badge.hub { font-size: 11px; }
+.hub-mark { color: var(--accent); font-size: 13px; }
+.hub-card .hub-pubs, .hub-card .hub-members { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
+.hub-card .share-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.hub-invite { margin-top: 6px; }
+.share-hubs { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+.share-hubs .share-row { display: flex; align-items: center; gap: 8px; }
 .chip.shared { color: var(--green); border-color: var(--green); }
 
 .propose-cta {

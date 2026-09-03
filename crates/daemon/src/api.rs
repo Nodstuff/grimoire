@@ -109,6 +109,29 @@ async fn docs(State(st): State<ApiState>) -> Json<Value> {
         .iter()
         .map(|m| (m.doc_id.to_string(), m.permission.as_str().to_string()))
         .collect();
+    // hub (slice 1): mirrors that come from a hub, relayed docs' true owners,
+    // and my subtrees published to a hub (every doc under a published root)
+    let contacts = s.list_contacts().unwrap_or_default();
+    let hub_contacts: std::collections::HashMap<Uuid, String> = contacts
+        .iter()
+        .filter(|c| c.is_hub && !c.revoked)
+        .map(|c| (c.id, c.petname.clone()))
+        .collect();
+    let from_hub: std::collections::HashSet<String> = mirror_rows
+        .iter()
+        .filter(|m| hub_contacts.contains_key(&m.owner))
+        .map(|m| m.doc_id.to_string())
+        .collect();
+    let origin_names: std::collections::HashMap<String, String> = mirror_rows
+        .iter()
+        .filter_map(|m| m.origin_owner_name.clone().map(|n| (m.doc_id.to_string(), n)))
+        .collect();
+    let all_shares = s.list_shares().unwrap_or_default();
+    let published_roots: std::collections::HashMap<Uuid, String> = all_shares
+        .iter()
+        .filter(|sh| sh.state == grimoire_store::ShareState::Active)
+        .filter_map(|sh| sh.contact.and_then(|c| hub_contacts.get(&c)).map(|n| (sh.root_doc, n.clone())))
+        .collect();
     // mirrors tended on the owner's side: shown as tended locally, and the
     // tend panel refuses to configure them (avoids two-sided agent edits)
     let owner_tended: std::collections::HashSet<String> = mirror_rows
@@ -116,33 +139,84 @@ async fn docs(State(st): State<ApiState>) -> Json<Value> {
         .filter(|m| m.owner_tended)
         .map(|m| m.doc_id.to_string())
         .collect();
-    let share_roots: std::collections::HashSet<String> = s
-        .list_shares()
-        .unwrap_or_default()
-        .into_iter()
+    let share_roots: std::collections::HashSet<String> = all_shares
+        .iter()
         .filter(|sh| sh.state != grimoire_store::ShareState::Revoked)
         .map(|sh| sh.root_doc.to_string())
         .collect();
     match s.list_docs() {
-        Ok(d) => Json(json!(
-            d.into_iter()
-                .map(|doc| {
-                    let id = doc.id.to_string();
-                    let mut v = json!(doc);
-                    v["is_canvas"] = json!(canvases.contains(&id));
-                    let owner_t = owner_tended.contains(&id);
-                    v["is_tended"] = json!(tended.contains(&id) || owner_t);
-                    v["owner_tended"] = json!(owner_t);
-                    if let Some(perm) = mirrors.get(&id) {
-                        v["mirror_permission"] = json!(perm);
+        Ok(d) => {
+            let parent_of: std::collections::HashMap<Uuid, Option<Uuid>> =
+                d.iter().map(|x| (x.id, x.parent_id)).collect();
+            // the hub a doc is published to: the nearest published ancestor (or itself)
+            let published_to = |mut cur: Uuid| -> Option<&String> {
+                if published_roots.is_empty() {
+                    return None;
+                }
+                loop {
+                    if let Some(n) = published_roots.get(&cur) {
+                        return Some(n);
                     }
-                    v["is_shared"] = json!(share_roots.contains(&id));
-                    v
-                })
-                .collect::<Vec<_>>()
-        )),
+                    match parent_of.get(&cur).copied().flatten() {
+                        Some(p) => cur = p,
+                        None => return None,
+                    }
+                }
+            };
+            Json(json!(
+                d.iter()
+                    .map(|doc| {
+                        let id = doc.id.to_string();
+                        let mut v = json!(doc);
+                        v["is_canvas"] = json!(canvases.contains(&id));
+                        let owner_t = owner_tended.contains(&id);
+                        v["is_tended"] = json!(tended.contains(&id) || owner_t);
+                        v["owner_tended"] = json!(owner_t);
+                        if let Some(perm) = mirrors.get(&id) {
+                            v["mirror_permission"] = json!(perm);
+                        }
+                        v["is_shared"] = json!(share_roots.contains(&id));
+                        if from_hub.contains(&id) {
+                            v["from_hub"] = json!(true);
+                        }
+                        if let Some(n) = origin_names.get(&id) {
+                            v["origin_owner_name"] = json!(n);
+                        }
+                        if let Some(n) = published_to(doc.id) {
+                            v["published_to"] = json!(n);
+                        }
+                        v
+                    })
+                    .collect::<Vec<_>>()
+            ))
+        }
         Err(e) => Json(json!({"error": e.to_string()})),
     }
+}
+
+/// Hub mode (slice 1), for the hub's own UI and the CLI on the box: whether
+/// this Grimoire is a hub, its name and root, active members and pending
+/// requests. Read-only; approving lives under /admin/hub/*.
+async fn hub_info(State(st): State<ApiState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(hub) = crate::fed::hub::config(&s) else {
+        return Json(json!({"enabled": false}));
+    };
+    let members = crate::fed::hub::members(&s).unwrap_or_default();
+    let (active, pending): (Vec<_>, Vec<_>) = members
+        .into_iter()
+        .filter(|m| m.membership != "ejected")
+        .partition(|m| m.membership == "active");
+    Json(json!({
+        "enabled": true,
+        "name": hub.name,
+        "root_doc": hub.root_doc,
+        "members": active,
+        "pending": pending,
+    }))
 }
 
 /// Everything the doc view needs to render federation state for one doc:
@@ -161,6 +235,7 @@ async fn doc_federation(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Jso
             .map(|c| c.petname.clone())
             .unwrap_or_else(|| "?".into())
     };
+    let is_hub = |cid: Uuid| contacts.iter().any(|c| c.id == cid && c.is_hub);
     let mirror = s.get_mirror(id).ok().flatten().map(|m| {
         json!({
             "owner": m.owner,
@@ -168,6 +243,11 @@ async fn doc_federation(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Jso
             "permission": m.permission,
             "synced_epoch": m.synced_epoch,
             "owner_tended": m.owner_tended,
+            // hub relay (slice 1): the share comes from a hub; a relayed doc
+            // names its true owner and is read-only in this slice
+            "from_hub": is_hub(m.owner),
+            "origin_owner": m.origin_owner,
+            "origin_owner_name": m.origin_owner_name,
         })
     });
     let shares: Vec<Value> = s
@@ -182,6 +262,7 @@ async fn doc_federation(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Jso
                 "state": sh.state,
                 "petname": sh.contact.map(&petname_of),
                 "trust": sh.trust,
+                "to_hub": sh.contact.map(is_hub).unwrap_or(false),
             })
         })
         .collect();
@@ -1344,6 +1425,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/doc/{id}/rename", post(rename_doc))
         .route("/api/doc/{id}/tendings", get(tendings))
         .route("/api/doc/{id}/federation", get(doc_federation))
+        .route("/api/hub", get(hub_info))
         .route("/api/comment", post(add_comment))
         .route("/api/resolve", post(resolve))
         .route("/api/resolve_bulk", post(resolve_bulk))

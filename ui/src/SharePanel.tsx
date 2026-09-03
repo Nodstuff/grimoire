@@ -164,6 +164,30 @@ export default function SharePanel({
   // shares rooted here vs inherited from an ancestor
   const rootedHere = fed.shares.filter((s) => s.root_doc === doc.id)
   const inherited = fed.shares.filter((s) => s.root_doc !== doc.id)
+  // hubs I am an active member of: publishing = a propose share offered to the hub
+  const hubs = contacts.filter((c) => c.is_hub && (c.membership ?? 'active') === 'active')
+  const [publishing, setPublishing] = useState<string | null>(null)
+  const publish = async (hub: Contact) => {
+    if (publishing) return
+    setPublishing(hub.id)
+    setError(null)
+    try {
+      const r = await api<{ delivered: boolean; to: string; reason?: string }>('/admin/shares/offer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ root_doc: doc.id, permission: 'propose', contact_id: hub.id }),
+      })
+      if (r.delivered) notify(`published “${doc.title}” to ${r.to} — members see it on their next sync`, 'ok')
+      else notify(`${r.to} is offline — publishing will complete when it is back (${r.reason ?? 'unreachable'})`)
+      onChanged()
+    } catch (e) {
+      setError(errText(e))
+    } finally {
+      setPublishing(null)
+    }
+  }
+  const publishedTo = (hub: Contact) =>
+    fed.shares.find((s) => s.to_hub && s.state !== 'revoked' && s.petname === hub.petname)
 
   return (
     <aside className="panel">
@@ -216,6 +240,29 @@ export default function SharePanel({
         </div>
       )}
 
+      {hubs.length > 0 && (
+        <div className="share-hubs">
+          {hubs.map((h) => {
+            const already = publishedTo(h)
+            return (
+              <div key={h.id} className="share-row">
+                <span className="hub-mark">⌂</span>
+                {already ? (
+                  <span className="meta">
+                    {already.root_doc === doc.id ? `published to ${h.petname}` : `published to ${h.petname} via a parent`}
+                  </span>
+                ) : (
+                  <button className="accept" disabled={!!publishing} onClick={() => publish(h)}>
+                    {publishing === h.id ? 'publishing…' : `Publish to ${h.petname}`}
+                  </button>
+                )}
+              </div>
+            )
+          })}
+          <div className="meta">publishing puts “{doc.title}” and everything under it in the team folder every member sees; you stay the owner</div>
+        </div>
+      )}
+
       <div className="share-new">
         <div className="meta">
           share “{doc.title}” and everything nested under it
@@ -235,7 +282,7 @@ export default function SharePanel({
             <div className="share-mint">
               <select value={pick} onChange={(e) => setPick(e.target.value)}>
                 <option value="">choose a contact…</option>
-                {contacts.map((c) => (
+                {contacts.filter((c) => !c.is_hub).map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.petname} · {shortFingerprint(c.pubkey).slice(0, 4)}
                   </option>
