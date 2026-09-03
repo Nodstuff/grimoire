@@ -293,6 +293,28 @@ Wire-additive; a 0.7.1 peer parses and redeems every 0.7.2 link and frame.
   inside the secret so the link format is unchanged and the hash covers the whole string.
 - **Request bound.** `client::request` is capped end to end by `REQUEST_TIMEOUT` (60 s) on top of
   the 10 s dial cap, so a peer that accepts and stalls cannot hang a pull or refresh loop.
-- **Frame limits.** (server side; see the `server.rs` limits) a connection whose peer is not yet
-  authenticated — unknown contact, or a `Redeem` still to be checked — is read under a small cap;
-  the large paged-pull cap applies only after authentication.
+- **Frame limits.** `server::PRE_AUTH_FRAME` (64 KB) caps a request frame — and a hot-bridge
+  header — from a peer that is not a live contact; an oversized frame is refused (`BadRequest`,
+  "frame too large") before a byte is parsed. `MAX_FRAME` (32 MB) applies once the peer is
+  paired. `READ_TIMEOUT` (30 s) bounds the handshake, each request read and the idle wait for the
+  next stream; `MAX_CONNECTIONS` (256) caps concurrent connections at accept.
+- **Hub forward dedupe.** The hub's `request_id` towards the owner is derived from
+  `(member pubkey, member request_id)` (`server::forward_request_id`), and every owner answer —
+  `Proposed` or `Refused` — is cached; unreachable/timeout is not. A member retry that misses the
+  hub cache is deduped by the owner instead of parking twice.
+- **Hot fan-out lag.** `HotState::next_fan_out` answers a broadcast `Lagged` with one full-state
+  `SyncStep2` (Yjs applies it idempotently) instead of ending the fan-out with the socket open;
+  depth 256 → 1024 (`FAN_OUT_DEPTH`). Empty `SyncStep2` frames (one per join) are not journaled.
+- **Mirror filing.** A wire `meta.parent` is honoured only if it names a doc inside the same share
+  (this response, or an existing mirror of the share); anything else files under the share root
+  with a warning. Closes the hole where an owner could place docs inside the grantee's own tree.
+- **Transfer completion.** New `Request::TransferReady { root_doc, share_id }` (member → hub): the
+  member's 120 s sweep re-announces a flipped out-transfer until the hub answers `Noted` (recorded
+  in settings `transfer.acked.<id>`); the hub answers `Busy` while it completes an `Accepted`
+  transfer off-thread. `member_flip` upserts every subtree doc not yet mirrored from the hub, so a
+  half-done flip is finished by the retry.
+- **Loops.** `pull_loop`, `notify_loop`, `join_retry_loop` run under `loops::supervise` (restart on
+  panic/exit, ERROR log, 1–60 s backoff). Hub publication accepts are gated by
+  `hub::PUBLICATION_GATE` (8 concurrent). The notify tick is incremental (`loops::notify_tick`):
+  an idle tick is still two trivial reads; a changed tick lists docs once, names the changed set
+  (epoch rose / new / hotness flipped), and walks only the shares containing them.

@@ -403,6 +403,10 @@ pub fn member_folder(store: &mut SqliteStore, hub: &HubConfig, contact: &Contact
 /// folder, record the publication, and pull the tree so the relay has
 /// content at once. `addr` is how we reach the member — by pubkey in
 /// production (discovery), explicit in tests.
+/// 0.7.2: how many member publications the hub accepts (redeem + first pull,
+/// each a network round) at once; the rest wait their turn on the permit.
+pub static PUBLICATION_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+
 pub async fn accept_publication(
     endpoint: &Endpoint,
     store: &Arc<Mutex<SqliteStore>>,

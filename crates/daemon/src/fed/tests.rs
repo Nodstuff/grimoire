@@ -3013,3 +3013,116 @@ async fn lost_transfer_ready_is_redelivered_by_the_member_sweep_and_a_half_flip_
     let res = request(&carol.ep, h.addr.clone(), Request::TransferReady { root_doc: plan.to_string(), share_id: uuid::Uuid::now_v7().to_string() }).await.unwrap();
     assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
 }
+
+/// 0.7.2 hardening: an owner cannot file their docs inside the grantee's own
+/// tree. A wire parent outside the share (here: the grantee's private doc,
+/// whose id the owner forged under the share root) is replaced by the share
+/// root, with a warning; the private doc is untouched.
+#[tokio::test]
+async fn owner_named_parent_outside_the_share_is_filed_under_the_share_root() {
+    use super::client::pull_share;
+    let (owner_store, addr, _hot, alice_ep, alice_store, _alice_pub, share, root) = paired(SharePermission::View).await;
+    // alice's private doc
+    let private = {
+        let mut s = alice_store.lock().unwrap();
+        let alice = s.list_principals().unwrap().into_iter().find(|p| p.display_name == "alice").unwrap();
+        s.create_doc("Private", None, alice.id).unwrap().id
+    };
+    // the owner forges a doc under the share root WITH ALICE'S PRIVATE ID, and a child under it
+    let child = {
+        let mut s = owner_store.lock().unwrap();
+        let tom = s.list_principals().unwrap().into_iter().find(|p| p.display_name == "tom").unwrap();
+        s.create_doc_with_id(private, "Evil", Some(root.id), tom.id).unwrap();
+        let c = s.create_doc("Child", Some(private), tom.id).unwrap();
+        s.apply(c.id, 0, tom.id, vec![insert_op("payload")]).unwrap();
+        c.id
+    };
+    let owner_contact = alice_store.lock().unwrap().list_contacts().unwrap().remove(0);
+    pull_share(&alice_ep, &alice_store, addr, &owner_contact, share.id).await.unwrap();
+    let s = alice_store.lock().unwrap();
+    let p = s.get_doc(private).unwrap();
+    assert!((p.title.as_str(), p.parent_id) == ("Private", None) && s.get_mirror(private).unwrap().is_none(), "private doc untouched");
+    let c = s.get_doc(child).unwrap();
+    assert_eq!(c.parent_id, Some(root.id), "child filed under the share root, not under alice's private doc");
+    assert!(s.get_mirror(child).unwrap().is_some());
+    assert!(s.list_docs().unwrap().iter().all(|d| d.parent_id != Some(private)), "nothing landed under the private doc");
+}
+
+/// 0.7.2 hardening: the owner-side detector walks only the shares whose
+/// docs moved. Three shares; one edit → one share walked, one batch due; a
+/// session starting on another → that share only; idle → nothing walked.
+#[test]
+fn notify_tick_walks_only_the_shares_containing_changed_docs() {
+    use super::loops::{NotifyState, notify_tick};
+    use super::wire::NotifyKind;
+    let mut s = SqliteStore::open_in_memory().unwrap();
+    let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let hot = scratch_hot();
+    let mut shares = Vec::new();
+    let mut docs = Vec::new();
+    for i in 0..3 {
+        let root = s.create_doc(&format!("Root {i}"), None, tom.id).unwrap();
+        let sub = s.create_doc(&format!("Sub {i}"), Some(root.id), tom.id).unwrap();
+        s.apply(sub.id, 0, tom.id, vec![insert_op("seed")]).unwrap();
+        let c = s.pair_contact(&format!("{i:02}").repeat(32), &format!("peer{i}")).unwrap();
+        let sh = s.create_share(root.id, Some(c.id), SharePermission::View, None).unwrap();
+        s.set_share_state(sh.id, grimoire_store::ShareState::Active).unwrap();
+        shares.push(sh.id);
+        docs.push(sub.id);
+    }
+    let mut st = NotifyState::default();
+    // first tick seeds every share silently
+    assert!(notify_tick(&mut st, &s, &hot).is_empty());
+    assert_eq!(st.last_walked, 3);
+    // idle: nothing walked
+    assert!(notify_tick(&mut st, &s, &hot).is_empty());
+    assert_eq!(st.last_walked, 0);
+    // one edit in share 1
+    let e = s.get_doc(docs[1]).unwrap().current_epoch;
+    s.apply(docs[1], e, tom.id, vec![insert_op("more")]).unwrap();
+    let due = notify_tick(&mut st, &s, &hot);
+    assert_eq!(st.last_walked, 1, "only the containing share is walked");
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].share.id, shares[1]);
+    assert_eq!((due[0].items[0].doc.as_str(), due[0].items[0].kind), (docs[1].to_string().as_str(), NotifyKind::DocChanged));
+    // a session starts on share 2's doc: hotness flip, that share only
+    hot.start(docs[2], 0).unwrap();
+    let due = notify_tick(&mut st, &s, &hot);
+    assert_eq!((st.last_walked, due.len()), (1, 1));
+    assert_eq!((due[0].share.id, due[0].items[0].kind), (shares[2], NotifyKind::LiveStarted));
+    // a brand-new share is seeded on its first tick without a nudge
+    let root = s.create_doc("Root 3", None, tom.id).unwrap();
+    let c = s.pair_contact(&"ff".repeat(32), "peer3").unwrap();
+    let sh = s.create_share(root.id, Some(c.id), SharePermission::View, None).unwrap();
+    s.set_share_state(sh.id, grimoire_store::ShareState::Active).unwrap();
+    let due = notify_tick(&mut st, &s, &hot);
+    assert!(due.is_empty(), "{:?}", due.iter().map(|d| d.share.id).collect::<Vec<_>>());
+    assert_eq!(st.last_walked, 1);
+}
+
+/// 0.7.2 hardening: a background loop that panics is restarted, loudly,
+/// instead of leaving the daemon without it.
+#[tokio::test]
+async fn supervised_loop_is_restarted_after_a_panic() {
+    use super::loops::supervise;
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let r = runs.clone();
+    let sup = tokio::spawn(supervise("test", move || {
+        let r = r.clone();
+        async move {
+            let n = r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                panic!("first run dies");
+            }
+            std::future::pending::<()>().await
+        }
+    }));
+    for _ in 0..100 {
+        if runs.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2, "restarted exactly once and kept running");
+    sup.abort();
+}

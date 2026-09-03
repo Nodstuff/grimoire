@@ -887,6 +887,7 @@ fn dispatch_inner(
                             let store_arc = store_arc.clone();
                             let offer_id = offer.id;
                             tokio::spawn(async move {
+                                let _permit = hub::PUBLICATION_GATE.acquire().await;
                                 match hub::accept_publication(&endpoint, &store_arc, offer_id, iroh::EndpointAddr::from(id)).await {
                                     Ok(root) => tracing::info!(%root, "hub: publication relayed"),
                                     Err(e) => tracing::warn!("hub: publication not accepted: {e:#}"),

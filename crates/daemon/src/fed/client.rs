@@ -678,6 +678,45 @@ async fn pull_page(
         removed: removed.len(),
     };
 
+    // 0c. 0.7.2: a parent the owner names is honoured only if it is inside
+    // THIS share (an id in this response, or already a mirror of this
+    // share). Anything else — the grantee's own doc, another share's doc —
+    // would let the owner file their docs inside the grantee's tree; such a
+    // doc goes under the share root instead, with a warning.
+    let in_share: std::collections::HashSet<uuid::Uuid> = metas
+        .iter()
+        .filter_map(|m| m.id.parse().ok())
+        .chain(changed.iter().filter_map(|wd| wd.meta.id.parse().ok()))
+        .chain(
+            s.list_mirrors()?
+                .into_iter()
+                .filter(|m| m.share_id == share_id)
+                .map(|m| m.doc_id),
+        )
+        .collect();
+    let share_root: Option<uuid::Uuid> = metas
+        .iter()
+        .find(|m| m.parent.is_none())
+        .and_then(|m| m.id.parse().ok())
+        .or_else(|| {
+            s.list_mirrors().ok()?.into_iter().find(|m| m.share_id == share_id && {
+                s.get_doc(m.doc_id).ok().is_some_and(|d| !d.parent_id.is_some_and(|p| in_share.contains(&p)))
+            }).map(|m| m.doc_id)
+        });
+    let sanitize_parent = |id: uuid::Uuid, wire_parent: Option<&String>| -> Option<uuid::Uuid> {
+        let p: uuid::Uuid = wire_parent.and_then(|p| p.parse().ok())?;
+        if in_share.contains(&p) {
+            return Some(p);
+        }
+        tracing::warn!(
+            doc = %id,
+            parent = %p,
+            owner = %owner.pubkey,
+            "owner named a parent outside the share; filing the doc under the share root"
+        );
+        share_root.filter(|r| *r != id)
+    };
+
     // 1. create any docs we've never seen, parents before children
     let mut pending: Vec<&WireDoc> = changed.clone();
     while !pending.is_empty() {
@@ -690,7 +729,7 @@ async fn pull_page(
             if s.get_doc(id).is_ok() {
                 return false; // exists
             }
-            let parent = wd.meta.parent.as_ref().and_then(|p| p.parse().ok());
+            let parent = sanitize_parent(id, wd.meta.parent.as_ref());
             // parent not materialized yet → retry next round
             if let Some(p) = parent
                 && s.get_doc(p).is_err()
@@ -725,10 +764,13 @@ async fn pull_page(
         if local.title != m.title {
             s.rename_doc(id, &m.title).ok();
         }
-        let Some(parent) = m.parent.as_ref().and_then(|p| p.parse::<uuid::Uuid>().ok()) else {
+        if m.parent.is_none() {
             continue; // share root: keep the grantee's filing
+        }
+        let Some(parent) = sanitize_parent(id, m.parent.as_ref()) else {
+            continue; // outside the share and no root to fall back to
         };
-        if local.parent_id != Some(parent) {
+        if local.parent_id != Some(parent) && s.get_doc(parent).is_ok() {
             s.move_doc(id, Some(parent), None).ok();
         }
     }

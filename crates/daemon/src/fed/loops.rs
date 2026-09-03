@@ -4,10 +4,11 @@
 //! 120s sweep for the rest, instant when nudged), the outbound-proposal
 //! status refresh, and the async join retry (ADR 0002 decision 6).
 //!
-//! Owner side: the change detector that NUDGES grantees — one 1s tick diffs
-//! every active share's docs (epoch moved → `doc_changed`, new id →
-//! `doc_added`, cold→hot → `live_started`) and dials the contact. Nudges are
-//! best-effort; the grantee's poll is the safety net.
+//! Owner side: the change detector that NUDGES grantees — one 1s tick names
+//! the docs that moved and diffs only the shares containing them (epoch
+//! moved → `doc_changed`, new id → `doc_added`, cold→hot → `live_started`),
+//! then dials the contact. Nudges are best-effort; the grantee's poll is the
+//! safety net. Every loop runs under `supervise` (restart on panic/exit).
 
 use super::client::{join_once, pull_share, request};
 use super::runtime::Runtime;
@@ -281,6 +282,10 @@ pub async fn pull_all_once(
 /// proposal statuses). Nudges from owners trigger pulls independently, so
 /// this is the safety net, not the primary path.
 pub async fn pull_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, runtime: Runtime) {
+    supervise("pull", move || pull_loop_inner(endpoint.clone(), store.clone(), runtime.clone())).await
+}
+
+async fn pull_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, runtime: Runtime) {
     let mut last_sweep = Instant::now();
     let dead = Mutex::new(DeadPeerTracker::default());
     loop {
@@ -427,94 +432,188 @@ pub async fn send_nudges(endpoint: Endpoint, peer_id: iroh::EndpointId, share: U
     }
 }
 
-/// Owner-side change detector + nudger. One 1s tick; on an idle daemon the
-/// tick is ONE aggregate query (`change_signature`) plus an atomic read of
-/// the hot generation — the per-share walk runs only when either moved.
-/// When something did, each share's changes go out as one `NotifyBatch`
-/// dial to its contact (best-effort, timed out, never blocking the loop).
-pub async fn notify_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot: HotState) {
-    // (share id) → (doc id → mark); a share's first observation seeds silently
-    let mut marks: HashMap<Uuid, HashMap<Uuid, DocMark>> = HashMap::new();
-    let mut last_sig: Option<(grimoire_store::ChangeSignature, u64)> = None;
-    loop {
-        tokio::time::sleep(NOTIFY_TICK).await;
-        // cheap gate: nothing moved → nothing to diff
-        let sig = {
-            let s = store.lock().unwrap_or_else(|p| p.into_inner());
-            match s.change_signature() {
-                Ok(sig) => (sig, hot.generation()),
-                Err(e) => {
-                    tracing::debug!("change signature failed: {e}");
-                    continue;
+/// Owner-side change detector state (0.7.2: incremental). Per share, the
+/// last (doc → mark) view; across shares, the last epoch of every doc and the
+/// set of live docs, so one tick can name exactly which docs moved and walk
+/// only the shares containing them.
+#[derive(Default)]
+pub struct NotifyState {
+    /// (share id) → (doc id → mark); a share's first observation seeds silently
+    marks: HashMap<Uuid, HashMap<Uuid, DocMark>>,
+    last_sig: Option<(grimoire_store::ChangeSignature, u64)>,
+    doc_epochs: HashMap<Uuid, i64>,
+    hot_docs: std::collections::HashSet<Uuid>,
+    /// How many shares the last tick walked (`served_docs_for` + diff); a
+    /// test seam and a log field.
+    pub last_walked: usize,
+}
+
+/// One nudge batch the tick decided to send.
+pub struct DueBatch {
+    pub share: grimoire_store::Share,
+    pub contact: grimoire_store::Contact,
+    pub items: Vec<NotifyItem>,
+}
+
+/// One detector tick, pure over the store: what is due, and to whom. Idle =
+/// the aggregate signature and the hot generation are unchanged → two trivial
+/// queries, nothing walked. Otherwise: ONE `list_docs` names the docs whose
+/// epoch rose (or are new) and whose hotness flipped; their containing
+/// shares (walked up once per changed doc) plus any share never seen before
+/// are the only ones diffed. Before 0.7.2 every active share was walked on
+/// every change — on a hub, O(shares × mirrors × docs) per edit anywhere.
+pub fn notify_tick(state: &mut NotifyState, store: &SqliteStore, hot: &HotState) -> Vec<DueBatch> {
+    state.last_walked = 0;
+    let sig = match store.change_signature() {
+        Ok(sig) => (sig, hot.generation()),
+        Err(e) => {
+            tracing::debug!("change signature failed: {e}");
+            return Vec::new();
+        }
+    };
+    if state.last_sig == Some(sig) {
+        return Vec::new();
+    }
+    state.last_sig = Some(sig);
+    let contacts = store.list_contacts().unwrap_or_default();
+    let shares: Vec<(grimoire_store::Share, grimoire_store::Contact)> = store
+        .list_shares()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|sh| sh.state == grimoire_store::ShareState::Active)
+        .filter_map(|sh| {
+            let c = contacts.iter().find(|c| Some(c.id) == sh.contact && !c.revoked)?.clone();
+            Some((sh, c))
+        })
+        .collect();
+    let live_share_ids: std::collections::HashSet<Uuid> = shares.iter().map(|(sh, _)| sh.id).collect();
+    state.marks.retain(|id, _| live_share_ids.contains(id)); // forget revoked shares
+
+    // the changed-doc set: epoch rose / new id / hotness flipped
+    let docs = store.list_docs().unwrap_or_default();
+    let hot_now: std::collections::HashSet<Uuid> = docs.iter().map(|d| d.id).filter(|d| hot.is_hot(*d)).collect();
+    let mut changed: Vec<Uuid> = Vec::new();
+    let mut epochs_now: HashMap<Uuid, i64> = HashMap::with_capacity(docs.len());
+    for d in &docs {
+        epochs_now.insert(d.id, d.current_epoch);
+        let moved = match state.doc_epochs.get(&d.id) {
+            Some(prev) => d.current_epoch > *prev,
+            None => true,
+        };
+        if moved || state.hot_docs.contains(&d.id) != hot_now.contains(&d.id) {
+            changed.push(d.id);
+        }
+    }
+    let first_tick = state.doc_epochs.is_empty() && state.marks.is_empty();
+    state.doc_epochs = epochs_now;
+    state.hot_docs = hot_now;
+
+    // shares to walk: those containing a changed doc, plus never-seen shares
+    let mut walk: std::collections::HashSet<Uuid> = shares
+        .iter()
+        .filter(|(sh, _)| !state.marks.contains_key(&sh.id))
+        .map(|(sh, _)| sh.id)
+        .collect();
+    if !first_tick {
+        for d in &changed {
+            for sh in store.shares_containing(*d).unwrap_or_default() {
+                if live_share_ids.contains(&sh.id) {
+                    walk.insert(sh.id);
                 }
             }
-        };
-        if last_sig == Some(sig) {
+        }
+    }
+    // never nudge about a mirror: its changes are the owner's, not ours (a
+    // transferred subtree is served back to its new owner but is nothing to
+    // announce to them) — a hub is the exception: relayed mirrors ARE what
+    // it announces
+    let mirror_ids: std::collections::HashSet<Uuid> = if super::hub::config(store).is_some() {
+        Default::default()
+    } else {
+        store.list_mirrors().unwrap_or_default().into_iter().map(|m| m.doc_id).collect()
+    };
+    let mut out = Vec::new();
+    for (share, contact) in shares {
+        if !walk.contains(&share.id) {
             continue;
         }
-        last_sig = Some(sig);
-        // snapshot under one lock: active shares with a contact, their docs
-        let snapshot: Vec<(grimoire_store::Share, grimoire_store::Contact, Vec<(Uuid, String, DocMark)>)> = {
+        state.last_walked += 1;
+        let Ok(docs) = served_docs_for(store, share.id, Some(&contact.pubkey)) else { continue };
+        let view: Vec<(Uuid, String, DocMark)> = docs
+            .into_iter()
+            .filter(|d| !mirror_ids.contains(&d.id))
+            .map(|d| (d.id, d.title, DocMark { epoch: d.current_epoch, hot: state.hot_docs.contains(&d.id) }))
+            .collect();
+        let seeded = state.marks.contains_key(&share.id);
+        let last = state.marks.entry(share.id).or_default();
+        let now: Vec<(Uuid, DocMark)> = view.iter().map(|(d, _, m)| (*d, *m)).collect();
+        let due = diff_share(last, &now, seeded);
+        *last = now.iter().copied().collect();
+        if due.is_empty() {
+            continue;
+        }
+        let titles: HashMap<Uuid, String> = view.into_iter().map(|(d, t, _)| (d, t)).collect();
+        out.push(DueBatch { share, contact, items: batch_nudges(&due, &titles) });
+    }
+    if state.last_walked > 0 {
+        tracing::debug!(changed = changed.len(), walked = state.last_walked, due = out.len(), "notify tick");
+    }
+    out
+}
+
+/// Owner-side change detector + nudger. One 1s tick; on an idle daemon the
+/// tick is ONE aggregate query (`change_signature`) plus an atomic read of
+/// the hot generation — the per-share walk runs only for shares whose docs
+/// moved (`notify_tick`). Each share's changes go out as one `NotifyBatch`
+/// dial to its contact (best-effort, timed out, never blocking the loop).
+pub async fn notify_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot: HotState) {
+    supervise("notify", move || notify_loop_inner(endpoint.clone(), store.clone(), hot.clone())).await
+}
+
+async fn notify_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot: HotState) {
+    let mut state = NotifyState::default();
+    loop {
+        tokio::time::sleep(NOTIFY_TICK).await;
+        let due = {
             let s = store.lock().unwrap_or_else(|p| p.into_inner());
-            let contacts = s.list_contacts().unwrap_or_default();
-            // never nudge about a mirror: its changes are the owner's, not
-            // ours (a transferred subtree is served back to its new owner
-            // but is nothing to announce to them)
-            // (a hub is the exception: relayed mirrors ARE what it announces)
-            let mirror_ids: std::collections::HashSet<Uuid> = if super::hub::config(&s).is_some() {
-                Default::default()
-            } else {
-                s.list_mirrors().unwrap_or_default().into_iter().map(|m| m.doc_id).collect()
-            };
-            s.list_shares()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|sh| sh.state == grimoire_store::ShareState::Active)
-                .filter_map(|sh| {
-                    let c = contacts.iter().find(|c| Some(c.id) == sh.contact && !c.revoked)?.clone();
-                    let docs = served_docs_for(&s, sh.id, Some(&c.pubkey)).ok()?;
-                    let view: Vec<(Uuid, String, DocMark)> = docs
-                        .into_iter()
-                        .filter(|d| !mirror_ids.contains(&d.id))
-                        .map(|d| {
-                            (
-                                d.id,
-                                d.title,
-                                DocMark {
-                                    epoch: d.current_epoch,
-                                    hot: hot.is_hot(d.id),
-                                },
-                            )
-                        })
-                        .collect();
-                    Some((sh, c, view))
-                })
-                .collect()
+            notify_tick(&mut state, &s, &hot)
         };
-        let live_share_ids: std::collections::HashSet<Uuid> = snapshot.iter().map(|(sh, _, _)| sh.id).collect();
-        marks.retain(|id, _| live_share_ids.contains(id)); // forget revoked shares
-        for (share, contact, view) in snapshot {
-            let seeded = marks.contains_key(&share.id);
-            let last = marks.entry(share.id).or_default();
-            let now: Vec<(Uuid, DocMark)> = view.iter().map(|(d, _, m)| (*d, *m)).collect();
-            let due = diff_share(last, &now, seeded);
-            *last = now.iter().copied().collect();
-            if due.is_empty() {
-                continue;
-            }
-            let titles: HashMap<Uuid, String> = view.into_iter().map(|(d, t, _)| (d, t)).collect();
-            let Ok(peer_id) = contact.pubkey.parse::<iroh::EndpointId>() else {
+        for batch in due {
+            let Ok(peer_id) = batch.contact.pubkey.parse::<iroh::EndpointId>() else {
                 continue;
             };
-            let items = batch_nudges(&due, &titles);
             tokio::spawn(send_nudges(
                 endpoint.clone(),
                 peer_id,
-                share.id,
-                items,
-                contact.petname.clone(),
+                batch.share.id,
+                batch.items,
+                batch.contact.petname.clone(),
             ));
         }
+    }
+}
+
+/// 0.7.2: run a background loop forever. A loop task that panics (a poisoned
+/// lock, an unwrap in a rarely-taken branch) or returns is logged at ERROR
+/// and restarted with a backoff (1s, doubling to 60s; reset after a healthy
+/// minute) instead of leaving the daemon silently without pulls, nudges or
+/// join retries until the next restart.
+pub async fn supervise<F, Fut>(name: &'static str, make: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    const MIN: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(60);
+    let mut backoff = MIN;
+    loop {
+        let started = Instant::now();
+        match tokio::spawn(make()).await {
+            Ok(()) => tracing::error!(name, "background loop exited; restarting"),
+            Err(e) => tracing::error!(name, "background loop panicked: {e}; restarting"),
+        }
+        backoff = if started.elapsed() > MAX { MIN } else { (backoff * 2).min(MAX) };
+        tokio::time::sleep(backoff).await;
     }
 }
 
@@ -555,6 +654,10 @@ pub fn join_expired(created_at: &str, now: chrono::DateTime<chrono::Utc>) -> boo
 /// give-up after the invite window (`join_expired`); every failure is
 /// recorded; success removes the row.
 pub async fn join_retry_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>) {
+    supervise("join-retry", move || join_retry_loop_inner(endpoint.clone(), store.clone())).await
+}
+
+async fn join_retry_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>) {
     const TICK: Duration = Duration::from_secs(60);
     // next attempt per pending join (in memory: a restart simply retries)
     let mut next_due: HashMap<Uuid, Instant> = HashMap::new();
