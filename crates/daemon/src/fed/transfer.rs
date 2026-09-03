@@ -22,6 +22,7 @@ use super::client::{pull_share, request};
 use super::hub;
 use super::wire::{Refusal, RefusalCode, Request, Response};
 use crate::hot::HotState;
+use crate::store_ext::with_store;
 use anyhow::{Context, Result};
 use grimoire_store::{
     BlockStore, Contact, HubTransferState, SharePermission, ShareState, SqliteStore,
@@ -199,8 +200,7 @@ pub async fn resend_ready(
     store: &Arc<Mutex<SqliteStore>>,
     addr: Option<EndpointAddr>,
 ) -> usize {
-    let due: Vec<(Uuid, Contact, Uuid, Uuid)> = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+    let due: Vec<(Uuid, Contact, Uuid, Uuid)> = with_store(store, |s| {
         let contacts = s.list_contacts().unwrap_or_default();
         s.list_doc_transfers()
             .unwrap_or_default()
@@ -219,7 +219,8 @@ pub async fn resend_ready(
                 Some((t.id, hub, t.root_doc, share.id))
             })
             .collect()
-    };
+    })
+    .await;
     let mut acked = 0;
     for (transfer, hub, root, share) in due {
         let addr = match &addr {
@@ -235,8 +236,7 @@ pub async fn resend_ready(
         };
         match tokio::time::timeout(std::time::Duration::from_secs(15), request(endpoint, addr, req)).await {
             Ok(Ok(Response::Noted)) => {
-                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                s.set_setting(&acked_key(transfer), "1").ok();
+                with_store(store, move |s| s.set_setting(&acked_key(transfer), "1").ok()).await;
                 tracing::info!(hub = hub.petname, %root, "transfer: hub confirmed it owns the folder");
                 acked += 1;
             }
@@ -284,17 +284,17 @@ pub async fn hub_complete(
     transfer_id: Uuid,
     addr: Option<EndpointAddr>,
 ) -> Result<()> {
-    let (hub_cfg, t, member) = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
-        let hub_cfg = hub::config(&s).context("not a hub")?;
+    let (hub_cfg, t, member) = with_store(store, move |s| -> Result<_> {
+        let hub_cfg = hub::config(s).context("not a hub")?;
         let t = s.get_hub_transfer(transfer_id)?;
         let member = s
             .list_contacts()?
             .into_iter()
             .find(|c| c.id == t.member_contact)
             .context("member contact is gone")?;
-        (hub_cfg, t, member)
-    };
+        Ok((hub_cfg, t, member))
+    })
+    .await?;
     if t.state == HubTransferState::Done {
         return Ok(());
     }
@@ -323,8 +323,7 @@ pub async fn hub_complete(
         Ok(Ok(Response::TransferReady { share_id })) => share_id.parse().context("member sent a bad share id")?,
         Ok(Ok(Response::Refused { reason, code })) => {
             // back to offered so an admin can try again once it is idle
-            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-            s.set_hub_transfer_state(transfer_id, HubTransferState::Offered).ok();
+            with_store(store, move |s| s.set_hub_transfer_state(transfer_id, HubTransferState::Offered).ok()).await;
             return Err(Refusal::new(code, format!("{} refused: {reason}", member.petname)).into());
         }
         Ok(Ok(other)) => anyhow::bail!("unexpected reply from {}: {other:?}", member.petname),
@@ -335,8 +334,7 @@ pub async fn hub_complete(
         .await
         .context("pulling the folder from the member")?;
     tracing::info!(root = %t.root_doc, docs = sum.changed, "transfer: folder pulled from the member");
-    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-    hub_flip(&mut s, &hub_cfg, &member, transfer_id, share_id)
+    with_store(store, move |s| hub_flip(s, &hub_cfg, &member, transfer_id, share_id)).await
 }
 
 /// Hub side: the pulled mirrors become the hub's own docs. Idempotent.
