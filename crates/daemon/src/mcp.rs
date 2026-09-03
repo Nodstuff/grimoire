@@ -21,48 +21,111 @@ use uuid::Uuid;
 /// in-memory; a retried propose with the same request_id returns the stored
 /// outcome instead of double-applying. Keyed by principal so one session's
 /// request_id can never replay another session's outcome.
-pub type DedupeCache = Arc<Mutex<std::collections::HashMap<(Uuid, Uuid), serde_json::Value>>>;
+/// Values carry an insertion sequence so eviction drops the OLDEST half
+/// instead of clearing — a retry storm never wipes an in-window entry.
+pub type DedupeCache = Arc<Mutex<std::collections::HashMap<(Uuid, Uuid), (u64, serde_json::Value)>>>;
+
+pub const DEDUPE_CAPACITY: usize = 512;
+static DEDUPE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn dedupe_get(cache: &DedupeCache, principal: Uuid, id: Uuid) -> Option<serde_json::Value> {
     cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&(principal, id))
-        .cloned()
+        .map(|(_, v)| v.clone())
 }
 
 pub fn new_dedupe() -> DedupeCache {
     Arc::new(Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Find-or-create the Agent principal named `name` (the `identify` rule,
-/// shared with the HTTP `X-Grimoire-Principal` header): trimmed, 1–60 chars.
-pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uuid, String> {
+/// Agent principals auto-created since boot (find-or-create by name is an
+/// unauthenticated surface: a misbehaving client must not fill the table).
+static AUTO_CREATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub const MAX_AUTO_PRINCIPALS_PER_BOOT: usize = 256;
+
+/// A principal name: 1–64 printable chars (no control characters), trimmed.
+pub fn valid_principal_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
-    if name.is_empty() || name.len() > 60 {
-        return Err("name must be 1-60 chars".into());
+    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+        return Err("name must be 1-64 printable chars".into());
     }
+    Ok(name)
+}
+
+/// Find-or-create the Agent principal named `name` (the `identify` rule,
+/// shared with the HTTP `X-Grimoire-Principal` header). Creation is capped
+/// per boot; existing names always resolve.
+pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uuid, String> {
+    let name = valid_principal_name(name)?;
     let existing = store
         .list_principals()
         .ok()
         .and_then(|ps| ps.into_iter().find(|pr| pr.display_name == name));
-    match existing {
-        Some(pr) => Ok(pr.id),
-        None => store
-            .create_principal(grimoire_store::PrincipalKind::Agent, name, None)
-            .map(|pr| pr.id)
-            .map_err(|e| e.to_string()),
+    if let Some(pr) = existing {
+        return Ok(pr.id);
     }
+    if AUTO_CREATED.load(std::sync::atomic::Ordering::Relaxed) >= MAX_AUTO_PRINCIPALS_PER_BOOT {
+        return Err(format!(
+            "too many new agent principals since the daemon started ({MAX_AUTO_PRINCIPALS_PER_BOOT}); \
+             reuse an existing name, or restart the daemon"
+        ));
+    }
+    let pr = store
+        .create_principal(grimoire_store::PrincipalKind::Agent, name, None)
+        .map_err(|e| e.to_string())?;
+    AUTO_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(pr.id)
 }
 
 pub fn dedupe_put(cache: &DedupeCache, principal: Uuid, id: Uuid, v: serde_json::Value) {
     let mut c = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if c.len() >= 512 {
-        c.clear(); // crude LRU: dedupe only needs to survive the retry window
+    if c.len() >= DEDUPE_CAPACITY {
+        // evict the oldest half: the newest entries are the ones a retry
+        // in flight can still ask for
+        let mut seqs: Vec<u64> = c.values().map(|(seq, _)| *seq).collect();
+        seqs.sort_unstable();
+        let cutoff = seqs[seqs.len() / 2];
+        c.retain(|_, (seq, _)| *seq >= cutoff);
     }
-    c.insert((principal, id), v);
+    let seq = DEDUPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    c.insert((principal, id), (seq, v));
+}
+
+#[cfg(test)]
+mod cache_and_name_tests {
+    use super::*;
+
+    #[test]
+    fn dedupe_evicts_the_oldest_half_not_everything() {
+        let cache = new_dedupe();
+        let p = Uuid::now_v7();
+        let ids: Vec<Uuid> = (0..DEDUPE_CAPACITY).map(|_| Uuid::now_v7()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            dedupe_put(&cache, p, *id, json!(i));
+        }
+        let extra = Uuid::now_v7();
+        dedupe_put(&cache, p, extra, json!("new"));
+        let n = cache.lock().unwrap().len();
+        assert_eq!(n, DEDUPE_CAPACITY / 2 + 1);
+        assert!(dedupe_get(&cache, p, ids[0]).is_none(), "oldest evicted");
+        assert_eq!(dedupe_get(&cache, p, ids[DEDUPE_CAPACITY - 1]), Some(json!(DEDUPE_CAPACITY - 1)), "newest kept");
+        assert_eq!(dedupe_get(&cache, p, extra), Some(json!("new")));
+    }
+
+    #[test]
+    fn principal_names_are_bounded_and_printable() {
+        assert_eq!(valid_principal_name("  claude:proj-task "), Ok("claude:proj-task"));
+        assert!(valid_principal_name("").is_err());
+        assert!(valid_principal_name("   ").is_err());
+        assert!(valid_principal_name("a\u{7}b").is_err());
+        assert!(valid_principal_name("line\nbreak").is_err());
+        assert!(valid_principal_name(&"x".repeat(64)).is_ok());
+        assert!(valid_principal_name(&"x".repeat(65)).is_err());
+    }
 }
 
 #[derive(Clone)]

@@ -16,6 +16,18 @@ fn main() {
             ),
         }
     }
+    // Short git sha for the build stamp fallback: a cross-compiled binary
+    // without an embedded ui/dist would otherwise report `build: 0`.
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "--short=9", "HEAD"])
+        .current_dir(&manifest)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=GRIMOIRE_GIT_SHA={sha}");
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=models/potion-base-8M");
     println!("cargo:rerun-if-changed=../../scripts/fetch-model.sh");
 }

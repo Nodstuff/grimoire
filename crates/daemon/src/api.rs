@@ -931,7 +931,8 @@ async fn stamp(State(st): State<ApiState>) -> Json<Value> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match s.change_stamp() {
-        Ok(v) => Json(json!({"stamp": v})),
+        // version/build ride along so the app needs one poll, not two
+        Ok(v) => Json(json!({"stamp": v, "version": env!("CARGO_PKG_VERSION"), "build": build_stamp(), "git": crate::GIT_SHA})),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
@@ -942,7 +943,11 @@ async fn stamp(State(st): State<ApiState>) -> Json<Value> {
 /// the GRIMOIRE_UI_DIST dev override it is that file's mtime. Never a
 /// machine-specific path.
 async fn buildinfo() -> Json<Value> {
-    let stamp = match std::env::var("GRIMOIRE_UI_DIST") {
+    Json(json!({"build": build_stamp(), "version": env!("CARGO_PKG_VERSION"), "git": crate::GIT_SHA}))
+}
+
+fn build_stamp() -> u64 {
+    match std::env::var("GRIMOIRE_UI_DIST") {
         Ok(dist) => std::fs::metadata(format!("{dist}/index.html"))
             .and_then(|m| m.modified())
             .ok()
@@ -950,8 +955,7 @@ async fn buildinfo() -> Json<Value> {
             .map(|d| d.as_secs())
             .unwrap_or(0),
         Err(_) => crate::ui_build_stamp(),
-    };
-    Json(json!({"build": stamp, "version": env!("CARGO_PKG_VERSION")}))
+    }
 }
 
 /// Last `n` lines of a file, reading only its tail (the daily log can be a
@@ -1721,10 +1725,10 @@ mod http_client_tests {
         assert_eq!(hist[0]["principal_name"], "workbox");
         // invalid names are refused before anything is written
         let bad = new_doc(&app, &[(PRINCIPAL_HEADER, "   ")]).await;
-        assert!(bad["error"].as_str().unwrap().contains("1-60 chars"), "{bad}");
-        let long = "x".repeat(61);
+        assert!(bad["error"].as_str().unwrap().contains("1-64 printable chars"), "{bad}");
+        let long = "x".repeat(65);
         let bad = new_doc(&app, &[(PRINCIPAL_HEADER, long.as_str())]).await;
-        assert!(bad["error"].as_str().unwrap().contains("1-60 chars"));
+        assert!(bad["error"].as_str().unwrap().contains("1-64 printable chars"));
     }
 
     #[tokio::test]
