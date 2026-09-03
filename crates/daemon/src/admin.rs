@@ -102,20 +102,24 @@ async fn create_gardener(
     }
 }
 
+/// Run-now. 409 when every matched gardener is already mid-run (a second
+/// click, or the daily cut got there first); a mixed batch reports the
+/// running ones with status "running" and runs the rest.
 async fn run_now(
     State(AdminState { store, hot }): State<AdminState>,
     Json(req): Json<RunReq>,
-) -> Json<Value> {
+) -> axum::response::Response {
     let gardeners = {
         let s = store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match s.list_gardeners() {
             Ok(g) => g,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return Json(json!({"error": e.to_string()})).into_response(),
         }
     };
     let mut outcomes = Vec::new();
+    let mut started = 0usize;
     for g in gardeners {
         if !g.enabled {
             continue;
@@ -127,6 +131,9 @@ async fn run_now(
         }
         let name = g.name.clone();
         let out = garden::run_gardener(store.clone(), hot.clone(), g).await;
+        if out.status != garden::STATUS_RUNNING {
+            started += 1;
+        }
         outcomes.push(json!({
             "gardener": name,
             "run_id": out.run_id,
@@ -135,9 +142,16 @@ async fn run_now(
         }));
     }
     if outcomes.is_empty() {
-        return Json(json!({"error": "no matching enabled gardener"}));
+        return Json(json!({"error": "no matching enabled gardener"})).into_response();
     }
-    Json(json!(outcomes))
+    if started == 0 {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({"error": "already running", "code": "gardener_running", "outcomes": outcomes})),
+        )
+            .into_response();
+    }
+    Json(json!(outcomes)).into_response()
 }
 
 async fn list_runs(State(AdminState { store, .. }): State<AdminState>, Query(q): Query<RunsQuery>) -> Json<Value> {
@@ -1666,6 +1680,47 @@ mod token_tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn run_now_is_409_while_the_gardener_is_mid_run() {
+        let app = app();
+        let create = Request::post("/admin/gardeners")
+            .header(ADMIN_HEADER, "s3cret")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"name": "tags", "task_prompt": "tag"}).to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let g: Value = serde_json::from_slice(&body).unwrap();
+        let id: Uuid = g["id"].as_str().unwrap().parse().unwrap();
+        // another run holds the claim
+        let claim = garden::claim_run(id).unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/garden")
+                    .header(ADMIN_HEADER, "s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"name": "tags"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], "gardener_running");
+        // no run row was written for the refused attempt
+        let res = app
+            .clone()
+            .oneshot(Request::get("/admin/runs").header(ADMIN_HEADER, "s3cret").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap().as_array().unwrap().len(), 0);
+        drop(claim);
+    }
+
     #[test]
     fn token_compare_is_exact() {
         let t = AdminToken::fixed("abc");
@@ -1722,6 +1777,10 @@ pub async fn daily_loop(store: Store, hot: crate::hot::HotState) {
             .into_iter()
             .filter(|g| g.enabled && g.schedule != "manual")
         {
+            if garden::is_running(g.id) {
+                tracing::info!("gardener {}: skipped, a run-now is still going", g.name);
+                continue;
+            }
             let name = g.name.clone();
             let out = garden::run_gardener(store.clone(), hot.clone(), g).await;
             tracing::info!("gardener {name}: {} — {}", out.status, out.summary);

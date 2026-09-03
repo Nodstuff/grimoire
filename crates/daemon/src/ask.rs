@@ -348,8 +348,16 @@ pub async fn ask(
         let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         let folder = answers_folder(&mut s, human).map_err(|e| e.to_string())?;
         let agent = crate::room::agent_principal(&mut s).map_err(|e| e.to_string())?;
-        let (doc_id, _) = grimoire_store::import::import_markdown(&mut *s, &title, Some(folder), agent, &md)
-            .map_err(|e| e.to_string())?;
+        // through the gate under the agent, never apply (ledgered verdicts)
+        let (doc_id, _) = crate::garden::create_doc_through_gate(
+            &mut s,
+            &title,
+            Some(folder),
+            agent,
+            &md,
+            grimoire_store::ConfidencePolicy::Gate,
+        )
+        .map_err(|e| e.to_string())?;
         (doc_id, agent)
     };
     let sources = excerpts.len();

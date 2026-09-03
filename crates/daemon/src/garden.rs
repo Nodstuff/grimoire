@@ -1276,16 +1276,23 @@ async fn run_scribe(
                 lines.push(format!("skipped existing: {}", nd.title));
                 continue;
             }
-            match grimoire_store::import::import_markdown(
-                &mut *s,
+            // through the gate, never apply: every block gets a verdict
+            match create_doc_through_gate(
+                &mut s,
                 &nd.title,
                 Some(parent),
                 g.principal,
                 &nd.markdown,
+                g.confidence_policy,
             ) {
-                Ok((_, blocks)) => {
+                Ok((_, out)) => {
                     written += 1;
-                    lines.push(format!("wrote {} ({} blocks)", nd.title, blocks));
+                    lines.push(format!(
+                        "wrote {} ({} blocks: {})",
+                        nd.title,
+                        out.verdicts.len(),
+                        verdict_counts(&out)
+                    ));
                 }
                 Err(e) => lines.push(format!("{}: write failed: {e}", nd.title)),
             }
@@ -1298,6 +1305,79 @@ async fn run_scribe(
     )
 }
 
+// --- one run per gardener at a time ---
+
+static IN_FLIGHT: Mutex<Option<HashSet<Uuid>>> = Mutex::new(None);
+
+fn in_flight<R>(f: impl FnOnce(&mut HashSet<Uuid>) -> R) -> R {
+    let mut g = IN_FLIGHT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(g.get_or_insert_with(HashSet::new))
+}
+
+/// Exclusive claim on a gardener for the duration of one run; released on
+/// drop (including a cancelled task).
+pub struct RunClaim(Uuid);
+
+impl Drop for RunClaim {
+    fn drop(&mut self) {
+        in_flight(|s| {
+            s.remove(&self.0);
+        });
+    }
+}
+
+/// Claim `gardener` for a run; `None` while another run holds it.
+pub fn claim_run(gardener: Uuid) -> Option<RunClaim> {
+    in_flight(|s| s.insert(gardener)).then_some(RunClaim(gardener))
+}
+
+pub fn is_running(gardener: Uuid) -> bool {
+    in_flight(|s| s.contains(&gardener))
+}
+
+/// Status a `run_gardener` outcome carries when the gardener was already
+/// running: nothing was started and no run row was written.
+pub const STATUS_RUNNING: &str = "running";
+
+/// Create a doc and land `md` through the GATE under `principal` — never
+/// `apply`. Every block is ledgered with a verdict; at epoch 0 with a fresh
+/// principal they land green, so the doc reads the same as an import, but
+/// the provenance is an agent's proposal. `policy` review caps at yellow.
+pub(crate) fn create_doc_through_gate(
+    s: &mut SqliteStore,
+    title: &str,
+    parent: Option<Uuid>,
+    principal: Uuid,
+    md: &str,
+    policy: ConfidencePolicy,
+) -> grimoire_store::Result<(Uuid, grimoire_store::ProposeOutcome)> {
+    use grimoire_store::import::{segment, to_ops};
+    let doc = s.create_doc(title, parent, principal)?;
+    let ops = to_ops(segment(md));
+    let outcome = if ops.is_empty() {
+        grimoire_store::ProposeOutcome { doc_id: doc.id, epoch: 0, verdicts: vec![] }
+    } else {
+        match policy {
+            ConfidencePolicy::Review => s.propose_reviewed(doc.id, 0, principal, ops)?,
+            ConfidencePolicy::Gate => s.propose(doc.id, 0, principal, ops)?,
+        }
+    };
+    Ok((doc.id, outcome))
+}
+
+/// "3 green / 1 yellow / 0 red" for a run-log line.
+pub(crate) fn verdict_counts(out: &grimoire_store::ProposeOutcome) -> String {
+    let mut c = (0, 0, 0);
+    for v in &out.verdicts {
+        match v.verdict {
+            grimoire_store::Verdict::Green => c.0 += 1,
+            grimoire_store::Verdict::Yellow => c.1 += 1,
+            grimoire_store::Verdict::Red => c.2 += 1,
+        }
+    }
+    format!("{} green / {} yellow / {} red", c.0, c.1, c.2)
+}
+
 /// Run one gardener end to end. Never panics the daemon; all failure modes
 /// land in the run log (ticket 4.6: never a hang, never silent).
 pub async fn run_gardener(
@@ -1305,6 +1385,15 @@ pub async fn run_gardener(
     hot: crate::hot::HotState,
     g: Gardener,
 ) -> RunOutcome {
+    // one run per gardener: a run-now during the daily cut (or a double
+    // click) must not spawn a second claude against the same scope
+    let Some(_claim) = claim_run(g.id) else {
+        return RunOutcome {
+            run_id: Uuid::nil(),
+            status: STATUS_RUNNING.into(),
+            summary: format!("{} is already running; not started again", g.name),
+        };
+    };
     let run_id = {
         let mut s = store
             .lock()
@@ -1687,5 +1776,49 @@ mod scribe_parse_tests {
     #[test]
     fn unterminated_section_fails_closed() {
         assert!(parse_scribe_docs("===DOC=== . :: X\nbody with no end").is_err());
+    }
+}
+
+#[cfg(test)]
+mod gate_path_tests {
+    use super::*;
+    use grimoire_store::PrincipalKind;
+
+    #[test]
+    fn new_docs_land_through_the_gate_with_a_verdict_on_every_block() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let scribe = s.create_principal(PrincipalKind::Agent, "scribe", None).unwrap();
+        let (doc, out) = create_doc_through_gate(
+            &mut s,
+            "Written",
+            None,
+            scribe.id,
+            "# Title\n\nA paragraph.\n\n- a list\n",
+            ConfidencePolicy::Gate,
+        )
+        .unwrap();
+        assert_eq!(out.verdicts.len(), 3);
+        let ops = s.ops_since(doc, 0).unwrap();
+        assert_eq!(ops.len(), 3, "every block is ledgered");
+        assert!(ops.iter().all(|o| o.verdict.is_some()), "every op carries a verdict");
+        assert!(ops.iter().all(|o| o.principal == scribe.id));
+        // epoch 0, fresh agent: green, so the doc reads like an import
+        assert_eq!(s.read_doc(doc).unwrap().roots.len(), 1);
+        assert_eq!(verdict_counts(&out), "3 green / 0 yellow / 0 red");
+        // an empty body is a bare doc, no ops
+        let (_, out) = create_doc_through_gate(&mut s, "Empty", None, scribe.id, "", ConfidencePolicy::Review).unwrap();
+        assert!(out.verdicts.is_empty());
+    }
+
+    #[test]
+    fn a_gardener_can_only_be_claimed_once_at_a_time() {
+        let id = Uuid::now_v7();
+        assert!(!is_running(id));
+        let claim = claim_run(id).expect("first claim");
+        assert!(is_running(id));
+        assert!(claim_run(id).is_none(), "second claim refused while running");
+        drop(claim);
+        assert!(!is_running(id));
+        assert!(claim_run(id).is_some());
     }
 }
