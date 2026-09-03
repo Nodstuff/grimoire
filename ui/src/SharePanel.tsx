@@ -6,6 +6,7 @@ import { useEffect, useState } from 'react'
 import QRCode from 'qrcode'
 import { api, Contact, Doc, DocFederation, HubRow, Share, ShareTrust } from './types'
 import { errText, notify } from './Notice'
+import { copyText } from './Profile'
 import { TRUST_TIERS, trustHint } from './trust'
 import { shortFingerprint } from './shares'
 
@@ -67,10 +68,12 @@ export function InviteLink({ link }: { link: string }) {
   }, [link])
 
   const copy = () => {
-    navigator.clipboard.writeText(link).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1800)
-    })
+    copyText(link)
+      .then(() => {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1800)
+      })
+      .catch(() => notify('could not copy — select the link text and copy it by hand', 'warn'))
   }
 
   return (

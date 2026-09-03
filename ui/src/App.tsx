@@ -242,6 +242,8 @@ export default function App() {
       if (!action) return
       // Esc isn't a combo — leave its default (blur inputs etc.) intact.
       if (action === 'escape') {
+        // a locked palette (ask in flight, first-run name) owns its own Esc
+        if (document.querySelector('.palette-backdrop[data-locked]')) return
         setPalette(null)
         return
       }
@@ -1037,6 +1039,12 @@ function DocTreeNav({
   // inline instead: first click arms the ×, second click within 2.5s deletes
   const [armed, setArmed] = useState<string | null>(null)
   const armTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(
+    () => () => {
+      if (armTimer.current) clearTimeout(armTimer.current)
+    },
+    [],
+  )
   const doDelete = async (d: Doc) => {
     if (armed !== d.id) {
       setArmed(d.id)
@@ -1223,22 +1231,32 @@ function DocTreeNav({
 function DocTitle({ doc, onRenamed }: { doc: Doc; onRenamed: () => void }) {
   const [editing, setEditing] = useState(false)
   const [value, setValue] = useState(doc.title)
+  // Enter unmounts the input, whose blur fires save again: one rename only
+  const saving = useRef(false)
 
   const save = async () => {
+    if (saving.current) return
+    saving.current = true
     setEditing(false)
     const title = value.trim()
     if (!title || title === doc.title) {
       setValue(doc.title)
+      saving.current = false
       return
     }
-    await api(`/api/doc/${doc.id}/rename`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title }),
-    }).catch((e) => {
+    try {
+      await api(`/api/doc/${doc.id}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      })
+    } catch (e) {
       console.error(e)
+      notify(`rename failed: ${errText(e)}`, 'warn')
       setValue(doc.title)
-    })
+    } finally {
+      saving.current = false
+    }
     onRenamed()
   }
 
