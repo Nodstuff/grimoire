@@ -32,20 +32,45 @@ impl Identity {
         if let Some(path) = std::env::var_os("GRIMOIRE_IDENTITY_FILE") {
             return Self::load_or_create_file(Path::new(&path));
         }
+        let file = db_dir.join(KEY_FILE);
+        // a key file beside the db always wins: it is how a headless box (no
+        // keychain) and a migrated identity are expressed
+        if file.exists() {
+            return Self::load_or_create_file(&file);
+        }
+        // Only macOS has a keychain backend compiled in (`apple-native`). On
+        // any other OS `keyring` falls back to an IN-MEMORY mock that happily
+        // "stores" the seed and forgets it at exit — a hub would mint a new
+        // node id on every restart and orphan its members. File only there.
+        if !cfg!(target_os = "macos") {
+            return Self::load_or_create_file(&file);
+        }
         match keychain_entry() {
             Ok(entry) => match entry.get_password() {
                 Ok(hex_seed) => Self::from_hex(&hex_seed),
                 Err(keyring::Error::NoEntry) => {
                     let id = Self::generate();
-                    entry
-                        .set_password(&id.seed_hex())
-                        .context("storing identity in keychain")?;
-                    Ok(id)
+                    match entry.set_password(&id.seed_hex()) {
+                        Ok(()) => Ok(id),
+                        // keychain present but refusing (locked, headless
+                        // session): persist to the file rather than minting a
+                        // throwaway identity every start
+                        Err(e) => {
+                            tracing::warn!("keychain refused the identity ({e}); keeping it in {}", file.display());
+                            write_secret_file(&file, &id.seed_hex())?;
+                            Ok(id)
+                        }
+                    }
                 }
-                Err(e) => Err(e).context("reading identity from keychain"),
+                // Linux without a native backend compiled in, a locked
+                // keychain, no session bus: none of these are "no identity",
+                // so fall back to the file instead of disabling federation
+                Err(e) => {
+                    tracing::warn!("keychain unavailable ({e}); using {}", file.display());
+                    Self::load_or_create_file(&file)
+                }
             },
-            // no keychain on this machine: file fallback
-            Err(_) => Self::load_or_create_file(&db_dir.join(KEY_FILE)),
+            Err(_) => Self::load_or_create_file(&file),
         }
     }
 
