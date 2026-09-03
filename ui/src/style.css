@@ -76,6 +76,7 @@ kbd {
 }
 
 .empty { align-self: center; color: var(--fg-dim); }
+.lazy-loading { padding: 24px; font-size: 12px; color: var(--fg-dim); opacity: 0.7; text-align: center; }
 
 /* ---------- doc ---------- */
 

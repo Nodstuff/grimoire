@@ -1,10 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DocEditor from './editor/DocEditor'
 import HotEditor, { AgentStatus, HotDoc } from './editor/HotEditor'
-import GraphView from './GraphView'
 import TendPanel from './TendPanel'
 import Gardeners from './Gardeners'
-import CanvasBlock from './CanvasBlock'
 import Sharing from './Sharing'
 import SharePanel from './SharePanel'
 import PaletteShell from './PaletteShell'
@@ -13,6 +11,12 @@ import Trash, { restoreDoc } from './Trash'
 import ImportFolder from './ImportFolder'
 import ReviewRail from './ReviewRail'
 import { notify, errText, Notices } from './Notice'
+
+// heavy views load on first use: xyflow + html-to-image (canvas) and
+// force-graph (graph) are not part of the boot bundle
+const CanvasBlock = lazy(() => import('./CanvasBlock'))
+const GraphView = lazy(() => import('./GraphView'))
+const Loading = () => <div className="lazy-loading">loading…</div>
 import { resolveShortcut } from './shortcuts'
 import { parseDeepLink, scrubDeepLink } from './deeplink'
 import { buildHighlightMap, targetBlockOf } from './review'
@@ -420,7 +424,11 @@ export default function App() {
             onChanged={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
           />
         )}
-        {view.kind === 'graph' && <GraphView onOpenDoc={openDoc} />}
+        {view.kind === 'graph' && (
+          <Suspense fallback={<Loading />}>
+            <GraphView onOpenDoc={openDoc} />
+          </Suspense>
+        )}
       </main>
 
       {profile && !profile.confirmed && <FirstRunName profile={profile} onSaved={setProfile} />}
@@ -1740,7 +1748,9 @@ function DocView({
           <DocTitle doc={tree.doc} onRenamed={loadTree} />
           <span className="meta">canvas · epoch {tree.doc.current_epoch}</span>
         </div>
-        <CanvasBlock block={canvases[0]} epoch={tree.doc.current_epoch} onSaved={loadTree} full />
+        <Suspense fallback={<Loading />}>
+          <CanvasBlock block={canvases[0]} epoch={tree.doc.current_epoch} onSaved={loadTree} full />
+        </Suspense>
       </div>
     )
   }
