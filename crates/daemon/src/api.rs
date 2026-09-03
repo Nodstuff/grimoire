@@ -236,6 +236,28 @@ async fn doc_federation(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Jso
             .unwrap_or_else(|| "?".into())
     };
     let is_hub = |cid: Uuid| contacts.iter().any(|c| c.id == cid && c.is_hub);
+    // hub slice 2: this doc (or an ancestor) was handed to the mirror's owner by me
+    let transferred_roots: Vec<Uuid> = s
+        .list_doc_transfers()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| t.direction == grimoire_store::TransferDirection::Out && t.state == "done")
+        .map(|t| t.root_doc)
+        .collect();
+    let transferred_from_me = |mut cur: Uuid| -> bool {
+        if transferred_roots.is_empty() {
+            return false;
+        }
+        loop {
+            if transferred_roots.contains(&cur) {
+                return true;
+            }
+            match s.get_doc(cur).ok().and_then(|d| d.parent_id) {
+                Some(p) => cur = p,
+                None => return false,
+            }
+        }
+    };
     let mirror = s.get_mirror(id).ok().flatten().map(|m| {
         json!({
             "owner": m.owner,
@@ -244,10 +266,11 @@ async fn doc_federation(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Jso
             "synced_epoch": m.synced_epoch,
             "owner_tended": m.owner_tended,
             // hub relay (slice 1): the share comes from a hub; a relayed doc
-            // names its true owner and is read-only in this slice
+            // names its true owner (slice 2: edits reach them through the hub)
             "from_hub": is_hub(m.owner),
             "origin_owner": m.origin_owner,
             "origin_owner_name": m.origin_owner_name,
+            "transferred_from_me": transferred_from_me(id),
         })
     });
     let shares: Vec<Value> = s
