@@ -4,7 +4,7 @@
 
 import type { ActivityItem } from './types'
 
-export type LiveEventKind = 'live_started' | 'doc_added' | 'doc_changed'
+export type LiveEventKind = 'live_started' | 'doc_added' | 'doc_changed' | 'share_offered'
 
 export interface LiveEvent {
   seq: number
@@ -78,6 +78,10 @@ export function liveEventLine(ev: LiveEvent): string | null {
       return `${ev.from} is live on “${ev.doc_title}” — click to join`
     case 'doc_added':
       return `${ev.from} added “${ev.doc_title}”`
+    case 'share_offered':
+      // durable: the request sits under Share requests on the Shares page;
+      // this toast only points there (doc_id is the offer id, not a doc)
+      return `${ev.from} wants to share “${ev.doc_title}” with you — see Share requests`
     default:
       return null
   }
@@ -92,6 +96,8 @@ export function liveEventVerb(kind: string): string {
       return 'added'
     case 'doc_changed':
       return 'changed'
+    case 'share_offered':
+      return 'offered to share'
     default:
       return kind
   }

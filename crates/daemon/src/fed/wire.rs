@@ -116,6 +116,18 @@ pub enum Request {
         title: String,
         kind: NotifyKind,
     },
+    /// Invites v2 (OWNER → contact): "I'd like to share this with you" — the
+    /// invite delivered over the wire instead of as a pasted link. The
+    /// recipient stores it as a durable share offer and accepts or declines
+    /// in its app; accepting redeems `secret` exactly like a link would. Only
+    /// accepted from a known, non-revoked contact.
+    Offer {
+        share: String,
+        root_title: String,
+        permission: String,
+        secret: String,
+        expires_at: String,
+    },
     /// The coalesced nudge: everything that changed in ONE share during one
     /// detector tick, in one dial. Replaces N `Notify` dials with one; old
     /// peers still receive `Notify` (see `loops::send_nudges`).
@@ -301,20 +313,36 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-/// The invite ticket: everything a grantee needs to join, serialized as a
-/// `grimoire://join/<base64url(json)>` link. The node id is enough to dial —
-/// iroh discovery resolves it — so no relay hint in v0. The secret is the
-/// trust anchor and only ever exists here and in flight.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+/// The invite ticket: everything a grantee needs to join. The node id is
+/// enough to dial — iroh discovery resolves it — so no relay hint in v0. The
+/// secret is the trust anchor and only ever exists here and in flight.
+///
+/// Link format (v2): `grimoire://join/<node-id-hex>/<secret>` — ~110 chars,
+/// readable aloud. The share id is not in the link: the owner looks the
+/// invite up by the secret's hash alone. Secrets are 16 random bytes in
+/// lowercase RFC 4648 base32 without padding (26 chars, no ambiguous
+/// case). The v1 form `grimoire://join/<base64url(json)>` still parses so
+/// links minted before this change keep working for their 7-day life.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct Ticket {
     pub v: u32,
     /// Owner's endpoint id (hex ed25519 pubkey).
     pub node: String,
+    /// Owner's share id — carried by v1 links only; empty for v2 (the owner
+    /// resolves the share from the secret).
+    #[serde(default)]
     pub share: String,
     pub secret: String,
 }
 
 const LINK_PREFIX: &str = "grimoire://join/";
+
+/// A fresh invite secret: 16 random bytes, base32 lowercase, no padding.
+pub fn new_secret() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("OS entropy");
+    data_encoding::BASE32_NOPAD.encode(&bytes).to_lowercase()
+}
 
 impl Ticket {
     pub fn new(node: String, share: String, secret: String) -> Self {
@@ -326,26 +354,36 @@ impl Ticket {
         }
     }
 
+    /// The v2 short link.
     pub fn to_link(&self) -> String {
-        let json = serde_json::to_vec(self).expect("ticket serializes");
-        format!(
-            "{LINK_PREFIX}{}",
-            data_encoding::BASE64URL_NOPAD.encode(&json)
-        )
+        format!("{LINK_PREFIX}{}/{}", self.node, self.secret)
     }
 
     pub fn parse(link: &str) -> Result<Self> {
         let encoded = link
             .trim()
+            .trim_end_matches('/')
             .strip_prefix(LINK_PREFIX)
             .context("not a grimoire://join/ link")?;
+        // v2: <64 hex>/<secret>
+        if let Some((node, secret)) = encoded.split_once('/') {
+            let node_ok = node.len() == 64 && node.chars().all(|c| c.is_ascii_hexdigit());
+            let secret_ok = !secret.is_empty()
+                && secret.len() <= 128
+                && secret.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if !node_ok || !secret_ok {
+                anyhow::bail!("link is malformed (expected grimoire://join/<id>/<secret>)");
+            }
+            return Ok(Ticket::new(node.to_lowercase(), String::new(), secret.to_string()));
+        }
+        // v1: base64url(json)
         let json = data_encoding::BASE64URL_NOPAD
             .decode(encoded.as_bytes())
-            .context("ticket is not valid base64url")?;
-        let ticket: Ticket = serde_json::from_slice(&json).context("ticket is not valid JSON")?;
+            .context("link is not valid base64url")?;
+        let ticket: Ticket = serde_json::from_slice(&json).context("link is not a valid ticket")?;
         if ticket.v != PROTOCOL_VERSION {
             anyhow::bail!(
-                "ticket is protocol version {} (this instance speaks {})",
+                "link is protocol version {} (this instance speaks {})",
                 ticket.v,
                 PROTOCOL_VERSION
             );

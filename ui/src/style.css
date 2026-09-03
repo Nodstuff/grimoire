@@ -1388,3 +1388,16 @@ kbd {
 }
 .suggestion-bar button.suggestion-accept:hover { color: var(--green); border-color: var(--green); }
 .suggestion-bar button.suggestion-reject:hover { color: var(--red); border-color: var(--red); }
+
+/* ---------- invites v2: share requests, neighbours, contact picker ---------- */
+.offer-card { border-color: var(--accent); }
+.offer-line { font-size: 13px; color: var(--fg); }
+.neighbours { margin-top: 8px; }
+.neighbour-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.chip.neighbour { cursor: default; font-size: 11px; }
+.chip.neighbour.known { border-color: var(--green); }
+.share-with { margin: 10px 0 6px; padding-top: 8px; border-top: 1px solid var(--border); }
+.share-link-flow { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 10px; }
+.share-fallback { margin-top: 6px; }
+.meta.ok { color: var(--green); }
+.meta.dim { opacity: 0.7; }

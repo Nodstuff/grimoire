@@ -27,14 +27,43 @@ use std::sync::{Arc, Mutex};
 /// — no relay, no public DNS in the path. That matters on office networks
 /// where the relay connection flaps (observed: 80+ resets in a day) and
 /// would otherwise make a colleague across the desk "unreachable".
-pub async fn bind(secret: [u8; 32]) -> Result<Endpoint> {
-    Endpoint::builder(presets::N0)
-        .secret_key(SecretKey::from_bytes(&secret))
+pub async fn bind(secret: [u8; 32]) -> Result<(Endpoint, iroh_mdns_address_lookup::MdnsAddressLookup)> {
+    let key = SecretKey::from_bytes(&secret);
+    // built by hand (not via the builder trait) so we keep a handle: its
+    // discovery stream is what the Shares page's "nearby" list reads
+    let mdns = iroh_mdns_address_lookup::MdnsAddressLookup::builder()
+        .build(key.public())
+        .context("starting local discovery")?;
+    let ep = Endpoint::builder(presets::N0)
+        .secret_key(key)
         .alpns(vec![ALPN.to_vec(), HOT_ALPN.to_vec()])
-        .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder())
+        .address_lookup(mdns.clone())
         .bind()
         .await
-        .context("binding federation endpoint")
+        .context("binding federation endpoint")?;
+    Ok((ep, mdns))
+}
+
+/// Feed mDNS discovery events into the runtime's neighbour list. Presence
+/// only: a neighbour still needs an invite or an offer to become a contact.
+pub async fn neighbour_loop(mdns: iroh_mdns_address_lookup::MdnsAddressLookup, runtime: Runtime) {
+    use futures_util::StreamExt;
+    let mut events = mdns.subscribe().await;
+    while let Some(ev) = events.next().await {
+        match ev {
+            iroh_mdns_address_lookup::DiscoveryEvent::Discovered { endpoint_info, .. } => {
+                let name = endpoint_info
+                    .user_data()
+                    .map(|u| u.to_string())
+                    .filter(|n| !n.trim().is_empty());
+                runtime.neighbour_seen(endpoint_info.endpoint_id.to_string(), name);
+            }
+            iroh_mdns_address_lookup::DiscoveryEvent::Expired { endpoint_id } => {
+                runtime.neighbour_gone(&endpoint_id.to_string());
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Bounded propose dedupe: (peer, request_id) → original outcome (retry
@@ -407,6 +436,40 @@ fn dispatch(
         ),
         Request::NotifyBatch { share, items } => {
             accept_nudges(&store, store_arc, endpoint, runtime, &contact, &share, items)
+        }
+        Request::Offer {
+            share,
+            root_title,
+            permission,
+            secret,
+            expires_at,
+        } => {
+            // a known contact offering us a share: store it durably, tell the UI
+            let Ok(share_uuid) = share.parse::<uuid::Uuid>() else {
+                return Response::refused(RefusalCode::BadRequest, "bad share id");
+            };
+            let Some(perm) = grimoire_store::SharePermission::parse(&permission) else {
+                return Response::refused(RefusalCode::BadRequest, "bad permission");
+            };
+            if secret.is_empty() || secret.len() > 128 || root_title.chars().count() > 300 {
+                return Response::refused(RefusalCode::BadRequest, "bad offer");
+            }
+            match store.add_share_offer(
+                contact.id,
+                peer,
+                share_uuid,
+                &root_title,
+                perm,
+                &secret,
+                &expires_at,
+            ) {
+                Ok(offer) => {
+                    tracing::info!(peer, petname = contact.petname, share, "share offer received");
+                    runtime.push_event("share_offered", offer.id, root_title, contact.petname.clone());
+                    Response::Noted
+                }
+                Err(e) => Response::refused(RefusalCode::Other, e.to_string()),
+            }
         }
         Request::ProposalStatus { op_ids } => {
             let ids: Vec<uuid::Uuid> = op_ids.iter().filter_map(|s| s.parse().ok()).collect();

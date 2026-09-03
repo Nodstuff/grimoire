@@ -32,7 +32,22 @@ struct Inner {
     /// Shares with a nudged pull in flight → whether another nudge arrived
     /// meanwhile (pull again when this one finishes).
     pulling: HashMap<Uuid, bool>,
+    /// Grimoires visible on the LAN right now (mDNS): pubkey → (advertised
+    /// name, last seen). Saves typing a node id; grants no trust.
+    neighbours: HashMap<String, (Option<String>, Instant)>,
 }
+
+/// A LAN neighbour as the UI sees it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Neighbour {
+    pub pubkey: String,
+    /// The name the peer advertises (its profile name), if any.
+    pub name: Option<String>,
+    pub seen_secs_ago: u64,
+}
+
+/// A neighbour unseen for this long is dropped from the list.
+const NEIGHBOUR_TTL: Duration = Duration::from_secs(120);
 
 /// Cheap to clone; shared across the API, the fed server, and the loops.
 #[derive(Clone, Default)]
@@ -53,6 +68,34 @@ impl Runtime {
         let mut g = self.lock();
         g.focus.retain(|_, t| t.elapsed() < FOCUS_WINDOW);
         g.focus.keys().copied().collect()
+    }
+
+    /// mDNS saw (or refreshed) a peer.
+    pub fn neighbour_seen(&self, pubkey: String, name: Option<String>) {
+        self.lock().neighbours.insert(pubkey, (name, Instant::now()));
+    }
+
+    /// mDNS says a peer went away.
+    pub fn neighbour_gone(&self, pubkey: &str) {
+        self.lock().neighbours.remove(pubkey);
+    }
+
+    /// Peers on the LAN, most recently seen first; `exclude` = our own key.
+    pub fn neighbours(&self, exclude: &str) -> Vec<Neighbour> {
+        let mut g = self.lock();
+        g.neighbours.retain(|_, (_, t)| t.elapsed() < NEIGHBOUR_TTL);
+        let mut out: Vec<Neighbour> = g
+            .neighbours
+            .iter()
+            .filter(|(pk, _)| pk.as_str() != exclude)
+            .map(|(pk, (name, t))| Neighbour {
+                pubkey: pk.clone(),
+                name: name.clone(),
+                seen_secs_ago: t.elapsed().as_secs(),
+            })
+            .collect();
+        out.sort_by_key(|n| n.seen_secs_ago);
+        out
     }
 
     /// Record a nudge from an owner; returns its sequence number.

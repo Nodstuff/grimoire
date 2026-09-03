@@ -12,6 +12,7 @@ export function refusalHint(raw: string | null | undefined): string | null {
   if (s.includes('expired') || s.includes('already redeemed') || s.includes('invite')) {
     return 'this link is no longer valid — ask for a fresh one'
   }
+  if (s.includes('did not accept the request')) return 'their Grimoire refused the request — they may need to unblock you'
   if (s.includes('timed out') || s.includes('unreachable') || s.includes('offline')) {
     return 'the owner’s Mac is offline or unreachable — will keep trying'
   }

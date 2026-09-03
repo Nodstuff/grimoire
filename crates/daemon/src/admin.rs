@@ -236,6 +236,8 @@ pub struct FedState {
     pub store: Store,
     pub ctx: FedCtx,
     pub hot: crate::hot::HotState,
+    /// Neighbours (mDNS presence) live here.
+    pub runtime: crate::fed::Runtime,
 }
 
 /// The local trust boundary for `/admin/*` (shares, trust, gardeners,
@@ -363,6 +365,13 @@ async fn list_shares(State(st): State<FedState>) -> Json<Value> {
                     v["root_title"] = json!(root.as_ref().map(|d| d.title.clone()).unwrap_or_default());
                     v["doc_count"] = json!(doc_count);
                     v["contact_petname"] = json!(petname);
+                    // invites v2: an unredeemed invite offered to a contact over the wire
+                    if sh.state == grimoire_store::ShareState::Offered
+                        && let Ok(Some(to)) = s.invite_offered_to(sh.id)
+                        && let Some(c) = contacts.iter().find(|x| x.id == to)
+                    {
+                        v["offered_to_petname"] = json!(c.petname);
+                    }
                     v
                 })
                 .collect::<Vec<_>>()
@@ -806,11 +815,215 @@ async fn list_joins(State(st): State<FedState>) -> Json<Value> {
     }
 }
 
-pub fn router(store: Store, fed: FedCtx, hot: crate::hot::HotState, token: AdminToken) -> Router {
+#[derive(Deserialize)]
+pub struct OfferShare {
+    pub root_doc: Uuid,
+    pub permission: Option<String>,
+    pub contact_id: Uuid,
+}
+
+/// Invites v2, owner side: share a subtree WITH A CONTACT — no link. Mints
+/// the invite, records whom it was offered to, and dials them with `Offer`.
+/// If they cannot be reached the invite still exists: the reply carries the
+/// link so the owner can send it by hand (`delivered: false`).
+async fn offer_share(State(st): State<FedState>, Json(req): Json<OfferShare>) -> Json<Value> {
+    let (Some(node_id), Some(endpoint)) = (&st.ctx.node_id, &st.ctx.endpoint) else {
+        return Json(json!({"error": "sharing is off: this Grimoire has no identity yet"}));
+    };
+    let permission = match req.permission.as_deref() {
+        None => grimoire_store::SharePermission::View,
+        Some(p) => match grimoire_store::SharePermission::parse(p) {
+            Some(p) => p,
+            None => return Json(json!({"error": format!("bad permission: {p}")})),
+        },
+    };
+    let (share, minted, contact, root_title) = {
+        let mut s = st
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(contact) = s
+            .list_contacts()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| c.id == req.contact_id && !c.revoked)
+        else {
+            return Json(json!({"error": "that contact is not available (removed or blocked)"}));
+        };
+        let root_title = s.get_doc(req.root_doc).map(|d| d.title).unwrap_or_default();
+        match crate::fed::mint_invite_full(&mut s, node_id, req.root_doc, permission) {
+            Ok((share, minted)) => {
+                if let Err(e) = s.set_invite_offered_to(share.id, contact.id) {
+                    return Json(json!({"error": e.to_string()}));
+                }
+                (share, minted, contact, root_title)
+            }
+            Err(e) => return Json(json!({"error": format!("{e:#}")})),
+        }
+    };
+    let delivered = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        crate::fed::offer_share(endpoint, &contact.pubkey, share.id, &root_title, permission, &minted),
+    )
+    .await;
+    match delivered {
+        Ok(Ok(())) => Json(json!({"share": share, "delivered": true, "to": contact.petname})),
+        Ok(Err(e)) => {
+            tracing::warn!(to = contact.petname, "share offer not delivered: {e:#}");
+            Json(json!({"share": share, "delivered": false, "to": contact.petname, "link": minted.link, "reason": format!("{e:#}")}))
+        }
+        Err(_) => Json(json!({"share": share, "delivered": false, "to": contact.petname, "link": minted.link, "reason": "they are offline or unreachable right now"})),
+    }
+}
+
+/// Recipient side: open share offers, with who they are from.
+async fn list_offers(State(st): State<FedState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let contacts = s.list_contacts().unwrap_or_default();
+    match s.list_share_offers(true) {
+        Ok(offers) => Json(json!(offers
+            .into_iter()
+            .map(|o| {
+                let c = contacts.iter().find(|c| c.id == o.from_contact);
+                let mut v = json!(o);
+                v["from_petname"] = json!(c.map(|c| c.petname.clone()).unwrap_or_else(|| "someone".into()));
+                v["from_pubkey"] = json!(c.map(|c| c.pubkey.clone()).unwrap_or_default());
+                // the secret never leaves the daemon
+                v.as_object_mut().map(|m| m.remove("secret"));
+                v
+            })
+            .collect::<Vec<_>>())),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+/// Accept an offer: redeem it exactly like a pasted link, then pull the tree.
+async fn accept_offer(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
+    let Some(endpoint) = &st.ctx.endpoint else {
+        return Json(json!({"error": "sharing is off: this Grimoire has no identity yet"}));
+    };
+    let offer = {
+        let s = st
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match s.get_share_offer(req.id) {
+            Ok(o) => o,
+            Err(e) => return Json(json!({"error": e.to_string()})),
+        }
+    };
+    if offer.state != grimoire_store::ShareOfferState::Open {
+        return Json(json!({"error": format!("this request is already {}", offer.state.as_str())}));
+    }
+    let ticket = crate::fed::ticket_for_offer(&offer);
+    let attempt = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        crate::fed::join_once(endpoint, &st.store, &ticket),
+    )
+    .await;
+    match attempt {
+        Ok(Ok(outcome)) => {
+            {
+                let mut s = st
+                    .store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                s.set_share_offer_state(offer.id, grimoire_store::ShareOfferState::Accepted).ok();
+            }
+            let pulled = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                crate::fed::pull_after_join(endpoint, &st.store, &outcome.root_doc),
+            )
+            .await;
+            match pulled {
+                Ok(Ok(sum)) => Json(json!({"joined": outcome, "docs": sum.changed})),
+                Ok(Err(e)) => Json(json!({"joined": outcome, "pull_error": format!("{e:#}")})),
+                Err(_) => Json(json!({"joined": outcome, "pull_error": "the first sync is taking a while; it continues in the background"})),
+            }
+        }
+        Ok(Err(e)) => {
+            // a dead invite (expired/burned) closes the offer; unreachable keeps it open
+            let msg = format!("{e:#}");
+            if crate::fed::loops::join_failure_is_dead(&e) {
+                let mut s = st
+                    .store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                s.set_share_offer_state(offer.id, grimoire_store::ShareOfferState::Expired).ok();
+            }
+            Json(json!({"error": msg}))
+        }
+        Err(_) => Json(json!({"error": "owner unreachable (timed out) — try again when they are online"})),
+    }
+}
+
+async fn decline_offer(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.set_share_offer_state(req.id, grimoire_store::ShareOfferState::Declined) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn clear_offers(State(st): State<FedState>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match s.clear_share_offers() {
+        Ok(n) => Json(json!({"ok": true, "cleared": n})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+/// Grimoires visible on this LAN right now (mDNS). Presence only — each is
+/// flagged if it is already a contact so the UI can offer the right action.
+async fn list_neighbours(State(st): State<FedState>) -> Json<Value> {
+    let me = st.ctx.node_id.clone().unwrap_or_default();
+    let contacts = {
+        let s = st
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.list_contacts().unwrap_or_default()
+    };
+    let rows: Vec<Value> = st
+        .runtime
+        .neighbours(&me)
+        .into_iter()
+        .map(|n| {
+            let c = contacts.iter().find(|c| c.pubkey == n.pubkey);
+            json!({
+                "pubkey": n.pubkey,
+                "name": n.name,
+                "seen_secs_ago": n.seen_secs_ago,
+                "contact_id": c.map(|c| c.id),
+                "contact_petname": c.map(|c| c.petname.clone()),
+                "blocked": c.map(|c| c.revoked).unwrap_or(false),
+            })
+        })
+        .collect();
+    Json(json!(rows))
+}
+
+pub fn router(
+    store: Store,
+    fed: FedCtx,
+    hot: crate::hot::HotState,
+    runtime: crate::fed::Runtime,
+    token: AdminToken,
+) -> Router {
     let fed_state = FedState {
         store: store.clone(),
         ctx: fed,
         hot: hot.clone(),
+        runtime,
     };
     // the profile is not gate-weakening (your own name + public identity):
     // it stays open so the first-run prompt works from any local client
@@ -819,6 +1032,12 @@ pub fn router(store: Store, fed: FedCtx, hot: crate::hot::HotState, token: Admin
         .with_state(fed_state.clone());
     let fed_routes = Router::new()
         .route("/admin/shares", get(list_shares).post(create_share))
+        .route("/admin/shares/offer", post(offer_share))
+        .route("/admin/offers", get(list_offers))
+        .route("/admin/offers/accept", post(accept_offer))
+        .route("/admin/offers/decline", post(decline_offer))
+        .route("/admin/offers/clear", post(clear_offers))
+        .route("/admin/neighbours", get(list_neighbours))
         .route("/admin/shares/revoke", post(revoke_share))
         .route("/admin/shares/delete", post(delete_share))
         .route("/admin/mirrors", get(list_mirrors))
@@ -871,6 +1090,7 @@ mod token_tests {
                 endpoint: None,
             },
             hot,
+            crate::fed::Runtime::default(),
             AdminToken::fixed("s3cret"),
         )
     }

@@ -463,6 +463,39 @@ pub trait BlockStore {
     // Grantee-side join queue: redeems that will retry until the owner is up.
 
     /// Queue a join ticket for background retry. Idempotent on ticket text.
+    /// Invites v2 (owner side): record whom a minted invite was offered to
+    /// over the wire, so the shares page can say "waiting for alice".
+    fn set_invite_offered_to(&mut self, share_id: Uuid, contact: Uuid) -> Result<()>;
+
+    /// Owner side: the contact an unredeemed invite of this share was offered
+    /// to, if any.
+    fn invite_offered_to(&self, share_id: Uuid) -> Result<Option<Uuid>>;
+
+    /// Invites v2 (recipient side): store an offer received from a contact.
+    /// A second offer for the same (owner, share) replaces the first.
+    fn add_share_offer(
+        &mut self,
+        from_contact: Uuid,
+        owner_node: &str,
+        share_id: Uuid,
+        root_title: &str,
+        permission: SharePermission,
+        secret: &str,
+        expires_at: &str,
+    ) -> Result<ShareOffer>;
+
+    fn list_share_offers(&self, open_only: bool) -> Result<Vec<ShareOffer>>;
+
+    fn get_share_offer(&self, id: Uuid) -> Result<ShareOffer>;
+
+    fn set_share_offer_state(&mut self, id: Uuid, state: ShareOfferState) -> Result<()>;
+
+    /// Mark open offers past their expiry as expired; returns how many.
+    fn expire_share_offers(&mut self) -> Result<usize>;
+
+    /// Remove declined/expired offers (the "clear" action).
+    fn clear_share_offers(&mut self) -> Result<usize>;
+
     fn queue_join(&mut self, ticket: &str) -> Result<Uuid>;
 
     fn list_pending_joins(&self) -> Result<Vec<PendingJoin>>;

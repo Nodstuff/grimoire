@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { groupShares, mirrorStatusLine, shareTitle, shareWho } from './shares'
+import { chipText, groupShares, mirrorStatusLine, offerLine, shareTitle, shareWho } from './shares'
 import type { MirrorRow, Share } from './types'
 
 function share(id: string, state: Share['state'], created_at: string, extra: Partial<Share> = {}): Share {
@@ -89,5 +89,26 @@ describe('mirrorStatusLine', () => {
   it('never synced when nothing has been pulled', () => {
     expect(mirrorStatusLine(row({}), NOW)).toEqual({ kind: 'never', text: 'never synced' })
     expect(mirrorStatusLine(row({ last_pulled_at: null, last_error: '   ' }), NOW).kind).toBe('never')
+  })
+})
+
+describe('invites v2 seams', () => {
+  it('shareWho says who an offered invite is waiting for', () => {
+    expect(shareWho(share('o', 'offered', '', { offered_to_petname: 'alice · 3f9a' }))).toBe('waiting for alice · 3f9a')
+    expect(shareWho(share('o', 'offered', ''))).toBe('not yet joined')
+  })
+  it('offerLine reads naturally for both grants', () => {
+    expect(offerLine({ from_petname: 'alice · 3f9a', root_title: 'Plan', permission: 'propose' })).toBe(
+      'alice · 3f9a wants to share “Plan” with you · can propose edits',
+    )
+    expect(offerLine({ from_petname: 'bob', root_title: 'Notes', permission: 'view' })).toBe(
+      'bob wants to share “Notes” with you · view only',
+    )
+  })
+  it('chipText combines counts and hides when both are zero', () => {
+    expect(chipText(0, 0)).toBeNull()
+    expect(chipText(3, 0)).toBe('3 to review')
+    expect(chipText(0, 1)).toBe('1 share request')
+    expect(chipText(2, 2)).toBe('2 to review · 2 share requests')
   })
 })

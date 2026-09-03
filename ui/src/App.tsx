@@ -18,6 +18,7 @@ import { parseDeepLink, scrubDeepLink } from './deeplink'
 import { buildHighlightMap, targetBlockOf } from './review'
 import { activityLine, loadLastSeen, storeLastSeen, unseenActivity } from './activity'
 import { advanceEvents, EventsCursor, EventsResponse, INITIAL_CURSOR, liveEventLine } from './live'
+import { chipText } from './shares'
 import {
   api,
   ApiError,
@@ -32,6 +33,7 @@ import {
   SearchHit,
   GardenerRun,
   Profile as ProfileRow,
+  ShareOffer,
 } from './types'
 
 type View =
@@ -95,6 +97,8 @@ export default function App() {
   const [treeOpen, setTreeOpen] = useState(false)
   const [palette, setPalette] = useState<Palette>(null)
   const [queueCount, setQueueCount] = useState(0)
+  // invites v2: open share requests ride the same header chip
+  const [offerCount, setOfferCount] = useState(0)
   // first-run name prompt: shown until the install-default name is confirmed.
   // null = no profile route (older daemon) or not loaded yet → no prompt.
   const [profile, setProfile] = useState<ProfileRow | null>(null)
@@ -107,6 +111,9 @@ export default function App() {
       api<QueueRow[]>('/api/queue').then((q) => q.length).catch(() => 0),
       api<{ block: { id: string } }[]>('/api/flags').then((f) => f.length).catch(() => 0),
     ]).then(([q, f]) => setQueueCount(q + f))
+    api<ShareOffer[]>('/admin/offers')
+      .then((o) => setOfferCount(Array.isArray(o) ? o.length : 0))
+      .catch(() => setOfferCount(0))
   }, [])
 
   // ?doc=<uuid>[&block=<uuid>][&tab=<name>]: the shell or an embedding host
@@ -157,7 +164,11 @@ export default function App() {
       cursor = r.cursor
       for (const ev of r.fresh) {
         const line = liveEventLine(ev)
-        if (line) {
+        if (ev.kind === 'share_offered') {
+          // durable request: the toast just points at the Shares page
+          if (line) notify(line, 'ok', { ttlMs: 15_000, onClick: () => setViewRaw({ kind: 'sharing' }) })
+          refreshQueue()
+        } else if (line) {
           notify(line, 'ok', { onClick: () => openDocRef.current(ev.doc_id) })
         } else if (ev.kind === 'doc_changed' && ev.doc_id) {
           setLiveChange((c) => ({ docId: ev.doc_id, n: (c?.n ?? 0) + 1 }))
@@ -409,9 +420,13 @@ export default function App() {
         onDone={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
       />
 
-      {queueCount > 0 && view.kind !== 'review' && (
-        <button className="queue-chip" onClick={() => setView({ kind: 'review' })}>
-          {queueCount} to review
+      {chipText(queueCount, view.kind === 'sharing' ? 0 : offerCount) && view.kind !== 'review' && (
+        <button
+          className="queue-chip"
+          onClick={() => setView({ kind: queueCount > 0 ? 'review' : 'sharing' })}
+          title={offerCount > 0 && queueCount > 0 ? 'share requests are on the Shares page' : undefined}
+        >
+          {chipText(queueCount, view.kind === 'sharing' ? 0 : offerCount)}
         </button>
       )}
 

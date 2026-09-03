@@ -1,7 +1,7 @@
 // Pure seams for the Shares page: grouping/ordering of the shares we own, and
 // the one-line status of a mirror someone shared with us.
 
-import type { MirrorRow, Share } from './types'
+import type { MirrorRow, Share, ShareOffer } from './types'
 import { relTime } from './time'
 
 export interface ShareGroups {
@@ -33,7 +33,22 @@ export function groupShares(rows: Share[]): ShareGroups {
 export function shareWho(s: Share, petnameOf?: (contactId: string) => string | undefined): string {
   if (s.contact_petname) return s.contact_petname
   if (s.contact) return petnameOf?.(s.contact) ?? '?'
+  if (s.offered_to_petname) return `waiting for ${s.offered_to_petname}`
   return 'not yet joined'
+}
+
+/** One line for a share request card: who, what, grant. */
+export function offerLine(o: Pick<ShareOffer, 'from_petname' | 'root_title' | 'permission'>): string {
+  const grant = o.permission === 'propose' ? 'can propose edits' : 'view only'
+  return `${o.from_petname} wants to share “${o.root_title}” with you · ${grant}`
+}
+
+/** Header-chip text combining review items and open share requests. */
+export function chipText(reviewCount: number, offerCount: number): string | null {
+  const parts: string[] = []
+  if (reviewCount > 0) parts.push(`${reviewCount} to review`)
+  if (offerCount > 0) parts.push(`${offerCount} share request${offerCount === 1 ? '' : 's'}`)
+  return parts.length ? parts.join(' · ') : null
 }
 
 /** Title for a share row: the daemon's root_title when present, else the

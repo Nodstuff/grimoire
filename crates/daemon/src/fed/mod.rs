@@ -32,11 +32,12 @@ pub use runtime::Runtime;
 // tests (via `super::`/`crate::fed::`), not re-exported here.
 pub use client::{
     comment_upstream, edit_ping_upstream, hot_end_upstream, hot_start_upstream, hot_status_upstream,
-    join_once, mint_invite, open_hot_bridge, propose_upstream, pull_after_join, pull_owner_of,
+    join_once, mint_invite, mint_invite_full, offer_share, open_hot_bridge, propose_upstream,
+    pull_after_join, pull_owner_of, ticket_for_offer,
 };
 pub use wire::{Refusal, RefusalCode};
 pub use loops::{join_retry_loop, notify_loop, pull_all_once, pull_loop, refresh_outbound};
-pub use server::{bind, serve};
+pub use server::{bind, neighbour_loop, serve};
 pub use wire::Ticket; // admin parses invite links
 
 #[cfg(test)]

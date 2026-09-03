@@ -45,6 +45,33 @@ export interface Share {
   doc_count?: number
   contact_petname?: string | null
   redeemed_at?: string | null
+  /** invites v2: an unredeemed invite was offered over the wire to this contact */
+  offered_to_petname?: string | null
+}
+
+/** Invites v2 — GET /admin/offers: a share someone offered us, awaiting our answer. */
+export interface ShareOffer {
+  id: string
+  from_contact: string
+  from_petname: string
+  from_pubkey: string
+  owner_node: string
+  share_id: string
+  root_title: string
+  permission: 'view' | 'propose'
+  state: 'open' | 'accepted' | 'declined' | 'expired'
+  created_at: string
+  expires_at: string
+}
+
+/** GET /admin/neighbours: a Grimoire visible on this network right now. */
+export interface Neighbour {
+  pubkey: string
+  name: string | null
+  seen_secs_ago: number
+  contact_id: string | null
+  contact_petname: string | null
+  blocked: boolean
 }
 
 export type ShareTrust = 'review' | 'yellow' | 'green'

@@ -108,6 +108,24 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
             )?;
         }
     }
+    let has_invites: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'share_invites'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_invites > 0 {
+        let has_offered: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('share_invites') WHERE name = 'offered_to'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_offered == 0 {
+            conn.execute(
+                "ALTER TABLE share_invites ADD COLUMN offered_to TEXT REFERENCES contacts (id)",
+                [],
+            )?;
+        }
+    }
     let has_shares: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'shares'",
         [],
@@ -498,6 +516,41 @@ fn share_row(row: &rusqlite::Row) -> rusqlite::Result<RawShare> {
         row.get(6)?,
         row.get(7)?,
     ))
+}
+
+type RawOffer = (String, String, String, String, String, String, String, String, String, String);
+
+fn offer_row(row: &rusqlite::Row) -> rusqlite::Result<RawOffer> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn finish_offer(raw: RawOffer) -> Result<ShareOffer> {
+    let (id, from_contact, owner_node, share_id, root_title, permission, secret, state, created_at, expires_at) = raw;
+    Ok(ShareOffer {
+        id: uuid_col(id, "share_offers.id")?,
+        from_contact: uuid_col(from_contact, "share_offers.from_contact")?,
+        owner_node,
+        share_id: uuid_col(share_id, "share_offers.share_id")?,
+        root_title,
+        permission: SharePermission::parse(&permission)
+            .ok_or_else(|| StoreError::InvalidOp(format!("bad offer permission: {permission}")))?,
+        secret,
+        state: ShareOfferState::parse(&state)
+            .ok_or_else(|| StoreError::InvalidOp(format!("bad offer state: {state}")))?,
+        created_at,
+        expires_at,
+    })
 }
 
 fn finish_share(raw: RawShare) -> Result<Share> {
@@ -2027,6 +2080,14 @@ impl BlockStore for SqliteStore {
             "DELETE FROM outbound_proposals WHERE owner = ?1",
             params![id.to_string()],
         )?;
+        tx.execute(
+            "DELETE FROM share_offers WHERE from_contact = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "UPDATE share_invites SET offered_to = NULL WHERE offered_to = ?1",
+            params![id.to_string()],
+        )?;
         let deleted = tx.execute("DELETE FROM contacts WHERE id = ?1", params![id.to_string()])?;
         if deleted == 0 {
             return Err(StoreError::NotFound(format!("contact {id}")));
@@ -2454,6 +2515,120 @@ impl BlockStore for SqliteStore {
             }
         }
         Ok(out)
+    }
+
+    fn set_invite_offered_to(&mut self, share_id: Uuid, contact: Uuid) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE share_invites SET offered_to = ?1
+             WHERE share_id = ?2 AND redeemed_at IS NULL",
+            params![contact.to_string(), share_id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("open invite for share {share_id}")));
+        }
+        Ok(())
+    }
+
+    fn invite_offered_to(&self, share_id: Uuid) -> Result<Option<Uuid>> {
+        let c: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT offered_to FROM share_invites
+                 WHERE share_id = ?1 AND redeemed_at IS NULL AND offered_to IS NOT NULL
+                 ORDER BY created_at DESC LIMIT 1",
+                params![share_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        c.map(|c| uuid_col(c, "share_invites.offered_to")).transpose()
+    }
+
+    fn add_share_offer(
+        &mut self,
+        from_contact: Uuid,
+        owner_node: &str,
+        share_id: Uuid,
+        root_title: &str,
+        permission: SharePermission,
+        secret: &str,
+        expires_at: &str,
+    ) -> Result<ShareOffer> {
+        let id = Uuid::now_v7();
+        self.conn.execute(
+            "INSERT INTO share_offers (id, from_contact, owner_node, share_id, root_title, permission, secret, state, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8)
+             ON CONFLICT(owner_node, share_id) DO UPDATE SET
+                 id = excluded.id, from_contact = excluded.from_contact, root_title = excluded.root_title,
+                 permission = excluded.permission, secret = excluded.secret, state = 'open',
+                 expires_at = excluded.expires_at, created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            params![
+                id.to_string(),
+                from_contact.to_string(),
+                owner_node,
+                share_id.to_string(),
+                root_title,
+                permission.as_str(),
+                secret,
+                expires_at
+            ],
+        )?;
+        self.get_share_offer(id)
+    }
+
+    fn list_share_offers(&self, open_only: bool) -> Result<Vec<ShareOffer>> {
+        let sql = if open_only {
+            "SELECT id, from_contact, owner_node, share_id, root_title, permission, secret, state, created_at, expires_at
+             FROM share_offers WHERE state = 'open' ORDER BY created_at DESC"
+        } else {
+            "SELECT id, from_contact, owner_node, share_id, root_title, permission, secret, state, created_at, expires_at
+             FROM share_offers ORDER BY created_at DESC"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], offer_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(finish_offer)
+            .collect()
+    }
+
+    fn get_share_offer(&self, id: Uuid) -> Result<ShareOffer> {
+        self.conn
+            .query_row(
+                "SELECT id, from_contact, owner_node, share_id, root_title, permission, secret, state, created_at, expires_at
+                 FROM share_offers WHERE id = ?1",
+                params![id.to_string()],
+                offer_row,
+            )
+            .optional()?
+            .map(finish_offer)
+            .transpose()?
+            .ok_or_else(|| StoreError::NotFound(format!("share offer {id}")))
+    }
+
+    fn set_share_offer_state(&mut self, id: Uuid, state: ShareOfferState) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE share_offers SET state = ?1 WHERE id = ?2",
+            params![state.as_str(), id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("share offer {id}")));
+        }
+        Ok(())
+    }
+
+    fn expire_share_offers(&mut self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE share_offers SET state = 'expired'
+             WHERE state = 'open' AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            [],
+        )?)
+    }
+
+    fn clear_share_offers(&mut self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM share_offers WHERE state IN ('declined', 'expired')",
+            [],
+        )?)
     }
 
     fn queue_join(&mut self, ticket: &str) -> Result<Uuid> {

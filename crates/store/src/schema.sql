@@ -211,7 +211,28 @@ CREATE TABLE IF NOT EXISTS share_invites (
     expires_at  TEXT NOT NULL,
     redeemed_by TEXT REFERENCES contacts (id),
     redeemed_at TEXT,
+    -- invites v2: the contact this invite was OFFERED to over the wire (no
+    -- link); NULL for a minted link. The shares page reads "waiting for X".
+    offered_to  TEXT REFERENCES contacts (id),
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Invites v2: share OFFERS received from contacts (recipient side). Durable —
+-- a request to join lives here until accepted/declined/expired, never only
+-- in a toast. The secret is the invite secret; the recipient needs it to
+-- redeem, so it is stored (this row IS the invite, from the other side).
+CREATE TABLE IF NOT EXISTS share_offers (
+    id           TEXT PRIMARY KEY,
+    from_contact TEXT NOT NULL REFERENCES contacts (id),
+    owner_node   TEXT NOT NULL,
+    share_id     TEXT NOT NULL,
+    root_title   TEXT NOT NULL,
+    permission   TEXT NOT NULL CHECK (permission IN ('view', 'propose')),
+    secret       TEXT NOT NULL,
+    state        TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'accepted', 'declined', 'expired')),
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    expires_at   TEXT NOT NULL,
+    UNIQUE (owner_node, share_id)
 );
 
 -- Grantee-side: a mirror doc's origin + pull cursor. Mirrors keep their origin

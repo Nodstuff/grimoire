@@ -4,9 +4,10 @@
 
 import { useEffect, useState } from 'react'
 import QRCode from 'qrcode'
-import { api, Doc, DocFederation, Share, ShareTrust } from './types'
+import { api, Contact, Doc, DocFederation, Share, ShareTrust } from './types'
 import { errText, notify } from './Notice'
 import { TRUST_TIERS, trustHint } from './trust'
+import { shortFingerprint } from './shares'
 
 /** Three-state trust control for an active propose share. */
 export function TrustControl({
@@ -75,7 +76,7 @@ export function InviteLink({ link }: { link: string }) {
   return (
     <div className="share-link">
       <div className="link-box mono" onClick={copy} title="click to copy">
-        {link.slice(0, 52)}…
+        {link.length > 140 ? `${link.slice(0, 52)}…` : link}
       </div>
       <button className="chip" onClick={copy}>
         {copied ? 'copied ✓' : 'copy link'}
@@ -113,6 +114,42 @@ export default function SharePanel({
   const [permission, setPermission] = useState<'view' | 'propose'>('view')
   const [link, setLink] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // invites v2: share straight with a contact — no link
+  const [contacts, setContacts] = useState<Contact[]>([])
+  const [pick, setPick] = useState<string>('')
+  const [sending, setSending] = useState(false)
+  const [sent, setSent] = useState<string | null>(null)
+  const [fallback, setFallback] = useState<{ to: string; link: string; reason: string } | null>(null)
+  useEffect(() => {
+    api<Contact[]>('/admin/contacts')
+      .then((cs) => setContacts(Array.isArray(cs) ? cs.filter((c) => !c.revoked) : []))
+      .catch(() => setContacts([]))
+  }, [])
+
+  const offer = async () => {
+    if (!pick || sending) return
+    setSending(true)
+    setError(null)
+    setSent(null)
+    setFallback(null)
+    try {
+      const r = await api<{ delivered: boolean; to: string; link?: string; reason?: string }>('/admin/shares/offer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ root_doc: doc.id, permission, contact_id: pick }),
+      })
+      if (r.delivered) {
+        setSent(`request sent to ${r.to} — it shows under their Share requests until they answer`)
+      } else if (r.link) {
+        setFallback({ to: r.to, link: r.link, reason: r.reason ?? 'they are offline' })
+      }
+      onChanged()
+    } catch (e) {
+      setError(errText(e))
+    } finally {
+      setSending(false)
+    }
+  }
 
   const mint = async () => {
     setError(null)
@@ -191,8 +228,39 @@ export default function SharePanel({
             <option value="view">view only</option>
             <option value="propose">can propose edits</option>
           </select>
-          <button className="accept" onClick={mint}>
-            mint invite link
+        </div>
+        {contacts.length > 0 && (
+          <div className="share-with">
+            <div className="meta">with a contact — they get a request to accept, no link needed</div>
+            <div className="share-mint">
+              <select value={pick} onChange={(e) => setPick(e.target.value)}>
+                <option value="">choose a contact…</option>
+                {contacts.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.petname} · {shortFingerprint(c.pubkey).slice(0, 4)}
+                  </option>
+                ))}
+              </select>
+              <button className="accept" disabled={!pick || sending} onClick={offer}>
+                {sending ? 'sending…' : 'send request'}
+              </button>
+            </div>
+            {sent && <div className="meta ok">{sent}</div>}
+            {fallback && (
+              <div className="share-fallback">
+                <div className="meta">
+                  {fallback.to} is offline or unreachable right now — send them this link instead
+                  <span className="meta dim"> ({fallback.reason})</span>
+                </div>
+                <InviteLink link={fallback.link} />
+              </div>
+            )}
+          </div>
+        )}
+        <div className="share-link-flow">
+          <div className="meta">{contacts.length > 0 ? '…or make an invite link for someone new' : 'make an invite link — the first time you share with someone'}</div>
+          <button className="chip" onClick={mint}>
+            make invite link
           </button>
         </div>
         {error && <div className="meta err">{error}</div>}

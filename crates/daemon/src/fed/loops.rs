@@ -273,6 +273,15 @@ pub async fn pull_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, runti
         let sweep = last_sweep.elapsed() >= SWEEP_EVERY;
         let results = if sweep {
             last_sweep = Instant::now();
+            {
+                // invites v2: offers die with their invite (7 days)
+                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                if let Ok(n) = s.expire_share_offers()
+                    && n > 0
+                {
+                    tracing::info!(expired = n, "share offers expired");
+                }
+            }
             refresh_outbound(&endpoint, &store).await;
             pull_groups(&endpoint, &store, share_groups(&store), &dead).await
         } else {

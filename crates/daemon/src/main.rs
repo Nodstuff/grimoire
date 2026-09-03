@@ -577,9 +577,25 @@ async fn main() -> anyhow::Result<()> {
             };
             if let Some(id) = fed_identity {
                 match fed::bind(id.secret_bytes()).await {
-                    Ok(ep) => {
+                    Ok((ep, mdns)) => {
                         fed_ctx.node_id = Some(id.node_id());
                         fed_ctx.endpoint = Some(ep.clone());
+                        // advertise our profile name on the LAN so neighbours
+                        // read "Tom's MacBook", not a key
+                        {
+                            let s = store.lock().unwrap_or_else(|p| p.into_inner());
+                            let name = s
+                                .list_principals()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .find(|p| p.kind == PrincipalKind::Human)
+                                .map(|p| p.display_name)
+                                .unwrap_or_default();
+                            if let Ok(ud) = name.parse::<iroh::address_lookup::UserData>() {
+                                ep.set_user_data_for_address_lookup(Some(ud));
+                            }
+                        }
+                        tokio::spawn(fed::neighbour_loop(mdns, runtime.clone()));
                         tokio::spawn(fed::serve(ep.clone(), store.clone(), hot.clone(), runtime.clone()));
                         tokio::spawn(fed::join_retry_loop(ep.clone(), store.clone()));
                         // grantee side: adaptive pull; owner side: nudge grantees on change
@@ -641,7 +657,7 @@ async fn main() -> anyhow::Result<()> {
                 }))
                 .merge({
                     fed_ctx_node_id = fed_ctx.node_id.clone();
-                    admin::router(store.clone(), fed_ctx, hot.clone(), admin_token)
+                    admin::router(store.clone(), fed_ctx, hot.clone(), runtime.clone(), admin_token)
                 })
                 .merge(api::router(api::ApiState {
                     store,

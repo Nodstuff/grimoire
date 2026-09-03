@@ -744,14 +744,69 @@ pub fn mint_invite(
     root_doc: uuid::Uuid,
     permission: grimoire_store::SharePermission,
 ) -> Result<(grimoire_store::Share, String)> {
+    let (share, minted) = mint_invite_full(store, node_id, root_doc, permission)?;
+    Ok((share, minted.link))
+}
+
+/// What a mint produces: the link, plus the raw secret and expiry for the
+/// over-the-wire offer path (which delivers the invite instead of a link).
+#[derive(Debug, Clone)]
+pub struct MintedInvite {
+    pub link: String,
+    pub secret: String,
+    pub expires_at: String,
+}
+
+pub fn mint_invite_full(
+    store: &mut SqliteStore,
+    node_id: &str,
+    root_doc: uuid::Uuid,
+    permission: grimoire_store::SharePermission,
+) -> Result<(grimoire_store::Share, MintedInvite)> {
     let share = store.create_share(root_doc, None, permission, None)?;
-    let mut secret_bytes = [0u8; 32];
-    getrandom::fill(&mut secret_bytes).expect("OS entropy");
-    let secret = hex::encode(secret_bytes);
-    let expires = (chrono::Utc::now() + chrono::Duration::days(7))
+    let secret = super::wire::new_secret();
+    let expires_at = (chrono::Utc::now() + chrono::Duration::days(7))
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
-    store.create_invite(share.id, &hash_secret(&secret), &expires)?;
-    let link = Ticket::new(node_id.to_string(), share.id.to_string(), secret).to_link();
-    Ok((share, link))
+    store.create_invite(share.id, &hash_secret(&secret), &expires_at)?;
+    let link = Ticket::new(node_id.to_string(), share.id.to_string(), secret.clone()).to_link();
+    Ok((share, MintedInvite { link, secret, expires_at }))
+}
+
+/// Invites v2, owner side: deliver a minted invite to a contact as an
+/// `Offer`. Ok(()) when their daemon stored it; Err when unreachable or
+/// refused (the caller falls back to the link).
+pub async fn offer_share(
+    endpoint: &Endpoint,
+    contact_pubkey: &str,
+    share_id: uuid::Uuid,
+    root_title: &str,
+    permission: grimoire_store::SharePermission,
+    minted: &MintedInvite,
+) -> Result<()> {
+    let id: iroh::EndpointId = contact_pubkey.parse().context("contact pubkey malformed")?;
+    let res = request(
+        endpoint,
+        EndpointAddr::from(id),
+        Request::Offer {
+            share: share_id.to_string(),
+            root_title: root_title.to_string(),
+            permission: permission.as_str().to_string(),
+            secret: minted.secret.clone(),
+            expires_at: minted.expires_at.clone(),
+        },
+    )
+    .await?;
+    match res {
+        Response::Noted => Ok(()),
+        Response::Refused { reason, code } => {
+            Err(Refusal::new(code, format!("they did not accept the request: {reason}")).into())
+        }
+        other => anyhow::bail!("unexpected reply to share offer: {other:?}"),
+    }
+}
+
+/// A ticket built from a stored offer — joining then reuses the link path.
+pub fn ticket_for_offer(offer: &grimoire_store::ShareOffer) -> Ticket {
+    Ticket::new(offer.owner_node.clone(), offer.share_id.to_string(), offer.secret.clone())
 }

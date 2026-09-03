@@ -634,6 +634,54 @@ pub struct Mirror {
     pub owner_epoch: i64,
 }
 
+/// Invites v2: a share OFFER received from a contact over the wire (recipient
+/// side). Durable until accepted / declined / expired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShareOffer {
+    pub id: Uuid,
+    pub from_contact: Uuid,
+    /// Owner's pubkey (hex) — what we dial to redeem.
+    pub owner_node: String,
+    /// The owner's share id.
+    pub share_id: Uuid,
+    pub root_title: String,
+    pub permission: SharePermission,
+    /// The invite secret; redeeming uses it exactly like a pasted link.
+    pub secret: String,
+    pub state: ShareOfferState,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareOfferState {
+    Open,
+    Accepted,
+    Declined,
+    Expired,
+}
+
+impl ShareOfferState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ShareOfferState::Open => "open",
+            ShareOfferState::Accepted => "accepted",
+            ShareOfferState::Declined => "declined",
+            ShareOfferState::Expired => "expired",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "open" => Some(ShareOfferState::Open),
+            "accepted" => Some(ShareOfferState::Accepted),
+            "declined" => Some(ShareOfferState::Declined),
+            "expired" => Some(ShareOfferState::Expired),
+            _ => None,
+        }
+    }
+}
+
 /// A queued join (grantee-side): a redeem that waits for the owner to be up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PendingJoin {

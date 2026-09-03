@@ -6,11 +6,11 @@
 // share lives here.
 
 import { useCallback, useEffect, useState } from 'react'
-import { ActivityItem, api, Contact, Doc, MirrorRow, PendingJoin, Profile, Share } from './types'
+import { ActivityItem, api, Contact, Doc, MirrorRow, Neighbour, PendingJoin, Profile, Share, ShareOffer } from './types'
 import { errText, notify } from './Notice'
 import { InviteLink, mintInvite, TrustControl } from './SharePanel'
 import { EventsResponse, LiveEvent, mergeActivity } from './live'
-import { groupShares, mirrorStatusLine, shareTitle, shareWho, shortFingerprint } from './shares'
+import { groupShares, mirrorStatusLine, offerLine, shareTitle, shareWho, shortFingerprint } from './shares'
 import { relTime } from './time'
 import { refusalHint } from './hints'
 import { loadProfile } from './Profile'
@@ -93,6 +93,9 @@ export default function Sharing({
   const [shares, setShares] = useState<Share[]>([])
   const [mirrors, setMirrors] = useState<MirrorRow[] | null>(null)
   const [joins, setJoins] = useState<PendingJoin[]>([])
+  const [offers, setOffers] = useState<ShareOffer[]>([])
+  const [neighbours, setNeighbours] = useState<Neighbour[]>([])
+  const [offerBusy, setOfferBusy] = useState<string | null>(null)
   const [activity, setActivity] = useState<ActivityItem[]>([])
   const [events, setEvents] = useState<LiveEvent[]>([])
   const [profile, setProfile] = useState<Profile | null>(null)
@@ -116,6 +119,9 @@ export default function Sharing({
     // older daemon → no route → null (section hides itself)
     api<MirrorRow[]>('/admin/mirrors').then((m) => setMirrors(Array.isArray(m) ? m : [])).catch(() => setMirrors(null))
     api<PendingJoin[]>('/admin/joins').then((j) => setJoins(Array.isArray(j) ? j : [])).catch(() => setJoins([]))
+    // invites v2: requests to join someone's share, and Grimoires nearby
+    api<ShareOffer[]>('/admin/offers').then((o) => setOffers(Array.isArray(o) ? o : [])).catch(() => setOffers([]))
+    api<Neighbour[]>('/admin/neighbours').then((n) => setNeighbours(Array.isArray(n) ? n : [])).catch(() => setNeighbours([]))
     api<ActivityItem[]>('/api/activity?limit=20')
       .then((a) => setActivity(Array.isArray(a) ? a : []))
       .catch(() => setActivity([]))
@@ -187,6 +193,27 @@ export default function Sharing({
         load()
       })
   }
+
+  const acceptOffer = async (o: ShareOffer) => {
+    if (offerBusy) return
+    setOfferBusy(o.id)
+    try {
+      const r = await api<{ joined?: { root_title: string }; docs?: number; pull_error?: string }>('/admin/offers/accept', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: o.id }),
+      })
+      const got = typeof r.docs === 'number' ? ` — ${r.docs} doc${r.docs === 1 ? '' : 's'} synced` : ''
+      notify(`joined “${o.root_title}” from ${o.from_petname}${got}`, 'ok')
+    } catch (e) {
+      notify(refusalHint(errText(e)) ?? errText(e))
+    } finally {
+      setOfferBusy(null)
+      load()
+    }
+  }
+  const declineOffer = (o: ShareOffer) =>
+    act(post('/admin/offers/decline', { id: o.id }), `declined “${o.root_title}”`)
 
   const reinviteShare = async (sh: Share) => {
     try {
@@ -266,6 +293,33 @@ export default function Sharing({
         )}
       </div>
 
+      {/* ---- share requests (invites v2): durable, never just a toast ---- */}
+      {offers.length > 0 && (
+        <>
+          <h2 className="runs-title">share requests</h2>
+          {offers.map((o) => (
+            <div key={o.id} className="card share-card offer-card">
+              <div className="card-head">
+                <span className="offer-line">{offerLine(o)}</span>
+                <span className="meta mono" title={o.from_pubkey}>
+                  {shortFingerprint(o.from_pubkey)}
+                </span>
+                <span className="meta">{relTime(o.created_at, now)}</span>
+                <span className="gardener-actions">
+                  <button className="accept" disabled={offerBusy === o.id} onClick={() => acceptOffer(o)}>
+                    {offerBusy === o.id ? 'joining…' : 'accept'}
+                  </button>
+                  <button className="decline" disabled={!!offerBusy} onClick={() => declineOffer(o)}>
+                    decline
+                  </button>
+                </span>
+              </div>
+              <div className="meta">accepting adds their docs under your tree, read-only unless they said you can propose edits</div>
+            </div>
+          ))}
+        </>
+      )}
+
       <div className="card">
         <div className="card-head">
           <span>join a share</span>
@@ -283,6 +337,23 @@ export default function Sharing({
           </button>
         </div>
         {joinMsg && <div className="meta">{joinMsg}</div>}
+        {neighbours.length > 0 && (
+          <div className="neighbours">
+            <div className="meta">nearby on this network</div>
+            <div className="neighbour-list">
+              {neighbours.map((n) => (
+                <span
+                  key={n.pubkey}
+                  className={`chip neighbour ${n.contact_id ? 'known' : ''}`}
+                  title={n.pubkey}
+                >
+                  {n.contact_petname ?? n.name ?? 'a Grimoire'} · {shortFingerprint(n.pubkey).slice(0, 4)}
+                  {n.contact_id ? (n.blocked ? ' — blocked' : ' — contact') : ' — not a contact yet: ask them to share with you'}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* ---- shared by me: GET /admin/shares ---- */}

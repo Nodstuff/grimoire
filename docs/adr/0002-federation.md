@@ -121,3 +121,32 @@ A write-accepting network surface on a daemon that currently trusts localhost
 absolutely — a bug in federation auth is a bug in the entire private vault. Mitigations
 are decisions 6 and 7: separate listener, deny-by-default pubkey allowlists, only
 shared subtrees reachable, view-only first.
+
+## Invites v2 (added 2026-09-03)
+
+**Short links.** `grimoire://join/<node-id-hex>/<secret>` — ~107 characters, readable
+aloud. The secret is 16 random bytes in lowercase RFC 4648 base32 without padding (26
+chars). The share id no longer travels: the owner resolves the invite by the secret's
+hash alone (`redeem_invite` already keyed on `secret_hash`). The v1 form
+`grimoire://join/<base64url(json)>` still parses so links minted before this change keep
+working for their 7-day life. A link remains the way to make FIRST contact.
+
+**Offers: sharing with a contact needs no link.** The owner mints the same one-time
+invite and delivers it over the wire as `Request::Offer {share, root_title, permission,
+secret, expires_at}` to a contact's daemon. The recipient accepts an `Offer` only from a
+known, non-revoked contact (the same gate as `Notify`), stores it in a durable
+`share_offers` table (state open|accepted|declined|expired, expiry = the invite's), and
+raises a `share_offered` runtime event. The app shows open offers as **Share requests**
+at the top of the Shares page with accept/decline and counts them in the header chip; the
+toast only points there. Accepting redeems the stored secret exactly like a pasted link
+(`join_once`, then the first pull) — nothing new is trusted. Declining closes the request
+locally; the owner is not told (the invite simply expires). The owner's side records
+`share_invites.offered_to`, so an unredeemed offered invite reads "waiting for alice".
+If the contact is unreachable the invite still exists and the reply carries the link for
+a manual send (`delivered: false`).
+
+**Neighbours.** The existing mDNS address lookup now also feeds a presence list: the
+daemon advertises the profile name as iroh user data and subscribes to discovery events;
+`GET /admin/neighbours` returns Grimoires on the LAN with their name, whether they are
+already a contact, and whether they are blocked. Presence grants nothing — a neighbour
+still needs an invite or an offer — it only saves reading out a key.

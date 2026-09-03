@@ -156,12 +156,35 @@ use grimoire_store::{BlockStore, SqliteStore};
 
     #[test]
     fn ticket_link_round_trips() {
-        let t = Ticket::new("ab".repeat(32), "share-id".into(), "s3cret".into());
+        // v2: grimoire://join/<node>/<secret>; the share id does not travel
+        let node = "ab".repeat(32);
+        let secret = super::wire::new_secret();
+        assert_eq!(secret.len(), 26, "16 bytes base32 no padding");
+        assert!(secret.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        let t = Ticket::new(node.clone(), "share-id".into(), secret.clone());
         let link = t.to_link();
-        assert!(link.starts_with("grimoire://join/"));
-        assert_eq!(Ticket::parse(&link).unwrap(), t);
-        assert_eq!(Ticket::parse(&format!("  {link}\n")).unwrap(), t); // pasted whitespace
+        assert_eq!(link, format!("grimoire://join/{node}/{secret}"));
+        assert!(link.len() < 120, "readable aloud: {}", link.len());
+        let parsed = Ticket::parse(&link).unwrap();
+        assert_eq!(parsed.node, node);
+        assert_eq!(parsed.secret, secret);
+        assert_eq!(parsed.share, "", "v2 links carry no share id");
+        assert_eq!(Ticket::parse(&format!("  {link}\n")).unwrap(), parsed); // pasted whitespace
+        assert_eq!(Ticket::parse(&format!("{link}/")).unwrap(), parsed); // trailing slash
+        // v1 links (base64url JSON) still parse for their remaining life
+        let v1 = format!(
+            "grimoire://join/{}",
+            data_encoding::BASE64URL_NOPAD.encode(
+                serde_json::to_vec(&Ticket::new(node.clone(), "old-share".into(), "deadbeef".into())).unwrap().as_slice()
+            )
+        );
+        let old = Ticket::parse(&v1).unwrap();
+        assert_eq!(old.share, "old-share");
+        assert_eq!(old.secret, "deadbeef");
+        // junk
         assert!(Ticket::parse("https://example.com/nope").is_err());
+        assert!(Ticket::parse("grimoire://join/notahexid/secret").is_err());
+        assert!(Ticket::parse(&format!("grimoire://join/{node}/bad secret!")).is_err());
     }
 
     #[tokio::test]
@@ -1552,7 +1575,7 @@ async fn only_the_owner_or_the_starter_may_end_a_remote_session() {
     let (bob_share, link) = {
         let mut s = owner_store.lock().unwrap();
         let owner_node = s.list_principals().unwrap().into_iter().find(|p| p.kind == PrincipalKind::Human).unwrap();
-        mint_invite(&mut s, owner_node.pubkey.as_deref().unwrap_or("00"), doc.id, SharePermission::Propose).unwrap()
+        mint_invite(&mut s, owner_node.pubkey.as_deref().unwrap_or(&"00".repeat(32)), doc.id, SharePermission::Propose).unwrap()
     };
     let mut bob_store = SqliteStore::open_in_memory().unwrap();
     bob_store.create_principal(PrincipalKind::Human, "bob", None).unwrap();
@@ -1583,7 +1606,7 @@ async fn two_grantees_on_one_live_doc_each_keep_their_own_permission() {
     let (bob_share, link) = {
         let mut s = owner_store.lock().unwrap();
         let owner_node = s.list_principals().unwrap().into_iter().find(|p| p.kind == PrincipalKind::Human).unwrap();
-        mint_invite(&mut s, owner_node.pubkey.as_deref().unwrap_or("00"), doc.id, SharePermission::Propose).unwrap()
+        mint_invite(&mut s, owner_node.pubkey.as_deref().unwrap_or(&"00".repeat(32)), doc.id, SharePermission::Propose).unwrap()
     };
     let mut bob_store = SqliteStore::open_in_memory().unwrap();
     bob_store.create_principal(PrincipalKind::Human, "bob", None).unwrap();
@@ -1754,4 +1777,111 @@ async fn notify_batch_lands_one_event_per_item_and_one_pull() {
         items: vec![NotifyItem { doc: "nope".into(), title: String::new(), kind: NotifyKind::DocChanged }],
     }).await.unwrap();
     assert_eq!(refusal_code(&res), RefusalCode::BadRequest);
+}
+
+
+// ── invites v2 ──────────────────────────────────────────────────────────
+
+/// Owner offers a share to a contact over the wire; the recipient stores a
+/// durable offer + UI event; accepting joins and pulls; the owner's share
+/// shows whom it was offered to; a stranger's offer is refused.
+#[tokio::test]
+async fn share_offer_round_trip_accept_joins_and_strangers_are_refused() {
+    use super::client::{mint_invite_full, offer_share, pull_after_join, ticket_for_offer};
+    use grimoire_store::ShareOfferState;
+    // A (owner) and B are already contacts via one earlier share
+    let mut a_store = SqliteStore::open_in_memory().unwrap();
+    let tom = a_store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let first = a_store.create_doc("First", None, tom.id).unwrap();
+    let plan = a_store.create_doc("Plan", None, tom.id).unwrap();
+    a_store.apply(plan.id, 0, tom.id, vec![grimoire_store::OpInput {
+        kind: grimoire_store::OpKind::Insert {
+            block_id: uuid::Uuid::now_v7(), parent_id: None, order_key: "a".into(),
+            block_type: grimoire_store::BlockType::Paragraph, content: "the plan".into(), refers_to: None,
+        },
+        source_refs: vec![],
+    }]).unwrap();
+    let a_ep = local_endpoint().await;
+    let (_s1, link1) = mint_invite(&mut a_store, &a_ep.id().to_string(), first.id, SharePermission::View).unwrap();
+    let a_store = Arc::new(Mutex::new(a_store));
+    let a_addr = direct_addr(&a_ep);
+    tokio::spawn(serve(a_ep.clone(), a_store.clone(), scratch_hot(), Runtime::default()));
+
+    let mut b_store = SqliteStore::open_in_memory().unwrap();
+    b_store.create_principal(PrincipalKind::Human, "bob", None).unwrap();
+    let b_store = Arc::new(Mutex::new(b_store));
+    let b_ep = local_endpoint().await;
+    let b_addr = direct_addr(&b_ep);
+    let b_runtime = Runtime::default();
+    tokio::spawn(serve(b_ep.clone(), b_store.clone(), scratch_hot(), b_runtime.clone()));
+    join_at(&b_ep, &b_store, &Ticket::parse(&link1).unwrap(), a_addr.clone()).await.unwrap();
+    let bob_on_a = a_store.lock().unwrap().list_contacts().unwrap().into_iter().find(|c| c.pubkey == b_ep.id().to_string()).unwrap();
+
+    // A offers "Plan" (propose) to bob — no link
+    let (share, minted) = mint_invite_full(&mut a_store.lock().unwrap(), &a_ep.id().to_string(), plan.id, SharePermission::Propose).unwrap();
+    a_store.lock().unwrap().set_invite_offered_to(share.id, bob_on_a.id).unwrap();
+    assert_eq!(a_store.lock().unwrap().invite_offered_to(share.id).unwrap(), Some(bob_on_a.id), "owner side: waiting for bob");
+    // (tests dial by explicit addr; the production helper dials by pubkey)
+    let res = request(&a_ep, b_addr.clone(), Request::Offer {
+        share: share.id.to_string(), root_title: "Plan".into(), permission: "propose".into(),
+        secret: minted.secret.clone(), expires_at: minted.expires_at.clone(),
+    }).await.unwrap();
+    assert_eq!(res, Response::Noted);
+    let _ = offer_share; // exercised by the admin route; signature-checked here
+
+    // B: durable offer + UI event pointing at it
+    let offers = b_store.lock().unwrap().list_share_offers(true).unwrap();
+    assert_eq!(offers.len(), 1);
+    let offer = &offers[0];
+    assert_eq!(offer.root_title, "Plan");
+    assert_eq!(offer.permission, SharePermission::Propose);
+    assert_eq!(offer.share_id, share.id);
+    assert_eq!(offer.owner_node, a_ep.id().to_string());
+    assert_eq!(offer.state, ShareOfferState::Open);
+    let (_, events) = b_runtime.events_since(0);
+    assert_eq!(events.last().unwrap().kind, "share_offered");
+    assert_eq!(events.last().unwrap().doc_id, offer.id);
+    assert_eq!(events.last().unwrap().from, "tom");
+
+    // the same offer sent twice replaces, never duplicates
+    request(&a_ep, b_addr.clone(), Request::Offer {
+        share: share.id.to_string(), root_title: "Plan".into(), permission: "propose".into(),
+        secret: minted.secret.clone(), expires_at: minted.expires_at.clone(),
+    }).await.unwrap();
+    assert_eq!(b_store.lock().unwrap().list_share_offers(true).unwrap().len(), 1);
+
+    // accept = redeem the stored secret like a link, then pull the tree
+    let offer = b_store.lock().unwrap().list_share_offers(true).unwrap().remove(0);
+    let ticket = ticket_for_offer(&offer);
+    let out = join_at(&b_ep, &b_store, &ticket, a_addr.clone()).await.unwrap();
+    assert_eq!(out.root_title, "Plan");
+    assert_eq!(out.permission, "propose");
+    b_store.lock().unwrap().set_share_offer_state(offer.id, ShareOfferState::Accepted).unwrap();
+    // pull_after_join dials by pubkey via discovery; tests use the explicit addr path
+    let owner = b_store.lock().unwrap().list_contacts().unwrap().into_iter().find(|c| c.pubkey == out.owner).unwrap();
+    let sum = super::client::pull_share(&b_ep, &b_store, a_addr.clone(), &owner, share.id).await.unwrap();
+    assert_eq!(sum.changed, 1);
+    let _ = pull_after_join;
+    assert!(b_store.lock().unwrap().list_share_offers(true).unwrap().is_empty(), "accepted offers leave the open list");
+    // owner side: the share is active and bound to bob
+    let sh = a_store.lock().unwrap().get_share(share.id).unwrap();
+    assert_eq!(sh.state, grimoire_store::ShareState::Active);
+    assert_eq!(sh.contact, Some(bob_on_a.id));
+
+    // a stranger offering B a share → unknown peer, nothing stored
+    let mallory = local_endpoint().await;
+    let res = request(&mallory, b_addr.clone(), Request::Offer {
+        share: uuid::Uuid::now_v7().to_string(), root_title: "Evil".into(), permission: "view".into(),
+        secret: "x".into(), expires_at: "2099-01-01T00:00:00.000Z".into(),
+    }).await.unwrap();
+    assert!(matches!(res, Response::Refused { code: RefusalCode::UnknownPeer, .. }));
+    assert_eq!(b_store.lock().unwrap().list_share_offers(false).unwrap().len(), 1);
+
+    // expiry: an offer past its expires_at flips to expired on the sweep tick
+    b_store.lock().unwrap().add_share_offer(owner.id, &out.owner, uuid::Uuid::now_v7(), "Old", SharePermission::View, "s", "2000-01-01T00:00:00.000Z").unwrap();
+    assert_eq!(b_store.lock().unwrap().expire_share_offers().unwrap(), 1);
+    assert!(b_store.lock().unwrap().list_share_offers(true).unwrap().is_empty());
+    // clear drops declined/expired, keeps accepted history
+    assert_eq!(b_store.lock().unwrap().clear_share_offers().unwrap(), 1);
+    assert_eq!(b_store.lock().unwrap().list_share_offers(false).unwrap().len(), 1);
 }

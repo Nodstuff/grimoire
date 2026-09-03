@@ -120,3 +120,11 @@ describe('viewersWriteChip', () => {
     expect(viewersWriteChip(false).title).toMatch(/everyone/)
   })
 })
+
+describe('share_offered event', () => {
+  it('toasts a pointer to Share requests', () => {
+    const line = liveEventLine({ seq: 9, kind: 'share_offered', doc_id: 'offer-1', doc_title: 'Plan', from: 'alice', at: '2026-09-03T10:00:00Z' })
+    expect(line).toBe('alice wants to share “Plan” with you — see Share requests')
+    expect(liveEventVerb('share_offered')).toBe('offered to share')
+  })
+})
