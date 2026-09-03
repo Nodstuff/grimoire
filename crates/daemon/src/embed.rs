@@ -84,6 +84,8 @@ impl Embedder {
     }
 
     /// Cosine of a query vector against one indexed block (None = not indexed).
+    /// Cosine for one block; kept for the retrieval probe harness.
+    #[allow(dead_code)]
     pub fn score(&self, q: &[f32], id: Uuid) -> Option<f32> {
         let index = self.index.read().unwrap_or_else(|p| p.into_inner());
         index.get(&id).map(|v| v.iter().zip(q).map(|(a, b)| a * b).sum())
