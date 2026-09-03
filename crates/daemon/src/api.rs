@@ -2,6 +2,7 @@
 //! (tom) — resolve here is Tom clicking accept/decline. Agents use MCP.
 
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use grimoire_store::{BlockStore, DocStatus, OpInput, ReviewDecision, SqliteStore};
@@ -25,6 +26,26 @@ pub struct ApiState {
     /// Block embeddings for ask-the-vault; None if the model failed to load
     /// (retrieval falls back to keywords).
     pub embedder: Option<Arc<crate::embed::Embedder>>,
+    /// Idempotency cache for `request_id` on propose routes, shared with MCP.
+    pub dedupe: crate::mcp::DedupeCache,
+}
+
+/// Optional on every HTTP write: attribute the write to this Agent principal
+/// (find-or-create by name, the `identify` rule) instead of the human. Lets
+/// an HTTP client such as workbox get the same provenance an MCP agent gets —
+/// its writes go through the gate as an agent's. Absent → the human.
+pub const PRINCIPAL_HEADER: &str = "x-grimoire-principal";
+
+fn resolve_principal(st: &ApiState, headers: &HeaderMap, s: &mut SqliteStore) -> Result<Uuid, String> {
+    match headers.get(PRINCIPAL_HEADER) {
+        None => Ok(st.human),
+        Some(v) => {
+            let name = v
+                .to_str()
+                .map_err(|_| format!("{PRINCIPAL_HEADER}: not valid UTF-8"))?;
+            crate::mcp::agent_principal_by_name(s, name).map_err(|m| format!("{PRINCIPAL_HEADER}: {m}"))
+        }
+    }
 }
 
 /// UI heartbeat: this doc is open. For a mirror, its share joins the fast
@@ -371,10 +392,15 @@ struct ProposeReq {
     doc_id: Uuid,
     base_epoch: i64,
     ops: Vec<OpInput>,
+    /// Optional idempotency key (any UUID): a retry with the same request_id
+    /// returns the first outcome instead of double-applying (per principal).
+    #[serde(default)]
+    request_id: Option<Uuid>,
 }
 
-/// Human writes: propose as tom — current-epoch ops green and apply directly.
-async fn propose(State(st): State<ApiState>, Json(req): Json<ProposeReq>) -> Json<Value> {
+/// Writes: propose as the human (or the `X-Grimoire-Principal` agent) —
+/// current-epoch ops green and apply directly, stale ones are scored per op.
+async fn propose(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json<ProposeReq>) -> Json<Value> {
     if let Err(m) = st.hot.assert_cold(req.doc_id) {
         return Json(json!({"error": m}));
     }
@@ -382,8 +408,91 @@ async fn propose(State(st): State<ApiState>, Json(req): Json<ProposeReq>) -> Jso
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.propose(req.doc_id, req.base_epoch, st.human, req.ops) {
-        Ok(out) => Json(json!(out)),
+    let principal = match resolve_principal(&st, &headers, &mut s) {
+        Ok(p) => p,
+        Err(m) => return Json(json!({"error": m})),
+    };
+    if let Some(rid) = req.request_id
+        && let Some(prev) = crate::mcp::dedupe_get(&st.dedupe, principal, rid)
+    {
+        return Json(prev);
+    }
+    match s.propose(req.doc_id, req.base_epoch, principal, req.ops) {
+        Ok(out) => {
+            let v = json!(out);
+            if let Some(rid) = req.request_id {
+                crate::mcp::dedupe_put(&st.dedupe, principal, rid, v.clone());
+            }
+            Json(v)
+        }
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+struct ProposeMarkdownReq {
+    doc_id: Uuid,
+    base_epoch: i64,
+    /// The doc's complete new markdown (frontmatter included).
+    markdown: String,
+    #[serde(default)]
+    request_id: Option<Uuid>,
+}
+
+/// HTTP twin of the MCP `propose_markdown` tool: diff the whole doc's new
+/// markdown against the current blocks and propose the minimal ops. Whole-doc
+/// semantics make a stale base an error here (the diff would re-apply the
+/// caller's stale view over others' edits) — `stale_base` carries the missed
+/// ops so the caller can re-read, re-apply and re-send.
+async fn propose_markdown(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<ProposeMarkdownReq>,
+) -> Json<Value> {
+    if let Err(m) = st.hot.assert_cold(req.doc_id) {
+        return Json(json!({"error": m}));
+    }
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let principal = match resolve_principal(&st, &headers, &mut s) {
+        Ok(p) => p,
+        Err(m) => return Json(json!({"error": m})),
+    };
+    if let Some(rid) = req.request_id
+        && let Some(prev) = crate::mcp::dedupe_get(&st.dedupe, principal, rid)
+    {
+        return Json(prev);
+    }
+    let tree = match s.read_doc(req.doc_id) {
+        Ok(t) => t,
+        Err(e) => return Json(json!({"error": e.to_string()})),
+    };
+    if req.base_epoch != tree.doc.current_epoch {
+        let missed = s.ops_since(req.doc_id, req.base_epoch).unwrap_or_default();
+        return Json(json!({
+            "error": "stale_base",
+            "base_epoch": req.base_epoch,
+            "current_epoch": tree.doc.current_epoch,
+            "missed_ops": missed,
+            "recover": "re-read the doc, re-apply your edit to the fresh markdown, re-send with the current epoch",
+        }));
+    }
+    let ops = grimoire_store::mddiff::markdown_to_ops(&tree.roots, &req.markdown);
+    if ops.is_empty() {
+        return Json(json!({
+            "doc_id": req.doc_id, "epoch": tree.doc.current_epoch, "verdicts": [], "note": "no changes"
+        }));
+    }
+    match s.propose(req.doc_id, req.base_epoch, principal, ops) {
+        Ok(out) => {
+            let v = json!(out);
+            if let Some(rid) = req.request_id {
+                crate::mcp::dedupe_put(&st.dedupe, principal, rid, v.clone());
+            }
+            Json(v)
+        }
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
@@ -394,12 +503,16 @@ struct CreateDocReq {
     parent_doc_id: Option<Uuid>,
 }
 
-async fn create_doc(State(st): State<ApiState>, Json(req): Json<CreateDocReq>) -> Json<Value> {
+async fn create_doc(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json<CreateDocReq>) -> Json<Value> {
     let mut s = st
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.create_doc(&req.title, req.parent_doc_id, st.human) {
+    let principal = match resolve_principal(&st, &headers, &mut s) {
+        Ok(p) => p,
+        Err(m) => return Json(json!({"error": m})),
+    };
+    match s.create_doc(&req.title, req.parent_doc_id, principal) {
         Ok(d) => Json(json!(d)),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
@@ -453,12 +566,16 @@ struct CommentReq {
     reply_to: Option<Uuid>,
 }
 
-async fn add_comment(State(st): State<ApiState>, Json(req): Json<CommentReq>) -> Json<Value> {
+async fn add_comment(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json<CommentReq>) -> Json<Value> {
     let mut s = st
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.add_comment(req.block_id, st.human, &req.text, req.reply_to) {
+    let principal = match resolve_principal(&st, &headers, &mut s) {
+        Ok(p) => p,
+        Err(m) => return Json(json!({"error": m})),
+    };
+    match s.add_comment(req.block_id, principal, &req.text, req.reply_to) {
         Ok(c) => Json(json!(c)),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
@@ -1182,6 +1299,7 @@ pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/docs", get(docs).post(create_doc))
         .route("/api/propose", post(propose))
+        .route("/api/propose_markdown", post(propose_markdown))
         .route("/api/doc/{id}", get(doc))
         .route("/api/doc/{id}/backlinks", get(backlinks))
         .route("/api/queue", get(queue))
@@ -1219,4 +1337,171 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/render/d2", post(render_d2))
         .route("/api/export", post(export_file))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod http_client_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use grimoire_store::PrincipalKind;
+    use tower::ServiceExt;
+
+    fn app() -> (Router, Uuid) {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let human = store.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let dir = std::env::temp_dir().join(format!("grimoire-api-test-{}", Uuid::now_v7()));
+        let st = ApiState {
+            store: Arc::new(Mutex::new(store)),
+            human,
+            hot: crate::hot::HotState::new(dir.clone()),
+            runtime: crate::fed::Runtime::default(),
+            db_path: dir.join("ks.db"),
+            node_id: None,
+            embedder: None,
+            dedupe: crate::mcp::new_dedupe(),
+        };
+        (router(st), human)
+    }
+
+    async fn call(app: &Router, method: &str, path: &str, headers: &[(&str, &str)], body: Option<Value>) -> Value {
+        let mut req = Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&b).unwrap()))
+                .unwrap(),
+            None => req.body(Body::empty()).unwrap(),
+        };
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn new_doc(app: &Router, headers: &[(&str, &str)]) -> Value {
+        call(app, "POST", "/api/docs", headers, Some(json!({"title": "T", "parent_doc_id": null}))).await
+    }
+
+    #[tokio::test]
+    async fn propose_markdown_diffs_then_refuses_a_stale_base() {
+        let (app, _) = app();
+        let doc = new_doc(&app, &[]).await;
+        let id = doc["id"].as_str().unwrap().to_string();
+        let out = call(
+            &app,
+            "POST",
+            "/api/propose_markdown",
+            &[],
+            Some(json!({"doc_id": id, "base_epoch": 0, "markdown": "# H\n\nfirst para\n"})),
+        )
+        .await;
+        assert_eq!(out["epoch"], 1, "{out}");
+        assert_eq!(out["verdicts"].as_array().unwrap().len(), 2);
+        assert!(out["verdicts"].as_array().unwrap().iter().all(|v| v["verdict"] == "green" && v["applied"] == true));
+        let tree = call(&app, "GET", &format!("/api/doc/{id}"), &[], None).await;
+        assert_eq!(tree["doc"]["current_epoch"], 1);
+        assert_eq!(tree["roots"][0]["block"]["content"], "# H");
+        assert_eq!(tree["roots"][0]["children"][0]["block"]["content"], "first para");
+        // same markdown again → no ops, epoch unchanged
+        let out = call(
+            &app,
+            "POST",
+            "/api/propose_markdown",
+            &[],
+            Some(json!({"doc_id": id, "base_epoch": 1, "markdown": "# H\n\nfirst para\n"})),
+        )
+        .await;
+        assert_eq!(out["note"], "no changes");
+        assert_eq!(out["epoch"], 1);
+        // stale base → typed error with the missed ops, nothing applied
+        let out = call(
+            &app,
+            "POST",
+            "/api/propose_markdown",
+            &[],
+            Some(json!({"doc_id": id, "base_epoch": 0, "markdown": "# H\n\nedited\n"})),
+        )
+        .await;
+        assert_eq!(out["error"], "stale_base");
+        assert_eq!(out["current_epoch"], 1);
+        assert_eq!(out["missed_ops"].as_array().unwrap().len(), 2);
+        let tree = call(&app, "GET", &format!("/api/doc/{id}"), &[], None).await;
+        assert_eq!(tree["doc"]["current_epoch"], 1);
+    }
+
+    #[tokio::test]
+    async fn principal_header_attributes_writes_to_a_named_agent() {
+        let (app, human) = app();
+        // absent → the human
+        let doc = new_doc(&app, &[]).await;
+        assert_eq!(doc["created_by"], human.to_string());
+        // present → an Agent principal created on first use, reused after
+        let doc = new_doc(&app, &[(PRINCIPAL_HEADER, "workbox")]).await;
+        let agent = doc["created_by"].as_str().unwrap().to_string();
+        assert_ne!(agent, human.to_string());
+        let doc2 = new_doc(&app, &[("X-Grimoire-Principal", "workbox")]).await;
+        assert_eq!(doc2["created_by"], agent);
+        let ps = call(&app, "GET", "/api/principals", &[], None).await;
+        let p = ps.as_array().unwrap().iter().find(|p| p["id"] == agent).unwrap();
+        assert_eq!(p["display_name"], "workbox");
+        assert_eq!(p["kind"], "agent");
+        // the agent's propose carries its principal into the ledger
+        let id = doc["id"].as_str().unwrap();
+        let out = call(
+            &app,
+            "POST",
+            "/api/propose",
+            &[(PRINCIPAL_HEADER, "workbox")],
+            Some(json!({"doc_id": id, "base_epoch": 0, "ops": [{"kind": {"op": "insert",
+                "block_id": Uuid::now_v7(), "parent_id": null, "order_key": "",
+                "block_type": "paragraph", "content": "hi"}}]})),
+        )
+        .await;
+        assert_eq!(out["verdicts"][0]["verdict"], "green", "{out}");
+        let hist = call(&app, "GET", &format!("/api/doc/{id}/history"), &[], None).await;
+        assert_eq!(hist[0]["principal_name"], "workbox");
+        // invalid names are refused before anything is written
+        let bad = new_doc(&app, &[(PRINCIPAL_HEADER, "   ")]).await;
+        assert!(bad["error"].as_str().unwrap().contains("1-60 chars"), "{bad}");
+        let long = "x".repeat(61);
+        let bad = new_doc(&app, &[(PRINCIPAL_HEADER, long.as_str())]).await;
+        assert!(bad["error"].as_str().unwrap().contains("1-60 chars"));
+    }
+
+    #[tokio::test]
+    async fn request_id_makes_propose_idempotent_per_principal() {
+        let (app, _) = app();
+        let doc = new_doc(&app, &[]).await;
+        let id = doc["id"].as_str().unwrap().to_string();
+        let rid = Uuid::now_v7();
+        let body = json!({"doc_id": id, "base_epoch": 0, "request_id": rid, "ops": [{"kind": {"op": "insert",
+            "block_id": Uuid::now_v7(), "parent_id": null, "order_key": "",
+            "block_type": "paragraph", "content": "once"}}]});
+        let first = call(&app, "POST", "/api/propose", &[], Some(body.clone())).await;
+        assert_eq!(first["epoch"], 1, "{first}");
+        // the retry returns the stored outcome; the doc did not move
+        let second = call(&app, "POST", "/api/propose", &[], Some(body.clone())).await;
+        assert_eq!(second, first);
+        let tree = call(&app, "GET", &format!("/api/doc/{id}"), &[], None).await;
+        assert_eq!(tree["doc"]["current_epoch"], 1);
+        assert_eq!(tree["roots"].as_array().unwrap().len(), 1);
+        // another principal with the same request_id is not replayed: its
+        // ops are scored on their own (stale base here → insert still greens)
+        let mut body2 = body.clone();
+        body2["ops"][0]["kind"]["block_id"] = json!(Uuid::now_v7());
+        let other = call(&app, "POST", "/api/propose", &[(PRINCIPAL_HEADER, "other")], Some(body2)).await;
+        assert_ne!(other, first);
+        assert_eq!(other["epoch"], 2, "{other}");
+        // propose_markdown honours it too
+        let rid = Uuid::now_v7();
+        let body = json!({"doc_id": id, "base_epoch": 2, "request_id": rid, "markdown": "only\n"});
+        let a = call(&app, "POST", "/api/propose_markdown", &[], Some(body.clone())).await;
+        let b = call(&app, "POST", "/api/propose_markdown", &[], Some(body)).await;
+        assert_eq!(a, b);
+        assert_eq!(a["epoch"], 3, "{a}");
+    }
 }

@@ -53,6 +53,26 @@ The UI accepts a few query params on load, all scrubbed off the URL once read:
 `?tab=review|runs|graph|sharing|profile|trash` (open a top-level view; `doc` wins if
 both are given) and `?join=<payload>` (a `grimoire://join/…` link routed by the shell).
 
+## HTTP API for other local clients (0.6.2+)
+
+Everything the UI uses is plain JSON under `/api/*` on `127.0.0.1:7425` (errors are
+`{"error": …}` with HTTP 200; only `/admin/*` needs the `X-Grimoire-Admin` token). Three
+additions give an HTTP client the same contract MCP agents get:
+
+- `POST /api/propose_markdown` `{doc_id, base_epoch, markdown, request_id?}` — the whole doc's
+  new markdown is diffed against the current blocks and the minimal ops go through the gate
+  (unchanged blocks keep their ids). A stale `base_epoch` returns
+  `{"error":"stale_base", base_epoch, current_epoch, missed_ops, recover}`; identical markdown
+  returns `{…, "verdicts": [], "note": "no changes"}`.
+- `X-Grimoire-Principal: <name>` (1–60 chars) on `POST /api/propose`, `/api/propose_markdown`,
+  `/api/docs` and `/api/comment` attributes the write to that Agent principal (created on first
+  use, the MCP `identify` rule) instead of you, so it goes through review as an agent's. Absent
+  → the human, as before.
+- `request_id` (any UUID) on `/api/propose` and `/api/propose_markdown`: a retry with the same
+  id returns the first outcome instead of double-applying. Per principal, in-memory.
+
+The daemon's version is `GET /api/buildinfo` → `{"version": "0.6.2", "build": <stamp>}`.
+
 `./release.sh` builds the signed, notarized dmg (needs a Developer ID certificate and a
 `notarytool` keychain profile). Gardeners need [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
 on the machine.

@@ -31,6 +31,30 @@ pub fn dedupe_get(cache: &DedupeCache, principal: Uuid, id: Uuid) -> Option<serd
         .cloned()
 }
 
+pub fn new_dedupe() -> DedupeCache {
+    Arc::new(Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Find-or-create the Agent principal named `name` (the `identify` rule,
+/// shared with the HTTP `X-Grimoire-Principal` header): trimmed, 1–60 chars.
+pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uuid, String> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 60 {
+        return Err("name must be 1-60 chars".into());
+    }
+    let existing = store
+        .list_principals()
+        .ok()
+        .and_then(|ps| ps.into_iter().find(|pr| pr.display_name == name));
+    match existing {
+        Some(pr) => Ok(pr.id),
+        None => store
+            .create_principal(grimoire_store::PrincipalKind::Agent, name, None)
+            .map(|pr| pr.id)
+            .map_err(|e| e.to_string()),
+    }
+}
+
 pub fn dedupe_put(cache: &DedupeCache, principal: Uuid, id: Uuid, v: serde_json::Value) {
     let mut c = cache
         .lock()
@@ -259,32 +283,20 @@ impl KsMcp {
         &self,
         Parameters(p): Parameters<IdentifyParams>,
     ) -> Result<CallToolResult, McpError> {
-        let name = p.name.trim();
-        if name.is_empty() || name.len() > 60 {
-            return err("name must be 1-60 chars".into());
-        }
+        let name = p.name.trim().to_string();
         let mut store = self
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let existing = store
-            .list_principals()
-            .ok()
-            .and_then(|ps| ps.into_iter().find(|pr| pr.display_name == name));
-        let principal = match existing {
-            Some(pr) => pr,
-            None => {
-                match store.create_principal(grimoire_store::PrincipalKind::Agent, name, None) {
-                    Ok(pr) => pr,
-                    Err(e) => return err(e.to_string()),
-                }
-            }
+        let principal = match agent_principal_by_name(&mut store, &name) {
+            Ok(id) => id,
+            Err(m) => return err(m),
         };
         *self
             .identity
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(principal.id);
-        ok_json(&json!({"identified_as": name, "principal": principal.id}))
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(principal);
+        ok_json(&json!({"identified_as": name, "principal": principal}))
     }
 
     #[tool(
@@ -748,8 +760,8 @@ pub fn router(
     store: Arc<Mutex<SqliteStore>>,
     agent: Uuid,
     hot: crate::hot::HotState,
+    dedupe: DedupeCache,
 ) -> axum::Router {
-    let dedupe: DedupeCache = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let service = StreamableHttpService::new(
         move || Ok(KsMcp::new(store.clone(), agent, dedupe.clone(), hot.clone())),
         LocalSessionManager::default().into(),

@@ -614,7 +614,9 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             let fed_ctx_node_id: Option<String>;
-            let app = mcp::router(store.clone(), claude, hot.clone())
+            // one idempotency cache for MCP and HTTP proposes (request_id)
+            let dedupe = mcp::new_dedupe();
+            let app = mcp::router(store.clone(), claude, hot.clone(), dedupe.clone())
                 .merge(hot::router(hot::HotCtx {
                     hot: hot.clone(),
                     store: store.clone(),
@@ -632,6 +634,7 @@ async fn main() -> anyhow::Result<()> {
                     db_path: cli.db.clone(),
                     node_id: fed_ctx_node_id,
                     embedder,
+                    dedupe,
                 }));
             // The frontend is EMBEDDED in this binary (rust-embed over ui/dist),
             // so the app is self-contained on any machine. GRIMOIRE_UI_DIST is a
