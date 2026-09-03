@@ -265,9 +265,11 @@ kbd {
   bottom: 0;
   left: var(--guide, 15px);
   width: 1px;
-  background: color-mix(in srgb, var(--border) 60%, transparent);
+  background: color-mix(in srgb, var(--fg-dim) 28%, transparent);
   pointer-events: none;
 }
+/* leaves keep the chevron's width so titles at one depth line up */
+.tree-leaf-slot { display: inline-block; width: 10px; flex-shrink: 0; }
 
 /* expand/collapse: grid-rows animation, ~120ms */
 .tree-collapse {

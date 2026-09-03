@@ -268,10 +268,12 @@ export default function DocTree({
           }}
           title={d.title}
         >
-          {isDir && (
+          {isDir ? (
             <svg width="10" height="10" viewBox="0 0 10 10" className={open ? 'chev open' : 'chev'} aria-hidden>
               <path d="M3 1.5 L7 5 L3 8.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
             </svg>
+          ) : (
+            <span className="tree-leaf-slot" aria-hidden />
           )}
           {d.is_canvas && <span className="tree-canvas" title="canvas">▨</span>}
           <span className="tree-title">{d.title}</span>
