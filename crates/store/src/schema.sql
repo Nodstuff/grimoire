@@ -321,6 +321,8 @@ CREATE TABLE IF NOT EXISTS hub_forwards (
     doc_id         TEXT NOT NULL,
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+-- prune_hub_forwards deletes by age
+CREATE INDEX IF NOT EXISTS hub_forwards_by_created ON hub_forwards (created_at);
 
 -- Hub side (slice 2): ownership transfers members offered the hub. An admin
 -- accepts or declines; on accept the hub dials the member, pulls the subtree,

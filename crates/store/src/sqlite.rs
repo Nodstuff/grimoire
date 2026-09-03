@@ -401,11 +401,14 @@ fn backfill_doc_sort_keys(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// The highest sort_key among the live docs under `parent_id`, if any.
+/// The highest sort_key among ALL docs under `parent_id` (tombstoned ones
+/// included), if any. Trashed siblings keep their key so a restore lands them
+/// back where they were; a new doc keyed only past the live ones could
+/// collide with a trashed key and then tie with it after the restore.
 fn max_doc_sort_key(conn: &Connection, parent_id: Option<&str>) -> Result<Option<String>> {
     Ok(conn.query_row(
         "SELECT max(sort_key) FROM docs
-         WHERE deleted = 0 AND sort_key IS NOT NULL
+         WHERE sort_key IS NOT NULL
            AND ((?1 IS NULL AND parent_id IS NULL) OR parent_id = ?1)",
         params![parent_id],
         |r| r.get(0),
@@ -1482,7 +1485,7 @@ impl BlockStore for SqliteStore {
     }
 
     fn list_docs(&self) -> Result<Vec<Doc>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status, sort_key
              FROM docs WHERE deleted = 0 ORDER BY sort_key IS NULL, sort_key, title",
         )?;
@@ -1491,14 +1494,12 @@ impl BlockStore for SqliteStore {
     }
 
     fn get_doc(&self, id: Uuid) -> Result<Doc> {
-        let raw = self
-            .conn
-            .query_row(
-                "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status, sort_key
-                 FROM docs WHERE id = ?1",
-                params![id.to_string()],
-                row_to_doc,
-            )
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status, sort_key
+             FROM docs WHERE id = ?1",
+        )?;
+        let raw = stmt
+            .query_row(params![id.to_string()], row_to_doc)
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("doc {id}")))?;
         build_doc(raw)
@@ -1560,7 +1561,7 @@ impl BlockStore for SqliteStore {
     }
 
     fn ops_since(&self, doc_id: Uuid, since_epoch: i64) -> Result<Vec<LedgerOp>> {
-        let mut stmt = self.conn.prepare(&format!(
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {OP_COLS} FROM ops
              WHERE doc_id = ?1 AND epoch_applied IS NOT NULL AND epoch_applied > ?2
              ORDER BY epoch_applied, id"
@@ -1598,6 +1599,17 @@ impl BlockStore for SqliteStore {
             }
             cursor = self.get_doc(p)?.parent_id;
         }
+        // no key from the client = append under the new parent; a move must
+        // never re-NULL a key the v5 backfill assigned
+        let sort_key = match sort_key {
+            Some(k) if crate::order_key::is_valid(k) => k.to_string(),
+            Some(k) => {
+                return Err(StoreError::InvalidOp(format!(
+                    "move: invalid sort_key {k:?}"
+                )))
+            }
+            None => next_doc_sort_key(&self.conn, new_parent)?,
+        };
         let n = self.conn.execute(
             "UPDATE docs SET parent_id = ?1, sort_key = ?2 WHERE id = ?3 AND deleted = 0",
             params![
@@ -1813,7 +1825,7 @@ impl BlockStore for SqliteStore {
              ORDER BY d.title, b.order_key",
             b_cols()
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![doc.title], |r| {
             let raw = row_to_block(r)?;
             let title: String = r.get(10)?;
@@ -1889,7 +1901,7 @@ impl BlockStore for SqliteStore {
                  ORDER BY bm25(blocks_fts) LIMIT ?2",
                 b_cols()
             );
-            let mut stmt = self.conn.prepare(&sql)?;
+            let mut stmt = self.conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![match_q, limit as i64], |r| {
                 let raw = row_to_block(r)?;
                 let title: String = r.get(10)?;
@@ -1916,7 +1928,7 @@ impl BlockStore for SqliteStore {
              ORDER BY d.title, b.order_key LIMIT ?2",
             b_cols()
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![pattern, limit as i64], |r| {
             let raw = row_to_block(r)?;
             let title: String = r.get(10)?;
@@ -4392,6 +4404,44 @@ mod tests {
         assert_eq!(after.max_epoch, before.max_epoch, "max alone cannot see this edit");
         assert_ne!(after, before, "signature must move on any single-doc epoch bump");
         assert_eq!(after.epoch_sum, before.epoch_sum + 1);
+    }
+
+    /// A move without a client key appends under the new parent instead of
+    /// re-NULLing the key; a malformed key is refused.
+    #[test]
+    fn move_doc_without_key_appends_and_rejects_invalid_keys() {
+        use crate::PrincipalKind;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "Tom", None).unwrap();
+        let folder = s.create_doc("folder", None, tom.id).unwrap();
+        let first = s.create_doc("first", Some(folder.id), tom.id).unwrap();
+        let mover = s.create_doc("mover", None, tom.id).unwrap();
+        s.move_doc(mover.id, Some(folder.id), None).unwrap();
+        let moved = s.get_doc(mover.id).unwrap();
+        assert_eq!(moved.parent_id, Some(folder.id));
+        let key = moved.sort_key.expect("move must not NULL the key");
+        assert!(crate::order_key::is_valid(&key));
+        assert!(key > first.sort_key.unwrap(), "appended after the last sibling");
+        let err = s.move_doc(mover.id, None, Some("A0")).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidOp(_)), "{err}");
+        assert_eq!(s.get_doc(mover.id).unwrap().parent_id, Some(folder.id));
+    }
+
+    /// A trashed sibling keeps its key; a new doc must key past it so the
+    /// restore does not produce two siblings with the same key.
+    #[test]
+    fn new_doc_key_clears_a_trashed_siblings_key() {
+        use crate::PrincipalKind;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "Tom", None).unwrap();
+        let a = s.create_doc("a", None, tom.id).unwrap();
+        s.delete_doc(a.id).unwrap();
+        let b = s.create_doc("b", None, tom.id).unwrap();
+        s.restore_doc(a.id).unwrap();
+        let ka = s.get_doc(a.id).unwrap().sort_key.unwrap();
+        let kb = s.get_doc(b.id).unwrap().sort_key.unwrap();
+        assert_ne!(ka, kb);
+        assert!(kb > ka);
     }
 
     /// v5 backfill: NULL sort_keys are assigned per parent, in title order,
