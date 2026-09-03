@@ -738,7 +738,7 @@ async fn main() -> anyhow::Result<()> {
                 tokio::spawn(memory::memory_loop(store.clone(), tom));
             }
             // daily self-contained db snapshot beside the db (backups/), keep 7
-            tokio::spawn(backup::backup_loop(store.clone(), cli.db.clone()));
+            tokio::spawn(backup::backup_loop(cli.db.clone()));
             // block embeddings (ask the vault): model compiled in, index kept
             // current block-by-block; a load failure degrades to keyword search
             let embedder = match embed::Embedder::load() {

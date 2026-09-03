@@ -1,5 +1,6 @@
-//! Registry of the child processes the daemon spawns (`claude -p` for
-//! gardeners, the room and ask-the-vault; `d2` for diagrams).
+//! Registry of the long-running child processes the daemon spawns (`claude
+//! -p` for gardeners, the room and ask-the-vault; `d2` renders are sub-second
+//! and stay out of it).
 //!
 //! Each child runs in its OWN process group so a budget overrun kills the
 //! whole tree (claude spawns its own helpers), and every live pid is

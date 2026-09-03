@@ -181,34 +181,48 @@ pub fn scan(root: &Path) -> HashMap<String, Vec<PathBuf>> {
 
 /// One sync pass. `human` owns the folders; the agent principal authors the
 /// docs and the later diffs (so they are reviewable like any agent write).
+///
+/// Every file is read BEFORE the store is locked, and the lock is taken per
+/// doc: a sync across dozens of projects never holds the UI for its whole
+/// duration.
 pub fn sync(store: &Arc<Mutex<SqliteStore>>, root: &Path, human: Uuid) -> grimoire_store::Result<SyncReport> {
     let files = scan(root);
     let mut report = SyncReport { projects: files.len(), ..Default::default() };
-    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-    let agent = crate::room::agent_principal(&mut s)?;
-    let root_doc = ensure_folder(&mut s, None, ROOT_TITLE, human)?;
-    let mut projects: Vec<_> = files.into_iter().collect();
-    projects.sort_by(|a, b| a.0.cmp(&b.0));
-    for (project, mut paths) in projects {
+    // phase 1: disk, no lock
+    let mut projects: Vec<(String, Vec<(PathBuf, String)>)> = Vec::new();
+    let mut sorted: Vec<_> = files.into_iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    for (project, mut paths) in sorted {
         paths.sort();
-        let folder = ensure_folder(&mut s, Some(root_doc), &project, human)?;
+        let mut read = Vec::with_capacity(paths.len());
         for path in paths {
             report.files += 1;
-            let Ok(md) = std::fs::read_to_string(&path) else {
-                report.skipped += 1;
-                continue;
-            };
-            if md.trim().is_empty() {
-                report.skipped += 1;
-                continue;
+            match std::fs::read_to_string(&path) {
+                Ok(md) if !md.trim().is_empty() => read.push((path, md)),
+                _ => report.skipped += 1,
             }
+        }
+        projects.push((project, read));
+    }
+    // phase 2: the store, one short lock per doc
+    let lock = || store.lock().unwrap_or_else(|p| p.into_inner());
+    let (agent, root_doc) = {
+        let mut s = lock();
+        let agent = crate::room::agent_principal(&mut s)?;
+        let root_doc = ensure_folder(&mut s, None, ROOT_TITLE, human)?;
+        (agent, root_doc)
+    };
+    for (project, files) in projects {
+        let folder = ensure_folder(&mut lock(), Some(root_doc), &project, human)?;
+        for (path, md) in files {
             let key = format!("memory.hash.{project}/{}", path.file_name().unwrap_or_default().to_string_lossy());
             let h = hash(&md);
+            let (title, doc_md, refs) = to_doc_markdown(&project, &path, &md);
+            let mut s = lock();
             if s.get_setting(&key)?.as_deref() == Some(h.as_str()) {
                 report.unchanged += 1;
                 continue;
             }
-            let (title, doc_md, refs) = to_doc_markdown(&project, &path, &md);
             match find_child(&s, Some(folder), &title) {
                 None => {
                     let (doc_id, _) = grimoire_store::import::import_markdown(&mut *s, &title, Some(folder), agent, &doc_md)?;

@@ -8,6 +8,7 @@ use axum::{Json, Router};
 use grimoire_store::{BlockStore, DocStatus, OpInput, ReviewDecision, SqliteStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -738,20 +739,36 @@ struct D2Req {
 
 /// Render D2 to SVG by shelling to the d2 binary (5.7). Text-to-diagram
 /// only — the diagram block's content stays the source of truth.
+/// Where `d2` lives, probed once (each probe is a process spawn — never on
+/// the runtime, never per request). Only a hit is cached: install d2 while
+/// the daemon runs and the next render finds it.
+async fn d2_binary() -> Option<&'static str> {
+    static FOUND: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    if let Some(b) = FOUND.get() {
+        return Some(b);
+    }
+    let probed = tokio::task::spawn_blocking(|| {
+        ["d2", "/opt/homebrew/bin/d2", "/usr/local/bin/d2"]
+            .iter()
+            .find(|b| {
+                std::process::Command::new(b)
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            })
+            .copied()
+    })
+    .await
+    .ok()
+    .flatten()?;
+    Some(*FOUND.get_or_init(|| probed))
+}
+
 async fn render_d2(Json(req): Json<D2Req>) -> Json<Value> {
-    let bin = ["d2", "/opt/homebrew/bin/d2", "/usr/local/bin/d2"]
-        .iter()
-        .find(|b| {
-            std::process::Command::new(b)
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        })
-        .copied();
-    let Some(bin) = bin else {
+    let Some(bin) = d2_binary().await else {
         return Json(json!({"error": "d2 binary not installed (brew install d2)"}));
     };
     let out = tokio::task::spawn_blocking(move || {
@@ -950,10 +967,12 @@ fn tail_lines(path: &std::path::Path, n: usize) -> String {
     if f.seek(SeekFrom::Start(start)).is_err() {
         return String::new();
     }
-    let mut buf = String::new();
-    if f.read_to_string(&mut buf).is_err() {
+    let mut bytes = Vec::new();
+    if f.read_to_end(&mut bytes).is_err() {
         return String::new();
     }
+    // the window can start mid-codepoint; never fail the whole tail on it
+    let buf = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = buf.lines().collect();
     let skip = lines.len().saturating_sub(n);
     // a window cut mid-line leaves a partial first line; drop it when we skipped
@@ -1198,9 +1217,8 @@ async fn backups(State(st): State<ApiState>) -> Json<Value> {
 }
 
 async fn backup_now(State(st): State<ApiState>) -> Json<Value> {
-    let store = st.store.clone();
     let path = st.db_path.clone();
-    match tokio::task::spawn_blocking(move || crate::backup::backup_now(&store, &path, true)).await {
+    match tokio::task::spawn_blocking(move || crate::backup::backup_now(&path, true)).await {
         Ok(Ok(info)) => Json(json!(info)),
         Ok(Err(e)) => Json(json!({"error": format!("{e:#}")})),
         Err(e) => Json(json!({"error": e.to_string()})),
@@ -1243,9 +1261,11 @@ struct ImportReq {
 
 /// Import a folder of markdown from the app. The browser can't hand the
 /// daemon a directory path (WKWebView uploads file contents), so the UI
-/// sends `{path, content}` pairs; we materialise them under a scratch dir
-/// and run the same `import_vault` the CLI uses — folders become docs with
-/// children, files become docs. Non-markdown files are skipped client-side.
+/// sends `{path, content}` pairs. Folders become docs with children, files
+/// become docs — the same shape `import_vault` gives the CLI — but nothing
+/// touches disk: every file is parsed OFF the store lock and the lock is
+/// taken per doc, so a 5000-file import never stalls the UI for its
+/// duration. Non-markdown files are skipped (the UI filters too).
 async fn import_markdown(State(st): State<ApiState>, Json(req): Json<ImportReq>) -> Json<Value> {
     const MAX_FILES: usize = 5000;
     const MAX_BYTES: usize = 200 * 1024 * 1024;
@@ -1259,46 +1279,81 @@ async fn import_markdown(State(st): State<ApiState>, Json(req): Json<ImportReq>)
     if total > MAX_BYTES {
         return Json(json!({"error": "that folder is over 200 MB; import in smaller folders"}));
     }
-    let scratch = std::env::temp_dir().join(format!("grimoire-import-{}", Uuid::now_v7()));
     for f in &req.files {
         // no absolute paths, no traversal: every component must be a plain name
         let rel = std::path::Path::new(&f.path);
         if rel.is_absolute()
             || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_)))
         {
-            let _ = std::fs::remove_dir_all(&scratch);
             return Json(json!({"error": format!("refusing path {:?}", f.path)}));
-        }
-        let dest = scratch.join(rel);
-        if let Some(parent) = dest.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            let _ = std::fs::remove_dir_all(&scratch);
-            return Json(json!({"error": e.to_string()}));
-        }
-        if let Err(e) = std::fs::write(&dest, &f.content) {
-            let _ = std::fs::remove_dir_all(&scratch);
-            return Json(json!({"error": e.to_string()}));
         }
     }
     let store = st.store.clone();
     let human = st.human;
-    let dir = scratch.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        grimoire_store::import::import_vault(&mut *s, &dir, human)
-    })
-    .await;
-    let _ = std::fs::remove_dir_all(&scratch);
+    let res = tokio::task::spawn_blocking(move || import_files(&store, human, req.files)).await;
     match res {
         Ok(Ok(report)) => Json(json!({
             "docs": report.docs,
             "blocks": report.blocks,
-            "skipped": report.skipped.iter().map(|p| p.strip_prefix(&scratch).unwrap_or(p).to_string_lossy().to_string()).collect::<Vec<_>>(),
+            "skipped": report.skipped.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
         })),
         Ok(Err(e)) => Json(json!({"error": e.to_string()})),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
+}
+
+/// The import walk, in memory: sorted by path (folders create in order, as
+/// the CLI walk does), parse outside the lock, one lock per doc.
+fn import_files(
+    store: &Arc<Mutex<SqliteStore>>,
+    human: Uuid,
+    mut files: Vec<ImportFile>,
+) -> grimoire_store::Result<grimoire_store::import::ImportReport> {
+    use grimoire_store::import::{ImportReport, segment, to_ops};
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut report = ImportReport::default();
+    // folder path → doc id, created on first use
+    let mut folders: HashMap<std::path::PathBuf, Uuid> = HashMap::new();
+    for f in files {
+        let rel = std::path::PathBuf::from(&f.path);
+        let name = rel.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if name.starts_with('.') || rel.extension().and_then(|e| e.to_str()) != Some("md") {
+            report.skipped.push(rel);
+            continue;
+        }
+        let title = rel.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or(name);
+        // parse off the lock
+        let ops = to_ops(segment(&f.content));
+        // folders: walk the ancestors root-first, each its own short lock
+        let mut parent: Option<Uuid> = None;
+        let mut sofar = std::path::PathBuf::new();
+        for comp in rel.parent().map(|p| p.components().collect::<Vec<_>>()).unwrap_or_default() {
+            sofar.push(comp);
+            if sofar.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
+                break;
+            }
+            let id = match folders.get(&sofar) {
+                Some(id) => *id,
+                None => {
+                    let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let d = s.create_doc(&comp.as_os_str().to_string_lossy(), parent, human)?;
+                    report.docs += 1;
+                    folders.insert(sofar.clone(), d.id);
+                    d.id
+                }
+            };
+            parent = Some(id);
+        }
+        let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let doc = s.create_doc(&title, parent, human)?;
+        let n = ops.len();
+        if n > 0 {
+            s.apply(doc.id, 0, human, ops)?;
+        }
+        report.docs += 1;
+        report.blocks += n;
+    }
+    Ok(report)
 }
 
 #[derive(Deserialize)]
@@ -1559,6 +1614,31 @@ mod http_client_tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn import_builds_folders_from_paths_and_skips_non_markdown() {
+        let (app, _) = app();
+        let files = json!({"files": [
+            {"path": "notes/sub/b.md", "content": "# B\n\nbody b\n"},
+            {"path": "top.md", "content": "top\n"},
+            {"path": "notes/a.md", "content": "a one\n\na two\n"},
+            {"path": "notes/img.png", "content": "not md"},
+        ]});
+        let v = call(&app, "POST", "/api/import", &[], Some(files)).await;
+        // notes, sub, a, b, top
+        assert_eq!(v["docs"], 5, "{v}");
+        assert_eq!(v["blocks"], 5);
+        assert_eq!(v["skipped"], json!(["notes/img.png"]));
+        let docs = call(&app, "GET", "/api/docs", &[], None).await;
+        let docs = docs.as_array().unwrap();
+        let find = |t: &str| docs.iter().find(|d| d["title"] == t).unwrap_or_else(|| panic!("{t}: {docs:?}"));
+        let notes = find("notes");
+        assert!(notes["parent_id"].is_null());
+        assert_eq!(find("sub")["parent_id"], notes["id"]);
+        assert_eq!(find("b")["parent_id"], find("sub")["id"]);
+        assert_eq!(find("a")["parent_id"], notes["id"]);
+        assert!(find("top")["parent_id"].is_null());
     }
 
     #[tokio::test]
