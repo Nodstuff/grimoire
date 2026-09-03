@@ -2,6 +2,7 @@
 //! thin client over these routes so the daemon stays the only DB owner.
 
 use crate::garden;
+use crate::store_ext::with_store;
 use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::response::IntoResponse;
@@ -63,13 +64,13 @@ pub struct RunsQuery {
 }
 
 async fn list_gardeners(State(AdminState { store, .. }): State<AdminState>) -> Json<Value> {
-    let s = store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.list_gardeners() {
-        Ok(g) => Json(json!(g)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&store, move |s| {
+        match s.list_gardeners() {
+            Ok(g) => Json(json!(g)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 async fn create_gardener(
@@ -90,16 +91,16 @@ async fn create_gardener(
             None => return Json(json!({"error": format!("bad kind: {k}")})),
         },
     };
-    let mut s = store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(e) = scope_on_mirror(&s, req.scope_doc) {
-        return Json(json!({"error": e}));
-    }
-    match s.create_gardener(&req.name, kind, &req.task_prompt, req.scope_doc, policy) {
-        Ok(g) => Json(json!(g)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&store, move |s| {
+        if let Some(e) = scope_on_mirror(&s, req.scope_doc) {
+            return Json(json!({"error": e}));
+        }
+        match s.create_gardener(&req.name, kind, &req.task_prompt, req.scope_doc, policy) {
+            Ok(g) => Json(json!(g)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// Run-now. 409 when every matched gardener is already mid-run (a second
@@ -109,14 +110,9 @@ async fn run_now(
     State(AdminState { store, hot }): State<AdminState>,
     Json(req): Json<RunReq>,
 ) -> axum::response::Response {
-    let gardeners = {
-        let s = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match s.list_gardeners() {
-            Ok(g) => g,
-            Err(e) => return Json(json!({"error": e.to_string()})).into_response(),
-        }
+    let gardeners = match with_store(&store, |s| s.list_gardeners()).await {
+        Ok(g) => g,
+        Err(e) => return Json(json!({"error": e.to_string()})).into_response(),
     };
     let mut outcomes = Vec::new();
     let mut started = 0usize;
@@ -155,13 +151,13 @@ async fn run_now(
 }
 
 async fn list_runs(State(AdminState { store, .. }): State<AdminState>, Query(q): Query<RunsQuery>) -> Json<Value> {
-    let s = store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.list_runs(q.limit.unwrap_or(20)) {
-        Ok(r) => Json(json!(r)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&store, move |s| {
+        match s.list_runs(q.limit.unwrap_or(20)) {
+            Ok(r) => Json(json!(r)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -183,29 +179,29 @@ async fn update_gardener(
     let Some(policy) = ConfidencePolicy::parse(&req.confidence_policy) else {
         return Json(json!({"error": format!("bad confidence_policy: {}", req.confidence_policy)}));
     };
-    let mut s = store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(e) = scope_on_mirror(&s, req.scope_doc) {
-        return Json(json!({"error": e}));
-    }
-    let bindings = if req.bindings.is_null() {
-        serde_json::json!([])
-    } else {
-        req.bindings
-    };
-    match s.update_gardener(
-        req.id,
-        &req.task_prompt,
-        &req.schedule,
-        policy,
-        req.scope_doc,
-        req.enabled,
-        bindings,
-    ) {
-        Ok(()) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&store, move |s| {
+        if let Some(e) = scope_on_mirror(&s, req.scope_doc) {
+            return Json(json!({"error": e}));
+        }
+        let bindings = if req.bindings.is_null() {
+            serde_json::json!([])
+        } else {
+            req.bindings
+        };
+        match s.update_gardener(
+            req.id,
+            &req.task_prompt,
+            &req.schedule,
+            policy,
+            req.scope_doc,
+            req.enabled,
+            bindings,
+        ) {
+            Ok(()) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -223,16 +219,16 @@ async fn set_policy(State(AdminState { store, .. }): State<AdminState>, Json(req
             None => return Json(json!({"error": format!("bad policy: {p}")})),
         },
     };
-    let mut s = store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if s.get_mirror(req.doc_id).ok().flatten().is_some() {
-        return Json(json!({"error": "this doc is shared with you by its owner — review policy is the owner's call"}));
-    }
-    match s.set_review_policy(req.doc_id, policy) {
-        Ok(()) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&store, move |s| {
+        if s.get_mirror(req.doc_id).ok().flatten().is_some() {
+            return Json(json!({"error": "this doc is shared with you by its owner — review policy is the owner's call"}));
+        }
+        match s.set_review_policy(req.doc_id, policy) {
+            Ok(()) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 // --- federation admin (ADR 0002; #57). Human surface only, never MCP. ---
@@ -336,7 +332,7 @@ pub struct CreateShare {
 }
 
 async fn create_share(State(st): State<FedState>, Json(req): Json<CreateShare>) -> Json<Value> {
-    let Some(node_id) = &st.ctx.node_id else {
+    let Some(node_id) = st.ctx.node_id.clone() else {
         return Json(json!({"error": "federation disabled: no instance identity"}));
     };
     let permission = match req.permission.as_deref() {
@@ -346,113 +342,109 @@ async fn create_share(State(st): State<FedState>, Json(req): Json<CreateShare>) 
             None => return Json(json!({"error": format!("bad permission: {p}")})),
         },
     };
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match crate::fed::mint_invite(&mut s, node_id, req.root_doc, permission) {
-        Ok((share, link)) => Json(json!({"share": share, "link": link})),
-        Err(e) => Json(json!({"error": format!("{e:#}")})),
-    }
+    with_store(&st.store, move |s| {
+        match crate::fed::mint_invite(s, &node_id, req.root_doc, permission) {
+            Ok((share, link)) => Json(json!({"share": share, "link": link})),
+            Err(e) => Json(json!({"error": format!("{e:#}")})),
+        }
+    })
+    .await
 }
 
 /// Owner side of the shares page: every share with what the UI needs to
 /// render it in one row — title, size, who, grant, trust, state.
 async fn list_shares(State(st): State<FedState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let contacts = s.list_contacts().unwrap_or_default();
-    match s.list_shares() {
-        Ok(shares) => Json(json!(
-            shares
-                .into_iter()
-                .map(|sh| {
-                    let root = s.get_doc(sh.root_doc).ok();
-                    let doc_count = s.docs_in_share(sh.id).map(|d| d.len()).unwrap_or(0);
-                    let petname = sh
-                        .contact
-                        .and_then(|c| contacts.iter().find(|x| x.id == c))
-                        .map(|c| c.petname.clone());
-                    let mut v = json!(sh);
-                    v["root_title"] = json!(root.as_ref().map(|d| d.title.clone()).unwrap_or_default());
-                    v["doc_count"] = json!(doc_count);
-                    v["contact_petname"] = json!(petname);
-                    // invites v2: an unredeemed invite offered to a contact over the wire
-                    if sh.state == grimoire_store::ShareState::Offered
-                        && let Ok(Some(to)) = s.invite_offered_to(sh.id)
-                        && let Some(c) = contacts.iter().find(|x| x.id == to)
-                    {
-                        v["offered_to_petname"] = json!(c.petname);
-                    }
-                    v
-                })
-                .collect::<Vec<_>>()
-        )),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        let contacts = s.list_contacts().unwrap_or_default();
+        match s.list_shares() {
+            Ok(shares) => Json(json!(
+                shares
+                    .into_iter()
+                    .map(|sh| {
+                        let root = s.get_doc(sh.root_doc).ok();
+                        let doc_count = s.docs_in_share(sh.id).map(|d| d.len()).unwrap_or(0);
+                        let petname = sh
+                            .contact
+                            .and_then(|c| contacts.iter().find(|x| x.id == c))
+                            .map(|c| c.petname.clone());
+                        let mut v = json!(sh);
+                        v["root_title"] = json!(root.as_ref().map(|d| d.title.clone()).unwrap_or_default());
+                        v["doc_count"] = json!(doc_count);
+                        v["contact_petname"] = json!(petname);
+                        // invites v2: an unredeemed invite offered to a contact over the wire
+                        if sh.state == grimoire_store::ShareState::Offered
+                            && let Ok(Some(to)) = s.invite_offered_to(sh.id)
+                            && let Some(c) = contacts.iter().find(|x| x.id == to)
+                        {
+                            v["offered_to_petname"] = json!(c.petname);
+                        }
+                        v
+                    })
+                    .collect::<Vec<_>>()
+            )),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// Permanently clear a REVOKED share (and its invites) — the shares page's
 /// "clear". Active/offered shares must be revoked first (store enforces).
 async fn delete_share(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.delete_share(req.id) {
-        Ok(()) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.delete_share(req.id) {
+            Ok(()) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// Grantee side of the shares page: one row per share we hold mirrors of,
 /// with sync health — a failing pull is a red row saying WHY, never a doc
 /// that silently has titles and no content.
 async fn list_mirrors(State(st): State<FedState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let contacts = s.list_contacts().unwrap_or_default();
-    let mirrors = s.list_mirrors().unwrap_or_default();
-    let mut by_share: std::collections::BTreeMap<Uuid, Vec<&grimoire_store::Mirror>> = Default::default();
-    for m in &mirrors {
-        by_share.entry(m.share_id).or_default().push(m);
-    }
-    let rows: Vec<Value> = by_share
-        .into_iter()
-        .map(|(share_id, ms)| {
-            let ids: std::collections::HashSet<Uuid> = ms.iter().map(|m| m.doc_id).collect();
-            // the root: the mirror whose parent is not a mirror of this share
-            let root = ms
-                .iter()
-                .filter_map(|m| s.get_doc(m.doc_id).ok())
-                .find(|d| d.parent_id.map(|p| !ids.contains(&p)).unwrap_or(true));
-            let owner = contacts.iter().find(|c| c.id == ms[0].owner);
-            json!({
-                "share_id": share_id,
-                "owner_petname": owner.map(|c| c.petname.clone()).unwrap_or_else(|| "?".into()),
-                "owner_pubkey": owner.map(|c| c.pubkey.clone()).unwrap_or_default(),
-                "permission": ms[0].permission,
-                "root_doc_id": root.as_ref().map(|d| d.id),
-                "root_title": root.as_ref().map(|d| d.title.clone()).unwrap_or_else(|| "(shared docs)".into()),
-                "doc_count": ms.len(),
-                "synced_epoch_max": ms.iter().map(|m| m.synced_epoch).max().unwrap_or(0),
-                // docs whose owner epoch (from the last meta) is past what we landed
-                "behind": ms.iter().filter(|m| m.owner_epoch > m.synced_epoch).count(),
-                "last_pulled_at": ms.iter().filter_map(|m| m.last_pulled_at.clone()).max(),
-                "last_error": ms.iter().find_map(|m| m.last_error.clone()),
-                "owner_tended": ms.iter().any(|m| m.owner_tended),
-                // hub relay (slice 1): the share comes from a hub; how many of its
-                // docs are relayed for other members (each names its true owner)
-                "from_hub": owner.map(|c| c.is_hub).unwrap_or(false),
-                "relayed_docs": ms.iter().filter(|m| m.origin_owner.is_some()).count(),
+    with_store(&st.store, move |s| {
+        let contacts = s.list_contacts().unwrap_or_default();
+        let mirrors = s.list_mirrors().unwrap_or_default();
+        let mut by_share: std::collections::BTreeMap<Uuid, Vec<&grimoire_store::Mirror>> = Default::default();
+        for m in &mirrors {
+            by_share.entry(m.share_id).or_default().push(m);
+        }
+        let rows: Vec<Value> = by_share
+            .into_iter()
+            .map(|(share_id, ms)| {
+                let ids: std::collections::HashSet<Uuid> = ms.iter().map(|m| m.doc_id).collect();
+                // the root: the mirror whose parent is not a mirror of this share
+                let root = ms
+                    .iter()
+                    .filter_map(|m| s.get_doc(m.doc_id).ok())
+                    .find(|d| d.parent_id.map(|p| !ids.contains(&p)).unwrap_or(true));
+                let owner = contacts.iter().find(|c| c.id == ms[0].owner);
+                json!({
+                    "share_id": share_id,
+                    "owner_petname": owner.map(|c| c.petname.clone()).unwrap_or_else(|| "?".into()),
+                    "owner_pubkey": owner.map(|c| c.pubkey.clone()).unwrap_or_default(),
+                    "permission": ms[0].permission,
+                    "root_doc_id": root.as_ref().map(|d| d.id),
+                    "root_title": root.as_ref().map(|d| d.title.clone()).unwrap_or_else(|| "(shared docs)".into()),
+                    "doc_count": ms.len(),
+                    "synced_epoch_max": ms.iter().map(|m| m.synced_epoch).max().unwrap_or(0),
+                    // docs whose owner epoch (from the last meta) is past what we landed
+                    "behind": ms.iter().filter(|m| m.owner_epoch > m.synced_epoch).count(),
+                    "last_pulled_at": ms.iter().filter_map(|m| m.last_pulled_at.clone()).max(),
+                    "last_error": ms.iter().find_map(|m| m.last_error.clone()),
+                    "owner_tended": ms.iter().any(|m| m.owner_tended),
+                    // hub relay (slice 1): the share comes from a hub; how many of its
+                    // docs are relayed for other members (each names its true owner)
+                    "from_hub": owner.map(|c| c.is_hub).unwrap_or(false),
+                    "relayed_docs": ms.iter().filter(|m| m.origin_owner.is_some()).count(),
+                })
             })
-        })
-        .collect();
-    Json(json!(rows))
+            .collect();
+        Json(json!(rows))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -464,12 +456,11 @@ pub struct ShareIdReq {
 /// deleted docs, mirror rows removed). The owner's share is untouched — it is
 /// theirs to revoke; a later re-join revives the docs.
 async fn leave_share(State(st): State<FedState>, Json(req): Json<ShareIdReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dropped = crate::fed::loops::drop_dead_share(&mut s, req.share_id);
-    Json(json!({"ok": true, "dropped": dropped.len()}))
+    with_store(&st.store, move |s| {
+        let dropped = crate::fed::loops::drop_dead_share(s, req.share_id);
+        Json(json!({"ok": true, "dropped": dropped.len()}))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -479,46 +470,46 @@ pub struct ClearJoinsReq {
 
 /// Clear pending join attempts: one by id, or all of them.
 async fn clear_joins(State(st): State<FedState>, Json(req): Json<ClearJoinsReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let ids: Vec<Uuid> = match req.id {
-        Some(id) => vec![id],
-        None => s.list_pending_joins().unwrap_or_default().into_iter().map(|j| j.id).collect(),
-    };
-    let mut n = 0;
-    for id in ids {
-        if s.remove_pending_join(id).is_ok() {
-            n += 1;
+    with_store(&st.store, move |s| {
+        let ids: Vec<Uuid> = match req.id {
+            Some(id) => vec![id],
+            None => s.list_pending_joins().unwrap_or_default().into_iter().map(|j| j.id).collect(),
+        };
+        let mut n = 0;
+        for id in ids {
+            if s.remove_pending_join(id).is_ok() {
+                n += 1;
+            }
         }
-    }
-    Json(json!({"ok": true, "cleared": n}))
+        Json(json!({"ok": true, "cleared": n}))
+    })
+    .await
 }
 
 /// The instance owner's profile: display name (the petname contacts see),
 /// identity, and whether the name was ever confirmed by the user.
 async fn get_profile(State(st): State<FedState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let human = s
-        .list_principals()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|p| p.kind == grimoire_store::PrincipalKind::Human);
-    let Some(human) = human else {
-        return Json(json!({"error": "no human principal"}));
-    };
-    let confirmed = s.get_setting("profile.confirmed").ok().flatten().as_deref() == Some("1");
-    Json(json!({
-        "name": human.display_name,
-        "principal_id": human.id,
-        "node_id": st.ctx.node_id,
-        "fingerprint": st.ctx.node_id.as_deref().map(crate::identity::fingerprint_of),
-        "confirmed": confirmed,
-    }))
+    let store = st.store.clone();
+    let st = st.clone();
+    with_store(&store, move |s| {
+        let human = s
+            .list_principals()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|p| p.kind == grimoire_store::PrincipalKind::Human);
+        let Some(human) = human else {
+            return Json(json!({"error": "no human principal"}));
+        };
+        let confirmed = s.get_setting("profile.confirmed").ok().flatten().as_deref() == Some("1");
+        Json(json!({
+            "name": human.display_name,
+            "principal_id": human.id,
+            "node_id": st.ctx.node_id,
+            "fingerprint": st.ctx.node_id.as_deref().map(crate::identity::fingerprint_of),
+            "confirmed": confirmed,
+        }))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -527,25 +518,24 @@ pub struct ProfileReq {
 }
 
 async fn set_profile(State(st): State<FedState>, Json(req): Json<ProfileReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let human = s
-        .list_principals()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|p| p.kind == grimoire_store::PrincipalKind::Human);
-    let Some(human) = human else {
-        return Json(json!({"error": "no human principal"}));
-    };
-    match s.rename_principal(human.id, &req.name) {
-        Ok(()) => {
-            s.set_setting("profile.confirmed", "1").ok();
-            Json(json!({"ok": true, "name": req.name.trim()}))
+    with_store(&st.store, move |s| {
+        let human = s
+            .list_principals()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|p| p.kind == grimoire_store::PrincipalKind::Human);
+        let Some(human) = human else {
+            return Json(json!({"error": "no human principal"}));
+        };
+        match s.rename_principal(human.id, &req.name) {
+            Ok(()) => {
+                s.set_setting("profile.confirmed", "1").ok();
+                Json(json!({"ok": true, "name": req.name.trim()}))
+            }
+            Err(e) => Json(json!({"error": e.to_string()})),
         }
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -554,21 +544,20 @@ pub struct IdReq {
 }
 
 async fn revoke_share(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // who held it, so we can tell them now rather than at their next sweep
-    let target = s.get_share(req.id).ok().and_then(|sh| {
-        let contact = s.list_contacts().ok()?.into_iter().find(|c| Some(c.id) == sh.contact)?;
-        let title = s.get_doc(sh.root_doc).map(|d| d.title).unwrap_or_default();
-        Some((contact, sh.root_doc, title))
-    });
-    match s.set_share_state(req.id, grimoire_store::ShareState::Revoked) {
+    let (target, revoked) = with_store(&st.store, move |s| {
+        // who held it, so we can tell them now rather than at their next sweep
+        let target = s.get_share(req.id).ok().and_then(|sh| {
+            let contact = s.list_contacts().ok()?.into_iter().find(|c| Some(c.id) == sh.contact)?;
+            let title = s.get_doc(sh.root_doc).map(|d| d.title).unwrap_or_default();
+            Some((contact, sh.root_doc, title))
+        });
+        (target, s.set_share_state(req.id, grimoire_store::ShareState::Revoked))
+    })
+    .await;
+    match revoked {
         Ok(()) => {
             // a live bridge on this share is cut now, not at the next re-auth
             let cut = st.hot.drop_bridges_for_share(req.id);
-            drop(s);
             // nudge the grantee: their next pull is refused ShareRevoked and
             // drops the mirrors at once (a hub un-relays the publication) —
             // without this they keep stale docs until the 120s sweep
@@ -589,14 +578,13 @@ async fn revoke_share(State(st): State<FedState>, Json(req): Json<IdReq>) -> Jso
 }
 
 async fn list_contacts(State(st): State<FedState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.list_contacts() {
-        Ok(c) => Json(json!(c)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.list_contacts() {
+            Ok(c) => Json(json!(c)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -610,14 +598,13 @@ async fn set_share_trust(State(st): State<FedState>, Json(req): Json<TrustReq>) 
     let Some(trust) = grimoire_store::ShareTrust::parse(&req.trust) else {
         return Json(json!({"error": format!("bad trust: {}", req.trust)}));
     };
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.set_share_trust(req.id, trust) {
-        Ok(()) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.set_share_trust(req.id, trust) {
+            Ok(()) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -627,14 +614,13 @@ pub struct VerifyReq {
 }
 
 async fn verify_contact(State(st): State<FedState>, Json(req): Json<VerifyReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.set_contact_verified(req.id, req.verified) {
-        Ok(()) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.set_contact_verified(req.id, req.verified) {
+            Ok(()) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -647,69 +633,69 @@ async fn rename_contact(
     State(st): State<FedState>,
     Json(req): Json<RenameContactReq>,
 ) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.rename_contact(req.id, req.petname.trim()) {
-        Ok(()) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.rename_contact(req.id, req.petname.trim()) {
+            Ok(()) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 async fn revoke_contact(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let pubkey = s
-        .list_contacts()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|c| c.id == req.id)
-        .map(|c| c.pubkey);
-    match s.revoke_contact(req.id) {
-        Ok(()) => {
-            let cut = pubkey.map(|pk| st.hot.drop_bridges_for_peer(&pk)).unwrap_or(0);
-            Json(json!({"ok": true, "bridges_cut": cut}))
+    let store = st.store.clone();
+    let st = st.clone();
+    with_store(&store, move |s| {
+        let pubkey = s
+            .list_contacts()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| c.id == req.id)
+            .map(|c| c.pubkey);
+        match s.revoke_contact(req.id) {
+            Ok(()) => {
+                let cut = pubkey.map(|pk| st.hot.drop_bridges_for_peer(&pk)).unwrap_or(0);
+                Json(json!({"ok": true, "bridges_cut": cut}))
+            }
+            Err(e) => Json(json!({"error": e.to_string()})),
         }
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    })
+    .await
 }
 
 /// Remove a contact without blocking: their shares are revoked, live bridges
 /// cut, the contact row gone. A fresh invite pairs them again like anyone.
 async fn remove_contact(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let pubkey = s
-        .list_contacts()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|c| c.id == req.id)
-        .map(|c| c.pubkey);
-    match s.remove_contact(req.id) {
-        Ok(()) => {
-            let cut = pubkey.map(|pk| st.hot.drop_bridges_for_peer(&pk)).unwrap_or(0);
-            Json(json!({"ok": true, "bridges_cut": cut}))
+    let store = st.store.clone();
+    let st = st.clone();
+    with_store(&store, move |s| {
+        let pubkey = s
+            .list_contacts()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| c.id == req.id)
+            .map(|c| c.pubkey);
+        match s.remove_contact(req.id) {
+            Ok(()) => {
+                let cut = pubkey.map(|pk| st.hot.drop_bridges_for_peer(&pk)).unwrap_or(0);
+                Json(json!({"ok": true, "bridges_cut": cut}))
+            }
+            Err(e) => Json(json!({"error": e.to_string()})),
         }
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    })
+    .await
 }
 
 /// Re-enable a revoked contact (human surface only, never MCP). Shares stay
 /// revoked; the owner re-shares deliberately.
 async fn unrevoke_contact(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.unrevoke_contact(req.id) {
-        Ok(()) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.unrevoke_contact(req.id) {
+            Ok(()) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -756,17 +742,16 @@ async fn join(State(st): State<FedState>, Json(req): Json<JoinReq>) -> Json<Valu
         Ok(Err(e)) => format!("{e:#}"),
         Err(_) => "owner unreachable (timed out)".into(),
     };
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.queue_join(&req.link) {
-        Ok(id) => {
-            s.record_join_attempt(id, &err).ok();
-            Json(json!({"queued": true, "pending_join": id, "last_error": err}))
+    with_store(&st.store, move |s| {
+        match s.queue_join(&req.link) {
+            Ok(id) => {
+                s.record_join_attempt(id, &err).ok();
+                Json(json!({"queued": true, "pending_join": id, "last_error": err}))
+            }
+            Err(e) => Json(json!({"error": e.to_string()})),
         }
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -794,14 +779,13 @@ async fn list_proposals(State(st): State<FedState>) -> Json<Value> {
     if let Some(endpoint) = &st.ctx.endpoint {
         crate::fed::refresh_outbound(endpoint, &st.store).await;
     }
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.list_outbound_proposals(false) {
-        Ok(p) => Json(json!(p)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.list_outbound_proposals(false) {
+            Ok(p) => Json(json!(p)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -847,14 +831,13 @@ async fn pull_now(State(st): State<FedState>) -> Json<Value> {
 }
 
 async fn list_joins(State(st): State<FedState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.list_pending_joins() {
-        Ok(j) => Json(json!(j)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.list_pending_joins() {
+            Ok(j) => Json(json!(j)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -869,7 +852,7 @@ pub struct OfferShare {
 /// If they cannot be reached the invite still exists: the reply carries the
 /// link so the owner can send it by hand (`delivered: false`).
 async fn offer_share(State(st): State<FedState>, Json(req): Json<OfferShare>) -> Json<Value> {
-    let (Some(node_id), Some(endpoint)) = (&st.ctx.node_id, &st.ctx.endpoint) else {
+    let (Some(node_id), Some(endpoint)) = (st.ctx.node_id.clone(), &st.ctx.endpoint) else {
         return Json(json!({"error": "sharing is off: this Grimoire has no identity yet"}));
     };
     let permission = match req.permission.as_deref() {
@@ -879,29 +862,33 @@ async fn offer_share(State(st): State<FedState>, Json(req): Json<OfferShare>) ->
             None => return Json(json!({"error": format!("bad permission: {p}")})),
         },
     };
-    let (share, minted, contact, root_title) = {
-        let mut s = st
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(contact) = s
-            .list_contacts()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|c| c.id == req.contact_id && !c.revoked)
-        else {
-            return Json(json!({"error": "that contact is not available (removed or blocked)"}));
-        };
-        let root_title = s.get_doc(req.root_doc).map(|d| d.title).unwrap_or_default();
-        match crate::fed::mint_invite_full(&mut s, node_id, req.root_doc, permission) {
-            Ok((share, minted)) => {
-                if let Err(e) = s.set_invite_offered_to(share.id, contact.id) {
-                    return Json(json!({"error": e.to_string()}));
+    let minted = {
+        let (contact_id, root_doc) = (req.contact_id, req.root_doc);
+        with_store(&st.store, move |s| {
+            let Some(contact) = s
+                .list_contacts()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|c| c.id == contact_id && !c.revoked)
+            else {
+                return Err(Json(json!({"error": "that contact is not available (removed or blocked)"})));
+            };
+            let root_title = s.get_doc(root_doc).map(|d| d.title).unwrap_or_default();
+            match crate::fed::mint_invite_full(s, &node_id, root_doc, permission) {
+                Ok((share, minted)) => {
+                    if let Err(e) = s.set_invite_offered_to(share.id, contact.id) {
+                        return Err(Json(json!({"error": e.to_string()})));
+                    }
+                    Ok((share, minted, contact, root_title))
                 }
-                (share, minted, contact, root_title)
+                Err(e) => Err(Json(json!({"error": format!("{e:#}")}))),
             }
-            Err(e) => return Json(json!({"error": format!("{e:#}")})),
-        }
+        })
+        .await
+    };
+    let (share, minted, contact, root_title) = match minted {
+        Ok(v) => v,
+        Err(r) => return r,
     };
     let delivered = tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -920,26 +907,25 @@ async fn offer_share(State(st): State<FedState>, Json(req): Json<OfferShare>) ->
 
 /// Recipient side: open share offers, with who they are from.
 async fn list_offers(State(st): State<FedState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let contacts = s.list_contacts().unwrap_or_default();
-    match s.list_share_offers(true) {
-        Ok(offers) => Json(json!(offers
-            .into_iter()
-            .map(|o| {
-                let c = contacts.iter().find(|c| c.id == o.from_contact);
-                let mut v = json!(o);
-                v["from_petname"] = json!(c.map(|c| c.petname.clone()).unwrap_or_else(|| "someone".into()));
-                v["from_pubkey"] = json!(c.map(|c| c.pubkey.clone()).unwrap_or_default());
-                // the secret never leaves the daemon
-                v.as_object_mut().map(|m| m.remove("secret"));
-                v
-            })
-            .collect::<Vec<_>>())),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        let contacts = s.list_contacts().unwrap_or_default();
+        match s.list_share_offers(true) {
+            Ok(offers) => Json(json!(offers
+                .into_iter()
+                .map(|o| {
+                    let c = contacts.iter().find(|c| c.id == o.from_contact);
+                    let mut v = json!(o);
+                    v["from_petname"] = json!(c.map(|c| c.petname.clone()).unwrap_or_else(|| "someone".into()));
+                    v["from_pubkey"] = json!(c.map(|c| c.pubkey.clone()).unwrap_or_default());
+                    // the secret never leaves the daemon
+                    v.as_object_mut().map(|m| m.remove("secret"));
+                    v
+                })
+                .collect::<Vec<_>>())),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// Accept an offer: redeem it exactly like a pasted link, then pull the tree.
@@ -947,15 +933,9 @@ async fn accept_offer(State(st): State<FedState>, Json(req): Json<IdReq>) -> Jso
     let Some(endpoint) = &st.ctx.endpoint else {
         return Json(json!({"error": "sharing is off: this Grimoire has no identity yet"}));
     };
-    let offer = {
-        let s = st
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match s.get_share_offer(req.id) {
-            Ok(o) => o,
-            Err(e) => return Json(json!({"error": e.to_string()})),
-        }
+    let offer = match with_store(&st.store, move |s| s.get_share_offer(req.id)).await {
+        Ok(o) => o,
+        Err(e) => return Json(json!({"error": e.to_string()})),
     };
     if offer.state != grimoire_store::ShareOfferState::Open {
         return Json(json!({"error": format!("this request is already {}", offer.state.as_str())}));
@@ -969,11 +949,10 @@ async fn accept_offer(State(st): State<FedState>, Json(req): Json<IdReq>) -> Jso
     match attempt {
         Ok(Ok(outcome)) => {
             {
-                let mut s = st
-                    .store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                s.set_share_offer_state(offer.id, grimoire_store::ShareOfferState::Accepted).ok();
+                with_store(&st.store, move |s| {
+                    s.set_share_offer_state(offer.id, grimoire_store::ShareOfferState::Accepted).ok();
+                })
+                .await
             }
             let pulled = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
@@ -990,11 +969,10 @@ async fn accept_offer(State(st): State<FedState>, Json(req): Json<IdReq>) -> Jso
             // a dead invite (expired/burned) closes the offer; unreachable keeps it open
             let msg = format!("{e:#}");
             if crate::fed::loops::join_failure_is_dead(&e) {
-                let mut s = st
-                    .store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                s.set_share_offer_state(offer.id, grimoire_store::ShareOfferState::Expired).ok();
+                with_store(&st.store, move |s| {
+                    s.set_share_offer_state(offer.id, grimoire_store::ShareOfferState::Expired).ok();
+                })
+                .await
             }
             Json(json!({"error": msg}))
         }
@@ -1003,25 +981,23 @@ async fn accept_offer(State(st): State<FedState>, Json(req): Json<IdReq>) -> Jso
 }
 
 async fn decline_offer(State(st): State<FedState>, Json(req): Json<IdReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.set_share_offer_state(req.id, grimoire_store::ShareOfferState::Declined) {
-        Ok(()) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.set_share_offer_state(req.id, grimoire_store::ShareOfferState::Declined) {
+            Ok(()) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 async fn clear_offers(State(st): State<FedState>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.clear_share_offers() {
-        Ok(n) => Json(json!({"ok": true, "cleared": n})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.clear_share_offers() {
+            Ok(n) => Json(json!({"ok": true, "cleared": n})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// Grimoires visible on this LAN right now (mDNS). Presence only — each is
@@ -1029,11 +1005,10 @@ async fn clear_offers(State(st): State<FedState>) -> Json<Value> {
 async fn list_neighbours(State(st): State<FedState>) -> Json<Value> {
     let me = st.ctx.node_id.clone().unwrap_or_default();
     let contacts = {
-        let s = st
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        s.list_contacts().unwrap_or_default()
+        with_store(&st.store, move |s| {
+            s.list_contacts().unwrap_or_default()
+        })
+        .await
     };
     let rows: Vec<Value> = st
         .runtime
@@ -1060,73 +1035,72 @@ async fn list_neighbours(State(st): State<FedState>) -> Json<Value> {
 /// my standing there (as last told by the hub), the hub folder if I hold it,
 /// and the subtrees I have published (my `propose` shares to the hub).
 async fn list_hubs(State(st): State<FedState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let contacts = s.list_contacts().unwrap_or_default();
-    let shares = s.list_shares().unwrap_or_default();
-    let mirrors = s.list_mirrors().unwrap_or_default();
-    let transfers = s.list_doc_transfers().unwrap_or_default();
-    let rows: Vec<Value> = contacts
-        .iter()
-        .filter(|c| c.is_hub && !c.revoked)
-        .map(|c| {
-            let ids: std::collections::HashSet<Uuid> =
-                mirrors.iter().filter(|m| m.owner == c.id).map(|m| m.doc_id).collect();
-            let root = mirrors
-                .iter()
-                .filter(|m| m.owner == c.id)
-                .filter_map(|m| s.get_doc(m.doc_id).ok())
-                .find(|d| d.parent_id.map(|p| !ids.contains(&p)).unwrap_or(true));
-            // slice 2: folders I handed over (done) or offered (waiting for an admin)
-            let mine_out: Vec<&grimoire_store::DocTransfer> = transfers
-                .iter()
-                .filter(|t| t.counterparty == c.id && t.direction == grimoire_store::TransferDirection::Out)
-                .collect();
-            let transferred: std::collections::HashSet<Uuid> =
-                mine_out.iter().filter(|t| t.state == "done").map(|t| t.root_doc).collect();
-            let transfers_json: Vec<Value> = mine_out
-                .iter()
-                .map(|t| {
-                    json!({
-                        "id": t.id,
-                        "root_doc": t.root_doc,
-                        "root_title": s.get_doc(t.root_doc).map(|d| d.title).unwrap_or_default(),
-                        "state": t.state,
-                        "at": t.at,
+    with_store(&st.store, move |s| {
+        let contacts = s.list_contacts().unwrap_or_default();
+        let shares = s.list_shares().unwrap_or_default();
+        let mirrors = s.list_mirrors().unwrap_or_default();
+        let transfers = s.list_doc_transfers().unwrap_or_default();
+        let rows: Vec<Value> = contacts
+            .iter()
+            .filter(|c| c.is_hub && !c.revoked)
+            .map(|c| {
+                let ids: std::collections::HashSet<Uuid> =
+                    mirrors.iter().filter(|m| m.owner == c.id).map(|m| m.doc_id).collect();
+                let root = mirrors
+                    .iter()
+                    .filter(|m| m.owner == c.id)
+                    .filter_map(|m| s.get_doc(m.doc_id).ok())
+                    .find(|d| d.parent_id.map(|p| !ids.contains(&p)).unwrap_or(true));
+                // slice 2: folders I handed over (done) or offered (waiting for an admin)
+                let mine_out: Vec<&grimoire_store::DocTransfer> = transfers
+                    .iter()
+                    .filter(|t| t.counterparty == c.id && t.direction == grimoire_store::TransferDirection::Out)
+                    .collect();
+                let transferred: std::collections::HashSet<Uuid> =
+                    mine_out.iter().filter(|t| t.state == "done").map(|t| t.root_doc).collect();
+                let transfers_json: Vec<Value> = mine_out
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "id": t.id,
+                            "root_doc": t.root_doc,
+                            "root_title": s.get_doc(t.root_doc).map(|d| d.title).unwrap_or_default(),
+                            "state": t.state,
+                            "at": t.at,
+                        })
                     })
-                })
-                .collect();
-            let publications: Vec<Value> = shares
-                .iter()
-                .filter(|sh| sh.contact == Some(c.id) && sh.state != grimoire_store::ShareState::Revoked)
-                // a transferred folder's share is the pipe the hub pulled through, not a publication
-                .filter(|sh| !transferred.contains(&sh.root_doc))
-                .map(|sh| {
-                    json!({
-                        "share_id": sh.id,
-                        "root_doc": sh.root_doc,
-                        "root_title": s.get_doc(sh.root_doc).map(|d| d.title).unwrap_or_default(),
-                        "doc_count": s.docs_in_share(sh.id).map(|d| d.len()).unwrap_or(0),
-                        "state": sh.state,
+                    .collect();
+                let publications: Vec<Value> = shares
+                    .iter()
+                    .filter(|sh| sh.contact == Some(c.id) && sh.state != grimoire_store::ShareState::Revoked)
+                    // a transferred folder's share is the pipe the hub pulled through, not a publication
+                    .filter(|sh| !transferred.contains(&sh.root_doc))
+                    .map(|sh| {
+                        json!({
+                            "share_id": sh.id,
+                            "root_doc": sh.root_doc,
+                            "root_title": s.get_doc(sh.root_doc).map(|d| d.title).unwrap_or_default(),
+                            "doc_count": s.docs_in_share(sh.id).map(|d| d.len()).unwrap_or(0),
+                            "state": sh.state,
+                        })
                     })
+                    .collect();
+                json!({
+                    "contact_id": c.id,
+                    "name": c.petname,
+                    "pubkey": c.pubkey,
+                    "role": c.role,
+                    "membership": c.membership,
+                    "root_doc_id": root.as_ref().map(|d| d.id),
+                    "relayed_docs": mirrors.iter().filter(|m| m.owner == c.id && m.origin_owner.is_some()).count(),
+                    "publications": publications,
+                    "transfers": transfers_json,
                 })
-                .collect();
-            json!({
-                "contact_id": c.id,
-                "name": c.petname,
-                "pubkey": c.pubkey,
-                "role": c.role,
-                "membership": c.membership,
-                "root_doc_id": root.as_ref().map(|d| d.id),
-                "relayed_docs": mirrors.iter().filter(|m| m.owner == c.id && m.origin_owner.is_some()).count(),
-                "publications": publications,
-                "transfers": transfers_json,
             })
-        })
-        .collect();
-    Json(json!(rows))
+            .collect();
+        Json(json!(rows))
+    })
+    .await
 }
 
 /// Dial a hub I belong to with one request (15s cap).
@@ -1136,17 +1110,14 @@ async fn dial_hub(st: &FedState, hub: Uuid, req: crate::fed::wire::Request) -> R
         .endpoint
         .as_ref()
         .ok_or_else(|| "sharing is off: this Grimoire has no identity yet".to_string())?;
-    let contact = {
-        let s = st
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let contact = with_store(&st.store, move |s| {
         s.list_contacts()
             .unwrap_or_default()
             .into_iter()
             .find(|c| c.id == hub && c.is_hub && !c.revoked)
-            .ok_or_else(|| "that hub is not one of your contacts".to_string())?
-    };
+            .ok_or_else(|| "that hub is not one of your contacts".to_string())
+    })
+    .await?;
     let id: iroh::EndpointId = contact.pubkey.parse().map_err(|_| "hub pubkey malformed".to_string())?;
     match tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -1173,17 +1144,16 @@ async fn hub_members(State(st): State<FedState>, Query(q): Query<HubQuery>) -> J
     use crate::fed::wire::{HubAction, Request, Response};
     let status = match dial_hub(&st, q.hub, Request::HubStatus).await {
         Ok(Response::HubStatusIs { name, role, membership, members, pending }) => {
-            let mut s = st
-                .store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(r) = grimoire_store::ContactRole::parse(&role) {
-                s.set_contact_role(q.hub, r).ok();
-            }
-            if let Some(m) = grimoire_store::Membership::parse(&membership) {
-                s.set_contact_membership(q.hub, m).ok();
-            }
-            json!({"name": name, "role": role, "membership": membership, "members": members, "pending": pending})
+            with_store(&st.store, move |s| {
+                if let Some(r) = grimoire_store::ContactRole::parse(&role) {
+                    s.set_contact_role(q.hub, r).ok();
+                }
+                if let Some(m) = grimoire_store::Membership::parse(&membership) {
+                    s.set_contact_membership(q.hub, m).ok();
+                }
+                json!({"name": name, "role": role, "membership": membership, "members": members, "pending": pending})
+            })
+            .await
         }
         Ok(Response::Refused { reason, .. }) => return Json(json!({"error": reason})),
         Ok(other) => return Json(json!({"error": format!("unexpected reply: {other:?}")})),
@@ -1312,33 +1282,37 @@ pub struct TransferOfferReq {
 /// until then — this only records the offer on both sides.
 async fn offer_transfer(State(st): State<FedState>, Json(req): Json<TransferOfferReq>) -> Json<Value> {
     use crate::fed::wire::{Request, Response};
-    let (title, doc_count) = {
-        let s = st
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Ok(doc) = s.get_doc(req.root_doc) else {
-            return Json(json!({"error": "no such doc"}));
-        };
-        if s.doc_is_tombstoned(req.root_doc).unwrap_or(true) {
-            return Json(json!({"error": "that folder is in the trash"}));
-        }
-        let subtree = s.doc_subtree_ids(req.root_doc).unwrap_or_default();
-        for id in &subtree {
-            if s.get_mirror(*id).ok().flatten().is_some() {
-                let t = s.get_doc(*id).map(|d| d.title).unwrap_or_default();
-                return Json(json!({"error": format!("“{t}” was shared to you — only its owner can transfer it")}));
+    let checked = {
+        let (root_doc, hub) = (req.root_doc, req.hub);
+        with_store(&st.store, move |s| {
+            let Ok(doc) = s.get_doc(root_doc) else {
+                return Err(Json(json!({"error": "no such doc"})));
+            };
+            if s.doc_is_tombstoned(root_doc).unwrap_or(true) {
+                return Err(Json(json!({"error": "that folder is in the trash"})));
             }
-        }
-        if !s
-            .list_contacts()
-            .unwrap_or_default()
-            .iter()
-            .any(|c| c.id == req.hub && c.is_hub && !c.revoked && c.membership == grimoire_store::Membership::Active)
-        {
-            return Json(json!({"error": "you are not an active member of that hub"}));
-        }
-        (doc.title, subtree.len())
+            let subtree = s.doc_subtree_ids(root_doc).unwrap_or_default();
+            for id in &subtree {
+                if s.get_mirror(*id).ok().flatten().is_some() {
+                    let t = s.get_doc(*id).map(|d| d.title).unwrap_or_default();
+                    return Err(Json(json!({"error": format!("“{t}” was shared to you — only its owner can transfer it")})));
+                }
+            }
+            if !s
+                .list_contacts()
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c.id == hub && c.is_hub && !c.revoked && c.membership == grimoire_store::Membership::Active)
+            {
+                return Err(Json(json!({"error": "you are not an active member of that hub"})));
+            }
+            Ok((doc.title, subtree.len()))
+        })
+        .await
+    };
+    let (title, doc_count) = match checked {
+        Ok(v) => v,
+        Err(r) => return r,
     };
     match dial_hub(
         &st,
@@ -1352,11 +1326,12 @@ async fn offer_transfer(State(st): State<FedState>, Json(req): Json<TransferOffe
     .await
     {
         Ok(Response::TransferOffered { id }) => {
-            let mut s = st
-                .store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Err(e) = s.add_doc_transfer(req.root_doc, req.hub, grimoire_store::TransferDirection::Out, "offered") {
+            let (root_doc, hub) = (req.root_doc, req.hub);
+            if let Err(e) = with_store(&st.store, move |s| {
+                s.add_doc_transfer(root_doc, hub, grimoire_store::TransferDirection::Out, "offered")
+            })
+            .await
+            {
                 return Json(json!({"error": e.to_string()}));
             }
             Json(json!({"ok": true, "id": id, "title": title, "doc_count": doc_count}))
@@ -1370,14 +1345,13 @@ async fn offer_transfer(State(st): State<FedState>, Json(req): Json<TransferOffe
 // --- the hub box itself (slice 2): queue + transfers for the CLI ----------------
 
 async fn local_hub_transfers(State(st): State<FedState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if crate::fed::hub::config(&s).is_none() {
-        return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
-    }
-    Json(json!(crate::fed::hub::transfers(&s)))
+    with_store(&st.store, move |s| {
+        if crate::fed::hub::config(&s).is_none() {
+            return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
+        }
+        Json(json!(crate::fed::hub::transfers(&s)))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1390,21 +1364,25 @@ async fn local_hub_transfer_accept(State(st): State<FedState>, Json(req): Json<L
         return Json(json!({"error": "sharing is off: this Grimoire has no identity yet"}));
     };
     {
-        let mut s = st
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if crate::fed::hub::config(&s).is_none() {
-            return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
-        }
-        match s.get_hub_transfer(req.id) {
-            Ok(t) if t.state == grimoire_store::HubTransferState::Done => return Json(json!({"ok": true, "state": "done"})),
-            Ok(t) if t.state == grimoire_store::HubTransferState::Declined => return Json(json!({"error": "that transfer was declined"})),
-            Ok(_) => {}
-            Err(e) => return Json(json!({"error": e.to_string()})),
-        }
-        if let Err(e) = s.set_hub_transfer_state(req.id, grimoire_store::HubTransferState::Accepted) {
-            return Json(json!({"error": e.to_string()}));
+        let id = req.id;
+        let early = with_store(&st.store, move |s| -> Result<(), Json<Value>> {
+            if crate::fed::hub::config(s).is_none() {
+                return Err(Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"})));
+            }
+            match s.get_hub_transfer(id) {
+                Ok(t) if t.state == grimoire_store::HubTransferState::Done => return Err(Json(json!({"ok": true, "state": "done"}))),
+                Ok(t) if t.state == grimoire_store::HubTransferState::Declined => return Err(Json(json!({"error": "that transfer was declined"}))),
+                Ok(_) => {}
+                Err(e) => return Err(Json(json!({"error": e.to_string()}))),
+            }
+            if let Err(e) = s.set_hub_transfer_state(id, grimoire_store::HubTransferState::Accepted) {
+                return Err(Json(json!({"error": e.to_string()})));
+            }
+            Ok(())
+        })
+        .await;
+        if let Err(r) = early {
+            return r;
         }
     }
     // synchronous here (the CLI waits): dial the member, pull, take over
@@ -1415,37 +1393,35 @@ async fn local_hub_transfer_accept(State(st): State<FedState>, Json(req): Json<L
 }
 
 async fn local_hub_transfer_decline(State(st): State<FedState>, Json(req): Json<LocalTransferReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if crate::fed::hub::config(&s).is_none() {
-        return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
-    }
-    match s.get_hub_transfer(req.id) {
-        Ok(t) if t.state == grimoire_store::HubTransferState::Done => Json(json!({"error": "that folder is already the hub's"})),
-        Ok(_) => match s.set_hub_transfer_state(req.id, grimoire_store::HubTransferState::Declined) {
-            Ok(()) => Json(json!({"ok": true})),
+    with_store(&st.store, move |s| {
+        if crate::fed::hub::config(&s).is_none() {
+            return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
+        }
+        match s.get_hub_transfer(req.id) {
+            Ok(t) if t.state == grimoire_store::HubTransferState::Done => Json(json!({"error": "that folder is already the hub's"})),
+            Ok(_) => match s.set_hub_transfer_state(req.id, grimoire_store::HubTransferState::Declined) {
+                Ok(()) => Json(json!({"ok": true})),
+                Err(e) => Json(json!({"error": e.to_string()})),
+            },
             Err(e) => Json(json!({"error": e.to_string()})),
-        },
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+        }
+    })
+    .await
 }
 
 // --- the hub box itself: local routes for the CLI over an SSH tunnel -------
 
 async fn local_hub_members(State(st): State<FedState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if crate::fed::hub::config(&s).is_none() {
-        return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
-    }
-    match crate::fed::hub::members(&s) {
-        Ok(m) => Json(json!(m)),
-        Err(e) => Json(json!({"error": format!("{e:#}")})),
-    }
+    with_store(&st.store, move |s| {
+        if crate::fed::hub::config(&s).is_none() {
+            return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
+        }
+        match crate::fed::hub::members(&s) {
+            Ok(m) => Json(json!(m)),
+            Err(e) => Json(json!({"error": format!("{e:#}")})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1455,15 +1431,14 @@ pub struct ContactIdReq {
 }
 
 async fn local_hub_approve(State(st): State<FedState>, Json(req): Json<ContactIdReq>) -> Json<Value> {
-    let (Some(node_id), Some(endpoint)) = (&st.ctx.node_id, &st.ctx.endpoint) else {
+    let (Some(node_id), Some(endpoint)) = (st.ctx.node_id.clone(), &st.ctx.endpoint) else {
         return Json(json!({"error": "sharing is off: this Grimoire has no identity yet"}));
     };
     let minted = {
-        let mut s = st
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::fed::hub::approve(&mut s, node_id, req.contact_id)
+        with_store(&st.store, move |s| {
+            crate::fed::hub::approve(s, &node_id, req.contact_id)
+        })
+        .await
     };
     match minted {
         Ok((hub, member, share, minted)) => {
@@ -1474,20 +1449,16 @@ async fn local_hub_approve(State(st): State<FedState>, Json(req): Json<ContactId
 }
 
 async fn local_hub_eject(State(st): State<FedState>, Json(req): Json<ContactIdReq>) -> Json<Value> {
-    let pubkey;
-    let res = {
-        let mut s = st
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pubkey = s
+    let (pubkey, res) = with_store(&st.store, move |s| {
+        let pubkey = s
             .list_contacts()
             .unwrap_or_default()
             .into_iter()
             .find(|c| c.id == req.contact_id)
             .map(|c| c.pubkey);
-        crate::fed::hub::eject(&mut s, req.contact_id)
-    };
+        (pubkey, crate::fed::hub::eject(s, req.contact_id))
+    })
+    .await;
     match res {
         Ok(dropped) => {
             let cut = pubkey.map(|pk| st.hot.drop_bridges_for_peer(&pk)).unwrap_or(0);
@@ -1501,33 +1472,31 @@ async fn local_hub_role(State(st): State<FedState>, Json(req): Json<ContactIdReq
     let Some(role) = req.role.as_deref().and_then(grimoire_store::ContactRole::parse) else {
         return Json(json!({"error": "role must be member or admin"}));
     };
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match crate::fed::hub::set_role(&mut s, req.contact_id, role) {
-        Ok(()) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": format!("{e:#}")})),
-    }
+    with_store(&st.store, move |s| {
+        match crate::fed::hub::set_role(s, req.contact_id, role) {
+            Ok(()) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": format!("{e:#}")})),
+        }
+    })
+    .await
 }
 
 /// Mint a one-time `propose` invite for the hub root (how the first admin,
 /// and anyone onboarding from the box, gets a link).
 async fn local_hub_invite(State(st): State<FedState>) -> Json<Value> {
-    let Some(node_id) = &st.ctx.node_id else {
+    let Some(node_id) = st.ctx.node_id.clone() else {
         return Json(json!({"error": "sharing is off: this Grimoire has no identity yet"}));
     };
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(hub) = crate::fed::hub::config(&s) else {
-        return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
-    };
-    match crate::fed::mint_invite(&mut s, node_id, hub.root_doc, grimoire_store::SharePermission::Propose) {
-        Ok((share, link)) => Json(json!({"share": share, "link": link, "hub": hub.name})),
-        Err(e) => Json(json!({"error": format!("{e:#}")})),
-    }
+    with_store(&st.store, move |s| {
+        let Some(hub) = crate::fed::hub::config(s) else {
+            return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
+        };
+        match crate::fed::mint_invite(s, &node_id, hub.root_doc, grimoire_store::SharePermission::Propose) {
+            Ok((share, link)) => Json(json!({"share": share, "link": link, "hub": hub.name})),
+            Err(e) => Json(json!({"error": format!("{e:#}")})),
+        }
+    })
+    .await
 }
 
 pub fn router(
@@ -1767,10 +1736,10 @@ pub async fn daily_loop(store: Store, hot: crate::hot::HotState) {
         tokio::time::sleep(wait).await;
 
         let gardeners = {
-            let s = store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.list_gardeners().unwrap_or_default()
+            with_store(&store, move |s| {
+                s.list_gardeners().unwrap_or_default()
+            })
+            .await
         };
         // manual-cadence tendings only run via run-now; the daily cut skips them
         for g in gardeners
