@@ -181,20 +181,6 @@ fn under_answers(store: &SqliteStore, doc_id: Uuid, answers: Option<Uuid>) -> bo
     false
 }
 
-/// Reciprocal rank fusion over ranked lists (k = 60, the textbook value).
-pub fn rrf(lists: &[Vec<SearchHit>]) -> Vec<SearchHit> {
-    let mut score: HashMap<Uuid, (f32, SearchHit)> = HashMap::new();
-    for list in lists {
-        for (rank, h) in list.iter().enumerate() {
-            let e = score.entry(h.block.id).or_insert((0.0, h.clone()));
-            e.0 += 1.0 / (60.0 + rank as f32 + 1.0);
-        }
-    }
-    let mut out: Vec<(f32, SearchHit)> = score.into_values().collect();
-    out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    out.into_iter().map(|(_, h)| h).collect()
-}
-
 fn budget(ranked: Vec<SearchHit>) -> Vec<SearchHit> {
     let mut out = Vec::new();
     let mut chars = 0usize;
@@ -459,22 +445,6 @@ mod tests {
         for h in &hits {
             assert!(md.contains(&format!("[[{}#^{}]]", h.doc_title, h.block.id)));
         }
-    }
-
-    #[test]
-    fn rrf_puts_blocks_high_in_both_lists_first() {
-        let mut s = SqliteStore::open_in_memory().unwrap();
-        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
-        import_markdown(&mut s, "D", None, tom.id, "alpha\n\nbravo\n\ncharlie\n").unwrap();
-        let all = retrieve(&s, None, "alpha bravo charlie");
-        assert_eq!(all.len(), 3);
-        // present in both lists beats top of one list: the dense leg says
-        // [bravo, alpha], the keyword leg says [bravo, charlie]
-        let a = vec![all[1].clone(), all[0].clone()];
-        let b = vec![all[1].clone(), all[2].clone()];
-        let fused = rrf(&[a, b]);
-        assert_eq!(fused[0].block.id, all[1].block.id);
-        assert_eq!(fused.len(), 3);
     }
 
     #[test]
