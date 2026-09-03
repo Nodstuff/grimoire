@@ -56,6 +56,20 @@ export interface HubRow {
   relayed_docs: number
   /** my subtrees published to this hub (propose shares to the hub contact) */
   publications: { share_id: string; root_doc: string; root_title: string; doc_count: number; state: string }[]
+  /** hub (slice 2): folders I offered to hand over ("offered") or already did ("done") */
+  transfers?: { id: string; root_doc: string; root_title: string; state: 'offered' | 'done'; at: string }[]
+}
+
+/** Hub (slice 2): one transfer offer as the hub reports it (GET /admin/hubs/transfers, admins only). */
+export interface HubTransfer {
+  id: string
+  member_contact: string
+  member: string
+  root_doc: string
+  title: string
+  doc_count: number
+  state: 'offered' | 'accepted' | 'declined' | 'done'
+  at: string
 }
 
 /** One row of a hub's member list (GET /admin/hubs/members, admins only). */
@@ -195,9 +209,11 @@ export interface DocFederation {
     owner_tended?: boolean
     /** hub (slice 1): the share comes from a hub */
     from_hub?: boolean
-    /** hub: relayed doc — its true owner (pubkey + name); read-only in this slice */
+    /** hub: relayed doc — its true owner (pubkey + name); edits reach them through the hub */
     origin_owner?: string | null
     origin_owner_name?: string | null
+    /** hub (slice 2): I handed this doc (or its folder) to the owner; my copy follows theirs */
+    transferred_from_me?: boolean
   } | null
   shares: {
     id: string

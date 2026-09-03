@@ -886,6 +886,9 @@ kbd {
 .hub-invite { margin-top: 6px; }
 .share-hubs { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
 .share-hubs .share-row { display: flex; align-items: center; gap: 8px; }
+.share-transfer { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.hub-queue-item { flex-wrap: wrap; }
+.hub-queue-item .meta { flex-basis: 100%; }
 .chip.shared { color: var(--green); border-color: var(--green); }
 
 .propose-cta {

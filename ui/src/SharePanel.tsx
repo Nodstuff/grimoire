@@ -4,7 +4,7 @@
 
 import { useEffect, useState } from 'react'
 import QRCode from 'qrcode'
-import { api, Contact, Doc, DocFederation, Share, ShareTrust } from './types'
+import { api, Contact, Doc, DocFederation, HubRow, Share, ShareTrust } from './types'
 import { errText, notify } from './Notice'
 import { TRUST_TIERS, trustHint } from './trust'
 import { shortFingerprint } from './shares'
@@ -188,6 +188,46 @@ export default function SharePanel({
   }
   const publishedTo = (hub: Contact) =>
     fed.shares.find((s) => s.to_hub && s.state !== 'revoked' && s.petname === hub.petname)
+  // hub (slice 2): hand the folder over. Armed confirm (two clicks), never window.confirm.
+  const [hubRows, setHubRows] = useState<HubRow[]>([])
+  const [transferArmed, setTransferArmed] = useState<string | null>(null)
+  const [transferring, setTransferring] = useState<string | null>(null)
+  useEffect(() => {
+    if (hubs.length === 0) return
+    api<HubRow[]>('/admin/hubs')
+      .then((rows) => setHubRows(Array.isArray(rows) ? rows : []))
+      .catch(() => setHubRows([]))
+  }, [hubs.length])
+  const transferOffered = (hub: Contact) =>
+    hubRows
+      .find((r) => r.contact_id === hub.id)
+      ?.transfers?.find((t) => t.root_doc === doc.id && t.state === 'offered')
+  const transfer = async (hub: Contact) => {
+    if (transferring) return
+    if (transferArmed !== hub.id) {
+      setTransferArmed(hub.id)
+      setTimeout(() => setTransferArmed((a) => (a === hub.id ? null : a)), 6000)
+      return
+    }
+    setTransferArmed(null)
+    setTransferring(hub.id)
+    setError(null)
+    try {
+      const r = await api<{ doc_count: number }>('/admin/hubs/transfer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hub: hub.id, root_doc: doc.id }),
+      })
+      notify(`offered “${doc.title}” (${r.doc_count} doc${r.doc_count === 1 ? '' : 's'}) to ${hub.petname} — an admin has to accept before anything changes`, 'ok')
+      const rows = await api<HubRow[]>('/admin/hubs').catch(() => [] as HubRow[])
+      setHubRows(Array.isArray(rows) ? rows : [])
+      onChanged()
+    } catch (e) {
+      setError(errText(e))
+    } finally {
+      setTransferring(null)
+    }
+  }
 
   return (
     <aside className="panel">
@@ -260,6 +300,35 @@ export default function SharePanel({
             )
           })}
           <div className="meta">publishing puts “{doc.title}” and everything under it in the team folder every member sees; you stay the owner</div>
+          {hubs.map((h) => {
+            const offered = transferOffered(h)
+            return (
+              <div key={`t-${h.id}`} className="share-transfer">
+                {offered ? (
+                  <div className="meta">transfer to {h.petname} offered — waiting for an admin to accept</div>
+                ) : (
+                  <button
+                    className={`decline ${transferArmed === h.id ? 'armed' : ''}`}
+                    disabled={!!transferring}
+                    title={`${h.petname} will own this folder. You keep a read-only copy and can propose edits like anyone.`}
+                    onClick={() => transfer(h)}
+                  >
+                    {transferring === h.id
+                      ? 'offering…'
+                      : transferArmed === h.id
+                        ? `yes, hand “${doc.title}” to ${h.petname}`
+                        : `Transfer to ${h.petname}…`}
+                  </button>
+                )}
+                {transferArmed === h.id && (
+                  <div className="meta">
+                    {h.petname} will own this folder. You keep a read-only copy and can propose edits like anyone.
+                    Everything inside must be idle: no live sessions, nothing waiting for review.
+                  </div>
+                )}
+              </div>
+            )
+          })}
         </div>
       )}
 
