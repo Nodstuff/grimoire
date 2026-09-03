@@ -234,6 +234,19 @@ pub async fn hot_start_upstream(
     }
 }
 
+/// The first pull right after a join: the root placeholder exists, the tree
+/// doesn't yet. Without this the grantee stares at one empty doc until the
+/// 120s sweep and concludes "that's all I got" (a colleague did exactly
+/// that). Returns the summary; errors are the caller's to report.
+pub async fn pull_after_join(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    root_doc: &str,
+) -> Result<PullSummary> {
+    let root: uuid::Uuid = root_doc.parse().context("join returned a bad root id")?;
+    pull_owner_of(endpoint, store, root).await
+}
+
 /// Pull one share from a mirror doc's owner right now (the "my copy is
 /// behind" recovery path: hot start refused stale, nudge received).
 pub async fn pull_owner_of(

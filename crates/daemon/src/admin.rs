@@ -686,7 +686,22 @@ async fn join(State(st): State<FedState>, Json(req): Json<JoinReq>) -> Json<Valu
     )
     .await;
     let err = match attempt {
-        Ok(Ok(outcome)) => return Json(json!({"joined": outcome})),
+        Ok(Ok(outcome)) => {
+            // fetch the tree NOW so the reply can say "45 docs", not "1 placeholder"
+            let pulled = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                crate::fed::pull_after_join(endpoint, &st.store, &outcome.root_doc),
+            )
+            .await;
+            return match pulled {
+                Ok(Ok(sum)) => Json(json!({"joined": outcome, "docs": sum.changed})),
+                Ok(Err(e)) => {
+                    tracing::warn!(root = outcome.root_doc, "first pull after join failed: {e:#}");
+                    Json(json!({"joined": outcome, "pull_error": format!("{e:#}")}))
+                }
+                Err(_) => Json(json!({"joined": outcome, "pull_error": "the first sync is taking a while; it continues in the background"})),
+            };
+        }
         Ok(Err(e)) => format!("{e:#}"),
         Err(_) => "owner unreachable (timed out)".into(),
     };

@@ -143,7 +143,12 @@ export default function Sharing({
     setBusy(true)
     setJoinMsg('connecting to owner…')
     try {
-      const r = await api<{ joined?: { root_title: string; owner_name: string; permission: string; root_doc: string }; queued?: boolean }>(
+      const r = await api<{
+        joined?: { root_title: string; owner_name: string; permission: string; root_doc: string }
+        docs?: number
+        pull_error?: string
+        queued?: boolean
+      }>(
         '/admin/join',
         {
           method: 'POST',
@@ -152,10 +157,15 @@ export default function Sharing({
         },
       )
       if (r.joined) {
-        setJoinMsg(`joined “${r.joined.root_title}” from ${r.joined.owner_name} (${r.joined.permission})`)
+        // the daemon pulls the tree before answering, so we can say how much arrived
+        const got =
+          typeof r.docs === 'number'
+            ? ` — ${r.docs} doc${r.docs === 1 ? '' : 's'} synced`
+            : r.pull_error
+              ? ` — first sync pending: ${refusalHint(r.pull_error) ?? r.pull_error}`
+              : ''
+        setJoinMsg(`joined “${r.joined.root_title}” from ${r.joined.owner_name} (${r.joined.permission})${got}`)
         setJoinLink('')
-        // pull the content right away so the doc isn't an empty shell
-        api('/admin/pull', { method: 'POST' }).catch(() => {})
       } else if (r.queued) {
         setJoinMsg('owner unreachable — queued, will keep retrying in the background')
         setJoinLink('')

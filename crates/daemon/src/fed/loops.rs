@@ -554,8 +554,14 @@ pub async fn join_retry_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>)
             match join_once(&endpoint, &store, &ticket).await {
                 Ok(out) => {
                     tracing::info!(root = out.root_doc, "queued join completed");
-                    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                    s.remove_pending_join(join.id).ok();
+                    {
+                        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                        s.remove_pending_join(join.id).ok();
+                    }
+                    match super::client::pull_after_join(&endpoint, &store, &out.root_doc).await {
+                        Ok(sum) => tracing::info!(root = out.root_doc, docs = sum.changed, "first pull after queued join"),
+                        Err(e) => tracing::warn!(root = out.root_doc, "first pull after queued join failed: {e:#}"),
+                    }
                 }
                 Err(e) => {
                     let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
