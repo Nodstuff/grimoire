@@ -12,6 +12,7 @@ mod fed;
 mod garden;
 mod hot;
 mod identity;
+mod local_guard;
 mod yrender;
 mod mcp;
 mod memory;
@@ -767,6 +768,9 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 Err(_) => app.fallback(serve_embedded_ui),
             };
+            // DNS-rebinding guard over EVERY surface (api, admin, mcp, ws, ui):
+            // a request whose Host/Origin is not a loopback name is refused
+            let app = app.layer(axum::middleware::from_fn(local_guard::require_loopback));
             tracing::info!("ksd serving MCP (streamable HTTP) at http://{addr}/mcp");
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
