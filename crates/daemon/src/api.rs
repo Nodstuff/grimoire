@@ -5,6 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use crate::store_ext::with_store;
 use grimoire_store::{BlockStore, DocStatus, OpInput, ReviewDecision, SqliteStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -53,11 +54,10 @@ fn resolve_principal(st: &ApiState, headers: &HeaderMap, s: &mut SqliteStore) ->
 /// (5s) pull tier for the focus window; owned docs are a harmless no-op.
 async fn focus_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
     let share = {
-        let s = st
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        s.get_mirror(id).ok().flatten().map(|m| m.share_id)
+        with_store(&st.store, move |s| {
+            s.get_mirror(id).ok().flatten().map(|m| m.share_id)
+        })
+        .await
     };
     if let Some(share) = share {
         st.runtime.focus_share(share);
@@ -90,236 +90,231 @@ fn refuse_if_mirror(s: &SqliteStore, id: Uuid, what: &str) -> Option<String> {
 }
 
 async fn docs(State(st): State<ApiState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let canvases: std::collections::HashSet<String> =
-        s.canvas_doc_ids().unwrap_or_default().into_iter().collect();
-    let tended: std::collections::HashSet<String> = s
-        .list_gardeners()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|g| g.enabled)
-        .filter_map(|g| g.scope_doc.map(|d| d.to_string()))
-        .collect();
-    // federation decorations: mirror docs ("shared with me") and the roots
-    // of active shares ("you are sharing this")
-    let mirror_rows = s.list_mirrors().unwrap_or_default();
-    let mirrors: std::collections::HashMap<String, String> = mirror_rows
-        .iter()
-        .map(|m| (m.doc_id.to_string(), m.permission.as_str().to_string()))
-        .collect();
-    // hub (slice 1): mirrors that come from a hub, relayed docs' true owners,
-    // and my subtrees published to a hub (every doc under a published root)
-    let contacts = s.list_contacts().unwrap_or_default();
-    let hub_contacts: std::collections::HashMap<Uuid, String> = contacts
-        .iter()
-        .filter(|c| c.is_hub && !c.revoked)
-        .map(|c| (c.id, c.petname.clone()))
-        .collect();
-    let from_hub: std::collections::HashSet<String> = mirror_rows
-        .iter()
-        .filter(|m| hub_contacts.contains_key(&m.owner))
-        .map(|m| m.doc_id.to_string())
-        .collect();
-    let origin_names: std::collections::HashMap<String, String> = mirror_rows
-        .iter()
-        .filter_map(|m| m.origin_owner_name.clone().map(|n| (m.doc_id.to_string(), n)))
-        .collect();
-    let all_shares = s.list_shares().unwrap_or_default();
-    let published_roots: std::collections::HashMap<Uuid, String> = all_shares
-        .iter()
-        .filter(|sh| sh.state == grimoire_store::ShareState::Active)
-        .filter_map(|sh| sh.contact.and_then(|c| hub_contacts.get(&c)).map(|n| (sh.root_doc, n.clone())))
-        .collect();
-    // mirrors tended on the owner's side: shown as tended locally, and the
-    // tend panel refuses to configure them (avoids two-sided agent edits)
-    let owner_tended: std::collections::HashSet<String> = mirror_rows
-        .iter()
-        .filter(|m| m.owner_tended)
-        .map(|m| m.doc_id.to_string())
-        .collect();
-    let share_roots: std::collections::HashSet<String> = all_shares
-        .iter()
-        .filter(|sh| sh.state != grimoire_store::ShareState::Revoked)
-        .map(|sh| sh.root_doc.to_string())
-        .collect();
-    match s.list_docs() {
-        Ok(d) => {
-            let parent_of: std::collections::HashMap<Uuid, Option<Uuid>> =
-                d.iter().map(|x| (x.id, x.parent_id)).collect();
-            // the hub a doc is published to: the nearest published ancestor (or itself)
-            let published_to = |mut cur: Uuid| -> Option<&String> {
-                if published_roots.is_empty() {
-                    return None;
-                }
-                loop {
-                    if let Some(n) = published_roots.get(&cur) {
-                        return Some(n);
+    with_store(&st.store, move |s| {
+        let canvases: std::collections::HashSet<String> =
+            s.canvas_doc_ids().unwrap_or_default().into_iter().collect();
+        let tended: std::collections::HashSet<String> = s
+            .list_gardeners()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|g| g.enabled)
+            .filter_map(|g| g.scope_doc.map(|d| d.to_string()))
+            .collect();
+        // federation decorations: mirror docs ("shared with me") and the roots
+        // of active shares ("you are sharing this")
+        let mirror_rows = s.list_mirrors().unwrap_or_default();
+        let mirrors: std::collections::HashMap<String, String> = mirror_rows
+            .iter()
+            .map(|m| (m.doc_id.to_string(), m.permission.as_str().to_string()))
+            .collect();
+        // hub (slice 1): mirrors that come from a hub, relayed docs' true owners,
+        // and my subtrees published to a hub (every doc under a published root)
+        let contacts = s.list_contacts().unwrap_or_default();
+        let hub_contacts: std::collections::HashMap<Uuid, String> = contacts
+            .iter()
+            .filter(|c| c.is_hub && !c.revoked)
+            .map(|c| (c.id, c.petname.clone()))
+            .collect();
+        let from_hub: std::collections::HashSet<String> = mirror_rows
+            .iter()
+            .filter(|m| hub_contacts.contains_key(&m.owner))
+            .map(|m| m.doc_id.to_string())
+            .collect();
+        let origin_names: std::collections::HashMap<String, String> = mirror_rows
+            .iter()
+            .filter_map(|m| m.origin_owner_name.clone().map(|n| (m.doc_id.to_string(), n)))
+            .collect();
+        let all_shares = s.list_shares().unwrap_or_default();
+        let published_roots: std::collections::HashMap<Uuid, String> = all_shares
+            .iter()
+            .filter(|sh| sh.state == grimoire_store::ShareState::Active)
+            .filter_map(|sh| sh.contact.and_then(|c| hub_contacts.get(&c)).map(|n| (sh.root_doc, n.clone())))
+            .collect();
+        // mirrors tended on the owner's side: shown as tended locally, and the
+        // tend panel refuses to configure them (avoids two-sided agent edits)
+        let owner_tended: std::collections::HashSet<String> = mirror_rows
+            .iter()
+            .filter(|m| m.owner_tended)
+            .map(|m| m.doc_id.to_string())
+            .collect();
+        let share_roots: std::collections::HashSet<String> = all_shares
+            .iter()
+            .filter(|sh| sh.state != grimoire_store::ShareState::Revoked)
+            .map(|sh| sh.root_doc.to_string())
+            .collect();
+        match s.list_docs() {
+            Ok(d) => {
+                let parent_of: std::collections::HashMap<Uuid, Option<Uuid>> =
+                    d.iter().map(|x| (x.id, x.parent_id)).collect();
+                // the hub a doc is published to: the nearest published ancestor (or itself)
+                let published_to = |mut cur: Uuid| -> Option<&String> {
+                    if published_roots.is_empty() {
+                        return None;
                     }
-                    match parent_of.get(&cur).copied().flatten() {
-                        Some(p) => cur = p,
-                        None => return None,
+                    loop {
+                        if let Some(n) = published_roots.get(&cur) {
+                            return Some(n);
+                        }
+                        match parent_of.get(&cur).copied().flatten() {
+                            Some(p) => cur = p,
+                            None => return None,
+                        }
                     }
-                }
-            };
-            Json(json!(
-                d.iter()
-                    .map(|doc| {
-                        let id = doc.id.to_string();
-                        let mut v = json!(doc);
-                        v["is_canvas"] = json!(canvases.contains(&id));
-                        let owner_t = owner_tended.contains(&id);
-                        v["is_tended"] = json!(tended.contains(&id) || owner_t);
-                        v["owner_tended"] = json!(owner_t);
-                        if let Some(perm) = mirrors.get(&id) {
-                            v["mirror_permission"] = json!(perm);
-                        }
-                        v["is_shared"] = json!(share_roots.contains(&id));
-                        if from_hub.contains(&id) {
-                            v["from_hub"] = json!(true);
-                        }
-                        if let Some(n) = origin_names.get(&id) {
-                            v["origin_owner_name"] = json!(n);
-                        }
-                        if let Some(n) = published_to(doc.id) {
-                            v["published_to"] = json!(n);
-                        }
-                        v
-                    })
-                    .collect::<Vec<_>>()
-            ))
+                };
+                Json(json!(
+                    d.iter()
+                        .map(|doc| {
+                            let id = doc.id.to_string();
+                            let mut v = json!(doc);
+                            v["is_canvas"] = json!(canvases.contains(&id));
+                            let owner_t = owner_tended.contains(&id);
+                            v["is_tended"] = json!(tended.contains(&id) || owner_t);
+                            v["owner_tended"] = json!(owner_t);
+                            if let Some(perm) = mirrors.get(&id) {
+                                v["mirror_permission"] = json!(perm);
+                            }
+                            v["is_shared"] = json!(share_roots.contains(&id));
+                            if from_hub.contains(&id) {
+                                v["from_hub"] = json!(true);
+                            }
+                            if let Some(n) = origin_names.get(&id) {
+                                v["origin_owner_name"] = json!(n);
+                            }
+                            if let Some(n) = published_to(doc.id) {
+                                v["published_to"] = json!(n);
+                            }
+                            v
+                        })
+                        .collect::<Vec<_>>()
+                ))
+            }
+            Err(e) => Json(json!({"error": e.to_string()})),
         }
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    })
+    .await
 }
 
 /// Hub mode (slice 1), for the hub's own UI and the CLI on the box: whether
 /// this Grimoire is a hub, its name and root, active members and pending
 /// requests. Read-only; approving lives under /admin/hub/*.
 async fn hub_info(State(st): State<ApiState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(hub) = crate::fed::hub::config(&s) else {
-        return Json(json!({"enabled": false}));
-    };
-    let members = crate::fed::hub::members(&s).unwrap_or_default();
-    let (active, pending): (Vec<_>, Vec<_>) = members
-        .into_iter()
-        .filter(|m| m.membership != "ejected")
-        .partition(|m| m.membership == "active");
-    Json(json!({
-        "enabled": true,
-        "name": hub.name,
-        "root_doc": hub.root_doc,
-        "members": active,
-        "pending": pending,
-    }))
+    with_store(&st.store, move |s| {
+        let Some(hub) = crate::fed::hub::config(&s) else {
+            return Json(json!({"enabled": false}));
+        };
+        let members = crate::fed::hub::members(&s).unwrap_or_default();
+        let (active, pending): (Vec<_>, Vec<_>) = members
+            .into_iter()
+            .filter(|m| m.membership != "ejected")
+            .partition(|m| m.membership == "active");
+        Json(json!({
+            "enabled": true,
+            "name": hub.name,
+            "root_doc": hub.root_doc,
+            "members": active,
+            "pending": pending,
+        }))
+    })
+    .await
 }
 
 /// Everything the doc view needs to render federation state for one doc:
 /// its mirror origin (if it is shared WITH us), the shares exposing it (if
 /// we are sharing it), and our pending upstream proposals against it.
 async fn doc_federation(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let contacts = s.list_contacts().unwrap_or_default();
-    let petname_of = |cid: Uuid| {
-        contacts
-            .iter()
-            .find(|c| c.id == cid)
-            .map(|c| c.petname.clone())
-            .unwrap_or_else(|| "?".into())
-    };
-    let is_hub = |cid: Uuid| contacts.iter().any(|c| c.id == cid && c.is_hub);
-    // hub slice 2: this doc (or an ancestor) was handed to the mirror's owner by me
-    let transferred_roots: Vec<Uuid> = s
-        .list_doc_transfers()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|t| t.direction == grimoire_store::TransferDirection::Out && t.state == "done")
-        .map(|t| t.root_doc)
-        .collect();
-    let transferred_from_me = |mut cur: Uuid| -> bool {
-        if transferred_roots.is_empty() {
-            return false;
-        }
-        loop {
-            if transferred_roots.contains(&cur) {
-                return true;
+    with_store(&st.store, move |s| {
+        let contacts = s.list_contacts().unwrap_or_default();
+        let petname_of = |cid: Uuid| {
+            contacts
+                .iter()
+                .find(|c| c.id == cid)
+                .map(|c| c.petname.clone())
+                .unwrap_or_else(|| "?".into())
+        };
+        let is_hub = |cid: Uuid| contacts.iter().any(|c| c.id == cid && c.is_hub);
+        // hub slice 2: this doc (or an ancestor) was handed to the mirror's owner by me
+        let transferred_roots: Vec<Uuid> = s
+            .list_doc_transfers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.direction == grimoire_store::TransferDirection::Out && t.state == "done")
+            .map(|t| t.root_doc)
+            .collect();
+        let transferred_from_me = |mut cur: Uuid| -> bool {
+            if transferred_roots.is_empty() {
+                return false;
             }
-            match s.get_doc(cur).ok().and_then(|d| d.parent_id) {
-                Some(p) => cur = p,
-                None => return false,
+            loop {
+                if transferred_roots.contains(&cur) {
+                    return true;
+                }
+                match s.get_doc(cur).ok().and_then(|d| d.parent_id) {
+                    Some(p) => cur = p,
+                    None => return false,
+                }
             }
-        }
-    };
-    let mirror = s.get_mirror(id).ok().flatten().map(|m| {
-        json!({
-            "owner": m.owner,
-            "owner_petname": petname_of(m.owner),
-            "permission": m.permission,
-            "synced_epoch": m.synced_epoch,
-            "owner_tended": m.owner_tended,
-            // hub relay (slice 1): the share comes from a hub; a relayed doc
-            // names its true owner (slice 2: edits reach them through the hub)
-            "from_hub": is_hub(m.owner),
-            "origin_owner": m.origin_owner,
-            "origin_owner_name": m.origin_owner_name,
-            "transferred_from_me": transferred_from_me(id),
-        })
-    });
-    let shares: Vec<Value> = s
-        .shares_containing(id)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|sh| {
+        };
+        let mirror = s.get_mirror(id).ok().flatten().map(|m| {
             json!({
-                "id": sh.id,
-                "root_doc": sh.root_doc,
-                "permission": sh.permission,
-                "state": sh.state,
-                "petname": sh.contact.map(&petname_of),
-                "trust": sh.trust,
-                "to_hub": sh.contact.map(is_hub).unwrap_or(false),
+                "owner": m.owner,
+                "owner_petname": petname_of(m.owner),
+                "permission": m.permission,
+                "synced_epoch": m.synced_epoch,
+                "owner_tended": m.owner_tended,
+                // hub relay (slice 1): the share comes from a hub; a relayed doc
+                // names its true owner (slice 2: edits reach them through the hub)
+                "from_hub": is_hub(m.owner),
+                "origin_owner": m.origin_owner,
+                "origin_owner_name": m.origin_owner_name,
+                "transferred_from_me": transferred_from_me(id),
             })
-        })
-        .collect();
-    let outbound: Vec<Value> = s
-        .list_outbound_proposals(false)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| p.doc_id == id)
-        .map(|p| json!(p))
-        .collect();
-    Json(json!({"mirror": mirror, "shares": shares, "outbound": outbound}))
+        });
+        let shares: Vec<Value> = s
+            .shares_containing(id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|sh| {
+                json!({
+                    "id": sh.id,
+                    "root_doc": sh.root_doc,
+                    "permission": sh.permission,
+                    "state": sh.state,
+                    "petname": sh.contact.map(&petname_of),
+                    "trust": sh.trust,
+                    "to_hub": sh.contact.map(is_hub).unwrap_or(false),
+                })
+            })
+            .collect();
+        let outbound: Vec<Value> = s
+            .list_outbound_proposals(false)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.doc_id == id)
+            .map(|p| json!(p))
+            .collect();
+        Json(json!({"mirror": mirror, "shares": shares, "outbound": outbound}))
+    })
+    .await
 }
 
 async fn doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.read_doc(id) {
-        Ok(t) => Json(json!(t)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.read_doc(id) {
+            Ok(t) => Json(json!(t)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 async fn backlinks(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.backlinks(id) {
-        Ok(b) => Json(json!(b)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.backlinks(id) {
+            Ok(b) => Json(json!(b)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// Decorate review items for rendering: doc titles, proposer names, and the
@@ -354,14 +349,13 @@ pub(crate) fn decorate_review_items(s: &SqliteStore, q: Vec<grimoire_store::Revi
 /// Open review items for ONE doc — the in-editor review rail's data source.
 /// Same item shape as /api/queue.
 async fn doc_review(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.review_queue(Some(id)) {
-        Ok(q) => Json(json!(decorate_review_items(&s, q))),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.review_queue(Some(id)) {
+            Ok(q) => Json(json!(decorate_review_items(&s, q))),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -372,25 +366,23 @@ struct ActivityQuery {
 /// The owner's notification feed: content edits applied directly by remote
 /// principals (maintainer-tier shares). Newest first.
 async fn activity(State(st): State<ApiState>, Query(q): Query<ActivityQuery>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.recent_remote_ops(q.limit.unwrap_or(20).min(200)) {
-        Ok(items) => Json(json!(items)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.recent_remote_ops(q.limit.unwrap_or(20).min(200)) {
+            Ok(items) => Json(json!(items)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 async fn queue(State(st): State<ApiState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.review_queue(None) {
-        Ok(q) => Json(json!(decorate_review_items(&s, q))),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.review_queue(None) {
+            Ok(q) => Json(json!(decorate_review_items(&s, q))),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -405,19 +397,20 @@ async fn resolve(State(st): State<ApiState>, Json(req): Json<ResolveReq>) -> Jso
         "decline" => ReviewDecision::Decline,
         other => return Json(json!({"error": format!("bad decision: {other}")})),
     };
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(doc) = crate::hot::annotation_doc(&s, req.annotation_id)
-        && let Err(m) = st.hot.assert_cold(doc)
-    {
-        return Json(json!({"error": m}));
-    }
-    match s.resolve(req.annotation_id, st.human, decision) {
-        Ok(receipt) => Json(json!({"ok": true, "receipt": receipt})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    let store = st.store.clone();
+    let st = st.clone();
+    with_store(&store, move |s| {
+        if let Some(doc) = crate::hot::annotation_doc(&s, req.annotation_id)
+            && let Err(m) = st.hot.assert_cold(doc)
+        {
+            return Json(json!({"error": m}));
+        }
+        match s.resolve(req.annotation_id, st.human, decision) {
+            Ok(receipt) => Json(json!({"ok": true, "receipt": receipt})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -434,24 +427,25 @@ async fn resolve_bulk(State(st): State<ApiState>, Json(req): Json<ResolveBulkReq
         "decline" => ReviewDecision::Decline,
         other => return Json(json!({"error": format!("bad decision: {other}")})),
     };
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (mut done, mut failed) = (0usize, Vec::new());
-    for id in req.annotation_ids {
-        if let Some(doc) = crate::hot::annotation_doc(&s, id)
-            && let Err(m) = st.hot.assert_cold(doc)
-        {
-            failed.push(json!({"id": id, "error": m}));
-            continue;
+    let store = st.store.clone();
+    let st = st.clone();
+    with_store(&store, move |s| {
+        let (mut done, mut failed) = (0usize, Vec::new());
+        for id in req.annotation_ids {
+            if let Some(doc) = crate::hot::annotation_doc(&s, id)
+                && let Err(m) = st.hot.assert_cold(doc)
+            {
+                failed.push(json!({"id": id, "error": m}));
+                continue;
+            }
+            match s.resolve(id, st.human, decision) {
+                Ok(_) => done += 1,
+                Err(e) => failed.push(json!({"id": id, "error": e.to_string()})),
+            }
         }
-        match s.resolve(id, st.human, decision) {
-            Ok(_) => done += 1,
-            Err(e) => failed.push(json!({"id": id, "error": e.to_string()})),
-        }
-    }
-    Json(json!({"resolved": done, "failed": failed}))
+        Json(json!({"resolved": done, "failed": failed}))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -460,36 +454,33 @@ struct SearchQuery {
 }
 
 async fn search(State(st): State<ApiState>, Query(p): Query<SearchQuery>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.search_blocks(&p.q, 20) {
-        Ok(h) => Json(json!(h)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.search_blocks(&p.q, 20) {
+            Ok(h) => Json(json!(h)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 async fn tags(State(st): State<ApiState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.list_tags() {
-        Ok(t) => Json(json!(t)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.list_tags() {
+            Ok(t) => Json(json!(t)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 async fn runs(State(st): State<ApiState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.list_runs(20) {
-        Ok(r) => Json(json!(r)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.list_runs(20) {
+            Ok(r) => Json(json!(r)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -509,29 +500,31 @@ async fn propose(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json
     if let Err(m) = st.hot.assert_cold(req.doc_id) {
         return Json(json!({"error": m}));
     }
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let principal = match resolve_principal(&st, &headers, &mut s) {
-        Ok(p) => p,
-        Err(m) => return Json(json!({"error": m})),
-    };
-    if let Some(rid) = req.request_id
-        && let Some(prev) = crate::mcp::dedupe_get(&st.dedupe, principal, rid)
-    {
-        return Json(prev);
-    }
-    match s.propose(req.doc_id, req.base_epoch, principal, req.ops) {
-        Ok(out) => {
-            let v = json!(out);
-            if let Some(rid) = req.request_id {
-                crate::mcp::dedupe_put(&st.dedupe, principal, rid, v.clone());
-            }
-            Json(v)
+    let store = st.store.clone();
+    let st = st.clone();
+    let headers = headers.clone();
+    with_store(&store, move |s| {
+        let principal = match resolve_principal(&st, &headers, s) {
+            Ok(p) => p,
+            Err(m) => return Json(json!({"error": m})),
+        };
+        if let Some(rid) = req.request_id
+            && let Some(prev) = crate::mcp::dedupe_get(&st.dedupe, principal, rid)
+        {
+            return Json(prev);
         }
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+        match s.propose(req.doc_id, req.base_epoch, principal, req.ops) {
+            Ok(out) => {
+                let v = json!(out);
+                if let Some(rid) = req.request_id {
+                    crate::mcp::dedupe_put(&st.dedupe, principal, rid, v.clone());
+                }
+                Json(v)
+            }
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -557,49 +550,51 @@ async fn propose_markdown(
     if let Err(m) = st.hot.assert_cold(req.doc_id) {
         return Json(json!({"error": m}));
     }
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let principal = match resolve_principal(&st, &headers, &mut s) {
-        Ok(p) => p,
-        Err(m) => return Json(json!({"error": m})),
-    };
-    if let Some(rid) = req.request_id
-        && let Some(prev) = crate::mcp::dedupe_get(&st.dedupe, principal, rid)
-    {
-        return Json(prev);
-    }
-    let tree = match s.read_doc(req.doc_id) {
-        Ok(t) => t,
-        Err(e) => return Json(json!({"error": e.to_string()})),
-    };
-    if req.base_epoch != tree.doc.current_epoch {
-        let missed = s.ops_since(req.doc_id, req.base_epoch).unwrap_or_default();
-        return Json(json!({
-            "error": "stale_base",
-            "base_epoch": req.base_epoch,
-            "current_epoch": tree.doc.current_epoch,
-            "missed_ops": missed,
-            "recover": "re-read the doc, re-apply your edit to the fresh markdown, re-send with the current epoch",
-        }));
-    }
-    let ops = grimoire_store::mddiff::markdown_to_ops(&tree.roots, &req.markdown);
-    if ops.is_empty() {
-        return Json(json!({
-            "doc_id": req.doc_id, "epoch": tree.doc.current_epoch, "verdicts": [], "note": "no changes"
-        }));
-    }
-    match s.propose(req.doc_id, req.base_epoch, principal, ops) {
-        Ok(out) => {
-            let v = json!(out);
-            if let Some(rid) = req.request_id {
-                crate::mcp::dedupe_put(&st.dedupe, principal, rid, v.clone());
-            }
-            Json(v)
+    let store = st.store.clone();
+    let st = st.clone();
+    let headers = headers.clone();
+    with_store(&store, move |s| {
+        let principal = match resolve_principal(&st, &headers, s) {
+            Ok(p) => p,
+            Err(m) => return Json(json!({"error": m})),
+        };
+        if let Some(rid) = req.request_id
+            && let Some(prev) = crate::mcp::dedupe_get(&st.dedupe, principal, rid)
+        {
+            return Json(prev);
         }
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+        let tree = match s.read_doc(req.doc_id) {
+            Ok(t) => t,
+            Err(e) => return Json(json!({"error": e.to_string()})),
+        };
+        if req.base_epoch != tree.doc.current_epoch {
+            let missed = s.ops_since(req.doc_id, req.base_epoch).unwrap_or_default();
+            return Json(json!({
+                "error": "stale_base",
+                "base_epoch": req.base_epoch,
+                "current_epoch": tree.doc.current_epoch,
+                "missed_ops": missed,
+                "recover": "re-read the doc, re-apply your edit to the fresh markdown, re-send with the current epoch",
+            }));
+        }
+        let ops = grimoire_store::mddiff::markdown_to_ops(&tree.roots, &req.markdown);
+        if ops.is_empty() {
+            return Json(json!({
+                "doc_id": req.doc_id, "epoch": tree.doc.current_epoch, "verdicts": [], "note": "no changes"
+            }));
+        }
+        match s.propose(req.doc_id, req.base_epoch, principal, ops) {
+            Ok(out) => {
+                let v = json!(out);
+                if let Some(rid) = req.request_id {
+                    crate::mcp::dedupe_put(&st.dedupe, principal, rid, v.clone());
+                }
+                Json(v)
+            }
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -609,58 +604,58 @@ struct CreateDocReq {
 }
 
 async fn create_doc(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json<CreateDocReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let principal = match resolve_principal(&st, &headers, &mut s) {
-        Ok(p) => p,
-        Err(m) => return Json(json!({"error": m})),
-    };
-    match s.create_doc(&req.title, req.parent_doc_id, principal) {
-        Ok(d) => Json(json!(d)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    let store = st.store.clone();
+    let st = st.clone();
+    let headers = headers.clone();
+    with_store(&store, move |s| {
+        let principal = match resolve_principal(&st, &headers, s) {
+            Ok(p) => p,
+            Err(m) => return Json(json!({"error": m})),
+        };
+        match s.create_doc(&req.title, req.parent_doc_id, principal) {
+            Ok(d) => Json(json!(d)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 async fn principals(State(st): State<ApiState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.list_principals() {
-        Ok(p) => Json(json!(p)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.list_principals() {
+            Ok(p) => Json(json!(p)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// Per-doc op history, newest first — the provenance panel (5.4).
 async fn history(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // newest first, capped in SQL (was: whole ledger, reversed, truncated)
-    match s.ops_for_doc_limited(id, 100) {
-        Ok(ops) => {
-            let rows: Vec<Value> = ops
-                .into_iter()
-                .map(|op| {
-                    let principal = s
-                        .get_principal(op.principal)
-                        .map(|p| (p.display_name, p.kind.as_str().to_string()))
-                        .unwrap_or_default();
-                    json!({
-                        "op": op,
-                        "principal_name": principal.0,
-                        "principal_kind": principal.1,
+    with_store(&st.store, move |s| {
+        // newest first, capped in SQL (was: whole ledger, reversed, truncated)
+        match s.ops_for_doc_limited(id, 100) {
+            Ok(ops) => {
+                let rows: Vec<Value> = ops
+                    .into_iter()
+                    .map(|op| {
+                        let principal = s
+                            .get_principal(op.principal)
+                            .map(|p| (p.display_name, p.kind.as_str().to_string()))
+                            .unwrap_or_default();
+                        json!({
+                            "op": op,
+                            "principal_name": principal.0,
+                            "principal_kind": principal.1,
+                        })
                     })
-                })
-                .collect();
-            Json(json!(rows))
+                    .collect();
+                Json(json!(rows))
+            }
+            Err(e) => Json(json!({"error": e.to_string()})),
         }
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -671,64 +666,65 @@ struct CommentReq {
 }
 
 async fn add_comment(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json<CommentReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let principal = match resolve_principal(&st, &headers, &mut s) {
-        Ok(p) => p,
-        Err(m) => return Json(json!({"error": m})),
-    };
-    match s.add_comment(req.block_id, principal, &req.text, req.reply_to) {
-        Ok(c) => Json(json!(c)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    let store = st.store.clone();
+    let st = st.clone();
+    let headers = headers.clone();
+    with_store(&store, move |s| {
+        let principal = match resolve_principal(&st, &headers, s) {
+            Ok(p) => p,
+            Err(m) => return Json(json!({"error": m})),
+        };
+        match s.add_comment(req.block_id, principal, &req.text, req.reply_to) {
+            Ok(c) => Json(json!(c)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// Graph view data (5.10): nodes = docs (tinted by tending principal —
 /// the principal of the doc's last applied op), links = resolved wikilinks.
 async fn graph(State(st): State<ApiState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let docs = match s.list_docs() {
-        Ok(d) => d,
-        Err(e) => return Json(json!({"error": e.to_string()})),
-    };
-    let mut tenders: std::collections::HashMap<String, String> = Default::default();
-    let mut names: std::collections::HashMap<String, String> = Default::default();
-    if let Ok(principals) = s.list_principals() {
-        for p in principals {
-            names.insert(p.id.to_string(), p.display_name);
-        }
-    }
-    // last applied op per doc = who tends it
-    if let Ok(rows) = s.raw_tending() {
-        for (doc, principal) in rows {
-            if let Some(name) = names.get(&principal) {
-                tenders.insert(doc, name.clone());
+    with_store(&st.store, move |s| {
+        let docs = match s.list_docs() {
+            Ok(d) => d,
+            Err(e) => return Json(json!({"error": e.to_string()})),
+        };
+        let mut tenders: std::collections::HashMap<String, String> = Default::default();
+        let mut names: std::collections::HashMap<String, String> = Default::default();
+        if let Ok(principals) = s.list_principals() {
+            for p in principals {
+                names.insert(p.id.to_string(), p.display_name);
             }
         }
-    }
-    let links = s.raw_links().unwrap_or_default();
-    let tags = s.raw_doc_tags().unwrap_or_default();
-    let nodes: Vec<Value> = docs
-        .iter()
-        .map(|d| {
-            json!({
-                "id": d.id,
-                "title": d.title,
-                "tender": tenders.get(&d.id.to_string()),
-                "tags": tags.get(&d.id.to_string()).cloned().unwrap_or_default(),
+        // last applied op per doc = who tends it
+        if let Ok(rows) = s.raw_tending() {
+            for (doc, principal) in rows {
+                if let Some(name) = names.get(&principal) {
+                    tenders.insert(doc, name.clone());
+                }
+            }
+        }
+        let links = s.raw_links().unwrap_or_default();
+        let tags = s.raw_doc_tags().unwrap_or_default();
+        let nodes: Vec<Value> = docs
+            .iter()
+            .map(|d| {
+                json!({
+                    "id": d.id,
+                    "title": d.title,
+                    "tender": tenders.get(&d.id.to_string()),
+                    "tags": tags.get(&d.id.to_string()).cloned().unwrap_or_default(),
+                })
             })
-        })
-        .collect();
-    let links: Vec<Value> = links
-        .into_iter()
-        .map(|(a, b)| json!({"source": a, "target": b}))
-        .collect();
-    Json(json!({"nodes": nodes, "links": links}))
+            .collect();
+        let links: Vec<Value> = links
+            .into_iter()
+            .map(|(a, b)| json!({"source": a, "target": b}))
+            .collect();
+        Json(json!({"nodes": nodes, "links": links}))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -812,38 +808,36 @@ async fn set_status(
             None => return Json(json!({"error": format!("bad status: {v}")})),
         },
     };
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(e) = refuse_if_mirror(&s, id, "status") {
-        return Json(json!({"error": e}));
-    }
-    match s.set_doc_status(id, status) {
-        Ok(()) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        if let Some(e) = refuse_if_mirror(&s, id, "status") {
+            return Json(json!({"error": e}));
+        }
+        match s.set_doc_status(id, status) {
+            Ok(()) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// Agent audit flags: comments by agent principals, queue-adjacent surface.
 async fn flags(State(st): State<ApiState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.agent_flags() {
-        Ok(rows) => Json(json!(
-            rows.into_iter()
-                .map(|(block, doc_title, author, target_content)| json!({
-                    "block": block,
-                    "doc_title": doc_title,
-                    "author": author,
-                    "target_content": target_content,
-                }))
-                .collect::<Vec<_>>()
-        )),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.agent_flags() {
+            Ok(rows) => Json(json!(
+                rows.into_iter()
+                    .map(|(block, doc_title, author, target_content)| json!({
+                        "block": block,
+                        "doc_title": doc_title,
+                        "author": author,
+                        "target_content": target_content,
+                    }))
+                    .collect::<Vec<_>>()
+            )),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -853,87 +847,86 @@ struct DismissReq {
 
 /// Dismiss a flag: delete the comment block through the gate as the human.
 async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let block = match s.read_block(req.comment_id) {
-        Ok(b) if b.block_type == grimoire_store::BlockType::Comment => b,
-        Ok(_) => return Json(json!({"error": "not a comment block"})),
-        Err(e) => return Json(json!({"error": e.to_string()})),
-    };
-    let epoch = match s.get_doc(block.doc_id) {
-        Ok(d) => d.current_epoch,
-        Err(e) => return Json(json!({"error": e.to_string()})),
-    };
-    let op = OpInput {
-        kind: grimoire_store::OpKind::Delete {
-            target: req.comment_id,
-        },
-        source_refs: vec!["flag:dismissed".into()],
-    };
-    match s.propose(block.doc_id, epoch, st.human, vec![op]) {
-        Ok(_) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    let store = st.store.clone();
+    let st = st.clone();
+    with_store(&store, move |s| {
+        let block = match s.read_block(req.comment_id) {
+            Ok(b) if b.block_type == grimoire_store::BlockType::Comment => b,
+            Ok(_) => return Json(json!({"error": "not a comment block"})),
+            Err(e) => return Json(json!({"error": e.to_string()})),
+        };
+        let epoch = match s.get_doc(block.doc_id) {
+            Ok(d) => d.current_epoch,
+            Err(e) => return Json(json!({"error": e.to_string()})),
+        };
+        let op = OpInput {
+            kind: grimoire_store::OpKind::Delete {
+                target: req.comment_id,
+            },
+            source_refs: vec!["flag:dismissed".into()],
+        };
+        match s.propose(block.doc_id, epoch, st.human, vec![op]) {
+            Ok(_) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// Tendings covering a doc: gardeners scoped to it or to any ancestor.
 /// The opt-in surface — configure agents where the docs live.
 async fn tendings(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // ancestor chain of this doc, self first
-    let mut chain = vec![id];
-    let mut cur = id;
-    while let Ok(d) = s.get_doc(cur) {
-        match d.parent_id {
-            Some(p) => {
-                chain.push(p);
-                cur = p;
+    with_store(&st.store, move |s| {
+        // ancestor chain of this doc, self first
+        let mut chain = vec![id];
+        let mut cur = id;
+        while let Ok(d) = s.get_doc(cur) {
+            match d.parent_id {
+                Some(p) => {
+                    chain.push(p);
+                    cur = p;
+                }
+                None => break,
             }
-            None => break,
         }
-    }
-    match s.list_gardeners() {
-        Ok(gs) => {
-            let rows: Vec<Value> = gs
-                .into_iter()
-                .filter(|g| g.scope_doc.map(|sd| chain.contains(&sd)).unwrap_or(false))
-                .map(|g| {
-                    let scope_title = g
-                        .scope_doc
-                        .and_then(|sd| s.get_doc(sd).ok())
-                        .map(|d| d.title)
-                        .unwrap_or_default();
-                    let inherited = g.scope_doc != Some(id);
-                    let mut v = json!(g);
-                    v["scope_title"] = json!(scope_title);
-                    v["inherited"] = json!(inherited);
-                    v
-                })
-                .collect();
-            Json(json!(rows))
+        match s.list_gardeners() {
+            Ok(gs) => {
+                let rows: Vec<Value> = gs
+                    .into_iter()
+                    .filter(|g| g.scope_doc.map(|sd| chain.contains(&sd)).unwrap_or(false))
+                    .map(|g| {
+                        let scope_title = g
+                            .scope_doc
+                            .and_then(|sd| s.get_doc(sd).ok())
+                            .map(|d| d.title)
+                            .unwrap_or_default();
+                        let inherited = g.scope_doc != Some(id);
+                        let mut v = json!(g);
+                        v["scope_title"] = json!(scope_title);
+                        v["inherited"] = json!(inherited);
+                        v
+                    })
+                    .collect();
+                Json(json!(rows))
+            }
+            Err(e) => Json(json!({"error": e.to_string()})),
         }
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    })
+    .await
 }
 
 /// Data change stamp: the app polls this and live-refreshes whatever view is
 /// open when it moves — gardener writes, MCP proposals from other sessions,
 /// queue resolutions all appear without a reload.
 async fn stamp(State(st): State<ApiState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.change_stamp() {
-        // version/build ride along so the app needs one poll, not two
-        Ok(v) => Json(json!({"stamp": v, "version": env!("CARGO_PKG_VERSION"), "build": build_stamp(), "git": crate::GIT_SHA})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.change_stamp() {
+            // version/build ride along so the app needs one poll, not two
+            Ok(v) => Json(json!({"stamp": v, "version": env!("CARGO_PKG_VERSION"), "build": build_stamp(), "git": crate::GIT_SHA})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// UI build stamp. The app polls this and reloads itself when it changes —
@@ -1020,17 +1013,16 @@ async fn move_doc(
     Path(id): Path<Uuid>,
     Json(req): Json<MoveDocReq>,
 ) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(e) = refuse_move(&s, id, req.parent_id) {
-        return Json(json!({"error": e}));
-    }
-    match s.move_doc(id, req.parent_id, req.sort_key.as_deref()) {
-        Ok(()) => Json(json!({"ok": true})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        if let Some(e) = refuse_move(&s, id, req.parent_id) {
+            return Json(json!({"error": e}));
+        }
+        match s.move_doc(id, req.parent_id, req.sort_key.as_deref()) {
+            Ok(()) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// Tree-move rules at the boundary between my docs and mirrors (ADR 0002):
@@ -1119,64 +1111,65 @@ async fn rename_doc(
     Path(id): Path<Uuid>,
     Json(req): Json<RenameReq>,
 ) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let old_title = match s.get_doc(id) {
-        Ok(d) => d.title,
-        Err(e) => return Json(json!({"error": e.to_string()})),
-    };
-    if let Some(e) = refuse_if_mirror(&s, id, "renaming") {
-        return Json(json!({"error": e}));
-    }
-    if let Err(e) = s.rename_doc(id, &req.title) {
-        return Json(json!({"error": e.to_string()}));
-    }
-    // no more link-rot: rewrite every inbound [[wikilink]] through the gate
-    let new_title = req.title.trim();
-    let mut rewritten = 0usize;
-    if old_title != new_title {
-        let linkers = s.linking_blocks(&old_title).unwrap_or_default();
-        // group by doc so each doc gets one epoch
-        let mut by_doc: std::collections::HashMap<Uuid, Vec<(Uuid, String)>> = Default::default();
-        for (block, doc, content) in linkers {
-            by_doc.entry(doc).or_default().push((block, content));
+    let store = st.store.clone();
+    let st = st.clone();
+    with_store(&store, move |s| {
+        let old_title = match s.get_doc(id) {
+            Ok(d) => d.title,
+            Err(e) => return Json(json!({"error": e.to_string()})),
+        };
+        if let Some(e) = refuse_if_mirror(&s, id, "renaming") {
+            return Json(json!({"error": e}));
         }
-        let mut deferred = 0usize;
-        for (doc, blocks) in by_doc {
-            let Ok(d) = s.get_doc(doc) else { continue };
-            // mirrors are the owner's (their pull will bring the new title);
-            // hot docs are the session's — their links get fixed on the next
-            // rename or by a gardener, never by writing under a live session
-            if s.get_mirror(doc).ok().flatten().is_some() {
-                continue;
+        if let Err(e) = s.rename_doc(id, &req.title) {
+            return Json(json!({"error": e.to_string()}));
+        }
+        // no more link-rot: rewrite every inbound [[wikilink]] through the gate
+        let new_title = req.title.trim();
+        let mut rewritten = 0usize;
+        if old_title != new_title {
+            let linkers = s.linking_blocks(&old_title).unwrap_or_default();
+            // group by doc so each doc gets one epoch
+            let mut by_doc: std::collections::HashMap<Uuid, Vec<(Uuid, String)>> = Default::default();
+            for (block, doc, content) in linkers {
+                by_doc.entry(doc).or_default().push((block, content));
             }
-            if st.hot.is_hot(doc) {
-                deferred += blocks.len();
-                continue;
-            }
-            let ops: Vec<OpInput> = blocks
-                .into_iter()
-                .filter_map(|(block, content)| {
-                    let new_content = rewrite_links(&content, &old_title, new_title);
-                    (new_content != content).then(|| OpInput {
-                        kind: ks_store_op_replace(block, new_content),
-                        source_refs: vec![format!("rename:{old_title} → {new_title}")],
+            let mut deferred = 0usize;
+            for (doc, blocks) in by_doc {
+                let Ok(d) = s.get_doc(doc) else { continue };
+                // mirrors are the owner's (their pull will bring the new title);
+                // hot docs are the session's — their links get fixed on the next
+                // rename or by a gardener, never by writing under a live session
+                if s.get_mirror(doc).ok().flatten().is_some() {
+                    continue;
+                }
+                if st.hot.is_hot(doc) {
+                    deferred += blocks.len();
+                    continue;
+                }
+                let ops: Vec<OpInput> = blocks
+                    .into_iter()
+                    .filter_map(|(block, content)| {
+                        let new_content = rewrite_links(&content, &old_title, new_title);
+                        (new_content != content).then(|| OpInput {
+                            kind: ks_store_op_replace(block, new_content),
+                            source_refs: vec![format!("rename:{old_title} → {new_title}")],
+                        })
                     })
-                })
-                .collect();
-            if ops.is_empty() {
-                continue;
+                    .collect();
+                if ops.is_empty() {
+                    continue;
+                }
+                rewritten += ops.len();
+                let _ = s.propose(doc, d.current_epoch, st.human, ops);
             }
-            rewritten += ops.len();
-            let _ = s.propose(doc, d.current_epoch, st.human, ops);
+            if deferred > 0 {
+                return Json(json!({"ok": true, "links_rewritten": rewritten, "links_deferred_hot": deferred}));
+            }
         }
-        if deferred > 0 {
-            return Json(json!({"ok": true, "links_rewritten": rewritten, "links_deferred_hot": deferred}));
-        }
-    }
-    Json(json!({"ok": true, "links_rewritten": rewritten}))
+        Json(json!({"ok": true, "links_rewritten": rewritten}))
+    })
+    .await
 }
 
 fn ks_store_op_replace(target: Uuid, content: String) -> grimoire_store::OpKind {
@@ -1184,31 +1177,32 @@ fn ks_store_op_replace(target: Uuid, content: String) -> grimoire_store::OpKind 
 }
 
 async fn delete_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(e) = refuse_if_mirror(&s, id, "deleting") {
-        return Json(json!({"error": e}));
-    }
-    // a live session anywhere in the subtree would flatten into a tombstone
-    // (and the session would outlive the doc): end it first
-    match s.doc_subtree_ids(id) {
-        Ok(ids) => {
-            if let Some(hot) = ids.iter().find(|d| st.hot.is_hot(**d)) {
-                let title = s.get_doc(*hot).map(|d| d.title).unwrap_or_default();
-                return Json(json!({
-                    "error": format!("“{title}” is in a live session — end it before deleting"),
-                    "code": "doc_hot",
-                }));
-            }
+    let store = st.store.clone();
+    let st = st.clone();
+    with_store(&store, move |s| {
+        if let Some(e) = refuse_if_mirror(&s, id, "deleting") {
+            return Json(json!({"error": e}));
         }
-        Err(e) => return Json(json!({"error": e.to_string()})),
-    }
-    match s.delete_doc(id) {
-        Ok(n) => Json(json!({"ok": true, "deleted": n})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+        // a live session anywhere in the subtree would flatten into a tombstone
+        // (and the session would outlive the doc): end it first
+        match s.doc_subtree_ids(id) {
+            Ok(ids) => {
+                if let Some(hot) = ids.iter().find(|d| st.hot.is_hot(**d)) {
+                    let title = s.get_doc(*hot).map(|d| d.title).unwrap_or_default();
+                    return Json(json!({
+                        "error": format!("“{title}” is in a live session — end it before deleting"),
+                        "code": "doc_hot",
+                    }));
+                }
+            }
+            Err(e) => return Json(json!({"error": e.to_string()})),
+        }
+        match s.delete_doc(id) {
+            Ok(n) => Json(json!({"ok": true, "deleted": n})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 /// Backups: list snapshots (GET) or take one now (POST).
@@ -1389,25 +1383,23 @@ async fn memory_sync(State(st): State<ApiState>) -> Json<Value> {
 }
 
 async fn trash(State(st): State<ApiState>) -> Json<Value> {
-    let s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.list_trash() {
-        Ok(rows) => Json(json!(rows)),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.list_trash() {
+            Ok(rows) => Json(json!(rows)),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 async fn restore_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let mut s = st
-        .store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.restore_doc(id) {
-        Ok(n) => Json(json!({"ok": true, "restored": n})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
+    with_store(&st.store, move |s| {
+        match s.restore_doc(id) {
+            Ok(n) => Json(json!({"ok": true, "restored": n})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize)]
