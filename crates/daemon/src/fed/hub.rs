@@ -18,6 +18,7 @@
 
 use super::client::{JoinOrigin, MintedInvite, join_at_from, mint_invite_full, pull_share, ticket_for_offer};
 use super::wire::{HubMember, HubPublicationInfo};
+use crate::store_ext::with_store;
 use anyhow::{Context, Result};
 use grimoire_store::{BlockStore, Contact, ContactRole, Membership, PrincipalKind, SqliteStore};
 use iroh::{Endpoint, EndpointAddr};
@@ -413,17 +414,17 @@ pub async fn accept_publication(
     offer_id: Uuid,
     addr: EndpointAddr,
 ) -> Result<Uuid> {
-    let (hub, offer, member) = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
-        let hub = config(&s).context("not a hub")?;
+    let (hub, offer, member) = with_store(store, move |s| -> Result<_> {
+        let hub = config(s).context("not a hub")?;
         let offer = s.get_share_offer(offer_id)?;
         let member = s
             .list_contacts()?
             .into_iter()
             .find(|c| c.id == offer.from_contact)
             .context("member contact is gone")?;
-        (hub, offer, member)
-    };
+        Ok((hub, offer, member))
+    })
+    .await?;
     if member.membership != Membership::Active || member.revoked {
         anyhow::bail!("only active members can publish");
     }
@@ -436,19 +437,23 @@ pub async fn accept_publication(
     let out = join_at_from(endpoint, store, &ticket, addr.clone(), JoinOrigin::HubRelay).await?;
     let root: Uuid = out.root_doc.parse().context("member sent a bad root id")?;
     {
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-        s.set_share_offer_state(offer.id, grimoire_store::ShareOfferState::Accepted)?;
-        let folder = member_folder(&mut s, &hub, &member)?;
-        if s.get_doc(root)?.parent_id != Some(folder) {
-            s.move_doc(root, Some(folder), None)?;
-        }
-        s.add_hub_publication(offer.share_id, member.id, root)?;
-        tracing::info!(
-            member = member.petname,
-            root = %root,
-            title = out.root_title,
-            "hub: publication accepted and filed"
-        );
+        let (offer, hub, member, root_title) = (offer.clone(), hub.clone(), member.clone(), out.root_title.clone());
+        with_store(store, move |s| -> Result<()> {
+            s.set_share_offer_state(offer.id, grimoire_store::ShareOfferState::Accepted)?;
+            let folder = member_folder(s, &hub, &member)?;
+            if s.get_doc(root)?.parent_id != Some(folder) {
+                s.move_doc(root, Some(folder), None)?;
+            }
+            s.add_hub_publication(offer.share_id, member.id, root)?;
+            tracing::info!(
+                member = member.petname,
+                root = %root,
+                title = root_title,
+                "hub: publication accepted and filed"
+            );
+            Ok(())
+        })
+        .await?;
     }
     match pull_share(endpoint, store, addr, &member, offer.share_id).await {
         Ok(sum) => tracing::info!(root = %root, docs = sum.changed, "hub: first pull of publication"),

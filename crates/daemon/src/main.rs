@@ -769,14 +769,15 @@ async fn main() -> anyhow::Result<()> {
                         // advertise our profile name on the LAN so neighbours
                         // read "Tom's MacBook", not a key
                         {
-                            let s = store.lock().unwrap_or_else(|p| p.into_inner());
-                            let name = s
-                                .list_principals()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .find(|p| p.kind == PrincipalKind::Human)
-                                .map(|p| p.display_name)
-                                .unwrap_or_default();
+                            let name = store_ext::with_store(&store, |s| {
+                                s.list_principals()
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .find(|p| p.kind == PrincipalKind::Human)
+                                    .map(|p| p.display_name)
+                                    .unwrap_or_default()
+                            })
+                            .await;
                             if let Ok(ud) = name.parse::<iroh::address_lookup::UserData>() {
                                 ep.set_user_data_for_address_lookup(Some(ud));
                             }
@@ -844,11 +845,12 @@ async fn main() -> anyhow::Result<()> {
                 Ok(e) => {
                     let e = Arc::new(e);
                     {
-                        let s = store.lock().unwrap_or_else(|p| p.into_inner());
-                        match e.load_index(&s) {
+                        let e = e.clone();
+                        store_ext::with_store(&store, move |s| match e.load_index(s) {
                             Ok(n) => tracing::info!(vectors = n, dim = e.dim, "embedding index loaded"),
                             Err(err) => tracing::warn!("embedding index load failed: {err}"),
-                        }
+                        })
+                        .await;
                     }
                     {
                         let (e, store) = (e.clone(), store.clone());
