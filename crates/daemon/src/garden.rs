@@ -149,6 +149,15 @@ async fn invoke_claude(prompt: &str) -> Result<(String, i64), String> {
     invoke_claude_with_dirs(prompt, &[]).await
 }
 
+/// A tool-less one-shot with a caller-chosen wall clock (the room agent:
+/// people are waiting). Same binary, same model, no read dirs.
+pub(crate) async fn invoke_claude_bounded(
+    prompt: &str,
+    wall_clock: Duration,
+) -> Result<(String, i64), String> {
+    invoke_claude_streaming(prompt, &[], wall_clock, |_| {}).await
+}
+
 /// `read_dirs` grants READ-ONLY tools scoped to those directories — the
 /// auditor's authoritative-source access. Writes still only exist through
 /// the gate; the model never gets a write tool.
@@ -279,7 +288,7 @@ async fn invoke_claude_streaming(
     }
 }
 
-fn parse_json_result<T: serde::de::DeserializeOwned>(result: &str) -> Result<T, String> {
+pub(crate) fn parse_json_result<T: serde::de::DeserializeOwned>(result: &str) -> Result<T, String> {
     let trimmed = result.trim();
     let json = trimmed
         .strip_prefix("```json")

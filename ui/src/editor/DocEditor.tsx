@@ -11,6 +11,7 @@ import { TableKit } from '@tiptap/extension-table'
 import CodeBlockView from './CodeBlockView'
 import { WikilinkDeco } from './WikilinkDeco'
 import { ReviewHighlight, ReviewMap, setReviewMap } from './ReviewHighlight'
+import { Suggestions } from './Suggestions'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block } from '../types'
 import { notify } from '../Notice'
@@ -73,6 +74,7 @@ export function makeExtensions({ history }: { history: boolean }) {
     WikilinkDeco,
     BlockId,
     ReviewHighlight,
+    Suggestions,
   ]
 }
 export const extensions = makeExtensions({ history: true })

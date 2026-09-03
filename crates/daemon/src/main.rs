@@ -12,6 +12,7 @@ mod hot;
 mod identity;
 mod yrender;
 mod mcp;
+mod room;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};

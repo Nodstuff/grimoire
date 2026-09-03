@@ -28,6 +28,14 @@ function colorFor(name: string): string {
   return CARET_COLORS[h % CARET_COLORS.length]
 }
 
+/** hot/status.agent — the room's agent, owner side. */
+export interface AgentStatus {
+  busy: boolean
+  last_error?: string | null
+  last_ok?: string | null
+  asks?: number
+}
+
 export interface HotDoc {
   docId: string
   frozenEpoch: number
@@ -43,6 +51,8 @@ export default function HotEditor({
   canEnd = true,
   viewersWrite,
   onToggleViewersWrite,
+  agent,
+  onAsk,
 }: {
   doc: HotDoc
   /** session over (we ended it, or the daemon dropped it) — reload cold */
@@ -60,7 +70,23 @@ export default function HotEditor({
    * a daemon that doesn't report it). */
   viewersWrite?: boolean
   onToggleViewersWrite?: (enabled: boolean) => void
+  /** Agents in the room: present on owned docs. `agent` mirrors hot/status. */
+  agent?: AgentStatus
+  onAsk?: (instruction: string) => Promise<void>
 }) {
+  const [ask, setAsk] = useState('')
+  const [asking, setAsking] = useState(false)
+  const submitAsk = async () => {
+    const q = ask.trim()
+    if (!q || !onAsk) return
+    setAsking(true)
+    try {
+      await onAsk(q)
+      setAsk('')
+    } finally {
+      setAsking(false)
+    }
+  }
   const [peerNames, setPeerNames] = useState<string[]>([])
   const [me, setMe] = useState<string>('me')
   const [connected, setConnected] = useState(false)
@@ -264,6 +290,33 @@ export default function HotEditor({
           </button>
         )}
       </div>
+      {onAsk && !readOnly && (
+        <div className="room-ask">
+          <span className="room-ask-mark" title="the room's agent — everything it writes is a suggestion you accept or reject">🌿</span>
+          <input
+            className="room-ask-input"
+            placeholder={agent?.busy ? 'scribe is thinking…' : 'ask the room\u2019s agent — e.g. “tighten the intro”, “pull the decision out of this thread”'}
+            value={ask}
+            disabled={asking || !!agent?.busy}
+            onChange={(e) => setAsk(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                submitAsk()
+              }
+            }}
+          />
+          {agent?.busy ? (
+            <span className="room-ask-status busy">thinking…</span>
+          ) : agent?.last_error ? (
+            <span className="room-ask-status error" title={agent.last_error}>
+              didn’t work — {agent.last_error.length > 60 ? agent.last_error.slice(0, 60) + '…' : agent.last_error}
+            </span>
+          ) : agent?.last_ok ? (
+            <span className="room-ask-status ok">{agent.last_ok}</span>
+          ) : null}
+        </div>
+      )}
       <EditorContent editor={editor} />
     </>
   )

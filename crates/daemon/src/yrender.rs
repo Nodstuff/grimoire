@@ -12,15 +12,31 @@ use yrs::types::xml::{XmlFragment, XmlOut};
 use yrs::{Any, GetString, Out, ReadTxn, Text, XmlElementRef, XmlTextRef};
 
 pub fn fragment_to_markdown<T: ReadTxn>(txn: &T, frag: &yrs::XmlFragmentRef) -> String {
+    fragment_to_blocks(txn, frag).join("\n\n")
+}
+
+/// The top-level blocks as markdown, in order. Nodes that are UNACCEPTED
+/// agent suggestions (`suggestion="insert"|"replace"`, see `room.rs`) are
+/// skipped: an ignored suggestion must never become doc content. A node
+/// marked `replaced` is the still-live original and renders normally.
+pub fn fragment_to_blocks<T: ReadTxn>(txn: &T, frag: &yrs::XmlFragmentRef) -> Vec<String> {
     let mut blocks: Vec<String> = Vec::new();
     for child in frag.children(txn) {
+        if let XmlOut::Element(el) = &child
+            && matches!(
+                attr_str(txn, el, "suggestion").as_deref(),
+                Some("insert") | Some("replace")
+            )
+        {
+            continue;
+        }
         if let Some(md) = render_node(txn, &child) {
             if !md.trim().is_empty() {
                 blocks.push(md);
             }
         }
     }
-    blocks.join("\n\n")
+    blocks
 }
 
 fn render_node<T: ReadTxn>(txn: &T, node: &XmlOut) -> Option<String> {

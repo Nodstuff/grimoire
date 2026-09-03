@@ -1355,3 +1355,36 @@ kbd {
 .profile-kv { display: grid; grid-template-columns: 90px 1fr auto; gap: 10px; align-items: center; padding: 4px 0; font-size: 13px; }
 .trash-row { grid-template-columns: minmax(120px, 1fr) auto auto; }
 .trash-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- agents in the room: suggestions + the ask box ---------- */
+
+.room-ask { display: flex; align-items: center; gap: 8px; margin: -6px 0 14px; font-size: 12px; color: var(--fg-dim); }
+.room-ask-mark { font-size: 13px; }
+.room-ask-input {
+  flex: 1;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+.room-ask-input:focus { border-color: var(--green); }
+.room-ask-input:disabled { opacity: 0.6; }
+.room-ask-status.busy { color: var(--green); }
+.room-ask-status.error { color: var(--red); }
+.room-ask-status.ok { color: var(--fg-dim); }
+
+.ProseMirror .suggestion { border-left: 2px solid var(--green); padding-left: 10px; margin-left: -12px; border-radius: 2px; }
+.ProseMirror .suggestion-insert, .ProseMirror .suggestion-replace { background: color-mix(in srgb, var(--green) 9%, transparent); }
+.ProseMirror .suggestion-replaced { border-left-color: var(--red); text-decoration: line-through; opacity: 0.55; }
+.suggestion-bar { display: flex; gap: 10px; align-items: center; font-size: 11px; color: var(--fg-dim); margin: -8px 0 14px -2px; user-select: none; }
+.suggestion-label { color: var(--green); }
+.suggestion-bar button {
+  background: none; border: 1px solid var(--border); color: var(--fg-dim);
+  border-radius: 6px; font-size: 11px; padding: 1px 8px; cursor: pointer;
+}
+.suggestion-bar button.suggestion-accept:hover { color: var(--green); border-color: var(--green); }
+.suggestion-bar button.suggestion-reject:hover { color: var(--red); border-color: var(--red); }

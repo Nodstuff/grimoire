@@ -60,6 +60,9 @@ pub struct HotSession {
     /// Everyone who joined: `None` = a local (owner) socket, `Some(pubkey)`
     /// = a remote bridge. Recorded into the flatten's provenance.
     pub participants: std::collections::HashSet<Option<String>>,
+    /// Agents that wrote suggestions in this session (room.rs) — named in
+    /// the flatten's provenance like any other participant.
+    pub agents: std::collections::HashSet<String>,
     /// First journal write failure (disk full, permissions). The session
     /// stays live — the text is in memory and flattens normally — but the
     /// crash-safety guarantee is gone, so the UI is told.
@@ -97,6 +100,9 @@ pub struct HotState {
     /// Bumped whenever a session starts or ends — a cheap "did hotness
     /// change?" signal for the owner-side nudge detector.
     pub generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Agents in the room (`room.rs`): per live doc, is the agent thinking,
+    /// what did it last say / fail with. Surfaced in hot/status.
+    pub agent: Arc<Mutex<HashMap<Uuid, crate::room::AgentStatus>>>,
 }
 
 impl HotState {
@@ -109,7 +115,52 @@ impl HotState {
             bridge_errors: Arc::new(Mutex::new(HashMap::new())),
             bridges: Arc::new(Mutex::new(HashMap::new())),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            agent: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn agent_status(&self, doc: Uuid) -> crate::room::AgentStatus {
+        self.agent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&doc)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Mark the agent busy for a doc; false if it already is (one ask at a time).
+    pub fn agent_begin(&self, doc: Uuid) -> bool {
+        let mut m = self.agent.lock().unwrap_or_else(|p| p.into_inner());
+        let st = m.entry(doc).or_default();
+        if st.busy {
+            return false;
+        }
+        st.busy = true;
+        st.asks += 1;
+        st.last_error = None;
+        st.last_ok = None;
+        true
+    }
+
+    pub fn agent_finish(&self, doc: Uuid, result: Result<usize, String>) {
+        let mut m = self.agent.lock().unwrap_or_else(|p| p.into_inner());
+        let st = m.entry(doc).or_default();
+        st.busy = false;
+        match result {
+            Ok(n) => {
+                st.last_error = None;
+                if st.last_ok.is_none() {
+                    st.last_ok = Some(format!("{n} suggestion{}", if n == 1 { "" } else { "s" }));
+                }
+            }
+            Err(e) => st.last_error = Some(e),
+        }
+    }
+
+    /// The agent's one-line note to the room (from its reply), if any.
+    pub fn set_agent_note(&self, doc: Uuid, note: Option<String>) {
+        let mut m = self.agent.lock().unwrap_or_else(|p| p.into_inner());
+        m.entry(doc).or_default().last_ok = note;
     }
 
     /// Current hotness generation (changes on every start/end).
@@ -372,6 +423,7 @@ impl HotState {
                 viewers_write: true,
                 starter: starter.map(str::to_string),
                 participants: std::collections::HashSet::new(),
+                agents: std::collections::HashSet::new(),
                 journal_error: None,
                 _doc_sub: sub,
             },
@@ -500,8 +552,10 @@ impl HotState {
             // the starter was in the room even if their socket never connected
             let mut who = session.participants.clone();
             who.insert(session.starter.clone());
-            (md, session.frozen_epoch, session.started_at.elapsed().as_secs(), who)
+            let agents = session.agents.clone();
+            (md, session.frozen_epoch, session.started_at.elapsed().as_secs(), (who, agents))
         };
+        let (participants, agents) = participants;
         // who was in the room, by petname (the owner by their own name): the
         // flatten lands under the owner's principal, so this is the only
         // record that a remote peer's keystrokes are in it
@@ -528,6 +582,9 @@ impl HotState {
                 .collect();
             names.sort();
             names.dedup();
+            let mut agents: Vec<String> = agents.iter().map(|a| format!("🌿 {a}")).collect();
+            agents.sort();
+            names.extend(agents);
             format!("participants: {}", names.join(", "))
         };
         // canvas sessions (#68/P2.5): shapes live in Y.Maps ("canvas_nodes"/
@@ -832,6 +889,7 @@ async fn hot_status(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json
             "can_write": true, // owned doc: always writable
             "viewers_write": s.viewers_write,
             "journal_error": s.journal_error,
+            "agent": ctx.hot.agent_status(doc_id),
         })),
         None => Json(json!({"hot": false, "editors": editors})),
     }
@@ -1022,8 +1080,50 @@ async fn hot_viewers_write(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct AskReq {
+    instruction: String,
+}
+
+/// Agents in the room: ask the session's agent for suggestions (owner side;
+/// the session and the agent both live here). Returns at once; progress and
+/// the outcome ride hot/status (`agent`), the suggestions ride the CRDT.
+async fn hot_ask(
+    State(ctx): State<HotCtx>,
+    Path(doc_id): Path<Uuid>,
+    Json(req): Json<AskReq>,
+) -> Json<Value> {
+    if mirror_of(&ctx, doc_id) {
+        return Json(json!({"error": "the room's agent runs on the owner's Grimoire — ask them to invite it"}));
+    }
+    if req.instruction.trim().is_empty() {
+        return Json(json!({"error": "say what you'd like the agent to do"}));
+    }
+    if !ctx.hot.is_hot(doc_id) {
+        return Json(json!({"error": "the doc is not in a live session"}));
+    }
+    if crate::garden::claude_bin().is_none() {
+        return Json(json!({"error": "Claude Code is not installed on this Mac — the room's agent needs it", "code": "no_claude"}));
+    }
+    if !ctx.hot.agent_begin(doc_id) {
+        return Json(json!({"error": "the agent is still working on the last ask", "code": "agent_busy"}));
+    }
+    let hot = ctx.hot.clone();
+    let store = ctx.store.clone();
+    tokio::spawn(async move {
+        let res = crate::room::ask(hot.clone(), store, doc_id, req.instruction).await;
+        match &res {
+            Err(e) => tracing::warn!(%doc_id, "room agent ask failed: {e}"),
+            Ok(n) => tracing::info!(%doc_id, landed = n, "room agent suggestions landed"),
+        }
+        hot.agent_finish(doc_id, res);
+    });
+    Json(json!({"ok": true}))
+}
+
 pub fn router(ctx: HotCtx) -> Router {
     Router::new()
+        .route("/api/doc/{id}/hot/ask", post(hot_ask))
         .route("/api/doc/{id}/hot/start", post(hot_start))
         .route("/api/doc/{id}/hot/end", post(hot_end))
         .route("/api/doc/{id}/hot/viewers_write", post(hot_viewers_write))

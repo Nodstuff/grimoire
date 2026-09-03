@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DocEditor from './editor/DocEditor'
-import HotEditor, { HotDoc } from './editor/HotEditor'
+import HotEditor, { AgentStatus, HotDoc } from './editor/HotEditor'
 import GraphView from './GraphView'
 import TendPanel from './TendPanel'
 import Gardeners from './Gardeners'
@@ -1149,6 +1149,8 @@ interface HotStatus {
   can_write?: boolean
   /** owned docs only: session-wide "everyone can edit" vs "watch only" */
   viewers_write?: boolean
+  /** owned docs only: the room's agent (agents in the room) */
+  agent?: AgentStatus
 }
 
 function DocView({
@@ -1451,6 +1453,7 @@ function DocView({
   // edit the live session (true) or only watch (false). Reported by
   // hot/status for owned docs; undefined for mirrors and older daemons.
   const [viewersWrite, setViewersWrite] = useState<boolean | undefined>(undefined)
+  const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null)
   const toggleViewersWrite = useCallback(
     async (enabled: boolean) => {
       setViewersWrite(enabled) // optimistic; the status poll re-reads the truth
@@ -1562,6 +1565,7 @@ function DocView({
           // editable state (it calls editor.setEditable), viewers_write the chip
           if (typeof st.can_write === 'boolean') setHotCanWrite(st.can_write)
           if (typeof st.viewers_write === 'boolean') setViewersWrite(st.viewers_write)
+          setAgentStatus(st.agent ?? null)
         })
         .catch(() => {})
     poll()
@@ -1680,6 +1684,23 @@ function DocView({
           canEnd={!isViewMirror}
           viewersWrite={mirror ? undefined : viewersWrite}
           onToggleViewersWrite={mirror ? undefined : toggleViewersWrite}
+          agent={mirror ? undefined : (agentStatus ?? undefined)}
+          onAsk={
+            mirror
+              ? undefined
+              : async (instruction) => {
+                  try {
+                    await api(`/api/doc/${docId}/hot/ask`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ instruction }),
+                    })
+                    setAgentStatus((a) => ({ ...(a ?? { busy: false }), busy: true, last_error: null, last_ok: null }))
+                  } catch (e) {
+                    notify(errText(e))
+                  }
+                }
+          }
           onEnded={() => {
             // Fetch the flattened tree FIRST, then swap it in and remount the
             // cold editor in the same tick. Remounting before the fetch
