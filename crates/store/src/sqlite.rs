@@ -4105,6 +4105,20 @@ impl SqliteStore {
             .map_err(Into::into)
     }
 
+    /// Hub side: drop forward records older than `older_than_days`. A forward
+    /// carries no outcome of its own (the owner's op and annotation do), so
+    /// age is the only terminal signal; the member's status handle for a
+    /// pruned forward then answers "unknown" instead of asking the owner.
+    /// Returns how many rows went.
+    pub fn prune_hub_forwards(&mut self, older_than_days: u32) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM hub_forwards
+             WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
+            params![format!("-{older_than_days} days")],
+        )?;
+        Ok(n)
+    }
+
     /// Docs whose content is a canvas scene (for tree/type badges).
     pub fn canvas_doc_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
@@ -4373,6 +4387,48 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
         backfill(&s.conn).unwrap();
         assert_eq!(key(a.id), ka, "idempotent");
+    }
+
+    /// prune_hub_forwards deletes by age only: a 40-day-old forward goes at
+    /// the 30-day cutoff, a fresh one and a 20-day-old one stay; 0 days
+    /// prunes everything already in the past.
+    #[test]
+    fn prune_hub_forwards_deletes_by_age() {
+        use crate::PrincipalKind;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s
+            .create_principal(PrincipalKind::Human, "Tom", None)
+            .unwrap();
+        let doc = s.create_doc("d", None, tom.id).unwrap();
+        let owner = s.pair_contact(&"a".repeat(64), "owner").unwrap();
+        let member = s.pair_contact(&"b".repeat(64), "member").unwrap();
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
+        for id in &ids {
+            s.add_hub_forward(*id, owner.id, member.id, Uuid::now_v7(), doc.id)
+                .unwrap();
+        }
+        for (id, days) in [(ids[0], 40), (ids[1], 20)] {
+            s.conn
+                .execute(
+                    "UPDATE hub_forwards
+                     SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)
+                     WHERE op_id = ?2",
+                    params![format!("-{days} days"), id.to_string()],
+                )
+                .unwrap();
+        }
+        assert_eq!(s.prune_hub_forwards(30).unwrap(), 1);
+        let left = s.hub_forwards_for(&ids).unwrap();
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().all(|f| f.op_id != ids[0]), "the 40-day row went");
+        assert_eq!(s.prune_hub_forwards(30).unwrap(), 0, "idempotent");
+        // 0 days: everything strictly in the past goes (the fresh row may
+        // share the cutoff's millisecond and legitimately survive)
+        assert!(s.prune_hub_forwards(0).unwrap() >= 1);
+        assert!(
+            s.hub_forwards_for(&ids).unwrap().iter().all(|f| f.op_id != ids[1]),
+            "the 20-day row went"
+        );
     }
 
     /// Items 8/9: the connection runs WAL + synchronous NORMAL with a busy
