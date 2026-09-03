@@ -364,6 +364,9 @@ export default function DocTree({
           }}
           spellCheck={false}
         />
+        <button type="button" className="tree-close" onClick={onClose} title="close the tree (⌘T)">
+          ⌘T
+        </button>
       </div>
       {pendingMove && (
         <div className="move-confirm">

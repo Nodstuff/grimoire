@@ -230,8 +230,11 @@ kbd {
 /* one right-aligned badge cluster: now-state always, ownership on hover/sel */
 .tree-badges { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .tree-badges .tend-dot { margin: 0 2px; }
-.tree-badges .quiet { margin-left: 0; opacity: 0; transition: opacity 0.12s; }
+.tree-badges .quiet { margin-left: 0; opacity: 0.45; transition: opacity 0.12s; }
 .tree-item:hover .quiet, .tree-item.sel .quiet { opacity: 1; }
+.sidebar-head { display: flex; align-items: center; gap: 6px; }
+.tree-close { flex-shrink: 0; background: none; border: 1px solid var(--border); color: var(--fg-dim); border-radius: 5px; font-size: 10px; padding: 2px 6px; cursor: pointer; }
+.tree-close:hover { color: var(--fg); background: var(--panel2); }
 .tree-count {
   font-size: 10px;
   color: var(--fg-dim);
