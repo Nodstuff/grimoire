@@ -455,6 +455,15 @@ pub async fn notify_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot
         let snapshot: Vec<(grimoire_store::Share, grimoire_store::Contact, Vec<(Uuid, String, DocMark)>)> = {
             let s = store.lock().unwrap_or_else(|p| p.into_inner());
             let contacts = s.list_contacts().unwrap_or_default();
+            // never nudge about a mirror: its changes are the owner's, not
+            // ours (a transferred subtree is served back to its new owner
+            // but is nothing to announce to them)
+            // (a hub is the exception: relayed mirrors ARE what it announces)
+            let mirror_ids: std::collections::HashSet<Uuid> = if super::hub::config(&s).is_some() {
+                Default::default()
+            } else {
+                s.list_mirrors().unwrap_or_default().into_iter().map(|m| m.doc_id).collect()
+            };
             s.list_shares()
                 .unwrap_or_default()
                 .into_iter()
@@ -464,6 +473,7 @@ pub async fn notify_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot
                     let docs = served_docs_for(&s, sh.id, Some(&c.pubkey)).ok()?;
                     let view: Vec<(Uuid, String, DocMark)> = docs
                         .into_iter()
+                        .filter(|d| !mirror_ids.contains(&d.id))
                         .map(|d| {
                             (
                                 d.id,

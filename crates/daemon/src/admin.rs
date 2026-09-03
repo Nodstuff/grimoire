@@ -1053,6 +1053,7 @@ async fn list_hubs(State(st): State<FedState>) -> Json<Value> {
     let contacts = s.list_contacts().unwrap_or_default();
     let shares = s.list_shares().unwrap_or_default();
     let mirrors = s.list_mirrors().unwrap_or_default();
+    let transfers = s.list_doc_transfers().unwrap_or_default();
     let rows: Vec<Value> = contacts
         .iter()
         .filter(|c| c.is_hub && !c.revoked)
@@ -1064,9 +1065,30 @@ async fn list_hubs(State(st): State<FedState>) -> Json<Value> {
                 .filter(|m| m.owner == c.id)
                 .filter_map(|m| s.get_doc(m.doc_id).ok())
                 .find(|d| d.parent_id.map(|p| !ids.contains(&p)).unwrap_or(true));
+            // slice 2: folders I handed over (done) or offered (waiting for an admin)
+            let mine_out: Vec<&grimoire_store::DocTransfer> = transfers
+                .iter()
+                .filter(|t| t.counterparty == c.id && t.direction == grimoire_store::TransferDirection::Out)
+                .collect();
+            let transferred: std::collections::HashSet<Uuid> =
+                mine_out.iter().filter(|t| t.state == "done").map(|t| t.root_doc).collect();
+            let transfers_json: Vec<Value> = mine_out
+                .iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "root_doc": t.root_doc,
+                        "root_title": s.get_doc(t.root_doc).map(|d| d.title).unwrap_or_default(),
+                        "state": t.state,
+                        "at": t.at,
+                    })
+                })
+                .collect();
             let publications: Vec<Value> = shares
                 .iter()
                 .filter(|sh| sh.contact == Some(c.id) && sh.state != grimoire_store::ShareState::Revoked)
+                // a transferred folder's share is the pipe the hub pulled through, not a publication
+                .filter(|sh| !transferred.contains(&sh.root_doc))
                 .map(|sh| {
                     json!({
                         "share_id": sh.id,
@@ -1086,6 +1108,7 @@ async fn list_hubs(State(st): State<FedState>) -> Json<Value> {
                 "root_doc_id": root.as_ref().map(|d| d.id),
                 "relayed_docs": mirrors.iter().filter(|m| m.owner == c.id && m.origin_owner.is_some()).count(),
                 "publications": publications,
+                "transfers": transfers_json,
             })
         })
         .collect();
@@ -1204,6 +1227,195 @@ pub struct HubReq {
 /// Ask a hub I administer for a fresh invite link (to onboard someone).
 async fn hub_invite(State(st): State<FedState>, Json(req): Json<HubReq>) -> Json<Value> {
     hub_action(&st, req.hub, crate::fed::wire::HubAction::Invite).await
+}
+
+// --- hubs (slice 2): hub-owned queue, transfers ------------------------------
+
+/// Open proposals on docs the hub itself owns (admins only; fetched when the
+/// section opens, never polled). Same item shape as /api/queue.
+async fn hub_queue(State(st): State<FedState>, Query(q): Query<HubQuery>) -> Json<Value> {
+    use crate::fed::wire::{HubAction, Request, Response};
+    match dial_hub(&st, q.hub, Request::HubAdmin { action: HubAction::ReviewQueue }).await {
+        Ok(Response::HubQueue { items }) => Json(json!({"items": items})),
+        Ok(Response::Refused { reason, .. }) => Json(json!({"error": reason})),
+        Ok(other) => Json(json!({"error": format!("unexpected reply: {other:?}")})),
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct HubResolveReq {
+    pub hub: Uuid,
+    pub annotation_id: Uuid,
+    pub decision: String,
+}
+
+async fn hub_resolve(State(st): State<FedState>, Json(req): Json<HubResolveReq>) -> Json<Value> {
+    hub_action(
+        &st,
+        req.hub,
+        crate::fed::wire::HubAction::Resolve {
+            annotation_id: req.annotation_id.to_string(),
+            decision: req.decision,
+        },
+    )
+    .await
+}
+
+/// Transfer offers at a hub I administer, every state.
+async fn hub_transfers(State(st): State<FedState>, Query(q): Query<HubQuery>) -> Json<Value> {
+    use crate::fed::wire::{HubAction, Request, Response};
+    match dial_hub(&st, q.hub, Request::HubAdmin { action: HubAction::ListTransfers }).await {
+        Ok(Response::HubTransfers { transfers }) => Json(json!({"transfers": transfers})),
+        Ok(Response::Refused { reason, .. }) => Json(json!({"error": reason})),
+        Ok(other) => Json(json!({"error": format!("unexpected reply: {other:?}")})),
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct HubTransferReq {
+    pub hub: Uuid,
+    pub id: Uuid,
+}
+
+async fn hub_transfer_accept(State(st): State<FedState>, Json(req): Json<HubTransferReq>) -> Json<Value> {
+    hub_action(&st, req.hub, crate::fed::wire::HubAction::AcceptTransfer { id: req.id.to_string() }).await
+}
+
+async fn hub_transfer_decline(State(st): State<FedState>, Json(req): Json<HubTransferReq>) -> Json<Value> {
+    hub_action(&st, req.hub, crate::fed::wire::HubAction::DeclineTransfer { id: req.id.to_string() }).await
+}
+
+#[derive(Deserialize)]
+pub struct TransferOfferReq {
+    pub hub: Uuid,
+    pub root_doc: Uuid,
+}
+
+/// Offer a subtree I own to a hub as a TRANSFER: the hub will own it, my copy
+/// becomes a read-only mirror once an admin accepts. Nothing changes here
+/// until then — this only records the offer on both sides.
+async fn offer_transfer(State(st): State<FedState>, Json(req): Json<TransferOfferReq>) -> Json<Value> {
+    use crate::fed::wire::{Request, Response};
+    let (title, doc_count) = {
+        let s = st
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Ok(doc) = s.get_doc(req.root_doc) else {
+            return Json(json!({"error": "no such doc"}));
+        };
+        if s.doc_is_tombstoned(req.root_doc).unwrap_or(true) {
+            return Json(json!({"error": "that folder is in the trash"}));
+        }
+        let subtree = s.doc_subtree_ids(req.root_doc).unwrap_or_default();
+        for id in &subtree {
+            if s.get_mirror(*id).ok().flatten().is_some() {
+                let t = s.get_doc(*id).map(|d| d.title).unwrap_or_default();
+                return Json(json!({"error": format!("“{t}” was shared to you — only its owner can transfer it")}));
+            }
+        }
+        if !s
+            .list_contacts()
+            .unwrap_or_default()
+            .iter()
+            .any(|c| c.id == req.hub && c.is_hub && !c.revoked && c.membership == grimoire_store::Membership::Active)
+        {
+            return Json(json!({"error": "you are not an active member of that hub"}));
+        }
+        (doc.title, subtree.len())
+    };
+    match dial_hub(
+        &st,
+        req.hub,
+        Request::TransferOffer {
+            root_doc: req.root_doc.to_string(),
+            title: title.clone(),
+            doc_count,
+        },
+    )
+    .await
+    {
+        Ok(Response::TransferOffered { id }) => {
+            let mut s = st
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(e) = s.add_doc_transfer(req.root_doc, req.hub, grimoire_store::TransferDirection::Out, "offered") {
+                return Json(json!({"error": e.to_string()}));
+            }
+            Json(json!({"ok": true, "id": id, "title": title, "doc_count": doc_count}))
+        }
+        Ok(Response::Refused { reason, .. }) => Json(json!({"error": reason})),
+        Ok(other) => Json(json!({"error": format!("unexpected reply: {other:?}")})),
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
+// --- the hub box itself (slice 2): queue + transfers for the CLI ----------------
+
+async fn local_hub_transfers(State(st): State<FedState>) -> Json<Value> {
+    let s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if crate::fed::hub::config(&s).is_none() {
+        return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
+    }
+    Json(json!(crate::fed::hub::transfers(&s)))
+}
+
+#[derive(Deserialize)]
+pub struct LocalTransferReq {
+    pub id: Uuid,
+}
+
+async fn local_hub_transfer_accept(State(st): State<FedState>, Json(req): Json<LocalTransferReq>) -> Json<Value> {
+    let Some(endpoint) = &st.ctx.endpoint else {
+        return Json(json!({"error": "sharing is off: this Grimoire has no identity yet"}));
+    };
+    {
+        let mut s = st
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if crate::fed::hub::config(&s).is_none() {
+            return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
+        }
+        match s.get_hub_transfer(req.id) {
+            Ok(t) if t.state == grimoire_store::HubTransferState::Done => return Json(json!({"ok": true, "state": "done"})),
+            Ok(t) if t.state == grimoire_store::HubTransferState::Declined => return Json(json!({"error": "that transfer was declined"})),
+            Ok(_) => {}
+            Err(e) => return Json(json!({"error": e.to_string()})),
+        }
+        if let Err(e) = s.set_hub_transfer_state(req.id, grimoire_store::HubTransferState::Accepted) {
+            return Json(json!({"error": e.to_string()}));
+        }
+    }
+    // synchronous here (the CLI waits): dial the member, pull, take over
+    match crate::fed::transfer::hub_complete(endpoint, &st.store, req.id, None).await {
+        Ok(()) => Json(json!({"ok": true, "state": "done"})),
+        Err(e) => Json(json!({"error": format!("{e:#}")})),
+    }
+}
+
+async fn local_hub_transfer_decline(State(st): State<FedState>, Json(req): Json<LocalTransferReq>) -> Json<Value> {
+    let mut s = st
+        .store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if crate::fed::hub::config(&s).is_none() {
+        return Json(json!({"error": "this Grimoire is not a hub (start it with --hub)"}));
+    }
+    match s.get_hub_transfer(req.id) {
+        Ok(t) if t.state == grimoire_store::HubTransferState::Done => Json(json!({"error": "that folder is already the hub's"})),
+        Ok(_) => match s.set_hub_transfer_state(req.id, grimoire_store::HubTransferState::Declined) {
+            Ok(()) => Json(json!({"ok": true})),
+            Err(e) => Json(json!({"error": e.to_string()})),
+        },
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
 }
 
 // --- the hub box itself: local routes for the CLI over an SSH tunnel -------
@@ -1355,6 +1567,15 @@ pub fn router(
         .route("/admin/hubs/eject", post(hub_eject))
         .route("/admin/hubs/role", post(hub_role))
         .route("/admin/hubs/invite", post(hub_invite))
+        .route("/admin/hubs/queue", get(hub_queue))
+        .route("/admin/hubs/resolve", post(hub_resolve))
+        .route("/admin/hubs/transfers", get(hub_transfers))
+        .route("/admin/hubs/transfers/accept", post(hub_transfer_accept))
+        .route("/admin/hubs/transfers/decline", post(hub_transfer_decline))
+        .route("/admin/hubs/transfer", post(offer_transfer))
+        .route("/admin/hub/transfers", get(local_hub_transfers))
+        .route("/admin/hub/transfers/accept", post(local_hub_transfer_accept))
+        .route("/admin/hub/transfers/decline", post(local_hub_transfer_decline))
         // … and THIS Grimoire as a hub (the CLI on the box)
         .route("/admin/hub/members", get(local_hub_members))
         .route("/admin/hub/approve", post(local_hub_approve))

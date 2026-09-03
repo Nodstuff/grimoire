@@ -728,10 +728,14 @@ pub async fn propose_upstream(
             note: note.to_string(),
             base_epoch: Some(mirror.synced_epoch),
             request_id: Some(uuid::Uuid::now_v7().to_string()),
+            on_behalf_of: None,
         },
     )
     .await?;
     let Response::Proposed { op_ids } = res else {
+        if let Response::Refused { reason, code } = res {
+            return Err(Refusal::new(code, format!("{} did not take the edit: {reason}", owner.petname)).into());
+        }
         anyhow::bail!("owner refused proposal: {res:?}");
     };
     let ids: Vec<uuid::Uuid> = op_ids.iter().filter_map(|s| s.parse().ok()).collect();

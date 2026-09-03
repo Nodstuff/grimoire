@@ -627,6 +627,36 @@ type RawMirror = (
 
 const MIRROR_COLS: &str = "doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error, owner_epoch, origin_owner, origin_owner_name";
 
+type RawHubTransfer = (String, String, String, String, i64, String, String);
+
+const HUB_TRANSFER_COLS: &str = "id, member_contact, root_doc, title, doc_count, state, at";
+
+fn hub_transfer_row(row: &rusqlite::Row) -> rusqlite::Result<RawHubTransfer> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn finish_hub_transfer(raw: RawHubTransfer) -> Result<HubTransfer> {
+    let (id, member_contact, root_doc, title, doc_count, state, at) = raw;
+    Ok(HubTransfer {
+        id: uuid_col(id, "hub_transfers.id")?,
+        member_contact: uuid_col(member_contact, "hub_transfers.member_contact")?,
+        root_doc: uuid_col(root_doc, "hub_transfers.root_doc")?,
+        title,
+        doc_count,
+        state: HubTransferState::parse(&state)
+            .ok_or_else(|| StoreError::InvalidOp(format!("bad hub transfer state {state}")))?,
+        at,
+    })
+}
+
 fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
     Ok((
         row.get(0)?,
@@ -2584,7 +2614,8 @@ impl BlockStore for SqliteStore {
                 .query_row(
                     "SELECT o.principal, o.epoch_applied,
                             (SELECT a.status FROM annotations a
-                             WHERE a.op_id = o.id ORDER BY a.created_at DESC LIMIT 1)
+                             WHERE a.op_id = o.id ORDER BY a.created_at DESC LIMIT 1),
+                            o.source_refs
                      FROM ops o WHERE o.id = ?1",
                     params![id.to_string()],
                     |r| {
@@ -2592,20 +2623,233 @@ impl BlockStore for SqliteStore {
                             r.get::<_, String>(0)?,
                             r.get::<_, Option<i64>>(1)?,
                             r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(3)?,
                         ))
                     },
                 )
                 .optional()?;
-            if let Some((principal, epoch_applied, review)) = row {
+            if let Some((principal, epoch_applied, review, refs)) = row {
                 out.push(OpStatus {
                     op_id: *id,
                     principal: uuid_col(principal, "ops.principal")?,
                     applied: epoch_applied.is_some(),
                     review,
+                    source_refs: serde_json::from_str(&refs).unwrap_or_default(),
                 });
             }
         }
         Ok(out)
+    }
+
+    // --- hub slice 2: forwarding + transfers ---
+
+    fn remote_principal_for(&mut self, pubkey: &str, name: &str) -> Result<Uuid> {
+        if let Some(c) = self.contact_by_pubkey(pubkey)? {
+            return Ok(c.principal);
+        }
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM principals WHERE kind = 'remote' AND pubkey = ?1 ORDER BY id LIMIT 1",
+                params![pubkey],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return uuid_col(id, "principals.id");
+        }
+        let name = name.trim();
+        let name = if name.is_empty() { "someone" } else { name };
+        Ok(self
+            .create_principal(PrincipalKind::Remote, name, Some(pubkey))?
+            .id)
+    }
+
+    fn add_hub_forward(
+        &mut self,
+        op_id: Uuid,
+        owner_contact: Uuid,
+        member_contact: Uuid,
+        owner_share: Uuid,
+        doc_id: Uuid,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO hub_forwards (op_id, owner_contact, member_contact, owner_share, doc_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                op_id.to_string(),
+                owner_contact.to_string(),
+                member_contact.to_string(),
+                owner_share.to_string(),
+                doc_id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn hub_forwards_for(&self, op_ids: &[Uuid]) -> Result<Vec<HubForward>> {
+        let mut out = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT op_id, owner_contact, member_contact, owner_share, doc_id
+             FROM hub_forwards WHERE op_id = ?1",
+        )?;
+        for id in op_ids {
+            let row: Option<(String, String, String, String, String)> = stmt
+                .query_row(params![id.to_string()], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })
+                .optional()?;
+            if let Some((op_id, owner_contact, member_contact, owner_share, doc_id)) = row {
+                out.push(HubForward {
+                    op_id: uuid_col(op_id, "hub_forwards.op_id")?,
+                    owner_contact: uuid_col(owner_contact, "hub_forwards.owner_contact")?,
+                    member_contact: uuid_col(member_contact, "hub_forwards.member_contact")?,
+                    owner_share: uuid_col(owner_share, "hub_forwards.owner_share")?,
+                    doc_id: uuid_col(doc_id, "hub_forwards.doc_id")?,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn add_hub_transfer(
+        &mut self,
+        member_contact: Uuid,
+        root_doc: Uuid,
+        title: &str,
+        doc_count: i64,
+    ) -> Result<HubTransfer> {
+        // one open offer per (member, root): a re-offer replaces it
+        self.conn.execute(
+            "DELETE FROM hub_transfers WHERE member_contact = ?1 AND root_doc = ?2 AND state = 'offered'",
+            params![member_contact.to_string(), root_doc.to_string()],
+        )?;
+        let id = Uuid::now_v7();
+        self.conn.execute(
+            "INSERT INTO hub_transfers (id, member_contact, root_doc, title, doc_count)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id.to_string(),
+                member_contact.to_string(),
+                root_doc.to_string(),
+                title,
+                doc_count
+            ],
+        )?;
+        self.get_hub_transfer(id)
+    }
+
+    fn list_hub_transfers(&self) -> Result<Vec<HubTransfer>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {HUB_TRANSFER_COLS} FROM hub_transfers ORDER BY at"))?;
+        let rows = stmt.query_map([], hub_transfer_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(finish_hub_transfer)
+            .collect()
+    }
+
+    fn get_hub_transfer(&self, id: Uuid) -> Result<HubTransfer> {
+        self.conn
+            .query_row(
+                &format!("SELECT {HUB_TRANSFER_COLS} FROM hub_transfers WHERE id = ?1"),
+                params![id.to_string()],
+                hub_transfer_row,
+            )
+            .optional()?
+            .map(finish_hub_transfer)
+            .transpose()?
+            .ok_or_else(|| StoreError::NotFound(format!("transfer {id}")))
+    }
+
+    fn set_hub_transfer_state(&mut self, id: Uuid, state: HubTransferState) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE hub_transfers SET state = ?1 WHERE id = ?2",
+            params![state.as_str(), id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("transfer {id}")));
+        }
+        Ok(())
+    }
+
+    fn add_doc_transfer(
+        &mut self,
+        root_doc: Uuid,
+        counterparty: Uuid,
+        direction: TransferDirection,
+        state: &str,
+    ) -> Result<DocTransfer> {
+        if !matches!(state, "offered" | "done") {
+            return Err(StoreError::InvalidOp(format!("bad transfer state {state}")));
+        }
+        // one live record per (root, direction): a re-offer replaces an open one
+        self.conn.execute(
+            "DELETE FROM doc_transfers WHERE root_doc = ?1 AND direction = ?2 AND state = 'offered'",
+            params![root_doc.to_string(), direction.as_str()],
+        )?;
+        let id = Uuid::now_v7();
+        self.conn.execute(
+            "INSERT INTO doc_transfers (id, root_doc, counterparty, direction, state)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id.to_string(),
+                root_doc.to_string(),
+                counterparty.to_string(),
+                direction.as_str(),
+                state
+            ],
+        )?;
+        Ok(self
+            .list_doc_transfers()?
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| StoreError::NotFound(format!("transfer {id}")))?)
+    }
+
+    fn list_doc_transfers(&self) -> Result<Vec<DocTransfer>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, root_doc, counterparty, direction, state, at FROM doc_transfers ORDER BY at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (id, root_doc, counterparty, direction, state, at) = r?;
+            Ok(DocTransfer {
+                id: uuid_col(id, "doc_transfers.id")?,
+                root_doc: uuid_col(root_doc, "doc_transfers.root_doc")?,
+                counterparty: uuid_col(counterparty, "doc_transfers.counterparty")?,
+                direction: TransferDirection::parse(&direction).ok_or_else(|| {
+                    StoreError::InvalidOp(format!("bad transfer direction {direction}"))
+                })?,
+                state,
+                at,
+            })
+        })
+        .collect()
+    }
+
+    fn set_doc_transfer_state(&mut self, id: Uuid, state: &str) -> Result<()> {
+        if !matches!(state, "offered" | "done") {
+            return Err(StoreError::InvalidOp(format!("bad transfer state {state}")));
+        }
+        let n = self.conn.execute(
+            "UPDATE doc_transfers SET state = ?1 WHERE id = ?2",
+            params![state, id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("transfer {id}")));
+        }
+        Ok(())
     }
 
     fn set_invite_offered_to(&mut self, share_id: Uuid, contact: Uuid) -> Result<()> {
@@ -3841,6 +4085,86 @@ impl SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hub slice 2 bookkeeping: on-behalf-of principals, forward records,
+    /// hub-side transfer offers, and the two-sided transfer ledger.
+    #[test]
+    fn hub_slice_2_tables_round_trip() {
+        use crate::PrincipalKind;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let hub = s.pair_contact(&"aa".repeat(32), "Team").unwrap();
+        let bob_key = "bb".repeat(32);
+        // a stranger's principal is created once, keyed by pubkey, no contact row
+        let p1 = s.remote_principal_for(&bob_key, "bob").unwrap();
+        let p2 = s.remote_principal_for(&bob_key, "robert").unwrap();
+        assert_eq!(p1, p2, "same pubkey → same principal");
+        assert_eq!(s.get_principal(p1).unwrap().display_name, "bob", "first name sticks");
+        assert!(s.contact_by_pubkey(&bob_key).unwrap().is_none(), "no contact row");
+        // a known contact's principal is reused
+        assert_eq!(s.remote_principal_for(&hub.pubkey, "x").unwrap(), hub.principal);
+        // empty name never yields an empty principal
+        let anon = s.remote_principal_for(&"cc".repeat(32), "  ").unwrap();
+        assert_eq!(s.get_principal(anon).unwrap().display_name, "someone");
+
+        // op_statuses carries source_refs
+        let doc = s.create_doc("d", None, tom.id).unwrap();
+        let ids = s
+            .park(
+                doc.id,
+                p1,
+                vec![OpInput {
+                    kind: OpKind::Insert {
+                        block_id: Uuid::now_v7(),
+                        parent_id: None,
+                        order_key: "a".into(),
+                        block_type: BlockType::Paragraph,
+                        content: "hi".into(),
+                        refers_to: None,
+                    },
+                    source_refs: vec!["via hub: Team".into()],
+                }],
+                "n",
+            )
+            .unwrap();
+        let st = s.op_statuses(&ids).unwrap();
+        assert_eq!(st.len(), 1);
+        assert!(st[0].source_refs.contains(&"via hub: Team".to_string()));
+        assert_eq!(st[0].review.as_deref(), Some("open"));
+
+        // forwards: owner op id → (owner, member, share)
+        let member = s.pair_contact(&bob_key, "bob").unwrap();
+        let share = Uuid::now_v7();
+        s.add_hub_forward(ids[0], hub.id, member.id, share, doc.id).unwrap();
+        let f = s.hub_forwards_for(&[ids[0], Uuid::now_v7()]).unwrap();
+        assert_eq!(f.len(), 1, "unknown ids skipped");
+        assert_eq!((f[0].owner_contact, f[0].member_contact, f[0].owner_share, f[0].doc_id), (hub.id, member.id, share, doc.id));
+
+        // hub transfers: one open offer per (member, root); state moves
+        let t1 = s.add_hub_transfer(member.id, doc.id, "d", 3).unwrap();
+        assert_eq!((t1.state, t1.doc_count, t1.title.as_str()), (HubTransferState::Offered, 3, "d"));
+        let t2 = s.add_hub_transfer(member.id, doc.id, "d2", 4).unwrap();
+        assert_ne!(t1.id, t2.id);
+        assert_eq!(s.list_hub_transfers().unwrap().len(), 1, "re-offer replaced the open one");
+        assert!(s.get_hub_transfer(t1.id).is_err());
+        s.set_hub_transfer_state(t2.id, HubTransferState::Done).unwrap();
+        assert_eq!(s.get_hub_transfer(t2.id).unwrap().state, HubTransferState::Done);
+        let t3 = s.add_hub_transfer(member.id, doc.id, "d3", 1).unwrap();
+        assert_eq!(s.list_hub_transfers().unwrap().len(), 2, "a done one is history, not replaced");
+        assert!(matches!(s.set_hub_transfer_state(Uuid::now_v7(), HubTransferState::Declined), Err(StoreError::NotFound(_))));
+        let _ = t3;
+
+        // doc transfers ledger
+        let out = s.add_doc_transfer(doc.id, hub.id, TransferDirection::Out, "offered").unwrap();
+        assert_eq!((out.direction, out.state.as_str()), (TransferDirection::Out, "offered"));
+        s.set_doc_transfer_state(out.id, "done").unwrap();
+        let again = s.add_doc_transfer(doc.id, hub.id, TransferDirection::Out, "offered").unwrap();
+        assert_ne!(again.id, out.id);
+        let all = s.list_doc_transfers().unwrap();
+        assert_eq!(all.len(), 2, "a done record is kept when a new offer arrives");
+        assert!(s.add_doc_transfer(doc.id, hub.id, TransferDirection::In, "bogus").is_err());
+        assert!(s.set_doc_transfer_state(again.id, "bogus").is_err());
+    }
 
     /// Fresh installs from before the maintainer tier created `shares` with a
     /// CHECK allowing only review|yellow; opening such a DB must widen it so

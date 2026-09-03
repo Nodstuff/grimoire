@@ -280,6 +280,47 @@ CREATE TABLE IF NOT EXISTS hub_publications (
     published_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+-- Hub side (slice 2): proposals the hub FORWARDED to a doc's true owner on a
+-- member's behalf. op_id is the OWNER's op id (returned to the member as the
+-- status handle); a member's ProposalStatus for it is answered by asking the
+-- owner. owner_share is the owner's share id the hub holds (the publication).
+CREATE TABLE IF NOT EXISTS hub_forwards (
+    op_id          TEXT PRIMARY KEY,
+    owner_contact  TEXT NOT NULL REFERENCES contacts (id),
+    member_contact TEXT NOT NULL REFERENCES contacts (id),
+    owner_share    TEXT NOT NULL,
+    doc_id         TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Hub side (slice 2): ownership transfers members offered the hub. An admin
+-- accepts or declines; on accept the hub dials the member, pulls the subtree,
+-- and flips its mirrors to owned docs (state done).
+CREATE TABLE IF NOT EXISTS hub_transfers (
+    id             TEXT PRIMARY KEY,
+    member_contact TEXT NOT NULL REFERENCES contacts (id),
+    root_doc       TEXT NOT NULL,
+    title          TEXT NOT NULL,
+    doc_count      INTEGER NOT NULL DEFAULT 0,
+    state          TEXT NOT NULL DEFAULT 'offered'
+        CHECK (state IN ('offered', 'accepted', 'declined', 'done')),
+    at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Both sides (slice 2): the ledger of ownership transfers this instance took
+-- part in. direction 'out' = I gave the subtree away (my copy is now a
+-- mirror of the counterparty); 'in' = I took it over. state offered|done.
+CREATE TABLE IF NOT EXISTS doc_transfers (
+    id           TEXT PRIMARY KEY,
+    root_doc     TEXT NOT NULL,
+    counterparty TEXT NOT NULL REFERENCES contacts (id),
+    direction    TEXT NOT NULL CHECK (direction IN ('out', 'in')),
+    state        TEXT NOT NULL DEFAULT 'offered' CHECK (state IN ('offered', 'done')),
+    at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS doc_transfers_by_root ON doc_transfers (root_doc);
+
 -- Instance-level key/value settings (profile confirmation etc.). Tiny and
 -- deliberately schemaless: anything bigger deserves its own table.
 CREATE TABLE IF NOT EXISTS settings (

@@ -93,7 +93,20 @@ export function publishedLine(hubName: string, n: number): string {
   return `published to ${hubName}: ${n}`
 }
 
-/** The banner line for a doc relayed through a hub: who really owns it. */
-export function relayedLine(hubName: string, ownerName: string): string {
-  return `⌂ ${hubName} · owned by ${ownerName} · read-only for now`
+/** The banner line for a doc relayed through a hub: who really owns it, and
+ * where an edit goes (through the hub, to them, as a suggestion). */
+export function relayedLine(hubName: string, ownerName: string, canPropose = true): string {
+  const tail = canPropose ? `your edits go to ${ownerName} as suggestions` : 'view only'
+  return `⌂ ${hubName} · owned by ${ownerName} · ${tail}`
+}
+
+/** The banner line for a doc I handed to a hub: the hub owns it now. */
+export function transferredLine(hubName: string): string {
+  return `⌂ owned by ${hubName} (transferred from you) · your edits go to ${hubName} as suggestions`
+}
+
+/** "3 proposals waiting" / "1 proposal waiting" / null. */
+export function waitingLine(n: number): string | null {
+  if (n <= 0) return null
+  return `${n} proposal${n === 1 ? '' : 's'} waiting`
 }

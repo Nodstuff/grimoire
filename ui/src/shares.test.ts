@@ -115,13 +115,18 @@ describe('invites v2 seams', () => {
 
 describe('hub lines', () => {
   it('says where I stand at a hub', async () => {
-    const { hubStandingLine, publishedLine, relayedLine } = await import('./shares')
+    const { hubStandingLine, publishedLine, relayedLine, transferredLine, waitingLine } = await import('./shares')
     expect(hubStandingLine('member', 'pending')).toBe('waiting for an admin to approve you')
     expect(hubStandingLine('admin', 'pending')).toBe('waiting for an admin to approve you')
     expect(hubStandingLine('member', 'active')).toBe('you are a member')
     expect(hubStandingLine('admin', 'active')).toBe('you are an admin')
     expect(hubStandingLine('member', 'ejected')).toBe('you were removed')
     expect(publishedLine('Team', 2)).toBe('published to Team: 2')
-    expect(relayedLine('Team', 'alice')).toBe('⌂ Team · owned by alice · read-only for now')
+    expect(relayedLine('Team', 'alice')).toBe('⌂ Team · owned by alice · your edits go to alice as suggestions')
+    expect(relayedLine('Team', 'alice', false)).toBe('⌂ Team · owned by alice · view only')
+    expect(transferredLine('Team')).toBe('⌂ owned by Team (transferred from you) · your edits go to Team as suggestions')
+    expect(waitingLine(0)).toBeNull()
+    expect(waitingLine(1)).toBe('1 proposal waiting')
+    expect(waitingLine(3)).toBe('3 proposals waiting')
   })
 })

@@ -6,11 +6,12 @@
 // share lives here.
 
 import { useCallback, useEffect, useState } from 'react'
-import { ActivityItem, api, Contact, Doc, HubMember, HubMembersResponse, HubRow, MirrorRow, Neighbour, PendingJoin, Profile, Share, ShareOffer } from './types'
+import { ActivityItem, api, Contact, Doc, HubMember, HubMembersResponse, HubRow, HubTransfer, MirrorRow, Neighbour, PendingJoin, Profile, QueueRow, Share, ShareOffer } from './types'
+import { describeChange } from './review'
 import { errText, notify } from './Notice'
 import { InviteLink, mintInvite, TrustControl } from './SharePanel'
 import { EventsResponse, LiveEvent, mergeActivity } from './live'
-import { groupShares, hubStandingLine, mirrorStatusLine, offerLine, publishedLine, shareTitle, shareWho, shortFingerprint } from './shares'
+import { groupShares, hubStandingLine, mirrorStatusLine, offerLine, publishedLine, shareTitle, shareWho, shortFingerprint, waitingLine } from './shares'
 import { relTime } from './time'
 import { refusalHint } from './hints'
 import { loadProfile } from './Profile'
@@ -629,7 +630,19 @@ function HubCard({
   const [err, setErr] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [invite, setInvite] = useState<string | null>(null)
+  // slice 2 (admins): transfers members offered, and proposals on hub-owned docs
+  const [transfers, setTransfers] = useState<HubTransfer[]>([])
+  const [queue, setQueue] = useState<QueueRow[]>([])
+  const [showQueue, setShowQueue] = useState(false)
 
+  const fetchAdminExtras = () => {
+    api<{ transfers?: HubTransfer[]; error?: string }>(`/admin/hubs/transfers?hub=${hub.contact_id}`)
+      .then((r) => setTransfers(r.transfers ?? []))
+      .catch(() => setTransfers([]))
+    api<{ items?: QueueRow[]; error?: string }>(`/admin/hubs/queue?hub=${hub.contact_id}`)
+      .then((r) => setQueue(r.items ?? []))
+      .catch(() => setQueue([]))
+  }
   const fetchMembers = () => {
     setErr(null)
     api<HubMembersResponse>(`/admin/hubs/members?hub=${hub.contact_id}`)
@@ -637,11 +650,23 @@ function HubCard({
         setStatus(r.status)
         setMembers(r.members)
         if (r.error) setErr(r.error)
+        if (r.status?.role === 'admin' && r.status.membership === 'active') fetchAdminExtras()
       })
       .catch((e) => {
         setErr(errText(e))
         setMembers(null)
       })
+  }
+  const decide = (path: string, body: unknown, okMsg: string, key: string) => {
+    if (busy) return
+    setBusy(key)
+    post(path, body)
+      .then(() => {
+        notify(okMsg, 'ok')
+        fetchAdminExtras()
+        onChanged()
+      }, (e) => notify(errText(e)))
+      .finally(() => setBusy(null))
   }
   const toggle = () => {
     const next = !open
@@ -723,9 +748,95 @@ function HubCard({
           ))}
         </div>
       )}
+      {(hub.transfers ?? []).length > 0 && (
+        <div className="hub-pubs">
+          <div className="meta">handed to {hub.name}</div>
+          {(hub.transfers ?? []).map((t) => (
+            <div key={t.id} className="share-row">
+              <span className="card-doc" onClick={() => onOpenDoc(t.root_doc)}>
+                {t.root_title || '(untitled)'}
+              </span>
+              <span className="meta">
+                {t.state === 'offered' ? 'offered — waiting for an admin to accept' : `owned by ${hub.name} since ${relTime(t.at, now)}`}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
       {open && (
         <div className="hub-members">
           {err && <div className="meta err">{err}</div>}
+          {isAdmin && transfers.some((t) => t.state === 'offered' || t.state === 'accepted') && (
+            <>
+              <div className="meta">folders offered to {hub.name}</div>
+              {transfers
+                .filter((t) => t.state === 'offered' || t.state === 'accepted')
+                .map((t) => (
+                  <div key={t.id} className="share-row">
+                    <span>
+                      {t.member} offers “{t.title}”
+                    </span>
+                    <span className="meta">
+                      {t.doc_count} doc{t.doc_count === 1 ? '' : 's'} · {relTime(t.at, now)}
+                      {t.state === 'accepted' ? ' · taking over…' : ''}
+                    </span>
+                    {t.state === 'offered' && (
+                      <>
+                        <button
+                          className="accept"
+                          disabled={!!busy}
+                          title={`${hub.name} takes “${t.title}” over; ${t.member} keeps a read-only copy`}
+                          onClick={() => decide('/admin/hubs/transfers/accept', { hub: hub.contact_id, id: t.id }, `taking “${t.title}” over from ${t.member}`, t.id)}
+                        >
+                          {busy === t.id ? 'accepting…' : 'accept'}
+                        </button>
+                        <ArmedButton
+                          label="decline"
+                          onFire={() => decide('/admin/hubs/transfers/decline', { hub: hub.contact_id, id: t.id }, `declined “${t.title}”`, t.id)}
+                        />
+                      </>
+                    )}
+                  </div>
+                ))}
+            </>
+          )}
+          {isAdmin && queue.length > 0 && (
+            <>
+              <div className="share-row">
+                <span className="meta">{waitingLine(queue.length)} on {hub.name}’s own docs</span>
+                <button className="chip" onClick={() => setShowQueue((v) => !v)}>
+                  {showQueue ? 'hide' : 'review'}
+                </button>
+              </div>
+              {showQueue &&
+                queue.map((r) => {
+                  const d = describeChange(r)
+                  const id = r.item.annotation.id
+                  return (
+                    <div key={id} className="share-row hub-queue-item">
+                      <span>
+                        <b>{r.doc_title}</b> · {r.proposer} {d.headline}
+                      </span>
+                      {d.after && <span className="meta">“{d.after.text.slice(0, 120)}”</span>}
+                      <button
+                        className="accept"
+                        disabled={!!busy}
+                        onClick={() => decide('/admin/hubs/resolve', { hub: hub.contact_id, annotation_id: id, decision: 'accept' }, `accepted ${r.proposer}’s edit to “${r.doc_title}”`, id)}
+                      >
+                        ✓ accept
+                      </button>
+                      <button
+                        className="decline"
+                        disabled={!!busy}
+                        onClick={() => decide('/admin/hubs/resolve', { hub: hub.contact_id, annotation_id: id, decision: 'decline' }, `declined ${r.proposer}’s edit to “${r.doc_title}”`, id)}
+                      >
+                        ✗ decline
+                      </button>
+                    </div>
+                  )
+                })}
+            </>
+          )}
           {members === undefined && !err && <div className="meta">asking {hub.name}…</div>}
           {members === null && !err && status && (
             <div className="meta">

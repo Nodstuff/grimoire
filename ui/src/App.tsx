@@ -1725,16 +1725,32 @@ function DocView({
     <article className="doc" onClick={onStageClick}>
       {mirror && mirror.origin_owner_name && (
         <div className="mirror-banner">
-          ⌂ <b>{mirror.owner_petname}</b> · owned by <b>{mirror.origin_owner_name}</b> · read-only for now — edits to their docs will
-          reach them in a coming release
+          ⌂ <b>{mirror.owner_petname}</b> · owned by <b>{mirror.origin_owner_name}</b>
+          {mirror.permission === 'view'
+            ? ' · view only'
+            : ` · your edits go to ${mirror.origin_owner_name} as suggestions`}
+          {pendingProposals.length > 0 && (
+            <span className="pending-chip">
+              {pendingProposals.length} suggestion{pendingProposals.length > 1 ? 's' : ''} awaiting{' '}
+              {mirror.origin_owner_name}
+            </span>
+          )}
         </div>
       )}
       {mirror && !mirror.origin_owner_name && (
         <div className="mirror-banner">
-          {mirror.from_hub ? '⌂' : '⇄'} shared by <b>{mirror.owner_petname}</b>
+          {mirror.transferred_from_me ? (
+            <>
+              ⌂ owned by <b>{mirror.owner_petname}</b> (transferred from you)
+            </>
+          ) : (
+            <>
+              {mirror.from_hub ? '⌂' : '⇄'} shared by <b>{mirror.owner_petname}</b>
+            </>
+          )}
           {mirror.permission === 'view'
             ? ' · view only'
-            : ' · your edits go to them as suggestions'}
+            : ` · your edits go to ${mirror.transferred_from_me ? mirror.owner_petname : 'them'} as suggestions`}
           {mirror.owner_tended && ` · 🌿 tended by ${mirror.owner_petname}`}
           {pendingProposals.length > 0 && (
             <span className="pending-chip">
@@ -1863,8 +1879,8 @@ function DocView({
         key={`${docId}:${editorGen}`}
         doc={editable}
         reviewMap={highlightMap}
-        // a doc relayed through a hub is read-only in this slice whatever the share says
-        mode={mirror ? (mirror.permission === 'propose' && !mirror.origin_owner_name ? 'propose' : 'readonly') : 'direct'}
+        // a relayed doc proposes through the hub, which carries it to the owner
+        mode={mirror ? (mirror.permission === 'propose' ? 'propose' : 'readonly') : 'direct'}
         onSaved={(e) => {
           ownEpoch.current = Math.max(ownEpoch.current, e)
         }}
