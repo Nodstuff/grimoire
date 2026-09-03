@@ -4105,6 +4105,19 @@ impl SqliteStore {
             .map_err(Into::into)
     }
 
+    /// The doc's most recent applied ops, newest first (epoch, then id,
+    /// descending), capped at `limit` — the history panel's page, fetched
+    /// in one bounded query instead of the whole ledger reversed and cut.
+    pub fn ops_for_doc_limited(&self, doc_id: Uuid, limit: usize) -> Result<Vec<LedgerOp>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {OP_COLS} FROM ops
+             WHERE doc_id = ?1 AND epoch_applied IS NOT NULL
+             ORDER BY epoch_applied DESC, id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![doc_id.to_string(), limit as i64], row_to_op)?;
+        rows.map(|r| build_op(r?)).collect()
+    }
+
     /// Hub side: drop forward records older than `older_than_days`. A forward
     /// carries no outcome of its own (the owner's op and annotation do), so
     /// age is the only terminal signal; the member's status handle for a
@@ -4429,6 +4442,51 @@ mod tests {
             s.hub_forwards_for(&ids).unwrap().iter().all(|f| f.op_id != ids[1]),
             "the 20-day row went"
         );
+    }
+
+    /// ops_for_doc_limited equals "ops_since(doc, 0), reversed, truncated"
+    /// — the history handler's derivation — for a multi-epoch, multi-op
+    /// ledger, and skips parked (unapplied) ops.
+    #[test]
+    fn ops_for_doc_limited_is_newest_first_and_capped() {
+        use crate::{BlockType, OpInput, OpKind, PrincipalKind};
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s
+            .create_principal(PrincipalKind::Human, "Tom", None)
+            .unwrap();
+        let doc = s.create_doc("d", None, tom.id).unwrap();
+        let ins = |content: &str| OpInput {
+            kind: OpKind::Insert {
+                block_id: Uuid::now_v7(),
+                parent_id: None,
+                order_key: "".into(),
+                block_type: BlockType::Paragraph,
+                content: content.into(),
+                refers_to: None,
+            },
+            source_refs: vec![],
+        };
+        // epoch 1: two ops in one batch; epochs 2..=4: one op each
+        s.apply(doc.id, 0, tom.id, vec![ins("a"), ins("b")]).unwrap();
+        for (i, c) in ["c", "d", "e"].iter().enumerate() {
+            s.apply(doc.id, 1 + i as i64, tom.id, vec![ins(c)]).unwrap();
+        }
+        // a parked op never shows in history
+        s.park(doc.id, tom.id, vec![ins("parked")], "later").unwrap();
+
+        let mut expected = s.ops_since(doc.id, 0).unwrap();
+        expected.reverse();
+        assert_eq!(expected.len(), 5);
+        let all = s.ops_for_doc_limited(doc.id, 100).unwrap();
+        assert_eq!(all, expected, "same order as reverse(ops_since)");
+        assert!(all.iter().all(|o| o.epoch_applied.is_some()));
+
+        expected.truncate(3);
+        let capped = s.ops_for_doc_limited(doc.id, 3).unwrap();
+        assert_eq!(capped, expected);
+        assert_eq!(capped[0].epoch_applied, Some(4));
+        assert!(s.ops_for_doc_limited(doc.id, 0).unwrap().is_empty());
+        assert!(s.ops_for_doc_limited(Uuid::now_v7(), 5).unwrap().is_empty());
     }
 
     /// Items 8/9: the connection runs WAL + synchronous NORMAL with a busy
