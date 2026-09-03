@@ -87,9 +87,38 @@ pub fn enable(store: &mut SqliteStore, name: Option<&str>, human: Uuid) -> Resul
             d.id
         }
     };
+    // slice 2: members propose on hub-owned docs; the queue is resolved by
+    // admins over the wire (there is no human at the hub's own review rail)
+    if store.get_doc(root_doc)?.review_policy.is_none() {
+        store.set_review_policy(root_doc, Some(grimoire_store::ReviewPolicy::AgentReview))?;
+    }
     store.rename_principal(human, &name)?;
     store.set_setting("profile.confirmed", "1")?;
     Ok(HubConfig { name, root_doc })
+}
+
+/// Slice 2: transfer offers as the wire and the local routes report them.
+pub fn transfers(store: &SqliteStore) -> Vec<super::wire::HubTransferInfo> {
+    let contacts = store.list_contacts().unwrap_or_default();
+    store
+        .list_hub_transfers()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| super::wire::HubTransferInfo {
+            id: t.id.to_string(),
+            member_contact: t.member_contact.to_string(),
+            member: contacts
+                .iter()
+                .find(|c| c.id == t.member_contact)
+                .map(|c| display_name(&contacts, c))
+                .unwrap_or_else(|| "someone".into()),
+            root_doc: t.root_doc.to_string(),
+            title: t.title,
+            doc_count: t.doc_count,
+            state: t.state.as_str().into(),
+            at: t.at,
+        })
+        .collect()
 }
 
 /// A contact's name for display: the peer-supplied petname carries a

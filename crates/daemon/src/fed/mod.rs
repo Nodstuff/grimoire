@@ -15,6 +15,7 @@
 //!              hot relay one-shots, mint_invite (owner CLI/admin helper)
 //! - `loops`  — background pull / outbound-status / join-retry loops
 //! - `hub`    — hub mode: membership, publish (auto-accept), relay provenance
+//! - `transfer` — hub slice 2: ownership transfer of a subtree to a hub
 //!
 //! Wire format: one request per bi-stream. The opener writes one JSON frame
 //! and finishes; the acceptor replies with one JSON frame. Every frame
@@ -25,6 +26,7 @@ pub mod hub;
 pub mod loops;
 pub mod runtime;
 pub mod server;
+pub mod transfer;
 pub mod wire;
 
 pub use runtime::Runtime;

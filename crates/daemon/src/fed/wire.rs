@@ -64,6 +64,12 @@ pub enum Request {
         /// parking twice (mirrors the MCP propose contract).
         #[serde(default)]
         request_id: Option<String>,
+        /// Hub (slice 2): a hub forwarding a MEMBER's proposal on a doc it
+        /// relays. The owner accepts this only from a contact flagged as a
+        /// hub, and files the proposal under the member's principal — the
+        /// hub carries, never decides. A plain peer setting it is refused.
+        #[serde(default)]
+        on_behalf_of: Option<OnBehalfOf>,
     },
     /// Status of previously proposed ops (only your own are disclosed).
     ProposalStatus { op_ids: Vec<String> },
@@ -142,6 +148,28 @@ pub enum Request {
     /// Hub (slice 1): "what am I to you?" — any contact (even pending) may
     /// ask, so a member waiting for approval can see that they are waiting.
     HubStatus,
+    /// Hub (slice 2, MEMBER → hub): "take ownership of this subtree of
+    /// mine". Recorded for an admin to accept or decline; nothing moves yet.
+    TransferOffer {
+        root_doc: String,
+        title: String,
+        doc_count: usize,
+    },
+    /// Hub (slice 2, hub → member): an admin accepted the transfer. The
+    /// member flips the subtree to mirrors of the hub and answers
+    /// `TransferReady` with the share the hub pulls it through — or refuses
+    /// `Busy` while any doc in it is live or has edits waiting for review.
+    TransferAccepted { root_doc: String },
+    /// Hub (slice 2): reversal seam — an admin handing a subtree back.
+    /// Typed so peers can answer `Unsupported` today.
+    TransferBack { root_doc: String },
+}
+
+/// Hub (slice 2): who a forwarded proposal is really from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnBehalfOf {
+    pub pubkey: String,
+    pub name: String,
 }
 
 /// What a hub admin can do over the wire.
@@ -160,6 +188,29 @@ pub enum HubAction {
     /// Mint a one-time invite (propose, hub root) and return the link — how
     /// an admin onboards someone without touching the hub box.
     Invite,
+    /// Slice 2: open proposals on HUB-OWNED docs (members' edits waiting).
+    ReviewQueue,
+    /// Slice 2: resolve one of them. `decision` = "accept" | "decline".
+    Resolve { annotation_id: String, decision: String },
+    /// Slice 2: transfers members offered the hub, every state.
+    ListTransfers,
+    /// Slice 2: take the subtree over (dials the member; completes off-thread).
+    AcceptTransfer { id: String },
+    DeclineTransfer { id: String },
+}
+
+/// Slice 2: one transfer offer as the hub reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HubTransferInfo {
+    pub id: String,
+    pub member_contact: String,
+    pub member: String,
+    pub root_doc: String,
+    pub title: String,
+    pub doc_count: i64,
+    /// offered | accepted | declined | done
+    pub state: String,
+    pub at: String,
 }
 
 /// One row of a hub's member list.
@@ -321,6 +372,17 @@ pub enum Response {
         members: usize,
         pending: usize,
     },
+    /// Hub (slice 2): open proposals on hub-owned docs, in the same shape
+    /// as the local `/api/queue` items (admins only).
+    HubQueue { items: Vec<serde_json::Value> },
+    /// Hub (slice 2): transfer offers (admins only).
+    HubTransfers { transfers: Vec<HubTransferInfo> },
+    /// Hub (slice 2): the hub recorded a member's transfer offer.
+    TransferOffered { id: String },
+    /// Hub (slice 2, member → hub): the subtree is flipped to mirrors of the
+    /// hub; pull it through this share (the member's `propose` share to the
+    /// hub) and take it over.
+    TransferReady { share_id: String },
 }
 
 impl Response {
@@ -363,8 +425,13 @@ pub enum RefusalCode {
     /// Protocol version mismatch.
     Version,
     /// Hub (slice 1): the doc is relayed for another member; the hub is not
-    /// its home, so it takes no edits — they will route to the owner later.
+    /// its home. Slice 2 forwards proposals to the owner; live sessions and
+    /// comments on relayed docs still answer this.
     RelayedReadOnly,
+    /// Hub (slice 2): a transfer was refused because a doc in the subtree is
+    /// in a live session or has edits waiting for review. The reason names
+    /// the doc; retry once it is idle.
+    Busy,
     #[default]
     #[serde(other)]
     Other,

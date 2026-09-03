@@ -428,7 +428,7 @@ use grimoire_store::{BlockStore, SqliteStore};
                 ops: ops.clone(),
                 note: "typo fix".into(),
                 base_epoch: None,
-                request_id: Some("retry-me".into()),
+                request_id: Some("retry-me".into()), on_behalf_of: None,
             },
         )
         .await
@@ -447,7 +447,7 @@ use grimoire_store::{BlockStore, SqliteStore};
                 ops: ops.clone(),
                 note: "typo fix".into(),
                 base_epoch: None,
-                request_id: Some("retry-me".into()),
+                request_id: Some("retry-me".into()), on_behalf_of: None,
             },
         )
         .await
@@ -527,7 +527,7 @@ use grimoire_store::{BlockStore, SqliteStore};
                 ops,
                 note: String::new(),
                 base_epoch: None,
-                request_id: None,
+                request_id: None, on_behalf_of: None,
             },
         )
         .await
@@ -585,7 +585,7 @@ use grimoire_store::{BlockStore, SqliteStore};
             ops,
             note: String::new(),
             base_epoch: Some(0),
-            request_id: None,
+            request_id: None, on_behalf_of: None,
         };
 
         // trusted: applies IMMEDIATELY as a flagged yellow
@@ -1008,7 +1008,7 @@ async fn maintainer_trust_applies_green_with_no_review_annotation() {
         source_refs: vec![],
     };
     let res = request(&alice_ep, addr, Request::Propose {
-        share: share.id.to_string(), doc: doc.id.to_string(), ops: vec![op], note: String::new(), base_epoch: Some(0), request_id: None,
+        share: share.id.to_string(), doc: doc.id.to_string(), ops: vec![op], note: String::new(), base_epoch: Some(0), request_id: None, on_behalf_of: None,
     }).await.unwrap();
     let Response::Proposed { op_ids } = res else { panic!("expected Proposed, got {res:?}") };
     let ids: Vec<uuid::Uuid> = op_ids.iter().map(|s| s.parse().unwrap()).collect();
@@ -2206,7 +2206,7 @@ async fn hub_publish_relays_with_provenance_refuses_edits_and_unpublish_drops() 
         source_refs: vec![],
     };
     let res = request(&bob.ep, h.addr.clone(), Request::Propose {
-        share: bob_share.clone(), doc: sub.to_string(), ops: vec![op.clone()], note: String::new(), base_epoch: None, request_id: None,
+        share: bob_share.clone(), doc: sub.to_string(), ops: vec![op.clone()], note: String::new(), base_epoch: None, request_id: None, on_behalf_of: None,
     }).await.unwrap();
     assert_eq!(refusal_code(&res), RefusalCode::RelayedReadOnly);
     let Response::Refused { reason, .. } = res else { unreachable!() };
@@ -2224,7 +2224,7 @@ async fn hub_publish_relays_with_provenance_refuses_edits_and_unpublish_drops() 
     let res = request(&bob.ep, h.addr.clone(), Request::HotStatus { share: bob_share.clone(), doc: sub.to_string() }).await.unwrap();
     assert!(matches!(res, Response::HotStatusIs { hot: false, .. }));
     let res = request(&bob.ep, h.addr.clone(), Request::Propose {
-        share: bob_share.clone(), doc: cfg.root_doc.to_string(), ops: vec![op], note: String::new(), base_epoch: None, request_id: None,
+        share: bob_share.clone(), doc: cfg.root_doc.to_string(), ops: vec![op], note: String::new(), base_epoch: None, request_id: None, on_behalf_of: None,
     }).await.unwrap();
     assert!(matches!(res, Response::Proposed { .. }), "{res:?}");
 

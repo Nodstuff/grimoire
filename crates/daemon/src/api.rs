@@ -300,7 +300,7 @@ async fn backlinks(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Val
 
 /// Decorate review items for rendering: doc titles, proposer names, and the
 /// live content of the target block (what a red would replace).
-fn decorate_review_items(s: &SqliteStore, q: Vec<grimoire_store::ReviewItem>) -> Vec<Value> {
+pub(crate) fn decorate_review_items(s: &SqliteStore, q: Vec<grimoire_store::ReviewItem>) -> Vec<Value> {
     q.into_iter()
         .map(|item| {
             let doc_title = s
