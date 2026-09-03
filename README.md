@@ -25,7 +25,18 @@ minisign-verified against the key in `crates/shell/tauri.conf.json`.
   — owner-authoritative mirrors, per-share `view`/`propose` grants and trust tiers,
   deny-by-default, mDNS on the LAN, relays anywhere else.
 - **Hot docs.** Go live on any doc: a Yjs session at the edge, one clean commit through
-  the gate when it ends. Works across instances.
+  the gate when it ends. Works across instances. Ask the room's agent for suggestions
+  inline; nothing it writes lands without a click.
+- **Ask the vault (⌘/).** A question becomes an answer doc whose every claim cites the
+  exact block it came from. Retrieval is local (a static embedding model compiled in,
+  one vector per block, kept current as you edit); a synthesis appears if Claude Code
+  is installed. Your Claude Code memories are imported and askable too.
+- **Hubs.** Run one headless (`grimoire serve --hub --name Team`) and a team joins it:
+  publish folders, get everything relayed with "owned by" provenance, suggest edits
+  through the hub to the owner, hand a folder to the team outright. Admin approval on
+  join; no inbound ports needed.
+- **Never lose text.** Trash with restore, daily self-contained backups, unsaved edits
+  that retry, stale live-session seeds refused.
 
 ## Layout
 
@@ -35,7 +46,8 @@ minisign-verified against the key in `crates/shell/tauri.conf.json`.
 | `crates/daemon` | The `grimoire` binary: MCP, JSON API, federation, hot sessions, gardeners, backups |
 | `crates/shell` | Tauri app — a window and tray around the daemon, which it bundles as a sidecar |
 | `ui/` | React + Tiptap + React Flow frontend, embedded into the daemon binary |
-| `docs/adr/` | Decisions: 0001 storage, 0002 federation, 0003 hot docs |
+| `deploy/hub/` | systemd unit + install script for a hub box |
+| `docs/adr/` | Decisions: 0001 storage, 0002 federation (incl. invites v2, hubs), 0003 hot docs |
 | `PROJECT.md` | The founding design record |
 
 ## Build
