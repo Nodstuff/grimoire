@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "grimoire"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -2362,7 +2362,7 @@ dependencies = [
 
 [[package]]
 name = "grimoire-shell"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "libc",
  "serde_json",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "grimoire-store"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "rusqlite",
  "serde",
