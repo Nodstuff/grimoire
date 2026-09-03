@@ -2721,6 +2721,54 @@ async fn transfer_is_refused_while_a_doc_is_live_or_has_edits_waiting_and_declin
     assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
 }
 
+/// The accept loop holds one semaphore permit per live connection: at the cap
+/// the next connection is dropped at accept rather than queued, and the daemon
+/// serves again as soon as a permit frees.
+#[tokio::test]
+async fn federation_connections_are_capped() {
+    use super::client::request_with_timeout;
+    let short = std::time::Duration::from_secs(3);
+    let mut s = SqliteStore::open_in_memory().unwrap();
+    s.create_principal(PrincipalKind::Human, "server", None).unwrap();
+    let store = Arc::new(Mutex::new(s));
+    let server = local_endpoint().await;
+    let addr = direct_addr(&server);
+    let hot = scratch_hot();
+    tokio::spawn(super::server::serve_with_cap(server, store, hot, Runtime::default(), 1));
+
+    // one live connection takes the only permit (held for the connection's life)
+    let first = local_endpoint().await;
+    let conn = first.connect(addr.clone(), ALPN).await.unwrap();
+    {
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let out = serde_json::to_vec(&Frame { v: super::wire::PROTOCOL_VERSION, msg: Request::Ping }).unwrap();
+        send.write_all(&out).await.unwrap();
+        send.finish().unwrap();
+        let raw = recv.read_to_end(MAX_FRAME).await.unwrap();
+        // a stranger's Ping is refused, but it IS served: the permit is taken
+        let f: Frame<Response> = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(refusal_code(&f.msg), RefusalCode::UnknownPeer, "{:?}", f.msg);
+    }
+
+    // the second is dropped at accept, not queued behind the first
+    let second = local_endpoint().await;
+    let err = request_with_timeout(&second, addr.clone(), Request::Ping, short).await.unwrap_err();
+    tracing::debug!("capped: {err:#}");
+
+    // freeing the permit lets the daemon serve again
+    conn.close(0u32.into(), b"done");
+    drop(conn);
+    let mut served = false;
+    for _ in 0..40 {
+        if request_with_timeout(&second, addr.clone(), Request::Ping, short).await.is_ok() {
+            served = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(served, "the daemon serves again once the permit is free");
+}
+
 /// `request_with_timeout` is the only thing standing between a loop and a
 /// peer that accepts the dial and then never answers: the call must come back
 /// with a timeout error, not hang, and not be mistaken for a refusal.

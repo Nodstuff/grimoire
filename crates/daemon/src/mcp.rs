@@ -46,6 +46,17 @@ pub fn new_dedupe() -> DedupeCache {
 static AUTO_CREATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub const MAX_AUTO_PRINCIPALS_PER_BOOT: usize = 256;
 
+/// Test-only: swap the per-boot counter, returning what it was. The counter is
+/// process-global, so a test that moves it holds `AUTO_CREATED_TEST_LOCK` for
+/// the whole window and puts the old value back — otherwise it would refuse
+/// creations for every other test in the binary.
+#[cfg(test)]
+pub static AUTO_CREATED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+pub fn swap_auto_created_for_test(n: usize) -> usize {
+    AUTO_CREATED.swap(n, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A principal name: 1–64 printable chars (no control characters), trimmed.
 pub fn valid_principal_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
@@ -810,6 +821,11 @@ impl ServerHandler for KsMcp {
     }
 }
 
+/// Largest `/mcp` request body, matching `propose_markdown` on the HTTP API:
+/// a whole doc's markdown can be megabytes. rmcp's own default is 4 MB, which
+/// silently truncated a big `propose_markdown` long before the axum layer.
+pub const MAX_MCP_BODY: usize = 16 * 1024 * 1024;
+
 pub fn router(
     store: Arc<Mutex<SqliteStore>>,
     agent: Uuid,
@@ -819,11 +835,99 @@ pub fn router(
     let service = StreamableHttpService::new(
         move || Ok(KsMcp::new(store.clone(), agent, dedupe.clone(), hot.clone())),
         LocalSessionManager::default().into(),
-        Default::default(),
+        rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default()
+            .with_max_request_body_bytes(MAX_MCP_BODY),
     );
-    // rmcp reads the body itself, so axum's DefaultBodyLimit never applies;
-    // cap it at the transport with tower-http (propose_markdown-sized payloads)
-    axum::Router::new()
-        .nest_service("/mcp", service)
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(16 * 1024 * 1024))
+    // rmcp reads the body itself, so neither axum's DefaultBodyLimit nor a
+    // tower-http layer gets a say: rmcp's own cap is the one that applies and
+    // it enforces it while streaming, answering 413. A tower-http layer here
+    // only turned that 413 into a 500 on a body with no Content-Length.
+    axum::Router::new().nest_service("/mcp", service)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The find-or-create-by-name surface is unauthenticated, so it is capped
+    /// per boot. At the cap, a NEW name is refused while EXISTING names still
+    /// resolve — an agent that already identified never loses its principal.
+    #[test]
+    fn auto_created_principals_are_capped_per_boot() {
+        let _serial = AUTO_CREATED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let previous = swap_auto_created_for_test(0);
+        let known = agent_principal_by_name(&mut store, "claude:known").unwrap();
+
+        swap_auto_created_for_test(MAX_AUTO_PRINCIPALS_PER_BOOT);
+        let err = agent_principal_by_name(&mut store, "claude:brand-new").unwrap_err();
+        assert!(err.contains("too many new agent principals"), "{err}");
+        assert_eq!(
+            agent_principal_by_name(&mut store, "claude:known").unwrap(),
+            known,
+            "an existing name still resolves at the cap"
+        );
+        // one under the cap lets exactly one more through
+        swap_auto_created_for_test(MAX_AUTO_PRINCIPALS_PER_BOOT - 1);
+        assert!(agent_principal_by_name(&mut store, "claude:last-one").is_ok());
+        assert!(agent_principal_by_name(&mut store, "claude:one-too-many").is_err());
+
+        swap_auto_created_for_test(previous);
+    }
+
+    /// rmcp reads the request body itself, so axum's `DefaultBodyLimit` never
+    /// fires on `/mcp`: the 16 MB cap is a tower-http layer. Over it the
+    /// request is rejected before the service sees it.
+    #[tokio::test]
+    async fn mcp_body_over_16mb_is_rejected() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        const LIMIT: usize = MAX_MCP_BODY;
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let agent = store
+            .create_principal(grimoire_store::PrincipalKind::Agent, "claude", None)
+            .unwrap()
+            .id;
+        let hot = crate::hot::HotState::new(
+            std::env::temp_dir().join(format!("grimoire-mcp-test-{}", Uuid::now_v7())),
+        );
+        let app = router(Arc::new(Mutex::new(store)), agent, hot, new_dedupe());
+
+        let send = |body: Vec<u8>| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::post("/mcp")
+                        .header("host", "127.0.0.1:7425")
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json, text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        // a well-formed initialize just under the cap: padded in an unused
+        // field so the body is huge but the JSON still parses
+        let pad = "x".repeat(LIMIT - 4096);
+        let under = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"{pad}","version":"1"}}}}}}"#
+        );
+        assert!(under.len() < LIMIT, "under the cap: {}", under.len());
+        assert_eq!(send(under.into_bytes()).await, StatusCode::OK);
+
+        let pad = "x".repeat(LIMIT + 1024);
+        let over = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"{pad}","version":"1"}}}}}}"#
+        );
+        assert!(over.len() > LIMIT);
+        assert_eq!(send(over.into_bytes()).await, StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }

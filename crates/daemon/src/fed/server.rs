@@ -132,13 +132,25 @@ pub async fn serve(
     hot: HotState,
     runtime: Runtime,
 ) {
+    serve_with_cap(endpoint, store, hot, runtime, MAX_CONNECTIONS).await
+}
+
+/// `serve` with an explicit connection cap, so a test can reach the cap with
+/// two connections instead of 257.
+pub async fn serve_with_cap(
+    endpoint: Endpoint,
+    store: Arc<Mutex<SqliteStore>>,
+    hot: HotState,
+    runtime: Runtime,
+    cap: usize,
+) {
     tracing::info!("federation endpoint listening (node id {})", endpoint.id());
     let dedupe: Dedupe = Arc::new(Mutex::new(DedupeCache::new(DEDUPE_CAP)));
-    let gate = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let gate = Arc::new(tokio::sync::Semaphore::new(cap));
     while let Some(incoming) = endpoint.accept().await {
         let Ok(permit) = gate.clone().try_acquire_owned() else {
             tracing::warn!(
-                cap = MAX_CONNECTIONS,
+                cap,
                 "federation: connection cap reached; dropping an incoming connection"
             );
             drop(incoming);
