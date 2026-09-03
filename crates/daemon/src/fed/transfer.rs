@@ -111,7 +111,10 @@ pub fn member_flip(
         .into());
     };
     let subtree = store.doc_subtree_ids(root_doc)?;
-    // already ours-as-a-mirror: the hub is retrying — answer the same way
+    // already ours-as-a-mirror: the hub is retrying — answer the same way.
+    // 0.7.2: "already" is judged on the root only, but the flip below runs
+    // over the WHOLE subtree regardless, so a flip that died half-way (root
+    // done, children not) is completed by the retry instead of frozen.
     let already = store
         .get_mirror(root_doc)?
         .is_some_and(|m| m.owner == hub.id);
@@ -151,17 +154,24 @@ pub fn member_flip(
             sh.id
         }
     };
-    if !already {
-        for id in &subtree {
-            let d = store.get_doc(*id)?;
-            store.upsert_mirror(*id, hub.id, membership, d.current_epoch, SharePermission::Propose)?;
-            store.set_mirror_owner_epoch(*id, d.current_epoch)?;
-            store.set_mirror_origin(*id, None, None)?;
+    let mut flipped = 0usize;
+    for id in &subtree {
+        // idempotent: a doc already mirrored from the hub keeps its cursor
+        if store.get_mirror(*id)?.is_some_and(|m| m.owner == hub.id) {
+            continue;
         }
+        let d = store.get_doc(*id)?;
+        store.upsert_mirror(*id, hub.id, membership, d.current_epoch, SharePermission::Propose)?;
+        store.set_mirror_owner_epoch(*id, d.current_epoch)?;
+        store.set_mirror_origin(*id, None, None)?;
+        flipped += 1;
+    }
+    if flipped > 0 {
         tracing::info!(
             hub = hub.petname,
             root = %root_doc,
-            docs = subtree.len(),
+            docs = flipped,
+            completing = already,
             "transfer: folder handed to the hub; local copy is now a mirror"
         );
     }
@@ -171,6 +181,98 @@ pub fn member_flip(
     Ok(Response::TransferReady {
         share_id: share_id.to_string(),
     })
+}
+
+/// Settings key marking a member's out-transfer as acknowledged by the hub
+/// (the hub answered `Noted` to our `TransferReady` re-announcement).
+fn acked_key(transfer: Uuid) -> String {
+    format!("transfer.acked.{transfer}")
+}
+
+/// Member sweep (0.7.2): a flipped transfer whose `TransferReady` reply the
+/// hub never got is stuck — our copy is a mirror of a hub that does not know
+/// it owns the folder. Re-announce every flipped, unacknowledged out-transfer
+/// with `Request::TransferReady`; `Noted` marks it acknowledged. `addr`
+/// overrides the dial-by-pubkey (tests). Returns how many were acknowledged.
+pub async fn resend_ready(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    addr: Option<EndpointAddr>,
+) -> usize {
+    let due: Vec<(Uuid, Contact, Uuid, Uuid)> = {
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let contacts = s.list_contacts().unwrap_or_default();
+        s.list_doc_transfers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.direction == TransferDirection::Out && t.state == "done")
+            .filter(|t| !matches!(s.get_setting(&acked_key(t.id)), Ok(Some(_))))
+            .filter_map(|t| {
+                let hub = contacts.iter().find(|c| c.id == t.counterparty && c.is_hub && !c.revoked)?.clone();
+                // still flipped: the root is our mirror of that hub
+                s.get_mirror(t.root_doc).ok().flatten().filter(|m| m.owner == hub.id)?;
+                let share = s
+                    .list_shares()
+                    .ok()?
+                    .into_iter()
+                    .find(|sh| sh.root_doc == t.root_doc && sh.contact == Some(hub.id) && sh.state == ShareState::Active)?;
+                Some((t.id, hub, t.root_doc, share.id))
+            })
+            .collect()
+    };
+    let mut acked = 0;
+    for (transfer, hub, root, share) in due {
+        let addr = match &addr {
+            Some(a) => a.clone(),
+            None => match hub.pubkey.parse::<iroh::EndpointId>() {
+                Ok(id) => EndpointAddr::from(id),
+                Err(_) => continue,
+            },
+        };
+        let req = Request::TransferReady {
+            root_doc: root.to_string(),
+            share_id: share.to_string(),
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(15), request(endpoint, addr, req)).await {
+            Ok(Ok(Response::Noted)) => {
+                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                s.set_setting(&acked_key(transfer), "1").ok();
+                tracing::info!(hub = hub.petname, %root, "transfer: hub confirmed it owns the folder");
+                acked += 1;
+            }
+            Ok(Ok(Response::Refused { code: RefusalCode::Busy, .. })) => {
+                tracing::info!(hub = hub.petname, %root, "transfer: hub is taking the folder over; will confirm next sweep");
+            }
+            Ok(Ok(other)) => tracing::warn!(hub = hub.petname, %root, "transfer: re-announce not taken: {other:?}"),
+            Ok(Err(e)) => tracing::debug!(hub = hub.petname, %root, "transfer: re-announce failed: {e:#}"),
+            Err(_) => tracing::debug!(hub = hub.petname, %root, "transfer: re-announce timed out"),
+        }
+    }
+    acked
+}
+
+/// Hub side of `Request::TransferReady` (0.7.2). `Ok(Some(id))` = an
+/// accepted transfer from this member for this root that still needs the
+/// take-over (the caller runs `hub_complete` off-thread and answers `Busy`);
+/// `Ok(None)` = already done, answer `Noted`. Runs under the store lock.
+pub fn hub_ready_ping(store: &SqliteStore, member: &Contact, root_doc: Uuid, _share_id: Uuid) -> Result<Option<Uuid>> {
+    let mut mine: Vec<_> = store
+        .list_hub_transfers()?
+        .into_iter()
+        .filter(|t| t.member_contact == member.id && t.root_doc == root_doc)
+        .collect();
+    if mine.iter().any(|t| t.state == HubTransferState::Done) {
+        return Ok(None);
+    }
+    mine.sort_by(|a, b| b.at.cmp(&a.at));
+    match mine.into_iter().find(|t| t.state == HubTransferState::Accepted) {
+        Some(t) => Ok(Some(t.id)),
+        None => Err(Refusal::new(
+            RefusalCode::NotAllowed,
+            "no accepted transfer of that folder from you",
+        )
+        .into()),
+    }
 }
 
 /// Hub side, after an admin accepted: dial the member, and on `TransferReady`

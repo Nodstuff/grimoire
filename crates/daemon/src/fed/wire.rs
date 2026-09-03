@@ -163,6 +163,14 @@ pub enum Request {
     /// Hub (slice 2): reversal seam — an admin handing a subtree back.
     /// Typed so peers can answer `Unsupported` today.
     TransferBack { root_doc: String },
+    /// 0.7.2 (member → hub): "I flipped this folder to your mirrors and my
+    /// `TransferReady` reply may not have reached you — pull it through
+    /// `share_id` and take it over." Sent by the member's sweep while a
+    /// flipped transfer is unacknowledged; the hub answers `Noted` once the
+    /// take-over is done (the member then stops asking), `Busy` while it is
+    /// in progress. A 0.7.1 hub answers `BadRequest` (unknown request):
+    /// the member simply asks again next sweep.
+    TransferReady { root_doc: String, share_id: String },
 }
 
 /// Hub (slice 2): who a forwarded proposal is really from.

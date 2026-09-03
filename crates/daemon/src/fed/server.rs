@@ -602,6 +602,31 @@ fn dispatch_inner(
                 Err(e) => Response::refused(RefusalCode::Other, e.to_string()),
             }
         }
+        Request::TransferReady { root_doc, share_id } => {
+            if hub_cfg.is_none() {
+                return Err(Response::refused(RefusalCode::Unsupported, "this Grimoire is not a hub"));
+            }
+            let (Ok(root), Ok(share)) = (root_doc.parse::<uuid::Uuid>(), share_id.parse::<uuid::Uuid>()) else {
+                return Err(Response::refused(RefusalCode::BadRequest, "bad id"));
+            };
+            match transfer::hub_ready_ping(&store, &contact, root, share) {
+                Ok(Some(transfer_id)) => {
+                    // the take-over needs the network: off this thread, like
+                    // an admin's accept; the member asks again next sweep
+                    let endpoint = endpoint.clone();
+                    let store_arc = store_arc.clone();
+                    let addr = peer.parse::<iroh::EndpointId>().ok().map(iroh::EndpointAddr::from);
+                    tokio::spawn(async move {
+                        if let Err(e) = transfer::hub_complete(&endpoint, &store_arc, transfer_id, addr).await {
+                            tracing::warn!(transfer = %transfer_id, "hub: transfer (re-announced by the member) did not complete: {e:#}");
+                        }
+                    });
+                    Response::refused(RefusalCode::Busy, "taking the folder over now — ask again shortly")
+                }
+                Ok(None) => Response::Noted,
+                Err(e) => refuse(e),
+            }
+        }
         Request::TransferAccepted { root_doc } => {
             let Ok(root) = root_doc.parse::<uuid::Uuid>() else {
                 return Err(Response::refused(RefusalCode::BadRequest, "bad doc id"));

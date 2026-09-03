@@ -298,6 +298,8 @@ pub async fn pull_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, runti
                 }
             }
             refresh_outbound(&endpoint, &store).await;
+            // 0.7.2: a flipped transfer whose Ready reply was lost is re-announced
+            super::transfer::resend_ready(&endpoint, &store, None).await;
             pull_groups(&endpoint, &store, share_groups(&store), &dead).await
         } else {
             let focused = runtime.focused_shares();

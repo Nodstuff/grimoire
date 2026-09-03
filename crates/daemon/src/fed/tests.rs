@@ -2960,3 +2960,56 @@ async fn lagged_hot_subscriber_is_resynced_with_the_full_doc_state() {
     assert!(crate::hot::update_is_empty(&[0, 0]));
     assert!(!crate::hot::update_is_empty(&edit));
 }
+
+/// 0.7.2 hardening: the member's `TransferReady` reply is lost after it
+/// flipped the folder. Its sweep re-announces (`Request::TransferReady`); the
+/// hub completes the take-over and, once done, answers `Noted` so the member
+/// stops asking. A half-done flip (root only) is completed by the retry.
+#[tokio::test]
+async fn lost_transfer_ready_is_redelivered_by_the_member_sweep_and_a_half_flip_completes() {
+    use super::transfer::{member_flip, membership_share, resend_ready};
+    let (h, cfg, alice, _bob) = team().await;
+    pull_hub(&alice, &h, &cfg).await;
+    let plan = alice.doc("Plan", None, "the plan");
+    let step = alice.doc("Step", Some(plan), "step one");
+    let t = offer_transfer(&alice, &h, plan, "Plan").await;
+    let t: uuid::Uuid = t.parse().unwrap();
+    let hub_on_alice = alice.contact_of(&h);
+    // the admin accepted, the hub dialed, alice flipped — and the reply vanished:
+    // hub record Accepted, no docs; alice's copy a mirror of the hub
+    h.store.lock().unwrap().set_hub_transfer_state(t, grimoire_store::HubTransferState::Accepted).unwrap();
+    {
+        let mut s = alice.store.lock().unwrap();
+        // a flip that died after the share and the root row (the retry must finish the child)
+        let membership = membership_share(&s, hub_on_alice.id).unwrap();
+        let sh = s.create_share(plan, Some(hub_on_alice.id), SharePermission::Propose, None).unwrap();
+        s.set_share_state(sh.id, grimoire_store::ShareState::Active).unwrap();
+        s.upsert_mirror(plan, hub_on_alice.id, membership, 1, SharePermission::Propose).unwrap();
+        let res = member_flip(&mut s, &alice.hot, &hub_on_alice, plan).unwrap();
+        assert!(matches!(res, Response::TransferReady { .. }), "{res:?}");
+        assert_eq!(s.get_mirror(step).unwrap().unwrap().owner, hub_on_alice.id, "child flipped by the retry");
+        assert_eq!(s.list_doc_transfers().unwrap()[0].state, "done");
+    }
+    assert!(h.store.lock().unwrap().get_doc(plan).is_err(), "hub has nothing yet");
+
+    // sweep 1: the hub is told, starts the take-over, says Busy
+    assert_eq!(resend_ready(&alice.ep, &alice.store, Some(h.addr.clone())).await, 0);
+    eventually("hub completes the transfer", || {
+        h.store.lock().unwrap().get_hub_transfer(t).unwrap().state == grimoire_store::HubTransferState::Done
+    }).await;
+    {
+        let s = h.store.lock().unwrap();
+        for d in [plan, step] {
+            assert!(s.get_doc(d).is_ok() && s.get_mirror(d).unwrap().is_none(), "hub owns {d}");
+        }
+        assert_eq!(s.read_doc(step).unwrap().roots[0].block.content, "step one");
+    }
+    // sweep 2: Noted → acknowledged; sweep 3: nothing left to announce
+    assert_eq!(resend_ready(&alice.ep, &alice.store, Some(h.addr.clone())).await, 1);
+    assert_eq!(resend_ready(&alice.ep, &alice.store, Some(h.addr.clone())).await, 0);
+    // a stranger to the transfer cannot trigger a take-over
+    let carol = peer("carol").await;
+    join_at(&carol.ep, &carol.store, &hub_invite(&h, &cfg), h.addr.clone()).await.unwrap();
+    let res = request(&carol.ep, h.addr.clone(), Request::TransferReady { root_doc: plan.to_string(), share_id: uuid::Uuid::now_v7().to_string() }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
+}
