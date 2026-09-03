@@ -449,6 +449,31 @@ fn admin_client(db: &std::path::Path, timeout: Option<std::time::Duration>) -> a
     Ok(b.build()?)
 }
 
+/// When spawned by the shell (`GRIMOIRE_PARENT_PID`), exit when that shell
+/// is gone. macOS has no PDEATHSIG, and a shell that crashes or is replaced
+/// by the updater leaves its child running; the next app version then
+/// attaches to a stale daemon (0.7.2 shipped this way). Raising SIGTERM on
+/// ourselves takes the normal graceful path, children included.
+#[cfg(unix)]
+async fn watch_parent() {
+    let Some(pid) = std::env::var("GRIMOIRE_PARENT_PID").ok().and_then(|p| p.parse::<i32>().ok()) else {
+        return;
+    };
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // SAFETY: kill(pid, 0) sends no signal; it only reports whether pid exists
+        let alive = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        if !alive {
+            tracing::info!(parent = pid, "shell is gone: shutting down");
+            // SAFETY: raise(3) on our own process
+            unsafe {
+                libc::raise(libc::SIGTERM);
+            }
+            return;
+        }
+    }
+}
+
 /// Ctrl-C from a terminal, or SIGTERM from the shell / launchd / `kill`.
 async fn shutdown_signal() {
     #[cfg(unix)]
@@ -754,6 +779,8 @@ async fn main() -> anyhow::Result<()> {
                 let (hot, store) = (hot.clone(), store.clone());
                 supervise("hot.idle", move || hot::idle_loop(hot.clone(), store.clone()));
             }
+            #[cfg(unix)]
+            tokio::spawn(watch_parent());
             // federation listener: separate iroh surface, deny-by-default
             // (ADR 0002 decision 7); the HTTP router below never sees it —
             // the admin routes only get the endpoint handle for outbound

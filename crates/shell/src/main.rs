@@ -58,20 +58,115 @@ fn log_path() -> String {
     }
 }
 
-/// Ensure the daemon: already up (whoever owns it) → spawn the bundled
-/// binary. Returns whether it answers.
-fn ensure_daemon() -> bool {
-    if daemon_up() {
+/// GET /api/stamp on the running daemon and read its `version`. None when
+/// nothing answers or the daemon predates 0.7.2 (no version in the stamp).
+fn daemon_version() -> Option<String> {
+    let mut s = TcpStream::connect_timeout(&DAEMON_ADDR.parse().unwrap(), Duration::from_millis(500)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    s.write_all(b"GET /api/stamp HTTP/1.0\r\nHost: 127.0.0.1:7425\r\nConnection: close\r\n\r\n").ok()?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).ok()?;
+    let body = raw.split("\r\n\r\n").nth(1)?;
+    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    v.get("version")?.as_str().map(str::to_string)
+}
+
+/// "0.7.2" → (0, 7, 2); anything unparseable sorts as (0, 0, 0), i.e. older.
+fn parse_version(v: &str) -> (u64, u64, u64) {
+    let mut it = v.trim().trim_start_matches('v').split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+/// The pid of a `grimoire` daemon listening on our port that is NOT the
+/// child we spawned — a leftover from a previous app version, or one started
+/// by hand. Anything else on the port is left alone.
+#[cfg(unix)]
+fn foreign_daemon_pid() -> Option<i32> {
+    let out = Command::new("lsof").args(["-ti", "tcp:7425", "-sTCP:LISTEN"]).output().ok()?;
+    let ours = SPAWNED.lock().unwrap().as_ref().map(|c| c.id() as i32);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+        .filter(|pid| Some(*pid) != ours)
+        .find(|pid| {
+            Command::new("ps")
+                .args(["-o", "comm=", "-p", &pid.to_string()])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains("grimoire"))
+                .unwrap_or(false)
+        })
+}
+
+/// SIGTERM a daemon we did not spawn (it shuts down cleanly and takes its
+/// gardener children with it), wait for the port to free, SIGKILL as a
+/// last resort. Returns whether the port is free afterwards.
+#[cfg(unix)]
+fn stop_foreign_daemon() -> bool {
+    let Some(pid) = foreign_daemon_pid() else { return !daemon_up() };
+    // SAFETY: kill(2) on a pid we just confirmed is a grimoire daemon
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    if wait_port_free(Duration::from_secs(5)) {
         return true;
     }
-    spawn_sidecar();
-    for _ in 0..20 {
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    wait_port_free(Duration::from_secs(2))
+}
+
+#[cfg(not(unix))]
+fn stop_foreign_daemon() -> bool {
+    !daemon_up()
+}
+
+fn wait_port_free(max: Duration) -> bool {
+    let deadline = std::time::Instant::now() + max;
+    while std::time::Instant::now() < deadline {
+        if !daemon_up() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !daemon_up()
+}
+
+fn wait_daemon_up(max: Duration) -> bool {
+    let deadline = std::time::Instant::now() + max;
+    while std::time::Instant::now() < deadline {
         if daemon_up() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    false
+    daemon_up()
+}
+
+/// Ensure a daemon at least as new as this app is answering. A daemon is
+/// already up → if it is this version (another shell, or a hand-started
+/// one) attach to it; if it is OLDER, or too old to say (no `version` in
+/// the stamp), it is a leftover from before an update — stop it and spawn
+/// the bundled binary. Before 0.7.3 the shell attached to whatever held the
+/// port, so an in-app update could leave a 0.7.1 daemon serving a 0.7.2
+/// window indefinitely, and "Restart background service" could not replace
+/// it because it only knew how to stop its own child.
+fn ensure_daemon() -> bool {
+    if daemon_up() {
+        let mine = parse_version(env!("CARGO_PKG_VERSION"));
+        let theirs = daemon_version().map(|v| parse_version(&v));
+        match theirs {
+            Some(v) if v >= mine => return true,
+            _ => {
+                if !stop_foreign_daemon() {
+                    // could not free the port; better an old daemon than none
+                    return true;
+                }
+            }
+        }
+    }
+    spawn_sidecar();
+    wait_daemon_up(Duration::from_secs(5))
 }
 
 fn spawn_sidecar() {
@@ -93,6 +188,10 @@ fn spawn_sidecar() {
         "PATH",
         format!("{path}:{home}/.claude/local/bin:{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin"),
     );
+    // the daemon exits on its own when this shell is gone (a crash, or the
+    // updater swapping the app out from under it), so it can never outlive
+    // the app and greet the next version as a stale attach target
+    cmd.env("GRIMOIRE_PARENT_PID", std::process::id().to_string());
     // the daemon writes its own rotating log; a GUI child has no terminal
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
@@ -125,8 +224,16 @@ fn stop_sidecar() {
     let _ = child.wait();
 }
 
+/// Restart whatever daemon is serving the port: our own child, or a foreign
+/// one we attached to. The port must actually be free before the spawn, or
+/// the new daemon dies on bind and the old one carries on unnoticed.
 fn restart_daemon() {
-    stop_sidecar();
+    if SPAWNED.lock().unwrap().is_some() {
+        stop_sidecar();
+    } else {
+        stop_foreign_daemon();
+    }
+    wait_port_free(Duration::from_secs(5));
     spawn_sidecar();
 }
 
@@ -484,4 +591,20 @@ fn main() {
                 _ => {}
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_version;
+
+    #[test]
+    fn versions_compare_numerically_and_unparseable_sorts_oldest() {
+        assert!(parse_version("0.7.2") > parse_version("0.7.1"));
+        assert!(parse_version("0.10.0") > parse_version("0.9.9"));
+        assert!(parse_version("1.0.0") > parse_version("0.99.99"));
+        assert_eq!(parse_version("v0.7.2"), parse_version("0.7.2"));
+        assert_eq!(parse_version("garbage"), (0, 0, 0));
+        // a daemon with no version in its stamp (pre-0.7.2) must read as older
+        assert!(parse_version("0.7.3") > parse_version(""));
+    }
 }
