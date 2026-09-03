@@ -1,0 +1,64 @@
+//! Run store work off the async workers.
+//!
+//! The daemon holds one `Arc<Mutex<SqliteStore>>`; every guard is block-scoped
+//! before any `.await`, but the SQLite work itself used to run on the tokio
+//! worker threads, so one long query stalled every other request on that
+//! worker. `with_store` moves the lock + query onto the blocking pool and
+//! hands the result back; the Mutex type and the store signatures stay as
+//! they are.
+
+use grimoire_store::SqliteStore;
+use std::sync::{Arc, Mutex};
+
+/// Lock the store inside `spawn_blocking`, run `f`, return its value.
+/// A poisoned lock is recovered (same as the inline `lock()` sites did); a
+/// panic inside `f` is re-raised on the caller so it is not silently lost.
+pub async fn with_store<T: Send + 'static>(
+    store: &Arc<Mutex<SqliteStore>>,
+    f: impl FnOnce(&mut SqliteStore) -> T + Send + 'static,
+) -> T {
+    let store = Arc::clone(store);
+    match tokio::task::spawn_blocking(move || {
+        let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut s)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => panic!("store task cancelled: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runs_closure_and_returns_value() {
+        let store = Arc::new(Mutex::new(SqliteStore::open_in_memory().unwrap()));
+        let n = with_store(&store, |s| s.canvas_doc_ids().unwrap().len()).await;
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn recovers_poisoned_lock() {
+        let store = Arc::new(Mutex::new(SqliteStore::open_in_memory().unwrap()));
+        let poison = Arc::clone(&store);
+        let _ = std::thread::spawn(move || {
+            let _g = poison.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(store.is_poisoned());
+        let n = with_store(&store, |s| s.canvas_doc_ids().unwrap().len()).await;
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "boom")]
+    async fn panic_in_closure_propagates() {
+        let store = Arc::new(Mutex::new(SqliteStore::open_in_memory().unwrap()));
+        with_store(&store, |_| panic!("boom")).await;
+    }
+}

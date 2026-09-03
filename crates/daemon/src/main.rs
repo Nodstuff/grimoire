@@ -18,6 +18,7 @@ mod yrender;
 mod mcp;
 mod memory;
 mod room;
+mod store_ext;
 #[cfg(test)]
 mod retrieval_probe;
 
