@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { BaselineBlock, Entry, computeOps, keyBetween } from './diff'
+import { BaselineBlock, Entry, compareSortKey, computeOps, keyBetween, keyForPosition } from './diff'
 
 let n = 0
 const newId = () => `new-${++n}`
@@ -133,5 +133,83 @@ describe('computeOps', () => {
     expect(body.kind.parent_id).toBe(head.kind.block_id)
     expect(head.kind.block_type).toBe('heading')
     expect(body.kind.block_type).toBe('paragraph')
+  })
+})
+
+describe('keyBetween is total', () => {
+  it('equal bounds → a key strictly after a (mid digit appended)', () => {
+    expect(keyBetween('i', 'i')).toBe('ii')
+    expect(keyBetween('i', 'i') > 'i').toBe(true)
+    expect(keyBetween('zz', 'zz')).toBe('zzi')
+  })
+
+  it('inverted bounds → a key strictly after a', () => {
+    const k = keyBetween('r', 'i')
+    expect(k > 'r').toBe(true)
+    expect(k.endsWith('0')).toBe(false)
+  })
+
+  it('adjacent keys keep bisecting below the open end', () => {
+    expect(keyBetween('i', 'j')).toBe('ii')
+    expect(keyBetween('ii', 'ij')).toBe('iii')
+    expect(keyBetween('iz', 'j')).toBe('izi')
+  })
+
+  it('null bounds', () => {
+    expect(keyBetween(null, null)).toBe('i')
+    expect(keyBetween(null, 'i') < 'i').toBe(true)
+    expect(keyBetween('i', null) > 'i').toBe(true)
+    expect(keyBetween(null, '1')).toBe('0i') // nothing below '1' but '0…'
+  })
+
+  it('exhaustion: 500 inserts at the front and at the back stay ordered', () => {
+    let hi: string | null = 'i'
+    let prev = hi
+    for (let n = 0; n < 500; n++) {
+      const k: string = keyBetween(null, hi)
+      expect(k < prev).toBe(true)
+      expect(k.endsWith('0')).toBe(false)
+      prev = k
+      hi = k
+    }
+    let lo = 'i'
+    for (let n = 0; n < 500; n++) {
+      const k: string = keyBetween(lo, 'j')
+      expect(k > lo && k < 'j').toBe(true)
+      lo = k
+    }
+  })
+})
+
+describe('compareSortKey / keyForPosition', () => {
+  it('sorts null last, like the server', () => {
+    const keys = ['r', null, 'i', null, 'a']
+    expect([...keys].sort(compareSortKey)).toEqual(['a', 'i', 'r', null, null])
+  })
+
+  const sib = (k: string | null) => ({ sort_key: k })
+
+  it('bounds come from the nearest keyed neighbours', () => {
+    const s = [sib('a'), sib('i'), sib('r')]
+    expect(keyForPosition(s, 0) < 'a').toBe(true)
+    const mid = keyForPosition(s, 1)
+    expect(mid > 'a' && mid < 'i').toBe(true)
+    expect(keyForPosition(s, 3) > 'r').toBe(true)
+  })
+
+  it('unkeyed siblings are skipped, not treated as lowest', () => {
+    const s = [sib('a'), sib('i'), sib(null), sib(null)]
+    // dropping after the unkeyed tail: after every keyed doc, not 'i'-then-lowest
+    expect(keyForPosition(s, 4) > 'i').toBe(true)
+    // dropping between the two unkeyed docs: still after every keyed doc
+    expect(keyForPosition(s, 3) > 'i').toBe(true)
+    // all unkeyed: any key is fine, and it terminates
+    expect(keyForPosition([sib(null), sib(null)], 1)).toBe('i')
+    expect(keyForPosition([], 0)).toBe('i')
+  })
+
+  it('duplicate keys among siblings still yield a key strictly after the left one', () => {
+    const s = [sib('i'), sib('i')]
+    expect(keyForPosition(s, 1) > 'i').toBe(true)
   })
 })

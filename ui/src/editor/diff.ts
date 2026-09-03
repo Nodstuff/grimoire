@@ -24,14 +24,21 @@ export interface Op {
 }
 
 const DIGITS = '0123456789abcdefghijklmnopqrstuvwxyz'
+const MID = DIGITS[18] // 'i'
 
+/** A base-36 fractional key strictly between `a` and `b` (null = open end).
+ * Total: when the bounds are inverted or equal (`a >= b`) — a broken sibling
+ * list, or two docs handed the same key — the answer is a key strictly
+ * after `a` (`a` + a mid digit) rather than an infinite loop. Never ends in
+ * '0', so every key has room below it. Mirrors crates/store/src/order_key.rs. */
 export function keyBetween(a: string | null, b: string | null): string {
+  if (a != null && b != null && a >= b) return a + MID
   const av = a ?? ''
   let out = ''
   let i = 0
   for (;;) {
-    const da = i < av.length ? DIGITS.indexOf(av[i]) : 0
-    const db = b == null ? 36 : i < b.length ? DIGITS.indexOf(b[i]) : 0
+    const da = i < av.length ? Math.max(0, DIGITS.indexOf(av[i])) : 0
+    const db = b == null ? 36 : i < b.length ? Math.max(0, DIGITS.indexOf(b[i])) : 0
     if (da === db) {
       out += DIGITS[da]
       i++
@@ -41,12 +48,45 @@ export function keyBetween(a: string | null, b: string | null): string {
     out += DIGITS[da]
     i++
     for (;;) {
-      const d = i < av.length ? DIGITS.indexOf(av[i]) : 0
+      const d = i < av.length ? Math.max(0, DIGITS.indexOf(av[i])) : 0
       if (36 - d > 1) return out + DIGITS[(d + 36) >> 1]
       out += DIGITS[d]
       i++
     }
   }
+}
+
+/** Sibling order as the server sorts it: by sort_key, NULL last (a doc that
+ * never got a key sits after every keyed one), ties keep input order. */
+export function compareSortKey(a: string | null | undefined, b: string | null | undefined): number {
+  if (a == null && b == null) return 0
+  if (a == null) return 1
+  if (b == null) return -1
+  return a < b ? -1 : a > b ? 1 : 0
+}
+
+/** Key for a doc dropped at `index` of `siblings` (the dragged doc already
+ * removed). Null-keyed siblings sort last on the server and bound nothing, so
+ * the bounds are the nearest KEYED neighbours on each side — after every
+ * keyed doc when only unkeyed ones follow. */
+export function keyForPosition(siblings: { sort_key: string | null }[], index: number): string {
+  let lo: string | null = null
+  for (let i = Math.min(index, siblings.length) - 1; i >= 0; i--) {
+    const k = siblings[i].sort_key
+    if (k != null) {
+      lo = k
+      break
+    }
+  }
+  let hi: string | null = null
+  for (let i = Math.max(index, 0); i < siblings.length; i++) {
+    const k = siblings[i].sort_key
+    if (k != null) {
+      hi = k
+      break
+    }
+  }
+  return keyBetween(lo, hi)
 }
 
 export function inferBlockType(content: string): string {

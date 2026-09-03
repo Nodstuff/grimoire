@@ -19,6 +19,7 @@ import { buildHighlightMap, targetBlockOf } from './review'
 import { activityLine, loadLastSeen, storeLastSeen, unseenActivity } from './activity'
 import { advanceEvents, EventsCursor, EventsResponse, INITIAL_CURSOR, liveEventLine } from './live'
 import { chipText } from './shares'
+import { compareSortKey, keyForPosition } from './editor/diff'
 import {
   api,
   ApiError,
@@ -933,6 +934,8 @@ function DocTreeNav({
       if (!m.has(k)) m.set(k, [])
       m.get(k)!.push(d)
     }
+    // the server's order: sort_key, NULL last (stable → ties keep its order)
+    for (const kids of m.values()) kids.sort((a, b) => compareSortKey(a.sort_key, b.sort_key))
     return m
   }, [docs])
 
@@ -979,17 +982,14 @@ function DocTreeNav({
     let sortKey: string | null
     if (mode === 'into') {
       parent = target.id
-      const kids = childrenOf.get(target.id) ?? []
-      const last = kids[kids.length - 1]
-      sortKey = keyBetween(last?.sort_key ?? null, null)
+      const kids = (childrenOf.get(target.id) ?? []).filter((d) => d.id !== dragged)
+      sortKey = keyForPosition(kids, kids.length)
       setOpenDirs((s) => new Set(s).add(target.id))
     } else {
       parent = target.parent_id
       const siblings = (childrenOf.get(parent) ?? []).filter((d) => d.id !== dragged)
       const i = siblings.findIndex((d) => d.id === target.id)
-      const before = mode === 'before' ? siblings[i - 1] : siblings[i]
-      const after = mode === 'before' ? siblings[i] : siblings[i + 1]
-      sortKey = keyBetween(before?.sort_key ?? null, after?.sort_key ?? null)
+      sortKey = keyForPosition(siblings, mode === 'before' ? i : i + 1)
     }
     // moving INTO a shared subtree makes the doc visible to its grantees on
     // their next pull — loud, explicit confirm (ADR 0002 edge semantics)
@@ -1183,31 +1183,6 @@ function DocTreeNav({
       </div>
     </aside>
   )
-}
-
-const DIGITS = '0123456789abcdefghijklmnopqrstuvwxyz'
-function keyBetween(a: string | null, b: string | null): string {
-  const av = a ?? ''
-  let out = ''
-  let i = 0
-  for (;;) {
-    const da = i < av.length ? DIGITS.indexOf(av[i]) : 0
-    const db = b == null ? 36 : i < b.length ? DIGITS.indexOf(b[i]) : 0
-    if (da === db) {
-      out += DIGITS[da]
-      i++
-      continue
-    }
-    if (db - da > 1) return out + DIGITS[(da + db) >> 1]
-    out += DIGITS[da]
-    i++
-    for (;;) {
-      const d = i < av.length ? DIGITS.indexOf(av[i]) : 0
-      if (36 - d > 1) return out + DIGITS[(d + 36) >> 1]
-      out += DIGITS[d]
-      i++
-    }
-  }
 }
 
 /* ---------- doc view ---------- */
