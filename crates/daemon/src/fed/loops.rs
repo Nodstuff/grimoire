@@ -523,7 +523,8 @@ pub async fn notify_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot
 pub fn join_failure_is_dead(e: &anyhow::Error) -> bool {
     matches!(
         e.downcast_ref::<Refusal>().map(|r| r.code),
-        Some(RefusalCode::InviteInvalid)
+        // a root held from another contact does not free itself by waiting
+        Some(RefusalCode::InviteInvalid | RefusalCode::RootConflict)
     )
 }
 

@@ -16,7 +16,7 @@
 //! Persisted in `settings`: `hub.enabled`, `hub.name`, `hub.root_doc`, and
 //! `hub.folder.<contact_id>` (the member's folder under the root).
 
-use super::client::{MintedInvite, join_at, mint_invite_full, pull_share, ticket_for_offer};
+use super::client::{JoinOrigin, MintedInvite, join_at_from, mint_invite_full, pull_share, ticket_for_offer};
 use super::wire::{HubMember, HubPublicationInfo};
 use anyhow::{Context, Result};
 use grimoire_store::{BlockStore, Contact, ContactRole, Membership, PrincipalKind, SqliteStore};
@@ -427,7 +427,9 @@ pub async fn accept_publication(
         anyhow::bail!("a publication must be a propose share");
     }
     let ticket = ticket_for_offer(&offer);
-    let out = join_at(endpoint, store, &ticket, addr.clone()).await?;
+    // automatic path: a root already mirrored from ANOTHER member is refused
+    // (`RootConflict`) — a member cannot capture a colleague's publication
+    let out = join_at_from(endpoint, store, &ticket, addr.clone(), JoinOrigin::HubRelay).await?;
     let root: Uuid = out.root_doc.parse().context("member sent a bad root id")?;
     {
         let mut s = store.lock().unwrap_or_else(|p| p.into_inner());

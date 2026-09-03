@@ -2720,3 +2720,96 @@ async fn transfer_is_refused_while_a_doc_is_live_or_has_edits_waiting_and_declin
     let res = request(&carol.ep, h.addr.clone(), Request::TransferOffer { root_doc: plan.to_string(), title: "x".into(), doc_count: 1 }).await.unwrap();
     assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
 }
+
+/// 0.7.2 hardening: a member offering a share whose root is ALREADY a mirror
+/// the hub holds from another member is refused (`RootConflict`) on the
+/// automatic hub path; the first member's mirror and contact are untouched.
+#[tokio::test]
+async fn hub_refuses_a_publication_that_names_another_members_root() {
+    use super::client::{JoinOrigin, join_at_from};
+    let (h, _cfg, alice, bob) = team().await;
+    // alice publishes "Notes"; the hub mirrors it from her
+    let notes = alice.doc("Notes", None, "alice's notes");
+    let hub_on_alice = alice.contact_of(&h);
+    let (share, minted) = {
+        let mut s = alice.store.lock().unwrap();
+        let (share, minted) = super::client::mint_invite_full(&mut s, &alice.pubkey(), notes, SharePermission::Propose).unwrap();
+        s.set_invite_offered_to(share.id, hub_on_alice.id).unwrap();
+        (share, minted)
+    };
+    let res = request(&alice.ep, h.addr.clone(), Request::Offer {
+        share: share.id.to_string(), root_title: "Notes".into(), permission: "propose".into(),
+        secret: minted.secret.clone(), expires_at: minted.expires_at.clone(),
+    }).await.unwrap();
+    assert_eq!(res, Response::Noted);
+    eventually("hub accepts alice's publication", || {
+        h.store.lock().unwrap().get_mirror(notes).unwrap().is_some_and(|m| m.synced_epoch > 0)
+    }).await;
+    let alice_on_hub = h.contact_of(&alice);
+    let bob_on_hub = h.contact_of(&bob);
+
+    // bob forges a doc under alice's root id and offers it to the hub
+    let (bob_share, bob_minted) = {
+        let mut s = bob.store.lock().unwrap();
+        s.create_doc_with_id(notes, "Notes", None, bob.human).unwrap();
+        super::client::mint_invite_full(&mut s, &bob.pubkey(), notes, SharePermission::Propose).unwrap()
+    };
+    // what `hub::accept_publication` builds from the stored offer
+    let ticket = Ticket::new(bob.pubkey(), bob_share.id.to_string(), bob_minted.secret.clone());
+    let err = join_at_from(&h.ep, &h.store, &ticket, bob.addr.clone(), JoinOrigin::HubRelay).await.unwrap_err();
+    assert_eq!(err.downcast_ref::<super::wire::Refusal>().map(|r| r.code), Some(RefusalCode::RootConflict), "{err:#}");
+    assert!(super::loops::join_failure_is_dead(&err), "a root conflict is never retried");
+    let s = h.store.lock().unwrap();
+    let m = s.get_mirror(notes).unwrap().unwrap();
+    assert_eq!((m.owner, m.share_id), (alice_on_hub.id, share.id), "still alice's mirror");
+    let contacts = s.list_contacts().unwrap();
+    assert!(!contacts.iter().find(|c| c.id == alice_on_hub.id).unwrap().revoked, "alice's contact intact");
+    assert!(!contacts.iter().find(|c| c.id == bob_on_hub.id).unwrap().revoked);
+    assert_eq!(s.list_hub_publications().unwrap().len(), 1);
+}
+
+/// 0.7.2 hardening: `is_hub` on a contact comes from the hub marker on the
+/// invite secret, never from the owner's `Redeemed` reply. A hub sharing a
+/// doc OUTSIDE its root replies `is_hub: true` with a plain secret: the
+/// grantee does not flag it, and its `on_behalf_of` is refused like any
+/// plain peer's.
+#[tokio::test]
+async fn is_hub_comes_from_the_hub_marked_invite_not_the_reply() {
+    let (h, cfg) = hub("Team").await;
+    let alice = peer("alice").await;
+    // the marker itself: a root invite carries it, an ordinary one does not
+    assert!(hub_invite(&h, &cfg).is_hub_invite());
+    let side = h.doc("Side", None, "not under the hub root");
+    let (_, link) = mint_invite(&mut h.store.lock().unwrap(), &h.pubkey(), side, SharePermission::View).unwrap();
+    let ticket = Ticket::parse(&link).unwrap();
+    assert!(!ticket.is_hub_invite());
+    assert_eq!(ticket.to_link(), link, "link format unchanged for 0.7.1 peers");
+
+    let out = join_at(&alice.ep, &alice.store, &ticket, h.addr.clone()).await.unwrap();
+    assert!(!out.is_hub, "{out:?}");
+    let h_on_alice = alice.contact_of(&h);
+    assert!(!h_on_alice.is_hub, "reply said hub, ticket did not: not believed");
+    assert!(alice.store.lock().unwrap().get_mirror(side).unwrap().is_some());
+
+    // alice gives that contact a propose share; its on_behalf_of is refused
+    let a_doc = alice.doc("A", None, "a");
+    let (_, link) = mint_invite(&mut alice.store.lock().unwrap(), &alice.pubkey(), a_doc, SharePermission::Propose).unwrap();
+    join_at(&h.ep, &h.store, &Ticket::parse(&link).unwrap(), alice.addr.clone()).await.unwrap();
+    let h_share = h.store.lock().unwrap().get_mirror(a_doc).unwrap().unwrap().share_id.to_string();
+    let res = request(&h.ep, alice.addr.clone(), Request::Propose {
+        share: h_share.clone(), doc: a_doc.to_string(), ops: vec![insert_op("x")], note: String::new(), base_epoch: Some(1), request_id: None,
+        on_behalf_of: Some(super::wire::OnBehalfOf { pubkey: "ab".repeat(32), name: "mallory".into() }),
+    }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
+    assert!(alice.store.lock().unwrap().review_queue(Some(a_doc)).unwrap().is_empty());
+    // the same proposal without the claim is an ordinary parked proposal
+    let res = request(&h.ep, alice.addr.clone(), Request::Propose {
+        share: h_share, doc: a_doc.to_string(), ops: vec![insert_op("x")], note: String::new(), base_epoch: Some(1), request_id: None, on_behalf_of: None,
+    }).await.unwrap();
+    assert!(matches!(res, Response::Proposed { .. }), "{res:?}");
+
+    // a genuine hub-root join still flags the hub
+    let out = join_at(&alice.ep, &alice.store, &hub_invite(&h, &cfg), h.addr.clone()).await.unwrap();
+    assert!(out.is_hub);
+    assert!(alice.contact_of(&h).is_hub);
+}

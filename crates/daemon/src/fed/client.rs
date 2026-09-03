@@ -8,8 +8,8 @@
 
 use super::server::{read_frame, write_frame};
 use super::wire::{
-    ALPN, Frame, HOT_ALPN, MAX_FRAME, PROTOCOL_VERSION, Refusal, Request, Response, Ticket,
-    WireDoc, hash_secret,
+    ALPN, Frame, HOT_ALPN, MAX_FRAME, PROTOCOL_VERSION, Refusal, RefusalCode, Request, Response,
+    Ticket, WireDoc, hash_secret,
 };
 use anyhow::{Context, Result};
 use grimoire_store::{BlockStore, SqliteStore};
@@ -17,9 +17,41 @@ use iroh::{Endpoint, EndpointAddr};
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 
+/// Upper bound on one whole request (dial + write + reply). The dial has its
+/// own 10s cap; this covers a peer that accepts and then stalls, so a pull
+/// or refresh loop can never hang on one stuck owner. Generous because a
+/// paged pull reply is up to `PULL_BUDGET` (4 MB) over a relay.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// One request against a remote instance (grantee-side; the pull loop and
-/// the redeem flow both come through here).
+/// the redeem flow both come through here). Bounded by `REQUEST_TIMEOUT`.
 pub async fn request(
+    endpoint: &Endpoint,
+    addr: impl Into<EndpointAddr>,
+    req: Request,
+) -> Result<Response> {
+    request_with_timeout(endpoint, addr, req, REQUEST_TIMEOUT).await
+}
+
+/// `request` with an explicit overall bound (callers with a tighter budget,
+/// tests with a stalling peer).
+pub async fn request_with_timeout(
+    endpoint: &Endpoint,
+    addr: impl Into<EndpointAddr>,
+    req: Request,
+    overall: std::time::Duration,
+) -> Result<Response> {
+    tokio::time::timeout(overall, request_inner(endpoint, addr, req))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "request timed out after {}s (peer accepted the dial but never answered)",
+                overall.as_secs()
+            )
+        })?
+}
+
+async fn request_inner(
     endpoint: &Endpoint,
     addr: impl Into<EndpointAddr>,
     req: Request,
@@ -301,9 +333,24 @@ pub struct JoinOutcome {
     pub membership: Option<String>,
 }
 
+/// Where a join came from (0.7.2 hardening). Decides how much the join may
+/// change about what this instance already holds: only a person's explicit
+/// action may rebind a share root that is already mirrored from another
+/// contact (the "owner changed identity" case) — an automatic path naming
+/// someone else's root is a hijack attempt and is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinOrigin {
+    /// A link the person pasted, or a share request they accepted by hand.
+    Interactive,
+    /// A hub auto-accepting a member's publication (`hub::accept_publication`).
+    HubRelay,
+}
+
 /// One join attempt (grantee-side): dial the ticket's node, redeem, pair the
 /// owner as a contact, and materialize the mirror root — a placeholder doc
 /// under the origin UUID that the pull loop (#59) fills with the subtree.
+/// This is the INTERACTIVE entry (pasted link / accepted request / queued
+/// retry of one); automatic callers use `join_at_from` with their origin.
 pub async fn join_once(
     endpoint: &Endpoint,
     store: &Arc<Mutex<SqliteStore>>,
@@ -314,15 +361,27 @@ pub async fn join_once(
         .node
         .parse()
         .context("ticket has a malformed node id")?;
-    join_at(endpoint, store, ticket, EndpointAddr::from(owner_id)).await
+    join_at_from(endpoint, store, ticket, EndpointAddr::from(owner_id), JoinOrigin::Interactive).await
 }
 
-/// join_once with an explicit address (tests, LAN-known peers).
+/// join_once with an explicit address (tests, LAN-known peers); interactive.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn join_at(
     endpoint: &Endpoint,
     store: &Arc<Mutex<SqliteStore>>,
     ticket: &Ticket,
     addr: EndpointAddr,
+) -> Result<JoinOutcome> {
+    join_at_from(endpoint, store, ticket, addr, JoinOrigin::Interactive).await
+}
+
+/// The join with its origin spelled out (see `JoinOrigin`).
+pub async fn join_at_from(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    ticket: &Ticket,
+    addr: EndpointAddr,
+    origin: JoinOrigin,
 ) -> Result<JoinOutcome> {
     let my_name = {
         let s = store.lock().unwrap_or_else(|p| p.into_inner());
@@ -363,6 +422,19 @@ pub async fn join_at(
         anyhow::bail!("owner refused the invite: {res:?}");
     };
 
+    // 0.7.2: `is_hub` is only believed when the ticket we redeemed was minted
+    // by a hub for its root (hub marker on the secret). The reply alone is a
+    // self-assertion: honouring it would let any owner whose link a person
+    // pasted have their `on_behalf_of` proposals accepted as a hub's.
+    let is_hub = if is_hub && !ticket.is_hub_invite() {
+        tracing::warn!(
+            owner = ticket.node,
+            "peer claims to be a hub but the invite was not a hub invite; not flagging it as one"
+        );
+        false
+    } else {
+        is_hub
+    };
     let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
     let owner_contact = s.pair_contact(&ticket.node, &owner_name)?;
     // hub: remember what it is and where we stand with it (the contact row
@@ -425,15 +497,40 @@ pub async fn join_at(
     }
     let perm = grimoire_store::SharePermission::parse(&permission)
         .unwrap_or(grimoire_store::SharePermission::View);
-    // the same root from a different node = the owner changed identity
-    // (re-install, restored keychain). The old pubkey will never answer
-    // again: revoke that contact so the loops stop dialing it, and say so.
+    // the same root from a different node = EITHER the owner changed identity
+    // (re-install, restored keychain — the old pubkey will never answer
+    // again: revoke that contact so the loops stop dialing it, and say so)
+    // OR a peer naming someone else's root to capture their mirror. 0.7.2:
+    // rebinding needs a person's action (`JoinOrigin::Interactive` — they
+    // pasted the link or accepted the request); an automatic join naming a
+    // root held from another contact is refused, typed, and logged.
     let owner_changed_from = match s.get_mirror(root_uuid)? {
         Some(m) if m.owner != owner_contact.id => {
             let old = s
                 .list_contacts()?
                 .into_iter()
                 .find(|c| c.id == m.owner);
+            let old_name = old
+                .as_ref()
+                .map(|c| c.petname.clone())
+                .unwrap_or_else(|| "another contact".into());
+            if origin != JoinOrigin::Interactive {
+                tracing::warn!(
+                    root = %root_uuid,
+                    held_from = old_name,
+                    claimed_by = owner_contact.petname,
+                    ?origin,
+                    "share root belongs to a mirror from another contact; refusing to rebind it"
+                );
+                return Err(Refusal::new(
+                    RefusalCode::RootConflict,
+                    format!(
+                        "share root {root_uuid} belongs to a mirror from {old_name}; not rebinding it to {}",
+                        owner_contact.petname
+                    ),
+                )
+                .into());
+            }
             if let Some(old) = &old {
                 s.revoke_contact(old.id)?;
                 tracing::warn!(
@@ -809,7 +906,14 @@ pub fn mint_invite_full(
     permission: grimoire_store::SharePermission,
 ) -> Result<(grimoire_store::Share, MintedInvite)> {
     let share = store.create_share(root_doc, None, permission, None)?;
-    let secret = super::wire::new_secret();
+    // a hub minting for its root marks the secret (`HUB_SECRET_PREFIX`): the
+    // marker is what lets the redeemer believe `is_hub` in the reply
+    let hub_root = super::hub::config(store).is_some_and(|h| h.root_doc == root_doc);
+    let secret = if hub_root {
+        super::wire::new_hub_secret()
+    } else {
+        super::wire::new_secret()
+    };
     let expires_at = (chrono::Utc::now() + chrono::Duration::days(7))
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();

@@ -271,3 +271,28 @@ Wire additions: `Propose.on_behalf_of`, `TransferOffer`, `TransferAccepted`, `Tr
 `POST /admin/hubs/transfer`; (hub box) `GET /admin/hub/transfers`, `POST /admin/hub/transfers/
 {accept,decline}`. `GET /admin/hubs` rows carry `transfers`; `GET /api/doc/{id}/federation` mirrors
 carry `transferred_from_me`.
+
+## 0.7.2 hardening
+
+Wire-additive; a 0.7.1 peer parses and redeems every 0.7.2 link and frame.
+
+- **Join origin rule.** `client::join_at_from(.., JoinOrigin)` decides how much a join may change
+  about what the instance already holds. When the redeemed share's root uuid is already a mirror
+  held from a *different* contact, only `Interactive` (a person pasted the link or accepted a share
+  request by hand) may take the "owner changed identity" branch — revoke the old contact, rebind the
+  mirror. `HubRelay` (`hub::accept_publication`) and any future automatic path refuse with the new
+  `RefusalCode::RootConflict`, log a warning, and leave the first mirror and contact intact.
+  `RootConflict` is a dead join (never retried by the queue). Without this a member could publish a
+  forged doc under a colleague's root id and capture their publication on the hub.
+- **Hub marker.** A contact is flagged `is_hub` only when the ticket it redeemed was minted by a hub
+  for its root. The marker is the `hub-` prefix on the invite secret (`wire::HUB_SECRET_PREFIX`,
+  `new_hub_secret`, `Ticket::is_hub_invite`); `mint_invite_full` applies it when the root is the
+  hub's configured root, so `hub invite` and the hub's membership offers carry it. The owner's
+  `Redeemed { is_hub }` alone is a self-assertion and is ignored (warned) without the marker — a
+  plain owner can no longer have its `on_behalf_of` proposals honoured as a hub's. The marker lives
+  inside the secret so the link format is unchanged and the hash covers the whole string.
+- **Request bound.** `client::request` is capped end to end by `REQUEST_TIMEOUT` (60 s) on top of
+  the 10 s dial cap, so a peer that accepts and stalls cannot hang a pull or refresh loop.
+- **Frame limits.** (server side; see the `server.rs` limits) a connection whose peer is not yet
+  authenticated — unknown contact, or a `Redeem` still to be checked — is read under a small cap;
+  the large paged-pull cap applies only after authentication.
