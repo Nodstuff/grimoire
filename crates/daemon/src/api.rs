@@ -640,10 +640,9 @@ async fn history(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match s.ops_since(id, 0) {
-        Ok(mut ops) => {
-            ops.reverse();
-            ops.truncate(100);
+    // newest first, capped in SQL (was: whole ledger, reversed, truncated)
+    match s.ops_for_doc_limited(id, 100) {
+        Ok(ops) => {
             let rows: Vec<Value> = ops
                 .into_iter()
                 .map(|op| {
