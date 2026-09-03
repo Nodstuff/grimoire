@@ -359,8 +359,10 @@ CREATE TABLE IF NOT EXISTS outbound_proposals (
 -- Block embeddings (ask the vault, 2026-09-03): one static-model vector per
 -- live content block, f32 little-endian BLOB. `epoch` is the block epoch the
 -- vector was computed at; a newer block epoch = stale = re-embed that block.
+-- CASCADE: mirror pulls hard-delete blocks (`mirror_replace_blocks`); the
+-- vector must go with its block or the FK fails once a mirror is embedded.
 CREATE TABLE IF NOT EXISTS block_vec (
-    block_id TEXT PRIMARY KEY REFERENCES blocks (id),
+    block_id TEXT PRIMARY KEY REFERENCES blocks (id) ON DELETE CASCADE,
     epoch    INTEGER NOT NULL,
     dim      INTEGER NOT NULL,
     vec      BLOB NOT NULL

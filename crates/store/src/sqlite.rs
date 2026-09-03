@@ -229,6 +229,21 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
             }
         }
     }
+    // block_vec: the first cut referenced blocks(id) without ON DELETE
+    // CASCADE, so a mirror pull (hard-delete + reinsert) failed the FK once
+    // a mirror block had been embedded. Rebuild once with the cascade.
+    let block_vec_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'block_vec'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(sql) = block_vec_sql
+        && !sql.to_ascii_uppercase().contains("ON DELETE CASCADE")
+    {
+        rebuild_block_vec_with_cascade(conn)?;
+    }
     let has_gardeners: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'gardeners'",
         [],
@@ -291,6 +306,28 @@ fn widen_shares_trust_check(conn: &Connection) -> Result<()> {
             "shares rebuild left {violations} dangling share_invites rows"
         )));
     }
+    Ok(())
+}
+
+/// Rebuild `block_vec` with `ON DELETE CASCADE` on its blocks FK. Nothing
+/// references block_vec, so the swap is copy → drop → rename, in one
+/// transaction; rows whose block is already gone are dropped on the way.
+fn rebuild_block_vec_with_cascade(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE block_vec_new (
+             block_id TEXT PRIMARY KEY REFERENCES blocks (id) ON DELETE CASCADE,
+             epoch    INTEGER NOT NULL,
+             dim      INTEGER NOT NULL,
+             vec      BLOB NOT NULL
+         );
+         INSERT INTO block_vec_new (block_id, epoch, dim, vec)
+             SELECT v.block_id, v.epoch, v.dim, v.vec FROM block_vec v
+             WHERE EXISTS (SELECT 1 FROM blocks b WHERE b.id = v.block_id);
+         DROP TABLE block_vec;
+         ALTER TABLE block_vec_new RENAME TO block_vec;
+         COMMIT;",
+    )?;
     Ok(())
 }
 
@@ -3085,8 +3122,11 @@ impl BlockStore for SqliteStore {
     fn stale_block_vectors(&self, limit: usize) -> Result<Vec<(Uuid, i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT b.id, b.epoch, b.content FROM blocks b
+             JOIN docs d ON d.id = b.doc_id
              LEFT JOIN block_vec v ON v.block_id = b.id
              WHERE b.deleted = 0 AND b.block_type != 'comment'
+               AND d.deleted = 0
+               AND NOT EXISTS (SELECT 1 FROM mirrors m WHERE m.doc_id = b.doc_id)
                AND (v.block_id IS NULL OR v.epoch < b.epoch)
              ORDER BY b.epoch DESC LIMIT ?1",
         )?;
@@ -3387,6 +3427,12 @@ impl BlockStore for SqliteStore {
                 tx.execute("DELETE FROM doc_tags WHERE block_id = ?1", params![id])?;
             }
         }
+        // embeddings go with their blocks (belt: the FK also cascades since
+        // the block_vec rebuild, but a pre-rebuild table must not fail here)
+        tx.execute(
+            "DELETE FROM block_vec WHERE block_id IN (SELECT id FROM blocks WHERE doc_id = ?1)",
+            params![doc_id.to_string()],
+        )?;
         tx.execute(
             "DELETE FROM blocks WHERE doc_id = ?1",
             params![doc_id.to_string()],
@@ -4220,6 +4266,71 @@ mod tests {
         assert_eq!(fk, 0);
         migrate_pre_schema(&s.conn).unwrap();
         assert_eq!(s.list_shares().unwrap().len(), 1);
+    }
+
+    /// block_vec from before the cascade: opening the DB rebuilds it with
+    /// ON DELETE CASCADE, keeps the rows, and a hard block delete then takes
+    /// the vector with it.
+    #[test]
+    fn opening_a_db_with_a_non_cascading_block_vec_rebuilds_it() {
+        use crate::{BlockType, OpInput, OpKind, PrincipalKind};
+        use rusqlite::params;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let doc = s.create_doc("D", None, tom.id).unwrap();
+        let bid = Uuid::now_v7();
+        s.apply(
+            doc.id,
+            0,
+            tom.id,
+            vec![OpInput {
+                kind: OpKind::Insert {
+                    block_id: bid,
+                    parent_id: None,
+                    order_key: "i".into(),
+                    block_type: BlockType::Paragraph,
+                    content: "x".into(),
+                    refers_to: None,
+                },
+                source_refs: vec![],
+            }],
+        )
+        .unwrap();
+        s.conn
+            .execute_batch(
+                "DROP TABLE block_vec;
+                 CREATE TABLE block_vec (
+                     block_id TEXT PRIMARY KEY REFERENCES blocks (id),
+                     epoch INTEGER NOT NULL, dim INTEGER NOT NULL, vec BLOB NOT NULL);",
+            )
+            .unwrap();
+        s.set_block_vec(bid, 1, &[1.0]).unwrap();
+        // old table: a hard delete of the block is an FK error
+        assert!(
+            s.conn
+                .execute("DELETE FROM blocks WHERE id = ?1", params![bid.to_string()])
+                .is_err()
+        );
+        migrate_pre_schema(&s.conn).unwrap();
+        migrate_pre_schema(&s.conn).unwrap(); // idempotent
+        let sql: String = s
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'block_vec'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("ON DELETE CASCADE"));
+        assert_eq!(s.block_vecs().unwrap().len(), 1, "rows survive the rebuild");
+        s.conn
+            .execute("DELETE FROM blocks WHERE id = ?1", params![bid.to_string()])
+            .unwrap();
+        let n: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM block_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "cascade took the vector");
     }
 
     /// v4 backfill: a row whose stored type disagrees with its content is
