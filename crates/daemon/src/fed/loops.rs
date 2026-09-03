@@ -57,6 +57,13 @@ pub fn spawn_nudged_pull(
         loop {
             match pull_share(&endpoint, &store, EndpointAddr::from(id), &owner, share_id).await {
                 Ok(s) => tracing::debug!(%share_id, changed = s.changed, "nudged pull"),
+                // an explicit revoke arrives as a nudge too (the owner tells us
+                // so we don't keep stale docs until the sweep): drop at once
+                Err(e) if refusal_code_of(&e) == Some(RefusalCode::ShareRevoked) => {
+                    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                    let dropped = drop_dead_share(&mut s, share_id);
+                    tracing::info!(%share_id, dropped = dropped.len(), "share revoked upstream; mirrors dropped");
+                }
                 Err(e) => tracing::warn!(%share_id, "nudged pull failed: {e:#}"),
             }
             if !runtime.finish_pull(share_id) {
@@ -128,6 +135,11 @@ pub async fn refresh_outbound(endpoint: &Endpoint, store: &Arc<Mutex<SqliteStore
         s.set_outbound_state(prop.id, state).ok();
         tracing::info!(doc = %prop.doc_id, state, "outbound proposal resolved");
     }
+}
+
+/// The typed code behind a pull error, if it was a refusal.
+fn refusal_code_of(e: &anyhow::Error) -> Option<RefusalCode> {
+    e.downcast_ref::<super::wire::Refusal>().map(|r| r.code)
 }
 
 /// The owner told us (by CODE, never by text) that this share no longer
@@ -364,7 +376,7 @@ pub fn batch_nudges(
 /// Deliver one share's nudges to its contact: ONE dial carrying the batch.
 /// An owner from before batching answers `Unsupported`/`BadRequest` to the
 /// new variant; then (and only then) fall back to one `Notify` per item.
-async fn send_nudges(endpoint: Endpoint, peer_id: iroh::EndpointId, share: Uuid, items: Vec<NotifyItem>, petname: String) {
+pub async fn send_nudges(endpoint: Endpoint, peer_id: iroh::EndpointId, share: Uuid, items: Vec<NotifyItem>, petname: String) {
     let n = items.len();
     let batch = Request::NotifyBatch {
         share: share.to_string(),

@@ -544,10 +544,30 @@ async fn revoke_share(State(st): State<FedState>, Json(req): Json<IdReq>) -> Jso
         .store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // who held it, so we can tell them now rather than at their next sweep
+    let target = s.get_share(req.id).ok().and_then(|sh| {
+        let contact = s.list_contacts().ok()?.into_iter().find(|c| Some(c.id) == sh.contact)?;
+        let title = s.get_doc(sh.root_doc).map(|d| d.title).unwrap_or_default();
+        Some((contact, sh.root_doc, title))
+    });
     match s.set_share_state(req.id, grimoire_store::ShareState::Revoked) {
         Ok(()) => {
             // a live bridge on this share is cut now, not at the next re-auth
             let cut = st.hot.drop_bridges_for_share(req.id);
+            drop(s);
+            // nudge the grantee: their next pull is refused ShareRevoked and
+            // drops the mirrors at once (a hub un-relays the publication) —
+            // without this they keep stale docs until the 120s sweep
+            if let (Some((contact, root, title)), Some(ep)) = (target, st.ctx.endpoint.clone())
+                && let Ok(peer) = contact.pubkey.parse::<iroh::EndpointId>()
+            {
+                let item = crate::fed::NotifyItem {
+                    doc: root.to_string(),
+                    title,
+                    kind: crate::fed::NotifyKind::DocChanged,
+                };
+                tokio::spawn(crate::fed::send_nudges(ep, peer, req.id, vec![item], contact.petname));
+            }
             Json(json!({"ok": true, "bridges_cut": cut}))
         }
         Err(e) => Json(json!({"error": e.to_string()})),

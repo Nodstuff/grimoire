@@ -109,6 +109,10 @@ struct Cli {
     /// Path to the SQLite database.
     #[arg(long, default_value_os_t = default_db())]
     db: PathBuf,
+    /// The daemon's port: what `serve` listens on and what every other
+    /// command talks to.
+    #[arg(long, global = true, default_value_t = 7425)]
+    port: u16,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -150,10 +154,8 @@ enum Cmd {
     Runs,
     /// Set a doc's review policy: human-review | agent-review | auto | clear.
     Policy { doc_id: String, policy: String },
-    /// Serve MCP over streamable HTTP.
+    /// Serve MCP over streamable HTTP (on --port, default 7425).
     Serve {
-        #[arg(long, default_value_t = 7425)]
-        port: u16,
         /// Run as a hub: a team Grimoire members join, publish to, and read
         /// from. Persisted — later plain `serve` runs stay a hub.
         #[arg(long)]
@@ -412,7 +414,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Gardener { cmd } => {
             let client = admin_client(&cli.db, None)?;
-            let base = "http://127.0.0.1:7425";
+            let base = format!("http://127.0.0.1:{}", cli.port);
             match cmd {
                 GardenerCmd::Add {
                     name,
@@ -444,7 +446,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Garden { name } => {
             let client = admin_client(&cli.db, Some(std::time::Duration::from_secs(600)))?;
             let r = client
-                .post("http://127.0.0.1:7425/admin/garden")
+                .post(format!("http://127.0.0.1:{}/admin/garden", cli.port))
                 .json(&serde_json::json!({ "name": name }))
                 .send()
                 .await?;
@@ -457,19 +459,19 @@ async fn main() -> anyhow::Result<()> {
             });
             let client = admin_client(&cli.db, None)?;
             let r = client
-                .post("http://127.0.0.1:7425/admin/policy")
+                .post(format!("http://127.0.0.1:{}/admin/policy", cli.port))
                 .json(&body)
                 .send()
                 .await?;
             println!("{}", r.text().await?);
         }
         Cmd::Runs => {
-            let r = admin_client(&cli.db, None)?.get("http://127.0.0.1:7425/admin/runs").send().await?;
+            let r = admin_client(&cli.db, None)?.get(format!("http://127.0.0.1:{}/admin/runs", cli.port)).send().await?;
             println!("{}", r.text().await?);
         }
         Cmd::Share { cmd } => {
             let client = admin_client(&cli.db, None)?;
-            let base = "http://127.0.0.1:7425";
+            let base = format!("http://127.0.0.1:{}", cli.port);
             match cmd {
                 ShareCmd::Invite { doc_id, permission } => {
                     let r = client
@@ -511,7 +513,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Join { link } => {
             let client = admin_client(&cli.db, Some(std::time::Duration::from_secs(30)))?;
             let r = client
-                .post("http://127.0.0.1:7425/admin/join")
+                .post(format!("http://127.0.0.1:{}/admin/join", cli.port))
                 .json(&serde_json::json!({"link": link}))
                 .send()
                 .await?;
@@ -530,13 +532,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Contacts => {
-            let r = admin_client(&cli.db, None)?.get("http://127.0.0.1:7425/admin/contacts").send().await?;
+            let r = admin_client(&cli.db, None)?.get(format!("http://127.0.0.1:{}/admin/contacts", cli.port)).send().await?;
             println!("{}", r.text().await?);
         }
         Cmd::Pull => {
             let client = admin_client(&cli.db, Some(std::time::Duration::from_secs(120)))?;
             let r = client
-                .post("http://127.0.0.1:7425/admin/pull")
+                .post(format!("http://127.0.0.1:{}/admin/pull", cli.port))
                 .send()
                 .await?;
             println!("{}", r.text().await?);
@@ -562,7 +564,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Hub { cmd } => {
             let client = admin_client(&cli.db, Some(std::time::Duration::from_secs(30)))?;
-            let base = "http://127.0.0.1:7425";
+            let base = format!("http://127.0.0.1:{}", cli.port);
             let text = match cmd {
                 HubCmd::Members => client.get(format!("{base}/admin/hub/members")).send().await?.text().await?,
                 HubCmd::Approve { contact_id } => {
@@ -607,7 +609,8 @@ async fn main() -> anyhow::Result<()> {
             };
             println!("{text}");
         }
-        Cmd::Serve { port, hub, name } => {
+        Cmd::Serve { hub, name } => {
+            let port = cli.port;
             let mut store = store;
             // hub mode (slice 1): persisted; `--hub` turns it on (and renames)
             if hub {

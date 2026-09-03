@@ -150,3 +150,48 @@ daemon advertises the profile name as iroh user data and subscribes to discovery
 `GET /admin/neighbours` returns Grimoires on the LAN with their name, whether they are
 already a contact, and whether they are blocked. Presence grants nothing — a neighbour
 still needs an invite or an offer — it only saves reading out a key.
+
+## Hub (slice 1, added 2026-09-03)
+
+A **hub** is an ordinary Grimoire run headless on an always-on box (`grimoire serve --hub
+--name "Team"`; persisted in `settings` as `hub.enabled` / `hub.name` / `hub.root_doc`, so
+later plain `serve` runs stay a hub). It is a peer like any other — same identity, invites,
+mirrors, trust tiers — plus three rules:
+
+1. **Membership has a gate.** Redeeming a hub invite pairs you as `pending` (no shares) until
+   an admin approves; the very first contact ever paired becomes the first admin (`contacts.role`
+   admin|member, `contacts.membership` pending|active|ejected). Admins act **over the wire from
+   their own Grimoire** (`Request::HubAdmin { ListMembers | Approve | Eject | SetRole | Invite }`,
+   authorized by the caller's role on the hub) or with `grimoire hub …` on the box; nobody needs
+   the hub's UI. A pending member may only ask `HubStatus`. Approval mints a `propose` share of
+   the hub root and delivers it as an `Offer` (it lands in the member's Share requests; accepting
+   files "⌂ Team" in their tree). Ejection = membership `ejected` + contact blocked + every
+   publication of theirs dropped + their folder removed.
+2. **Members publish, the hub relays.** Publishing is a plain `propose` share **offered to the
+   hub**; a hub auto-accepts offers from active members: it redeems, pulls, files the mirror root
+   under `<hub root>/<member>` (folder created on first publication, owned by the hub) and records
+   it in `hub_publications(share_id, member_contact, root_doc, published_at)`. Unpublish = the
+   member revokes; the hub's `ShareRevoked` path drops the mirror and the publication, and other
+   members lose it on their next pull.
+3. **Every doc keeps one home.** `served_docs` still excludes mirrors everywhere — except, on a
+   hub, mirrors that are hub publications under the hub root. Those ship with `origin_owner`
+   (pubkey) and `origin_owner_name` in `WireDocMeta`; grantees store them on the mirror row
+   (`mirrors.origin_owner`, `origin_owner_name`) and the app shows "owned by alice". In this slice
+   the hub refuses `Propose`/`HotStart`/`HotEnd`/`EditPing` on any relayed doc with
+   `RefusalCode::RelayedReadOnly` ("this doc is owned by alice — edits go to them, not the hub
+   (coming soon)"); relayed docs open read-only in members' editors. Hub-owned docs (no
+   origin_owner) behave like any owner's docs.
+
+Wire additions: `HubAdmin`, `HubStatus` → `HubStatusIs{name, role, membership, members, pending}`,
+`HubMembers`, `HubInvite`; `Redeemed` carries `is_hub` and `membership`; new refusal codes
+`NotAllowed`, `Unsupported`, `RelayedReadOnly`. Contacts carry `is_hub`. Local routes: on any
+Grimoire `GET /admin/hubs`, `GET /admin/hubs/members?hub=`, `POST /admin/hubs/{approve,eject,role,
+invite}` (dial the hub); on the hub box `/admin/hub/{members,approve,eject,role,invite}`.
+
+**Slice 2 (planned):** proposals on relayed docs travel member → hub → owner as a proposal *from
+the member* (the hub forwards, never decides) and flow back through the relay; live sessions on
+relayed docs bridge through the hub to the owner's daemon; editing hub-owned docs (gate
+`agent-review`, admins resolve); **ownership transfer** as a two-sided ledgered op (offer/accept,
+UUIDs preserved, the former owner's copy flips to a mirror; refused while any doc in the subtree is
+hot or has open proposals; reversible by an admin) — the Qompass docs are the first transfer.
+Deployment: the EC2 recipe from the 2026-09-02 verification, `serve --hub` under systemd.

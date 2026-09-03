@@ -38,7 +38,8 @@ pub use client::{
     pull_after_join, pull_owner_of, ticket_for_offer,
 };
 pub use wire::{Refusal, RefusalCode};
-pub use loops::{join_retry_loop, notify_loop, pull_all_once, pull_loop, refresh_outbound};
+pub use loops::{join_retry_loop, notify_loop, pull_all_once, pull_loop, refresh_outbound, send_nudges};
+pub use wire::{NotifyItem, NotifyKind};
 pub use server::{bind, neighbour_loop, serve};
 pub use wire::Ticket; // admin parses invite links
 

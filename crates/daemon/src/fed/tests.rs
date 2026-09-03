@@ -2097,7 +2097,10 @@ async fn hub_first_contact_is_admin_later_ones_wait_and_approval_offers_the_fold
     let res = request(&h.ep, alice.addr.clone(), Request::HubStatus).await;
     // (the hub is not alice's contact → unknown peer; use bob, whom alice never paired) — so pair first:
     let _ = res;
-    let (_, link) = mint_invite(&mut alice.store.lock().unwrap(), &alice.pubkey(), alice.doc("A", None, "a"), SharePermission::View).unwrap();
+    // (take the doc id BEFORE locking the store for the mint — the same
+    // expression locking twice is a deadlock, not a test)
+    let a_doc = alice.doc("A", None, "a");
+    let (_, link) = mint_invite(&mut alice.store.lock().unwrap(), &alice.pubkey(), a_doc, SharePermission::View).unwrap();
     join_at(&carol.ep, &carol.store, &Ticket::parse(&link).unwrap(), alice.addr.clone()).await.unwrap();
     let res = request(&carol.ep, alice.addr.clone(), Request::HubStatus).await.unwrap();
     assert_eq!(refusal_code(&res), RefusalCode::Unsupported);
