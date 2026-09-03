@@ -2959,6 +2959,9 @@ async fn lagged_hot_subscriber_is_resynced_with_the_full_doc_state() {
     // journal hygiene: the empty step-2 is skipped, a real update is not
     assert!(crate::hot::update_is_empty(&[0, 0]));
     assert!(!crate::hot::update_is_empty(&edit));
+    // exactly two zero bytes — a longer all-zero frame is not an empty update
+    assert!(!crate::hot::update_is_empty(&[0, 0, 0]));
+    assert!(!crate::hot::update_is_empty(&[]));
 }
 
 /// 0.7.2 hardening: the member's `TransferReady` reply is lost after it
@@ -3004,13 +3007,45 @@ async fn lost_transfer_ready_is_redelivered_by_the_member_sweep_and_a_half_flip_
         }
         assert_eq!(s.read_doc(step).unwrap().roots[0].block.content, "step one");
     }
-    // sweep 2: Noted → acknowledged; sweep 3: nothing left to announce
+    // 0.7.2: the take-over pulled alice's share, and a pull only happens once
+    // the hub holds our Ready — so the transfer is already acknowledged and
+    // sweep 2 costs no round trip at all
+    {
+        let s = alice.store.lock().unwrap();
+        let id = s.list_doc_transfers().unwrap()[0].id;
+        assert_eq!(s.get_setting(&format!("transfer.acked.{id}")).unwrap().as_deref(), Some("1"));
+    }
+    assert_eq!(resend_ready(&alice.ep, &alice.store, Some(h.addr.clone())).await, 0);
+    // and the Noted path still acknowledges: forget the pull-derived marker
+    {
+        let mut s = alice.store.lock().unwrap();
+        let id = s.list_doc_transfers().unwrap()[0].id;
+        s.set_setting(&format!("transfer.acked.{id}"), "").unwrap();
+    }
     assert_eq!(resend_ready(&alice.ep, &alice.store, Some(h.addr.clone())).await, 1);
     assert_eq!(resend_ready(&alice.ep, &alice.store, Some(h.addr.clone())).await, 0);
+    // a hub too old to decode the re-announcement (BadRequest) is backed off to
+    // hourly, logged once, and skipped by the sweep until then
+    {
+        let mut s = alice.store.lock().unwrap();
+        let id = s.list_doc_transfers().unwrap()[0].id;
+        s.set_setting(&format!("transfer.acked.{id}"), "").unwrap();
+        assert!(super::transfer::back_off_old_hub(&mut s, id), "logged the first time");
+        assert!(!super::transfer::back_off_old_hub(&mut s, id), "and not again");
+        let after: i64 = s
+            .get_setting(&format!("transfer.ready_retry_after.{id}"))
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        assert!((3500..=3600).contains(&(after - now)), "backed off ~an hour, not {}", after - now);
+    }
+    assert_eq!(resend_ready(&alice.ep, &alice.store, Some(h.addr.clone())).await, 0, "skipped while backed off");
     // a stranger to the transfer cannot trigger a take-over
     let carol = peer("carol").await;
     join_at(&carol.ep, &carol.store, &hub_invite(&h, &cfg), h.addr.clone()).await.unwrap();
-    let res = request(&carol.ep, h.addr.clone(), Request::TransferReady { root_doc: plan.to_string(), share_id: uuid::Uuid::now_v7().to_string() }).await.unwrap();
+    let res = request(&carol.ep, h.addr.clone(), Request::TransferReady { root_doc: plan.to_string() }).await.unwrap();
     assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
 }
 

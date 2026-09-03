@@ -1085,9 +1085,11 @@ fn journal_updates(journal: &mut std::fs::File, data: &[u8]) -> std::io::Result<
     Ok(())
 }
 
-/// A v1 update that carries no structs and no deletions (`[0, 0]`).
+/// A v1 update that carries no structs and no deletions: exactly `[0, 0]`
+/// (a zero struct count followed by a zero delete-set length). A longer
+/// all-zero slice is not an empty update and must still be journalled.
 pub fn update_is_empty(u: &[u8]) -> bool {
-    u.iter().all(|b| *b == 0)
+    u == [0, 0]
 }
 
 /// Strip a client frame down to what a READ-ONLY participant may send:

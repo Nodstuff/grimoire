@@ -164,13 +164,15 @@ pub enum Request {
     /// Typed so peers can answer `Unsupported` today.
     TransferBack { root_doc: String },
     /// 0.7.2 (member → hub): "I flipped this folder to your mirrors and my
-    /// `TransferReady` reply may not have reached you — pull it through
-    /// `share_id` and take it over." Sent by the member's sweep while a
-    /// flipped transfer is unacknowledged; the hub answers `Noted` once the
-    /// take-over is done (the member then stops asking), `Busy` while it is
-    /// in progress. A 0.7.1 hub answers `BadRequest` (unknown request):
-    /// the member simply asks again next sweep.
-    TransferReady { root_doc: String, share_id: String },
+    /// `TransferReady` reply may not have reached you — re-run the take-over."
+    /// Sent by the member's sweep while a flipped transfer is unacknowledged;
+    /// the hub answers `Noted` once the take-over is done (the member then
+    /// stops asking), `Busy` while it is in progress. No share id: the hub
+    /// keeps none for an accepted transfer, so it could not validate one, and
+    /// it learns the share from the member's `TransferAccepted` reply anyway.
+    /// A 0.7.1 hub cannot decode this and answers `BadRequest`: the member
+    /// backs that transfer off to hourly.
+    TransferReady { root_doc: String },
 }
 
 /// Hub (slice 2): who a forwarded proposal is really from.

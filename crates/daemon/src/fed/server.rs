@@ -615,14 +615,14 @@ fn dispatch_inner(
                 Err(e) => Response::refused(RefusalCode::Other, e.to_string()),
             }
         }
-        Request::TransferReady { root_doc, share_id } => {
+        Request::TransferReady { root_doc } => {
             if hub_cfg.is_none() {
                 return Err(Response::refused(RefusalCode::Unsupported, "this Grimoire is not a hub"));
             }
-            let (Ok(root), Ok(share)) = (root_doc.parse::<uuid::Uuid>(), share_id.parse::<uuid::Uuid>()) else {
+            let Ok(root) = root_doc.parse::<uuid::Uuid>() else {
                 return Err(Response::refused(RefusalCode::BadRequest, "bad id"));
             };
-            match transfer::hub_ready_ping(&store, &contact, root, share) {
+            match transfer::hub_ready_ping(&store, &contact, root) {
                 Ok(Some(transfer_id)) => {
                     // the take-over needs the network: off this thread, like
                     // an admin's accept; the member asks again next sweep
@@ -661,7 +661,19 @@ fn dispatch_inner(
             Response::Pong
         }
         Request::Pull { share, cursors } => match handle_pull(&store, &contact, &share, &cursors) {
-            Ok(r) => r,
+            Ok(r) => {
+                // a pull of a handed-over folder's share is the hub telling us
+                // it has our TransferReady; the sweep can stop re-announcing
+                if let Some(root) = share
+                    .parse::<uuid::Uuid>()
+                    .ok()
+                    .and_then(|id| store.list_shares().ok()?.into_iter().find(|sh| sh.id == id))
+                    .map(|sh| sh.root_doc)
+                {
+                    transfer::note_transfer_pulled(&mut store, &contact, root);
+                }
+                r
+            }
             Err(e) => {
                 tracing::warn!(peer, share, "pull refused: {e}");
                 refuse(e)

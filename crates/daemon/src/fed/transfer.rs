@@ -184,10 +184,72 @@ pub fn member_flip(
     })
 }
 
-/// Settings key marking a member's out-transfer as acknowledged by the hub
-/// (the hub answered `Noted` to our `TransferReady` re-announcement).
+/// Settings key marking a member's out-transfer as acknowledged by the hub:
+/// either the hub answered `Noted` to our `TransferReady` re-announcement, or
+/// it pulled the transfer's share, which only happens once it has our
+/// `TransferReady` in hand.
 fn acked_key(transfer: Uuid) -> String {
     format!("transfer.acked.{transfer}")
+}
+
+/// Settings key holding the unix second before which we must not re-announce
+/// a given out-transfer. Set when the hub cannot parse `TransferReady` at all
+/// (a hub older than 0.7.2), which no amount of prompt retrying will fix.
+/// A settings marker counts as set only when it has a value: an empty string
+/// reads as absent, so a marker can be cleared without a delete.
+fn marker_set(store: &SqliteStore, key: &str) -> bool {
+    matches!(store.get_setting(key), Ok(Some(v)) if !v.is_empty())
+}
+
+fn retry_after_key(transfer: Uuid) -> String {
+    format!("transfer.ready_retry_after.{transfer}")
+}
+
+/// A hub that predates 0.7.2 has no `TransferReady` request: it fails to
+/// decode the frame and refuses `BadRequest`. Back that transfer off to
+/// roughly hourly instead of warning every sweep.
+const OLD_HUB_BACKOFF_SECS: i64 = 3600;
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Back a re-announcement off to roughly hourly because the hub could not
+/// decode it. Returns true the first time, so the log line is written once.
+pub fn back_off_old_hub(store: &mut SqliteStore, transfer: Uuid) -> bool {
+    let first = !marker_set(store, &retry_after_key(transfer));
+    let _ = store.set_setting(
+        &retry_after_key(transfer),
+        &(now_secs() + OLD_HUB_BACKOFF_SECS).to_string(),
+    );
+    first
+}
+
+/// Member side: the hub pulling the share of a flipped out-transfer proves it
+/// received our `TransferReady`, so the sweep need not re-announce that one.
+/// Saves a round trip per completed transfer. Cheap and idempotent: at most
+/// one settings write, and only for a share whose root is a done out-transfer
+/// to the peer doing the pulling.
+pub fn note_transfer_pulled(store: &mut SqliteStore, puller: &Contact, share_root: Uuid) {
+    let acked: Vec<Uuid> = store
+        .list_doc_transfers()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| {
+            t.direction == TransferDirection::Out
+                && t.state == "done"
+                && t.counterparty == puller.id
+                && t.root_doc == share_root
+        })
+        .map(|t| t.id)
+        .filter(|id| !marker_set(store, &acked_key(*id)))
+        .collect();
+    for id in acked {
+        let _ = store.set_setting(&acked_key(id), "1");
+    }
 }
 
 /// Member sweep (0.7.2): a flipped transfer whose `TransferReady` reply the
@@ -206,7 +268,12 @@ pub async fn resend_ready(
             .unwrap_or_default()
             .into_iter()
             .filter(|t| t.direction == TransferDirection::Out && t.state == "done")
-            .filter(|t| !matches!(s.get_setting(&acked_key(t.id)), Ok(Some(_))))
+            .filter(|t| !marker_set(s, &acked_key(t.id)))
+            // a hub that cannot decode TransferReady is retried hourly, not every sweep
+            .filter(|t| match s.get_setting(&retry_after_key(t.id)) {
+                Ok(Some(v)) => v.parse::<i64>().unwrap_or(0) <= now_secs(),
+                _ => true,
+            })
             .filter_map(|t| {
                 let hub = contacts.iter().find(|c| c.id == t.counterparty && c.is_hub && !c.revoked)?.clone();
                 // still flipped: the root is our mirror of that hub
@@ -222,7 +289,7 @@ pub async fn resend_ready(
     })
     .await;
     let mut acked = 0;
-    for (transfer, hub, root, share) in due {
+    for (transfer, hub, root, _share) in due {
         let addr = match &addr {
             Some(a) => a.clone(),
             None => match hub.pubkey.parse::<iroh::EndpointId>() {
@@ -232,7 +299,6 @@ pub async fn resend_ready(
         };
         let req = Request::TransferReady {
             root_doc: root.to_string(),
-            share_id: share.to_string(),
         };
         match tokio::time::timeout(std::time::Duration::from_secs(15), request(endpoint, addr, req)).await {
             Ok(Ok(Response::Noted)) => {
@@ -242,6 +308,18 @@ pub async fn resend_ready(
             }
             Ok(Ok(Response::Refused { code: RefusalCode::Busy, .. })) => {
                 tracing::info!(hub = hub.petname, %root, "transfer: hub is taking the folder over; will confirm next sweep");
+            }
+            Ok(Ok(Response::Refused { code: RefusalCode::BadRequest, .. })) => {
+                // the frame did not decode: a hub older than 0.7.2. Say so once
+                // (the first sweep sets the marker) and slow right down.
+                let first = with_store(store, move |s| back_off_old_hub(s, transfer)).await;
+                if first {
+                    tracing::info!(
+                        hub = hub.petname,
+                        %root,
+                        "transfer: hub predates 0.7.2 and cannot take the re-announcement; will retry hourly"
+                    );
+                }
             }
             Ok(Ok(other)) => tracing::warn!(hub = hub.petname, %root, "transfer: re-announce not taken: {other:?}"),
             Ok(Err(e)) => tracing::debug!(hub = hub.petname, %root, "transfer: re-announce failed: {e:#}"),
@@ -255,7 +333,7 @@ pub async fn resend_ready(
 /// accepted transfer from this member for this root that still needs the
 /// take-over (the caller runs `hub_complete` off-thread and answers `Busy`);
 /// `Ok(None)` = already done, answer `Noted`. Runs under the store lock.
-pub fn hub_ready_ping(store: &SqliteStore, member: &Contact, root_doc: Uuid, _share_id: Uuid) -> Result<Option<Uuid>> {
+pub fn hub_ready_ping(store: &SqliteStore, member: &Contact, root_doc: Uuid) -> Result<Option<Uuid>> {
     let mut mine: Vec<_> = store
         .list_hub_transfers()?
         .into_iter()
