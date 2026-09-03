@@ -10,6 +10,7 @@
 //! import path under the agent principal, so it is itself searchable,
 //! gardened and auditable (its `source_refs` are the cited block ids).
 
+use crate::store_ext::with_store;
 use grimoire_store::{BlockStore, SearchHit, SqliteStore};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -323,8 +324,8 @@ pub async fn ask(
         return Err("ask something".into());
     }
     let excerpts = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
-        retrieve(&s, embedder.as_deref(), &question)
+        let (embedder, question) = (embedder.clone(), question.clone());
+        with_store(&store, move |s| retrieve(s, embedder.as_deref(), &question)).await
     };
     let docs: std::collections::HashSet<Uuid> = excerpts.iter().map(|h| h.block.doc_id).collect();
     if excerpts.is_empty() {
@@ -345,20 +346,23 @@ pub async fn ask(
     );
     let title = title_for(&question);
     let (doc_id, agent) = {
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-        let folder = answers_folder(&mut s, human).map_err(|e| e.to_string())?;
-        let agent = crate::room::agent_principal(&mut s).map_err(|e| e.to_string())?;
-        // through the gate under the agent, never apply (ledgered verdicts)
-        let (doc_id, _) = crate::garden::create_doc_through_gate(
-            &mut s,
-            &title,
-            Some(folder),
-            agent,
-            &md,
-            grimoire_store::ConfidencePolicy::Gate,
-        )
-        .map_err(|e| e.to_string())?;
-        (doc_id, agent)
+        let title = title.clone();
+        with_store(&store, move |s| -> Result<(Uuid, Uuid), String> {
+            let folder = answers_folder(s, human).map_err(|e| e.to_string())?;
+            let agent = crate::room::agent_principal(s).map_err(|e| e.to_string())?;
+            // through the gate under the agent, never apply (ledgered verdicts)
+            let (doc_id, _) = crate::garden::create_doc_through_gate(
+                s,
+                &title,
+                Some(folder),
+                agent,
+                &md,
+                grimoire_store::ConfidencePolicy::Gate,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok((doc_id, agent))
+        })
+        .await?
     };
     let sources = excerpts.len();
     if synthesise {
@@ -375,22 +379,24 @@ pub async fn ask(
                     format!("*The synthesis could not be written ({e}); the excerpts below stand on their own.*")
                 }
             };
-            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-            let Ok(tree) = s.read_doc(doc_id) else { return };
-            let placeholder = tree
-                .roots
-                .iter()
-                .flat_map(|n| std::iter::once(&n.block).chain(n.children.iter().map(|c| &c.block)))
-                .find(|b| b.content == SYNTH_PLACEHOLDER)
-                .map(|b| b.id);
-            let Some(target) = placeholder else { return };
-            let op = grimoire_store::OpInput {
-                kind: grimoire_store::OpKind::Replace { target, content: text },
-                source_refs: vec!["ask-the-vault: synthesis".into()],
-            };
-            if let Err(e) = s.propose(doc_id, tree.doc.current_epoch, agent, vec![op]) {
-                tracing::warn!(%doc_id, "ask synthesis could not land: {e}");
-            }
+            with_store(&store, move |s| {
+                let Ok(tree) = s.read_doc(doc_id) else { return };
+                let placeholder = tree
+                    .roots
+                    .iter()
+                    .flat_map(|n| std::iter::once(&n.block).chain(n.children.iter().map(|c| &c.block)))
+                    .find(|b| b.content == SYNTH_PLACEHOLDER)
+                    .map(|b| b.id);
+                let Some(target) = placeholder else { return };
+                let op = grimoire_store::OpInput {
+                    kind: grimoire_store::OpKind::Replace { target, content: text },
+                    source_refs: vec!["ask-the-vault: synthesis".into()],
+                };
+                if let Err(e) = s.propose(doc_id, tree.doc.current_epoch, agent, vec![op]) {
+                    tracing::warn!(%doc_id, "ask synthesis could not land: {e}");
+                }
+            })
+            .await;
         });
     }
     Ok(Answer {
