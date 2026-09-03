@@ -746,7 +746,10 @@ async fn main() -> anyhow::Result<()> {
             let hot = hot::HotState::new(
                 cli.db.parent().unwrap_or(std::path::Path::new(".")).join("hot"),
             );
-            hot.recover(&store);
+            {
+                let (hot, store) = (hot.clone(), store.clone());
+                store_ext::blocking(move || hot.recover(&store)).await;
+            }
             {
                 let (hot, store) = (hot.clone(), store.clone());
                 supervise("hot.idle", move || hot::idle_loop(hot.clone(), store.clone()));

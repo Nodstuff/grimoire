@@ -28,6 +28,7 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use crate::store_ext::{blocking, with_store};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -768,7 +769,8 @@ pub async fn idle_loop(hot: HotState, store: Arc<Mutex<grimoire_store::SqliteSto
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         for doc_id in hot.idle_candidates(IDLE) {
-            if let Err(e) = hot.flatten_and_close(&store, doc_id, "idle timeout") {
+            let (hot, store) = (hot.clone(), store.clone());
+            if let Err(e) = blocking(move || hot.flatten_and_close(&store, doc_id, "idle timeout")).await {
                 tracing::error!(%doc_id, "idle flatten failed: {e:#}");
             }
         }
@@ -796,10 +798,9 @@ pub struct HotCtx {
     pub endpoint: Option<iroh::Endpoint>,
 }
 
-fn mirror_of(ctx: &HotCtx, doc_id: Uuid) -> bool {
+async fn mirror_of(ctx: &HotCtx, doc_id: Uuid) -> bool {
     use grimoire_store::BlockStore;
-    let s = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-    s.get_mirror(doc_id).ok().flatten().is_some()
+    with_store(&ctx.store, move |s| s.get_mirror(doc_id).ok().flatten().is_some()).await
 }
 
 /// `POST /api/doc/{id}/hot/start` body. `base_epoch` is the epoch of the tree
@@ -827,14 +828,19 @@ async fn hot_start(
         }
     };
     // mirror docs: the session lives on the OWNER's daemon (#66)
-    if mirror_of(&ctx, doc_id) {
+    if mirror_of(&ctx, doc_id).await {
         let Some(ep) = &ctx.endpoint else {
             return Json(json!({"error": "federation disabled"}));
         };
-        let base = req.base_epoch.unwrap_or_else(|| {
-            let s = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-            s.get_mirror(doc_id).ok().flatten().map(|m| m.synced_epoch).unwrap_or(-1)
-        });
+        let base = match req.base_epoch {
+            Some(b) => b,
+            None => {
+                with_store(&ctx.store, move |s| {
+                    s.get_mirror(doc_id).ok().flatten().map(|m| m.synced_epoch).unwrap_or(-1)
+                })
+                .await
+            }
+        };
         return match crate::fed::hot_start_upstream(ep, &ctx.store, doc_id, base).await {
             Ok((frozen_epoch, seed)) => Json(json!({
                 "ws": format!("/ws/hot/{doc_id}"),
@@ -864,12 +870,9 @@ async fn hot_start(
             }
         };
     }
-    let frozen_epoch = {
-        let s = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        match s.get_doc(doc_id) {
-            Ok(d) => d.current_epoch,
-            Err(e) => return Json(json!({"error": e.to_string()})),
-        }
+    let frozen_epoch = match with_store(&ctx.store, move |s| s.get_doc(doc_id)).await {
+        Ok(d) => d.current_epoch,
+        Err(e) => return Json(json!({"error": e.to_string()})),
     };
     // Creating a session seeds it from the caller's tree; a caller holding
     // an older tree (a save landed between its fetch and this call) would
@@ -896,7 +899,7 @@ async fn hot_start(
 /// End the session: the DAEMON flattens (#67) — one propose at the frozen
 /// epoch, session and journal dropped. Mirrors relay the end to the owner.
 async fn hot_end(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<Value> {
-    if mirror_of(&ctx, doc_id) {
+    if mirror_of(&ctx, doc_id).await {
         let Some(ep) = &ctx.endpoint else {
             return Json(json!({"error": "federation disabled"}));
         };
@@ -905,14 +908,15 @@ async fn hot_end(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<Va
             Err(e) => Json(json!({"error": format!("{e:#}")})),
         };
     }
-    match ctx.hot.flatten_and_close(&ctx.store, doc_id, "ended") {
+    let (hot, store) = (ctx.hot.clone(), ctx.store.clone());
+    match blocking(move || hot.flatten_and_close(&store, doc_id, "ended")).await {
         Ok(applied) => Json(json!({"flattened_ops": applied})),
         Err(e) => Json(json!({"error": format!("{e:#}")})),
     }
 }
 
 async fn hot_status(State(ctx): State<HotCtx>, Path(doc_id): Path<Uuid>) -> Json<Value> {
-    if mirror_of(&ctx, doc_id) {
+    if mirror_of(&ctx, doc_id).await {
         let Some(ep) = &ctx.endpoint else {
             return Json(json!({"hot": false, "editors": 0}));
         };
@@ -960,7 +964,7 @@ async fn editing_ping(
     Path(doc_id): Path<Uuid>,
     Json(req): Json<EditPing>,
 ) -> Json<Value> {
-    if mirror_of(&ctx, doc_id) {
+    if mirror_of(&ctx, doc_id).await {
         let Some(ep) = &ctx.endpoint else {
             return Json(json!({"editors": 1}));
         };
@@ -983,7 +987,7 @@ async fn ws_hot(
 async fn ws_session(mut socket: WebSocket, ctx: HotCtx, doc_id: Uuid) {
     // mirror docs: pure byte pipe to the owner's session over iroh (#66) —
     // the UI speaks y-sync to the owner's daemon through us
-    if mirror_of(&ctx, doc_id) {
+    if mirror_of(&ctx, doc_id).await {
         let Some(ep) = ctx.endpoint.clone() else {
             socket.send(WsMessage::Close(None)).await.ok();
             return;
@@ -1137,7 +1141,7 @@ async fn hot_viewers_write(
     Path(doc_id): Path<Uuid>,
     Json(req): Json<ViewersWriteReq>,
 ) -> Json<Value> {
-    if mirror_of(&ctx, doc_id) {
+    if mirror_of(&ctx, doc_id).await {
         return Json(json!({"error": "only the owner can change who may edit a live session"}));
     }
     match ctx.hot.set_viewers_write(doc_id, req.enabled) {
@@ -1159,7 +1163,7 @@ async fn hot_ask(
     Path(doc_id): Path<Uuid>,
     Json(req): Json<AskReq>,
 ) -> Json<Value> {
-    if mirror_of(&ctx, doc_id) {
+    if mirror_of(&ctx, doc_id).await {
         return Json(json!({"error": "the room's agent runs on the owner's Grimoire — ask them to invite it"}));
     }
     if req.instruction.trim().is_empty() {
