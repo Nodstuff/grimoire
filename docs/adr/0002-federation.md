@@ -195,3 +195,79 @@ relayed docs bridge through the hub to the owner's daemon; editing hub-owned doc
 UUIDs preserved, the former owner's copy flips to a mirror; refused while any doc in the subtree is
 hot or has open proposals; reversible by an admin) — the Qompass docs are the first transfer.
 Deployment: the EC2 recipe from the 2026-09-02 verification, `serve --hub` under systemd.
+
+## Hub (slice 2, added 2026-09-03)
+
+Slice 1 left relayed docs read-only at the hub. Slice 2 removes that and adds ownership transfer.
+The hub still never decides anything about a member's doc: it **carries**.
+
+1. **Proposals on relayed docs travel member → hub → owner, as the member's proposal.** A member's
+   `propose_upstream` goes to the hub (the mirror's owner from their side). For a doc the hub only
+   relays it does not park: it dials the true owner with `Request::Propose` through the publication
+   share it holds, `base_epoch` = its synced epoch for the doc, a fresh `request_id`, and the new
+   optional `on_behalf_of: {pubkey, name}`. The owner accepts `on_behalf_of` **only from a contact
+   flagged `is_hub`** (a plain peer setting it is refused `NotAllowed`; a hub relaying for another
+   hub likewise). The proposal is filed under the member's principal — their contact's if they are
+   one of the owner's contacts, else a `remote` principal keyed by their pubkey
+   (`remote_principal_for`, no contact row) — and **always parked red**, whatever the hub's trust
+   tier: trust in the hub is not trust in everyone behind it. `source_refs` gain `via hub: <name>`,
+   `hub-pubkey:<hex>`, `proposer-pubkey:<hex>`; the note reads `from bob via Team: …`. The hub
+   records `hub_forwards(op_id → owner_contact, member_contact, owner_share, doc)` and answers the
+   member's `ProposalStatus` by asking the owner (the owner discloses forwarded ops to the hub by the
+   `hub-pubkey` ref; `OpStatus` now carries `source_refs`). Accepted content flows owner → hub
+   (pull) → member (relay) through existing code; the member's outbound proposal resolves through
+   the existing refresh loop, unchanged. **Not forwarded:** live sessions (`HotStart`/`HotEnd`/
+   `EditPing`) and `Comment` on relayed docs still answer `RelayedReadOnly` — bridging a member's
+   Yjs frames through the hub to the owner's session needs the hub's synced epoch to equal the
+   owner's at seed time and a second bridge hop; it was left out rather than half-done.
+   Compatibility note: an owner from before this slice ignores `on_behalf_of` (serde default) and
+   would file the proposal under the hub's own principal.
+2. **Hub-owned docs are editable.** `hub::enable` sets the hub root's review policy to
+   `agent-review`; a member's proposal on a hub-owned doc parks in the hub's queue like any remote
+   proposal. Admins resolve it **over the wire**: `HubAdmin::ReviewQueue` → `Response::HubQueue
+   {items}` (the `/api/queue` item shape, proposer named like the member list) and
+   `HubAdmin::Resolve {annotation_id, decision}` (honours the hot freeze; proposer ≠ approver still
+   holds). Local routes: `GET /admin/hubs/queue?hub=`, `POST /admin/hubs/resolve`.
+3. **Ownership transfer to the hub.** Two-sided, ledgered, UUIDs preserved.
+   - Member: `POST /admin/hubs/transfer {hub, root_doc}` → `Request::TransferOffer {root_doc, title,
+     doc_count}` (active members only; a subtree containing docs shared TO the member is refused
+     locally). The hub records it in `hub_transfers(id, member_contact, root_doc, title, doc_count,
+     state offered|accepted|declined|done, at)` and answers `TransferOffered {id}`; the member records
+     `doc_transfers(root_doc, counterparty, 'out', offered)`.
+   - Admin: `HubAdmin::ListTransfers` → `HubTransfers`; `AcceptTransfer {id}` / `DeclineTransfer
+     {id}`. Accept sets `accepted` and, off-thread, dials the member with `TransferAccepted
+     {root_doc}`.
+   - Member, on `TransferAccepted`: refused `NotAllowed` unless the caller is a hub **this member
+     offered that root to**; refused **`Busy`** (new code; the reason names the doc: `“Sub” is in a
+     live session — end it first` / `“Sub” has edits waiting for review — resolve them first`) while
+     any doc in the subtree is hot or has an open proposal. Otherwise: make sure a `propose` share to
+     the hub covers the root (the publication share is reused; else one is created **before** the
+     mirror rows, because the re-share guard refuses a share over mirrors), then every doc in the
+     subtree gets a mirror row — owner = the hub contact, share = the member's membership share of
+     the hub root, `synced_epoch` = the doc's current epoch, no origin owner — so the member's copy is
+     a read-only mirror from that instant. `doc_transfers` → `done`; reply `TransferReady
+     {share_id}`. Sequential store calls, not one transaction.
+   - Hub, on `TransferReady`: pull the subtree through that share (a never-published root is created
+     and filed under `<hub root>/<member>`), then flip to OWNED: delete those `mirrors` rows, drop the
+     `hub_publications` row for the share, record `doc_transfers(root, member, 'in', done)`, set the
+     transfer `done`. Block `created_by` is untouched (provenance). From then on the relay meta has
+     no `origin_owner`, every member — the former owner included — mirrors the docs from the hub, and
+     edits are proposals to the hub (item 2). On the member's next pull their copy moves under
+     `⌂ Team/<member>` in their tree (the hub's filing wins for in-share parents).
+   - A refusal on accept (Busy, offline) puts the hub's record back to `offered` so an admin can retry.
+   - Idempotent: a second `TransferAccepted` for a root already mirrored from that hub answers
+     `TransferReady` again and changes nothing; a second hub flip finds no mirrors and no-ops;
+     accepting a `done` transfer is `Noted`. `TransferBack` is a typed seam answering `Unsupported`.
+   - Serving rule change: a mirror is still never served onward — **except back to the very peer it
+     is mirrored from** (`served_docs_for`), which is how the hub pulls a flipped subtree. The
+     owner-side nudge loop skips mirrors on non-hubs so the member does not nudge the hub about docs
+     the hub now owns.
+
+Wire additions: `Propose.on_behalf_of`, `TransferOffer`, `TransferAccepted`, `TransferBack`;
+`HubAction::{ReviewQueue, Resolve, ListTransfers, AcceptTransfer, DeclineTransfer}`;
+`Response::{HubQueue, HubTransfers, TransferOffered, TransferReady}`; `RefusalCode::Busy`. Tables:
+`hub_forwards`, `hub_transfers`, `doc_transfers`. Local routes (member): `GET /admin/hubs/queue`,
+`POST /admin/hubs/resolve`, `GET /admin/hubs/transfers`, `POST /admin/hubs/transfers/{accept,decline}`,
+`POST /admin/hubs/transfer`; (hub box) `GET /admin/hub/transfers`, `POST /admin/hub/transfers/
+{accept,decline}`. `GET /admin/hubs` rows carry `transfers`; `GET /api/doc/{id}/federation` mirrors
+carry `transferred_from_me`.
