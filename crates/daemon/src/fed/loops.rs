@@ -15,6 +15,7 @@ use super::runtime::Runtime;
 use super::server::served_docs_for;
 use super::wire::{NotifyItem, NotifyKind, Refusal, RefusalCode, Request, Response, Ticket};
 use crate::hot::HotState;
+use crate::store_ext::{blocking, with_store};
 use anyhow::Result;
 use futures_util::StreamExt;
 use grimoire_store::{BlockStore, SqliteStore};
@@ -61,8 +62,7 @@ pub fn spawn_nudged_pull(
                 // an explicit revoke arrives as a nudge too (the owner tells us
                 // so we don't keep stale docs until the sweep): drop at once
                 Err(e) if refusal_code_of(&e) == Some(RefusalCode::ShareRevoked) => {
-                    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                    let dropped = drop_dead_share(&mut s, share_id);
+                    let dropped = with_store(&store, move |s| drop_dead_share(s, share_id)).await;
                     tracing::info!(%share_id, dropped = dropped.len(), "share revoked upstream; mirrors dropped");
                 }
                 Err(e) => tracing::warn!(%share_id, "nudged pull failed: {e:#}"),
@@ -77,16 +77,16 @@ pub fn spawn_nudged_pull(
 /// Refresh the state of pending outbound proposals from their owners; any
 /// accepted content arrives via the normal pull.
 pub async fn refresh_outbound(endpoint: &Endpoint, store: &Arc<Mutex<SqliteStore>>) {
-    let pending = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
-        s.list_outbound_proposals(true).unwrap_or_default()
-    };
+    let pending = with_store(store, |s| s.list_outbound_proposals(true).unwrap_or_default()).await;
     for prop in pending {
         let owner = {
-            let s = store.lock().unwrap_or_else(|p| p.into_inner());
-            s.list_contacts()
-                .ok()
-                .and_then(|cs| cs.into_iter().find(|c| c.id == prop.owner))
+            let owner = prop.owner;
+            with_store(store, move |s| {
+                s.list_contacts()
+                    .ok()
+                    .and_then(|cs| cs.into_iter().find(|c| c.id == owner))
+            })
+            .await
         };
         let Some(owner) = owner.filter(|o| !o.revoked) else {
             continue;
@@ -132,8 +132,8 @@ pub async fn refresh_outbound(endpoint: &Endpoint, store: &Arc<Mutex<SqliteStore
         } else {
             "mixed"
         };
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-        s.set_outbound_state(prop.id, state).ok();
+        let id = prop.id;
+        with_store(store, move |s| s.set_outbound_state(id, state).ok()).await;
         tracing::info!(doc = %prop.doc_id, state, "outbound proposal resolved");
     }
 }
@@ -205,19 +205,21 @@ impl DeadPeerTracker {
 }
 
 /// (owner contact, share) pairs we hold mirrors for, non-revoked owners only.
-fn share_groups(store: &Arc<Mutex<SqliteStore>>) -> Vec<(grimoire_store::Contact, Uuid)> {
-    let s = store.lock().unwrap_or_else(|p| p.into_inner());
-    let mirrors = s.list_mirrors().unwrap_or_default();
-    let contacts = s.list_contacts().unwrap_or_default();
-    let mut seen = std::collections::HashSet::new();
-    mirrors
-        .into_iter()
-        .filter(|m| seen.insert((m.owner, m.share_id)))
-        .filter_map(|m| {
-            let c = contacts.iter().find(|c| c.id == m.owner)?.clone();
-            (!c.revoked).then_some((c, m.share_id))
-        })
-        .collect()
+async fn share_groups(store: &Arc<Mutex<SqliteStore>>) -> Vec<(grimoire_store::Contact, Uuid)> {
+    with_store(store, |s| {
+        let mirrors = s.list_mirrors().unwrap_or_default();
+        let contacts = s.list_contacts().unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+        mirrors
+            .into_iter()
+            .filter(|m| seen.insert((m.owner, m.share_id)))
+            .filter_map(|m| {
+                let c = contacts.iter().find(|c| c.id == m.owner)?.clone();
+                (!c.revoked).then_some((c, m.share_id))
+            })
+            .collect()
+    })
+    .await
 }
 
 /// Pull a set of (owner, share) groups — `PULL_CONCURRENCY` owners at a time
@@ -236,11 +238,8 @@ async fn pull_groups(
             };
             // sync health for the shares page: success clears, failure records
             {
-                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                match &res {
-                    Ok(_) => s.set_mirror_sync_result(share_id, None).ok(),
-                    Err(e) => s.set_mirror_sync_result(share_id, Some(&format!("{e:#}"))).ok(),
-                };
+                let err = res.as_ref().err().map(|e| format!("{e:#}"));
+                with_store(store, move |s| s.set_mirror_sync_result(share_id, err.as_deref()).ok()).await;
             }
             (share_id, res)
         })
@@ -258,10 +257,12 @@ async fn pull_groups(
             .collect()
     };
     if !dead_shares.is_empty() {
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-        for share_id in dead_shares {
-            drop_dead_share(&mut s, share_id);
-        }
+        with_store(store, move |s| {
+            for share_id in dead_shares {
+                drop_dead_share(s, share_id);
+            }
+        })
+        .await;
     }
     out
 }
@@ -273,7 +274,7 @@ pub async fn pull_all_once(
     endpoint: &Endpoint,
     store: &Arc<Mutex<SqliteStore>>,
 ) -> Vec<(Uuid, Result<PullSummary>)> {
-    let groups = share_groups(store);
+    let groups = share_groups(store).await;
     pull_groups(endpoint, store, groups, &Mutex::new(DeadPeerTracker::default())).await
 }
 
@@ -295,24 +296,30 @@ async fn pull_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, run
             last_sweep = Instant::now();
             {
                 // invites v2: offers die with their invite (7 days)
-                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                if let Ok(n) = s.expire_share_offers()
-                    && n > 0
-                {
-                    tracing::info!(expired = n, "share offers expired");
-                }
+                with_store(&store, |s| {
+                    if let Ok(n) = s.expire_share_offers()
+                        && n > 0
+                    {
+                        tracing::info!(expired = n, "share offers expired");
+                    }
+                })
+                .await;
             }
             refresh_outbound(&endpoint, &store).await;
             // 0.7.2: a flipped transfer whose Ready reply was lost is re-announced
             super::transfer::resend_ready(&endpoint, &store, None).await;
-            prune_hub_forwards(&store);
-            pull_groups(&endpoint, &store, share_groups(&store), &dead).await
+            {
+                let store = store.clone();
+                blocking(move || prune_hub_forwards(&store)).await;
+            }
+            pull_groups(&endpoint, &store, share_groups(&store).await, &dead).await
         } else {
             let focused = runtime.focused_shares();
             if focused.is_empty() {
                 continue;
             }
             let groups: Vec<_> = share_groups(&store)
+                .await
                 .into_iter()
                 .filter(|(_, sh)| focused.contains(sh))
                 .collect();
@@ -576,8 +583,15 @@ async fn notify_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, h
     loop {
         tokio::time::sleep(NOTIFY_TICK).await;
         let due = {
-            let s = store.lock().unwrap_or_else(|p| p.into_inner());
-            notify_tick(&mut state, &s, &hot)
+            let (hot, st) = (hot.clone(), std::mem::take(&mut state));
+            let (due, st) = with_store(&store, move |s| {
+                let mut st = st;
+                let due = notify_tick(&mut st, s, &hot);
+                (due, st)
+            })
+            .await;
+            state = st;
+            due
         };
         for batch in due {
             let Ok(peer_id) = batch.contact.pubkey.parse::<iroh::EndpointId>() else {
@@ -691,19 +705,19 @@ async fn join_retry_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>
     let mut next_due: HashMap<Uuid, Instant> = HashMap::new();
     loop {
         tokio::time::sleep(TICK).await;
-        let pending = {
-            let s = store.lock().unwrap_or_else(|p| p.into_inner());
-            s.list_pending_joins().unwrap_or_default()
-        };
+        let pending = with_store(&store, |s| s.list_pending_joins().unwrap_or_default()).await;
         let live: std::collections::HashSet<Uuid> = pending.iter().map(|j| j.id).collect();
         next_due.retain(|id, _| live.contains(id));
         let now = Instant::now();
         for join in pending {
             if join_expired(&join.created_at, chrono::Utc::now()) {
                 tracing::warn!(attempts = join.attempts, "pending join older than the invite window; giving up");
-                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                s.record_join_attempt(join.id, "gave up: the invite link is older than 7 days — ask for a new one").ok();
-                s.remove_pending_join(join.id).ok();
+                let id = join.id;
+                with_store(&store, move |s| {
+                    s.record_join_attempt(id, "gave up: the invite link is older than 7 days — ask for a new one").ok();
+                    s.remove_pending_join(id).ok();
+                })
+                .await;
                 continue;
             }
             if next_due.get(&join.id).is_some_and(|t| *t > now) {
@@ -714,8 +728,8 @@ async fn join_retry_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>
                 Err(e) => {
                     // unparseable tickets can never succeed; drop them
                     tracing::warn!("dropping unparseable pending join: {e:#}");
-                    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                    s.remove_pending_join(join.id).ok();
+                    let id = join.id;
+                    with_store(&store, move |s| s.remove_pending_join(id).ok()).await;
                     continue;
                 }
             };
@@ -723,8 +737,8 @@ async fn join_retry_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>
                 Ok(out) => {
                     tracing::info!(root = out.root_doc, "queued join completed");
                     {
-                        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                        s.remove_pending_join(join.id).ok();
+                        let id = join.id;
+                        with_store(&store, move |s| s.remove_pending_join(id).ok()).await;
                     }
                     match super::client::pull_after_join(&endpoint, &store, &out.root_doc).await {
                         Ok(sum) => tracing::info!(root = out.root_doc, docs = sum.changed, "first pull after queued join"),
@@ -732,12 +746,13 @@ async fn join_retry_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>
                     }
                 }
                 Err(e) => {
-                    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                    let id = join.id;
                     if join_failure_is_dead(&e) {
                         tracing::warn!("dropping pending join: {e:#}");
-                        s.remove_pending_join(join.id).ok();
+                        with_store(&store, move |s| s.remove_pending_join(id).ok()).await;
                     } else {
-                        s.record_join_attempt(join.id, &format!("{e:#}")).ok();
+                        let msg = format!("{e:#}");
+                        with_store(&store, move |s| s.record_join_attempt(id, &msg).ok()).await;
                         next_due.insert(join.id, now + join_backoff(join.attempts + 1));
                     }
                 }
