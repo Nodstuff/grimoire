@@ -47,6 +47,12 @@ cargo test && (cd ui && npx vitest run)
 ./target/release/grimoire serve    # http://127.0.0.1:7425
 ```
 
+The UI accepts a few query params on load, all scrubbed off the URL once read:
+`?admin_token=<token>` (the per-boot token beside the db, kept in sessionStorage for
+`/admin/*` calls), `?doc=<uuid>[&block=<uuid>]` (open that doc, scroll to the block),
+`?tab=review|runs|graph|sharing|profile|trash` (open a top-level view; `doc` wins if
+both are given) and `?join=<payload>` (a `grimoire://join/…` link routed by the shell).
+
 `./release.sh` builds the signed, notarized dmg (needs a Developer ID certificate and a
 `notarytool` keychain profile). Gardeners need [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
 on the machine.

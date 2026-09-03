@@ -14,6 +14,7 @@ import ImportFolder from './ImportFolder'
 import ReviewRail from './ReviewRail'
 import { notify, errText, Notices } from './Notice'
 import { resolveShortcut } from './shortcuts'
+import { parseDeepLink, scrubDeepLink } from './deeplink'
 import { buildHighlightMap, targetBlockOf } from './review'
 import { activityLine, loadLastSeen, storeLastSeen, unseenActivity } from './activity'
 import { advanceEvents, EventsCursor, EventsResponse, INITIAL_CURSOR, liveEventLine } from './live'
@@ -108,9 +109,26 @@ export default function App() {
     ]).then(([q, f]) => setQueueCount(q + f))
   }, [])
 
+  // ?doc=<uuid>[&block=<uuid>][&tab=<name>]: the shell or an embedding host
+  // opens the page ON a doc or view. Read once, scrubbed off the URL like
+  // admin_token so a reload lands on home, not back on the doc.
+  const deepLink = useRef(parseDeepLink(location.search))
+
   useEffect(() => {
-    api<Doc[]>('/api/docs').then(setDocs).catch(console.error)
+    const link = deepLink.current
+    api<Doc[]>('/api/docs')
+      .then((list) => {
+        setDocs(list)
+        if (!link?.doc) return
+        if (list.some((d) => d.id === link.doc)) openDocRef.current(link.doc, { blockId: link.block })
+        else notify('That doc is not here — it may have been deleted or moved to the Trash')
+      })
+      .catch(console.error)
     refreshQueue()
+    if (link) {
+      if (link.tab && link.tab !== 'home') setViewRaw({ kind: link.tab })
+      window.history.replaceState(null, '', location.pathname + scrubDeepLink(location.search) + location.hash)
+    }
     if (joinPrefill) {
       setViewRaw({ kind: 'sharing' })
       window.history.replaceState(null, '', '/') // don't re-trigger on reload
