@@ -816,4 +816,99 @@ pub struct OpStatus {
     /// Open annotation state: "open" | "accepted" | "declined"; None when
     /// the op never had one.
     pub review: Option<String>,
+    /// The op's provenance refs (hub slice 2: a hub asking on a member's
+    /// behalf is matched by the `via hub` refs, not by principal).
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+}
+
+/// Hub side (slice 2): a proposal the hub forwarded to a doc's true owner on
+/// a member's behalf. `op_id` is the OWNER's op id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HubForward {
+    pub op_id: Uuid,
+    pub owner_contact: Uuid,
+    pub member_contact: Uuid,
+    pub owner_share: Uuid,
+    pub doc_id: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HubTransferState {
+    Offered,
+    Accepted,
+    Declined,
+    Done,
+}
+
+impl HubTransferState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HubTransferState::Offered => "offered",
+            HubTransferState::Accepted => "accepted",
+            HubTransferState::Declined => "declined",
+            HubTransferState::Done => "done",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "offered" => Some(HubTransferState::Offered),
+            "accepted" => Some(HubTransferState::Accepted),
+            "declined" => Some(HubTransferState::Declined),
+            "done" => Some(HubTransferState::Done),
+            _ => None,
+        }
+    }
+}
+
+/// Hub side (slice 2): a member's offer to hand a subtree over to the hub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HubTransfer {
+    pub id: Uuid,
+    pub member_contact: Uuid,
+    pub root_doc: Uuid,
+    pub title: String,
+    pub doc_count: i64,
+    pub state: HubTransferState,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferDirection {
+    /// I gave the subtree away; my copy is a mirror of the counterparty now.
+    Out,
+    /// I took the subtree over.
+    In,
+}
+
+impl TransferDirection {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TransferDirection::Out => "out",
+            TransferDirection::In => "in",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "out" => Some(TransferDirection::Out),
+            "in" => Some(TransferDirection::In),
+            _ => None,
+        }
+    }
+}
+
+/// Both sides (slice 2): one ownership transfer this instance took part in.
+/// `state` is "offered" until the hand-over happened, then "done".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DocTransfer {
+    pub id: Uuid,
+    pub root_doc: Uuid,
+    pub counterparty: Uuid,
+    pub direction: TransferDirection,
+    pub state: String,
+    pub at: String,
 }

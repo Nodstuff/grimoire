@@ -528,6 +528,57 @@ pub trait BlockStore {
 
     fn remove_pending_join(&mut self, id: Uuid) -> Result<()>;
 
+    // Hub slice 2: forwarding, transfers.
+
+    /// The principal a proposal arriving ON BEHALF OF a peer is filed under:
+    /// an existing contact's principal if that pubkey is a contact, else a
+    /// Remote principal keyed by pubkey (created once, no contact row).
+    fn remote_principal_for(&mut self, pubkey: &str, name: &str) -> Result<Uuid>;
+
+    /// Hub side: remember a proposal forwarded to its owner for a member.
+    fn add_hub_forward(
+        &mut self,
+        op_id: Uuid,
+        owner_contact: Uuid,
+        member_contact: Uuid,
+        owner_share: Uuid,
+        doc_id: Uuid,
+    ) -> Result<()>;
+
+    /// Hub side: the forward records for these owner-side op ids (unknown
+    /// ids are skipped).
+    fn hub_forwards_for(&self, op_ids: &[Uuid]) -> Result<Vec<HubForward>>;
+
+    /// Hub side: a member offered a subtree. Re-offering the same root by
+    /// the same member while a previous offer is still open replaces it.
+    fn add_hub_transfer(
+        &mut self,
+        member_contact: Uuid,
+        root_doc: Uuid,
+        title: &str,
+        doc_count: i64,
+    ) -> Result<HubTransfer>;
+
+    fn list_hub_transfers(&self) -> Result<Vec<HubTransfer>>;
+
+    fn get_hub_transfer(&self, id: Uuid) -> Result<HubTransfer>;
+
+    fn set_hub_transfer_state(&mut self, id: Uuid, state: HubTransferState) -> Result<()>;
+
+    /// Both sides: record a transfer of `root_doc` with `counterparty`
+    /// (state "offered" | "done").
+    fn add_doc_transfer(
+        &mut self,
+        root_doc: Uuid,
+        counterparty: Uuid,
+        direction: TransferDirection,
+        state: &str,
+    ) -> Result<DocTransfer>;
+
+    fn list_doc_transfers(&self) -> Result<Vec<DocTransfer>>;
+
+    fn set_doc_transfer_state(&mut self, id: Uuid, state: &str) -> Result<()>;
+
     /// Resolve one annotation. Invariant enforced here: proposer ≠ approver.
     /// - accept yellow: clear the annotation (the edit is already live)
     /// - decline yellow: revert via the op's pre-image, as a new green op by
