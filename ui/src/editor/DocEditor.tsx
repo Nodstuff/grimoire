@@ -17,7 +17,13 @@ import { api, Block } from '../types'
 import { notify } from '../Notice'
 import { proposeErrorText, saveErrorText } from '../hints'
 import { BaselineBlock, Entry, computeOps } from './diff'
+import { debounce } from '../timing'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
+import { AfterSave, afterSave } from './savePlan'
+
+/** transaction meta marking DocEditor's own post-save blockId stamping, so
+ * onUpdate can tell it apart from a real edit. */
+const STAMP_META = 'grimoire-stamp'
 
 const TOP_LEVEL_TYPES = [
   'paragraph',
@@ -106,7 +112,9 @@ export default function DocEditor({
 }: {
   doc: EditableDoc
   mode?: EditorMode
-  onSaved: (epoch: number) => void
+  /** `docId` names the doc the save landed on: the unmount flush can fire
+   * after the parent has moved to another doc, which must ignore it */
+  onSaved: (epoch: number, docId: string) => void
   onProposed?: () => void
   onSelectionBlock?: (blockId: string | null) => void
   /** blocks under review → tone; painted as node decorations, no remount */
@@ -114,8 +122,22 @@ export default function DocEditor({
 }) {
   const selCb = useRef(onSelectionBlock)
   selCb.current = onSelectionBlock
+  const modeRef = useRef(mode)
+  modeRef.current = mode
   const [saveState, setSaveState] = useState<SaveState>('clean')
   const [epoch, setEpoch] = useState(doc.epoch)
+  // autosave debounce, driven by the editor's update event: every keystroke
+  // re-arms it, so the save lands 1.2s after the LAST edit. (An effect keyed
+  // on editor.state.doc did not re-arm — Tiptap 3 does not re-render per
+  // transaction — so the timer fired 1.2s after the FIRST keystroke.)
+  const saveRef = useRef<() => Promise<void>>(async () => {})
+  const autosave = useRef(debounce(1200, () => saveRef.current()))
+  /** the save currently in flight, or null; the single concurrency guard */
+  const inFlight = useRef<Promise<void> | null>(null)
+  /** false once the cleanup below has run — a save that resolves after that
+   * must not re-arm timers that no longer exist */
+  const mounted = useRef(true)
+  const lastPlan = useRef<AfterSave>('clean')
 
   // baseline: per block, the round-tripped markdown (comparison form) + structure
   const initial = useMemo(() => {
@@ -156,7 +178,13 @@ export default function DocEditor({
         type: 'doc',
         content: initial.nodes.map((n) => n.toJSON()),
       },
-      onUpdate: () => setSaveState('dirty'),
+      onUpdate: ({ transaction }) => {
+        // the post-save blockId stamp is our own bookkeeping, not an edit:
+        // arming the debounce for it caused a spurious empty save 1.2s later
+        if (transaction.getMeta(STAMP_META)) return
+        setSaveState('dirty')
+        if (modeRef.current === 'direct') autosave.current.arm()
+      },
       onSelectionUpdate: ({ editor }) => {
         const sel = editor.state.selection
         if (sel.empty) {
@@ -216,8 +244,12 @@ export default function DocEditor({
     return entries
   }
 
-  const save = async () => {
-    if (!editor || saveState === 'saving' || mode === 'readonly') return
+  const runSave = async () => {
+    if (!editor || modeRef.current === 'readonly') return
+    autosave.current.cancel()
+    // what this save writes; edits landing while the request is in flight
+    // make the doc differ from it, and the editor must stay dirty for them
+    const snapshot = editor.state.doc
     const entries = extractEntries()
     const assigned: string[] = []
     const ops = computeOps(baselineRef.current, entries, () => {
@@ -254,6 +286,7 @@ export default function DocEditor({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ doc_id: doc.docId, base_epoch: epochRef.current, ops }),
       })
+      const editedMeanwhile = !editor.state.doc.eq(snapshot)
       // stamp fresh ids onto the inserted nodes so the next diff sees them
       let cursor = 0
       const inserted = ops
@@ -268,15 +301,26 @@ export default function DocEditor({
           }
         })
         tr.setMeta('addToHistory', false)
+        tr.setMeta(STAMP_META, true)
         editor.view.dispatch(tr)
       }
       // new baseline = what we just wrote
       baselineRef.current = rebuildBaseline(baselineRef.current, entries, ops)
       epochRef.current = out.epoch
       setEpoch(out.epoch)
-      setSaveState('clean')
       lastSaveError.current = null
-      onSaved(out.epoch)
+      // typed during the request? those keystrokes are not in what landed
+      const plan = afterSave({ editedMeanwhile, mounted: mounted.current })
+      lastPlan.current = plan
+      if (plan === 'clean') {
+        setSaveState('clean')
+      } else {
+        setSaveState('dirty')
+        // 'save-now' (typed then switched doc) is driven by the unmount
+        // cleanup below — no debounce or retry clock survives the unmount
+        if (plan === 'rearm') autosave.current.arm()
+      }
+      onSaved(out.epoch, doc.docId)
     } catch (e) {
       // the text is still in the editor and stays dirty; the retry clock
       // below keeps trying. Say so ONCE per distinct cause — a silent
@@ -292,11 +336,19 @@ export default function DocEditor({
   }
   const lastSaveError = useRef<string | null>(null)
 
-  // debounce autosave; flush on unmount/navigation
-  const saveRef = useRef(save)
+  /** One save at a time, tracked by promise rather than React state: the
+   * unmount cleanup runs after the component is gone, where `saveState` is
+   * stale, and it must be able to await the request in flight. */
+  const save = (): Promise<void> => {
+    if (inFlight.current) return inFlight.current
+    const p = runSave().finally(() => {
+      inFlight.current = null
+    })
+    inFlight.current = p
+    return p
+  }
+
   saveRef.current = save
-  const modeRef = useRef(mode)
-  modeRef.current = mode
 
   // cold-editor heartbeat (auto-hot): while someone is actively in this
   // editor, tell the daemon — two concurrent editors escalate to a live
@@ -316,11 +368,6 @@ export default function DocEditor({
     }, 4000)
     return () => clearInterval(t)
   }, [editor, mode, doc.docId, saveState])
-  useEffect(() => {
-    if (saveState !== 'dirty' || mode !== 'direct') return
-    const t = setTimeout(() => saveRef.current(), 1200)
-    return () => clearTimeout(t)
-  }, [saveState, editor?.state.doc, mode])
   // a failed save leaves the doc dirty with no new keystrokes to re-arm the
   // debounce: retry on a slow clock until it lands (daemon back, live
   // session over, …)
@@ -335,9 +382,24 @@ export default function DocEditor({
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') saveRef.current()
     }
     window.addEventListener('keydown', onKey)
+    const pending = autosave.current
     return () => {
       window.removeEventListener('keydown', onKey)
-      if (modeRef.current === 'direct') saveRef.current()
+      // unmount/navigation: land whatever is pending now (the save reports
+      // its own docId, so a parent that has moved on ignores the result)
+      pending.cancel()
+      mounted.current = false
+      if (modeRef.current !== 'direct') return
+      const flight = inFlight.current
+      if (!flight) {
+        saveRef.current()
+        return
+      }
+      // a save is mid-request: its response cannot carry keystrokes typed
+      // after it started, so wait for it and save those once more
+      flight.then(() => {
+        if (lastPlan.current === 'save-now') saveRef.current()
+      })
     }
   }, [])
 

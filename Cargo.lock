@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "grimoire"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2339,9 +2339,11 @@ dependencies = [
  "iroh",
  "iroh-mdns-address-lookup",
  "keyring",
+ "libc",
  "model2vec-rs",
  "reqwest 0.12.28",
  "rmcp",
+ "rusqlite",
  "rust-embed",
  "schemars 1.2.2",
  "serde",
@@ -2360,8 +2362,9 @@ dependencies = [
 
 [[package]]
 name = "grimoire-shell"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
+ "libc",
  "serde_json",
  "tauri",
  "tauri-build",
@@ -2373,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "grimoire-store"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "rusqlite",
  "serde",

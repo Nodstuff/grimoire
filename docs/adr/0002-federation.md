@@ -271,3 +271,51 @@ Wire additions: `Propose.on_behalf_of`, `TransferOffer`, `TransferAccepted`, `Tr
 `POST /admin/hubs/transfer`; (hub box) `GET /admin/hub/transfers`, `POST /admin/hub/transfers/
 {accept,decline}`. `GET /admin/hubs` rows carry `transfers`; `GET /api/doc/{id}/federation` mirrors
 carry `transferred_from_me`.
+
+## 0.7.2 hardening
+
+Wire-additive; a 0.7.1 peer parses and redeems every 0.7.2 link and frame.
+
+- **Join origin rule.** `client::join_at_from(.., JoinOrigin)` decides how much a join may change
+  about what the instance already holds. When the redeemed share's root uuid is already a mirror
+  held from a *different* contact, only `Interactive` (a person pasted the link or accepted a share
+  request by hand) may take the "owner changed identity" branch — revoke the old contact, rebind the
+  mirror. `HubRelay` (`hub::accept_publication`) and any future automatic path refuse with the new
+  `RefusalCode::RootConflict`, log a warning, and leave the first mirror and contact intact.
+  `RootConflict` is a dead join (never retried by the queue). Without this a member could publish a
+  forged doc under a colleague's root id and capture their publication on the hub.
+- **Hub marker.** A contact is flagged `is_hub` only when the ticket it redeemed was minted by a hub
+  for its root. The marker is the `hub-` prefix on the invite secret (`wire::HUB_SECRET_PREFIX`,
+  `new_hub_secret`, `Ticket::is_hub_invite`); `mint_invite_full` applies it when the root is the
+  hub's configured root, so `hub invite` and the hub's membership offers carry it. The owner's
+  `Redeemed { is_hub }` alone is a self-assertion and is ignored (warned) without the marker — a
+  plain owner can no longer have its `on_behalf_of` proposals honoured as a hub's. The marker lives
+  inside the secret so the link format is unchanged and the hash covers the whole string.
+- **Request bound.** `client::request` is capped end to end by `REQUEST_TIMEOUT` (60 s) on top of
+  the 10 s dial cap, so a peer that accepts and stalls cannot hang a pull or refresh loop.
+- **Frame limits.** `server::PRE_AUTH_FRAME` (64 KB) caps a request frame — and a hot-bridge
+  header — from a peer that is not a live contact; an oversized frame is refused (`BadRequest`,
+  "frame too large") before a byte is parsed. `MAX_FRAME` (32 MB) applies once the peer is
+  paired. `READ_TIMEOUT` (30 s) bounds the handshake, each request read and the idle wait for the
+  next stream; `MAX_CONNECTIONS` (256) caps concurrent connections at accept.
+- **Hub forward dedupe.** The hub's `request_id` towards the owner is derived from
+  `(member pubkey, member request_id)` (`server::forward_request_id`), and every owner answer —
+  `Proposed` or `Refused` — is cached; unreachable/timeout is not. A member retry that misses the
+  hub cache is deduped by the owner instead of parking twice.
+- **Hot fan-out lag.** `HotState::next_fan_out` answers a broadcast `Lagged` with one full-state
+  `SyncStep2` (Yjs applies it idempotently) instead of ending the fan-out with the socket open;
+  depth 256 → 1024 (`FAN_OUT_DEPTH`). Empty `SyncStep2` frames (one per join) are not journaled.
+- **Mirror filing.** A wire `meta.parent` is honoured only if it names a doc inside the same share
+  (this response, or an existing mirror of the share); anything else files under the share root
+  with a warning. Closes the hole where an owner could place docs inside the grantee's own tree.
+- **Transfer completion.** New `Request::TransferReady { root_doc, share_id }` (member → hub): the
+  member's 120 s sweep re-announces a flipped out-transfer until the hub answers `Noted` (recorded
+  in settings `transfer.acked.<id>`); the hub answers `Busy` while it completes an `Accepted`
+  transfer off-thread. `member_flip` upserts every subtree doc not yet mirrored from the hub, so a
+  half-done flip is finished by the retry.
+- **Loops.** `pull_loop`, `notify_loop`, `join_retry_loop` run under `loops::supervise` (restart on
+  panic/exit, ERROR log, 1–60 s backoff). Hub publication accepts are gated by
+  `hub::PUBLICATION_GATE` (8 concurrent). A hub prunes `hub_forwards` rows older than
+  `HUB_FORWARD_RETENTION_DAYS` (7) on the 120 s sweep (`SqliteStore::prune_hub_forwards`). The notify tick is incremental (`loops::notify_tick`):
+  an idle tick is still two trivial reads; a changed tick lists docs once, names the changed set
+  (epoch rose / new / hotness flipped), and walks only the shares containing them.

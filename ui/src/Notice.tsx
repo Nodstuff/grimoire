@@ -24,6 +24,9 @@ export interface NotifyOpts {
 }
 
 const OK_TTL_MS = 4000
+/** at most this many on screen: past it the oldest auto-dismissing one goes
+ * (sticky errors stay until clicked — they are the ones that matter) */
+export const MAX_VISIBLE = 5
 const OK_ACTION_TTL_MS = 12000
 const WARN_TTL_MS = 8000
 
@@ -44,6 +47,10 @@ export function errText(e: unknown): string {
 export function notify(message: string, kind: NoticeKind = 'error', opts: NotifyOpts = {}): number {
   const id = ++seq
   notices = [...notices, { id, message: message.replace(/^Error:\s*/, ''), kind, onClick: opts.onClick }]
+  while (notices.length > MAX_VISIBLE) {
+    const victim = notices.find((n) => n.kind !== 'error') ?? notices[0]
+    notices = notices.filter((n) => n !== victim)
+  }
   emit()
   if (kind === 'ok') {
     setTimeout(() => dismiss(id), opts.ttlMs ?? (opts.onClick ? OK_ACTION_TTL_MS : OK_TTL_MS))

@@ -1,14 +1,15 @@
 [package]
 name = "grimoire"
-version = "0.7.1"
+version = "0.7.2"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 grimoire-store = { path = "../store" }
+rusqlite.workspace = true
 rmcp = { version = "3.1", features = ["server", "transport-streamable-http-server"] }
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs", "limit"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "time"] }
 uuid.workspace = true
 serde.workspace = true
@@ -33,6 +34,7 @@ futures-util = "0.3.34"
 base64 = "0.23.1"
 rust-embed = "8.12"
 iroh-mdns-address-lookup = "0.5.0"
+libc = "0.2"
 model2vec-rs = { version = "0.2.1", default-features = false, features = ["onig", "local-only"] }
 
 [build-dependencies]

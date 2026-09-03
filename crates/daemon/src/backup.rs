@@ -9,9 +9,7 @@
 //! Cost: one read transaction and a file the size of the db (29 MB today).
 //! It runs when the daemon starts (if today's is missing) and then daily.
 
-use grimoire_store::SqliteStore;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 const KEEP: usize = 7;
 const PREFIX: &str = "ks-";
@@ -60,11 +58,11 @@ fn list_in(dir: &Path) -> Vec<BackupInfo> {
 
 /// Take a snapshot now. Returns the new file, or the existing one if today's
 /// snapshot is already there (`force` replaces it). Prunes to `KEEP`.
-pub fn backup_now(
-    store: &Arc<Mutex<SqliteStore>>,
-    db_path: &Path,
-    force: bool,
-) -> anyhow::Result<BackupInfo> {
+///
+/// Reads through a SECOND, read-only connection to the same file: the
+/// store's mutex is never held for the seconds a 30 MB VACUUM takes, so the
+/// UI and MCP keep answering. WAL gives the copy a consistent snapshot.
+pub fn backup_now(db_path: &Path, force: bool) -> anyhow::Result<BackupInfo> {
     let dir = backup_dir(db_path);
     std::fs::create_dir_all(&dir)?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -85,8 +83,13 @@ pub fn backup_now(
     let tmp = dir.join(format!(".{PREFIX}{today}{SUFFIX}.partial"));
     std::fs::remove_file(&tmp).ok();
     {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
-        s.backup_to(&tmp)?;
+        use rusqlite::OpenFlags;
+        let ro = rusqlite::Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        ro.busy_timeout(std::time::Duration::from_secs(10))?;
+        ro.execute("VACUUM INTO ?1", rusqlite::params![tmp.to_string_lossy()])?;
     }
     std::fs::rename(&tmp, &target)?;
     let bytes = std::fs::metadata(&target)?.len();
@@ -109,13 +112,12 @@ fn prune(dir: &Path) {
 
 /// Once at start (if today's snapshot is missing), then every 24h. Quiet on
 /// success; a failure is a WARN, never a crash — the daemon's job is the notes.
-pub async fn backup_loop(store: Arc<Mutex<SqliteStore>>, db_path: PathBuf) {
+pub async fn backup_loop(db_path: PathBuf) {
     // let the daemon settle before the first read transaction
     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     loop {
-        let s = store.clone();
         let p = db_path.clone();
-        let res = tokio::task::spawn_blocking(move || backup_now(&s, &p, false)).await;
+        let res = tokio::task::spawn_blocking(move || backup_now(&p, false)).await;
         match res {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => tracing::warn!("daily backup failed: {e:#}"),
@@ -128,7 +130,8 @@ pub async fn backup_loop(store: Arc<Mutex<SqliteStore>>, db_path: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grimoire_store::{BlockStore, PrincipalKind};
+    use grimoire_store::{BlockStore, PrincipalKind, SqliteStore};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn backup_is_a_self_contained_db_and_prunes_to_keep() {
@@ -140,12 +143,16 @@ mod tests {
         store.create_doc("kept", None, tom.id).unwrap();
         let store = Arc::new(Mutex::new(store));
 
-        let info = backup_now(&store, &db_path, false).unwrap();
+        // the store's lock is HELD throughout: the backup must not need it
+        let held = store.lock().unwrap();
+        let info = backup_now(&db_path, false).unwrap();
         assert!(Path::new(&info.path).exists());
         // idempotent for the day
-        let again = backup_now(&store, &db_path, false).unwrap();
+        let again = backup_now(&db_path, false).unwrap();
         assert_eq!(again.path, info.path);
-        // the copy opens on its own and has the data
+        drop(held);
+        // the copy opens on its own and has the data (written via the WAL,
+        // never checkpointed — the snapshot still sees it)
         let copy = SqliteStore::open(&info.path).unwrap();
         assert_eq!(copy.list_docs().unwrap()[0].title, "kept");
 
@@ -154,7 +161,7 @@ mod tests {
         for i in 1..=(KEEP + 3) {
             std::fs::write(bdir.join(format!("{PREFIX}2000-01-{i:02}{SUFFIX}")), b"x").unwrap();
         }
-        backup_now(&store, &db_path, true).unwrap();
+        backup_now(&db_path, true).unwrap();
         assert_eq!(list_backups(&db_path).len(), KEEP);
         assert_eq!(list_backups(&db_path)[0].date, info.date);
     }

@@ -286,3 +286,71 @@ fn persists_across_reopen() {
     assert_eq!(tree.roots[0].block.content, "hello");
     assert_eq!(tree.doc.current_epoch, 1);
 }
+
+/// P1 (0.7.2): order keys are client input. Equal sibling keys + `after:` must
+/// yield a distinct key rather than panic; garbage keys are a normal error;
+/// a parked insert accepted after a sibling took its key is re-keyed.
+#[test]
+fn order_keys_never_panic_and_are_validated() {
+    let (mut s, tom) = store_with_tom();
+    let doc = s.create_doc("keys", None, tom.id).unwrap();
+    // two siblings deliberately sharing a key
+    let (a, op_a) = insert(None, "i", BlockType::Paragraph, "a");
+    let (_b, op_b) = insert(None, "i", BlockType::Paragraph, "b");
+    s.apply(doc.id, 0, tom.id, vec![op_a, op_b]).unwrap();
+    let (c, op_c) = insert(None, &format!("after:{a}"), BlockType::Paragraph, "c");
+    s.apply(doc.id, 1, tom.id, vec![op_c]).expect("equal sibling keys must not panic");
+    let keys: Vec<String> = s
+        .read_doc(doc.id)
+        .unwrap()
+        .roots
+        .iter()
+        .map(|n| n.block.order_key.clone())
+        .collect();
+    let c_key = s.read_block(c).unwrap().order_key;
+    assert!(c_key.as_str() > "i", "lands after the collided pair: {keys:?}");
+    assert_eq!(keys.iter().filter(|k| **k == c_key).count(), 1);
+
+    // garbage keys: rejected, doc untouched
+    for bad in ["I", "after:", "i0", "1-2", " "] {
+        let (_, op) = insert(None, bad, BlockType::Paragraph, "x");
+        let err = s.apply(doc.id, 2, tom.id, vec![op]).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidOp(_)), "{bad:?}: {err}");
+    }
+    let mv = OpInput {
+        kind: OpKind::Move {
+            target: c,
+            new_parent: None,
+            new_order_key: "Z".into(),
+        },
+        source_refs: vec![],
+    };
+    assert!(matches!(
+        s.apply(doc.id, 2, tom.id, vec![mv]),
+        Err(StoreError::InvalidOp(_))
+    ));
+    assert_eq!(s.get_doc(doc.id).unwrap().current_epoch, 2);
+
+    // parked insert: resolved after `c` at park time ...
+    let (parked, op_p) = insert(None, &format!("after:{c}"), BlockType::Paragraph, "parked");
+    s.park(doc.id, tom.id, vec![op_p], "later").unwrap();
+    let parked_key = match &s.review_queue(Some(doc.id)).unwrap()[0].op.kind {
+        OpKind::Insert { order_key, .. } => order_key.clone(),
+        other => panic!("{other:?}"),
+    };
+    // ... then a live sibling takes exactly that key
+    let (_taker, op_t) = insert(None, &parked_key, BlockType::Paragraph, "taker");
+    s.apply(doc.id, 2, tom.id, vec![op_t]).unwrap();
+    let ann = s.review_queue(Some(doc.id)).unwrap()[0].annotation.id;
+    s.resolve(ann, tom.id, ReviewDecision::Accept).unwrap();
+    let live_keys: Vec<String> = s
+        .read_doc(doc.id)
+        .unwrap()
+        .roots
+        .iter()
+        .map(|n| n.block.order_key.clone())
+        .collect();
+    let got = s.read_block(parked).unwrap().order_key;
+    assert_ne!(got, parked_key, "accepted parked insert was re-keyed");
+    assert_eq!(live_keys.iter().filter(|k| **k == got).count(), 1, "{live_keys:?}");
+}

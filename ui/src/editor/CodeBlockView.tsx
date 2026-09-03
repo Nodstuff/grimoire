@@ -4,15 +4,27 @@
 
 import { NodeViewContent, NodeViewProps, NodeViewWrapper } from '@tiptap/react'
 import { useEffect, useRef, useState } from 'react'
-import mermaid from 'mermaid'
 import { api } from '../types'
 
-mermaid.initialize({
-  startOnLoad: false,
-  theme: 'dark',
-  darkMode: true,
-  themeVariables: { background: '#101014', primaryColor: '#1e1e26', lineColor: '#6b6b7b' },
-})
+// mermaid is ~2MB: fetched on the first mermaid fence, not at boot
+let mermaidMod: Promise<typeof import('mermaid')['default']> | null = null
+function loadMermaid() {
+  if (!mermaidMod) {
+    mermaidMod = import('mermaid').then((m) => {
+      m.default.initialize({
+        startOnLoad: false,
+        theme: 'dark',
+        darkMode: true,
+        themeVariables: { background: '#101014', primaryColor: '#1e1e26', lineColor: '#6b6b7b' },
+      })
+      return m.default
+    })
+    mermaidMod.catch(() => {
+      mermaidMod = null // let the next fence retry the fetch
+    })
+  }
+  return mermaidMod
+}
 
 let mermaidSeq = 0
 
@@ -20,18 +32,25 @@ function MermaidPreview({ code }: { code: string }) {
   const [svg, setSvg] = useState<string>('')
   const [err, setErr] = useState<string>('')
   useEffect(() => {
+    let stale = false
     const t = setTimeout(async () => {
       try {
+        const mermaid = await loadMermaid()
         const { svg } = await mermaid.render(`mmd-${++mermaidSeq}`, code)
+        if (stale) return
         setSvg(svg)
         setErr('')
       } catch (e) {
-        setErr(String(e).split('\n')[0])
+        if (!stale) setErr(String(e).split('\n')[0])
       }
     }, 400)
-    return () => clearTimeout(t)
+    return () => {
+      stale = true
+      clearTimeout(t)
+    }
   }, [code])
   if (err) return <div className="diagram-err">{err}</div>
+  if (!svg) return <div className="lazy-loading">loading…</div>
   return <div className="diagram" dangerouslySetInnerHTML={{ __html: svg }} />
 }
 

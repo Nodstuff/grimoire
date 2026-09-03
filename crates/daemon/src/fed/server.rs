@@ -17,6 +17,7 @@ use super::wire::{
     Refusal, RefusalCode, Request, Response, WireDoc, WireDocMeta, hash_secret,
 };
 use crate::hot::HotState;
+use crate::store_ext::{blocking, with_store};
 use anyhow::{Context, Result};
 use grimoire_store::{BlockStore, Contact, OpStatus, SqliteStore};
 use iroh::endpoint::presets;
@@ -111,6 +112,19 @@ impl DedupeCache {
 type Dedupe = Arc<Mutex<DedupeCache>>;
 const DEDUPE_CAP: usize = 512;
 
+/// 0.7.2 frame limits. A peer that is not (yet) a contact may only ever be
+/// redeeming an invite — a few hundred bytes — so its frame is read under
+/// this cap; `MAX_FRAME` applies once the peer is a known, live contact.
+/// Before this an unknown node could make the daemon buffer and parse 32 MB
+/// per connection, unbounded in connections and in time.
+pub const PRE_AUTH_FRAME: usize = 64 * 1024;
+/// How long one request frame (handshake, or bytes after `accept_bi`) may
+/// take to arrive; also the idle wait for the next stream on a connection.
+pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Concurrent federation connections (requests + hot bridges) this daemon
+/// services; the rest are dropped at accept with a warning.
+pub const MAX_CONNECTIONS: usize = 256;
+
 /// Accept loop. Spawned once per daemon; lives until the endpoint closes.
 pub async fn serve(
     endpoint: Endpoint,
@@ -118,20 +132,46 @@ pub async fn serve(
     hot: HotState,
     runtime: Runtime,
 ) {
+    serve_with_cap(endpoint, store, hot, runtime, MAX_CONNECTIONS).await
+}
+
+/// `serve` with an explicit connection cap, so a test can reach the cap with
+/// two connections instead of 257.
+pub async fn serve_with_cap(
+    endpoint: Endpoint,
+    store: Arc<Mutex<SqliteStore>>,
+    hot: HotState,
+    runtime: Runtime,
+    cap: usize,
+) {
     tracing::info!("federation endpoint listening (node id {})", endpoint.id());
     let dedupe: Dedupe = Arc::new(Mutex::new(DedupeCache::new(DEDUPE_CAP)));
+    let gate = Arc::new(tokio::sync::Semaphore::new(cap));
     while let Some(incoming) = endpoint.accept().await {
+        let Ok(permit) = gate.clone().try_acquire_owned() else {
+            tracing::warn!(
+                cap,
+                "federation: connection cap reached; dropping an incoming connection"
+            );
+            drop(incoming);
+            continue;
+        };
         let store = store.clone();
         let dedupe = dedupe.clone();
         let hot = hot.clone();
         let runtime = runtime.clone();
         let ep = endpoint.clone();
         tokio::spawn(async move {
+            let _permit = permit; // held for the life of the connection
             let conn = match incoming.accept() {
-                Ok(accepting) => match accepting.await {
-                    Ok(conn) => conn,
-                    Err(e) => {
+                Ok(accepting) => match tokio::time::timeout(READ_TIMEOUT, accepting).await {
+                    Ok(Ok(conn)) => conn,
+                    Ok(Err(e)) => {
                         tracing::debug!("federation handshake failed: {e:#}");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::debug!("federation handshake timed out");
                         return;
                     }
                 },
@@ -169,12 +209,39 @@ async fn handle_conn(
     // once per connection: a successful redeem upgrades the session, and a
     // mid-session revoke takes effect on the next request.
     loop {
-        let (mut send, mut recv) = match conn.accept_bi().await {
-            Ok(s) => s,
-            // peer closed: normal end of conversation
-            Err(_) => return Ok(()),
+        let (mut send, mut recv) = match tokio::time::timeout(READ_TIMEOUT, conn.accept_bi()).await {
+            Ok(Ok(s)) => s,
+            // peer closed: normal end of conversation; idle too long: ours
+            Ok(Err(_)) | Err(_) => return Ok(()),
         };
-        let raw = recv.read_to_end(MAX_FRAME).await?;
+        // the cap is decided per request from the store, never from what the
+        // peer says about itself: a stranger gets `PRE_AUTH_FRAME` until a
+        // redeem has paired it, and a revoke shrinks it again
+        let authed = {
+            let peer = peer.to_string();
+            with_store(&store, move |s| s.contact_by_pubkey(&peer).ok().flatten().is_some_and(|c| !c.revoked)).await
+        };
+        let limit = if authed { MAX_FRAME } else { PRE_AUTH_FRAME };
+        let raw = match tokio::time::timeout(READ_TIMEOUT, recv.read_to_end(limit)).await {
+            Ok(Ok(raw)) => raw,
+            Ok(Err(iroh::endpoint::ReadToEndError::TooLong)) => {
+                // refused without parsing a byte of it (the reply is flushed
+                // by the normal close: the peer hangs up after reading it)
+                tracing::warn!(peer, authed, limit, "federation: frame over the cap; refused");
+                let out = serde_json::to_vec(&Frame {
+                    v: PROTOCOL_VERSION,
+                    msg: Response::refused(
+                        RefusalCode::BadRequest,
+                        format!("frame too large ({limit} bytes max{})", if authed { "" } else { " before authentication" }),
+                    ),
+                })?;
+                send.write_all(&out).await?;
+                send.finish()?;
+                continue;
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!("request frame timed out after {}s", READ_TIMEOUT.as_secs()),
+        };
         let response = match serde_json::from_slice::<Frame<Request>>(&raw) {
             Err(e) => Response::refused(RefusalCode::BadRequest, format!("bad frame: {e}")),
             Ok(frame) if frame.v != PROTOCOL_VERSION => Response::refused(
@@ -247,7 +314,14 @@ async fn dispatch(
     endpoint: &Endpoint,
     runtime: &Runtime,
 ) -> Response {
-    match dispatch_sync(req, peer, store_arc, dedupe, hot, endpoint, runtime) {
+    // the planner holds the store lock for its whole body: run it on the
+    // blocking pool, not on the async worker
+    let step = {
+        let (peer, store, dedupe, hot, endpoint, runtime) =
+            (peer.to_string(), store_arc.clone(), dedupe.clone(), hot.clone(), endpoint.clone(), runtime.clone());
+        blocking(move || dispatch_sync(req, &peer, &store, &dedupe, &hot, &endpoint, &runtime)).await
+    };
+    match step {
         Step::Reply(r) => r,
         Step::ForwardPropose(f) => forward_propose(endpoint, store_arc, dedupe, *f).await,
         Step::ForwardStatus { local, remote } => forward_status(endpoint, local, remote).await,
@@ -257,6 +331,27 @@ async fn dispatch(
 /// Hub (slice 2): carry a member's proposal to the doc's true owner. The
 /// owner sees it as the MEMBER's proposal (`on_behalf_of`); the hub records
 /// the owner's op ids so the member's status checks can be answered later.
+/// 0.7.2: the `request_id` the hub uses towards the owner for a member's
+/// proposal. Derived from the hub-side dedupe key (`<member pubkey>:<member
+/// request_id>`) so a member retry that misses the hub's own cache (evicted,
+/// hub restarted, first forward timed out after the owner parked it) reaches
+/// the owner under the SAME id and hits the owner's dedupe instead of parking
+/// a second copy. Distinct members never collide (the pubkey is in the key).
+/// A member that sent no request_id gets a fresh id: it asked for no retry
+/// safety.
+pub(super) fn forward_request_id(dedupe_key: Option<&str>) -> String {
+    match dedupe_key {
+        Some(key) => {
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(format!("grimoire-hub-forward:{key}").as_bytes());
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            uuid::Uuid::from_bytes(bytes).to_string()
+        }
+        None => uuid::Uuid::now_v7().to_string(),
+    }
+}
+
 async fn forward_propose(
     endpoint: &Endpoint,
     store_arc: &Arc<Mutex<SqliteStore>>,
@@ -266,6 +361,7 @@ async fn forward_propose(
     let Ok(owner_id) = f.owner.pubkey.parse::<iroh::EndpointId>() else {
         return Response::refused(RefusalCode::Other, "the owner's address is malformed");
     };
+    let request_id = forward_request_id(f.dedupe_key.as_deref());
     let mut ops = f.ops;
     for op in &mut ops {
         op.source_refs.push(format!("via hub: {}", f.hub_name));
@@ -281,7 +377,7 @@ async fn forward_propose(
                 ops,
                 note: f.note,
                 base_epoch: Some(f.base_epoch),
-                request_id: Some(uuid::Uuid::now_v7().to_string()),
+                request_id: Some(request_id),
                 on_behalf_of: Some(OnBehalfOf {
                     pubkey: f.member.pubkey.clone(),
                     name: f.member_name.clone(),
@@ -291,14 +387,22 @@ async fn forward_propose(
     )
     .await;
     let owner_name = f.owner.petname.clone();
+    // terminal = the owner answered (parked or refused); an unreachable or
+    // silent owner is not, so a retry gets to try again
+    let terminal = matches!(res, Ok(Ok(Response::Proposed { .. } | Response::Refused { .. })));
     let response = match res {
         Ok(Ok(Response::Proposed { op_ids })) => {
             let ids: Vec<uuid::Uuid> = op_ids.iter().filter_map(|s| s.parse().ok()).collect();
-            let mut s = store_arc.lock().unwrap_or_else(|p| p.into_inner());
-            for id in &ids {
-                if let Err(e) = s.add_hub_forward(*id, f.owner.id, f.member.id, f.owner_share, f.doc) {
-                    tracing::warn!(op = %id, "hub: forward record failed: {e}");
-                }
+            {
+                let (ids, owner, member, owner_share, doc) = (ids.clone(), f.owner.id, f.member.id, f.owner_share, f.doc);
+                with_store(store_arc, move |s| {
+                    for id in &ids {
+                        if let Err(e) = s.add_hub_forward(*id, owner, member, owner_share, doc) {
+                            tracing::warn!(op = %id, "hub: forward record failed: {e}");
+                        }
+                    }
+                })
+                .await;
             }
             tracing::info!(
                 member = f.member_name,
@@ -320,7 +424,9 @@ async fn forward_propose(
         }
         Err(_) => Response::refused(RefusalCode::Other, format!("{owner_name} is offline or unreachable right now — try again later")),
     };
-    if let (Some(key), Response::Proposed { .. }) = (&f.dedupe_key, &response) {
+    if let Some(key) = &f.dedupe_key
+        && terminal
+    {
         let mut cache = dedupe.lock().unwrap_or_else(|p| p.into_inner());
         cache.insert(key.clone(), response.clone());
     }
@@ -521,6 +627,31 @@ fn dispatch_inner(
                 Err(e) => Response::refused(RefusalCode::Other, e.to_string()),
             }
         }
+        Request::TransferReady { root_doc } => {
+            if hub_cfg.is_none() {
+                return Err(Response::refused(RefusalCode::Unsupported, "this Grimoire is not a hub"));
+            }
+            let Ok(root) = root_doc.parse::<uuid::Uuid>() else {
+                return Err(Response::refused(RefusalCode::BadRequest, "bad id"));
+            };
+            match transfer::hub_ready_ping(&store, &contact, root) {
+                Ok(Some(transfer_id)) => {
+                    // the take-over needs the network: off this thread, like
+                    // an admin's accept; the member asks again next sweep
+                    let endpoint = endpoint.clone();
+                    let store_arc = store_arc.clone();
+                    let addr = peer.parse::<iroh::EndpointId>().ok().map(iroh::EndpointAddr::from);
+                    tokio::spawn(async move {
+                        if let Err(e) = transfer::hub_complete(&endpoint, &store_arc, transfer_id, addr).await {
+                            tracing::warn!(transfer = %transfer_id, "hub: transfer (re-announced by the member) did not complete: {e:#}");
+                        }
+                    });
+                    Response::refused(RefusalCode::Busy, "taking the folder over now — ask again shortly")
+                }
+                Ok(None) => Response::Noted,
+                Err(e) => refuse(e),
+            }
+        }
         Request::TransferAccepted { root_doc } => {
             let Ok(root) = root_doc.parse::<uuid::Uuid>() else {
                 return Err(Response::refused(RefusalCode::BadRequest, "bad doc id"));
@@ -542,7 +673,19 @@ fn dispatch_inner(
             Response::Pong
         }
         Request::Pull { share, cursors } => match handle_pull(&store, &contact, &share, &cursors) {
-            Ok(r) => r,
+            Ok(r) => {
+                // a pull of a handed-over folder's share is the hub telling us
+                // it has our TransferReady; the sweep can stop re-announcing
+                if let Some(root) = share
+                    .parse::<uuid::Uuid>()
+                    .ok()
+                    .and_then(|id| store.list_shares().ok()?.into_iter().find(|sh| sh.id == id))
+                    .map(|sh| sh.root_doc)
+                {
+                    transfer::note_transfer_pulled(&mut store, &contact, root);
+                }
+                r
+            }
             Err(e) => {
                 tracing::warn!(peer, share, "pull refused: {e}");
                 refuse(e)
@@ -781,6 +924,7 @@ fn dispatch_inner(
                             let store_arc = store_arc.clone();
                             let offer_id = offer.id;
                             tokio::spawn(async move {
+                                let _permit = hub::PUBLICATION_GATE.acquire().await;
                                 match hub::accept_publication(&endpoint, &store_arc, offer_id, iroh::EndpointAddr::from(id)).await {
                                     Ok(root) => tracing::info!(%root, "hub: publication relayed"),
                                     Err(e) => tracing::warn!("hub: publication not accepted: {e:#}"),
@@ -1538,16 +1682,25 @@ async fn handle_hot_bridge(
     store: Arc<Mutex<SqliteStore>>,
     hot: HotState,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn.accept_bi().await?;
-    let header = read_frame(&mut recv).await?.context("bridge closed before header")?;
+    // 0.7.2: the header is read under the pre-auth cap and a deadline — the
+    // peer is not authorized until `bridge_authorized` says so
+    let (mut send, mut recv) = tokio::time::timeout(READ_TIMEOUT, conn.accept_bi())
+        .await
+        .context("bridge: no stream opened in time")??;
+    let header = tokio::time::timeout(READ_TIMEOUT, read_frame_capped(&mut recv, PRE_AUTH_FRAME))
+        .await
+        .context("bridge: header timed out")??
+        .context("bridge closed before header")?;
     #[derive(Deserialize)]
     struct Header {
         share: String,
         doc: String,
     }
     let header: Header = serde_json::from_slice(&header).context("bad bridge header")?;
-    let (doc_id, mut view_share, share_id) =
-        bridge_authorized(&store, peer, &header.share, &header.doc)?;
+    let (doc_id, mut view_share, share_id) = {
+        let (store, peer, share, doc) = (store.clone(), peer.to_string(), header.share.clone(), header.doc.clone());
+        blocking(move || bridge_authorized(&store, &peer, &share, &doc)).await?
+    };
     let (mut rx, hello) = hot
         .connect_as(doc_id, Some(peer))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1563,8 +1716,10 @@ async fn handle_hot_bridge(
     }
     let _unregister = Unregister(&hot, bridge_id);
 
+    let fan_hot = hot.clone();
+    let fan_peer = peer.to_string();
     let fan_out = tokio::spawn(async move {
-        while let Ok(frame) = rx.recv().await {
+        while let Some(frame) = fan_hot.next_fan_out(&mut rx, doc_id, &fan_peer).await {
             if write_frame(&mut send, &frame).await.is_err() {
                 break;
             }
@@ -1572,8 +1727,10 @@ async fn handle_hot_bridge(
     });
     // re-auth re-reads the permission too: a propose→view downgrade applies
     // to the live bridge, not only to the next one
-    let reauth = |view_share: &mut bool| -> Result<()> {
-        let (_, ro, _) = bridge_authorized(&store, peer, &header.share, &header.doc)
+    let reauth = async |view_share: &mut bool| -> Result<()> {
+        let (store, who, share, doc) = (store.clone(), peer.to_string(), header.share.clone(), header.doc.clone());
+        let (_, ro, _) = blocking(move || bridge_authorized(&store, &who, &share, &doc))
+            .await
             .context("bridge authorization lapsed")?;
         if ro != *view_share {
             tracing::info!(peer, %doc_id, read_only = ro, "bridge permission changed");
@@ -1589,7 +1746,7 @@ async fn handle_hot_bridge(
                 break Err(anyhow::anyhow!("bridge cut: share or contact revoked"));
             }
             _ = tokio::time::sleep(BRIDGE_REAUTH) => {
-                if let Err(e) = reauth(&mut view_share) {
+                if let Err(e) = reauth(&mut view_share).await {
                     break Err(e);
                 }
                 last_auth = std::time::Instant::now();
@@ -1599,7 +1756,7 @@ async fn handle_hot_bridge(
         match frame {
             Ok(Some(frame)) => {
                 if last_auth.elapsed() > BRIDGE_REAUTH {
-                    if let Err(e) = reauth(&mut view_share) {
+                    if let Err(e) = reauth(&mut view_share).await {
                         break Err(e);
                     }
                     last_auth = std::time::Instant::now();
@@ -1635,15 +1792,22 @@ pub(super) async fn write_frame(send: &mut iroh::endpoint::SendStream, data: &[u
     Ok(())
 }
 
+/// Largest length-prefixed bridge frame (a full Yjs state of a big doc).
+const BRIDGE_FRAME_MAX: usize = 8 * 1024 * 1024;
+
 pub(super) async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> Result<Option<Vec<u8>>> {
+    read_frame_capped(recv, BRIDGE_FRAME_MAX).await
+}
+
+async fn read_frame_capped(recv: &mut iroh::endpoint::RecvStream, cap: usize) -> Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
     match recv.read_exact(&mut len).await {
         Ok(()) => {}
         Err(_) => return Ok(None), // stream closed
     }
     let len = u32::from_le_bytes(len) as usize;
-    if len > 8 * 1024 * 1024 {
-        anyhow::bail!("bridge frame too large");
+    if len > cap {
+        anyhow::bail!("bridge frame too large ({len} > {cap})");
     }
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf).await.context("torn frame")?;

@@ -7,15 +7,18 @@ mod admin;
 mod api;
 mod ask;
 mod backup;
+mod children;
 mod embed;
 mod fed;
 mod garden;
 mod hot;
 mod identity;
+mod local_guard;
 mod yrender;
 mod mcp;
 mod memory;
 mod room;
+mod store_ext;
 #[cfg(test)]
 mod retrieval_probe;
 
@@ -67,15 +70,61 @@ async fn serve_embedded_ui(uri: axum::http::Uri) -> axum::response::Response {
 /// changes this). Computed once.
 pub fn ui_build_stamp() -> u64 {
     static STAMP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *STAMP.get_or_init(|| {
-        let Some(f) = EmbeddedUi::get("index.html") else { return 0 };
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in f.data.iter() {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        h
+    *STAMP.get_or_init(|| match EmbeddedUi::get("index.html") {
+        Some(f) => fnv1a(&f.data),
+        // no embedded UI (a cross-compiled hub build): the git sha still
+        // distinguishes one binary from the next instead of a flat 0
+        None => match GIT_SHA {
+            Some(sha) if !sha.is_empty() => fnv1a(sha.as_bytes()),
+            _ => 0,
+        },
     })
+}
+
+/// Short git sha of the checkout this binary was built from (build.rs); None
+/// when built outside a git checkout.
+pub const GIT_SHA: Option<&str> = option_env!("GRIMOIRE_GIT_SHA");
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Keep a long-lived background loop alive: log its exit or panic with its
+/// name and start it again after a backoff (5s doubling to 5 min). Without
+/// this a panic in, say, the pull loop silently ends federation until the
+/// next restart.
+fn supervise<F, Fut>(name: &'static str, mk: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    supervise_with(name, std::time::Duration::from_secs(5), mk);
+}
+
+fn supervise_with<F, Fut>(name: &'static str, initial_backoff: std::time::Duration, mk: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut backoff = initial_backoff;
+        loop {
+            match tokio::spawn(mk()).await {
+                Ok(()) => tracing::warn!(task = name, "background loop exited; restarting in {}s", backoff.as_secs()),
+                Err(e) if e.is_panic() => {
+                    tracing::error!(task = name, "background loop panicked: {e}; restarting in {}s", backoff.as_secs())
+                }
+                Err(_) => return, // cancelled: the runtime is shutting down
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(300));
+        }
+    });
 }
 
 /// Content type from a file extension — the handful Vite emits. Kept local to
@@ -318,19 +367,23 @@ pub fn log_path() -> Option<PathBuf> {
         .max()
 }
 
+type LogLevelHandle = tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+
 /// One log, owned by the daemon: a daily-rolled file beside the db (the
 /// shell used to redirect stdout into a second, never-rotating file), plus
-/// stdout when run from a terminal. Level: RUST_LOG, else the `log.level`
-/// setting, else info. Returns the non-blocking writer's guard — drop it and
-/// buffered lines are lost, so `main` holds it until exit.
-fn init_logging(db_dir: &std::path::Path, level: Option<String>) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+/// stdout when run from a terminal. Level: RUST_LOG, else info until the
+/// store opens and `apply_log_level` swaps in the `log.level` setting — so
+/// a store that fails to open is itself logged. Returns the non-blocking
+/// writer's guard (drop it and buffered lines are lost, so `main` holds it
+/// until exit) and the reload handle.
+fn init_logging(db_dir: &std::path::Path) -> (Option<tracing_appender::non_blocking::WorkerGuard>, LogLevelHandle) {
     use std::io::IsTerminal;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .or_else(|_| tracing_subscriber::EnvFilter::try_new(level.as_deref().unwrap_or("info")))
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
     let stdout_layer = std::io::stdout()
         .is_terminal()
         .then(tracing_subscriber::fmt::layer);
@@ -349,7 +402,7 @@ fn init_logging(db_dir: &std::path::Path, level: Option<String>) -> Option<traci
                 .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer))
                 .with(stdout_layer)
                 .init();
-            Some(guard)
+            (Some(guard), handle)
         }
         Err(e) => {
             // no writable log dir: stderr is better than silence
@@ -358,8 +411,24 @@ fn init_logging(db_dir: &std::path::Path, level: Option<String>) -> Option<traci
                 .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
                 .init();
             tracing::warn!("log file unavailable ({e}); logging to stderr only");
-            None
+            (None, handle)
         }
+    }
+}
+
+/// The `log.level` setting, once the store is open. RUST_LOG still wins.
+fn apply_log_level(handle: &LogLevelHandle, level: Option<String>) {
+    if std::env::var_os("RUST_LOG").is_some() {
+        return;
+    }
+    let Some(level) = level else { return };
+    match tracing_subscriber::EnvFilter::try_new(&level) {
+        Ok(f) => {
+            if let Err(e) = handle.reload(f) {
+                tracing::warn!("could not apply log.level={level}: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("bad log.level setting {level:?}: {e}"),
     }
 }
 
@@ -380,6 +449,29 @@ fn admin_client(db: &std::path::Path, timeout: Option<std::time::Duration>) -> a
     Ok(b.build()?)
 }
 
+/// Ctrl-C from a terminal, or SIGTERM from the shell / launchd / `kill`.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("no SIGTERM handler ({e}); ctrl-c only");
+                tokio::signal::ctrl_c().await.ok();
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("ctrl-c: shutting down"),
+            _ = term.recv() => tracing::info!("SIGTERM: shutting down"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -389,10 +481,16 @@ async fn main() -> anyhow::Result<()> {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&db_dir).context("creating db directory")?;
-    let mut store = SqliteStore::open(&cli.db).context("opening store")?;
-    // logging waits for the store: the level may live in settings (log.level)
-    let level = store.get_setting("log.level").ok().flatten();
-    let _log_guard = init_logging(&db_dir, level);
+    // logging first: a store that will not open must say so in the log
+    let (_log_guard, log_level) = init_logging(&db_dir);
+    let mut store = match SqliteStore::open(&cli.db) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(db = %cli.db.display(), "could not open the store: {e}");
+            return Err(anyhow::Error::from(e).context(format!("opening store {}", cli.db.display())));
+        }
+    };
+    apply_log_level(&log_level, store.get_setting("log.level").ok().flatten());
     let (tom, claude) = bootstrap_principals(&mut store)?;
 
     match cli.cmd {
@@ -648,8 +746,14 @@ async fn main() -> anyhow::Result<()> {
             let hot = hot::HotState::new(
                 cli.db.parent().unwrap_or(std::path::Path::new(".")).join("hot"),
             );
-            hot.recover(&store);
-            tokio::spawn(hot::idle_loop(hot.clone(), store.clone()));
+            {
+                let (hot, store) = (hot.clone(), store.clone());
+                store_ext::blocking(move || hot.recover(&store)).await;
+            }
+            {
+                let (hot, store) = (hot.clone(), store.clone());
+                supervise("hot.idle", move || hot::idle_loop(hot.clone(), store.clone()));
+            }
             // federation listener: separate iroh surface, deny-by-default
             // (ADR 0002 decision 7); the HTTP router below never sees it —
             // the admin routes only get the endpoint handle for outbound
@@ -668,24 +772,34 @@ async fn main() -> anyhow::Result<()> {
                         // advertise our profile name on the LAN so neighbours
                         // read "Tom's MacBook", not a key
                         {
-                            let s = store.lock().unwrap_or_else(|p| p.into_inner());
-                            let name = s
-                                .list_principals()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .find(|p| p.kind == PrincipalKind::Human)
-                                .map(|p| p.display_name)
-                                .unwrap_or_default();
+                            let name = store_ext::with_store(&store, |s| {
+                                s.list_principals()
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .find(|p| p.kind == PrincipalKind::Human)
+                                    .map(|p| p.display_name)
+                                    .unwrap_or_default()
+                            })
+                            .await;
                             if let Ok(ud) = name.parse::<iroh::address_lookup::UserData>() {
                                 ep.set_user_data_for_address_lookup(Some(ud));
                             }
                         }
-                        tokio::spawn(fed::neighbour_loop(mdns, runtime.clone()));
-                        tokio::spawn(fed::serve(ep.clone(), store.clone(), hot.clone(), runtime.clone()));
+                        {
+                            let runtime = runtime.clone();
+                            supervise("fed.neighbours", move || fed::neighbour_loop(mdns.clone(), runtime.clone()));
+                        }
+                        {
+                            let (ep, store, hot, runtime) = (ep.clone(), store.clone(), hot.clone(), runtime.clone());
+                            supervise("fed.serve", move || {
+                                fed::serve(ep.clone(), store.clone(), hot.clone(), runtime.clone())
+                            });
+                        }
+                        // join retry, grantee-side adaptive pull and owner-side
+                        // change nudges each self-supervise via fed::loops::supervise
                         tokio::spawn(fed::join_retry_loop(ep.clone(), store.clone()));
-                        // grantee side: adaptive pull; owner side: nudge grantees on change
                         tokio::spawn(fed::pull_loop(ep.clone(), store.clone(), runtime.clone()));
-                        tokio::spawn(fed::notify_loop(ep, store.clone(), hot.clone()));
+                        tokio::spawn(fed::notify_loop(ep.clone(), store.clone(), hot.clone()));
                     }
                     Err(e) => tracing::warn!("federation endpoint failed to bind: {e:#}"),
                 }
@@ -707,26 +821,39 @@ async fn main() -> anyhow::Result<()> {
                 .context("minting admin token")?;
             // a hub has no gardeners to schedule and no Claude memory to mirror
             if hub_mode.is_none() {
-                tokio::spawn(admin::daily_loop(store.clone(), hot.clone()));
+                {
+                    let (store, hot) = (store.clone(), hot.clone());
+                    supervise("gardener.daily", move || admin::daily_loop(store.clone(), hot.clone()));
+                }
                 // Claude Code's per-project memory → `Claude Memory` docs, kept in
                 // sync through the gate (changed memories arrive as reviewable)
-                tokio::spawn(memory::memory_loop(store.clone(), tom));
+                {
+                    let store = store.clone();
+                    supervise("memory.sync", move || memory::memory_loop(store.clone(), tom));
+                }
             }
             // daily self-contained db snapshot beside the db (backups/), keep 7
-            tokio::spawn(backup::backup_loop(store.clone(), cli.db.clone()));
+            {
+                let db = cli.db.clone();
+                supervise("backup.daily", move || backup::backup_loop(db.clone()));
+            }
             // block embeddings (ask the vault): model compiled in, index kept
             // current block-by-block; a load failure degrades to keyword search
             let embedder = match embed::Embedder::load() {
                 Ok(e) => {
                     let e = Arc::new(e);
                     {
-                        let s = store.lock().unwrap_or_else(|p| p.into_inner());
-                        match e.load_index(&s) {
+                        let e = e.clone();
+                        store_ext::with_store(&store, move |s| match e.load_index(s) {
                             Ok(n) => tracing::info!(vectors = n, dim = e.dim, "embedding index loaded"),
                             Err(err) => tracing::warn!("embedding index load failed: {err}"),
-                        }
+                        })
+                        .await;
                     }
-                    tokio::spawn(embed::embed_loop(e.clone(), store.clone()));
+                    {
+                        let (e, store) = (e.clone(), store.clone());
+                        supervise("embed", move || embed::embed_loop(e.clone(), store.clone()));
+                    }
                     Some(e)
                 }
                 Err(err) => {
@@ -767,13 +894,42 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 Err(_) => app.fallback(serve_embedded_ui),
             };
+            // DNS-rebinding guard over EVERY surface (api, admin, mcp, ws, ui):
+            // a request whose Host/Origin is not a loopback name is refused
+            let app = app.layer(axum::middleware::from_fn(local_guard::require_loopback));
             tracing::info!("ksd serving MCP (streamable HTTP) at http://{addr}/mcp");
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
-                    tokio::signal::ctrl_c().await.ok();
+                    shutdown_signal().await;
+                    // children first: a slow connection drain must never
+                    // leave a `claude -p` running past the daemon
+                    children::kill_all().await;
                 })
                 .await?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod supervise_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn a_panicking_loop_is_restarted_after_backoff() {
+        static STARTS: AtomicUsize = AtomicUsize::new(0);
+        supervise_with("test.loop", std::time::Duration::from_millis(10), || async {
+            let n = STARTS.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                panic!("first run dies");
+            }
+            std::future::pending::<()>().await;
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while STARTS.load(Ordering::SeqCst) < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(STARTS.load(Ordering::SeqCst), 2, "restarted exactly once, then kept running");
+    }
 }

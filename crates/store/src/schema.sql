@@ -48,6 +48,29 @@ CREATE TABLE IF NOT EXISTS blocks (
 );
 
 CREATE INDEX IF NOT EXISTS blocks_by_doc ON blocks (doc_id, parent_id, order_key);
+-- comment threads: list_comments looks blocks up by the block they anchor to
+CREATE INDEX IF NOT EXISTS blocks_by_refers_to ON blocks (refers_to);
+-- tree walks (delete/restore subtree, next sibling key) go parent → children
+CREATE INDEX IF NOT EXISTS docs_by_parent ON docs (parent_id);
+
+-- Monotone counter bumped by trigger on every docs write (insert, any
+-- update, delete). change_stamp's signal for the mutations its aggregates
+-- cannot see: a same-length rename, a status or review-policy flip.
+CREATE TABLE IF NOT EXISTS doc_revs (
+    id  INTEGER PRIMARY KEY CHECK (id = 1),
+    rev INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO doc_revs (id, rev) VALUES (1, 0);
+
+CREATE TRIGGER IF NOT EXISTS docs_rev_ai AFTER INSERT ON docs BEGIN
+    UPDATE doc_revs SET rev = rev + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS docs_rev_au AFTER UPDATE ON docs BEGIN
+    UPDATE doc_revs SET rev = rev + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS docs_rev_ad AFTER DELETE ON docs BEGIN
+    UPDATE doc_revs SET rev = rev + 1 WHERE id = 1;
+END;
 
 CREATE TABLE IF NOT EXISTS ops (
     id            TEXT PRIMARY KEY,
@@ -70,6 +93,8 @@ CREATE TABLE IF NOT EXISTS ops (
 );
 
 CREATE INDEX IF NOT EXISTS ops_by_doc_epoch ON ops (doc_id, epoch_applied);
+-- proposal_outcomes: "what happened to MY ops" scans by principal
+CREATE INDEX IF NOT EXISTS ops_by_principal ON ops (principal);
 
 -- Review state lives as annotations referencing ops — never baked into content
 -- (PROJECT.md §2). Accepting a yellow is clearing an annotation, not an edit.
@@ -86,6 +111,10 @@ CREATE TABLE IF NOT EXISTS annotations (
 );
 
 CREATE INDEX IF NOT EXISTS annotations_open ON annotations (doc_id, status);
+-- the whole-vault review queue filters on status alone (doc_id IS NULL)
+CREATE INDEX IF NOT EXISTS annotations_by_status ON annotations (status);
+-- op → its annotation: op_statuses, proposal_outcomes, resolve
+CREATE INDEX IF NOT EXISTS annotations_by_op ON annotations (op_id);
 
 -- [[wikilink]] edges (ticket 2.11): to_target is the raw link text, resolved
 -- to docs at query time (Octarine links are workspace paths; match by title).
@@ -292,6 +321,8 @@ CREATE TABLE IF NOT EXISTS hub_forwards (
     doc_id         TEXT NOT NULL,
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+-- prune_hub_forwards deletes by age
+CREATE INDEX IF NOT EXISTS hub_forwards_by_created ON hub_forwards (created_at);
 
 -- Hub side (slice 2): ownership transfers members offered the hub. An admin
 -- accepts or declines; on accept the hub dials the member, pulls the subtree,
@@ -359,8 +390,10 @@ CREATE TABLE IF NOT EXISTS outbound_proposals (
 -- Block embeddings (ask the vault, 2026-09-03): one static-model vector per
 -- live content block, f32 little-endian BLOB. `epoch` is the block epoch the
 -- vector was computed at; a newer block epoch = stale = re-embed that block.
+-- CASCADE: mirror pulls hard-delete blocks (`mirror_replace_blocks`); the
+-- vector must go with its block or the FK fails once a mirror is embedded.
 CREATE TABLE IF NOT EXISTS block_vec (
-    block_id TEXT PRIMARY KEY REFERENCES blocks (id),
+    block_id TEXT PRIMARY KEY REFERENCES blocks (id) ON DELETE CASCADE,
     epoch    INTEGER NOT NULL,
     dim      INTEGER NOT NULL,
     vec      BLOB NOT NULL

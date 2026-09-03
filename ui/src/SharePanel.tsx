@@ -2,10 +2,11 @@
 // new one-time invite link (+ QR) for someone new. The link IS the secret —
 // the UI says so out loud.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import QRCode from 'qrcode'
 import { api, Contact, Doc, DocFederation, HubRow, Share, ShareTrust } from './types'
 import { errText, notify } from './Notice'
+import { copyText } from './Profile'
 import { TRUST_TIERS, trustHint } from './trust'
 import { shortFingerprint } from './shares'
 
@@ -59,6 +60,9 @@ export function TrustControl({
 export function InviteLink({ link }: { link: string }) {
   const [qr, setQr] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+  // an unmount mid-flash used to leave the timer to fire into a dead component
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => clearTimeout(copiedTimer.current ?? undefined), [])
 
   useEffect(() => {
     QRCode.toDataURL(link, { margin: 1, width: 220, color: { dark: '#d6d6dd', light: '#17171d' } })
@@ -67,10 +71,13 @@ export function InviteLink({ link }: { link: string }) {
   }, [link])
 
   const copy = () => {
-    navigator.clipboard.writeText(link).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1800)
-    })
+    copyText(link)
+      .then(() => {
+        setCopied(true)
+        clearTimeout(copiedTimer.current ?? undefined)
+        copiedTimer.current = setTimeout(() => setCopied(false), 1800)
+      })
+      .catch(() => notify('could not copy — select the link text and copy it by hand', 'warn'))
   }
 
   return (
@@ -191,6 +198,8 @@ export default function SharePanel({
   // hub (slice 2): hand the folder over. Armed confirm (two clicks), never window.confirm.
   const [hubRows, setHubRows] = useState<HubRow[]>([])
   const [transferArmed, setTransferArmed] = useState<string | null>(null)
+  const armTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => clearTimeout(armTimer.current ?? undefined), [])
   const [transferring, setTransferring] = useState<string | null>(null)
   useEffect(() => {
     if (hubs.length === 0) return
@@ -206,7 +215,8 @@ export default function SharePanel({
     if (transferring) return
     if (transferArmed !== hub.id) {
       setTransferArmed(hub.id)
-      setTimeout(() => setTransferArmed((a) => (a === hub.id ? null : a)), 6000)
+      clearTimeout(armTimer.current ?? undefined)
+      armTimer.current = setTimeout(() => setTransferArmed((a) => (a === hub.id ? null : a)), 6000)
       return
     }
     setTransferArmed(null)

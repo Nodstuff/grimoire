@@ -19,6 +19,7 @@
 //! the owner's daemon and so does the agent.
 
 use crate::hot::HotState;
+use crate::store_ext::with_store;
 use grimoire_store::{BlockStore, PrincipalKind, SqliteStore};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -283,9 +284,12 @@ pub async fn ask(
 ) -> Result<usize, String> {
     let blocks = numbered_blocks(&hot, doc_id).ok_or("doc is not in a live session")?;
     let who = {
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-        agent_principal(&mut s).map_err(|e| e.to_string())?;
-        participants_line(&hot, doc_id, &s)
+        let hot = hot.clone();
+        with_store(&store, move |s| -> Result<String, String> {
+            agent_principal(s).map_err(|e| e.to_string())?;
+            Ok(participants_line(&hot, doc_id, s))
+        })
+        .await?
     };
     let prompt = compose(&blocks, instruction.trim(), &who);
     presence(&hot, doc_id, true);

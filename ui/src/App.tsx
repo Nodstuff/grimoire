@@ -1,18 +1,37 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DocEditor from './editor/DocEditor'
 import HotEditor, { AgentStatus, HotDoc } from './editor/HotEditor'
-import GraphView from './GraphView'
 import TendPanel from './TendPanel'
 import Gardeners from './Gardeners'
-import CanvasBlock from './CanvasBlock'
 import Sharing from './Sharing'
 import SharePanel from './SharePanel'
 import PaletteShell from './PaletteShell'
 import Profile, { FirstRunName, loadProfile } from './Profile'
-import Trash, { restoreDoc } from './Trash'
+import Trash from './Trash'
 import ImportFolder from './ImportFolder'
 import ReviewRail from './ReviewRail'
+import DocTreePanel from './DocTree'
 import { notify, errText, Notices } from './Notice'
+
+// heavy views load on first use: xyflow + html-to-image (canvas) and
+// force-graph (graph) are not part of the boot bundle
+const CanvasBlock = lazy(() => import('./CanvasBlock'))
+
+/** The doc side panels, owned by App so a doc switch does not close one. */
+type Panel = 'none' | 'history' | 'comments' | 'tend' | 'share' | 'review'
+
+type Stamp = { stamp: number; build?: number; version?: string }
+
+/** Every request on the 2.5s poll is bounded: a hung fetch used to hold
+ * `inFlight` forever, so `misses` stopped counting and the down-detector
+ * never fired for the one failure mode it exists for. */
+const pollTimeout = () => AbortSignal.timeout(4000)
+
+/** An editor with unsaved work, canvas included — a deploy must not reload
+ * over it. Both editors render the same `.save-state` chip. */
+const DIRTY_SELECTOR = '.save-state.dirty, .save-state.saving'
+const GraphView = lazy(() => import('./GraphView'))
+const Loading = () => <div className="lazy-loading">loading…</div>
 import { resolveShortcut } from './shortcuts'
 import { parseDeepLink, scrubDeepLink } from './deeplink'
 import { buildHighlightMap, targetBlockOf } from './review'
@@ -67,6 +86,12 @@ export default function App() {
   const [anchor, setAnchor] = useState<string | null>(null)
   // opened FROM the review queue (or with { review: true }): DocView opens its rail
   const [reviewIntent, setReviewIntent] = useState(false)
+  // which side panel a doc shows. Above DocView because that is keyed by
+  // docId: kept here, the rail the user opened survives a doc switch.
+  const [docPanel, setDocPanel] = useState<Panel>('none')
+  // the poll's own reply carries version/build/git: no page needs its own
+  // /api/buildinfo round-trip for them
+  const [appStamp, setAppStamp] = useState<Stamp | null>(null)
 
   // ⌘[ / ⌘] history over views, browser-style
   const history = useRef<View[]>([{ kind: 'home' }])
@@ -159,7 +184,9 @@ export default function App() {
     let cursor: EventsCursor = INITIAL_CURSOR
     const pollEvents = async () => {
       // older daemon without the route: api() throws, cursor stays put
-      const resp = await api<EventsResponse>(`/api/events?since=${cursor.since}`).catch(() => null)
+      const resp = await api<EventsResponse>(`/api/events?since=${cursor.since}`, {
+        signal: pollTimeout(),
+      }).catch(() => null)
       const r = advanceEvents(cursor, resp)
       cursor = r.cursor
       for (const ev of r.fresh) {
@@ -178,10 +205,15 @@ export default function App() {
     // don't wait a whole tick for the first nudge check
     pollEvents().catch(() => {})
     let misses = 0
+    let inFlight = false
     const t = setInterval(async () => {
+      // a slow daemon must not stack ticks (each one is up to three requests)
+      if (inFlight) return
+      inFlight = true
       try {
-        const r = await api<{ stamp: number }>('/api/stamp')
+        const r = await api<Stamp>('/api/stamp', { signal: pollTimeout() })
         misses = 0
+        setAppStamp(r)
         setDaemonDown(false)
         if (stamp === null) stamp = r.stamp
         else if (r.stamp !== stamp) {
@@ -191,16 +223,23 @@ export default function App() {
           refreshQueue()
         }
         await pollEvents()
-        // deploy landed → reload the bundle (deferred while an editor is dirty)
-        const b = await api<{ build: number }>('/api/buildinfo')
-        if (build === null) build = b.build
-        else if (b.build !== build && !document.querySelector('.save-state.dirty, .save-state.saving')) {
+        // deploy landed → reload the bundle (deferred while an editor is dirty).
+        // Newer daemons carry the build on the stamp; fall back to the
+        // dedicated route only when it is absent.
+        const b =
+          typeof r.build === 'number'
+            ? r.build
+            : (await api<{ build: number }>('/api/buildinfo', { signal: pollTimeout() })).build
+        if (build === null) build = b
+        else if (b !== build && !document.querySelector(DIRTY_SELECTOR)) {
           location.reload()
         }
       } catch {
         // restarting mid-deploy, or actually down — say so after 3 misses
         misses += 1
         if (misses >= 3) setDaemonDown(true)
+      } finally {
+        inFlight = false
       }
     }, 2500)
     return () => clearInterval(t)
@@ -229,6 +268,8 @@ export default function App() {
       if (!action) return
       // Esc isn't a combo — leave its default (blur inputs etc.) intact.
       if (action === 'escape') {
+        // a locked palette (ask in flight, first-run name) owns its own Esc
+        if (document.querySelector('.palette-backdrop[data-locked]')) return
         setPalette(null)
         return
       }
@@ -331,7 +372,7 @@ export default function App() {
         </div>
       )}
       {treeOpen && (
-        <DocTreeNav
+        <DocTreePanel
           docs={docs}
           selected={view.kind === 'doc' ? view.id : null}
           onSelect={openDoc}
@@ -375,6 +416,7 @@ export default function App() {
         )}
         {view.kind === 'doc' && (
           <DocView
+            key={view.id}
             docId={view.id}
             onOpenDoc={openDoc}
             docs={docs}
@@ -382,6 +424,8 @@ export default function App() {
             liveChange={liveChange}
             anchor={anchor}
             reviewIntent={reviewIntent}
+            panel={docPanel}
+            setPanel={setDocPanel}
           />
         )}
         {view.kind === 'review' && (
@@ -402,7 +446,9 @@ export default function App() {
             onOpenProfile={() => setView({ kind: 'profile' })}
           />
         )}
-        {view.kind === 'profile' && <Profile dataVersion={dataVersion} onChanged={setProfile} />}
+        {view.kind === 'profile' && (
+          <Profile dataVersion={dataVersion} onChanged={setProfile} version={appStamp?.version ?? null} />
+        )}
         {view.kind === 'trash' && (
           <Trash
             dataVersion={dataVersion}
@@ -410,7 +456,11 @@ export default function App() {
             onChanged={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
           />
         )}
-        {view.kind === 'graph' && <GraphView onOpenDoc={openDoc} />}
+        {view.kind === 'graph' && (
+          <Suspense fallback={<Loading />}>
+            <GraphView onOpenDoc={openDoc} />
+          </Suspense>
+        )}
       </main>
 
       {profile && !profile.confirmed && <FirstRunName profile={profile} onSaved={setProfile} />}
@@ -785,6 +835,9 @@ function fuzzyMatch(needle: string, hay: string): boolean {
   return false
 }
 
+/** rows rendered in the search palette; arrow keys clamp to these */
+const PALETTE_MAX = 12
+
 function SearchPalette({
   onOpenDoc,
   onClose,
@@ -803,15 +856,26 @@ function SearchPalette({
       setHits([])
       return
     }
+    // latest wins: a slow response for an older query must not overwrite
+    // the hits for what is in the box now
+    let stale = false
     const t = setTimeout(() => {
       api<SearchHit[]>(`/api/search?q=${encodeURIComponent(q)}`)
-        .then(setHits)
-        .catch(() => setHits([]))
+        .then((hs) => {
+          if (!stale) setHits(hs)
+        })
+        .catch(() => {
+          if (!stale) setHits([])
+        })
     }, 120)
-    return () => clearTimeout(t)
+    return () => {
+      stale = true
+      clearTimeout(t)
+    }
   }, [q])
 
   useEffect(() => setSel(0), [hits])
+  const shown = hits.slice(0, PALETTE_MAX)
 
   return (
     <PaletteShell onClose={onClose}>
@@ -821,13 +885,13 @@ function SearchPalette({
         value={q}
         onChange={(e) => setQ(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === 'ArrowDown') setSel((s) => Math.min(s + 1, hits.length - 1))
+          if (e.key === 'ArrowDown') setSel((s) => Math.min(s + 1, shown.length - 1))
           if (e.key === 'ArrowUp') setSel((s) => Math.max(s - 1, 0))
-          if (e.key === 'Enter' && hits[sel]) onOpenDoc(hits[sel].block.doc_id)
+          if (e.key === 'Enter' && shown[sel]) onOpenDoc(shown[sel].block.doc_id)
         }}
       />
       <div className="palette-list">
-        {hits.slice(0, 12).map((h, i) => (
+        {shown.map((h, i) => (
           <div
             key={h.block.id}
             className={`palette-item ${i === sel ? 'sel' : ''}`}
@@ -911,305 +975,6 @@ function NewDocPalette({
 
 /* ---------- tree ---------- */
 
-type Drop = { id: string; mode: 'into' | 'before' | 'after' } | null
-
-function DocTreeNav({
-  docs,
-  selected,
-  onSelect,
-  onClose,
-  onChanged,
-}: {
-  docs: Doc[]
-  selected: string | null
-  onSelect: (id: string) => void
-  onClose: () => void
-  onChanged: () => void
-}) {
-  const childrenOf = useMemo(() => {
-    const m = new Map<string | null, Doc[]>()
-    for (const d of docs) {
-      const k = d.parent_id
-      if (!m.has(k)) m.set(k, [])
-      m.get(k)!.push(d)
-    }
-    return m
-  }, [docs])
-
-  const [openDirs, setOpenDirs] = useState<Set<string>>(new Set())
-  const [dragging, setDragging] = useState<string | null>(null)
-  const [drop, setDrop] = useState<Drop>(null)
-
-  const [pendingMove, setPendingMove] = useState<{
-    dragged: string
-    parent: string | null
-    sortKey: string | null
-    sharedRoot: string
-  } | null>(null)
-
-  const byId = useMemo(() => new Map(docs.map((d) => [d.id, d])), [docs])
-  // the nearest shared ancestor (incl. self) of a doc, if any
-  const sharedRootOf = (id: string | null): Doc | null => {
-    let cur = id ? byId.get(id) : undefined
-    while (cur) {
-      if (cur.is_shared) return cur
-      cur = cur.parent_id ? byId.get(cur.parent_id) : undefined
-    }
-    return null
-  }
-
-  // the actual move; the server may refuse (e.g. a mirror into a shared
-  // subtree) — its error string surfaces as a notice
-  const commitMove = async (dragged: string, parent: string | null, sortKey: string | null) => {
-    try {
-      await api(`/api/doc/${dragged}/move`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ parent_id: parent, sort_key: sortKey }),
-      })
-      onChanged()
-    } catch (e) {
-      notify(String(e))
-    }
-  }
-
-  const doMove = async (dragged: string, target: Doc, mode: 'into' | 'before' | 'after') => {
-    if (dragged === target.id) return
-    let parent: string | null
-    let sortKey: string | null
-    if (mode === 'into') {
-      parent = target.id
-      const kids = childrenOf.get(target.id) ?? []
-      const last = kids[kids.length - 1]
-      sortKey = keyBetween(last?.sort_key ?? null, null)
-      setOpenDirs((s) => new Set(s).add(target.id))
-    } else {
-      parent = target.parent_id
-      const siblings = (childrenOf.get(parent) ?? []).filter((d) => d.id !== dragged)
-      const i = siblings.findIndex((d) => d.id === target.id)
-      const before = mode === 'before' ? siblings[i - 1] : siblings[i]
-      const after = mode === 'before' ? siblings[i] : siblings[i + 1]
-      sortKey = keyBetween(before?.sort_key ?? null, after?.sort_key ?? null)
-    }
-    // moving INTO a shared subtree makes the doc visible to its grantees on
-    // their next pull — loud, explicit confirm (ADR 0002 edge semantics)
-    const wasShared = sharedRootOf(byId.get(dragged)?.parent_id ?? null)
-    const nowShared = sharedRootOf(parent)
-    if (nowShared && nowShared.id !== wasShared?.id) {
-      setPendingMove({ dragged, parent, sortKey, sharedRoot: nowShared.title })
-      return
-    }
-    await commitMove(dragged, parent, sortKey)
-  }
-
-  // window.confirm is a silent no-op in Tauri's webview — arm-then-confirm
-  // inline instead: first click arms the ×, second click within 2.5s deletes
-  const [armed, setArmed] = useState<string | null>(null)
-  const armTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const doDelete = async (d: Doc) => {
-    if (armed !== d.id) {
-      setArmed(d.id)
-      if (armTimer.current) clearTimeout(armTimer.current)
-      armTimer.current = setTimeout(() => setArmed(null), 2500)
-      return
-    }
-    setArmed(null)
-    try {
-      const out = await api<{ deleted: number }>(`/api/doc/${d.id}/delete`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}',
-      })
-      // nothing is gone for good (Trash), but the undo should be one click
-      const inside = out.deleted > 1 ? ` and ${out.deleted - 1} inside it` : ''
-      notify(`deleted “${d.title}”${inside} — click to undo`, 'ok', {
-        ttlMs: 10_000,
-        onClick: () => {
-          restoreDoc(d.id)
-            .then(() => {
-              notify(`restored “${d.title}”`, 'ok')
-              onChanged()
-            })
-            .catch((e) => notify(errText(e)))
-        },
-      })
-    } catch (e) {
-      notify(errText(e))
-    }
-    onChanged()
-  }
-
-  const renderLevel = (parent: string | null, depth: number): React.ReactNode =>
-    (childrenOf.get(parent) ?? []).map((d) => {
-      const isDir = !!childrenOf.get(d.id)?.length
-      const isOpen = openDirs.has(d.id)
-      const dropHere = drop?.id === d.id ? drop.mode : null
-      return (
-        <div key={d.id}>
-          <div
-            className={[
-              'tree-item',
-              selected === d.id ? 'sel' : '',
-              dragging === d.id ? 'dragging' : '',
-              dropHere === 'into' ? 'drop-into' : '',
-              dropHere === 'before' ? 'drop-before' : '',
-              dropHere === 'after' ? 'drop-after' : '',
-            ].join(' ')}
-            style={{ paddingLeft: 8 }}
-            draggable
-            onDragStart={(e) => {
-              setDragging(d.id)
-              e.dataTransfer.effectAllowed = 'move'
-            }}
-            onDragEnd={() => {
-              setDragging(null)
-              setDrop(null)
-            }}
-            onDragOver={(e) => {
-              if (!dragging || dragging === d.id) return
-              e.preventDefault()
-              const r = e.currentTarget.getBoundingClientRect()
-              const y = (e.clientY - r.top) / r.height
-              setDrop({ id: d.id, mode: y < 0.3 ? 'before' : y > 0.7 ? 'after' : 'into' })
-            }}
-            onDragLeave={() => setDrop((cur) => (cur?.id === d.id ? null : cur))}
-            onDrop={(e) => {
-              e.preventDefault()
-              if (dragging && drop?.id === d.id) doMove(dragging, d, drop.mode)
-              setDrop(null)
-              setDragging(null)
-            }}
-            onClick={() => {
-              if (isDir)
-                setOpenDirs((s) => {
-                  const n = new Set(s)
-                  if (n.has(d.id)) n.delete(d.id)
-                  else n.add(d.id)
-                  return n
-                })
-              onSelect(d.id)
-            }}
-          >
-            <span className={`tree-icon ${d.is_canvas ? 'canvas' : ''}`}>
-              {isDir ? (
-                <svg width="10" height="10" viewBox="0 0 10 10" className={isOpen ? 'chev open' : 'chev'}>
-                  <path d="M3 1.5 L7 5 L3 8.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-                </svg>
-              ) : d.is_canvas ? (
-                '▨'
-              ) : (
-                ''
-              )}
-            </span>
-            <span className="tree-title">{d.title}</span>
-            {d.is_tended && <span className="tend-dot" title="tended by agents" />}
-            {d.mirror_permission && !d.from_hub && (
-              <span className="mirror-badge" title={`shared with you (${d.mirror_permission})`}>⇄</span>
-            )}
-            {d.from_hub && (
-              <span
-                className="mirror-badge hub"
-                title={d.origin_owner_name ? `relayed by the hub · owned by ${d.origin_owner_name}` : 'a hub folder'}
-              >
-                ⌂
-              </span>
-            )}
-            {d.is_shared && !d.published_to && <span className="shared-badge" title="you share this subtree">↗</span>}
-            {d.published_to && !d.mirror_permission && (
-              <span className="shared-badge hub" title={`published to ${d.published_to}`}>⌂</span>
-            )}
-            {!d.mirror_permission && (
-            <button
-              className={`tree-delete ${armed === d.id ? 'armed' : ''}`}
-              title={armed === d.id ? 'click again to delete' : 'delete'}
-              onClick={(e) => {
-                e.stopPropagation()
-                doDelete(d)
-              }}
-            >
-              {armed === d.id ? 'sure?' : '×'}
-            </button>
-            )}
-          </div>
-          {isDir && isOpen && (
-            <div className="tree-children">{renderLevel(d.id, depth + 1)}</div>
-          )}
-        </div>
-      )
-    })
-
-  return (
-    <aside className="sidebar">
-      <div className="sidebar-head">
-        <span>files</span>
-        <button onClick={onClose}>⌘T</button>
-      </div>
-      {pendingMove && (
-        <div className="move-confirm">
-          <div>
-            “{byId.get(pendingMove.dragged)?.title ?? '?'}” will become visible to
-            everyone “{pendingMove.sharedRoot}” is shared with
-          </div>
-          <div className="move-confirm-actions">
-            <button
-              className="accept"
-              onClick={() => {
-                const m = pendingMove
-                setPendingMove(null)
-                commitMove(m.dragged, m.parent, m.sortKey)
-              }}
-            >
-              share it
-            </button>
-            <button className="decline" onClick={() => setPendingMove(null)}>
-              cancel
-            </button>
-          </div>
-        </div>
-      )}
-      <div
-        className="tree-root"
-        onDragOver={(e) => {
-          // dropping on empty space = move to root
-          if (dragging && e.target === e.currentTarget) e.preventDefault()
-        }}
-        onDrop={(e) => {
-          if (dragging && e.target === e.currentTarget) {
-            commitMove(dragging, null, null)
-          }
-        }}
-      >
-        {renderLevel(null, 0)}
-      </div>
-    </aside>
-  )
-}
-
-const DIGITS = '0123456789abcdefghijklmnopqrstuvwxyz'
-function keyBetween(a: string | null, b: string | null): string {
-  const av = a ?? ''
-  let out = ''
-  let i = 0
-  for (;;) {
-    const da = i < av.length ? DIGITS.indexOf(av[i]) : 0
-    const db = b == null ? 36 : i < b.length ? DIGITS.indexOf(b[i]) : 0
-    if (da === db) {
-      out += DIGITS[da]
-      i++
-      continue
-    }
-    if (db - da > 1) return out + DIGITS[(da + db) >> 1]
-    out += DIGITS[da]
-    i++
-    for (;;) {
-      const d = i < av.length ? DIGITS.indexOf(av[i]) : 0
-      if (36 - d > 1) return out + DIGITS[(d + 36) >> 1]
-      out += DIGITS[d]
-      i++
-    }
-  }
-}
-
 /* ---------- doc view ---------- */
 
 /** Click-to-rename doc title. Inbound [[wikilinks]] resolve by title and are
@@ -1217,22 +982,32 @@ function keyBetween(a: string | null, b: string | null): string {
 function DocTitle({ doc, onRenamed }: { doc: Doc; onRenamed: () => void }) {
   const [editing, setEditing] = useState(false)
   const [value, setValue] = useState(doc.title)
+  // Enter unmounts the input, whose blur fires save again: one rename only
+  const saving = useRef(false)
 
   const save = async () => {
+    if (saving.current) return
+    saving.current = true
     setEditing(false)
     const title = value.trim()
     if (!title || title === doc.title) {
       setValue(doc.title)
+      saving.current = false
       return
     }
-    await api(`/api/doc/${doc.id}/rename`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title }),
-    }).catch((e) => {
+    try {
+      await api(`/api/doc/${doc.id}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      })
+    } catch (e) {
       console.error(e)
+      notify(`rename failed: ${errText(e)}`, 'warn')
       setValue(doc.title)
-    })
+    } finally {
+      saving.current = false
+    }
     onRenamed()
   }
 
@@ -1284,6 +1059,8 @@ function DocView({
   liveChange = null,
   anchor,
   reviewIntent = false,
+  panel,
+  setPanel,
 }: {
   docId: string
   onOpenDoc: OpenDoc
@@ -1295,20 +1072,38 @@ function DocView({
   anchor?: string | null
   /** opened from the review queue: open the rail on load */
   reviewIntent?: boolean
+  /** owned by App so it outlives this component's per-doc remount */
+  panel: Panel
+  setPanel: (p: Panel) => void
 }) {
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
   const [fed, setFed] = useState<DocFederation | null>(null)
   const [hot, setHot] = useState<HotDoc | null>(null)
   const mirrorRef = useRef<unknown>(null)
-  const [panel, setPanel] = useState<'none' | 'history' | 'comments' | 'tend' | 'share' | 'review'>('none')
+  // stale guard: DocView is keyed by docId (one instance per open doc), so a
+  // fetch that resolves after unmount — or after a doc switch — is for a doc
+  // that is no longer on screen. `gen` bumps on every docId change too, in
+  // case a caller ever reuses the instance.
+  const gen = useRef(0)
+  useEffect(() => {
+    const g = ++gen.current
+    return () => {
+      if (gen.current === g) gen.current++
+    }
+  }, [docId])
+  const fresh = useCallback(
+    (g: number) => gen.current === g,
+    [],
+  )
   // open review items for THIS doc (yellow = applied+flagged, red = parked)
   const [reviewItems, setReviewItems] = useState<QueueRow[]>([])
   const loadReview = useCallback(() => {
+    const g = gen.current
     api<QueueRow[]>(`/api/doc/${docId}/review`)
-      .then((r) => setReviewItems(Array.isArray(r) ? r : []))
-      .catch(() => setReviewItems([]))
-  }, [docId])
+      .then((r) => fresh(g) && setReviewItems(Array.isArray(r) ? r : []))
+      .catch(() => fresh(g) && setReviewItems([]))
+  }, [docId, fresh])
   const [selBlock, setSelBlock] = useState<string | null>(null)
   const [selRect, setSelRect] = useState<{ x: number; y: number } | null>(null)
   const [commentTarget, setCommentTarget] = useState<string | null>(null)
@@ -1335,14 +1130,23 @@ function DocView({
   }, [])
 
   const loadTree = useCallback(() => {
-    api<DocTree>(`/api/doc/${docId}`).then(setTree).catch(console.error)
-    api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => setBacklinks([]))
-    api<DocFederation>(`/api/doc/${docId}/federation`).then(setFed).catch(() => setFed(null))
-  }, [docId])
+    const g = gen.current
+    api<DocTree>(`/api/doc/${docId}`)
+      .then((t) => fresh(g) && setTree(t))
+      .catch(console.error)
+    api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
+      .then((b) => fresh(g) && setBacklinks(b))
+      .catch(() => fresh(g) && setBacklinks([]))
+    api<DocFederation>(`/api/doc/${docId}/federation`)
+      .then((f) => fresh(g) && setFed(f))
+      .catch(() => fresh(g) && setFed(null))
+  }, [docId, fresh])
 
   useEffect(() => {
     setTree(null)
-    setPanel(reviewIntent ? 'review' : 'none')
+    // the panel choice is the user's, not the doc's: only a review-queue
+    // open overrides it (the same rule as the reviewIntent effect below)
+    if (reviewIntent) setPanel('review')
     setCommentTarget(null)
     setHot(null)
     setHotCanWrite(undefined)
@@ -1380,17 +1184,19 @@ function DocView({
   treeRef.current = tree
   const afterResolve = useCallback(() => {
     loadReview()
+    const g = gen.current
     api<DocTree>(`/api/doc/${docId}`)
-      .then((fresh) => {
+      .then((next) => {
+        if (!fresh(g)) return
         const cur = treeRef.current
-        if (!cur || fresh.doc.current_epoch !== cur.doc.current_epoch) {
-          ownEpoch.current = Math.max(ownEpoch.current, fresh.doc.current_epoch)
+        if (!cur || next.doc.current_epoch !== cur.doc.current_epoch) {
+          ownEpoch.current = Math.max(ownEpoch.current, next.doc.current_epoch)
           setEditorGen((g) => g + 1)
         }
-        setTree(fresh)
+        setTree(next)
       })
       .catch(() => {})
-  }, [docId, loadReview])
+  }, [docId, loadReview, fresh])
 
   const highlightMap = useMemo(() => buildHighlightMap(reviewItems), [reviewItems])
 
@@ -1400,21 +1206,27 @@ function DocView({
   const refreshFromStore = useCallback(() => {
     const cur = treeRef.current
     if (!cur) return
+    const g = gen.current
     api<DocTree>(`/api/doc/${docId}`)
-      .then((fresh) => {
+      .then((next) => {
+        if (!fresh(g)) return
         const known = Math.max(cur.doc.current_epoch, ownEpoch.current)
         const dirty = document.querySelector('.save-state.dirty, .save-state.saving')
-        if (fresh.doc.current_epoch > known && !dirty) {
-          setTree(fresh)
+        if (next.doc.current_epoch > known && !dirty) {
+          setTree(next)
           setEditorGen((g) => g + 1)
-        } else if (fresh.doc.status !== cur.doc.status) {
-          setTree(fresh)
+        } else if (next.doc.status !== cur.doc.status) {
+          setTree(next)
         }
-        api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => {})
-        api<DocFederation>(`/api/doc/${docId}/federation`).then(setFed).catch(() => {})
+        api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
+          .then((b) => fresh(g) && setBacklinks(b))
+          .catch(() => {})
+        api<DocFederation>(`/api/doc/${docId}/federation`)
+          .then((f) => fresh(g) && setFed(f))
+          .catch(() => {})
       })
       .catch((e) => console.warn('doc refresh failed', docId, e))
-  }, [docId])
+  }, [docId, fresh])
   useEffect(() => {
     if (dataVersion === 0) return
     refreshFromStore()
@@ -1620,9 +1432,10 @@ function DocView({
   const liveHeldOff = useRef<string | null>(null)
   useEffect(() => {
     if (!tree || hot) return
+    const g = gen.current
     api<HotStatus>(`/api/doc/${docId}/hot/status`)
       .then((st) => {
-        if (!editable) return
+        if (!editable || !fresh(g)) return
         if (st.hot) {
           // someone else went live while this cold editor holds unsaved text.
           // Swapping editors now would fire the cold save into the freeze and
@@ -1710,7 +1523,9 @@ function DocView({
           <DocTitle doc={tree.doc} onRenamed={loadTree} />
           <span className="meta">canvas · epoch {tree.doc.current_epoch}</span>
         </div>
-        <CanvasBlock block={canvases[0]} epoch={tree.doc.current_epoch} onSaved={loadTree} full />
+        <Suspense fallback={<Loading />}>
+          <CanvasBlock block={canvases[0]} epoch={tree.doc.current_epoch} onSaved={loadTree} full />
+        </Suspense>
       </div>
     )
   }
@@ -1858,16 +1673,23 @@ function DocView({
             setHotCanWrite(undefined)
             setViewersWrite(undefined)
             loadReview()
+            const g = gen.current
             api<DocTree>(`/api/doc/${docId}`)
-              .then((fresh) => {
-                ownEpoch.current = Math.max(ownEpoch.current, fresh.doc.current_epoch)
-                setTree(fresh)
+              .then((next) => {
+                if (!fresh(g)) return
+                ownEpoch.current = Math.max(ownEpoch.current, next.doc.current_epoch)
+                setTree(next)
                 setHot(null)
                 setEditorGen((g) => g + 1)
-                api<SearchHit[]>(`/api/doc/${docId}/backlinks`).then(setBacklinks).catch(() => {})
-                api<DocFederation>(`/api/doc/${docId}/federation`).then(setFed).catch(() => {})
+                api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
+                  .then((b) => fresh(g) && setBacklinks(b))
+                  .catch(() => {})
+                api<DocFederation>(`/api/doc/${docId}/federation`)
+                  .then((f) => fresh(g) && setFed(f))
+                  .catch(() => {})
               })
               .catch((e) => {
+                if (!fresh(g)) return
                 notify(`session ended but the doc could not be reloaded: ${errText(e)}`)
                 setHot(null)
                 loadTree()
@@ -1881,7 +1703,9 @@ function DocView({
         reviewMap={highlightMap}
         // a relayed doc proposes through the hub, which carries it to the owner
         mode={mirror ? (mirror.permission === 'propose' ? 'propose' : 'readonly') : 'direct'}
-        onSaved={(e) => {
+        onSaved={(e, savedDocId) => {
+          // the unmount flush of a PREVIOUS doc's editor reports its own id
+          if (savedDocId !== docId) return
           ownEpoch.current = Math.max(ownEpoch.current, e)
         }}
         onProposed={() => {

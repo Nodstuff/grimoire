@@ -73,6 +73,24 @@ wait_for() {
 doc_has()            { api "$1" "$2" GET "/api/doc/$3" | jq -r --arg t "$4" '[.roots[].block.content] | index($t) // empty'; }
 hub_transfer_state() { hub GET /admin/hub/transfers | jq -r --arg id "$1" '.[] | select(.id==$id) | .state'; }
 
+# join_hub NAME PORT EXPECTED_MEMBERSHIP — a fresh peer is not dialable the instant
+# it boots (its address has to reach mDNS or the n0 DNS first), and the daemon
+# answers that honestly by QUEUEING the join and retrying on its own clock. The
+# smoke must not read that as a failure: mint a fresh invite and try again until
+# one lands. Local multicast being down (VPN, a flapping interface) is exactly
+# when this matters.
+join_hub() {
+  local name=$1 port=$2 want=$3 link out
+  for _ in $(seq 1 12); do
+    link=$(hub POST /admin/hub/invite | jq -r .link)
+    out=$(api "$name" "$port" POST /admin/join "$(jq -cn --arg l "$link" '{link:$l}')" || true)
+    if printf '%s' "$out" | jq -e --arg m "$want" '.joined.membership==$m' >/dev/null 2>&1; then return 0; fi
+    sleep 2
+  done
+  echo "   last join answer: $out"
+  fail "$name could not join the hub (peer never became dialable)"
+}
+
 step "start hub (Team), alice, bob"
 start hub   $HUB_PORT --hub --name Team
 start alice $ALICE_PORT
@@ -83,10 +101,8 @@ bob   POST /api/profile '{"name":"bob"}'   >/dev/null
 ok "scratch dirs under $ROOT"
 
 step "alice joins (first contact → admin), bob joins (pending) and is approved by alice"
-LINK=$(hub POST /admin/hub/invite | jq -r .link)
-alice POST /admin/join "$(jq -cn --arg l "$LINK" '{link:$l}')" | jqe '.joined.membership=="active"' && ok "alice active (admin)"
-LINK=$(hub POST /admin/hub/invite | jq -r .link)
-bob POST /admin/join "$(jq -cn --arg l "$LINK" '{link:$l}')" | jqe '.joined.membership=="pending"' && ok "bob pending"
+join_hub alice $ALICE_PORT active  && ok "alice active (admin)"
+join_hub bob   $BOB_PORT   pending && ok "bob pending"
 HUB_ON_ALICE=$(alice GET /admin/hubs | jq -r '.[0].contact_id')
 HUB_ON_BOB=$(bob GET /admin/hubs | jq -r '.[0].contact_id')
 BOB_KEY=$(bob GET /api/profile | jq -r .node_id)

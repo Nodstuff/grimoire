@@ -5,7 +5,7 @@
 // first invite lives on the doc itself (SharePanel) — re-inviting a revoked
 // share lives here.
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ActivityItem, api, Contact, Doc, HubMember, HubMembersResponse, HubRow, HubTransfer, MirrorRow, Neighbour, PendingJoin, Profile, QueueRow, Share, ShareOffer } from './types'
 import { describeChange } from './review'
 import { errText, notify } from './Notice'
@@ -48,6 +48,10 @@ function ArmedButton({
   title?: string
 }) {
   const [armed, setArmed] = useState(false)
+  // the disarm timer must not outlive the button (a re-render of the shares
+  // list unmounts plenty of them)
+  const disarm = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => clearTimeout(disarm.current ?? undefined), [])
   return (
     <button
       className={`${className} ${armed ? 'armed' : ''}`}
@@ -55,7 +59,8 @@ function ArmedButton({
       onClick={() => {
         if (!armed) {
           setArmed(true)
-          setTimeout(() => setArmed(false), 2500)
+          clearTimeout(disarm.current ?? undefined)
+          disarm.current = setTimeout(() => setArmed(false), 2500)
           return
         }
         setArmed(false)

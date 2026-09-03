@@ -22,6 +22,7 @@ use super::client::{pull_share, request};
 use super::hub;
 use super::wire::{Refusal, RefusalCode, Request, Response};
 use crate::hot::HotState;
+use crate::store_ext::with_store;
 use anyhow::{Context, Result};
 use grimoire_store::{
     BlockStore, Contact, HubTransferState, SharePermission, ShareState, SqliteStore,
@@ -111,7 +112,10 @@ pub fn member_flip(
         .into());
     };
     let subtree = store.doc_subtree_ids(root_doc)?;
-    // already ours-as-a-mirror: the hub is retrying — answer the same way
+    // already ours-as-a-mirror: the hub is retrying — answer the same way.
+    // 0.7.2: "already" is judged on the root only, but the flip below runs
+    // over the WHOLE subtree regardless, so a flip that died half-way (root
+    // done, children not) is completed by the retry instead of frozen.
     let already = store
         .get_mirror(root_doc)?
         .is_some_and(|m| m.owner == hub.id);
@@ -151,17 +155,24 @@ pub fn member_flip(
             sh.id
         }
     };
-    if !already {
-        for id in &subtree {
-            let d = store.get_doc(*id)?;
-            store.upsert_mirror(*id, hub.id, membership, d.current_epoch, SharePermission::Propose)?;
-            store.set_mirror_owner_epoch(*id, d.current_epoch)?;
-            store.set_mirror_origin(*id, None, None)?;
+    let mut flipped = 0usize;
+    for id in &subtree {
+        // idempotent: a doc already mirrored from the hub keeps its cursor
+        if store.get_mirror(*id)?.is_some_and(|m| m.owner == hub.id) {
+            continue;
         }
+        let d = store.get_doc(*id)?;
+        store.upsert_mirror(*id, hub.id, membership, d.current_epoch, SharePermission::Propose)?;
+        store.set_mirror_owner_epoch(*id, d.current_epoch)?;
+        store.set_mirror_origin(*id, None, None)?;
+        flipped += 1;
+    }
+    if flipped > 0 {
         tracing::info!(
             hub = hub.petname,
             root = %root_doc,
-            docs = subtree.len(),
+            docs = flipped,
+            completing = already,
             "transfer: folder handed to the hub; local copy is now a mirror"
         );
     }
@@ -173,6 +184,175 @@ pub fn member_flip(
     })
 }
 
+/// Settings key marking a member's out-transfer as acknowledged by the hub:
+/// either the hub answered `Noted` to our `TransferReady` re-announcement, or
+/// it pulled the transfer's share, which only happens once it has our
+/// `TransferReady` in hand.
+fn acked_key(transfer: Uuid) -> String {
+    format!("transfer.acked.{transfer}")
+}
+
+/// Settings key holding the unix second before which we must not re-announce
+/// a given out-transfer. Set when the hub cannot parse `TransferReady` at all
+/// (a hub older than 0.7.2), which no amount of prompt retrying will fix.
+/// A settings marker counts as set only when it has a value: an empty string
+/// reads as absent, so a marker can be cleared without a delete.
+fn marker_set(store: &SqliteStore, key: &str) -> bool {
+    matches!(store.get_setting(key), Ok(Some(v)) if !v.is_empty())
+}
+
+fn retry_after_key(transfer: Uuid) -> String {
+    format!("transfer.ready_retry_after.{transfer}")
+}
+
+/// A hub that predates 0.7.2 has no `TransferReady` request: it fails to
+/// decode the frame and refuses `BadRequest`. Back that transfer off to
+/// roughly hourly instead of warning every sweep.
+const OLD_HUB_BACKOFF_SECS: i64 = 3600;
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Back a re-announcement off to roughly hourly because the hub could not
+/// decode it. Returns true the first time, so the log line is written once.
+pub fn back_off_old_hub(store: &mut SqliteStore, transfer: Uuid) -> bool {
+    let first = !marker_set(store, &retry_after_key(transfer));
+    let _ = store.set_setting(
+        &retry_after_key(transfer),
+        &(now_secs() + OLD_HUB_BACKOFF_SECS).to_string(),
+    );
+    first
+}
+
+/// Member side: the hub pulling the share of a flipped out-transfer proves it
+/// received our `TransferReady`, so the sweep need not re-announce that one.
+/// Saves a round trip per completed transfer. Cheap and idempotent: at most
+/// one settings write, and only for a share whose root is a done out-transfer
+/// to the peer doing the pulling.
+pub fn note_transfer_pulled(store: &mut SqliteStore, puller: &Contact, share_root: Uuid) {
+    let acked: Vec<Uuid> = store
+        .list_doc_transfers()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| {
+            t.direction == TransferDirection::Out
+                && t.state == "done"
+                && t.counterparty == puller.id
+                && t.root_doc == share_root
+        })
+        .map(|t| t.id)
+        .filter(|id| !marker_set(store, &acked_key(*id)))
+        .collect();
+    for id in acked {
+        let _ = store.set_setting(&acked_key(id), "1");
+    }
+}
+
+/// Member sweep (0.7.2): a flipped transfer whose `TransferReady` reply the
+/// hub never got is stuck — our copy is a mirror of a hub that does not know
+/// it owns the folder. Re-announce every flipped, unacknowledged out-transfer
+/// with `Request::TransferReady`; `Noted` marks it acknowledged. `addr`
+/// overrides the dial-by-pubkey (tests). Returns how many were acknowledged.
+pub async fn resend_ready(
+    endpoint: &Endpoint,
+    store: &Arc<Mutex<SqliteStore>>,
+    addr: Option<EndpointAddr>,
+) -> usize {
+    let due: Vec<(Uuid, Contact, Uuid, Uuid)> = with_store(store, |s| {
+        let contacts = s.list_contacts().unwrap_or_default();
+        s.list_doc_transfers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.direction == TransferDirection::Out && t.state == "done")
+            .filter(|t| !marker_set(s, &acked_key(t.id)))
+            // a hub that cannot decode TransferReady is retried hourly, not every sweep
+            .filter(|t| match s.get_setting(&retry_after_key(t.id)) {
+                Ok(Some(v)) => v.parse::<i64>().unwrap_or(0) <= now_secs(),
+                _ => true,
+            })
+            .filter_map(|t| {
+                let hub = contacts.iter().find(|c| c.id == t.counterparty && c.is_hub && !c.revoked)?.clone();
+                // still flipped: the root is our mirror of that hub
+                s.get_mirror(t.root_doc).ok().flatten().filter(|m| m.owner == hub.id)?;
+                let share = s
+                    .list_shares()
+                    .ok()?
+                    .into_iter()
+                    .find(|sh| sh.root_doc == t.root_doc && sh.contact == Some(hub.id) && sh.state == ShareState::Active)?;
+                Some((t.id, hub, t.root_doc, share.id))
+            })
+            .collect()
+    })
+    .await;
+    let mut acked = 0;
+    for (transfer, hub, root, _share) in due {
+        let addr = match &addr {
+            Some(a) => a.clone(),
+            None => match hub.pubkey.parse::<iroh::EndpointId>() {
+                Ok(id) => EndpointAddr::from(id),
+                Err(_) => continue,
+            },
+        };
+        let req = Request::TransferReady {
+            root_doc: root.to_string(),
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(15), request(endpoint, addr, req)).await {
+            Ok(Ok(Response::Noted)) => {
+                with_store(store, move |s| s.set_setting(&acked_key(transfer), "1").ok()).await;
+                tracing::info!(hub = hub.petname, %root, "transfer: hub confirmed it owns the folder");
+                acked += 1;
+            }
+            Ok(Ok(Response::Refused { code: RefusalCode::Busy, .. })) => {
+                tracing::info!(hub = hub.petname, %root, "transfer: hub is taking the folder over; will confirm next sweep");
+            }
+            Ok(Ok(Response::Refused { code: RefusalCode::BadRequest, .. })) => {
+                // the frame did not decode: a hub older than 0.7.2. Say so once
+                // (the first sweep sets the marker) and slow right down.
+                let first = with_store(store, move |s| back_off_old_hub(s, transfer)).await;
+                if first {
+                    tracing::info!(
+                        hub = hub.petname,
+                        %root,
+                        "transfer: hub predates 0.7.2 and cannot take the re-announcement; will retry hourly"
+                    );
+                }
+            }
+            Ok(Ok(other)) => tracing::warn!(hub = hub.petname, %root, "transfer: re-announce not taken: {other:?}"),
+            Ok(Err(e)) => tracing::debug!(hub = hub.petname, %root, "transfer: re-announce failed: {e:#}"),
+            Err(_) => tracing::debug!(hub = hub.petname, %root, "transfer: re-announce timed out"),
+        }
+    }
+    acked
+}
+
+/// Hub side of `Request::TransferReady` (0.7.2). `Ok(Some(id))` = an
+/// accepted transfer from this member for this root that still needs the
+/// take-over (the caller runs `hub_complete` off-thread and answers `Busy`);
+/// `Ok(None)` = already done, answer `Noted`. Runs under the store lock.
+pub fn hub_ready_ping(store: &SqliteStore, member: &Contact, root_doc: Uuid) -> Result<Option<Uuid>> {
+    let mut mine: Vec<_> = store
+        .list_hub_transfers()?
+        .into_iter()
+        .filter(|t| t.member_contact == member.id && t.root_doc == root_doc)
+        .collect();
+    if mine.iter().any(|t| t.state == HubTransferState::Done) {
+        return Ok(None);
+    }
+    mine.sort_by(|a, b| b.at.cmp(&a.at));
+    match mine.into_iter().find(|t| t.state == HubTransferState::Accepted) {
+        Some(t) => Ok(Some(t.id)),
+        None => Err(Refusal::new(
+            RefusalCode::NotAllowed,
+            "no accepted transfer of that folder from you",
+        )
+        .into()),
+    }
+}
+
 /// Hub side, after an admin accepted: dial the member, and on `TransferReady`
 /// pull the subtree and take it over. `addr` is how we reach the member —
 /// by pubkey in production (they dialed us to offer), explicit in tests.
@@ -182,17 +362,17 @@ pub async fn hub_complete(
     transfer_id: Uuid,
     addr: Option<EndpointAddr>,
 ) -> Result<()> {
-    let (hub_cfg, t, member) = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
-        let hub_cfg = hub::config(&s).context("not a hub")?;
+    let (hub_cfg, t, member) = with_store(store, move |s| -> Result<_> {
+        let hub_cfg = hub::config(s).context("not a hub")?;
         let t = s.get_hub_transfer(transfer_id)?;
         let member = s
             .list_contacts()?
             .into_iter()
             .find(|c| c.id == t.member_contact)
             .context("member contact is gone")?;
-        (hub_cfg, t, member)
-    };
+        Ok((hub_cfg, t, member))
+    })
+    .await?;
     if t.state == HubTransferState::Done {
         return Ok(());
     }
@@ -221,8 +401,7 @@ pub async fn hub_complete(
         Ok(Ok(Response::TransferReady { share_id })) => share_id.parse().context("member sent a bad share id")?,
         Ok(Ok(Response::Refused { reason, code })) => {
             // back to offered so an admin can try again once it is idle
-            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-            s.set_hub_transfer_state(transfer_id, HubTransferState::Offered).ok();
+            with_store(store, move |s| s.set_hub_transfer_state(transfer_id, HubTransferState::Offered).ok()).await;
             return Err(Refusal::new(code, format!("{} refused: {reason}", member.petname)).into());
         }
         Ok(Ok(other)) => anyhow::bail!("unexpected reply from {}: {other:?}", member.petname),
@@ -233,8 +412,7 @@ pub async fn hub_complete(
         .await
         .context("pulling the folder from the member")?;
     tracing::info!(root = %t.root_doc, docs = sum.changed, "transfer: folder pulled from the member");
-    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-    hub_flip(&mut s, &hub_cfg, &member, transfer_id, share_id)
+    with_store(store, move |s| hub_flip(s, &hub_cfg, &member, transfer_id, share_id)).await
 }
 
 /// Hub side: the pulled mirrors become the hub's own docs. Idempotent.

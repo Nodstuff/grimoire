@@ -2720,3 +2720,561 @@ async fn transfer_is_refused_while_a_doc_is_live_or_has_edits_waiting_and_declin
     let res = request(&carol.ep, h.addr.clone(), Request::TransferOffer { root_doc: plan.to_string(), title: "x".into(), doc_count: 1 }).await.unwrap();
     assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
 }
+
+/// The accept loop holds one semaphore permit per live connection: at the cap
+/// the next connection is dropped at accept rather than queued, and the daemon
+/// serves again as soon as a permit frees.
+#[tokio::test]
+async fn federation_connections_are_capped() {
+    use super::client::request_with_timeout;
+    let short = std::time::Duration::from_secs(3);
+    let mut s = SqliteStore::open_in_memory().unwrap();
+    s.create_principal(PrincipalKind::Human, "server", None).unwrap();
+    let store = Arc::new(Mutex::new(s));
+    let server = local_endpoint().await;
+    let addr = direct_addr(&server);
+    let hot = scratch_hot();
+    tokio::spawn(super::server::serve_with_cap(server, store, hot, Runtime::default(), 1));
+
+    // one live connection takes the only permit (held for the connection's life)
+    let first = local_endpoint().await;
+    let conn = first.connect(addr.clone(), ALPN).await.unwrap();
+    {
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let out = serde_json::to_vec(&Frame { v: super::wire::PROTOCOL_VERSION, msg: Request::Ping }).unwrap();
+        send.write_all(&out).await.unwrap();
+        send.finish().unwrap();
+        let raw = recv.read_to_end(MAX_FRAME).await.unwrap();
+        // a stranger's Ping is refused, but it IS served: the permit is taken
+        let f: Frame<Response> = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(refusal_code(&f.msg), RefusalCode::UnknownPeer, "{:?}", f.msg);
+    }
+
+    // the second is dropped at accept, not queued behind the first
+    let second = local_endpoint().await;
+    let err = request_with_timeout(&second, addr.clone(), Request::Ping, short).await.unwrap_err();
+    tracing::debug!("capped: {err:#}");
+
+    // freeing the permit lets the daemon serve again
+    conn.close(0u32.into(), b"done");
+    drop(conn);
+    let mut served = false;
+    for _ in 0..40 {
+        if request_with_timeout(&second, addr.clone(), Request::Ping, short).await.is_ok() {
+            served = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(served, "the daemon serves again once the permit is free");
+}
+
+/// `request_with_timeout` is the only thing standing between a loop and a
+/// peer that accepts the dial and then never answers: the call must come back
+/// with a timeout error, not hang, and not be mistaken for a refusal.
+#[tokio::test]
+async fn a_peer_that_accepts_and_never_answers_times_out() {
+    use super::client::request_with_timeout;
+    let stalled = local_endpoint().await;
+    let addr = direct_addr(&stalled);
+    // accept the connection and the stream, read the request, answer nothing
+    tokio::spawn(async move {
+        while let Some(incoming) = stalled.accept().await {
+            tokio::spawn(async move {
+                let Ok(conn) = incoming.await else { return };
+                let Ok((_send, mut recv)) = conn.accept_bi().await else { return };
+                let _ = recv.read_to_end(MAX_FRAME).await;
+                // hold the connection open forever
+                std::future::pending::<()>().await
+            });
+        }
+    });
+    let caller = local_endpoint().await;
+    let started = std::time::Instant::now();
+    let err = request_with_timeout(&caller, addr, Request::Ping, std::time::Duration::from_millis(300))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("timed out"), "{err:#}");
+    assert!(err.downcast_ref::<super::wire::Refusal>().is_none(), "a stall is not a refusal");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "returned promptly: {:?}", started.elapsed());
+}
+
+/// 0.7.2 hardening: a member offering a share whose root is ALREADY a mirror
+/// the hub holds from another member is refused (`RootConflict`) on the
+/// automatic hub path; the first member's mirror and contact are untouched.
+#[tokio::test]
+async fn hub_refuses_a_publication_that_names_another_members_root() {
+    use super::client::{JoinOrigin, join_at_from};
+    let (h, _cfg, alice, bob) = team().await;
+    // alice publishes "Notes"; the hub mirrors it from her
+    let notes = alice.doc("Notes", None, "alice's notes");
+    let hub_on_alice = alice.contact_of(&h);
+    let (share, minted) = {
+        let mut s = alice.store.lock().unwrap();
+        let (share, minted) = super::client::mint_invite_full(&mut s, &alice.pubkey(), notes, SharePermission::Propose).unwrap();
+        s.set_invite_offered_to(share.id, hub_on_alice.id).unwrap();
+        (share, minted)
+    };
+    let res = request(&alice.ep, h.addr.clone(), Request::Offer {
+        share: share.id.to_string(), root_title: "Notes".into(), permission: "propose".into(),
+        secret: minted.secret.clone(), expires_at: minted.expires_at.clone(),
+    }).await.unwrap();
+    assert_eq!(res, Response::Noted);
+    eventually("hub accepts alice's publication", || {
+        h.store.lock().unwrap().get_mirror(notes).unwrap().is_some_and(|m| m.synced_epoch > 0)
+    }).await;
+    let alice_on_hub = h.contact_of(&alice);
+    let bob_on_hub = h.contact_of(&bob);
+
+    // bob forges a doc under alice's root id and offers it to the hub
+    let (bob_share, bob_minted) = {
+        let mut s = bob.store.lock().unwrap();
+        s.create_doc_with_id(notes, "Notes", None, bob.human).unwrap();
+        super::client::mint_invite_full(&mut s, &bob.pubkey(), notes, SharePermission::Propose).unwrap()
+    };
+    // what `hub::accept_publication` builds from the stored offer
+    let ticket = Ticket::new(bob.pubkey(), bob_share.id.to_string(), bob_minted.secret.clone());
+    let err = join_at_from(&h.ep, &h.store, &ticket, bob.addr.clone(), JoinOrigin::HubRelay).await.unwrap_err();
+    assert_eq!(err.downcast_ref::<super::wire::Refusal>().map(|r| r.code), Some(RefusalCode::RootConflict), "{err:#}");
+    assert!(super::loops::join_failure_is_dead(&err), "a root conflict is never retried");
+    let s = h.store.lock().unwrap();
+    let m = s.get_mirror(notes).unwrap().unwrap();
+    assert_eq!((m.owner, m.share_id), (alice_on_hub.id, share.id), "still alice's mirror");
+    let contacts = s.list_contacts().unwrap();
+    assert!(!contacts.iter().find(|c| c.id == alice_on_hub.id).unwrap().revoked, "alice's contact intact");
+    assert!(!contacts.iter().find(|c| c.id == bob_on_hub.id).unwrap().revoked);
+    assert_eq!(s.list_hub_publications().unwrap().len(), 1);
+    let before = contacts.len();
+    drop(s);
+
+    // 0.7.2: the conflict is settled BEFORE pairing, so a stranger's refused
+    // automatic join leaves no contact row behind at all
+    let carol = peer("carol").await;
+    let (carol_share, carol_minted) = {
+        let mut s = carol.store.lock().unwrap();
+        s.create_doc_with_id(notes, "Notes", None, carol.human).unwrap();
+        super::client::mint_invite_full(&mut s, &carol.pubkey(), notes, SharePermission::Propose).unwrap()
+    };
+    let ticket = Ticket::new(carol.pubkey(), carol_share.id.to_string(), carol_minted.secret.clone());
+    let err = join_at_from(&h.ep, &h.store, &ticket, carol.addr.clone(), JoinOrigin::HubRelay).await.unwrap_err();
+    assert_eq!(err.downcast_ref::<super::wire::Refusal>().map(|r| r.code), Some(RefusalCode::RootConflict), "{err:#}");
+    let s = h.store.lock().unwrap();
+    assert_eq!(s.list_contacts().unwrap().len(), before, "the refused join paired nobody");
+    assert!(!s.list_contacts().unwrap().iter().any(|c| c.pubkey == carol.pubkey()));
+    assert_eq!(s.get_mirror(notes).unwrap().unwrap().owner, alice_on_hub.id, "still alice's mirror");
+}
+
+/// 0.7.2 hardening: `is_hub` on a contact comes from the hub marker on the
+/// invite secret, never from the owner's `Redeemed` reply. A hub sharing a
+/// doc OUTSIDE its root replies `is_hub: true` with a plain secret: the
+/// grantee does not flag it, and its `on_behalf_of` is refused like any
+/// plain peer's.
+#[tokio::test]
+async fn is_hub_comes_from_the_hub_marked_invite_not_the_reply() {
+    let (h, cfg) = hub("Team").await;
+    let alice = peer("alice").await;
+    // the marker itself: a root invite carries it, an ordinary one does not
+    assert!(hub_invite(&h, &cfg).is_hub_invite());
+    let side = h.doc("Side", None, "not under the hub root");
+    let (_, link) = mint_invite(&mut h.store.lock().unwrap(), &h.pubkey(), side, SharePermission::View).unwrap();
+    let ticket = Ticket::parse(&link).unwrap();
+    assert!(!ticket.is_hub_invite());
+    assert_eq!(ticket.to_link(), link, "link format unchanged for 0.7.1 peers");
+
+    let out = join_at(&alice.ep, &alice.store, &ticket, h.addr.clone()).await.unwrap();
+    assert!(!out.is_hub, "{out:?}");
+    let h_on_alice = alice.contact_of(&h);
+    assert!(!h_on_alice.is_hub, "reply said hub, ticket did not: not believed");
+    assert!(alice.store.lock().unwrap().get_mirror(side).unwrap().is_some());
+
+    // alice gives that contact a propose share; its on_behalf_of is refused
+    let a_doc = alice.doc("A", None, "a");
+    let (_, link) = mint_invite(&mut alice.store.lock().unwrap(), &alice.pubkey(), a_doc, SharePermission::Propose).unwrap();
+    join_at(&h.ep, &h.store, &Ticket::parse(&link).unwrap(), alice.addr.clone()).await.unwrap();
+    let h_share = h.store.lock().unwrap().get_mirror(a_doc).unwrap().unwrap().share_id.to_string();
+    let res = request(&h.ep, alice.addr.clone(), Request::Propose {
+        share: h_share.clone(), doc: a_doc.to_string(), ops: vec![insert_op("x")], note: String::new(), base_epoch: Some(1), request_id: None,
+        on_behalf_of: Some(super::wire::OnBehalfOf { pubkey: "ab".repeat(32), name: "mallory".into() }),
+    }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
+    assert!(alice.store.lock().unwrap().review_queue(Some(a_doc)).unwrap().is_empty());
+    // the same proposal without the claim is an ordinary parked proposal
+    let res = request(&h.ep, alice.addr.clone(), Request::Propose {
+        share: h_share, doc: a_doc.to_string(), ops: vec![insert_op("x")], note: String::new(), base_epoch: Some(1), request_id: None, on_behalf_of: None,
+    }).await.unwrap();
+    assert!(matches!(res, Response::Proposed { .. }), "{res:?}");
+
+    // a genuine hub-root join still flags the hub
+    let out = join_at(&alice.ep, &alice.store, &hub_invite(&h, &cfg), h.addr.clone()).await.unwrap();
+    assert!(out.is_hub);
+    assert!(alice.contact_of(&h).is_hub);
+}
+
+/// 0.7.2 hardening: a peer that is not a contact is read under
+/// `PRE_AUTH_FRAME`; an oversized frame is refused before it is parsed. The
+/// same frame from a paired contact is read under `MAX_FRAME` and served.
+#[tokio::test]
+async fn unknown_peer_frame_over_the_pre_auth_cap_is_refused_before_parse() {
+    use super::server::PRE_AUTH_FRAME;
+    let store = owner_store("the-secret");
+    let owner = local_endpoint().await;
+    let addr = direct_addr(&owner);
+    tokio::spawn(serve(owner, store.clone(), scratch_hot(), Runtime::default()));
+    // a valid Ping frame padded with 1 MB of whitespace: parses fine, but
+    // only a contact is allowed to make us read that much
+    let mut padded = serde_json::to_vec(&Frame { v: super::wire::PROTOCOL_VERSION, msg: Request::Ping }).unwrap();
+    padded.extend(std::iter::repeat_n(b' ', 1024 * 1024));
+    assert!(padded.len() > PRE_AUTH_FRAME && padded.len() < MAX_FRAME);
+    let raw_request = |ep: Endpoint, addr: EndpointAddr, body: Vec<u8>| async move {
+        let conn = ep.connect(addr, ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&body).await.unwrap();
+        send.finish().unwrap();
+        let raw = recv.read_to_end(MAX_FRAME).await.unwrap();
+        serde_json::from_slice::<Frame<Response>>(&raw).unwrap().msg
+    };
+    let stranger = local_endpoint().await;
+    let res = raw_request(stranger.clone(), addr.clone(), padded.clone()).await;
+    match &res {
+        Response::Refused { reason, code } => {
+            assert_eq!(*code, RefusalCode::BadRequest);
+            assert!(reason.contains("too large") && reason.contains("before authentication"), "{reason}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // a stranger's small frame is still read and dispatched (refused as unknown, not as oversized)
+    let res = request(&stranger, addr.clone(), Request::Ping).await.unwrap();
+    assert!(matches!(&res, Response::Refused { reason, .. } if !reason.contains("too large")), "{res:?}");
+    // once paired, the same padded frame is under MAX_FRAME and answered
+    let res = request(&stranger, addr.clone(), Request::Redeem { secret: "the-secret".into(), petname: "alice".into() }).await.unwrap();
+    assert!(matches!(res, Response::Redeemed { .. }), "{res:?}");
+    let res = raw_request(stranger, addr, padded).await;
+    assert_eq!(res, Response::Pong);
+}
+
+/// 0.7.2 hardening: a member's retry of a forwarded proposal (same
+/// `request_id`) parks ONE proposal on the owner. The hub answers the retry
+/// from its cache; and because the id it uses towards the owner is derived
+/// from (member, request_id), a retry that misses the hub cache is deduped
+/// by the owner instead.
+#[tokio::test]
+async fn hub_forward_retry_parks_one_proposal_and_owner_refusals_are_cached() {
+    use super::server::forward_request_id;
+    // the derivation: stable per (member, id), distinct across members, fresh without an id
+    assert_eq!(forward_request_id(Some("pk-a:r1")), forward_request_id(Some("pk-a:r1")));
+    assert_ne!(forward_request_id(Some("pk-a:r1")), forward_request_id(Some("pk-b:r1")));
+    assert_ne!(forward_request_id(None), forward_request_id(None));
+
+    let (h, cfg, alice, bob) = team().await;
+    pull_hub(&alice, &h, &cfg).await;
+    pull_hub(&bob, &h, &cfg).await;
+    let notes = alice.doc("Notes", None, "alice's notes");
+    publish(&alice, &h, notes, "Notes").await;
+    pull_hub(&bob, &h, &cfg).await;
+    let bob_share = bob.store.lock().unwrap().get_mirror(cfg.root_doc).unwrap().unwrap().share_id.to_string();
+    let propose = |rid: &str, text: &str| {
+        let (ep, addr, share) = (bob.ep.clone(), h.addr.clone(), bob_share.clone());
+        let req = Request::Propose {
+            share, doc: notes.to_string(), ops: vec![insert_op(text)], note: "x".into(), base_epoch: None,
+            request_id: Some(rid.into()), on_behalf_of: None,
+        };
+        async move { request(&ep, addr, req).await.unwrap() }
+    };
+    let first = propose("r1", "bob's edit").await;
+    let Response::Proposed { op_ids } = &first else { panic!("{first:?}") };
+    let retry = propose("r1", "bob's edit").await;
+    assert_eq!(retry, first, "retry answered from the hub's cache");
+    {
+        let s = alice.store.lock().unwrap();
+        let q = s.review_queue(Some(notes)).unwrap();
+        assert_eq!(q.len(), 1, "one parked op on alice, not two");
+        assert_eq!(q[0].op.id.to_string(), op_ids[0]);
+    }
+    // the owner's own dedupe sees the derived id: the very same forward sent
+    // again by hand (as if the hub had lost its cache) parks nothing new
+    let hub_on_alice_share = h.store.lock().unwrap().list_hub_publications().unwrap()[0].share_id.to_string();
+    let derived = forward_request_id(Some(&format!("{}:r1", bob.pubkey())));
+    let res = request(&h.ep, alice.addr.clone(), Request::Propose {
+        share: hub_on_alice_share, doc: notes.to_string(), ops: vec![insert_op("bob's edit")], note: "x".into(), base_epoch: None,
+        request_id: Some(derived), on_behalf_of: Some(super::wire::OnBehalfOf { pubkey: bob.pubkey(), name: "bob".into() }),
+    }).await.unwrap();
+    assert_eq!(res, first);
+    assert_eq!(alice.store.lock().unwrap().review_queue(Some(notes)).unwrap().len(), 1);
+
+    // an owner refusal is terminal too: cached, not re-forwarded. Alice's
+    // doc goes hot → DocHot; her ending the session does not change the
+    // answer to the SAME request_id (a fresh id gets a fresh answer).
+    let epoch = alice.store.lock().unwrap().get_doc(notes).unwrap().current_epoch;
+    alice.hot.start(notes, epoch).unwrap();
+    let res = propose("r2", "later").await;
+    assert_eq!(refusal_code(&res), RefusalCode::DocHot, "{res:?}");
+    alice.hot.flatten_and_close(&alice.store, notes, "test").unwrap();
+    assert_eq!(propose("r2", "later").await, res, "cached refusal");
+    assert!(matches!(propose("r3", "later").await, Response::Proposed { .. }));
+    assert_eq!(alice.store.lock().unwrap().review_queue(Some(notes)).unwrap().len(), 2);
+}
+
+/// 0.7.2 hardening: a fan-out subscriber that falls behind the broadcast
+/// depth is not left silently stale — it gets one full-state SyncStep2 and
+/// the stream continues. (Before, `Lagged` ended the fan-out loop with the
+/// socket still open.) Empty SyncStep2 frames (every join) are not journaled.
+#[tokio::test]
+async fn lagged_hot_subscriber_is_resynced_with_the_full_doc_state() {
+    use yrs::sync::{Message as YMessage, SyncMessage};
+    use yrs::updates::decoder::{Decode, DecoderV1};
+    use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+    use yrs::{GetString, ReadTxn, Text, Transact};
+    let hot = scratch_hot();
+    let doc = uuid::Uuid::now_v7();
+    hot.start(doc, 0).unwrap();
+    let (mut rx, _hello) = hot.connect_as(doc, Some("peer")).unwrap();
+    // a real edit lands in the session
+    let edit = {
+        let d = yrs::Doc::new();
+        let t = d.get_or_insert_text("t");
+        t.insert(&mut d.transact_mut(), 0, "hello");
+        let u = d.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        let mut enc = EncoderV1::new();
+        YMessage::Sync(SyncMessage::Update(u)).encode(&mut enc);
+        enc.to_vec()
+    };
+    assert!(hot.handle_frame(doc, &edit));
+    // the subscriber sleeps through far more frames than the channel holds
+    for _ in 0..(crate::hot::FAN_OUT_DEPTH + 64) {
+        assert!(hot.broadcast_raw(doc, vec![0, 0]));
+    }
+    let frame = hot.next_fan_out(&mut rx, doc, "peer").await.expect("resync, not end of stream");
+    let mut decoder = DecoderV1::new(yrs::encoding::read::Cursor::new(&frame));
+    let msg = yrs::sync::MessageReader::new(&mut decoder).next().unwrap().unwrap();
+    let YMessage::Sync(SyncMessage::SyncStep2(u)) = msg else { panic!("{msg:?}") };
+    let fresh = yrs::Doc::new();
+    fresh.transact_mut().apply_update(yrs::Update::decode_v1(&u).unwrap()).unwrap();
+    assert_eq!(fresh.get_or_insert_text("t").get_string(&fresh.transact()), "hello");
+    // and the stream goes on: the frames that survived the lag still arrive
+    assert!(hot.next_fan_out(&mut rx, doc, "peer").await.is_some());
+    // journal hygiene: the empty step-2 is skipped, a real update is not
+    assert!(crate::hot::update_is_empty(&[0, 0]));
+    assert!(!crate::hot::update_is_empty(&edit));
+    // exactly two zero bytes — a longer all-zero frame is not an empty update
+    assert!(!crate::hot::update_is_empty(&[0, 0, 0]));
+    assert!(!crate::hot::update_is_empty(&[]));
+}
+
+/// 0.7.2 hardening: the member's `TransferReady` reply is lost after it
+/// flipped the folder. Its sweep re-announces (`Request::TransferReady`); the
+/// hub completes the take-over and, once done, answers `Noted` so the member
+/// stops asking. A half-done flip (root only) is completed by the retry.
+#[tokio::test]
+async fn lost_transfer_ready_is_redelivered_by_the_member_sweep_and_a_half_flip_completes() {
+    use super::transfer::{member_flip, membership_share, resend_ready};
+    let (h, cfg, alice, _bob) = team().await;
+    pull_hub(&alice, &h, &cfg).await;
+    let plan = alice.doc("Plan", None, "the plan");
+    let step = alice.doc("Step", Some(plan), "step one");
+    let t = offer_transfer(&alice, &h, plan, "Plan").await;
+    let t: uuid::Uuid = t.parse().unwrap();
+    let hub_on_alice = alice.contact_of(&h);
+    // the admin accepted, the hub dialed, alice flipped — and the reply vanished:
+    // hub record Accepted, no docs; alice's copy a mirror of the hub
+    h.store.lock().unwrap().set_hub_transfer_state(t, grimoire_store::HubTransferState::Accepted).unwrap();
+    {
+        let mut s = alice.store.lock().unwrap();
+        // a flip that died after the share and the root row (the retry must finish the child)
+        let membership = membership_share(&s, hub_on_alice.id).unwrap();
+        let sh = s.create_share(plan, Some(hub_on_alice.id), SharePermission::Propose, None).unwrap();
+        s.set_share_state(sh.id, grimoire_store::ShareState::Active).unwrap();
+        s.upsert_mirror(plan, hub_on_alice.id, membership, 1, SharePermission::Propose).unwrap();
+        let res = member_flip(&mut s, &alice.hot, &hub_on_alice, plan).unwrap();
+        assert!(matches!(res, Response::TransferReady { .. }), "{res:?}");
+        assert_eq!(s.get_mirror(step).unwrap().unwrap().owner, hub_on_alice.id, "child flipped by the retry");
+        assert_eq!(s.list_doc_transfers().unwrap()[0].state, "done");
+    }
+    assert!(h.store.lock().unwrap().get_doc(plan).is_err(), "hub has nothing yet");
+
+    // sweep 1: the hub is told, starts the take-over, says Busy
+    assert_eq!(resend_ready(&alice.ep, &alice.store, Some(h.addr.clone())).await, 0);
+    eventually("hub completes the transfer", || {
+        h.store.lock().unwrap().get_hub_transfer(t).unwrap().state == grimoire_store::HubTransferState::Done
+    }).await;
+    {
+        let s = h.store.lock().unwrap();
+        for d in [plan, step] {
+            assert!(s.get_doc(d).is_ok() && s.get_mirror(d).unwrap().is_none(), "hub owns {d}");
+        }
+        assert_eq!(s.read_doc(step).unwrap().roots[0].block.content, "step one");
+    }
+    // 0.7.2: the take-over pulled alice's share, and a pull only happens once
+    // the hub holds our Ready — so the transfer is already acknowledged and
+    // sweep 2 costs no round trip at all
+    {
+        let s = alice.store.lock().unwrap();
+        let id = s.list_doc_transfers().unwrap()[0].id;
+        assert_eq!(s.get_setting(&format!("transfer.acked.{id}")).unwrap().as_deref(), Some("1"));
+    }
+    assert_eq!(resend_ready(&alice.ep, &alice.store, Some(h.addr.clone())).await, 0);
+    // and the Noted path still acknowledges: forget the pull-derived marker
+    {
+        let mut s = alice.store.lock().unwrap();
+        let id = s.list_doc_transfers().unwrap()[0].id;
+        s.set_setting(&format!("transfer.acked.{id}"), "").unwrap();
+    }
+    assert_eq!(resend_ready(&alice.ep, &alice.store, Some(h.addr.clone())).await, 1);
+    assert_eq!(resend_ready(&alice.ep, &alice.store, Some(h.addr.clone())).await, 0);
+    // a hub too old to decode the re-announcement (BadRequest) is backed off to
+    // hourly, logged once, and skipped by the sweep until then
+    {
+        let mut s = alice.store.lock().unwrap();
+        let id = s.list_doc_transfers().unwrap()[0].id;
+        s.set_setting(&format!("transfer.acked.{id}"), "").unwrap();
+        assert!(super::transfer::back_off_old_hub(&mut s, id), "logged the first time");
+        assert!(!super::transfer::back_off_old_hub(&mut s, id), "and not again");
+        let after: i64 = s
+            .get_setting(&format!("transfer.ready_retry_after.{id}"))
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        assert!((3500..=3600).contains(&(after - now)), "backed off ~an hour, not {}", after - now);
+    }
+    assert_eq!(resend_ready(&alice.ep, &alice.store, Some(h.addr.clone())).await, 0, "skipped while backed off");
+    // a stranger to the transfer cannot trigger a take-over
+    let carol = peer("carol").await;
+    join_at(&carol.ep, &carol.store, &hub_invite(&h, &cfg), h.addr.clone()).await.unwrap();
+    let res = request(&carol.ep, h.addr.clone(), Request::TransferReady { root_doc: plan.to_string() }).await.unwrap();
+    assert_eq!(refusal_code(&res), RefusalCode::NotAllowed);
+}
+
+/// 0.7.2 hardening: an owner cannot file their docs inside the grantee's own
+/// tree. A wire parent outside the share (here: the grantee's private doc,
+/// whose id the owner forged under the share root) is replaced by the share
+/// root, with a warning; the private doc is untouched.
+#[tokio::test]
+async fn owner_named_parent_outside_the_share_is_filed_under_the_share_root() {
+    use super::client::pull_share;
+    let (owner_store, addr, _hot, alice_ep, alice_store, _alice_pub, share, root) = paired(SharePermission::View).await;
+    // alice's private doc
+    let private = {
+        let mut s = alice_store.lock().unwrap();
+        let alice = s.list_principals().unwrap().into_iter().find(|p| p.display_name == "alice").unwrap();
+        s.create_doc("Private", None, alice.id).unwrap().id
+    };
+    // the owner forges a doc under the share root WITH ALICE'S PRIVATE ID, and a child under it
+    let child = {
+        let mut s = owner_store.lock().unwrap();
+        let tom = s.list_principals().unwrap().into_iter().find(|p| p.display_name == "tom").unwrap();
+        s.create_doc_with_id(private, "Evil", Some(root.id), tom.id).unwrap();
+        let c = s.create_doc("Child", Some(private), tom.id).unwrap();
+        s.apply(c.id, 0, tom.id, vec![insert_op("payload")]).unwrap();
+        c.id
+    };
+    let owner_contact = alice_store.lock().unwrap().list_contacts().unwrap().remove(0);
+    pull_share(&alice_ep, &alice_store, addr, &owner_contact, share.id).await.unwrap();
+    let s = alice_store.lock().unwrap();
+    let p = s.get_doc(private).unwrap();
+    assert!((p.title.as_str(), p.parent_id) == ("Private", None) && s.get_mirror(private).unwrap().is_none(), "private doc untouched");
+    let c = s.get_doc(child).unwrap();
+    assert_eq!(c.parent_id, Some(root.id), "child filed under the share root, not under alice's private doc");
+    assert!(s.get_mirror(child).unwrap().is_some());
+    assert!(s.list_docs().unwrap().iter().all(|d| d.parent_id != Some(private)), "nothing landed under the private doc");
+}
+
+/// 0.7.2 hardening: the owner-side detector walks only the shares whose
+/// docs moved. Three shares; one edit → one share walked, one batch due; a
+/// session starting on another → that share only; idle → nothing walked.
+#[test]
+fn notify_tick_walks_only_the_shares_containing_changed_docs() {
+    use super::loops::{NotifyState, notify_tick};
+    use super::wire::NotifyKind;
+    let mut s = SqliteStore::open_in_memory().unwrap();
+    let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+    let hot = scratch_hot();
+    let mut shares = Vec::new();
+    let mut docs = Vec::new();
+    for i in 0..3 {
+        let root = s.create_doc(&format!("Root {i}"), None, tom.id).unwrap();
+        let sub = s.create_doc(&format!("Sub {i}"), Some(root.id), tom.id).unwrap();
+        s.apply(sub.id, 0, tom.id, vec![insert_op("seed")]).unwrap();
+        let c = s.pair_contact(&format!("{i:02}").repeat(32), &format!("peer{i}")).unwrap();
+        let sh = s.create_share(root.id, Some(c.id), SharePermission::View, None).unwrap();
+        s.set_share_state(sh.id, grimoire_store::ShareState::Active).unwrap();
+        shares.push(sh.id);
+        docs.push(sub.id);
+    }
+    let mut st = NotifyState::default();
+    // first tick seeds every share silently
+    assert!(notify_tick(&mut st, &s, &hot).is_empty());
+    assert_eq!(st.last_walked, 3);
+    // idle: nothing walked
+    assert!(notify_tick(&mut st, &s, &hot).is_empty());
+    assert_eq!(st.last_walked, 0);
+    // one edit in share 1
+    let e = s.get_doc(docs[1]).unwrap().current_epoch;
+    s.apply(docs[1], e, tom.id, vec![insert_op("more")]).unwrap();
+    let due = notify_tick(&mut st, &s, &hot);
+    assert_eq!(st.last_walked, 1, "only the containing share is walked");
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].share.id, shares[1]);
+    assert_eq!((due[0].items[0].doc.as_str(), due[0].items[0].kind), (docs[1].to_string().as_str(), NotifyKind::DocChanged));
+    // a session starts on share 2's doc: hotness flip, that share only
+    hot.start(docs[2], 0).unwrap();
+    let due = notify_tick(&mut st, &s, &hot);
+    assert_eq!((st.last_walked, due.len()), (1, 1));
+    assert_eq!((due[0].share.id, due[0].items[0].kind), (shares[2], NotifyKind::LiveStarted));
+    // a brand-new share is seeded on its first tick without a nudge
+    let root = s.create_doc("Root 3", None, tom.id).unwrap();
+    let c = s.pair_contact(&"ff".repeat(32), "peer3").unwrap();
+    let sh = s.create_share(root.id, Some(c.id), SharePermission::View, None).unwrap();
+    s.set_share_state(sh.id, grimoire_store::ShareState::Active).unwrap();
+    let due = notify_tick(&mut st, &s, &hot);
+    assert!(due.is_empty(), "{:?}", due.iter().map(|d| d.share.id).collect::<Vec<_>>());
+    assert_eq!(st.last_walked, 1);
+}
+
+/// 0.7.2 hardening: a background loop that panics is restarted, loudly,
+/// instead of leaving the daemon without it.
+#[tokio::test]
+async fn supervised_loop_is_restarted_after_a_panic() {
+    use super::loops::supervise;
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let r = runs.clone();
+    let sup = tokio::spawn(supervise("test", move || {
+        let r = r.clone();
+        async move {
+            let n = r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                panic!("first run dies");
+            }
+            std::future::pending::<()>().await
+        }
+    }));
+    for _ in 0..100 {
+        if runs.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2, "restarted exactly once and kept running");
+    sup.abort();
+}
+
+/// 0.7.2 hardening: hub forward records are pruned by age on the sweep;
+/// fresh rows (a member may still ask about them) stay, and a non-hub skips.
+#[tokio::test]
+async fn hub_forward_records_are_pruned_by_age_on_the_sweep() {
+    use super::loops::{HUB_FORWARD_RETENTION_DAYS, prune_hub_forwards};
+    let (h, _cfg, alice, bob) = team().await;
+    let (alice_on_hub, bob_on_hub) = (h.contact_of(&alice), h.contact_of(&bob));
+    let (op, share, doc) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    h.store.lock().unwrap().add_hub_forward(op, alice_on_hub.id, bob_on_hub.id, share, doc).unwrap();
+    assert_eq!(prune_hub_forwards(&h.store), 0, "a fresh row is kept");
+    assert_eq!(h.store.lock().unwrap().hub_forwards_for(&[op]).unwrap().len(), 1);
+    // the store's own cut-off: everything older than the retention window goes
+    // (created_at has ms precision; make sure "now" has moved past it)
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert_eq!(h.store.lock().unwrap().prune_hub_forwards(0).unwrap(), 1);
+    assert!(h.store.lock().unwrap().hub_forwards_for(&[op]).unwrap().is_empty());
+    assert!(HUB_FORWARD_RETENTION_DAYS >= 7);
+    // a plain daemon holds no rows and runs no delete
+    assert_eq!(prune_hub_forwards(&alice.store), 0);
+}

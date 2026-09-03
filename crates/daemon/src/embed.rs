@@ -170,7 +170,8 @@ pub async fn embed_loop(embedder: Arc<Embedder>, store: Arc<Mutex<SqliteStore>>)
         }
         ticks += 1;
         if ticks % 30 == 0
-            && let Ok(n) = embedder.purge(&store)
+            && let (e, s) = (embedder.clone(), store.clone())
+            && let Ok(Ok(n)) = tokio::task::spawn_blocking(move || e.purge(&s)).await
             && n > 0
         {
             tracing::debug!(purged = n, "dropped embeddings of deleted blocks");
@@ -222,6 +223,7 @@ mod tests {
         }]).ok();
         let purged = embedder.purge(&store).unwrap();
         assert!(purged >= 1, "purged {purged}");
-        assert_eq!(embedder.indexed(), 1);
+        // 0.7.2: blocks of a tombstoned doc leave block_vecs (never searchable)
+        assert_eq!(embedder.indexed(), 0);
     }
 }

@@ -435,6 +435,45 @@ fn mirror_replace_blocks_accepts_children_before_parents() {
     assert_eq!(s.read_doc(doc).unwrap().roots[0].block.content, "# Top v2");
 }
 
+/// P0 (0.7.2): block_vec referenced blocks(id) with no cascade, so the
+/// second pull of a mirror whose blocks had been embedded failed the FK on
+/// `DELETE FROM blocks`. The replace must purge the vectors with the blocks,
+/// and the stale scan must never offer mirror or trashed blocks to embed.
+#[test]
+fn mirror_replace_purges_embeddings_and_stale_scan_skips_mirrors_and_trash() {
+    let (mut s, tom) = store_with_tom();
+    let owner = s.pair_contact(&"cd".repeat(32), "owner").unwrap();
+    let doc = uuid::Uuid::now_v7();
+    s.create_doc_with_id(doc, "Mirrored", None, owner.principal).unwrap();
+    s.upsert_mirror(doc, owner.id, uuid::Uuid::now_v7(), 0, SharePermission::View).unwrap();
+    let b1 = uuid::Uuid::now_v7();
+    let mk = |id, key: &str, content: &str| MirrorBlock {
+        id,
+        parent_id: None,
+        order_key: key.into(),
+        block_type: BlockType::Paragraph,
+        content: content.into(),
+        refers_to: None,
+    };
+    s.mirror_replace_blocks(doc, vec![mk(b1, "i", "mirrored para")], 1, owner.principal).unwrap();
+    // a mirror block never shows up as stale work for the embedder
+    let stale: Vec<_> = s.stale_block_vectors(100).unwrap();
+    assert!(stale.iter().all(|(id, _, _)| *id != b1), "mirror blocks are not embedded locally");
+    // ... but if one was embedded (older daemon), the next pull must still work
+    s.set_block_vec(b1, 1, &[0.5, 0.25]).unwrap();
+    let b2 = uuid::Uuid::now_v7();
+    s.mirror_replace_blocks(doc, vec![mk(b2, "i", "mirrored para v2")], 2, owner.principal)
+        .expect("re-replace with an embedded block must not fail the block_vec FK");
+    assert!(s.block_vecs().unwrap().iter().all(|(id, _)| *id != b1), "old vector purged");
+    assert_eq!(s.read_doc(doc).unwrap().roots[0].block.content, "mirrored para v2");
+
+    // trashed docs: their blocks leave the stale scan too
+    let (own, _) = import::import_markdown(&mut s, "Mine", None, tom.id, "a paragraph\n").unwrap();
+    assert!(s.stale_block_vectors(100).unwrap().iter().any(|(_, _, c)| c == "a paragraph"));
+    s.delete_doc(own).unwrap();
+    assert!(!s.stale_block_vectors(100).unwrap().iter().any(|(_, _, c)| c == "a paragraph"));
+}
+
 #[test]
 fn profile_rename_and_settings() {
     let (mut s, tom) = store_with_tom();

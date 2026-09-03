@@ -38,6 +38,10 @@ impl SqliteStore {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // WAL + NORMAL: durable across process crashes, one fsync per
+        // checkpoint instead of per commit (a power loss can lose the last
+        // few commits, never corrupt the file)
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         migrate_pre_schema(&conn)?;
@@ -52,7 +56,49 @@ fn uuid_col(s: String, ctx: &str) -> Result<Uuid> {
 }
 
 /// Additive column migrations that must run before the IF-NOT-EXISTS schema.
+/// The ALTERs land in one transaction (a crash mid-way used to leave a table
+/// with half its new columns); the table rebuilds run after it, on their
+/// own — one toggles `foreign_keys`, which is a no-op inside a transaction.
 fn migrate_pre_schema(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    additive_column_migrations(&tx)?;
+    tx.commit()?;
+    // Fresh installs from before the maintainer tier created `shares` with
+    // a CHECK that only allows review|yellow; SQLite can't widen a CHECK in
+    // place, so rebuild the table once when we see the old constraint.
+    // (DBs that got `trust` via ALTER have no CHECK and need nothing.)
+    let shares_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'shares'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(sql) = shares_sql
+        && sql.contains("trust IN ('review', 'yellow'))")
+        && !sql.contains("'green'")
+    {
+        widen_shares_trust_check(conn)?;
+    }
+    // block_vec: the first cut referenced blocks(id) without ON DELETE
+    // CASCADE, so a mirror pull (hard-delete + reinsert) failed the FK once
+    // a mirror block had been embedded. Rebuild once with the cascade.
+    let block_vec_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'block_vec'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(sql) = block_vec_sql
+        && !sql.to_ascii_uppercase().contains("ON DELETE CASCADE")
+    {
+        rebuild_block_vec_with_cascade(conn)?;
+    }
+    Ok(())
+}
+
+fn additive_column_migrations(conn: &Connection) -> Result<()> {
     let has_blocks: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'blocks'",
         [],
@@ -142,23 +188,6 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
                 "ALTER TABLE shares ADD COLUMN trust TEXT NOT NULL DEFAULT 'review'",
                 [],
             )?;
-        }
-        // Fresh installs from before the maintainer tier created `shares` with
-        // a CHECK that only allows review|yellow; SQLite can't widen a CHECK in
-        // place, so rebuild the table once when we see the old constraint.
-        // (DBs that got `trust` via ALTER have no CHECK and need nothing.)
-        let shares_sql: Option<String> = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'shares'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(sql) = shares_sql
-            && sql.contains("trust IN ('review', 'yellow'))")
-            && !sql.contains("'green'")
-        {
-            widen_shares_trust_check(conn)?;
         }
     }
     let has_mirrors: i64 = conn.query_row(
@@ -294,24 +323,109 @@ fn widen_shares_trust_check(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Rebuild `block_vec` with `ON DELETE CASCADE` on its blocks FK. Nothing
+/// references block_vec, so the swap is copy → drop → rename, in one
+/// transaction; rows whose block is already gone are dropped on the way.
+fn rebuild_block_vec_with_cascade(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE block_vec_new (
+             block_id TEXT PRIMARY KEY REFERENCES blocks (id) ON DELETE CASCADE,
+             epoch    INTEGER NOT NULL,
+             dim      INTEGER NOT NULL,
+             vec      BLOB NOT NULL
+         );
+         INSERT INTO block_vec_new (block_id, epoch, dim, vec)
+             SELECT v.block_id, v.epoch, v.dim, v.vec FROM block_vec v
+             WHERE EXISTS (SELECT 1 FROM blocks b WHERE b.id = v.block_id);
+         DROP TABLE block_vec;
+         ALTER TABLE block_vec_new RENAME TO block_vec;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
+/// Every outstanding step and the version bump commit together: a crash
+/// mid-backfill re-runs the whole thing next open instead of leaving a
+/// half-filled index stamped as done.
 fn backfill(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version >= SCHEMA_VERSION {
         return Ok(());
     }
+    let tx = conn.unchecked_transaction()?;
+    if version < 3 {
+        backfill_fts_edges_tags(&tx)?;
+    }
     if version < 4 {
-        backfill_block_types(conn)?;
+        backfill_block_types(&tx)?;
     }
-    if version >= 3 {
-        // only the v4 step was outstanding
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        return Ok(());
+    if version < 5 {
+        backfill_doc_sort_keys(&tx)?;
     }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// v5: docs used to be created with a NULL sort_key (sorted last, by title).
+/// Key every unkeyed doc after its parent's last keyed sibling, in title
+/// order, so the tree order is explicit and stable from here on.
+fn backfill_doc_sort_keys(conn: &Connection) -> Result<()> {
+    let rows: Vec<(String, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_id FROM docs WHERE sort_key IS NULL
+             ORDER BY parent_id, deleted, title, id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut last: std::collections::HashMap<Option<String>, Option<String>> = Default::default();
+    for (id, parent_id) in rows {
+        let prev = match last.get(&parent_id) {
+            Some(k) => k.clone(),
+            None => max_doc_sort_key(conn, parent_id.as_deref())?,
+        };
+        let key = crate::order_key::between(prev.as_deref(), None);
+        conn.execute(
+            "UPDATE docs SET sort_key = ?1 WHERE id = ?2",
+            params![key, id],
+        )?;
+        last.insert(parent_id, Some(key));
+    }
+    Ok(())
+}
+
+/// The highest sort_key among ALL docs under `parent_id` (tombstoned ones
+/// included), if any. Trashed siblings keep their key so a restore lands them
+/// back where they were; a new doc keyed only past the live ones could
+/// collide with a trashed key and then tie with it after the restore.
+fn max_doc_sort_key(conn: &Connection, parent_id: Option<&str>) -> Result<Option<String>> {
+    Ok(conn.query_row(
+        "SELECT max(sort_key) FROM docs
+         WHERE sort_key IS NOT NULL
+           AND ((?1 IS NULL AND parent_id IS NULL) OR parent_id = ?1)",
+        params![parent_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// The sort_key for a doc appended under `parent`: just after the last keyed
+/// live sibling, so a new doc never carries NULL and lands at the end.
+fn next_doc_sort_key(conn: &Connection, parent: Option<Uuid>) -> Result<String> {
+    let parent = parent.map(|p| p.to_string());
+    let last = max_doc_sort_key(conn, parent.as_deref())?;
+    Ok(crate::order_key::between(last.as_deref(), None))
+}
+
+/// v1→v3: FTS rows, wikilink edges and frontmatter tags for blocks that
+/// predate their triggers/extraction.
+fn backfill_fts_edges_tags(conn: &Connection) -> Result<()> {
     conn.execute("INSERT INTO blocks_fts (blocks_fts) VALUES ('rebuild')", [])?;
     let edges: i64 = conn.query_row("SELECT count(*) FROM edges", [], |r| r.get(0))?;
     if edges == 0 {
@@ -346,7 +460,6 @@ fn backfill(conn: &Connection) -> Result<()> {
             }
         }
     }
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
 
@@ -766,16 +879,92 @@ fn build_block(raw: RawBlock) -> Result<Block> {
 const BLOCK_COLS: &str =
     "id, doc_id, parent_id, order_key, block_type, content, created_by, epoch, deleted, refers_to";
 
+/// A new docs row, keyed after its last live sibling (never NULL).
+fn insert_doc_row(
+    conn: &Connection,
+    id: Uuid,
+    title: &str,
+    parent: Option<Uuid>,
+    created_by: Uuid,
+) -> Result<()> {
+    let sort_key = next_doc_sort_key(conn, parent)?;
+    conn.execute(
+        "INSERT INTO docs (id, parent_id, title, created_by, sort_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            id.to_string(),
+            parent.map(|p| p.to_string()),
+            title,
+            created_by.to_string(),
+            sort_key
+        ],
+    )?;
+    Ok(())
+}
+
+/// The body of `apply` against an open transaction: epoch check, project +
+/// ledger for every op, epoch bump. The caller commits.
+fn apply_in_tx(
+    tx: &Transaction,
+    doc_id: Uuid,
+    base_epoch: i64,
+    principal: Uuid,
+    ops: Vec<OpInput>,
+) -> Result<ApplyReceipt> {
+    let current = doc_epoch(tx, doc_id)?;
+    if base_epoch != current {
+        return Err(StoreError::StaleBase {
+            base: base_epoch,
+            current,
+        });
+    }
+
+    // one committed transaction = one epoch (PROJECT.md §3.1)
+    let epoch = current + 1;
+    let mut op_ids = Vec::with_capacity(ops.len());
+    for op in &ops {
+        let op_id = Uuid::now_v7();
+        let mut op = op.clone();
+        resolve_order_keys(tx, doc_id, &mut op.kind)?;
+        let op = &op;
+        let prior = match op.kind.target_block() {
+            Some(t) => block_by_id(tx, doc_id, t)?,
+            None => None,
+        };
+        project(tx, doc_id, epoch, principal, &op.kind)?;
+        insert_op_row(
+            tx,
+            op_id,
+            doc_id,
+            op,
+            principal,
+            base_epoch,
+            Some(epoch),
+            Verdict::Green,
+            1.0,
+            &prior,
+        )?;
+        op_ids.push(op_id);
+    }
+    tx.execute(
+        "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
+        params![epoch, doc_id.to_string()],
+    )?;
+    Ok(ApplyReceipt {
+        doc_id,
+        epoch,
+        op_ids,
+    })
+}
+
 /// Fetch a block by id within a doc, tombstoned ones included.
 fn block_by_id(tx: &Transaction, doc_id: Uuid, id: Uuid) -> Result<Option<Block>> {
-    tx.query_row(
-        &format!("SELECT {BLOCK_COLS} FROM blocks WHERE id = ?1 AND doc_id = ?2"),
-        params![id.to_string(), doc_id.to_string()],
-        row_to_block,
-    )
-    .optional()?
-    .map(build_block)
-    .transpose()
+    let mut stmt = tx.prepare_cached(&format!(
+        "SELECT {BLOCK_COLS} FROM blocks WHERE id = ?1 AND doc_id = ?2"
+    ))?;
+    stmt.query_row(params![id.to_string(), doc_id.to_string()], row_to_block)
+        .optional()?
+        .map(build_block)
+        .transpose()
 }
 
 fn doc_epoch(tx: &Transaction, doc_id: Uuid) -> Result<i64> {
@@ -882,31 +1071,24 @@ fn inverse_of(kind: &OpKind, prior: Option<&Block>) -> Result<OpKind> {
 /// and its next sibling. Real keys pass through untouched, and the ledger
 /// stores the resolved op.
 fn resolve_order_keys(tx: &Transaction, doc_id: Uuid, kind: &mut OpKind) -> Result<()> {
-    let OpKind::Insert {
-        parent_id,
-        order_key,
-        ..
-    } = kind
-    else {
-        return Ok(());
+    let (parent_id, order_key) = match kind {
+        OpKind::Insert {
+            parent_id,
+            order_key,
+            ..
+        } => (parent_id, order_key),
+        // a move carries a real key: validate, never resolve
+        OpKind::Move { new_order_key, .. } => {
+            check_order_key(new_order_key)?;
+            return Ok(());
+        }
+        _ => return Ok(()),
     };
     let spec = order_key.clone();
     if !spec.is_empty() && !spec.starts_with("after:") {
-        return Ok(());
+        return check_order_key(&spec);
     }
-    let siblings: Vec<(String, String)> = {
-        let mut stmt = tx.prepare(
-            "SELECT id, order_key FROM blocks
-             WHERE doc_id = ?1 AND deleted = 0
-               AND ((?2 IS NULL AND parent_id IS NULL) OR parent_id = ?2)
-             ORDER BY order_key",
-        )?;
-        let rows = stmt.query_map(
-            params![doc_id.to_string(), parent_id.map(|p| p.to_string())],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        )?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
+    let siblings = live_sibling_keys(tx, doc_id, *parent_id)?;
     let new_key = if let Some(after_id) = spec.strip_prefix("after:") {
         let after_id = after_id.trim();
         let idx = siblings
@@ -924,16 +1106,74 @@ fn resolve_order_keys(tx: &Transaction, doc_id: Uuid, kind: &mut OpKind) -> Resu
     Ok(())
 }
 
+/// Client-supplied keys must be real fractional keys (base36, non-empty, no
+/// trailing 0): anything else is rejected as a normal error, never a panic.
+fn check_order_key(key: &str) -> Result<()> {
+    if crate::order_key::is_valid(key) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidOp(format!(
+            "order_key {key:?}: must be non-empty base36 digits (or \"\" / \"after:<id>\" on insert)"
+        )))
+    }
+}
+
+/// (id, order_key) of the live blocks under `parent_id`, in key order.
+fn live_sibling_keys(
+    tx: &Transaction,
+    doc_id: Uuid,
+    parent_id: Option<Uuid>,
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT id, order_key FROM blocks
+         WHERE doc_id = ?1 AND deleted = 0
+           AND ((?2 IS NULL AND parent_id IS NULL) OR parent_id = ?2)
+         ORDER BY order_key",
+    )?;
+    let rows = stmt.query_map(
+        params![doc_id.to_string(), parent_id.map(|p| p.to_string())],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// A parked insert resolved its key when it was parked; by the time it is
+/// accepted a sibling may have taken that key. Re-resolve to a fresh key just
+/// after the collision so live siblings never share a key. Returns whether
+/// the key changed.
+fn dedupe_insert_key(tx: &Transaction, doc_id: Uuid, kind: &mut OpKind) -> Result<bool> {
+    let OpKind::Insert {
+        block_id,
+        parent_id,
+        order_key,
+        ..
+    } = kind
+    else {
+        return Ok(false);
+    };
+    let siblings = live_sibling_keys(tx, doc_id, *parent_id)?;
+    let me = block_id.to_string();
+    let taken = siblings
+        .iter()
+        .any(|(id, k)| *id != me && k == order_key);
+    if !taken {
+        return Ok(false);
+    }
+    let next = siblings
+        .iter()
+        .map(|(_, k)| k.as_str())
+        .find(|k| *k > order_key.as_str());
+    *order_key = crate::order_key::between(Some(order_key), next);
+    Ok(true)
+}
+
 /// Fetch a live (non-deleted) block within a doc, for projection checks.
 fn live_block(tx: &Transaction, doc_id: Uuid, id: Uuid, role: &str) -> Result<Block> {
-    let raw = tx
-        .query_row(
-            &format!(
-                "SELECT {BLOCK_COLS} FROM blocks WHERE id = ?1 AND doc_id = ?2 AND deleted = 0"
-            ),
-            params![id.to_string(), doc_id.to_string()],
-            row_to_block,
-        )
+    let mut stmt = tx.prepare_cached(&format!(
+        "SELECT {BLOCK_COLS} FROM blocks WHERE id = ?1 AND doc_id = ?2 AND deleted = 0"
+    ))?;
+    let raw = stmt
+        .query_row(params![id.to_string(), doc_id.to_string()], row_to_block)
         .optional()?
         .ok_or_else(|| StoreError::NotFound(format!("{role} block {id} in doc {doc_id}")))?;
     build_block(raw)
@@ -1222,20 +1462,30 @@ impl BlockStore for SqliteStore {
 
     fn create_doc(&mut self, title: &str, parent: Option<Uuid>, created_by: Uuid) -> Result<Doc> {
         let id = Uuid::now_v7();
-        self.conn.execute(
-            "INSERT INTO docs (id, parent_id, title, created_by) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                id.to_string(),
-                parent.map(|p| p.to_string()),
-                title,
-                created_by.to_string()
-            ],
-        )?;
+        insert_doc_row(&self.conn, id, title, parent, created_by)?;
         self.get_doc(id)
     }
 
+    fn create_doc_with_ops(
+        &mut self,
+        title: &str,
+        parent: Option<Uuid>,
+        created_by: Uuid,
+        ops: Vec<OpInput>,
+    ) -> Result<(Doc, usize)> {
+        let id = Uuid::now_v7();
+        let n = ops.len();
+        let tx = self.conn.transaction()?;
+        insert_doc_row(&tx, id, title, parent, created_by)?;
+        if n > 0 {
+            apply_in_tx(&tx, id, 0, created_by, ops)?;
+        }
+        tx.commit()?;
+        Ok((self.get_doc(id)?, n))
+    }
+
     fn list_docs(&self) -> Result<Vec<Doc>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status, sort_key
              FROM docs WHERE deleted = 0 ORDER BY sort_key IS NULL, sort_key, title",
         )?;
@@ -1244,14 +1494,12 @@ impl BlockStore for SqliteStore {
     }
 
     fn get_doc(&self, id: Uuid) -> Result<Doc> {
-        let raw = self
-            .conn
-            .query_row(
-                "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status, sort_key
-                 FROM docs WHERE id = ?1",
-                params![id.to_string()],
-                row_to_doc,
-            )
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status, sort_key
+             FROM docs WHERE id = ?1",
+        )?;
+        let raw = stmt
+            .query_row(params![id.to_string()], row_to_doc)
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("doc {id}")))?;
         build_doc(raw)
@@ -1259,7 +1507,7 @@ impl BlockStore for SqliteStore {
 
     fn read_doc(&self, id: Uuid) -> Result<DocTree> {
         let doc = self.get_doc(id)?;
-        let mut stmt = self.conn.prepare(&format!(
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {BLOCK_COLS} FROM blocks
              WHERE doc_id = ?1 AND deleted = 0 ORDER BY order_key"
         ))?;
@@ -1285,13 +1533,11 @@ impl BlockStore for SqliteStore {
     }
 
     fn read_block(&self, id: Uuid) -> Result<Block> {
-        let raw = self
+        let mut stmt = self
             .conn
-            .query_row(
-                &format!("SELECT {BLOCK_COLS} FROM blocks WHERE id = ?1"),
-                params![id.to_string()],
-                row_to_block,
-            )
+            .prepare_cached(&format!("SELECT {BLOCK_COLS} FROM blocks WHERE id = ?1"))?;
+        let raw = stmt
+            .query_row(params![id.to_string()], row_to_block)
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("block {id}")))?;
         build_block(raw)
@@ -1309,63 +1555,13 @@ impl BlockStore for SqliteStore {
             return Err(StoreError::InvalidOp("apply: empty op list".into()));
         }
         let tx = self.conn.transaction()?;
-
-        let current: i64 = tx
-            .query_row(
-                "SELECT current_epoch FROM docs WHERE id = ?1",
-                params![doc_id.to_string()],
-                |r| r.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(format!("doc {doc_id}")))?;
-        if base_epoch != current {
-            return Err(StoreError::StaleBase {
-                base: base_epoch,
-                current,
-            });
-        }
-
-        // one committed transaction = one epoch (PROJECT.md §3.1)
-        let epoch = current + 1;
-        let mut op_ids = Vec::with_capacity(ops.len());
-        for op in &ops {
-            let op_id = Uuid::now_v7();
-            let mut op = op.clone();
-            resolve_order_keys(&tx, doc_id, &mut op.kind)?;
-            let op = &op;
-            let prior = match op.kind.target_block() {
-                Some(t) => block_by_id(&tx, doc_id, t)?,
-                None => None,
-            };
-            project(&tx, doc_id, epoch, principal, &op.kind)?;
-            insert_op_row(
-                &tx,
-                op_id,
-                doc_id,
-                op,
-                principal,
-                base_epoch,
-                Some(epoch),
-                Verdict::Green,
-                1.0,
-                &prior,
-            )?;
-            op_ids.push(op_id);
-        }
-        tx.execute(
-            "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
-            params![epoch, doc_id.to_string()],
-        )?;
+        let receipt = apply_in_tx(&tx, doc_id, base_epoch, principal, ops)?;
         tx.commit()?;
-        Ok(ApplyReceipt {
-            doc_id,
-            epoch,
-            op_ids,
-        })
+        Ok(receipt)
     }
 
     fn ops_since(&self, doc_id: Uuid, since_epoch: i64) -> Result<Vec<LedgerOp>> {
-        let mut stmt = self.conn.prepare(&format!(
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {OP_COLS} FROM ops
              WHERE doc_id = ?1 AND epoch_applied IS NOT NULL AND epoch_applied > ?2
              ORDER BY epoch_applied, id"
@@ -1403,6 +1599,17 @@ impl BlockStore for SqliteStore {
             }
             cursor = self.get_doc(p)?.parent_id;
         }
+        // no key from the client = append under the new parent; a move must
+        // never re-NULL a key the v5 backfill assigned
+        let sort_key = match sort_key {
+            Some(k) if crate::order_key::is_valid(k) => k.to_string(),
+            Some(k) => {
+                return Err(StoreError::InvalidOp(format!(
+                    "move: invalid sort_key {k:?}"
+                )))
+            }
+            None => next_doc_sort_key(&self.conn, new_parent)?,
+        };
         let n = self.conn.execute(
             "UPDATE docs SET parent_id = ?1, sort_key = ?2 WHERE id = ?3 AND deleted = 0",
             params![
@@ -1613,11 +1820,12 @@ impl BlockStore for SqliteStore {
             "SELECT DISTINCT {}, d.title FROM edges e
              JOIN blocks b ON b.id = e.from_block
              JOIN docs d ON d.id = b.doc_id
-             WHERE b.deleted = 0 AND (e.to_target = ?1 OR e.to_target LIKE '%/' || ?1)
+             WHERE b.deleted = 0 AND d.deleted = 0
+               AND (e.to_target = ?1 OR e.to_target LIKE '%/' || ?1)
              ORDER BY d.title, b.order_key",
             b_cols()
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![doc.title], |r| {
             let raw = row_to_block(r)?;
             let title: String = r.get(10)?;
@@ -1689,11 +1897,11 @@ impl BlockStore for SqliteStore {
                 "SELECT {}, d.title FROM blocks_fts f
                  JOIN blocks b ON b.rowid = f.rowid
                  JOIN docs d ON d.id = b.doc_id
-                 WHERE blocks_fts MATCH ?1 AND b.deleted = 0
+                 WHERE blocks_fts MATCH ?1 AND b.deleted = 0 AND d.deleted = 0
                  ORDER BY bm25(blocks_fts) LIMIT ?2",
                 b_cols()
             );
-            let mut stmt = self.conn.prepare(&sql)?;
+            let mut stmt = self.conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![match_q, limit as i64], |r| {
                 let raw = row_to_block(r)?;
                 let title: String = r.get(10)?;
@@ -1716,11 +1924,11 @@ impl BlockStore for SqliteStore {
         let pattern = format!("%{escaped}%");
         let sql = format!(
             "SELECT {}, d.title FROM blocks b JOIN docs d ON d.id = b.doc_id
-             WHERE b.deleted = 0 AND b.content LIKE ?1 ESCAPE '\\'
+             WHERE b.deleted = 0 AND d.deleted = 0 AND b.content LIKE ?1 ESCAPE '\\'
              ORDER BY d.title, b.order_key LIMIT ?2",
             b_cols()
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![pattern, limit as i64], |r| {
             let raw = row_to_block(r)?;
             let title: String = r.get(10)?;
@@ -1955,7 +2163,9 @@ impl BlockStore for SqliteStore {
 
     fn list_tags(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT tag, count(DISTINCT doc_id) FROM doc_tags GROUP BY tag ORDER BY 2 DESC, tag",
+            "SELECT t.tag, count(DISTINCT t.doc_id) FROM doc_tags t
+             JOIN docs d ON d.id = t.doc_id AND d.deleted = 0
+             GROUP BY t.tag ORDER BY 2 DESC, t.tag",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.map(|r| Ok(r?)).collect()
@@ -1965,7 +2175,7 @@ impl BlockStore for SqliteStore {
         let mut stmt = self.conn.prepare(
             "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status, d.sort_key
              FROM docs d JOIN doc_tags t ON t.doc_id = d.id
-             WHERE t.tag = ?1 GROUP BY d.id ORDER BY d.title",
+             WHERE t.tag = ?1 AND d.deleted = 0 GROUP BY d.id ORDER BY d.title",
         )?;
         let rows = stmt.query_map(params![tag.to_lowercase()], row_to_doc)?;
         rows.map(|r| build_doc(r?)).collect()
@@ -1975,7 +2185,8 @@ impl BlockStore for SqliteStore {
         let mut stmt = self.conn.prepare(
             "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status, d.sort_key
              FROM docs d
-             WHERE EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0)
+             WHERE d.deleted = 0
+               AND EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0)
                AND NOT EXISTS (SELECT 1 FROM doc_tags t WHERE t.doc_id = d.id)
              ORDER BY d.title LIMIT ?1",
         )?;
@@ -2437,32 +2648,48 @@ impl BlockStore for SqliteStore {
         // An existing contact keeps the owner's chosen name (pair_contact).
         let suffix: String = pubkey.chars().take(4).collect();
         let shown = format!("{} · {suffix}", petname.trim());
-        let contact = self.pair_contact(pubkey, &shown)?;
-        // burn first: even if binding fails, the secret is single-use
-        self.conn.execute(
-            "UPDATE share_invites SET redeemed_by = ?1,
-                 redeemed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ?2",
-            params![contact.id.to_string(), invite_id],
-        )?;
-        self.conn.execute(
-            "UPDATE shares SET contact = ?1, state = 'active' WHERE id = ?2",
-            params![contact.id.to_string(), share_id.to_string()],
-        )?;
-        // supersede: a re-invite of the same subtree to the same person
-        // replaces the old grant — one active share per (root_doc, contact),
-        // so grantee mirror rows never tug-of-war over permission
-        let share = self.get_share(share_id)?;
-        self.conn.execute(
-            "UPDATE shares SET state = 'revoked'
-             WHERE root_doc = ?1 AND contact = ?2 AND id != ?3 AND state = 'active'",
-            params![
-                share.root_doc.to_string(),
-                contact.id.to_string(),
-                share_id.to_string()
-            ],
-        )?;
-        Ok((contact, share))
+        // pair + burn + bind + supersede land together: a failure half-way
+        // must not leave a contact without a share, or a burned invite that
+        // never bound. The helpers below run on self, so the transaction is
+        // driven by hand rather than through a Transaction borrow.
+        self.conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<(Contact, Share)> {
+            let contact = self.pair_contact(pubkey, &shown)?;
+            self.conn.execute(
+                "UPDATE share_invites SET redeemed_by = ?1,
+                     redeemed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE id = ?2",
+                params![contact.id.to_string(), invite_id],
+            )?;
+            self.conn.execute(
+                "UPDATE shares SET contact = ?1, state = 'active' WHERE id = ?2",
+                params![contact.id.to_string(), share_id.to_string()],
+            )?;
+            // supersede: a re-invite of the same subtree to the same person
+            // replaces the old grant — one active share per (root_doc, contact),
+            // so grantee mirror rows never tug-of-war over permission
+            let share = self.get_share(share_id)?;
+            self.conn.execute(
+                "UPDATE shares SET state = 'revoked'
+                 WHERE root_doc = ?1 AND contact = ?2 AND id != ?3 AND state = 'active'",
+                params![
+                    share.root_doc.to_string(),
+                    contact.id.to_string(),
+                    share_id.to_string()
+                ],
+            )?;
+            Ok((contact, share))
+        })();
+        match result {
+            Ok(out) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(out)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     fn docs_in_share(&self, share_id: Uuid) -> Result<Vec<Doc>> {
@@ -2513,15 +2740,7 @@ impl BlockStore for SqliteStore {
         parent: Option<Uuid>,
         created_by: Uuid,
     ) -> Result<Doc> {
-        self.conn.execute(
-            "INSERT INTO docs (id, parent_id, title, created_by) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                id.to_string(),
-                parent.map(|p| p.to_string()),
-                title,
-                created_by.to_string()
-            ],
-        )?;
+        insert_doc_row(&self.conn, id, title, parent, created_by)?;
         self.get_doc(id)
     }
 
@@ -3085,8 +3304,11 @@ impl BlockStore for SqliteStore {
     fn stale_block_vectors(&self, limit: usize) -> Result<Vec<(Uuid, i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT b.id, b.epoch, b.content FROM blocks b
+             JOIN docs d ON d.id = b.doc_id
              LEFT JOIN block_vec v ON v.block_id = b.id
              WHERE b.deleted = 0 AND b.block_type != 'comment'
+               AND d.deleted = 0
+               AND NOT EXISTS (SELECT 1 FROM mirrors m WHERE m.doc_id = b.doc_id)
                AND (v.block_id IS NULL OR v.epoch < b.epoch)
              ORDER BY b.epoch DESC LIMIT ?1",
         )?;
@@ -3115,8 +3337,10 @@ impl BlockStore for SqliteStore {
 
     fn block_vecs(&self) -> Result<Vec<(Uuid, Vec<f32>)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT v.block_id, v.vec FROM block_vec v JOIN blocks b ON b.id = v.block_id
-             WHERE b.deleted = 0 AND v.dim > 0",
+            "SELECT v.block_id, v.vec FROM block_vec v
+             JOIN blocks b ON b.id = v.block_id
+             JOIN docs d ON d.id = b.doc_id
+             WHERE b.deleted = 0 AND d.deleted = 0 AND v.dim > 0",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
         rows.map(|r| {
@@ -3147,7 +3371,17 @@ impl BlockStore for SqliteStore {
             if block.deleted {
                 continue;
             }
-            let doc_title = self.get_doc(block.doc_id).map(|d| d.title).unwrap_or_default();
+            // a trashed doc's blocks are not hits (the vector index lags the
+            // tombstone by up to one embed pass)
+            let doc: Option<(String, i64)> = self
+                .conn
+                .query_row(
+                    "SELECT title, deleted FROM docs WHERE id = ?1",
+                    params![block.doc_id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((doc_title, 0)) = doc else { continue };
             out.push(SearchHit { block, doc_title });
         }
         Ok(out)
@@ -3156,10 +3390,10 @@ impl BlockStore for SqliteStore {
     fn change_signature(&self) -> Result<ChangeSignature> {
         // one cheap aggregate over docs + shares: enough to say "nothing an
         // owner-side nudge could care about moved since last tick"
-        let (max_epoch, doc_count): (i64, i64) = self.conn.query_row(
-            "SELECT coalesce(max(current_epoch), 0), count(*) FROM docs WHERE deleted = 0",
+        let (max_epoch, epoch_sum, doc_count): (i64, i64, i64) = self.conn.query_row(
+            "SELECT coalesce(max(current_epoch), 0), coalesce(sum(current_epoch), 0), count(*) FROM docs WHERE deleted = 0",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let active_shares: i64 = self.conn.query_row(
             "SELECT count(*) FROM shares WHERE state = 'active'",
@@ -3168,6 +3402,7 @@ impl BlockStore for SqliteStore {
         )?;
         Ok(ChangeSignature {
             max_epoch,
+            epoch_sum,
             doc_count,
             active_shares,
         })
@@ -3387,6 +3622,12 @@ impl BlockStore for SqliteStore {
                 tx.execute("DELETE FROM doc_tags WHERE block_id = ?1", params![id])?;
             }
         }
+        // embeddings go with their blocks (belt: the FK also cascades since
+        // the block_vec rebuild, but a pre-rebuild table must not fail here)
+        tx.execute(
+            "DELETE FROM block_vec WHERE block_id IN (SELECT id FROM blocks WHERE doc_id = ?1)",
+            params![doc_id.to_string()],
+        )?;
         tx.execute(
             "DELETE FROM blocks WHERE doc_id = ?1",
             params![doc_id.to_string()],
@@ -3552,7 +3793,15 @@ impl BlockStore for SqliteStore {
             (AnnotationKind::Parked, ReviewDecision::Accept) => {
                 let current = doc_epoch(&tx, doc_id)?;
                 let epoch = current + 1;
-                project(&tx, doc_id, epoch, op.principal, &op.kind)?;
+                // the key was resolved at park time; a sibling may hold it now
+                let mut kind = op.kind.clone();
+                if dedupe_insert_key(&tx, doc_id, &mut kind)? {
+                    tx.execute(
+                        "UPDATE ops SET payload = ?1 WHERE id = ?2",
+                        params![serde_json::to_string(&kind)?, op.id.to_string()],
+                    )?;
+                }
+                project(&tx, doc_id, epoch, op.principal, &kind)?;
                 tx.execute(
                     "UPDATE ops SET epoch_applied = ?1 WHERE id = ?2",
                     params![epoch, op.id.to_string()],
@@ -3681,7 +3930,9 @@ impl SqliteStore {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT b.id, b.doc_id, b.content
              FROM edges e JOIN blocks b ON b.id = e.from_block
-             WHERE b.deleted = 0 AND (e.to_target = ?1 OR e.to_target LIKE '%/' || ?1)",
+             JOIN docs d ON d.id = b.doc_id
+             WHERE b.deleted = 0 AND d.deleted = 0
+               AND (e.to_target = ?1 OR e.to_target LIKE '%/' || ?1)",
         )?;
         let rows = stmt.query_map(params![title], |r| {
             Ok((
@@ -3859,11 +4110,39 @@ impl SqliteStore {
                       + (SELECT COALESCE(max(rowid), 0) FROM gardener_runs) * 104729
                       + (SELECT count(*) FROM gardener_runs WHERE status != 'running') * 31
                       + (SELECT COALESCE(sum(length(coalesce(summary,''))), 0) FROM gardener_runs)
-                      + (SELECT COALESCE(sum(length(coalesce(sort_key,'')) + length(coalesce(parent_id,'')) + length(title)), 0) FROM docs WHERE deleted = 0)",
+                      + (SELECT COALESCE(sum(length(coalesce(sort_key,'')) + length(coalesce(parent_id,'')) + length(title)), 0) FROM docs WHERE deleted = 0)
+                      + (SELECT COALESCE(rev, 0) FROM doc_revs WHERE id = 1) * 1299709",
                 [],
                 |r| r.get(0),
             )
             .map_err(Into::into)
+    }
+
+    /// The doc's most recent applied ops, newest first (epoch, then id,
+    /// descending), capped at `limit` — the history panel's page, fetched
+    /// in one bounded query instead of the whole ledger reversed and cut.
+    pub fn ops_for_doc_limited(&self, doc_id: Uuid, limit: usize) -> Result<Vec<LedgerOp>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {OP_COLS} FROM ops
+             WHERE doc_id = ?1 AND epoch_applied IS NOT NULL
+             ORDER BY epoch_applied DESC, id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![doc_id.to_string(), limit as i64], row_to_op)?;
+        rows.map(|r| build_op(r?)).collect()
+    }
+
+    /// Hub side: drop forward records older than `older_than_days`. A forward
+    /// carries no outcome of its own (the owner's op and annotation do), so
+    /// age is the only terminal signal; the member's status handle for a
+    /// pruned forward then answers "unknown" instead of asking the owner.
+    /// Returns how many rows went.
+    pub fn prune_hub_forwards(&mut self, older_than_days: u32) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM hub_forwards
+             WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
+            params![format!("-{older_than_days} days")],
+        )?;
+        Ok(n)
     }
 
     /// Docs whose content is a canvas scene (for tree/type badges).
@@ -3891,8 +4170,9 @@ impl SqliteStore {
             "SELECT DISTINCT b.doc_id, d2.id
              FROM edges e
              JOIN blocks b ON b.id = e.from_block AND b.deleted = 0
+             JOIN docs d1 ON d1.id = b.doc_id AND d1.deleted = 0
              JOIN docs d2 ON (e.to_target = d2.title OR e.to_target LIKE '%/' || d2.title)
-             WHERE b.doc_id != d2.id",
+             WHERE b.doc_id != d2.id AND d2.deleted = 0",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         rows.map(|r| Ok(r?)).collect()
@@ -3902,7 +4182,11 @@ impl SqliteStore {
     pub fn raw_doc_tags(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT doc_id, tag FROM doc_tags ORDER BY doc_id")?;
+            .prepare(
+                "SELECT t.doc_id, t.tag FROM doc_tags t
+                 JOIN docs d ON d.id = t.doc_id AND d.deleted = 0
+                 ORDER BY t.doc_id",
+            )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
         for r in rows {
@@ -4086,6 +4370,256 @@ impl SqliteStore {
 mod tests {
     use super::*;
 
+    /// Epochs are per doc: editing a doc whose epoch stays below the global
+    /// max must still move the change signature (the realtime nudge relies
+    /// on it), which `max(current_epoch)` alone never did.
+    #[test]
+    fn change_signature_moves_on_a_lower_epoch_doc_edit() {
+        use crate::PrincipalKind;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "Tom", None).unwrap();
+        let ins = |content: &str| OpInput {
+            kind: OpKind::Insert {
+                block_id: Uuid::now_v7(),
+                parent_id: None,
+                order_key: "".into(),
+                block_type: BlockType::Paragraph,
+                content: content.into(),
+                refers_to: None,
+            },
+            source_refs: vec![],
+        };
+        let high = s.create_doc("high", None, tom.id).unwrap();
+        let low = s.create_doc("low", None, tom.id).unwrap();
+        // high: epochs 1..=3; low: epoch 1
+        for e in 0..3 {
+            s.apply(high.id, e, tom.id, vec![ins("h")]).unwrap();
+        }
+        s.apply(low.id, 0, tom.id, vec![ins("l")]).unwrap();
+        let before = s.change_signature().unwrap();
+        assert_eq!(before.max_epoch, 3);
+        // bump the lower doc to epoch 2: the max is unchanged, the sum is not
+        s.apply(low.id, 1, tom.id, vec![ins("l2")]).unwrap();
+        let after = s.change_signature().unwrap();
+        assert_eq!(after.max_epoch, before.max_epoch, "max alone cannot see this edit");
+        assert_ne!(after, before, "signature must move on any single-doc epoch bump");
+        assert_eq!(after.epoch_sum, before.epoch_sum + 1);
+    }
+
+    /// A move without a client key appends under the new parent instead of
+    /// re-NULLing the key; a malformed key is refused.
+    #[test]
+    fn move_doc_without_key_appends_and_rejects_invalid_keys() {
+        use crate::PrincipalKind;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "Tom", None).unwrap();
+        let folder = s.create_doc("folder", None, tom.id).unwrap();
+        let first = s.create_doc("first", Some(folder.id), tom.id).unwrap();
+        let mover = s.create_doc("mover", None, tom.id).unwrap();
+        s.move_doc(mover.id, Some(folder.id), None).unwrap();
+        let moved = s.get_doc(mover.id).unwrap();
+        assert_eq!(moved.parent_id, Some(folder.id));
+        let key = moved.sort_key.expect("move must not NULL the key");
+        assert!(crate::order_key::is_valid(&key));
+        assert!(key > first.sort_key.unwrap(), "appended after the last sibling");
+        let err = s.move_doc(mover.id, None, Some("A0")).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidOp(_)), "{err}");
+        assert_eq!(s.get_doc(mover.id).unwrap().parent_id, Some(folder.id));
+    }
+
+    /// A trashed sibling keeps its key; a new doc must key past it so the
+    /// restore does not produce two siblings with the same key.
+    #[test]
+    fn new_doc_key_clears_a_trashed_siblings_key() {
+        use crate::PrincipalKind;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "Tom", None).unwrap();
+        let a = s.create_doc("a", None, tom.id).unwrap();
+        s.delete_doc(a.id).unwrap();
+        let b = s.create_doc("b", None, tom.id).unwrap();
+        s.restore_doc(a.id).unwrap();
+        let ka = s.get_doc(a.id).unwrap().sort_key.unwrap();
+        let kb = s.get_doc(b.id).unwrap().sort_key.unwrap();
+        assert_ne!(ka, kb);
+        assert!(kb > ka);
+    }
+
+    /// v5 backfill: NULL sort_keys are assigned per parent, in title order,
+    /// after any key the parent's siblings already hold; a second run is a
+    /// no-op and the version lands at SCHEMA_VERSION.
+    #[test]
+    fn backfill_v5_keys_unkeyed_docs_per_parent_in_title_order() {
+        use crate::PrincipalKind;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s
+            .create_principal(PrincipalKind::Human, "Tom", None)
+            .unwrap();
+        let folder = s.create_doc("folder", None, tom.id).unwrap();
+        let keyed = s.create_doc("keyed", Some(folder.id), tom.id).unwrap();
+        let keyed_key = keyed.sort_key.clone().unwrap();
+        let b = s.create_doc("b", Some(folder.id), tom.id).unwrap();
+        let a = s.create_doc("a", Some(folder.id), tom.id).unwrap();
+        let root = s.create_doc("root-null", None, tom.id).unwrap();
+        for id in [b.id, a.id, root.id] {
+            s.conn
+                .execute(
+                    "UPDATE docs SET sort_key = NULL WHERE id = ?1",
+                    params![id.to_string()],
+                )
+                .unwrap();
+        }
+        s.conn.pragma_update(None, "user_version", 4).unwrap();
+        backfill(&s.conn).unwrap();
+
+        let key = |id: Uuid| s.get_doc(id).unwrap().sort_key.unwrap();
+        let (ka, kb) = (key(a.id), key(b.id));
+        assert!(keyed_key < ka && ka < kb, "{keyed_key} < {ka} < {kb}");
+        assert!(key(folder.id) < key(root.id), "root-level null keyed last");
+        let nulls: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM docs WHERE sort_key IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(nulls, 0);
+        let v: i64 = s
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        backfill(&s.conn).unwrap();
+        assert_eq!(key(a.id), ka, "idempotent");
+    }
+
+    /// prune_hub_forwards deletes by age only: a 40-day-old forward goes at
+    /// the 30-day cutoff, a fresh one and a 20-day-old one stay; 0 days
+    /// prunes everything already in the past.
+    #[test]
+    fn prune_hub_forwards_deletes_by_age() {
+        use crate::PrincipalKind;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s
+            .create_principal(PrincipalKind::Human, "Tom", None)
+            .unwrap();
+        let doc = s.create_doc("d", None, tom.id).unwrap();
+        let owner = s.pair_contact(&"a".repeat(64), "owner").unwrap();
+        let member = s.pair_contact(&"b".repeat(64), "member").unwrap();
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
+        for id in &ids {
+            s.add_hub_forward(*id, owner.id, member.id, Uuid::now_v7(), doc.id)
+                .unwrap();
+        }
+        for (id, days) in [(ids[0], 40), (ids[1], 20)] {
+            s.conn
+                .execute(
+                    "UPDATE hub_forwards
+                     SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)
+                     WHERE op_id = ?2",
+                    params![format!("-{days} days"), id.to_string()],
+                )
+                .unwrap();
+        }
+        assert_eq!(s.prune_hub_forwards(30).unwrap(), 1);
+        let left = s.hub_forwards_for(&ids).unwrap();
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().all(|f| f.op_id != ids[0]), "the 40-day row went");
+        assert_eq!(s.prune_hub_forwards(30).unwrap(), 0, "idempotent");
+        // 0 days: everything strictly in the past goes (the fresh row may
+        // share the cutoff's millisecond and legitimately survive)
+        assert!(s.prune_hub_forwards(0).unwrap() >= 1);
+        assert!(
+            s.hub_forwards_for(&ids).unwrap().iter().all(|f| f.op_id != ids[1]),
+            "the 20-day row went"
+        );
+    }
+
+    /// ops_for_doc_limited equals "ops_since(doc, 0), reversed, truncated"
+    /// — the history handler's derivation — for a multi-epoch, multi-op
+    /// ledger, and skips parked (unapplied) ops.
+    #[test]
+    fn ops_for_doc_limited_is_newest_first_and_capped() {
+        use crate::{BlockType, OpInput, OpKind, PrincipalKind};
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s
+            .create_principal(PrincipalKind::Human, "Tom", None)
+            .unwrap();
+        let doc = s.create_doc("d", None, tom.id).unwrap();
+        let ins = |content: &str| OpInput {
+            kind: OpKind::Insert {
+                block_id: Uuid::now_v7(),
+                parent_id: None,
+                order_key: "".into(),
+                block_type: BlockType::Paragraph,
+                content: content.into(),
+                refers_to: None,
+            },
+            source_refs: vec![],
+        };
+        // epoch 1: two ops in one batch; epochs 2..=4: one op each
+        s.apply(doc.id, 0, tom.id, vec![ins("a"), ins("b")]).unwrap();
+        for (i, c) in ["c", "d", "e"].iter().enumerate() {
+            s.apply(doc.id, 1 + i as i64, tom.id, vec![ins(c)]).unwrap();
+        }
+        // a parked op never shows in history
+        s.park(doc.id, tom.id, vec![ins("parked")], "later").unwrap();
+
+        let mut expected = s.ops_since(doc.id, 0).unwrap();
+        expected.reverse();
+        assert_eq!(expected.len(), 5);
+        let all = s.ops_for_doc_limited(doc.id, 100).unwrap();
+        assert_eq!(all, expected, "same order as reverse(ops_since)");
+        assert!(all.iter().all(|o| o.epoch_applied.is_some()));
+
+        expected.truncate(3);
+        let capped = s.ops_for_doc_limited(doc.id, 3).unwrap();
+        assert_eq!(capped, expected);
+        assert_eq!(capped[0].epoch_applied, Some(4));
+        assert!(s.ops_for_doc_limited(doc.id, 0).unwrap().is_empty());
+        assert!(s.ops_for_doc_limited(Uuid::now_v7(), 5).unwrap().is_empty());
+    }
+
+    /// Items 8/9: the connection runs WAL + synchronous NORMAL with a busy
+    /// timeout, and the query-backed indexes exist.
+    #[test]
+    fn pragmas_and_indexes_are_in_place() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let sync: i64 = s
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 1, "NORMAL");
+        let busy: i64 = s
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert!(busy >= 5000);
+        for idx in [
+            "blocks_by_refers_to",
+            "docs_by_parent",
+            "ops_by_principal",
+            "annotations_by_status",
+            "annotations_by_op",
+        ] {
+            let n: i64 = s
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    params![idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "index {idx} missing");
+        }
+        // the plan for list_comments walks the refers_to index
+        let plan: String = s
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM blocks WHERE refers_to = 'x' AND deleted = 0",
+                [],
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap();
+        assert!(plan.contains("blocks_by_refers_to"), "{plan}");
+    }
+
     /// Hub slice 2 bookkeeping: on-behalf-of principals, forward records,
     /// hub-side transfer offers, and the two-sided transfer ledger.
     #[test]
@@ -4220,6 +4754,71 @@ mod tests {
         assert_eq!(fk, 0);
         migrate_pre_schema(&s.conn).unwrap();
         assert_eq!(s.list_shares().unwrap().len(), 1);
+    }
+
+    /// block_vec from before the cascade: opening the DB rebuilds it with
+    /// ON DELETE CASCADE, keeps the rows, and a hard block delete then takes
+    /// the vector with it.
+    #[test]
+    fn opening_a_db_with_a_non_cascading_block_vec_rebuilds_it() {
+        use crate::{BlockType, OpInput, OpKind, PrincipalKind};
+        use rusqlite::params;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
+        let doc = s.create_doc("D", None, tom.id).unwrap();
+        let bid = Uuid::now_v7();
+        s.apply(
+            doc.id,
+            0,
+            tom.id,
+            vec![OpInput {
+                kind: OpKind::Insert {
+                    block_id: bid,
+                    parent_id: None,
+                    order_key: "i".into(),
+                    block_type: BlockType::Paragraph,
+                    content: "x".into(),
+                    refers_to: None,
+                },
+                source_refs: vec![],
+            }],
+        )
+        .unwrap();
+        s.conn
+            .execute_batch(
+                "DROP TABLE block_vec;
+                 CREATE TABLE block_vec (
+                     block_id TEXT PRIMARY KEY REFERENCES blocks (id),
+                     epoch INTEGER NOT NULL, dim INTEGER NOT NULL, vec BLOB NOT NULL);",
+            )
+            .unwrap();
+        s.set_block_vec(bid, 1, &[1.0]).unwrap();
+        // old table: a hard delete of the block is an FK error
+        assert!(
+            s.conn
+                .execute("DELETE FROM blocks WHERE id = ?1", params![bid.to_string()])
+                .is_err()
+        );
+        migrate_pre_schema(&s.conn).unwrap();
+        migrate_pre_schema(&s.conn).unwrap(); // idempotent
+        let sql: String = s
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'block_vec'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("ON DELETE CASCADE"));
+        assert_eq!(s.block_vecs().unwrap().len(), 1, "rows survive the rebuild");
+        s.conn
+            .execute("DELETE FROM blocks WHERE id = ?1", params![bid.to_string()])
+            .unwrap();
+        let n: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM block_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "cascade took the vector");
     }
 
     /// v4 backfill: a row whose stored type disagrees with its content is

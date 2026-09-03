@@ -163,6 +163,16 @@ pub enum Request {
     /// Hub (slice 2): reversal seam — an admin handing a subtree back.
     /// Typed so peers can answer `Unsupported` today.
     TransferBack { root_doc: String },
+    /// 0.7.2 (member → hub): "I flipped this folder to your mirrors and my
+    /// `TransferReady` reply may not have reached you — re-run the take-over."
+    /// Sent by the member's sweep while a flipped transfer is unacknowledged;
+    /// the hub answers `Noted` once the take-over is done (the member then
+    /// stops asking), `Busy` while it is in progress. No share id: the hub
+    /// keeps none for an accepted transfer, so it could not validate one, and
+    /// it learns the share from the member's `TransferAccepted` reply anyway.
+    /// A 0.7.1 hub cannot decode this and answers `BadRequest`: the member
+    /// backs that transfer off to hourly.
+    TransferReady { root_doc: String },
 }
 
 /// Hub (slice 2): who a forwarded proposal is really from.
@@ -432,6 +442,11 @@ pub enum RefusalCode {
     /// in a live session or has edits waiting for review. The reason names
     /// the doc; retry once it is idle.
     Busy,
+    /// 0.7.2: the share's root is already a mirror held from a DIFFERENT
+    /// contact and this join may not rebind it (raised grantee-side by
+    /// `client::join_at_from`; never retried — the invite cannot succeed
+    /// until the person resolves the conflict).
+    RootConflict,
     #[default]
     #[serde(other)]
     Other,
@@ -485,11 +500,25 @@ pub struct Ticket {
 
 const LINK_PREFIX: &str = "grimoire://join/";
 
+/// 0.7.2 hub marker: an invite minted BY A HUB for its root carries this
+/// prefix on the secret. The grantee sets `is_hub` on the new contact only
+/// when the ticket it redeemed carries the marker — the owner's `Redeemed`
+/// reply alone never does (a plain owner could otherwise claim to be a hub
+/// and have its `on_behalf_of` proposals honoured). Living inside the secret
+/// keeps the link format unchanged: a 0.7.1 peer parses and redeems it as
+/// any other secret (the hash covers the whole string).
+pub const HUB_SECRET_PREFIX: &str = "hub-";
+
 /// A fresh invite secret: 16 random bytes, base32 lowercase, no padding.
 pub fn new_secret() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("OS entropy");
     data_encoding::BASE32_NOPAD.encode(&bytes).to_lowercase()
+}
+
+/// A secret for a hub-root invite (`HUB_SECRET_PREFIX` + `new_secret`).
+pub fn new_hub_secret() -> String {
+    format!("{HUB_SECRET_PREFIX}{}", new_secret())
 }
 
 impl Ticket {
@@ -500,6 +529,12 @@ impl Ticket {
             share,
             secret,
         }
+    }
+
+    /// Whether this invite was minted by a hub for its root (see
+    /// `HUB_SECRET_PREFIX`). Only such a ticket may flag the owner `is_hub`.
+    pub fn is_hub_invite(&self) -> bool {
+        self.secret.starts_with(HUB_SECRET_PREFIX)
     }
 
     /// The v2 short link.

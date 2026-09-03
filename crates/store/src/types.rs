@@ -680,6 +680,9 @@ pub struct Share {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChangeSignature {
     pub max_epoch: i64,
+    /// Epochs are per doc: an edit to a doc below the global max leaves
+    /// `max_epoch` alone, so the sum is what makes every bump visible.
+    pub epoch_sum: i64,
     pub doc_count: i64,
     pub active_shares: i64,
 }

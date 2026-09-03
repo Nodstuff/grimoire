@@ -4,16 +4,18 @@
 //! 120s sweep for the rest, instant when nudged), the outbound-proposal
 //! status refresh, and the async join retry (ADR 0002 decision 6).
 //!
-//! Owner side: the change detector that NUDGES grantees — one 1s tick diffs
-//! every active share's docs (epoch moved → `doc_changed`, new id →
-//! `doc_added`, cold→hot → `live_started`) and dials the contact. Nudges are
-//! best-effort; the grantee's poll is the safety net.
+//! Owner side: the change detector that NUDGES grantees — one 1s tick names
+//! the docs that moved and diffs only the shares containing them (epoch
+//! moved → `doc_changed`, new id → `doc_added`, cold→hot → `live_started`),
+//! then dials the contact. Nudges are best-effort; the grantee's poll is the
+//! safety net. Every loop runs under `supervise` (restart on panic/exit).
 
 use super::client::{join_once, pull_share, request};
 use super::runtime::Runtime;
 use super::server::served_docs_for;
 use super::wire::{NotifyItem, NotifyKind, Refusal, RefusalCode, Request, Response, Ticket};
 use crate::hot::HotState;
+use crate::store_ext::{blocking, with_store};
 use anyhow::Result;
 use futures_util::StreamExt;
 use grimoire_store::{BlockStore, SqliteStore};
@@ -60,8 +62,7 @@ pub fn spawn_nudged_pull(
                 // an explicit revoke arrives as a nudge too (the owner tells us
                 // so we don't keep stale docs until the sweep): drop at once
                 Err(e) if refusal_code_of(&e) == Some(RefusalCode::ShareRevoked) => {
-                    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                    let dropped = drop_dead_share(&mut s, share_id);
+                    let dropped = with_store(&store, move |s| drop_dead_share(s, share_id)).await;
                     tracing::info!(%share_id, dropped = dropped.len(), "share revoked upstream; mirrors dropped");
                 }
                 Err(e) => tracing::warn!(%share_id, "nudged pull failed: {e:#}"),
@@ -76,16 +77,16 @@ pub fn spawn_nudged_pull(
 /// Refresh the state of pending outbound proposals from their owners; any
 /// accepted content arrives via the normal pull.
 pub async fn refresh_outbound(endpoint: &Endpoint, store: &Arc<Mutex<SqliteStore>>) {
-    let pending = {
-        let s = store.lock().unwrap_or_else(|p| p.into_inner());
-        s.list_outbound_proposals(true).unwrap_or_default()
-    };
+    let pending = with_store(store, |s| s.list_outbound_proposals(true).unwrap_or_default()).await;
     for prop in pending {
         let owner = {
-            let s = store.lock().unwrap_or_else(|p| p.into_inner());
-            s.list_contacts()
-                .ok()
-                .and_then(|cs| cs.into_iter().find(|c| c.id == prop.owner))
+            let owner = prop.owner;
+            with_store(store, move |s| {
+                s.list_contacts()
+                    .ok()
+                    .and_then(|cs| cs.into_iter().find(|c| c.id == owner))
+            })
+            .await
         };
         let Some(owner) = owner.filter(|o| !o.revoked) else {
             continue;
@@ -131,8 +132,8 @@ pub async fn refresh_outbound(endpoint: &Endpoint, store: &Arc<Mutex<SqliteStore
         } else {
             "mixed"
         };
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-        s.set_outbound_state(prop.id, state).ok();
+        let id = prop.id;
+        with_store(store, move |s| s.set_outbound_state(id, state).ok()).await;
         tracing::info!(doc = %prop.doc_id, state, "outbound proposal resolved");
     }
 }
@@ -204,19 +205,21 @@ impl DeadPeerTracker {
 }
 
 /// (owner contact, share) pairs we hold mirrors for, non-revoked owners only.
-fn share_groups(store: &Arc<Mutex<SqliteStore>>) -> Vec<(grimoire_store::Contact, Uuid)> {
-    let s = store.lock().unwrap_or_else(|p| p.into_inner());
-    let mirrors = s.list_mirrors().unwrap_or_default();
-    let contacts = s.list_contacts().unwrap_or_default();
-    let mut seen = std::collections::HashSet::new();
-    mirrors
-        .into_iter()
-        .filter(|m| seen.insert((m.owner, m.share_id)))
-        .filter_map(|m| {
-            let c = contacts.iter().find(|c| c.id == m.owner)?.clone();
-            (!c.revoked).then_some((c, m.share_id))
-        })
-        .collect()
+async fn share_groups(store: &Arc<Mutex<SqliteStore>>) -> Vec<(grimoire_store::Contact, Uuid)> {
+    with_store(store, |s| {
+        let mirrors = s.list_mirrors().unwrap_or_default();
+        let contacts = s.list_contacts().unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+        mirrors
+            .into_iter()
+            .filter(|m| seen.insert((m.owner, m.share_id)))
+            .filter_map(|m| {
+                let c = contacts.iter().find(|c| c.id == m.owner)?.clone();
+                (!c.revoked).then_some((c, m.share_id))
+            })
+            .collect()
+    })
+    .await
 }
 
 /// Pull a set of (owner, share) groups — `PULL_CONCURRENCY` owners at a time
@@ -235,11 +238,8 @@ async fn pull_groups(
             };
             // sync health for the shares page: success clears, failure records
             {
-                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                match &res {
-                    Ok(_) => s.set_mirror_sync_result(share_id, None).ok(),
-                    Err(e) => s.set_mirror_sync_result(share_id, Some(&format!("{e:#}"))).ok(),
-                };
+                let err = res.as_ref().err().map(|e| format!("{e:#}"));
+                with_store(store, move |s| s.set_mirror_sync_result(share_id, err.as_deref()).ok()).await;
             }
             (share_id, res)
         })
@@ -257,10 +257,12 @@ async fn pull_groups(
             .collect()
     };
     if !dead_shares.is_empty() {
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-        for share_id in dead_shares {
-            drop_dead_share(&mut s, share_id);
-        }
+        with_store(store, move |s| {
+            for share_id in dead_shares {
+                drop_dead_share(s, share_id);
+            }
+        })
+        .await;
     }
     out
 }
@@ -272,7 +274,7 @@ pub async fn pull_all_once(
     endpoint: &Endpoint,
     store: &Arc<Mutex<SqliteStore>>,
 ) -> Vec<(Uuid, Result<PullSummary>)> {
-    let groups = share_groups(store);
+    let groups = share_groups(store).await;
     pull_groups(endpoint, store, groups, &Mutex::new(DeadPeerTracker::default())).await
 }
 
@@ -281,6 +283,10 @@ pub async fn pull_all_once(
 /// proposal statuses). Nudges from owners trigger pulls independently, so
 /// this is the safety net, not the primary path.
 pub async fn pull_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, runtime: Runtime) {
+    supervise("pull", move || pull_loop_inner(endpoint.clone(), store.clone(), runtime.clone())).await
+}
+
+async fn pull_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, runtime: Runtime) {
     let mut last_sweep = Instant::now();
     let dead = Mutex::new(DeadPeerTracker::default());
     loop {
@@ -290,21 +296,30 @@ pub async fn pull_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, runti
             last_sweep = Instant::now();
             {
                 // invites v2: offers die with their invite (7 days)
-                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                if let Ok(n) = s.expire_share_offers()
-                    && n > 0
-                {
-                    tracing::info!(expired = n, "share offers expired");
-                }
+                with_store(&store, |s| {
+                    if let Ok(n) = s.expire_share_offers()
+                        && n > 0
+                    {
+                        tracing::info!(expired = n, "share offers expired");
+                    }
+                })
+                .await;
             }
             refresh_outbound(&endpoint, &store).await;
-            pull_groups(&endpoint, &store, share_groups(&store), &dead).await
+            // 0.7.2: a flipped transfer whose Ready reply was lost is re-announced
+            super::transfer::resend_ready(&endpoint, &store, None).await;
+            {
+                let store = store.clone();
+                blocking(move || prune_hub_forwards(&store)).await;
+            }
+            pull_groups(&endpoint, &store, share_groups(&store).await, &dead).await
         } else {
             let focused = runtime.focused_shares();
             if focused.is_empty() {
                 continue;
             }
             let groups: Vec<_> = share_groups(&store)
+                .await
                 .into_iter()
                 .filter(|(_, sh)| focused.contains(sh))
                 .collect();
@@ -425,94 +440,224 @@ pub async fn send_nudges(endpoint: Endpoint, peer_id: iroh::EndpointId, share: U
     }
 }
 
-/// Owner-side change detector + nudger. One 1s tick; on an idle daemon the
-/// tick is ONE aggregate query (`change_signature`) plus an atomic read of
-/// the hot generation — the per-share walk runs only when either moved.
-/// When something did, each share's changes go out as one `NotifyBatch`
-/// dial to its contact (best-effort, timed out, never blocking the loop).
-pub async fn notify_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot: HotState) {
-    // (share id) → (doc id → mark); a share's first observation seeds silently
-    let mut marks: HashMap<Uuid, HashMap<Uuid, DocMark>> = HashMap::new();
-    let mut last_sig: Option<(grimoire_store::ChangeSignature, u64)> = None;
-    loop {
-        tokio::time::sleep(NOTIFY_TICK).await;
-        // cheap gate: nothing moved → nothing to diff
-        let sig = {
-            let s = store.lock().unwrap_or_else(|p| p.into_inner());
-            match s.change_signature() {
-                Ok(sig) => (sig, hot.generation()),
-                Err(e) => {
-                    tracing::debug!("change signature failed: {e}");
-                    continue;
+/// Owner-side change detector state (0.7.2: incremental). Per share, the
+/// last (doc → mark) view; across shares, the last epoch of every doc and the
+/// set of live docs, so one tick can name exactly which docs moved and walk
+/// only the shares containing them.
+#[derive(Default)]
+pub struct NotifyState {
+    /// (share id) → (doc id → mark); a share's first observation seeds silently
+    marks: HashMap<Uuid, HashMap<Uuid, DocMark>>,
+    last_sig: Option<(grimoire_store::ChangeSignature, u64)>,
+    doc_epochs: HashMap<Uuid, i64>,
+    hot_docs: std::collections::HashSet<Uuid>,
+    /// How many shares the last tick walked (`served_docs_for` + diff); a
+    /// test seam and a log field.
+    pub last_walked: usize,
+}
+
+/// One nudge batch the tick decided to send.
+pub struct DueBatch {
+    pub share: grimoire_store::Share,
+    pub contact: grimoire_store::Contact,
+    pub items: Vec<NotifyItem>,
+}
+
+/// One detector tick, pure over the store: what is due, and to whom. Idle =
+/// the aggregate signature and the hot generation are unchanged → two trivial
+/// queries, nothing walked. Otherwise: ONE `list_docs` names the docs whose
+/// epoch rose (or are new) and whose hotness flipped; their containing
+/// shares (walked up once per changed doc) plus any share never seen before
+/// are the only ones diffed. Before 0.7.2 every active share was walked on
+/// every change — on a hub, O(shares × mirrors × docs) per edit anywhere.
+pub fn notify_tick(state: &mut NotifyState, store: &SqliteStore, hot: &HotState) -> Vec<DueBatch> {
+    state.last_walked = 0;
+    let sig = match store.change_signature() {
+        Ok(sig) => (sig, hot.generation()),
+        Err(e) => {
+            tracing::debug!("change signature failed: {e}");
+            return Vec::new();
+        }
+    };
+    if state.last_sig == Some(sig) {
+        return Vec::new();
+    }
+    state.last_sig = Some(sig);
+    let contacts = store.list_contacts().unwrap_or_default();
+    let shares: Vec<(grimoire_store::Share, grimoire_store::Contact)> = store
+        .list_shares()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|sh| sh.state == grimoire_store::ShareState::Active)
+        .filter_map(|sh| {
+            let c = contacts.iter().find(|c| Some(c.id) == sh.contact && !c.revoked)?.clone();
+            Some((sh, c))
+        })
+        .collect();
+    let live_share_ids: std::collections::HashSet<Uuid> = shares.iter().map(|(sh, _)| sh.id).collect();
+    state.marks.retain(|id, _| live_share_ids.contains(id)); // forget revoked shares
+
+    // the changed-doc set: epoch rose / new id / hotness flipped
+    let docs = store.list_docs().unwrap_or_default();
+    let hot_now: std::collections::HashSet<Uuid> = docs.iter().map(|d| d.id).filter(|d| hot.is_hot(*d)).collect();
+    let mut changed: Vec<Uuid> = Vec::new();
+    let mut epochs_now: HashMap<Uuid, i64> = HashMap::with_capacity(docs.len());
+    for d in &docs {
+        epochs_now.insert(d.id, d.current_epoch);
+        let moved = match state.doc_epochs.get(&d.id) {
+            Some(prev) => d.current_epoch > *prev,
+            None => true,
+        };
+        if moved || state.hot_docs.contains(&d.id) != hot_now.contains(&d.id) {
+            changed.push(d.id);
+        }
+    }
+    let first_tick = state.doc_epochs.is_empty() && state.marks.is_empty();
+    state.doc_epochs = epochs_now;
+    state.hot_docs = hot_now;
+
+    // shares to walk: those containing a changed doc, plus never-seen shares
+    let mut walk: std::collections::HashSet<Uuid> = shares
+        .iter()
+        .filter(|(sh, _)| !state.marks.contains_key(&sh.id))
+        .map(|(sh, _)| sh.id)
+        .collect();
+    if !first_tick {
+        for d in &changed {
+            for sh in store.shares_containing(*d).unwrap_or_default() {
+                if live_share_ids.contains(&sh.id) {
+                    walk.insert(sh.id);
                 }
             }
-        };
-        if last_sig == Some(sig) {
+        }
+    }
+    // never nudge about a mirror: its changes are the owner's, not ours (a
+    // transferred subtree is served back to its new owner but is nothing to
+    // announce to them) — a hub is the exception: relayed mirrors ARE what
+    // it announces
+    let mirror_ids: std::collections::HashSet<Uuid> = if super::hub::config(store).is_some() {
+        Default::default()
+    } else {
+        store.list_mirrors().unwrap_or_default().into_iter().map(|m| m.doc_id).collect()
+    };
+    let mut out = Vec::new();
+    for (share, contact) in shares {
+        if !walk.contains(&share.id) {
             continue;
         }
-        last_sig = Some(sig);
-        // snapshot under one lock: active shares with a contact, their docs
-        let snapshot: Vec<(grimoire_store::Share, grimoire_store::Contact, Vec<(Uuid, String, DocMark)>)> = {
-            let s = store.lock().unwrap_or_else(|p| p.into_inner());
-            let contacts = s.list_contacts().unwrap_or_default();
-            // never nudge about a mirror: its changes are the owner's, not
-            // ours (a transferred subtree is served back to its new owner
-            // but is nothing to announce to them)
-            // (a hub is the exception: relayed mirrors ARE what it announces)
-            let mirror_ids: std::collections::HashSet<Uuid> = if super::hub::config(&s).is_some() {
-                Default::default()
-            } else {
-                s.list_mirrors().unwrap_or_default().into_iter().map(|m| m.doc_id).collect()
-            };
-            s.list_shares()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|sh| sh.state == grimoire_store::ShareState::Active)
-                .filter_map(|sh| {
-                    let c = contacts.iter().find(|c| Some(c.id) == sh.contact && !c.revoked)?.clone();
-                    let docs = served_docs_for(&s, sh.id, Some(&c.pubkey)).ok()?;
-                    let view: Vec<(Uuid, String, DocMark)> = docs
-                        .into_iter()
-                        .filter(|d| !mirror_ids.contains(&d.id))
-                        .map(|d| {
-                            (
-                                d.id,
-                                d.title,
-                                DocMark {
-                                    epoch: d.current_epoch,
-                                    hot: hot.is_hot(d.id),
-                                },
-                            )
-                        })
-                        .collect();
-                    Some((sh, c, view))
-                })
-                .collect()
+        state.last_walked += 1;
+        let Ok(docs) = served_docs_for(store, share.id, Some(&contact.pubkey)) else { continue };
+        let view: Vec<(Uuid, String, DocMark)> = docs
+            .into_iter()
+            .filter(|d| !mirror_ids.contains(&d.id))
+            .map(|d| (d.id, d.title, DocMark { epoch: d.current_epoch, hot: state.hot_docs.contains(&d.id) }))
+            .collect();
+        let seeded = state.marks.contains_key(&share.id);
+        let last = state.marks.entry(share.id).or_default();
+        let now: Vec<(Uuid, DocMark)> = view.iter().map(|(d, _, m)| (*d, *m)).collect();
+        let due = diff_share(last, &now, seeded);
+        *last = now.iter().copied().collect();
+        if due.is_empty() {
+            continue;
+        }
+        let titles: HashMap<Uuid, String> = view.into_iter().map(|(d, t, _)| (d, t)).collect();
+        out.push(DueBatch { share, contact, items: batch_nudges(&due, &titles) });
+    }
+    if state.last_walked > 0 {
+        tracing::debug!(changed = changed.len(), walked = state.last_walked, due = out.len(), "notify tick");
+    }
+    out
+}
+
+/// Owner-side change detector + nudger. One 1s tick; on an idle daemon the
+/// tick is ONE aggregate query (`change_signature`) plus an atomic read of
+/// the hot generation — the per-share walk runs only for shares whose docs
+/// moved (`notify_tick`). Each share's changes go out as one `NotifyBatch`
+/// dial to its contact (best-effort, timed out, never blocking the loop).
+pub async fn notify_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot: HotState) {
+    supervise("notify", move || notify_loop_inner(endpoint.clone(), store.clone(), hot.clone())).await
+}
+
+async fn notify_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot: HotState) {
+    let mut state = NotifyState::default();
+    loop {
+        tokio::time::sleep(NOTIFY_TICK).await;
+        let due = {
+            let (hot, st) = (hot.clone(), std::mem::take(&mut state));
+            let (due, st) = with_store(&store, move |s| {
+                let mut st = st;
+                let due = notify_tick(&mut st, s, &hot);
+                (due, st)
+            })
+            .await;
+            state = st;
+            due
         };
-        let live_share_ids: std::collections::HashSet<Uuid> = snapshot.iter().map(|(sh, _, _)| sh.id).collect();
-        marks.retain(|id, _| live_share_ids.contains(id)); // forget revoked shares
-        for (share, contact, view) in snapshot {
-            let seeded = marks.contains_key(&share.id);
-            let last = marks.entry(share.id).or_default();
-            let now: Vec<(Uuid, DocMark)> = view.iter().map(|(d, _, m)| (*d, *m)).collect();
-            let due = diff_share(last, &now, seeded);
-            *last = now.iter().copied().collect();
-            if due.is_empty() {
-                continue;
-            }
-            let titles: HashMap<Uuid, String> = view.into_iter().map(|(d, t, _)| (d, t)).collect();
-            let Ok(peer_id) = contact.pubkey.parse::<iroh::EndpointId>() else {
+        for batch in due {
+            let Ok(peer_id) = batch.contact.pubkey.parse::<iroh::EndpointId>() else {
                 continue;
             };
-            let items = batch_nudges(&due, &titles);
             tokio::spawn(send_nudges(
                 endpoint.clone(),
                 peer_id,
-                share.id,
-                items,
-                contact.petname.clone(),
+                batch.share.id,
+                batch.items,
+                batch.contact.petname.clone(),
             ));
         }
+    }
+}
+
+/// Hub forward records older than this are pruned on the sweep.
+pub const HUB_FORWARD_RETENTION_DAYS: u32 = 7;
+
+/// 0.7.2: `hub_forwards` grew forever (one row per forwarded op, never
+/// pruned). A hub drops rows older than `HUB_FORWARD_RETENTION_DAYS` on the
+/// 120s sweep; the owner's op/annotation carries the verdict, so an old row
+/// is only needed while a member may still ask `ProposalStatus` about it.
+/// Non-hubs hold no rows and skip the query.
+pub fn prune_hub_forwards(store: &Arc<Mutex<SqliteStore>>) -> usize {
+    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+    if super::hub::config(&s).is_none() {
+        return 0;
+    }
+    match s.prune_hub_forwards(HUB_FORWARD_RETENTION_DAYS) {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!(pruned = n, days = HUB_FORWARD_RETENTION_DAYS, "hub: old forward records pruned");
+            }
+            n
+        }
+        Err(e) => {
+            tracing::warn!("hub: pruning forward records failed: {e}");
+            0
+        }
+    }
+}
+
+/// 0.7.2: run a background loop forever. A loop task that panics (a poisoned
+/// lock, an unwrap in a rarely-taken branch) or returns is logged at ERROR
+/// and restarted with a backoff (1s, doubling to 60s; reset after a healthy
+/// minute) instead of leaving the daemon silently without pulls, nudges or
+/// join retries until the next restart.
+pub async fn supervise<F, Fut>(name: &'static str, make: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    const MIN: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(60);
+    let mut backoff = MIN;
+    loop {
+        let started = Instant::now();
+        match tokio::spawn(make()).await {
+            Ok(()) => tracing::error!(name, "background loop exited; restarting"),
+            Err(e) if e.is_panic() => tracing::error!(name, "background loop panicked: {e}; restarting"),
+            // cancelled: the runtime is shutting down — a clean exit, not a crash
+            Err(_) => return,
+        }
+        backoff = if started.elapsed() > MAX { MIN } else { (backoff * 2).min(MAX) };
+        tokio::time::sleep(backoff).await;
     }
 }
 
@@ -523,7 +668,8 @@ pub async fn notify_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>, hot
 pub fn join_failure_is_dead(e: &anyhow::Error) -> bool {
     matches!(
         e.downcast_ref::<Refusal>().map(|r| r.code),
-        Some(RefusalCode::InviteInvalid)
+        // a root held from another contact does not free itself by waiting
+        Some(RefusalCode::InviteInvalid | RefusalCode::RootConflict)
     )
 }
 
@@ -552,24 +698,28 @@ pub fn join_expired(created_at: &str, now: chrono::DateTime<chrono::Utc>) -> boo
 /// give-up after the invite window (`join_expired`); every failure is
 /// recorded; success removes the row.
 pub async fn join_retry_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>) {
+    supervise("join-retry", move || join_retry_loop_inner(endpoint.clone(), store.clone())).await
+}
+
+async fn join_retry_loop_inner(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>) {
     const TICK: Duration = Duration::from_secs(60);
     // next attempt per pending join (in memory: a restart simply retries)
     let mut next_due: HashMap<Uuid, Instant> = HashMap::new();
     loop {
         tokio::time::sleep(TICK).await;
-        let pending = {
-            let s = store.lock().unwrap_or_else(|p| p.into_inner());
-            s.list_pending_joins().unwrap_or_default()
-        };
+        let pending = with_store(&store, |s| s.list_pending_joins().unwrap_or_default()).await;
         let live: std::collections::HashSet<Uuid> = pending.iter().map(|j| j.id).collect();
         next_due.retain(|id, _| live.contains(id));
         let now = Instant::now();
         for join in pending {
             if join_expired(&join.created_at, chrono::Utc::now()) {
                 tracing::warn!(attempts = join.attempts, "pending join older than the invite window; giving up");
-                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                s.record_join_attempt(join.id, "gave up: the invite link is older than 7 days — ask for a new one").ok();
-                s.remove_pending_join(join.id).ok();
+                let id = join.id;
+                with_store(&store, move |s| {
+                    s.record_join_attempt(id, "gave up: the invite link is older than 7 days — ask for a new one").ok();
+                    s.remove_pending_join(id).ok();
+                })
+                .await;
                 continue;
             }
             if next_due.get(&join.id).is_some_and(|t| *t > now) {
@@ -580,8 +730,8 @@ pub async fn join_retry_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>)
                 Err(e) => {
                     // unparseable tickets can never succeed; drop them
                     tracing::warn!("dropping unparseable pending join: {e:#}");
-                    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                    s.remove_pending_join(join.id).ok();
+                    let id = join.id;
+                    with_store(&store, move |s| s.remove_pending_join(id).ok()).await;
                     continue;
                 }
             };
@@ -589,8 +739,8 @@ pub async fn join_retry_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>)
                 Ok(out) => {
                     tracing::info!(root = out.root_doc, "queued join completed");
                     {
-                        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                        s.remove_pending_join(join.id).ok();
+                        let id = join.id;
+                        with_store(&store, move |s| s.remove_pending_join(id).ok()).await;
                     }
                     match super::client::pull_after_join(&endpoint, &store, &out.root_doc).await {
                         Ok(sum) => tracing::info!(root = out.root_doc, docs = sum.changed, "first pull after queued join"),
@@ -598,12 +748,13 @@ pub async fn join_retry_loop(endpoint: Endpoint, store: Arc<Mutex<SqliteStore>>)
                     }
                 }
                 Err(e) => {
-                    let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                    let id = join.id;
                     if join_failure_is_dead(&e) {
                         tracing::warn!("dropping pending join: {e:#}");
-                        s.remove_pending_join(join.id).ok();
+                        with_store(&store, move |s| s.remove_pending_join(id).ok()).await;
                     } else {
-                        s.record_join_attempt(join.id, &format!("{e:#}")).ok();
+                        let msg = format!("{e:#}");
+                        with_store(&store, move |s| s.record_join_attempt(id, &msg).ok()).await;
                         next_due.insert(join.id, now + join_backoff(join.attempts + 1));
                     }
                 }

@@ -3,6 +3,7 @@
 //! All writes act as the `claude` agent principal and go through the propose
 //! gate — the MCP surface has no direct-write path by design.
 
+use crate::store_ext::with_store;
 use grimoire_store::{BlockNode, BlockStore, OpInput, ReviewDecision, SqliteStore};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -21,48 +22,122 @@ use uuid::Uuid;
 /// in-memory; a retried propose with the same request_id returns the stored
 /// outcome instead of double-applying. Keyed by principal so one session's
 /// request_id can never replay another session's outcome.
-pub type DedupeCache = Arc<Mutex<std::collections::HashMap<(Uuid, Uuid), serde_json::Value>>>;
+/// Values carry an insertion sequence so eviction drops the OLDEST half
+/// instead of clearing — a retry storm never wipes an in-window entry.
+pub type DedupeCache = Arc<Mutex<std::collections::HashMap<(Uuid, Uuid), (u64, serde_json::Value)>>>;
+
+pub const DEDUPE_CAPACITY: usize = 512;
+static DEDUPE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn dedupe_get(cache: &DedupeCache, principal: Uuid, id: Uuid) -> Option<serde_json::Value> {
     cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&(principal, id))
-        .cloned()
+        .map(|(_, v)| v.clone())
 }
 
 pub fn new_dedupe() -> DedupeCache {
     Arc::new(Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Find-or-create the Agent principal named `name` (the `identify` rule,
-/// shared with the HTTP `X-Grimoire-Principal` header): trimmed, 1–60 chars.
-pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uuid, String> {
+/// Agent principals auto-created since boot (find-or-create by name is an
+/// unauthenticated surface: a misbehaving client must not fill the table).
+static AUTO_CREATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub const MAX_AUTO_PRINCIPALS_PER_BOOT: usize = 256;
+
+/// Test-only: swap the per-boot counter, returning what it was. The counter is
+/// process-global, so a test that moves it holds `AUTO_CREATED_TEST_LOCK` for
+/// the whole window and puts the old value back — otherwise it would refuse
+/// creations for every other test in the binary.
+#[cfg(test)]
+pub static AUTO_CREATED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+pub fn swap_auto_created_for_test(n: usize) -> usize {
+    AUTO_CREATED.swap(n, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A principal name: 1–64 printable chars (no control characters), trimmed.
+pub fn valid_principal_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
-    if name.is_empty() || name.len() > 60 {
-        return Err("name must be 1-60 chars".into());
+    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+        return Err("name must be 1-64 printable chars".into());
     }
+    Ok(name)
+}
+
+/// Find-or-create the Agent principal named `name` (the `identify` rule,
+/// shared with the HTTP `X-Grimoire-Principal` header). Creation is capped
+/// per boot; existing names always resolve.
+pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uuid, String> {
+    let name = valid_principal_name(name)?;
     let existing = store
         .list_principals()
         .ok()
         .and_then(|ps| ps.into_iter().find(|pr| pr.display_name == name));
-    match existing {
-        Some(pr) => Ok(pr.id),
-        None => store
-            .create_principal(grimoire_store::PrincipalKind::Agent, name, None)
-            .map(|pr| pr.id)
-            .map_err(|e| e.to_string()),
+    if let Some(pr) = existing {
+        return Ok(pr.id);
     }
+    if AUTO_CREATED.load(std::sync::atomic::Ordering::Relaxed) >= MAX_AUTO_PRINCIPALS_PER_BOOT {
+        return Err(format!(
+            "too many new agent principals since the daemon started ({MAX_AUTO_PRINCIPALS_PER_BOOT}); \
+             reuse an existing name, or restart the daemon"
+        ));
+    }
+    let pr = store
+        .create_principal(grimoire_store::PrincipalKind::Agent, name, None)
+        .map_err(|e| e.to_string())?;
+    AUTO_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(pr.id)
 }
 
 pub fn dedupe_put(cache: &DedupeCache, principal: Uuid, id: Uuid, v: serde_json::Value) {
     let mut c = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if c.len() >= 512 {
-        c.clear(); // crude LRU: dedupe only needs to survive the retry window
+    if c.len() >= DEDUPE_CAPACITY {
+        // evict the oldest half: the newest entries are the ones a retry
+        // in flight can still ask for
+        let mut seqs: Vec<u64> = c.values().map(|(seq, _)| *seq).collect();
+        seqs.sort_unstable();
+        let cutoff = seqs[seqs.len() / 2];
+        c.retain(|_, (seq, _)| *seq >= cutoff);
     }
-    c.insert((principal, id), v);
+    let seq = DEDUPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    c.insert((principal, id), (seq, v));
+}
+
+#[cfg(test)]
+mod cache_and_name_tests {
+    use super::*;
+
+    #[test]
+    fn dedupe_evicts_the_oldest_half_not_everything() {
+        let cache = new_dedupe();
+        let p = Uuid::now_v7();
+        let ids: Vec<Uuid> = (0..DEDUPE_CAPACITY).map(|_| Uuid::now_v7()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            dedupe_put(&cache, p, *id, json!(i));
+        }
+        let extra = Uuid::now_v7();
+        dedupe_put(&cache, p, extra, json!("new"));
+        let n = cache.lock().unwrap().len();
+        assert_eq!(n, DEDUPE_CAPACITY / 2 + 1);
+        assert!(dedupe_get(&cache, p, ids[0]).is_none(), "oldest evicted");
+        assert_eq!(dedupe_get(&cache, p, ids[DEDUPE_CAPACITY - 1]), Some(json!(DEDUPE_CAPACITY - 1)), "newest kept");
+        assert_eq!(dedupe_get(&cache, p, extra), Some(json!("new")));
+    }
+
+    #[test]
+    fn principal_names_are_bounded_and_printable() {
+        assert_eq!(valid_principal_name("  claude:proj-task "), Ok("claude:proj-task"));
+        assert!(valid_principal_name("").is_err());
+        assert!(valid_principal_name("   ").is_err());
+        assert!(valid_principal_name("a\u{7}b").is_err());
+        assert!(valid_principal_name("line\nbreak").is_err());
+        assert!(valid_principal_name(&"x".repeat(64)).is_ok());
+        assert!(valid_principal_name(&"x".repeat(65)).is_err());
+    }
 }
 
 #[derive(Clone)]
@@ -284,11 +359,11 @@ impl KsMcp {
         Parameters(p): Parameters<IdentifyParams>,
     ) -> Result<CallToolResult, McpError> {
         let name = p.name.trim().to_string();
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let principal = match agent_principal_by_name(&mut store, &name) {
+        let principal = {
+            let name = name.clone();
+            with_store(&self.store, move |store| agent_principal_by_name(store, &name)).await
+        };
+        let principal = match principal {
             Ok(id) => id,
             Err(m) => return err(m),
         };
@@ -306,37 +381,36 @@ impl KsMcp {
         &self,
         Parameters(p): Parameters<MyProposalsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.proposal_outcomes(self.principal(), p.limit.unwrap_or(20) as usize) {
-            Ok(rows) => ok_json(
-                &rows
-                    .into_iter()
-                    .map(|(op, status, resolver)| {
-                        json!({
-                            "op": op,
-                            "review_status": status,
-                            "resolved_by": resolver,
+        let principal = self.principal();
+        with_store(&self.store, move |store| {
+            match store.proposal_outcomes(principal, p.limit.unwrap_or(20) as usize) {
+                Ok(rows) => ok_json(
+                    &rows
+                        .into_iter()
+                        .map(|(op, status, resolver)| {
+                            json!({
+                                "op": op,
+                                "review_status": status,
+                                "resolved_by": resolver,
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-            Err(e) => err(e.to_string()),
-        }
+                        .collect::<Vec<_>>(),
+                ),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 
     #[tool(description = "All tags with doc counts — the vocabulary.")]
     async fn list_tags(&self) -> Result<CallToolResult, McpError> {
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.list_tags() {
-            Ok(t) => ok_json(&t),
-            Err(e) => err(e.to_string()),
-        }
+        with_store(&self.store, move |store| {
+            match store.list_tags() {
+                Ok(t) => ok_json(&t),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 
     #[tool(description = "Docs carrying a tag.")]
@@ -344,14 +418,13 @@ impl KsMcp {
         &self,
         Parameters(p): Parameters<DocsByTagParams>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.docs_by_tag(&p.tag) {
-            Ok(d) => ok_json(&d),
-            Err(e) => err(e.to_string()),
-        }
+        with_store(&self.store, move |store| {
+            match store.docs_by_tag(&p.tag) {
+                Ok(d) => ok_json(&d),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 
     #[tool(
@@ -361,23 +434,22 @@ impl KsMcp {
         &self,
         Parameters(p): Parameters<ListDocsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match p.parent_doc_id.as_deref() {
-            Some(root) => match parse_uuid(root, "parent_doc_id") {
-                Ok(root) => match store.doc_subtree(root) {
+        with_store(&self.store, move |store| {
+            match p.parent_doc_id.as_deref() {
+                Some(root) => match parse_uuid(root, "parent_doc_id") {
+                    Ok(root) => match store.doc_subtree(root) {
+                        Ok(docs) => ok_json(&docs),
+                        Err(e) => err(e.to_string()),
+                    },
+                    Err(m) => err(m),
+                },
+                None => match store.list_docs() {
                     Ok(docs) => ok_json(&docs),
                     Err(e) => err(e.to_string()),
                 },
-                Err(m) => err(m),
-            },
-            None => match store.list_docs() {
-                Ok(docs) => ok_json(&docs),
-                Err(e) => err(e.to_string()),
-            },
-        }
+            }
+        })
+        .await
     }
 
     #[tool(
@@ -392,23 +464,22 @@ impl KsMcp {
             Err(m) => return err(m),
         };
         let full = p.mode.as_deref() == Some("full");
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.read_doc(doc_id) {
-            Ok(tree) => {
-                let mut blocks = Vec::new();
-                flatten(&tree.roots, 0, full, &mut blocks);
-                ok_json(&json!({
-                    "doc": tree.doc,
-                    "epoch": tree.doc.current_epoch,
-                    "mode": if full { "full" } else { "outline" },
-                    "blocks": blocks,
-                }))
+        with_store(&self.store, move |store| {
+            match store.read_doc(doc_id) {
+                Ok(tree) => {
+                    let mut blocks = Vec::new();
+                    flatten(&tree.roots, 0, full, &mut blocks);
+                    ok_json(&json!({
+                        "doc": tree.doc,
+                        "epoch": tree.doc.current_epoch,
+                        "mode": if full { "full" } else { "outline" },
+                        "blocks": blocks,
+                    }))
+                }
+                Err(e) => err(e.to_string()),
             }
-            Err(e) => err(e.to_string()),
-        }
+        })
+        .await
     }
 
     #[tool(description = "Read one block in full (any block id from read_doc or search).")]
@@ -420,14 +491,13 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.read_block(id) {
-            Ok(b) => ok_json(&b),
-            Err(e) => err(e.to_string()),
-        }
+        with_store(&self.store, move |store| {
+            match store.read_block(id) {
+                Ok(b) => ok_json(&b),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 
     #[tool(
@@ -459,28 +529,28 @@ impl KsMcp {
         if let Err(m) = self.hot.assert_cold(doc_id) {
             return err(m);
         }
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // block ops against a stale base are SCORED per op (the gate's whole
-        // point: unchanged targets still green, conflicts yellow/red) — a
-        // stale base is not an error here; see propose_markdown for the
-        // whole-doc path, where it is.
-        match store.propose(doc_id, p.base_epoch, principal, ops) {
-            Ok(out) => {
-                if let Some(rid) = request_id {
-                    dedupe_put(
-                        &self.dedupe,
-                        principal,
-                        rid,
-                        serde_json::to_value(&out).unwrap_or_default(),
-                    );
+        let dedupe = self.dedupe.clone();
+        with_store(&self.store, move |store| {
+            // block ops against a stale base are SCORED per op (the gate's whole
+            // point: unchanged targets still green, conflicts yellow/red) — a
+            // stale base is not an error here; see propose_markdown for the
+            // whole-doc path, where it is.
+            match store.propose(doc_id, p.base_epoch, principal, ops) {
+                Ok(out) => {
+                    if let Some(rid) = request_id {
+                        dedupe_put(
+                            &dedupe,
+                            principal,
+                            rid,
+                            serde_json::to_value(&out).unwrap_or_default(),
+                        );
+                    }
+                    ok_json(&out)
                 }
-                ok_json(&out)
+                Err(e) => err(e.to_string()),
             }
-            Err(e) => err(e.to_string()),
-        }
+        })
+        .await
     }
 
     #[tool(
@@ -508,50 +578,50 @@ impl KsMcp {
         if let Err(m) = self.hot.assert_cold(doc_id) {
             return err(m);
         }
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tree = match store.read_doc(doc_id) {
-            Ok(t) => t,
-            Err(e) => return err(e.to_string()),
-        };
-        // Whole-doc semantics: the markdown was written against base_epoch,
-        // but the diff can only be taken against the CURRENT blocks. If the
-        // doc moved on, that diff would silently re-apply the agent's stale
-        // view over others' edits (scored red, parked, invisible to the
-        // caller). So a stale base is an error here, with the missed ops
-        // attached — re-read, re-apply, re-send.
-        if p.base_epoch != tree.doc.current_epoch {
-            let missed = store.ops_since(doc_id, p.base_epoch).unwrap_or_default();
-            return ok_json(&json!({
-                "error": "stale_base",
-                "base_epoch": p.base_epoch,
-                "current_epoch": tree.doc.current_epoch,
-                "missed_ops": missed,
-                "recover": "re-read the doc (mode full), re-apply your edit to the fresh markdown, re-send with the current epoch",
-            }));
-        }
-        let ops = grimoire_store::mddiff::markdown_to_ops(&tree.roots, &p.markdown);
-        if ops.is_empty() {
-            return ok_json(
-                &json!({"doc_id": doc_id, "epoch": tree.doc.current_epoch, "verdicts": [], "note": "no changes"}),
-            );
-        }
-        match store.propose(doc_id, p.base_epoch, principal, ops) {
-            Ok(out) => {
-                if let Some(rid) = request_id {
-                    dedupe_put(
-                        &self.dedupe,
-                        principal,
-                        rid,
-                        serde_json::to_value(&out).unwrap_or_default(),
-                    );
-                }
-                ok_json(&out)
+        let dedupe = self.dedupe.clone();
+        with_store(&self.store, move |store| {
+            let tree = match store.read_doc(doc_id) {
+                Ok(t) => t,
+                Err(e) => return err(e.to_string()),
+            };
+            // Whole-doc semantics: the markdown was written against base_epoch,
+            // but the diff can only be taken against the CURRENT blocks. If the
+            // doc moved on, that diff would silently re-apply the agent's stale
+            // view over others' edits (scored red, parked, invisible to the
+            // caller). So a stale base is an error here, with the missed ops
+            // attached — re-read, re-apply, re-send.
+            if p.base_epoch != tree.doc.current_epoch {
+                let missed = store.ops_since(doc_id, p.base_epoch).unwrap_or_default();
+                return ok_json(&json!({
+                    "error": "stale_base",
+                    "base_epoch": p.base_epoch,
+                    "current_epoch": tree.doc.current_epoch,
+                    "missed_ops": missed,
+                    "recover": "re-read the doc (mode full), re-apply your edit to the fresh markdown, re-send with the current epoch",
+                }));
             }
-            Err(e) => err(e.to_string()),
-        }
+            let ops = grimoire_store::mddiff::markdown_to_ops(&tree.roots, &p.markdown);
+            if ops.is_empty() {
+                return ok_json(
+                    &json!({"doc_id": doc_id, "epoch": tree.doc.current_epoch, "verdicts": [], "note": "no changes"}),
+                );
+            }
+            match store.propose(doc_id, p.base_epoch, principal, ops) {
+                Ok(out) => {
+                    if let Some(rid) = request_id {
+                        dedupe_put(
+                            &dedupe,
+                            principal,
+                            rid,
+                            serde_json::to_value(&out).unwrap_or_default(),
+                        );
+                    }
+                    ok_json(&out)
+                }
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 
     #[tool(
@@ -565,14 +635,13 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.ops_since(doc_id, p.since_epoch) {
-            Ok(ops) => ok_json(&ops),
-            Err(e) => err(e.to_string()),
-        }
+        with_store(&self.store, move |store| {
+            match store.ops_since(doc_id, p.since_epoch) {
+                Ok(ops) => ok_json(&ops),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 
     #[tool(
@@ -582,14 +651,13 @@ impl KsMcp {
         &self,
         Parameters(p): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.search_blocks(&p.query, p.limit.unwrap_or(20) as usize) {
-            Ok(hits) => ok_json(&hits),
-            Err(e) => err(e.to_string()),
-        }
+        with_store(&self.store, move |store| {
+            match store.search_blocks(&p.query, p.limit.unwrap_or(20) as usize) {
+                Ok(hits) => ok_json(&hits),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 
     #[tool(
@@ -608,14 +676,13 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.review_queue(doc_id) {
-            Ok(q) => ok_json(&q),
-            Err(e) => err(e.to_string()),
-        }
+        with_store(&self.store, move |store| {
+            match store.review_queue(doc_id) {
+                Ok(q) => ok_json(&q),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 
     #[tool(
@@ -634,19 +701,19 @@ impl KsMcp {
             "decline" => ReviewDecision::Decline,
             other => return err(format!("decision must be accept|decline, got {other}")),
         };
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(doc) = crate::hot::annotation_doc(&store, id)
-            && let Err(m) = self.hot.assert_cold(doc)
-        {
-            return err(m);
-        }
-        match store.resolve(id, self.principal(), decision) {
-            Ok(receipt) => ok_json(&json!({ "resolved": true, "receipt": receipt })),
-            Err(e) => err(e.to_string()),
-        }
+        let (hot, principal) = (self.hot.clone(), self.principal());
+        with_store(&self.store, move |store| {
+            if let Some(doc) = crate::hot::annotation_doc(&store, id)
+                && let Err(m) = hot.assert_cold(doc)
+            {
+                return err(m);
+            }
+            match store.resolve(id, principal, decision) {
+                Ok(receipt) => ok_json(&json!({ "resolved": true, "receipt": receipt })),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 
     #[tool(
@@ -660,14 +727,13 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.backlinks(doc_id) {
-            Ok(hits) => ok_json(&hits),
-            Err(e) => err(e.to_string()),
-        }
+        with_store(&self.store, move |store| {
+            match store.backlinks(doc_id) {
+                Ok(hits) => ok_json(&hits),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 
     #[tool(
@@ -690,14 +756,14 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.add_comment(block_id, self.principal(), &p.text, reply_to) {
-            Ok(c) => ok_json(&c),
-            Err(e) => err(e.to_string()),
-        }
+        let principal = self.principal();
+        with_store(&self.store, move |store| {
+            match store.add_comment(block_id, principal, &p.text, reply_to) {
+                Ok(c) => ok_json(&c),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 
     #[tool(description = "All comments anchored to a content block (threads via parent_id).")]
@@ -709,14 +775,13 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.list_comments(block_id) {
-            Ok(c) => ok_json(&c),
-            Err(e) => err(e.to_string()),
-        }
+        with_store(&self.store, move |store| {
+            match store.list_comments(block_id) {
+                Ok(c) => ok_json(&c),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 
     #[tool(description = "Create a new empty doc; add content with propose.")]
@@ -733,14 +798,14 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match store.create_doc(&p.title, parent, self.principal()) {
-            Ok(doc) => ok_json(&doc),
-            Err(e) => err(e.to_string()),
-        }
+        let principal = self.principal();
+        with_store(&self.store, move |store| {
+            match store.create_doc(&p.title, parent, principal) {
+                Ok(doc) => ok_json(&doc),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
     }
 }
 
@@ -756,6 +821,11 @@ impl ServerHandler for KsMcp {
     }
 }
 
+/// Largest `/mcp` request body, matching `propose_markdown` on the HTTP API:
+/// a whole doc's markdown can be megabytes. rmcp's own default is 4 MB, which
+/// silently truncated a big `propose_markdown` long before the axum layer.
+pub const MAX_MCP_BODY: usize = 16 * 1024 * 1024;
+
 pub fn router(
     store: Arc<Mutex<SqliteStore>>,
     agent: Uuid,
@@ -765,7 +835,99 @@ pub fn router(
     let service = StreamableHttpService::new(
         move || Ok(KsMcp::new(store.clone(), agent, dedupe.clone(), hot.clone())),
         LocalSessionManager::default().into(),
-        Default::default(),
+        rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default()
+            .with_max_request_body_bytes(MAX_MCP_BODY),
     );
+    // rmcp reads the body itself, so neither axum's DefaultBodyLimit nor a
+    // tower-http layer gets a say: rmcp's own cap is the one that applies and
+    // it enforces it while streaming, answering 413. A tower-http layer here
+    // only turned that 413 into a 500 on a body with no Content-Length.
     axum::Router::new().nest_service("/mcp", service)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The find-or-create-by-name surface is unauthenticated, so it is capped
+    /// per boot. At the cap, a NEW name is refused while EXISTING names still
+    /// resolve — an agent that already identified never loses its principal.
+    #[test]
+    fn auto_created_principals_are_capped_per_boot() {
+        let _serial = AUTO_CREATED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let previous = swap_auto_created_for_test(0);
+        let known = agent_principal_by_name(&mut store, "claude:known").unwrap();
+
+        swap_auto_created_for_test(MAX_AUTO_PRINCIPALS_PER_BOOT);
+        let err = agent_principal_by_name(&mut store, "claude:brand-new").unwrap_err();
+        assert!(err.contains("too many new agent principals"), "{err}");
+        assert_eq!(
+            agent_principal_by_name(&mut store, "claude:known").unwrap(),
+            known,
+            "an existing name still resolves at the cap"
+        );
+        // one under the cap lets exactly one more through
+        swap_auto_created_for_test(MAX_AUTO_PRINCIPALS_PER_BOOT - 1);
+        assert!(agent_principal_by_name(&mut store, "claude:last-one").is_ok());
+        assert!(agent_principal_by_name(&mut store, "claude:one-too-many").is_err());
+
+        swap_auto_created_for_test(previous);
+    }
+
+    /// rmcp reads the request body itself, so axum's `DefaultBodyLimit` never
+    /// fires on `/mcp`: the 16 MB cap is a tower-http layer. Over it the
+    /// request is rejected before the service sees it.
+    #[tokio::test]
+    async fn mcp_body_over_16mb_is_rejected() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        const LIMIT: usize = MAX_MCP_BODY;
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let agent = store
+            .create_principal(grimoire_store::PrincipalKind::Agent, "claude", None)
+            .unwrap()
+            .id;
+        let hot = crate::hot::HotState::new(
+            std::env::temp_dir().join(format!("grimoire-mcp-test-{}", Uuid::now_v7())),
+        );
+        let app = router(Arc::new(Mutex::new(store)), agent, hot, new_dedupe());
+
+        let send = |body: Vec<u8>| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::post("/mcp")
+                        .header("host", "127.0.0.1:7425")
+                        .header("content-type", "application/json")
+                        .header("accept", "application/json, text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        // a well-formed initialize just under the cap: padded in an unused
+        // field so the body is huge but the JSON still parses
+        let pad = "x".repeat(LIMIT - 4096);
+        let under = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"{pad}","version":"1"}}}}}}"#
+        );
+        assert!(under.len() < LIMIT, "under the cap: {}", under.len());
+        assert_eq!(send(under.into_bytes()).await, StatusCode::OK);
+
+        let pad = "x".repeat(LIMIT + 1024);
+        let over = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"{pad}","version":"1"}}}}}}"#
+        );
+        assert!(over.len() > LIMIT);
+        assert_eq!(send(over.into_bytes()).await, StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }

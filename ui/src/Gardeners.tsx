@@ -4,6 +4,10 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, GardenerRun } from './types'
 import { notify } from './Notice'
+import { copyText } from './Profile'
+
+// target=_blank / window.open are inert in Tauri's webview: show the URL
+const CLAUDE_CODE_URL = 'https://docs.anthropic.com/en/docs/claude-code'
 
 export interface Gardener {
   id: string
@@ -66,10 +70,18 @@ export default function Gardeners({ dataVersion = 0 }: { dataVersion?: number })
       </div>
       {claude === false && (
         <div className="gardeners-empty">
-          Gardeners run on Claude Code, which is not installed on this Mac.{' '}
-          <a href="https://docs.anthropic.com/en/docs/claude-code" target="_blank" rel="noreferrer">
-            Install Claude Code
-          </a>
+          Gardeners run on Claude Code, which is not installed on this Mac. Install it from{' '}
+          <span className="mono">{CLAUDE_CODE_URL}</span>{' '}
+          <button
+            className="chip"
+            onClick={() =>
+              copyText(CLAUDE_CODE_URL)
+                .then(() => notify('link copied', 'ok'))
+                .catch(() => notify('could not copy — select the link and copy it by hand', 'warn'))
+            }
+          >
+            copy link
+          </button>
           , then reopen this page.
         </div>
       )}

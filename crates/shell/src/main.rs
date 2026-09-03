@@ -101,11 +101,32 @@ fn spawn_sidecar() {
     }
 }
 
-fn restart_daemon() {
-    if let Some(mut child) = SPAWNED.lock().unwrap().take() {
-        let _ = child.kill();
-        let _ = child.wait();
+/// Stop the sidecar we spawned: SIGTERM so the daemon takes its own
+/// children (`claude -p`) down with it, up to 3s for it to exit, then
+/// SIGKILL. A bare kill() is SIGKILL and orphans every gardener.
+fn stop_sidecar() {
+    let Some(mut child) = SPAWNED.lock().unwrap().take() else { return };
+    #[cfg(unix)]
+    {
+        // SAFETY: kill(2) on our own child's pid; no memory preconditions
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
     }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn restart_daemon() {
+    stop_sidecar();
     spawn_sidecar();
 }
 
@@ -459,12 +480,7 @@ fn main() {
                     }
                 }
                 // the daemon we spawned dies with us
-                tauri::RunEvent::Exit => {
-                    if let Some(mut child) = SPAWNED.lock().unwrap().take() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
-                }
+                tauri::RunEvent::Exit => stop_sidecar(),
                 _ => {}
             }
         });
