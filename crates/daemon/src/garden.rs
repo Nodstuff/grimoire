@@ -11,6 +11,7 @@ use grimoire_store::{
     BlockStore, ConfidencePolicy, Gardener, GardenerKind, OpInput, OpKind, ReviewDecision,
     ReviewItem, SqliteStore, order_key,
 };
+use crate::store_ext::with_store;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -634,22 +635,27 @@ async fn run_reviewer(
     run_id: Uuid,
 ) -> (String, String, Option<i64>) {
     let (items, prompt) = {
-        let s = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let items = match reviewable_items(&s, g.principal) {
-            Ok(i) => i,
-            Err(e) => return ("failed".into(), format!("queue read: {e}"), None),
-        };
-        if items.is_empty() {
-            return (
-                "ok".into(),
-                "nothing to do: no reviewable items on agent-review docs".into(),
-                Some(0),
-            );
+        let g = g.clone();
+        match with_store(&store, move |s| {
+            let items = match reviewable_items(s, g.principal) {
+                Ok(i) => i,
+                Err(e) => return Err(("failed".into(), format!("queue read: {e}"), None)),
+            };
+            if items.is_empty() {
+                return Err((
+                    "ok".into(),
+                    "nothing to do: no reviewable items on agent-review docs".into(),
+                    Some(0),
+                ));
+            }
+            let prompt = compose_review(s, &g, &items);
+            Ok((items, prompt))
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(early) => return early,
         }
-        let prompt = compose_review(&s, g, &items);
-        (items, prompt)
     };
     let _ = run_id;
     let (result, tokens) = match invoke_claude(&prompt).await {
@@ -678,18 +684,20 @@ async fn run_reviewer(
             Some((d.annotation_id, dec, d.rationale))
         })
         .collect();
+    let presented = items.len();
     let (accepted, declined, lines) = {
-        let mut s = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        apply_review_decisions(&mut s, g.principal, &items, decisions, |d| hot.is_hot(d))
+        let (hot, principal) = (hot.clone(), g.principal);
+        with_store(&store, move |s| {
+            apply_review_decisions(s, principal, &items, decisions, |d| hot.is_hot(d))
+        })
+        .await
     };
     (
         "ok".into(),
         format!(
             "items presented: {}; accepted {accepted}, declined {declined}
 {}",
-            items.len(),
+            presented,
             lines.join(
                 "
 "
@@ -857,10 +865,8 @@ async fn run_auditor(
         );
     };
     let (prompt, doc_count, doc_ids) = {
-        let s = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match compose_audit(&s, g, scope) {
+        let g = g.clone();
+        match with_store(&store, move |s| compose_audit(s, &g, scope)).await {
             Ok(p) => p,
             Err(e) => return ("failed".into(), format!("compose: {e}"), None),
         }
@@ -908,13 +914,11 @@ async fn run_auditor(
         Err(e) => return ("failed".into(), e, Some(tokens)),
     };
     let allowed: std::collections::HashSet<Uuid> = doc_ids.iter().copied().collect();
-    let mut lines = Vec::new();
-    let mut flagged = 0usize;
-    let mut corrected = 0usize;
-    {
-        let mut s = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (g, hot, dirs) = (g.clone(), hot.clone(), dirs.clone());
+    let (lines, flagged, corrected) = with_store(&store, move |s| {
+        let mut lines = Vec::new();
+        let mut flagged = 0usize;
+        let mut corrected = 0usize;
         for f in findings {
             if !allowed.contains(&f.doc_id) {
                 lines.push(format!(
@@ -998,7 +1002,9 @@ async fn run_auditor(
         if let Err(e) = s.record_audits(g.principal, &doc_ids) {
             lines.push(format!("audit bookkeeping failed: {e}"));
         }
-    }
+        (lines, flagged, corrected)
+    })
+    .await;
     (
         "ok".into(),
         format!(
@@ -1153,61 +1159,63 @@ async fn run_scribe(
         );
     }
     let prompt = {
-        let s = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let outline = match scope_outline(&s, scope) {
-            Ok(o) => o,
-            Err(e) => return ("failed".into(), format!("outline: {e}"), None),
-        };
-        // style exemplars: full content of the named docs
-        let mut exemplars = String::new();
-        for title in binding_style_docs(g) {
-            let doc = s
-                .list_docs()
-                .ok()
-                .and_then(|ds| ds.into_iter().find(|d| d.title == title));
-            if let Some(doc) = doc
-                && let Ok(tree) = s.read_doc(doc.id)
-            {
-                let mut body = String::new();
-                fn rec(nodes: &[grimoire_store::BlockNode], out: &mut String) {
-                    for n in nodes {
-                        if n.block.block_type != grimoire_store::BlockType::Comment {
-                            out.push_str(&n.block.content);
-                            out.push_str("\n\n");
+        let (g, dirs) = (g.clone(), dirs.clone());
+        let composed = with_store(&store, move |s| -> Result<String, String> {
+            let outline = scope_outline(s, scope).map_err(|e| format!("outline: {e}"))?;
+            // style exemplars: full content of the named docs
+            let mut exemplars = String::new();
+            for title in binding_style_docs(&g) {
+                let doc = s
+                    .list_docs()
+                    .ok()
+                    .and_then(|ds| ds.into_iter().find(|d| d.title == title));
+                if let Some(doc) = doc
+                    && let Ok(tree) = s.read_doc(doc.id)
+                {
+                    let mut body = String::new();
+                    fn rec(nodes: &[grimoire_store::BlockNode], out: &mut String) {
+                        for n in nodes {
+                            if n.block.block_type != grimoire_store::BlockType::Comment {
+                                out.push_str(&n.block.content);
+                                out.push_str("\n\n");
+                            }
+                            rec(&n.children, out);
                         }
-                        rec(&n.children, out);
                     }
+                    rec(&tree.roots, &mut body);
+                    truncate_chars(&mut body, 5_000);
+                    exemplars.push_str(&format!("### exemplar: {title}\n{body}\n"));
                 }
-                rec(&tree.roots, &mut body);
-                truncate_chars(&mut body, 5_000);
-                exemplars.push_str(&format!("### exemplar: {title}\n{body}\n"));
             }
+            if exemplars.is_empty() {
+                exemplars = "(none provided — use clean, dense technical markdown)".into();
+            }
+            let mut p = format!(
+                "{SCRIBE_PREAMBLE}\n\n{GRIMOIRE_PRIMER}\n\n## Instructions for this scope\n{}\n\n\
+                 ## Source repositories (read with your tools)\n{}\n\n\
+                 ## Style exemplars — imitate these\n{}\n\
+                 ## What already exists in the scope (do NOT recreate)\n{}\n\n\
+                 ## Output contract\nEmit each doc as a delimited section — the markdown \
+                 travels RAW, never inside JSON strings:\n\
+                 ===DOC=== Sub/Folder :: Doc Title\n<the doc's full markdown>\n\
+                 ===END===\n\
+                 The header line after ===DOC=== is 'path :: title' (path relative to the \
+                 scope root; use '.' for the root). At most {SCRIBE_DOCS_PER_RUN} docs per \
+                 run; pick the most foundational missing ones first. Output nothing outside \
+                 the ===DOC===/===END=== sections; no docs to write = empty output.",
+                g.task_prompt,
+                dirs.join(", "),
+                exemplars,
+                outline,
+            );
+            truncate_chars(&mut p, MAX_PROMPT_CHARS);
+            Ok(p)
+        })
+        .await;
+        match composed {
+            Ok(p) => p,
+            Err(e) => return ("failed".into(), e, None),
         }
-        if exemplars.is_empty() {
-            exemplars = "(none provided — use clean, dense technical markdown)".into();
-        }
-        let mut p = format!(
-            "{SCRIBE_PREAMBLE}\n\n{GRIMOIRE_PRIMER}\n\n## Instructions for this scope\n{}\n\n\
-             ## Source repositories (read with your tools)\n{}\n\n\
-             ## Style exemplars — imitate these\n{}\n\
-             ## What already exists in the scope (do NOT recreate)\n{}\n\n\
-             ## Output contract\nEmit each doc as a delimited section — the markdown \
-             travels RAW, never inside JSON strings:\n\
-             ===DOC=== Sub/Folder :: Doc Title\n<the doc's full markdown>\n\
-             ===END===\n\
-             The header line after ===DOC=== is 'path :: title' (path relative to the \
-             scope root; use '.' for the root). At most {SCRIBE_DOCS_PER_RUN} docs per \
-             run; pick the most foundational missing ones first. Output nothing outside \
-             the ===DOC===/===END=== sections; no docs to write = empty output.",
-            g.task_prompt,
-            dirs.join(", "),
-            exemplars,
-            outline,
-        );
-        truncate_chars(&mut p, MAX_PROMPT_CHARS);
-        p
     };
 
     let (result, tokens) = match invoke_claude_streaming(
@@ -1233,12 +1241,10 @@ async fn run_scribe(
         Err(e) => return ("failed".into(), e, Some(tokens)),
     };
 
-    let mut lines = Vec::new();
-    let mut written = 0usize;
-    {
-        let mut s = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let g = g.clone();
+    let (lines, written) = with_store(&store, move |s| {
+        let mut lines = Vec::new();
+        let mut written = 0usize;
         for nd in new_docs.into_iter().take(SCRIBE_DOCS_PER_RUN) {
             // resolve/create the folder path under the scope
             let mut parent = scope;
@@ -1278,7 +1284,7 @@ async fn run_scribe(
             }
             // through the gate, never apply: every block gets a verdict
             match create_doc_through_gate(
-                &mut s,
+                s,
                 &nd.title,
                 Some(parent),
                 g.principal,
@@ -1297,7 +1303,9 @@ async fn run_scribe(
                 Err(e) => lines.push(format!("{}: write failed: {e}", nd.title)),
             }
         }
-    }
+        (lines, written)
+    })
+    .await;
     (
         "ok".into(),
         format!("docs written: {written}\n{}", lines.join("\n")),
@@ -1378,6 +1386,22 @@ pub(crate) fn verdict_counts(out: &grimoire_store::ProposeOutcome) -> String {
     format!("{} green / {} yellow / {} red", c.0, c.1, c.2)
 }
 
+/// Close the run row and build the outcome (store work on the blocking pool).
+async fn finish_run(
+    store: Arc<Mutex<SqliteStore>>,
+    run_id: Uuid,
+    status: String,
+    summary: String,
+    tokens: Option<i64>,
+) -> RunOutcome {
+    let (st, sm) = (status.clone(), summary.clone());
+    with_store(&store, move |s| {
+        let _ = s.finish_run(run_id, &st, &sm, tokens, Some(0));
+    })
+    .await;
+    RunOutcome { run_id, status, summary }
+}
+
 /// Run one gardener end to end. Never panics the daemon; all failure modes
 /// land in the run log (ticket 4.6: never a hang, never silent).
 pub async fn run_gardener(
@@ -1395,10 +1419,8 @@ pub async fn run_gardener(
         };
     };
     let run_id = {
-        let mut s = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match s.start_run(g.id) {
+        let gid = g.id;
+        match with_store(&store, move |s| s.start_run(gid)).await {
             Ok(id) => id,
             Err(e) => {
                 return RunOutcome {
@@ -1409,40 +1431,29 @@ pub async fn run_gardener(
             }
         }
     };
-    let finish =
-        |store: &Arc<Mutex<SqliteStore>>, status: &str, summary: &str, tokens: Option<i64>| {
-            let mut s = store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = s.finish_run(run_id, status, summary, tokens, Some(0));
-            RunOutcome {
-                run_id,
-                status: status.into(),
-                summary: summary.into(),
-            }
-        };
+    let finish = |store: &Arc<Mutex<SqliteStore>>, status: &str, summary: &str, tokens: Option<i64>| {
+        finish_run(store.clone(), run_id, status.to_string(), summary.to_string(), tokens)
+    };
 
     if g.kind == GardenerKind::Reviewer {
         let (status, summary, tokens) = run_reviewer(store.clone(), &hot, &g, run_id).await;
-        return finish(&store, &status, &summary, tokens);
+        return finish(&store, &status, &summary, tokens).await;
     }
     if g.kind == GardenerKind::Scribe {
         let (status, summary, tokens) = run_scribe(store.clone(), &g, run_id).await;
-        return finish(&store, &status, &summary, tokens);
+        return finish(&store, &status, &summary, tokens).await;
     }
     if g.kind == GardenerKind::Auditor || g.kind == GardenerKind::Keeper {
         let (status, summary, tokens) = run_auditor(store.clone(), &hot, &g, run_id).await;
-        return finish(&store, &status, &summary, tokens);
+        return finish(&store, &status, &summary, tokens).await;
     }
 
     // compose (lock released before the long claude call)
     let (prompt, doc_count) = {
-        let s = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match compose_tagging(&s, &g) {
+        let g = g.clone();
+        match with_store(&store, move |s| compose_tagging(s, &g)).await {
             Ok(p) => p,
-            Err(e) => return finish(&store, "failed", &format!("compose: {e}"), None),
+            Err(e) => return finish(&store, "failed", &format!("compose: {e}"), None).await,
         }
     };
     if doc_count == 0 {
@@ -1451,7 +1462,8 @@ pub async fn run_gardener(
             "ok",
             "nothing to do: no untagged docs in scope",
             Some(0),
-        );
+        )
+        .await;
     }
 
     let (result, tokens) = match invoke_claude(&prompt).await {
@@ -1462,22 +1474,21 @@ pub async fn run_gardener(
             } else {
                 "failed"
             };
-            return finish(&store, status, &e, None);
+            return finish(&store, status, &e, None).await;
         }
     };
 
     let proposals = match parse_proposals(&result) {
         Ok(p) => p,
-        Err(e) => return finish(&store, "failed", &e, Some(tokens)),
+        Err(e) => return finish(&store, "failed", &e, Some(tokens)).await,
     };
 
     // submit through the gate as the gardener's principal
-    let mut counts = (0usize, 0usize, 0usize); // green, yellow, red
-    let mut lines = Vec::new();
-    {
-        let mut s = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (g2, hot2) = (g.clone(), hot.clone());
+    let (counts, lines) = with_store(&store, move |s| {
+        let (g, hot) = (g2, hot2);
+        let mut counts = (0usize, 0usize, 0usize); // green, yellow, red
+        let mut lines = Vec::new();
         for p in proposals {
             let tags: Vec<String> = p
                 .add_tags
@@ -1492,7 +1503,7 @@ pub async fn run_gardener(
                 lines.push(format!("skipped invented doc_id {}", p.doc_id));
                 continue;
             };
-            let ops = match tag_ops(&s, doc.id, &tags) {
+            let ops = match tag_ops(s, doc.id, &tags) {
                 Ok(o) => o,
                 Err(e) => {
                     lines.push(format!("{}: op build failed: {e}", doc.title));
@@ -1531,7 +1542,9 @@ pub async fn run_gardener(
                 Err(e) => lines.push(format!("{}: propose failed: {e}", doc.title)),
             }
         }
-    }
+        (counts, lines)
+    })
+    .await;
     let summary = format!(
         "docs considered: {doc_count}; verdicts green {}, yellow {}, red {}\n{}",
         counts.0,
@@ -1539,7 +1552,7 @@ pub async fn run_gardener(
         counts.2,
         lines.join("\n")
     );
-    finish(&store, "ok", &summary, Some(tokens))
+    finish(&store, "ok", &summary, Some(tokens)).await
 }
 
 #[cfg(test)]
