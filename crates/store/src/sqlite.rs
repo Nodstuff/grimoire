@@ -3378,10 +3378,10 @@ impl BlockStore for SqliteStore {
     fn change_signature(&self) -> Result<ChangeSignature> {
         // one cheap aggregate over docs + shares: enough to say "nothing an
         // owner-side nudge could care about moved since last tick"
-        let (max_epoch, doc_count): (i64, i64) = self.conn.query_row(
-            "SELECT coalesce(max(current_epoch), 0), count(*) FROM docs WHERE deleted = 0",
+        let (max_epoch, epoch_sum, doc_count): (i64, i64, i64) = self.conn.query_row(
+            "SELECT coalesce(max(current_epoch), 0), coalesce(sum(current_epoch), 0), count(*) FROM docs WHERE deleted = 0",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let active_shares: i64 = self.conn.query_row(
             "SELECT count(*) FROM shares WHERE state = 'active'",
@@ -3390,6 +3390,7 @@ impl BlockStore for SqliteStore {
         )?;
         Ok(ChangeSignature {
             max_epoch,
+            epoch_sum,
             doc_count,
             active_shares,
         })
@@ -4356,6 +4357,42 @@ impl SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Epochs are per doc: editing a doc whose epoch stays below the global
+    /// max must still move the change signature (the realtime nudge relies
+    /// on it), which `max(current_epoch)` alone never did.
+    #[test]
+    fn change_signature_moves_on_a_lower_epoch_doc_edit() {
+        use crate::PrincipalKind;
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "Tom", None).unwrap();
+        let ins = |content: &str| OpInput {
+            kind: OpKind::Insert {
+                block_id: Uuid::now_v7(),
+                parent_id: None,
+                order_key: "".into(),
+                block_type: BlockType::Paragraph,
+                content: content.into(),
+                refers_to: None,
+            },
+            source_refs: vec![],
+        };
+        let high = s.create_doc("high", None, tom.id).unwrap();
+        let low = s.create_doc("low", None, tom.id).unwrap();
+        // high: epochs 1..=3; low: epoch 1
+        for e in 0..3 {
+            s.apply(high.id, e, tom.id, vec![ins("h")]).unwrap();
+        }
+        s.apply(low.id, 0, tom.id, vec![ins("l")]).unwrap();
+        let before = s.change_signature().unwrap();
+        assert_eq!(before.max_epoch, 3);
+        // bump the lower doc to epoch 2: the max is unchanged, the sum is not
+        s.apply(low.id, 1, tom.id, vec![ins("l2")]).unwrap();
+        let after = s.change_signature().unwrap();
+        assert_eq!(after.max_epoch, before.max_epoch, "max alone cannot see this edit");
+        assert_ne!(after, before, "signature must move on any single-doc epoch bump");
+        assert_eq!(after.epoch_sum, before.epoch_sum + 1);
+    }
 
     /// v5 backfill: NULL sort_keys are assigned per parent, in title order,
     /// after any key the parent's siblings already hold; a second run is a
