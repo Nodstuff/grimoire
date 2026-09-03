@@ -29,17 +29,31 @@ const SECTION_LABEL: Record<Section, string> = { pinned: 'Pinned', folders: 'Fol
  * DOM. */
 function Collapse({ open, children }: { open: boolean; children: React.ReactNode }) {
   const [mounted, setMounted] = useState(open)
+  // the `open` class, one frame behind `mounted`. Mounting the row and adding
+  // the class in the same commit gives the browser no 0fr start value to
+  // transition FROM, so the first expand snaps instead of growing; two rAFs
+  // put the class after the paint that established the collapsed height.
+  // (Reasoned, not yet watched in a browser.)
+  const [grown, setGrown] = useState(open)
   useEffect(() => {
     if (open) {
       setMounted(true)
-      return
+      let inner = 0
+      const outer = requestAnimationFrame(() => {
+        inner = requestAnimationFrame(() => setGrown(true))
+      })
+      return () => {
+        cancelAnimationFrame(outer)
+        cancelAnimationFrame(inner)
+      }
     }
+    setGrown(false)
     const t = setTimeout(() => setMounted(false), 140)
     return () => clearTimeout(t)
   }, [open])
   if (!mounted) return null
   return (
-    <div className={`tree-collapse ${open ? 'open' : ''}`}>
+    <div className={`tree-collapse ${grown ? 'open' : ''}`}>
       <div className="tree-collapse-inner">{children}</div>
     </div>
   )

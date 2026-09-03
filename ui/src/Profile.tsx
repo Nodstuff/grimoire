@@ -115,22 +115,35 @@ export function FirstRunName({ profile, onSaved }: { profile: ProfileRow; onSave
 }
 
 /** The Profile page (view kind 'profile'). */
-export default function Profile({ dataVersion, onChanged }: { dataVersion: number; onChanged?: (p: ProfileRow) => void }) {
+export default function Profile({
+  dataVersion,
+  onChanged,
+  version: appVersion = null,
+}: {
+  dataVersion: number
+  onChanged?: (p: ProfileRow) => void
+  /** the version off App's /api/stamp poll; null on a daemon too old to send it */
+  version?: string | null
+}) {
   const [profile, setProfile] = useState<ProfileRow | null | undefined>(undefined)
   const [name, setName] = useState('')
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState<string | null>(null)
-  const [version, setVersion] = useState<string | null>(null)
+  // App polls /api/stamp every 2.5s and newer daemons put the version on it;
+  // only an older daemon (no version there) costs a /api/buildinfo call
+  const [fetchedVersion, setFetchedVersion] = useState<string | null>(null)
+  const version = appVersion ?? fetchedVersion
 
   useEffect(() => {
     loadProfile().then((p) => {
       setProfile(p)
       if (p) setName(p.name)
     })
+    if (appVersion) return
     api<{ version?: string }>('/api/buildinfo')
-      .then((b) => setVersion(b.version ?? null))
-      .catch(() => setVersion(null))
-  }, [dataVersion])
+      .then((b) => setFetchedVersion(b.version ?? null))
+      .catch(() => setFetchedVersion(null))
+  }, [dataVersion, appVersion])
 
   const copyDiagnostics = async () => {
     try {

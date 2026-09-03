@@ -273,6 +273,10 @@ function CanvasFlow({
   const { screenToFlowPosition, fitView } = useReactFlow()
   const epochRef = useRef(epoch)
   const dirty = useRef(false)
+  // the same `.save-state` chip DocEditor renders. It is the signal a deploy
+  // reload checks for, so an unsaved canvas now defers a reload the way an
+  // unsaved doc always did — and the user can see the canvas is unsaved.
+  const [saveState, setSaveState] = useState<'clean' | 'dirty' | 'saving'>('clean')
   const fitTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
     epochRef.current = epoch
@@ -433,6 +437,7 @@ function CanvasFlow({
       snapshot.edges ?? [],
     )
     saving.current = true
+    setSaveState('saving')
     try {
       const out = await api<{ epoch: number }>('/api/propose', {
         method: 'POST',
@@ -458,9 +463,12 @@ function CanvasFlow({
       const editedMeanwhile =
         nodesRef.current !== snapshot.nodes || edgesRef.current !== snapshot.edges
       dirty.current = editedMeanwhile
+      setSaveState(editedMeanwhile ? 'dirty' : 'clean')
       if (editedMeanwhile) autosave.current.arm()
       onSaved()
     } catch (e) {
+      // the shapes are still on screen and stay dirty; the retry clock below
+      setSaveState('dirty')
       const msg = saveErrorText(e)
       if (lastSaveError.current !== msg) {
         lastSaveError.current = msg
@@ -476,6 +484,7 @@ function CanvasFlow({
   const autosave = useRef(debounce(1200, () => saveRef.current()))
   const scheduleSave = useCallback(() => {
     dirty.current = true
+    setSaveState('dirty')
     autosave.current.arm()
   }, [])
   // retry clock while dirty (daemon back, live session over, …)
@@ -805,6 +814,9 @@ function CanvasFlow({
       tabIndex={0}
       onKeyDownCapture={onCanvasKey}
     >
+      <span className={`save-state ${saveState}`}>
+        {saveState === 'clean' ? 'saved' : saveState === 'dirty' ? 'unsaved' : 'saving…'}
+      </span>
       <div className="canvas-toolbar">
         <button onClick={() => addNode('box')} title="process">▭</button>
         <button onClick={() => addNode('pill')} title="start / end">⬭</button>

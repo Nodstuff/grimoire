@@ -16,6 +16,20 @@ import { notify, errText, Notices } from './Notice'
 // heavy views load on first use: xyflow + html-to-image (canvas) and
 // force-graph (graph) are not part of the boot bundle
 const CanvasBlock = lazy(() => import('./CanvasBlock'))
+
+/** The doc side panels, owned by App so a doc switch does not close one. */
+type Panel = 'none' | 'history' | 'comments' | 'tend' | 'share' | 'review'
+
+type Stamp = { stamp: number; build?: number; version?: string }
+
+/** Every request on the 2.5s poll is bounded: a hung fetch used to hold
+ * `inFlight` forever, so `misses` stopped counting and the down-detector
+ * never fired for the one failure mode it exists for. */
+const pollTimeout = () => AbortSignal.timeout(4000)
+
+/** An editor with unsaved work, canvas included — a deploy must not reload
+ * over it. Both editors render the same `.save-state` chip. */
+const DIRTY_SELECTOR = '.save-state.dirty, .save-state.saving'
 const GraphView = lazy(() => import('./GraphView'))
 const Loading = () => <div className="lazy-loading">loading…</div>
 import { resolveShortcut } from './shortcuts'
@@ -72,6 +86,12 @@ export default function App() {
   const [anchor, setAnchor] = useState<string | null>(null)
   // opened FROM the review queue (or with { review: true }): DocView opens its rail
   const [reviewIntent, setReviewIntent] = useState(false)
+  // which side panel a doc shows. Above DocView because that is keyed by
+  // docId: kept here, the rail the user opened survives a doc switch.
+  const [docPanel, setDocPanel] = useState<Panel>('none')
+  // the poll's own reply carries version/build/git: no page needs its own
+  // /api/buildinfo round-trip for them
+  const [appStamp, setAppStamp] = useState<Stamp | null>(null)
 
   // ⌘[ / ⌘] history over views, browser-style
   const history = useRef<View[]>([{ kind: 'home' }])
@@ -164,7 +184,9 @@ export default function App() {
     let cursor: EventsCursor = INITIAL_CURSOR
     const pollEvents = async () => {
       // older daemon without the route: api() throws, cursor stays put
-      const resp = await api<EventsResponse>(`/api/events?since=${cursor.since}`).catch(() => null)
+      const resp = await api<EventsResponse>(`/api/events?since=${cursor.since}`, {
+        signal: pollTimeout(),
+      }).catch(() => null)
       const r = advanceEvents(cursor, resp)
       cursor = r.cursor
       for (const ev of r.fresh) {
@@ -189,8 +211,9 @@ export default function App() {
       if (inFlight) return
       inFlight = true
       try {
-        const r = await api<{ stamp: number; build?: number; version?: string }>('/api/stamp')
+        const r = await api<Stamp>('/api/stamp', { signal: pollTimeout() })
         misses = 0
+        setAppStamp(r)
         setDaemonDown(false)
         if (stamp === null) stamp = r.stamp
         else if (r.stamp !== stamp) {
@@ -203,9 +226,12 @@ export default function App() {
         // deploy landed → reload the bundle (deferred while an editor is dirty).
         // Newer daemons carry the build on the stamp; fall back to the
         // dedicated route only when it is absent.
-        const b = typeof r.build === 'number' ? r.build : (await api<{ build: number }>('/api/buildinfo')).build
+        const b =
+          typeof r.build === 'number'
+            ? r.build
+            : (await api<{ build: number }>('/api/buildinfo', { signal: pollTimeout() })).build
         if (build === null) build = b
-        else if (b !== build && !document.querySelector('.save-state.dirty, .save-state.saving')) {
+        else if (b !== build && !document.querySelector(DIRTY_SELECTOR)) {
           location.reload()
         }
       } catch {
@@ -398,6 +424,8 @@ export default function App() {
             liveChange={liveChange}
             anchor={anchor}
             reviewIntent={reviewIntent}
+            panel={docPanel}
+            setPanel={setDocPanel}
           />
         )}
         {view.kind === 'review' && (
@@ -418,7 +446,9 @@ export default function App() {
             onOpenProfile={() => setView({ kind: 'profile' })}
           />
         )}
-        {view.kind === 'profile' && <Profile dataVersion={dataVersion} onChanged={setProfile} />}
+        {view.kind === 'profile' && (
+          <Profile dataVersion={dataVersion} onChanged={setProfile} version={appStamp?.version ?? null} />
+        )}
         {view.kind === 'trash' && (
           <Trash
             dataVersion={dataVersion}
@@ -1029,6 +1059,8 @@ function DocView({
   liveChange = null,
   anchor,
   reviewIntent = false,
+  panel,
+  setPanel,
 }: {
   docId: string
   onOpenDoc: OpenDoc
@@ -1040,13 +1072,15 @@ function DocView({
   anchor?: string | null
   /** opened from the review queue: open the rail on load */
   reviewIntent?: boolean
+  /** owned by App so it outlives this component's per-doc remount */
+  panel: Panel
+  setPanel: (p: Panel) => void
 }) {
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
   const [fed, setFed] = useState<DocFederation | null>(null)
   const [hot, setHot] = useState<HotDoc | null>(null)
   const mirrorRef = useRef<unknown>(null)
-  const [panel, setPanel] = useState<'none' | 'history' | 'comments' | 'tend' | 'share' | 'review'>('none')
   // stale guard: DocView is keyed by docId (one instance per open doc), so a
   // fetch that resolves after unmount — or after a doc switch — is for a doc
   // that is no longer on screen. `gen` bumps on every docId change too, in
@@ -1110,7 +1144,9 @@ function DocView({
 
   useEffect(() => {
     setTree(null)
-    setPanel(reviewIntent ? 'review' : 'none')
+    // the panel choice is the user's, not the doc's: only a review-queue
+    // open overrides it (the same rule as the reviewIntent effect below)
+    if (reviewIntent) setPanel('review')
     setCommentTarget(null)
     setHot(null)
     setHotCanWrite(undefined)
