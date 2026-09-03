@@ -311,6 +311,27 @@ async fn dispatch(
 /// Hub (slice 2): carry a member's proposal to the doc's true owner. The
 /// owner sees it as the MEMBER's proposal (`on_behalf_of`); the hub records
 /// the owner's op ids so the member's status checks can be answered later.
+/// 0.7.2: the `request_id` the hub uses towards the owner for a member's
+/// proposal. Derived from the hub-side dedupe key (`<member pubkey>:<member
+/// request_id>`) so a member retry that misses the hub's own cache (evicted,
+/// hub restarted, first forward timed out after the owner parked it) reaches
+/// the owner under the SAME id and hits the owner's dedupe instead of parking
+/// a second copy. Distinct members never collide (the pubkey is in the key).
+/// A member that sent no request_id gets a fresh id: it asked for no retry
+/// safety.
+pub(super) fn forward_request_id(dedupe_key: Option<&str>) -> String {
+    match dedupe_key {
+        Some(key) => {
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(format!("grimoire-hub-forward:{key}").as_bytes());
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            uuid::Uuid::from_bytes(bytes).to_string()
+        }
+        None => uuid::Uuid::now_v7().to_string(),
+    }
+}
+
 async fn forward_propose(
     endpoint: &Endpoint,
     store_arc: &Arc<Mutex<SqliteStore>>,
@@ -320,6 +341,7 @@ async fn forward_propose(
     let Ok(owner_id) = f.owner.pubkey.parse::<iroh::EndpointId>() else {
         return Response::refused(RefusalCode::Other, "the owner's address is malformed");
     };
+    let request_id = forward_request_id(f.dedupe_key.as_deref());
     let mut ops = f.ops;
     for op in &mut ops {
         op.source_refs.push(format!("via hub: {}", f.hub_name));
@@ -335,7 +357,7 @@ async fn forward_propose(
                 ops,
                 note: f.note,
                 base_epoch: Some(f.base_epoch),
-                request_id: Some(uuid::Uuid::now_v7().to_string()),
+                request_id: Some(request_id),
                 on_behalf_of: Some(OnBehalfOf {
                     pubkey: f.member.pubkey.clone(),
                     name: f.member_name.clone(),
@@ -345,6 +367,9 @@ async fn forward_propose(
     )
     .await;
     let owner_name = f.owner.petname.clone();
+    // terminal = the owner answered (parked or refused); an unreachable or
+    // silent owner is not, so a retry gets to try again
+    let terminal = matches!(res, Ok(Ok(Response::Proposed { .. } | Response::Refused { .. })));
     let response = match res {
         Ok(Ok(Response::Proposed { op_ids })) => {
             let ids: Vec<uuid::Uuid> = op_ids.iter().filter_map(|s| s.parse().ok()).collect();
@@ -374,7 +399,9 @@ async fn forward_propose(
         }
         Err(_) => Response::refused(RefusalCode::Other, format!("{owner_name} is offline or unreachable right now — try again later")),
     };
-    if let (Some(key), Response::Proposed { .. }) = (&f.dedupe_key, &response) {
+    if let Some(key) = &f.dedupe_key
+        && terminal
+    {
         let mut cache = dedupe.lock().unwrap_or_else(|p| p.into_inner());
         cache.insert(key.clone(), response.clone());
     }

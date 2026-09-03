@@ -2855,3 +2855,65 @@ async fn unknown_peer_frame_over_the_pre_auth_cap_is_refused_before_parse() {
     let res = raw_request(stranger, addr, padded).await;
     assert_eq!(res, Response::Pong);
 }
+
+/// 0.7.2 hardening: a member's retry of a forwarded proposal (same
+/// `request_id`) parks ONE proposal on the owner. The hub answers the retry
+/// from its cache; and because the id it uses towards the owner is derived
+/// from (member, request_id), a retry that misses the hub cache is deduped
+/// by the owner instead.
+#[tokio::test]
+async fn hub_forward_retry_parks_one_proposal_and_owner_refusals_are_cached() {
+    use super::server::forward_request_id;
+    // the derivation: stable per (member, id), distinct across members, fresh without an id
+    assert_eq!(forward_request_id(Some("pk-a:r1")), forward_request_id(Some("pk-a:r1")));
+    assert_ne!(forward_request_id(Some("pk-a:r1")), forward_request_id(Some("pk-b:r1")));
+    assert_ne!(forward_request_id(None), forward_request_id(None));
+
+    let (h, cfg, alice, bob) = team().await;
+    pull_hub(&alice, &h, &cfg).await;
+    pull_hub(&bob, &h, &cfg).await;
+    let notes = alice.doc("Notes", None, "alice's notes");
+    publish(&alice, &h, notes, "Notes").await;
+    pull_hub(&bob, &h, &cfg).await;
+    let bob_share = bob.store.lock().unwrap().get_mirror(cfg.root_doc).unwrap().unwrap().share_id.to_string();
+    let propose = |rid: &str, text: &str| {
+        let (ep, addr, share) = (bob.ep.clone(), h.addr.clone(), bob_share.clone());
+        let req = Request::Propose {
+            share, doc: notes.to_string(), ops: vec![insert_op(text)], note: "x".into(), base_epoch: None,
+            request_id: Some(rid.into()), on_behalf_of: None,
+        };
+        async move { request(&ep, addr, req).await.unwrap() }
+    };
+    let first = propose("r1", "bob's edit").await;
+    let Response::Proposed { op_ids } = &first else { panic!("{first:?}") };
+    let retry = propose("r1", "bob's edit").await;
+    assert_eq!(retry, first, "retry answered from the hub's cache");
+    {
+        let s = alice.store.lock().unwrap();
+        let q = s.review_queue(Some(notes)).unwrap();
+        assert_eq!(q.len(), 1, "one parked op on alice, not two");
+        assert_eq!(q[0].op.id.to_string(), op_ids[0]);
+    }
+    // the owner's own dedupe sees the derived id: the very same forward sent
+    // again by hand (as if the hub had lost its cache) parks nothing new
+    let hub_on_alice_share = h.store.lock().unwrap().list_hub_publications().unwrap()[0].share_id.to_string();
+    let derived = forward_request_id(Some(&format!("{}:r1", bob.pubkey())));
+    let res = request(&h.ep, alice.addr.clone(), Request::Propose {
+        share: hub_on_alice_share, doc: notes.to_string(), ops: vec![insert_op("bob's edit")], note: "x".into(), base_epoch: None,
+        request_id: Some(derived), on_behalf_of: Some(super::wire::OnBehalfOf { pubkey: bob.pubkey(), name: "bob".into() }),
+    }).await.unwrap();
+    assert_eq!(res, first);
+    assert_eq!(alice.store.lock().unwrap().review_queue(Some(notes)).unwrap().len(), 1);
+
+    // an owner refusal is terminal too: cached, not re-forwarded. Alice's
+    // doc goes hot → DocHot; her ending the session does not change the
+    // answer to the SAME request_id (a fresh id gets a fresh answer).
+    let epoch = alice.store.lock().unwrap().get_doc(notes).unwrap().current_epoch;
+    alice.hot.start(notes, epoch).unwrap();
+    let res = propose("r2", "later").await;
+    assert_eq!(refusal_code(&res), RefusalCode::DocHot, "{res:?}");
+    alice.hot.flatten_and_close(&alice.store, notes, "test").unwrap();
+    assert_eq!(propose("r2", "later").await, res, "cached refusal");
+    assert!(matches!(propose("r3", "later").await, Response::Proposed { .. }));
+    assert_eq!(alice.store.lock().unwrap().review_queue(Some(notes)).unwrap().len(), 2);
+}
