@@ -111,6 +111,37 @@ export function descendantCount(id: string, children: Map<string | null, Doc[]>)
   return n
 }
 
+/** Every doc's descendant count in one post-order pass, so a render that
+ * shows N collapsed rows costs O(docs) rather than O(subtree) per row.
+ * Iterative: a deep tree must not blow the JS stack. A parent cycle (only
+ * reachable from corrupt data) terminates with the back-edge counted as 0. */
+export function descendantCounts(children: Map<string | null, Doc[]>): Map<string, number> {
+  const counts = new Map<string, number>()
+  const done = new Set<string>()
+  const started = new Set<string>()
+  for (const kids of children.values()) {
+    for (const root of kids) {
+      if (done.has(root.id)) continue
+      const stack: string[] = [root.id]
+      while (stack.length) {
+        const cur = stack[stack.length - 1]
+        if (!started.has(cur)) {
+          started.add(cur)
+          for (const k of children.get(cur) ?? []) if (!started.has(k.id)) stack.push(k.id)
+          continue
+        }
+        stack.pop()
+        if (done.has(cur)) continue
+        let n = 0
+        for (const k of children.get(cur) ?? []) n += 1 + (counts.get(k.id) ?? 0)
+        counts.set(cur, n)
+        done.add(cur)
+      }
+    }
+  }
+  return counts
+}
+
 /* ---------- persisted open state ---------- */
 
 export const TREE_STATE_KEY = 'grimoire.tree.v1'

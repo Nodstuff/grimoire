@@ -19,6 +19,11 @@ import { proposeErrorText, saveErrorText } from '../hints'
 import { BaselineBlock, Entry, computeOps } from './diff'
 import { debounce } from '../timing'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
+import { AfterSave, afterSave } from './savePlan'
+
+/** transaction meta marking DocEditor's own post-save blockId stamping, so
+ * onUpdate can tell it apart from a real edit. */
+const STAMP_META = 'grimoire-stamp'
 
 const TOP_LEVEL_TYPES = [
   'paragraph',
@@ -127,6 +132,12 @@ export default function DocEditor({
   // transaction — so the timer fired 1.2s after the FIRST keystroke.)
   const saveRef = useRef<() => Promise<void>>(async () => {})
   const autosave = useRef(debounce(1200, () => saveRef.current()))
+  /** the save currently in flight, or null; the single concurrency guard */
+  const inFlight = useRef<Promise<void> | null>(null)
+  /** false once the cleanup below has run — a save that resolves after that
+   * must not re-arm timers that no longer exist */
+  const mounted = useRef(true)
+  const lastPlan = useRef<AfterSave>('clean')
 
   // baseline: per block, the round-tripped markdown (comparison form) + structure
   const initial = useMemo(() => {
@@ -167,7 +178,10 @@ export default function DocEditor({
         type: 'doc',
         content: initial.nodes.map((n) => n.toJSON()),
       },
-      onUpdate: () => {
+      onUpdate: ({ transaction }) => {
+        // the post-save blockId stamp is our own bookkeeping, not an edit:
+        // arming the debounce for it caused a spurious empty save 1.2s later
+        if (transaction.getMeta(STAMP_META)) return
         setSaveState('dirty')
         if (modeRef.current === 'direct') autosave.current.arm()
       },
@@ -230,8 +244,8 @@ export default function DocEditor({
     return entries
   }
 
-  const save = async () => {
-    if (!editor || saveState === 'saving' || mode === 'readonly') return
+  const runSave = async () => {
+    if (!editor || modeRef.current === 'readonly') return
     autosave.current.cancel()
     // what this save writes; edits landing while the request is in flight
     // make the doc differ from it, and the editor must stay dirty for them
@@ -287,6 +301,7 @@ export default function DocEditor({
           }
         })
         tr.setMeta('addToHistory', false)
+        tr.setMeta(STAMP_META, true)
         editor.view.dispatch(tr)
       }
       // new baseline = what we just wrote
@@ -294,12 +309,16 @@ export default function DocEditor({
       epochRef.current = out.epoch
       setEpoch(out.epoch)
       lastSaveError.current = null
-      if (editedMeanwhile) {
-        // typed during the request: those keystrokes are not in what landed
-        setSaveState('dirty')
-        autosave.current.arm()
-      } else {
+      // typed during the request? those keystrokes are not in what landed
+      const plan = afterSave({ editedMeanwhile, mounted: mounted.current })
+      lastPlan.current = plan
+      if (plan === 'clean') {
         setSaveState('clean')
+      } else {
+        setSaveState('dirty')
+        // 'save-now' (typed then switched doc) is driven by the unmount
+        // cleanup below — no debounce or retry clock survives the unmount
+        if (plan === 'rearm') autosave.current.arm()
       }
       onSaved(out.epoch, doc.docId)
     } catch (e) {
@@ -316,6 +335,18 @@ export default function DocEditor({
     }
   }
   const lastSaveError = useRef<string | null>(null)
+
+  /** One save at a time, tracked by promise rather than React state: the
+   * unmount cleanup runs after the component is gone, where `saveState` is
+   * stale, and it must be able to await the request in flight. */
+  const save = (): Promise<void> => {
+    if (inFlight.current) return inFlight.current
+    const p = runSave().finally(() => {
+      inFlight.current = null
+    })
+    inFlight.current = p
+    return p
+  }
 
   saveRef.current = save
 
@@ -357,7 +388,18 @@ export default function DocEditor({
       // unmount/navigation: land whatever is pending now (the save reports
       // its own docId, so a parent that has moved on ignores the result)
       pending.cancel()
-      if (modeRef.current === 'direct') saveRef.current()
+      mounted.current = false
+      if (modeRef.current !== 'direct') return
+      const flight = inFlight.current
+      if (!flight) {
+        saveRef.current()
+        return
+      }
+      // a save is mid-request: its response cannot carry keystrokes typed
+      // after it started, so wait for it and save those once more
+      flight.then(() => {
+        if (lastPlan.current === 'save-now') saveRef.current()
+      })
     }
   }, [])
 

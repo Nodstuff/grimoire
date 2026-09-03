@@ -4,6 +4,7 @@ import {
   ancestorsOf,
   childrenIndex,
   descendantCount,
+  descendantCounts,
   filterDocs,
   groupRoot,
   loadTreeState,
@@ -68,6 +69,14 @@ describe('ancestorsOf / descendantCount', () => {
     expect(ancestorsOf('daily', byId)).toEqual([])
     expect(descendantCount('zeta', children)).toBe(2)
     expect(descendantCount('loose', children)).toBe(0)
+  })
+  it('descendantCounts matches descendantCount for every doc, in one pass', () => {
+    const all = descendantCounts(children)
+    for (const kids of children.values()) {
+      for (const d of kids) expect(all.get(d.id) ?? 0).toBe(descendantCount(d.id, children))
+    }
+    expect(all.get('zeta')).toBe(2)
+    expect(all.get('loose')).toBe(0)
   })
 })
 

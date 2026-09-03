@@ -13,7 +13,7 @@ import {
   Section,
   ancestorsOf,
   childrenIndex,
-  descendantCount,
+  descendantCounts,
   filterDocs,
   groupRoot,
   loadTreeState,
@@ -61,6 +61,7 @@ export default function DocTree({
   const childrenOf = useMemo(() => childrenIndex(docs), [docs])
   const byId = useMemo(() => new Map(docs.map((d) => [d.id, d])), [docs])
   const groups = useMemo(() => groupRoot(docs, childrenOf), [docs, childrenOf])
+  const counts = useMemo(() => descendantCounts(childrenOf), [childrenOf])
 
   /* ---- open state, persisted (try/catch inside load/save) ---- */
   const persisted = useRef(loadTreeState())
@@ -103,6 +104,11 @@ export default function DocTree({
   /* ---- filter ---- */
   const [filter, setFilter] = useState('')
   const filterRef = useRef<HTMLInputElement>(null)
+  // the tree only mounts when it is open, so mount = "the tree just opened":
+  // put the caret in the filter so ⌘T is followed straight by typing
+  useEffect(() => {
+    filterRef.current?.focus()
+  }, [])
   const filtered = useMemo(() => filterDocs(docs, filter, byId), [docs, filter, byId])
   const isOpen = (id: string) => (filtered ? filtered.expanded.has(id) || openDirs.has(id) : openDirs.has(id))
   const isVisible = (id: string) => !filtered || filtered.visible.has(id)
@@ -278,7 +284,7 @@ export default function DocTree({
           {d.is_canvas && <span className="tree-canvas" title="canvas">▨</span>}
           <span className="tree-title">{d.title}</span>
           <span className="tree-badges">
-            {isDir && !open && <span className="tree-count">{descendantCount(d.id, childrenOf)}</span>}
+            {isDir && !open && <span className="tree-count">{counts.get(d.id) ?? 0}</span>}
             {d.is_tended && <span className="tend-dot" title="tended by agents" />}
             {d.mirror_permission && !d.from_hub && (
               <span className="mirror-badge quiet" title={`shared with you (${d.mirror_permission})`}>⇄</span>
@@ -359,8 +365,14 @@ export default function DocTree({
             // global Esc (palettes) must not see either
             e.stopPropagation()
             e.preventDefault()
-            if (filter) setFilter('')
-            else onClose()
+            if (filter) {
+              setFilter('')
+              return
+            }
+            // closing leaves the input mounted for the exit animation; drop
+            // focus first so keystrokes go to the editor, not a dead field
+            filterRef.current?.blur()
+            onClose()
           }}
           spellCheck={false}
         />
