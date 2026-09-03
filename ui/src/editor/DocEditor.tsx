@@ -17,6 +17,7 @@ import { api, Block } from '../types'
 import { notify } from '../Notice'
 import { proposeErrorText, saveErrorText } from '../hints'
 import { BaselineBlock, Entry, computeOps } from './diff'
+import { debounce } from '../timing'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
 
 const TOP_LEVEL_TYPES = [
@@ -116,8 +117,16 @@ export default function DocEditor({
 }) {
   const selCb = useRef(onSelectionBlock)
   selCb.current = onSelectionBlock
+  const modeRef = useRef(mode)
+  modeRef.current = mode
   const [saveState, setSaveState] = useState<SaveState>('clean')
   const [epoch, setEpoch] = useState(doc.epoch)
+  // autosave debounce, driven by the editor's update event: every keystroke
+  // re-arms it, so the save lands 1.2s after the LAST edit. (An effect keyed
+  // on editor.state.doc did not re-arm — Tiptap 3 does not re-render per
+  // transaction — so the timer fired 1.2s after the FIRST keystroke.)
+  const saveRef = useRef<() => Promise<void>>(async () => {})
+  const autosave = useRef(debounce(1200, () => saveRef.current()))
 
   // baseline: per block, the round-tripped markdown (comparison form) + structure
   const initial = useMemo(() => {
@@ -158,7 +167,10 @@ export default function DocEditor({
         type: 'doc',
         content: initial.nodes.map((n) => n.toJSON()),
       },
-      onUpdate: () => setSaveState('dirty'),
+      onUpdate: () => {
+        setSaveState('dirty')
+        if (modeRef.current === 'direct') autosave.current.arm()
+      },
       onSelectionUpdate: ({ editor }) => {
         const sel = editor.state.selection
         if (sel.empty) {
@@ -220,6 +232,10 @@ export default function DocEditor({
 
   const save = async () => {
     if (!editor || saveState === 'saving' || mode === 'readonly') return
+    autosave.current.cancel()
+    // what this save writes; edits landing while the request is in flight
+    // make the doc differ from it, and the editor must stay dirty for them
+    const snapshot = editor.state.doc
     const entries = extractEntries()
     const assigned: string[] = []
     const ops = computeOps(baselineRef.current, entries, () => {
@@ -256,6 +272,7 @@ export default function DocEditor({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ doc_id: doc.docId, base_epoch: epochRef.current, ops }),
       })
+      const editedMeanwhile = !editor.state.doc.eq(snapshot)
       // stamp fresh ids onto the inserted nodes so the next diff sees them
       let cursor = 0
       const inserted = ops
@@ -276,8 +293,14 @@ export default function DocEditor({
       baselineRef.current = rebuildBaseline(baselineRef.current, entries, ops)
       epochRef.current = out.epoch
       setEpoch(out.epoch)
-      setSaveState('clean')
       lastSaveError.current = null
+      if (editedMeanwhile) {
+        // typed during the request: those keystrokes are not in what landed
+        setSaveState('dirty')
+        autosave.current.arm()
+      } else {
+        setSaveState('clean')
+      }
       onSaved(out.epoch, doc.docId)
     } catch (e) {
       // the text is still in the editor and stays dirty; the retry clock
@@ -294,11 +317,7 @@ export default function DocEditor({
   }
   const lastSaveError = useRef<string | null>(null)
 
-  // debounce autosave; flush on unmount/navigation
-  const saveRef = useRef(save)
   saveRef.current = save
-  const modeRef = useRef(mode)
-  modeRef.current = mode
 
   // cold-editor heartbeat (auto-hot): while someone is actively in this
   // editor, tell the daemon — two concurrent editors escalate to a live
@@ -318,11 +337,6 @@ export default function DocEditor({
     }, 4000)
     return () => clearInterval(t)
   }, [editor, mode, doc.docId, saveState])
-  useEffect(() => {
-    if (saveState !== 'dirty' || mode !== 'direct') return
-    const t = setTimeout(() => saveRef.current(), 1200)
-    return () => clearTimeout(t)
-  }, [saveState, editor?.state.doc, mode])
   // a failed save leaves the doc dirty with no new keystrokes to re-arm the
   // debounce: retry on a slow clock until it lands (daemon back, live
   // session over, …)
@@ -337,8 +351,12 @@ export default function DocEditor({
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') saveRef.current()
     }
     window.addEventListener('keydown', onKey)
+    const pending = autosave.current
     return () => {
       window.removeEventListener('keydown', onKey)
+      // unmount/navigation: land whatever is pending now (the save reports
+      // its own docId, so a parent that has moved on ignores the result)
+      pending.cancel()
       if (modeRef.current === 'direct') saveRef.current()
     }
   }, [])
