@@ -282,6 +282,7 @@ async fn invoke_claude_streaming(
         }
     };
     if tokio::time::timeout(wall_clock, read_all).await.is_err() {
+        #[cfg(unix)]
         if let Some(r) = &registered {
             crate::children::kill_group(r.pid(), libc::SIGKILL);
         }
@@ -832,6 +833,9 @@ JSON array of          {{\"doc_id\": \"<uuid>\", \"block_id\": \"<uuid from a [b
 
 /// Progress reporter: streams the model's tool activity into the run row so
 /// a running gardener is visibly alive (the UI live-refreshes off the stamp).
+/// Called from the stdout-reading async task, so the store lock is taken on
+/// the blocking pool (fire-and-forget), never on a tokio worker; the 2s
+/// throttle keeps the write rate to one row update at a time in practice.
 fn progress_to_run(store: &Arc<Mutex<SqliteStore>>, run_id: Uuid) -> impl FnMut(String) {
     let store = store.clone();
     let mut last = std::time::Instant::now() - std::time::Duration::from_secs(10);
@@ -840,10 +844,13 @@ fn progress_to_run(store: &Arc<Mutex<SqliteStore>>, run_id: Uuid) -> impl FnMut(
             return;
         }
         last = std::time::Instant::now();
-        let mut s = store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = s.update_run_progress(run_id, &msg);
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut s = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = s.update_run_progress(run_id, &msg);
+        });
     }
 }
 

@@ -652,7 +652,9 @@ where
         let started = Instant::now();
         match tokio::spawn(make()).await {
             Ok(()) => tracing::error!(name, "background loop exited; restarting"),
-            Err(e) => tracing::error!(name, "background loop panicked: {e}; restarting"),
+            Err(e) if e.is_panic() => tracing::error!(name, "background loop panicked: {e}; restarting"),
+            // cancelled: the runtime is shutting down — a clean exit, not a crash
+            Err(_) => return,
         }
         backoff = if started.elapsed() > MAX { MIN } else { (backoff * 2).min(MAX) };
         tokio::time::sleep(backoff).await;

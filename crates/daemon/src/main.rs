@@ -785,26 +785,21 @@ async fn main() -> anyhow::Result<()> {
                                 ep.set_user_data_for_address_lookup(Some(ud));
                             }
                         }
-                        tokio::spawn(fed::neighbour_loop(mdns, runtime.clone()));
+                        {
+                            let runtime = runtime.clone();
+                            supervise("fed.neighbours", move || fed::neighbour_loop(mdns.clone(), runtime.clone()));
+                        }
                         {
                             let (ep, store, hot, runtime) = (ep.clone(), store.clone(), hot.clone(), runtime.clone());
                             supervise("fed.serve", move || {
                                 fed::serve(ep.clone(), store.clone(), hot.clone(), runtime.clone())
                             });
                         }
-                        {
-                            let (ep, store) = (ep.clone(), store.clone());
-                            supervise("fed.join_retry", move || fed::join_retry_loop(ep.clone(), store.clone()));
-                        }
-                        // grantee side: adaptive pull; owner side: nudge grantees on change
-                        {
-                            let (ep, store, runtime) = (ep.clone(), store.clone(), runtime.clone());
-                            supervise("fed.pull", move || fed::pull_loop(ep.clone(), store.clone(), runtime.clone()));
-                        }
-                        {
-                            let (store, hot) = (store.clone(), hot.clone());
-                            supervise("fed.notify", move || fed::notify_loop(ep.clone(), store.clone(), hot.clone()));
-                        }
+                        // join retry, grantee-side adaptive pull and owner-side
+                        // change nudges each self-supervise via fed::loops::supervise
+                        tokio::spawn(fed::join_retry_loop(ep.clone(), store.clone()));
+                        tokio::spawn(fed::pull_loop(ep.clone(), store.clone(), runtime.clone()));
+                        tokio::spawn(fed::notify_loop(ep.clone(), store.clone(), hot.clone()));
                     }
                     Err(e) => tracing::warn!("federation endpoint failed to bind: {e:#}"),
                 }

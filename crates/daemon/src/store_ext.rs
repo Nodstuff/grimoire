@@ -27,11 +27,19 @@ pub async fn with_store<T: Send + 'static>(
 
 /// `spawn_blocking` that re-raises a panic in `f` on the caller instead of
 /// handing back a `JoinError`. For sync fns that lock the store themselves.
+///
+/// A blocking task is only ever *cancelled* (never started) when the runtime
+/// is shutting down; there is no `T` to hand back, so the caller parks until
+/// the shutdown drops it — a benign early exit rather than a panic that
+/// would read as a store failure in the logs.
 pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     match tokio::task::spawn_blocking(f).await {
         Ok(v) => v,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(e) => panic!("store task cancelled: {e}"),
+        Err(e) => {
+            tracing::debug!("store task cancelled (runtime shutting down): {e}");
+            std::future::pending().await
+        }
     }
 }
 
