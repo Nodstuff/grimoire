@@ -50,7 +50,8 @@ pub fn export_vault(store: &impl BlockStore, out: &Path) -> Result<ExportReport>
     Ok(report)
 }
 
-fn safe_name(title: &str) -> String {
+/// A doc title as a file name: path separators become dashes.
+pub fn safe_name(title: &str) -> String {
     title.replace(['/', '\\'], "-")
 }
 

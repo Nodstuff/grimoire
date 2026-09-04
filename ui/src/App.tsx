@@ -6,7 +6,7 @@ import Gardeners from './Gardeners'
 import Sharing from './Sharing'
 import SharePanel from './SharePanel'
 import PaletteShell from './PaletteShell'
-import Profile, { FirstRunName, loadProfile } from './Profile'
+import Profile, { FirstRunName, loadProfile, copyText } from './Profile'
 import Trash from './Trash'
 import ImportFolder from './ImportFolder'
 import ReviewRail from './ReviewRail'
@@ -483,6 +483,7 @@ export default function App() {
       {palette === 'commands' && (
         <CommandPalette
           queueCount={queueCount}
+          docId={view.kind === 'doc' ? view.id : null}
           onAction={(a) => {
             if (a === 'review') setView({ kind: 'review' })
             if (a === 'runs') setView({ kind: 'runs' })
@@ -597,10 +598,13 @@ function ShortcutHelp({ onClose }: { onClose: () => void }) {
 
 function CommandPalette({
   queueCount,
+  docId,
   onAction,
   onClose,
 }: {
   queueCount: number
+  /** the open doc, if any — enables the per-doc commands */
+  docId: string | null
   onAction: (
     a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph' | 'sharing' | 'profile' | 'trash' | 'close' | 'ask',
   ) => void
@@ -646,6 +650,31 @@ function CommandPalette({
           .catch((e) => notify(errText(e)))
       },
     },
+    ...(docId
+      ? [
+          {
+            label: 'Export this doc as Markdown…',
+            hint: 'one .md file in ~/Downloads — for Slack, email, anywhere',
+            run: () => {
+              onAction('close')
+              api<{ path: string }>(`/api/doc/${docId}/export`, { method: 'POST' })
+                .then((r) => notify(`saved ${r.path}`, 'ok', { ttlMs: 12_000 }))
+                .catch((e) => notify(errText(e)))
+            },
+          },
+          {
+            label: 'Copy this doc as Markdown',
+            hint: 'to the clipboard',
+            run: () => {
+              onAction('close')
+              api<{ markdown: string }>(`/api/doc/${docId}/markdown`)
+                .then((r) => copyText(r.markdown))
+                .then(() => notify('copied as Markdown', 'ok'))
+                .catch((e) => notify(errText(e)))
+            },
+          },
+        ]
+      : []),
     {
       label: 'Export all docs as Markdown…',
       hint: 'a folder in ~/Downloads',

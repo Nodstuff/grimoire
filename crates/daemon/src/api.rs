@@ -1244,6 +1244,52 @@ async fn export_vault(State(st): State<ApiState>) -> Json<Value> {
     }
 }
 
+/// One doc as markdown, for "copy as Markdown" in the app.
+async fn doc_markdown(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
+    with_store(&st.store, move |s| match grimoire_store::export::export_doc(&*s, id) {
+        Ok(md) => Json(json!({"markdown": md})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    })
+    .await
+}
+
+/// One doc to `~/Downloads/<title>.md` — the single-file escape hatch, for
+/// sharing a doc outside Grimoire without exporting the whole vault. A name
+/// already taken gets ` (2)`, ` (3)`… rather than overwriting.
+async fn export_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
+    let (title, md) = match with_store(&st.store, move |s| {
+        let doc = s.get_doc(id)?;
+        let md = grimoire_store::export::export_doc(&*s, id)?;
+        Ok::<_, grimoire_store::StoreError>((doc.title, md))
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return Json(json!({"error": e.to_string()})),
+    };
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let dir = std::path::PathBuf::from(home).join("Downloads");
+    let base = grimoire_store::export::safe_name(title.trim());
+    let base = if base.is_empty() { "untitled".to_string() } else { base };
+    let res = tokio::task::spawn_blocking(move || -> std::io::Result<std::path::PathBuf> {
+        std::fs::create_dir_all(&dir)?;
+        let mut path = dir.join(format!("{base}.md"));
+        let mut n = 2;
+        while path.exists() {
+            path = dir.join(format!("{base} ({n}).md"));
+            n += 1;
+        }
+        std::fs::write(&path, md.as_bytes())?;
+        Ok(path)
+    })
+    .await;
+    match res {
+        Ok(Ok(path)) => Json(json!({"path": path.to_string_lossy()})),
+        Ok(Err(e)) => Json(json!({"error": e.to_string()})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
 #[derive(Deserialize)]
 struct ImportFile {
     /// Relative path inside the chosen folder (`notes/2026/a.md`).
@@ -1497,6 +1543,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/trash", get(trash))
         .route("/api/backups", get(backups).post(backup_now))
         .route("/api/export_vault", post(export_vault))
+        .route("/api/doc/{id}/export", post(export_doc))
+        .route("/api/doc/{id}/markdown", get(doc_markdown))
         .route(
             "/api/import",
             post(import_markdown).layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024)),
