@@ -25,6 +25,25 @@ body {
 
 .app { display: flex; height: 100vh; }
 
+/* ---------- window chrome ---------- */
+
+/* The app's title bar is transparent and the page runs under it, so the top
+   28px (macOS title-bar height) is the strip you grab to move the window:
+   `data-tauri-drag-region` in App.tsx, inert in a browser tab. Above the
+   stage and graph, below palettes and banners (z 20+), so those stay
+   clickable and the strip never steals a click from anything laid out
+   beneath it — nothing is. */
+.titlebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 28px;
+  z-index: 15;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
 /* ---------- stage: distraction-free center column ---------- */
 
 .stage {
@@ -136,7 +155,8 @@ kbd {
   /* one barely visible step lighter than the panel */
   background: color-mix(in srgb, var(--panel) 70%, var(--panel2) 30%);
   border-right: 1px solid var(--border);
-  padding: 14px 0 24px;
+  /* clears the traffic lights and the drag strip (28px) above the filter */
+  padding: 38px 0 24px;
 }
 .sidebar-head { padding: 0 10px 8px; }
 .tree-filter {

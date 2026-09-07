@@ -1213,11 +1213,57 @@ async fn backups(State(st): State<ApiState>) -> Json<Value> {
     }))
 }
 
-async fn backup_now(State(st): State<ApiState>) -> Json<Value> {
+/// `POST /api/backups` — empty body (or `{}`): today's snapshot beside the
+/// db, replaced if present. `{"to": "/abs/path/name.db"}`: a snapshot at a
+/// place the user chose in the app's native Save sheet (never pruned; refused
+/// inside the data directory — see `backup::backup_to`).
+#[derive(Deserialize, Default)]
+struct BackupReq {
+    to: Option<String>,
+}
+
+async fn backup_now(State(st): State<ApiState>, body: axum::body::Bytes) -> Json<Value> {
+    let req: BackupReq = if body.iter().all(u8::is_ascii_whitespace) {
+        BackupReq::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => return Json(json!({"error": format!("bad request: {e}")})),
+        }
+    };
     let path = st.db_path.clone();
-    match tokio::task::spawn_blocking(move || crate::backup::backup_now(&path, true)).await {
+    let res = tokio::task::spawn_blocking(move || match req.to {
+        Some(to) => crate::backup::backup_to(&path, std::path::Path::new(&to)),
+        None => crate::backup::backup_now(&path, true),
+    })
+    .await;
+    match res {
         Ok(Ok(info)) => Json(json!(info)),
         Ok(Err(e)) => Json(json!({"error": format!("{e:#}")})),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+/// Open the backups folder in the file manager: the snapshot toast names a
+/// path nobody wants to type. Local UI only, like every `/api` route.
+async fn reveal_backups(State(st): State<ApiState>) -> Json<Value> {
+    let dir = crate::backup::backup_dir(&st.db_path);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Json(json!({"error": e.to_string()}));
+    }
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    let d = dir.clone();
+    let status = tokio::task::spawn_blocking(move || std::process::Command::new(opener).arg(&d).status()).await;
+    match status {
+        Ok(Ok(s)) if s.success() => Json(json!({"ok": true, "dir": dir.to_string_lossy()})),
+        Ok(Ok(s)) => Json(json!({"error": format!("{opener} exited with {s}")})),
+        Ok(Err(e)) => Json(json!({"error": format!("could not open {}: {e}", dir.display())})),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
@@ -1542,6 +1588,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/doc/{id}/restore", post(restore_doc))
         .route("/api/trash", get(trash))
         .route("/api/backups", get(backups).post(backup_now))
+        .route("/api/backups/reveal", post(reveal_backups))
         .route("/api/export_vault", post(export_vault))
         .route("/api/doc/{id}/export", post(export_doc))
         .route("/api/doc/{id}/markdown", get(doc_markdown))

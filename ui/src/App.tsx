@@ -12,6 +12,7 @@ import ImportFolder from './ImportFolder'
 import ReviewRail from './ReviewRail'
 import DocTreePanel from './DocTree'
 import { notify, errText, Notices } from './Notice'
+import { backupFileName, inTauri, saveDialog } from './tauri'
 
 // heavy views load on first use: xyflow + html-to-image (canvas) and
 // force-graph (graph) are not part of the boot bundle
@@ -365,9 +366,14 @@ export default function App() {
 
   return (
     <div className="app">
+      {/* the window's title bar is transparent and the page runs under it
+          (traffic lights float over the UI); this strip is what you grab
+          to drag the window, and double-click to zoom it. Inert in a
+          browser tab. */}
+      <div className="titlebar" data-tauri-drag-region aria-hidden="true" />
       <Notices />
       {daemonDown && (
-        <div className="daemon-banner" role="status">
+        <div className="daemon-banner" role="status" data-tauri-drag-region>
           Grimoire’s background service is not responding — edits are kept in the editor and will save when it is back
         </div>
       )}
@@ -693,6 +699,40 @@ function CommandPalette({
         api<{ path: string; bytes: number }>('/api/backups', { method: 'POST' })
           .then((r) => notify(`backup written: ${r.path} (${(r.bytes / 1_048_576).toFixed(1)} MB)`, 'ok', { ttlMs: 12_000 }))
           .catch((e) => notify(errText(e)))
+      },
+    },
+    // a native Save sheet needs the app; in a browser tab the row is absent
+    ...(inTauri()
+      ? [
+          {
+            label: 'Back up database to…',
+            hint: 'one self-contained file wherever you choose — a USB stick, iCloud Drive, a sync folder',
+            run: () => {
+              onAction('close')
+              saveDialog({
+                title: 'Back up Grimoire database',
+                defaultPath: backupFileName(),
+                filters: [{ name: 'SQLite database', extensions: ['db'] }],
+              })
+                .then((to) => {
+                  if (!to) return
+                  return api<{ path: string; bytes: number }>('/api/backups', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ to }),
+                  }).then((r) => notify(`backup written: ${r.path} (${(r.bytes / 1_048_576).toFixed(1)} MB)`, 'ok', { ttlMs: 12_000 }))
+                })
+                .catch((e) => notify(errText(e)))
+            },
+          },
+        ]
+      : []),
+    {
+      label: 'Show backups in Finder',
+      hint: '~/.grimoire/backups — the folder to point Time Machine or a sync tool at',
+      run: () => {
+        onAction('close')
+        api<{ dir: string }>('/api/backups/reveal', { method: 'POST' }).catch((e) => notify(errText(e)))
       },
     },
     { label: 'Toggle file tree', hint: '⌘T', run: () => onAction('tree') },

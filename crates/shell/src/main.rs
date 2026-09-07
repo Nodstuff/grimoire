@@ -331,6 +331,11 @@ fn show_window(app: &AppHandle) {
         return;
     }
     let target = if daemon_up() { ui_url(&[]) } else { error_page() };
+    // Overlay: the page extends under the (transparent) title bar, so the
+    // traffic lights float over the UI. That also means the title bar is not
+    // natively draggable — the UI marks its top strip `data-tauri-drag-region`
+    // and the capability in `capabilities/main.json` lets the daemon's origin
+    // call start_dragging.
     let _ = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(target.parse().unwrap()))
         .title("Grimoire")
         .inner_size(1240.0, 860.0)
@@ -503,6 +508,18 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        // the window reopens where you left it. VISIBLE is deliberately not
+        // saved: the window is hidden (close-to-tray) at almost every quit,
+        // and restoring that would relaunch into an invisible app.
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::SIZE
+                        | tauri_plugin_window_state::StateFlags::POSITION
+                        | tauri_plugin_window_state::StateFlags::MAXIMIZED,
+                )
+                .build(),
+        )
         .setup(|app| {
             ensure_daemon();
 
