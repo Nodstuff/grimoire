@@ -14,7 +14,7 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -305,6 +305,10 @@ pub struct DiffSinceParams {
 pub struct ReviewQueueParams {
     /// Restrict to one doc (UUID); omit for all docs.
     pub doc_id: Option<String>,
+    /// Max entries, oldest first (default 50).
+    pub limit: Option<u32>,
+    /// Include full prior blocks and provenance fields (default false: prior = {id, block_type, content}).
+    pub verbose: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -810,9 +814,30 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
+        let limit = p.limit.unwrap_or(50).max(1) as usize;
+        let verbose = p.verbose.unwrap_or(false);
         with_store(&self.store, move |store| {
             match store.review_queue(doc_id) {
-                Ok(q) => ok_json(&q),
+                Ok(q) => {
+                    let total = q.len();
+                    let mut items: Vec<Value> = q.iter().take(limit).map(|e| json!(e)).collect();
+                    if !verbose {
+                        // the queue is read to decide, not to reconstruct: the
+                        // pre-image's provenance fields are noise on every entry
+                        for item in &mut items {
+                            if let Some(prior) = item.pointer_mut("/op/prior") {
+                                if prior.is_object() {
+                                    *prior = json!({
+                                        "id": prior.get("id").cloned().unwrap_or(Value::Null),
+                                        "block_type": prior.get("block_type").cloned().unwrap_or(Value::Null),
+                                        "content": prior.get("content").cloned().unwrap_or(Value::Null),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    ok_json(&json!({"total": total, "shown": items.len(), "items": items}))
+                }
                 Err(e) => err(e.to_string()),
             }
         })

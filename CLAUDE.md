@@ -8,7 +8,9 @@ account may be flipped to the work account by other sessions — push with
 - **[[Roadmap]]** in Grimoire (under the `[[Grimoire]]` tree) is the outstanding list — read it first in any
   new session; the daily doc carries narrative, the roadmap carries the work.
 - Test with `cargo test -p grimoire -p grimoire-store` (the shell crate's build.rs needs the sidecar
-  binary; a bare workspace `cargo test` fails in a fresh worktree) and `cd ui && npx vitest run`.
+  binary; a bare workspace `cargo test` fails in a fresh worktree). In a fresh worktree the daemon
+  also needs `ui/dist/` to exist (rust-embed): `mkdir -p ui/dist && touch ui/dist/index.html` or
+  copy the main checkout's `ui/dist` before `cargo test`. Then `cd ui && npx vitest run`.
   Print `rg -c 'test result: ok'` AND `rg -c 'test result: FAILED'` in the foreground before releasing.
 - Before any push/release: `git branch --show-current` must be `main` (another session may have
   switched this shared checkout); `release.sh` enforces this and tags the exact HEAD.
