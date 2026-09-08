@@ -1,7 +1,12 @@
 //! MCP tools over streamable HTTP (tickets 3.1–3.6, 3.7, #52/#53).
 //!
-//! All writes act as the `claude` agent principal and go through the propose
-//! gate — the MCP surface has no direct-write path by design.
+//! Every write goes through the propose gate — the MCP surface has no
+//! direct-write path by design — and is attributed to an *acting principal*:
+//! the `as` argument on the call (a name or an agent UUID), else the identity
+//! set by `identify` (session-capable clients only), else the shared `claude`.
+//! MCP 2026-07-28 has no sessions (SEP-2567) and rmcp serves it with a fresh
+//! `KsMcp` per request, so `as` is the only handle that survives between
+//! calls for those clients — see `acting_principal`.
 
 use crate::store_ext::with_store;
 use grimoire_store::{BlockNode, BlockStore, OpInput, ReviewDecision, SqliteStore};
@@ -57,6 +62,17 @@ pub fn swap_auto_created_for_test(n: usize) -> usize {
     AUTO_CREATED.swap(n, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Name/UUID string → agent principal id, shared across requests (one per
+/// daemon, handed to every `KsMcp` the factory builds — the same pattern as
+/// `DedupeCache`). Only a shortcut past the `list_principals` scan:
+/// `agent_principal_by_name` stays the source of truth and every entry was
+/// resolved through it (or verified via `get_principal`) first.
+pub type NameCache = Arc<Mutex<std::collections::HashMap<String, Uuid>>>;
+
+pub fn new_name_cache() -> NameCache {
+    Arc::new(Mutex::new(std::collections::HashMap::new()))
+}
+
 /// A principal name: 1–64 printable chars (no control characters), trimmed.
 pub fn valid_principal_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
@@ -66,9 +82,10 @@ pub fn valid_principal_name(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
-/// Find-or-create the Agent principal named `name` (the `identify` rule,
-/// shared with the HTTP `X-Grimoire-Principal` header). Creation is capped
-/// per boot; existing names always resolve.
+/// Find-or-create the Agent principal named `name` (the `identify` / `as`
+/// rule, shared with the HTTP `X-Grimoire-Principal` header). Creation is
+/// capped per boot; existing agent names always resolve. A Human or Remote
+/// principal carrying the name is refused: an agent never acts as the human.
 pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uuid, String> {
     let name = valid_principal_name(name)?;
     let existing = store
@@ -76,7 +93,13 @@ pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uu
         .ok()
         .and_then(|ps| ps.into_iter().find(|pr| pr.display_name == name));
     if let Some(pr) = existing {
-        return Ok(pr.id);
+        return match pr.kind {
+            grimoire_store::PrincipalKind::Agent => Ok(pr.id),
+            kind => Err(format!(
+                "{name:?} is the {} principal, not an agent: agents cannot act as it",
+                kind.as_str()
+            )),
+        };
     }
     if AUTO_CREATED.load(std::sync::atomic::Ordering::Relaxed) >= MAX_AUTO_PRINCIPALS_PER_BOOT {
         return Err(format!(
@@ -89,6 +112,54 @@ pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uu
         .map_err(|e| e.to_string())?;
     AUTO_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(pr.id)
+}
+
+/// Who a call acts as. Precedence: `as_` (the explicit handle) > `identity`
+/// (set by `identify` in a session-capable client) > `default` (the shared
+/// `claude`). `as_` is either an agent principal's UUID — which must exist and
+/// be an Agent — or a name, found-or-created like `identify`. Either form is
+/// remembered in `names` so the next request skips the store scan.
+pub fn acting_principal(
+    store: &mut SqliteStore,
+    names: &NameCache,
+    as_: Option<&str>,
+    identity: Option<Uuid>,
+    default: Uuid,
+) -> Result<Uuid, String> {
+    let Some(raw) = as_ else {
+        return Ok(identity.unwrap_or(default));
+    };
+    let key = raw.trim();
+    if let Some(id) = cached_principal(names, key) {
+        return Ok(id);
+    }
+    let id = match Uuid::parse_str(key) {
+        Ok(id) => match store.get_principal(id) {
+            Ok(pr) if pr.kind == grimoire_store::PrincipalKind::Agent => id,
+            Ok(pr) => {
+                return Err(format!(
+                    "as: {id} is the {} principal {:?}, not an agent: agents cannot act as it",
+                    pr.kind.as_str(),
+                    pr.display_name
+                ));
+            }
+            Err(_) => return Err(format!("as: no principal with id {id}; pass a name to create one")),
+        },
+        Err(_) => agent_principal_by_name(store, key).map_err(|m| format!("as: {m}"))?,
+    };
+    names
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_string(), id);
+    Ok(id)
+}
+
+fn cached_principal(names: &NameCache, key: &str) -> Option<Uuid> {
+    names
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .copied()
 }
 
 pub fn dedupe_put(cache: &DedupeCache, principal: Uuid, id: Uuid, v: serde_json::Value) {
@@ -148,9 +219,12 @@ pub struct KsMcp {
     hot: crate::hot::HotState,
     /// Default principal for un-identified sessions.
     agent: Uuid,
-    /// Per-session identity set via the `identify` tool — distinct provenance
-    /// for concurrent agent sessions.
+    /// Per-session identity set via the `identify` tool. Only session-capable
+    /// clients (protocol ≤ 2025-11-25) keep it between calls; stateless ones
+    /// pass `as` on every write instead.
     identity: Arc<Mutex<Option<Uuid>>>,
+    /// Shared `as`-string → principal cache (see `NameCache`).
+    names: NameCache,
     /// Block embeddings for the dense leg of `search`/`related`; None when
     /// the model did not load (those tools degrade to keywords and say so).
     embedder: Option<Arc<crate::embed::Embedder>>,
@@ -160,11 +234,28 @@ pub struct KsMcp {
 }
 
 impl KsMcp {
-    fn principal(&self) -> Uuid {
-        self.identity
+    fn identity(&self) -> Option<Uuid> {
+        *self
+            .identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .unwrap_or(self.agent)
+    }
+
+    /// The principal this call acts as (`acting_principal`). Skips the store
+    /// when `as` is absent or already cached.
+    async fn acting(&self, as_: Option<&str>) -> Result<Uuid, String> {
+        let (identity, default) = (self.identity(), self.agent);
+        let Some(raw) = as_ else {
+            return Ok(identity.unwrap_or(default));
+        };
+        if let Some(id) = cached_principal(&self.names, raw.trim()) {
+            return Ok(id);
+        }
+        let (names, raw) = (self.names.clone(), raw.to_string());
+        with_store(&self.store, move |store| {
+            acting_principal(store, &names, Some(&raw), identity, default)
+        })
+        .await
     }
 
     pub fn with_embedder(mut self, embedder: Option<Arc<crate::embed::Embedder>>) -> Self {
@@ -232,6 +323,13 @@ pub struct RenameDocParams {
     pub doc_id: String,
     /// The new title.
     pub title: String,
+    /// Who this call acts as: the same name you would give identify (e.g.
+    /// 'claude:myproject-task') or an agent principal UUID. Required for
+    /// correct provenance on stateless MCP clients (protocol 2026-07-28 has no
+    /// sessions); optional when you identified earlier in a session-capable
+    /// client.
+    #[serde(rename = "as")]
+    pub as_: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -241,6 +339,13 @@ pub struct MoveDocParams {
     pub new_parent_id: Option<String>,
     /// Land right after this sibling (UUID, must be a child of the new parent); omit to append last.
     pub after_doc_id: Option<String>,
+    /// Who this call acts as: the same name you would give identify (e.g.
+    /// 'claude:myproject-task') or an agent principal UUID. Required for
+    /// correct provenance on stateless MCP clients (protocol 2026-07-28 has no
+    /// sessions); optional when you identified earlier in a session-capable
+    /// client.
+    #[serde(rename = "as")]
+    pub as_: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -248,11 +353,25 @@ pub struct SetStatusParams {
     pub doc_id: String,
     /// "draft" | "in-review" | "decided" | "superseded"; omit or "null" to clear.
     pub status: Option<String>,
+    /// Who this call acts as: the same name you would give identify (e.g.
+    /// 'claude:myproject-task') or an agent principal UUID. Required for
+    /// correct provenance on stateless MCP clients (protocol 2026-07-28 has no
+    /// sessions); optional when you identified earlier in a session-capable
+    /// client.
+    #[serde(rename = "as")]
+    pub as_: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DeleteDocParams {
     pub doc_id: String,
+    /// Who this call acts as: the same name you would give identify (e.g.
+    /// 'claude:myproject-task') or an agent principal UUID. Required for
+    /// correct provenance on stateless MCP clients (protocol 2026-07-28 has no
+    /// sessions); optional when you identified earlier in a session-capable
+    /// client.
+    #[serde(rename = "as")]
+    pub as_: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -261,6 +380,13 @@ pub struct MergeDocsParams {
     pub from_doc_id: String,
     /// The doc that receives the content.
     pub into_doc_id: String,
+    /// Who this call acts as: the same name you would give identify (e.g.
+    /// 'claude:myproject-task') or an agent principal UUID. Required for
+    /// correct provenance on stateless MCP clients (protocol 2026-07-28 has no
+    /// sessions); optional when you identified earlier in a session-capable
+    /// client.
+    #[serde(rename = "as")]
+    pub as_: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -279,6 +405,13 @@ pub struct ProposeParams {
     /// propose with the same request_id returns the original outcome instead
     /// of double-applying.
     pub request_id: Option<String>,
+    /// Who this call acts as: the same name you would give identify (e.g.
+    /// 'claude:myproject-task') or an agent principal UUID. Required for
+    /// correct provenance on stateless MCP clients (protocol 2026-07-28 has no
+    /// sessions); optional when you identified earlier in a session-capable
+    /// client.
+    #[serde(rename = "as")]
+    pub as_: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -291,6 +424,13 @@ pub struct ProposeMarkdownParams {
     pub markdown: String,
     /// Optional idempotency key (any UUID).
     pub request_id: Option<String>,
+    /// Who this call acts as: the same name you would give identify (e.g.
+    /// 'claude:myproject-task') or an agent principal UUID. Required for
+    /// correct provenance on stateless MCP clients (protocol 2026-07-28 has no
+    /// sessions); optional when you identified earlier in a session-capable
+    /// client.
+    #[serde(rename = "as")]
+    pub as_: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -317,6 +457,13 @@ pub struct ResolveParams {
     pub annotation_id: String,
     /// "accept" or "decline".
     pub decision: String,
+    /// Who this call acts as: the same name you would give identify (e.g.
+    /// 'claude:myproject-task') or an agent principal UUID. Required for
+    /// correct provenance on stateless MCP clients (protocol 2026-07-28 has no
+    /// sessions); optional when you identified earlier in a session-capable
+    /// client.
+    #[serde(rename = "as")]
+    pub as_: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -330,6 +477,13 @@ pub struct CreateDocParams {
     /// exists under the parent. "reuse": return that doc instead (with
     /// `reused: true`, and `markdown` ignored) — an atomic find-or-create.
     pub if_exists: Option<String>,
+    /// Who this call acts as: the same name you would give identify (e.g.
+    /// 'claude:myproject-task') or an agent principal UUID. Required for
+    /// correct provenance on stateless MCP clients (protocol 2026-07-28 has no
+    /// sessions); optional when you identified earlier in a session-capable
+    /// client.
+    #[serde(rename = "as")]
+    pub as_: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -345,6 +499,13 @@ pub struct AddCommentParams {
     pub text: String,
     /// Comment UUID to reply to (same thread); omit for a new thread.
     pub reply_to: Option<String>,
+    /// Who this call acts as: the same name you would give identify (e.g.
+    /// 'claude:myproject-task') or an agent principal UUID. Required for
+    /// correct provenance on stateless MCP clients (protocol 2026-07-28 has no
+    /// sessions); optional when you identified earlier in a session-capable
+    /// client.
+    #[serde(rename = "as")]
+    pub as_: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -363,6 +524,15 @@ pub struct IdentifyParams {
 pub struct MyProposalsParams {
     /// Max ops to return (default 20).
     pub limit: Option<u32>,
+    /// Include full prior blocks and op bookkeeping (default false).
+    pub verbose: Option<bool>,
+    /// Who this call acts as: the same name you would give identify (e.g.
+    /// 'claude:myproject-task') or an agent principal UUID. Required for
+    /// correct provenance on stateless MCP clients (protocol 2026-07-28 has no
+    /// sessions); optional when you identified earlier in a session-capable
+    /// client.
+    #[serde(rename = "as")]
+    pub as_: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -414,6 +584,7 @@ impl KsMcp {
         store: Arc<Mutex<SqliteStore>>,
         agent: Uuid,
         dedupe: DedupeCache,
+        names: NameCache,
         hot: crate::hot::HotState,
     ) -> Self {
         Self {
@@ -422,13 +593,14 @@ impl KsMcp {
             hot,
             agent,
             identity: Arc::new(Mutex::new(None)),
+            names,
             embedder: None,
             tool_router: Self::tool_router(),
         }
     }
 
     #[tool(
-        description = "Identify this session with a name (e.g. 'claude:myproject-refactor'). Your writes are then attributed to that principal instead of the shared 'claude' — do this first in any session that writes, so provenance distinguishes concurrent agents."
+        description = "Optional: name this session (e.g. 'claude:myproject-task') so later writes in a session-capable client are attributed to that principal. Stateless clients (MCP 2026-07-28, e.g. Claude Code) have no session — pass as=<that name> on every write instead; identify still finds-or-creates the principal and echoes the handle."
     )]
     async fn identify(
         &self,
@@ -447,23 +619,60 @@ impl KsMcp {
             .identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(principal);
-        ok_json(&json!({"identified_as": name, "principal": principal}))
+        self.names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.clone(), principal);
+        ok_json(&json!({
+            "identified_as": name,
+            "principal": principal,
+            "as": name,
+            "note": "stateless clients (MCP 2026-07-28, e.g. Claude Code) have no session: pass as=<this name> on every write",
+        }))
     }
 
     #[tool(
-        description = "What happened to this session's recent proposals: each op with its verdict, whether its review annotation was accepted/declined/open, and who resolved it. Use to learn from declines."
+        description = "What happened to your recent proposals (as: the name you write under): each op with its verdict, whether its review annotation was accepted/declined/open, and who resolved it. Use to learn from declines."
     )]
     async fn my_proposals(
         &self,
         Parameters(p): Parameters<MyProposalsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let principal = self.principal();
+        let principal = match self.acting(p.as_.as_deref()).await {
+            Ok(id) => id,
+            Err(m) => return err(m),
+        };
+        let verbose = p.verbose.unwrap_or(false);
         with_store(&self.store, move |store| {
             match store.proposal_outcomes(principal, p.limit.unwrap_or(20) as usize) {
-                Ok(rows) => ok_json(
-                    &rows
+                Ok(rows) => ok_json(&json!({
+                    "principal": principal,
+                    "proposals": rows
                         .into_iter()
                         .map(|(op, status, resolver)| {
+                            let mut op = json!(op);
+                            if !verbose {
+                                // the outcome is the point: what was proposed, the
+                                // verdict, who resolved it. The pre-image's
+                                // provenance fields and the op's own bookkeeping
+                                // are noise here (verbose: true keeps them).
+                                if let Some(prior) = op.get_mut("prior") {
+                                    if prior.is_object() {
+                                        *prior = json!({
+                                            "id": prior.get("id").cloned().unwrap_or(Value::Null),
+                                            "block_type": prior.get("block_type").cloned().unwrap_or(Value::Null),
+                                            "content": prior.get("content").cloned().unwrap_or(Value::Null),
+                                        });
+                                    }
+                                }
+                                if let Some(o) = op.as_object_mut() {
+                                    o.remove("principal");
+                                    o.remove("base_epoch");
+                                    if let Some(k) = o.get_mut("kind").and_then(Value::as_object_mut) {
+                                        k.remove("refers_to");
+                                    }
+                                }
+                            }
                             json!({
                                 "op": op,
                                 "review_status": status,
@@ -471,7 +680,7 @@ impl KsMcp {
                             })
                         })
                         .collect::<Vec<_>>(),
-                ),
+                })),
                 Err(e) => err(e.to_string()),
             }
         })
@@ -655,7 +864,7 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Propose block edits through the review gate. Returns per-op structured verdicts {op_id, block_id, verdict, applied, note}: green = applied; yellow = applied, flagged for review; red = parked unapplied (your text is preserved for a reviewer). A stale base_epoch is fine — ops against unchanged blocks still green. Never guess base_epoch: read_doc first and quote its epoch. For inserts, block_id is optional (the server mints one and returns it in the verdict); set order_key to \"\" to append after the last sibling, or \"after:<block-uuid>\" to insert after a specific block — the server assigns the real key; never compute keys yourself. For anything beyond a one-block change prefer propose_markdown."
+        description = "Propose block edits through the review gate. Returns per-op structured verdicts {op_id, block_id, verdict, applied, note}: green = applied; yellow = applied, flagged for review; red = parked unapplied (your text is preserved for a reviewer). A stale base_epoch is fine — ops against unchanged blocks still green. Never guess base_epoch: read_doc first and quote its epoch. For inserts, block_id is optional (the server mints one and returns it in the verdict); set order_key to \"\" to append after the last sibling, or \"after:<block-uuid>\" to insert after a specific block — the server assigns the real key; never compute keys yourself. For anything beyond a one-block change prefer propose_markdown. Pass as=<your name> for provenance."
     )]
     async fn propose(
         &self,
@@ -674,7 +883,10 @@ impl KsMcp {
             Some(Err(m)) => return err(m),
             None => None,
         };
-        let principal = self.principal();
+        let principal = match self.acting(p.as_.as_deref()).await {
+            Ok(id) => id,
+            Err(m) => return err(m),
+        };
         if let Some(rid) = request_id
             && let Some(prev) = dedupe_get(&self.dedupe, principal, rid)
         {
@@ -708,7 +920,7 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "THE EASY WRITE PATH: hand over a doc's complete new markdown; the server diffs it against the current blocks and proposes minimal ops through the gate — unchanged blocks keep their ids (provenance and comment anchors survive), edits become replaces, new/removed paragraphs become inserts/deletes. Loop: read_doc(mode 'markdown') → edit the string (keep or drop the '<!-- block … -->' markers, both work) → propose_markdown with that read's epoch → verdicts. Prefer this over hand-built block ops for anything beyond a single-block change."
+        description = "THE EASY WRITE PATH: hand over a doc's complete new markdown; the server diffs it against the current blocks and proposes minimal ops through the gate — unchanged blocks keep their ids (provenance and comment anchors survive), edits become replaces, new/removed paragraphs become inserts/deletes. Loop: read_doc(mode 'markdown') → edit the string (keep or drop the '<!-- block … -->' markers, both work) → propose_markdown with that read's epoch → verdicts. Prefer this over hand-built block ops for anything beyond a single-block change. Pass as=<your name> for provenance."
     )]
     async fn propose_markdown(
         &self,
@@ -723,7 +935,10 @@ impl KsMcp {
             Some(Err(m)) => return err(m),
             None => None,
         };
-        let principal = self.principal();
+        let principal = match self.acting(p.as_.as_deref()).await {
+            Ok(id) => id,
+            Err(m) => return err(m),
+        };
         if let Some(rid) = request_id
             && let Some(prev) = dedupe_get(&self.dedupe, principal, rid)
         {
@@ -845,7 +1060,7 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Resolve one review annotation as this agent: accept or decline. You cannot resolve your own proposals (proposer ≠ approver)."
+        description = "Resolve one review annotation as this agent (as=<your name>): accept or decline. You cannot resolve your own proposals (proposer ≠ approver)."
     )]
     async fn resolve(
         &self,
@@ -860,7 +1075,11 @@ impl KsMcp {
             "decline" => ReviewDecision::Decline,
             other => return err(format!("decision must be accept|decline, got {other}")),
         };
-        let (hot, principal) = (self.hot.clone(), self.principal());
+        let principal = match self.acting(p.as_.as_deref()).await {
+            Ok(id) => id,
+            Err(m) => return err(m),
+        };
+        let hot = self.hot.clone();
         with_store(&self.store, move |store| {
             if let Some(doc) = crate::hot::annotation_doc(&store, id)
                 && let Err(m) = hot.assert_cold(doc)
@@ -915,7 +1134,10 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let principal = self.principal();
+        let principal = match self.acting(p.as_.as_deref()).await {
+            Ok(id) => id,
+            Err(m) => return err(m),
+        };
         with_store(&self.store, move |store| {
             match store.add_comment(block_id, principal, &p.text, reply_to) {
                 Ok(c) => ok_json(&c),
@@ -954,7 +1176,10 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let principal = self.principal();
+        let principal = match self.acting(p.as_.as_deref()).await {
+            Ok(id) => id,
+            Err(m) => return err(m),
+        };
         with_store(&self.store, move |store| {
             match crate::docops::rename(store, doc_id, &p.title, principal) {
                 Ok(out) => ok_json(&out),
@@ -993,7 +1218,10 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let principal = self.principal();
+        let principal = match self.acting(p.as_.as_deref()).await {
+            Ok(id) => id,
+            Err(m) => return err(m),
+        };
         with_store(&self.store, move |store| {
             match crate::docops::move_doc(store, doc_id, new_parent, after, principal) {
                 Ok(out) => ok_json(&out),
@@ -1018,7 +1246,10 @@ impl KsMcp {
             Ok(s) => s,
             Err(m) => return err(m),
         };
-        let principal = self.principal();
+        let principal = match self.acting(p.as_.as_deref()).await {
+            Ok(id) => id,
+            Err(m) => return err(m),
+        };
         with_store(&self.store, move |store| {
             match crate::docops::set_status(store, doc_id, status, principal) {
                 Ok(out) => ok_json(&out),
@@ -1039,7 +1270,11 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let (hot, principal) = (self.hot.clone(), self.principal());
+        let principal = match self.acting(p.as_.as_deref()).await {
+            Ok(id) => id,
+            Err(m) => return err(m),
+        };
+        let hot = self.hot.clone();
         with_store(&self.store, move |store| {
             match crate::docops::delete(store, &|d| hot.is_hot(d), doc_id, principal) {
                 Ok(out) => ok_json(&out),
@@ -1064,7 +1299,11 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let (hot, principal) = (self.hot.clone(), self.principal());
+        let principal = match self.acting(p.as_.as_deref()).await {
+            Ok(id) => id,
+            Err(m) => return err(m),
+        };
+        let hot = self.hot.clone();
         with_store(&self.store, move |store| {
             match crate::docops::merge(store, &|d| hot.is_hot(d), from, into, principal) {
                 Ok(out) => ok_json(&out),
@@ -1099,7 +1338,10 @@ impl KsMcp {
         if title.is_empty() {
             return err("title must not be empty".into());
         }
-        let principal = self.principal();
+        let principal = match self.acting(p.as_.as_deref()).await {
+            Ok(id) => id,
+            Err(m) => return err(m),
+        };
         with_store(&self.store, move |store| {
             // one lock for the whole find-or-create: two sessions racing on
             // the same daily title cannot both create
@@ -1261,12 +1503,17 @@ impl ServerHandler for KsMcp {
             "Grimoire: docs as block trees behind a review gate. Everything you write \
              gets a verdict: green = applied, yellow = applied + flagged for a human \
              (revertible), red = parked until a human accepts.\n\
-             The loop: identify(name) once per session → find_doc(query) to locate a doc \
-             (or tree() for the shape; list_docs only for one small subtree) → \
-             read_doc(doc_id, mode 'markdown') → edit the markdown → propose_markdown \
-             (doc_id, that read's epoch, markdown) → read the verdicts. If told \
-             stale_base: diff_since, re-read, re-propose. Use propose for a single-block \
-             change (insert block_id is optional).\n\
+             Provenance: pass as: 'claude:<project>-<task>' on EVERY write (propose, \
+             propose_markdown, create_doc, rename_doc, move_doc, set_status, delete_doc, \
+             merge_docs, add_comment, resolve) and on my_proposals. MCP has no sessions \
+             any more, so nothing else survives between calls; identify(name) is optional \
+             (it only helps older session-capable clients). Without as, writes land on \
+             the shared 'claude'.\n\
+             The loop: find_doc(query) to locate a doc (or tree() for the shape; \
+             list_docs only for one small subtree) → read_doc(doc_id, mode 'markdown') → \
+             edit the markdown → propose_markdown (doc_id, that read's epoch, markdown, as) \
+             → read the verdicts. If told stale_base: diff_since, re-read, re-propose. \
+             Use propose for a single-block change (insert block_id is optional).\n\
              Find-or-create: create_doc(title, parent_doc_id, markdown, if_exists 'reuse') \
              returns the existing doc instead of a duplicate.\n\
              Tree ops carry verdicts too: rename_doc / move_doc / set_status are yellow \
@@ -1293,8 +1540,14 @@ pub fn router(
     dedupe: DedupeCache,
     embedder: Option<Arc<crate::embed::Embedder>>,
 ) -> axum::Router {
+    // one `as` cache for every request: rmcp builds a fresh KsMcp per request
+    // on stateless protocol versions, so anything cross-call lives out here
+    let names = new_name_cache();
     let service = StreamableHttpService::new(
-        move || Ok(KsMcp::new(store.clone(), agent, dedupe.clone(), hot.clone()).with_embedder(embedder.clone())),
+        move || {
+            Ok(KsMcp::new(store.clone(), agent, dedupe.clone(), names.clone(), hot.clone())
+                .with_embedder(embedder.clone()))
+        },
         LocalSessionManager::default().into(),
         rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default()
             .with_max_request_body_bytes(MAX_MCP_BODY),
@@ -1409,11 +1662,8 @@ mod tests {
         let (shell, _) = import_markdown(&mut store, "Shell", None, tom, "Drag the window by its title bar.\n").unwrap();
         import_markdown(&mut store, "Entitlements", None, tom, "The entitlement check runs at login.\n").unwrap();
         let hot = crate::hot::HotState::new(std::env::temp_dir().join(format!("grimoire-mcp-ax-{}", Uuid::now_v7())));
-        let mcp = KsMcp::new(Arc::new(Mutex::new(store)), agent, new_dedupe(), hot);
+        let mcp = KsMcp::new(Arc::new(Mutex::new(store)), agent, new_dedupe(), new_name_cache(), hot);
 
-        fn p<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> T {
-            serde_json::from_value(v).unwrap()
-        }
         let (is_err, hits) = text_of(mcp.search(Parameters(p(json!({"query": "title bar"})))).await.unwrap());
         assert!(!is_err);
         assert_eq!(hits[0]["doc_title"], "Shell");
@@ -1446,5 +1696,140 @@ mod tests {
         assert!(!is_err);
         let map = map.as_str().unwrap();
         assert!(map.starts_with("# Corpus — 2 docs") && map.contains("- Shell · "), "{map}");
+    }
+
+    fn test_hot(tag: &str) -> crate::hot::HotState {
+        crate::hot::HotState::new(std::env::temp_dir().join(format!("grimoire-mcp-{tag}-{}", Uuid::now_v7())))
+    }
+
+    fn p<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> T {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// `as` beats the session identity, which beats the shared default; both
+    /// forms of `as` resolve (a name finds-or-creates, a UUID must exist);
+    /// the human and remote principals are refused by name and by id.
+    #[test]
+    fn acting_principal_precedence_forms_and_refusals() {
+        let _serial = AUTO_CREATED_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = swap_auto_created_for_test(0);
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let peer = store.create_principal(grimoire_store::PrincipalKind::Remote, "laptop", None).unwrap().id;
+        let claude = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let session = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude:session", None).unwrap().id;
+        let names = new_name_cache();
+        let act = |store: &mut SqliteStore, as_: Option<&str>, identity: Option<Uuid>| {
+            acting_principal(store, &names, as_, identity, claude)
+        };
+
+        // precedence
+        assert_eq!(act(&mut store, None, None), Ok(claude), "default");
+        assert_eq!(act(&mut store, None, Some(session)), Ok(session), "identity beats default");
+        let named = act(&mut store, Some("claude:proj-task"), Some(session)).unwrap();
+        assert_ne!(named, session, "as beats identity");
+        assert_eq!(agent_principal_by_name(&mut store, "claude:proj-task").unwrap(), named, "name form created it");
+        assert_eq!(act(&mut store, Some(" claude:proj-task "), None), Ok(named), "trimmed, idempotent");
+        // UUID form
+        assert_eq!(act(&mut store, Some(&session.to_string()), None), Ok(session));
+        let e = act(&mut store, Some(&Uuid::now_v7().to_string()), None).unwrap_err();
+        assert!(e.contains("no principal with id"), "{e}");
+        // never the human or a remote peer
+        for (label, as_) in [("human name", "tom".to_string()), ("human id", tom.to_string()), ("remote name", "laptop".into()), ("remote id", peer.to_string())] {
+            let e = act(&mut store, Some(&as_), None).unwrap_err();
+            assert!(e.contains("not an agent"), "{label}: {e}");
+        }
+        // an invalid name is an error, not a fallback to the default
+        assert!(act(&mut store, Some(""), Some(session)).is_err());
+        assert!(act(&mut store, Some("line\nbreak"), None).is_err());
+        // the human is not cached by mistake
+        assert!(cached_principal(&names, "tom").is_none());
+        swap_auto_created_for_test(previous);
+    }
+
+    /// A cache hit never touches the store: a key seeded in the cache resolves
+    /// to its id even though no such principal exists in this store, and a
+    /// resolved name lands in the cache for the next request.
+    #[test]
+    fn acting_principal_cache_hit_skips_the_store() {
+        let _serial = AUTO_CREATED_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = swap_auto_created_for_test(0);
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let claude = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let names = new_name_cache();
+        let ghost = Uuid::now_v7();
+        names.lock().unwrap().insert("claude:elsewhere".into(), ghost);
+        assert_eq!(acting_principal(&mut store, &names, Some("claude:elsewhere"), None, claude), Ok(ghost));
+        assert!(store.get_principal(ghost).is_err(), "the store never saw it");
+
+        let fresh = acting_principal(&mut store, &names, Some("claude:fresh"), None, claude).unwrap();
+        assert_eq!(cached_principal(&names, "claude:fresh"), Some(fresh));
+        assert_eq!(cached_principal(&names, &fresh.to_string()), None, "cached under the string given");
+        // at the creation cap the cached name still resolves (no store scan, no create)
+        swap_auto_created_for_test(MAX_AUTO_PRINCIPALS_PER_BOOT);
+        assert_eq!(acting_principal(&mut store, &names, Some("claude:fresh"), None, claude), Ok(fresh));
+        swap_auto_created_for_test(previous);
+    }
+
+    /// Through the tool: a `propose` with `as` records that principal on the
+    /// ledger op, a second KsMcp (a fresh per-request instance, as on
+    /// stateless protocols) sees the same principal via the shared cache, the
+    /// dedupe cache is keyed by the resolved principal, and `identify` echoes
+    /// the handle to pass.
+    #[tokio::test]
+    async fn propose_with_as_records_that_principal() {
+        use grimoire_store::import::import_markdown;
+        let _serial = AUTO_CREATED_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = swap_auto_created_for_test(0);
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let claude = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let (doc, _) = import_markdown(&mut store, "Notes", None, tom, "first\n").unwrap();
+        let epoch = store.read_doc(doc).unwrap().doc.current_epoch;
+        let store = Arc::new(Mutex::new(store));
+        let (dedupe, names) = (new_dedupe(), new_name_cache());
+        let fresh = || KsMcp::new(store.clone(), claude, dedupe.clone(), names.clone(), test_hot("as"));
+        let insert = |content: &str, rid: Uuid, as_: Option<&str>| {
+            let mut v = json!({"doc_id": doc.to_string(), "base_epoch": epoch, "request_id": rid.to_string(),
+                "ops": [{"kind": {"op": "insert", "parent_id": null, "order_key": "", "block_type": "paragraph", "content": content}}]});
+            if let Some(a) = as_ { v["as"] = json!(a); }
+            v
+        };
+
+        let rid = Uuid::now_v7();
+        let (is_err, out) = text_of(fresh().propose(Parameters(p(insert("by task", rid, Some("claude:proj-task"))))).await.unwrap());
+        assert!(!is_err, "{out}");
+        let task = names.lock().unwrap().get("claude:proj-task").copied().expect("as cached");
+        assert_ne!(task, claude);
+        let ops = store.lock().unwrap().ops_since(doc, epoch).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].principal, task, "the op is attributed to the `as` principal");
+
+        // same request_id, same as → the stored outcome, no second op
+        let (_, again) = text_of(fresh().propose(Parameters(p(insert("by task", rid, Some("claude:proj-task"))))).await.unwrap());
+        assert_eq!(again, out);
+        assert_eq!(store.lock().unwrap().ops_since(doc, epoch).unwrap().len(), 1);
+        // same request_id, no as → a different principal, so not a replay
+        let (is_err, other) = text_of(fresh().propose(Parameters(p(insert("by default", rid, None)))).await.unwrap());
+        assert!(!is_err, "{other}");
+        let ops = store.lock().unwrap().ops_since(doc, epoch).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[1].principal, claude);
+
+        // the human is refused at the tool boundary, nothing written
+        let (is_err, msg) = text_of(fresh().propose(Parameters(p(insert("nope", Uuid::now_v7(), Some("tom"))))).await.unwrap());
+        assert!(is_err && msg.as_str().unwrap().contains("not an agent"), "{msg}");
+        assert_eq!(store.lock().unwrap().ops_since(doc, epoch).unwrap().len(), 2);
+
+        // identify: echoes the handle, and my_proposals with that `as` lists the op
+        let (is_err, id) = text_of(fresh().identify(Parameters(p(json!({"name": "claude:proj-task"})))).await.unwrap());
+        assert!(!is_err);
+        assert_eq!(id["as"], "claude:proj-task");
+        assert_eq!(id["principal"], json!(task));
+        assert!(id["note"].as_str().unwrap().contains("pass as="));
+        let (_, mine) = text_of(fresh().my_proposals(Parameters(p(json!({"as": "claude:proj-task"})))).await.unwrap());
+        assert_eq!(mine["principal"], json!(task));
+        assert_eq!(mine["proposals"].as_array().unwrap().len(), 1);
+        swap_auto_created_for_test(previous);
     }
 }

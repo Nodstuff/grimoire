@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 grimoire-store = { path = "../store" }
 rusqlite.workspace = true
-rmcp = { version = "3.1", features = ["server", "transport-streamable-http-server"] }
+rmcp = { version = "3.2", features = ["server", "transport-streamable-http-server"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "limit"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "time"] }
