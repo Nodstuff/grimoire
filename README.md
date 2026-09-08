@@ -78,8 +78,10 @@ additions give an HTTP client the same contract MCP agents get:
   returns `{…, "verdicts": [], "note": "no changes"}`.
 - `X-Grimoire-Principal: <name>` (1–60 chars) on `POST /api/propose`, `/api/propose_markdown`,
   `/api/docs` and `/api/comment` attributes the write to that Agent principal (created on first
-  use, the MCP `identify` rule) instead of you, so it goes through review as an agent's. Absent
-  → the human, as before.
+  use — the same rule as the MCP `as` argument; a human's or a contact's name is refused) instead
+  of you, so it goes through review as an agent's. Absent → the human, as before. Over MCP, pass
+  `as: "<name>"` on every attributing call: MCP 2026-07-28 has no sessions, so nothing set by an
+  earlier call survives to the next.
 - `request_id` (any UUID) on `/api/propose` and `/api/propose_markdown`: a retry with the same
   id returns the first outcome instead of double-applying. Per principal, in-memory.
 

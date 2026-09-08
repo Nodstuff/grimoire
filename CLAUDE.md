@@ -44,6 +44,13 @@ account may be flipped to the work account by other sessions — push with
 - Federation smoke across two daemons is the canonical end-to-end test (join → pull →
   propose → accept → pull back). Two browser windows on one daemon test hot sessions.
 
+## Writing to Grimoire over MCP (this repo's own docs live in it)
+- Pass `as: "claude:grimoire-<task>"` on every attributing call (`propose`, `propose_markdown`,
+  `create_doc`, `rename_doc`, `move_doc`, `set_status`, `delete_doc`, `merge_docs`, `add_comment`,
+  `resolve`, `my_proposals`). MCP 2026-07-28 has no sessions, so `identify` alone is forgotten by
+  the next call (0.7.8). A running Claude Code session needs `/mcp` reconnect to see tools or
+  parameters added by a daemon you just deployed.
+
 ## Traps
 - `window.alert`/`confirm` are silent no-ops in Tauri's WKWebView — use inline UI.
 - Markdown-it's commonmark preset has no tables; mirrors are read-only at the store layer;
