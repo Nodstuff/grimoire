@@ -182,6 +182,9 @@ pub struct DocTree {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum OpKind {
     Insert {
+        /// The new block's id. Optional on the wire: the server mints a
+        /// UUIDv7 when absent, so agents need not generate ids.
+        #[serde(default = "Uuid::now_v7")]
         block_id: Uuid,
         parent_id: Option<Uuid>,
         order_key: String,
@@ -203,6 +206,48 @@ pub enum OpKind {
         new_parent: Option<Uuid>,
         new_order_key: String,
     },
+    // --- doc ops (AX slice B): tree changes an agent proposes through the
+    // gate. Ledgered like block ops, on the doc they act on, with the
+    // pre-image INSIDE the payload (`from_*`) because `prior` is a Block.
+    // The server fills the pre-image at propose time; caller values are
+    // ignored. Doc ops never bump the doc epoch (hot sessions freeze it).
+    /// Retitle the doc. Yellow: applied, inbound [[wikilinks]] rewritten,
+    /// flagged. Declining renames back and rewrites the links again.
+    RenameDoc {
+        title: String,
+        #[serde(default)]
+        from_title: String,
+    },
+    /// Reparent/reorder the doc. Yellow. Parent titles are denormalised so
+    /// the review card can say where it went even after later renames.
+    MoveDoc {
+        new_parent: Option<Uuid>,
+        #[serde(default)]
+        sort_key: Option<String>,
+        #[serde(default)]
+        new_parent_title: Option<String>,
+        #[serde(default)]
+        from_parent: Option<Uuid>,
+        #[serde(default)]
+        from_sort_key: Option<String>,
+        #[serde(default)]
+        from_parent_title: Option<String>,
+    },
+    /// Set or clear the lifecycle status. Yellow.
+    SetStatus {
+        status: Option<DocStatus>,
+        #[serde(default)]
+        from_status: Option<DocStatus>,
+    },
+    /// Trash the doc and its subtree. ALWAYS red: parked until a human
+    /// accepts, then it goes to the Trash (restorable). `title` and
+    /// `doc_count` are captured at propose time for the queue card.
+    DeleteDoc {
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        doc_count: usize,
+    },
 }
 
 impl OpKind {
@@ -212,6 +257,10 @@ impl OpKind {
             OpKind::Replace { .. } => "replace",
             OpKind::Delete { .. } => "delete",
             OpKind::Move { .. } => "move",
+            OpKind::RenameDoc { .. } => "rename_doc",
+            OpKind::MoveDoc { .. } => "move_doc",
+            OpKind::SetStatus { .. } => "set_status",
+            OpKind::DeleteDoc { .. } => "delete_doc",
         }
     }
 
@@ -221,7 +270,24 @@ impl OpKind {
             OpKind::Replace { target, .. }
             | OpKind::Delete { target }
             | OpKind::Move { target, .. } => Some(*target),
+            OpKind::RenameDoc { .. }
+            | OpKind::MoveDoc { .. }
+            | OpKind::SetStatus { .. }
+            | OpKind::DeleteDoc { .. } => None,
         }
+    }
+
+    /// A doc-level op (rename/move/status/delete of the doc itself) rather
+    /// than a block op. Never scored by the block gate: the verdict is fixed
+    /// (yellow, or red for delete_doc).
+    pub fn is_doc_op(&self) -> bool {
+        matches!(
+            self,
+            OpKind::RenameDoc { .. }
+                | OpKind::MoveDoc { .. }
+                | OpKind::SetStatus { .. }
+                | OpKind::DeleteDoc { .. }
+        )
     }
 }
 
@@ -326,6 +392,9 @@ pub struct Annotation {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProposeVerdict {
     pub op_id: Uuid,
+    /// The block the op created or targets (None for doc ops). Inserts may
+    /// omit block_id on the wire; the minted id comes back here.
+    pub block_id: Option<Uuid>,
     pub verdict: Verdict,
     pub confidence: f64,
     pub applied: bool,

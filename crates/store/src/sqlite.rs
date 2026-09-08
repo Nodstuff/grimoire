@@ -7,13 +7,26 @@ use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("schema.sql");
 
+/// "Is this doc frozen for writes right now?" — the daemon plugs its hot
+/// session state in here so store-internal writes that fan out to OTHER
+/// docs (rename link rewrites, their decline-revert, a parked delete's
+/// accept) can skip live docs without the store knowing about sessions.
+pub type FrozenProbe = Box<dyn Fn(Uuid) -> bool + Send + Sync>;
+
 pub struct SqliteStore {
     conn: Connection,
+    frozen: Option<FrozenProbe>,
 }
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::init(Connection::open(path)?)
+    }
+
+    /// Install the freeze probe (see [`FrozenProbe`]). Without one, no doc
+    /// is ever considered frozen.
+    pub fn set_frozen_probe(&mut self, probe: FrozenProbe) {
+        self.frozen = Some(probe);
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -47,7 +60,7 @@ impl SqliteStore {
         migrate_pre_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
         backfill(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, frozen: None })
     }
 }
 
@@ -94,6 +107,20 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
         && !sql.to_ascii_uppercase().contains("ON DELETE CASCADE")
     {
         rebuild_block_vec_with_cascade(conn)?;
+    }
+    // ops: doc ops (AX slice B) need op_type values the original CHECK did
+    // not allow. Rebuild once when the constraint predates them.
+    let ops_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ops'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(sql) = ops_sql
+        && !sql.contains("'rename_doc'")
+    {
+        widen_ops_op_type_check(conn)?;
     }
     Ok(())
 }
@@ -342,6 +369,58 @@ fn rebuild_block_vec_with_cascade(conn: &Connection) -> Result<()> {
          ALTER TABLE block_vec_new RENAME TO block_vec;
          COMMIT;",
     )?;
+    Ok(())
+}
+
+/// Rebuild `ops` with the op_type CHECK widened to the doc ops (rename_doc,
+/// move_doc, set_status, delete_doc). Same dance as `shares`: annotations
+/// reference ops by id, ids are preserved, foreign keys are off for the swap
+/// and checked afterwards; the two indexes are recreated.
+fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = (|| -> Result<()> {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE ops_new (
+                 id            TEXT PRIMARY KEY,
+                 doc_id        TEXT NOT NULL REFERENCES docs (id),
+                 op_type       TEXT NOT NULL CHECK (op_type IN ('insert', 'replace', 'delete', 'move',
+                                                                'rename_doc', 'move_doc', 'set_status', 'delete_doc')),
+                 target_block  TEXT,
+                 payload       TEXT NOT NULL,
+                 principal     TEXT NOT NULL REFERENCES principals (id),
+                 base_epoch    INTEGER NOT NULL,
+                 epoch_applied INTEGER,
+                 verdict       TEXT CHECK (verdict IN ('green', 'yellow', 'red')),
+                 confidence    REAL,
+                 prior         TEXT,
+                 source_refs   TEXT NOT NULL DEFAULT '[]',
+                 created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             );
+             INSERT INTO ops_new (id, doc_id, op_type, target_block, payload, principal, base_epoch,
+                                  epoch_applied, verdict, confidence, prior, source_refs, created_at)
+                 SELECT id, doc_id, op_type, target_block, payload, principal, base_epoch,
+                        epoch_applied, verdict, confidence, prior, source_refs, created_at FROM ops;
+             DROP TABLE ops;
+             ALTER TABLE ops_new RENAME TO ops;
+             CREATE INDEX IF NOT EXISTS ops_by_doc_epoch ON ops (doc_id, epoch_applied);
+             CREATE INDEX IF NOT EXISTS ops_by_principal ON ops (principal);
+             COMMIT;",
+        )?;
+        Ok(())
+    })();
+    conn.pragma_update(None, "foreign_keys", true)?;
+    result?;
+    let violations: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check('annotations')",
+        [],
+        |r| r.get(0),
+    )?;
+    if violations > 0 {
+        return Err(StoreError::InvalidOp(format!(
+            "ops rebuild left {violations} dangling annotations rows"
+        )));
+    }
     Ok(())
 }
 
@@ -1063,7 +1142,189 @@ fn inverse_of(kind: &OpKind, prior: Option<&Block>) -> Result<OpKind> {
                 refers_to: p.refers_to,
             })
         }
+        // doc ops carry their own pre-image in the payload
+        OpKind::RenameDoc { title, from_title } => Ok(OpKind::RenameDoc {
+            title: from_title.clone(),
+            from_title: title.clone(),
+        }),
+        OpKind::MoveDoc {
+            new_parent,
+            sort_key,
+            new_parent_title,
+            from_parent,
+            from_sort_key,
+            from_parent_title,
+        } => Ok(OpKind::MoveDoc {
+            new_parent: *from_parent,
+            sort_key: from_sort_key.clone(),
+            new_parent_title: from_parent_title.clone(),
+            from_parent: *new_parent,
+            from_sort_key: sort_key.clone(),
+            from_parent_title: new_parent_title.clone(),
+        }),
+        OpKind::SetStatus { status, from_status } => Ok(OpKind::SetStatus {
+            status: *from_status,
+            from_status: *status,
+        }),
+        // a delete is never yellow: it parks red, and a declined red is
+        // simply never applied — there is nothing to invert
+        OpKind::DeleteDoc { .. } => Err(StoreError::InvalidOp(
+            "cannot invert delete_doc: it is never applied as a yellow".into(),
+        )),
     }
+}
+
+/// Project a doc op (AX slice B) onto the `docs` table. Shared by the human
+/// paths (`rename_doc` / `move_doc` / `delete_doc` in the trait impl) and the
+/// gate (`propose_doc_op`, `resolve`), so the rules cannot drift.
+fn project_doc_op(conn: &Connection, doc_id: Uuid, op: &OpKind) -> Result<()> {
+    match op {
+        OpKind::RenameDoc { title, .. } => rename_doc_conn(conn, doc_id, title),
+        OpKind::MoveDoc {
+            new_parent,
+            sort_key,
+            ..
+        } => move_doc_conn(conn, doc_id, *new_parent, sort_key.as_deref()),
+        OpKind::SetStatus { status, .. } => set_doc_status_conn(conn, doc_id, *status),
+        OpKind::DeleteDoc { .. } => delete_subtree(conn, doc_id).map(|_| ()),
+        _ => Err(StoreError::InvalidOp(format!(
+            "{} is a block op, not a doc op",
+            op.op_type()
+        ))),
+    }
+}
+
+fn rename_doc_conn(conn: &Connection, doc_id: Uuid, title: &str) -> Result<()> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(StoreError::InvalidOp("rename: empty title".into()));
+    }
+    let n = conn.execute(
+        "UPDATE docs SET title = ?1 WHERE id = ?2 AND deleted = 0",
+        params![title, doc_id.to_string()],
+    )?;
+    if n == 0 {
+        return Err(StoreError::NotFound(format!("doc {doc_id}")));
+    }
+    Ok(())
+}
+
+fn set_doc_status_conn(conn: &Connection, doc_id: Uuid, status: Option<DocStatus>) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE docs SET status = ?1 WHERE id = ?2",
+        params![status.map(|st| st.as_str()), doc_id.to_string()],
+    )?;
+    if n == 0 {
+        return Err(StoreError::NotFound(format!("doc {doc_id}")));
+    }
+    Ok(())
+}
+
+/// The doc's parent chain, nearest first (live or not — a cycle check must
+/// see every row).
+fn doc_parent_of(conn: &Connection, id: Uuid) -> Result<Option<Uuid>> {
+    let p: Option<Option<String>> = conn
+        .query_row(
+            "SELECT parent_id FROM docs WHERE id = ?1",
+            params![id.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match p {
+        None => Err(StoreError::NotFound(format!("doc {id}"))),
+        Some(p) => p.map(|p| uuid_col(p, "docs.parent_id")).transpose(),
+    }
+}
+
+fn move_doc_conn(
+    conn: &Connection,
+    doc_id: Uuid,
+    new_parent: Option<Uuid>,
+    sort_key: Option<&str>,
+) -> Result<()> {
+    let mut cursor = new_parent;
+    while let Some(p) = cursor {
+        if p == doc_id {
+            return Err(StoreError::InvalidOp(
+                "move: doc cannot nest under itself".into(),
+            ));
+        }
+        cursor = doc_parent_of(conn, p)?;
+    }
+    // no key from the client = append under the new parent; a move must
+    // never re-NULL a key the v5 backfill assigned
+    let sort_key = match sort_key {
+        Some(k) if crate::order_key::is_valid(k) => k.to_string(),
+        Some(k) => {
+            return Err(StoreError::InvalidOp(format!(
+                "move: invalid sort_key {k:?}"
+            )))
+        }
+        None => next_doc_sort_key(conn, new_parent)?,
+    };
+    let n = conn.execute(
+        "UPDATE docs SET parent_id = ?1, sort_key = ?2 WHERE id = ?3 AND deleted = 0",
+        params![
+            new_parent.map(|p| p.to_string()),
+            sort_key,
+            doc_id.to_string()
+        ],
+    )?;
+    if n == 0 {
+        return Err(StoreError::NotFound(format!("doc {doc_id}")));
+    }
+    Ok(())
+}
+
+/// Soft-delete `doc_id` and every live descendant under one `deleted_at`
+/// stamp (so `restore_doc` revives exactly this subtree). Returns the count.
+/// Runs on whatever connection/transaction the caller holds.
+fn delete_subtree(conn: &Connection, doc_id: Uuid) -> Result<usize> {
+    let mut to_delete = vec![doc_id];
+    let mut i = 0;
+    while i < to_delete.len() {
+        let kids: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT id FROM docs WHERE parent_id = ?1 AND deleted = 0")?;
+            let rows = stmt.query_map(params![to_delete[i].to_string()], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for k in kids {
+            to_delete.push(uuid_col(k, "docs.id")?);
+        }
+        i += 1;
+    }
+    // one stamp for the whole subtree: restore_doc revives exactly the
+    // docs that fell together, not a child tombstoned earlier on its own
+    let stamp: String = conn.query_row(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut n = 0;
+    for d in &to_delete {
+        n += conn.execute(
+            "UPDATE docs SET deleted = 1, deleted_at = ?2 WHERE id = ?1 AND deleted = 0",
+            params![d.to_string(), stamp],
+        )?;
+    }
+    if n == 0 {
+        return Err(StoreError::NotFound(format!("doc {doc_id}")));
+    }
+    Ok(n)
+}
+
+/// Live docs in the subtree rooted at `doc_id` (root included).
+fn subtree_ids_conn(conn: &Connection, doc_id: Uuid) -> Result<Vec<Uuid>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE sub(id) AS (
+             SELECT id FROM docs WHERE id = ?1
+             UNION ALL
+             SELECT docs.id FROM docs JOIN sub ON docs.parent_id = sub.id
+             WHERE docs.deleted = 0)
+         SELECT id FROM sub",
+    )?;
+    let rows = stmt.query_map(params![doc_id.to_string()], |r| r.get::<_, String>(0))?;
+    rows.map(|r| uuid_col(r?, "docs.id")).collect()
 }
 
 /// Resolve agent-friendly order_key specs before anything is persisted:
@@ -1320,6 +1581,10 @@ fn project(tx: &Transaction, doc_id: Uuid, epoch: i64, principal: Uuid, op: &OpK
                 ],
             )?;
         }
+        OpKind::RenameDoc { .. }
+        | OpKind::MoveDoc { .. }
+        | OpKind::SetStatus { .. }
+        | OpKind::DeleteDoc { .. } => project_doc_op(tx, doc_id, op)?,
     }
     Ok(())
 }
@@ -1494,15 +1759,7 @@ impl BlockStore for SqliteStore {
     }
 
     fn get_doc(&self, id: Uuid) -> Result<Doc> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status, sort_key
-             FROM docs WHERE id = ?1",
-        )?;
-        let raw = stmt
-            .query_row(params![id.to_string()], row_to_doc)
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(format!("doc {id}")))?;
-        build_doc(raw)
+        get_doc_conn(&self.conn, id)
     }
 
     fn read_doc(&self, id: Uuid) -> Result<DocTree> {
@@ -1590,74 +1847,12 @@ impl BlockStore for SqliteStore {
         new_parent: Option<Uuid>,
         sort_key: Option<&str>,
     ) -> Result<()> {
-        let mut cursor = new_parent;
-        while let Some(p) = cursor {
-            if p == doc_id {
-                return Err(StoreError::InvalidOp(
-                    "move: doc cannot nest under itself".into(),
-                ));
-            }
-            cursor = self.get_doc(p)?.parent_id;
-        }
-        // no key from the client = append under the new parent; a move must
-        // never re-NULL a key the v5 backfill assigned
-        let sort_key = match sort_key {
-            Some(k) if crate::order_key::is_valid(k) => k.to_string(),
-            Some(k) => {
-                return Err(StoreError::InvalidOp(format!(
-                    "move: invalid sort_key {k:?}"
-                )))
-            }
-            None => next_doc_sort_key(&self.conn, new_parent)?,
-        };
-        let n = self.conn.execute(
-            "UPDATE docs SET parent_id = ?1, sort_key = ?2 WHERE id = ?3 AND deleted = 0",
-            params![
-                new_parent.map(|p| p.to_string()),
-                sort_key,
-                doc_id.to_string()
-            ],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("doc {doc_id}")));
-        }
-        Ok(())
+        move_doc_conn(&self.conn, doc_id, new_parent, sort_key)
     }
 
     fn delete_doc(&mut self, doc_id: Uuid) -> Result<usize> {
-        let mut to_delete = vec![doc_id];
-        let mut i = 0;
-        while i < to_delete.len() {
-            let kids: Vec<String> = {
-                let mut stmt = self
-                    .conn
-                    .prepare("SELECT id FROM docs WHERE parent_id = ?1 AND deleted = 0")?;
-                let rows = stmt.query_map(params![to_delete[i].to_string()], |r| r.get(0))?;
-                rows.collect::<rusqlite::Result<_>>()?
-            };
-            for k in kids {
-                to_delete.push(uuid_col(k, "docs.id")?);
-            }
-            i += 1;
-        }
-        // one stamp for the whole subtree: restore_doc revives exactly the
-        // docs that fell together, not a child tombstoned earlier on its own
-        let stamp: String = self.conn.query_row(
-            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-            [],
-            |r| r.get(0),
-        )?;
         let tx = self.conn.transaction()?;
-        let mut n = 0;
-        for d in &to_delete {
-            n += tx.execute(
-                "UPDATE docs SET deleted = 1, deleted_at = ?2 WHERE id = ?1 AND deleted = 0",
-                params![d.to_string(), stamp],
-            )?;
-        }
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("doc {doc_id}")));
-        }
+        let n = delete_subtree(&tx, doc_id)?;
         tx.commit()?;
         Ok(n)
     }
@@ -1778,29 +1973,11 @@ impl BlockStore for SqliteStore {
     }
 
     fn rename_doc(&mut self, doc_id: Uuid, title: &str) -> Result<()> {
-        let title = title.trim();
-        if title.is_empty() {
-            return Err(StoreError::InvalidOp("rename: empty title".into()));
-        }
-        let n = self.conn.execute(
-            "UPDATE docs SET title = ?1 WHERE id = ?2 AND deleted = 0",
-            params![title, doc_id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("doc {doc_id}")));
-        }
-        Ok(())
+        rename_doc_conn(&self.conn, doc_id, title)
     }
 
     fn set_doc_status(&mut self, doc_id: Uuid, status: Option<DocStatus>) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE docs SET status = ?1 WHERE id = ?2",
-            params![status.map(|st| st.as_str()), doc_id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("doc {doc_id}")));
-        }
-        Ok(())
+        set_doc_status_conn(&self.conn, doc_id, status)
     }
 
     fn set_review_policy(&mut self, doc_id: Uuid, policy: Option<ReviewPolicy>) -> Result<()> {
@@ -1962,6 +2139,144 @@ impl BlockStore for SqliteStore {
         ops: Vec<OpInput>,
     ) -> Result<ProposeOutcome> {
         self.propose_impl(doc_id, base_epoch, principal, ops, true)
+    }
+
+    fn propose_doc_op(
+        &mut self,
+        doc_id: Uuid,
+        principal: Uuid,
+        mut kind: OpKind,
+        source_refs: Vec<String>,
+    ) -> Result<ProposeOutcome> {
+        if !kind.is_doc_op() {
+            return Err(StoreError::InvalidOp(format!(
+                "propose_doc_op: {} is a block op — use propose",
+                kind.op_type()
+            )));
+        }
+        self.reject_if_mirror(doc_id)?;
+        let frozen = &self.frozen;
+        let tx = self.conn.transaction()?;
+        if !doc_is_live(&tx, doc_id)? {
+            return Err(StoreError::NotFound(format!("doc {doc_id}")));
+        }
+        let doc = get_doc_conn(&tx, doc_id)?;
+        let current = doc.current_epoch;
+        let parent_title = |p: Option<Uuid>| -> Result<Option<String>> {
+            p.map(|p| get_doc_conn(&tx, p).map(|d| d.title)).transpose()
+        };
+        // the server owns the pre-image: whatever the caller put in from_* is replaced
+        let note;
+        match &mut kind {
+            OpKind::RenameDoc { title, from_title } => {
+                let new = title.trim().to_string();
+                if new.is_empty() {
+                    return Err(StoreError::InvalidOp("rename: empty title".into()));
+                }
+                if new == doc.title {
+                    return Err(StoreError::InvalidOp(format!(
+                        "rename: doc is already titled {new:?}"
+                    )));
+                }
+                *title = new;
+                *from_title = doc.title.clone();
+            }
+            OpKind::MoveDoc {
+                new_parent,
+                sort_key,
+                new_parent_title,
+                from_parent,
+                from_sort_key,
+                from_parent_title,
+            } => {
+                if let Some(p) = new_parent
+                    && !doc_is_live(&tx, *p)?
+                {
+                    return Err(StoreError::NotFound(format!("new_parent doc {p}")));
+                }
+                *new_parent_title = parent_title(*new_parent)?;
+                *from_parent = doc.parent_id;
+                *from_sort_key = doc.sort_key.clone();
+                *from_parent_title = parent_title(doc.parent_id)?;
+                if sort_key.is_none() {
+                    // resolve "append" now so the ledger holds the real key
+                    *sort_key = Some(next_doc_sort_key(&tx, *new_parent)?);
+                }
+            }
+            OpKind::SetStatus { from_status, .. } => {
+                *from_status = doc.status;
+            }
+            OpKind::DeleteDoc { title, doc_count } => {
+                *title = doc.title.clone();
+                *doc_count = subtree_ids_conn(&tx, doc_id)?.len();
+            }
+            _ => unreachable!("is_doc_op checked above"),
+        }
+        let op_id = Uuid::now_v7();
+        let (verdict, confidence, applied) = if let OpKind::DeleteDoc { title, doc_count } = &kind {
+            note = format!(
+                "parked: trashing “{title}” ({doc_count} doc{}) needs a human accept in the review queue",
+                if *doc_count == 1 { "" } else { "s" }
+            );
+            (Verdict::Red, 0.5, false)
+        } else {
+            // a cycle / bad key / missing parent is the caller's mistake: an
+            // error, not a parked red that could never apply
+            project_doc_op(&tx, doc_id, &kind)?;
+            let mut n = String::from("applied; flagged for review (declining reverts it)");
+            if let OpKind::RenameDoc { title, from_title } = &kind {
+                let (rewritten, deferred) = rewrite_inbound_links_tx(
+                    &tx,
+                    frozen,
+                    from_title,
+                    title,
+                    principal,
+                    &format!("rename:{from_title} → {title}"),
+                )?;
+                n = format!("{n}; {rewritten} inbound link block(s) rewritten");
+                if deferred > 0 {
+                    n = format!("{n}, {deferred} deferred (their doc is in a live session)");
+                }
+            }
+            note = n;
+            (Verdict::Yellow, 1.0, true)
+        };
+        let input = OpInput { kind, source_refs };
+        insert_op_row(
+            &tx,
+            op_id,
+            doc_id,
+            &input,
+            principal,
+            current,
+            applied.then_some(current),
+            verdict,
+            confidence,
+            &None,
+        )?;
+        insert_annotation(
+            &tx,
+            doc_id,
+            op_id,
+            if applied {
+                AnnotationKind::Review
+            } else {
+                AnnotationKind::Parked
+            },
+        )?;
+        tx.commit()?;
+        Ok(ProposeOutcome {
+            doc_id,
+            epoch: current,
+            verdicts: vec![ProposeVerdict {
+                op_id,
+                block_id: None,
+                verdict,
+                confidence,
+                applied,
+                note,
+            }],
+        })
     }
 
     fn create_gardener(
@@ -3748,7 +4063,23 @@ impl BlockStore for SqliteStore {
         }
 
         let mut receipt = None;
+        // doc ops (AX slice B) never bump the epoch and carry their own
+        // pre-image; they resolve on their own path
+        let doc_op = op.kind.is_doc_op();
+        if doc_op {
+            receipt = resolve_doc_op(
+                &tx,
+                &self.frozen,
+                doc_id,
+                annotation_id,
+                &op,
+                reviewer,
+                kind,
+                decision,
+            )?;
+        }
         match (kind, decision) {
+            _ if doc_op => {}
             // yellow accepted: the edit is already live — just clear the flag
             (AnnotationKind::Review, ReviewDecision::Accept) => {}
             // yellow declined: revert via pre-image, as a green op by the reviewer
@@ -3839,6 +4170,208 @@ impl BlockStore for SqliteStore {
     }
 }
 
+/// Resolve an annotation whose op is a doc op. Yellow accept: nothing to do.
+/// Yellow decline: apply the inverse (rename back + links back, move back,
+/// status back) as a green op by the reviewer. Red accept (delete_doc): trash
+/// the subtree now, refused while any doc in it is frozen. Red decline:
+/// closed, never applied. No epoch bump in any case.
+#[expect(clippy::too_many_arguments)]
+fn resolve_doc_op(
+    tx: &Transaction,
+    frozen: &Option<FrozenProbe>,
+    doc_id: Uuid,
+    annotation_id: Uuid,
+    op: &LedgerOp,
+    reviewer: Uuid,
+    kind: AnnotationKind,
+    decision: ReviewDecision,
+) -> Result<Option<ApplyReceipt>> {
+    let current = doc_epoch(tx, doc_id)?;
+    match (kind, decision) {
+        (AnnotationKind::Review, ReviewDecision::Accept)
+        | (AnnotationKind::Parked, ReviewDecision::Decline) => Ok(None),
+        (AnnotationKind::Review, ReviewDecision::Decline) => {
+            let inverse = inverse_of(&op.kind, None)?;
+            project_doc_op(tx, doc_id, &inverse)?;
+            let mut note = String::new();
+            if let OpKind::RenameDoc { title, from_title } = &inverse {
+                // links were rewritten from_title → title on propose; put them back
+                let (n, deferred) = rewrite_inbound_links_tx(
+                    tx,
+                    frozen,
+                    from_title,
+                    title,
+                    reviewer,
+                    &format!("rename:{from_title} → {title}"),
+                )?;
+                note = format!("links_rewritten:{n} links_deferred_hot:{deferred}");
+            }
+            let inv_id = Uuid::now_v7();
+            let mut source_refs = vec![format!("review:decline:{annotation_id}")];
+            if !note.is_empty() {
+                source_refs.push(note);
+            }
+            let inv_input = OpInput {
+                kind: inverse,
+                source_refs,
+            };
+            insert_op_row(
+                tx,
+                inv_id,
+                doc_id,
+                &inv_input,
+                reviewer,
+                current,
+                Some(current),
+                Verdict::Green,
+                1.0,
+                &None,
+            )?;
+            Ok(Some(ApplyReceipt {
+                doc_id,
+                epoch: current,
+                op_ids: vec![inv_id],
+            }))
+        }
+        (AnnotationKind::Parked, ReviewDecision::Accept) => {
+            if matches!(op.kind, OpKind::DeleteDoc { .. }) {
+                for d in subtree_ids_conn(tx, doc_id)? {
+                    if frozen.as_ref().is_some_and(|p| p(d)) {
+                        let title = get_doc_conn(tx, d).map(|d| d.title).unwrap_or_default();
+                        return Err(StoreError::InvalidOp(format!(
+                            "“{title}” is in a live session — end it before trashing"
+                        )));
+                    }
+                }
+            }
+            project_doc_op(tx, doc_id, &op.kind)?;
+            tx.execute(
+                "UPDATE ops SET epoch_applied = ?1 WHERE id = ?2",
+                params![current, op.id.to_string()],
+            )?;
+            Ok(Some(ApplyReceipt {
+                doc_id,
+                epoch: current,
+                op_ids: vec![op.id],
+            }))
+        }
+    }
+}
+
+fn get_doc_conn(conn: &Connection, id: Uuid) -> Result<Doc> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status, sort_key
+         FROM docs WHERE id = ?1",
+    )?;
+    let raw = stmt
+        .query_row(params![id.to_string()], row_to_doc)
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound(format!("doc {id}")))?;
+    build_doc(raw)
+}
+
+fn doc_is_live(conn: &Connection, id: Uuid) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT deleted = 0 FROM docs WHERE id = ?1",
+            params![id.to_string()],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+fn is_mirror_conn(conn: &Connection, doc_id: Uuid) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM mirrors WHERE doc_id = ?1",
+            params![doc_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Blocks whose [[wikilinks]] point at `title` (exact or path form):
+/// (block_id, doc_id, content).
+fn linking_blocks_conn(conn: &Connection, title: &str) -> Result<Vec<(Uuid, Uuid, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT b.id, b.doc_id, b.content
+         FROM edges e JOIN blocks b ON b.id = e.from_block
+         JOIN docs d ON d.id = b.doc_id
+         WHERE b.deleted = 0 AND d.deleted = 0
+           AND (e.to_target = ?1 OR e.to_target LIKE '%/' || ?1)",
+    )?;
+    let rows = stmt.query_map(params![title], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    rows.map(|r| {
+        let (b, d, c) = r?;
+        Ok((
+            uuid_col(b, "edges.from_block")?,
+            uuid_col(d, "blocks.doc_id")?,
+            c,
+        ))
+    })
+    .collect()
+}
+
+/// Rewrite every inbound [[wikilink]] from `old` to `new` as green replaces
+/// by `principal`, one epoch per linking doc (the same rule as the human
+/// rename in the API): mirrors are the owner's (their pull brings the new
+/// title) and frozen (hot) docs are the session's — both skipped. Returns
+/// (blocks rewritten, blocks deferred because their doc was hot).
+fn rewrite_inbound_links_tx(
+    tx: &Transaction,
+    frozen: &Option<FrozenProbe>,
+    old: &str,
+    new: &str,
+    principal: Uuid,
+    source_ref: &str,
+) -> Result<(usize, usize)> {
+    if old == new {
+        return Ok((0, 0));
+    }
+    let mut by_doc: std::collections::HashMap<Uuid, Vec<(Uuid, String)>> = Default::default();
+    for (block, doc, content) in linking_blocks_conn(tx, old)? {
+        by_doc.entry(doc).or_default().push((block, content));
+    }
+    let (mut rewritten, mut deferred) = (0usize, 0usize);
+    for (doc, blocks) in by_doc {
+        if is_mirror_conn(tx, doc)? {
+            continue;
+        }
+        if frozen.as_ref().is_some_and(|p| p(doc)) {
+            deferred += blocks.len();
+            continue;
+        }
+        let ops: Vec<OpInput> = blocks
+            .into_iter()
+            .filter_map(|(block, content)| {
+                let new_content = crate::rewrite_links(&content, old, new);
+                (new_content != content).then(|| OpInput {
+                    kind: OpKind::Replace {
+                        target: block,
+                        content: new_content,
+                    },
+                    source_refs: vec![source_ref.to_string()],
+                })
+            })
+            .collect();
+        if ops.is_empty() {
+            continue;
+        }
+        rewritten += ops.len();
+        let current = doc_epoch(tx, doc)?;
+        apply_in_tx(tx, doc, current, principal, ops)?;
+    }
+    Ok((rewritten, deferred))
+}
+
 const OP_COLS: &str = "id, doc_id, payload, principal, base_epoch, epoch_applied, verdict, confidence, prior, source_refs";
 
 type RawOp = (
@@ -3927,29 +4460,7 @@ impl SqliteStore {
     /// Blocks whose [[wikilinks]] point at this title (exact or path form),
     /// for rewrite-on-rename. Returns (block_id, doc_id, content).
     pub fn linking_blocks(&self, title: &str) -> Result<Vec<(Uuid, Uuid, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT b.id, b.doc_id, b.content
-             FROM edges e JOIN blocks b ON b.id = e.from_block
-             JOIN docs d ON d.id = b.doc_id
-             WHERE b.deleted = 0 AND d.deleted = 0
-               AND (e.to_target = ?1 OR e.to_target LIKE '%/' || ?1)",
-        )?;
-        let rows = stmt.query_map(params![title], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
-        rows.map(|r| {
-            let (b, d, c) = r?;
-            Ok((
-                uuid_col(b, "edges.from_block")?,
-                uuid_col(d, "blocks.doc_id")?,
-                c,
-            ))
-        })
-        .collect()
+        linking_blocks_conn(&self.conn, title)
     }
 
     /// Outcome feedback for an agent: its recent ops with the annotation
@@ -4254,6 +4765,12 @@ impl SqliteStore {
         if ops.is_empty() {
             return Err(StoreError::InvalidOp("propose: empty op list".into()));
         }
+        if let Some(op) = ops.iter().find(|o| o.kind.is_doc_op()) {
+            return Err(StoreError::InvalidOp(format!(
+                "propose: {} is a doc op — use rename_doc/move_doc/set_status/delete_doc",
+                op.kind.op_type()
+            )));
+        }
         let policy = self.effective_policy(doc_id)?;
         let tx = self.conn.transaction()?;
         let current = doc_epoch(&tx, doc_id)?;
@@ -4339,6 +4856,7 @@ impl SqliteStore {
             applied_any |= applied;
             verdicts.push(ProposeVerdict {
                 op_id,
+                block_id: op.kind.target_block(),
                 verdict: scored.verdict,
                 confidence: scored.confidence,
                 applied,

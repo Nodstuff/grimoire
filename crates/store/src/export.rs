@@ -24,13 +24,46 @@ fn collect(nodes: &[BlockNode], out: &mut Vec<String>) {
 /// A doc's markdown: blocks in tree order, blank-line separated.
 pub fn export_doc(store: &impl BlockStore, doc_id: Uuid) -> Result<String> {
     let tree = store.read_doc(doc_id)?;
+    Ok(markdown_of(&tree.roots, false))
+}
+
+/// The same markdown with a `<!-- block <uuid> -->` line above every block
+/// (`mddiff::block_marker`) — what `read_doc(mode: "markdown")` returns, so
+/// an agent can quote block ids while editing; `propose_markdown` strips
+/// them. Same block set as `export_doc` (comments excluded).
+pub fn export_doc_with_markers(store: &impl BlockStore, doc_id: Uuid) -> Result<String> {
+    let tree = store.read_doc(doc_id)?;
+    Ok(markdown_of(&tree.roots, true))
+}
+
+/// Blocks in tree order joined by blank lines, optionally each preceded by
+/// its marker line.
+pub fn markdown_of(roots: &[BlockNode], markers: bool) -> String {
     let mut parts = Vec::new();
-    collect(&tree.roots, &mut parts);
+    if markers {
+        collect_marked(roots, &mut parts);
+    } else {
+        collect(roots, &mut parts);
+    }
     let mut md = parts.join("\n\n");
     if !md.is_empty() {
         md.push('\n');
     }
-    Ok(md)
+    md
+}
+
+fn collect_marked(nodes: &[BlockNode], out: &mut Vec<String>) {
+    for n in nodes {
+        if n.block.block_type == BlockType::Comment {
+            continue;
+        }
+        out.push(format!(
+            "{}\n{}",
+            crate::mddiff::block_marker(n.block.id),
+            n.block.content
+        ));
+        collect_marked(&n.children, out);
+    }
 }
 
 #[derive(Debug, Default)]

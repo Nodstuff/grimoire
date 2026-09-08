@@ -45,6 +45,24 @@ pub fn is_editor_hidden(b: &Block) -> bool {
         || b.content.starts_with("---")
 }
 
+/// Rewrite the `[[Old Title]]` / `[[Path/Old|alias]]` / `[[Old#anchor]]`
+/// link forms in `content` to point at `new`. Shared by the human rename
+/// (api) and the gated agent rename + its decline-revert (store).
+pub fn rewrite_links(content: &str, old: &str, new: &str) -> String {
+    let mut out = content.to_string();
+    for (from, to) in [
+        (format!("[[{old}]]"), format!("[[{new}]]")),
+        (format!("[[{old}|"), format!("[[{new}|")),
+        (format!("[[{old}#"), format!("[[{new}#")),
+        (format!("/{old}]]"), format!("/{new}]]")),
+        (format!("/{old}|"), format!("/{new}|")),
+        (format!("/{old}#"), format!("/{new}#")),
+    ] {
+        out = out.replace(&from, &to);
+    }
+    out
+}
+
 /// Policy when a doc and all its ancestors leave review_policy null.
 /// Human-review until the reviewer agent (4.8) exists; flip to AgentReview then.
 pub const DEFAULT_REVIEW_POLICY: ReviewPolicy = ReviewPolicy::HumanReview;
@@ -234,6 +252,23 @@ pub trait BlockStore {
         base_epoch: i64,
         principal: Uuid,
         ops: Vec<OpInput>,
+    ) -> Result<ProposeOutcome>;
+
+    /// A doc op (AX slice B) through the gate: `kind` must be one of the
+    /// `is_doc_op` variants. Fixed verdicts — rename/move/status land YELLOW
+    /// (applied now, flagged with the pre-image in the payload; a decline
+    /// reverts), delete_doc lands RED (parked; a human accept trashes the
+    /// subtree). One ledger row + one open annotation on `doc_id`, in one
+    /// transaction; the doc epoch is NOT bumped (a live session freezes it).
+    /// A rename also rewrites inbound [[wikilinks]] as green replaces by
+    /// `principal`, skipping mirrors and frozen (hot) docs. Mirrors are
+    /// refused; a move that would nest a doc under itself is an error.
+    fn propose_doc_op(
+        &mut self,
+        doc_id: Uuid,
+        principal: Uuid,
+        kind: OpKind,
+        source_refs: Vec<String>,
     ) -> Result<ProposeOutcome>;
 
     // --- gardener registry (4.1) + run log (4.5) ---

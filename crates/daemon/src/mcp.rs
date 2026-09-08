@@ -183,14 +183,76 @@ fn parse_uuid(s: &str, what: &str) -> std::result::Result<Uuid, String> {
 pub struct ReadDocParams {
     /// Doc UUID.
     pub doc_id: String,
-    /// "outline" (default: block ids + first lines, token-cheap) or "full".
+    /// "outline" (default: block ids + first lines, token-cheap), "full"
+    /// (every block's content as JSON), or "markdown" (the whole doc as one
+    /// markdown string with `<!-- block <uuid> -->` marker lines — edit it
+    /// and hand it to propose_markdown; the markers are stripped server-side).
     pub mode: Option<String>,
+    /// Include provenance fields on blocks (created_by, epoch, deleted,
+    /// refers_to). Default false: agents rarely need them.
+    pub verbose: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ReadBlockParams {
     /// Block UUID.
     pub block_id: String,
+    /// Include provenance fields (created_by, epoch, deleted, refers_to).
+    pub verbose: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FindDocParams {
+    /// Title or path fragment, e.g. "roadmap", "daily 2026-09-08", "revew gate" (typos ok).
+    pub query: String,
+    /// Restrict to this doc's subtree (UUID).
+    pub parent_doc_id: Option<String>,
+    /// Max matches (default 8).
+    pub limit: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct TreeParams {
+    /// Start from this doc (UUID); omit for the corpus top level.
+    pub root_doc_id: Option<String>,
+    /// Levels to expand (default 2); deeper subtrees show as "(N more)".
+    pub depth: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RenameDocParams {
+    pub doc_id: String,
+    /// The new title.
+    pub title: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MoveDocParams {
+    pub doc_id: String,
+    /// Destination parent doc (UUID); omit for the root level.
+    pub new_parent_id: Option<String>,
+    /// Land right after this sibling (UUID, must be a child of the new parent); omit to append last.
+    pub after_doc_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SetStatusParams {
+    pub doc_id: String,
+    /// "draft" | "in-review" | "decided" | "superseded"; omit or "null" to clear.
+    pub status: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DeleteDocParams {
+    pub doc_id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MergeDocsParams {
+    /// The doc whose content moves (and which is then trashed, pending review).
+    pub from_doc_id: String,
+    /// The doc that receives the content.
+    pub into_doc_id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -200,9 +262,10 @@ pub struct ProposeParams {
     /// The doc epoch your read was based on (from read_doc).
     pub base_epoch: i64,
     /// Ops array. Each op: {"kind": {"op": "insert"|"replace"|"delete"|"move", ...},
-    /// "source_refs": ["..."]}. insert: block_id (new UUID you generate), parent_id
-    /// (block UUID or null), order_key, block_type, content. replace: target,
-    /// content. delete: target. move: target, new_parent, new_order_key.
+    /// "source_refs": ["..."]}. insert: parent_id (block UUID or null),
+    /// order_key, block_type, content, and optionally block_id (omit it and the
+    /// server mints one — it comes back in the verdict's block_id). replace:
+    /// target, content. delete: target. move: target, new_parent, new_order_key.
     pub ops: serde_json::Value,
     /// Optional idempotency key (any UUID you generate): retrying a timed-out
     /// propose with the same request_id returns the original outcome instead
@@ -236,6 +299,8 @@ pub struct SearchParams {
     pub query: String,
     /// Max hits (default 20).
     pub limit: Option<u32>,
+    /// Include provenance fields on hit blocks.
+    pub verbose: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -257,6 +322,12 @@ pub struct CreateDocParams {
     pub title: String,
     /// Parent doc UUID for tree placement; omit for root.
     pub parent_doc_id: Option<String>,
+    /// Initial content: the whole doc as markdown, written in the same call.
+    pub markdown: Option<String>,
+    /// "error" (default): fail if a live doc with this exact title already
+    /// exists under the parent. "reuse": return that doc instead (with
+    /// `reused: true`, and `markdown` ignored) — an atomic find-or-create.
+    pub if_exists: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -306,6 +377,7 @@ pub struct ListDocsParams {
 #[derive(Serialize)]
 struct FlatBlock {
     id: Uuid,
+    parent_id: Option<Uuid>,
     depth: usize,
     block_type: &'static str,
     content: String,
@@ -325,6 +397,7 @@ fn flatten(nodes: &[BlockNode], depth: usize, full: bool, out: &mut Vec<FlatBloc
         };
         out.push(FlatBlock {
             id: n.block.id,
+            parent_id: n.block.parent_id,
             depth,
             block_type: n.block.block_type.as_str(),
             content,
@@ -428,32 +501,89 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "List docs: id, title, parent_id, current_epoch, review_policy. Pass parent_doc_id to list only that subtree — cheaper than the whole corpus."
+        description = "Compact doc rows {id, title, parent_id, epoch} for ONE subtree: pass parent_doc_id. Without it the whole corpus is returned only when it is small (≤200 docs) — otherwise use tree (shape) or find_doc (lookup by name). Not for finding a doc: find_doc is."
     )]
     async fn list_docs(
         &self,
         Parameters(p): Parameters<ListDocsParams>,
     ) -> Result<CallToolResult, McpError> {
         with_store(&self.store, move |store| {
-            match p.parent_doc_id.as_deref() {
+            let docs = match p.parent_doc_id.as_deref() {
                 Some(root) => match parse_uuid(root, "parent_doc_id") {
-                    Ok(root) => match store.doc_subtree(root) {
-                        Ok(docs) => ok_json(&docs),
-                        Err(e) => err(e.to_string()),
-                    },
-                    Err(m) => err(m),
+                    Ok(root) => store.doc_subtree(root),
+                    Err(m) => return err(m),
                 },
-                None => match store.list_docs() {
-                    Ok(docs) => ok_json(&docs),
-                    Err(e) => err(e.to_string()),
-                },
+                None => store.list_docs(),
+            };
+            let docs = match docs {
+                Ok(d) => d,
+                Err(e) => return err(e.to_string()),
+            };
+            if p.parent_doc_id.is_none() && docs.len() > crate::nav::LIST_DOCS_LIMIT {
+                return err(format!(
+                    "the corpus has {} docs — too many to list. Use find_doc(query) to look one up, \
+                     tree(depth) to see the shape, or pass parent_doc_id to list one subtree.",
+                    docs.len()
+                ));
+            }
+            ok_json(&docs.iter().map(crate::nav::compact_doc).collect::<Vec<_>>())
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Find docs by name: fuzzy match over titles and breadcrumb paths ('Folder › Sub › Title'), case-insensitive, typo-tolerant. Ranked exact > prefix > substring > all words in path > fuzzy. Returns {id, title, path, parent_id, epoch, status}. Use this instead of list_docs to look a doc up."
+    )]
+    async fn find_doc(
+        &self,
+        Parameters(p): Parameters<FindDocParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let parent = match p
+            .parent_doc_id
+            .as_deref()
+            .map(|s| parse_uuid(s, "parent_doc_id"))
+            .transpose()
+        {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let limit = p.limit.unwrap_or(8).clamp(1, 50) as usize;
+        with_store(&self.store, move |store| {
+            match store.list_docs() {
+                Ok(docs) => ok_json(&crate::nav::find_docs(&docs, &p.query, parent, limit)),
+                Err(e) => err(e.to_string()),
             }
         })
         .await
     }
 
     #[tool(
-        description = "Read a doc as blocks. Returns the doc's current epoch — quote it as base_epoch when proposing. mode 'outline' (default) returns block ids, types and first lines within a small token budget; fetch full blocks with read_block or mode 'full'."
+        description = "The doc tree as indented text, one line per doc: '- Title  [id]', with subtrees below `depth` (default 2) collapsed to '(N more)'. Cheap orientation: call once, then find_doc/read_doc. root_doc_id zooms into one subtree."
+    )]
+    async fn tree(&self, Parameters(p): Parameters<TreeParams>) -> Result<CallToolResult, McpError> {
+        let root = match p
+            .root_doc_id
+            .as_deref()
+            .map(|s| parse_uuid(s, "root_doc_id"))
+            .transpose()
+        {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let depth = p.depth.unwrap_or(2).clamp(1, 12) as usize;
+        with_store(&self.store, move |store| {
+            match store.list_docs() {
+                Ok(docs) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                    crate::nav::render_tree(&docs, root, depth),
+                )])),
+                Err(e) => err(e.to_string()),
+            }
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Read a doc. Returns the doc's current epoch — quote it as base_epoch when proposing. mode 'outline' (default): block ids, types, first lines. mode 'markdown': the whole doc as ONE markdown string with '<!-- block <uuid> -->' lines above each block — the input to edit and send back via propose_markdown (markers are stripped server-side; unchanged markdown = zero ops). mode 'full': every block as JSON. Blocks carry id, parent_id, block_type, content unless verbose."
     )]
     async fn read_doc(
         &self,
@@ -463,26 +593,46 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        let full = p.mode.as_deref() == Some("full");
+        let mode = p.mode.clone().unwrap_or_else(|| "outline".into());
+        if !matches!(mode.as_str(), "outline" | "full" | "markdown") {
+            return err(format!("mode must be outline | full | markdown, got {mode}"));
+        }
         with_store(&self.store, move |store| {
-            match store.read_doc(doc_id) {
-                Ok(tree) => {
-                    let mut blocks = Vec::new();
-                    flatten(&tree.roots, 0, full, &mut blocks);
-                    ok_json(&json!({
-                        "doc": tree.doc,
-                        "epoch": tree.doc.current_epoch,
-                        "mode": if full { "full" } else { "outline" },
-                        "blocks": blocks,
-                    }))
-                }
-                Err(e) => err(e.to_string()),
+            let tree = match store.read_doc(doc_id) {
+                Ok(t) => t,
+                Err(e) => return err(e.to_string()),
+            };
+            let doc = json!({
+                "id": tree.doc.id,
+                "title": tree.doc.title,
+                "parent_id": tree.doc.parent_id,
+                "status": tree.doc.status,
+                "review_policy": tree.doc.review_policy,
+            });
+            if mode == "markdown" {
+                return ok_json(&json!({
+                    "doc": doc,
+                    "epoch": tree.doc.current_epoch,
+                    "mode": "markdown",
+                    "markdown": grimoire_store::export::markdown_of(&tree.roots, true),
+                }));
             }
+            let full = mode == "full";
+            let mut blocks = Vec::new();
+            flatten(&tree.roots, 0, full, &mut blocks);
+            ok_json(&json!({
+                "doc": if p.verbose.unwrap_or(false) { json!(tree.doc) } else { doc },
+                "epoch": tree.doc.current_epoch,
+                "mode": mode,
+                "blocks": blocks,
+            }))
         })
         .await
     }
 
-    #[tool(description = "Read one block in full (any block id from read_doc or search).")]
+    #[tool(
+        description = "Read one block in full (any block id from read_doc or search). Returns id, doc_id, parent_id, order_key, block_type, content (plus provenance with verbose)."
+    )]
     async fn read_block(
         &self,
         Parameters(p): Parameters<ReadBlockParams>,
@@ -491,9 +641,10 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
+        let verbose = p.verbose.unwrap_or(false);
         with_store(&self.store, move |store| {
             match store.read_block(id) {
-                Ok(b) => ok_json(&b),
+                Ok(b) => ok_json(&crate::nav::compact_block(&b, verbose)),
                 Err(e) => err(e.to_string()),
             }
         })
@@ -501,7 +652,7 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Propose block edits through the review gate. Returns per-op structured verdicts: green = applied; yellow = applied, flagged for review; red = parked unapplied (your text is preserved for a reviewer). A stale base_epoch is fine — ops against unchanged blocks still green. Never guess base_epoch: read_doc first and quote its epoch. For inserts, set order_key to \"\" to append after the last sibling, or \"after:<block-uuid>\" to insert after a specific block — the server assigns the real key; never compute keys yourself."
+        description = "Propose block edits through the review gate. Returns per-op structured verdicts {op_id, block_id, verdict, applied, note}: green = applied; yellow = applied, flagged for review; red = parked unapplied (your text is preserved for a reviewer). A stale base_epoch is fine — ops against unchanged blocks still green. Never guess base_epoch: read_doc first and quote its epoch. For inserts, block_id is optional (the server mints one and returns it in the verdict); set order_key to \"\" to append after the last sibling, or \"after:<block-uuid>\" to insert after a specific block — the server assigns the real key; never compute keys yourself. For anything beyond a one-block change prefer propose_markdown."
     )]
     async fn propose(
         &self,
@@ -554,7 +705,7 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "THE EASY WRITE PATH: hand over a doc's complete new markdown; the server diffs it against the current blocks and proposes minimal ops through the gate — unchanged blocks keep their ids (provenance and comment anchors survive), edits become replaces, new/removed paragraphs become inserts/deletes. Read the doc (mode 'full'), edit the markdown, send it back. Prefer this over hand-built block ops for anything beyond a single-block change."
+        description = "THE EASY WRITE PATH: hand over a doc's complete new markdown; the server diffs it against the current blocks and proposes minimal ops through the gate — unchanged blocks keep their ids (provenance and comment anchors survive), edits become replaces, new/removed paragraphs become inserts/deletes. Loop: read_doc(mode 'markdown') → edit the string (keep or drop the '<!-- block … -->' markers, both work) → propose_markdown with that read's epoch → verdicts. Prefer this over hand-built block ops for anything beyond a single-block change."
     )]
     async fn propose_markdown(
         &self,
@@ -645,15 +796,26 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Search live block content (substring). Hits are blocks with their doc title — the editable unit, not whole pages."
+        description = "Search live block content (substring / trigram, typo-tolerant). Hits are {block, doc_title} — the editable unit, not whole pages. Blocks are compact unless verbose. To find a DOC by name use find_doc."
     )]
     async fn search(
         &self,
         Parameters(p): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
+        let verbose = p.verbose.unwrap_or(false);
         with_store(&self.store, move |store| {
             match store.search_blocks(&p.query, p.limit.unwrap_or(20) as usize) {
-                Ok(hits) => ok_json(&hits),
+                Ok(hits) => ok_json(
+                    &hits
+                        .iter()
+                        .map(|h| {
+                            json!({
+                                "block": crate::nav::compact_block(&h.block, verbose),
+                                "doc_title": h.doc_title,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                ),
                 Err(e) => err(e.to_string()),
             }
         })
@@ -661,7 +823,7 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Open review annotations (applied-but-flagged yellows, parked reds) with their ops, oldest first."
+        description = "Open review annotations (applied-but-flagged yellows, parked reds) with their ops, oldest first. Includes doc ops (rename_doc / move_doc / set_status / delete_doc) alongside block ops."
     )]
     async fn review_queue(
         &self,
@@ -784,7 +946,140 @@ impl KsMcp {
         .await
     }
 
-    #[tool(description = "Create a new empty doc; add content with propose.")]
+    #[tool(
+        description = "Retitle a doc THROUGH THE GATE: applied now as a flagged yellow (a reviewer's decline renames it back), and every inbound [[wikilink]] is rewritten to the new title. Returns the same verdict shape as propose. Refused for docs shared with you (mirrors)."
+    )]
+    async fn rename_doc(
+        &self,
+        Parameters(p): Parameters<RenameDocParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let principal = self.principal();
+        with_store(&self.store, move |store| {
+            match crate::docops::rename(store, doc_id, &p.title, principal) {
+                Ok(out) => ok_json(&out),
+                Err(m) => err(m),
+            }
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Move a doc in the tree THROUGH THE GATE: reparent to new_parent_id (omit = root) and optionally land right after after_doc_id (omit = append last). Applied now as a flagged yellow; decline moves it back. Same boundary rules as the app: nothing lands inside a tree shared with you, and shared docs move only at their share root."
+    )]
+    async fn move_doc(
+        &self,
+        Parameters(p): Parameters<MoveDocParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let new_parent = match p
+            .new_parent_id
+            .as_deref()
+            .map(|s| parse_uuid(s, "new_parent_id"))
+            .transpose()
+        {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let after = match p
+            .after_doc_id
+            .as_deref()
+            .map(|s| parse_uuid(s, "after_doc_id"))
+            .transpose()
+        {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let principal = self.principal();
+        with_store(&self.store, move |store| {
+            match crate::docops::move_doc(store, doc_id, new_parent, after, principal) {
+                Ok(out) => ok_json(&out),
+                Err(m) => err(m),
+            }
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Set a doc's lifecycle status THROUGH THE GATE: draft | in-review | decided | superseded, or omit/\"null\" to clear. Applied now as a flagged yellow; decline restores the previous status."
+    )]
+    async fn set_status(
+        &self,
+        Parameters(p): Parameters<SetStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let status = match crate::docops::parse_status(p.status.as_deref()) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
+        let principal = self.principal();
+        with_store(&self.store, move |store| {
+            match crate::docops::set_status(store, doc_id, status, principal) {
+                Ok(out) => ok_json(&out),
+                Err(m) => err(m),
+            }
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Propose trashing a doc and its subtree. ALWAYS RED: nothing happens until a human accepts the card in the review queue (\"<you> wants to trash 'Title' (N docs)\"); then it goes to the Trash, restorable. Refused when any doc in the subtree is shared with you or in a live session. To de-duplicate two docs use merge_docs instead."
+    )]
+    async fn delete_doc(
+        &self,
+        Parameters(p): Parameters<DeleteDocParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let (hot, principal) = (self.hot.clone(), self.principal());
+        with_store(&self.store, move |store| {
+            match crate::docops::delete(store, &|d| hot.is_hot(d), doc_id, principal) {
+                Ok(out) => ok_json(&out),
+                Err(m) => err(m),
+            }
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Merge two docs (e.g. same-title daily-doc duplicates): from_doc_id's content blocks are appended after into_doc_id's last block as flagged yellows (from's frontmatter is not carried), then a RED delete_doc(from) is parked for a human to accept. Both docs must be yours and cold. Returns {into: verdicts, delete: verdict, note}."
+    )]
+    async fn merge_docs(
+        &self,
+        Parameters(p): Parameters<MergeDocsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let from = match parse_uuid(&p.from_doc_id, "from_doc_id") {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let into = match parse_uuid(&p.into_doc_id, "into_doc_id") {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let (hot, principal) = (self.hot.clone(), self.principal());
+        with_store(&self.store, move |store| {
+            match crate::docops::merge(store, &|d| hot.is_hot(d), from, into, principal) {
+                Ok(out) => ok_json(&out),
+                Err(m) => err(m),
+            }
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Create a doc — optionally with its content in the same call (markdown: the whole doc). if_exists 'reuse' makes it an atomic find-or-create: a live doc with this exact title under the same parent is returned (reused: true) instead of creating a duplicate — use it for daily docs and other well-known titles. Default 'error' refuses a duplicate title. Returns {id, title, parent_id, epoch, reused}."
+    )]
     async fn create_doc(
         &self,
         Parameters(p): Parameters<CreateDocParams>,
@@ -798,10 +1093,48 @@ impl KsMcp {
             Ok(u) => u,
             Err(m) => return err(m),
         };
+        let reuse = match p.if_exists.as_deref().unwrap_or("error") {
+            "reuse" => true,
+            "error" => false,
+            other => return err(format!("if_exists must be reuse | error, got {other}")),
+        };
+        let title = p.title.trim().to_string();
+        if title.is_empty() {
+            return err("title must not be empty".into());
+        }
         let principal = self.principal();
         with_store(&self.store, move |store| {
-            match store.create_doc(&p.title, parent, principal) {
-                Ok(doc) => ok_json(&doc),
+            // one lock for the whole find-or-create: two sessions racing on
+            // the same daily title cannot both create
+            let existing = match store.list_docs() {
+                Ok(docs) => docs
+                    .into_iter()
+                    .find(|d| d.parent_id == parent && d.title == title),
+                Err(e) => return err(e.to_string()),
+            };
+            if let Some(d) = existing {
+                if reuse {
+                    return ok_json(&json!({
+                        "id": d.id, "title": d.title, "parent_id": d.parent_id,
+                        "epoch": d.current_epoch, "reused": true,
+                    }));
+                }
+                return err(format!(
+                    "a doc titled {title:?} already exists here ({}); pass if_exists: \"reuse\" to use it",
+                    d.id
+                ));
+            }
+            let ops = p
+                .markdown
+                .as_deref()
+                .filter(|m| !m.trim().is_empty())
+                .map(|m| grimoire_store::import::to_ops(grimoire_store::import::segment(m)))
+                .unwrap_or_default();
+            match store.create_doc_with_ops(&title, parent, principal, ops) {
+                Ok((d, _)) => ok_json(&json!({
+                    "id": d.id, "title": d.title, "parent_id": d.parent_id,
+                    "epoch": d.current_epoch, "reused": false,
+                })),
                 Err(e) => err(e.to_string()),
             }
         })
@@ -813,10 +1146,23 @@ impl KsMcp {
 impl ServerHandler for KsMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Grimoire: docs as block trees with a review gate. Read \
-                 (read_doc returns the epoch), then propose edits quoting that epoch \
-                 as base_epoch. Verdicts: green applied, yellow applied+flagged, red \
-                 parked for review. If told stale_base, call diff_since and re-propose.",
+            "Grimoire: docs as block trees behind a review gate. Everything you write \
+             gets a verdict: green = applied, yellow = applied + flagged for a human \
+             (revertible), red = parked until a human accepts.\n\
+             The loop: identify(name) once per session → find_doc(query) to locate a doc \
+             (or tree() for the shape; list_docs only for one small subtree) → \
+             read_doc(doc_id, mode 'markdown') → edit the markdown → propose_markdown \
+             (doc_id, that read's epoch, markdown) → read the verdicts. If told \
+             stale_base: diff_since, re-read, re-propose. Use propose for a single-block \
+             change (insert block_id is optional).\n\
+             Find-or-create: create_doc(title, parent_doc_id, markdown, if_exists 'reuse') \
+             returns the existing doc instead of a duplicate.\n\
+             Tree ops carry verdicts too: rename_doc / move_doc / set_status are yellow \
+             (applied, flagged, declinable); delete_doc is always red (parked until a \
+             human trashes it); merge_docs = yellow append + red delete.\n\
+             Human-only, never over MCP: review policy, shares, trust, gardeners, hub \
+             roles, profile. my_proposals shows what happened to yours; review_queue \
+             lists what awaits a human.",
         )
     }
 }

@@ -80,7 +80,7 @@ async fn events(State(st): State<ApiState>, Query(q): Query<EventsQuery>) -> Jso
 /// Mirror docs are the owner's: no local rename/delete/status/policy — and
 /// no move except of the share root, which the grantee may file where they
 /// like. Returns the user-facing refusal.
-fn refuse_if_mirror(s: &SqliteStore, id: Uuid, what: &str) -> Option<String> {
+pub(crate) fn refuse_if_mirror(s: &SqliteStore, id: Uuid, what: &str) -> Option<String> {
     match s.get_mirror(id) {
         Ok(Some(_)) => Some(format!(
             "this doc is shared with you by its owner — {what} is the owner's call"
@@ -1033,7 +1033,7 @@ async fn move_doc(
 /// - no doc whose subtree contains a mirror moves INTO one of my shares —
 ///   the re-share guard at create time would otherwise be bypassed and the
 ///   pull would ship someone else's content onward.
-fn refuse_move(s: &SqliteStore, id: Uuid, new_parent: Option<Uuid>) -> Option<String> {
+pub(crate) fn refuse_move(s: &SqliteStore, id: Uuid, new_parent: Option<Uuid>) -> Option<String> {
     let mirrors: std::collections::HashMap<Uuid, grimoire_store::Mirror> = s
         .list_mirrors()
         .unwrap_or_default()
@@ -1091,19 +1091,9 @@ struct RenameReq {
 }
 
 /// Rewrite [[Old Title]] / [[Path/Old|alias]] / [[Old#anchor]] link forms.
+/// One rule for the human rename here and the gated agent rename (store).
 fn rewrite_links(content: &str, old: &str, new: &str) -> String {
-    let mut out = content.to_string();
-    for (from, to) in [
-        (format!("[[{old}]]"), format!("[[{new}]]")),
-        (format!("[[{old}|"), format!("[[{new}|")),
-        (format!("[[{old}#"), format!("[[{new}#")),
-        (format!("/{old}]]"), format!("/{new}]]")),
-        (format!("/{old}|"), format!("/{new}|")),
-        (format!("/{old}#"), format!("/{new}#")),
-    ] {
-        out = out.replace(&from, &to);
-    }
-    out
+    grimoire_store::rewrite_links(content, old, new)
 }
 
 async fn rename_doc(

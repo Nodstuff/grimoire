@@ -8,6 +8,7 @@ mod api;
 mod ask;
 mod backup;
 mod children;
+mod docops;
 mod embed;
 mod fed;
 mod garden;
@@ -17,6 +18,7 @@ mod local_guard;
 mod yrender;
 mod mcp;
 mod memory;
+mod nav;
 mod room;
 mod store_ext;
 #[cfg(test)]
@@ -771,6 +773,15 @@ async fn main() -> anyhow::Result<()> {
             let hot = hot::HotState::new(
                 cli.db.parent().unwrap_or(std::path::Path::new(".")).join("hot"),
             );
+            {
+                // store-internal writes that fan out to other docs (a gated
+                // rename's link rewrites, a parked delete's accept) skip live docs
+                let probe = hot.clone();
+                store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .set_frozen_probe(Box::new(move |doc| probe.is_hot(doc)));
+            }
             {
                 let (hot, store) = (hot.clone(), store.clone());
                 store_ext::blocking(move || hot.recover(&store)).await;

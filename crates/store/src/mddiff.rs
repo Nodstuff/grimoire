@@ -106,6 +106,40 @@ pub fn markdown_to_ops_editor(roots: &[BlockNode], markdown: &str) -> Vec<OpInpu
     diff_with_filter(roots, markdown, &is_editor_hidden, "editor")
 }
 
+/// The block-id marker `read_doc(mode: "markdown")` puts on its own line
+/// before each block: `<!-- block <uuid> -->`. Purely informational — the
+/// diff strips them (`strip_block_markers`), so markdown with or without
+/// them round-trips to the same ops.
+pub const BLOCK_MARKER_PREFIX: &str = "<!-- block ";
+
+/// A marker line for `id`.
+pub fn block_marker(id: Uuid) -> String {
+    format!("{BLOCK_MARKER_PREFIX}{id} -->")
+}
+
+/// Is this (trimmed) line a block marker? Only a well-formed UUID counts, so
+/// a human's own `<!-- block ... -->` comment is never eaten.
+pub fn is_block_marker(line: &str) -> bool {
+    let t = line.trim();
+    t.strip_prefix(BLOCK_MARKER_PREFIX)
+        .and_then(|rest| rest.strip_suffix("-->"))
+        .is_some_and(|id| Uuid::parse_str(id.trim()).is_ok())
+}
+
+/// Drop every block-marker line. The markers sit on their own line directly
+/// above a block, so removing the line yields exactly the plain export.
+pub fn strip_block_markers(markdown: &str) -> String {
+    if !markdown.contains(BLOCK_MARKER_PREFIX) {
+        return markdown.to_string();
+    }
+    let mut out: Vec<&str> = markdown.lines().filter(|l| !is_block_marker(l)).collect();
+    // `lines()` drops a trailing newline; put it back if the input had one
+    if markdown.ends_with('\n') {
+        out.push("");
+    }
+    out.join("\n")
+}
+
 fn diff_with_filter(
     roots: &[BlockNode],
     markdown: &str,
@@ -114,7 +148,8 @@ fn diff_with_filter(
 ) -> Vec<OpInput> {
     let mut old = Vec::new();
     flatten(roots, skip, &mut old);
-    let new = segment(markdown);
+    let markdown = strip_block_markers(markdown);
+    let new = segment(&markdown);
     let matched = lcs_match(&old, &new);
 
     let mut ops: Vec<OpInput> = Vec::new();
@@ -565,5 +600,44 @@ mod tests {
         apply_md(&mut s, doc, tom, new_md);
         let out = crate::export::export_doc(&s, doc).unwrap();
         assert_eq!(out.trim_end(), new_md);
+    }
+
+    /// `read_doc(mode: "markdown")` → `propose_markdown` unchanged is zero
+    /// ops: the markers are stripped, not diffed. Editing one block with the
+    /// markers left in place is exactly one replace of that block.
+    #[test]
+    fn block_markers_round_trip_to_zero_ops() {
+        let (mut s, doc, tom) = setup();
+        let marked = crate::export::export_doc_with_markers(&s, doc).unwrap();
+        assert!(marked.contains(BLOCK_MARKER_PREFIX));
+        assert_eq!(strip_block_markers(&marked), crate::export::export_doc(&s, doc).unwrap());
+        let tree = s.read_doc(doc).unwrap();
+        assert!(markdown_to_ops(&tree.roots, &marked).is_empty(), "unchanged markdown is a no-op");
+
+        let first = find_by_content(&s, doc, "first para");
+        let edited = marked.replace("first para", "first para, edited");
+        let ops = markdown_to_ops(&tree.roots, &edited);
+        assert_eq!(ops.len(), 1, "{ops:?}");
+        assert!(
+            matches!(&ops[0].kind, OpKind::Replace { target, content } if *target == first.id && content == "first para, edited")
+        );
+        s.propose(doc, tree.doc.current_epoch, tom, ops).unwrap();
+        assert_eq!(
+            crate::export::export_doc(&s, doc).unwrap().trim_end(),
+            MD.replace("first para", "first para, edited")
+        );
+    }
+
+    #[test]
+    fn only_well_formed_markers_are_stripped() {
+        let id = Uuid::now_v7();
+        assert!(is_block_marker(&block_marker(id)));
+        assert!(is_block_marker(&format!("  {} ", block_marker(id))));
+        assert!(!is_block_marker("<!-- block not-a-uuid -->"));
+        assert!(!is_block_marker("<!-- block -->"));
+        assert!(!is_block_marker("<!-- a comment -->"));
+        let md = format!("{}\npara\n\n<!-- keep me -->\n", block_marker(id));
+        assert_eq!(strip_block_markers(&md), "para\n\n<!-- keep me -->\n");
+        assert_eq!(strip_block_markers("no markers"), "no markers");
     }
 }

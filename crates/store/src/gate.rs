@@ -151,6 +151,15 @@ pub fn score_stale_op(
                 }
             }
         }
+        // doc ops have fixed verdicts and never reach the block gate
+        // (`propose_doc_op` is their path); parked red if one slips in
+        OpKind::RenameDoc { .. }
+        | OpKind::MoveDoc { .. }
+        | OpKind::SetStatus { .. }
+        | OpKind::DeleteDoc { .. } => red(
+            0.0,
+            format!("{} is a doc op: use the rename_doc/move_doc/set_status/delete_doc tools", op.op_type()),
+        ),
     }
 }
 

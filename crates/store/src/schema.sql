@@ -75,7 +75,10 @@ END;
 CREATE TABLE IF NOT EXISTS ops (
     id            TEXT PRIMARY KEY,
     doc_id        TEXT NOT NULL REFERENCES docs (id),
-    op_type       TEXT NOT NULL CHECK (op_type IN ('insert', 'replace', 'delete', 'move')),
+    -- block ops, plus doc ops (AX slice B: rename/move/status/delete of the
+    -- doc itself, proposed by agents through the gate)
+    op_type       TEXT NOT NULL CHECK (op_type IN ('insert', 'replace', 'delete', 'move',
+                                                   'rename_doc', 'move_doc', 'set_status', 'delete_doc')),
     target_block  TEXT,
     -- full OpKind as JSON; op_type/target_block are denormalised for querying
     payload       TEXT NOT NULL,
