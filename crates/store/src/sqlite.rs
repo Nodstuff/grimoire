@@ -4195,6 +4195,46 @@ impl SqliteStore {
         }
         Ok(out)
     }
+
+    /// Every live block of every live doc with its doc title, in doc/tree
+    /// order — one pass for the agent `grep` tool (daemon retrieval.rs).
+    pub fn live_blocks_with_titles(&self) -> Result<Vec<SearchHit>> {
+        let sql = format!(
+            "SELECT {}, d.title FROM blocks b JOIN docs d ON d.id = b.doc_id
+             WHERE b.deleted = 0 AND d.deleted = 0
+             ORDER BY b.doc_id, b.parent_id IS NOT NULL, b.order_key",
+            b_cols()
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map([], |r| {
+            let raw = row_to_block(r)?;
+            let title: String = r.get(10)?;
+            Ok((raw, title))
+        })?;
+        rows.map(|r| {
+            let (raw, doc_title) = r?;
+            Ok(SearchHit {
+                block: build_block(raw)?,
+                doc_title,
+            })
+        })
+        .collect()
+    }
+
+    /// doc id → live block count (size hints for the `orient` map).
+    pub fn block_counts(&self) -> Result<std::collections::HashMap<Uuid, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT b.doc_id, count(*) FROM blocks b JOIN docs d ON d.id = b.doc_id
+             WHERE b.deleted = 0 AND d.deleted = 0 GROUP BY b.doc_id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut out = std::collections::HashMap::new();
+        for r in rows {
+            let (d, n) = r?;
+            out.insert(uuid_col(d, "blocks.doc_id")?, n);
+        }
+        Ok(out)
+    }
 }
 
 fn b_cols() -> String {

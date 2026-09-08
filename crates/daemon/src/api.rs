@@ -451,13 +451,25 @@ async fn resolve_bulk(State(st): State<ApiState>, Json(req): Json<ResolveBulkReq
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
+    /// Restrict to this doc's subtree.
+    #[serde(default)]
+    scope: Option<Uuid>,
 }
 
+/// ⌘P. Same `SearchHit[]` shape as ever, ranked by `retrieval::search_ranked`
+/// (exact phrase first, then whole words, then fuzzy/by-meaning) so the
+/// palette stops leading with trigram noise. Answers docs stay findable here.
 async fn search(State(st): State<ApiState>, Query(p): Query<SearchQuery>) -> Json<Value> {
+    let embedder = st.embedder.clone();
     with_store(&st.store, move |s| {
-        match s.search_blocks(&p.q, 20) {
-            Ok(h) => Json(json!(h)),
-            Err(e) => Json(json!({"error": e.to_string()})),
+        let opts = crate::retrieval::SearchOpts {
+            scope: p.scope,
+            exclude_answers: false,
+            limit: 20,
+        };
+        match crate::retrieval::search_ranked(s, embedder.as_deref(), &p.q, opts) {
+            Ok(ranked) => Json(json!(ranked.into_iter().take(20).map(|r| r.hit).collect::<Vec<_>>())),
+            Err(e) => Json(json!({"error": e})),
         }
     })
     .await
