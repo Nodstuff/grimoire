@@ -264,12 +264,21 @@ fn ui_url(extra: &[(&str, &str)]) -> String {
     }
 }
 
-/// What the window shows when the daemon is not answering: no white screen.
-/// Self-contained (data: URL); the button probes the daemon from the page
-/// and the shell keeps retrying `ensure_daemon` behind it.
+/// Where the error page lives: a custom URI scheme served by the shell
+/// itself (`register_uri_scheme_protocol` below). Before 0.7.7 this was a
+/// `data:` URL handed to `WebviewWindowBuilder` — and on macOS that build
+/// silently failed, so a launch with a slow or absent daemon produced a tray
+/// and no window at all (the page below had never once been seen).
+const ERROR_URL: &str = "grimoire-shell://localhost/waiting";
+
+/// What the window shows while the daemon is not answering: no white
+/// screen, no dead app. The page probes the daemon every 3s and replaces
+/// itself with the UI (token and all) the moment it answers; the shell's
+/// retry thread does the same from its side.
 fn error_page() -> String {
     let log_path = log_path();
-    let html = format!(
+    let ui = ui_url(&[]);
+    format!(
         r#"<!doctype html><meta charset="utf-8"><title>Grimoire</title>
 <style>
 :root{{color-scheme:light dark}}
@@ -282,38 +291,26 @@ button{{margin-top:18px;padding:8px 18px;border-radius:10px;border:1px solid #44
 button:hover{{background:#262626}}
 #s{{min-height:1.4em;margin-top:10px;font-size:12px;color:#c9a35a}}
 </style>
-<main>
+<main data-tauri-drag-region>
 <div style="font-size:36px;opacity:.5;margin-bottom:16px">◈</div>
-<h1>Grimoire’s background service did not start</h1>
-<p>Your notes are safe. The service that stores and serves them is not answering on port 7425.</p>
-<p>Its log is in <code>{log_path}</code></p>
+<h1>Waiting for Grimoire’s background service</h1>
+<p>Your notes are safe. The service that stores and serves them is not answering on port 7425 yet — after an update its first start can take a few seconds. This page switches to your notes as soon as it answers.</p>
+<p>If it never does, its log is in <code>{log_path}</code></p>
 <button onclick="retry()">Try again</button>
 <div id="s"></div>
 </main>
 <script>
-const url='{DAEMON_URL}';
+const ui='{ui}';
 const s=document.getElementById('s');
-function probe(){{return fetch(url+'api/stamp',{{mode:'no-cors',cache:'no-store'}})}}
-function go(){{location.replace('grimoire-shell://ui')}}
+function probe(){{return fetch('{DAEMON_URL}api/stamp',{{mode:'no-cors',cache:'no-store'}})}}
+function go(){{location.replace(ui)}}
 function retry(){{
   s.textContent='checking…';
   probe().then(go).catch(()=>{{s.textContent='still not running — quit Grimoire from the ◈ menu and open it again, or check the log'}});
 }}
 setInterval(()=>probe().then(go).catch(()=>{{}}),3000);
 </script>"#
-    );
-    format!("data:text/html;charset=utf-8,{}", urlencode(&html))
-}
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
+    )
 }
 
 fn navigate(app: &AppHandle, target: &str) {
@@ -330,23 +327,27 @@ fn show_window(app: &AppHandle) {
         let _ = w.set_focus();
         return;
     }
-    let target = if daemon_up() { ui_url(&[]) } else { error_page() };
-    // Overlay: the page extends under the (transparent) title bar, so the
-    // traffic lights float over the UI. That also means the title bar is not
-    // natively draggable — the UI marks its top strip `data-tauri-drag-region`
-    // and the capability in `capabilities/main.json` lets the daemon's origin
-    // call start_dragging.
-    let _ = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(target.parse().unwrap()))
+    let url = if daemon_up() {
+        WebviewUrl::External(ui_url(&[]).parse().unwrap())
+    } else {
+        WebviewUrl::CustomProtocol(ERROR_URL.parse().unwrap())
+    };
+    let built = WebviewWindowBuilder::new(app, "main", url)
         .title("Grimoire")
         .inner_size(1240.0, 860.0)
         .hidden_title(true)
         .title_bar_style(tauri::TitleBarStyle::Overlay)
-        .on_navigation(|url| {
-            // the error page asks to be replaced by the UI once the daemon
-            // answers; everything else navigates normally
-            url.scheme() != "grimoire-shell"
-        })
         .build();
+    if let Err(e) = built {
+        // a window that fails to build leaves a tray and nothing else; say so
+        eprintln!("could not create the main window: {e}");
+        app.dialog()
+            .message(format!("Grimoire could not open its window.\n\n{e}"))
+            .kind(MessageDialogKind::Error)
+            .title("Grimoire")
+            .show(|_| {});
+        return;
+    }
     if !daemon_up() {
         // keep trying behind the error page; swap in the UI the moment it answers
         let handle = app.clone();
@@ -508,6 +509,14 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        // `grimoire-shell://localhost/waiting`: the page shown while the
+        // daemon is not answering (see ERROR_URL)
+        .register_uri_scheme_protocol("grimoire-shell", |_ctx, _req| {
+            tauri::http::Response::builder()
+                .header("Content-Type", "text/html; charset=utf-8")
+                .body(error_page().into_bytes())
+                .unwrap()
+        })
         // the window reopens where you left it. VISIBLE is deliberately not
         // saved: the window is hidden (close-to-tray) at almost every quit,
         // and restoring that would relaunch into an invisible app.
@@ -559,7 +568,7 @@ fn main() {
                             if ensure_daemon() {
                                 navigate(&handle, &ui_url(&[]));
                             } else {
-                                navigate(&handle, &error_page());
+                                navigate(&handle, ERROR_URL);
                             }
                         });
                     }
