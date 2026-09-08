@@ -117,13 +117,18 @@ pub fn block_marker(id: Uuid) -> String {
     format!("{BLOCK_MARKER_PREFIX}{id} -->")
 }
 
-/// Is this (trimmed) line a block marker? Only a well-formed UUID counts, so
-/// a human's own `<!-- block ... -->` comment is never eaten.
+/// Is this (trimmed) line a block marker? Anything shaped like
+/// `<!-- block <token> -->` with a single whitespace-free token counts: the
+/// real UUID markers `read_doc(markdown)` emits, and the placeholder ids
+/// agents invent for new blocks (`<!-- block NEWQ-nats-1 -->` was stored as
+/// content on 2026-09-08 when only UUIDs were stripped). A prose comment
+/// (`<!-- block quotes are rendered as ... -->`) has spaces and survives.
 pub fn is_block_marker(line: &str) -> bool {
     let t = line.trim();
     t.strip_prefix(BLOCK_MARKER_PREFIX)
         .and_then(|rest| rest.strip_suffix("-->"))
-        .is_some_and(|id| Uuid::parse_str(id.trim()).is_ok())
+        .map(str::trim)
+        .is_some_and(|id| !id.is_empty() && !id.contains(char::is_whitespace))
 }
 
 /// Drop every block-marker line. The markers sit on their own line directly
@@ -606,6 +611,18 @@ mod tests {
     /// ops: the markers are stripped, not diffed. Editing one block with the
     /// markers left in place is exactly one replace of that block.
     #[test]
+    fn any_single_token_marker_is_stripped_but_prose_comments_survive() {
+        assert!(is_block_marker("<!-- block 01a080ba-17b1-7a43-93d5-4d99f46f2401 -->"));
+        assert!(is_block_marker("  <!-- block NEWQ-nats-1 -->"));
+        assert!(is_block_marker("<!-- block new-3 -->"));
+        assert!(!is_block_marker("<!-- block quotes are rendered as callouts -->"));
+        assert!(!is_block_marker("<!-- block -->"));
+        assert!(!is_block_marker("<!-- todo: block this -->"));
+        let md = "<!-- block NEWQ-1 -->\n- a bullet\n\n<!-- block quotes need care -->\n\npara\n";
+        assert_eq!(strip_block_markers(md), "- a bullet\n\n<!-- block quotes need care -->\n\npara\n");
+    }
+
+    #[test]
     fn block_markers_round_trip_to_zero_ops() {
         let (mut s, doc, tom) = setup();
         let marked = crate::export::export_doc_with_markers(&s, doc).unwrap();
@@ -629,11 +646,12 @@ mod tests {
     }
 
     #[test]
-    fn only_well_formed_markers_are_stripped() {
+    fn markers_are_stripped_and_prose_comments_kept() {
         let id = Uuid::now_v7();
         assert!(is_block_marker(&block_marker(id)));
         assert!(is_block_marker(&format!("  {} ", block_marker(id))));
-        assert!(!is_block_marker("<!-- block not-a-uuid -->"));
+        // a single non-UUID token is still a marker (agents invent ids for new blocks)
+        assert!(is_block_marker("<!-- block not-a-uuid -->"));
         assert!(!is_block_marker("<!-- block -->"));
         assert!(!is_block_marker("<!-- a comment -->"));
         let md = format!("{}\npara\n\n<!-- keep me -->\n", block_marker(id));
