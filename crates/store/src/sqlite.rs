@@ -4884,6 +4884,166 @@ impl SqliteStore {
     }
 }
 
+/// Doc ops (AX slice B) at the store boundary: ledger shape, gate rules,
+/// the frozen probe, the ops CHECK migration, and the optional insert id.
+#[cfg(test)]
+mod doc_op_tests {
+    use super::*;
+    use crate::{PrincipalKind, import::import_markdown};
+
+    fn setup() -> (SqliteStore, Uuid, Uuid) {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let bot = s.create_principal(PrincipalKind::Agent, "claude:t", None).unwrap().id;
+        (s, tom, bot)
+    }
+
+    #[test]
+    fn rename_ledgers_pre_image_and_never_bumps_the_epoch() {
+        let (mut s, tom, bot) = setup();
+        let (d, _) = import_markdown(&mut s, "Old", None, tom, "body").unwrap();
+        let epoch_before = s.get_doc(d).unwrap().current_epoch;
+        let out = s
+            .propose_doc_op(
+                d,
+                bot,
+                OpKind::RenameDoc {
+                    title: "  New  ".into(),
+                    from_title: "caller lies".into(),
+                },
+                vec!["t".into()],
+            )
+            .unwrap();
+        assert_eq!(out.epoch, epoch_before);
+        assert_eq!(s.get_doc(d).unwrap().current_epoch, epoch_before, "hot sessions freeze the epoch");
+        assert_eq!(s.get_doc(d).unwrap().title, "New", "trimmed");
+        let ops = s.ops_since(d, epoch_before - 1).unwrap();
+        let op = ops.iter().find(|o| o.kind.is_doc_op()).expect("ledgered");
+        assert_eq!(op.verdict, Some(Verdict::Yellow));
+        assert_eq!(op.epoch_applied, Some(epoch_before));
+        assert!(op.prior.is_none());
+        assert!(matches!(&op.kind, OpKind::RenameDoc { from_title, .. } if from_title == "Old"), "server-owned pre-image");
+        // accept keeps it; the outcome feed shows the resolver
+        let q = s.review_queue(Some(d)).unwrap();
+        s.resolve(q[0].annotation.id, tom, ReviewDecision::Accept).unwrap();
+        assert_eq!(s.get_doc(d).unwrap().title, "New");
+        let (_, status, who) = &s.proposal_outcomes(bot, 5).unwrap()[0];
+        assert_eq!((status.as_deref(), who.as_deref()), (Some("accepted"), Some("tom")));
+    }
+
+    #[test]
+    fn frozen_docs_defer_link_rewrites() {
+        let (mut s, tom, bot) = setup();
+        let d = s.create_doc("Old", None, tom).unwrap();
+        let (hot_linker, _) = import_markdown(&mut s, "hot", None, tom, "[[Old]]").unwrap();
+        let (cold_linker, _) = import_markdown(&mut s, "cold", None, tom, "[[Old]]").unwrap();
+        s.set_frozen_probe(Box::new(move |id| id == hot_linker));
+        let out = s
+            .propose_doc_op(d.id, bot, OpKind::RenameDoc { title: "New".into(), from_title: String::new() }, vec![])
+            .unwrap();
+        assert!(out.verdicts[0].note.contains("1 inbound link block(s) rewritten, 1 deferred"), "{}", out.verdicts[0].note);
+        assert_eq!(crate::export::export_doc(&s, hot_linker).unwrap().trim(), "[[Old]]");
+        assert_eq!(crate::export::export_doc(&s, cold_linker).unwrap().trim(), "[[New]]");
+    }
+
+    #[test]
+    fn block_gate_refuses_doc_ops_and_doc_gate_refuses_block_ops() {
+        let (mut s, tom, bot) = setup();
+        let d = s.create_doc("D", None, tom).unwrap();
+        let doc_op = OpInput {
+            kind: OpKind::SetStatus { status: Some(DocStatus::Draft), from_status: None },
+            source_refs: vec![],
+        };
+        assert!(s.propose(d.id, 0, bot, vec![doc_op]).is_err());
+        assert!(s.propose_doc_op(d.id, bot, OpKind::Delete { target: Uuid::now_v7() }, vec![]).is_err());
+        // a trashed doc takes no doc ops
+        s.delete_doc(d.id).unwrap();
+        assert!(matches!(
+            s.propose_doc_op(d.id, bot, OpKind::SetStatus { status: None, from_status: None }, vec![]),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn insert_without_block_id_gets_one_minted_and_returned() {
+        let (mut s, tom, _) = setup();
+        let d = s.create_doc("D", None, tom).unwrap();
+        let ops: Vec<OpInput> = serde_json::from_str(
+            r#"[{"kind":{"op":"insert","parent_id":null,"order_key":"","block_type":"paragraph","content":"hi"}}]"#,
+        )
+        .unwrap();
+        let out = s.propose(d.id, 0, tom, ops).unwrap();
+        let id = out.verdicts[0].block_id.expect("minted id returned");
+        assert_eq!(s.read_block(id).unwrap().content, "hi");
+        assert_eq!(out.verdicts[0].op_id != id, true);
+    }
+
+    /// A db from before doc ops has `op_type IN ('insert','replace','delete','move')`;
+    /// opening it rebuilds `ops` with the wider CHECK, keeping rows and the
+    /// annotations FK, and is idempotent.
+    #[test]
+    fn opening_a_db_with_the_old_op_type_check_widens_it() {
+        let (mut s, tom, bot) = setup();
+        let (d, _) = import_markdown(&mut s, "D", None, tom, "para").unwrap();
+        s.conn.pragma_update(None, "foreign_keys", false).unwrap();
+        s.conn
+            .execute_batch(
+                "CREATE TABLE ops_old AS SELECT * FROM ops;
+                 DROP TABLE ops;
+                 CREATE TABLE ops (
+                     id TEXT PRIMARY KEY,
+                     doc_id TEXT NOT NULL REFERENCES docs (id),
+                     op_type TEXT NOT NULL CHECK (op_type IN ('insert', 'replace', 'delete', 'move')),
+                     target_block TEXT,
+                     payload TEXT NOT NULL,
+                     principal TEXT NOT NULL REFERENCES principals (id),
+                     base_epoch INTEGER NOT NULL,
+                     epoch_applied INTEGER,
+                     verdict TEXT CHECK (verdict IN ('green', 'yellow', 'red')),
+                     confidence REAL,
+                     prior TEXT,
+                     source_refs TEXT NOT NULL DEFAULT '[]',
+                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                 );
+                 INSERT INTO ops SELECT * FROM ops_old;
+                 DROP TABLE ops_old;",
+            )
+            .unwrap();
+        s.conn.pragma_update(None, "foreign_keys", true).unwrap();
+        // park a block op so an annotation references an op across the rebuild
+        let target = s.read_doc(d).unwrap().roots[0].block.id;
+        s.park(d, bot, vec![OpInput { kind: OpKind::Delete { target }, source_refs: vec![] }], "n").unwrap();
+        let rows_before: i64 = s.conn.query_row("SELECT count(*) FROM ops", [], |r| r.get(0)).unwrap();
+        // the old CHECK refuses a doc op
+        assert!(
+            s.propose_doc_op(d, bot, OpKind::SetStatus { status: Some(DocStatus::Draft), from_status: None }, vec![])
+                .is_err()
+        );
+        migrate_pre_schema(&s.conn).unwrap();
+        s.propose_doc_op(d, bot, OpKind::SetStatus { status: Some(DocStatus::Draft), from_status: None }, vec![])
+            .unwrap();
+        let rows_after: i64 = s.conn.query_row("SELECT count(*) FROM ops", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows_after, rows_before + 1);
+        assert_eq!(s.review_queue(None).unwrap().len(), 2, "parked block op + status yellow");
+        let fk: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 0);
+        migrate_pre_schema(&s.conn).unwrap();
+        assert_eq!(s.review_queue(None).unwrap().len(), 2);
+        let idx: i64 = s
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'ops'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(idx >= 2, "both ops indexes recreated");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

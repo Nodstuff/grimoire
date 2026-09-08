@@ -35,7 +35,7 @@ const GraphView = lazy(() => import('./GraphView'))
 const Loading = () => <div className="lazy-loading">loading…</div>
 import { resolveShortcut } from './shortcuts'
 import { parseDeepLink, scrubDeepLink } from './deeplink'
-import { buildHighlightMap, targetBlockOf } from './review'
+import { actionLabels, buildHighlightMap, describeChange, isDocOp, targetBlockOf } from './review'
 import { activityLine, loadLastSeen, storeLastSeen, unseenActivity } from './activity'
 import { advanceEvents, EventsCursor, EventsResponse, INITIAL_CURSOR, liveEventLine } from './live'
 import { chipText } from './shares'
@@ -2164,6 +2164,10 @@ function ReviewQueue({
         const proposed =
           typeof op.kind.content === 'string' ? (op.kind.content as string) : JSON.stringify(op.kind)
         const parked = r.item.annotation.kind === 'parked'
+        // doc ops (an agent's rename / move / status / trash through the
+        // gate) have no block diff: the card is the sentence describeChange builds
+        const docOp = isDocOp(op.kind.op) ? describeChange(r) : null
+        const labels = actionLabels(r)
         return (
           <div
             key={r.item.annotation.id}
@@ -2181,20 +2185,42 @@ function ReviewQueue({
                 {op.confidence != null && ` · ${op.confidence.toFixed(2)}`}
               </span>
             </div>
-            <div className="diff">
-              {op.prior && (
+            {docOp ? (
+              <>
+                <div className="rail-headline">{docOp.headline}</div>
+                {(docOp.before || docOp.after) && (
+                  <div className="diff">
+                    {docOp.before && (
+                      <div className="diff-col">
+                        <div className="diff-label">{docOp.before.label}</div>
+                        <pre>{docOp.before.text}</pre>
+                      </div>
+                    )}
+                    {docOp.after && (
+                      <div className="diff-col">
+                        <div className="diff-label">{docOp.after.label}</div>
+                        <pre>{docOp.after.text}</pre>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="diff">
+                {op.prior && (
+                  <div className="diff-col">
+                    <div className="diff-label">{parked ? 'current' : 'before'}</div>
+                    <pre>
+                      {(parked ? r.current_content ?? op.prior.content : op.prior.content).slice(0, 800)}
+                    </pre>
+                  </div>
+                )}
                 <div className="diff-col">
-                  <div className="diff-label">{parked ? 'current' : 'before'}</div>
-                  <pre>
-                    {(parked ? r.current_content ?? op.prior.content : op.prior.content).slice(0, 800)}
-                  </pre>
+                  <div className="diff-label">{parked ? 'proposed' : 'now'}</div>
+                  <pre>{proposed.slice(0, 800)}</pre>
                 </div>
-              )}
-              <div className="diff-col">
-                <div className="diff-label">{parked ? 'proposed' : 'now'}</div>
-                <pre>{proposed.slice(0, 800)}</pre>
               </div>
-            </div>
+            )}
             {op.source_refs.length > 0 && <div className="refs">{op.source_refs.join(' · ')}</div>}
             <div className="actions" onClick={(e) => e.stopPropagation()}>
               <button
@@ -2202,14 +2228,14 @@ function ReviewQueue({
                 disabled={busy === r.item.annotation.id}
                 onClick={() => resolve(r.item.annotation.id, 'accept')}
               >
-                {parked ? 'apply' : 'keep'}
+                {labels.accept}
               </button>
               <button
                 className="decline"
                 disabled={busy === r.item.annotation.id}
                 onClick={() => resolve(r.item.annotation.id, 'decline')}
               >
-                {parked ? 'discard' : 'revert'}
+                {labels.decline}
               </button>
               <button className="chip open-in-doc" onClick={() => openInDoc(r)}>
                 open in doc →

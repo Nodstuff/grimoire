@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildHighlightMap, describeChange, targetBlockOf, toneOf } from './review'
+import { actionLabels, buildHighlightMap, describeChange, isDocOp, targetBlockOf, toneOf } from './review'
 import type { Block, QueueRow } from './types'
 
 function block(id: string, content: string): Block {
@@ -110,5 +110,69 @@ describe('describeChange', () => {
     expect(del.headline).toBe('proposes deleting this block')
     expect(del.before).toBeNull()
     expect(del.after).toBeNull()
+  })
+})
+
+describe('doc ops (agent tree changes through the gate)', () => {
+  it('are recognised and never point at a block', () => {
+    for (const op of ['rename_doc', 'move_doc', 'set_status', 'delete_doc']) {
+      expect(isDocOp(op)).toBe(true)
+      expect(targetBlockOf(row('review', { op }))).toBeNull()
+    }
+    expect(isDocOp('replace')).toBe(false)
+    expect(buildHighlightMap([row('parked', { op: 'delete_doc', title: 'X', doc_count: 1 })])).toEqual({})
+  })
+  it('yellow rename reads as a sentence with was/now', () => {
+    const d = describeChange(row('review', { op: 'rename_doc', title: 'New', from_title: 'Old' }))
+    expect(d.badge).toBe('applied · flagged')
+    expect(d.headline).toBe('alice renamed “Old” to “New”')
+    expect(d.before).toEqual({ label: 'was', text: 'Old' })
+    expect(d.after).toEqual({ label: 'now', text: 'New' })
+    expect(actionLabels(row('review', { op: 'rename_doc', title: 'New', from_title: 'Old' }))).toEqual({
+      accept: 'keep',
+      decline: 'revert',
+    })
+  })
+  it('move uses parent titles, falling back to the top level', () => {
+    const d = describeChange(
+      row('review', {
+        op: 'move_doc',
+        new_parent: 'p2',
+        new_parent_title: 'Archive',
+        from_parent: null,
+        from_parent_title: null,
+      }),
+    )
+    expect(d.headline).toBe('alice moved this doc under “Archive”')
+    expect(d.before).toEqual({ label: 'was under', text: 'the top level' })
+    expect(d.after).toEqual({ label: 'now under', text: 'Archive' })
+  })
+  it('status shows none for a cleared status', () => {
+    const d = describeChange(row('review', { op: 'set_status', status: null, from_status: 'decided' }))
+    expect(d.headline).toBe('alice set status to none')
+    expect(d.before).toEqual({ label: 'was', text: 'decided' })
+  })
+  it('parked delete_doc says who wants to trash what, and the buttons say trash/keep', () => {
+    const r = row('parked', { op: 'delete_doc', title: 'Dup', doc_count: 3 })
+    const d = describeChange(r)
+    expect(d.badge).toBe('proposed · not applied')
+    expect(d.headline).toBe('alice wants to trash “Dup” (3 docs)')
+    expect(d.before).toBeNull()
+    expect(d.after).toBeNull()
+    expect(toneOf(r)).toBe('red')
+    expect(actionLabels(r)).toEqual({ accept: 'trash it', decline: 'keep it' })
+    expect(describeChange(row('parked', { op: 'delete_doc', title: 'One', doc_count: 1 })).headline).toBe(
+      'alice wants to trash “One” (1 doc)',
+    )
+  })
+  it('block ops keep the editor wording', () => {
+    expect(actionLabels(row('parked', { op: 'insert', block_id: 'n', content: 'x' }))).toEqual({
+      accept: 'apply',
+      decline: 'discard',
+    })
+    expect(actionLabels(row('review', { op: 'replace', target: 'b', content: 'x' }))).toEqual({
+      accept: 'keep',
+      decline: 'revert',
+    })
   })
 })

@@ -5,7 +5,7 @@
 import { useState } from 'react'
 import { api, QueueRow } from './types'
 import { errText, notify } from './Notice'
-import { describeChange, targetBlockOf } from './review'
+import { actionLabels, describeChange, isDocOp, targetBlockOf } from './review'
 
 /** Scroll a rendered block into view and flash it (same treatment as a
  * [[Doc#^uuid]] anchor). Returns false when the block is not in the DOM. */
@@ -124,10 +124,10 @@ export default function ReviewRail({
             )}
             <div className="actions" onClick={(e) => e.stopPropagation()}>
               <button className="accept" disabled={busy !== null} onClick={() => resolve(id, 'accept')}>
-                ✓ accept
+                ✓ {isDocOp(r.item.op.kind.op) ? actionLabels(r).accept : 'accept'}
               </button>
               <button className="decline" disabled={busy !== null} onClick={() => resolve(id, 'decline')}>
-                ✗ decline
+                ✗ {isDocOp(r.item.op.kind.op) ? actionLabels(r).decline : 'decline'}
               </button>
             </div>
           </div>
