@@ -2341,6 +2341,7 @@ dependencies = [
  "keyring",
  "libc",
  "model2vec-rs",
+ "regex",
  "reqwest 0.12.28",
  "rmcp",
  "rusqlite",

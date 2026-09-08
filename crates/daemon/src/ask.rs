@@ -87,9 +87,9 @@ pub fn retrieve(store: &SqliteStore, embedder: Option<&crate::embed::Embedder>, 
 }
 
 /// Cosine below this is noise for potion-class static models.
-const DENSE_FLOOR: f32 = 0.30;
+pub(crate) const DENSE_FLOOR: f32 = 0.30;
 /// …and anything much weaker than the best hit is padding, not evidence.
-const DENSE_RELATIVE: f32 = 0.70;
+pub(crate) const DENSE_RELATIVE: f32 = 0.70;
 
 /// Kept for the retrieval probe harness (see `retrieval_probe.rs`).
 #[allow(dead_code)]
@@ -113,12 +113,12 @@ pub fn stem(w: &str) -> String {
 
 
 /// `# Title` alone carries no fact worth citing.
-fn is_bare_heading(content: &str) -> bool {
+pub(crate) fn is_bare_heading(content: &str) -> bool {
     let t = content.trim();
     t.starts_with('#') && !t.contains('\n')
 }
 
-fn answers_folder_id(store: &SqliteStore) -> Option<Uuid> {
+pub(crate) fn answers_folder_id(store: &SqliteStore) -> Option<Uuid> {
     store
         .list_docs()
         .ok()?
@@ -128,7 +128,7 @@ fn answers_folder_id(store: &SqliteStore) -> Option<Uuid> {
 }
 
 /// Answer docs must never be evidence for the next answer (they'd echo).
-fn under_answers(store: &SqliteStore, doc_id: Uuid, answers: Option<Uuid>) -> bool {
+pub(crate) fn under_answers(store: &SqliteStore, doc_id: Uuid, answers: Option<Uuid>) -> bool {
     let Some(a) = answers else { return false };
     let mut cur = Some(doc_id);
     while let Some(id) = cur {
@@ -169,6 +169,13 @@ fn budget(ranked: Vec<SearchHit>) -> Vec<SearchHit> {
 
 /// Keyword leg: blocks hit by the most distinct question words first.
 pub fn retrieve_keyword(store: &SqliteStore, question: &str) -> Vec<SearchHit> {
+    retrieve_keyword_with(store, question, PER_WORD_LIMIT)
+}
+
+/// `retrieve_keyword` with the per-word candidate cap as a parameter: the
+/// agent `search` tool (retrieval.rs) needs a deeper pool when it filters to
+/// a subtree afterwards; the ask path keeps `PER_WORD_LIMIT`.
+pub fn retrieve_keyword_with(store: &SqliteStore, question: &str, per_word_limit: usize) -> Vec<SearchHit> {
     let words = keywords(question);
     let mut score: HashMap<Uuid, (usize, SearchHit)> = HashMap::new();
     // the trigram index is deliberately fuzzy (typos welcome); for grounding
@@ -184,7 +191,7 @@ pub fn retrieve_keyword(store: &SqliteStore, question: &str) -> Vec<SearchHit> {
         e.0 += weight;
     };
     let contains = |hit: &SearchHit, w: &str| hit.block.content.to_lowercase().contains(w);
-    if let Ok(hits) = store.search_blocks(question, PER_WORD_LIMIT) {
+    if let Ok(hits) = store.search_blocks(question, per_word_limit) {
         for h in hits {
             let n = words.iter().filter(|w| contains(&h, w)).count();
             if n > 0 {
@@ -193,7 +200,7 @@ pub fn retrieve_keyword(store: &SqliteStore, question: &str) -> Vec<SearchHit> {
         }
     }
     for w in &words {
-        if let Ok(hits) = store.search_blocks(w, PER_WORD_LIMIT) {
+        if let Ok(hits) = store.search_blocks(w, per_word_limit) {
             for h in hits {
                 if contains(&h, w) {
                     consider(h, 1);

@@ -151,6 +151,9 @@ pub struct KsMcp {
     /// Per-session identity set via the `identify` tool — distinct provenance
     /// for concurrent agent sessions.
     identity: Arc<Mutex<Option<Uuid>>>,
+    /// Block embeddings for the dense leg of `search`/`related`; None when
+    /// the model did not load (those tools degrade to keywords and say so).
+    embedder: Option<Arc<crate::embed::Embedder>>,
     // referenced only through the #[tool_handler] macro's generated code
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
@@ -162,6 +165,11 @@ impl KsMcp {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .unwrap_or(self.agent)
+    }
+
+    pub fn with_embedder(mut self, embedder: Option<Arc<crate::embed::Embedder>>) -> Self {
+        self.embedder = embedder;
+        self
     }
 }
 
@@ -294,16 +302,6 @@ pub struct DiffSinceParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct SearchParams {
-    /// Substring to find in block content.
-    pub query: String,
-    /// Max hits (default 20).
-    pub limit: Option<u32>,
-    /// Include provenance fields on hit blocks.
-    pub verbose: Option<bool>,
-}
-
-#[derive(Deserialize, JsonSchema)]
 pub struct ReviewQueueParams {
     /// Restrict to one doc (UUID); omit for all docs.
     pub doc_id: Option<String>,
@@ -420,6 +418,7 @@ impl KsMcp {
             hot,
             agent,
             identity: Arc::new(Mutex::new(None)),
+            embedder: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -796,33 +795,6 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Search live block content (substring / trigram, typo-tolerant). Hits are {block, doc_title} — the editable unit, not whole pages. Blocks are compact unless verbose. To find a DOC by name use find_doc."
-    )]
-    async fn search(
-        &self,
-        Parameters(p): Parameters<SearchParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let verbose = p.verbose.unwrap_or(false);
-        with_store(&self.store, move |store| {
-            match store.search_blocks(&p.query, p.limit.unwrap_or(20) as usize) {
-                Ok(hits) => ok_json(
-                    &hits
-                        .iter()
-                        .map(|h| {
-                            json!({
-                                "block": crate::nav::compact_block(&h.block, verbose),
-                                "doc_title": h.doc_title,
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-                Err(e) => err(e.to_string()),
-            }
-        })
-        .await
-    }
-
-    #[tool(
         description = "Open review annotations (applied-but-flagged yellows, parked reds) with their ops, oldest first. Includes doc ops (rename_doc / move_doc / set_status / delete_doc) alongside block ops."
     )]
     async fn review_queue(
@@ -1140,6 +1112,121 @@ impl KsMcp {
         })
         .await
     }
+
+    // ── AX retrieval tools (crate::retrieval) ──
+
+    #[tool(
+        description = "Ranked search over live blocks: exact phrase matches first, then blocks carrying every word, then fuzzy (trigram) and by-meaning hits. Returns compact hits (doc_id, path, block_id, ≤200-char snippet, score) — follow up with read_block/read_doc. kind 'docs' groups by doc. scope_doc_id restricts to a subtree. Earlier ask-the-vault Answers are excluded unless exclude_answers=false."
+    )]
+    async fn search(
+        &self,
+        Parameters(p): Parameters<crate::retrieval::SearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let scope = match p.scope_doc_id.as_deref().map(|s| parse_uuid(s, "scope_doc_id")).transpose() {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let kind = p.kind.clone().unwrap_or_else(|| "blocks".into());
+        if kind != "blocks" && kind != "docs" {
+            return err(format!("kind must be blocks|docs, got {kind}"));
+        }
+        let opts = crate::retrieval::SearchOpts {
+            scope,
+            exclude_answers: p.exclude_answers.unwrap_or(true),
+            limit: p.limit.unwrap_or(10).clamp(1, 100) as usize,
+        };
+        let embedder = self.embedder.clone();
+        with_store(&self.store, move |store| {
+            let emb = embedder.as_deref();
+            let out = if kind == "docs" {
+                crate::retrieval::search_docs(store, emb, &p.query, opts).map(|h| json!(h))
+            } else {
+                crate::retrieval::search_blocks(store, emb, &p.query, opts).map(|h| json!(h))
+            };
+            match out {
+                Ok(v) => ok_json(&v),
+                Err(m) => err(m),
+            }
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Exhaustive regex sweep (Rust regex syntax, per line of block content) grouped by doc: every match, with total_groups/total_matches and a truncated flag — raise max_groups/max_matches_per_group for the rest. Comments and frontmatter are skipped unless include_hidden."
+    )]
+    async fn grep(
+        &self,
+        Parameters(p): Parameters<crate::retrieval::GrepParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let scope = match p.scope_doc_id.as_deref().map(|s| parse_uuid(s, "scope_doc_id")).transpose() {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let opts = crate::retrieval::GrepOpts {
+            scope,
+            case_insensitive: p.case_insensitive.unwrap_or(false),
+            max_groups: p.max_groups.unwrap_or(20).clamp(1, 500) as usize,
+            max_matches_per_group: p.max_matches_per_group.unwrap_or(5).clamp(1, 200) as usize,
+            include_hidden: p.include_hidden.unwrap_or(false),
+        };
+        with_store(&self.store, move |store| {
+            match crate::retrieval::grep(store, &p.pattern, opts) {
+                Ok(out) => ok_json(&out),
+                Err(m) => err(m),
+            }
+        })
+        .await
+    }
+
+    #[tool(
+        description = "From a known block or doc, what else matters: docs that [[link]] to it (why=backlink), the nearest blocks by meaning in other docs (why=similar; needs the embedding model, says so if absent), and docs in the same folder (why=sibling). Pass block_id or doc_id."
+    )]
+    async fn related(
+        &self,
+        Parameters(p): Parameters<crate::retrieval::RelatedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let anchor = match (p.block_id.as_deref(), p.doc_id.as_deref()) {
+            (Some(b), _) => match parse_uuid(b, "block_id") {
+                Ok(u) => crate::retrieval::Anchor::Block(u),
+                Err(m) => return err(m),
+            },
+            (None, Some(d)) => match parse_uuid(d, "doc_id") {
+                Ok(u) => crate::retrieval::Anchor::Doc(u),
+                Err(m) => return err(m),
+            },
+            (None, None) => return err("pass block_id or doc_id".into()),
+        };
+        let limit = p.limit.unwrap_or(8).clamp(1, 50) as usize;
+        let embedder = self.embedder.clone();
+        with_store(&self.store, move |store| {
+            match crate::retrieval::related(store, embedder.as_deref(), anchor, limit) {
+                Ok(out) => ok_json(&out),
+                Err(m) => err(m),
+            }
+        })
+        .await
+    }
+
+    #[tool(
+        description = "The map: orient in a subtree (or the whole corpus) within a token budget — its tree to depth 2 with doc/block counts and ids, the most-linked docs with their first paragraph, and its tags with counts. Call once before searching an unfamiliar area; says when truncated."
+    )]
+    async fn orient(
+        &self,
+        Parameters(p): Parameters<crate::retrieval::OrientParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let root = match p.root_doc_id.as_deref().map(|s| parse_uuid(s, "root_doc_id")).transpose() {
+            Ok(u) => u,
+            Err(m) => return err(m),
+        };
+        let max_tokens = p.max_tokens.unwrap_or(1500).clamp(100, 20_000) as usize;
+        with_store(&self.store, move |store| {
+            match crate::retrieval::orient(store, root, max_tokens) {
+                Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
+                Err(m) => err(m),
+            }
+        })
+        .await
+    }
 }
 
 #[tool_handler]
@@ -1172,14 +1259,17 @@ impl ServerHandler for KsMcp {
 /// silently truncated a big `propose_markdown` long before the axum layer.
 pub const MAX_MCP_BODY: usize = 16 * 1024 * 1024;
 
+/// `embedder`: the block embedder for the dense legs of `search`/`related`
+/// (None = keyword-only, the tools say so).
 pub fn router(
     store: Arc<Mutex<SqliteStore>>,
     agent: Uuid,
     hot: crate::hot::HotState,
     dedupe: DedupeCache,
+    embedder: Option<Arc<crate::embed::Embedder>>,
 ) -> axum::Router {
     let service = StreamableHttpService::new(
-        move || Ok(KsMcp::new(store.clone(), agent, dedupe.clone(), hot.clone())),
+        move || Ok(KsMcp::new(store.clone(), agent, dedupe.clone(), hot.clone()).with_embedder(embedder.clone())),
         LocalSessionManager::default().into(),
         rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default()
             .with_max_request_body_bytes(MAX_MCP_BODY),
@@ -1241,7 +1331,7 @@ mod tests {
         let hot = crate::hot::HotState::new(
             std::env::temp_dir().join(format!("grimoire-mcp-test-{}", Uuid::now_v7())),
         );
-        let app = router(Arc::new(Mutex::new(store)), agent, hot, new_dedupe());
+        let app = router(Arc::new(Mutex::new(store)), agent, hot, new_dedupe(), None);
 
         let send = |body: Vec<u8>| {
             let app = app.clone();
@@ -1275,5 +1365,61 @@ mod tests {
         );
         assert!(over.len() > LIMIT);
         assert_eq!(send(over.into_bytes()).await, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn text_of(r: CallToolResult) -> (bool, serde_json::Value) {
+        let is_err = r.is_error.unwrap_or(false);
+        let text = r.content[0].as_text().map(|t| t.text.clone()).unwrap_or_default();
+        (is_err, serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
+    }
+
+    /// The AX tools through the tool fns: compact hits, validated `kind`,
+    /// a clear regex error, `related` naming the missing embedder.
+    #[tokio::test]
+    async fn ax_tools_return_compact_shapes_and_clear_errors() {
+        use grimoire_store::import::import_markdown;
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let agent = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let (shell, _) = import_markdown(&mut store, "Shell", None, tom, "Drag the window by its title bar.\n").unwrap();
+        import_markdown(&mut store, "Entitlements", None, tom, "The entitlement check runs at login.\n").unwrap();
+        let hot = crate::hot::HotState::new(std::env::temp_dir().join(format!("grimoire-mcp-ax-{}", Uuid::now_v7())));
+        let mcp = KsMcp::new(Arc::new(Mutex::new(store)), agent, new_dedupe(), hot);
+
+        fn p<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> T {
+            serde_json::from_value(v).unwrap()
+        }
+        let (is_err, hits) = text_of(mcp.search(Parameters(p(json!({"query": "title bar"})))).await.unwrap());
+        assert!(!is_err);
+        assert_eq!(hits[0]["doc_title"], "Shell");
+        assert_eq!(hits[0]["path"], "Shell");
+        assert!(hits[0]["snippet"].as_str().unwrap().contains("title bar"));
+        assert!(hits[0].get("block_id").is_some() && hits[0].get("score").is_some());
+        assert!(hits[0].get("block").is_none(), "compact: no full block");
+
+        let (is_err, docs) = text_of(mcp.search(Parameters(p(json!({"query": "title bar", "kind": "docs"})))).await.unwrap());
+        assert!(!is_err);
+        assert_eq!(docs[0]["hits"], 1);
+        let (is_err, msg) = text_of(mcp.search(Parameters(p(json!({"query": "x", "kind": "pages"})))).await.unwrap());
+        assert!(is_err && msg.as_str().unwrap().contains("kind must be"));
+
+        let (is_err, msg) = text_of(mcp.grep(Parameters(p(json!({"pattern": "(oops"})))).await.unwrap());
+        assert!(is_err && msg.as_str().unwrap().starts_with("invalid regex:"), "{msg}");
+        let (_, out) = text_of(mcp.grep(Parameters(p(json!({"pattern": "title|entitlement"})))).await.unwrap());
+        assert_eq!(out["total_groups"], 2);
+        assert_eq!(out["truncated"], false);
+
+        let (is_err, out) = text_of(mcp.related(Parameters(p(json!({"doc_id": shell.to_string()})))).await.unwrap());
+        assert!(!is_err);
+        assert_eq!(out["embedder"], false);
+        assert!(out["note"].as_str().unwrap().contains("similar"));
+        assert!(out["related"].as_array().unwrap().iter().any(|r| r["why"] == "sibling" && r["title"] == "Entitlements"));
+        let (is_err, msg) = text_of(mcp.related(Parameters(p(json!({})))).await.unwrap());
+        assert!(is_err && msg.as_str().unwrap().contains("block_id or doc_id"));
+
+        let (is_err, map) = text_of(mcp.orient(Parameters(p(json!({})))).await.unwrap());
+        assert!(!is_err);
+        let map = map.as_str().unwrap();
+        assert!(map.starts_with("# Corpus — 2 docs") && map.contains("- Shell · "), "{map}");
     }
 }

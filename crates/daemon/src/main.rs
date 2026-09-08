@@ -20,6 +20,7 @@ mod mcp;
 mod memory;
 mod nav;
 mod room;
+mod retrieval;
 mod store_ext;
 #[cfg(test)]
 mod retrieval_probe;
@@ -902,7 +903,7 @@ async fn main() -> anyhow::Result<()> {
             let fed_ctx_node_id: Option<String>;
             // one idempotency cache for MCP and HTTP proposes (request_id)
             let dedupe = mcp::new_dedupe();
-            let app = mcp::router(store.clone(), claude, hot.clone(), dedupe.clone())
+            let app = mcp::router(store.clone(), claude, hot.clone(), dedupe.clone(), embedder.clone())
                 .merge(hot::router(hot::HotCtx {
                     hot: hot.clone(),
                     store: store.clone(),
