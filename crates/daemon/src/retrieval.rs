@@ -66,12 +66,18 @@ pub struct GrepParams {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct RelatedParams {
-    /// Start from this block (UUID) — or pass doc_id instead.
+    /// Start from this block (UUID or ^abc123 ref) — or pass doc_id instead.
     pub block_id: Option<String>,
     /// Start from this doc (UUID).
     pub doc_id: Option<String>,
     /// Max entries per relation (default 8).
     pub limit: Option<u32>,
+    /// "tag": list the docs carrying `tag` instead of neighbours of a block/doc.
+    pub by: Option<String>,
+    /// The tag for by: "tag".
+    pub tag: Option<String>,
+    /// true: return every tag with its doc count (the vocabulary) and nothing else.
+    pub tags: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -80,6 +86,8 @@ pub struct OrientParams {
     pub root_doc_id: Option<String>,
     /// Approximate output budget in tokens (default 1500; 1 token ≈ 4 chars).
     pub max_tokens: Option<u32>,
+    /// Tree levels to expand (default 2; 1–12). Deeper subtrees show as "N below".
+    pub depth: Option<u32>,
 }
 
 // ─── shared: doc map and paths ───
@@ -723,7 +731,7 @@ fn first_paragraph(store: &SqliteStore, doc_id: Uuid) -> Option<String> {
     None
 }
 
-pub fn orient(store: &SqliteStore, root: Option<Uuid>, max_tokens: usize) -> Result<String, String> {
+pub fn orient(store: &SqliteStore, root: Option<Uuid>, max_tokens: usize, depth: usize) -> Result<String, String> {
     let docs = DocMap::load(store);
     if let Some(r) = root {
         store.get_doc(r).map_err(|e| format!("root_doc_id: {e}"))?;
@@ -768,26 +776,33 @@ pub fn orient(store: &SqliteStore, root: Option<Uuid>, max_tokens: usize) -> Res
         }
         s
     };
-    let top = docs.children(root);
-    'tree: for (i, d) in top.iter().enumerate() {
-        if i >= ORIENT_CHILDREN_SHOWN {
-            b.line(&format!("- … +{} more", top.len() - i));
-            break;
-        }
-        if !b.line(&entry(d, "")) {
-            break;
-        }
-        let kids = docs.children(Some(d.id));
-        for (j, k) in kids.iter().enumerate() {
-            if j >= ORIENT_CHILDREN_SHOWN {
-                b.line(&format!("  - … +{} more", kids.len() - j));
+    // `depth` levels of children (absorbs the old `tree` tool); each level
+    // caps at ORIENT_CHILDREN_SHOWN siblings and the budget stops the walk.
+    fn walk(
+        b: &mut Budget,
+        docs: &DocMap,
+        entry: &dyn Fn(&Doc, &str) -> String,
+        parent: Option<Uuid>,
+        level: usize,
+        depth: usize,
+    ) -> bool {
+        let kids = docs.children(parent);
+        let indent = "  ".repeat(level);
+        for (i, d) in kids.iter().enumerate() {
+            if i >= ORIENT_CHILDREN_SHOWN {
+                b.line(&format!("{indent}- … +{} more", kids.len() - i));
                 break;
             }
-            if !b.line(&entry(k, "  ")) {
-                break 'tree;
+            if !b.line(&entry(d, &indent)) {
+                return false;
+            }
+            if level + 1 < depth && !walk(b, docs, entry, Some(d.id), level + 1, depth) {
+                return false;
             }
         }
+        true
     }
+    walk(&mut b, &docs, &entry, root, 0, depth.clamp(1, 12));
 
     // most linked (inbound doc→doc wikilinks resolved by title)
     let mut inbound: HashMap<Uuid, usize> = HashMap::new();
@@ -1045,7 +1060,7 @@ mod tests {
             doc(&mut s, tom, &format!("Leaf {i}"), Some(hub), &format!("---\ntags:\n  - leaf\n---\n\nLeaf {i} links to [[Hub]].\n"));
         }
         doc(&mut s, tom, "Outside", None, "Also links to [[Hub]] but is outside the root.\n");
-        let map = orient(&s, Some(root), 1500).unwrap();
+        let map = orient(&s, Some(root), 1500, 2).unwrap();
         assert!(map.starts_with("# Root — 7 docs"), "{map}");
         assert!(map.contains("- Hub · "), "{map}");
         assert!(map.contains("5 below"), "{map}");
@@ -1056,13 +1071,13 @@ mod tests {
         assert!(map.contains("## Tags (2)") && map.contains("leaf (5), core (1)"), "{map}");
         assert!(!map.contains("truncated"));
 
-        let small = orient(&s, Some(root), 100).unwrap();
+        let small = orient(&s, Some(root), 100, 2).unwrap();
         assert!(small.len() <= 100 * 4 + 1, "{}", small.len());
         assert!(small.contains("truncated"), "{small}");
 
-        let whole = orient(&s, None, 1500).unwrap();
+        let whole = orient(&s, None, 1500, 2).unwrap();
         assert!(whole.starts_with("# Corpus — 8 docs"), "{whole}");
         assert!(whole.contains("- Outside · "));
-        assert!(orient(&s, Some(Uuid::now_v7()), 1500).is_err());
+        assert!(orient(&s, Some(Uuid::now_v7()), 1500, 2).is_err());
     }
 }
