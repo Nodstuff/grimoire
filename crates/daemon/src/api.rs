@@ -1619,7 +1619,8 @@ pub fn router(state: ApiState) -> Router {
         .with_state(state.clone())
         // the briefing home (last-visit stamp, new docs since) and quick capture
         .merge(crate::home::router(state.clone()))
-        .merge(crate::inbox::router(state))
+        .merge(crate::inbox::router(state.clone()))
+        .merge(crate::todo::router(state))
 }
 
 #[cfg(test)]
