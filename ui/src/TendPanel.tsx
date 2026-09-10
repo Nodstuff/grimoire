@@ -11,7 +11,7 @@ import { notify } from './Notice'
 interface Tending {
   id: string
   name: string
-  kind: 'scribe' | 'keeper' | 'auditor' | 'tagging' | 'reviewer'
+  kind: 'scribe' | 'keeper' | 'auditor' | 'tagging' | 'reviewer' | 'filer'
   scope_doc: string | null
   scope_title: string
   inherited: boolean
@@ -26,6 +26,7 @@ const KIND_INFO: Record<string, string> = {
   scribe: 'writes the missing docs from the sources, imitating your style exemplars',
   keeper: 'keeps these docs true to the sources — drift becomes reviewable fixes',
   auditor: 'sweeps for stale or wrong claims — verified fixes apply, suspicions park',
+  filer: 'empties the Inbox — each note gets a folder, a title and tags, all reviewable',
 }
 
 function bindingsOf(t: Tending): { repos: string[]; style_docs: string[] } {

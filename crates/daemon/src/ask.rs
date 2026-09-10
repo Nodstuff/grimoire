@@ -313,8 +313,11 @@ pub async fn ask(
     }
     let synthesise = crate::garden::claude_bin().is_some();
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // the question rides in frontmatter so the refresher (living.rs) can
+    // re-ask it verbatim; the editor hides `---` blocks
     let md = format!(
-        "# {q}\n\n{synth}{receipts}---\n\n*Asked {date} · {n} block{s} across {d} doc{ds}.*\n",
+        "{fm}\n\n# {q}\n\n{synth}{receipts}---\n\n*Asked {date} · {n} block{s} across {d} doc{ds}.*\n",
+        fm = crate::living::question_frontmatter(&question),
         q = question,
         synth = if synthesise { format!("{SYNTH_PLACEHOLDER}\n\n") } else { String::new() },
         receipts = receipts_markdown(&excerpts),
@@ -324,6 +327,8 @@ pub async fn ask(
         ds = if docs.len() == 1 { "" } else { "s" },
     );
     let title = title_for(&question);
+    // what the answer rests on, at the epochs it was read (living answers)
+    let cited: Vec<(Uuid, i64)> = excerpts.iter().map(|h| (h.block.id, h.block.epoch)).collect();
     let (doc_id, agent) = {
         let title = title.clone();
         with_store(&store, move |s| -> Result<(Uuid, Uuid), String> {
@@ -339,6 +344,9 @@ pub async fn ask(
                 grimoire_store::ConfidencePolicy::Gate,
             )
             .map_err(|e| e.to_string())?;
+            if let Err(e) = s.record_answer_sources(doc_id, &cited) {
+                tracing::warn!(%doc_id, "answer sources not recorded: {e}");
+            }
             Ok((doc_id, agent))
         })
         .await?

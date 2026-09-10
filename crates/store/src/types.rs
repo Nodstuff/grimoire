@@ -473,6 +473,9 @@ pub enum GardenerKind {
     /// Keeps its scope true to its bound sources: proposes updates as
     /// reviewable yellows when the repo and the docs disagree. SCOPED ONLY.
     Keeper,
+    /// Files notes captured under the `Inbox` root: proposes a destination
+    /// folder, a better title and tags, each as a reviewable yellow. Global.
+    Filer,
 }
 
 impl GardenerKind {
@@ -483,6 +486,7 @@ impl GardenerKind {
             GardenerKind::Auditor => "auditor",
             GardenerKind::Scribe => "scribe",
             GardenerKind::Keeper => "keeper",
+            GardenerKind::Filer => "filer",
         }
     }
 
@@ -502,6 +506,7 @@ impl GardenerKind {
             "auditor" => Some(GardenerKind::Auditor),
             "scribe" => Some(GardenerKind::Scribe),
             "keeper" => Some(GardenerKind::Keeper),
+            "filer" => Some(GardenerKind::Filer),
             _ => None,
         }
     }
@@ -521,6 +526,31 @@ pub struct Gardener {
     pub schedule: String,
     pub confidence_policy: ConfidencePolicy,
     pub enabled: bool,
+}
+
+/// One cited block of an ask-the-vault answer, with where it stands now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnswerSource {
+    pub block_id: Uuid,
+    pub epoch_at_answer: i64,
+    pub recorded_at: String,
+    /// The block's epoch today; None when the row is gone entirely.
+    pub current_epoch: Option<i64>,
+    /// Tombstoned or missing.
+    pub gone: bool,
+    pub doc_title: Option<String>,
+    /// `gone` or edited since the answer read it.
+    pub changed: bool,
+}
+
+/// One row of the freshness list (`GET /api/freshness`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FreshnessRow {
+    pub id: Uuid,
+    pub title: String,
+    pub verified_at: Option<String>,
+    pub last_edited: String,
+    pub tended: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

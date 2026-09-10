@@ -27,6 +27,17 @@ pub fn rename(
     title: &str,
     principal: Uuid,
 ) -> Result<ProposeOutcome, String> {
+    rename_with_refs(store, doc_id, title, principal, src("rename_doc"))
+}
+
+/// `rename` with caller-chosen provenance (the filer's `filer: <reason>`).
+pub fn rename_with_refs(
+    store: &mut SqliteStore,
+    doc_id: Uuid,
+    title: &str,
+    principal: Uuid,
+    source_refs: Vec<String>,
+) -> Result<ProposeOutcome, String> {
     if let Some(e) = refuse_if_mirror(store, doc_id, "renaming") {
         return Err(e);
     }
@@ -38,7 +49,7 @@ pub fn rename(
                 title: title.to_string(),
                 from_title: String::new(),
             },
-            src("rename_doc"),
+            source_refs,
         )
         .map_err(|e| e.to_string())
 }
@@ -51,6 +62,18 @@ pub fn move_doc(
     new_parent: Option<Uuid>,
     after: Option<Uuid>,
     principal: Uuid,
+) -> Result<ProposeOutcome, String> {
+    move_doc_with_refs(store, doc_id, new_parent, after, principal, src("move_doc"))
+}
+
+/// `move_doc` with caller-chosen provenance (the filer's `filer: <reason>`).
+pub fn move_doc_with_refs(
+    store: &mut SqliteStore,
+    doc_id: Uuid,
+    new_parent: Option<Uuid>,
+    after: Option<Uuid>,
+    principal: Uuid,
+    source_refs: Vec<String>,
 ) -> Result<ProposeOutcome, String> {
     if let Some(e) = refuse_move(store, doc_id, new_parent) {
         return Err(e);
@@ -92,7 +115,7 @@ pub fn move_doc(
                 from_sort_key: None,
                 from_parent_title: None,
             },
-            src("move_doc"),
+            source_refs,
         )
         .map_err(|e| e.to_string())
 }

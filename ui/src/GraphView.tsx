@@ -25,6 +25,7 @@ const TENDER_COLORS: Record<string, string> = {
   claude: '#95c99b',
   tagging: '#d9b47a',
   reviewer: '#d98a94',
+  filer: '#8fbcbb',
 }
 
 function colorFor(tender: string | null): string {

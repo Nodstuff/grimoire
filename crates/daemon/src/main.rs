@@ -11,9 +11,12 @@ mod children;
 mod docops;
 mod embed;
 mod fed;
+mod filer;
+mod freshness;
 mod garden;
 mod hot;
 mod identity;
+mod living;
 mod local_guard;
 mod yrender;
 mod mcp;
@@ -900,6 +903,8 @@ async fn main() -> anyhow::Result<()> {
                     None
                 }
             };
+            // the living-answers refresher retrieves the way a fresh ask does
+            living::set_embedder(embedder.clone());
             let fed_ctx_node_id: Option<String>;
             // one idempotency cache for MCP and HTTP proposes (request_id)
             let dedupe = mcp::new_dedupe();
