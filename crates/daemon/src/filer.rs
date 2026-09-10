@@ -66,7 +66,7 @@ pub fn inbox_children(store: &SqliteStore, inbox: Uuid, limit: usize) -> Vec<Doc
         .into_iter()
         .filter(|d| d.parent_id == Some(inbox))
         .collect();
-    kids.sort_by(|a, b| a.id.cmp(&b.id));
+    kids.sort_by_key(|d| d.id);
     kids.truncate(limit);
     kids
 }
@@ -263,7 +263,7 @@ pub async fn run(
     let composed = {
         let g = g.clone();
         with_store(&store, move |s| {
-            let Some(inbox) = inbox_id(s) else { return None };
+            let inbox = inbox_id(s)?;
             let (prompt, notes) = compose(s, &g, inbox);
             Some((inbox, prompt, notes))
         })

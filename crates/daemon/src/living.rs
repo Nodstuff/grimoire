@@ -469,18 +469,19 @@ mod tests {
         let lines = refresh_sweep(store.clone(), hot.clone(), None).await;
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("1 of"), "{lines:?}");
-        let s = store.lock().unwrap();
-        let st = status(&s, doc);
-        assert_eq!(st.changed, 0, "sources re-recorded at their new epochs");
-        assert!(s.answer_sources(doc).unwrap().iter().any(|x| x.block_id == excerpts[0].block.id));
-        let md = grimoire_store::export::export_doc(&*s, doc).unwrap();
-        assert!(md.contains("expires fast"), "new receipt text landed: {md}");
-        assert!(!md.contains(crate::ask::SYNTH_PLACEHOLDER), "no placeholder without a synthesis");
-        let q = s.review_queue(Some(doc)).unwrap();
-        assert!(!q.is_empty(), "the refresh is reviewable");
-        assert!(q.iter().all(|i| i.op.source_refs.iter().any(|r| r.starts_with("living-answer: refreshed, 1 of"))));
+        {
+            let s = store.lock().unwrap();
+            let st = status(&s, doc);
+            assert_eq!(st.changed, 0, "sources re-recorded at their new epochs");
+            assert!(s.answer_sources(doc).unwrap().iter().any(|x| x.block_id == excerpts[0].block.id));
+            let md = grimoire_store::export::export_doc(&*s, doc).unwrap();
+            assert!(md.contains("expires fast"), "new receipt text landed: {md}");
+            assert!(!md.contains(crate::ask::SYNTH_PLACEHOLDER), "no placeholder without a synthesis");
+            let q = s.review_queue(Some(doc)).unwrap();
+            assert!(!q.is_empty(), "the refresh is reviewable");
+            assert!(q.iter().all(|i| i.op.source_refs.iter().any(|r| r.starts_with("living-answer: refreshed, 1 of"))));
+        }
         // a live session defers the doc
-        drop(s);
         {
             let mut s = store.lock().unwrap();
             let src = excerpts[0].block.doc_id;
