@@ -6,15 +6,18 @@ import Gardeners from './Gardeners'
 import Sharing from './Sharing'
 import SharePanel from './SharePanel'
 import PaletteShell from './PaletteShell'
-import Profile, { FirstRunName, loadProfile, copyText } from './Profile'
+import Profile, { FirstRunName, loadProfile } from './Profile'
 import Trash from './Trash'
 import ImportFolder from './ImportFolder'
 import ReviewRail from './ReviewRail'
 import DocTreePanel from './DocTree'
 import { notify, errText, Notices } from './Notice'
-import { CAPTURE_EVENT, backupFileName, inTauri, onShellEvent, saveDialog } from './tauri'
+import { CAPTURE_EVENT, onShellEvent } from './tauri'
 import Home from './Home'
 import Capture from './Capture'
+import Omnibox from './Omnibox'
+import { buildCommands } from './commands'
+import { loadRecentIds, pushRecentId, storeRecentIds, type OmniMode } from './omni'
 
 // heavy views load on first use: xyflow + html-to-image (canvas) and
 // force-graph (graph) are not part of the boot bundle
@@ -67,7 +70,9 @@ type View =
   | { kind: 'profile' }
   | { kind: 'trash' }
   | { kind: 'home' }
-type Palette = null | 'commands' | 'open' | 'search' | 'newdoc' | 'newcanvas' | 'help' | 'ask' | 'capture'
+/** `omnibox` is the one search-and-command palette (⌘K / ⌘O / ⌘P / ⌘/ all
+ * open it, in different modes — see `omniMode`). */
+type Palette = null | 'omnibox' | 'newdoc' | 'newcanvas' | 'help' | 'capture'
 
 /** How a doc is opened: `anchor` is a [[Doc#fragment]] target (`^uuid` for a
  * block); `review` opens the in-editor review rail; `blockId` scrolls to that
@@ -124,6 +129,15 @@ export default function App() {
   const [docs, setDocs] = useState<Doc[]>([])
   const [treeOpen, setTreeOpen] = useState(false)
   const [palette, setPalette] = useState<Palette>(null)
+  // which groups the omnibox leads with: ⌘K mixed, ⌘O docs, ⌘P content, ⌘/ ask
+  const [omniMode, setOmniMode] = useState<OmniMode>('mixed')
+  const omniModeRef = useRef<OmniMode>('mixed')
+  const openOmnibox = useCallback((mode: OmniMode) => {
+    setOmniMode(mode)
+    // the same key again closes it; a different alias just switches mode
+    setPalette((p) => (p === 'omnibox' && mode === omniModeRef.current ? null : 'omnibox'))
+    omniModeRef.current = mode
+  }, [])
   const [queueCount, setQueueCount] = useState(0)
   // invites v2: open share requests ride the same header chip
   const [offerCount, setOfferCount] = useState(0)
@@ -293,10 +307,10 @@ export default function App() {
       e.preventDefault()
       switch (action) {
         case 'commands':
-          setPalette((p) => (p === 'commands' ? null : 'commands'))
+          openOmnibox('mixed')
           break
         case 'open':
-          setPalette((p) => (p === 'open' ? null : 'open'))
+          openOmnibox('docs')
           break
         case 'search':
           // ⌘S while writing means "save" to every editor user: the doc
@@ -305,10 +319,10 @@ export default function App() {
             notify('autosaved', 'ok', { ttlMs: 1500 })
             break
           }
-          setPalette((p) => (p === 'search' ? null : 'search'))
+          openOmnibox('content')
           break
         case 'ask':
-          setPalette((p) => (p === 'ask' ? null : 'ask'))
+          openOmnibox('ask')
           break
         case 'capture':
           setPalette((p) => (p === 'capture' ? null : 'capture'))
@@ -344,7 +358,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [goBack, goForward, setView])
+  }, [goBack, goForward, setView, openOmnibox])
 
   const openDoc = useCallback<OpenDoc>(
     (id, opts) => {
@@ -353,10 +367,37 @@ export default function App() {
       setReviewIntent(!!o.review)
       setView({ kind: 'doc', id })
       setPalette(null)
+      // the omnibox's empty-query list
+      storeRecentIds(pushRecentId(loadRecentIds(), id))
     },
     [setView],
   )
   openDocRef.current = openDoc
+
+  // the ⌘K command list (data for the omnibox's Commands group)
+  const commands = useMemo(
+    () =>
+      buildCommands({
+        queueCount,
+        docId: view.kind === 'doc' ? view.id : null,
+        onAction: (a) => {
+          if (a === 'review') setView({ kind: 'review' })
+          if (a === 'runs') setView({ kind: 'runs' })
+          if (a === 'graph') setView({ kind: 'graph' })
+          if (a === 'sharing') setView({ kind: 'sharing' })
+          if (a === 'profile') setView({ kind: 'profile' })
+          if (a === 'trash') setView({ kind: 'trash' })
+          if (a === 'home') setView({ kind: 'home' })
+          if (a === 'tree') setTreeOpen((t) => !t)
+          if (a === 'capture' || a === 'newdoc' || a === 'newcanvas') {
+            setPalette(a)
+            return
+          }
+          setPalette(null)
+        },
+      }),
+    [queueCount, view, setView],
+  )
 
   // canvas nodes fire wikilink clicks as events (CanvasBlock has no doc list)
   useEffect(() => {
@@ -506,46 +547,16 @@ export default function App() {
         </button>
       )}
 
-      {palette === 'commands' && (
-        <CommandPalette
-          queueCount={queueCount}
-          docId={view.kind === 'doc' ? view.id : null}
-          onAction={(a) => {
-            if (a === 'review') setView({ kind: 'review' })
-            if (a === 'runs') setView({ kind: 'runs' })
-            if (a === 'graph') setView({ kind: 'graph' })
-            if (a === 'sharing') setView({ kind: 'sharing' })
-            if (a === 'profile') setView({ kind: 'profile' })
-            if (a === 'trash') setView({ kind: 'trash' })
-            if (a === 'ask') {
-              setPalette('ask')
-              return
-            }
-            if (a === 'capture') {
-              setPalette('capture')
-              return
-            }
-            if (a === 'tree') setTreeOpen((t) => !t)
-            if (a === 'home') setView({ kind: 'home' })
-            if (a === 'newdoc') {
-              setPalette('newdoc')
-              return
-            }
-            if (a === 'newcanvas') {
-              setPalette('newcanvas')
-              return
-            }
-            setPalette(null)
-          }}
+      {palette === 'omnibox' && (
+        <Omnibox
+          mode={omniMode}
+          docs={docs}
+          commands={commands}
+          onOpenDoc={openDoc}
           onClose={() => setPalette(null)}
         />
       )}
-      {palette === 'open' && (
-        <OpenDocPalette docs={docs} onOpenDoc={openDoc} onClose={() => setPalette(null)} />
-      )}
-      {palette === 'search' && <SearchPalette onOpenDoc={openDoc} onClose={() => setPalette(null)} />}
       {palette === 'help' && <ShortcutHelp onClose={() => setPalette(null)} />}
-      {palette === 'ask' && <AskPalette onOpenDoc={openDoc} onClose={() => setPalette(null)} />}
       {palette === 'capture' && (
         <Capture
           onClose={() => setPalette(null)}
@@ -578,10 +589,10 @@ function ShortcutHelp({ onClose }: { onClose: () => void }) {
     [
       'Navigate',
       [
-        ['⌘K', 'commands'],
-        ['⌘O', 'open a doc'],
-        ['⌘P', 'search (⌘F too; ⌘S in an editor just confirms autosave)'],
-        ['⌘/', 'ask the vault — an answer doc with block citations'],
+        ['⌘K', 'omnibox — docs, content, commands and ask in one box (> commands · ? ask)'],
+        ['⌘O', 'omnibox, docs first (recent when empty)'],
+        ['⌘P', 'omnibox, content search (⌘F too; ⌘S in an editor just confirms autosave)'],
+        ['⌘/', 'omnibox, ask the vault — an answer doc with block citations (⌘↵ asks from any row)'],
         ['⌘T', 'toggle file tree'],
         ['⌘W', 'home'],
         ['⌘[ / ⌘]', 'history back / forward'],
@@ -631,384 +642,6 @@ function ShortcutHelp({ onClose }: { onClose: () => void }) {
             ))}
           </div>
         ))}
-      </div>
-    </PaletteShell>
-  )
-}
-
-function CommandPalette({
-  queueCount,
-  docId,
-  onAction,
-  onClose,
-}: {
-  queueCount: number
-  /** the open doc, if any — enables the per-doc commands */
-  docId: string | null
-  onAction: (
-    a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph' | 'sharing' | 'profile' | 'trash' | 'close' | 'ask' | 'capture',
-  ) => void
-  onClose: () => void
-}) {
-  const [q, setQ] = useState('')
-  const [sel, setSel] = useState(0)
-  const inputRef = useRef<HTMLInputElement>(null)
-  useEffect(() => inputRef.current?.focus(), [])
-
-  type Item = { label: string; hint?: string; run: () => void }
-  const commands: Item[] = [
-    { label: `Review queue`, hint: '⌘⇧R', run: () => onAction('review') },
-    { label: 'New doc…', hint: '⌘N', run: () => onAction('newdoc') },
-    { label: 'New canvas…', hint: '⌘⇧N', run: () => onAction('newcanvas') },
-    { label: 'Gardeners', hint: '⌘G', run: () => onAction('runs') },
-    { label: 'Shares & contacts', run: () => onAction('sharing') },
-    { label: 'Profile', hint: 'your name, node id, fingerprint', run: () => onAction('profile') },
-    { label: 'Graph view', run: () => onAction('graph') },
-    { label: 'Ask the vault…', hint: '⌘/ — an answer with citations', run: () => onAction('ask') },
-    { label: 'Quick capture…', hint: '⌘⇧I — a note straight into Inbox', run: () => onAction('capture') },
-    { label: 'Trash', hint: 'restore deleted docs', run: () => onAction('trash') },
-    {
-      label: 'Import a folder of Markdown…',
-      hint: 'files become docs, folders become sections',
-      run: () => {
-        onAction('close')
-        document.getElementById('import-folder-input')?.click()
-      },
-    },
-    {
-      label: 'Sync Claude Code memory now',
-      hint: '~/.claude/projects/*/memory → Claude Memory (also runs every 10 min)',
-      run: () => {
-        onAction('close')
-        api<{ files: number; imported: number; updated: number; unchanged: number; projects: number }>('/api/memory/sync', { method: 'POST' })
-          .then((r) =>
-            notify(
-              `memory: ${r.files} files across ${r.projects} projects — ${r.imported} imported, ${r.updated} updated (in review), ${r.unchanged} unchanged`,
-              'ok',
-              { ttlMs: 10_000 },
-            ),
-          )
-          .catch((e) => notify(errText(e)))
-      },
-    },
-    ...(docId
-      ? [
-          {
-            label: 'Export this doc as Markdown…',
-            hint: 'one .md file in ~/Downloads — for Slack, email, anywhere',
-            run: () => {
-              onAction('close')
-              api<{ path: string }>(`/api/doc/${docId}/export`, { method: 'POST' })
-                .then((r) => notify(`saved ${r.path}`, 'ok', { ttlMs: 12_000 }))
-                .catch((e) => notify(errText(e)))
-            },
-          },
-          {
-            label: 'Copy this doc as Markdown',
-            hint: 'to the clipboard',
-            run: () => {
-              onAction('close')
-              api<{ markdown: string }>(`/api/doc/${docId}/markdown`)
-                .then((r) => copyText(r.markdown))
-                .then(() => notify('copied as Markdown', 'ok'))
-                .catch((e) => notify(errText(e)))
-            },
-          },
-        ]
-      : []),
-    {
-      label: 'Export all docs as Markdown…',
-      hint: 'a folder in ~/Downloads',
-      run: () => {
-        onAction('close')
-        api<{ path: string; files: number }>('/api/export_vault', { method: 'POST' })
-          .then((r) => notify(`exported ${r.files} files to ${r.path}`, 'ok', { ttlMs: 12_000 }))
-          .catch((e) => notify(errText(e)))
-      },
-    },
-    {
-      label: 'Back up database now',
-      hint: 'daily snapshot, kept beside your notes',
-      run: () => {
-        onAction('close')
-        api<{ path: string; bytes: number }>('/api/backups', { method: 'POST' })
-          .then((r) => notify(`backup written: ${r.path} (${(r.bytes / 1_048_576).toFixed(1)} MB)`, 'ok', { ttlMs: 12_000 }))
-          .catch((e) => notify(errText(e)))
-      },
-    },
-    // a native Save sheet needs the app; in a browser tab the row is absent
-    ...(inTauri()
-      ? [
-          {
-            label: 'Back up database to…',
-            hint: 'one self-contained file wherever you choose — a USB stick, iCloud Drive, a sync folder',
-            run: () => {
-              onAction('close')
-              saveDialog({
-                title: 'Back up Grimoire database',
-                defaultPath: backupFileName(),
-                filters: [{ name: 'SQLite database', extensions: ['db'] }],
-              })
-                .then((to) => {
-                  if (!to) return
-                  return api<{ path: string; bytes: number }>('/api/backups', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ to }),
-                  }).then((r) => notify(`backup written: ${r.path} (${(r.bytes / 1_048_576).toFixed(1)} MB)`, 'ok', { ttlMs: 12_000 }))
-                })
-                .catch((e) => notify(errText(e)))
-            },
-          },
-        ]
-      : []),
-    {
-      label: 'Show backups in Finder',
-      hint: '~/.grimoire/backups — the folder to point Time Machine or a sync tool at',
-      run: () => {
-        onAction('close')
-        api<{ dir: string }>('/api/backups/reveal', { method: 'POST' }).catch((e) => notify(errText(e)))
-      },
-    },
-    { label: 'Toggle file tree', hint: '⌘T', run: () => onAction('tree') },
-    { label: 'Home', hint: '⌘W — the briefing', run: () => onAction('home') },
-  ]
-
-  // ⌘K is operations only — docs live under ⌘O. Filter the commands, and
-  // surface the live review count as a hint on that row.
-  const items: Item[] = useMemo(() => {
-    const needle = q.trim().toLowerCase()
-    return commands
-      .map((c) =>
-        c.label === 'Review queue'
-          ? { ...c, hint: queueCount ? `${queueCount} open` : c.hint }
-          : c,
-      )
-      .filter((c) => !needle || c.label.toLowerCase().includes(needle))
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, queueCount])
-
-  useEffect(() => setSel(0), [q])
-
-  return (
-    <PaletteShell onClose={onClose}>
-      <input
-        ref={inputRef}
-        placeholder="Type a command…"
-        value={q}
-        onChange={(e) => setQ(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'ArrowDown') setSel((s) => Math.min(s + 1, items.length - 1))
-          if (e.key === 'ArrowUp') setSel((s) => Math.max(s - 1, 0))
-          if (e.key === 'Enter') items[sel]?.run()
-        }}
-      />
-      <div className="palette-list">
-        {items.map((it, i) => (
-          <div
-            key={it.label + i}
-            className={`palette-item ${i === sel ? 'sel' : ''}`}
-            onMouseEnter={() => setSel(i)}
-            onClick={() => it.run()}
-          >
-            <span>{it.label}</span>
-            {it.hint && <span className="hint">{it.hint}</span>}
-          </div>
-        ))}
-      </div>
-    </PaletteShell>
-  )
-}
-
-/** ⌘O — open a doc by title. Fuzzy over doc TITLES only (operations live under
- * ⌘K, block-content search under ⌘P). */
-function OpenDocPalette({
-  docs,
-  onOpenDoc,
-  onClose,
-}: {
-  docs: Doc[]
-  onOpenDoc: (id: string) => void
-  onClose: () => void
-}) {
-  const [q, setQ] = useState('')
-  const [sel, setSel] = useState(0)
-  const inputRef = useRef<HTMLInputElement>(null)
-  useEffect(() => inputRef.current?.focus(), [])
-
-  const hits = useMemo(() => {
-    const needle = q.trim().toLowerCase()
-    const matched = needle
-      ? docs.filter((d) => fuzzyMatch(needle, d.title.toLowerCase()))
-      : docs
-    return matched.slice(0, 12)
-  }, [q, docs])
-
-  useEffect(() => setSel(0), [q])
-
-  return (
-    <PaletteShell onClose={onClose}>
-      <input
-        ref={inputRef}
-        placeholder="Open a doc…"
-        value={q}
-        onChange={(e) => setQ(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'ArrowDown') setSel((s) => Math.min(s + 1, hits.length - 1))
-          if (e.key === 'ArrowUp') setSel((s) => Math.max(s - 1, 0))
-          if (e.key === 'Enter' && hits[sel]) onOpenDoc(hits[sel].id)
-        }}
-      />
-      <div className="palette-list">
-        {hits.map((d, i) => (
-          <div
-            key={d.id}
-            className={`palette-item ${i === sel ? 'sel' : ''}`}
-            onMouseEnter={() => setSel(i)}
-            onClick={() => onOpenDoc(d.id)}
-          >
-            <span>{d.is_canvas ? `▨ ${d.title}` : d.title}</span>
-            <span className="hint">{d.is_canvas ? 'canvas' : 'doc'}</span>
-          </div>
-        ))}
-        {docs.length === 0 && <div className="palette-empty">no docs yet — ⌘N creates one</div>}
-      </div>
-    </PaletteShell>
-  )
-}
-
-/** Ask the vault (⌘/): a question becomes an answer doc under Answers whose
- * every claim links [[Doc#^block]]. One round trip; the palette waits. */
-function AskPalette({ onOpenDoc, onClose }: { onOpenDoc: OpenDoc; onClose: () => void }) {
-  const [q, setQ] = useState('')
-  const [busy, setBusy] = useState(false)
-  const inputRef = useRef<HTMLInputElement>(null)
-  useEffect(() => inputRef.current?.focus(), [])
-  const submit = async () => {
-    const question = q.trim()
-    if (!question || busy) return
-    setBusy(true)
-    try {
-      const a = await api<{ doc_id: string | null; title: string; sources: number; docs: number }>('/api/ask', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question }),
-      })
-      if (!a.doc_id) {
-        notify('nothing in your notes matches that yet', 'warn')
-        setBusy(false)
-        return
-      }
-      notify(`answered from ${a.sources} block${a.sources === 1 ? '' : 's'} across ${a.docs} doc${a.docs === 1 ? '' : 's'}`, 'ok')
-      onOpenDoc(a.doc_id)
-    } catch (e) {
-      notify(errText(e))
-      setBusy(false)
-    }
-  }
-  return (
-    <PaletteShell onClose={onClose} locked={busy}>
-      <input
-        ref={inputRef}
-        placeholder="Ask your notes a question… every claim in the answer cites the block it came from"
-        value={q}
-        disabled={busy}
-        onChange={(e) => setQ(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') {
-            e.preventDefault()
-            submit()
-          }
-        }}
-      />
-      <div className="palette-list">
-        <div className="palette-empty">
-          {busy ? '🌿 reading your notes and writing the answer… (up to a minute)' : 'Enter to ask · the answer lands as a doc under Answers'}
-        </div>
-      </div>
-    </PaletteShell>
-  )
-}
-
-function fuzzyMatch(needle: string, hay: string): boolean {
-  let i = 0
-  for (const c of hay) {
-    if (c === needle[i]) i++
-    if (i === needle.length) return true
-  }
-  return false
-}
-
-/** rows rendered in the search palette; arrow keys clamp to these */
-const PALETTE_MAX = 12
-
-function SearchPalette({
-  onOpenDoc,
-  onClose,
-}: {
-  onOpenDoc: (id: string) => void
-  onClose: () => void
-}) {
-  const [q, setQ] = useState('')
-  const [hits, setHits] = useState<SearchHit[]>([])
-  const [sel, setSel] = useState(0)
-  const inputRef = useRef<HTMLInputElement>(null)
-  useEffect(() => inputRef.current?.focus(), [])
-
-  useEffect(() => {
-    if (q.trim().length < 2) {
-      setHits([])
-      return
-    }
-    // latest wins: a slow response for an older query must not overwrite
-    // the hits for what is in the box now
-    let stale = false
-    const t = setTimeout(() => {
-      api<SearchHit[]>(`/api/search?q=${encodeURIComponent(q)}`)
-        .then((hs) => {
-          if (!stale) setHits(hs)
-        })
-        .catch(() => {
-          if (!stale) setHits([])
-        })
-    }, 120)
-    return () => {
-      stale = true
-      clearTimeout(t)
-    }
-  }, [q])
-
-  useEffect(() => setSel(0), [hits])
-  const shown = hits.slice(0, PALETTE_MAX)
-
-  return (
-    <PaletteShell onClose={onClose}>
-      <input
-        ref={inputRef}
-        placeholder="Search everything… (typos fine)"
-        value={q}
-        onChange={(e) => setQ(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'ArrowDown') setSel((s) => Math.min(s + 1, shown.length - 1))
-          if (e.key === 'ArrowUp') setSel((s) => Math.max(s - 1, 0))
-          if (e.key === 'Enter' && shown[sel]) onOpenDoc(shown[sel].block.doc_id)
-        }}
-      />
-      <div className="palette-list">
-        {shown.map((h, i) => (
-          <div
-            key={h.block.id}
-            className={`palette-item ${i === sel ? 'sel' : ''}`}
-            onMouseEnter={() => setSel(i)}
-            onClick={() => onOpenDoc(h.block.doc_id)}
-          >
-            <div className="hit-body">
-              <span className="hit-doc">{h.doc_title}</span>
-              <span className="hit-text">{h.block.content.slice(0, 110)}</span>
-            </div>
-          </div>
-        ))}
-        {q.length >= 2 && hits.length === 0 && <div className="palette-empty">no hits</div>}
       </div>
     </PaletteShell>
   )

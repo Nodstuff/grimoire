@@ -1538,6 +1538,19 @@ kbd {
 .home-leftover { color: var(--fg-dim); font-size: 13px; padding-left: 12px; }
 .home-brief .home-hints { justify-content: flex-start; margin-top: 24px; color: var(--fg-dim); }
 
+/* ---------- omnibox (Omnibox.tsx): group labels inside the palette list ---------- */
+
+.omni-group {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  padding: 8px 12px 2px;
+}
+.omni-list .palette-item .hit-body > span:first-child { color: var(--fg); }
+.omni-ask em { font-style: normal; color: var(--accent); }
+
 /* ---------- quick capture (Capture.tsx) ---------- */
 
 .capture { display: flex; flex-direction: column; }
