@@ -1613,7 +1613,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/graph", get(graph))
         .route("/api/render/d2", post(render_d2))
         .route("/api/export", post(export_file))
-        .with_state(state)
+        .with_state(state.clone())
+        // the briefing home (last-visit stamp, new docs since) and quick capture
+        .merge(crate::home::router(state.clone()))
+        .merge(crate::inbox::router(state))
 }
 
 #[cfg(test)]
