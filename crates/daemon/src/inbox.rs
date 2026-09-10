@@ -3,11 +3,15 @@
 //! ⌘⇧I palette, the ⌥⌘G global hotkey, or a curl). The doc is titled from
 //! the first line, carries the whole text as its body and is tagged `inbox`
 //! in frontmatter so the filing gardener can find it later.
+//!
+//! `GET /api/inbox` → `{doc_id, items:[{id, title, created_at}]}`: what is
+//! waiting to be filed (the Inbox root's direct children, newest first;
+//! creation time from the UUIDv7). No Inbox yet → `doc_id: null, items: []`.
 
 use crate::api::ApiState;
 use crate::store_ext::with_store;
 use axum::extract::State;
-use axum::routing::post;
+use axum::routing::get;
 use axum::{Json, Router};
 use grimoire_store::{BlockStore, Doc, SqliteStore};
 use serde::Deserialize;
@@ -97,8 +101,37 @@ async fn capture(State(st): State<ApiState>, Json(req): Json<CaptureReq>) -> Jso
     .await
 }
 
+async fn list(State(st): State<ApiState>) -> Json<Value> {
+    with_store(&st.store, move |s| {
+        let docs = match s.list_docs() {
+            Ok(d) => d,
+            Err(e) => return Json(json!({"error": e.to_string()})),
+        };
+        let Some(inbox) = docs.iter().find(|d| d.parent_id.is_none() && d.title == INBOX_TITLE) else {
+            return Json(json!({"doc_id": null, "items": []}));
+        };
+        let mut rows: Vec<(i64, Value)> = docs
+            .iter()
+            .filter(|d| d.parent_id == Some(inbox.id))
+            .map(|d| {
+                let ms = crate::home::uuid_v7_millis(d.id).unwrap_or(0);
+                let created_at = chrono::DateTime::from_timestamp_millis(ms)
+                    .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                    .unwrap_or_default();
+                (ms, json!({"id": d.id, "title": d.title, "created_at": created_at}))
+            })
+            .collect();
+        // list order is creation order; reversing first makes the stable
+        // sort keep same-millisecond captures newest-first too
+        rows.reverse();
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        Json(json!({"doc_id": inbox.id, "items": rows.into_iter().map(|r| r.1).collect::<Vec<_>>()}))
+    })
+    .await
+}
+
 pub fn router(state: ApiState) -> Router {
-    Router::new().route("/api/inbox", post(capture)).with_state(state)
+    Router::new().route("/api/inbox", get(list).post(capture)).with_state(state)
 }
 
 #[cfg(test)]
@@ -159,6 +192,25 @@ mod tests {
         // empty text is refused
         let e = call(&app, "POST", "/api/inbox", Some(json!({"text": "  \n"}))).await;
         assert!(e["error"].is_string());
+        // the listing: newest first, the Inbox's own id
+        let l = call(&app, "GET", "/api/inbox", None).await;
+        assert_eq!(l["doc_id"], inbox_id, "{l}");
+        let items = l["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["title"], "second thought");
+        assert_eq!(items[1]["title"], "call the bank");
+        assert!(items[0]["created_at"].as_str().unwrap() >= items[1]["created_at"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn listing_without_an_inbox_is_empty_and_creates_nothing() {
+        use crate::home::testing::{app, call};
+        let (app, _) = app();
+        let l = call(&app, "GET", "/api/inbox", None).await;
+        assert!(l["doc_id"].is_null());
+        assert_eq!(l["items"].as_array().unwrap().len(), 0);
+        let docs = call(&app, "GET", "/api/docs", None).await;
+        assert_eq!(docs.as_array().unwrap().len(), 0);
     }
 
     #[test]

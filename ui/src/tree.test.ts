@@ -9,8 +9,28 @@ import {
   groupRoot,
   loadTreeState,
   saveTreeState,
+  staleness,
+  stalenessTitle,
   TREE_STATE_KEY,
 } from './tree'
+
+describe('staleness', () => {
+  const now = Date.parse('2026-09-10T12:00:00Z')
+  const ago = (days: number) => new Date(now - days * 86_400_000).toISOString()
+  it('never / stale past the threshold / fresh within it', () => {
+    expect(staleness(null, now)).toEqual({ kind: 'never' })
+    expect(staleness('garbage', now)).toEqual({ kind: 'never' })
+    expect(staleness(ago(41), now)).toEqual({ kind: 'stale', days: 41 })
+    expect(staleness(ago(30), now)).toEqual({ kind: 'fresh' })
+    expect(staleness(ago(2), now)).toEqual({ kind: 'fresh' })
+    expect(staleness(ago(8), now, 7)).toEqual({ kind: 'stale', days: 8 })
+  })
+  it('tooltips', () => {
+    expect(stalenessTitle({ kind: 'never' })).toBe('never verified')
+    expect(stalenessTitle({ kind: 'stale', days: 41 })).toBe('verified 41d ago')
+    expect(stalenessTitle({ kind: 'fresh' })).toBe('')
+  })
+})
 
 function doc(id: string, title: string, parent: string | null = null, extra: Partial<Doc> = {}): Doc {
   return {

@@ -5,6 +5,9 @@ import { useCallback, useEffect, useState } from 'react'
 import { api, GardenerRun } from './types'
 import { notify } from './Notice'
 import { copyText } from './Profile'
+import { relTime } from './time'
+import { fmtTokens, parseSummary } from './runs'
+import { Chips, ProgressLine, StatusPill, failureLine, runChips } from './RunStatus'
 
 // target=_blank / window.open are inert in Tauri's webview: show the URL
 const CLAUDE_CODE_URL = 'https://docs.anthropic.com/en/docs/claude-code'
@@ -132,18 +135,61 @@ export default function Gardeners({ dataVersion = 0 }: { dataVersion?: number })
         </>
       )}
       <h2 className="runs-title">runs</h2>
-      {runs.map((r) => (
-        <div key={r.id} className="run">
-          <div className="run-head">
-            <span className="who agent">{r.gardener_name}</span>
-            <span className={`status ${r.status}`}>{r.status}</span>
-            <span className="meta">{r.started_at.slice(0, 16).replace('T', ' ')}</span>
-            {r.tokens_used != null && <span className="meta">{r.tokens_used} tokens</span>}
-          </div>
-          <pre>{r.summary}</pre>
-        </div>
-      ))}
+      <div className="run-list">
+        {runs.map((r) => (
+          <RunRow key={r.id} run={r} kind={gardeners.find((g) => g.id === r.gardener)?.kind} />
+        ))}
+      </div>
       {runs.length === 0 && <div className="empty">no runs yet</div>}
+    </div>
+  )
+}
+
+/** One run as a structured row: kind badge, name, status pill, when, tokens,
+ * the headline chips; the per-item log behind a disclosure; a running run's
+ * live line; a failed run's error in the row itself. */
+function RunRow({ run: r, kind }: { run: GardenerRun; kind?: Gardener['kind'] }) {
+  const [open, setOpen] = useState(false)
+  const summary = parseSummary(r.summary)
+  const running = r.status === 'running'
+  const fail = failureLine(r)
+  const chips = runChips(r)
+  const hasDetails = summary.lines.length > 0 || (!running && !fail && !!summary.headline && chips.length === 0)
+  return (
+    <div className={`run-row status-${r.status} ${open ? 'open' : ''}`}>
+      <div className="run-head">
+        {kind && <span className={`kind-badge kind-${kind}`}>{kind}</span>}
+        <span className="who agent">{r.gardener_name}</span>
+        <StatusPill run={r} />
+        <Chips chips={chips} />
+        <span className="run-spacer" />
+        {r.tokens_used != null && r.tokens_used > 0 && (
+          <span className="meta run-tokens" title={`${r.tokens_used} tokens`}>
+            {fmtTokens(r.tokens_used)} tok
+          </span>
+        )}
+        <span className="meta run-when" title={new Date(r.started_at).toLocaleString()}>
+          {relTime(r.started_at)}
+        </span>
+        {hasDetails && (
+          <button className="run-details-btn" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+            {open ? 'hide' : 'details'}
+          </button>
+        )}
+      </div>
+      {running && <ProgressLine run={r} />}
+      {fail && <div className="run-failure">{fail}</div>}
+      {!running && !fail && summary.headline && chips.length > 0 && <div className="run-note">{summary.headline}</div>}
+      {open && (
+        <div className="run-log">
+          {summary.headline && chips.length === 0 && <div className="run-log-line">{summary.headline}</div>}
+          {summary.lines.map((l, i) => (
+            <div key={i} className="run-log-line">
+              {l}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

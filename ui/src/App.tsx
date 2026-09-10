@@ -383,6 +383,11 @@ export default function App() {
       buildCommands({
         queueCount,
         docId: view.kind === 'doc' ? view.id : null,
+        inboxId: docs.find((d) => d.parent_id === null && d.title === 'Inbox')?.id ?? null,
+        onOpenDoc: (id) => {
+          setPalette(null)
+          openDocRef.current(id)
+        },
         onAction: (a) => {
           if (a === 'review') setView({ kind: 'review' })
           if (a === 'runs') setView({ kind: 'runs' })
@@ -400,7 +405,7 @@ export default function App() {
           setPalette(null)
         },
       }),
-    [queueCount, view, setView],
+    [queueCount, view, setView, docs],
   )
 
   // canvas nodes fire wikilink clicks as events (CanvasBlock has no doc list)
@@ -480,7 +485,6 @@ export default function App() {
                 onOpenDoc={openDoc}
                 dataVersion={dataVersion}
                 onDocsChanged={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
-                onQueueChanged={refreshQueue}
               />
             )}
           </div>
