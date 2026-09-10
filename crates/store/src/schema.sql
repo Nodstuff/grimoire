@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS docs (
     -- when the tombstone was set; one value for every doc of a single delete,
     -- so restore can revive exactly that subtree (Trash)
     deleted_at    TEXT,
+    -- doc freshness: when an auditor/keeper last evaluated this doc and found
+    -- nothing, or a human accepted one of its fixes. Never set by ordinary
+    -- edits; NULL = never verified.
+    verified_at   TEXT,
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -155,7 +159,7 @@ CREATE TABLE IF NOT EXISTS gardeners (
     id            TEXT PRIMARY KEY,
     name          TEXT NOT NULL UNIQUE,
     kind          TEXT NOT NULL DEFAULT 'tagging'
-        CHECK (kind IN ('tagging', 'reviewer', 'auditor', 'scribe', 'keeper')),
+        CHECK (kind IN ('tagging', 'reviewer', 'auditor', 'scribe', 'keeper', 'filer')),
     principal     TEXT NOT NULL REFERENCES principals (id),
     -- null scope = whole corpus; else this doc's subtree
     scope_doc     TEXT REFERENCES docs (id),
@@ -193,6 +197,18 @@ CREATE TABLE IF NOT EXISTS doc_tags (
 
 CREATE INDEX IF NOT EXISTS doc_tags_by_tag ON doc_tags (tag);
 CREATE INDEX IF NOT EXISTS doc_tags_by_doc ON doc_tags (doc_id);
+
+-- Living answers: the blocks an ask-the-vault answer cited, at the epoch
+-- they were read. A cited block whose epoch moved on (or that is gone)
+-- makes the answer stale; the refresher re-runs the question and lands new
+-- receipts through the gate, then rewrites these rows.
+CREATE TABLE IF NOT EXISTS answer_sources (
+    answer_doc_id   TEXT NOT NULL REFERENCES docs (id),
+    block_id        TEXT NOT NULL,
+    epoch_at_answer INTEGER NOT NULL,
+    recorded_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (answer_doc_id, block_id)
+);
 
 -- Veracity sweep bookkeeping: which auditor covered which doc, when.
 CREATE TABLE IF NOT EXISTS audits (

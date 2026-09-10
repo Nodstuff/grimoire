@@ -122,6 +122,76 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
     {
         widen_ops_op_type_check(conn)?;
     }
+    // gardeners: the `filer` kind postdates the kind CHECK on fresh installs
+    // (DBs that got `kind` via ALTER carry no CHECK and need nothing).
+    let gardeners_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'gardeners'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(sql) = gardeners_sql
+        && sql.contains("kind IN (")
+        && !sql.contains("'filer'")
+    {
+        widen_gardeners_kind_check(conn)?;
+    }
+    Ok(())
+}
+
+/// Rebuild `gardeners` with the kind CHECK widened to include `filer`
+/// (same dance as `widen_ops_op_type_check`; ids are preserved so the
+/// gardener_runs FK holds afterwards).
+fn widen_gardeners_kind_check(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = (|| -> Result<()> {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE gardeners_new (
+                 id            TEXT PRIMARY KEY,
+                 name          TEXT NOT NULL UNIQUE,
+                 kind          TEXT NOT NULL DEFAULT 'tagging'
+                     CHECK (kind IN ('tagging', 'reviewer', 'auditor', 'scribe', 'keeper', 'filer')),
+                 principal     TEXT NOT NULL REFERENCES principals (id),
+                 scope_doc     TEXT REFERENCES docs (id),
+                 task_prompt   TEXT NOT NULL,
+                 bindings      TEXT NOT NULL DEFAULT '[]',
+                 creds_ref     TEXT,
+                 schedule      TEXT NOT NULL DEFAULT 'daily',
+                 confidence_policy TEXT NOT NULL DEFAULT 'review' CHECK (confidence_policy IN ('review', 'gate')),
+                 enabled       INTEGER NOT NULL DEFAULT 1,
+                 created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             );
+             INSERT INTO gardeners_new (id, name, kind, principal, scope_doc, task_prompt, bindings,
+                                        creds_ref, schedule, confidence_policy, enabled, created_at)
+                 SELECT id, name, kind, principal, scope_doc, task_prompt, bindings,
+                        creds_ref, schedule, confidence_policy, enabled, created_at FROM gardeners;
+             DROP TABLE gardeners;
+             ALTER TABLE gardeners_new RENAME TO gardeners;
+             COMMIT;",
+        )?;
+        Ok(())
+    })();
+    conn.pragma_update(None, "foreign_keys", true)?;
+    result?;
+    let has_runs: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'gardener_runs'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_runs > 0 {
+        let violations: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_foreign_key_check('gardener_runs')",
+            [],
+            |r| r.get(0),
+        )?;
+        if violations > 0 {
+            return Err(StoreError::InvalidOp(format!(
+                "gardeners rebuild left {violations} dangling gardener_runs rows"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -179,6 +249,14 @@ fn additive_column_migrations(conn: &Connection) -> Result<()> {
                 "UPDATE docs SET deleted_at = created_at WHERE deleted = 1 AND deleted_at IS NULL",
                 [],
             )?;
+        }
+        let has_verified: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('docs') WHERE name = 'verified_at'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_verified == 0 {
+            conn.execute("ALTER TABLE docs ADD COLUMN verified_at TEXT", [])?;
         }
     }
     let has_invites: i64 = conn.query_row(
@@ -4165,6 +4243,27 @@ impl BlockStore for SqliteStore {
                 annotation_id.to_string()
             ],
         )?;
+        // doc freshness: a HUMAN accepting an auditor's/keeper's fix means
+        // the doc was just checked — stamp it. Nothing else here verifies.
+        if decision == ReviewDecision::Accept && !doc_op {
+            let reviewer_is_human: bool = tx.query_row(
+                "SELECT kind = 'human' FROM principals WHERE id = ?1",
+                params![reviewer.to_string()],
+                |r| r.get(0),
+            )?;
+            let by_auditor: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM gardeners g
+                                WHERE g.principal = ?1 AND g.kind IN ('auditor', 'keeper'))",
+                params![op.principal.to_string()],
+                |r| r.get(0),
+            )?;
+            if reviewer_is_human && by_auditor {
+                tx.execute(
+                    "UPDATE docs SET verified_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+                    params![doc_id.to_string()],
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(receipt)
     }
@@ -4565,6 +4664,141 @@ impl SqliteStore {
             row_to_doc,
         )?;
         rows.map(|r| build_doc(r?)).collect()
+    }
+
+    // --- living answers: cited blocks at the epoch they were read ---
+
+    /// Replace an answer doc's cited-block set (called on create and after
+    /// every refresh).
+    pub fn record_answer_sources(&mut self, answer_doc: Uuid, sources: &[(Uuid, i64)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM answer_sources WHERE answer_doc_id = ?1",
+            params![answer_doc.to_string()],
+        )?;
+        for (block, epoch) in sources {
+            tx.execute(
+                "INSERT INTO answer_sources (answer_doc_id, block_id, epoch_at_answer) VALUES (?1, ?2, ?3)",
+                params![answer_doc.to_string(), block.to_string(), epoch],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The cited blocks of one answer doc, each with the block's CURRENT
+    /// state (epoch now, tombstoned/gone) so a caller can tell stale from
+    /// fresh without a second round-trip.
+    pub fn answer_sources(&self, answer_doc: Uuid) -> Result<Vec<AnswerSource>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.block_id, a.epoch_at_answer, a.recorded_at, b.epoch, b.deleted, d.title
+             FROM answer_sources a
+             LEFT JOIN blocks b ON b.id = a.block_id
+             LEFT JOIN docs d ON d.id = b.doc_id
+             WHERE a.answer_doc_id = ?1
+             ORDER BY a.recorded_at, a.block_id",
+        )?;
+        let rows = stmt.query_map(params![answer_doc.to_string()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<bool>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (block, at, recorded, now, deleted, title) = r?;
+            let gone = now.is_none() || deleted.unwrap_or(true);
+            Ok(AnswerSource {
+                block_id: uuid_col(block, "answer_sources.block_id")?,
+                epoch_at_answer: at,
+                recorded_at: recorded,
+                current_epoch: now,
+                gone,
+                doc_title: title,
+                changed: gone || now.is_some_and(|n| n > at),
+            })
+        })
+        .collect()
+    }
+
+    /// Every live doc with recorded answer sources, oldest recorded first.
+    pub fn answer_docs(&self) -> Result<Vec<Uuid>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.answer_doc_id, min(a.recorded_at) AS first
+             FROM answer_sources a JOIN docs d ON d.id = a.answer_doc_id
+             WHERE d.deleted = 0
+             GROUP BY a.answer_doc_id ORDER BY first",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.map(|r| uuid_col(r?, "answer_sources.answer_doc_id")).collect()
+    }
+
+    // --- doc freshness ---
+
+    /// Stamp a doc as verified now. Only the auditor/keeper paths call this
+    /// (a no-finding evaluation, or a human accepting one of their fixes).
+    pub fn set_doc_verified(&mut self, doc_id: Uuid) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE docs SET verified_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![doc_id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("doc {doc_id}")));
+        }
+        Ok(())
+    }
+
+    pub fn doc_verified_at(&self, doc_id: Uuid) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT verified_at FROM docs WHERE id = ?1",
+                params![doc_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("doc {doc_id}")))
+    }
+
+    /// Owned docs (no mirrors) that carry content, never-verified first, then
+    /// oldest `verified_at`. `last_edited` is the newest applied op's time
+    /// (falling back to the doc's creation time).
+    pub fn freshness(&self, limit: usize, tended_only: bool) -> Result<Vec<FreshnessRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, d.title, d.verified_at,
+                    COALESCE((SELECT max(o.created_at) FROM ops o
+                              WHERE o.doc_id = d.id AND o.epoch_applied IS NOT NULL), d.created_at)
+             FROM docs d
+             LEFT JOIN mirrors m ON m.doc_id = d.id
+             WHERE d.deleted = 0 AND m.doc_id IS NULL
+               AND EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0
+                           AND b.block_type != 'comment')
+             ORDER BY d.verified_at IS NOT NULL, d.verified_at, d.title",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, title, verified_at, last_edited) = r?;
+            let id = uuid_col(id, "docs.id")?;
+            let tended = self.doc_is_tended(id)?;
+            if tended_only && !tended {
+                continue;
+            }
+            out.push(FreshnessRow { id, title, verified_at, last_edited, tended });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Mark docs as covered by an auditor (re-audit = delete the rows).
