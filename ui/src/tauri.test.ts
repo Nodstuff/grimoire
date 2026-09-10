@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { backupFileName, inTauri, saveDialog } from './tauri'
+import { CAPTURE_EVENT, backupFileName, inTauri, onShellEvent, saveDialog } from './tauri'
 
-type Bridge = { invoke: (cmd: string, args?: unknown) => Promise<unknown> }
+type Bridge = {
+  invoke: (cmd: string, args?: unknown) => Promise<unknown>
+  transformCallback?: (cb: (payload: unknown) => void, once?: boolean) => number
+}
 const g = globalThis as { __TAURI_INTERNALS__?: Bridge }
 
 describe('tauri bridge', () => {
@@ -32,6 +35,32 @@ describe('tauri bridge', () => {
     // cancel
     reply = null
     expect(await saveDialog(opts)).toBeNull()
+  })
+
+  it('shell events: listen through the bridge, deliver the payload, unlisten by id', async () => {
+    // no bridge → inert
+    expect(typeof onShellEvent(CAPTURE_EVENT, () => {})).toBe('function')
+    const calls: [string, unknown][] = []
+    const callbacks = new Map<number, (p: unknown) => void>()
+    g.__TAURI_INTERNALS__ = {
+      invoke: async (cmd, args) => {
+        calls.push([cmd, args])
+        return cmd === 'plugin:event|listen' ? 42 : null
+      },
+      transformCallback: (cb) => {
+        callbacks.set(7, cb)
+        return 7
+      },
+    }
+    const got: unknown[] = []
+    const off = onShellEvent(CAPTURE_EVENT, (p) => got.push(p))
+    await Promise.resolve()
+    expect(calls[0]).toEqual(['plugin:event|listen', { event: 'grimoire:capture', target: { kind: 'Any' }, handler: 7 }])
+    callbacks.get(7)!({ event: CAPTURE_EVENT, id: 42, payload: { from: 'hotkey' } })
+    expect(got).toEqual([{ from: 'hotkey' }])
+    off()
+    await new Promise((r) => setTimeout(r, 0))
+    expect(calls[1]).toEqual(['plugin:event|unlisten', { event: 'grimoire:capture', eventId: 42 }])
   })
 
   it('proposes a dated .db name, zero-padded', () => {
