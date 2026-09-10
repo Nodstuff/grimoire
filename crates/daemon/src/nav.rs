@@ -1,18 +1,12 @@
 //! Agent navigation (AX slice A): fuzzy doc lookup over titles and
-//! breadcrumb paths, a token-cheap indented tree, and compact block JSON.
-//! Pure functions over the doc list so they are unit-testable without a
-//! store; the MCP tools in `mcp.rs` are thin wrappers.
+//! breadcrumb paths. Pure functions over the doc list so they are
+//! unit-testable without a store; the MCP tools in `mcp.rs` are thin
+//! wrappers (`find_doc`, and the `doc <id> · epoch · path` header of `read_doc`).
 
-use grimoire_store::{Block, Doc, DocStatus};
+use grimoire_store::{Doc, DocStatus};
 use serde::Serialize;
-use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
-
-/// `list_docs` without a `parent_doc_id` refuses corpora larger than this:
-/// a 700-doc dump is thousands of tokens an agent never needed — `tree` and
-/// `find_doc` exist for that.
-pub const LIST_DOCS_LIMIT: usize = 200;
 
 /// Breadcrumb separator in paths (`Folder › Sub › Title`).
 pub const CRUMB: &str = " › ";
@@ -155,97 +149,6 @@ pub fn find_docs(docs: &[Doc], query: &str, parent: Option<Uuid>, limit: usize) 
         .collect()
 }
 
-/// Indented text tree: one line per doc, `- Title  [id]`, children indented
-/// two spaces, subtrees below `depth` collapsed to `(N more)`. With a root,
-/// the root is the first line at depth 0; without, the corpus roots are.
-pub fn render_tree(docs: &[Doc], root: Option<Uuid>, depth: usize) -> String {
-    let mut children: HashMap<Option<Uuid>, Vec<&Doc>> = HashMap::new();
-    for d in docs {
-        children.entry(d.parent_id).or_default().push(d);
-    }
-    fn count(children: &HashMap<Option<Uuid>, Vec<&Doc>>, id: Uuid, seen: &mut HashSet<Uuid>) -> usize {
-        if !seen.insert(id) {
-            return 0;
-        }
-        children
-            .get(&Some(id))
-            .map(|kids| kids.iter().map(|k| 1 + count(children, k.id, seen)).sum())
-            .unwrap_or(0)
-    }
-    fn line(out: &mut String, d: &Doc, level: usize, more: usize) {
-        out.push_str(&"  ".repeat(level));
-        out.push_str("- ");
-        out.push_str(&d.title);
-        out.push_str("  [");
-        out.push_str(&d.id.to_string());
-        out.push(']');
-        if more > 0 {
-            out.push_str(&format!("  ({more} more)"));
-        }
-        out.push('\n');
-    }
-    fn walk(
-        out: &mut String,
-        children: &HashMap<Option<Uuid>, Vec<&Doc>>,
-        parent: Option<Uuid>,
-        level: usize,
-        depth: usize,
-        seen: &mut HashSet<Uuid>,
-    ) {
-        let Some(kids) = children.get(&parent) else { return };
-        for d in kids {
-            if !seen.insert(d.id) {
-                continue;
-            }
-            let collapsed = level + 1 >= depth;
-            let more = if collapsed {
-                count(children, d.id, &mut HashSet::new())
-            } else {
-                0
-            };
-            line(out, d, level, more);
-            if !collapsed {
-                walk(out, children, Some(d.id), level + 1, depth, seen);
-            }
-        }
-    }
-    let depth = depth.max(1);
-    let mut out = String::new();
-    let mut seen = HashSet::new();
-    match root {
-        Some(r) => {
-            let Some(d) = docs.iter().find(|d| d.id == r) else {
-                return format!("doc {r} not found\n");
-            };
-            seen.insert(r);
-            line(&mut out, d, 0, 0);
-            walk(&mut out, &children, Some(r), 1, depth + 1, &mut seen);
-        }
-        None => walk(&mut out, &children, None, 0, depth, &mut seen),
-    }
-    out
-}
-
-/// Compact row for `list_docs`.
-pub fn compact_doc(d: &Doc) -> Value {
-    json!({"id": d.id, "title": d.title, "parent_id": d.parent_id, "epoch": d.current_epoch})
-}
-
-/// Block JSON for agents: the six fields an edit needs unless `verbose`.
-pub fn compact_block(b: &Block, verbose: bool) -> Value {
-    if verbose {
-        return json!(b);
-    }
-    json!({
-        "id": b.id,
-        "doc_id": b.doc_id,
-        "parent_id": b.parent_id,
-        "order_key": b.order_key,
-        "block_type": b.block_type,
-        "content": b.content,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,46 +215,5 @@ mod tests {
         assert!(titles.contains(&"Roadmap") && titles.contains(&"Review Gate"));
         assert!(!titles.contains(&"Gardeners"), "outside the subtree");
         assert_eq!(find_docs(&docs, "r", None, 1).len(), 1);
-    }
-
-    #[test]
-    fn tree_collapses_below_depth_with_counts() {
-        let docs = corpus();
-        let t = render_tree(&docs, None, 1);
-        let lines: Vec<&str> = t.lines().collect();
-        assert_eq!(lines.len(), 3, "{t}");
-        assert!(lines[0].starts_with(&format!("- Daily  [{}]  (1 more)", docs[0].id)), "{t}");
-        assert!(lines[1].contains("(2 more)"), "{t}");
-        assert!(!lines[2].contains("more"), "leaf has no count: {t}");
-
-        let t = render_tree(&docs, None, 2);
-        assert!(t.contains("  - Roadmap  ["), "{t}");
-        assert!(!t.contains("more"), "{t}");
-
-        let t = render_tree(&docs, Some(docs[2].id), 2);
-        assert!(t.starts_with("- Grimoire  ["), "{t}");
-        assert_eq!(t.lines().count(), 3);
-        assert!(render_tree(&docs, Some(Uuid::nil()), 2).contains("not found"));
-    }
-
-    #[test]
-    fn compact_block_keeps_six_fields() {
-        let b = Block {
-            id: Uuid::now_v7(),
-            doc_id: Uuid::now_v7(),
-            parent_id: None,
-            order_key: "i".into(),
-            block_type: grimoire_store::BlockType::Paragraph,
-            content: "x".into(),
-            created_by: Uuid::now_v7(),
-            epoch: 4,
-            deleted: false,
-            refers_to: None,
-        };
-        let v = compact_block(&b, false);
-        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
-        assert_eq!(keys.len(), 6);
-        assert!(v.get("created_by").is_none() && v.get("epoch").is_none() && v.get("deleted").is_none());
-        assert!(compact_block(&b, true).get("created_by").is_some());
     }
 }
