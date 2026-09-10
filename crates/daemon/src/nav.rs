@@ -217,3 +217,75 @@ mod tests {
         assert_eq!(find_docs(&docs, "r", None, 1).len(), 1);
     }
 }
+
+/// Indented text tree: one line per doc, `- Title  [id]`, children indented
+/// two spaces, subtrees below `depth` collapsed to `(N more)`. With a root,
+/// the root is the first line at depth 0; without, the corpus roots are.
+pub fn render_tree(docs: &[Doc], root: Option<Uuid>, depth: usize) -> String {
+    let mut children: HashMap<Option<Uuid>, Vec<&Doc>> = HashMap::new();
+    for d in docs {
+        children.entry(d.parent_id).or_default().push(d);
+    }
+    fn count(children: &HashMap<Option<Uuid>, Vec<&Doc>>, id: Uuid, seen: &mut HashSet<Uuid>) -> usize {
+        if !seen.insert(id) {
+            return 0;
+        }
+        children
+            .get(&Some(id))
+            .map(|kids| kids.iter().map(|k| 1 + count(children, k.id, seen)).sum())
+            .unwrap_or(0)
+    }
+    fn line(out: &mut String, d: &Doc, level: usize, more: usize) {
+        out.push_str(&"  ".repeat(level));
+        out.push_str("- ");
+        out.push_str(&d.title);
+        out.push_str("  [");
+        out.push_str(&d.id.to_string());
+        out.push(']');
+        if more > 0 {
+            out.push_str(&format!("  ({more} more)"));
+        }
+        out.push('\n');
+    }
+    fn walk(
+        out: &mut String,
+        children: &HashMap<Option<Uuid>, Vec<&Doc>>,
+        parent: Option<Uuid>,
+        level: usize,
+        depth: usize,
+        seen: &mut HashSet<Uuid>,
+    ) {
+        let Some(kids) = children.get(&parent) else { return };
+        for d in kids {
+            if !seen.insert(d.id) {
+                continue;
+            }
+            let collapsed = level + 1 >= depth;
+            let more = if collapsed {
+                count(children, d.id, &mut HashSet::new())
+            } else {
+                0
+            };
+            line(out, d, level, more);
+            if !collapsed {
+                walk(out, children, Some(d.id), level + 1, depth, seen);
+            }
+        }
+    }
+    let depth = depth.max(1);
+    let mut out = String::new();
+    let mut seen = HashSet::new();
+    match root {
+        Some(r) => {
+            let Some(d) = docs.iter().find(|d| d.id == r) else {
+                return format!("doc {r} not found\n");
+            };
+            seen.insert(r);
+            line(&mut out, d, 0, 0);
+            walk(&mut out, &children, Some(r), 1, depth + 1, &mut seen);
+        }
+        None => walk(&mut out, &children, None, 0, depth, &mut seen),
+    }
+    out
+}
+
