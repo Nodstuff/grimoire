@@ -45,11 +45,16 @@ account may be flipped to the work account by other sessions — push with
   propose → accept → pull back). Two browser windows on one daemon test hot sessions.
 
 ## Writing to Grimoire over MCP (this repo's own docs live in it)
-- Pass `as: "claude:grimoire-<task>"` on every attributing call (`propose`, `propose_markdown`,
-  `create_doc`, `rename_doc`, `move_doc`, `set_status`, `delete_doc`, `merge_docs`, `add_comment`,
-  `resolve`, `my_proposals`). MCP 2026-07-28 has no sessions, so `identify` alone is forgotten by
-  the next call (0.7.8). A running Claude Code session needs `/mcp` reconnect to see tools or
-  parameters added by a daemon you just deployed.
+- 16 tools (AX 2): `find_doc`, `orient`, `read_doc`, `edit_doc`, `append`, `propose_markdown`,
+  `propose`, `diff_since`, `search`, `grep`, `related`, `create_doc`, `doc_op`, `add_comment`,
+  `resolve`, `proposals`. `edit_doc(old, new)` and `append(markdown, to, create_missing)` need no
+  epoch; `read_doc` is text (`doc <id> · epoch N · path` + markdown; `refs: true` for `^abc123`).
+- Attribution: pass `as: "claude:grimoire-<task>"` on every attributing call (`edit_doc`, `append`,
+  `propose`, `propose_markdown`, `create_doc`, `doc_op`, `add_comment`, `resolve`, `proposals`), or
+  register the server as `/mcp?as=<name>` / `/mcp?cwd=${PWD}` (→ `claude:<dirname>`) or send
+  `X-Grimoire-Principal`. Precedence: tool `as` > header > `?as=` > `?cwd=` > shared `claude`.
+  MCP 2026-07-28 has no sessions (`identify` is gone). A running Claude Code session needs `/mcp`
+  reconnect to see tools or parameters added by a daemon you just deployed.
 
 ## Traps
 - `window.alert`/`confirm` are silent no-ops in Tauri's WKWebView — use inline UI.
