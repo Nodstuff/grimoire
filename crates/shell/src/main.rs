@@ -18,8 +18,9 @@ use std::process::Command;
 use std::time::Duration;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -321,14 +322,41 @@ fn navigate(app: &AppHandle, target: &str) {
     }
 }
 
+/// The event the page listens for (ui/src/tauri.ts CAPTURE_EVENT): open the
+/// quick-capture palette. Emitted by the global hotkey and the tray item.
+const CAPTURE_EVENT: &str = "grimoire:capture";
+
+/// ⌥⌘G system-wide: quick capture from anywhere on the Mac. Not yet
+/// configurable — the constant is the one place to change it.
+fn capture_shortcut() -> Shortcut {
+    Shortcut::new(Some(Modifiers::ALT | Modifiers::SUPER), Code::KeyG)
+}
+
+/// Bring the window up and open the capture palette. A window that already
+/// exists hears the event; one that has to be created is opened straight on
+/// `?capture=1` (the page is not there yet to listen).
+fn open_capture(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.set_focus();
+        let _ = app.emit(CAPTURE_EVENT, "shell");
+        return;
+    }
+    show_window_with(app, &[("capture", "1")]);
+}
+
 fn show_window(app: &AppHandle) {
+    show_window_with(app, &[])
+}
+
+fn show_window_with(app: &AppHandle, extra: &[(&str, &str)]) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.set_focus();
         return;
     }
     let url = if daemon_up() {
-        WebviewUrl::External(ui_url(&[]).parse().unwrap())
+        WebviewUrl::External(ui_url(extra).parse().unwrap())
     } else {
         WebviewUrl::CustomProtocol(ERROR_URL.parse().unwrap())
     };
@@ -509,6 +537,16 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        // ⌥⌘G anywhere on the Mac → quick capture (registered in setup)
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    if event.state() == ShortcutState::Pressed && *shortcut == capture_shortcut() {
+                        open_capture(app);
+                    }
+                })
+                .build(),
+        )
         // `grimoire-shell://localhost/waiting`: the page shown while the
         // daemon is not answering (see ERROR_URL)
         .register_uri_scheme_protocol("grimoire-shell", |_ctx, _req| {
@@ -540,13 +578,22 @@ fn main() {
                 });
             }
 
+            // the hotkey is best-effort: another app may hold ⌥⌘G. The tray
+            // item and ⌘⇧I in the page still work, so just say so in the log.
+            if let Err(e) = app.global_shortcut().register(capture_shortcut()) {
+                eprintln!("could not register the ⌥⌘G quick-capture hotkey: {e}");
+            }
+
             let open = MenuItemBuilder::with_id("open", "Open Grimoire").build(app)?;
+            let capture = MenuItemBuilder::with_id("capture", "Quick capture")
+                .accelerator("Alt+Super+G")
+                .build(app)?;
             let garden = MenuItemBuilder::with_id("garden", "Run gardeners now").build(app)?;
             let restart = MenuItemBuilder::with_id("restart", "Restart background service").build(app)?;
             let update = MenuItemBuilder::with_id("update", "Check for updates…").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
             let menu = MenuBuilder::new(app)
-                .items(&[&open, &garden, &restart, &update, &quit])
+                .items(&[&open, &capture, &garden, &restart, &update, &quit])
                 .build()?;
 
             let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
@@ -557,6 +604,7 @@ fn main() {
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => show_window(app),
+                    "capture" => open_capture(app),
                     "garden" => {
                         let handle = app.clone();
                         std::thread::spawn(move || run_gardeners_now(handle));

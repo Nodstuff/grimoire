@@ -48,6 +48,11 @@ describe('resolveShortcut', () => {
     expect(resolveShortcut({ key: '/', shiftKey: false, metaKey: true, ctrlKey: false })).toBe('ask')
   })
 
+  it('⌘⇧I captures; plain ⌘I stays the editor italic', () => {
+    expect(resolveShortcut(meta('I', true))).toBe('capture')
+    expect(resolveShortcut(meta('i'))).toBeNull()
+  })
+
   it('shift disambiguates N and R without collision', () => {
     expect(resolveShortcut(meta('n'))).toBe('newdoc')
     expect(resolveShortcut(meta('N', true))).toBe('newcanvas')

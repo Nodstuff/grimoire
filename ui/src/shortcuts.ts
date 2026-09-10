@@ -17,6 +17,7 @@ export type ShortcutAction =
   | 'forward' // ⌘] — history forward
   | 'home' // ⌘W — home
   | 'ask' // ⌘/ — ask the vault
+  | 'capture' // ⌘⇧I — quick capture to Inbox (⌘I alone is the editor's italic)
   | 'help' // ? — shortcut cheatsheet (no modifier; caller ignores it in inputs)
   | 'escape' // Esc — dismiss palette
 
@@ -54,6 +55,8 @@ export function resolveShortcut(e: KeyLike): ShortcutAction | null {
       return e.shiftKey ? 'review' : 'reload'
     case 'g':
       return 'gardeners'
+    case 'i':
+      return e.shiftKey ? 'capture' : null
     case '[':
       return 'back'
     case ']':
