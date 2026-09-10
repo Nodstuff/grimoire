@@ -10,8 +10,37 @@ import {
   rankDocs,
   recentDocs,
   snippetOf,
+  stableSelection,
   type OmniCommand,
+  type OmniRow,
 } from './omni'
+
+describe('stableSelection', () => {
+  const D = (id: string): OmniRow => ({ key: `docs:${id}`, group: 'docs', doc: doc(id, id), path: id })
+  const C = (id: string): OmniRow => ({ key: `content:${id}`, group: 'content', hit: hit(id, 'r', 'R', 'x'), crumb: 'R', snippet: 'x' })
+  const K = (id: string): OmniRow => ({ key: `cmd:${id}`, group: 'commands', cmd: cmd(id, id) })
+  const ASK: OmniRow = { key: 'ask', group: 'ask', query: 'q' }
+
+  it('keeps the selected row by key when content lands between docs and commands', () => {
+    const before = [D('a'), D('b'), K('review'), ASK]
+    const after = [D('a'), D('b'), C('h1'), C('h2'), K('review'), ASK]
+    expect(stableSelection(before, 1, after)).toBe(1)
+    expect(stableSelection(before, 2, after)).toBe(4) // the command moved down, selection follows it
+    expect(stableSelection(before, 3, after)).toBe(5)
+  })
+  it('a vanished row falls back to the same group at the same offset, clamped', () => {
+    const before = [D('a'), C('h1'), C('h2'), C('h3'), K('k')]
+    const after = [D('a'), C('h9'), C('h8'), K('k')]
+    expect(stableSelection(before, 3, after)).toBe(2) // third content hit → last content hit
+    expect(stableSelection(before, 1, after)).toBe(1)
+  })
+  it('a vanished group clamps the index; an empty list is 0', () => {
+    expect(stableSelection([D('a'), C('h1')], 1, [D('a')])).toBe(0)
+    expect(stableSelection([D('a')], 0, [])).toBe(0)
+    expect(stableSelection([], 0, [D('a'), D('b')])).toBe(0)
+    expect(stableSelection([D('a'), D('b'), D('c')], 2, [K('x')])).toBe(0)
+  })
+})
 import type { Block, Doc, SearchHit } from './types'
 
 const doc = (id: string, title: string, parent_id: string | null = null): Doc => ({

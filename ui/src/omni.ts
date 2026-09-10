@@ -256,6 +256,31 @@ export function groupStarts(rows: OmniRow[]): Set<number> {
   return starts
 }
 
+/** Where the selection lands after the rows change under it. The selected
+ * row keeps its identity by KEY when it survives (the Content group landing
+ * 120 ms after Docs must not move the highlight off the doc the user was on);
+ * a vanished row falls back to the first row of the same group, then to the
+ * same index clamped, then to 0. Pure — the root cause of the old "jumpy"
+ * mixed mode was an index-based selection over a list whose groups arrive
+ * at different times. */
+export function stableSelection(prevRows: OmniRow[], prevSel: number, nextRows: OmniRow[]): number {
+  if (nextRows.length === 0) return 0
+  const prev = prevRows[prevSel]
+  if (!prev) return Math.min(prevSel, nextRows.length - 1)
+  const byKey = nextRows.findIndex((r) => r.key === prev.key)
+  if (byKey !== -1) return byKey
+  const sameGroup = nextRows.findIndex((r) => r.group === prev.group)
+  if (sameGroup !== -1) {
+    // same group, same offset within it where possible
+    const prevGroupStart = prevRows.findIndex((r) => r.group === prev.group)
+    const offset = Math.max(0, prevSel - prevGroupStart)
+    let i = sameGroup
+    while (offset > i - sameGroup && i + 1 < nextRows.length && nextRows[i + 1].group === prev.group) i++
+    return i
+  }
+  return Math.min(prevSel, nextRows.length - 1)
+}
+
 /** Placeholder for the box in each opening mode. */
 export function placeholderFor(mode: OmniMode): string {
   switch (mode) {

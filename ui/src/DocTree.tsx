@@ -18,7 +18,16 @@ import {
   groupRoot,
   loadTreeState,
   saveTreeState,
+  staleness,
+  stalenessTitle,
 } from './tree'
+
+/** One row of GET /api/freshness (owned docs with content). */
+interface FreshRow {
+  id: string
+  verified_at: string | null
+  tended: boolean
+}
 
 type Drop = { id: string; mode: 'into' | 'before' | 'after' } | null
 
@@ -76,6 +85,16 @@ export default function DocTree({
   const byId = useMemo(() => new Map(docs.map((d) => [d.id, d])), [docs])
   const groups = useMemo(() => groupRoot(docs, childrenOf), [docs, childrenOf])
   const counts = useMemo(() => descendantCounts(childrenOf), [childrenOf])
+
+  /* ---- freshness: one fetch, joined by id; only tended docs get a glyph ---- */
+  const [verified, setVerified] = useState<Map<string, string | null>>(new Map())
+  useEffect(() => {
+    // `tended=true` keeps the payload to the docs the indicator applies to;
+    // refetched whenever the doc list changes (a verification bumps it)
+    api<FreshRow[]>('/api/freshness?limit=1000&tended=true')
+      .then((rows) => setVerified(new Map((Array.isArray(rows) ? rows : []).map((r) => [r.id, r.verified_at]))))
+      .catch(() => setVerified(new Map()))
+  }, [docs])
 
   /* ---- open state, persisted (try/catch inside load/save) ---- */
   const persisted = useRef(loadTreeState())
@@ -299,7 +318,19 @@ export default function DocTree({
           <span className="tree-title">{d.title}</span>
           <span className="tree-badges">
             {isDir && !open && <span className="tree-count">{counts.get(d.id) ?? 0}</span>}
-            {d.is_tended && <span className="tend-dot" title="tended by agents" />}
+            {d.is_tended &&
+              (() => {
+                // the tended dot carries freshness too: green = verified
+                // recently, amber = stale / never verified (tooltip says which)
+                const s = verified.has(d.id) ? staleness(verified.get(d.id)) : null
+                const stale = s && s.kind !== 'fresh'
+                return (
+                  <span
+                    className={`tend-dot ${stale ? 'stale' : ''}`}
+                    title={stale ? `tended by agents · ${stalenessTitle(s)}` : 'tended by agents'}
+                  />
+                )
+              })()}
             {d.mirror_permission && !d.from_hub && (
               <span className="mirror-badge quiet" title={`shared with you (${d.mirror_permission})`}>⇄</span>
             )}

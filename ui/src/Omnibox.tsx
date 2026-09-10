@@ -17,6 +17,7 @@ import {
   loadRecentIds,
   parseQuery,
   placeholderFor,
+  stableSelection,
   type OmniCommand,
   type OmniMode,
   type OmniRow,
@@ -38,53 +39,88 @@ export default function Omnibox({
 }) {
   const [raw, setRaw] = useState('')
   const [hits, setHits] = useState<SearchHit[]>([])
+  // the query the LIST shows. Docs/Commands used to recompute on every
+  // keystroke while Content landed 120 ms + a fetch later, so the list
+  // re-flowed twice per keystroke and the index-based selection jumped
+  // groups. Now everything settles on one 120 ms tick; Content keeps its
+  // space (previous hits, dimmed) until the fetch for that tick lands.
+  const [settled, setSettled] = useState(() => parseQuery('', baseMode))
+  const [pending, setPending] = useState(false)
   const [sel, setSel] = useState(0)
   const [asking, setAsking] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
   useEffect(() => inputRef.current?.focus(), [])
 
-  const { mode, q } = parseQuery(raw, baseMode)
-  const wantsContent = (mode === 'mixed' || mode === 'content') && q.length >= 2
+  const live = parseQuery(raw, baseMode)
+  const liveWantsContent = (live.mode === 'mixed' || live.mode === 'content') && live.q.length >= 2
 
-  // content hits: debounced, latest wins (a slow older reply must not land
-  // over the hits for what is in the box now)
   useEffect(() => {
+    const { mode, q } = parseQuery(raw, baseMode)
+    const wantsContent = (mode === 'mixed' || mode === 'content') && q.length >= 2
     if (!wantsContent) {
+      // nothing to fetch: settle at once (empty box, `>` commands, `?` ask)
+      setSettled({ mode, q })
       setHits([])
+      setPending(false)
       return
     }
+    setPending(true)
     let stale = false
     const t = setTimeout(() => {
+      // one tick: docs + commands recompute now, content follows when the
+      // fetch lands — latest wins, a slow older reply never lands over it
+      setSettled({ mode, q })
       api<SearchHit[]>(`/api/search?q=${encodeURIComponent(q)}`)
         .then((hs) => {
-          if (!stale) setHits(Array.isArray(hs) ? hs : [])
+          if (stale) return
+          setHits(Array.isArray(hs) ? hs : [])
+          setPending(false)
         })
         .catch(() => {
-          if (!stale) setHits([])
+          if (stale) return
+          setHits([])
+          setPending(false)
         })
     }, 120)
     return () => {
       stale = true
       clearTimeout(t)
     }
-  }, [q, wantsContent])
+  }, [raw, baseMode])
 
+  const { mode, q } = settled
   const recentIds = useMemo(loadRecentIds, [])
   const rows: OmniRow[] = useMemo(
     () => buildRows({ mode, q, docs, recentIds, hits, commands }),
     [mode, q, docs, recentIds, hits, commands],
   )
   const starts = useMemo(() => groupStarts(rows), [rows])
-  useEffect(() => setSel(0), [q, mode])
+  // selection by identity: a new query starts at the top; the same query's
+  // rows changing under the cursor (content landing) keeps the selected row
+  const prevRows = useRef<OmniRow[]>([])
+  const prevQuery = useRef(`${mode}:${q}`)
   useEffect(() => {
-    setSel((s) => Math.min(s, Math.max(rows.length - 1, 0)))
-  }, [rows.length])
-  // keep the selected row in view as the arrows move
+    const key = `${mode}:${q}`
+    if (key !== prevQuery.current) {
+      prevQuery.current = key
+      setSel(0)
+    } else {
+      setSel((s) => stableSelection(prevRows.current, s, rows))
+    }
+    prevRows.current = rows
+  }, [rows, mode, q])
+  // the only auto-scroll: keep the selected row visible (nearest = no jump
+  // when it already is)
   useEffect(() => {
     const el = listRef.current?.querySelector<HTMLElement>(`[data-idx="${sel}"]`)
     el?.scrollIntoView({ block: 'nearest' })
   }, [sel])
+  // content is pending when the box wants content the list has not settled
+  // for yet (typing) or the fetch for the settled query is still out
+  const contentPending = pending || (liveWantsContent && (live.q !== q || live.mode !== mode))
+  const hasContentRows = rows.some((r) => r.group === 'content')
+  const showPlaceholder = contentPending && !hasContentRows && (mode === 'mixed' || mode === 'content')
 
   const ask = async (question: string) => {
     const qq = question.trim()
@@ -128,7 +164,7 @@ export default function Omnibox({
     }
   }
 
-  const empty = rows.length === 0
+  const empty = rows.length === 0 && !showPlaceholder
   const emptyText =
     mode === 'commands'
       ? 'no such command'
@@ -169,10 +205,20 @@ export default function Omnibox({
           rows.map((r, i) => (
             <div key={r.key}>
               {starts.has(i) && <div className="omni-group">{GROUP_LABEL[r.group]}</div>}
+              {/* the Content group's slot while its fetch is out and no
+                  earlier hits hold the space */}
+              {showPlaceholder && r.group === 'commands' && starts.has(i) && (
+                <>
+                  <div className="omni-group">{GROUP_LABEL.content}</div>
+                  <div className="omni-pending" aria-hidden />
+                </>
+              )}
               <div
                 data-idx={i}
-                className={`palette-item omni-${r.group} ${i === sel ? 'sel' : ''}`}
-                onMouseEnter={() => setSel(i)}
+                className={`palette-item omni-${r.group} ${i === sel ? 'sel' : ''} ${r.group === 'content' && contentPending ? 'pending' : ''}`}
+                // mousemove, not mouseenter: a list re-flowing under a
+                // stationary pointer must not steal the selection
+                onMouseMove={() => sel !== i && setSel(i)}
                 onClick={() => run(r)}
               >
                 {(r.group === 'recent' || r.group === 'docs') && (

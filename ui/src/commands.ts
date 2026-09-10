@@ -28,12 +28,25 @@ export interface CommandCtx {
   queueCount: number
   /** the open doc, if any — enables the per-doc commands */
   docId: string | null
+  /** the root doc titled Inbox, when quick capture has made one */
+  inboxId: string | null
   onAction: (a: CommandAction) => void
+  onOpenDoc: (id: string) => void
 }
 
-export function buildCommands({ queueCount, docId, onAction }: CommandCtx): OmniCommand[] {
+export function buildCommands({ queueCount, docId, inboxId, onAction, onOpenDoc }: CommandCtx): OmniCommand[] {
   const cmds: OmniCommand[] = [
     { id: 'review', label: 'Review queue', hint: queueCount ? `${queueCount} open` : undefined, keys: '⌘⇧R', run: () => onAction('review') },
+    {
+      id: 'inbox',
+      label: 'Inbox',
+      hint: 'captured notes, waiting to be filed',
+      run: () => {
+        onAction('close')
+        if (inboxId) onOpenDoc(inboxId)
+        else notify('nothing captured yet — ⌘⇧I captures a note', 'ok')
+      },
+    },
     { id: 'capture', label: 'Quick capture…', hint: 'a note straight into Inbox', keys: '⌘⇧I', run: () => onAction('capture') },
     { id: 'newdoc', label: 'New doc…', keys: '⌘N', run: () => onAction('newdoc') },
     { id: 'newcanvas', label: 'New canvas…', keys: '⌘⇧N', run: () => onAction('newcanvas') },

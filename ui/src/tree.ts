@@ -179,6 +179,35 @@ export function saveTreeState(state: TreeState, storage: Pick<Storage, 'setItem'
   }
 }
 
+/* ---------- freshness in the tree ---------- */
+
+/** A tended doc verified longer ago than this is marked stale in the tree. */
+export const STALE_AFTER_DAYS = 30
+
+export type Staleness = { kind: 'fresh' } | { kind: 'never' } | { kind: 'stale'; days: number }
+
+/** Never verified → `never`; verified more than `STALE_AFTER_DAYS` ago →
+ * `stale` with the age; else `fresh`. Unparseable stamps count as never. */
+export function staleness(verifiedAt: string | null | undefined, now: number = Date.now(), after = STALE_AFTER_DAYS): Staleness {
+  if (!verifiedAt) return { kind: 'never' }
+  const t = new Date(verifiedAt).getTime()
+  if (Number.isNaN(t)) return { kind: 'never' }
+  const days = Math.floor((now - t) / 86_400_000)
+  return days > after ? { kind: 'stale', days } : { kind: 'fresh' }
+}
+
+/** Tooltip for the tree's stale glyph. */
+export function stalenessTitle(s: Staleness): string {
+  switch (s.kind) {
+    case 'never':
+      return 'never verified'
+    case 'stale':
+      return `verified ${s.days}d ago`
+    default:
+      return ''
+  }
+}
+
 function safeStorage(): Storage | null {
   try {
     return typeof localStorage === 'undefined' ? null : localStorage
