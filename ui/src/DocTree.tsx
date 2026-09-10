@@ -318,19 +318,25 @@ export default function DocTree({
           <span className="tree-title">{d.title}</span>
           <span className="tree-badges">
             {isDir && !open && <span className="tree-count">{counts.get(d.id) ?? 0}</span>}
-            {d.is_tended &&
-              (() => {
-                // the tended dot carries freshness too: green = verified
-                // recently, amber = stale / never verified (tooltip says which)
-                const s = verified.has(d.id) ? staleness(verified.get(d.id)) : null
-                const stale = s && s.kind !== 'fresh'
+            {(() => {
+              // the tended dot carries freshness too: green = verified
+              // recently, amber = stale / never verified (tooltip says which).
+              // Docs inside a tended scope (in the freshness map but not the
+              // scope root) show only the amber dot, and only when stale —
+              // a fresh library stays quiet.
+              const s = verified.has(d.id) ? staleness(verified.get(d.id)) : null
+              const stale = !!s && s.kind !== 'fresh'
+              if (d.is_tended) {
                 return (
                   <span
                     className={`tend-dot ${stale ? 'stale' : ''}`}
                     title={stale ? `tended by agents · ${stalenessTitle(s)}` : 'tended by agents'}
                   />
                 )
-              })()}
+              }
+              if (stale) return <span className="tend-dot stale in-scope" title={stalenessTitle(s)} />
+              return null
+            })()}
             {d.mirror_permission && !d.from_hub && (
               <span className="mirror-badge quiet" title={`shared with you (${d.mirror_permission})`}>⇄</span>
             )}

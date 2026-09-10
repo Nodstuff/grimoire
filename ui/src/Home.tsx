@@ -359,9 +359,9 @@ function TimelineRow({ it, gardeners, onOpenDoc }: { it: SinceItem; gardeners: M
     const kind = gardeners.get(r.gardener)?.kind
     const fail = failureLine(r)
     return (
-      <li className={`tl-row run status-${r.status}`}>
+      <li className={`tl-row tl-run status-${r.status}`}>
         {time}
-        <span className="tl-glyph run" aria-hidden>
+        <span className="tl-glyph glyph-run" aria-hidden>
           🌿
         </span>
         <span className="tl-body">
