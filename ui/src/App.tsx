@@ -8,6 +8,8 @@ import SharePanel from './SharePanel'
 import PaletteShell from './PaletteShell'
 import Profile, { FirstRunName, loadProfile, copyText } from './Profile'
 import Trash from './Trash'
+import Freshness, { FreshnessChip } from './Freshness'
+import LivingChip from './LivingChip'
 import ImportFolder from './ImportFolder'
 import ReviewRail from './ReviewRail'
 import DocTreePanel from './DocTree'
@@ -64,6 +66,7 @@ type View =
   | { kind: 'sharing' }
   | { kind: 'profile' }
   | { kind: 'trash' }
+  | { kind: 'freshness' }
   | { kind: 'home' }
 type Palette = null | 'commands' | 'open' | 'search' | 'newdoc' | 'newcanvas' | 'help' | 'ask'
 
@@ -467,6 +470,7 @@ export default function App() {
             <GraphView onOpenDoc={openDoc} />
           </Suspense>
         )}
+        {view.kind === 'freshness' && <Freshness dataVersion={dataVersion} onOpenDoc={openDoc} />}
       </main>
 
       {profile && !profile.confirmed && <FirstRunName profile={profile} onSaved={setProfile} />}
@@ -497,6 +501,7 @@ export default function App() {
             if (a === 'sharing') setView({ kind: 'sharing' })
             if (a === 'profile') setView({ kind: 'profile' })
             if (a === 'trash') setView({ kind: 'trash' })
+            if (a === 'freshness') setView({ kind: 'freshness' })
             if (a === 'ask') {
               setPalette('ask')
               return
@@ -612,7 +617,7 @@ function CommandPalette({
   /** the open doc, if any — enables the per-doc commands */
   docId: string | null
   onAction: (
-    a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph' | 'sharing' | 'profile' | 'trash' | 'close' | 'ask',
+    a: 'review' | 'runs' | 'tree' | 'home' | 'newdoc' | 'newcanvas' | 'graph' | 'sharing' | 'profile' | 'trash' | 'freshness' | 'close' | 'ask',
   ) => void
   onClose: () => void
 }) {
@@ -632,6 +637,7 @@ function CommandPalette({
     { label: 'Graph view', run: () => onAction('graph') },
     { label: 'Ask the vault…', hint: '⌘/ — an answer with citations', run: () => onAction('ask') },
     { label: 'Trash', hint: 'restore deleted docs', run: () => onAction('trash') },
+    { label: 'Stale docs', hint: 'never verified first, then the oldest verification', run: () => onAction('freshness') },
     {
       label: 'Import a folder of Markdown…',
       hint: 'files become docs, folders become sections',
@@ -1648,6 +1654,8 @@ function DocView({
         <span className="head-actions">
           {tree.doc.review_policy && <span className="meta policy">{tree.doc.review_policy}</span>}
           {!mirror && <StatusChip doc={tree.doc} onChanged={loadTree} />}
+          {!mirror && <LivingChip docId={docId} dataVersion={dataVersion} />}
+          {!mirror && <FreshnessChip docId={docId} dataVersion={dataVersion} />}
           <button
             className={`chip ${panel === 'history' ? 'on' : ''}`}
             onClick={() => setPanel(panel === 'history' ? 'none' : 'history')}

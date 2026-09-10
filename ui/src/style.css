@@ -856,6 +856,7 @@ kbd {
 .kind-scribe { color: var(--accent); background: color-mix(in srgb, var(--accent) 15%, transparent); }
 .kind-keeper { color: var(--green); background: color-mix(in srgb, var(--green) 15%, transparent); }
 .kind-auditor { color: var(--yellow); background: color-mix(in srgb, var(--yellow) 15%, transparent); }
+.kind-filer { color: var(--fg-dim); background: color-mix(in srgb, var(--fg-dim) 15%, transparent); }
 .kind-blurb { margin-bottom: 8px; }
 .tend-field { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--fg-dim); margin: 6px 0; }
 .tend-field input {
@@ -1128,6 +1129,15 @@ kbd {
   opacity: 0.75;
 }
 .chip.review-chip { color: var(--yellow); border-color: var(--yellow); }
+
+/* doc freshness + living answers (header chips, Stale docs list) */
+.chip.freshness-chip, .chip.living-chip { cursor: default; }
+.chip.unverified { opacity: 0.6; }
+.chip.verified { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
+.chip.living-fresh { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
+.chip.living-stale { color: var(--yellow); border-color: var(--yellow); }
+.freshness-row { cursor: pointer; }
+.freshness-row:hover { background: var(--panel); }
 .chip.review-chip.on { background: color-mix(in srgb, var(--yellow) 15%, transparent); }
 .chip.review-chip:disabled { opacity: 0.55; cursor: default; }
 .review-hot-note { color: var(--yellow); margin-bottom: 10px; }
