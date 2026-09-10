@@ -131,13 +131,19 @@ pub fn is_block_marker(line: &str) -> bool {
         .is_some_and(|id| !id.is_empty() && !id.contains(char::is_whitespace))
 }
 
-/// Drop every block-marker line. The markers sit on their own line directly
-/// above a block, so removing the line yields exactly the plain export.
+/// Drop every block-marker line — the `<!-- block … -->` form and the short
+/// ref `^abc123` form `read_doc(refs: true)` emits. Both sit on their own line
+/// directly above a block, so removing the line yields exactly the plain
+/// export, and a read with refs round-trips through `propose_markdown` as
+/// zero ops.
 pub fn strip_block_markers(markdown: &str) -> String {
-    if !markdown.contains(BLOCK_MARKER_PREFIX) {
+    if !markdown.contains(BLOCK_MARKER_PREFIX) && !markdown.contains('^') {
         return markdown.to_string();
     }
-    let mut out: Vec<&str> = markdown.lines().filter(|l| !is_block_marker(l)).collect();
+    let mut out: Vec<&str> = markdown
+        .lines()
+        .filter(|l| !is_block_marker(l) && !crate::locate::is_short_ref_line(l))
+        .collect();
     // `lines()` drops a trailing newline; put it back if the input had one
     if markdown.ends_with('\n') {
         out.push("");

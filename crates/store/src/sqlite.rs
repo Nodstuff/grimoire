@@ -4522,6 +4522,20 @@ impl SqliteStore {
         )?)
     }
 
+    /// Live blocks whose id ends with `suffix` (the `^abc123` short-ref
+    /// resolver, `locate::short_ref`). A suffix scan over `blocks.id`; the
+    /// caller turns 0 / >1 rows into the not-found / ambiguity errors.
+    pub fn blocks_by_id_suffix(&self, suffix: &str) -> Result<Vec<Block>> {
+        let suffix = suffix.to_ascii_lowercase();
+        if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(Vec::new());
+        }
+        let sql = format!("SELECT {BLOCK_COLS} FROM blocks WHERE id LIKE ?1 AND deleted = 0 ORDER BY id");
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![format!("%{suffix}")], row_to_block)?;
+        rows.map(|r| build_block(r?)).collect()
+    }
+
     /// All live docs in a subtree, the scope root included — the opt-in
     /// boundary every scoped gardener works within.
     pub fn doc_subtree(&self, root: Uuid) -> Result<Vec<Doc>> {

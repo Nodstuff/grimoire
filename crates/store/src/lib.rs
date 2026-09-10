@@ -6,6 +6,7 @@
 pub mod export;
 pub mod gate;
 pub mod import;
+pub mod locate;
 pub mod mddiff;
 pub mod order_key;
 mod sqlite;
