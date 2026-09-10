@@ -1576,6 +1576,7 @@ pub fn router(
         .route("/admin/gardeners/update", post(update_gardener))
         .route("/admin/runs", get(list_runs))
         .route("/admin/policy", post(set_policy))
+        .route("/admin/living/refresh", post(crate::living::refresh_now))
         .route_layer(axum::middleware::from_fn_with_state(token, require_admin))
         .with_state(AdminState { store, hot })
         .merge(fed_routes)
@@ -1754,5 +1755,8 @@ pub async fn daily_loop(store: Store, hot: crate::hot::HotState) {
             let out = garden::run_gardener(store.clone(), hot.clone(), g).await;
             tracing::info!("gardener {name}: {} — {}", out.status, out.summary);
         }
+        // living answers: re-ground answers whose cited blocks moved on
+        let lines = crate::living::refresh_sweep(store.clone(), hot.clone(), None).await;
+        tracing::info!("living answers sweep: {}", lines.join(" | "));
     }
 }

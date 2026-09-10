@@ -1613,6 +1613,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/graph", get(graph))
         .route("/api/render/d2", post(render_d2))
         .route("/api/export", post(export_file))
+        .route("/api/doc/{id}/living", get(crate::living::living_status))
+        .route("/api/doc/{id}/freshness", get(crate::freshness::doc_freshness))
+        .route("/api/freshness", get(crate::freshness::freshness))
         .with_state(state)
 }
 

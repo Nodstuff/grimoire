@@ -34,7 +34,7 @@ pub const AUDIT_DOCS_PER_RUN: usize = 5;
 pub const TRIPWIRE_RED_LIMIT: usize = 5;
 
 /// String::truncate panics off a char boundary — content is arbitrary UTF-8.
-fn truncate_chars(s: &mut String, max_bytes: usize) {
+pub(crate) fn truncate_chars(s: &mut String, max_bytes: usize) {
     if s.len() <= max_bytes {
         return;
     }
@@ -146,7 +146,7 @@ pub fn claude_bin() -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
-async fn invoke_claude(prompt: &str) -> Result<(String, i64), String> {
+pub(crate) async fn invoke_claude(prompt: &str) -> Result<(String, i64), String> {
     invoke_claude_with_dirs(prompt, &[]).await
 }
 
@@ -410,14 +410,15 @@ fn parse_proposals(result: &str) -> Result<Vec<TagProposal>, String> {
     parse_json_result(result)
 }
 
-/// Turn one accepted proposal into frontmatter ops for the doc.
-fn tag_ops(
+/// Turn one accepted proposal into frontmatter ops for the doc. `refs` is
+/// the provenance the ops carry (`gardener:tagging`, `filer: <reason>`).
+pub(crate) fn tag_ops(
     store: &SqliteStore,
     doc_id: Uuid,
     add: &[String],
+    refs: Vec<String>,
 ) -> grimoire_store::Result<Vec<OpInput>> {
     let tree = store.read_doc(doc_id)?;
-    let refs = vec!["gardener:tagging".to_string()];
     let tags_yaml = |tags: &[String]| {
         let items: Vec<String> = tags.iter().map(|t| format!("  - {t}")).collect();
         items.join("\n")
@@ -854,6 +855,118 @@ fn progress_to_run(store: &Arc<Mutex<SqliteStore>>, run_id: Uuid) -> impl FnMut(
     }
 }
 
+/// Land an audit's findings: verified fixes as flagged yellows, unverified
+/// ones parked; every presented doc recorded as covered; docs the model
+/// raised nothing about are stamped verified (doc freshness). Pure enough
+/// to test without a model.
+fn apply_audit_findings(
+    s: &mut SqliteStore,
+    g: &Gardener,
+    dirs: &[String],
+    doc_ids: &[Uuid],
+    findings: Vec<AuditFinding>,
+    is_hot: impl Fn(Uuid) -> bool,
+) -> (Vec<String>, usize, usize) {
+    let allowed: std::collections::HashSet<Uuid> = doc_ids.iter().copied().collect();
+    let mut lines = Vec::new();
+    let mut flagged = 0usize;
+    let mut corrected = 0usize;
+    // doc freshness: a presented doc the model raised NOTHING about was
+    // just checked and found sound — even a finding that is later dropped
+    // (no drafted fix, invented block) means the doc was not clean
+    let raised: std::collections::HashSet<Uuid> = findings.iter().map(|f| f.doc_id).collect();
+    for f in findings {
+        if !allowed.contains(&f.doc_id) {
+            lines.push(format!(
+                "ignored finding outside presented docs ({})",
+                f.doc_id
+            ));
+            continue;
+        }
+        match s.read_block(f.block_id) {
+            Ok(b) if b.doc_id == f.doc_id && !b.deleted => {}
+            _ => {
+                lines.push(format!("ignored invented block_id {}", f.block_id));
+                continue;
+            }
+        }
+        // every finding is a drafted fix; findings without one are dropped
+        let Some(content) = f.corrected_content.filter(|c| !c.trim().is_empty()) else {
+            lines.push(format!(
+                "{}: dropped — no drafted fix (comment: {})",
+                f.block_id,
+                f.comment.chars().take(80).collect::<String>()
+            ));
+            continue;
+        };
+        // HARD RULE: verification requires bound authoritative sources
+        let verified = f.verified && !dirs.is_empty();
+        let op = OpInput {
+            kind: OpKind::Replace {
+                target: f.block_id,
+                content,
+            },
+            source_refs: vec![
+                if verified {
+                    "auditor:verified".to_string()
+                } else {
+                    "auditor:unverified".to_string()
+                },
+                format!("audit:{}", f.comment.chars().take(200).collect::<String>()),
+            ],
+        };
+        if is_hot(f.doc_id) {
+            lines.push(format!("{}: deferred, doc is in a live session", f.block_id));
+            continue;
+        }
+        if verified {
+            let epoch = match s.get_doc(f.doc_id) {
+                Ok(d) => d.current_epoch,
+                Err(e) => {
+                    lines.push(format!("{}: skipped: {e}", f.block_id));
+                    continue;
+                }
+            };
+            match s.propose_reviewed(f.doc_id, epoch, g.principal, vec![op]) {
+                Ok(out) => {
+                    corrected += 1;
+                    lines.push(format!(
+                        "verified fix applied (flagged) {} → epoch {}: {}",
+                        f.block_id,
+                        out.epoch,
+                        f.comment.chars().take(90).collect::<String>()
+                    ));
+                }
+                Err(e) => lines.push(format!("{}: propose failed: {e}", f.block_id)),
+            }
+        } else {
+            match s.park(f.doc_id, g.principal, vec![op], "") {
+                Ok(_) => {
+                    flagged += 1;
+                    lines.push(format!(
+                        "fix parked (unverified) {}: {}",
+                        f.block_id,
+                        f.comment.chars().take(90).collect::<String>()
+                    ));
+                }
+                Err(e) => lines.push(format!("{}: park failed: {e}", f.block_id)),
+            }
+        }
+    }
+    // every presented doc is marked covered — clean docs advance the
+    // sweep too (re-audit later = clear its audits rows)
+    if let Err(e) = s.record_audits(g.principal, doc_ids) {
+        lines.push(format!("audit bookkeeping failed: {e}"));
+    }
+    for d in doc_ids.iter().filter(|d| !raised.contains(d)) {
+        match s.set_doc_verified(*d) {
+            Ok(()) => lines.push(format!("{d}: no findings — verified")),
+            Err(e) => lines.push(format!("{d}: verified_at not set: {e}")),
+        }
+    }
+    (lines, flagged, corrected)
+}
+
 async fn run_auditor(
     store: Arc<Mutex<SqliteStore>>,
     hot: &crate::hot::HotState,
@@ -920,96 +1033,9 @@ async fn run_auditor(
         Ok(f) => f,
         Err(e) => return ("failed".into(), e, Some(tokens)),
     };
-    let allowed: std::collections::HashSet<Uuid> = doc_ids.iter().copied().collect();
     let (g, hot, dirs) = (g.clone(), hot.clone(), dirs.clone());
     let (lines, flagged, corrected) = with_store(&store, move |s| {
-        let mut lines = Vec::new();
-        let mut flagged = 0usize;
-        let mut corrected = 0usize;
-        for f in findings {
-            if !allowed.contains(&f.doc_id) {
-                lines.push(format!(
-                    "ignored finding outside presented docs ({})",
-                    f.doc_id
-                ));
-                continue;
-            }
-            match s.read_block(f.block_id) {
-                Ok(b) if b.doc_id == f.doc_id && !b.deleted => {}
-                _ => {
-                    lines.push(format!("ignored invented block_id {}", f.block_id));
-                    continue;
-                }
-            }
-            // every finding is a drafted fix; findings without one are dropped
-            let Some(content) = f.corrected_content.filter(|c| !c.trim().is_empty()) else {
-                lines.push(format!(
-                    "{}: dropped — no drafted fix (comment: {})",
-                    f.block_id,
-                    f.comment.chars().take(80).collect::<String>()
-                ));
-                continue;
-            };
-            // HARD RULE: verification requires bound authoritative sources
-            let verified = f.verified && !dirs.is_empty();
-            let op = OpInput {
-                kind: OpKind::Replace {
-                    target: f.block_id,
-                    content,
-                },
-                source_refs: vec![
-                    if verified {
-                        "auditor:verified".to_string()
-                    } else {
-                        "auditor:unverified".to_string()
-                    },
-                    format!("audit:{}", f.comment.chars().take(200).collect::<String>()),
-                ],
-            };
-            if hot.is_hot(f.doc_id) {
-                lines.push(format!("{}: deferred, doc is in a live session", f.block_id));
-                continue;
-            }
-            if verified {
-                let epoch = match s.get_doc(f.doc_id) {
-                    Ok(d) => d.current_epoch,
-                    Err(e) => {
-                        lines.push(format!("{}: skipped: {e}", f.block_id));
-                        continue;
-                    }
-                };
-                match s.propose_reviewed(f.doc_id, epoch, g.principal, vec![op]) {
-                    Ok(out) => {
-                        corrected += 1;
-                        lines.push(format!(
-                            "verified fix applied (flagged) {} → epoch {}: {}",
-                            f.block_id,
-                            out.epoch,
-                            f.comment.chars().take(90).collect::<String>()
-                        ));
-                    }
-                    Err(e) => lines.push(format!("{}: propose failed: {e}", f.block_id)),
-                }
-            } else {
-                match s.park(f.doc_id, g.principal, vec![op], "") {
-                    Ok(_) => {
-                        flagged += 1;
-                        lines.push(format!(
-                            "fix parked (unverified) {}: {}",
-                            f.block_id,
-                            f.comment.chars().take(90).collect::<String>()
-                        ));
-                    }
-                    Err(e) => lines.push(format!("{}: park failed: {e}", f.block_id)),
-                }
-            }
-        }
-        // every presented doc is marked covered — clean docs advance the
-        // sweep too (re-audit later = clear its audits rows)
-        if let Err(e) = s.record_audits(g.principal, &doc_ids) {
-            lines.push(format!("audit bookkeeping failed: {e}"));
-        }
-        (lines, flagged, corrected)
+        apply_audit_findings(s, &g, &dirs, &doc_ids, findings, |d| hot.is_hot(d))
     })
     .await;
     (
@@ -1454,6 +1480,10 @@ pub async fn run_gardener(
         let (status, summary, tokens) = run_auditor(store.clone(), &hot, &g, run_id).await;
         return finish(&store, &status, &summary, tokens).await;
     }
+    if g.kind == GardenerKind::Filer {
+        let (status, summary, tokens) = crate::filer::run(store.clone(), &hot, &g, run_id).await;
+        return finish(&store, &status, &summary, tokens).await;
+    }
 
     // compose (lock released before the long claude call)
     let (prompt, doc_count) = {
@@ -1510,7 +1540,7 @@ pub async fn run_gardener(
                 lines.push(format!("skipped invented doc_id {}", p.doc_id));
                 continue;
             };
-            let ops = match tag_ops(s, doc.id, &tags) {
+            let ops = match tag_ops(s, doc.id, &tags, vec!["gardener:tagging".to_string()]) {
                 Ok(o) => o,
                 Err(e) => {
                     lines.push(format!("{}: op build failed: {e}", doc.title));
@@ -1840,5 +1870,49 @@ mod gate_path_tests {
         drop(claim);
         assert!(!is_running(id));
         assert!(claim_run(id).is_some());
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    use grimoire_store::{PrincipalKind, import::import_markdown};
+
+    #[test]
+    fn a_no_finding_evaluation_verifies_the_doc_and_a_finding_does_not() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let scope = s.create_doc("Docs", None, tom).unwrap();
+        let g = s
+            .create_gardener("aud", GardenerKind::Auditor, "audit", Some(scope.id), ConfidencePolicy::Review)
+            .unwrap();
+        let (clean, _) = import_markdown(&mut s, "Clean", Some(scope.id), tom, "all good\n").unwrap();
+        let (flagged, _) = import_markdown(&mut s, "Flagged", Some(scope.id), tom, "version 1.0 is current\n").unwrap();
+        let (homework, _) = import_markdown(&mut s, "Homework", Some(scope.id), tom, "maybe stale\n").unwrap();
+        let block_of = |s: &SqliteStore, d: Uuid| s.read_doc(d).unwrap().roots[0].block.id;
+        let findings = vec![
+            AuditFinding {
+                doc_id: flagged,
+                block_id: block_of(&s, flagged),
+                comment: "1.0 shipped long ago".into(),
+                corrected_content: Some("version 2.0 is current".into()),
+                verified: false,
+            },
+            // a finding with no drafted fix is dropped — but the doc was still NOT clean
+            AuditFinding { doc_id: homework, block_id: block_of(&s, homework), comment: "hmm".into(), corrected_content: None, verified: false },
+        ];
+        let doc_ids = vec![clean, flagged, homework];
+        let (lines, parked, corrected) = apply_audit_findings(&mut s, &g, &[], &doc_ids, findings, |_| false);
+        assert_eq!((parked, corrected), (1, 0), "{lines:?}");
+        assert!(s.doc_verified_at(clean).unwrap().is_some(), "no findings → verified");
+        assert_eq!(s.doc_verified_at(flagged).unwrap(), None, "a parked fix is not a verification");
+        assert_eq!(s.doc_verified_at(homework).unwrap(), None, "a dropped finding is still a finding");
+        assert!(lines.iter().any(|l| l.contains("no findings — verified")));
+        // every presented doc is covered for the sweep regardless
+        assert!(s.audit_candidates(g.principal, scope.id, 10).unwrap().is_empty());
+        // the human accepting the parked fix verifies the flagged doc
+        let q = s.review_queue(Some(flagged)).unwrap();
+        s.resolve(q[0].annotation.id, tom, ReviewDecision::Accept).unwrap();
+        assert!(s.doc_verified_at(flagged).unwrap().is_some());
     }
 }
