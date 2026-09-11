@@ -24,6 +24,33 @@ export interface TodoDay {
   carried: number
   prev_date: string | null
   epoch: number
+  /** an add/edit whose trailing `due …` phrase could not be read */
+  warning?: string
+}
+
+/** `GET /api/todo/parse?text=…`: what the daemon makes of a typed line. The
+ * grammar (`due fri`, `by 12/9` day/month, `due 12 sep`, `due in 3 days`,
+ * `due next mon`, ISO) lives ONLY in the daemon (`due.rs`); the UI just asks. */
+export interface DueParse {
+  text: string
+  deadline: string | null
+  warning?: string
+}
+
+/** Worth asking the daemon: the draft ends in `due …` / `by …` (≤ 3 words).
+ * A trigger only — whether the phrase means anything is the daemon's call. */
+export function hasDuePhrase(text: string): boolean {
+  return /(^|\s)(due|by)\s+\S+(\s+\S+){0,2}\s*$/i.test(text)
+}
+
+/** The quiet hint under the add row: `→ Fri 12 Sep`, or the warning. */
+export function previewLabel(res: DueParse | null, today: string): string {
+  if (!res) return ''
+  if (res.warning) return res.warning
+  if (!res.deadline) return ''
+  const rel = fmtDay(res.deadline, today)
+  const abs = fromIso(res.deadline).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' })
+  return `→ ${rel === abs ? abs : `${rel} · ${abs}`}`
 }
 
 /** Local calendar date as `YYYY-MM-DD`. */
@@ -68,7 +95,7 @@ export function deadlineTone(it: Pick<TodoItem, 'overdue' | 'due_soon' | 'done'>
   return 'later'
 }
 
-/** `⏰ 12 Sep` / `⏰ today` / `⏰ 3d overdue` for the pill. */
+/** `due 12 Sep` / `due Fri` (this week) / `due today` / `3d overdue` for the pill. */
 export function fmtDeadline(deadline: string, today: string): string {
   const days = Math.round((fromIso(deadline).getTime() - fromIso(today).getTime()) / 86_400_000)
   if (days === 0) return 'due today'

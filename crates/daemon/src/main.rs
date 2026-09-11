@@ -27,6 +27,7 @@ mod nav;
 mod room;
 mod retrieval;
 mod store_ext;
+mod due;
 mod todo;
 #[cfg(test)]
 mod retrieval_probe;
