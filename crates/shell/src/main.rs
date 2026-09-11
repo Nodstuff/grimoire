@@ -179,6 +179,18 @@ fn spawn_sidecar() {
     if !ksd.exists() {
         return;
     }
+    // Never stack sidecars: if the child we spawned is still alive but not yet
+    // answering (first start after an update runs migrations; an unsigned
+    // build can sit in a Keychain prompt for the identity key), spawning
+    // another only produces a second blocked daemon — and a second prompt.
+    // 2026-09-11: eleven daemons and ~20 Keychain dialogs from exactly this.
+    if let Ok(mut guard) = SPAWNED.lock() {
+        if let Some(child) = guard.as_mut() {
+            if matches!(child.try_wait(), Ok(None)) {
+                return;
+            }
+        }
+    }
     let home = home();
     let _ = std::fs::create_dir_all(data_dir());
     let mut cmd = Command::new(&ksd);
