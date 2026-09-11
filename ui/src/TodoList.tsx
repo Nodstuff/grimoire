@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { errText, notify } from './Notice'
 import { api } from './types'
-import { addDays, deadlineTone, fmtDay, fmtDeadline, nextMonday, type TodoDay, type TodoItem } from './todo'
+import { addDays, deadlineTone, fmtDay, fmtDeadline, hasDuePhrase, nextMonday, previewLabel, type DueParse, type TodoDay, type TodoItem } from './todo'
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
@@ -35,6 +35,7 @@ export default function Todo({
   const [missing, setMissing] = useState(false)
   const [busy, setBusy] = useState(false)
   const [draft, setDraft] = useState('')
+  const [preview, setPreview] = useState<DueParse | null>(null)
   const [editing, setEditing] = useState<string | null>(null)
   const [noteOpen, setNoteOpen] = useState<Set<string>>(new Set())
   const [noteEdit, setNoteEdit] = useState<string | null>(null)
@@ -69,6 +70,7 @@ export default function Todo({
     try {
       const d = await api<TodoDay>(path, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ date, ...body }) })
       apply(d)
+      if (d.warning) notify(`${d.warning} — kept as typed; set it from the ⋯ menu`, 'warn')
       return true
     } catch (e) {
       notify(errText(e))
@@ -83,8 +85,28 @@ export default function Todo({
     const text = draft.trim()
     if (!text) return
     setDraft('')
+    setPreview(null)
     if (!(await post('/api/todo', { text }))) setDraft(text)
   }
+
+  // the live hint: a draft ending in `due …` / `by …` is shown to the daemon
+  // (debounced) and its reading echoed beside the row; the rules live there
+  useEffect(() => {
+    if (!hasDuePhrase(draft)) {
+      setPreview(null)
+      return
+    }
+    let live = true
+    const t = setTimeout(() => {
+      api<DueParse>(`/api/todo/parse?text=${encodeURIComponent(draft.trim())}`)
+        .then((r) => live && setPreview(r))
+        .catch(() => live && setPreview(null))
+    }, 150)
+    return () => {
+      live = false
+      clearTimeout(t)
+    }
+  }, [draft])
 
   // the ⋯ menu closes on Esc and on a click anywhere else
   useEffect(() => {
@@ -172,7 +194,7 @@ export default function Todo({
           </span>
           <input
             className="todo-add-input"
-            placeholder="add a to-do · Enter adds · ⏰ 2026-09-20 sets a deadline"
+            placeholder='add a to-do · Enter adds · "due fri" or "due 12/9" sets a deadline'
             value={draft}
             disabled={busy}
             onChange={(e) => setDraft(e.target.value)}
@@ -187,6 +209,11 @@ export default function Todo({
               }
             }}
           />
+          {preview && previewLabel(preview, today) && (
+            <span className={`todo-add-hint ${preview.warning ? 'warn' : ''}`} title={preview.deadline ?? undefined}>
+              {previewLabel(preview, today)}
+            </span>
+          )}
         </div>
       )}
       <div className="todo-foot">

@@ -1743,6 +1743,8 @@ kbd {
 }
 .todo-add-input::placeholder { color: var(--fg-dim); opacity: 0.7; }
 .todo-add-input:focus::placeholder { opacity: 0.4; }
+.todo-add-hint { font-size: 12px; color: var(--fg-dim); white-space: nowrap; flex-shrink: 0; padding-right: 4px; }
+.todo-add-hint.warn { color: var(--yellow); }
 .todo-foot { display: flex; justify-content: flex-end; padding: 4px 6px 0; }
 .todo-loading { opacity: 0.5; }
 
