@@ -92,7 +92,7 @@ async fn capture(State(st): State<ApiState>, Json(req): Json<CaptureReq>) -> Jso
         };
         let title = inbox_title(&req.text);
         let md = inbox_markdown(&req.text);
-        let ops = grimoire_store::mddiff::markdown_to_ops(&[], &md);
+        let ops = grimoire_store::mddiff::markdown_to_ops_from(&[], &md, "inbox");
         match s.create_doc_with_ops(&title, Some(inbox.id), human, ops) {
             Ok((doc, _)) => Json(json!({"doc_id": doc.id, "title": doc.title, "inbox_id": inbox.id})),
             Err(e) => Json(json!({"error": e.to_string()})),

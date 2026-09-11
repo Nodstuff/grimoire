@@ -615,7 +615,7 @@ pub fn find_or_create_todo(s: &mut SqliteStore, human: Uuid) -> grimoire_store::
 /// the text is unchanged). Returns the epoch afterwards.
 fn save(s: &mut SqliteStore, doc: Uuid, human: Uuid, new_md: &str) -> Result<i64, String> {
     let tree = s.read_doc(doc).map_err(|e| e.to_string())?;
-    let ops = grimoire_store::mddiff::markdown_to_ops(&tree.roots, new_md);
+    let ops = grimoire_store::mddiff::markdown_to_ops_from(&tree.roots, new_md, "todo");
     if ops.is_empty() {
         return Ok(tree.doc.current_epoch);
     }

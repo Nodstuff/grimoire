@@ -95,7 +95,14 @@ fn lcs_match(old: &[Existing], new: &[Segment]) -> Vec<Option<usize>> {
 /// `markdown` — the agent path (`propose_markdown`): `markdown` is the whole
 /// doc, frontmatter included, so only comments and canvases are skipped.
 pub fn markdown_to_ops(roots: &[BlockNode], markdown: &str) -> Vec<OpInput> {
-    diff_with_filter(roots, markdown, &skip_non_content, "propose_markdown")
+    markdown_to_ops_from(roots, markdown, "propose_markdown")
+}
+
+/// `markdown_to_ops` with the caller's name in every op's `source_refs`, so
+/// provenance says which tool made the change (`edit_doc`, `append`, `todo`,
+/// `inbox`) rather than blaming `propose_markdown` for all of them.
+pub fn markdown_to_ops_from(roots: &[BlockNode], markdown: &str, source: &str) -> Vec<OpInput> {
+    diff_with_filter(roots, markdown, &skip_non_content, source)
 }
 
 /// The editor path: `markdown` is what the editor showed, which never

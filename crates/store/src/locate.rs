@@ -447,14 +447,18 @@ pub fn first_line(content: &str, max: usize) -> String {
 }
 
 /// The heading level new root-level sections get when `append` creates a
-/// path that does not exist: the doc's existing root-level headings' level
-/// (`##` when its sections are `##`), else `#`.
+/// path that does not exist: the doc's existing root-level section level
+/// (`##` when its sections are `##`). `#` is a doc's title in Grimoire, never
+/// a section, so a doc with only an H1 — or no headings at all — gets `##`
+/// (the first live `append(create_missing)` on an empty daily doc produced
+/// `# grimoire` / `## Done`, 2026-09-11).
 pub fn root_heading_level(roots: &[BlockNode]) -> u8 {
     roots
         .iter()
         .filter_map(|n| heading_level(&n.block.content))
         .min()
-        .unwrap_or(1)
+        .map(|l| l.max(2))
+        .unwrap_or(2)
 }
 
 #[cfg(test)]
@@ -556,9 +560,9 @@ mod tests {
         assert_eq!(best.content, "- shipped x");
         assert_eq!(root_heading_level(&roots), 2);
         let (_, _, r2) = tree("# Title\n\npara\n");
-        assert_eq!(root_heading_level(&r2), 1);
+        assert_eq!(root_heading_level(&r2), 2, "an H1 is the title, sections start at ##");
         let (_, _, r3) = tree("just a paragraph\n");
-        assert_eq!(root_heading_level(&r3), 1);
+        assert_eq!(root_heading_level(&r3), 2, "no headings: sections start at ##");
         assert_eq!(first_line("line one\nline two", 100), "line one…");
         assert_eq!(first_line("short", 100), "short");
     }

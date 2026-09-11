@@ -1384,7 +1384,7 @@ impl KsMcp {
             for r in ranges.iter().rev() {
                 new_md = locate::splice_replace(&new_md, r.clone(), &p.new);
             }
-            let ops = grimoire_store::mddiff::markdown_to_ops(&tree.roots, &new_md);
+            let ops = grimoire_store::mddiff::markdown_to_ops_from(&tree.roots, &new_md, "edit_doc");
             if ops.is_empty() {
                 return no_changes(epoch);
             }
@@ -1452,7 +1452,7 @@ impl KsMcp {
             }
             text.push_str(p.markdown.trim_matches('\n'));
             let new_md = locate::splice_insert(&export, landing.offset, &text);
-            let ops = grimoire_store::mddiff::markdown_to_ops(&tree.roots, &new_md);
+            let ops = grimoire_store::mddiff::markdown_to_ops_from(&tree.roots, &new_md, "append");
             if ops.is_empty() {
                 return no_changes(epoch);
             }
