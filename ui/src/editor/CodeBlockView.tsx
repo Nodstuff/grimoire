@@ -1,10 +1,11 @@
 // Code-block NodeView (5.7): a diagram is a block whose content is source —
-// mermaid renders client-side, d2 via the daemon; the code stays editable
+// mermaid and reladraw render client-side, d2 via the daemon; the code stays editable
 // and the preview follows it live.
 
 import { NodeViewContent, NodeViewProps, NodeViewWrapper } from '@tiptap/react'
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../types'
+import { appTheme, renderReladraw } from './reladraw'
 
 // mermaid is ~2MB: fetched on the first mermaid fence, not at boot
 let mermaidMod: Promise<typeof import('mermaid')['default']> | null = null
@@ -54,6 +55,33 @@ function MermaidPreview({ code }: { code: string }) {
   return <div className="diagram" dangerouslySetInnerHTML={{ __html: svg }} />
 }
 
+function ReladrawPreview({ code }: { code: string }) {
+  const [svg, setSvg] = useState<string>('')
+  const [err, setErr] = useState<string>('')
+  useEffect(() => {
+    let stale = false
+    const t = setTimeout(async () => {
+      try {
+        const r = await renderReladraw(code, appTheme())
+        if (stale) return
+        if ('svg' in r) {
+          setSvg(r.svg)
+          setErr('')
+        } else setErr(r.err)
+      } catch (e) {
+        if (!stale) setErr(String(e).split('\n')[0])
+      }
+    }, 400)
+    return () => {
+      stale = true
+      clearTimeout(t)
+    }
+  }, [code])
+  if (err) return <div className="diagram-err">{err}</div>
+  if (!svg) return <div className="lazy-loading">loading…</div>
+  return <div className="diagram" dangerouslySetInnerHTML={{ __html: svg }} />
+}
+
 function D2Preview({ code }: { code: string }) {
   const [svg, setSvg] = useState<string>('')
   const [err, setErr] = useState<string>('')
@@ -87,7 +115,8 @@ export default function CodeBlockView({ node }: NodeViewProps) {
         <NodeViewContent />
       </pre>
       {lang === 'mermaid' && code.trim() && <MermaidPreview code={code} />}
-      {lang === 'd2' && code.trim() && <D2Preview code={code} />}
+      {lang === 'reladraw' && code.trim() && <ReladrawPreview code={code} />}
+      {lang === 'd2' &&code.trim() && <D2Preview code={code} />}
     </NodeViewWrapper>
   )
 }
