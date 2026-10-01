@@ -107,24 +107,59 @@ import Testing
         #expect(again.commitText().isEmpty, "nothing to resend: the queue already holds it")
     }
 
-    @Test func proposesChainOnOurOwnLandedWrites() async throws {
+    func green(_ epoch: Int, _ block: String) -> MockServer.Reply {
+        .json(#"{"doc_id":"d1","epoch":\#(epoch),"verdicts":[{"op_id":"o\#(epoch)","block_id":"\#(block)","verdict":"green","confidence":1,"applied":true,"note":""}]}"#)
+    }
+
+    func sentBases(_ s: MockServer) -> [Int] {
+        s.requests.compactMap { (try? JSONSerialization.jsonObject(with: $0.httpBody ?? Data()) as? [String: Any])?["base_epoch"] as? Int }
+    }
+
+    /// (a) our replace of p1 lands at 7, an agent writes p2 at 8: our next
+    /// replace of p1, made on 6, goes out on 7, so the gate sees p1 as
+    /// unchanged since and applies it green.
+    @Test func ourOwnWriteToABlockIsNeverAConflict() async throws {
         let cache = try Cache.inMemory()
         try await seed(cache)
-        try await cache.enqueue(replace("p1", "one"))
-        let server = MockServer { _ in .json(#"{"doc_id":"d1","epoch":6,"verdicts":[{"op_id":"o1","block_id":"p1","verdict":"green","confidence":1,"applied":true,"note":""}]}"#) }
-        try await OutboxReplayer(api: server.client(), cache: cache).replay()
-        // the editor still believes epoch 5 (the body hasn't refetched): the
-        // next save moves up past our own write instead of scoring stale against it
-        let next = try await cache.enqueue(replace("p1", "two", base: 5))
-        #expect(try JSONDecoder().decode(ProposeRequest.self, from: next.body ?? Data()).baseEpoch == 6)
-        #expect(try await cache.lastLandedEpoch("d1") == 6)
-        // someone else's write in between breaks the chain
-        let other = try Cache.inMemory()
-        try await other.enqueue(replace("p1", "one"))
-        let jumped = MockServer { _ in .json(#"{"doc_id":"d1","epoch":8,"verdicts":[]}"#) }
-        try await OutboxReplayer(api: jumped.client(), cache: other).replay()
-        let stale = try await other.enqueue(replace("p1", "two", base: 5))
-        #expect(try JSONDecoder().decode(ProposeRequest.self, from: stale.body ?? Data()).baseEpoch == 5)
+        try await cache.enqueue(replace("p1", "one", base: 6))
+        let first = MockServer { _ in self.green(7, "p1") }
+        try await OutboxReplayer(api: first.client(), cache: cache).replay()
+        try await cache.applyDocState("d1", Change.DocState(title: "Doc", currentEpoch: 8)) // the agent's write to p2
+        try await cache.enqueue(replace("p1", "two", base: 6))
+        let second = MockServer { _ in self.green(9, "p1") }
+        try await OutboxReplayer(api: second.client(), cache: cache).replay()
+        #expect(sentBases(second) == [7])
+        #expect(try await cache.lastLandedEpoch("d1") == 9)
+    }
+
+    /// (b) the desktop changes p1 at 8 after our write at 7: our next
+    /// replace of p1 still counts from 7, so the gate sees the desktop's
+    /// change and scores it (red), never silently overwriting it. A propose
+    /// touching p1 and an untouched p2 goes on the lower base.
+    @Test func someoneElsesChangeToTheBlockStillConflicts() async throws {
+        let cache = try Cache.inMemory()
+        try await seed(cache)
+        try await cache.enqueue(replace("p1", "one", base: 6))
+        let first = MockServer { _ in self.green(7, "p1") }
+        try await OutboxReplayer(api: first.client(), cache: cache).replay()
+        try await cache.applyDocState("d1", Change.DocState(title: "Doc", currentEpoch: 8))
+        try await cache.enqueue(replace("p1", "two", base: 6))
+        try await cache.enqueue(ProposeRequest(docID: "d1", baseEpoch: 6, ops: [.replace(target: "p1", content: "x"), .replace(target: "p2", content: "y")]))
+        let second = MockServer { _ in .json(#"{"doc_id":"d1","epoch":8,"verdicts":[]}"#) }
+        try await OutboxReplayer(api: second.client(), cache: cache).replay()
+        #expect(sentBases(second) == [7, 6], "never past our write to p1; p2 we never wrote")
+        #expect(try await cache.adjustedBase(replace("p1", "z", base: 6)) == 7)
+    }
+
+    @Test func refusedWritesStayOnScreen() async throws {
+        let cache = try Cache.inMemory()
+        try await seed(cache)
+        try await cache.enqueue(replace("p1", "typed, then refused"))
+        let refuse = MockServer { _ in .json(#"{"error":"read-only"}"#) }
+        try await OutboxReplayer(api: refuse.client(), cache: cache).replay()
+        #expect(try await cache.outboxState(for: "d1").failed == 1)
+        let editor = try #require(try await cache.editor(for: "d1"))
+        #expect(editor.blocks["p1"]?.content == "typed, then refused")
     }
 
     @Test func verdictsMarkBlocksUntilReviewed() async throws {
@@ -149,6 +184,23 @@ import Testing
         let green = MockServer { _ in .json(#"{"doc_id":"d1","epoch":7,"verdicts":[{"op_id":"g2","block_id":"p2","verdict":"green","confidence":1,"applied":true,"note":""}]}"#) }
         try await OutboxReplayer(api: green.client(), cache: cache).replay()
         #expect(try await cache.reviews(for: "d1")["p2"] == nil)
+    }
+
+    /// Another doc's write must not wake an editor watching this one.
+    @Test func blockObservationIgnoresOtherDocs() async throws {
+        let cache = try Cache.inMemory()
+        try await seed(cache)
+        var it = cache.observeBlocks(of: "d1").makeAsyncIterator()
+        let first = try await it.next()
+        #expect(first?.count == 3)
+        try await cache.storeDoc(DocTree(doc: DocSummary(id: "d2", parentID: nil, title: "Other", currentEpoch: 1), roots: [
+            BlockNode(block: Block(id: "x", docID: "d2", parentID: nil, orderKey: "i", blockType: .paragraph, content: "other")),
+        ]))
+        try await cache.storeDoc(DocTree(doc: DocSummary(id: "d1", parentID: nil, title: "Doc", currentEpoch: 6), roots: [
+            BlockNode(block: Block(id: "h1", docID: "d1", parentID: nil, orderKey: "i", blockType: .heading, content: "# One", epoch: 6)),
+        ]))
+        let next = try await it.next()
+        #expect(next?.map(\.id) == ["h1"], "the next emission is this doc's change, not a repeat")
     }
 
     @Test func outboxStateForTheChip() async throws {

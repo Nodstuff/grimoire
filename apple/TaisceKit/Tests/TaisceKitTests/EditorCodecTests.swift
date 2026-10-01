@@ -77,6 +77,16 @@ import Testing
         ("Brackets [not a link] and [x]", true),
         ("    indented code", false),
         ("", true),
+        ("## Issue #", true),
+        ("## #", true),
+        ("**Note:**text", true),
+        ("**中文。**テキスト", true),
+        ("1. a\n1. b", true),
+        ("- a\n* b", nil),
+        ("> a\nb", true),
+        ("non\u{00A0}breaking and zero\u{200B}width", true),
+        ("[x](a\\b)", true),
+        ("[see [[x]] here](u)", nil),
     ]
 
     @Test func corpusRoundTripsWithoutChangingMeaning() throws {
@@ -183,6 +193,20 @@ import Testing
         #expect(md(InlineRun("alias", marks: .bold, wiki: "Doc|alias")) == "**[[Doc|alias]]**")
     }
 
+    /// Bold ending in punctuation right before a letter has no markdown
+    /// spelling: the mark pulls in rather than leave literal asterisks.
+    @Test func emphasisWithNoSpellingNeverLeavesDeadDelimiters() throws {
+        for (runs, text) in [
+            ([InlineRun("Note:", marks: .bold), InlineRun("text")], "Note:text"),
+            ([InlineRun("中文。", marks: .bold), InlineRun("テキスト")], "中文。テキスト"),
+        ] {
+            let out = InlineCodec.serialize(InlineCodec.build(runs))
+            let back = try #require(InlineCodec.parse(out))
+            #expect(String(back.characters) == text, "no stray asterisks: \(out)")
+            #expect(InlineCodec.runs(back).contains { $0.marks.contains(.bold) }, "still bold where it can be: \(out)")
+        }
+    }
+
     @Test func everyCanonicalOutputParsesBack() throws {
         // text with every awkward character, in every mark
         let nasty = "a*b_c`d[e]f<g>h&i;~j\\k#l|m!n"
@@ -192,6 +216,15 @@ import Testing
             let back = try #require(InlineCodec.parse(out), "parses: \(out)")
             #expect(String(back.characters) == "x \(nasty) y", "text survives: \(out)")
         }
+    }
+
+    @Test func headingEndingInHashesKeepsThem() {
+        for text in ["Issue #", "Sharp ##", "#", "C#"] {
+            let h = EditorBlockContent.heading(level: 2, AttributedString(text))
+            #expect(EditorBlockContent.parse(markdown: h.markdown) == h, "\(text) → \(h.markdown)")
+        }
+        #expect(EditorBlockContent.heading(level: 1, AttributedString("Issue #")).markdown == "# Issue \\#")
+        #expect(EditorBlockContent.heading(level: 1, AttributedString("C#")).markdown == "# C#")
     }
 
     @Test func blockKinds() throws {

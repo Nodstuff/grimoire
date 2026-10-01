@@ -39,6 +39,10 @@ struct DocEditorView: View {
                 .frame(maxWidth: .infinity)
             }
             .scrollDismissesKeyboard(.interactively)
+            // the [[ popup is pinned to where the caret was: a scroll drops it
+            .onScrollPhaseChange { _, phase in
+                if phase == .interacting { model.dismissCompletion() }
+            }
             .onChange(of: model.pendingFocus) { _, f in
                 if let f { proxy.scrollTo(f.id) }
             }

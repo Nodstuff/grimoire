@@ -314,6 +314,8 @@ public final class Cache: Sendable {
             .tracking { db in
                 try BlockRecord.filter(BlockRecord.Columns.docID == id).order(BlockRecord.Columns.position).fetchAll(db)
             }
+            // any doc's write touches the blocks table: emit only real changes to this one
+            .removeDuplicates()
             .values(in: db)
     }
 }

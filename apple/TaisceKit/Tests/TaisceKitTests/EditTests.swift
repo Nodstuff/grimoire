@@ -148,12 +148,18 @@ import Testing
         try await cache.enqueue([.replaceText("n1", "new, edited")], on: &again)
 
         let epoch = Counter()
-        let server = MockServer { _ in .json(#"{"doc_id":"d1","epoch":\#(6 + epoch.next()),"verdicts":[]}"#) }
+        let targets = ["p1", "n1", "n1"]
+        let server = MockServer { _ in
+            let n = epoch.next()
+            return .json(#"{"doc_id":"d1","epoch":\#(6 + n),"verdicts":[{"op_id":"o\#(n)","block_id":"\#(targets[min(n, 2)])","verdict":"green","confidence":1,"applied":true,"note":""}]}"#)
+        }
         try await OutboxReplayer(api: server.client(), cache: cache).replay()
 
         let bodies = try server.requests.map(sent)
         #expect(server.requests.map(\.path) == ["/api/propose", "/api/propose", "/api/propose"])
-        #expect(bodies.map { $0["base_epoch"] as? Int } == [5, 6, 7])
+        // each counts from our own last write to the blocks it touches: the
+        // insert under h1 (untouched) stays on 5, the edit of n1 follows its insert at 7
+        #expect(bodies.map { $0["base_epoch"] as? Int } == [5, 5, 7])
         let rids = bodies.compactMap { $0["request_id"] as? String }
         #expect(Set(rids).count == 3 && rids.allSatisfy { UUID(uuidString: $0) != nil })
         let kinds = bodies.map { (($0["ops"] as? [[String: Any]])?.first?["kind"] as? [String: Any])?["op"] as? String }

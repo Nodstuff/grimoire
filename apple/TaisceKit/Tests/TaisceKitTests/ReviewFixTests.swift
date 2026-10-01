@@ -236,23 +236,28 @@ import Testing
         }
     }
 
-    /// #9: rebase only onto our own write (epoch + 1); a bigger jump means
-    /// someone else wrote, and the gate should score the rest.
-    @Test func rebaseOnlyWhenTheEpochMovedByOurWriteAlone() async throws {
+    /// #9, per block: a queued edit of b1 is sent on the epoch our last
+    /// applied write to b1 landed at, even when others wrote other blocks
+    /// in between (the landing epoch jumped); a red (unapplied) op doesn't count.
+    @Test func rebaseFollowsOurLastWriteToTheBlock() async throws {
         let cache = try Cache.inMemory()
         try await cache.enqueue(propose(5))
         try await cache.enqueue(propose(5))
         try await cache.enqueue(propose(5))
         let epochs = Counter()
         let server = MockServer { _ in
-            // first lands at 6 (ours), second at 9 (others wrote in between)
-            .json(#"{"doc_id":"d1","epoch":\#([6, 9, 10][min(epochs.next(), 2)]),"verdicts":[]}"#)
+            let n = epochs.next()
+            // lands at 6, then at 9 (others wrote in between), then parked red
+            let (epoch, applied, verdict) = [(6, true, "green"), (9, true, "green"), (9, false, "red")][min(n, 2)]
+            return .json(#"{"doc_id":"d1","epoch":\#(epoch),"verdicts":[{"op_id":"o\#(n)","block_id":"b1","verdict":"\#(verdict)","confidence":1,"applied":\#(applied),"note":""}]}"#)
         }
+        try await OutboxReplayer(api: server.client(), cache: cache).replay()
+        try await cache.enqueue(propose(5))
         try await OutboxReplayer(api: server.client(), cache: cache).replay()
         let bases = server.requests.compactMap { r -> Int? in
             (try? JSONSerialization.jsonObject(with: r.httpBody ?? Data()) as? [String: Any])?["base_epoch"] as? Int
         }
-        #expect(bases == [5, 6, 6])
+        #expect(bases == [5, 6, 9, 9])
     }
 }
 

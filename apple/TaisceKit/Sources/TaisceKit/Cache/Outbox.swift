@@ -39,9 +39,8 @@ public struct OutboxEntry: Codable, Sendable, Hashable, FetchableRecord, Mutable
 
 extension Cache {
     /// Queue a propose. Re-enqueueing the same `requestID` is a no-op.
-    /// A base epoch our own landed writes have since moved past (each one
-    /// `base → base + 1`, nobody else in between) is moved up with them,
-    /// so an edit made on top of them isn't scored as stale against them.
+    /// Its base is moved up past our own landed writes to the blocks it
+    /// touches when it is sent (`adjustedBase`), not here.
     @discardableResult
     public func enqueue(_ request: ProposeRequest, now: Date = .now) async throws -> OutboxEntry {
         let key = request.requestID ?? UUID().uuidString.lowercased()
@@ -51,7 +50,6 @@ extension Cache {
             }
             var req = request
             req.requestID = key
-            req.baseEpoch = try Self.chainedBase(db, doc: req.docID, from: req.baseEpoch)
             var e = OutboxEntry(
                 id: nil, createdAt: now, idempotencyKey: key, method: "POST", path: "/api/propose",
                 body: try JSONEncoder().encode(req), state: .pending, attempts: 0, lastError: nil
@@ -87,25 +85,55 @@ extension Cache {
         return try await enqueue(req, now: now)
     }
 
-    /// Follow our own landed proposes up from `base`.
-    static func chainedBase(_ db: Database, doc: DocID, from base: Int) throws -> Int {
-        var base = base
-        let landed = try OutboxEntry
-            .filter(OutboxEntry.Columns.state == OutboxEntry.State.done.rawValue)
-            .filter(OutboxEntry.Columns.createdAt >= Date().addingTimeInterval(-Cache.reviewWindow))
-            .filter(OutboxEntry.Columns.path == "/api/propose" || OutboxEntry.Columns.path == "/api/propose_markdown")
-            .filter(OutboxEntry.Columns.outcome != nil)
-            .fetchAll(db)
-        var steps: [Int: Int] = [:]
-        for e in landed {
-            guard let (d, b) = OutboxReplayer.proposeBase(e), d == doc, let data = e.outcome,
-                  let out = try? JSONDecoder().decode(ProposeOutcome.self, from: data), out.epoch == b + 1
-            else { continue }
-            steps[b] = out.epoch
+    /// For each block of `docID`, the epoch our newest applied op on it
+    /// landed at (from the outbox's recorded outcomes).
+    public func ourLastWrites(_ docID: DocID, now: Date = .now) async throws -> [BlockID: Int] {
+        let rows = try await db.read { db in
+            try OutboxEntry
+                .filter(OutboxEntry.Columns.state == OutboxEntry.State.done.rawValue)
+                .filter(OutboxEntry.Columns.path == "/api/propose")
+                .filter(OutboxEntry.Columns.outcome != nil)
+                .filter(OutboxEntry.Columns.createdAt >= now.addingTimeInterval(-Cache.reviewWindow))
+                .fetchAll(db)
         }
-        var seen: Set<Int> = []
-        while let next = steps[base], seen.insert(base).inserted { base = next }
-        return base
+        var out: [BlockID: Int] = [:]
+        for e in rows {
+            guard let body = e.body, let data = e.outcome,
+                  let req = try? JSONDecoder().decode(ProposeRequest.self, from: body), req.docID == docID,
+                  let outcome = try? JSONDecoder().decode(ProposeOutcome.self, from: data)
+            else { continue }
+            for (i, v) in outcome.verdicts.enumerated() where v.applied {
+                guard let t = v.blockID ?? (i < req.ops.count ? req.ops[i].kind.target : nil) else { continue }
+                out[t] = max(out[t] ?? 0, outcome.epoch)
+            }
+        }
+        return out
+    }
+
+    /// The base a propose should be sent on. The gate scores an op as
+    /// stale when its block changed after the base; a change that was our
+    /// own landed write isn't a conflict, so each block counts from our
+    /// last write to it (or the propose's own base, if later). One propose
+    /// has one base: the lowest over the blocks it touches (a replace,
+    /// delete or move target, an insert's parent), so a block someone else
+    /// changed is still caught. Never above what the server has reached.
+    public func adjustedBase(_ req: ProposeRequest) async throws -> Int {
+        let ours = try await ourLastWrites(req.docID)
+        guard !ours.isEmpty else { return req.baseEpoch }
+        var keys: [BlockID] = []
+        for op in req.ops {
+            switch op.kind {
+            case let .insert(_, parent, _, _, _): if let parent { keys.append(parent) }
+            case let .replace(t, _), let .delete(t): keys.append(t)
+            case let .move(t, parent, _):
+                keys.append(t)
+                if let parent { keys.append(parent) }
+            }
+        }
+        guard !keys.isEmpty else { return req.baseEpoch }
+        let base = keys.map { max(req.baseEpoch, ours[$0] ?? req.baseEpoch) }.min() ?? req.baseEpoch
+        let known = max(try await doc(req.docID)?.currentEpoch ?? 0, ours.values.max() ?? 0)
+        return min(base, max(known, req.baseEpoch))
     }
 
     /// Queue a deadline change (`nil` clears it). Same body as
@@ -254,13 +282,22 @@ public struct OutboxReplayer: Sendable {
                 var r = try await api.request(entry.path, method: entry.method)
                 r.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 r.httpBody = entry.body
+                // sent on the base its blocks really have, given our own landed writes
+                if entry.path == "/api/propose", let body = entry.body,
+                   var req = try? JSONDecoder().decode(ProposeRequest.self, from: body) {
+                    let base = try await cache.adjustedBase(req)
+                    if base != req.baseEpoch {
+                        req.baseEpoch = base
+                        r.httpBody = try JSONEncoder().encode(req)
+                    }
+                }
                 let data = try await api.send(raw: r)
                 let isPropose = entry.path == "/api/propose" || entry.path == "/api/propose_markdown"
                 try await cache.markOutbox(id, state: .done, outcome: isPropose ? data : nil)
-                // rebase only onto our own write: an epoch that jumped further
-                // means someone else wrote too, and the gate should score the rest
-                if let (doc, base) = Self.proposeBase(entry), let outcome = try? JSONDecoder().decode(Landed.self, from: data),
-                   outcome.epoch == base + 1 {
+                // whole-doc proposes (no per-block bases) rebase only onto our
+                // own write: an epoch that jumped further means someone else wrote
+                if entry.path == "/api/propose_markdown", let (doc, base) = Self.proposeBase(entry),
+                   let outcome = try? JSONDecoder().decode(Landed.self, from: data), outcome.epoch == base + 1 {
                     try await cache.rebaseOutbox(docID: doc, from: base, to: outcome.epoch)
                 }
             } catch let APIError.server(msg) where msg.hasPrefix(Self.liveSessionRefusal) {

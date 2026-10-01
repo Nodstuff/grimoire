@@ -160,16 +160,22 @@ extension Cache {
     /// was never fetched.
     public func editor(for id: DocID) async throws -> DocEditor? {
         guard let rec = try await doc(id), let bodyEpoch = rec.bodyEpoch else { return nil }
-        let queued = try await pendingOutbox().compactMap { e -> ProposeRequest? in
-            guard e.path == "/api/propose", let body = e.body,
-                  let req = try? JSONDecoder().decode(ProposeRequest.self, from: body), req.docID == id
-            else { return nil }
-            return req
+        func proposes(_ rows: [OutboxEntry]) -> [ProposeRequest] {
+            rows.compactMap { e in
+                guard e.path == "/api/propose", let body = e.body,
+                      let req = try? JSONDecoder().decode(ProposeRequest.self, from: body), req.docID == id
+                else { return nil }
+                return req
+            }
         }
-        // chained edits keep the queue's base so replay can rebase them together
+        let queued = proposes(try await pendingOutbox())
+        // refused writes stay on screen too (until retried or discarded):
+        // typed text never just disappears
+        let refused = try await failedOutbox()
+        let overlay = (try await pendingOutbox() + refused).sorted { ($0.id ?? 0) < ($1.id ?? 0) }
         let base = queued.first?.baseEpoch ?? bodyEpoch
         var editor = DocEditor(docID: id, baseEpoch: base, blocks: try await blocks(of: id).map(\.block))
-        editor.overlay(queued.flatMap { $0.ops.map(\.kind) })
+        editor.overlay(proposes(overlay).flatMap { $0.ops.map(\.kind) })
         return editor
     }
 
