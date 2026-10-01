@@ -274,6 +274,7 @@ struct DocContent: View {
                         action: onToggle.map { f in { i, v in f(block.id, i, v) } }
                     ))
             }
+            .environment(\.docTables, page.chartTables)
         } else if let loadError {
             VStack(alignment: .leading, spacing: 12) {
                 EmptyCard(icon: "wifi.slash", title: "Couldn't load this doc", hint: loadError)

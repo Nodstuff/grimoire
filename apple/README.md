@@ -332,8 +332,62 @@ markdown. `LaunchTests` needs a doc titled "Welcome" headed "Welcome to Taisce".
 - `propose_markdown` queues are rebased like `propose`, but a stale base is
   an error there (whole-doc diff), so they are not chained.
 - Pins are local (UserDefaults, per server); pinned docs are always fetched by sync.
-- Diagrams (Mermaid, Vega-Lite, D2) render as labelled placeholder cards.
+- D2 and canvases render as labelled cards; full Vega (not -Lite) too.
 - Mac Catalyst.
+
+## Charts and diagrams
+
+**Charts** (` ```vega-lite ` fences) are drawn natively with Swift Charts; no
+web view. `ChartSpec.parse` (TaisceKit `Charts/`, pure) maps the JSON to a
+`ChartModel`; `ChartBlock` (app `Diagrams/`) renders it.
+
+- Marks: bar, line, area, point, arc (pie; donut with `innerRadius`), rule,
+  tick. Encodings: x, y, color, theta, size, xOffset (grouped bars), `datum`.
+  Field types quantitative / temporal / nominal / ordinal (inferred when
+  absent: numbers → quantitative, ISO dates → temporal, else nominal).
+  `aggregate` sum / mean / count / min / max / median; `sort` (default
+  ascending, `null`, `descending`, `"-y"`, an explicit list, `{op, order}`);
+  `stack` (`normalize`, `center`, `null`); `title`, axis titles; `layer`
+  (line + point, bar + mean rule); `"point": true`; `interpolate`; `height`
+  (clamped 220-320 pt).
+- Data: inline `data.values`, or `{"block": "^abc123"}` / `{"table": "^abc123"}`
+  naming a GFM table in the same doc (the last six hex digits of its block
+  id, as `read_doc refs: true` shows them). The header row is the fields;
+  cells coerce to numbers (`1,234`, `12%`, `$5`) and ISO dates, so editing
+  the table redraws the chart. `data.url` and named datasets show a note.
+- Anything else (transforms, facets, concat, other marks) is a "Chart type
+  not supported on iPhone yet" card naming the mark; invalid JSON is a card
+  with the error and the offending line.
+- Theme: the accent first, then green, amber, rose, teal, violet, tan, grey
+  (each a dark/light pair). A temporal or categorical x with more than 24
+  values scrolls horizontally (16 visible). Swift Charts supplies audio
+  graphs; each mark carries a label and value, the chart a summary.
+
+**Mermaid** renders on the device with the bundled mermaid **12.0.0**
+(`App/Taisce/Resources/mermaid.min.js`, MIT, `mermaid.LICENSE.txt`):
+
+- Provenance: `dist/mermaid.min.js` from `https://registry.npmjs.org/mermaid/-/mermaid-12.0.0.tgz`;
+  the tarball matches the registry's `dist.integrity`
+  (`sha512-/wQXC9iBxoGV8p3erbvaXs9h77VyLDBH6GdayVjj3hEcSQhFU4N1WUhUppotCEqlIxI2pRMwjwBSwTB1MfZBgQ==`),
+  and the file is byte-identical to jsdelivr's
+  `mermaid@12.0.0/dist/mermaid.min.js`. sha256 of the bundled file:
+  `28fca7ae6ebc7ed7bb63bde63136a74bfef14f296a57e403657eeb8b32836073`.
+  To upgrade: fetch the new tarball, check its integrity, copy the file,
+  bump `DiagramCacheKey.renderer` and this paragraph.
+- One shared offscreen, non-persistent `WKWebView` (`MermaidWebView`),
+  loaded with `loadHTMLString` and a base URL inside the app bundle. CSP
+  `default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src data:`
+  (no network of any kind); every navigation after the first is refused;
+  `securityLevel: 'strict'`; `htmlLabels: false`. Theme follows the trait
+  collection (`dark` / `default`). The page rasterises the SVG on a canvas
+  at the device scale (capped at 16 Mpx) and returns PNG.
+- `DiagramRenderQueue` (TaisceKit actor) runs one render at a time, joins
+  identical requests, caches PNGs in `Caches/diagrams/<sha256(renderer +
+  theme + width + source)>.png`, and fails a render after 5 s (the queue
+  moves on). Widths are bucketed to 20 pt.
+- Inline: a shimmer while rendering, then the image at its aspect (never
+  upscaled); tap opens full screen with pinch-zoom, pan and double-tap.
+  Errors (mermaid's parse message, the timeout) show as a card.
 
 ## Running the app against a scratch daemon
 

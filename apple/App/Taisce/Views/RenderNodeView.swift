@@ -40,8 +40,8 @@ struct RenderNodeView: View {
             CodeBlockView(label: language, code: code)
         case let .table(table):
             TableBlock(table: table)
-        case let .diagram(kind, _):
-            DiagramCard(kind: kind)
+        case let .diagram(kind, source):
+            DiagramBlock(kind: kind, source: source)
         case let .frontmatter(text):
             CodeBlockView(label: "properties", code: text)
         case .thematicBreak:
@@ -265,39 +265,5 @@ private struct TableBlock: View {
         case .center: .center
         case .trailing: .trailing
         }
-    }
-}
-
-/// Mermaid / Vega-Lite / D2 / canvas: native rendering comes later.
-private struct DiagramCard: View {
-    let kind: String
-
-    var name: String {
-        switch kind {
-        case "mermaid": "Mermaid"
-        case "vega-lite", "vega": "Vega-Lite"
-        case "d2": "D2"
-        case "canvas": "Canvas"
-        default: kind.capitalized
-        }
-    }
-
-    var body: some View {
-        HStack(spacing: 14) {
-            Image(systemName: kind == "vega-lite" || kind == "vega" ? "chart.xyaxis.line" : "point.3.connected.trianglepath.dotted")
-                .font(.title3)
-                .foregroundStyle(Theme.accent)
-                .frame(width: 40, height: 40)
-                .background(Theme.accent.opacity(0.12), in: .rect(cornerRadius: 10, style: .continuous))
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Diagram: open on desktop").font(.subheadline.weight(.medium)).foregroundStyle(Theme.text)
-                Text("\(name) diagrams render in the desktop app for now.").font(.footnote).foregroundStyle(Theme.secondary)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(14)
-        .card(Theme.surface2)
-        .accessibilityElement(children: .combine)
     }
 }
