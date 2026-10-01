@@ -38,6 +38,8 @@ public actor SyncEngine {
     private var runner: Task<Void, Never>?
     private var subscribers: [UUID: AsyncStream<SyncUpdate>.Continuation] = [:]
     private var serverRetry: Duration?
+    /// set by `follow()` when the current connection delivered anything
+    private var connectionHealthy = false
 
     public init(
         api: APIClient,
@@ -101,13 +103,16 @@ public actor SyncEngine {
                     caughtUp = true
                 }
                 status = .live
-                if try await follow() { attempt = 0 }
+                try await follow()
             } catch is CancellationError {
                 break
             } catch {
                 // fall through to the backoff; a failed catch-up is retried whole
             }
             if Task.isCancelled { break }
+            // a connection that delivered events or heartbeats was healthy:
+            // its drop starts the backoff over
+            if connectionHealthy { attempt = 0 }
             let delay = serverRetry.map { max($0, backoff.delay(attempt: attempt)) } ?? backoff.delay(attempt: attempt)
             status = .waiting(retryIn: delay)
             attempt += 1
@@ -134,13 +139,12 @@ public actor SyncEngine {
         }
     }
 
-    /// Follow the SSE stream until it ends. Returns whether any event or
-    /// heartbeat arrived (a healthy connection resets the backoff).
-    func follow() async throws -> Bool {
+    /// Follow the SSE stream until it ends or drops.
+    func follow() async throws {
         let from = try await cache.lastSeq()
-        var healthy = false
+        connectionHealthy = false
         for try await out in api.changeStream(lastEventID: from) {
-            healthy = true
+            connectionHealthy = true
             switch out {
             case .retry(let ms):
                 serverRetry = .milliseconds(ms)
@@ -156,7 +160,6 @@ public actor SyncEngine {
                 if seq > (try await cache.lastSeq()) { try await cache.setLastSeq(seq) }
             }
         }
-        return healthy
     }
 
     // MARK: applying changes

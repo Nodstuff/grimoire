@@ -59,8 +59,10 @@ public enum BlockRenderer {
         }
     }
 
+    /// Inline children re-serialised on their own: formatting them in place
+    /// would carry container syntax (`> ` inside quotes, list indents).
     static func inline(_ m: any Markup) -> String {
-        m.children.map { $0.format() }.joined()
+        Paragraph(m.children.compactMap { $0 as? any InlineMarkup }).format()
     }
 
     static func item(_ li: Markdown.ListItem) -> RenderNode.ListItem {
