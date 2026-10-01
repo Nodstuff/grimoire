@@ -4,13 +4,15 @@ import TaisceKit
 /// The doc tree, with disclosure. Pull to refresh catches up with the server.
 struct LibraryScreen: View {
     @Environment(AppModel.self) private var model
+    @Environment(Router.self) private var router
 
     var body: some View {
         LibraryContent(
             nodes: model.library,
             loaded: model.treeLoaded,
             pins: Set(model.pins),
-            onTogglePin: model.togglePin
+            onTogglePin: model.togglePin,
+            onNewDoc: { router.newDoc(in: $0) }
         )
         .refreshable { try? await model.sync?.catchUp() }
     }
@@ -21,6 +23,8 @@ struct LibraryContent: View {
     let loaded: Bool
     var pins: Set<DocID> = []
     var onTogglePin: (DocID) -> Void = { _ in }
+    /// nil parent = top level
+    var onNewDoc: ((DocID?) -> Void)?
     /// folders start closed; the ones you open are remembered across launches
     @AppStorage("library.expanded") private var expandedStore = ""
     @State private var expanded: Set<DocID>?
@@ -39,10 +43,14 @@ struct LibraryContent: View {
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets())
                 } else {
-                    LibraryTreeRows(nodes: nodes, pins: pins, expanded: $expanded, onTogglePin: onTogglePin)
+                    LibraryTreeRows(nodes: nodes, pins: pins, expanded: $expanded, onTogglePin: onTogglePin, onNewDoc: onNewDoc)
                 }
             } header: {
-                ScreenHeader(title: "Library")
+                ScreenHeader(title: "Library") {
+                    if let onNewDoc {
+                        CircleIconButton(systemImage: "plus", label: "New doc", filled: true) { onNewDoc(nil) }
+                    }
+                }
                     .textCase(nil)
                     .padding(.bottom, 8)
                     .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
@@ -71,12 +79,13 @@ struct LibraryTreeRows: View {
     let pins: Set<DocID>
     @Binding var expanded: Set<DocID>?
     let onTogglePin: (DocID) -> Void
+    var onNewDoc: ((DocID?) -> Void)?
 
     var body: some View {
         ForEach(nodes) { node in
             if let kids = node.children {
                 DisclosureGroup(isExpanded: binding(node.id)) {
-                    LibraryTreeRows(nodes: kids, pins: pins, expanded: $expanded, onTogglePin: onTogglePin)
+                    LibraryTreeRows(nodes: kids, pins: pins, expanded: $expanded, onTogglePin: onTogglePin, onNewDoc: onNewDoc)
                 } label: {
                     link(node)
                 }
@@ -105,6 +114,9 @@ struct LibraryTreeRows: View {
         .contextMenu {
             Button(pins.contains(node.id) ? "Unpin from Today" : "Pin to Today",
                    systemImage: pins.contains(node.id) ? "pin.slash" : "pin") { onTogglePin(node.id) }
+            if let onNewDoc {
+                Button("New doc here", systemImage: "plus") { onNewDoc(node.id) }
+            }
         }
     }
 }
