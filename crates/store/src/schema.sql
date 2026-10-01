@@ -469,3 +469,94 @@ WHEN old.status IS NOT new.status BEGIN
     INSERT INTO changes (doc_id, kind, epoch)
         SELECT id, 'doc', current_epoch FROM docs WHERE id = new.doc_id AND deleted = 0;
 END;
+
+-- Auth (server mode: OAuth 2.1 + passkeys). Every secret is stored as a
+-- SHA-256 hex hash, never in the clear; every expiry is unix seconds and
+-- enforced by the query that reads the row, not only by the cleanup sweep.
+-- Users are rows, not a singleton: one owner today, more later.
+CREATE TABLE IF NOT EXISTS auth_users (
+    id           TEXT PRIMARY KEY,
+    -- the principal this user's /api writes are attributed to
+    principal_id TEXT NOT NULL REFERENCES principals (id),
+    name         TEXT NOT NULL,
+    role         TEXT NOT NULL CHECK (role IN ('owner', 'member')),
+    created_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auth_credentials (
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES auth_users (id) ON DELETE CASCADE,
+    -- the WebAuthn credential id (base64url), unique across all users
+    cred_id      TEXT NOT NULL UNIQUE,
+    -- webauthn-rs `Passkey`, serialised (public key + counter; no secret)
+    passkey      TEXT NOT NULL,
+    label        TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    last_used_at INTEGER
+);
+
+-- One-time owner enrollment links minted by `grimoire auth enroll`.
+CREATE TABLE IF NOT EXISTS auth_enrollments (
+    token_hash TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL REFERENCES auth_users (id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL,
+    used_at    INTEGER
+);
+
+-- OAuth clients: 'dcr' (RFC 7591, client_id minted here) or 'cimd' (the
+-- client_id is an https URL; the fetched document is cached here).
+CREATE TABLE IF NOT EXISTS oauth_clients (
+    client_id     TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL CHECK (kind IN ('dcr', 'cimd')),
+    client_name   TEXT NOT NULL,
+    redirect_uris TEXT NOT NULL,
+    metadata      TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    -- cimd: when the cached document must be fetched again
+    refresh_at    INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS oauth_codes (
+    code_hash      TEXT PRIMARY KEY,
+    client_id      TEXT NOT NULL,
+    user_id        TEXT NOT NULL REFERENCES auth_users (id) ON DELETE CASCADE,
+    redirect_uri   TEXT NOT NULL,
+    code_challenge TEXT NOT NULL,
+    resource       TEXT,
+    scope          TEXT NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    used_at        INTEGER,
+    -- the grant this code was exchanged for: a replayed code revokes it
+    grant_id       TEXT
+);
+
+-- A grant is one authorization (one client, one user): the family every
+-- refresh/access token descends from. Revoking it kills all of them.
+CREATE TABLE IF NOT EXISTS oauth_grants (
+    id         TEXT PRIMARY KEY,
+    client_id  TEXT NOT NULL,
+    user_id    TEXT NOT NULL REFERENCES auth_users (id) ON DELETE CASCADE,
+    resource   TEXT,
+    scope      TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    revoke_why TEXT
+);
+
+CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
+    token_hash TEXT PRIMARY KEY,
+    grant_id   TEXT NOT NULL REFERENCES oauth_grants (id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    -- set when rotated: presenting it again is reuse (revokes the grant)
+    used_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS oauth_refresh_grant ON oauth_refresh_tokens (grant_id);
+
+CREATE TABLE IF NOT EXISTS oauth_access_tokens (
+    token_hash TEXT PRIMARY KEY,
+    grant_id   TEXT NOT NULL REFERENCES oauth_grants (id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS oauth_access_grant ON oauth_access_tokens (grant_id);

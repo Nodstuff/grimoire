@@ -3,6 +3,7 @@
 //! Ledger (`ops`) is the primary write record; `blocks` is the projection,
 //! written in the same transaction. One committed `apply` = one epoch.
 
+pub mod auth;
 pub mod export;
 pub mod gate;
 pub mod import;

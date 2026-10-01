@@ -14,7 +14,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 pub type FrozenProbe = Box<dyn Fn(Uuid) -> bool + Send + Sync>;
 
 pub struct SqliteStore {
-    conn: Connection,
+    pub(crate) conn: Connection,
     frozen: Option<FrozenProbe>,
 }
 
