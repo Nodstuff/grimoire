@@ -1,0 +1,23 @@
+[Unit]
+Description=Taisce daemon (grimoire, SERVER mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=taisce
+Group=taisce
+Environment=HOME=/var/lib/taisce
+Environment=GRIMOIRE_IDENTITY_FILE=/var/lib/taisce/identity.key
+Environment=GRIMOIRE_PUBLIC_URL=https://taisce.null.ie
+Environment=GRIMOIRE_TRUSTED_PROXY=true
+ExecStart=/opt/taisce/bin/grimoire --db /var/lib/taisce/ks.db --port 7425 serve
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/taisce
+
+[Install]
+WantedBy=multi-user.target

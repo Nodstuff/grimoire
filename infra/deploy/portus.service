@@ -1,0 +1,22 @@
+[Unit]
+Description=Portus reverse proxy (TLS via ACME tls-alpn-01)
+After=network-online.target grimoire.service
+Wants=network-online.target
+
+[Service]
+User=portus
+Group=portus
+Environment=PORTUS_CONFIG_FILE=/etc/portus/portus.yaml
+ExecStart=/opt/taisce/bin/portus-dataplane
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/portus
+
+[Install]
+WantedBy=multi-user.target

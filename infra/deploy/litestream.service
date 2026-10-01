@@ -1,0 +1,20 @@
+[Unit]
+Description=Litestream replication of the Taisce db to S3
+After=grimoire.service
+Requires=grimoire.service
+
+[Service]
+User=taisce
+Group=taisce
+Environment=HOME=/var/lib/taisce
+Environment=AWS_REGION=eu-west-1
+ExecStart=/opt/taisce/bin/litestream replicate -config /etc/taisce/litestream.yml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/taisce
+
+[Install]
+WantedBy=multi-user.target

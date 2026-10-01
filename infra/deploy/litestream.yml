@@ -1,0 +1,6 @@
+# Continuous SQLite replication of the Taisce library to S3.
+dbs:
+  - path: /var/lib/taisce/ks.db
+    replica:
+      url: s3://taisce-backups-895102116452/litestream/ks.db
+      region: eu-west-1
