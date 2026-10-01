@@ -91,8 +91,21 @@ pub(crate) fn refuse_if_mirror(s: &SqliteStore, id: Uuid, what: &str) -> Option<
     }
 }
 
-async fn docs(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+/// Header on `GET /api/docs`: the change journal's head, read under the same
+/// lock as the list — a syncing client's cursor for exactly this snapshot.
+pub const SEQ_HEADER: &str = "x-grimoire-seq";
+
+async fn docs(State(st): State<ApiState>) -> ([(&'static str, String); 1], Json<Value>) {
+    let (seq, body) = with_store(&st.store, move |s| {
+        let seq = s.latest_change_seq().unwrap_or(0);
+        (seq, docs_json(s))
+    })
+    .await;
+    ([(SEQ_HEADER, seq.to_string())], body)
+}
+
+fn docs_json(s: &mut SqliteStore) -> Json<Value> {
+    {
         let canvases: std::collections::HashSet<String> =
             s.canvas_doc_ids().unwrap_or_default().into_iter().collect();
         let tended: std::collections::HashSet<String> = s
@@ -192,8 +205,7 @@ async fn docs(State(st): State<ApiState>) -> Json<Value> {
             }
             Err(e) => Json(json!({"error": e.to_string()})),
         }
-    })
-    .await
+    }
 }
 
 /// Hub mode (slice 1), for the hub's own UI and the CLI on the box: whether

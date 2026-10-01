@@ -1024,6 +1024,22 @@ pub struct Change {
     pub kind: String,
     pub epoch: Option<i64>,
     pub at: String,
+    /// The doc as it stands NOW (read when the page is served, not as of
+    /// `seq`), so a tree change needs no `/api/docs` refetch. Absent when the
+    /// row is gone (hard delete).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<DocSummary>,
+}
+
+/// The tree-facing fields of a doc, riding on a [`Change`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocSummary {
+    pub title: String,
+    pub parent_id: Option<String>,
+    pub sort_key: Option<String>,
+    pub status: Option<String>,
+    pub current_epoch: i64,
+    pub deleted: bool,
 }
 
 /// A page of [`Change`]s after a cursor; `seq` is the journal's head.

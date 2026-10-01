@@ -163,3 +163,24 @@ fn commit_hook_fires_on_every_commit() {
     s.apply(doc.id, 0, tom.id, vec![insert("a")]).unwrap();
     assert!(n.load(Ordering::SeqCst) > after_create);
 }
+
+#[test]
+fn rows_carry_the_doc_summary_as_it_stands_now() {
+    let (mut s, tom) = store_with_tom();
+    let parent = s.create_doc("p", None, tom.id).unwrap();
+    let doc = s.create_doc("d", Some(parent.id), tom.id).unwrap();
+    s.set_doc_status(doc.id, Some(DocStatus::Draft)).unwrap();
+    let page = s.changes_since(0, 100).unwrap();
+    let row = page.changes.iter().find(|c| c.doc_id == doc.id.to_string()).unwrap();
+    let sum = row.doc.as_ref().unwrap();
+    assert_eq!(sum.title, "d");
+    assert_eq!(sum.parent_id.as_deref(), Some(parent.id.to_string().as_str()));
+    assert!(sum.sort_key.is_some());
+    assert_eq!(sum.status.as_deref(), Some("draft"), "current state, even on the older create row");
+    assert_eq!(sum.current_epoch, 0);
+    assert!(!sum.deleted);
+    s.delete_doc(doc.id).unwrap();
+    let last = s.changes_since(0, 100).unwrap().changes.pop().unwrap();
+    assert_eq!(last.kind, "deleted");
+    assert!(last.doc.unwrap().deleted);
+}

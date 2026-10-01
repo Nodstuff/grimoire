@@ -4903,16 +4903,31 @@ impl SqliteStore {
     /// `more` says rows remain past the page.
     pub fn changes_since(&self, since: i64, limit: usize) -> Result<ChangePage> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT seq, doc_id, kind, epoch, at FROM changes WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+            "SELECT c.seq, c.doc_id, c.kind, c.epoch, c.at,
+                    d.id, d.title, d.parent_id, d.sort_key, d.status, d.current_epoch, d.deleted
+             FROM changes c LEFT JOIN docs d ON d.id = c.doc_id
+             WHERE c.seq > ?1 ORDER BY c.seq LIMIT ?2",
         )?;
         let mut changes: Vec<Change> = stmt
             .query_map(params![since, limit as i64 + 1], |r| {
+                let doc = match r.get::<_, Option<String>>(5)? {
+                    Some(_) => Some(DocSummary {
+                        title: r.get(6)?,
+                        parent_id: r.get(7)?,
+                        sort_key: r.get(8)?,
+                        status: r.get(9)?,
+                        current_epoch: r.get(10)?,
+                        deleted: r.get::<_, i64>(11)? != 0,
+                    }),
+                    None => None,
+                };
                 Ok(Change {
                     seq: r.get(0)?,
                     doc_id: r.get(1)?,
                     kind: r.get(2)?,
                     epoch: r.get(3)?,
                     at: r.get(4)?,
+                    doc,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;

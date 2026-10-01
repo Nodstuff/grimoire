@@ -8,7 +8,15 @@
 //! - `GET /api/changes/stream` — Server-Sent Events. Resumes after the
 //!   `Last-Event-ID` header (else `?since=`, else 0): replays the backlog,
 //!   then pushes rows as they land. Each event is `id: <seq>`, `event:
-//!   change`, `data: <one change object>`; a `: ping` comment every 25s.
+//!   change`, `data: <one change object>`; a `retry: 3000` once on connect
+//!   and a `: ping` comment every 25s.
+//!
+//! Each change carries `doc: {title, parent_id, sort_key, status,
+//! current_epoch, deleted}` — the doc as it stands when the page is served —
+//! unless the row is gone. Failures are real statuses with a JSON body: 400
+//! for a bad query, 500 for a store error. `GET /api/docs` answers with
+//! `X-Grimoire-Seq: <head>` read under the same lock as the list, so a
+//! client bootstraps the tree and its cursor from one snapshot.
 //!
 //! Waking: the store's commit hook pokes a [`Notify`]; ONE pump task per
 //! daemon re-reads `max(seq)` and publishes it on a `watch` channel, with a
@@ -18,15 +26,18 @@
 
 use crate::api::ApiState;
 use crate::store_ext::with_store;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
+use futures_util::StreamExt as _;
 use futures_util::stream::{self, Stream};
 use grimoire_store::{Change, SqliteStore};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, Once};
@@ -40,6 +51,13 @@ const HEARTBEAT: Duration = Duration::from_secs(25);
 const FALLBACK_POLL: Duration = Duration::from_secs(2);
 /// Rows a stream reads per store round-trip while replaying.
 const STREAM_PAGE: usize = 500;
+/// The reconnect delay sent once per stream (`retry:`); clients floor their
+/// backoff on it.
+const RETRY: Duration = Duration::from_secs(3);
+
+fn error(status: StatusCode, msg: impl std::fmt::Display) -> Response {
+    (status, Json(json!({"error": msg.to_string()}))).into_response()
+}
 
 /// The journal head, published to every open stream.
 #[derive(Clone)]
@@ -99,11 +117,15 @@ struct ChangesQuery {
     limit: Option<usize>,
 }
 
-async fn changes(State(st): State<ApiState>, Query(q): Query<ChangesQuery>) -> Json<Value> {
+async fn changes(State(st): State<ApiState>, q: Result<Query<ChangesQuery>, QueryRejection>) -> Response {
+    let Query(q) = match q {
+        Ok(q) => q,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     with_store(&st.store, move |s| match s.changes_since(q.since, limit) {
-        Ok(page) => Json(json!(page)),
-        Err(e) => Json(json!({"error": e.to_string()})),
+        Ok(page) => Json(json!(page)).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
     })
     .await
 }
@@ -168,23 +190,40 @@ async fn next_change(mut cur: Cursor) -> Option<(Result<Event, Infallible>, Curs
 
 fn change_stream(feed: &Feed, store: Arc<Mutex<SqliteStore>>, after: i64) -> impl Stream<Item = Result<Event, Infallible>> + use<> {
     let cur = Cursor { store, head: feed.subscribe(), after, queue: VecDeque::new() };
-    stream::unfold(cur, next_change)
+    stream::once(async { Ok(Event::default().retry(RETRY)) }).chain(stream::unfold(cur, next_change))
 }
 
 async fn changes_stream(
     State(st): State<ApiState>,
     headers: HeaderMap,
-    Query(q): Query<StreamQuery>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    q: Result<Query<StreamQuery>, QueryRejection>,
+) -> Response {
+    let Query(q) = match q {
+        Ok(q) => q,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
+    // fail before the 200: a store that cannot answer is a 500, not an
+    // empty stream
+    if let Err(e) = with_store(&st.store, |s| s.latest_change_seq()).await {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
     let after = resume_from(&headers, q.since);
     Sse::new(change_stream(&st.changes, st.store.clone(), after))
         .keep_alive(KeepAlive::new().interval(HEARTBEAT).text("ping"))
+        .into_response()
+}
+
+/// Any `/api/*` path no route claims: a JSON 404, never the SPA's
+/// index.html with a 200 (a client would read that as success).
+async fn api_not_found() -> Response {
+    error(StatusCode::NOT_FOUND, "no such API route")
 }
 
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/changes", get(changes))
         .route("/api/changes/stream", get(changes_stream))
+        .route("/api/{*rest}", axum::routing::any(api_not_found))
         .with_state(state)
 }
 
@@ -195,7 +234,58 @@ mod tests {
     use axum::http::Request;
     use futures_util::StreamExt;
     use grimoire_store::{BlockStore, PrincipalKind};
+    use serde_json::Value;
     use tower::ServiceExt;
+
+    async fn raw(app: &Router, req: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let res = app.clone().oneshot(req).await.unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 22).await.unwrap();
+        (status, headers, bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn docs_carry_the_head_seq_and_failures_are_real_statuses() {
+        let (app, _) = crate::home::testing::app();
+        crate::home::testing::call(&app, "POST", "/api/docs", Some(json!({"title": "a", "parent_doc_id": null}))).await;
+        let (status, headers, _) = raw(&app, Request::get("/api/docs").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[crate::api::SEQ_HEADER], "1");
+        // a bad cursor is a 400 with a JSON body, on both routes
+        for uri in ["/api/changes?since=abc", "/api/changes/stream?since=abc", "/api/changes?limit=-1"] {
+            let (status, headers, body) = raw(&app, Request::get(uri).body(Body::empty()).unwrap()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(headers["content-type"], "application/json");
+            assert!(serde_json::from_slice::<Value>(&body).unwrap()["error"].is_string());
+        }
+        // an unknown API route is a JSON 404, any method
+        for m in ["GET", "POST"] {
+            let req = Request::builder().method(m).uri("/api/no/such/route").body(Body::empty()).unwrap();
+            let (status, headers, _) = raw(&app, req).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{m}");
+            assert_eq!(headers["content-type"], "application/json");
+        }
+        // and the real routes still win over the catch-all
+        let (status, _, _) = raw(&app, Request::get("/api/stamp").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rows_carry_the_doc_summary_and_the_stream_opens_with_retry() {
+        let (app, _) = crate::home::testing::app();
+        crate::home::testing::call(&app, "POST", "/api/docs", Some(json!({"title": "a", "parent_doc_id": null}))).await;
+        let v = crate::home::testing::call(&app, "GET", "/api/changes", None).await;
+        let doc = &v["changes"][0]["doc"];
+        assert_eq!(doc["title"], "a");
+        assert!(doc["parent_id"].is_null());
+        assert!(doc["sort_key"].is_string());
+        assert_eq!(doc["current_epoch"], 0);
+        assert_eq!(doc["deleted"], false);
+        let res = app.clone().oneshot(Request::get("/api/changes/stream").body(Body::empty()).unwrap()).await.unwrap();
+        let mut body = res.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_secs(5), body.next()).await.unwrap().unwrap().unwrap();
+        assert!(std::str::from_utf8(&first).unwrap().starts_with("retry: 3000\n"), "{first:?}");
+    }
 
     #[test]
     fn last_event_id_beats_since() {
@@ -311,6 +401,7 @@ mod tests {
             tom
         };
         let mut st = Box::pin(change_stream(&feed, store.clone(), 2));
+        let _retry = st.next().await;
         let first = tokio::time::timeout(Duration::from_secs(5), st.next()).await.unwrap();
         assert!(first.is_some());
         // a write from outside any HTTP route (a gardener, MCP) still wakes it
