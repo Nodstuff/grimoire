@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { addDays, deadlineTone, fmtDay, fmtDeadline, hasDuePhrase, isoDate, nextMonday, openItems, previewLabel, summaryLine, type TodoItem } from './todo'
+import { addDays, clientClock, deadlineTone, dueDate, fmtDay, fmtDeadline, hasDuePhrase, isOverdue, isoDate, moveDueAt, nextMonday, openItems, previewLabel, summaryLine, utcOffset, type TodoItem } from './todo'
 
 const item = (over: Partial<TodoItem> = {}): TodoItem => ({
   id: '0-abc',
   text: 'x',
   done: false,
-  overdue: false,
   due_soon: false,
   ...over,
 })
@@ -32,11 +31,36 @@ describe('dates', () => {
 })
 
 describe('deadlines', () => {
-  it('tone: overdue > soon > later, done never nags', () => {
-    expect(deadlineTone(item({ overdue: true, due_soon: false }))).toBe('overdue')
-    expect(deadlineTone(item({ due_soon: true }))).toBe('soon')
-    expect(deadlineTone(item())).toBe('later')
-    expect(deadlineTone(item({ overdue: true, done: true }))).toBe('later')
+  it('tone: overdue > soon > later, done never nags — overdue computed here', () => {
+    const now = new Date(2026, 8, 10, 12, 0)
+    expect(deadlineTone(item({ deadline: '2026-09-09' }), now)).toBe('overdue')
+    expect(deadlineTone(item({ deadline: '2026-09-10', due_soon: true }), now)).toBe('soon')
+    expect(deadlineTone(item(), now)).toBe('later')
+    expect(deadlineTone(item({ deadline: '2026-09-09', done: true }), now)).toBe('later')
+  })
+  it('overdue: a timed one once its instant passes, an all-day one once its day ends', () => {
+    const now = new Date(2026, 8, 10, 12, 0)
+    const before = new Date(2026, 8, 10, 11, 59).toISOString()
+    const after = new Date(2026, 8, 10, 12, 1).toISOString()
+    expect(isOverdue(item({ due_at: before }), now)).toBe(true)
+    expect(isOverdue(item({ due_at: after }), now)).toBe(false)
+    expect(isOverdue(item({ deadline: '2026-09-10' }), now)).toBe(false)
+    expect(isOverdue(item({ deadline: '2026-09-09', carried: true }), now)).toBe(false)
+  })
+  it('a timed deadline shows on its local date and moves keeping its local time', () => {
+    const at = new Date(2026, 8, 11, 15, 0).toISOString()
+    expect(dueDate(item({ due_at: at }))).toBe('2026-09-11')
+    expect(dueDate(item({ deadline: '2026-09-12' }))).toBe('2026-09-12')
+    const moved = new Date(moveDueAt(at, '2026-09-14'))
+    expect([moved.getDate(), moved.getHours(), moved.getMinutes()]).toEqual([14, 15, 0])
+  })
+  it('tells the daemon its date and UTC offset', () => {
+    expect(utcOffset(new Date())).toMatch(/^[+-]\d{2}:\d{2}$/)
+    const c = clientClock(new Date(2026, 8, 10, 23, 30))
+    expect(c.today).toBe('2026-09-10')
+    const m = -new Date(2026, 8, 10, 23, 30).getTimezoneOffset()
+    expect(c.utc_offset).toBe(utcOffset(new Date(2026, 8, 10, 23, 30)))
+    expect(Number(c.utc_offset.slice(1, 3)) * 60 + Number(c.utc_offset.slice(4))).toBe(Math.abs(m))
   })
   it('pill text: `due Fri` this week, `due 12 Sep` later, `2d overdue`', () => {
     expect(fmtDeadline('2026-09-10', '2026-09-10')).toBe('due today')
@@ -73,6 +97,8 @@ describe('due phrase hint', () => {
     expect(later).toMatch(/\w{3}/) // a weekday
     expect(previewLabel({ text: 'x', deadline: '2026-09-11' }, '2026-09-10')).toMatch(/^→ tomorrow · .*11/)
     expect(previewLabel({ text: 'x', deadline: '2026-09-10' }, '2026-09-10')).toMatch(/^→ today · .*10/)
+    const at = new Date(2026, 8, 11, 9, 30).toISOString()
+    expect(previewLabel({ text: 'x', deadline: null, due_at: at }, '2026-09-10')).toMatch(/^→ tomorrow · .*11.* 09:30$/)
   })
 })
 

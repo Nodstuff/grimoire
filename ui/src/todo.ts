@@ -10,9 +10,14 @@ export interface TodoItem {
   /** `- [>]`: moved forward into a later day */
   carried?: boolean
   carried_from?: string
+  /** an all-day deadline, `YYYY-MM-DD` (floating: no zone) */
   deadline?: string
+  /** a timed deadline, RFC 3339 UTC — shown in the browser's zone */
+  due_at?: string
+  /** a pre-UTC `YYYY-MM-DD HH:MM` deadline the daemon read as UTC */
+  legacy_time?: boolean
   note?: string
-  overdue: boolean
+  /** the daemon has no clock for you: overdue is computed here (`isOverdue`) */
   due_soon: boolean
 }
 
@@ -34,7 +39,51 @@ export interface TodoDay {
 export interface DueParse {
   text: string
   deadline: string | null
+  /** a typed time, as a UTC instant */
+  due_at?: string | null
   warning?: string
+}
+
+/** The browser's UTC offset at `d`: `+01:00`, `-05:30`. */
+export function utcOffset(d: Date = new Date()): string {
+  const m = -d.getTimezoneOffset()
+  const a = Math.abs(m)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${m < 0 ? '-' : '+'}${p(Math.floor(a / 60))}:${p(a % 60)}`
+}
+
+/** What every `/api/todo*` call tells the daemon about the client's clock:
+ * the server runs in UTC and never guesses a local date or zone. */
+export function clientClock(now: Date = new Date()): { today: string; utc_offset: string } {
+  return { today: isoDate(now), utc_offset: utcOffset(now) }
+}
+
+/** The local calendar date a deadline falls on (a timed one in this zone). */
+export function dueDate(it: Pick<TodoItem, 'deadline' | 'due_at'>): string | undefined {
+  if (it.deadline) return it.deadline
+  return it.due_at ? isoDate(new Date(it.due_at)) : undefined
+}
+
+/** `15:00` in this zone for a timed deadline. */
+export function dueTime(dueAt: string): string {
+  const d = new Date(dueAt)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+/** Past due at `now`: a timed one once its instant passes, an all-day one
+ * once its day is over (in this zone). Done / moved-on items never are. */
+export function isOverdue(it: Pick<TodoItem, 'deadline' | 'due_at' | 'done' | 'carried'>, now: Date = new Date()): boolean {
+  if (it.done || it.carried) return false
+  if (it.due_at) return new Date(it.due_at).getTime() < now.getTime()
+  return !!it.deadline && it.deadline < isoDate(now)
+}
+
+/** A timed deadline moved to the local `date`, keeping its local time. */
+export function moveDueAt(dueAt: string, date: string): string {
+  const t = new Date(dueAt)
+  const [y, m, d] = date.split('-').map(Number)
+  return new Date(y, m - 1, d, t.getHours(), t.getMinutes()).toISOString()
 }
 
 /** Worth asking the daemon: the draft ends in `due …` / `by …` (≤ 3 words).
@@ -47,10 +96,12 @@ export function hasDuePhrase(text: string): boolean {
 export function previewLabel(res: DueParse | null, today: string): string {
   if (!res) return ''
   if (res.warning) return res.warning
-  if (!res.deadline) return ''
-  const rel = fmtDay(res.deadline, today)
-  const abs = fromIso(res.deadline).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' })
-  return `→ ${rel === abs ? abs : `${rel} · ${abs}`}`
+  const date = res.deadline ?? (res.due_at ? isoDate(new Date(res.due_at)) : null)
+  if (!date) return ''
+  const rel = fmtDay(date, today)
+  const abs = fromIso(date).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' })
+  const at = res.due_at ? ` ${dueTime(res.due_at)}` : ''
+  return `→ ${rel === abs ? abs : `${rel} · ${abs}`}${at}`
 }
 
 /** Local calendar date as `YYYY-MM-DD`. */
@@ -88,9 +139,12 @@ export function fmtDay(date: string, today: string): string {
 
 export type DeadlineTone = 'overdue' | 'soon' | 'later'
 
-export function deadlineTone(it: Pick<TodoItem, 'overdue' | 'due_soon' | 'done'>): DeadlineTone {
+export function deadlineTone(
+  it: Pick<TodoItem, 'deadline' | 'due_at' | 'due_soon' | 'done' | 'carried'>,
+  now: Date = new Date(),
+): DeadlineTone {
   if (it.done) return 'later'
-  if (it.overdue) return 'overdue'
+  if (isOverdue(it, now)) return 'overdue'
   if (it.due_soon) return 'soon'
   return 'later'
 }

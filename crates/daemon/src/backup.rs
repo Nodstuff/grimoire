@@ -65,7 +65,7 @@ fn list_in(dir: &Path) -> Vec<BackupInfo> {
 pub fn backup_now(db_path: &Path, force: bool) -> anyhow::Result<BackupInfo> {
     let dir = backup_dir(db_path);
     std::fs::create_dir_all(&dir)?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let target = dir.join(format!("{PREFIX}{today}{SUFFIX}"));
     if target.exists() {
         if !force {
@@ -120,7 +120,7 @@ pub fn backup_to(db_path: &Path, target: &Path) -> anyhow::Result<BackupInfo> {
     tracing::info!(path = %target.display(), bytes, "database backup written (chosen location)");
     Ok(BackupInfo {
         path: target.to_string_lossy().to_string(),
-        date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+        date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
         bytes,
     })
 }

@@ -19,11 +19,14 @@
 //! - ` · due YYYY-MM-DD` is the DEADLINE (the day heading is the scheduled
 //!   day). Typed as any trailing `due <when>` / `by <when>` phrase — `due fri`,
 //!   `by 12/9` (DAY/MONTH), `due 12 sep`, `due in 3 days`, `due next mon` — see
-//!   `due.rs` for the grammar; the daemon resolves it against its local date
-//!   and stores the ISO form. A time may follow (`due fri 3pm`, `by tomorrow
-//!   09:30`) and is stored as ` · due YYYY-MM-DD HH:MM` (24h, local); a
-//!   date-only deadline alerts at `due::DEFAULT_ALERT_TIME`. The pre-0.8 `⏰ YYYY-MM-DD` token is still read
-//!   and rewritten to the new form the next time its day is written.
+//!   `due.rs` for the grammar; it is resolved against the CLIENT's `today` and
+//!   stored in ISO form. A time may follow (`due fri 3pm`, `by tomorrow
+//!   09:30`): it is the client's wall time at its `utc_offset`, stored as a UTC
+//!   instant ` · due 2026-10-03T14:00Z`. A date alone stays a floating all-day
+//!   date. The server never uses a local timezone. The pre-UTC
+//!   ` · due YYYY-MM-DD HH:MM` is read as UTC and flagged `legacy_time`, never
+//!   rewritten. The pre-0.8 `⏰ YYYY-MM-DD` token is still read and rewritten
+//!   to the new form the next time its day is written.
 //! - `(carried from YYYY-MM-DD)` at the end names the day the item was first
 //!   scheduled; carry-forward keeps the original stamp.
 //! - Indented lines under the item, inside the same block, are its NOTE.
@@ -47,7 +50,7 @@
 //! whose index no longer matches falls back to the single item with that
 //! hash, and errors when there is none.
 //!
-//! Carry-forward: a `GET` for today (a date ≥ the daemon's local date, with no
+//! Carry-forward: a `GET` for today (a date ≥ the client's `today`, with no
 //! newer day in the doc) copies the still-open `[ ]` items of the most recent
 //! earlier day into today's section — deadline and note intact, stamped
 //! `(carried from <original day>)` — and marks the sources `[>]`. A repeat GET
@@ -55,45 +58,52 @@
 //! agent already started today's section; a read of a past day never moves
 //! anything.
 //!
+//! Client context: the server has no idea what day it is for you. Every
+//! route takes the client's `today` (`YYYY-MM-DD`, query or body) — REQUIRED
+//! in SERVER mode; in LOCAL mode it falls back to the UTC date — and, for
+//! anything that reads a typed time, its `utc_offset` (`+01:00`); a typed time
+//! with no offset is refused. Deadlines in answers: `deadline` (`YYYY-MM-DD`)
+//! for all-day items, `due_at` (RFC 3339 UTC) for timed ones, `legacy_time:
+//! true` on a pre-UTC one. No `overdue`: clients compute it in their zone.
+//!
 //! Routes (all human-principal):
-//! - `GET  /api/todo?date=YYYY-MM-DD` → `{doc_id, date, today, items:[{id, text,
-//!   done, carried?, carried_from?, deadline?, due_time?, alert_at?, note?,
-//!   overdue, due_soon}], ...}` — `deadline` is the DATE (`YYYY-MM-DD`),
-//!   `due_time` its `HH:MM` when one was given, `alert_at` the local
-//!   `YYYY-MM-DDTHH:MM` to remind at (the time, else 09:00); `{
-//!   carried, prev_date, epoch}`
-//! - `POST /api/todo {date, text}` add; a trailing `due <when>` / `by <when>`
-//!   phrase becomes the deadline. One that looks like a date but does not
-//!   parse leaves the text as typed and adds `warning: "couldn't read that
-//!   date"` to the answer.
-//! - `POST /api/todo/toggle {date, item_id | text, done}`
-//! - `POST /api/todo/edit {date, item_id, text}` (same phrase handling; a text
-//!   without a phrase keeps the item's deadline)
-//! - `GET  /api/todo/parse?text=…` → `{text, deadline | null, due_time | null,
-//!   alert_at | null, warning?}` — the
-//!   UI's live hint, so the rules live here only
-//! - `POST /api/todo/remove {date, item_id}`
-//! - `POST /api/todo/move {date, item_id, to_date}` (heading created in date order)
-//! - `POST /api/todo/deadline {date, item_id, deadline | null, due_time?}`
-//!   (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM`; a date alone KEEPS the item's time
-//!   — the UI's date picker — unless `due_time` says otherwise: `"HH:MM"`
-//!   sets it, `null` clears it)
+//! - `GET  /api/todo?date=YYYY-MM-DD&today=YYYY-MM-DD` → `{doc_id, date,
+//!   today, items:[{id, text, done, carried?, carried_from?, deadline?,
+//!   due_at?, legacy_time?, note?, due_soon}], carried, prev_date, epoch}`
+//! - `POST /api/todo {date, text, today, utc_offset}` add; a trailing
+//!   `due <when>` / `by <when>` phrase becomes the deadline. One that looks
+//!   like a date but does not parse leaves the text as typed and adds
+//!   `warning: "couldn't read that date"` to the answer.
+//! - `POST /api/todo/toggle {date, item_id | text, done, today}`
+//! - `POST /api/todo/edit {date, item_id, text, today, utc_offset}` (same
+//!   phrase handling; a text without a phrase keeps the item's deadline)
+//! - `GET  /api/todo/parse?text=…&today=…&utc_offset=…` → `{text, deadline |
+//!   null, due_at | null, warning?}` — the UI's live hint, so the rules live
+//!   here only
+//! - `POST /api/todo/remove {date, item_id, today}`
+//! - `POST /api/todo/move {date, item_id, to_date, today}` (heading created in
+//!   date order)
+//! - `POST /api/todo/deadline {date, item_id, deadline | due_at | neither,
+//!   today}` — `deadline: "YYYY-MM-DD"` makes it all-day, `due_at` (RFC 3339
+//!   with a zone) timed, neither clears
 //! - `GET  /api/todo/due?until=<YYYY-MM-DD | RFC 3339>` → `{doc_id | null,
-//!   epoch, now, until, default_alert_time, items: [{date, id, text,
-//!   deadline, due_time?, alert_at, overdue, note?, carried_from?}]}` —
-//!   every OPEN item with a deadline, across all days, soonest `alert_at`
-//!   first; `until` keeps deadlines on or before that day (a date) or alerts
-//!   at or before that instant. READ-ONLY: no carry-forward, and no To-do
-//!   doc is created. `overdue` is by time: past its `HH:MM`, or past the end
-//!   of its day when it has none. Errors are 400/500 with `{error}`.
-//! - `POST /api/todo/note {date, item_id, note}` (empty clears)
+//!   epoch, now (UTC), until, default_alert_time, items: [{date, id, text,
+//!   deadline? | due_at?, legacy_time?, note?, carried_from?}]}` — every OPEN
+//!   item with a deadline, across all days, soonest first (an all-day item
+//!   sorts at the start of its date); a date `until` keeps all-day deadlines
+//!   on or before it and timed ones whose UTC date is; an instant keeps timed
+//!   ones at or before it and all-day ones on or before its UTC date. No
+//!   local-time reading of either. READ-ONLY: no carry-forward, and no To-do
+//!   doc is created. Errors are 400/500 with `{error}`.
+//! - `POST /api/todo/note {date, item_id, note, today}` (empty clears)
 
 use crate::api::ApiState;
 use crate::store_ext::with_store;
 use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::NaiveDate;
+use crate::due::Due;
+use chrono::{FixedOffset, NaiveDate};
 use grimoire_store::{BlockStore, Doc, SqliteStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -113,7 +123,7 @@ pub struct ItemRec {
     /// ' ' open, 'x' done, '>' moved forward
     pub mark: char,
     pub text: String,
-    /// `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`, as stored after ` · due `
+    /// as stored after ` · due ` (`due::Due::stored`), kept verbatim
     pub deadline: Option<String>,
     pub carried_from: Option<String>,
     /// note lines, de-indented, joined by '\n'
@@ -147,18 +157,19 @@ pub struct Item {
     pub carried: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub carried_from: Option<String>,
-    /// the deadline's date, `YYYY-MM-DD`
+    /// an all-day deadline, `YYYY-MM-DD`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline: Option<String>,
-    /// the deadline's time, `HH:MM`, when it has one
+    /// a timed deadline, RFC 3339 UTC
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub due_time: Option<String>,
-    /// local `YYYY-MM-DDTHH:MM` to remind at (time, else the default)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub alert_at: Option<String>,
+    pub due_at: Option<String>,
+    /// a pre-UTC `YYYY-MM-DD HH:MM` deadline, read as UTC
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_time: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    pub overdue: bool,
+    /// open, due within `DUE_SOON_DAYS` of the client's `today` (a timed
+    /// deadline by its UTC date)
     pub due_soon: bool,
 }
 
@@ -227,14 +238,16 @@ struct Tokens {
     warning: Option<&'static str>,
 }
 
+/// `today` is validated where it enters (`client`); UTC is only the
+/// unreachable fallback, never a local clock.
 fn today_date(today: &str) -> NaiveDate {
-    parse_date(today).unwrap_or_else(|| chrono::Local::now().date_naive())
+    parse_date(today).unwrap_or_else(|| chrono::Utc::now().date_naive())
 }
 
 /// Pull the trailing `(carried from D)` stamp, the legacy `⏰ D` token and a
-/// trailing `due <when>` / `by <when>` phrase (resolved against `today`) out
-/// of an item's first line.
-fn split_tokens(raw: &str, today: NaiveDate) -> Tokens {
+/// trailing `due <when>` / `by <when>` phrase (resolved against `today`, a
+/// typed time at `zone`) out of an item's first line.
+fn split_tokens(raw: &str, today: NaiveDate, zone: Option<FixedOffset>) -> Tokens {
     let mut t = raw.trim().to_string();
     let mut from = None;
     if t.ends_with(')')
@@ -257,9 +270,9 @@ fn split_tokens(raw: &str, today: NaiveDate) -> Tokens {
         }
     }
     let mut warning = None;
-    let parsed = crate::due::split_due(&t, today);
+    let parsed = crate::due::split_due(&t, today, zone);
     let text = if deadline.is_none() {
-        deadline = parsed.deadline.map(|d| crate::due::format_deadline(d, parsed.time));
+        deadline = parsed.due.map(|d| d.stored());
         warning = parsed.warning;
         parsed.text
     } else {
@@ -270,7 +283,8 @@ fn split_tokens(raw: &str, today: NaiveDate) -> Tokens {
 
 fn parse_item(block: &[&str], today: NaiveDate) -> Option<ItemRec> {
     let (mark, first) = split_item_line(block[0])?;
-    let Tokens { text, deadline, carried_from, .. } = split_tokens(first, today);
+    // read out of the doc: no client zone (a typed time there is legacy)
+    let Tokens { text, deadline, carried_from, .. } = split_tokens(first, today, None);
     let note_lines: Vec<&str> = block[1..]
         .iter()
         .map(|l| l.strip_prefix("  ").or_else(|| l.strip_prefix('\t')).unwrap_or(l.trim_start()))
@@ -467,17 +481,10 @@ fn days(chunks: &[Chunk]) -> Vec<&str> {
 
 fn to_item(index: usize, it: &ItemRec, today: &str) -> Item {
     let open = it.mark == ' ';
-    let due = it.deadline.as_deref().and_then(crate::due::parse_deadline);
-    let (overdue, due_soon) = match (due, parse_date(today)) {
-        (Some((dl, tm)), Some(t)) if open => {
-            let diff = (dl - t).num_days();
-            // a timed deadline today is overdue once its time passes — only
-            // when `today` IS today (a past or future view stays by day)
-            let now = chrono::Local::now().naive_local();
-            let late_today = diff == 0 && now.date() == t && crate::due::is_overdue(dl, tm, now);
-            (diff < 0 || late_today, (0..=DUE_SOON_DAYS).contains(&diff) && !late_today)
-        }
-        _ => (false, false),
+    let due = it.deadline.as_deref().and_then(crate::due::parse_stored);
+    let due_soon = match (due, parse_date(today)) {
+        (Some(d), Some(t)) if open => (0..=DUE_SOON_DAYS).contains(&(d.utc_date() - t).num_days()),
+        _ => false,
     };
     Item {
         id: item_id(index, &it.text),
@@ -485,11 +492,10 @@ fn to_item(index: usize, it: &ItemRec, today: &str) -> Item {
         done: it.mark == 'x',
         carried: it.mark == '>',
         carried_from: it.carried_from.clone(),
-        deadline: due.map(|(d, _)| d.to_string()),
-        due_time: due.and_then(|(_, t)| t).map(|t| t.format(crate::due::TIME_FMT).to_string()),
-        alert_at: due.map(|(d, t)| crate::due::alert_at(d, t)),
+        deadline: due.and_then(|d| d.day()).map(|d| d.to_string()),
+        due_at: due.and_then(|d| d.instant()).map(crate::due::rfc3339),
+        legacy_time: due.is_some_and(|d| d.is_legacy()),
         note: it.note.clone(),
-        overdue,
         due_soon,
     }
 }
@@ -575,76 +581,75 @@ pub struct DueItem {
     pub date: String,
     pub id: String,
     pub text: String,
-    pub deadline: String,
+    /// all-day, `YYYY-MM-DD`
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub due_time: Option<String>,
-    pub alert_at: String,
-    pub overdue: bool,
+    pub deadline: Option<String>,
+    /// timed, RFC 3339 UTC
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_time: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub carried_from: Option<String>,
 }
 
-/// The `until` bound: a whole day, or an instant (local wall time).
+/// The `until` bound: a calendar date, or an instant (UTC).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Until {
     Day(NaiveDate),
-    At(chrono::NaiveDateTime),
+    At(chrono::DateTime<chrono::Utc>),
 }
 
-/// `YYYY-MM-DD`, RFC 3339 (converted to local time), or a local
-/// `YYYY-MM-DDTHH:MM[:SS]`.
+/// `YYYY-MM-DD`, or an RFC 3339 instant with its zone. A wall time with no
+/// zone is refused: nothing here reads local time.
 pub fn parse_until(s: &str) -> Option<Until> {
     let s = s.trim();
     if let Some(d) = parse_date(s).filter(|_| s.len() == 10) {
         return Some(Until::Day(d));
     }
-    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(Until::At(t.with_timezone(&chrono::Local).naive_local()));
-    }
-    ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"]
-        .iter()
-        .find_map(|f| chrono::NaiveDateTime::parse_from_str(s, f).ok())
-        .map(Until::At)
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|t| Until::At(t.with_timezone(&chrono::Utc)))
 }
 
-/// Every open item with a deadline, across all days, soonest alert first.
-/// Pure: reads `md`, writes nothing.
-pub fn due_items(md: &str, now: chrono::NaiveDateTime, until: Option<Until>) -> Vec<DueItem> {
-    let mut out = Vec::new();
-    for chunk in parse_doc(md, now.date()) {
+/// Every open item with a deadline, across all days, soonest first. Pure:
+/// reads `md` (relative phrases resolved against `today`), writes nothing.
+pub fn due_items(md: &str, today: NaiveDate, until: Option<Until>) -> Vec<DueItem> {
+    let mut out: Vec<(String, DueItem)> = Vec::new();
+    for chunk in parse_doc(md, today) {
         let Chunk::Day { date, entries } = chunk else { continue };
         for (i, it) in items_of(&entries).into_iter().enumerate() {
             if it.mark != ' ' {
                 continue;
             }
-            let Some((d, t)) = it.deadline.as_deref().and_then(crate::due::parse_deadline) else { continue };
-            let alert = d.and_time(t.unwrap_or_else(|| {
-                chrono::NaiveTime::parse_from_str(crate::due::DEFAULT_ALERT_TIME, crate::due::TIME_FMT).unwrap()
-            }));
-            let keep = match until {
-                None => true,
-                Some(Until::Day(u)) => d <= u,
-                Some(Until::At(u)) => alert <= u,
+            let Some(due) = it.deadline.as_deref().and_then(crate::due::parse_stored) else { continue };
+            let keep = match (until, due.instant()) {
+                (None, _) => true,
+                (Some(Until::Day(u)), _) => due.utc_date() <= u,
+                (Some(Until::At(u)), Some(t)) => t <= u,
+                (Some(Until::At(u)), None) => due.utc_date() <= u.date_naive(),
             };
             if keep {
-                out.push(DueItem {
+                // an all-day date sorts at the start of its day
+                let key = match due.instant() {
+                    Some(t) => crate::due::rfc3339(t),
+                    None => due.utc_date().to_string(),
+                };
+                out.push((key, DueItem {
                     date: date.clone(),
                     id: item_id(i, &it.text),
                     text: it.text.clone(),
-                    deadline: d.to_string(),
-                    due_time: t.map(|t| t.format(crate::due::TIME_FMT).to_string()),
-                    alert_at: crate::due::alert_at(d, t),
-                    overdue: crate::due::is_overdue(d, t, now),
+                    deadline: due.day().map(|d| d.to_string()),
+                    due_at: due.instant().map(crate::due::rfc3339),
+                    legacy_time: due.is_legacy(),
                     note: it.note.clone(),
                     carried_from: it.carried_from.clone(),
-                });
+                }));
             }
         }
     }
-    out.sort_by(|a, b| (&a.alert_at, &a.date, &a.id).cmp(&(&b.alert_at, &b.date, &b.id)));
-    out
+    out.sort_by(|a, b| (&a.0, &a.1.date, &a.1.id).cmp(&(&b.0, &b.1.date, &b.1.id)));
+    out.into_iter().map(|(_, d)| d).collect()
 }
 
 /// Markdown after a write plus a phrase warning for the caller to surface.
@@ -653,12 +658,10 @@ pub type Written = (String, Option<&'static str>);
 /// Append `- [ ] text` to the day (section created in date order). A trailing
 /// `due <when>` / `by <when>` phrase (or a legacy `⏰ YYYY-MM-DD`) becomes the
 /// deadline; one that looks like a date but does not parse is kept as typed
-/// and reported.
-pub fn add_item(md: &str, date: &str, today: &str, text: &str) -> Result<Written, String> {
-    let tk = split_tokens(text.lines().next().unwrap_or(""), today_date(today));
-    if tk.text.is_empty() {
-        return Err("empty to-do".into());
-    }
+/// and reported. A typed time is wall time at `zone`; with no zone it is
+/// refused (the server does not guess one).
+pub fn add_item(md: &str, date: &str, today: &str, zone: Option<FixedOffset>, text: &str) -> Result<Written, String> {
+    let tk = typed_tokens(text, today, zone)?;
     let mut chunks = parse_doc(md, today_date(today));
     let i = ensure_day(&mut chunks, date);
     touch_day(&mut chunks, i);
@@ -673,16 +676,27 @@ pub fn add_item(md: &str, date: &str, today: &str, text: &str) -> Result<Written
     Ok((render_doc(&chunks), tk.warning))
 }
 
+/// A line the client typed: phrase resolved, a time only with a zone.
+fn typed_tokens(text: &str, today: &str, zone: Option<FixedOffset>) -> Result<Tokens, String> {
+    let tk = split_tokens(text.lines().next().unwrap_or(""), today_date(today), zone);
+    if tk.text.is_empty() {
+        return Err("empty to-do".into());
+    }
+    if zone.is_none() && tk.deadline.as_deref().and_then(crate::due::parse_stored).is_some_and(|d| d.is_legacy()) {
+        return Err(NEED_OFFSET.into());
+    }
+    Ok(tk)
+}
+
+const NEED_OFFSET: &str = "a deadline with a time needs the client's utc_offset (e.g. +01:00)";
+
 pub fn toggle_item(md: &str, date: &str, today: &str, id: Option<&str>, text: Option<&str>, done: bool) -> Result<String, String> {
     with_item(md, date, today, id, text, |it| it.mark = if done { 'x' } else { ' ' })
 }
 
 /// Replace the text; a phrase in it sets the deadline, none keeps the old one.
-pub fn edit_item(md: &str, date: &str, today: &str, id: &str, text: &str) -> Result<Written, String> {
-    let tk = split_tokens(text.lines().next().unwrap_or(""), today_date(today));
-    if tk.text.is_empty() {
-        return Err("empty to-do".into());
-    }
+pub fn edit_item(md: &str, date: &str, today: &str, zone: Option<FixedOffset>, id: &str, text: &str) -> Result<Written, String> {
+    let tk = typed_tokens(text, today, zone)?;
     let md = with_item(md, date, today, Some(id), None, |it| {
         it.text = tk.text;
         if tk.deadline.is_some() {
@@ -692,48 +706,20 @@ pub fn edit_item(md: &str, date: &str, today: &str, id: &str, text: &str) -> Res
     Ok((md, tk.warning))
 }
 
-/// What a deadline write does to the item's time of day.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimeEdit<'a> {
-    /// a date alone keeps the time the item had
-    Keep,
-    Set(&'a str),
-    Clear,
-}
-
-pub fn set_deadline(
-    md: &str,
-    date: &str,
-    today: &str,
-    id: &str,
-    deadline: Option<&str>,
-    time: TimeEdit,
-) -> Result<String, String> {
-    let parsed = match deadline {
-        Some(d) => match crate::due::parse_deadline(d) {
-            Some(p) => Some(p),
-            None => return Err(format!("deadline must be YYYY-MM-DD or YYYY-MM-DD HH:MM, got {d:?}")),
-        },
-        None => None,
+/// Set the deadline: `deadline` (`YYYY-MM-DD`) makes it all-day, `due_at`
+/// (RFC 3339 with a zone) timed — stored as UTC; neither clears it.
+pub fn set_deadline(md: &str, date: &str, today: &str, id: &str, deadline: Option<&str>, due_at: Option<&str>) -> Result<String, String> {
+    let due = match (due_at, deadline) {
+        (Some(t), _) => Some(Due::At(
+            crate::due::parse_instant(t).ok_or_else(|| format!("due_at must be RFC 3339 with a zone, got {t:?}"))?,
+        )),
+        (None, Some(d)) => Some(Due::Day(
+            parse_date(d).filter(|_| d.len() == 10).ok_or_else(|| format!("deadline must be YYYY-MM-DD (use due_at for a time), got {d:?}"))?,
+        )),
+        (None, None) => None,
     };
-    let set = match time {
-        TimeEdit::Set(t) => match chrono::NaiveTime::parse_from_str(t, crate::due::TIME_FMT) {
-            Ok(parsed) if t.len() == 5 => Some(Some(parsed)),
-            _ => return Err(format!("due_time must be HH:MM, got {t:?}")),
-        },
-        TimeEdit::Clear => Some(None),
-        TimeEdit::Keep => None,
-    };
-    with_item(md, date, today, Some(id), None, |it| {
-        let had = it.deadline.as_deref().and_then(crate::due::parse_deadline).and_then(|(_, t)| t);
-        it.deadline = parsed.map(|(d, t)| {
-            // an explicit due_time wins; else a time in the deadline; else the old one
-            let t = set.unwrap_or(t.or(had));
-            crate::due::format_deadline(d, t)
-        });
-    })
+    with_item(md, date, today, Some(id), None, |it| it.deadline = due.map(|d| d.stored()))
 }
-
 
 pub fn set_note(md: &str, date: &str, today: &str, id: &str, note: &str) -> Result<String, String> {
     let note = note.trim_end();
@@ -810,9 +796,34 @@ pub fn carry_forward(md: &str, date: &str, today: &str) -> (String, usize) {
     (render_doc(&chunks), n)
 }
 
-fn local_today() -> String {
-    chrono::Local::now().format("%Y-%m-%d").to_string()
+/// What the client says about its own clock (query or body).
+#[derive(Debug, Default, Clone, Deserialize)]
+struct ClientClock {
+    #[serde(default)]
+    today: Option<String>,
+    #[serde(default)]
+    utc_offset: Option<String>,
 }
+
+/// The client's date and zone, validated. `today` is required in SERVER mode
+/// (`server`: the request carried a token); LOCAL mode falls back to the UTC
+/// date. A missing offset stays None: only a typed time needs it.
+fn client(c: &ClientClock, server: bool) -> Result<(String, Option<FixedOffset>), String> {
+    let today = match c.today.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) if is_date(t) && parse_date(t).is_some() => t.to_string(),
+        Some(t) => return Err(format!("today must be YYYY-MM-DD, got {t:?}")),
+        None if server => return Err("today (the client's YYYY-MM-DD) is required".into()),
+        None => chrono::Utc::now().date_naive().to_string(),
+    };
+    let zone = match c.utc_offset.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+        Some(o) => Some(crate::due::parse_offset(o).ok_or_else(|| format!("utc_offset must be like +01:00, got {o:?}"))?),
+        None => None,
+    };
+    Ok((today, zone))
+}
+
+/// SERVER mode: the request came through `auth::require_auth` with a token.
+type Server = Option<axum::Extension<crate::auth::Authenticated>>;
 
 /// Carry only into today (or later) and only when no newer day exists: a
 /// read of yesterday must never move items into yesterday.
@@ -881,15 +892,20 @@ fn check_date(d: &str) -> Result<(), String> {
 /// warning.
 async fn mutate(
     st: ApiState,
+    server: bool,
+    clock: ClientClock,
     date: String,
-    f: impl FnOnce(&str, &str) -> Result<Written, String> + Send + 'static,
+    f: impl FnOnce(&str, &str, Option<FixedOffset>) -> Result<Written, String> + Send + 'static,
 ) -> Json<Value> {
     if let Err(m) = check_date(&date) {
         return Json(json!({"error": m}));
     }
+    let (today, zone) = match client(&clock, server) {
+        Ok(c) => c,
+        Err(m) => return Json(json!({"error": m})),
+    };
     let human = st.human;
     let hot = st.hot.clone();
-    let today = local_today();
     with_store(&st.store, move |s| {
         let doc = match find_or_create_todo(s, human) {
             Ok(d) => d,
@@ -902,7 +918,7 @@ async fn mutate(
             Ok(m) => m,
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
-        let (new_md, warning) = match f(&md, &today) {
+        let (new_md, warning) = match f(&md, &today, zone) {
             Ok(m) => m,
             Err(e) => return Json(json!({"error": e})),
         };
@@ -920,10 +936,15 @@ async fn mutate(
 #[derive(Deserialize)]
 struct DayQuery {
     date: Option<String>,
+    #[serde(flatten)]
+    clock: ClientClock,
 }
 
-async fn get_day(State(st): State<ApiState>, Query(q): Query<DayQuery>) -> Json<Value> {
-    let today = local_today();
+async fn get_day(State(st): State<ApiState>, server: Server, Query(q): Query<DayQuery>) -> Json<Value> {
+    let today = match client(&q.clock, server.is_some()) {
+        Ok((t, _)) => t,
+        Err(m) => return Json(json!({"error": m})),
+    };
     let date = q.date.unwrap_or_else(|| today.clone());
     if let Err(m) = check_date(&date) {
         return Json(json!({"error": m}));
@@ -962,16 +983,20 @@ async fn get_day(State(st): State<ApiState>, Query(q): Query<DayQuery>) -> Json<
 struct AddReq {
     date: String,
     text: String,
+    #[serde(flatten)]
+    clock: ClientClock,
 }
 
-async fn add(State(st): State<ApiState>, Json(req): Json<AddReq>) -> Json<Value> {
+async fn add(State(st): State<ApiState>, server: Server, Json(req): Json<AddReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, req.date, move |md, today| add_item(md, &date, today, &req.text)).await
+    mutate(st, server.is_some(), req.clock, req.date, move |md, today, zone| add_item(md, &date, today, zone, &req.text)).await
 }
 
 #[derive(Deserialize)]
 struct DueQuery {
     until: Option<String>,
+    #[serde(flatten)]
+    clock: ClientClock,
 }
 
 /// Read-only across days: no carry-forward, and an absent To-do doc stays
@@ -980,6 +1005,12 @@ async fn due(State(st): State<ApiState>, Query(q): Query<DueQuery>) -> axum::res
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let fail = |code: StatusCode, e: String| (code, Json(json!({"error": e}))).into_response();
+    // `today` only resolves an agent's relative phrase still in the doc;
+    // optional here in both modes (UTC date when absent)
+    let today = match client(&q.clock, false) {
+        Ok((t, _)) => today_date(&t),
+        Err(m) => return fail(StatusCode::BAD_REQUEST, m),
+    };
     let until = match q.until.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
         Some(u) => match parse_until(u) {
             Some(x) => Some(x),
@@ -989,14 +1020,14 @@ async fn due(State(st): State<ApiState>, Query(q): Query<DueQuery>) -> axum::res
     };
     let until_echo = q.until.clone();
     with_store(&st.store, move |s| {
-        let now = chrono::Local::now().naive_local();
+        let now = chrono::Utc::now();
         let doc = match s.list_docs() {
             Ok(docs) => docs.into_iter().find(|d| d.parent_id.is_none() && d.title == TODO_TITLE),
             Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
         let (doc_id, epoch, items) = match doc {
             Some(d) => match grimoire_store::export::export_doc(&*s, d.id) {
-                Ok(md) => (Some(d.id.to_string()), d.current_epoch, due_items(&md, now, until)),
+                Ok(md) => (Some(d.id.to_string()), d.current_epoch, due_items(&md, today, until)),
                 Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             },
             None => (None, 0, Vec::new()),
@@ -1004,7 +1035,7 @@ async fn due(State(st): State<ApiState>, Query(q): Query<DueQuery>) -> axum::res
         Json(json!({
             "doc_id": doc_id,
             "epoch": epoch,
-            "now": now.format("%Y-%m-%dT%H:%M").to_string(),
+            "now": crate::due::rfc3339(now),
             "until": until_echo,
             "default_alert_time": crate::due::DEFAULT_ALERT_TIME,
             "items": items,
@@ -1018,20 +1049,29 @@ async fn due(State(st): State<ApiState>, Query(q): Query<DueQuery>) -> axum::res
 struct ParseQuery {
     #[serde(default)]
     text: String,
+    #[serde(flatten)]
+    clock: ClientClock,
 }
 
-/// The UI's live hint while typing: what the daemon would make of `text`.
-async fn parse(Query(q): Query<ParseQuery>) -> Json<Value> {
-    let tk = split_tokens(q.text.lines().next().unwrap_or(""), today_date(&local_today()));
-    let due = tk.deadline.as_deref().and_then(crate::due::parse_deadline);
+/// The UI's live hint while typing: what the daemon would make of `text`,
+/// read against the client's `today` and `utc_offset`.
+async fn parse(server: Server, Query(q): Query<ParseQuery>) -> Json<Value> {
+    let (today, zone) = match client(&q.clock, server.is_some()) {
+        Ok(c) => c,
+        Err(m) => return Json(json!({"error": m})),
+    };
+    let tk = split_tokens(q.text.lines().next().unwrap_or(""), today_date(&today), zone);
+    let due = tk.deadline.as_deref().and_then(crate::due::parse_stored);
     let mut v = json!({
         "text": tk.text,
-        "deadline": due.map(|(d, _)| d.to_string()),
-        "due_time": due.and_then(|(_, t)| t).map(|t| t.format(crate::due::TIME_FMT).to_string()),
-        "alert_at": due.map(|(d, t)| crate::due::alert_at(d, t)),
+        "deadline": due.and_then(|d| d.day()).map(|d| d.to_string()),
+        "due_at": due.and_then(|d| d.instant()).map(crate::due::rfc3339),
     });
     if let Some(w) = tk.warning {
         v["warning"] = json!(w);
+    } else if zone.is_none() && due.is_some_and(|d| d.is_legacy()) {
+        v["warning"] = json!(NEED_OFFSET);
+        v["due_at"] = Value::Null;
     }
     Json(v)
 }
@@ -1042,11 +1082,13 @@ struct ToggleReq {
     item_id: Option<String>,
     text: Option<String>,
     done: bool,
+    #[serde(flatten)]
+    clock: ClientClock,
 }
 
-async fn toggle(State(st): State<ApiState>, Json(req): Json<ToggleReq>) -> Json<Value> {
+async fn toggle(State(st): State<ApiState>, server: Server, Json(req): Json<ToggleReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, req.date, move |md, today| {
+    mutate(st, server.is_some(), req.clock, req.date, move |md, today, _| {
         toggle_item(md, &date, today, req.item_id.as_deref(), req.text.as_deref(), req.done).map(|m| (m, None))
     })
     .await
@@ -1057,22 +1099,29 @@ struct EditReq {
     date: String,
     item_id: String,
     text: String,
+    #[serde(flatten)]
+    clock: ClientClock,
 }
 
-async fn edit(State(st): State<ApiState>, Json(req): Json<EditReq>) -> Json<Value> {
+async fn edit(State(st): State<ApiState>, server: Server, Json(req): Json<EditReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, req.date, move |md, today| edit_item(md, &date, today, &req.item_id, &req.text)).await
+    mutate(st, server.is_some(), req.clock, req.date, move |md, today, zone| {
+        edit_item(md, &date, today, zone, &req.item_id, &req.text)
+    })
+    .await
 }
 
 #[derive(Deserialize)]
 struct RemoveReq {
     date: String,
     item_id: String,
+    #[serde(flatten)]
+    clock: ClientClock,
 }
 
-async fn remove(State(st): State<ApiState>, Json(req): Json<RemoveReq>) -> Json<Value> {
+async fn remove(State(st): State<ApiState>, server: Server, Json(req): Json<RemoveReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, req.date, move |md, today| remove_item(md, &date, today, &req.item_id).map(|m| (m, None))).await
+    mutate(st, server.is_some(), req.clock, req.date, move |md, today, _| remove_item(md, &date, today, &req.item_id).map(|m| (m, None))).await
 }
 
 #[derive(Deserialize)]
@@ -1080,41 +1129,35 @@ struct MoveReq {
     date: String,
     item_id: String,
     to_date: String,
+    #[serde(flatten)]
+    clock: ClientClock,
 }
 
-async fn mv(State(st): State<ApiState>, Json(req): Json<MoveReq>) -> Json<Value> {
+async fn mv(State(st): State<ApiState>, server: Server, Json(req): Json<MoveReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, req.date, move |md, today| move_item(md, &date, today, &req.item_id, &req.to_date).map(|m| (m, None))).await
+    mutate(st, server.is_some(), req.clock, req.date, move |md, today, _| move_item(md, &date, today, &req.item_id, &req.to_date).map(|m| (m, None))).await
 }
 
 #[derive(Deserialize)]
 struct DeadlineReq {
     date: String,
     item_id: String,
-    /// null / absent clears
+    /// all-day `YYYY-MM-DD`
     #[serde(default)]
     deadline: Option<String>,
-    /// absent keeps the item's time; "HH:MM" sets it; null clears it
-    #[serde(default, deserialize_with = "present")]
-    due_time: Option<Option<String>>,
+    /// timed: RFC 3339 with a zone (stored as UTC); wins over `deadline`
+    #[serde(default)]
+    due_at: Option<String>,
+    #[serde(flatten)]
+    clock: ClientClock,
 }
 
-/// `Some(None)` for an explicit null, `None` (via `default`) when absent.
-fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
-    Option::<String>::deserialize(d).map(Some)
-}
-
-async fn deadline(State(st): State<ApiState>, Json(req): Json<DeadlineReq>) -> Json<Value> {
+async fn deadline(State(st): State<ApiState>, server: Server, Json(req): Json<DeadlineReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, req.date, move |md, today| {
-        let dl = req.deadline.as_deref().map(str::trim).filter(|d| !d.is_empty());
-        let time = match &req.due_time {
-            None => TimeEdit::Keep,
-            Some(None) => TimeEdit::Clear,
-            Some(Some(t)) if t.trim().is_empty() => TimeEdit::Clear,
-            Some(Some(t)) => TimeEdit::Set(t.trim()),
-        };
-        set_deadline(md, &date, today, &req.item_id, dl, time).map(|m| (m, None))
+    mutate(st, server.is_some(), req.clock, req.date, move |md, today, _| {
+        let blank = |x: &Option<String>| x.as_deref().map(str::trim).filter(|d| !d.is_empty()).map(str::to_string);
+        let (dl, at) = (blank(&req.deadline), blank(&req.due_at));
+        set_deadline(md, &date, today, &req.item_id, dl.as_deref(), at.as_deref()).map(|m| (m, None))
     })
     .await
 }
@@ -1125,11 +1168,13 @@ struct NoteReq {
     item_id: String,
     #[serde(default)]
     note: String,
+    #[serde(flatten)]
+    clock: ClientClock,
 }
 
-async fn note(State(st): State<ApiState>, Json(req): Json<NoteReq>) -> Json<Value> {
+async fn note(State(st): State<ApiState>, server: Server, Json(req): Json<NoteReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, req.date, move |md, today| set_note(md, &date, today, &req.item_id, &req.note).map(|m| (m, None))).await
+    mutate(st, server.is_some(), req.clock, req.date, move |md, today, _| set_note(md, &date, today, &req.item_id, &req.note).map(|m| (m, None))).await
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -1158,8 +1203,13 @@ mod tests {
         items.iter().map(|i| i.text.as_str()).collect()
     }
 
+    /// A client at UTC+0 (typed times then read as written).
+    fn utc() -> Option<FixedOffset> {
+        FixedOffset::east_opt(0)
+    }
+
     fn add(md: &str, date: &str, text: &str) -> Result<String, String> {
-        add_item(md, date, T, text).map(|(m, _)| m)
+        add_item(md, date, T, utc(), text).map(|(m, _)| m)
     }
 
     #[test]
@@ -1174,12 +1224,12 @@ mod tests {
             items[1].note.as_deref(),
             Some("needs Tom's sign-off after the local trial\nrelease.sh --publish, then the hub box")
         );
-        assert!(!items[1].overdue && !items[1].due_soon, "done items never nag");
+        assert!(!items[1].due_soon, "done items never nag");
         assert_eq!(items[2].carried_from.as_deref(), Some("2026-09-08"));
         assert_eq!(items[2].deadline.as_deref(), Some("2026-09-08"));
-        assert!(items[2].overdue && !items[2].due_soon);
+        assert!(!items[2].due_soon, "past: not soon (overdue is the client's call)");
         let today = parse_day(DOC, T, T);
-        assert!(today[0].due_soon && !today[0].overdue);
+        assert!(today[0].due_soon);
         assert!(parse_day(DOC, "2026-09-11", T).is_empty());
         assert_eq!(prev_day(DOC, T).as_deref(), Some("2026-09-09"));
         assert_eq!(prev_day(DOC, "2026-09-09"), None);
@@ -1260,11 +1310,11 @@ mod tests {
         let md = add(&md, T, "eighth due next thu").unwrap();
         assert!(md.ends_with("- [ ] eighth · due 2026-09-17\n"), "{md}");
         // a phrase that looks like a date but is not: text kept, warning returned
-        let (md, warn) = add_item(&md, T, T, "rent due 31/2").unwrap();
+        let (md, warn) = add_item(&md, T, T, utc(), "rent due 31/2").unwrap();
         assert_eq!(warn, Some(crate::due::WARNING));
         assert!(md.ends_with("- [ ] rent due 31/2\n"), "{md}");
         // a mid-sentence due is text
-        let (md, warn) = add_item(&md, T, T, "read the due diligence doc").unwrap();
+        let (md, warn) = add_item(&md, T, T, utc(), "read the due diligence doc").unwrap();
         assert!(warn.is_none());
         assert!(md.ends_with("- [ ] read the due diligence doc\n"), "{md}");
         let md = add(&md, "2026-09-12", "later").unwrap();
@@ -1285,25 +1335,25 @@ mod tests {
         let md = toggle_item(&md, "2026-09-09", T, None, Some("ship 0.8.0"), false).unwrap();
         assert!(md.contains("- [ ] ship 0.8.0 · due 2026-09-12\n  needs Tom's"));
         // edit keeps deadline, note and stamp
-        let (md, _) = edit_item(&md, "2026-09-09", T, &items[2].id, "rotate ALL tokens").unwrap();
+        let (md, _) = edit_item(&md, "2026-09-09", T, utc(), &items[2].id, "rotate ALL tokens").unwrap();
         assert!(md.contains("- [ ] rotate ALL tokens · due 2026-09-08 (carried from 2026-09-08)\n"));
         // an edit with a phrase moves the deadline
         let items = parse_day(&md, "2026-09-09", T);
-        let (md, warn) = edit_item(&md, "2026-09-09", T, &items[2].id, "rotate ALL tokens by sat").unwrap();
+        let (md, warn) = edit_item(&md, "2026-09-09", T, utc(), &items[2].id, "rotate ALL tokens by sat").unwrap();
         assert!(warn.is_none());
         assert!(md.contains("- [ ] rotate ALL tokens · due 2026-09-12 (carried from 2026-09-08)\n"), "{md}");
         // an edit with an unreadable phrase keeps the text as typed and the old deadline
-        let (md, warn) = edit_item(&md, "2026-09-09", T, &items[2].id, "rotate ALL tokens by 32/9").unwrap();
+        let (md, warn) = edit_item(&md, "2026-09-09", T, utc(), &items[2].id, "rotate ALL tokens by 32/9").unwrap();
         assert_eq!(warn, Some(crate::due::WARNING));
         assert!(md.contains("- [ ] rotate ALL tokens by 32/9 · due 2026-09-12 (carried from 2026-09-08)\n"), "{md}");
-        let (md, _) = edit_item(&md, "2026-09-09", T, &parse_day(&md, "2026-09-09", T)[2].id, "rotate ALL tokens").unwrap();
+        let (md, _) = edit_item(&md, "2026-09-09", T, utc(), &parse_day(&md, "2026-09-09", T)[2].id, "rotate ALL tokens").unwrap();
         let items = parse_day(&md, "2026-09-09", T);
         // deadline set / clear
-        let md = set_deadline(&md, "2026-09-09", T, &items[0].id, Some("2026-09-30"), TimeEdit::Keep).unwrap();
+        let md = set_deadline(&md, "2026-09-09", T, &items[0].id, Some("2026-09-30"), None).unwrap();
         assert!(md.contains("- [x] call the bank · due 2026-09-30\n"));
-        let md = set_deadline(&md, "2026-09-09", T, &items[2].id, None, TimeEdit::Keep).unwrap();
+        let md = set_deadline(&md, "2026-09-09", T, &items[2].id, None, None).unwrap();
         assert!(md.contains("- [ ] rotate ALL tokens (carried from 2026-09-08)\n"));
-        assert!(set_deadline(&md, "2026-09-09", T, &items[0].id, Some("soon"), TimeEdit::Keep).is_err());
+        assert!(set_deadline(&md, "2026-09-09", T, &items[0].id, Some("soon"), None).is_err());
         // note set (blank lines inside collapse — they would split the block) / clear
         let md = set_note(&md, "2026-09-09", T, &items[0].id, "ask for\n\nthe statement  \n").unwrap();
         assert!(md.contains("- [x] call the bank · due 2026-09-30\n  ask for\n  the statement\n\n- [ ] ship"));
@@ -1357,10 +1407,9 @@ mod tests {
         let today = parse_day(&md, T, T);
         assert_eq!(texts(&today), ["write the report", "call the bank", "rotate the token"]);
         assert_eq!(today[1].carried_from.as_deref(), Some("2026-09-09"));
-        // the original origin and the (overdue) deadline are kept
+        // the original origin and the (past) deadline are kept
         assert_eq!(today[2].carried_from.as_deref(), Some("2026-09-08"));
         assert_eq!(today[2].deadline.as_deref(), Some("2026-09-08"));
-        assert!(today[2].overdue);
         let src = parse_day(&md, "2026-09-09", T);
         assert!(src[0].carried && !src[0].done);
         assert!(src[1].done && !src[1].carried);
@@ -1407,53 +1456,53 @@ mod tests {
         let kids = roots[0]["children"].as_array().unwrap();
         assert_eq!(kids.len(), 2, "two item blocks");
         assert_eq!(kids[0]["block"]["content"], "- [ ] call the bank · due 2026-09-09");
-        // today: carry-forward pulls the open one, once, deadline intact (now overdue)
-        let today = local_today();
-        let g = call(&app, "GET", &format!("/api/todo?date={today}"), None).await;
+        // the client's today: carry-forward pulls the open one, once, deadline intact
+        let today = "2026-09-10";
+        let g = call(&app, "GET", &format!("/api/todo?date={today}&today={today}"), None).await;
         assert_eq!(g["carried"], 1, "{g}");
         assert_eq!(g["items"][0]["text"], "call the bank");
         assert_eq!(g["items"][0]["carried_from"], "2026-09-09");
-        assert_eq!(g["items"][0]["overdue"], true);
+        assert!(g["items"][0].get("overdue").is_none(), "clients compute overdue: {g}");
         assert_eq!(g["prev_date"], "2026-09-09");
         assert_eq!(g["today"], today);
-        let g2 = call(&app, "GET", &format!("/api/todo?date={today}"), None).await;
+        let g2 = call(&app, "GET", &format!("/api/todo?date={today}&today={today}"), None).await;
         assert_eq!(g2["carried"], 0);
         assert_eq!(g2["items"].as_array().unwrap().len(), 1);
-        let y = call(&app, "GET", "/api/todo?date=2026-09-09", None).await;
+        let y = call(&app, "GET", &format!("/api/todo?date=2026-09-09&today={today}"), None).await;
         assert_eq!(y["items"][0]["carried"], true, "{y}");
         assert_eq!(y["carried"], 0);
         // note, deadline, edit, move, remove by id
         let tid = g2["items"][0]["id"].as_str().unwrap().to_string();
-        let n = call(&app, "POST", "/api/todo/note", Some(json!({"date": today, "item_id": tid, "note": "about the mortgage"}))).await;
+        let n = call(&app, "POST", "/api/todo/note", Some(json!({"date": today, "item_id": tid, "note": "about the mortgage", "today": today}))).await;
         assert_eq!(n["items"][0]["note"], "about the mortgage", "{n}");
-        let d = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": today, "item_id": tid, "deadline": null}))).await;
+        let d = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": today, "item_id": tid, "deadline": null, "today": today}))).await;
         assert!(d["items"][0].get("deadline").is_none(), "{d}");
-        let e = call(&app, "POST", "/api/todo/edit", Some(json!({"date": today, "item_id": tid, "text": "call the bank today"}))).await;
+        let e = call(&app, "POST", "/api/todo/edit", Some(json!({"date": today, "item_id": tid, "text": "call the bank today", "today": today}))).await;
         assert_eq!(e["items"][0]["text"], "call the bank today");
         assert_eq!(e["items"][0]["note"], "about the mortgage");
-        // an edit with a phrase sets the deadline relative to the daemon's today
+        // an edit with a phrase sets the deadline relative to the CLIENT's today
         let tid = e["items"][0]["id"].as_str().unwrap().to_string();
-        let e = call(&app, "POST", "/api/todo/edit", Some(json!({"date": today, "item_id": tid, "text": "call the bank today due tomorrow"}))).await;
+        let e = call(&app, "POST", "/api/todo/edit", Some(json!({"date": today, "item_id": tid, "text": "call the bank today due tomorrow", "today": today}))).await;
         assert_eq!(e["items"][0]["text"], "call the bank today", "{e}");
-        let tomorrow = (chrono::Local::now().date_naive() + chrono::Duration::days(1)).to_string();
+        let tomorrow = "2026-09-11";
         assert_eq!(e["items"][0]["deadline"], tomorrow);
         assert_eq!(e["items"][0]["due_soon"], true);
         let tid = e["items"][0]["id"].as_str().unwrap().to_string();
-        let m = call(&app, "POST", "/api/todo/move", Some(json!({"date": today, "item_id": tid, "to_date": "2099-01-01"}))).await;
+        let m = call(&app, "POST", "/api/todo/move", Some(json!({"date": today, "item_id": tid, "to_date": "2099-01-01", "today": today}))).await;
         assert_eq!(m["items"].as_array().unwrap().len(), 0, "answers with the source day: {m}");
-        let far = call(&app, "GET", "/api/todo?date=2099-01-01", None).await;
+        let far = call(&app, "GET", &format!("/api/todo?date=2099-01-01&today={today}"), None).await;
         assert_eq!(far["items"][0]["text"], "call the bank today");
         let tid = far["items"][0]["id"].as_str().unwrap().to_string();
         let r = call(&app, "POST", "/api/todo/remove", Some(json!({"date": "2099-01-01", "item_id": tid}))).await;
         assert_eq!(r["items"].as_array().unwrap().len(), 0);
         // an unreadable phrase: kept as typed, warned about
-        let w = call(&app, "POST", "/api/todo", Some(json!({"date": today, "text": "rent due 31/2"}))).await;
+        let w = call(&app, "POST", "/api/todo", Some(json!({"date": today, "text": "rent due 31/2", "today": today}))).await;
         assert_eq!(w["warning"], crate::due::WARNING, "{w}");
         let last = w["items"].as_array().unwrap().last().unwrap().clone();
         assert_eq!(last["text"], "rent due 31/2");
         assert!(last.get("deadline").is_none());
         // the live hint
-        let p = call(&app, "GET", "/api/todo/parse?text=pay%20rent%20by%20tomorrow", None).await;
+        let p = call(&app, "GET", &format!("/api/todo/parse?text=pay%20rent%20by%20tomorrow&today={today}"), None).await;
         assert_eq!(p["text"], "pay rent");
         assert_eq!(p["deadline"], tomorrow);
         assert!(p.get("warning").is_none());
@@ -1464,16 +1513,18 @@ mod tests {
         let p = call(&app, "GET", "/api/todo/parse?text=read%20the%20due%20diligence%20doc", None).await;
         assert_eq!(p["text"], "read the due diligence doc");
         assert!(p["deadline"].is_null() && p.get("warning").is_none());
-        assert!(p["due_time"].is_null() && p["alert_at"].is_null());
-        // a time rides along: the date stays in `deadline`, the time beside it
-        let p = call(&app, "GET", "/api/todo/parse?text=pay%20rent%20by%20tomorrow%2009%3A30", None).await;
+        assert!(p["due_at"].is_null());
+        // a time is the client's wall time at its offset: due_at in UTC, no date
+        let q = format!("/api/todo/parse?text=pay%20rent%20by%20tomorrow%2009%3A30&today={today}&utc_offset=%2B01%3A00");
+        let p = call(&app, "GET", &q, None).await;
         assert_eq!(p["text"], "pay rent");
-        assert_eq!(p["deadline"], tomorrow);
-        assert_eq!(p["due_time"], "09:30");
-        assert_eq!(p["alert_at"], format!("{tomorrow}T09:30"));
-        let p = call(&app, "GET", "/api/todo/parse?text=pay%20rent%20by%20tomorrow", None).await;
-        assert!(p["due_time"].is_null());
-        assert_eq!(p["alert_at"], format!("{tomorrow}T{}", crate::due::DEFAULT_ALERT_TIME));
+        assert!(p["deadline"].is_null(), "{p}");
+        assert_eq!(p["due_at"], "2026-09-11T08:30:00Z");
+        // no offset: the time is not guessed
+        let p = call(&app, "GET", &format!("/api/todo/parse?text=pay%20rent%20by%20tomorrow%2009%3A30&today={today}"), None).await;
+        assert!(p["due_at"].is_null() && p["warning"].as_str().unwrap().contains("utc_offset"), "{p}");
+        let p = call(&app, "GET", "/api/todo/parse?text=x&utc_offset=1", None).await;
+        assert!(p["error"].as_str().unwrap().contains("utc_offset"), "{p}");
         // exactly one root To-do doc, created by the human, every write human
         let docs = call(&app, "GET", "/api/docs", None).await;
         let docs = docs.as_array().unwrap();
@@ -1487,102 +1538,110 @@ mod tests {
         // bad input
         let e = call(&app, "GET", "/api/todo?date=yesterday", None).await;
         assert!(e["error"].is_string());
-        let e = call(&app, "POST", "/api/todo", Some(json!({"date": today, "text": "  "}))).await;
+        let e = call(&app, "POST", "/api/todo", Some(json!({"date": today, "text": "  ", "today": today}))).await;
         assert!(e["error"].is_string());
+        let e = call(&app, "GET", "/api/todo?today=10/09/2026", None).await;
+        assert!(e["error"].as_str().unwrap().contains("today"), "{e}");
+        let e = call(&app, "POST", "/api/todo", Some(json!({"date": today, "text": "call due fri 3pm", "today": today}))).await;
+        assert!(e["error"].as_str().unwrap().contains("utc_offset"), "a typed time needs the offset: {e}");
     }
 
     #[test]
-    fn deadlines_carry_an_optional_time() {
-        let md = add("", T, "call the bank due fri 3pm").unwrap();
-        assert_eq!(md, "## 2026-09-10\n\n- [ ] call the bank · due 2026-09-11 15:00\n");
+    fn a_typed_time_is_stored_as_a_utc_instant() {
+        let dublin = crate::due::parse_offset("+01:00");
+        let (md, _) = add_item("", T, T, dublin, "call the bank due fri 3pm").unwrap();
+        assert_eq!(md, "## 2026-09-10\n\n- [ ] call the bank · due 2026-09-11T14:00Z\n");
         let items = parse_day(&md, T, T);
         assert_eq!(items[0].text, "call the bank");
-        assert_eq!(items[0].deadline.as_deref(), Some("2026-09-11"), "deadline stays the date");
-        assert_eq!(items[0].due_time.as_deref(), Some("15:00"));
-        assert_eq!(items[0].alert_at.as_deref(), Some("2026-09-11T15:00"));
-        assert!(items[0].due_soon && !items[0].overdue);
-        // date-only: no time in the text, alert at the default
-        let md = add(&md, T, "ship it by 12/10").unwrap();
+        assert!(items[0].deadline.is_none(), "a timed item has no all-day date");
+        assert_eq!(items[0].due_at.as_deref(), Some("2026-09-11T14:00:00Z"));
+        assert!(!items[0].legacy_time && items[0].due_soon);
+        // date-only stays a floating date
+        let (md, _) = add_item(&md, T, T, dublin, "ship it by 12/10").unwrap();
         assert!(md.contains("- [ ] ship it · due 2026-10-12\n"), "{md}");
         let items = parse_day(&md, T, T);
-        assert!(items[1].due_time.is_none());
-        assert_eq!(items[1].alert_at.as_deref(), Some("2026-10-12T09:00"));
-        // the stored form re-reads identically and survives a rewrite of the day
+        assert_eq!((items[1].deadline.as_deref(), items[1].due_at.as_deref()), (Some("2026-10-12"), None));
+        // the stored instant re-reads identically and survives a rewrite of the day
         let md = toggle_item(&md, T, T, Some(&items[0].id), None, true).unwrap();
-        assert!(md.contains("- [x] call the bank · due 2026-09-11 15:00\n"), "{md}");
-        // an edit without a phrase keeps date AND time; one with a phrase replaces both
-        let (md, _) = edit_item(&md, T, T, &items[0].id, "call the bank about fees").unwrap();
-        assert!(md.contains("- [x] call the bank about fees · due 2026-09-11 15:00\n"), "{md}");
+        assert!(md.contains("- [x] call the bank · due 2026-09-11T14:00Z\n"), "{md}");
+        // an edit without a phrase keeps it; one with a phrase replaces it
+        let (md, _) = edit_item(&md, T, T, dublin, &items[0].id, "call the bank about fees").unwrap();
+        assert!(md.contains("- [x] call the bank about fees · due 2026-09-11T14:00Z\n"), "{md}");
         let id = parse_day(&md, T, T)[0].id.clone();
-        let (md, _) = edit_item(&md, T, T, &id, "call the bank about fees by 12/10 17:00").unwrap();
-        assert!(md.contains("· due 2026-10-12 17:00\n"), "{md}");
-        // set_deadline takes either form
+        let (md, _) = edit_item(&md, T, T, crate::due::parse_offset("-05:00"), &id, "call the bank about fees by 12/10 17:00").unwrap();
+        assert!(md.contains("· due 2026-10-12T22:00Z\n"), "{md}");
+        // no zone: a typed time is refused, a date is fine
+        assert!(add_item(&md, T, T, None, "x due fri 3pm").unwrap_err().contains("utc_offset"));
+        assert!(add_item(&md, T, T, None, "x due fri").is_ok());
+        // set_deadline: due_at (any zone) → UTC; a date → all-day
         let id = parse_day(&md, T, T)[0].id.clone();
-        let md = set_deadline(&md, T, T, &id, Some("2026-09-20 08:15"), TimeEdit::Keep).unwrap();
-        assert!(md.contains("· due 2026-09-20 08:15\n"), "{md}");
-        let md = set_deadline(&md, T, T, &id, Some("2026-09-20T10:00"), TimeEdit::Keep).unwrap();
-        assert!(md.contains("· due 2026-09-20 10:00\n"), "a T separator is normalised: {md}");
-        // the UI's date picker sends a date alone: the time stays
-        let md = set_deadline(&md, T, T, &id, Some("2026-09-21"), TimeEdit::Keep).unwrap();
-        assert!(md.contains("· due 2026-09-21 10:00\n"), "{md}");
-        let md = set_deadline(&md, T, T, &id, Some("2026-09-22"), TimeEdit::Set("07:30")).unwrap();
-        assert!(md.contains("· due 2026-09-22 07:30\n"), "{md}");
-        assert!(set_deadline(&md, T, T, &id, Some("2026-09-22"), TimeEdit::Set("7:3")).is_err());
-        let md = set_deadline(&md, T, T, &id, Some("2026-09-21"), TimeEdit::Clear).unwrap();
+        let md = set_deadline(&md, T, T, &id, None, Some("2026-09-20T08:15:00+01:00")).unwrap();
+        assert!(md.contains("· due 2026-09-20T07:15Z\n"), "{md}");
+        let md = set_deadline(&md, T, T, &id, Some("2026-09-21"), None).unwrap();
         assert!(md.contains("· due 2026-09-21\n"), "{md}");
-        assert!(set_deadline(&md, T, T, &id, Some("2026-09-21 25:00"), TimeEdit::Keep).is_err());
-        // an agent's raw line is read with the time resolved, left as typed
-        let raw = "## 2026-09-10\n\n- [ ] standup due tomorrow 9:45\n";
-        let items = parse_day(raw, T, T);
-        assert_eq!((items[0].text.as_str(), items[0].due_time.as_deref()), ("standup", Some("09:45")));
-        // the legacy clock token stays date-only
-        let items = parse_day("## 2026-09-10\n\n- [ ] old ⏰ 2026-09-12\n", T, T);
-        assert_eq!(items[0].deadline.as_deref(), Some("2026-09-12"));
-        assert!(items[0].due_time.is_none());
-    }
-
-    fn at(s: &str) -> chrono::NaiveDateTime {
-        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").unwrap()
+        assert!(set_deadline(&md, T, T, &id, None, Some("2026-09-20T08:15")).is_err(), "no zone, no guess");
+        assert!(set_deadline(&md, T, T, &id, Some("2026-09-21 10:00"), None).is_err());
     }
 
     #[test]
-    fn due_lists_open_deadlined_items_across_days_overdue_by_time() {
-        let md = "## 2026-09-08\n\n- [ ] old and late · due 2026-09-09\n\n- [>] moved on · due 2026-09-09\n\n## 2026-09-10\n\n- [ ] standup · due 2026-09-10 09:30\n  room 4\n\n- [ ] report · due 2026-09-10\n\n- [x] done already · due 2026-09-10 08:00\n\n- [ ] no deadline\n\n- [ ] later · due 2026-09-20 17:00 (carried from 2026-09-08)\n";
-        let now = at("2026-09-10T10:00");
-        let all = due_items(md, now, None);
-        let rows: Vec<(&str, &str, bool)> = all.iter().map(|i| (i.text.as_str(), i.alert_at.as_str(), i.overdue)).collect();
+    fn legacy_wall_times_are_read_as_utc_flagged_and_left_alone() {
+        let old = "## 2026-09-10\n\n- [ ] call · due 2026-09-11 15:00\n\n- [ ] standup due tomorrow 9:45\n";
+        let items = parse_day(old, T, T);
+        assert_eq!(items[0].due_at.as_deref(), Some("2026-09-11T15:00:00Z"));
+        assert!(items[0].legacy_time && items[0].deadline.is_none());
+        assert_eq!((items[1].text.as_str(), items[1].due_at.as_deref(), items[1].legacy_time), ("standup", Some("2026-09-11T09:45:00Z"), true));
+        // a write to the day keeps the legacy form (never silently rezoned)
+        let md = toggle_item(old, T, T, Some(&items[0].id), None, true).unwrap();
+        assert!(md.contains("- [x] call · due 2026-09-11 15:00\n"), "{md}");
+        // the clock token stays date-only
+        let items = parse_day("## 2026-09-10\n\n- [ ] old ⏰ 2026-09-12\n", T, T);
+        assert_eq!((items[0].deadline.as_deref(), items[0].due_at.as_deref()), (Some("2026-09-12"), None));
+    }
+
+    fn utc_at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn due_lists_open_deadlined_items_across_days_soonest_first() {
+        let md = "## 2026-09-08\n\n- [ ] old and late · due 2026-09-09\n\n- [>] moved on · due 2026-09-09\n\n## 2026-09-10\n\n- [ ] standup · due 2026-09-10T08:30Z\n  room 4\n\n- [ ] report · due 2026-09-10\n\n- [x] done already · due 2026-09-10T07:00Z\n\n- [ ] no deadline\n\n- [ ] later · due 2026-09-20 17:00 (carried from 2026-09-08)\n";
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let all = due_items(md, today, None);
+        let rows: Vec<(&str, Option<&str>, Option<&str>)> =
+            all.iter().map(|i| (i.text.as_str(), i.deadline.as_deref(), i.due_at.as_deref())).collect();
         assert_eq!(
             rows,
             vec![
-                ("old and late", "2026-09-09T09:00", true),
-                ("report", "2026-09-10T09:00", false),
-                ("standup", "2026-09-10T09:30", true),
-                ("later", "2026-09-20T17:00", false),
+                ("old and late", Some("2026-09-09"), None),
+                ("report", Some("2026-09-10"), None),
+                ("standup", None, Some("2026-09-10T08:30:00Z")),
+                ("later", None, Some("2026-09-20T17:00:00Z")),
             ],
-            "open + deadlined only, soonest alert first; by TIME: 09:30 is past at 10:00, a date-only today is not"
+            "open + deadlined only, soonest first, an all-day date at the start of its day"
         );
         let standup = &all[2];
-        assert_eq!((standup.date.as_str(), standup.deadline.as_str(), standup.due_time.as_deref()), ("2026-09-10", "2026-09-10", Some("09:30")));
+        assert_eq!(standup.date, "2026-09-10");
         assert_eq!(standup.id, item_id(0, "standup"), "addressable with {{date, item_id}}");
         assert_eq!(standup.note.as_deref(), Some("room 4"));
+        assert!(all[3].legacy_time);
         assert_eq!(all[3].carried_from.as_deref(), Some("2026-09-08"));
-        // until a day: deadlines on or before it
-        let d = due_items(md, now, Some(Until::Day(NaiveDate::from_ymd_opt(2026, 9, 10).unwrap())));
+        // until a date: all-day on or before it, timed by UTC date
+        let d = due_items(md, today, Some(Until::Day(today)));
         assert_eq!(d.len(), 3);
-        // until an instant: alerts at or before it
-        let d = due_items(md, now, Some(Until::At(at("2026-09-10T09:00"))));
+        // until an instant: timed at or before it, all-day on or before its UTC date
+        let d = due_items(md, today, Some(Until::At(utc_at("2026-09-10T08:29:00Z"))));
         assert_eq!(d.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["old and late", "report"]);
-        assert!(due_items("", now, None).is_empty());
+        let d = due_items(md, today, Some(Until::At(utc_at("2026-09-10T09:30:00+01:00"))));
+        assert_eq!(d.len(), 3, "08:30Z is in");
+        assert!(due_items("", today, None).is_empty());
     }
 
     #[test]
-    fn until_accepts_a_day_rfc3339_or_local_wall_time() {
+    fn until_is_a_date_or_an_instant_with_a_zone() {
         assert_eq!(parse_until("2026-09-10"), Some(Until::Day(NaiveDate::from_ymd_opt(2026, 9, 10).unwrap())));
-        assert_eq!(parse_until("2026-09-10T17:00"), Some(Until::At(at("2026-09-10T17:00"))));
-        assert_eq!(parse_until("2026-09-10T17:00:30"), Some(Until::At(at("2026-09-10T17:00") + chrono::Duration::seconds(30))));
-        let utc = chrono::DateTime::parse_from_rfc3339("2026-09-10T17:00:00Z").unwrap();
-        assert_eq!(parse_until("2026-09-10T17:00:00Z"), Some(Until::At(utc.with_timezone(&chrono::Local).naive_local())));
-        for bad in ["tomorrow", "2026-13-01", "2026-09-10 17:00", ""] {
+        assert_eq!(parse_until("2026-09-10T17:00:00Z"), Some(Until::At(utc_at("2026-09-10T17:00:00Z"))));
+        assert_eq!(parse_until("2026-09-10T18:00:00+01:00"), Some(Until::At(utc_at("2026-09-10T17:00:00Z"))));
+        for bad in ["tomorrow", "2026-13-01", "2026-09-10 17:00", "2026-09-10T17:00", ""] {
             assert_eq!(parse_until(bad), None, "{bad}");
         }
     }
@@ -1598,11 +1657,13 @@ mod tests {
         let v = call(&app, "GET", "/api/todo/due", None).await;
         assert!(v["doc_id"].is_null() && v["items"].as_array().unwrap().is_empty(), "{v}");
         assert_eq!(v["default_alert_time"], "09:00");
+        assert!(v["now"].as_str().unwrap().ends_with('Z'), "{v}");
         let docs = call(&app, "GET", "/api/docs", None).await;
         assert!(docs.as_array().unwrap().is_empty(), "no doc created: {docs}");
         // an open item on a PAST day: GET /api/todo for today would carry it
-        call(&app, "POST", "/api/todo", Some(json!({"date": "2020-01-01", "text": "pay the fine due 2020-01-02 10:00"}))).await;
-        call(&app, "POST", "/api/todo", Some(json!({"date": "2020-01-01", "text": "renew due 2099-01-01"}))).await;
+        let t = "2020-01-01";
+        call(&app, "POST", "/api/todo", Some(json!({"date": t, "text": "pay the fine due 2020-01-02 10:00", "today": t, "utc_offset": "+00:00"}))).await;
+        call(&app, "POST", "/api/todo", Some(json!({"date": t, "text": "renew due 2099-01-01", "today": t}))).await;
         let before = call(&app, "GET", "/api/changes", None).await["seq"].clone();
         let epoch = |docs: &Value| docs.as_array().unwrap().iter().find(|d| d["title"] == TODO_TITLE).unwrap()["current_epoch"].clone();
         let e0 = epoch(&call(&app, "GET", "/api/docs", None).await);
@@ -1611,41 +1672,79 @@ mod tests {
         assert_eq!(items.len(), 2, "{v}");
         assert_eq!(items[0]["text"], "pay the fine");
         assert_eq!(items[0]["date"], "2020-01-01");
-        assert_eq!(items[0]["deadline"], "2020-01-02");
-        assert_eq!(items[0]["due_time"], "10:00");
-        assert_eq!(items[0]["alert_at"], "2020-01-02T10:00");
-        assert_eq!(items[0]["overdue"], true);
-        assert_eq!(items[1]["overdue"], false);
-        assert!(items[1].get("due_time").is_none());
-        assert_eq!(items[1]["alert_at"], "2099-01-01T09:00");
+        assert_eq!(items[0]["due_at"], "2020-01-02T10:00:00Z");
+        assert!(items[0].get("deadline").is_none() && items[0].get("overdue").is_none());
+        assert_eq!(items[1]["deadline"], "2099-01-01");
+        assert!(items[1].get("due_at").is_none());
         let v = call(&app, "GET", "/api/todo/due?until=2098-12-31", None).await;
         assert_eq!(v["items"].as_array().unwrap().len(), 1);
-        let v = call(&app, "GET", "/api/todo/due?until=2020-01-02T10:00", None).await;
-        assert_eq!(v["items"].as_array().unwrap().len(), 1, "an alert AT the bound is in");
-        let v = call(&app, "GET", "/api/todo/due?until=2020-01-02T09:59", None).await;
-        assert!(v["items"].as_array().unwrap().is_empty());
+        let v = call(&app, "GET", "/api/todo/due?until=2020-01-02T10:00:00Z", None).await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 1, "an instant AT the bound is in");
+        let v = call(&app, "GET", "/api/todo/due?until=2020-01-02T10:59:00%2B01:00", None).await;
+        assert!(v["items"].as_array().unwrap().is_empty(), "09:59Z is before it");
         // nothing moved: same epoch, same journal head
         assert_eq!(epoch(&call(&app, "GET", "/api/docs", None).await), e0);
         assert_eq!(call(&app, "GET", "/api/changes", None).await["seq"], before);
-        // a bad bound is a 400 with a JSON body
-        let res = app.clone().oneshot(Request::get("/api/todo/due?until=soon").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        // a bad bound (or a zoneless wall time) is a 400 with a JSON body
+        for bad in ["soon", "2020-01-02T10:00"] {
+            let res = app.clone().oneshot(Request::get(format!("/api/todo/due?until={bad}")).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
     }
 
     #[tokio::test]
-    async fn the_deadline_route_keeps_or_sets_or_clears_the_time() {
+    async fn the_deadline_route_sets_a_day_an_instant_or_clears() {
         use crate::home::testing::{app, call};
         let (app, _) = app();
         let d = "2020-01-01";
-        let v = call(&app, "POST", "/api/todo", Some(json!({"date": d, "text": "x due 2020-01-05 15:00"}))).await;
+        let v = call(&app, "POST", "/api/todo", Some(json!({"date": d, "text": "x due 2020-01-05", "today": d}))).await;
         let id = v["items"][0]["id"].as_str().unwrap().to_string();
-        let v = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": d, "item_id": id, "deadline": "2020-01-06"}))).await;
-        assert_eq!((v["items"][0]["deadline"].clone(), v["items"][0]["due_time"].clone()), (json!("2020-01-06"), json!("15:00")), "{v}");
-        let v = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": d, "item_id": id, "deadline": "2020-01-06", "due_time": "08:00"}))).await;
-        assert_eq!(v["items"][0]["due_time"], "08:00");
-        let v = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": d, "item_id": id, "deadline": "2020-01-06", "due_time": null}))).await;
-        assert!(v["items"][0].get("due_time").is_none(), "{v}");
-        let v = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": d, "item_id": id, "deadline": null}))).await;
-        assert!(v["items"][0].get("deadline").is_none(), "{v}");
+        let v = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": d, "item_id": id, "due_at": "2020-01-06T15:00:00+01:00", "today": d}))).await;
+        assert_eq!((v["items"][0]["due_at"].clone(), v["items"][0].get("deadline").cloned()), (json!("2020-01-06T14:00:00Z"), None), "{v}");
+        let v = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": d, "item_id": id, "deadline": "2020-01-07", "today": d}))).await;
+        assert_eq!((v["items"][0]["deadline"].clone(), v["items"][0].get("due_at").cloned()), (json!("2020-01-07"), None), "{v}");
+        let v = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": d, "item_id": id, "due_at": "2020-01-06 15:00", "today": d}))).await;
+        assert!(v["error"].as_str().unwrap().contains("RFC 3339"), "{v}");
+        let v = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": d, "item_id": id, "deadline": null, "today": d}))).await;
+        assert!(v["items"][0].get("deadline").is_none() && v["items"][0].get("due_at").is_none(), "{v}");
+    }
+
+    /// SERVER mode (a token on the request): the client's `today` is required.
+    #[tokio::test]
+    async fn server_mode_requires_the_clients_today() {
+        use crate::home::testing::app;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let (app, human) = app();
+        let who = crate::auth::Authenticated {
+            user_id: Uuid::now_v7(),
+            grant_id: Uuid::now_v7(),
+            client_id: "dcr_x".into(),
+            principal: "claude:taisce-ios".into(),
+            owner_app: true,
+            human,
+        };
+        let get = |uri: &str| {
+            let mut r = Request::get(uri).body(Body::empty()).unwrap();
+            r.extensions_mut().insert(who.clone());
+            r
+        };
+        let body = |r: axum::response::Response| async move {
+            serde_json::from_slice::<Value>(&axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap()
+        };
+        let v = body(app.clone().oneshot(get("/api/todo")).await.unwrap()).await;
+        assert!(v["error"].as_str().unwrap().contains("today"), "{v}");
+        let v = body(app.clone().oneshot(get("/api/todo/parse?text=x%20due%20fri")).await.unwrap()).await;
+        assert!(v["error"].as_str().unwrap().contains("today"), "{v}");
+        let v = body(app.clone().oneshot(get("/api/todo?today=2026-09-10")).await.unwrap()).await;
+        assert_eq!(v["today"], "2026-09-10", "{v}");
+        let mut r = Request::post("/api/todo")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"date": "2026-09-10", "text": "x"}).to_string()))
+            .unwrap();
+        r.extensions_mut().insert(who.clone());
+        let v = body(app.clone().oneshot(r).await.unwrap()).await;
+        assert!(v["error"].as_str().unwrap().contains("today"), "{v}");
     }
 }

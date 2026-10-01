@@ -1292,7 +1292,7 @@ async fn reveal_backups(State(st): State<ApiState>) -> Json<Value> {
 /// in-app). Titles become file names; docs with children become folders.
 async fn export_vault(State(st): State<ApiState>) -> Json<Value> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let stamp = chrono::Local::now().format("%Y-%m-%d-%H%M").to_string();
+    let stamp = chrono::Utc::now().format("%Y-%m-%d-%H%M").to_string();
     let dir = std::path::PathBuf::from(home)
         .join("Downloads")
         .join(format!("grimoire-export-{stamp}"));

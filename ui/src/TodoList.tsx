@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { errText, notify } from './Notice'
 import { api } from './types'
-import { addDays, deadlineTone, fmtDay, fmtDeadline, hasDuePhrase, nextMonday, previewLabel, type DueParse, type TodoDay, type TodoItem } from './todo'
+import { addDays, clientClock, deadlineTone, dueDate, dueTime, fmtDay, fmtDeadline, hasDuePhrase, moveDueAt, nextMonday, previewLabel, type DueParse, type TodoDay, type TodoItem } from './todo'
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
@@ -50,7 +50,7 @@ export default function Todo({
   )
 
   const load = useCallback(() => {
-    api<TodoDay>(`/api/todo?date=${encodeURIComponent(date)}`)
+    api<TodoDay>(`/api/todo?date=${encodeURIComponent(date)}&today=${clientClock().today}`)
       .then((d) => {
         setMissing(false)
         apply(d)
@@ -68,7 +68,7 @@ export default function Todo({
   const post = async (path: string, body: Record<string, unknown>) => {
     setBusy(true)
     try {
-      const d = await api<TodoDay>(path, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ date, ...body }) })
+      const d = await api<TodoDay>(path, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ date, ...clientClock(), ...body }) })
       apply(d)
       if (d.warning) notify(`${d.warning} — kept as typed; set it from the ⋯ menu`, 'warn')
       return true
@@ -98,7 +98,8 @@ export default function Todo({
     }
     let live = true
     const t = setTimeout(() => {
-      api<DueParse>(`/api/todo/parse?text=${encodeURIComponent(draft.trim())}`)
+      const c = clientClock()
+      api<DueParse>(`/api/todo/parse?text=${encodeURIComponent(draft.trim())}&today=${c.today}&utc_offset=${encodeURIComponent(c.utc_offset)}`)
         .then((r) => live && setPreview(r))
         .catch(() => live && setPreview(null))
     }, 150)
@@ -172,7 +173,9 @@ export default function Todo({
             }}
             onDeadline={(dl) => {
               setMenu(null)
-              post('/api/todo/deadline', { item_id: it.id, deadline: dl })
+              // a timed deadline keeps its local time on the new date
+              if (dl && it.due_at) post('/api/todo/deadline', { item_id: it.id, due_at: moveDueAt(it.due_at, dl) })
+              else post('/api/todo/deadline', { item_id: it.id, deadline: dl })
             }}
             onNoteToggle={() => toggleNote(it.id)}
             onNoteEdit={() => {
@@ -284,6 +287,7 @@ function TodoRow({
   }, [noteEditing, it.note])
 
   const tone = deadlineTone(it)
+  const due = dueDate(it)
   const state = it.done ? 'done' : it.carried ? 'carried' : 'open'
   const notePreview = it.note?.split('\n')[0] ?? ''
 
@@ -328,9 +332,10 @@ function TodoRow({
             ≡
           </button>
         )}
-        {it.deadline && (
-          <span className={`todo-deadline ${tone}`} title={`deadline ${it.deadline}`}>
-            {fmtDeadline(it.deadline, today)}
+        {due && (
+          <span className={`todo-deadline ${tone}`} title={`deadline ${it.due_at ? new Date(it.due_at).toLocaleString() : due}`}>
+            {fmtDeadline(due, today)}
+            {it.due_at && ` ${dueTime(it.due_at)}`}
           </span>
         )}
         {!readOnly && (
@@ -379,7 +384,7 @@ function TodoRow({
           {menu === 'root' && (
             <>
               <button onClick={() => onMenu('move')}>move →</button>
-              <button onClick={() => onMenu('deadline')}>{it.deadline ? 'deadline →' : 'set a deadline →'}</button>
+              <button onClick={() => onMenu('deadline')}>{due ? 'deadline →' : 'set a deadline →'}</button>
               <button onClick={onNoteEdit}>{it.note ? 'edit note' : 'add a note'}</button>
             </>
           )}
@@ -401,12 +406,12 @@ function TodoRow({
             <>
               <label className="todo-menu-pick">
                 deadline
-                <input type="date" value={pick || it.deadline || ''} onChange={(e) => setPick(e.target.value)} />
-                <button disabled={!(pick || it.deadline)} onClick={() => onDeadline(pick || it.deadline || null)}>
+                <input type="date" value={pick || due || ''} onChange={(e) => setPick(e.target.value)} />
+                <button disabled={!(pick || due)} onClick={() => onDeadline(pick || due || null)}>
                   set
                 </button>
               </label>
-              {it.deadline && <button onClick={() => onDeadline(null)}>clear the deadline</button>}
+              {due && <button onClick={() => onDeadline(null)}>clear the deadline</button>}
             </>
           )}
         </div>

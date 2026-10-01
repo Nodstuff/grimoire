@@ -1720,19 +1720,20 @@ mod token_tests {
     }
 }
 
-/// The 16:00 daily cut (§3.4): the daemon self-schedules; no external cron.
+/// The 16:00 UTC daily cut (§3.4): the daemon self-schedules; no external
+/// cron. UTC, like every server clock: the process never reads a timezone.
 pub async fn daily_loop(store: Store, hot: crate::hot::HotState) {
     loop {
-        let now = chrono::Local::now();
+        let now = chrono::Utc::now();
         let today_four = now.date_naive().and_hms_opt(16, 0, 0).unwrap();
-        let next = if now.naive_local() < today_four {
+        let next = if now.naive_utc() < today_four {
             today_four
         } else {
             (now.date_naive() + chrono::Days::new(1))
                 .and_hms_opt(16, 0, 0)
                 .unwrap()
         };
-        let wait = (next - now.naive_local()).to_std().unwrap_or_default();
+        let wait = (next - now.naive_utc()).to_std().unwrap_or_default();
         tracing::info!("next gardener run in {}s", wait.as_secs());
         tokio::time::sleep(wait).await;
 

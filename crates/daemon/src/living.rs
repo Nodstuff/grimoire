@@ -183,7 +183,7 @@ pub fn refresh_ops(tree: &DocTree, refreshable: &[Uuid], body_md: &str, source_r
 /// The refreshed body: synthesis (or its placeholder text), receipts, footer.
 pub fn refreshed_body(synthesis: Option<&str>, excerpts: &[SearchHit], changed: usize, total: usize) -> String {
     let docs: HashSet<Uuid> = excerpts.iter().map(|h| h.block.doc_id).collect();
-    let date = chrono::Local::now().format("%Y-%m-%d");
+    let date = chrono::Utc::now().format("%Y-%m-%d");
     let mut md = String::new();
     if let Some(s) = synthesis {
         md.push_str(s.trim());

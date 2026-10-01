@@ -312,7 +312,7 @@ pub async fn ask(
         return Ok(Answer { doc_id: None, title: title_for(&question), sources: 0, docs: 0 });
     }
     let synthesise = crate::garden::claude_bin().is_some();
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     // the question rides in frontmatter so the refresher (living.rs) can
     // re-ask it verbatim; the editor hides `---` blocks
     let md = format!(
