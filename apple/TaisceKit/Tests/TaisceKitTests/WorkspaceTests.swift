@@ -110,28 +110,71 @@ import Testing
         #expect(k["workspace_id"] == nil && k["parent_doc_id"] as? String == "p1")
     }
 
+    /// Tom's phone has a v1 cache: open one with the full Cache and keep
+    /// everything but the to-do rows (rebuilt from the To-do doc on the next
+    /// sync) and the cursor (reset so a bootstrap fills in workspace ids).
     @Test func aV1CacheMigratesThroughBothV2s() async throws {
         let q = try DatabaseQueue()
         try Cache.migrator.migrate(q, upTo: "v1")
         try await q.write { db in
-            try db.execute(sql: "INSERT INTO docs(id, title, current_epoch, body_epoch) VALUES ('t', 'To-do', 3, 3), ('d', 'Doc', 2, 2)")
-            try db.execute(sql: "INSERT INTO todos(date, position, mark, text) VALUES ('2026-10-01', 0, ' ', 'old')")
+            try db.execute(sql: """
+                INSERT INTO docs(id, parent_id, title, current_epoch, sort_key, status, is_canvas, is_shared, mirror_permission, body_epoch) VALUES
+                ('t', NULL, 'To-do', 3, 'a', NULL, 0, 0, NULL, 3),
+                ('g', NULL, 'Grimoire', 5, 'b', 'active', 0, 1, NULL, 5),
+                ('r', 'g', 'Roadmap', 2, 'a', NULL, 0, 0, NULL, NULL)
+                """)
+            try db.execute(sql: """
+                INSERT INTO blocks(id, doc_id, parent_id, order_key, block_type, content, epoch, refers_to, position, depth) VALUES
+                ('th', 't', NULL, 'a', 'heading', '## 2026-10-01', 3, NULL, 0, 0),
+                ('ti', 't', 'th', 'b', 'paragraph', '- [ ] old item · due 2026-10-02', 3, NULL, 1, 1),
+                ('gh', 'g', NULL, 'a', 'heading', '# Grimoire', 5, NULL, 0, 0),
+                ('gp', 'g', 'gh', 'b', 'paragraph', 'alpha bravo', 5, NULL, 1, 1)
+                """)
+            try db.execute(sql: "INSERT INTO todos(date, position, mark, text, deadline) VALUES ('2026-10-01', 0, ' ', 'old item', '2026-10-02')")
             try db.execute(sql: "INSERT INTO sync_state(key, value) VALUES ('last_seq', 42)")
+            try db.execute(sql: """
+                INSERT INTO outbox(created_at, idempotency_key, method, path, body, state, attempts, last_error) VALUES
+                ('2026-10-01 09:00:00.000', 'k1', 'POST', '/api/todo/toggle', X'7B7D', 'pending', 1, 'offline')
+                """)
         }
         let cache = try Cache(writer: q)
         let applied = try await q.read { db in try Cache.migrator.appliedIdentifiers(db) }
         #expect(applied == ["v1", "v2", "v2-workspaces"])
-        try await q.read { db in
-            let outbox = try db.columns(in: "outbox").map(\.name)
-            #expect(outbox.contains("outcome"), "the editor's v2")
-            #expect(try db.columns(in: "docs").map(\.name).contains("workspace_id"))
-            #expect(try db.columns(in: "todos").map(\.name).contains("doc_id"))
-            #expect(try db.tableExists("workspaces"))
+        let (outbox, docCols, todoCols, wsTable) = try await q.read { db in
+            (try db.columns(in: "outbox").map(\.name), try db.columns(in: "docs").map(\.name),
+             try db.columns(in: "todos").map(\.name), try db.tableExists("workspaces"))
         }
+        #expect(outbox.contains("outcome"), "the editor's v2")
+        #expect(docCols.contains("workspace_id") && todoCols.contains("doc_id") && wsTable)
+        // docs and blocks survive; only the To-do body is marked for refetch
+        let docs = try await cache.docs()
+        #expect(Set(docs.map(\.id)) == ["t", "g", "r"])
+        #expect(docs.allSatisfy { $0.workspaceID == nil }, "filled in by the bootstrap")
+        let g = try #require(docs.first { $0.id == "g" })
+        #expect(g.bodyEpoch == 5 && g.isShared && g.status == "active")
         #expect(try await cache.doc("t")?.bodyEpoch == nil, "the To-do doc refetches its list")
-        #expect(try await cache.doc("d")?.bodyEpoch == 2, "other bodies are kept")
-        #expect(try await cache.lastSeq() == 0, "re-bootstrap for workspace ids")
+        #expect(try await cache.blocks(of: "g").map(\.content) == ["# Grimoire", "alpha bravo"])
+        #expect(try await cache.blocks(of: "t").count == 2)
+        #expect(try await cache.searchBlocks("bravo").map(\.id) == ["gp"], "FTS still indexed")
+        // the queued write survives, untouched, with no outcome yet
+        let queued = try await cache.pendingOutbox()
+        #expect(queued.count == 1)
+        let e = try #require(queued.first)
+        #expect(e.idempotencyKey == "k1" && e.path == "/api/todo/toggle" && e.attempts == 1 && e.lastError == "offline")
+        #expect(e.body == Data("{}".utf8) && e.outcome == nil)
+        // cursor reset: the next catch-up bootstraps the tree (bodies kept)
+        #expect(try await cache.lastSeq() == 0)
+        // to-do rows are rebuilt from the To-do doc on its next fetch, keyed by it
         #expect(try await cache.todos().isEmpty)
+        let json = Fixture.docTree("t", title: "To-do", epoch: 4, roots: """
+        {"block":\(Fixture.block("th", doc: "t", type: "heading", content: "## 2026-10-01", epoch: 4)),"children":[
+          {"block":\(Fixture.block("ti", doc: "t", content: "- [ ] old item · due 2026-10-02", parent: "th", epoch: 4)),"children":[]}
+        ]}
+        """)
+        try await cache.storeDoc(JSONDecoder().decode(DocTree.self, from: Data(json.utf8)))
+        let rebuilt = try await cache.todos()
+        #expect(rebuilt.map(\.text) == ["old item"] && rebuilt.map(\.docID) == ["t"])
+        #expect(try await cache.todos(in: "t").first?.deadline == "2026-10-02")
     }
 
     @Test func scopeParamRoundTrips() throws {
