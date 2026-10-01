@@ -291,6 +291,7 @@ struct DocContent: View {
                         action: onToggle.map { f in { i, v in f(block.id, i, v) } }
                     ))
             }
+            .environment(\.docTables, page.chartTables)
             DocChildrenList(layout: children, childCounts: childCounts, now: now, onOpen: onOpenChild)
         } else if case .folder = children {
             DocChildrenList(layout: children, childCounts: childCounts, now: now, onOpen: onOpenChild, onNewDocHere: onNewDocHere)
