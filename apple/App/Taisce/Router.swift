@@ -32,6 +32,9 @@ final class Router {
     var padPath: [Route] = []
     var searchQuery = ""
     var showSettings = false
+    /// the "New doc" sheet, and the folder it starts in
+    var showNewDoc = false
+    var newDocParent: DocID?
     /// set by the pad layout, so `open` pushes onto the detail stack
     var isPad = false
 
@@ -52,6 +55,11 @@ final class Router {
     func select(_ item: PadItem) {
         padItem = item
         padPath = []
+    }
+
+    func newDoc(in parent: DocID? = nil) {
+        newDocParent = parent
+        showNewDoc = true
     }
 
     func showTodos() {

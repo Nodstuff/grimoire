@@ -71,9 +71,25 @@ public struct APIClient: Sendable {
     // MARK: block edits (no UI yet)
 
     /// A new, empty doc (nil parent = top level). Fill it with `proposeMarkdown`.
-    public func createDoc(title: String, parent: DocID? = nil) async throws -> DocSummary {
-        struct Body: Encodable { var title: String; var parent_doc_id: DocID? }
-        return try await post("/api/docs", body: Body(title: title, parent_doc_id: parent))
+    /// `requestID` is sent for servers that dedupe creates on it; callers
+    /// retrying after a lost answer should look for the doc first
+    /// (`NewDoc.find`), as a server that ignores it would create a second.
+    public func createDoc(title: String, parent: DocID? = nil, requestID: String? = nil) async throws -> DocSummary {
+        struct Body: Encodable { var title: String; var parent_doc_id: DocID?; var request_id: String? }
+        return try await post("/api/docs", body: Body(title: title, parent_doc_id: parent, request_id: requestID))
+    }
+
+    /// Op ids on `docID` waiting for a human (`GET /api/doc/{id}/review`).
+    public func openReviewOps(_ docID: DocID) async throws -> Set<String> {
+        struct Row: Decodable {
+            struct Item: Decodable {
+                struct Annotation: Decodable { var op_id: String; var status: String? }
+                var annotation: Annotation
+            }
+            var item: Item
+        }
+        let rows: [Row] = try await get("/api/doc/\(docID)/review")
+        return Set(rows.filter { ($0.item.annotation.status ?? "open") == "open" }.map(\.item.annotation.op_id))
     }
 
     public func propose(_ req: ProposeRequest) async throws -> ProposeOutcome {
