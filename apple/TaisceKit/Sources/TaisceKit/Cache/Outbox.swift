@@ -110,6 +110,10 @@ public struct OutboxReplayer: Sendable {
                 r.httpBody = entry.body
                 _ = try await api.send(raw: r)
                 try await cache.markOutbox(id, state: .done)
+            } catch APIError.unauthorized {
+                // signed out or mid-refresh: not this entry's fault, keep it and the order
+                try await cache.markOutbox(id, state: .pending, error: String(describing: APIError.unauthorized))
+                return
             } catch let e as APIError {
                 // the server answered: retrying the same request won't help
                 try await cache.markOutbox(id, state: .failed, error: String(describing: e))

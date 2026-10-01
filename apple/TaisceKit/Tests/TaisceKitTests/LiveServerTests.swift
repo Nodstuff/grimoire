@@ -30,3 +30,24 @@ struct LiveServerTests {
         print("live: \(tree.count) docs, \(blocks) blocks rendered from 40, \(hits.count) search hits")
     }
 }
+
+/// Opt-in, read-only discovery check against a server-mode daemon:
+/// `TAISCE_LIVE_AUTH_URL=https://taisce.null.ie swift test --filter LiveAuth`.
+/// Two GETs of public metadata; never registers a client or creates a grant.
+@Suite(.enabled(if: ProcessInfo.processInfo.environment["TAISCE_LIVE_AUTH_URL"] != nil))
+struct LiveAuthDiscoveryTests {
+    @Test func decodesTheRealMetadata() async throws {
+        let base = try #require(ProcessInfo.processInfo.environment["TAISCE_LIVE_AUTH_URL"].flatMap(URL.init(string:)))
+        let oauth = OAuthClient(baseURL: base)
+        let d = try #require(try await oauth.discover())
+        #expect(OAuthClient.trimmed(d.resource.resource) == oauth.origin)
+        #expect(d.server.registrationEndpoint != nil && d.server.revocationEndpoint != nil)
+        #expect(d.server.tokenEndpointAuthMethodsSupported?.contains("none") == true)
+        // the probe: GET /api without a token is a 401 carrying the metadata URL
+        let (_, response) = try await URLSession.shared.data(from: base.appending(path: "api/docs"))
+        let http = try #require(response as? HTTPURLResponse)
+        #expect(http.statusCode == 401)
+        #expect(http.value(forHTTPHeaderField: "WWW-Authenticate")?.contains("resource_metadata=") == true)
+        print("live auth: issuer \(d.server.issuer), resource \(d.resource.resource), scopes \(d.resource.scopesSupported ?? [])")
+    }
+}

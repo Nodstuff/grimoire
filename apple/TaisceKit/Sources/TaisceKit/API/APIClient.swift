@@ -21,7 +21,7 @@ public struct APIClient: Sendable {
     /// lock as the list: page `/api/changes` from it to bootstrap without a race.
     /// `seq` is nil on daemons that predate the change log.
     public func treeWithSeq() async throws -> (docs: [DocSummary], seq: Int?) {
-        let (data, response) = try await session.data(for: try await request("/api/docs"))
+        let (data, response) = try await data(for: try await request("/api/docs"))
         try Self.check(data: data, response: response)
         let seq = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "X-Grimoire-Seq").flatMap(Int.init)
         do {
@@ -168,9 +168,32 @@ public struct APIClient: Sendable {
 
     /// Raw send for callers that replay stored requests (the outbox).
     public func send(raw request: URLRequest) async throws -> Data {
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await data(for: request)
         try Self.check(data: data, response: response)
         return data
+    }
+
+    /// One round trip; a 401 to a bearer request renews the token (single
+    /// flight, in the provider) and retries once.
+    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        let (data, response) = try await session.data(for: request)
+        guard Self.isUnauthorized(response), let retry = try await renewed(request) else { return (data, response) }
+        return try await session.data(for: retry)
+    }
+
+    /// `request` with a fresh bearer after a 401, or nil when there is
+    /// nothing to renew (no token was sent, or the provider gives up).
+    func renewed(_ request: URLRequest) async throws -> URLRequest? {
+        guard let auth = request.value(forHTTPHeaderField: "Authorization"), auth.hasPrefix("Bearer "),
+              let token = try await config.tokenProvider.renew(rejected: String(auth.dropFirst(7)))
+        else { return nil }
+        var r = request
+        r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        return r
+    }
+
+    static func isUnauthorized(_ response: URLResponse) -> Bool {
+        (response as? HTTPURLResponse)?.statusCode == 401
     }
 
     func send<T: Decodable>(_ request: URLRequest) async throws -> T {
@@ -186,6 +209,7 @@ public struct APIClient: Sendable {
         if response.mimeType == "text/html" {
             throw APIError.notAPIRoute(response.url?.path() ?? "")
         }
+        if isUnauthorized(response) { throw APIError.unauthorized }
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             if let msg = errorMessage(in: data) { throw APIError.server(msg) }
             throw APIError.http(status: http.statusCode)

@@ -1,9 +1,17 @@
 import Foundation
 
-/// Supplies a bearer token per request. OAuth + passkeys plug in here later;
-/// `nil` means "send no Authorization header" (the localhost default).
+/// Supplies a bearer token per request (`AuthSession` for a server-mode
+/// daemon); `nil` means "send no Authorization header" (the localhost default).
 public protocol TokenProvider: Sendable {
     func token() async throws -> String?
+    /// The server answered 401 to `rejected`: a fresh token to retry with
+    /// once, or nil to give up. Called concurrently by every request that
+    /// got the 401, so it must refresh at most once per rejected token.
+    func renew(rejected: String) async throws -> String?
+}
+
+extension TokenProvider {
+    public func renew(rejected: String) async throws -> String? { nil }
 }
 
 public struct NoAuth: TokenProvider {
@@ -27,6 +35,8 @@ public enum APIError: Error, Sendable, Equatable {
     /// The daemon answers most failures as HTTP 200 `{"error": "..."}`.
     case server(String)
     case http(status: Int)
+    /// 401 even after one token renewal: sign in again.
+    case unauthorized
     case decoding(String)
     case badURL(String)
     /// HTML where JSON was expected: the daemon's SPA fallback answers

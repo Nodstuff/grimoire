@@ -11,6 +11,7 @@ let package = Package(
         // versions verified against GitHub releases on 2026-10-01
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.11.1"),
         .package(url: "https://github.com/swiftlang/swift-markdown.git", from: "0.9.0"),
+        .package(url: "https://github.com/square/Valet.git", from: "5.1.1"),
     ],
     targets: [
         .target(
@@ -18,6 +19,7 @@ let package = Package(
             dependencies: [
                 .product(name: "GRDB", package: "GRDB.swift"),
                 .product(name: "Markdown", package: "swift-markdown"),
+                .product(name: "Valet", package: "Valet"),
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),

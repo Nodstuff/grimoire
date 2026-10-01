@@ -6,7 +6,9 @@ extension APIClient {
     /// idle timeout, which is exactly that watchdog.
     static let streamIdleTimeout: TimeInterval = 60
 
-    /// Opens `GET /api/changes/stream`, resuming after `lastEventID`. The
+    /// Opens `GET /api/changes/stream`, resuming after `lastEventID`, with
+    /// the provider's current bearer (each reconnect asks again, so a
+    /// refreshed token is picked up; a 401 renews and retries once). The
     /// stream finishes when the server closes and throws on network errors;
     /// reconnecting is the caller's job (see `SyncEngine`).
     public func changeStream(lastEventID: Int?) -> AsyncThrowingStream<SSEOutput, any Error> {
@@ -20,7 +22,11 @@ extension APIClient {
                         req.setValue(String(lastEventID), forHTTPHeaderField: "Last-Event-ID")
                     }
                     req.timeoutInterval = Self.streamIdleTimeout
-                    let (bytes, response) = try await session.bytes(for: req)
+                    var (bytes, response) = try await session.bytes(for: req)
+                    if Self.isUnauthorized(response), let retry = try await renewed(req) {
+                        (bytes, response) = try await session.bytes(for: retry)
+                    }
+                    if Self.isUnauthorized(response) { throw APIError.unauthorized }
                     if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                         throw APIError.http(status: http.statusCode)
                     }

@@ -1,5 +1,5 @@
 {
-  "originHash" : "39f19bb4b9cf53478c2afdd0b01af38d4d3e1572a4f1bc8f556319ecb9433b1b",
+  "originHash" : "a1ee1d5e23e08e6f57a479bde4b9ced7cb6dd51d290314b41874ae3ee1c0dde5",
   "pins" : [
     {
       "identity" : "grdb.swift",
@@ -26,6 +26,15 @@
       "state" : {
         "revision" : "25cb61d3482054b09ae76ca4f281b1bfe7fe5a43",
         "version" : "0.9.0"
+      }
+    },
+    {
+      "identity" : "valet",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/square/Valet.git",
+      "state" : {
+        "revision" : "43f517941ced37752c0cd5e2b53a3c9d021c848b",
+        "version" : "5.1.1"
       }
     }
   ],
