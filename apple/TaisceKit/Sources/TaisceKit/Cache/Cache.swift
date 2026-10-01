@@ -8,7 +8,9 @@ public final class Cache: Sendable {
 
     /// On-disk cache (WAL). Pass a path under Application Support.
     public convenience init(path: String) throws {
+        try Cache.protectDirectory(ofDatabaseAt: path)
         try self.init(writer: DatabasePool(path: path))
+        try Cache.protectFiles(ofDatabaseAt: path)
     }
 
     /// In-memory cache, for tests and previews.
