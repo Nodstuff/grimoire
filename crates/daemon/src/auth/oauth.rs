@@ -33,11 +33,21 @@ pub fn router(st: AuthState) -> axum::Router {
         .route("/.well-known/oauth-protected-resource", get(resource_metadata_root))
         .route("/.well-known/oauth-protected-resource/mcp", get(resource_metadata_mcp))
         .route("/.well-known/oauth-authorization-server", get(server_metadata))
+        // RFC 8414 path-suffixed form, which some clients (Claude Code's SDK)
+        // probe for the /mcp resource: the same server, so the same document
+        .route("/.well-known/oauth-authorization-server/mcp", get(server_metadata))
+        // anything else under .well-known (openid-configuration, …) is a JSON
+        // 404, never the web UI's HTML, so a client's discovery fallback can parse it
+        .route("/.well-known/{*rest}", get(well_known_missing))
         .route("/oauth/register", post(register).options(preflight))
         .route("/oauth/authorize", get(authorize))
         .route("/oauth/token", post(token).options(preflight))
         .route("/oauth/revoke", post(revoke).options(preflight))
         .with_state(st)
+}
+
+async fn well_known_missing() -> Response {
+    cors((StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error": "not found"}))).into_response())
 }
 
 /// Discovery and the token endpoints are called cross-origin by browser

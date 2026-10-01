@@ -241,6 +241,22 @@ async fn mcp_tools(app: &Router, token: &str) -> Res {
 
 // ---- metadata ----
 
+/// Claude Code's SDK probes more discovery URLs than claude.ai does; every one
+/// must answer JSON (the suffixed AS document, or a JSON 404), never the web
+/// UI's HTML, or its sign-in fails with "Unrecognized token '<'".
+#[tokio::test]
+async fn every_well_known_path_answers_json() {
+    let h = harness();
+    let sfx = send(&h.app, get("/.well-known/oauth-authorization-server/mcp")).await;
+    assert_eq!(sfx.status, StatusCode::OK);
+    assert_eq!(sfx.json()["issuer"], BASE);
+    for p in ["/.well-known/openid-configuration", "/.well-known/openid-configuration/mcp", "/.well-known/anything/else"] {
+        let r = send(&h.app, get(p)).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{p}");
+        assert!(r.headers["content-type"].to_str().unwrap().starts_with("application/json"), "{p}");
+    }
+}
+
 #[tokio::test]
 async fn metadata_documents() {
     let h = harness();
