@@ -127,6 +127,7 @@ struct TodayContent: View {
     }
 }
 
+#if DEBUG
 #Preview("Today") {
     NavigationStack {
         TodayContent(
@@ -146,3 +147,4 @@ struct TodayContent: View {
     }
     .preferredColorScheme(.light)
 }
+#endif

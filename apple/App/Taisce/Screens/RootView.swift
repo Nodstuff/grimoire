@@ -181,6 +181,8 @@ struct LaunchView: View {
     }
 }
 
+#if DEBUG
 #Preview("Launch") {
     LaunchView().preferredColorScheme(.dark)
 }
+#endif

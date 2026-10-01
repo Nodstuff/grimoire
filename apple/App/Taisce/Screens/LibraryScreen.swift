@@ -131,6 +131,7 @@ struct LibraryRow: View {
     }
 }
 
+#if DEBUG
 #Preview("Library") {
     NavigationStack {
         LibraryContent(nodes: LibraryNode.build(PreviewData.docs), loaded: true, pins: ["g-road"])
@@ -144,3 +145,4 @@ struct LibraryRow: View {
     }
     .preferredColorScheme(.light)
 }
+#endif

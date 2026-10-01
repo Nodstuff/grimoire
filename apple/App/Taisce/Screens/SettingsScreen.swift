@@ -160,6 +160,7 @@ struct SettingsContent: View {
     }
 }
 
+#if DEBUG
 #Preview("Settings") {
     NavigationStack {
         SettingsContent(info: SettingsInfo(
@@ -180,3 +181,4 @@ struct SettingsContent: View {
     }
     .preferredColorScheme(.light)
 }
+#endif

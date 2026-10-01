@@ -194,6 +194,7 @@ struct NewTodoField: View {
     }
 }
 
+#if DEBUG
 #Preview("To-dos") {
     @Previewable @State var draft = ""
     NavigationStack {
@@ -218,3 +219,4 @@ struct NewTodoField: View {
     NavigationStack { TodosContent(board: TodoBoard(), offline: true, draft: $draft) }
         .preferredColorScheme(.dark)
 }
+#endif

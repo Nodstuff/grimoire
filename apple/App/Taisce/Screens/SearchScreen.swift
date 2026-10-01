@@ -155,6 +155,7 @@ struct SearchResultCard: View {
     }
 }
 
+#if DEBUG
 #Preview("Search") {
     @Previewable @State var query = "sync"
     @Previewable @State var tag: String?
@@ -175,3 +176,4 @@ struct SearchResultCard: View {
     NavigationStack { SearchContent(query: $query, state: SearchState(), tag: $tag, autofocus: false) }
         .preferredColorScheme(.dark)
 }
+#endif

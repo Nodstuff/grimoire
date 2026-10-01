@@ -181,6 +181,7 @@ struct DocContent: View {
     }
 }
 
+#if DEBUG
 #Preview("Doc") {
     NavigationStack {
         DocContent(
@@ -205,3 +206,4 @@ struct DocContent: View {
     }
     .preferredColorScheme(.dark)
 }
+#endif

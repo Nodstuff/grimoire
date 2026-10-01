@@ -79,6 +79,7 @@ struct SignInContent: View {
     }
 }
 
+#if DEBUG
 #Preview("Sign in") {
     SignInContent(serverURL: "https://taisce.null.ie")
         .preferredColorScheme(.dark)
@@ -88,3 +89,4 @@ struct SignInContent: View {
     SignInContent(serverURL: "https://taisce.null.ie", error: "Sign-in failed: the server is unreachable.")
         .preferredColorScheme(.light)
 }
+#endif
