@@ -106,7 +106,7 @@ struct BlockEditorView: UIViewRepresentable {
     func updateUIView(_ tv: BlockTextView, context: Context) {
         let c = context.coordinator
         c.onResize = onResize
-        if c.revision != item.revision || c.dynamicType != dynamicType || c.isDraft != item.isDraft {
+        if c.revision != item.revision || c.dynamicType != dynamicType {
             c.load(item, dynamicType: dynamicType)
         }
         model.register(c)
@@ -114,7 +114,7 @@ struct BlockEditorView: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ tv: BlockTextView, coordinator: BlockTextCoordinator) {
-        coordinator.model.unregister(coordinator)
+        coordinator.model?.unregister(coordinator)
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, uiView: BlockTextView, context: Context) -> CGSize? {
@@ -129,7 +129,7 @@ struct BlockEditorView: UIViewRepresentable {
 @MainActor
 final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
     let id: BlockID
-    unowned let model: EditorModel
+    private(set) weak var model: EditorModel?
     weak var textView: BlockTextView?
     var onResize: () -> Void = {}
     private(set) var content: EditorBlockContent = .paragraph(AttributedString())
@@ -147,7 +147,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
     }
 
     var kind: EditorText.Kind { EditorText.Kind(content) }
-    var isCompleting: Bool { model.completion?.blockID == id }
+    var isCompleting: Bool { model?.completion?.blockID == id }
 
     // MARK: loading
 
@@ -209,7 +209,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
         if !tv.isFirstResponder, tv.window != nil { tv.becomeFirstResponder() }
         setCaret(caret)
         updateTyping()
-        model.caretMoved(self)
+        model?.caretMoved(self)
     }
 
     /// a caret was asked for before the view was on screen
@@ -219,8 +219,8 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
     /// revision it refers to. Consumed once; the keyboard follows when the
     /// view reaches a window.
     func applyPendingFocus() {
-        guard let f = model.pendingFocus, f.id == id, f.revision <= revision, let tv = textView else { return }
-        model.pendingFocus = nil
+        guard let f = model?.pendingFocus, f.id == id, f.revision <= revision, let tv = textView else { return }
+        model?.pendingFocus = nil
         if tv.window == nil {
             setCaret(f.caret)
             wantsKeyboard = f.caret
@@ -249,20 +249,25 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
     // MARK: UITextViewDelegate
 
     func textViewDidBeginEditing(_ textView: UITextView) {
-        model.didFocus(self)
+        model?.didFocus(self)
     }
 
     func textViewDidEndEditing(_ textView: UITextView) {
-        model.didBlur(self)
+        model?.didBlur(self)
     }
 
     func textView(_ textView: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String) -> Bool {
         guard let tv = self.textView else { return true }
         if text == "\n" {
-            if isCompleting { model.acceptCompletion(); return false }
+            if isCompleting {
+                if model?.completion?.results.isEmpty == false { model?.acceptCompletion(); return false }
+                model?.dismissCompletion()
+            }
             if content.isRaw { return true }
+            // Return over a selection replaces it, then splits there
+            if range.length > 0 { replace(range, with: "") }
             syncContent()
-            model.returnKey(id, caret: currentCaret())
+            model?.returnKey(id, caret: currentCaret())
             return false
         }
         if content.isRaw { return true }
@@ -325,12 +330,17 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
     }
 
     func textViewDidChange(_ textView: UITextView) {
-        // mid-composition (CJK, dictation) the storage belongs to the input
-        // method: no shortcuts, restyling or reloads until it commits
-        guard !reloading, let tv = self.textView, tv.markedTextRange == nil else { return }
+        guard !reloading, let tv = self.textView else { return }
+        if tv.markedTextRange != nil {
+            // mid-composition the storage belongs to the input method:
+            // remember the text, but no shortcuts, restyling or reloads
+            let typed = content.isRaw ? .raw(tv.text) : EditorText.content(from: tv.attributedText, like: content)
+            model?.textChanged(id, content: typed)
+            return
+        }
         if content.isRaw {
             content = .raw(tv.text)
-            model.textChanged(id, content: content)
+            model?.textChanged(id, content: content)
             resizeIfNeeded()
             return
         }
@@ -347,7 +357,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
             restyle()
         }
         content = derived
-        model.textChanged(id, content: derived)
+        model?.textChanged(id, content: derived)
         updateCompletion()
         resizeIfNeeded()
     }
@@ -362,10 +372,16 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
                 break
             }
         }
+        // nor inside a wikilink (they're atomic): to its nearer edge
+        if tv.selectedRange.length == 0, let run = Self.expandToWikiLinks(tv.selectedRange, in: tv.attributedText) {
+            let loc = tv.selectedRange.location
+            let edge = loc - run.location < run.location + run.length - loc ? run.location : run.location + run.length
+            tv.selectedRange = NSRange(location: edge, length: 0)
+        }
         pendingMarks = nil
         updateTyping()
         updateCompletion()
-        model.caretMoved(self)
+        model?.caretMoved(self)
     }
 
     /// Redraw the whole block from `c`, keeping the caret.
@@ -397,7 +413,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
     func syncContent() {
         guard let tv = textView, tv.markedTextRange == nil else { return }
         content = content.isRaw ? .raw(tv.text) : EditorText.content(from: tv.attributedText, like: content)
-        model.textChanged(id, content: content)
+        model?.textChanged(id, content: content)
     }
 
     /// What typing inserts next: the marks around the caret (or the bar's
@@ -432,7 +448,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
         if !marks.isEmpty { a[EditorText.marks] = marks.rawValue }
         if let link { a[EditorText.link] = link }
         tv.typingAttributes = a
-        model.marksChanged(marks)
+        model?.marksChanged(marks)
     }
 
     // MARK: Backspace
@@ -442,7 +458,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
         let loc = tv.selectedRange.location
         if content.isRaw {
             guard loc == 0, tv.text.isEmpty else { return false }
-            model.backspaceAtStart(id, caret: .start)
+            model?.backspaceAtStart(id, caret: .start)
             return true
         }
         let s = tv.attributedText ?? NSAttributedString()
@@ -456,7 +472,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
         }
         if atStart {
             syncContent()
-            model.backspaceAtStart(id, caret: EditorCaret(line: caret.line, offset: 0))
+            model?.backspaceAtStart(id, caret: EditorCaret(line: caret.line, offset: 0))
             return true
         }
         // a wikilink goes as a whole
@@ -477,7 +493,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
         guard let tv = textView, let text = UIPasteboard.general.string else { return false }
         if content.isRaw { return false }
         if content.isEmpty, case .paragraph = content, text.contains("\n") || text.hasPrefix("#") || text.hasPrefix("- ") || text.hasPrefix("> ") {
-            model.pasteMarkdown(id, markdown: text)
+            model?.pasteMarkdown(id, markdown: text)
             return true
         }
         var flat = text
@@ -525,7 +541,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
             return
         }
         let r = tv.selectedRange
-        model.askForLink { [weak self] url in
+        model?.askForLink { [weak self] url in
             guard let self, let tv = self.textView, let url, !url.isEmpty else { return }
             let m = NSMutableAttributedString(attributedString: tv.attributedText)
             m.addAttribute(EditorText.link, value: url, range: r)
@@ -549,37 +565,37 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
             return
         }
         syncContent()
-        model.indent(id, caret: currentCaret(), by: by)
+        model?.indent(id, caret: currentCaret(), by: by)
     }
 
     func escape() {
-        if isCompleting { model.dismissCompletion() } else { textView?.resignFirstResponder() }
+        if isCompleting { model?.dismissCompletion() } else { textView?.resignFirstResponder() }
     }
 
     func moveToNeighbour(_ dir: Int) {
-        model.moveFocus(from: id, by: dir)
+        model?.moveFocus(from: id, by: dir)
     }
 
     // MARK: [[ completion
 
     func updateCompletion() {
         guard let tv = textView, !content.isRaw, tv.isFirstResponder, tv.selectedRange.length == 0 else {
-            if isCompleting { model.dismissCompletion() }
+            if isCompleting { model?.dismissCompletion() }
             return
         }
         let before = EditorText.textBeforeCaret(tv.selectedRange.location, in: tv.attributedText, kind: kind)
         guard let q = WikiCompletion.query(before: before) else {
-            if isCompleting { model.dismissCompletion() }
+            if isCompleting { model?.dismissCompletion() }
             return
         }
         var anchor = CGRect.zero
         if let r = tv.selectedTextRange {
             anchor = tv.convert(tv.caretRect(for: r.end), to: nil)
         }
-        model.updateCompletion(self, query: q, anchor: anchor)
+        model?.updateCompletion(self, query: q, anchor: anchor)
     }
 
-    func completionMove(_ by: Int) { model.moveCompletion(by) }
+    func completionMove(_ by: Int) { model?.moveCompletion(by) }
 
     /// Replace `[[query` before the caret with the wikilink.
     func insertWikiLink(_ target: String) {
@@ -605,7 +621,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
         tv.attributedText = m
         tv.selectedRange = NSRange(location: after + 1, length: 0)
         reloading = false
-        model.dismissCompletion()
+        model?.dismissCompletion()
         textViewDidChange(tv)
     }
 
@@ -624,7 +640,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
         let indent = CGFloat(prefix.indent) * EditorText.indentStep
         guard p.x < indent + 24 + tv.textContainerInset.left else { return }
         syncContent()
-        model.setChecked(id, line: caret.line, !checked)
+        model?.setChecked(id, line: caret.line, !checked)
     }
 
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }

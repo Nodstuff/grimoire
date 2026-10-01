@@ -96,10 +96,12 @@ final class EditorModel {
                 }
             } catch {}
         }
+        // saves poll after themselves (send()); this catches the rest
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.poll()
-                try? await Task.sleep(for: .seconds(1))
+                guard let self else { return }
+                await self.poll()
+                try? await Task.sleep(for: .seconds(3))
             }
         }
     }

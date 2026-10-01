@@ -309,9 +309,46 @@ public enum InlineCodec {
         if parse(minimal) == model { return minimal }
         let full = emit(model, escapeAll: true)
         if parse(full) == model || model.characters.isEmpty { return full }
-        // some formatting has no markdown spelling here (a delimiter between
-        // punctuation and a letter); the text itself survives either way
-        return full
+        // Some formatting has no markdown spelling: a delimiter between
+        // punctuation and a letter (`**Note:**text`) is just asterisks.
+        // Pull the mark in off its edge punctuation (`**Note**:text`), and as
+        // a last resort drop the emphasis, rather than write dead delimiters.
+        var shrunk = model
+        for _ in 0..<3 {
+            shrunk = offEdgePunctuation(shrunk)
+            for escapeAll in [false, true] {
+                let out = emit(shrunk, escapeAll: escapeAll)
+                if parse(out) == shrunk { return out }
+            }
+        }
+        var plain = InlineCodec.runs(model)
+        for i in plain.indices { plain[i].marks.subtract([.bold, .italic, .strike]) }
+        return emit(normalized(build(plain)), escapeAll: true)
+    }
+
+    /// Emphasis taken off the punctuation at each marked stretch's ends.
+    static func offEdgePunctuation(_ text: AttributedString) -> AttributedString {
+        var chars: [(Character, InlineRun)] = runs(text).flatMap { r in r.text.map { ($0, r) } }
+        for mark in [InlineMarks.bold, .italic, .strike] {
+            var k = 0
+            while k < chars.count {
+                guard chars[k].1.marks.contains(mark) else { k += 1; continue }
+                var end = k
+                while end < chars.count, chars[end].1.marks.contains(mark) { end += 1 }
+                if chars[k].0.isPunctuation, chars[k].1.wiki == nil { chars[k].1.marks.remove(mark) }
+                if end - 1 > k, chars[end - 1].0.isPunctuation, chars[end - 1].1.wiki == nil { chars[end - 1].1.marks.remove(mark) }
+                k = end
+            }
+        }
+        var out: [InlineRun] = []
+        for (c, r) in chars {
+            if let last = out.last, last.marks == r.marks, last.link == r.link, last.wiki == r.wiki {
+                out[out.count - 1].text.append(c)
+            } else {
+                out.append(InlineRun(String(c), marks: r.marks, link: r.link, wiki: r.wiki))
+            }
+        }
+        return normalized(build(out))
     }
 
     /// One element of the emitted sequence: plain or code text, a wikilink,

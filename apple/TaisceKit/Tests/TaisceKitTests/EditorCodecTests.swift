@@ -77,6 +77,16 @@ import Testing
         ("Brackets [not a link] and [x]", true),
         ("    indented code", false),
         ("", true),
+        ("## Issue #", true),
+        ("## #", true),
+        ("**Note:**text", true),
+        ("**中文。**テキスト", true),
+        ("1. a\n1. b", true),
+        ("- a\n* b", nil),
+        ("> a\nb", true),
+        ("non\u{00A0}breaking and zero\u{200B}width", true),
+        ("[x](a\\b)", true),
+        ("[see [[x]] here](u)", nil),
     ]
 
     @Test func corpusRoundTripsWithoutChangingMeaning() throws {
@@ -181,6 +191,20 @@ import Testing
         #expect(md(InlineRun("a  \nb")) == "a\nb")
         #expect(md(InlineRun("Doc", wiki: "Doc")) == "[[Doc]]")
         #expect(md(InlineRun("alias", marks: .bold, wiki: "Doc|alias")) == "**[[Doc|alias]]**")
+    }
+
+    /// Bold ending in punctuation right before a letter has no markdown
+    /// spelling: the mark pulls in rather than leave literal asterisks.
+    @Test func emphasisWithNoSpellingNeverLeavesDeadDelimiters() throws {
+        for (runs, text) in [
+            ([InlineRun("Note:", marks: .bold), InlineRun("text")], "Note:text"),
+            ([InlineRun("中文。", marks: .bold), InlineRun("テキスト")], "中文。テキスト"),
+        ] {
+            let out = InlineCodec.serialize(InlineCodec.build(runs))
+            let back = try #require(InlineCodec.parse(out))
+            #expect(String(back.characters) == text, "no stray asterisks: \(out)")
+            #expect(InlineCodec.runs(back).contains { $0.marks.contains(.bold) }, "still bold where it can be: \(out)")
+        }
     }
 
     @Test func everyCanonicalOutputParsesBack() throws {

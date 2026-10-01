@@ -188,7 +188,9 @@ public enum EditorBlockContent: Hashable, Sendable {
             else { return nil }
             items.append(EditorListItem(prefix, text))
         }
-        return .list(items)
+        // cmark numbers from each list's first item (`1. a\n1. b` shows 1, 2):
+        // so does the model, and a touched list is written out that way
+        return .list(EditorCommands.renumbered(items))
     }
 
     /// `  - [ ] text` → (prefix, "text").

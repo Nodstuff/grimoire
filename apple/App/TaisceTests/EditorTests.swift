@@ -156,12 +156,32 @@ import UIKit
         let h = try Harness(blocks("see [[Roadmap]] now"))
         let tv = h.view("b0")
         #expect(tv.text == "see Roadmap now")
-        // typing inside the link goes after it
+        // the caret can't be inside the link: typing there lands at its nearer edge
         h.type("b0", "!", at: 6)
-        #expect(h.markdown == ["see [[Roadmap]]! now"])
+        #expect(h.markdown == ["see ![[Roadmap]] now"])
         // Backspace right after it removes all of it
-        h.backspace("b0", at: 11)
+        h.backspace("b0", at: 12)
         #expect(h.markdown == ["see ! now"])
+    }
+
+    @Test func theCaretNeverSitsInsideAWikilink() throws {
+        let h = try Harness(blocks("see [[Roadmap]] now"))
+        let tv = h.view("b0")
+        tv.selectedRange = NSRange(location: 6, length: 0)   // "Ro|admap": nearer the start
+        #expect(tv.selectedRange.location == 4)
+        tv.selectedRange = NSRange(location: 9, length: 0)   // "Road|map"... nearer the end
+        #expect(tv.selectedRange.location == 11)
+        // so Return never cuts a link in two
+        h.type("b0", "\n", at: 8)
+        #expect(h.markdown.first?.contains("[[Roadmap]]") == true)
+    }
+
+    @Test func returnOverASelectionReplacesItThenSplits() throws {
+        let h = try Harness(blocks("hello cruel world"))
+        let tv = h.view("b0")
+        tv.selectedRange = NSRange(location: 5, length: 6)    // " cruel"
+        h.type("b0", "\n")
+        #expect(h.markdown == ["hello", "world"], "the space at the cut goes, as markdown drops it")
     }
 
     @Test func savesCoalesceIntoOneWrite() async throws {
@@ -229,7 +249,8 @@ import UIKit
         tv.setMarkedText("## ", selectedRange: NSRange(location: 3, length: 0))
         let composing = tv.markedTextRange != nil
         #expect(tv.text == "## ", "the composition is untouched")
-        if composing { #expect(h.model.snapshot == [.paragraph(AttributedString())], "not turned into a heading mid-composition") }
+        #expect(composing, "the composition really opened")
+        #expect(h.model.snapshot == [.paragraph(AttributedString("## "))], "tracked, but not turned into a heading mid-composition")
         tv.unmarkText()
         tv.resignFirstResponder()
     }
