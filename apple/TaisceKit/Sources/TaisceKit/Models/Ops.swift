@@ -2,7 +2,7 @@ import Foundation
 
 /// The block ops `POST /api/propose` takes (`OpKind`, tagged by `op`).
 /// Doc-level ops (rename/move/status/delete) go through their own routes.
-public enum BlockOp: Sendable, Hashable, Encodable {
+public enum BlockOp: Sendable, Hashable, Codable {
     case insert(blockID: BlockID?, parentID: BlockID?, orderKey: String, type: BlockType, content: String)
     case replace(target: BlockID, content: String)
     case delete(target: BlockID)
@@ -16,6 +16,33 @@ public enum BlockOp: Sendable, Hashable, Encodable {
         case blockType = "block_type"
         case newParent = "new_parent"
         case newOrderKey = "new_order_key"
+    }
+
+    /// Read back from the outbox (`DocEditor` overlays queued edits).
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        switch try c.decode(String.self, forKey: .op) {
+        case "insert":
+            self = .insert(
+                blockID: try c.decodeIfPresent(BlockID.self, forKey: .blockID),
+                parentID: try c.decodeIfPresent(BlockID.self, forKey: .parentID),
+                orderKey: try c.decode(String.self, forKey: .orderKey),
+                type: try c.decode(BlockType.self, forKey: .blockType),
+                content: try c.decode(String.self, forKey: .content)
+            )
+        case "replace":
+            self = .replace(target: try c.decode(BlockID.self, forKey: .target), content: try c.decode(String.self, forKey: .content))
+        case "delete":
+            self = .delete(target: try c.decode(BlockID.self, forKey: .target))
+        case "move":
+            self = .move(
+                target: try c.decode(BlockID.self, forKey: .target),
+                newParent: try c.decodeIfPresent(BlockID.self, forKey: .newParent),
+                newOrderKey: try c.decode(String.self, forKey: .newOrderKey)
+            )
+        case let op:
+            throw DecodingError.dataCorruptedError(forKey: .op, in: c, debugDescription: "not a block op: \(op)")
+        }
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -46,8 +73,8 @@ public enum BlockOp: Sendable, Hashable, Encodable {
 }
 
 /// `POST /api/propose` body. `requestID` makes a retry idempotent per principal.
-public struct ProposeRequest: Encodable, Sendable, Hashable {
-    public struct Op: Encodable, Sendable, Hashable {
+public struct ProposeRequest: Codable, Sendable, Hashable {
+    public struct Op: Codable, Sendable, Hashable {
         public var kind: BlockOp
         public var sourceRefs: [String]
 

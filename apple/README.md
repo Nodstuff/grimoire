@@ -19,6 +19,8 @@ apple/
     Sources/TaisceKit/
       Models/                  Doc, DocSummary, Block, BlockNode, Change, Todo/Due, BlockOp
       API/                     ServerConfig (+ TokenProvider seam), APIClient
+      Auth/                    OAuthClient, AuthSession (TokenProvider), PKCE, Keychain TokenStore
+      Edit/                    OrderKey (port of the store's), DocEditor (BlockEdit → BlockOp)
       Cache/                   GRDB cache (docs, blocks + FTS5, todos, sync_state, outbox)
       Sync/                    SSEParser, changeStream, Backoff, SyncEngine (actor)
       Render/                  block markdown → RenderNode (swift-markdown), inline/wikilinks
@@ -35,6 +37,8 @@ apple/
 cd apple/TaisceKit && swift test
 # read-only smoke against a real daemon (GETs only; never /api/todo):
 TAISCE_LIVE_URL=http://127.0.0.1:7425 swift test --filter LiveServer
+# public OAuth metadata of a server-mode daemon (no registration, no grant):
+TAISCE_LIVE_AUTH_URL=https://taisce.null.ie swift test --filter LiveAuth
 
 cd apple/App && xcodegen generate && open Taisce.xcodeproj
 xcodebuild -project Taisce.xcodeproj -scheme Taisce -sdk iphonesimulator \
@@ -99,14 +103,79 @@ today carries items forward on the server. `todoSetDeadline` sends the day as
 `deadline` and the time as `due_time` (also queueable via `Cache.enqueueDeadline`); a date-only deadline keeps the item's
 existing time.
 
+## Sign-in
+
+The default server is `https://taisce.null.ie` (SERVER mode: every `/api`,
+`/mcp` and `/ws` request needs a bearer). A loopback URL
+(`http://127.0.0.1:7425`, `localhost`) is a LOCAL-mode daemon: no tokens, no
+sign-in screen.
+
+Flow (`AuthSession`, driven by `AppModel`):
+
+1. Discovery: `/.well-known/oauth-protected-resource` → authorization
+   server metadata (RFC 9728 / 8414). No metadata = LOCAL mode, no auth.
+2. Client: dynamic registration (`token_endpoint_auth_method: none`,
+   redirect `ie.null.taisce:/oauth/callback`, which the server allows by
+   default). The client id is cached in the Keychain per server and probed
+   before reuse; a wiped server gets a fresh registration.
+3. Browser: `ASWebAuthenticationSession` (`SystemWebAuthenticator`) on the
+   authorize URL with PKCE S256 + `state`, callback scheme `ie.null.taisce`
+   (also registered as `CFBundleURLTypes`). Not ephemeral, so the server's
+   passkey page reaches iCloud Keychain passkeys. The callback's `state`
+   and `iss` are checked before the code is exchanged.
+4. Tokens: access + refresh in the Keychain (Valet), per server. Refresh is
+   single-flight: the server rotates the refresh token on every use and
+   revokes the grant if a spent one comes back (outside a 60 s grace), so
+   concurrent 401s all join one refresh. A 401 renews once and retries (SSE
+   included); `invalid_grant` signs out and the app shows `SignInView`.
+5. Sign out (Settings): `POST /oauth/revoke` with the refresh token
+   (revokes the grant server-side; best effort offline), then clear the
+   Keychain tokens. The client id and the per-server cache stay.
+
+To sign in: run the app, tap **Sign in**, and approve with your passkey
+on the server's page. To enrol a passkey first, use an enrolment link from
+`grimoire auth` on the server. To use a local daemon instead, set the server
+URL to `http://127.0.0.1:7425` in Settings.
+
+ATS: HTTPS everywhere, except a `localhost` exception plus
+`NSAllowsLocalNetworking` (needed for `127.0.0.1`, since exception domains
+can't name IP addresses).
+
+## Editing (groundwork, no UI)
+
+`DocEditor` holds one doc's blocks (the cached body plus every queued,
+unsent propose for it: `Cache.editor(for:)`) and turns `BlockEdit`s into
+`BlockOp`s for `POST /api/propose`:
+
+| `BlockEdit` | ops |
+|---|---|
+| `.replaceText(id, text)` | `replace` (the server retypes it from the markdown) |
+| `.insert(after:parent:type:content:id:)` | `insert` with a client-minted UUID and an order key between the neighbours |
+| `.delete(id)` | `delete` for the subtree, children first (the server does not cascade) |
+| `.move(id, after:parent:)` | `move` with a new order key; refuses cycles |
+
+`OrderKey` is a port of `crates/store/src/order_key.rs`, tested against the
+store's shared vectors. `Cache.enqueue(_:on:)` queues one propose per call
+(its `request_id` is the outbox idempotency key) and folds it into the
+editor. `OutboxReplayer` sends in order; when a propose lands at epoch N,
+queued proposes for the same doc still based on the old epoch are rebased
+to N, so a chain of offline edits applies green instead of scoring as stale
+against our own writes. A live (hot) session's refusal keeps the queue for
+later.
+
 ## What's stubbed
 
-- Outbox replay: queues, orders and replays once (idempotent via
-  `request_id`), but no conflict handling, no UI.
-- Editing: `APIClient` wires `propose`, `propose_markdown` and the to-do
-  writes; no editing UI.
-- Auth: `ServerConfig.tokenProvider` sends a Bearer token when one is
-  supplied; default is none (localhost).
+- Editing UI: none yet. No optimistic write of queued edits into the cache
+  (the editor overlays them, the doc view does not), and no conflict UI: a
+  stale base (someone else wrote first) comes back scored or red from the
+  gate and is only recorded on the outbox row.
+- Outbox idempotency: the server's `request_id` dedupe is in memory with a
+  120 s TTL, so a replay long after a lost response can apply twice.
+  Client-minted insert ids make a doubled insert fail instead of
+  duplicating; `replace` and `move` are idempotent; a doubled delete fails
+  harmlessly.
+- `propose_markdown` queues are rebased like `propose`, but a stale base is
+  an error there (whole-doc diff), so they are not chained.
 - Pinned: sidebar placeholder.
 - Diagrams (Mermaid, Vega-Lite, D2) render as labelled placeholder cards.
-- APNs / background refresh, Keychain (Valet), Mac Catalyst.
+- APNs / background refresh, Mac Catalyst.
