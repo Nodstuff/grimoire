@@ -10,7 +10,7 @@ public indirect enum RenderNode: Sendable, Hashable {
     case quote(callout: String?, children: [RenderNode])
     case code(language: String?, code: String)
     case table(Table)
-    /// mermaid, vega-lite, d2: rendered later; a labelled card for now
+    /// mermaid, reladraw, vega-lite (drawn on the device), d2 (a labelled card)
     case diagram(kind: String, source: String)
     case frontmatter(String)
     case thematicBreak

@@ -4,7 +4,7 @@ import Markdown
 /// Block markdown → `RenderNode`s, via swift-markdown (cmark-gfm: tables,
 /// task lists, strikethrough).
 public enum BlockRenderer {
-    static let diagramLanguages: Set<String> = ["mermaid", "vega-lite", "vegalite", "vega", "d2"]
+    static let diagramLanguages: Set<String> = ["mermaid", "vega-lite", "vegalite", "vega", "d2", "reladraw"]
 
     public static func render(_ block: Block) -> [RenderNode] {
         switch block.blockType {

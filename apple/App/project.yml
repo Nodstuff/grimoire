@@ -19,7 +19,13 @@ targets:
     platform: iOS
     deploymentTarget: "26.0"
     sources:
-      - Taisce
+      - path: Taisce
+        excludes: ["Resources/reladraw/**"]
+      # reladraw is ES modules importing each other by relative path: a
+      # folder reference keeps them together as reladraw/ in the bundle
+      - path: Taisce/Resources/reladraw
+        type: folder
+        buildPhase: resources
     dependencies:
       - package: TaisceKit
     settings:

@@ -363,7 +363,7 @@ web view. `ChartSpec.parse` (TaisceKit `Charts/`, pure) maps the JSON to a
   values scrolls horizontally (16 visible). Swift Charts supplies audio
   graphs; each mark carries a label and value, the chart a summary.
 
-**Mermaid** renders on the device with the bundled mermaid **12.0.0**
+**Mermaid** (and reladraw, below) renders on the device with the bundled mermaid **12.0.0**
 (`App/Taisce/Resources/mermaid.min.js`, MIT, `mermaid.LICENSE.txt`):
 
 - Provenance: `dist/mermaid.min.js` from `https://registry.npmjs.org/mermaid/-/mermaid-12.0.0.tgz`;
@@ -374,16 +374,31 @@ web view. `ChartSpec.parse` (TaisceKit `Charts/`, pure) maps the JSON to a
   `28fca7ae6ebc7ed7bb63bde63136a74bfef14f296a57e403657eeb8b32836073`.
   To upgrade: fetch the new tarball, check its integrity, copy the file,
   bump `DiagramCacheKey.renderer` and this paragraph.
-- One shared offscreen, non-persistent `WKWebView` (`MermaidWebView`),
-  loaded with `loadHTMLString` and a base URL inside the app bundle. CSP
+- One shared offscreen, non-persistent `WKWebView` (`DiagramWebView`),
+  loaded with `loadHTMLString` at base URL `taisce-diagram://bundle/`, a
+  `WKURLSchemeHandler` that serves only `.js` files from the app bundle
+  (reladraw's ES modules need a real origin to import each other). CSP
   `default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src data:`
   (no network of any kind); every navigation after the first is refused;
   `securityLevel: 'strict'`; `htmlLabels: false`. Theme follows the trait
   collection (`dark` / `default`). The page rasterises the SVG on a canvas
   at the device scale (capped at 16 Mpx) and returns PNG.
+- **reladraw** (` ```reladraw ` fences) goes through the same web view and
+  queue: `compile(source, {theme: THEMES.dark | THEMES.light})` from
+  reladraw **0.15.1** (Apache-2.0, `LICENSE.txt` and `NOTICE.txt` beside it),
+  imported as modules from `Resources/reladraw/` (a folder reference in
+  `project.yml`). Its `SourceError` shows as `line N: message` on the error
+  card. Provenance: `dist/*.js` except `cli.js` from
+  `https://registry.npmjs.org/reladraw/-/reladraw-0.15.1.tgz`, verbatim; the
+  tarball matches the registry's `dist.integrity`
+  (`sha512-2Kn3Ojm4OkQBLm+i/mFJ17uqNtR08EhfnTEhTdPiRDppbNymyUHJ9ZCsphJoH93gGQoTud5h/H8+eONEBHF3Pw==`).
+  Per-file sha256 in `Resources/reladraw/SHA256SUMS` (that file's sha256:
+  `49dbaa4a6eb9f89c6ed14a061e4c0bb90313b3362b39db385c46f8e268db1c45`;
+  `index.js`: `8c13ea18e9c5fd95b94b61dac8b0f3ec284cc81218ddb6aa67166d082fd7596b`).
+  To upgrade: same steps, regenerate `SHA256SUMS`, bump `DiagramCacheKey.reladraw`.
 - `DiagramRenderQueue` (TaisceKit actor) runs one render at a time, joins
   identical requests, caches PNGs in `Caches/diagrams/<sha256(renderer +
-  theme + width + source)>.png`, and fails a render after 5 s (the queue
+  theme + width + source)>.png` (renderer = mermaid-12.0.0 or reladraw-0.15.1), and fails a render after 5 s (the queue
   moves on). Widths are bucketed to 20 pt.
 - Inline: a shimmer while rendering, then the image at its aspect (never
   upscaled); tap opens full screen with pinch-zoom, pan and double-tap.

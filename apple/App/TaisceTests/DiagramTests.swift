@@ -30,6 +30,28 @@ private struct FailingRenderer: DiagramRendering {
         #expect(phase == .failed("Parse error on line 2:\n...A-->\n-----^"))
     }
 
+    @Test func reladrawErrorKeepsItsLine() async {
+        struct Reladraw: DiagramRendering {
+            func render(_ request: DiagramRequest) async throws -> Data {
+                #expect(request.kind == .reladraw)
+                throw DiagramRenderError(message: "line 2: edge to \"zz\", which does not exist")
+            }
+        }
+        let q = DiagramRenderQueue(renderer: Reladraw(), store: MemoryDiagramStore())
+        let phase = await DiagramPhase.load(DiagramRequest(kind: .reladraw, source: "node a\nedge a -> zz", theme: .light, width: 320), queue: q)
+        #expect(phase == .failed("line 2: edge to \"zz\", which does not exist"))
+    }
+
+    @Test func bundleSchemeServesOnlyBundleFiles() throws {
+        let index = try #require(BundleSchemeHandler.file(for: URL(string: "taisce-diagram://bundle/reladraw/index.js")!))
+        #expect(index.lastPathComponent == "index.js")
+        #expect(BundleSchemeHandler.file(for: URL(string: "taisce-diagram://bundle/mermaid.min.js")!) != nil)
+        #expect(BundleSchemeHandler.file(for: URL(string: "taisce-diagram://bundle/../../etc/hosts")!) == nil)
+        #expect(BundleSchemeHandler.file(for: URL(string: "taisce-diagram://elsewhere/mermaid.min.js")!) == nil)
+        #expect(BundleSchemeHandler.file(for: URL(string: "https://bundle/mermaid.min.js")!) == nil)
+        #expect(BundleSchemeHandler.file(for: URL(string: "taisce-diagram://bundle/reladraw/nope.js")!) == nil)
+    }
+
     @Test func widthBuckets() {
         #expect(DiagramPhase.bucket(359.7) == 340)
         #expect(DiagramPhase.bucket(360) == 360)
@@ -37,7 +59,7 @@ private struct FailingRenderer: DiagramRendering {
     }
 
     @Test func mermaidErrorsAreTrimmed() {
-        #expect(MermaidWebView.tidy("a\n\n  b  \nc\nd\ne") == "a\nb\nc\nd")
+        #expect(DiagramWebView.tidy("a\n\n  b  \nc\nd\ne") == "a\nb\nc\nd")
     }
 
     @Test func docTablesComeFromThePage() {
@@ -66,11 +88,11 @@ private struct FailingRenderer: DiagramRendering {
     }
 }
 
-/// One real render through the bundled mermaid in the shared web view.
+/// Real renders through the bundled mermaid and reladraw in the shared web view.
 @MainActor
-@Suite struct MermaidSmokeTests {
+@Suite(.serialized) struct DiagramSmokeTests {
     @Test func flowchartRendersToAnImage() async throws {
-        let q = DiagramRenderQueue(renderer: MermaidWebRenderer(), store: MemoryDiagramStore(), timeout: .seconds(30))
+        let q = DiagramRenderQueue(renderer: DiagramWebRenderer(), store: MemoryDiagramStore(), timeout: .seconds(30))
         let req = DiagramRequest(source: "flowchart LR\n  A[Phone] --> B(Cache)\n  B --> C{Server}", theme: .dark, width: 320, scale: 2)
         let phase = await DiagramPhase.load(req, queue: q)
         guard case let .image(image) = phase else {
@@ -87,5 +109,20 @@ private struct FailingRenderer: DiagramRendering {
             return
         }
         #expect(!message.isEmpty)
+    }
+
+    @Test func reladrawRendersToAnImage() async throws {
+        let q = DiagramRenderQueue(renderer: DiagramWebRenderer(), store: MemoryDiagramStore(), timeout: .seconds(30))
+        let source = "node a \"Phone\"\nnode b \"Server\" right of a\nedge a -> b"
+        let phase = await DiagramPhase.load(DiagramRequest(kind: .reladraw, source: source, theme: .light, width: 320, scale: 2), queue: q)
+        guard case let .image(image) = phase else {
+            Issue.record("expected an image, got \(phase)")
+            return
+        }
+        #expect(image.size.width > 50 && image.size.height > 10)
+        #expect(image.size.width <= 320)
+
+        let bad = await DiagramPhase.load(DiagramRequest(kind: .reladraw, source: "node a\nedge a -> zz", theme: .dark, width: 320, scale: 2), queue: q)
+        #expect(bad == .failed("line 2: edge to \"zz\", which does not exist"))
     }
 }

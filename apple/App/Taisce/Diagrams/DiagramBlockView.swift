@@ -2,7 +2,7 @@ import SwiftUI
 import TaisceKit
 import UIKit
 
-/// What a Mermaid block shows: a shimmer while it renders, then the image
+/// What a Mermaid or reladraw block shows: a shimmer while it renders, then the image
 /// or the renderer's error.
 enum DiagramPhase: Equatable {
     case rendering
@@ -28,8 +28,9 @@ enum DiagramPhase: Equatable {
     }
 }
 
-/// A ```` ```mermaid ```` fence, drawn on the device.
-struct MermaidBlock: View {
+/// A ```` ```mermaid ```` or ```` ```reladraw ```` fence, drawn on the device.
+struct RenderedDiagramBlock: View {
+    var kind: DiagramKind = .mermaid
     let source: String
     var queue: DiagramRenderQueue = Diagrams.queue
 
@@ -40,7 +41,7 @@ struct MermaidBlock: View {
     @State private var showsFull = false
 
     var request: DiagramRequest {
-        DiagramRequest(source: source, theme: scheme == .dark ? .dark : .light, width: width, scale: Double(scale))
+        DiagramRequest(kind: kind, source: source, theme: scheme == .dark ? .dark : .light, width: width, scale: Double(scale))
     }
 
     var body: some View {
@@ -80,7 +81,7 @@ struct MermaidBlock: View {
             .accessibilityLabel("Diagram")
             .accessibilityHint("Opens full screen")
         case let .failed(message):
-            DiagramNoticeCard(icon: "exclamationmark.triangle", title: "Mermaid diagram couldn't render", detail: message, tint: Theme.amber)
+            DiagramNoticeCard(icon: "exclamationmark.triangle", title: "\(kind == .reladraw ? "Reladraw" : "Mermaid") diagram couldn't render", detail: message, tint: Theme.amber)
         }
     }
 }
@@ -194,7 +195,7 @@ struct ZoomableImage: UIViewRepresentable {
     }
 }
 
-/// The renderer for a diagram fence: charts and Mermaid natively, the
+/// The renderer for a diagram fence: charts, Mermaid and reladraw on the device, the
 /// rest (D2, canvases) as a card.
 struct DiagramBlock: View {
     let kind: String
@@ -205,7 +206,9 @@ struct DiagramBlock: View {
         case "vega-lite":
             ChartBlock(source: source)
         case "mermaid":
-            MermaidBlock(source: source)
+            RenderedDiagramBlock(kind: .mermaid, source: source)
+        case "reladraw":
+            RenderedDiagramBlock(kind: .reladraw, source: source)
         case "vega":
             DiagramNoticeCard(icon: "chart.xyaxis.line", title: "Chart type not supported on iPhone yet", detail: "Full Vega specs render in the desktop app; Vega-Lite ones render here.")
         default:

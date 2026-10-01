@@ -50,6 +50,26 @@ private final class FakeRenderer: DiagramRendering {
         // pinned: a change here throws away every cached image
         #expect(DiagramCacheKey.make(source: "", theme: .dark, width: 0) == DiagramCacheKey.make(source: "", theme: .dark, width: 0))
         #expect(DiagramCacheKey.renderer == "mermaid-12.0.0")
+        // the mermaid key is unchanged by the kind parameter; reladraw's differs
+        #expect(DiagramRequest(source: "a", theme: .dark, width: 300).key == DiagramCacheKey.make(source: "a", theme: .dark, width: 300))
+        let rd = DiagramRequest(kind: .reladraw, source: "node a", theme: .dark, width: 300).key
+        #expect(rd == DiagramCacheKey.make(kind: .reladraw, source: "node a", theme: .dark, width: 300))
+        #expect(rd != DiagramCacheKey.make(kind: .mermaid, source: "node a", theme: .dark, width: 300))
+        #expect(DiagramCacheKey.reladraw == "reladraw-0.15.1")
+    }
+
+    @Test func mixedKindsShareTheQueue() async throws {
+        let r = FakeRenderer()
+        let q = DiagramRenderQueue(renderer: r, store: MemoryDiagramStore())
+        async let a = q.image(for: DiagramRequest(kind: .mermaid, source: "same", theme: .dark, width: 300))
+        async let b = q.image(for: DiagramRequest(kind: .reladraw, source: "same", theme: .dark, width: 300))
+        _ = try await (a, b)
+        #expect(await q.started == 2, "same source, different renderer: two images")
+        #expect(r.state.withLock { $0.maxRunning } == 1)
+    }
+
+    @Test func reladrawFenceIsADiagram() {
+        #expect(BlockRenderer.render(markdown: "```reladraw\nnode a\n```") == [.diagram(kind: "reladraw", source: "node a")])
     }
 
     @Test func rendersOneAtATimeInOrder() async throws {

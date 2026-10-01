@@ -6,32 +6,47 @@ public enum DiagramTheme: String, Sendable, Hashable {
     case dark, light
 }
 
+/// Which bundled renderer draws the source.
+public enum DiagramKind: String, Sendable, Hashable {
+    case mermaid, reladraw
+}
+
 /// One diagram to rasterise: its source, the appearance and the width (pt)
 /// it is laid out at. `scale` is the device's pixels per point.
 public struct DiagramRequest: Sendable, Hashable {
+    public var kind: DiagramKind
     public var source: String
     public var theme: DiagramTheme
     public var width: Int
     public var scale: Double
 
-    public init(source: String, theme: DiagramTheme, width: Int, scale: Double = 3) {
+    public init(kind: DiagramKind = .mermaid, source: String, theme: DiagramTheme, width: Int, scale: Double = 3) {
+        self.kind = kind
         self.source = source
         self.theme = theme
         self.width = width
         self.scale = scale
     }
 
-    public var key: String { DiagramCacheKey.make(source: source, theme: theme, width: width) }
+    public var key: String { DiagramCacheKey.make(kind: kind, source: source, theme: theme, width: width) }
 }
 
 public enum DiagramCacheKey {
-    /// bump when the bundled renderer changes, so old images are not reused
+    /// bump when a bundled renderer changes, so old images are not reused
     public static let renderer = "mermaid-12.0.0"
+    public static let reladraw = "reladraw-0.15.1"
+
+    public static func rendererName(for kind: DiagramKind) -> String {
+        switch kind {
+        case .mermaid: renderer
+        case .reladraw: reladraw
+        }
+    }
 
     /// sha256 of renderer + theme + width + source, lowercase hex. Fields
     /// are newline-separated with the source last, so no two inputs share a key.
-    public static func make(source: String, theme: DiagramTheme, width: Int) -> String {
-        let input = "\(renderer)\n\(theme.rawValue)\n\(width)\n\(source)"
+    public static func make(kind: DiagramKind = .mermaid, source: String, theme: DiagramTheme, width: Int) -> String {
+        let input = "\(rendererName(for: kind))\n\(theme.rawValue)\n\(width)\n\(source)"
         return SHA256.hash(data: Data(input.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 }
@@ -56,7 +71,7 @@ public struct DiagramRenderError: Error, Sendable, Hashable, LocalizedError {
 }
 
 /// Draws one diagram to PNG data. The app's is a WKWebView running the
-/// bundled mermaid; tests use fakes.
+/// bundled mermaid or reladraw; tests use fakes.
 public protocol DiagramRendering: Sendable {
     func render(_ request: DiagramRequest) async throws -> Data
 }
