@@ -16,10 +16,16 @@ serde.workspace = true
 serde_json.workspace = true
 schemars = "1"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 chrono = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+url = "2.5.8"
+webauthn-rs = "0.5.5"
+# webauthn-rs links OpenSSL; vendor it so the binary (and the cross-built
+# hub) never depends on a system libssl
+openssl = { version = "0.10.81", features = ["vendored"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2.5"
 ed25519-dalek = "3"
@@ -41,5 +47,6 @@ model2vec-rs = { version = "0.2.1", default-features = false, features = ["onig"
 [build-dependencies]
 
 [dev-dependencies]
+webauthn-authenticator-rs = { version = "0.5.5", default-features = false, features = ["softpasskey"] }
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }

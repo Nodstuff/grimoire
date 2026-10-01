@@ -1927,6 +1927,7 @@ pub const MAX_MCP_BODY: usize = 16 * 1024 * 1024;
 
 /// `embedder`: the block embedder for the dense legs of `search`/`related`
 /// (None = keyword-only, the tools say so).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn router(
     store: Arc<Mutex<SqliteStore>>,
     agent: Uuid,
@@ -1934,6 +1935,24 @@ pub fn router(
     dedupe: DedupeCache,
     embedder: Option<Arc<crate::embed::Embedder>>,
 ) -> axum::Router {
+    router_with_hosts(store, agent, hot, dedupe, embedder, None)
+}
+
+/// `router` with rmcp's inbound Host allowlist replaced: server mode adds the
+/// public host (rmcp's default admits loopback names only).
+pub fn router_with_hosts(
+    store: Arc<Mutex<SqliteStore>>,
+    agent: Uuid,
+    hot: crate::hot::HotState,
+    dedupe: DedupeCache,
+    embedder: Option<Arc<crate::embed::Embedder>>,
+    allowed_hosts: Option<Vec<String>>,
+) -> axum::Router {
+    let mut config = rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default()
+        .with_max_request_body_bytes(MAX_MCP_BODY);
+    if let Some(hosts) = allowed_hosts {
+        config = config.with_allowed_hosts(hosts);
+    }
     // one `as` cache for every request: rmcp builds a fresh KsMcp per request
     // on stateless protocol versions, so anything cross-call lives out here
     let names = new_name_cache();
@@ -1943,8 +1962,7 @@ pub fn router(
                 .with_embedder(embedder.clone()))
         },
         LocalSessionManager::default().into(),
-        rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default()
-            .with_max_request_body_bytes(MAX_MCP_BODY),
+        config,
     );
     // rmcp reads the body itself, so neither axum's DefaultBodyLimit nor a
     // tower-http layer gets a say: rmcp's own cap is the one that applies and

@@ -510,6 +510,24 @@ impl SqliteStore {
         Ok(Some(g))
     }
 
+    /// RFC 7009: revoke the grant behind an access or refresh token.
+    pub fn oauth_revoke_by_token(&mut self, token_hash: &str, why: &str, now: i64) -> Result<Option<Uuid>> {
+        let grant: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT grant_id FROM oauth_access_tokens WHERE token_hash = ?1
+                 UNION ALL SELECT grant_id FROM oauth_refresh_tokens WHERE token_hash = ?1 LIMIT 1",
+                [token_hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(g) = grant.map(uuid_of).transpose()? else {
+            return Ok(None);
+        };
+        revoke_grant(&self.conn, g, why, now)?;
+        Ok(Some(g))
+    }
+
     /// Delete everything past its use: expired codes, tokens and enrollment
     /// links, tokens of revoked grants, and grants revoked over 30 days ago.
     pub fn oauth_cleanup(&mut self, now: i64) -> Result<usize> {
