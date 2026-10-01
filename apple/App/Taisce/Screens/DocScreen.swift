@@ -35,7 +35,8 @@ struct DocScreen: View {
         })
         .task(id: docID) { await observe() }
         .task(id: docID) { await refresh(force: false) }
-        .task(id: docID) { await model.loadEditMeta(docID) }
+        // a sync write drops the cached meta: load it again
+        .task(id: MetaKey(doc: docID, missing: model.editMeta[docID] == nil)) { await model.loadEditMeta(docID) }
     }
 
     private func observe() async {
@@ -77,6 +78,11 @@ struct DocScreen: View {
             }
         }
     }
+}
+
+private struct MetaKey: Hashable {
+    var doc: DocID
+    var missing: Bool
 }
 
 struct DocContent: View {

@@ -77,6 +77,8 @@ final class AppModel {
 
     func boot() async {
         guard api == nil else { return }
+        // never let the permission read hold up the launch state
+        Task { await dueAlerts.refresh() }
         await connect()
         await startSync()
     }

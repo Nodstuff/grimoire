@@ -48,6 +48,10 @@ struct LibraryContent: View {
             }
         }
         .listStyle(.insetGrouped)
+        // reading width on iPad, centred on the ground
+        .frame(maxWidth: Theme.readingWidth)
+        .frame(maxWidth: .infinity)
+        .background(Theme.ground.ignoresSafeArea())
         .tint(Theme.accent)
         .groundBackground()
         .toolbarVisibility(.hidden, for: .navigationBar)
@@ -108,13 +112,14 @@ struct LibraryRow: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: node.isFolder ? "folder" : "doc.text")
+                .font(.subheadline)
                 .foregroundStyle(node.isFolder ? Theme.accent : Theme.secondary)
                 .frame(width: 24)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
-                Text(node.doc.title).font(.body).foregroundStyle(Theme.text).lineLimit(2)
+                Text(node.doc.title).font(.subheadline).foregroundStyle(Theme.text).lineLimit(2)
                 if let sub = node.subtitle {
-                    Text(sub).font(.caption).foregroundStyle(Theme.secondary).lineLimit(1)
+                    Text(sub).font(.caption2).foregroundStyle(Theme.secondary).lineLimit(1)
                 }
             }
             Spacer(minLength: 0)

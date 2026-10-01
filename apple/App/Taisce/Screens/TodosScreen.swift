@@ -71,10 +71,12 @@ struct TodosContent: View {
                 }
                 .listRowBackground(Color.clear)
                 .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 0))
-                if alertStatus == .notDetermined {
+            }
+            if alertStatus == .notDetermined {
+                Section {
                     PromptCard(icon: "bell", text: "Get a nudge when things are due", action: "Turn on", onAction: onEnableAlerts)
                         .listRowBackground(Color.clear)
-                        .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 0, trailing: 0))
+                        .listRowInsets(EdgeInsets())
                 }
             }
             if let board {
@@ -95,6 +97,10 @@ struct TodosContent: View {
         .listStyle(.insetGrouped)
         .listSectionSpacing(20)
         .contentMargins(.top, 0, for: .scrollContent)
+        // reading width on iPad, centred on the ground
+        .frame(maxWidth: Theme.readingWidth)
+        .frame(maxWidth: .infinity)
+        .background(Theme.ground.ignoresSafeArea())
         .groundBackground()
         .toolbarVisibility(.hidden, for: .navigationBar)
         .safeAreaInset(edge: .bottom) {
