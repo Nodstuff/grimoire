@@ -4891,6 +4891,17 @@ impl SqliteStore {
             .map_err(Into::into)
     }
 
+    /// Run `f` inside one deferred read transaction: every read in it sees
+    /// the same snapshot, even with another process writing the file (WAL).
+    /// `f` must only read — a write path opening its own transaction inside
+    /// would fail. The transaction is closed whatever `f` returns.
+    pub fn read_snapshot<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> Result<T> {
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        let out = f(self);
+        self.conn.execute_batch("COMMIT")?;
+        Ok(out)
+    }
+
     /// The change journal's head: the highest `seq`, 0 when empty.
     pub fn latest_change_seq(&self) -> Result<i64> {
         Ok(self

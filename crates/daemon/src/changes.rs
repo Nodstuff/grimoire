@@ -3,8 +3,9 @@
 //! that keep an offline cache.
 //!
 //! - `GET /api/changes?since=<seq>&limit=<n>` → `{seq, changes: [{seq,
-//!   doc_id, kind, epoch, at}], more}` — rows after `since` in seq order;
-//!   `limit` defaults to 500, capped at 2000; `seq` is the journal's head.
+//!   doc_id, kind, epoch, at, doc?}], more}` — rows after `since` in seq
+//!   order; `limit` defaults to 500, capped at 2000; `seq` is the journal's
+//!   head. `limit=0` answers the head alone (`changes: []`, `more: false`).
 //! - `GET /api/changes/stream` — Server-Sent Events. Resumes after the
 //!   `Last-Event-ID` header (else `?since=`, else 0): replays the backlog,
 //!   then pushes rows as they land. Each event is `id: <seq>`, `event:
@@ -122,7 +123,15 @@ async fn changes(State(st): State<ApiState>, q: Result<Query<ChangesQuery>, Quer
         Ok(q) => q,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    // limit=0 asks for the head alone: the cursor to start from, no rows
+    if q.limit == Some(0) {
+        return with_store(&st.store, |s| match s.latest_change_seq() {
+            Ok(seq) => Json(json!({"seq": seq, "changes": [], "more": false})).into_response(),
+            Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
+        })
+        .await;
+    }
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     with_store(&st.store, move |s| match s.changes_since(q.since, limit) {
         Ok(page) => Json(json!(page)).into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -318,6 +327,9 @@ mod tests {
         let v = crate::home::testing::call(&app, "GET", "/api/changes?since=2", None).await;
         assert_eq!(v["more"], false);
         assert_eq!(v["changes"].as_array().unwrap().len(), 1);
+        // limit=0: the head alone, the cursor a fresh client starts from
+        let v = crate::home::testing::call(&app, "GET", "/api/changes?since=0&limit=0", None).await;
+        assert_eq!(v, json!({"seq": 3, "changes": [], "more": false}));
         // limit is clamped, never an error
         let v = crate::home::testing::call(&app, "GET", "/api/changes?limit=999999", None).await;
         assert_eq!(v["changes"].as_array().unwrap().len(), 3);
