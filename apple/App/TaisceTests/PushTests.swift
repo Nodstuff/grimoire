@@ -9,11 +9,6 @@ import UIKit
 @MainActor @Suite(.serialized, .timeLimit(.minutes(1))) struct PushTests {
     let now = Date(timeIntervalSince1970: 1_790_000_000)
 
-    @Test func debugBuildsRegisterSandboxTokens() {
-        // these tests only run in Debug; Release is `.production` by #if
-        #expect(PushConfig.environment == .sandbox)
-    }
-
     @Test func appVersionIsShortVersionAndBuild() {
         #expect(PushConfig.appVersion(info: ["CFBundleShortVersionString": "0.1.0", "CFBundleVersion": "7"]) == "0.1.0 (7)")
         #expect(PushConfig.appVersion(info: nil) == "0 (0)")
@@ -108,5 +103,24 @@ struct HangingRegistry: DeviceRegistry {
     }
     func unregisterDevice(token: String) async throws {
         try await Task.sleep(for: .seconds(3600))
+    }
+}
+
+@Suite struct PushEnvironmentFromProfileTests {
+    func profile(_ aps: String?) -> Data {
+        let ents = aps.map { "<key>aps-environment</key><string>\($0)</string>" } ?? ""
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Entitlements</key><dict>\(ents)</dict></dict></plist>"
+        // a provisioning profile is CMS-wrapped: binary bytes around the plist
+        return Data([0x30, 0x82, 0x01, 0x00]) + Data(xml.utf8) + Data([0xA0, 0x00])
+    }
+    @Test func developmentProfileMeansSandbox() {
+        #expect(PushConfig.environment(profile: profile("development")) == .sandbox)
+    }
+    @Test func productionProfileMeansProduction() {
+        #expect(PushConfig.environment(profile: profile("production")) == .production)
+    }
+    @Test func noProfileMeansProduction() {
+        #expect(PushConfig.environment(profile: nil) == .production)
+        #expect(PushConfig.environment(profile: profile(nil)) == .production)
     }
 }

@@ -4,14 +4,27 @@ import UIKit
 
 /// This build's APNs settings.
 enum PushConfig {
-    /// A Debug build is signed with `aps-environment` development, so its
-    /// token is a sandbox one; Release (TestFlight, App Store) is production.
+    /// The APNs gateway this install's token belongs to, read from the
+    /// provisioning profile the app was signed with — not the build
+    /// configuration: a Release build installed from Xcode carries a
+    /// development profile (`aps-environment` development → a sandbox token).
+    /// No embedded profile (App Store) means production.
     static var environment: PushEnvironment {
-        #if DEBUG
-        .sandbox
-        #else
-        .production
-        #endif
+        let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision")
+        return environment(profile: url.flatMap { try? Data(contentsOf: $0) })
+    }
+
+    static func environment(profile: Data?) -> PushEnvironment {
+        guard let profile,
+              let text = String(data: profile, encoding: .isoLatin1),
+              let start = text.range(of: "<?xml"),
+              let end = text.range(of: "</plist>", range: start.lowerBound..<text.endIndex),
+              let xml = String(text[start.lowerBound..<end.upperBound]).data(using: .isoLatin1),
+              let plist = try? PropertyListSerialization.propertyList(from: xml, format: nil) as? [String: Any],
+              let ents = plist["Entitlements"] as? [String: Any],
+              let aps = ents["aps-environment"] as? String
+        else { return .production }
+        return aps == "development" ? .sandbox : .production
     }
 
     /// `CFBundleShortVersionString (CFBundleVersion)`, e.g. `0.1.0 (1)`.
