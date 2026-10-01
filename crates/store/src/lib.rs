@@ -70,7 +70,6 @@ pub fn rewrite_links(content: &str, old: &str, new: &str) -> String {
 }
 
 /// Policy when a doc and all its ancestors leave review_policy null.
-/// Human-review until the reviewer agent (4.8) exists; flip to AgentReview then.
 pub const DEFAULT_REVIEW_POLICY: ReviewPolicy = ReviewPolicy::HumanReview;
 
 /// Storage boundary (ADR 0001). No SQL above this trait.

@@ -372,7 +372,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -395,8 +395,19 @@ fn backfill(conn: &Connection) -> Result<()> {
     if version < 6 {
         backfill_changes(&tx)?;
     }
+    if version < 7 {
+        retire_reviewer_gardeners(&tx)?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
+    Ok(())
+}
+
+/// v7: the reviewer gardener kind is retired. Existing reviewer rows (and
+/// their run log) are kept but disabled, so the daily cut never runs them;
+/// the kind stays in the CHECK so those rows still read.
+fn retire_reviewer_gardeners(conn: &Connection) -> Result<()> {
+    conn.execute("UPDATE gardeners SET enabled = 0 WHERE kind = 'reviewer'", [])?;
     Ok(())
 }
 
@@ -1992,6 +2003,9 @@ impl BlockStore for SqliteStore {
         scope_doc: Option<Uuid>,
         confidence_policy: ConfidencePolicy,
     ) -> Result<Gardener> {
+        if kind == GardenerKind::Reviewer {
+            return Err(StoreError::InvalidOp("the reviewer gardener kind was retired".into()));
+        }
         // each gardener is its own principal: provenance is per-gardener
         let principal = self.create_principal(PrincipalKind::Agent, name, None)?;
         let id = Uuid::now_v7();
@@ -3666,6 +3680,35 @@ mod tests {
         drop(s);
         // a second open is a no-op
         SqliteStore::open(&path).unwrap();
+    }
+
+    /// v7: reviewer gardeners are disabled once (rows and runs kept), and no
+    /// new one can be created.
+    #[test]
+    fn v7_disables_reviewer_gardeners_and_refuses_new_ones() {
+        use crate::{BlockStore, ConfidencePolicy, GardenerKind, PrincipalKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ks.db");
+        {
+            let mut s = SqliteStore::open(&path).unwrap();
+            let p = s.create_principal(PrincipalKind::Agent, "rev", None).unwrap().id;
+            s.conn
+                .execute(
+                    "INSERT INTO gardeners (id, name, kind, principal, task_prompt) VALUES (?1, 'rev', 'reviewer', ?2, 'r')",
+                    params![Uuid::now_v7().to_string(), p.to_string()],
+                )
+                .unwrap();
+            s.create_gardener("tags", GardenerKind::Tagging, "t", None, ConfidencePolicy::Review).unwrap();
+            s.conn.pragma_update(None, "user_version", 6).unwrap();
+        }
+        let mut s = SqliteStore::open(&path).unwrap();
+        let gs = s.list_gardeners().unwrap();
+        let rev = gs.iter().find(|g| g.kind == GardenerKind::Reviewer).unwrap();
+        assert!(!rev.enabled, "disabled by the migration");
+        assert!(gs.iter().find(|g| g.kind == GardenerKind::Tagging).unwrap().enabled);
+        assert!(s.create_gardener("r2", GardenerKind::Reviewer, "r", None, ConfidencePolicy::Review).is_err());
+        let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 7);
     }
 
     const FEDERATION_DDL: &str = "

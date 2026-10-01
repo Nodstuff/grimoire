@@ -24,7 +24,7 @@ pub struct AdminState {
 #[derive(Deserialize)]
 pub struct CreateGardener {
     pub name: String,
-    /// "tagging" (default) or "reviewer"
+    /// "tagging" (default), "auditor", "scribe", "keeper" or "filer"
     pub kind: Option<String>,
     pub task_prompt: String,
     pub scope_doc: Option<Uuid>,

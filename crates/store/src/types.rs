@@ -461,7 +461,9 @@ impl ConfidencePolicy {
 pub enum GardenerKind {
     /// Sweeps docs, proposes content (tags, updates).
     Tagging,
-    /// Reads the review queue on agent-review docs and resolves it (4.8).
+    /// Retired: read the review queue on agent-review docs and resolved it
+    /// (4.8). Kept only so old rows still read; none can be created and the
+    /// runner does nothing for one.
     Reviewer,
     /// Veracity sweeps: reads the stalest docs and flags suspect claims
     /// as comments on the offending blocks. Flags, never edits.

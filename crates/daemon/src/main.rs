@@ -183,7 +183,7 @@ enum GardenerCmd {
     Add {
         name: String,
         task_prompt: String,
-        /// tagging (default) or reviewer
+        /// tagging (default), auditor, scribe, keeper or filer
         #[arg(long)]
         kind: Option<String>,
         #[arg(long)]

@@ -15,6 +15,7 @@ const CLAUDE_CODE_URL = 'https://docs.anthropic.com/en/docs/claude-code'
 export interface Gardener {
   id: string
   name: string
+  /** 'reviewer' only on old, disabled rows: the kind was retired */
   kind: 'tagging' | 'reviewer' | 'auditor' | 'filer'
   principal: string
   scope_doc: string | null
@@ -300,7 +301,7 @@ function GardenerCard({
 
 function CreateCard({ onCreated }: { onCreated: () => void }) {
   const [name, setName] = useState('')
-  const [kind, setKind] = useState<'tagging' | 'reviewer' | 'auditor' | 'filer'>('tagging')
+  const [kind, setKind] = useState<'tagging' | 'auditor' | 'filer'>('tagging')
   const [prompt, setPrompt] = useState('')
 
   const create = async () => {
@@ -322,9 +323,8 @@ function CreateCard({ onCreated }: { onCreated: () => void }) {
         </label>
         <label>
           kind
-          <select value={kind} onChange={(e) => setKind(e.target.value as 'tagging' | 'reviewer' | 'auditor' | 'filer')}>
+          <select value={kind} onChange={(e) => setKind(e.target.value as 'tagging' | 'auditor' | 'filer')}>
             <option value="tagging">tagging (sweeps docs)</option>
-            <option value="reviewer">reviewer (clears the queue)</option>
             <option value="auditor">auditor (flags stale/suspect claims)</option>
             <option value="filer">filer (empties the Inbox: folder, title, tags)</option>
           </select>
