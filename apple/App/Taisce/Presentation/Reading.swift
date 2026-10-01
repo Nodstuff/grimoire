@@ -119,6 +119,45 @@ enum Checkbox {
     }
 }
 
+/// Where a checkbox in the To-do doc lives as a to-do item: its day (the
+/// `## YYYY-MM-DD` above it) and its position among that day's items,
+/// counted the way TodoParser counts (`[>]` carried items included).
+enum TodoDocAddress {
+    static func locate(_ blocks: [DocBlock], block target: BlockID, index: Int) -> (date: String, position: Int)? {
+        var day: String?
+        var position = 0
+        for b in blocks {
+            var box = 0
+            for raw in b.content.split(separator: "\n", omittingEmptySubsequences: false) {
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                if line.hasPrefix("## "), let d = Due(String(line.dropFirst(3))), !d.hasTime {
+                    day = d.dateString
+                    position = 0
+                    continue
+                }
+                if line.hasPrefix("#"), !line.hasPrefix("###") { day = nil }
+                guard day != nil, let mark = itemMark(line) else { continue }
+                if b.id == target, mark != ">" {
+                    if box == index, let day { return (day, position) }
+                    box += 1
+                }
+                position += 1
+            }
+        }
+        return nil
+    }
+
+    /// `- [x] text` → "x"; nil for a line that isn't a to-do item.
+    static func itemMark(_ line: String) -> Character? {
+        guard line.hasPrefix("- ") || line.hasPrefix("* ") else { return nil }
+        let rest = line.dropFirst(2).drop { $0 == " " }
+        guard rest.count >= 3, rest.first == "[" else { return nil }
+        let mark = rest[rest.index(after: rest.startIndex)]
+        guard rest[rest.index(rest.startIndex, offsetBy: 2)] == "]", " xX>".contains(mark) else { return nil }
+        return mark
+    }
+}
+
 /// One search result card (one per doc: its best-ranked block).
 struct SearchResult: Identifiable, Hashable, Sendable {
     var docID: DocID

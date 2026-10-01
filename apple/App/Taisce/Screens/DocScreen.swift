@@ -71,7 +71,12 @@ struct DocScreen: View {
         overrides[block, default: [:]][index] = checked
         Task {
             do {
-                try await model.setCheckbox(doc: docID, block: block, index: index, checked: checked)
+                if docID == model.todoDocID {
+                    guard let at = TodoDocAddress.locate(page?.blocks ?? [], block: block, index: index) else { throw TodoWriteError.notFound }
+                    try await model.setTodoDone(date: at.date, position: at.position, done: checked)
+                } else {
+                    try await model.setCheckbox(doc: docID, block: block, index: index, checked: checked)
+                }
             } catch {
                 overrides[block]?[index] = nil
                 model.lastError = error.localizedDescription

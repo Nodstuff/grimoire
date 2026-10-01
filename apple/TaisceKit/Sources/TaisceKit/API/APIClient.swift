@@ -88,57 +88,114 @@ public struct APIClient: Sendable {
     // No `GET /api/todo` on purpose: a GET for today carries items forward
     // (a server write). Reads go through `todoDue` and the cached To-do doc.
 
-    public func todoAdd(date: String, text: String) async throws -> TodoDay {
-        try await post("/api/todo", body: ["date": date, "text": text])
+    // Every to-do call carries the device's clock (`TodoClock`): the server
+    // has no idea what day it is for you, and SERVER mode refuses calls
+    // without `today`. `utc_offset` lets it read a typed time ("due fri 3pm").
+
+    public func todoAdd(date: String, text: String, clock: TodoClock = TodoClock()) async throws -> TodoDay {
+        try await post("/api/todo", body: TodoBody(date: date, text: text, clock: clock))
     }
 
-    public func todoToggle(date: String, itemID: String, done: Bool) async throws -> TodoDay {
-        struct Body: Encodable { var date: String; var item_id: String; var done: Bool }
-        return try await post("/api/todo/toggle", body: Body(date: date, item_id: itemID, done: done))
+    public func todoToggle(date: String, itemID: String, done: Bool, clock: TodoClock = TodoClock()) async throws -> TodoDay {
+        try await post("/api/todo/toggle", body: TodoBody(date: date, itemID: itemID, done: done, clock: clock))
     }
 
-    public func todoEdit(date: String, itemID: String, text: String) async throws -> TodoDay {
-        try await post("/api/todo/edit", body: ["date": date, "item_id": itemID, "text": text])
+    public func todoEdit(date: String, itemID: String, text: String, clock: TodoClock = TodoClock()) async throws -> TodoDay {
+        try await post("/api/todo/edit", body: TodoBody(date: date, itemID: itemID, text: text, clock: clock))
     }
 
-    public func todoRemove(date: String, itemID: String) async throws -> TodoDay {
-        try await post("/api/todo/remove", body: ["date": date, "item_id": itemID])
+    public func todoRemove(date: String, itemID: String, clock: TodoClock = TodoClock()) async throws -> TodoDay {
+        try await post("/api/todo/remove", body: TodoBody(date: date, itemID: itemID, clock: clock))
     }
 
-    public func todoMove(date: String, itemID: String, to toDate: String) async throws -> TodoDay {
-        try await post("/api/todo/move", body: ["date": date, "item_id": itemID, "to_date": toDate])
+    public func todoMove(date: String, itemID: String, to toDate: String, clock: TodoClock = TodoClock()) async throws -> TodoDay {
+        try await post("/api/todo/move", body: TodoBody(date: date, itemID: itemID, toDate: toDate, clock: clock))
     }
 
-    /// `nil` clears the deadline. A date-only `Due` keeps the item's existing
-    /// time (server rule); a timed one sets `due_time`.
-    public func todoSetDeadline(date: String, itemID: String, deadline: Due?) async throws -> TodoDay {
-        try await post("/api/todo/deadline", body: DeadlineBody(date: date, itemID: itemID, deadline: deadline))
+    public func todoSetNote(date: String, itemID: String, note: String, clock: TodoClock = TodoClock()) async throws -> TodoDay {
+        try await post("/api/todo/note", body: TodoBody(date: date, itemID: itemID, note: note, clock: clock))
+    }
+
+    /// `nil` clears the deadline; `.allDay` sends `deadline`, `.at` sends
+    /// `due_at` (UTC) plus the local day as `deadline`, so a pre-UTC server
+    /// still files it on the right day.
+    public func todoSetDeadline(date: String, itemID: String, deadline: Deadline?, clock: TodoClock = TodoClock()) async throws -> TodoDay {
+        try await post("/api/todo/deadline", body: DeadlineBody(date: date, itemID: itemID, deadline: deadline, clock: clock))
+    }
+
+    /// A wall-clock `Due` picked on this device (date only = all-day).
+    public func todoSetDeadline(date: String, itemID: String, deadline: Due?, clock: TodoClock = TodoClock()) async throws -> TodoDay {
+        try await todoSetDeadline(date: date, itemID: itemID, deadline: deadline.flatMap { Deadline.local($0) }, clock: clock)
+    }
+
+    /// The body of every to-do write: the address, the change, the clock.
+    struct TodoBody: Encodable {
+        var date: String
+        var itemID: String?
+        var text: String?
+        var done: Bool?
+        var toDate: String?
+        var note: String?
+        var clock: TodoClock
+
+        init(date: String, itemID: String? = nil, text: String? = nil, done: Bool? = nil, toDate: String? = nil, note: String? = nil, clock: TodoClock) {
+            self.date = date
+            self.itemID = itemID
+            self.text = text
+            self.done = done
+            self.toDate = toDate
+            self.note = note
+            self.clock = clock
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case date, text, done, note, today
+            case itemID = "item_id"
+            case toDate = "to_date"
+            case utcOffset = "utc_offset"
+        }
+
+        func encode(to encoder: any Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(date, forKey: .date)
+            try c.encodeIfPresent(itemID, forKey: .itemID)
+            try c.encodeIfPresent(text, forKey: .text)
+            try c.encodeIfPresent(done, forKey: .done)
+            try c.encodeIfPresent(toDate, forKey: .toDate)
+            try c.encodeIfPresent(note, forKey: .note)
+            try c.encode(clock.today, forKey: .today)
+            try c.encode(clock.utcOffset, forKey: .utcOffset)
+        }
     }
 
     struct DeadlineBody: Encodable {
         var date: String
         var itemID: String
-        var deadline: Due?
+        var deadline: Deadline?
+        var clock: TodoClock
 
         enum CodingKeys: String, CodingKey {
-            case date, deadline
+            case date, deadline, today
             case itemID = "item_id"
-            case dueTime = "due_time"
+            case dueAt = "due_at"
         }
 
         func encode(to encoder: any Encoder) throws {
             var c = encoder.container(keyedBy: CodingKeys.self)
             try c.encode(date, forKey: .date)
             try c.encode(itemID, forKey: .itemID)
-            try c.encode(deadline?.dateString, forKey: .deadline)
-            if let d = deadline, let h = d.hour, let m = d.minute {
-                try c.encode(String(format: "%02d:%02d", h, m), forKey: .dueTime)
+            try c.encode(clock.today, forKey: .today)
+            switch deadline {
+            case nil:
+                // neither clears it
+                try c.encodeNil(forKey: .deadline)
+            case let .allDay(d)?:
+                try c.encode(d, forKey: .deadline)
+            case let d?:
+                try c.encode(d.wire.dueAt, forKey: .dueAt)
+                try c.encode(d.day(in: clock.timeZone), forKey: .deadline)
             }
         }
-    }
-
-    public func todoSetNote(date: String, itemID: String, note: String) async throws -> TodoDay {
-        try await post("/api/todo/note", body: ["date": date, "item_id": itemID, "note": note])
     }
 
     // MARK: plumbing

@@ -104,7 +104,13 @@ public struct TodoRecord: Codable, Sendable, Hashable, FetchableRecord, Persista
     public var note: String?
 
     public var isOpen: Bool { mark == " " }
-    public var due: Due? { deadline.flatMap(Due.init) }
+    /// `deadline` is the stored token: `YYYY-MM-DD`, `YYYY-MM-DDTHH:MMZ`, or legacy `D HH:MM`
+    public var deadlineValue: Deadline? { deadline.flatMap { Deadline(stored: $0) } }
+    /// The deadline as a wall-clock date/time in the device's zone.
+    public var due: Due? { deadlineValue?.due() }
+    public func isOverdue(now: Date = .now, in timeZone: TimeZone = .current) -> Bool {
+        isOpen && (deadlineValue?.isOverdue(now: now, in: timeZone) ?? false)
+    }
 
     public enum CodingKeys: String, CodingKey, ColumnExpression {
         case date, position, mark, text, deadline, note

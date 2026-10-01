@@ -46,11 +46,25 @@ extension Cache {
     }
 
     /// Queue a deadline change (`nil` clears it). Same body as
-    /// `APIClient.todoSetDeadline`.
+    /// `APIClient.todoSetDeadline`; the clock is the one at queue time.
     @discardableResult
-    public func enqueueDeadline(date: String, itemID: String, deadline: Due?, key: String = UUID().uuidString.lowercased(), now: Date = .now) async throws -> OutboxEntry {
-        let body = try JSONEncoder().encode(APIClient.DeadlineBody(date: date, itemID: itemID, deadline: deadline))
+    public func enqueueDeadline(date: String, itemID: String, deadline: Deadline?, clock: TodoClock = TodoClock(), key: String = UUID().uuidString.lowercased(), now: Date = .now) async throws -> OutboxEntry {
+        let body = try JSONEncoder().encode(APIClient.DeadlineBody(date: date, itemID: itemID, deadline: deadline, clock: clock))
         return try await enqueue(method: "POST", path: "/api/todo/deadline", body: body, key: key, now: now)
+    }
+
+    /// A wall-clock `Due` picked on this device (date only = all-day).
+    @discardableResult
+    public func enqueueDeadline(date: String, itemID: String, deadline: Due?, clock: TodoClock = TodoClock(), key: String = UUID().uuidString.lowercased(), now: Date = .now) async throws -> OutboxEntry {
+        try await enqueueDeadline(date: date, itemID: itemID, deadline: deadline.flatMap { Deadline.local($0) }, clock: clock, key: key, now: now)
+    }
+
+    /// Queue any to-do write with the device's clock in the body (SERVER
+    /// mode refuses one without `today`): toggle, add, edit, remove, move, note.
+    @discardableResult
+    public func enqueueTodo(_ path: String, date: String, itemID: String? = nil, text: String? = nil, done: Bool? = nil, toDate: String? = nil, note: String? = nil, clock: TodoClock = TodoClock(), key: String = UUID().uuidString.lowercased(), now: Date = .now) async throws -> OutboxEntry {
+        let body = try JSONEncoder().encode(APIClient.TodoBody(date: date, itemID: itemID, text: text, done: done, toDate: toDate, note: note, clock: clock))
+        return try await enqueue(method: "POST", path: path, body: body, key: key, now: now)
     }
 
     @discardableResult

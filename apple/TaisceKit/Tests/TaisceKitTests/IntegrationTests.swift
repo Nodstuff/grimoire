@@ -179,25 +179,46 @@ struct LocalIntegrationTests {
         #expect(c.kind == .doc && (c.epoch ?? 0) > tree.doc.currentEpoch)
     }
 
+    /// The device's clock rides along; deadlines go out as an all-day date
+    /// or a UTC instant. Against a pre-UTC daemon a timed deadline lands as
+    /// its local day (the `deadline` that rides along with `due_at`).
     @Test func todoDueAndDeadlineWrite() async throws {
-        let today = Due.today.dateString
+        let clock = TodoClock()
+        let today = clock.today
         let tag = "rent\(UUID().uuidString.prefix(6).lowercased())"
-        let day = try await api.todoAdd(date: today, text: "pay \(tag) · due \(today) 23:59")
+        let day = try await api.todoAdd(date: today, text: "pay \(tag)", clock: clock)
         let item = try #require(day.items.first { $0.text.contains(tag) }, "added: \(day.items)")
-        let due = try await api.todoDue()
-        let listed = try #require(due.items.first { $0.itemID == item.id })
-        #expect(listed.deadline == today && listed.dueTime == "23:59")
+        func listed() async throws -> TodoDueList.Item? { try await api.todoDue().items.first { $0.itemID == item.id } }
 
-        let tomorrow = try #require(Calendar.current.date(byAdding: .day, value: 1, to: .now))
-        let next = Due.today(now: tomorrow)
-        _ = try await api.todoSetDeadline(date: today, itemID: item.id, deadline: Due(year: next.year, month: next.month, day: next.day, hour: 8, minute: 15))
-        let after = try await api.todoDue()
-        let moved = try #require(after.items.first { $0.itemID == item.id })
-        #expect(moved.deadline == next.dateString && moved.dueTime == "08:15")
-        // date-only keeps the time (server rule)
-        _ = try await api.todoSetDeadline(date: today, itemID: item.id, deadline: Due(today))
-        let kept = try #require(try await api.todoDue().items.first { $0.itemID == item.id })
-        #expect(kept.deadline == today && kept.dueTime == "08:15")
+        let todayDue = try #require(Due(today))
+        let timed = try #require(Deadline.local(Due(year: todayDue.year, month: todayDue.month, day: todayDue.day, hour: 23, minute: 45)))
+        _ = try await api.todoSetDeadline(date: today, itemID: item.id, deadline: timed, clock: clock)
+        let t = try #require(try await listed())
+        if t.dueAt != nil {
+            #expect(t.deadlineValue == timed, "UTC daemon: the instant round-trips")
+            #expect(t.dueTime == "23:45" && t.deadline == today, "shown back in the device's zone")
+        } else {
+            #expect(t.deadline == today, "pre-UTC daemon: filed on the local day")
+        }
+        #expect(t.deadlineValue?.isOverdue() == false)
+
+        let tomorrow = Deadline.calendar(.current).dateString(Date.now.addingTimeInterval(86_400))
+        _ = try await api.todoSetDeadline(date: today, itemID: item.id, deadline: Deadline.allDay(tomorrow), clock: clock)
+        let a = try #require(try await listed())
+        #expect(a.deadlineValue == .allDay(tomorrow) && a.dueTime == nil)
+
+        _ = try await api.todoSetDeadline(date: today, itemID: item.id, deadline: nil as Deadline?, clock: clock)
+        #expect(try await listed() == nil, "cleared")
+    }
+
+    @Test func aMissingDocIsNotFound() async throws {
+        // today's daemon: 200 {"error": "not found: …"}; the next: a real 404
+        await #expect(throws: APIError.self) { try await api.doc(UUID().uuidString.lowercased()) }
+        do {
+            _ = try await api.doc(UUID().uuidString.lowercased())
+        } catch let e as APIError {
+            guard case .notFound = e else { Issue.record("not .notFound: \(e)"); return }
+        }
     }
 
     /// Each `DocEditor` op, sent for real: edit → change event → refetch shows it.
@@ -359,6 +380,14 @@ struct ServerIntegrationTests {
             if case .retry = out { gotRetry = true; break }
         }
         #expect(gotRetry)
+    }
+
+    @Test func t3b_todoCallsCarryTheClock() async throws {
+        let api = api(session())
+        let clock = TodoClock()
+        let day = try await api.todoAdd(date: clock.today, text: "server-mode \(UUID().uuidString.prefix(6))", clock: clock)
+        #expect(day.today == clock.today, "the server took the device's today")
+        _ = try await api.todoDue()
     }
 
     @Test func t4_refreshRotatesAndStillWorks() async throws {

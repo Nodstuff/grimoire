@@ -335,3 +335,31 @@ private extension Optional {
         #expect(!DueAlertPrompt(alerts.status).showsTodosCard)
     }
 }
+
+@Suite struct TodoDocAddressTests {
+    func blocks(_ md: [String]) -> [DocBlock] {
+        md.enumerated().map { DocBlock(id: "b\($0.offset)", content: $0.element, nodes: []) }
+    }
+
+    @Test func emptyAndOutsideADay() {
+        #expect(TodoDocAddress.locate([], block: "b0", index: 0) == nil)
+        #expect(TodoDocAddress.locate(blocks(["- [ ] no day"]), block: "b0", index: 0) == nil)
+    }
+
+    @Test func oneItem() {
+        let b = blocks(["## 2026-10-01", "- [ ] only"])
+        let at = TodoDocAddress.locate(b, block: "b1", index: 0)
+        #expect(at?.date == "2026-10-01" && at?.position == 0)
+    }
+
+    @Test func manyDaysCountCarriedItemsButNotAsBoxes() {
+        let b = blocks([
+            "## 2026-09-30", "- [>] carried\n- [x] done",
+            "## 2026-10-01", "- [ ] a\n- [>] b\n- [ ] c",
+        ])
+        #expect(TodoDocAddress.locate(b, block: "b1", index: 0).map { [$0.date, String($0.position)] } == ["2026-09-30", "1"])
+        // the second GFM box in b3 is "c": position 2 because [>] b counts
+        #expect(TodoDocAddress.locate(b, block: "b3", index: 1).map { [$0.date, String($0.position)] } == ["2026-10-01", "2"])
+        #expect(TodoDocAddress.locate(b, block: "b3", index: 2) == nil)
+    }
+}

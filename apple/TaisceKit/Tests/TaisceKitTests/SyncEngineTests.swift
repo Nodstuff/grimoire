@@ -119,7 +119,7 @@ import Testing
         // two changes for d1 in one batch → one fetch
         #expect(server.requests.map(\.path) == ["/api/doc/d1", "/api/doc/todo"])
         #expect(try await cache.doc("d1")?.bodyEpoch == 4)
-        #expect(try await cache.todos().first?.due == Due(year: 2026, month: 10, day: 1, hour: 10, minute: 0))
+        #expect(try await cache.todos().first?.deadlineValue == .at(Deadline.instant("2026-10-01T10:00:00Z")!, isLegacy: true))
 
         // a change we already hold is skipped
         let again = try await sync.apply([Change(seq: 13, docID: "d1", kind: .doc, epoch: 4)])

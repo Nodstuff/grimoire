@@ -154,7 +154,7 @@ struct NewTodoField: View {
     var hintText: String? {
         guard let hint else { return nil }
         if let w = hint.warning { return w }
-        guard let due = hint.due else { return nil }
+        guard let due = hint.due() else { return nil }
         let label = DueLabel.make(TodoEntry(date: "", itemID: "", text: hint.text, due: due), now: now)
         return label.text.map { "Due \($0.replacingOccurrences(of: " · ", with: " "))" }
     }

@@ -154,8 +154,11 @@ import Testing
         let cache = try Cache.inMemory()
         try await cache.replaceTree([])
         try await cache.setLastSeq(1)
+        // the stream stays open: a live loop holds exactly one connection
         let server = MockServer { r in
-            r.path == "/api/changes/stream" ? .sse(": ping\n\n") : Self.page(seq: 1, more: false)
+            r.path == "/api/changes/stream"
+                ? MockServer.Reply(chunks: [Data(": ping\n\n".utf8)], contentType: "text/event-stream", hold: true)
+                : Self.page(seq: 1, more: false)
         }
         let sync = SyncEngine(api: server.client(), cache: cache, backoff: Backoff(base: .milliseconds(20), cap: .milliseconds(20), jitter: { 1 }))
         await sync.start()
@@ -164,11 +167,9 @@ import Testing
         }
         await sync.stop()
         #expect(await sync.status == .idle)
-        // a request already handed to URLSession may still land; give it a moment
-        try await Task.sleep(for: .milliseconds(50))
-        let after = server.requests.count
         try await Task.sleep(for: .milliseconds(300))
-        #expect(server.requests.count == after, "nothing runs after stop() returns")
+        // a loop still alive after stop() would reconnect once the held stream is cancelled
+        #expect(server.requests.filter { $0.path == "/api/changes/stream" }.count == 1, "nothing runs after stop() returns")
         // a restart runs one loop again
         await sync.start()
         await sync.stop()

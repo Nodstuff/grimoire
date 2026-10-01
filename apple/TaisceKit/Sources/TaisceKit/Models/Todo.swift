@@ -92,26 +92,32 @@ public struct Due: Sendable, Hashable, Comparable, CustomStringConvertible {
 
 /// One item of `GET /api/todo` (`Item` in crates/daemon/src/todo.rs).
 /// `id` is `<index>-<fnv1a(text)>`, stable only within its day.
+///
+/// Deadlines: `deadline` (`YYYY-MM-DD`) for an all-day item, `due_at` (RFC
+/// 3339 UTC) for a timed one, `legacy_time` on a pre-UTC one. Overdue is
+/// the device's call (`deadlineValue?.isOverdue()`), never the server's.
+/// Pre-UTC servers sent `deadline` + `due_time` + `alert_at` + `overdue`;
+/// those still decode (the time is read as UTC, as the server reads it).
 public struct TodoItem: Codable, Sendable, Hashable, Identifiable {
     public var id: String
     public var text: String
     public var done: Bool
     public var carried: Bool
     public var carriedFrom: String?
-    /// the deadline's day, `YYYY-MM-DD`
+    /// all-day `YYYY-MM-DD` (pre-UTC servers: the day of a timed one too)
     public var deadline: String?
-    /// `HH:MM` when the deadline has a time
+    /// timed: the instant (RFC 3339 UTC)
+    public var dueAt: String?
+    public var legacyTime: Bool
+    /// pre-UTC servers only: `HH:MM`
     public var dueTime: String?
-    /// `YYYY-MM-DDTHH:MM` local; the server's answer to "when to alert" (09:00 if no time)
-    public var alertAt: String?
     public var note: String?
-    public var overdue: Bool
     public var dueSoon: Bool
 
     public init(
         id: String, text: String, done: Bool, carried: Bool = false, carriedFrom: String? = nil,
-        deadline: String? = nil, dueTime: String? = nil, alertAt: String? = nil,
-        note: String? = nil, overdue: Bool = false, dueSoon: Bool = false
+        deadline: String? = nil, dueAt: String? = nil, legacyTime: Bool = false, dueTime: String? = nil,
+        note: String? = nil, dueSoon: Bool = false
     ) {
         self.id = id
         self.text = text
@@ -119,25 +125,30 @@ public struct TodoItem: Codable, Sendable, Hashable, Identifiable {
         self.carried = carried
         self.carriedFrom = carriedFrom
         self.deadline = deadline
+        self.dueAt = dueAt
+        self.legacyTime = legacyTime
         self.dueTime = dueTime
-        self.alertAt = alertAt
         self.note = note
-        self.overdue = overdue
         self.dueSoon = dueSoon
     }
 
-    /// Deadline day + optional time. Also reads a combined `D HH:MM` deadline.
-    public var due: Due? {
-        guard let deadline else { return nil }
-        return Due(dueTime.map { "\(deadline) \($0)" } ?? deadline)
+    public var deadlineValue: Deadline? {
+        Deadline.fromWire(deadline: deadline, dueAt: dueAt, legacyTime: legacyTime, dueTime: dueTime)
     }
 
+    /// The deadline as a wall-clock date/time in the device's zone.
+    public var due: Due? { deadlineValue?.due() }
+
+    /// Past due on this device, now.
+    public var overdue: Bool { !done && (deadlineValue?.isOverdue() ?? false) }
+
     enum CodingKeys: String, CodingKey {
-        case id, text, done, carried, deadline, note, overdue
+        case id, text, done, carried, deadline, note
         case carriedFrom = "carried_from"
         case dueSoon = "due_soon"
+        case dueAt = "due_at"
+        case legacyTime = "legacy_time"
         case dueTime = "due_time"
-        case alertAt = "alert_at"
     }
 
     public init(from decoder: any Decoder) throws {
@@ -149,10 +160,10 @@ public struct TodoItem: Codable, Sendable, Hashable, Identifiable {
         carried = try c.decodeIfPresent(Bool.self, forKey: .carried) ?? false
         carriedFrom = try c.decodeIfPresent(String.self, forKey: .carriedFrom)
         deadline = try c.decodeIfPresent(String.self, forKey: .deadline)
+        dueAt = try c.decodeIfPresent(String.self, forKey: .dueAt)
+        legacyTime = try c.decodeIfPresent(Bool.self, forKey: .legacyTime) ?? false
         dueTime = try c.decodeIfPresent(String.self, forKey: .dueTime)
-        alertAt = try c.decodeIfPresent(String.self, forKey: .alertAt)
         note = try c.decodeIfPresent(String.self, forKey: .note)
-        overdue = try c.decodeIfPresent(Bool.self, forKey: .overdue) ?? false
         dueSoon = try c.decodeIfPresent(Bool.self, forKey: .dueSoon) ?? false
     }
 }
@@ -191,32 +202,73 @@ public struct TodoDay: Codable, Sendable, Hashable {
 }
 
 /// `GET /api/todo/due?until=`: open items with deadlines across all days,
-/// soonest alert first. Read-only (never carries forward), so safe to poll.
+/// soonest first. Read-only (never carries forward), so safe to poll. The
+/// server compares in UTC; `dueToday(now:)` gives the device's view.
 public struct TodoDueList: Codable, Sendable, Hashable {
     public struct Item: Codable, Sendable, Hashable, Identifiable {
         /// the day the item is scheduled under; with `itemID`, its address for writes
         public var date: String
         public var itemID: String
         public var text: String
-        public var deadline: String
-        public var dueTime: String?
-        /// local `YYYY-MM-DDTHH:MM`
-        public var alertAt: String
-        public var overdue: Bool
+        /// all-day `YYYY-MM-DD` (pre-UTC servers: also a timed one's day)
+        public var allDay: String?
+        /// timed: RFC 3339 UTC
+        public var dueAt: String?
+        public var legacyTime: Bool
+        /// pre-UTC servers only
+        public var legacyDueTime: String?
         public var note: String?
         public var carriedFrom: String?
 
         public var id: String { "\(date)/\(itemID)" }
 
-        public var due: Due? { Due(dueTime.map { "\(deadline) \($0)" } ?? deadline) }
+        public var deadlineValue: Deadline? {
+            Deadline.fromWire(deadline: allDay, dueAt: dueAt, legacyTime: legacyTime, dueTime: legacyDueTime)
+        }
+
+        /// The deadline as a wall-clock date/time in the device's zone.
+        public var due: Due? { deadlineValue?.due() }
+        /// The deadline's day in the device's zone.
+        public var deadline: String { deadlineValue?.day() ?? allDay ?? "" }
+        /// `HH:MM` in the device's zone, for a timed deadline.
+        public var dueTime: String? {
+            guard let d = due, let h = d.hour, let m = d.minute else { return nil }
+            return String(format: "%02d:%02d", h, m)
+        }
+        /// Past due on this device, now (the server no longer says).
+        public var overdue: Bool { deadlineValue?.isOverdue() ?? false }
+        /// When to notify: the instant, or 09:00 local on an all-day date.
+        public var alertDate: Date? { deadlineValue?.alertDate() }
 
         enum CodingKeys: String, CodingKey {
-            case date, text, deadline, overdue, note
+            case date, text, note
             case itemID = "id"
-            case dueTime = "due_time"
-            case alertAt = "alert_at"
+            case allDay = "deadline"
+            case dueAt = "due_at"
+            case legacyTime = "legacy_time"
+            case legacyDueTime = "due_time"
             case carriedFrom = "carried_from"
         }
+
+        public init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            date = try c.decode(String.self, forKey: .date)
+            itemID = try c.decode(String.self, forKey: .itemID)
+            text = try c.decode(String.self, forKey: .text)
+            allDay = try c.decodeIfPresent(String.self, forKey: .allDay)
+            dueAt = try c.decodeIfPresent(String.self, forKey: .dueAt)
+            legacyTime = try c.decodeIfPresent(Bool.self, forKey: .legacyTime) ?? false
+            legacyDueTime = try c.decodeIfPresent(String.self, forKey: .legacyDueTime)
+            note = try c.decodeIfPresent(String.self, forKey: .note)
+            carriedFrom = try c.decodeIfPresent(String.self, forKey: .carriedFrom)
+        }
+    }
+
+    /// Due by the end of the device's today, or overdue: soonest first.
+    public func dueToday(now: Date = .now, in timeZone: TimeZone = .current) -> [Item] {
+        items
+            .filter { $0.deadlineValue?.isDueToday(now: now, in: timeZone) ?? false }
+            .sorted { ($0.deadlineValue?.sortDate(in: timeZone) ?? .distantFuture) < ($1.deadlineValue?.sortDate(in: timeZone) ?? .distantFuture) }
     }
 
     public var docID: DocID?

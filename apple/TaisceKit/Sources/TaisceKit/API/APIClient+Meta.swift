@@ -53,25 +53,35 @@ public struct TodoParseHint: Decodable, Sendable, Hashable {
     public var text: String
     public var deadline: String?
     public var dueTime: String?
+    /// a UTC-aware server answers the instant; older ones a local wall time
+    public var dueAt: String?
     public var alertAt: String?
     public var warning: String?
 
-    public init(text: String, deadline: String? = nil, dueTime: String? = nil, alertAt: String? = nil, warning: String? = nil) {
+    public init(text: String, deadline: String? = nil, dueTime: String? = nil, dueAt: String? = nil, alertAt: String? = nil, warning: String? = nil) {
         self.text = text
         self.deadline = deadline
         self.dueTime = dueTime
+        self.dueAt = dueAt
         self.alertAt = alertAt
         self.warning = warning
     }
 
-    public var due: Due? {
-        guard let deadline else { return nil }
-        return Due(dueTime.map { "\(deadline) \($0)" } ?? deadline)
+    /// `due_at` as an instant, else the day + wall time read on this
+    /// device (the parse was asked with this device's `today`/`utc_offset`).
+    public func deadlineValue(in timeZone: TimeZone = .current) -> Deadline? {
+        if let dueAt, let d = Deadline(stored: dueAt) { return d }
+        guard let deadline, let day = Due(dueTime.map { "\(deadline) \($0)" } ?? deadline) else { return nil }
+        return Deadline.local(day, in: timeZone)
     }
+
+    /// The deadline as a wall time in `timeZone`, for display.
+    public func due(in timeZone: TimeZone = .current) -> Due? { deadlineValue(in: timeZone)?.due(in: timeZone) }
 
     enum CodingKeys: String, CodingKey {
         case text, deadline, warning
         case dueTime = "due_time"
+        case dueAt = "due_at"
         case alertAt = "alert_at"
     }
 }
@@ -82,8 +92,13 @@ extension APIClient {
         try await get("/api/doc/\(id)/history")
     }
 
-    /// The server's reading of a typed to-do, e.g. "call Ann due fri 3pm".
-    public func todoParse(_ text: String) async throws -> TodoParseHint {
-        try await get("/api/todo/parse", query: [URLQueryItem(name: "text", value: text)])
+    /// The server's reading of a typed to-do, e.g. "call Ann due fri 3pm",
+    /// relative to this device's day and offset.
+    public func todoParse(_ text: String, clock: TodoClock = TodoClock()) async throws -> TodoParseHint {
+        try await get("/api/todo/parse", query: [
+            URLQueryItem(name: "text", value: text),
+            URLQueryItem(name: "today", value: clock.today),
+            URLQueryItem(name: "utc_offset", value: clock.utcOffset),
+        ])
     }
 }

@@ -26,16 +26,16 @@ struct TodoEntry: Identifiable, Hashable, Sendable {
         self.init(date: item.date, itemID: item.itemID, text: item.text, due: item.due, overdue: item.overdue, note: item.note)
     }
 
-    /// From the cache. Overdue is computed here as the server would: a timed
-    /// deadline by its time, a date-only one once its day has passed.
+    /// From the cache. The deadline shows as a wall time in `timeZone`;
+    /// overdue is the device's call (by the instant, or after an all-day date).
     init(_ r: TodoRecord, now: Date = .now, timeZone: TimeZone = .current) {
-        let due = r.due
         self.init(
             date: r.date, itemID: Self.itemID(position: r.position, text: r.text), text: r.text,
-            due: due, overdue: due.map { Self.isOverdue($0, now: now, timeZone: timeZone) } ?? false, note: r.note
+            due: r.deadlineValue?.due(in: timeZone), overdue: r.isOverdue(now: now, in: timeZone), note: r.note
         )
     }
 
+    /// A local wall-time deadline's overdue rule (the device decides).
     static func isOverdue(_ due: Due, now: Date, timeZone: TimeZone) -> Bool {
         if due.hasTime { return (due.alertDate(in: timeZone) ?? .distantFuture) < now }
         return due.dateString < Due.today(now: now, in: timeZone).dateString

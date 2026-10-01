@@ -13,6 +13,8 @@ final class MockServer: Sendable {
         var headers: [String: String] = [:]
         /// fail the connection after the chunks, instead of finishing cleanly
         var failAfter = false
+        /// keep the connection open after the chunks until the client cancels
+        var hold = false
 
         static func json(_ s: String) -> Reply { Reply(chunks: [Data(s.utf8)]) }
         static func sse(_ chunks: String...) -> Reply { Reply(chunks: chunks.map { Data($0.utf8) }, contentType: "text/event-stream") }
@@ -77,6 +79,7 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
         let response = HTTPURLResponse(url: url, statusCode: reply.status, httpVersion: "HTTP/1.1", headerFields: reply.headers.merging(["Content-Type": reply.contentType]) { a, _ in a })
         if let response { client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed) }
         for chunk in reply.chunks { client?.urlProtocol(self, didLoad: chunk) }
+        if reply.hold { return }
         if reply.failAfter {
             client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
         } else {

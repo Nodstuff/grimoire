@@ -365,12 +365,12 @@ final class AppModel {
 
     // MARK: to-dos
 
-    /// Open to-dos: dated ones from `GET /api/todo/due` (read-only, overdue
-    /// by time), today's undated ones from the cached To-do doc. Offline,
-    /// both come from the cache. Never `GET /api/todo` (it carries forward).
+    /// Open to-dos: dated ones from the server's read-only due list (`api.todoDue`; overdue
+    /// computed on the device), today's undated ones from the cached To-do doc. Offline,
+    /// both come from the cache. Never the day read (a GET for today carries items forward).
     func loadTodos(now: Date = .now) async -> (board: TodoBoard, offline: Bool) {
         let cached = (try? await cache?.todos()) ?? []
-        let today = Due.today(now: now).dateString
+        let today = TodoClock(now: now).today
         let undated = cached.filter { $0.isOpen && $0.date == today && $0.due == nil }.map { TodoEntry($0, now: now) }
         var dated: [TodoEntry]
         var offline = false
@@ -388,22 +388,20 @@ final class AppModel {
         return (board, offline)
     }
 
+    // Every to-do write goes through TaisceKit's typed, queued calls (each
+    // carries this device's TodoClock); none spells a route here.
+
     func markDone(_ e: TodoEntry) async {
-        struct Body: Encodable { var date: String; var item_id: String; var done: Bool }
-        await queue("/api/todo/toggle", Body(date: e.date, item_id: e.itemID, done: true), settling: e)
+        await queue(settling: e) { cache in
+            try await cache.enqueueTodoToggle(date: e.date, itemID: e.itemID, done: true)
+        }
     }
 
+    /// The new deadline is a wall time on this device, stored as UTC.
     func snooze(_ e: TodoEntry, _ s: Snooze) async {
-        guard let cache, let due = s.deadline() else { return }
-        settledTodos.insert(e.id)
-        do {
-            try await cache.enqueueDeadline(date: e.date, itemID: e.itemID, deadline: due)
-            pendingWrites += 1
-            todoRevision += 1
-            await replayOutbox()
-        } catch {
-            settledTodos.remove(e.id)
-            lastError = error.localizedDescription
+        guard let due = s.deadline(), let deadline = Deadline.local(due) else { return }
+        await queue(settling: e) { cache in
+            try await cache.enqueueDeadline(date: e.date, itemID: e.itemID, deadline: deadline)
         }
     }
 
@@ -411,7 +409,23 @@ final class AppModel {
     func addTodo(_ text: String) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        await queue("/api/todo", ["date": Due.today.dateString, "text": trimmed], settling: nil)
+        let clock = TodoClock()
+        await queue(settling: nil) { cache in
+            try await cache.enqueueTodoAdd(date: clock.today, text: trimmed, clock: clock)
+        }
+    }
+
+    /// A checkbox in the To-do doc itself: the item's typed toggle, not a
+    /// block edit (the to-do routes keep the doc's canonical form).
+    func setTodoDone(date: String, position: Int, done: Bool) async throws {
+        guard let cache else { return }
+        guard let record = try await cache.todos().first(where: { $0.date == date && $0.position == position }) else {
+            throw TodoWriteError.notFound
+        }
+        let itemID = TodoEntry(record).itemID
+        await queue(settling: nil) { cache in
+            try await cache.enqueueTodoToggle(date: date, itemID: itemID, done: done)
+        }
     }
 
     /// The server's reading of a typed to-do, for the live hint.
@@ -419,11 +433,11 @@ final class AppModel {
         try? await api?.todoParse(text)
     }
 
-    private func queue(_ path: String, _ body: some Encodable, settling e: TodoEntry?) async {
+    private func queue(settling e: TodoEntry?, _ write: (Cache) async throws -> Void) async {
         guard let cache else { return }
         if let e { settledTodos.insert(e.id) }
         do {
-            try await cache.enqueue(method: "POST", path: path, body: JSONEncoder().encode(body), key: UUID().uuidString.lowercased())
+            try await write(cache)
             pendingWrites += 1
             todoRevision += 1
             await replayOutbox()
