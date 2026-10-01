@@ -100,10 +100,37 @@ struct WorkspaceEmptyState: Hashable, Sendable {
     }
 }
 
-/// The six swatches a workspace can wear: Theme's accent, green, amber,
-/// rose, accentActive and secondary (their dark values; stored as hex).
+/// The six swatches a workspace can wear, stored as Theme token names so
+/// they follow light/dark mode. Any other value is read as `#rrggbb`.
 enum WorkspacePalette {
-    static let colors = ["#8b9dc3", "#95c99b", "#d9b47a", "#d98a94", "#a9b7d6", "#8f8f9e"]
+    static let colors = ["accent", "green", "amber", "rose", "accentActive", "secondary"]
+
+    /// Builds before tokens stored the swatches' dark-mode hex: read those
+    /// as their token, so they adapt too.
+    static let legacyHex = [
+        "#8b9dc3": "accent", "#95c99b": "green", "#d9b47a": "amber",
+        "#d98a94": "rose", "#a9b7d6": "accentActive", "#8f8f9e": "secondary",
+    ]
+
+    /// The token a stored colour means, if any.
+    static func token(_ stored: String?) -> String? {
+        guard let stored else { return nil }
+        if colors.contains(stored) { return stored }
+        return legacyHex[stored.lowercased()]
+    }
+
+    /// For VoiceOver.
+    static func name(_ token: String) -> String {
+        switch token {
+        case "accent": "Blue"
+        case "green": "Green"
+        case "amber": "Amber"
+        case "rose": "Rose"
+        case "accentActive": "Sky"
+        case "secondary": "Grey"
+        default: token
+        }
+    }
 }
 
 /// "Manage workspaces": the pure parts.

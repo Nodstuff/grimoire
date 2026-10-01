@@ -59,14 +59,14 @@ private let c = Workspace(id: "wc", name: "Gamma", sortKey: "r", docCount: 0)
         RecordingProtocol.reply.withLock { $0 = #"{"id":"wa","name":"Work","doc_ids":[],"doc_count":3}"# }
         let api = RecordingProtocol.client()
         _ = try await api.updateWorkspace("wa", name: "Work")
-        _ = try await api.updateWorkspace("wa", color: "#95c99b")
+        _ = try await api.updateWorkspace("wa", color: "green")
         _ = try await api.updateWorkspace("wa", sortKey: "f")
         let reqs = RecordingProtocol.log.withLock { $0 }
         #expect(reqs.map(\.httpMethod) == ["PATCH", "PATCH", "PATCH"])
         #expect(reqs.allSatisfy { $0.url?.path() == "/api/workspaces/wa" })
         let rename = try body(reqs[0]), colour = try body(reqs[1]), sort = try body(reqs[2])
         #expect(rename as NSDictionary == ["name": "Work"], "absent fields are kept")
-        #expect(colour as NSDictionary == ["color": "#95c99b"])
+        #expect(colour as NSDictionary == ["color": "green"])
         #expect(sort as NSDictionary == ["sort_key": "f"])
     }
 
@@ -109,7 +109,21 @@ private let c = Workspace(id: "wc", name: "Gamma", sortKey: "r", docCount: 0)
 
     @Test func swatchesAreSixThemeColours() {
         #expect(WorkspacePalette.colors.count == 6)
-        #expect(WorkspacePalette.colors.allSatisfy { Color(workspaceHex: $0) != nil })
+        #expect(WorkspacePalette.colors.allSatisfy { Color(workspaceColor: $0) != nil })
+    }
+
+    @Test func swatchesAreTokensThatFollowTheScheme() {
+        // stored as a token name, resolved to the Theme colour (light/dark pair)
+        #expect(WorkspacePalette.token("rose") == "rose")
+        #expect(Color(workspaceColor: "rose") == Theme.rose)
+        #expect(Color(workspaceColor: "accent") == Theme.accent)
+        // an earlier build's dark-mode hex reads as its token, so it adapts too
+        #expect(WorkspacePalette.token("#D98A94") == "rose")
+        #expect(Color(workspaceColor: "#d98a94") == Theme.rose)
+        // any other hex (another client) is a fixed colour; junk is nil
+        #expect(WorkspacePalette.token("#123456") == nil && Color(workspaceColor: "#123456") != nil)
+        #expect(Color(workspaceColor: "nope") == nil && Color(workspaceColor: nil) == nil)
+        #expect(WorkspacePalette.name("accentActive") == "Sky")
     }
 }
 
