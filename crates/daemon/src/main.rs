@@ -26,6 +26,7 @@ mod yrender;
 mod mcp;
 mod memory;
 mod nav;
+mod push;
 mod room;
 mod retrieval;
 mod store_ext;
@@ -236,6 +237,9 @@ enum Cmd {
         /// repeatable). Claude's callback, loopback and the app's scheme are built in.
         #[arg(long = "allow-redirect", env = "GRIMOIRE_OAUTH_REDIRECTS", value_delimiter = ',')]
         allow_redirect: Vec<String>,
+        /// SERVER mode: APNs push to the Taisce app (off unless configured).
+        #[command(flatten)]
+        apns: push::ApnsArgs,
     },
     /// SERVER mode sign-in: passkeys and OAuth grants (works on the db
     /// directly; run it on the server box).
@@ -848,7 +852,7 @@ async fn main() -> anyhow::Result<()> {
             let mut store = store;
             auth_cli(&mut store, cmd, cli.public_url.clone(), tom)?;
         }
-        Cmd::Serve { hub, name, trusted_proxy, allow_redirect } => {
+        Cmd::Serve { hub, name, trusted_proxy, allow_redirect, apns } => {
             let port = cli.port;
             let mut store = store;
             // SERVER mode: OAuth + passkeys replace loopback trust entirely
@@ -1052,6 +1056,34 @@ async fn main() -> anyhow::Result<()> {
                 let host = st.cfg.rp_id.clone();
                 vec![st.cfg.authority(), host, "localhost".into(), "127.0.0.1".into(), "::1".into()]
             });
+            // one feed: the store has a single commit hook
+            let feed = changes::Feed::new(&store);
+            // APNs (push.rs): device routes always answer; the sender runs
+            // only in SERVER mode with a key configured
+            let apns_cfg = match apns.config() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("APNs disabled: {e:#}");
+                    None
+                }
+            };
+            let default_env = apns_cfg.as_ref().map_or_else(|| apns.apns_env.clone(), |c| c.default_env.clone());
+            match (apns_cfg, auth_state.is_some()) {
+                (Some(cfg), true) => {
+                    tracing::info!(topic = cfg.topic, "APNs enabled: change nudges to registered devices");
+                    match push::ApnsSender::new(cfg) {
+                        Ok(sender) => {
+                            let (store, feed, sender) = (store.clone(), feed.clone(), Arc::new(sender));
+                            supervise("push", move || {
+                                push::push_loop(store.clone(), feed.clone(), sender.clone(), push::COALESCE)
+                            });
+                        }
+                        Err(e) => tracing::error!("APNs disabled: {e:#}"),
+                    }
+                }
+                (Some(_), false) => tracing::warn!("APNs configured but this is LOCAL mode: push needs --public-url"),
+                (None, _) => {}
+            }
             let app = mcp::router_with_hosts(store.clone(), claude, hot.clone(), dedupe.clone(), embedder.clone(), mcp_hosts)
                 .merge(hot::router(hot::HotCtx {
                     hot: hot.clone(),
@@ -1062,8 +1094,9 @@ async fn main() -> anyhow::Result<()> {
                     fed_ctx_node_id = fed_ctx.node_id.clone();
                     admin::router(store.clone(), fed_ctx, hot.clone(), runtime.clone(), admin_token)
                 })
+                .merge(push::router(push::DevicesState { store: store.clone(), default_env }))
                 .merge(api::router(api::ApiState {
-                    changes: changes::Feed::new(&store),
+                    changes: feed,
                     store,
                     human: tom,
                     hot,

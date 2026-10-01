@@ -577,3 +577,21 @@ CREATE TABLE IF NOT EXISTS idempotency (
     PRIMARY KEY (principal, key)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idempotency_created ON idempotency (created_at);
+
+-- Push devices (APNs): a device token registered by a signed-in user's app.
+-- Tokens are not secrets but are scoped to a user: a token re-registered by
+-- another user moves to them. A token APNs reports gone (410, BadDeviceToken,
+-- Unregistered) is disabled, never retried, until the app registers it again.
+CREATE TABLE IF NOT EXISTS push_devices (
+    token        TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES auth_users (id) ON DELETE CASCADE,
+    platform     TEXT NOT NULL CHECK (platform IN ('ios')),
+    env          TEXT NOT NULL CHECK (env IN ('sandbox', 'production')),
+    app_version  TEXT NOT NULL DEFAULT '',
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    last_sent_at INTEGER,
+    last_error   TEXT,
+    disabled_at  INTEGER
+);
+CREATE INDEX IF NOT EXISTS push_devices_user ON push_devices (user_id);

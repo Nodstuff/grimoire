@@ -47,6 +47,7 @@ fn harness_with(cfg: AuthConfig) -> H {
             embedder: None,
             dedupe,
         }))
+        .merge(crate::push::router(crate::push::DevicesState { store: store.clone(), default_env: "production".into() }))
         .merge(router(st.clone()))
         .fallback(|| async { "<!doctype html>ui" })
         .layer(axum::middleware::from_fn_with_state(st.clone(), require_auth));
@@ -767,4 +768,28 @@ fn path_classes() {
     assert!(needs_token(&Method::GET, "/mcp") && needs_token(&Method::GET, "/api") && needs_token(&Method::GET, "/ws/hot/1"));
     assert!(!needs_token(&Method::GET, "/assets/x.js") && !needs_token(&Method::GET, "/apiary"));
     assert!(needs_token(&Method::POST, "/anything"));
+}
+
+// ---- push devices behind the token ----
+
+#[tokio::test]
+async fn devices_need_the_owners_app_token() {
+    let mut h = harness();
+    let (_, connector, _) = h.tokens().await;
+    let app = h.token_for("Taisce", APP_REDIRECT).await;
+    let token = "ab".repeat(32);
+    let body = json!({"token": token, "platform": "ios", "env": "sandbox", "app_version": "1.0 (1)"});
+    let with = |bearer: Option<&str>| {
+        let mut req = post_json("/api/devices", body.clone());
+        if let Some(b) = bearer {
+            req.headers_mut().insert(header::AUTHORIZATION, format!("Bearer {b}").parse().unwrap());
+        }
+        req
+    };
+    assert_eq!(send(&h.app, with(None)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(send(&h.app, with(Some(&connector))).await.status, StatusCode::FORBIDDEN);
+    let r = send(&h.app, with(Some(&app))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let d = h.st.store.lock().unwrap().push_device(&token).unwrap().unwrap();
+    assert_eq!((d.user_id, d.env.as_str()), (h.owner, "sandbox"));
 }

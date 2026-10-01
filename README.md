@@ -89,6 +89,14 @@ additions give an HTTP client the same contract MCP agents get:
 - SERVER mode (`--public-url`): identity is the bearer token's. `X-Grimoire-Principal`, `?as=`
   and `?cwd=` are ignored; the owner's app (redirect `ie.null.taisce:`) writes as the human, a
   connector as `claude:<client>`, and MCP `as` may only name a `claude:<label>` sub-principal.
+- SERVER mode push (APNs, `push.rs`): the app registers with `POST /api/devices`
+  `{token, platform: "ios", env: "sandbox"|"production", app_version}` and removes itself with
+  `DELETE /api/devices/{token}` (owner's app token only). Each journal change sends every active
+  device one silent nudge (`content-available`, collapse id `changes`, at most one per device per
+  30 s); 410 / `BadDeviceToken` / `Unregistered` disable the token. Configure with
+  `GRIMOIRE_APNS_KEY_FILE` (or `GRIMOIRE_APNS_KEY`, the PEM), `GRIMOIRE_APNS_KEY_ID`,
+  `GRIMOIRE_APNS_TEAM_ID`, optional `GRIMOIRE_APNS_TOPIC` (default `ie.null.taisce`) and
+  `GRIMOIRE_APNS_ENV` (default env for a registration naming none; `production`); unset = off.
 
 The daemon's version is `GET /api/buildinfo` → `{"version": "0.6.2", "build": <stamp>}`.
 

@@ -85,7 +85,7 @@ impl Feed {
         Feed(Arc::new(Inner { store: store.clone(), wake, head, pump: Once::new() }))
     }
 
-    fn subscribe(&self) -> watch::Receiver<i64> {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<i64> {
         let inner = self.0.clone();
         self.0.pump.call_once(move || {
             tokio::spawn(pump(inner));
