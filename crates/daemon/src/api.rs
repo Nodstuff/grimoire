@@ -655,6 +655,10 @@ async fn propose_markdown(
 struct CreateDocReq {
     title: String,
     parent_doc_id: Option<Uuid>,
+    /// Optional idempotency key: a retry with the same request_id (even days
+    /// later, or after a restart) returns the first answer, never a second doc.
+    #[serde(default)]
+    request_id: Option<Uuid>,
     /// Label a new ROOT doc with this workspace; a child always inherits
     /// its parent's (refused here when it names another).
     #[serde(default)]
@@ -670,6 +674,11 @@ async fn create_doc(State(st): State<ApiState>, headers: HeaderMap, Json(req): J
             Ok(p) => p,
             Err(m) => return Json(json!({"error": m})),
         };
+        if let Some(rid) = req.request_id
+            && let Some(prev) = crate::mcp::durable_get(s, &st.dedupe, principal, rid, crate::mcp::REQUEST_ID_TTL)
+        {
+            return Json(prev);
+        }
         if let Some(w) = req.workspace_id {
             if let Err(e) = s.get_workspace(w) {
                 return Json(json!({"error": e.to_string()}));
@@ -689,6 +698,9 @@ async fn create_doc(State(st): State<ApiState>, headers: HeaderMap, Json(req): J
                 }
                 let mut v = json!(d);
                 v["workspace_id"] = json!(s.doc_workspace(d.id).ok().flatten());
+                if let Some(rid) = req.request_id {
+                    crate::mcp::durable_put(s, &st.dedupe, principal, rid, v.clone(), crate::mcp::REQUEST_ID_TTL);
+                }
                 Json(v)
             }
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -1909,6 +1921,36 @@ mod http_client_tests {
             embedder: None,
             dedupe: crate::mcp::new_dedupe(),
         }
+    }
+
+    /// `POST /api/docs` with a request_id creates exactly one doc, even when
+    /// the phone retries after a lost reply and a daemon restart.
+    #[tokio::test]
+    async fn create_doc_request_id_never_creates_twice() {
+        let dir = std::env::temp_dir().join(format!("grimoire-api-create-idem-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("ks.db");
+        let human = SqliteStore::open(&db).unwrap().create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let st = state_on(&db, human);
+        let app = router(st.clone());
+        let rid = Uuid::now_v7();
+        let body = json!({"title": "From the phone", "parent_doc_id": null, "request_id": rid});
+        let first = call(&app, "POST", "/api/docs", &[], Some(body.clone())).await;
+        assert!(first["id"].is_string(), "{first}");
+        let retry = call(&app, "POST", "/api/docs", &[], Some(body.clone())).await;
+        assert_eq!(retry, first, "a retry answers the first doc");
+        drop(app);
+        drop(st);
+        let app = router(state_on(&db, human));
+        let after_restart = call(&app, "POST", "/api/docs", &[], Some(body.clone())).await;
+        assert_eq!(after_restart, first, "and so does one after a restart");
+        let docs = call(&app, "GET", "/api/docs", &[], None).await;
+        let n = docs.as_array().unwrap().iter().filter(|d| d["title"] == "From the phone").count();
+        assert_eq!(n, 1, "exactly one doc");
+        // no request_id: every call creates (unchanged behaviour)
+        let a = call(&app, "POST", "/api/docs", &[], Some(json!({"title": "plain"}))).await;
+        let b = call(&app, "POST", "/api/docs", &[], Some(json!({"title": "plain"}))).await;
+        assert_ne!(a["id"], b["id"]);
     }
 
     /// A `request_id` replays past the memory cache's 120s window and across
