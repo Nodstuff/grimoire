@@ -29,4 +29,7 @@ public enum APIError: Error, Sendable, Equatable {
     case http(status: Int)
     case decoding(String)
     case badURL(String)
+    /// HTML where JSON was expected: the daemon's SPA fallback answers
+    /// unknown routes (e.g. an older daemon without /api/changes) with 200 + index.html
+    case notAPIRoute(String)
 }

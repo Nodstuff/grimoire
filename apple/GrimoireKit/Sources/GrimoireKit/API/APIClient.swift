@@ -139,6 +139,9 @@ public struct APIClient: Sendable {
     }
 
     static func check(data: Data, response: URLResponse) throws {
+        if response.mimeType == "text/html" {
+            throw APIError.notAPIRoute(response.url?.path() ?? "")
+        }
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             if let msg = errorMessage(in: data) { throw APIError.server(msg) }
             throw APIError.http(status: http.statusCode)

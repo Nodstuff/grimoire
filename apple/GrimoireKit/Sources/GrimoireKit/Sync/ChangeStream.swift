@@ -24,6 +24,7 @@ extension APIClient {
                     if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                         throw APIError.http(status: http.statusCode)
                     }
+                    if response.mimeType == "text/html" { throw APIError.notAPIRoute("/api/changes/stream") }
                     var parser = SSEParser(lastEventID: lastEventID.map(String.init))
                     var out: [SSEOutput] = []
                     for try await b in bytes {

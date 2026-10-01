@@ -9,11 +9,12 @@ final class MockServer: Sendable {
     struct Reply: Sendable {
         var status = 200
         var chunks: [Data]
+        var contentType = "application/json"
         /// fail the connection after the chunks, instead of finishing cleanly
         var failAfter = false
 
         static func json(_ s: String) -> Reply { Reply(chunks: [Data(s.utf8)]) }
-        static func sse(_ chunks: String...) -> Reply { Reply(chunks: chunks.map { Data($0.utf8) }) }
+        static func sse(_ chunks: String...) -> Reply { Reply(chunks: chunks.map { Data($0.utf8) }, contentType: "text/event-stream") }
     }
 
     typealias Handler = @Sendable (URLRequest) -> Reply
@@ -72,7 +73,7 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
             req.httpBody = Data(reading: stream)
         }
         let reply = server.handle(req)
-        let response = HTTPURLResponse(url: url, statusCode: reply.status, httpVersion: "HTTP/1.1", headerFields: nil)
+        let response = HTTPURLResponse(url: url, statusCode: reply.status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": reply.contentType])
         if let response { client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed) }
         for chunk in reply.chunks { client?.urlProtocol(self, didLoad: chunk) }
         if reply.failAfter {

@@ -24,6 +24,13 @@ import Testing
         }
     }
 
+    @Test func htmlFallbackIsNotAnAPIResponse() async throws {
+        let server = MockServer { _ in MockServer.Reply(chunks: [Data("<!doctype html>".utf8)], contentType: "text/html; charset=utf-8") }
+        await #expect(throws: APIError.notAPIRoute("/api/changes")) {
+            _ = try await server.client().changes(since: 0)
+        }
+    }
+
     @Test func searchAndChangesBuildQueries() async throws {
         let server = MockServer { r in
             r.path == "/api/search" ? .json("[]") : .json(#"{"seq":0,"changes":[],"more":false}"#)
