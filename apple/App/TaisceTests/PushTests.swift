@@ -54,25 +54,59 @@ import UIKit
     }
 
     @Test func aPushToAnUnreachableLocalDaemonFails() async {
-        UserDefaults.standard.set("http://127.0.0.1:9", forKey: AppModel.serverURLKey)
+        UserDefaults.standard.set("http://127.0.0.1:19", forKey: AppModel.serverURLKey)
         defer { UserDefaults.standard.removeObject(forKey: AppModel.serverURLKey) }
         let m = AppModel()
         // a background launch: no boot yet, the push connects on its own
         let start = ContinuousClock.now
         let result = await m.handleSilentPush(seq: 5)
         #expect(m.api != nil && m.authPhase == .notRequired)
-        #expect(result == .failed, "nothing listens on port 9")
+        #expect(result == .failed, "nothing listens on port 19")
         #expect(ContinuousClock.now - start < .seconds(25))
         await m.stopSync()
     }
 
     @Test func aLocalDaemonRegistersNoToken() async {
-        UserDefaults.standard.set("http://127.0.0.1:9", forKey: AppModel.serverURLKey)
+        UserDefaults.standard.set("http://127.0.0.1:19", forKey: AppModel.serverURLKey)
         defer { UserDefaults.standard.removeObject(forKey: AppModel.serverURLKey) }
         let m = AppModel()
         await m.boot()
         await m.stopSync()
         // no bearer, no registry: a token waits
         #expect(await m.push.didRegister(token: "aa") == .waiting)
+    }
+
+    @Test func bootReturnsQuicklyWhenRegistrationNeverCallsBack() async {
+        UserDefaults.standard.set("http://127.0.0.1:29", forKey: AppModel.serverURLKey)
+        defer { UserDefaults.standard.removeObject(forKey: AppModel.serverURLKey) }
+        let m = AppModel()
+        m.discover = { _ in nil }
+        // iOS never calls didRegister/didFail in a test host
+        let start = ContinuousClock.now
+        await m.boot()
+        #expect(ContinuousClock.now - start < .seconds(2))
+        await m.stopSync()
+        // signed in, with a token and a server that never answers: still returns at once
+        await m.push.didRegister(token: String(repeating: "ab", count: 32))
+        var asked = false
+        let t0 = ContinuousClock.now
+        m.beginPushRegistration(server: "https://hang.invalid", registry: HangingRegistry()) { asked = true }
+        #expect(asked, "the token is requested")
+        #expect(ContinuousClock.now - t0 < .milliseconds(500))
+        // and sign-out drops the hung send, bounded
+        let t1 = ContinuousClock.now
+        await m.pushSessionEnding()
+        #expect(ContinuousClock.now - t1 < PushConfig.unregisterLimit + .seconds(1))
+        #expect(m.pushTask == nil)
+    }
+}
+
+/// A server that never answers (cancellable).
+struct HangingRegistry: DeviceRegistry {
+    func registerDevice(_ registration: DeviceRegistration) async throws {
+        try await Task.sleep(for: .seconds(3600))
+    }
+    func unregisterDevice(token: String) async throws {
+        try await Task.sleep(for: .seconds(3600))
     }
 }

@@ -30,6 +30,8 @@ import UIKit
     @Test func bootStartsUndecidedAndNormalisesTheURL() async throws {
         UserDefaults.standard.set("127.0.0.1:9", forKey: AppModel.serverURLKey)
         let m = AppModel()
+        // no real discovery: `taisce.invalid` must not wait on DNS
+        m.discover = { _ in nil }
         #expect(m.authPhase == .checking, "neither docs nor sign-in before boot decides")
         #expect(m.serverURL == "http://127.0.0.1:9")
         await m.boot()

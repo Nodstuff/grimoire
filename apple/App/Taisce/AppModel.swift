@@ -36,6 +36,10 @@ final class AppModel {
     let dueAlerts = NotificationCoordinator()
     // push: APNs token registration (Push.swift)
     let push = PushRegistrar(store: UserDefaultsPushStore(), environment: PushConfig.environment, appVersion: PushConfig.appVersion())
+    /// push: the registrar's queued work (fire-and-forget, never awaited by boot)
+    @ObservationIgnored var pushTask: Task<Void, Never>?
+    /// Server discovery (does it need sign-in?); tests swap in one with no network.
+    @ObservationIgnored var discover: @MainActor (URL) async throws -> AuthSession? = { try await AppModel.authSession(for: $0) }
 
     // sync indicator
     private(set) var syncStatus: SyncStatus = .idle
@@ -114,7 +118,7 @@ final class AppModel {
         await sync?.start()
         startPolling()
         await dueAlerts.reconcile()
-        await pushSessionStarted() // push
+        pushSessionStarted() // push: fire-and-forget
     }
 
     func stopSync() async {
@@ -214,7 +218,7 @@ final class AppModel {
             let name = "cache-\(url.host() ?? "server")-\(url.port ?? 0).sqlite"
             let cache = try Cache(path: dir.appending(path: name).path(percentEncoded: false))
             authPhase = .checking
-            let auth = withAuth ? try await Self.authSession(for: url) : nil
+            let auth = withAuth ? try await discover(url) : nil
             let api = APIClient(config: ServerConfig(baseURL: url, tokenProvider: auth ?? NoAuth()))
             self.auth = auth
             authPhase = auth == nil ? .notRequired : (await auth?.state == .signedIn ? .signedIn : .signedOut)

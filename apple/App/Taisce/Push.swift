@@ -23,6 +23,8 @@ enum PushConfig {
 
     /// How long sign-out (or a server switch) waits for the device delete.
     static let unregisterLimit: Duration = .seconds(5)
+    /// How long one registration send may run (it is never awaited by launch).
+    static let registerLimit: Duration = .seconds(30)
 }
 
 /// The server's silent push: `{"aps":{"content-available":1},"seq":N}`.
@@ -51,20 +53,44 @@ extension UIBackgroundFetchResult {
 extension AppModel {
     /// After sign-in (and on every foreground start): point the registrar
     /// at this server and ask iOS for the token, which iOS hands back
-    /// through `AppDelegate` on every launch; the registrar sends it when it
-    /// changed or is a day old. LOCAL mode (no bearer) registers nothing.
-    func pushSessionStarted() async {
+    /// through `AppDelegate` whenever it likes (or never: no network, a test
+    /// host); the registrar sends it when it changed or is a day old. LOCAL
+    /// mode (no bearer) registers nothing. Never awaited: launch must not
+    /// wait on APNs or on the device POST.
+    func pushSessionStarted() {
         guard authPhase == .signedIn, let api else {
-            await push.disconnect()
+            enqueuePush { await $0.disconnect() }
             return
         }
-        await push.connect(server: serverURL, registry: api)
-        UIApplication.shared.registerForRemoteNotifications()
+        beginPushRegistration(server: serverURL, registry: api) {
+            UIApplication.shared.registerForRemoteNotifications()
+        }
     }
 
-    /// Sign-out or a server switch: delete this device on the server while
-    /// the bearer still works, bounded so an offline sign-out isn't held up.
+    /// Queue the registrar's connect (bounded by `registerLimit`) and ask
+    /// for a token; returns at once.
+    func beginPushRegistration(server: String, registry: any DeviceRegistry, requestToken: () -> Void) {
+        enqueuePush { push in
+            _ = await withTimeLimit(PushConfig.registerLimit) { await push.connect(server: server, registry: registry) }
+        }
+        requestToken()
+    }
+
+    /// Registrar work runs in order, off the caller.
+    private func enqueuePush(_ op: @escaping @Sendable (PushRegistrar) async -> Void) {
+        let (previous, push) = (pushTask, push)
+        pushTask = Task {
+            await previous?.value
+            await op(push)
+        }
+    }
+
+    /// Sign-out or a server switch: drop any send still out, then delete
+    /// this device on the server while the bearer still works, bounded so
+    /// an offline sign-out isn't held up.
     func pushSessionEnding() async {
+        pushTask?.cancel()
+        pushTask = nil
         let push = push
         _ = await withTimeLimit(PushConfig.unregisterLimit) { await push.unregister() }
     }

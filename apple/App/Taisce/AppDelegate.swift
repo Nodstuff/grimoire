@@ -13,7 +13,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
         registrationError = nil
         let push = model.push
-        Task { await push.didRegister(deviceToken: deviceToken) }
+        // bounded: a hung POST must not keep a task alive forever
+        Task { _ = await withTimeLimit(PushConfig.registerLimit) { await push.didRegister(deviceToken: deviceToken) } }
     }
 
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: any Error) {
