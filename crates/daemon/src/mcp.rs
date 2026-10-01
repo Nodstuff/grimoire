@@ -1678,6 +1678,9 @@ impl KsMcp {
             Ok(o) => o,
             Err(e) => return err(format!("ops did not parse: {e}")),
         };
+        if let Some(m) = crate::api::refuse_new_canvas(&ops) {
+            return err(m);
+        }
         let verbose = p.verbose.unwrap_or(false);
         let principal = match self.acting(p.as_.as_deref(), &hint).await {
             Ok(id) => id,

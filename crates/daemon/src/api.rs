@@ -46,6 +46,19 @@ fn resolve_principal(st: &ApiState, headers: &HeaderMap, s: &mut SqliteStore) ->
     }
 }
 
+/// Canvases were removed: old `canvas_scene` blocks stay readable in the
+/// store (trashed docs hold them), but no write surface creates new ones.
+pub(crate) fn refuse_new_canvas(ops: &[OpInput]) -> Option<String> {
+    ops.iter()
+        .any(|o| {
+            matches!(
+                o.kind,
+                grimoire_store::OpKind::Insert { block_type: grimoire_store::BlockType::CanvasScene, .. }
+            )
+        })
+        .then(|| "canvas_scene blocks can no longer be created (canvases were removed)".into())
+}
+
 /// Header on `GET /api/docs`: the change journal's head, read in the same
 /// read transaction as the list — a syncing client's cursor for exactly this
 /// snapshot.
@@ -93,6 +106,8 @@ fn docs_json(s: &mut SqliteStore, filter: Option<grimoire_store::WorkspaceFilter
                         .map(|doc| {
                             let id = doc.id.to_string();
                             let mut v = json!(doc);
+                            // the canvas editor is gone, but docs holding old scenes
+                            // stay flagged so clients keep them read-only
                             v["is_canvas"] = json!(canvases.contains(&id));
                             v["is_tended"] = json!(tended.contains(&id));
                             v["workspace_id"] = json!(ws_map.get(&doc.id).copied().flatten());
@@ -301,6 +316,9 @@ struct ProposeReq {
 /// Writes: propose as the human (or the `X-Grimoire-Principal` agent) —
 /// current-epoch ops green and apply directly, stale ones are scored per op.
 async fn propose(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json<ProposeReq>) -> Json<Value> {
+    if let Some(m) = refuse_new_canvas(&req.ops) {
+        return Json(json!({"error": m}));
+    }
     let store = st.store.clone();
     let st = st.clone();
     let headers = headers.clone();
@@ -1211,69 +1229,6 @@ async fn restore_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<V
     .await
 }
 
-#[derive(Deserialize)]
-struct ExportReq {
-    filename: String,
-    /// data:image/png;base64,… or data:image/svg+xml;…
-    data_url: String,
-}
-
-/// Save a canvas export to ~/Downloads (#68 v2.2). WKWebView downloads are
-/// unreliable in Tauri, so the daemon writes the file — human surface only.
-async fn export_file(Json(req): Json<ExportReq>) -> Json<Value> {
-    let name: String = req
-        .filename
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-        .collect();
-    if name.is_empty() || name.starts_with('.') {
-        return Json(json!({"error": "bad filename"}));
-    }
-    let Some((_, payload)) = req.data_url.split_once(',') else {
-        return Json(json!({"error": "not a data url"}));
-    };
-    let bytes = if req.data_url.contains(";base64,") {
-        use base64::Engine;
-        match base64::engine::general_purpose::STANDARD.decode(payload) {
-            Ok(b) => b,
-            Err(e) => return Json(json!({"error": format!("bad base64: {e}")})),
-        }
-    } else {
-        match urlencoding_decode(payload) {
-            Ok(s) => s.into_bytes(),
-            Err(e) => return Json(json!({"error": e})),
-        }
-    };
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let dir = std::path::PathBuf::from(home).join("Downloads");
-    std::fs::create_dir_all(&dir).ok();
-    let path = dir.join(&name);
-    match std::fs::write(&path, bytes) {
-        Ok(()) => Json(json!({"path": path.to_string_lossy()})),
-        Err(e) => Json(json!({"error": e.to_string()})),
-    }
-}
-
-fn urlencoding_decode(s: &str) -> Result<String, String> {
-    let mut out = Vec::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|e| e.to_string())?;
-                out.push(u8::from_str_radix(hex, 16).map_err(|e| e.to_string())?);
-                i += 3;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).map_err(|e| e.to_string())
-}
-
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/docs", get(docs).post(create_doc))
@@ -1322,7 +1277,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/runs", get(runs))
         .route("/api/graph", get(graph))
         .route("/api/render/d2", post(render_d2))
-        .route("/api/export", post(export_file))
         .route("/api/doc/{id}/living", get(crate::living::living_status))
         .route("/api/doc/{id}/freshness", get(crate::freshness::doc_freshness))
         .route("/api/freshness", get(crate::freshness::freshness))
@@ -1379,6 +1333,22 @@ mod http_client_tests {
 
     async fn new_doc(app: &Router, headers: &[(&str, &str)]) -> Value {
         call(app, "POST", "/api/docs", headers, Some(json!({"title": "T", "parent_doc_id": null}))).await
+    }
+
+    /// Canvases are gone: a new canvas_scene block is refused; other inserts land.
+    #[tokio::test]
+    async fn propose_refuses_new_canvas_blocks() {
+        let (app, _) = app();
+        let doc = new_doc(&app, &[]).await;
+        let insert = |ty: &str| {
+            json!({"doc_id": doc["id"], "base_epoch": 0, "ops": [{"kind": {
+                "op": "insert", "parent_id": null, "order_key": "i", "block_type": ty, "content": "{}"
+            }}]})
+        };
+        let out = call(&app, "POST", "/api/propose", &[], Some(insert("canvas_scene"))).await;
+        assert!(out["error"].as_str().unwrap().contains("canvases were removed"), "{out}");
+        let out = call(&app, "POST", "/api/propose", &[], Some(insert("paragraph"))).await;
+        assert_eq!(out["verdicts"][0]["verdict"], "green", "{out}");
     }
 
     #[tokio::test]
