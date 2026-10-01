@@ -82,7 +82,7 @@ The client follows a global change cursor:
    `last_seq`.
 
 Applying a batch: last change per doc wins; `deleted` drops the doc and its
-blocks; `tree` / `restored` apply the row's `doc` state in place, and
+blocks; every row's `doc` state (title, parent, epoch) is applied in place, and `tree` / `restored` rows
 refetch `/api/docs` only if a row lacks it; `doc` refetches the body
 only for docs we hold (or the To-do doc, or `alwaysFetch`), otherwise just
 marks the cached row stale (`current_epoch > body_epoch`) so opening it

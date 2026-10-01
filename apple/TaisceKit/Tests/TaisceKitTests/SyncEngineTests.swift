@@ -83,6 +83,19 @@ import Testing
         #expect(try await cache.doc("n1") == nil)
     }
 
+    @Test func docRowsApplyTitleAndEpochBeforeAnyBodyFetch() async throws {
+        let cache = try Cache.inMemory()
+        try await cache.replaceTree(JSONDecoder().decode([DocSummary].self, from: Data(Self.treeJSON.utf8)))
+        let server = MockServer { r in .json(#"{"error":"unexpected \#(r.path)"}"#) }
+        // d3 was never opened: no body fetch, but the title and serve-time epoch land
+        let update = try await engine(server, cache: cache).apply([
+            Change(seq: 5, docID: "d3", kind: .doc, epoch: 2, doc: Change.DocState(title: "Three (renamed)", currentEpoch: 4)),
+        ])
+        #expect(server.requests.isEmpty && update.treeChanged)
+        let d3 = try #require(try await cache.doc("d3"))
+        #expect(d3.title == "Three (renamed)" && d3.currentEpoch == 4 && d3.isBodyStale)
+    }
+
     @Test func applyRefetchesHeldAndTodoDocsOnly() async throws {
         let cache = try Cache.inMemory()
         try await cache.replaceTree(JSONDecoder().decode([DocSummary].self, from: Data(Self.treeJSON.utf8)))

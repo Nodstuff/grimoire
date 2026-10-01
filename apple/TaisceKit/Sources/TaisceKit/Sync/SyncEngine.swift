@@ -188,27 +188,34 @@ public actor SyncEngine {
             update.docIDs.insert(id)
             update.treeChanged = true
         }
-        let treeShaped = order.compactMap { last[$0] }.filter { $0.kind == .tree || $0.kind == .restored }
-        if treeShaped.contains(where: { $0.doc == nil }) {
+        // every row carries the doc's serve-time state: apply it first, so
+        // titles and epochs update before any body refetch
+        let live = order.compactMap { last[$0] }.filter { $0.kind != .deleted }
+        if live.contains(where: { ($0.kind == .tree || $0.kind == .restored) && $0.doc == nil }) {
             try await cache.replaceTree(api.tree())
             update.treeChanged = true
-        } else {
-            for c in treeShaped {
-                if let s = c.doc { try await cache.applyDocState(c.docID, s) }
+        }
+        for c in live {
+            guard let s = c.doc else { continue }
+            let before = try await cache.doc(c.docID)
+            try await cache.applyDocState(c.docID, s)
+            if c.kind == .tree || c.kind == .restored || before?.title != s.title || before?.parentID != s.parentID {
                 update.treeChanged = true
             }
         }
         for id in order {
             guard let c = last[id], c.kind != .deleted else { continue }
+            // the serve-time epoch is newer than or equal to the row's
+            let target = c.doc?.currentEpoch ?? c.epoch
             let cached = try await cache.doc(id)
             let wanted = alwaysFetch.contains(id)
                 || (cached.map { $0.parentID == nil && $0.title == TodoParser.todoDocTitle } ?? false)
             let held = cached?.bodyEpoch != nil
             if held || wanted {
-                if let have = cached?.bodyEpoch, let epoch = c.epoch, have >= epoch { continue }
+                if let have = cached?.bodyEpoch, let target, have >= target { continue }
                 try await cache.storeDoc(api.doc(id))
                 update.docIDs.insert(id)
-            } else if let epoch = c.epoch {
+            } else if let epoch = target {
                 try await cache.noteEpoch(id, epoch: epoch)
             }
         }
