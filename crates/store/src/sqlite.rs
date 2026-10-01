@@ -6,6 +6,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("schema.sql");
+const WORKSPACES_SCHEMA: &str = include_str!("workspaces.sql");
 
 /// "Is this doc frozen for writes right now?" — the daemon plugs its hot
 /// session state in here so store-internal writes that fan out to OTHER
@@ -59,6 +60,7 @@ impl SqliteStore {
         conn.pragma_update(None, "foreign_keys", true)?;
         migrate_pre_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(WORKSPACES_SCHEMA)?;
         backfill(&conn)?;
         Ok(Self { conn, frozen: None })
     }
@@ -1354,6 +1356,7 @@ fn move_doc_conn(
         }
         None => next_doc_sort_key(conn, new_parent)?,
     };
+    let ws_before = crate::workspaces::resolve_conn(conn, doc_id)?;
     let n = conn.execute(
         "UPDATE docs SET parent_id = ?1, sort_key = ?2 WHERE id = ?3 AND deleted = 0",
         params![
@@ -1364,6 +1367,10 @@ fn move_doc_conn(
     )?;
     if n == 0 {
         return Err(StoreError::NotFound(format!("doc {doc_id}")));
+    }
+    // the trigger journals the moved doc; its subtree re-resolves too
+    if crate::workspaces::resolve_conn(conn, doc_id)? != ws_before {
+        crate::workspaces::emit_tree_conn(conn, &crate::workspaces::descendants_conn(conn, doc_id)?)?;
     }
     Ok(())
 }
@@ -4929,6 +4936,7 @@ impl SqliteStore {
                         status: r.get(9)?,
                         current_epoch: r.get(10)?,
                         deleted: r.get::<_, i64>(11)? != 0,
+                        workspace_id: None,
                     }),
                     None => None,
                 };
@@ -4944,6 +4952,18 @@ impl SqliteStore {
             .collect::<rusqlite::Result<_>>()?;
         let more = changes.len() > limit;
         changes.truncate(limit);
+        let mut resolved: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+        for c in changes.iter_mut() {
+            let Some(doc) = c.doc.as_mut() else { continue };
+            if !resolved.contains_key(&c.doc_id) {
+                let ws = match Uuid::parse_str(&c.doc_id) {
+                    Ok(id) => crate::workspaces::resolve_conn(&self.conn, id)?.map(|w| w.to_string()),
+                    Err(_) => None,
+                };
+                resolved.insert(c.doc_id.clone(), ws);
+            }
+            doc.workspace_id = resolved[&c.doc_id].clone();
+        }
         Ok(ChangePage { seq: self.latest_change_seq()?, changes, more })
     }
 
