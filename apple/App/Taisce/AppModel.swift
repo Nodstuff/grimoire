@@ -33,7 +33,7 @@ final class AppModel {
     /// whether the cache has delivered the tree at least once
     private(set) var treeLoaded = false
     var lastError: String?
-    let dueAlerts = NotificationCoordinator()
+    let dueAlerts: NotificationCoordinator
     // push: APNs token registration (Push.swift)
     let push = PushRegistrar(store: UserDefaultsPushStore(), environment: PushConfig.environment, appVersion: PushConfig.appVersion())
     /// push: the registrar's queued work (fire-and-forget, never awaited by boot)
@@ -89,7 +89,9 @@ final class AppModel {
     /// rendered blocks by (block id, content hash), shared across doc views
     let renderCache = RenderCache()
 
-    init() {
+    /// `dueAlerts`: tests pass one over a fake notification center.
+    init(dueAlerts: NotificationCoordinator = NotificationCoordinator()) {
+        self.dueAlerts = dueAlerts
         let stored = UserDefaults.standard.string(forKey: Self.serverURLKey).flatMap { ServerConfig.normalizedURL($0)?.absoluteString }
         serverURL = stored.flatMap { ServerURLPolicy.accepts($0) ? $0 : nil } ?? Self.defaultServerURL
     }
@@ -130,7 +132,10 @@ final class AppModel {
         guard authPhase == .signedIn || authPhase == .notRequired else { return }
         await sync?.start()
         startPolling()
-        await dueAlerts.reconcile()
+        // never awaited: the notification center's XPC can stall, and the
+        // launch (or a server switch) must not wait on it
+        let dueAlerts = dueAlerts
+        Task { await dueAlerts.reconcile() }
         refreshWorkspaces() // workspaces
         pushSessionStarted() // push: fire-and-forget
     }
