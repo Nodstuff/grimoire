@@ -172,6 +172,19 @@ resource "aws_iam_role_policy" "backups" {
   policy = data.aws_iam_policy_document.backups.json
 }
 
+data "aws_iam_policy_document" "apns" {
+  statement {
+    actions   = ["ssm:GetParameter", "ssm:GetParameters"]
+    resources = ["arn:aws:ssm:${var.region}:${var.account_id}:parameter/taisce/apns/*"]
+  }
+}
+
+resource "aws_iam_role_policy" "apns" {
+  name   = "taisce-apns-key"
+  role   = aws_iam_role.taisce.id
+  policy = data.aws_iam_policy_document.apns.json
+}
+
 resource "aws_iam_instance_profile" "taisce" {
   name = "taisce-server"
   role = aws_iam_role.taisce.name
