@@ -81,7 +81,8 @@ import Testing
         try await cache.storeDoc(JSONDecoder().decode(DocTree.self, from: Data(json.utf8)))
         let todos = try await cache.todos()
         #expect(todos.map(\.text) == ["pay rent", "done"])
-        #expect(todos.first?.due == Due(year: 2026, month: 10, day: 1, hour: 9, minute: 30))
+        // a pre-UTC wall time, read as UTC
+        #expect(todos.first?.deadlineValue == .at(Deadline.instant("2026-10-01T09:30:00Z")!, isLegacy: true))
     }
 
     @Test func lastSeqRoundTrips() async throws {
@@ -116,13 +117,16 @@ import Testing
 
     @Test func deadlineChangesQueueAndReplay() async throws {
         let cache = try Cache.inMemory()
-        try await cache.enqueueDeadline(date: "2026-10-01", itemID: "0-ab", deadline: Due("2026-10-02 14:30"))
+        try await cache.enqueueDeadline(
+            date: "2026-10-01", itemID: "0-ab", deadline: Deadline.at(Deadline.instant("2026-10-02T13:30:00Z")!),
+            clock: TodoClock(today: "2026-10-01", utcOffset: "+01:00")
+        )
         let server = MockServer { _ in .json(#"{"carried":0,"date":"2026-10-01","doc_id":"t","epoch":3,"items":[],"prev_date":null,"today":"2026-10-01"}"#) }
         try await OutboxReplayer(api: server.client(), cache: cache).replay()
         let sent = try #require(server.requests.first)
         #expect(sent.path == "/api/todo/deadline" && sent.httpMethod == "POST")
         let obj = try #require(try JSONSerialization.jsonObject(with: sent.httpBody ?? Data()) as? [String: String])
-        #expect(obj == ["date": "2026-10-01", "item_id": "0-ab", "deadline": "2026-10-02", "due_time": "14:30"])
+        #expect(obj == ["date": "2026-10-01", "item_id": "0-ab", "deadline": "2026-10-02", "due_at": "2026-10-02T13:30:00Z", "today": "2026-10-01"])
         #expect(try await cache.pendingOutbox().isEmpty)
     }
 

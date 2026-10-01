@@ -102,11 +102,13 @@ public enum TodoParser {
             }
         }
         var deadline: String?
-        // canonical ` · due D[ HH:MM]` — the LAST separator, so a `·` in the text survives
+        // canonical ` · due D` / ` · due DTHH:MMZ` (legacy ` · due D HH:MM`) —
+        // the LAST separator, so a `·` in the text survives
         if let sep = t.range(of: " · due ", options: .backwards) {
             let cand = String(t[sep.upperBound...]).trimmingCharacters(in: .whitespaces)
-            if let due = Due(cand) {
-                deadline = due.description
+            if let d = Deadline(stored: cand) {
+                // legacy wall times keep their text; the reader treats them as UTC
+                if case .at(_, isLegacy: true) = d { deadline = cand } else { deadline = d.stored }
                 t = String(t[..<sep.lowerBound])
             }
         } else if let clock = t.range(of: "⏰") {
@@ -129,14 +131,12 @@ public enum TodoParser {
         return line.trimmingCharacters(in: .whitespaces)
     }
 
-    /// Open items due on or before `now`'s day, or overdue by time — the
-    /// Today view's "due / overdue" list, soonest first.
+    /// Open items due by the end of the device's today, or overdue — the
+    /// Today view's "due / overdue" list, soonest first. All-day dates are
+    /// local dates; timed ones are instants seen from `timeZone`.
     public static func dueOrOverdue(_ items: [TodoRecord], now: Date = .now, timeZone: TimeZone = .current) -> [TodoRecord] {
-        var endOfToday = Due.today(now: now, in: timeZone)
-        endOfToday.hour = 23
-        endOfToday.minute = 59
-        return items
-            .filter { $0.isOpen && ($0.due.map { $0 <= endOfToday } ?? false) }
-            .sorted { ($0.due ?? endOfToday) < ($1.due ?? endOfToday) }
+        items
+            .filter { $0.isOpen && ($0.deadlineValue?.isDueToday(now: now, in: timeZone) ?? false) }
+            .sorted { ($0.deadlineValue?.sortDate(in: timeZone) ?? .distantFuture) < ($1.deadlineValue?.sortDate(in: timeZone) ?? .distantFuture) }
     }
 }

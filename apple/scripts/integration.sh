@@ -7,13 +7,14 @@
 # Usage: apple/scripts/integration.sh [path to the grimoire checkout]
 #   (default: the main checkout; it needs target/release/grimoire and
 #   target/release/examples/softpasskey, built with
-#   `cargo build --release -p grimoire && cargo build --release -p grimoire --example softpasskey`)
+#   `cargo build --release -p grimoire && cargo build --release -p grimoire --example softpasskey`;
+#   GRIMOIRE_BIN / SOFTPASSKEY_BIN point at binaries built elsewhere)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="${1:-${GRIMOIRE_REPO:-$HOME/personal/knowledge-system}}"
-BIN="$REPO/target/release/grimoire"
-SOFTPASSKEY="$REPO/target/release/examples/softpasskey"
+BIN="${GRIMOIRE_BIN:-$REPO/target/release/grimoire}"
+SOFTPASSKEY="${SOFTPASSKEY_BIN:-$REPO/target/release/examples/softpasskey}"
 LOCAL_PORT=7515
 SERVER_PORT=7516
 

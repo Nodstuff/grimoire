@@ -82,7 +82,8 @@ import Testing
         let due = try await server.client().todoDue(until: "2026-10-01")
         #expect(server.requests[0].path == "/api/todo/due" && server.requests[0].query == ["until": "2026-10-01"])
         #expect(due.items.map(\.id) == ["2026-09-30/0-ab", "2026-10-01/1-cd"])
-        #expect(due.items[0].due == Due(year: 2026, month: 10, day: 1, hour: 10, minute: 0))
+        // the pre-UTC shape: the wall time is read as UTC
+        #expect(due.items[0].deadlineValue == .at(Deadline.instant("2026-10-01T10:00:00Z")!, isLegacy: true))
         #expect(due.items[1].due?.hasTime == false && due.items[1].carriedFrom == "2026-09-29")
     }
 
@@ -101,17 +102,17 @@ import Testing
         }
     }
 
-    @Test func deadlineBodySplitsDateAndTime() throws {
-        func body(_ d: Due?) throws -> [String: Any] {
-            let data = try JSONEncoder().encode(APIClient.DeadlineBody(date: "2026-10-01", itemID: "0-ab", deadline: d))
+    @Test func deadlineBodyIsAllDayOrAnInstant() throws {
+        func body(_ d: Deadline?) throws -> [String: Any] {
+            let data = try JSONEncoder().encode(APIClient.DeadlineBody(date: "2026-10-01", itemID: "0-ab", deadline: d, clock: TodoClock(today: "2026-10-01", utcOffset: "+01:00")))
             return try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
         }
-        let timed = try body(Due("2026-10-02 14:30"))
-        #expect(timed["deadline"] as? String == "2026-10-02" && timed["due_time"] as? String == "14:30")
-        let dateOnly = try body(Due("2026-10-02"))
-        #expect(dateOnly["deadline"] as? String == "2026-10-02" && dateOnly["due_time"] == nil)
+        let timed = try body(.at(Deadline.instant("2026-10-02T13:30:00Z")!))
+        #expect(timed["due_at"] as? String == "2026-10-02T13:30:00Z" && timed["due_time"] == nil)
+        let dateOnly = try body(.allDay("2026-10-02"))
+        #expect(dateOnly["deadline"] as? String == "2026-10-02" && dateOnly["due_at"] == nil)
         let cleared = try body(nil)
-        #expect(cleared["deadline"] is NSNull && cleared.keys.contains("deadline"))
+        #expect(cleared["deadline"] is NSNull && cleared["due_at"] == nil && cleared["today"] as? String == "2026-10-01")
     }
 
     @Test func todoDayDecodes() async throws {
