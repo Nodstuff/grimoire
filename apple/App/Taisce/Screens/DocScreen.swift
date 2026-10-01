@@ -11,6 +11,7 @@ struct DocScreen: View {
     @State private var page: DocPage?
     @State private var loadError: String?
     @State private var overrides: [BlockID: [Int: Bool]] = [:]
+    @State private var movingWorkspace = false // workspaces
 
     var body: some View {
         let doc = model.index.byID[docID]
@@ -24,8 +25,11 @@ struct DocScreen: View {
             overrides: overrides,
             onToggle: toggle,
             onTogglePin: { model.togglePin(docID) },
-            onRetry: { Task { await refresh(force: true) } }
+            onRetry: { Task { await refresh(force: true) } },
+            workspace: model.workspaceBadge(for: docID),
+            onMoveWorkspace: model.hasWorkspaces ? { movingWorkspace = true } : nil
         )
+        .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
         .environment(\.openURL, OpenURLAction { url in
             if let target = InlineMarkdown.wikiTarget(url) {
                 if let doc = model.index.doc(titled: target) { router.open(.doc(doc.id)) }
@@ -103,11 +107,15 @@ struct DocContent: View {
     var onToggle: ((BlockID, Int, Bool) -> Void)?
     var onTogglePin: () -> Void = {}
     var onRetry: () -> Void = {}
+    // workspaces: the header chip and the … menu's "Move to workspace…"
+    var workspace: WorkspaceBadge?
+    var onMoveWorkspace: (() -> Void)?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 VStack(alignment: .leading, spacing: 10) {
+                    if let workspace { WorkspaceChip(badge: workspace) }
                     Text(title)
                         .font(Theme.serif(.largeTitle))
                         .foregroundStyle(Theme.text)
@@ -146,6 +154,9 @@ struct DocContent: View {
             ToolbarItem(placement: .primaryAction) {
                 Menu {
                     Button(pinned ? "Unpin from Today" : "Pin to Today", systemImage: pinned ? "pin.slash" : "pin", action: onTogglePin)
+                    if let onMoveWorkspace {
+                        Button("Move to workspace\u{2026}", systemImage: "square.stack", action: onMoveWorkspace)
+                    }
                 } label: {
                     Image(systemName: "ellipsis")
                 }

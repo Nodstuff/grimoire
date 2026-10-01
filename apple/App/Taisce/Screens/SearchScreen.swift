@@ -7,6 +7,8 @@ struct SearchScreen: View {
     @Environment(Router.self) private var router
     @State private var state: SearchState?
     @State private var tag: String?
+    /// workspaces: false = this workspace only
+    @State private var everywhere = false
     /// the iPad sidebar has its own field; the detail then shows results only
     var showsField = true
 
@@ -17,9 +19,10 @@ struct SearchScreen: View {
             state: state,
             tag: $tag,
             showsField: showsField,
+            everywhere: model.hasWorkspaces ? $everywhere : nil,
             onOpen: { router.open(.doc($0)) }
         )
-        .task(id: router.searchQuery) {
+        .task(id: SearchKey(query: router.searchQuery, everywhere: everywhere, workspace: model.currentWorkspace)) {
             try? await Task.sleep(for: .milliseconds(250)) // debounce typing
             guard !Task.isCancelled else { return }
             let q = router.searchQuery
@@ -27,7 +30,7 @@ struct SearchScreen: View {
                 state = nil
                 return
             }
-            let found = await model.search(q)
+            let found = await model.search(q, everywhere: everywhere)
             guard !Task.isCancelled else { return }
             state = found
             if tag.map({ !found.tags.contains($0) }) ?? false { tag = nil }
@@ -37,6 +40,12 @@ struct SearchScreen: View {
     }
 }
 
+private struct SearchKey: Hashable {
+    var query: String
+    var everywhere: Bool
+    var workspace: WorkspaceScope?
+}
+
 struct SearchContent: View {
     @Binding var query: String
     /// nil = no query yet
@@ -44,6 +53,8 @@ struct SearchContent: View {
     @Binding var tag: String?
     var showsField = true
     var autofocus = true
+    /// workspaces: the "This workspace · Everywhere" chip (nil = no workspaces)
+    var everywhere: Binding<Bool>?
     var onOpen: (DocID) -> Void = { _ in }
     @FocusState private var focused: Bool
 
@@ -65,6 +76,7 @@ struct SearchContent: View {
                         }
                     }
                 } else if let state {
+                    if everywhere != nil { chips(state) }
                     EmptyCard(icon: "magnifyingglass", title: "No matches for \u{201C}\(query)\u{201D}",
                               hint: state.offline ? "You're offline: only docs on this device were searched." : "Try fewer words, or a word from the title.")
                 } else {
@@ -112,6 +124,11 @@ struct SearchContent: View {
     private func chips(_ state: SearchState) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                if let everywhere {
+                    FilterChip(title: "This workspace", selected: !everywhere.wrappedValue) { everywhere.wrappedValue = false }
+                    FilterChip(title: "Everywhere", selected: everywhere.wrappedValue) { everywhere.wrappedValue = true }
+                    Divider().frame(height: 18)
+                }
                 FilterChip(title: "All", selected: tag == nil) { tag = nil }
                 ForEach(state.tags, id: \.self) { t in
                     FilterChip(title: "#\(t)", selected: tag == t) { tag = tag == t ? nil : t }

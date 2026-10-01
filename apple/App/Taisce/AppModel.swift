@@ -60,6 +60,17 @@ final class AppModel {
     /// overdue + due today, for the iPad sidebar's Today badge
     private(set) var dueCount = 0
 
+    // workspaces (Workspaces.swift): Today, Library, Pinned, To-dos and
+    // search show the current one; alerts span them all
+    var workspaces: [Workspace] = []
+    /// the server answered `GET /api/workspaces` (older daemons: no switcher, no filter)
+    var workspacesSupported = false
+    /// the last workspace chosen on this device, per server
+    var storedWorkspace: WorkspaceScope?
+    /// cached docs resolving to no workspace (Unsorted shows only while > 0)
+    private(set) var unsortedDocCount = 0
+    @ObservationIgnored var workspacesTask: Task<Void, Never>?
+
     // local state
     private(set) var pins: [DocID] = []
     private(set) var editMeta: [DocID: EditMeta] = [:]
@@ -118,6 +129,7 @@ final class AppModel {
         await sync?.start()
         startPolling()
         await dueAlerts.reconcile()
+        refreshWorkspaces() // workspaces
         pushSessionStarted() // push: fire-and-forget
     }
 
@@ -235,6 +247,7 @@ final class AppModel {
             self.sync = sync
             dueAlerts.connect(cache: cache, api: api, sync: sync)
             pins = UserDefaults.standard.stringArray(forKey: pinsKey) ?? []
+            await loadCachedWorkspaces(cache) // workspaces
             editMeta = [:]
             treeLoaded = false
             await sync.setAlwaysFetch(Set(pins))
@@ -260,11 +273,14 @@ final class AppModel {
 
     private func treeChanged(_ records: [DocRecord]) async {
         let docs = records.map(DocInfo.init)
+        let unsorted = docs.count { $0.workspaceID == nil }
+        let scope = WorkspacePicker(workspaces: workspaces, unsortedCount: unsorted, stored: storedWorkspace, enabled: hasWorkspaces).current
         // the outline is O(n log n) over the whole tree: build it off the main actor
-        let (index, library) = await Task.detached { (DocIndex(docs), LibraryNode.build(docs)) }.value
+        let (index, library) = await Task.detached { (DocIndex(docs), LibraryNode.build(WorkspaceFilter.docs(docs, in: scope))) }.value
         self.docs = docs
         self.index = index
         self.library = library
+        unsortedDocCount = unsorted
         treeLoaded = true
         observeTodoDoc()
     }
@@ -290,6 +306,8 @@ final class AppModel {
     private func synced(_ u: SyncUpdate) {
         lastSynced = .now
         if u.treeChanged || u.docIDs.contains(where: { $0 == todoDocID }) { todoRevision += 1 }
+        // a label change journals tree rows: names and counts may have moved
+        if u.treeChanged { refreshWorkspaces() }
         for id in u.docIDs { editMeta[id] = nil }
     }
 
@@ -350,8 +368,28 @@ final class AppModel {
 
     // MARK: docs
 
+    /// The current workspace's To-do doc (legacy: the root one).
     var todoDocID: DocID? {
-        docs.first { $0.parentID == nil && $0.title == TodoParser.todoDocTitle }?.id
+        WorkspaceFilter.todoDoc(in: docs, index: index, scope: currentWorkspace)
+    }
+
+    /// Switch workspace: remembered per server, and every screen re-reads.
+    func selectWorkspace(_ scope: WorkspaceScope) {
+        storedWorkspace = scope
+        WorkspacePreference(key: workspaceKey).save(scope)
+        workspaceDidChange()
+    }
+
+    /// The current workspace moved (a choice, or the stored one vanished).
+    func workspaceDidChange() {
+        library = LibraryNode.build(WorkspaceFilter.docs(docs, in: currentWorkspace))
+        observeTodoDoc()
+        todoRevision += 1
+    }
+
+    var workspaceKey: String {
+        let url = URL(string: serverURL)
+        return "workspace-\(url?.host() ?? "server")-\(url?.port ?? 0)"
     }
 
     /// Who last edited the doc, from its ledger; cached until the doc changes.
@@ -389,12 +427,15 @@ final class AppModel {
     /// computed on the device), today's undated ones from the cached To-do doc. Offline,
     /// both come from the cache. Never the day read (a GET for today carries items forward).
     func loadTodos(now: Date = .now) async -> (board: TodoBoard, offline: Bool) {
-        let cached = (try? await cache?.todos()) ?? []
+        // this workspace's list only
+        let scope = currentWorkspace
+        var cached: [TodoRecord] = []
+        if let id = todoDocID, let cache { cached = (try? await cache.todos(in: id)) ?? [] }
         let today = TodoClock(now: now).today
         let undated = cached.filter { $0.isOpen && $0.date == today && $0.due == nil }.map { TodoEntry($0, now: now) }
         var dated: [TodoEntry]
         var offline = false
-        if let api, let list = try? await api.todoDue() {
+        if let api, let list = try? await api.todoDue(workspace: scope) {
             dated = list.items.map(TodoEntry.init)
         } else {
             offline = true
@@ -413,7 +454,7 @@ final class AppModel {
 
     func markDone(_ e: TodoEntry) async {
         await queue(settling: e) { cache in
-            try await cache.enqueueTodoToggle(date: e.date, itemID: e.itemID, done: true)
+            try await cache.enqueueTodoToggle(date: e.date, itemID: e.itemID, done: true, clock: todoClock())
         }
     }
 
@@ -421,7 +462,7 @@ final class AppModel {
     func snooze(_ e: TodoEntry, _ s: Snooze) async {
         guard let due = s.deadline(), let deadline = Deadline.local(due) else { return }
         await queue(settling: e) { cache in
-            try await cache.enqueueDeadline(date: e.date, itemID: e.itemID, deadline: deadline)
+            try await cache.enqueueDeadline(date: e.date, itemID: e.itemID, deadline: deadline, clock: todoClock())
         }
     }
 
@@ -429,7 +470,7 @@ final class AppModel {
     func addTodo(_ text: String) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        let clock = TodoClock()
+        let clock = todoClock()
         await queue(settling: nil) { cache in
             try await cache.enqueueTodoAdd(date: clock.today, text: trimmed, clock: clock)
         }
@@ -439,12 +480,12 @@ final class AppModel {
     /// block edit (the to-do routes keep the doc's canonical form).
     func setTodoDone(date: String, position: Int, done: Bool) async throws {
         guard let cache else { return }
-        guard let record = try await cache.todos().first(where: { $0.date == date && $0.position == position }) else {
+        guard let todoDocID, let record = try await cache.todos(in: todoDocID).first(where: { $0.date == date && $0.position == position }) else {
             throw TodoWriteError.notFound
         }
         let itemID = TodoEntry(record).itemID
         await queue(settling: nil) { cache in
-            try await cache.enqueueTodoToggle(date: date, itemID: itemID, done: done)
+            try await cache.enqueueTodoToggle(date: date, itemID: itemID, done: done, clock: todoClock())
         }
     }
 
@@ -472,16 +513,21 @@ final class AppModel {
     /// Server search, falling back to the offline FTS index when the server
     /// can't be reached. Tags come from cached frontmatter (`fillTags` fetches
     /// the rest).
-    func search(_ query: String) async -> SearchState {
+    /// The current workspace's docs unless `everywhere`.
+    func search(_ query: String, everywhere: Bool = false) async -> SearchState {
         let q = query.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return SearchState() }
+        let scope = everywhere ? nil : currentWorkspace
         var hits: [(block: BlockID, doc: DocID, title: String, content: String)] = []
         var offline = false
-        if let api, let found = try? await api.search(q) {
+        if let api, let found = try? await api.search(q, workspace: scope) {
             hits = found.map { ($0.block.id, $0.block.docID, $0.docTitle, $0.block.content) }
         } else if let cache, let found = try? await cache.searchBlocks(q) {
             offline = true
-            hits = found.map { ($0.id, $0.docID, index.byID[$0.docID]?.title ?? "", $0.content) }
+            let index = index
+            hits = found
+                .filter { WorkspaceFilter.keeps(index.byID[$0.docID], scope: scope) }
+                .map { ($0.id, $0.docID, index.byID[$0.docID]?.title ?? "", $0.content) }
         }
         var tags: [DocID: [String]] = [:]
         for id in Set(hits.map(\.doc)) { tags[id] = await cachedTags(id) }

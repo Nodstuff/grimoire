@@ -6,13 +6,20 @@ struct LibraryScreen: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        LibraryContent(
-            nodes: model.library,
-            loaded: model.treeLoaded,
-            pins: Set(model.pins),
-            onTogglePin: model.togglePin
-        )
-        .refreshable { try? await model.sync?.catchUp() }
+        // workspaces: an empty workspace says so; the bar switches and triages
+        if let empty = model.workspaceEmptyState, model.treeLoaded, model.library.isEmpty {
+            WorkspaceEmptyView(state: empty).refreshable { try? await model.sync?.catchUp() }
+        } else {
+            LibraryContent(
+                nodes: model.library,
+                loaded: model.treeLoaded,
+                pins: Set(model.pins),
+                onTogglePin: model.togglePin
+            )
+            .refreshable { try? await model.sync?.catchUp() }
+            .safeAreaInset(edge: .top, spacing: 0) { WorkspaceBar(triage: true) }
+            .modifier(WorkspaceMoveHost())
+        }
     }
 }
 
@@ -71,6 +78,7 @@ struct LibraryTreeRows: View {
     let pins: Set<DocID>
     @Binding var expanded: Set<DocID>?
     let onTogglePin: (DocID) -> Void
+    @Environment(\.moveToWorkspace) private var moveToWorkspace
 
     var body: some View {
         ForEach(nodes) { node in
@@ -105,6 +113,9 @@ struct LibraryTreeRows: View {
         .contextMenu {
             Button(pins.contains(node.id) ? "Unpin from Today" : "Pin to Today",
                    systemImage: pins.contains(node.id) ? "pin.slash" : "pin") { onTogglePin(node.id) }
+            if let moveToWorkspace {
+                Button("Move to workspace\u{2026}", systemImage: "square.stack") { moveToWorkspace(node.id) }
+            }
         }
     }
 }

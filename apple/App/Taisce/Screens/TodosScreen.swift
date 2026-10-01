@@ -28,6 +28,7 @@ struct TodosScreen: View {
                 Task { await model.addTodo(text) }
             }
         )
+        .safeAreaInset(edge: .top, spacing: 0) { WorkspaceBar() } // workspaces
         .refreshable { await reload() }
         .task(id: model.todoRevision) { await reload() }
         .task { await model.dueAlerts.refresh() }

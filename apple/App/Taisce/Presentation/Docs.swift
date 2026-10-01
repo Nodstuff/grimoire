@@ -7,16 +7,19 @@ struct DocInfo: Identifiable, Hashable, Sendable {
     var parentID: DocID?
     var title: String
     var sortKey: String?
+    /// resolved workspace (nil = Unsorted)
+    var workspaceID: WorkspaceID?
 
-    init(id: DocID, parentID: DocID? = nil, title: String, sortKey: String? = nil) {
+    init(id: DocID, parentID: DocID? = nil, title: String, sortKey: String? = nil, workspaceID: WorkspaceID? = nil) {
         self.id = id
         self.parentID = parentID
         self.title = title
         self.sortKey = sortKey
+        self.workspaceID = workspaceID
     }
 
     init(_ r: DocRecord) {
-        self.init(id: r.id, parentID: r.parentID, title: r.title, sortKey: r.sortKey)
+        self.init(id: r.id, parentID: r.parentID, title: r.title, sortKey: r.sortKey, workspaceID: r.workspaceID)
     }
 }
 

@@ -12,7 +12,7 @@ struct TodayScreen: View {
         TodayContent(
             dayLine: RelativeTime.dayLine(),
             due: TodoBoard.shown(board, hasSynced: model.hasSynced, status: model.syncStatus)?.due,
-            pinned: DocCardModel.pinned(model.pins, index: model.index, meta: model.editMeta),
+            pinned: DocCardModel.pinned(model.workspacePins, index: model.index, meta: model.editMeta),
             badge: SyncBadge.make(status: model.syncStatus, pending: model.pendingWrites),
             onSearch: router.showSearch,
             onSettings: { router.showSettings = true },
@@ -20,6 +20,7 @@ struct TodayScreen: View {
             onOpen: { router.open(.doc($0)) },
             onUnpin: model.togglePin
         )
+        .safeAreaInset(edge: .top, spacing: 0) { WorkspaceBar() } // workspaces
         .refreshable { await reload() }
         .task(id: model.todoRevision) { await reload() }
         .task(id: model.pins) {

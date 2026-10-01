@@ -53,6 +53,9 @@ final class NotificationCoordinator: DueAlertPermission {
     @ObservationIgnored private var lastReconcile: Task<Void, Never>?
     /// what the last reconcile planned from, re-planned after an action
     @ObservationIgnored private var lastInputs: [DueAlertInput] = []
+    /// which workspace's list each planned item ("day/item") is on, so an
+    /// action writes to the right list (absent = the legacy list)
+    @ObservationIgnored private(set) var lists: [String: WorkspaceScope] = [:]
     @ObservationIgnored private var timeZoneObserver: (any NSObjectProtocol)?
 
     init(
@@ -113,17 +116,43 @@ final class NotificationCoordinator: DueAlertPermission {
 
     private func touchesTodoDoc(_ update: SyncUpdate) async -> Bool {
         if update.treeChanged { return true }
-        guard let cache, let docs = try? await cache.docs(), let id = Library.todoDocID(in: docs) else { return false }
-        return update.docIDs.contains(id)
+        guard let cache, let docs = try? await cache.docs() else { return false }
+        return !update.docIDs.isDisjoint(with: Library.todoDocIDs(in: docs))
     }
 
     // MARK: reconcile
 
-    /// From the cached To-do doc.
+    /// Every workspace's list: the server's due list read with no
+    /// `workspace` (all lists), else every cached To-do doc.
     func reconcile() async {
-        guard let cache, let records = try? await cache.todos() else { return }
         let tz = timeZone()
+        if let api, let list = try? await api.todoDue() {
+            lists = Self.lists(list)
+            await reconcile(with: list.items.compactMap { DueAlertInput($0, timeZone: tz) })
+            return
+        }
+        guard let cache, let records = try? await cache.todos() else { return }
+        let docs = (try? await cache.docs()) ?? []
+        lists = Self.lists(records, docs: docs)
         await reconcile(with: records.compactMap { DueAlertInput($0, timeZone: tz) })
+    }
+
+    /// Items from a daemon with workspaces name their list's workspace.
+    nonisolated static func lists(_ list: TodoDueList) -> [String: WorkspaceScope] {
+        var out: [String: WorkspaceScope] = [:]
+        for item in list.items where item.docID != nil { out[item.id] = WorkspaceScope(item.workspaceID) }
+        return out
+    }
+
+    nonisolated static func lists(_ records: [TodoRecord], docs: [DocRecord]) -> [String: WorkspaceScope] {
+        guard docs.contains(where: { $0.workspaceID != nil }) else { return [:] }
+        let ws = Dictionary(docs.map { ($0.id, $0.workspaceID) }, uniquingKeysWith: { a, _ in a })
+        var out: [String: WorkspaceScope] = [:]
+        for r in records {
+            guard let resolved = ws[r.docID] else { continue }
+            out["\(r.date)/\(DueAlertInput.serverItemID(position: r.position, text: r.text))"] = WorkspaceScope(resolved)
+        }
+        return out
     }
 
     /// Make the pending `todo:` requests match the plan for `inputs`:
@@ -162,16 +191,17 @@ final class NotificationCoordinator: DueAlertPermission {
         }
         let id = "\(day)/\(itemID)"
         let tz = timeZone()
+        let clock = TodoClock().in(lists[id])
         do {
             switch action {
             case .done:
-                try await cache.enqueueTodoToggle(date: day, itemID: itemID, done: true)
+                try await cache.enqueueTodoToggle(date: day, itemID: itemID, done: true, clock: clock)
                 overrides[id] = .done
             case .snooze:
                 // to the minute (what the server stores), from the instant:
                 // a wall time is ambiguous in the repeated October hour
                 let at = Date(timeIntervalSince1970: (now().timeIntervalSince1970 / 60).rounded(.down) * 60 + 3600)
-                try await cache.enqueueDeadline(date: day, itemID: itemID, deadline: Deadline.at(at))
+                try await cache.enqueueDeadline(date: day, itemID: itemID, deadline: Deadline.at(at), clock: clock)
                 overrides[id] = .snoozed(at)
             case .tomorrow:
                 var cal = Calendar(identifier: .gregorian)
@@ -181,7 +211,7 @@ final class NotificationCoordinator: DueAlertPermission {
                 due.hour = DueAlertPlanner.allDayHour
                 due.minute = 0
                 guard let deadline = Deadline.local(due, in: tz), let at = deadline.alertDate(in: tz) else { return }
-                try await cache.enqueueDeadline(date: day, itemID: itemID, deadline: deadline)
+                try await cache.enqueueDeadline(date: day, itemID: itemID, deadline: deadline, clock: clock)
                 overrides[id] = .snoozed(at)
             }
         } catch {
