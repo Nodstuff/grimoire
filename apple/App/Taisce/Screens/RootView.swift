@@ -33,6 +33,9 @@ struct RootView: View {
             appliedLaunchArguments = true
             router.applyLaunchArguments(index: model.index)
         }
+        .onChange(of: model.docs.count) {
+            if appliedLaunchArguments { _ = router.openLaunchDoc(index: model.index) }
+        }
     }
 }
 

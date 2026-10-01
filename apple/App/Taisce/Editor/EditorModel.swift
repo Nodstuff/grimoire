@@ -79,6 +79,12 @@ final class EditorModel {
 
     var items: [EditorSession.Item] { session.items }
 
+    /// Every block's content as typed (the session plus unfolded keystrokes).
+    var snapshot: [EditorBlockContent] { session.items.map { live[$0.id] ?? $0.content } }
+
+    /// The block the last structure change or move sent the caret to.
+    @ObservationIgnored private(set) var focusTarget: BlockID?
+
     func start() {
         observeTask = Task { [weak self, cache, docID] in
             do {
@@ -190,6 +196,7 @@ final class EditorModel {
         guard let change else { return }
         if let req = change.request { enqueue(req, coalescing: false) }
         let rev = session.item(change.focus)?.revision ?? 0
+        focusTarget = change.focus
         pendingFocus = FocusRequest(id: change.focus, caret: change.caret, revision: rev)
         // a block that keeps its view (no reload) takes the caret now
         if let c = coordinators[change.focus]?.c, !change.reload.contains(change.focus) {
@@ -268,6 +275,7 @@ final class EditorModel {
         guard session.items.indices.contains(j) else { return }
         let target = session.items[j]
         let caret = by < 0 ? EditorCommands.endCaret(target.content) : .start
+        focusTarget = target.id
         pendingFocus = FocusRequest(id: target.id, caret: caret, revision: target.revision)
         if let c = coordinators[target.id]?.c { pendingFocus = nil; c.focus(caret) }
     }

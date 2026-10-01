@@ -232,34 +232,72 @@ doc, and on a time zone change. Actions queue through the outbox
 (`enqueueToggle`, `enqueueDeadline`), so they work offline; the answer is
 held locally until a sync shows it, so the old alert doesn't come back.
 
-## Editing (groundwork, no UI)
+## Editing
 
-`DocEditor` holds one doc's blocks (the cached body plus every queued,
-unsent propose for it: `Cache.editor(for:)`) and turns `BlockEdit`s into
-`BlockOp`s for `POST /api/propose`:
+**Edit** on a doc (not canvases or mirrors) swaps the reading view for one
+`UITextView` (TextKit 2) per block; **Done** saves and goes back. The nav bar
+chip says what happened: Saved · Saving… · Offline · N pending · Doc is open
+in a live session · will retry · Waiting for review (amber = applied and
+flagged, rose = parked) · N edits not saved (refused; tap to retry, never dropped).
 
-| `BlockEdit` | ops |
-|---|---|
-| `.replaceText(id, text)` | `replace` (the server retypes it from the markdown) |
-| `.insert(after:parent:type:content:id:)` | `insert` with a client-minted UUID and an order key between the neighbours |
-| `.delete(id)` | `delete` for the subtree, children first (the server does not cascade) |
-| `.move(id, after:parent:)` | `move` with a new order key; refuses cycles |
+Model (TaisceKit `Edit/`):
 
-`OrderKey` is a port of `crates/store/src/order_key.rs`, tested against the
-store's shared vectors. `Cache.enqueue(_:on:)` queues one propose per call
-(its `request_id` is the outbox idempotency key) and folds it into the
-editor. `OutboxReplayer` sends in order; when a propose lands at epoch N,
-queued proposes for the same doc still based on the old epoch are rebased
-to N, so a chain of offline edits applies green instead of scoring as stale
-against our own writes. A live (hot) session's refusal keeps the queue for
-later.
+- `InlineCodec`: inline markdown ↔ `AttributedString` with Taisce attributes
+  (`taisceMarks` bold/italic/code/strike, `taisceLink`, `taisceWiki` = the
+  text between `[[ ]]`, alias and `#^ref` included). `parse` returns nil for
+  anything it can't hold exactly (images, HTML, hard breaks, titled links).
+  `serialize` is canonical (`**`, `*`, `~~`, minimal escapes) and checks
+  itself by re-parsing. Parsing uses `.disableSmartOpts` (no curly quotes).
+- `EditorBlockContent`: paragraph / heading / quote / list (items with
+  `ListPrefix`: depth, bullet or number, task box) / raw. A block is shown
+  structured only when its canonical form parses to the same document
+  (`sameMeaning`); otherwise it is edited as raw markdown source (code,
+  mermaid/vega/d2, tables, callouts, frontmatter, anything unusual). An
+  untouched block is never written; an edited one is written canonically.
+- `EditorCommands`: Return (split, new list item, leave a list on an empty
+  item, ```` ``` ```` + Return = code block), Backspace at the start (heading/quote/list item
+  → text, nested item → outdent, paragraph → merge into the block above),
+  shortcuts at a block's start (`# `…`###### `, `- `/`* `/`+ `, `1. `, `[ ] `, `> `),
+  indent/outdent, block kinds, to-do toggle.
+- `EditorSession`: the visible blocks over a `DocEditor`. Structure changes
+  become one propose at once (a block after a heading becomes its first
+  child; a merged-away block hands its children to its parent first).
+  Text is committed on demand. `refresh` takes a server change without
+  touching the focused or unsaved blocks; a block the server changed under
+  you is proposed on its older epoch (the gate scores the conflict instead
+  of it silently winning), one it deleted comes back as a draft insert.
+- Saving: `SaveScheduler` debounces 600 ms per block; leaving a block,
+  structure changes, Done and backgrounding flush. `Cache.enqueueCoalescing`
+  rewrites the newest never-sent replace of the same block instead of
+  queueing another. `Cache.enqueue` moves a propose's base up past our own
+  landed writes (`base → base+1`, recorded in the outbox's new `outcome`
+  column). The replayer claims rows atomically (`claimOutbox`).
+- Review marks: `Cache.reviews(for:openOps:)` from landed outcomes (newest per
+  block; green clears), filtered by the doc's open queue
+  (`APIClient.openReviewOps`, `GET /api/doc/{id}/review`) when online.
+- `[[` completion: `WikiCompletion.query/rank/target` (titles and
+  breadcrumbs, diacritic-folded, `Folder/Title` when titles clash).
+- New doc: `NewDoc.create` (`POST /api/docs` with a `request_id`; after a
+  lost answer it looks for the doc before trying again, as the REST route
+  doesn't dedupe creates; only MCP `create_doc` does).
+
+App (`App/Taisce/Editor/`): `EditorText` maps content ↔ the text view's
+attributed string (list markers are tagged text the caret skips);
+`BlockTextView` handles Backspace at the start, atomic wikilinks, paste
+(markdown into an empty paragraph becomes blocks), checkbox taps and the
+hardware keys (⌘B ⌘I ⌘E, ⌘K link / `[[`, Tab ⇧Tab, ↑↓ between blocks, Esc);
+`FormattingBar` is the input accessory; `EditorModel` ties it together.
+Queued edits also show in the reading view until they land.
+
+UI test: `EditorUITests` seeds a doc on a LOCAL daemon
+(`TEST_RUNNER_TAISCE_UI_URL`, default `http://127.0.0.1:7518`), edits it
+(type, Return, Backspace-merge, `[[` pick, Done) and checks the daemon's
+markdown. `LaunchTests` needs a doc titled "Welcome" headed "Welcome to Taisce".
 
 ## What's stubbed
 
-- Editing UI: none yet. No optimistic write of queued edits into the cache
-  (the editor overlays them, the doc view does not), and no conflict UI: a
-  stale base (someone else wrote first) comes back scored or red from the
-  gate and is only recorded on the outbox row.
+- Editing: no rich table editing (tables are raw source), no title rename,
+  no drag to reorder blocks, no soft line breaks typed (Return splits).
 - Outbox idempotency: main's daemon keeps `request_id` dedupe in memory for
   120 s (server-identity makes it durable for 7 days). Client-minted insert
   ids make a doubled insert fail instead of duplicating; `replace` and
@@ -267,7 +305,6 @@ later.
 - `propose_markdown` queues are rebased like `propose`, but a stale base is
   an error there (whole-doc diff), so they are not chained.
 - Pins are local (UserDefaults, per server); pinned docs are always fetched by sync.
-- Doc checkboxes toggle through a queued `replace`; the rest of editing is the next pass.
 - Diagrams (Mermaid, Vega-Lite, D2) render as labelled placeholder cards.
 - APNs / background refresh, Mac Catalyst.
 

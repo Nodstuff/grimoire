@@ -12,6 +12,11 @@ final class BlockTextView: UITextView {
         super.deleteBackward()
     }
 
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        handler?.didMoveToWindow()
+    }
+
     override func paste(_ sender: Any?) {
         if handler?.handlePaste() == true { return }
         super.paste(sender)
@@ -200,27 +205,33 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
 
     func focus(_ caret: EditorCaret) {
         guard let tv = textView else { return }
-        if !tv.isFirstResponder { tv.becomeFirstResponder() }
+        if !tv.isFirstResponder, tv.window != nil { tv.becomeFirstResponder() }
         setCaret(caret)
         updateTyping()
         model.caretMoved(self)
     }
 
+    /// a caret was asked for before the view was on screen
+    private var wantsKeyboard: EditorCaret?
+
+    /// Take the caret the model asked for, once this view shows the
+    /// revision it refers to. Consumed once; the keyboard follows when the
+    /// view reaches a window.
     func applyPendingFocus() {
-        guard let f = model.pendingFocus, f.id == id, f.revision <= revision, textView?.window != nil else {
-            if model.pendingFocus?.id == id {
-                DispatchQueue.main.async { [weak self] in self?.applyPendingFocusLater() }
-            }
+        guard let f = model.pendingFocus, f.id == id, f.revision <= revision, let tv = textView else { return }
+        model.pendingFocus = nil
+        if tv.window == nil {
+            setCaret(f.caret)
+            wantsKeyboard = f.caret
             return
         }
-        model.pendingFocus = nil
         focus(f.caret)
     }
 
-    private func applyPendingFocusLater() {
-        guard let f = model.pendingFocus, f.id == id, textView?.window != nil else { return }
-        model.pendingFocus = nil
-        focus(f.caret)
+    func didMoveToWindow() {
+        guard let caret = wantsKeyboard, textView?.window != nil else { return }
+        wantsKeyboard = nil
+        focus(caret)
     }
 
     var caretOnFirstLine: Bool {

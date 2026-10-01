@@ -83,13 +83,24 @@ final class Router {
         default: break
         }
         if let q = d.string(forKey: "searchQuery") { searchQuery = q }
-        if let title = d.string(forKey: "openDoc"), let doc = index.doc(titled: title) {
-            if isPad {
-                padItem = .doc(doc.id)
-            } else {
-                open(.doc(doc.id))
-            }
-        }
+        _ = openLaunchDoc(index: index)
         if d.bool(forKey: "showSettings") { showSettings = true }
+    }
+
+    private var openedLaunchDoc = false
+
+    /// `-openDoc <title>`, once the tree has it (a doc made just before
+    /// launch arrives with the first sync, after the cached tree). True
+    /// when there is nothing (left) to open.
+    func openLaunchDoc(index: DocIndex) -> Bool {
+        guard !openedLaunchDoc, let title = UserDefaults.standard.string(forKey: "openDoc") else { return true }
+        guard let doc = index.doc(titled: title) else { return false }
+        openedLaunchDoc = true
+        if isPad {
+            padItem = .doc(doc.id)
+        } else {
+            open(.doc(doc.id))
+        }
+        return true
     }
 }
