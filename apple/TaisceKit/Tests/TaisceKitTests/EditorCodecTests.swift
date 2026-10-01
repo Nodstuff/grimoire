@@ -194,6 +194,15 @@ import Testing
         }
     }
 
+    @Test func headingEndingInHashesKeepsThem() {
+        for text in ["Issue #", "Sharp ##", "#", "C#"] {
+            let h = EditorBlockContent.heading(level: 2, AttributedString(text))
+            #expect(EditorBlockContent.parse(markdown: h.markdown) == h, "\(text) → \(h.markdown)")
+        }
+        #expect(EditorBlockContent.heading(level: 1, AttributedString("Issue #")).markdown == "# Issue \\#")
+        #expect(EditorBlockContent.heading(level: 1, AttributedString("C#")).markdown == "# C#")
+    }
+
     @Test func blockKinds() throws {
         #expect(EditorBlockContent.parse(markdown: "## Two") == .heading(level: 2, AttributedString("Two")))
         guard case let .list(items) = EditorBlockContent.parse(markdown: "- a\n  - b\n- [x] c") else {

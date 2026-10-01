@@ -177,6 +177,63 @@ import UIKit
         #expect(req.ops.map(\.kind) == [.replace(target: "b0", content: "abcdef")])
     }
 
+    /// A save is in the outbox before the network answers: a hanging
+    /// replay never holds typed text in memory, and flush (Done) returns.
+    @Test func savesPersistWhileTheNetworkHangs() async throws {
+        let h = try Harness(blocks("a"))
+        let gate = Gate()
+        h.model.replay = { await gate.wait() }
+        h.type("b0", "b", at: 1)
+        await h.model.flush()
+        #expect(try await h.cache.pendingOutbox().count == 1, "written while the first send still hangs")
+        h.type("b0", "c", at: 2)
+        await h.model.flush()
+        let rows = try await h.cache.pendingOutbox()
+        let req = try JSONDecoder().decode(ProposeRequest.self, from: rows.last?.body ?? Data())
+        #expect(req.ops.first?.kind == .replace(target: "b0", content: "abc"))
+        #expect(gate.waiting > 0, "the send really is still hanging")
+        gate.open()
+    }
+
+    /// A sync refresh between a keystroke's commit and its outbox write
+    /// keeps the typed text and the new block.
+    @Test func aRefreshBeforeTheWriteLandsKeepsTypedText() async throws {
+        let h = try Harness(blocks("hello", "other"))
+        try await h.cache.storeDoc(DocTree(doc: DocSummary(id: "d", parentID: nil, title: "D", currentEpoch: 1),
+                                           roots: h.model.session.editor.children(of: nil).map { BlockNode(block: $0) }))
+        // the editor sync would rebuild from: the cache, before our write, with someone else's edit
+        var stale = try #require(try await h.cache.editor(for: "d"))
+        _ = try stale.apply(.replaceText("b1", "other, edited remotely"))
+        h.type("b0", " world", at: 5)
+        h.model.save(["b0"])           // committed, not yet in the outbox
+        h.type("b0", "\n")             // a split: its insert isn't written yet either
+        let newID = try #require(h.model.focusTarget)
+        h.model.applyRemote(stale)
+        #expect(h.markdown == ["hello world", "", "other, edited remotely"])
+        #expect(h.model.session.item(newID)?.isDraft == false, "the new block is not re-inserted")
+        await h.model.flush()
+    }
+
+    /// Mid-composition (an input method's marked text) nothing reshapes
+    /// the block: no shortcut, no reload.
+    @Test func markedTextIsLeftAlone() async throws {
+        let h = try Harness(blocks(""))
+        let tv = h.view("b0")
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.addSubview(tv)
+        tv.frame = CGRect(x: 0, y: 0, width: 300, height: 60)
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        tv.becomeFirstResponder()
+        tv.setMarkedText("## ", selectedRange: NSRange(location: 3, length: 0))
+        let composing = tv.markedTextRange != nil
+        #expect(tv.text == "## ", "the composition is untouched")
+        if composing { #expect(h.model.snapshot == [.paragraph(AttributedString())], "not turned into a heading mid-composition") }
+        tv.unmarkText()
+        tv.resignFirstResponder()
+    }
+
     @Test func chipSaysWhatHappened() {
         let none = DocOutboxState()
         #expect(EditorChip.make(online: true, unsaved: 0, outbox: none, reviews: []).text == "Saved")
@@ -186,5 +243,23 @@ import UIKit
         #expect(EditorChip.make(online: true, unsaved: 0, outbox: none, reviews: [.red]).tone == .conflict)
         #expect(EditorChip.make(online: true, unsaved: 0, outbox: none, reviews: [.yellow]).tone == .review)
         #expect(EditorChip.make(online: true, unsaved: 0, outbox: DocOutboxState(failed: 2), reviews: [.red]).text == "2 edits not saved")
+    }
+}
+
+/// A send that hangs until the test opens it.
+@MainActor final class Gate {
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var isOpen = false
+    var waiting: Int { continuations.count }
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { continuations.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        continuations.forEach { $0.resume() }
+        continuations = []
     }
 }

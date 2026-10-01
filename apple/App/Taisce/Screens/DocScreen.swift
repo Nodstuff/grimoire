@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import TaisceKit
 
 /// Reading view: renders the cached blocks, refreshes them when missing or
@@ -32,7 +33,14 @@ struct DocScreen: View {
         // a sync write drops the cached meta: load it again
         .task(id: MetaKey(doc: docID, missing: model.editMeta[docID] == nil)) { await model.loadEditMeta(docID) }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active, let editor { Task { await editor.flush() } }
+            // finish writing to the outbox even if iOS suspends us mid-flush
+            if phase != .active, let editor {
+                let id = UIApplication.shared.beginBackgroundTask(withName: "editor flush")
+                Task {
+                    await editor.flush()
+                    UIApplication.shared.endBackgroundTask(id)
+                }
+            }
         }
         .onChange(of: editable, initial: true) { _, ok in
             // a doc just created here opens straight into edit mode
@@ -105,11 +113,12 @@ struct DocScreen: View {
     private func finishEditing() async {
         guard let e = editor else { return }
         e.activeCoordinator?.textView?.resignFirstResponder()
+        // only the local write is awaited; sending happens in the background
         await e.flush()
         e.stop()
         editor = nil
-        await model.replayOutbox()
         await reloadPage()
+        Task { await model.replayOutbox() }
     }
 
     private func reloadPage() async {

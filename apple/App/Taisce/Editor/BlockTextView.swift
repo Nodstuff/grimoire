@@ -152,7 +152,8 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
     // MARK: loading
 
     func load(_ item: EditorSession.Item, dynamicType: DynamicTypeSize) {
-        guard let tv = textView else { return }
+        // never replace text under an open composition (the next update retries)
+        guard let tv = textView, tv.markedTextRange == nil else { return }
         content = item.content
         revision = item.revision
         isDraft = item.isDraft
@@ -324,7 +325,9 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
     }
 
     func textViewDidChange(_ textView: UITextView) {
-        guard !reloading, let tv = self.textView else { return }
+        // mid-composition (CJK, dictation) the storage belongs to the input
+        // method: no shortcuts, restyling or reloads until it commits
+        guard !reloading, let tv = self.textView, tv.markedTextRange == nil else { return }
         if content.isRaw {
             content = .raw(tv.text)
             model.textChanged(id, content: content)
@@ -350,7 +353,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
     }
 
     func textViewDidChangeSelection(_ textView: UITextView) {
-        guard !reloading, let tv = self.textView else { return }
+        guard !reloading, let tv = self.textView, tv.markedTextRange == nil else { return }
         // never inside a list marker
         if kind == .list, tv.selectedRange.length == 0 {
             let loc = tv.selectedRange.location
@@ -392,7 +395,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
     }
 
     func syncContent() {
-        guard let tv = textView else { return }
+        guard let tv = textView, tv.markedTextRange == nil else { return }
         content = content.isRaw ? .raw(tv.text) : EditorText.content(from: tv.attributedText, like: content)
         model.textChanged(id, content: content)
     }

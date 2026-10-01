@@ -229,7 +229,15 @@ public enum EditorBlockContent: Hashable, Sendable {
         case let .paragraph(t):
             return InlineCodec.serialize(t)
         case let .heading(level, t):
-            let inline = InlineCodec.serialize(Self.singleLine(t))
+            var inline = InlineCodec.serialize(Self.singleLine(t))
+            // a trailing ` #` run would read as the closing sequence: escape it
+            if inline.hasSuffix("#") {
+                let run = inline.reversed().prefix { $0 == "#" }.count
+                let before = inline.dropLast(run)
+                if before.isEmpty || before.last == " " || before.last == "\t" {
+                    inline = String(before) + "\\" + String(repeating: "#", count: run)
+                }
+            }
             return String(repeating: "#", count: max(1, min(6, level))) + " " + inline
         case let .quote(t):
             let inline = InlineCodec.serialize(t)

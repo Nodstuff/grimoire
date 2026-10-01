@@ -26,6 +26,11 @@ public struct EditorSession: Sendable {
         /// its next save is proposed against this older epoch, so the gate
         /// scores it as a conflict instead of it silently winning
         public var staleBase: Int?
+        /// a conflicted save has gone out: until the server shows this
+        /// block's text as ours (accepted on the desktop), only an explicit
+        /// flush saves it again, still on `staleBase`
+        public var conflictSent = false
+        public var inConflict: Bool { staleBase != nil }
 
         public var isDirty: Bool { isDraft || content.markdown != baseline }
 
@@ -96,15 +101,17 @@ public struct EditorSession: Sendable {
     /// replace per edited block, an insert per draft. Blocks changed
     /// underneath on the server go out in their own propose on the older
     /// epoch (see `staleBase`). Empty when nothing changed.
-    public mutating func commitText(_ ids: Set<BlockID>? = nil) -> [ProposeRequest] {
+    public mutating func commitText(_ ids: Set<BlockID>? = nil, includeConflicts: Bool = false) -> [ProposeRequest] {
         var batch = editor
         var ops: [BlockOp] = []
         var stale: [Int: [BlockOp]] = [:]
         for i in items.indices where ids?.contains(items[i].id) ?? true {
-            guard items[i].isDirty, let edit = textEdit(at: i, in: batch), let o = try? batch.apply(edit) else { continue }
+            guard items[i].isDirty, !(items[i].conflictSent && !includeConflicts) else { continue }
+            guard let edit = textEdit(at: i, in: batch), let o = try? batch.apply(edit) else { continue }
             if let base = items[i].staleBase {
+                // every save of a conflicted block stays on the older epoch
                 stale[base, default: []] += o
-                items[i].staleBase = nil
+                items[i].conflictSent = true
             } else {
                 ops += o
             }
@@ -287,12 +294,18 @@ public struct EditorSession: Sendable {
     public mutating func refresh(_ newEditor: DocEditor, keep: Set<BlockID>) -> Set<BlockID> {
         let oldBase = editor.baseEpoch
         let old = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        let held = Set(items.filter { keep.contains($0.id) || $0.isDirty }.map(\.id))
+        let held = Set(items.filter { keep.contains($0.id) || $0.isDirty || $0.inConflict }.map(\.id))
         var reload: Set<BlockID> = []
         var next: [Item] = []
         for b in Self.visible(newEditor) {
             if var mine = old[b.id], held.contains(b.id) {
-                if b.content != mine.saved, !mine.isDraft {
+                if mine.inConflict, b.content == mine.content.markdown {
+                    // the desktop accepted ours: the conflict is over
+                    mine.staleBase = nil
+                    mine.conflictSent = false
+                    mine.saved = b.content
+                    mine.baseline = b.content
+                } else if b.content != mine.saved, !mine.isDraft {
                     // someone else wrote this block while it was open here
                     if mine.content.markdown != b.content { mine.staleBase = mine.staleBase ?? oldBase }
                     mine.saved = b.content

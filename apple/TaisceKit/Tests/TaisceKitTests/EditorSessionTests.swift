@@ -184,9 +184,29 @@ import Testing
         let reqs = s.commitText()
         #expect(reqs.count == 1 && reqs[0].baseEpoch == 4)
         #expect(reqs[0].ops.map(\.kind) == [.replace(target: "p1", content: "alpha beta, typing")])
-        // later saves are on the new epoch
+        // other blocks save on the new epoch
         s.update("p2", content: p("gamma 2"))
         #expect(s.commitText().first?.baseEpoch == 7)
+        // the conflicted block stays in conflict: no more autosaves...
+        s.update("p1", content: p("alpha beta, typing more"))
+        #expect(s.commitText().isEmpty, "autosave holds a conflicted block")
+        #expect(s.item("p1")?.inConflict == true)
+        // ...and an explicit flush still goes on the old epoch, never silently winning
+        let flushed = s.commitText(includeConflicts: true)
+        #expect(flushed.map(\.baseEpoch) == [4])
+        #expect(flushed.first?.ops.map(\.kind) == [.replace(target: "p1", content: "alpha beta, typing more")])
+        // a refresh that doesn't show our text keeps it, and the conflict
+        var still = s.editor
+        _ = try still.apply(.replaceText("p1", "alpha (their edit)"))
+        s.refresh(DocEditor(docID: "d", baseEpoch: 8, blocks: Array(still.blocks.values)), keep: [])
+        #expect(s.item("p1")?.content == p("alpha beta, typing more") && s.item("p1")?.inConflict == true)
+        // the desktop accepts ours: over
+        var accepted = s.editor
+        _ = try accepted.apply(.replaceText("p1", "alpha beta, typing more"))
+        s.refresh(DocEditor(docID: "d", baseEpoch: 9, blocks: Array(accepted.blocks.values)), keep: [])
+        #expect(s.item("p1")?.inConflict == false)
+        s.update("p1", content: p("after"))
+        #expect(s.commitText().first?.baseEpoch == 9)
     }
 
     @Test func aBlockDeletedRemotelyWhileTypedInBecomesADraft() throws {

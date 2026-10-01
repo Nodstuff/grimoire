@@ -151,6 +151,23 @@ import Testing
         #expect(try await cache.reviews(for: "d1")["p2"] == nil)
     }
 
+    /// Another doc's write must not wake an editor watching this one.
+    @Test func blockObservationIgnoresOtherDocs() async throws {
+        let cache = try Cache.inMemory()
+        try await seed(cache)
+        var it = cache.observeBlocks(of: "d1").makeAsyncIterator()
+        let first = try await it.next()
+        #expect(first?.count == 3)
+        try await cache.storeDoc(DocTree(doc: DocSummary(id: "d2", parentID: nil, title: "Other", currentEpoch: 1), roots: [
+            BlockNode(block: Block(id: "x", docID: "d2", parentID: nil, orderKey: "i", blockType: .paragraph, content: "other")),
+        ]))
+        try await cache.storeDoc(DocTree(doc: DocSummary(id: "d1", parentID: nil, title: "Doc", currentEpoch: 6), roots: [
+            BlockNode(block: Block(id: "h1", docID: "d1", parentID: nil, orderKey: "i", blockType: .heading, content: "# One", epoch: 6)),
+        ]))
+        let next = try await it.next()
+        #expect(next?.map(\.id) == ["h1"], "the next emission is this doc's change, not a repeat")
+    }
+
     @Test func outboxStateForTheChip() async throws {
         let cache = try Cache.inMemory()
         try await cache.enqueue(replace("p1", "one"))

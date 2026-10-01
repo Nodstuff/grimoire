@@ -62,6 +62,7 @@ final class EditorModel {
         self.api = api
         self.app = app
         saver = SaveScheduler(delay: saveDelay) { [weak self] ids in self?.save(ids) }
+        replay = { [weak app] in await app?.replayOutbox() }
         if let index = app?.index {
             candidates = index.docs.filter { $0.id != docID }.map { WikiCandidate(id: $0.id, title: $0.title, breadcrumb: index.breadcrumb(of: $0.id)) }
         }
@@ -156,17 +157,25 @@ final class EditorModel {
     // MARK: saving
 
     /// The debounce ran out for `ids` (or a flush): one propose for them.
-    private func save(_ ids: Set<BlockID>) {
+    /// Blocks in conflict wait for an explicit flush.
+    func save(_ ids: Set<BlockID>) {
         foldLive()
         let reqs = session.commitText(ids)
         unsaved = saver.waiting.count
         for r in reqs { enqueue(r, coalescing: true) }
     }
 
-    /// Writes go out in the order they were made.
+    /// Committed proposes not yet written to the outbox, oldest first: a
+    /// refresh overlays them, so nothing committed is ever rolled back.
+    @ObservationIgnored private(set) var unpersisted: [ProposeRequest] = []
+
+    /// Writes reach the outbox in the order they were made. Only the
+    /// local writes are chained: sending them is a separate, unawaited
+    /// step, so a slow or hanging network never holds a save in memory.
     private func enqueue(_ req: ProposeRequest, coalescing: Bool) {
         let prev = queue
         let cache = cache
+        unpersisted.append(req)
         queue = Task { [weak self] in
             await prev?.value
             do {
@@ -174,18 +183,31 @@ final class EditorModel {
             } catch {
                 self?.lastError = "Couldn't queue the edit: \(error.localizedDescription)"
             }
-            await self?.app?.replayOutbox()
+            self?.unpersisted.removeAll { $0.requestID == req.requestID }
+            self?.send()
+        }
+    }
+
+    /// Replay the outbox in the background (single-flight in the app model).
+    private func send() {
+        let replay = replay
+        Task { [weak self] in
+            await replay()
             await self?.poll()
         }
     }
 
-    /// Every pending save now, and wait until it's queued (Done, leaving
-    /// the screen, the app going to the background).
+    /// How queued writes get sent (the app's outbox replay; tests swap it).
+    @ObservationIgnored var replay: @MainActor () async -> Void = {}
+
+    /// Every pending save, conflicted blocks included (on their older
+    /// epoch), written to the outbox before this returns. Never waits on
+    /// the network (Done, leaving the screen, the app going to the background).
     func flush() async {
         activeCoordinator?.syncContent()
         await saver.flush()
         foldLive()
-        for r in session.commitText() { enqueue(r, coalescing: true) }
+        for r in session.commitText(includeConflicts: true) { enqueue(r, coalescing: true) }
         await queue?.value
         unsaved = 0
     }
@@ -358,10 +380,25 @@ final class EditorModel {
         // a body older than our own landed write would roll it back on screen
         if let landed = try? await cache.lastLandedEpoch(docID), let rec = try? await cache.doc(docID),
            let body = rec.bodyEpoch, body < landed { return }
+        // what's committed but maybe not yet in the outbox when the cache is read
+        let before = unpersisted
         guard let editor = try? await cache.editor(for: docID) else { return }
-        foldLive()
-        var keep = saver.waiting
+        applyRemote(editor, overlaying: before)
+    }
+
+    /// Take a refreshed editor: our committed-but-unwritten proposes go on
+    /// top of it, and the focused, typed-in and debounced blocks keep
+    /// their text.
+    func applyRemote(_ fresh: DocEditor, overlaying earlier: [ProposeRequest] = []) {
+        var editor = fresh
+        var seen: Set<String> = []
+        for r in earlier + unpersisted where seen.insert(r.requestID ?? "").inserted {
+            editor.overlay(r.ops.map(\.kind))
+        }
+        var keep = saver.waiting.union(live.keys)
         if let f = focusedID { keep.insert(f) }
+        for r in earlier + unpersisted { for op in r.ops { if let t = op.kind.target { keep.insert(t) } } }
+        foldLive()
         _ = session.refresh(editor, keep: keep)
     }
 
