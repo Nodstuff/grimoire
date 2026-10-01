@@ -1,7 +1,7 @@
 import Foundation
 import Synchronization
 import Testing
-@testable import GrimoireKit
+@testable import TaisceKit
 
 @Suite struct CacheTests {
     func tree(_ id: String, title: String = "Doc", epoch: Int = 2) throws -> DocTree {

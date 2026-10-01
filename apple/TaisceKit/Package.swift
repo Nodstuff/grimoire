@@ -2,10 +2,10 @@
 import PackageDescription
 
 let package = Package(
-    name: "GrimoireKit",
+    name: "TaisceKit",
     platforms: [.iOS(.v26), .macOS(.v26), .macCatalyst(.v26)],
     products: [
-        .library(name: "GrimoireKit", targets: ["GrimoireKit"]),
+        .library(name: "TaisceKit", targets: ["TaisceKit"]),
     ],
     dependencies: [
         // versions verified against GitHub releases on 2026-10-01
@@ -14,7 +14,7 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "GrimoireKit",
+            name: "TaisceKit",
             dependencies: [
                 .product(name: "GRDB", package: "GRDB.swift"),
                 .product(name: "Markdown", package: "swift-markdown"),
@@ -22,8 +22,8 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
-            name: "GrimoireKitTests",
-            dependencies: ["GrimoireKit"],
+            name: "TaisceKitTests",
+            dependencies: ["TaisceKit"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

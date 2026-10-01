@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import GrimoireKit
+@testable import TaisceKit
 
 @Suite struct APIClientTests {
     @Test func decodesTreeWithDecorations() async throws {

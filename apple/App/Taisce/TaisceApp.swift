@@ -1,8 +1,8 @@
-import GrimoireKit
+import TaisceKit
 import SwiftUI
 
 @main
-struct GrimoireApp: App {
+struct TaisceApp: App {
     @State private var model = AppModel()
     @Environment(\.scenePhase) private var scenePhase
 

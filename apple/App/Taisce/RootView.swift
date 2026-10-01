@@ -1,4 +1,4 @@
-import GrimoireKit
+import TaisceKit
 import SwiftUI
 
 enum SidebarItem: Hashable {
@@ -16,7 +16,7 @@ struct RootView: View {
     var body: some View {
         NavigationSplitView {
             SidebarView(selection: $selection, query: query)
-                .navigationTitle("Grimoire")
+                .navigationTitle("Taisce")
                 .searchable(text: $query, placement: .sidebar, prompt: "Search")
                 .toolbar {
                     ToolbarItem {

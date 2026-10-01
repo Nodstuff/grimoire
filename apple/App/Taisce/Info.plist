@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Grimoire</string>
+	<string>Taisce</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -34,6 +34,6 @@
 		</dict>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Grimoire connects to your Grimoire server on this network.</string>
+	<string>Taisce connects to your server on this network.</string>
 </dict>
 </plist>

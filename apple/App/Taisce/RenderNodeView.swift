@@ -1,4 +1,4 @@
-import GrimoireKit
+import TaisceKit
 import SwiftUI
 
 /// One `RenderNode`. Deliberately plain: the design pass styles these.

@@ -1,7 +1,7 @@
 import Foundation
 import Synchronization
 import Testing
-@testable import GrimoireKit
+@testable import TaisceKit
 
 @Suite struct SyncEngineTests {
     static let treeJSON = "[\(Fixture.summary("d1", title: "One", epoch: 1)),\(Fixture.summary("todo", title: "To-do", epoch: 1)),\(Fixture.summary("d3", title: "Three"))]"

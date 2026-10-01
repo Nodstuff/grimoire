@@ -1,14 +1,14 @@
 import Foundation
 import Testing
-@testable import GrimoireKit
+@testable import TaisceKit
 
 /// Opt-in, read-only smoke against a real daemon:
-/// `GRIMOIRE_LIVE_URL=http://127.0.0.1:7425 swift test --filter LiveServer`.
+/// `TAISCE_LIVE_URL=http://127.0.0.1:7425 swift test --filter LiveServer`.
 /// GETs only, and never `/api/todo` (a GET for today can carry items forward).
-@Suite(.enabled(if: ProcessInfo.processInfo.environment["GRIMOIRE_LIVE_URL"] != nil))
+@Suite(.enabled(if: ProcessInfo.processInfo.environment["TAISCE_LIVE_URL"] != nil))
 struct LiveServerTests {
     var api: APIClient? {
-        ProcessInfo.processInfo.environment["GRIMOIRE_LIVE_URL"]
+        ProcessInfo.processInfo.environment["TAISCE_LIVE_URL"]
             .flatMap(URL.init(string:))
             .map { APIClient(config: ServerConfig(baseURL: $0)) }
     }

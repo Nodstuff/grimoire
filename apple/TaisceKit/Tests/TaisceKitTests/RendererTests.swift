@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import GrimoireKit
+@testable import TaisceKit
 
 @Suite struct RendererTests {
     func block(_ type: BlockType, _ content: String) -> Block {
@@ -43,8 +43,8 @@ import Testing
 
     @Test func wikiLinksBecomeAppLinks() throws {
         #expect(InlineMarkdown.rewriteWikiLinks("go [[Alert Engine/02 Clamps|clamps]] or [[X]]")
-            == "go [clamps](grimoire://wiki/Alert%20Engine%2F02%20Clamps) or [X](grimoire://wiki/X)")
-        let url = try #require(URL(string: "grimoire://wiki/Alert%20Engine%2F02%20Clamps"))
+            == "go [clamps](taisce://wiki/Alert%20Engine%2F02%20Clamps) or [X](taisce://wiki/X)")
+        let url = try #require(URL(string: "taisce://wiki/Alert%20Engine%2F02%20Clamps"))
         #expect(InlineMarkdown.wikiTarget(url) == "Alert Engine/02 Clamps")
         let s = InlineMarkdown.attributed("a **b** [[C]]")
         #expect(String(s.characters) == "a b C")

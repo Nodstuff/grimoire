@@ -1,9 +1,9 @@
 import Foundation
 
 /// Inline markdown → `AttributedString` for SwiftUI `Text`. `[[Wiki Links]]`
-/// become `grimoire://wiki/<title>` links the app resolves against the tree.
+/// become `taisce://wiki/<title>` links the app resolves against the tree.
 public enum InlineMarkdown {
-    public static let wikiScheme = "grimoire"
+    public static let wikiScheme = "taisce"
 
     public static func attributed(_ inline: String) -> AttributedString {
         let md = rewriteWikiLinks(inline)
@@ -11,7 +11,7 @@ public enum InlineMarkdown {
         return (try? AttributedString(markdown: md, options: opts)) ?? AttributedString(inline)
     }
 
-    /// `[[A/B|label]]` → `[label](grimoire://wiki/A%2FB)`; `[[A]]` → `[A](...)`.
+    /// `[[A/B|label]]` → `[label](taisce://wiki/A%2FB)`; `[[A]]` → `[A](...)`.
     public static func rewriteWikiLinks(_ s: String) -> String {
         var out = ""
         var rest = Substring(s)
@@ -29,7 +29,7 @@ public enum InlineMarkdown {
         return out
     }
 
-    /// The wiki title a `grimoire://wiki/...` URL points at.
+    /// The wiki title a `taisce://wiki/...` URL points at.
     public static func wikiTarget(_ url: URL) -> String? {
         guard url.scheme == wikiScheme, url.host() == "wiki" else { return nil }
         return String(url.path(percentEncoded: false).dropFirst())

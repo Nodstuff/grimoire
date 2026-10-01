@@ -1,6 +1,13 @@
-# Grimoire for iPhone, iPad (and later Mac)
+# Taisce for iPhone, iPad (and later Mac)
 
-A native SwiftUI client for a Grimoire server: a view into its docs with an
+**Naming:** the product is now **Taisce** (Irish: treasure kept safe). On the
+Apple side that means the app target and display name `Taisce`, the bundle id
+`ie.null.taisce`, and the package `TaisceKit` (formerly GrimoireKit). Wiki links
+open in-app as `taisce://wiki/<title>`. Everything server-side keeps the name
+"grimoire" for now (the crate, `~/.grimoire`, API paths, the MCP server, and
+`X-Grimoire-*` headers); that rename is a separate cleanup later.
+
+A native SwiftUI client for a Grimoire (Taisce) server: a view into its docs with an
 offline cache. No web views for UI. iPhone + iPad first; Mac via Mac Catalyst
 later.
 
@@ -8,37 +15,37 @@ later.
 
 ```
 apple/
-  GrimoireKit/                 Swift package: all logic, tested on macOS
-    Sources/GrimoireKit/
+  TaisceKit/                 Swift package: all logic, tested on macOS
+    Sources/TaisceKit/
       Models/                  Doc, DocSummary, Block, BlockNode, Change, Todo/Due, BlockOp
       API/                     ServerConfig (+ TokenProvider seam), APIClient
       Cache/                   GRDB cache (docs, blocks + FTS5, todos, sync_state, outbox)
       Sync/                    SSEParser, changeStream, Backoff, SyncEngine (actor)
       Render/                  block markdown → RenderNode (swift-markdown), inline/wikilinks
       Todo/                    offline parser for the To-do doc
-    Tests/GrimoireKitTests/    Swift Testing + a URLProtocol mock server
+    Tests/TaisceKitTests/    Swift Testing + a URLProtocol mock server
   App/                         thin iOS app shell (xcodegen)
     project.yml
-    Grimoire/                  SwiftUI views + AppModel
+    Taisce/                    SwiftUI views + AppModel
 ```
 
 ## Build and test
 
 ```sh
-cd apple/GrimoireKit && swift test
+cd apple/TaisceKit && swift test
 # read-only smoke against a real daemon (GETs only; never /api/todo):
-GRIMOIRE_LIVE_URL=http://127.0.0.1:7425 swift test --filter LiveServer
+TAISCE_LIVE_URL=http://127.0.0.1:7425 swift test --filter LiveServer
 
-cd apple/App && xcodegen generate && open Grimoire.xcodeproj
-xcodebuild -project Grimoire.xcodeproj -scheme Grimoire -sdk iphonesimulator \
+cd apple/App && xcodegen generate && open Taisce.xcodeproj
+xcodebuild -project Taisce.xcodeproj -scheme Taisce -sdk iphonesimulator \
   -destination 'generic/platform=iOS Simulator' build
 ```
 
 `xcodebuild` needs the iOS platform/simulator runtime installed (Xcode ›
 Settings › Components). Without it, the app sources can still be
-type-checked against the simulator SDK by cross-building GrimoireKit
+type-checked against the simulator SDK by cross-building TaisceKit
 (`swift build --triple arm64-apple-ios26.0-simulator --sdk $(xcrun --sdk iphonesimulator --show-sdk-path)`)
-and running `swiftc -typecheck` over `App/Grimoire/*.swift`.
+and running `swiftc -typecheck` over `App/Taisce/*.swift`.
 
 Dependencies (SPM only): GRDB.swift 7.11.1, swift-markdown 0.9.0 (pulls
 swift-cmark 0.9.0). SSE is hand-rolled (`SSEParser`, ~120 lines) rather than a

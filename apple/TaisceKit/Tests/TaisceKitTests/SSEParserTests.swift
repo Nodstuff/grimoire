@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import GrimoireKit
+@testable import TaisceKit
 
 @Suite struct SSEParserTests {
     func parse(_ chunks: [String]) -> [SSEOutput] {

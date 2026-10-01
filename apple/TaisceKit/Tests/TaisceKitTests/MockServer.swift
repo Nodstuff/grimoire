@@ -1,6 +1,6 @@
 import Foundation
 import Synchronization
-@testable import GrimoireKit
+@testable import TaisceKit
 
 /// A scripted server behind `URLProtocol`. Each `MockServer` owns its own
 /// URLSession, routed by a header, so Swift Testing's parallel tests don't

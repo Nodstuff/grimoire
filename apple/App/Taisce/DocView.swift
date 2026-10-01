@@ -1,4 +1,4 @@
-import GrimoireKit
+import TaisceKit
 import SwiftUI
 
 /// Read-only doc: renders the cached blocks and refreshes them from the

@@ -1,9 +1,9 @@
 import Foundation
-import GrimoireKit
+import TaisceKit
 import Observation
 
 /// App-wide state: the server connection, its cache and sync engine, and the
-/// doc tree the sidebar shows. Everything below the UI lives in GrimoireKit.
+/// doc tree the sidebar shows. Everything below the UI lives in TaisceKit.
 @MainActor @Observable
 final class AppModel {
     static let serverURLKey = "serverURL"

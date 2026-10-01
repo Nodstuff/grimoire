@@ -1,6 +1,6 @@
-name: Grimoire
+name: Taisce
 options:
-  bundleIdPrefix: ie.null.grimoire
+  bundleIdPrefix: ie.null
   deploymentTarget:
     iOS: "26.0"
   createIntermediateGroups: true
@@ -11,20 +11,20 @@ settings:
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
 packages:
-  GrimoireKit:
-    path: ../GrimoireKit
+  TaisceKit:
+    path: ../TaisceKit
 targets:
-  Grimoire:
+  Taisce:
     type: application
     platform: iOS
     deploymentTarget: "26.0"
     sources:
-      - Grimoire
+      - Taisce
     dependencies:
-      - package: GrimoireKit
+      - package: TaisceKit
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: ie.null.grimoire.client
+        PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce
         TARGETED_DEVICE_FAMILY: "1,2"
         # Mac Catalyst comes later; flip to YES when the Mac pass starts
         SUPPORTS_MACCATALYST: NO
@@ -35,9 +35,9 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         CODE_SIGN_STYLE: Automatic
     info:
-      path: Grimoire/Info.plist
+      path: Taisce/Info.plist
       properties:
-        CFBundleDisplayName: Grimoire
+        CFBundleDisplayName: Taisce
         # plain HTTP to a daemon on this device / the local network only;
         # remote servers must be HTTPS
         NSAppTransportSecurity:
@@ -45,4 +45,4 @@ targets:
           NSExceptionDomains:
             localhost:
               NSExceptionAllowsInsecureHTTPLoads: true
-        NSLocalNetworkUsageDescription: Grimoire connects to your Grimoire server on this network.
+        NSLocalNetworkUsageDescription: Taisce connects to your server on this network.

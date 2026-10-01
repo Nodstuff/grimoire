@@ -1,4 +1,4 @@
-import GrimoireKit
+import TaisceKit
 import SwiftUI
 
 struct SidebarView: View {
