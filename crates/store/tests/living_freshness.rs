@@ -1,5 +1,5 @@
 //! Living answers (answer_sources) and doc freshness (docs.verified_at):
-//! table round-trips, the resolve hook, list ordering, migration idempotence.
+//! table round-trips, the resolve hook, migration idempotence.
 
 use grimoire_store::*;
 use uuid::Uuid;
@@ -127,34 +127,6 @@ fn human_accepting_an_auditor_fix_verifies_the_doc_but_other_accepts_do_not() {
     let q = s.review_queue(Some(d)).unwrap();
     s.resolve(q[0].annotation.id, tom, ReviewDecision::Accept).unwrap();
     assert!(s.doc_verified_at(d).unwrap().is_some());
-}
-
-#[test]
-fn freshness_lists_never_verified_first_then_oldest_and_skips_empty_docs() {
-    let (mut s, tom) = seed();
-    let (old, _) = import::import_markdown(&mut s, "Old", None, tom, "x\n").unwrap();
-    let (newer, _) = import::import_markdown(&mut s, "Newer", None, tom, "x\n").unwrap();
-    let (never, _) = import::import_markdown(&mut s, "Never", None, tom, "x\n").unwrap();
-    let _empty_folder = s.create_doc("Folder", None, tom).unwrap();
-
-    s.set_doc_verified(old).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(3));
-    s.set_doc_verified(newer).unwrap();
-
-    let rows = s.freshness(50, false).unwrap();
-    let titles: Vec<&str> = rows.iter().map(|r| r.title.as_str()).collect();
-    assert_eq!(titles, vec!["Never", "Old", "Newer"], "{rows:?}");
-    assert!(rows.iter().all(|r| !r.tended));
-    assert!(rows.iter().all(|r| !r.last_edited.is_empty()));
-    assert_eq!(rows[0].id, never);
-    assert_eq!(s.freshness(1, false).unwrap().len(), 1);
-
-    // tended filter: only docs under an enabled gardener scope
-    s.create_gardener("keep", GardenerKind::Keeper, "k", Some(newer), ConfidencePolicy::Review)
-        .unwrap();
-    let tended = s.freshness(50, true).unwrap();
-    assert_eq!(tended.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), vec!["Newer"]);
-    assert!(tended[0].tended);
 }
 
 /// A pre-freshness / pre-filer database opens, gains the column and the

@@ -334,10 +334,6 @@ pub trait BlockStore {
     /// tombstones too. NotFound if no row at all.
     fn doc_is_tombstoned(&self, id: Uuid) -> Result<bool>;
 
-    /// True if a gardener tends this doc or an ancestor (recursive, enabled
-    /// only).
-    fn doc_is_tended(&self, doc_id: Uuid) -> Result<bool>;
-
     /// Resolve one annotation. Invariant enforced here: proposer ≠ approver.
     /// - accept yellow: clear the annotation (the edit is already live)
     /// - decline yellow: revert via the op's pre-image, as a new green op by

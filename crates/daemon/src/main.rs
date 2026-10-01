@@ -13,7 +13,6 @@ mod children;
 mod docops;
 mod embed;
 mod filer;
-mod freshness;
 mod garden;
 mod home;
 mod inbox;

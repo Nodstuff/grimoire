@@ -2302,26 +2302,6 @@ impl BlockStore for SqliteStore {
         .collect()
     }
 
-    fn doc_is_tended(&self, doc_id: Uuid) -> Result<bool> {
-        let scopes: std::collections::HashSet<Uuid> = self
-            .list_gardeners()?
-            .into_iter()
-            .filter(|g| g.enabled)
-            .filter_map(|g| g.scope_doc)
-            .collect();
-        if scopes.is_empty() {
-            return Ok(false);
-        }
-        let mut cur = Some(doc_id);
-        while let Some(id) = cur {
-            if scopes.contains(&id) {
-                return Ok(true);
-            }
-            cur = self.get_doc(id).ok().and_then(|d| d.parent_id);
-        }
-        Ok(false)
-    }
-
     fn stale_block_vectors(&self, limit: usize) -> Result<Vec<(Uuid, i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT b.id, b.epoch, b.content FROM blocks b
@@ -3045,10 +3025,12 @@ impl SqliteStore {
         rows.map(|r| uuid_col(r?, "answer_sources.answer_doc_id")).collect()
     }
 
-    // --- doc freshness ---
+    // --- verification stamps (docs.verified_at) ---
 
     /// Stamp a doc as verified now. Only the auditor/keeper paths call this
     /// (a no-finding evaluation, or a human accepting one of their fixes).
+    /// Nothing reads the stamp since the freshness views went; the column and
+    /// the bookkeeping stay so a future view has the history.
     pub fn set_doc_verified(&mut self, doc_id: Uuid) -> Result<()> {
         let n = self.conn.execute(
             "UPDATE docs SET verified_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
@@ -3069,44 +3051,6 @@ impl SqliteStore {
             )
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("doc {doc_id}")))
-    }
-
-    /// Docs that carry content, never-verified first, then
-    /// oldest `verified_at`. `last_edited` is the newest applied op's time
-    /// (falling back to the doc's creation time).
-    pub fn freshness(&self, limit: usize, tended_only: bool) -> Result<Vec<FreshnessRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT d.id, d.title, d.verified_at,
-                    COALESCE((SELECT max(o.created_at) FROM ops o
-                              WHERE o.doc_id = d.id AND o.epoch_applied IS NOT NULL), d.created_at)
-             FROM docs d
-             WHERE d.deleted = 0
-               AND EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0
-                           AND b.block_type != 'comment')
-             ORDER BY d.verified_at IS NOT NULL, d.verified_at, d.title",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            let (id, title, verified_at, last_edited) = r?;
-            let id = uuid_col(id, "docs.id")?;
-            let tended = self.doc_is_tended(id)?;
-            if tended_only && !tended {
-                continue;
-            }
-            out.push(FreshnessRow { id, title, verified_at, last_edited, tended });
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
     }
 
     /// Mark docs as covered by an auditor (re-audit = delete the rows).

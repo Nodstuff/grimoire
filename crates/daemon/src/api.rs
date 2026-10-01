@@ -1278,8 +1278,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/graph", get(graph))
         .route("/api/render/d2", post(render_d2))
         .route("/api/doc/{id}/living", get(crate::living::living_status))
-        .route("/api/doc/{id}/freshness", get(crate::freshness::doc_freshness))
-        .route("/api/freshness", get(crate::freshness::freshness))
         .with_state(state.clone())
         // the briefing home (last-visit stamp, new docs since) and quick capture
         .merge(crate::home::router(state.clone()))

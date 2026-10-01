@@ -543,16 +543,6 @@ pub struct AnswerSource {
     pub changed: bool,
 }
 
-/// One row of the freshness list (`GET /api/freshness`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct FreshnessRow {
-    pub id: Uuid,
-    pub title: String,
-    pub verified_at: Option<String>,
-    pub last_edited: String,
-    pub tended: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GardenerRun {
     pub id: Uuid,
