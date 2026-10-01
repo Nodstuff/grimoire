@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 import Testing
 @testable import TaisceKit
 
@@ -107,6 +108,30 @@ import Testing
         let k = try #require(JSONSerialization.jsonObject(with: kid) as? [String: Any])
         #expect(r["workspace_id"] as? String == "w1" && r["parent_doc_id"] == nil)
         #expect(k["workspace_id"] == nil && k["parent_doc_id"] as? String == "p1")
+    }
+
+    @Test func aV1CacheMigratesThroughBothV2s() async throws {
+        let q = try DatabaseQueue()
+        try Cache.migrator.migrate(q, upTo: "v1")
+        try await q.write { db in
+            try db.execute(sql: "INSERT INTO docs(id, title, current_epoch, body_epoch) VALUES ('t', 'To-do', 3, 3), ('d', 'Doc', 2, 2)")
+            try db.execute(sql: "INSERT INTO todos(date, position, mark, text) VALUES ('2026-10-01', 0, ' ', 'old')")
+            try db.execute(sql: "INSERT INTO sync_state(key, value) VALUES ('last_seq', 42)")
+        }
+        let cache = try Cache(writer: q)
+        let applied = try await q.read { db in try Cache.migrator.appliedIdentifiers(db) }
+        #expect(applied == ["v1", "v2", "v2-workspaces"])
+        try await q.read { db in
+            let outbox = try db.columns(in: "outbox").map(\.name)
+            #expect(outbox.contains("outcome"), "the editor's v2")
+            #expect(try db.columns(in: "docs").map(\.name).contains("workspace_id"))
+            #expect(try db.columns(in: "todos").map(\.name).contains("doc_id"))
+            #expect(try db.tableExists("workspaces"))
+        }
+        #expect(try await cache.doc("t")?.bodyEpoch == nil, "the To-do doc refetches its list")
+        #expect(try await cache.doc("d")?.bodyEpoch == 2, "other bodies are kept")
+        #expect(try await cache.lastSeq() == 0, "re-bootstrap for workspace ids")
+        #expect(try await cache.todos().isEmpty)
     }
 
     @Test func scopeParamRoundTrips() throws {
