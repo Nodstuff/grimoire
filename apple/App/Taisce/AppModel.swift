@@ -34,6 +34,8 @@ final class AppModel {
     private(set) var treeLoaded = false
     var lastError: String?
     let dueAlerts = NotificationCoordinator()
+    // push: APNs token registration (Push.swift)
+    let push = PushRegistrar(store: UserDefaultsPushStore(), environment: PushConfig.environment, appVersion: PushConfig.appVersion())
 
     // sync indicator
     private(set) var syncStatus: SyncStatus = .idle
@@ -100,6 +102,7 @@ final class AppModel {
             return
         }
         await stopSync()
+        await pushSessionEnding() // push
         serverURL = trimmed
         UserDefaults.standard.set(trimmed, forKey: Self.serverURLKey)
         await connect()
@@ -111,6 +114,7 @@ final class AppModel {
         await sync?.start()
         startPolling()
         await dueAlerts.reconcile()
+        await pushSessionStarted() // push
     }
 
     func stopSync() async {
@@ -146,6 +150,7 @@ final class AppModel {
     /// stays (it is per server, and the next sign-in resumes from it).
     func signOut() async {
         await stopSync()
+        await pushSessionEnding() // push: before the revoke, while the bearer works
         await auth?.signOut()
     }
 
@@ -155,7 +160,14 @@ final class AppModel {
             await startSync()
         } else {
             await stopSync()
+            await pushSessionEnding() // push
         }
+    }
+
+    // push: a silent push can launch the app in the background, before boot
+    func connectIfNeeded() async {
+        guard api == nil else { return }
+        await connect()
     }
 
     static func isLoopback(_ url: URL) -> Bool {

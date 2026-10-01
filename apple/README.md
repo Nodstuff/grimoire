@@ -212,7 +212,7 @@ two plists in step when `project.yml`'s `info` changes. The GRDB cache, its
 WAL and SHM files and their directory are `completeUntilFirstUserAuthentication`.
 Nothing logs tokens or doc content (no `Logger`/`os_log` in the app or kit).
 
-## Due alerts (local notifications, no APNs)
+## Due alerts (local notifications)
 
 `DueAlertPlanner` (TaisceKit, pure) turns open to-dos into the notifications
 that should be pending: timed items (`due_at` instant, or the older local
@@ -231,6 +231,32 @@ stale, add new or changed) on foreground, after syncs touching the To-do
 doc, and on a time zone change. Actions queue through the outbox
 (`enqueueToggle`, `enqueueDeadline`), so they work offline; the answer is
 held locally until a sync shows it, so the old alert doesn't come back.
+
+## Push (APNs, silent)
+
+APNs keeps the cache fresh in the background and cancels alerts for to-dos
+changed elsewhere; the alerts themselves stay local. The server sends
+`{"aps":{"content-available":1},"seq":N}`.
+
+- Entitlement `aps-environment`: `Support/Taisce-Debug.entitlements`
+  (development) and `Taisce-Release.entitlements` (production), picked per
+  configuration by `CODE_SIGN_ENTITLEMENTS`; `UIBackgroundModes`
+  `remote-notification` (in both Info plists).
+- `PushRegistrar` (TaisceKit actor): after sign-in (every foreground
+  `startSync`, SERVER mode only) the app calls
+  `registerForRemoteNotifications`; the token (lowercase hex) goes to
+  `POST /api/devices` `{token, platform: "ios", env: sandbox|production
+  (#if DEBUG), app_version: "0.1.0 (1)"}` when the token, server, env or
+  version changed, else at most once a day (`UserDefaultsPushStore`).
+  Sign-out and a server switch `DELETE /api/devices/{token}` first (5 s
+  bound, 404 = gone), then forget the record.
+- `AppDelegate` (`UIApplicationDelegateAdaptor`, owns the `AppModel` so a
+  background launch has one) answers a silent push with
+  `BackgroundRefresh.run`: one `SyncEngine.catchUp()` raced against 20 s
+  (`withTimeLimit`, which returns on time even if the work ignores
+  cancellation), then `NotificationCoordinator.reconcile()`, then
+  newData / noData / failed. A push whose `seq` the cursor already passed,
+  or one arriving while the stream is live, only reconciles.
 
 ## Editing (groundwork, no UI)
 
@@ -269,7 +295,7 @@ later.
 - Pins are local (UserDefaults, per server); pinned docs are always fetched by sync.
 - Doc checkboxes toggle through a queued `replace`; the rest of editing is the next pass.
 - Diagrams (Mermaid, Vega-Lite, D2) render as labelled placeholder cards.
-- APNs / background refresh, Mac Catalyst.
+- Mac Catalyst.
 
 ## Running the app against a scratch daemon
 

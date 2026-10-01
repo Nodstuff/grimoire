@@ -1,0 +1,93 @@
+import Foundation
+import TaisceKit
+import UIKit
+
+/// This build's APNs settings.
+enum PushConfig {
+    /// A Debug build is signed with `aps-environment` development, so its
+    /// token is a sandbox one; Release (TestFlight, App Store) is production.
+    static var environment: PushEnvironment {
+        #if DEBUG
+        .sandbox
+        #else
+        .production
+        #endif
+    }
+
+    /// `CFBundleShortVersionString (CFBundleVersion)`, e.g. `0.1.0 (1)`.
+    static func appVersion(info: [String: Any]? = Bundle.main.infoDictionary) -> String {
+        let short = info?["CFBundleShortVersionString"] as? String ?? "0"
+        let build = info?["CFBundleVersion"] as? String ?? "0"
+        return "\(short) (\(build))"
+    }
+
+    /// How long sign-out (or a server switch) waits for the device delete.
+    static let unregisterLimit: Duration = .seconds(5)
+}
+
+/// The server's silent push: `{"aps":{"content-available":1},"seq":N}`.
+enum SilentPush {
+    /// The change-log head the push announces, if it carries one.
+    static func seq(from userInfo: [AnyHashable: Any]) -> Int? {
+        switch userInfo["seq"] {
+        case let n as Int: n
+        case let n as NSNumber: n.intValue
+        case let s as String: Int(s)
+        default: nil
+        }
+    }
+}
+
+extension UIBackgroundFetchResult {
+    init(_ result: BackgroundRefreshResult) {
+        switch result {
+        case .newData: self = .newData
+        case .noData: self = .noData
+        case .failed: self = .failed
+        }
+    }
+}
+
+extension AppModel {
+    /// After sign-in (and on every foreground start): point the registrar
+    /// at this server and ask iOS for the token, which iOS hands back
+    /// through `AppDelegate` on every launch; the registrar sends it when it
+    /// changed or is a day old. LOCAL mode (no bearer) registers nothing.
+    func pushSessionStarted() async {
+        guard authPhase == .signedIn, let api else {
+            await push.disconnect()
+            return
+        }
+        await push.connect(server: serverURL, registry: api)
+        UIApplication.shared.registerForRemoteNotifications()
+    }
+
+    /// Sign-out or a server switch: delete this device on the server while
+    /// the bearer still works, bounded so an offline sign-out isn't held up.
+    func pushSessionEnding() async {
+        let push = push
+        _ = await withTimeLimit(PushConfig.unregisterLimit) { await push.unregister() }
+    }
+
+    /// A silent push: one bounded catch-up, then the due alerts follow the
+    /// cache (a to-do done or moved elsewhere cancels its alert here).
+    func handleSilentPush(seq: Int?) async -> BackgroundRefreshResult {
+        await connectIfNeeded()
+        guard authPhase == .signedIn || authPhase == .notRequired, let sync, let cache else { return .noData }
+        let dueAlerts = dueAlerts
+        // the foreground stream already has it, or the cache is past it
+        let cursor = (try? await cache.lastSeq()) ?? 0
+        if syncStatus == .live || (seq.map { $0 <= cursor } ?? false) {
+            await dueAlerts.reconcile()
+            return .noData
+        }
+        return await BackgroundRefresh.run(
+            catchUp: {
+                let before = try await cache.lastSeq()
+                try await sync.catchUp()
+                return try await cache.lastSeq() != before
+            },
+            reconcile: { await dueAlerts.reconcile() }
+        )
+    }
+}

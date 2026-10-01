@@ -40,6 +40,10 @@ targets:
       configs:
         Debug:
           INFOPLIST_FILE: Support/Info-Debug.plist
+          # APNs (push): a Debug build's token is a sandbox one
+          CODE_SIGN_ENTITLEMENTS: Support/Taisce-Debug.entitlements
+        Release:
+          CODE_SIGN_ENTITLEMENTS: Support/Taisce-Release.entitlements
     info:
       path: Taisce/Info.plist
       properties:
@@ -53,6 +57,8 @@ targets:
         # Debug builds use Support/Info-Debug.plist, this plus the
         # loopback exception for scratch daemons; keep the two in step.
         NSLocalNetworkUsageDescription: Taisce connects to your server on this network.
+        # APNs: silent content-available pushes wake the app for one catch-up
+        UIBackgroundModes: [remote-notification]
   TaisceTests:
     type: bundle.unit-test
     platform: iOS

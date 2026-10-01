@@ -33,5 +33,9 @@
 	<string>1</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Taisce connects to your server on this network.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
 </dict>
 </plist>
