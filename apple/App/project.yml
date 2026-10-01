@@ -70,6 +70,21 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 6UP35L9425
+  TaisceUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - TaisceUITests
+    dependencies:
+      - target: Taisce
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 6UP35L9425
+        TEST_TARGET_NAME: Taisce
 schemes:
   Taisce:
     build:
@@ -78,3 +93,4 @@ schemes:
     test:
       targets:
         - TaisceTests
+        - TaisceUITests
