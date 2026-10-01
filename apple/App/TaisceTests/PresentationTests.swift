@@ -339,7 +339,7 @@ private extension Optional {
     }
 }
 
-@MainActor @Suite struct DueAlertTests {
+@MainActor @Suite struct DueAlertPromptTests {
     @Test func promptPerStatus() {
         #expect(DueAlertPrompt(.notDetermined) == .turnOn && DueAlertPrompt(.notDetermined).showsTodosCard)
         #expect(DueAlertPrompt(.allowed) == .on && !DueAlertPrompt(.allowed).showsTodosCard)

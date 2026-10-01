@@ -33,6 +33,7 @@ final class AppModel {
     /// whether the cache has delivered the tree at least once
     private(set) var treeLoaded = false
     var lastError: String?
+    let dueAlerts = NotificationCoordinator()
 
     // sync indicator
     private(set) var syncStatus: SyncStatus = .idle
@@ -68,13 +69,10 @@ final class AppModel {
     private var observedTodoDoc: DocID?
     /// rendered blocks by (block id, content hash), shared across doc views
     let renderCache = RenderCache()
-    /// due-alert permission (stubbed on the system center until the
-    /// NotificationCoordinator lands)
-    let dueAlerts: any DueAlertPermission = SystemDueAlerts()
 
     init() {
-        let stored = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? Self.defaultServerURL
-        serverURL = ServerConfig.normalizedURL(stored)?.absoluteString ?? Self.defaultServerURL
+        let stored = UserDefaults.standard.string(forKey: Self.serverURLKey).flatMap { ServerConfig.normalizedURL($0)?.absoluteString }
+        serverURL = stored.flatMap { ServerURLPolicy.accepts($0) ? $0 : nil } ?? Self.defaultServerURL
     }
 
     var needsSignIn: Bool { authPhase == .signedOut }
@@ -92,11 +90,15 @@ final class AppModel {
     func setServerURL(_ s: String) async {
         // "taisce.null.ie" means https://taisce.null.ie
         guard let url = ServerConfig.normalizedURL(s) else {
-            lastError = "not a server URL: \(s)"
+            lastError = ServerURLPolicy.Rejection.notAURL.message
             return
         }
         let trimmed = url.absoluteString
         guard trimmed != serverURL else { return }
+        if case .failure(let rejection) = ServerURLPolicy.check(trimmed) {
+            lastError = rejection.message
+            return
+        }
         await stopSync()
         serverURL = trimmed
         UserDefaults.standard.set(trimmed, forKey: Self.serverURLKey)
@@ -108,6 +110,7 @@ final class AppModel {
         guard authPhase == .signedIn || authPhase == .notRequired else { return }
         await sync?.start()
         startPolling()
+        await dueAlerts.reconcile()
     }
 
     func stopSync() async {
@@ -214,6 +217,7 @@ final class AppModel {
             self.api = api
             let sync = SyncEngine(api: api, cache: cache)
             self.sync = sync
+            dueAlerts.connect(cache: cache, api: api, sync: sync)
             pins = UserDefaults.standard.stringArray(forKey: pinsKey) ?? []
             editMeta = [:]
             treeLoaded = false
