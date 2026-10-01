@@ -6,7 +6,9 @@
 mod admin;
 mod api;
 mod ask;
+mod auth;
 mod backup;
+mod changes;
 mod children;
 mod docops;
 mod embed;
@@ -172,6 +174,10 @@ struct Cli {
     /// command talks to.
     #[arg(long, global = true, default_value_t = 7425)]
     port: u16,
+    /// SERVER mode: the public origin clients reach this daemon at, through
+    /// a TLS reverse proxy (`https://taisce.example`). Unset = LOCAL mode.
+    #[arg(long, global = true, env = "GRIMOIRE_PUBLIC_URL")]
+    public_url: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -222,6 +228,20 @@ enum Cmd {
         /// The hub's name (its root folder and the name members see).
         #[arg(long, requires = "hub")]
         name: Option<String>,
+        /// SERVER mode: rate-limit by the reverse proxy's X-Forwarded-For
+        /// (its last hop) instead of the socket peer.
+        #[arg(long, env = "GRIMOIRE_TRUSTED_PROXY")]
+        trusted_proxy: bool,
+        /// SERVER mode: an extra OAuth redirect URI to accept (exact match;
+        /// repeatable). Claude's callback, loopback and the app's scheme are built in.
+        #[arg(long = "allow-redirect", env = "GRIMOIRE_OAUTH_REDIRECTS", value_delimiter = ',')]
+        allow_redirect: Vec<String>,
+    },
+    /// SERVER mode sign-in: passkeys and OAuth grants (works on the db
+    /// directly; run it on the server box).
+    Auth {
+        #[command(subcommand)]
+        cmd: AuthCmd,
     },
     /// Hub administration on the hub box (talks to the running daemon).
     Hub {
@@ -245,6 +265,16 @@ enum Cmd {
     Pull,
     /// List paired contacts.
     Contacts,
+}
+
+#[derive(Subcommand)]
+enum AuthCmd {
+    /// Print a one-time link (15 minutes) that registers a passkey for the owner.
+    Enroll,
+    /// List users, passkeys and live OAuth grants.
+    List,
+    /// Revoke an OAuth grant, or delete a passkey, by id (or unique prefix).
+    Revoke { id: String },
 }
 
 #[derive(Subcommand)]
@@ -507,8 +537,80 @@ async fn shutdown_signal() {
     }
 }
 
+/// rustls (reqwest's https, for client metadata documents) needs one process
+/// crypto provider; ring, as iroh uses. Idempotent.
+pub fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn human_name(store: &SqliteStore) -> String {
+    store
+        .list_principals()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|p| p.kind == PrincipalKind::Human)
+        .map(|p| p.display_name)
+        .unwrap_or_else(|| "owner".into())
+}
+
+/// `grimoire auth …`: straight against the db (WAL lets the daemon run on).
+fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, human: uuid::Uuid) -> anyhow::Result<()> {
+    let now = auth::now();
+    let fmt_time = |t: i64| {
+        chrono::DateTime::from_timestamp(t, 0)
+            .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_default()
+    };
+    match cmd {
+        AuthCmd::Enroll => {
+            let base = match public_url {
+                Some(u) => auth::AuthConfig::from_public_url(&u)?.base,
+                None => store.get_setting("auth.public_url")?.ok_or_else(|| {
+                    anyhow::anyhow!("no public URL: pass --public-url (or serve once in server mode)")
+                })?,
+            };
+            let name = human_name(store);
+            let owner = store.auth_ensure_owner(human, &name, now)?;
+            let token = auth::random_token();
+            store.auth_add_enrollment(&auth::hash_secret(&token), owner.id, now + auth::ENROLL_TTL)?;
+            tracing::info!(target: auth::AUDIT, event = "enroll.mint", user = %owner.id);
+            println!("{base}/auth/enroll?t={token}");
+            println!("(one-time, expires in 15 minutes — open it on the device that will hold the passkey)");
+        }
+        AuthCmd::List => {
+            for u in store.auth_users()? {
+                println!("user {}  {}  ({})", u.id, u.name, u.role);
+                for c in store.auth_credentials(Some(u.id))? {
+                    let used = c.last_used_at.map(fmt_time).unwrap_or_else(|| "never".into());
+                    println!("  passkey {}  {:<20}  added {}  last used {}", c.id, c.label, fmt_time(c.created_at), used);
+                }
+            }
+            for g in store.oauth_grants(false)? {
+                let name = store.oauth_client(&g.client_id)?.map(|c| c.client_name).unwrap_or_default();
+                println!("grant {}  {}  [{}]  since {}", g.id, name, g.client_id, fmt_time(g.created_at));
+            }
+        }
+        AuthCmd::Revoke { id } => {
+            if let Some(g) = store.oauth_revoke_grant(&id, "revoked from the CLI", now)? {
+                tracing::info!(target: auth::AUDIT, event = "token.revoke", why = "cli", grant = %g);
+                println!("revoked grant {g}");
+            } else if store.auth_delete_credential(&id)? == 1 {
+                tracing::info!(target: auth::AUDIT, event = "passkey.delete", credential = id);
+                println!("deleted passkey {id}");
+            } else {
+                anyhow::bail!("no live grant or passkey matches {id:?} (ambiguous prefix?)");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    install_crypto_provider();
     let cli = Cli::parse();
     let db_dir = cli
         .db
@@ -742,9 +844,27 @@ async fn main() -> anyhow::Result<()> {
             };
             println!("{text}");
         }
-        Cmd::Serve { hub, name } => {
+        Cmd::Auth { cmd } => {
+            let mut store = store;
+            auth_cli(&mut store, cmd, cli.public_url.clone(), tom)?;
+        }
+        Cmd::Serve { hub, name, trusted_proxy, allow_redirect } => {
             let port = cli.port;
             let mut store = store;
+            // SERVER mode: OAuth + passkeys replace loopback trust entirely
+            let auth_cfg = match cli.public_url.as_deref() {
+                Some(u) => {
+                    let mut cfg = auth::AuthConfig::from_public_url(u)?;
+                    cfg.trusted_proxy = trusted_proxy;
+                    cfg.extra_redirects = allow_redirect.into_iter().filter(|r| !r.trim().is_empty()).collect();
+                    store.set_setting("auth.public_url", &cfg.base)?;
+                    let name = human_name(&store);
+                    store.auth_ensure_owner(tom, &name, auth::now())?;
+                    tracing::info!(public_url = cfg.base, trusted_proxy, "SERVER mode: every data route needs an OAuth bearer token");
+                    Some(cfg)
+                }
+                None => None,
+            };
             // hub mode (slice 1): persisted; `--hub` turns it on (and renames)
             if hub {
                 let cfg = fed::hub::enable(&mut store, name.as_deref(), tom).context("enabling hub mode")?;
@@ -912,7 +1032,23 @@ async fn main() -> anyhow::Result<()> {
             let fed_ctx_node_id: Option<String>;
             // one idempotency cache for MCP and HTTP proposes (request_id)
             let dedupe = mcp::new_dedupe();
-            let app = mcp::router(store.clone(), claude, hot.clone(), dedupe.clone(), embedder.clone())
+            let auth_state = match auth_cfg {
+                Some(cfg) => {
+                    let st = auth::AuthState::new(cfg, store.clone())?;
+                    {
+                        let st = st.clone();
+                        supervise("auth.cleanup", move || auth::cleanup_loop(st.clone()));
+                    }
+                    Some(st)
+                }
+                None => None,
+            };
+            // rmcp checks Host itself; behind the proxy it is the public name
+            let mcp_hosts = auth_state.as_ref().map(|st| {
+                let host = st.cfg.rp_id.clone();
+                vec![st.cfg.authority(), host, "localhost".into(), "127.0.0.1".into(), "::1".into()]
+            });
+            let app = mcp::router_with_hosts(store.clone(), claude, hot.clone(), dedupe.clone(), embedder.clone(), mcp_hosts)
                 .merge(hot::router(hot::HotCtx {
                     hot: hot.clone(),
                     store: store.clone(),
@@ -923,6 +1059,7 @@ async fn main() -> anyhow::Result<()> {
                     admin::router(store.clone(), fed_ctx, hot.clone(), runtime.clone(), admin_token)
                 })
                 .merge(api::router(api::ApiState {
+                    changes: changes::Feed::new(&store),
                     store,
                     human: tom,
                     hot,
@@ -932,6 +1069,10 @@ async fn main() -> anyhow::Result<()> {
                     embedder,
                     dedupe,
                 }));
+            let app = match &auth_state {
+                Some(st) => app.merge(auth::router(st.clone())),
+                None => app,
+            };
             // The frontend is EMBEDDED in this binary (rust-embed over ui/dist),
             // so the app is self-contained on any machine. GRIMOIRE_UI_DIST is a
             // dev override: set it to serve a live build off disk instead.
@@ -942,11 +1083,16 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 Err(_) => app.fallback(serve_embedded_ui),
             };
-            // DNS-rebinding guard over EVERY surface (api, admin, mcp, ws, ui):
-            // a request whose Host/Origin is not a loopback name is refused
-            let app = app.layer(axum::middleware::from_fn(local_guard::require_loopback));
+            let app = match auth_state {
+                // SERVER mode: the proxy makes every request loopback, so no
+                // loopback trust; a bearer token on every data surface instead
+                Some(st) => app.layer(axum::middleware::from_fn_with_state(st, auth::require_auth)),
+                // DNS-rebinding guard over EVERY surface (api, admin, mcp, ws, ui):
+                // a request whose Host/Origin is not a loopback name is refused
+                None => app.layer(axum::middleware::from_fn(local_guard::require_loopback)),
+            };
             tracing::info!("ksd serving MCP (streamable HTTP) at http://{addr}/mcp");
-            axum::serve(listener, app)
+            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .with_graceful_shutdown(async {
                     shutdown_signal().await;
                     // children first: a slow connection drain must never

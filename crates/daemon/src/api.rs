@@ -30,6 +30,8 @@ pub struct ApiState {
     pub embedder: Option<Arc<crate::embed::Embedder>>,
     /// Idempotency cache for `request_id` on propose routes, shared with MCP.
     pub dedupe: crate::mcp::DedupeCache,
+    /// The change journal's head, pushed to `/api/changes/stream` clients.
+    pub changes: crate::changes::Feed,
 }
 
 /// Optional on every HTTP write: attribute the write to this Agent principal
@@ -89,8 +91,22 @@ pub(crate) fn refuse_if_mirror(s: &SqliteStore, id: Uuid, what: &str) -> Option<
     }
 }
 
-async fn docs(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+/// Header on `GET /api/docs`: the change journal's head, read in the same
+/// read transaction as the list — a syncing client's cursor for exactly this
+/// snapshot.
+pub const SEQ_HEADER: &str = "x-grimoire-seq";
+
+async fn docs(State(st): State<ApiState>) -> ([(&'static str, String); 1], Json<Value>) {
+    let (seq, body) = with_store(&st.store, move |s| {
+        let snap = s.read_snapshot(|s| (s.latest_change_seq().unwrap_or(0), docs_json(s)));
+        snap.unwrap_or_else(|e| (0, Json(json!({"error": e.to_string()}))))
+    })
+    .await;
+    ([(SEQ_HEADER, seq.to_string())], body)
+}
+
+fn docs_json(s: &mut SqliteStore) -> Json<Value> {
+    {
         let canvases: std::collections::HashSet<String> =
             s.canvas_doc_ids().unwrap_or_default().into_iter().collect();
         let tended: std::collections::HashSet<String> = s
@@ -190,8 +206,7 @@ async fn docs(State(st): State<ApiState>) -> Json<Value> {
             }
             Err(e) => Json(json!({"error": e.to_string()})),
         }
-    })
-    .await
+    }
 }
 
 /// Hub mode (slice 1), for the hub's own UI and the CLI on the box: whether
@@ -1620,6 +1635,7 @@ pub fn router(state: ApiState) -> Router {
         // the briefing home (last-visit stamp, new docs since) and quick capture
         .merge(crate::home::router(state.clone()))
         .merge(crate::inbox::router(state.clone()))
+        .merge(crate::changes::router(state.clone()))
         .merge(crate::todo::router(state))
 }
 
@@ -1635,8 +1651,10 @@ mod http_client_tests {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let human = store.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
         let dir = std::env::temp_dir().join(format!("grimoire-api-test-{}", Uuid::now_v7()));
+        let store = Arc::new(Mutex::new(store));
         let st = ApiState {
-            store: Arc::new(Mutex::new(store)),
+            changes: crate::changes::Feed::new(&store),
+            store,
             human,
             hot: crate::hot::HotState::new(dir.clone()),
             runtime: crate::fed::Runtime::default(),

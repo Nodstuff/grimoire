@@ -1014,3 +1014,38 @@ pub struct DocTransfer {
     pub state: String,
     pub at: String,
 }
+
+/// One row of the change journal (`changes` table): something about
+/// `doc_id` moved at `seq`. `kind` is `doc`, `tree`, `deleted` or `restored`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Change {
+    pub seq: i64,
+    pub doc_id: String,
+    pub kind: String,
+    pub epoch: Option<i64>,
+    pub at: String,
+    /// The doc as it stands NOW (read when the page is served, not as of
+    /// `seq`), so a tree change needs no `/api/docs` refetch. Absent when the
+    /// row is gone (hard delete).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<DocSummary>,
+}
+
+/// The tree-facing fields of a doc, riding on a [`Change`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocSummary {
+    pub title: String,
+    pub parent_id: Option<String>,
+    pub sort_key: Option<String>,
+    pub status: Option<String>,
+    pub current_epoch: i64,
+    pub deleted: bool,
+}
+
+/// A page of [`Change`]s after a cursor; `seq` is the journal's head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangePage {
+    pub seq: i64,
+    pub changes: Vec<Change>,
+    pub more: bool,
+}

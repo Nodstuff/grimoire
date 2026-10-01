@@ -14,7 +14,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 pub type FrozenProbe = Box<dyn Fn(Uuid) -> bool + Send + Sync>;
 
 pub struct SqliteStore {
-    conn: Connection,
+    pub(crate) conn: Connection,
     frozen: Option<FrozenProbe>,
 }
 
@@ -505,7 +505,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -525,8 +525,22 @@ fn backfill(conn: &Connection) -> Result<()> {
     if version < 5 {
         backfill_doc_sort_keys(&tx)?;
     }
+    if version < 6 {
+        backfill_changes(&tx)?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
+    Ok(())
+}
+
+/// v6: seed the change journal with one `doc` row per live doc, so a client
+/// syncing from `since=0` sees everything that predates the triggers.
+fn backfill_changes(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO changes (doc_id, kind, epoch)
+         SELECT id, 'doc', current_epoch FROM docs WHERE deleted = 0 ORDER BY created_at, id",
+        [],
+    )?;
     Ok(())
 }
 
@@ -4875,6 +4889,73 @@ impl SqliteStore {
                 |r| r.get(0),
             )
             .map_err(Into::into)
+    }
+
+    /// Run `f` inside one deferred read transaction: every read in it sees
+    /// the same snapshot, even with another process writing the file (WAL).
+    /// `f` must only read — a write path opening its own transaction inside
+    /// would fail. The transaction is closed whatever `f` returns.
+    pub fn read_snapshot<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> Result<T> {
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        let out = f(self);
+        self.conn.execute_batch("COMMIT")?;
+        Ok(out)
+    }
+
+    /// The change journal's head: the highest `seq`, 0 when empty.
+    pub fn latest_change_seq(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT COALESCE(max(seq), 0) FROM changes")?
+            .query_row([], |r| r.get(0))?)
+    }
+
+    /// Journal rows with `seq > since`, oldest first, at most `limit`;
+    /// `more` says rows remain past the page.
+    pub fn changes_since(&self, since: i64, limit: usize) -> Result<ChangePage> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT c.seq, c.doc_id, c.kind, c.epoch, c.at,
+                    d.id, d.title, d.parent_id, d.sort_key, d.status, d.current_epoch, d.deleted
+             FROM changes c LEFT JOIN docs d ON d.id = c.doc_id
+             WHERE c.seq > ?1 ORDER BY c.seq LIMIT ?2",
+        )?;
+        let mut changes: Vec<Change> = stmt
+            .query_map(params![since, limit as i64 + 1], |r| {
+                let doc = match r.get::<_, Option<String>>(5)? {
+                    Some(_) => Some(DocSummary {
+                        title: r.get(6)?,
+                        parent_id: r.get(7)?,
+                        sort_key: r.get(8)?,
+                        status: r.get(9)?,
+                        current_epoch: r.get(10)?,
+                        deleted: r.get::<_, i64>(11)? != 0,
+                    }),
+                    None => None,
+                };
+                Ok(Change {
+                    seq: r.get(0)?,
+                    doc_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    epoch: r.get(3)?,
+                    at: r.get(4)?,
+                    doc,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let more = changes.len() > limit;
+        changes.truncate(limit);
+        Ok(ChangePage { seq: self.latest_change_seq()?, changes, more })
+    }
+
+    /// Call `f` after every commit on this connection (autocommit statements
+    /// included) — the change feed's wake-up. `f` runs inside SQLite's commit
+    /// and must not touch the database; signal and return. Replaces any
+    /// previous hook.
+    pub fn on_commit(&self, f: impl Fn() + Send + 'static) {
+        self.conn.commit_hook(Some(move || {
+            f();
+            false
+        }));
     }
 
     /// The doc's most recent applied ops, newest first (epoch, then id,
