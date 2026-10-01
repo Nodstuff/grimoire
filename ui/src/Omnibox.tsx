@@ -224,10 +224,10 @@ export default function Omnibox({
                 {(r.group === 'recent' || r.group === 'docs') && (
                   <>
                     <span className="hit-body">
-                      <span>{r.doc.is_canvas ? `▨ ${r.doc.title}` : r.doc.title}</span>
+                      <span>{r.doc.title}</span>
                       {r.path !== r.doc.title && <span className="hit-text">{r.path}</span>}
                     </span>
-                    <span className="hint">{r.doc.is_canvas ? 'canvas' : i === sel && r.group === 'recent' ? 'recent' : 'doc'}</span>
+                    <span className="hint">{i === sel && r.group === 'recent' ? 'recent' : 'doc'}</span>
                   </>
                 )}
                 {r.group === 'content' && (

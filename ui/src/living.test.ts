@@ -1,20 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { livingLabel, livingTone, verifiedLabel, LivingStatus } from './stale'
+import { livingLabel, livingTone, LivingStatus } from './living'
 
 const NOW = Date.parse('2026-09-10T12:00:00Z')
 const ago = (ms: number) => new Date(NOW - ms).toISOString()
-const DAY = 86_400_000
-
-describe('verifiedLabel', () => {
-  it('reads never verified for a null stamp', () => {
-    expect(verifiedLabel(null, NOW)).toBe('never verified')
-    expect(verifiedLabel(undefined, NOW)).toBe('never verified')
-  })
-  it('reads verified <relative> otherwise', () => {
-    expect(verifiedLabel(ago(3 * DAY), NOW)).toBe('verified 3d ago')
-    expect(verifiedLabel(ago(2_000), NOW)).toBe('verified just now')
-  })
-})
 
 describe('livingLabel', () => {
   const base: LivingStatus = { is_answer: true, question: 'q', sources: [], changed: 0, last_refreshed: ago(2 * 3_600_000) }

@@ -1,8 +1,8 @@
 // The file tree (⌘T): a quiet library. Typography carries the hierarchy —
 // folders in --fg at weight 500, leaves in --fg-dim, a faint guide per
 // depth — and the root is grouped into Pinned / Folders / Notes. Behaviour
-// is unchanged from the old DocTreeNav: drag into/before/after, the
-// shared-subtree move confirm, arm-then-confirm delete with an undo toast.
+// is unchanged from the old DocTreeNav: drag into/before/after,
+// arm-then-confirm delete with an undo toast.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, Doc } from './types'
@@ -18,16 +18,7 @@ import {
   groupRoot,
   loadTreeState,
   saveTreeState,
-  staleness,
-  stalenessTitle,
 } from './tree'
-
-/** One row of GET /api/freshness (owned docs with content). */
-interface FreshRow {
-  id: string
-  verified_at: string | null
-  tended: boolean
-}
 
 type Drop = { id: string; mode: 'into' | 'before' | 'after' } | null
 
@@ -86,16 +77,6 @@ export default function DocTree({
   const groups = useMemo(() => groupRoot(docs, childrenOf), [docs, childrenOf])
   const counts = useMemo(() => descendantCounts(childrenOf), [childrenOf])
 
-  /* ---- freshness: one fetch, joined by id; only tended docs get a glyph ---- */
-  const [verified, setVerified] = useState<Map<string, string | null>>(new Map())
-  useEffect(() => {
-    // `tended=true` keeps the payload to the docs the indicator applies to;
-    // refetched whenever the doc list changes (a verification bumps it)
-    api<FreshRow[]>('/api/freshness?limit=1000&tended=true')
-      .then((rows) => setVerified(new Map((Array.isArray(rows) ? rows : []).map((r) => [r.id, r.verified_at]))))
-      .catch(() => setVerified(new Map()))
-  }, [docs])
-
   /* ---- open state, persisted (try/catch inside load/save) ---- */
   const persisted = useRef(loadTreeState())
   const [openDirs, setOpenDirs] = useState<Set<string>>(() => new Set(persisted.current.open))
@@ -149,25 +130,8 @@ export default function DocTree({
   /* ---- drag & drop ---- */
   const [dragging, setDragging] = useState<string | null>(null)
   const [drop, setDrop] = useState<Drop>(null)
-  const [pendingMove, setPendingMove] = useState<{
-    dragged: string
-    parent: string | null
-    sortKey: string | null
-    sharedRoot: string
-  } | null>(null)
-
-  // the nearest shared ancestor (incl. self) of a doc, if any
-  const sharedRootOf = (id: string | null): Doc | null => {
-    let cur = id ? byId.get(id) : undefined
-    while (cur) {
-      if (cur.is_shared) return cur
-      cur = cur.parent_id ? byId.get(cur.parent_id) : undefined
-    }
-    return null
-  }
-
-  // the actual move; the server may refuse (e.g. a mirror into a shared
-  // subtree) — its error string surfaces as a notice
+  // the actual move; the server may refuse (a cycle) — its error string
+  // surfaces as a notice
   const commitMove = async (dragged: string, parent: string | null, sortKey: string | null) => {
     try {
       await api(`/api/doc/${dragged}/move`, {
@@ -195,14 +159,6 @@ export default function DocTree({
       const siblings = (childrenOf.get(parent) ?? []).filter((d) => d.id !== dragged)
       const i = siblings.findIndex((d) => d.id === target.id)
       sortKey = keyForPosition(siblings, mode === 'before' ? i : i + 1)
-    }
-    // moving INTO a shared subtree makes the doc visible to its grantees on
-    // their next pull — loud, explicit confirm (ADR 0002 edge semantics)
-    const wasShared = sharedRootOf(byId.get(dragged)?.parent_id ?? null)
-    const nowShared = sharedRootOf(parent)
-    if (nowShared && nowShared.id !== wasShared?.id) {
-      setPendingMove({ dragged, parent, sortKey, sharedRoot: nowShared.title })
-      return
     }
     await commitMove(dragged, parent, sortKey)
   }
@@ -314,58 +270,20 @@ export default function DocTree({
           ) : (
             <span className="tree-leaf-slot" aria-hidden />
           )}
-          {d.is_canvas && <span className="tree-canvas" title="canvas">▨</span>}
           <span className="tree-title">{d.title}</span>
           <span className="tree-badges">
             {isDir && !open && <span className="tree-count">{counts.get(d.id) ?? 0}</span>}
-            {(() => {
-              // the tended dot carries freshness too: green = verified
-              // recently, amber = stale / never verified (tooltip says which).
-              // Docs inside a tended scope (in the freshness map but not the
-              // scope root) show only the amber dot, and only when stale —
-              // a fresh library stays quiet.
-              const s = verified.has(d.id) ? staleness(verified.get(d.id)) : null
-              const stale = !!s && s.kind !== 'fresh'
-              if (d.is_tended) {
-                return (
-                  <span
-                    className={`tend-dot ${stale ? 'stale' : ''}`}
-                    title={stale ? `tended by agents · ${stalenessTitle(s)}` : 'tended by agents'}
-                  />
-                )
-              }
-              if (stale) return <span className="tend-dot stale in-scope" title={stalenessTitle(s)} />
-              return null
-            })()}
-            {d.mirror_permission && !d.from_hub && (
-              <span className="mirror-badge quiet" title={`shared with you (${d.mirror_permission})`}>⇄</span>
-            )}
-            {d.from_hub && (
-              <span
-                className="mirror-badge hub quiet"
-                title={d.origin_owner_name ? `relayed by the hub · owned by ${d.origin_owner_name}` : 'a hub folder'}
-              >
-                ⌂
-              </span>
-            )}
-            {d.is_shared && !d.published_to && (
-              <span className="shared-badge quiet" title="you share this subtree">↗</span>
-            )}
-            {d.published_to && !d.mirror_permission && (
-              <span className="shared-badge hub quiet" title={`published to ${d.published_to}`}>⌂</span>
-            )}
-            {!d.mirror_permission && (
-              <button
-                className={`tree-delete ${armed === d.id ? 'armed' : ''}`}
-                title={armed === d.id ? 'click again to delete' : 'delete'}
-                onClick={(e) => {
-                  e.stopPropagation()
-                  doDelete(d)
-                }}
-              >
-                {armed === d.id ? 'sure?' : '×'}
-              </button>
-            )}
+            {d.is_tended && <span className="tend-dot" title="tended by agents" />}
+            <button
+              className={`tree-delete ${armed === d.id ? 'armed' : ''}`}
+              title={armed === d.id ? 'click again to delete' : 'delete'}
+              onClick={(e) => {
+                e.stopPropagation()
+                doDelete(d)
+              }}
+            >
+              {armed === d.id ? 'sure?' : '×'}
+            </button>
           </span>
         </div>
         {isDir && (
@@ -431,29 +349,6 @@ export default function DocTree({
           ⌘T
         </button>
       </div>
-      {pendingMove && (
-        <div className="move-confirm">
-          <div>
-            “{byId.get(pendingMove.dragged)?.title ?? '?'}” will become visible to
-            everyone “{pendingMove.sharedRoot}” is shared with
-          </div>
-          <div className="move-confirm-actions">
-            <button
-              className="accept"
-              onClick={() => {
-                const m = pendingMove
-                setPendingMove(null)
-                commitMove(m.dragged, m.parent, m.sortKey)
-              }}
-            >
-              share it
-            </button>
-            <button className="decline" onClick={() => setPendingMove(null)}>
-              cancel
-            </button>
-          </div>
-        </div>
-      )}
       <div
         className="tree-root"
         onDragOver={(e) => {

@@ -9,7 +9,6 @@ export type ShortcutAction =
   | 'search' // ⌘P / ⌘S / ⌘F — content (FTS) search
   | 'tree' // ⌘T — file tree
   | 'newdoc' // ⌘N — new doc
-  | 'newcanvas' // ⌘⇧N — new canvas
   | 'review' // ⌘⇧R — review queue
   | 'gardeners' // ⌘G — gardeners
   | 'reload' // ⌘R — reload
@@ -50,7 +49,7 @@ export function resolveShortcut(e: KeyLike): ShortcutAction | null {
     case 't':
       return 'tree'
     case 'n':
-      return e.shiftKey ? 'newcanvas' : 'newdoc'
+      return e.shiftKey ? null : 'newdoc'
     case 'r':
       return e.shiftKey ? 'review' : 'reload'
     case 'g':

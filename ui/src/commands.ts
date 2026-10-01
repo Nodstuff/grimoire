@@ -15,12 +15,9 @@ export type CommandAction =
   | 'tree'
   | 'home'
   | 'newdoc'
-  | 'newcanvas'
   | 'graph'
-  | 'sharing'
   | 'profile'
   | 'trash'
-  | 'freshness'
   | 'capture'
   | 'close'
 
@@ -49,14 +46,11 @@ export function buildCommands({ queueCount, docId, inboxId, onAction, onOpenDoc 
     },
     { id: 'capture', label: 'Quick capture…', hint: 'a note straight into Inbox', keys: '⌘⇧I', run: () => onAction('capture') },
     { id: 'newdoc', label: 'New doc…', keys: '⌘N', run: () => onAction('newdoc') },
-    { id: 'newcanvas', label: 'New canvas…', keys: '⌘⇧N', run: () => onAction('newcanvas') },
     { id: 'home', label: 'Home', hint: 'the briefing', keys: '⌘W', run: () => onAction('home') },
     { id: 'runs', label: 'Gardeners', keys: '⌘G', run: () => onAction('runs') },
-    { id: 'sharing', label: 'Shares & contacts', run: () => onAction('sharing') },
-    { id: 'profile', label: 'Profile', hint: 'your name, node id, fingerprint', run: () => onAction('profile') },
+    { id: 'profile', label: 'Profile', hint: 'your name, version, diagnostics', run: () => onAction('profile') },
     { id: 'graph', label: 'Graph view', run: () => onAction('graph') },
     { id: 'trash', label: 'Trash', hint: 'restore deleted docs', run: () => onAction('trash') },
-    { id: 'freshness', label: 'Stale docs', hint: 'never verified first, then the oldest verification', run: () => onAction('freshness') },
     { id: 'tree', label: 'Toggle file tree', keys: '⌘T', run: () => onAction('tree') },
     {
       id: 'import',

@@ -1,7 +1,7 @@
-// Profile: the name contacts see, plus this node's id and fingerprint. Two
-// surfaces share the same save path: the Profile page (⌘K → Profile, or the
-// name chip on the Shares page) and the first-run prompt shown until the
-// install-default name has been confirmed once.
+// Profile: the owner's display name, the version and diagnostics. Two
+// surfaces share the same save path: the Profile page (⌘K → Profile) and the
+// first-run prompt shown until the install-default name has been confirmed
+// once.
 
 import { useEffect, useState } from 'react'
 import PaletteShell from './PaletteShell'
@@ -64,7 +64,7 @@ function shortId(id: string | undefined): string {
 }
 
 /** Shown on load while `confirmed === false`. Not dismissible by Esc or
- * click-outside — a name is required for sharing to mean anything. */
+ * click-outside — a name is how your edits are attributed. */
 export function FirstRunName({ profile, onSaved }: { profile: ProfileRow; onSaved: (p: ProfileRow) => void }) {
   const [name, setName] = useState(profile.name)
   const [busy, setBusy] = useState(false)
@@ -89,8 +89,8 @@ export function FirstRunName({ profile, onSaved }: { profile: ProfileRow; onSave
       <div className="first-run">
         <div className="first-run-title">What should others call you?</div>
         <div className="meta">
-          this is the name your contacts see on shares, proposals and edits — you can change it
-          later under Profile
+          this is the name your edits and reviews are attributed to — you can change it later
+          under Profile
         </div>
         <input
           autoFocus
@@ -128,7 +128,6 @@ export default function Profile({
   const [profile, setProfile] = useState<ProfileRow | null | undefined>(undefined)
   const [name, setName] = useState('')
   const [busy, setBusy] = useState(false)
-  const [copied, setCopied] = useState<string | null>(null)
   // App polls /api/stamp every 2.5s and newer daemons put the version on it;
   // only an older daemon (no version there) costs a /api/buildinfo call
   const [fetchedVersion, setFetchedVersion] = useState<string | null>(null)
@@ -150,8 +149,6 @@ export default function Profile({
       const d = await api<Diagnostics>('/api/diagnostics')
       const lines = [
         `Grimoire ${d.version}`,
-        `node id: ${profile?.node_id ?? '—'}`,
-        `fingerprint: ${profile?.fingerprint ?? '—'}`,
         `log: ${d.log_path ?? '—'}`,
         '',
         d.log_tail,
@@ -182,15 +179,6 @@ export default function Profile({
     setBusy(false)
   }
 
-  const copy = (label: string, value: string) => {
-    copyText(value)
-      .then(() => {
-        setCopied(label)
-        setTimeout(() => setCopied(null), 1800)
-      })
-      .catch((e) => notify(`could not copy: ${errText(e)}`))
-  }
-
   if (profile === undefined) return <div className="queue"><h1 className="queue-title">profile</h1></div>
   if (profile === null) {
     return (
@@ -208,7 +196,7 @@ export default function Profile({
       <div className="card">
         <div className="card-head">
           <span>name</span>
-          <span className="meta">this is the name your contacts see</span>
+          <span className="meta">your edits and reviews are attributed to it</span>
         </div>
         <div className="profile-name-row">
           <input
@@ -223,32 +211,13 @@ export default function Profile({
           </button>
         </div>
         {!profile.confirmed && (
-          <div className="meta">still the install default — pick something your contacts will recognise</div>
+          <div className="meta">still the install default — pick your own</div>
         )}
       </div>
 
       <div className="card">
         <div className="card-head">
           <span>identity</span>
-          <span className="meta">share the fingerprint out-of-band so contacts can verify you</span>
-        </div>
-        <div className="profile-kv">
-          <span className="meta">node id</span>
-          <span className="mono" title={profile.node_id ?? ''}>{shortId(profile.node_id)}</span>
-          {profile.node_id && (
-            <button className="chip" onClick={() => copy('node', profile.node_id!)}>
-              {copied === 'node' ? 'copied ✓' : 'copy'}
-            </button>
-          )}
-        </div>
-        <div className="profile-kv">
-          <span className="meta">fingerprint</span>
-          <span className="mono">{profile.fingerprint ?? '—'}</span>
-          {profile.fingerprint && (
-            <button className="chip" onClick={() => copy('fp', profile.fingerprint!)}>
-              {copied === 'fp' ? 'copied ✓' : 'copy'}
-            </button>
-          )}
         </div>
         <div className="profile-kv">
           <span className="meta">account id</span>

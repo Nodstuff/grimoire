@@ -16,7 +16,7 @@ import { Chips, ProgressLine, StatusPill, failureLine, runChips } from './RunSta
 import Todo from './TodoList'
 import { DAILY_ROOT, clockOf, findDailyDoc, findDailyRoot, localDateTitle, sinceItems, type NewDoc, type SinceItem } from './briefing'
 import { addDays, openItems, summaryLine, type TodoDay } from './todo'
-import { api, type ActivityItem, type Doc, type GardenerRun } from './types'
+import { api, type Doc, type GardenerRun } from './types'
 import type { Gardener } from './Gardeners'
 
 const COLLAPSED_KEY = 'grimoire.home.collapsed'
@@ -192,15 +192,12 @@ export default function Home({
       const q = v.since ? `?since=${encodeURIComponent(v.since)}` : ''
       Promise.all([
         api<GardenerRun[]>('/api/runs').catch(() => [] as GardenerRun[]),
-        api<ActivityItem[]>('/api/activity?limit=50').catch(() => [] as ActivityItem[]),
         api<{ docs: NewDoc[] }>(`/api/home/since${q}`)
           .then((r) => r.docs ?? [])
           .catch(() => [] as NewDoc[]),
-      ]).then(([runs, activity, newDocs]) => {
+      ]).then(([runs, newDocs]) => {
         if (stale) return
-        setSinceList(
-          sinceItems(v.since, Array.isArray(runs) ? runs : [], Array.isArray(activity) ? activity : [], Array.isArray(newDocs) ? newDocs : []),
-        )
+        setSinceList(sinceItems(v.since, Array.isArray(runs) ? runs : [], Array.isArray(newDocs) ? newDocs : []))
       })
     })
     return () => {
@@ -381,11 +378,11 @@ function TimelineRow({ it, gardeners, onOpenDoc }: { it: SinceItem; gardeners: M
     <li className={`tl-row ${it.kind}`}>
       {time}
       <span className={`tl-glyph ${it.kind}`} aria-hidden>
-        {it.kind === 'edit' ? '✎' : '+'}
+        +
       </span>
       <span className="tl-body">
         <span className="tl-line">
-          <span className="tl-who">{it.who}</span> {it.kind === 'edit' ? 'edited' : 'created'}{' '}
+          <span className="tl-who">{it.who}</span> created{' '}
           <button className="home-link" onClick={() => onOpenDoc(it.docId)}>
             {it.docTitle}
           </button>

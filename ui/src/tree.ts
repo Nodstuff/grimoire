@@ -28,26 +28,21 @@ export function childrenIndex(docs: Doc[]): Map<string | null, Doc[]> {
   return m
 }
 
-/** Root docs in three groups: Pinned = system folders by exact title plus
- * anything that came from a hub; Folders = the remaining roots with
- * children, alphabetical; Notes = root leaves in the server's order. */
+/** Root docs in three groups: Pinned = system folders by exact title;
+ * Folders = the remaining roots with children, alphabetical; Notes = root
+ * leaves in the server's order. */
 export function groupRoot(docs: Doc[], children: Map<string | null, Doc[]>): RootGroups {
   const pinned: Doc[] = []
   const folders: Doc[] = []
   const notes: Doc[] = []
   for (const d of children.get(null) ?? []) {
-    if (PINNED_TITLES.has(d.title) || d.from_hub) pinned.push(d)
+    if (PINNED_TITLES.has(d.title)) pinned.push(d)
     else if (children.get(d.id)?.length) folders.push(d)
     else notes.push(d)
   }
   const byTitle = (a: Doc, b: Doc) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' })
-  pinned.sort((a, b) => {
-    // system folders first, in their canonical order; hubs after, by name
-    const ai = [...PINNED_TITLES].indexOf(a.title)
-    const bi = [...PINNED_TITLES].indexOf(b.title)
-    if (ai !== -1 || bi !== -1) return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi)
-    return byTitle(a, b)
-  })
+  // system folders in their canonical order
+  pinned.sort((a, b) => [...PINNED_TITLES].indexOf(a.title) - [...PINNED_TITLES].indexOf(b.title))
   folders.sort(byTitle)
   return { pinned, folders, notes }
 }
@@ -176,35 +171,6 @@ export function saveTreeState(state: TreeState, storage: Pick<Storage, 'setItem'
     storage?.setItem(TREE_STATE_KEY, JSON.stringify(state))
   } catch {
     // private mode / quota: the tree just forgets on reload
-  }
-}
-
-/* ---------- freshness in the tree ---------- */
-
-/** A tended doc verified longer ago than this is marked stale in the tree. */
-export const STALE_AFTER_DAYS = 30
-
-export type Staleness = { kind: 'fresh' } | { kind: 'never' } | { kind: 'stale'; days: number }
-
-/** Never verified → `never`; verified more than `STALE_AFTER_DAYS` ago →
- * `stale` with the age; else `fresh`. Unparseable stamps count as never. */
-export function staleness(verifiedAt: string | null | undefined, now: number = Date.now(), after = STALE_AFTER_DAYS): Staleness {
-  if (!verifiedAt) return { kind: 'never' }
-  const t = new Date(verifiedAt).getTime()
-  if (Number.isNaN(t)) return { kind: 'never' }
-  const days = Math.floor((now - t) / 86_400_000)
-  return days > after ? { kind: 'stale', days } : { kind: 'fresh' }
-}
-
-/** Tooltip for the tree's stale glyph. */
-export function stalenessTitle(s: Staleness): string {
-  switch (s.kind) {
-    case 'never':
-      return 'never verified'
-    case 'stale':
-      return `verified ${s.days}d ago`
-    default:
-      return ''
   }
 }
 

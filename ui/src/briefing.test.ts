@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { clockOf, findDailyDoc, localDateTitle, sinceItems } from './briefing'
-import type { ActivityItem, Doc, GardenerRun } from './types'
+import type { Doc, GardenerRun } from './types'
 
 describe('sinceItems', () => {
   const now = new Date('2026-09-10T12:00:00Z').getTime()
@@ -9,22 +9,18 @@ describe('sinceItems', () => {
     { id: 'r0', gardener: 'g', gardener_name: 'tagger', started_at: '2026-09-08T09:00:00Z', status: 'ok', summary: null, tokens_used: null, tool_calls: null },
     { id: 'rr', gardener: 'g', gardener_name: 'auditor', started_at: '2026-09-07T09:00:00Z', status: 'running', summary: 'working… 4s · 1 tool call', tokens_used: null, tool_calls: null },
   ]
-  const activity: ActivityItem[] = [
-    { op_id: 'o1', doc_id: 'd', doc_title: 'Notes', principal: 'p', principal_name: 'alice', op_type: 'replace', epoch: 3, created_at: '2026-09-10T10:00:00Z' },
-  ]
   const docs = [{ id: 'n', title: 'Answer', created_by_name: 'scribe', created_by_kind: 'agent', created_at: '2026-09-10T11:00:00Z' }]
 
   it('merges newest-first and drops anything before the stamp — except a run still going', () => {
-    const items = sinceItems('2026-09-09T00:00:00Z', runs, activity, docs, now)
-    expect(items.map((i) => i.kind)).toEqual(['newdoc', 'edit', 'run', 'run'])
-    expect(items[2].kind === 'run' && items[2].run.id).toBe('r1')
-    expect(items[3].kind === 'run' && items[3].run.status).toBe('running')
-    expect(items[1].kind === 'edit' && items[1].who).toBe('alice')
+    const items = sinceItems('2026-09-09T00:00:00Z', runs, docs, now)
+    expect(items.map((i) => i.kind)).toEqual(['newdoc', 'run', 'run'])
+    expect(items[1].kind === 'run' && items[1].run.id).toBe('r1')
+    expect(items[2].kind === 'run' && items[2].run.status).toBe('running')
     expect(items[0].kind === 'newdoc' && items[0].docTitle).toBe('Answer')
   })
   it('without a stamp shows the last 24h', () => {
-    expect(sinceItems(null, runs.slice(0, 2), [], [], now)).toHaveLength(1)
-    expect(sinceItems('2026-09-10T11:30:00Z', runs.slice(0, 2), activity, docs, now)).toHaveLength(0)
+    expect(sinceItems(null, runs.slice(0, 2), [], now)).toHaveLength(1)
+    expect(sinceItems('2026-09-10T11:30:00Z', runs.slice(0, 2), docs, now)).toHaveLength(0)
   })
   it('clock stamps carry the weekday when not today', () => {
     const today = new Date(2026, 8, 10, 21, 34).toISOString()

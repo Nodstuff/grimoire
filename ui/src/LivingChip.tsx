@@ -5,7 +5,7 @@
 
 import { useEffect, useState } from 'react'
 import { api } from './types'
-import { LivingStatus, livingLabel, livingTone } from './stale'
+import { LivingStatus, livingLabel, livingTone } from './living'
 
 export default function LivingChip({ docId, dataVersion }: { docId: string; dataVersion: number }) {
   const [status, setStatus] = useState<LivingStatus | null>(null)

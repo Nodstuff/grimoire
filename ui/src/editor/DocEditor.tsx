@@ -11,11 +11,10 @@ import { TableKit } from '@tiptap/extension-table'
 import CodeBlockView from './CodeBlockView'
 import { WikilinkDeco } from './WikilinkDeco'
 import { ReviewHighlight, ReviewMap, setReviewMap } from './ReviewHighlight'
-import { Suggestions } from './Suggestions'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block } from '../types'
 import { notify } from '../Notice'
-import { proposeErrorText, saveErrorText } from '../hints'
+import { saveErrorText } from '../hints'
 import { BaselineBlock, Entry, computeOps } from './diff'
 import { debounce } from '../timing'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
@@ -58,18 +57,12 @@ const BlockId = Extension.create({
   },
 })
 
-/** The editor extension set. `history: false` builds the variant for the live
- * (Yjs) editor: StarterKit bundles undo/redo as a nested extension, so it must
- * be switched off at configure time — filtering the array by name never
- * matches it (the top-level name is 'starterKit'). Yjs owns history in
- * collab mode; two history plugins would fight. Schema is identical either
- * way (undo/redo adds no nodes or marks). */
-export function makeExtensions({ history }: { history: boolean }) {
+/** The editor extension set. */
+export function makeExtensions() {
   return [
     StarterKit.configure({
       link: { openOnClick: false },
       codeBlock: false,
-      ...(history ? {} : { undoRedo: false }),
     }),
     CodeBlock.extend({
       addNodeView() {
@@ -80,10 +73,9 @@ export function makeExtensions({ history }: { history: boolean }) {
     WikilinkDeco,
     BlockId,
     ReviewHighlight,
-    Suggestions,
   ]
 }
-export const extensions = makeExtensions({ history: true })
+export const extensions = makeExtensions()
 export const schema = getSchema(extensions)
 export const parser = makeParser(schema)
 export const serializer = makeSerializer()
@@ -97,35 +89,23 @@ export interface EditableDoc {
 
 type SaveState = 'clean' | 'dirty' | 'saving'
 
-/** direct = normal gate save; readonly = view-only mirror; propose = mirror
- * with propose permission — edits ship UPSTREAM as a proposal (no autosave,
- * explicit action), then the editor resets to the pristine mirror. */
-export type EditorMode = 'direct' | 'readonly' | 'propose'
-
 export default function DocEditor({
   doc,
-  mode = 'direct',
   onSaved,
-  onProposed,
   onSelectionBlock,
   reviewMap,
 }: {
   doc: EditableDoc
-  mode?: EditorMode
   /** `docId` names the doc the save landed on: the unmount flush can fire
    * after the parent has moved to another doc, which must ignore it */
   onSaved: (epoch: number, docId: string) => void
-  onProposed?: () => void
   onSelectionBlock?: (blockId: string | null) => void
   /** blocks under review → tone; painted as node decorations, no remount */
   reviewMap?: ReviewMap
 }) {
   const selCb = useRef(onSelectionBlock)
   selCb.current = onSelectionBlock
-  const modeRef = useRef(mode)
-  modeRef.current = mode
   const [saveState, setSaveState] = useState<SaveState>('clean')
-  const [epoch, setEpoch] = useState(doc.epoch)
   // autosave debounce, driven by the editor's update event: every keystroke
   // re-arms it, so the save lands 1.2s after the LAST edit. (An effect keyed
   // on editor.state.doc did not re-arm — Tiptap 3 does not re-render per
@@ -166,14 +146,13 @@ export default function DocEditor({
   useEffect(() => {
     baselineRef.current = initial.baseline
     epochRef.current = doc.epoch
-    setEpoch(doc.epoch)
     setSaveState('clean')
   }, [initial])
 
   const editor = useEditor(
     {
       extensions,
-      editable: mode !== 'readonly',
+      editable: true,
       content: {
         type: 'doc',
         content: initial.nodes.map((n) => n.toJSON()),
@@ -183,7 +162,7 @@ export default function DocEditor({
         // arming the debounce for it caused a spurious empty save 1.2s later
         if (transaction.getMeta(STAMP_META)) return
         setSaveState('dirty')
-        if (modeRef.current === 'direct') autosave.current.arm()
+        autosave.current.arm()
       },
       onSelectionUpdate: ({ editor }) => {
         const sel = editor.state.selection
@@ -245,7 +224,7 @@ export default function DocEditor({
   }
 
   const runSave = async () => {
-    if (!editor || modeRef.current === 'readonly') return
+    if (!editor) return
     autosave.current.cancel()
     // what this save writes; edits landing while the request is in flight
     // make the doc differ from it, and the editor must stay dirty for them
@@ -259,24 +238,6 @@ export default function DocEditor({
     })
     if (ops.length === 0) {
       setSaveState('clean')
-      return
-    }
-    if (mode === 'propose') {
-      // pessimistic mirror: the edit becomes an upstream proposal; the local
-      // doc never changes until the owner accepts and a pull lands it
-      setSaveState('saving')
-      try {
-        await api('/admin/propose_upstream', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ doc_id: doc.docId, ops, note: '' }),
-        })
-        setSaveState('clean')
-        onProposed?.()
-      } catch (e) {
-        setSaveState('dirty')
-        notify(proposeErrorText(e), 'warn')
-      }
       return
     }
     setSaveState('saving')
@@ -307,7 +268,6 @@ export default function DocEditor({
       // new baseline = what we just wrote
       baselineRef.current = rebuildBaseline(baselineRef.current, entries, ops)
       epochRef.current = out.epoch
-      setEpoch(out.epoch)
       lastSaveError.current = null
       // typed during the request? those keystrokes are not in what landed
       const plan = afterSave({ editedMeanwhile, mounted: mounted.current })
@@ -350,32 +310,13 @@ export default function DocEditor({
 
   saveRef.current = save
 
-  // cold-editor heartbeat (auto-hot): while someone is actively in this
-  // editor, tell the daemon — two concurrent editors escalate to a live
-  // session (the DocView owns the escalation; we just ping)
-  const editorKey = useRef(crypto.randomUUID())
-  useEffect(() => {
-    if (mode === 'readonly') return
-    const t = setInterval(() => {
-      if (!editor) return
-      const active = editor.isFocused || saveState !== 'clean'
-      if (!active) return
-      api(`/api/doc/${doc.docId}/editing`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key: editorKey.current }),
-      }).catch(() => {})
-    }, 4000)
-    return () => clearInterval(t)
-  }, [editor, mode, doc.docId, saveState])
   // a failed save leaves the doc dirty with no new keystrokes to re-arm the
-  // debounce: retry on a slow clock until it lands (daemon back, live
-  // session over, …)
+  // debounce: retry on a slow clock until it lands (daemon back, …)
   useEffect(() => {
-    if (saveState !== 'dirty' || mode !== 'direct') return
+    if (saveState !== 'dirty') return
     const t = setInterval(() => saveRef.current(), 5000)
     return () => clearInterval(t)
-  }, [saveState, mode])
+  }, [saveState])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -389,7 +330,6 @@ export default function DocEditor({
       // its own docId, so a parent that has moved on ignores the result)
       pending.cancel()
       mounted.current = false
-      if (modeRef.current !== 'direct') return
       const flight = inFlight.current
       if (!flight) {
         saveRef.current()
@@ -403,32 +343,12 @@ export default function DocEditor({
     }
   }, [])
 
-  if (mode === 'propose') {
-    return (
-      <>
-        <EditorContent editor={editor} />
-        {saveState !== 'clean' ? (
-          <button
-            className="propose-cta"
-            disabled={saveState === 'saving'}
-            onClick={() => saveRef.current()}
-          >
-            {saveState === 'saving' ? 'sending…' : 'suggest changes ⌘⏎'}
-          </button>
-        ) : (
-          <span className="save-state clean" title={`version ${epoch}`}>up to date</span>
-        )}
-      </>
-    )
-  }
   return (
     <>
       <EditorContent editor={editor} />
-      {mode === 'direct' && (
-        <span className={`save-state ${saveState}`}>
-          {saveState === 'clean' ? 'saved' : saveState === 'dirty' ? 'unsaved' : 'saving…'}
-        </span>
-      )}
+      <span className={`save-state ${saveState}`}>
+        {saveState === 'clean' ? 'saved' : saveState === 'dirty' ? 'unsaved' : 'saving…'}
+      </span>
     </>
   )
 }

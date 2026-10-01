@@ -1,14 +1,10 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DocEditor from './editor/DocEditor'
-import HotEditor, { AgentStatus, HotDoc } from './editor/HotEditor'
 import TendPanel from './TendPanel'
 import Gardeners from './Gardeners'
-import Sharing from './Sharing'
-import SharePanel from './SharePanel'
 import PaletteShell from './PaletteShell'
 import Profile, { FirstRunName, loadProfile } from './Profile'
 import Trash from './Trash'
-import Freshness, { FreshnessChip } from './Freshness'
 import LivingChip from './LivingChip'
 import ImportFolder from './ImportFolder'
 import ReviewRail from './ReviewRail'
@@ -21,12 +17,8 @@ import Omnibox from './Omnibox'
 import { buildCommands } from './commands'
 import { loadRecentIds, pushRecentId, storeRecentIds, type OmniMode } from './omni'
 
-// heavy views load on first use: xyflow + html-to-image (canvas) and
-// force-graph (graph) are not part of the boot bundle
-const CanvasBlock = lazy(() => import('./CanvasBlock'))
-
 /** The doc side panels, owned by App so a doc switch does not close one. */
-type Panel = 'none' | 'history' | 'comments' | 'tend' | 'share' | 'review'
+type Panel = 'none' | 'history' | 'comments' | 'tend' | 'review'
 
 type Stamp = { stamp: number; build?: number; version?: string }
 
@@ -35,24 +27,18 @@ type Stamp = { stamp: number; build?: number; version?: string }
  * never fired for the one failure mode it exists for. */
 const pollTimeout = () => AbortSignal.timeout(4000)
 
-/** An editor with unsaved work, canvas included — a deploy must not reload
- * over it. Both editors render the same `.save-state` chip. */
+/** An editor with unsaved work — a deploy must not reload over it. */
 const DIRTY_SELECTOR = '.save-state.dirty, .save-state.saving'
+// force-graph (graph) is not part of the boot bundle: it loads on first use
 const GraphView = lazy(() => import('./GraphView'))
 const Loading = () => <div className="lazy-loading">loading…</div>
 import { resolveShortcut } from './shortcuts'
 import { parseDeepLink, scrubDeepLink } from './deeplink'
 import { actionLabels, buildHighlightMap, describeChange, isDocOp, targetBlockOf } from './review'
-import { activityLine, loadLastSeen, storeLastSeen, unseenActivity } from './activity'
-import { advanceEvents, EventsCursor, EventsResponse, INITIAL_CURSOR, liveEventLine } from './live'
-import { chipText } from './shares'
 import {
   api,
-  ApiError,
-  ActivityItem,
   Block,
   Doc,
-  DocFederation,
   DocTree,
   BlockNode,
   HistoryRow,
@@ -60,7 +46,6 @@ import {
   SearchHit,
   GardenerRun,
   Profile as ProfileRow,
-  ShareOffer,
 } from './types'
 
 type View =
@@ -68,14 +53,12 @@ type View =
   | { kind: 'review' }
   | { kind: 'runs' }
   | { kind: 'graph' }
-  | { kind: 'sharing' }
   | { kind: 'profile' }
   | { kind: 'trash' }
-  | { kind: 'freshness' }
   | { kind: 'home' }
 /** `omnibox` is the one search-and-command palette (⌘K / ⌘O / ⌘P / ⌘/ all
  * open it, in different modes — see `omniMode`). */
-type Palette = null | 'omnibox' | 'newdoc' | 'newcanvas' | 'help' | 'capture'
+type Palette = null | 'omnibox' | 'newdoc' | 'help' | 'capture'
 
 /** How a doc is opened: `anchor` is a [[Doc#fragment]] target (`^uuid` for a
  * block); `review` opens the in-editor review rail; `blockId` scrolls to that
@@ -89,11 +72,6 @@ export type OpenDoc = (id: string, opts?: string | OpenDocOpts) => void
 
 export default function App() {
   const [view, setViewRaw] = useState<View>({ kind: 'home' })
-  // a clicked grimoire://join/… link arrives from the shell as ?join=<payload>
-  const [joinPrefill, setJoinPrefill] = useState<string | null>(() => {
-    const payload = new URLSearchParams(location.search).get('join')
-    return payload ? `grimoire://join/${payload}` : null
-  })
   const [anchor, setAnchor] = useState<string | null>(null)
   // opened FROM the review queue (or with { review: true }): DocView opens its rail
   const [reviewIntent, setReviewIntent] = useState(false)
@@ -142,8 +120,6 @@ export default function App() {
     omniModeRef.current = mode
   }, [])
   const [queueCount, setQueueCount] = useState(0)
-  // invites v2: open share requests ride the same header chip
-  const [offerCount, setOfferCount] = useState(0)
   // first-run name prompt: shown until the install-default name is confirmed.
   // null = no profile route (older daemon) or not loaded yet → no prompt.
   const [profile, setProfile] = useState<ProfileRow | null>(null)
@@ -156,9 +132,6 @@ export default function App() {
       api<QueueRow[]>('/api/queue').then((q) => q.length).catch(() => 0),
       api<{ block: { id: string } }[]>('/api/flags').then((f) => f.length).catch(() => 0),
     ]).then(([q, f]) => setQueueCount(q + f))
-    api<ShareOffer[]>('/admin/offers')
-      .then((o) => setOfferCount(Array.isArray(o) ? o.length : 0))
-      .catch(() => setOfferCount(0))
   }, [])
 
   // ?doc=<uuid>[&block=<uuid>][&tab=<name>]: the shell or an embedding host
@@ -181,10 +154,6 @@ export default function App() {
       if (link.tab && link.tab !== 'home') setViewRaw({ kind: link.tab })
       window.history.replaceState(null, '', location.pathname + scrubDeepLink(location.search) + location.hash)
     }
-    if (joinPrefill) {
-      setViewRaw({ kind: 'sharing' })
-      window.history.replaceState(null, '', '/') // don't re-trigger on reload
-    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshQueue])
 
@@ -194,40 +163,14 @@ export default function App() {
   // the stamp poll doubles as the liveness check: three misses in a row
   // (7.5s) = the background service is down; one hit clears it
   const [daemonDown, setDaemonDown] = useState(false)
-  // owner→grantee nudges (GET /api/events): a doc_changed for the doc that is
-  // open makes DocView reload at once instead of waiting for the next pull
-  const [liveChange, setLiveChange] = useState<{ docId: string; n: number } | null>(null)
   const openDocRef = useRef<OpenDoc>(() => {})
   useEffect(() => {
     let stamp: number | null = null
     let build: number | null = null
-    let cursor: EventsCursor = INITIAL_CURSOR
-    const pollEvents = async () => {
-      // older daemon without the route: api() throws, cursor stays put
-      const resp = await api<EventsResponse>(`/api/events?since=${cursor.since}`, {
-        signal: pollTimeout(),
-      }).catch(() => null)
-      const r = advanceEvents(cursor, resp)
-      cursor = r.cursor
-      for (const ev of r.fresh) {
-        const line = liveEventLine(ev)
-        if (ev.kind === 'share_offered') {
-          // durable request: the toast just points at the Shares page
-          if (line) notify(line, 'ok', { ttlMs: 15_000, onClick: () => setViewRaw({ kind: 'sharing' }) })
-          refreshQueue()
-        } else if (line) {
-          notify(line, 'ok', { onClick: () => openDocRef.current(ev.doc_id) })
-        } else if (ev.kind === 'doc_changed' && ev.doc_id) {
-          setLiveChange((c) => ({ docId: ev.doc_id, n: (c?.n ?? 0) + 1 }))
-        }
-      }
-    }
-    // don't wait a whole tick for the first nudge check
-    pollEvents().catch(() => {})
     let misses = 0
     let inFlight = false
     const t = setInterval(async () => {
-      // a slow daemon must not stack ticks (each one is up to three requests)
+      // a slow daemon must not stack ticks (each one is up to two requests)
       if (inFlight) return
       inFlight = true
       try {
@@ -242,7 +185,6 @@ export default function App() {
           api<Doc[]>('/api/docs').then(setDocs).catch(() => {})
           refreshQueue()
         }
-        await pollEvents()
         // deploy landed → reload the bundle (deferred while an editor is dirty).
         // Newer daemons carry the build on the stamp; fall back to the
         // dedicated route only when it is absent.
@@ -264,23 +206,6 @@ export default function App() {
     }, 2500)
     return () => clearInterval(t)
   }, [refreshQueue])
-
-  // owner notifications: maintainer-tier (green) edits land directly, so the
-  // activity feed is the only signal. Poll on data changes; toast each
-  // unseen item once; remember the newest seen op across launches.
-  const lastSeenOp = useRef<string | null>(loadLastSeen())
-  useEffect(() => {
-    api<ActivityItem[]>('/api/activity?limit=20')
-      .then((items) => {
-        if (!Array.isArray(items) || items.length === 0) return
-        for (const it of unseenActivity(items, lastSeenOp.current).reverse()) {
-          notify(activityLine(it), 'ok')
-        }
-        lastSeenOp.current = items[0].op_id
-        storeLastSeen(items[0].op_id)
-      })
-      .catch(() => {})
-  }, [dataVersion])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -336,9 +261,6 @@ export default function App() {
         case 'newdoc':
           setPalette((p) => (p === 'newdoc' ? null : 'newdoc'))
           break
-        case 'newcanvas':
-          setPalette((p) => (p === 'newcanvas' ? null : 'newcanvas'))
-          break
         case 'review':
           setView({ kind: 'review' })
           break
@@ -392,13 +314,11 @@ export default function App() {
           if (a === 'review') setView({ kind: 'review' })
           if (a === 'runs') setView({ kind: 'runs' })
           if (a === 'graph') setView({ kind: 'graph' })
-          if (a === 'sharing') setView({ kind: 'sharing' })
           if (a === 'profile') setView({ kind: 'profile' })
           if (a === 'trash') setView({ kind: 'trash' })
-          if (a === 'freshness') setView({ kind: 'freshness' })
           if (a === 'home') setView({ kind: 'home' })
           if (a === 'tree') setTreeOpen((t) => !t)
-          if (a === 'capture' || a === 'newdoc' || a === 'newcanvas') {
+          if (a === 'capture' || a === 'newdoc') {
             setPalette(a)
             return
           }
@@ -407,17 +327,6 @@ export default function App() {
       }),
     [queueCount, view, setView, docs],
   )
-
-  // canvas nodes fire wikilink clicks as events (CanvasBlock has no doc list)
-  useEffect(() => {
-    const onOpen = (e: Event) => {
-      const title = (e as CustomEvent<string>).detail
-      const target = docs.find((d) => d.title === title)
-      if (target) openDoc(target.id)
-    }
-    window.addEventListener('grimoire:open-doc', onOpen)
-    return () => window.removeEventListener('grimoire:open-doc', onOpen)
-  }, [docs, openDoc])
 
   // quick capture from outside the page: the shell's global hotkey (⌥⌘G) and
   // tray item emit CAPTURE_EVENT; a window the hotkey had to CREATE arrives
@@ -470,7 +379,6 @@ export default function App() {
               <div className="home-start">
                 <div className="home-start-title">Welcome to Grimoire</div>
                 <div><kbd>⌘N</kbd> create your first doc</div>
-                <div><kbd>⌘K</kbd> → Shares &amp; contacts to join a share someone sent you</div>
                 <div>
                   <ImportFolder
                     label="Already have notes? Import a folder of Markdown…"
@@ -496,7 +404,6 @@ export default function App() {
             onOpenDoc={openDoc}
             docs={docs}
             dataVersion={dataVersion}
-            liveChange={liveChange}
             anchor={anchor}
             reviewIntent={reviewIntent}
             panel={docPanel}
@@ -511,16 +418,6 @@ export default function App() {
           />
         )}
         {view.kind === 'runs' && <Gardeners dataVersion={dataVersion} />}
-        {view.kind === 'sharing' && (
-          <Sharing
-            docs={docs}
-            dataVersion={dataVersion}
-            onOpenDoc={openDoc}
-            prefillLink={joinPrefill}
-            onPrefillConsumed={() => setJoinPrefill(null)}
-            onOpenProfile={() => setView({ kind: 'profile' })}
-          />
-        )}
         {view.kind === 'profile' && (
           <Profile dataVersion={dataVersion} onChanged={setProfile} version={appStamp?.version ?? null} />
         )}
@@ -536,7 +433,6 @@ export default function App() {
             <GraphView onOpenDoc={openDoc} />
           </Suspense>
         )}
-        {view.kind === 'freshness' && <Freshness dataVersion={dataVersion} onOpenDoc={openDoc} />}
       </main>
 
       {profile && !profile.confirmed && <FirstRunName profile={profile} onSaved={setProfile} />}
@@ -546,13 +442,9 @@ export default function App() {
         onDone={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
       />
 
-      {chipText(queueCount, view.kind === 'sharing' ? 0 : offerCount) && view.kind !== 'review' && (
-        <button
-          className="queue-chip"
-          onClick={() => setView({ kind: queueCount > 0 ? 'review' : 'sharing' })}
-          title={offerCount > 0 && queueCount > 0 ? 'share requests are on the Shares page' : undefined}
-        >
-          {chipText(queueCount, view.kind === 'sharing' ? 0 : offerCount)}
+      {queueCount > 0 && view.kind !== 'review' && (
+        <button className="queue-chip" onClick={() => setView({ kind: 'review' })}>
+          {queueCount} to review
         </button>
       )}
 
@@ -575,9 +467,8 @@ export default function App() {
           }}
         />
       )}
-      {(palette === 'newdoc' || palette === 'newcanvas') && (
+      {palette === 'newdoc' && (
         <NewDocPalette
-          canvas={palette === 'newcanvas'}
           onCreated={(id) => {
             api<Doc[]>('/api/docs').then(setDocs).catch(() => {})
             openDoc(id)
@@ -612,7 +503,6 @@ function ShortcutHelp({ onClose }: { onClose: () => void }) {
       'Create & act',
       [
         ['⌘N', 'new doc'],
-        ['⌘⇧N', 'new canvas'],
         ['⌘⇧I', 'quick capture → Inbox (⌥⌘G from anywhere on the Mac, in the app)'],
         ['⌘⇧R', 'review queue'],
         ['⌘G', 'gardeners'],
@@ -656,15 +546,7 @@ function ShortcutHelp({ onClose }: { onClose: () => void }) {
   )
 }
 
-function NewDocPalette({
-  canvas = false,
-  onCreated,
-  onClose,
-}: {
-  canvas?: boolean
-  onCreated: (id: string) => void
-  onClose: () => void
-}) {
+function NewDocPalette({ onCreated, onClose }: { onCreated: (id: string) => void; onClose: () => void }) {
   const [title, setTitle] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
   useEffect(() => inputRef.current?.focus(), [])
@@ -676,30 +558,6 @@ function NewDocPalette({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: title.trim() }),
     })
-    if (canvas) {
-      await api('/api/propose', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          doc_id: d.id,
-          base_epoch: 0,
-          ops: [
-            {
-              kind: {
-                op: 'insert',
-                block_id: crypto.randomUUID(),
-                parent_id: null,
-                order_key: 'i',
-                block_type: 'canvas_scene',
-                content: '{}',
-                refers_to: null,
-              },
-              source_refs: ['canvas:created'],
-            },
-          ],
-        }),
-      })
-    }
     onCreated(d.id)
   }
 
@@ -707,7 +565,7 @@ function NewDocPalette({
     <PaletteShell onClose={onClose}>
       <input
         ref={inputRef}
-        placeholder={canvas ? 'New canvas title…' : 'New doc title…'}
+        placeholder="New doc title…"
         value={title}
         onChange={(e) => setTitle(e.target.value)}
         onKeyDown={(e) => {
@@ -784,25 +642,11 @@ function DocTitle({ doc, onRenamed }: { doc: Doc; onRenamed: () => void }) {
   )
 }
 
-/** GET /api/doc/{id}/hot/status — newer fields are optional (older daemons). */
-interface HotStatus {
-  hot: boolean
-  frozen_epoch?: number
-  editors?: number
-  /** may THIS participant write in the session (authoritative when present) */
-  can_write?: boolean
-  /** owned docs only: session-wide "everyone can edit" vs "watch only" */
-  viewers_write?: boolean
-  /** owned docs only: the room's agent (agents in the room) */
-  agent?: AgentStatus
-}
-
 function DocView({
   docId,
   onOpenDoc,
   docs,
   dataVersion,
-  liveChange = null,
   anchor,
   reviewIntent = false,
   panel,
@@ -812,9 +656,6 @@ function DocView({
   onOpenDoc: OpenDoc
   docs: Doc[]
   dataVersion: number
-  /** owner nudged us that a doc changed (GET /api/events doc_changed);
-   * bumps `n` each time so the same doc can nudge twice */
-  liveChange?: { docId: string; n: number } | null
   anchor?: string | null
   /** opened from the review queue: open the rail on load */
   reviewIntent?: boolean
@@ -824,9 +665,6 @@ function DocView({
 }) {
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
-  const [fed, setFed] = useState<DocFederation | null>(null)
-  const [hot, setHot] = useState<HotDoc | null>(null)
-  const mirrorRef = useRef<unknown>(null)
   // stale guard: DocView is keyed by docId (one instance per open doc), so a
   // fetch that resolves after unmount — or after a doc switch — is for a doc
   // that is no longer on screen. `gen` bumps on every docId change too, in
@@ -883,9 +721,6 @@ function DocView({
     api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
       .then((b) => fresh(g) && setBacklinks(b))
       .catch(() => fresh(g) && setBacklinks([]))
-    api<DocFederation>(`/api/doc/${docId}/federation`)
-      .then((f) => fresh(g) && setFed(f))
-      .catch(() => fresh(g) && setFed(null))
   }, [docId, fresh])
 
   useEffect(() => {
@@ -894,25 +729,12 @@ function DocView({
     // open overrides it (the same rule as the reviewIntent effect below)
     if (reviewIntent) setPanel('review')
     setCommentTarget(null)
-    setHot(null)
-    setHotCanWrite(undefined)
-    setViewersWrite(undefined)
     setReviewItems([])
     ownEpoch.current = 0
     loadTree()
     loadReview()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadTree, loadReview])
-
-  // focus heartbeat (adaptive sync): while this doc is open, tell the daemon
-  // every 5s so a mirrored share is pulled at 5s instead of 120s. Owned docs
-  // are a server-side no-op; an older daemon 404s — either way, ignore.
-  useEffect(() => {
-    const beat = () => api(`/api/doc/${docId}/focus`, { method: 'POST' }).catch(() => {})
-    beat()
-    const t = setInterval(beat, 5000)
-    return () => clearInterval(t)
-  }, [docId])
 
   // a later { review: true } open of the SAME doc still opens the rail
   useEffect(() => {
@@ -967,9 +789,6 @@ function DocView({
         api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
           .then((b) => fresh(g) && setBacklinks(b))
           .catch(() => {})
-        api<DocFederation>(`/api/doc/${docId}/federation`)
-          .then((f) => fresh(g) && setFed(f))
-          .catch(() => {})
       })
       .catch((e) => console.warn('doc refresh failed', docId, e))
   }, [docId, fresh])
@@ -979,17 +798,7 @@ function DocView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dataVersion])
 
-  // an owner nudge (doc_changed) for THIS doc: the grantee daemon has already
-  // pulled it, so refresh now rather than on the next stamp tick. The pull may
-  // still be in flight — the stamp poll catches that case a tick later.
-  useEffect(() => {
-    if (!liveChange || liveChange.docId !== docId) return
-    refreshFromStore()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveChange])
-
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
-
 
   // anchor from a link: [[Doc#^block-uuid]] finds the block by stable id,
   // [[Doc#Heading]] falls back to text match. Scroll + flash.
@@ -1037,23 +846,24 @@ function DocView({
     [byTitle, onOpenDoc],
   )
 
-  const { editable, comments, allBlocks, canvases } = useMemo(() => {
+  const { editable, comments, allBlocks, removedCanvases } = useMemo(() => {
     if (!tree)
       return {
         editable: null,
         comments: [] as Block[],
         allBlocks: [] as Block[],
-        canvases: [] as Block[],
+        removedCanvases: 0,
       }
     const blocks: Block[] = []
     const comments: Block[] = []
     const allBlocks: Block[] = []
-    const canvases: Block[] = []
+    let removedCanvases = 0
     const walk = (nodes: BlockNode[]) => {
       for (const n of nodes) {
         allBlocks.push(n.block)
         if (n.block.block_type === 'comment') comments.push(n.block)
-        else if (n.block.block_type === 'canvas_scene') canvases.push(n.block)
+        // the canvas editor is gone; old scenes stay in the store, unrendered
+        else if (n.block.block_type === 'canvas_scene') removedCanvases++
         else if (!n.block.content.startsWith('---')) blocks.push(n.block)
         walk(n.children)
       }
@@ -1063,270 +873,18 @@ function DocView({
       editable: { docId, epoch: tree.doc.current_epoch, blocks },
       comments,
       allBlocks,
-      canvases,
+      removedCanvases,
     }
   }, [tree, docId])
 
-  // go live: shared by the ⚡ chip, auto-join, and auto-hot escalation.
-  // The seeder NEVER seeds from in-memory state — it fetches the doc fresh
-  // and requires the fetched epoch to match the frozen epoch, so a save that
-  // landed moments before the session started can't be lost.
-  const goLive = useCallback(async () => {
-    if (!editable) return
-    // unsaved cold edits: the autosave lands within ~1.2s — wait for it
-    // rather than starting a session that would freeze it out
-    for (let i = 0; i < 12; i++) {
-      if (!document.querySelector('.save-state.dirty, .save-state.saving')) break
-      await new Promise((res) => setTimeout(res, 250))
-    }
-    if (document.querySelector('.save-state.dirty, .save-state.saving')) {
-      notify('your last edit has not saved yet — try again in a moment', 'warn')
-      return
-    }
-    try {
-      // fetch → start(base_epoch) → seed from that same tree. The daemon
-      // refuses to CREATE a session from any epoch but the current one
-      // (code stale_base) — for a mirror it pulls the owner first — so a
-      // save or pull that races us means "refetch and retry", never "seed
-      // stale text that the flatten then lands over newer edits".
-      let fresh = await api<DocTree>(`/api/doc/${docId}`)
-      let r: { frozen_epoch: number; seed: boolean } | null = null
-      for (let attempt = 0; attempt < 4 && !r; attempt++) {
-        try {
-          r = await api<{ frozen_epoch: number; seed: boolean }>(
-            `/api/doc/${docId}/hot/start`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ base_epoch: fresh.doc.current_epoch }),
-            },
-          )
-        } catch (e) {
-          if (!(e instanceof ApiError) || e.code !== 'stale_base' || attempt === 3) throw e
-          await new Promise((res) => setTimeout(res, 400))
-          fresh = await api<DocTree>(`/api/doc/${docId}`)
-        }
-      }
-      if (!r) return
-      setHotCanWrite(true) // we started it; the next status poll may refine
-      setHot({
-        docId,
-        frozenEpoch: r.frozen_epoch,
-        seed: r.seed,
-        blocks: r.seed ? editableBlocksOf(fresh) : editable.blocks,
-      })
-    } catch (e) {
-      notify(errText(e))
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [docId, editable])
-
-  // view-share mirrors watch the owner's live session read-only: they join
-  // when it is hot but never start or end one
-  const isViewMirror = fed?.mirror?.permission === 'view'
-  // whether THIS participant may write in the current live session. The
-  // daemon's hot/status `can_write` is authoritative when present (and is
-  // re-evaluated on every poll — a session can flip it); absent (older
-  // daemon) we fall back to the mirror permission; owned docs are writable.
-  const [hotCanWrite, setHotCanWrite] = useState<boolean | undefined>(undefined)
-  const hotReadOnly = hotCanWrite !== undefined ? !hotCanWrite : isViewMirror
-  // session = consent: on an OWNED doc, whether every share participant may
-  // edit the live session (true) or only watch (false). Reported by
-  // hot/status for owned docs; undefined for mirrors and older daemons.
-  const [viewersWrite, setViewersWrite] = useState<boolean | undefined>(undefined)
-  const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null)
-  const toggleViewersWrite = useCallback(
-    async (enabled: boolean) => {
-      setViewersWrite(enabled) // optimistic; the status poll re-reads the truth
-      try {
-        const r = await api<{ ok?: boolean; viewers_write?: boolean }>(
-          `/api/doc/${docId}/hot/viewers_write`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled }),
-          },
-        )
-        if (typeof r.viewers_write === 'boolean') setViewersWrite(r.viewers_write)
-      } catch (e) {
-        setViewersWrite(!enabled)
-        notify(errText(e))
-      }
-    },
-    [docId],
-  )
-
-  // a live session started elsewhere (second window, another instance,
-  // recovered journal, or the OWNER of a doc mirrored to us): join it rather
-  // than editing cold. And when TWO editors are typing the same cold doc,
-  // escalate to a live session (P2.1 auto-hot) — only from a clean editor,
-  // so no keystrokes are lost.
-  // While COLD, re-check on a 5s clock too (not only when the store changes):
-  // for a mirror the status is a federation round-trip that can time out on a
-  // bad path, and a single missed answer used to mean "toast, click, no
-  // banner, nothing ever retried". Now a missed join self-heals.
-  const [coldTick, setColdTick] = useState(0)
-  useEffect(() => {
-    if (hot) return
-    const t = setInterval(() => setColdTick((x) => x + 1), 5000)
-    return () => clearInterval(t)
-  }, [hot, docId])
-  // auto-hot is OPT-IN: when two editors sit on the same cold doc we offer to
-  // go live together (once per doc-open) instead of silently switching the
-  // editor out from under both of them
-  const autoHotOffered = useRef<string | null>(null)
-  const liveHeldOff = useRef<string | null>(null)
-  useEffect(() => {
-    if (!tree || hot) return
-    const g = gen.current
-    api<HotStatus>(`/api/doc/${docId}/hot/status`)
-      .then((st) => {
-        if (!editable || !fresh(g)) return
-        if (st.hot) {
-          // someone else went live while this cold editor holds unsaved text.
-          // Swapping editors now would fire the cold save into the freeze and
-          // lose it — stay cold; the editor keeps retrying and lands the save
-          // when the session ends, and the next tick joins.
-          if (document.querySelector('.save-state.dirty, .save-state.saving')) {
-            if (liveHeldOff.current !== docId) {
-              liveHeldOff.current = docId
-              notify(
-                'a live session started on this doc — your unsaved edits will save when it ends',
-                'warn',
-                { ttlMs: 10_000 },
-              )
-            }
-            return
-          }
-          liveHeldOff.current = null
-          setHotCanWrite(typeof st.can_write === 'boolean' ? st.can_write : undefined)
-          setViewersWrite(typeof st.viewers_write === 'boolean' ? st.viewers_write : undefined)
-          setHot({
-            docId,
-            frozenEpoch: st.frozen_epoch ?? tree.doc.current_epoch,
-            seed: false,
-            blocks: editable.blocks,
-          })
-        } else if ((st.editors ?? 0) >= 2 && !isViewMirror && autoHotOffered.current !== docId) {
-          autoHotOffered.current = docId
-          notify('someone else is editing this doc too — go live together?', 'ok', {
-            onClick: () => {
-              const dirty = document.querySelector('.save-state.dirty, .save-state.saving')
-              if (dirty) notify('finish saving first, then try again')
-              else goLive()
-            },
-            ttlMs: 20_000,
-          })
-        }
-      })
-      .catch(() => {})
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tree, dataVersion, coldTick])
-
-  // while live: poll hot/status on its own clock (session state such as the
-  // owner's "watch only" toggle lives in memory and never moves the store
-  // stamp). If the daemon says the session is gone (the owner ended it and
-  // our socket close was missed), fall back to the cold view.
-  useEffect(() => {
-    if (!hot) return
-    let cancelled = false
-    const poll = () =>
-      api<HotStatus>(`/api/doc/${docId}/hot/status`)
-        .then((st) => {
-          if (cancelled) return
-          if (!st.hot) {
-            setHot(null)
-            setHotCanWrite(undefined)
-            setViewersWrite(undefined)
-            setEditorGen((g) => g + 1)
-            loadTree()
-            loadReview()
-            return
-          }
-          // both flip live mid-session: can_write re-renders HotEditor's
-          // editable state (it calls editor.setEditable), viewers_write the chip
-          if (typeof st.can_write === 'boolean') setHotCanWrite(st.can_write)
-          if (typeof st.viewers_write === 'boolean') setViewersWrite(st.viewers_write)
-          setAgentStatus(st.agent ?? null)
-        })
-        .catch(() => {})
-    poll()
-    const t = setInterval(poll, 2500)
-    return () => {
-      cancelled = true
-      clearInterval(t)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hot?.docId, hot?.frozenEpoch])
-
   if (!tree || !editable) return <div className="empty">…</div>
-
-  // a canvas doc IS the canvas: full-stage React Flow editor, its own experience
-  if (canvases.length > 0 && editable.blocks.length === 0) {
-    return (
-      <div className="canvas-doc">
-        <div className="canvas-doc-head">
-          <DocTitle doc={tree.doc} onRenamed={loadTree} />
-          <span className="meta">canvas · epoch {tree.doc.current_epoch}</span>
-        </div>
-        <Suspense fallback={<Loading />}>
-          <CanvasBlock block={canvases[0]} epoch={tree.doc.current_epoch} onSaved={loadTree} full />
-        </Suspense>
-      </div>
-    )
-  }
-
-  const mirror = fed?.mirror ?? null
-  mirrorRef.current = mirror
-  const pendingProposals = (fed?.outbound ?? []).filter((o) => o.state === 'pending')
-  // hub (slice 1): this doc is inside a subtree published to a hub
-  const publishedHub = fed?.shares.find((s) => s.to_hub && s.state === 'active')?.petname ?? null
 
   return (
     <article className="doc" onClick={onStageClick}>
-      {mirror && mirror.origin_owner_name && (
-        <div className="mirror-banner">
-          ⌂ <b>{mirror.owner_petname}</b> · owned by <b>{mirror.origin_owner_name}</b>
-          {mirror.permission === 'view'
-            ? ' · view only'
-            : ` · your edits go to ${mirror.origin_owner_name} as suggestions`}
-          {pendingProposals.length > 0 && (
-            <span className="pending-chip">
-              {pendingProposals.length} suggestion{pendingProposals.length > 1 ? 's' : ''} awaiting{' '}
-              {mirror.origin_owner_name}
-            </span>
-          )}
-        </div>
-      )}
-      {mirror && !mirror.origin_owner_name && (
-        <div className="mirror-banner">
-          {mirror.transferred_from_me ? (
-            <>
-              ⌂ owned by <b>{mirror.owner_petname}</b> (transferred from you)
-            </>
-          ) : (
-            <>
-              {mirror.from_hub ? '⌂' : '⇄'} shared by <b>{mirror.owner_petname}</b>
-            </>
-          )}
-          {mirror.permission === 'view'
-            ? ' · view only'
-            : ` · your edits go to ${mirror.transferred_from_me ? mirror.owner_petname : 'them'} as suggestions`}
-          {mirror.owner_tended && ` · 🌿 tended by ${mirror.owner_petname}`}
-          {pendingProposals.length > 0 && (
-            <span className="pending-chip">
-              {pendingProposals.length} suggestion{pendingProposals.length > 1 ? 's' : ''} awaiting{' '}
-              {mirror.owner_petname}
-            </span>
-          )}
-        </div>
-      )}
       <div className="doc-head">
         <span className="head-actions">
           {tree.doc.review_policy && <span className="meta policy">{tree.doc.review_policy}</span>}
-          {!mirror && <StatusChip doc={tree.doc} onChanged={loadTree} />}
-          {!mirror && <LivingChip docId={docId} dataVersion={dataVersion} />}
-          {!mirror && <FreshnessChip docId={docId} dataVersion={dataVersion} />}
+          <LivingChip docId={docId} dataVersion={dataVersion} />
           <button
             className={`chip ${panel === 'history' ? 'on' : ''}`}
             onClick={() => setPanel(panel === 'history' ? 'none' : 'history')}
@@ -1339,132 +897,41 @@ function DocView({
           >
             comments{comments.length > 0 ? ` ${comments.length}` : ''}
           </button>
-          {!mirror && (
-            <button
-              className={`chip ${panel === 'tend' ? 'on' : ''} ${docs.find((d) => d.id === docId)?.is_tended ? 'tended' : ''}`}
-              onClick={() => setPanel(panel === 'tend' ? 'none' : 'tend')}
-            >
-              {docs.find((d) => d.id === docId)?.is_tended ? '🌿 tended' : 'tend'}
-            </button>
-          )}
-          {!mirror && (
-            <button
-              className={`chip ${panel === 'share' ? 'on' : ''} ${(fed?.shares.length ?? 0) > 0 ? 'shared' : ''}`}
-              onClick={() => setPanel(panel === 'share' ? 'none' : 'share')}
-              title={publishedHub ? `published to ${publishedHub}` : undefined}
-            >
-              {publishedHub ? `⌂ published to ${publishedHub}` : (fed?.shares.length ?? 0) > 0 ? '↗ shared' : 'share'}
-            </button>
-          )}
-          {!hot && editable && (!mirror || (mirror.permission === 'propose' && !mirror.origin_owner_name)) && (
-            <button
-              className="chip"
-              title="start a live co-editing session"
-              onClick={goLive}
-            >
-              ⚡ go live
-            </button>
-          )}
+          <button
+            className={`chip ${panel === 'tend' ? 'on' : ''} ${docs.find((d) => d.id === docId)?.is_tended ? 'tended' : ''}`}
+            onClick={() => setPanel(panel === 'tend' ? 'none' : 'tend')}
+          >
+            {docs.find((d) => d.id === docId)?.is_tended ? '🌿 tended' : 'tend'}
+          </button>
           {reviewItems.length > 0 && (
             <button
               className={`chip review-chip ${panel === 'review' ? 'on' : ''}`}
-              title={hot ? 'review after the live session ends' : 'review changes in this doc'}
-              disabled={!!hot}
+              title="review changes in this doc"
               onClick={() => setPanel(panel === 'review' ? 'none' : 'review')}
             >
               ⚠ {reviewItems.length} to review
             </button>
           )}
         </span>
-        {mirror ? (
-          <h1 className="doc-title readonly">{tree.doc.title}</h1>
-        ) : (
-          <DocTitle doc={tree.doc} onRenamed={loadTree} />
-        )}
+        <DocTitle doc={tree.doc} onRenamed={loadTree} />
       </div>
-      {hot && reviewItems.length > 0 && (
-        <div className="meta review-hot-note">
-          ⚠ {reviewItems.length} change{reviewItems.length === 1 ? '' : 's'} to review · review after the live session ends
+      {removedCanvases > 0 && (
+        <div className="meta canvas-removed">
+          Canvas (removed) · this doc holds {removedCanvases === 1 ? 'a canvas' : `${removedCanvases} canvases`} the
+          app no longer shows
         </div>
       )}
-      {hot ? (
-        <HotEditor
-          key={`hot:${docId}`}
-          doc={hot}
-          readOnly={hotReadOnly}
-          canEnd={!isViewMirror}
-          viewersWrite={mirror ? undefined : viewersWrite}
-          onToggleViewersWrite={mirror ? undefined : toggleViewersWrite}
-          agent={mirror ? undefined : (agentStatus ?? undefined)}
-          onAsk={
-            mirror
-              ? undefined
-              : async (instruction) => {
-                  try {
-                    await api(`/api/doc/${docId}/hot/ask`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ instruction }),
-                    })
-                    setAgentStatus((a) => ({ ...(a ?? { busy: false }), busy: true, last_error: null, last_ok: null }))
-                  } catch (e) {
-                    notify(errText(e))
-                  }
-                }
-          }
-          onEnded={() => {
-            // Fetch the flattened tree FIRST, then swap it in and remount the
-            // cold editor in the same tick. Remounting before the fetch
-            // resolved froze the editor on the pre-session content (its
-            // initial content is memoised per doc), so the owner saw the
-            // grantee's live text "vanish" even though the flatten landed.
-            setHotCanWrite(undefined)
-            setViewersWrite(undefined)
-            loadReview()
-            const g = gen.current
-            api<DocTree>(`/api/doc/${docId}`)
-              .then((next) => {
-                if (!fresh(g)) return
-                ownEpoch.current = Math.max(ownEpoch.current, next.doc.current_epoch)
-                setTree(next)
-                setHot(null)
-                setEditorGen((g) => g + 1)
-                api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
-                  .then((b) => fresh(g) && setBacklinks(b))
-                  .catch(() => {})
-                api<DocFederation>(`/api/doc/${docId}/federation`)
-                  .then((f) => fresh(g) && setFed(f))
-                  .catch(() => {})
-              })
-              .catch((e) => {
-                if (!fresh(g)) return
-                notify(`session ended but the doc could not be reloaded: ${errText(e)}`)
-                setHot(null)
-                loadTree()
-              })
-          }}
-        />
-      ) : (
       <DocEditor
         key={`${docId}:${editorGen}`}
         doc={editable}
         reviewMap={highlightMap}
-        // a relayed doc proposes through the hub, which carries it to the owner
-        mode={mirror ? (mirror.permission === 'propose' ? 'propose' : 'readonly') : 'direct'}
         onSaved={(e, savedDocId) => {
           // the unmount flush of a PREVIOUS doc's editor reports its own id
           if (savedDocId !== docId) return
           ownEpoch.current = Math.max(ownEpoch.current, e)
         }}
-        onProposed={() => {
-          // pessimistic mirror: reset the editor to the pristine mirror and
-          // show the pending chip
-          setEditorGen((g) => g + 1)
-          loadTree()
-        }}
         onSelectionBlock={onSelectionBlock}
       />
-      )}
       {selBlock && selRect && panel !== 'comments' && (
         <span className="sel-actions" style={{ left: selRect.x, top: selRect.y }}>
           <button
@@ -1493,16 +960,8 @@ function DocView({
         </span>
       )}
       {panel === 'history' && <HistoryPanel docId={docId} onClose={() => setPanel('none')} />}
-      {panel === 'review' && !hot && (
+      {panel === 'review' && (
         <ReviewRail items={reviewItems} onChanged={afterResolve} onClose={() => setPanel('none')} />
-      )}
-      {panel === 'share' && (
-        <SharePanel
-          doc={tree.doc}
-          fed={fed ?? { mirror: null, shares: [], outbound: [] }}
-          onChanged={loadTree}
-          onClose={() => setPanel('none')}
-        />
       )}
       {panel === 'tend' && (
         <TendPanel doc={tree.doc} onClose={() => setPanel('none')} dataVersion={dataVersion} />
@@ -1513,7 +972,6 @@ function DocView({
           allBlocks={allBlocks}
           target={commentTarget}
           setTarget={setCommentTarget}
-          upstream={!!mirror}
           onPosted={loadTree}
           onClose={() => setPanel('none')}
         />
@@ -1529,49 +987,6 @@ function DocView({
         </div>
       )}
     </article>
-  )
-}
-
-/** The blocks the editor works on: content flow only — comments, frontmatter
- * and canvases excluded (the same walk as DocView's editable memo). */
-function editableBlocksOf(tree: DocTree): Block[] {
-  const blocks: Block[] = []
-  const walk = (nodes: BlockNode[]) => {
-    for (const n of nodes) {
-      if (
-        n.block.block_type !== 'comment' &&
-        n.block.block_type !== 'canvas_scene' &&
-        !n.block.content.startsWith('---')
-      ) {
-        blocks.push(n.block)
-      }
-      walk(n.children)
-    }
-  }
-  walk(tree.roots)
-  return blocks
-}
-
-/* ---------- doc status (5.6) ---------- */
-
-const STATUS_CYCLE = [null, 'draft', 'in-review', 'decided', 'superseded'] as const
-
-function StatusChip({ doc, onChanged }: { doc: Doc; onChanged: () => void }) {
-  const next = () => {
-    const i = STATUS_CYCLE.indexOf(doc.status as (typeof STATUS_CYCLE)[number])
-    const nextStatus = STATUS_CYCLE[(i + 1) % STATUS_CYCLE.length]
-    api(`/api/doc/${doc.id}/status`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: nextStatus }),
-    })
-      .then(onChanged)
-      .catch((e) => notify(String(e)))
-  }
-  return (
-    <button className={`chip status-${doc.status ?? 'none'}`} onClick={next} title="cycle status">
-      {doc.status ?? 'no status'}
-    </button>
   )
 }
 
@@ -1635,7 +1050,6 @@ function CommentsPanel({
   allBlocks,
   target,
   setTarget,
-  upstream = false,
   onPosted,
   onClose,
 }: {
@@ -1643,8 +1057,6 @@ function CommentsPanel({
   allBlocks: Block[]
   target: string | null
   setTarget: (t: string | null) => void
-  /** mirror docs: comments post to the owner and echo back via pull */
-  upstream?: boolean
   onPosted: () => void
   onClose: () => void
 }) {
@@ -1658,9 +1070,7 @@ function CommentsPanel({
   const post = async () => {
     const blockId = replyTo ? replyTo.refers_to : target
     if (!text.trim() || !blockId) return
-    // mirror docs: the comment channel — applied on the owner, echoed back
-    const endpoint = upstream ? '/admin/comment_upstream' : '/api/comment'
-    await api(endpoint, {
+    await api('/api/comment', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ block_id: blockId, text: text.trim(), reply_to: replyTo?.id ?? null }),

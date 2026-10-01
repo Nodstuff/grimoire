@@ -18,14 +18,14 @@ describe('parseDeepLink', () => {
   })
   it('is null for an empty or unrelated query', () => {
     expect(parseDeepLink('')).toBeNull()
-    expect(parseDeepLink('?join=abc')).toBeNull()
+    expect(parseDeepLink('?capture=1')).toBeNull()
   })
 })
 
 describe('scrubDeepLink', () => {
   it('removes only the deep-link params', () => {
     expect(scrubDeepLink(`?doc=${D}&block=${B}&tab=review`)).toBe('')
-    expect(scrubDeepLink(`?join=abc&doc=${D}`)).toBe('?join=abc')
+    expect(scrubDeepLink(`?capture=1&doc=${D}`)).toBe('?capture=1')
     expect(scrubDeepLink('')).toBe('')
   })
 })

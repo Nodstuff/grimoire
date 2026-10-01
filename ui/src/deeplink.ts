@@ -2,10 +2,9 @@
  * frame, e.g. workbox) opens the page as
  * `/?admin_token=…&doc=<uuid>[&block=<uuid>][&tab=<name>]`. `admin_token` is
  * consumed by main.tsx; the rest is parsed here once on boot and scrubbed the
- * same way so a reload does not re-open the doc. `?join=` (grimoire://join
- * links) is handled separately in App. */
+ * same way so a reload does not re-open the doc. */
 
-export const TABS = ['home', 'review', 'runs', 'graph', 'sharing', 'profile', 'trash'] as const
+export const TABS = ['home', 'review', 'runs', 'graph', 'profile', 'trash'] as const
 export type Tab = (typeof TABS)[number]
 
 export interface DeepLink {

@@ -23,7 +23,6 @@ describe('resolveShortcut', () => {
     ['⌘F → search (alias)', meta('f'), 'search'],
     ['⌘T → tree', meta('t'), 'tree'],
     ['⌘N → newdoc', meta('n'), 'newdoc'],
-    ['⌘⇧N → newcanvas', meta('N', true), 'newcanvas'],
     ['⌘R → reload', meta('r'), 'reload'],
     ['⌘⇧R → review', meta('R', true), 'review'],
     ['⌘G → gardeners', meta('g'), 'gardeners'],
@@ -55,7 +54,7 @@ describe('resolveShortcut', () => {
 
   it('shift disambiguates N and R without collision', () => {
     expect(resolveShortcut(meta('n'))).toBe('newdoc')
-    expect(resolveShortcut(meta('N', true))).toBe('newcanvas')
+    expect(resolveShortcut(meta('N', true))).toBeNull()
     expect(resolveShortcut(meta('r'))).toBe('reload')
     expect(resolveShortcut(meta('R', true))).toBe('review')
   })

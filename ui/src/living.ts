@@ -1,17 +1,7 @@
-// Doc freshness + living answers: the pure label logic behind the header
-// chips and the Stale docs list. Kept out of the components so it tests
-// with a fixed `now`.
+// Living answers: the pure label logic behind the header chip. Kept out of
+// the component so it tests with a fixed `now`.
 
 import { relTime } from './time'
-
-export interface FreshnessRow {
-  id: string
-  title: string
-  path: string
-  verified_at: string | null
-  last_edited: string
-  tended: boolean
-}
 
 export interface LivingSource {
   block_id: string
@@ -29,12 +19,6 @@ export interface LivingStatus {
   sources: LivingSource[]
   changed: number
   last_refreshed: string | null
-}
-
-/** `verified 3d ago` / `never verified`. */
-export function verifiedLabel(verifiedAt: string | null | undefined, now: number = Date.now()): string {
-  if (!verifiedAt) return 'never verified'
-  return `verified ${relTime(verifiedAt, now)}`
 }
 
 /** `answer · verified 2h ago` while every cited block stands; `answer · 2

@@ -9,28 +9,8 @@ import {
   groupRoot,
   loadTreeState,
   saveTreeState,
-  staleness,
-  stalenessTitle,
   TREE_STATE_KEY,
 } from './tree'
-
-describe('staleness', () => {
-  const now = Date.parse('2026-09-10T12:00:00Z')
-  const ago = (days: number) => new Date(now - days * 86_400_000).toISOString()
-  it('never / stale past the threshold / fresh within it', () => {
-    expect(staleness(null, now)).toEqual({ kind: 'never' })
-    expect(staleness('garbage', now)).toEqual({ kind: 'never' })
-    expect(staleness(ago(41), now)).toEqual({ kind: 'stale', days: 41 })
-    expect(staleness(ago(30), now)).toEqual({ kind: 'fresh' })
-    expect(staleness(ago(2), now)).toEqual({ kind: 'fresh' })
-    expect(staleness(ago(8), now, 7)).toEqual({ kind: 'stale', days: 8 })
-  })
-  it('tooltips', () => {
-    expect(stalenessTitle({ kind: 'never' })).toBe('never verified')
-    expect(stalenessTitle({ kind: 'stale', days: 41 })).toBe('verified 41d ago')
-    expect(stalenessTitle({ kind: 'fresh' })).toBe('')
-  })
-})
 
 function doc(id: string, title: string, parent: string | null = null, extra: Partial<Doc> = {}): Doc {
   return {
@@ -54,7 +34,6 @@ const docs: Doc[] = [
   doc('z11', 'Zeta design detail', 'z1'),
   doc('alpha', 'Alpha project'),
   doc('a1', 'Alpha notes', 'alpha'),
-  doc('hub', 'Team', null, { from_hub: true }),
   doc('loose', 'Loose note', null, { sort_key: 'b' }),
   doc('loose2', 'Another loose note', null, { sort_key: 'a' }),
 ]
@@ -62,9 +41,9 @@ const children = childrenIndex(docs)
 const byId = new Map(docs.map((d) => [d.id, d]))
 
 describe('groupRoot', () => {
-  it('pins system folders and hub roots, sorts folders alphabetically, keeps note order', () => {
+  it('pins system folders, sorts folders alphabetically, keeps note order', () => {
     const g = groupRoot(docs, children)
-    expect(g.pinned.map((d) => d.id)).toEqual(['daily', 'hub'])
+    expect(g.pinned.map((d) => d.id)).toEqual(['daily'])
     expect(g.folders.map((d) => d.id)).toEqual(['alpha', 'zeta'])
     // server order: sort_key asc (loose2 'a' before loose 'b')
     expect(g.notes.map((d) => d.id)).toEqual(['loose2', 'loose'])

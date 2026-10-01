@@ -44,21 +44,15 @@ export default function TendPanel({
   onClose: () => void
   dataVersion: number
 }) {
-  // A mirror is the owner's to tend — agent care is theirs so two agents never
-  // edit both copies. We offer no tend config for it and never call the
-  // create/update gardener endpoints (the backend also refuses).
-  const isMirror = !!doc.mirror_permission
-
   const [tendings, setTendings] = useState<Tending[]>([])
   const [runs, setRuns] = useState<GardenerRun[]>([])
   const [adding, setAdding] = useState(false)
   const [running, setRunning] = useState<string | null>(null)
 
   const load = useCallback(() => {
-    if (isMirror) return
     api<Tending[]>(`/api/doc/${doc.id}/tendings`).then(setTendings).catch(console.error)
     api<GardenerRun[]>('/api/runs').then(setRuns).catch(() => {})
-  }, [doc.id, isMirror])
+  }, [doc.id])
 
   useEffect(load, [load, dataVersion])
 
@@ -79,16 +73,7 @@ export default function TendPanel({
         <span>tending — {doc.title}</span>
         <button onClick={onClose}>esc</button>
       </div>
-      {isMirror && (
-        <div className="tend-empty">
-          <p>🌿 Tended by its owner.</p>
-          <p className="meta">
-            Agent care for a shared doc is the owner's — you can't tend it here, so two
-            agents never edit both copies.
-          </p>
-        </div>
-      )}
-      {!isMirror && tendings.length === 0 && !adding && (
+      {tendings.length === 0 && !adding && (
         <div className="tend-empty">
           <p>
             This doc is <b>manual-only</b> — no agent touches it or anything inside it.
@@ -99,8 +84,7 @@ export default function TendPanel({
           </p>
         </div>
       )}
-      {!isMirror &&
-        tendings.map((t) => (
+      {tendings.map((t) => (
           <TendingCard
             key={t.id}
             t={t}
@@ -110,17 +94,16 @@ export default function TendPanel({
             onSaved={load}
           />
         ))}
-      {!isMirror &&
-        (adding ? (
-          <NewTending docId={doc.id} docTitle={doc.title} onDone={() => {
-            setAdding(false)
-            load()
-          }} />
-        ) : (
-          <button className="chip tend-add" onClick={() => setAdding(true)}>
-            + attach a tending
-          </button>
-        ))}
+      {adding ? (
+        <NewTending docId={doc.id} docTitle={doc.title} onDone={() => {
+          setAdding(false)
+          load()
+        }} />
+      ) : (
+        <button className="chip tend-add" onClick={() => setAdding(true)}>
+          + attach a tending
+        </button>
+      )}
     </aside>
   )
 }
