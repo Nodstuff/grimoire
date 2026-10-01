@@ -18,3 +18,6 @@ listeners:
         backends:
           - address: "127.0.0.1:7425"
         max_request_body_bytes: 26214400
+        response_headers:
+          set:
+            Strict-Transport-Security: "max-age=31536000; includeSubDomains"
