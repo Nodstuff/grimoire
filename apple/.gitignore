@@ -3,3 +3,5 @@
 *.xcodeproj/
 App/build/
 DerivedData/
+.build-*/
+*.log

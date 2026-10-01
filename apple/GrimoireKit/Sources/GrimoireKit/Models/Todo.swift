@@ -21,6 +21,16 @@ public struct Due: Sendable, Hashable, Comparable, CustomStringConvertible {
 
     public var hasTime: Bool { hour != nil }
 
+    /// Today's date (no time) in `timeZone`.
+    public static func today(now: Date = .now, in timeZone: TimeZone = .current) -> Due {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        let c = cal.dateComponents([.year, .month, .day], from: now)
+        return Due(year: c.year ?? 1970, month: c.month ?? 1, day: c.day ?? 1)
+    }
+
+    public static var today: Due { today() }
+
     /// Parses `2026-09-12` or `2026-09-12 14:30`; nil for anything else
     /// (including impossible dates like 2026-02-31).
     public init?(_ text: String) {
@@ -143,6 +153,20 @@ public struct TodoDay: Codable, Sendable, Hashable {
     public var epoch: Int
     /// set when a typed `due <when>` phrase looked like a date but didn't parse
     public var warning: String?
+
+    public init(
+        docID: DocID, date: String, today: String, items: [TodoItem], carried: Int = 0,
+        prevDate: String? = nil, epoch: Int, warning: String? = nil
+    ) {
+        self.docID = docID
+        self.date = date
+        self.today = today
+        self.items = items
+        self.carried = carried
+        self.prevDate = prevDate
+        self.epoch = epoch
+        self.warning = warning
+    }
 
     enum CodingKeys: String, CodingKey {
         case date, today, items, carried, epoch, warning

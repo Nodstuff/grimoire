@@ -131,11 +131,9 @@ public enum TodoParser {
     /// Open items due on or before `now`'s day, or overdue by time — the
     /// Today view's "due / overdue" list, soonest first.
     public static func dueOrOverdue(_ items: [TodoRecord], now: Date = .now, timeZone: TimeZone = .current) -> [TodoRecord] {
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = timeZone
-        let c = cal.dateComponents([.year, .month, .day], from: now)
-        guard let y = c.year, let m = c.month, let d = c.day else { return [] }
-        let endOfToday = Due(year: y, month: m, day: d, hour: 23, minute: 59)
+        var endOfToday = Due.today(now: now, in: timeZone)
+        endOfToday.hour = 23
+        endOfToday.minute = 59
         return items
             .filter { $0.isOpen && ($0.due.map { $0 <= endOfToday } ?? false) }
             .sorted { ($0.due ?? endOfToday) < ($1.due ?? endOfToday) }
