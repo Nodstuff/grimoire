@@ -22,6 +22,9 @@ targets:
       - Taisce
     dependencies:
       - package: TaisceKit
+    scheme:
+      testTargets:
+        - TaisceTests
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce
@@ -51,3 +54,18 @@ targets:
             localhost:
               NSExceptionAllowsInsecureHTTPLoads: true
         NSLocalNetworkUsageDescription: Taisce connects to your server on this network.
+  TaisceTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - TaisceTests
+    dependencies:
+      # the host app carries TaisceKit; linking it here too turns it into a
+      # shared framework that doesn't re-export GRDB
+      - target: Taisce
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "1,2"

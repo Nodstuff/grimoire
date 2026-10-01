@@ -3,8 +3,8 @@ import TaisceKit
 import Observation
 
 /// App-wide state: the server connection, its sign-in, cache and sync
-/// engine, and the doc tree the sidebar shows. Everything below the UI lives
-/// in TaisceKit.
+/// engine, the doc tree, pins, and the sync indicator. Everything below the
+/// UI lives in TaisceKit; the cache and network calls run off the main actor.
 @MainActor @Observable
 final class AppModel {
     static let serverURLKey = "serverURL"
@@ -24,18 +24,41 @@ final class AppModel {
     private(set) var auth: AuthSession?
     private(set) var authPhase: AuthPhase = .notRequired
     private(set) var isSigningIn = false
-    private(set) var docs: [DocRecord] = []
-    private(set) var tree: [DocTreeNode] = []
+    private(set) var docs: [DocInfo] = []
+    private(set) var index = DocIndex([])
+    private(set) var library: [LibraryNode] = []
+    /// whether the cache has delivered the tree at least once
+    private(set) var treeLoaded = false
     var lastError: String?
+
+    // sync indicator
+    private(set) var syncStatus: SyncStatus = .idle
+    private(set) var lastSynced: Date?
+    private(set) var cursor = 0
+    private(set) var pendingWrites = 0
+    private(set) var failedWrites = 0
+    /// bumps on every sync update touching the To-do doc (or the tree):
+    /// to-do lists reload on it
+    private(set) var todoRevision = 0
+
+    // local state
+    private(set) var pins: [DocID] = []
+    private(set) var editMeta: [DocID: EditMeta] = [:]
+    /// to-dos marked done or snoozed here, hidden until the server's list catches up
+    private(set) var settledTodos: Set<String> = []
 
     private var observeTask: Task<Void, Never>?
     private var authTask: Task<Void, Never>?
+    private var updatesTask: Task<Void, Never>?
+    private var pollTask: Task<Void, Never>?
+    private var replaying = false
 
     init() {
         serverURL = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? Self.defaultServerURL
     }
 
     var needsSignIn: Bool { authPhase == .signedOut }
+    var isOnline: Bool { syncStatus == .live }
 
     func boot() async {
         guard api == nil else { return }
@@ -45,7 +68,7 @@ final class AppModel {
 
     func setServerURL(_ s: String) async {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed != serverURL, URL(string: trimmed) != nil else { return }
+        guard trimmed != serverURL, URL(string: trimmed)?.host() != nil else { return }
         await stopSync()
         serverURL = trimmed
         UserDefaults.standard.set(trimmed, forKey: Self.serverURLKey)
@@ -56,9 +79,15 @@ final class AppModel {
     func startSync() async {
         guard authPhase != .signedOut else { return }
         await sync?.start()
+        startPolling()
     }
 
-    func stopSync() async { await sync?.stop() }
+    func stopSync() async {
+        pollTask?.cancel()
+        pollTask = nil
+        await sync?.stop()
+        syncStatus = .idle
+    }
 
     // MARK: sign-in
 
@@ -92,9 +121,9 @@ final class AppModel {
     private func authChanged(_ state: AuthSession.State) async {
         authPhase = state == .signedIn ? .signedIn : .signedOut
         if state == .signedIn {
-            await sync?.start()
+            await startSync()
         } else {
-            await sync?.stop()
+            await stopSync()
         }
     }
 
@@ -108,6 +137,7 @@ final class AppModel {
     private func connect(withAuth: Bool = true) async {
         observeTask?.cancel()
         authTask?.cancel()
+        updatesTask?.cancel()
         guard let url = URL(string: serverURL) else {
             lastError = "not a URL: \(serverURL)"
             return
@@ -131,51 +161,245 @@ final class AppModel {
             }
             self.cache = cache
             self.api = api
-            sync = SyncEngine(api: api, cache: cache)
+            let sync = SyncEngine(api: api, cache: cache)
+            self.sync = sync
+            pins = UserDefaults.standard.stringArray(forKey: pinsKey) ?? []
+            editMeta = [:]
+            treeLoaded = false
+            await sync.setAlwaysFetch(Set(pins))
             observeTask = Task { [weak self] in
                 do {
-                    for try await docs in cache.observeTree() {
-                        self?.docs = docs
-                        self?.tree = DocTreeNode.build(docs)
+                    for try await records in cache.observeTree() {
+                        await self?.treeChanged(records)
                     }
                 } catch {
                     self?.lastError = error.localizedDescription
                 }
+            }
+            let updates = await sync.updates()
+            updatesTask = Task { [weak self] in
+                for await u in updates { self?.synced(u) }
             }
         } catch {
             lastError = error.localizedDescription
         }
     }
 
-    func doc(titled title: String) -> DocRecord? {
-        // wikilinks name docs by title, optionally with a parent path
-        let leaf = title.split(separator: "/").last.map(String.init) ?? title
-        return docs.first { $0.title == title } ?? docs.first { $0.title == leaf }
+    private func treeChanged(_ records: [DocRecord]) async {
+        let docs = records.map(DocInfo.init)
+        // the outline is O(n log n) over the whole tree: build it off the main actor
+        let (index, library) = await Task.detached { (DocIndex(docs), LibraryNode.build(docs)) }.value
+        self.docs = docs
+        self.index = index
+        self.library = library
+        treeLoaded = true
     }
+
+    private func synced(_ u: SyncUpdate) {
+        lastSynced = .now
+        if u.treeChanged || u.docIDs.contains(where: { $0 == todoDocID }) { todoRevision += 1 }
+        for id in u.docIDs { editMeta[id] = nil }
+    }
+
+    /// The indicator reads the engine and outbox every couple of seconds
+    /// (both are cheap actor/GRDB reads), and replays queued writes when
+    /// the connection is back.
+    private func startPolling() {
+        pollTask?.cancel()
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.pollOnce()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+
+    private func pollOnce() async {
+        guard let sync, let cache else { return }
+        let status = await sync.status
+        if status == .live, syncStatus != .live { lastSynced = .now }
+        syncStatus = status
+        cursor = (try? await cache.lastSeq()) ?? cursor
+        let pending = (try? await cache.pendingOutbox().count) ?? 0
+        pendingWrites = pending
+        if pending > 0, status == .live { await replayOutbox() }
+    }
+
+    /// Send queued writes in order. Single-flight; failures stay on the row.
+    func replayOutbox() async {
+        guard let api, let cache, !replaying else { return }
+        replaying = true
+        defer { replaying = false }
+        try? await OutboxReplayer(api: api, cache: cache).replay()
+        pendingWrites = (try? await cache.pendingOutbox().count) ?? pendingWrites
+        if pendingWrites == 0 { todoRevision += 1 }
+    }
+
+    // MARK: pins (local for now)
+
+    private var pinsKey: String {
+        let url = URL(string: serverURL)
+        return "pins-\(url?.host() ?? "server")-\(url?.port ?? 0)"
+    }
+
+    func isPinned(_ id: DocID) -> Bool { pins.contains(id) }
+
+    func togglePin(_ id: DocID) {
+        if let i = pins.firstIndex(of: id) { pins.remove(at: i) } else { pins.append(id) }
+        UserDefaults.standard.set(pins, forKey: pinsKey)
+        let ids = Set(pins)
+        Task { await sync?.setAlwaysFetch(ids) }
+    }
+
+    // MARK: docs
 
     var todoDocID: DocID? {
         docs.first { $0.parentID == nil && $0.title == TodoParser.todoDocTitle }?.id
     }
+
+    /// Who last edited the doc, from its ledger; cached until the doc changes.
+    func loadEditMeta(_ id: DocID) async {
+        guard editMeta[id] == nil, let api else { return }
+        if let history = try? await api.docHistory(id), let meta = EditMeta(history: history) {
+            editMeta[id] = meta
+        }
+    }
+
+    /// The doc's page: cached blocks, rendered off the main actor.
+    func page(for id: DocID, records: [BlockRecord]) async -> DocPage {
+        let title = index.byID[id]?.title ?? ""
+        let blocks = records.map(\.block)
+        return await Task.detached { DocPage.build(title: title, blocks: blocks) }.value
+    }
+
+    /// Tick or untick the `index`th checkbox in a block: a `replace` through
+    /// the outbox, then an immediate replay.
+    func setCheckbox(doc: DocID, block: BlockID, index: Int, checked: Bool) async throws {
+        guard let cache else { return }
+        guard var editor = try await cache.editor(for: doc), let current = editor.blocks[block],
+              let text = Checkbox.toggled(current.content, index: index, checked: checked)
+        else { throw TodoWriteError.notFound }
+        try await cache.enqueue([.replaceText(block, text)], on: &editor)
+        pendingWrites += 1
+        await replayOutbox()
+    }
+
+    // MARK: to-dos
+
+    /// Open to-dos: dated ones from `GET /api/todo/due` (read-only, overdue
+    /// by time), today's undated ones from the cached To-do doc. Offline,
+    /// both come from the cache. Never `GET /api/todo` (it carries forward).
+    func loadTodos(now: Date = .now) async -> (board: TodoBoard, offline: Bool) {
+        let cached = (try? await cache?.todos()) ?? []
+        let today = Due.today(now: now).dateString
+        let undated = cached.filter { $0.isOpen && $0.date == today && $0.due == nil }.map { TodoEntry($0, now: now) }
+        var dated: [TodoEntry]
+        var offline = false
+        if let api, let list = try? await api.todoDue() {
+            dated = list.items.map(TodoEntry.init)
+        } else {
+            offline = true
+            dated = cached.filter { $0.isOpen && $0.due != nil }.map { TodoEntry($0, now: now) }
+        }
+        let settled = settledTodos
+        if pendingWrites == 0 { settledTodos = [] }
+        let visible = dated.filter { !settled.contains($0.id) }
+        return (TodoBoard.build(dated: visible, undated: undated.filter { !settled.contains($0.id) }, now: now), offline)
+    }
+
+    func markDone(_ e: TodoEntry) async {
+        struct Body: Encodable { var date: String; var item_id: String; var done: Bool }
+        await queue("/api/todo/toggle", Body(date: e.date, item_id: e.itemID, done: true), settling: e)
+    }
+
+    func snooze(_ e: TodoEntry, _ s: Snooze) async {
+        guard let cache, let due = s.deadline() else { return }
+        settledTodos.insert(e.id)
+        do {
+            try await cache.enqueueDeadline(date: e.date, itemID: e.itemID, deadline: due)
+            pendingWrites += 1
+            todoRevision += 1
+            await replayOutbox()
+        } catch {
+            settledTodos.remove(e.id)
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// A new to-do on today; the server reads any `due …` phrase in it.
+    func addTodo(_ text: String) async {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        await queue("/api/todo", ["date": Due.today.dateString, "text": trimmed], settling: nil)
+    }
+
+    /// The server's reading of a typed to-do, for the live hint.
+    func parseHint(_ text: String) async -> TodoParseHint? {
+        try? await api?.todoParse(text)
+    }
+
+    private func queue(_ path: String, _ body: some Encodable, settling e: TodoEntry?) async {
+        guard let cache else { return }
+        if let e { settledTodos.insert(e.id) }
+        do {
+            try await cache.enqueue(method: "POST", path: path, body: JSONEncoder().encode(body), key: UUID().uuidString.lowercased())
+            pendingWrites += 1
+            todoRevision += 1
+            await replayOutbox()
+        } catch {
+            if let e { settledTodos.remove(e.id) }
+            lastError = error.localizedDescription
+        }
+    }
+
+    // MARK: search
+
+    /// Server search, falling back to the offline FTS index when the server
+    /// can't be reached. Tags come from cached frontmatter (`fillTags` fetches
+    /// the rest).
+    func search(_ query: String) async -> SearchState {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return SearchState() }
+        var hits: [(block: BlockID, doc: DocID, title: String, content: String)] = []
+        var offline = false
+        if let api, let found = try? await api.search(q) {
+            hits = found.map { ($0.block.id, $0.block.docID, $0.docTitle, $0.block.content) }
+        } else if let cache, let found = try? await cache.searchBlocks(q) {
+            offline = true
+            hits = found.map { ($0.id, $0.docID, index.byID[$0.docID]?.title ?? "", $0.content) }
+        }
+        var tags: [DocID: [String]] = [:]
+        for id in Set(hits.map(\.doc)) { tags[id] = await cachedTags(id) }
+        let index = index
+        return await Task.detached { SearchState.build(hits: hits, query: q, index: index, tags: tags, offline: offline) }.value
+    }
+
+    /// Frontmatter tags of a cached body; nil when the body was never fetched.
+    func cachedTags(_ id: DocID) async -> [String]? {
+        guard let cache, let rec = try? await cache.doc(id), rec.bodyEpoch != nil else { return nil }
+        let blocks = (try? await cache.blocks(of: id)) ?? []
+        return blocks.filter { $0.content.hasPrefix("---") }.flatMap { DocPage.frontmatterTags($0.content) }
+    }
+
+    /// Fetch up to eight result docs we hold no body for, so their tags
+    /// (and offline search) fill in; returns the tags found.
+    func fillTags(_ state: SearchState) async -> SearchState {
+        guard let sync else { return state }
+        var state = state
+        var fetched = 0
+        for i in state.results.indices where fetched < 8 {
+            let id = state.results[i].docID
+            guard await cachedTags(id) == nil else { continue }
+            fetched += 1
+            try? await sync.refresh(id)
+            state.results[i].tags = await cachedTags(id) ?? []
+        }
+        return state
+    }
 }
 
-/// The flat doc list as a tree for `OutlineGroup` (nil children = leaf).
-struct DocTreeNode: Identifiable, Hashable {
-    var doc: DocRecord
-    var children: [DocTreeNode]?
-    var id: DocID { doc.id }
+enum TodoWriteError: Error, LocalizedError {
+    case notFound
 
-    static func build(_ docs: [DocRecord]) -> [DocTreeNode] {
-        // a doc whose parent we don't have (trashed, not shared to us) shows at the root
-        let ids = Set(docs.map(\.id))
-        let byParent = Dictionary(grouping: docs) { $0.parentID.flatMap { ids.contains($0) ? $0 : nil } }
-        func nodes(_ parent: DocID?) -> [DocTreeNode] {
-            (byParent[parent] ?? [])
-                .sorted { ($0.sortKey ?? "", $0.title) < ($1.sortKey ?? "", $1.title) }
-                .map { d in
-                    let kids = nodes(d.id)
-                    return DocTreeNode(doc: d, children: kids.isEmpty ? nil : kids)
-                }
-        }
-        return nodes(nil)
-    }
+    var errorDescription: String? { "That item changed on the server; pull to refresh." }
 }
