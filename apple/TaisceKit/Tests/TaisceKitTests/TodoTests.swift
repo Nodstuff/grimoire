@@ -33,6 +33,15 @@ import Testing
         #expect([late, dateOnly, early].sorted() == [early, dateOnly, late])
     }
 
+    @Test func decodesSplitDeadlineAndDueTime() throws {
+        let json = #"{"id":"0-1","text":"Ship","done":false,"deadline":"2026-09-12","due_time":"14:30","alert_at":"2026-09-12T14:30","overdue":false,"due_soon":true}"#
+        let item = try JSONDecoder().decode(TodoItem.self, from: Data(json.utf8))
+        #expect(item.due == Due(year: 2026, month: 9, day: 12, hour: 14, minute: 30))
+        #expect(item.alertAt == "2026-09-12T14:30")
+        let dateOnly = try JSONDecoder().decode(TodoItem.self, from: Data(#"{"id":"0-1","text":"x","done":false,"deadline":"2026-09-12","alert_at":"2026-09-12T09:00"}"#.utf8))
+        #expect(dateOnly.due == Due(year: 2026, month: 9, day: 12))
+    }
+
     @Test func decodesServerItem() throws {
         let json = #"{"id":"0-9a1f0c2e","text":"Ship","done":false,"deadline":"2026-09-12 14:30","overdue":true,"due_soon":false}"#
         let item = try JSONDecoder().decode(TodoItem.self, from: Data(json.utf8))

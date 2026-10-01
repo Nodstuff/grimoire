@@ -51,6 +51,38 @@ import Testing
         #expect(try await cache.doc("d3") == nil)
     }
 
+    @Test func freshCacheStartsFromTheTreesSeqHeader() async throws {
+        let cache = try Cache.inMemory()
+        let server = MockServer { r in
+            switch r.path {
+            case "/api/docs": MockServer.Reply(chunks: [Data(Self.treeJSON.utf8)], headers: ["X-Grimoire-Seq": "40"])
+            case "/api/changes": Self.page(seq: 41, more: false, Fixture.change(41, doc: "d1", kind: "doc", epoch: 2))
+            default: .json(#"{"error":"unexpected"}"#)
+            }
+        }
+        try await engine(server, cache: cache).catchUp()
+        #expect(server.requests.filter { $0.path == "/api/changes" }.map { $0.query["since"] } == ["40"])
+        #expect(try await cache.lastSeq() == 41)
+    }
+
+    @Test func treeChangesApplyTheRowsDocStateWithoutRefetch() async throws {
+        let cache = try Cache.inMemory()
+        try await cache.storeDoc(JSONDecoder().decode(DocTree.self, from: Data(Self.docJSON("d1", epoch: 1).utf8)))
+        let server = MockServer { r in .json(#"{"error":"unexpected \#(r.path)"}"#) }
+        let page = #"{"seq":3,"more":false,"changes":[{"seq":2,"doc_id":"d1","kind":"tree","epoch":0,"at":"","doc":{"title":"Renamed","parent_id":null,"sort_key":"k","status":"draft","current_epoch":1,"deleted":false}},{"seq":3,"doc_id":"n1","kind":"tree","epoch":0,"at":"","doc":{"title":"New","parent_id":"d1","sort_key":"i","status":null,"current_epoch":0,"deleted":false}}]}"#
+        let changes = try JSONDecoder().decode(ChangePage.self, from: Data(page.utf8)).changes
+        let update = try await engine(server, cache: cache).apply(changes)
+        #expect(update.treeChanged && server.requests.isEmpty)
+        let d1 = try #require(try await cache.doc("d1"))
+        #expect(d1.title == "Renamed" && d1.status == "draft" && d1.bodyEpoch == 1)
+        #expect(try await cache.blocks(of: "d1").count == 1, "the body survives a rename")
+        #expect(try await cache.doc("n1")?.parentID == "d1")
+
+        let gone = Change(seq: 4, docID: "n1", kind: .tree, doc: Change.DocState(title: "New", deleted: true))
+        _ = try await engine(server, cache: cache).apply([gone])
+        #expect(try await cache.doc("n1") == nil)
+    }
+
     @Test func applyRefetchesHeldAndTodoDocsOnly() async throws {
         let cache = try Cache.inMemory()
         try await cache.replaceTree(JSONDecoder().decode([DocSummary].self, from: Data(Self.treeJSON.utf8)))

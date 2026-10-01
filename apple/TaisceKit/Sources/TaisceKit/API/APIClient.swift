@@ -14,7 +14,21 @@ public struct APIClient: Sendable {
     // MARK: read side
 
     public func tree() async throws -> [DocSummary] {
-        try await get("/api/docs")
+        try await treeWithSeq().docs
+    }
+
+    /// The tree plus `X-Grimoire-Seq`, the change-log head read under the same
+    /// lock as the list: page `/api/changes` from it to bootstrap without a race.
+    /// `seq` is nil on daemons that predate the change log.
+    public func treeWithSeq() async throws -> (docs: [DocSummary], seq: Int?) {
+        let (data, response) = try await session.data(for: try await request("/api/docs"))
+        try Self.check(data: data, response: response)
+        let seq = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "X-Grimoire-Seq").flatMap(Int.init)
+        do {
+            return (try JSONDecoder().decode([DocSummary].self, from: data), seq)
+        } catch {
+            throw APIError.decoding(String(describing: error))
+        }
     }
 
     public func doc(_ id: DocID) async throws -> DocTree {

@@ -24,6 +24,13 @@ import Testing
         }
     }
 
+    @Test func jsonErrorWithStatusCarriesTheMessage() async throws {
+        let server = MockServer { _ in MockServer.Reply(status: 400, chunks: [Data(#"{"error":"since must be an integer"}"#.utf8)]) }
+        await #expect(throws: APIError.server("since must be an integer")) {
+            _ = try await server.client().changes(since: 0)
+        }
+    }
+
     @Test func htmlFallbackIsNotAnAPIResponse() async throws {
         let server = MockServer { _ in MockServer.Reply(chunks: [Data("<!doctype html>".utf8)], contentType: "text/html; charset=utf-8") }
         await #expect(throws: APIError.notAPIRoute("/api/changes")) {

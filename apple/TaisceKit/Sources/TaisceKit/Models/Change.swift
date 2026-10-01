@@ -33,22 +33,51 @@ public struct Change: Codable, Sendable, Hashable {
         }
     }
 
+    /// The doc as it stands when the page is SERVED (not as of `seq`): an
+    /// older row can carry a newer title. Nil only for a hard-deleted doc.
+    public struct DocState: Codable, Sendable, Hashable {
+        public var title: String
+        public var parentID: DocID?
+        public var sortKey: String?
+        public var status: String?
+        public var currentEpoch: Int
+        public var deleted: Bool
+
+        public init(title: String, parentID: DocID? = nil, sortKey: String? = nil, status: String? = nil, currentEpoch: Int = 0, deleted: Bool = false) {
+            self.title = title
+            self.parentID = parentID
+            self.sortKey = sortKey
+            self.status = status
+            self.currentEpoch = currentEpoch
+            self.deleted = deleted
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case title, status, deleted
+            case parentID = "parent_id"
+            case sortKey = "sort_key"
+            case currentEpoch = "current_epoch"
+        }
+    }
+
     public var seq: Int
     public var docID: DocID
     public var kind: Kind
     public var epoch: Int?
     public var at: String
+    public var doc: DocState?
 
-    public init(seq: Int, docID: DocID, kind: Kind, epoch: Int? = nil, at: String = "") {
+    public init(seq: Int, docID: DocID, kind: Kind, epoch: Int? = nil, at: String = "", doc: DocState? = nil) {
         self.seq = seq
         self.docID = docID
         self.kind = kind
         self.epoch = epoch
         self.at = at
+        self.doc = doc
     }
 
     enum CodingKeys: String, CodingKey {
-        case seq, kind, epoch, at
+        case seq, kind, epoch, at, doc
         case docID = "doc_id"
     }
 }

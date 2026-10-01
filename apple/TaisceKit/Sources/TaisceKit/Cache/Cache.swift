@@ -120,6 +120,25 @@ public final class Cache: Sendable {
         }
     }
 
+    /// Apply one doc's state from a change row, keeping its cached body and
+    /// tree decorations. A `deleted` state removes the doc.
+    public func applyDocState(_ id: DocID, _ s: Change.DocState) async throws {
+        try await db.write { db in
+            if s.deleted {
+                _ = try DocRecord.deleteOne(db, key: id)
+                return
+            }
+            var rec = try DocRecord.fetchOne(db, key: id)
+                ?? DocRecord(DocSummary(id: id, parentID: s.parentID, title: s.title, currentEpoch: s.currentEpoch), bodyEpoch: nil)
+            rec.title = s.title
+            rec.parentID = s.parentID
+            rec.sortKey = s.sortKey
+            rec.status = s.status
+            rec.currentEpoch = max(rec.currentEpoch, s.currentEpoch)
+            try rec.upsert(db)
+        }
+    }
+
     public func docs() async throws -> [DocRecord] {
         try await db.read { db in try DocRecord.order(DocRecord.Columns.sortKey, DocRecord.Columns.title).fetchAll(db) }
     }

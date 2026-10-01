@@ -57,14 +57,22 @@ in-memory id), and the parser is pure and tested byte-by-byte.
 
 The client follows a global change cursor:
 
+- `GET /api/docs` sends `X-Grimoire-Seq: <head>`, read under the same lock
+  as the list.
 - `GET /api/changes?since=<seq>&limit=<n>` →
-  `{"seq": Int, "changes": [{"seq", "doc_id", "kind": "doc"|"tree"|"deleted"|"restored", "epoch"?, "at"}], "more": Bool}`
+  `{"seq": Int, "changes": [{"seq", "doc_id", "kind": "doc"|"tree"|"deleted"|"restored", "epoch"?, "at", "doc"?}], "more": Bool}`.
+  `doc` = `{title, parent_id, sort_key, status, current_epoch, deleted}` as
+  of serving time, not as of `seq`. It is absent only for a hard-deleted doc.
+  Errors use real statuses (400/404/500) with a `{"error"}` body.
 - `GET /api/changes/stream` (SSE): `id: <seq>`, `event: change`,
-  `data: <one change>`, `: ping` every 25 s, resumes from `Last-Event-ID`.
+  `data: <one change>`, `retry: 3000` on connect, `: ping` every 25 s,
+  resumes from `Last-Event-ID`.
 
 `SyncEngine` (actor, foreground-only `start()` / `stop()`):
 
-1. Fresh cache (cursor 0): load the whole tree from `/api/docs`.
+1. Fresh cache (cursor 0): load the whole tree from `/api/docs` and start
+   the cursor at its `X-Grimoire-Seq`. Without the header (an older daemon),
+   start at 0.
 2. Catch up: page `/api/changes` from `last_seq` until `more` is false;
    store the cursor after each page.
 3. Follow the stream with `Last-Event-ID: <last_seq>`; a 60 s idle timeout
@@ -74,13 +82,16 @@ The client follows a global change cursor:
    `last_seq`.
 
 Applying a batch: last change per doc wins; `deleted` drops the doc and its
-blocks; `tree` / `restored` refetch `/api/docs` once; `doc` refetches the body
+blocks; `tree` / `restored` apply the row's `doc` state in place, and
+refetch `/api/docs` only if a row lacks it; `doc` refetches the body
 only for docs we hold (or the To-do doc, or `alwaysFetch`), otherwise just
 marks the cached row stale (`current_epoch > body_epoch`) so opening it
 fetches. UI listens via `updates()` (AsyncStream) and GRDB `ValueObservation`.
 
-To-dos: deadlines are `· due YYYY-MM-DD` or `· due YYYY-MM-DD HH:MM`; a
-date-only deadline alerts at 09:00 local (`Due.alertDate`).
+To-dos: deadlines are written `· due YYYY-MM-DD` or `· due YYYY-MM-DD HH:MM`.
+The offline parser reads both forms. API items send the day in `deadline`,
+plus `due_time` (`HH:MM`) and `alert_at` (local; 09:00 when there is no time).
+`TodoItem.due` combines `deadline` and `due_time`.
 
 ## What's stubbed
 

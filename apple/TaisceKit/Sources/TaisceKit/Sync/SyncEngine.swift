@@ -121,11 +121,17 @@ public actor SyncEngine {
     }
 
     /// Page the change log from the stored cursor until `more` is false.
-    /// A fresh cache (cursor 0) first loads the whole tree.
+    /// A fresh cache (cursor 0) first loads the whole tree and starts from
+    /// the `X-Grimoire-Seq` it came with, skipping the backfill.
     public func catchUp() async throws {
         var since = try await cache.lastSeq()
         if since == 0 {
-            try await cache.replaceTree(api.tree())
+            let (docs, head) = try await api.treeWithSeq()
+            try await cache.replaceTree(docs)
+            if let head {
+                since = head
+                try await cache.setLastSeq(head)
+            }
             publish(SyncUpdate(docIDs: [], treeChanged: true))
         }
         while true {
@@ -165,8 +171,9 @@ public actor SyncEngine {
     // MARK: applying changes
 
     /// Apply a batch: the LAST change per doc wins (a doc edited then
-    /// deleted in one page is just deleted). Tree-shaped changes refetch the
-    /// tree once; doc changes refetch bodies we hold, else mark them stale.
+    /// deleted in one page is just deleted). Tree-shaped changes apply the
+    /// row's `doc` state, refetching the whole tree only when a row lacks it
+    /// (older daemon); doc changes refetch bodies we hold, else mark them stale.
     func apply(_ changes: [Change]) async throws -> SyncUpdate {
         guard !changes.isEmpty else { return SyncUpdate(docIDs: [], treeChanged: false) }
         var last: [DocID: Change] = [:]
@@ -181,9 +188,15 @@ public actor SyncEngine {
             update.docIDs.insert(id)
             update.treeChanged = true
         }
-        if changes.contains(where: { $0.kind == .tree || $0.kind == .restored }) {
+        let treeShaped = order.compactMap { last[$0] }.filter { $0.kind == .tree || $0.kind == .restored }
+        if treeShaped.contains(where: { $0.doc == nil }) {
             try await cache.replaceTree(api.tree())
             update.treeChanged = true
+        } else {
+            for c in treeShaped {
+                if let s = c.doc { try await cache.applyDocState(c.docID, s) }
+                update.treeChanged = true
+            }
         }
         for id in order {
             guard let c = last[id], c.kind != .deleted else { continue }

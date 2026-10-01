@@ -98,15 +98,20 @@ public struct TodoItem: Codable, Sendable, Hashable, Identifiable {
     public var done: Bool
     public var carried: Bool
     public var carriedFrom: String?
-    /// raw deadline as sent: `YYYY-MM-DD` today, `YYYY-MM-DD HH:MM` once due times land
+    /// the deadline's day, `YYYY-MM-DD`
     public var deadline: String?
+    /// `HH:MM` when the deadline has a time
+    public var dueTime: String?
+    /// `YYYY-MM-DDTHH:MM` local; the server's answer to "when to alert" (09:00 if no time)
+    public var alertAt: String?
     public var note: String?
     public var overdue: Bool
     public var dueSoon: Bool
 
     public init(
         id: String, text: String, done: Bool, carried: Bool = false, carriedFrom: String? = nil,
-        deadline: String? = nil, note: String? = nil, overdue: Bool = false, dueSoon: Bool = false
+        deadline: String? = nil, dueTime: String? = nil, alertAt: String? = nil,
+        note: String? = nil, overdue: Bool = false, dueSoon: Bool = false
     ) {
         self.id = id
         self.text = text
@@ -114,17 +119,25 @@ public struct TodoItem: Codable, Sendable, Hashable, Identifiable {
         self.carried = carried
         self.carriedFrom = carriedFrom
         self.deadline = deadline
+        self.dueTime = dueTime
+        self.alertAt = alertAt
         self.note = note
         self.overdue = overdue
         self.dueSoon = dueSoon
     }
 
-    public var due: Due? { deadline.flatMap(Due.init) }
+    /// Deadline day + optional time. Also reads a combined `D HH:MM` deadline.
+    public var due: Due? {
+        guard let deadline else { return nil }
+        return Due(dueTime.map { "\(deadline) \($0)" } ?? deadline)
+    }
 
     enum CodingKeys: String, CodingKey {
         case id, text, done, carried, deadline, note, overdue
         case carriedFrom = "carried_from"
         case dueSoon = "due_soon"
+        case dueTime = "due_time"
+        case alertAt = "alert_at"
     }
 
     public init(from decoder: any Decoder) throws {
@@ -136,6 +149,8 @@ public struct TodoItem: Codable, Sendable, Hashable, Identifiable {
         carried = try c.decodeIfPresent(Bool.self, forKey: .carried) ?? false
         carriedFrom = try c.decodeIfPresent(String.self, forKey: .carriedFrom)
         deadline = try c.decodeIfPresent(String.self, forKey: .deadline)
+        dueTime = try c.decodeIfPresent(String.self, forKey: .dueTime)
+        alertAt = try c.decodeIfPresent(String.self, forKey: .alertAt)
         note = try c.decodeIfPresent(String.self, forKey: .note)
         overdue = try c.decodeIfPresent(Bool.self, forKey: .overdue) ?? false
         dueSoon = try c.decodeIfPresent(Bool.self, forKey: .dueSoon) ?? false
