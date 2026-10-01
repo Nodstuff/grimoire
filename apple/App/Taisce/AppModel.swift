@@ -1,6 +1,7 @@
 import Foundation
 import TaisceKit
 import Observation
+import UIKit
 
 /// App-wide state: the server connection, its sign-in, cache and sync
 /// engine, and the doc tree the sidebar shows. Everything below the UI lives
@@ -11,7 +12,10 @@ final class AppModel {
     static let defaultServerURL = "https://taisce.null.ie"
 
     enum AuthPhase: Equatable {
-        /// a loopback (LOCAL-mode) daemon: no tokens
+        /// boot hasn't decided yet (Keychain read, discovery): show neither
+        /// the docs nor the sign-in screen
+        case checking
+        /// a LOCAL-mode daemon: no tokens
         case notRequired
         case signedOut
         case signedIn
@@ -22,7 +26,7 @@ final class AppModel {
     private(set) var cache: Cache?
     private(set) var sync: SyncEngine?
     private(set) var auth: AuthSession?
-    private(set) var authPhase: AuthPhase = .notRequired
+    private(set) var authPhase: AuthPhase = .checking
     private(set) var isSigningIn = false
     private(set) var docs: [DocRecord] = []
     private(set) var tree: [DocTreeNode] = []
@@ -32,7 +36,8 @@ final class AppModel {
     private var authTask: Task<Void, Never>?
 
     init() {
-        serverURL = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? Self.defaultServerURL
+        let stored = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? Self.defaultServerURL
+        serverURL = ServerConfig.normalizedURL(stored)?.absoluteString ?? Self.defaultServerURL
     }
 
     var needsSignIn: Bool { authPhase == .signedOut }
@@ -44,8 +49,13 @@ final class AppModel {
     }
 
     func setServerURL(_ s: String) async {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed != serverURL, URL(string: trimmed) != nil else { return }
+        // "taisce.null.ie" means https://taisce.null.ie
+        guard let url = ServerConfig.normalizedURL(s) else {
+            lastError = "not a server URL: \(s)"
+            return
+        }
+        let trimmed = url.absoluteString
+        guard trimmed != serverURL else { return }
         await stopSync()
         serverURL = trimmed
         UserDefaults.standard.set(trimmed, forKey: Self.serverURLKey)
@@ -54,7 +64,7 @@ final class AppModel {
     }
 
     func startSync() async {
-        guard authPhase != .signedOut else { return }
+        guard authPhase == .signedIn || authPhase == .notRequired else { return }
         await sync?.start()
     }
 
@@ -108,7 +118,7 @@ final class AppModel {
     /// LOCAL-mode one can be reached by name). Unreachable and no tokens:
     /// a loopback daemon is assumed LOCAL, anything else asks to sign in.
     static func authSession(for url: URL) async throws -> AuthSession? {
-        let auth = AuthSession(oauth: OAuthClient(baseURL: url), store: try KeychainTokenStore())
+        let auth = AuthSession(oauth: OAuthClient(baseURL: url), store: try KeychainTokenStore(), shield: Self.backgroundTask)
         if await auth.state == .signedIn { return auth }
         do {
             return try await auth.requiresAuth() ? auth : nil
@@ -117,12 +127,20 @@ final class AppModel {
         }
     }
 
+    /// Finish a token refresh even if the app is backgrounded mid-request:
+    /// a rotation the server did but we never saved costs the whole grant.
+    static let backgroundTask: AuthSession.Shield = { name in
+        let id = await MainActor.run { UIApplication.shared.beginBackgroundTask(withName: name) }
+        return { await MainActor.run { UIApplication.shared.endBackgroundTask(id) } }
+    }
+
     /// One cache file per server, so switching servers never mixes docs.
     private func connect(withAuth: Bool = true) async {
         observeTask?.cancel()
         authTask?.cancel()
         guard let url = URL(string: serverURL) else {
             lastError = "not a URL: \(serverURL)"
+            authPhase = .notRequired
             return
         }
         do {
@@ -155,6 +173,8 @@ final class AppModel {
             }
         } catch {
             lastError = error.localizedDescription
+            // the error shows in Settings; never leave the UI on "checking"
+            if authPhase == .checking { authPhase = .notRequired }
         }
     }
 

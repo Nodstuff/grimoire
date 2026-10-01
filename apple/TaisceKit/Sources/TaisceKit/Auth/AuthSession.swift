@@ -17,8 +17,15 @@ public actor AuthSession: TokenProvider {
         case signedOut, signedIn
     }
 
+    /// Brackets work that must not be cut short by suspension: returns the
+    /// "done" callback. The app wraps `UIApplication.beginBackgroundTask`,
+    /// because a refresh the server has rotated but we haven't saved revokes
+    /// the grant on the next try.
+    public typealias Shield = @Sendable (_ name: String) async -> @Sendable () async -> Void
+
     public nonisolated let oauth: OAuthClient
     let store: any TokenStore
+    let shield: Shield
     let now: @Sendable () -> Date
     /// Refresh this long before the access token expires.
     let refreshMargin: TimeInterval
@@ -35,10 +42,12 @@ public actor AuthSession: TokenProvider {
         oauth: OAuthClient,
         store: any TokenStore,
         refreshMargin: TimeInterval = 120,
-        now: @escaping @Sendable () -> Date = { .now }
+        now: @escaping @Sendable () -> Date = { .now },
+        shield: @escaping Shield = { _ in {} }
     ) {
         self.oauth = oauth
         self.store = store
+        self.shield = shield
         self.refreshMargin = refreshMargin
         self.now = now
     }
@@ -135,12 +144,14 @@ public actor AuthSession: TokenProvider {
         return tokens
     }
 
+    /// Memory first: if the Keychain write fails, this process still holds
+    /// the rotated tokens (the spent refresh token is useless either way).
     private func save(_ t: TokenSet?) throws {
         let was = state
-        try store.setTokens(t, for: server)
         tokens = t
         loaded = true
         if state != was { publish() }
+        try store.setTokens(t, for: server)
     }
 
     func discovered() async throws -> OAuthDiscovery {
@@ -180,10 +191,13 @@ public actor AuthSession: TokenProvider {
         }
         let d = try await discovered()
         let gen = generation
+        let done = await shield("taisce.token-refresh")
+        defer { Task { await done() } }
         do {
             let next = try await oauth.refresh(t.refreshToken, clientID: clientID, d, now: now())
             guard gen == generation else { throw AuthError.signedOut }
-            try save(next)
+            // a failed Keychain write must not lose the rotation: keep using it
+            try? save(next)
             return next
         } catch let AuthError.oauth(error, _) where error == "invalid_grant" || error == "invalid_client" {
             // revoked, expired, or reused: only a new sign-in helps

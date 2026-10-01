@@ -27,6 +27,20 @@ import UIKit
         window.isHidden = true
     }
 
+    @Test func bootStartsUndecidedAndNormalisesTheURL() async throws {
+        UserDefaults.standard.set("127.0.0.1:9", forKey: AppModel.serverURLKey)
+        let m = AppModel()
+        #expect(m.authPhase == .checking, "neither docs nor sign-in before boot decides")
+        #expect(m.serverURL == "http://127.0.0.1:9")
+        await m.boot()
+        await m.stopSync()
+        #expect(m.authPhase == .notRequired)
+        await m.setServerURL("taisce.invalid")
+        await m.stopSync()
+        #expect(m.serverURL == "https://taisce.invalid")
+        UserDefaults.standard.removeObject(forKey: AppModel.serverURLKey)
+    }
+
     @Test func anUnreachableLocalDaemonShowsTheEmptyLibrary() async throws {
         // nothing listens on port 9: loopback is assumed LOCAL (no sign-in)
         let m = await model(server: "http://127.0.0.1:9")

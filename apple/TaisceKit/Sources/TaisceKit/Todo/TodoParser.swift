@@ -16,7 +16,8 @@ public enum TodoParser {
     public static func parse(markdown: String) -> [TodoRecord] {
         var out: [TodoRecord] = []
         var day: String?
-        var position = 0
+        // per date, not per heading: a day heading can appear twice
+        var positions: [String: Int] = [:]
         var current: TodoRecord?
         var noteLines: [String] = []
 
@@ -35,7 +36,6 @@ public enum TodoParser {
             if let d = dayHeading(trimmed) {
                 flush()
                 day = d
-                position = 0
                 continue
             }
             if trimmed.hasPrefix("#") {
@@ -48,11 +48,12 @@ public enum TodoParser {
             if let (mark, rest) = splitItemLine(trimmed) {
                 flush()
                 let t = tokens(rest)
+                let position = positions[day, default: 0]
+                positions[day] = position + 1
                 current = TodoRecord(
                     date: day, position: position, mark: String(mark), text: t.text,
                     deadline: t.deadline, carriedFrom: t.carriedFrom, note: nil
                 )
-                position += 1
             } else if trimmed.isEmpty {
                 flush()
             } else if current != nil {

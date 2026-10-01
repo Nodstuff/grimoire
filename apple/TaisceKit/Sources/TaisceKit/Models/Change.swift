@@ -84,7 +84,10 @@ public struct Change: Codable, Sendable, Hashable {
 
 /// `GET /api/changes?since=&limit=` → one page.
 public struct ChangePage: Codable, Sendable, Hashable {
-    /// the cursor to pass as `since` next
+    /// The journal HEAD at serving time, not this page's last row. While
+    /// `more` is true, page on from `changes.last.seq`; jumping to `seq`
+    /// would skip the rows in between. A head below your cursor means the
+    /// server's database was reset.
     public var seq: Int
     public var changes: [Change]
     public var more: Bool

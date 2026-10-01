@@ -35,7 +35,15 @@ public actor SyncEngine {
     /// (the To-do doc is always included; pinned docs later).
     public var alwaysFetch: Set<DocID> = []
 
+    /// Bodies that failed to fetch (doc id → error), kept stale and retried
+    /// on the doc's next change or when it is opened. The UI can show these.
+    public private(set) var failedDocs: [DocID: String] = [:]
+    public private(set) var lastError: String?
+
     private var runner: Task<Void, Never>?
+    /// The loop `stop()` cancelled, until it has unwound: `start()` waits for
+    /// it so two loops never write the cursor at once.
+    private var stopping: Task<Void, Never>?
     private var subscribers: [UUID: AsyncStream<SyncUpdate>.Continuation] = [:]
     private var serverRetry: Duration?
     /// set by `follow()` when the current connection delivered anything
@@ -57,15 +65,21 @@ public actor SyncEngine {
 
     // MARK: lifecycle
 
-    public func start() {
+    public func start() async {
+        await stopping?.value
         guard runner == nil else { return }
         runner = Task { await self.run() }
     }
 
-    public func stop() {
-        runner?.cancel()
+    /// Cancel the loop and wait for it to finish.
+    public func stop() async {
+        guard let old = runner else { return }
         runner = nil
-        status = .idle
+        old.cancel()
+        stopping = old
+        await old.value
+        if stopping == old { stopping = nil }
+        if runner == nil { status = .idle }
     }
 
     public func setAlwaysFetch(_ ids: Set<DocID>) {
@@ -106,8 +120,15 @@ public actor SyncEngine {
                 try await follow()
             } catch is CancellationError {
                 break
+            } catch SyncError.undecodableEvent {
+                // re-read that stretch through /api/changes before following
+                // again (after the usual backoff, so a server that keeps
+                // sending it can't spin us)
+                caughtUp = false
+                lastError = "an undecodable change event; catching up"
             } catch {
                 // fall through to the backoff; a failed catch-up is retried whole
+                lastError = String(describing: error)
             }
             if Task.isCancelled { break }
             // a connection that delivered events or heartbeats was healthy:
@@ -122,30 +143,59 @@ public actor SyncEngine {
 
     /// Page the change log from the stored cursor until `more` is false.
     /// A fresh cache (cursor 0) first loads the whole tree and starts from
-    /// the `X-Grimoire-Seq` it came with, skipping the backfill.
+    /// the `Taisce-Seq` it came with, skipping the backfill. A head below
+    /// our cursor means the server's database was reset or restored: start
+    /// over from a fresh tree. Then fetch the To-do doc if it is stale, so
+    /// Today has items on first run.
     public func catchUp() async throws {
         var since = try await cache.lastSeq()
-        if since == 0 {
-            let (docs, head) = try await api.treeWithSeq()
-            try await cache.replaceTree(docs)
-            if let head {
-                since = head
-                try await cache.setLastSeq(head)
-            }
-            publish(SyncUpdate(docIDs: [], treeChanged: true))
-        }
+        if since == 0 { since = try await bootstrap() }
         while true {
             try Task.checkCancellation()
             let page = try await api.changes(since: since, limit: pageSize)
+            if page.seq < since {
+                since = try await bootstrap(reset: true)
+                continue
+            }
             publish(try await apply(page.changes))
-            // never move the cursor backwards, even on a confused server
-            since = max(since, page.seq)
-            try await cache.setLastSeq(since)
+            // `seq` is the journal head, not this page's last row: with
+            // `more` the next page starts after the last row we saw
+            if let last = page.changes.last?.seq, last > since {
+                since = last
+                try await cache.setLastSeq(since)
+            }
             if !page.more || page.changes.isEmpty { break }
         }
+        try await fetchTodoIfStale()
+        lastError = nil
     }
 
-    /// Follow the SSE stream until it ends or drops.
+    /// Load the whole tree and start the cursor at its head. Returns the cursor.
+    func bootstrap(reset: Bool = false) async throws -> Int {
+        let (docs, head) = try await api.treeWithSeq()
+        try await cache.replaceTree(docs)
+        if reset {
+            // cached bodies may describe the old database's epochs
+            try await cache.markAllBodiesStale()
+            try await cache.resetLastSeq(head ?? 0)
+        } else if let head {
+            try await cache.setLastSeq(head)
+        }
+        publish(SyncUpdate(docIDs: [], treeChanged: true))
+        return head ?? 0
+    }
+
+    func fetchTodoIfStale() async throws {
+        guard let todo = try await cache.docs().first(where: { $0.parentID == nil && $0.title == TodoParser.todoDocTitle }),
+              todo.isBodyStale
+        else { return }
+        var update = SyncUpdate(docIDs: [], treeChanged: false)
+        try await fetchBody(todo.id, target: todo.currentEpoch, into: &update)
+        publish(update)
+    }
+
+    /// Follow the SSE stream until it ends or drops. An event we can't read
+    /// leaves the cursor where it was and hands over to a catch-up.
     func follow() async throws {
         let from = try await cache.lastSeq()
         connectionHealthy = false
@@ -157,13 +207,12 @@ public actor SyncEngine {
             case .comment:
                 break
             case .event(let e):
-                guard e.event == "change" || e.event == "message",
-                      let data = e.data.data(using: .utf8),
-                      let change = try? JSONDecoder().decode(Change.self, from: data)
-                else { continue }
+                guard e.event == "change" || e.event == "message" else { continue }
+                guard let change = try? JSONDecoder().decode(Change.self, from: Data(e.data.utf8)) else {
+                    throw SyncError.undecodableEvent(e.id)
+                }
                 publish(try await apply([change]))
-                let seq = max(change.seq, e.id.flatMap(Int.init) ?? 0)
-                if seq > (try await cache.lastSeq()) { try await cache.setLastSeq(seq) }
+                if change.seq > (try await cache.lastSeq()) { try await cache.setLastSeq(change.seq) }
             }
         }
     }
@@ -213,8 +262,7 @@ public actor SyncEngine {
             let held = cached?.bodyEpoch != nil
             if held || wanted {
                 if let have = cached?.bodyEpoch, let target, have >= target { continue }
-                try await cache.storeDoc(api.doc(id))
-                update.docIDs.insert(id)
+                try await fetchBody(id, target: target, into: &update)
             } else if let epoch = target {
                 try await cache.noteEpoch(id, epoch: epoch)
             }
@@ -222,9 +270,47 @@ public actor SyncEngine {
         return update
     }
 
-    /// Fetch one doc now (opening a doc whose body is missing or stale).
-    public func refresh(_ id: DocID) async throws {
-        try await cache.storeDoc(api.doc(id))
-        publish(SyncUpdate(docIDs: [id], treeChanged: false))
+    /// One body fetch inside a batch. A doc the server no longer has is
+    /// dropped; any other failure leaves it stale (so opening it retries)
+    /// and is recorded in `failedDocs` instead of stalling the whole sync.
+    /// Auth failures and cancellation still end the batch.
+    func fetchBody(_ id: DocID, target: Int?, into update: inout SyncUpdate) async throws {
+        do {
+            try await cache.storeDoc(api.doc(id))
+            failedDocs[id] = nil
+            update.docIDs.insert(id)
+        } catch APIError.notFound {
+            try await cache.deleteDoc(id)
+            failedDocs[id] = nil
+            update.docIDs.insert(id)
+            update.treeChanged = true
+        } catch APIError.unauthorized {
+            throw APIError.unauthorized
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            if let target { try await cache.noteEpoch(id, epoch: target) }
+            failedDocs[id] = String(describing: error)
+        }
     }
+
+    /// Fetch one doc now (opening a doc whose body is missing or stale). A
+    /// doc the server no longer has is dropped from the cache, then rethrown.
+    public func refresh(_ id: DocID) async throws {
+        do {
+            try await cache.storeDoc(api.doc(id))
+            failedDocs[id] = nil
+            publish(SyncUpdate(docIDs: [id], treeChanged: false))
+        } catch let e as APIError {
+            if case .notFound = e {
+                try await cache.deleteDoc(id)
+                publish(SyncUpdate(docIDs: [id], treeChanged: true))
+            }
+            throw e
+        }
+    }
+}
+
+enum SyncError: Error {
+    /// An SSE `change` whose data doesn't decode (carries the event id).
+    case undecodableEvent(String?)
 }
