@@ -13,8 +13,10 @@
 //!   and a `: ping` comment every 25s.
 //!
 //! Each change carries `doc: {title, parent_id, sort_key, status,
-//! current_epoch, deleted}` — the doc as it stands when the page is served —
-//! unless the row is gone. Failures are real statuses with a JSON body: 400
+//! current_epoch, deleted, workspace_id}` — the doc as it stands when the
+//! page is served, `workspace_id` resolved (null = Unsorted) — unless the
+//! row is gone. Labelling a doc, or renaming/deleting a workspace, journals
+//! a `tree` row for every doc it re-resolves or re-chips. Failures are real statuses with a JSON body: 400
 //! for a bad query, 500 for a store error. `GET /api/docs` answers with
 //! `Taisce-Seq: <head>` (RFC 6648: no `X-`) read under the same lock as the
 //! list, so a client bootstraps the tree and its cursor from one snapshot.

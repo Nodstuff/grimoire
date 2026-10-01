@@ -66,6 +66,16 @@
 //! for all-day items, `due_at` (RFC 3339 UTC) for timed ones, `legacy_time:
 //! true` on a pre-UTC one. No `overdue`: clients compute it in their zone.
 //!
+//! Workspaces: one list PER workspace. Every route takes an optional
+//! `workspace` (query or body: `unsorted`, an id, or a name, case-
+//! insensitive). A workspace's list is the shallowest doc titled To-do
+//! resolving to it, created on first write/GET under its first labelled
+//! root (shallowest, sidebar order), or at the root, labelled, when it has
+//! none. Unsorted's is the unlabelled ROOT To-do. With no `workspace` the
+//! routes keep today's behaviour: the unlabelled root To-do, else a root
+//! To-do that has since been labelled. Day answers carry the list's
+//! `workspace_id`.
+//!
 //! Routes (all human-principal):
 //! - `GET  /api/todo?date=YYYY-MM-DD&today=YYYY-MM-DD` → `{doc_id, date,
 //!   today, items:[{id, text, done, carried?, carried_from?, deadline?,
@@ -94,7 +104,11 @@
 //!   on or before it and timed ones whose UTC date is; an instant keeps timed
 //!   ones at or before it and all-day ones on or before its UTC date. No
 //!   local-time reading of either. READ-ONLY: no carry-forward, and no To-do
-//!   doc is created. Errors are 400/500 with `{error}`.
+//!   doc is created. Errors are 400/500 with `{error}`. With no
+//!   `workspace` it reads EVERY list (alerts fire for every workspace):
+//!   each item gains `doc_id` and `workspace_id`, `docs: [{doc_id,
+//!   workspace_id, epoch}]` lists what was read, and `doc_id`/`epoch` stay
+//!   the legacy list's.
 //! - `POST /api/todo/note {date, item_id, note, today}` (empty clears)
 
 use crate::api::ApiState;
@@ -104,7 +118,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use crate::due::Due;
 use chrono::{FixedOffset, NaiveDate};
-use grimoire_store::{BlockStore, Doc, SqliteStore};
+use grimoire_store::{BlockStore, Doc, SqliteStore, WorkspaceFilter};
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -796,13 +811,17 @@ pub fn carry_forward(md: &str, date: &str, today: &str) -> (String, usize) {
     (render_doc(&chunks), n)
 }
 
-/// What the client says about its own clock (query or body).
+/// What the client says about its own clock (query or body), and which
+/// workspace's list it means.
 #[derive(Debug, Default, Clone, Deserialize)]
 struct ClientClock {
     #[serde(default)]
     today: Option<String>,
     #[serde(default)]
     utc_offset: Option<String>,
+    /// `unsorted`, a workspace id or name; absent = the legacy list
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 /// The client's date and zone, validated. `today` is required in SERVER mode
@@ -836,16 +855,80 @@ fn should_carry(md: &str, date: &str, today: &str) -> bool {
 
 /* ---------- the doc ---------- */
 
-/// The root doc titled To-do, created (by the human) when absent.
-pub fn find_or_create_todo(s: &mut SqliteStore, human: Uuid) -> grimoire_store::Result<Doc> {
-    if let Some(d) = s
-        .list_docs()?
-        .into_iter()
-        .find(|d| d.parent_id.is_none() && d.title == TODO_TITLE)
+/// Which To-do doc a request means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoScope {
+    /// No `workspace` param (today's clients): the unlabelled root To-do,
+    /// else a root To-do that has since been labelled.
+    Legacy,
+    /// That workspace's list; Unsorted's is the unlabelled root To-do.
+    In(WorkspaceFilter),
+}
+
+fn scope_of(s: &SqliteStore, raw: Option<&str>) -> Result<TodoScope, String> {
+    Ok(match crate::workspaces::filter_param(s, raw)? {
+        None => TodoScope::Legacy,
+        Some(f) => TodoScope::In(f),
+    })
+}
+
+fn depth(docs: &HashMap<Uuid, &Doc>, id: Uuid) -> usize {
+    let mut n = 0;
+    let mut cur = docs.get(&id).and_then(|d| d.parent_id);
+    while let Some(p) = cur
+        && n < 256
     {
+        n += 1;
+        cur = docs.get(&p).and_then(|d| d.parent_id);
+    }
+    n
+}
+
+/// The scope's To-do doc, if it exists (never creates). A workspace's is
+/// the shallowest doc titled To-do resolving to it, in sidebar order.
+pub fn find_todo(s: &SqliteStore, scope: TodoScope) -> grimoire_store::Result<Option<Doc>> {
+    let docs = s.list_docs()?;
+    let ws = s.workspace_map()?;
+    let ws_of = |d: &Doc| ws.get(&d.id).copied().flatten();
+    let todos: Vec<&Doc> = docs.iter().filter(|d| d.title == TODO_TITLE).collect();
+    let root_unsorted = todos.iter().find(|d| d.parent_id.is_none() && ws_of(d).is_none());
+    let found = match scope {
+        TodoScope::Legacy => root_unsorted.or_else(|| todos.iter().find(|d| d.parent_id.is_none())),
+        TodoScope::In(WorkspaceFilter::Unsorted) => root_unsorted,
+        TodoScope::In(WorkspaceFilter::Id(w)) => {
+            let by_id: HashMap<Uuid, &Doc> = docs.iter().map(|d| (d.id, d)).collect();
+            todos.iter().filter(|d| ws_of(d) == Some(w)).min_by_key(|d| depth(&by_id, d.id))
+        }
+    };
+    Ok(found.map(|d| (*d).clone()))
+}
+
+/// The scope's To-do doc, created (by the human) when absent: a
+/// workspace's goes under its first labelled root (shallowest, in sidebar
+/// order; mirrors skipped), else at the root, labelled.
+pub fn find_or_create_todo_in(s: &mut SqliteStore, human: Uuid, scope: TodoScope) -> grimoire_store::Result<Doc> {
+    if let Some(d) = find_todo(s, scope)? {
         return Ok(d);
     }
-    s.create_doc(TODO_TITLE, None, human)
+    let TodoScope::In(WorkspaceFilter::Id(w)) = scope else {
+        return s.create_doc(TODO_TITLE, None, human);
+    };
+    let labelled: std::collections::HashSet<Uuid> = s.get_workspace(w)?.doc_ids.into_iter().collect();
+    let docs = s.list_docs()?;
+    let by_id: HashMap<Uuid, &Doc> = docs.iter().map(|d| (d.id, d)).collect();
+    let parent = docs
+        .iter()
+        .filter(|d| labelled.contains(&d.id) && !matches!(s.get_mirror(d.id), Ok(Some(_))))
+        .min_by_key(|d| depth(&by_id, d.id))
+        .map(|d| d.id);
+    match parent {
+        Some(p) => s.create_doc(TODO_TITLE, Some(p), human),
+        None => {
+            let d = s.create_doc(TODO_TITLE, None, human)?;
+            s.set_doc_workspace(d.id, Some(w))?;
+            Ok(d)
+        }
+    }
 }
 
 /// Save `new_md` over the doc as the human at the current epoch (no-op when
@@ -876,6 +959,7 @@ fn day_json(s: &SqliteStore, doc: &Doc, date: &str, today: &str, carried: usize,
         "carried": carried,
         "prev_date": prev_day(&md, date),
         "epoch": tree.doc.current_epoch,
+        "workspace_id": s.doc_workspace(doc.id).map_err(|e| e.to_string())?,
     });
     if let Some(w) = warning {
         v["warning"] = json!(w);
@@ -907,7 +991,11 @@ async fn mutate(
     let human = st.human;
     let hot = st.hot.clone();
     with_store(&st.store, move |s| {
-        let doc = match find_or_create_todo(s, human) {
+        let scope = match scope_of(s, clock.workspace.as_deref()) {
+            Ok(sc) => sc,
+            Err(m) => return Json(json!({"error": m})),
+        };
+        let doc = match find_or_create_todo_in(s, human, scope) {
             Ok(d) => d,
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
@@ -951,8 +1039,13 @@ async fn get_day(State(st): State<ApiState>, server: Server, Query(q): Query<Day
     }
     let human = st.human;
     let hot = st.hot.clone();
+    let ws = q.clock.workspace.clone();
     with_store(&st.store, move |s| {
-        let doc = match find_or_create_todo(s, human) {
+        let scope = match scope_of(s, ws.as_deref()) {
+            Ok(sc) => sc,
+            Err(m) => return Json(json!({"error": m})),
+        };
+        let doc = match find_or_create_todo_in(s, human, scope) {
             Ok(d) => d,
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
@@ -1019,30 +1112,71 @@ async fn due(State(st): State<ApiState>, Query(q): Query<DueQuery>) -> axum::res
         None => None,
     };
     let until_echo = q.until.clone();
+    let ws = q.clock.workspace.clone();
     with_store(&st.store, move |s| {
         let now = chrono::Utc::now();
-        let doc = match s.list_docs() {
-            Ok(docs) => docs.into_iter().find(|d| d.parent_id.is_none() && d.title == TODO_TITLE),
+        let scope = match scope_of(s, ws.as_deref()) {
+            Ok(sc) => sc,
+            Err(m) => return fail(StatusCode::BAD_REQUEST, m),
+        };
+        // no workspace: every list (the legacy one first), so alerts fire
+        // for every workspace; else just that workspace's
+        let lists = match due_lists(s, scope) {
+            Ok(l) => l,
             Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        let (doc_id, epoch, items) = match doc {
-            Some(d) => match grimoire_store::export::export_doc(&*s, d.id) {
-                Ok(md) => (Some(d.id.to_string()), d.current_epoch, due_items(&md, today, until)),
+        let mut items: Vec<(String, Value)> = Vec::new();
+        let mut docs = Vec::new();
+        for (d, ws_id) in &lists {
+            let md = match grimoire_store::export::export_doc(&*s, d.id) {
+                Ok(m) => m,
                 Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            },
-            None => (None, 0, Vec::new()),
-        };
+            };
+            docs.push(json!({"doc_id": d.id, "workspace_id": ws_id, "epoch": d.current_epoch}));
+            for it in due_items(&md, today, until) {
+                let key = it.due_at.clone().or_else(|| it.deadline.clone()).unwrap_or_default();
+                let mut v = json!(it);
+                v["doc_id"] = json!(d.id);
+                v["workspace_id"] = json!(ws_id);
+                items.push((key, v));
+            }
+        }
+        // an all-day date sorts at the start of its day ("D" < "DT…")
+        items.sort_by(|a, b| (&a.0, a.1["date"].as_str(), a.1["id"].as_str()).cmp(&(&b.0, b.1["date"].as_str(), b.1["id"].as_str())));
+        let first = lists.first().map(|(d, _)| d);
         Json(json!({
-            "doc_id": doc_id,
-            "epoch": epoch,
+            "doc_id": first.map(|d| d.id.to_string()),
+            "epoch": first.map(|d| d.current_epoch).unwrap_or(0),
+            "docs": docs,
             "now": crate::due::rfc3339(now),
             "until": until_echo,
             "default_alert_time": crate::due::DEFAULT_ALERT_TIME,
-            "items": items,
+            "items": items.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
         }))
         .into_response()
     })
     .await
+}
+
+/// The To-do docs `due` reads (found, never created) with each one's
+/// resolved workspace: one for a scope; for Legacy (no param) the legacy
+/// list first, then every workspace's, each doc once.
+fn due_lists(s: &SqliteStore, scope: TodoScope) -> grimoire_store::Result<Vec<(Doc, Option<Uuid>)>> {
+    let mut scopes = vec![scope];
+    if scope == TodoScope::Legacy {
+        scopes.push(TodoScope::In(WorkspaceFilter::Unsorted));
+        scopes.extend(s.list_workspaces()?.into_iter().map(|w| TodoScope::In(WorkspaceFilter::Id(w.id))));
+    }
+    let mut out: Vec<(Doc, Option<Uuid>)> = Vec::new();
+    for sc in scopes {
+        if let Some(d) = find_todo(s, sc)?
+            && !out.iter().any(|(o, _)| o.id == d.id)
+        {
+            let ws = s.doc_workspace(d.id)?;
+            out.push((d, ws));
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -1746,5 +1880,82 @@ mod tests {
         r.extensions_mut().insert(who.clone());
         let v = body(app.clone().oneshot(r).await.unwrap()).await;
         assert!(v["error"].as_str().unwrap().contains("today"), "{v}");
+    }
+
+    #[tokio::test]
+    async fn one_list_per_workspace_created_on_first_use_and_due_spans_them_all() {
+        use crate::home::testing::{app, call};
+        let (app, _) = app();
+        let t = "2026-10-01";
+        let work = call(&app, "POST", "/api/workspaces", Some(json!({"name": "Work"}))).await["id"].clone();
+        let home = call(&app, "POST", "/api/workspaces", Some(json!({"name": "Home"}))).await["id"].clone();
+        let projects = call(&app, "POST", "/api/docs", Some(json!({"title": "Projects", "parent_doc_id": null}))).await["id"].clone();
+        call(&app, "PUT", &format!("/api/docs/{}/workspace", projects.as_str().unwrap()), Some(json!({"workspace_id": work}))).await;
+
+        let l = call(&app, "POST", "/api/todo", Some(json!({"date": t, "text": "legacy item due 2026-10-05", "today": t}))).await;
+        assert!(l["workspace_id"].is_null(), "{l}");
+        let w = call(&app, "POST", "/api/todo", Some(json!({"date": t, "text": "work item due 2026-10-03", "today": t, "workspace": "work"}))).await;
+        assert_eq!(w["workspace_id"], work, "{w}");
+        let h = call(&app, "POST", "/api/todo", Some(json!({"date": t, "text": "home item due 2026-10-02", "today": t, "workspace": home}))).await;
+        assert_eq!(h["workspace_id"], home, "{h}");
+        let ids = [l["doc_id"].clone(), w["doc_id"].clone(), h["doc_id"].clone()];
+        assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2], "three lists: {ids:?}");
+
+        // where they were created: Work's under its labelled root, Home's (no
+        // labelled doc) at the root, labelled
+        let docs = call(&app, "GET", "/api/docs", None).await;
+        let doc = |id: &Value| docs.as_array().unwrap().iter().find(|d| d["id"] == *id).unwrap().clone();
+        assert_eq!(doc(&ids[1])["parent_id"], projects);
+        assert!(doc(&ids[2])["parent_id"].is_null());
+        assert_eq!(doc(&ids[2])["workspace_id"], home);
+        assert_eq!(docs.as_array().unwrap().iter().filter(|d| d["title"] == TODO_TITLE).count(), 3);
+
+        // isolation, and no duplicate on the next write
+        let g = call(&app, "GET", &format!("/api/todo?date={t}&today={t}&workspace=Work"), None).await;
+        assert_eq!(texts_of(&g), ["work item"]);
+        let g = call(&app, "GET", &format!("/api/todo?date={t}&today={t}"), None).await;
+        assert_eq!(texts_of(&g), ["legacy item"], "no param: the legacy list");
+        let g = call(&app, "GET", &format!("/api/todo?date={t}&today={t}&workspace=unsorted"), None).await;
+        assert_eq!(g["doc_id"], ids[0], "Unsorted's list is the unlabelled root one");
+        let w2 = call(&app, "POST", "/api/todo/toggle", Some(json!({"date": t, "text": "work item", "done": true, "today": t, "workspace": "Work"}))).await;
+        assert_eq!(w2["doc_id"], ids[1]);
+        assert_eq!(w2["items"][0]["done"], true);
+        call(&app, "POST", "/api/todo/toggle", Some(json!({"date": t, "text": "work item", "done": false, "today": t, "workspace": "Work"}))).await;
+        let bad = call(&app, "GET", &format!("/api/todo?date={t}&today={t}&workspace=nope"), None).await;
+        assert!(bad["error"].as_str().unwrap().contains("workspace"), "{bad}");
+
+        // due: no param = every workspace, soonest first, each tagged
+        let d = call(&app, "GET", "/api/todo/due", None).await;
+        let rows: Vec<(String, Value)> =
+            d["items"].as_array().unwrap().iter().map(|i| (i["text"].as_str().unwrap().to_string(), i["workspace_id"].clone())).collect();
+        assert_eq!(
+            rows,
+            vec![("home item".into(), home.clone()), ("work item".into(), work.clone()), ("legacy item".into(), Value::Null)],
+            "{d}"
+        );
+        assert_eq!(d["doc_id"], ids[0], "doc_id stays the legacy list");
+        assert_eq!(d["docs"].as_array().unwrap().len(), 3);
+        assert_eq!(d["items"][1]["doc_id"], ids[1]);
+        let d = call(&app, "GET", "/api/todo/due?workspace=Work", None).await;
+        assert_eq!(d["items"].as_array().unwrap().len(), 1);
+        assert_eq!(d["doc_id"], ids[1]);
+
+        // the legacy doc, once labelled, is that workspace's list; no-param
+        // clients keep it, and Unsorted gets a fresh one on first use
+        let health = call(&app, "POST", "/api/workspaces", Some(json!({"name": "Health"}))).await["id"].clone();
+        call(&app, "PUT", &format!("/api/docs/{}/workspace", ids[0].as_str().unwrap()), Some(json!({"workspace_id": health}))).await;
+        let g = call(&app, "GET", &format!("/api/todo?date={t}&today={t}"), None).await;
+        assert_eq!(g["doc_id"], ids[0]);
+        assert_eq!(g["workspace_id"], health);
+        let g = call(&app, "GET", &format!("/api/todo?date={t}&today={t}&workspace=Health"), None).await;
+        assert_eq!(g["doc_id"], ids[0]);
+        let u = call(&app, "GET", &format!("/api/todo?date={t}&today={t}&workspace=unsorted"), None).await;
+        assert!(u["doc_id"] != ids[0] && u["workspace_id"].is_null(), "{u}");
+        let g = call(&app, "GET", &format!("/api/todo?date={t}&today={t}"), None).await;
+        assert_eq!(g["doc_id"], u["doc_id"], "an unlabelled root list wins again for no-param clients");
+    }
+
+    fn texts_of(v: &Value) -> Vec<String> {
+        v["items"].as_array().unwrap().iter().map(|i| i["text"].as_str().unwrap().to_string()).collect()
     }
 }

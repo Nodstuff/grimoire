@@ -14,9 +14,11 @@ pub mod order_key;
 pub mod push;
 mod sqlite;
 mod types;
+pub mod workspaces;
 
 pub use sqlite::SqliteStore;
 pub use types::*;
+pub use workspaces::{Workspace, WorkspaceFilter, WorkspacePatch};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]

@@ -641,6 +641,55 @@ fn answer(ops: &[OpInput], out: &ProposeOutcome, before: i64, verbose: bool) -> 
 
 /// What the dedupe cache stores for a write: both renderings, so a replay
 /// answers in whichever shape the retry asks for.
+/// doc_op "workspace": label (or, with no workspace, unlabel) a doc; its
+/// subtree follows. Applied directly, not gated: a label moves nothing and
+/// weakens nothing. The store journals the tree rows.
+fn file_doc(store: &mut SqliteStore, doc_id: Uuid, workspace: Option<&str>, create_missing: bool) -> Result<(String, Value), String> {
+    let doc = store.get_doc(doc_id).map_err(|e| e.to_string())?;
+    let mut created = false;
+    let target = match workspace.map(str::trim).filter(|w| !w.is_empty() && !w.eq_ignore_ascii_case("null")) {
+        None => None,
+        Some(w) => match store.find_workspace(w).map_err(|e| e.to_string())? {
+            Some(found) => Some(found),
+            None if create_missing => {
+                created = true;
+                Some(store.create_workspace(w, None, None, None).map_err(|e| e.to_string())?)
+            }
+            None => {
+                return Err(crate::retrieval::workspace_arg(store, Some(w))
+                    .err()
+                    .map(|m| format!("{m}; pass create_missing: true to create it"))
+                    .unwrap_or_else(|| format!("workspace {w:?} not found")));
+            }
+        },
+    };
+    let resolved = store.set_doc_workspace(doc_id, target.as_ref().map(|w| w.id)).map_err(|e| e.to_string())?;
+    let count = 1 + store.doc_subtree_ids(doc_id).map(|v| v.len().saturating_sub(1)).unwrap_or(0);
+    let name_of = |id: Option<Uuid>| match id {
+        None => "Unsorted".to_string(),
+        Some(id) => store.get_workspace(id).map(|w| w.name).unwrap_or_else(|_| id.to_string()),
+    };
+    let text = match &target {
+        Some(w) => format!(
+            "ok · filed “{}” under {}{} · {count} doc{} · doc {doc_id}",
+            doc.title,
+            w.name,
+            if created { " (created)" } else { "" },
+            if count == 1 { "" } else { "s" }
+        ),
+        None => format!("ok · unlabelled “{}” · now {} · doc {doc_id}", doc.title, name_of(resolved)),
+    };
+    let full = json!({
+        "doc_id": doc_id,
+        "label": target.as_ref().map(|w| w.id),
+        "workspace_id": resolved,
+        "workspace": name_of(resolved),
+        "created": created,
+        "docs": count,
+    });
+    Ok((text, full))
+}
+
 fn stored(text: &str, full: &Value) -> Value {
     json!({"text": text, "full": full})
 }
@@ -748,11 +797,14 @@ pub struct FindDocParams {
     pub parent_doc_id: Option<String>,
     /// Max matches (default 8).
     pub limit: Option<u32>,
+    /// Only docs in this workspace (name, case-insensitive, or id; "unsorted"
+    /// = no workspace). Omit to search everywhere.
+    pub workspace: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DocOpParams {
-    /// "rename" | "move" | "status" | "delete" | "merge".
+    /// "rename" | "move" | "status" | "delete" | "merge" | "workspace".
     pub op: String,
     /// The doc acted on (for merge: the doc whose content moves and is then trashed).
     pub doc_id: String,
@@ -766,6 +818,11 @@ pub struct DocOpParams {
     pub status: Option<String>,
     /// merge: the doc that receives doc_id's content.
     pub into_doc_id: Option<String>,
+    /// workspace: file doc_id (and its subtree) under this workspace (name,
+    /// case-insensitive, or id); null to unlabel it.
+    pub workspace: Option<String>,
+    /// workspace: create the workspace when no name matches (default false).
+    pub create_missing: Option<bool>,
     #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
@@ -855,6 +912,10 @@ pub struct CreateDocParams {
     /// exists under the parent. "reuse": return that doc instead (markdown
     /// ignored) — an atomic find-or-create.
     pub if_exists: Option<String>,
+    /// Workspace (name, case-insensitive, or id) to label a new ROOT doc
+    /// with. A doc with a parent always inherits the parent's workspace;
+    /// naming a different one there is an error.
+    pub workspace: Option<String>,
     #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
@@ -1109,9 +1170,23 @@ impl KsMcp {
             Err(m) => return err(m),
         };
         let limit = p.limit.unwrap_or(8).clamp(1, 50) as usize;
-        with_store(&self.store, move |store| match store.list_docs() {
-            Ok(docs) => ok_json(&crate::nav::find_docs(&docs, &p.query, parent, limit)),
-            Err(e) => err(e.to_string()),
+        with_store(&self.store, move |store| {
+            let ws = match crate::retrieval::workspace_arg(store, p.workspace.as_deref()) {
+                Ok(w) => w,
+                Err(m) => return err(m),
+            };
+            let docs = match store.list_docs() {
+                Ok(d) => d,
+                Err(e) => return err(e.to_string()),
+            };
+            let docs = match ws {
+                None => docs,
+                Some(w) => match store.workspace_doc_ids(w) {
+                    Ok(keep) => docs.into_iter().filter(|d| keep.contains(&d.id)).collect(),
+                    Err(e) => return err(e.to_string()),
+                },
+            };
+            ok_json(&crate::nav::find_docs(&docs, &p.query, parent, limit))
         })
         .await
     }
@@ -1126,9 +1201,22 @@ impl KsMcp {
         };
         let max_tokens = p.max_tokens.unwrap_or(1500).clamp(100, 20_000) as usize;
         let depth = p.depth.unwrap_or(2).clamp(1, 12) as usize;
-        with_store(&self.store, move |store| match crate::retrieval::orient(store, root, max_tokens, depth) {
-            Ok(text) => ok_text(text),
-            Err(m) => err(m),
+        with_store(&self.store, move |store| {
+            let ws = match crate::retrieval::workspace_arg(store, p.workspace.as_deref()) {
+                Ok(w) => w,
+                Err(m) => return err(m),
+            };
+            let named = ws.map(|w| {
+                let name = match w {
+                    grimoire_store::WorkspaceFilter::Unsorted => "Unsorted".to_string(),
+                    grimoire_store::WorkspaceFilter::Id(id) => store.get_workspace(id).map(|w| w.name).unwrap_or_default(),
+                };
+                (w, name)
+            });
+            match crate::retrieval::orient(store, root, named, max_tokens, depth) {
+                Ok(text) => ok_text(text),
+                Err(m) => err(m),
+            }
         })
         .await
     }
@@ -1279,13 +1367,18 @@ impl KsMcp {
         if kind != "blocks" && kind != "docs" {
             return err(format!("kind must be blocks|docs, got {kind}"));
         }
-        let opts = crate::retrieval::SearchOpts {
+        let mut opts = crate::retrieval::SearchOpts {
             scope,
+            workspace: None,
             exclude_answers: p.exclude_answers.unwrap_or(true),
             limit: p.limit.unwrap_or(10).clamp(1, 100) as usize,
         };
         let embedder = self.embedder.clone();
         with_store(&self.store, move |store| {
+            opts.workspace = match crate::retrieval::workspace_arg(store, p.workspace.as_deref()) {
+                Ok(w) => w,
+                Err(m) => return err(m),
+            };
             let emb = embedder.as_deref();
             let out = if kind == "docs" {
                 crate::retrieval::search_docs(store, emb, &p.query, opts).map(|h| json!(h))
@@ -1390,7 +1483,7 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Tree ops through the gate: op 'rename' (title), 'move' (new_parent_id, after_doc_id), 'status' (status) land as flagged yellows a reviewer can decline; 'delete' is always red (parked until a human trashes it); 'merge' (into_doc_id) appends doc_id's content as yellows then parks a red delete. Refused on docs shared with you."
+        description = "Tree ops through the gate: op 'rename' (title), 'move' (new_parent_id, after_doc_id), 'status' (status) land as flagged yellows a reviewer can decline; 'delete' is always red (parked until a human trashes it); 'merge' (into_doc_id) appends doc_id's content as yellows then parks a red delete; 'workspace' (workspace: name or id, null to unlabel; create_missing) files doc_id and its subtree directly. Refused on docs shared with you."
     )]
     async fn doc_op(
         &self,
@@ -1719,7 +1812,8 @@ impl KsMcp {
             Ok(id) => id,
             Err(m) => return err(m),
         };
-        let key = dedupe_key("create_doc", parent, &json!({"title": title, "markdown": p.markdown, "reuse": reuse}));
+        let ws_arg = p.workspace.as_deref().map(str::trim).filter(|w| !w.is_empty()).map(str::to_string);
+        let key = dedupe_key("create_doc", parent, &json!({"title": title, "markdown": p.markdown, "reuse": reuse, "workspace": ws_arg}));
         if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
             return replay(&prev, verbose);
         }
@@ -1727,6 +1821,27 @@ impl KsMcp {
         with_store(&self.store, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
                 return replay(&prev, verbose);
+            }
+            // a parent's workspace is inherited, never overridden here
+            let ws = match ws_arg.as_deref() {
+                None => None,
+                Some(w) => match store.find_workspace(w) {
+                    Ok(Some(found)) => Some(found),
+                    Ok(None) => return err(crate::retrieval::workspace_arg(store, Some(w)).err().unwrap_or_else(|| format!("workspace {w:?} not found"))),
+                    Err(e) => return err(e.to_string()),
+                },
+            };
+            if let (Some(w), Some(par)) = (&ws, parent) {
+                match store.doc_workspace(par) {
+                    Ok(inherited) if inherited == Some(w.id) => {}
+                    Ok(_) => {
+                        return err(format!(
+                            "the parent is not in workspace {:?}; a doc with a parent inherits its workspace (omit workspace, or pick a parent inside it)",
+                            w.name
+                        ));
+                    }
+                    Err(e) => return err(e.to_string()),
+                }
             }
             // one lock for the whole find-or-create: two sessions racing on
             // the same daily title cannot both create
@@ -1763,6 +1878,11 @@ impl KsMcp {
                 .unwrap_or_default();
             match store.create_doc_with_ops(&title, parent, principal, ops) {
                 Ok((d, _)) => {
+                    if let (Some(w), None) = (&ws, parent)
+                        && let Err(e) = store.set_doc_workspace(d.id, Some(w.id))
+                    {
+                        return err(format!("created doc {} but could not label it: {e}", d.id));
+                    }
                     let (text, full) = render(&d, false);
                     durable_put(store, &dedupe, principal, key, stored(&text, &full), DEDUPE_TTL);
                     if verbose { ok_json(&full) } else { ok_text(text) }
@@ -1779,8 +1899,8 @@ impl KsMcp {
             Err(m) => return err(m),
         };
         let op = p.op.trim().to_lowercase();
-        if !matches!(op.as_str(), "rename" | "move" | "status" | "delete" | "merge") {
-            return err(format!("op must be rename | move | status | delete | merge, got {}", p.op));
+        if !matches!(op.as_str(), "rename" | "move" | "status" | "delete" | "merge" | "workspace") {
+            return err(format!("op must be rename | move | status | delete | merge | workspace, got {}", p.op));
         }
         let verbose = p.verbose.unwrap_or(false);
         let principal = match self.acting(p.as_.as_deref(), &hint).await {
@@ -1790,6 +1910,7 @@ impl KsMcp {
         let payload = json!({
             "op": op, "title": p.title, "new_parent_id": p.new_parent_id, "after_doc_id": p.after_doc_id,
             "status": p.status, "into_doc_id": p.into_doc_id,
+            "workspace": p.workspace, "create_missing": p.create_missing,
         });
         let key = dedupe_key("doc_op", Some(doc_id), &payload);
         if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
@@ -1830,6 +1951,13 @@ impl KsMcp {
                 Err(m) => err(m),
             };
             match op.as_str() {
+                "workspace" => match file_doc(store, doc_id, p.workspace.as_deref(), p.create_missing.unwrap_or(false)) {
+                    Ok((text, full)) => {
+                        durable_put(store, &dedupe, principal, key, stored(&text, &full), DEDUPE_TTL);
+                        if verbose { ok_json(&full) } else { ok_text(text) }
+                    }
+                    Err(m) => err(m),
+                },
                 "rename" => {
                     let Some(title) = p.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
                         return err("rename needs title".into());
@@ -2356,6 +2484,110 @@ mod tests {
     }
 
     const NONE: RequestHint = RequestHint { header: None, query_as: None, cwd: None, pinned: None };
+
+    /// `workspace` on search / find_doc / orient / create_doc: subtree
+    /// semantics, case-insensitive names, "unsorted", inheritance on create.
+    #[tokio::test]
+    async fn workspace_params_filter_reads_and_label_creates() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let agent = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let work = store.create_workspace("Work", None, None, None).unwrap().id;
+        let home = store.create_workspace("Home", None, None, None).unwrap().id;
+        let (root, _) = import_markdown(&mut store, "Office", None, tom, "The needle alpha lives here.\n").unwrap();
+        import_markdown(&mut store, "Loose Notes", None, tom, "The needle beta lives here.\n").unwrap();
+        store.set_doc_workspace(root, Some(work)).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let mcp = KsMcp::new(store.clone(), agent, new_dedupe(), new_name_cache(), test_hot("ws"));
+
+        let titles = |v: &Value, key: &str| -> Vec<String> { v.as_array().unwrap().iter().map(|h| h[key].as_str().unwrap().to_string()).collect() };
+        let (_, all) = text_of(mcp.search(Parameters(p(json!({"query": "needle"})))).await.unwrap());
+        assert_eq!(all.as_array().unwrap().len(), 2, "everywhere by default");
+        let (_, w) = text_of(mcp.search(Parameters(p(json!({"query": "needle", "workspace": "WORK"})))).await.unwrap());
+        assert_eq!(titles(&w, "doc_title"), ["Office"]);
+        let (_, u) = text_of(mcp.search(Parameters(p(json!({"query": "needle", "workspace": "unsorted", "kind": "docs"})))).await.unwrap());
+        assert_eq!(titles(&u, "title"), ["Loose Notes"]);
+        let (is_err, msg) = text_of(mcp.search(Parameters(p(json!({"query": "needle", "workspace": "Gym"})))).await.unwrap());
+        assert!(is_err && msg.as_str().unwrap().contains("Work, Home"), "{msg}");
+
+        let (_, f) = text_of(mcp.find_doc(Parameters(p(json!({"query": "o", "workspace": work.to_string()})))).await.unwrap());
+        assert_eq!(titles(&f, "title"), ["Office"]);
+        let (_, f) = text_of(mcp.find_doc(Parameters(p(json!({"query": "office", "workspace": "home"})))).await.unwrap());
+        assert!(f.as_array().unwrap().is_empty());
+
+        let (_, map) = raw(mcp.orient(Parameters(p(json!({"workspace": "work"})))).await.unwrap());
+        assert!(map.starts_with("# Workspace Work — 1 docs"), "{map}");
+        assert!(map.contains("Office") && !map.contains("Loose Notes"), "{map}");
+
+        // a child inherits; a workspace labels a new root; a mismatch is refused
+        let (is_err, child) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "Child", "parent_doc_id": root.to_string(), "verbose": true}))).await.unwrap());
+        assert!(!is_err, "{child}");
+        let child_id: Uuid = child["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(store.lock().unwrap().doc_workspace(child_id).unwrap(), Some(work));
+        let (is_err, top) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "Garden", "workspace": "home", "verbose": true}))).await.unwrap());
+        assert!(!is_err, "{top}");
+        let top_id: Uuid = top["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(store.lock().unwrap().doc_label(top_id).unwrap(), Some(home));
+        let (is_err, msg) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "Shed", "parent_doc_id": root.to_string(), "workspace": "Home"}))).await.unwrap());
+        assert!(is_err && msg.as_str().unwrap().contains("inherits"), "{msg}");
+        let (is_err, _) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "Deep", "parent_doc_id": root.to_string(), "workspace": "work"}))).await.unwrap());
+        assert!(!is_err, "naming the parent's own workspace is fine");
+        let (is_err, msg) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "X", "workspace": "Gym"}))).await.unwrap());
+        assert!(is_err && msg.as_str().unwrap().contains("workspace"), "{msg}");
+    }
+
+    /// doc_op "workspace": files a subtree, creates on create_missing,
+    /// unlabels with null, dedupes a replay, journals tree rows.
+    #[tokio::test]
+    async fn doc_op_workspace_files_and_unfiles_a_subtree() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let agent = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let outer = store.create_workspace("Home", None, None, None).unwrap().id;
+        let top = store.create_doc("Life", None, tom).unwrap().id;
+        let gp = store.create_doc("GP visits", Some(top), tom).unwrap().id;
+        let kid = store.create_doc("2026", Some(gp), tom).unwrap().id;
+        store.set_doc_workspace(top, Some(outer)).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let mcp = KsMcp::new(store.clone(), agent, new_dedupe(), new_name_cache(), test_hot("wsop"));
+        let op = |v: Value| mcp.doc_op_impl(NONE, p(v));
+
+        let (is_err, msg) = raw(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": "Health"})).await.unwrap());
+        assert!(is_err && msg.contains("create_missing"), "{msg}");
+        assert!(store.lock().unwrap().find_workspace("Health").unwrap().is_none(), "nothing created without create_missing");
+
+        let seq = store.lock().unwrap().latest_change_seq().unwrap();
+        let (is_err, msg) = raw(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": "Health", "create_missing": true})).await.unwrap());
+        assert!(!is_err, "{msg}");
+        assert!(msg.starts_with("ok · filed “GP visits” under Health (created) · 2 docs"), "{msg}");
+        let health = store.lock().unwrap().find_workspace("health").unwrap().unwrap().id;
+        {
+            let s = store.lock().unwrap();
+            assert_eq!(s.doc_workspace(kid).unwrap(), Some(health), "the subtree follows");
+            assert_eq!(s.doc_workspace(top).unwrap(), Some(outer));
+            let rows: Vec<String> = s.changes_since(seq, 100).unwrap().changes.into_iter().filter(|c| c.kind == "tree").map(|c| c.doc_id).collect();
+            assert_eq!(rows, [gp.to_string(), kid.to_string()]);
+        }
+        // a replay within the window answers the first outcome and writes nothing
+        let seq = store.lock().unwrap().latest_change_seq().unwrap();
+        let (_, again) = raw(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": "Health", "create_missing": true})).await.unwrap());
+        assert_eq!(again, msg);
+        assert_eq!(store.lock().unwrap().latest_change_seq().unwrap(), seq);
+        assert_eq!(store.lock().unwrap().list_workspaces().unwrap().len(), 2);
+
+        // an existing name, case-insensitively, by id, then unlabel back to the outer workspace
+        let (is_err, msg) = raw(op(json!({"op": "workspace", "doc_id": kid.to_string(), "workspace": "HOME"})).await.unwrap());
+        assert!(!is_err && msg.contains("under Home · 1 doc ·"), "{msg}");
+        let (_, full) = text_of(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": null, "verbose": true})).await.unwrap());
+        assert_eq!(full["workspace_id"], json!(outer), "{full}");
+        assert_eq!(full["label"], Value::Null);
+        assert_eq!(full["workspace"], "Home");
+        let (_, msg) = raw(op(json!({"op": "workspace", "doc_id": top.to_string()})).await.unwrap());
+        assert!(msg.contains("now Unsorted"), "{msg}");
+        assert_eq!(store.lock().unwrap().doc_workspace(gp).unwrap(), None);
+        let (is_err, _) = raw(op(json!({"op": "workspace", "doc_id": Uuid::now_v7().to_string(), "workspace": health.to_string()})).await.unwrap());
+        assert!(is_err, "unknown doc");
+    }
 
     /// The AX tools through the tool fns: compact hits, validated `kind`,
     /// a clear regex error, `related` naming the missing embedder and

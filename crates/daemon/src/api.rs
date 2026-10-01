@@ -96,17 +96,30 @@ pub(crate) fn refuse_if_mirror(s: &SqliteStore, id: Uuid, what: &str) -> Option<
 /// snapshot.
 pub const SEQ_HEADER: &str = "taisce-seq";
 
-async fn docs(State(st): State<ApiState>) -> ([(&'static str, String); 1], Json<Value>) {
+#[derive(Deserialize)]
+struct DocsQuery {
+    /// `unsorted`, a workspace id or name: only docs resolving to it
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+async fn docs(State(st): State<ApiState>, Query(q): Query<DocsQuery>) -> ([(&'static str, String); 1], Json<Value>) {
     let (seq, body) = with_store(&st.store, move |s| {
-        let snap = s.read_snapshot(|s| (s.latest_change_seq().unwrap_or(0), docs_json(s)));
+        let filter = match crate::workspaces::filter_param(s, q.workspace.as_deref()) {
+            Ok(f) => f,
+            Err(m) => return (0, Json(json!({"error": m}))),
+        };
+        let snap = s.read_snapshot(|s| (s.latest_change_seq().unwrap_or(0), docs_json(s, filter)));
         snap.unwrap_or_else(|e| (0, Json(json!({"error": e.to_string()}))))
     })
     .await;
     ([(SEQ_HEADER, seq.to_string())], body)
 }
 
-fn docs_json(s: &mut SqliteStore) -> Json<Value> {
+fn docs_json(s: &mut SqliteStore, filter: Option<grimoire_store::WorkspaceFilter>) -> Json<Value> {
     {
+        // every entry carries its resolved workspace (null = Unsorted)
+        let ws_map = s.workspace_map().unwrap_or_default();
         let canvases: std::collections::HashSet<String> =
             s.canvas_doc_ids().unwrap_or_default().into_iter().collect();
         let tended: std::collections::HashSet<String> = s
@@ -177,8 +190,10 @@ fn docs_json(s: &mut SqliteStore) -> Json<Value> {
                         }
                     }
                 };
+                let want = filter.map(|f| f.as_option());
                 Json(json!(
                     d.iter()
+                        .filter(|doc| want.is_none_or(|w| ws_map.get(&doc.id).copied().flatten() == w))
                         .map(|doc| {
                             let id = doc.id.to_string();
                             let mut v = json!(doc);
@@ -199,6 +214,7 @@ fn docs_json(s: &mut SqliteStore) -> Json<Value> {
                             if let Some(n) = published_to(doc.id) {
                                 v["published_to"] = json!(n);
                             }
+                            v["workspace_id"] = json!(ws_map.get(&doc.id).copied().flatten());
                             v
                         })
                         .collect::<Vec<_>>()
@@ -472,6 +488,9 @@ struct SearchQuery {
     /// Restrict to this doc's subtree.
     #[serde(default)]
     scope: Option<Uuid>,
+    /// `unsorted`, a workspace id or name.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 /// ⌘P. Same `SearchHit[]` shape as ever, ranked by `retrieval::search_ranked`
@@ -480,8 +499,13 @@ struct SearchQuery {
 async fn search(State(st): State<ApiState>, Query(p): Query<SearchQuery>) -> Json<Value> {
     let embedder = st.embedder.clone();
     with_store(&st.store, move |s| {
+        let workspace = match crate::workspaces::filter_param(s, p.workspace.as_deref()) {
+            Ok(w) => w,
+            Err(m) => return Json(json!({"error": m})),
+        };
         let opts = crate::retrieval::SearchOpts {
             scope: p.scope,
+            workspace,
             exclude_answers: false,
             limit: 20,
         };
@@ -631,6 +655,10 @@ async fn propose_markdown(
 struct CreateDocReq {
     title: String,
     parent_doc_id: Option<Uuid>,
+    /// Label a new ROOT doc with this workspace; a child always inherits
+    /// its parent's (refused here when it names another).
+    #[serde(default)]
+    workspace_id: Option<Uuid>,
 }
 
 async fn create_doc(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json<CreateDocReq>) -> Json<Value> {
@@ -642,8 +670,27 @@ async fn create_doc(State(st): State<ApiState>, headers: HeaderMap, Json(req): J
             Ok(p) => p,
             Err(m) => return Json(json!({"error": m})),
         };
+        if let Some(w) = req.workspace_id {
+            if let Err(e) = s.get_workspace(w) {
+                return Json(json!({"error": e.to_string()}));
+            }
+            if let Some(p) = req.parent_doc_id
+                && s.doc_workspace(p).ok().flatten() != Some(w)
+            {
+                return Json(json!({"error": "a doc with a parent inherits the parent's workspace"}));
+            }
+        }
         match s.create_doc(&req.title, req.parent_doc_id, principal) {
-            Ok(d) => Json(json!(d)),
+            Ok(d) => {
+                if let (Some(w), None) = (req.workspace_id, req.parent_doc_id)
+                    && let Err(e) = s.set_doc_workspace(d.id, Some(w))
+                {
+                    return Json(json!({"error": e.to_string()}));
+                }
+                let mut v = json!(d);
+                v["workspace_id"] = json!(s.doc_workspace(d.id).ok().flatten());
+                Json(v)
+            }
             Err(e) => Json(json!({"error": e.to_string()})),
         }
     })
@@ -1639,6 +1686,7 @@ pub fn router(state: ApiState) -> Router {
         .merge(crate::home::router(state.clone()))
         .merge(crate::inbox::router(state.clone()))
         .merge(crate::changes::router(state.clone()))
+        .merge(crate::workspaces::router(state.clone()))
         .merge(crate::todo::router(state))
 }
 

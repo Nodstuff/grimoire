@@ -1040,6 +1040,10 @@ pub struct DocSummary {
     pub status: Option<String>,
     pub current_epoch: i64,
     pub deleted: bool,
+    /// The doc's resolved workspace (nearest labelled ancestor); null =
+    /// Unsorted.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 /// A page of [`Change`]s after a cursor; `seq` is the journal's head.

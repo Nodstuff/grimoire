@@ -17,7 +17,7 @@
 //! own fusion, filters and tiers, so the answer path's ranking cannot drift.
 
 use crate::embed::Embedder;
-use grimoire_store::{BlockStore, BlockType, Doc, SearchHit, SqliteStore};
+use grimoire_store::{BlockStore, BlockType, Doc, SearchHit, SqliteStore, WorkspaceFilter};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -46,6 +46,9 @@ pub struct SearchParams {
     pub kind: Option<String>,
     /// Skip earlier ask-the-vault answers (default true).
     pub exclude_answers: Option<bool>,
+    /// Only docs in this workspace (name, case-insensitive, or id; "unsorted"
+    /// = no workspace). Omit to search everywhere.
+    pub workspace: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -88,6 +91,9 @@ pub struct OrientParams {
     pub max_tokens: Option<u32>,
     /// Tree levels to expand (default 2; 1–12). Deeper subtrees show as "N below".
     pub depth: Option<u32>,
+    /// Only this workspace's docs (name, case-insensitive, or id; "unsorted"
+    /// = no workspace). Omit for every workspace.
+    pub workspace: Option<String>,
 }
 
 // ─── shared: doc map and paths ───
@@ -171,6 +177,28 @@ fn scope_set(store: &SqliteStore, scope: Option<Uuid>) -> Result<Option<HashSet<
     }
 }
 
+/// The subtree scope intersected with the workspace's docs.
+fn scope_and_workspace(store: &SqliteStore, scope: Option<Uuid>, ws: Option<WorkspaceFilter>) -> Result<Option<HashSet<Uuid>>, String> {
+    let sub = scope_set(store, scope)?;
+    let Some(ws) = ws else { return Ok(sub) };
+    let in_ws = store.workspace_doc_ids(ws).map_err(|e| e.to_string())?;
+    Ok(Some(match sub {
+        Some(sub) => sub.intersection(&in_ws).copied().collect(),
+        None => in_ws,
+    }))
+}
+
+/// An MCP `workspace` argument: absent/blank = everywhere.
+pub fn workspace_arg(store: &SqliteStore, raw: Option<&str>) -> Result<Option<WorkspaceFilter>, String> {
+    match raw.map(str::trim).filter(|w| !w.is_empty()) {
+        None => Ok(None),
+        Some(w) => store.parse_workspace_filter(w).map(Some).map_err(|e| {
+            let names: Vec<String> = store.list_workspaces().unwrap_or_default().into_iter().map(|w| w.name).collect();
+            format!("workspace: {e} (known: {}, or \"unsorted\")", if names.is_empty() { "none".into() } else { names.join(", ") })
+        }),
+    }
+}
+
 fn is_hidden(h: &SearchHit) -> bool {
     h.block.block_type == BlockType::Comment
         || h.block.block_type == BlockType::CanvasScene
@@ -240,6 +268,8 @@ pub fn snippet(content: &str, phrase: &str, words: &[String]) -> String {
 #[derive(Clone, Copy, Debug)]
 pub struct SearchOpts {
     pub scope: Option<Uuid>,
+    /// Only docs resolving to this workspace (subtree semantics).
+    pub workspace: Option<WorkspaceFilter>,
     pub exclude_answers: bool,
     pub limit: usize,
 }
@@ -248,6 +278,7 @@ impl Default for SearchOpts {
     fn default() -> Self {
         Self {
             scope: None,
+            workspace: None,
             exclude_answers: true,
             limit: 10,
         }
@@ -324,7 +355,7 @@ pub fn search_ranked(store: &SqliteStore, embedder: Option<&Embedder>, query: &s
     if q.is_empty() {
         return Ok(Vec::new());
     }
-    let scope = scope_set(store, opts.scope)?;
+    let scope = scope_and_workspace(store, opts.scope, opts.workspace)?;
     let answers = if opts.exclude_answers { crate::ask::answers_folder_id(store) } else { None };
     let usable = |h: &SearchHit| {
         !is_hidden(h)
@@ -731,15 +762,26 @@ fn first_paragraph(store: &SqliteStore, doc_id: Uuid) -> Option<String> {
     None
 }
 
-pub fn orient(store: &SqliteStore, root: Option<Uuid>, max_tokens: usize, depth: usize) -> Result<String, String> {
+/// `ws`: only that workspace's docs, named in the header by `ws_name`.
+pub fn orient(
+    store: &SqliteStore,
+    root: Option<Uuid>,
+    ws: Option<(WorkspaceFilter, String)>,
+    max_tokens: usize,
+    depth: usize,
+) -> Result<String, String> {
     let docs = DocMap::load(store);
     if let Some(r) = root {
         store.get_doc(r).map_err(|e| format!("root_doc_id: {e}"))?;
     }
-    let in_scope: HashSet<Uuid> = match root {
+    let mut in_scope: HashSet<Uuid> = match root {
         Some(r) => store.doc_subtree_ids(r).map_err(|e| e.to_string())?.into_iter().collect(),
         None => docs.docs.keys().copied().collect(),
     };
+    if let Some((w, _)) = &ws {
+        let in_ws = store.workspace_doc_ids(*w).map_err(|e| e.to_string())?;
+        in_scope.retain(|d| in_ws.contains(d));
+    }
     let blocks = store.block_counts().unwrap_or_default();
     let block_total: i64 = in_scope.iter().map(|d| blocks.get(d).copied().unwrap_or(0)).sum();
     let limit = max_tokens.max(100) * 4;
@@ -750,15 +792,16 @@ pub fn orient(store: &SqliteStore, root: Option<Uuid>, max_tokens: usize, depth:
         truncated: false,
     };
 
-    match root {
-        Some(r) => b.line(&format!(
+    match (root, &ws) {
+        (None, Some((_, name))) => b.line(&format!("# Workspace {name} — {} docs, {} blocks", in_scope.len(), block_total)),
+        (Some(r), _) => b.line(&format!(
             "# {} — {} docs, {} blocks (root {})",
             docs.path(r),
             in_scope.len(),
             block_total,
             r
         )),
-        None => b.line(&format!("# Corpus — {} docs, {} blocks", in_scope.len(), block_total)),
+        (None, None) => b.line(&format!("# Corpus — {} docs, {} blocks", in_scope.len(), block_total)),
     };
 
     // tree to depth 2
@@ -781,12 +824,12 @@ pub fn orient(store: &SqliteStore, root: Option<Uuid>, max_tokens: usize, depth:
     fn walk(
         b: &mut Budget,
         docs: &DocMap,
+        in_scope: &HashSet<Uuid>,
         entry: &dyn Fn(&Doc, &str) -> String,
-        parent: Option<Uuid>,
+        kids: Vec<&Doc>,
         level: usize,
         depth: usize,
     ) -> bool {
-        let kids = docs.children(parent);
         let indent = "  ".repeat(level);
         for (i, d) in kids.iter().enumerate() {
             if i >= ORIENT_CHILDREN_SHOWN {
@@ -796,13 +839,33 @@ pub fn orient(store: &SqliteStore, root: Option<Uuid>, max_tokens: usize, depth:
             if !b.line(&entry(d, &indent)) {
                 return false;
             }
-            if level + 1 < depth && !walk(b, docs, entry, Some(d.id), level + 1, depth) {
+            let next: Vec<&Doc> = docs.children(Some(d.id)).into_iter().filter(|c| in_scope.contains(&c.id)).collect();
+            if level + 1 < depth && !walk(b, docs, in_scope, entry, next, level + 1, depth) {
                 return false;
             }
         }
         true
     }
-    walk(&mut b, &docs, &entry, root, 0, depth.clamp(1, 12));
+    // a workspace with no root starts at its top docs: in scope, parent not
+    let tops: Vec<&Doc> = match (root, &ws) {
+        (None, Some(_)) => {
+            let mut t: Vec<&Doc> = in_scope
+                .iter()
+                .filter_map(|id| docs.get(*id))
+                .filter(|d| d.parent_id.is_none_or(|p| !in_scope.contains(&p)))
+                .collect();
+            t.sort_by(|a, b| {
+                a.sort_key
+                    .is_none()
+                    .cmp(&b.sort_key.is_none())
+                    .then_with(|| a.sort_key.cmp(&b.sort_key))
+                    .then_with(|| a.title.cmp(&b.title))
+            });
+            t
+        }
+        _ => docs.children(root).into_iter().filter(|c| in_scope.contains(&c.id)).collect(),
+    };
+    walk(&mut b, &docs, &in_scope, &entry, tops, 0, depth.clamp(1, 12));
 
     // most linked (inbound doc→doc wikilinks resolved by title)
     let mut inbound: HashMap<Uuid, usize> = HashMap::new();
@@ -1060,7 +1123,7 @@ mod tests {
             doc(&mut s, tom, &format!("Leaf {i}"), Some(hub), &format!("---\ntags:\n  - leaf\n---\n\nLeaf {i} links to [[Hub]].\n"));
         }
         doc(&mut s, tom, "Outside", None, "Also links to [[Hub]] but is outside the root.\n");
-        let map = orient(&s, Some(root), 1500, 2).unwrap();
+        let map = orient(&s, Some(root), None, 1500, 2).unwrap();
         assert!(map.starts_with("# Root — 7 docs"), "{map}");
         assert!(map.contains("- Hub · "), "{map}");
         assert!(map.contains("5 below"), "{map}");
@@ -1071,13 +1134,13 @@ mod tests {
         assert!(map.contains("## Tags (2)") && map.contains("leaf (5), core (1)"), "{map}");
         assert!(!map.contains("truncated"));
 
-        let small = orient(&s, Some(root), 100, 2).unwrap();
+        let small = orient(&s, Some(root), None, 100, 2).unwrap();
         assert!(small.len() <= 100 * 4 + 1, "{}", small.len());
         assert!(small.contains("truncated"), "{small}");
 
-        let whole = orient(&s, None, 1500, 2).unwrap();
+        let whole = orient(&s, None, None, 1500, 2).unwrap();
         assert!(whole.starts_with("# Corpus — 8 docs"), "{whole}");
         assert!(whole.contains("- Outside · "));
-        assert!(orient(&s, Some(Uuid::now_v7()), 1500, 2).is_err());
+        assert!(orient(&s, Some(Uuid::now_v7()), None, 1500, 2).is_err());
     }
 }
