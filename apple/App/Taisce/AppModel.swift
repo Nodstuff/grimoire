@@ -76,6 +76,8 @@ final class AppModel {
     private(set) var editMeta: [DocID: EditMeta] = [:]
     /// to-dos marked done or snoozed here, hidden until the server's list catches up
     private(set) var settledTodos: Set<String> = []
+    /// a doc just created here: its screen opens in edit mode
+    var pendingEditDoc: DocID?
 
     private var observeTask: Task<Void, Never>?
     private var authTask: Task<Void, Never>?
@@ -404,7 +406,11 @@ final class AppModel {
     /// whose content hasn't changed come from `renderCache`.
     func page(for id: DocID, records: [BlockRecord]) async -> DocPage {
         let title = index.byID[id]?.title ?? ""
-        let blocks = records.map(\.block)
+        var blocks = records.map(\.block)
+        // edits still in the outbox show as they will land
+        if pendingWrites > 0, let cache, let editor = try? await cache.editor(for: id) {
+            blocks = editor.ordered().map(\.block)
+        }
         let cache = renderCache
         return await Task.detached { DocPage.build(title: title, blocks: blocks, render: cache.nodes(for:)) }.value
     }
@@ -419,6 +425,24 @@ final class AppModel {
         try await cache.enqueue([.replaceText(block, text)], on: &editor)
         pendingWrites += 1
         await replayOutbox()
+    }
+
+    /// A new doc under `parent` (nil = top level), created once even if
+    /// the answer is lost, and put in the tree at once.
+    func createDoc(title: String, parent: DocID?) async throws -> DocID {
+        guard let api, let cache else { throw TodoWriteError.notFound }
+        // workspaces: a root doc lands in the current workspace; a child inherits
+        let doc = try await NewDoc.create(
+            api: api, title: title, parent: parent, known: Set(docs.map(\.id)),
+            workspaceID: parent == nil ? currentWorkspace?.workspaceID : nil
+        )
+        let inherited = parent.flatMap { index.byID[$0]?.workspaceID }
+        try await cache.applyDocState(doc.id, Change.DocState(
+            title: doc.title, parentID: doc.parentID, sortKey: doc.sortKey, status: doc.status, currentEpoch: doc.currentEpoch,
+            workspaceID: doc.workspaceID ?? inherited ?? (parent == nil ? currentWorkspace?.workspaceID : nil)
+        ))
+        pendingEditDoc = doc.id
+        return doc.id
     }
 
     // MARK: to-dos

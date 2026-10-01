@@ -94,6 +94,21 @@ import Testing
         #expect(reqs[3].query["workspace"] == nil)
     }
 
+    @Test func newRootDocsCarryTheWorkspaceChildrenDoNot() async throws {
+        let server = MockServer { _ in .json(#"{"id":"n1","parent_id":null,"title":"New","current_epoch":0,"workspace_id":"w1"}"#) }
+        let api = server.client()
+        let made = try await NewDoc.create(api: api, title: "New", parent: nil, known: [], workspaceID: "w1")
+        #expect(made.workspaceID == "w1")
+        _ = try await api.createDoc(title: "Kid", parent: "p1", workspaceID: "w1")
+        let reqs = server.requests
+        let root = try #require(reqs[0].httpBody)
+        let kid = try #require(reqs[1].httpBody)
+        let r = try #require(JSONSerialization.jsonObject(with: root) as? [String: Any])
+        let k = try #require(JSONSerialization.jsonObject(with: kid) as? [String: Any])
+        #expect(r["workspace_id"] as? String == "w1" && r["parent_doc_id"] == nil)
+        #expect(k["workspace_id"] == nil && k["parent_doc_id"] as? String == "p1")
+    }
+
     @Test func scopeParamRoundTrips() throws {
         #expect(WorkspaceScope(param: "unsorted") == .unsorted)
         #expect(WorkspaceScope(param: "w1") == .id("w1"))

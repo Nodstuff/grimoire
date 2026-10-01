@@ -24,11 +24,17 @@ struct RootView: View {
         .environment(router)
         .tint(Theme.accent)
         .sheet(isPresented: $router.showSettings) { SettingsScreen() }
+        .sheet(isPresented: $router.showNewDoc) {
+            NewDocSheet(parent: router.newDocParent).environment(router)
+        }
         .onChange(of: sizeClass, initial: true) { _, size in router.isPad = size == .regular }
         .onChange(of: model.treeLoaded) { _, loaded in
             guard loaded, !appliedLaunchArguments else { return }
             appliedLaunchArguments = true
             router.applyLaunchArguments(index: model.index)
+        }
+        .onChange(of: model.docs.count) {
+            if appliedLaunchArguments { _ = router.openLaunchDoc(index: model.index) }
         }
     }
 }
@@ -143,12 +149,20 @@ struct PadSidebar: View {
                         .contextMenu {
                             Button(model.isPinned(node.id) ? "Unpin from Today" : "Pin to Today",
                                    systemImage: model.isPinned(node.id) ? "pin.slash" : "pin") { model.togglePin(node.id) }
+                            Button("New doc here", systemImage: "plus") { router.newDoc(in: node.id) }
                         }
                 }
             }
         }
         .listStyle(.sidebar)
         .navigationTitle("Taisce")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button { router.newDoc() } label: { Image(systemName: "square.and.pencil") }
+                    .accessibilityLabel("New doc")
+                    .keyboardShortcut("n", modifiers: .command)
+            }
+        }
         .safeAreaInset(edge: .bottom) {
             HStack {
                 SyncChip(badge: SyncBadge.make(status: model.syncStatus, pending: model.pendingWrites))

@@ -81,6 +81,12 @@ targets:
     deploymentTarget: "26.0"
     sources:
       - TaisceUITests
+    # the runner seeds and checks a scratch daemon over plain http on loopback
+    info:
+      path: TaisceUITests/Info.plist
+      properties:
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
     dependencies:
       - target: Taisce
     settings:

@@ -7,15 +7,64 @@ import TaisceKit
 struct DocScreen: View {
     @Environment(AppModel.self) private var model
     @Environment(Router.self) private var router
+    @Environment(\.scenePhase) private var scenePhase
     let docID: DocID
     @State private var page: DocPage?
     @State private var loadError: String?
     @State private var overrides: [BlockID: [Int: Bool]] = [:]
+    @State private var editor: EditorModel?
+    @State private var editable = false
+    @State private var opening = false
     @State private var movingWorkspace = false // workspaces
 
     var body: some View {
+        Group {
+            if let editor {
+                editing(editor)
+            } else {
+                reading
+            }
+        }
+        .task(id: docID) { await observe() }
+        .task(id: docID) { await refresh(force: false) }
+        .task(id: docID) { await checkEditable() }
+        // queued edits show while they wait (offline, a live session)
+        .task(id: model.pendingWrites) { await reloadPage() }
+        // a sync write drops the cached meta: load it again
+        .task(id: MetaKey(doc: docID, missing: model.editMeta[docID] == nil)) { await model.loadEditMeta(docID) }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active, let editor { Task { await editor.flush() } }
+        }
+        .onChange(of: editable, initial: true) { _, ok in
+            // a doc just created here opens straight into edit mode
+            if ok, model.pendingEditDoc == docID {
+                model.pendingEditDoc = nil
+                Task { await startEditing() }
+            }
+        }
+        .onDisappear {
+            if let editor { Task { await editor.flush(); editor.stop() } }
+        }
+    }
+
+    private func editing(_ editor: EditorModel) -> some View {
+        DocEditorView(title: model.index.byID[docID]?.title ?? "", model: editor)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    EditorChipView(chip: editor.chip) { Task { await editor.retryFailed() } }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { Task { await finishEditing() } }
+                        .accessibilityIdentifier("editor.done")
+                }
+            }
+            .environment(\.openURL, OpenURLAction { _ in .handled })
+    }
+
+    private var reading: some View {
         let doc = model.index.byID[docID]
-        DocContent(
+        return DocContent(
             title: doc?.title ?? "",
             breadcrumb: model.index.breadcrumb(of: docID),
             page: page,
@@ -26,6 +75,7 @@ struct DocScreen: View {
             onToggle: toggle,
             onTogglePin: { model.togglePin(docID) },
             onRetry: { Task { await refresh(force: true) } },
+            onEdit: editable && page != nil && !opening ? { Task { await startEditing() } } : nil,
             workspace: model.workspaceBadge(for: docID),
             onMoveWorkspace: model.hasWorkspaces ? { movingWorkspace = true } : nil
         )
@@ -37,10 +87,38 @@ struct DocScreen: View {
             }
             return .systemAction
         })
-        .task(id: docID) { await observe() }
-        .task(id: docID) { await refresh(force: false) }
-        // a sync write drops the cached meta: load it again
-        .task(id: MetaKey(doc: docID, missing: model.editMeta[docID] == nil)) { await model.loadEditMeta(docID) }
+    }
+
+    /// Canvases and federation mirrors are read-only here.
+    private func checkEditable() async {
+        guard let cache = model.cache, let rec = try? await cache.doc(docID) else { return }
+        editable = !rec.isCanvas && rec.mirrorPermission == nil
+    }
+
+    private func startEditing() async {
+        guard editor == nil, !opening else { return }
+        opening = true
+        defer { opening = false }
+        if let e = await EditorModel.open(docID, app: model) {
+            editor = e
+        } else {
+            model.lastError = "This doc isn't available offline yet."
+        }
+    }
+
+    private func finishEditing() async {
+        guard let e = editor else { return }
+        e.activeCoordinator?.textView?.resignFirstResponder()
+        await e.flush()
+        e.stop()
+        editor = nil
+        await model.replayOutbox()
+        await reloadPage()
+    }
+
+    private func reloadPage() async {
+        guard let cache = model.cache, page != nil, let records = try? await cache.blocks(of: docID) else { return }
+        page = await model.page(for: docID, records: records)
     }
 
     private func observe() async {
@@ -107,6 +185,8 @@ struct DocContent: View {
     var onToggle: ((BlockID, Int, Bool) -> Void)?
     var onTogglePin: () -> Void = {}
     var onRetry: () -> Void = {}
+    /// nil when the doc can't be edited here (yet)
+    var onEdit: (() -> Void)?
     // workspaces: the header chip and the … menu's "Move to workspace…"
     var workspace: WorkspaceBadge?
     var onMoveWorkspace: (() -> Void)?
@@ -150,6 +230,12 @@ struct DocContent: View {
                     .foregroundStyle(Theme.secondary)
                     .lineLimit(1)
                     .truncationMode(.head)
+            }
+            if let onEdit {
+                ToolbarItem(placement: .primaryAction) {
+                    Button("Edit", action: onEdit)
+                        .accessibilityIdentifier("doc.edit")
+                }
             }
             ToolbarItem(placement: .primaryAction) {
                 Menu {

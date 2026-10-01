@@ -82,6 +82,11 @@ public final class Cache: Sendable {
                 t.column("last_error", .text)
             }
         }
+        m.registerMigration("v2") { db in
+            // a landed propose's answer (`ProposeOutcome`): its verdicts drive
+            // the editor's review marks, its epoch chains later proposes
+            try db.alter(table: "outbox") { t in t.add(column: "outcome", .blob) }
+        }
         m.registerMigration("v2-workspaces") { db in
             try db.alter(table: "docs") { t in t.add(column: "workspace_id", .text) }
             try db.create(table: "workspaces") { t in
