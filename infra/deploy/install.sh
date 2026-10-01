@@ -7,7 +7,7 @@ T=$(mktemp -d)
 aws s3 cp --recursive --quiet "$B" "$T"
 cd "$T"
 sha256sum -c SHA256SUMS
-install -m 0755 grimoire portus-dataplane litestream /opt/taisce/bin/
+install -m 0755 grimoire portus-dataplane litestream apns-key.sh /opt/taisce/bin/
 install -d -m 0755 /etc/portus
 install -m 0644 portus.yaml /etc/portus/portus.yaml
 install -m 0644 litestream.yml /etc/taisce/litestream.yml

@@ -10,6 +10,12 @@ Environment=HOME=/var/lib/taisce
 Environment=GRIMOIRE_IDENTITY_FILE=/var/lib/taisce/identity.key
 Environment=GRIMOIRE_PUBLIC_URL=https://taisce.null.ie
 Environment=GRIMOIRE_TRUSTED_PROXY=true
+ExecStartPre=-+/opt/taisce/bin/apns-key.sh
+Environment=GRIMOIRE_APNS_KEY_FILE=/run/taisce/apns.p8
+Environment=GRIMOIRE_APNS_KEY_ID=WT3Q587Y97
+Environment=GRIMOIRE_APNS_TEAM_ID=6UP35L9425
+Environment=GRIMOIRE_APNS_TOPIC=ie.null.taisce
+Environment=GRIMOIRE_APNS_ENV=production
 ExecStart=/opt/taisce/bin/grimoire --db /var/lib/taisce/ks.db --port 7425 serve
 Restart=on-failure
 RestartSec=3
@@ -18,6 +24,8 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/taisce
+RuntimeDirectory=taisce
+RuntimeDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target
