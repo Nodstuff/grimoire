@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import TaisceKit
 
-@Suite struct DueAlertPlannerTests {
+@Suite(.timeLimit(.minutes(1))) struct DueAlertPlannerTests {
     let dublin = TimeZone(identifier: "Europe/Dublin")!
     let newYork = TimeZone(identifier: "America/New_York")!
 
@@ -86,6 +86,20 @@ import Testing
         #expect(byID["d"]?.body == "Due 01:30 · To-do")
         #expect(byID["e"]?.body == "Due 01:30 · To-do")
         #expect(plan.map(\.itemID) == ["a", "d", "e", "b", "c"])
+    }
+
+    /// 01:30 happens twice in Dublin on 2026-10-25 (00:30Z IST, 01:30Z
+    /// GMT): a local wall time takes the first.
+    @Test func dstOverlapWallTimeTakesTheFirstOccurrence() throws {
+        // a wall time typed on this device (the string adapter's local path)
+        let typed = DueAlertInput(day: "2026-10-24", itemID: "0-a", title: "a", docTitle: "To-do", deadline: "2026-10-25", dueTime: "01:30", timeZone: dublin)
+        #expect(typed?.kind == .timed(try at("2026-10-25T00:30:00Z")))
+        // stored deadlines are instants already (the time model): the first 01:30 is 00:30Z
+        let rec = TodoRecord(date: "2026-10-24", position: 0, mark: " ", text: "a", deadline: "2026-10-25T00:30Z")
+        #expect(DueAlertInput(rec, timeZone: dublin)?.kind == .timed(try at("2026-10-25T00:30:00Z")))
+        // outside the overlap: unchanged
+        #expect(DueAlertInput.instant(wallTime: Due(year: 2026, month: 10, day: 25, hour: 3, minute: 0), in: dublin) == (try at("2026-10-25T03:00:00Z")))
+        #expect(DueAlertInput.instant(wallTime: Due(year: 2026, month: 10, day: 24, hour: 3, minute: 0), in: dublin) == (try at("2026-10-24T02:00:00Z")))
     }
 
     @Test func timeZoneChangeBetweenRuns() throws {

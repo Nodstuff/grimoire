@@ -101,6 +101,17 @@ public struct DueAlertInput: Sendable, Hashable, Identifiable {
         return "\(position)-" + String(format: "%08x", h)
     }
 
+    /// A local wall time as an instant. In a DST overlap (the hour that
+    /// happens twice) the first occurrence wins; in a gap the time moves
+    /// forward by the gap. (`Due.alertDate` picks the later occurrence.)
+    public static func instant(wallTime due: Due, in timeZone: TimeZone) -> Date? {
+        var wall = due
+        if wall.hour == nil { wall.hour = Due.defaultAlertHour; wall.minute = 0 }
+        // one source of truth for wall time → instant
+        guard case let .at(t, _)? = Deadline.local(wall, in: timeZone) else { return nil }
+        return t
+    }
+
     static func parseInstant(_ s: String) -> Date? {
         let plain = ISO8601DateFormatter()
         if let d = plain.date(from: s) { return d }

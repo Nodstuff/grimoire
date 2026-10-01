@@ -168,12 +168,11 @@ final class NotificationCoordinator: DueAlertPermission {
                 try await cache.enqueueTodoToggle(date: day, itemID: itemID, done: true)
                 overrides[id] = .done
             case .snooze:
-                // an hour from now is an instant, whatever the zone does; to the
-                // minute (what the server stores), so the override matches the synced item
-                let soon = now().addingTimeInterval(3600).timeIntervalSince1970
-                let deadline = Deadline.at(Date(timeIntervalSince1970: (soon / 60).rounded(.down) * 60))
-                try await cache.enqueueDeadline(date: day, itemID: itemID, deadline: deadline)
-                if let at = deadline.alertDate(in: tz) { overrides[id] = .snoozed(at) }
+                // to the minute (what the server stores), from the instant:
+                // a wall time is ambiguous in the repeated October hour
+                let at = Date(timeIntervalSince1970: (now().timeIntervalSince1970 / 60).rounded(.down) * 60 + 3600)
+                try await cache.enqueueDeadline(date: day, itemID: itemID, deadline: Deadline.at(at))
+                overrides[id] = .snoozed(at)
             case .tomorrow:
                 var cal = Calendar(identifier: .gregorian)
                 cal.timeZone = tz
@@ -181,9 +180,9 @@ final class NotificationCoordinator: DueAlertPermission {
                 var due = Due.today(now: tomorrow, in: tz)
                 due.hour = DueAlertPlanner.allDayHour
                 due.minute = 0
-                guard let deadline = Deadline.local(due, in: tz) else { return }
+                guard let deadline = Deadline.local(due, in: tz), let at = deadline.alertDate(in: tz) else { return }
                 try await cache.enqueueDeadline(date: day, itemID: itemID, deadline: deadline)
-                if let at = deadline.alertDate(in: tz) { overrides[id] = .snoozed(at) }
+                overrides[id] = .snoozed(at)
             }
         } catch {
             return
