@@ -7,7 +7,6 @@ Wants=network-online.target
 User=taisce
 Group=taisce
 Environment=HOME=/var/lib/taisce
-Environment=TZ=Europe/Dublin
 Environment=GRIMOIRE_IDENTITY_FILE=/var/lib/taisce/identity.key
 Environment=GRIMOIRE_PUBLIC_URL=https://taisce.null.ie
 Environment=GRIMOIRE_TRUSTED_PROXY=true
