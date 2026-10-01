@@ -312,12 +312,15 @@ async fn doc_federation(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Jso
     .await
 }
 
-async fn doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    with_store(&st.store, move |s| {
-        match s.read_doc(id) {
-            Ok(t) => Json(json!(t)),
-            Err(e) => Json(json!({"error": e.to_string()})),
+/// A missing (or hard-deleted) doc is a real 404 with `{error}`.
+async fn doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    with_store(&st.store, move |s| match s.read_doc(id) {
+        Ok(t) => Json(json!(t)).into_response(),
+        Err(e @ grimoire_store::StoreError::NotFound(_)) => {
+            (axum::http::StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))).into_response()
         }
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     })
     .await
 }
@@ -1906,6 +1909,22 @@ mod http_client_tests {
         let tree = call(&app, "GET", &format!("/api/doc/{id}"), &[], None).await;
         assert_eq!(tree["doc"]["current_epoch"], 2, "applied once");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_missing_doc_is_a_404_with_an_error_body() {
+        let (app, _) = app();
+        let res = app
+            .clone()
+            .oneshot(Request::get(format!("/api/doc/{}", Uuid::now_v7())).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("not found"), "{body}");
+        let doc = new_doc(&app, &[]).await;
+        let tree = call(&app, "GET", &format!("/api/doc/{}", doc["id"].as_str().unwrap()), &[], None).await;
+        assert_eq!(tree["doc"]["id"], doc["id"], "a live doc is still 200");
     }
 
     #[tokio::test]
