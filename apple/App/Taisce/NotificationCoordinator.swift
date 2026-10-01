@@ -122,26 +122,15 @@ final class NotificationCoordinator: DueAlertPermission {
 
     // MARK: reconcile
 
-    /// Every workspace's list: the server's due list read with no
-    /// `workspace` (all lists), else every cached To-do doc.
+    /// Every workspace's list: sync caches every To-do doc, so this is the
+    /// same set `/api/todo/due` with no `workspace` reads, without a network
+    /// wait at launch (and it works offline).
     func reconcile() async {
-        let tz = timeZone()
-        if let api, let list = try? await api.todoDue() {
-            lists = Self.lists(list)
-            await reconcile(with: list.items.compactMap { DueAlertInput($0, timeZone: tz) })
-            return
-        }
         guard let cache, let records = try? await cache.todos() else { return }
+        let tz = timeZone()
         let docs = (try? await cache.docs()) ?? []
         lists = Self.lists(records, docs: docs)
         await reconcile(with: records.compactMap { DueAlertInput($0, timeZone: tz) })
-    }
-
-    /// Items from a daemon with workspaces name their list's workspace.
-    nonisolated static func lists(_ list: TodoDueList) -> [String: WorkspaceScope] {
-        var out: [String: WorkspaceScope] = [:]
-        for item in list.items where item.docID != nil { out[item.id] = WorkspaceScope(item.workspaceID) }
-        return out
     }
 
     nonisolated static func lists(_ records: [TodoRecord], docs: [DocRecord]) -> [String: WorkspaceScope] {

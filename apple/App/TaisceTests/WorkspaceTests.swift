@@ -126,12 +126,12 @@ private let docs = [
         #expect(queued.last?.path == "/api/todo/toggle" && obj["workspace"] as? String == "w2")
     }
 
-    @Test func theServersDueListNamesEachItemsWorkspace() throws {
+    @Test func dueItemsReadWithoutAWorkspaceNameTheirList() throws {
         let json = #"{"items":[{"date":"2026-09-21","id":"0-a","text":"a","deadline":"2026-09-22","doc_id":"t2","workspace_id":"w2"},{"date":"2026-09-21","id":"0-b","text":"b","deadline":"2026-09-22","doc_id":"t1","workspace_id":null}],"doc_id":null,"epoch":0,"now":"2026-10-01T00:00:00Z","default_alert_time":"09:00"}"#
         let list = try JSONDecoder().decode(TodoDueList.self, from: Data(json.utf8))
-        #expect(NotificationCoordinator.lists(list) == ["2026-09-21/0-a": .id("w2"), "2026-09-21/0-b": .unsorted])
+        #expect(list.items.map(\.workspaceID) == ["w2", nil] && list.items.map(\.docID) == ["t2", "t1"])
         let legacy = try JSONDecoder().decode(TodoDueList.self, from: Data(#"{"items":[{"date":"2026-09-21","id":"0-a","text":"a","deadline":"2026-09-22"}],"doc_id":null,"epoch":0,"now":"2026-10-01T00:00:00Z","default_alert_time":"09:00"}"#.utf8))
-        #expect(NotificationCoordinator.lists(legacy).isEmpty, "a daemon without workspaces: the legacy list")
+        #expect(legacy.items.first?.docID == nil, "a daemon without workspaces: the legacy list")
     }
 
     @Test func offlineSearchKeepsTheCurrentWorkspace() {
