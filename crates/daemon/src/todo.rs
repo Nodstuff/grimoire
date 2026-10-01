@@ -74,8 +74,18 @@
 //!   UI's live hint, so the rules live here only
 //! - `POST /api/todo/remove {date, item_id}`
 //! - `POST /api/todo/move {date, item_id, to_date}` (heading created in date order)
-//! - `POST /api/todo/deadline {date, item_id, deadline | null}` (`YYYY-MM-DD`
-//!   or `YYYY-MM-DD HH:MM`; a date alone drops any time)
+//! - `POST /api/todo/deadline {date, item_id, deadline | null, due_time?}`
+//!   (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM`; a date alone KEEPS the item's time
+//!   — the UI's date picker — unless `due_time` says otherwise: `"HH:MM"`
+//!   sets it, `null` clears it)
+//! - `GET  /api/todo/due?until=<YYYY-MM-DD | RFC 3339>` → `{doc_id | null,
+//!   epoch, now, until, default_alert_time, items: [{date, id, text,
+//!   deadline, due_time?, alert_at, overdue, note?, carried_from?}]}` —
+//!   every OPEN item with a deadline, across all days, soonest `alert_at`
+//!   first; `until` keeps deadlines on or before that day (a date) or alerts
+//!   at or before that instant. READ-ONLY: no carry-forward, and no To-do
+//!   doc is created. `overdue` is by time: past its `HH:MM`, or past the end
+//!   of its day when it has none. Errors are 400/500 with `{error}`.
 //! - `POST /api/todo/note {date, item_id, note}` (empty clears)
 
 use crate::api::ApiState;
@@ -459,10 +469,13 @@ fn to_item(index: usize, it: &ItemRec, today: &str) -> Item {
     let open = it.mark == ' ';
     let due = it.deadline.as_deref().and_then(crate::due::parse_deadline);
     let (overdue, due_soon) = match (due, parse_date(today)) {
-        // day granularity: a deadline later today is not overdue yet
-        (Some((dl, _)), Some(t)) if open => {
+        (Some((dl, tm)), Some(t)) if open => {
             let diff = (dl - t).num_days();
-            (diff < 0, (0..=DUE_SOON_DAYS).contains(&diff))
+            // a timed deadline today is overdue once its time passes — only
+            // when `today` IS today (a past or future view stays by day)
+            let now = chrono::Local::now().naive_local();
+            let late_today = diff == 0 && now.date() == t && crate::due::is_overdue(dl, tm, now);
+            (diff < 0 || late_today, (0..=DUE_SOON_DAYS).contains(&diff) && !late_today)
         }
         _ => (false, false),
     };
@@ -555,6 +568,85 @@ fn with_item(
     Ok(render_doc(&chunks))
 }
 
+/// One open, deadlined item for `GET /api/todo/due`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DueItem {
+    /// the day heading it sits under (address it with `{date, item_id}`)
+    pub date: String,
+    pub id: String,
+    pub text: String,
+    pub deadline: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_time: Option<String>,
+    pub alert_at: String,
+    pub overdue: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried_from: Option<String>,
+}
+
+/// The `until` bound: a whole day, or an instant (local wall time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Until {
+    Day(NaiveDate),
+    At(chrono::NaiveDateTime),
+}
+
+/// `YYYY-MM-DD`, RFC 3339 (converted to local time), or a local
+/// `YYYY-MM-DDTHH:MM[:SS]`.
+pub fn parse_until(s: &str) -> Option<Until> {
+    let s = s.trim();
+    if let Some(d) = parse_date(s).filter(|_| s.len() == 10) {
+        return Some(Until::Day(d));
+    }
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(Until::At(t.with_timezone(&chrono::Local).naive_local()));
+    }
+    ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"]
+        .iter()
+        .find_map(|f| chrono::NaiveDateTime::parse_from_str(s, f).ok())
+        .map(Until::At)
+}
+
+/// Every open item with a deadline, across all days, soonest alert first.
+/// Pure: reads `md`, writes nothing.
+pub fn due_items(md: &str, now: chrono::NaiveDateTime, until: Option<Until>) -> Vec<DueItem> {
+    let mut out = Vec::new();
+    for chunk in parse_doc(md, now.date()) {
+        let Chunk::Day { date, entries } = chunk else { continue };
+        for (i, it) in items_of(&entries).into_iter().enumerate() {
+            if it.mark != ' ' {
+                continue;
+            }
+            let Some((d, t)) = it.deadline.as_deref().and_then(crate::due::parse_deadline) else { continue };
+            let alert = d.and_time(t.unwrap_or_else(|| {
+                chrono::NaiveTime::parse_from_str(crate::due::DEFAULT_ALERT_TIME, crate::due::TIME_FMT).unwrap()
+            }));
+            let keep = match until {
+                None => true,
+                Some(Until::Day(u)) => d <= u,
+                Some(Until::At(u)) => alert <= u,
+            };
+            if keep {
+                out.push(DueItem {
+                    date: date.clone(),
+                    id: item_id(i, &it.text),
+                    text: it.text.clone(),
+                    deadline: d.to_string(),
+                    due_time: t.map(|t| t.format(crate::due::TIME_FMT).to_string()),
+                    alert_at: crate::due::alert_at(d, t),
+                    overdue: crate::due::is_overdue(d, t, now),
+                    note: it.note.clone(),
+                    carried_from: it.carried_from.clone(),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.alert_at, &a.date, &a.id).cmp(&(&b.alert_at, &b.date, &b.id)));
+    out
+}
+
 /// Markdown after a write plus a phrase warning for the caller to surface.
 pub type Written = (String, Option<&'static str>);
 
@@ -600,16 +692,48 @@ pub fn edit_item(md: &str, date: &str, today: &str, id: &str, text: &str) -> Res
     Ok((md, tk.warning))
 }
 
-pub fn set_deadline(md: &str, date: &str, today: &str, id: &str, deadline: Option<&str>) -> Result<String, String> {
-    let deadline = match deadline {
+/// What a deadline write does to the item's time of day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeEdit<'a> {
+    /// a date alone keeps the time the item had
+    Keep,
+    Set(&'a str),
+    Clear,
+}
+
+pub fn set_deadline(
+    md: &str,
+    date: &str,
+    today: &str,
+    id: &str,
+    deadline: Option<&str>,
+    time: TimeEdit,
+) -> Result<String, String> {
+    let parsed = match deadline {
         Some(d) => match crate::due::parse_deadline(d) {
-            Some((d, t)) => Some(crate::due::format_deadline(d, t)),
+            Some(p) => Some(p),
             None => return Err(format!("deadline must be YYYY-MM-DD or YYYY-MM-DD HH:MM, got {d:?}")),
         },
         None => None,
     };
-    with_item(md, date, today, Some(id), None, |it| it.deadline = deadline)
+    let set = match time {
+        TimeEdit::Set(t) => match chrono::NaiveTime::parse_from_str(t, crate::due::TIME_FMT) {
+            Ok(parsed) if t.len() == 5 => Some(Some(parsed)),
+            _ => return Err(format!("due_time must be HH:MM, got {t:?}")),
+        },
+        TimeEdit::Clear => Some(None),
+        TimeEdit::Keep => None,
+    };
+    with_item(md, date, today, Some(id), None, |it| {
+        let had = it.deadline.as_deref().and_then(crate::due::parse_deadline).and_then(|(_, t)| t);
+        it.deadline = parsed.map(|(d, t)| {
+            // an explicit due_time wins; else a time in the deadline; else the old one
+            let t = set.unwrap_or(t.or(had));
+            crate::due::format_deadline(d, t)
+        });
+    })
 }
+
 
 pub fn set_note(md: &str, date: &str, today: &str, id: &str, note: &str) -> Result<String, String> {
     let note = note.trim_end();
@@ -846,6 +970,51 @@ async fn add(State(st): State<ApiState>, Json(req): Json<AddReq>) -> Json<Value>
 }
 
 #[derive(Deserialize)]
+struct DueQuery {
+    until: Option<String>,
+}
+
+/// Read-only across days: no carry-forward, and an absent To-do doc stays
+/// absent (find, never create).
+async fn due(State(st): State<ApiState>, Query(q): Query<DueQuery>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let fail = |code: StatusCode, e: String| (code, Json(json!({"error": e}))).into_response();
+    let until = match q.until.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        Some(u) => match parse_until(u) {
+            Some(x) => Some(x),
+            None => return fail(StatusCode::BAD_REQUEST, format!("until must be YYYY-MM-DD or RFC 3339, got {u:?}")),
+        },
+        None => None,
+    };
+    let until_echo = q.until.clone();
+    with_store(&st.store, move |s| {
+        let now = chrono::Local::now().naive_local();
+        let doc = match s.list_docs() {
+            Ok(docs) => docs.into_iter().find(|d| d.parent_id.is_none() && d.title == TODO_TITLE),
+            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let (doc_id, epoch, items) = match doc {
+            Some(d) => match grimoire_store::export::export_doc(&*s, d.id) {
+                Ok(md) => (Some(d.id.to_string()), d.current_epoch, due_items(&md, now, until)),
+                Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            },
+            None => (None, 0, Vec::new()),
+        };
+        Json(json!({
+            "doc_id": doc_id,
+            "epoch": epoch,
+            "now": now.format("%Y-%m-%dT%H:%M").to_string(),
+            "until": until_echo,
+            "default_alert_time": crate::due::DEFAULT_ALERT_TIME,
+            "items": items,
+        }))
+        .into_response()
+    })
+    .await
+}
+
+#[derive(Deserialize)]
 struct ParseQuery {
     #[serde(default)]
     text: String,
@@ -925,13 +1094,27 @@ struct DeadlineReq {
     /// null / absent clears
     #[serde(default)]
     deadline: Option<String>,
+    /// absent keeps the item's time; "HH:MM" sets it; null clears it
+    #[serde(default, deserialize_with = "present")]
+    due_time: Option<Option<String>>,
+}
+
+/// `Some(None)` for an explicit null, `None` (via `default`) when absent.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
 }
 
 async fn deadline(State(st): State<ApiState>, Json(req): Json<DeadlineReq>) -> Json<Value> {
     let date = req.date.clone();
     mutate(st, req.date, move |md, today| {
         let dl = req.deadline.as_deref().map(str::trim).filter(|d| !d.is_empty());
-        set_deadline(md, &date, today, &req.item_id, dl).map(|m| (m, None))
+        let time = match &req.due_time {
+            None => TimeEdit::Keep,
+            Some(None) => TimeEdit::Clear,
+            Some(Some(t)) if t.trim().is_empty() => TimeEdit::Clear,
+            Some(Some(t)) => TimeEdit::Set(t.trim()),
+        };
+        set_deadline(md, &date, today, &req.item_id, dl, time).map(|m| (m, None))
     })
     .await
 }
@@ -953,6 +1136,7 @@ pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/todo", get(get_day).post(add))
         .route("/api/todo/parse", get(parse))
+        .route("/api/todo/due", get(due))
         .route("/api/todo/toggle", post(toggle))
         .route("/api/todo/edit", post(edit))
         .route("/api/todo/remove", post(remove))
@@ -1115,11 +1299,11 @@ mod tests {
         let (md, _) = edit_item(&md, "2026-09-09", T, &parse_day(&md, "2026-09-09", T)[2].id, "rotate ALL tokens").unwrap();
         let items = parse_day(&md, "2026-09-09", T);
         // deadline set / clear
-        let md = set_deadline(&md, "2026-09-09", T, &items[0].id, Some("2026-09-30")).unwrap();
+        let md = set_deadline(&md, "2026-09-09", T, &items[0].id, Some("2026-09-30"), TimeEdit::Keep).unwrap();
         assert!(md.contains("- [x] call the bank · due 2026-09-30\n"));
-        let md = set_deadline(&md, "2026-09-09", T, &items[2].id, None).unwrap();
+        let md = set_deadline(&md, "2026-09-09", T, &items[2].id, None, TimeEdit::Keep).unwrap();
         assert!(md.contains("- [ ] rotate ALL tokens (carried from 2026-09-08)\n"));
-        assert!(set_deadline(&md, "2026-09-09", T, &items[0].id, Some("soon")).is_err());
+        assert!(set_deadline(&md, "2026-09-09", T, &items[0].id, Some("soon"), TimeEdit::Keep).is_err());
         // note set (blank lines inside collapse — they would split the block) / clear
         let md = set_note(&md, "2026-09-09", T, &items[0].id, "ask for\n\nthe statement  \n").unwrap();
         assert!(md.contains("- [x] call the bank · due 2026-09-30\n  ask for\n  the statement\n\n- [ ] ship"));
@@ -1332,15 +1516,21 @@ mod tests {
         let id = parse_day(&md, T, T)[0].id.clone();
         let (md, _) = edit_item(&md, T, T, &id, "call the bank about fees by 12/10 17:00").unwrap();
         assert!(md.contains("· due 2026-10-12 17:00\n"), "{md}");
-        // set_deadline takes either form; a date alone drops the time
+        // set_deadline takes either form
         let id = parse_day(&md, T, T)[0].id.clone();
-        let md = set_deadline(&md, T, T, &id, Some("2026-09-20 08:15")).unwrap();
+        let md = set_deadline(&md, T, T, &id, Some("2026-09-20 08:15"), TimeEdit::Keep).unwrap();
         assert!(md.contains("· due 2026-09-20 08:15\n"), "{md}");
-        let md = set_deadline(&md, T, T, &id, Some("2026-09-20T10:00")).unwrap();
+        let md = set_deadline(&md, T, T, &id, Some("2026-09-20T10:00"), TimeEdit::Keep).unwrap();
         assert!(md.contains("· due 2026-09-20 10:00\n"), "a T separator is normalised: {md}");
-        let md = set_deadline(&md, T, T, &id, Some("2026-09-21")).unwrap();
+        // the UI's date picker sends a date alone: the time stays
+        let md = set_deadline(&md, T, T, &id, Some("2026-09-21"), TimeEdit::Keep).unwrap();
+        assert!(md.contains("· due 2026-09-21 10:00\n"), "{md}");
+        let md = set_deadline(&md, T, T, &id, Some("2026-09-22"), TimeEdit::Set("07:30")).unwrap();
+        assert!(md.contains("· due 2026-09-22 07:30\n"), "{md}");
+        assert!(set_deadline(&md, T, T, &id, Some("2026-09-22"), TimeEdit::Set("7:3")).is_err());
+        let md = set_deadline(&md, T, T, &id, Some("2026-09-21"), TimeEdit::Clear).unwrap();
         assert!(md.contains("· due 2026-09-21\n"), "{md}");
-        assert!(set_deadline(&md, T, T, &id, Some("2026-09-21 25:00")).is_err());
+        assert!(set_deadline(&md, T, T, &id, Some("2026-09-21 25:00"), TimeEdit::Keep).is_err());
         // an agent's raw line is read with the time resolved, left as typed
         let raw = "## 2026-09-10\n\n- [ ] standup due tomorrow 9:45\n";
         let items = parse_day(raw, T, T);
@@ -1349,5 +1539,113 @@ mod tests {
         let items = parse_day("## 2026-09-10\n\n- [ ] old ⏰ 2026-09-12\n", T, T);
         assert_eq!(items[0].deadline.as_deref(), Some("2026-09-12"));
         assert!(items[0].due_time.is_none());
+    }
+
+    fn at(s: &str) -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").unwrap()
+    }
+
+    #[test]
+    fn due_lists_open_deadlined_items_across_days_overdue_by_time() {
+        let md = "## 2026-09-08\n\n- [ ] old and late · due 2026-09-09\n\n- [>] moved on · due 2026-09-09\n\n## 2026-09-10\n\n- [ ] standup · due 2026-09-10 09:30\n  room 4\n\n- [ ] report · due 2026-09-10\n\n- [x] done already · due 2026-09-10 08:00\n\n- [ ] no deadline\n\n- [ ] later · due 2026-09-20 17:00 (carried from 2026-09-08)\n";
+        let now = at("2026-09-10T10:00");
+        let all = due_items(md, now, None);
+        let rows: Vec<(&str, &str, bool)> = all.iter().map(|i| (i.text.as_str(), i.alert_at.as_str(), i.overdue)).collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("old and late", "2026-09-09T09:00", true),
+                ("report", "2026-09-10T09:00", false),
+                ("standup", "2026-09-10T09:30", true),
+                ("later", "2026-09-20T17:00", false),
+            ],
+            "open + deadlined only, soonest alert first; by TIME: 09:30 is past at 10:00, a date-only today is not"
+        );
+        let standup = &all[2];
+        assert_eq!((standup.date.as_str(), standup.deadline.as_str(), standup.due_time.as_deref()), ("2026-09-10", "2026-09-10", Some("09:30")));
+        assert_eq!(standup.id, item_id(0, "standup"), "addressable with {{date, item_id}}");
+        assert_eq!(standup.note.as_deref(), Some("room 4"));
+        assert_eq!(all[3].carried_from.as_deref(), Some("2026-09-08"));
+        // until a day: deadlines on or before it
+        let d = due_items(md, now, Some(Until::Day(NaiveDate::from_ymd_opt(2026, 9, 10).unwrap())));
+        assert_eq!(d.len(), 3);
+        // until an instant: alerts at or before it
+        let d = due_items(md, now, Some(Until::At(at("2026-09-10T09:00"))));
+        assert_eq!(d.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["old and late", "report"]);
+        assert!(due_items("", now, None).is_empty());
+    }
+
+    #[test]
+    fn until_accepts_a_day_rfc3339_or_local_wall_time() {
+        assert_eq!(parse_until("2026-09-10"), Some(Until::Day(NaiveDate::from_ymd_opt(2026, 9, 10).unwrap())));
+        assert_eq!(parse_until("2026-09-10T17:00"), Some(Until::At(at("2026-09-10T17:00"))));
+        assert_eq!(parse_until("2026-09-10T17:00:30"), Some(Until::At(at("2026-09-10T17:00") + chrono::Duration::seconds(30))));
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-09-10T17:00:00Z").unwrap();
+        assert_eq!(parse_until("2026-09-10T17:00:00Z"), Some(Until::At(utc.with_timezone(&chrono::Local).naive_local())));
+        for bad in ["tomorrow", "2026-13-01", "2026-09-10 17:00", ""] {
+            assert_eq!(parse_until(bad), None, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn due_route_is_read_only() {
+        use crate::home::testing::{app, call};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        let (app, _) = app();
+        // no To-do doc yet: the read must not create one
+        let v = call(&app, "GET", "/api/todo/due", None).await;
+        assert!(v["doc_id"].is_null() && v["items"].as_array().unwrap().is_empty(), "{v}");
+        assert_eq!(v["default_alert_time"], "09:00");
+        let docs = call(&app, "GET", "/api/docs", None).await;
+        assert!(docs.as_array().unwrap().is_empty(), "no doc created: {docs}");
+        // an open item on a PAST day: GET /api/todo for today would carry it
+        call(&app, "POST", "/api/todo", Some(json!({"date": "2020-01-01", "text": "pay the fine due 2020-01-02 10:00"}))).await;
+        call(&app, "POST", "/api/todo", Some(json!({"date": "2020-01-01", "text": "renew due 2099-01-01"}))).await;
+        let before = call(&app, "GET", "/api/changes", None).await["seq"].clone();
+        let epoch = |docs: &Value| docs.as_array().unwrap().iter().find(|d| d["title"] == TODO_TITLE).unwrap()["current_epoch"].clone();
+        let e0 = epoch(&call(&app, "GET", "/api/docs", None).await);
+        let v = call(&app, "GET", "/api/todo/due", None).await;
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "{v}");
+        assert_eq!(items[0]["text"], "pay the fine");
+        assert_eq!(items[0]["date"], "2020-01-01");
+        assert_eq!(items[0]["deadline"], "2020-01-02");
+        assert_eq!(items[0]["due_time"], "10:00");
+        assert_eq!(items[0]["alert_at"], "2020-01-02T10:00");
+        assert_eq!(items[0]["overdue"], true);
+        assert_eq!(items[1]["overdue"], false);
+        assert!(items[1].get("due_time").is_none());
+        assert_eq!(items[1]["alert_at"], "2099-01-01T09:00");
+        let v = call(&app, "GET", "/api/todo/due?until=2098-12-31", None).await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+        let v = call(&app, "GET", "/api/todo/due?until=2020-01-02T10:00", None).await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 1, "an alert AT the bound is in");
+        let v = call(&app, "GET", "/api/todo/due?until=2020-01-02T09:59", None).await;
+        assert!(v["items"].as_array().unwrap().is_empty());
+        // nothing moved: same epoch, same journal head
+        assert_eq!(epoch(&call(&app, "GET", "/api/docs", None).await), e0);
+        assert_eq!(call(&app, "GET", "/api/changes", None).await["seq"], before);
+        // a bad bound is a 400 with a JSON body
+        let res = app.clone().oneshot(Request::get("/api/todo/due?until=soon").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_deadline_route_keeps_or_sets_or_clears_the_time() {
+        use crate::home::testing::{app, call};
+        let (app, _) = app();
+        let d = "2020-01-01";
+        let v = call(&app, "POST", "/api/todo", Some(json!({"date": d, "text": "x due 2020-01-05 15:00"}))).await;
+        let id = v["items"][0]["id"].as_str().unwrap().to_string();
+        let v = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": d, "item_id": id, "deadline": "2020-01-06"}))).await;
+        assert_eq!((v["items"][0]["deadline"].clone(), v["items"][0]["due_time"].clone()), (json!("2020-01-06"), json!("15:00")), "{v}");
+        let v = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": d, "item_id": id, "deadline": "2020-01-06", "due_time": "08:00"}))).await;
+        assert_eq!(v["items"][0]["due_time"], "08:00");
+        let v = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": d, "item_id": id, "deadline": "2020-01-06", "due_time": null}))).await;
+        assert!(v["items"][0].get("due_time").is_none(), "{v}");
+        let v = call(&app, "POST", "/api/todo/deadline", Some(json!({"date": d, "item_id": id, "deadline": null}))).await;
+        assert!(v["items"][0].get("deadline").is_none(), "{v}");
     }
 }

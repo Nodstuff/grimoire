@@ -160,6 +160,15 @@ pub fn parse_deadline(s: &str) -> Option<(NaiveDate, Option<NaiveTime>)> {
     }
 }
 
+/// Past due at `now` (local wall time): after its time, or — with no time —
+/// once its day is over.
+pub fn is_overdue(d: NaiveDate, t: Option<NaiveTime>, now: chrono::NaiveDateTime) -> bool {
+    match t {
+        Some(t) => now > d.and_time(t),
+        None => now.date() > d,
+    }
+}
+
 /// When a deadline alerts, `YYYY-MM-DDTHH:MM` local: its own time, else
 /// [`DEFAULT_ALERT_TIME`].
 pub fn alert_at(d: NaiveDate, t: Option<NaiveTime>) -> String {
@@ -466,6 +475,11 @@ mod tests {
             assert_eq!(parse_deadline(bad), None, "{bad}");
         }
         assert_eq!(alert_at(d, None), "2026-09-12T09:00");
+        let at = |h, m| d.and_hms_opt(h, m, 0).unwrap();
+        assert!(!is_overdue(d, t, at(15, 0)), "at the minute itself: not yet");
+        assert!(is_overdue(d, t, at(15, 1)));
+        assert!(!is_overdue(d, None, at(23, 59)), "date-only: due all day");
+        assert!(is_overdue(d, None, (d + Duration::days(1)).and_hms_opt(0, 0, 0).unwrap()));
         assert_eq!(alert_at(d, t), "2026-09-12T15:00");
     }
 }
