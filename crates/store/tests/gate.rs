@@ -234,7 +234,7 @@ fn proposer_cannot_resolve_own_proposal() {
 }
 
 /// The invariant bounds AGENTS. The human owner's own stale edit that the
-/// gate parked red (autosave racing a live session, a second window) must be
+/// gate parked red (an autosave racing a second window) must be
 /// resolvable by that human — otherwise it is stuck in the queue forever.
 #[test]
 fn human_owner_can_resolve_their_own_parked_edit() {

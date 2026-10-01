@@ -1,5 +1,5 @@
 //! Store hygiene regressions (0.7.2): docs always keyed, trashed docs stay
-//! out of every read surface, imports and redeems are atomic, the change
+//! out of every read surface, imports are atomic, the change
 //! stamp sees every docs mutation.
 
 use grimoire_store::*;
@@ -32,7 +32,7 @@ fn insert(parent: Option<Uuid>, key: &str, content: &str) -> OpInput {
     }
 }
 
-/// Item 3: create_doc / create_doc_with_id / import never leave sort_key
+/// Item 3: create_doc / import never leave sort_key
 /// NULL; siblings get distinct ascending keys in creation order.
 #[test]
 fn new_docs_get_distinct_sort_keys_in_creation_order() {
@@ -41,9 +41,7 @@ fn new_docs_get_distinct_sort_keys_in_creation_order() {
     assert!(folder.sort_key.is_some(), "root doc keyed");
 
     let z = s.create_doc("zeta", Some(folder.id), tom.id).unwrap();
-    let a = s
-        .create_doc_with_id(Uuid::now_v7(), "alpha", Some(folder.id), tom.id)
-        .unwrap();
+    let a = s.create_doc("alpha", Some(folder.id), tom.id).unwrap();
     let m = add_doc(&mut s, &tom, "mid", "# x\n");
     let (zk, ak) = (z.sort_key.clone().unwrap(), a.sort_key.clone().unwrap());
     assert!(zk < ak, "creation order, not title order: {zk} < {ak}");
@@ -166,27 +164,6 @@ fn create_doc_with_ops_is_atomic() {
     );
     let tree = s.read_doc(doc.id).unwrap();
     assert_eq!(tree.roots.len(), 2);
-}
-
-/// Item 5: redeem_invite's four writes commit as one and leave the
-/// connection in autocommit (a stray open transaction would block every
-/// later write with "cannot start a transaction within a transaction").
-#[test]
-fn redeem_invite_commits_and_leaves_no_open_transaction() {
-    let (mut s, tom) = seed();
-    let doc = s.create_doc("shared", None, tom.id).unwrap();
-    let share = s
-        .create_share(doc.id, None, SharePermission::View, None)
-        .unwrap();
-    s.create_invite(share.id, "h1", "2099-01-01T00:00:00.000Z")
-        .unwrap();
-    let (alice, bound) = s.redeem_invite("h1", "abcdef0123456789", "alice").unwrap();
-    assert_eq!(bound.contact, Some(alice.id));
-    // a second redeem of the burned secret fails cleanly...
-    assert!(s.redeem_invite("h1", "abcdef0123456789", "alice").is_err());
-    // ...and writes still work afterwards (nothing left open either way)
-    s.create_doc("after", None, tom.id).unwrap();
-    s.rename_doc(doc.id, "renamed").unwrap();
 }
 
 /// Item 6: change_stamp moves on every docs mutation, including the ones

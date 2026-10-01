@@ -1,8 +1,10 @@
 -- knowledge-system substrate schema (PROJECT.md §3.1–3.2).
 -- Ledger (ops) is the primary write record; blocks is the projection,
 -- written in the same transaction and authoritative for reads.
--- All IDs are UUIDs stored as TEXT — never autoincrement (federation tax §6).
+-- All IDs are UUIDs stored as TEXT — never autoincrement (PROJECT.md §6).
 
+-- 'remote' principals were federation peers (ADR 0002, superseded); the
+-- kind stays so the provenance of their past ops still reads.
 CREATE TABLE IF NOT EXISTS principals (
     id           TEXT PRIMARY KEY,
     kind         TEXT NOT NULL CHECK (kind IN ('human', 'agent', 'remote')),
@@ -18,7 +20,7 @@ CREATE TABLE IF NOT EXISTS docs (
     review_policy TEXT CHECK (review_policy IN ('human-review', 'agent-review', 'auto')),
     -- doc lifecycle (ticket 5.6); null = plain doc, no status
     status        TEXT CHECK (status IN ('draft', 'in-review', 'decided', 'superseded')),
-    -- per-document, never global (federation tax §6); one epoch = one committed transaction
+    -- per-document, never global (PROJECT.md §6); one epoch = one committed transaction
     current_epoch INTEGER NOT NULL DEFAULT 0,
     created_by    TEXT NOT NULL REFERENCES principals (id),
     -- manual tree ordering (fractional, like blocks); null sorts after keyed, by title
@@ -218,159 +220,6 @@ CREATE TABLE IF NOT EXISTS audits (
     PRIMARY KEY (doc_id, principal)
 );
 
--- Federation (ADR 0002): pair-once contacts, subtree shares, one-time invites,
--- grantee-side mirror cursors. Owner-authoritative; a remote peer is
--- gardener-shaped — its writes arrive through the propose gate.
-CREATE TABLE IF NOT EXISTS contacts (
-    id        TEXT PRIMARY KEY,
-    -- iroh node id = ed25519 public key, hex — keys identify actors, UUIDs data
-    pubkey    TEXT NOT NULL UNIQUE,
-    petname   TEXT NOT NULL,
-    principal TEXT NOT NULL REFERENCES principals (id),
-    verified  INTEGER NOT NULL DEFAULT 0,
-    revoked   INTEGER NOT NULL DEFAULT 0,
-    paired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    -- hub membership (slice 1). On a hub: the member's role/standing. On a
-    -- member's instance, for a contact that is_hub: MY role/standing there.
-    role       TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('member', 'admin')),
-    membership TEXT NOT NULL DEFAULT 'active' CHECK (membership IN ('pending', 'active', 'ejected')),
-    -- the contact is a hub (grimoire serve --hub)
-    is_hub     INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS shares (
-    id         TEXT PRIMARY KEY,
-    root_doc   TEXT NOT NULL REFERENCES docs (id),
-    -- NULL until an invite is redeemed and binds a contact
-    contact    TEXT REFERENCES contacts (id),
-    permission TEXT NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'propose')),
-    -- offered = minted/awaiting grantee accept; active = syncing; revoked = refused on dial
-    state      TEXT NOT NULL DEFAULT 'offered' CHECK (state IN ('offered', 'active', 'revoked')),
-    -- overrides the doc's review policy for proposals arriving via this share
-    policy_override TEXT CHECK (policy_override IN ('human-review', 'agent-review', 'auto')),
-    -- trust tier (#62): review = remote proposals park red (default);
-    -- yellow = they apply immediately as flagged yellows (reds still park);
-    -- green = maintainer: clean edits land green, no review, owner notified
-    trust      TEXT NOT NULL DEFAULT 'review' CHECK (trust IN ('review', 'yellow', 'green')),
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
-CREATE INDEX IF NOT EXISTS shares_by_contact ON shares (contact);
-
--- One-time invite secrets (hash only, never the secret), burned on redeem.
-CREATE TABLE IF NOT EXISTS share_invites (
-    id          TEXT PRIMARY KEY,
-    share_id    TEXT NOT NULL REFERENCES shares (id),
-    secret_hash TEXT NOT NULL UNIQUE,
-    expires_at  TEXT NOT NULL,
-    redeemed_by TEXT REFERENCES contacts (id),
-    redeemed_at TEXT,
-    -- invites v2: the contact this invite was OFFERED to over the wire (no
-    -- link); NULL for a minted link. The shares page reads "waiting for X".
-    offered_to  TEXT REFERENCES contacts (id),
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
--- Invites v2: share OFFERS received from contacts (recipient side). Durable —
--- a request to join lives here until accepted/declined/expired, never only
--- in a toast. The secret is the invite secret; the recipient needs it to
--- redeem, so it is stored (this row IS the invite, from the other side).
-CREATE TABLE IF NOT EXISTS share_offers (
-    id           TEXT PRIMARY KEY,
-    from_contact TEXT NOT NULL REFERENCES contacts (id),
-    owner_node   TEXT NOT NULL,
-    share_id     TEXT NOT NULL,
-    root_title   TEXT NOT NULL,
-    permission   TEXT NOT NULL CHECK (permission IN ('view', 'propose')),
-    secret       TEXT NOT NULL,
-    state        TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'accepted', 'declined', 'expired')),
-    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    expires_at   TEXT NOT NULL,
-    UNIQUE (owner_node, share_id)
-);
-
--- Grantee-side: a mirror doc's origin + pull cursor. Mirrors keep their origin
--- UUIDs (federation tax), so doc_id is the same id the owner holds. share_id
--- is the owner-side share id — a foreign instance's id, deliberately no FK.
-CREATE TABLE IF NOT EXISTS mirrors (
-    doc_id       TEXT PRIMARY KEY REFERENCES docs (id),
-    owner        TEXT NOT NULL REFERENCES contacts (id),
-    share_id     TEXT NOT NULL,
-    synced_epoch INTEGER NOT NULL DEFAULT 0,
-    -- what the owner granted us: drives the editor mode (read-only vs
-    -- propose-upstream); the owner enforces regardless
-    permission   TEXT NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'propose')),
-    -- the owner tends this doc (a gardener over it or an ancestor). Shipped in
-    -- the pull meta so the grantee can show "tended by owner" and refuse to
-    -- tend it locally — one side's agents own a shared doc, never both.
-    owner_tended INTEGER NOT NULL DEFAULT 0,
-    -- sync health, per mirror doc: when the last pull that touched it
-    -- succeeded, and the last pull error (cleared on success). The shares
-    -- page shows these — a mirror that is "titles but no content" MUST read
-    -- as a red row saying why, never as a silent doc.
-    last_pulled_at TEXT,
-    last_error     TEXT,
-    -- the owner's epoch from the last pull meta; > synced_epoch = "behind"
-    owner_epoch  INTEGER NOT NULL DEFAULT 0,
-    -- hub relay provenance (slice 1): the TRUE owner of a doc relayed through
-    -- a hub (pubkey hex + the hub's name for them); NULL = owned by `owner`
-    origin_owner      TEXT,
-    origin_owner_name TEXT
-);
-
--- Hub side (slice 1): member subtrees the hub accepted and relays to every
--- member. share_id is the MEMBER's share id (a foreign id, no FK); root_doc
--- is the hub's mirror root of it, filed under <hub root>/<member>.
-CREATE TABLE IF NOT EXISTS hub_publications (
-    share_id       TEXT PRIMARY KEY,
-    member_contact TEXT NOT NULL REFERENCES contacts (id),
-    root_doc       TEXT NOT NULL,
-    published_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
--- Hub side (slice 2): proposals the hub FORWARDED to a doc's true owner on a
--- member's behalf. op_id is the OWNER's op id (returned to the member as the
--- status handle); a member's ProposalStatus for it is answered by asking the
--- owner. owner_share is the owner's share id the hub holds (the publication).
-CREATE TABLE IF NOT EXISTS hub_forwards (
-    op_id          TEXT PRIMARY KEY,
-    owner_contact  TEXT NOT NULL REFERENCES contacts (id),
-    member_contact TEXT NOT NULL REFERENCES contacts (id),
-    owner_share    TEXT NOT NULL,
-    doc_id         TEXT NOT NULL,
-    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
--- prune_hub_forwards deletes by age
-CREATE INDEX IF NOT EXISTS hub_forwards_by_created ON hub_forwards (created_at);
-
--- Hub side (slice 2): ownership transfers members offered the hub. An admin
--- accepts or declines; on accept the hub dials the member, pulls the subtree,
--- and flips its mirrors to owned docs (state done).
-CREATE TABLE IF NOT EXISTS hub_transfers (
-    id             TEXT PRIMARY KEY,
-    member_contact TEXT NOT NULL REFERENCES contacts (id),
-    root_doc       TEXT NOT NULL,
-    title          TEXT NOT NULL,
-    doc_count      INTEGER NOT NULL DEFAULT 0,
-    state          TEXT NOT NULL DEFAULT 'offered'
-        CHECK (state IN ('offered', 'accepted', 'declined', 'done')),
-    at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
--- Both sides (slice 2): the ledger of ownership transfers this instance took
--- part in. direction 'out' = I gave the subtree away (my copy is now a
--- mirror of the counterparty); 'in' = I took it over. state offered|done.
-CREATE TABLE IF NOT EXISTS doc_transfers (
-    id           TEXT PRIMARY KEY,
-    root_doc     TEXT NOT NULL,
-    counterparty TEXT NOT NULL REFERENCES contacts (id),
-    direction    TEXT NOT NULL CHECK (direction IN ('out', 'in')),
-    state        TEXT NOT NULL DEFAULT 'offered' CHECK (state IN ('offered', 'done')),
-    at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
-CREATE INDEX IF NOT EXISTS doc_transfers_by_root ON doc_transfers (root_doc);
-
 -- Instance-level key/value settings (profile confirmation etc.). Tiny and
 -- deliberately schemaless: anything bigger deserves its own table.
 CREATE TABLE IF NOT EXISTS settings (
@@ -378,39 +227,11 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
--- Grantee-side: joins that could not complete because the owner was offline.
--- A background loop retries; success removes the row (async redeem, ADR 0002
--- decision 6). The ticket contains the secret, so this table is as sensitive
--- as the link itself — local-only, like everything here.
-CREATE TABLE IF NOT EXISTS pending_joins (
-    id         TEXT PRIMARY KEY,
-    ticket     TEXT NOT NULL UNIQUE,
-    attempts   INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
--- Grantee-side: proposals shipped upstream through a propose share (#60).
--- op_ids are OWNER-side op ids (JSON array) — the handle for status checks.
--- Pessimistic mirror: the local doc never changes until the owner accepts
--- and the next pull lands it.
-CREATE TABLE IF NOT EXISTS outbound_proposals (
-    id         TEXT PRIMARY KEY,
-    doc_id     TEXT NOT NULL REFERENCES docs (id),
-    share_id   TEXT NOT NULL,
-    owner      TEXT NOT NULL REFERENCES contacts (id),
-    op_ids     TEXT NOT NULL,
-    note       TEXT NOT NULL DEFAULT '',
-    state      TEXT NOT NULL DEFAULT 'pending'
-        CHECK (state IN ('pending', 'accepted', 'declined', 'mixed')),
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
 -- Block embeddings (ask the vault, 2026-09-03): one static-model vector per
 -- live content block, f32 little-endian BLOB. `epoch` is the block epoch the
 -- vector was computed at; a newer block epoch = stale = re-embed that block.
--- CASCADE: mirror pulls hard-delete blocks (`mirror_replace_blocks`); the
--- vector must go with its block or the FK fails once a mirror is embedded.
+-- CASCADE: a hard block delete takes the vector with it (the FK would
+-- otherwise fail once the block is embedded).
 CREATE TABLE IF NOT EXISTS block_vec (
     block_id TEXT PRIMARY KEY REFERENCES blocks (id) ON DELETE CASCADE,
     epoch    INTEGER NOT NULL,
@@ -420,10 +241,9 @@ CREATE TABLE IF NOT EXISTS block_vec (
 
 -- Change journal: the sync cursor for offline clients (GET /api/changes,
 -- /api/changes/stream). One row per observable doc change, written by the
--- triggers below so every write path (UI, MCP, gardeners, import, federation
--- pull) lands here without opting in. `seq` is the cursor — the one integer
--- id in the schema, deliberately: it is local to this database and never
--- federated. Rows are not coalesced; a client refetches the doc either way.
+-- triggers below so every write path (UI, MCP, gardeners, import) lands
+-- here without opting in. `seq` is the cursor — the one integer id in the
+-- schema, deliberately: it is local to this database. Rows are not coalesced; a client refetches the doc either way.
 CREATE TABLE IF NOT EXISTS changes (
     seq    INTEGER PRIMARY KEY AUTOINCREMENT,
     doc_id TEXT NOT NULL,
@@ -438,8 +258,7 @@ CREATE TRIGGER IF NOT EXISTS changes_docs_ai AFTER INSERT ON docs BEGIN
     INSERT INTO changes (doc_id, kind, epoch) VALUES (new.id, 'tree', new.current_epoch);
 END;
 -- content edits all bump current_epoch (one epoch = one transaction), so the
--- epoch column, not ops, is the content signal: one row per commit, and
--- mirror refreshes (which write blocks without ops) are caught too
+-- epoch column, not ops, is the content signal: one row per commit
 CREATE TRIGGER IF NOT EXISTS changes_docs_au AFTER UPDATE ON docs BEGIN
     INSERT INTO changes (doc_id, kind, epoch)
         SELECT new.id, 'deleted', new.current_epoch WHERE old.deleted = 0 AND new.deleted <> 0;

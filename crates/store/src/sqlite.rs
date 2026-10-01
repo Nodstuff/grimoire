@@ -8,26 +8,13 @@ use uuid::Uuid;
 const SCHEMA: &str = include_str!("schema.sql");
 const WORKSPACES_SCHEMA: &str = include_str!("workspaces.sql");
 
-/// "Is this doc frozen for writes right now?" — the daemon plugs its hot
-/// session state in here so store-internal writes that fan out to OTHER
-/// docs (rename link rewrites, their decline-revert, a parked delete's
-/// accept) can skip live docs without the store knowing about sessions.
-pub type FrozenProbe = Box<dyn Fn(Uuid) -> bool + Send + Sync>;
-
 pub struct SqliteStore {
     pub(crate) conn: Connection,
-    frozen: Option<FrozenProbe>,
 }
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::init(Connection::open(path)?)
-    }
-
-    /// Install the freeze probe (see [`FrozenProbe`]). Without one, no doc
-    /// is ever considered frozen.
-    pub fn set_frozen_probe(&mut self, probe: FrozenProbe) {
-        self.frozen = Some(probe);
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -62,7 +49,7 @@ impl SqliteStore {
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(WORKSPACES_SCHEMA)?;
         backfill(&conn)?;
-        Ok(Self { conn, frozen: None })
+        Ok(Self { conn })
     }
 }
 
@@ -78,26 +65,15 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     additive_column_migrations(&tx)?;
     tx.commit()?;
-    // Fresh installs from before the maintainer tier created `shares` with
-    // a CHECK that only allows review|yellow; SQLite can't widen a CHECK in
-    // place, so rebuild the table once when we see the old constraint.
-    // (DBs that got `trust` via ALTER have no CHECK and need nothing.)
-    let shares_sql: Option<String> = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'shares'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(sql) = shares_sql
-        && sql.contains("trust IN ('review', 'yellow'))")
-        && !sql.contains("'green'")
-    {
-        widen_shares_trust_check(conn)?;
-    }
+    // v7: the peer-to-peer federation tables (contacts, shares, invites,
+    // offers, mirrors, hub publications/forwards/transfers, doc transfers,
+    // pending joins, outbound proposals) held only federation metadata;
+    // federation is gone. Children before parents: foreign keys are on and
+    // a DROP is an implicit DELETE. Idempotent, so it runs on every open.
+    drop_federation_tables(conn)?;
     // block_vec: the first cut referenced blocks(id) without ON DELETE
-    // CASCADE, so a mirror pull (hard-delete + reinsert) failed the FK once
-    // a mirror block had been embedded. Rebuild once with the cascade.
+    // CASCADE, so a hard block delete failed the FK once the block had been
+    // embedded. Rebuild once with the cascade.
     let block_vec_sql: Option<String> = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'block_vec'",
@@ -139,6 +115,43 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
     {
         widen_gardeners_kind_check(conn)?;
     }
+    Ok(())
+}
+
+/// The tables federation (ADR 0002, superseded) kept, children first.
+const FEDERATION_TABLES: [&str; 11] = [
+    "share_invites",
+    "share_offers",
+    "outbound_proposals",
+    "mirrors",
+    "hub_publications",
+    "hub_forwards",
+    "hub_transfers",
+    "doc_transfers",
+    "pending_joins",
+    "shares",
+    "contacts",
+];
+
+fn drop_federation_tables(conn: &Connection) -> Result<()> {
+    let present: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ({})",
+            FEDERATION_TABLES.map(|t| format!("'{t}'")).join(", ")
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    if present == 0 {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    for t in FEDERATION_TABLES {
+        tx.execute_batch(&format!("DROP TABLE IF EXISTS {t};"))?;
+    }
+    // hub mode's settings went with it
+    tx.execute("DELETE FROM settings WHERE key LIKE 'hub.%'", [])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -261,110 +274,6 @@ fn additive_column_migrations(conn: &Connection) -> Result<()> {
             conn.execute("ALTER TABLE docs ADD COLUMN verified_at TEXT", [])?;
         }
     }
-    let has_invites: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'share_invites'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_invites > 0 {
-        let has_offered: i64 = conn.query_row(
-            "SELECT count(*) FROM pragma_table_info('share_invites') WHERE name = 'offered_to'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_offered == 0 {
-            conn.execute(
-                "ALTER TABLE share_invites ADD COLUMN offered_to TEXT REFERENCES contacts (id)",
-                [],
-            )?;
-        }
-    }
-    let has_shares: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'shares'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_shares > 0 {
-        let has_trust: i64 = conn.query_row(
-            "SELECT count(*) FROM pragma_table_info('shares') WHERE name = 'trust'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_trust == 0 {
-            conn.execute(
-                "ALTER TABLE shares ADD COLUMN trust TEXT NOT NULL DEFAULT 'review'",
-                [],
-            )?;
-        }
-    }
-    let has_mirrors: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'mirrors'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_mirrors > 0 {
-        let has_perm: i64 = conn.query_row(
-            "SELECT count(*) FROM pragma_table_info('mirrors') WHERE name = 'permission'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_perm == 0 {
-            conn.execute(
-                "ALTER TABLE mirrors ADD COLUMN permission TEXT NOT NULL DEFAULT 'view'",
-                [],
-            )?;
-        }
-        let has_tended: i64 = conn.query_row(
-            "SELECT count(*) FROM pragma_table_info('mirrors') WHERE name = 'owner_tended'",
-            [],
-            |r| r.get(0),
-        )?;
-        if has_tended == 0 {
-            conn.execute(
-                "ALTER TABLE mirrors ADD COLUMN owner_tended INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
-        for (col, ddl) in [
-            ("last_pulled_at", "ALTER TABLE mirrors ADD COLUMN last_pulled_at TEXT"),
-            ("last_error", "ALTER TABLE mirrors ADD COLUMN last_error TEXT"),
-            ("owner_epoch", "ALTER TABLE mirrors ADD COLUMN owner_epoch INTEGER NOT NULL DEFAULT 0"),
-            // hub relay provenance (slice 1)
-            ("origin_owner", "ALTER TABLE mirrors ADD COLUMN origin_owner TEXT"),
-            ("origin_owner_name", "ALTER TABLE mirrors ADD COLUMN origin_owner_name TEXT"),
-        ] {
-            let has: i64 = conn.query_row(
-                "SELECT count(*) FROM pragma_table_info('mirrors') WHERE name = ?1",
-                params![col],
-                |r| r.get(0),
-            )?;
-            if has == 0 {
-                conn.execute(ddl, [])?;
-            }
-        }
-    }
-    // hub membership columns on contacts (slice 1)
-    let has_contacts: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'contacts'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_contacts > 0 {
-        for (col, ddl) in [
-            ("role", "ALTER TABLE contacts ADD COLUMN role TEXT NOT NULL DEFAULT 'member'"),
-            ("membership", "ALTER TABLE contacts ADD COLUMN membership TEXT NOT NULL DEFAULT 'active'"),
-            ("is_hub", "ALTER TABLE contacts ADD COLUMN is_hub INTEGER NOT NULL DEFAULT 0"),
-        ] {
-            let has: i64 = conn.query_row(
-                "SELECT count(*) FROM pragma_table_info('contacts') WHERE name = ?1",
-                params![col],
-                |r| r.get(0),
-            )?;
-            if has == 0 {
-                conn.execute(ddl, [])?;
-            }
-        }
-    }
     let has_gardeners: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'gardeners'",
         [],
@@ -382,50 +291,6 @@ fn additive_column_migrations(conn: &Connection) -> Result<()> {
                 [],
             )?;
         }
-    }
-    Ok(())
-}
-
-/// The SQLite "rebuild a table to change a constraint" dance for `shares`:
-/// copy into a table with the widened trust CHECK, swap, recreate the index.
-/// Foreign keys are switched off for the swap (share_invites references
-/// shares by id; the ids are preserved, so integrity holds afterwards).
-fn widen_shares_trust_check(conn: &Connection) -> Result<()> {
-    conn.pragma_update(None, "foreign_keys", false)?;
-    let result = (|| -> Result<()> {
-        conn.execute_batch(
-            "BEGIN;
-             CREATE TABLE shares_new (
-                 id         TEXT PRIMARY KEY,
-                 root_doc   TEXT NOT NULL REFERENCES docs (id),
-                 contact    TEXT REFERENCES contacts (id),
-                 permission TEXT NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'propose')),
-                 state      TEXT NOT NULL DEFAULT 'offered' CHECK (state IN ('offered', 'active', 'revoked')),
-                 policy_override TEXT CHECK (policy_override IN ('human-review', 'agent-review', 'auto')),
-                 trust      TEXT NOT NULL DEFAULT 'review' CHECK (trust IN ('review', 'yellow', 'green')),
-                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-             );
-             INSERT INTO shares_new (id, root_doc, contact, permission, state, policy_override, trust, created_at)
-                 SELECT id, root_doc, contact, permission, state, policy_override, trust, created_at FROM shares;
-             DROP TABLE shares;
-             ALTER TABLE shares_new RENAME TO shares;
-             CREATE INDEX IF NOT EXISTS shares_by_contact ON shares (contact);
-             COMMIT;",
-        )?;
-        Ok(())
-    })();
-    conn.pragma_update(None, "foreign_keys", true)?;
-    result?;
-    // belt and braces: nothing dangling after the swap
-    let violations: i64 = conn.query_row(
-        "SELECT count(*) FROM pragma_foreign_key_check('share_invites')",
-        [],
-        |r| r.get(0),
-    )?;
-    if violations > 0 {
-        return Err(StoreError::InvalidOp(format!(
-            "shares rebuild left {violations} dangling share_invites rows"
-        )));
     }
     Ok(())
 }
@@ -773,219 +638,6 @@ fn build_doc(raw: RawDoc) -> Result<Doc> {
             })
             .transpose()?,
         sort_key,
-    })
-}
-
-// --- federation row mapping (ADR 0002) ---
-
-type RawContact = (String, String, String, String, bool, bool, String, String, String, bool);
-
-const CONTACT_COLS: &str =
-    "id, pubkey, petname, principal, verified, revoked, paired_at, role, membership, is_hub";
-
-fn contact_row(row: &rusqlite::Row) -> rusqlite::Result<RawContact> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
-    ))
-}
-
-fn finish_contact(raw: RawContact) -> Result<Contact> {
-    let (id, pubkey, petname, principal, verified, revoked, paired_at, role, membership, is_hub) = raw;
-    Ok(Contact {
-        id: uuid_col(id, "contacts.id")?,
-        pubkey,
-        petname,
-        principal: uuid_col(principal, "contacts.principal")?,
-        verified,
-        revoked,
-        paired_at,
-        role: ContactRole::parse(&role)
-            .ok_or_else(|| StoreError::InvalidOp(format!("bad contact role: {role}")))?,
-        membership: Membership::parse(&membership)
-            .ok_or_else(|| StoreError::InvalidOp(format!("bad contact membership: {membership}")))?,
-        is_hub,
-    })
-}
-
-type RawShare = (
-    String,
-    String,
-    Option<String>,
-    String,
-    String,
-    Option<String>,
-    String,
-    String,
-);
-
-fn share_row(row: &rusqlite::Row) -> rusqlite::Result<RawShare> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-    ))
-}
-
-type RawOffer = (String, String, String, String, String, String, String, String, String, String);
-
-fn offer_row(row: &rusqlite::Row) -> rusqlite::Result<RawOffer> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
-    ))
-}
-
-fn finish_offer(raw: RawOffer) -> Result<ShareOffer> {
-    let (id, from_contact, owner_node, share_id, root_title, permission, secret, state, created_at, expires_at) = raw;
-    Ok(ShareOffer {
-        id: uuid_col(id, "share_offers.id")?,
-        from_contact: uuid_col(from_contact, "share_offers.from_contact")?,
-        owner_node,
-        share_id: uuid_col(share_id, "share_offers.share_id")?,
-        root_title,
-        permission: SharePermission::parse(&permission)
-            .ok_or_else(|| StoreError::InvalidOp(format!("bad offer permission: {permission}")))?,
-        secret,
-        state: ShareOfferState::parse(&state)
-            .ok_or_else(|| StoreError::InvalidOp(format!("bad offer state: {state}")))?,
-        created_at,
-        expires_at,
-    })
-}
-
-fn finish_share(raw: RawShare) -> Result<Share> {
-    let (id, root_doc, contact, permission, state, policy_override, created_at, trust) = raw;
-    Ok(Share {
-        id: uuid_col(id, "shares.id")?,
-        root_doc: uuid_col(root_doc, "shares.root_doc")?,
-        contact: contact.map(|c| uuid_col(c, "shares.contact")).transpose()?,
-        permission: SharePermission::parse(&permission)
-            .ok_or_else(|| StoreError::InvalidOp(format!("bad permission: {permission}")))?,
-        state: ShareState::parse(&state)
-            .ok_or_else(|| StoreError::InvalidOp(format!("bad share state: {state}")))?,
-        policy_override: policy_override
-            .map(|p| {
-                ReviewPolicy::parse(&p)
-                    .ok_or_else(|| StoreError::InvalidOp(format!("bad policy_override: {p}")))
-            })
-            .transpose()?,
-        created_at,
-        trust: ShareTrust::parse(&trust)
-            .ok_or_else(|| StoreError::InvalidOp(format!("bad trust: {trust}")))?,
-    })
-}
-
-type RawMirror = (
-    String,
-    String,
-    String,
-    i64,
-    String,
-    bool,
-    Option<String>,
-    Option<String>,
-    i64,
-    Option<String>,
-    Option<String>,
-);
-
-const MIRROR_COLS: &str = "doc_id, owner, share_id, synced_epoch, permission, owner_tended, last_pulled_at, last_error, owner_epoch, origin_owner, origin_owner_name";
-
-type RawHubTransfer = (String, String, String, String, i64, String, String);
-
-const HUB_TRANSFER_COLS: &str = "id, member_contact, root_doc, title, doc_count, state, at";
-
-fn hub_transfer_row(row: &rusqlite::Row) -> rusqlite::Result<RawHubTransfer> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-    ))
-}
-
-fn finish_hub_transfer(raw: RawHubTransfer) -> Result<HubTransfer> {
-    let (id, member_contact, root_doc, title, doc_count, state, at) = raw;
-    Ok(HubTransfer {
-        id: uuid_col(id, "hub_transfers.id")?,
-        member_contact: uuid_col(member_contact, "hub_transfers.member_contact")?,
-        root_doc: uuid_col(root_doc, "hub_transfers.root_doc")?,
-        title,
-        doc_count,
-        state: HubTransferState::parse(&state)
-            .ok_or_else(|| StoreError::InvalidOp(format!("bad hub transfer state {state}")))?,
-        at,
-    })
-}
-
-fn mirror_row(row: &rusqlite::Row) -> rusqlite::Result<RawMirror> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
-        row.get(10)?,
-    ))
-}
-
-fn finish_mirror(raw: RawMirror) -> Result<Mirror> {
-    let (
-        doc_id,
-        owner,
-        share_id,
-        synced_epoch,
-        permission,
-        owner_tended,
-        last_pulled_at,
-        last_error,
-        owner_epoch,
-        origin_owner,
-        origin_owner_name,
-    ) = raw;
-    Ok(Mirror {
-        doc_id: uuid_col(doc_id, "mirrors.doc_id")?,
-        owner: uuid_col(owner, "mirrors.owner")?,
-        share_id: uuid_col(share_id, "mirrors.share_id")?,
-        synced_epoch,
-        permission: SharePermission::parse(&permission)
-            .ok_or_else(|| StoreError::InvalidOp(format!("bad mirror permission: {permission}")))?,
-        owner_tended,
-        last_pulled_at,
-        last_error,
-        owner_epoch,
-        origin_owner,
-        origin_owner_name,
     })
 }
 
@@ -1728,17 +1380,6 @@ impl BlockStore for SqliteStore {
         })
     }
 
-    fn set_principal_pubkey(&mut self, id: Uuid, pubkey: &str) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE principals SET pubkey = ?1 WHERE id = ?2",
-            params![pubkey, id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("principal {id}")));
-        }
-        Ok(())
-    }
-
     fn rename_principal(&mut self, id: Uuid, display_name: &str) -> Result<()> {
         let name = display_name.trim();
         if name.is_empty() || name.chars().count() > 64 {
@@ -1767,35 +1408,6 @@ impl BlockStore for SqliteStore {
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
-        Ok(())
-    }
-
-    fn set_mirror_sync_result(&mut self, share_id: Uuid, error: Option<&str>) -> Result<()> {
-        match error {
-            None => self.conn.execute(
-                "UPDATE mirrors SET last_pulled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), last_error = NULL
-                 WHERE share_id = ?1",
-                params![share_id.to_string()],
-            )?,
-            Some(e) => self.conn.execute(
-                "UPDATE mirrors SET last_error = ?2 WHERE share_id = ?1",
-                params![share_id.to_string(), e],
-            )?,
-        };
-        Ok(())
-    }
-
-    fn delete_share(&mut self, id: Uuid) -> Result<()> {
-        let share = self.get_share(id)?;
-        if share.state != ShareState::Revoked {
-            return Err(StoreError::InvalidOp(
-                "only a revoked share can be cleared — revoke it first".into(),
-            ));
-        }
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM share_invites WHERE share_id = ?1", params![id.to_string()])?;
-        tx.execute("DELETE FROM shares WHERE id = ?1", params![id.to_string()])?;
-        tx.commit()?;
         Ok(())
     }
 
@@ -1906,7 +1518,6 @@ impl BlockStore for SqliteStore {
         principal: Uuid,
         ops: Vec<OpInput>,
     ) -> Result<ApplyReceipt> {
-        self.reject_if_mirror(doc_id)?;
         if ops.is_empty() {
             return Err(StoreError::InvalidOp("apply: empty op list".into()));
         }
@@ -1958,8 +1569,9 @@ impl BlockStore for SqliteStore {
 
     fn list_trash(&self) -> Result<Vec<TrashEntry>> {
         // roots of tombstoned subtrees: deleted, and the parent is live or
-        // absent. Docs a remote owner created are dropped mirrors of a revoked
-        // share, not the user's own deletions — they revive via re-join.
+        // absent. Docs a remote principal created are tombstones federation
+        // left behind (dropped mirrors of a revoked share), not the user's own
+        // deletions, and stay out of the Trash.
         let mut stmt = self.conn.prepare(
             "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by,
                     d.status, d.sort_key, d.deleted_at,
@@ -2253,8 +1865,6 @@ impl BlockStore for SqliteStore {
                 kind.op_type()
             )));
         }
-        self.reject_if_mirror(doc_id)?;
-        let frozen = &self.frozen;
         let tx = self.conn.transaction()?;
         if !doc_is_live(&tx, doc_id)? {
             return Err(StoreError::NotFound(format!("doc {doc_id}")));
@@ -2324,18 +1934,14 @@ impl BlockStore for SqliteStore {
             project_doc_op(&tx, doc_id, &kind)?;
             let mut n = String::from("applied; flagged for review (declining reverts it)");
             if let OpKind::RenameDoc { title, from_title } = &kind {
-                let (rewritten, deferred) = rewrite_inbound_links_tx(
+                let rewritten = rewrite_inbound_links_tx(
                     &tx,
-                    frozen,
                     from_title,
                     title,
                     principal,
                     &format!("rename:{from_title} → {title}"),
                 )?;
                 n = format!("{n}; {rewritten} inbound link block(s) rewritten");
-                if deferred > 0 {
-                    n = format!("{n}, {deferred} deferred (their doc is in a live session)");
-                }
             }
             note = n;
             (Verdict::Yellow, 1.0, true)
@@ -2615,7 +2221,6 @@ impl BlockStore for SqliteStore {
         ops: Vec<OpInput>,
         note: &str,
     ) -> Result<Vec<Uuid>> {
-        self.reject_if_mirror(doc_id)?;
         if ops.is_empty() {
             return Err(StoreError::InvalidOp("park: empty op list".into()));
         }
@@ -2697,1022 +2302,24 @@ impl BlockStore for SqliteStore {
         .collect()
     }
 
-    // --- federation (ADR 0002) ---
-
-    fn pair_contact(&mut self, pubkey: &str, petname: &str) -> Result<Contact> {
-        // Idempotent on pubkey. An existing contact is returned untouched:
-        // the petname is the owner's chosen name (rename_contact is the way
-        // to change it, never a peer's self-description), and revocation is
-        // only lifted by the explicit unrevoke_contact — re-pairing must not
-        // quietly restore trust.
-        if let Some(existing) = self.contact_by_pubkey(pubkey)? {
-            return Ok(existing);
-        }
-        let principal = self.create_principal(PrincipalKind::Remote, petname, Some(pubkey))?;
-        let id = Uuid::now_v7();
-        self.conn.execute(
-            "INSERT INTO contacts (id, pubkey, petname, principal) VALUES (?1, ?2, ?3, ?4)",
-            params![id.to_string(), pubkey, petname, principal.id.to_string()],
-        )?;
-        self.contact_by_pubkey(pubkey)?
-            .ok_or_else(|| StoreError::NotFound(format!("contact {id}")))
-    }
-
-    fn list_contacts(&self) -> Result<Vec<Contact>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {CONTACT_COLS} FROM contacts ORDER BY paired_at"))?;
-        let rows = stmt.query_map([], contact_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    fn doc_is_tended(&self, doc_id: Uuid) -> Result<bool> {
+        let scopes: std::collections::HashSet<Uuid> = self
+            .list_gardeners()?
             .into_iter()
-            .map(finish_contact)
-            .collect()
-    }
-
-    fn contact_by_pubkey(&self, pubkey: &str) -> Result<Option<Contact>> {
-        self.conn
-            .query_row(
-                &format!("SELECT {CONTACT_COLS} FROM contacts WHERE pubkey = ?1"),
-                params![pubkey],
-                contact_row,
-            )
-            .optional()?
-            .map(finish_contact)
-            .transpose()
-    }
-
-    fn set_contact_verified(&mut self, id: Uuid, verified: bool) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE contacts SET verified = ?1 WHERE id = ?2",
-            params![verified, id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("contact {id}")));
-        }
-        Ok(())
-    }
-
-    fn revoke_contact(&mut self, id: Uuid) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE contacts SET revoked = 1 WHERE id = ?1",
-            params![id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("contact {id}")));
-        }
-        self.conn.execute(
-            "UPDATE shares SET state = 'revoked' WHERE contact = ?1",
-            params![id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    fn remove_contact(&mut self, id: Uuid) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        let n = tx.execute(
-            "UPDATE shares SET state = 'revoked' WHERE contact = ?1 AND state != 'revoked'",
-            params![id.to_string()],
-        )?;
-        let _ = n;
-        // shares keep pointing at the contact row for history → null the FK
-        // rather than cascade-deleting the audit trail
-        tx.execute("UPDATE shares SET contact = NULL WHERE contact = ?1", params![id.to_string()])?;
-        tx.execute(
-            "UPDATE share_invites SET redeemed_by = NULL WHERE redeemed_by = ?1",
-            params![id.to_string()],
-        )?;
-        // mirrors we hold FROM this contact reference the row: the user must
-        // leave those shares first (that path drops the mirrors deliberately)
-        let held: i64 = tx.query_row(
-            "SELECT count(*) FROM mirrors WHERE owner = ?1",
-            params![id.to_string()],
-            |r| r.get(0),
-        )?;
-        if held > 0 {
-            return Err(StoreError::InvalidOp(format!(
-                "you still hold {held} doc{} shared by this contact — leave those shares first",
-                if held == 1 { "" } else { "s" }
-            )));
-        }
-        // proposals we sent THEM (grantee side) are history too
-        tx.execute(
-            "DELETE FROM outbound_proposals WHERE owner = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM share_offers WHERE from_contact = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "UPDATE share_invites SET offered_to = NULL WHERE offered_to = ?1",
-            params![id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM hub_publications WHERE member_contact = ?1",
-            params![id.to_string()],
-        )?;
-        let deleted = tx.execute("DELETE FROM contacts WHERE id = ?1", params![id.to_string()])?;
-        if deleted == 0 {
-            return Err(StoreError::NotFound(format!("contact {id}")));
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    fn unrevoke_contact(&mut self, id: Uuid) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE contacts SET revoked = 0 WHERE id = ?1",
-            params![id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("contact {id}")));
-        }
-        Ok(())
-    }
-
-    fn create_share(
-        &mut self,
-        root_doc: Uuid,
-        contact: Option<Uuid>,
-        permission: SharePermission,
-        policy_override: Option<ReviewPolicy>,
-    ) -> Result<Share> {
-        self.get_doc(root_doc)?; // must exist
-        // re-share guard: a subtree containing mirrors is someone ELSE's
-        // content — serving it onward would leak their docs to a third party
-        // without their gate ever seeing it. Share your own docs only.
-        // The one exception (hub, slice 1): a hub sharing its ROOT may contain
-        // members' publications — mirrors the members asked it to relay.
-        let relayed: std::collections::HashSet<Uuid> = {
-            let hub_root: Option<Uuid> = match self.get_setting("hub.enabled")?.as_deref() {
-                Some("1") => self.get_setting("hub.root_doc")?.and_then(|r| r.parse().ok()),
-                _ => None,
-            };
-            if hub_root == Some(root_doc) {
-                let pubs: std::collections::HashSet<Uuid> =
-                    self.list_hub_publications()?.into_iter().map(|p| p.share_id).collect();
-                self.list_mirrors()?
-                    .into_iter()
-                    .filter(|m| pubs.contains(&m.share_id))
-                    .map(|m| m.doc_id)
-                    .collect()
-            } else {
-                Default::default()
-            }
-        };
-        let mirrors: std::collections::HashSet<Uuid> = self
-            .list_mirrors()?
-            .into_iter()
-            .map(|m| m.doc_id)
-            .filter(|id| !relayed.contains(id))
+            .filter(|g| g.enabled)
+            .filter_map(|g| g.scope_doc)
             .collect();
-        if !mirrors.is_empty() {
-            let mut stmt = self.conn.prepare(
-                "WITH RECURSIVE subtree (id) AS (
-                     SELECT id FROM docs WHERE id = ?1 AND deleted = 0
-                     UNION ALL
-                     SELECT d.id FROM docs d JOIN subtree s ON d.parent_id = s.id
-                     WHERE d.deleted = 0
-                 )
-                 SELECT id FROM subtree",
-            )?;
-            let ids: Vec<String> = stmt
-                .query_map(params![root_doc.to_string()], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            for id in ids {
-                let id = uuid_col(id, "docs.id")?;
-                if mirrors.contains(&id) {
-                    return Err(StoreError::InvalidOp(
-                        "cannot share a subtree containing docs shared TO you —                          only the owner can share those"
-                            .into(),
-                    ));
-                }
+        if scopes.is_empty() {
+            return Ok(false);
+        }
+        let mut cur = Some(doc_id);
+        while let Some(id) = cur {
+            if scopes.contains(&id) {
+                return Ok(true);
             }
+            cur = self.get_doc(id).ok().and_then(|d| d.parent_id);
         }
-        let id = Uuid::now_v7();
-        self.conn.execute(
-            "INSERT INTO shares (id, root_doc, contact, permission, policy_override)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                id.to_string(),
-                root_doc.to_string(),
-                contact.map(|c| c.to_string()),
-                permission.as_str(),
-                policy_override.map(|p| p.as_str()),
-            ],
-        )?;
-        self.get_share(id)
-    }
-
-    fn list_shares(&self) -> Result<Vec<Share>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, root_doc, contact, permission, state, policy_override, created_at, trust
-             FROM shares ORDER BY created_at",
-        )?;
-        let rows = stmt.query_map([], share_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(finish_share)
-            .collect()
-    }
-
-    fn get_share(&self, id: Uuid) -> Result<Share> {
-        self.conn
-            .query_row(
-                "SELECT id, root_doc, contact, permission, state, policy_override, created_at, trust
-                 FROM shares WHERE id = ?1",
-                params![id.to_string()],
-                share_row,
-            )
-            .optional()?
-            .map(finish_share)
-            .transpose()?
-            .ok_or_else(|| StoreError::NotFound(format!("share {id}")))
-    }
-
-    fn set_share_state(&mut self, id: Uuid, state: ShareState) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE shares SET state = ?1 WHERE id = ?2",
-            params![state.as_str(), id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("share {id}")));
-        }
-        Ok(())
-    }
-
-    fn set_share_permission(&mut self, id: Uuid, permission: SharePermission) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE shares SET permission = ?1 WHERE id = ?2",
-            params![permission.as_str(), id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("share {id}")));
-        }
-        Ok(())
-    }
-
-    fn set_share_trust(&mut self, id: Uuid, trust: ShareTrust) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE shares SET trust = ?1 WHERE id = ?2",
-            params![trust.as_str(), id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("share {id}")));
-        }
-        Ok(())
-    }
-
-    fn recent_remote_ops(&self, limit: usize) -> Result<Vec<ActivityItem>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT o.id, o.doc_id, d.title, o.principal, p.display_name, o.op_type,
-                    o.epoch_applied, o.created_at
-             FROM ops o
-             JOIN docs d ON d.id = o.doc_id
-             JOIN principals p ON p.id = o.principal
-             WHERE p.kind = 'remote' AND o.epoch_applied IS NOT NULL
-             ORDER BY o.created_at DESC, o.id DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, String>(7)?,
-            ))
-        })?;
-        rows.map(|r| {
-            let (op_id, doc_id, doc_title, principal, principal_name, op_type, epoch, created_at) =
-                r?;
-            Ok(ActivityItem {
-                op_id: uuid_col(op_id, "ops.id")?,
-                doc_id: uuid_col(doc_id, "ops.doc_id")?,
-                doc_title,
-                principal: uuid_col(principal, "ops.principal")?,
-                principal_name,
-                op_type,
-                epoch,
-                created_at,
-            })
-        })
-        .collect()
-    }
-
-    fn create_invite(
-        &mut self,
-        share_id: Uuid,
-        secret_hash: &str,
-        expires_at: &str,
-    ) -> Result<Uuid> {
-        self.get_share(share_id)?;
-        let id = Uuid::now_v7();
-        self.conn.execute(
-            "INSERT INTO share_invites (id, share_id, secret_hash, expires_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                id.to_string(),
-                share_id.to_string(),
-                secret_hash,
-                expires_at
-            ],
-        )?;
-        Ok(id)
-    }
-
-    fn redeem_invite(
-        &mut self,
-        secret_hash: &str,
-        pubkey: &str,
-        petname: &str,
-    ) -> Result<(Contact, Share)> {
-        // ISO-8601 UTC strings compare lexicographically; 'now' matches the
-        // strftime format used everywhere else in this schema.
-        let row: Option<(String, String)> = self
-            .conn
-            .query_row(
-                "SELECT id, share_id FROM share_invites
-                 WHERE secret_hash = ?1
-                   AND redeemed_at IS NULL
-                   AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-                params![secret_hash],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((invite_id, share_id)) = row else {
-            return Err(StoreError::InvalidOp(
-                "invite invalid: unknown, already redeemed, or expired".into(),
-            ));
-        };
-        let share_id = uuid_col(share_id, "share_invites.share_id")?;
-        // a revoked peer cannot redeem their way back in: nothing is burned,
-        // nothing is revived — the owner un-revokes first, deliberately
-        if self.contact_by_pubkey(pubkey)?.is_some_and(|c| c.revoked) {
-            return Err(StoreError::InvalidOp(
-                "contact is revoked; un-revoke before re-inviting".into(),
-            ));
-        }
-        // The petname is PEER-SUPPLIED. A first-seen contact carries a short
-        // fingerprint suffix ("alice · 3f9a") so two peers claiming the same
-        // name are distinguishable until the owner renames or verifies them.
-        // An existing contact keeps the owner's chosen name (pair_contact).
-        let suffix: String = pubkey.chars().take(4).collect();
-        let shown = format!("{} · {suffix}", petname.trim());
-        // pair + burn + bind + supersede land together: a failure half-way
-        // must not leave a contact without a share, or a burned invite that
-        // never bound. The helpers below run on self, so the transaction is
-        // driven by hand rather than through a Transaction borrow.
-        self.conn.execute_batch("BEGIN")?;
-        let result = (|| -> Result<(Contact, Share)> {
-            let contact = self.pair_contact(pubkey, &shown)?;
-            self.conn.execute(
-                "UPDATE share_invites SET redeemed_by = ?1,
-                     redeemed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ?2",
-                params![contact.id.to_string(), invite_id],
-            )?;
-            self.conn.execute(
-                "UPDATE shares SET contact = ?1, state = 'active' WHERE id = ?2",
-                params![contact.id.to_string(), share_id.to_string()],
-            )?;
-            // supersede: a re-invite of the same subtree to the same person
-            // replaces the old grant — one active share per (root_doc, contact),
-            // so grantee mirror rows never tug-of-war over permission
-            let share = self.get_share(share_id)?;
-            self.conn.execute(
-                "UPDATE shares SET state = 'revoked'
-                 WHERE root_doc = ?1 AND contact = ?2 AND id != ?3 AND state = 'active'",
-                params![
-                    share.root_doc.to_string(),
-                    contact.id.to_string(),
-                    share_id.to_string()
-                ],
-            )?;
-            Ok((contact, share))
-        })();
-        match result {
-            Ok(out) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(out)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
-    }
-
-    fn docs_in_share(&self, share_id: Uuid) -> Result<Vec<Doc>> {
-        let share = self.get_share(share_id)?;
-        let mut stmt = self.conn.prepare(
-            "WITH RECURSIVE subtree (id) AS (
-                 SELECT id FROM docs WHERE id = ?1 AND deleted = 0
-                 UNION ALL
-                 SELECT d.id FROM docs d JOIN subtree s ON d.parent_id = s.id
-                 WHERE d.deleted = 0
-             )
-             SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch,
-                    d.created_by, d.status, d.sort_key
-             FROM docs d JOIN subtree s ON d.id = s.id
-             ORDER BY d.sort_key IS NULL, d.sort_key, d.title",
-        )?;
-        let rows = stmt.query_map(params![share.root_doc.to_string()], row_to_doc)?;
-        rows.map(|r| build_doc(r?)).collect()
-    }
-
-    fn shares_containing(&self, doc_id: Uuid) -> Result<Vec<Share>> {
-        // walk up from the doc; any non-revoked share rooted at an ancestor
-        // (or the doc itself) contains it
-        let mut stmt = self.conn.prepare(
-            "WITH RECURSIVE ancestors (id) AS (
-                 SELECT id FROM docs WHERE id = ?1
-                 UNION ALL
-                 SELECT d.parent_id FROM docs d JOIN ancestors a ON d.id = a.id
-                 WHERE d.parent_id IS NOT NULL
-             )
-             SELECT s.id, s.root_doc, s.contact, s.permission, s.state,
-                    s.policy_override, s.created_at, s.trust
-             FROM shares s JOIN ancestors a ON s.root_doc = a.id
-             WHERE s.state != 'revoked'
-             ORDER BY s.created_at",
-        )?;
-        let rows = stmt.query_map(params![doc_id.to_string()], share_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(finish_share)
-            .collect()
-    }
-
-    fn create_doc_with_id(
-        &mut self,
-        id: Uuid,
-        title: &str,
-        parent: Option<Uuid>,
-        created_by: Uuid,
-    ) -> Result<Doc> {
-        insert_doc_row(&self.conn, id, title, parent, created_by)?;
-        self.get_doc(id)
-    }
-
-    fn record_outbound_proposal(
-        &mut self,
-        doc_id: Uuid,
-        share_id: Uuid,
-        owner: Uuid,
-        op_ids: &[Uuid],
-        note: &str,
-    ) -> Result<Uuid> {
-        let id = Uuid::now_v7();
-        let ids_json =
-            serde_json::to_string(&op_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>())?;
-        self.conn.execute(
-            "INSERT INTO outbound_proposals (id, doc_id, share_id, owner, op_ids, note)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                id.to_string(),
-                doc_id.to_string(),
-                share_id.to_string(),
-                owner.to_string(),
-                ids_json,
-                note
-            ],
-        )?;
-        Ok(id)
-    }
-
-    fn list_outbound_proposals(&self, pending_only: bool) -> Result<Vec<OutboundProposal>> {
-        let sql = if pending_only {
-            "SELECT id, doc_id, share_id, owner, op_ids, note, state, created_at
-             FROM outbound_proposals WHERE state = 'pending' ORDER BY created_at"
-        } else {
-            "SELECT id, doc_id, share_id, owner, op_ids, note, state, created_at
-             FROM outbound_proposals ORDER BY created_at"
-        };
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, String>(6)?,
-                r.get::<_, String>(7)?,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(
-                |(id, doc_id, share_id, owner, op_ids, note, state, created_at)| {
-                    let raw_ids: Vec<String> = serde_json::from_str(&op_ids)?;
-                    Ok(OutboundProposal {
-                        id: uuid_col(id, "outbound_proposals.id")?,
-                        doc_id: uuid_col(doc_id, "outbound_proposals.doc_id")?,
-                        share_id: uuid_col(share_id, "outbound_proposals.share_id")?,
-                        owner: uuid_col(owner, "outbound_proposals.owner")?,
-                        op_ids: raw_ids
-                            .into_iter()
-                            .map(|s| uuid_col(s, "outbound_proposals.op_ids"))
-                            .collect::<Result<_>>()?,
-                        note,
-                        state,
-                        created_at,
-                    })
-                },
-            )
-            .collect()
-    }
-
-    fn set_outbound_state(&mut self, id: Uuid, state: &str) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE outbound_proposals SET state = ?1 WHERE id = ?2",
-            params![state, id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("outbound proposal {id}")));
-        }
-        Ok(())
-    }
-
-    fn op_statuses(&self, ids: &[Uuid]) -> Result<Vec<OpStatus>> {
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            let row = self
-                .conn
-                .query_row(
-                    "SELECT o.principal, o.epoch_applied,
-                            (SELECT a.status FROM annotations a
-                             WHERE a.op_id = o.id ORDER BY a.created_at DESC LIMIT 1),
-                            o.source_refs
-                     FROM ops o WHERE o.id = ?1",
-                    params![id.to_string()],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, Option<i64>>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                            r.get::<_, String>(3)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            if let Some((principal, epoch_applied, review, refs)) = row {
-                out.push(OpStatus {
-                    op_id: *id,
-                    principal: uuid_col(principal, "ops.principal")?,
-                    applied: epoch_applied.is_some(),
-                    review,
-                    source_refs: serde_json::from_str(&refs).unwrap_or_default(),
-                });
-            }
-        }
-        Ok(out)
-    }
-
-    // --- hub slice 2: forwarding + transfers ---
-
-    fn remote_principal_for(&mut self, pubkey: &str, name: &str) -> Result<Uuid> {
-        if let Some(c) = self.contact_by_pubkey(pubkey)? {
-            return Ok(c.principal);
-        }
-        let existing: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM principals WHERE kind = 'remote' AND pubkey = ?1 ORDER BY id LIMIT 1",
-                params![pubkey],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(id) = existing {
-            return uuid_col(id, "principals.id");
-        }
-        let name = name.trim();
-        let name = if name.is_empty() { "someone" } else { name };
-        Ok(self
-            .create_principal(PrincipalKind::Remote, name, Some(pubkey))?
-            .id)
-    }
-
-    fn add_hub_forward(
-        &mut self,
-        op_id: Uuid,
-        owner_contact: Uuid,
-        member_contact: Uuid,
-        owner_share: Uuid,
-        doc_id: Uuid,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO hub_forwards (op_id, owner_contact, member_contact, owner_share, doc_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                op_id.to_string(),
-                owner_contact.to_string(),
-                member_contact.to_string(),
-                owner_share.to_string(),
-                doc_id.to_string()
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn hub_forwards_for(&self, op_ids: &[Uuid]) -> Result<Vec<HubForward>> {
-        let mut out = Vec::new();
-        let mut stmt = self.conn.prepare(
-            "SELECT op_id, owner_contact, member_contact, owner_share, doc_id
-             FROM hub_forwards WHERE op_id = ?1",
-        )?;
-        for id in op_ids {
-            let row: Option<(String, String, String, String, String)> = stmt
-                .query_row(params![id.to_string()], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-                })
-                .optional()?;
-            if let Some((op_id, owner_contact, member_contact, owner_share, doc_id)) = row {
-                out.push(HubForward {
-                    op_id: uuid_col(op_id, "hub_forwards.op_id")?,
-                    owner_contact: uuid_col(owner_contact, "hub_forwards.owner_contact")?,
-                    member_contact: uuid_col(member_contact, "hub_forwards.member_contact")?,
-                    owner_share: uuid_col(owner_share, "hub_forwards.owner_share")?,
-                    doc_id: uuid_col(doc_id, "hub_forwards.doc_id")?,
-                });
-            }
-        }
-        Ok(out)
-    }
-
-    fn add_hub_transfer(
-        &mut self,
-        member_contact: Uuid,
-        root_doc: Uuid,
-        title: &str,
-        doc_count: i64,
-    ) -> Result<HubTransfer> {
-        // one open offer per (member, root): a re-offer replaces it
-        self.conn.execute(
-            "DELETE FROM hub_transfers WHERE member_contact = ?1 AND root_doc = ?2 AND state = 'offered'",
-            params![member_contact.to_string(), root_doc.to_string()],
-        )?;
-        let id = Uuid::now_v7();
-        self.conn.execute(
-            "INSERT INTO hub_transfers (id, member_contact, root_doc, title, doc_count)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                id.to_string(),
-                member_contact.to_string(),
-                root_doc.to_string(),
-                title,
-                doc_count
-            ],
-        )?;
-        self.get_hub_transfer(id)
-    }
-
-    fn list_hub_transfers(&self) -> Result<Vec<HubTransfer>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {HUB_TRANSFER_COLS} FROM hub_transfers ORDER BY at"))?;
-        let rows = stmt.query_map([], hub_transfer_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(finish_hub_transfer)
-            .collect()
-    }
-
-    fn get_hub_transfer(&self, id: Uuid) -> Result<HubTransfer> {
-        self.conn
-            .query_row(
-                &format!("SELECT {HUB_TRANSFER_COLS} FROM hub_transfers WHERE id = ?1"),
-                params![id.to_string()],
-                hub_transfer_row,
-            )
-            .optional()?
-            .map(finish_hub_transfer)
-            .transpose()?
-            .ok_or_else(|| StoreError::NotFound(format!("transfer {id}")))
-    }
-
-    fn set_hub_transfer_state(&mut self, id: Uuid, state: HubTransferState) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE hub_transfers SET state = ?1 WHERE id = ?2",
-            params![state.as_str(), id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("transfer {id}")));
-        }
-        Ok(())
-    }
-
-    fn add_doc_transfer(
-        &mut self,
-        root_doc: Uuid,
-        counterparty: Uuid,
-        direction: TransferDirection,
-        state: &str,
-    ) -> Result<DocTransfer> {
-        if !matches!(state, "offered" | "done") {
-            return Err(StoreError::InvalidOp(format!("bad transfer state {state}")));
-        }
-        // one live record per (root, direction): a re-offer replaces an open one
-        self.conn.execute(
-            "DELETE FROM doc_transfers WHERE root_doc = ?1 AND direction = ?2 AND state = 'offered'",
-            params![root_doc.to_string(), direction.as_str()],
-        )?;
-        let id = Uuid::now_v7();
-        self.conn.execute(
-            "INSERT INTO doc_transfers (id, root_doc, counterparty, direction, state)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                id.to_string(),
-                root_doc.to_string(),
-                counterparty.to_string(),
-                direction.as_str(),
-                state
-            ],
-        )?;
-        Ok(self
-            .list_doc_transfers()?
-            .into_iter()
-            .find(|t| t.id == id)
-            .ok_or_else(|| StoreError::NotFound(format!("transfer {id}")))?)
-    }
-
-    fn list_doc_transfers(&self) -> Result<Vec<DocTransfer>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, root_doc, counterparty, direction, state, at FROM doc_transfers ORDER BY at",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-            ))
-        })?;
-        rows.map(|r| {
-            let (id, root_doc, counterparty, direction, state, at) = r?;
-            Ok(DocTransfer {
-                id: uuid_col(id, "doc_transfers.id")?,
-                root_doc: uuid_col(root_doc, "doc_transfers.root_doc")?,
-                counterparty: uuid_col(counterparty, "doc_transfers.counterparty")?,
-                direction: TransferDirection::parse(&direction).ok_or_else(|| {
-                    StoreError::InvalidOp(format!("bad transfer direction {direction}"))
-                })?,
-                state,
-                at,
-            })
-        })
-        .collect()
-    }
-
-    fn set_doc_transfer_state(&mut self, id: Uuid, state: &str) -> Result<()> {
-        if !matches!(state, "offered" | "done") {
-            return Err(StoreError::InvalidOp(format!("bad transfer state {state}")));
-        }
-        let n = self.conn.execute(
-            "UPDATE doc_transfers SET state = ?1 WHERE id = ?2",
-            params![state, id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("transfer {id}")));
-        }
-        Ok(())
-    }
-
-    fn set_invite_offered_to(&mut self, share_id: Uuid, contact: Uuid) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE share_invites SET offered_to = ?1
-             WHERE share_id = ?2 AND redeemed_at IS NULL",
-            params![contact.to_string(), share_id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("open invite for share {share_id}")));
-        }
-        Ok(())
-    }
-
-    fn invite_offered_to(&self, share_id: Uuid) -> Result<Option<Uuid>> {
-        let c: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT offered_to FROM share_invites
-                 WHERE share_id = ?1 AND redeemed_at IS NULL AND offered_to IS NOT NULL
-                 ORDER BY created_at DESC LIMIT 1",
-                params![share_id.to_string()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        c.map(|c| uuid_col(c, "share_invites.offered_to")).transpose()
-    }
-
-    fn add_share_offer(
-        &mut self,
-        from_contact: Uuid,
-        owner_node: &str,
-        share_id: Uuid,
-        root_title: &str,
-        permission: SharePermission,
-        secret: &str,
-        expires_at: &str,
-    ) -> Result<ShareOffer> {
-        let id = Uuid::now_v7();
-        self.conn.execute(
-            "INSERT INTO share_offers (id, from_contact, owner_node, share_id, root_title, permission, secret, state, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8)
-             ON CONFLICT(owner_node, share_id) DO UPDATE SET
-                 id = excluded.id, from_contact = excluded.from_contact, root_title = excluded.root_title,
-                 permission = excluded.permission, secret = excluded.secret, state = 'open',
-                 expires_at = excluded.expires_at, created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-            params![
-                id.to_string(),
-                from_contact.to_string(),
-                owner_node,
-                share_id.to_string(),
-                root_title,
-                permission.as_str(),
-                secret,
-                expires_at
-            ],
-        )?;
-        self.get_share_offer(id)
-    }
-
-    fn list_share_offers(&self, open_only: bool) -> Result<Vec<ShareOffer>> {
-        let sql = if open_only {
-            "SELECT id, from_contact, owner_node, share_id, root_title, permission, secret, state, created_at, expires_at
-             FROM share_offers WHERE state = 'open' ORDER BY created_at DESC"
-        } else {
-            "SELECT id, from_contact, owner_node, share_id, root_title, permission, secret, state, created_at, expires_at
-             FROM share_offers ORDER BY created_at DESC"
-        };
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map([], offer_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(finish_offer)
-            .collect()
-    }
-
-    fn get_share_offer(&self, id: Uuid) -> Result<ShareOffer> {
-        self.conn
-            .query_row(
-                "SELECT id, from_contact, owner_node, share_id, root_title, permission, secret, state, created_at, expires_at
-                 FROM share_offers WHERE id = ?1",
-                params![id.to_string()],
-                offer_row,
-            )
-            .optional()?
-            .map(finish_offer)
-            .transpose()?
-            .ok_or_else(|| StoreError::NotFound(format!("share offer {id}")))
-    }
-
-    fn set_share_offer_state(&mut self, id: Uuid, state: ShareOfferState) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE share_offers SET state = ?1 WHERE id = ?2",
-            params![state.as_str(), id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("share offer {id}")));
-        }
-        Ok(())
-    }
-
-    fn expire_share_offers(&mut self) -> Result<usize> {
-        Ok(self.conn.execute(
-            "UPDATE share_offers SET state = 'expired'
-             WHERE state = 'open' AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-            [],
-        )?)
-    }
-
-    fn clear_share_offers(&mut self) -> Result<usize> {
-        Ok(self.conn.execute(
-            "DELETE FROM share_offers WHERE state IN ('declined', 'expired')",
-            [],
-        )?)
-    }
-
-    fn queue_join(&mut self, ticket: &str) -> Result<Uuid> {
-        if let Some(existing) = self
-            .conn
-            .query_row(
-                "SELECT id FROM pending_joins WHERE ticket = ?1",
-                params![ticket],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            return uuid_col(existing, "pending_joins.id");
-        }
-        let id = Uuid::now_v7();
-        self.conn.execute(
-            "INSERT INTO pending_joins (id, ticket) VALUES (?1, ?2)",
-            params![id.to_string(), ticket],
-        )?;
-        Ok(id)
-    }
-
-    fn list_pending_joins(&self) -> Result<Vec<PendingJoin>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, ticket, attempts, last_error, created_at
-             FROM pending_joins ORDER BY created_at",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(|(id, ticket, attempts, last_error, created_at)| {
-                Ok(PendingJoin {
-                    id: uuid_col(id, "pending_joins.id")?,
-                    ticket,
-                    attempts,
-                    last_error,
-                    created_at,
-                })
-            })
-            .collect()
-    }
-
-    fn record_join_attempt(&mut self, id: Uuid, error: &str) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE pending_joins SET attempts = attempts + 1, last_error = ?1 WHERE id = ?2",
-            params![error, id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("pending join {id}")));
-        }
-        Ok(())
-    }
-
-    fn remove_pending_join(&mut self, id: Uuid) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM pending_joins WHERE id = ?1",
-            params![id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    fn upsert_mirror(
-        &mut self,
-        doc_id: Uuid,
-        owner: Uuid,
-        share_id: Uuid,
-        synced_epoch: i64,
-        permission: SharePermission,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO mirrors (doc_id, owner, share_id, synced_epoch, permission)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (doc_id) DO UPDATE SET
-                 owner = excluded.owner,
-                 share_id = excluded.share_id,
-                 synced_epoch = excluded.synced_epoch,
-                 permission = excluded.permission",
-            params![
-                doc_id.to_string(),
-                owner.to_string(),
-                share_id.to_string(),
-                synced_epoch,
-                permission.as_str()
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn rename_contact(&mut self, id: Uuid, petname: &str) -> Result<()> {
-        let petname = petname.trim();
-        if petname.is_empty() || petname.chars().count() > 64 {
-            return Err(StoreError::InvalidOp("petname must be 1..64 characters".into()));
-        }
-        let n = self.conn.execute(
-            "UPDATE contacts SET petname = ?1 WHERE id = ?2",
-            params![petname, id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("contact {id}")));
-        }
-        // the contact's Remote principal is how they appear in provenance and
-        // the review queue; it follows the owner's chosen name
-        self.conn.execute(
-            "UPDATE principals SET display_name = ?1
-             WHERE id = (SELECT principal FROM contacts WHERE id = ?2)",
-            params![petname, id.to_string()],
-        )?;
-        Ok(())
+        Ok(false)
     }
 
     fn stale_block_vectors(&self, limit: usize) -> Result<Vec<(Uuid, i64, String)>> {
@@ -3722,7 +2329,6 @@ impl BlockStore for SqliteStore {
              LEFT JOIN block_vec v ON v.block_id = b.id
              WHERE b.deleted = 0 AND b.block_type != 'comment'
                AND d.deleted = 0
-               AND NOT EXISTS (SELECT 1 FROM mirrors m WHERE m.doc_id = b.doc_id)
                AND (v.block_id IS NULL OR v.epoch < b.epoch)
              ORDER BY b.epoch DESC LIMIT ?1",
         )?;
@@ -3801,39 +2407,6 @@ impl BlockStore for SqliteStore {
         Ok(out)
     }
 
-    fn change_signature(&self) -> Result<ChangeSignature> {
-        // one cheap aggregate over docs + shares: enough to say "nothing an
-        // owner-side nudge could care about moved since last tick"
-        let (max_epoch, epoch_sum, doc_count): (i64, i64, i64) = self.conn.query_row(
-            "SELECT coalesce(max(current_epoch), 0), coalesce(sum(current_epoch), 0), count(*) FROM docs WHERE deleted = 0",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        let active_shares: i64 = self.conn.query_row(
-            "SELECT count(*) FROM shares WHERE state = 'active'",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(ChangeSignature {
-            max_epoch,
-            epoch_sum,
-            doc_count,
-            active_shares,
-        })
-    }
-
-    fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>> {
-        self.conn
-            .query_row(
-                &format!("SELECT {MIRROR_COLS} FROM mirrors WHERE doc_id = ?1"),
-                params![doc_id.to_string()],
-                mirror_row,
-            )
-            .optional()?
-            .map(finish_mirror)
-            .transpose()
-    }
-
     fn doc_is_tombstoned(&self, id: Uuid) -> Result<bool> {
         self.conn
             .query_row(
@@ -3843,271 +2416,6 @@ impl BlockStore for SqliteStore {
             )
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("doc {id}")))
-    }
-
-    fn undelete_doc(&mut self, id: Uuid) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE docs SET deleted = 0 WHERE id = ?1",
-            params![id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("doc {id}")));
-        }
-        Ok(())
-    }
-
-    fn set_mirror_owner_epoch(&mut self, doc_id: Uuid, owner_epoch: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE mirrors SET owner_epoch = ?1 WHERE doc_id = ?2",
-            params![owner_epoch, doc_id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    fn set_mirror_tended(&mut self, doc_id: Uuid, tended: bool) -> Result<()> {
-        self.conn.execute(
-            "UPDATE mirrors SET owner_tended = ?1 WHERE doc_id = ?2",
-            params![tended, doc_id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    fn set_mirror_origin(
-        &mut self,
-        doc_id: Uuid,
-        origin_owner: Option<&str>,
-        origin_owner_name: Option<&str>,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE mirrors SET origin_owner = ?1, origin_owner_name = ?2 WHERE doc_id = ?3",
-            params![origin_owner, origin_owner_name, doc_id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    // --- hub membership + publications (slice 1) ---
-
-    fn set_contact_role(&mut self, id: Uuid, role: ContactRole) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE contacts SET role = ?1 WHERE id = ?2",
-            params![role.as_str(), id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("contact {id}")));
-        }
-        Ok(())
-    }
-
-    fn set_contact_membership(&mut self, id: Uuid, membership: Membership) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE contacts SET membership = ?1 WHERE id = ?2",
-            params![membership.as_str(), id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("contact {id}")));
-        }
-        Ok(())
-    }
-
-    fn set_contact_is_hub(&mut self, id: Uuid, is_hub: bool) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE contacts SET is_hub = ?1 WHERE id = ?2",
-            params![is_hub, id.to_string()],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound(format!("contact {id}")));
-        }
-        Ok(())
-    }
-
-    fn add_hub_publication(&mut self, share_id: Uuid, member_contact: Uuid, root_doc: Uuid) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO hub_publications (share_id, member_contact, root_doc) VALUES (?1, ?2, ?3)
-             ON CONFLICT (share_id) DO UPDATE SET
-                 member_contact = excluded.member_contact,
-                 root_doc = excluded.root_doc",
-            params![share_id.to_string(), member_contact.to_string(), root_doc.to_string()],
-        )?;
-        Ok(())
-    }
-
-    fn list_hub_publications(&self) -> Result<Vec<HubPublication>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT share_id, member_contact, root_doc, published_at
-             FROM hub_publications ORDER BY published_at",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?;
-        rows.map(|r| {
-            let (share_id, member_contact, root_doc, published_at) = r?;
-            Ok(HubPublication {
-                share_id: uuid_col(share_id, "hub_publications.share_id")?,
-                member_contact: uuid_col(member_contact, "hub_publications.member_contact")?,
-                root_doc: uuid_col(root_doc, "hub_publications.root_doc")?,
-                published_at,
-            })
-        })
-        .collect()
-    }
-
-    fn remove_hub_publication(&mut self, share_id: Uuid) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM hub_publications WHERE share_id = ?1",
-            params![share_id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    /// True if a gardener tends this doc or any ancestor (recursive
-    /// containment, the same rule the tend panel uses). Disabled gardeners
-    /// don't count.
-    fn doc_is_tended(&self, doc_id: Uuid) -> Result<bool> {
-        let scopes: std::collections::HashSet<Uuid> = self
-            .list_gardeners()?
-            .into_iter()
-            .filter(|g| g.enabled)
-            .filter_map(|g| g.scope_doc)
-            .collect();
-        if scopes.is_empty() {
-            return Ok(false);
-        }
-        let mut cur = Some(doc_id);
-        while let Some(id) = cur {
-            if scopes.contains(&id) {
-                return Ok(true);
-            }
-            cur = self.get_doc(id).ok().and_then(|d| d.parent_id);
-        }
-        Ok(false)
-    }
-
-    fn list_mirrors(&self) -> Result<Vec<Mirror>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {MIRROR_COLS} FROM mirrors ORDER BY doc_id"))?;
-        let rows = stmt.query_map([], mirror_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(finish_mirror)
-            .collect()
-    }
-
-    fn remove_mirror(&mut self, doc_id: Uuid) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM mirrors WHERE doc_id = ?1",
-            params![doc_id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    fn doc_blocks_flat(&self, doc_id: Uuid) -> Result<Vec<Block>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {BLOCK_COLS} FROM blocks
-             WHERE doc_id = ?1 AND deleted = 0 ORDER BY order_key"
-        ))?;
-        let rows = stmt.query_map(params![doc_id.to_string()], row_to_block)?;
-        rows.map(|r| build_block(r?)).collect()
-    }
-
-    fn mirror_replace_blocks(
-        &mut self,
-        doc_id: Uuid,
-        blocks: Vec<MirrorBlock>,
-        owner_epoch: i64,
-        principal: Uuid,
-    ) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        // clear the old projection outright: a mirror is a replica, not a
-        // ledger — tombstones and ops describe the OWNER's history, which
-        // lives on the owner's instance
-        {
-            let mut stmt = tx.prepare("SELECT id FROM blocks WHERE doc_id = ?1")?;
-            let old_ids: Vec<String> = stmt
-                .query_map(params![doc_id.to_string()], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            for id in old_ids {
-                tx.execute("DELETE FROM edges WHERE from_block = ?1", params![id])?;
-                tx.execute("DELETE FROM doc_tags WHERE block_id = ?1", params![id])?;
-            }
-        }
-        // embeddings go with their blocks (belt: the FK also cascades since
-        // the block_vec rebuild, but a pre-rebuild table must not fail here)
-        tx.execute(
-            "DELETE FROM block_vec WHERE block_id IN (SELECT id FROM blocks WHERE doc_id = ?1)",
-            params![doc_id.to_string()],
-        )?;
-        tx.execute(
-            "DELETE FROM blocks WHERE doc_id = ?1",
-            params![doc_id.to_string()],
-        )?;
-        // blocks.parent_id REFERENCES blocks(id): parents must exist before
-        // their children. The wire order is order_key (per-sibling), which
-        // says nothing about depth — a paragraph under a heading can arrive
-        // before the heading and fail the FK, leaving a doc with a title and
-        // no content. Insert in topological order; defer FK checks to commit
-        // so a genuinely dangling parent still fails loudly rather than by
-        // accident of ordering.
-        tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
-        let ids: std::collections::HashSet<Uuid> = blocks.iter().map(|b| b.id).collect();
-        let mut placed: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        let mut ordered: Vec<&MirrorBlock> = Vec::with_capacity(blocks.len());
-        let mut remaining: Vec<&MirrorBlock> = blocks.iter().collect();
-        while !remaining.is_empty() {
-            let before = remaining.len();
-            remaining.retain(|b| {
-                let ready = match b.parent_id {
-                    None => true,
-                    // parent outside this doc's block set: treat as root-ready
-                    Some(p) => placed.contains(&p) || !ids.contains(&p),
-                };
-                if ready {
-                    placed.insert(b.id);
-                    ordered.push(b);
-                }
-                !ready
-            });
-            if remaining.len() == before {
-                // cycle in parent links: never valid; insert what's left as-is
-                // and let the deferred FK check report it
-                ordered.extend(remaining.drain(..));
-            }
-        }
-        for b in ordered {
-            tx.execute(
-                "INSERT INTO blocks (id, doc_id, parent_id, order_key, block_type,
-                                     content, created_by, epoch, refers_to)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    b.id.to_string(),
-                    doc_id.to_string(),
-                    b.parent_id.map(|p| p.to_string()),
-                    b.order_key,
-                    b.block_type.as_str(),
-                    b.content,
-                    principal.to_string(),
-                    owner_epoch,
-                    b.refers_to.map(|r| r.to_string()),
-                ],
-            )?;
-            set_edges(&tx, b.id, &b.content)?;
-            set_tags(&tx, doc_id, b.id, &b.content)?;
-        }
-        tx.execute(
-            "UPDATE docs SET current_epoch = ?1 WHERE id = ?2",
-            params![owner_epoch, doc_id.to_string()],
-        )?;
-        tx.execute(
-            "UPDATE mirrors SET synced_epoch = ?1 WHERE doc_id = ?2",
-            params![owner_epoch, doc_id.to_string()],
-        )?;
-        tx.commit()?;
-        Ok(())
     }
 
     fn resolve(
@@ -4143,10 +2451,10 @@ impl BlockStore for SqliteStore {
         let op = build_op(raw_op)?;
 
         // the trust invariant (§3.4): proposer ≠ approver, enforced at the
-        // gate — for AGENT and REMOTE principals, whose autonomy it bounds.
-        // The instance's human owner is exempt: their own stale edit that the
-        // gate parked red (an autosave that raced a live session, a second
-        // window) is theirs to accept or drop, and there is no one else to
+        // gate — for AGENT principals, whose autonomy it bounds. The
+        // instance's human owner is exempt: their own stale edit that the
+        // gate parked red (an autosave that raced another window or device)
+        // is theirs to accept or drop, and there is no one else to
         // do it — without this exemption those items are stuck forever.
         if op.principal == reviewer {
             let kind: String = tx.query_row(
@@ -4168,7 +2476,6 @@ impl BlockStore for SqliteStore {
         if doc_op {
             receipt = resolve_doc_op(
                 &tx,
-                &self.frozen,
                 doc_id,
                 annotation_id,
                 &op,
@@ -4293,12 +2600,11 @@ impl BlockStore for SqliteStore {
 /// Resolve an annotation whose op is a doc op. Yellow accept: nothing to do.
 /// Yellow decline: apply the inverse (rename back + links back, move back,
 /// status back) as a green op by the reviewer. Red accept (delete_doc): trash
-/// the subtree now, refused while any doc in it is frozen. Red decline:
-/// closed, never applied. No epoch bump in any case.
+/// the subtree now. Red decline: closed, never applied. No epoch bump in
+/// any case.
 #[expect(clippy::too_many_arguments)]
 fn resolve_doc_op(
     tx: &Transaction,
-    frozen: &Option<FrozenProbe>,
     doc_id: Uuid,
     annotation_id: Uuid,
     op: &LedgerOp,
@@ -4316,15 +2622,14 @@ fn resolve_doc_op(
             let mut note = String::new();
             if let OpKind::RenameDoc { title, from_title } = &inverse {
                 // links were rewritten from_title → title on propose; put them back
-                let (n, deferred) = rewrite_inbound_links_tx(
+                let n = rewrite_inbound_links_tx(
                     tx,
-                    frozen,
                     from_title,
                     title,
                     reviewer,
                     &format!("rename:{from_title} → {title}"),
                 )?;
-                note = format!("links_rewritten:{n} links_deferred_hot:{deferred}");
+                note = format!("links_rewritten:{n}");
             }
             let inv_id = Uuid::now_v7();
             let mut source_refs = vec![format!("review:decline:{annotation_id}")];
@@ -4354,16 +2659,6 @@ fn resolve_doc_op(
             }))
         }
         (AnnotationKind::Parked, ReviewDecision::Accept) => {
-            if matches!(op.kind, OpKind::DeleteDoc { .. }) {
-                for d in subtree_ids_conn(tx, doc_id)? {
-                    if frozen.as_ref().is_some_and(|p| p(d)) {
-                        let title = get_doc_conn(tx, d).map(|d| d.title).unwrap_or_default();
-                        return Err(StoreError::InvalidOp(format!(
-                            "“{title}” is in a live session — end it before trashing"
-                        )));
-                    }
-                }
-            }
             project_doc_op(tx, doc_id, &op.kind)?;
             tx.execute(
                 "UPDATE ops SET epoch_applied = ?1 WHERE id = ?2",
@@ -4401,17 +2696,6 @@ fn doc_is_live(conn: &Connection, id: Uuid) -> Result<bool> {
         .unwrap_or(false))
 }
 
-fn is_mirror_conn(conn: &Connection, doc_id: Uuid) -> Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT 1 FROM mirrors WHERE doc_id = ?1",
-            params![doc_id.to_string()],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
-}
-
 /// Blocks whose [[wikilinks]] point at `title` (exact or path form):
 /// (block_id, doc_id, content).
 fn linking_blocks_conn(conn: &Connection, title: &str) -> Result<Vec<(Uuid, Uuid, String)>> {
@@ -4442,33 +2726,23 @@ fn linking_blocks_conn(conn: &Connection, title: &str) -> Result<Vec<(Uuid, Uuid
 
 /// Rewrite every inbound [[wikilink]] from `old` to `new` as green replaces
 /// by `principal`, one epoch per linking doc (the same rule as the human
-/// rename in the API): mirrors are the owner's (their pull brings the new
-/// title) and frozen (hot) docs are the session's — both skipped. Returns
-/// (blocks rewritten, blocks deferred because their doc was hot).
+/// rename in the API). Returns how many blocks were rewritten.
 fn rewrite_inbound_links_tx(
     tx: &Transaction,
-    frozen: &Option<FrozenProbe>,
     old: &str,
     new: &str,
     principal: Uuid,
     source_ref: &str,
-) -> Result<(usize, usize)> {
+) -> Result<usize> {
     if old == new {
-        return Ok((0, 0));
+        return Ok(0);
     }
     let mut by_doc: std::collections::HashMap<Uuid, Vec<(Uuid, String)>> = Default::default();
     for (block, doc, content) in linking_blocks_conn(tx, old)? {
         by_doc.entry(doc).or_default().push((block, content));
     }
-    let (mut rewritten, mut deferred) = (0usize, 0usize);
+    let mut rewritten = 0usize;
     for (doc, blocks) in by_doc {
-        if is_mirror_conn(tx, doc)? {
-            continue;
-        }
-        if frozen.as_ref().is_some_and(|p| p(doc)) {
-            deferred += blocks.len();
-            continue;
-        }
         let ops: Vec<OpInput> = blocks
             .into_iter()
             .filter_map(|(block, content)| {
@@ -4489,7 +2763,7 @@ fn rewrite_inbound_links_tx(
         let current = doc_epoch(tx, doc)?;
         apply_in_tx(tx, doc, current, principal, ops)?;
     }
-    Ok((rewritten, deferred))
+    Ok(rewritten)
 }
 
 const OP_COLS: &str = "id, doc_id, payload, principal, base_epoch, epoch_applied, verdict, confidence, prior, source_refs";
@@ -4797,7 +3071,7 @@ impl SqliteStore {
             .ok_or_else(|| StoreError::NotFound(format!("doc {doc_id}")))
     }
 
-    /// Owned docs (no mirrors) that carry content, never-verified first, then
+    /// Docs that carry content, never-verified first, then
     /// oldest `verified_at`. `last_edited` is the newest applied op's time
     /// (falling back to the doc's creation time).
     pub fn freshness(&self, limit: usize, tended_only: bool) -> Result<Vec<FreshnessRow>> {
@@ -4806,8 +3080,7 @@ impl SqliteStore {
                     COALESCE((SELECT max(o.created_at) FROM ops o
                               WHERE o.doc_id = d.id AND o.epoch_applied IS NOT NULL), d.created_at)
              FROM docs d
-             LEFT JOIN mirrors m ON m.doc_id = d.id
-             WHERE d.deleted = 0 AND m.doc_id IS NULL
+             WHERE d.deleted = 0
                AND EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0
                            AND b.block_type != 'comment')
              ORDER BY d.verified_at IS NOT NULL, d.verified_at, d.title",
@@ -4991,20 +3264,6 @@ impl SqliteStore {
         rows.map(|r| build_op(r?)).collect()
     }
 
-    /// Hub side: drop forward records older than `older_than_days`. A forward
-    /// carries no outcome of its own (the owner's op and annotation do), so
-    /// age is the only terminal signal; the member's status handle for a
-    /// pruned forward then answers "unknown" instead of asking the owner.
-    /// Returns how many rows went.
-    pub fn prune_hub_forwards(&mut self, older_than_days: u32) -> Result<usize> {
-        let n = self.conn.execute(
-            "DELETE FROM hub_forwards
-             WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
-            params![format!("-{older_than_days} days")],
-        )?;
-        Ok(n)
-    }
-
     /// Docs whose content is a canvas scene (for tree/type badges).
     pub fn canvas_doc_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
@@ -5128,20 +3387,6 @@ fn fts_query(q: &str) -> Option<String> {
 }
 
 impl SqliteStore {
-    /// Mirror docs are read-only replicas at the store layer (#59): every
-    /// local content write is refused, whatever the surface. The propose
-    /// permission (#60) ships edits UPSTREAM instead — it never writes the
-    /// local projection directly. The sync path itself uses
-    /// mirror_replace_blocks, which bypasses this by construction.
-    fn reject_if_mirror(&self, doc_id: Uuid) -> Result<()> {
-        if self.get_mirror(doc_id)?.is_some() {
-            return Err(StoreError::InvalidOp(
-                "mirror doc is read-only: it is synced from a remote owner".into(),
-            ));
-        }
-        Ok(())
-    }
-
     fn propose_impl(
         &mut self,
         doc_id: Uuid,
@@ -5150,7 +3395,6 @@ impl SqliteStore {
         ops: Vec<OpInput>,
         cap_review: bool,
     ) -> Result<ProposeOutcome> {
-        self.reject_if_mirror(doc_id)?;
         if ops.is_empty() {
             return Err(StoreError::InvalidOp("propose: empty op list".into()));
         }
@@ -5274,7 +3518,7 @@ impl SqliteStore {
 }
 
 /// Doc ops (AX slice B) at the store boundary: ledger shape, gate rules,
-/// the frozen probe, the ops CHECK migration, and the optional insert id.
+/// link rewrites, the ops CHECK migration, and the optional insert id.
 #[cfg(test)]
 mod doc_op_tests {
     use super::*;
@@ -5304,7 +3548,7 @@ mod doc_op_tests {
             )
             .unwrap();
         assert_eq!(out.epoch, epoch_before);
-        assert_eq!(s.get_doc(d).unwrap().current_epoch, epoch_before, "hot sessions freeze the epoch");
+        assert_eq!(s.get_doc(d).unwrap().current_epoch, epoch_before, "doc ops never bump the epoch");
         assert_eq!(s.get_doc(d).unwrap().title, "New", "trimmed");
         let ops = s.ops_since(d, epoch_before - 1).unwrap();
         let op = ops.iter().find(|o| o.kind.is_doc_op()).expect("ledgered");
@@ -5318,21 +3562,6 @@ mod doc_op_tests {
         assert_eq!(s.get_doc(d).unwrap().title, "New");
         let (_, status, who) = &s.proposal_outcomes(bot, 5).unwrap()[0];
         assert_eq!((status.as_deref(), who.as_deref()), (Some("accepted"), Some("tom")));
-    }
-
-    #[test]
-    fn frozen_docs_defer_link_rewrites() {
-        let (mut s, tom, bot) = setup();
-        let d = s.create_doc("Old", None, tom).unwrap();
-        let (hot_linker, _) = import_markdown(&mut s, "hot", None, tom, "[[Old]]").unwrap();
-        let (cold_linker, _) = import_markdown(&mut s, "cold", None, tom, "[[Old]]").unwrap();
-        s.set_frozen_probe(Box::new(move |id| id == hot_linker));
-        let out = s
-            .propose_doc_op(d.id, bot, OpKind::RenameDoc { title: "New".into(), from_title: String::new() }, vec![])
-            .unwrap();
-        assert!(out.verdicts[0].note.contains("1 inbound link block(s) rewritten, 1 deferred"), "{}", out.verdicts[0].note);
-        assert_eq!(crate::export::export_doc(&s, hot_linker).unwrap().trim(), "[[Old]]");
-        assert_eq!(crate::export::export_doc(&s, cold_linker).unwrap().trim(), "[[New]]");
     }
 
     #[test]
@@ -5437,44 +3666,178 @@ mod doc_op_tests {
 mod tests {
     use super::*;
 
-    /// Epochs are per doc: editing a doc whose epoch stays below the global
-    /// max must still move the change signature (the realtime nudge relies
-    /// on it), which `max(current_epoch)` alone never did.
-    #[test]
-    fn change_signature_moves_on_a_lower_epoch_doc_edit() {
-        use crate::PrincipalKind;
-        let mut s = SqliteStore::open_in_memory().unwrap();
-        let tom = s.create_principal(PrincipalKind::Human, "Tom", None).unwrap();
-        let ins = |content: &str| OpInput {
-            kind: OpKind::Insert {
-                block_id: Uuid::now_v7(),
-                parent_id: None,
-                order_key: "".into(),
-                block_type: BlockType::Paragraph,
-                content: content.into(),
-                refers_to: None,
-            },
-            source_refs: vec![],
-        };
-        let high = s.create_doc("high", None, tom.id).unwrap();
-        let low = s.create_doc("low", None, tom.id).unwrap();
-        // high: epochs 1..=3; low: epoch 1
-        for e in 0..3 {
-            s.apply(high.id, e, tom.id, vec![ins("h")]).unwrap();
-        }
-        s.apply(low.id, 0, tom.id, vec![ins("l")]).unwrap();
-        let before = s.change_signature().unwrap();
-        assert_eq!(before.max_epoch, 3);
-        // bump the lower doc to epoch 2: the max is unchanged, the sum is not
-        s.apply(low.id, 1, tom.id, vec![ins("l2")]).unwrap();
-        let after = s.change_signature().unwrap();
-        assert_eq!(after.max_epoch, before.max_epoch, "max alone cannot see this edit");
-        assert_ne!(after, before, "signature must move on any single-doc epoch bump");
-        assert_eq!(after.epoch_sum, before.epoch_sum + 1);
-    }
-
     /// A move without a client key appends under the new parent instead of
     /// re-NULLing the key; a malformed key is refused.
+    /// v7: the federation tables of an old database are dropped on open —
+    /// rows and all, children before parents, with foreign keys on — and
+    /// hub settings go with them; docs, blocks, ops and other settings stay.
+    #[test]
+    fn opening_a_db_with_federation_tables_drops_them() {
+        use crate::{BlockStore, PrincipalKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ks.db");
+        let (doc, tom) = {
+            let mut s = SqliteStore::open(&path).unwrap();
+            let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+            let (doc, _) = crate::import::import_markdown(&mut s, "Shared", None, tom, "# A\n\nbody\n").unwrap();
+            s.conn.execute_batch(FEDERATION_DDL).unwrap();
+            let peer = Uuid::now_v7();
+            s.conn
+                .execute_batch(&format!(
+                    "INSERT INTO principals (id, kind, display_name, pubkey) VALUES ('{peer}', 'remote', 'alice', 'k1');
+                     INSERT INTO contacts (id, pubkey, petname, principal) VALUES ('c1', 'k1', 'alice', '{peer}');
+                     INSERT INTO shares (id, root_doc, contact, state) VALUES ('s1', '{doc}', 'c1', 'active');
+                     INSERT INTO share_invites (id, share_id, secret_hash, expires_at, redeemed_by)
+                         VALUES ('i1', 's1', 'h', '2099-01-01', 'c1');
+                     INSERT INTO share_offers (id, from_contact, owner_node, share_id, root_title, permission, secret, expires_at)
+                         VALUES ('o1', 'c1', 'k1', 's9', 'T', 'view', 'x', '2099-01-01');
+                     INSERT INTO mirrors (doc_id, owner, share_id) VALUES ('{doc}', 'c1', 's9');
+                     INSERT INTO hub_publications (share_id, member_contact, root_doc) VALUES ('s2', 'c1', '{doc}');
+                     INSERT INTO hub_forwards (op_id, owner_contact, member_contact, owner_share, doc_id)
+                         VALUES ('op1', 'c1', 'c1', 's1', '{doc}');
+                     INSERT INTO hub_transfers (id, member_contact, root_doc, title) VALUES ('t1', 'c1', '{doc}', 'T');
+                     INSERT INTO doc_transfers (id, root_doc, counterparty, direction) VALUES ('d1', '{doc}', 'c1', 'out');
+                     INSERT INTO pending_joins (id, ticket) VALUES ('j1', 'ticket');
+                     INSERT INTO outbound_proposals (id, doc_id, share_id, owner, op_ids)
+                         VALUES ('ob1', '{doc}', 's9', 'c1', '[]');
+                     INSERT INTO settings (key, value) VALUES ('hub.enabled', 'x'), ('hub.name', 'Team'), ('log.level', 'info');"
+                ))
+                .unwrap();
+            (doc, tom)
+        };
+        let count = |s: &SqliteStore, sql: &str| -> i64 { s.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        let s = SqliteStore::open(&path).unwrap();
+        for t in FEDERATION_TABLES {
+            let n = count(&s, &format!("SELECT count(*) FROM sqlite_master WHERE name = '{t}'"));
+            assert_eq!(n, 0, "{t} still there");
+        }
+        assert_eq!(count(&s, "SELECT count(*) FROM settings WHERE key LIKE 'hub.%'"), 0);
+        assert_eq!(s.get_setting("log.level").unwrap().as_deref(), Some("info"));
+        assert_eq!(count(&s, "SELECT count(*) FROM pragma_foreign_key_check"), 0);
+        // the content and its provenance are untouched, remote principal included
+        assert_eq!(s.read_doc(doc).unwrap().roots.len(), 1, "the heading, its paragraph nested");
+        assert_eq!(s.ops_since(doc, 0).unwrap().len(), 2);
+        assert_eq!(s.list_principals().unwrap().len(), 2);
+        let _ = tom;
+        drop(s);
+        // a second open is a no-op
+        SqliteStore::open(&path).unwrap();
+    }
+
+    const FEDERATION_DDL: &str = "
+CREATE TABLE IF NOT EXISTS contacts (
+    id        TEXT PRIMARY KEY,
+    pubkey    TEXT NOT NULL UNIQUE,
+    petname   TEXT NOT NULL,
+    principal TEXT NOT NULL REFERENCES principals (id),
+    verified  INTEGER NOT NULL DEFAULT 0,
+    revoked   INTEGER NOT NULL DEFAULT 0,
+    paired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    role       TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('member', 'admin')),
+    membership TEXT NOT NULL DEFAULT 'active' CHECK (membership IN ('pending', 'active', 'ejected')),
+    is_hub     INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS shares (
+    id         TEXT PRIMARY KEY,
+    root_doc   TEXT NOT NULL REFERENCES docs (id),
+    contact    TEXT REFERENCES contacts (id),
+    permission TEXT NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'propose')),
+    state      TEXT NOT NULL DEFAULT 'offered' CHECK (state IN ('offered', 'active', 'revoked')),
+    policy_override TEXT CHECK (policy_override IN ('human-review', 'agent-review', 'auto')),
+    trust      TEXT NOT NULL DEFAULT 'review' CHECK (trust IN ('review', 'yellow', 'green')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS shares_by_contact ON shares (contact);
+CREATE TABLE IF NOT EXISTS share_invites (
+    id          TEXT PRIMARY KEY,
+    share_id    TEXT NOT NULL REFERENCES shares (id),
+    secret_hash TEXT NOT NULL UNIQUE,
+    expires_at  TEXT NOT NULL,
+    redeemed_by TEXT REFERENCES contacts (id),
+    redeemed_at TEXT,
+    offered_to  TEXT REFERENCES contacts (id),
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE TABLE IF NOT EXISTS share_offers (
+    id           TEXT PRIMARY KEY,
+    from_contact TEXT NOT NULL REFERENCES contacts (id),
+    owner_node   TEXT NOT NULL,
+    share_id     TEXT NOT NULL,
+    root_title   TEXT NOT NULL,
+    permission   TEXT NOT NULL CHECK (permission IN ('view', 'propose')),
+    secret       TEXT NOT NULL,
+    state        TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'accepted', 'declined', 'expired')),
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    expires_at   TEXT NOT NULL,
+    UNIQUE (owner_node, share_id)
+);
+CREATE TABLE IF NOT EXISTS mirrors (
+    doc_id       TEXT PRIMARY KEY REFERENCES docs (id),
+    owner        TEXT NOT NULL REFERENCES contacts (id),
+    share_id     TEXT NOT NULL,
+    synced_epoch INTEGER NOT NULL DEFAULT 0,
+    permission   TEXT NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'propose')),
+    owner_tended INTEGER NOT NULL DEFAULT 0,
+    last_pulled_at TEXT,
+    last_error     TEXT,
+    owner_epoch  INTEGER NOT NULL DEFAULT 0,
+    origin_owner      TEXT,
+    origin_owner_name TEXT
+);
+CREATE TABLE IF NOT EXISTS hub_publications (
+    share_id       TEXT PRIMARY KEY,
+    member_contact TEXT NOT NULL REFERENCES contacts (id),
+    root_doc       TEXT NOT NULL,
+    published_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE TABLE IF NOT EXISTS hub_forwards (
+    op_id          TEXT PRIMARY KEY,
+    owner_contact  TEXT NOT NULL REFERENCES contacts (id),
+    member_contact TEXT NOT NULL REFERENCES contacts (id),
+    owner_share    TEXT NOT NULL,
+    doc_id         TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS hub_forwards_by_created ON hub_forwards (created_at);
+CREATE TABLE IF NOT EXISTS hub_transfers (
+    id             TEXT PRIMARY KEY,
+    member_contact TEXT NOT NULL REFERENCES contacts (id),
+    root_doc       TEXT NOT NULL,
+    title          TEXT NOT NULL,
+    doc_count      INTEGER NOT NULL DEFAULT 0,
+    state          TEXT NOT NULL DEFAULT 'offered'
+        CHECK (state IN ('offered', 'accepted', 'declined', 'done')),
+    at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE TABLE IF NOT EXISTS doc_transfers (
+    id           TEXT PRIMARY KEY,
+    root_doc     TEXT NOT NULL,
+    counterparty TEXT NOT NULL REFERENCES contacts (id),
+    direction    TEXT NOT NULL CHECK (direction IN ('out', 'in')),
+    state        TEXT NOT NULL DEFAULT 'offered' CHECK (state IN ('offered', 'done')),
+    at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS doc_transfers_by_root ON doc_transfers (root_doc);
+CREATE TABLE IF NOT EXISTS pending_joins (
+    id         TEXT PRIMARY KEY,
+    ticket     TEXT NOT NULL UNIQUE,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE TABLE IF NOT EXISTS outbound_proposals (
+    id         TEXT PRIMARY KEY,
+    doc_id     TEXT NOT NULL REFERENCES docs (id),
+    share_id   TEXT NOT NULL,
+    owner      TEXT NOT NULL REFERENCES contacts (id),
+    op_ids     TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    state      TEXT NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'accepted', 'declined', 'mixed')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+";
+
     #[test]
     fn move_doc_without_key_appends_and_rejects_invalid_keys() {
         use crate::PrincipalKind;
@@ -5554,48 +3917,6 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
         backfill(&s.conn).unwrap();
         assert_eq!(key(a.id), ka, "idempotent");
-    }
-
-    /// prune_hub_forwards deletes by age only: a 40-day-old forward goes at
-    /// the 30-day cutoff, a fresh one and a 20-day-old one stay; 0 days
-    /// prunes everything already in the past.
-    #[test]
-    fn prune_hub_forwards_deletes_by_age() {
-        use crate::PrincipalKind;
-        let mut s = SqliteStore::open_in_memory().unwrap();
-        let tom = s
-            .create_principal(PrincipalKind::Human, "Tom", None)
-            .unwrap();
-        let doc = s.create_doc("d", None, tom.id).unwrap();
-        let owner = s.pair_contact(&"a".repeat(64), "owner").unwrap();
-        let member = s.pair_contact(&"b".repeat(64), "member").unwrap();
-        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
-        for id in &ids {
-            s.add_hub_forward(*id, owner.id, member.id, Uuid::now_v7(), doc.id)
-                .unwrap();
-        }
-        for (id, days) in [(ids[0], 40), (ids[1], 20)] {
-            s.conn
-                .execute(
-                    "UPDATE hub_forwards
-                     SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)
-                     WHERE op_id = ?2",
-                    params![format!("-{days} days"), id.to_string()],
-                )
-                .unwrap();
-        }
-        assert_eq!(s.prune_hub_forwards(30).unwrap(), 1);
-        let left = s.hub_forwards_for(&ids).unwrap();
-        assert_eq!(left.len(), 2);
-        assert!(left.iter().all(|f| f.op_id != ids[0]), "the 40-day row went");
-        assert_eq!(s.prune_hub_forwards(30).unwrap(), 0, "idempotent");
-        // 0 days: everything strictly in the past goes (the fresh row may
-        // share the cutoff's millisecond and legitimately survive)
-        assert!(s.prune_hub_forwards(0).unwrap() >= 1);
-        assert!(
-            s.hub_forwards_for(&ids).unwrap().iter().all(|f| f.op_id != ids[1]),
-            "the 20-day row went"
-        );
     }
 
     /// ops_for_doc_limited equals "ops_since(doc, 0), reversed, truncated"
@@ -5685,142 +4006,6 @@ mod tests {
             )
             .unwrap();
         assert!(plan.contains("blocks_by_refers_to"), "{plan}");
-    }
-
-    /// Hub slice 2 bookkeeping: on-behalf-of principals, forward records,
-    /// hub-side transfer offers, and the two-sided transfer ledger.
-    #[test]
-    fn hub_slice_2_tables_round_trip() {
-        use crate::PrincipalKind;
-        let mut s = SqliteStore::open_in_memory().unwrap();
-        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
-        let hub = s.pair_contact(&"aa".repeat(32), "Team").unwrap();
-        let bob_key = "bb".repeat(32);
-        // a stranger's principal is created once, keyed by pubkey, no contact row
-        let p1 = s.remote_principal_for(&bob_key, "bob").unwrap();
-        let p2 = s.remote_principal_for(&bob_key, "robert").unwrap();
-        assert_eq!(p1, p2, "same pubkey → same principal");
-        assert_eq!(s.get_principal(p1).unwrap().display_name, "bob", "first name sticks");
-        assert!(s.contact_by_pubkey(&bob_key).unwrap().is_none(), "no contact row");
-        // a known contact's principal is reused
-        assert_eq!(s.remote_principal_for(&hub.pubkey, "x").unwrap(), hub.principal);
-        // empty name never yields an empty principal
-        let anon = s.remote_principal_for(&"cc".repeat(32), "  ").unwrap();
-        assert_eq!(s.get_principal(anon).unwrap().display_name, "someone");
-
-        // op_statuses carries source_refs
-        let doc = s.create_doc("d", None, tom.id).unwrap();
-        let ids = s
-            .park(
-                doc.id,
-                p1,
-                vec![OpInput {
-                    kind: OpKind::Insert {
-                        block_id: Uuid::now_v7(),
-                        parent_id: None,
-                        order_key: "a".into(),
-                        block_type: BlockType::Paragraph,
-                        content: "hi".into(),
-                        refers_to: None,
-                    },
-                    source_refs: vec!["via hub: Team".into()],
-                }],
-                "n",
-            )
-            .unwrap();
-        let st = s.op_statuses(&ids).unwrap();
-        assert_eq!(st.len(), 1);
-        assert!(st[0].source_refs.contains(&"via hub: Team".to_string()));
-        assert_eq!(st[0].review.as_deref(), Some("open"));
-
-        // forwards: owner op id → (owner, member, share)
-        let member = s.pair_contact(&bob_key, "bob").unwrap();
-        let share = Uuid::now_v7();
-        s.add_hub_forward(ids[0], hub.id, member.id, share, doc.id).unwrap();
-        let f = s.hub_forwards_for(&[ids[0], Uuid::now_v7()]).unwrap();
-        assert_eq!(f.len(), 1, "unknown ids skipped");
-        assert_eq!((f[0].owner_contact, f[0].member_contact, f[0].owner_share, f[0].doc_id), (hub.id, member.id, share, doc.id));
-
-        // hub transfers: one open offer per (member, root); state moves
-        let t1 = s.add_hub_transfer(member.id, doc.id, "d", 3).unwrap();
-        assert_eq!((t1.state, t1.doc_count, t1.title.as_str()), (HubTransferState::Offered, 3, "d"));
-        let t2 = s.add_hub_transfer(member.id, doc.id, "d2", 4).unwrap();
-        assert_ne!(t1.id, t2.id);
-        assert_eq!(s.list_hub_transfers().unwrap().len(), 1, "re-offer replaced the open one");
-        assert!(s.get_hub_transfer(t1.id).is_err());
-        s.set_hub_transfer_state(t2.id, HubTransferState::Done).unwrap();
-        assert_eq!(s.get_hub_transfer(t2.id).unwrap().state, HubTransferState::Done);
-        let t3 = s.add_hub_transfer(member.id, doc.id, "d3", 1).unwrap();
-        assert_eq!(s.list_hub_transfers().unwrap().len(), 2, "a done one is history, not replaced");
-        assert!(matches!(s.set_hub_transfer_state(Uuid::now_v7(), HubTransferState::Declined), Err(StoreError::NotFound(_))));
-        let _ = t3;
-
-        // doc transfers ledger
-        let out = s.add_doc_transfer(doc.id, hub.id, TransferDirection::Out, "offered").unwrap();
-        assert_eq!((out.direction, out.state.as_str()), (TransferDirection::Out, "offered"));
-        s.set_doc_transfer_state(out.id, "done").unwrap();
-        let again = s.add_doc_transfer(doc.id, hub.id, TransferDirection::Out, "offered").unwrap();
-        assert_ne!(again.id, out.id);
-        let all = s.list_doc_transfers().unwrap();
-        assert_eq!(all.len(), 2, "a done record is kept when a new offer arrives");
-        assert!(s.add_doc_transfer(doc.id, hub.id, TransferDirection::In, "bogus").is_err());
-        assert!(s.set_doc_transfer_state(again.id, "bogus").is_err());
-    }
-
-    /// Fresh installs from before the maintainer tier created `shares` with a
-    /// CHECK allowing only review|yellow; opening such a DB must widen it so
-    /// `green` is accepted, without losing rows or the share_invites FK.
-    #[test]
-    fn opening_a_db_with_the_old_trust_check_widens_it_for_green() {
-        use crate::{PrincipalKind, SharePermission, ShareTrust};
-        use rusqlite::params;
-        let mut s = SqliteStore::open_in_memory().unwrap();
-        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
-        let doc = s.create_doc("D", None, tom.id).unwrap();
-        // recreate `shares` exactly as the OLD schema did (strict CHECK)
-        s.conn.pragma_update(None, "foreign_keys", false).unwrap();
-        s.conn
-            .execute_batch(
-                "DROP TABLE shares;
-                 CREATE TABLE shares (
-                     id TEXT PRIMARY KEY,
-                     root_doc TEXT NOT NULL REFERENCES docs (id),
-                     contact TEXT REFERENCES contacts (id),
-                     permission TEXT NOT NULL DEFAULT 'view' CHECK (permission IN ('view', 'propose')),
-                     state TEXT NOT NULL DEFAULT 'offered' CHECK (state IN ('offered', 'active', 'revoked')),
-                     policy_override TEXT CHECK (policy_override IN ('human-review', 'agent-review', 'auto')),
-                     trust TEXT NOT NULL DEFAULT 'review' CHECK (trust IN ('review', 'yellow')),
-                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-                 );",
-            )
-            .unwrap();
-        s.conn.pragma_update(None, "foreign_keys", true).unwrap();
-        let share = s.create_share(doc.id, None, SharePermission::Propose, None).unwrap();
-        s.create_invite(share.id, "hash", "2099-01-01T00:00:00.000Z").unwrap();
-        // the old CHECK refuses green
-        assert!(s.set_share_trust(share.id, ShareTrust::Green).is_err());
-        // the migration open() runs widens it
-        migrate_pre_schema(&s.conn).unwrap();
-        s.set_share_trust(share.id, ShareTrust::Green).unwrap();
-        assert_eq!(s.get_share(share.id).unwrap().trust, ShareTrust::Green);
-        // row + invite FK survived the rebuild; idempotent on a second run
-        assert_eq!(s.list_shares().unwrap().len(), 1);
-        let n: i64 = s
-            .conn
-            .query_row(
-                "SELECT count(*) FROM share_invites WHERE share_id = ?1",
-                params![share.id.to_string()],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(n, 1);
-        let fk: i64 = s
-            .conn
-            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(fk, 0);
-        migrate_pre_schema(&s.conn).unwrap();
-        assert_eq!(s.list_shares().unwrap().len(), 1);
     }
 
     /// block_vec from before the cascade: opening the DB rebuilds it with
@@ -5961,123 +4146,6 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
         // idempotent: a second open-time backfill is a no-op
         backfill(&s.conn).unwrap();
-    }
-
-    /// Remove forgets a contact (shares revoked, row gone, a new redeem from
-    /// the same key pairs afresh); block keeps the row with revoked=1 and the
-    /// redeem is refused. Holding mirrors from the contact blocks removal.
-    #[test]
-    fn remove_contact_forgets_without_blocking_and_block_refuses_redeem() {
-        use crate::{PrincipalKind, SharePermission};
-        let mut s = SqliteStore::open_in_memory().unwrap();
-        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
-        let doc = s.create_doc("D", None, tom.id).unwrap();
-        let pk = "ab".repeat(32);
-        // pair via redeem
-        let share = s.create_share(doc.id, None, SharePermission::View, None).unwrap();
-        s.create_invite(share.id, "h1", "2099-01-01T00:00:00.000Z").unwrap();
-        let (c, _) = s.redeem_invite("h1", &pk, "alice").unwrap();
-        assert_eq!(s.get_share(share.id).unwrap().state, crate::ShareState::Active);
-        // remove: share revoked, contact gone, redeem works again
-        s.remove_contact(c.id).unwrap();
-        assert_eq!(s.get_share(share.id).unwrap().state, crate::ShareState::Revoked);
-        assert!(s.contact_by_pubkey(&pk).unwrap().is_none());
-        let share2 = s.create_share(doc.id, None, SharePermission::View, None).unwrap();
-        s.create_invite(share2.id, "h2", "2099-01-01T00:00:00.000Z").unwrap();
-        let (c2, _) = s.redeem_invite("h2", &pk, "alice").unwrap();
-        // block: row stays, redeem refused, unrevoke lifts it
-        s.revoke_contact(c2.id).unwrap();
-        let share3 = s.create_share(doc.id, None, SharePermission::View, None).unwrap();
-        s.create_invite(share3.id, "h3", "2099-01-01T00:00:00.000Z").unwrap();
-        assert!(s.redeem_invite("h3", &pk, "alice").is_err());
-        s.unrevoke_contact(c2.id).unwrap();
-        s.redeem_invite("h3", &pk, "alice").unwrap();
-        // a contact we hold mirrors FROM cannot be removed
-        let owner = s.pair_contact(&"cd".repeat(32), "bob").unwrap();
-        let root = s.create_doc_with_id(uuid::Uuid::now_v7(), "theirs", None, owner.principal).unwrap();
-        s.upsert_mirror(root.id, owner.id, uuid::Uuid::now_v7(), 0, SharePermission::View).unwrap();
-        assert!(matches!(s.remove_contact(owner.id), Err(StoreError::InvalidOp(_))));
-    }
-
-    /// Hub (slice 1): contacts carry role/membership/is_hub with safe defaults,
-    /// mirrors carry relay provenance, publications upsert on share id and go
-    /// with their member — and a pre-hub `contacts` table gains the columns.
-    #[test]
-    fn hub_columns_default_and_round_trip_and_migrate_onto_old_tables() {
-        use crate::{ContactRole, Membership, PrincipalKind, SharePermission};
-        let mut s = SqliteStore::open_in_memory().unwrap();
-        let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
-        let alice = s.pair_contact(&"ab".repeat(32), "alice").unwrap();
-        assert_eq!((alice.role, alice.membership, alice.is_hub), (ContactRole::Member, Membership::Active, false));
-        s.set_contact_role(alice.id, ContactRole::Admin).unwrap();
-        s.set_contact_membership(alice.id, Membership::Pending).unwrap();
-        s.set_contact_is_hub(alice.id, true).unwrap();
-        let a = s.contact_by_pubkey(&alice.pubkey).unwrap().unwrap();
-        assert_eq!((a.role, a.membership, a.is_hub), (ContactRole::Admin, Membership::Pending, true));
-        assert!(matches!(s.set_contact_role(Uuid::now_v7(), ContactRole::Admin), Err(StoreError::NotFound(_))));
-
-        // mirror provenance
-        let root = s.create_doc_with_id(Uuid::now_v7(), "theirs", None, alice.principal).unwrap();
-        let share = Uuid::now_v7();
-        s.upsert_mirror(root.id, alice.id, share, 0, SharePermission::Propose).unwrap();
-        let m = s.get_mirror(root.id).unwrap().unwrap();
-        assert_eq!((m.origin_owner, m.origin_owner_name), (None, None));
-        s.set_mirror_origin(root.id, Some("cd"), Some("bob")).unwrap();
-        let m = s.get_mirror(root.id).unwrap().unwrap();
-        assert_eq!((m.origin_owner.as_deref(), m.origin_owner_name.as_deref()), (Some("cd"), Some("bob")));
-        // a re-upsert (every pull) keeps the provenance until it is re-set
-        s.upsert_mirror(root.id, alice.id, share, 3, SharePermission::Propose).unwrap();
-        assert_eq!(s.get_mirror(root.id).unwrap().unwrap().origin_owner.as_deref(), Some("cd"));
-        s.set_mirror_origin(root.id, None, None).unwrap();
-        assert_eq!(s.list_mirrors().unwrap()[0].origin_owner, None);
-
-        // publications: upsert on share id, listed, removed with the member
-        s.add_hub_publication(share, alice.id, root.id).unwrap();
-        s.add_hub_publication(share, alice.id, root.id).unwrap();
-        let pubs = s.list_hub_publications().unwrap();
-        assert_eq!(pubs.len(), 1);
-        assert_eq!((pubs[0].share_id, pubs[0].member_contact, pubs[0].root_doc), (share, alice.id, root.id));
-        s.remove_hub_publication(share).unwrap();
-        assert!(s.list_hub_publications().unwrap().is_empty());
-        s.add_hub_publication(share, alice.id, root.id).unwrap();
-        s.remove_mirror(root.id).unwrap();
-        s.remove_contact(alice.id).unwrap();
-        assert!(s.list_hub_publications().unwrap().is_empty(), "publications go with the member");
-        let _ = tom;
-
-        // migration: a pre-hub contacts table gains the three columns with defaults
-        let old = SqliteStore::open_in_memory().unwrap();
-        old.conn.pragma_update(None, "foreign_keys", false).unwrap();
-        old.conn
-            .execute_batch(
-                "DROP TABLE contacts;
-                 CREATE TABLE contacts (
-                     id TEXT PRIMARY KEY,
-                     pubkey TEXT NOT NULL UNIQUE,
-                     petname TEXT NOT NULL,
-                     principal TEXT NOT NULL REFERENCES principals (id),
-                     verified INTEGER NOT NULL DEFAULT 0,
-                     revoked INTEGER NOT NULL DEFAULT 0,
-                     paired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-                 );
-                 INSERT INTO principals (id, kind, display_name) VALUES ('p1', 'remote', 'x');
-                 INSERT INTO contacts (id, pubkey, petname, principal) VALUES ('c1', 'k', 'x', 'p1');",
-            )
-            .unwrap();
-        old.conn.pragma_update(None, "foreign_keys", true).unwrap();
-        assert!(old.list_contacts().is_err(), "old table lacks the columns");
-        migrate_pre_schema(&old.conn).unwrap();
-        migrate_pre_schema(&old.conn).unwrap(); // idempotent
-        let cs = old.list_contacts();
-        // ids in this hand-made row are not uuids, so mapping fails on id — check columns directly
-        let _ = cs;
-        let (role, membership, is_hub): (String, String, bool) = old
-            .conn
-            .query_row("SELECT role, membership, is_hub FROM contacts WHERE id = 'c1'", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
-            .unwrap();
-        assert_eq!((role.as_str(), membership.as_str(), is_hub), ("member", "active", false));
     }
 
     /// Trash: a delete tombstones the subtree under one stamp; the trash lists

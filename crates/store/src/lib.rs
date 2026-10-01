@@ -86,10 +86,6 @@ pub trait BlockStore {
 
     fn list_principals(&self) -> Result<Vec<Principal>>;
 
-    /// Attach a pubkey to a principal — links the local human to the
-    /// instance's federation identity on first serve (ADR 0002, #54).
-    fn set_principal_pubkey(&mut self, id: Uuid, pubkey: &str) -> Result<()>;
-
     /// Change a principal's display name (1..64 chars). For the human owner
     /// this is the petname every contact sees — never a hardcoded default.
     fn rename_principal(&mut self, id: Uuid, display_name: &str) -> Result<()>;
@@ -97,16 +93,6 @@ pub trait BlockStore {
     /// Instance-level settings (tiny kv): e.g. `profile.confirmed`.
     fn get_setting(&self, key: &str) -> Result<Option<String>>;
     fn set_setting(&mut self, key: &str, value: &str) -> Result<()>;
-
-    /// Record the outcome of a pull for every mirror of a share: success
-    /// stamps last_pulled_at and clears last_error; failure stores the error.
-    /// The shares page reads these so a failing mirror is a red row, not a
-    /// silent doc.
-    fn set_mirror_sync_result(&mut self, share_id: Uuid, error: Option<&str>) -> Result<()>;
-
-    /// Permanently remove a REVOKED share and its invites (the "clear" action
-    /// on the shares page). Active/offered shares must be revoked first.
-    fn delete_share(&mut self, id: Uuid) -> Result<()>;
 
     fn create_doc(&mut self, title: &str, parent: Option<Uuid>, created_by: Uuid) -> Result<Doc>;
 
@@ -180,8 +166,8 @@ pub trait BlockStore {
     /// `restore_doc` — every doc of one delete shares a `deleted_at` stamp.
     fn delete_doc(&mut self, doc_id: Uuid) -> Result<usize>;
 
-    /// The Trash: roots of tombstoned subtrees the user deleted (dropped
-    /// mirrors of revoked shares are excluded — they revive via re-join).
+    /// The Trash: roots of tombstoned subtrees the user deleted (tombstones
+    /// federation left behind, created by remote principals, are excluded).
     fn list_trash(&self) -> Result<Vec<TrashEntry>>;
 
     /// Undo a delete: revive the doc and the descendants that fell with it
@@ -189,7 +175,7 @@ pub trait BlockStore {
     /// the root. Returns how many docs came back.
     fn restore_doc(&mut self, doc_id: Uuid) -> Result<usize>;
 
-    /// The doc and every live descendant (the delete/hot-check universe).
+    /// The doc and every live descendant (the delete universe).
     fn doc_subtree_ids(&self, doc_id: Uuid) -> Result<Vec<Uuid>>;
 
     /// Rename a doc. NOTE: inbound [[wikilinks]] resolve by title and are not
@@ -265,10 +251,9 @@ pub trait BlockStore {
     /// (applied now, flagged with the pre-image in the payload; a decline
     /// reverts), delete_doc lands RED (parked; a human accept trashes the
     /// subtree). One ledger row + one open annotation on `doc_id`, in one
-    /// transaction; the doc epoch is NOT bumped (a live session freezes it).
-    /// A rename also rewrites inbound [[wikilinks]] as green replaces by
-    /// `principal`, skipping mirrors and frozen (hot) docs. Mirrors are
-    /// refused; a move that would nest a doc under itself is an error.
+    /// transaction; the doc epoch is NOT bumped. A rename also rewrites
+    /// inbound [[wikilinks]] as green replaces by `principal`; a move that
+    /// would nest a doc under itself is an error.
     fn propose_doc_op(
         &mut self,
         doc_id: Uuid,
@@ -326,119 +311,7 @@ pub trait BlockStore {
     /// Leaf docs (≥1 block) with no tags — the tagging gardener's worklist.
     fn untagged_docs(&self, limit: usize) -> Result<Vec<Doc>>;
 
-    // --- federation (ADR 0002): contacts, shares, invites, mirrors ---
-
-    /// Pair a peer: creates the contact and its remote principal. Idempotent
-    /// on pubkey — an existing contact is returned as-is: its petname (the
-    /// owner's chosen name; see rename_contact) and revoked flag (see
-    /// unrevoke_contact) are never touched by a re-pair.
-    fn pair_contact(&mut self, pubkey: &str, petname: &str) -> Result<Contact>;
-
-    fn list_contacts(&self) -> Result<Vec<Contact>>;
-
-    fn contact_by_pubkey(&self, pubkey: &str) -> Result<Option<Contact>>;
-
-    fn set_contact_verified(&mut self, id: Uuid, verified: bool) -> Result<()>;
-
-    /// Revoke a contact: marks it revoked and revokes every share bound to it.
-    /// The row (and its principal) survive — provenance outlives trust.
-    fn revoke_contact(&mut self, id: Uuid) -> Result<()>;
-
-    /// Lift a revocation: the contact may redeem invites again. Shares
-    /// revoked alongside it stay revoked — re-inviting is a separate,
-    /// deliberate act. Human surface only; never MCP, never the remote side.
-    fn unrevoke_contact(&mut self, id: Uuid) -> Result<()>;
-
-    /// Remove a contact WITHOUT blocking them: every share to them is revoked
-    /// and the contact row is deleted, so a fresh invite pairs them again like
-    /// anyone else. Their principal stays (provenance of past edits).
-    /// `revoke_contact` is the BLOCK: the row stays with revoked=1 and any
-    /// redeem from that pubkey is refused until un-revoked.
-    fn remove_contact(&mut self, id: Uuid) -> Result<()>;
-
-    /// Create a share of `root_doc`'s subtree. `contact: None` = awaiting an
-    /// invite redeem to bind one.
-    fn create_share(
-        &mut self,
-        root_doc: Uuid,
-        contact: Option<Uuid>,
-        permission: SharePermission,
-        policy_override: Option<ReviewPolicy>,
-    ) -> Result<Share>;
-
-    fn list_shares(&self) -> Result<Vec<Share>>;
-
-    fn get_share(&self, id: Uuid) -> Result<Share>;
-
-    fn set_share_state(&mut self, id: Uuid, state: ShareState) -> Result<()>;
-
-    fn set_share_permission(&mut self, id: Uuid, permission: SharePermission) -> Result<()>;
-
-    /// Trust tier (#62). Human surface only — never MCP, never the remote side.
-    fn set_share_trust(&mut self, id: Uuid, trust: ShareTrust) -> Result<()>;
-
-    /// The owner's activity feed: the most recent content edits APPLIED by
-    /// remote principals (maintainer-tier shares land green with no review
-    /// annotation, so this is how the owner hears about them). Newest first.
-    fn recent_remote_ops(&self, limit: usize) -> Result<Vec<ActivityItem>>;
-
-    /// Record a minted invite. Only the secret's hash is stored; the secret
-    /// itself lives in the `grimoire://` link and is never persisted.
-    fn create_invite(
-        &mut self,
-        share_id: Uuid,
-        secret_hash: &str,
-        expires_at: &str,
-    ) -> Result<Uuid>;
-
-    /// Burn-on-redeem: matches an unexpired, unredeemed invite by secret hash,
-    /// pairs the presenting pubkey as a contact, binds it to the share, and
-    /// activates the share. A second redeem (or an expired one) is an error.
-    fn redeem_invite(
-        &mut self,
-        secret_hash: &str,
-        pubkey: &str,
-        petname: &str,
-    ) -> Result<(Contact, Share)>;
-
-    /// Live docs in the share's subtree — recursive containment from root_doc,
-    /// the same rule as tend scopes. This is the entire universe a grantee
-    /// can ever see through this share.
-    fn docs_in_share(&self, share_id: Uuid) -> Result<Vec<Doc>>;
-
-    /// Non-revoked shares whose subtree contains this doc (enforcement + the
-    /// owner-side "you are sharing this" badge / move-into-share warning).
-    fn shares_containing(&self, doc_id: Uuid) -> Result<Vec<Share>>;
-
-    // Grantee-side mirror bookkeeping. The mirror doc keeps its origin UUID.
-
-    /// Create a doc under a caller-chosen UUID — the mirror path (#57):
-    /// mirrors keep their origin UUIDs so deep links and ops line up across
-    /// instances. Everything else must use create_doc.
-    fn create_doc_with_id(
-        &mut self,
-        id: Uuid,
-        title: &str,
-        parent: Option<Uuid>,
-        created_by: Uuid,
-    ) -> Result<Doc>;
-
-    fn upsert_mirror(
-        &mut self,
-        doc_id: Uuid,
-        owner: Uuid,
-        share_id: Uuid,
-        synced_epoch: i64,
-        permission: SharePermission,
-    ) -> Result<()>;
-
-    /// Rename a contact's petname (human surface).
-    fn rename_contact(&mut self, id: Uuid, petname: &str) -> Result<()>;
-
-    /// A cheap "did anything move?" aggregate for owner-side change
-    /// detection: max doc epoch, live doc count, active share count. Equal
-    /// signatures on two ticks mean no nudge is due — no per-share walk needed.
-    fn change_signature(&self) -> Result<ChangeSignature>;
+    // --- block embeddings (ask the vault) ---
 
     /// Live content blocks whose embedding is missing or older than the
     /// block (`block_vec.epoch < blocks.epoch`): (id, epoch, content).
@@ -457,187 +330,13 @@ pub trait BlockStore {
     /// Search hits for specific block ids (live only), in the given order.
     fn blocks_as_hits(&self, ids: &[Uuid]) -> Result<Vec<SearchHit>>;
 
-    fn get_mirror(&self, doc_id: Uuid) -> Result<Option<Mirror>>;
-
-    fn list_mirrors(&self) -> Result<Vec<Mirror>>;
-
-    fn remove_mirror(&mut self, doc_id: Uuid) -> Result<()>;
-
-    /// Record whether the owner tends this mirror doc (from the pull meta).
-    fn set_mirror_tended(&mut self, doc_id: Uuid, tended: bool) -> Result<()>;
-
-    /// Hub relay provenance from the pull meta (slice 1): the TRUE owner of a
-    /// doc a hub relays to us. None/None = owned by the contact we pull from.
-    fn set_mirror_origin(
-        &mut self,
-        doc_id: Uuid,
-        origin_owner: Option<&str>,
-        origin_owner_name: Option<&str>,
-    ) -> Result<()>;
-
-    // Hub membership (slice 1). Human/admin surfaces only — never MCP.
-
-    fn set_contact_role(&mut self, id: Uuid, role: ContactRole) -> Result<()>;
-
-    fn set_contact_membership(&mut self, id: Uuid, membership: Membership) -> Result<()>;
-
-    fn set_contact_is_hub(&mut self, id: Uuid, is_hub: bool) -> Result<()>;
-
-    /// Hub side: record a member's published subtree (upsert on share_id).
-    fn add_hub_publication(&mut self, share_id: Uuid, member_contact: Uuid, root_doc: Uuid) -> Result<()>;
-
-    fn list_hub_publications(&self) -> Result<Vec<HubPublication>>;
-
-    fn remove_hub_publication(&mut self, share_id: Uuid) -> Result<()>;
-
-    /// Record the owner's epoch for a mirror doc from the pull meta, so the
-    /// grantee can tell "up to date" from "behind" without another round-trip.
-    fn set_mirror_owner_epoch(&mut self, doc_id: Uuid, owner_epoch: i64) -> Result<()>;
-
     /// Is this doc row a tombstone (soft-deleted)? `get_doc` returns
-    /// tombstones too, so callers that must distinguish "mine and live" from
-    /// "left behind by a dropped mirror" ask this. NotFound if no row at all.
+    /// tombstones too. NotFound if no row at all.
     fn doc_is_tombstoned(&self, id: Uuid) -> Result<bool>;
 
-    /// Bring a soft-deleted doc back (deleted = 0). Used when a share of a
-    /// subtree we previously mirrored and dropped is granted again: the same
-    /// origin UUIDs return, and they must revive rather than collide.
-    fn undelete_doc(&mut self, id: Uuid) -> Result<()>;
-
     /// True if a gardener tends this doc or an ancestor (recursive, enabled
-    /// only) — the owner-side signal shipped in the pull meta.
+    /// only).
     fn doc_is_tended(&self, doc_id: Uuid) -> Result<bool>;
-
-    /// Live blocks of a doc, flat (parent/order fields carry the tree) — the
-    /// owner-side snapshot read for the federation wire (#58).
-    fn doc_blocks_flat(&self, doc_id: Uuid) -> Result<Vec<Block>>;
-
-    /// Wholesale-replace a mirror doc's blocks and pin its epoch to the
-    /// owner's (#58). v1 read path: the wire detects change by epoch compare
-    /// and ships whole docs; op-granular shipping is the later upgrade, and
-    /// this method is what it would replace. Block ids are the owner's, so
-    /// deep links and comment anchors survive syncs.
-    fn mirror_replace_blocks(
-        &mut self,
-        doc_id: Uuid,
-        blocks: Vec<MirrorBlock>,
-        owner_epoch: i64,
-        principal: Uuid,
-    ) -> Result<()>;
-
-    // Upstream proposals (#60): grantee bookkeeping + owner status answers.
-
-    fn record_outbound_proposal(
-        &mut self,
-        doc_id: Uuid,
-        share_id: Uuid,
-        owner: Uuid,
-        op_ids: &[Uuid],
-        note: &str,
-    ) -> Result<Uuid>;
-
-    fn list_outbound_proposals(&self, pending_only: bool) -> Result<Vec<OutboundProposal>>;
-
-    fn set_outbound_state(&mut self, id: Uuid, state: &str) -> Result<()>;
-
-    /// Status of specific ledger ops (owner side): applied? still under an
-    /// open annotation? Caller filters by principal before disclosing.
-    fn op_statuses(&self, ids: &[Uuid]) -> Result<Vec<OpStatus>>;
-
-    // Grantee-side join queue: redeems that will retry until the owner is up.
-
-    /// Queue a join ticket for background retry. Idempotent on ticket text.
-    /// Invites v2 (owner side): record whom a minted invite was offered to
-    /// over the wire, so the shares page can say "waiting for alice".
-    fn set_invite_offered_to(&mut self, share_id: Uuid, contact: Uuid) -> Result<()>;
-
-    /// Owner side: the contact an unredeemed invite of this share was offered
-    /// to, if any.
-    fn invite_offered_to(&self, share_id: Uuid) -> Result<Option<Uuid>>;
-
-    /// Invites v2 (recipient side): store an offer received from a contact.
-    /// A second offer for the same (owner, share) replaces the first.
-    fn add_share_offer(
-        &mut self,
-        from_contact: Uuid,
-        owner_node: &str,
-        share_id: Uuid,
-        root_title: &str,
-        permission: SharePermission,
-        secret: &str,
-        expires_at: &str,
-    ) -> Result<ShareOffer>;
-
-    fn list_share_offers(&self, open_only: bool) -> Result<Vec<ShareOffer>>;
-
-    fn get_share_offer(&self, id: Uuid) -> Result<ShareOffer>;
-
-    fn set_share_offer_state(&mut self, id: Uuid, state: ShareOfferState) -> Result<()>;
-
-    /// Mark open offers past their expiry as expired; returns how many.
-    fn expire_share_offers(&mut self) -> Result<usize>;
-
-    /// Remove declined/expired offers (the "clear" action).
-    fn clear_share_offers(&mut self) -> Result<usize>;
-
-    fn queue_join(&mut self, ticket: &str) -> Result<Uuid>;
-
-    fn list_pending_joins(&self) -> Result<Vec<PendingJoin>>;
-
-    fn record_join_attempt(&mut self, id: Uuid, error: &str) -> Result<()>;
-
-    fn remove_pending_join(&mut self, id: Uuid) -> Result<()>;
-
-    // Hub slice 2: forwarding, transfers.
-
-    /// The principal a proposal arriving ON BEHALF OF a peer is filed under:
-    /// an existing contact's principal if that pubkey is a contact, else a
-    /// Remote principal keyed by pubkey (created once, no contact row).
-    fn remote_principal_for(&mut self, pubkey: &str, name: &str) -> Result<Uuid>;
-
-    /// Hub side: remember a proposal forwarded to its owner for a member.
-    fn add_hub_forward(
-        &mut self,
-        op_id: Uuid,
-        owner_contact: Uuid,
-        member_contact: Uuid,
-        owner_share: Uuid,
-        doc_id: Uuid,
-    ) -> Result<()>;
-
-    /// Hub side: the forward records for these owner-side op ids (unknown
-    /// ids are skipped).
-    fn hub_forwards_for(&self, op_ids: &[Uuid]) -> Result<Vec<HubForward>>;
-
-    /// Hub side: a member offered a subtree. Re-offering the same root by
-    /// the same member while a previous offer is still open replaces it.
-    fn add_hub_transfer(
-        &mut self,
-        member_contact: Uuid,
-        root_doc: Uuid,
-        title: &str,
-        doc_count: i64,
-    ) -> Result<HubTransfer>;
-
-    fn list_hub_transfers(&self) -> Result<Vec<HubTransfer>>;
-
-    fn get_hub_transfer(&self, id: Uuid) -> Result<HubTransfer>;
-
-    fn set_hub_transfer_state(&mut self, id: Uuid, state: HubTransferState) -> Result<()>;
-
-    /// Both sides: record a transfer of `root_doc` with `counterparty`
-    /// (state "offered" | "done").
-    fn add_doc_transfer(
-        &mut self,
-        root_doc: Uuid,
-        counterparty: Uuid,
-        direction: TransferDirection,
-        state: &str,
-    ) -> Result<DocTransfer>;
-
-    fn list_doc_transfers(&self) -> Result<Vec<DocTransfer>>;
-
-    fn set_doc_transfer_state(&mut self, id: Uuid, state: &str) -> Result<()>;
 
     /// Resolve one annotation. Invariant enforced here: proposer ≠ approver.
     /// - accept yellow: clear the annotation (the edit is already live)

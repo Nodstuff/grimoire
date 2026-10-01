@@ -130,15 +130,12 @@ fn human_accepting_an_auditor_fix_verifies_the_doc_but_other_accepts_do_not() {
 }
 
 #[test]
-fn freshness_lists_never_verified_first_then_oldest_and_skips_mirrors_and_empty_docs() {
+fn freshness_lists_never_verified_first_then_oldest_and_skips_empty_docs() {
     let (mut s, tom) = seed();
     let (old, _) = import::import_markdown(&mut s, "Old", None, tom, "x\n").unwrap();
     let (newer, _) = import::import_markdown(&mut s, "Newer", None, tom, "x\n").unwrap();
     let (never, _) = import::import_markdown(&mut s, "Never", None, tom, "x\n").unwrap();
     let _empty_folder = s.create_doc("Folder", None, tom).unwrap();
-    let (mirror, _) = import::import_markdown(&mut s, "Mirror", None, tom, "x\n").unwrap();
-    let contact = s.pair_contact(&"ab".repeat(32), "alice").unwrap();
-    s.upsert_mirror(mirror, contact.id, Uuid::now_v7(), 0, SharePermission::View).unwrap();
 
     s.set_doc_verified(old).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(3));
