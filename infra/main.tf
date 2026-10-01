@@ -85,7 +85,7 @@ resource "aws_vpc_security_group_egress_rule" "all_v4" {
   security_group_id = aws_security_group.taisce.id
   cidr_ipv4         = "0.0.0.0/0"
   ip_protocol       = "-1"
-  description       = "Outbound: Let's Encrypt, APNs, S3, SSM, package repos"
+  description       = "Outbound - Lets Encrypt, APNs, S3, SSM, package repos"
 }
 
 # ---- backups ---------------------------------------------------------------
