@@ -74,6 +74,8 @@ final class EditorModel {
         if (try? await cache.doc(docID))?.bodyEpoch == nil { try? await app.sync?.refresh(docID) }
         guard let editor = try? await cache.editor(for: docID) else { return nil }
         let model = EditorModel(docID: docID, editor: editor, cache: cache, api: app.api, app: app)
+        // a conflict from an earlier session still stands
+        for (block, base) in (try? await cache.conflictedBlocks(docID)) ?? [:] { model.session.markConflicted(block, base: base) }
         model.start()
         return model
     }
@@ -164,8 +166,27 @@ final class EditorModel {
         foldLive()
         let reqs = session.commitText(ids)
         unsaved = saver.waiting.count
-        for r in reqs { enqueue(r, coalescing: true) }
+        enqueueText(reqs)
     }
+
+    /// Text saves: coalesced, except a conflicted block's (kept apart, flagged).
+    private func enqueueText(_ reqs: [ProposeRequest]) {
+        let conflicts = session.conflictRequestIDs
+        for r in reqs {
+            let isConflict = conflicts.contains(r.requestID ?? "")
+            enqueue(r, coalescing: !isConflict, conflict: isConflict)
+        }
+    }
+
+    /// How a propose is written to the outbox (tests swap it to fail).
+    @ObservationIgnored lazy var persist: (ProposeRequest, Bool, Bool) async throws -> Void = { [cache] req, coalescing, conflict in
+        if conflict { try await cache.enqueue(req, conflict: true) } else if coalescing { try await cache.enqueueCoalescing(req) } else { try await cache.enqueue(req) }
+    }
+    /// waits between attempts at a failing outbox write
+    @ObservationIgnored var persistRetryDelays: [Duration] = [.milliseconds(200), .seconds(1), .seconds(3)]
+    /// outbox writes that kept failing: their text stays (overlaid), the chip says so
+    private(set) var persistFailures = 0
+    @ObservationIgnored private(set) var abandoned: [ProposeRequest] = []
 
     /// Committed proposes not yet written to the outbox, oldest first: a
     /// refresh overlays them, so nothing committed is ever rolled back.
@@ -174,19 +195,33 @@ final class EditorModel {
     /// Writes reach the outbox in the order they were made. Only the
     /// local writes are chained: sending them is a separate, unawaited
     /// step, so a slow or hanging network never holds a save in memory.
-    private func enqueue(_ req: ProposeRequest, coalescing: Bool) {
+    private func enqueue(_ req: ProposeRequest, coalescing: Bool, conflict: Bool = false) {
         let prev = queue
-        let cache = cache
         unpersisted.append(req)
         queue = Task { [weak self] in
             await prev?.value
-            do {
-                if coalescing { try await cache.enqueueCoalescing(req) } else { try await cache.enqueue(req) }
-            } catch {
-                self?.lastError = "Couldn't queue the edit: \(error.localizedDescription)"
+            guard let self else { return }
+            var attempt = 0
+            while true {
+                do {
+                    try await self.persist(req, coalescing, conflict)
+                    break
+                } catch {
+                    // the request stays in `unpersisted` (on screen, overlaid) while we retry
+                    guard attempt < self.persistRetryDelays.count else {
+                        // kept (and on screen) until the next flush tries again
+                        self.unpersisted.removeAll { $0.requestID == req.requestID }
+                        self.abandoned.append(req)
+                        self.persistFailures = self.abandoned.count
+                        self.lastError = "Couldn't save: \(error.localizedDescription)"
+                        return
+                    }
+                    try? await Task.sleep(for: self.persistRetryDelays[attempt])
+                    attempt += 1
+                }
             }
-            self?.unpersisted.removeAll { $0.requestID == req.requestID }
-            self?.send()
+            self.unpersisted.removeAll { $0.requestID == req.requestID }
+            self.send()
         }
     }
 
@@ -206,10 +241,17 @@ final class EditorModel {
     /// epoch), written to the outbox before this returns. Never waits on
     /// the network (Done, leaving the screen, the app going to the background).
     func flush() async {
+        // an open composition (Japanese, Chinese, dictation) is committed first, so it's saved
+        if let tv = activeCoordinator?.textView, tv.markedTextRange != nil { tv.unmarkText() }
         activeCoordinator?.syncContent()
+        // outbox writes that failed for good get another go, first
+        let retry = abandoned
+        abandoned = []
+        persistFailures = 0
+        for r in retry { enqueue(r, coalescing: false) }
         await saver.flush()
         foldLive()
-        for r in session.commitText(includeConflicts: true) { enqueue(r, coalescing: true) }
+        enqueueText(session.commitText(includeConflicts: true))
         await queue?.value
         unsaved = 0
     }
@@ -241,7 +283,7 @@ final class EditorModel {
     private func prepareStructure() {
         foldLive()
         saver.cancelAll()
-        for r in session.commitText() { enqueue(r, coalescing: true) }
+        enqueueText(session.commitText())
         unsaved = 0
     }
 
@@ -260,7 +302,7 @@ final class EditorModel {
         guard let (content, caret) = result else { return }
         prepareStructure()
         applyChange(session.apply(.update(content, caret: caret), to: id))
-        for r in session.commitText([id]) { enqueue(r, coalescing: true) }
+        enqueueText(session.commitText([id]))
     }
 
     func indent(_ id: BlockID, caret: EditorCaret, by: Int) {
@@ -383,7 +425,7 @@ final class EditorModel {
         if let landed = try? await cache.lastLandedEpoch(docID), let rec = try? await cache.doc(docID),
            let body = rec.bodyEpoch, body < landed { return }
         // what's committed but maybe not yet in the outbox when the cache is read
-        let before = unpersisted
+        let before = abandoned + unpersisted
         guard let editor = try? await cache.editor(for: docID) else { return }
         applyRemote(editor, overlaying: before)
     }
@@ -394,24 +436,64 @@ final class EditorModel {
     func applyRemote(_ fresh: DocEditor, overlaying earlier: [ProposeRequest] = []) {
         var editor = fresh
         var seen: Set<String> = []
-        for r in earlier + unpersisted where seen.insert(r.requestID ?? "").inserted {
+        for r in earlier + abandoned + unpersisted where seen.insert(r.requestID ?? "").inserted {
             editor.overlay(r.ops.map(\.kind))
         }
         var keep = saver.waiting.union(live.keys)
         if let f = focusedID { keep.insert(f) }
-        for r in earlier + unpersisted { for op in r.ops { if let t = op.kind.target { keep.insert(t) } } }
+        for r in earlier + abandoned + unpersisted { for op in r.ops { if let t = op.kind.target { keep.insert(t) } } }
         foldLive()
         _ = session.refresh(editor, keep: keep)
     }
 
+    /// blocks whose saves the server refused
+    private(set) var failedBlocks: Set<BlockID> = []
+
     func poll() async {
         if let s = try? await cache.outboxState(for: docID), s != outbox { outbox = s }
+        if let f = try? await cache.failedBlocks(docID), f != failedBlocks { failedBlocks = f }
         // the open review queue, now and then, when online
         if let api, app?.isOnline == true, Date().timeIntervalSince(lastReviewFetch) > 15 {
             lastReviewFetch = Date()
             openOps = try? await api.openReviewOps(docID)
         }
         if let r = try? await cache.reviews(for: docID, openOps: openOps), r != reviews { reviews = r }
+    }
+
+    // MARK: conflicts and refusals
+
+    /// The desktop's text wins: our queued saves of the block go.
+    func takeTheirs(_ id: BlockID) async {
+        foldLive()
+        saver.cancelAll()
+        session.takeTheirs(id)
+        await queue?.value
+        try? await cache.discardPending(docID, block: id)
+        try? await cache.clearConflict(docID, block: id)
+        await poll()
+    }
+
+    /// Ours wins, by choice: proposed on the current epoch.
+    func keepMine(_ id: BlockID) async {
+        foldLive()
+        let reqs = session.keepMine(id)
+        await queue?.value
+        try? await cache.clearConflict(docID, block: id)
+        for r in reqs { enqueue(r, coalescing: false) }
+        await queue?.value
+    }
+
+    /// Give up on refused saves: the blocks go back to the server's text.
+    func discardFailed() async {
+        let ids = failedBlocks
+        try? await cache.discardFailed(docID: docID)
+        if let editor = try? await cache.editor(for: docID) {
+            foldLive()
+            var keep = saver.waiting
+            if let f = focusedID, !ids.contains(f) { keep.insert(f) }
+            _ = session.refresh(editor, keep: keep.subtracting(ids))
+        }
+        await poll()
     }
 
     func retryFailed() async {
@@ -422,7 +504,7 @@ final class EditorModel {
 
     var chip: EditorChip {
         EditorChip.make(
-            online: app?.isOnline ?? false, unsaved: unsaved, outbox: outbox,
+            online: app?.isOnline ?? false, unsaved: unsaved, outbox: outbox, persistFailures: persistFailures,
             reviews: reviews.values.map(\.verdict)
         )
     }

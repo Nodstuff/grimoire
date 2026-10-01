@@ -151,6 +151,22 @@ import Testing
         #expect(try await cache.adjustedBase(replace("p1", "z", base: 6)) == 7)
     }
 
+    /// A conflicted save is flagged on its row, so reopening the editor
+    /// finds the conflict; resolving clears it; Take theirs drops queued saves.
+    @Test func conflictsOutliveTheEditor() async throws {
+        let cache = try Cache.inMemory()
+        try await cache.enqueue(replace("p1", "mine", base: 4), conflict: true)
+        try await cache.enqueue(replace("p2", "other"))
+        #expect(try await cache.conflictedBlocks("d1") == ["p1": 4])
+        #expect(try await cache.conflictedBlocks("d2").isEmpty)
+        try await cache.discardPending("d1", block: "p1")
+        #expect(try await bodies(cache).map { $0.ops.first?.kind.target } == ["p2"], "only the block's own saves go")
+        try await cache.enqueue(replace("p1", "mine again", base: 4), conflict: true)
+        try await cache.clearConflict("d1", block: "p1")
+        #expect(try await cache.conflictedBlocks("d1").isEmpty)
+        #expect(try await cache.pendingOutbox().count == 2, "clearing a conflict keeps the save")
+    }
+
     @Test func refusedWritesStayOnScreen() async throws {
         let cache = try Cache.inMemory()
         try await seed(cache)
@@ -160,6 +176,7 @@ import Testing
         #expect(try await cache.outboxState(for: "d1").failed == 1)
         let editor = try #require(try await cache.editor(for: "d1"))
         #expect(editor.blocks["p1"]?.content == "typed, then refused")
+        #expect(try await cache.failedBlocks("d1") == ["p1"])
     }
 
     @Test func verdictsMarkBlocksUntilReviewed() async throws {

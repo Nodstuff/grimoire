@@ -19,7 +19,7 @@ struct DocEditorView: View {
                         .padding(.bottom, 10)
                     LazyVStack(alignment: .leading, spacing: 4) {
                         ForEach(model.items) { item in
-                            BlockRow(item: item, model: model, review: model.reviews[item.id], dynamicType: dynamicType)
+                            BlockRow(item: item, model: model, review: model.reviews[item.id], failed: model.failedBlocks.contains(item.id), dynamicType: dynamicType)
                                 .id(item.id)
                         }
                     }
@@ -57,8 +57,16 @@ private struct BlockRow: View {
     let item: EditorSession.Item
     let model: EditorModel
     let review: BlockReview?
+    var failed = false
     let dynamicType: DynamicTypeSize
     @State private var layoutToken = 0
+
+    /// the outline: refused (rose), conflict or parked (rose), flagged (amber)
+    var outline: Color? {
+        if failed || item.remoteText != nil || review?.verdict == .red { return Theme.rose }
+        if review?.verdict == .yellow { return Theme.amber }
+        return nil
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -66,7 +74,30 @@ private struct BlockRow: View {
                 layoutToken &+= 1
             }
             .padding(.top, Self.topPadding(item.content))
-            if let review {
+            if failed {
+                HStack(spacing: 12) {
+                    Label("Couldn't save", systemImage: "exclamationmark.triangle").foregroundStyle(Theme.rose)
+                    Spacer()
+                    Button("Retry") { Task { await model.retryFailed() } }.accessibilityIdentifier("block.retry")
+                    Button("Discard", role: .destructive) { Task { await model.discardFailed() } }.accessibilityIdentifier("block.discard")
+                }
+                .font(.caption)
+                .buttonStyle(.borderless)
+                .padding(.bottom, 4)
+            } else if let theirs = item.remoteText {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Changed on desktop", systemImage: "arrow.triangle.branch").foregroundStyle(Theme.rose)
+                    Text(theirs).font(.caption).foregroundStyle(Theme.secondary).lineLimit(3)
+                        .accessibilityLabel("Their version: \(theirs)")
+                    HStack(spacing: 16) {
+                        Button("Keep mine") { Task { await model.keepMine(item.id) } }.accessibilityIdentifier("block.keepMine")
+                        Button("Take theirs") { Task { await model.takeTheirs(item.id) } }.accessibilityIdentifier("block.takeTheirs")
+                    }
+                    .buttonStyle(.borderless)
+                }
+                .font(.caption)
+                .padding(.bottom, 4)
+            } else if let review {
                 Label(review.verdict == .red ? "Waiting for review on desktop" : "Flagged for review on desktop",
                       systemImage: review.verdict == .red ? "hourglass" : "flag")
                     .font(.caption)
@@ -74,11 +105,11 @@ private struct BlockRow: View {
                     .padding(.bottom, 4)
             }
         }
-        .padding(.horizontal, review == nil ? 0 : 10)
+        .padding(.horizontal, outline == nil ? 0 : 10)
         .overlay {
-            if let review {
+            if let outline {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(review.verdict == .red ? Theme.rose : Theme.amber, lineWidth: 1.5)
+                    .strokeBorder(outline, lineWidth: 1.5)
                     .allowsHitTesting(false)
             }
         }

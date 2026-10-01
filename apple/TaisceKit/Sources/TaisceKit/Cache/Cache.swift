@@ -87,6 +87,11 @@ public final class Cache: Sendable {
             // the editor's review marks, its epoch chains later proposes
             try db.alter(table: "outbox") { t in t.add(column: "outcome", .blob) }
         }
+        m.registerMigration("v3") { db in
+            // a save of a block in conflict (proposed on its older epoch): the
+            // editor reopens with the conflict still standing
+            try db.alter(table: "outbox") { t in t.add(column: "conflict", .boolean).notNull().defaults(to: false) }
+        }
         return m
     }
 

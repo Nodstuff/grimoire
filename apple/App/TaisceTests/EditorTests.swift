@@ -255,6 +255,97 @@ import UIKit
         tv.resignFirstResponder()
     }
 
+    /// Done or a back-swipe frees the model while UIKit still holds the
+    /// text view and the bar: callbacks after that do nothing, no crash.
+    @Test func callbacksAfterTheEditorIsGoneAreHarmless() throws {
+        var harness: Harness? = try Harness(blocks("a"))
+        let (tv, c) = harness!.views["b0"]!
+        let bar = harness!.model.formattingBar
+        weak var gone = harness!.model
+        harness = nil
+        #expect(gone == nil, "nothing keeps the model alive")
+        tv.insertText("b")
+        c.textViewDidChange(tv)
+        c.textViewDidChangeSelection(tv)
+        _ = c.textView(tv, shouldChangeTextIn: NSRange(location: 0, length: 0), replacementText: "\n")
+        tv.deleteBackward()
+        c.toggle(.bold)
+        c.indent(1)
+        c.textViewDidEndEditing(tv)
+        bar.update(for: .paragraph(AttributedString("x")), marks: .bold)
+        #expect(bar.model == nil)
+    }
+
+    /// An outbox write that throws is retried; the text is never dropped,
+    /// and after the retries it stays (on screen) for the next flush.
+    @Test func aFailingOutboxWriteIsRetriedNotDropped() async throws {
+        let h = try Harness(blocks("a"))
+        h.model.persistRetryDelays = [.milliseconds(10), .milliseconds(10)]
+        let failures = Locked(0)
+        let real = h.model.persist
+        h.model.persist = { req, c, k in
+            if failures.value < 2 { failures.mutate { $0 += 1 }; throw CocoaError(.fileWriteUnknown) }
+            try await real(req, c, k)
+        }
+        h.type("b0", "b", at: 1)
+        await h.model.flush()
+        #expect(try await h.cache.pendingOutbox().count == 1, "written on the third try")
+        // failing for good: kept, said, and written by the next flush
+        h.model.persist = { _, _, _ in throw CocoaError(.fileWriteOutOfSpace) }
+        h.type("b0", "c", at: 2)
+        await h.model.flush()
+        #expect(h.model.persistFailures == 1)
+        #expect(h.model.chip.text == "Couldn't save on this device")
+        #expect(h.markdown == ["abc"], "still there")
+        h.model.persist = real
+        await h.model.flush()
+        #expect(h.model.persistFailures == 0)
+        let last = try JSONDecoder().decode(ProposeRequest.self, from: try await h.cache.pendingOutbox().last?.body ?? Data())
+        #expect(last.ops.first?.kind == .replace(target: "b0", content: "abc"))
+    }
+
+    /// Done (or the app going away) mid-composition saves what's composed.
+    @Test func flushCommitsAnOpenComposition() async throws {
+        let h = try Harness(blocks("ab"))
+        let tv = h.view("b0")
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.addSubview(tv)
+        tv.frame = CGRect(x: 0, y: 0, width: 300, height: 60)
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        tv.becomeFirstResponder()
+        h.model.didFocus(h.views["b0"]!.1)
+        tv.selectedRange = NSRange(location: 2, length: 0)
+        tv.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0))
+        #expect(tv.markedTextRange != nil)
+        await h.model.flush()
+        let row = try #require(try await h.cache.pendingOutbox().last)
+        let req = try JSONDecoder().decode(ProposeRequest.self, from: row.body ?? Data())
+        #expect(req.ops.first?.kind == .replace(target: "b0", content: "abか"))
+        tv.resignFirstResponder()
+    }
+
+    /// Changed on desktop while typed in: the conflict is saved flagged,
+    /// and Take theirs drops our queued saves and shows their text.
+    @Test func takeTheirsDropsOurQueuedSave() async throws {
+        let h = try Harness(blocks("mine"))
+        try await h.cache.storeDoc(DocTree(doc: DocSummary(id: "d", parentID: nil, title: "D", currentEpoch: 1),
+                                           roots: h.model.session.editor.children(of: nil).map { BlockNode(block: $0) }))
+        var remote = try #require(try await h.cache.editor(for: "d"))
+        _ = try remote.apply(.replaceText("b0", "theirs"))
+        h.type("b0", "!", at: 4)
+        h.model.applyRemote(DocEditor(docID: "d", baseEpoch: 2, blocks: Array(remote.blocks.values)))
+        #expect(h.model.session.item("b0")?.remoteText == "theirs")
+        await h.model.flush()
+        #expect(try await h.cache.conflictedBlocks("d") == ["b0": 1], "saved on its old epoch, flagged")
+        await h.model.takeTheirs("b0")
+        h.sync()
+        #expect(h.markdown == ["theirs"])
+        #expect(try await h.cache.pendingOutbox().isEmpty)
+        #expect(try await h.cache.conflictedBlocks("d").isEmpty)
+    }
+
     @Test func chipSaysWhatHappened() {
         let none = DocOutboxState()
         #expect(EditorChip.make(online: true, unsaved: 0, outbox: none, reviews: []).text == "Saved")
@@ -283,4 +374,13 @@ import UIKit
         continuations.forEach { $0.resume() }
         continuations = []
     }
+}
+
+/// A tiny lock for test closures.
+final class Locked<T: Sendable>: @unchecked Sendable {
+    private var v: T
+    private let lock = NSLock()
+    init(_ v: T) { self.v = v }
+    var value: T { lock.withLock { v } }
+    func mutate(_ f: (inout T) -> Void) { lock.withLock { f(&v) } }
 }
