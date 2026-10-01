@@ -58,11 +58,31 @@ private func entry(_ id: String, _ due: String?, overdue: Bool = false, text: St
         #expect(TodoEntry.itemID(position: 3, text: " a ") == "3-e40c292c")
     }
 
-    @Test func overdueFromCacheByTimeOrDay() {
-        #expect(TodoEntry.isOverdue(Due("2026-10-01 11:59").unsafelyUnwrappedForTest, now: noon, timeZone: utc))
-        #expect(!TodoEntry.isOverdue(Due("2026-10-01 12:30").unsafelyUnwrappedForTest, now: noon, timeZone: utc))
-        #expect(!TodoEntry.isOverdue(Due("2026-10-01").unsafelyUnwrappedForTest, now: noon, timeZone: utc))
-        #expect(TodoEntry.isOverdue(Due("2026-09-30").unsafelyUnwrappedForTest, now: noon, timeZone: utc))
+    @Test func overdueByTheInstantOrAfterTheDay() throws {
+        let at = try #require(Deadline.local(Due(year: 2026, month: 10, day: 1, hour: 11, minute: 59), in: utc))
+        let later = try #require(Deadline.local(Due(year: 2026, month: 10, day: 1, hour: 12, minute: 30), in: utc))
+        #expect(at.isOverdue(now: noon, in: utc) && !later.isOverdue(now: noon, in: utc))
+        #expect(!Deadline.allDay("2026-10-01").isOverdue(now: noon, in: utc))
+        #expect(Deadline.allDay("2026-09-30").isOverdue(now: noon, in: utc))
+    }
+
+    /// 2026-10-25 01:30 happens twice in Dublin (BST, then GMT): the first
+    /// one counts, it shows as 01:30, and overdue follows the instant.
+    @Test func dublinFallBackRepeatedHour() throws {
+        let dublin = try #require(TimeZone(identifier: "Europe/Dublin"))
+        let wall = Due(year: 2026, month: 10, day: 25, hour: 1, minute: 30)
+        let d = try #require(Deadline.local(wall, in: dublin))
+        // 01:30 BST = 00:30Z
+        let first = Date(timeIntervalSince1970: 1_792_888_200)
+        #expect(d == .at(first))
+        #expect(d.due(in: dublin) == wall)
+        #expect(!d.isOverdue(now: first.addingTimeInterval(-60), in: dublin))
+        #expect(d.isOverdue(now: first.addingTimeInterval(60), in: dublin))
+        // the entry the To-dos list builds shows the same wall time and tone
+        let entry = TodoEntry(date: "2026-10-25", itemID: "0-x", text: "x", due: d.due(in: dublin), overdue: d.isOverdue(now: first.addingTimeInterval(60), in: dublin))
+        var dubCal = Calendar(identifier: .gregorian)
+        dubCal.timeZone = dublin
+        #expect(DueLabel.make(entry, now: first.addingTimeInterval(60), calendar: dubCal) == DueLabel(tone: .overdue, text: "Overdue · 01:30"))
     }
 
     @Test func snoozeTargets() {

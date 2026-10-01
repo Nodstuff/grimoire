@@ -35,12 +35,6 @@ struct TodoEntry: Identifiable, Hashable, Sendable {
         )
     }
 
-    /// A local wall-time deadline's overdue rule (the device decides).
-    static func isOverdue(_ due: Due, now: Date, timeZone: TimeZone) -> Bool {
-        if due.hasTime { return (due.alertDate(in: timeZone) ?? .distantFuture) < now }
-        return due.dateString < Due.today(now: now, in: timeZone).dateString
-    }
-
     /// `<index among the day's items>-<fnv1a(text)>` (crates/daemon/src/todo.rs).
     /// The server falls back to the hash when the index has shifted.
     static func itemID(position: Int, text: String) -> String {
