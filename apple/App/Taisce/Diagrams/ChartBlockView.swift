@@ -195,34 +195,46 @@ private struct ChartMarkContent: ChartContent {
     var yTitle: String { model.y?.title ?? "y" }
 
     var body: some ChartContent {
-        let x = point.x, y = point.y
-        switch (x, y) {
-        case let (x?, y?):
-            switch (x, y) {
-            case let (.text(a), .number(b)): plot(a, b)
-            case let (.date(a), .number(b)): plot(a, b)
-            case let (.number(a), .number(b)): plot(a, b)
-            case let (.number(a), .text(b)): plot(a, b)
-            case let (.number(a), .date(b)): plot(a, b)
-            case let (.text(a), .text(b)): plot(a, b)
-            case let (.date(a), .text(b)): plot(a, b)
-            case let (.text(a), .date(b)): plot(a, b)
-            case let (.date(a), .date(b)): plot(a, b)
-            }
-        case let (x?, nil):
-            switch x {
-            case let .number(a): RuleMark(x: .value(xTitle, a)).styled(layer, point, rule: true)
-            case let .date(a): RuleMark(x: .value(xTitle, a)).styled(layer, point, rule: true)
-            case let .text(a): RuleMark(x: .value(xTitle, a)).styled(layer, point, rule: true)
-            }
-        case let (nil, y?):
-            switch y {
-            case let .number(b): RuleMark(y: .value(yTitle, b)).styled(layer, point, rule: true)
-            case let .date(b): RuleMark(y: .value(yTitle, b)).styled(layer, point, rule: true)
-            case let .text(b): RuleMark(y: .value(yTitle, b)).styled(layer, point, rule: true)
-            }
-        case (nil, nil):
+        if let x = point.x {
+            if let y = point.y { both(x, y) } else { xRule(x) }
+        } else if let y = point.y {
+            yRule(y)
+        } else {
             RuleMark(y: .value(yTitle, 0.0)).opacity(0)
+        }
+    }
+
+    // split up so the type checker keeps up
+
+    @ChartContentBuilder func both(_ x: ChartValue, _ y: ChartValue) -> some ChartContent {
+        switch x {
+        case let .text(a): withY(a, y)
+        case let .number(a): withY(a, y)
+        case let .date(a): withY(a, y)
+        }
+    }
+
+    @ChartContentBuilder func withY<X: Plottable>(_ a: X, _ y: ChartValue) -> some ChartContent {
+        switch y {
+        case let .number(b): plot(a, b)
+        case let .text(b): plot(a, b)
+        case let .date(b): plot(a, b)
+        }
+    }
+
+    @ChartContentBuilder func xRule(_ x: ChartValue) -> some ChartContent {
+        switch x {
+        case let .number(a): RuleMark(x: .value(xTitle, a)).styled(layer, point, rule: true)
+        case let .date(a): RuleMark(x: .value(xTitle, a)).styled(layer, point, rule: true)
+        case let .text(a): RuleMark(x: .value(xTitle, a)).styled(layer, point, rule: true)
+        }
+    }
+
+    @ChartContentBuilder func yRule(_ y: ChartValue) -> some ChartContent {
+        switch y {
+        case let .number(b): RuleMark(y: .value(yTitle, b)).styled(layer, point, rule: true)
+        case let .date(b): RuleMark(y: .value(yTitle, b)).styled(layer, point, rule: true)
+        case let .text(b): RuleMark(y: .value(yTitle, b)).styled(layer, point, rule: true)
         }
     }
 
