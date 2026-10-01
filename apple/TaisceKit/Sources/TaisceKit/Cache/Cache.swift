@@ -82,6 +82,34 @@ public final class Cache: Sendable {
                 t.column("last_error", .text)
             }
         }
+        m.registerMigration("v2-workspaces") { db in
+            try db.alter(table: "docs") { t in t.add(column: "workspace_id", .text) }
+            try db.create(table: "workspaces") { t in
+                t.primaryKey("id", .text)
+                t.column("name", .text).notNull()
+                t.column("color", .text)
+                t.column("icon", .text)
+                t.column("sort_key", .text)
+                t.column("doc_count", .integer).notNull().defaults(to: 0)
+            }
+            // one list per workspace: rows are keyed by their To-do doc too
+            try db.drop(table: "todos")
+            try db.create(table: "todos") { t in
+                t.column("doc_id", .text).notNull()
+                t.column("date", .text).notNull()
+                t.column("position", .integer).notNull()
+                t.column("mark", .text).notNull()
+                t.column("text", .text).notNull()
+                t.column("deadline", .text)
+                t.column("carried_from", .text)
+                t.column("note", .text)
+                t.primaryKey(["doc_id", "date", "position"])
+            }
+            // the dropped rows come back on the next fetch of each To-do doc
+            try db.execute(sql: "UPDATE docs SET body_epoch = NULL WHERE title = ?", arguments: [TodoParser.todoDocTitle])
+            // re-bootstrap (bodies kept) so every doc row gains its workspace_id
+            try db.execute(sql: "DELETE FROM sync_state WHERE key = 'last_seq'")
+        }
         return m
     }
 
@@ -155,6 +183,7 @@ public final class Cache: Sendable {
             rec.parentID = s.parentID
             rec.sortKey = s.sortKey
             rec.status = s.status
+            rec.workspaceID = s.workspaceID
             rec.currentEpoch = max(rec.currentEpoch, s.currentEpoch)
             try rec.upsert(db)
         }
@@ -181,8 +210,9 @@ public final class Cache: Sendable {
     /// Upsert the doc row and replace its blocks with the fetched tree.
     public func storeDoc(_ tree: DocTree) async throws {
         let flat = tree.flattened().filter { !$0.block.deleted }
-        let todos = tree.doc.parentID == nil && tree.doc.title == TodoParser.todoDocTitle
-            ? TodoParser.parse(markdown: flat.map(\.block.content).joined(separator: "\n\n"))
+        // every workspace has its own To-do doc, at any depth
+        let todos = tree.doc.title == TodoParser.todoDocTitle
+            ? TodoParser.parse(markdown: flat.map(\.block.content).joined(separator: "\n\n")).map { var t = $0; t.docID = tree.doc.id; return t }
             : nil
         try await db.write { db in
             var rec = DocRecord(tree.doc, bodyEpoch: tree.doc.currentEpoch)
@@ -191,6 +221,7 @@ public final class Cache: Sendable {
                 rec.isCanvas = existing.isCanvas
                 rec.isShared = existing.isShared
                 rec.mirrorPermission = existing.mirrorPermission
+                rec.workspaceID = existing.workspaceID
             }
             try rec.upsert(db)
             try BlockRecord.filter(BlockRecord.Columns.docID == tree.doc.id).deleteAll(db)
@@ -203,7 +234,7 @@ public final class Cache: Sendable {
                 ).upsert(db)
             }
             if let todos {
-                try TodoRecord.deleteAll(db)
+                try TodoRecord.filter(TodoRecord.Columns.docID == tree.doc.id).deleteAll(db)
                 for t in todos { try t.upsert(db) }
             }
         }
@@ -233,8 +264,29 @@ public final class Cache: Sendable {
 
     // MARK: to-dos
 
+    /// Every cached list's items (every workspace: what alerts plan from).
     public func todos() async throws -> [TodoRecord] {
         try await db.read { db in try TodoRecord.order(TodoRecord.Columns.date, TodoRecord.Columns.position).fetchAll(db) }
+    }
+
+    /// One To-do doc's items.
+    public func todos(in docID: DocID) async throws -> [TodoRecord] {
+        try await db.read { db in
+            try TodoRecord.filter(TodoRecord.Columns.docID == docID).order(TodoRecord.Columns.date, TodoRecord.Columns.position).fetchAll(db)
+        }
+    }
+
+    // MARK: workspaces
+
+    public func replaceWorkspaces(_ all: [Workspace]) async throws {
+        try await db.write { db in
+            try WorkspaceRecord.deleteAll(db)
+            for w in all { try WorkspaceRecord(w).insert(db) }
+        }
+    }
+
+    public func workspaces() async throws -> [Workspace] {
+        try await db.read { db in try WorkspaceRecord.fetchAll(db).map(\.workspace) }
     }
 
     // MARK: observation (for the UI)

@@ -42,14 +42,17 @@ public struct Change: Codable, Sendable, Hashable {
         public var status: String?
         public var currentEpoch: Int
         public var deleted: Bool
+        /// resolved workspace (nil = Unsorted, or a daemon without workspaces)
+        public var workspaceID: WorkspaceID?
 
-        public init(title: String, parentID: DocID? = nil, sortKey: String? = nil, status: String? = nil, currentEpoch: Int = 0, deleted: Bool = false) {
+        public init(title: String, parentID: DocID? = nil, sortKey: String? = nil, status: String? = nil, currentEpoch: Int = 0, deleted: Bool = false, workspaceID: WorkspaceID? = nil) {
             self.title = title
             self.parentID = parentID
             self.sortKey = sortKey
             self.status = status
             self.currentEpoch = currentEpoch
             self.deleted = deleted
+            self.workspaceID = workspaceID
         }
 
         enum CodingKeys: String, CodingKey {
@@ -57,6 +60,7 @@ public struct Change: Codable, Sendable, Hashable {
             case parentID = "parent_id"
             case sortKey = "sort_key"
             case currentEpoch = "current_epoch"
+            case workspaceID = "workspace_id"
         }
     }
 

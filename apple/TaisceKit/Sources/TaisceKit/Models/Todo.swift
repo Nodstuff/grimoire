@@ -219,6 +219,9 @@ public struct TodoDueList: Codable, Sendable, Hashable {
         public var legacyDueTime: String?
         public var note: String?
         public var carriedFrom: String?
+        /// Lists read without a `workspace` (every list): which one it is on.
+        public var docID: DocID?
+        public var workspaceID: WorkspaceID?
 
         public var id: String { "\(date)/\(itemID)" }
 
@@ -248,6 +251,8 @@ public struct TodoDueList: Codable, Sendable, Hashable {
             case legacyTime = "legacy_time"
             case legacyDueTime = "due_time"
             case carriedFrom = "carried_from"
+            case docID = "doc_id"
+            case workspaceID = "workspace_id"
         }
 
         public init(from decoder: any Decoder) throws {
@@ -261,6 +266,8 @@ public struct TodoDueList: Codable, Sendable, Hashable {
             legacyDueTime = try c.decodeIfPresent(String.self, forKey: .legacyDueTime)
             note = try c.decodeIfPresent(String.self, forKey: .note)
             carriedFrom = try c.decodeIfPresent(String.self, forKey: .carriedFrom)
+            docID = try c.decodeIfPresent(DocID.self, forKey: .docID)
+            workspaceID = try c.decodeIfPresent(WorkspaceID.self, forKey: .workspaceID)
         }
     }
 

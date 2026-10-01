@@ -43,17 +43,23 @@ public struct APIClient: Sendable {
         return b.markdown
     }
 
-    public func search(_ query: String, scope: DocID? = nil) async throws -> [SearchHit] {
+    /// `workspace` limits hits to docs resolving to it (nil = everywhere).
+    public func search(_ query: String, scope: DocID? = nil, workspace: WorkspaceScope? = nil) async throws -> [SearchHit] {
         var q = [URLQueryItem(name: "q", value: query)]
         if let scope { q.append(URLQueryItem(name: "scope", value: scope)) }
+        if let workspace { q.append(URLQueryItem(name: "workspace", value: workspace.param)) }
         return try await get("/api/search", query: q)
     }
 
     /// Open to-dos with deadlines up to `until` (a day, RFC 3339, or a local
     /// `YYYY-MM-DDTHH:MM`; nil = every deadline), soonest alert first,
     /// overdue computed by time. Read-only.
-    public func todoDue(until: String? = nil) async throws -> TodoDueList {
-        try await get("/api/todo/due", query: until.map { [URLQueryItem(name: "until", value: $0)] } ?? [])
+    /// `workspace` reads that workspace's list; nil reads EVERY list (each
+    /// item then carries its `docID` and `workspaceID`), for alerts.
+    public func todoDue(until: String? = nil, workspace: WorkspaceScope? = nil) async throws -> TodoDueList {
+        var q = until.map { [URLQueryItem(name: "until", value: $0)] } ?? []
+        if let workspace { q.append(URLQueryItem(name: "workspace", value: workspace.param)) }
+        return try await get("/api/todo/due", query: q)
     }
 
     /// The change-log head alone (`limit=0`), e.g. to start a cursor without a backfill.
@@ -153,11 +159,13 @@ public struct APIClient: Sendable {
             case itemID = "item_id"
             case toDate = "to_date"
             case utcOffset = "utc_offset"
+            case workspace
         }
 
         func encode(to encoder: any Encoder) throws {
             var c = encoder.container(keyedBy: CodingKeys.self)
             try c.encode(date, forKey: .date)
+            try c.encodeIfPresent(clock.workspace, forKey: .workspace)
             try c.encodeIfPresent(itemID, forKey: .itemID)
             try c.encodeIfPresent(text, forKey: .text)
             try c.encodeIfPresent(done, forKey: .done)
@@ -178,11 +186,13 @@ public struct APIClient: Sendable {
             case date, deadline, today
             case itemID = "item_id"
             case dueAt = "due_at"
+            case workspace
         }
 
         func encode(to encoder: any Encoder) throws {
             var c = encoder.container(keyedBy: CodingKeys.self)
             try c.encode(date, forKey: .date)
+            try c.encodeIfPresent(clock.workspace, forKey: .workspace)
             try c.encode(itemID, forKey: .itemID)
             try c.encode(clock.today, forKey: .today)
             switch deadline {

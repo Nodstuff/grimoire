@@ -16,6 +16,8 @@ public struct DocRecord: Codable, Sendable, Hashable, Identifiable, FetchableRec
     public var isShared: Bool
     public var mirrorPermission: String?
     public var bodyEpoch: Int?
+    /// resolved workspace from `/api/docs` or a change row (nil = Unsorted)
+    public var workspaceID: WorkspaceID?
 
     public var isBodyStale: Bool { bodyEpoch.map { $0 < currentEpoch } ?? true }
 
@@ -28,6 +30,7 @@ public struct DocRecord: Codable, Sendable, Hashable, Identifiable, FetchableRec
         case isShared = "is_shared"
         case mirrorPermission = "mirror_permission"
         case bodyEpoch = "body_epoch"
+        case workspaceID = "workspace_id"
     }
 
     public typealias Columns = CodingKeys
@@ -43,13 +46,14 @@ public struct DocRecord: Codable, Sendable, Hashable, Identifiable, FetchableRec
         isShared = s.isShared
         mirrorPermission = s.mirrorPermission
         self.bodyEpoch = bodyEpoch
+        workspaceID = s.workspaceID
     }
 
     public var summary: DocSummary {
         DocSummary(
             id: id, parentID: parentID, title: title, currentEpoch: currentEpoch,
             sortKey: sortKey, status: status, isCanvas: isCanvas, isShared: isShared,
-            mirrorPermission: mirrorPermission
+            mirrorPermission: mirrorPermission, workspaceID: workspaceID
         )
     }
 }
@@ -102,6 +106,8 @@ public struct TodoRecord: Codable, Sendable, Hashable, FetchableRecord, Persista
     public var deadline: String?
     public var carriedFrom: String?
     public var note: String?
+    /// the To-do doc it was parsed from (one list per workspace)
+    public var docID: DocID = ""
 
     public var isOpen: Bool { mark == " " }
     /// `deadline` is the stored token: `YYYY-MM-DD`, `YYYY-MM-DDTHH:MMZ`, or legacy `D HH:MM`
@@ -115,7 +121,40 @@ public struct TodoRecord: Codable, Sendable, Hashable, FetchableRecord, Persista
     public enum CodingKeys: String, CodingKey, ColumnExpression {
         case date, position, mark, text, deadline, note
         case carriedFrom = "carried_from"
+        case docID = "doc_id"
     }
 
     public typealias Columns = CodingKeys
+}
+
+/// A cached `GET /api/workspaces` row (doc ids and counts stay server-side:
+/// a doc's workspace comes from its own `workspace_id`).
+public struct WorkspaceRecord: Codable, Sendable, Hashable, FetchableRecord, PersistableRecord {
+    public static let databaseTableName = "workspaces"
+
+    public var id: WorkspaceID
+    public var name: String
+    public var color: String?
+    public var icon: String?
+    public var sortKey: String?
+    public var docCount: Int
+
+    public enum CodingKeys: String, CodingKey, ColumnExpression {
+        case id, name, color, icon
+        case sortKey = "sort_key"
+        case docCount = "doc_count"
+    }
+
+    init(_ w: Workspace) {
+        id = w.id
+        name = w.name
+        color = w.color
+        icon = w.icon
+        sortKey = w.sortKey
+        docCount = w.docCount
+    }
+
+    public var workspace: Workspace {
+        Workspace(id: id, name: name, color: color, icon: icon, sortKey: sortKey, docCount: docCount)
+    }
 }

@@ -185,12 +185,12 @@ public actor SyncEngine {
         return head ?? 0
     }
 
+    /// Every To-do doc (one per workspace), so each list has items offline.
     func fetchTodoIfStale() async throws {
-        guard let todo = try await cache.docs().first(where: { $0.parentID == nil && $0.title == TodoParser.todoDocTitle }),
-              todo.isBodyStale
-        else { return }
+        let stale = try await cache.docs().filter { $0.title == TodoParser.todoDocTitle && $0.isBodyStale }
+        guard !stale.isEmpty else { return }
         var update = SyncUpdate(docIDs: [], treeChanged: false)
-        try await fetchBody(todo.id, target: todo.currentEpoch, into: &update)
+        for todo in stale { try await fetchBody(todo.id, target: todo.currentEpoch, into: &update) }
         publish(update)
     }
 
@@ -258,7 +258,7 @@ public actor SyncEngine {
             let target = c.doc?.currentEpoch ?? c.epoch
             let cached = try await cache.doc(id)
             let wanted = alwaysFetch.contains(id)
-                || (cached.map { $0.parentID == nil && $0.title == TodoParser.todoDocTitle } ?? false)
+                || (cached.map { $0.title == TodoParser.todoDocTitle } ?? false)
             let held = cached?.bodyEpoch != nil
             if held || wanted {
                 if let have = cached?.bodyEpoch, let target, have >= target { continue }

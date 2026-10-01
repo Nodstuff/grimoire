@@ -194,6 +194,9 @@ public struct TodoClock: Sendable, Hashable, Encodable {
     /// The zone `today` was read in (not sent): the local day of a timed
     /// deadline is taken in it.
     public var timeZone: TimeZone
+    /// Which workspace's To-do list the call means (`unsorted` or an id);
+    /// nil = the legacy list. Sent as `workspace`.
+    public var workspace: String?
 
     /// A fixed clock; the zone is the offset's (`+01:00` → UTC+1).
     public init(today: String, utcOffset: String) {
@@ -210,6 +213,13 @@ public struct TodoClock: Sendable, Hashable, Encodable {
         return TimeZone(secondsFromGMT: (sign == "-" ? -1 : 1) * (h * 3600 + m * 60))
     }
 
+    /// This clock, addressed to one workspace's list.
+    public func `in`(_ scope: WorkspaceScope?) -> TodoClock {
+        var c = self
+        c.workspace = scope?.param
+        return c
+    }
+
     public init(now: Date = .now, timeZone: TimeZone = .current) {
         self.timeZone = timeZone
         today = Deadline.calendar(timeZone).dateString(now)
@@ -221,5 +231,13 @@ public struct TodoClock: Sendable, Hashable, Encodable {
     enum CodingKeys: String, CodingKey {
         case today
         case utcOffset = "utc_offset"
+        case workspace
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(today, forKey: .today)
+        try c.encode(utcOffset, forKey: .utcOffset)
+        try c.encodeIfPresent(workspace, forKey: .workspace)
     }
 }

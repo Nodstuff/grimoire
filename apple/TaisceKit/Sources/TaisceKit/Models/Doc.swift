@@ -18,11 +18,14 @@ public struct DocSummary: Codable, Sendable, Hashable, Identifiable {
     public var isShared: Bool
     /// Set when the doc is a federation mirror ("read" / "propose" / ...).
     public var mirrorPermission: String?
+    /// The workspace the doc resolves to (nil = Unsorted, or a daemon
+    /// without workspaces). `/api/docs` only.
+    public var workspaceID: WorkspaceID?
 
     public init(
         id: DocID, parentID: DocID?, title: String, currentEpoch: Int,
         sortKey: String? = nil, status: String? = nil, isCanvas: Bool = false,
-        isShared: Bool = false, mirrorPermission: String? = nil
+        isShared: Bool = false, mirrorPermission: String? = nil, workspaceID: WorkspaceID? = nil
     ) {
         self.id = id
         self.parentID = parentID
@@ -33,6 +36,7 @@ public struct DocSummary: Codable, Sendable, Hashable, Identifiable {
         self.isCanvas = isCanvas
         self.isShared = isShared
         self.mirrorPermission = mirrorPermission
+        self.workspaceID = workspaceID
     }
 
     enum CodingKeys: String, CodingKey {
@@ -43,6 +47,7 @@ public struct DocSummary: Codable, Sendable, Hashable, Identifiable {
         case isCanvas = "is_canvas"
         case isShared = "is_shared"
         case mirrorPermission = "mirror_permission"
+        case workspaceID = "workspace_id"
     }
 
     public init(from decoder: any Decoder) throws {
@@ -57,6 +62,7 @@ public struct DocSummary: Codable, Sendable, Hashable, Identifiable {
         isCanvas = try c.decodeIfPresent(Bool.self, forKey: .isCanvas) ?? false
         isShared = try c.decodeIfPresent(Bool.self, forKey: .isShared) ?? false
         mirrorPermission = try c.decodeIfPresent(String.self, forKey: .mirrorPermission)
+        workspaceID = try c.decodeIfPresent(WorkspaceID.self, forKey: .workspaceID)
     }
 }
 

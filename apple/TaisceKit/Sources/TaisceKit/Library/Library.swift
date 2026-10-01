@@ -37,4 +37,9 @@ public enum Library {
     public static func todoDocID(in docs: [DocRecord]) -> DocID? {
         docs.first { $0.parentID == nil && $0.title == TodoParser.todoDocTitle }?.id
     }
+
+    /// Every To-do doc: one list per workspace, at any depth.
+    public static func todoDocIDs(in docs: [DocRecord]) -> Set<DocID> {
+        Set(docs.filter { $0.title == TodoParser.todoDocTitle }.map(\.id))
+    }
 }
