@@ -11,7 +11,9 @@ struct RootView: View {
     var body: some View {
         @Bindable var router = router
         Group {
-            if model.needsSignIn {
+            if model.isCheckingAuth {
+                LaunchView()
+            } else if model.needsSignIn {
                 SignInScreen()
             } else if sizeClass == .regular {
                 PadRoot()
@@ -131,6 +133,7 @@ struct PadSidebar: View {
                     if !q.isEmpty, router.padItem != .search { router.select(.search) }
                 }
                 Label("Today", systemImage: "house").tag(PadItem.today)
+                    .badge(model.dueCount)
                 Label("To-dos", systemImage: "checkmark.circle").tag(PadItem.todos)
             }
             Section("Library") {
@@ -160,4 +163,24 @@ struct PadSidebar: View {
         }
         .refreshable { try? await model.sync?.catchUp() }
     }
+}
+
+/// While discovery decides whether the server needs sign-in.
+struct LaunchView: View {
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Taisce")
+                .font(.system(size: 40, weight: .semibold, design: .serif))
+                .foregroundStyle(Theme.text)
+            ProgressView().tint(Theme.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.ground.ignoresSafeArea())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Taisce, connecting")
+    }
+}
+
+#Preview("Launch") {
+    LaunchView().preferredColorScheme(.dark)
 }

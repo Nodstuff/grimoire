@@ -88,15 +88,19 @@ struct LibraryNode: Identifiable, Hashable, Sendable {
         let index = DocIndex(docs)
         // a doc whose parent we don't have (trashed, not shared to us) shows at the root
         let byParent = Dictionary(grouping: docs) { d in d.parentID.flatMap { index.byID[$0] == nil ? nil : $0 } }
-        func nodes(_ parent: DocID?, depth: Int) -> [LibraryNode] {
-            (byParent[parent] ?? [])
-                .sorted { ($0.sortKey ?? "", $0.title) < ($1.sortKey ?? "", $1.title) }
-                .map { d in
-                    let kids = depth < 64 ? nodes(d.id, depth: depth + 1) : []
-                    return LibraryNode(doc: d, subtitle: subtitle(d, kids: kids.count, index: index), children: kids.isEmpty ? nil : kids)
-                }
+        let order: (DocInfo, DocInfo) -> Bool = { ($0.sortKey ?? "", $0.title) < ($1.sortKey ?? "", $1.title) }
+        var seen: Set<DocID> = []
+        func node(_ d: DocInfo) -> LibraryNode {
+            seen.insert(d.id)
+            let kids = (byParent[d.id] ?? []).filter { !seen.contains($0.id) }.sorted(by: order).map(node)
+            return LibraryNode(doc: d, subtitle: subtitle(d, kids: kids.count, index: index), children: kids.isEmpty ? nil : kids)
         }
-        return nodes(nil, depth: 0)
+        var roots = (byParent[nil] ?? []).sorted(by: order).map(node)
+        // a parent cycle (a → b → a) never reaches the root: show it there
+        for d in docs.sorted(by: order) where !seen.contains(d.id) {
+            roots.append(node(d))
+        }
+        return roots
     }
 
     /// Folders say how much is inside; nested leaves say where they live.

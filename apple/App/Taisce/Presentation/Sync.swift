@@ -13,6 +13,7 @@ struct SyncBadge: Hashable, Sendable {
         case (.live, 0): SyncBadge(tone: .saved, text: "Saved")
         case (.live, let n): SyncBadge(tone: .busy, text: "Saving · \(n)")
         case (.catchingUp, 0): SyncBadge(tone: .busy, text: "Syncing")
+        case (.waiting, 0): SyncBadge(tone: .offline, text: "Offline")
         case (_, 0): SyncBadge(tone: .idle, text: "Offline")
         case (_, let n): SyncBadge(tone: .offline, text: "Offline · \(n) pending")
         }

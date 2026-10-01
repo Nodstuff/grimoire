@@ -53,27 +53,11 @@ struct RenderNodeView: View {
 
     static func headingFont(_ level: Int) -> Font {
         switch level {
-        case 1: Theme.serif(.title)
-        case 2: Theme.serif(.title2)
-        case 3: Theme.serif(.title3)
+        case 1: Theme.serif(.title2)
+        case 2: Theme.serif(.title3)
+        case 3: Theme.serif(.headline)
         default: .headline
         }
-    }
-
-    /// Task checkboxes inside `node` (pre-order, as they appear in the markdown).
-    nonisolated static func checkboxCount(_ node: RenderNode) -> Int {
-        switch node {
-        case let .list(_, _, items):
-            items.reduce(0) { $0 + ($1.checked == nil ? 0 : 1) + checkboxCount($1.children) }
-        case let .quote(_, children):
-            checkboxCount(children)
-        default:
-            0
-        }
-    }
-
-    nonisolated static func checkboxCount(_ nodes: [RenderNode]) -> Int {
-        nodes.reduce(0) { $0 + checkboxCount($1) }
     }
 }
 
@@ -85,20 +69,10 @@ struct NodeStack: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: spacing) {
-            ForEach(Array(offsets.enumerated()), id: \.offset) { i, base in
+            ForEach(Array(RenderMetrics.checkboxOffsets(nodes, base: checkboxBase).enumerated()), id: \.offset) { i, base in
                 RenderNodeView(node: nodes[i], checkboxBase: base)
             }
         }
-    }
-
-    var offsets: [Int] {
-        var out: [Int] = []
-        var n = checkboxBase
-        for node in nodes {
-            out.append(n)
-            n += RenderNodeView.checkboxCount(node)
-        }
-        return out
     }
 }
 
@@ -107,7 +81,7 @@ private struct Paragraph: View {
 
     var body: some View {
         Text(InlineMarkdown.attributed(inline))
-            .font(.body)
+            .font(.callout)
             .lineSpacing(4)
             .foregroundStyle(Theme.text)
             .tint(Theme.accentActive)
@@ -125,8 +99,9 @@ private struct ListBlock: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            let offsets = RenderMetrics.itemOffsets(items, base: checkboxBase)
             ForEach(Array(items.enumerated()), id: \.offset) { i, item in
-                let base = itemBase(i)
+                let base = offsets[i]
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     marker(i, item, index: base)
                     NodeStack(nodes: item.children, checkboxBase: base + (item.checked == nil ? 0 : 1), spacing: 6)
@@ -134,10 +109,6 @@ private struct ListBlock: View {
                 }
             }
         }
-    }
-
-    func itemBase(_ i: Int) -> Int {
-        checkboxBase + items[..<i].reduce(0) { $0 + ($1.checked == nil ? 0 : 1) + RenderNodeView.checkboxCount($1.children) }
     }
 
     func isChecked(_ item: RenderNode.ListItem, _ index: Int) -> Bool {

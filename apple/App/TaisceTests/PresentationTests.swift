@@ -128,6 +128,12 @@ private func entry(_ id: String, _ due: String?, overdue: Bool = false, text: St
         #expect(index.doc(titled: "Nope") == nil)
     }
 
+    @Test func parentCycleStillShowsAtTheRoot() {
+        let nodes = LibraryNode.build([DocInfo(id: "a", parentID: "b", title: "A"), DocInfo(id: "b", parentID: "a", title: "B")])
+        #expect(nodes.count == 1)
+        #expect(nodes[0].children?.count == 1)
+    }
+
     @Test func ancestorsStopOnCycle() {
         let index = DocIndex([DocInfo(id: "a", parentID: "b", title: "A"), DocInfo(id: "b", parentID: "a", title: "B")])
         #expect(index.ancestors(of: "a").map(\.id) == ["b"])
@@ -169,6 +175,19 @@ private func entry(_ id: String, _ due: String?, overdue: Bool = false, text: St
         #expect(SyncBadge.make(status: .live, pending: 2).tone == .busy)
         #expect(SyncBadge.make(status: .waiting(retryIn: .seconds(3)), pending: 2) == SyncBadge(tone: .offline, text: "Offline · 2 pending"))
         #expect(SyncBadge.make(status: .idle, pending: 0).text == "Offline")
+        #expect(SyncBadge.make(status: .waiting(retryIn: .seconds(3)), pending: 0) == SyncBadge(tone: .offline, text: "Offline"))
+    }
+
+    @Test func emptyBoardIsLoadingUntilTheFirstSync() {
+        let empty = TodoBoard()
+        let one = TodoBoard.build(dated: [entry("a", "2026-10-01 13:00")], now: noon, timeZone: utc)
+        #expect(TodoBoard.shown(nil, hasSynced: true, status: .live) == nil)
+        #expect(TodoBoard.shown(empty, hasSynced: false, status: .catchingUp) == nil)
+        #expect(TodoBoard.shown(empty, hasSynced: false, status: .idle) == nil)
+        #expect(TodoBoard.shown(empty, hasSynced: true, status: .live) == empty)
+        // offline with nothing cached: show the empty state, not a spinner forever
+        #expect(TodoBoard.shown(empty, hasSynced: false, status: .waiting(retryIn: .seconds(2))) == empty)
+        #expect(TodoBoard.shown(one, hasSynced: false, status: .catchingUp) == one)
     }
 }
 
@@ -218,7 +237,32 @@ private func entry(_ id: String, _ due: String?, overdue: Bool = false, text: St
 
     @Test func checkboxCountsMatchRenderOrder() {
         let nodes = BlockRenderer.render(markdown: "- [ ] one\n- [x] two\n  - [ ] nested\n- plain")
-        #expect(RenderNodeView.checkboxCount(nodes) == 3)
+        #expect(RenderMetrics.checkboxCount(nodes) == 3)
+        guard case let .list(_, _, items)? = nodes.first else { Issue.record("not a list"); return }
+        #expect(RenderMetrics.itemOffsets(items) == [0, 1, 3])
+    }
+}
+
+@Suite struct RenderCacheTests {
+    func block(_ content: String, id: String = "b") -> Block {
+        Block(id: id, docID: "d", parentID: nil, orderKey: "a", blockType: .paragraph, content: content)
+    }
+
+    @Test func reusesUnchangedBlocksAndReparsesEdits() {
+        let cache = RenderCache()
+        #expect(cache.count == 0)
+        let first = cache.nodes(for: block("Hello"))
+        #expect(cache.nodes(for: block("Hello")) == first && cache.count == 1)
+        #expect(cache.nodes(for: block("Hello **you**")) == [.paragraph(inline: "Hello **you**")])
+        #expect(cache.count == 2)
+    }
+
+    @Test func manyBlocksOffTheMainActorAndALimit() async {
+        let cache = RenderCache(limit: 10)
+        let blocks = (0..<25).map { block("para \($0)", id: "b\($0)") }
+        let page = await Task.detached { DocPage.build(title: "T", blocks: blocks, render: cache.nodes(for:)) }.value
+        #expect(page.blocks.count == 25)
+        #expect(cache.count <= 10)
     }
 }
 

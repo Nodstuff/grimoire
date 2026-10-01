@@ -293,6 +293,29 @@ struct ScriptedWeb: WebAuthenticator {
         #expect(await auth.state == .signedOut)
     }
 
+    @Test func aCancelledSignInLeavesAUsableStateAndCanRetry() async throws {
+        let fake = FakeAuthServer()
+        let store = MemoryTokenStore()
+        let auth = session(fake, store: store)
+        await #expect(throws: AuthError.cancelled) { try await auth.signIn(using: CancellingWeb()) }
+        #expect(await auth.state == .signedOut)
+        #expect(try store.tokens(for: Self.server) == nil)
+        await #expect(throws: AuthError.signedOut) { try await auth.token() }
+        // the retry reuses the client registered before the cancel
+        try await auth.signIn(using: ScriptedWeb(server: fake))
+        #expect(await auth.state == .signedIn && fake.snapshot.registrations == 1)
+    }
+
+    @Test func tokensSurviveARelaunch() async throws {
+        let fake = FakeAuthServer()
+        let store = MemoryTokenStore()
+        try await session(fake, store: store).signIn(using: ScriptedWeb(server: fake))
+        // a new process: a fresh session over the same store
+        let relaunched = session(fake, store: store)
+        #expect(await relaunched.state == .signedIn)
+        #expect(try await relaunched.token() == "a1")
+    }
+
     // MARK: refresh
 
     @Test func nearExpiryRefreshesAndRotates() async throws {
@@ -387,4 +410,9 @@ struct ScriptedWeb: WebAuthenticator {
         #expect(streams.allSatisfy { $0.value(forHTTPHeaderField: "Last-Event-ID") == "3" })
         #expect(fake.tokenCalls == 1)
     }
+}
+
+/// The user closed the sign-in sheet.
+struct CancellingWeb: WebAuthenticator {
+    func authenticate(url: URL, callbackScheme: String) async throws -> URL { throw AuthError.cancelled }
 }

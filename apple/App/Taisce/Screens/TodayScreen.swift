@@ -11,7 +11,7 @@ struct TodayScreen: View {
     var body: some View {
         TodayContent(
             dayLine: RelativeTime.dayLine(),
-            due: board?.due,
+            due: TodoBoard.shown(board, hasSynced: model.hasSynced, status: model.syncStatus)?.due,
             pinned: DocCardModel.pinned(model.pins, index: model.index, meta: model.editMeta),
             badge: SyncBadge.make(status: model.syncStatus, pending: model.pendingWrites),
             onSearch: router.showSearch,
@@ -47,31 +47,29 @@ struct TodayContent: View {
 
     static let dueLimit = 5
 
+
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
-                VStack(alignment: .leading, spacing: 16) {
-                    ScreenHeader(title: "Today", kicker: dayLine) {
-                        HStack(spacing: 4) {
-                            SyncChip(badge: badge)
-                            Button(action: onSettings) {
-                                Image(systemName: "gearshape")
-                                    .font(.title3)
-                                    .foregroundStyle(Theme.secondary)
-                                    .frame(width: Theme.minTarget, height: Theme.minTarget)
-                                    .contentShape(.rect)
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Settings")
-                        }
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(dayLine).font(.caption).foregroundStyle(Theme.secondary)
+                        Spacer()
+                        SyncChip(badge: badge)
+                        CircleIconButton(systemImage: "gearshape", label: "Settings", action: onSettings)
                     }
+                    Text("Today")
+                        .font(Theme.serif(.largeTitle))
+                        .foregroundStyle(Theme.text)
+                        .accessibilityAddTraits(.isHeader)
+                        .padding(.bottom, 10)
                     SearchFieldButton(action: onSearch)
                 }
                 dueSection
                 pinnedSection
             }
             .padding(.horizontal, Theme.gutter)
-            .padding(.top, 8)
+            .padding(.top, 4)
             .padding(.bottom, 32)
             .frame(maxWidth: Theme.readingWidth)
             .frame(maxWidth: .infinity)
@@ -84,11 +82,8 @@ struct TodayContent: View {
         VStack(alignment: .leading, spacing: 10) {
             SectionLabel("Due", trailing: AnyView(
                 Button(action: onAllTodos) {
-                    HStack(spacing: 2) {
-                        Text("All to-dos")
-                        Image(systemName: "chevron.right").font(.caption.weight(.semibold))
-                    }
-                    .font(.subheadline)
+                    Text("All to-dos")
+                    .font(.caption.weight(.medium))
                     .foregroundStyle(Theme.accentActive)
                     .frame(minHeight: Theme.minTarget)
                     .contentShape(.rect)
@@ -118,7 +113,7 @@ struct TodayContent: View {
             if pinned.isEmpty {
                 EmptyCard(icon: "pin", title: "No pinned docs", hint: "Long-press a doc in Library to pin it here. Pins stay on this device.")
             } else {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
                     ForEach(pinned) { doc in
                         Button { onOpen(doc.id) } label: { DocCard(doc: doc, now: now) }
                             .buttonStyle(.plain)

@@ -101,18 +101,19 @@ struct DocContent: View {
                         .font(Theme.serif(.largeTitle))
                         .foregroundStyle(Theme.text)
                         .accessibilityAddTraits(.isHeader)
-                    if let tags = page?.tags, !tags.isEmpty {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 6) { ForEach(tags, id: \.self) { TagChip(tag: $0) } }
+                    if !metaLine.isEmpty {
+                        // "#design #mobile · edited by claude 2 h ago"
+                        FlowRow(spacing: 6) {
+                            ForEach(page?.tags ?? [], id: \.self) { TagChip(tag: $0) }
+                            if let meta {
+                                Text("\(page?.tags.isEmpty == false ? "· " : "")edited by \(meta.author) \(RelativeTime.string(meta.date, now: now))")
+                                    .font(.caption2)
+                                    .foregroundStyle(Theme.secondary)
+                            }
                         }
                     }
-                    if let meta {
-                        Text("edited by \(meta.author) \(RelativeTime.string(meta.date, now: now))")
-                            .font(.footnote)
-                            .foregroundStyle(Theme.secondary)
-                    }
                 }
-                .padding(.bottom, 8)
+                .padding(.bottom, 6)
                 content
             }
             .padding(.horizontal, Theme.gutter)
@@ -132,10 +133,19 @@ struct DocContent: View {
                     .truncationMode(.head)
             }
             ToolbarItem(placement: .primaryAction) {
-                Button(pinned ? "Unpin" : "Pin", systemImage: pinned ? "pin.slash" : "pin", action: onTogglePin)
-                    .accessibilityLabel(pinned ? "Unpin from Today" : "Pin to Today")
+                Menu {
+                    Button(pinned ? "Unpin from Today" : "Pin to Today", systemImage: pinned ? "pin.slash" : "pin", action: onTogglePin)
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                .accessibilityLabel("More")
             }
         }
+    }
+
+    /// whether the tags / "edited by" line has anything to show
+    var metaLine: String {
+        ((page?.tags ?? []) + (meta.map { [$0.author] } ?? [])).joined()
     }
 
     @ViewBuilder private var content: some View {

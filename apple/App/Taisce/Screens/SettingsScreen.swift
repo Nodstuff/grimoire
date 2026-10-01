@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import TaisceKit
 
 /// Server, account and sync status.
@@ -16,9 +17,11 @@ struct SettingsScreen: View {
                     lastSynced: model.lastSynced,
                     cursor: model.cursor,
                     pending: model.pendingWrites,
-                    lastError: model.lastError
+                    lastError: model.lastError,
+                    alerts: model.dueAlerts.status
                 ),
                 onSave: { url in Task { await model.setServerURL(url) } },
+                onEnableAlerts: { Task { await model.dueAlerts.requestAuthorization() } },
                 onSignOut: {
                     Task {
                         await model.signOut()
@@ -27,6 +30,7 @@ struct SettingsScreen: View {
                 },
                 onDone: { dismiss() }
             )
+            .task { await model.dueAlerts.refresh() }
         }
     }
 }
@@ -39,12 +43,15 @@ struct SettingsInfo {
     var cursor: Int
     var pending: Int
     var lastError: String?
+    var alerts: DueAlertStatus = .allowed
 }
 
 struct SettingsContent: View {
     let info: SettingsInfo
     var now: Date = .now
     var onSave: (String) -> Void = { _ in }
+    var onEnableAlerts: () -> Void = {}
+    @Environment(\.openURL) private var openURL
     var onSignOut: () -> Void = {}
     var onDone: () -> Void = {}
     @State private var url = ""
@@ -90,6 +97,24 @@ struct SettingsContent: View {
             }
             .listRowBackground(Theme.surface)
 
+            Section {
+                switch info.alerts {
+                case .allowed:
+                    LabeledContent("Due reminders", value: "On")
+                case .notDetermined:
+                    Button("Turn on due reminders", action: onEnableAlerts)
+                case .denied:
+                    Button("Allow notifications in Settings") {
+                        if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
+                    }
+                }
+            } header: {
+                Text("Notifications")
+            } footer: {
+                Text("A nudge when a to-do's deadline arrives.")
+            }
+            .listRowBackground(Theme.surface)
+
             if let error = info.lastError {
                 Section("Last error") { Text(error).font(.footnote).foregroundStyle(Theme.secondary) }
                     .listRowBackground(Theme.surface)
@@ -109,6 +134,7 @@ struct SettingsContent: View {
 
     var accountText: String {
         switch info.account {
+        case .checking: "Checking the server"
         case .notRequired: "Local daemon, no sign-in"
         case .signedIn: "Signed in"
         case .signedOut: "Signed out"
@@ -120,7 +146,7 @@ struct SettingsContent: View {
     NavigationStack {
         SettingsContent(info: SettingsInfo(
             serverURL: "https://taisce.null.ie", account: .signedIn, status: .live,
-            lastSynced: PreviewData.ago(40), cursor: 1842, pending: 0
+            lastSynced: PreviewData.ago(40), cursor: 1842, pending: 0, alerts: .notDetermined
         ), now: PreviewData.now)
     }
     .preferredColorScheme(.dark)

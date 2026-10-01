@@ -17,7 +17,7 @@ struct DocPage: Hashable, Sendable {
     var isEmpty: Bool { blocks.isEmpty }
 
     /// Pure and synchronous (markdown parsing): call it off the main actor.
-    static func build(title: String, blocks: [Block]) -> DocPage {
+    static func build(title: String, blocks: [Block], render: (Block) -> [RenderNode] = BlockRenderer.render) -> DocPage {
         var page = DocPage()
         for b in blocks where !b.deleted && b.blockType != .comment {
             // frontmatter, whatever type the import gave it
@@ -26,7 +26,7 @@ struct DocPage: Hashable, Sendable {
                 page.tags.append(contentsOf: frontmatterTags(trimmed))
                 continue
             }
-            var nodes = BlockRenderer.render(b)
+            var nodes = render(b)
             nodes.removeAll { node in
                 if case .frontmatter(let text) = node {
                     page.tags.append(contentsOf: frontmatterTags(text))

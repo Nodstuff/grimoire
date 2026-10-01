@@ -22,9 +22,6 @@ targets:
       - Taisce
     dependencies:
       - package: TaisceKit
-    scheme:
-      testTargets:
-        - TaisceTests
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce
@@ -37,6 +34,9 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 6UP35L9425
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
     info:
       path: Taisce/Info.plist
       properties:
@@ -60,12 +60,37 @@ targets:
     deploymentTarget: "26.0"
     sources:
       - TaisceTests
+    # TaisceKit comes through the host app (BUNDLE_LOADER): linking the
+    # package here too turns it into a shared framework and breaks the app's link
     dependencies:
-      # the host app carries TaisceKit; linking it here too turns it into a
-      # shared framework that doesn't re-export GRDB
       - target: Taisce
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce.tests
         GENERATE_INFOPLIST_FILE: YES
-        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 6UP35L9425
+  TaisceUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - TaisceUITests
+    dependencies:
+      - target: Taisce
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 6UP35L9425
+        TEST_TARGET_NAME: Taisce
+schemes:
+  Taisce:
+    build:
+      targets:
+        Taisce: all
+    test:
+      targets:
+        - TaisceTests
+        - TaisceUITests

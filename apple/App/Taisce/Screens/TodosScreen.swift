@@ -13,8 +13,10 @@ struct TodosScreen: View {
 
     var body: some View {
         TodosContent(
-            board: board,
+            board: TodoBoard.shown(board, hasSynced: model.hasSynced, status: model.syncStatus),
             offline: offline,
+            alertStatus: model.dueAlerts.status,
+            onEnableAlerts: { Task { await model.dueAlerts.requestAuthorization() } },
             draft: $draft,
             hint: hint,
             onDone: { e in Task { await model.markDone(e) } },
@@ -28,6 +30,7 @@ struct TodosScreen: View {
         )
         .refreshable { await reload() }
         .task(id: model.todoRevision) { await reload() }
+        .task { await model.dueAlerts.refresh() }
         .task(id: draft) {
             // debounce typing, then ask the server how it reads the phrase
             guard draft.count > 2 else { hint = nil; return }
@@ -48,6 +51,8 @@ struct TodosContent: View {
     /// nil while loading
     let board: TodoBoard?
     var offline = false
+    var alertStatus: DueAlertStatus = .allowed
+    var onEnableAlerts: () -> Void = {}
     @Binding var draft: String
     var hint: TodoParseHint?
     var now: Date = .now
@@ -56,13 +61,21 @@ struct TodosContent: View {
     var onAdd: () -> Void = {}
 
     @State private var snoozing: TodoEntry?
+    @FocusState private var fieldFocused: Bool
 
     var body: some View {
         List {
             Section {
-                ScreenHeader(title: "To-dos", kicker: offline ? "Offline · from this device" : nil)
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
+                ScreenHeader(title: "To-dos", kicker: offline ? "Offline · from this device" : nil) {
+                    CircleIconButton(systemImage: "plus", label: "New to-do", filled: true) { fieldFocused = true }
+                }
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 0))
+                if alertStatus == .notDetermined {
+                    PromptCard(icon: "bell", text: "Get a nudge when things are due", action: "Turn on", onAction: onEnableAlerts)
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 0, trailing: 0))
+                }
             }
             if let board {
                 if board.isEmpty {
@@ -73,7 +86,7 @@ struct TodosContent: View {
                     }
                 }
                 section("Overdue", board.overdue, color: Theme.rose)
-                section("Today", board.today, color: Theme.amber)
+                section("Today", board.today, color: Theme.secondary)
                 section("Upcoming", board.upcoming, color: Theme.secondary)
             } else {
                 Section { HStack { Spacer(); ProgressView(); Spacer() }.frame(minHeight: 120).listRowBackground(Color.clear) }
@@ -85,7 +98,7 @@ struct TodosContent: View {
         .groundBackground()
         .toolbarVisibility(.hidden, for: .navigationBar)
         .safeAreaInset(edge: .bottom) {
-            NewTodoField(draft: $draft, hint: hint, now: now, onAdd: onAdd)
+            NewTodoField(draft: $draft, hint: hint, now: now, focused: $fieldFocused, onAdd: onAdd)
                 .padding(.horizontal, Theme.gutter)
                 .padding(.bottom, 8)
                 .frame(maxWidth: Theme.readingWidth)
@@ -114,9 +127,9 @@ struct TodosContent: View {
                         .accessibilityAction(named: "Snooze") { snoozing = entry }
                 }
             } header: {
-                Text("\(title.uppercased())  \(items.count)")
-                    .font(.footnote.weight(.semibold))
-                    .tracking(1.2)
+                Text(title.uppercased())
+                    .font(.caption.weight(.semibold))
+                    .tracking(1.4)
                     .foregroundStyle(color)
                     .accessibilityAddTraits(.isHeader)
             }
@@ -129,8 +142,8 @@ struct NewTodoField: View {
     @Binding var draft: String
     var hint: TodoParseHint?
     var now: Date = .now
+    var focused: FocusState<Bool>.Binding
     var onAdd: () -> Void
-    @FocusState private var focused: Bool
 
     var hintText: String? {
         guard let hint else { return nil }
@@ -152,7 +165,7 @@ struct NewTodoField: View {
             HStack(spacing: 10) {
                 Image(systemName: "plus.circle").foregroundStyle(Theme.accent).accessibilityHidden(true)
                 TextField("New to-do\u{2026} try \u{2018}due fri 3pm\u{2019}", text: $draft)
-                    .focused($focused)
+                    .focused(focused)
                     .submitLabel(.done)
                     .onSubmit(onAdd)
                     .foregroundStyle(Theme.text)
@@ -167,7 +180,8 @@ struct NewTodoField: View {
             }
             .padding(.leading, 16)
             .padding(.trailing, draft.isEmpty ? 16 : 0)
-            .frame(minHeight: 50)
+            .font(.subheadline)
+            .frame(minHeight: 46)
             .glassEffect(.regular, in: .rect(cornerRadius: 25, style: .continuous))
         }
         .animation(.default, value: hintText)
@@ -177,7 +191,7 @@ struct NewTodoField: View {
 #Preview("To-dos") {
     @Previewable @State var draft = ""
     NavigationStack {
-        TodosContent(board: PreviewData.board, draft: $draft, now: PreviewData.now)
+        TodosContent(board: PreviewData.board, alertStatus: .notDetermined, draft: $draft, now: PreviewData.now)
     }
     .preferredColorScheme(.dark)
 }

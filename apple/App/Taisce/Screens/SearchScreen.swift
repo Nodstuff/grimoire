@@ -52,12 +52,13 @@ struct SearchContent: View {
             VStack(alignment: .leading, spacing: 16) {
                 if showsField { field }
                 if let state, !state.results.isEmpty {
-                    chips(state)
-                    if state.offline {
-                        Label("Offline results from this device", systemImage: "wifi.slash")
-                            .font(.footnote).foregroundStyle(Theme.amber)
+                    VStack(alignment: .leading, spacing: 2) {
+                        chips(state)
+                        Text(state.offline ? "Offline · searched the docs on this device" : "Matches by word · searched on the server")
+                            .font(.caption2)
+                            .foregroundStyle(state.offline ? Theme.amber : Theme.secondary)
                     }
-                    LazyVStack(spacing: 12) {
+                    LazyVStack(spacing: 10) {
                         ForEach(state.filtered(by: tag)) { r in
                             Button { onOpen(r.docID) } label: { SearchResultCard(result: r, query: query) }
                                 .buttonStyle(.plain)
@@ -84,7 +85,6 @@ struct SearchContent: View {
 
     private var field: some View {
         VStack(alignment: .leading, spacing: 14) {
-            ScreenHeader(title: "Search")
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(Theme.secondary).accessibilityHidden(true)
                 TextField("Search your library", text: $query)
@@ -102,7 +102,8 @@ struct SearchContent: View {
                     .accessibilityLabel("Clear search")
                 }
             }
-            .padding(.leading, 14)
+            .font(.subheadline)
+            .padding(.leading, 12)
             .frame(minHeight: Theme.minTarget)
             .background(Theme.surface2, in: .rect(cornerRadius: 12, style: .continuous))
         }
@@ -126,17 +127,17 @@ struct SearchResultCard: View {
     let query: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
             if let crumb = result.breadcrumb {
-                Text(crumb).font(.caption).foregroundStyle(Theme.secondary).lineLimit(1)
+                Text(crumb).font(.caption2).foregroundStyle(Theme.secondary).lineLimit(1)
             }
-            Text(result.title).font(Theme.serif(.title3)).foregroundStyle(Theme.text)
-            Text(highlighted).font(.subheadline).foregroundStyle(Theme.secondary).lineLimit(3)
+            Text(result.title).font(Theme.serif(.headline)).foregroundStyle(Theme.text)
+            Text(highlighted).font(.footnote).foregroundStyle(Theme.secondary).lineLimit(3)
             if !result.tags.isEmpty {
                 HStack(spacing: 6) { ForEach(result.tags.prefix(3), id: \.self) { TagChip(tag: $0) } }.padding(.top, 2)
             }
         }
-        .padding(16)
+        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .card()
         .contentShape(.rect(cornerRadius: Theme.radius))
@@ -147,7 +148,7 @@ struct SearchResultCard: View {
         var s = AttributedString(result.snippet)
         for r in SearchState.matches(in: result.snippet, query: query) {
             guard let lo = AttributedString.Index(r.lowerBound, within: s), let hi = AttributedString.Index(r.upperBound, within: s) else { continue }
-            s[lo..<hi].backgroundColor = Theme.accent.opacity(0.28)
+            s[lo..<hi].backgroundColor = Theme.accent.opacity(0.30)
             s[lo..<hi].foregroundColor = Theme.text
         }
         return s

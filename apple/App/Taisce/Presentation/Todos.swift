@@ -144,6 +144,15 @@ struct TodoBoard: Hashable, Sendable {
         return board
     }
 
+    /// The board to show, or nil for "loading": an empty board before the
+    /// first sync has landed is not yet "nothing due". Once the connection
+    /// has failed (waiting), empty means empty.
+    static func shown(_ board: TodoBoard?, hasSynced: Bool, status: SyncStatus) -> TodoBoard? {
+        guard let board else { return nil }
+        if board.isEmpty, !hasSynced, status == .idle || status == .catchingUp || status == .live { return nil }
+        return board
+    }
+
     /// Today's "DUE" card list: overdue, then due today.
     var due: [TodoEntry] { overdue + today.filter { $0.due != nil } }
 }

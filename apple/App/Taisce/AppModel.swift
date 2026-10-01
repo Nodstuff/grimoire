@@ -11,7 +11,9 @@ final class AppModel {
     static let defaultServerURL = "https://taisce.null.ie"
 
     enum AuthPhase: Equatable {
-        /// a loopback (LOCAL-mode) daemon: no tokens
+        /// discovery hasn't answered yet: show a neutral launch state
+        case checking
+        /// a LOCAL-mode daemon: no tokens
         case notRequired
         case signedOut
         case signedIn
@@ -22,7 +24,7 @@ final class AppModel {
     private(set) var cache: Cache?
     private(set) var sync: SyncEngine?
     private(set) var auth: AuthSession?
-    private(set) var authPhase: AuthPhase = .notRequired
+    private(set) var authPhase: AuthPhase = .checking
     private(set) var isSigningIn = false
     private(set) var docs: [DocInfo] = []
     private(set) var index = DocIndex([])
@@ -37,9 +39,14 @@ final class AppModel {
     private(set) var cursor = 0
     private(set) var pendingWrites = 0
     private(set) var failedWrites = 0
-    /// bumps on every sync update touching the To-do doc (or the tree):
-    /// to-do lists reload on it
+    /// bumps whenever the To-do doc's cached blocks change (sync, first
+    /// fetch, or our own writes landing): to-do lists reload on it
     private(set) var todoRevision = 0
+    /// the first catch-up (or a cached body from an earlier run) has
+    /// landed: before it, empty to-do lists mean "loading", not "nothing"
+    private(set) var hasSynced = false
+    /// overdue + due today, for the iPad sidebar's Today badge
+    private(set) var dueCount = 0
 
     // local state
     private(set) var pins: [DocID] = []
@@ -52,12 +59,20 @@ final class AppModel {
     private var updatesTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
     private var replaying = false
+    private var todoObserveTask: Task<Void, Never>?
+    private var observedTodoDoc: DocID?
+    /// rendered blocks by (block id, content hash), shared across doc views
+    let renderCache = RenderCache()
+    /// due-alert permission (stubbed on the system center until the
+    /// NotificationCoordinator lands)
+    let dueAlerts: any DueAlertPermission = SystemDueAlerts()
 
     init() {
         serverURL = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? Self.defaultServerURL
     }
 
     var needsSignIn: Bool { authPhase == .signedOut }
+    var isCheckingAuth: Bool { authPhase == .checking }
     var isOnline: Bool { syncStatus == .live }
 
     func boot() async {
@@ -77,7 +92,7 @@ final class AppModel {
     }
 
     func startSync() async {
-        guard authPhase != .signedOut else { return }
+        guard authPhase != .signedOut, authPhase != .checking else { return }
         await sync?.start()
         startPolling()
     }
@@ -127,10 +142,23 @@ final class AppModel {
         }
     }
 
-    /// Loopback daemons run in LOCAL mode (loopback is trusted); anything
-    /// else gets an `AuthSession` with tokens in the Keychain.
     static func isLoopback(_ url: URL) -> Bool {
         ["127.0.0.1", "localhost", "::1"].contains(url.host() ?? "")
+    }
+
+    /// The server decides, not the URL: one with tokens in the Keychain is
+    /// signed in; otherwise discovery says whether it needs sign-in (a
+    /// SERVER-mode daemon can sit on localhost behind a tunnel, and a
+    /// LOCAL-mode one can be reached by name). Unreachable and no tokens:
+    /// a loopback daemon is assumed LOCAL, anything else asks to sign in.
+    static func authSession(for url: URL) async throws -> AuthSession? {
+        let auth = AuthSession(oauth: OAuthClient(baseURL: url), store: try KeychainTokenStore())
+        if await auth.state == .signedIn { return auth }
+        do {
+            return try await auth.requiresAuth() ? auth : nil
+        } catch {
+            return isLoopback(url) ? nil : auth
+        }
     }
 
     /// One cache file per server, so switching servers never mixes docs.
@@ -138,6 +166,9 @@ final class AppModel {
         observeTask?.cancel()
         authTask?.cancel()
         updatesTask?.cancel()
+        todoObserveTask?.cancel()
+        observedTodoDoc = nil
+        hasSynced = false
         guard let url = URL(string: serverURL) else {
             lastError = "not a URL: \(serverURL)"
             return
@@ -146,9 +177,8 @@ final class AppModel {
             let dir = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
             let name = "cache-\(url.host() ?? "server")-\(url.port ?? 0).sqlite"
             let cache = try Cache(path: dir.appending(path: name).path(percentEncoded: false))
-            let auth = withAuth && !Self.isLoopback(url)
-                ? AuthSession(oauth: OAuthClient(baseURL: url), store: KeychainTokenStore())
-                : nil
+            authPhase = .checking
+            let auth = withAuth ? try await Self.authSession(for: url) : nil
             let api = APIClient(config: ServerConfig(baseURL: url, tokenProvider: auth ?? NoAuth()))
             self.auth = auth
             authPhase = auth == nil ? .notRequired : (await auth?.state == .signedIn ? .signedIn : .signedOut)
@@ -182,6 +212,8 @@ final class AppModel {
             }
         } catch {
             lastError = error.localizedDescription
+            // never strand the launch state: the sign-in screen shows the error and the server field
+            if authPhase == .checking { authPhase = .signedOut }
         }
     }
 
@@ -193,6 +225,25 @@ final class AppModel {
         self.index = index
         self.library = library
         treeLoaded = true
+        observeTodoDoc()
+    }
+
+    /// Follow the To-do doc's blocks, so Today and To-dos reload whenever
+    /// its body is (re)stored, including the first fetch after bootstrap.
+    private func observeTodoDoc() {
+        guard let id = todoDocID, id != observedTodoDoc, let cache else { return }
+        observedTodoDoc = id
+        todoObserveTask?.cancel()
+        todoObserveTask = Task { [weak self] in
+            do {
+                for try await blocks in cache.observeBlocks(of: id) {
+                    if !blocks.isEmpty { self?.hasSynced = true }
+                    self?.todoRevision += 1
+                }
+            } catch {
+                self?.lastError = error.localizedDescription
+            }
+        }
     }
 
     private func synced(_ u: SyncUpdate) {
@@ -217,7 +268,10 @@ final class AppModel {
     private func pollOnce() async {
         guard let sync, let cache else { return }
         let status = await sync.status
-        if status == .live, syncStatus != .live { lastSynced = .now }
+        if status == .live, syncStatus != .live {
+            lastSynced = .now
+            hasSynced = true
+        }
         syncStatus = status
         cursor = (try? await cache.lastSeq()) ?? cursor
         let pending = (try? await cache.pendingOutbox().count) ?? 0
@@ -265,11 +319,13 @@ final class AppModel {
         }
     }
 
-    /// The doc's page: cached blocks, rendered off the main actor.
+    /// The doc's page: cached blocks, parsed off the main actor; blocks
+    /// whose content hasn't changed come from `renderCache`.
     func page(for id: DocID, records: [BlockRecord]) async -> DocPage {
         let title = index.byID[id]?.title ?? ""
         let blocks = records.map(\.block)
-        return await Task.detached { DocPage.build(title: title, blocks: blocks) }.value
+        let cache = renderCache
+        return await Task.detached { DocPage.build(title: title, blocks: blocks, render: cache.nodes(for:)) }.value
     }
 
     /// Tick or untick the `index`th checkbox in a block: a `replace` through
@@ -304,7 +360,9 @@ final class AppModel {
         let settled = settledTodos
         if pendingWrites == 0 { settledTodos = [] }
         let visible = dated.filter { !settled.contains($0.id) }
-        return (TodoBoard.build(dated: visible, undated: undated.filter { !settled.contains($0.id) }, now: now), offline)
+        let board = TodoBoard.build(dated: visible, undated: undated.filter { !settled.contains($0.id) }, now: now)
+        dueCount = board.due.count
+        return (board, offline)
     }
 
     func markDone(_ e: TodoEntry) async {
