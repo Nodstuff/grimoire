@@ -139,12 +139,13 @@ import Testing
         }
         let cache = try Cache(writer: q)
         let applied = try await q.read { db in try Cache.migrator.appliedIdentifiers(db) }
-        #expect(applied == ["v1", "v2", "v2-workspaces"])
+        #expect(applied == ["v1", "v2", "v2-workspaces", "v3"])
         let (outbox, docCols, todoCols, wsTable) = try await q.read { db in
             (try db.columns(in: "outbox").map(\.name), try db.columns(in: "docs").map(\.name),
              try db.columns(in: "todos").map(\.name), try db.tableExists("workspaces"))
         }
         #expect(outbox.contains("outcome"), "the editor's v2")
+            #expect(outbox.contains("conflict"), "the editor's v3")
         #expect(docCols.contains("workspace_id") && todoCols.contains("doc_id") && wsTable)
         // docs and blocks survive; only the To-do body is marked for refetch
         let docs = try await cache.docs()

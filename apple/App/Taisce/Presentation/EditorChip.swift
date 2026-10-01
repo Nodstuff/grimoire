@@ -10,7 +10,10 @@ struct EditorChip: Hashable, Sendable {
 
     /// Worst news first: refused writes, a live session holding the queue,
     /// parked (red) edits, then the queue itself, then flagged (yellow) ones.
-    static func make(online: Bool, unsaved: Int, outbox: DocOutboxState, reviews: [Verdict]) -> EditorChip {
+    static func make(online: Bool, unsaved: Int, outbox: DocOutboxState, persistFailures: Int = 0, reviews: [Verdict]) -> EditorChip {
+        if persistFailures > 0 {
+            return EditorChip(tone: .failed, text: "Couldn't save on this device")
+        }
         if outbox.failed > 0 {
             return EditorChip(tone: .failed, text: outbox.failed == 1 ? "1 edit not saved" : "\(outbox.failed) edits not saved")
         }

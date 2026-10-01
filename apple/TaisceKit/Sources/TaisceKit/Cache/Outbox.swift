@@ -22,9 +22,11 @@ public struct OutboxEntry: Codable, Sendable, Hashable, FetchableRecord, Mutable
     public var lastError: String?
     /// the server's answer to a landed propose
     public var outcome: Data?
+    /// a conflicted block's save (see `Cache.conflictedBlocks`)
+    public var conflict: Bool = false
 
     public enum CodingKeys: String, CodingKey, ColumnExpression {
-        case id, method, path, body, state, attempts, outcome
+        case id, method, path, body, state, attempts, outcome, conflict
         case createdAt = "created_at"
         case idempotencyKey = "idempotency_key"
         case lastError = "last_error"
@@ -42,7 +44,7 @@ extension Cache {
     /// Its base is moved up past our own landed writes to the blocks it
     /// touches when it is sent (`adjustedBase`), not here.
     @discardableResult
-    public func enqueue(_ request: ProposeRequest, now: Date = .now) async throws -> OutboxEntry {
+    public func enqueue(_ request: ProposeRequest, conflict: Bool = false, now: Date = .now) async throws -> OutboxEntry {
         let key = request.requestID ?? UUID().uuidString.lowercased()
         return try await db.write { db in
             if let existing = try OutboxEntry.filter(OutboxEntry.Columns.idempotencyKey == key).fetchOne(db) {
@@ -52,11 +54,67 @@ extension Cache {
             req.requestID = key
             var e = OutboxEntry(
                 id: nil, createdAt: now, idempotencyKey: key, method: "POST", path: "/api/propose",
-                body: try JSONEncoder().encode(req), state: .pending, attempts: 0, lastError: nil
+                body: try JSONEncoder().encode(req), state: .pending, attempts: 0, lastError: nil, conflict: conflict
             )
             try e.insert(db)
             return e
         }
+    }
+
+    /// Blocks of `docID` whose last saves went out in conflict, with the
+    /// epoch they were proposed on, until `clearConflict`.
+    public func conflictedBlocks(_ docID: DocID, now: Date = .now) async throws -> [BlockID: Int] {
+        let rows = try await db.read { db in
+            try OutboxEntry.filter(OutboxEntry.Columns.conflict == true)
+                .filter(OutboxEntry.Columns.createdAt >= now.addingTimeInterval(-Cache.reviewWindow))
+                .fetchAll(db)
+        }
+        var out: [BlockID: Int] = [:]
+        for e in rows {
+            guard let body = e.body, let req = try? JSONDecoder().decode(ProposeRequest.self, from: body), req.docID == docID else { continue }
+            for op in req.ops { if let t = op.kind.target { out[t] = min(out[t] ?? req.baseEpoch, req.baseEpoch) } }
+        }
+        return out
+    }
+
+    /// The conflict on `block` is resolved (accepted, or the user chose).
+    public func clearConflict(_ docID: DocID, block: BlockID) async throws {
+        try await rewriteRows(docID, touching: block, onlyConflicts: true) { db, e in
+            var e = e
+            e.conflict = false
+            try e.update(db)
+        }
+    }
+
+    /// Drop queued, unsent saves that only write `block` (Take theirs).
+    public func discardPending(_ docID: DocID, block: BlockID) async throws {
+        try await rewriteRows(docID, touching: block, onlyConflicts: false) { db, e in
+            guard e.state == .pending else { return }
+            _ = try e.delete(db)
+        }
+    }
+
+    private func rewriteRows(_ docID: DocID, touching block: BlockID, onlyConflicts: Bool, _ f: @escaping @Sendable (Database, OutboxEntry) throws -> Void) async throws {
+        try await db.write { db in
+            var q = OutboxEntry.filter(OutboxEntry.Columns.path == "/api/propose")
+            if onlyConflicts { q = q.filter(OutboxEntry.Columns.conflict == true) }
+            for e in try q.fetchAll(db) {
+                guard let body = e.body, let req = try? JSONDecoder().decode(ProposeRequest.self, from: body), req.docID == docID,
+                      !req.ops.isEmpty, req.ops.allSatisfy({ $0.kind.target == block })
+                else { continue }
+                try f(db, e)
+            }
+        }
+    }
+
+    /// Blocks written by refused saves of `docID`.
+    public func failedBlocks(_ docID: DocID) async throws -> Set<BlockID> {
+        var out: Set<BlockID> = []
+        for e in try await failedOutbox() {
+            guard let body = e.body, let req = try? JSONDecoder().decode(ProposeRequest.self, from: body), req.docID == docID else { continue }
+            for op in req.ops { if let t = op.kind.target { out.insert(t) } }
+        }
+        return out
     }
 
     /// Queue a text save: when the newest queued write is a never-sent
@@ -166,7 +224,7 @@ extension Cache {
             }
             var e = OutboxEntry(
                 id: nil, createdAt: now, idempotencyKey: key, method: method, path: path,
-                body: body, state: .pending, attempts: 0, lastError: nil
+                body: body, state: .pending, attempts: 0, lastError: nil, conflict: false
             )
             try e.insert(db)
             return e

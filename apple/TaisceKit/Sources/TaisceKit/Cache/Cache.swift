@@ -115,6 +115,11 @@ public final class Cache: Sendable {
             // re-bootstrap (bodies kept) so every doc row gains its workspace_id
             try db.execute(sql: "DELETE FROM sync_state WHERE key = 'last_seq'")
         }
+        m.registerMigration("v3") { db in
+            // a save of a block in conflict (proposed on its older epoch): the
+            // editor reopens with the conflict still standing
+            try db.alter(table: "outbox") { t in t.add(column: "conflict", .boolean).notNull().defaults(to: false) }
+        }
         return m
     }
 

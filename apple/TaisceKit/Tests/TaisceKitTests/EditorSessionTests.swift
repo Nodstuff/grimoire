@@ -209,6 +209,42 @@ import Testing
         #expect(s.commitText().first?.baseEpoch == 9)
     }
 
+    /// Changed on desktop: both texts are known, and the user picks.
+    @Test func keepMineOrTakeTheirs() throws {
+        func conflicted() throws -> EditorSession {
+            var s = session()
+            s.update("p1", content: p("mine"))
+            var remote = s.editor
+            _ = try remote.apply(.replaceText("p1", "theirs"))
+            s.refresh(DocEditor(docID: "d", baseEpoch: 7, blocks: Array(remote.blocks.values)), keep: ["p1"])
+            return s
+        }
+        var a = try conflicted()
+        #expect(a.item("p1")?.remoteText == "theirs" && a.item("p1")?.inConflict == true)
+        let first = a.commitText()
+        #expect(first.map(\.baseEpoch) == [4] && a.conflictRequestIDs == Set(first.compactMap(\.requestID)))
+        // the desktop edits it again: still both
+        var again = a.editor
+        _ = try again.apply(.replaceText("p1", "theirs, again"))
+        a.refresh(DocEditor(docID: "d", baseEpoch: 8, blocks: Array(again.blocks.values)), keep: [])
+        #expect(a.item("p1")?.remoteText == "theirs, again" && a.item("p1")?.content == p("mine"))
+        // keep mine: an explicit save on the current epoch
+        let kept = a.keepMine("p1")
+        #expect(kept.map(\.baseEpoch) == [8] && kept.first?.ops.map(\.kind) == [.replace(target: "p1", content: "mine")])
+        #expect(a.item("p1")?.inConflict == false && a.item("p1")?.remoteText == nil)
+        // take theirs: their text, nothing to save
+        var b = try conflicted()
+        b.takeTheirs("p1")
+        #expect(b.item("p1")?.content == p("theirs") && b.item("p1")?.inConflict == false)
+        #expect(b.commitText().isEmpty)
+        // a conflict restored on reopen holds autosave
+        var c = session()
+        c.markConflicted("p1", base: 3)
+        c.update("p1", content: p("typed after reopening"))
+        #expect(c.commitText().isEmpty)
+        #expect(c.commitText(includeConflicts: true).map(\.baseEpoch) == [3])
+    }
+
     @Test func aBlockDeletedRemotelyWhileTypedInBecomesADraft() throws {
         var s = session()
         s.update("p2", content: p("gamma, still typing"))

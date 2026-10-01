@@ -31,6 +31,9 @@ public struct EditorSession: Sendable {
         /// flush saves it again, still on `staleBase`
         public var conflictSent = false
         public var inConflict: Bool { staleBase != nil }
+        /// the server's text for a block in conflict, when it differs from
+        /// ours: the editor offers Keep mine / Take theirs
+        public var remoteText: String?
 
         public var isDirty: Bool { isDraft || content.markdown != baseline }
 
@@ -80,6 +83,40 @@ public struct EditorSession: Sendable {
     public func index(of id: BlockID) -> Int? { items.firstIndex { $0.id == id } }
     public func item(_ id: BlockID) -> Item? { index(of: id).map { items[$0] } }
     public var dirtyIDs: Set<BlockID> { Set(items.filter(\.isDirty).map(\.id)) }
+    /// ids of the requests the last `commitText` proposed on a conflicted block's older epoch
+    public private(set) var conflictRequestIDs: Set<String> = []
+
+    /// A conflict that outlived the editor (from `Cache.conflictedBlocks`).
+    public mutating func markConflicted(_ id: BlockID, base: Int) {
+        guard let i = index(of: id) else { return }
+        items[i].staleBase = base
+        items[i].conflictSent = true
+    }
+
+    /// Take the server's text for a conflicted block, dropping ours.
+    public mutating func takeTheirs(_ id: BlockID) {
+        guard let i = index(of: id) else { return }
+        let theirs = items[i].remoteText ?? editor.blocks[id]?.content ?? items[i].saved
+        items[i].content = EditorBlockContent.parse(markdown: theirs)
+        items[i].saved = theirs
+        items[i].baseline = items[i].content.markdown
+        items[i].staleBase = nil
+        items[i].conflictSent = false
+        items[i].remoteText = nil
+        items[i].revision += 1
+    }
+
+    /// Keep our text over the server's: an explicit choice, so it is
+    /// proposed on the current epoch.
+    public mutating func keepMine(_ id: BlockID) -> [ProposeRequest] {
+        guard let i = index(of: id) else { return [] }
+        items[i].staleBase = nil
+        items[i].conflictSent = false
+        if let theirs = items[i].remoteText { items[i].saved = theirs }
+        items[i].remoteText = nil
+        items[i].baseline = "\u{0}" // dirty: it saves now
+        return commitText([id])
+    }
 
     // MARK: text
 
@@ -118,6 +155,7 @@ public struct EditorSession: Sendable {
         }
         editor = batch
         var out = stale.sorted { $0.key < $1.key }.map { ProposeRequest(docID: docID, baseEpoch: $0.key, ops: $0.value, requestID: Self.newID()) }
+        conflictRequestIDs = Set(out.compactMap(\.requestID))
         if !ops.isEmpty { out.append(ProposeRequest(docID: docID, baseEpoch: editor.baseEpoch, ops: ops, requestID: Self.newID())) }
         return out
     }
@@ -303,12 +341,19 @@ public struct EditorSession: Sendable {
                     // the desktop accepted ours: the conflict is over
                     mine.staleBase = nil
                     mine.conflictSent = false
+                    mine.remoteText = nil
                     mine.saved = b.content
                     mine.baseline = b.content
                 } else if b.content != mine.saved, !mine.isDraft {
                     // someone else wrote this block while it was open here
-                    if mine.content.markdown != b.content { mine.staleBase = mine.staleBase ?? oldBase }
+                    if mine.content.markdown != b.content {
+                        mine.staleBase = mine.staleBase ?? oldBase
+                        mine.remoteText = b.content
+                    }
                     mine.saved = b.content
+                } else if mine.inConflict, mine.remoteText == nil, b.content != mine.content.markdown {
+                    // reopened with a standing conflict: show theirs
+                    mine.remoteText = b.content
                 }
                 mine.isDraft = false
                 next.append(mine)
