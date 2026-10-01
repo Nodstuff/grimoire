@@ -75,6 +75,30 @@ import Testing
         #expect(obj["base_epoch"] as? Int == 1)
     }
 
+    @Test func todoDueDecodesAndSendsUntil() async throws {
+        let server = MockServer { _ in
+            .json(#"{"doc_id":"t","epoch":12,"now":"2026-10-01T12:00","until":"2026-10-01","default_alert_time":"09:00","items":[{"date":"2026-09-30","id":"0-ab","text":"rent","deadline":"2026-10-01","due_time":"10:00","alert_at":"2026-10-01T10:00","overdue":true},{"date":"2026-10-01","id":"1-cd","text":"call","deadline":"2026-10-01","alert_at":"2026-10-01T09:00","overdue":true,"carried_from":"2026-09-29"}]}"#)
+        }
+        let due = try await server.client().todoDue(until: "2026-10-01")
+        #expect(server.requests[0].path == "/api/todo/due" && server.requests[0].query == ["until": "2026-10-01"])
+        #expect(due.items.map(\.id) == ["2026-09-30/0-ab", "2026-10-01/1-cd"])
+        #expect(due.items[0].due == Due(year: 2026, month: 10, day: 1, hour: 10, minute: 0))
+        #expect(due.items[1].due?.hasTime == false && due.items[1].carriedFrom == "2026-09-29")
+    }
+
+    @Test func deadlineBodySplitsDateAndTime() throws {
+        func body(_ d: Due?) throws -> [String: Any] {
+            let data = try JSONEncoder().encode(APIClient.DeadlineBody(date: "2026-10-01", itemID: "0-ab", deadline: d))
+            return try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+        let timed = try body(Due("2026-10-02 14:30"))
+        #expect(timed["deadline"] as? String == "2026-10-02" && timed["due_time"] as? String == "14:30")
+        let dateOnly = try body(Due("2026-10-02"))
+        #expect(dateOnly["deadline"] as? String == "2026-10-02" && dateOnly["due_time"] == nil)
+        let cleared = try body(nil)
+        #expect(cleared["deadline"] is NSNull && cleared.keys.contains("deadline"))
+    }
+
     @Test func todoDayDecodes() async throws {
         let server = MockServer { _ in
             .json(#"{"carried":0,"date":"2026-10-01","doc_id":"t","epoch":11,"items":[{"id":"0-1","text":"x","done":true,"overdue":false,"due_soon":false}],"prev_date":null,"today":"2026-10-01"}"#)

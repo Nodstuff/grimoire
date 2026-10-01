@@ -92,6 +92,12 @@ To-dos: deadlines are written `· due YYYY-MM-DD` or `· due YYYY-MM-DD HH:MM`.
 The offline parser reads both forms. API items send the day in `deadline`,
 plus `due_time` (`HH:MM`) and `alert_at` (local; 09:00 when there is no time).
 `TodoItem.due` combines `deadline` and `due_time`.
+The Today view reads due and overdue items from `GET /api/todo/due?until=`,
+which is read-only and computes overdue by time. Today's list comes from the
+cached To-do doc. The view never calls `GET /api/todo`, because a GET for
+today carries items forward on the server. `todoSetDeadline` sends the day as
+`deadline` and the time as `due_time`; a date-only deadline keeps the item's
+existing time.
 
 ## What's stubbed
 

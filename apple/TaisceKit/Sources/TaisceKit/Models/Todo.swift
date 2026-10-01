@@ -189,3 +189,46 @@ public struct TodoDay: Codable, Sendable, Hashable {
         case prevDate = "prev_date"
     }
 }
+
+/// `GET /api/todo/due?until=`: open items with deadlines across all days,
+/// soonest alert first. Read-only (never carries forward), so safe to poll.
+public struct TodoDueList: Codable, Sendable, Hashable {
+    public struct Item: Codable, Sendable, Hashable, Identifiable {
+        /// the day the item is scheduled under; with `itemID`, its address for writes
+        public var date: String
+        public var itemID: String
+        public var text: String
+        public var deadline: String
+        public var dueTime: String?
+        /// local `YYYY-MM-DDTHH:MM`
+        public var alertAt: String
+        public var overdue: Bool
+        public var note: String?
+        public var carriedFrom: String?
+
+        public var id: String { "\(date)/\(itemID)" }
+
+        public var due: Due? { Due(dueTime.map { "\(deadline) \($0)" } ?? deadline) }
+
+        enum CodingKeys: String, CodingKey {
+            case date, text, deadline, overdue, note
+            case itemID = "id"
+            case dueTime = "due_time"
+            case alertAt = "alert_at"
+            case carriedFrom = "carried_from"
+        }
+    }
+
+    public var docID: DocID?
+    public var epoch: Int
+    public var now: String
+    public var until: String
+    public var defaultAlertTime: String
+    public var items: [Item]
+
+    enum CodingKeys: String, CodingKey {
+        case epoch, now, until, items
+        case docID = "doc_id"
+        case defaultAlertTime = "default_alert_time"
+    }
+}

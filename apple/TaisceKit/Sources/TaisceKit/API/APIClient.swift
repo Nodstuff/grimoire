@@ -53,6 +53,17 @@ public struct APIClient: Sendable {
         try await get("/api/todo", query: date.map { [URLQueryItem(name: "date", value: $0)] } ?? [])
     }
 
+    /// Open to-dos with deadlines up to `until` (a day, or a local
+    /// `YYYY-MM-DDTHH:MM`), overdue computed by time. Read-only.
+    public func todoDue(until: String) async throws -> TodoDueList {
+        try await get("/api/todo/due", query: [URLQueryItem(name: "until", value: until)])
+    }
+
+    /// The change-log head alone (`limit=0`), e.g. to start a cursor without a backfill.
+    public func changesHead() async throws -> Int {
+        try await changes(since: 0, limit: 0).seq
+    }
+
     public func changes(since: Int, limit: Int = 500) async throws -> ChangePage {
         try await get("/api/changes", query: [
             URLQueryItem(name: "since", value: String(since)),
@@ -93,10 +104,32 @@ public struct APIClient: Sendable {
         try await post("/api/todo/move", body: ["date": date, "item_id": itemID, "to_date": toDate])
     }
 
-    /// `nil` clears the deadline.
+    /// `nil` clears the deadline. A date-only `Due` keeps the item's existing
+    /// time (server rule); a timed one sets `due_time`.
     public func todoSetDeadline(date: String, itemID: String, deadline: Due?) async throws -> TodoDay {
-        struct Body: Encodable { var date: String; var item_id: String; var deadline: String? }
-        return try await post("/api/todo/deadline", body: Body(date: date, item_id: itemID, deadline: deadline?.description))
+        try await post("/api/todo/deadline", body: DeadlineBody(date: date, itemID: itemID, deadline: deadline))
+    }
+
+    struct DeadlineBody: Encodable {
+        var date: String
+        var itemID: String
+        var deadline: Due?
+
+        enum CodingKeys: String, CodingKey {
+            case date, deadline
+            case itemID = "item_id"
+            case dueTime = "due_time"
+        }
+
+        func encode(to encoder: any Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(date, forKey: .date)
+            try c.encode(itemID, forKey: .itemID)
+            try c.encode(deadline?.dateString, forKey: .deadline)
+            if let d = deadline, let h = d.hour, let m = d.minute {
+                try c.encode(String(format: "%02d:%02d", h, m), forKey: .dueTime)
+            }
+        }
     }
 
     public func todoSetNote(date: String, itemID: String, note: String) async throws -> TodoDay {
