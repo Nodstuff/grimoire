@@ -641,6 +641,55 @@ fn answer(ops: &[OpInput], out: &ProposeOutcome, before: i64, verbose: bool) -> 
 
 /// What the dedupe cache stores for a write: both renderings, so a replay
 /// answers in whichever shape the retry asks for.
+/// doc_op "workspace": label (or, with no workspace, unlabel) a doc; its
+/// subtree follows. Applied directly, not gated: a label moves nothing and
+/// weakens nothing. The store journals the tree rows.
+fn file_doc(store: &mut SqliteStore, doc_id: Uuid, workspace: Option<&str>, create_missing: bool) -> Result<(String, Value), String> {
+    let doc = store.get_doc(doc_id).map_err(|e| e.to_string())?;
+    let mut created = false;
+    let target = match workspace.map(str::trim).filter(|w| !w.is_empty() && !w.eq_ignore_ascii_case("null")) {
+        None => None,
+        Some(w) => match store.find_workspace(w).map_err(|e| e.to_string())? {
+            Some(found) => Some(found),
+            None if create_missing => {
+                created = true;
+                Some(store.create_workspace(w, None, None, None).map_err(|e| e.to_string())?)
+            }
+            None => {
+                return Err(crate::retrieval::workspace_arg(store, Some(w))
+                    .err()
+                    .map(|m| format!("{m}; pass create_missing: true to create it"))
+                    .unwrap_or_else(|| format!("workspace {w:?} not found")));
+            }
+        },
+    };
+    let resolved = store.set_doc_workspace(doc_id, target.as_ref().map(|w| w.id)).map_err(|e| e.to_string())?;
+    let count = 1 + store.doc_subtree_ids(doc_id).map(|v| v.len().saturating_sub(1)).unwrap_or(0);
+    let name_of = |id: Option<Uuid>| match id {
+        None => "Unsorted".to_string(),
+        Some(id) => store.get_workspace(id).map(|w| w.name).unwrap_or_else(|_| id.to_string()),
+    };
+    let text = match &target {
+        Some(w) => format!(
+            "ok · filed “{}” under {}{} · {count} doc{} · doc {doc_id}",
+            doc.title,
+            w.name,
+            if created { " (created)" } else { "" },
+            if count == 1 { "" } else { "s" }
+        ),
+        None => format!("ok · unlabelled “{}” · now {} · doc {doc_id}", doc.title, name_of(resolved)),
+    };
+    let full = json!({
+        "doc_id": doc_id,
+        "label": target.as_ref().map(|w| w.id),
+        "workspace_id": resolved,
+        "workspace": name_of(resolved),
+        "created": created,
+        "docs": count,
+    });
+    Ok((text, full))
+}
+
 fn stored(text: &str, full: &Value) -> Value {
     json!({"text": text, "full": full})
 }
@@ -755,7 +804,7 @@ pub struct FindDocParams {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DocOpParams {
-    /// "rename" | "move" | "status" | "delete" | "merge".
+    /// "rename" | "move" | "status" | "delete" | "merge" | "workspace".
     pub op: String,
     /// The doc acted on (for merge: the doc whose content moves and is then trashed).
     pub doc_id: String,
@@ -769,6 +818,11 @@ pub struct DocOpParams {
     pub status: Option<String>,
     /// merge: the doc that receives doc_id's content.
     pub into_doc_id: Option<String>,
+    /// workspace: file doc_id (and its subtree) under this workspace (name,
+    /// case-insensitive, or id); null to unlabel it.
+    pub workspace: Option<String>,
+    /// workspace: create the workspace when no name matches (default false).
+    pub create_missing: Option<bool>,
     #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
@@ -1429,7 +1483,7 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Tree ops through the gate: op 'rename' (title), 'move' (new_parent_id, after_doc_id), 'status' (status) land as flagged yellows a reviewer can decline; 'delete' is always red (parked until a human trashes it); 'merge' (into_doc_id) appends doc_id's content as yellows then parks a red delete. Refused on docs shared with you."
+        description = "Tree ops through the gate: op 'rename' (title), 'move' (new_parent_id, after_doc_id), 'status' (status) land as flagged yellows a reviewer can decline; 'delete' is always red (parked until a human trashes it); 'merge' (into_doc_id) appends doc_id's content as yellows then parks a red delete; 'workspace' (workspace: name or id, null to unlabel; create_missing) files doc_id and its subtree directly. Refused on docs shared with you."
     )]
     async fn doc_op(
         &self,
@@ -1845,8 +1899,8 @@ impl KsMcp {
             Err(m) => return err(m),
         };
         let op = p.op.trim().to_lowercase();
-        if !matches!(op.as_str(), "rename" | "move" | "status" | "delete" | "merge") {
-            return err(format!("op must be rename | move | status | delete | merge, got {}", p.op));
+        if !matches!(op.as_str(), "rename" | "move" | "status" | "delete" | "merge" | "workspace") {
+            return err(format!("op must be rename | move | status | delete | merge | workspace, got {}", p.op));
         }
         let verbose = p.verbose.unwrap_or(false);
         let principal = match self.acting(p.as_.as_deref(), &hint).await {
@@ -1856,6 +1910,7 @@ impl KsMcp {
         let payload = json!({
             "op": op, "title": p.title, "new_parent_id": p.new_parent_id, "after_doc_id": p.after_doc_id,
             "status": p.status, "into_doc_id": p.into_doc_id,
+            "workspace": p.workspace, "create_missing": p.create_missing,
         });
         let key = dedupe_key("doc_op", Some(doc_id), &payload);
         if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
@@ -1896,6 +1951,13 @@ impl KsMcp {
                 Err(m) => err(m),
             };
             match op.as_str() {
+                "workspace" => match file_doc(store, doc_id, p.workspace.as_deref(), p.create_missing.unwrap_or(false)) {
+                    Ok((text, full)) => {
+                        durable_put(store, &dedupe, principal, key, stored(&text, &full), DEDUPE_TTL);
+                        if verbose { ok_json(&full) } else { ok_text(text) }
+                    }
+                    Err(m) => err(m),
+                },
                 "rename" => {
                     let Some(title) = p.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
                         return err("rename needs title".into());
@@ -2472,6 +2534,59 @@ mod tests {
         assert!(!is_err, "naming the parent's own workspace is fine");
         let (is_err, msg) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "X", "workspace": "Gym"}))).await.unwrap());
         assert!(is_err && msg.as_str().unwrap().contains("workspace"), "{msg}");
+    }
+
+    /// doc_op "workspace": files a subtree, creates on create_missing,
+    /// unlabels with null, dedupes a replay, journals tree rows.
+    #[tokio::test]
+    async fn doc_op_workspace_files_and_unfiles_a_subtree() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let agent = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let outer = store.create_workspace("Home", None, None, None).unwrap().id;
+        let top = store.create_doc("Life", None, tom).unwrap().id;
+        let gp = store.create_doc("GP visits", Some(top), tom).unwrap().id;
+        let kid = store.create_doc("2026", Some(gp), tom).unwrap().id;
+        store.set_doc_workspace(top, Some(outer)).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let mcp = KsMcp::new(store.clone(), agent, new_dedupe(), new_name_cache(), test_hot("wsop"));
+        let op = |v: Value| mcp.doc_op_impl(NONE, p(v));
+
+        let (is_err, msg) = raw(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": "Health"})).await.unwrap());
+        assert!(is_err && msg.contains("create_missing"), "{msg}");
+        assert!(store.lock().unwrap().find_workspace("Health").unwrap().is_none(), "nothing created without create_missing");
+
+        let seq = store.lock().unwrap().latest_change_seq().unwrap();
+        let (is_err, msg) = raw(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": "Health", "create_missing": true})).await.unwrap());
+        assert!(!is_err, "{msg}");
+        assert!(msg.starts_with("ok · filed “GP visits” under Health (created) · 2 docs"), "{msg}");
+        let health = store.lock().unwrap().find_workspace("health").unwrap().unwrap().id;
+        {
+            let s = store.lock().unwrap();
+            assert_eq!(s.doc_workspace(kid).unwrap(), Some(health), "the subtree follows");
+            assert_eq!(s.doc_workspace(top).unwrap(), Some(outer));
+            let rows: Vec<String> = s.changes_since(seq, 100).unwrap().changes.into_iter().filter(|c| c.kind == "tree").map(|c| c.doc_id).collect();
+            assert_eq!(rows, [gp.to_string(), kid.to_string()]);
+        }
+        // a replay within the window answers the first outcome and writes nothing
+        let seq = store.lock().unwrap().latest_change_seq().unwrap();
+        let (_, again) = raw(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": "Health", "create_missing": true})).await.unwrap());
+        assert_eq!(again, msg);
+        assert_eq!(store.lock().unwrap().latest_change_seq().unwrap(), seq);
+        assert_eq!(store.lock().unwrap().list_workspaces().unwrap().len(), 2);
+
+        // an existing name, case-insensitively, by id, then unlabel back to the outer workspace
+        let (is_err, msg) = raw(op(json!({"op": "workspace", "doc_id": kid.to_string(), "workspace": "HOME"})).await.unwrap());
+        assert!(!is_err && msg.contains("under Home · 1 doc ·"), "{msg}");
+        let (_, full) = text_of(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": null, "verbose": true})).await.unwrap());
+        assert_eq!(full["workspace_id"], json!(outer), "{full}");
+        assert_eq!(full["label"], Value::Null);
+        assert_eq!(full["workspace"], "Home");
+        let (_, msg) = raw(op(json!({"op": "workspace", "doc_id": top.to_string()})).await.unwrap());
+        assert!(msg.contains("now Unsorted"), "{msg}");
+        assert_eq!(store.lock().unwrap().doc_workspace(gp).unwrap(), None);
+        let (is_err, _) = raw(op(json!({"op": "workspace", "doc_id": Uuid::now_v7().to_string(), "workspace": health.to_string()})).await.unwrap());
+        assert!(is_err, "unknown doc");
     }
 
     /// The AX tools through the tool fns: compact hits, validated `kind`,
