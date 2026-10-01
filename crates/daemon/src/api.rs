@@ -94,7 +94,7 @@ pub(crate) fn refuse_if_mirror(s: &SqliteStore, id: Uuid, what: &str) -> Option<
 /// Header on `GET /api/docs`: the change journal's head, read in the same
 /// read transaction as the list — a syncing client's cursor for exactly this
 /// snapshot.
-pub const SEQ_HEADER: &str = "x-grimoire-seq";
+pub const SEQ_HEADER: &str = "taisce-seq";
 
 async fn docs(State(st): State<ApiState>) -> ([(&'static str, String); 1], Json<Value>) {
     let (seq, body) = with_store(&st.store, move |s| {

@@ -16,8 +16,8 @@
 //! current_epoch, deleted}` — the doc as it stands when the page is served —
 //! unless the row is gone. Failures are real statuses with a JSON body: 400
 //! for a bad query, 500 for a store error. `GET /api/docs` answers with
-//! `X-Grimoire-Seq: <head>` read under the same lock as the list, so a
-//! client bootstraps the tree and its cursor from one snapshot.
+//! `Taisce-Seq: <head>` (RFC 6648: no `X-`) read under the same lock as the
+//! list, so a client bootstraps the tree and its cursor from one snapshot.
 //!
 //! Waking: the store's commit hook pokes a [`Notify`]; ONE pump task per
 //! daemon re-reads `max(seq)` and publishes it on a `watch` channel, with a
@@ -259,7 +259,8 @@ mod tests {
         crate::home::testing::call(&app, "POST", "/api/docs", Some(json!({"title": "a", "parent_doc_id": null}))).await;
         let (status, headers, _) = raw(&app, Request::get("/api/docs").body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(headers[crate::api::SEQ_HEADER], "1");
+        assert_eq!(headers["Taisce-Seq"], "1");
+        assert!(!headers.contains_key("x-grimoire-seq"), "renamed, no alias");
         // a bad cursor is a 400 with a JSON body, on both routes
         for uri in ["/api/changes?since=abc", "/api/changes/stream?since=abc", "/api/changes?limit=-1"] {
             let (status, headers, body) = raw(&app, Request::get(uri).body(Body::empty()).unwrap()).await;
