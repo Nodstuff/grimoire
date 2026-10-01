@@ -38,6 +38,11 @@ targets:
       path: Taisce/Info.plist
       properties:
         CFBundleDisplayName: Taisce
+        # the OAuth redirect (ie.null.taisce:/oauth/callback);
+        # ASWebAuthenticationSession catches it, this makes the scheme ours
+        CFBundleURLTypes:
+          - CFBundleURLName: ie.null.taisce.oauth
+            CFBundleURLSchemes: [ie.null.taisce]
         # plain HTTP to a daemon on this device / the local network only;
         # remote servers must be HTTPS
         NSAppTransportSecurity:

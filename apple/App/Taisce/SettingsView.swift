@@ -17,7 +17,19 @@ struct SettingsView: View {
                 } header: {
                     Text("Server")
                 } footer: {
-                    Text("Plain HTTP works for this device and the local network only; use HTTPS for anything else.")
+                    Text("HTTPS servers ask you to sign in with a passkey. Plain HTTP is for a daemon on this device (no sign-in).")
+                }
+                if model.authPhase == .signedIn {
+                    Section {
+                        Button("Sign out", role: .destructive) {
+                            Task {
+                                await model.signOut()
+                                dismiss()
+                            }
+                        }
+                    } footer: {
+                        Text("Revokes this device's access on the server and removes its tokens from the Keychain.")
+                    }
                 }
                 if let error = model.lastError {
                     Section("Last error") { Text(error).foregroundStyle(.secondary) }

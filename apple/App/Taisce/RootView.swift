@@ -14,6 +14,14 @@ struct RootView: View {
     @State private var showSettings = false
 
     var body: some View {
+        if model.needsSignIn {
+            SignInView()
+        } else {
+            docs
+        }
+    }
+
+    private var docs: some View {
         NavigationSplitView {
             SidebarView(selection: $selection, query: query)
                 .navigationTitle("Taisce")
