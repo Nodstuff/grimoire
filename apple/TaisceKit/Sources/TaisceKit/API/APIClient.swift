@@ -47,16 +47,11 @@ public struct APIClient: Sendable {
         return try await get("/api/search", query: q)
     }
 
-    /// NB: a GET for today (or later) may carry-forward yesterday's open items,
-    /// i.e. it can write on the server. That is the web UI's behaviour too.
-    public func todoDay(_ date: String? = nil) async throws -> TodoDay {
-        try await get("/api/todo", query: date.map { [URLQueryItem(name: "date", value: $0)] } ?? [])
-    }
-
-    /// Open to-dos with deadlines up to `until` (a day, or a local
-    /// `YYYY-MM-DDTHH:MM`), overdue computed by time. Read-only.
-    public func todoDue(until: String) async throws -> TodoDueList {
-        try await get("/api/todo/due", query: [URLQueryItem(name: "until", value: until)])
+    /// Open to-dos with deadlines up to `until` (a day, RFC 3339, or a local
+    /// `YYYY-MM-DDTHH:MM`; nil = every deadline), soonest alert first,
+    /// overdue computed by time. Read-only.
+    public func todoDue(until: String? = nil) async throws -> TodoDueList {
+        try await get("/api/todo/due", query: until.map { [URLQueryItem(name: "until", value: $0)] } ?? [])
     }
 
     /// The change-log head alone (`limit=0`), e.g. to start a cursor without a backfill.
@@ -82,6 +77,8 @@ public struct APIClient: Sendable {
     }
 
     // MARK: to-dos
+    // No `GET /api/todo` on purpose: a GET for today carries items forward
+    // (a server write). Reads go through `todoDue` and the cached To-do doc.
 
     public func todoAdd(date: String, text: String) async throws -> TodoDay {
         try await post("/api/todo", body: ["date": date, "text": text])

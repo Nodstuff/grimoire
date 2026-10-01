@@ -86,6 +86,21 @@ import Testing
         #expect(due.items[1].due?.hasTime == false && due.items[1].carriedFrom == "2026-09-29")
     }
 
+    @Test func todoDueWithoutUntil() async throws {
+        let server = MockServer { _ in
+            .json(#"{"doc_id":null,"epoch":0,"now":"2026-10-01T12:00","until":null,"default_alert_time":"09:00","items":[]}"#)
+        }
+        let due = try await server.client().todoDue()
+        #expect(server.requests[0].query.isEmpty && due.until == nil && due.docID == nil)
+    }
+
+    @Test func badUntilIs400JSON() async throws {
+        let server = MockServer { _ in MockServer.Reply(status: 400, chunks: [Data(#"{"error":"until: bad date"}"#.utf8)]) }
+        await #expect(throws: APIError.server("until: bad date")) {
+            _ = try await server.client().todoDue(until: "fri")
+        }
+    }
+
     @Test func deadlineBodySplitsDateAndTime() throws {
         func body(_ d: Due?) throws -> [String: Any] {
             let data = try JSONEncoder().encode(APIClient.DeadlineBody(date: "2026-10-01", itemID: "0-ab", deadline: d))
@@ -103,7 +118,7 @@ import Testing
         let server = MockServer { _ in
             .json(#"{"carried":0,"date":"2026-10-01","doc_id":"t","epoch":11,"items":[{"id":"0-1","text":"x","done":true,"overdue":false,"due_soon":false}],"prev_date":null,"today":"2026-10-01"}"#)
         }
-        let day = try await server.client().todoDay()
+        let day = try await server.client().todoAdd(date: "2026-10-01", text: "x")
         #expect(day.items.first?.done == true && day.prevDate == nil && day.epoch == 11)
     }
 }

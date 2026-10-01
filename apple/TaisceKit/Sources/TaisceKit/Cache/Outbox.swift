@@ -45,6 +45,14 @@ extension Cache {
         return try await enqueue(method: "POST", path: "/api/propose", body: JSONEncoder().encode(req), key: key, now: now)
     }
 
+    /// Queue a deadline change (`nil` clears it). Same body as
+    /// `APIClient.todoSetDeadline`.
+    @discardableResult
+    public func enqueueDeadline(date: String, itemID: String, deadline: Due?, key: String = UUID().uuidString.lowercased(), now: Date = .now) async throws -> OutboxEntry {
+        let body = try JSONEncoder().encode(APIClient.DeadlineBody(date: date, itemID: itemID, deadline: deadline))
+        return try await enqueue(method: "POST", path: "/api/todo/deadline", body: body, key: key, now: now)
+    }
+
     @discardableResult
     public func enqueue(method: String, path: String, body: Data?, key: String, now: Date = .now) async throws -> OutboxEntry {
         try await db.write { db in

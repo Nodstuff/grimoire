@@ -57,8 +57,8 @@ in-memory id), and the parser is pure and tested byte-by-byte.
 
 The client follows a global change cursor:
 
-- `GET /api/docs` sends `X-Grimoire-Seq: <head>`, read under the same lock
-  as the list.
+- `GET /api/docs` sends `X-Grimoire-Seq: <head>`, read in the same transaction
+  as the tree. `GET /api/changes?since=0&limit=0` returns just `{seq, changes: [], more: false}`.
 - `GET /api/changes?since=<seq>&limit=<n>` →
   `{"seq": Int, "changes": [{"seq", "doc_id", "kind": "doc"|"tree"|"deleted"|"restored", "epoch"?, "at", "doc"?}], "more": Bool}`.
   `doc` = `{title, parent_id, sort_key, status, current_epoch, deleted}` as
@@ -96,7 +96,7 @@ The Today view reads due and overdue items from `GET /api/todo/due?until=`,
 which is read-only and computes overdue by time. Today's list comes from the
 cached To-do doc. The view never calls `GET /api/todo`, because a GET for
 today carries items forward on the server. `todoSetDeadline` sends the day as
-`deadline` and the time as `due_time`; a date-only deadline keeps the item's
+`deadline` and the time as `due_time` (also queueable via `Cache.enqueueDeadline`); a date-only deadline keeps the item's
 existing time.
 
 ## What's stubbed

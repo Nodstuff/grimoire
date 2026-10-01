@@ -114,6 +114,18 @@ import Testing
         #expect((obj["ops"] as? [[String: Any]])?.first?["kind"] as? [String: String] == ["op": "replace", "target": "b1", "content": "new"])
     }
 
+    @Test func deadlineChangesQueueAndReplay() async throws {
+        let cache = try Cache.inMemory()
+        try await cache.enqueueDeadline(date: "2026-10-01", itemID: "0-ab", deadline: Due("2026-10-02 14:30"))
+        let server = MockServer { _ in .json(#"{"carried":0,"date":"2026-10-01","doc_id":"t","epoch":3,"items":[],"prev_date":null,"today":"2026-10-01"}"#) }
+        try await OutboxReplayer(api: server.client(), cache: cache).replay()
+        let sent = try #require(server.requests.first)
+        #expect(sent.path == "/api/todo/deadline" && sent.httpMethod == "POST")
+        let obj = try #require(try JSONSerialization.jsonObject(with: sent.httpBody ?? Data()) as? [String: String])
+        #expect(obj == ["date": "2026-10-01", "item_id": "0-ab", "deadline": "2026-10-02", "due_time": "14:30"])
+        #expect(try await cache.pendingOutbox().isEmpty)
+    }
+
     @Test func replaySendsInOrderAndStopsOnTransportFailure() async throws {
         let cache = try Cache.inMemory()
         let first = try await cache.enqueue(propose(nil))

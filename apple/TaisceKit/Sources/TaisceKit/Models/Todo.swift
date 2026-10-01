@@ -222,7 +222,8 @@ public struct TodoDueList: Codable, Sendable, Hashable {
     public var docID: DocID?
     public var epoch: Int
     public var now: String
-    public var until: String
+    /// echo of the `until` asked for; nil when none was given
+    public var until: String?
     public var defaultAlertTime: String
     public var items: [Item]
 
