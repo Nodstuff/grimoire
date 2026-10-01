@@ -21,6 +21,8 @@ struct LibraryContent: View {
     let loaded: Bool
     var pins: Set<DocID> = []
     var onTogglePin: (DocID) -> Void = { _ in }
+    /// top-level folders start open, so the tree reads as a tree
+    @State private var expanded: Set<DocID>?
 
     var body: some View {
         List {
@@ -36,16 +38,7 @@ struct LibraryContent: View {
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets())
                 } else {
-                    OutlineGroup(nodes, children: \.children) { node in
-                        NavigationLink(value: Route.doc(node.id)) {
-                            LibraryRow(node: node, pinned: pins.contains(node.id))
-                        }
-                        .contextMenu {
-                            Button(pins.contains(node.id) ? "Unpin from Today" : "Pin to Today",
-                                   systemImage: pins.contains(node.id) ? "pin.slash" : "pin") { onTogglePin(node.id) }
-                        }
-                        .listRowBackground(Theme.surface)
-                    }
+                    LibraryTreeRows(nodes: nodes, pins: pins, expanded: $expanded, onTogglePin: onTogglePin)
                 }
             } header: {
                 ScreenHeader(title: "Library")
@@ -58,6 +51,53 @@ struct LibraryContent: View {
         .tint(Theme.accent)
         .groundBackground()
         .toolbarVisibility(.hidden, for: .navigationBar)
+        .onChange(of: nodes.map(\.id), initial: true) { _, roots in
+            if expanded == nil, !roots.isEmpty { expanded = Set(nodes.filter(\.isFolder).map(\.id)) }
+        }
+    }
+}
+
+/// The tree as rows: folders disclose their children, every row opens its doc.
+struct LibraryTreeRows: View {
+    let nodes: [LibraryNode]
+    let pins: Set<DocID>
+    @Binding var expanded: Set<DocID>?
+    let onTogglePin: (DocID) -> Void
+
+    var body: some View {
+        ForEach(nodes) { node in
+            if let kids = node.children {
+                DisclosureGroup(isExpanded: binding(node.id)) {
+                    LibraryTreeRows(nodes: kids, pins: pins, expanded: $expanded, onTogglePin: onTogglePin)
+                } label: {
+                    link(node)
+                }
+                .listRowBackground(Theme.surface)
+            } else {
+                link(node).listRowBackground(Theme.surface)
+            }
+        }
+    }
+
+    func binding(_ id: DocID) -> Binding<Bool> {
+        Binding(
+            get: { expanded?.contains(id) ?? false },
+            set: { open in
+                var set = expanded ?? []
+                if open { set.insert(id) } else { set.remove(id) }
+                expanded = set
+            }
+        )
+    }
+
+    func link(_ node: LibraryNode) -> some View {
+        NavigationLink(value: Route.doc(node.id)) {
+            LibraryRow(node: node, pinned: pins.contains(node.id))
+        }
+        .contextMenu {
+            Button(pins.contains(node.id) ? "Unpin from Today" : "Pin to Today",
+                   systemImage: pins.contains(node.id) ? "pin.slash" : "pin") { onTogglePin(node.id) }
+        }
     }
 }
 

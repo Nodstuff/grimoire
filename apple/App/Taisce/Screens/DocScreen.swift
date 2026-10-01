@@ -125,7 +125,7 @@ struct DocContent: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
-                Text(breadcrumb.map { $0 + DocIndex.separator + title } ?? title)
+                Text(breadcrumb ?? title)
                     .font(.footnote.weight(.medium))
                     .foregroundStyle(Theme.secondary)
                     .lineLimit(1)

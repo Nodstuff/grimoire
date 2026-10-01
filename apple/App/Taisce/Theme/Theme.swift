@@ -28,7 +28,7 @@ enum Theme {
         .system(style, design: .serif).weight(weight)
     }
 
-    static let mono = Font.system(.callout, design: .monospaced)
+    static let mono = Font.system(.footnote, design: .monospaced)
 }
 
 extension Color {

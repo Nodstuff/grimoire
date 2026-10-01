@@ -26,9 +26,11 @@ apple/
       Render/                  block markdown → RenderNode (swift-markdown), inline/wikilinks
       Todo/                    offline parser for the To-do doc
     Tests/TaisceKitTests/    Swift Testing + a URLProtocol mock server
-  App/                         thin iOS app shell (xcodegen)
+  App/                         the iOS app (xcodegen)
     project.yml
-    Taisce/                    SwiftUI views + AppModel
+    Taisce/                    AppModel, Router, Theme (tokens), Presentation (pure view models),
+                               Views (components, block renderer), Screens
+    TaisceTests/               view-model tests (Swift Testing, hosted in the app)
 ```
 
 ## Build and test
@@ -176,6 +178,17 @@ later.
   harmlessly.
 - `propose_markdown` queues are rebased like `propose`, but a stale base is
   an error there (whole-doc diff), so they are not chained.
-- Pinned: sidebar placeholder.
+- Pins are local (UserDefaults, per server); pinned docs are always fetched by sync.
+- Doc checkboxes toggle through a queued `replace`; the rest of editing is the next pass.
 - Diagrams (Mermaid, Vega-Lite, D2) render as labelled placeholder cards.
 - APNs / background refresh, Mac Catalyst.
+
+## Running the app against a scratch daemon
+
+Launch arguments (UserDefaults' argument domain) make screenshots and UI
+runs reproducible: `-serverURL http://127.0.0.1:7517`, `-tab
+today|library|todos|search`, `-openDoc "<title>"`, `-searchQuery <text>`,
+`-showSettings YES`. For example
+`xcrun simctl launch booted ie.null.taisce -serverURL http://127.0.0.1:7517 -openDoc "Roadmap"`.
+Start the daemon with `HOME=<tmp>` so it does not import this machine's
+Claude memory files. Tests: `xcodebuild -scheme Taisce -destination 'platform=iOS Simulator,name=iPhone 18 Pro' test`.

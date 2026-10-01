@@ -81,6 +81,7 @@ struct TodosContent: View {
         }
         .listStyle(.insetGrouped)
         .listSectionSpacing(20)
+        .contentMargins(.top, 0, for: .scrollContent)
         .groundBackground()
         .toolbarVisibility(.hidden, for: .navigationBar)
         .safeAreaInset(edge: .bottom) {

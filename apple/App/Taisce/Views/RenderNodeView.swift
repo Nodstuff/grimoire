@@ -253,7 +253,7 @@ private struct TableBlock: View {
                     ForEach(0..<columns, id: \.self) { i in
                         cell(i < table.header.count ? table.header[i] : "", column: i)
                             .font(.subheadline.weight(.semibold))
-                            .background(Theme.surface2)
+                            .background { Rectangle().fill(Theme.surface2) }
                     }
                 }
                 ForEach(Array(table.rows.enumerated()), id: \.offset) { _, row in
