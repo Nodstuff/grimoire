@@ -240,7 +240,7 @@ def main():
         if not os.path.exists(binary):
             sys.exit(f"{binary} missing: cargo build --release -p grimoire first")
         scratch = tempfile.mkdtemp(prefix="grimoire-mcp-smoke.")
-        env = dict(os.environ, GRIMOIRE_IDENTITY_FILE=os.path.join(scratch, "identity.key"))
+        env = dict(os.environ, HOME=scratch)
         log = open(os.path.join(scratch, "log"), "w")
         proc = subprocess.Popen([binary, "--db", os.path.join(scratch, "ks.db"), "--port", str(PORT), "serve"],
                                 env=env, stdout=log, stderr=subprocess.STDOUT)

@@ -1,8 +1,16 @@
 # ADR 0003 — Hot docs and comment channels
 
-- **Status**: decided
+- **Status**: superseded (2026-10-01) — hot docs were removed from the code
 - **Who/when**: Tom + Claude, 2026-09-01 (design session; realises PROJECT.md §7 P2.1–P2.4 on the ADR 0002 transport)
 - **Tickets**: #64–#67
+
+> **Superseded, 2026-10-01.** Hot sessions existed for co-editing across instances and
+> for agents writing into a live room. With federation gone (ADR 0002, superseded) the
+> product is one person's server reached from their own devices; a session froze the epoch,
+> made every propose surface refuse edits, and carried a yrs/Yjs stack, a journal directory
+> and a websocket route. hot.rs, room.rs, `/ws/hot`, the live-session refusals and
+> the UI's live editor were deleted; offline clients reconcile through the review gate and
+> the change feed instead. Kept below as the record of what was decided and built.
 
 ## Decision
 

@@ -1,5 +1,22 @@
 # Grimoire — working rules for Claude sessions
 
+What it is now: ONE personal server, **Taisce** (`https://taisce.null.ie`), plus clients.
+- The `grimoire` binary runs in two modes. **SERVER** (`--public-url` /
+  `GRIMOIRE_PUBLIC_URL` set): every data route needs an OAuth 2.1 bearer token, sign-in is
+  passkeys (`grimoire auth enroll|list|revoke` on the box), the proxy is trusted for
+  rate-limiting (`--trusted-proxy`), APNs nudges the iOS app. **LOCAL** (no public URL): the
+  Mac app's daemon on `127.0.0.1:7425`, loopback-only (DNS-rebinding guard), `/admin/*` behind
+  the per-boot `admin.token`.
+- Clients: this web UI (embedded in the binary), the native Apple app under `apple/` on
+  branch `ios-ui` (TaisceKit + the Taisce app), Claude over MCP at `/mcp`.
+- The server box: `infra/` on branch `infra` (Terraform for the EC2 instance, systemd units for
+  grimoire + portus + litestream, `deploy/install.sh` run over SSM from a release bundle in the
+  backup bucket). Zero ingress; SSM only.
+- Cut on 2026-10-01 and gone from the code: peer-to-peer federation (iroh, shares, mirrors,
+  hubs), hot docs and agents in the room, canvases, doc freshness views, the status chip, the
+  reviewer gardener. ADRs 0002/0003 are marked superseded; a store migration dropped the
+  federation tables.
+
 Repo: github.com/Nodstuff/grimoire (personal account `Nodstuff`; `gh`'s active
 account may be flipped to the work account by other sessions — push with
 `git -c credential.helper= -c 'credential.helper=!f() { echo username=Nodstuff; echo password=$(gh auth token --user Nodstuff); }; f' push origin main`).
@@ -16,16 +33,16 @@ account may be flipped to the work account by other sessions — push with
   switched this shared checkout); `release.sh` enforces this and tags the exact HEAD.
 - Big builds: a fresh general-purpose agent (forks inherit the whole conversation and die on
   context), in an isolated worktree if a release may build concurrently; commit as you go.
-- The real hub runs on EC2 (`i-01cfd84ace1e1e2a4`, Qompass-Dev, SSM only, zero ingress); update
-  it with `cargo zigbuild --release -p grimoire --target aarch64-unknown-linux-gnu` shipped via a
-  throwaway presigned S3 object. Never point a test daemon at it or at `~/.grimoire`.
+- The server target must keep building: `cargo zigbuild --release -p grimoire --target
+  aarch64-unknown-linux-gnu`; ship it with the `infra` branch's SSM deploy. Never point a test
+  daemon at the server or at `~/.grimoire`.
 
 ## Where the truth is
 - **System docs**: the `[[Grimoire]]` doc tree in Grimoire itself (MCP server `grimoire`):
-  Architecture, Review Gate, Gardeners, Federation, Hot Docs, Agent Guide, Using the App,
-  Development, Roadmap. These are current; `PROJECT.md` is the founding design record and its
-  status section says what has since been built.
-- **Decisions**: `docs/adr/` (0001 storage, 0002 federation, 0003 hot docs).
+  Architecture, Review Gate, Gardeners, Agent Guide, Using the App, Development, Roadmap
+  (its Federation and Hot Docs pages describe removed features). `PROJECT.md` is the founding
+  design record and its status section says what has since been built and cut.
+- **Decisions**: `docs/adr/` (0001 storage; 0002 federation and 0003 hot docs, both superseded).
 - **Backlog**: GitHub issues; milestones M1–M9 are complete.
 
 ## Build / test / ship
@@ -35,14 +52,13 @@ account may be flipped to the work account by other sessions — push with
 - **Before any live smoke test: `cd <repo> && cargo build --release`** — `cargo test`/debug
   builds do not refresh `target/release/grimoire`; a stale scratch daemon has burned hours.
   The shell cwd drifts into `ui/` after npm commands; always `cd` to the repo root first.
-- Scratch daemons: `GRIMOIRE_IDENTITY_FILE=<dir>/identity.key ./target/release/grimoire --db <dir>/ks.db --port 751x serve [--hub --name X]`
+- Scratch daemons (LOCAL mode): `HOME=<dir> ./target/release/grimoire --db <dir>/ks.db --port 751x serve`
   (`--port` is global; the UI is embedded, no `GRIMOIRE_UI_DIST` needed). Admin routes need
-  `-H "X-Grimoire-Admin: $(cat <dir>/admin.token)"`. Never point one at `~/.grimoire`.
-- Hub changes: run `scripts/smoke-hub-slice2.sh` (3 daemons, 33 checks) before shipping.
-- `./deploy.sh` = fast unsigned local deploy (restarts the production daemon on 7425 —
+  `-H "X-Grimoire-Admin: $(cat <dir>/admin.token)"`. Add `--public-url https://…` for SERVER
+  mode. Never point one at `~/.grimoire`.
+- `scripts/mcp-smoke.py` drives a scratch daemon over MCP end to end.
+- `./deploy.sh` = fast unsigned local deploy of the Mac app (restarts the daemon on 7425 —
   in-flight gardener runs get orphaned). `./release.sh` = signed + notarized dmg.
-- Federation smoke across two daemons is the canonical end-to-end test (join → pull →
-  propose → accept → pull back). Two browser windows on one daemon test hot sessions.
 
 ## Writing to Grimoire over MCP (this repo's own docs live in it)
 - 16 tools (AX 2): `find_doc`, `orient`, `read_doc`, `edit_doc`, `append`, `propose_markdown`,
@@ -58,7 +74,8 @@ account may be flipped to the work account by other sessions — push with
 
 ## Traps
 - `window.alert`/`confirm` are silent no-ops in Tauri's WKWebView — use inline UI.
-- Markdown-it's commonmark preset has no tables; mirrors are read-only at the store layer;
-  hot docs freeze the epoch (propose surfaces refuse — retry after the session).
-- Anything settable that weakens the gate (review policy, shares, trust, gardeners) is a
-  human surface: never expose it over MCP.
+- Markdown-it's commonmark preset has no tables.
+- Old databases still hold `canvas_scene` blocks and `remote` principals: both stay valid in
+  the schema (the editor, export and retrieval skip canvas blocks; new ones are refused).
+- Anything settable that weakens the gate (review policy, gardeners) is a human surface:
+  never expose it over MCP.

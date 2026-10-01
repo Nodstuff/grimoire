@@ -1,11 +1,18 @@
-> **Status (2026-09-01):** this is the founding design record, kept as written. Since
-> then everything in it has been built, including all of §6 and §7: v1 (M1–M5),
-> federation over iroh with trust tiers (M6/M7, ADR 0002), hot docs with presence,
-> auto-hot and comments-as-chat (M8, ADR 0003), a signed + notarized dmg, and the
-> React Flow canvas with live collab (M9). Where this file says "parked" or "design
-> constraints only", read the ADRs in `docs/adr/` and the `[[Grimoire]]` doc tree in
-> Grimoire itself for what exists. The repo is `Nodstuff/grimoire` (renamed from
-> `knowledge-system`).
+> **Status (2026-10-01):** this is the founding design record, kept as written. Everything
+> in it was built, including all of §6 and §7: v1 (M1–M5), federation over iroh with trust
+> tiers (M6/M7, ADR 0002), hot docs with presence, auto-hot and comments-as-chat (M8, ADR
+> 0003), a signed + notarized dmg, and the React Flow canvas with live collab (M9). Since
+> then the product became one personal server, Taisce (`taisce.null.ie`, SERVER mode: OAuth
+> 2.1 + passkeys, APNs) with native Apple clients (`apple/`, branch `ios-ui`), this web UI and
+> MCP; the Mac app runs the same binary in LOCAL mode. On 2026-10-01 these were cut from the
+> code: federation and hubs (ADR 0002 superseded; store migration v7 dropped its tables), hot
+> docs and agents in the room (ADR 0003 superseded), canvases (old `canvas_scene` blocks stay
+> in the store, unrendered), the doc freshness views (the `verified_at` column stays), the
+> doc status chip, and the reviewer gardener kind. Built since the original plan and kept:
+> ask-the-vault with living answers, workspaces, the change feed for offline clients, quick
+> capture with the filer, to-dos, Claude memory sync, import/export, daily backups. Where
+> this file describes phase 2 (§6, §7), read it as history. The repo is `Nodstuff/grimoire`
+> (renamed from `knowledge-system`).
 
 # PROJECT.md — Personal Knowledge System That Maintains Itself
 

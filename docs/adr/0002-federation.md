@@ -1,8 +1,18 @@
 # ADR 0002 — Federation: owner-authoritative mirrors over iroh
 
-- **Status**: decided
+- **Status**: superseded (2026-10-01) — federation was removed from the code
 - **Who/when**: Tom + Claude, 2026-09-01 (design session; realises PROJECT.md §6 / P2.7)
 - **Tickets**: TBD (P2.7 slice-up)
+
+> **Superseded, 2026-10-01.** Grimoire became one personal server (Taisce, at
+> `taisce.null.ie`, OAuth + passkeys) with native Apple clients and this web UI. Every
+> device reaches the same server, so instance-to-instance sharing solved a problem the
+> product no longer has, while costing a second write path into the gate, an iroh
+> network stack, read-only mirror guards on every surface and a hub mode.
+> All of it — iroh, contacts, shares, invites, mirrors, hubs, doc transfers and the
+> `share|hub|identity` CLI — was deleted, and store migration v7 dropped the federation
+> tables. `remote` principals stay in the schema so the provenance of past ops still
+> reads. Kept below as the record of what was decided and built.
 
 ## Decision
 
