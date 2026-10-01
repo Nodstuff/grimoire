@@ -18,9 +18,11 @@ public protocol TokenStore: Sendable {
 public struct KeychainTokenStore: TokenStore {
     let valet: Valet
 
-    public init(identifier: String = "ie.null.taisce.auth") {
-        // a non-empty literal: Identifier(nonEmpty:) can't fail here
-        valet = .valet(with: Identifier(nonEmpty: identifier)!, accessibility: .afterFirstUnlockThisDeviceOnly)
+    public struct EmptyIdentifier: Error {}
+
+    public init(identifier: String = "ie.null.taisce.auth") throws {
+        guard let id = Identifier(nonEmpty: identifier) else { throw EmptyIdentifier() }
+        valet = .valet(with: id, accessibility: .afterFirstUnlockThisDeviceOnly)
     }
 
     public func tokens(for server: String) throws -> TokenSet? {

@@ -98,10 +98,23 @@ final class AppModel {
         }
     }
 
-    /// Loopback daemons run in LOCAL mode (loopback is trusted); anything
-    /// else gets an `AuthSession` with tokens in the Keychain.
     static func isLoopback(_ url: URL) -> Bool {
         ["127.0.0.1", "localhost", "::1"].contains(url.host() ?? "")
+    }
+
+    /// The server decides, not the URL: one with tokens in the Keychain is
+    /// signed in; otherwise discovery says whether it needs sign-in (a
+    /// SERVER-mode daemon can sit on localhost behind a tunnel, and a
+    /// LOCAL-mode one can be reached by name). Unreachable and no tokens:
+    /// a loopback daemon is assumed LOCAL, anything else asks to sign in.
+    static func authSession(for url: URL) async throws -> AuthSession? {
+        let auth = AuthSession(oauth: OAuthClient(baseURL: url), store: try KeychainTokenStore())
+        if await auth.state == .signedIn { return auth }
+        do {
+            return try await auth.requiresAuth() ? auth : nil
+        } catch {
+            return isLoopback(url) ? nil : auth
+        }
     }
 
     /// One cache file per server, so switching servers never mixes docs.
@@ -116,9 +129,7 @@ final class AppModel {
             let dir = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
             let name = "cache-\(url.host() ?? "server")-\(url.port ?? 0).sqlite"
             let cache = try Cache(path: dir.appending(path: name).path(percentEncoded: false))
-            let auth = withAuth && !Self.isLoopback(url)
-                ? AuthSession(oauth: OAuthClient(baseURL: url), store: KeychainTokenStore())
-                : nil
+            let auth = withAuth ? try await Self.authSession(for: url) : nil
             let api = APIClient(config: ServerConfig(baseURL: url, tokenProvider: auth ?? NoAuth()))
             self.auth = auth
             authPhase = auth == nil ? .notRequired : (await auth?.state == .signedIn ? .signedIn : .signedOut)
@@ -147,35 +158,7 @@ final class AppModel {
         }
     }
 
-    func doc(titled title: String) -> DocRecord? {
-        // wikilinks name docs by title, optionally with a parent path
-        let leaf = title.split(separator: "/").last.map(String.init) ?? title
-        return docs.first { $0.title == title } ?? docs.first { $0.title == leaf }
-    }
+    func doc(titled title: String) -> DocRecord? { Library.doc(titled: title, in: docs) }
 
-    var todoDocID: DocID? {
-        docs.first { $0.parentID == nil && $0.title == TodoParser.todoDocTitle }?.id
-    }
-}
-
-/// The flat doc list as a tree for `OutlineGroup` (nil children = leaf).
-struct DocTreeNode: Identifiable, Hashable {
-    var doc: DocRecord
-    var children: [DocTreeNode]?
-    var id: DocID { doc.id }
-
-    static func build(_ docs: [DocRecord]) -> [DocTreeNode] {
-        // a doc whose parent we don't have (trashed, not shared to us) shows at the root
-        let ids = Set(docs.map(\.id))
-        let byParent = Dictionary(grouping: docs) { $0.parentID.flatMap { ids.contains($0) ? $0 : nil } }
-        func nodes(_ parent: DocID?) -> [DocTreeNode] {
-            (byParent[parent] ?? [])
-                .sorted { ($0.sortKey ?? "", $0.title) < ($1.sortKey ?? "", $1.title) }
-                .map { d in
-                    let kids = nodes(d.id)
-                    return DocTreeNode(doc: d, children: kids.isEmpty ? nil : kids)
-                }
-        }
-        return nodes(nil)
-    }
+    var todoDocID: DocID? { Library.todoDocID(in: docs) }
 }

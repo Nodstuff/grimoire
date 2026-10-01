@@ -34,6 +34,9 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 6UP35L9425
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
     info:
       path: Taisce/Info.plist
       properties:
@@ -51,3 +54,27 @@ targets:
             localhost:
               NSExceptionAllowsInsecureHTTPLoads: true
         NSLocalNetworkUsageDescription: Taisce connects to your server on this network.
+  TaisceTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - TaisceTests
+    # TaisceKit comes through the host app (BUNDLE_LOADER): linking the
+    # package here too turns it into a shared framework and breaks the app's link
+    dependencies:
+      - target: Taisce
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce.tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 6UP35L9425
+schemes:
+  Taisce:
+    build:
+      targets:
+        Taisce: all
+    test:
+      targets:
+        - TaisceTests

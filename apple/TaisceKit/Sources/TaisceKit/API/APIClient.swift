@@ -68,6 +68,12 @@ public struct APIClient: Sendable {
 
     // MARK: block edits (no UI yet)
 
+    /// A new, empty doc (nil parent = top level). Fill it with `proposeMarkdown`.
+    public func createDoc(title: String, parent: DocID? = nil) async throws -> DocSummary {
+        struct Body: Encodable { var title: String; var parent_doc_id: DocID? }
+        return try await post("/api/docs", body: Body(title: title, parent_doc_id: parent))
+    }
+
     public func propose(_ req: ProposeRequest) async throws -> ProposeOutcome {
         try await post("/api/propose", body: req)
     }

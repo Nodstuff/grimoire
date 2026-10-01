@@ -45,6 +45,23 @@ xcodebuild -project Taisce.xcodeproj -scheme Taisce -sdk iphonesimulator \
   -destination 'generic/platform=iOS Simulator' build
 ```
 
+Integration against real scratch daemons (LOCAL on 7515, SERVER on 7516
+signed in headlessly with the daemon's `softpasskey` example; temp dirs,
+killed on exit):
+
+```sh
+# in the grimoire checkout: cargo build --release -p grimoire && cargo build --release -p grimoire --example softpasskey
+apple/scripts/integration.sh [path to the grimoire checkout]
+```
+
+App-hosted tests (Keychain persistence, first-launch view models, failed
+sign-in) run on a simulator:
+
+```sh
+cd apple/App && xcodegen generate
+xcodebuild -scheme Taisce -destination 'platform=iOS Simulator,name=iPhone 18 Pro' test
+```
+
 `xcodebuild` needs the iOS platform/simulator runtime installed (Xcode ›
 Settings › Components). Without it, the app sources can still be
 type-checked against the simulator SDK by cross-building TaisceKit
@@ -106,9 +123,12 @@ existing time.
 ## Sign-in
 
 The default server is `https://taisce.null.ie` (SERVER mode: every `/api`,
-`/mcp` and `/ws` request needs a bearer). A loopback URL
-(`http://127.0.0.1:7425`, `localhost`) is a LOCAL-mode daemon: no tokens, no
-sign-in screen.
+`/mcp` and `/ws` request needs a bearer). The server decides whether sign-in
+is needed, not the URL: with tokens in the Keychain the app is signed in;
+otherwise OAuth discovery runs, and a server without metadata (LOCAL mode,
+e.g. `http://127.0.0.1:7425`) gets no sign-in screen. If discovery can't
+reach the server, a loopback URL is assumed LOCAL and anything else shows
+the sign-in screen.
 
 Flow (`AuthSession`, driven by `AppModel`):
 

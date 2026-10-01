@@ -215,6 +215,8 @@ public struct OAuthClient: Sendable {
         var r = URLRequest(url: url)
         r.httpMethod = method
         r.setValue("application/json", forHTTPHeaderField: "Accept")
+        // small documents: an unreachable server shouldn't hold up launch for a minute
+        r.timeoutInterval = 15
         return r
     }
 
