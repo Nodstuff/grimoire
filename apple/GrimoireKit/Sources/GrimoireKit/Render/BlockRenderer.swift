@@ -21,8 +21,10 @@ public enum BlockRenderer {
         }
     }
 
+    /// A doc's blocks for reading: comment threads are left out (they anchor
+    /// to blocks via `refers_to` and get their own surface later).
     public static func render(_ records: [BlockRecord]) -> [RenderedBlock] {
-        records.map { RenderedBlock(id: $0.id, depth: $0.depth, nodes: render($0.block)) }
+        records.filter { $0.blockType != BlockType.comment.rawValue }.map { RenderedBlock(id: $0.id, depth: $0.depth, nodes: render($0.block)) }
     }
 
     public static func render(markdown: String) -> [RenderNode] {
