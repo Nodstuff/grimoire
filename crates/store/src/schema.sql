@@ -564,3 +564,16 @@ CREATE TABLE IF NOT EXISTS oauth_access_tokens (
     expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS oauth_access_grant ON oauth_access_tokens (grant_id);
+
+-- Idempotency: (principal, key) → the first outcome of a write, so a retry
+-- (HTTP `request_id`, or an MCP write's content key) replays it instead of
+-- applying twice — across restarts. Readers pass their own window; rows
+-- older than the longest one (7 days) are swept.
+CREATE TABLE IF NOT EXISTS idempotency (
+    principal  TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    response   TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (principal, key)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idempotency_created ON idempotency (created_at);

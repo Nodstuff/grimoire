@@ -1032,6 +1032,10 @@ async fn main() -> anyhow::Result<()> {
             let fed_ctx_node_id: Option<String>;
             // one idempotency cache for MCP and HTTP proposes (request_id)
             let dedupe = mcp::new_dedupe();
+            {
+                let store = store.clone();
+                supervise("idempotency.cleanup", move || mcp::idempotency_cleanup_loop(store.clone()));
+            }
             let auth_state = match auth_cfg {
                 Some(cfg) => {
                     let st = auth::AuthState::new(cfg, store.clone())?;

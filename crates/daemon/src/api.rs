@@ -536,7 +536,7 @@ async fn propose(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json
             Err(m) => return Json(json!({"error": m})),
         };
         if let Some(rid) = req.request_id
-            && let Some(prev) = crate::mcp::dedupe_get(&st.dedupe, principal, rid)
+            && let Some(prev) = crate::mcp::durable_get(s, &st.dedupe, principal, rid, crate::mcp::REQUEST_ID_TTL)
         {
             return Json(prev);
         }
@@ -544,7 +544,7 @@ async fn propose(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json
             Ok(out) => {
                 let v = json!(out);
                 if let Some(rid) = req.request_id {
-                    crate::mcp::dedupe_put(&st.dedupe, principal, rid, v.clone());
+                    crate::mcp::durable_put(s, &st.dedupe, principal, rid, v.clone(), crate::mcp::REQUEST_ID_TTL);
                 }
                 Json(v)
             }
@@ -586,7 +586,7 @@ async fn propose_markdown(
             Err(m) => return Json(json!({"error": m})),
         };
         if let Some(rid) = req.request_id
-            && let Some(prev) = crate::mcp::dedupe_get(&st.dedupe, principal, rid)
+            && let Some(prev) = crate::mcp::durable_get(s, &st.dedupe, principal, rid, crate::mcp::REQUEST_ID_TTL)
         {
             return Json(prev);
         }
@@ -614,7 +614,7 @@ async fn propose_markdown(
             Ok(out) => {
                 let v = json!(out);
                 if let Some(rid) = req.request_id {
-                    crate::mcp::dedupe_put(&st.dedupe, principal, rid, v.clone());
+                    crate::mcp::durable_put(s, &st.dedupe, principal, rid, v.clone(), crate::mcp::REQUEST_ID_TTL);
                 }
                 Json(v)
             }
@@ -1842,6 +1842,70 @@ mod http_client_tests {
         let long = "x".repeat(65);
         let bad = new_doc(&app, &[(PRINCIPAL_HEADER, long.as_str())]).await;
         assert!(bad["error"].as_str().unwrap().contains("1-64 printable chars"));
+    }
+
+    fn state_on(db: &std::path::Path, human: Uuid) -> ApiState {
+        let store = Arc::new(Mutex::new(SqliteStore::open(db).unwrap()));
+        let dir = db.parent().unwrap().to_path_buf();
+        ApiState {
+            changes: crate::changes::Feed::new(&store),
+            store,
+            human,
+            hot: crate::hot::HotState::new(dir.clone()),
+            runtime: crate::fed::Runtime::default(),
+            db_path: db.to_path_buf(),
+            node_id: None,
+            embedder: None,
+            dedupe: crate::mcp::new_dedupe(),
+        }
+    }
+
+    /// A `request_id` replays past the memory cache's 120s window and across
+    /// a restart (a new store handle and an empty cache on the same db): the
+    /// doc moves exactly once.
+    #[tokio::test]
+    async fn request_id_replays_after_the_memory_window_and_a_restart() {
+        let dir = std::env::temp_dir().join(format!("grimoire-api-idem-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("ks.db");
+        let human = SqliteStore::open(&db).unwrap().create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let st = state_on(&db, human);
+        let app = router(st.clone());
+        let doc = new_doc(&app, &[]).await;
+        let id = doc["id"].as_str().unwrap().to_string();
+        let rid = Uuid::now_v7();
+        let body = json!({"doc_id": id, "base_epoch": 0, "request_id": rid, "ops": [{"kind": {"op": "insert",
+            "block_id": Uuid::now_v7(), "parent_id": null, "order_key": "",
+            "block_type": "paragraph", "content": "once"}}]});
+        let first = call(&app, "POST", "/api/propose", &[], Some(body.clone())).await;
+        assert_eq!(first["epoch"], 1, "{first}");
+        // simulated 121s: every memory entry is past DEDUPE_TTL
+        for (_, at, _) in st.dedupe.lock().unwrap().values_mut() {
+            *at = std::time::Instant::now() - std::time::Duration::from_secs(121);
+        }
+        assert!(crate::mcp::dedupe_get(&st.dedupe, human, rid).is_none(), "memory window passed");
+        let late = call(&app, "POST", "/api/propose", &[], Some(body.clone())).await;
+        assert_eq!(late, first);
+        // restart: a fresh handle and an empty cache on the same file
+        drop(app);
+        drop(st);
+        let app = router(state_on(&db, human));
+        let again = call(&app, "POST", "/api/propose", &[], Some(body.clone())).await;
+        assert_eq!(again, first);
+        let tree = call(&app, "GET", &format!("/api/doc/{id}"), &[], None).await;
+        assert_eq!(tree["doc"]["current_epoch"], 1, "applied once");
+        assert_eq!(tree["roots"].as_array().unwrap().len(), 1);
+        // propose_markdown: same guarantee across a restart
+        let body = json!({"doc_id": id, "base_epoch": 1, "request_id": Uuid::now_v7(), "markdown": "only\n"});
+        let a = call(&app, "POST", "/api/propose_markdown", &[], Some(body.clone())).await;
+        assert_eq!(a["epoch"], 2, "{a}");
+        drop(app);
+        let app = router(state_on(&db, human));
+        let b = call(&app, "POST", "/api/propose_markdown", &[], Some(body)).await;
+        assert_eq!(a, b);
+        let tree = call(&app, "GET", &format!("/api/doc/{id}"), &[], None).await;
+        assert_eq!(tree["doc"]["current_epoch"], 2, "applied once");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

@@ -46,6 +46,9 @@ use uuid::Uuid;
 /// principal so one agent's retry can never replay another's outcome.
 /// Values carry an insertion sequence so eviction drops the OLDEST half
 /// instead of clearing — a retry storm never wipes an in-window entry.
+/// The propose paths (MCP edit/append/propose/propose_markdown, HTTP
+/// `request_id`) also go through `durable_get`/`durable_put`, which back it
+/// with the store's `idempotency` table so a retry survives a restart.
 pub type DedupeCache = Arc<Mutex<std::collections::HashMap<(Uuid, Uuid), (u64, Instant, Value)>>>;
 
 pub const DEDUPE_CAPACITY: usize = 512;
@@ -77,6 +80,51 @@ pub fn dedupe_put(cache: &DedupeCache, principal: Uuid, id: Uuid, v: Value) {
     }
     let seq = DEDUPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     c.insert((principal, id), (seq, Instant::now(), v));
+}
+
+/// How long an HTTP `request_id`'s outcome replays: a phone retrying after
+/// a night offline still gets the original answer, not a second apply.
+pub const REQUEST_ID_TTL: Duration = Duration::from_secs(7 * 86400);
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `dedupe_get` backed by the store's `idempotency` table: the memory cache
+/// first, then a row recorded within `window` — so a retry after a restart
+/// (or, for a `request_id`, days later) still replays.
+pub fn durable_get(store: &SqliteStore, cache: &DedupeCache, principal: Uuid, id: Uuid, window: Duration) -> Option<Value> {
+    if let Some(v) = dedupe_get(cache, principal, id) {
+        return Some(v);
+    }
+    let since = unix_now() - window.as_secs() as i64;
+    let row = store.idempotency_get(principal, id, since).ok().flatten()?;
+    serde_json::from_str(&row).ok()
+}
+
+/// `dedupe_put` that also records the outcome durably (kept for `window`; a
+/// failed write only loses restart-survival, never the answer).
+pub fn durable_put(store: &mut SqliteStore, cache: &DedupeCache, principal: Uuid, id: Uuid, v: Value, window: Duration) {
+    if let Err(e) = store.idempotency_put(principal, id, &v.to_string(), unix_now(), window.as_secs() as i64) {
+        tracing::warn!("idempotency record failed: {e}");
+    }
+    dedupe_put(cache, principal, id, v);
+}
+
+/// Sweep idempotency rows past the longest window (`REQUEST_ID_TTL`), hourly.
+pub async fn idempotency_cleanup_loop(store: Arc<Mutex<SqliteStore>>) {
+    loop {
+        let before = unix_now() - REQUEST_ID_TTL.as_secs() as i64;
+        match with_store(&store, move |s| s.idempotency_cleanup(before)).await {
+            Ok(n) if n > 0 => tracing::info!(rows = n, "idempotency cleanup"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("idempotency cleanup failed: {e}"),
+        }
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
 }
 
 pub fn new_dedupe() -> DedupeCache {
@@ -534,6 +582,7 @@ fn replay(prev: &Value, verbose: bool) -> Result<CallToolResult, McpError> {
 /// The verdict of a write or a store error, as the tool's answer; records the
 /// outcome under `key` for retries.
 fn finish(
+    store: &mut SqliteStore,
     dedupe: &DedupeCache,
     principal: Uuid,
     key: Uuid,
@@ -545,7 +594,8 @@ fn finish(
     match res {
         Ok(out) => {
             let text = render_outcome(ops, &out, before);
-            dedupe_put(dedupe, principal, key, stored(&text, &serde_json::to_value(&out).unwrap_or_default()));
+            let v = stored(&text, &serde_json::to_value(&out).unwrap_or_default());
+            durable_put(store, dedupe, principal, key, v, DEDUPE_TTL);
             answer(ops, &out, before, verbose)
         }
         Err(e) => err(e.to_string()),
@@ -1336,6 +1386,9 @@ impl KsMcp {
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, move |store| {
+            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, verbose);
+            }
             if let Some(m) = crate::api::refuse_if_mirror(store, doc_id, "editing") {
                 return err(m);
             }
@@ -1389,7 +1442,7 @@ impl KsMcp {
                 return no_changes(epoch);
             }
             let res = store.propose(doc_id, epoch, principal, ops.clone());
-            finish(&dedupe, principal, key, &ops, res, epoch, verbose)
+            finish(store, &dedupe, principal, key, &ops, res, epoch, verbose)
         })
         .await
     }
@@ -1425,6 +1478,9 @@ impl KsMcp {
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, move |store| {
+            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, verbose);
+            }
             if let Some(m) = crate::api::refuse_if_mirror(store, doc_id, "editing") {
                 return err(m);
             }
@@ -1457,7 +1513,7 @@ impl KsMcp {
                 return no_changes(epoch);
             }
             let res = store.propose(doc_id, epoch, principal, ops.clone());
-            finish(&dedupe, principal, key, &ops, res, epoch, verbose)
+            finish(store, &dedupe, principal, key, &ops, res, epoch, verbose)
         })
         .await
     }
@@ -1485,13 +1541,16 @@ impl KsMcp {
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, move |store| {
+            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, verbose);
+            }
             // block ops against a stale base are SCORED per op (the gate's whole
             // point: unchanged targets still green, conflicts yellow/red) — a
             // stale base is not an error here; see propose_markdown for the
             // whole-doc path, where it is.
             let before = store.get_doc(doc_id).map(|d| d.current_epoch).unwrap_or(p.base_epoch);
             let res = store.propose(doc_id, p.base_epoch, principal, ops.clone());
-            finish(&dedupe, principal, key, &ops, res, before, verbose)
+            finish(store, &dedupe, principal, key, &ops, res, before, verbose)
         })
         .await
     }
@@ -1515,6 +1574,9 @@ impl KsMcp {
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, move |store| {
+            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, verbose);
+            }
             let tree = match store.read_doc(doc_id) {
                 Ok(t) => t,
                 Err(e) => return err(e.to_string()),
@@ -1559,7 +1621,7 @@ impl KsMcp {
                 return no_changes(tree.doc.current_epoch);
             }
             let res = store.propose(doc_id, p.base_epoch, principal, ops.clone());
-            finish(&dedupe, principal, key, &ops, res, tree.doc.current_epoch, verbose)
+            finish(store, &dedupe, principal, key, &ops, res, tree.doc.current_epoch, verbose)
         })
         .await
     }
@@ -2775,5 +2837,32 @@ mod tests {
         let (_, mine) = text_of(fresh().proposals_impl(hint(None, Some("/Users/me/portus"), None), p(json!({}))).await.unwrap());
         assert_eq!(mine["proposals"].as_array().unwrap().len(), 1, "the hint scopes proposals too");
         swap_auto_created_for_test(previous);
+    }
+
+    /// An MCP write retried after a restart (new store handle, empty memory
+    /// cache, same db) inside the window replays instead of applying twice.
+    #[tokio::test]
+    async fn mcp_propose_paths_replay_across_a_restart() {
+        let dir = std::env::temp_dir().join(format!("grimoire-mcp-idem-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("ks.db");
+        let (claude, doc) = {
+            let mut s = SqliteStore::open(&db).unwrap();
+            let tom = s.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
+            let claude = s.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+            (claude, import_markdown(&mut s, "d", None, tom, "first\n").unwrap().0)
+        };
+        let boot = || KsMcp::new(Arc::new(Mutex::new(SqliteStore::open(&db).unwrap())), claude, new_dedupe(), new_name_cache(), test_hot("idem"));
+        let e0 = SqliteStore::open(&db).unwrap().get_doc(doc).unwrap().current_epoch;
+        let args = json!({"doc_id": doc.to_string(), "markdown": "once"});
+        let (is_err, a) = raw(boot().append_impl(NONE, p(args.clone())).await.unwrap());
+        assert!(!is_err, "{a}");
+        let (is_err, b) = raw(boot().append_impl(NONE, p(args)).await.unwrap());
+        assert!(!is_err, "{b}");
+        assert_eq!(a, b, "the replay is the original verdict");
+        let s = SqliteStore::open(&db).unwrap();
+        assert_eq!(s.get_doc(doc).unwrap().current_epoch, e0 + 1, "applied once");
+        assert_eq!(grimoire_store::export::export_doc(&s, doc).unwrap().matches("once").count(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

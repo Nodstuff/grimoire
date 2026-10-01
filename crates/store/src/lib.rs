@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod export;
 pub mod gate;
+pub mod idempotency;
 pub mod import;
 pub mod locate;
 pub mod mddiff;
