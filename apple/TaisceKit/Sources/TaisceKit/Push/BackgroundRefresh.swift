@@ -89,6 +89,8 @@ public func withTimeLimit<T: Sendable>(_ limit: Duration, _ operation: @escaping
 public enum BackgroundRefresh {
     /// iOS gives a content-available push about 30 s; leave room for the reconcile.
     public static let defaultLimit: Duration = .seconds(20)
+    /// The reconcile after it gets this long (the notification center can stall).
+    public static let reconcileLimit: Duration = .seconds(5)
 
     /// - Parameters:
     ///   - catchUp: one catch-up; answers whether anything changed
@@ -96,10 +98,11 @@ public enum BackgroundRefresh {
     public static func run(
         limit: Duration = defaultLimit,
         catchUp: @escaping @Sendable () async throws -> Bool,
-        reconcile: @Sendable () async -> Void
+        reconcileLimit: Duration = reconcileLimit,
+        reconcile: @escaping @Sendable () async -> Void
     ) async -> BackgroundRefreshResult {
         let outcome = await withTimeLimit(limit, catchUp)
-        await reconcile()
+        _ = await withTimeLimit(reconcileLimit, reconcile)
         switch outcome {
         case .finished(true): return .newData
         case .finished(false): return .noData

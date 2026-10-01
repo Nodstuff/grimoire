@@ -117,7 +117,7 @@ extension AppModel {
         // the foreground stream already has it, or the cache is past it
         let cursor = (try? await cache.lastSeq()) ?? 0
         if syncStatus == .live || (seq.map { $0 <= cursor } ?? false) {
-            await dueAlerts.reconcile()
+            _ = await withTimeLimit(BackgroundRefresh.reconcileLimit) { await dueAlerts.reconcile() }
             return .noData
         }
         return await BackgroundRefresh.run(

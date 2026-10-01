@@ -37,6 +37,8 @@ protocol DueAlertCenter: AnyObject {
 @MainActor @Observable
 final class NotificationCoordinator: DueAlertPermission {
     nonisolated static let category = "TODO_DUE"
+    /// One reconcile's budget against the notification center.
+    nonisolated static let applyLimit: Duration = .seconds(10)
 
     private(set) var status: DueAlertStatus = .notDetermined
 
@@ -151,7 +153,9 @@ final class NotificationCoordinator: DueAlertPermission {
         let previous = lastReconcile
         let run = Task { @MainActor in
             await previous?.value
-            await self.apply(inputs)
+            // bounded: a stalled notification center must not wedge every
+            // later reconcile behind it
+            _ = await withTimeLimit(Self.applyLimit) { @MainActor in await self.apply(inputs) }
         }
         lastReconcile = run
         await run.value

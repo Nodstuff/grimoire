@@ -43,6 +43,33 @@ import UIKit
         UserDefaults.standard.removeObject(forKey: AppModel.serverURLKey)
     }
 
+    /// Launch, stop and a server switch against unreachable servers, with
+    /// a notification center that never answers: each step returns in 2 s
+    /// (bounded here, so a regression fails by name instead of hanging).
+    @Test func lifecycleNeverWaitsOnTheNetworkOrTheNotificationCenter() async throws {
+        UserDefaults.standard.set("http://127.0.0.1:9", forKey: AppModel.serverURLKey)
+        defer { UserDefaults.standard.removeObject(forKey: AppModel.serverURLKey) }
+        let m = AppModel(dueAlerts: NotificationCoordinator(center: StalledAlertCenter()))
+        m.discover = { _ in nil }
+        let steps: [(String, @MainActor @Sendable () async -> Void)] = [
+            ("boot", { await m.boot() }),
+            ("stopSync", { await m.stopSync() }),
+            ("setServerURL(taisce.invalid)", { await m.setServerURL("taisce.invalid") }),
+            ("stopSync after switch", { await m.stopSync() }),
+            ("setServerURL(back)", { await m.setServerURL("http://127.0.0.1:9") }),
+            ("startSync", { await m.startSync() }),
+            ("stopSync at the end", { await m.stopSync() }),
+        ]
+        for (name, step) in steps {
+            let start = ContinuousClock.now
+            let r = await withTimeLimit(.seconds(3)) { await step() }
+            let took = ContinuousClock.now - start
+            if case .timedOut = r { Issue.record("\(name) hung (> 3 s)") }
+            #expect(took < .seconds(2), "\(name) took \(took)")
+        }
+        #expect(m.serverURL == "http://127.0.0.1:9")
+    }
+
     @Test func anUnreachableLocalDaemonShowsTheEmptyLibrary() async throws {
         // nothing listens on port 9: loopback is assumed LOCAL (no sign-in)
         let m = await model(server: "http://127.0.0.1:9")

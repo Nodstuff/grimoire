@@ -32,6 +32,20 @@ final class FakeDueAlertCenter: DueAlertCenter {
     }
 }
 
+/// A notification center whose XPC never answers (cancellable, and gives
+/// up after two minutes so nothing leaks past the run).
+@MainActor
+final class StalledAlertCenter: DueAlertCenter {
+    var onAction: (@MainActor (DueAlertAction, String, String) async -> Void)?
+    private func stall() async { try? await Task.sleep(for: .seconds(120)) }
+    func authorizationStatus() async -> DueAlertStatus { await stall(); return .allowed }
+    func requestAuthorization() async { await stall() }
+    func registerCategory() {}
+    func pending() async -> [PlannedAlert] { await stall(); return [] }
+    func add(_ alert: PlannedAlert) async throws { await stall() }
+    func removePending(_ identifiers: [String]) {}
+}
+
 @MainActor @Suite(.serialized, .timeLimit(.minutes(1))) struct DueAlertTests {
     let dublin = TimeZone(identifier: "Europe/Dublin")!
     let now = Date(timeIntervalSince1970: 1_790_000_000)  // 2026-09-21T14:13:20Z
