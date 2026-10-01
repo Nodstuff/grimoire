@@ -748,6 +748,9 @@ pub struct FindDocParams {
     pub parent_doc_id: Option<String>,
     /// Max matches (default 8).
     pub limit: Option<u32>,
+    /// Only docs in this workspace (name, case-insensitive, or id; "unsorted"
+    /// = no workspace). Omit to search everywhere.
+    pub workspace: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -855,6 +858,10 @@ pub struct CreateDocParams {
     /// exists under the parent. "reuse": return that doc instead (markdown
     /// ignored) — an atomic find-or-create.
     pub if_exists: Option<String>,
+    /// Workspace (name, case-insensitive, or id) to label a new ROOT doc
+    /// with. A doc with a parent always inherits the parent's workspace;
+    /// naming a different one there is an error.
+    pub workspace: Option<String>,
     #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
@@ -1109,9 +1116,23 @@ impl KsMcp {
             Err(m) => return err(m),
         };
         let limit = p.limit.unwrap_or(8).clamp(1, 50) as usize;
-        with_store(&self.store, move |store| match store.list_docs() {
-            Ok(docs) => ok_json(&crate::nav::find_docs(&docs, &p.query, parent, limit)),
-            Err(e) => err(e.to_string()),
+        with_store(&self.store, move |store| {
+            let ws = match crate::retrieval::workspace_arg(store, p.workspace.as_deref()) {
+                Ok(w) => w,
+                Err(m) => return err(m),
+            };
+            let docs = match store.list_docs() {
+                Ok(d) => d,
+                Err(e) => return err(e.to_string()),
+            };
+            let docs = match ws {
+                None => docs,
+                Some(w) => match store.workspace_doc_ids(w) {
+                    Ok(keep) => docs.into_iter().filter(|d| keep.contains(&d.id)).collect(),
+                    Err(e) => return err(e.to_string()),
+                },
+            };
+            ok_json(&crate::nav::find_docs(&docs, &p.query, parent, limit))
         })
         .await
     }
@@ -1126,9 +1147,22 @@ impl KsMcp {
         };
         let max_tokens = p.max_tokens.unwrap_or(1500).clamp(100, 20_000) as usize;
         let depth = p.depth.unwrap_or(2).clamp(1, 12) as usize;
-        with_store(&self.store, move |store| match crate::retrieval::orient(store, root, max_tokens, depth) {
-            Ok(text) => ok_text(text),
-            Err(m) => err(m),
+        with_store(&self.store, move |store| {
+            let ws = match crate::retrieval::workspace_arg(store, p.workspace.as_deref()) {
+                Ok(w) => w,
+                Err(m) => return err(m),
+            };
+            let named = ws.map(|w| {
+                let name = match w {
+                    grimoire_store::WorkspaceFilter::Unsorted => "Unsorted".to_string(),
+                    grimoire_store::WorkspaceFilter::Id(id) => store.get_workspace(id).map(|w| w.name).unwrap_or_default(),
+                };
+                (w, name)
+            });
+            match crate::retrieval::orient(store, root, named, max_tokens, depth) {
+                Ok(text) => ok_text(text),
+                Err(m) => err(m),
+            }
         })
         .await
     }
@@ -1279,13 +1313,18 @@ impl KsMcp {
         if kind != "blocks" && kind != "docs" {
             return err(format!("kind must be blocks|docs, got {kind}"));
         }
-        let opts = crate::retrieval::SearchOpts {
+        let mut opts = crate::retrieval::SearchOpts {
             scope,
+            workspace: None,
             exclude_answers: p.exclude_answers.unwrap_or(true),
             limit: p.limit.unwrap_or(10).clamp(1, 100) as usize,
         };
         let embedder = self.embedder.clone();
         with_store(&self.store, move |store| {
+            opts.workspace = match crate::retrieval::workspace_arg(store, p.workspace.as_deref()) {
+                Ok(w) => w,
+                Err(m) => return err(m),
+            };
             let emb = embedder.as_deref();
             let out = if kind == "docs" {
                 crate::retrieval::search_docs(store, emb, &p.query, opts).map(|h| json!(h))
@@ -1719,7 +1758,8 @@ impl KsMcp {
             Ok(id) => id,
             Err(m) => return err(m),
         };
-        let key = dedupe_key("create_doc", parent, &json!({"title": title, "markdown": p.markdown, "reuse": reuse}));
+        let ws_arg = p.workspace.as_deref().map(str::trim).filter(|w| !w.is_empty()).map(str::to_string);
+        let key = dedupe_key("create_doc", parent, &json!({"title": title, "markdown": p.markdown, "reuse": reuse, "workspace": ws_arg}));
         if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
             return replay(&prev, verbose);
         }
@@ -1727,6 +1767,27 @@ impl KsMcp {
         with_store(&self.store, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
                 return replay(&prev, verbose);
+            }
+            // a parent's workspace is inherited, never overridden here
+            let ws = match ws_arg.as_deref() {
+                None => None,
+                Some(w) => match store.find_workspace(w) {
+                    Ok(Some(found)) => Some(found),
+                    Ok(None) => return err(crate::retrieval::workspace_arg(store, Some(w)).err().unwrap_or_else(|| format!("workspace {w:?} not found"))),
+                    Err(e) => return err(e.to_string()),
+                },
+            };
+            if let (Some(w), Some(par)) = (&ws, parent) {
+                match store.doc_workspace(par) {
+                    Ok(inherited) if inherited == Some(w.id) => {}
+                    Ok(_) => {
+                        return err(format!(
+                            "the parent is not in workspace {:?}; a doc with a parent inherits its workspace (omit workspace, or pick a parent inside it)",
+                            w.name
+                        ));
+                    }
+                    Err(e) => return err(e.to_string()),
+                }
             }
             // one lock for the whole find-or-create: two sessions racing on
             // the same daily title cannot both create
@@ -1763,6 +1824,11 @@ impl KsMcp {
                 .unwrap_or_default();
             match store.create_doc_with_ops(&title, parent, principal, ops) {
                 Ok((d, _)) => {
+                    if let (Some(w), None) = (&ws, parent)
+                        && let Err(e) = store.set_doc_workspace(d.id, Some(w.id))
+                    {
+                        return err(format!("created doc {} but could not label it: {e}", d.id));
+                    }
                     let (text, full) = render(&d, false);
                     durable_put(store, &dedupe, principal, key, stored(&text, &full), DEDUPE_TTL);
                     if verbose { ok_json(&full) } else { ok_text(text) }
@@ -2356,6 +2422,57 @@ mod tests {
     }
 
     const NONE: RequestHint = RequestHint { header: None, query_as: None, cwd: None, pinned: None };
+
+    /// `workspace` on search / find_doc / orient / create_doc: subtree
+    /// semantics, case-insensitive names, "unsorted", inheritance on create.
+    #[tokio::test]
+    async fn workspace_params_filter_reads_and_label_creates() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let agent = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let work = store.create_workspace("Work", None, None, None).unwrap().id;
+        let home = store.create_workspace("Home", None, None, None).unwrap().id;
+        let (root, _) = import_markdown(&mut store, "Office", None, tom, "The needle alpha lives here.\n").unwrap();
+        import_markdown(&mut store, "Loose Notes", None, tom, "The needle beta lives here.\n").unwrap();
+        store.set_doc_workspace(root, Some(work)).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let mcp = KsMcp::new(store.clone(), agent, new_dedupe(), new_name_cache(), test_hot("ws"));
+
+        let titles = |v: &Value, key: &str| -> Vec<String> { v.as_array().unwrap().iter().map(|h| h[key].as_str().unwrap().to_string()).collect() };
+        let (_, all) = text_of(mcp.search(Parameters(p(json!({"query": "needle"})))).await.unwrap());
+        assert_eq!(all.as_array().unwrap().len(), 2, "everywhere by default");
+        let (_, w) = text_of(mcp.search(Parameters(p(json!({"query": "needle", "workspace": "WORK"})))).await.unwrap());
+        assert_eq!(titles(&w, "doc_title"), ["Office"]);
+        let (_, u) = text_of(mcp.search(Parameters(p(json!({"query": "needle", "workspace": "unsorted", "kind": "docs"})))).await.unwrap());
+        assert_eq!(titles(&u, "title"), ["Loose Notes"]);
+        let (is_err, msg) = text_of(mcp.search(Parameters(p(json!({"query": "needle", "workspace": "Gym"})))).await.unwrap());
+        assert!(is_err && msg.as_str().unwrap().contains("Work, Home"), "{msg}");
+
+        let (_, f) = text_of(mcp.find_doc(Parameters(p(json!({"query": "o", "workspace": work.to_string()})))).await.unwrap());
+        assert_eq!(titles(&f, "title"), ["Office"]);
+        let (_, f) = text_of(mcp.find_doc(Parameters(p(json!({"query": "office", "workspace": "home"})))).await.unwrap());
+        assert!(f.as_array().unwrap().is_empty());
+
+        let (_, map) = raw(mcp.orient(Parameters(p(json!({"workspace": "work"})))).await.unwrap());
+        assert!(map.starts_with("# Workspace Work — 1 docs"), "{map}");
+        assert!(map.contains("Office") && !map.contains("Loose Notes"), "{map}");
+
+        // a child inherits; a workspace labels a new root; a mismatch is refused
+        let (is_err, child) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "Child", "parent_doc_id": root.to_string(), "verbose": true}))).await.unwrap());
+        assert!(!is_err, "{child}");
+        let child_id: Uuid = child["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(store.lock().unwrap().doc_workspace(child_id).unwrap(), Some(work));
+        let (is_err, top) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "Garden", "workspace": "home", "verbose": true}))).await.unwrap());
+        assert!(!is_err, "{top}");
+        let top_id: Uuid = top["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(store.lock().unwrap().doc_label(top_id).unwrap(), Some(home));
+        let (is_err, msg) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "Shed", "parent_doc_id": root.to_string(), "workspace": "Home"}))).await.unwrap());
+        assert!(is_err && msg.as_str().unwrap().contains("inherits"), "{msg}");
+        let (is_err, _) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "Deep", "parent_doc_id": root.to_string(), "workspace": "work"}))).await.unwrap());
+        assert!(!is_err, "naming the parent's own workspace is fine");
+        let (is_err, msg) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "X", "workspace": "Gym"}))).await.unwrap());
+        assert!(is_err && msg.as_str().unwrap().contains("workspace"), "{msg}");
+    }
 
     /// The AX tools through the tool fns: compact hits, validated `kind`,
     /// a clear regex error, `related` naming the missing embedder and

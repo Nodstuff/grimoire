@@ -31,6 +31,7 @@ mod retrieval;
 mod store_ext;
 mod due;
 mod todo;
+mod workspaces;
 #[cfg(test)]
 mod retrieval_probe;
 
