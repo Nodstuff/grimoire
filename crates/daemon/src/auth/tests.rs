@@ -313,7 +313,7 @@ async fn dynamic_client_registration() {
         post_json(
             "/oauth/register",
             json!({"client_name": "Claude", "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
-                   "token_endpoint_auth_method": "client_secret_basic", "grant_types": ["authorization_code", "refresh_token"]}),
+                   "token_endpoint_auth_method": "none", "grant_types": ["authorization_code", "refresh_token"]}),
         ),
     )
     .await;
@@ -330,6 +330,18 @@ async fn dynamic_client_registration() {
     ] {
         let r = send(&h.app, post_json("/oauth/register", bad.clone())).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    // a confidential client is refused plainly, not silently downgraded
+    for m in ["client_secret_basic", "client_secret_post", "private_key_jwt"] {
+        let r = send(
+            &h.app,
+            post_json("/oauth/register", json!({"redirect_uris": [REDIRECT], "token_endpoint_auth_method": m})),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{m}");
+        let j = r.json();
+        assert_eq!(j["error"], "invalid_client_metadata");
+        assert!(j["error_description"].as_str().unwrap().contains(m), "{j}");
     }
 }
 
@@ -351,13 +363,18 @@ async fn passkey_code_flow_tokens_and_mcp_tools_list() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(send(&h.app, api).await.status, StatusCode::OK);
-    // rotation: new pair; the old refresh token is then a reuse → family revoked
+    // rotation: a new pair each time
     let r1 = h.refresh(&client, &refresh).await;
     assert_eq!(r1.status, StatusCode::OK, "{}", r1.body);
     let j = r1.json();
     let (access2, refresh2) = (j["access_token"].as_str().unwrap().to_string(), j["refresh_token"].as_str().unwrap().to_string());
     assert_ne!(refresh2, refresh);
     assert_eq!(mcp_tools(&h.app, &access2).await.status, StatusCode::OK);
+    // once the successor refresh token has itself been used, presenting the
+    // old one is theft, grace window or not
+    let r2 = h.refresh(&client, &refresh2).await;
+    assert_eq!(r2.status, StatusCode::OK);
+    let refresh2 = r2.json()["refresh_token"].as_str().unwrap().to_string();
     let reuse = h.refresh(&client, &refresh).await;
     assert_eq!(reuse.status, StatusCode::BAD_REQUEST);
     assert_eq!(reuse.json()["error"], "invalid_grant");
@@ -365,6 +382,25 @@ async fn passkey_code_flow_tokens_and_mcp_tools_list() {
     assert_eq!(h.refresh(&client, &refresh2).await.json()["error"], "invalid_grant");
     let r = send(&h.app, mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}), Some(&access2), None)).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+/// A client that lost the refresh response retries with the old token at
+/// once: it gets a working pair, the grant survives, the lost pair is dead.
+#[tokio::test]
+async fn immediate_refresh_retry_reissues() {
+    let mut h = harness();
+    let (client, _, refresh) = h.tokens().await;
+    let lost = h.refresh(&client, &refresh).await.json();
+    let retry = h.refresh(&client, &refresh).await;
+    assert_eq!(retry.status, StatusCode::OK, "{}", retry.body);
+    let j = retry.json();
+    let access = j["access_token"].as_str().unwrap();
+    assert_ne!(access, lost["access_token"].as_str().unwrap());
+    assert_eq!(mcp_tools(&h.app, access).await.status, StatusCode::OK);
+    let lost_access = lost["access_token"].as_str().unwrap();
+    assert_eq!(send(&h.app, mcp(json!({}), Some(lost_access), None)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(h.refresh(&client, lost["refresh_token"].as_str().unwrap()).await.json()["error"], "invalid_grant");
+    assert_eq!(h.refresh(&client, j["refresh_token"].as_str().unwrap()).await.status, StatusCode::OK);
 }
 
 #[tokio::test]

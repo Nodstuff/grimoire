@@ -202,8 +202,8 @@ pub async fn resolve_client(st: &AuthState, client_id: &str) -> Result<OAuthClie
     Ok(client)
 }
 
-/// RFC 7591 dynamic registration, public clients only: whatever auth method
-/// is asked for, the registered one is `none` (§3.2.1 lets the server say so).
+/// RFC 7591 dynamic registration, public clients only: a request for any
+/// token_endpoint_auth_method but `none` is refused (invalid_client_metadata).
 async fn register(State(st): State<AuthState>, req: Request) -> Response {
     let ip = super::client_ip(&st.cfg, req.headers(), req.extensions());
     if !st.limiter.allow(Class::Register, &ip) {
@@ -239,6 +239,17 @@ async fn register(State(st): State<AuthState>, req: Request) -> Response {
             _ => false,
         }
     };
+    match body.get("token_endpoint_auth_method") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(m)) if m == "none" => {}
+        Some(m) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client_metadata",
+                &format!("token_endpoint_auth_method {m} is not supported: this server registers public clients only (\"none\", with PKCE)"),
+            );
+        }
+    }
     if !subset("grant_types", &["authorization_code", "refresh_token"]) {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", "grant_types: authorization_code, refresh_token only");
     }
@@ -554,7 +565,12 @@ async fn refresh_grant(st: &AuthState, client_id: &str, refresh: &str, ip: &str)
             tracing::info!(target: AUDIT, event = "token.refresh", client = client_id, grant = %g.id, ip);
             token_response(&access, &next)
         }
-        Ok(RefreshOutcome::Rotated(g)) => {
+        Ok(RefreshOutcome::Reissued(g)) if g.client_id == client_id => {
+            // a retry inside the grace window: the lost successor is replaced
+            tracing::info!(target: AUDIT, event = "token.reissue", client = client_id, grant = %g.id, ip);
+            token_response(&access, &next)
+        }
+        Ok(RefreshOutcome::Rotated(g) | RefreshOutcome::Reissued(g)) => {
             // another client holding this client's refresh token: stolen
             let gid = g.id.to_string();
             let _ = with_store(&st.store, move |s| s.oauth_revoke_grant(&gid, "refresh token presented by another client", now)).await;

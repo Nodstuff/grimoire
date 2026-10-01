@@ -80,11 +80,18 @@ pub enum CodeOutcome {
     Invalid,
 }
 
+/// Seconds after a rotation during which re-presenting the old refresh
+/// token re-issues (rather than revokes) — if its successor is still unused.
+pub const REFRESH_GRACE: i64 = 60;
+
 /// What presenting a refresh token did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshOutcome {
     /// Live and unused: it is now rotated out; issue its successor.
     Rotated(Grant),
+    /// A retry inside the grace window with the successor still unused:
+    /// the successor pair is replaced by the new one.
+    Reissued(Grant),
     /// Already rotated: the whole grant family is now revoked.
     Reused { grant_id: Uuid },
     /// Unknown, expired, or its grant is revoked.
@@ -417,7 +424,11 @@ impl SqliteStore {
     }
 
     /// Rotate a refresh token: on success the old one is spent and the new
-    /// pair is stored, atomically. Presenting a spent one revokes its grant.
+    /// pair is stored, atomically. Presenting a spent one revokes its grant —
+    /// except a retry within [`REFRESH_GRACE`] of the rotation whose
+    /// successor was never used (the client lost the response): the unused
+    /// successor pair is replaced by the new one (`Reissued`). Only hashes are
+    /// stored, so the lost pair cannot be handed back verbatim.
     pub fn oauth_rotate_refresh(
         &mut self,
         refresh_hash: &str,
@@ -430,19 +441,23 @@ impl SqliteStore {
         let tx = self.conn.transaction()?;
         let row = tx
             .query_row(
-                "SELECT grant_id, expires_at, used_at FROM oauth_refresh_tokens WHERE token_hash = ?1",
+                "SELECT grant_id, expires_at, used_at, next_refresh, next_access
+                 FROM oauth_refresh_tokens WHERE token_hash = ?1",
                 [refresh_hash],
-                |r| Ok((uuid_of(r.get(0)?)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?)),
+                |r| {
+                    Ok((
+                        uuid_of(r.get(0)?)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((grant_id, expires_at, used_at)) = row else {
+        let Some((grant_id, expires_at, used_at, next_refresh, next_access)) = row else {
             return Ok(RefreshOutcome::Invalid);
         };
-        if used_at.is_some() {
-            revoke_grant(&tx, grant_id, "refresh token reused", now)?;
-            tx.commit()?;
-            return Ok(RefreshOutcome::Reused { grant_id });
-        }
         let grant = tx
             .query_row(
                 &format!("SELECT {GRANT_COLS} FROM oauth_grants g WHERE g.id = ?1"),
@@ -453,12 +468,46 @@ impl SqliteStore {
         let Some(grant) = grant else {
             return Ok(RefreshOutcome::Invalid);
         };
-        if expires_at <= now || grant.revoked_at.is_some() {
+        if grant.revoked_at.is_some() {
+            return Ok(RefreshOutcome::Invalid);
+        }
+        if let Some(used) = used_at {
+            // the successor is still unused (and unexpired) only if nobody
+            // has rotated it: that is a lost response, not a stolen token
+            let successor_unused = match &next_refresh {
+                Some(n) => tx
+                    .query_row(
+                        "SELECT 1 FROM oauth_refresh_tokens WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
+                        params![n, now],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some(),
+                None => false,
+            };
+            if now - used <= REFRESH_GRACE && successor_unused {
+                tx.execute("DELETE FROM oauth_refresh_tokens WHERE token_hash = ?1", [next_refresh.as_deref()])?;
+                tx.execute("DELETE FROM oauth_access_tokens WHERE token_hash = ?1", [next_access.as_deref()])?;
+                insert_tokens(&tx, grant_id, now, new_access_hash, access_expires, new_refresh_hash, refresh_expires)?;
+                // the window stays anchored at the first rotation
+                tx.execute(
+                    "UPDATE oauth_refresh_tokens SET next_refresh = ?2, next_access = ?3 WHERE token_hash = ?1",
+                    params![refresh_hash, new_refresh_hash, new_access_hash],
+                )?;
+                tx.commit()?;
+                return Ok(RefreshOutcome::Reissued(grant));
+            }
+            revoke_grant(&tx, grant_id, "refresh token reused", now)?;
+            tx.commit()?;
+            return Ok(RefreshOutcome::Reused { grant_id });
+        }
+        if expires_at <= now {
             return Ok(RefreshOutcome::Invalid);
         }
         let spent = tx.execute(
-            "UPDATE oauth_refresh_tokens SET used_at = ?2 WHERE token_hash = ?1 AND used_at IS NULL",
-            params![refresh_hash, now],
+            "UPDATE oauth_refresh_tokens SET used_at = ?2, next_refresh = ?3, next_access = ?4
+             WHERE token_hash = ?1 AND used_at IS NULL",
+            params![refresh_hash, now, new_refresh_hash, new_access_hash],
         )?;
         if spent != 1 {
             revoke_grant(&tx, grant_id, "refresh token reused", now)?;
@@ -702,15 +751,50 @@ mod tests {
             panic!()
         };
         assert_eq!(got.id, g.id);
-        // the rotated-out token again: the whole family dies, r2 included
+        // the successor is used, so r1 again is theft even inside the window
+        assert!(matches!(s.oauth_rotate_refresh("r2", 155, "a3", 255, "r3", 1000).unwrap(), RefreshOutcome::Rotated(_)));
         assert_eq!(
-            s.oauth_rotate_refresh("r1", 160, "a3", 260, "r3", 1000).unwrap(),
+            s.oauth_rotate_refresh("r1", 160, "a4", 260, "r4", 1000).unwrap(),
             RefreshOutcome::Reused { grant_id: g.id }
         );
-        assert!(s.oauth_access_grant("a2", 161).unwrap().is_none());
-        assert_eq!(s.oauth_rotate_refresh("r2", 170, "a4", 270, "r4", 1000).unwrap(), RefreshOutcome::Invalid);
+        assert!(s.oauth_access_grant("a3", 161).unwrap().is_none());
+        assert_eq!(s.oauth_rotate_refresh("r3", 170, "a5", 270, "r5", 1000).unwrap(), RefreshOutcome::Invalid);
         assert_eq!(s.oauth_grants(false).unwrap().len(), 0);
         assert_eq!(s.oauth_grants(true).unwrap()[0].revoke_why.as_deref(), Some("refresh token reused"));
+    }
+
+    #[test]
+    fn retry_inside_the_grace_window_reissues() {
+        let (mut s, u) = store_with_owner();
+        let g = grant(&u, 100);
+        s.oauth_issue_grant(None, &g, "a1", 2000, "r1", 9000).unwrap();
+        assert!(matches!(s.oauth_rotate_refresh("r1", 150, "a2", 2000, "r2", 9000).unwrap(), RefreshOutcome::Rotated(_)));
+        // the response was lost: r1 again within 60s, r2 never used
+        let RefreshOutcome::Reissued(got) = s.oauth_rotate_refresh("r1", 150 + REFRESH_GRACE, "a3", 2000, "r3", 9000).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(got.id, g.id);
+        // the lost pair is dead (not a reuse tripwire); the new one is live
+        assert!(s.oauth_access_grant("a2", 211).unwrap().is_none());
+        assert_eq!(s.oauth_rotate_refresh("r2", 211, "x", 2000, "y", 9000).unwrap(), RefreshOutcome::Invalid);
+        assert!(s.oauth_access_grant("a3", 211).unwrap().is_some());
+        assert_eq!(s.oauth_grants(false).unwrap().len(), 1, "grant survives");
+        assert!(matches!(s.oauth_rotate_refresh("r3", 212, "a4", 2000, "r4", 9000).unwrap(), RefreshOutcome::Rotated(_)));
+    }
+
+    #[test]
+    fn retry_after_the_grace_window_revokes() {
+        let (mut s, u) = store_with_owner();
+        let g = grant(&u, 100);
+        s.oauth_issue_grant(None, &g, "a1", 2000, "r1", 9000).unwrap();
+        assert!(matches!(s.oauth_rotate_refresh("r1", 150, "a2", 2000, "r2", 9000).unwrap(), RefreshOutcome::Rotated(_)));
+        assert_eq!(
+            s.oauth_rotate_refresh("r1", 150 + REFRESH_GRACE + 1, "a3", 2000, "r3", 9000).unwrap(),
+            RefreshOutcome::Reused { grant_id: g.id }
+        );
+        assert!(s.oauth_access_grant("a2", 212).unwrap().is_none());
+        assert_eq!(s.oauth_grants(false).unwrap().len(), 0);
     }
 
     #[test]

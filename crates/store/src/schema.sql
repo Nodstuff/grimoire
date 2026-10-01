@@ -548,8 +548,12 @@ CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
     grant_id   TEXT NOT NULL REFERENCES oauth_grants (id) ON DELETE CASCADE,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
-    -- set when rotated: presenting it again is reuse (revokes the grant)
-    used_at    INTEGER
+    -- set when rotated: presenting it again is reuse (revokes the grant),
+    -- unless within the grace window while its successor is still unused
+    used_at    INTEGER,
+    -- the pair this rotation issued (hashes), for that grace check
+    next_refresh TEXT,
+    next_access  TEXT
 );
 CREATE INDEX IF NOT EXISTS oauth_refresh_grant ON oauth_refresh_tokens (grant_id);
 
