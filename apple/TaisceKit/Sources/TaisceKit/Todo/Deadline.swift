@@ -162,7 +162,7 @@ public enum Deadline: Sendable, Hashable {
     }()
 
     /// `2026-10-03T14:00Z`
-    nonisolated(unsafe) static let storedFormatter: DateFormatter = {
+    static let storedFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = TimeZone(identifier: "UTC")

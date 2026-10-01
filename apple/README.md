@@ -3,9 +3,10 @@
 **Naming:** the product is now **Taisce** (Irish: treasure kept safe). On the
 Apple side that means the app target and display name `Taisce`, the bundle id
 `ie.null.taisce`, and the package `TaisceKit` (formerly GrimoireKit). Wiki links
-open in-app as `taisce://wiki/<title>`. Everything server-side keeps the name
-"grimoire" for now (the crate, `~/.grimoire`, API paths, the MCP server, and
-`X-Grimoire-*` headers); that rename is a separate cleanup later.
+open in-app as `taisce://wiki/<title>`. Server-side, the crate, `~/.grimoire`,
+API paths and the MCP server keep the name "grimoire" for now; the bootstrap
+header is `Taisce-Seq` (TaisceKit falls back to the old `X-Grimoire-Seq`).
+The app never sends `X-Grimoire-Principal`: in SERVER mode identity is the token.
 
 A native SwiftUI client for a Grimoire (Taisce) server: a view into its docs with an
 offline cache. No web views for UI. iPhone + iPad first; Mac via Mac Catalyst
@@ -24,7 +25,8 @@ apple/
       Cache/                   GRDB cache (docs, blocks + FTS5, todos, sync_state, outbox)
       Sync/                    SSEParser, changeStream, Backoff, SyncEngine (actor)
       Render/                  block markdown → RenderNode (swift-markdown), inline/wikilinks
-      Todo/                    offline parser for the To-do doc
+      Todo/                    Deadline (all-day | UTC instant), TodoClock, offline To-do parser
+      Library/                 doc tree for the sidebar, wikilink lookups
     Tests/TaisceKitTests/    Swift Testing + a URLProtocol mock server
   App/                         the iOS app (xcodegen)
     project.yml
@@ -54,7 +56,15 @@ killed on exit):
 ```sh
 # in the grimoire checkout: cargo build --release -p grimoire && cargo build --release -p grimoire --example softpasskey
 apple/scripts/integration.sh [path to the grimoire checkout]
+# binaries built elsewhere (e.g. another branch):
+GRIMOIRE_BIN=… SOFTPASSKEY_BIN=… apple/scripts/integration.sh
 ```
+
+The UI launch test (`TaisceUITests`) needs a LOCAL daemon serving a doc
+titled "Welcome" (`TEST_RUNNER_TAISCE_UI_URL`, default 127.0.0.1:7515); its
+screenshot is an xcresult attachment. Use your own simulator
+(`xcrun simctl create …`): another agent's test run on a shared one
+replaces the installed app.
 
 App-hosted tests (Keychain persistence, first-launch view models, failed
 sign-in) run on a simulator:
@@ -80,10 +90,12 @@ in-memory id), and the parser is pure and tested byte-by-byte.
 
 The client follows a global change cursor:
 
-- `GET /api/docs` sends `X-Grimoire-Seq: <head>`, read in the same transaction
+- `GET /api/docs` sends `Taisce-Seq: <head>`, read in the same transaction
   as the tree. `GET /api/changes?since=0&limit=0` returns just `{seq, changes: [], more: false}`.
 - `GET /api/changes?since=<seq>&limit=<n>` →
   `{"seq": Int, "changes": [{"seq", "doc_id", "kind": "doc"|"tree"|"deleted"|"restored", "epoch"?, "at", "doc"?}], "more": Bool}`.
+  `seq` is the journal HEAD, not the page's last row: page on from
+  `changes.last.seq` while `more`.
   `doc` = `{title, parent_id, sort_key, status, current_epoch, deleted}` as
   of serving time, not as of `seq`. It is absent only for a hard-deleted doc.
   Errors use real statuses (400/404/500) with a `{"error"}` body.
@@ -94,33 +106,58 @@ The client follows a global change cursor:
 `SyncEngine` (actor, foreground-only `start()` / `stop()`):
 
 1. Fresh cache (cursor 0): load the whole tree from `/api/docs` and start
-   the cursor at its `X-Grimoire-Seq`. Without the header (an older daemon),
+   the cursor at its `Taisce-Seq`. Without the header (an older daemon),
    start at 0.
 2. Catch up: page `/api/changes` from `last_seq` until `more` is false;
-   store the cursor after each page.
+   store the cursor (the page's last row) after each page. A head below the
+   cursor means the server's database was reset: re-bootstrap and mark
+   every cached body stale. Then fetch the To-do doc if stale.
 3. Follow the stream with `Last-Event-ID: <last_seq>`; a 60 s idle timeout
    (two missed heartbeats) counts as a drop.
 4. On drop: exponential backoff with jitter (1 s → 30 s cap, floored by the
    server's `retry:`), reset after any healthy connection; resume from
-   `last_seq`.
+   `last_seq`. An SSE event that doesn't decode leaves the cursor alone and
+   falls back to a catch-up. The cursor never moves backwards (except that
+   reset); `stop()` returns once the loop has unwound.
 
 Applying a batch: last change per doc wins; `deleted` drops the doc and its
 blocks; every row's `doc` state (title, parent, epoch) is applied in place, and `tree` / `restored` rows
 refetch `/api/docs` only if a row lacks it; `doc` refetches the body
 only for docs we hold (or the To-do doc, or `alwaysFetch`), otherwise just
 marks the cached row stale (`current_epoch > body_epoch`) so opening it
-fetches. UI listens via `updates()` (AsyncStream) and GRDB `ValueObservation`.
+fetches. A body fetch that fails doesn't stall the batch: a missing doc
+(404, or the older 200 `not found`) is dropped, any other error leaves it
+stale and is listed in `SyncEngine.failedDocs`. UI listens via `updates()`
+(AsyncStream) and GRDB `ValueObservation`.
 
-To-dos: deadlines are written `· due YYYY-MM-DD` or `· due YYYY-MM-DD HH:MM`.
-The offline parser reads both forms. API items send the day in `deadline`,
-plus `due_time` (`HH:MM`) and `alert_at` (local; 09:00 when there is no time).
-`TodoItem.due` combines `deadline` and `due_time`.
-The Today view reads due and overdue items from `GET /api/todo/due?until=`,
-which is read-only and computes overdue by time. Today's list comes from the
-cached To-do doc. The view never calls `GET /api/todo`, because a GET for
-today carries items forward on the server. `todoSetDeadline` sends the day as
-`deadline` and the time as `due_time` (also queueable via `Cache.enqueueDeadline`); a date-only deadline keeps the item's
-existing time.
+Outbox replay retries later on 5xx, 408, 429 and HTML (proxy) answers and
+fails an entry only on the server's own refusal (a 4xx or `{error}`);
+a live session's refusal waits too. A landed propose rebases the queued ones
+for that doc only when the epoch moved by exactly our write (+1).
+
+To-dos and time: the device owns local time; the server never reads a
+local clock. A deadline is either an all-day date (` · due 2026-10-03`,
+API `deadline`) or a UTC instant (` · due 2026-10-03T14:00Z`, API `due_at`);
+`Deadline` models both. The pre-UTC ` · due D HH:MM` is read as UTC
+(`legacy_time`), as the server reads it.
+
+- Writing: a time picked on the phone is that wall time in the device's
+  zone, converted to UTC (`Deadline.local`; in the October overlap the
+  first 01:30 wins, in the March gap the time moves forward). Writes send
+  `deadline` or `due_at` (plus the local day as `deadline`, which a pre-UTC
+  server files the item under and a UTC one ignores).
+- Reading: overdue, due-today and alerts are computed on the device, never
+  taken from the server: an instant by the instant; an all-day date
+  becomes overdue at local midnight after it and alerts at 09:00 local
+  (so it follows the phone across time zones).
+- Every to-do call sends `TodoClock` (`today`, `utc_offset`): SERVER mode
+  refuses calls without `today`, and `utc_offset` lets it read a typed
+  "due fri 3pm". Raw outbox writes go through `Cache.enqueueTodo` /
+  `enqueueDeadline`, which add it.
+- The Today view never calls `GET /api/todo` (a GET for today carries items
+  forward on the server); it reads `GET /api/todo/due` (`dueToday(now:)`
+  for the device's view) and the cached To-do doc, which sync fetches after
+  bootstrap (`Cache.observeTodos()` to reload on).
 
 ## Sign-in
 
@@ -135,7 +172,10 @@ the sign-in screen.
 Flow (`AuthSession`, driven by `AppModel`):
 
 1. Discovery: `/.well-known/oauth-protected-resource` → authorization
-   server metadata (RFC 9728 / 8414). No metadata = LOCAL mode, no auth.
+   server metadata (RFC 9728 / 8414). "No auth" is believed only from a JSON
+   404 or an HTML page from a loopback / plain-http host (a LOCAL daemon's
+   SPA); a 5xx or HTML over https (proxy error, captive portal) is an error,
+   never a silent downgrade.
 2. Client: dynamic registration (`token_endpoint_auth_method: none`,
    redirect `ie.null.taisce:/oauth/callback`, which the server allows by
    default). The client id is cached in the Keychain per server and probed
@@ -149,7 +189,10 @@ Flow (`AuthSession`, driven by `AppModel`):
    single-flight: the server rotates the refresh token on every use and
    revokes the grant if a spent one comes back (outside a 60 s grace), so
    concurrent 401s all join one refresh. A 401 renews once and retries (SSE
-   included); `invalid_grant` signs out and the app shows `SignInView`.
+   included); `invalid_grant` signs out and the app shows `SignInView`. The
+   rotated tokens are kept in memory before the Keychain write, and the app
+   wraps a refresh in `beginBackgroundTask` (`AuthSession.Shield`), so a
+   suspension mid-rotation doesn't cost the grant.
 5. Sign out (Settings): `POST /oauth/revoke` with the refresh token
    (revokes the grant server-side; best effort offline), then clear the
    Keychain tokens. The client id and the per-server cache stay.
@@ -191,11 +234,10 @@ later.
   (the editor overlays them, the doc view does not), and no conflict UI: a
   stale base (someone else wrote first) comes back scored or red from the
   gate and is only recorded on the outbox row.
-- Outbox idempotency: the server's `request_id` dedupe is in memory with a
-  120 s TTL, so a replay long after a lost response can apply twice.
-  Client-minted insert ids make a doubled insert fail instead of
-  duplicating; `replace` and `move` are idempotent; a doubled delete fails
-  harmlessly.
+- Outbox idempotency: main's daemon keeps `request_id` dedupe in memory for
+  120 s (server-identity makes it durable for 7 days). Client-minted insert
+  ids make a doubled insert fail instead of duplicating; `replace` and
+  `move` are idempotent; a doubled delete fails harmlessly.
 - `propose_markdown` queues are rebased like `propose`, but a stale base is
   an error there (whole-doc diff), so they are not chained.
 - Pins are local (UserDefaults, per server); pinned docs are always fetched by sync.
