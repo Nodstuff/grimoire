@@ -216,10 +216,7 @@ mod tests {
             changes: crate::changes::Feed::new(&store),
             store: store.clone(),
             human,
-            hot: crate::hot::HotState::new(dir.clone()),
-            runtime: crate::fed::Runtime::default(),
             db_path: dir.join("ks.db"),
-            node_id: None,
             embedder: None,
             dedupe: crate::mcp::new_dedupe(),
         };

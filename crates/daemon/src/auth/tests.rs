@@ -31,19 +31,15 @@ fn harness_with(cfg: AuthConfig) -> H {
     let owner = store.auth_ensure_owner(human, "tom", now()).unwrap().id;
     let store = Arc::new(Mutex::new(store));
     let dir = std::env::temp_dir().join(format!("grimoire-auth-test-{}", uuid::Uuid::now_v7()));
-    let hot = crate::hot::HotState::new(dir.clone());
     let dedupe = crate::mcp::new_dedupe();
     let st = AuthState::new(cfg, store.clone()).unwrap();
     let hosts = vec![st.cfg.authority(), st.cfg.rp_id.clone()];
-    let app = crate::mcp::router_with_hosts(store.clone(), agent, hot.clone(), dedupe.clone(), None, Some(hosts))
+    let app = crate::mcp::router_with_hosts(store.clone(), agent, dedupe.clone(), None, Some(hosts))
         .merge(crate::api::router(crate::api::ApiState {
             changes: crate::changes::Feed::new(&store),
             store: store.clone(),
             human,
-            hot,
-            runtime: crate::fed::Runtime::default(),
             db_path: dir.join("ks.db"),
-            node_id: None,
             embedder: None,
             dedupe,
         }))
@@ -317,7 +313,7 @@ async fn server_mode_rejects_unauthenticated_loopback() {
     assert_eq!(send(&h.app, req).await.status, StatusCode::UNAUTHORIZED);
     let req = HttpRequest::post("/api/propose").header("host", "localhost").body(Body::empty()).unwrap();
     assert_eq!(send(&h.app, req).await.status, StatusCode::UNAUTHORIZED);
-    let ws = HttpRequest::get("/ws/hot/x").header("host", "127.0.0.1").body(Body::empty()).unwrap();
+    let ws = HttpRequest::get("/ws/x").header("host", "127.0.0.1").body(Body::empty()).unwrap();
     assert_eq!(send(&h.app, ws).await.status, StatusCode::UNAUTHORIZED);
     // /admin through the proxy (forwarded headers) is refused outright
     let adm = HttpRequest::get("/admin/runs")
@@ -781,7 +777,7 @@ fn path_classes() {
     use axum::http::Method;
     assert!(is_public("/.well-known/oauth-authorization-server") && is_public("/oauth/token") && is_public("/healthz"));
     assert!(!is_public("/api/docs") && !is_public("/oauthx"));
-    assert!(needs_token(&Method::GET, "/mcp") && needs_token(&Method::GET, "/api") && needs_token(&Method::GET, "/ws/hot/1"));
+    assert!(needs_token(&Method::GET, "/mcp") && needs_token(&Method::GET, "/api") && needs_token(&Method::GET, "/ws/1"));
     assert!(!needs_token(&Method::GET, "/assets/x.js") && !needs_token(&Method::GET, "/apiary"));
     assert!(needs_token(&Method::POST, "/anything"));
 }

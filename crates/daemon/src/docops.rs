@@ -2,19 +2,11 @@
 //! delete / merge as an AGENT. Every call lands one ledger op with a fixed
 //! verdict — yellow (applied + flagged, revertible by decline) or, for
 //! anything that trashes a doc, red (parked until a human accepts in the
-//! queue). The refusal rules are the human API's own (`refuse_if_mirror`,
-//! `refuse_move`, the live-session freeze), so an agent can never do what
-//! the app would refuse the user.
-//!
-//! `is_hot` is passed as a closure so this module is testable without a
-//! `HotState`; `mcp.rs` wires `HotState::is_hot`.
+//! queue).
 
-use crate::api::{refuse_if_mirror, refuse_move};
 use grimoire_store::{BlockStore, DocStatus, OpKind, ProposeOutcome, SqliteStore, order_key};
 use serde_json::{Value, json};
 use uuid::Uuid;
-
-pub type IsHot<'a> = &'a dyn Fn(Uuid) -> bool;
 
 fn src(tool: &str) -> Vec<String> {
     vec![format!("mcp:{tool}")]
@@ -38,9 +30,6 @@ pub fn rename_with_refs(
     principal: Uuid,
     source_refs: Vec<String>,
 ) -> Result<ProposeOutcome, String> {
-    if let Some(e) = refuse_if_mirror(store, doc_id, "renaming") {
-        return Err(e);
-    }
     store
         .propose_doc_op(
             doc_id,
@@ -75,9 +64,6 @@ pub fn move_doc_with_refs(
     principal: Uuid,
     source_refs: Vec<String>,
 ) -> Result<ProposeOutcome, String> {
-    if let Some(e) = refuse_move(store, doc_id, new_parent) {
-        return Err(e);
-    }
     let sort_key = match after {
         None => None,
         Some(a) => {
@@ -138,9 +124,6 @@ pub fn set_status(
     status: Option<DocStatus>,
     principal: Uuid,
 ) -> Result<ProposeOutcome, String> {
-    if let Some(e) = refuse_if_mirror(store, doc_id, "status") {
-        return Err(e);
-    }
     store
         .propose_doc_op(
             doc_id,
@@ -155,14 +138,11 @@ pub fn set_status(
 }
 
 /// Red, always: parked until a human accepts, then the subtree goes to the
-/// Trash. Refused when any doc of the subtree is a mirror or in a live session.
-pub fn delete(
-    store: &mut SqliteStore,
-    is_hot: IsHot,
-    doc_id: Uuid,
-    principal: Uuid,
-) -> Result<ProposeOutcome, String> {
-    refuse_subtree_locked(store, is_hot, doc_id, "deleting")?;
+/// Trash.
+pub fn delete(store: &mut SqliteStore, doc_id: Uuid, principal: Uuid) -> Result<ProposeOutcome, String> {
+    if store.doc_subtree_ids(doc_id).map_err(|e| e.to_string())?.is_empty() {
+        return Err(format!("not found: doc {doc_id}"));
+    }
     store
         .propose_doc_op(
             doc_id,
@@ -176,36 +156,11 @@ pub fn delete(
         .map_err(|e| e.to_string())
 }
 
-/// The delete/merge universe check: no mirror and no live session anywhere
-/// in the subtree (the app's own rule, `api::delete_doc`).
-fn refuse_subtree_locked(
-    store: &SqliteStore,
-    is_hot: IsHot,
-    doc_id: Uuid,
-    what: &str,
-) -> Result<(), String> {
-    let ids = store.doc_subtree_ids(doc_id).map_err(|e| e.to_string())?;
-    if ids.is_empty() {
-        return Err(format!("not found: doc {doc_id}"));
-    }
-    for d in &ids {
-        if let Some(e) = refuse_if_mirror(store, *d, what) {
-            return Err(e);
-        }
-        if is_hot(*d) {
-            let title = store.get_doc(*d).map(|d| d.title).unwrap_or_default();
-            return Err(format!("“{title}” is in a live session — end it before {what}"));
-        }
-    }
-    Ok(())
-}
-
 /// Append `from`'s content after `into`'s last block as reviewable yellows,
 /// then park a red delete of `from`. `from`'s frontmatter is not carried
 /// over (`into` keeps its own tags). Returns both outcomes.
 pub fn merge(
     store: &mut SqliteStore,
-    is_hot: IsHot,
     from: Uuid,
     into: Uuid,
     principal: Uuid,
@@ -213,18 +168,11 @@ pub fn merge(
     if from == into {
         return Err("from_doc_id and into_doc_id are the same doc".into());
     }
-    refuse_subtree_locked(store, is_hot, from, "merging")?;
-    if let Some(e) = refuse_if_mirror(store, into, "merging into") {
-        return Err(e);
+    let from_ids = store.doc_subtree_ids(from).map_err(|e| e.to_string())?;
+    if from_ids.is_empty() {
+        return Err(format!("not found: doc {from}"));
     }
-    if is_hot(into) {
-        return Err("the target doc is in a live session — retry after it ends".into());
-    }
-    if store
-        .doc_subtree_ids(from)
-        .map_err(|e| e.to_string())?
-        .contains(&into)
-    {
+    if from_ids.contains(&into) {
         return Err("into_doc_id is inside from_doc_id's subtree — trashing from would trash it too".into());
     }
     let from_tree = store.read_doc(from).map_err(|e| e.to_string())?;
@@ -256,7 +204,7 @@ pub fn merge(
             )
         }
     };
-    let delete_outcome = delete(store, is_hot, from, principal)?;
+    let delete_outcome = delete(store, from, principal)?;
     Ok(json!({
         "into": content_outcome,
         "delete": delete_outcome,
@@ -281,10 +229,6 @@ mod tests {
         let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
         let bot = s.create_principal(PrincipalKind::Agent, "claude:test", None).unwrap().id;
         (s, tom, bot)
-    }
-
-    fn cold(_: Uuid) -> bool {
-        false
     }
 
     #[test]
@@ -363,7 +307,7 @@ mod tests {
         let (mut s, tom, bot) = setup();
         let d = s.create_doc("Gone", None, tom).unwrap();
         let kid = s.create_doc("kid", Some(d.id), tom).unwrap();
-        let out = delete(&mut s, &cold, d.id, bot).unwrap();
+        let out = delete(&mut s, d.id, bot).unwrap();
         assert_eq!(out.verdicts[0].verdict, Verdict::Red);
         assert!(!out.verdicts[0].applied);
         assert!(out.verdicts[0].note.contains("2 docs"));
@@ -374,10 +318,6 @@ mod tests {
         assert!(matches!(&q[0].op.kind, OpKind::DeleteDoc { title, doc_count } if title == "Gone" && *doc_count == 2));
         // the agent cannot accept its own
         assert!(s.resolve(q[0].annotation.id, bot, ReviewDecision::Accept).is_err());
-        // a live session in the subtree blocks the accept
-        s.set_frozen_probe(Box::new(move |id| id == kid.id));
-        assert!(s.resolve(q[0].annotation.id, tom, ReviewDecision::Accept).is_err());
-        s.set_frozen_probe(Box::new(|_| false));
         s.resolve(q[0].annotation.id, tom, ReviewDecision::Accept).unwrap();
         assert!(s.doc_is_tombstoned(d.id).unwrap() && s.doc_is_tombstoned(kid.id).unwrap());
         let trash = s.list_trash().unwrap();
@@ -390,14 +330,11 @@ mod tests {
     }
 
     #[test]
-    fn delete_declined_is_never_applied_and_hot_docs_are_refused_up_front() {
+    fn delete_declined_is_never_applied() {
         let (mut s, tom, bot) = setup();
         let d = s.create_doc("Keep", None, tom).unwrap();
-        let kid = s.create_doc("kid", Some(d.id), tom).unwrap();
-        let hot = move |id: Uuid| id == kid.id;
-        let e = delete(&mut s, &hot, d.id, bot).unwrap_err();
-        assert!(e.contains("live session"), "{e}");
-        delete(&mut s, &cold, d.id, bot).unwrap();
+        s.create_doc("kid", Some(d.id), tom).unwrap();
+        delete(&mut s, d.id, bot).unwrap();
         let q = s.review_queue(None).unwrap();
         s.resolve(q[0].annotation.id, tom, ReviewDecision::Decline).unwrap();
         assert!(!s.doc_is_tombstoned(d.id).unwrap());
@@ -408,28 +345,12 @@ mod tests {
     }
 
     #[test]
-    fn mirrors_are_refused_everywhere() {
-        let (mut s, tom, bot) = setup();
-        let m = s.create_doc("Mirror", None, tom).unwrap();
-        let contact = s.pair_contact("ab".repeat(32).as_str(), "alice").unwrap();
-        s.upsert_mirror(m.id, contact.id, Uuid::now_v7(), 0, grimoire_store::SharePermission::View)
-            .unwrap();
-        let mine = s.create_doc("Mine", None, tom).unwrap();
-        assert!(rename(&mut s, m.id, "X", bot).is_err());
-        assert!(set_status(&mut s, m.id, Some(DocStatus::Draft), bot).is_err());
-        assert!(delete(&mut s, &cold, m.id, bot).is_err());
-        assert!(move_doc(&mut s, mine.id, Some(m.id), None, bot).is_err(), "nothing lands inside a mirror");
-        assert!(merge(&mut s, &cold, m.id, mine.id, bot).is_err());
-        assert!(merge(&mut s, &cold, mine.id, m.id, bot).is_err());
-    }
-
-    #[test]
     fn merge_appends_as_yellows_and_parks_the_delete() {
         let (mut s, tom, bot) = setup();
         let (into, _) = import_markdown(&mut s, "2026-09-08", None, tom, "---\ntags:\n  - daily\n---\n\n# A\n\none").unwrap();
         let (from, _) = import_markdown(&mut s, "2026-09-08", None, tom, "---\ntags:\n  - other\n---\n\n# B\n\ntwo").unwrap();
-        assert!(merge(&mut s, &cold, from, from, bot).is_err());
-        let out = merge(&mut s, &cold, from, into, bot).unwrap();
+        assert!(merge(&mut s, from, from, bot).is_err());
+        let out = merge(&mut s, from, into, bot).unwrap();
         assert_eq!(out["delete"]["verdicts"][0]["verdict"], "red");
         let verdicts = out["into"]["verdicts"].as_array().unwrap();
         assert_eq!(verdicts.len(), 2, "heading + paragraph, no frontmatter: {out}");
@@ -440,6 +361,6 @@ mod tests {
         assert_eq!(s.review_queue(None).unwrap().len(), 3);
         // a doc cannot be merged into its own descendant
         let child = s.create_doc("child", Some(from), tom).unwrap();
-        assert!(merge(&mut s, &cold, from, child.id, bot).is_err());
+        assert!(merge(&mut s, from, child.id, bot).is_err());
     }
 }

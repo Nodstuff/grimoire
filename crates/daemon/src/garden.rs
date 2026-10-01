@@ -560,27 +560,14 @@ JSON array of {{\"annotation_id\": \"<uuid from below>\", \"decision\": \"accept
 }
 
 /// Apply reviewer decisions with the tripwire. Pure enough to test directly.
-/// Apply a reviewer gardener's decisions. Decisions on docs that are hot are
-/// skipped (the freeze, P2.3): resolving applies/reverts content, which the
-/// live session owns. Pass `|_| false` for the un-gated behaviour.
 pub fn apply_review_decisions(
     store: &mut SqliteStore,
     reviewer_principal: Uuid,
     items: &[ReviewItem],
     decisions: Vec<(Uuid, ReviewDecision, String)>,
-    is_hot: impl Fn(Uuid) -> bool,
 ) -> (usize, usize, Vec<String>) {
     let presented: HashMap<Uuid, &ReviewItem> =
         items.iter().map(|i| (i.annotation.id, i)).collect();
-    let (decisions, deferred): (Vec<_>, Vec<_>) = decisions.into_iter().partition(|(ann, _, _)| {
-        presented
-            .get(ann)
-            .map(|i| !is_hot(i.annotation.doc_id))
-            .unwrap_or(true)
-    });
-    if !deferred.is_empty() {
-        tracing::info!(n = deferred.len(), "review decisions deferred: docs are hot (P2.3)");
-    }
     // tripwire: count requested red resolutions per doc first
     let mut red_per_doc: HashMap<Uuid, usize> = HashMap::new();
     for (ann, _, _) in &decisions {
@@ -632,7 +619,6 @@ pub fn apply_review_decisions(
 
 async fn run_reviewer(
     store: Arc<Mutex<SqliteStore>>,
-    hot: &crate::hot::HotState,
     g: &Gardener,
     run_id: Uuid,
 ) -> (String, String, Option<i64>) {
@@ -688,10 +674,8 @@ async fn run_reviewer(
         .collect();
     let presented = items.len();
     let (accepted, declined, lines) = {
-        let (hot, principal) = (hot.clone(), g.principal);
-        with_store(&store, move |s| {
-            apply_review_decisions(s, principal, &items, decisions, |d| hot.is_hot(d))
-        })
+        let principal = g.principal;
+        with_store(&store, move |s| apply_review_decisions(s, principal, &items, decisions))
         .await
     };
     (
@@ -865,7 +849,6 @@ fn apply_audit_findings(
     dirs: &[String],
     doc_ids: &[Uuid],
     findings: Vec<AuditFinding>,
-    is_hot: impl Fn(Uuid) -> bool,
 ) -> (Vec<String>, usize, usize) {
     let allowed: std::collections::HashSet<Uuid> = doc_ids.iter().copied().collect();
     let mut lines = Vec::new();
@@ -915,10 +898,6 @@ fn apply_audit_findings(
                 format!("audit:{}", f.comment.chars().take(200).collect::<String>()),
             ],
         };
-        if is_hot(f.doc_id) {
-            lines.push(format!("{}: deferred, doc is in a live session", f.block_id));
-            continue;
-        }
         if verified {
             let epoch = match s.get_doc(f.doc_id) {
                 Ok(d) => d.current_epoch,
@@ -969,7 +948,6 @@ fn apply_audit_findings(
 
 async fn run_auditor(
     store: Arc<Mutex<SqliteStore>>,
-    hot: &crate::hot::HotState,
     g: &Gardener,
     run_id: Uuid,
 ) -> (String, String, Option<i64>) {
@@ -1033,11 +1011,9 @@ async fn run_auditor(
         Ok(f) => f,
         Err(e) => return ("failed".into(), e, Some(tokens)),
     };
-    let (g, hot, dirs) = (g.clone(), hot.clone(), dirs.clone());
-    let (lines, flagged, corrected) = with_store(&store, move |s| {
-        apply_audit_findings(s, &g, &dirs, &doc_ids, findings, |d| hot.is_hot(d))
-    })
-    .await;
+    let (g, dirs) = (g.clone(), dirs.clone());
+    let (lines, flagged, corrected) =
+        with_store(&store, move |s| apply_audit_findings(s, &g, &dirs, &doc_ids, findings)).await;
     (
         "ok".into(),
         format!(
@@ -1437,11 +1413,7 @@ async fn finish_run(
 
 /// Run one gardener end to end. Never panics the daemon; all failure modes
 /// land in the run log (ticket 4.6: never a hang, never silent).
-pub async fn run_gardener(
-    store: Arc<Mutex<SqliteStore>>,
-    hot: crate::hot::HotState,
-    g: Gardener,
-) -> RunOutcome {
+pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOutcome {
     // one run per gardener: a run-now during the daily cut (or a double
     // click) must not spawn a second claude against the same scope
     let Some(_claim) = claim_run(g.id) else {
@@ -1469,7 +1441,7 @@ pub async fn run_gardener(
     };
 
     if g.kind == GardenerKind::Reviewer {
-        let (status, summary, tokens) = run_reviewer(store.clone(), &hot, &g, run_id).await;
+        let (status, summary, tokens) = run_reviewer(store.clone(), &g, run_id).await;
         return finish(&store, &status, &summary, tokens).await;
     }
     if g.kind == GardenerKind::Scribe {
@@ -1477,11 +1449,11 @@ pub async fn run_gardener(
         return finish(&store, &status, &summary, tokens).await;
     }
     if g.kind == GardenerKind::Auditor || g.kind == GardenerKind::Keeper {
-        let (status, summary, tokens) = run_auditor(store.clone(), &hot, &g, run_id).await;
+        let (status, summary, tokens) = run_auditor(store.clone(), &g, run_id).await;
         return finish(&store, &status, &summary, tokens).await;
     }
     if g.kind == GardenerKind::Filer {
-        let (status, summary, tokens) = crate::filer::run(store.clone(), &hot, &g, run_id).await;
+        let (status, summary, tokens) = crate::filer::run(store.clone(), &g, run_id).await;
         return finish(&store, &status, &summary, tokens).await;
     }
 
@@ -1521,9 +1493,9 @@ pub async fn run_gardener(
     };
 
     // submit through the gate as the gardener's principal
-    let (g2, hot2) = (g.clone(), hot.clone());
+    let g2 = g.clone();
     let (counts, lines) = with_store(&store, move |s| {
-        let (g, hot) = (g2, hot2);
+        let g = g2;
         let mut counts = (0usize, 0usize, 0usize); // green, yellow, red
         let mut lines = Vec::new();
         for p in proposals {
@@ -1547,12 +1519,6 @@ pub async fn run_gardener(
                     continue;
                 }
             };
-            // the freeze applies regardless of confidence policy (P2.3)
-            if hot.is_hot(doc.id) {
-                tracing::info!(doc = %doc.id, "gardener proposal deferred: doc is hot (P2.3)");
-                lines.push(format!("{}: deferred, doc is in a live session", doc.title));
-                continue;
-            }
             let outcome = match g.confidence_policy {
                 ConfidencePolicy::Review => {
                     s.propose_reviewed(doc.id, doc.current_epoch, g.principal, ops)
@@ -1676,7 +1642,7 @@ mod tests {
             .map(|i| (i.annotation.id, ReviewDecision::Accept, "looks fine".into()))
             .collect();
         let (accepted, declined, lines) =
-            apply_review_decisions(&mut s, reviewer, &items, decisions, |_| false);
+            apply_review_decisions(&mut s, reviewer, &items, decisions);
         assert_eq!((accepted, declined), (0, 0), "whole batch escalated");
         assert!(lines.iter().all(|l| l.contains("TRIPWIRE")));
         assert_eq!(
@@ -1693,7 +1659,7 @@ mod tests {
             .iter()
             .map(|i| (i.annotation.id, ReviewDecision::Accept, String::new()))
             .collect();
-        let (accepted, _, _) = apply_review_decisions(&mut s, reviewer, &items, decisions, |_| false);
+        let (accepted, _, _) = apply_review_decisions(&mut s, reviewer, &items, decisions);
         assert_eq!(accepted, TRIPWIRE_RED_LIMIT);
         assert!(s.review_queue(None).unwrap().is_empty());
     }
@@ -1703,7 +1669,7 @@ mod tests {
         let (mut s, reviewer, items) = seed_reds(1);
         let decisions = vec![(Uuid::now_v7(), ReviewDecision::Accept, "injected".into())];
         let (accepted, declined, lines) =
-            apply_review_decisions(&mut s, reviewer, &items, decisions, |_| false);
+            apply_review_decisions(&mut s, reviewer, &items, decisions);
         assert_eq!((accepted, declined), (0, 0));
         assert!(lines[0].contains("ignored invented"));
     }
@@ -1902,7 +1868,7 @@ mod freshness_tests {
             AuditFinding { doc_id: homework, block_id: block_of(&s, homework), comment: "hmm".into(), corrected_content: None, verified: false },
         ];
         let doc_ids = vec![clean, flagged, homework];
-        let (lines, parked, corrected) = apply_audit_findings(&mut s, &g, &[], &doc_ids, findings, |_| false);
+        let (lines, parked, corrected) = apply_audit_findings(&mut s, &g, &[], &doc_ids, findings);
         assert_eq!((parked, corrected), (1, 0), "{lines:?}");
         assert!(s.doc_verified_at(clean).unwrap().is_some(), "no findings → verified");
         assert_eq!(s.doc_verified_at(flagged).unwrap(), None, "a parked fix is not a verification");

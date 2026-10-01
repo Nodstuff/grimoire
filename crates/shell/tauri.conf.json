@@ -13,13 +13,6 @@
     }
   },
   "plugins": {
-    "deep-link": {
-      "desktop": {
-        "schemes": [
-          "grimoire"
-        ]
-      }
-    },
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJDQ0M0MUNFODkxNjM2RTEKUldUaE5oYUp6a0hNTFA4V01MQlJXSWVwakV4Q0grQ3NKNGJnbFRibWtJNUFTK1g4c1drZ1UwQncK",
       "endpoints": [

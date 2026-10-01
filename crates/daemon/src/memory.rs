@@ -208,7 +208,7 @@ pub fn sync(store: &Arc<Mutex<SqliteStore>>, root: &Path, human: Uuid) -> grimoi
     let lock = || store.lock().unwrap_or_else(|p| p.into_inner());
     let (agent, root_doc) = {
         let mut s = lock();
-        let agent = crate::room::agent_principal(&mut s)?;
+        let agent = crate::store_ext::scribe_principal(&mut s)?;
         let root_doc = ensure_folder(&mut s, None, ROOT_TITLE, human)?;
         (agent, root_doc)
     };

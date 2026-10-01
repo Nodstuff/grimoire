@@ -9,7 +9,7 @@
 //! filer's own principal: `move_doc` and `rename_doc` as yellows via
 //! `docops`, tags via the tagging frontmatter path — so the result shows up
 //! in the queue as the usual doc-op cards, each carrying `filer: <reason>`.
-//! Destinations docops refuses (mirrors, hub-relayed trees) are logged, not
+//! Destinations outside the tree it was shown are logged, not
 //! fatal. No Inbox = nothing to do.
 
 use crate::store_ext::with_store;
@@ -71,8 +71,8 @@ pub fn inbox_children(store: &SqliteStore, inbox: Uuid, limit: usize) -> Vec<Doc
     kids
 }
 
-/// Every doc that can be a destination: not the Inbox subtree, not a mirror,
-/// not the Answers folder (answers are not a filing cabinet).
+/// Every doc that can be a destination: not the Inbox subtree, not the
+/// Answers folder (answers are not a filing cabinet).
 fn destination_docs(store: &SqliteStore, inbox: Uuid) -> Vec<Doc> {
     let excluded: HashSet<Uuid> = store
         .doc_subtree_ids(inbox)
@@ -80,19 +80,13 @@ fn destination_docs(store: &SqliteStore, inbox: Uuid) -> Vec<Doc> {
         .into_iter()
         .chain(crate::ask::answers_folder_id(store))
         .collect();
-    let mirrors: HashSet<Uuid> = store
-        .list_mirrors()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|m| m.doc_id)
-        .collect();
     let all = store.list_docs().unwrap_or_default();
-    // a doc under a mirror or under the Inbox is out too
+    // a doc under the Inbox is out too
     let by_id: std::collections::HashMap<Uuid, Option<Uuid>> = all.iter().map(|d| (d.id, d.parent_id)).collect();
     let under_excluded = |mut id: Uuid| {
         let mut seen = 0;
         loop {
-            if excluded.contains(&id) || mirrors.contains(&id) {
+            if excluded.contains(&id) {
                 return true;
             }
             match by_id.get(&id).copied().flatten() {
@@ -173,7 +167,6 @@ pub fn apply(
     inbox: Uuid,
     presented: &[Doc],
     proposals: Vec<FileProposal>,
-    is_hot: impl Fn(Uuid) -> bool,
 ) -> (Vec<String>, usize, usize, usize) {
     let allowed: HashSet<Uuid> = presented.iter().map(|d| d.id).collect();
     let valid_dest: HashSet<Uuid> = destination_docs(store, inbox).into_iter().map(|d| d.id).collect();
@@ -190,10 +183,6 @@ pub fn apply(
         };
         if doc.parent_id != Some(inbox) {
             lines.push(format!("{}: no longer in the Inbox, skipped", doc.title));
-            continue;
-        }
-        if is_hot(doc.id) {
-            lines.push(format!("{}: deferred, doc is in a live session", doc.title));
             continue;
         }
         let why = reason(&p);
@@ -256,7 +245,6 @@ pub fn apply(
 /// One filer run. Same return shape as the other kinds' runners.
 pub async fn run(
     store: Arc<Mutex<SqliteStore>>,
-    hot: &crate::hot::HotState,
     g: &Gardener,
     _run_id: Uuid,
 ) -> (String, String, Option<i64>) {
@@ -286,10 +274,10 @@ pub async fn run(
         Ok(p) => p,
         Err(e) => return ("failed".into(), e, Some(tokens)),
     };
-    let (g, hot) = (g.clone(), hot.clone());
+    let g = g.clone();
     let n = notes.len();
     let (lines, moved, renamed, tagged) =
-        with_store(&store, move |s| apply(s, &g, inbox, &notes, proposals, |d| hot.is_hot(d))).await;
+        with_store(&store, move |s| apply(s, &g, inbox, &notes, proposals)).await;
     (
         "ok".into(),
         format!("notes considered: {n}; filed {moved}, renamed {renamed}, tagged {tagged}\n{}", lines.join("\n")),
@@ -364,7 +352,7 @@ mod tests {
         );
         let proposals = parse(&raw).unwrap();
         assert_eq!(proposals.len(), 3);
-        let (lines, moved, renamed, tagged) = apply(&mut s, &g, inbox.id, &notes, proposals, |_| false);
+        let (lines, moved, renamed, tagged) = apply(&mut s, &g, inbox.id, &notes, proposals);
         assert_eq!((moved, renamed, tagged), (2, 1, 1), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("ignored invented")));
         // applied now, flagged: parent + title changed, frontmatter added
@@ -392,40 +380,32 @@ mod tests {
         let (mut s, tom, g) = setup();
         let inbox = s.create_doc(INBOX_TITLE, None, tom).unwrap();
         let (note, _) = import_markdown(&mut s, "n", Some(inbox.id), tom, "x\n").unwrap();
-        let mirror = s.create_doc("Shared", None, tom).unwrap();
-        let contact = s.pair_contact(&"ab".repeat(32), "alice").unwrap();
-        s.upsert_mirror(mirror.id, contact.id, Uuid::now_v7(), 0, grimoire_store::SharePermission::View).unwrap();
+        let answers = s.create_doc(crate::ask::ANSWERS_FOLDER, None, tom).unwrap();
         let ok_folder = s.create_doc("Mine", None, tom).unwrap();
         let (_, notes) = compose(&s, &g, inbox.id);
-        // the mirror is not even offered as a destination
+        // the Answers folder is not even offered as a destination
         let dests = destination_docs(&s, inbox.id);
-        assert!(!dests.iter().any(|d| d.id == mirror.id));
+        assert!(!dests.iter().any(|d| d.id == answers.id));
         assert!(dests.iter().any(|d| d.id == ok_folder.id));
         let proposals = vec![
-            FileProposal { doc_id: note, destination_doc_id: Some(mirror.id), title: None, add_tags: vec![], rationale: "x".into() },
+            FileProposal { doc_id: note, destination_doc_id: Some(answers.id), title: None, add_tags: vec![], rationale: "x".into() },
             FileProposal { doc_id: note, destination_doc_id: Some(inbox.id), title: None, add_tags: vec![], rationale: "x".into() },
         ];
-        let (lines, moved, _, _) = apply(&mut s, &g, inbox.id, &notes, proposals, |_| false);
+        let (lines, moved, _, _) = apply(&mut s, &g, inbox.id, &notes, proposals);
         assert_eq!(moved, 0);
         assert!(lines.iter().all(|l| l.contains("not in the tree shown")), "{lines:?}");
         assert_eq!(s.get_doc(note).unwrap().parent_id, Some(inbox.id));
-        // a hot note is deferred
-        let proposals = vec![FileProposal { doc_id: note, destination_doc_id: Some(ok_folder.id), title: None, add_tags: vec![], rationale: String::new() }];
-        let (lines, moved, _, _) = apply(&mut s, &g, inbox.id, &notes, proposals, |d| d == note);
-        assert_eq!(moved, 0);
-        assert!(lines[0].contains("live session"));
     }
 
     #[tokio::test]
     async fn no_inbox_or_an_empty_inbox_is_a_no_op_run() {
         let (s, tom, g) = setup();
         let store = Arc::new(Mutex::new(s));
-        let hot = crate::hot::HotState::new(std::env::temp_dir().join(format!("grimoire-filer-{}", Uuid::now_v7())));
-        let (status, summary, tokens) = run(store.clone(), &hot, &g, Uuid::now_v7()).await;
+        let (status, summary, tokens) = run(store.clone(), &g, Uuid::now_v7()).await;
         assert_eq!((status.as_str(), tokens), ("ok", Some(0)));
         assert!(summary.contains("no Inbox"));
         store.lock().unwrap().create_doc(INBOX_TITLE, None, tom).unwrap();
-        let (status, summary, _) = run(store.clone(), &hot, &g, Uuid::now_v7()).await;
+        let (status, summary, _) = run(store.clone(), &g, Uuid::now_v7()).await;
         assert_eq!(status, "ok");
         assert!(summary.contains("Inbox is empty"), "{summary}");
     }

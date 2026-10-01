@@ -12,22 +12,17 @@ mod changes;
 mod children;
 mod docops;
 mod embed;
-mod fed;
 mod filer;
 mod freshness;
 mod garden;
 mod home;
-mod hot;
-mod identity;
 mod inbox;
 mod living;
 mod local_guard;
-mod yrender;
 mod mcp;
 mod memory;
 mod nav;
 mod push;
-mod room;
 mod retrieval;
 mod store_ext;
 mod due;
@@ -86,7 +81,7 @@ pub fn ui_build_stamp() -> u64 {
     static STAMP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *STAMP.get_or_init(|| match EmbeddedUi::get("index.html") {
         Some(f) => fnv1a(&f.data),
-        // no embedded UI (a cross-compiled hub build): the git sha still
+        // no embedded UI (a cross-compiled server build): the git sha still
         // distinguishes one binary from the next instead of a flat 0
         None => match GIT_SHA {
             Some(sha) if !sha.is_empty() => fnv1a(sha.as_bytes()),
@@ -110,7 +105,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Keep a long-lived background loop alive: log its exit or panic with its
 /// name and start it again after a backoff (5s doubling to 5 min). Without
-/// this a panic in, say, the pull loop silently ends federation until the
+/// this a panic in, say, the embed loop silently ends indexing until the
 /// next restart.
 fn supervise<F, Fut>(name: &'static str, mk: F)
 where
@@ -223,13 +218,6 @@ enum Cmd {
     Policy { doc_id: String, policy: String },
     /// Serve MCP over streamable HTTP (on --port, default 7425).
     Serve {
-        /// Run as a hub: a team Grimoire members join, publish to, and read
-        /// from. Persisted — later plain `serve` runs stay a hub.
-        #[arg(long)]
-        hub: bool,
-        /// The hub's name (its root folder and the name members see).
-        #[arg(long, requires = "hub")]
-        name: Option<String>,
         /// SERVER mode: rate-limit by the reverse proxy's X-Forwarded-For
         /// (its last hop) instead of the socket peer.
         #[arg(long, env = "GRIMOIRE_TRUSTED_PROXY")]
@@ -248,28 +236,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AuthCmd,
     },
-    /// Hub administration on the hub box (talks to the running daemon).
-    Hub {
-        #[command(subcommand)]
-        cmd: HubCmd,
-    },
-    /// Show the instance's federation identity (ADR 0002); export/import
-    /// move it between machines.
-    Identity {
-        #[command(subcommand)]
-        cmd: Option<IdentityCmd>,
-    },
-    /// Manage shares (talks to the running daemon).
-    Share {
-        #[command(subcommand)]
-        cmd: ShareCmd,
-    },
-    /// Join a share from a grimoire://join/… invite link.
-    Join { link: String },
-    /// Pull all shared mirrors from their owners now.
-    Pull,
-    /// List paired contacts.
-    Contacts,
 }
 
 #[derive(Subcommand)]
@@ -280,49 +246,6 @@ enum AuthCmd {
     List,
     /// Revoke an OAuth grant, or delete a passkey, by id (or unique prefix).
     Revoke { id: String },
-}
-
-#[derive(Subcommand)]
-enum ShareCmd {
-    /// Share a doc's subtree: mints a one-time invite link (7-day validity).
-    Invite {
-        doc_id: String,
-        /// view (default) or propose
-        #[arg(long, default_value = "view")]
-        permission: String,
-    },
-    List,
-    Revoke {
-        share_id: String,
-    },
-    /// Set a share's trust tier: review (park, default), yellow (trusted:
-    /// applies flagged) or green (maintainer: applies directly, you're notified).
-    Trust {
-        share_id: String,
-        trust: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum HubCmd {
-    /// List members and pending requests.
-    Members,
-    /// Approve a pending member (offers them the hub folder).
-    Approve { contact_id: String },
-    /// Remove a member: their publications and access go, and they are blocked.
-    Eject { contact_id: String },
-    /// Set a member's role: member | admin.
-    Role { contact_id: String, role: String },
-    /// Mint a one-time invite link to the hub (7-day validity).
-    Invite,
-}
-
-#[derive(Subcommand)]
-enum IdentityCmd {
-    /// Write the identity key to a file (0600) for machine migration.
-    Export { path: PathBuf },
-    /// Adopt an exported identity, replacing this machine's key.
-    Import { path: PathBuf },
 }
 
 fn default_db() -> PathBuf {
@@ -336,9 +259,7 @@ fn dirs_home() -> PathBuf {
 }
 
 /// The display name a fresh install starts with: the macOS account's full
-/// name, else the login name, else "me". It is the petname others see when
-/// this instance pairs with them, so it must never be a hardcoded placeholder
-/// — a network of instances all called "tom" is indistinguishable.
+/// name, else the login name, else "me" — never a hardcoded placeholder.
 fn default_human_name() -> String {
     if let Ok(out) = std::process::Command::new("id").arg("-F").output()
         && out.status.success()
@@ -542,8 +463,8 @@ async fn shutdown_signal() {
     }
 }
 
-/// rustls (reqwest's https, for client metadata documents) needs one process
-/// crypto provider; ring, as iroh uses. Idempotent.
+/// rustls (reqwest's https, for client metadata documents and APNs) needs one
+/// process crypto provider: ring. Idempotent.
 pub fn install_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -709,151 +630,11 @@ async fn main() -> anyhow::Result<()> {
             let r = admin_client(&cli.db, None)?.get(format!("http://127.0.0.1:{}/admin/runs", cli.port)).send().await?;
             println!("{}", r.text().await?);
         }
-        Cmd::Share { cmd } => {
-            let client = admin_client(&cli.db, None)?;
-            let base = format!("http://127.0.0.1:{}", cli.port);
-            match cmd {
-                ShareCmd::Invite { doc_id, permission } => {
-                    let r = client
-                        .post(format!("{base}/admin/shares"))
-                        .json(&serde_json::json!({"root_doc": doc_id, "permission": permission}))
-                        .send()
-                        .await?;
-                    let v: serde_json::Value = r.json().await?;
-                    match v.get("link").and_then(|l| l.as_str()) {
-                        Some(link) => {
-                            println!("{link}");
-                            println!("(one-time, expires in 7 days — send it over a private channel)");
-                        }
-                        None => println!("{v}"),
-                    }
-                }
-                ShareCmd::List => {
-                    let r = client.get(format!("{base}/admin/shares")).send().await?;
-                    println!("{}", r.text().await?);
-                }
-                ShareCmd::Revoke { share_id } => {
-                    let r = client
-                        .post(format!("{base}/admin/shares/revoke"))
-                        .json(&serde_json::json!({"id": share_id}))
-                        .send()
-                        .await?;
-                    println!("{}", r.text().await?);
-                }
-                ShareCmd::Trust { share_id, trust } => {
-                    let r = client
-                        .post(format!("{base}/admin/shares/trust"))
-                        .json(&serde_json::json!({"id": share_id, "trust": trust}))
-                        .send()
-                        .await?;
-                    println!("{}", r.text().await?);
-                }
-            }
-        }
-        Cmd::Join { link } => {
-            let client = admin_client(&cli.db, Some(std::time::Duration::from_secs(30)))?;
-            let r = client
-                .post(format!("http://127.0.0.1:{}/admin/join", cli.port))
-                .json(&serde_json::json!({"link": link}))
-                .send()
-                .await?;
-            let v: serde_json::Value = r.json().await?;
-            if let Some(j) = v.get("joined") {
-                println!(
-                    "joined \"{}\" from {} ({})",
-                    j["root_title"].as_str().unwrap_or("?"),
-                    j["owner_name"].as_str().unwrap_or("?"),
-                    j["permission"].as_str().unwrap_or("?"),
-                );
-            } else if v.get("queued").is_some() {
-                println!("owner unreachable — join queued, will retry in the background");
-            } else {
-                println!("{v}");
-            }
-        }
-        Cmd::Contacts => {
-            let r = admin_client(&cli.db, None)?.get(format!("http://127.0.0.1:{}/admin/contacts", cli.port)).send().await?;
-            println!("{}", r.text().await?);
-        }
-        Cmd::Pull => {
-            let client = admin_client(&cli.db, Some(std::time::Duration::from_secs(120)))?;
-            let r = client
-                .post(format!("http://127.0.0.1:{}/admin/pull", cli.port))
-                .send()
-                .await?;
-            println!("{}", r.text().await?);
-        }
-        Cmd::Identity { cmd } => {
-            let db_dir = cli.db.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
-            match cmd {
-                None => {
-                    let id = identity::Identity::load_or_create(&db_dir)?;
-                    println!("node id:     {}", id.node_id());
-                    println!("fingerprint: {}", id.fingerprint());
-                }
-                Some(IdentityCmd::Export { path }) => {
-                    let id = identity::Identity::load_or_create(&db_dir)?;
-                    id.export(&path)?;
-                    println!("identity exported to {} (0600)", path.display());
-                }
-                Some(IdentityCmd::Import { path }) => {
-                    let id = identity::Identity::import(&path, &db_dir)?;
-                    println!("identity imported; node id: {}", id.node_id());
-                }
-            }
-        }
-        Cmd::Hub { cmd } => {
-            let client = admin_client(&cli.db, Some(std::time::Duration::from_secs(30)))?;
-            let base = format!("http://127.0.0.1:{}", cli.port);
-            let text = match cmd {
-                HubCmd::Members => client.get(format!("{base}/admin/hub/members")).send().await?.text().await?,
-                HubCmd::Approve { contact_id } => {
-                    client
-                        .post(format!("{base}/admin/hub/approve"))
-                        .json(&serde_json::json!({"contact_id": contact_id}))
-                        .send()
-                        .await?
-                        .text()
-                        .await?
-                }
-                HubCmd::Eject { contact_id } => {
-                    client
-                        .post(format!("{base}/admin/hub/eject"))
-                        .json(&serde_json::json!({"contact_id": contact_id}))
-                        .send()
-                        .await?
-                        .text()
-                        .await?
-                }
-                HubCmd::Role { contact_id, role } => {
-                    client
-                        .post(format!("{base}/admin/hub/role"))
-                        .json(&serde_json::json!({"contact_id": contact_id, "role": role}))
-                        .send()
-                        .await?
-                        .text()
-                        .await?
-                }
-                HubCmd::Invite => {
-                    let v: serde_json::Value = client
-                        .post(format!("{base}/admin/hub/invite"))
-                        .send()
-                        .await?
-                        .json()
-                        .await?;
-                    match v.get("link").and_then(|l| l.as_str()) {
-                        Some(link) => format!("{link}\n(one-time, expires in 7 days — the first person to join becomes admin)"),
-                        None => v.to_string(),
-                    }
-                }
-            };
-            println!("{text}");
-        }
         Cmd::Auth { cmd } => {
             let mut store = store;
             auth_cli(&mut store, cmd, cli.public_url.clone(), tom)?;
         }
-        Cmd::Serve { hub, name, trusted_proxy, allow_redirect, apns } => {
+        Cmd::Serve { trusted_proxy, allow_redirect, apns } => {
             let port = cli.port;
             let mut store = store;
             // SERVER mode: OAuth + passkeys replace loopback trust entirely
@@ -870,111 +651,14 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => None,
             };
-            // hub mode (slice 1): persisted; `--hub` turns it on (and renames)
-            if hub {
-                let cfg = fed::hub::enable(&mut store, name.as_deref(), tom).context("enabling hub mode")?;
-                tracing::info!(name = cfg.name, root = %cfg.root_doc, "hub mode enabled");
-            }
-            let hub_mode = fed::hub::config(&store);
-            if let Some(h) = &hub_mode {
-                tracing::info!(name = h.name, "serving as a hub: gardener schedule and memory sync are off");
-            }
-            // federation identity: minted silently on first serve, linked to
-            // the human principal so provenance and pubkey agree (#54)
-            let db_dir = cli.db.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
-            let fed_identity = match identity::Identity::load_or_create(&db_dir) {
-                Ok(id) => {
-                    store.set_principal_pubkey(tom, &id.node_id())?;
-                    tracing::info!("federation identity: {}", id.fingerprint());
-                    Some(id)
-                }
-                Err(e) => {
-                    tracing::warn!("no federation identity; federation disabled: {e:#}");
-                    None
-                }
-            };
             if let Ok(n) = store.mark_orphaned_runs()
                 && n > 0
             {
                 tracing::warn!("marked {n} orphaned gardener runs (daemon restarted mid-run)");
             }
             let store = Arc::new(Mutex::new(store));
-            // hot sessions (#65): journal-backed live co-editing state, created
-            // first because every write surface (fed, gardeners, api, mcp)
-            // consults it for the freeze. Journals live beside the db so
-            // multiple instances never share.
-            let hot = hot::HotState::new(
-                cli.db.parent().unwrap_or(std::path::Path::new(".")).join("hot"),
-            );
-            {
-                // store-internal writes that fan out to other docs (a gated
-                // rename's link rewrites, a parked delete's accept) skip live docs
-                let probe = hot.clone();
-                store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .set_frozen_probe(Box::new(move |doc| probe.is_hot(doc)));
-            }
-            {
-                let (hot, store) = (hot.clone(), store.clone());
-                store_ext::blocking(move || hot.recover(&store)).await;
-            }
-            {
-                let (hot, store) = (hot.clone(), store.clone());
-                supervise("hot.idle", move || hot::idle_loop(hot.clone(), store.clone()));
-            }
             #[cfg(unix)]
             tokio::spawn(watch_parent());
-            // federation listener: separate iroh surface, deny-by-default
-            // (ADR 0002 decision 7); the HTTP router below never sees it —
-            // the admin routes only get the endpoint handle for outbound
-            // joins and the node id for minting links
-            // federation runtime state: focus heartbeats + received nudges
-            let runtime = fed::Runtime::default();
-            let mut fed_ctx = admin::FedCtx {
-                node_id: None,
-                endpoint: None,
-            };
-            if let Some(id) = fed_identity {
-                match fed::bind(id.secret_bytes()).await {
-                    Ok((ep, mdns)) => {
-                        fed_ctx.node_id = Some(id.node_id());
-                        fed_ctx.endpoint = Some(ep.clone());
-                        // advertise our profile name on the LAN so neighbours
-                        // read "Tom's MacBook", not a key
-                        {
-                            let name = store_ext::with_store(&store, |s| {
-                                s.list_principals()
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .find(|p| p.kind == PrincipalKind::Human)
-                                    .map(|p| p.display_name)
-                                    .unwrap_or_default()
-                            })
-                            .await;
-                            if let Ok(ud) = name.parse::<iroh::address_lookup::UserData>() {
-                                ep.set_user_data_for_address_lookup(Some(ud));
-                            }
-                        }
-                        {
-                            let runtime = runtime.clone();
-                            supervise("fed.neighbours", move || fed::neighbour_loop(mdns.clone(), runtime.clone()));
-                        }
-                        {
-                            let (ep, store, hot, runtime) = (ep.clone(), store.clone(), hot.clone(), runtime.clone());
-                            supervise("fed.serve", move || {
-                                fed::serve(ep.clone(), store.clone(), hot.clone(), runtime.clone())
-                            });
-                        }
-                        // join retry, grantee-side adaptive pull and owner-side
-                        // change nudges each self-supervise via fed::loops::supervise
-                        tokio::spawn(fed::join_retry_loop(ep.clone(), store.clone()));
-                        tokio::spawn(fed::pull_loop(ep.clone(), store.clone(), runtime.clone()));
-                        tokio::spawn(fed::notify_loop(ep.clone(), store.clone(), hot.clone()));
-                    }
-                    Err(e) => tracing::warn!("federation endpoint failed to bind: {e:#}"),
-                }
-            }
             // the local trust boundary for /admin/*: a per-boot token beside the
             // db; the shell and CLI read it, any other local process is refused
             // Win the port BEFORE minting the admin token: a second daemon
@@ -990,18 +674,15 @@ async fn main() -> anyhow::Result<()> {
             };
             let admin_token = admin::AdminToken::mint(&db_dir)
                 .context("minting admin token")?;
-            // a hub has no gardeners to schedule and no Claude memory to mirror
-            if hub_mode.is_none() {
-                {
-                    let (store, hot) = (store.clone(), hot.clone());
-                    supervise("gardener.daily", move || admin::daily_loop(store.clone(), hot.clone()));
-                }
-                // Claude Code's per-project memory → `Claude Memory` docs, kept in
-                // sync through the gate (changed memories arrive as reviewable)
-                {
-                    let store = store.clone();
-                    supervise("memory.sync", move || memory::memory_loop(store.clone(), tom));
-                }
+            {
+                let store = store.clone();
+                supervise("gardener.daily", move || admin::daily_loop(store.clone()));
+            }
+            // Claude Code's per-project memory → `Claude Memory` docs, kept in
+            // sync through the gate (changed memories arrive as reviewable)
+            {
+                let store = store.clone();
+                supervise("memory.sync", move || memory::memory_loop(store.clone(), tom));
             }
             // daily self-contained db snapshot beside the db (backups/), keep 7
             {
@@ -1034,7 +715,6 @@ async fn main() -> anyhow::Result<()> {
             };
             // the living-answers refresher retrieves the way a fresh ask does
             living::set_embedder(embedder.clone());
-            let fed_ctx_node_id: Option<String>;
             // one idempotency cache for MCP and HTTP proposes (request_id)
             let dedupe = mcp::new_dedupe();
             {
@@ -1085,25 +765,14 @@ async fn main() -> anyhow::Result<()> {
                 (Some(_), false) => tracing::warn!("APNs configured but this is LOCAL mode: push needs --public-url"),
                 (None, _) => {}
             }
-            let app = mcp::router_with_hosts(store.clone(), claude, hot.clone(), dedupe.clone(), embedder.clone(), mcp_hosts)
-                .merge(hot::router(hot::HotCtx {
-                    hot: hot.clone(),
-                    store: store.clone(),
-                    endpoint: fed_ctx.endpoint.clone(),
-                }))
-                .merge({
-                    fed_ctx_node_id = fed_ctx.node_id.clone();
-                    admin::router(store.clone(), fed_ctx, hot.clone(), runtime.clone(), admin_token)
-                })
+            let app = mcp::router_with_hosts(store.clone(), claude, dedupe.clone(), embedder.clone(), mcp_hosts)
+                .merge(admin::router(store.clone(), admin_token))
                 .merge(push::router(push::DevicesState { store: store.clone(), default_env }))
                 .merge(api::router(api::ApiState {
                     changes: feed,
                     store,
                     human: tom,
-                    hot,
-                    runtime,
                     db_path: cli.db.clone(),
-                    node_id: fed_ctx_node_id,
                     embedder,
                     dedupe,
                 }));

@@ -181,7 +181,7 @@ fn spawn_sidecar() {
     }
     // Never stack sidecars: if the child we spawned is still alive but not yet
     // answering (first start after an update runs migrations; an unsigned
-    // build can sit in a Keychain prompt for the identity key), spawning
+    // build could sit in a Keychain prompt), spawning
     // another only produces a second blocked daemon — and a second prompt.
     // 2026-09-11: eleven daemons and ~20 Keychain dialogs from exactly this.
     if let Ok(mut guard) = SPAWNED.lock() {
@@ -261,7 +261,7 @@ fn admin_token() -> Option<String> {
 }
 
 /// The URL the window loads: the daemon UI, with the admin token and any
-/// extra query params (`join=`) attached.
+/// extra query params attached.
 fn ui_url(extra: &[(&str, &str)]) -> String {
     let mut params: Vec<String> = Vec::new();
     if let Some(tok) = admin_token() {
@@ -404,19 +404,6 @@ fn show_window_with(app: &AppHandle, extra: &[(&str, &str)]) {
     }
 }
 
-/// A clicked grimoire://join/… link lands here (#57): route it into the UI
-/// as a query param — App.tsx prefills the join box on the sharing screen.
-fn handle_deep_link(app: &AppHandle, urls: Vec<tauri::Url>) {
-    let Some(link) = urls.first() else { return };
-    let link = link.as_str();
-    // only the payload travels as the query value — base64url is query-safe
-    let Some(payload) = link.strip_prefix("grimoire://join/") else {
-        return;
-    };
-    show_window(app);
-    navigate(app, &ui_url(&[("join", payload)]));
-}
-
 /// One HTTP/1.1 POST to the daemon without pulling in an HTTP client: the
 /// tray's "Run gardeners now". Returns the status code.
 fn post_admin(path: &str) -> Result<u16, String> {
@@ -545,7 +532,6 @@ fn check_for_updates(app: AppHandle, interactive: bool) {
 
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
@@ -581,14 +567,6 @@ fn main() {
         )
         .setup(|app| {
             ensure_daemon();
-
-            {
-                use tauri_plugin_deep_link::DeepLinkExt;
-                let handle = app.handle().clone();
-                app.deep_link().on_open_url(move |event| {
-                    handle_deep_link(&handle, event.urls());
-                });
-            }
 
             // the hotkey is best-effort: another app may hold ⌥⌘G. The tray
             // item and ⌘⇧I in the page still work, so just say so in the log.

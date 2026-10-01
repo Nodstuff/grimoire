@@ -6,7 +6,7 @@
 //! Such a request always carries the attacker's hostname in `Host` (and, for
 //! cross-site fetches and websocket upgrades, in `Origin`). Refusing anything
 //! whose Host/Origin is not a loopback name closes the hole for every surface
-//! at once: /api, /admin, /mcp, /ws/hot and the embedded UI.
+//! at once: /api, /admin, /mcp and the embedded UI.
 //!
 //! Any loopback port is accepted, not just the bound one: the Vite dev proxy
 //! forwards `Host: localhost:5173` verbatim and a rebinding attacker can never
@@ -238,7 +238,7 @@ mod tests {
             // the same path with a writing method is still refused
             assert!(check_request(&Method::POST, p, &h).is_err(), "POST {p}");
         }
-        for p in ["/api/docs", "/api/stamp/x", "/mcp", "/admin/gardeners", "/ws/hot"] {
+        for p in ["/api/docs", "/api/stamp/x", "/mcp", "/admin/gardeners"] {
             assert!(check_request(&Method::GET, p, &h).is_err(), "{p}");
         }
         // the exemption is for `null` only, not for a foreign origin

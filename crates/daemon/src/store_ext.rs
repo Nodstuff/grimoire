@@ -7,8 +7,9 @@
 //! hands the result back; the Mutex type and the store signatures stay as
 //! they are.
 
-use grimoire_store::SqliteStore;
+use grimoire_store::{BlockStore, PrincipalKind, SqliteStore};
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 /// Lock the store inside `spawn_blocking`, run `f`, return its value.
 /// A poisoned lock is recovered (same as the inline `lock()` sites did); a
@@ -43,6 +44,20 @@ pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
     }
 }
 
+/// The agent principal ask-the-vault, living answers and memory sync write
+/// under ("scribe"), created on first use.
+pub fn scribe_principal(store: &mut SqliteStore) -> grimoire_store::Result<Uuid> {
+    const NAME: &str = "scribe";
+    if let Some(p) = store
+        .list_principals()?
+        .into_iter()
+        .find(|p| p.kind == PrincipalKind::Agent && p.display_name == NAME)
+    {
+        return Ok(p.id);
+    }
+    Ok(store.create_principal(PrincipalKind::Agent, NAME, None)?.id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,7 +65,7 @@ mod tests {
     #[tokio::test]
     async fn runs_closure_and_returns_value() {
         let store = Arc::new(Mutex::new(SqliteStore::open_in_memory().unwrap()));
-        let n = with_store(&store, |s| s.canvas_doc_ids().unwrap().len()).await;
+        let n = with_store(&store, |s| s.list_docs().unwrap().len()).await;
         assert_eq!(n, 0);
     }
 
@@ -64,7 +79,7 @@ mod tests {
         })
         .join();
         assert!(store.is_poisoned());
-        let n = with_store(&store, |s| s.canvas_doc_ids().unwrap().len()).await;
+        let n = with_store(&store, |s| s.list_docs().unwrap().len()).await;
         assert_eq!(n, 0);
     }
 

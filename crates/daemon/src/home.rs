@@ -164,10 +164,7 @@ pub(crate) mod testing {
             changes: crate::changes::Feed::new(&store),
             store,
             human,
-            hot: crate::hot::HotState::new(dir.clone()),
-            runtime: crate::fed::Runtime::default(),
             db_path: dir.join("ks.db"),
-            node_id: None,
             embedder: None,
             dedupe: crate::mcp::new_dedupe(),
         };

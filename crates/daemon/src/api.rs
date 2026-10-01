@@ -17,14 +17,8 @@ use uuid::Uuid;
 pub struct ApiState {
     pub store: Arc<Mutex<SqliteStore>>,
     pub human: Uuid,
-    /// The freeze: content writes against a live doc are refused (P2.3).
-    pub hot: crate::hot::HotState,
-    /// Federation runtime: focus heartbeats (adaptive pull) + owner nudges.
-    pub runtime: crate::fed::Runtime,
     /// The live database file — backups live beside it.
     pub db_path: std::path::PathBuf,
-    /// Federation identity (node id), None when federation is disabled.
-    pub node_id: Option<String>,
     /// Block embeddings for ask-the-vault; None if the model failed to load
     /// (retrieval falls back to keywords).
     pub embedder: Option<Arc<crate::embed::Embedder>>,
@@ -49,45 +43,6 @@ fn resolve_principal(st: &ApiState, headers: &HeaderMap, s: &mut SqliteStore) ->
                 .map_err(|_| format!("{PRINCIPAL_HEADER}: not valid UTF-8"))?;
             crate::mcp::agent_principal_by_name(s, name).map_err(|m| format!("{PRINCIPAL_HEADER}: {m}"))
         }
-    }
-}
-
-/// UI heartbeat: this doc is open. For a mirror, its share joins the fast
-/// (5s) pull tier for the focus window; owned docs are a harmless no-op.
-async fn focus_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let share = {
-        with_store(&st.store, move |s| {
-            s.get_mirror(id).ok().flatten().map(|m| m.share_id)
-        })
-        .await
-    };
-    if let Some(share) = share {
-        st.runtime.focus_share(share);
-    }
-    Json(json!({"ok": true, "focused_share": share}))
-}
-
-#[derive(Deserialize)]
-struct EventsQuery {
-    since: Option<u64>,
-}
-
-/// Nudges received from owners (live_started / doc_added / doc_changed),
-/// cursor-paginated: pass the previous `next`.
-async fn events(State(st): State<ApiState>, Query(q): Query<EventsQuery>) -> Json<Value> {
-    let (next, events) = st.runtime.events_since(q.since.unwrap_or(0));
-    Json(json!({"next": next, "events": events}))
-}
-
-/// Mirror docs are the owner's: no local rename/delete/status/policy — and
-/// no move except of the share root, which the grantee may file where they
-/// like. Returns the user-facing refusal.
-pub(crate) fn refuse_if_mirror(s: &SqliteStore, id: Uuid, what: &str) -> Option<String> {
-    match s.get_mirror(id) {
-        Ok(Some(_)) => Some(format!(
-            "this doc is shared with you by its owner — {what} is the owner's call"
-        )),
-        _ => None,
     }
 }
 
@@ -129,67 +84,8 @@ fn docs_json(s: &mut SqliteStore, filter: Option<grimoire_store::WorkspaceFilter
             .filter(|g| g.enabled)
             .filter_map(|g| g.scope_doc.map(|d| d.to_string()))
             .collect();
-        // federation decorations: mirror docs ("shared with me") and the roots
-        // of active shares ("you are sharing this")
-        let mirror_rows = s.list_mirrors().unwrap_or_default();
-        let mirrors: std::collections::HashMap<String, String> = mirror_rows
-            .iter()
-            .map(|m| (m.doc_id.to_string(), m.permission.as_str().to_string()))
-            .collect();
-        // hub (slice 1): mirrors that come from a hub, relayed docs' true owners,
-        // and my subtrees published to a hub (every doc under a published root)
-        let contacts = s.list_contacts().unwrap_or_default();
-        let hub_contacts: std::collections::HashMap<Uuid, String> = contacts
-            .iter()
-            .filter(|c| c.is_hub && !c.revoked)
-            .map(|c| (c.id, c.petname.clone()))
-            .collect();
-        let from_hub: std::collections::HashSet<String> = mirror_rows
-            .iter()
-            .filter(|m| hub_contacts.contains_key(&m.owner))
-            .map(|m| m.doc_id.to_string())
-            .collect();
-        let origin_names: std::collections::HashMap<String, String> = mirror_rows
-            .iter()
-            .filter_map(|m| m.origin_owner_name.clone().map(|n| (m.doc_id.to_string(), n)))
-            .collect();
-        let all_shares = s.list_shares().unwrap_or_default();
-        let published_roots: std::collections::HashMap<Uuid, String> = all_shares
-            .iter()
-            .filter(|sh| sh.state == grimoire_store::ShareState::Active)
-            .filter_map(|sh| sh.contact.and_then(|c| hub_contacts.get(&c)).map(|n| (sh.root_doc, n.clone())))
-            .collect();
-        // mirrors tended on the owner's side: shown as tended locally, and the
-        // tend panel refuses to configure them (avoids two-sided agent edits)
-        let owner_tended: std::collections::HashSet<String> = mirror_rows
-            .iter()
-            .filter(|m| m.owner_tended)
-            .map(|m| m.doc_id.to_string())
-            .collect();
-        let share_roots: std::collections::HashSet<String> = all_shares
-            .iter()
-            .filter(|sh| sh.state != grimoire_store::ShareState::Revoked)
-            .map(|sh| sh.root_doc.to_string())
-            .collect();
         match s.list_docs() {
             Ok(d) => {
-                let parent_of: std::collections::HashMap<Uuid, Option<Uuid>> =
-                    d.iter().map(|x| (x.id, x.parent_id)).collect();
-                // the hub a doc is published to: the nearest published ancestor (or itself)
-                let published_to = |mut cur: Uuid| -> Option<&String> {
-                    if published_roots.is_empty() {
-                        return None;
-                    }
-                    loop {
-                        if let Some(n) = published_roots.get(&cur) {
-                            return Some(n);
-                        }
-                        match parent_of.get(&cur).copied().flatten() {
-                            Some(p) => cur = p,
-                            None => return None,
-                        }
-                    }
-                };
                 let want = filter.map(|f| f.as_option());
                 Json(json!(
                     d.iter()
@@ -198,22 +94,7 @@ fn docs_json(s: &mut SqliteStore, filter: Option<grimoire_store::WorkspaceFilter
                             let id = doc.id.to_string();
                             let mut v = json!(doc);
                             v["is_canvas"] = json!(canvases.contains(&id));
-                            let owner_t = owner_tended.contains(&id);
-                            v["is_tended"] = json!(tended.contains(&id) || owner_t);
-                            v["owner_tended"] = json!(owner_t);
-                            if let Some(perm) = mirrors.get(&id) {
-                                v["mirror_permission"] = json!(perm);
-                            }
-                            v["is_shared"] = json!(share_roots.contains(&id));
-                            if from_hub.contains(&id) {
-                                v["from_hub"] = json!(true);
-                            }
-                            if let Some(n) = origin_names.get(&id) {
-                                v["origin_owner_name"] = json!(n);
-                            }
-                            if let Some(n) = published_to(doc.id) {
-                                v["published_to"] = json!(n);
-                            }
+                            v["is_tended"] = json!(tended.contains(&id));
                             v["workspace_id"] = json!(ws_map.get(&doc.id).copied().flatten());
                             v
                         })
@@ -223,109 +104,6 @@ fn docs_json(s: &mut SqliteStore, filter: Option<grimoire_store::WorkspaceFilter
             Err(e) => Json(json!({"error": e.to_string()})),
         }
     }
-}
-
-/// Hub mode (slice 1), for the hub's own UI and the CLI on the box: whether
-/// this Grimoire is a hub, its name and root, active members and pending
-/// requests. Read-only; approving lives under /admin/hub/*.
-async fn hub_info(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| {
-        let Some(hub) = crate::fed::hub::config(&s) else {
-            return Json(json!({"enabled": false}));
-        };
-        let members = crate::fed::hub::members(&s).unwrap_or_default();
-        let (active, pending): (Vec<_>, Vec<_>) = members
-            .into_iter()
-            .filter(|m| m.membership != "ejected")
-            .partition(|m| m.membership == "active");
-        Json(json!({
-            "enabled": true,
-            "name": hub.name,
-            "root_doc": hub.root_doc,
-            "members": active,
-            "pending": pending,
-        }))
-    })
-    .await
-}
-
-/// Everything the doc view needs to render federation state for one doc:
-/// its mirror origin (if it is shared WITH us), the shares exposing it (if
-/// we are sharing it), and our pending upstream proposals against it.
-async fn doc_federation(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    with_store(&st.store, move |s| {
-        let contacts = s.list_contacts().unwrap_or_default();
-        let petname_of = |cid: Uuid| {
-            contacts
-                .iter()
-                .find(|c| c.id == cid)
-                .map(|c| c.petname.clone())
-                .unwrap_or_else(|| "?".into())
-        };
-        let is_hub = |cid: Uuid| contacts.iter().any(|c| c.id == cid && c.is_hub);
-        // hub slice 2: this doc (or an ancestor) was handed to the mirror's owner by me
-        let transferred_roots: Vec<Uuid> = s
-            .list_doc_transfers()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|t| t.direction == grimoire_store::TransferDirection::Out && t.state == "done")
-            .map(|t| t.root_doc)
-            .collect();
-        let transferred_from_me = |mut cur: Uuid| -> bool {
-            if transferred_roots.is_empty() {
-                return false;
-            }
-            loop {
-                if transferred_roots.contains(&cur) {
-                    return true;
-                }
-                match s.get_doc(cur).ok().and_then(|d| d.parent_id) {
-                    Some(p) => cur = p,
-                    None => return false,
-                }
-            }
-        };
-        let mirror = s.get_mirror(id).ok().flatten().map(|m| {
-            json!({
-                "owner": m.owner,
-                "owner_petname": petname_of(m.owner),
-                "permission": m.permission,
-                "synced_epoch": m.synced_epoch,
-                "owner_tended": m.owner_tended,
-                // hub relay (slice 1): the share comes from a hub; a relayed doc
-                // names its true owner (slice 2: edits reach them through the hub)
-                "from_hub": is_hub(m.owner),
-                "origin_owner": m.origin_owner,
-                "origin_owner_name": m.origin_owner_name,
-                "transferred_from_me": transferred_from_me(id),
-            })
-        });
-        let shares: Vec<Value> = s
-            .shares_containing(id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|sh| {
-                json!({
-                    "id": sh.id,
-                    "root_doc": sh.root_doc,
-                    "permission": sh.permission,
-                    "state": sh.state,
-                    "petname": sh.contact.map(&petname_of),
-                    "trust": sh.trust,
-                    "to_hub": sh.contact.map(is_hub).unwrap_or(false),
-                })
-            })
-            .collect();
-        let outbound: Vec<Value> = s
-            .list_outbound_proposals(false)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|p| p.doc_id == id)
-            .map(|p| json!(p))
-            .collect();
-        Json(json!({"mirror": mirror, "shares": shares, "outbound": outbound}))
-    })
-    .await
 }
 
 /// A missing (or hard-deleted) doc is a real 404 with `{error}`.
@@ -392,23 +170,6 @@ async fn doc_review(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Va
     .await
 }
 
-#[derive(Deserialize)]
-struct ActivityQuery {
-    limit: Option<usize>,
-}
-
-/// The owner's notification feed: content edits applied directly by remote
-/// principals (maintainer-tier shares). Newest first.
-async fn activity(State(st): State<ApiState>, Query(q): Query<ActivityQuery>) -> Json<Value> {
-    with_store(&st.store, move |s| {
-        match s.recent_remote_ops(q.limit.unwrap_or(20).min(200)) {
-            Ok(items) => Json(json!(items)),
-            Err(e) => Json(json!({"error": e.to_string()})),
-        }
-    })
-    .await
-}
-
 async fn queue(State(st): State<ApiState>) -> Json<Value> {
     with_store(&st.store, move |s| {
         match s.review_queue(None) {
@@ -434,11 +195,6 @@ async fn resolve(State(st): State<ApiState>, Json(req): Json<ResolveReq>) -> Jso
     let store = st.store.clone();
     let st = st.clone();
     with_store(&store, move |s| {
-        if let Some(doc) = crate::hot::annotation_doc(&s, req.annotation_id)
-            && let Err(m) = st.hot.assert_cold(doc)
-        {
-            return Json(json!({"error": m}));
-        }
         match s.resolve(req.annotation_id, st.human, decision) {
             Ok(receipt) => Json(json!({"ok": true, "receipt": receipt})),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -466,12 +222,6 @@ async fn resolve_bulk(State(st): State<ApiState>, Json(req): Json<ResolveBulkReq
     with_store(&store, move |s| {
         let (mut done, mut failed) = (0usize, Vec::new());
         for id in req.annotation_ids {
-            if let Some(doc) = crate::hot::annotation_doc(&s, id)
-                && let Err(m) = st.hot.assert_cold(doc)
-            {
-                failed.push(json!({"id": id, "error": m}));
-                continue;
-            }
             match s.resolve(id, st.human, decision) {
                 Ok(_) => done += 1,
                 Err(e) => failed.push(json!({"id": id, "error": e.to_string()})),
@@ -551,9 +301,6 @@ struct ProposeReq {
 /// Writes: propose as the human (or the `X-Grimoire-Principal` agent) —
 /// current-epoch ops green and apply directly, stale ones are scored per op.
 async fn propose(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json<ProposeReq>) -> Json<Value> {
-    if let Err(m) = st.hot.assert_cold(req.doc_id) {
-        return Json(json!({"error": m}));
-    }
     let store = st.store.clone();
     let st = st.clone();
     let headers = headers.clone();
@@ -601,9 +348,6 @@ async fn propose_markdown(
     headers: HeaderMap,
     Json(req): Json<ProposeMarkdownReq>,
 ) -> Json<Value> {
-    if let Err(m) = st.hot.assert_cold(req.doc_id) {
-        return Json(json!({"error": m}));
-    }
     let store = st.store.clone();
     let st = st.clone();
     let headers = headers.clone();
@@ -898,9 +642,6 @@ async fn set_status(
         },
     };
     with_store(&st.store, move |s| {
-        if let Some(e) = refuse_if_mirror(&s, id, "status") {
-            return Json(json!({"error": e}));
-        }
         match s.set_doc_status(id, status) {
             Ok(()) => Json(json!({"ok": true})),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -1066,14 +807,12 @@ fn tail_lines(path: &std::path::Path, n: usize) -> String {
 }
 
 /// What to paste into a bug report: version, log location and the last 200
-/// log lines. The UI adds node id + fingerprint from /api/profile.
+/// log lines.
 async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
     let path = crate::log_path();
     let tail = path.as_deref().map(|p| tail_lines(p, 200)).unwrap_or_default();
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "node_id": st.node_id,
-        "fingerprint": st.node_id.as_deref().map(crate::identity::fingerprint_of),
         "embedded_blocks": st.embedder.as_ref().map(|e| e.indexed()),
         "log_path": path.map(|p| p.to_string_lossy().to_string()),
         "log_tail": tail,
@@ -1103,75 +842,12 @@ async fn move_doc(
     Json(req): Json<MoveDocReq>,
 ) -> Json<Value> {
     with_store(&st.store, move |s| {
-        if let Some(e) = refuse_move(&s, id, req.parent_id) {
-            return Json(json!({"error": e}));
-        }
         match s.move_doc(id, req.parent_id, req.sort_key.as_deref()) {
             Ok(()) => Json(json!({"ok": true})),
             Err(e) => Json(json!({"error": e.to_string()})),
         }
     })
     .await
-}
-
-/// Tree-move rules at the boundary between my docs and mirrors (ADR 0002):
-/// - a mirror may move only if it is a share ROOT (its parent is not part of
-///   the same share) — the grantee files it, the owner shapes the inside;
-/// - nothing lands INSIDE a mirror subtree (that tree is the owner's; a pull
-///   would strand or delete it);
-/// - no doc whose subtree contains a mirror moves INTO one of my shares —
-///   the re-share guard at create time would otherwise be bypassed and the
-///   pull would ship someone else's content onward.
-pub(crate) fn refuse_move(s: &SqliteStore, id: Uuid, new_parent: Option<Uuid>) -> Option<String> {
-    let mirrors: std::collections::HashMap<Uuid, grimoire_store::Mirror> = s
-        .list_mirrors()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|m| (m.doc_id, m))
-        .collect();
-    if mirrors.is_empty() {
-        return None;
-    }
-    if let Some(m) = mirrors.get(&id) {
-        let parent_in_same_share = s
-            .get_doc(id)
-            .ok()
-            .and_then(|d| d.parent_id)
-            .and_then(|p| mirrors.get(&p))
-            .is_some_and(|pm| pm.share_id == m.share_id);
-        if parent_in_same_share {
-            return Some("this doc sits inside a shared tree — only its owner can move it".into());
-        }
-    }
-    if let Some(p) = new_parent
-        && mirrors.contains_key(&p)
-    {
-        return Some("cannot file a doc inside a tree shared with you — that tree is the owner's".into());
-    }
-    // does the moved subtree contain a mirror, and is the destination inside one of my shares?
-    let subtree_has_mirror = {
-        let mut stack = vec![id];
-        let docs = s.list_docs().unwrap_or_default();
-        let mut found = false;
-        while let Some(d) = stack.pop() {
-            if mirrors.contains_key(&d) {
-                found = true;
-                break;
-            }
-            stack.extend(docs.iter().filter(|c| c.parent_id == Some(d)).map(|c| c.id));
-        }
-        found
-    };
-    if subtree_has_mirror
-        && let Some(p) = new_parent
-        && !s.shares_containing(p).unwrap_or_default().is_empty()
-    {
-        return Some(
-            "cannot move a doc shared TO you into a tree you share — only the owner can share it onward"
-                .into(),
-        );
-    }
-    None
 }
 
 #[derive(Deserialize)]
@@ -1197,9 +873,6 @@ async fn rename_doc(
             Ok(d) => d.title,
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
-        if let Some(e) = refuse_if_mirror(&s, id, "renaming") {
-            return Json(json!({"error": e}));
-        }
         if let Err(e) = s.rename_doc(id, &req.title) {
             return Json(json!({"error": e.to_string()}));
         }
@@ -1213,19 +886,8 @@ async fn rename_doc(
             for (block, doc, content) in linkers {
                 by_doc.entry(doc).or_default().push((block, content));
             }
-            let mut deferred = 0usize;
             for (doc, blocks) in by_doc {
                 let Ok(d) = s.get_doc(doc) else { continue };
-                // mirrors are the owner's (their pull will bring the new title);
-                // hot docs are the session's — their links get fixed on the next
-                // rename or by a gardener, never by writing under a live session
-                if s.get_mirror(doc).ok().flatten().is_some() {
-                    continue;
-                }
-                if st.hot.is_hot(doc) {
-                    deferred += blocks.len();
-                    continue;
-                }
                 let ops: Vec<OpInput> = blocks
                     .into_iter()
                     .filter_map(|(block, content)| {
@@ -1242,9 +904,6 @@ async fn rename_doc(
                 rewritten += ops.len();
                 let _ = s.propose(doc, d.current_epoch, st.human, ops);
             }
-            if deferred > 0 {
-                return Json(json!({"ok": true, "links_rewritten": rewritten, "links_deferred_hot": deferred}));
-            }
         }
         Json(json!({"ok": true, "links_rewritten": rewritten}))
     })
@@ -1256,30 +915,9 @@ fn ks_store_op_replace(target: Uuid, content: String) -> grimoire_store::OpKind 
 }
 
 async fn delete_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let store = st.store.clone();
-    let st = st.clone();
-    with_store(&store, move |s| {
-        if let Some(e) = refuse_if_mirror(&s, id, "deleting") {
-            return Json(json!({"error": e}));
-        }
-        // a live session anywhere in the subtree would flatten into a tombstone
-        // (and the session would outlive the doc): end it first
-        match s.doc_subtree_ids(id) {
-            Ok(ids) => {
-                if let Some(hot) = ids.iter().find(|d| st.hot.is_hot(**d)) {
-                    let title = s.get_doc(*hot).map(|d| d.title).unwrap_or_default();
-                    return Json(json!({
-                        "error": format!("“{title}” is in a live session — end it before deleting"),
-                        "code": "doc_hot",
-                    }));
-                }
-            }
-            Err(e) => return Json(json!({"error": e.to_string()})),
-        }
-        match s.delete_doc(id) {
-            Ok(n) => Json(json!({"ok": true, "deleted": n})),
-            Err(e) => Json(json!({"error": e.to_string()})),
-        }
+    with_store(&st.store, move |s| match s.delete_doc(id) {
+        Ok(n) => Json(json!({"ok": true, "deleted": n})),
+        Err(e) => Json(json!({"error": e.to_string()})),
     })
     .await
 }
@@ -1650,9 +1288,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/doc/{id}/backlinks", get(backlinks))
         .route("/api/queue", get(queue))
         .route("/api/doc/{id}/review", get(doc_review))
-        .route("/api/activity", get(activity))
-        .route("/api/doc/{id}/focus", post(focus_doc))
-        .route("/api/events", get(events))
         .route("/api/flags", get(flags))
         .route("/api/flags/dismiss", post(dismiss_flag))
         .route("/api/principals", get(principals))
@@ -1679,8 +1314,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/memory/sync", post(memory_sync))
         .route("/api/doc/{id}/rename", post(rename_doc))
         .route("/api/doc/{id}/tendings", get(tendings))
-        .route("/api/doc/{id}/federation", get(doc_federation))
-        .route("/api/hub", get(hub_info))
         .route("/api/comment", post(add_comment))
         .route("/api/resolve", post(resolve))
         .route("/api/resolve_bulk", post(resolve_bulk))
@@ -1719,10 +1352,7 @@ mod http_client_tests {
             changes: crate::changes::Feed::new(&store),
             store,
             human,
-            hot: crate::hot::HotState::new(dir.clone()),
-            runtime: crate::fed::Runtime::default(),
             db_path: dir.join("ks.db"),
-            node_id: None,
             embedder: None,
             dedupe: crate::mcp::new_dedupe(),
         };
@@ -1909,15 +1539,11 @@ mod http_client_tests {
 
     fn state_on(db: &std::path::Path, human: Uuid) -> ApiState {
         let store = Arc::new(Mutex::new(SqliteStore::open(db).unwrap()));
-        let dir = db.parent().unwrap().to_path_buf();
         ApiState {
             changes: crate::changes::Feed::new(&store),
             store,
             human,
-            hot: crate::hot::HotState::new(dir.clone()),
-            runtime: crate::fed::Runtime::default(),
             db_path: db.to_path_buf(),
-            node_id: None,
             embedder: None,
             dedupe: crate::mcp::new_dedupe(),
         }

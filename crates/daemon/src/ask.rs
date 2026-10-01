@@ -333,7 +333,7 @@ pub async fn ask(
         let title = title.clone();
         with_store(&store, move |s| -> Result<(Uuid, Uuid), String> {
             let folder = answers_folder(s, human).map_err(|e| e.to_string())?;
-            let agent = crate::room::agent_principal(s).map_err(|e| e.to_string())?;
+            let agent = crate::store_ext::scribe_principal(s).map_err(|e| e.to_string())?;
             // through the gate under the agent, never apply (ledgered verdicts)
             let (doc_id, _) = crate::garden::create_doc_through_gate(
                 s,

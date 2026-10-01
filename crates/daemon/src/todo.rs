@@ -37,7 +37,7 @@
 //! the touched day's section canonically — one blank-line-separated block per
 //! item), diffs it back into ops and proposes them at the current epoch AS THE
 //! HUMAN — the path DocEditor / `propose_markdown` take (greens, applied
-//! directly, one epoch bump). A doc in a live session is left alone.
+//! directly, one epoch bump).
 //!
 //! An agent's `append(todo, "- [ ] x due fri")` is read with the phrase
 //! resolved (deadline shown, text without it) but the line is left as typed
@@ -905,7 +905,7 @@ pub fn find_todo(s: &SqliteStore, scope: TodoScope) -> grimoire_store::Result<Op
 
 /// The scope's To-do doc, created (by the human) when absent: a
 /// workspace's goes under its first labelled root (shallowest, in sidebar
-/// order; mirrors skipped), else at the root, labelled.
+/// order), else at the root, labelled.
 pub fn find_or_create_todo_in(s: &mut SqliteStore, human: Uuid, scope: TodoScope) -> grimoire_store::Result<Doc> {
     if let Some(d) = find_todo(s, scope)? {
         return Ok(d);
@@ -918,7 +918,7 @@ pub fn find_or_create_todo_in(s: &mut SqliteStore, human: Uuid, scope: TodoScope
     let by_id: HashMap<Uuid, &Doc> = docs.iter().map(|d| (d.id, d)).collect();
     let parent = docs
         .iter()
-        .filter(|d| labelled.contains(&d.id) && !matches!(s.get_mirror(d.id), Ok(Some(_))))
+        .filter(|d| labelled.contains(&d.id))
         .min_by_key(|d| depth(&by_id, d.id))
         .map(|d| d.id);
     match parent {
@@ -989,7 +989,6 @@ async fn mutate(
         Err(m) => return Json(json!({"error": m})),
     };
     let human = st.human;
-    let hot = st.hot.clone();
     with_store(&st.store, move |s| {
         let scope = match scope_of(s, clock.workspace.as_deref()) {
             Ok(sc) => sc,
@@ -999,9 +998,6 @@ async fn mutate(
             Ok(d) => d,
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
-        if let Err(m) = hot.assert_cold(doc.id) {
-            return Json(json!({"error": m}));
-        }
         let md = match grimoire_store::export::export_doc(&*s, doc.id) {
             Ok(m) => m,
             Err(e) => return Json(json!({"error": e.to_string()})),
@@ -1038,7 +1034,6 @@ async fn get_day(State(st): State<ApiState>, server: Server, Query(q): Query<Day
         return Json(json!({"error": m}));
     }
     let human = st.human;
-    let hot = st.hot.clone();
     let ws = q.clock.workspace.clone();
     with_store(&st.store, move |s| {
         let scope = match scope_of(s, ws.as_deref()) {
@@ -1054,8 +1049,7 @@ async fn get_day(State(st): State<ApiState>, server: Server, Query(q): Query<Day
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
         let mut carried = 0;
-        // a hot doc freezes writes: read only, carry next time
-        if should_carry(&md, &date, &today) && hot.assert_cold(doc.id).is_ok() {
+        if should_carry(&md, &date, &today) {
             let (new_md, n) = carry_forward(&md, &date, &today);
             if n > 0 {
                 if let Err(e) = save(s, doc.id, human, &new_md) {

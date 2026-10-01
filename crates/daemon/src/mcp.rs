@@ -432,8 +432,6 @@ fn cached_principal(names: &NameCache, key: &str) -> Option<Uuid> {
 pub struct KsMcp {
     store: Arc<Mutex<SqliteStore>>,
     dedupe: DedupeCache,
-    /// The freeze: content writes against a live doc are refused (P2.3).
-    hot: crate::hot::HotState,
     /// The shared default principal (`claude`).
     agent: Uuid,
     /// Shared `as`-string → principal cache (see `NameCache`).
@@ -1148,12 +1146,10 @@ impl KsMcp {
         agent: Uuid,
         dedupe: DedupeCache,
         names: NameCache,
-        hot: crate::hot::HotState,
     ) -> Self {
         Self {
             store,
             dedupe,
-            hot,
             agent,
             names,
             embedder: None,
@@ -1483,7 +1479,7 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Tree ops through the gate: op 'rename' (title), 'move' (new_parent_id, after_doc_id), 'status' (status) land as flagged yellows a reviewer can decline; 'delete' is always red (parked until a human trashes it); 'merge' (into_doc_id) appends doc_id's content as yellows then parks a red delete; 'workspace' (workspace: name or id, null to unlabel; create_missing) files doc_id and its subtree directly. Refused on docs shared with you."
+        description = "Tree ops through the gate: op 'rename' (title), 'move' (new_parent_id, after_doc_id), 'status' (status) land as flagged yellows a reviewer can decline; 'delete' is always red (parked until a human trashes it); 'merge' (into_doc_id) appends doc_id's content as yellows then parks a red delete; 'workspace' (workspace: name or id, null to unlabel; create_missing) files doc_id and its subtree directly."
     )]
     async fn doc_op(
         &self,
@@ -1548,16 +1544,10 @@ impl KsMcp {
         if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
             return replay(&prev, verbose);
         }
-        if let Err(m) = self.hot.assert_cold(doc_id) {
-            return err(m);
-        }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
                 return replay(&prev, verbose);
-            }
-            if let Some(m) = crate::api::refuse_if_mirror(store, doc_id, "editing") {
-                return err(m);
             }
             let tree = match store.read_doc(doc_id) {
                 Ok(t) => t,
@@ -1640,16 +1630,10 @@ impl KsMcp {
         if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
             return replay(&prev, verbose);
         }
-        if let Err(m) = self.hot.assert_cold(doc_id) {
-            return err(m);
-        }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
                 return replay(&prev, verbose);
-            }
-            if let Some(m) = crate::api::refuse_if_mirror(store, doc_id, "editing") {
-                return err(m);
             }
             let tree = match store.read_doc(doc_id) {
                 Ok(t) => t,
@@ -1703,9 +1687,6 @@ impl KsMcp {
         if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
             return replay(&prev, verbose);
         }
-        if let Err(m) = self.hot.assert_cold(doc_id) {
-            return err(m);
-        }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
@@ -1735,9 +1716,6 @@ impl KsMcp {
         let key = dedupe_key("propose_markdown", Some(doc_id), &json!({"base_epoch": p.base_epoch, "markdown": p.markdown}));
         if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
             return replay(&prev, verbose);
-        }
-        if let Err(m) = self.hot.assert_cold(doc_id) {
-            return err(m);
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, move |store| {
@@ -1916,13 +1894,11 @@ impl KsMcp {
         if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
             return replay(&prev, verbose);
         }
-        let hot = self.hot.clone();
         let dedupe = self.dedupe.clone();
         with_store(&self.store, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
                 return replay(&prev, verbose);
             }
-            let is_hot = |d: Uuid| hot.is_hot(d);
             let before = store.get_doc(doc_id).map(|d| d.current_epoch).unwrap_or(0);
             let single = |store: &mut SqliteStore, ops_kind: &str, res: Result<ProposeOutcome, String>| match res {
                 Ok(out) => {
@@ -1986,7 +1962,7 @@ impl KsMcp {
                     single(store, "status", res)
                 }
                 "delete" => {
-                    let res = crate::docops::delete(store, &is_hot, doc_id, principal);
+                    let res = crate::docops::delete(store, doc_id, principal);
                     single(store, "delete", res)
                 }
                 _ => {
@@ -1995,7 +1971,7 @@ impl KsMcp {
                         Some(Err(m)) => return err(m),
                         None => return err("merge needs into_doc_id".into()),
                     };
-                    match crate::docops::merge(store, &is_hot, doc_id, into, principal) {
+                    match crate::docops::merge(store, doc_id, into, principal) {
                         Ok(out) => {
                             let appended = out["into"]["verdicts"].as_array().map(Vec::len).unwrap_or(0);
                             let text = format!(
@@ -2064,13 +2040,7 @@ impl KsMcp {
             Ok(id) => id,
             Err(m) => return err(m),
         };
-        let hot = self.hot.clone();
         with_store(&self.store, move |store| {
-            if let Some(doc) = crate::hot::annotation_doc(store, id)
-                && let Err(m) = hot.assert_cold(doc)
-            {
-                return err(m);
-            }
             match store.resolve(id, principal, decision) {
                 Ok(receipt) => {
                     if verbose {
@@ -2211,11 +2181,10 @@ pub const MAX_MCP_BODY: usize = 16 * 1024 * 1024;
 pub fn router(
     store: Arc<Mutex<SqliteStore>>,
     agent: Uuid,
-    hot: crate::hot::HotState,
     dedupe: DedupeCache,
     embedder: Option<Arc<crate::embed::Embedder>>,
 ) -> axum::Router {
-    router_with_hosts(store, agent, hot, dedupe, embedder, None)
+    router_with_hosts(store, agent, dedupe, embedder, None)
 }
 
 /// `router` with rmcp's inbound Host allowlist replaced: server mode adds the
@@ -2223,7 +2192,6 @@ pub fn router(
 pub fn router_with_hosts(
     store: Arc<Mutex<SqliteStore>>,
     agent: Uuid,
-    hot: crate::hot::HotState,
     dedupe: DedupeCache,
     embedder: Option<Arc<crate::embed::Embedder>>,
     allowed_hosts: Option<Vec<String>>,
@@ -2238,7 +2206,7 @@ pub fn router_with_hosts(
     let names = new_name_cache();
     let service = StreamableHttpService::new(
         move || {
-            Ok(KsMcp::new(store.clone(), agent, dedupe.clone(), names.clone(), hot.clone())
+            Ok(KsMcp::new(store.clone(), agent, dedupe.clone(), names.clone())
                 .with_embedder(embedder.clone()))
         },
         LocalSessionManager::default().into(),
@@ -2428,7 +2396,7 @@ mod tests {
             .create_principal(grimoire_store::PrincipalKind::Agent, "claude", None)
             .unwrap()
             .id;
-        let app = router(Arc::new(Mutex::new(store)), agent, test_hot("body"), new_dedupe(), None);
+        let app = router(Arc::new(Mutex::new(store)), agent, new_dedupe(), None);
 
         let send = |body: Vec<u8>| {
             let app = app.clone();
@@ -2475,10 +2443,6 @@ mod tests {
         (is_err, r.content[0].as_text().map(|t| t.text.clone()).unwrap_or_default())
     }
 
-    fn test_hot(tag: &str) -> crate::hot::HotState {
-        crate::hot::HotState::new(std::env::temp_dir().join(format!("grimoire-mcp-{tag}-{}", Uuid::now_v7())))
-    }
-
     fn p<T: serde::de::DeserializeOwned>(v: Value) -> T {
         serde_json::from_value(v).unwrap()
     }
@@ -2498,7 +2462,7 @@ mod tests {
         import_markdown(&mut store, "Loose Notes", None, tom, "The needle beta lives here.\n").unwrap();
         store.set_doc_workspace(root, Some(work)).unwrap();
         let store = Arc::new(Mutex::new(store));
-        let mcp = KsMcp::new(store.clone(), agent, new_dedupe(), new_name_cache(), test_hot("ws"));
+        let mcp = KsMcp::new(store.clone(), agent, new_dedupe(), new_name_cache());
 
         let titles = |v: &Value, key: &str| -> Vec<String> { v.as_array().unwrap().iter().map(|h| h[key].as_str().unwrap().to_string()).collect() };
         let (_, all) = text_of(mcp.search(Parameters(p(json!({"query": "needle"})))).await.unwrap());
@@ -2549,7 +2513,7 @@ mod tests {
         let kid = store.create_doc("2026", Some(gp), tom).unwrap().id;
         store.set_doc_workspace(top, Some(outer)).unwrap();
         let store = Arc::new(Mutex::new(store));
-        let mcp = KsMcp::new(store.clone(), agent, new_dedupe(), new_name_cache(), test_hot("wsop"));
+        let mcp = KsMcp::new(store.clone(), agent, new_dedupe(), new_name_cache());
         let op = |v: Value| mcp.doc_op_impl(NONE, p(v));
 
         let (is_err, msg) = raw(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": "Health"})).await.unwrap());
@@ -2599,7 +2563,7 @@ mod tests {
         let agent = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let (shell, _) = import_markdown(&mut store, "Shell", None, tom, "---\ntags:\n  - ui\n---\n\nDrag the window by its title bar.\n").unwrap();
         import_markdown(&mut store, "Entitlements", None, tom, "The entitlement check runs at login.\n").unwrap();
-        let mcp = KsMcp::new(Arc::new(Mutex::new(store)), agent, new_dedupe(), new_name_cache(), test_hot("ax"));
+        let mcp = KsMcp::new(Arc::new(Mutex::new(store)), agent, new_dedupe(), new_name_cache());
 
         let (is_err, hits) = text_of(mcp.search(Parameters(p(json!({"query": "title bar"})))).await.unwrap());
         assert!(!is_err);
@@ -2740,13 +2704,13 @@ mod tests {
 
     const DAILY: &str = "---\ntags:\n  - daily\n---\n\n## qompass\n\n### Done\n\n- shipped x\n\n### Plans\n\n- plan q\n\n## portus\n\n### Plans\n\n- plan p\n\n## grimoire\n\nintro line\n";
 
-    fn fixture(md: &str, tag: &str) -> Fx {
+    fn fixture(md: &str) -> Fx {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
         let claude = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let (doc, _) = import_markdown(&mut store, "2026-09-10", None, tom, md).unwrap();
         let store = Arc::new(Mutex::new(store));
-        let mcp = KsMcp::new(store.clone(), claude, new_dedupe(), new_name_cache(), test_hot(tag));
+        let mcp = KsMcp::new(store.clone(), claude, new_dedupe(), new_name_cache());
         Fx { store, mcp, doc, tom, claude }
     }
 
@@ -2776,7 +2740,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_doc_one_match_replaces_and_answers_one_line() {
-        let fx = fixture(DAILY, "edit1");
+        let fx = fixture(DAILY);
         let e0 = fx.epoch();
         let (is_err, out) = fx.edit(json!({"old": "- plan q", "new": "- plan q (done)"})).await;
         assert!(!is_err, "{out}");
@@ -2804,7 +2768,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_doc_zero_and_many_matches_are_actionable_errors() {
-        let fx = fixture(DAILY, "edit0");
+        let fx = fixture(DAILY);
         let (is_err, out) = fx.edit(json!({"old": "- shipped y", "new": "z"})).await;
         assert!(is_err);
         assert!(out.starts_with("old not found in doc (epoch"), "{out}");
@@ -2833,8 +2797,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_doc_repeat_within_ttl_replays_and_hot_docs_refuse() {
-        let fx = fixture(DAILY, "edit-dedupe");
+    async fn edit_doc_repeat_within_ttl_replays() {
+        let fx = fixture(DAILY);
         let e0 = fx.epoch();
         let (_, first) = fx.edit(json!({"old": "- plan q", "new": "- plan Q"})).await;
         let (_, again) = fx.edit(json!({"old": "- plan q", "new": "- plan Q"})).await;
@@ -2845,17 +2809,11 @@ mod tests {
         // the same edit by another principal is not a replay (it fails on its own merits)
         let (is_err, out) = fx.edit(json!({"old": "- plan q", "new": "- plan Q", "as": "claude:other"})).await;
         assert!(is_err && out.starts_with("old not found"), "{out}");
-        // hot doc
-        fx.mcp.hot.start(fx.doc, fx.epoch()).unwrap();
-        let (is_err, out) = fx.edit(json!({"old": "- plan p", "new": "x"})).await;
-        assert!(is_err && out.contains("live session"), "{out}");
-        let (is_err, out) = fx.append(json!({"markdown": "x"})).await;
-        assert!(is_err && out.contains("live session"), "{out}");
     }
 
     #[tokio::test]
     async fn append_lands_at_end_start_and_creates_missing_paths() {
-        let fx = fixture(DAILY, "append");
+        let fx = fixture(DAILY);
         let e0 = fx.epoch();
         let (is_err, out) = fx.append(json!({"markdown": "- plan q2", "to": "qompass › Plans"})).await;
         assert!(!is_err, "{out}");
@@ -2903,7 +2861,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_doc_is_text_with_header_refs_section_block_and_comments() {
-        let fx = fixture(DAILY, "read");
+        let fx = fixture(DAILY);
         let (is_err, out) = fx.read(json!({})).await;
         assert!(!is_err);
         let mut lines = out.lines();
@@ -2979,7 +2937,7 @@ mod tests {
 
     #[tokio::test]
     async fn verdict_rendering_covers_yellow_red_and_doc_ops() {
-        let fx = fixture(DAILY, "verdicts");
+        let fx = fixture(DAILY);
         let e0 = fx.epoch();
         // a stale propose against a block someone else changed → non-green lines
         let tree = fx.store.lock().unwrap().read_doc(fx.doc).unwrap();
@@ -3066,7 +3024,7 @@ mod tests {
 
     #[tokio::test]
     async fn propose_markdown_stale_base_is_a_one_line_error_with_the_misses() {
-        let fx = fixture(DAILY, "stale");
+        let fx = fixture(DAILY);
         let e0 = fx.epoch();
         fx.edit(json!({"old": "- plan p", "new": "- plan p2"})).await;
         let (is_err, out) = raw(
@@ -3111,7 +3069,7 @@ mod tests {
         let epoch = store.read_doc(doc).unwrap().doc.current_epoch;
         let store = Arc::new(Mutex::new(store));
         let (dedupe, names) = (new_dedupe(), new_name_cache());
-        let fresh = || KsMcp::new(store.clone(), claude, dedupe.clone(), names.clone(), test_hot("as"));
+        let fresh = || KsMcp::new(store.clone(), claude, dedupe.clone(), names.clone());
         let hint = |q: Option<&str>, cwd: Option<&str>, h: Option<&str>| RequestHint {
             header: h.map(String::from),
             query_as: q.map(String::from),
@@ -3176,7 +3134,7 @@ mod tests {
             let claude = s.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
             (claude, import_markdown(&mut s, "d", None, tom, "first\n").unwrap().0)
         };
-        let boot = || KsMcp::new(Arc::new(Mutex::new(SqliteStore::open(&db).unwrap())), claude, new_dedupe(), new_name_cache(), test_hot("idem"));
+        let boot = || KsMcp::new(Arc::new(Mutex::new(SqliteStore::open(&db).unwrap())), claude, new_dedupe(), new_name_cache());
         let e0 = SqliteStore::open(&db).unwrap().get_doc(doc).unwrap().current_epoch;
         let args = json!({"doc_id": doc.to_string(), "markdown": "once"});
         let (is_err, a) = raw(boot().append_impl(NONE, p(args.clone())).await.unwrap());

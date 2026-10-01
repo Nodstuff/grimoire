@@ -204,13 +204,11 @@ pub fn refreshed_body(synthesis: Option<&str>, excerpts: &[SearchHit], changed: 
 /// Refresh one answer. Returns a run-log line; `Err` lines are skips.
 pub async fn refresh_one(
     store: Arc<Mutex<SqliteStore>>,
-    hot: crate::hot::HotState,
     doc_id: Uuid,
 ) -> Result<String, String> {
     let embedder = embedder();
     // phase 1: what changed, the question, fresh retrieval
     let (question, excerpts, changed, total, agent) = {
-        let hot = hot.clone();
         with_store(&store, move |s| -> Result<_, String> {
             let tree = s.read_doc(doc_id).map_err(|e| e.to_string())?;
             let sources = s.answer_sources(doc_id).map_err(|e| e.to_string())?;
@@ -218,15 +216,12 @@ pub async fn refresh_one(
             if changed == 0 {
                 return Err(format!("{}: fresh, nothing to do", tree.doc.title));
             }
-            if hot.is_hot(doc_id) {
-                return Err(format!("{}: deferred, doc is in a live session", tree.doc.title));
-            }
             let question = question_of(&tree).ok_or_else(|| format!("{}: no question recorded", tree.doc.title))?;
             let excerpts = crate::ask::retrieve(s, embedder.as_deref(), &question);
             if excerpts.is_empty() {
                 return Err(format!("{}: nothing in the vault answers it any more; left as is", tree.doc.title));
             }
-            let agent = crate::room::agent_principal(s).map_err(|e| e.to_string())?;
+            let agent = crate::store_ext::scribe_principal(s).map_err(|e| e.to_string())?;
             Ok((question, excerpts, changed, sources.len(), agent))
         })
         .await?
@@ -289,7 +284,6 @@ pub fn stale_answers(store: &SqliteStore, only: Option<Uuid>) -> Vec<Uuid> {
 /// run (one line per answer); returns the lines.
 pub async fn refresh_sweep(
     store: Arc<Mutex<SqliteStore>>,
-    hot: crate::hot::HotState,
     only: Option<Uuid>,
 ) -> Vec<String> {
     let candidates = with_store(&store, move |s| stale_answers(s, only)).await;
@@ -299,7 +293,7 @@ pub async fn refresh_sweep(
         return lines;
     }
     for d in candidates.into_iter().take(REFRESH_BUDGET) {
-        let line = match refresh_one(store.clone(), hot.clone(), d).await {
+        let line = match refresh_one(store.clone(), d).await {
             Ok(l) => l,
             Err(l) => l,
         };
@@ -327,7 +321,7 @@ pub async fn refresh_now(
     body: Option<Json<RefreshReq>>,
 ) -> Json<Value> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
-    let lines = refresh_sweep(st.store.clone(), st.hot.clone(), req.doc_id).await;
+    let lines = refresh_sweep(st.store.clone(), req.doc_id).await;
     Json(json!({"ok": true, "lines": lines}))
 }
 
@@ -342,7 +336,7 @@ mod tests {
         let human_folder = crate::ask::ANSWERS_FOLDER;
         import_markdown(&mut s, "Grants", None, tom, "# Grants\n\nThe grant flow uses temporary delegation.\n\nGrants expire after one hour.\n").unwrap();
         let answers = s.create_doc(human_folder, None, tom).unwrap().id;
-        let agent = crate::room::agent_principal(&mut s).unwrap();
+        let agent = crate::store_ext::scribe_principal(&mut s).unwrap();
         let q = "how does the grant flow work?";
         let excerpts = crate::ask::retrieve(&s, None, q);
         assert!(!excerpts.is_empty());
@@ -456,8 +450,7 @@ mod tests {
         // point the resolver at a path that is not a file so the test never spawns claude
         unsafe { std::env::set_var("GRIMOIRE_CLAUDE_BIN", "/nonexistent/claude") };
         let (store, tom, _, doc, excerpts) = seed();
-        let hot = crate::hot::HotState::new(std::env::temp_dir().join(format!("grimoire-living-{}", Uuid::now_v7())));
-        let lines = refresh_sweep(store.clone(), hot.clone(), None).await;
+        let lines = refresh_sweep(store.clone(), None).await;
         assert_eq!(lines, vec!["living answers: nothing stale".to_string()]);
 
         {
@@ -466,7 +459,7 @@ mod tests {
             let epoch = s.get_doc(src).unwrap().current_epoch;
             s.apply(src, epoch, tom, vec![OpInput { kind: OpKind::Replace { target: excerpts[0].block.id, content: "The grant flow uses temporary delegation and expires fast.".into() }, source_refs: vec![] }]).unwrap();
         }
-        let lines = refresh_sweep(store.clone(), hot.clone(), None).await;
+        let lines = refresh_sweep(store.clone(), None).await;
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("1 of"), "{lines:?}");
         {
@@ -481,16 +474,5 @@ mod tests {
             assert!(!q.is_empty(), "the refresh is reviewable");
             assert!(q.iter().all(|i| i.op.source_refs.iter().any(|r| r.starts_with("living-answer: refreshed, 1 of"))));
         }
-        // a live session defers the doc
-        {
-            let mut s = store.lock().unwrap();
-            let src = excerpts[0].block.doc_id;
-            let epoch = s.get_doc(src).unwrap().current_epoch;
-            s.apply(src, epoch, tom, vec![OpInput { kind: OpKind::Replace { target: excerpts[0].block.id, content: "again".into() }, source_refs: vec![] }]).unwrap();
-        }
-        let frozen = crate::hot::HotState::new(std::env::temp_dir().join(format!("grimoire-living-{}", Uuid::now_v7())));
-        frozen.start(doc, 0).unwrap();
-        let lines = refresh_sweep(store.clone(), frozen, Some(doc)).await;
-        assert!(lines[0].contains("live session"), "{lines:?}");
     }
 }
