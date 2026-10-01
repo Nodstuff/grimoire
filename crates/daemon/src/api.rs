@@ -30,6 +30,8 @@ pub struct ApiState {
     pub embedder: Option<Arc<crate::embed::Embedder>>,
     /// Idempotency cache for `request_id` on propose routes, shared with MCP.
     pub dedupe: crate::mcp::DedupeCache,
+    /// The change journal's head, pushed to `/api/changes/stream` clients.
+    pub changes: crate::changes::Feed,
 }
 
 /// Optional on every HTTP write: attribute the write to this Agent principal
@@ -1620,6 +1622,7 @@ pub fn router(state: ApiState) -> Router {
         // the briefing home (last-visit stamp, new docs since) and quick capture
         .merge(crate::home::router(state.clone()))
         .merge(crate::inbox::router(state.clone()))
+        .merge(crate::changes::router(state.clone()))
         .merge(crate::todo::router(state))
 }
 
@@ -1635,8 +1638,10 @@ mod http_client_tests {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let human = store.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
         let dir = std::env::temp_dir().join(format!("grimoire-api-test-{}", Uuid::now_v7()));
+        let store = Arc::new(Mutex::new(store));
         let st = ApiState {
-            store: Arc::new(Mutex::new(store)),
+            changes: crate::changes::Feed::new(&store),
+            store,
             human,
             hot: crate::hot::HotState::new(dir.clone()),
             runtime: crate::fed::Runtime::default(),

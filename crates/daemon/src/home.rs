@@ -159,8 +159,10 @@ pub(crate) mod testing {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let human = store.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
         let dir = std::env::temp_dir().join(format!("grimoire-home-test-{}", Uuid::now_v7()));
+        let store = Arc::new(Mutex::new(store));
         let st = ApiState {
-            store: Arc::new(Mutex::new(store)),
+            changes: crate::changes::Feed::new(&store),
+            store,
             human,
             hot: crate::hot::HotState::new(dir.clone()),
             runtime: crate::fed::Runtime::default(),

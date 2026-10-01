@@ -7,6 +7,7 @@ mod admin;
 mod api;
 mod ask;
 mod backup;
+mod changes;
 mod children;
 mod docops;
 mod embed;
@@ -923,6 +924,7 @@ async fn main() -> anyhow::Result<()> {
                     admin::router(store.clone(), fed_ctx, hot.clone(), runtime.clone(), admin_token)
                 })
                 .merge(api::router(api::ApiState {
+                    changes: changes::Feed::new(&store),
                     store,
                     human: tom,
                     hot,
