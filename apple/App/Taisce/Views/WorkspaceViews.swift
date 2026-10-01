@@ -2,10 +2,20 @@ import SwiftUI
 import TaisceKit
 
 extension Color {
-    /// `#rrggbb` (a workspace's colour); nil for anything else.
-    init?(workspaceHex hex: String?) {
-        guard let hex, hex.hasPrefix("#"), hex.count == 7, let v = UInt32(hex.dropFirst(), radix: 16) else { return nil }
-        self.init(red: Double((v >> 16) & 0xff) / 255, green: Double((v >> 8) & 0xff) / 255, blue: Double(v & 0xff) / 255)
+    /// A workspace's stored colour: a Theme token (adapts to light/dark),
+    /// else a fixed `#rrggbb`; nil for anything else.
+    init?(workspaceColor stored: String?) {
+        switch WorkspacePalette.token(stored) {
+        case "accent": self = Theme.accent
+        case "green": self = Theme.green
+        case "amber": self = Theme.amber
+        case "rose": self = Theme.rose
+        case "accentActive": self = Theme.accentActive
+        case "secondary": self = Theme.secondary
+        default:
+            guard let hex = stored, hex.hasPrefix("#"), hex.count == 7, let v = UInt32(hex.dropFirst(), radix: 16) else { return nil }
+            self.init(red: Double((v >> 16) & 0xff) / 255, green: Double((v >> 8) & 0xff) / 255, blue: Double(v & 0xff) / 255)
+        }
     }
 }
 
@@ -15,7 +25,7 @@ struct WorkspaceDot: View {
 
     var body: some View {
         Circle()
-            .fill(Color(workspaceHex: color) ?? Theme.secondary)
+            .fill(Color(workspaceColor: color) ?? Theme.secondary)
             .frame(width: size, height: size)
             .accessibilityHidden(true)
     }
@@ -114,7 +124,7 @@ struct NewWorkspaceSheet: View {
                                     .overlay(Circle().stroke(Theme.text, lineWidth: color == c ? 2 : 0).padding(-3))
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel(c)
+                            .accessibilityLabel(WorkspacePalette.name(c))
                             .accessibilityAddTraits(color == c ? .isSelected : [])
                         }
                     }
@@ -302,13 +312,13 @@ struct ManageWorkspaceRow: View {
                 ForEach(WorkspacePalette.colors, id: \.self) { c in
                     Button { onColor(c) } label: {
                         WorkspaceDot(color: c, size: 22)
-                            .overlay(Circle().stroke(Theme.text, lineWidth: workspace.color == c ? 2 : 0).padding(-3))
+                            .overlay(Circle().stroke(Theme.text, lineWidth: WorkspacePalette.token(workspace.color) == c ? 2 : 0).padding(-3))
                             .frame(width: 32, height: Theme.minTarget)
                             .contentShape(.rect)
                     }
                     .buttonStyle(.borderless)
-                    .accessibilityLabel("Colour \(c)")
-                    .accessibilityAddTraits(workspace.color == c ? .isSelected : [])
+                    .accessibilityLabel("Colour \(WorkspacePalette.name(c))")
+                    .accessibilityAddTraits(WorkspacePalette.token(workspace.color) == c ? .isSelected : [])
                 }
                 Spacer()
                 if !confirming {
