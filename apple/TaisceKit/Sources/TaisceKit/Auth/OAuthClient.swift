@@ -30,12 +30,23 @@ public struct OAuthClient: Sendable {
     // MARK: discovery
 
     /// Both metadata documents, or nil when the server does no OAuth (a
-    /// LOCAL-mode daemon answers the well-known path with its SPA or a 404).
+    /// LOCAL-mode daemon answers the well-known path with its SPA page).
+    /// "No OAuth" is believed only where a downgrade can't be an attack or an
+    /// outage: a JSON 404 (the daemon's own answer), or an HTML page from a
+    /// loopback or plain-http host. A 5xx, or HTML over https from anywhere
+    /// else (a proxy error page, a captive portal), throws instead of
+    /// silently dropping to no auth.
     public func discover() async throws -> OAuthDiscovery? {
         let prmURL = try endpoint("/.well-known/oauth-protected-resource")
         let (data, response) = try await session.data(for: jsonRequest(prmURL))
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if status == 404 || response.mimeType == "text/html" { return nil }
+        if status >= 500 { throw APIError.http(status: status) }
+        let html = response.mimeType == "text/html"
+        if status == 404 && response.mimeType == "application/json" { return nil }
+        if html || status == 404 {
+            if Self.isLoopback(baseURL) || baseURL.scheme == "http" { return nil }
+            throw html ? APIError.notAPIRoute(prmURL.path()) : APIError.http(status: status)
+        }
         guard (200..<300).contains(status) else { throw APIError.http(status: status) }
         let prm: ProtectedResourceMetadata = try decode(data)
 
@@ -54,6 +65,10 @@ public struct OAuthClient: Sendable {
             throw AuthError.unsupportedServer("no public clients (token_endpoint_auth_method none)")
         }
         return OAuthDiscovery(resource: prm, server: meta)
+    }
+
+    static func isLoopback(_ url: URL) -> Bool {
+        ["127.0.0.1", "localhost", "::1", "[::1]"].contains(url.host() ?? "")
     }
 
     // MARK: registration

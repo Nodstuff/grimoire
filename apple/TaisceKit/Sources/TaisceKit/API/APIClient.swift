@@ -17,13 +17,15 @@ public struct APIClient: Sendable {
         try await treeWithSeq().docs
     }
 
-    /// The tree plus `X-Grimoire-Seq`, the change-log head read under the same
+    /// The tree plus `Taisce-Seq` (`X-Grimoire-Seq` on daemons before the
+    /// rename), the change-log head read under the same
     /// lock as the list: page `/api/changes` from it to bootstrap without a race.
     /// `seq` is nil on daemons that predate the change log.
     public func treeWithSeq() async throws -> (docs: [DocSummary], seq: Int?) {
         let (data, response) = try await data(for: try await request("/api/docs"))
         try Self.check(data: data, response: response)
-        let seq = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "X-Grimoire-Seq").flatMap(Int.init)
+        let http = response as? HTTPURLResponse
+        let seq = (http?.value(forHTTPHeaderField: "Taisce-Seq") ?? http?.value(forHTTPHeaderField: "X-Grimoire-Seq")).flatMap(Int.init)
         do {
             return (try JSONDecoder().decode([DocSummary].self, from: data), seq)
         } catch {
@@ -216,11 +218,17 @@ public struct APIClient: Sendable {
             throw APIError.notAPIRoute(response.url?.path() ?? "")
         }
         if isUnauthorized(response) { throw APIError.unauthorized }
+        let msg = errorMessage(in: data)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            if let msg = errorMessage(in: data) { throw APIError.server(msg) }
-            throw APIError.http(status: http.statusCode)
+            let status = http.statusCode
+            if status == 404 { throw APIError.notFound(msg ?? response.url?.path() ?? "") }
+            // keep the status for the retryable ones; a 4xx message is the server's answer
+            if let msg, !APIError.http(status: status).isTransient { throw APIError.server(msg) }
+            throw APIError.http(status: status)
         }
-        if let msg = errorMessage(in: data) { throw APIError.server(msg) }
+        if let msg {
+            throw msg.hasPrefix("not found") ? APIError.notFound(msg) : APIError.server(msg)
+        }
     }
 
     /// The `{"error": "..."}` envelope, if `data` is one.

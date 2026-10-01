@@ -29,7 +29,8 @@ import Testing
         let server = MockServer { r in
             switch (r.path, r.query["since"]) {
             case ("/api/docs", _): .json(Self.treeJSON)
-            case ("/api/changes", "0"): Self.page(seq: 2, more: true,
+            // `seq` is the journal head (3), not the page's last row (2)
+            case ("/api/changes", "0"): Self.page(seq: 3, more: true,
                 Fixture.change(1, doc: "d1", kind: "doc", epoch: 2),
                 Fixture.change(2, doc: "d3", kind: "tree"))
             case ("/api/changes", "2"): Self.page(seq: 3, more: false,
@@ -55,7 +56,8 @@ import Testing
         let cache = try Cache.inMemory()
         let server = MockServer { r in
             switch r.path {
-            case "/api/docs": MockServer.Reply(chunks: [Data(Self.treeJSON.utf8)], headers: ["X-Grimoire-Seq": "40"])
+            // the renamed header wins over the old one
+            case "/api/docs": MockServer.Reply(chunks: [Data(Self.treeJSON.utf8)], headers: ["Taisce-Seq": "40", "X-Grimoire-Seq": "1"])
             case "/api/changes": Self.page(seq: 41, more: false, Fixture.change(41, doc: "d1", kind: "doc", epoch: 2))
             default: .json(#"{"error":"unexpected"}"#)
             }

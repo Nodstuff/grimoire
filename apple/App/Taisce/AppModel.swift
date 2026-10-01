@@ -1,6 +1,7 @@
 import Foundation
 import TaisceKit
 import Observation
+import UIKit
 
 /// App-wide state: the server connection, its sign-in, cache and sync
 /// engine, the doc tree, pins, and the sync indicator. Everything below the
@@ -39,6 +40,10 @@ final class AppModel {
     private(set) var cursor = 0
     private(set) var pendingWrites = 0
     private(set) var failedWrites = 0
+    /// the engine's last connection/catch-up error (nil once healthy)
+    private(set) var syncError: String?
+    /// docs whose body fetch failed, with why (sync carries on without them)
+    private(set) var failedDocs: [DocID: String] = [:]
     /// bumps whenever the To-do doc's cached blocks change (sync, first
     /// fetch, or our own writes landing): to-do lists reload on it
     private(set) var todoRevision = 0
@@ -68,7 +73,8 @@ final class AppModel {
     let dueAlerts: any DueAlertPermission = SystemDueAlerts()
 
     init() {
-        serverURL = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? Self.defaultServerURL
+        let stored = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? Self.defaultServerURL
+        serverURL = ServerConfig.normalizedURL(stored)?.absoluteString ?? Self.defaultServerURL
     }
 
     var needsSignIn: Bool { authPhase == .signedOut }
@@ -84,8 +90,13 @@ final class AppModel {
     }
 
     func setServerURL(_ s: String) async {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed != serverURL, URL(string: trimmed)?.host() != nil else { return }
+        // "taisce.null.ie" means https://taisce.null.ie
+        guard let url = ServerConfig.normalizedURL(s) else {
+            lastError = "not a server URL: \(s)"
+            return
+        }
+        let trimmed = url.absoluteString
+        guard trimmed != serverURL else { return }
         await stopSync()
         serverURL = trimmed
         UserDefaults.standard.set(trimmed, forKey: Self.serverURLKey)
@@ -94,7 +105,7 @@ final class AppModel {
     }
 
     func startSync() async {
-        guard authPhase != .signedOut, authPhase != .checking else { return }
+        guard authPhase == .signedIn || authPhase == .notRequired else { return }
         await sync?.start()
         startPolling()
     }
@@ -154,13 +165,20 @@ final class AppModel {
     /// LOCAL-mode one can be reached by name). Unreachable and no tokens:
     /// a loopback daemon is assumed LOCAL, anything else asks to sign in.
     static func authSession(for url: URL) async throws -> AuthSession? {
-        let auth = AuthSession(oauth: OAuthClient(baseURL: url), store: try KeychainTokenStore())
+        let auth = AuthSession(oauth: OAuthClient(baseURL: url), store: try KeychainTokenStore(), shield: Self.backgroundTask)
         if await auth.state == .signedIn { return auth }
         do {
             return try await auth.requiresAuth() ? auth : nil
         } catch {
             return isLoopback(url) ? nil : auth
         }
+    }
+
+    /// Finish a token refresh even if the app is backgrounded mid-request:
+    /// a rotation the server did but we never saved costs the whole grant.
+    static let backgroundTask: AuthSession.Shield = { name in
+        let id = await MainActor.run { UIApplication.shared.beginBackgroundTask(withName: name) }
+        return { await MainActor.run { UIApplication.shared.endBackgroundTask(id) } }
     }
 
     /// One cache file per server, so switching servers never mixes docs.
@@ -173,6 +191,7 @@ final class AppModel {
         hasSynced = false
         guard let url = URL(string: serverURL) else {
             lastError = "not a URL: \(serverURL)"
+            authPhase = .notRequired
             return
         }
         do {
@@ -214,8 +233,8 @@ final class AppModel {
             }
         } catch {
             lastError = error.localizedDescription
-            // never strand the launch state: the sign-in screen shows the error and the server field
-            if authPhase == .checking { authPhase = .signedOut }
+            // the error shows in Settings; never leave the UI on "checking"
+            if authPhase == .checking { authPhase = .notRequired }
         }
     }
 
@@ -270,6 +289,8 @@ final class AppModel {
     private func pollOnce() async {
         guard let sync, let cache else { return }
         let status = await sync.status
+        syncError = await sync.lastError
+        failedDocs = await sync.failedDocs
         if status == .live, syncStatus != .live {
             lastSynced = .now
             hasSynced = true

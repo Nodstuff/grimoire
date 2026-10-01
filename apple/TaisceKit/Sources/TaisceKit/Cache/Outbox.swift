@@ -140,7 +140,10 @@ public struct OutboxReplayer: Sendable {
                 r.httpBody = entry.body
                 let data = try await api.send(raw: r)
                 try await cache.markOutbox(id, state: .done)
-                if let (doc, base) = Self.proposeBase(entry), let outcome = try? JSONDecoder().decode(Landed.self, from: data) {
+                // rebase only onto our own write: an epoch that jumped further
+                // means someone else wrote too, and the gate should score the rest
+                if let (doc, base) = Self.proposeBase(entry), let outcome = try? JSONDecoder().decode(Landed.self, from: data),
+                   outcome.epoch == base + 1 {
                     try await cache.rebaseOutbox(docID: doc, from: base, to: outcome.epoch)
                 }
             } catch let APIError.server(msg) where msg.hasPrefix(Self.liveSessionRefusal) {
@@ -150,6 +153,10 @@ public struct OutboxReplayer: Sendable {
             } catch APIError.unauthorized {
                 // signed out or mid-refresh: not this entry's fault, keep it and the order
                 try await cache.markOutbox(id, state: .pending, error: String(describing: APIError.unauthorized))
+                return
+            } catch let e as APIError where e.isTransient {
+                // 5xx, 408, 429, or a proxy's HTML page: try again later, keep order
+                try await cache.markOutbox(id, state: .pending, error: String(describing: e))
                 return
             } catch let e as APIError {
                 // the server answered: retrying the same request won't help

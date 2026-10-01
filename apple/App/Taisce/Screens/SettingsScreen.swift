@@ -18,6 +18,8 @@ struct SettingsScreen: View {
                     cursor: model.cursor,
                     pending: model.pendingWrites,
                     lastError: model.lastError,
+                    syncError: model.syncError,
+                    failedDocs: model.failedDocs.map { (model.index.byID[$0.key]?.title ?? $0.key, $0.value) }.sorted { $0.0 < $1.0 },
                     alerts: model.dueAlerts.status
                 ),
                 onSave: { url in Task { await model.setServerURL(url) } },
@@ -43,6 +45,9 @@ struct SettingsInfo {
     var cursor: Int
     var pending: Int
     var lastError: String?
+    var syncError: String?
+    /// (doc title, why) for docs whose body couldn't be fetched
+    var failedDocs: [(String, String)] = []
     var alerts: DueAlertStatus = .allowed
 }
 
@@ -90,6 +95,18 @@ struct SettingsContent: View {
                 LabeledContent("Last synced", value: info.lastSynced.map { RelativeTime.string($0, now: now) } ?? "Not yet")
                 LabeledContent("Cursor") { Text("seq \(info.cursor)").monospacedDigit() }
                 LabeledContent("Pending writes") { Text("\(info.pending)").monospacedDigit() }
+                if let error = info.syncError {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Sync error").foregroundStyle(Theme.rose)
+                        Text(error).font(.footnote).foregroundStyle(Theme.secondary)
+                    }
+                }
+                ForEach(info.failedDocs, id: \.0) { title, why in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Couldn't fetch \u{201C}\(title)\u{201D}").foregroundStyle(Theme.amber)
+                        Text(why).font(.footnote).foregroundStyle(Theme.secondary).lineLimit(3)
+                    }
+                }
             } header: {
                 Text("Sync")
             } footer: {
@@ -157,7 +174,8 @@ struct SettingsContent: View {
     NavigationStack {
         SettingsContent(info: SettingsInfo(
             serverURL: "http://127.0.0.1:7425", account: .notRequired, status: .waiting(retryIn: .seconds(8)),
-            lastSynced: PreviewData.ago(3 * 3600), cursor: 977, pending: 3, lastError: "Could not connect to the server."
+            lastSynced: PreviewData.ago(3 * 3600), cursor: 977, pending: 3, lastError: "Could not connect to the server.",
+            syncError: "The request timed out.", failedDocs: [("Roadmap", "http(status: 500)")]
         ), now: PreviewData.now)
     }
     .preferredColorScheme(.light)

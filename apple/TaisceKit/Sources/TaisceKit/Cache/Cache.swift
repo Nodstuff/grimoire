@@ -91,12 +91,31 @@ public final class Cache: Sendable {
         }
     }
 
+    /// Advance the cursor. Never moves it backwards (a late writer from a
+    /// stopped loop, a confused server); `resetLastSeq` is the one way back.
     public func setLastSeq(_ seq: Int) async throws {
+        try await db.write { db in
+            try db.execute(
+                sql: "INSERT INTO sync_state(key, value) VALUES ('last_seq', ?) ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)",
+                arguments: [seq]
+            )
+        }
+    }
+
+    /// Put the cursor anywhere, backwards included: the server was reset.
+    public func resetLastSeq(_ seq: Int) async throws {
         try await db.write { db in
             try db.execute(
                 sql: "INSERT INTO sync_state(key, value) VALUES ('last_seq', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 arguments: [seq]
             )
+        }
+    }
+
+    /// Every cached body needs a refetch before it is trusted again.
+    public func markAllBodiesStale() async throws {
+        try await db.write { db in
+            try db.execute(sql: "UPDATE docs SET body_epoch = -1 WHERE body_epoch IS NOT NULL")
         }
     }
 
@@ -183,7 +202,7 @@ public final class Cache: Sendable {
             }
             if let todos {
                 try TodoRecord.deleteAll(db)
-                for t in todos { try t.insert(db) }
+                for t in todos { try t.upsert(db) }
             }
         }
     }
@@ -217,6 +236,13 @@ public final class Cache: Sendable {
     }
 
     // MARK: observation (for the UI)
+
+    /// The To-do doc's items, re-emitted whenever sync rewrites them.
+    public func observeTodos() -> AsyncValueObservation<[TodoRecord]> {
+        ValueObservation.tracking { db in
+            try TodoRecord.order(TodoRecord.Columns.date, TodoRecord.Columns.position).fetchAll(db)
+        }.values(in: db)
+    }
 
     public func observeTree() -> AsyncValueObservation<[DocRecord]> {
         ValueObservation
