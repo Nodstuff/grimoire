@@ -295,6 +295,40 @@ public final class Cache: Sendable {
         }
     }
 
+    /// A workspace was deleted: every doc that resolved to it re-resolves
+    /// at once, as the server does, to the workspace of its nearest
+    /// ancestor outside it (an outer workspace), else Unsorted. Sync's tree
+    /// rows then confirm. Returns how many docs moved.
+    @discardableResult
+    public func clearWorkspace(_ id: WorkspaceID) async throws -> Int {
+        try await db.write { db in
+            let rows = try Row.fetchAll(db, sql: "SELECT id, parent_id, workspace_id FROM docs")
+            var parent: [DocID: DocID] = [:]
+            var ws: [DocID: WorkspaceID] = [:]
+            for r in rows {
+                let doc: DocID = r["id"]
+                if let p: DocID = r["parent_id"] { parent[doc] = p }
+                if let w: WorkspaceID = r["workspace_id"] { ws[doc] = w }
+            }
+            let affected = ws.filter { $0.value == id }.map(\.key)
+            for doc in affected {
+                var next = parent[doc]
+                var seen: Set<DocID> = [doc]
+                var resolved: WorkspaceID?
+                while let p = next, seen.insert(p).inserted {
+                    if ws[p] != id {
+                        resolved = ws[p]
+                        break
+                    }
+                    next = parent[p]
+                }
+                try db.execute(sql: "UPDATE docs SET workspace_id = ? WHERE id = ?", arguments: [resolved, doc])
+            }
+            try db.execute(sql: "DELETE FROM workspaces WHERE id = ?", arguments: [id])
+            return affected.count
+        }
+    }
+
     public func workspaces() async throws -> [Workspace] {
         try await db.read { db in try WorkspaceRecord.fetchAll(db).map(\.workspace) }
     }

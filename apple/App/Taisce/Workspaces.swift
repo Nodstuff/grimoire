@@ -269,6 +269,8 @@ extension AppModel {
         let fallback = WorkspaceManagement.fallback(afterDeleting: id, from: workspaces)
         workspaces.removeAll { $0.id == id }
         try? await cache?.replaceWorkspaces(workspaces)
+        // its docs re-resolve now (Unsorted or an outer workspace): nothing vanishes
+        try? await cache?.clearWorkspace(id)
         if wasCurrent { selectWorkspace(fallback) } else { workspaceDidChange() }
         refreshWorkspaces()
         return nil

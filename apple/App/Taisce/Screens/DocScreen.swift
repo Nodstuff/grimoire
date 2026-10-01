@@ -85,9 +85,21 @@ struct DocScreen: View {
             onRetry: { Task { await refresh(force: true) } },
             onEdit: editable && page != nil && !opening ? { Task { await startEditing() } } : nil,
             workspace: model.workspaceBadge(for: docID),
-            onMoveWorkspace: model.hasWorkspaces ? { movingWorkspace = true } : nil
+            onMoveWorkspace: model.hasWorkspaces ? { movingWorkspace = true } : nil,
+            children: DocChildrenLayout.make(
+                pageEmpty: page.map(\.isEmpty),
+                children: DocChildrenLayout.children(of: docID, index: model.index, meta: model.editMeta)
+            ),
+            childCounts: model.index.childCount,
+            onOpenChild: { router.open(.doc($0)) },
+            onNewDocHere: { router.newDoc(in: docID) }
         )
         .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
+        // children's "edited … ago" (a handful; each is cached until it changes)
+        .task(id: docID) {
+            let kids = DocChildrenLayout.children(of: docID, index: model.index, meta: [:]).prefix(20)
+            for kid in kids { await model.loadEditMeta(kid.id) }
+        }
         .environment(\.openURL, OpenURLAction { url in
             if let target = InlineMarkdown.wikiTarget(url) {
                 if let doc = model.index.doc(titled: target) { router.open(.doc(doc.id)) }
@@ -199,6 +211,11 @@ struct DocContent: View {
     // workspaces: the header chip and the … menu's "Move to workspace…"
     var workspace: WorkspaceBadge?
     var onMoveWorkspace: (() -> Void)?
+    // children: a folder view for an empty body, else "Inside this doc"
+    var children: DocChildrenLayout = .none
+    var childCounts: [DocID: Int] = [:]
+    var onOpenChild: (DocID) -> Void = { _ in }
+    var onNewDocHere: (() -> Void)?
 
     var body: some View {
         ScrollView {
@@ -274,6 +291,9 @@ struct DocContent: View {
                         action: onToggle.map { f in { i, v in f(block.id, i, v) } }
                     ))
             }
+            DocChildrenList(layout: children, childCounts: childCounts, now: now, onOpen: onOpenChild)
+        } else if case .folder = children {
+            DocChildrenList(layout: children, childCounts: childCounts, now: now, onOpen: onOpenChild, onNewDocHere: onNewDocHere)
         } else if let loadError {
             VStack(alignment: .leading, spacing: 12) {
                 EmptyCard(icon: "wifi.slash", title: "Couldn't load this doc", hint: loadError)
