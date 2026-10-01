@@ -7,6 +7,7 @@ struct TodayScreen: View {
     @Environment(AppModel.self) private var model
     @Environment(Router.self) private var router
     @State private var board: TodoBoard?
+    @State private var taps = RingTaps()
 
     var body: some View {
         TodayContent(
@@ -18,7 +19,9 @@ struct TodayScreen: View {
             onSettings: { router.showSettings = true },
             onAllTodos: router.showTodos,
             onOpen: { router.open(.doc($0)) },
-            onUnpin: model.togglePin
+            onUnpin: model.togglePin,
+            checked: taps.checked,
+            onToggleDone: { e in taps.tap(e) { await model.markDone($0) } }
         )
         .safeAreaInset(edge: .top, spacing: 0) { WorkspaceBar() } // workspaces
         .refreshable { await reload() }
@@ -45,6 +48,9 @@ struct TodayContent: View {
     var onAllTodos: () -> Void = {}
     var onOpen: (DocID) -> Void = { _ in }
     var onUnpin: (DocID) -> Void = { _ in }
+    /// rows checked by a ring tap, fading out
+    var checked: Set<String> = []
+    var onToggleDone: ((TodoEntry) -> Void)?
 
     static let dueLimit = 5
 
@@ -96,7 +102,10 @@ struct TodayContent: View {
                     EmptyCard(icon: "checkmark.circle", title: "Nothing due", hint: "Deadlines show up here. Add one to any to-do, like \u{2018}due fri 3pm\u{2019}.")
                 } else {
                     CardList(items: Array(due.prefix(Self.dueLimit))) { entry in
-                        Button(action: onAllTodos) { TodoRow(entry: entry, now: now) }.buttonStyle(.plain)
+                        // the ring is its own button; the rest of the row opens To-dos
+                        TodoRow(entry: entry, now: now, done: checked.contains(entry.id), onToggle: onToggleDone.map { f in { f(entry) } })
+                            .onTapGesture(perform: onAllTodos)
+                            .accessibilityAction(named: "Open To-dos", onAllTodos)
                     }
                     if due.count > Self.dueLimit {
                         Text("\(due.count - Self.dueLimit) more in To-dos").font(.footnote).foregroundStyle(Theme.secondary).padding(.horizontal, 4)

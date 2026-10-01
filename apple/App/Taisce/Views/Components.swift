@@ -87,16 +87,31 @@ struct TodoRow: View {
     let entry: TodoEntry
     var now: Date = .now
     var done = false
+    /// the ring as a button (tap to mark done / undo); nil = a plain ring
+    var onToggle: (() -> Void)?
 
     var body: some View {
         let label = DueLabel.make(entry, now: now)
         HStack(alignment: .center, spacing: 14) {
-            TodoRing(tone: label.tone, done: done)
+            if let onToggle {
+                Button(action: onToggle) {
+                    TodoRing(tone: label.tone, done: done)
+                        .frame(width: Theme.minTarget, height: Theme.minTarget)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.borderless)
+                .padding(.horizontal, -12)
+                .accessibilityLabel(done ? "Mark not done" : "Mark done")
+                .sensoryFeedback(.success, trigger: done) { old, new in new && !old }
+            } else {
+                TodoRing(tone: label.tone, done: done)
+            }
             VStack(alignment: .leading, spacing: 3) {
                 Text(InlineMarkdown.attributed(entry.text))
                     .font(.subheadline)
                     .foregroundStyle(Theme.text)
                     .strikethrough(done, color: Theme.secondary)
+                    .opacity(done ? 0.55 : 1)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if let text = label.text {
                     Text(text).font(.caption).foregroundStyle(subtitleColor(label.tone))
@@ -110,7 +125,8 @@ struct TodoRow: View {
         .padding(.vertical, 10)
         .frame(minHeight: Theme.minTarget)
         .contentShape(.rect)
-        .accessibilityElement(children: .combine)
+        .animation(.easeOut(duration: 0.25), value: done)
+        .accessibilityElement(children: onToggle == nil ? .combine : .contain)
         .accessibilityLabel([entry.text, label.text].compactMap { $0 }.joined(separator: ", "))
     }
 

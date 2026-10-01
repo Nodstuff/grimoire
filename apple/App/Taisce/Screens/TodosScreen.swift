@@ -10,6 +10,7 @@ struct TodosScreen: View {
     @State private var offline = false
     @State private var draft = ""
     @State private var hint: TodoParseHint?
+    @State private var taps = RingTaps()
 
     var body: some View {
         TodosContent(
@@ -20,6 +21,8 @@ struct TodosScreen: View {
             draft: $draft,
             hint: hint,
             onDone: { e in Task { await model.markDone(e) } },
+            checked: taps.checked,
+            onToggleDone: { e in taps.tap(e) { await model.markDone($0) } },
             onSnooze: { e, s in Task { await model.snooze(e, s) } },
             onAdd: {
                 let text = draft
@@ -58,6 +61,9 @@ struct TodosContent: View {
     var hint: TodoParseHint?
     var now: Date = .now
     var onDone: (TodoEntry) -> Void = { _ in }
+    /// rows checked by a ring tap, fading out
+    var checked: Set<String> = []
+    var onToggleDone: ((TodoEntry) -> Void)?
     var onSnooze: (TodoEntry, Snooze) -> Void = { _, _ in }
     var onAdd: () -> Void = {}
 
@@ -121,7 +127,7 @@ struct TodosContent: View {
         if !items.isEmpty {
             Section {
                 ForEach(items) { entry in
-                    TodoRow(entry: entry, now: now)
+                    TodoRow(entry: entry, now: now, done: checked.contains(entry.id), onToggle: onToggleDone.map { f in { f(entry) } })
                         .listRowInsets(EdgeInsets())
                         .listRowBackground(Theme.surface)
                         .swipeActions(edge: .leading, allowsFullSwipe: true) {
