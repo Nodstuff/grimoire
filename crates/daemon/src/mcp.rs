@@ -48,8 +48,7 @@ use uuid::Uuid;
 /// principal so one agent's retry can never replay another's outcome.
 /// Values carry an insertion sequence so eviction drops the OLDEST half
 /// instead of clearing — a retry storm never wipes an in-window entry.
-/// The propose paths (MCP edit/append/propose/propose_markdown, HTTP
-/// `request_id`) also go through `durable_get`/`durable_put`, which back it
+/// Every write path (the MCP write tools, HTTP `request_id`) also goes through `durable_get`/`durable_put`, which back it
 /// with the store's `idempotency` table so a retry survives a restart.
 pub type DedupeCache = Arc<Mutex<std::collections::HashMap<(Uuid, Uuid), (u64, Instant, Value)>>>;
 
@@ -1726,6 +1725,9 @@ impl KsMcp {
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, move |store| {
+            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, verbose);
+            }
             // one lock for the whole find-or-create: two sessions racing on
             // the same daily title cannot both create
             let existing = match store.list_docs() {
@@ -1762,7 +1764,7 @@ impl KsMcp {
             match store.create_doc_with_ops(&title, parent, principal, ops) {
                 Ok((d, _)) => {
                     let (text, full) = render(&d, false);
-                    dedupe_put(&dedupe, principal, key, stored(&text, &full));
+                    durable_put(store, &dedupe, principal, key, stored(&text, &full), DEDUPE_TTL);
                     if verbose { ok_json(&full) } else { ok_text(text) }
                 }
                 Err(e) => err(e.to_string()),
@@ -1796,9 +1798,12 @@ impl KsMcp {
         let hot = self.hot.clone();
         let dedupe = self.dedupe.clone();
         with_store(&self.store, move |store| {
+            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, verbose);
+            }
             let is_hot = |d: Uuid| hot.is_hot(d);
             let before = store.get_doc(doc_id).map(|d| d.current_epoch).unwrap_or(0);
-            let single = |ops_kind: &str, res: Result<ProposeOutcome, String>| match res {
+            let single = |store: &mut SqliteStore, ops_kind: &str, res: Result<ProposeOutcome, String>| match res {
                 Ok(out) => {
                     // doc ops are one ledger row; label it by the op name
                     let fake = vec![OpInput {
@@ -1818,7 +1823,8 @@ impl KsMcp {
                         source_refs: vec![],
                     }];
                     let text = render_outcome(&fake, &out, before);
-                    dedupe_put(&dedupe, principal, key, stored(&text, &serde_json::to_value(&out).unwrap_or_default()));
+                    let v = stored(&text, &serde_json::to_value(&out).unwrap_or_default());
+                    durable_put(store, &dedupe, principal, key, v, DEDUPE_TTL);
                     if verbose { ok_json(&out) } else { ok_text(text) }
                 }
                 Err(m) => err(m),
@@ -1828,7 +1834,8 @@ impl KsMcp {
                     let Some(title) = p.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
                         return err("rename needs title".into());
                     };
-                    single("rename", crate::docops::rename(store, doc_id, title, principal))
+                    let res = crate::docops::rename(store, doc_id, title, principal);
+                    single(store, "rename", res)
                 }
                 "move" => {
                     let new_parent = match parse_opt_uuid(p.new_parent_id.as_deref(), "new_parent_id") {
@@ -1839,16 +1846,21 @@ impl KsMcp {
                         Ok(u) => u,
                         Err(m) => return err(m),
                     };
-                    single("move", crate::docops::move_doc(store, doc_id, new_parent, after, principal))
+                    let res = crate::docops::move_doc(store, doc_id, new_parent, after, principal);
+                    single(store, "move", res)
                 }
                 "status" => {
                     let status = match crate::docops::parse_status(p.status.as_deref()) {
                         Ok(s) => s,
                         Err(m) => return err(m),
                     };
-                    single("status", crate::docops::set_status(store, doc_id, status, principal))
+                    let res = crate::docops::set_status(store, doc_id, status, principal);
+                    single(store, "status", res)
                 }
-                "delete" => single("delete", crate::docops::delete(store, &is_hot, doc_id, principal)),
+                "delete" => {
+                    let res = crate::docops::delete(store, &is_hot, doc_id, principal);
+                    single(store, "delete", res)
+                }
                 _ => {
                     let into = match p.into_doc_id.as_deref().map(|s| parse_uuid(s, "into_doc_id")) {
                         Some(Ok(u)) => u,
@@ -1862,7 +1874,7 @@ impl KsMcp {
                                 "ok · merge · {appended} appended (yellow, flagged) · delete parked red — {}",
                                 out["note"].as_str().unwrap_or("")
                             );
-                            dedupe_put(&dedupe, principal, key, stored(&text, &out));
+                            durable_put(store, &dedupe, principal, key, stored(&text, &out), DEDUPE_TTL);
                             if verbose { ok_json(&out) } else { ok_text(text) }
                         }
                         Err(m) => err(m),
@@ -1885,6 +1897,9 @@ impl KsMcp {
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, move |store| {
+            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, verbose);
+            }
             let target = match resolve_block(store, &p.block_id) {
                 Ok(b) => b,
                 Err(m) => return err(m),
@@ -1897,7 +1912,7 @@ impl KsMcp {
             match store.add_comment(target.id, principal, &p.text, reply_to) {
                 Ok(c) => {
                     let text = format!("ok · comment {} on {} · epoch {}", short_ref(c.id), short_ref(target.id), c.epoch);
-                    dedupe_put(&dedupe, principal, key, stored(&text, &json!(c)));
+                    durable_put(store, &dedupe, principal, key, stored(&text, &json!(c)), DEDUPE_TTL);
                     if verbose { ok_json(&c) } else { ok_text(text) }
                 }
                 Err(e) => err(e.to_string()),
@@ -2940,6 +2955,30 @@ mod tests {
         let s = SqliteStore::open(&db).unwrap();
         assert_eq!(s.get_doc(doc).unwrap().current_epoch, e0 + 1, "applied once");
         assert_eq!(grimoire_store::export::export_doc(&s, doc).unwrap().matches("once").count(), 1);
+        // create_doc, doc_op and add_comment replay across a restart too
+        let (is_err, c1) = raw(boot().create_doc_impl(NONE, p(json!({"title": "From the phone"}))).await.unwrap());
+        assert!(!is_err, "{c1}");
+        let (_, c2) = raw(boot().create_doc_impl(NONE, p(json!({"title": "From the phone"}))).await.unwrap());
+        assert_eq!(c1, c2, "a replay, not 'already exists'");
+        let s = SqliteStore::open(&db).unwrap();
+        assert_eq!(s.list_docs().unwrap().iter().filter(|d| d.title == "From the phone").count(), 1, "created once");
+        let block_id = s.read_doc(doc).unwrap().roots[0].block.id;
+        let block = block_id.to_string();
+        drop(s);
+        let rename = json!({"doc_id": doc.to_string(), "op": "rename", "title": "renamed once"});
+        let (is_err, r1) = raw(boot().doc_op_impl(NONE, p(rename.clone())).await.unwrap());
+        assert!(!is_err, "{r1}");
+        let (_, r2) = raw(boot().doc_op_impl(NONE, p(rename)).await.unwrap());
+        assert_eq!(r1, r2);
+        let comment = json!({"block_id": block, "text": "once"});
+        let (is_err, m1) = raw(boot().add_comment_impl(NONE, p(comment.clone())).await.unwrap());
+        assert!(!is_err, "{m1}");
+        let (_, m2) = raw(boot().add_comment_impl(NONE, p(comment)).await.unwrap());
+        assert_eq!(m1, m2);
+        let s = SqliteStore::open(&db).unwrap();
+        let renames = s.ops_for_doc_limited(doc, 50).unwrap().into_iter().filter(|o| matches!(o.kind, OpKind::RenameDoc { .. })).count();
+        assert_eq!(renames, 1, "renamed once");
+        assert_eq!(s.list_comments(block_id).unwrap().len(), 1, "commented once");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
