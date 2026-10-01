@@ -417,3 +417,55 @@ CREATE TABLE IF NOT EXISTS block_vec (
     dim      INTEGER NOT NULL,
     vec      BLOB NOT NULL
 );
+
+-- Change journal: the sync cursor for offline clients (GET /api/changes,
+-- /api/changes/stream). One row per observable doc change, written by the
+-- triggers below so every write path (UI, MCP, gardeners, import, federation
+-- pull) lands here without opting in. `seq` is the cursor — the one integer
+-- id in the schema, deliberately: it is local to this database and never
+-- federated. Rows are not coalesced; a client refetches the doc either way.
+CREATE TABLE IF NOT EXISTS changes (
+    seq    INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id TEXT NOT NULL,
+    -- doc: content/title/status/tags/review state; tree: created, moved,
+    -- reordered; deleted: tombstoned (or purged); restored: out of the Trash
+    kind   TEXT NOT NULL CHECK (kind IN ('doc', 'tree', 'deleted', 'restored')),
+    epoch  INTEGER,
+    at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TRIGGER IF NOT EXISTS changes_docs_ai AFTER INSERT ON docs BEGIN
+    INSERT INTO changes (doc_id, kind, epoch) VALUES (new.id, 'tree', new.current_epoch);
+END;
+-- content edits all bump current_epoch (one epoch = one transaction), so the
+-- epoch column, not ops, is the content signal: one row per commit, and
+-- mirror refreshes (which write blocks without ops) are caught too
+CREATE TRIGGER IF NOT EXISTS changes_docs_au AFTER UPDATE ON docs BEGIN
+    INSERT INTO changes (doc_id, kind, epoch)
+        SELECT new.id, 'deleted', new.current_epoch WHERE old.deleted = 0 AND new.deleted <> 0;
+    INSERT INTO changes (doc_id, kind, epoch)
+        SELECT new.id, 'restored', new.current_epoch WHERE old.deleted <> 0 AND new.deleted = 0;
+    INSERT INTO changes (doc_id, kind, epoch)
+        SELECT new.id, 'tree', new.current_epoch
+        WHERE old.deleted = 0 AND new.deleted = 0
+          AND (old.parent_id IS NOT new.parent_id OR old.sort_key IS NOT new.sort_key);
+    INSERT INTO changes (doc_id, kind, epoch)
+        SELECT new.id, 'doc', new.current_epoch
+        WHERE old.deleted = 0 AND new.deleted = 0
+          AND (old.current_epoch <> new.current_epoch OR old.title <> new.title
+               OR old.status IS NOT new.status);
+END;
+CREATE TRIGGER IF NOT EXISTS changes_docs_ad AFTER DELETE ON docs BEGIN
+    INSERT INTO changes (doc_id, kind, epoch) VALUES (old.id, 'deleted', old.current_epoch);
+END;
+-- review state (a yellow flagged or accepted, a red parked or resolved)
+-- changes what a client shows without moving the epoch
+CREATE TRIGGER IF NOT EXISTS changes_annotations_ai AFTER INSERT ON annotations BEGIN
+    INSERT INTO changes (doc_id, kind, epoch)
+        SELECT id, 'doc', current_epoch FROM docs WHERE id = new.doc_id AND deleted = 0;
+END;
+CREATE TRIGGER IF NOT EXISTS changes_annotations_au AFTER UPDATE OF status ON annotations
+WHEN old.status IS NOT new.status BEGIN
+    INSERT INTO changes (doc_id, kind, epoch)
+        SELECT id, 'doc', current_epoch FROM docs WHERE id = new.doc_id AND deleted = 0;
+END;

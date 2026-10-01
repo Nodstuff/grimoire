@@ -1014,3 +1014,22 @@ pub struct DocTransfer {
     pub state: String,
     pub at: String,
 }
+
+/// One row of the change journal (`changes` table): something about
+/// `doc_id` moved at `seq`. `kind` is `doc`, `tree`, `deleted` or `restored`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Change {
+    pub seq: i64,
+    pub doc_id: String,
+    pub kind: String,
+    pub epoch: Option<i64>,
+    pub at: String,
+}
+
+/// A page of [`Change`]s after a cursor; `seq` is the journal's head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangePage {
+    pub seq: i64,
+    pub changes: Vec<Change>,
+    pub more: bool,
+}
