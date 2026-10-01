@@ -168,9 +168,11 @@ final class NotificationCoordinator: DueAlertPermission {
                 try await cache.enqueueToggle(date: day, itemID: itemID, done: true)
                 overrides[id] = .done
             case .snooze:
-                let due = Self.due(at: now().addingTimeInterval(3600), in: tz)
-                try await cache.enqueueDeadline(date: day, itemID: itemID, deadline: due)
-                if let at = due.alertDate(in: tz) { overrides[id] = .snoozed(at) }
+                // to the minute (what the server stores), from the instant:
+                // a wall time is ambiguous in the repeated October hour
+                let at = Date(timeIntervalSince1970: (now().timeIntervalSince1970 / 60).rounded(.down) * 60 + 3600)
+                try await cache.enqueueDeadline(date: day, itemID: itemID, deadline: Self.due(at: at, in: tz))
+                overrides[id] = .snoozed(at)
             case .tomorrow:
                 var cal = Calendar(identifier: .gregorian)
                 cal.timeZone = tz
@@ -178,8 +180,9 @@ final class NotificationCoordinator: DueAlertPermission {
                 var due = Due.today(now: tomorrow, in: tz)
                 due.hour = DueAlertPlanner.allDayHour
                 due.minute = 0
+                guard let at = DueAlertInput.instant(wallTime: due, in: tz) else { return }
                 try await cache.enqueueDeadline(date: day, itemID: itemID, deadline: due)
-                if let at = due.alertDate(in: tz) { overrides[id] = .snoozed(at) }
+                overrides[id] = .snoozed(at)
             }
         } catch {
             return
@@ -190,8 +193,7 @@ final class NotificationCoordinator: DueAlertPermission {
         await reconcile(with: lastInputs)
     }
 
-    /// `instant` as a timed deadline in `tz`, to the minute (what the
-    /// server stores), so the snooze override matches the synced item.
+    /// `instant` as a timed deadline (wall time) in `tz`, for the wire.
     static func due(at instant: Date, in tz: TimeZone) -> Due {
         let c = Calendar(identifier: .gregorian).dateComponents(in: tz, from: instant)
         return Due(year: c.year ?? 1970, month: c.month ?? 1, day: c.day ?? 1, hour: c.hour ?? 0, minute: c.minute ?? 0)

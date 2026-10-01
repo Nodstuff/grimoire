@@ -46,7 +46,7 @@ public struct DueAlertInput: Sendable, Hashable, Identifiable {
             kind = .timed(instant)
         } else if let deadline, let due = Due(dueTime.map { "\(deadline) \($0)" } ?? deadline) {
             if due.hasTime {
-                guard let instant = due.alertDate(in: timeZone) else { return nil }
+                guard let instant = Self.instant(wallTime: due, in: timeZone) else { return nil }
                 kind = .timed(instant)
             } else {
                 kind = .allDay(DateComponents(year: due.year, month: due.month, day: due.day))
@@ -92,6 +92,20 @@ public struct DueAlertInput: Sendable, Hashable, Identifiable {
             h = h &* 0x0100_0193
         }
         return "\(position)-" + String(format: "%08x", h)
+    }
+
+    /// A local wall time as an instant. In a DST overlap (the hour that
+    /// happens twice) the first occurrence wins; in a gap the time moves
+    /// forward by the gap. (`Due.alertDate` picks the later occurrence.)
+    public static func instant(wallTime due: Due, in timeZone: TimeZone) -> Date? {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        guard let midnight = cal.date(from: DateComponents(year: due.year, month: due.month, day: due.day)) else { return nil }
+        return cal.nextDate(
+            after: midnight.addingTimeInterval(-1),
+            matching: DateComponents(hour: due.hour ?? Due.defaultAlertHour, minute: due.minute ?? 0, second: 0),
+            matchingPolicy: .nextTimePreservingSmallerComponents, repeatedTimePolicy: .first, direction: .forward
+        )
     }
 
     static func parseInstant(_ s: String) -> Date? {

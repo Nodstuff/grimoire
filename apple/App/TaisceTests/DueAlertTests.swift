@@ -32,7 +32,7 @@ final class FakeDueAlertCenter: DueAlertCenter {
     }
 }
 
-@MainActor @Suite(.serialized) struct DueAlertTests {
+@MainActor @Suite(.serialized, .timeLimit(.minutes(1))) struct DueAlertTests {
     let dublin = TimeZone(identifier: "Europe/Dublin")!
     let now = Date(timeIntervalSince1970: 1_790_000_000)  // 2026-09-21T14:13:20Z
 
@@ -114,6 +114,22 @@ final class FakeDueAlertCenter: DueAlertCenter {
         bSynced.kind = try #require(DueAlertInput(day: "2026-09-21", itemID: "b", title: "t", docTitle: "To-do", deadline: "2026-09-22", dueTime: "09:00", timeZone: dublin)).kind
         await c.reconcile(with: [a, bSynced])
         #expect(c.overrides.isEmpty)
+    }
+
+    /// Snoozing at 01:10 IST on 2026-10-25 (00:10Z): an hour later is
+    /// 01:10 GMT (01:10Z), the second 01:10 of the night.
+    @Test func snoozeInTheRepeatedHourKeepsTheInstant() async throws {
+        let center = FakeDueAlertCenter()
+        let tz = dublin
+        let start = Date(timeIntervalSince1970: 1_792_887_000)  // 2026-10-25T00:10:00Z
+        let c = NotificationCoordinator(center: center, now: { start }, timeZone: { tz })
+        c.connect(cache: try Cache.inMemory(), api: nil, sync: nil)
+        let item = DueAlertInput(day: "2026-10-24", itemID: "a", title: "t", docTitle: "To-do", kind: .timed(start.addingTimeInterval(600)))
+        await c.reconcile(with: [item])
+        await center.onAction?(.snooze, "2026-10-24", "a")
+        #expect(c.overrides["2026-10-24/a"] == .snoozed(start.addingTimeInterval(3600)))
+        #expect(center.pendingByID["todo:2026-10-24/a"]?.fireDate == start.addingTimeInterval(3600))
+        #expect(center.pendingByID["todo:2026-10-24/a"]?.body == "Due 01:10 · To-do")
     }
 
     @Test func requestsRoundTripThroughTheSystemShape() throws {
