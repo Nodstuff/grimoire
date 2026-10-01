@@ -20,7 +20,9 @@
 //!   day). Typed as any trailing `due <when>` / `by <when>` phrase — `due fri`,
 //!   `by 12/9` (DAY/MONTH), `due 12 sep`, `due in 3 days`, `due next mon` — see
 //!   `due.rs` for the grammar; the daemon resolves it against its local date
-//!   and stores the ISO form. The pre-0.8 `⏰ YYYY-MM-DD` token is still read
+//!   and stores the ISO form. A time may follow (`due fri 3pm`, `by tomorrow
+//!   09:30`) and is stored as ` · due YYYY-MM-DD HH:MM` (24h, local); a
+//!   date-only deadline alerts at `due::DEFAULT_ALERT_TIME`. The pre-0.8 `⏰ YYYY-MM-DD` token is still read
 //!   and rewritten to the new form the next time its day is written.
 //! - `(carried from YYYY-MM-DD)` at the end names the day the item was first
 //!   scheduled; carry-forward keeps the original stamp.
@@ -55,7 +57,10 @@
 //!
 //! Routes (all human-principal):
 //! - `GET  /api/todo?date=YYYY-MM-DD` → `{doc_id, date, today, items:[{id, text,
-//!   done, carried?, carried_from?, deadline?, note?, overdue, due_soon}],
+//!   done, carried?, carried_from?, deadline?, due_time?, alert_at?, note?,
+//!   overdue, due_soon}], ...}` — `deadline` is the DATE (`YYYY-MM-DD`),
+//!   `due_time` its `HH:MM` when one was given, `alert_at` the local
+//!   `YYYY-MM-DDTHH:MM` to remind at (the time, else 09:00); `{
 //!   carried, prev_date, epoch}`
 //! - `POST /api/todo {date, text}` add; a trailing `due <when>` / `by <when>`
 //!   phrase becomes the deadline. One that looks like a date but does not
@@ -64,11 +69,13 @@
 //! - `POST /api/todo/toggle {date, item_id | text, done}`
 //! - `POST /api/todo/edit {date, item_id, text}` (same phrase handling; a text
 //!   without a phrase keeps the item's deadline)
-//! - `GET  /api/todo/parse?text=…` → `{text, deadline | null, warning?}` — the
+//! - `GET  /api/todo/parse?text=…` → `{text, deadline | null, due_time | null,
+//!   alert_at | null, warning?}` — the
 //!   UI's live hint, so the rules live here only
 //! - `POST /api/todo/remove {date, item_id}`
 //! - `POST /api/todo/move {date, item_id, to_date}` (heading created in date order)
-//! - `POST /api/todo/deadline {date, item_id, deadline | null}`
+//! - `POST /api/todo/deadline {date, item_id, deadline | null}` (`YYYY-MM-DD`
+//!   or `YYYY-MM-DD HH:MM`; a date alone drops any time)
 //! - `POST /api/todo/note {date, item_id, note}` (empty clears)
 
 use crate::api::ApiState;
@@ -96,6 +103,7 @@ pub struct ItemRec {
     /// ' ' open, 'x' done, '>' moved forward
     pub mark: char,
     pub text: String,
+    /// `YYYY-MM-DD` or `YYYY-MM-DD HH:MM`, as stored after ` · due `
     pub deadline: Option<String>,
     pub carried_from: Option<String>,
     /// note lines, de-indented, joined by '\n'
@@ -129,8 +137,15 @@ pub struct Item {
     pub carried: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub carried_from: Option<String>,
+    /// the deadline's date, `YYYY-MM-DD`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline: Option<String>,
+    /// the deadline's time, `HH:MM`, when it has one
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_time: Option<String>,
+    /// local `YYYY-MM-DDTHH:MM` to remind at (time, else the default)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alert_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     pub overdue: bool,
@@ -234,7 +249,7 @@ fn split_tokens(raw: &str, today: NaiveDate) -> Tokens {
     let mut warning = None;
     let parsed = crate::due::split_due(&t, today);
     let text = if deadline.is_none() {
-        deadline = parsed.deadline.map(|d| d.to_string());
+        deadline = parsed.deadline.map(|d| crate::due::format_deadline(d, parsed.time));
         warning = parsed.warning;
         parsed.text
     } else {
@@ -442,14 +457,13 @@ fn days(chunks: &[Chunk]) -> Vec<&str> {
 
 fn to_item(index: usize, it: &ItemRec, today: &str) -> Item {
     let open = it.mark == ' ';
-    let (overdue, due_soon) = match (&it.deadline, parse_date(today)) {
-        (Some(d), Some(t)) if open => match parse_date(d) {
-            Some(dl) => {
-                let diff = (dl - t).num_days();
-                (diff < 0, (0..=DUE_SOON_DAYS).contains(&diff))
-            }
-            None => (false, false),
-        },
+    let due = it.deadline.as_deref().and_then(crate::due::parse_deadline);
+    let (overdue, due_soon) = match (due, parse_date(today)) {
+        // day granularity: a deadline later today is not overdue yet
+        (Some((dl, _)), Some(t)) if open => {
+            let diff = (dl - t).num_days();
+            (diff < 0, (0..=DUE_SOON_DAYS).contains(&diff))
+        }
         _ => (false, false),
     };
     Item {
@@ -458,7 +472,9 @@ fn to_item(index: usize, it: &ItemRec, today: &str) -> Item {
         done: it.mark == 'x',
         carried: it.mark == '>',
         carried_from: it.carried_from.clone(),
-        deadline: it.deadline.clone(),
+        deadline: due.map(|(d, _)| d.to_string()),
+        due_time: due.and_then(|(_, t)| t).map(|t| t.format(crate::due::TIME_FMT).to_string()),
+        alert_at: due.map(|(d, t)| crate::due::alert_at(d, t)),
         note: it.note.clone(),
         overdue,
         due_soon,
@@ -585,12 +601,14 @@ pub fn edit_item(md: &str, date: &str, today: &str, id: &str, text: &str) -> Res
 }
 
 pub fn set_deadline(md: &str, date: &str, today: &str, id: &str, deadline: Option<&str>) -> Result<String, String> {
-    if let Some(d) = deadline
-        && !is_date(d)
-    {
-        return Err(format!("deadline must be YYYY-MM-DD, got {d:?}"));
-    }
-    with_item(md, date, today, Some(id), None, |it| it.deadline = deadline.map(str::to_string))
+    let deadline = match deadline {
+        Some(d) => match crate::due::parse_deadline(d) {
+            Some((d, t)) => Some(crate::due::format_deadline(d, t)),
+            None => return Err(format!("deadline must be YYYY-MM-DD or YYYY-MM-DD HH:MM, got {d:?}")),
+        },
+        None => None,
+    };
+    with_item(md, date, today, Some(id), None, |it| it.deadline = deadline)
 }
 
 pub fn set_note(md: &str, date: &str, today: &str, id: &str, note: &str) -> Result<String, String> {
@@ -836,7 +854,13 @@ struct ParseQuery {
 /// The UI's live hint while typing: what the daemon would make of `text`.
 async fn parse(Query(q): Query<ParseQuery>) -> Json<Value> {
     let tk = split_tokens(q.text.lines().next().unwrap_or(""), today_date(&local_today()));
-    let mut v = json!({"text": tk.text, "deadline": tk.deadline});
+    let due = tk.deadline.as_deref().and_then(crate::due::parse_deadline);
+    let mut v = json!({
+        "text": tk.text,
+        "deadline": due.map(|(d, _)| d.to_string()),
+        "due_time": due.and_then(|(_, t)| t).map(|t| t.format(crate::due::TIME_FMT).to_string()),
+        "alert_at": due.map(|(d, t)| crate::due::alert_at(d, t)),
+    });
     if let Some(w) = tk.warning {
         v["warning"] = json!(w);
     }
@@ -1256,6 +1280,16 @@ mod tests {
         let p = call(&app, "GET", "/api/todo/parse?text=read%20the%20due%20diligence%20doc", None).await;
         assert_eq!(p["text"], "read the due diligence doc");
         assert!(p["deadline"].is_null() && p.get("warning").is_none());
+        assert!(p["due_time"].is_null() && p["alert_at"].is_null());
+        // a time rides along: the date stays in `deadline`, the time beside it
+        let p = call(&app, "GET", "/api/todo/parse?text=pay%20rent%20by%20tomorrow%2009%3A30", None).await;
+        assert_eq!(p["text"], "pay rent");
+        assert_eq!(p["deadline"], tomorrow);
+        assert_eq!(p["due_time"], "09:30");
+        assert_eq!(p["alert_at"], format!("{tomorrow}T09:30"));
+        let p = call(&app, "GET", "/api/todo/parse?text=pay%20rent%20by%20tomorrow", None).await;
+        assert!(p["due_time"].is_null());
+        assert_eq!(p["alert_at"], format!("{tomorrow}T{}", crate::due::DEFAULT_ALERT_TIME));
         // exactly one root To-do doc, created by the human, every write human
         let docs = call(&app, "GET", "/api/docs", None).await;
         let docs = docs.as_array().unwrap();
@@ -1271,5 +1305,49 @@ mod tests {
         assert!(e["error"].is_string());
         let e = call(&app, "POST", "/api/todo", Some(json!({"date": today, "text": "  "}))).await;
         assert!(e["error"].is_string());
+    }
+
+    #[test]
+    fn deadlines_carry_an_optional_time() {
+        let md = add("", T, "call the bank due fri 3pm").unwrap();
+        assert_eq!(md, "## 2026-09-10\n\n- [ ] call the bank · due 2026-09-11 15:00\n");
+        let items = parse_day(&md, T, T);
+        assert_eq!(items[0].text, "call the bank");
+        assert_eq!(items[0].deadline.as_deref(), Some("2026-09-11"), "deadline stays the date");
+        assert_eq!(items[0].due_time.as_deref(), Some("15:00"));
+        assert_eq!(items[0].alert_at.as_deref(), Some("2026-09-11T15:00"));
+        assert!(items[0].due_soon && !items[0].overdue);
+        // date-only: no time in the text, alert at the default
+        let md = add(&md, T, "ship it by 12/10").unwrap();
+        assert!(md.contains("- [ ] ship it · due 2026-10-12\n"), "{md}");
+        let items = parse_day(&md, T, T);
+        assert!(items[1].due_time.is_none());
+        assert_eq!(items[1].alert_at.as_deref(), Some("2026-10-12T09:00"));
+        // the stored form re-reads identically and survives a rewrite of the day
+        let md = toggle_item(&md, T, T, Some(&items[0].id), None, true).unwrap();
+        assert!(md.contains("- [x] call the bank · due 2026-09-11 15:00\n"), "{md}");
+        // an edit without a phrase keeps date AND time; one with a phrase replaces both
+        let (md, _) = edit_item(&md, T, T, &items[0].id, "call the bank about fees").unwrap();
+        assert!(md.contains("- [x] call the bank about fees · due 2026-09-11 15:00\n"), "{md}");
+        let id = parse_day(&md, T, T)[0].id.clone();
+        let (md, _) = edit_item(&md, T, T, &id, "call the bank about fees by 12/10 17:00").unwrap();
+        assert!(md.contains("· due 2026-10-12 17:00\n"), "{md}");
+        // set_deadline takes either form; a date alone drops the time
+        let id = parse_day(&md, T, T)[0].id.clone();
+        let md = set_deadline(&md, T, T, &id, Some("2026-09-20 08:15")).unwrap();
+        assert!(md.contains("· due 2026-09-20 08:15\n"), "{md}");
+        let md = set_deadline(&md, T, T, &id, Some("2026-09-20T10:00")).unwrap();
+        assert!(md.contains("· due 2026-09-20 10:00\n"), "a T separator is normalised: {md}");
+        let md = set_deadline(&md, T, T, &id, Some("2026-09-21")).unwrap();
+        assert!(md.contains("· due 2026-09-21\n"), "{md}");
+        assert!(set_deadline(&md, T, T, &id, Some("2026-09-21 25:00")).is_err());
+        // an agent's raw line is read with the time resolved, left as typed
+        let raw = "## 2026-09-10\n\n- [ ] standup due tomorrow 9:45\n";
+        let items = parse_day(raw, T, T);
+        assert_eq!((items[0].text.as_str(), items[0].due_time.as_deref()), ("standup", Some("09:45")));
+        // the legacy clock token stays date-only
+        let items = parse_day("## 2026-09-10\n\n- [ ] old ⏰ 2026-09-12\n", T, T);
+        assert_eq!(items[0].deadline.as_deref(), Some("2026-09-12"));
+        assert!(items[0].due_time.is_none());
     }
 }
