@@ -295,7 +295,7 @@ import UIKit
         h.type("b0", "c", at: 2)
         await h.model.flush()
         #expect(h.model.persistFailures == 1)
-        #expect(h.model.chip.text == "Couldn't save on this device")
+        #expect(h.model.chip.text == "Couldn't save · Retry")
         #expect(h.markdown == ["abc"], "still there")
         h.model.persist = real
         await h.model.flush()

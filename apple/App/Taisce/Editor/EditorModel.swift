@@ -496,7 +496,9 @@ final class EditorModel {
         await poll()
     }
 
+    /// The chip's Retry: outbox writes that failed here, and saves the server refused.
     func retryFailed() async {
+        if !abandoned.isEmpty { await flush() }
         try? await cache.retryFailed(docID: docID)
         await app?.replayOutbox()
         await poll()
