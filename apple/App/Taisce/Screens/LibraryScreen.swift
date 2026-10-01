@@ -21,7 +21,8 @@ struct LibraryContent: View {
     let loaded: Bool
     var pins: Set<DocID> = []
     var onTogglePin: (DocID) -> Void = { _ in }
-    /// top-level folders start open, so the tree reads as a tree
+    /// folders start closed; the ones you open are remembered across launches
+    @AppStorage("library.expanded") private var expandedStore = ""
     @State private var expanded: Set<DocID>?
 
     var body: some View {
@@ -55,8 +56,11 @@ struct LibraryContent: View {
         .tint(Theme.accent)
         .groundBackground()
         .toolbarVisibility(.hidden, for: .navigationBar)
-        .onChange(of: nodes.map(\.id), initial: true) { _, roots in
-            if expanded == nil, !roots.isEmpty { expanded = Set(nodes.filter(\.isFolder).map(\.id)) }
+        .onAppear {
+            if expanded == nil { expanded = Set(expandedStore.split(separator: ",").map(String.init)) }
+        }
+        .onChange(of: expanded) { _, now in
+            expandedStore = (now ?? []).sorted().joined(separator: ",")
         }
     }
 }
