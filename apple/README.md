@@ -157,9 +157,35 @@ on the server's page. To enrol a passkey first, use an enrolment link from
 `grimoire auth` on the server. To use a local daemon instead, set the server
 URL to `http://127.0.0.1:7425` in Settings.
 
-ATS: HTTPS everywhere, except a `localhost` exception plus
-`NSAllowsLocalNetworking` (needed for `127.0.0.1`, since exception domains
-can't name IP addresses).
+HTTPS only, end to end. Release builds carry no ATS exceptions and refuse a
+non-`https` server URL (`ServerURLPolicy`; a stored one falls back to the
+default). Debug builds alone use `App/Support/Info-Debug.plist` (the
+generated `Taisce/Info.plist` plus a `localhost` exception and
+`NSAllowsLocalNetworking`, needed for `127.0.0.1` since exception domains
+can't name IP addresses) and accept `http://` to a loopback daemon. Keep the
+two plists in step when `project.yml`'s `info` changes. The GRDB cache, its
+WAL and SHM files and their directory are `completeUntilFirstUserAuthentication`.
+Nothing logs tokens or doc content (no `Logger`/`os_log` in the app or kit).
+
+## Due alerts (local notifications, no APNs)
+
+`DueAlertPlanner` (TaisceKit, pure) turns open to-dos into the notifications
+that should be pending: timed items (`due_at` instant, or the older local
+`deadline` + `due_time`) fire at their instant, all-day ones at 09:00 local
+on their date (a floating calendar trigger, so it follows the device's time
+zone). Identifier `todo:<day>/<item id>`, title the to-do text, body
+`Due 15:00 · To-do` / `Due today · To-do`; done and past items are skipped,
+soonest first, capped at iOS's 64. `DueAlertInput` adapts `TodoItem`,
+`TodoDueList.Item`, cached `TodoRecord`s (server item id recomputed) and the
+UTC model's fields.
+
+`NotificationCoordinator` (app, conforms to `DueAlertPermission`) asks for
+alert + sound, registers category `TODO_DUE` (Done / Snooze 1 hour /
+Tomorrow 09:00), and reconciles pending requests against the plan (remove
+stale, add new or changed) on foreground, after syncs touching the To-do
+doc, and on a time zone change. Actions queue through the outbox
+(`enqueueToggle`, `enqueueDeadline`), so they work offline; the answer is
+held locally until a sync shows it, so the old alert doesn't come back.
 
 ## Editing (groundwork, no UI)
 

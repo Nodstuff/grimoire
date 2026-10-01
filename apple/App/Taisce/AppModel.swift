@@ -27,12 +27,14 @@ final class AppModel {
     private(set) var docs: [DocRecord] = []
     private(set) var tree: [DocTreeNode] = []
     var lastError: String?
+    let dueAlerts = NotificationCoordinator()
 
     private var observeTask: Task<Void, Never>?
     private var authTask: Task<Void, Never>?
 
     init() {
-        serverURL = UserDefaults.standard.string(forKey: Self.serverURLKey) ?? Self.defaultServerURL
+        let stored = UserDefaults.standard.string(forKey: Self.serverURLKey)
+        serverURL = stored.flatMap { ServerURLPolicy.accepts($0) ? $0 : nil } ?? Self.defaultServerURL
     }
 
     var needsSignIn: Bool { authPhase == .signedOut }
@@ -45,7 +47,11 @@ final class AppModel {
 
     func setServerURL(_ s: String) async {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed != serverURL, URL(string: trimmed) != nil else { return }
+        guard trimmed != serverURL else { return }
+        if case .failure(let rejection) = ServerURLPolicy.check(trimmed) {
+            lastError = rejection.message
+            return
+        }
         await stopSync()
         serverURL = trimmed
         UserDefaults.standard.set(trimmed, forKey: Self.serverURLKey)
@@ -56,6 +62,7 @@ final class AppModel {
     func startSync() async {
         guard authPhase != .signedOut else { return }
         await sync?.start()
+        await dueAlerts.reconcile()
     }
 
     func stopSync() async { await sync?.stop() }
@@ -143,6 +150,7 @@ final class AppModel {
             self.cache = cache
             self.api = api
             sync = SyncEngine(api: api, cache: cache)
+            dueAlerts.connect(cache: cache, api: api, sync: sync)
             observeTask = Task { [weak self] in
                 do {
                     for try await docs in cache.observeTree() {
