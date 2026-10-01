@@ -6,6 +6,30 @@ enum DueAlertStatus: Hashable, Sendable {
     case notDetermined, allowed, denied
 }
 
+/// What the UI shows for each permission state: the To-dos card only
+/// before the user has been asked; Settings always has a row.
+enum DueAlertPrompt: Hashable, Sendable {
+    case on, turnOn, openSettings
+
+    init(_ status: DueAlertStatus) {
+        self = switch status {
+        case .allowed: .on
+        case .notDetermined: .turnOn
+        case .denied: .openSettings
+        }
+    }
+
+    var showsTodosCard: Bool { self == .turnOn }
+
+    var settingsTitle: String {
+        switch self {
+        case .on: "Due reminders"
+        case .turnOn: "Turn on due reminders"
+        case .openSettings: "Allow notifications in Settings"
+        }
+    }
+}
+
 /// Whether due alerts may be shown, and asking for it. The UI only talks to
 /// this protocol; TaisceKit's NotificationCoordinator (on ios-client) slots
 /// in by conforming, replacing `SystemDueAlerts`.

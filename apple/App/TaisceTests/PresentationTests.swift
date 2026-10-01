@@ -318,3 +318,20 @@ private extension Optional {
         return self
     }
 }
+
+@MainActor @Suite struct DueAlertTests {
+    @Test func promptPerStatus() {
+        #expect(DueAlertPrompt(.notDetermined) == .turnOn && DueAlertPrompt(.notDetermined).showsTodosCard)
+        #expect(DueAlertPrompt(.allowed) == .on && !DueAlertPrompt(.allowed).showsTodosCard)
+        #expect(DueAlertPrompt(.denied) == .openSettings && !DueAlertPrompt(.denied).showsTodosCard)
+        #expect(DueAlertPrompt(.denied).settingsTitle == "Allow notifications in Settings")
+    }
+
+    @Test func askingFlipsTheStatusAndHidesTheCard() async {
+        let alerts: any DueAlertPermission = PreviewDueAlerts(.notDetermined)
+        #expect(DueAlertPrompt(alerts.status).showsTodosCard)
+        await alerts.requestAuthorization()
+        #expect(alerts.status == .allowed)
+        #expect(!DueAlertPrompt(alerts.status).showsTodosCard)
+    }
+}

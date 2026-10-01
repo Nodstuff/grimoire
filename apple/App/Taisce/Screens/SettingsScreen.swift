@@ -98,13 +98,14 @@ struct SettingsContent: View {
             .listRowBackground(Theme.surface)
 
             Section {
-                switch info.alerts {
-                case .allowed:
-                    LabeledContent("Due reminders", value: "On")
-                case .notDetermined:
-                    Button("Turn on due reminders", action: onEnableAlerts)
-                case .denied:
-                    Button("Allow notifications in Settings") {
+                let prompt = DueAlertPrompt(info.alerts)
+                switch prompt {
+                case .on:
+                    LabeledContent(prompt.settingsTitle, value: "On")
+                case .turnOn:
+                    Button(prompt.settingsTitle, action: onEnableAlerts)
+                case .openSettings:
+                    Button(prompt.settingsTitle) {
                         if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
                     }
                 }

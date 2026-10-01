@@ -72,7 +72,7 @@ struct TodosContent: View {
                 .listRowBackground(Color.clear)
                 .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 0))
             }
-            if alertStatus == .notDetermined {
+            if DueAlertPrompt(alertStatus).showsTodosCard {
                 Section {
                     PromptCard(icon: "bell", text: "Get a nudge when things are due", action: "Turn on", onAction: onEnableAlerts)
                         .listRowBackground(Color.clear)
