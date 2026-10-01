@@ -144,21 +144,29 @@ impl H {
 
     /// Enroll, register a DCR client and run the code flow to its redirect.
     async fn code_for(&mut self, client: &str) -> String {
+        self.code_for_at(client, REDIRECT).await
+    }
+
+    async fn code_for_at(&mut self, client: &str, redirect: &str) -> String {
         let q = format!(
-            "response_type=code&client_id={client}&redirect_uri={REDIRECT}&code_challenge={CHALLENGE}&code_challenge_method=S256&state=xyz&resource={BASE}/mcp"
+            "response_type=code&client_id={client}&redirect_uri={redirect}&code_challenge={CHALLENGE}&code_challenge_method=S256&state=xyz&resource={BASE}/mcp"
         );
         let (page, req) = self.authorize(&q).await;
         assert_eq!(page.status, StatusCode::OK, "{}", page.body);
-        let redirect = self.sign_in(&req.unwrap()).await;
-        let u = Url::parse(&redirect).unwrap();
+        let back = self.sign_in(&req.unwrap()).await;
+        let u = Url::parse(&back).unwrap();
         let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
         assert_eq!(q["state"], "xyz");
         assert_eq!(q["iss"], BASE);
-        assert!(redirect.starts_with(REDIRECT));
+        assert!(back.starts_with(redirect));
         q["code"].clone()
     }
 
     async fn exchange(&self, client: &str, code: &str, verifier: &str) -> Res {
+        self.exchange_at(client, code, verifier, REDIRECT).await
+    }
+
+    async fn exchange_at(&self, client: &str, code: &str, verifier: &str, redirect: &str) -> Res {
         send(
             &self.app,
             post_form(
@@ -166,7 +174,7 @@ impl H {
                 &[
                     ("grant_type", "authorization_code"),
                     ("code", code),
-                    ("redirect_uri", REDIRECT),
+                    ("redirect_uri", redirect),
                     ("client_id", client),
                     ("code_verifier", verifier),
                     ("resource", &format!("{BASE}/mcp")),
@@ -418,6 +426,117 @@ async fn the_connector_writes_as_its_own_principal() {
     let names: Vec<String> =
         h.st.store.lock().unwrap().list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
     assert!(names.contains(&"claude:claude".to_string()), "{names:?}");
+}
+
+// ---- identity pinned to the token ----
+
+const APP_REDIRECT: &str = "ie.null.taisce:/oauth/callback";
+
+impl H {
+    /// An access token for another client, the passkey already enrolled.
+    async fn token_for(&mut self, name: &str, redirect: &str) -> String {
+        let client = self.register(name, redirect).await;
+        let code = self.code_for_at(&client, redirect).await;
+        let t = self.exchange_at(&client, &code, VERIFIER, redirect).await;
+        assert_eq!(t.status, StatusCode::OK, "{}", t.body);
+        t.json()["access_token"].as_str().unwrap().to_string()
+    }
+
+    fn doc(&self, title: &str) -> uuid::Uuid {
+        let human = self.st.store.lock().unwrap().auth_owner().unwrap().unwrap().principal_id;
+        self.st.store.lock().unwrap().create_doc(title, None, human).unwrap().id
+    }
+
+    /// Display name of the principal behind the doc's newest op.
+    fn last_writer(&self, doc: uuid::Uuid) -> String {
+        let s = self.st.store.lock().unwrap();
+        let op = s.ops_for_doc_limited(doc, 1).unwrap().remove(0);
+        s.get_principal(op.principal).unwrap().display_name
+    }
+}
+
+/// One stateless MCP tools/call on `path` with extra headers: (is_error, text).
+async fn tool(app: &Router, token: &str, path: &str, headers: &[(&str, &str)], name: &str, args: Value) -> (bool, String) {
+    let at = |body: Value, session: Option<&str>| {
+        let mut req = mcp(body, Some(token), session);
+        *req.uri_mut() = path.parse().unwrap();
+        for (k, v) in headers {
+            req.headers_mut().insert(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+        }
+        req
+    };
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+    let r = send(app, at(init, None)).await;
+    let session = r.headers.get("mcp-session-id").and_then(|v| v.to_str().ok()).map(str::to_string);
+    send(app, at(json!({"jsonrpc":"2.0","method":"notifications/initialized"}), session.as_deref())).await;
+    let body = json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name": name, "arguments": args}});
+    let r = send(app, at(body, session.as_deref())).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let v = rpc_body(&r.body);
+    let res = &v["result"];
+    (res["isError"].as_bool().unwrap_or(false), res["content"][0]["text"].as_str().unwrap_or_default().to_string())
+}
+
+#[tokio::test]
+async fn a_connector_token_cannot_name_someone_else() {
+    let mut h = harness();
+    let (_, access, _) = h.tokens().await;
+    // a second connector: its principal is not a label this token may take
+    h.token_for("Claude Code", REDIRECT).await;
+    let doc = h.doc("pinned");
+    let tom_id = h.st.store.lock().unwrap().auth_owner().unwrap().unwrap().principal_id.to_string();
+    // header, ?as= and ?cwd= are not identity sources under a token
+    let spoof = [("x-grimoire-principal", "tom")];
+    let (e, out) = tool(&h.app, &access, "/mcp?as=claude:q&cwd=/x/y", &spoof, "append", json!({"doc_id": doc, "markdown": "a"})).await;
+    assert!(!e, "{out}");
+    assert_eq!(h.last_writer(doc), "claude:claude");
+    let (e, out) = tool(&h.app, &access, "/mcp", &[("x-grimoire-principal", "claude:spoof")], "append", json!({"doc_id": doc, "markdown": "b"})).await;
+    assert!(!e, "{out}");
+    assert_eq!(h.last_writer(doc), "claude:claude");
+    // `as` is a label in the token's own namespace
+    let (e, out) = tool(&h.app, &access, "/mcp", &[], "append", json!({"doc_id": doc, "markdown": "c", "as": "claude:grimoire-task"})).await;
+    assert!(!e, "{out}");
+    assert_eq!(h.last_writer(doc), "claude:grimoire-task");
+    for bad in ["tom", "claude", "workbox", tom_id.as_str(), "claude:", "claude:claude-code"] {
+        let (e, out) = tool(&h.app, &access, "/mcp", &[], "append", json!({"doc_id": doc, "markdown": format!("x {bad}"), "as": bad})).await;
+        assert!(e, "as {bad:?} must be refused: {out}");
+        assert!(out.starts_with("as: "), "{out}");
+    }
+    assert_eq!(h.last_writer(doc), "claude:grimoire-task", "no refused write landed");
+    let names: Vec<String> = h.st.store.lock().unwrap().list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
+    for n in ["claude:q", "claude:y", "claude:spoof", "workbox"] {
+        assert!(!names.contains(&n.to_string()), "{n} must not exist: {names:?}");
+    }
+    // /api under a connector token: its own principal, never the header's
+    let mut req = post_json("/api/propose", json!({"doc_id": doc, "base_epoch": 0, "ops": [{"kind": {"op": "insert",
+        "block_id": uuid::Uuid::now_v7(), "parent_id": null, "order_key": "", "block_type": "paragraph", "content": "api"}}]}));
+    req.headers_mut().insert("authorization", format!("Bearer {access}").parse().unwrap());
+    req.headers_mut().insert("x-grimoire-principal", "tom".parse().unwrap());
+    let r = send(&h.app, req).await;
+    assert!(r.json()["verdicts"].is_array(), "{}", r.body);
+    assert_eq!(h.last_writer(doc), "claude:claude");
+}
+
+#[tokio::test]
+async fn the_owners_app_writes_as_the_human_and_ignores_as() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    let app = h.token_for("Taisce iOS", APP_REDIRECT).await;
+    let doc = h.doc("from the phone");
+    let (e, out) = tool(&h.app, &app, "/mcp", &[("x-grimoire-principal", "claude:spoof")], "append",
+        json!({"doc_id": doc, "markdown": "a", "as": "claude:whoever"})).await;
+    assert!(!e, "{out}");
+    assert_eq!(h.last_writer(doc), "tom");
+    let mut req = post_json("/api/propose", json!({"doc_id": doc, "base_epoch": 0, "ops": [{"kind": {"op": "insert",
+        "block_id": uuid::Uuid::now_v7(), "parent_id": null, "order_key": "", "block_type": "paragraph", "content": "api"}}]}));
+    req.headers_mut().insert("authorization", format!("Bearer {app}").parse().unwrap());
+    req.headers_mut().insert("x-grimoire-principal", "claude:spoof".parse().unwrap());
+    let r = send(&h.app, req).await;
+    assert!(r.json()["verdicts"].is_array(), "{}", r.body);
+    assert_eq!(h.last_writer(doc), "tom");
+    let names: Vec<String> = h.st.store.lock().unwrap().list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
+    assert!(!names.iter().any(|n| n == "claude:spoof" || n == "claude:whoever"), "{names:?}");
 }
 
 #[tokio::test]

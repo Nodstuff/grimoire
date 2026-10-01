@@ -6,7 +6,9 @@
 //! `KsMcp` per request, so nothing survives between calls; the principal is
 //! resolved per call from, in precedence order: the tool's `as` argument, the
 //! `X-Grimoire-Principal` header, `?as=<name>` on the `/mcp` URL,
-//! `?cwd=<path>` (→ `claude:<basename>`), else the shared `claude`.
+//! `?cwd=<path>` (→ `claude:<basename>`), else the shared `claude`. In
+//! SERVER mode a bearer token pins the principal instead (`Pinned`): the
+//! header and query hints are ignored and `as` is only a `claude:` label.
 //!
 //! How the per-request HTTP values reach a tool: rmcp's streamable-HTTP
 //! service consumes the body and injects the remaining `http::request::Parts`
@@ -224,10 +226,27 @@ pub struct RequestHint {
     pub header: Option<String>,
     pub query_as: Option<String>,
     pub cwd: Option<String>,
+    /// SERVER mode: the bearer token fixed who this is (the other hints are
+    /// then empty — a token's request cannot name someone else).
+    pub pinned: Option<Pinned>,
+}
+
+/// Identity fixed by an OAuth token (`auth::Authenticated`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pinned {
+    /// The owner's own app: acts as this human principal; `as` is ignored.
+    Owner(Uuid),
+    /// A connector: acts as `claude:<client-slug>`; `as` may only pick a
+    /// `claude:<label>` sub-principal (`pinned_label`).
+    Client(String),
 }
 
 impl RequestHint {
     pub fn from_parts(parts: &axum::http::request::Parts) -> Self {
+        if let Some(who) = parts.extensions.get::<crate::auth::Authenticated>() {
+            let pin = if who.owner_app { Pinned::Owner(who.human) } else { Pinned::Client(who.principal.clone()) };
+            return Self { pinned: Some(pin), ..Self::default() };
+        }
         let header = parts
             .headers
             .get(PRINCIPAL_HEADER)
@@ -244,7 +263,7 @@ impl RequestHint {
                 _ => {}
             }
         }
-        Self { header, query_as, cwd }
+        Self { header, query_as, cwd, pinned: None }
     }
 
     pub fn from_ctx(ctx: &RequestContext<RoleServer>) -> Self {
@@ -365,6 +384,41 @@ pub fn acting_principal(
     Ok(id)
 }
 
+/// The `as` a connector token may pass: a `claude:<label>` name in its own
+/// namespace. Refused: anything not `claude:`-prefixed (a human's name, a
+/// principal id, the shared `claude`) and another OAuth client's principal.
+/// A human or remote principal that happens to carry a `claude:` name is
+/// refused later by `agent_principal_by_name`.
+pub fn pinned_label(store: &SqliteStore, base: &str, label: &str) -> Result<String, String> {
+    let label = label.trim();
+    if label == base {
+        return Ok(label.to_string());
+    }
+    let refuse = |why: &str| {
+        Err(format!(
+            "as: {label:?} {why}; this token writes as {base:?} — `as` may only add a \"claude:<label>\" sub-principal"
+        ))
+    };
+    let Some(rest) = label.strip_prefix("claude:") else {
+        return refuse("is outside this connector's namespace");
+    };
+    if rest.trim().is_empty() {
+        return refuse("has an empty label");
+    }
+    valid_principal_name(label).map_err(|m| format!("as: {m}"))?;
+    let grants = store.oauth_grants(false).map_err(|e| e.to_string())?;
+    let mut clients: Vec<String> = grants.into_iter().map(|g| g.client_id).collect();
+    clients.sort();
+    clients.dedup();
+    for c in clients {
+        let name = store.oauth_client(&c).ok().flatten().map(|c| c.client_name).unwrap_or_default();
+        if crate::auth::client_principal(&c, &name) == label {
+            return refuse("is another OAuth client's principal");
+        }
+    }
+    Ok(label.to_string())
+}
+
 fn cached_principal(names: &NameCache, key: &str) -> Option<Uuid> {
     names
         .lock()
@@ -397,6 +451,27 @@ impl KsMcp {
     /// The principal this call acts as (`acting_principal`). Skips the store
     /// when no handle is given or it is already cached.
     async fn acting(&self, as_: Option<&str>, hint: &RequestHint) -> Result<Uuid, String> {
+        match &hint.pinned {
+            Some(Pinned::Owner(human)) => return Ok(*human),
+            Some(Pinned::Client(base)) => {
+                let (base, label) = (base.clone(), as_.map(|a| a.trim().to_string()));
+                if label.is_none()
+                    && let Some(id) = cached_principal(&self.names, &base)
+                {
+                    return Ok(id);
+                }
+                let (names, default) = (self.names.clone(), self.agent);
+                return with_store(&self.store, move |store| {
+                    let raw = match label {
+                        Some(l) => pinned_label(store, &base, &l)?,
+                        None => base,
+                    };
+                    acting_principal(store, &names, Some(&raw), &RequestHint::default(), default)
+                })
+                .await;
+            }
+            None => {}
+        }
         let raw = match as_ {
             Some(a) => a.trim().to_string(),
             None => match hint.default_name() {
@@ -2265,7 +2340,7 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
-    const NONE: RequestHint = RequestHint { header: None, query_as: None, cwd: None };
+    const NONE: RequestHint = RequestHint { header: None, query_as: None, cwd: None, pinned: None };
 
     /// The AX tools through the tool fns: compact hits, validated `kind`,
     /// a clear regex error, `related` naming the missing embedder and
@@ -2350,6 +2425,7 @@ mod tests {
             header: header.map(String::from),
             query_as: q.map(String::from),
             cwd: cwd.map(String::from),
+            pinned: None,
         };
 
         // precedence
@@ -2793,6 +2869,7 @@ mod tests {
             header: h.map(String::from),
             query_as: q.map(String::from),
             cwd: cwd.map(String::from),
+            pinned: None,
         };
 
         let (is_err, out) = raw(fresh().append_impl(NONE, p(json!({"doc_id": doc.to_string(), "markdown": "by task", "as": "claude:proj-task"}))).await.unwrap());

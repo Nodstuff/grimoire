@@ -83,7 +83,12 @@ additions give an HTTP client the same contract MCP agents get:
   `as: "<name>"` on every attributing call: MCP 2026-07-28 has no sessions, so nothing set by an
   earlier call survives to the next.
 - `request_id` (any UUID) on `/api/propose` and `/api/propose_markdown`: a retry with the same
-  id returns the first outcome instead of double-applying. Per principal, in-memory.
+  id returns the first outcome instead of double-applying. Per principal, kept 7 days in the
+  store (survives restarts).
+- `GET /api/docs` answers with `Taisce-Seq: <change-journal head>` for that snapshot.
+- SERVER mode (`--public-url`): identity is the bearer token's. `X-Grimoire-Principal`, `?as=`
+  and `?cwd=` are ignored; the owner's app (redirect `ie.null.taisce:`) writes as the human, a
+  connector as `claude:<client>`, and MCP `as` may only name a `claude:<label>` sub-principal.
 
 The daemon's version is `GET /api/buildinfo` → `{"version": "0.6.2", "build": <stamp>}`.
 

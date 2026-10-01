@@ -204,14 +204,29 @@ pub fn client_principal(client_id: &str, client_name: &str) -> String {
     }
 }
 
+/// The native app's redirect scheme. A client whose every redirect URI is
+/// on it is the owner's own app: it writes as the human, not as an agent.
+pub const APP_REDIRECT_SCHEME: &str = "ie.null.taisce:";
+
+fn is_owner_app(redirect_uris: &[String]) -> bool {
+    !redirect_uris.is_empty() && redirect_uris.iter().all(|u| u.starts_with(APP_REDIRECT_SCHEME))
+}
+
 /// Who a request authenticated as (an extension on authenticated requests).
+/// In SERVER mode identity is pinned to the token: `X-Grimoire-Principal`,
+/// `?as=` and `?cwd=` are ignored, and the MCP `as` argument is only a label
+/// inside the token's own `claude:` namespace (`mcp::Pinned`).
 #[derive(Debug, Clone)]
 pub struct Authenticated {
     pub user_id: uuid::Uuid,
     pub grant_id: uuid::Uuid,
     pub client_id: String,
-    /// `claude:<slug>`: MCP writes default to it.
+    /// `claude:<slug>`: a connector's writes are attributed to it.
     pub principal: String,
+    /// The owner's own app (`APP_REDIRECT_SCHEME`): writes as `human`.
+    pub owner_app: bool,
+    /// The authorizing user's human principal.
+    pub human: uuid::Uuid,
 }
 
 /// Paths reachable with no token: discovery, the OAuth endpoints, the
@@ -283,16 +298,15 @@ pub async fn authenticate(st: &AuthState, token: &str) -> Option<Authenticated> 
     let now = now();
     crate::store_ext::with_store(&st.store, move |s| {
         let grant = s.oauth_access_grant(&hash, now).ok()??;
-        let name = s
-            .oauth_client(&grant.client_id)
-            .ok()
-            .flatten()
-            .map(|c| c.client_name)
-            .unwrap_or_default();
+        let client = s.oauth_client(&grant.client_id).ok().flatten();
+        let name = client.as_ref().map(|c| c.client_name.clone()).unwrap_or_default();
+        let human = s.auth_user(grant.user_id).ok().flatten()?.principal_id;
         Some(Authenticated {
             user_id: grant.user_id,
             grant_id: grant.id,
             principal: client_principal(&grant.client_id, &name),
+            owner_app: client.is_some_and(|c| is_owner_app(&c.redirect_uris)),
+            human,
             client_id: grant.client_id,
         })
     })
@@ -328,20 +342,13 @@ pub async fn require_auth(State(st): State<AuthState>, mut req: Request, next: N
         return unauthorized(&st.cfg, &path, Some("invalid_token"));
     };
     let is_mcp = under(&path, "/mcp");
-    if is_mcp {
-        // the connector's default principal sits BELOW every existing rule
-        // (tool `as` > header > ?as= > ?cwd=): fill the header slot only when
-        // the request named nobody itself
-        let named = req.headers().contains_key(crate::mcp::PRINCIPAL_HEADER)
-            || req.uri().query().is_some_and(|q| {
-                q.split('&').any(|kv| {
-                    let k = kv.split('=').next().unwrap_or("");
-                    (k == "as" || k == "cwd") && kv.len() > k.len() + 1
-                })
-            });
-        if !named && let Ok(v) = HeaderValue::from_str(&who.principal) {
-            req.headers_mut().insert(crate::mcp::PRINCIPAL_HEADER, v);
-        }
+    // identity is the token's: whatever the request names itself is dropped.
+    // The HTTP API reads the header slot, so a connector's token fills it
+    // with its own principal and the owner's app leaves it empty (→ the
+    // human); MCP reads `Authenticated` itself (`mcp::RequestHint`).
+    req.headers_mut().remove(crate::mcp::PRINCIPAL_HEADER);
+    if !who.owner_app && let Ok(v) = HeaderValue::from_str(&who.principal) {
+        req.headers_mut().insert(crate::mcp::PRINCIPAL_HEADER, v);
     }
     let ip = client_ip(&st.cfg, req.headers(), req.extensions());
     let method = req.method().clone();
@@ -363,6 +370,7 @@ pub async fn require_auth(State(st): State<AuthState>, mut req: Request, next: N
             grant = %who.grant_id,
             user = %who.user_id,
             principal = who.principal,
+            owner_app = who.owner_app,
             ip,
             rpc,
             tool,
