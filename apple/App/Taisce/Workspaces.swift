@@ -100,9 +100,40 @@ struct WorkspaceEmptyState: Hashable, Sendable {
     }
 }
 
-/// A colour offered by "New workspace…".
+/// The six swatches a workspace can wear: Theme's accent, green, amber,
+/// rose, accentActive and secondary (their dark values; stored as hex).
 enum WorkspacePalette {
-    static let colors = ["#5b8def", "#3fb68b", "#e0a93b", "#e5655c", "#a77bd9", "#3bb3c3", "#8a8f98"]
+    static let colors = ["#8b9dc3", "#95c99b", "#d9b47a", "#d98a94", "#a9b7d6", "#8f8f9e"]
+}
+
+/// "Manage workspaces": the pure parts.
+enum WorkspaceManagement {
+    /// The inline delete confirmation.
+    static func deletePrompt(_ w: Workspace) -> String {
+        let docs = w.docCount == 1 ? "Its 1 doc moves" : "Its \(w.docCount) docs move"
+        return "Delete \(w.name)? \(docs) to Unsorted. No docs are deleted."
+    }
+
+    /// The sort key that puts the workspace at `index` of the sidebar order
+    /// (an index into the list WITHOUT it), between its new neighbours.
+    static func sortKey(moving id: WorkspaceID, to index: Int, in all: [Workspace]) -> String {
+        let rest = Workspace.ordered(all).filter { $0.id != id }
+        let i = max(0, min(index, rest.count))
+        let before = i > 0 ? rest[i - 1].sortKey : nil
+        let after = i < rest.count ? rest[i].sortKey : nil
+        return OrderKey.between(before, after)
+    }
+
+    /// `List.onMove`'s (source, destination) as an index into the list without it.
+    static func destination(from source: Int, to destination: Int) -> Int {
+        destination > source ? destination - 1 : destination
+    }
+
+    /// Where the app goes when `deleted` was current: the first remaining
+    /// workspace, else Unsorted.
+    static func fallback(afterDeleting deleted: WorkspaceID, from all: [Workspace]) -> WorkspaceScope {
+        Workspace.ordered(all).first { $0.id != deleted }.map { .id($0.id) } ?? .unsorted
+    }
 }
 
 extension AppModel {
@@ -199,6 +230,48 @@ extension AppModel {
             lastError = error.localizedDescription
         }
         await replayOutbox()
+    }
+
+    // MARK: manage
+
+    /// Rename / recolour / reorder (PATCH); the local list follows the answer.
+    func updateWorkspace(_ id: WorkspaceID, name: String? = nil, color: String? = nil, sortKey: String? = nil) async -> String? {
+        guard let api else { return "Not connected." }
+        do {
+            let w = try await api.updateWorkspace(id, name: name, color: color, sortKey: sortKey)
+            if let i = workspaces.firstIndex(where: { $0.id == id }) { workspaces[i] = w } else { workspaces.append(w) }
+            try? await cache?.replaceWorkspaces(workspaces)
+            return nil
+        } catch APIError.server(let msg) {
+            return msg
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    /// Drag to reorder: a key between the new neighbours.
+    func moveWorkspace(_ id: WorkspaceID, to index: Int) async -> String? {
+        await updateWorkspace(id, sortKey: WorkspaceManagement.sortKey(moving: id, to: index, in: workspaces))
+    }
+
+    /// The labels go, the docs stay. Deleting the current one switches to
+    /// the first remaining workspace.
+    func deleteWorkspace(_ id: WorkspaceID) async -> String? {
+        guard let api else { return "Not connected." }
+        do {
+            try await api.deleteWorkspace(id)
+        } catch APIError.server(let msg) {
+            return msg
+        } catch {
+            return error.localizedDescription
+        }
+        let wasCurrent = currentWorkspace == .id(id)
+        let fallback = WorkspaceManagement.fallback(afterDeleting: id, from: workspaces)
+        workspaces.removeAll { $0.id == id }
+        try? await cache?.replaceWorkspaces(workspaces)
+        if wasCurrent { selectWorkspace(fallback) } else { workspaceDidChange() }
+        refreshWorkspaces()
+        return nil
     }
 
     /// Unsorted docs, flat, for the triage list.

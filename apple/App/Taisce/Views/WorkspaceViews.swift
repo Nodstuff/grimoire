@@ -27,6 +27,7 @@ struct WorkspaceSwitcher: View {
     let picker: WorkspacePicker
     var onSelect: (WorkspaceScope) -> Void = { _ in }
     var onNew: () -> Void = {}
+    var onManage: () -> Void = {}
 
     var body: some View {
         if let current = picker.current {
@@ -42,6 +43,7 @@ struct WorkspaceSwitcher: View {
                 }
                 Divider()
                 Button("New workspace\u{2026}", systemImage: "plus", action: onNew)
+                Button("Manage workspaces", systemImage: "slider.horizontal.3", action: onManage)
             } label: {
                 HStack(spacing: 6) {
                     WorkspaceDot(color: picker.color(current))
@@ -66,11 +68,12 @@ struct WorkspaceBar: View {
     var triage = false
     @State private var creating = false
     @State private var selecting = false
+    @State private var managing = false
 
     var body: some View {
         if model.hasWorkspaces {
             HStack {
-                WorkspaceSwitcher(picker: model.workspacePicker, onSelect: model.selectWorkspace, onNew: { creating = true })
+                WorkspaceSwitcher(picker: model.workspacePicker, onSelect: model.selectWorkspace, onNew: { creating = true }, onManage: { managing = true })
                 Spacer()
                 if triage, model.currentWorkspace == .unsorted, !model.unsortedDocs.isEmpty {
                     Button("Select") { selecting = true }
@@ -85,6 +88,7 @@ struct WorkspaceBar: View {
             .background(Theme.ground)
             .sheet(isPresented: $creating) { NewWorkspaceSheet() }
             .sheet(isPresented: $selecting) { UnsortedTriageSheet() }
+            .sheet(isPresented: $managing) { ManageWorkspacesSheet() }
         }
     }
 }
@@ -213,6 +217,123 @@ struct UnsortedTriageSheet: View {
                 MoveToWorkspaceSheet(docIDs: Array(selection).sorted())
             }
         }
+    }
+}
+
+/// "Manage workspaces": rename, recolour, drag to reorder, delete (an
+/// inline confirmation: the docs move to Unsorted, none are deleted).
+struct ManageWorkspacesSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var creating = false
+    @State private var confirming: WorkspaceID?
+    @State private var error: String?
+
+    var body: some View {
+        let ordered = model.workspacePicker.ordered
+        NavigationStack {
+            List {
+                if let error {
+                    Text(error).font(.footnote).foregroundStyle(Theme.rose)
+                }
+                Section {
+                    ForEach(ordered) { w in
+                        ManageWorkspaceRow(
+                            workspace: w,
+                            confirming: confirming == w.id,
+                            onRename: { name in run { await model.updateWorkspace(w.id, name: name) } },
+                            onColor: { c in run { await model.updateWorkspace(w.id, color: c) } },
+                            onAskDelete: { confirming = w.id },
+                            onCancelDelete: { confirming = nil },
+                            onDelete: {
+                                confirming = nil
+                                run { await model.deleteWorkspace(w.id) }
+                            }
+                        )
+                    }
+                    .onMove { from, to in
+                        guard let source = from.first else { return }
+                        let id = ordered[source].id
+                        let index = WorkspaceManagement.destination(from: source, to: to)
+                        run { await model.moveWorkspace(id, to: index) }
+                    }
+                } footer: {
+                    Text("Drag to reorder. Deleting a workspace never deletes its docs.")
+                }
+                Button("New workspace\u{2026}", systemImage: "plus") { creating = true }
+            }
+            .navigationTitle("Workspaces")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .sheet(isPresented: $creating) { NewWorkspaceSheet() }
+        }
+    }
+
+    private func run(_ op: @escaping @MainActor () async -> String?) {
+        Task { error = await op() }
+    }
+}
+
+struct ManageWorkspaceRow: View {
+    let workspace: Workspace
+    var confirming = false
+    var onRename: (String) -> Void = { _ in }
+    var onColor: (String) -> Void = { _ in }
+    var onAskDelete: () -> Void = {}
+    var onCancelDelete: () -> Void = {}
+    var onDelete: () -> Void = {}
+    @State private var name = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                WorkspaceDot(color: workspace.color, size: 12)
+                TextField("Name", text: $name)
+                    .submitLabel(.done)
+                    .onSubmit {
+                        let t = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !t.isEmpty, t != workspace.name { onRename(t) } else { name = workspace.name }
+                    }
+                    .foregroundStyle(Theme.text)
+                Text(workspace.docCount == 1 ? "1 doc" : "\(workspace.docCount) docs")
+                    .font(.caption).foregroundStyle(Theme.secondary)
+            }
+            HStack(spacing: 12) {
+                ForEach(WorkspacePalette.colors, id: \.self) { c in
+                    Button { onColor(c) } label: {
+                        WorkspaceDot(color: c, size: 22)
+                            .overlay(Circle().stroke(Theme.text, lineWidth: workspace.color == c ? 2 : 0).padding(-3))
+                            .frame(width: 32, height: Theme.minTarget)
+                            .contentShape(.rect)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Colour \(c)")
+                    .accessibilityAddTraits(workspace.color == c ? .isSelected : [])
+                }
+                Spacer()
+                if !confirming {
+                    Button("Delete", systemImage: "trash", role: .destructive, action: onAskDelete)
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderless)
+                        .frame(minWidth: Theme.minTarget, minHeight: Theme.minTarget)
+                        .accessibilityLabel("Delete \(workspace.name)")
+                }
+            }
+            if confirming {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(WorkspaceManagement.deletePrompt(workspace)).font(.footnote).foregroundStyle(Theme.text)
+                    HStack {
+                        Button("Delete", role: .destructive, action: onDelete).buttonStyle(.bordered)
+                        Button("Cancel", action: onCancelDelete).buttonStyle(.borderless)
+                    }
+                }
+                .padding(10)
+                .background(Theme.surface2, in: .rect(cornerRadius: 10, style: .continuous))
+            }
+        }
+        .padding(.vertical, 4)
+        .onAppear { name = workspace.name }
+        .onChange(of: workspace.name) { _, now in name = now }
     }
 }
 

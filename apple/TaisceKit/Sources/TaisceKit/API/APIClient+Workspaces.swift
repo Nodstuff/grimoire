@@ -12,10 +12,15 @@ extension APIClient {
         try await post("/api/workspaces", body: CreateWorkspaceBody(name: name, color: color, icon: icon, requestID: requestID))
     }
 
-    /// Rename or recolour; nil fields are kept.
-    public func updateWorkspace(_ id: WorkspaceID, name: String? = nil, color: String? = nil) async throws -> Workspace {
-        struct Body: Encodable { var name: String?; var color: String? }
-        return try await send(body: Body(name: name, color: color), method: "PATCH", path: "/api/workspaces/\(id)")
+    /// Rename, recolour or reorder; nil fields are kept. `sortKey` must be
+    /// a valid order key (`OrderKey.between` its new neighbours).
+    public func updateWorkspace(_ id: WorkspaceID, name: String? = nil, color: String? = nil, sortKey: String? = nil) async throws -> Workspace {
+        struct Body: Encodable {
+            var name: String?
+            var color: String?
+            var sort_key: String?
+        }
+        return try await send(body: Body(name: name, color: color, sort_key: sortKey), method: "PATCH", path: "/api/workspaces/\(id)")
     }
 
     /// The labels go, the docs stay (Unsorted, or an outer workspace).
