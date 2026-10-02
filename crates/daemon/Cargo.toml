@@ -24,7 +24,9 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 # APNs provider JWTs (ES256); already in the tree under rustls
 ring = "0.17.14"
 url = "2.5.8"
-webauthn-rs = "0.5.5"
+# conditional-ui: the discoverable-credential sign-in (no allowCredentials:
+# the server never hands out who is enrolled)
+webauthn-rs = { version = "0.5.5", features = ["conditional-ui"] }
 # webauthn-rs links OpenSSL; vendor it so the binary (and the cross-built
 # server) never depends on a system libssl
 openssl = { version = "0.10.81", features = ["vendored"] }

@@ -48,8 +48,45 @@ fn harness_with(cfg: AuthConfig) -> H {
         .merge(router(st.clone()))
         .fallback(|| async { "<!doctype html>ui" })
         .layer(axum::middleware::from_fn_with_state(st.clone(), require_auth))
+        .layer(axum::middleware::from_fn(web::security_headers))
         .layer(axum::middleware::from_fn(crate::legacy::rename_headers));
     H { app, st, owner, passkey: WebauthnAuthenticator::new(SoftPasskey::new(true)) }
+}
+
+/// The soft token stands in for a platform authenticator: it cannot store
+/// resident keys (it refuses `requireResidentKey`), so the test drops that
+/// legacy flag after checking enrollment asks for a discoverable credential.
+fn soft_registration(options: &Value) -> CreationChallengeResponse {
+    let mut o = options.clone();
+    let sel = o.pointer_mut("/publicKey/authenticatorSelection").unwrap();
+    assert_eq!(sel["residentKey"], "required", "enrollment asks for a discoverable passkey");
+    assert_eq!(sel["requireResidentKey"], true);
+    sel["requireResidentKey"] = json!(false);
+    serde_json::from_value(o).unwrap()
+}
+
+impl H {
+    /// A discoverable challenge names no credential. The soft token cannot
+    /// discover its own (it is U2F underneath), so the test plays the
+    /// authenticator's part: after checking `allowCredentials` is empty, it
+    /// fills in the credentials this soft token holds (every one enrolled in
+    /// the harness). The signed clientData is unchanged by this.
+    fn discover(&self, options: &Value) -> RequestChallengeResponse {
+        assert_eq!(options["publicKey"]["allowCredentials"], json!([]), "no credential is named: {options}");
+        assert!(options.get("mediation").is_none(), "modal, not conditional: {options}");
+        let mut o = options.clone();
+        let ids: Vec<Value> = self
+            .st
+            .store
+            .lock(taisce_store::Scope::System)
+            .auth_credentials(None)
+            .unwrap()
+            .into_iter()
+            .map(|c| json!({"type": "public-key", "id": c.cred_id}))
+            .collect();
+        o["publicKey"]["allowCredentials"] = json!(ids);
+        serde_json::from_value(o).unwrap()
+    }
 }
 
 fn harness() -> H {
@@ -109,7 +146,7 @@ impl H {
         let begin = send(&self.app, post_json("/auth/enroll/begin", json!({"t": t, "label": "soft"}))).await;
         assert_eq!(begin.status, StatusCode::OK, "{}", begin.body);
         let b = begin.json();
-        let ccr: CreationChallengeResponse = serde_json::from_value(b["options"].clone()).unwrap();
+        let ccr = soft_registration(&b["options"]);
         let cred = self.passkey.do_registration(Url::parse(BASE).unwrap(), ccr).unwrap();
         send(&self.app, post_json("/auth/enroll/finish", json!({"ceremony": b["ceremony"], "credential": cred}))).await
     }
@@ -134,7 +171,7 @@ impl H {
     async fn sign_in(&mut self, req: &str) -> String {
         let begin = send(&self.app, post_json("/oauth/authorize/begin", json!({"req": req}))).await;
         assert_eq!(begin.status, StatusCode::OK, "{}", begin.body);
-        let rcr: RequestChallengeResponse = serde_json::from_value(begin.json()).unwrap();
+        let rcr = self.discover(&begin.json());
         let cred = self.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
         let fin = send(&self.app, post_json("/oauth/authorize/finish", json!({"req": req, "credential": cred}))).await;
         assert_eq!(fin.status, StatusCode::OK, "{}", fin.body);
@@ -666,7 +703,7 @@ async fn enrollment_link_is_single_use() {
     let (hsh, owner) = (hash_secret(&t), h.owner);
     h.st.store.lock(taisce_store::Scope::System).auth_add_enrollment(&hsh, owner, now() + ENROLL_TTL).unwrap();
     let begin = send(&h.app, post_json("/auth/enroll/begin", json!({"t": t}))).await.json();
-    let ccr: CreationChallengeResponse = serde_json::from_value(begin["options"].clone()).unwrap();
+    let ccr = soft_registration(&begin["options"]);
     let cred = h.passkey.do_registration(Url::parse(BASE).unwrap(), ccr).unwrap();
     let fin = send(&h.app, post_json("/auth/enroll/finish", json!({"ceremony": begin["ceremony"], "credential": cred}))).await;
     assert_eq!(fin.status, StatusCode::OK, "{}", fin.body);
@@ -1065,6 +1102,7 @@ async fn a_lapsed_app_client_re_registers_as_the_pinned_app() {
             created_at: t0,
             revoked_at: None,
             revoke_why: None,
+            credential_id: None,
         };
         s.oauth_issue_grant(None, &g, &hash_secret(&access), t0 + 3600, &hash_secret(&refresh), t0 + 86400).unwrap();
         (access, refresh)
@@ -1288,4 +1326,570 @@ fn device_summaries_are_coarse() {
     assert_eq!(d(Some("curl/8.7.1")), "an unknown device");
     assert_eq!(d(None), "an unknown device");
     assert_eq!(passkey::server_time(1_790_000_000), "21 Sep 2026, 14:13 UTC");
+}
+
+// ---- the web UI's session cookie ----
+
+/// `__Host-taisce_session=<value>` for a request's Cookie header.
+fn with_cookie(mut req: HttpRequest<Body>, value: &str) -> HttpRequest<Body> {
+    req.headers_mut().insert(header::COOKIE, format!("theme=dark; {}={value}", web::COOKIE).parse().unwrap());
+    req
+}
+
+/// A same-origin write from the web UI: Origin, the CSRF header, the cookie.
+fn ui_write(method: &str, path: &str, body: Value, cookie: &str) -> HttpRequest<Body> {
+    let req = HttpRequest::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "localhost:7512")
+        .header("origin", BASE)
+        .header(web::CSRF_HEADER, "1")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    with_cookie(req, cookie)
+}
+
+fn set_cookie_of(r: &Res) -> String {
+    r.headers.get(header::SET_COOKIE).map(|v| v.to_str().unwrap().to_string()).unwrap_or_default()
+}
+
+impl H {
+    /// Enroll the soft passkey (once) and sign the web UI in: the finish
+    /// response and the cookie's value.
+    async fn web_sign_in(&mut self) -> (Res, String) {
+        if self.st.store.lock(taisce_store::Scope::System).auth_credentials(None).unwrap().is_empty() {
+            assert!(self.enroll().await.status.is_success());
+        }
+        let begin = send(&self.app, post_json("/auth/web/begin", json!({}))).await;
+        assert_eq!(begin.status, StatusCode::OK, "{}", begin.body);
+        let b = begin.json();
+        let rcr = self.discover(&b["options"]);
+        let cred = self.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
+        let mut req = post_json("/auth/web/finish", json!({"ceremony": b["ceremony"], "credential": cred}));
+        req.headers_mut().insert(
+            header::USER_AGENT,
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15".parse().unwrap(),
+        );
+        let fin = send(&self.app, req).await;
+        assert_eq!(fin.status, StatusCode::OK, "{}", fin.body);
+        let sc = set_cookie_of(&fin);
+        let value = sc.strip_prefix(&format!("{}=", web::COOKIE)).and_then(|r| r.split(';').next()).unwrap().to_string();
+        (fin, value)
+    }
+
+    fn sessions(&self) -> Vec<taisce_store::auth::WebSession> {
+        self.st.store.lock(taisce_store::Scope::System).auth_web_sessions().unwrap()
+    }
+}
+
+#[tokio::test]
+async fn web_sign_in_sets_the_session_cookie_with_the_exact_attributes() {
+    let mut h = harness();
+    let (fin, value) = h.web_sign_in().await;
+    assert_eq!(
+        set_cookie_of(&fin),
+        format!("__Host-taisce_session={value}; Path=/; Max-Age=7776000; Secure; HttpOnly; SameSite=Strict")
+    );
+    assert!(!set_cookie_of(&fin).to_lowercase().contains("domain"));
+    assert_eq!(value.len(), 43, "256 random bits, base64url");
+    assert_eq!(fin.headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(fin.json()["name"], "tom");
+    // stored as its hash only, with a coarse device summary
+    let s = h.sessions();
+    assert_eq!(s.len(), 1);
+    assert_eq!((s[0].user_id, s[0].user_agent.as_str()), (h.owner, "Mac · Safari"));
+    let st = h.st.store.lock(taisce_store::Scope::System);
+    assert!(st.auth_web_session_by_hash(&value, now()).unwrap().is_none(), "the raw value is not a key");
+    assert_eq!(st.auth_web_session_by_hash(&hash_secret(&value), now()).unwrap().unwrap().id, s[0].id);
+    let audits: Vec<String> = st.audit_events(20).unwrap().into_iter().map(|e| e.event).collect();
+    assert!(audits.contains(&"web.signin".to_string()), "{audits:?}");
+}
+
+#[tokio::test]
+async fn web_sign_in_refuses_cross_origin_replayed_and_mismatched_assertions() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    let mut evil = post_json("/auth/web/begin", json!({}));
+    evil.headers_mut().insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+    assert_eq!(send(&h.app, evil).await.status, StatusCode::FORBIDDEN);
+    let mut none = post_json("/auth/web/begin", json!({}));
+    none.headers_mut().remove(header::ORIGIN);
+    assert_eq!(send(&h.app, none).await.status, StatusCode::FORBIDDEN, "Origin is required");
+    // a ceremony works once
+    let begin = send(&h.app, post_json("/auth/web/begin", json!({}))).await.json();
+    let rcr = h.discover(&begin["options"]);
+    let cred = h.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
+    let body = json!({"ceremony": begin["ceremony"], "credential": cred});
+    assert_eq!(send(&h.app, post_json("/auth/web/finish", body.clone())).await.status, StatusCode::OK);
+    let again = send(&h.app, post_json("/auth/web/finish", body)).await;
+    assert_eq!(again.status, StatusCode::GONE);
+    assert!(set_cookie_of(&again).is_empty());
+    // an assertion over another ceremony's challenge is refused
+    let b1 = send(&h.app, post_json("/auth/web/begin", json!({}))).await.json();
+    let b2 = send(&h.app, post_json("/auth/web/begin", json!({}))).await.json();
+    let rcr = h.discover(&b1["options"]);
+    let cred = h.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
+    let r = send(&h.app, post_json("/auth/web/finish", json!({"ceremony": b2["ceremony"], "credential": cred}))).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+    assert_eq!(h.sessions().len(), 1);
+}
+
+#[tokio::test]
+async fn web_sign_in_is_rate_limited_per_ip() {
+    let mut h = harness_with(AuthConfig { trusted_proxy: true, ..AuthConfig::from_public_url(BASE).unwrap() });
+    assert!(h.enroll().await.status.is_success());
+    let from = |ip: &str| {
+        let mut r = post_json("/auth/web/begin", json!({}));
+        r.headers_mut().insert("x-forwarded-for", ip.parse().unwrap());
+        r
+    };
+    let mut limited = 0;
+    for _ in 0..25 {
+        if send(&h.app, from("203.0.113.7")).await.status == StatusCode::TOO_MANY_REQUESTS {
+            limited += 1;
+        }
+    }
+    assert!(limited >= 5, "the Login bucket (burst 20): {limited}");
+    assert_eq!(send(&h.app, from("198.51.100.1")).await.status, StatusCode::OK, "another IP has its own bucket");
+}
+
+#[tokio::test]
+async fn the_cookie_opens_api_only() {
+    let mut h = harness();
+    let (_, c) = h.web_sign_in().await;
+    // /api: yes
+    let r = send(&h.app, with_cookie(get("/api/docs"), &c)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(send(&h.app, get("/api/docs")).await.status, StatusCode::UNAUTHORIZED, "no cookie, no data");
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), "not-a-session")).await.status, StatusCode::UNAUTHORIZED);
+    // /mcp: no (the cookie is not a bearer, and it is ignored there)
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+    let mut m = with_cookie(mcp(init, None, None), &c);
+    m.headers_mut().insert(header::ORIGIN, BASE.parse().unwrap());
+    m.headers_mut().insert(web::CSRF_HEADER, "1".parse().unwrap());
+    assert_eq!(send(&h.app, m).await.status, StatusCode::UNAUTHORIZED);
+    // /ws: no
+    assert_eq!(send(&h.app, with_cookie(get("/ws/x"), &c)).await.status, StatusCode::UNAUTHORIZED);
+    // /oauth/token: the cookie is no credential there (no token comes back)
+    let mut t = with_cookie(post_form("/oauth/token", &[("grant_type", "refresh_token"), ("client_id", FIRST_PARTY_APP_CLIENT)]), &c);
+    t.headers_mut().insert(header::ORIGIN, BASE.parse().unwrap());
+    let r = send(&h.app, t).await;
+    assert_ne!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(!r.body.contains("access_token"), "{}", r.body);
+    // a bearer token beside a cookie wins
+    let (_, connector, _) = h.tokens().await;
+    let r = send(&h.app, with_bearer(with_cookie(get("/api/docs"), &c), &connector)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let r = send(&h.app, with_bearer(with_cookie(get("/api/docs"), &c), "junk")).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "an invalid bearer is not rescued by the cookie");
+    // the session route says who is signed in
+    let r = send(&h.app, with_cookie(get("/auth/web/session"), &c)).await;
+    assert_eq!((r.json()["signed_in"].as_bool(), r.json()["name"].as_str()), (Some(true), Some("tom")));
+    let r = send(&h.app, get("/auth/web/session")).await;
+    assert_eq!(r.json()["signed_in"], false);
+}
+
+#[tokio::test]
+async fn cookie_writes_need_our_origin_and_the_csrf_header() {
+    let mut h = harness();
+    let (_, c) = h.web_sign_in().await;
+    let docs = |h: &H| h.st.store.lock(taisce_store::Scope::System).list_docs().unwrap().len();
+    let before = docs(&h);
+    let create = |origin: Option<&str>, csrf: Option<&str>, extra: &[(&str, &str)]| {
+        let mut b = HttpRequest::post("/api/docs").header("host", "localhost:7512").header("content-type", "application/json");
+        if let Some(o) = origin {
+            b = b.header("origin", o);
+        }
+        if let Some(x) = csrf {
+            b = b.header(web::CSRF_HEADER, x);
+        }
+        for (k, v) in extra {
+            b = b.header(*k, *v);
+        }
+        with_cookie(b.body(Body::from(json!({"title": "made by the cookie"}).to_string())).unwrap(), &c)
+    };
+    for (what, req) in [
+        ("no Origin", create(None, Some("1"), &[])),
+        ("a foreign Origin", create(Some("https://evil.example"), Some("1"), &[])),
+        ("a look-alike Origin", create(Some("http://localhost:7512.evil.example"), Some("1"), &[])),
+        ("Origin null", create(Some("null"), Some("1"), &[])),
+        ("no CSRF header", create(Some(BASE), None, &[])),
+        ("a wrong CSRF value", create(Some(BASE), Some("0"), &[])),
+        // a cross-site form post: no custom header can ride on it
+        ("a cross-site form POST", create(Some("https://evil.example"), None, &[("sec-fetch-site", "cross-site")])),
+    ] {
+        let r = send(&h.app, req).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{what}: {}", r.body);
+        assert_eq!(r.json()["code"], "csrf", "{what}");
+    }
+    // other methods too
+    for m in ["PUT", "PATCH", "DELETE"] {
+        let req = HttpRequest::builder().method(m).uri("/api/workspaces/x").header("host", "localhost:7512").body(Body::empty()).unwrap();
+        assert_eq!(send(&h.app, with_cookie(req, &c)).await.status, StatusCode::FORBIDDEN, "{m}");
+    }
+    assert_eq!(docs(&h), before, "no refused write reached the store");
+    // the UI's own write: Origin + Taisce-CSRF
+    let r = send(&h.app, create(Some(BASE), Some("1"), &[])).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(docs(&h), before + 1);
+    // written as the person (their human principal), not an agent
+    {
+        let s = h.st.store.lock(taisce_store::Scope::System);
+        let d = s.list_docs().unwrap().into_iter().find(|d| d.title == "made by the cookie").unwrap();
+        let p = s.list_principals().unwrap().into_iter().find(|p| p.id == d.created_by).unwrap();
+        assert_eq!(p.kind, PrincipalKind::Human);
+    }
+    // a bearer write needs neither (no ambient credential to forge)
+    let (_, connector, _) = h.tokens().await;
+    let req = HttpRequest::post("/api/docs")
+        .header("host", "localhost:7512")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"title": "by a token"}).to_string()))
+        .unwrap();
+    assert_eq!(send(&h.app, with_bearer(req, &connector)).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn web_sessions_expire_idle_and_absolute_and_roll() {
+    use taisce_store::auth::{WEB_SESSION_ABSOLUTE, WEB_SESSION_IDLE};
+    let h = harness();
+    let mk = |created: i64, touched: Option<i64>| {
+        let tok = random_token();
+        let mut s = h.st.store.lock(taisce_store::Scope::System);
+        let w = s.auth_create_web_session(h.owner, None, &hash_secret(&tok), "", created).unwrap();
+        if let Some(t) = touched {
+            assert!(s.auth_touch_web_session(w.id, t).unwrap());
+        }
+        (tok, w.id)
+    };
+    let last = |id: uuid::Uuid| h.sessions().into_iter().find(|w| w.id == id).unwrap().last_used_at;
+    let n = now();
+    // idle 14 days: refused, and the cookie is cleared
+    let (idle, _) = mk(n - WEB_SESSION_IDLE - 5, None);
+    let r = send(&h.app, with_cookie(get("/api/docs"), &idle)).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(set_cookie_of(&r), "__Host-taisce_session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict");
+    // idle 13 days: live, and the request rolls last_used forward
+    let (busy, busy_id) = mk(n - 13 * 86400, None);
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &busy)).await.status, StatusCode::OK);
+    assert!(last(busy_id) >= n, "rolled");
+    // used a minute ago but signed in 90 days ago: the absolute end
+    let (old, _) = mk(n - WEB_SESSION_ABSOLUTE - 5, Some(n - 60));
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &old)).await.status, StatusCode::UNAUTHORIZED);
+    let (young, _) = mk(n - WEB_SESSION_ABSOLUTE + 3600, Some(n - 60));
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &young)).await.status, StatusCode::OK);
+    // the roll writes at most once a minute
+    let (fresh, fresh_id) = mk(n - 30, None);
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &fresh)).await.status, StatusCode::OK);
+    assert_eq!(last(fresh_id), n - 30, "used 30 s ago: no write");
+}
+
+#[tokio::test]
+async fn logout_revokes_the_session_and_clears_the_cookie() {
+    let mut h = harness();
+    let (_, c) = h.web_sign_in().await;
+    let (_, other) = h.web_sign_in().await;
+    // a cross-site logout is refused (and changes nothing)
+    let mut evil = with_cookie(post_json("/auth/web/logout", json!({})), &c);
+    evil.headers_mut().insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+    evil.headers_mut().insert(web::CSRF_HEADER, "1".parse().unwrap());
+    assert_eq!(send(&h.app, evil).await.status, StatusCode::FORBIDDEN);
+    let no_csrf = with_cookie(post_json("/auth/web/logout", json!({})), &c);
+    assert_eq!(send(&h.app, no_csrf).await.status, StatusCode::FORBIDDEN, "no CSRF header");
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &c)).await.status, StatusCode::OK);
+    let r = send(&h.app, ui_write("POST", "/auth/web/logout", json!({}), &c)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(set_cookie_of(&r), web::clear_cookie());
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &c)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &other)).await.status, StatusCode::OK, "only this browser signs out");
+    // signing out twice is harmless
+    assert_eq!(send(&h.app, ui_write("POST", "/auth/web/logout", json!({}), &c)).await.status, StatusCode::OK);
+    let audits: Vec<String> =
+        h.st.store.lock(taisce_store::Scope::System).audit_events(50).unwrap().into_iter().map(|e| e.event).collect();
+    assert_eq!(audits.iter().filter(|e| *e == "web.signout").count(), 1, "{audits:?}");
+}
+
+#[tokio::test]
+async fn the_cli_lists_and_revokes_web_sessions() {
+    let mut h = harness();
+    let (_, c) = h.web_sign_in().await;
+    let id = h.sessions()[0].id.to_string();
+    let lines = web::session_lines(&h.st.store.lock(taisce_store::Scope::System), now()).unwrap();
+    assert_eq!(lines.len(), 1);
+    let l = &lines[0];
+    assert!(l.contains(&id[..18]) && l.contains("tom") && l.contains("Mac · Safari") && l.ends_with("live"), "{l}");
+    assert!(!l.contains(&c), "never the secret");
+    // the exact path `taisce auth revoke <prefix>` runs
+    let out = cli_revoke(&mut h.st.store.lock(taisce_store::Scope::System), &id[..18], now()).unwrap();
+    assert_eq!(out, format!("revoked web session {id}"));
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &c)).await.status, StatusCode::UNAUTHORIZED);
+    {
+        let s = h.st.store.lock(taisce_store::Scope::System);
+        assert!(web::session_lines(&s, now()).unwrap()[0].contains("revoked"));
+        let audits: Vec<String> = s.audit_events(50).unwrap().into_iter().map(|e| e.event).collect();
+        assert!(audits.contains(&"web.revoke".to_string()), "{audits:?}");
+    }
+    assert!(cli_revoke(&mut h.st.store.lock(taisce_store::Scope::System), &id, now()).is_err(), "already revoked");
+}
+
+#[tokio::test]
+async fn a_web_session_is_not_a_push_device() {
+    let mut h = harness();
+    let (_, c) = h.web_sign_in().await;
+    let body = json!({"token": "cd".repeat(32), "platform": "ios", "env": "sandbox", "app_version": "1"});
+    let r = send(&h.app, ui_write("POST", "/api/devices", body, &c)).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
+}
+
+#[tokio::test]
+async fn server_mode_ui_responses_carry_the_security_headers() {
+    let h = harness();
+    let r = send(&h.app, get("/")).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.headers.get(header::CONTENT_SECURITY_POLICY).unwrap(), web::UI_CSP);
+    assert!(web::UI_CSP.contains("frame-ancestors 'none'") && web::UI_CSP.contains("script-src 'self';"));
+    assert_eq!(r.headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+    assert_eq!(r.headers.get(header::REFERRER_POLICY).unwrap(), "same-origin");
+    assert_eq!(r.headers.get("x-content-type-options").unwrap(), "nosniff");
+    // the 401 the UI turns into its sign-in screen carries them too
+    assert!(send(&h.app, get("/api/docs")).await.headers.contains_key(header::CONTENT_SECURITY_POLICY));
+    // a passkey page keeps its own nonce'd policy
+    let t = random_token();
+    h.st.store.lock(taisce_store::Scope::System).auth_add_enrollment(&hash_secret(&t), h.owner, now() + ENROLL_TTL).unwrap();
+    let page = send(&h.app, get(&format!("/auth/enroll?t={t}"))).await;
+    assert!(page.headers.get(header::CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap().contains("'nonce-"));
+}
+
+// ---- review round: discoverable sign-in, passkey revocation, ceremonies ----
+
+/// The status of an MCP initialize as `token`.
+async fn mcp_status(app: &Router, token: &str) -> StatusCode {
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+    send(app, mcp(init, Some(token), None)).await.status
+}
+
+#[tokio::test]
+async fn sign_in_challenges_name_no_credential() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    // a second person with a passkey of their own
+    let other = h.st.store.lock(taisce_store::Scope::System).auth_add_user("aoife", now()).unwrap();
+    h.st.store
+        .lock(taisce_store::Scope::System)
+        .auth_add_credential(&taisce_store::auth::AuthCredential {
+            id: uuid::Uuid::now_v7(),
+            user_id: other.id,
+            cred_id: "c2Vjb25kLWNyZWRlbnRpYWw".into(),
+            passkey: "{}".into(),
+            label: "theirs".into(),
+            created_at: now(),
+            last_used_at: None,
+        })
+        .unwrap();
+    let ids: Vec<String> = h.st.store.lock(taisce_store::Scope::System).auth_credentials(None).unwrap().into_iter().map(|c| c.cred_id).collect();
+    assert_eq!(ids.len(), 2);
+    // the web UI's challenge, and the OAuth sign-in page's
+    let web = send(&h.app, post_json("/auth/web/begin", json!({}))).await;
+    let client = h.register("Claude", REDIRECT).await;
+    let q = format!(
+        "response_type=code&client_id={client}&redirect_uri={REDIRECT}&code_challenge={CHALLENGE}&code_challenge_method=S256&state=xyz&resource={BASE}/mcp"
+    );
+    let (_, req) = h.authorize(&q).await;
+    let oauth = send(&h.app, post_json("/oauth/authorize/begin", json!({"req": req.unwrap()}))).await;
+    for (what, r, opts) in [("web", &web, web.json()["options"].clone()), ("oauth", &oauth, oauth.json())] {
+        assert_eq!(r.status, StatusCode::OK, "{what}: {}", r.body);
+        assert_eq!(opts["publicKey"]["allowCredentials"], json!([]), "{what}");
+        assert_eq!(opts["publicKey"]["userVerification"], "required", "{what}");
+        for id in &ids {
+            assert!(!r.body.contains(id.as_str()), "{what} leaks credential {id}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_user_handle_must_name_the_credentials_owner() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    for (handle, want) in [(Some(uuid::Uuid::now_v7()), StatusCode::UNAUTHORIZED), (Some(h.owner), StatusCode::OK), (None, StatusCode::OK)] {
+        let b = send(&h.app, post_json("/auth/web/begin", json!({}))).await.json();
+        let rcr = h.discover(&b["options"]);
+        let cred = h.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
+        let mut v = serde_json::to_value(&cred).unwrap();
+        if let Some(u) = handle {
+            v["response"]["userHandle"] = json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(u.as_bytes()));
+        }
+        let r = send(&h.app, post_json("/auth/web/finish", json!({"ceremony": b["ceremony"], "credential": v}))).await;
+        assert_eq!(r.status, want, "handle {handle:?}: {}", r.body);
+    }
+    // a credential this server does not know (deleted since): the same
+    // refusal as a bad signature
+    let b = send(&h.app, post_json("/auth/web/begin", json!({}))).await.json();
+    let rcr = h.discover(&b["options"]);
+    let cred = h.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
+    let id = h.st.store.lock(taisce_store::Scope::System).auth_credentials(None).unwrap()[0].id.to_string();
+    h.st.store.lock(taisce_store::Scope::System).auth_revoke_credential(&id, now()).unwrap().unwrap();
+    let r = send(&h.app, post_json("/auth/web/finish", json!({"ceremony": b["ceremony"], "credential": cred}))).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (StatusCode::UNAUTHORIZED, Some("passkey not accepted")));
+}
+
+#[tokio::test]
+async fn deleting_a_passkey_ends_the_web_sessions_and_grants_it_opened() {
+    let mut h = harness();
+    let (_, cookie) = h.web_sign_in().await;
+    let client = h.register("Claude", REDIRECT).await;
+    let code = h.code_for(&client).await;
+    let t = h.exchange(&client, &code, VERIFIER).await.json();
+    let (access, refresh) = (t["access_token"].as_str().unwrap().to_string(), t["refresh_token"].as_str().unwrap().to_string());
+    let creds = h.st.store.lock(taisce_store::Scope::System).auth_credentials(None).unwrap();
+    assert_eq!(creds.len(), 1);
+    let cred = creds[0].id;
+    // both sign-ins record the passkey that opened them
+    assert_eq!(h.sessions()[0].credential_id, Some(cred));
+    assert_eq!(h.st.store.lock(taisce_store::Scope::System).oauth_grants(false).unwrap()[0].credential_id, Some(cred));
+    // a sign-in from before passkeys were recorded (NULL) survives the delete, and is listed
+    let old = {
+        let mut s = h.st.store.lock(taisce_store::Scope::System);
+        let g = taisce_store::auth::Grant {
+            id: uuid::Uuid::now_v7(),
+            client_id: client.clone(),
+            user_id: h.owner,
+            resource: None,
+            scope: SCOPE.into(),
+            created_at: now(),
+            revoked_at: None,
+            revoke_why: None,
+            credential_id: None,
+        };
+        s.oauth_issue_grant(None, &g, &hash_secret("old-access"), now() + 3600, &hash_secret("old-refresh"), now() + 86400).unwrap();
+        g.id
+    };
+    let out = cli_revoke(&mut h.st.store.lock(taisce_store::Scope::System), &cred.to_string()[..18], now()).unwrap();
+    assert!(out.starts_with(&format!("deleted passkey {cred}")), "{out}");
+    assert!(out.contains("revoked the 1 web session(s) and 1 grant(s) it opened"), "{out}");
+    assert!(out.contains("still live for this user") && out.contains(&old.to_string()) && out.contains("(passkey not recorded)"), "{out}");
+    // the browser and the connector are signed out
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &cookie)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(mcp_status(&h.app, &access).await, StatusCode::UNAUTHORIZED);
+    let r = h.refresh(&client, &refresh).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_grant")));
+    let audits: Vec<String> = h.st.store.lock(taisce_store::Scope::System).audit_events(20).unwrap().into_iter().map(|e| e.event).collect();
+    assert!(audits.contains(&"passkey.delete".to_string()), "{audits:?}");
+}
+
+#[tokio::test]
+async fn deleting_the_last_sign_in_says_nothing_remains() {
+    let mut h = harness();
+    let (_, _cookie) = h.web_sign_in().await;
+    let cred = h.st.store.lock(taisce_store::Scope::System).auth_credentials(None).unwrap()[0].id;
+    let out = cli_revoke(&mut h.st.store.lock(taisce_store::Scope::System), &cred.to_string(), now()).unwrap();
+    assert!(out.ends_with("no live sessions or grants remain for this user"), "{out}");
+}
+
+#[tokio::test]
+async fn revoke_all_for_a_lost_device_ends_every_sign_in_of_that_user_only() {
+    let mut h = harness();
+    let (_, cookie) = h.web_sign_in().await;
+    let (_, connector, refresh) = h.tokens().await;
+    let (_, pat) = h.pat("laptop");
+    // someone else, signed in too
+    let other = h.st.store.lock(taisce_store::Scope::System).auth_add_user("aoife", now()).unwrap();
+    let theirs = random_token();
+    h.st.store.lock(taisce_store::Scope::System).auth_create_web_session(other.id, None, &hash_secret(&theirs), "", now()).unwrap();
+    let owner = h.st.store.lock(taisce_store::Scope::System).auth_user(h.owner).unwrap().unwrap();
+    let out = cli_revoke_user_all(&mut h.st.store.lock(taisce_store::Scope::System), &owner, now()).unwrap();
+    assert!(out.starts_with("tom: deleted 2 passkey(s), revoked 1 web session(s) and 1 grant(s)"), "{out}");
+    assert!(out.contains("no live sessions or grants remain") && out.contains("1 personal access token(s) still live"), "{out}");
+    assert!(h.st.store.lock(taisce_store::Scope::System).auth_credentials(Some(h.owner)).unwrap().is_empty());
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &cookie)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(mcp_status(&h.app, &connector).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(h.refresh("x", &refresh).await.status, StatusCode::BAD_REQUEST);
+    // another person's session lives on; PATs are a separate, named revoke
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &theirs)).await.status, StatusCode::OK);
+    assert_eq!(mcp_status(&h.app, &pat).await, StatusCode::OK);
+    let audits: Vec<String> = h.st.store.lock(taisce_store::Scope::System).audit_events(20).unwrap().into_iter().map(|e| e.event).collect();
+    assert!(audits.contains(&"user.revoke_all".to_string()), "{audits:?}");
+}
+
+#[tokio::test]
+async fn one_ip_cannot_evict_another_ips_sign_in() {
+    let mut h = harness_with(AuthConfig { trusted_proxy: true, ..AuthConfig::from_public_url(BASE).unwrap() });
+    assert!(h.enroll().await.status.is_success());
+    let begin_from = |ip: &'static str| {
+        let mut r = post_json("/auth/web/begin", json!({}));
+        r.headers_mut().insert("x-forwarded-for", ip.parse().unwrap());
+        r
+    };
+    let tom = send(&h.app, begin_from("198.51.100.1")).await.json();
+    for _ in 0..16 {
+        assert_eq!(send(&h.app, begin_from("203.0.113.66")).await.status, StatusCode::OK);
+    }
+    // the flood keeps at most MAX_PENDING_PER_IP of its own, and evicts nothing else
+    {
+        let p = h.st.pending.lock().unwrap();
+        assert_eq!(p.web.values().filter(|c| c.ip == "203.0.113.66").count(), passkey::MAX_PENDING_PER_IP);
+        assert_eq!(p.web.values().filter(|c| c.ip == "198.51.100.1").count(), 1);
+    }
+    let finish = |h: &mut H, b: &Value| {
+        let rcr = h.discover(&b["options"]);
+        let cred = h.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
+        post_json("/auth/web/finish", json!({"ceremony": b["ceremony"], "credential": cred}))
+    };
+    let r = finish(&mut h, &tom);
+    assert_eq!(send(&h.app, r).await.status, StatusCode::OK, "Tom's open sign-in survived the flood");
+}
+
+#[tokio::test]
+async fn a_ceremony_lasts_two_minutes() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    let b = send(&h.app, post_json("/auth/web/begin", json!({}))).await.json();
+    let id = b["ceremony"].as_str().unwrap().to_string();
+    h.st.pending.lock().unwrap().web.get_mut(&id).unwrap().at -= passkey::CEREMONY_TTL;
+    let rcr = h.discover(&b["options"]);
+    let cred = h.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
+    let r = send(&h.app, post_json("/auth/web/finish", json!({"ceremony": id, "credential": cred}))).await;
+    assert_eq!(r.status, StatusCode::GONE, "{}", r.body);
+}
+
+#[test]
+fn a_full_pending_map_refuses_new_sign_ins_rather_than_evicting() {
+    let h = harness();
+    let mut p = passkey::Pending::default();
+    let cer = || h.st.webauthn.start_discoverable_authentication().unwrap().1;
+    let t = now();
+    // per IP: the ninth from one address replaces that address's oldest
+    let mine: Vec<String> = (0..passkey::MAX_PENDING_PER_IP)
+        .map(|_| p.add_web(passkey::WebCeremony { ip: "a".into(), at: t, ceremony: cer() }).unwrap())
+        .collect();
+    let other = p.add_web(passkey::WebCeremony { ip: "b".into(), at: t, ceremony: cer() }).unwrap();
+    p.add_web(passkey::WebCeremony { ip: "a".into(), at: t + 1, ceremony: cer() }).unwrap();
+    assert_eq!(p.web.keys().filter(|k| mine.contains(k)).count(), passkey::MAX_PENDING_PER_IP - 1);
+    assert!(p.web.contains_key(&other));
+    // whole map full (many IPs): a new address is refused, nobody is evicted
+    let mut i = 0;
+    while p.web.len() < 1000 {
+        p.add_web(passkey::WebCeremony { ip: format!("ip{i}"), at: t + 1, ceremony: cer() }).unwrap();
+        i += 1;
+    }
+    assert!(p.add_web(passkey::WebCeremony { ip: "late".into(), at: t + 1, ceremony: cer() }).is_none());
+    assert!(p.web.contains_key(&other), "the open sign-in is still there");
+    // OAuth sign-in requests follow the same per-IP rule
+    let req = |ip: &str| passkey::AuthzRequest {
+        client_id: "c".into(),
+        client_name: "c".into(),
+        redirect_uri: REDIRECT.into(),
+        state: None,
+        code_challenge: CHALLENGE.into(),
+        resource: None,
+        scope: SCOPE.into(),
+        created: t,
+        ip: ip.into(),
+        ceremony: None,
+    };
+    let toms = p.add_authz(req("tom")).unwrap();
+    let flood: Vec<String> = (0..20).map(|_| p.add_authz(req("flood")).unwrap()).collect();
+    assert!(p.has_authz(&toms));
+    assert_eq!(flood.iter().filter(|id| p.has_authz(id)).count(), passkey::MAX_PENDING_PER_IP);
 }

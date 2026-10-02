@@ -1052,8 +1052,9 @@ async fn get_day(State(st): State<ApiState>, v: Viewer, server: Server, Query(q)
     let human = v.human;
     let ws = q.clock.workspace.clone();
     // a GET is read-only for anything but the person's own app (ADR 0004):
-    // a connector's GET never creates a list or carries items forward
-    let may_write = v.human_surface;
+    // a connector's or a browser session's GET never creates a list or
+    // carries items forward
+    let may_write = v.get_may_write();
     with_store(&st.store, v.scope, move |s| {
         let scope = match scope_of(s, ws.as_deref()) {
             Ok(sc) => sc,
@@ -1881,6 +1882,7 @@ mod tests {
             owner_app: true,
             human,
             instance_owner: false,
+            web_session: false,
         };
         let get = |uri: &str| {
             let mut r = Request::get(uri).body(Body::empty()).unwrap();

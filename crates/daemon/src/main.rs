@@ -291,13 +291,26 @@ enum AuthCmd {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// List users, passkeys and live OAuth grants.
+    /// List users, passkeys, live OAuth grants and web UI sessions.
     List,
-    /// Revoke an OAuth grant, or delete a passkey, by id (or unique prefix).
+    /// Revoke an OAuth grant or a web UI session, or delete a passkey, by id
+    /// (or unique prefix; a web session's id is the prefix `auth list` shows).
+    /// Deleting a passkey also revokes the web sessions and grants it opened.
+    /// A lost device: `--user <name> --all` deletes every passkey and revokes
+    /// every session and grant of that user.
     /// Revocation is always per grant (one sign-in on one device): every
     /// Taisce app sign-in shares the client `taisce-app`, so never revoke "by
     /// client" — that would sign out every person's every device.
-    Revoke { id: String },
+    Revoke {
+        /// grant, web session or passkey id (or unique prefix)
+        id: Option<String>,
+        /// with --all: the user whose every sign-in to revoke
+        #[arg(long, requires = "all")]
+        user: Option<String>,
+        /// every passkey, web session and grant of --user
+        #[arg(long, requires = "user", conflicts_with = "id")]
+        all: bool,
+    },
     /// Personal access tokens: static bearers for /mcp only.
     Token {
         #[command(subcommand)]
@@ -631,6 +644,9 @@ fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, h
                 let name = store.oauth_client(&g.client_id)?.map(|c| c.client_name).unwrap_or_default();
                 println!("grant {}  {}  [{}]  since {}", g.id, name, g.client_id, fmt_time(g.created_at));
             }
+            for line in auth::web::session_lines(store, now)? {
+                println!("{line}");
+            }
         }
         AuthCmd::Token { cmd: TokenCmd::Create { name, user, hash } } => {
             if user.is_none() {
@@ -656,17 +672,14 @@ fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, h
             let t = auth::revoke_api_token(store, &key, now)?;
             println!("revoked token {} {}", t.name, t.id);
         }
-        AuthCmd::Revoke { id } => {
-            if let Some(g) = store.oauth_revoke_grant(&id, "revoked from the CLI", now)? {
-                tracing::info!(target: auth::AUDIT, event = "token.revoke", why = "cli", grant = %g);
-                println!("revoked grant {g}");
-            } else if store.auth_delete_credential(&id)? == 1 {
-                tracing::info!(target: auth::AUDIT, event = "passkey.delete", credential = id);
-                println!("deleted passkey {id}");
-            } else {
-                anyhow::bail!("no live grant or passkey matches {id:?} (ambiguous prefix?)");
+        AuthCmd::Revoke { id, user, all } => match (id, user) {
+            (None, Some(key)) if all => {
+                let u = one_user(store, &key)?;
+                println!("{}", auth::cli_revoke_user_all(store, &u, now)?);
             }
-        }
+            (Some(id), None) => println!("{}", auth::cli_revoke(store, &id, now)?),
+            _ => anyhow::bail!("give an id, or --user <name> --all"),
+        },
     }
     Ok(())
 }
@@ -1034,7 +1047,11 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
             let app = match auth_state {
                 // SERVER mode: the proxy makes every request loopback, so no
                 // loopback trust; a bearer token on every data surface instead
-                Some(st) => app.layer(axum::middleware::from_fn_with_state(st, auth::require_auth)),
+                // (and the web UI's session cookie on /api); the UI's
+                // security headers (CSP, no framing) over every response
+                Some(st) => app
+                    .layer(axum::middleware::from_fn_with_state(st, auth::require_auth))
+                    .layer(axum::middleware::from_fn(auth::web::security_headers)),
                 // DNS-rebinding guard over EVERY surface (api, admin, mcp, ws, ui):
                 // a request whose Host/Origin is not a loopback name is refused
                 None => app.layer(axum::middleware::from_fn(local_guard::require_loopback)),

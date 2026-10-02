@@ -23,6 +23,9 @@ export type CommandAction =
 
 export interface CommandCtx {
   queueCount: number
+  /** SERVER mode, signed in through this browser: offer Sign out */
+  signedIn?: boolean
+  onSignOut?: () => void
   /** the open doc, if any — enables the per-doc commands */
   docId: string | null
   /** the root doc titled Inbox, when quick capture has made one */
@@ -31,7 +34,7 @@ export interface CommandCtx {
   onOpenDoc: (id: string) => void
 }
 
-export function buildCommands({ queueCount, docId, inboxId, onAction, onOpenDoc }: CommandCtx): OmniCommand[] {
+export function buildCommands({ queueCount, signedIn, onSignOut, docId, inboxId, onAction, onOpenDoc }: CommandCtx): OmniCommand[] {
   const cmds: OmniCommand[] = [
     { id: 'review', label: 'Review queue', hint: queueCount ? `${queueCount} open` : undefined, keys: '⌘⇧R', run: () => onAction('review') },
     {
@@ -166,5 +169,8 @@ export function buildCommands({ queueCount, docId, inboxId, onAction, onOpenDoc 
       api<{ dir: string }>('/api/backups/reveal', { method: 'POST' }).catch((e) => notify(errText(e)))
     },
   })
+  if (signedIn && onSignOut) {
+    cmds.push({ id: 'sign-out', label: 'Sign out', hint: 'end this browser’s session', run: onSignOut })
+  }
   return cmds
 }

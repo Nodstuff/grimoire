@@ -2,7 +2,8 @@
 
 What it is now: ONE personal server, **Taisce** (`https://taisce.null.ie`), plus clients.
 - The `taisce` binary runs in two modes. **SERVER** (`--public-url` /
-  `TAISCE_PUBLIC_URL` set): every data route needs an OAuth 2.1 bearer token, sign-in is
+  `TAISCE_PUBLIC_URL` set): every data route needs an OAuth 2.1 bearer token (or, on `/api`
+  only, the web UI's passkey session cookie: ADR 0004 §5d), sign-in is
   passkeys (`taisce auth enroll|list|revoke` on the box), the proxy is trusted for
   rate-limiting (`--trusted-proxy`), APNs nudges the iOS app. **LOCAL** (no public URL): the
   Mac app's daemon on `127.0.0.1:7425`, loopback-only (DNS-rebinding guard), `/admin/*` behind

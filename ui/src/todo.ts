@@ -183,3 +183,14 @@ export function summaryLine(parts: { todos: number | null; inbox: number | null;
   }
   return out.length ? out.join(' · ') : 'all clear'
 }
+
+/** GET /api/todo's answer when there is no To-do list yet and the caller's
+ * GET may not create one (a browser session in SERVER mode). */
+export function isNoListYet(e: unknown): boolean {
+  return e instanceof Error && /no To-do list here yet/.test(e.message)
+}
+
+/** An empty day to show (and add to) before the list exists. */
+export function emptyDay(date: string, today: string): TodoDay {
+  return { doc_id: '', date, today, items: [], carried: 0, prev_date: null, epoch: 0 }
+}

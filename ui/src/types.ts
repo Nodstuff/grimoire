@@ -1,3 +1,5 @@
+import { signalUnauthorized, withCsrf } from './auth'
+
 export interface Doc {
   id: string
   parent_id: string | null
@@ -131,13 +133,20 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       init = { ...init, headers }
     }
   }
-  const r = await fetch(path, init)
+  // SERVER mode: writes carry the CSRF header beside the session cookie
+  // (harmless in LOCAL mode, which ignores it)
+  const r = await fetch(path, withCsrf(init))
   const j = await r.json().catch(() => null)
   if (r.status === 401 && path.startsWith('/admin/')) {
     throw new ApiError(
       'open Taisce from the app (or add ?admin_token=… from ~/.grimoire/admin.token to the URL)',
       'admin_token',
     )
+  }
+  if (r.status === 401 && path.startsWith('/api/')) {
+    // SERVER mode, signed out or the session lapsed: AuthGate shows sign-in
+    signalUnauthorized()
+    throw new ApiError('sign in to continue', 'unauthorized')
   }
   if (j && typeof j === 'object' && 'error' in j) {
     const code = 'code' in j && typeof j.code === 'string' ? j.code : undefined

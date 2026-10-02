@@ -119,9 +119,12 @@ export default function Profile({
   dataVersion,
   onChanged,
   version: appVersion = null,
+  onSignOut,
 }: {
   dataVersion: number
   onChanged?: (p: ProfileRow) => void
+  /** SERVER mode, signed in through this browser */
+  onSignOut?: () => void
   /** the version off App's /api/stamp poll; null on a daemon too old to send it */
   version?: string | null
 }) {
@@ -223,6 +226,13 @@ export default function Profile({
           <span className="meta">account id</span>
           <span className="mono" title={profile.principal_id}>{shortId(profile.principal_id)}</span>
         </div>
+        {onSignOut && (
+          <div className="profile-kv">
+            <span className="meta">this browser</span>
+            <span className="meta">signed in with a passkey</span>
+            <button className="chip" onClick={onSignOut}>sign out</button>
+          </div>
+        )}
       </div>
 
       <div className="card">

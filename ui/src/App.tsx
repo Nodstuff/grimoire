@@ -15,6 +15,7 @@ import Home from './Home'
 import Capture from './Capture'
 import Omnibox from './Omnibox'
 import { buildCommands } from './commands'
+import { signOut, webSession } from './auth'
 import { loadRecentIds, pushRecentId, storeRecentIds, type OmniMode } from './omni'
 
 /** The doc side panels, owned by App so a doc switch does not close one. */
@@ -37,6 +38,7 @@ import { parseDeepLink, scrubDeepLink } from './deeplink'
 import { actionLabels, buildHighlightMap, describeChange, isDocOp, targetBlockOf } from './review'
 import {
   api,
+  ApiError,
   Block,
   Doc,
   DocTree,
@@ -69,6 +71,13 @@ export interface OpenDocOpts {
   blockId?: string
 }
 export type OpenDoc = (id: string, opts?: string | OpenDocOpts) => void
+
+/** Sign out of the browser session, then reload onto the sign-in screen. */
+export function signOutAndReload(): void {
+  signOut()
+    .then(() => location.reload())
+    .catch((e) => notify(`could not sign out: ${errText(e)}`))
+}
 
 export default function App() {
   const [view, setViewRaw] = useState<View>({ kind: 'home' })
@@ -125,6 +134,11 @@ export default function App() {
   const [profile, setProfile] = useState<ProfileRow | null>(null)
   useEffect(() => {
     loadProfile().then(setProfile)
+  }, [])
+  // SERVER mode: signed in through the browser (offer Sign out); LOCAL: never
+  const [signedIn, setSignedIn] = useState(false)
+  useEffect(() => {
+    webSession().then((w) => setSignedIn(!!w?.signed_in))
   }, [])
 
   const refreshQueue = useCallback(() => {
@@ -196,7 +210,9 @@ export default function App() {
         else if (b !== build && !document.querySelector(DIRTY_SELECTOR)) {
           location.reload()
         }
-      } catch {
+      } catch (e) {
+        // signed out (SERVER mode): the sign-in screen says so, not the banner
+        if (e instanceof ApiError && e.code === 'unauthorized') return
         // restarting mid-deploy, or actually down — say so after 3 misses
         misses += 1
         if (misses >= 3) setDaemonDown(true)
@@ -304,6 +320,11 @@ export default function App() {
     () =>
       buildCommands({
         queueCount,
+        signedIn,
+        onSignOut: () => {
+          setPalette(null)
+          signOutAndReload()
+        },
         docId: view.kind === 'doc' ? view.id : null,
         inboxId: docs.find((d) => d.parent_id === null && d.title === 'Inbox')?.id ?? null,
         onOpenDoc: (id) => {
@@ -325,7 +346,7 @@ export default function App() {
           setPalette(null)
         },
       }),
-    [queueCount, view, setView, docs],
+    [queueCount, signedIn, view, setView, docs],
   )
 
   // quick capture from outside the page: the shell's global hotkey (⌥⌘G) and
@@ -419,7 +440,12 @@ export default function App() {
         )}
         {view.kind === 'runs' && <Gardeners dataVersion={dataVersion} />}
         {view.kind === 'profile' && (
-          <Profile dataVersion={dataVersion} onChanged={setProfile} version={appStamp?.version ?? null} />
+          <Profile
+            dataVersion={dataVersion}
+            onChanged={setProfile}
+            version={appStamp?.version ?? null}
+            onSignOut={signedIn ? signOutAndReload : undefined}
+          />
         )}
         {view.kind === 'trash' && (
           <Trash
