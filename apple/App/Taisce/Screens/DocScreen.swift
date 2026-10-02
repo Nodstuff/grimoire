@@ -30,6 +30,7 @@ struct DocScreen: View {
         #if targetEnvironment(macCatalyst)
         // View › Bigger / Smaller Text; ⌘= works as well as ⌘+ (no shift)
         .dynamicTypeSize(DocTextSize.size(textSize))
+        .environment(\.docScale, DocTextSize.scale(textSize))
         .background {
             Button("") { textSize = DocTextSize.bigger(textSize) }
                 .keyboardShortcut("=")
@@ -285,7 +286,7 @@ struct DocContent: View {
                         }
                     }
                     Text(title)
-                        .font(Theme.serif(.largeTitle))
+                        .docFont(.largeTitle, design: .serif, weight: .semibold)
                         .foregroundStyle(Theme.text)
                         .accessibilityAddTraits(.isHeader)
                     if !metaLine.isEmpty {

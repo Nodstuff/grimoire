@@ -46,7 +46,8 @@ enum EditorText {
             var d = UIFontDescriptor.preferredFontDescriptor(withTextStyle: style, compatibleWith: traits)
             if serif, let s = d.withDesign(.serif) { d = s }
             if bold, let b = d.withSymbolicTraits(.traitBold) { d = b }
-            return UIFont(descriptor: d, size: 0)
+            let scale = traits?.docScale ?? 1
+            return UIFont(descriptor: d, size: scale == 1 ? 0 : d.pointSize * scale)
         }
         switch kind {
         case .paragraph, .list: return styled(.body, serif: false, bold: false)
@@ -59,7 +60,7 @@ enum EditorText {
             }
         case .quote: return styled(.body, serif: true, bold: false)
         case .raw:
-            let size = UIFont.preferredFont(forTextStyle: .footnote, compatibleWith: traits).pointSize
+            let size = UIFont.preferredFont(forTextStyle: .footnote, compatibleWith: traits).pointSize * (traits?.docScale ?? 1)
             return UIFont.monospacedSystemFont(ofSize: size, weight: .regular)
         }
     }

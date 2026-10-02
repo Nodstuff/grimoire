@@ -22,7 +22,7 @@ struct RenderNodeView: View {
         switch node {
         case let .heading(level, inline):
             Text(InlineMarkdown.attributed(inline))
-                .font(Self.headingFont(level))
+                .headingFont(level)
                 .foregroundStyle(Theme.text)
                 .padding(.top, level <= 2 ? 14 : 8)
                 .accessibilityAddTraits(.isHeader)
@@ -47,7 +47,7 @@ struct RenderNodeView: View {
         case .thematicBreak:
             Rectangle().fill(Theme.hairline).frame(height: 1).padding(.vertical, 8)
         case let .html(raw):
-            Text(raw).font(.caption.monospaced()).foregroundStyle(Theme.secondary)
+            Text(raw).docFont(.caption, design: .monospaced).foregroundStyle(Theme.secondary)
         }
     }
 
@@ -57,6 +57,18 @@ struct RenderNodeView: View {
         case 2: Theme.serif(.title3)
         case 3: Theme.serif(.headline)
         default: .headline
+        }
+    }
+}
+
+extension View {
+    /// A heading's style at the doc's text size (`headingFont` at 1).
+    func headingFont(_ level: Int) -> some View {
+        switch level {
+        case 1: AnyView(docFont(.title2, design: .serif, weight: .semibold))
+        case 2: AnyView(docFont(.title3, design: .serif, weight: .semibold))
+        case 3: AnyView(docFont(.headline, design: .serif, weight: .semibold))
+        default: AnyView(docFont(.headline, weight: .semibold))
         }
     }
 }
@@ -81,7 +93,7 @@ private struct Paragraph: View {
 
     var body: some View {
         Text(InlineMarkdown.attributed(inline))
-            .font(.callout)
+            .docFont(.callout)
             .lineSpacing(4)
             .foregroundStyle(Theme.text)
             .tint(Theme.accentActive)
@@ -123,7 +135,7 @@ private struct ListBlock: View {
                 toggle.action?(index, !checked)
             } label: {
                 Image(systemName: checked ? "checkmark.square.fill" : "square")
-                    .font(.body)
+                    .docFont(.body)
                     .foregroundStyle(checked ? Theme.green : Theme.secondary)
                     .frame(width: 28, height: 28)
                     .contentShape(.rect)
@@ -173,7 +185,7 @@ private struct CalloutView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Label(kind.capitalized, systemImage: style.icon)
-                .font(.subheadline.weight(.semibold))
+                .docFont(.subheadline, weight: .semibold)
                 .foregroundStyle(style.color)
             NodeStack(nodes: children, checkboxBase: checkboxBase, spacing: 6)
         }
@@ -192,14 +204,14 @@ struct CodeBlockView: View {
         VStack(alignment: .leading, spacing: 0) {
             if let label, !label.isEmpty {
                 Text(label)
-                    .font(.caption.weight(.medium))
+                    .docFont(.caption, weight: .medium)
                     .foregroundStyle(Theme.secondary)
                     .padding(.horizontal, 14)
                     .padding(.top, 10)
             }
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(code)
-                    .font(Theme.mono)
+                    .docFont(.footnote, design: .monospaced)
                     .foregroundStyle(Theme.text)
                     .textSelection(.enabled)
                     .fixedSize()
@@ -223,7 +235,7 @@ private struct TableBlock: View {
                 GridRow {
                     ForEach(0..<columns, id: \.self) { i in
                         cell(i < table.header.count ? table.header[i] : "", column: i)
-                            .font(.subheadline.weight(.semibold))
+                            .docFont(.subheadline, weight: .semibold)
                             .background { Rectangle().fill(Theme.surface2) }
                     }
                 }
@@ -231,7 +243,7 @@ private struct TableBlock: View {
                     Rectangle().fill(Theme.hairline).frame(height: 1).gridCellUnsizedAxes(.horizontal)
                     GridRow {
                         ForEach(0..<columns, id: \.self) { i in
-                            cell(i < row.count ? row[i] : "", column: i).font(.subheadline)
+                            cell(i < row.count ? row[i] : "", column: i).docFont(.subheadline)
                         }
                     }
                 }

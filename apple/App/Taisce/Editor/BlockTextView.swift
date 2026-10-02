@@ -151,7 +151,13 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
     /// The text view's traits at the size SwiftUI asked for (the Mac's
     /// View › Bigger Text sets it on the doc screen; UIKit wouldn't see it).
     private func traits(_ tv: UITextView) -> UITraitCollection {
-        tv.traitCollection.modifyingTraits { $0.preferredContentSizeCategory = UIContentSizeCategory(dynamicType) }
+        tv.traitCollection.modifyingTraits {
+            $0.preferredContentSizeCategory = UIContentSizeCategory(dynamicType)
+            #if targetEnvironment(macCatalyst)
+            // Catalyst ignores the size category: scale by hand
+            $0.docScale = DocTextSize.scale(for: dynamicType)
+            #endif
+        }
     }
 
     var kind: EditorText.Kind { EditorText.Kind(content) }
