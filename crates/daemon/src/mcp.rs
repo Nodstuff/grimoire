@@ -806,7 +806,8 @@ pub struct AppendParams {
     /// Where: a heading path ('grimoire › Plans', '## grimoire / ### Plans')
     /// or a block ref (^abc123 / UUID). Omit for the end of the doc.
     pub to: Option<String>,
-    /// "end" (default: after the section's last block) or "start" (right after its heading).
+    /// "end" (default: after the section's last block) or "start" (right after its heading;
+    /// with no `to`, the top of the doc: under any frontmatter and its `# Title`).
     pub at: Option<String>,
     /// true: create the headings of `to` that do not exist yet (levels from
     /// the path's `#`s if given, else parent level + 1; a new top-level
@@ -1107,7 +1108,9 @@ fn resolve_landing(
     create_missing: bool,
 ) -> Result<Landing, String> {
     let Some(to) = to.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(Landing { offset: md.len(), new_headings: Vec::new() });
+        // no section: the doc's end, or its start (under frontmatter and the # title)
+        let offset = if at_start { locate::doc_start_offset(roots) } else { md.len() };
+        return Ok(Landing { offset, new_headings: Vec::new() });
     };
     // a block ref anchors directly
     if locate::parse_block_ref(to).is_some() {
@@ -3003,6 +3006,10 @@ mod tests {
         let (is_err, _) = fx.append(json!({"markdown": "- first", "to": "## qompass / ### plans", "at": "start"})).await;
         assert!(!is_err);
         assert!(fx.export().contains("### Plans\n\n- first\n\n- plan q\n"), "{}", fx.export());
+        // start of the doc (no `to`): above the first section, never at the end
+        let (is_err, out) = fx.append(json!({"markdown": "> top note", "at": "start"})).await;
+        assert!(!is_err, "{out}");
+        assert!(fx.export().starts_with("---\ntags:\n  - daily\n---\n\n> top note\n\n## qompass"), "{}", fx.export());
         // ambiguous path → error, nothing written, even with create_missing
         let before = fx.export();
         let (is_err, out) = fx.append(json!({"markdown": "x", "to": "Plans", "create_missing": true})).await;
