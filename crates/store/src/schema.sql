@@ -12,8 +12,13 @@ CREATE TABLE IF NOT EXISTS principals (
     pubkey       TEXT,
     -- ADR 0004: an agent's person (auth_users.id); NULL = the instance owner.
     -- Humans carry none (auth_users.principal_id points at them).
-    owner_user   TEXT
+    owner_user   TEXT,
+    -- ADR 0004: a person's name as compared for uniqueness (NFKC, case
+    -- folded, invisible characters stripped, TR39 skeleton); humans only
+    name_key     TEXT
 );
+CREATE UNIQUE INDEX IF NOT EXISTS principals_human_name_key ON principals (name_key)
+    WHERE kind = 'human' AND name_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS docs (
     id            TEXT PRIMARY KEY,
@@ -265,8 +270,13 @@ CREATE TABLE IF NOT EXISTS changes (
     -- ADR 0004: NULL = a global row (filtered by the reader's visibility);
     -- set = a row for that user only: access gained ('tree') or revoked
     -- ('deleted', the client drops the doc)
-    user_id TEXT
+    user_id TEXT,
+    -- on a granted ('tree', user_id set) row: the ops rowid high-water mark
+    -- at the grant — the reader's history starts after it (monotonic, so
+    -- no clock can misplace the cut)
+    ops_mark INTEGER
 );
+CREATE INDEX IF NOT EXISTS changes_by_user_doc ON changes (user_id, doc_id);
 
 CREATE TRIGGER IF NOT EXISTS changes_docs_ai AFTER INSERT ON docs BEGIN
     INSERT INTO changes (doc_id, kind, epoch) VALUES (new.id, 'tree', new.current_epoch);

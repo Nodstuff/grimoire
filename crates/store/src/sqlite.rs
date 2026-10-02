@@ -315,6 +315,8 @@ fn additive_column_migrations(conn: &Connection) -> Result<()> {
         add_column_if_missing(conn, "docs", "owner_id", "TEXT")?;
     }
     add_column_if_missing(conn, "principals", "owner_user", "TEXT")?;
+    add_column_if_missing(conn, "principals", "name_key", "TEXT")?;
+    add_column_if_missing(conn, "changes", "ops_mark", "INTEGER")?;
     add_column_if_missing(conn, "changes", "user_id", "TEXT")?;
     let has_gardeners: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'gardeners'",
@@ -477,7 +479,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -509,6 +511,26 @@ fn backfill(conn: &Connection) -> Result<()> {
         if let Some(owner) = tenancy::instance_owner_conn(&tx)? {
             tenancy::adopt_unowned_conn(&tx, owner)?;
         }
+    }
+    if version < 9 {
+        // ADR 0004 round 3: people's normalised name keys (a duplicate of an
+        // earlier one keeps NULL rather than fail the open), and the
+        // monotonic history cut on any grant rows already journalled
+        let humans: Vec<(String, String)> = {
+            let mut st = tx.prepare("SELECT id, display_name FROM principals WHERE kind = 'human' ORDER BY id")?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        for (id, name) in humans {
+            tx.execute(
+                "UPDATE OR IGNORE principals SET name_key = ?1 WHERE id = ?2",
+                params![tenancy::name_key(&name), id],
+            )?;
+        }
+        tx.execute(
+            "UPDATE changes SET ops_mark = (SELECT COALESCE(max(rowid), 0) FROM ops)
+             WHERE user_id IS NOT NULL AND kind = 'tree' AND ops_mark IS NULL",
+            [],
+        )?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -904,6 +926,12 @@ fn apply_in_tx(
         epoch,
         op_ids,
     })
+}
+
+/// Fetch a block by id, any doc, tombstoned ones included (unscoped).
+fn block_by_id_conn(conn: &Connection, id: Uuid) -> Result<Option<Block>> {
+    let mut stmt = conn.prepare_cached(&format!("SELECT {BLOCK_COLS} FROM blocks WHERE id = ?1"))?;
+    stmt.query_row(params![id.to_string()], row_to_block).optional()?.map(build_block).transpose()
 }
 
 /// Fetch a block by id within a doc, tombstoned ones included.
@@ -1493,10 +1521,16 @@ impl BlockStore for SqliteStore {
             PrincipalKind::Agent => self.scope.user(),
             _ => None,
         };
-        self.conn.execute(
-            "INSERT INTO principals (id, kind, display_name, pubkey, owner_user) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id.to_string(), kind.as_str(), display_name, pubkey, owner.map(|o| o.to_string())],
-        )?;
+        let key = match kind {
+            PrincipalKind::Human => Some(tenancy::name_key(display_name)),
+            _ => None,
+        };
+        self.conn
+            .execute(
+                "INSERT INTO principals (id, kind, display_name, pubkey, owner_user, name_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id.to_string(), kind.as_str(), display_name, pubkey, owner.map(|o| o.to_string()), key],
+            )
+            .map_err(tenancy::name_conflict)?;
         Ok(Principal {
             id,
             kind,
@@ -1538,8 +1572,11 @@ impl BlockStore for SqliteStore {
             .conn
             .query_row("SELECT kind FROM principals WHERE id = ?1", params![id.to_string()], |r| r.get(0))
             .optional()?;
-        if kind.as_deref() == Some("human") && tenancy::name_taken_conn(&self.conn, name, Some(id))? {
-            return Err(StoreError::InvalidOp("that name is taken".into()));
+        if kind.as_deref() == Some("human") {
+            tenancy::check_person_name(name)?;
+            if tenancy::name_taken_conn(&self.conn, name, Some(id))? {
+                return Err(StoreError::InvalidOp("that name is taken".into()));
+            }
         }
         if let Some(u) = self.scope.user() {
             let mine: bool = self.conn.query_row(
@@ -1555,10 +1592,14 @@ impl BlockStore for SqliteStore {
                 params![name, u.to_string()],
             )?;
         }
-        let n = self.conn.execute(
-            "UPDATE principals SET display_name = ?1 WHERE id = ?2",
-            params![name, id.to_string()],
-        )?;
+        let key = (kind.as_deref() == Some("human")).then(|| tenancy::name_key(name));
+        let n = self
+            .conn
+            .execute(
+                "UPDATE principals SET display_name = ?1, name_key = COALESCE(?3, name_key) WHERE id = ?2",
+                params![name, id.to_string(), key],
+            )
+            .map_err(tenancy::name_conflict)?;
         if n == 0 {
             return Err(StoreError::NotFound(format!("principal {id}")));
         }
@@ -1614,10 +1655,12 @@ impl BlockStore for SqliteStore {
                                          OR a.id IN (SELECT m.user_id FROM workspace_members m
                                                      WHERE m.workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = '{u}')))))
                        OR (kind != 'human' AND (
-                            id IN (SELECT o.principal FROM ops o JOIN docs v ON v.id = o.doc_id WHERE {vis})
-                            OR id IN (SELECT v.created_by FROM docs v WHERE {vis})
+                            id IN (SELECT o.principal FROM ops o JOIN docs v ON v.id = o.doc_id WHERE {vis} AND {hist})
+                            OR id IN (SELECT v.created_by FROM docs v WHERE {vis}
+                                      AND NOT EXISTS (SELECT 1 FROM changes g WHERE g.user_id = '{u}' AND g.doc_id = v.id AND g.kind = 'tree'))
                             OR id IN (SELECT g.principal FROM gardeners g WHERE {gard})))",
-                    gard = self.gardener_pred("g.owner_id")
+                    gard = self.gardener_pred("g.owner_id"),
+                    hist = self.history_pred("o.doc_id", "o.rowid")
                 )
             }
         };
@@ -1723,7 +1766,10 @@ impl BlockStore for SqliteStore {
              WHERE doc_id = ?1 AND deleted = 0 ORDER BY order_key"
         ))?;
         let rows = stmt.query_map(params![id.to_string()], row_to_block)?;
-        let blocks: Vec<Block> = rows.map(|r| build_block(r?)).collect::<Result<_>>()?;
+        let mut blocks: Vec<Block> = rows.map(|r| build_block(r?)).collect::<Result<_>>()?;
+        for b in blocks.iter_mut() {
+            self.mask_anchor(b);
+        }
 
         // assemble tree: children were already fetched in order_key order
         fn attach(parent: Option<Uuid>, pool: &mut Vec<Block>) -> Vec<BlockNode> {
@@ -1751,10 +1797,11 @@ impl BlockStore for SqliteStore {
             .query_row(params![id.to_string()], row_to_block)
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("block {id}")))?;
-        let block = build_block(raw)?;
-        if tenancy::ensure_visible_conn(&self.conn, self.scope, block.doc_id).is_err() {
+        let mut block = build_block(raw)?;
+        if tenancy::ensure_visible_conn(&self.conn, self.scope, block.doc_id).is_err() || !self.block_readable(&block) {
             return Err(StoreError::NotFound(format!("block {id}")));
         }
+        self.mask_anchor(&mut block);
         Ok(block)
     }
 
@@ -1798,7 +1845,7 @@ impl BlockStore for SqliteStore {
             "SELECT {OP_COLS} FROM ops
              WHERE doc_id = ?1 AND epoch_applied IS NOT NULL AND epoch_applied > ?2 AND {}
              ORDER BY epoch_applied, id",
-            self.history_pred("ops.doc_id", "ops.created_at")
+            self.history_pred("ops.doc_id", "ops.rowid")
         ))?;
         let rows = stmt.query_map(params![doc_id.to_string(), since_epoch], row_to_op)?;
         rows.map(|r| build_op(r?).map(|o| self.mask_op(o))).collect()
@@ -2081,6 +2128,7 @@ impl BlockStore for SqliteStore {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![target_block.to_string(), target.doc_id.to_string()], row_to_block)?;
+        // (the target is readable, so the anchors below are too)
         rows.map(|r| build_block(r?)).collect()
     }
 
@@ -2649,7 +2697,7 @@ impl BlockStore for SqliteStore {
                 .collect::<Vec<_>>()
                 .join(", "),
             self.vis("a.doc_id"),
-            self.history_pred("o.doc_id", "o.created_at")
+            self.history_pred("o.doc_id", "o.rowid")
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![doc_id.map(|d| d.to_string())], |r| {
@@ -3296,7 +3344,7 @@ impl SqliteStore {
                 .collect::<Vec<_>>()
                 .join(", "),
             self.vis("o.doc_id"),
-            self.history_pred("o.doc_id", "o.created_at")
+            self.history_pred("o.doc_id", "o.rowid")
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![principal.to_string(), limit as i64], |r| {
@@ -3531,11 +3579,12 @@ impl SqliteStore {
              FROM blocks b
              JOIN docs d ON d.id = b.doc_id
              JOIN principals p ON p.id = b.created_by AND p.kind = 'agent'
-             LEFT JOIN blocks t ON t.id = b.refers_to AND t.doc_id = b.doc_id AND {}
+             LEFT JOIN blocks t ON t.id = b.refers_to AND t.doc_id = b.doc_id AND {} AND (t.deleted = 0 OR {})
              WHERE b.block_type = 'comment' AND b.deleted = 0 AND {}
              ORDER BY b.id DESC",
             b_cols(),
             self.vis("t.doc_id"),
+            if self.scope.sees_all() { "1" } else { "0" },
             self.vis("d.id")
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -3622,8 +3671,9 @@ impl SqliteStore {
         let filter = match self.scope.user() {
             None => "c.user_id IS NULL".to_string(),
             Some(u) => format!(
-                "((c.user_id IS NULL AND {}) OR c.user_id = '{u}')",
-                self.vis("c.doc_id")
+                "((c.user_id IS NULL AND {} AND {}) OR c.user_id = '{u}')",
+                self.vis("c.doc_id"),
+                tenancy::feed_window_pred(u, "c")
             ),
         };
         let mut stmt = self.conn.prepare_cached(&format!(
@@ -3707,7 +3757,7 @@ impl SqliteStore {
             "SELECT {OP_COLS} FROM ops
              WHERE doc_id = ?1 AND epoch_applied IS NOT NULL AND {}
              ORDER BY epoch_applied DESC, id DESC LIMIT ?2",
-            self.history_pred("ops.doc_id", "ops.created_at")
+            self.history_pred("ops.doc_id", "ops.rowid")
         ))?;
         let rows = stmt.query_map(params![doc_id.to_string(), limit as i64], row_to_op)?;
         rows.map(|r| build_op(r?).map(|o| self.mask_op(o))).collect()
@@ -3727,8 +3777,9 @@ impl SqliteStore {
     pub fn raw_tending(&self) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT doc_id, principal, max(epoch_applied) FROM ops
-             WHERE epoch_applied IS NOT NULL AND {} GROUP BY doc_id",
-            self.vis("doc_id")
+             WHERE epoch_applied IS NOT NULL AND {} AND {} GROUP BY doc_id",
+            self.vis("doc_id"),
+            self.history_pred("ops.doc_id", "ops.rowid")
         ))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         rows.map(|r| Ok(r?)).collect()
@@ -4011,13 +4062,43 @@ impl SqliteStore {
     /// before — sharing a doc must not share what was deleted from it
     /// before. Readers who could see it all along have no such row and see
     /// everything. System/Local: no filter.
-    pub(crate) fn history_pred(&self, doc_col: &str, created_col: &str) -> String {
-        match self.scope.user() {
-            None => "1".into(),
-            Some(u) => format!(
-                "{created_col} > COALESCE((SELECT max(hc.at) FROM changes hc
-                                          WHERE hc.user_id = '{u}' AND hc.doc_id = {doc_col} AND hc.kind = 'tree'), '')"
-            ),
+    pub(crate) fn history_pred(&self, doc_col: &str, rowid_col: &str) -> String {
+        tenancy::history_pred(self.scope, doc_col, rowid_col)
+    }
+
+    /// A tombstoned block is readable only by a reader who had access when
+    /// it was deleted (its delete op is inside their history); a live block,
+    /// or System/Local, always.
+    pub(crate) fn block_readable(&self, b: &Block) -> bool {
+        if !b.deleted || self.scope.sees_all() {
+            return true;
+        }
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM ops WHERE target_block = ?1 AND op_type = 'delete'
+                       AND epoch_applied IS NOT NULL AND {})",
+                    self.history_pred("ops.doc_id", "ops.rowid")
+                ),
+                params![b.id.to_string()],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    }
+
+    /// A comment's anchor the reader cannot read is not theirs to know.
+    pub(crate) fn mask_anchor(&self, b: &mut Block) {
+        if self.scope.sees_all() {
+            return;
+        }
+        if let Some(r) = b.refers_to {
+            let ok = block_by_id_conn(&self.conn, r)
+                .ok()
+                .flatten()
+                .is_some_and(|t| t.doc_id == b.doc_id && self.block_readable(&t));
+            if !ok {
+                b.refers_to = None;
+            }
         }
     }
 

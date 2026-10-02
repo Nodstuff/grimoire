@@ -242,7 +242,7 @@ pub fn ensure_first_party(s: &mut SqliteStore, now: i64) -> taisce_store::Result
         })?;
     }
     // the app's DCR clients from before this pin keep their sessions
-    let n = s.oauth_grandfather_first_party(APP_REDIRECT_SCHEME, now)?;
+    let n = s.oauth_grandfather_first_party(APP_REDIRECT_URI, now)?;
     if n > 0 {
         tracing::info!(target: AUDIT, event = "client.first_party_grandfathered", clients = n);
     }

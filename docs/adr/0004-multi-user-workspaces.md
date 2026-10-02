@@ -200,6 +200,31 @@ gained (the client fetches them).
 - **Renames leave ambiguous links alone.** A link is rewritten only if every reader of the
   linking doc can see the renamed doc and none of them can see another doc of that title.
 
+### 5c. Review round 3
+
+- **Tombstones honour the history cut (S1).** For a user scope a deleted block is NotFound
+  unless its delete op is inside the reader's history (they had access when it was deleted);
+  a comment's `refers_to` is masked on every read for a reader who cannot read its anchor
+  (`read_doc`, `read_block`, comment threads; flags drop deleted targets). Every by-id block
+  path goes through `read_block` (full id, `^ref`, `read_doc block:`/`section:`, `related`,
+  `add_comment`); `prior` pre-images only ride on ops inside the cut.
+- **The cut is monotonic**: a grant row records the ops rowid high-water mark
+  (`changes.ops_mark`); history, tending and the principals list compare op rowids against
+  it, never timestamps.
+- **The change feed shows only rows inside the reader's access window** (after their latest
+  grant row for the doc); the page's `seq` is still the journal head, so the cursor advances
+  exactly as before. Push uses the same window.
+- **Grandfathering pins only real sign-ins**: the app's exact redirect AND a live grant
+  (unrevoked, unexpired refresh token). A pre-registered client nobody signed in with is not
+  pinned.
+- **Names are compared normalised**: invisible/format characters stripped, NFKC, case-folded,
+  whitespace collapsed, then the UTS #39 confusable skeleton (`unicode-security`, the
+  unicode-rs crate rustc's confusable lints use); mixed-script names (e.g. Latin + Cyrillic)
+  and names carrying invisible characters are refused. `principals.name_key` has a partial
+  UNIQUE index for humans, so a CLI and the server cannot race two people into one name.
+- **Revocation is per grant**: every app sign-in shares the client `taisce-app`; the CLI
+  revokes grants and tokens by id, never by client (noted in `taisce auth revoke --help`).
+
 **Stored cross-doc references and how each is scoped**
 
 | Reference | Where | Scoped by |
@@ -260,6 +285,12 @@ Additive and idempotent, one transaction for the data part:
 - Sign-out / account switch: wipe the per-user cache (docs, blocks, cursor, pending writes);
   cursors are per user, never shared across accounts on one device.
 - 403 `forbidden` on a write means "read-only here" (viewer), not a bug.
+- Follow-up (round 3, recorded, not built): first-party sign-in through a universal-link
+  https redirect (an `apple-app-site-association` file on taisce.null.ie and an
+  `https://taisce.null.ie/...` redirect the app claims) instead of the `ie.null.taisce:`
+  custom scheme any local app could claim; and the passkey page showing which device and
+  when is asking to sign in. Both need the app; until then first party rests on the pinned
+  client_id plus the custom-scheme redirect.
 
 The API stays backward compatible: every existing field is still present, new fields are
 additive, and a single-user server answers exactly as before.
@@ -306,6 +337,10 @@ additive, and a single-user server answers exactly as before.
    that such descendants exist, never which.
 10. A visible doc whose parent the viewer cannot see is a root for them (`parent_id` is
     masked to null in lists, reads and change summaries).
+
+Accepted as is after round 3: an unlabelled doc a member moved under the owner's workspace
+doc travels with the owner's tree when the workspace is deleted (it is part of that tree,
+not a labelled root the member contributed).
 
 Accepted as is after the review (no change): the global change-feed `seq` and the head the
 stream wakes on; `change_stamp`'s user variant still moves with corpus-wide bm25 statistics

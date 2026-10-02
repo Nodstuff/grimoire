@@ -5,6 +5,7 @@
 //! NotFound (never Forbidden).
 
 use taisce_store::*;
+use taisce_store::tenancy::name_key;
 use uuid::Uuid;
 
 fn para(content: &str) -> OpInput {
@@ -954,4 +955,128 @@ fn a_rename_leaves_ambiguous_links_alone() {
     let s = t.store.lock(Scope::User(t.b));
     assert!(serde_json::to_string(&s.read_doc(b_note).unwrap()).unwrap().contains("[[Groceries]]"), "her own link stands");
     assert!(serde_json::to_string(&s.read_doc(b_other).unwrap()).unwrap().contains("[[Jobs]]"), "an unambiguous link follows");
+}
+
+// ---- round-3 regressions (r1–r3) ----
+
+fn ins(c: &str) -> (Uuid, OpInput) {
+    let id = Uuid::now_v7();
+    (id, OpInput { kind: OpKind::Insert { block_id: id, parent_id: None, order_key: String::new(), block_type: BlockType::Paragraph, content: c.into(), refers_to: None }, source_refs: vec![] })
+}
+fn del(t: Uuid) -> OpInput {
+    OpInput { kind: OpKind::Delete { target: t }, source_refs: vec![] }
+}
+
+/// r1: the history cut holds for unshare → edit → reshare, for access
+/// through an ancestor's label, for the principals and tending lists, and
+/// for the change feed (which shows only rows from inside the window, while
+/// its cursor still advances). The cut is the ops rowid, not a clock: no
+/// sleeps needed.
+#[test]
+fn r1_history_cut_variants_hold() {
+    let t = setup();
+    // (a) unshare / edit / reshare
+    t.store.lock(Scope::User(t.a)).unshare_workspace(t.family, t.b).unwrap();
+    {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let e = s.get_doc(t.shared_doc).unwrap().current_epoch;
+        let (id, op) = ins("written while unshared: WHILE-UNSHARED");
+        s.apply(t.shared_doc, e, t.a_human, vec![op]).unwrap();
+        let e = s.get_doc(t.shared_doc).unwrap().current_epoch;
+        s.apply(t.shared_doc, e, t.a_human, vec![del(id)]).unwrap();
+    }
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    let dump = |v: &Vec<LedgerOp>| serde_json::to_string(v).unwrap();
+    assert!(!dump(&t.store.lock(Scope::User(t.b)).ops_since(t.shared_doc, 0).unwrap()).contains("WHILE-UNSHARED"));
+    // the feed: no rows from while she had no access, but the grant row and the head
+    let page = t.store.lock(Scope::User(t.b)).changes_since(0, 10_000).unwrap();
+    let rows: Vec<&Change> = page.changes.iter().filter(|c| c.doc_id == t.shared_doc.to_string()).collect();
+    let grant = rows.iter().rev().find(|c| c.access.as_deref() == Some("granted")).expect("a grant row");
+    for c in &rows {
+        assert!(c.access.is_some() || c.seq > grant.seq, "a global row from outside her window: {c:?}");
+    }
+    assert_eq!(page.seq, t.store.lock(Scope::System).latest_change_seq().unwrap(), "the cursor is the journal head");
+    // (b) access through an ancestor's label
+    let c = {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let p = s.create_doc("Parent folder", None, t.a_human).unwrap().id;
+        let (c, _) = s.create_doc_with_ops("Child note", Some(p), t.a_human, vec![ins("ANCESTOR-PRE secret").1]).unwrap();
+        let tree = s.read_doc(c.id).unwrap();
+        s.apply(c.id, tree.doc.current_epoch, t.a_human, vec![del(tree.roots[0].block.id)]).unwrap();
+        s.set_doc_workspace(p, Some(t.family), t.a_human).unwrap();
+        c.id
+    };
+    assert!(t.store.lock(Scope::User(t.b)).ops_since(c, 0).unwrap().is_empty());
+    // (c) an agent that only wrote before her access stays nameless
+    let agent = t.store.lock(Scope::User(t.a)).create_principal(PrincipalKind::Agent, "claude:tom-divorce-notes", None).unwrap().id;
+    let d = {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let (d, _) = s.create_doc_with_ops("Later shared", None, t.a_human, vec![]).unwrap();
+        s.apply(d.id, 0, agent, vec![ins("agent text").1]).unwrap();
+        let tree = s.read_doc(d.id).unwrap();
+        s.apply(d.id, tree.doc.current_epoch, t.a_human, vec![del(tree.roots[0].block.id)]).unwrap();
+        s.set_doc_workspace(d.id, Some(t.family), t.a_human).unwrap();
+        d.id
+    };
+    let s = t.store.lock(Scope::User(t.b));
+    let names: Vec<String> = s.list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
+    assert!(names.iter().all(|n| !n.contains("tom-divorce-notes")), "{names:?}");
+    assert!(s.raw_tending().unwrap().iter().all(|(dd, p)| *dd != d.to_string() || *p != agent.to_string()));
+}
+
+/// r2 / S1: a block deleted before the reader had access is gone for them:
+/// by id, through a surviving comment's anchor, and as a ref.
+#[test]
+fn r2_a_pre_access_tombstone_is_not_found() {
+    let t = setup();
+    let (d, secret) = {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let (sid, op) = ins("TOMBSTONE secret: salary 90k");
+        let (d, _) = s.create_doc_with_ops("Plans", None, t.a_human, vec![op, ins("keep").1]).unwrap();
+        s.add_comment(sid, t.a_human, "check this number", None).unwrap();
+        let e = s.get_doc(d.id).unwrap().current_epoch;
+        s.apply(d.id, e, t.a_human, vec![del(sid)]).unwrap();
+        s.set_doc_workspace(d.id, Some(t.family), t.a_human).unwrap();
+        (d.id, sid)
+    };
+    let s = t.store.lock(Scope::User(t.b));
+    let tree = serde_json::to_string(&s.read_doc(d).unwrap()).unwrap();
+    assert!(!tree.contains(&secret.to_string()), "the anchor id is masked: {tree}");
+    not_found(s.read_block(secret));
+    let suffix = &secret.simple().to_string()[26..];
+    assert!(s.blocks_by_id_suffix(suffix).unwrap().is_empty());
+    drop(s);
+    // the owner, who saw it deleted, still reads the tombstone and the anchor
+    let s = t.store.lock(Scope::User(t.a));
+    assert!(s.read_block(secret).unwrap().deleted);
+    assert!(serde_json::to_string(&s.read_doc(d).unwrap()).unwrap().contains(&secret.to_string()));
+    drop(s);
+    // a block deleted while B could see it stays readable to her
+    let kept = {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let (k, op) = ins("deleted after the share");
+        let e = s.get_doc(d).unwrap().current_epoch;
+        s.apply(d, e, t.a_human, vec![op]).unwrap();
+        let e = s.get_doc(d).unwrap().current_epoch;
+        s.apply(d, e, t.a_human, vec![del(k)]).unwrap();
+        k
+    };
+    assert!(t.store.lock(Scope::User(t.b)).read_block(kept).unwrap().deleted);
+}
+
+/// r3: confusable and invisible-character names never get past the
+/// uniqueness check, and mixed-script names are refused.
+#[test]
+fn r3_confusable_names_are_taken() {
+    let t = setup();
+    let mut s = t.store.lock(Scope::User(t.b));
+    for n in ["TOM", "Т\u{043E}m", "To\u{200B}m", "tom\u{00A0}", "ＴＯＭ", "T\u{043E}m"] {
+        assert!(s.rename_principal(t.b_human, n).is_err(), "{n:?} must be refused");
+    }
+    s.rename_principal(t.b_human, "Аня").unwrap(); // a single-script Cyrillic name is fine
+    drop(s);
+    assert_eq!(name_key("ＴＯＭ"), name_key("tom"));
+    assert_eq!(name_key("To\u{200B}m"), name_key("tom"));
+    // the index closes the race: a second human with the same key cannot be inserted
+    assert!(t.store.lock(Scope::System).create_principal(PrincipalKind::Human, "tom", None).is_err());
 }

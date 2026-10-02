@@ -294,6 +294,9 @@ enum AuthCmd {
     /// List users, passkeys and live OAuth grants.
     List,
     /// Revoke an OAuth grant, or delete a passkey, by id (or unique prefix).
+    /// Revocation is always per grant (one sign-in on one device): every
+    /// Taisce app sign-in shares the client `taisce-app`, so never revoke "by
+    /// client" — that would sign out every person's every device.
     Revoke { id: String },
     /// Personal access tokens: static bearers for /mcp only.
     Token {

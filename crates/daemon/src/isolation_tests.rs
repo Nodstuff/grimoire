@@ -132,6 +132,10 @@ const COVERAGE: &[(&str, &str)] = &[
     ("mcp:append", "agent_principals_are_per_person"),
     ("/api/todo", "a_connectors_get_writes_nothing"),
     ("/api/devices", "first_party_is_a_pinned_client_not_a_declared_redirect"),
+    ("/api/doc/{id}", "a_pre_access_tombstone_is_gone_on_every_block_path"),
+    ("mcp:read_doc", "a_pre_access_tombstone_is_gone_on_every_block_path"),
+    ("mcp:add_comment", "a_pre_access_tombstone_is_gone_on_every_block_path"),
+    ("mcp:related", "a_pre_access_tombstone_is_gone_on_every_block_path"),
     ("/api/doc/{id}/history", "agent_principals_are_per_person"),
 ];
 
@@ -1220,22 +1224,81 @@ async fn first_party_is_a_pinned_client_not_a_declared_redirect() {
     assert_eq!(st, StatusCode::FORBIDDEN);
     let (st, _) = fx.call(&sneaky, "POST", &format!("/api/doc/{}/rename", fx.b_doc), Some(json!({"title": "x"}))).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
-    // grandfathering: an app-scheme DCR client from before the pin is first
-    // party after the one-time pass; the pass never runs again
+    // grandfathering (round 3): only the app's exact redirect AND a live
+    // grant. Tom's iPhone and Mac (signed in, refresh tokens live) carry
+    // over; a registration nobody signed in with, or a revoked one, does not;
+    // and the pass never runs again
     let mut raw = SqliteStore::open_in_memory().unwrap();
-    let old = OAuthClient {
-        client_id: "dcr_old_app".into(),
+    let h = raw.create_principal(PrincipalKind::Human, "Tom", None).unwrap().id;
+    let tom = raw.auth_ensure_owner(h, "Tom", now()).unwrap().id;
+    let client = |id: &str, uri: &str| OAuthClient {
+        client_id: id.into(),
         kind: "dcr".into(),
         client_name: "Taisce".into(),
-        redirect_uris: vec![crate::auth::APP_REDIRECT_URI.into()],
+        redirect_uris: vec![uri.into()],
         metadata: "{}".into(),
         created_at: 1,
         refresh_at: None,
     };
-    raw.oauth_upsert_client(&old).unwrap();
+    let grant = |raw: &mut SqliteStore, id: &str| {
+        let g = Grant { id: Uuid::now_v7(), client_id: id.into(), user_id: tom, resource: None, scope: crate::auth::SCOPE.into(), created_at: now(), revoked_at: None, revoke_why: None };
+        raw.oauth_issue_grant(None, &g, &hash_secret(&random_token()), now() + 3600, &hash_secret(&random_token()), now() + 86400).unwrap();
+        g.id
+    };
+    for id in ["dcr_tom_iphone", "dcr_tom_mac", "dcr_squatter", "dcr_revoked"] {
+        raw.oauth_upsert_client(&client(id, crate::auth::APP_REDIRECT_URI)).unwrap();
+    }
+    grant(&mut raw, "dcr_tom_iphone");
+    grant(&mut raw, "dcr_tom_mac");
+    let gone = grant(&mut raw, "dcr_revoked");
+    raw.oauth_revoke_grant(&gone.to_string(), "test", now()).unwrap();
     crate::auth::ensure_first_party(&mut raw, now()).unwrap();
-    assert!(raw.oauth_is_first_party("dcr_old_app").unwrap(), "the app's live session keeps working");
-    raw.oauth_upsert_client(&OAuthClient { client_id: "dcr_new_claim".into(), ..old }).unwrap();
+    assert!(raw.oauth_is_first_party("dcr_tom_iphone").unwrap() && raw.oauth_is_first_party("dcr_tom_mac").unwrap(), "Tom's live app sessions carry over");
+    assert!(!raw.oauth_is_first_party("dcr_squatter").unwrap(), "a pre-registered client nobody signed in with is not pinned");
+    assert!(!raw.oauth_is_first_party("dcr_revoked").unwrap(), "a revoked grant does not pin");
+    raw.oauth_upsert_client(&client("dcr_new_claim", crate::auth::APP_REDIRECT_URI)).unwrap();
+    grant(&mut raw, "dcr_new_claim");
     crate::auth::ensure_first_party(&mut raw, now()).unwrap();
     assert!(!raw.oauth_is_first_party("dcr_new_claim").unwrap(), "a later claim is never grandfathered");
+}
+
+/// Round-3 S1, end to end: a block A deleted before B had access never
+/// reads back for B — not the anchor id in /api/doc, not read_doc's
+/// section/block by full id or ^ref, not related, not add_comment.
+#[tokio::test]
+async fn a_pre_access_tombstone_is_gone_on_every_block_path() {
+    let fx = fixture();
+    fx.store.lock(Scope::User(fx.a)).share_workspace(fx.family, fx.b, Role::Editor).unwrap();
+    let (d, sid) = {
+        let mut s = fx.store.lock(Scope::User(fx.a));
+        let (sid, op) = para("zebrasecret TOMBSTONE salary 90k");
+        let (d, _) = s.create_doc_with_ops("Plans", None, fx.a_human, vec![op, para("keep").1]).unwrap();
+        s.add_comment(sid, fx.a_human, "check this number", None).unwrap();
+        let e = s.get_doc(d.id).unwrap().current_epoch;
+        s.apply(d.id, e, fx.a_human, vec![OpInput { kind: OpKind::Delete { target: sid }, source_refs: vec![] }]).unwrap();
+        s.set_doc_workspace(d.id, Some(fx.family), fx.a_human).unwrap();
+        (d.id, sid)
+    };
+    let (st, out) = fx.b("GET", &format!("/api/doc/{d}"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(!out.contains(&sid.to_string()), "the anchor id is masked: {out}");
+    let short = taisce_store::locate::short_ref(sid);
+    for args in [
+        json!({"doc_id": d.to_string(), "section": sid.to_string()}),
+        json!({"doc_id": d.to_string(), "section": short}),
+        json!({"doc_id": d.to_string(), "block": sid.to_string()}),
+        json!({"doc_id": d.to_string(), "comments": true}),
+    ] {
+        let (_, o) = fx.tool(&fx.b_pat, "read_doc", args.clone()).await;
+        // (an error may echo the id she asked about; nothing else of it)
+        let echoed = args.to_string().contains(&sid.to_string());
+        assert!(!o.contains("90k") && (echoed || !o.contains(&sid.to_string())), "read_doc {args}: {o}");
+    }
+    let (is_err, o) = fx.tool(&fx.b_pat, "related", json!({"block_id": sid.to_string()})).await;
+    assert!(is_err && !o.contains("90k"), "{o}");
+    let (is_err, o) = fx.tool(&fx.b_pat, "add_comment", json!({"block_id": sid.to_string(), "text": "x"})).await;
+    assert!(is_err && o.contains("not found"), "{o}");
+    // the history of the doc starts at her access: no pre-share ops
+    let (_, hist) = fx.b("GET", &format!("/api/doc/{d}/history"), None).await;
+    assert!(!hist.contains("90k"), "{hist}");
 }

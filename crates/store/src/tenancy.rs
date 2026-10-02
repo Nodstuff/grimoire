@@ -270,13 +270,92 @@ pub(crate) fn link_reaches(conn: &Connection, linking: Uuid, target: Uuid, title
 /// member lists and the CLI's `--user <name>` all go by them. `except` is
 /// the principal being renamed.
 pub(crate) fn name_taken_conn(conn: &Connection, name: &str, except: Option<Uuid>) -> Result<bool> {
+    // compared normalised (`name_key`) against every principal and user:
+    // a handful of rows, so in Rust; the unique index on human name keys
+    // closes the race between two writers
+    let key = name_key(name);
     let except = except.map(|e| e.to_string());
-    Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM principals WHERE display_name = ?1 COLLATE NOCASE AND id IS NOT ?2)
-             OR EXISTS (SELECT 1 FROM auth_users WHERE name = ?1 COLLATE NOCASE AND principal_id IS NOT ?2)",
-        params![name.trim(), except],
-        |r| r.get(0),
-    )?)
+    let mut st = conn.prepare_cached(
+        "SELECT id, display_name FROM principals
+         UNION ALL SELECT principal_id, name FROM auth_users",
+    )?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (id, n) = row?;
+        if Some(&id) != except.as_ref() && name_key(&n) == key {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// History cut (ADR 0004 N2, monotonic since round 3): rows whose ops
+/// rowid is after the reader's latest grant mark for the doc. No grant row =
+/// they saw it all along.
+pub(crate) fn history_pred(scope: Scope, doc_col: &str, rowid_col: &str) -> String {
+    match scope.user() {
+        None => "1".into(),
+        Some(u) => format!(
+            "{rowid_col} > COALESCE((SELECT max(hc.ops_mark) FROM changes hc
+                                     WHERE hc.user_id = '{u}' AND hc.doc_id = {doc_col} AND hc.kind = 'tree'), 0)"
+        ),
+    }
+}
+
+/// The change feed's window: a global row `alias` is shown to `user` only if
+/// it came after their latest grant for that doc (rows from before they had
+/// access, or from a revoked stretch, stay out). The cursor still advances:
+/// the page's `seq` is the journal head.
+pub(crate) fn feed_window_pred(user: Uuid, alias: &str) -> String {
+    format!(
+        "{alias}.seq > COALESCE((SELECT max(g.seq) FROM changes g
+                                 WHERE g.user_id = '{user}' AND g.doc_id = {alias}.doc_id AND g.kind = 'tree'), 0)"
+    )
+}
+
+/// Invisible / format characters a name must not carry (zero-width,
+/// bidi controls, soft hyphen, BOM, …).
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}' | '\u{180E}'
+        | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
+        | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}')
+        || c.is_control()
+}
+
+/// A person's name as compared for uniqueness: invisible characters out,
+/// NFKC, case-folded, whitespace collapsed, then the TR39 confusable
+/// skeleton (so `Тоm` with Cyrillic letters, `ＴＯＭ` and `To\u{200B}m`
+/// all meet `tom`).
+pub fn name_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let cleaned: String = name.chars().filter(|c| !is_invisible(*c)).collect();
+    let folded: String = cleaned.nfkc().collect::<String>().to_lowercase();
+    let collapsed = folded.split_whitespace().collect::<Vec<_>>().join(" ");
+    unicode_security::confusable_detection::skeleton(&collapsed).collect::<String>().to_lowercase()
+}
+
+/// A name a person may carry: no invisible characters, and one script (a
+/// Latin/Cyrillic/Greek mix is how confusables are built).
+pub(crate) fn check_person_name(name: &str) -> Result<()> {
+    use unicode_security::MixedScript;
+    if name.chars().any(is_invisible) {
+        return Err(StoreError::InvalidOp("a name may not contain invisible characters".into()));
+    }
+    if !name.is_single_script() {
+        return Err(StoreError::InvalidOp("a name must be written in one script".into()));
+    }
+    Ok(())
+}
+
+/// A unique-name index violation, as the store's "taken" error.
+pub(crate) fn name_conflict(e: rusqlite::Error) -> StoreError {
+    match &e {
+        rusqlite::Error::SqliteFailure(f, Some(m)) if f.code == rusqlite::ErrorCode::ConstraintViolation && m.contains("name_key") => {
+            StoreError::InvalidOp("that name is taken".into())
+        }
+        _ => e.into(),
+    }
 }
 
 /// Is `principal` an agent (the share gate's subject)?
@@ -349,8 +428,9 @@ pub(crate) fn journal_access_diff(conn: &Connection, before: AccessSnapshot) -> 
     }
     let after: HashMap<Uuid, HashSet<String>> = access_snapshot(conn)?.into_iter().collect();
     let mut st = conn.prepare_cached(
-        "INSERT INTO changes (doc_id, kind, epoch, user_id)
-         SELECT ?1, ?2, (SELECT current_epoch FROM docs WHERE id = ?1), ?3",
+        "INSERT INTO changes (doc_id, kind, epoch, user_id, ops_mark)
+         SELECT ?1, ?2, (SELECT current_epoch FROM docs WHERE id = ?1), ?3,
+                CASE WHEN ?2 = 'tree' THEN (SELECT COALESCE(max(rowid), 0) FROM ops) END",
     )?;
     for (user, was) in before {
         let now = after.get(&user).cloned().unwrap_or_default();
@@ -652,8 +732,9 @@ impl SqliteStore {
             let n: i64 = self.conn.query_row(
                 &format!(
                     "SELECT EXISTS (SELECT 1 FROM changes c WHERE c.seq > ?1
-                       AND ((c.user_id IS NULL AND c.doc_id IN ({})) OR c.user_id = ?2))",
-                    vis_subquery(user, None)
+                       AND ((c.user_id IS NULL AND c.doc_id IN ({}) AND {}) OR c.user_id = ?2))",
+                    vis_subquery(user, None),
+                    feed_window_pred(user, "c")
                 ),
                 params![since, user.to_string()],
                 |r| r.get(0),

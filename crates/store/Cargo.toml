@@ -10,6 +10,9 @@ uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# ADR 0004: people's names are compared NFKC + case-folded + TR39 skeleton
+unicode-normalization = "0.1.25"
+unicode-security = "0.1.2"
 
 [dev-dependencies]
 tempfile = "3"

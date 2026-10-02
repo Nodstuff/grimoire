@@ -201,6 +201,7 @@ impl SqliteStore {
         if name.is_empty() || name.chars().count() > 64 {
             return Err(StoreError::InvalidOp("a user's name must be 1..64 characters".into()));
         }
+        crate::tenancy::check_person_name(name)?;
         if crate::tenancy::name_taken_conn(&self.conn, name, None)? {
             return Err(StoreError::InvalidOp(format!("the name {name:?} is taken (a person or an agent has it)")));
         }
@@ -211,9 +212,10 @@ impl SqliteStore {
         let id = Uuid::now_v7();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO principals (id, kind, display_name) VALUES (?1, 'human', ?2)",
-            params![principal.to_string(), name],
-        )?;
+            "INSERT INTO principals (id, kind, display_name, name_key) VALUES (?1, 'human', ?2, ?3)",
+            params![principal.to_string(), name, crate::tenancy::name_key(name)],
+        )
+        .map_err(crate::tenancy::name_conflict)?;
         tx.execute(
             "INSERT INTO auth_users (id, principal_id, name, role, created_at) VALUES (?1, ?2, ?3, 'member', ?4)",
             params![id.to_string(), principal.to_string(), name, now],
@@ -453,7 +455,7 @@ impl SqliteStore {
     /// clients were pinned whose every redirect is the app's scheme become
     /// first party, so the app's live sessions keep working. Returns how
     /// many; later registrations never go through here.
-    pub fn oauth_grandfather_first_party(&mut self, app_scheme: &str, now: i64) -> Result<usize> {
+    pub fn oauth_grandfather_first_party(&mut self, app_redirect: &str, now: i64) -> Result<usize> {
         const KEY: &str = "auth.first_party_grandfathered";
         let done: Option<String> = self
             .conn
@@ -462,15 +464,24 @@ impl SqliteStore {
         if done.is_some() {
             return Ok(0);
         }
+        // only clients someone actually signed in with: the app's exact
+        // redirect AND a live grant (unrevoked, with an unexpired refresh
+        // token). A registration nobody completed — anyone could DCR the
+        // scheme before this build — is never pinned.
         let rows: Vec<(String, String)> = {
-            let mut st = self.conn.prepare("SELECT client_id, redirect_uris FROM oauth_clients WHERE kind = 'dcr'")?;
-            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+            let mut st = self.conn.prepare(
+                "SELECT c.client_id, c.redirect_uris FROM oauth_clients c
+                 WHERE c.kind = 'dcr' AND EXISTS (
+                     SELECT 1 FROM oauth_grants g JOIN oauth_refresh_tokens t ON t.grant_id = g.id
+                     WHERE g.client_id = c.client_id AND g.revoked_at IS NULL AND t.expires_at > ?1)",
+            )?;
+            st.query_map([now], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
         };
         let tx = self.conn.unchecked_transaction()?;
         let mut n = 0;
         for (id, uris) in rows {
             let uris: Vec<String> = serde_json::from_str(&uris).unwrap_or_default();
-            if !uris.is_empty() && uris.iter().all(|u| u.starts_with(app_scheme)) {
+            if uris.len() == 1 && uris[0] == app_redirect {
                 tx.execute("INSERT OR IGNORE INTO oauth_first_party (client_id, added_at) VALUES (?1, ?2)", params![id, now])?;
                 n += 1;
             }
