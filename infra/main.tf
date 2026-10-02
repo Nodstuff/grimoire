@@ -4,6 +4,15 @@
 
 terraform {
   required_version = ">= 1.13.0"
+  # State lives off the laptop in its own versioned bucket (created by hand:
+  # the box's role can reach the backups bucket, never this one).
+  backend "s3" {
+    bucket       = "taisce-tfstate-895102116452"
+    key          = "taisce/terraform.tfstate"
+    region       = "eu-west-1"
+    encrypt      = true
+    use_lockfile = true
+  }
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -214,6 +223,8 @@ resource "aws_instance" "taisce" {
     volume_size           = 10
     encrypted             = true
     delete_on_termination = false
+    # default_tags reach the volume at create but not on import; say them here
+    tags = { Project = "taisce", ManagedBy = "opentofu" }
   }
 
   # A new AMI release must not replace the box (and its data) on the next apply.
