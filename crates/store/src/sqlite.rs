@@ -337,6 +337,11 @@ fn additive_column_migrations(conn: &Connection) -> Result<()> {
         }
         add_column_if_missing(conn, "gardeners", "owner_id", "TEXT")?;
     }
+    // which passkey opened a sign-in (revoking the passkey revokes them);
+    // additive: existing grants carry NULL
+    add_column_if_missing(conn, "oauth_codes", "credential_id", "TEXT")?;
+    add_column_if_missing(conn, "oauth_grants", "credential_id", "TEXT")?;
+    add_column_if_missing(conn, "auth_web_sessions", "credential_id", "TEXT")?;
     Ok(())
 }
 

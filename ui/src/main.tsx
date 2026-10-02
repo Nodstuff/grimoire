@@ -1,6 +1,7 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
+import AuthGate from './SignIn'
 import './style.css'
 
 // The shell opens the page as /?admin_token=… (the per-boot token the daemon
@@ -21,6 +22,9 @@ try {
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
+    {/* SERVER mode: a passkey sign-in before anything loads (LOCAL: passes straight through) */}
+    <AuthGate>
+      <App />
+    </AuthGate>
   </React.StrictMode>,
 )

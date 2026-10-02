@@ -21,12 +21,18 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use webauthn_rs::prelude::{
-    Passkey, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
+    DiscoverableAuthentication, DiscoverableKey, Passkey, PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
+    RequestChallengeResponse,
 };
 
 const AUTHZ_TTL: i64 = 600;
 const MAX_AUTHZ: usize = 1000;
 const MAX_ENROLL: usize = 100;
+/// Outstanding sign-in requests (and web ceremonies) one IP may hold: a
+/// flood from one address evicts only its own oldest, never anyone else's.
+pub(super) const MAX_PENDING_PER_IP: usize = 8;
+/// A passkey challenge is good for two minutes after the button is pressed.
+pub const CEREMONY_TTL: i64 = 120;
 
 /// An authorization request waiting for its passkey.
 #[derive(Clone)]
@@ -39,7 +45,17 @@ pub struct AuthzRequest {
     pub resource: Option<String>,
     pub scope: String,
     pub created: i64,
-    pub ceremony: Option<PasskeyAuthentication>,
+    /// the IP that opened the request (`MAX_PENDING_PER_IP`)
+    pub ip: String,
+    /// the outstanding challenge and when it was issued (`CEREMONY_TTL`)
+    pub ceremony: Option<(i64, DiscoverableAuthentication)>,
+}
+
+/// A web UI sign-in challenge (`auth::web`).
+pub struct WebCeremony {
+    pub ip: String,
+    pub at: i64,
+    pub ceremony: DiscoverableAuthentication,
 }
 
 pub struct Enrollment {
@@ -54,19 +70,49 @@ pub struct Enrollment {
 pub struct Pending {
     authz: HashMap<String, AuthzRequest>,
     enroll: HashMap<String, Enrollment>,
+    /// web UI sign-ins (`auth::web`): ceremony id → challenge
+    pub(super) web: HashMap<String, WebCeremony>,
 }
 
 impl Pending {
-    pub fn add_authz(&mut self, r: AuthzRequest) -> String {
+    /// Hold a sign-in request. One IP holds at most `MAX_PENDING_PER_IP`
+    /// (its own oldest goes); when the whole map is full the new request is
+    /// refused (None) rather than evicting someone else's.
+    pub fn add_authz(&mut self, r: AuthzRequest) -> Option<String> {
         self.sweep(r.created);
-        if self.authz.len() >= MAX_AUTHZ
-            && let Some(oldest) = self.authz.iter().min_by_key(|(_, v)| v.created).map(|(k, _)| k.clone())
+        let mine: Vec<(String, i64)> =
+            self.authz.iter().filter(|(_, v)| v.ip == r.ip).map(|(k, v)| (k.clone(), v.created)).collect();
+        if mine.len() >= MAX_PENDING_PER_IP
+            && let Some((oldest, _)) = mine.iter().min_by_key(|(_, t)| *t)
         {
-            self.authz.remove(&oldest);
+            self.authz.remove(oldest);
+        } else if self.authz.len() >= MAX_AUTHZ {
+            return None;
         }
         let id = random_token();
         self.authz.insert(id.clone(), r);
-        id
+        Some(id)
+    }
+
+    #[cfg(test)]
+    pub fn has_authz(&self, id: &str) -> bool {
+        self.authz.contains_key(id)
+    }
+
+    /// Hold a web UI sign-in challenge, under the same per-IP rule.
+    pub(super) fn add_web(&mut self, c: WebCeremony) -> Option<String> {
+        self.sweep(c.at);
+        let mine: Vec<(String, i64)> = self.web.iter().filter(|(_, v)| v.ip == c.ip).map(|(k, v)| (k.clone(), v.at)).collect();
+        if mine.len() >= MAX_PENDING_PER_IP
+            && let Some((oldest, _)) = mine.iter().min_by_key(|(_, t)| *t)
+        {
+            self.web.remove(oldest);
+        } else if self.web.len() >= MAX_AUTHZ {
+            return None;
+        }
+        let id = random_token();
+        self.web.insert(id.clone(), c);
+        Some(id)
     }
 
     fn authz_live(&mut self, id: &str, now: i64) -> Option<&mut AuthzRequest> {
@@ -76,6 +122,7 @@ impl Pending {
     pub fn sweep(&mut self, now: i64) {
         self.authz.retain(|_, r| now - r.created < AUTHZ_TTL);
         self.enroll.retain(|_, e| now - e.created < super::ENROLL_TTL);
+        self.web.retain(|_, c| now - c.at < CEREMONY_TTL);
     }
 }
 
@@ -95,7 +142,7 @@ pub fn cred_id_text(pk: &Passkey) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk.cred_id().as_ref())
 }
 
-fn json_err(status: StatusCode, msg: &str) -> Response {
+pub(super) fn json_err(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({"error": msg}))).into_response()
 }
 
@@ -108,12 +155,12 @@ fn same_origin(st: &AuthState, headers: &HeaderMap) -> bool {
     }
 }
 
-fn limited(st: &AuthState, req: &Request) -> bool {
+pub(super) fn limited(st: &AuthState, req: &Request) -> bool {
     let ip = super::client_ip(&st.cfg, req.headers(), req.extensions());
     !st.limiter.allow(Class::Login, &ip)
 }
 
-async fn json_body<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, Response> {
+pub(super) async fn json_body<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, Response> {
     let Json(v) = <Json<T> as axum::extract::FromRequest<()>>::from_request(req, &())
         .await
         .map_err(|_| json_err(StatusCode::BAD_REQUEST, "malformed request"))?;
@@ -142,22 +189,15 @@ async fn login_begin(State(st): State<AuthState>, req: Request) -> Response {
         Ok(b) => b,
         Err(r) => return r,
     };
-    // every user's passkeys: the assertion names the credential, and the
-    // credential names the user (no username field to type)
-    let creds = with_store(&st.store, taisce_store::Scope::System, |s| s.auth_credentials(None).unwrap_or_default()).await;
-    let keys = passkeys_of(&creds);
-    if keys.is_empty() {
-        return json_err(StatusCode::SERVICE_UNAVAILABLE, "no passkey enrolled");
-    }
-    let (options, ceremony) = match st.webauthn.start_passkey_authentication(&keys) {
+    let (options, ceremony) = match start_discoverable(&st).await {
         Ok(x) => x,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("webauthn: {e}")),
+        Err(r) => return r,
     };
     let mut p = st.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(r) = p.authz_live(&body.req, now()) else {
         return json_err(StatusCode::GONE, "this sign-in request expired; start again from the app");
     };
-    r.ceremony = Some(ceremony);
+    r.ceremony = Some((now(), ceremony));
     Json(options).into_response()
 }
 
@@ -184,40 +224,91 @@ async fn login_finish(State(st): State<AuthState>, req: Request) -> Response {
         let Some(r) = p.authz_live(&body.req, now()) else {
             return json_err(StatusCode::GONE, "this sign-in request expired; start again from the app");
         };
-        let Some(c) = r.ceremony.take() else {
+        let Some((at, c)) = r.ceremony.take() else {
             return json_err(StatusCode::BAD_REQUEST, "no passkey challenge outstanding; press the button again");
         };
+        if now() - at >= CEREMONY_TTL {
+            return json_err(StatusCode::GONE, "the passkey prompt timed out; press the button again");
+        }
         (r.clone(), c)
     };
-    let result = match st.webauthn.finish_passkey_authentication(&body.credential, &ceremony) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(target: AUDIT, event = "login.fail", client = authz.client_id, "passkey assertion rejected: {e}");
-            return json_err(StatusCode::UNAUTHORIZED, "passkey not accepted");
-        }
-    };
-    let cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(result.cred_id().as_ref());
-    let now = now();
-    let user = with_store(&st.store, taisce_store::Scope::System, move |s| {
-        let c = s.auth_credential_by_cred_id(&cred_id).ok()??;
-        if let Ok(mut pk) = serde_json::from_str::<Passkey>(&c.passkey) {
-            pk.update_credential(&result);
-            if let Ok(js) = serde_json::to_string(&pk) {
-                let _ = s.auth_touch_credential(&cred_id, &js, now);
-            }
-        }
-        Some(c.user_id)
-    })
-    .await;
-    let Some(user) = user else {
-        return json_err(StatusCode::UNAUTHORIZED, "passkey not recognised");
+    let (user, credential) = match verify_assertion(&st, &body.credential, ceremony, &authz.client_id).await {
+        Ok(u) => u,
+        Err(r) => return r,
     };
     st.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).authz.remove(&body.req);
     tracing::info!(target: AUDIT, event = "login.ok", client = authz.client_id, name = authz.client_name, user = %user);
-    match super::oauth::issue_code(&st, &authz, user).await {
+    match super::oauth::issue_code(&st, &authz, user, credential).await {
         Ok(redirect) => Json(json!({"redirect": redirect})).into_response(),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
+}
+
+/// A discoverable-credential challenge: `allowCredentials` is EMPTY, so
+/// nobody learns which credentials (or how many people) are enrolled; the
+/// authenticator offers its own resident passkey for this RP and the
+/// assertion names it. Plain modal mediation (the button), not conditional
+/// autofill. 503 when no passkey is enrolled at all (the box must enroll).
+pub(super) async fn start_discoverable(st: &AuthState) -> Result<(RequestChallengeResponse, DiscoverableAuthentication), Response> {
+    let any = with_store(&st.store, taisce_store::Scope::System, |s| s.auth_credentials(None).map(|c| !c.is_empty()).unwrap_or(false)).await;
+    if !any {
+        return Err(json_err(StatusCode::SERVICE_UNAVAILABLE, "no passkey enrolled"));
+    }
+    let (mut options, ceremony) = st
+        .webauthn
+        .start_discoverable_authentication()
+        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("webauthn: {e}")))?;
+    options.mediation = None;
+    debug_assert!(options.public_key.allow_credentials.is_empty());
+    Ok((options, ceremony))
+}
+
+/// Verify a discoverable passkey assertion against its (single-shot)
+/// ceremony and record the use (the signature counter). The credential id
+/// in the assertion names the passkey, and the passkey names the user; a
+/// `userHandle`, when the authenticator sends one, must be that same user.
+/// The user and the passkey's row id, or the refusal (one answer for an
+/// unknown credential and a bad signature). `client` names the sign-in in
+/// the audit line (an OAuth client id, or the web UI).
+pub(super) async fn verify_assertion(
+    st: &AuthState,
+    credential: &PublicKeyCredential,
+    ceremony: DiscoverableAuthentication,
+    client: &str,
+) -> Result<(uuid::Uuid, uuid::Uuid), Response> {
+    let refuse = |why: &str| {
+        tracing::warn!(target: AUDIT, event = "login.fail", client, "passkey assertion rejected: {why}");
+        json_err(StatusCode::UNAUTHORIZED, "passkey not accepted")
+    };
+    let cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(credential.get_credential_id());
+    let handle = credential.get_user_unique_id().map(<[u8]>::to_vec);
+    let c2 = cred_id.clone();
+    let Some(row) = with_store(&st.store, taisce_store::Scope::System, move |s| s.auth_credential_by_cred_id(&c2).ok().flatten()).await
+    else {
+        return Err(refuse("unknown credential"));
+    };
+    if let Some(h) = handle
+        && h.as_slice() != row.user_id.as_bytes()
+    {
+        return Err(refuse("userHandle names another user"));
+    }
+    let Ok(pk) = serde_json::from_str::<Passkey>(&row.passkey) else {
+        return Err(refuse("stored passkey unreadable"));
+    };
+    let result = match st.webauthn.finish_discoverable_authentication(credential, ceremony, &[DiscoverableKey::from(&pk)]) {
+        Ok(r) => r,
+        Err(e) => return Err(refuse(&e.to_string())),
+    };
+    let now = now();
+    let mut pk = pk;
+    pk.update_credential(&result);
+    if let Ok(js) = serde_json::to_string(&pk) {
+        with_store(&st.store, taisce_store::Scope::System, move |s| {
+            let _ = s.auth_touch_credential(&cred_id, &js, now);
+        })
+        .await;
+    }
+    Ok((row.user_id, row.id))
 }
 
 async fn login_deny(State(st): State<AuthState>, req: Request) -> Response {
@@ -311,6 +402,7 @@ async fn enroll_begin(State(st): State<AuthState>, req: Request) -> Response {
         Ok(x) => x,
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("webauthn: {e}")),
     };
+    let options = resident_key_required(options);
     let label = super::oauth::clean_name(body.label.as_deref().unwrap_or("passkey"));
     let id = random_token();
     {
@@ -387,6 +479,20 @@ async fn enroll_finish(State(st): State<AuthState>, req: Request) -> Response {
     }
 }
 
+/// Ask the authenticator for a discoverable (resident) credential: sign-in
+/// sends no `allowCredentials`, so only a passkey the device can find by
+/// itself signs in. (webauthn-rs registers passkeys with
+/// `residentKey: discouraged`; platform passkeys are discoverable anyway,
+/// a bare security key may not be.)
+pub fn resident_key_required(options: webauthn_rs::prelude::CreationChallengeResponse) -> serde_json::Value {
+    let mut v = serde_json::to_value(options).unwrap_or_default();
+    if let Some(sel) = v.pointer_mut("/publicKey/authenticatorSelection").and_then(|s| s.as_object_mut()) {
+        sel.insert("residentKey".into(), json!("required"));
+        sel.insert("requireResidentKey".into(), json!(true));
+    }
+    v
+}
+
 // ---- pages ----
 
 fn esc(s: &str) -> String {
@@ -433,7 +539,7 @@ async function enroll(){
   transports:c.response.getTransports?c.response.getTransports():undefined}};
  await post('/auth/enroll/finish',{ceremony:b.ceremony,credential});
  document.getElementById('go').disabled=true;say('Passkey added. You can close this page.');}
-const run=f=>()=>f().catch(e=>say(e.name==='NotAllowedError'?'Cancelled.':('Failed: '+e.message)));
+const run=f=>()=>f().catch(e=>say(e.name==='NotAllowedError'?'Cancelled, or no passkey for this server on this device.':('Failed: '+e.message)));
 if(!window.PublicKeyCredential)say('This browser does not support passkeys.');
 document.getElementById('go').addEventListener('click',run(d.mode==='enroll'?enroll:login));
 const n=document.getElementById('deny');if(n)n.addEventListener('click',run(deny));

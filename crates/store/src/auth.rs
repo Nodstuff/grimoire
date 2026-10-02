@@ -55,6 +55,8 @@ pub struct AuthCode {
     pub resource: Option<String>,
     pub scope: String,
     pub expires_at: i64,
+    /// the passkey (`auth_credentials.id`) the person signed in with
+    pub credential_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +69,8 @@ pub struct Grant {
     pub created_at: i64,
     pub revoked_at: Option<i64>,
     pub revoke_why: Option<String>,
+    /// the passkey that signed this grant in (None: before this was recorded)
+    pub credential_id: Option<Uuid>,
 }
 
 /// A personal access token (the secret itself is never stored).
@@ -83,6 +87,47 @@ pub struct ApiToken {
 /// Seconds between `last_used_at` writes for one token: a busy MCP client
 /// costs one UPDATE a minute, not one per request.
 pub const API_TOKEN_TOUCH_EVERY: i64 = 60;
+
+/// A web UI session (the cookie's value is never stored, only its hash).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSession {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub created_at: i64,
+    pub last_used_at: i64,
+    /// the absolute end (sign-in + `WEB_SESSION_ABSOLUTE`)
+    pub expires_at: i64,
+    /// coarse device summary, e.g. "Mac · Safari"
+    pub user_agent: String,
+    pub revoked_at: Option<i64>,
+    /// the passkey that opened it
+    pub credential_id: Option<Uuid>,
+}
+
+/// What deleting a passkey took with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialRevoked {
+    pub credential: AuthCredential,
+    /// web sessions it had opened, now revoked
+    pub sessions: usize,
+    /// OAuth grants it had signed in, now revoked
+    pub grants: usize,
+}
+
+/// What `auth_revoke_user_all` (a lost device) revoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UserRevoked {
+    pub passkeys: usize,
+    pub sessions: usize,
+    pub grants: usize,
+}
+
+/// A web session ends after 14 idle days…
+pub const WEB_SESSION_IDLE: i64 = 14 * 86400;
+/// …or 90 days after sign-in, whichever comes first.
+pub const WEB_SESSION_ABSOLUTE: i64 = 90 * 86400;
+/// Seconds between `last_used_at` writes for one session.
+pub const WEB_SESSION_TOUCH_EVERY: i64 = 60;
 
 /// What presenting an authorization code did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +194,7 @@ fn grant_row(r: &rusqlite::Row) -> rusqlite::Result<Grant> {
         created_at: r.get(5)?,
         revoked_at: r.get(6)?,
         revoke_why: r.get(7)?,
+        credential_id: r.get::<_, Option<String>>(8)?.map(uuid_of).transpose()?,
     })
 }
 
@@ -163,10 +209,24 @@ fn api_token_row(r: &rusqlite::Row) -> rusqlite::Result<ApiToken> {
     })
 }
 
+fn web_session_row(r: &rusqlite::Row) -> rusqlite::Result<WebSession> {
+    Ok(WebSession {
+        id: uuid_of(r.get(0)?)?,
+        user_id: uuid_of(r.get(1)?)?,
+        created_at: r.get(2)?,
+        last_used_at: r.get(3)?,
+        expires_at: r.get(4)?,
+        user_agent: r.get(5)?,
+        revoked_at: r.get(6)?,
+        credential_id: r.get::<_, Option<String>>(7)?.map(uuid_of).transpose()?,
+    })
+}
+
+const WEB_SESSION_COLS: &str = "id, user_id, created_at, last_used_at, expires_at, user_agent, revoked_at, credential_id";
 const USER_COLS: &str = "id, principal_id, name, role, created_at";
 const CRED_COLS: &str = "id, user_id, cred_id, passkey, label, created_at, last_used_at";
 const API_TOKEN_COLS: &str = "id, user_id, name, created_at, last_used_at, revoked_at";
-const GRANT_COLS: &str = "g.id, g.client_id, g.user_id, g.resource, g.scope, g.created_at, g.revoked_at, g.revoke_why";
+const GRANT_COLS: &str = "g.id, g.client_id, g.user_id, g.resource, g.scope, g.created_at, g.revoked_at, g.revoke_why, g.credential_id";
 
 impl SqliteStore {
     // ---- users ----
@@ -345,17 +405,65 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Delete a credential by its row id (or a unique prefix of it).
-    pub fn auth_delete_credential(&mut self, id: &str) -> Result<usize> {
+    /// Delete a passkey by its row id (or a unique prefix of it), and revoke
+    /// every web session and OAuth grant it opened, in one transaction: a
+    /// lost device's passkey takes its sign-ins with it. None when nothing
+    /// (or more than one passkey) matches.
+    pub fn auth_revoke_credential(&mut self, id: &str, now: i64) -> Result<Option<CredentialRevoked>> {
         let id = id.trim();
-        let ids: Vec<String> = {
-            let mut st = self.conn.prepare("SELECT id FROM auth_credentials WHERE id LIKE ?1 || '%'")?;
-            st.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
-        };
-        if ids.len() != 1 || id.is_empty() {
-            return Ok(0);
+        if id.is_empty() {
+            return Ok(None);
         }
-        Ok(self.conn.execute("DELETE FROM auth_credentials WHERE id = ?1", [&ids[0]])?)
+        let hits: Vec<AuthCredential> = {
+            let mut st = self.conn.prepare(&format!("SELECT {CRED_COLS} FROM auth_credentials WHERE id LIKE ?1 || '%'"))?;
+            st.query_map([id], cred_row)?.collect::<rusqlite::Result<_>>()?
+        };
+        let [c] = hits.as_slice() else {
+            return Ok(None);
+        };
+        let tx = self.conn.transaction()?;
+        let (sessions, grants) = revoke_by_credential(&tx, c.id, now)?;
+        tx.execute("DELETE FROM auth_credentials WHERE id = ?1", [c.id.to_string()])?;
+        tx.commit()?;
+        Ok(Some(CredentialRevoked { credential: c.clone(), sessions, grants }))
+    }
+
+    /// A lost device: delete every passkey of `user` and revoke every live
+    /// web session and OAuth grant (those from before credentials were
+    /// recorded included). Personal access tokens are left alone.
+    pub fn auth_revoke_user_all(&mut self, user: Uuid, now: i64) -> Result<UserRevoked> {
+        let tx = self.conn.transaction()?;
+        let u = user.to_string();
+        let sessions = tx.execute(
+            "UPDATE auth_web_sessions SET revoked_at = ?2 WHERE user_id = ?1 AND revoked_at IS NULL",
+            params![u, now],
+        )?;
+        let grant_ids: Vec<String> = {
+            let mut st = tx.prepare("SELECT id FROM oauth_grants WHERE user_id = ?1 AND revoked_at IS NULL")?;
+            st.query_map([&u], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        for g in &grant_ids {
+            revoke_grant(&tx, uuid_of(g.clone())?, "revoked from the CLI (all of the user's sign-ins)", now)?;
+        }
+        let passkeys = tx.execute("DELETE FROM auth_credentials WHERE user_id = ?1", [&u])?;
+        tx.commit()?;
+        Ok(UserRevoked { passkeys, sessions, grants: grant_ids.len() })
+    }
+
+    /// `user`'s live web sessions (unrevoked, inside both expiry windows).
+    pub fn auth_live_web_sessions(&self, user: Uuid, now: i64) -> Result<Vec<WebSession>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {WEB_SESSION_COLS} FROM auth_web_sessions
+             WHERE user_id = ?1 AND revoked_at IS NULL AND expires_at > ?2 AND last_used_at > ?2 - ?3
+             ORDER BY created_at, id"
+        ))?;
+        let rows = st.query_map(params![user.to_string(), now, WEB_SESSION_IDLE], web_session_row)?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// `user`'s unrevoked OAuth grants.
+    pub fn oauth_live_grants_of(&self, user: Uuid) -> Result<Vec<Grant>> {
+        Ok(self.oauth_grants(false)?.into_iter().filter(|g| g.user_id == user).collect())
     }
 
     // ---- personal access tokens ----
@@ -429,6 +537,118 @@ impl SqliteStore {
             params![t.id.to_string(), now],
         )?;
         Ok(Some(ApiToken { revoked_at: Some(now), ..(*t).clone() }))
+    }
+
+    // ---- web sessions ----
+
+    /// A new web session for `user_id` (signed in now), ending at the latest
+    /// `WEB_SESSION_ABSOLUTE` from now.
+    pub fn auth_create_web_session(
+        &mut self,
+        user_id: Uuid,
+        credential: Option<Uuid>,
+        token_hash: &str,
+        user_agent: &str,
+        now: i64,
+    ) -> Result<WebSession> {
+        let s = WebSession {
+            id: Uuid::now_v7(),
+            user_id,
+            created_at: now,
+            last_used_at: now,
+            expires_at: now + WEB_SESSION_ABSOLUTE,
+            user_agent: user_agent.chars().take(80).collect(),
+            revoked_at: None,
+            credential_id: credential,
+        };
+        self.conn.execute(
+            "INSERT INTO auth_web_sessions (id, user_id, token_hash, created_at, last_used_at, expires_at, user_agent, credential_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                s.id.to_string(),
+                user_id.to_string(),
+                token_hash,
+                now,
+                now,
+                s.expires_at,
+                s.user_agent,
+                credential.map(|c| c.to_string())
+            ],
+        )?;
+        Ok(s)
+    }
+
+    /// The live session behind a cookie's hash: unrevoked, inside its
+    /// absolute lifetime, used within the idle window, its user present.
+    pub fn auth_web_session_by_hash(&self, token_hash: &str, now: i64) -> Result<Option<WebSession>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {WEB_SESSION_COLS} FROM auth_web_sessions
+                     WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2 AND last_used_at > ?2 - ?3
+                       AND user_id IN (SELECT id FROM auth_users)"
+                ),
+                params![token_hash, now, WEB_SESSION_IDLE],
+                web_session_row,
+            )
+            .optional()?)
+    }
+
+    /// Roll `last_used_at` forward, unless it moved in the last minute.
+    /// True when it wrote.
+    pub fn auth_touch_web_session(&mut self, id: Uuid, now: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE auth_web_sessions SET last_used_at = ?2
+             WHERE id = ?1 AND revoked_at IS NULL AND last_used_at <= ?2 - ?3",
+            params![id.to_string(), now, WEB_SESSION_TOUCH_EVERY],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Every session, revoked and lapsed ones included, oldest first.
+    pub fn auth_web_sessions(&self) -> Result<Vec<WebSession>> {
+        let mut st = self.conn.prepare(&format!("SELECT {WEB_SESSION_COLS} FROM auth_web_sessions ORDER BY created_at, id"))?;
+        let rows = st.query_map([], web_session_row)?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Revoke a session by its cookie's hash (sign-out). The session, when
+    /// one was live.
+    pub fn auth_revoke_web_session_by_hash(&mut self, token_hash: &str, now: i64) -> Result<Option<WebSession>> {
+        let found = self
+            .conn
+            .query_row(
+                &format!("SELECT {WEB_SESSION_COLS} FROM auth_web_sessions WHERE token_hash = ?1 AND revoked_at IS NULL"),
+                [token_hash],
+                web_session_row,
+            )
+            .optional()?;
+        let Some(s) = found else { return Ok(None) };
+        self.conn.execute("UPDATE auth_web_sessions SET revoked_at = ?2 WHERE id = ?1", params![s.id.to_string(), now])?;
+        Ok(Some(WebSession { revoked_at: Some(now), ..s }))
+    }
+
+    /// Revoke an unrevoked session by id or a unique id prefix. None when
+    /// nothing (or more than one session) matches.
+    pub fn auth_revoke_web_session(&mut self, key: &str, now: i64) -> Result<Option<WebSession>> {
+        let key = key.trim().to_lowercase();
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let hits: Vec<WebSession> = self
+            .auth_web_sessions()?
+            .into_iter()
+            .filter(|s| s.revoked_at.is_none() && s.id.to_string().starts_with(&key))
+            .collect();
+        let [s] = hits.as_slice() else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            "UPDATE auth_web_sessions SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+            params![s.id.to_string(), now],
+        )?;
+        Ok(Some(WebSession { revoked_at: Some(now), ..s.clone() }))
     }
 
     // ---- clients ----
@@ -549,8 +769,8 @@ impl SqliteStore {
 
     pub fn oauth_insert_code(&mut self, c: &AuthCode) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO oauth_codes (code_hash, client_id, user_id, redirect_uri, code_challenge, resource, scope, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO oauth_codes (code_hash, client_id, user_id, redirect_uri, code_challenge, resource, scope, expires_at, credential_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 c.code_hash,
                 c.client_id,
@@ -559,7 +779,8 @@ impl SqliteStore {
                 c.code_challenge,
                 c.resource,
                 c.scope,
-                c.expires_at
+                c.expires_at,
+                c.credential_id.map(|x| x.to_string())
             ],
         )?;
         Ok(())
@@ -571,7 +792,7 @@ impl SqliteStore {
         let tx = self.conn.transaction()?;
         let row = tx
             .query_row(
-                "SELECT client_id, user_id, redirect_uri, code_challenge, resource, scope, expires_at, used_at, grant_id
+                "SELECT client_id, user_id, redirect_uri, code_challenge, resource, scope, expires_at, used_at, grant_id, credential_id
                  FROM oauth_codes WHERE code_hash = ?1",
                 [code_hash],
                 |r| {
@@ -585,6 +806,7 @@ impl SqliteStore {
                             resource: r.get(4)?,
                             scope: r.get(5)?,
                             expires_at: r.get(6)?,
+                            credential_id: r.get::<_, Option<String>>(9)?.map(uuid_of).transpose()?,
                         },
                         r.get::<_, Option<i64>>(7)?,
                         r.get::<_, Option<String>>(8)?,
@@ -626,14 +848,15 @@ impl SqliteStore {
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO oauth_grants (id, client_id, user_id, resource, scope, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO oauth_grants (id, client_id, user_id, resource, scope, created_at, credential_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 grant.id.to_string(),
                 grant.client_id,
                 grant.user_id.to_string(),
                 grant.resource,
                 grant.scope,
-                grant.created_at
+                grant.created_at,
+                grant.credential_id.map(|c| c.to_string())
             ],
         )?;
         if let Some(c) = code_hash {
@@ -813,6 +1036,13 @@ impl SqliteStore {
         )?;
         n += tx.execute("DELETE FROM oauth_grants WHERE revoked_at IS NOT NULL AND revoked_at <= ?1 - 2592000", [now])?;
         n += tx.execute("DELETE FROM auth_enrollments WHERE expires_at <= ?1", [now])?;
+        // web sessions: gone 30 days after they ended (revoked, lapsed, idle),
+        // so `auth list` still shows a recent sign-out
+        n += tx.execute(
+            "DELETE FROM auth_web_sessions
+             WHERE MIN(COALESCE(revoked_at, expires_at), expires_at, last_used_at + ?2) <= ?1 - 2592000",
+            params![now, WEB_SESSION_IDLE],
+        )?;
         tx.commit()?;
         Ok(n)
     }
@@ -855,6 +1085,23 @@ fn insert_tokens(
     Ok(())
 }
 
+/// Revoke every live web session and OAuth grant a passkey opened.
+fn revoke_by_credential(conn: &rusqlite::Connection, credential: Uuid, now: i64) -> Result<(usize, usize)> {
+    let c = credential.to_string();
+    let sessions = conn.execute(
+        "UPDATE auth_web_sessions SET revoked_at = ?2 WHERE credential_id = ?1 AND revoked_at IS NULL",
+        params![c, now],
+    )?;
+    let grant_ids: Vec<String> = {
+        let mut st = conn.prepare("SELECT id FROM oauth_grants WHERE credential_id = ?1 AND revoked_at IS NULL")?;
+        st.query_map([&c], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+    };
+    for g in &grant_ids {
+        revoke_grant(conn, uuid_of(g.clone())?, "its passkey was deleted", now)?;
+    }
+    Ok((sessions, grant_ids.len()))
+}
+
 fn revoke_grant(conn: &rusqlite::Connection, grant: Uuid, why: &str, now: i64) -> Result<()> {
     conn.execute(
         "UPDATE oauth_grants SET revoked_at = ?2, revoke_why = ?3 WHERE id = ?1 AND revoked_at IS NULL",
@@ -886,6 +1133,7 @@ mod tests {
             created_at: now,
             revoked_at: None,
             revoke_why: None,
+            credential_id: None,
         }
     }
 
@@ -895,6 +1143,47 @@ mod tests {
         let again = s.auth_ensure_owner(u.principal_id, "other", 200).unwrap();
         assert_eq!(again, u);
         assert_eq!(s.auth_users().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn web_sessions_expire_idle_and_absolute_and_revoke() {
+        let (mut s, u) = store_with_owner();
+        let t0 = 1_000_000;
+        let w = s.auth_create_web_session(u.id, None, "w1", "Mac · Safari", t0).unwrap();
+        assert_eq!(w.expires_at, t0 + WEB_SESSION_ABSOLUTE);
+        assert_eq!(s.auth_web_session_by_hash("w1", t0 + 1).unwrap().unwrap().id, w.id);
+        assert!(s.auth_web_session_by_hash("nope", t0 + 1).unwrap().is_none());
+        // idle: one second short of 14 days is live, 14 days is not
+        assert!(s.auth_web_session_by_hash("w1", t0 + WEB_SESSION_IDLE - 1).unwrap().is_some());
+        assert!(s.auth_web_session_by_hash("w1", t0 + WEB_SESSION_IDLE).unwrap().is_none());
+        // rolling: touched once a minute at most
+        assert!(!s.auth_touch_web_session(w.id, t0 + 59).unwrap());
+        assert!(s.auth_touch_web_session(w.id, t0 + 60).unwrap());
+        // keep it busy: every 13 days, so idle never ends it, but 90 days does
+        let mut t = t0 + 60;
+        while t + 13 * 86400 < t0 + WEB_SESSION_ABSOLUTE {
+            t += 13 * 86400;
+            assert!(s.auth_web_session_by_hash("w1", t).unwrap().is_some(), "live at {t}");
+            assert!(s.auth_touch_web_session(w.id, t).unwrap());
+        }
+        assert!(s.auth_web_session_by_hash("w1", t0 + WEB_SESSION_ABSOLUTE).unwrap().is_none(), "absolute end");
+        // revoke by prefix and by hash
+        let w2 = s.auth_create_web_session(u.id, None, "w2", "iPhone · Safari", t0).unwrap();
+        let w3 = s.auth_create_web_session(u.id, None, "w3", "", t0).unwrap();
+        assert!(s.auth_revoke_web_session("", t0).unwrap().is_none());
+        let r = s.auth_revoke_web_session(&w2.id.to_string()[..30], t0 + 5).unwrap().unwrap();
+        assert_eq!((r.id, r.revoked_at), (w2.id, Some(t0 + 5)));
+        assert!(s.auth_web_session_by_hash("w2", t0 + 6).unwrap().is_none());
+        assert!(s.auth_revoke_web_session(&w2.id.to_string(), t0 + 7).unwrap().is_none(), "already revoked");
+        assert_eq!(s.auth_revoke_web_session_by_hash("w3", t0 + 8).unwrap().unwrap().id, w3.id);
+        assert!(s.auth_revoke_web_session_by_hash("w3", t0 + 9).unwrap().is_none());
+        assert_eq!(s.auth_web_sessions().unwrap().len(), 3);
+        // cleanup drops sessions 30 days after they ended
+        s.oauth_cleanup(t0 + 10).unwrap();
+        assert_eq!(s.auth_web_sessions().unwrap().len(), 3);
+        s.oauth_cleanup(t0 + 8 + 2_592_000).unwrap();
+        let left: Vec<Uuid> = s.auth_web_sessions().unwrap().into_iter().map(|x| x.id).collect();
+        assert_eq!(left, vec![w.id], "w2 and w3 ended at sign-out; w1 is still within 30 days of its end");
     }
 
     #[test]
@@ -940,8 +1229,96 @@ mod tests {
         let second = AuthCredential { id: Uuid::now_v7(), cred_id: "cred2".into(), ..cred.clone() };
         assert!(!s.auth_enroll_credential("h1", &second, 501).unwrap(), "spent");
         assert_eq!(s.auth_credentials(Some(u.id)).unwrap().len(), 1);
-        assert_eq!(s.auth_delete_credential(&cred.id.to_string()[..8]).unwrap(), 1);
+        let r = s.auth_revoke_credential(&cred.id.to_string()[..8], 600).unwrap().unwrap();
+        assert_eq!((r.credential.id, r.sessions, r.grants), (cred.id, 0, 0));
         assert!(s.auth_credentials(None).unwrap().is_empty());
+    }
+
+    fn cred(u: &AuthUser, cred_id: &str) -> AuthCredential {
+        AuthCredential {
+            id: Uuid::now_v7(),
+            user_id: u.id,
+            cred_id: cred_id.into(),
+            passkey: "{}".into(),
+            label: cred_id.into(),
+            created_at: 100,
+            last_used_at: None,
+        }
+    }
+
+    #[test]
+    fn deleting_a_passkey_revokes_the_sessions_and_grants_it_opened() {
+        let (mut s, u) = store_with_owner();
+        let (lost, kept) = (cred(&u, "lost"), cred(&u, "kept"));
+        s.auth_add_credential(&lost).unwrap();
+        s.auth_add_credential(&kept).unwrap();
+        s.auth_create_web_session(u.id, Some(lost.id), "w-lost", "", 100).unwrap();
+        s.auth_create_web_session(u.id, Some(kept.id), "w-kept", "", 100).unwrap();
+        let g_lost = Grant { credential_id: Some(lost.id), ..grant(&u, 100) };
+        let g_kept = Grant { credential_id: Some(kept.id), ..grant(&u, 100) };
+        let g_old = grant(&u, 100); // from before the column: NULL
+        s.oauth_issue_grant(None, &g_lost, "a-lost", 9999, "r-lost", 9999).unwrap();
+        s.oauth_issue_grant(None, &g_kept, "a-kept", 9999, "r-kept", 9999).unwrap();
+        s.oauth_issue_grant(None, &g_old, "a-old", 9999, "r-old", 9999).unwrap();
+        assert_eq!(s.oauth_grants(false).unwrap().iter().find(|g| g.id == g_lost.id).unwrap().credential_id, Some(lost.id));
+        let r = s.auth_revoke_credential(&lost.id.to_string(), 200).unwrap().unwrap();
+        assert_eq!((r.sessions, r.grants), (1, 1));
+        assert!(s.auth_web_session_by_hash("w-lost", 201).unwrap().is_none());
+        assert!(s.oauth_access_grant("a-lost", 201).unwrap().is_none());
+        assert!(matches!(s.oauth_rotate_refresh("r-lost", 201, "a2", 9999, "r2", 9999).unwrap(), RefreshOutcome::Invalid));
+        // the other passkey's sign-ins, and grants with no recorded passkey, live on
+        assert!(s.auth_web_session_by_hash("w-kept", 201).unwrap().is_some());
+        assert!(s.oauth_access_grant("a-kept", 201).unwrap().is_some());
+        assert!(s.oauth_access_grant("a-old", 201).unwrap().is_some());
+        assert_eq!(s.auth_live_web_sessions(u.id, 201).unwrap().len(), 1);
+        assert_eq!(s.oauth_live_grants_of(u.id).unwrap().len(), 2);
+        assert!(s.auth_revoke_credential(&lost.id.to_string(), 202).unwrap().is_none(), "gone");
+    }
+
+    #[test]
+    fn revoking_all_of_a_user_spares_everyone_else() {
+        let (mut s, u) = store_with_owner();
+        let v = s.auth_add_user("aoife", 100).unwrap();
+        for (who, n) in [(&u, "u"), (&v, "v")] {
+            let c = cred(who, &format!("{n}-key"));
+            s.auth_add_credential(&c).unwrap();
+            s.auth_create_web_session(who.id, Some(c.id), &format!("w-{n}"), "", 100).unwrap();
+            s.auth_create_web_session(who.id, None, &format!("w2-{n}"), "", 100).unwrap();
+            let g = Grant { user_id: who.id, ..grant(who, 100) };
+            s.oauth_issue_grant(None, &g, &format!("a-{n}"), 9999, &format!("r-{n}"), 9999).unwrap();
+        }
+        let r = s.auth_revoke_user_all(u.id, 200).unwrap();
+        assert_eq!(r, UserRevoked { passkeys: 1, sessions: 2, grants: 1 });
+        assert!(s.auth_credentials(Some(u.id)).unwrap().is_empty());
+        assert!(s.auth_live_web_sessions(u.id, 201).unwrap().is_empty());
+        assert!(s.oauth_live_grants_of(u.id).unwrap().is_empty());
+        assert_eq!(s.auth_credentials(Some(v.id)).unwrap().len(), 1);
+        assert_eq!(s.auth_live_web_sessions(v.id, 201).unwrap().len(), 2);
+        assert_eq!(s.oauth_live_grants_of(v.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn credential_columns_are_added_to_an_older_database() {
+        let dir = std::env::temp_dir().join(format!("taisce-credcol-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ks.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE oauth_grants (id TEXT PRIMARY KEY, client_id TEXT NOT NULL, user_id TEXT NOT NULL,
+                   resource TEXT, scope TEXT NOT NULL, created_at INTEGER NOT NULL, revoked_at INTEGER, revoke_why TEXT);
+                 INSERT INTO oauth_grants VALUES ('g1', 'c', 'u', NULL, 'grimoire', 1, NULL, NULL);",
+            )
+            .unwrap();
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        let n: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM pragma_table_info('oauth_grants') WHERE name = 'credential_id'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let v: Option<String> = s.conn.query_row("SELECT credential_id FROM oauth_grants WHERE id = 'g1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, None, "existing grants carry NULL");
     }
 
     #[test]
@@ -956,6 +1333,7 @@ mod tests {
             resource: None,
             scope: "grimoire".into(),
             expires_at: 160,
+            credential_id: None,
         };
         s.oauth_insert_code(&code).unwrap();
         let CodeOutcome::Fresh(got) = s.oauth_consume_code("ch", 120).unwrap() else { panic!() };
@@ -980,6 +1358,7 @@ mod tests {
             resource: None,
             scope: "grimoire".into(),
             expires_at: 160,
+            credential_id: None,
         };
         s.oauth_insert_code(&code).unwrap();
         assert_eq!(s.oauth_consume_code("ch", 160).unwrap(), CodeOutcome::Invalid);

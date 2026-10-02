@@ -231,6 +231,52 @@ gained (the client fetches them).
 - **Revocation is per grant**: every app sign-in shares the client `taisce-app`; the CLI
   revokes grants and tokens by id, never by client (noted in `taisce auth revoke --help`).
 
+### 5d. The web UI's own sign-in (SERVER mode)
+
+- The embedded web UI is a third first-party client beside the app: a passkey assertion
+  (`POST /auth/web/begin|finish`, the same webauthn-rs ceremony as the OAuth sign-in page,
+  rate-limited per IP in the `Login` bucket) sets `__Host-taisce_session` (HttpOnly, Secure,
+  SameSite=Strict, Path=/, no Domain; 256 random bits, stored only as SHA-256 in
+  `auth_web_sessions`). Idle expiry 14 days, absolute 90, `last_used_at` rolled at most once a
+  minute. `POST /auth/web/logout` revokes it; `taisce auth list|revoke` show and revoke it.
+- **The cookie opens `/api` only** (never `/mcp`, `/ws`, `/oauth/*`, `/admin`); a bearer token,
+  when present, wins. Identity = the person's human principal, `owner_app` like the app: the
+  same `Viewer`/`Scope`, so every isolation rule applies unchanged (the isolation suites run a
+  second time with B signed in by cookie). Sharing stays a human surface: a session may use the
+  members routes; connectors and PATs still may not.
+- **CSRF**: SameSite=Strict, and every cookie request other than GET/HEAD must carry `Origin`
+  exactly equal to the public origin AND `Taisce-CSRF: 1`, else 403 `csrf`.
+- **A session's GET writes nothing** (`Viewer::get_may_write`): `GET /api/todo` only finds
+  (404 before the list exists; the UI shows an empty day and the first add creates it).
+  A session is not a push device.
+- SERVER-mode responses carry a CSP fitted to the built UI (`script-src 'self'`, inline
+  styles for mermaid/the editor, `img-src 'self' data: blob: https:`, `connect-src 'self'`,
+  `frame-ancestors 'none'`), `X-Frame-Options: DENY`, `Referrer-Policy: same-origin` and
+  `nosniff`; the nonce'd passkey pages keep their own CSP. LOCAL mode is unchanged.
+  `img-src https:` is a trade-off: a remote image in a shared doc tells its host your IP (and
+  when you opened the doc) — `Referrer-Policy` keeps the page URL from it, nothing hides the
+  fetch itself.
+- **SameSite is per registrable domain**: `Strict` treats every `*.null.ie` host as same-site,
+  so the cookie rides on requests a page on another null.ie host makes. That is fine while
+  nobody else hosts pages there; the Origin + `Taisce-CSRF` check is what refuses such a
+  page's writes regardless.
+- **Sign-in is discoverable** (review round): both passkey sign-ins (`/auth/web/begin` and the
+  OAuth page's `/oauth/authorize/begin`) send an empty `allowCredentials`, so nobody learns
+  which credentials or how many people are enrolled (the Origin check is only a browser rule).
+  The assertion's credential id names the passkey and the passkey names the user; a
+  `userHandle`, when present, must be that user. Enrollment asks for `residentKey: required`.
+  Passkeys enrolled earlier were registered `residentKey: discouraged`; platform passkeys
+  (iCloud Keychain, Google Password Manager) are discoverable regardless, a bare security
+  key may not be — such a key no longer signs in, and the recovery is `taisce auth enroll`
+  on the box (the app's existing grants are unaffected).
+- **A passkey's sign-ins die with it**: codes, grants and web sessions record the passkey
+  (`credential_id`; grants from before carry NULL). `taisce auth revoke <passkey>` revokes the
+  sessions and grants it opened and prints what still signs that person in;
+  `taisce auth revoke --user <name> --all` (a lost device) deletes every passkey and revokes
+  every session and grant of that user (PATs are named separately).
+- **Pending sign-ins** are held per IP (at most 8 each; a flood evicts only its own oldest; a
+  full map refuses new ones instead of evicting), and a passkey challenge lives two minutes.
+
 **Stored cross-doc references and how each is scoped**
 
 | Reference | Where | Scoped by |

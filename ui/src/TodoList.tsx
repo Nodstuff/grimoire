@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { errText, notify } from './Notice'
 import { api } from './types'
-import { addDays, clientClock, deadlineTone, dueDate, dueTime, fmtDay, fmtDeadline, hasDuePhrase, moveDueAt, nextMonday, previewLabel, type DueParse, type TodoDay, type TodoItem } from './todo'
+import { addDays, clientClock, deadlineTone, dueDate, dueTime, emptyDay, fmtDay, fmtDeadline, hasDuePhrase, isNoListYet, moveDueAt, nextMonday, previewLabel, type DueParse, type TodoDay, type TodoItem } from './todo'
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
@@ -57,6 +57,13 @@ export default function Todo({
         if (d.carried > 0) notify(`${d.carried} to-do${d.carried === 1 ? '' : 's'} carried forward from ${d.prev_date}`, 'ok')
       })
       .catch((e) => {
+        // a browser session's GET never creates the list (SERVER mode): an
+        // empty day, and the first add makes it
+        if (isNoListYet(e)) {
+          setMissing(false)
+          apply(emptyDay(date, clientClock().today))
+          return
+        }
         // an older daemon without the route: the section says so quietly
         setMissing(true)
         apply(null)
@@ -219,11 +226,13 @@ export default function Todo({
           )}
         </div>
       )}
-      <div className="todo-foot">
-        <button className="home-link dim" onClick={() => onOpenDoc(day.doc_id)}>
-          open the To-do doc →
-        </button>
-      </div>
+      {day.doc_id && (
+        <div className="todo-foot">
+          <button className="home-link dim" onClick={() => onOpenDoc(day.doc_id)}>
+            open the To-do doc →
+          </button>
+        </div>
+      )}
     </div>
   )
 }
