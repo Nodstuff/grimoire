@@ -148,6 +148,12 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
         self.model = model
     }
 
+    /// The text view's traits at the size SwiftUI asked for (the Mac's
+    /// View › Bigger Text sets it on the doc screen; UIKit wouldn't see it).
+    private func traits(_ tv: UITextView) -> UITraitCollection {
+        tv.traitCollection.modifyingTraits { $0.preferredContentSizeCategory = UIContentSizeCategory(dynamicType) }
+    }
+
     var kind: EditorText.Kind { EditorText.Kind(content) }
     var isCompleting: Bool { model?.completion?.blockID == id }
 
@@ -162,7 +168,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
         self.dynamicType = dynamicType
         let caret = tv.isFirstResponder ? currentCaret() : nil
         reloading = true
-        tv.attributedText = EditorText.attributed(item.content, traits: tv.traitCollection)
+        tv.attributedText = EditorText.attributed(item.content, traits: traits(tv))
         configure(tv)
         if let caret { setCaret(caret) }
         reloading = false
@@ -352,7 +358,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
             derived = shortcut
             caret = at
             render(derived, caret: caret)
-        } else if derived.isList, EditorText.attributed(derived, traits: tv.traitCollection).string != tv.text {
+        } else if derived.isList, EditorText.attributed(derived, traits: traits(tv)).string != tv.text {
             // markers out of step (a line lost its marker, numbers moved): redraw them
             render(derived, caret: caret)
         } else {
@@ -391,7 +397,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
         guard let tv = textView else { return }
         reloading = true
         content = c
-        tv.attributedText = EditorText.attributed(c, traits: tv.traitCollection)
+        tv.attributedText = EditorText.attributed(c, traits: traits(tv))
         configure(tv)
         setCaret(caret)
         reloading = false
@@ -404,7 +410,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
         let sel = tv.selectedRange
         reloading = true
         let derived = EditorText.content(from: tv.attributedText, like: content)
-        let fresh = EditorText.attributed(derived, traits: tv.traitCollection)
+        let fresh = EditorText.attributed(derived, traits: traits(tv))
         if fresh.string == tv.text, !fresh.isEqual(to: tv.attributedText) {
             tv.textStorage.setAttributedString(fresh)
             tv.selectedRange = sel
@@ -423,7 +429,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
     func updateTyping() {
         guard let tv = textView else { return }
         if content.isRaw {
-            tv.typingAttributes = EditorText.look(.raw, marks: [], link: nil, wiki: nil, checked: false, traits: tv.traitCollection)
+            tv.typingAttributes = EditorText.look(.raw, marks: [], link: nil, wiki: nil, checked: false, traits: traits(tv))
             return
         }
         let s = tv.attributedText ?? NSAttributedString()
@@ -446,7 +452,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
             }
         }
         if let pendingMarks { marks = pendingMarks }
-        var a = EditorText.look(kind, marks: marks, link: link, wiki: nil, checked: prefix?.checkbox == true, traits: tv.traitCollection, prefix: prefix)
+        var a = EditorText.look(kind, marks: marks, link: link, wiki: nil, checked: prefix?.checkbox == true, traits: traits(tv), prefix: prefix)
         if !marks.isEmpty { a[EditorText.marks] = marks.rawValue }
         if let link { a[EditorText.link] = link }
         tv.typingAttributes = a
@@ -609,7 +615,7 @@ final class BlockTextCoordinator: NSObject, UITextViewDelegate, UIGestureRecogni
         let range = NSRange(location: loc - len, length: len)
         let m = NSMutableAttributedString(attributedString: tv.attributedText)
         let marks = InlineMarks(rawValue: (tv.typingAttributes[EditorText.marks] as? Int) ?? 0)
-        var a = EditorText.look(kind, marks: marks, link: nil, wiki: target, checked: false, traits: tv.traitCollection)
+        var a = EditorText.look(kind, marks: marks, link: nil, wiki: target, checked: false, traits: traits(tv))
         a[EditorText.wiki] = target
         if !marks.isEmpty { a[EditorText.marks] = marks.rawValue }
         m.replaceCharacters(in: range, with: NSAttributedString(string: InlineCodec.wikiDisplay(target), attributes: a))

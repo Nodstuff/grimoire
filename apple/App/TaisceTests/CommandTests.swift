@@ -28,6 +28,16 @@ private let picker = WorkspacePicker(workspaces: [work, home], unsortedCount: 2,
         #expect(off.shortcut(1) == nil)
     }
 
+    @Test func docTextSizeStepsAlongDynamicTypeAndStopsAtTheEnds() {
+        #expect(DocTextSize.size(DocTextSize.actual) == .large)
+        #expect(DocTextSize.size(DocTextSize.bigger(DocTextSize.actual)) == .xLarge)
+        #expect(DocTextSize.smaller(0) == 0 && !DocTextSize.canShrink(0))
+        let top = DocTextSize.steps.count - 1
+        #expect(DocTextSize.bigger(top) == top && !DocTextSize.canGrow(top))
+        // a stored value from a longer scale never crashes
+        #expect(DocTextSize.size(99) == DocTextSize.steps.last && DocTextSize.size(-3) == .medium)
+    }
+
     @Test func todayIsClickableAgainAfterOpeningADocFromIt() {
         let r = Router()
         r.isPad = true

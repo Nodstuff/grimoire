@@ -13,8 +13,23 @@ extension FocusedValues {
 struct TaisceCommands: Commands {
     let model: AppModel
     @FocusedValue(\.router) private var router
+    @AppStorage(DocTextSize.key) private var textSize = DocTextSize.actual
 
     var body: some Commands {
+        #if targetEnvironment(macCatalyst)
+        CommandGroup(before: .toolbar) {
+            Button("Bigger Text") { textSize = DocTextSize.bigger(textSize) }
+                .keyboardShortcut("+")
+                .disabled(!DocTextSize.canGrow(textSize))
+            Button("Smaller Text") { textSize = DocTextSize.smaller(textSize) }
+                .keyboardShortcut("-")
+                .disabled(!DocTextSize.canShrink(textSize))
+            Button("Actual Size") { textSize = DocTextSize.actual }
+                .keyboardShortcut("0")
+                .disabled(textSize == DocTextSize.actual)
+            Divider()
+        }
+        #endif
         CommandGroup(replacing: .newItem) {
             item("New Doc", .newDoc).keyboardShortcut("n")
         }

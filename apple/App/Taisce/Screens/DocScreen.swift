@@ -17,6 +17,7 @@ struct DocScreen: View {
     @State private var editable = false
     @State private var opening = false
     @State private var movingWorkspace = false // workspaces
+    @AppStorage(DocTextSize.key) private var textSize = DocTextSize.actual
 
     var body: some View {
         Group {
@@ -26,6 +27,15 @@ struct DocScreen: View {
                 reading
             }
         }
+        #if targetEnvironment(macCatalyst)
+        // View › Bigger / Smaller Text; ⌘= works as well as ⌘+ (no shift)
+        .dynamicTypeSize(DocTextSize.size(textSize))
+        .background {
+            Button("") { textSize = DocTextSize.bigger(textSize) }
+                .keyboardShortcut("=")
+                .hidden()
+        }
+        #endif
         .task(id: docID) { await observe() }
         .task(id: docID) { await refresh(force: false) }
         .task(id: docID) { await checkEditable() }
