@@ -6,7 +6,15 @@ import UIKit
 /// launches the app in the background finds one before any scene exists.
 @MainActor
 final class AppDelegate: NSObject, UIApplicationDelegate {
-    let model = AppModel()
+    let model: AppModel
+
+    override init() {
+        // the Mac's first unsandboxed launch: the old container's cache and
+        // preferences come over before the model reads either
+        AppPaths.migrateSandboxContainer()
+        model = AppModel()
+        super.init()
+    }
     /// why iOS gave no token (no network, no entitlement in a dev build)
     private(set) var registrationError: String?
 

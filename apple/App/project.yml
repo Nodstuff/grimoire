@@ -57,7 +57,7 @@ targets:
           INFOPLIST_FILE: Support/Info-Debug.plist
           # APNs (push): a Debug build's token is a sandbox one
           CODE_SIGN_ENTITLEMENTS: Support/Taisce-Debug.entitlements
-          # the Mac adds the App Sandbox (network client only)
+          # the Mac: push, no App Sandbox (runnable code blocks run your own tools)
           "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": Support/Taisce-Mac-Debug.entitlements
           # no universal links in Debug (scratch daemons are http; the Mac
           # test runs need no Associated Domains in the profile): the

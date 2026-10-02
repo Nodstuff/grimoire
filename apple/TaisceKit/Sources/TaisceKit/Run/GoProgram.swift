@@ -124,6 +124,18 @@ public enum GoProgram {
         return lines.joined(separator: "\n")
     }
 
+    /// The first top-level func's name (not a method, not `main`): the try
+    /// line's hint, e.g. `pairSum(…)`.
+    public static func firstFunction(in source: String) -> String? {
+        for u in Parsed(source).units where u.kind == .funcOrType {
+            let t = u.skeleton.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard t.hasPrefix("func "), !t.hasPrefix("func (") else { continue }
+            let name = t.dropFirst(5).prefix { $0 == "_" || $0.isLetter || $0.isNumber }
+            if !name.isEmpty, name != "main" { return String(name) }
+        }
+        return nil
+    }
+
     /// Import paths the compiler says are unused (`"os" imported and not
     /// used`, `"math/rand" imported as r and not used`).
     public static func unusedImports(fromBuildOutput s: String) -> [String] {

@@ -12,12 +12,14 @@ struct TaisceApp: App {
         WindowGroup {
             RootView()
                 .environment(model)
-                .task { await model.boot() }
+                // a test host (hosted unit tests) never connects: tests make their own models
+                .task { if !AppPaths.isTestHost { await model.boot() } }
         }
         .commands { TaisceCommands(model: model) }
         .onChange(of: scenePhase) { _, phase in
             // the stream is foreground-only; silent pushes catch up in the background (AppDelegate)
             Task {
+                guard !AppPaths.isTestHost else { return }
                 switch phase {
                 case .active: await model.startSync()
                 case .background: await model.stopSync()

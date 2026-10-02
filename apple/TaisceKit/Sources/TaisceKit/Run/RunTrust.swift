@@ -107,7 +107,8 @@ public enum RunTrust {
 /// Approvals per doc, kept in UserDefaults on this device (per server).
 public struct RunApprovals: @unchecked Sendable {
     let defaults: UserDefaults
-    let key: String
+    /// the UserDefaults key (forgotten on sign-out with the person's settings)
+    public let key: String
 
     public init(defaults: UserDefaults = .standard, server: String) {
         self.defaults = defaults

@@ -171,6 +171,12 @@ import Testing
         #expect(GoProgram.removingImports(["os", "math/rand"], from: src) == "package main\n\nimport (\n\t\"fmt\"\n)\n\n")
     }
 
+    @Test func firstFunctionForTheTryLineHint() {
+        #expect(GoProgram.firstFunction(in: Self.pairSum) == "pairSum")
+        #expect(GoProgram.firstFunction(in: "// helper\ntype T int\nfunc (t T) M() {}\nfunc main() {}\nfunc g[K any](k K) {}") == "g")
+        #expect(GoProgram.firstFunction(in: "x := 1") == nil)
+    }
+
     @Test func goModFromTheToolchainVersion() {
         #expect(GoProgram.goMod(goVersion: "go1.26.1\n") == "module run\n\ngo 1.26.1\n")
         #expect(GoProgram.goMod(goVersion: "devel go1.27-abc") == "module run\n\ngo 1.22\n")

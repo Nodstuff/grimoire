@@ -110,12 +110,15 @@ final class AppModel {
     private var observedTodoDoc: DocID?
     /// rendered blocks by (block id, content hash), shared across doc views
     let renderCache = RenderCache()
+    /// runnable code blocks (Mac): this session's runs, try lines, practice text
+    let codeRuns = CodeRunStore()
 
     /// `dueAlerts`: tests pass one over a fake notification center.
     init(dueAlerts: NotificationCoordinator = NotificationCoordinator()) {
         self.dueAlerts = dueAlerts
         let stored = UserDefaults.standard.string(forKey: Self.serverURLKey).flatMap { ServerConfig.normalizedURL($0)?.absoluteString }
         serverURL = stored.flatMap { ServerURLPolicy.accepts($0) ? $0 : nil } ?? Self.defaultServerURL
+        codeRuns.app = self
     }
 
     var needsSignIn: Bool { authPhase == .signedOut }
@@ -259,6 +262,7 @@ final class AppModel {
         workspaces = []
         workspacesSupported = false
         editMeta = [:]
+        codeRuns.reset()
         settledTodos = []
         pendingEditDoc = nil
         pendingWrites = 0
@@ -375,6 +379,7 @@ final class AppModel {
         updatesTask?.cancel()
         todoObserveTask?.cancel()
         observedTodoDoc = nil
+        codeRuns.reset()
         hasSynced = false
         ownerChecked = false
         ownerSettled = false
@@ -385,7 +390,8 @@ final class AppModel {
             return
         }
         do {
-            let dir = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            // Application Support (the Mac: its ie.null.taisce folder, AppPaths)
+            let dir = try AppPaths.supportDirectory()
             let name = "cache-\(url.host() ?? "server")-\(url.port ?? 0).sqlite"
             let cache = try Cache(path: dir.appending(path: name).path(percentEncoded: false))
             authPhase = .checking
@@ -599,6 +605,20 @@ final class AppModel {
         guard var editor = try await cache.editor(for: doc), let current = editor.blocks[block],
               let text = Checkbox.toggled(current.content, index: index, checked: checked)
         else { throw TodoWriteError.notFound }
+        try await cache.enqueue([.replaceText(block, text)], on: &editor)
+        pendingWrites += 1
+        await replayOutbox()
+    }
+
+    /// Rewrite one block's markdown (a code block's practice edit saved to
+    /// the doc): a `replace` through the outbox, then an immediate replay,
+    /// exactly like an editor save, so the review gate applies.
+    func replaceBlockText(doc: DocID, block: BlockID, _ transform: (String) -> String?) async throws {
+        guard let cache else { throw TodoWriteError.notFound }
+        guard var editor = try await cache.editor(for: doc), let current = editor.blocks[block],
+              let text = transform(current.content)
+        else { throw TodoWriteError.notFound }
+        guard text != current.content else { return }
         try await cache.enqueue([.replaceText(block, text)], on: &editor)
         pendingWrites += 1
         await replayOutbox()

@@ -5,11 +5,11 @@ import WebKit
 
 /// The app's one diagram queue: Mermaid and reladraw drawn by the bundled
 /// mermaid 12.0.0 and reladraw 0.15.1 in a shared offscreen web view, PNGs
-/// cached in Caches/diagrams.
+/// cached in Caches/diagrams (`AppPaths.diagramCache`).
 enum Diagrams {
     static let queue = DiagramRenderQueue(
         renderer: DiagramWebRenderer(),
-        store: FileDiagramStore(directory: URL.cachesDirectory.appending(path: "diagrams", directoryHint: .isDirectory))
+        store: FileDiagramStore(directory: AppPaths.diagramCache)
     )
 }
 

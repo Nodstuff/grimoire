@@ -1,4 +1,5 @@
 import Foundation
+import TaisceKit
 
 /// The settings this device keeps for the signed-in person on one server
 /// (ADR 0004: forgotten on sign-out, so the next person starts clean): pins,
@@ -18,7 +19,10 @@ struct UserSettings {
     /// `LibraryContent`'s `@AppStorage` (doc ids; not per server)
     static let libraryExpandedKey = "library.expanded"
 
-    var keys: [String] { [pinsKey, workspaceKey, Self.libraryExpandedKey] }
+    /// runnable code blocks: the docs you said yes to running on this device
+    var runApprovalsKey: String { RunApprovals(defaults: defaults, server: server).key }
+
+    var keys: [String] { [pinsKey, workspaceKey, Self.libraryExpandedKey, runApprovalsKey] }
 
     func forget() {
         for key in keys { defaults.removeObject(forKey: key) }
