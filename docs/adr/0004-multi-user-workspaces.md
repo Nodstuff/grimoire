@@ -231,6 +231,29 @@ gained (the client fetches them).
 - **Revocation is per grant**: every app sign-in shares the client `taisce-app`; the CLI
   revokes grants and tokens by id, never by client (noted in `taisce auth revoke --help`).
 
+### 5d. The web UI's own sign-in (SERVER mode)
+
+- The embedded web UI is a third first-party client beside the app: a passkey assertion
+  (`POST /auth/web/begin|finish`, the same webauthn-rs ceremony as the OAuth sign-in page,
+  rate-limited per IP in the `Login` bucket) sets `__Host-taisce_session` (HttpOnly, Secure,
+  SameSite=Strict, Path=/, no Domain; 256 random bits, stored only as SHA-256 in
+  `auth_web_sessions`). Idle expiry 14 days, absolute 90, `last_used_at` rolled at most once a
+  minute. `POST /auth/web/logout` revokes it; `taisce auth list|revoke` show and revoke it.
+- **The cookie opens `/api` only** (never `/mcp`, `/ws`, `/oauth/*`, `/admin`); a bearer token,
+  when present, wins. Identity = the person's human principal, `owner_app` like the app: the
+  same `Viewer`/`Scope`, so every isolation rule applies unchanged (the isolation suites run a
+  second time with B signed in by cookie). Sharing stays a human surface: a session may use the
+  members routes; connectors and PATs still may not.
+- **CSRF**: SameSite=Strict, and every cookie request other than GET/HEAD must carry `Origin`
+  exactly equal to the public origin AND `Taisce-CSRF: 1`, else 403 `csrf`.
+- **A session's GET writes nothing** (`Viewer::get_may_write`): `GET /api/todo` only finds
+  (404 before the list exists; the UI shows an empty day and the first add creates it).
+  A session is not a push device.
+- SERVER-mode responses carry a CSP fitted to the built UI (`script-src 'self'`, inline
+  styles for mermaid/the editor, `img-src 'self' data: blob: https:`, `connect-src 'self'`,
+  `frame-ancestors 'none'`), `X-Frame-Options: DENY`, `Referrer-Policy: same-origin` and
+  `nosniff`; the nonce'd passkey pages keep their own CSP. LOCAL mode is unchanged.
+
 **Stored cross-doc references and how each is scoped**
 
 | Reference | Where | Scoped by |
