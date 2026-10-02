@@ -54,13 +54,37 @@ public enum RunTrust {
     }
 
     /// Who last wrote the block's content, from the ledger (newest first).
+    ///
+    /// Some ops carry your principal but someone else's words, so they are
+    /// not taken at face value:
+    /// - a decline's revert (`review:decline:…`) restores an older version
+    ///   whose author the ledger doesn't name: unknown (it asks);
+    /// - a rename's link rewrite (`rename:…`) changed only a link: the op
+    ///   before it says who wrote the rest;
+    /// - a write of yours whose content an earlier op by someone else wrote
+    ///   word for word (a whole-doc save re-inserting an agent's block under
+    ///   a new id): theirs.
     public static func author(of block: BlockID, history: [DocHistoryEntry]?, me: Me) -> Author {
         guard let history else { return .unknown }
-        guard let row = history.first(where: { $0.applied && $0.targetBlock == block && ($0.opType == "insert" || $0.opType == "replace") }) else {
-            return .unknown
+        let writes = history.indices.filter { i in
+            let e = history[i]
+            return e.applied && e.targetBlock == block && (e.opType == "insert" || e.opType == "replace")
         }
-        return me.matches(row) ? .me : .other(row.principalName.isEmpty ? "someone else" : row.principalName)
+        for i in writes {
+            let row = history[i]
+            if row.sourceRefs.contains(where: { $0.hasPrefix("review:decline:") }) { return .unknown }
+            if row.sourceRefs.contains(where: { $0.hasPrefix("rename:") }) { continue }
+            guard me.matches(row) else { return .other(name(row)) }
+            if let content = row.content,
+               let earlier = history[(i + 1)...].first(where: { $0.applied && $0.content == content && !me.matches($0) }) {
+                return .other(name(earlier))
+            }
+            return .me
+        }
+        return .unknown
     }
+
+    static func name(_ e: DocHistoryEntry) -> String { e.principalName.isEmpty ? "someone else" : e.principalName }
 
     /// The epoch of the newest applied op in the doc by anyone but `me`
     /// (nil: none in the history, or no history).

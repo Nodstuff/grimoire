@@ -326,6 +326,32 @@ import Testing
         #expect(RunTrust.decide(block: "b1", history: later, me: me, practiceEditedByMe: false, approval: a, docEpoch: 4) == .ask(lastEditedBy: "someone else"))
     }
 
+    /// S2: ops that carry your principal but someone else's content.
+    @Test func declineRevertsAreUnknown() {
+        let decline = DocHistoryEntry(opID: "o9", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 9, targetBlock: "b1", opType: "replace", sourceRefs: ["review:decline:ann-1"], content: "echo old")
+        let h = [decline, op("p-claude", "claude:x", epoch: 8, block: "b1"), op("p-tom", "Tom", epoch: 2, block: "b1", type: "insert")]
+        #expect(RunTrust.author(of: "b1", history: h, me: me) == .unknown)
+        #expect(RunTrust.decide(block: "b1", history: h, me: me, practiceEditedByMe: false, approval: nil, docEpoch: 9) == .ask(lastEditedBy: "someone else"))
+    }
+
+    @Test func linkRewritesLookFurtherBack() {
+        let rewrite = DocHistoryEntry(opID: "o7", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 7, targetBlock: "b1", opType: "replace", sourceRefs: ["rename:Old → New"], content: "see [[New]]")
+        #expect(RunTrust.author(of: "b1", history: [rewrite, op("p-claude", "claude:x", epoch: 5, block: "b1")], me: me) == .other("claude:x"))
+        #expect(RunTrust.author(of: "b1", history: [rewrite, op("p-tom", "Tom", epoch: 5, block: "b1")], me: me) == .me)
+        #expect(RunTrust.author(of: "b1", history: [rewrite], me: me) == .unknown)
+    }
+
+    @Test func aReinsertOfSomeoneElsesContentIsTheirs() {
+        // a whole-doc save of yours re-inserts claude's block under a new id
+        let reinsert = DocHistoryEntry(opID: "o6", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 6, targetBlock: "b2", opType: "insert", content: "```bash\nrm -rf x\n```")
+        let theirs = DocHistoryEntry(opID: "o3", principalName: "claude:x", principalKind: "agent", principalID: "p-claude", epoch: 3, targetBlock: "b1", opType: "insert", content: "```bash\nrm -rf x\n```")
+        #expect(RunTrust.author(of: "b2", history: [reinsert, theirs], me: me) == .other("claude:x"))
+        // your own text, never written by anyone else: yours
+        var mine = reinsert
+        mine.content = "```bash\necho mine\n```"
+        #expect(RunTrust.author(of: "b2", history: [mine, theirs], me: me) == .me)
+    }
+
     @Test func nameFallbackForOlderServers() {
         let old = RunTrust.Me(principalID: nil, name: "Tom")
         let h = [DocHistoryEntry(opID: "o", principalName: "Tom", principalKind: "human", epoch: 2, targetBlock: "b1", opType: "replace")]
@@ -352,7 +378,8 @@ import Testing
                 "kind":{"op":"replace","target":"0199A0B0-0000-7000-8000-0000000000BB","content":"x"}},"principal_name":"claude","principal_kind":"agent"},
          {"op":{"id":"o2","doc_id":"d1","principal":"p2","epoch_applied":3,"kind":{"op":"insert","block_id":"b2","parent_id":null,"order_key":"a","block_type":"code","content":"y"}},"principal_name":"tom","principal_kind":"human"},
          {"op":{"id":"o3","doc_id":"d1","epoch_applied":2,"kind":{"op":"rename_doc","title":"T"}},"principal_name":"tom","principal_kind":"human"},
-         {"op":{"id":"o4","doc_id":"d1","epoch_applied":null},"principal_name":"tom","principal_kind":"human"}]
+         {"op":{"id":"o4","doc_id":"d1","epoch_applied":null},"principal_name":"tom","principal_kind":"human"},
+         {"op":{"id":"o5","doc_id":"d1","epoch_applied":5,"source_refs":["review:decline:x"],"kind":{"op":"replace","target":"b1","content":"old"}},"principal_name":"tom","principal_kind":"human"}]
         """
         let rows = try JSONDecoder().decode([DocHistoryEntry].self, from: Data(json.utf8))
         #expect(rows[0].principalID == "0199a0b0-0000-7000-8000-000000000001")
@@ -361,6 +388,8 @@ import Testing
         #expect(rows[1].targetBlock == "b2" && rows[1].opType == "insert")
         #expect(rows[2].targetBlock == nil && rows[2].opType == "rename_doc")
         #expect(rows[3].applied == false && rows[3].principalID == nil && rows[3].opType == nil)
+        #expect(rows[3].sourceRefs.isEmpty && rows[0].content == "x" && rows[1].content == "y")
+        #expect(rows[4].sourceRefs == ["review:decline:x"] && rows[4].content == "old")
     }
 }
 

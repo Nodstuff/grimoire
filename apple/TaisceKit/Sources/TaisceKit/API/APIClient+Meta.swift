@@ -16,10 +16,16 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
     public var targetBlock: BlockID?
     /// `insert`, `replace`, `delete`, `move`, `rename_doc`, …
     public var opType: String?
+    /// the op's provenance (`review:decline:<id>` for a decline's revert,
+    /// `rename:Old → New` for a link rewrite, …)
+    public var sourceRefs: [String]
+    /// what an insert or replace wrote
+    public var content: String?
 
     public init(
         opID: String, principalName: String, principalKind: String, applied: Bool = true,
-        principalID: String? = nil, epoch: Int? = nil, targetBlock: BlockID? = nil, opType: String? = nil
+        principalID: String? = nil, epoch: Int? = nil, targetBlock: BlockID? = nil, opType: String? = nil,
+        sourceRefs: [String] = [], content: String? = nil
     ) {
         self.opID = opID
         self.principalName = principalName
@@ -29,6 +35,8 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
         self.epoch = epoch
         self.targetBlock = targetBlock
         self.opType = opType
+        self.sourceRefs = sourceRefs
+        self.content = content
     }
 
     /// When the op was written, from its UUIDv7 id; nil for any other id.
@@ -47,11 +55,13 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
         var epoch_applied: Int?
         var principal: String?
         var kind: Kind?
+        var source_refs: [String]?
 
         struct Kind: Decodable {
             var op: String?
             var target: String?
             var block_id: String?
+            var content: String?
         }
     }
 
@@ -70,6 +80,8 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
         principalID = op.principal?.lowercased()
         opType = op.kind?.op
         targetBlock = (op.kind?.target ?? op.kind?.block_id)?.lowercased()
+        sourceRefs = op.source_refs ?? []
+        content = op.kind?.content
         principalName = try c.decodeIfPresent(String.self, forKey: .principalName) ?? ""
         principalKind = try c.decodeIfPresent(String.self, forKey: .principalKind) ?? ""
     }
