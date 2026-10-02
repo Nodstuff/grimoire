@@ -24,6 +24,25 @@ Repo: github.com/Nodstuff/grimoire (the repo keeps its old name; personal accoun
 account may be flipped to the work account by other sessions — push with
 `git -c credential.helper= -c 'credential.helper=!f() { echo username=Nodstuff; echo password=$(gh auth token --user Nodstuff); }; f' push origin main`).
 
+## Multi-user (ADR 0004)
+- SERVER mode is multi-user: each person is an `auth_users` row (`taisce auth user add <name>`,
+  then `taisce auth enroll --user <name>`), with their own Unsorted and workspaces; a workspace
+  is shared through `workspace_members` (owner | editor | viewer). LOCAL mode is single-user and
+  unchanged.
+- **The Scope rule**: isolation lives in the store, nowhere else. Every store call runs in a
+  `taisce_store::Scope` (`User(id)` for a request, `Local` in LOCAL mode, `System` only for
+  migrations / the embed indexer / backups / the box CLI / push fan-out / gardener bookkeeping).
+  The daemon reaches the store only through `SharedStore::lock(scope)` /
+  `with_store(&store, scope, …)`; a request's scope comes from `viewer::Viewer` (HTTP) or
+  `KsMcp::scope_of` (MCP). A new store query filters with `self.vis(col)` (lists) or
+  `self.see(doc)` / `self.may_write(doc)` (by id): invisible = `NotFound` (404), never 403.
+- **Every new read path needs an isolation test**: add its route or tool to
+  `crates/daemon/src/isolation_tests.rs` `COVERAGE` with a test that proves B sees nothing of
+  A's; `every_route_and_tool_is_covered` fails the build otherwise.
+- **Sharing is human-only**: `taisce workspace share|unshare|members` on the box, or
+  `/api/workspaces/{id}/members` from a person's own app. Never MCP, never a connector or PAT
+  token. An agent's write into a shared workspace always lands flagged (the share gate).
+
 ## Start here
 - **[[Roadmap]]** in Taisce (under the `[[Grimoire]]` tree — doc titles are data, not renamed) is the outstanding list — read it first in any
   new session; the daily doc carries narrative, the roadmap carries the work.

@@ -3,7 +3,9 @@
 A knowledge system for people who work with AI agents. Your notes are markdown
 blocks in one SQLite file; humans and agents write through the same **review gate**.
 It runs as a personal server (SERVER mode: OAuth + passkeys behind a TLS proxy, with
-native Apple clients) or as the Mac app's local daemon (LOCAL mode).
+native Apple clients) or as the Mac app's local daemon (LOCAL mode). A server can host a
+household: each person has their own docs and workspaces, and shares a workspace with
+others as editor or viewer (`taisce workspace share`; see `docs/adr/0004-multi-user-workspaces.md`).
 
 **Download:** [latest release](https://github.com/Nodstuff/grimoire/releases/latest)
 (macOS, Apple Silicon, signed + notarized; SHA-256 in each release’s notes).
