@@ -141,6 +141,34 @@ public final class Cache: Sendable {
         return m
     }
 
+    public enum WipeError: Error, Equatable {
+        /// the WAL still held frames after every retry (a reader never let go)
+        case walNotTruncated(frames: Int)
+    }
+
+    /// Checkpoint the WAL into the database and truncate it to zero bytes,
+    /// so no page of the wiped content stays in `-wal`. A reader mid-query
+    /// (a UI observation) makes SQLite answer BUSY or leave frames behind:
+    /// let the pool's idle readers go and try again, then give up loudly.
+    func truncateWAL(attempts: Int = 40) async throws {
+        var frames = 0
+        for attempt in 0..<attempts {
+            if attempt > 0 {
+                (db as? DatabasePool)?.releaseMemory()
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            do {
+                let (wal, done) = try await db.writeWithoutTransaction { db in try db.checkpoint(.truncate) }
+                // -1/-1: not in WAL mode (in memory); else every frame must be in the db
+                if wal <= 0 || wal == done { return }
+                frames = wal - done
+            } catch let e as DatabaseError where e.resultCode == .SQLITE_BUSY || e.resultCode == .SQLITE_LOCKED {
+                frames = -1
+            }
+        }
+        throw WipeError.walNotTruncated(frames: frames)
+    }
+
     // MARK: whose cache this is (ADR 0004)
 
     /// The signed-in user this cache holds data for (their human principal
@@ -182,7 +210,7 @@ public final class Cache: Sendable {
             try db.execute(sql: "INSERT INTO blocks_fts(blocks_fts) VALUES ('rebuild')")
         }
         try await db.vacuum()
-        try await db.writeWithoutTransaction { db in try db.checkpoint(.truncate) }
+        try await truncateWAL()
         // SQLite may have recreated the WAL/SHM: give them the cache's class again
         if let path { try Cache.protectFiles(ofDatabaseAt: path) }
     }

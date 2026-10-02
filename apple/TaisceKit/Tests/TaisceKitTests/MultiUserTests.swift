@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TaisceKit
 
@@ -186,21 +187,23 @@ import Testing
         }
         let replayer = OutboxReplayer(api: server.client(), cache: cache)
         let report = try await replayer.replay()
-        #expect(report.forbidden == 1 && report.dropped == 1)
+        #expect(report.forbidden == 1 && report.gone == 1)
         #expect(server.requests.count == 4, "a refusal doesn't stop the queue")
         let failed = try await cache.failedOutbox()
-        #expect(failed.count == 1)
-        #expect(failed.first.flatMap { OutboxReplayer.proposeBase($0)?.0 } == "viewed")
-        #expect(failed.first?.lastError == OutboxReplayer.readOnlyMessage)
+        let byDoc = Dictionary(uniqueKeysWithValues: failed.compactMap { e in OutboxReplayer.proposeBase(e).map { ($0.0, e) } })
+        #expect(Set(byDoc.keys) == ["viewed", "gone"])
+        #expect(byDoc["viewed"]?.lastError == OutboxReplayer.readOnlyMessage)
         #expect(OutboxReplayer.readOnlyMessage.contains("You can only view this workspace"))
+        // a plain 404 (deleted elsewhere) keeps the write, text and all, as failed
+        #expect(byDoc["gone"]?.lastError == "This doc no longer exists, so this change wasn't saved.")
+        let kept = try #require(byDoc["gone"]?.body.flatMap { try? JSONDecoder().decode(ProposeRequest.self, from: $0) })
+        #expect(kept.ops.first?.kind == .replace(target: "b", content: "z"), "the typed text is still there")
+        #expect(try await cache.failedBlocks("gone") == ["b"], "where the editor shows refused writes")
         #expect(try await cache.pendingOutbox().isEmpty)
         #expect(try await cache.outboxState(for: "mine").failed == 0)
         // no endless retries: the next replay sends nothing
         _ = try await replayer.replay()
         #expect(server.requests.count == 4)
-        // a 404 dropped the write for the doc that's gone; nothing left of it
-        let all = try await cache.db.read { db in try OutboxEntry.fetchAll(db) }
-        #expect(!all.contains { OutboxReplayer.proposeBase($0)?.0 == "gone" })
     }
 
     @Test func forbiddenIsRecognised() {
@@ -240,7 +243,13 @@ import Testing
         let cache = try Cache(path: path)
         try await cache.storeDoc(Self.doc("d", title: "Private", content: "zebrauniquemarker salary"))
         try await cache.setOwner("u1")
+        // the app has live observations on the pool while it wipes
+        let watching = Task { for try await _ in cache.observeTree() {} }
+        defer { watching.cancel() }
+        try await Task.sleep(for: .milliseconds(50))
         try await cache.wipe()
+        let wal = (try? FileManager.default.attributesOfItem(atPath: path + "-wal")[.size] as? Int) ?? 0
+        #expect(wal == 0, "the WAL is checkpointed and truncated: no wiped page lingers there")
         #expect(try await cache.docs().isEmpty)
         #expect(try await cache.searchBlocks("zebrauniquemarker").isEmpty)
         // no trace in the database, its WAL or SHM
@@ -285,6 +294,49 @@ import Testing
         try await cache.storeDoc(Self.doc("a", title: "Aoife's", content: "hers"))
         #expect(try await CacheOwnership.reconcile(cache: cache, api: server.client(), freshSignIn: false) == .keep)
         #expect(try await cache.doc("a") != nil)
+    }
+
+    /// The upgrade edge: Tom's cache from an older build, unclaimed; the
+    /// launch's profile read fails (offline), so it stays unclaimed; a later
+    /// read works and records him; then his grant lapses and he signs in
+    /// again: his cache and queued writes stay.
+    @Test func aLaterProfileReadClaimsTheCacheSoTheSamePersonKeepsIt() async throws {
+        let cache = try await sharedFixture()
+        let online = Mutex(false)
+        let server = MockServer { r in
+            guard r.path == "/api/profile", online.withLock({ $0 }) else { return MockServer.Reply(status: 503, chunks: []) }
+            return .json(#"{"name":"Tom","principal_id":"tom-principal"}"#)
+        }
+        let api = server.client()
+        // launch, offline: a resume keeps, nothing recorded
+        #expect(try await CacheOwnership.reconcile(cache: cache, api: api, freshSignIn: false) == .keep)
+        #expect(try await cache.owner() == nil)
+        #expect(await CacheOwnership.recordIfUnclaimed(cache: cache, api: api) == false, "still offline")
+        // back online: the next successful read claims it
+        online.withLock { $0 = true }
+        #expect(await CacheOwnership.recordIfUnclaimed(cache: cache, api: api))
+        #expect(try await cache.owner() == "tom-principal")
+        // a fresh sign-in by the same person keeps everything
+        let queued = try await cache.pendingOutbox().count
+        #expect(try await CacheOwnership.reconcile(cache: cache, api: api, freshSignIn: true) == .keep)
+        #expect(try await cache.pendingOutbox().count == queued && queued == 4)
+        #expect(try await cache.doc("plan") != nil)
+        // recording never overwrites someone already recorded
+        try await cache.setOwner("aoife-principal")
+        #expect(await CacheOwnership.recordIfUnclaimed(cache: cache, api: api))
+        #expect(try await cache.owner() == "aoife-principal")
+    }
+
+    @Test func decisionChangesNothingUntilApplied() async throws {
+        let cache = try await sharedFixture()
+        try await cache.setOwner("tom-principal")
+        let server = MockServer { _ in .json(#"{"name":"Aoife","principal_id":"aoife-principal"}"#) }
+        let d = try await CacheOwnership.decision(cache: cache, api: server.client(), freshSignIn: true)
+        #expect(d == .wipe(owner: "aoife-principal"))
+        #expect(try await cache.doc("plan") != nil, "nothing wiped yet: the app stops sync first")
+        try await CacheOwnership.apply(d, to: cache)
+        #expect(try await cache.doc("plan") == nil)
+        #expect(try await cache.owner() == "aoife-principal")
     }
 
     @Test func profileDecodes() throws {

@@ -267,10 +267,6 @@ extension Cache {
         }
     }
 
-    public func dropOutboxEntry(_ id: Int64) async throws {
-        try await db.write { db in _ = try OutboxEntry.deleteOne(db, key: id) }
-    }
-
     /// Entries the server refused, oldest first.
     public func failedOutbox() async throws -> [OutboxEntry] {
         try await db.read { db in
@@ -365,12 +361,14 @@ public struct OutboxReplayer: Sendable {
     public struct Report: Sendable, Hashable {
         /// entries the server refused as read-only (403: a viewer's write)
         public var forbidden = 0
-        /// entries dropped because their target is gone or no longer shared (404)
-        public var dropped = 0
+        /// entries whose doc is gone (404): failed, kept, never retried on their own
+        public var gone = 0
     }
 
     /// Stored on an entry refused with 403: the workspace is view-only for you.
     public static let readOnlyMessage = "You can only view this workspace, so this change wasn't saved."
+    /// Stored on an entry refused with 404: the doc was deleted elsewhere.
+    public static let goneMessage = "This doc no longer exists, so this change wasn't saved."
 
     @discardableResult
     public func replay() async throws -> Report {
@@ -419,9 +417,11 @@ public struct OutboxReplayer: Sendable {
                 try await cache.markOutbox(id, state: .failed, error: Self.readOnlyMessage)
                 report.forbidden += 1
             } catch APIError.notFound {
-                // gone, or no longer shared with us: it can never land
-                try await cache.dropOutboxEntry(id)
-                report.dropped += 1
+                // the doc is gone (hard-deleted elsewhere): kept as failed, so
+                // the text stays where refused writes are shown and can be
+                // copied out. Only a `revoked` row drops writes (dropOutbox).
+                try await cache.markOutbox(id, state: .failed, error: Self.goneMessage)
+                report.gone += 1
             } catch let e as APIError {
                 // the server answered: retrying the same request won't help
                 try await cache.markOutbox(id, state: .failed, error: String(describing: e))

@@ -36,15 +36,17 @@ public enum CacheOwnership {
         }
     }
 
-    /// Read the profile, decide, and wipe or record the owner. Returns what
-    /// was done, so the app can clear its own per-user state on a wipe.
-    @discardableResult
-    public static func reconcile(cache: Cache, api: APIClient, freshSignIn: Bool) async throws -> Decision {
+    /// Read the profile and decide, changing nothing: the app stops sync
+    /// before applying a wipe.
+    public static func decision(cache: Cache, api: APIClient, freshSignIn: Bool) async throws -> Decision {
         let current = try? await api.profile().principalID
-        let decision = decide(
+        return decide(
             cached: try await cache.owner(), current: current,
             freshSignIn: freshSignIn, cacheEmpty: try await cache.isEmpty()
         )
+    }
+
+    public static func apply(_ decision: Decision, to cache: Cache) async throws {
         switch decision {
         case .keep: break
         case let .adopt(owner): try await cache.setOwner(owner)
@@ -52,6 +54,27 @@ public enum CacheOwnership {
             try await cache.wipe()
             if let owner { try await cache.setOwner(owner) }
         }
-        return decision
+    }
+
+    /// Read the profile, decide, and wipe or record the owner. Returns what
+    /// was done, so the app can clear its own per-user state on a wipe.
+    @discardableResult
+    public static func reconcile(cache: Cache, api: APIClient, freshSignIn: Bool) async throws -> Decision {
+        let d = try await decision(cache: cache, api: api, freshSignIn: freshSignIn)
+        try await apply(d, to: cache)
+        return d
+    }
+
+    /// A cache nobody has claimed yet (the launch's profile read failed, or
+    /// a build before this one) is claimed by the signed-in person at the
+    /// first profile read that works, so a later fresh sign-in by the same
+    /// person keeps it (and its queued writes) instead of wiping unclaimed
+    /// data. Never overwrites a recorded owner. True once it is recorded.
+    @discardableResult
+    public static func recordIfUnclaimed(cache: Cache, api: APIClient) async -> Bool {
+        guard (try? await cache.owner()) == nil else { return true }
+        guard let me = try? await api.profile().principalID else { return false }
+        guard (try? await cache.owner()) == nil else { return true }
+        return (try? await cache.setOwner(me)) != nil
     }
 }
