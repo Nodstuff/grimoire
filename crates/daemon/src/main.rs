@@ -592,9 +592,7 @@ fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, h
             let owner = store.auth_ensure_owner(human, &name, now)?;
             let target = match user.as_deref() {
                 None => owner,
-                Some(key) => store
-                    .auth_find_user(key)?
-                    .ok_or_else(|| anyhow::anyhow!("no single user matches {key:?} (see `taisce auth list`)"))?,
+                Some(key) => one_user(store, key)?,
             };
             let token = auth::random_token();
             store.auth_add_enrollment(&auth::hash_secret(&token), target.id, now + auth::ENROLL_TTL)?;
@@ -698,11 +696,23 @@ fn cli_workspace(store: &SqliteStore, key: &str) -> anyhow::Result<taisce_store:
     }
 }
 
+/// Exactly one user for a CLI `--user`: an unknown or ambiguous name is
+/// refused, and an ambiguous one lists the candidates' ids.
+fn one_user(store: &SqliteStore, key: &str) -> anyhow::Result<taisce_store::auth::AuthUser> {
+    let mut hits = store.auth_users_matching(key)?;
+    match hits.len() {
+        1 => Ok(hits.remove(0)),
+        0 => anyhow::bail!("no user matches {key:?} (see `taisce auth list`)"),
+        _ => anyhow::bail!(
+            "{key:?} matches several users — pass an id: {}",
+            hits.iter().map(|u| format!("{} ({})", u.id, u.name)).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
 /// `taisce workspace …`: straight against the db, as System (the box).
 fn workspace_cli(store: &mut SqliteStore, cmd: WorkspaceCmd) -> anyhow::Result<()> {
-    let user_of = |store: &SqliteStore, key: &str| -> anyhow::Result<taisce_store::auth::AuthUser> {
-        store.auth_find_user(key)?.ok_or_else(|| anyhow::anyhow!("no single user matches {key:?} (see `taisce auth list`)"))
-    };
+    let user_of = |store: &SqliteStore, key: &str| one_user(store, key);
     match cmd {
         WorkspaceCmd::List => {
             for w in store.list_workspaces()? {
@@ -730,7 +740,7 @@ fn workspace_cli(store: &mut SqliteStore, cmd: WorkspaceCmd) -> anyhow::Result<(
             let role = taisce_store::Role::parse(&role).ok_or_else(|| anyhow::anyhow!("--role: editor | viewer"))?;
             store.share_workspace(w.id, u.id, role)?;
             tracing::info!(target: auth::AUDIT, event = "workspace.share", workspace = %w.id, user = %u.id, role = role.as_str(), by = "cli");
-            println!("shared {} with {} as {}", w.name, u.name, role.as_str());
+            println!("shared {} with {} as {} (history before today stays private)", w.name, u.name, role.as_str());
         }
         WorkspaceCmd::Unshare { workspace, user } => {
             let w = cli_workspace(store, &workspace)?;

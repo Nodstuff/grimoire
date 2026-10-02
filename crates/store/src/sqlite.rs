@@ -1532,6 +1532,15 @@ impl BlockStore for SqliteStore {
         if name.is_empty() || name.chars().count() > 64 {
             return Err(StoreError::InvalidOp("display name must be 1..64 characters".into()));
         }
+        // a person's name is theirs alone: never another person's, a later
+        // user's, or an agent's (ADR 0004)
+        let kind: Option<String> = self
+            .conn
+            .query_row("SELECT kind FROM principals WHERE id = ?1", params![id.to_string()], |r| r.get(0))
+            .optional()?;
+        if kind.as_deref() == Some("human") && tenancy::name_taken_conn(&self.conn, name, Some(id))? {
+            return Err(StoreError::InvalidOp("that name is taken".into()));
+        }
         if let Some(u) = self.scope.user() {
             let mine: bool = self.conn.query_row(
                 "SELECT EXISTS (SELECT 1 FROM auth_users WHERE id = ?1 AND principal_id = ?2)",
@@ -1787,8 +1796,9 @@ impl BlockStore for SqliteStore {
         self.see(doc_id)?;
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {OP_COLS} FROM ops
-             WHERE doc_id = ?1 AND epoch_applied IS NOT NULL AND epoch_applied > ?2
-             ORDER BY epoch_applied, id"
+             WHERE doc_id = ?1 AND epoch_applied IS NOT NULL AND epoch_applied > ?2 AND {}
+             ORDER BY epoch_applied, id",
+            self.history_pred("ops.doc_id", "ops.created_at")
         ))?;
         let rows = stmt.query_map(params![doc_id.to_string(), since_epoch], row_to_op)?;
         rows.map(|r| build_op(r?).map(|o| self.mask_op(o))).collect()
@@ -2631,14 +2641,15 @@ impl BlockStore for SqliteStore {
             "SELECT a.id, a.doc_id, a.op_id, a.kind, a.status, a.resolved_by,
                     {}
              FROM annotations a JOIN ops o ON o.id = a.op_id
-             WHERE a.status = 'open' AND (?1 IS NULL OR a.doc_id = ?1) AND {}
+             WHERE a.status = 'open' AND (?1 IS NULL OR a.doc_id = ?1) AND {} AND {}
              ORDER BY a.created_at, a.id",
             OP_COLS
                 .split(", ")
                 .map(|c| format!("o.{c}"))
                 .collect::<Vec<_>>()
                 .join(", "),
-            self.vis("a.doc_id")
+            self.vis("a.doc_id"),
+            self.history_pred("o.doc_id", "o.created_at")
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![doc_id.map(|d| d.to_string())], |r| {
@@ -3277,14 +3288,15 @@ impl SqliteStore {
              FROM ops o
              LEFT JOIN annotations a ON a.op_id = o.id
              LEFT JOIN principals p ON p.id = a.resolved_by
-             WHERE o.principal = ?1 AND {}
+             WHERE o.principal = ?1 AND {} AND {}
              ORDER BY o.id DESC LIMIT ?2",
             OP_COLS
                 .split(", ")
                 .map(|c| format!("o.{c}"))
                 .collect::<Vec<_>>()
                 .join(", "),
-            self.vis("o.doc_id")
+            self.vis("o.doc_id"),
+            self.history_pred("o.doc_id", "o.created_at")
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![principal.to_string(), limit as i64], |r| {
@@ -3693,8 +3705,9 @@ impl SqliteStore {
         self.see(doc_id)?;
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {OP_COLS} FROM ops
-             WHERE doc_id = ?1 AND epoch_applied IS NOT NULL
-             ORDER BY epoch_applied DESC, id DESC LIMIT ?2"
+             WHERE doc_id = ?1 AND epoch_applied IS NOT NULL AND {}
+             ORDER BY epoch_applied DESC, id DESC LIMIT ?2",
+            self.history_pred("ops.doc_id", "ops.created_at")
         ))?;
         let rows = stmt.query_map(params![doc_id.to_string(), limit as i64], row_to_op)?;
         rows.map(|r| build_op(r?).map(|o| self.mask_op(o))).collect()
@@ -3991,6 +4004,21 @@ impl SqliteStore {
                 |row| row.get::<_, bool>(0),
             )
             .unwrap_or(false)
+    }
+
+    /// ADR 0004: a reader sees a doc's history from the point it entered
+    /// their view (their latest `granted` access row for it), never the ops
+    /// before — sharing a doc must not share what was deleted from it
+    /// before. Readers who could see it all along have no such row and see
+    /// everything. System/Local: no filter.
+    pub(crate) fn history_pred(&self, doc_col: &str, created_col: &str) -> String {
+        match self.scope.user() {
+            None => "1".into(),
+            Some(u) => format!(
+                "{created_col} > COALESCE((SELECT max(hc.at) FROM changes hc
+                                          WHERE hc.user_id = '{u}' AND hc.doc_id = {doc_col} AND hc.kind = 'tree'), '')"
+            ),
+        }
     }
 
     /// Hide a parent the viewer cannot see (the doc is a root for them).

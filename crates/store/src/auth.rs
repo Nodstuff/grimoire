@@ -201,8 +201,8 @@ impl SqliteStore {
         if name.is_empty() || name.chars().count() > 64 {
             return Err(StoreError::InvalidOp("a user's name must be 1..64 characters".into()));
         }
-        if self.auth_users()?.iter().any(|u| u.name.eq_ignore_ascii_case(name)) {
-            return Err(StoreError::InvalidOp(format!("a user named {name:?} already exists")));
+        if crate::tenancy::name_taken_conn(&self.conn, name, None)? {
+            return Err(StoreError::InvalidOp(format!("the name {name:?} is taken (a person or an agent has it)")));
         }
         if self.auth_owner()?.is_none() {
             return Err(StoreError::InvalidOp("no owner yet: serve once in server mode (or `auth enroll`) first".into()));
@@ -224,20 +224,26 @@ impl SqliteStore {
     }
 
     /// A user by id, unique id prefix, or (case-insensitive) name.
+    /// A user by id, unique id prefix, or (case-insensitive) name — only
+    /// when exactly one user matches.
     pub fn auth_find_user(&self, key: &str) -> Result<Option<AuthUser>> {
+        let mut hits = self.auth_users_matching(key)?;
+        Ok(if hits.len() == 1 { hits.pop() } else { None })
+    }
+
+    /// Every user a key could mean: by name (case-insensitive), else by id
+    /// prefix. The CLI prints them when there is not exactly one.
+    pub fn auth_users_matching(&self, key: &str) -> Result<Vec<AuthUser>> {
         let key = key.trim();
         if key.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let users = self.auth_users()?;
-        if let Some(u) = users.iter().find(|u| u.name.eq_ignore_ascii_case(key)) {
-            return Ok(Some(u.clone()));
+        let by_name: Vec<AuthUser> = users.iter().filter(|u| u.name.eq_ignore_ascii_case(key)).cloned().collect();
+        if !by_name.is_empty() {
+            return Ok(by_name);
         }
-        let hits: Vec<&AuthUser> = users.iter().filter(|u| u.id.to_string().starts_with(&key.to_lowercase())).collect();
-        Ok(match hits.as_slice() {
-            [u] => Some((*u).clone()),
-            _ => None,
-        })
+        Ok(users.into_iter().filter(|u| u.id.to_string().starts_with(&key.to_lowercase())).collect())
     }
 
     pub fn auth_owner(&self) -> Result<Option<AuthUser>> {

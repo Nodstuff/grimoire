@@ -247,6 +247,20 @@ pub(crate) fn link_reaches(conn: &Connection, linking: Uuid, target: Uuid) -> Re
     Ok(readers.is_subset(&seers))
 }
 
+/// Is a display name taken by another principal (a person or an agent) or
+/// user, case-insensitively? People's names are unique (ADR 0004): history,
+/// member lists and the CLI's `--user <name>` all go by them. `except` is
+/// the principal being renamed.
+pub(crate) fn name_taken_conn(conn: &Connection, name: &str, except: Option<Uuid>) -> Result<bool> {
+    let except = except.map(|e| e.to_string());
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM principals WHERE display_name = ?1 COLLATE NOCASE AND id IS NOT ?2)
+             OR EXISTS (SELECT 1 FROM auth_users WHERE name = ?1 COLLATE NOCASE AND principal_id IS NOT ?2)",
+        params![name.trim(), except],
+        |r| r.get(0),
+    )?)
+}
+
 /// Is `principal` an agent (the share gate's subject)?
 pub(crate) fn is_agent_conn(conn: &Connection, principal: Uuid) -> Result<bool> {
     let kind: Option<String> = conn

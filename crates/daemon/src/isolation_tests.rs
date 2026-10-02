@@ -130,6 +130,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/todo", "a_viewer_reading_a_shared_todo_creates_nothing"),
     ("/api/docs/{id}/workspace", "unlabel_into_a_hidden_parent_is_a_generic_refusal"),
     ("mcp:append", "agent_principals_are_per_person"),
+    ("/api/todo", "a_connectors_get_writes_nothing"),
     ("/api/doc/{id}/history", "agent_principals_are_per_person"),
 ];
 
@@ -1135,4 +1136,34 @@ async fn unlabel_into_a_hidden_parent_is_a_generic_refusal() {
     let (st, out) = fx.b("PUT", &format!("/api/docs/{d}/workspace"), Some(json!({"workspace_id": null}))).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{out}");
     assert!(!out.contains("destination") && !out.contains("A private parent"), "{out}");
+}
+
+/// Round-2 N4: a GET is read-only for a connector token: GET /api/todo on a
+/// shared workspace neither creates its To-do nor carries items forward.
+/// (Audit of every GET handler: GET /api/todo was the only one that writes —
+/// find-or-create plus carry-forward; /api/todo/due, /api/inbox,
+/// /api/home/*, /api/docs and the rest only read.)
+#[tokio::test]
+async fn a_connectors_get_writes_nothing() {
+    let fx = fixture();
+    fx.store.lock(Scope::User(fx.a)).share_workspace(fx.family, fx.b, Role::Editor).unwrap();
+    let today = "2026-10-02";
+    let n0 = fx.store.lock(Scope::System).latest_change_seq().unwrap();
+    let (st, out) = fx
+        .call(&fx.b_conn, "GET", &format!("/api/todo?date={today}&today={today}&utc_offset=%2B00:00&workspace={}", fx.family), None)
+        .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{out}");
+    let (st, _) = fx.call(&fx.b_conn, "GET", &format!("/api/todo?date={today}&today={today}"), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert_eq!(fx.store.lock(Scope::System).latest_change_seq().unwrap(), n0, "nothing was written");
+    // B's own app may still create her list on a GET
+    let (st, _) = fx.b("GET", &format!("/api/todo?date={today}&today={today}&workspace={}", fx.family), None).await;
+    assert_eq!(st, StatusCode::OK);
+    // and once it exists the connector reads it, without carrying forward
+    let n1 = fx.store.lock(Scope::System).latest_change_seq().unwrap();
+    let (st, _) = fx
+        .call(&fx.b_conn, "GET", &format!("/api/todo?date=2026-10-05&today=2026-10-05&workspace={}", fx.family), None)
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(fx.store.lock(Scope::System).latest_change_seq().unwrap(), n1, "no carry-forward by a connector");
 }

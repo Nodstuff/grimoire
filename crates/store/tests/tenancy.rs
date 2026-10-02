@@ -823,3 +823,109 @@ fn answer_sources_report_only_visible_citations() {
     assert_eq!(got.iter().map(|a| a.block_id).collect::<Vec<_>>(), vec![t.shared_block]);
     assert_eq!(t.store.lock(Scope::System).answer_sources(t.shared_doc).unwrap().len(), 2, "the refresher sees all");
 }
+
+// ---- round-2 regressions (n1–n3) ----
+
+/// n1: deleting a workspace never takes a member's own doc: a doc B filed
+/// into A's workspace from her private folder goes back under that folder.
+#[test]
+fn n1_deleting_a_workspace_returns_members_docs_to_them() {
+    let t = setup();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    let (p, c) = {
+        let mut s = t.store.lock(Scope::User(t.b));
+        let p = s.create_doc("B private folder", None, t.b_human).unwrap().id;
+        let c = s.create_doc("B's recipe, shared", Some(p), t.b_human).unwrap().id;
+        s.set_doc_workspace(c, Some(t.family), t.b_human).unwrap();
+        (p, c)
+    };
+    t.store.lock(Scope::User(t.a)).delete_workspace(t.family).unwrap();
+    assert_eq!(t.store.lock(Scope::User(t.b)).get_doc(c).unwrap().parent_id, Some(p), "back under her folder");
+    not_found(t.store.lock(Scope::User(t.a)).get_doc(c));
+    // and a member's doc whose parent she can no longer write comes to her root
+    let mut s = t.store.lock(Scope::User(t.a));
+    let fam2 = s.create_workspace("Family2", None, None, None).unwrap().id;
+    s.set_doc_workspace(t.shared_doc, Some(fam2), t.a_human).unwrap();
+    s.share_workspace(fam2, t.b, Role::Viewer).unwrap(); // she can read A's doc, not write under it
+    drop(s);
+    let mine = {
+        let mut s = t.store.lock(Scope::User(t.b));
+        let d = s.create_doc("B's own, filed under A's doc", None, t.b_human).unwrap().id;
+        let w = s.create_workspace("B shelf", None, None, None).unwrap().id;
+        s.set_doc_workspace(d, Some(w), t.b_human).unwrap();
+        s.share_workspace(w, t.a, Role::Editor).unwrap();
+        d
+    };
+    // (System builds the shape: B's labelled doc under A's Family2 root)
+    t.store.lock(Scope::System).move_doc(mine, Some(t.shared_doc), None).unwrap();
+    let shelf = t.store.lock(Scope::User(t.b)).doc_workspace(mine).unwrap().unwrap();
+    t.store.lock(Scope::User(t.b)).delete_workspace(shelf).unwrap();
+    let s = t.store.lock(Scope::User(t.b));
+    let d = s.get_doc(mine).unwrap();
+    assert_eq!(d.parent_id, None, "she cannot write under A's doc (a viewer): it comes to her root");
+    assert_eq!(s.doc_space(mine).unwrap(), Space::Unsorted(Some(t.b)), "her Unsorted, still hers");
+}
+
+/// n2: a reader sees a doc's history only from the point it entered their
+/// view; what was deleted before the share stays private.
+#[test]
+fn n2_history_before_access_stays_private() {
+    let t = setup();
+    let d = {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let (d, _) = s.create_doc_with_ops("Trip plan", None, t.a_human, vec![para("pre-share secret: the money is in the blue tin")]).unwrap();
+        let tree = s.read_doc(d.id).unwrap();
+        let bid = tree.roots[0].block.id;
+        s.apply(d.id, tree.doc.current_epoch, t.a_human, vec![OpInput { kind: OpKind::Delete { target: bid }, source_refs: vec![] }]).unwrap();
+        let e = s.get_doc(d.id).unwrap().current_epoch;
+        s.apply(d.id, e, t.a_human, vec![para("clean public text")]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.set_doc_workspace(d.id, Some(t.family), t.a_human).unwrap();
+        d.id
+    };
+    let dump = |v: &Vec<LedgerOp>| serde_json::to_string(v).unwrap();
+    {
+        let s = t.store.lock(Scope::User(t.b));
+        let since0 = s.ops_since(d, 0).unwrap();
+        assert!(since0.is_empty(), "diff from before her access starts at her access, no error: {}", dump(&since0));
+        assert!(!dump(&s.ops_for_doc_limited(d, 100).unwrap()).contains("blue tin"));
+        assert!(serde_json::to_string(&s.review_queue(None).unwrap()).unwrap().find("blue tin").is_none());
+        // the current content reads
+        assert!(serde_json::to_string(&s.read_doc(d).unwrap()).unwrap().contains("clean public text"));
+    }
+    // ops after the share are hers to see
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let e = s.get_doc(d).unwrap().current_epoch;
+        s.apply(d, e, t.a_human, vec![para("after the share")]).unwrap();
+    }
+    let s = t.store.lock(Scope::User(t.b));
+    let after = dump(&s.ops_since(d, 0).unwrap());
+    assert!(after.contains("after the share") && !after.contains("blue tin"), "{after}");
+    drop(s);
+    // the owner, who saw it all along, sees everything
+    assert!(dump(&t.store.lock(Scope::User(t.a)).ops_since(d, 0).unwrap()).contains("blue tin"));
+}
+
+/// n3: people's names are unique: nobody renames themselves to another
+/// person's (or a later user's, or an agent's) name, and a name lookup is
+/// never ambiguous.
+#[test]
+fn n3_names_are_unique_and_lookups_unambiguous() {
+    let t = setup();
+    let c = t.store.lock(Scope::System).auth_add_user("Ciara", 5).unwrap();
+    {
+        let mut s = t.store.lock(Scope::User(t.b));
+        assert!(s.rename_principal(t.b_human, "Ciara").is_err(), "a later user's name");
+        assert!(s.rename_principal(t.b_human, "tom").is_err(), "another person's, case-insensitively");
+        assert!(s.rename_principal(t.b_human, "claude:test").is_err(), "an agent's");
+        s.rename_principal(t.b_human, "Aoife M").unwrap();
+        s.rename_principal(t.b_human, "aoife m").unwrap();
+    }
+    assert!(t.store.lock(Scope::System).auth_add_user("AOIFE M", 6).is_err(), "user add checks people too");
+    assert!(t.store.lock(Scope::System).auth_add_user("claude:test", 6).is_err(), "and agents");
+    assert_eq!(t.store.lock(Scope::System).auth_find_user("Ciara").unwrap().map(|u| u.id), Some(c.id));
+    let names: Vec<String> = t.store.lock(Scope::User(t.a)).list_principals().unwrap().into_iter().filter(|p| p.kind == PrincipalKind::Human).map(|p| p.display_name).collect();
+    assert!(!names.iter().any(|n| n == "Tom" && names.iter().filter(|m| *m == "Tom").count() > 1), "{names:?}");
+}

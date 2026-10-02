@@ -1051,13 +1051,18 @@ async fn get_day(State(st): State<ApiState>, v: Viewer, server: Server, Query(q)
     }
     let human = v.human;
     let ws = q.clock.workspace.clone();
+    // a GET is read-only for anything but the person's own app (ADR 0004):
+    // a connector's GET never creates a list or carries items forward
+    let may_write = v.human_surface;
     with_store(&st.store, v.scope, move |s| {
         let scope = match scope_of(s, ws.as_deref()) {
             Ok(sc) => sc,
             Err(m) => return Json(json!({"error": m})),
         };
-        let doc = match find_or_create_todo_in(s, human, scope) {
-            Ok(d) => d,
+        let found = if may_write { find_or_create_todo_in(s, human, scope).map(Some) } else { find_todo(s, scope) };
+        let doc = match found {
+            Ok(Some(d)) => d,
+            Ok(None) => return Json(json!({"error": "not found: no To-do list here yet"})),
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
         let md = match taisce_store::export::export_doc(&*s, doc.id) {
@@ -1065,7 +1070,7 @@ async fn get_day(State(st): State<ApiState>, v: Viewer, server: Server, Query(q)
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
         let mut carried = 0;
-        if should_carry(&md, &date, &today) {
+        if may_write && should_carry(&md, &date, &today) {
             let (new_md, n) = carry_forward(&md, &date, &today);
             if n > 0 {
                 if let Err(e) = save(s, doc.id, human, &new_md) {

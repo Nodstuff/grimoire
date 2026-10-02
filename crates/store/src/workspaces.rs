@@ -445,29 +445,29 @@ impl SqliteStore {
         let before = tenancy::access_snapshot(&tx)?;
         let labels = tx.execute("DELETE FROM doc_workspace WHERE workspace_id = ?1", params![id.to_string()])?;
         tx.execute("DELETE FROM workspaces WHERE id = ?1", params![id.to_string()])?;
-        // its docs stay with its owner (ADR 0004): a labelled root that would
-        // now fall into someone else's space comes to the owner's root
-        if let Some(owner) = ws_owner {
-            for d in labelled {
-                let lands = match tenancy::space_conn(&tx, d) {
-                    Ok(Space::Unsorted(o)) => o,
-                    Ok(Space::Workspace(x)) => tx
-                        .query_row(
-                            &format!("SELECT COALESCE(owner_id, {}) FROM workspaces WHERE id = ?1", tenancy::INSTANCE_OWNER_SQL),
-                            params![x.to_string()],
-                            |r| r.get::<_, Option<String>>(0),
-                        )
-                        .optional()?
-                        .flatten()
-                        .and_then(|o| Uuid::parse_str(&o).ok()),
-                    Err(_) => continue,
-                };
-                if lands != Some(owner) {
-                    tx.execute(
-                        "UPDATE docs SET parent_id = NULL, owner_id = ?1 WHERE id = ?2",
-                        params![owner.to_string(), d.to_string()],
-                    )?;
-                }
+        // every labelled root goes back to whoever put it there (ADR 0004):
+        // its contributor (the doc's owner — the workspace owner, or a member
+        // who filed their own doc in). It stays where it now falls if they
+        // can write there; otherwise it comes to their own root, in their
+        // Unsorted. Ownership never changes hands as a side effect.
+        let _ = ws_owner;
+        for d in labelled {
+            let contributor: Option<String> = tx
+                .query_row(
+                    &format!("SELECT COALESCE(owner_id, {}) FROM docs WHERE id = ?1", tenancy::INSTANCE_OWNER_SQL),
+                    params![d.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let Some(contributor) = contributor.and_then(|c| Uuid::parse_str(&c).ok()) else { continue };
+            let Ok(lands) = tenancy::space_conn(&tx, d) else { continue };
+            let can_write = tenancy::access_conn(&tx, Scope::User(contributor), lands)?.is_some_and(|r| r.can_write());
+            if !can_write {
+                tx.execute(
+                    "UPDATE docs SET parent_id = NULL, owner_id = ?1 WHERE id = ?2",
+                    params![contributor.to_string(), d.to_string()],
+                )?;
             }
         }
         emit_tree_conn(&tx, &docs)?;
