@@ -241,6 +241,7 @@ fn mint(s: &mut SqliteStore, user: Uuid, name: &str, app: bool) -> String {
         created_at: now(),
         revoked_at: None,
         revoke_why: None,
+        credential_id: None,
     };
     s.oauth_issue_grant(None, &grant, &hash_secret(&access), now() + 3600, &hash_secret(&random_token()), now() + 86400)
         .unwrap();
@@ -348,7 +349,7 @@ fn fixture() -> Fx {
 /// ceremony is `auth::tests`' job): `cookie:<value>` for `Fx::call`.
 fn web_session(s: &mut SqliteStore, user: Uuid) -> String {
     let value = random_token();
-    s.auth_create_web_session(user, &hash_secret(&value), "Mac · Safari", now()).unwrap();
+    s.auth_create_web_session(user, None, &hash_secret(&value), "Mac · Safari", now()).unwrap();
     format!("{COOKIE_TOKEN}{value}")
 }
 
@@ -1310,7 +1311,7 @@ async fn first_party_is_a_pinned_client_not_a_declared_redirect() {
             refresh_at: None,
         })
         .unwrap();
-        let grant = Grant { id: Uuid::now_v7(), client_id: cid, user_id: fx.b, resource: None, scope: crate::auth::SCOPE.into(), created_at: now(), revoked_at: None, revoke_why: None };
+        let grant = Grant { id: Uuid::now_v7(), client_id: cid, user_id: fx.b, resource: None, scope: crate::auth::SCOPE.into(), created_at: now(), revoked_at: None, revoke_why: None, credential_id: None };
         s.oauth_issue_grant(None, &grant, &hash_secret(&tok), now() + 3600, &hash_secret(&random_token()), now() + 86400).unwrap();
         tok
     };
@@ -1337,7 +1338,7 @@ async fn first_party_is_a_pinned_client_not_a_declared_redirect() {
         refresh_at: None,
     };
     let grant = |raw: &mut SqliteStore, id: &str| {
-        let g = Grant { id: Uuid::now_v7(), client_id: id.into(), user_id: tom, resource: None, scope: crate::auth::SCOPE.into(), created_at: now(), revoked_at: None, revoke_why: None };
+        let g = Grant { id: Uuid::now_v7(), client_id: id.into(), user_id: tom, resource: None, scope: crate::auth::SCOPE.into(), created_at: now(), revoked_at: None, revoke_why: None, credential_id: None };
         raw.oauth_issue_grant(None, &g, &hash_secret(&random_token()), now() + 3600, &hash_secret(&random_token()), now() + 86400).unwrap();
         g.id
     };

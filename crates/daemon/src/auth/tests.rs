@@ -53,6 +53,42 @@ fn harness_with(cfg: AuthConfig) -> H {
     H { app, st, owner, passkey: WebauthnAuthenticator::new(SoftPasskey::new(true)) }
 }
 
+/// The soft token stands in for a platform authenticator: it cannot store
+/// resident keys (it refuses `requireResidentKey`), so the test drops that
+/// legacy flag after checking enrollment asks for a discoverable credential.
+fn soft_registration(options: &Value) -> CreationChallengeResponse {
+    let mut o = options.clone();
+    let sel = o.pointer_mut("/publicKey/authenticatorSelection").unwrap();
+    assert_eq!(sel["residentKey"], "required", "enrollment asks for a discoverable passkey");
+    assert_eq!(sel["requireResidentKey"], true);
+    sel["requireResidentKey"] = json!(false);
+    serde_json::from_value(o).unwrap()
+}
+
+impl H {
+    /// A discoverable challenge names no credential. The soft token cannot
+    /// discover its own (it is U2F underneath), so the test plays the
+    /// authenticator's part: after checking `allowCredentials` is empty, it
+    /// fills in the credentials this soft token holds (every one enrolled in
+    /// the harness). The signed clientData is unchanged by this.
+    fn discover(&self, options: &Value) -> RequestChallengeResponse {
+        assert_eq!(options["publicKey"]["allowCredentials"], json!([]), "no credential is named: {options}");
+        assert!(options.get("mediation").is_none(), "modal, not conditional: {options}");
+        let mut o = options.clone();
+        let ids: Vec<Value> = self
+            .st
+            .store
+            .lock(taisce_store::Scope::System)
+            .auth_credentials(None)
+            .unwrap()
+            .into_iter()
+            .map(|c| json!({"type": "public-key", "id": c.cred_id}))
+            .collect();
+        o["publicKey"]["allowCredentials"] = json!(ids);
+        serde_json::from_value(o).unwrap()
+    }
+}
+
 fn harness() -> H {
     harness_with(AuthConfig::from_public_url(BASE).unwrap())
 }
@@ -110,7 +146,7 @@ impl H {
         let begin = send(&self.app, post_json("/auth/enroll/begin", json!({"t": t, "label": "soft"}))).await;
         assert_eq!(begin.status, StatusCode::OK, "{}", begin.body);
         let b = begin.json();
-        let ccr: CreationChallengeResponse = serde_json::from_value(b["options"].clone()).unwrap();
+        let ccr = soft_registration(&b["options"]);
         let cred = self.passkey.do_registration(Url::parse(BASE).unwrap(), ccr).unwrap();
         send(&self.app, post_json("/auth/enroll/finish", json!({"ceremony": b["ceremony"], "credential": cred}))).await
     }
@@ -135,7 +171,7 @@ impl H {
     async fn sign_in(&mut self, req: &str) -> String {
         let begin = send(&self.app, post_json("/oauth/authorize/begin", json!({"req": req}))).await;
         assert_eq!(begin.status, StatusCode::OK, "{}", begin.body);
-        let rcr: RequestChallengeResponse = serde_json::from_value(begin.json()).unwrap();
+        let rcr = self.discover(&begin.json());
         let cred = self.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
         let fin = send(&self.app, post_json("/oauth/authorize/finish", json!({"req": req, "credential": cred}))).await;
         assert_eq!(fin.status, StatusCode::OK, "{}", fin.body);
@@ -667,7 +703,7 @@ async fn enrollment_link_is_single_use() {
     let (hsh, owner) = (hash_secret(&t), h.owner);
     h.st.store.lock(taisce_store::Scope::System).auth_add_enrollment(&hsh, owner, now() + ENROLL_TTL).unwrap();
     let begin = send(&h.app, post_json("/auth/enroll/begin", json!({"t": t}))).await.json();
-    let ccr: CreationChallengeResponse = serde_json::from_value(begin["options"].clone()).unwrap();
+    let ccr = soft_registration(&begin["options"]);
     let cred = h.passkey.do_registration(Url::parse(BASE).unwrap(), ccr).unwrap();
     let fin = send(&h.app, post_json("/auth/enroll/finish", json!({"ceremony": begin["ceremony"], "credential": cred}))).await;
     assert_eq!(fin.status, StatusCode::OK, "{}", fin.body);
@@ -1066,6 +1102,7 @@ async fn a_lapsed_app_client_re_registers_as_the_pinned_app() {
             created_at: t0,
             revoked_at: None,
             revoke_why: None,
+            credential_id: None,
         };
         s.oauth_issue_grant(None, &g, &hash_secret(&access), t0 + 3600, &hash_secret(&refresh), t0 + 86400).unwrap();
         (access, refresh)
@@ -1327,7 +1364,7 @@ impl H {
         let begin = send(&self.app, post_json("/auth/web/begin", json!({}))).await;
         assert_eq!(begin.status, StatusCode::OK, "{}", begin.body);
         let b = begin.json();
-        let rcr: RequestChallengeResponse = serde_json::from_value(b["options"].clone()).unwrap();
+        let rcr = self.discover(&b["options"]);
         let cred = self.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
         let mut req = post_json("/auth/web/finish", json!({"ceremony": b["ceremony"], "credential": cred}));
         req.headers_mut().insert(
@@ -1381,7 +1418,7 @@ async fn web_sign_in_refuses_cross_origin_replayed_and_mismatched_assertions() {
     assert_eq!(send(&h.app, none).await.status, StatusCode::FORBIDDEN, "Origin is required");
     // a ceremony works once
     let begin = send(&h.app, post_json("/auth/web/begin", json!({}))).await.json();
-    let rcr: RequestChallengeResponse = serde_json::from_value(begin["options"].clone()).unwrap();
+    let rcr = h.discover(&begin["options"]);
     let cred = h.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
     let body = json!({"ceremony": begin["ceremony"], "credential": cred});
     assert_eq!(send(&h.app, post_json("/auth/web/finish", body.clone())).await.status, StatusCode::OK);
@@ -1391,7 +1428,7 @@ async fn web_sign_in_refuses_cross_origin_replayed_and_mismatched_assertions() {
     // an assertion over another ceremony's challenge is refused
     let b1 = send(&h.app, post_json("/auth/web/begin", json!({}))).await.json();
     let b2 = send(&h.app, post_json("/auth/web/begin", json!({}))).await.json();
-    let rcr: RequestChallengeResponse = serde_json::from_value(b1["options"].clone()).unwrap();
+    let rcr = h.discover(&b1["options"]);
     let cred = h.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
     let r = send(&h.app, post_json("/auth/web/finish", json!({"ceremony": b2["ceremony"], "credential": cred}))).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
@@ -1520,7 +1557,7 @@ async fn web_sessions_expire_idle_and_absolute_and_roll() {
     let mk = |created: i64, touched: Option<i64>| {
         let tok = random_token();
         let mut s = h.st.store.lock(taisce_store::Scope::System);
-        let w = s.auth_create_web_session(h.owner, &hash_secret(&tok), "", created).unwrap();
+        let w = s.auth_create_web_session(h.owner, None, &hash_secret(&tok), "", created).unwrap();
         if let Some(t) = touched {
             assert!(s.auth_touch_web_session(w.id, t).unwrap());
         }

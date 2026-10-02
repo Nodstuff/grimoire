@@ -295,10 +295,22 @@ enum AuthCmd {
     List,
     /// Revoke an OAuth grant or a web UI session, or delete a passkey, by id
     /// (or unique prefix; a web session's id is the prefix `auth list` shows).
+    /// Deleting a passkey also revokes the web sessions and grants it opened.
+    /// A lost device: `--user <name> --all` deletes every passkey and revokes
+    /// every session and grant of that user.
     /// Revocation is always per grant (one sign-in on one device): every
     /// Taisce app sign-in shares the client `taisce-app`, so never revoke "by
     /// client" — that would sign out every person's every device.
-    Revoke { id: String },
+    Revoke {
+        /// grant, web session or passkey id (or unique prefix)
+        id: Option<String>,
+        /// with --all: the user whose every sign-in to revoke
+        #[arg(long, requires = "all")]
+        user: Option<String>,
+        /// every passkey, web session and grant of --user
+        #[arg(long, requires = "user", conflicts_with = "id")]
+        all: bool,
+    },
     /// Personal access tokens: static bearers for /mcp only.
     Token {
         #[command(subcommand)]
@@ -660,9 +672,14 @@ fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, h
             let t = auth::revoke_api_token(store, &key, now)?;
             println!("revoked token {} {}", t.name, t.id);
         }
-        AuthCmd::Revoke { id } => {
-            println!("{}", auth::cli_revoke(store, &id, now)?);
-        }
+        AuthCmd::Revoke { id, user, all } => match (id, user) {
+            (None, Some(key)) if all => {
+                let u = one_user(store, &key)?;
+                println!("{}", auth::cli_revoke_user_all(store, &u, now)?);
+            }
+            (Some(id), None) => println!("{}", auth::cli_revoke(store, &id, now)?),
+            _ => anyhow::bail!("give an id, or --user <name> --all"),
+        },
     }
     Ok(())
 }

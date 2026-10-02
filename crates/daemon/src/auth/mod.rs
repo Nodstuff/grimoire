@@ -527,11 +527,73 @@ pub fn cli_revoke(store: &mut SqliteStore, id: &str, now: i64) -> anyhow::Result
     if let Some(w) = web::revoke_session(store, id, now)? {
         return Ok(format!("revoked web session {w}"));
     }
-    if store.auth_delete_credential(id)? == 1 {
-        tracing::info!(target: AUDIT, event = "passkey.delete", credential = id);
-        return Ok(format!("deleted passkey {id}"));
+    if let Some(r) = store.auth_revoke_credential(id, now)? {
+        let c = &r.credential;
+        tracing::info!(target: AUDIT, event = "passkey.delete", credential = %c.id, user = %c.user_id, sessions = r.sessions, grants = r.grants);
+        store.audit(
+            "passkey.delete",
+            &c.id.to_string(),
+            serde_json::json!({"user": c.user_id, "label": c.label, "sessions_revoked": r.sessions, "grants_revoked": r.grants}),
+        )?;
+        let mut out = vec![format!(
+            "deleted passkey {} ({}); revoked the {} web session(s) and {} grant(s) it opened",
+            c.id, c.label, r.sessions, r.grants
+        )];
+        out.extend(remaining_sign_ins(store, c.user_id, now)?);
+        return Ok(out.join("\n"));
     }
     anyhow::bail!("no live grant, web session or passkey matches {id:?} (ambiguous prefix?)")
+}
+
+/// `taisce auth revoke --user <name> --all`: a lost device. Every passkey,
+/// web session and OAuth grant of that user (personal access tokens are
+/// separate: `taisce auth token revoke`).
+pub fn cli_revoke_user_all(store: &mut SqliteStore, user: &taisce_store::auth::AuthUser, now: i64) -> anyhow::Result<String> {
+    let r = store.auth_revoke_user_all(user.id, now)?;
+    tracing::info!(target: AUDIT, event = "user.revoke_all", user = %user.id, passkeys = r.passkeys, sessions = r.sessions, grants = r.grants);
+    store.audit(
+        "user.revoke_all",
+        &user.id.to_string(),
+        serde_json::json!({"passkeys": r.passkeys, "sessions": r.sessions, "grants": r.grants}),
+    )?;
+    let mut out = vec![format!(
+        "{}: deleted {} passkey(s), revoked {} web session(s) and {} grant(s)",
+        user.name, r.passkeys, r.sessions, r.grants
+    )];
+    out.extend(remaining_sign_ins(store, user.id, now)?);
+    let pats = store.auth_api_tokens()?.into_iter().filter(|t| t.user_id == user.id && t.revoked_at.is_none()).count();
+    if pats > 0 {
+        out.push(format!("  {pats} personal access token(s) still live: `taisce auth token revoke <name>` if they were on that device"));
+    }
+    out.push(format!("  next: `taisce auth enroll --user {:?}` for a new passkey", user.name));
+    Ok(out.join("\n"))
+}
+
+/// After a passkey delete: what still signs this person in (the sign-ins
+/// of their other passkeys, and grants from before passkeys were recorded).
+pub fn remaining_sign_ins(store: &SqliteStore, user: uuid::Uuid, now: i64) -> anyhow::Result<Vec<String>> {
+    let at = |t: i64| {
+        chrono::DateTime::from_timestamp(t, 0)
+            .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_default()
+    };
+    let sessions = store.auth_live_web_sessions(user, now)?;
+    let grants = store.oauth_live_grants_of(user)?;
+    if sessions.is_empty() && grants.is_empty() {
+        return Ok(vec!["  no live sessions or grants remain for this user".into()]);
+    }
+    let mut out = vec!["  still live for this user:".to_string()];
+    for w in sessions {
+        let id = w.id.to_string();
+        let device = if w.user_agent.is_empty() { "unknown device" } else { w.user_agent.as_str() };
+        out.push(format!("    web session {}  {}  last used {}", &id[..18], device, at(w.last_used_at)));
+    }
+    for g in grants {
+        let name = store.oauth_client(&g.client_id)?.map(|c| c.client_name).unwrap_or_default();
+        let via = if g.credential_id.is_some() { "" } else { "  (passkey not recorded)" };
+        out.push(format!("    grant {}  {}  since {}{via}", g.id, name, at(g.created_at)));
+    }
+    Ok(out)
 }
 
 /// `taisce auth token list`: one line per token, revoked ones included.

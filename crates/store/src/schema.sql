@@ -370,7 +370,9 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
     expires_at     INTEGER NOT NULL,
     used_at        INTEGER,
     -- the grant this code was exchanged for: a replayed code revokes it
-    grant_id       TEXT
+    grant_id       TEXT,
+    -- the passkey (auth_credentials.id) that signed this sign-in in
+    credential_id  TEXT
 );
 
 -- A grant is one authorization (one client, one user): the family every
@@ -383,7 +385,10 @@ CREATE TABLE IF NOT EXISTS oauth_grants (
     scope      TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     revoked_at INTEGER,
-    revoke_why TEXT
+    revoke_why TEXT,
+    -- the passkey (auth_credentials.id) that signed this grant in: deleting
+    -- the passkey revokes the grant. NULL for grants from before the column.
+    credential_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
@@ -441,7 +446,10 @@ CREATE TABLE IF NOT EXISTS auth_web_sessions (
     expires_at   INTEGER NOT NULL,
     -- a coarse device summary ("Mac · Safari"), never the raw User-Agent
     user_agent   TEXT NOT NULL DEFAULT '',
-    revoked_at   INTEGER
+    revoked_at   INTEGER,
+    -- the passkey (auth_credentials.id) that opened it: deleting the passkey
+    -- revokes the session
+    credential_id TEXT
 );
 CREATE INDEX IF NOT EXISTS auth_web_sessions_user ON auth_web_sessions (user_id);
 

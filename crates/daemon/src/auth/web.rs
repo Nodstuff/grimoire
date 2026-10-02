@@ -21,7 +21,7 @@
 //! custom header no cross-site form can send and no cross-site fetch can
 //! send without a preflight we never answer). Anything else is 403.
 
-use super::passkey::{all_passkeys, json_body, json_err, limited, verify_assertion};
+use super::passkey::{WebCeremony, json_body, json_err, limited, start_discoverable, verify_assertion};
 use super::{AUDIT, AuthConfig, AuthState, Authenticated, hash_secret, now, random_token};
 use crate::store_ext::with_store;
 use axum::Json;
@@ -43,9 +43,7 @@ pub const COOKIE: &str = "__Host-taisce_session";
 pub const CSRF_HEADER: &str = "taisce-csrf";
 /// The client id web sessions show in `Authenticated` and audit lines.
 pub const WEB_CLIENT: &str = "taisce-web";
-/// A sign-in ceremony (the passkey prompt) is good for five minutes.
-pub const CEREMONY_TTL: i64 = 300;
-const MAX_CEREMONIES: usize = 1000;
+pub use super::passkey::CEREMONY_TTL;
 
 pub fn router(st: AuthState) -> axum::Router {
     axum::Router::new()
@@ -168,25 +166,16 @@ async fn begin(State(st): State<AuthState>, req: Request) -> Response {
     if !origin_is_ours(&st.cfg, req.headers()) {
         return json_err(StatusCode::FORBIDDEN, "cross-origin request");
     }
-    let keys = all_passkeys(&st).await;
-    if keys.is_empty() {
-        return json_err(StatusCode::SERVICE_UNAVAILABLE, "no passkey enrolled");
-    }
-    let (options, ceremony) = match st.webauthn.start_passkey_authentication(&keys) {
+    let ip = super::client_ip(&st.cfg, req.headers(), req.extensions());
+    // a discoverable challenge: no allowCredentials, nothing about who is enrolled
+    let (options, ceremony) = match start_discoverable(&st).await {
         Ok(x) => x,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("webauthn: {e}")),
+        Err(r) => return r,
     };
-    let id = random_token();
-    {
-        let mut p = st.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        p.sweep(now());
-        if p.web.len() >= MAX_CEREMONIES
-            && let Some(oldest) = p.web.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone())
-        {
-            p.web.remove(&oldest);
-        }
-        p.web.insert(id.clone(), (now(), ceremony));
-    }
+    let added = st.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).add_web(WebCeremony { ip, at: now(), ceremony });
+    let Some(id) = added else {
+        return json_err(StatusCode::SERVICE_UNAVAILABLE, "too many sign-ins in progress; try again in a few minutes");
+    };
     no_store(Json(json!({"ceremony": id, "options": options})).into_response())
 }
 
@@ -211,17 +200,17 @@ async fn finish(State(st): State<AuthState>, req: Request) -> Response {
     };
     // single-shot: taken out whether it verifies or not
     let ceremony = st.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).web.remove(&body.ceremony);
-    let Some((_, ceremony)) = ceremony.filter(|(at, _)| now() - *at < CEREMONY_TTL) else {
+    let Some(c) = ceremony.filter(|c| now() - c.at < CEREMONY_TTL) else {
         return json_err(StatusCode::GONE, "this sign-in expired; press the button again");
     };
-    let user = match verify_assertion(&st, &body.credential, &ceremony, WEB_CLIENT).await {
+    let (user, credential) = match verify_assertion(&st, &body.credential, c.ceremony, WEB_CLIENT).await {
         Ok(u) => u,
         Err(r) => return r,
     };
     let token = random_token();
     let (hash, ua2) = (hash_secret(&token), ua.clone());
     let made = with_store(&st.store, Scope::System, move |s| {
-        let w = s.auth_create_web_session(user, &hash, &ua2, now()).map_err(|e| e.to_string())?;
+        let w = s.auth_create_web_session(user, Some(credential), &hash, &ua2, now()).map_err(|e| e.to_string())?;
         let name = s.auth_user(user).ok().flatten().map(|u| u.name).unwrap_or_default();
         let _ = s.audit("web.signin", &w.id.to_string(), json!({"user": user, "device": ua2}));
         Ok::<_, String>((w, name))

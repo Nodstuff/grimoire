@@ -505,9 +505,12 @@ async fn authorize(State(st): State<AuthState>, headers: HeaderMap, Query(q): Qu
         resource: q.resource.clone(),
         scope: SCOPE.into(),
         created: now(),
+        ip: ip.clone(),
         ceremony: None,
     };
-    let id = st.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).add_authz(pending);
+    let Some(id) = st.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).add_authz(pending) else {
+        return super::passkey::error_page(StatusCode::SERVICE_UNAVAILABLE, "Too many sign-ins in progress. Try again in a few minutes.");
+    };
     let cid = client.client_id.clone();
     let first_party = with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_is_first_party(&cid).unwrap_or(false)).await;
     super::passkey::login_page(
@@ -523,7 +526,12 @@ async fn authorize(State(st): State<AuthState>, headers: HeaderMap, Query(q): Qu
 }
 
 /// After the passkey: mint the single-use code and the redirect carrying it.
-pub async fn issue_code(st: &AuthState, req: &super::passkey::AuthzRequest, user_id: uuid::Uuid) -> Result<String, String> {
+pub async fn issue_code(
+    st: &AuthState,
+    req: &super::passkey::AuthzRequest,
+    user_id: uuid::Uuid,
+    credential: uuid::Uuid,
+) -> Result<String, String> {
     let code = random_token();
     let row = AuthCode {
         code_hash: hash_secret(&code),
@@ -534,6 +542,7 @@ pub async fn issue_code(st: &AuthState, req: &super::passkey::AuthzRequest, user
         resource: req.resource.clone(),
         scope: req.scope.clone(),
         expires_at: now() + super::CODE_TTL,
+        credential_id: Some(credential),
     };
     with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_insert_code(&row)).await.map_err(|e| e.to_string())?;
     tracing::info!(target: AUDIT, event = "code.issue", client = req.client_id, user = %user_id);
@@ -653,6 +662,8 @@ async fn code_grant(
         created_at: now,
         revoked_at: None,
         revoke_why: None,
+        // deleting the passkey that signed this in revokes the grant
+        credential_id: c.credential_id,
     };
     let (access, refresh) = (random_token(), random_token());
     let (ah, rh, g) = (hash_secret(&access), hash_secret(&refresh), grant.clone());
