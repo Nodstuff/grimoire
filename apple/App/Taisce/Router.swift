@@ -82,6 +82,18 @@ final class Router {
         padPath = []
     }
 
+    /// What the sidebar highlights: the screen in front, not the item the
+    /// stack started from. With a doc pushed over Today, Today is no longer
+    /// selected, so clicking it is a change and pops back (the List drops
+    /// a click on the row that is already selected).
+    var sidebarSelection: PadItem? {
+        switch padPath.last {
+        case .doc(let id)?: .doc(id)
+        case .todos?: .todos
+        case nil: padItem
+        }
+    }
+
     func newDoc(in parent: DocID? = nil) {
         newDocParent = parent
         showNewDoc = true

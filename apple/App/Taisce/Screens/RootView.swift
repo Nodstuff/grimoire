@@ -135,7 +135,7 @@ struct PadSidebar: View {
 
     var body: some View {
         @Bindable var router = router
-        let selection = Binding<PadItem?>(get: { router.padItem }, set: { if let item = $0 { router.select(item) } })
+        let selection = Binding<PadItem?>(get: { router.sidebarSelection }, set: { if let item = $0 { router.select(item) } })
         List(selection: selection) {
             if model.hasWorkspaces {
                 SidebarWorkspaceRow()

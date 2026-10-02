@@ -28,6 +28,19 @@ private let picker = WorkspacePicker(workspaces: [work, home], unsortedCount: 2,
         #expect(off.shortcut(1) == nil)
     }
 
+    @Test func todayIsClickableAgainAfterOpeningADocFromIt() {
+        let r = Router()
+        r.isPad = true
+        #expect(r.sidebarSelection == .today)
+        r.open(.doc("d1"))
+        // the sidebar follows the doc in front, so a click on Today is a change
+        #expect(r.sidebarSelection == .doc("d1"))
+        r.select(.today)
+        #expect(r.sidebarSelection == .today && r.padPath.isEmpty)
+        r.open(.todos)
+        #expect(r.sidebarSelection == .todos)
+    }
+
     @Test func nothingRunsBeforeSignIn() {
         let r = Router()
         for c in [AppCommand.newDoc, .search, .refresh, .settings, .today, .todos, .workspace(1)] {
