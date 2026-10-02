@@ -120,10 +120,21 @@ gained (the client fetches them).
   `doc_op op=workspace`) resolve **only among the caller's visible workspaces**: an id wins;
   else the caller's own workspace of that name; else a single shared one; else an error
   listing the candidates as `Name · Owner (id …)`. `create_missing` creates under the caller.
-- Sharing is never an MCP surface. An agent writing into a **shared** workspace always lands
-  at least yellow (`gate`: the review cap applies to agent principals in shared spaces, and
-  the `auto` policy cannot clean it); an agent move/label that changes a doc's space into
-  or out of a shared workspace parks red.
+- Sharing is never an MCP surface (the guard test also fails on any tool named like a
+  sharing surface). An agent writing into a **shared** workspace always lands at least
+  yellow: `propose`/`apply`/`add_comment`/`create_doc` content get the review cap
+  (`tenancy::agent_into_shared`; the `auto` policy cannot clean it), an agent's link rewrite
+  (from a rename) inside a shared doc is applied and flagged, an agent move into or out of a
+  shared workspace parks red, an agent may not label a doc into or out of one, and an agent
+  may not resolve proposals there (its members do).
+- The principals list a user gets is their own human principal, the people they share a
+  workspace with, and the agents that wrote in (or created) a doc they can see — an agent's
+  `claude:<label>` can say what someone is working on. Identity resolution by name
+  (`as`, `scribe`) stays unscoped so a filtered list never mints a duplicate principal.
+- Per-user singletons: Inbox, the Unsorted To-do, Answers and Claude Memory are each
+  person's own root (`own_root_titled`); `/api/todo/due` alerts only on the viewer's own
+  lists (their Unsorted and the workspaces they own). Settings written in a user scope are
+  that user's (`user.<id>.<key>`); the instance owner still reads the pre-0004 keys.
 
 ### 6. Human-only sharing surfaces
 
@@ -151,6 +162,11 @@ Additive and idempotent, one transaction for the data part:
    (`migration_v8_on_a_realistic_db` measures it).
 
 ### 8. What the Apple app must change (follow-up; not in this change)
+
+- Errors are real statuses now: a route that used to answer `200 {"error":"not found: …"}`
+  answers `404` with the same body (the `/api` status layer, `viewer::error_status`), and a
+  viewer's write answers `403 {"error":"forbidden: read-only: …"}`. Treat a 404 on a queued
+  write as "gone or no longer shared with you" (drop it, do not retry), a 403 as read-only.
 
 - Workspace switcher: show `display_name` (falls back to `name`), badge `shared`, and hide
   write affordances when `role == "viewer"`.
@@ -193,3 +209,16 @@ additive, and a single-user server answers exactly as before.
    somewhere (a number, never a doc id or title). Acceptable for a family server.
 6. Deleting a user is not provided (revoke their passkeys/tokens instead); their docs would
    need a reassignment policy first.
+7. An agent creating a doc under a shared parent: the doc (its title) is visible to the
+   members at once; its content lands flagged. Creation has no op to gate, so the title is
+   not reviewable. Creating a ROOT doc labelled into a shared workspace is refused for
+   agents (it would be a share).
+8. Gardeners: a gardener whose scope doc is in a shared workspace runs `Within` that
+   workspace; one tending a private subtree that contains a shared labelled descendant runs
+   in its owner's full scope, so it can read the private part — its writes into the shared
+   descendant are flagged by the share gate, but a human should read them before accepting.
+9. Deleting a subtree that holds docs the caller cannot write (a descendant labelled into a
+   workspace they only view, or cannot see) is refused with a generic message: it reveals
+   that such descendants exist, never which.
+10. A visible doc whose parent the viewer cannot see is a root for them (`parent_id` is
+    masked to null in lists, reads and change summaries).
