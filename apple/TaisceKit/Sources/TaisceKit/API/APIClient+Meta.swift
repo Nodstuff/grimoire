@@ -110,9 +110,12 @@ public struct Profile: Decodable, Sendable, Hashable {
 }
 
 extension APIClient {
-    /// Who the token belongs to. Read-only.
+    /// Who the token belongs to. Read-only. Bounded (10 s): sync waits on
+    /// it at launch, and a resume without an answer just keeps its cache.
     public func profile() async throws -> Profile {
-        try await get("/api/profile")
+        var r = try await request("/api/profile")
+        r.timeoutInterval = 10
+        return try await send(r)
     }
 
     /// The doc's op ledger, newest first (the server caps it at 100).
