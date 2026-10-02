@@ -81,14 +81,18 @@ account may be flipped to the work account by other sessions — push with
   reconnect to see tools or parameters added by a daemon you just deployed.
 
 ## MCP from Claude Code: one PAT via headersHelper
-- Every Claude Code account can share one personal access token instead of an OAuth sign-in each.
-  Mint it on the box over SSM: `taisce --db <server db> auth token create --name claude-code`
-  (prints `tsk_…` once; `auth token list` / `auth token revoke <name|id>`). It opens `/mcp` only.
-- Store it in a 0600 file (`~/.config/taisce/token`) and register the server with a
-  `headersHelper` so the secret never sits in the MCP config:
-  `"taisce": {"type": "http", "url": "https://taisce.null.ie/mcp", "headersHelper":
-  "printf '{\"Authorization\":\"Bearer %s\"}' \"$(cat ~/.config/taisce/token)\""}`.
-- Writes default to `claude:<token name>`; `as: "claude:<project>-<task>"` still labels each call.
+- Every Claude account (the default one and each workbox account under `~/.claude-accounts/`) uses
+  ONE personal access token, named `claude-code`, instead of an OAuth sign-in per account. Each account's
+  `.claude.json` has `"taisce": {"type": "http", "url": "https://taisce.null.ie/mcp",
+  "headersHelper": "/Users/tmeaney/.claude/taisce-mcp-headers.sh"}` (workbox seeds new accounts
+  from `~/.claude.json`). The helper reads the Keychain item `taisce-mcp-token`; the token is
+  never in a file.
+- Minted on the laptop, registered by hash so the secret never reaches the box or SSM history:
+  `taisce auth token create --name claude-code --hash <sha256 of tsk_…>` (run as `taisce` on the
+  box). Rotate: mint a new one into the Keychain with `security add-generic-password -U`, register
+  it, then `taisce auth token revoke <old id>`. `auth token list` shows last use.
+- PATs open `/mcp` only (401 on `/api`, the web UI and the phone keep OAuth/passkeys). Writes
+  default to `claude:claude-code`; `as: "claude:<project>-<task>"` still labels each call.
 
 ## Traps
 - `window.alert`/`confirm` are silent no-ops in Tauri's WKWebView — use inline UI.
