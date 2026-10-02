@@ -1,6 +1,36 @@
 import SwiftUI
 import TaisceKit
 
+/// The Mac's data move didn't finish: nothing opens until a launch from
+/// Finder (which may read the old container) completes it.
+struct MigrationBlockedView: View {
+    let reason: String
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "shippingbox")
+                .font(.system(size: 40))
+                .foregroundStyle(Theme.accent)
+            Text("Moving your data")
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(Theme.text)
+            Text(reason)
+                .font(.body)
+                .foregroundStyle(Theme.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 420)
+            Button("Quit Taisce") { exit(0) }
+                .buttonStyle(.borderedProminent)
+                .tint(Theme.accent)
+                .accessibilityIdentifier("migration.quit")
+        }
+        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .groundBackground()
+        .accessibilityIdentifier("migration.blocked")
+    }
+}
+
 /// Sign-in, or the phone tabs / pad split view by size class.
 struct RootView: View {
     @Environment(AppModel.self) private var model
@@ -11,7 +41,9 @@ struct RootView: View {
     var body: some View {
         @Bindable var router = router
         Group {
-            if model.isCheckingAuth {
+            if let reason = model.migrationBlocked {
+                MigrationBlockedView(reason: reason)
+            } else if model.isCheckingAuth {
                 LaunchView()
             } else if model.needsSignIn {
                 SignInScreen()

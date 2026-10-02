@@ -431,21 +431,136 @@ import Testing
         #expect(SandboxMigration.logLines(r).first?.contains("sandbox container migration") == true)
     }
 
-    @Test func neverOverwritesAnExistingCacheAndRetriesWithoutTheMarker() async throws {
+    func suite() throws -> (UserDefaults, String) {
+        let name = "taisce.tests.migration.\(UUID().uuidString)"
+        return (try #require(UserDefaults(suiteName: name)), name)
+    }
+
+    func run(_ container: URL, _ dest: URL, _ d: UserDefaults, _ name: String, fm: FileManager = .default) -> SandboxMigration.Report {
+        SandboxMigration.run(containerData: container, supportDestination: dest, bundleID: "ie.null.taisce", defaults: d, domain: name, fileManager: fm)
+    }
+
+    static let cacheName = "cache-taisce.null.ie-0.sqlite"
+
+    /// B1: a launch that can't read the container, then the app opens an
+    /// (empty) cache at the destination, then a launch that can: the
+    /// container's cache and outbox still come over.
+    @Test func anEmptyCacheMadeBeforeMigratingIsReplaced() async throws {
         let container = try await fakeContainer(prefs: ["serverURL": "https://taisce.null.ie"])
-        let dest = try tempDir("support2")
-        let suite = "taisce.tests.migration.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let existing = dest.appendingPathComponent("cache-taisce.null.ie-0.sqlite")
-        try Data("mine".utf8).write(to: existing)
-        let r = SandboxMigration.run(containerData: container, supportDestination: dest, bundleID: "ie.null.taisce", defaults: defaults, domain: suite)
-        #expect(r.kept == ["Application Support/cache-taisce.null.ie-0.sqlite"])
-        #expect(r.copied.isEmpty)
-        #expect(try Data(contentsOf: existing) == Data("mine".utf8))
-        // the marker means a later run is a no-op even if the file goes away
-        try FileManager.default.removeItem(at: existing)
-        #expect(SandboxMigration.run(containerData: container, supportDestination: dest, bundleID: "ie.null.taisce", defaults: defaults, domain: suite).alreadyDone)
+        let dest = try tempDir("b1")
+        let (d, name) = try suite()
+        defer { d.removePersistentDomain(forName: name) }
+        chmod(container.path, 0)
+        let r1 = run(container, dest, d, name)
+        chmod(container.path, 0o755)
+        #expect(r1.sourceUnreadable && !r1.complete)
+        #expect(SandboxMigration.blockingReason(r1) == "Quit and open Taisce from Finder to finish moving your data.")
+        // what the app did before the fix: open its cache anyway
+        try await { let c = try Cache(path: dest.appendingPathComponent(Self.cacheName).path); _ = try await c.lastSeq() }()
+        let r2 = run(container, dest, d, name)
+        #expect(r2.complete)
+        #expect(r2.replaced == ["Application Support/\(Self.cacheName)"])
+        #expect(r2.copied.contains("Application Support/\(Self.cacheName)"))
+        #expect(SandboxMigration.blockingReason(r2) == nil)
+        let cache = try Cache(path: dest.appendingPathComponent(Self.cacheName).path)
+        #expect(try await cache.pendingOutbox().count == 2)
+        // the empty one is set aside, not deleted
+        let aside = try FileManager.default.contentsOfDirectory(atPath: dest.path).filter { $0.hasPrefix(".replaced-") }
+        #expect(aside.count == 1)
+    }
+
+    final class FailingMoves: FileManager, @unchecked Sendable {
+        /// a move onto a file with this suffix throws
+        let suffix: String
+        init(failing suffix: String) {
+            self.suffix = suffix
+            super.init()
+        }
+
+        override func moveItem(at srcURL: URL, to dstURL: URL) throws {
+            if dstURL.lastPathComponent.hasSuffix(suffix) { throw CocoaError(.fileWriteUnknown) }
+            try super.moveItem(at: srcURL, to: dstURL)
+        }
+    }
+
+    /// B1, partial copy: the WAL moved, the database failed: nothing is
+    /// left for the app to open beside a foreign WAL, the pass is
+    /// incomplete, and the next one copies it whole.
+    @Test func aPartialCopyLeavesNothingAndIsRetried() async throws {
+        let container = try await fakeContainer(prefs: [:])
+        let walInContainer = container.appendingPathComponent("Library/Application Support/\(Self.cacheName)-wal")
+        #expect(FileManager.default.fileExists(atPath: walInContainer.path), "the fixture keeps its writes in the WAL")
+        let dest = try tempDir("partial")
+        let (d, name) = try suite()
+        defer { d.removePersistentDomain(forName: name) }
+        // a stray SHM from some earlier failure
+        try Data("stale".utf8).write(to: dest.appendingPathComponent(Self.cacheName + "-shm"))
+        let r1 = run(container, dest, d, name, fm: FailingMoves(failing: ".sqlite"))
+        #expect(!r1.complete && r1.errors.count == 1)
+        #expect(SandboxMigration.blockingReason(r1) != nil)
+        let left = try FileManager.default.contentsOfDirectory(atPath: dest.path).filter { $0.hasPrefix("cache-") }
+        #expect(left.isEmpty, "\(left)")
+        #expect(d.string(forKey: SandboxMigration.doneKey) == nil)
+        let r2 = run(container, dest, d, name)
+        #expect(r2.complete && r2.copied.count == 3)
+        #expect(try await Cache(path: dest.appendingPathComponent(Self.cacheName).path).pendingOutbox().count == 2)
+    }
+
+    /// A destination cache with data (an owner) and a container cache with
+    /// unsent writes: both kept, an error, never marked done.
+    @Test func neverMarkedDoneWhileContainerWritesWereNotCopied() async throws {
+        let container = try await fakeContainer(prefs: [:])
+        let dest = try tempDir("conflict")
+        let (d, name) = try suite()
+        defer { d.removePersistentDomain(forName: name) }
+        try await { let c = try Cache(path: dest.appendingPathComponent(Self.cacheName).path); try await c.setOwner("p-someone") }()
+        let r = run(container, dest, d, name)
+        #expect(!r.complete && r.copied.isEmpty && r.replaced.isEmpty)
+        #expect(r.errors.first?.contains("2 unsent changes") == true)
+        #expect(d.string(forKey: SandboxMigration.doneKey) == nil)
+        #expect(try await Cache(path: dest.appendingPathComponent(Self.cacheName).path).owner() == "p-someone")
+        // a file that isn't a cache at all counts as data too
+        let dest2 = try tempDir("conflict2")
+        try Data("mine".utf8).write(to: dest2.appendingPathComponent(Self.cacheName))
+        let r2 = run(container, dest2, d, name)
+        #expect(!r2.complete)
+        #expect(try Data(contentsOf: dest2.appendingPathComponent(Self.cacheName)) == Data("mine".utf8))
+    }
+
+    /// The same, but the container's cache has nothing unsent: keep the
+    /// destination's and finish.
+    @Test func aDestinationCacheIsKeptWhenTheContainerHasNothingUnsent() async throws {
+        let data = try tempDir("container0").appendingPathComponent("Data", isDirectory: true)
+        let support = data.appendingPathComponent("Library/Application Support", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        try await { let c = try Cache(path: support.appendingPathComponent(Self.cacheName).path); try await c.setLastSeq(9) }()
+        let dest = try tempDir("keep")
+        let (d, name) = try suite()
+        defer { d.removePersistentDomain(forName: name) }
+        try await { let c = try Cache(path: dest.appendingPathComponent(Self.cacheName).path); try await c.setOwner("p-tom") }()
+        let r = run(data, dest, d, name)
+        #expect(r.complete && r.kept == ["Application Support/\(Self.cacheName)"])
+        #expect(try await Cache(path: dest.appendingPathComponent(Self.cacheName).path).owner() == "p-tom")
+    }
+
+    /// A pass that copied the cache but couldn't read the preferences: the
+    /// next pass knows the cache is its own (it holds the outbox now) and
+    /// finishes.
+    @Test func aCacheThisMigrationCopiedIsItsOwnOnTheNextPass() async throws {
+        let container = try await fakeContainer(prefs: ["serverURL": "https://taisce.null.ie"])
+        let plist = container.appendingPathComponent("Library/Preferences/ie.null.taisce.plist")
+        let dest = try tempDir("ours")
+        let (d, name) = try suite()
+        defer { d.removePersistentDomain(forName: name) }
+        chmod(plist.path, 0)
+        let r1 = run(container, dest, d, name)
+        chmod(plist.path, 0o644)
+        #expect(!r1.complete && r1.copied.contains("Application Support/\(Self.cacheName)"))
+        #expect((d.array(forKey: SandboxMigration.createdKey) as? [String]) == [Self.cacheName])
+        let r2 = run(container, dest, d, name)
+        #expect(r2.complete && r2.kept == ["Application Support/\(Self.cacheName)"] && r2.errors.isEmpty)
+        #expect(r2.importedKeys == ["serverURL"])
+        #expect(try await Cache(path: dest.appendingPathComponent(Self.cacheName).path).pendingOutbox().count == 2)
     }
 
     @Test func noContainerIsDoneAndAnUnreadableOneIsRetried() throws {

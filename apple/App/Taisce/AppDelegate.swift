@@ -11,8 +11,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     override init() {
         // the Mac's first unsandboxed launch: the old container's cache and
         // preferences come over before the model reads either
-        AppPaths.migrateSandboxContainer()
-        model = AppModel()
+        let report = AppPaths.migrateSandboxContainer()
+        model = AppModel(migrationBlocked: SandboxMigration.blockingReason(report))
         super.init()
     }
     /// why iOS gave no token (no network, no entitlement in a dev build)

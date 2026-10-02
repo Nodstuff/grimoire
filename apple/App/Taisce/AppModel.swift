@@ -113,9 +113,16 @@ final class AppModel {
     /// runnable code blocks (Mac): this session's runs, try lines, practice text
     let codeRuns = CodeRunStore()
 
+    /// The Mac's move out of the sandbox didn't finish this launch (the
+    /// container couldn't be read, or a copy failed): the app opens no
+    /// cache at all, so it can't create one the next pass would mistake for
+    /// data, and shows why instead (`MigrationBlockedView`).
+    let migrationBlocked: String?
+
     /// `dueAlerts`: tests pass one over a fake notification center.
-    init(dueAlerts: NotificationCoordinator = NotificationCoordinator()) {
+    init(dueAlerts: NotificationCoordinator = NotificationCoordinator(), migrationBlocked: String? = nil) {
         self.dueAlerts = dueAlerts
+        self.migrationBlocked = migrationBlocked
         let stored = UserDefaults.standard.string(forKey: Self.serverURLKey).flatMap { ServerConfig.normalizedURL($0)?.absoluteString }
         serverURL = stored.flatMap { ServerURLPolicy.accepts($0) ? $0 : nil } ?? Self.defaultServerURL
         codeRuns.app = self
@@ -374,6 +381,8 @@ final class AppModel {
 
     /// One cache file per server, so switching servers never mixes docs.
     private func connect(withAuth: Bool = true) async {
+        // never a cache while the migration is unfinished (see migrationBlocked)
+        guard migrationBlocked == nil else { return }
         observeTask?.cancel()
         authTask?.cancel()
         updatesTask?.cancel()
