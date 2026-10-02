@@ -58,6 +58,18 @@ enum AppPaths {
         return (isSandboxed ? base : base.appending(path: bundleID, directoryHint: .isDirectory)).appending(path: "diagrams", directoryHint: .isDirectory)
     }
 
+    /// One side of a "both have data" conflict, chosen on the blocked screen;
+    /// logged to `migration.log`.
+    static func resolveMigrationConflict(_ c: SandboxMigration.Conflict, keepHere: Bool) {
+        guard let dest = try? supportDirectory() else { return }
+        let log = dest.appending(path: "migration.log")
+        if keepHere {
+            SandboxMigration.appendLog(SandboxMigration.keepDestination(c, defaults: .standard, domain: bundleID), to: log)
+        } else if let lines = try? SandboxMigration.useContainerCopy(c, supportDestination: dest) {
+            SandboxMigration.appendLog(lines, to: log)
+        }
+    }
+
     /// First unsandboxed Mac launch: bring the sandboxed build's cache
     /// (with its outbox) and preferences over from the container. Runs
     /// before the model reads a single preference; idempotent; never in a

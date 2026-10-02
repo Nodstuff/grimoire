@@ -117,12 +117,15 @@ final class AppModel {
     /// container couldn't be read, or a copy failed): the app opens no
     /// cache at all, so it can't create one the next pass would mistake for
     /// data, and shows why instead (`MigrationBlockedView`).
-    let migrationBlocked: String?
+    private(set) var migrationBlocked: String?
+    /// caches both here and in the old container, for a person to decide
+    private(set) var migrationConflicts: [SandboxMigration.Conflict] = []
 
     /// `dueAlerts`: tests pass one over a fake notification center.
-    init(dueAlerts: NotificationCoordinator = NotificationCoordinator(), migrationBlocked: String? = nil) {
+    init(dueAlerts: NotificationCoordinator = NotificationCoordinator(), migration: SandboxMigration.Report? = nil) {
         self.dueAlerts = dueAlerts
-        self.migrationBlocked = migrationBlocked
+        self.migrationBlocked = SandboxMigration.blockingReason(migration)
+        self.migrationConflicts = migration?.complete == false ? migration?.conflicts ?? [] : []
         let stored = UserDefaults.standard.string(forKey: Self.serverURLKey).flatMap { ServerConfig.normalizedURL($0)?.absoluteString }
         serverURL = stored.flatMap { ServerURLPolicy.accepts($0) ? $0 : nil } ?? Self.defaultServerURL
         codeRuns.app = self
@@ -158,6 +161,20 @@ final class AppModel {
         UserDefaults.standard.set(trimmed, forKey: Self.serverURLKey)
         await connect()
         await startSync()
+    }
+
+    /// The "both have data" way out: keep the copy here (the old one stays
+    /// untouched in the container) or use the old one (this one is set
+    /// aside). Then the migration runs again; once it finishes, the app
+    /// opens as usual.
+    func resolveMigration(keepHere: Bool) async {
+        for c in migrationConflicts {
+            AppPaths.resolveMigrationConflict(c, keepHere: keepHere)
+        }
+        let report = AppPaths.migrateSandboxContainer()
+        migrationBlocked = SandboxMigration.blockingReason(report)
+        migrationConflicts = report?.complete == false ? report?.conflicts ?? [] : []
+        if migrationBlocked == nil { await boot() }
     }
 
     func startSync() async {
@@ -585,6 +602,17 @@ final class AppModel {
     }
 
     var workspaceKey: String { UserSettings(server: serverURL).workspaceKey }
+
+    /// Runnable code blocks: is the doc's workspace yours alone? Unsorted
+    /// is (ADR 0004: your own Unsorted); a listed workspace is when it isn't
+    /// shared and you own it. nil = can't tell (a server without
+    /// workspaces, or one not in the list yet), which asks before running.
+    func workspaceIsPrivate(_ doc: DocID) -> Bool? {
+        guard workspacesSupported, let info = index.byID[doc] else { return nil }
+        guard let ws = info.workspaceID else { return true }
+        guard let w = workspaces.first(where: { $0.id == ws }) else { return nil }
+        return !w.shared && (w.role == nil || w.role == "owner")
+    }
 
     /// Who last edited the doc, from its ledger; cached until the doc changes.
     func loadEditMeta(_ id: DocID) async {

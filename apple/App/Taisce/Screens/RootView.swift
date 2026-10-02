@@ -5,6 +5,15 @@ import TaisceKit
 /// Finder (which may read the old container) completes it.
 struct MigrationBlockedView: View {
     let reason: String
+    var conflicts: [SandboxMigration.Conflict] = []
+    var resolve: (Bool) -> Void = { _ in }
+
+    var unsent: String {
+        let known = conflicts.compactMap(\.unsent)
+        guard known.count == conflicts.count else { return "an unknown number of unsent changes" }
+        let n = known.reduce(0, +)
+        return n == 1 ? "1 unsent change" : "\(n) unsent changes"
+    }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -19,6 +28,19 @@ struct MigrationBlockedView: View {
                 .foregroundStyle(Theme.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 420)
+            if !conflicts.isEmpty {
+                Text("This Mac already has a copy here, and the old one has \(unsent).")
+                    .font(.callout)
+                    .foregroundStyle(Theme.text)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 420)
+                Button("Use the copy already here (the old one stays untouched)") { resolve(true) }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("migration.keepHere")
+                Button("Use the old copy, with its unsent changes (this one is set aside)") { resolve(false) }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("migration.useOld")
+            }
             Button("Quit Taisce") { exit(0) }
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
@@ -42,7 +64,9 @@ struct RootView: View {
         @Bindable var router = router
         Group {
             if let reason = model.migrationBlocked {
-                MigrationBlockedView(reason: reason)
+                MigrationBlockedView(reason: reason, conflicts: model.migrationConflicts) { keepHere in
+                    Task { await model.resolveMigration(keepHere: keepHere) }
+                }
             } else if model.isCheckingAuth {
                 LaunchView()
             } else if model.needsSignIn {

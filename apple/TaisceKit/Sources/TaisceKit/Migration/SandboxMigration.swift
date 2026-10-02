@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import GRDB
 
@@ -32,6 +33,18 @@ public enum SandboxMigration {
     /// which existing files are its own
     public static let createdKey = "migration.sandboxContainer.created"
 
+    public struct Conflict: Sendable, Hashable {
+        /// the cache file, e.g. `cache-taisce.null.ie-0.sqlite`
+        public var name: String
+        /// unsent changes in the container's copy (nil: couldn't read it)
+        public var unsent: Int?
+
+        public init(name: String, unsent: Int?) {
+            self.name = name
+            self.unsent = unsent
+        }
+    }
+
     public struct Report: Sendable, Hashable {
         /// files copied, relative to Library
         public var copied: [String] = []
@@ -44,6 +57,10 @@ public enum SandboxMigration {
         /// keys the destination already had (its value kept)
         public var keptKeys: [String] = []
         public var errors: [String] = []
+        /// caches that are both here (with data) and in the container (with
+        /// unsent changes, or unreadable): a person decides
+        /// (`keepDestination` / `useContainerCopy`)
+        public var conflicts: [Conflict] = []
         public var alreadyDone = false
         public var noContainer = false
         public var sourceUnreadable = false
@@ -118,9 +135,17 @@ public enum SandboxMigration {
                     let incoming = inspect(staging.appendingPathComponent(main).path)
                     let target = supportDestination.appendingPathComponent(main)
                     if fileManager.fileExists(atPath: target.path) {
-                        if created.contains(main) {
-                            // ours, from an earlier pass that stopped later on
+                        // ours: recorded, or the very bytes staged (a crash
+                        // between moving it in and recording it; or a build
+                        // that predates the record)
+                        let identical = sameBytes(target, staging.appendingPathComponent(main))
+                        if created.contains(main) || identical {
                             report.kept.append(label)
+                            if !created.contains(main) {
+                                created.insert(main)
+                                dest[createdKey] = created.sorted()
+                                defaults.setPersistentDomain(dest, forName: domain)
+                            }
                             continue
                         }
                         if let e = inspect(target.path), e.owner == nil, e.outbox == 0 {
@@ -139,6 +164,7 @@ public enum SandboxMigration {
                         } else {
                             let n = incoming.map { "\($0.outbox)" } ?? "an unknown number of"
                             report.errors.append("\(label): one with data is already here and the old one has \(n) unsent changes; both kept, nothing copied")
+                            report.conflicts.append(Conflict(name: main, unsent: incoming?.outbox))
                             continue
                         }
                     }
@@ -188,6 +214,45 @@ public enum SandboxMigration {
         return report
     }
 
+    /// Same size and SHA-256.
+    static func sameBytes(_ a: URL, _ b: URL) -> Bool {
+        guard let sa = try? FileManager.default.attributesOfItem(atPath: a.path)[.size] as? Int,
+              let sb = try? FileManager.default.attributesOfItem(atPath: b.path)[.size] as? Int, sa == sb,
+              let da = try? Data(contentsOf: a, options: .mappedIfSafe),
+              let db = try? Data(contentsOf: b, options: .mappedIfSafe)
+        else { return false }
+        return SHA256.hash(data: da) == SHA256.hash(data: db)
+    }
+
+    /// A conflict, resolved by keeping the cache already here: the
+    /// container's copy (and its unsent changes) stays where it is,
+    /// untouched; the next pass counts this one as the migration's own.
+    /// Returns the log lines.
+    @discardableResult
+    public static func keepDestination(_ c: Conflict, defaults: UserDefaults, domain: String, now: Date = .now) -> [String] {
+        var dest = defaults.persistentDomain(forName: domain) ?? [:]
+        var created = Set(dest[createdKey] as? [String] ?? [])
+        created.insert(c.name)
+        dest[createdKey] = created.sorted()
+        defaults.setPersistentDomain(dest, forName: domain)
+        let n = c.unsent.map(String.init) ?? "an unknown number of"
+        return ["\(ISO8601DateFormatter().string(from: now)) kept the cache already here for \(c.name); the old one, with \(n) unsent changes, stays in the container untouched"]
+    }
+
+    /// A conflict, resolved by using the container's copy: the cache here
+    /// is set aside (never deleted) under `.replaced-<time>/`, so the next
+    /// pass copies the container's in. Returns the log lines.
+    @discardableResult
+    public static func useContainerCopy(_ c: Conflict, supportDestination: URL, fileManager: FileManager = .default, now: Date = .now) throws -> [String] {
+        let aside = supportDestination.appendingPathComponent(".replaced-\(Int(now.timeIntervalSince1970))", isDirectory: true)
+        try fileManager.createDirectory(at: aside, withIntermediateDirectories: true)
+        for name in [c.name, c.name + "-wal", c.name + "-shm"] {
+            let u = supportDestination.appendingPathComponent(name)
+            if fileManager.fileExists(atPath: u.path) { try fileManager.moveItem(at: u, to: aside.appendingPathComponent(name)) }
+        }
+        return ["\(ISO8601DateFormatter().string(from: now)) set aside the cache here for \(c.name) (in \(aside.lastPathComponent)) to use the old one"]
+    }
+
     /// Move a staged cache into place, the database last. If any move
     /// fails, the pieces already moved are removed again (they are copies):
     /// never a WAL or SHM beside the wrong database.
@@ -232,6 +297,9 @@ public enum SandboxMigration {
         guard let r, !r.complete else { return nil }
         if r.sourceUnreadable {
             return "Quit and open Taisce from Finder to finish moving your data."
+        }
+        if !r.conflicts.isEmpty {
+            return "Your data is in two places: here, and in the storage the sandboxed version used. Choose which copy to use."
         }
         return "Taisce couldn't finish moving your data from the sandboxed version (see migration.log in ~/Library/Application Support/ie.null.taisce). Nothing has been lost; quit and open it again from Finder."
     }

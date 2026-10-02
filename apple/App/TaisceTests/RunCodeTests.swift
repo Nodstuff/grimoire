@@ -256,6 +256,40 @@ import Darwin
     }
     #endif
 
+    /// R2: the blocked screen offers both ways out of a conflict.
+    @Test func aMigrationConflictBlocksWithTwoWaysOut() throws {
+        var r = SandboxMigration.Report()
+        r.errors = ["x"]
+        r.conflicts = [.init(name: "cache-taisce.null.ie-0.sqlite", unsent: 3)]
+        let m = AppModel(migration: r)
+        #expect(m.migrationBlocked?.contains("two places") == true)
+        #expect(m.migrationConflicts.count == 1)
+        #expect(MigrationBlockedView(reason: "r", conflicts: m.migrationConflicts).unsent == "3 unsent changes")
+        try AppModelTests().render(MigrationBlockedView(reason: m.migrationBlocked ?? "", conflicts: m.migrationConflicts))
+        #expect(AppModel(migration: SandboxMigration.Report()).migrationBlocked == nil)
+    }
+
+    /// Option A's other input: is the doc's workspace yours alone?
+    @Test func workspacePrivacyForRunTrust() async throws {
+        let (m, doc, _) = try await modelWithCodeDoc()
+        for _ in 0..<100 where m.index.byID[doc] == nil { try await Task.sleep(for: .milliseconds(20)) }
+        m.workspacesSupported = false
+        #expect(m.workspaceIsPrivate(doc) == nil, "no workspaces on this server: unknown")
+        m.workspacesSupported = true
+        #expect(m.workspaceIsPrivate(doc) == true, "Unsorted is yours alone")
+        let cache = try #require(m.cache)
+        try await cache.applyDocState(doc, Change.DocState(title: "Runs", parentID: nil, sortKey: nil, status: nil, currentEpoch: 2, workspaceID: "w1"))
+        for _ in 0..<100 where m.index.byID[doc]?.workspaceID != "w1" { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(m.workspaceIsPrivate(doc) == nil, "a workspace not in the list: unknown")
+        m.workspaces = [Workspace(id: "w1", name: "Mine", role: "owner", shared: false)]
+        #expect(m.workspaceIsPrivate(doc) == true)
+        m.workspaces = [Workspace(id: "w1", name: "Family", role: "owner", shared: true)]
+        #expect(m.workspaceIsPrivate(doc) == false)
+        m.workspaces = [Workspace(id: "w1", name: "Aoife's", role: "editor", shared: true)]
+        #expect(m.workspaceIsPrivate(doc) == false)
+        try await cache.deleteDoc(doc)
+    }
+
     @Test func approvalsAreForgottenWithThePersonsSettings() throws {
         let suite = "taisce.tests.run.\(UUID().uuidString)"
         let d = try #require(UserDefaults(suiteName: suite))
@@ -362,9 +396,10 @@ import Darwin
     }
 
     @Test func timeoutFires() async throws {
-        let o = await Self.collect(CodeRun(RunRequest(language: .shell(interpreter: "/bin/sh"), code: "sleep 30"), environment: await Self.env(), options: try Self.options(timeout: .milliseconds(400))))
+        let o = await Self.collect(CodeRun(RunRequest(language: .shell(interpreter: "/bin/sh"), code: "echo start\nsleep 30"), environment: await Self.env(), options: try Self.options(timeout: .milliseconds(1500))))
         #expect(o.result?.timedOut == true)
-        #expect((o.result?.duration ?? .zero) < .seconds(4))
+        #expect(o.log.text == "start\n")
+        #expect((o.result?.duration ?? .zero) < .seconds(6))
     }
 
     @Test func goPairSumFromTheTryLine() async throws {

@@ -418,7 +418,13 @@ it there (`migration.sandboxContainer.created`), set aside under
 `.replaced-<time>/` and replaced if it has no owner and no queued writes, kept
 if the container's copy has nothing unsent, and otherwise left with an error:
 the pass is never marked done while the container holds writes that weren't
-copied. While a pass is incomplete (unreadable container, a failed copy, that
+copied. A destination byte-identical (size and SHA-256) to the staged copy
+counts as the migration's own (a crash before it was recorded, an older
+build's copy). When both really have data, the blocked screen offers "Use the
+copy already here (the old one stays untouched)", which logs the old copy's
+unsent count, or "Use the old copy, with its unsent changes", which sets this
+one aside under `.replaced-<time>/`; either way the migration runs again and
+the app opens. While a pass is incomplete (unreadable container, a failed copy, that
 conflict) the app opens no cache at all and shows "Quit and open Taisce from
 Finder to finish moving your data" (`MigrationBlockedView`), so it can never
 create the empty cache a later pass would mistake for data. The container is
@@ -459,8 +465,11 @@ and duration, "compiled ✓" for a Go block that only compiles.
   /dev/null. Nothing is shared between runs. When the leader exits, the rest
   of its group is always sent SIGTERM (SIGKILL 2 s later) and the run
   reports done only once the group is gone, so a backgrounded child never
-  outlives it. A program that leaves its group (`setsid`, a double fork into
-  a new group) is out of reach, as for any process group.
+  outlives it: `nohup … &`, `caffeinate &`, `ssh -f` and the like end with
+  the block. To leave something running, hand it to something that
+  outlives the run: `launchctl` / `brew services`, or a terminal. A program
+  that leaves its group (`setsid`, a double fork into a new group) is out of
+  reach, as for any process group.
 - Environment: your login shell's (`$SHELL -l -c 'env -0'` from a minimal
   seed, once per launch, 5 s bound, else the app's own). cwd is the run's
   temp dir, or the fence's `cwd=` (```` ```bash cwd=~/code/portus ````; `~`
@@ -485,13 +494,26 @@ and duration, "compiled ✓" for a Go block that only compiles.
   through the outbox like an editor save (the review gate applies). Practice
   text and try lines last for the session.
 - Trust (`RunTrust`, pure): the doc's ledger (`/api/doc/{id}/history`
-  carries each op's principal, target block, epoch, `source_refs` and
-  content) says who last wrote the block's content (insert/replace). Ops that
-  carry your principal but someone else's words are not taken at face
-  value: a decline's revert (`review:decline:`) is unknown, a rename's link
-  rewrite (`rename:`) looks further back, and a write of yours repeating
-  content someone else wrote earlier (a whole-doc save re-inserting their
-  block) is theirs. Run shows "Checking who wrote this…" while the ledger
+  carries each op's principal, target block, epoch, `source_refs`, content,
+  and `principal_is_yours`, which the server works out for the caller) says
+  who last wrote the block's content (insert/replace). **You** are the
+  signed-in human, or one of your own agents (`principal_is_yours`, from ADR
+  0004 `owner_user`, never a name) in a workspace only you can see (not
+  shared; Unsorted counts as yours alone). So Claude writing code at your
+  request in your own workspace runs without a question; in a shared
+  workspace every agent asks, your own included, and other people and their
+  agents always ask. An older server (no `principal_is_yours`) or unknown
+  sharing asks. The caveat: a prompt-injected edit by your own agent in a
+  private workspace runs without a prompt; the block's history still shows
+  which agent wrote it. Provenance is read only on your own (the human's)
+  ops: a decline's revert (`review:decline:`) is unknown; a rename's link
+  rewrite (`rename:`) that changed nothing outside `[[…]]` looks to the
+  write before it (unknown if that isn't in the history), one that changed
+  more is an ordinary write of yours; the same tags on anyone else's op mean
+  nothing. The server refuses those prefixes (and its other reserved ones)
+  from callers. A write of yours repeating content someone else wrote
+  earlier (a whole-doc save re-inserting their block) is theirs; that look
+  back covers only the history the server returns (the newest 100 ops). Run shows "Checking who wrote this…" while the ledger
   and profile load (5 s at most; then, or on an error, it asks and says
   why). Yours (`/api/profile` principal id)
   runs; anyone else's (an agent, another person), or unknown (offline,

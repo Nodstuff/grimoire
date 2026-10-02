@@ -16,7 +16,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // runs a crash or force quit left behind
         if !AppPaths.isTestHost { CodeRun.sweepStaleRuns() }
         #endif
-        model = AppModel(migrationBlocked: SandboxMigration.blockingReason(report))
+        model = AppModel(migration: report)
         super.init()
     }
     /// why iOS gave no token (no network, no entitlement in a dev build)

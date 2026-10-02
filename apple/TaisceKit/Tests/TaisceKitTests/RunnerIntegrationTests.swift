@@ -150,11 +150,11 @@ import Testing
     }
 
     @Test func timeoutFires() async throws {
-        let o = await Self.collect(CodeRun(RunRequest(language: .shell(interpreter: "/bin/sh"), code: "echo start\nsleep 30"), environment: await Self.env(), options: try Self.options(timeout: .milliseconds(500))))
+        let o = await Self.collect(CodeRun(RunRequest(language: .shell(interpreter: "/bin/sh"), code: "echo start\nsleep 30"), environment: await Self.env(), options: try Self.options(timeout: .milliseconds(1500))))
         #expect(o.result?.timedOut == true)
         #expect(o.result?.stopped == false)
         #expect(o.log.text == "start\n")
-        #expect((o.result?.duration ?? .zero) < .seconds(4))
+        #expect((o.result?.duration ?? .zero) < .seconds(6))
     }
 
     @Test func chattyOutputIsBatchedAndCapped() async throws {

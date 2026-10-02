@@ -21,11 +21,14 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
     public var sourceRefs: [String]
     /// what an insert or replace wrote
     public var content: String?
+    /// the server's answer to "is this the caller, or one of the caller's
+    /// own agents?" (`principal_is_yours`); nil from an older server
+    public var principalIsYours: Bool?
 
     public init(
         opID: String, principalName: String, principalKind: String, applied: Bool = true,
         principalID: String? = nil, epoch: Int? = nil, targetBlock: BlockID? = nil, opType: String? = nil,
-        sourceRefs: [String] = [], content: String? = nil
+        sourceRefs: [String] = [], content: String? = nil, principalIsYours: Bool? = nil
     ) {
         self.opID = opID
         self.principalName = principalName
@@ -37,6 +40,7 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
         self.opType = opType
         self.sourceRefs = sourceRefs
         self.content = content
+        self.principalIsYours = principalIsYours
     }
 
     /// When the op was written, from its UUIDv7 id; nil for any other id.
@@ -69,6 +73,7 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
         case op
         case principalName = "principal_name"
         case principalKind = "principal_kind"
+        case principalIsYours = "principal_is_yours"
     }
 
     public init(from decoder: any Decoder) throws {
@@ -84,6 +89,7 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
         content = op.kind?.content
         principalName = try c.decodeIfPresent(String.self, forKey: .principalName) ?? ""
         principalKind = try c.decodeIfPresent(String.self, forKey: .principalKind) ?? ""
+        principalIsYours = try c.decodeIfPresent(Bool.self, forKey: .principalIsYours)
     }
 }
 

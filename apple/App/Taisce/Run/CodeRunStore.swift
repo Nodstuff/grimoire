@@ -220,7 +220,8 @@ final class CodeRunStore {
         } else {
             why = "not connected"
         }
-        let me = await currentMe()
+        var me = await currentMe()
+        me.privateWorkspace = app?.workspaceIsPrivate(c.doc)
         var decision = RunTrust.decide(
             block: c.block, history: history, me: me, practiceEditedByMe: practiceEdited,
             approval: approvals?.approval(for: c.doc), docEpoch: docEpoch

@@ -4,27 +4,48 @@ import Foundation
 ///
 /// Per block: the newest applied content op (insert or replace) on the
 /// block in the doc's ledger (`GET /api/doc/{id}/history`, which carries
-/// each op's principal, target and epoch) says who wrote the code. Yours →
-/// run. Anyone else (an agent such as `claude:…`, another person) → ask,
-/// unless this device already approved the doc and nobody but you has
-/// changed it since. Unknown (offline, history hidden from you, the block
-/// older than the newest 100 ops) → ask, and the answer is remembered the
-/// same way.
+/// each op's principal, target, epoch, provenance and, from the server,
+/// whether the principal is the caller's) says who wrote the code.
+///
+/// "You" is the signed-in human, or one of your own agents (the server's
+/// `principal_is_yours`, from ADR 0004 `owner_user`, never a name) in a
+/// workspace only you can see (Unsorted counts as yours alone). In a shared
+/// workspace every agent asks, your own included; other people and their
+/// agents always ask. Unknown ownership (an older server) or unknown
+/// sharing asks. Yours → run; anyone else → ask, unless this device already
+/// approved the doc and nobody but you has changed it since. Unknown
+/// (offline, history hidden from you, the block older than the newest 100
+/// ops) → ask, remembered the same way.
+///
+/// The caveat, by design: a prompt-injected edit by your own agent in a
+/// private workspace runs without a question (the block's history still
+/// says which agent wrote it).
 public enum RunTrust {
     public struct Me: Sendable, Hashable {
         public var principalID: String?
         public var name: String?
+        /// the doc's workspace has no member but you (nil = unknown)
+        public var privateWorkspace: Bool?
 
-        public init(principalID: String?, name: String?) {
+        public init(principalID: String?, name: String?, privateWorkspace: Bool? = nil) {
             self.principalID = principalID
             self.name = name
+            self.privateWorkspace = privateWorkspace
         }
 
-        func matches(_ e: DocHistoryEntry) -> Bool {
+        /// The signed-in human themself.
+        func isHuman(_ e: DocHistoryEntry) -> Bool {
             if let id = principalID, let theirs = e.principalID { return id == theirs }
             // an older server without principal ids: fall back to the name
-            if let name, !name.isEmpty, !e.principalName.isEmpty { return name == e.principalName }
+            // (an agent can't take a person's name)
+            if let name, !name.isEmpty, !e.principalName.isEmpty, e.principalKind != "agent" { return name == e.principalName }
             return false
+        }
+
+        /// You, or your own agent in a workspace only you can see.
+        func matches(_ e: DocHistoryEntry) -> Bool {
+            if isHuman(e) { return true }
+            return e.principalKind == "agent" && e.principalIsYours == true && privateWorkspace == true
         }
     }
 
@@ -55,36 +76,71 @@ public enum RunTrust {
 
     /// Who last wrote the block's content, from the ledger (newest first).
     ///
-    /// Some ops carry your principal but someone else's words, so they are
-    /// not taken at face value:
+    /// Some of YOUR OWN ops (the signed-in human's; the server writes these
+    /// tags only on its own paths and refuses them from callers) carry
+    /// someone else's words, so they are not taken at face value:
     /// - a decline's revert (`review:decline:…`) restores an older version
     ///   whose author the ledger doesn't name: unknown (it asks);
-    /// - a rename's link rewrite (`rename:…`) changed only a link: the op
-    ///   before it says who wrote the rest;
-    /// - a write of yours whose content an earlier op by someone else wrote
-    ///   word for word (a whole-doc save re-inserting an agent's block under
-    ///   a new id): theirs.
+    /// - a rename's link rewrite (`rename:…`) that changed nothing outside
+    ///   `[[…]]` links: the write before it says who wrote the rest (unknown
+    ///   if that write isn't in the history). One that changed anything else
+    ///   is an ordinary write of yours.
+    /// The same tags on anyone else's op mean nothing: it is their write.
+    /// And a write of yours whose content an earlier op by someone else
+    /// wrote word for word (a whole-doc save re-inserting an agent's block
+    /// under a new id) is theirs; this looks back only as far as the history
+    /// goes (the newest 100 ops).
     public static func author(of block: BlockID, history: [DocHistoryEntry]?, me: Me) -> Author {
         guard let history else { return .unknown }
         let writes = history.indices.filter { i in
             let e = history[i]
             return e.applied && e.targetBlock == block && (e.opType == "insert" || e.opType == "replace")
         }
-        for i in writes {
+        for (pos, i) in writes.enumerated() {
             let row = history[i]
-            if row.sourceRefs.contains(where: { $0.hasPrefix("review:decline:") }) { return .unknown }
-            if row.sourceRefs.contains(where: { $0.hasPrefix("rename:") }) { continue }
-            guard me.matches(row) else { return .other(name(row)) }
+            if me.isHuman(row) {
+                if row.sourceRefs.contains(where: { $0.hasPrefix("review:decline:") }) { return .unknown }
+                if row.sourceRefs.contains(where: { $0.hasPrefix("rename:") }) {
+                    guard pos + 1 < writes.count else { return .unknown }
+                    let prev = history[writes[pos + 1]]
+                    if let c = row.content, let p = prev.content, onlyLinksDiffer(c, p) { continue }
+                }
+            }
+            guard me.matches(row) else { return .other(name(row, me: me)) }
             if let content = row.content,
                let earlier = history[(i + 1)...].first(where: { $0.applied && $0.content == content && !me.matches($0) }) {
-                return .other(name(earlier))
+                return .other(name(earlier, me: me))
             }
             return .me
         }
         return .unknown
     }
 
-    static func name(_ e: DocHistoryEntry) -> String { e.principalName.isEmpty ? "someone else" : e.principalName }
+    /// `a` and `b` are the same text apart from what's inside `[[…]]`.
+    static func onlyLinksDiffer(_ a: String, _ b: String) -> Bool {
+        func blank(_ s: String) -> String {
+            s.replacingOccurrences(of: #"\[\[[^\]\n]*\]\]"#, with: "[[]]", options: .regularExpression)
+        }
+        return blank(a) == blank(b)
+    }
+
+    /// Who, for the question: "claude:x, Aoife's agent" from the server's
+    /// "claude:x (Aoife)"; your own agent says so and why it asks.
+    static func name(_ e: DocHistoryEntry, me: Me) -> String {
+        guard !e.principalName.isEmpty else { return "someone else" }
+        guard e.principalKind == "agent" else { return e.principalName }
+        if e.principalIsYours == true {
+            return me.privateWorkspace == nil
+                ? "\(e.principalName), your agent (couldn't tell whether this workspace is shared)"
+                : "\(e.principalName), your agent, in a shared workspace"
+        }
+        if let open = e.principalName.lastIndex(of: "("), e.principalName.hasSuffix(")"), open > e.principalName.startIndex {
+            let label = e.principalName[..<open].trimmingCharacters(in: .whitespaces)
+            let owner = e.principalName[e.principalName.index(after: open)..<e.principalName.index(before: e.principalName.endIndex)]
+            return "\(label), \(owner)'s agent"
+        }
+        return e.principalName
+    }
 
     /// The epoch of the newest applied op in the doc by anyone but `me`
     /// (nil: none in the history, or no history).
