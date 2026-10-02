@@ -161,8 +161,11 @@ struct PadSidebar: View {
                     if !q.isEmpty, router.padItem != .search { router.select(.search) }
                 }
                 .onChange(of: router.searchFocusRequest) { searchFocused = true }
-                Label("Today", systemImage: "house").tag(PadItem.today)
+                // the tag goes last: a badge wrapping it hides it from the
+                // List's selection on the Mac, so Today couldn't be clicked
+                Label("Today", systemImage: "house")
                     .badge(model.dueCount)
+                    .tag(PadItem.today)
                 Label("To-dos", systemImage: "checkmark.circle").tag(PadItem.todos)
             }
             Section("Library") {
