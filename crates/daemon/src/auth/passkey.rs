@@ -54,6 +54,8 @@ pub struct Enrollment {
 pub struct Pending {
     authz: HashMap<String, AuthzRequest>,
     enroll: HashMap<String, Enrollment>,
+    /// web UI sign-ins (`auth::web`): ceremony id → (started, challenge)
+    pub(super) web: HashMap<String, (i64, PasskeyAuthentication)>,
 }
 
 impl Pending {
@@ -76,6 +78,7 @@ impl Pending {
     pub fn sweep(&mut self, now: i64) {
         self.authz.retain(|_, r| now - r.created < AUTHZ_TTL);
         self.enroll.retain(|_, e| now - e.created < super::ENROLL_TTL);
+        self.web.retain(|_, (at, _)| now - *at < super::web::CEREMONY_TTL);
     }
 }
 
@@ -95,7 +98,7 @@ pub fn cred_id_text(pk: &Passkey) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pk.cred_id().as_ref())
 }
 
-fn json_err(status: StatusCode, msg: &str) -> Response {
+pub(super) fn json_err(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({"error": msg}))).into_response()
 }
 
@@ -108,12 +111,12 @@ fn same_origin(st: &AuthState, headers: &HeaderMap) -> bool {
     }
 }
 
-fn limited(st: &AuthState, req: &Request) -> bool {
+pub(super) fn limited(st: &AuthState, req: &Request) -> bool {
     let ip = super::client_ip(&st.cfg, req.headers(), req.extensions());
     !st.limiter.allow(Class::Login, &ip)
 }
 
-async fn json_body<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, Response> {
+pub(super) async fn json_body<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, Response> {
     let Json(v) = <Json<T> as axum::extract::FromRequest<()>>::from_request(req, &())
         .await
         .map_err(|_| json_err(StatusCode::BAD_REQUEST, "malformed request"))?;
@@ -142,10 +145,7 @@ async fn login_begin(State(st): State<AuthState>, req: Request) -> Response {
         Ok(b) => b,
         Err(r) => return r,
     };
-    // every user's passkeys: the assertion names the credential, and the
-    // credential names the user (no username field to type)
-    let creds = with_store(&st.store, taisce_store::Scope::System, |s| s.auth_credentials(None).unwrap_or_default()).await;
-    let keys = passkeys_of(&creds);
+    let keys = all_passkeys(&st).await;
     if keys.is_empty() {
         return json_err(StatusCode::SERVICE_UNAVAILABLE, "no passkey enrolled");
     }
@@ -189,11 +189,33 @@ async fn login_finish(State(st): State<AuthState>, req: Request) -> Response {
         };
         (r.clone(), c)
     };
-    let result = match st.webauthn.finish_passkey_authentication(&body.credential, &ceremony) {
+    let user = match verify_assertion(&st, &body.credential, &ceremony, &authz.client_id).await {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    st.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).authz.remove(&body.req);
+    tracing::info!(target: AUDIT, event = "login.ok", client = authz.client_id, name = authz.client_name, user = %user);
+    match super::oauth::issue_code(&st, &authz, user).await {
+        Ok(redirect) => Json(json!({"redirect": redirect})).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
+}
+
+/// Verify a passkey assertion against its (single-shot) ceremony and record
+/// the use on the credential (its signature counter). The user the
+/// credential belongs to, or the refusal. `client` names the sign-in in the
+/// audit line (an OAuth client id, or the web UI).
+pub(super) async fn verify_assertion(
+    st: &AuthState,
+    credential: &PublicKeyCredential,
+    ceremony: &PasskeyAuthentication,
+    client: &str,
+) -> Result<uuid::Uuid, Response> {
+    let result = match st.webauthn.finish_passkey_authentication(credential, ceremony) {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(target: AUDIT, event = "login.fail", client = authz.client_id, "passkey assertion rejected: {e}");
-            return json_err(StatusCode::UNAUTHORIZED, "passkey not accepted");
+            tracing::warn!(target: AUDIT, event = "login.fail", client, "passkey assertion rejected: {e}");
+            return Err(json_err(StatusCode::UNAUTHORIZED, "passkey not accepted"));
         }
     };
     let cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(result.cred_id().as_ref());
@@ -209,15 +231,14 @@ async fn login_finish(State(st): State<AuthState>, req: Request) -> Response {
         Some(c.user_id)
     })
     .await;
-    let Some(user) = user else {
-        return json_err(StatusCode::UNAUTHORIZED, "passkey not recognised");
-    };
-    st.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).authz.remove(&body.req);
-    tracing::info!(target: AUDIT, event = "login.ok", client = authz.client_id, name = authz.client_name, user = %user);
-    match super::oauth::issue_code(&st, &authz, user).await {
-        Ok(redirect) => Json(json!({"redirect": redirect})).into_response(),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),
-    }
+    user.ok_or_else(|| json_err(StatusCode::UNAUTHORIZED, "passkey not recognised"))
+}
+
+/// Every enrolled passkey, for a sign-in ceremony (the assertion names the
+/// credential, and the credential names the user: no username to type).
+pub(super) async fn all_passkeys(st: &AuthState) -> Vec<Passkey> {
+    let creds = with_store(&st.store, taisce_store::Scope::System, |s| s.auth_credentials(None).unwrap_or_default()).await;
+    passkeys_of(&creds)
 }
 
 async fn login_deny(State(st): State<AuthState>, req: Request) -> Response {

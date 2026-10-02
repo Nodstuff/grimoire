@@ -464,7 +464,9 @@ fn normalise_token(t: &str) -> Option<String> {
 fn device_user(who: Option<Extension<Authenticated>>) -> Result<uuid::Uuid, Response> {
     match who {
         None => Err(error(StatusCode::FORBIDDEN, "push devices need a signed-in app (SERVER mode)")),
-        Some(Extension(w)) if !w.owner_app => Err(error(StatusCode::FORBIDDEN, "only the Taisce app registers push devices")),
+        Some(Extension(w)) if !w.owner_app || w.web_session => {
+            Err(error(StatusCode::FORBIDDEN, "only the Taisce app registers push devices"))
+        }
         Some(Extension(w)) => Ok(w.user_id),
     }
 }
@@ -653,6 +655,7 @@ mod tests {
             owner_app,
             human: uuid::Uuid::now_v7(),
             instance_owner: false,
+            web_session: false,
         }
     }
 

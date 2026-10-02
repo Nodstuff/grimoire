@@ -15,6 +15,8 @@
 //!   fetched with an SSRF guard.
 //! - `passkey`: the server-rendered login and enrollment pages (webauthn-rs).
 //! - `ratelimit`: per-IP token buckets on the unauthenticated endpoints.
+//! - `web`: the embedded web UI's own sign-in — a passkey opens a
+//!   same-origin session cookie, accepted on `/api` only.
 //!
 //! Secrets (codes, tokens, enrollment links) are random 256-bit values,
 //! handed out once and stored only as SHA-256 hashes.
@@ -23,6 +25,7 @@ pub mod cimd;
 pub mod oauth;
 pub mod passkey;
 pub mod ratelimit;
+pub mod web;
 #[cfg(test)]
 mod tests;
 
@@ -152,7 +155,8 @@ impl AuthState {
 /// The routes that must stay reachable without a token.
 pub fn router(state: AuthState) -> axum::Router {
     oauth::router(state.clone())
-        .merge(passkey::router(state))
+        .merge(passkey::router(state.clone()))
+        .merge(web::router(state))
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         // every body here is a small form or JSON document
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
@@ -316,6 +320,10 @@ pub struct Authenticated {
     /// ADR 0004: the user is the instance owner (the first `owner`-role
     /// user): server-level surfaces (backups, diagnostics) are theirs.
     pub instance_owner: bool,
+    /// The web UI's session cookie (`web`), not a bearer token. First party
+    /// like the app (`owner_app`), but its GETs never write and it is not a
+    /// push device.
+    pub web_session: bool,
 }
 
 /// Paths reachable with no token: discovery, the OAuth endpoints, the
@@ -405,6 +413,7 @@ pub async fn authenticate(st: &AuthState, token: &str) -> Option<Authenticated> 
             human,
             client_id: grant.client_id,
             instance_owner,
+            web_session: false,
         })
     })
     .await
@@ -438,6 +447,7 @@ pub async fn authenticate_pat(st: &AuthState, token: &str, ip: String) -> Option
         human,
         client_id,
         instance_owner,
+        web_session: false,
     })
 }
 
@@ -507,6 +517,23 @@ pub fn revoke_api_token(store: &mut SqliteStore, key: &str, now: i64) -> anyhow:
     Ok(t)
 }
 
+/// `taisce auth revoke <id>`: an OAuth grant, else a web UI session, else a
+/// passkey, by id or unique prefix. What was revoked, as the CLI prints it.
+pub fn cli_revoke(store: &mut SqliteStore, id: &str, now: i64) -> anyhow::Result<String> {
+    if let Some(g) = store.oauth_revoke_grant(id, "revoked from the CLI", now)? {
+        tracing::info!(target: AUDIT, event = "token.revoke", why = "cli", grant = %g);
+        return Ok(format!("revoked grant {g}"));
+    }
+    if let Some(w) = web::revoke_session(store, id, now)? {
+        return Ok(format!("revoked web session {w}"));
+    }
+    if store.auth_delete_credential(id)? == 1 {
+        tracing::info!(target: AUDIT, event = "passkey.delete", credential = id);
+        return Ok(format!("deleted passkey {id}"));
+    }
+    anyhow::bail!("no live grant, web session or passkey matches {id:?} (ambiguous prefix?)")
+}
+
 /// `taisce auth token list`: one line per token, revoked ones included.
 /// Only metadata is stored, so there is no secret here to leak.
 pub fn api_token_lines(store: &SqliteStore) -> anyhow::Result<Vec<String>> {
@@ -549,6 +576,13 @@ pub async fn require_auth(State(st): State<AuthState>, mut req: Request, next: N
         return next.run(req).await;
     }
     let Some(token) = bearer(req.headers()).map(str::to_string) else {
+        // the web UI's session cookie opens /api and nothing else (not /mcp,
+        // /ws, /oauth/* or /admin); a bearer token, when present, wins
+        if under(&path, "/api")
+            && let Some(cookie) = web::session_cookie(req.headers())
+        {
+            return web::with_session(&st, req, next, cookie).await;
+        }
         return unauthorized(&st.cfg, &path, None);
     };
     let is_mcp = under(&path, "/mcp");

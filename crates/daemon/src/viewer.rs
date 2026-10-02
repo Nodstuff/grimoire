@@ -28,12 +28,15 @@ pub struct Viewer {
     /// LOCAL mode, or the person's own app — not a connector token. Sharing
     /// and membership are human surfaces only.
     pub human_surface: bool,
+    /// The web UI's session cookie (SERVER mode): first party, but a GET
+    /// never writes (no find-or-create, no carry-forward).
+    pub web: bool,
 }
 
 impl Viewer {
     /// LOCAL mode's single user.
     pub fn local(human: Uuid) -> Self {
-        Self { scope: Scope::Local, human, user: None, admin: true, human_surface: true }
+        Self { scope: Scope::Local, human, user: None, admin: true, human_surface: true, web: false }
     }
 
     /// A signed-in SERVER-mode user.
@@ -44,6 +47,7 @@ impl Viewer {
             user: Some(who.user_id),
             admin: who.instance_owner,
             human_surface: who.owner_app,
+            web: who.web_session,
         }
     }
 
@@ -62,6 +66,13 @@ impl Viewer {
         } else {
             Err(forbidden("only the server's owner can do this"))
         }
+    }
+
+    /// May a GET of this request create or rewrite anything? Only the
+    /// person's own app (and LOCAL mode): never a connector, never a browser
+    /// session (ADR 0004: a GET is read-only).
+    pub fn get_may_write(&self) -> bool {
+        self.human_surface && !self.web
     }
 
     /// 403 unless this request comes from a person, not a connector.
