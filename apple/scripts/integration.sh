@@ -15,8 +15,8 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="${1:-${TAISCE_REPO:-${GRIMOIRE_REPO:-$HOME/personal/knowledge-system}}}"
 BIN="${TAISCE_BIN:-${GRIMOIRE_BIN:-$REPO/target/release/taisce}}"
 SOFTPASSKEY="${SOFTPASSKEY_BIN:-$REPO/target/release/examples/softpasskey}"
-LOCAL_PORT=7515
-SERVER_PORT=7516
+LOCAL_PORT="${TAISCE_IT_LOCAL_PORT:-7515}"
+SERVER_PORT="${TAISCE_IT_SERVER_PORT:-7516}"
 
 for f in "$BIN" "$SOFTPASSKEY"; do
   [[ -x "$f" ]] || { echo "missing $f (build it in $REPO)" >&2; exit 1; }

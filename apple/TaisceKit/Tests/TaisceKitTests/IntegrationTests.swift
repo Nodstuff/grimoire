@@ -391,6 +391,30 @@ struct ServerIntegrationTests {
         _ = try await api.todoDue()
     }
 
+    /// ADR 0004 against the real server: the profile keys the cache, the
+    /// workspaces carry roles, and the universal link registers as the
+    /// pinned app client beside the custom scheme.
+    @Test func t3c_multiUserSurfaces() async throws {
+        let api = api(session())
+        let me = try #require(try await api.profile().principalID, "the cache is keyed to it")
+        let cache = try Cache.inMemory()
+        #expect(try await CacheOwnership.reconcile(cache: cache, api: api, freshSignIn: true) == .adopt(me))
+        #expect(try await cache.owner() == me)
+        let ws = try await api.createWorkspace(name: "IT \(UUID().uuidString.prefix(6))")
+        #expect(ws.role == "owner" && ws.isOwn && ws.label == ws.name && !ws.shared)
+        let d = try #require(try await oauth.discover())
+        let link = base.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + OAuthClient.appLinkPath
+        let reg = try await oauth.register(d, redirectURIs: [link, OAuthClient.redirectURI])
+        #expect(reg.clientID == "taisce-app")
+        #expect(Set(reg.redirectURIs) == [link, OAuthClient.redirectURI])
+        #expect(await oauth.clientIsKnown("taisce-app", d, redirectURI: link) == true)
+        #expect(await oauth.clientIsKnown("taisce-app", d) == true, "the custom scheme still works")
+        // the AASA file, as Apple's CDN fetches it
+        let (aasa, response) = try await URLSession.shared.data(from: base.appending(path: ".well-known/apple-app-site-association"))
+        #expect((response as? HTTPURLResponse)?.statusCode == 200 && response.mimeType == "application/json")
+        #expect(String(decoding: aasa, as: UTF8.self).contains("6UP35L9425.ie.null.taisce"))
+    }
+
     @Test func t4_refreshRotatesAndStillWorks() async throws {
         let before = try #require(try ITState.shared.store.tokens(for: oauth.origin))
         // a margin longer than the token's life: every token() call refreshes
