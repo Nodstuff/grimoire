@@ -465,8 +465,14 @@ async fn authorize(State(st): State<AuthState>, headers: HeaderMap, Query(q): Qu
         None if client.redirect_uris.len() == 1 => client.redirect_uris[0].clone(),
         None => return super::passkey::error_page(StatusCode::BAD_REQUEST, "redirect_uri is required."),
     };
-    // (the app's universal link is registered only on the fixed app client)
-    if !redirect_allowed(&st.cfg.extra_redirects, &redirect) && redirect != st.cfg.app_https_redirect() {
+    // the app's universal link goes only to the fixed app client: DCR can't
+    // register it for anyone else, and a CIMD document listing it is refused here
+    let app_link = redirect == st.cfg.app_https_redirect();
+    if app_link && client.client_id != super::FIRST_PARTY_APP_CLIENT {
+        tracing::warn!(target: AUDIT, event = "authorize.refused", why = "app link for another client", client = client.client_id, ip);
+        return super::passkey::error_page(StatusCode::BAD_REQUEST, "This server does not send sign-ins to that redirect_uri.");
+    }
+    if !redirect_allowed(&st.cfg.extra_redirects, &redirect) && !app_link {
         return super::passkey::error_page(StatusCode::BAD_REQUEST, "This server does not send sign-ins to that redirect_uri.");
     }
     let state = q.state.as_deref();

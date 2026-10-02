@@ -729,6 +729,29 @@ async fn cimd_client_is_fetched_validated_and_cached() {
     assert_eq!(h.exchange(&id, &code, VERIFIER).await.status, StatusCode::OK);
 }
 
+/// A client metadata document may list any redirect it likes; the app's
+/// universal link still goes only to the fixed app client.
+#[tokio::test]
+async fn a_cimd_client_cannot_claim_the_apps_universal_link() {
+    let mut cfg = AuthConfig::from_public_url(BASE).unwrap();
+    cfg.cimd_allow_insecure = true;
+    let mut h = harness_with(cfg);
+    assert!(h.enroll().await.status.is_success());
+    let link = format!("{BASE}{APP_HTTPS_CALLBACK_PATH}");
+    let listed = link.clone();
+    let id = serve_doc(move |id| json!({"client_id": id, "client_name": "Taisce", "redirect_uris": [listed, REDIRECT]}).to_string()).await;
+    let q = format!("response_type=code&client_id={id}&redirect_uri={link}&code_challenge={CHALLENGE}&code_challenge_method=S256");
+    let (r, req) = h.authorize(&q).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(req.is_none(), "no sign-in page, no code");
+    // its other redirect still works; the app client still gets the link
+    let q = format!("response_type=code&client_id={id}&redirect_uri={REDIRECT}&code_challenge={CHALLENGE}&code_challenge_method=S256");
+    assert_eq!(h.authorize(&q).await.0.status, StatusCode::OK);
+    register_uris(&h, json!([link])).await;
+    let code = h.code_for_at(FIRST_PARTY_APP_CLIENT, &link).await;
+    assert!(!code.is_empty());
+}
+
 #[tokio::test]
 async fn cimd_document_must_name_itself() {
     let mut cfg = AuthConfig::from_public_url(BASE).unwrap();
