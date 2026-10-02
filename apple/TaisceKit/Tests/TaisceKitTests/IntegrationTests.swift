@@ -111,7 +111,7 @@ struct LocalIntegrationTests {
         #expect(has { if case let .list(false, _, items) = $0 { items.contains { $0.checked == true } && items.contains { $0.checked == false } } else { false } })
         #expect(has { if case .list(true, 1, _) = $0 { true } else { false } })
         #expect(has { if case let .table(t) = $0 { t.header == ["a", "b"] && t.rows == [["1", "2"]] } else { false } })
-        #expect(has { if case .code("swift", _) = $0 { true } else { false } })
+        #expect(has { if case .code("swift", _, _) = $0 { true } else { false } })
         #expect(has { if case .diagram("mermaid", _) = $0 { true } else { false } })
         #expect(has { if case .quote("NOTE", _) = $0 { true } else { false } } || has { if case .quote = $0 { true } else { false } })
         // the markdown export round-trips the content

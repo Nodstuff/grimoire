@@ -7,12 +7,28 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
     public var principalName: String
     public var principalKind: String
     public var applied: Bool
+    /// the op's principal (`op.principal`); `Profile.principalID` is yours
+    public var principalID: String?
+    /// the epoch the op landed in (`op.epoch_applied`)
+    public var epoch: Int?
+    /// the block it wrote (`kind.target`, or `kind.block_id` for an insert);
+    /// nil for doc ops (rename, move, status)
+    public var targetBlock: BlockID?
+    /// `insert`, `replace`, `delete`, `move`, `rename_doc`, …
+    public var opType: String?
 
-    public init(opID: String, principalName: String, principalKind: String, applied: Bool = true) {
+    public init(
+        opID: String, principalName: String, principalKind: String, applied: Bool = true,
+        principalID: String? = nil, epoch: Int? = nil, targetBlock: BlockID? = nil, opType: String? = nil
+    ) {
         self.opID = opID
         self.principalName = principalName
         self.principalKind = principalKind
         self.applied = applied
+        self.principalID = principalID
+        self.epoch = epoch
+        self.targetBlock = targetBlock
+        self.opType = opType
     }
 
     /// When the op was written, from its UUIDv7 id; nil for any other id.
@@ -29,6 +45,14 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
     struct Op: Decodable {
         var id: String
         var epoch_applied: Int?
+        var principal: String?
+        var kind: Kind?
+
+        struct Kind: Decodable {
+            var op: String?
+            var target: String?
+            var block_id: String?
+        }
     }
 
     enum CodingKeys: String, CodingKey {
@@ -42,6 +66,10 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
         let op = try c.decode(Op.self, forKey: .op)
         opID = op.id
         applied = op.epoch_applied != nil
+        epoch = op.epoch_applied
+        principalID = op.principal?.lowercased()
+        opType = op.kind?.op
+        targetBlock = (op.kind?.target ?? op.kind?.block_id)?.lowercased()
         principalName = try c.decodeIfPresent(String.self, forKey: .principalName) ?? ""
         principalKind = try c.decodeIfPresent(String.self, forKey: .principalKind) ?? ""
     }

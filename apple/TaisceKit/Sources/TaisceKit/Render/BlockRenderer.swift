@@ -44,12 +44,14 @@ public enum BlockRenderer {
         case let q as BlockQuote:
             return quote(q)
         case let c as CodeBlock:
-            let lang = c.language?.lowercased()
+            // cmark's "language" is the whole info string: `bash cwd=~/x`
+            let info = FenceInfo(c.language)
+            let lang = info.normalizedLanguage
             let code = c.code.hasSuffix("\n") ? String(c.code.dropLast()) : c.code
             if let lang, diagramLanguages.contains(lang) {
                 return .diagram(kind: lang == "vegalite" ? "vega-lite" : lang, source: code)
             }
-            return .code(language: c.language, code: code)
+            return .code(language: info.language, code: code, attributes: info.attributes)
         case let t as Markdown.Table:
             return .table(table(t))
         case is ThematicBreak:
