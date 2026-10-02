@@ -384,6 +384,23 @@ CREATE TABLE IF NOT EXISTS oauth_access_tokens (
 );
 CREATE INDEX IF NOT EXISTS oauth_access_grant ON oauth_access_tokens (grant_id);
 
+-- Personal access tokens (`taisce auth token create`): one static bearer per
+-- name, for MCP clients that cannot run the OAuth flow (one token shared by
+-- every Claude Code account). Accepted on /mcp only; the user is the token's
+-- identity exactly as an OAuth grant's. A name is unique among a user's live
+-- tokens, so a revoked name can be minted again.
+CREATE TABLE IF NOT EXISTS auth_api_tokens (
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES auth_users (id) ON DELETE CASCADE,
+    name         TEXT NOT NULL,
+    token_hash   TEXT NOT NULL UNIQUE,
+    created_at   INTEGER NOT NULL,
+    -- touched at most once a minute (`auth_touch_api_token`)
+    last_used_at INTEGER,
+    revoked_at   INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS auth_api_tokens_name ON auth_api_tokens (user_id, name) WHERE revoked_at IS NULL;
+
 -- Idempotency: (principal, key) → the first outcome of a write, so a retry
 -- (HTTP `request_id`, or an MCP write's content key) replays it instead of
 -- applying twice — across restarts. Readers pass their own window; rows

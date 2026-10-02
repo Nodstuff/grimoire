@@ -69,6 +69,21 @@ pub struct Grant {
     pub revoke_why: Option<String>,
 }
 
+/// A personal access token (the secret itself is never stored).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiToken {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub name: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+}
+
+/// Seconds between `last_used_at` writes for one token: a busy MCP client
+/// costs one UPDATE a minute, not one per request.
+pub const API_TOKEN_TOUCH_EVERY: i64 = 60;
+
 /// What presenting an authorization code did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodeOutcome {
@@ -137,8 +152,20 @@ fn grant_row(r: &rusqlite::Row) -> rusqlite::Result<Grant> {
     })
 }
 
+fn api_token_row(r: &rusqlite::Row) -> rusqlite::Result<ApiToken> {
+    Ok(ApiToken {
+        id: uuid_of(r.get(0)?)?,
+        user_id: uuid_of(r.get(1)?)?,
+        name: r.get(2)?,
+        created_at: r.get(3)?,
+        last_used_at: r.get(4)?,
+        revoked_at: r.get(5)?,
+    })
+}
+
 const USER_COLS: &str = "id, principal_id, name, role, created_at";
 const CRED_COLS: &str = "id, user_id, cred_id, passkey, label, created_at, last_used_at";
+const API_TOKEN_COLS: &str = "id, user_id, name, created_at, last_used_at, revoked_at";
 const GRANT_COLS: &str = "g.id, g.client_id, g.user_id, g.resource, g.scope, g.created_at, g.revoked_at, g.revoke_why";
 
 impl SqliteStore {
@@ -266,6 +293,79 @@ impl SqliteStore {
             return Ok(0);
         }
         Ok(self.conn.execute("DELETE FROM auth_credentials WHERE id = ?1", [&ids[0]])?)
+    }
+
+    // ---- personal access tokens ----
+
+    /// A new token for `user_id` under `name` (unique among the user's live
+    /// tokens: a clash is `InvalidOp`).
+    pub fn auth_create_api_token(&mut self, user_id: Uuid, name: &str, token_hash: &str, now: i64) -> Result<ApiToken> {
+        let id = Uuid::now_v7();
+        let r = self.conn.execute(
+            "INSERT INTO auth_api_tokens (id, user_id, name, token_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id.to_string(), user_id.to_string(), name, token_hash, now],
+        );
+        match r {
+            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+                return Err(StoreError::InvalidOp(format!("a live token named {name:?} already exists")));
+            }
+            r => r?,
+        };
+        Ok(ApiToken { id, user_id, name: name.to_string(), created_at: now, last_used_at: None, revoked_at: None })
+    }
+
+    /// The live (unrevoked) token behind a hash, its user still present.
+    pub fn auth_api_token_by_hash(&self, token_hash: &str) -> Result<Option<ApiToken>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {API_TOKEN_COLS} FROM auth_api_tokens WHERE token_hash = ?1 AND revoked_at IS NULL"),
+                [token_hash],
+                api_token_row,
+            )
+            .optional()?)
+    }
+
+    /// Record a use, unless one was recorded in the last minute. True when
+    /// it wrote (callers can skip the call when `last_used_at` is fresh).
+    pub fn auth_touch_api_token(&mut self, id: Uuid, now: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE auth_api_tokens SET last_used_at = ?2
+             WHERE id = ?1 AND (last_used_at IS NULL OR last_used_at <= ?2 - ?3)",
+            params![id.to_string(), now, API_TOKEN_TOUCH_EVERY],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Every token, revoked ones included, oldest first.
+    pub fn auth_api_tokens(&self) -> Result<Vec<ApiToken>> {
+        let mut st = self.conn.prepare(&format!("SELECT {API_TOKEN_COLS} FROM auth_api_tokens ORDER BY created_at, id"))?;
+        let rows = st.query_map([], api_token_row)?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Revoke a live token by name, id, or a unique id prefix. None when
+    /// nothing (or more than one token) matches.
+    pub fn auth_revoke_api_token(&mut self, key: &str, now: i64) -> Result<Option<ApiToken>> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let live: Vec<ApiToken> = self.auth_api_tokens()?.into_iter().filter(|t| t.revoked_at.is_none()).collect();
+        let by_name: Vec<&ApiToken> = live.iter().filter(|t| t.name == key).collect();
+        let hits: Vec<&ApiToken> = if by_name.is_empty() {
+            live.iter().filter(|t| t.id.to_string().starts_with(key)).collect()
+        } else {
+            by_name
+        };
+        let [t] = hits.as_slice() else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            "UPDATE auth_api_tokens SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+            params![t.id.to_string(), now],
+        )?;
+        Ok(Some(ApiToken { revoked_at: Some(now), ..(*t).clone() }))
     }
 
     // ---- clients ----
@@ -674,6 +774,30 @@ mod tests {
         let again = s.auth_ensure_owner(u.principal_id, "other", 200).unwrap();
         assert_eq!(again, u);
         assert_eq!(s.auth_users().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn api_tokens_live_until_revoked() {
+        let (mut s, u) = store_with_owner();
+        let t = s.auth_create_api_token(u.id, "laptop", "h1", 100).unwrap();
+        assert!(matches!(s.auth_create_api_token(u.id, "laptop", "h2", 101), Err(StoreError::InvalidOp(_))));
+        assert_eq!(s.auth_api_token_by_hash("h1").unwrap().unwrap().id, t.id);
+        assert!(s.auth_api_token_by_hash("nope").unwrap().is_none());
+        // touched once a minute at most
+        assert!(s.auth_touch_api_token(t.id, 200).unwrap());
+        assert!(!s.auth_touch_api_token(t.id, 259).unwrap());
+        assert!(s.auth_touch_api_token(t.id, 260).unwrap());
+        assert_eq!(s.auth_api_token_by_hash("h1").unwrap().unwrap().last_used_at, Some(260));
+        // revoke by name; the name is free again
+        assert!(s.auth_revoke_api_token("nobody", 300).unwrap().is_none());
+        assert_eq!(s.auth_revoke_api_token("laptop", 300).unwrap().unwrap().revoked_at, Some(300));
+        assert!(s.auth_api_token_by_hash("h1").unwrap().is_none());
+        assert!(s.auth_revoke_api_token("laptop", 301).unwrap().is_none(), "already revoked");
+        let t2 = s.auth_create_api_token(u.id, "laptop", "h3", 400).unwrap();
+        // revoke by id prefix
+        let prefix = &t2.id.to_string()[..18];
+        assert_eq!(s.auth_revoke_api_token(prefix, 500).unwrap().unwrap().id, t2.id);
+        assert_eq!(s.auth_api_tokens().unwrap().len(), 2);
     }
 
     #[test]
