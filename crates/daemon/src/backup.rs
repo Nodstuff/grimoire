@@ -182,7 +182,7 @@ pub async fn backup_loop(db_path: PathBuf) {
 mod tests {
     use super::*;
     use taisce_store::{BlockStore, PrincipalKind, SqliteStore};
-    use std::sync::{Arc, Mutex};
+    
 
     #[test]
     fn backup_is_a_self_contained_db_and_prunes_to_keep() {
@@ -192,10 +192,10 @@ mod tests {
         let mut store = store;
         let tom = store.create_principal(PrincipalKind::Human, "tom", None).unwrap();
         store.create_doc("kept", None, tom.id).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = taisce_store::SharedStore::new(store);
 
         // the store's lock is HELD throughout: the backup must not need it
-        let held = store.lock().unwrap();
+        let held = store.lock(taisce_store::Scope::System);
         let info = backup_now(&db_path, false).unwrap();
         assert!(Path::new(&info.path).exists());
         // idempotent for the day

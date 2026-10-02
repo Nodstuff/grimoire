@@ -1,26 +1,26 @@
 //! Run store work off the async workers.
 //!
-//! The daemon holds one `Arc<Mutex<SqliteStore>>`; every guard is block-scoped
-//! before any `.await`, but the SQLite work itself used to run on the tokio
-//! worker threads, so one long query stalled every other request on that
-//! worker. `with_store` moves the lock + query onto the blocking pool and
-//! hands the result back; the Mutex type and the store signatures stay as
-//! they are.
+//! The daemon holds one `SharedStore`; every guard is block-scoped before
+//! any `.await`, but the SQLite work itself used to run on the tokio worker
+//! threads, so one long query stalled every other request on that worker.
+//! `with_store` moves the lock + query onto the blocking pool and hands the
+//! result back. It takes the `Scope` the work runs for (ADR 0004): there is
+//! no way to reach the store without one.
 
-use taisce_store::{BlockStore, PrincipalKind, SqliteStore};
-use std::sync::{Arc, Mutex};
+use taisce_store::{BlockStore, PrincipalKind, Scope, SharedStore, SqliteStore};
 use uuid::Uuid;
 
-/// Lock the store inside `spawn_blocking`, run `f`, return its value.
-/// A poisoned lock is recovered (same as the inline `lock()` sites did); a
-/// panic inside `f` is re-raised on the caller so it is not silently lost.
+/// Lock the store for `scope` inside `spawn_blocking`, run `f`, return its
+/// value. A poisoned lock is recovered; a panic inside `f` is re-raised on
+/// the caller so it is not silently lost.
 pub async fn with_store<T: Send + 'static>(
-    store: &Arc<Mutex<SqliteStore>>,
+    store: &SharedStore,
+    scope: Scope,
     f: impl FnOnce(&mut SqliteStore) -> T + Send + 'static,
 ) -> T {
-    let store = Arc::clone(store);
+    let store = store.clone();
     blocking(move || {
-        let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = store.lock(scope);
         f(&mut s)
     })
     .await
@@ -64,29 +64,32 @@ mod tests {
 
     #[tokio::test]
     async fn runs_closure_and_returns_value() {
-        let store = Arc::new(Mutex::new(SqliteStore::open_in_memory().unwrap()));
-        let n = with_store(&store, |s| s.list_docs().unwrap().len()).await;
+        let store = SharedStore::new(SqliteStore::open_in_memory().unwrap());
+        let n = with_store(&store, Scope::System, |s| s.list_docs().unwrap().len()).await;
         assert_eq!(n, 0);
     }
 
     #[tokio::test]
     async fn recovers_poisoned_lock() {
-        let store = Arc::new(Mutex::new(SqliteStore::open_in_memory().unwrap()));
-        let poison = Arc::clone(&store);
-        let _ = std::thread::spawn(move || {
-            let _g = poison.lock().unwrap();
-            panic!("poison");
-        })
-        .join();
+        let store = SharedStore::new(SqliteStore::open_in_memory().unwrap());
+        store.poison_for_test();
         assert!(store.is_poisoned());
-        let n = with_store(&store, |s| s.list_docs().unwrap().len()).await;
+        let n = with_store(&store, Scope::System, |s| s.list_docs().unwrap().len()).await;
         assert_eq!(n, 0);
     }
 
     #[tokio::test]
     #[should_panic(expected = "boom")]
     async fn panic_in_closure_propagates() {
-        let store = Arc::new(Mutex::new(SqliteStore::open_in_memory().unwrap()));
-        with_store(&store, |_| panic!("boom")).await;
+        let store = SharedStore::new(SqliteStore::open_in_memory().unwrap());
+        with_store(&store, Scope::System, |_| panic!("boom")).await;
+    }
+
+    #[tokio::test]
+    async fn the_lock_runs_in_the_scope_it_was_given() {
+        let store = SharedStore::new(SqliteStore::open_in_memory().unwrap());
+        let u = Uuid::now_v7();
+        assert_eq!(with_store(&store, Scope::User(u), |s| s.scope()).await, Scope::User(u));
+        assert_eq!(with_store(&store, Scope::Local, |s| s.scope()).await, Scope::Local);
     }
 }

@@ -11,6 +11,7 @@
 
 use crate::api::ApiState;
 use crate::store_ext::with_store;
+use crate::viewer::Viewer;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -41,8 +42,8 @@ fn parse_iso_millis(s: &str) -> Option<i64> {
         .map(|d| d.timestamp_millis())
 }
 
-async fn get_visit(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| match s.get_setting(LAST_VISIT_KEY) {
+async fn get_visit(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| match s.get_setting(LAST_VISIT_KEY) {
         Ok(v) => Json(json!({"last_visit": v})),
         Err(e) => Json(json!({"error": e.to_string()})),
     })
@@ -56,7 +57,7 @@ struct VisitReq {
     at: Option<String>,
 }
 
-async fn post_visit(State(st): State<ApiState>, body: axum::body::Bytes) -> Json<Value> {
+async fn post_visit(State(st): State<ApiState>, v: Viewer, body: axum::body::Bytes) -> Json<Value> {
     let req: VisitReq = if body.is_empty() {
         VisitReq::default()
     } else {
@@ -70,7 +71,7 @@ async fn post_visit(State(st): State<ApiState>, body: axum::body::Bytes) -> Json
         Some(a) => return Json(json!({"error": format!("`at` is not RFC 3339: {a}")})),
         None => now_iso(),
     };
-    with_store(&st.store, move |s| {
+    with_store(&st.store, v.scope, move |s| {
         let previous = match s.get_setting(LAST_VISIT_KEY) {
             Ok(v) => v,
             Err(e) => return Json(json!({"error": e.to_string()})),
@@ -89,13 +90,13 @@ struct SinceQuery {
     limit: Option<usize>,
 }
 
-async fn since(State(st): State<ApiState>, Query(q): Query<SinceQuery>) -> Json<Value> {
+async fn since(State(st): State<ApiState>, v: Viewer, Query(q): Query<SinceQuery>) -> Json<Value> {
     let floor = q.since.as_deref().and_then(parse_iso_millis);
     if q.since.is_some() && floor.is_none() {
         return Json(json!({"error": "`since` is not RFC 3339"}));
     }
     let limit = q.limit.unwrap_or(20).min(200);
-    with_store(&st.store, move |s| {
+    with_store(&st.store, v.scope, move |s| {
         let principals: HashMap<Uuid, (String, PrincipalKind)> = match s.list_principals() {
             Ok(ps) => ps.into_iter().map(|p| (p.id, (p.display_name, p.kind))).collect(),
             Err(e) => return Json(json!({"error": e.to_string()})),
@@ -152,18 +153,19 @@ pub(crate) mod testing {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use taisce_store::SqliteStore;
-    use std::sync::{Arc, Mutex};
+    
     use tower::ServiceExt;
 
     pub fn app() -> (Router, Uuid) {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let human = store.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
         let dir = std::env::temp_dir().join(format!("taisce-home-test-{}", Uuid::now_v7()));
-        let store = Arc::new(Mutex::new(store));
+        let store = taisce_store::SharedStore::new(store);
         let st = ApiState {
             changes: crate::changes::Feed::new(&store),
             store,
             human,
+            server_mode: false,
             db_path: dir.join("ks.db"),
             embedder: None,
             dedupe: crate::mcp::new_dedupe(),

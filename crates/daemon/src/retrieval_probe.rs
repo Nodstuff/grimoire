@@ -28,7 +28,7 @@ mod probe {
                     println!("  [{}] cos={:?} cov={cov}/{} :: {}", d.title, c.map(|x| (x*1000.0).round()/1000.0), words.len(), b.content.replace('\n'," ").chars().take(70).collect::<String>());
                 }
             }
-            let all = e.search(q, 400);
+            let all = e.search(&s, q, 400);
             println!("  dense rank of blocks scoring >= 0.40: {}", all.iter().filter(|(_, sc)| *sc >= 0.40).count());
         }
         for q in [

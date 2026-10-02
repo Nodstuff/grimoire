@@ -409,6 +409,48 @@ impl SqliteStore {
         })
     }
 
+    /// Every block id the scope may see (None: System/Local, no filter) —
+    /// the allowlist a global in-memory index (embeddings) is cut to before
+    /// ranking.
+    pub fn visible_block_ids(&self) -> Result<Option<HashSet<Uuid>>> {
+        let Some(sub) = vis_sub(self.scope) else { return Ok(None) };
+        let mut st = self
+            .conn
+            .prepare_cached(&format!("SELECT id FROM blocks WHERE deleted = 0 AND doc_id IN ({sub})"))?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for r in rows {
+            out.insert(parse(r?, "blocks.id")?);
+        }
+        Ok(Some(out))
+    }
+
+    /// The scope's own live root doc titled `title` (the per-person
+    /// singletons: Inbox, To-do, Answers, Claude Memory). A root whose
+    /// owner is the viewer; System/Local: any root. Oldest first.
+    pub fn own_root_titled(&self, title: &str) -> Result<Option<crate::Doc>> {
+        let owner = match self.scope.user() {
+            None => "1".to_string(),
+            Some(u) => format!("COALESCE(owner_id, {INSTANCE_OWNER_SQL}) = '{u}'"),
+        };
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT id FROM docs WHERE parent_id IS NULL AND deleted = 0 AND title = ?1 AND {owner} AND {}
+                     ORDER BY created_at, id LIMIT 1",
+                    vis_pred(self.scope, "id")
+                ),
+                params![title],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => Ok(Some(crate::BlockStore::get_doc(self, parse(id, "docs.id")?)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Record an audit event as the current scope's user.
     pub fn audit(&mut self, event: &str, subject: &str, detail: serde_json::Value) -> Result<()> {
         audit_conn(&self.conn, self.scope.user(), event, subject, &detail)

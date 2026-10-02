@@ -2319,14 +2319,16 @@ impl BlockStore for SqliteStore {
             schedule: "daily".into(),
             confidence_policy,
             enabled: true,
+            owner_id: owner,
         })
     }
 
     fn list_gardeners(&self) -> Result<Vec<Gardener>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT id, name, kind, principal, scope_doc, task_prompt, bindings, creds_ref,
-                    schedule, confidence_policy, enabled
+                    schedule, confidence_policy, enabled, COALESCE(owner_id, {})
              FROM gardeners WHERE {} ORDER BY name",
+            tenancy::INSTANCE_OWNER_SQL,
             self.gardener_pred("gardeners.owner_id")
         ))?;
         let rows = stmt.query_map([], |r| {
@@ -2342,6 +2344,7 @@ impl BlockStore for SqliteStore {
                 r.get::<_, String>(8)?,
                 r.get::<_, String>(9)?,
                 r.get::<_, bool>(10)?,
+                r.get::<_, Option<String>>(11)?,
             ))
         })?;
         rows.map(|r| {
@@ -2357,6 +2360,7 @@ impl BlockStore for SqliteStore {
                 schedule,
                 cp,
                 enabled,
+                owner,
             ) = r?;
             Ok(Gardener {
                 id: uuid_col(id, "gardeners.id")?,
@@ -2374,6 +2378,7 @@ impl BlockStore for SqliteStore {
                 confidence_policy: ConfidencePolicy::parse(&cp)
                     .ok_or_else(|| StoreError::InvalidOp(format!("bad confidence_policy: {cp}")))?,
                 enabled,
+                owner_id: owner.map(|o| uuid_col(o, "gardeners.owner_id")).transpose()?,
             })
         })
         .collect()

@@ -528,6 +528,10 @@ pub struct Gardener {
     pub schedule: String,
     pub confidence_policy: ConfidencePolicy,
     pub enabled: bool,
+    /// ADR 0004: the user it works for (its runs are scoped to them);
+    /// None = the instance owner / LOCAL.
+    #[serde(default)]
+    pub owner_id: Option<Uuid>,
 }
 
 /// One cited block of an ask-the-vault answer, with where it stands now.

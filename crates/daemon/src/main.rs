@@ -28,6 +28,7 @@ mod store_ext;
 mod due;
 mod todo;
 mod workspaces;
+mod viewer;
 #[cfg(test)]
 mod retrieval_probe;
 
@@ -35,7 +36,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use taisce_store::{BlockStore, PrincipalKind, SqliteStore};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// The built frontend, compiled INTO the binary (release) so the app is
 /// self-contained — no external `ui/dist` path to go missing on another
@@ -236,12 +237,58 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AuthCmd,
     },
+    /// Workspaces and who they are shared with (ADR 0004). Works on the db
+    /// directly, on the server box: sharing is a human surface, never MCP.
+    Workspace {
+        #[command(subcommand)]
+        cmd: WorkspaceCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCmd {
+    /// Every workspace: owner, members, shared.
+    List,
+    /// The members of one workspace (id, unique id prefix, or `Name` when
+    /// only one workspace carries it; `Name@owner` picks the owner's).
+    Members { workspace: String },
+    /// Share a workspace with a user as editor or viewer (or change a role).
+    Share {
+        workspace: String,
+        /// user id, unique prefix, or name
+        #[arg(long)]
+        user: String,
+        /// editor | viewer
+        #[arg(long, default_value = "viewer")]
+        role: String,
+    },
+    /// Remove a user from a workspace; their clients drop its docs.
+    Unshare {
+        workspace: String,
+        #[arg(long)]
+        user: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum AuthCmd {
-    /// Print a one-time link (15 minutes) that registers a passkey for the owner.
-    Enroll,
+    /// Print a one-time link (15 minutes) that registers a passkey for the
+    /// owner, or for another user with --user.
+    Enroll {
+        /// user id, unique prefix, or name (default: the owner)
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// People on this server (ADR 0004).
+    User {
+        #[command(subcommand)]
+        cmd: UserCmd,
+    },
+    /// Recent audit events: users, membership changes, refused shares.
+    Audit {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// List users, passkeys and live OAuth grants.
     List,
     /// Revoke an OAuth grant, or delete a passkey, by id (or unique prefix).
@@ -251,6 +298,13 @@ enum AuthCmd {
         #[command(subcommand)]
         cmd: TokenCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum UserCmd {
+    /// Add a person (their own Unsorted, workspaces and passkeys); then
+    /// `taisce auth enroll --user <name>` for their passkey link.
+    Add { name: String },
 }
 
 #[derive(Subcommand)]
@@ -314,8 +368,11 @@ fn bootstrap_principals(store: &mut SqliteStore) -> anyhow::Result<(uuid::Uuid, 
             .find(|p| p.display_name == name)
             .map(|p| p.id)
     };
-    let human = match existing.iter().find(|p| p.kind == PrincipalKind::Human) {
-        Some(p) => p.id,
+    // ADR 0004: with several people there are several human principals; the
+    // instance's own is the owner user's
+    let owner_principal = store.auth_owner()?.map(|u| u.principal_id);
+    let human = match owner_principal.or_else(|| existing.iter().find(|p| p.kind == PrincipalKind::Human).map(|p| p.id)) {
+        Some(p) => p,
         None => {
             let name = default_human_name();
             tracing::info!(name, "first run: human principal created (rename it in the app)");
@@ -501,6 +558,9 @@ pub fn install_crypto_provider() {
 }
 
 fn human_name(store: &SqliteStore) -> String {
+    if let Ok(Some(u)) = store.auth_owner() {
+        return u.name;
+    }
     store
         .list_principals()
         .unwrap_or_default()
@@ -519,7 +579,7 @@ fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, h
             .unwrap_or_default()
     };
     match cmd {
-        AuthCmd::Enroll => {
+        AuthCmd::Enroll { user } => {
             let base = match public_url {
                 Some(u) => auth::AuthConfig::from_public_url(&u)?.base,
                 None => store.get_setting("auth.public_url")?.ok_or_else(|| {
@@ -528,11 +588,33 @@ fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, h
             };
             let name = human_name(store);
             let owner = store.auth_ensure_owner(human, &name, now)?;
+            let target = match user.as_deref() {
+                None => owner,
+                Some(key) => store
+                    .auth_find_user(key)?
+                    .ok_or_else(|| anyhow::anyhow!("no single user matches {key:?} (see `taisce auth list`)"))?,
+            };
             let token = auth::random_token();
-            store.auth_add_enrollment(&auth::hash_secret(&token), owner.id, now + auth::ENROLL_TTL)?;
-            tracing::info!(target: auth::AUDIT, event = "enroll.mint", user = %owner.id);
+            store.auth_add_enrollment(&auth::hash_secret(&token), target.id, now + auth::ENROLL_TTL)?;
+            tracing::info!(target: auth::AUDIT, event = "enroll.mint", user = %target.id);
+            if target.role != "owner" {
+                println!("passkey link for {}:", target.name);
+            }
             println!("{base}/auth/enroll?t={token}");
             println!("(one-time, expires in 15 minutes — open it on the device that will hold the passkey)");
+        }
+        AuthCmd::User { cmd: UserCmd::Add { name } } => {
+            let owner_name = human_name(store);
+            store.auth_ensure_owner(human, &owner_name, now)?;
+            let u = store.auth_add_user(&name, now)?;
+            tracing::info!(target: auth::AUDIT, event = "user.create", user = %u.id, name = u.name);
+            println!("added user {}  {}  (member)", u.id, u.name);
+            println!("next: taisce auth enroll --user {:?}   (their passkey link)", u.name);
+        }
+        AuthCmd::Audit { limit } => {
+            for e in store.audit_events(limit)? {
+                println!("{}  {:<26} {}  actor {}  {}", e.at, e.event, e.subject, e.actor.unwrap_or_else(|| "cli".into()), e.detail);
+            }
         }
         AuthCmd::List => {
             for u in store.auth_users()? {
@@ -581,6 +663,78 @@ fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, h
             } else {
                 anyhow::bail!("no live grant or passkey matches {id:?} (ambiguous prefix?)");
             }
+        }
+    }
+    Ok(())
+}
+
+/// A workspace by id, unique id prefix, `Name@owner`, or a name only one
+/// workspace carries (the CLI is System scope: it sees every person's).
+fn cli_workspace(store: &SqliteStore, key: &str) -> anyhow::Result<taisce_store::Workspace> {
+    let all = store.list_workspaces()?;
+    let key = key.trim();
+    let (name, owner) = match key.rsplit_once('@') {
+        Some((n, o)) => (n.trim(), Some(o.trim().to_lowercase())),
+        None => (key, None),
+    };
+    let hits: Vec<&taisce_store::Workspace> = all
+        .iter()
+        .filter(|w| {
+            w.id.to_string().starts_with(&key.to_lowercase())
+                || (w.name.eq_ignore_ascii_case(name)
+                    && owner.as_ref().is_none_or(|o| w.owner_name.as_deref().is_some_and(|n| n.to_lowercase() == *o)))
+        })
+        .collect();
+    match hits.as_slice() {
+        [w] => Ok((*w).clone()),
+        [] => anyhow::bail!("no workspace matches {key:?}"),
+        many => anyhow::bail!(
+            "{key:?} is ambiguous: {} — use the id or Name@owner",
+            many.iter().map(|w| format!("{}@{} ({})", w.name, w.owner_name.as_deref().unwrap_or("?"), w.id)).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// `taisce workspace …`: straight against the db, as System (the box).
+fn workspace_cli(store: &mut SqliteStore, cmd: WorkspaceCmd) -> anyhow::Result<()> {
+    let user_of = |store: &SqliteStore, key: &str| -> anyhow::Result<taisce_store::auth::AuthUser> {
+        store.auth_find_user(key)?.ok_or_else(|| anyhow::anyhow!("no single user matches {key:?} (see `taisce auth list`)"))
+    };
+    match cmd {
+        WorkspaceCmd::List => {
+            for w in store.list_workspaces()? {
+                let members = store.workspace_members(w.id)?;
+                println!(
+                    "workspace {}  {:<24} owner {:<12} {} member{}{}",
+                    w.id,
+                    w.name,
+                    w.owner_name.as_deref().unwrap_or("?"),
+                    members.len(),
+                    if members.len() == 1 { "" } else { "s" },
+                    if w.shared { "  (shared)" } else { "" }
+                );
+            }
+        }
+        WorkspaceCmd::Members { workspace } => {
+            let w = cli_workspace(store, &workspace)?;
+            for m in store.workspace_members(w.id)? {
+                println!("{}  {:<20} {:<7} since {}", m.user_id, m.name, m.role.as_str(), m.added_at);
+            }
+        }
+        WorkspaceCmd::Share { workspace, user, role } => {
+            let w = cli_workspace(store, &workspace)?;
+            let u = user_of(store, &user)?;
+            let role = taisce_store::Role::parse(&role).ok_or_else(|| anyhow::anyhow!("--role: editor | viewer"))?;
+            store.share_workspace(w.id, u.id, role)?;
+            tracing::info!(target: auth::AUDIT, event = "workspace.share", workspace = %w.id, user = %u.id, role = role.as_str(), by = "cli");
+            println!("shared {} with {} as {}", w.name, u.name, role.as_str());
+        }
+        WorkspaceCmd::Unshare { workspace, user } => {
+            let w = cli_workspace(store, &workspace)?;
+            let u = user_of(store, &user)?;
+            let removed = store.unshare_workspace(w.id, u.id)?;
+            tracing::info!(target: auth::AUDIT, event = "workspace.unshare", workspace = %w.id, user = %u.id, by = "cli");
+            println!("{} {} from {}", if removed { "removed" } else { "was not a member:" }, u.name, w.name);
         }
     }
     Ok(())
@@ -696,6 +850,10 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
             let mut store = store;
             auth_cli(&mut store, cmd, cli.public_url.clone(), tom)?;
         }
+        Cmd::Workspace { cmd } => {
+            let mut store = store;
+            workspace_cli(&mut store, cmd)?;
+        }
         Cmd::Serve { trusted_proxy, allow_redirect, apns } => {
             let port = cli.port;
             let mut store = store;
@@ -718,7 +876,7 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
             {
                 tracing::warn!("marked {n} orphaned gardener runs (daemon restarted mid-run)");
             }
-            let store = Arc::new(Mutex::new(store));
+            let store = taisce_store::SharedStore::new(store);
             #[cfg(unix)]
             tokio::spawn(watch_parent());
             // the local trust boundary for /admin/*: a per-boot token beside the
@@ -758,7 +916,8 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                     let e = Arc::new(e);
                     {
                         let e = e.clone();
-                        store_ext::with_store(&store, move |s| match e.load_index(s) {
+                        // the index holds every block (System); searches cut it per viewer
+                        store_ext::with_store(&store, taisce_store::Scope::System, move |s| match e.load_index(s) {
                             Ok(n) => tracing::info!(vectors = n, dim = e.dim, "embedding index loaded"),
                             Err(err) => tracing::warn!("embedding index load failed: {err}"),
                         })
@@ -827,13 +986,17 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                 (Some(_), false) => tracing::warn!("APNs configured but this is LOCAL mode: push needs --public-url"),
                 (None, _) => {}
             }
+            // ADR 0004: SERVER mode is multi-user; a request without a token's
+            // identity is refused, never served as the local user
+            let server_mode = auth_state.is_some();
             let app = mcp::router_with_hosts(store.clone(), claude, dedupe.clone(), embedder.clone(), mcp_hosts)
-                .merge(admin::router(store.clone(), admin_token))
+                .merge(admin::router(store.clone(), admin_token, server_mode))
                 .merge(push::router(push::DevicesState { store: store.clone(), default_env }))
                 .merge(api::router(api::ApiState {
                     changes: feed,
                     store,
                     human: tom,
+                    server_mode,
                     db_path: cli.db.clone(),
                     embedder,
                     dedupe,

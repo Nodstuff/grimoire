@@ -18,6 +18,18 @@
 //!   `{doc_id, label, workspace_id}`: `label` is the doc's own label,
 //!   `workspace_id` what it resolves to now.
 //!
+//! - `GET /api/workspaces/{id}/members` → `{members: [{user_id, name, role,
+//!   added_at, added_by}]}` (any member).
+//! - `POST /api/workspaces/{id}/members {user, role}` — share with a user
+//!   (id or name) as `editor` or `viewer`, or change their role; the
+//!   workspace owner only, from a human surface (the person's own app or
+//!   LOCAL), never a connector token or MCP (ADR 0004).
+//! - `DELETE /api/workspaces/{id}/members/{user_id}` — unshare (same rule).
+//!
+//! In SERVER mode every list is the viewer's: their own workspaces and the
+//! ones shared with them, each with `owner_id`, `owner_name`, `role`,
+//! `shared` and `display_name` (`Work · Aoife` when a shared name clashes).
+//!
 //! Every label or workspace change journals a `tree` change for each doc it
 //! touches (`/api/changes`, whose `doc` summaries carry `workspace_id`).
 //! Errors are real statuses with `{error}`: 400 bad input, 404 unknown id,
@@ -25,6 +37,7 @@
 
 use crate::api::ApiState;
 use crate::store_ext::with_store;
+use crate::viewer::Viewer;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -39,6 +52,7 @@ use uuid::Uuid;
 fn fail(e: StoreError) -> Response {
     let code = match &e {
         StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+        StoreError::Forbidden(_) => StatusCode::FORBIDDEN,
         StoreError::InvalidOp(m) if m.contains("already exists") => StatusCode::CONFLICT,
         StoreError::InvalidOp(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -61,8 +75,8 @@ fn counts(s: &SqliteStore) -> taisce_store::Result<HashMap<Option<Uuid>, usize>>
     Ok(out)
 }
 
-async fn list(State(st): State<ApiState>) -> Response {
-    with_store(&st.store, |s| {
+async fn list(State(st): State<ApiState>, v: Viewer) -> Response {
+    with_store(&st.store, v.scope, |s| {
         let run = || -> taisce_store::Result<Value> {
             let c = counts(s)?;
             let all: Vec<Value> = s.list_workspaces()?.iter().map(|w| ws_json(w, &c)).collect();
@@ -89,9 +103,9 @@ struct CreateReq {
     request_id: Option<Uuid>,
 }
 
-async fn create(State(st): State<ApiState>, Json(req): Json<CreateReq>) -> Response {
-    let (human, dedupe) = (st.human, st.dedupe.clone());
-    with_store(&st.store, move |s| {
+async fn create(State(st): State<ApiState>, v: Viewer, Json(req): Json<CreateReq>) -> Response {
+    let (human, dedupe) = (v.human, st.dedupe.clone());
+    with_store(&st.store, v.scope, move |s| {
         if let Some(rid) = req.request_id
             && let Some(prev) = crate::mcp::durable_get(s, &dedupe, human, rid, crate::mcp::REQUEST_ID_TTL)
         {
@@ -130,8 +144,8 @@ struct PatchReq {
     sort_key: Option<Option<String>>,
 }
 
-async fn update(State(st): State<ApiState>, Path(id): Path<Uuid>, Json(req): Json<PatchReq>) -> Response {
-    with_store(&st.store, move |s| {
+async fn update(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>, Json(req): Json<PatchReq>) -> Response {
+    with_store(&st.store, v.scope, move |s| {
         let patch = WorkspacePatch { name: req.name, color: req.color, icon: req.icon, sort_key: req.sort_key };
         match s.update_workspace(id, patch).and_then(|w| Ok(ws_json(&w, &counts(s)?))) {
             Ok(v) => Json(v).into_response(),
@@ -141,8 +155,8 @@ async fn update(State(st): State<ApiState>, Path(id): Path<Uuid>, Json(req): Jso
     .await
 }
 
-async fn remove(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Response {
-    with_store(&st.store, move |s| match s.delete_workspace(id) {
+async fn remove(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> Response {
+    with_store(&st.store, v.scope, move |s| match s.delete_workspace(id) {
         Ok(n) => Json(json!({"deleted": id, "unlabelled": n})).into_response(),
         Err(e) => fail(e),
     })
@@ -157,15 +171,15 @@ struct AssignReq {
     request_id: Option<Uuid>,
 }
 
-async fn assign(State(st): State<ApiState>, Path(doc): Path<Uuid>, Json(req): Json<AssignReq>) -> Response {
-    let (human, dedupe) = (st.human, st.dedupe.clone());
-    with_store(&st.store, move |s| {
+async fn assign(State(st): State<ApiState>, v: Viewer, Path(doc): Path<Uuid>, Json(req): Json<AssignReq>) -> Response {
+    let (human, dedupe) = (v.human, st.dedupe.clone());
+    with_store(&st.store, v.scope, move |s| {
         if let Some(rid) = req.request_id
             && let Some(prev) = crate::mcp::durable_get(s, &dedupe, human, rid, crate::mcp::REQUEST_ID_TTL)
         {
             return Json(prev).into_response();
         }
-        let done = s.set_doc_workspace(doc, req.workspace_id).and_then(|resolved| {
+        let done = s.set_doc_workspace(doc, req.workspace_id, human).and_then(|resolved| {
             Ok(json!({"doc_id": doc, "label": s.doc_label(doc)?, "workspace_id": resolved}))
         });
         match done {
@@ -190,10 +204,70 @@ pub fn filter_param(s: &SqliteStore, raw: Option<&str>) -> Result<Option<Workspa
     }
 }
 
+async fn members(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> Response {
+    with_store(&st.store, v.scope, move |s| match s.workspace_members(id) {
+        Ok(m) => Json(json!({"members": m})).into_response(),
+        Err(e) => fail(e),
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct ShareReq {
+    /// a user id, or a name (case-insensitive)
+    user: String,
+    /// `editor` or `viewer`
+    role: String,
+}
+
+/// Share a workspace (human surface; the store checks ownership).
+async fn share(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>, Json(req): Json<ShareReq>) -> Response {
+    if let Err(r) = v.require_human_surface() {
+        return r;
+    }
+    let Some(role) = taisce_store::Role::parse(&req.role) else {
+        return fail(StoreError::InvalidOp(format!("role must be editor or viewer, got {:?}", req.role)));
+    };
+    with_store(&st.store, v.scope, move |s| {
+        let user = match s.auth_find_user(&req.user) {
+            Ok(Some(u)) => u,
+            Ok(None) => return fail(StoreError::NotFound(format!("user {:?}", req.user))),
+            Err(e) => return fail(e),
+        };
+        match s.share_workspace(id, user.id, role) {
+            Ok(()) => {
+                tracing::info!(target: crate::auth::AUDIT, event = "workspace.share", workspace = %id, user = %user.id, role = role.as_str(), by = ?v.user);
+                match s.workspace_members(id) {
+                    Ok(m) => Json(json!({"members": m})).into_response(),
+                    Err(e) => fail(e),
+                }
+            }
+            Err(e) => fail(e),
+        }
+    })
+    .await
+}
+
+async fn unshare(State(st): State<ApiState>, v: Viewer, Path((id, user)): Path<(Uuid, Uuid)>) -> Response {
+    if let Err(r) = v.require_human_surface() {
+        return r;
+    }
+    with_store(&st.store, v.scope, move |s| match s.unshare_workspace(id, user) {
+        Ok(removed) => {
+            tracing::info!(target: crate::auth::AUDIT, event = "workspace.unshare", workspace = %id, user = %user, by = ?v.user);
+            Json(json!({"removed": removed})).into_response()
+        }
+        Err(e) => fail(e),
+    })
+    .await
+}
+
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/workspaces", get(list).post(create))
         .route("/api/workspaces/{id}", patch(update).delete(remove))
+        .route("/api/workspaces/{id}/members", get(members).post(share))
+        .route("/api/workspaces/{id}/members/{user}", axum::routing::delete(unshare))
         .route("/api/docs/{id}/workspace", put(assign))
         .with_state(state)
 }
@@ -204,18 +278,19 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use taisce_store::{BlockStore, PrincipalKind};
-    use std::sync::{Arc, Mutex};
+    
     use tower::ServiceExt;
 
-    pub(crate) fn app() -> (Router, Arc<Mutex<SqliteStore>>, Uuid) {
+    pub(crate) fn app() -> (Router, taisce_store::SharedStore, Uuid) {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let human = store.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
         let dir = std::env::temp_dir().join(format!("taisce-ws-test-{}", Uuid::now_v7()));
-        let store = Arc::new(Mutex::new(store));
+        let store = taisce_store::SharedStore::new(store);
         let st = ApiState {
             changes: crate::changes::Feed::new(&store),
             store: store.clone(),
             human,
+            server_mode: false,
             db_path: dir.join("ks.db"),
             embedder: None,
             dedupe: crate::mcp::new_dedupe(),
@@ -239,7 +314,7 @@ mod tests {
     async fn crud_assign_filters_and_change_rows() {
         let (app, store, human) = app();
         let (a, b, loose) = {
-            let mut s = store.lock().unwrap();
+            let mut s = store.lock(taisce_store::Scope::System);
             let ops = |md: &str| taisce_store::import::to_ops(taisce_store::import::segment(md));
             let a = s.create_doc("Projects", None, human).unwrap().id;
             let b = s.create_doc_with_ops("Grimoire", Some(a), human, ops("workspace needle here\n")).unwrap().0.id;

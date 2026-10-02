@@ -13,7 +13,7 @@
 use crate::store_ext::with_store;
 use taisce_store::{BlockStore, SearchHit, SqliteStore};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub const ANSWERS_FOLDER: &str = "Answers";
@@ -70,7 +70,7 @@ pub fn retrieve(store: &SqliteStore, embedder: Option<&crate::embed::Embedder>, 
     // puts genuinely related prose well above ~0.3 cosine and unrelated
     // prose below; a relative cut against the best hit handles both a sharp
     // question (one clear winner) and a broad one (several good excerpts)
-    let scored = emb.search(question, 60);
+    let scored = emb.search(store, question, 60);
     let top = scored.first().map(|(_, s)| *s).unwrap_or(0.0);
     let dense_ids: Vec<Uuid> = scored
         .into_iter()
@@ -118,13 +118,9 @@ pub(crate) fn is_bare_heading(content: &str) -> bool {
     t.starts_with('#') && !t.contains('\n')
 }
 
+/// The viewer's own `Answers` root (ADR 0004: one per person).
 pub(crate) fn answers_folder_id(store: &SqliteStore) -> Option<Uuid> {
-    store
-        .list_docs()
-        .ok()?
-        .into_iter()
-        .find(|d| d.parent_id.is_none() && d.title == ANSWERS_FOLDER)
-        .map(|d| d.id)
+    store.own_root_titled(ANSWERS_FOLDER).ok().flatten().map(|d| d.id)
 }
 
 /// Answer docs must never be evidence for the next answer (they'd echo).
@@ -264,11 +260,7 @@ distinct parts, no preamble, no closing summary, no mention of \"excerpts\"."
 
 /// Ensure the `Answers` root folder exists (owned by the human).
 fn answers_folder(store: &mut SqliteStore, human: Uuid) -> taisce_store::Result<Uuid> {
-    if let Some(d) = store
-        .list_docs()?
-        .into_iter()
-        .find(|d| d.parent_id.is_none() && d.title == ANSWERS_FOLDER)
-    {
+    if let Some(d) = store.own_root_titled(ANSWERS_FOLDER)? {
         return Ok(d.id);
     }
     Ok(store.create_doc(ANSWERS_FOLDER, None, human)?.id)
@@ -293,7 +285,8 @@ pub struct Answer {
 }
 
 pub async fn ask(
-    store: Arc<Mutex<SqliteStore>>,
+    store: taisce_store::SharedStore,
+    scope: taisce_store::Scope,
     embedder: Option<Arc<crate::embed::Embedder>>,
     human: Uuid,
     question: String,
@@ -304,7 +297,7 @@ pub async fn ask(
     }
     let excerpts = {
         let (embedder, question) = (embedder.clone(), question.clone());
-        with_store(&store, move |s| retrieve(s, embedder.as_deref(), &question)).await
+        with_store(&store, scope, move |s| retrieve(s, embedder.as_deref(), &question)).await
     };
     let docs: std::collections::HashSet<Uuid> = excerpts.iter().map(|h| h.block.doc_id).collect();
     if excerpts.is_empty() {
@@ -331,7 +324,7 @@ pub async fn ask(
     let cited: Vec<(Uuid, i64)> = excerpts.iter().map(|h| (h.block.id, h.block.epoch)).collect();
     let (doc_id, agent) = {
         let title = title.clone();
-        with_store(&store, move |s| -> Result<(Uuid, Uuid), String> {
+        with_store(&store, scope, move |s| -> Result<(Uuid, Uuid), String> {
             let folder = answers_folder(s, human).map_err(|e| e.to_string())?;
             let agent = crate::store_ext::scribe_principal(s).map_err(|e| e.to_string())?;
             // through the gate under the agent, never apply (ledgered verdicts)
@@ -366,7 +359,7 @@ pub async fn ask(
                     format!("*The synthesis could not be written ({e}); the excerpts below stand on their own.*")
                 }
             };
-            with_store(&store, move |s| {
+            with_store(&store, scope, move |s| {
                 let Ok(tree) = s.read_doc(doc_id) else { return };
                 let placeholder = tree
                     .roots

@@ -32,7 +32,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
-use taisce_store::SqliteStore;
+use taisce_store::{Scope, SharedStore, SqliteStore};
 use sha2::Digest as _;
 use std::sync::{Arc, Mutex};
 use webauthn_rs::prelude::Url;
@@ -116,14 +116,14 @@ impl AuthConfig {
 #[derive(Clone)]
 pub struct AuthState {
     pub cfg: Arc<AuthConfig>,
-    pub store: Arc<Mutex<SqliteStore>>,
+    pub store: SharedStore,
     pub webauthn: Arc<webauthn_rs::Webauthn>,
     pub pending: Arc<Mutex<passkey::Pending>>,
     pub limiter: ratelimit::Limiter,
 }
 
 impl AuthState {
-    pub fn new(cfg: AuthConfig, store: Arc<Mutex<SqliteStore>>) -> anyhow::Result<Self> {
+    pub fn new(cfg: AuthConfig, store: SharedStore) -> anyhow::Result<Self> {
         let origin = Url::parse(&cfg.base)?;
         let webauthn = webauthn_rs::WebauthnBuilder::new(&cfg.rp_id, &origin)
             .map_err(|e| anyhow::anyhow!("webauthn config: {e}"))?
@@ -239,6 +239,9 @@ pub struct Authenticated {
     pub owner_app: bool,
     /// The authorizing user's human principal.
     pub human: uuid::Uuid,
+    /// ADR 0004: the user is the instance owner (the first `owner`-role
+    /// user): server-level surfaces (backups, diagnostics) are theirs.
+    pub instance_owner: bool,
 }
 
 /// Paths reachable with no token: discovery, the OAuth endpoints, the
@@ -308,11 +311,12 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 pub async fn authenticate(st: &AuthState, token: &str) -> Option<Authenticated> {
     let hash = hash_secret(token);
     let now = now();
-    crate::store_ext::with_store(&st.store, move |s| {
+    crate::store_ext::with_store(&st.store, Scope::System, move |s| {
         let grant = s.oauth_access_grant(&hash, now).ok()??;
         let client = s.oauth_client(&grant.client_id).ok().flatten();
         let name = client.as_ref().map(|c| c.client_name.clone()).unwrap_or_default();
         let human = s.auth_user(grant.user_id).ok().flatten()?.principal_id;
+        let instance_owner = s.instance_owner().ok().flatten() == Some(grant.user_id);
         Some(Authenticated {
             user_id: grant.user_id,
             grant_id: grant.id,
@@ -320,6 +324,7 @@ pub async fn authenticate(st: &AuthState, token: &str) -> Option<Authenticated> 
             owner_app: client.is_some_and(|c| is_owner_app(&c.redirect_uris)),
             human,
             client_id: grant.client_id,
+            instance_owner,
         })
     })
     .await
@@ -332,12 +337,13 @@ pub async fn authenticate(st: &AuthState, token: &str) -> Option<Authenticated> 
 pub async fn authenticate_pat(st: &AuthState, token: &str, ip: String) -> Option<Authenticated> {
     let hash = hash_secret(token);
     let now = now();
-    let (t, human, first) = crate::store_ext::with_store(&st.store, move |s| {
+    let (t, human, first, instance_owner) = crate::store_ext::with_store(&st.store, Scope::System, move |s| {
         let t = s.auth_api_token_by_hash(&hash).ok()??;
         let human = s.auth_user(t.user_id).ok().flatten()?.principal_id;
         let stale = t.last_used_at.is_none_or(|u| u <= now - taisce_store::auth::API_TOKEN_TOUCH_EVERY);
         let first = stale && s.auth_touch_api_token(t.id, now).unwrap_or(false) && t.last_used_at.is_none();
-        Some((t, human, first))
+        let instance_owner = s.instance_owner().ok().flatten() == Some(t.user_id);
+        Some((t, human, first, instance_owner))
     })
     .await?;
     if first {
@@ -351,6 +357,7 @@ pub async fn authenticate_pat(st: &AuthState, token: &str, ip: String) -> Option
         owner_app: false,
         human,
         client_id,
+        instance_owner,
     })
 }
 
@@ -534,7 +541,7 @@ fn rpc_summary(body: &[u8]) -> (String, String) {
 /// Sweep expired codes/tokens/links and stale login ceremonies, every 10 min.
 pub async fn cleanup_loop(st: AuthState) {
     loop {
-        let n = crate::store_ext::with_store(&st.store, |s| s.oauth_cleanup(now())).await;
+        let n = crate::store_ext::with_store(&st.store, Scope::System, |s| s.oauth_cleanup(now())).await;
         match n {
             Ok(n) if n > 0 => tracing::info!(rows = n, "auth cleanup"),
             Ok(_) => {}

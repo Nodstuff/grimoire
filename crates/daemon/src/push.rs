@@ -25,6 +25,7 @@
 use crate::auth::Authenticated;
 use crate::changes::Feed;
 use crate::store_ext::with_store;
+use taisce_store::Scope;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -32,7 +33,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, post};
 use axum::{Extension, Json, Router};
 use base64::Engine as _;
-use taisce_store::SqliteStore;
 use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
 use serde::Deserialize;
@@ -322,11 +322,19 @@ impl Coalescer {
 
     /// A change landed: every token in `active` owes a nudge; tokens no
     /// longer active are forgotten.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn changed(&mut self, active: impl IntoIterator<Item = String>) {
+        self.changed_for(active.into_iter().map(|t| (t, true)));
+    }
+
+    /// A change landed that only some devices may hear about (ADR 0004: a
+    /// device's user must be able to see a changed doc): `(token, owes)`
+    /// for every active token; tokens no longer active are forgotten.
+    pub fn changed_for(&mut self, active: impl IntoIterator<Item = (String, bool)>) {
         let mut next = HashMap::new();
-        for t in active {
+        for (t, owes) in active {
             let mut slot = self.slots.remove(&t).unwrap_or_default();
-            slot.pending = true;
+            slot.pending |= owes;
             next.insert(t, slot);
         }
         self.slots = next;
@@ -357,10 +365,11 @@ impl Coalescer {
 }
 
 /// Follow the journal head and nudge every active device, coalesced.
-pub async fn push_loop<S: Sender>(store: Arc<Mutex<SqliteStore>>, feed: Feed, sender: Arc<S>, window: Duration) {
+pub async fn push_loop<S: Sender>(store: taisce_store::SharedStore, feed: Feed, sender: Arc<S>, window: Duration) {
     let mut head = feed.subscribe();
     // a boot is not a change: start from the journal as it stands
-    let mut seen = with_store(&store, |s| s.latest_change_seq()).await.unwrap_or(0);
+    // the fan-out sees every user's rows: System, then per-user filtering
+    let mut seen = with_store(&store, Scope::System, |s| s.latest_change_seq()).await.unwrap_or(0);
     let mut co = Coalescer::new(window);
     let mut envs: HashMap<String, String> = HashMap::new();
     loop {
@@ -372,11 +381,21 @@ pub async fn push_loop<S: Sender>(store: Arc<Mutex<SqliteStore>>, feed: Feed, se
                 }
                 let seq = *head.borrow_and_update();
                 if seq != seen {
+                    let since = seen;
                     seen = seq;
-                    match with_store(&store, |s| s.push_devices_active()).await {
-                        Ok(ds) => {
+                    // a device hears about a change only if its user can see
+                    // one of the changed docs (or a row addressed to them)
+                    let got = with_store(&store, Scope::System, move |s| {
+                        Ok::<_, taisce_store::StoreError>((s.push_devices_active()?, s.change_audience(since)?))
+                    })
+                    .await;
+                    match got {
+                        Ok((ds, audience)) => {
                             envs = ds.iter().map(|d| (d.token.clone(), d.env.clone())).collect();
-                            co.changed(ds.into_iter().map(|d| d.token));
+                            co.changed_for(ds.into_iter().map(|d| {
+                                let owes = audience.contains(&d.user_id);
+                                (d.token, owes)
+                            }));
                         }
                         Err(e) => tracing::warn!("push: reading devices failed: {e}"),
                     }
@@ -399,7 +418,7 @@ pub async fn push_loop<S: Sender>(store: Arc<Mutex<SqliteStore>>, feed: Feed, se
             }
             let t = token.clone();
             if let Err(e) =
-                with_store(&store, move |s| s.push_device_result(&t, err.as_deref(), disable, crate::auth::now())).await
+                with_store(&store, Scope::System, move |s| s.push_device_result(&t, err.as_deref(), disable, crate::auth::now())).await
             {
                 tracing::warn!("push: recording the outcome failed: {e}");
             }
@@ -411,7 +430,7 @@ pub async fn push_loop<S: Sender>(store: Arc<Mutex<SqliteStore>>, feed: Feed, se
 
 #[derive(Clone)]
 pub struct DevicesState {
-    pub store: Arc<Mutex<SqliteStore>>,
+    pub store: taisce_store::SharedStore,
     /// `--apns-env`: the env of a registration that names none.
     pub default_env: String,
 }
@@ -477,7 +496,7 @@ async fn register(
         return error(StatusCode::BAD_REQUEST, "app_version: at most 64 bytes");
     }
     let now = crate::auth::now();
-    with_store(&st.store, move |s| match s.push_device_upsert(user, &token, &b.platform, &env, &b.app_version, now) {
+    with_store(&st.store, Scope::User(user), move |s| match s.push_device_upsert(user, &token, &b.platform, &env, &b.app_version, now) {
         Ok(_) => Json(json!({"ok": true})).into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
     })
@@ -496,7 +515,7 @@ async fn unregister(
     let Some(token) = normalise_token(&token) else {
         return error(StatusCode::BAD_REQUEST, "token: expected the APNs device token in hex");
     };
-    with_store(&st.store, move |s| match s.push_device_delete(user, &token) {
+    with_store(&st.store, Scope::User(user), move |s| match s.push_device_delete(user, &token) {
         Ok(true) => Json(json!({"ok": true})).into_response(),
         Ok(false) => error(StatusCode::NOT_FOUND, "no such device"),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -620,7 +639,7 @@ mod tests {
 
     struct T {
         app: Router,
-        store: Arc<Mutex<SqliteStore>>,
+        store: taisce_store::SharedStore,
         tom: uuid::Uuid,
         ann: uuid::Uuid,
     }
@@ -633,16 +652,17 @@ mod tests {
             principal: "claude:test".into(),
             owner_app,
             human: uuid::Uuid::now_v7(),
+            instance_owner: false,
         }
     }
 
     fn setup() -> T {
-        let mut s = SqliteStore::open_in_memory().unwrap();
+        let mut s = taisce_store::SqliteStore::open_in_memory().unwrap();
         let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
         let tom = s.auth_ensure_owner(p, "tom", 1).unwrap().id;
         // another user: deleting needs no row of theirs, only a different id
         let ann = uuid::Uuid::now_v7();
-        let store = Arc::new(Mutex::new(s));
+        let store = taisce_store::SharedStore::new(s);
         let app = router(DevicesState { store: store.clone(), default_env: "production".into() });
         T { app, store, tom, ann }
     }
@@ -669,7 +689,7 @@ mod tests {
         let (status, v) = call(&t, "POST", "/api/devices", Some(who(t.tom, true)), Some(body.clone())).await;
         assert_eq!((status, v), (StatusCode::OK, json!({"ok": true})));
         {
-            let s = t.store.lock().unwrap();
+            let s = t.store.lock(taisce_store::Scope::System);
             let d = s.push_devices_for_user(t.tom).unwrap();
             assert_eq!(d.len(), 1);
             assert_eq!((d[0].token.as_str(), d[0].env.as_str(), d[0].app_version.as_str()), (TOKEN, "sandbox", "1.0 (3)"));
@@ -677,7 +697,7 @@ mod tests {
         // env defaults to --apns-env; a re-send refreshes in place
         let (status, _) = call(&t, "POST", "/api/devices", Some(who(t.tom, true)), Some(json!({"token": TOKEN}))).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(t.store.lock().unwrap().push_device(TOKEN).unwrap().unwrap().env, "production");
+        assert_eq!(t.store.lock(taisce_store::Scope::System).push_device(TOKEN).unwrap().unwrap().env, "production");
         // bad input is a 400 with an error
         for b in [
             json!({"token": "nothex!"}),
@@ -695,7 +715,7 @@ mod tests {
         assert_eq!(call(&t, "DELETE", &uri, None, None).await.0, StatusCode::FORBIDDEN);
         assert_eq!(call(&t, "DELETE", &uri, Some(who(t.tom, true)), None).await.0, StatusCode::OK);
         assert_eq!(call(&t, "DELETE", &uri, Some(who(t.tom, true)), None).await.0, StatusCode::NOT_FOUND);
-        assert!(t.store.lock().unwrap().push_device(TOKEN).unwrap().is_none());
+        assert!(t.store.lock(taisce_store::Scope::System).push_device(TOKEN).unwrap().is_none());
     }
 
     /// Records sends; answers `Gone` for tokens starting `dead`.
@@ -730,7 +750,7 @@ mod tests {
         let live = "aa".repeat(32);
         let dead = format!("dead{}", "00".repeat(30));
         {
-            let mut s = t.store.lock().unwrap();
+            let mut s = t.store.lock(taisce_store::Scope::System);
             s.push_device_upsert(t.tom, &live, "ios", "sandbox", "", 1).unwrap();
             s.push_device_upsert(t.tom, &dead, "ios", "production", "", 1).unwrap();
             let author = s.list_principals().unwrap()[0].id;
@@ -740,11 +760,11 @@ mod tests {
         let mock = Arc::new(Mock::default());
         let window = Duration::from_millis(300);
         let task = tokio::spawn(push_loop(t.store.clone(), feed, mock.clone(), window));
-        let author = t.store.lock().unwrap().list_principals().unwrap()[0].id;
+        let author = t.store.lock(taisce_store::Scope::System).list_principals().unwrap()[0].id;
         // booting is not a change
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(mock.sent.lock().unwrap().is_empty(), "no nudge at boot");
-        t.store.lock().unwrap().create_doc("one", None, author).unwrap();
+        t.store.lock(taisce_store::Scope::System).create_doc("one", None, author).unwrap();
         wait_for("the first nudges", || mock.sent.lock().unwrap().len() == 2).await;
         {
             let sent = mock.sent.lock().unwrap();
@@ -752,14 +772,14 @@ mod tests {
             assert!(sent.contains(&("production".into(), dead.clone(), 2)));
         }
         wait_for("the gone token disabled", || {
-            t.store.lock().unwrap().push_device(&dead).unwrap().unwrap().disabled_at.is_some()
+            t.store.lock(taisce_store::Scope::System).push_device(&dead).unwrap().unwrap().disabled_at.is_some()
         })
         .await;
-        let d = t.store.lock().unwrap().push_device(&dead).unwrap().unwrap();
+        let d = t.store.lock(taisce_store::Scope::System).push_device(&dead).unwrap().unwrap();
         assert_eq!(d.last_error.as_deref(), Some("410 Unregistered"));
         // a burst inside the window: one more nudge, to the live token only, carrying the latest seq
         for i in 0..3 {
-            t.store.lock().unwrap().create_doc(&format!("burst {i}"), None, author).unwrap();
+            t.store.lock(taisce_store::Scope::System).create_doc(&format!("burst {i}"), None, author).unwrap();
         }
         wait_for("the coalesced nudge", || mock.sent.lock().unwrap().len() == 3).await;
         tokio::time::sleep(window + Duration::from_millis(200)).await;
@@ -767,7 +787,7 @@ mod tests {
         assert_eq!(sent.len(), 3, "{sent:?}");
         assert_eq!(sent[2].1, live);
         assert_eq!(sent[2].2, 5, "the newest head");
-        assert!(t.store.lock().unwrap().push_device(&live).unwrap().unwrap().last_sent_at.is_some());
+        assert!(t.store.lock(taisce_store::Scope::System).push_device(&live).unwrap().unwrap().last_sent_at.is_some());
         task.abort();
     }
 }

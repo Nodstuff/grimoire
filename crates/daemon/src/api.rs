@@ -6,17 +6,24 @@ use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use crate::store_ext::with_store;
-use taisce_store::{BlockStore, DocStatus, OpInput, ReviewDecision, SqliteStore};
+use crate::viewer::Viewer;
+use axum::response::IntoResponse;
+use taisce_store::{BlockStore, DocStatus, OpInput, ReviewDecision, Scope, SharedStore, SqliteStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct ApiState {
-    pub store: Arc<Mutex<SqliteStore>>,
+    pub store: SharedStore,
+    /// LOCAL mode's human principal (SERVER mode: each user's own, from
+    /// their token — see `Viewer`).
     pub human: Uuid,
+    /// SERVER mode (`--public-url`): a request without a token's identity is
+    /// refused, never treated as the local user (ADR 0004).
+    pub server_mode: bool,
     /// The live database file — backups live beside it.
     pub db_path: std::path::PathBuf,
     /// Block embeddings for ask-the-vault; None if the model failed to load
@@ -34,9 +41,9 @@ pub struct ApiState {
 /// its writes go through the gate as an agent's. Absent → the human.
 pub const PRINCIPAL_HEADER: &str = "taisce-principal";
 
-fn resolve_principal(st: &ApiState, headers: &HeaderMap, s: &mut SqliteStore) -> Result<Uuid, String> {
+fn resolve_principal(human: Uuid, headers: &HeaderMap, s: &mut SqliteStore) -> Result<Uuid, String> {
     match headers.get(PRINCIPAL_HEADER) {
-        None => Ok(st.human),
+        None => Ok(human),
         Some(v) => {
             let name = v
                 .to_str()
@@ -71,8 +78,8 @@ struct DocsQuery {
     workspace: Option<String>,
 }
 
-async fn docs(State(st): State<ApiState>, Query(q): Query<DocsQuery>) -> ([(&'static str, String); 1], Json<Value>) {
-    let (seq, body) = with_store(&st.store, move |s| {
+async fn docs(State(st): State<ApiState>, v: Viewer, Query(q): Query<DocsQuery>) -> ([(&'static str, String); 1], Json<Value>) {
+    let (seq, body) = with_store(&st.store, v.scope, move |s| {
         let filter = match crate::workspaces::filter_param(s, q.workspace.as_deref()) {
             Ok(f) => f,
             Err(m) => return (0, Json(json!({"error": m}))),
@@ -122,9 +129,9 @@ fn docs_json(s: &mut SqliteStore, filter: Option<taisce_store::WorkspaceFilter>)
 }
 
 /// A missing (or hard-deleted) doc is a real 404 with `{error}`.
-async fn doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> axum::response::Response {
+async fn doc(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> axum::response::Response {
     use axum::response::IntoResponse;
-    with_store(&st.store, move |s| match s.read_doc(id) {
+    with_store(&st.store, v.scope, move |s| match s.read_doc(id) {
         Ok(t) => Json(json!(t)).into_response(),
         Err(e @ taisce_store::StoreError::NotFound(_)) => {
             (axum::http::StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))).into_response()
@@ -134,8 +141,8 @@ async fn doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> axum::response
     .await
 }
 
-async fn backlinks(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn backlinks(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         match s.backlinks(id) {
             Ok(b) => Json(json!(b)),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -175,8 +182,8 @@ pub(crate) fn decorate_review_items(s: &SqliteStore, q: Vec<taisce_store::Review
 
 /// Open review items for ONE doc — the in-editor review rail's data source.
 /// Same item shape as /api/queue.
-async fn doc_review(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn doc_review(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         match s.review_queue(Some(id)) {
             Ok(q) => Json(json!(decorate_review_items(&s, q))),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -185,8 +192,8 @@ async fn doc_review(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Va
     .await
 }
 
-async fn queue(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn queue(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         match s.review_queue(None) {
             Ok(q) => Json(json!(decorate_review_items(&s, q))),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -201,16 +208,16 @@ struct ResolveReq {
     decision: String,
 }
 
-async fn resolve(State(st): State<ApiState>, Json(req): Json<ResolveReq>) -> Json<Value> {
+async fn resolve(State(st): State<ApiState>, v: Viewer, Json(req): Json<ResolveReq>) -> Json<Value> {
     let decision = match req.decision.as_str() {
         "accept" => ReviewDecision::Accept,
         "decline" => ReviewDecision::Decline,
         other => return Json(json!({"error": format!("bad decision: {other}")})),
     };
     let store = st.store.clone();
-    let st = st.clone();
-    with_store(&store, move |s| {
-        match s.resolve(req.annotation_id, st.human, decision) {
+    let _st = st.clone();
+    with_store(&store, v.scope, move |s| {
+        match s.resolve(req.annotation_id, v.human, decision) {
             Ok(receipt) => Json(json!({"ok": true, "receipt": receipt})),
             Err(e) => Json(json!({"error": e.to_string()})),
         }
@@ -226,18 +233,18 @@ struct ResolveBulkReq {
 
 /// Bulk resolve as the human: one request, per-item outcomes. Errors on
 /// individual items (already resolved, proposer==approver) don't stop the rest.
-async fn resolve_bulk(State(st): State<ApiState>, Json(req): Json<ResolveBulkReq>) -> Json<Value> {
+async fn resolve_bulk(State(st): State<ApiState>, v: Viewer, Json(req): Json<ResolveBulkReq>) -> Json<Value> {
     let decision = match req.decision.as_str() {
         "accept" => ReviewDecision::Accept,
         "decline" => ReviewDecision::Decline,
         other => return Json(json!({"error": format!("bad decision: {other}")})),
     };
     let store = st.store.clone();
-    let st = st.clone();
-    with_store(&store, move |s| {
+    let _st = st.clone();
+    with_store(&store, v.scope, move |s| {
         let (mut done, mut failed) = (0usize, Vec::new());
         for id in req.annotation_ids {
-            match s.resolve(id, st.human, decision) {
+            match s.resolve(id, v.human, decision) {
                 Ok(_) => done += 1,
                 Err(e) => failed.push(json!({"id": id, "error": e.to_string()})),
             }
@@ -261,9 +268,9 @@ struct SearchQuery {
 /// ⌘P. Same `SearchHit[]` shape as ever, ranked by `retrieval::search_ranked`
 /// (exact phrase first, then whole words, then fuzzy/by-meaning) so the
 /// palette stops leading with trigram noise. Answers docs stay findable here.
-async fn search(State(st): State<ApiState>, Query(p): Query<SearchQuery>) -> Json<Value> {
+async fn search(State(st): State<ApiState>, v: Viewer, Query(p): Query<SearchQuery>) -> Json<Value> {
     let embedder = st.embedder.clone();
-    with_store(&st.store, move |s| {
+    with_store(&st.store, v.scope, move |s| {
         let workspace = match crate::workspaces::filter_param(s, p.workspace.as_deref()) {
             Ok(w) => w,
             Err(m) => return Json(json!({"error": m})),
@@ -282,8 +289,8 @@ async fn search(State(st): State<ApiState>, Query(p): Query<SearchQuery>) -> Jso
     .await
 }
 
-async fn tags(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn tags(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         match s.list_tags() {
             Ok(t) => Json(json!(t)),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -292,8 +299,8 @@ async fn tags(State(st): State<ApiState>) -> Json<Value> {
     .await
 }
 
-async fn runs(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn runs(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         match s.list_runs(20) {
             Ok(r) => Json(json!(r)),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -315,15 +322,15 @@ struct ProposeReq {
 
 /// Writes: propose as the human (or the `Taisce-Principal` agent) —
 /// current-epoch ops green and apply directly, stale ones are scored per op.
-async fn propose(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json<ProposeReq>) -> Json<Value> {
+async fn propose(State(st): State<ApiState>, v: Viewer, headers: HeaderMap, Json(req): Json<ProposeReq>) -> Json<Value> {
     if let Some(m) = refuse_new_canvas(&req.ops) {
         return Json(json!({"error": m}));
     }
     let store = st.store.clone();
     let st = st.clone();
     let headers = headers.clone();
-    with_store(&store, move |s| {
-        let principal = match resolve_principal(&st, &headers, s) {
+    with_store(&store, v.scope, move |s| {
+        let principal = match resolve_principal(v.human, &headers, s) {
             Ok(p) => p,
             Err(m) => return Json(json!({"error": m})),
         };
@@ -362,15 +369,15 @@ struct ProposeMarkdownReq {
 /// caller's stale view over others' edits) — `stale_base` carries the missed
 /// ops so the caller can re-read, re-apply and re-send.
 async fn propose_markdown(
-    State(st): State<ApiState>,
+    State(st): State<ApiState>, v: Viewer,
     headers: HeaderMap,
     Json(req): Json<ProposeMarkdownReq>,
 ) -> Json<Value> {
     let store = st.store.clone();
     let st = st.clone();
     let headers = headers.clone();
-    with_store(&store, move |s| {
-        let principal = match resolve_principal(&st, &headers, s) {
+    with_store(&store, v.scope, move |s| {
+        let principal = match resolve_principal(v.human, &headers, s) {
             Ok(p) => p,
             Err(m) => return Json(json!({"error": m})),
         };
@@ -427,12 +434,12 @@ struct CreateDocReq {
     workspace_id: Option<Uuid>,
 }
 
-async fn create_doc(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json<CreateDocReq>) -> Json<Value> {
+async fn create_doc(State(st): State<ApiState>, v: Viewer, headers: HeaderMap, Json(req): Json<CreateDocReq>) -> Json<Value> {
     let store = st.store.clone();
     let st = st.clone();
     let headers = headers.clone();
-    with_store(&store, move |s| {
-        let principal = match resolve_principal(&st, &headers, s) {
+    with_store(&store, v.scope, move |s| {
+        let principal = match resolve_principal(v.human, &headers, s) {
             Ok(p) => p,
             Err(m) => return Json(json!({"error": m})),
         };
@@ -454,7 +461,7 @@ async fn create_doc(State(st): State<ApiState>, headers: HeaderMap, Json(req): J
         match s.create_doc(&req.title, req.parent_doc_id, principal) {
             Ok(d) => {
                 if let (Some(w), None) = (req.workspace_id, req.parent_doc_id)
-                    && let Err(e) = s.set_doc_workspace(d.id, Some(w))
+                    && let Err(e) = s.set_doc_workspace(d.id, Some(w), principal)
                 {
                     return Json(json!({"error": e.to_string()}));
                 }
@@ -471,8 +478,8 @@ async fn create_doc(State(st): State<ApiState>, headers: HeaderMap, Json(req): J
     .await
 }
 
-async fn principals(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn principals(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         match s.list_principals() {
             Ok(p) => Json(json!(p)),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -482,8 +489,8 @@ async fn principals(State(st): State<ApiState>) -> Json<Value> {
 }
 
 /// Per-doc op history, newest first — the provenance panel (5.4).
-async fn history(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn history(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         // newest first, capped in SQL (was: whole ledger, reversed, truncated)
         match s.ops_for_doc_limited(id, 100) {
             Ok(ops) => {
@@ -516,12 +523,12 @@ struct CommentReq {
     reply_to: Option<Uuid>,
 }
 
-async fn add_comment(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json<CommentReq>) -> Json<Value> {
+async fn add_comment(State(st): State<ApiState>, v: Viewer, headers: HeaderMap, Json(req): Json<CommentReq>) -> Json<Value> {
     let store = st.store.clone();
-    let st = st.clone();
+    let _st = st.clone();
     let headers = headers.clone();
-    with_store(&store, move |s| {
-        let principal = match resolve_principal(&st, &headers, s) {
+    with_store(&store, v.scope, move |s| {
+        let principal = match resolve_principal(v.human, &headers, s) {
             Ok(p) => p,
             Err(m) => return Json(json!({"error": m})),
         };
@@ -535,8 +542,8 @@ async fn add_comment(State(st): State<ApiState>, headers: HeaderMap, Json(req): 
 
 /// Graph view data (5.10): nodes = docs (tinted by tending principal —
 /// the principal of the doc's last applied op), links = resolved wikilinks.
-async fn graph(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn graph(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         let docs = match s.list_docs() {
             Ok(d) => d,
             Err(e) => return Json(json!({"error": e.to_string()})),
@@ -648,7 +655,7 @@ struct StatusReq {
 }
 
 async fn set_status(
-    State(st): State<ApiState>,
+    State(st): State<ApiState>, v: Viewer,
     Path(id): Path<Uuid>,
     Json(req): Json<StatusReq>,
 ) -> Json<Value> {
@@ -659,7 +666,7 @@ async fn set_status(
             None => return Json(json!({"error": format!("bad status: {v}")})),
         },
     };
-    with_store(&st.store, move |s| {
+    with_store(&st.store, v.scope, move |s| {
         match s.set_doc_status(id, status) {
             Ok(()) => Json(json!({"ok": true})),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -669,8 +676,8 @@ async fn set_status(
 }
 
 /// Agent audit flags: comments by agent principals, queue-adjacent surface.
-async fn flags(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn flags(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         match s.agent_flags() {
             Ok(rows) => Json(json!(
                 rows.into_iter()
@@ -694,10 +701,10 @@ struct DismissReq {
 }
 
 /// Dismiss a flag: delete the comment block through the gate as the human.
-async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -> Json<Value> {
+async fn dismiss_flag(State(st): State<ApiState>, v: Viewer, Json(req): Json<DismissReq>) -> Json<Value> {
     let store = st.store.clone();
-    let st = st.clone();
-    with_store(&store, move |s| {
+    let _st = st.clone();
+    with_store(&store, v.scope, move |s| {
         let block = match s.read_block(req.comment_id) {
             Ok(b) if b.block_type == taisce_store::BlockType::Comment => b,
             Ok(_) => return Json(json!({"error": "not a comment block"})),
@@ -713,7 +720,7 @@ async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -
             },
             source_refs: vec!["flag:dismissed".into()],
         };
-        match s.propose(block.doc_id, epoch, st.human, vec![op]) {
+        match s.propose(block.doc_id, epoch, v.human, vec![op]) {
             Ok(_) => Json(json!({"ok": true})),
             Err(e) => Json(json!({"error": e.to_string()})),
         }
@@ -723,8 +730,8 @@ async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -
 
 /// Tendings covering a doc: gardeners scoped to it or to any ancestor.
 /// The opt-in surface — configure agents where the docs live.
-async fn tendings(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn tendings(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         // ancestor chain of this doc, self first
         let mut chain = vec![id];
         let mut cur = id;
@@ -766,8 +773,8 @@ async fn tendings(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Valu
 /// Data change stamp: the app polls this and live-refreshes whatever view is
 /// open when it moves — gardener writes, MCP proposals from other sessions,
 /// queue resolutions all appear without a reload.
-async fn stamp(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn stamp(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         match s.change_stamp() {
             // version/build ride along so the app needs one poll, not two
             Ok(v) => Json(json!({"stamp": v, "version": env!("CARGO_PKG_VERSION"), "build": build_stamp(), "git": crate::GIT_SHA})),
@@ -826,7 +833,14 @@ fn tail_lines(path: &std::path::Path, n: usize) -> String {
 
 /// What to paste into a bug report: version, log location and the last 200
 /// log lines.
-async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
+async fn diagnostics(State(st): State<ApiState>, v: Viewer) -> axum::response::Response {
+    if let Err(r) = v.require_admin() {
+        return r;
+    }
+    diagnostics_inner(st).await.into_response()
+}
+
+async fn diagnostics_inner(st: ApiState) -> Json<Value> {
     let path = crate::log_path();
     let tail = path.as_deref().map(|p| tail_lines(p, 200)).unwrap_or_default();
     Json(json!({
@@ -855,11 +869,11 @@ struct MoveDocReq {
 }
 
 async fn move_doc(
-    State(st): State<ApiState>,
+    State(st): State<ApiState>, v: Viewer,
     Path(id): Path<Uuid>,
     Json(req): Json<MoveDocReq>,
 ) -> Json<Value> {
-    with_store(&st.store, move |s| {
+    with_store(&st.store, v.scope, move |s| {
         match s.move_doc(id, req.parent_id, req.sort_key.as_deref()) {
             Ok(()) => Json(json!({"ok": true})),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -880,13 +894,13 @@ fn rewrite_links(content: &str, old: &str, new: &str) -> String {
 }
 
 async fn rename_doc(
-    State(st): State<ApiState>,
+    State(st): State<ApiState>, v: Viewer,
     Path(id): Path<Uuid>,
     Json(req): Json<RenameReq>,
 ) -> Json<Value> {
     let store = st.store.clone();
-    let st = st.clone();
-    with_store(&store, move |s| {
+    let _st = st.clone();
+    with_store(&store, v.scope, move |s| {
         let old_title = match s.get_doc(id) {
             Ok(d) => d.title,
             Err(e) => return Json(json!({"error": e.to_string()})),
@@ -905,6 +919,9 @@ async fn rename_doc(
                 by_doc.entry(doc).or_default().push((block, content));
             }
             for (doc, blocks) in by_doc {
+                if !s.can_write_doc(doc) {
+                    continue;
+                }
                 let Ok(d) = s.get_doc(doc) else { continue };
                 let ops: Vec<OpInput> = blocks
                     .into_iter()
@@ -920,7 +937,7 @@ async fn rename_doc(
                     continue;
                 }
                 rewritten += ops.len();
-                let _ = s.propose(doc, d.current_epoch, st.human, ops);
+                let _ = s.propose(doc, d.current_epoch, v.human, ops);
             }
         }
         Json(json!({"ok": true, "links_rewritten": rewritten}))
@@ -932,8 +949,8 @@ fn ks_store_op_replace(target: Uuid, content: String) -> taisce_store::OpKind {
     taisce_store::OpKind::Replace { target, content }
 }
 
-async fn delete_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    with_store(&st.store, move |s| match s.delete_doc(id) {
+async fn delete_doc(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| match s.delete_doc(id) {
         Ok(n) => Json(json!({"ok": true, "deleted": n})),
         Err(e) => Json(json!({"error": e.to_string()})),
     })
@@ -941,7 +958,14 @@ async fn delete_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Va
 }
 
 /// Backups: list snapshots (GET) or take one now (POST).
-async fn backups(State(st): State<ApiState>) -> Json<Value> {
+async fn backups(State(st): State<ApiState>, v: Viewer) -> axum::response::Response {
+    if let Err(r) = v.require_admin() {
+        return r;
+    }
+    backups_inner(st).await.into_response()
+}
+
+async fn backups_inner(st: ApiState) -> Json<Value> {
     Json(json!({
         "dir": crate::backup::backup_dir(&st.db_path).to_string_lossy(),
         "backups": crate::backup::list_backups(&st.db_path),
@@ -957,7 +981,14 @@ struct BackupReq {
     to: Option<String>,
 }
 
-async fn backup_now(State(st): State<ApiState>, body: axum::body::Bytes) -> Json<Value> {
+async fn backup_now(State(st): State<ApiState>, v: Viewer, body: axum::body::Bytes) -> axum::response::Response {
+    if let Err(r) = v.require_admin() {
+        return r;
+    }
+    backup_now_inner(st, body).await.into_response()
+}
+
+async fn backup_now_inner(st: ApiState, body: axum::body::Bytes) -> Json<Value> {
     let req: BackupReq = if body.iter().all(u8::is_ascii_whitespace) {
         BackupReq::default()
     } else {
@@ -981,7 +1012,14 @@ async fn backup_now(State(st): State<ApiState>, body: axum::body::Bytes) -> Json
 
 /// Open the backups folder in the file manager: the snapshot toast names a
 /// path nobody wants to type. Local UI only, like every `/api` route.
-async fn reveal_backups(State(st): State<ApiState>) -> Json<Value> {
+async fn reveal_backups(State(st): State<ApiState>, v: Viewer) -> axum::response::Response {
+    if let Err(r) = v.require_admin() {
+        return r;
+    }
+    reveal_backups_inner(st).await.into_response()
+}
+
+async fn reveal_backups_inner(st: ApiState) -> Json<Value> {
     let dir = crate::backup::backup_dir(&st.db_path);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Json(json!({"error": e.to_string()}));
@@ -1005,7 +1043,14 @@ async fn reveal_backups(State(st): State<ApiState>) -> Json<Value> {
 
 /// Export every doc as a markdown tree under ~/Downloads (the escape hatch,
 /// in-app). Titles become file names; docs with children become folders.
-async fn export_vault(State(st): State<ApiState>) -> Json<Value> {
+async fn export_vault(State(st): State<ApiState>, v: Viewer) -> axum::response::Response {
+    if let Err(r) = v.require_admin() {
+        return r;
+    }
+    export_vault_inner(st, v).await.into_response()
+}
+
+async fn export_vault_inner(st: ApiState, v: Viewer) -> Json<Value> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let stamp = chrono::Utc::now().format("%Y-%m-%d-%H%M").to_string();
     let dir = std::path::PathBuf::from(home)
@@ -1014,7 +1059,7 @@ async fn export_vault(State(st): State<ApiState>) -> Json<Value> {
     let store = st.store.clone();
     let out = dir.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = store.lock(v.scope);
         taisce_store::export::export_vault(&*s, &out)
     })
     .await;
@@ -1026,8 +1071,8 @@ async fn export_vault(State(st): State<ApiState>) -> Json<Value> {
 }
 
 /// One doc as markdown, for "copy as Markdown" in the app.
-async fn doc_markdown(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    with_store(&st.store, move |s| match taisce_store::export::export_doc(&*s, id) {
+async fn doc_markdown(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| match taisce_store::export::export_doc(&*s, id) {
         Ok(md) => Json(json!({"markdown": md})),
         Err(e) => Json(json!({"error": e.to_string()})),
     })
@@ -1037,8 +1082,15 @@ async fn doc_markdown(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<
 /// One doc to `~/Downloads/<title>.md` — the single-file escape hatch, for
 /// sharing a doc outside Taisce without exporting the whole vault. A name
 /// already taken gets ` (2)`, ` (3)`… rather than overwriting.
-async fn export_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    let (title, md) = match with_store(&st.store, move |s| {
+async fn export_doc(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> axum::response::Response {
+    if let Err(r) = v.require_admin() {
+        return r;
+    }
+    export_doc_inner(st, v, id).await.into_response()
+}
+
+async fn export_doc_inner(st: ApiState, v: Viewer, id: Uuid) -> Json<Value> {
+    let (title, md) = match with_store(&st.store, v.scope, move |s| {
         let doc = s.get_doc(id)?;
         let md = taisce_store::export::export_doc(&*s, id)?;
         Ok::<_, taisce_store::StoreError>((doc.title, md))
@@ -1090,7 +1142,7 @@ struct ImportReq {
 /// touches disk: every file is parsed OFF the store lock and the lock is
 /// taken per doc, so a 5000-file import never stalls the UI for its
 /// duration. Non-markdown files are skipped (the UI filters too).
-async fn import_markdown(State(st): State<ApiState>, Json(req): Json<ImportReq>) -> Json<Value> {
+async fn import_markdown(State(st): State<ApiState>, v: Viewer, Json(req): Json<ImportReq>) -> Json<Value> {
     const MAX_FILES: usize = 5000;
     const MAX_BYTES: usize = 200 * 1024 * 1024;
     if req.files.is_empty() {
@@ -1113,8 +1165,8 @@ async fn import_markdown(State(st): State<ApiState>, Json(req): Json<ImportReq>)
         }
     }
     let store = st.store.clone();
-    let human = st.human;
-    let res = tokio::task::spawn_blocking(move || import_files(&store, human, req.files)).await;
+    let (human, scope) = (v.human, v.scope);
+    let res = tokio::task::spawn_blocking(move || import_files(&store, scope, human, req.files)).await;
     match res {
         Ok(Ok(report)) => Json(json!({
             "docs": report.docs,
@@ -1129,7 +1181,8 @@ async fn import_markdown(State(st): State<ApiState>, Json(req): Json<ImportReq>)
 /// The import walk, in memory: sorted by path (folders create in order, as
 /// the CLI walk does), parse outside the lock, one lock per doc.
 fn import_files(
-    store: &Arc<Mutex<SqliteStore>>,
+    store: &SharedStore,
+    scope: Scope,
     human: Uuid,
     mut files: Vec<ImportFile>,
 ) -> taisce_store::Result<taisce_store::import::ImportReport> {
@@ -1159,7 +1212,7 @@ fn import_files(
             let id = match folders.get(&sofar) {
                 Some(id) => *id,
                 None => {
-                    let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut s = store.lock(scope);
                     let d = s.create_doc(&comp.as_os_str().to_string_lossy(), parent, human)?;
                     report.docs += 1;
                     folders.insert(sofar.clone(), d.id);
@@ -1168,7 +1221,7 @@ fn import_files(
             };
             parent = Some(id);
         }
-        let mut s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = store.lock(scope);
         let doc = s.create_doc(&title, parent, human)?;
         let n = ops.len();
         if n > 0 {
@@ -1187,30 +1240,38 @@ struct AskReq {
 
 /// Ask the vault: question → answer doc with block-level citations. Waits
 /// for the model (a minute at most); the UI shows "thinking…" meanwhile.
-async fn ask_vault(State(st): State<ApiState>, Json(req): Json<AskReq>) -> Json<Value> {
-    match crate::ask::ask(st.store.clone(), st.embedder.clone(), st.human, req.question).await {
+async fn ask_vault(State(st): State<ApiState>, v: Viewer, Json(req): Json<AskReq>) -> Json<Value> {
+    match crate::ask::ask(st.store.clone(), v.scope, st.embedder.clone(), v.human, req.question).await {
         Ok(a) => Json(json!(a)),
         Err(e) => Json(json!({"error": e})),
     }
 }
 
 /// Sync Claude Code's memory files into `Claude Memory` now.
-async fn memory_sync(State(st): State<ApiState>) -> Json<Value> {
+async fn memory_sync(State(st): State<ApiState>, v: Viewer) -> axum::response::Response {
+    if let Err(r) = v.require_admin() {
+        return r;
+    }
+    memory_sync_inner(st, v).await.into_response()
+}
+
+async fn memory_sync_inner(st: ApiState, v: Viewer) -> Json<Value> {
     let store = st.store.clone();
-    let human = st.human;
+    let human = v.human;
+    let scope = v.scope;
     let root = crate::memory::memory_root();
     if !root.is_dir() {
         return Json(json!({"error": format!("no Claude Code memory found at {}", root.display())}));
     }
-    match tokio::task::spawn_blocking(move || crate::memory::sync(&store, &root, human)).await {
+    match tokio::task::spawn_blocking(move || crate::memory::sync(&store, scope, &root, human)).await {
         Ok(Ok(r)) => Json(json!(r)),
         Ok(Err(e)) => Json(json!({"error": e.to_string()})),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
 
-async fn trash(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn trash(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         match s.list_trash() {
             Ok(rows) => Json(json!(rows)),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -1219,8 +1280,8 @@ async fn trash(State(st): State<ApiState>) -> Json<Value> {
     .await
 }
 
-async fn restore_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn restore_doc(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         match s.restore_doc(id) {
             Ok(n) => Json(json!({"ok": true, "restored": n})),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -1285,6 +1346,8 @@ pub fn router(state: ApiState) -> Router {
         .merge(crate::changes::router(state.clone()))
         .merge(crate::workspaces::router(state.clone()))
         .merge(crate::todo::router(state))
+        // one place maps `{error: "not found: …"}` to 404 for every route
+        .layer(axum::middleware::from_fn(crate::viewer::error_status))
 }
 
 #[cfg(test)]
@@ -1299,11 +1362,12 @@ mod http_client_tests {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let human = store.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
         let dir = std::env::temp_dir().join(format!("taisce-api-test-{}", Uuid::now_v7()));
-        let store = Arc::new(Mutex::new(store));
+        let store = taisce_store::SharedStore::new(store);
         let st = ApiState {
             changes: crate::changes::Feed::new(&store),
             store,
             human,
+            server_mode: false,
             db_path: dir.join("ks.db"),
             embedder: None,
             dedupe: crate::mcp::new_dedupe(),
@@ -1506,11 +1570,12 @@ mod http_client_tests {
     }
 
     fn state_on(db: &std::path::Path, human: Uuid) -> ApiState {
-        let store = Arc::new(Mutex::new(SqliteStore::open(db).unwrap()));
+        let store = taisce_store::SharedStore::new(SqliteStore::open(db).unwrap());
         ApiState {
             changes: crate::changes::Feed::new(&store),
             store,
             human,
+            server_mode: false,
             db_path: db.to_path_buf(),
             embedder: None,
             dedupe: crate::mcp::new_dedupe(),
@@ -1570,7 +1635,7 @@ mod http_client_tests {
         for (_, at, _) in st.dedupe.lock().unwrap().values_mut() {
             *at = std::time::Instant::now() - std::time::Duration::from_secs(121);
         }
-        assert!(crate::mcp::dedupe_get(&st.dedupe, human, rid).is_none(), "memory window passed");
+        assert!(crate::mcp::dedupe_get(&st.dedupe, None, human, rid).is_none(), "memory window passed");
         let late = call(&app, "POST", "/api/propose", &[], Some(body.clone())).await;
         assert_eq!(late, first);
         // restart: a fresh handle and an empty cache on the same file
