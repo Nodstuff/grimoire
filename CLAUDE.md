@@ -118,6 +118,11 @@ account may be flipped to the work account by other sessions — push with
 - Mac Catalyst answers every text-style size at `.large`: `.dynamicTypeSize(…)` and
   `UIFont.preferredFont(…, compatibleWith:)` change nothing there. Doc text scales by hand
   (`DocTextSize`, `docScale`, `DocScaleTrait` in `apple/App/Taisce/Presentation/TextSize.swift`).
+- The Mac app is unsandboxed: its hosted unit tests run as `ie.null.taisce` with the real
+  Keychain and `UserDefaults` domain. `AppPaths.isTestHost` keeps them off the real caches and
+  stops the host booting or migrating; keep it that way. The old sandbox container is
+  readable only when the app is launched by Launch Services (`open`, Finder), never from a
+  shell (macOS app-data protection), so a migration run from a shell logs EPERM and retries.
 - Markdown-it's commonmark preset has no tables.
 - Old databases still hold `canvas_scene` blocks and `remote` principals: both stay valid in
   the schema (the editor, export and retrieval skip canvas blocks; new ones are refused).

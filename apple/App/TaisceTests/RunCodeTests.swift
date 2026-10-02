@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import Testing
 import TaisceKit
 @testable import Taisce
@@ -44,6 +45,103 @@ import Darwin
         #expect(AppPaths.diagramCache.path.hasPrefix(FileManager.default.temporaryDirectory.path))
         #expect(AppPaths.migrateSandboxContainer() == nil, "never migrates inside a test host")
     }
+
+    /// A booted model on an unreachable LOCAL server, its cache in the test
+    /// host's temp folder, holding one doc with a bash block.
+    func modelWithCodeDoc() async throws -> (AppModel, DocID, BlockID) {
+        // never boot on whatever server UserDefaults holds (other suites set it):
+        // switch straight to an unreachable LOCAL one
+        let m = AppModel()
+        m.discover = { _ in nil }
+        await m.setServerURL("http://127.0.0.1:9")
+        // already on :9 (another suite's setting): setServerURL was a no-op
+        if m.cache == nil { await m.boot() }
+        await m.stopSync()
+        UserDefaults.standard.removeObject(forKey: AppModel.serverURLKey)
+        #expect(m.serverURL == "http://127.0.0.1:9")
+        let cache = try #require(m.cache)
+        let doc = "run-\(UUID().uuidString.prefix(8))".lowercased()
+        let block = "\(doc)-b"
+        try await cache.storeDoc(DocTree(
+            doc: DocSummary(id: doc, parentID: nil, title: "Runs", currentEpoch: 2),
+            roots: [BlockNode(block: Block(id: block, docID: doc, parentID: nil, orderKey: "a", blockType: .code, content: "```bash cwd=~\necho hi\n```", epoch: 2))]
+        ))
+        return (m, doc, block)
+    }
+
+    @Test func theCodeCardLaysOut() async throws {
+        let (m, doc, block) = try await modelWithCodeDoc()
+        let ctx = CodeRunContext(doc: doc, block: block, canSave: true)
+        let s = m.codeRuns.state(ctx)
+        s.log.append([OutputChunk(.stdout, "out\n"), OutputChunk(.stderr, "err\n")])
+        s.result = RunResult(exitCode: 1, duration: .seconds(1))
+        s.tryLine = "f(1)"
+        try AppModelTests().render(
+            VStack {
+                RunnableCodeBlock(language: "bash", code: "echo hi", attributes: ["cwd": "~"])
+                RunnableCodeBlock(language: "go", code: "func f(x int) int { return x }")
+                RunnableCodeBlock(language: "python", code: "print(1)")
+            }
+            .environment(m)
+            .environment(\.codeRunContext, ctx)
+        )
+        store(m).beginPractice(s, docCode: "echo hi")
+        try AppModelTests().render(RunnableCodeBlock(language: "bash", code: "echo hi").environment(m).environment(\.codeRunContext, ctx))
+        try await m.cache?.deleteDoc(doc)
+    }
+
+    func store(_ m: AppModel) -> CodeRunStore { m.codeRuns }
+
+    @Test func saveToDocQueuesAReplaceThroughTheOutbox() async throws {
+        let (m, doc, block) = try await modelWithCodeDoc()
+        let cache = try #require(m.cache)
+        let before = try await cache.pendingOutbox().count
+        let ctx = CodeRunContext(doc: doc, block: block, canSave: true)
+        let s = m.codeRuns.state(ctx)
+        m.codeRuns.beginPractice(s, docCode: "echo hi")
+        s.practice = "echo bye"
+        await m.codeRuns.save(s, context: ctx)
+        #expect(s.saveError == nil && s.practice == nil)
+        let queued = try await cache.pendingOutbox()
+        #expect(queued.count == before + 1)
+        let body = try #require(queued.last?.body)
+        let req = try JSONDecoder().decode(ProposeRequest.self, from: body)
+        #expect(req.docID == doc && req.baseEpoch == 2)
+        #expect(String(decoding: body, as: UTF8.self).contains(#"```bash cwd=~\necho bye\n```"#))
+        try await cache.deleteDoc(doc)
+        _ = try await cache.dropOutbox(forDocs: [doc])
+    }
+
+    #if targetEnvironment(macCatalyst)
+    @Test func offlineRunAsksFirstThenRunsAndRemembers() async throws {
+        let (m, doc, block) = try await modelWithCodeDoc()
+        let ctx = CodeRunContext(doc: doc, block: block, canSave: true)
+        let s = m.codeRuns.state(ctx)
+        let req = RunRequest(language: .shell(interpreter: "/bin/bash"), code: "echo hi", cwd: "~")
+        // nothing listens on :9, so no ledger: who wrote it is unknown → ask
+        await m.codeRuns.run(s, req, context: ctx, docCode: "echo hi")
+        let prompt = try #require(s.trustPrompt)
+        #expect(prompt.lastEditedBy.contains("offline"))
+        #expect(prompt.code == "echo hi")
+        #expect(!s.isRunning)
+        await m.codeRuns.confirm(s)
+        #expect(s.trustPrompt == nil)
+        #expect(s.result?.exitCode == 0)
+        #expect(s.log.text == "hi\n")
+        // approved for this doc at this epoch: the next run doesn't ask
+        await m.codeRuns.run(s, req, context: ctx, docCode: "echo hi")
+        #expect(s.trustPrompt == nil && s.result?.exitCode == 0)
+        // your own practice edit never asks, even in a doc never approved
+        let other = CodeRunContext(doc: "\(doc)-2", block: "b", canSave: false)
+        let s2 = m.codeRuns.state(other)
+        m.codeRuns.beginPractice(s2, docCode: "echo a")
+        s2.practice = "echo typed"
+        await m.codeRuns.run(s2, RunRequest(language: .shell(interpreter: "/bin/sh"), code: "echo typed"), context: other, docCode: "echo a")
+        #expect(s2.trustPrompt == nil && s2.log.text == "typed\n")
+        RunApprovals(server: m.serverURL).forget()
+        try await m.cache?.deleteDoc(doc)
+    }
+    #endif
 
     @Test func approvalsAreForgottenWithThePersonsSettings() throws {
         let suite = "taisce.tests.run.\(UUID().uuidString)"
