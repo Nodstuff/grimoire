@@ -214,7 +214,9 @@ async fn members(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) ->
 
 #[derive(Deserialize)]
 struct ShareReq {
-    /// a user id, or a name (case-insensitive)
+    /// a user id. Names are resolved on the box's CLI only, and an unknown
+    /// id answers exactly like a known one, so the route never confirms who
+    /// has an account here (ADR 0004).
     user: String,
     /// `editor` or `viewer`
     role: String,
@@ -229,21 +231,31 @@ async fn share(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>, Json
         return fail(StoreError::InvalidOp(format!("role must be editor or viewer, got {:?}", req.role)));
     };
     with_store(&st.store, v.scope, move |s| {
-        let user = match s.auth_find_user(&req.user) {
-            Ok(Some(u)) => u,
-            Ok(None) => return fail(StoreError::NotFound(format!("user {:?}", req.user))),
-            Err(e) => return fail(e),
-        };
-        match s.share_workspace(id, user.id, role) {
-            Ok(()) => {
-                tracing::info!(target: crate::auth::AUDIT, event = "workspace.share", workspace = %id, user = %user.id, role = role.as_str(), by = ?v.user);
-                match s.workspace_members(id) {
-                    Ok(m) => Json(json!({"members": m})).into_response(),
-                    Err(e) => fail(e),
-                }
+        // ownership first: a non-owner learns nothing about the user named
+        if let Err(e) = s.workspace_members(id).and_then(|_| {
+            let w = s.get_workspace(id)?;
+            if !s.scope().sees_all() && w.role != taisce_store::Role::Owner {
+                return Err(StoreError::Forbidden("only the workspace owner can change or delete it".into()));
             }
-            Err(e) => fail(e),
+            Ok(())
+        }) {
+            return fail(e);
         }
+        let user = Uuid::parse_str(req.user.trim()).ok().and_then(|u| s.auth_user(u).ok().flatten());
+        match user {
+            Some(user) => match s.share_workspace(id, user.id, role) {
+                Ok(()) => {
+                    tracing::info!(target: crate::auth::AUDIT, event = "workspace.share", workspace = %id, user = %user.id, role = role.as_str(), by = ?v.user);
+                }
+                // sharing with yourself or the owner: a no-op, said the same way
+                Err(StoreError::InvalidOp(_)) => {}
+                Err(e) => return fail(e),
+            },
+            None => {
+                let _ = s.audit("refused.share_unknown_user", &id.to_string(), json!({}));
+            }
+        }
+        Json(json!({"ok": true})).into_response()
     })
     .await
 }

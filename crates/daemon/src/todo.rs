@@ -922,7 +922,13 @@ pub fn find_or_create_todo_in(s: &mut SqliteStore, human: Uuid, scope: TodoScope
     let TodoScope::In(WorkspaceFilter::Id(w)) = scope else {
         return s.create_doc(TODO_TITLE, None, human);
     };
-    let labelled: std::collections::HashSet<Uuid> = s.get_workspace(w)?.doc_ids.into_iter().collect();
+    let ws = s.get_workspace(w)?;
+    // a viewer reads a workspace's list but never creates one (nothing may
+    // land in their own Unsorted on a GET)
+    if !ws.role.can_write() {
+        return Err(taisce_store::StoreError::Forbidden("read-only: this workspace has no To-do list yet".into()));
+    }
+    let labelled: std::collections::HashSet<Uuid> = ws.doc_ids.into_iter().collect();
     let docs = s.list_docs()?;
     let by_id: HashMap<Uuid, &Doc> = docs.iter().map(|d| (d.id, d)).collect();
     let parent = docs

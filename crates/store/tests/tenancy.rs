@@ -806,3 +806,20 @@ fn p7_a_private_rename_never_rewrites_a_shared_link() {
     s.propose_doc_op(a_doc, t.a_human, OpKind::RenameDoc { title: "Clinics".into(), from_title: String::new() }, vec![]).unwrap();
     assert!(serde_json::to_string(&s.read_doc(mine.id).unwrap()).unwrap().contains("[[Clinics]]"));
 }
+
+/// Sibling of review findings 1/2/4: an answer's recorded sources are
+/// cross-doc block references; a reader gets only the ones they can see.
+#[test]
+fn answer_sources_report_only_visible_citations() {
+    let t = setup();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    {
+        let mut s = t.store.lock(Scope::User(t.a));
+        // an answer in Family that (before 0004, or by mistake) cites A's private block
+        s.record_answer_sources(t.shared_doc, &[(t.a_secret_block, 1), (t.shared_block, 1)]).unwrap();
+        assert_eq!(s.answer_sources(t.shared_doc).unwrap().len(), 2);
+    }
+    let got = t.store.lock(Scope::User(t.b)).answer_sources(t.shared_doc).unwrap();
+    assert_eq!(got.iter().map(|a| a.block_id).collect::<Vec<_>>(), vec![t.shared_block]);
+    assert_eq!(t.store.lock(Scope::System).answer_sources(t.shared_doc).unwrap().len(), 2, "the refresher sees all");
+}

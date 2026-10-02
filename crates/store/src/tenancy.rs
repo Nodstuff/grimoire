@@ -281,7 +281,8 @@ pub(crate) fn check_space_change(conn: &Connection, scope: Scope, from: Space, t
         Some(_) => {}
     }
     match access_conn(conn, scope, to)? {
-        None => Err(StoreError::NotFound("destination".into())),
+        // generic: the destination may be a parent the caller cannot see
+        None => Err(StoreError::Forbidden("you cannot move or file this doc there".into())),
         Some(d) if !d.can_write() => Err(read_only("the destination")),
         Some(_) => Ok(()),
     }

@@ -3417,17 +3417,18 @@ impl SqliteStore {
     /// fresh without a second round-trip.
     pub fn answer_sources(&self, answer_doc: Uuid) -> Result<Vec<AnswerSource>> {
         self.see(answer_doc)?;
-        // a cited block in a doc the viewer cannot see is reported without
-        // its doc's title
+        // a cited block in a doc the viewer cannot see (or that is gone) is
+        // not reported to them at all: neither its id nor its doc's title
+        // (System, the refresher's stale check, sees every row)
+        let vis = self.vis("d.id");
         let mut stmt = self.conn.prepare(&format!(
             "SELECT a.block_id, a.epoch_at_answer, a.recorded_at, b.epoch, b.deleted,
-                    CASE WHEN {} THEN d.title END
+                    CASE WHEN {vis} THEN d.title END
              FROM answer_sources a
              LEFT JOIN blocks b ON b.id = a.block_id
              LEFT JOIN docs d ON d.id = b.doc_id
-             WHERE a.answer_doc_id = ?1
-             ORDER BY a.recorded_at, a.block_id",
-            self.vis("d.id")
+             WHERE a.answer_doc_id = ?1 AND {vis}
+             ORDER BY a.recorded_at, a.block_id"
         ))?;
         let rows = stmt.query_map(params![answer_doc.to_string()], |r| {
             Ok((

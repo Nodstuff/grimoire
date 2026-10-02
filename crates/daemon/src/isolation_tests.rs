@@ -127,6 +127,8 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/profile", "connector_tokens_on_api_get_the_agent_treatment"),
     ("/api/import", "connector_tokens_on_api_get_the_agent_treatment"),
     ("/api/propose", "connector_tokens_on_api_get_the_agent_treatment"),
+    ("/api/todo", "a_viewer_reading_a_shared_todo_creates_nothing"),
+    ("/api/docs/{id}/workspace", "unlabel_into_a_hidden_parent_is_a_generic_refusal"),
     ("mcp:append", "agent_principals_are_per_person"),
     ("/api/doc/{id}/history", "agent_principals_are_per_person"),
 ];
@@ -666,8 +668,15 @@ async fn workspaces_and_membership_routes() {
         assert_eq!(st, StatusCode::UNAUTHORIZED, "{m} {path} with a PAT");
     }
     // A shares her Work with B: B now sees two "Work"s, A's labelled with its owner
-    let (st, out) = fx.call(&fx.a_app, "POST", &format!("/api/workspaces/{}/members", fx.a_work), Some(json!({"user": "Aoife", "role": "editor"}))).await;
+    // the route takes an id and answers an unknown one exactly like a known
+    // one (it never confirms who has an account); names are the CLI's
+    let (st_unknown, unknown) = fx
+        .call(&fx.a_app, "POST", &format!("/api/workspaces/{}/members", fx.a_work), Some(json!({"user": Uuid::now_v7().to_string(), "role": "editor"})))
+        .await;
+    let (st_name, by_name) = fx.call(&fx.a_app, "POST", &format!("/api/workspaces/{}/members", fx.a_work), Some(json!({"user": "Aoife", "role": "editor"}))).await;
+    let (st, out) = fx.call(&fx.a_app, "POST", &format!("/api/workspaces/{}/members", fx.a_work), Some(json!({"user": fx.b.to_string(), "role": "editor"}))).await;
     assert_eq!(st, StatusCode::OK, "{out}");
+    assert_eq!((st_unknown, unknown.as_str(), st_name, by_name.as_str()), (st, out.as_str(), st, out.as_str()), "indistinguishable");
     let (_, list) = fx.b("GET", "/api/workspaces", None).await;
     let v: Value = serde_json::from_str(&list).unwrap();
     let names: Vec<&str> = v["workspaces"].as_array().unwrap().iter().map(|w| w["display_name"].as_str().unwrap()).collect();
@@ -1095,4 +1104,35 @@ async fn agent_principals_are_per_person() {
     let (_, hist) = fx.call(&fx.a_app, "GET", &format!("/api/doc/{}/history", fx.shared_doc), None).await;
     assert!(hist.contains("claude:claude-code (Aoife)"), "{hist}");
     assert!(hist.contains("\"claude:claude-code\""), "Tom's own reads plain: {hist}");
+}
+
+/// Review nit 10: a viewer's GET of a shared workspace's (missing) To-do
+/// creates nothing anywhere.
+#[tokio::test]
+async fn a_viewer_reading_a_shared_todo_creates_nothing() {
+    let fx = fixture();
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let before = fx.store.lock(Scope::System).list_docs().unwrap().len();
+    let (st, out) = fx.b("GET", &format!("/api/todo?date={today}&today={today}&workspace={}", fx.family), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{out}");
+    assert_eq!(fx.store.lock(Scope::System).list_docs().unwrap().len(), before, "no stray To-do root");
+}
+
+/// Review nit 10: unlabelling a doc whose parent the caller cannot see says
+/// nothing about that parent.
+#[tokio::test]
+async fn unlabel_into_a_hidden_parent_is_a_generic_refusal() {
+    let fx = fixture();
+    fx.store.lock(Scope::User(fx.a)).share_workspace(fx.family, fx.b, Role::Editor).unwrap();
+    // a Family doc under A's private (unlabelled) parent; B unlabels it
+    let d = {
+        let mut s = fx.store.lock(Scope::User(fx.a));
+        let p = s.create_doc("A private parent", None, fx.a_human).unwrap().id;
+        let d = s.create_doc("Family note", Some(p), fx.a_human).unwrap().id;
+        s.set_doc_workspace(d, Some(fx.family), fx.a_human).unwrap();
+        d
+    };
+    let (st, out) = fx.b("PUT", &format!("/api/docs/{d}/workspace"), Some(json!({"workspace_id": null}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{out}");
+    assert!(!out.contains("destination") && !out.contains("A private parent"), "{out}");
 }

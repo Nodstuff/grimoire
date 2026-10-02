@@ -42,12 +42,14 @@ export default function WorkspaceSwitcher({
   const share = async () => {
     if (!current || !who.trim()) return
     try {
-      const r = await api<{ members: Member[] }>(`/api/workspaces/${current.id}/members`, {
+      // the route takes a user id and never says whether one exists; the
+      // list below is the truth (names are resolved on the box's CLI)
+      await api(`/api/workspaces/${current.id}/members`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ user: who.trim(), role }),
       })
-      setMembers(r.members)
+      loadMembers(current.id)
       setWho('')
       load()
     } catch (e) {
@@ -110,7 +112,7 @@ export default function WorkspaceSwitcher({
             </div>
           ))}
           <div className="ws-member ws-add">
-            <input value={who} onChange={(e) => setWho(e.target.value)} placeholder="name" spellCheck={false} />
+            <input value={who} onChange={(e) => setWho(e.target.value)} placeholder="user id" spellCheck={false} />
             <select value={role} onChange={(e) => setRole(e.target.value as Role)}>
               <option value="viewer">viewer</option>
               <option value="editor">editor</option>
