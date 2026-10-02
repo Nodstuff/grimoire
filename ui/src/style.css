@@ -174,6 +174,47 @@ kbd {
 .tree-filter::placeholder { color: var(--fg-dim); opacity: 0.8; }
 .tree-filter:focus { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent); }
 .tree-root { padding: 2px 0 24px; }
+
+/* workspace switcher (ADR 0004) */
+.ws-switcher { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.ws-select {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  border: none;
+  border-radius: 6px;
+  background: var(--panel2);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+}
+.ws-members-btn, .ws-member button {
+  border: none;
+  border-radius: 6px;
+  background: var(--panel2);
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.ws-members { width: 100%; display: flex; flex-direction: column; gap: 3px; padding: 4px 2px; font-size: 12px; }
+.ws-member { display: flex; gap: 6px; align-items: center; }
+.ws-member > span:first-child { flex: 1; color: var(--fg); }
+.ws-role { color: var(--fg-dim); font-size: 11px; }
+.ws-add input {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  border: none;
+  border-radius: 6px;
+  background: var(--panel2);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  padding: 0 6px;
+}
+.ws-add select { height: 22px; border: none; border-radius: 6px; background: var(--panel2); color: var(--fg); font-size: 11px; }
 .tree-empty { padding: 12px 10px; font-size: 12px; color: var(--fg-dim); }
 
 /* sections */
