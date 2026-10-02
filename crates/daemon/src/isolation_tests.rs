@@ -127,6 +127,8 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/profile", "connector_tokens_on_api_get_the_agent_treatment"),
     ("/api/import", "connector_tokens_on_api_get_the_agent_treatment"),
     ("/api/propose", "connector_tokens_on_api_get_the_agent_treatment"),
+    ("mcp:append", "agent_principals_are_per_person"),
+    ("/api/doc/{id}/history", "agent_principals_are_per_person"),
 ];
 
 struct Fx {
@@ -1056,4 +1058,41 @@ async fn unshare_then_a_stale_anchor_reads_nothing_through_flags() {
     assert_eq!(st, StatusCode::OK);
     assert!(!flags.contains("written after unshare"), "{flags}");
     fx.no_leak("/api/flags", &flags);
+}
+
+/// Review finding 8: agent principals are per person. Tom's and Aoife's
+/// `claude-code` PATs write as two principals, an `as` label never lands on
+/// someone else's principal, and attribution shown to the other says whose.
+#[tokio::test]
+async fn agent_principals_are_per_person() {
+    let fx = fixture();
+    fx.store.lock(Scope::User(fx.a)).share_workspace(fx.family, fx.b, Role::Editor).unwrap();
+    let a_pat = crate::auth::create_api_token(&mut fx.store.lock(Scope::System), Some(&fx.a.to_string()), "claude-code", None, now())
+        .unwrap()
+        .1
+        .unwrap();
+    let shared = fx.shared_doc.to_string();
+    let (e1, o1) = fx.tool(&a_pat, "append", json!({"doc_id": shared, "markdown": "from tom's claude", "as": "claude:grimoire-task"})).await;
+    let (e2, o2) = fx.tool(&fx.b_pat, "append", json!({"doc_id": shared, "markdown": "from aoife's claude", "as": "claude:grimoire-task"})).await;
+    assert!(!e1 && !e2, "{o1} / {o2}");
+    let (e3, o3) = fx.tool(&a_pat, "append", json!({"doc_id": shared, "markdown": "tom plain"})).await;
+    let (e4, o4) = fx.tool(&fx.b_pat, "append", json!({"doc_id": shared, "markdown": "aoife plain"})).await;
+    assert!(!e3 && !e4, "{o3} / {o4}");
+    let ops = fx.store.lock(Scope::System).ops_for_doc_limited(fx.shared_doc, 50).unwrap();
+    let by = |text: &str| {
+        ops.iter()
+            .find(|o| matches!(&o.kind, OpKind::Insert { content, .. } if content.contains(text)))
+            .map(|o| o.principal)
+            .unwrap_or_else(|| panic!("no op for {text}"))
+    };
+    assert_ne!(by("from tom's claude"), by("from aoife's claude"), "the same `as` label is two principals");
+    assert_ne!(by("tom plain"), by("aoife plain"), "two claude-code PATs are two principals");
+    // by id, B cannot write as Tom's agent
+    let tom_agent = by("from tom's claude").to_string();
+    let (is_err, out) = fx.tool(&fx.b_pat, "append", json!({"doc_id": shared, "markdown": "x", "as": tom_agent})).await;
+    assert!(is_err, "{out}");
+    // attribution Tom sees names Aoife's agent as hers
+    let (_, hist) = fx.call(&fx.a_app, "GET", &format!("/api/doc/{}/history", fx.shared_doc), None).await;
+    assert!(hist.contains("claude:claude-code (Aoife)"), "{hist}");
+    assert!(hist.contains("\"claude:claude-code\""), "Tom's own reads plain: {hist}");
 }

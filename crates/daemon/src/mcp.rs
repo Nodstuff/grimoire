@@ -192,17 +192,14 @@ pub fn valid_principal_name(name: &str) -> Result<&str, String> {
 /// carrying the name is refused: an agent never acts as the human.
 pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uuid, String> {
     let name = valid_principal_name(name)?;
-    // unscoped by name: a user scope's principal list is filtered, and a
-    // miss there must never mint a second principal of the same name
-    let existing = store.principal_by_name(name).ok().flatten();
-    if let Some(pr) = existing {
-        return match pr.kind {
-            taisce_store::PrincipalKind::Agent => Ok(pr.id),
-            kind => Err(format!(
-                "{name:?} is the {} principal, not an agent: agents cannot act as it",
-                kind.as_str()
-            )),
-        };
+    // ADR 0004: agents are per person — the scope's own agent of that name,
+    // never someone else's (the same label under two users is two principals)
+    if let Some(pr) = store.agent_named(name).map_err(|e| e.to_string())? {
+        return Ok(pr.id);
+    }
+    // an agent never takes a person's name; the refusal does not say whose
+    if store.name_is_a_persons(name).map_err(|e| e.to_string())? {
+        return Err(format!("{name:?} is not an agent name you can use"));
     }
     if AUTO_CREATED.load(std::sync::atomic::Ordering::Relaxed) >= MAX_AUTO_PRINCIPALS_PER_BOOT {
         return Err(format!(
@@ -365,27 +362,23 @@ pub fn acting_principal(
         },
     };
     let key = raw.trim();
-    if let Some(id) = cached_principal(names, key) {
+    let cache_key = name_key(store.scope().user(), key);
+    if let Some(id) = cached_principal(names, &cache_key) {
         return Ok(id);
     }
     let id = match Uuid::parse_str(key) {
-        Ok(id) => match store.get_principal(id) {
-            Ok(pr) if pr.kind == taisce_store::PrincipalKind::Agent => id,
-            Ok(pr) => {
-                return Err(format!(
-                    "as: {id} is the {} principal {:?}, not an agent: agents cannot act as it",
-                    pr.kind.as_str(),
-                    pr.display_name
-                ));
-            }
-            Err(_) => return Err(format!("as: no principal with id {id}; pass a name to create one")),
+        // by id: only one of the caller's own agents (System/Local: the
+        // instance's); anything else answers as if it did not exist
+        Ok(id) => match store.agent_is_mine(id) {
+            Ok(true) => id,
+            _ => return Err(format!("as: no principal with id {id} among your agents; pass a name to create one")),
         },
         Err(_) => agent_principal_by_name(store, key).map_err(|m| format!("as: {m}"))?,
     };
     names
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key.to_string(), id);
+        .insert(cache_key, id);
     Ok(id)
 }
 
@@ -411,8 +404,11 @@ pub fn pinned_label(store: &SqliteStore, base: &str, label: &str) -> Result<Stri
         return refuse("has an empty label");
     }
     valid_principal_name(label).map_err(|m| format!("as: {m}"))?;
+    // only the caller's own connectors: agent principals are per person, so
+    // another person's client names are none of this token's business
+    let me = store.scope().user();
     let grants = store.oauth_grants(false).map_err(|e| e.to_string())?;
-    let mut clients: Vec<String> = grants.into_iter().map(|g| g.client_id).collect();
+    let mut clients: Vec<String> = grants.into_iter().filter(|g| me.is_none_or(|u| g.user_id == u)).map(|g| g.client_id).collect();
     clients.sort();
     clients.dedup();
     for c in clients {
@@ -422,6 +418,11 @@ pub fn pinned_label(store: &SqliteStore, base: &str, label: &str) -> Result<Stri
         }
     }
     Ok(label.to_string())
+}
+
+/// The `as` cache key: a name means a different principal per person.
+pub fn name_key(user: Option<Uuid>, name: &str) -> String {
+    format!("{}|{}", user.map(|u| u.to_string()).unwrap_or_default(), name.trim())
 }
 
 fn cached_principal(names: &NameCache, key: &str) -> Option<Uuid> {
@@ -457,17 +458,19 @@ impl KsMcp {
     /// The principal this call acts as (`acting_principal`). Skips the store
     /// when no handle is given or it is already cached.
     async fn acting(&self, as_: Option<&str>, hint: &RequestHint) -> Result<Uuid, String> {
+        // principals resolve in the caller's scope: agents are per person
+        let scope = self.scope_of(hint)?;
         match &hint.pinned {
             Some(Pinned::Owner(human)) => return Ok(*human),
             Some(Pinned::Client(base)) => {
                 let (base, label) = (base.clone(), as_.map(|a| a.trim().to_string()));
                 if label.is_none()
-                    && let Some(id) = cached_principal(&self.names, &base)
+                    && let Some(id) = cached_principal(&self.names, &name_key(scope.user(), &base))
                 {
                     return Ok(id);
                 }
                 let (names, default) = (self.names.clone(), self.agent);
-                return with_store(&self.store, Scope::System, move |store| {
+                return with_store(&self.store, scope, move |store| {
                     let raw = match label {
                         Some(l) => pinned_label(store, &base, &l)?,
                         None => base,
@@ -485,11 +488,11 @@ impl KsMcp {
                 None => return Ok(self.agent),
             },
         };
-        if let Some(id) = cached_principal(&self.names, &raw) {
+        if let Some(id) = cached_principal(&self.names, &name_key(scope.user(), &raw)) {
             return Ok(id);
         }
         let (names, default) = (self.names.clone(), self.agent);
-        with_store(&self.store, Scope::System, move |store| {
+        with_store(&self.store, scope, move |store| {
             acting_principal(store, &names, Some(&raw), &RequestHint::default(), default)
         })
         .await
@@ -2831,9 +2834,10 @@ mod tests {
         let e = act(&mut store, Some(&Uuid::now_v7().to_string()), &NONE).unwrap_err();
         assert!(e.contains("no principal with id"), "{e}");
         // never the human or a remote peer — by argument or by header
+        // (by id the refusal is the generic "no principal": it never says whose)
         for (label, as_) in [("human name", "tom".to_string()), ("human id", tom.to_string()), ("remote name", "laptop".into()), ("remote id", peer.to_string())] {
             let e = act(&mut store, Some(&as_), &NONE).unwrap_err();
-            assert!(e.contains("not an agent"), "{label}: {e}");
+            assert!(e.contains("not an agent") || (label.ends_with("id") && e.contains("no principal with id")), "{label}: {e}");
         }
         let e = act(&mut store, None, &hint(Some("tom"), None, None)).unwrap_err();
         assert!(e.contains("not an agent"), "header: {e}");
@@ -2856,13 +2860,13 @@ mod tests {
         let claude = store.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let names = new_name_cache();
         let ghost = Uuid::now_v7();
-        names.lock().unwrap().insert("claude:elsewhere".into(), ghost);
+        names.lock().unwrap().insert(name_key(None, "claude:elsewhere"), ghost);
         assert_eq!(acting_principal(&mut store, &names, Some("claude:elsewhere"), &NONE, claude), Ok(ghost));
         assert!(store.get_principal(ghost).is_err(), "the store never saw it");
 
         let fresh = acting_principal(&mut store, &names, Some("claude:fresh"), &NONE, claude).unwrap();
-        assert_eq!(cached_principal(&names, "claude:fresh"), Some(fresh));
-        assert_eq!(cached_principal(&names, &fresh.to_string()), None, "cached under the string given");
+        assert_eq!(cached_principal(&names, &name_key(None, "claude:fresh")), Some(fresh));
+        assert_eq!(cached_principal(&names, &name_key(None, &fresh.to_string())), None, "cached under the string given");
         // at the creation cap the cached name still resolves (no store scan, no create)
         swap_auto_created_for_test(MAX_AUTO_PRINCIPALS_PER_BOOT);
         assert_eq!(acting_principal(&mut store, &names, Some("claude:fresh"), &NONE, claude), Ok(fresh));
@@ -3254,7 +3258,7 @@ mod tests {
 
         let (is_err, out) = raw(fresh().append_impl(NONE, p(json!({"doc_id": doc.to_string(), "markdown": "by task", "as": "claude:proj-task"}))).await.unwrap());
         assert!(!is_err, "{out}");
-        let task = names.lock().unwrap().get("claude:proj-task").copied().expect("as cached");
+        let task = names.lock().unwrap().get(&name_key(None, "claude:proj-task")).copied().expect("as cached");
         assert_ne!(task, claude);
         let ops = store.lock(taisce_store::Scope::System).ops_since(doc, epoch).unwrap();
         assert_eq!(ops.len(), 1);

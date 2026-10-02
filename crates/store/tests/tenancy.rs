@@ -447,6 +447,7 @@ fn migration_v8_on_a_realistic_db() {
         c.execute_batch(PRE_V8_DDL).unwrap();
         let tx = c.unchecked_transaction().unwrap();
         tx.execute("INSERT INTO principals (id, kind, display_name) VALUES ('00000000-0000-7000-8000-000000000001', 'human', 'Tom')", []).unwrap();
+        tx.execute("INSERT INTO principals (id, kind, display_name) VALUES ('00000000-0000-7000-8000-000000000002', 'agent', 'claude:claude-code')", []).unwrap();
         tx.execute(
             "INSERT INTO auth_users (id, principal_id, name, role, created_at)
              VALUES ('00000000-0000-7000-8000-0000000000aa', '00000000-0000-7000-8000-000000000001', 'Tom', 'owner', 1)",
@@ -527,6 +528,9 @@ fn migration_v8_on_a_realistic_db() {
     }
     // a second user sees nothing of it
     let b = shared.lock(Scope::System).auth_add_user("Aoife", 5).unwrap().id;
+    // existing agent principals are the owner's; the same label for B is B's own
+    assert!(shared.lock(Scope::User(owner)).agent_named("claude:claude-code").unwrap().is_some());
+    assert!(shared.lock(Scope::User(b)).agent_named("claude:claude-code").unwrap().is_none());
     assert!(shared.lock(Scope::User(b)).list_docs().unwrap().is_empty());
     assert!(shared.lock(Scope::User(b)).search_blocks("lorem", 20).unwrap().is_empty());
     // idempotent: reopening changes nothing

@@ -314,6 +314,7 @@ fn additive_column_migrations(conn: &Connection) -> Result<()> {
         }
         add_column_if_missing(conn, "docs", "owner_id", "TEXT")?;
     }
+    add_column_if_missing(conn, "principals", "owner_user", "TEXT")?;
     add_column_if_missing(conn, "changes", "user_id", "TEXT")?;
     let has_gardeners: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'gardeners'",
@@ -1486,9 +1487,15 @@ impl BlockStore for SqliteStore {
         pubkey: Option<&str>,
     ) -> Result<Principal> {
         let id = Uuid::now_v7();
+        // ADR 0004: an agent belongs to the person it acts for — the same
+        // label under two users is two principals (NULL = the instance owner)
+        let owner = match kind {
+            PrincipalKind::Agent => self.scope.user(),
+            _ => None,
+        };
         self.conn.execute(
-            "INSERT INTO principals (id, kind, display_name, pubkey) VALUES (?1, ?2, ?3, ?4)",
-            params![id.to_string(), kind.as_str(), display_name, pubkey],
+            "INSERT INTO principals (id, kind, display_name, pubkey, owner_user) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id.to_string(), kind.as_str(), display_name, pubkey, owner.map(|o| o.to_string())],
         )?;
         Ok(Principal {
             id,
@@ -1504,7 +1511,7 @@ impl BlockStore for SqliteStore {
         let raw: Option<(String, String, String, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT id, kind, display_name, pubkey FROM principals WHERE id = ?1",
+                &format!("SELECT id, kind, {}, pubkey FROM principals WHERE id = ?1", self.principal_name_sql()),
                 params![id.to_string()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
@@ -1606,7 +1613,8 @@ impl BlockStore for SqliteStore {
             }
         };
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT id, kind, display_name, pubkey FROM principals {filter} ORDER BY display_name",
+            "SELECT id, kind, {}, pubkey FROM principals {filter} ORDER BY display_name",
+            self.principal_name_sql()
         ))?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -2329,6 +2337,10 @@ impl BlockStore for SqliteStore {
             Some(u) => Some(u),
             None => self.instance_owner()?,
         };
+        self.conn.execute(
+            "UPDATE principals SET owner_user = ?1 WHERE id = ?2",
+            params![owner.map(|o| o.to_string()), principal.id.to_string()],
+        )?;
         self.conn.execute(
             "INSERT INTO gardeners (id, name, kind, principal, scope_doc, task_prompt, confidence_policy, owner_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",

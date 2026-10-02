@@ -373,6 +373,7 @@ pub(crate) fn adopt_unowned_conn(conn: &Connection, owner: Uuid) -> Result<()> {
     conn.execute("UPDATE docs SET owner_id = ?1 WHERE owner_id IS NULL", params![o])?;
     conn.execute("UPDATE workspaces SET owner_id = ?1 WHERE owner_id IS NULL", params![o])?;
     conn.execute("UPDATE gardeners SET owner_id = ?1 WHERE owner_id IS NULL", params![o])?;
+    conn.execute("UPDATE principals SET owner_user = ?1 WHERE kind = 'agent' AND owner_user IS NULL", params![o])?;
     conn.execute(
         "INSERT OR IGNORE INTO workspace_members (workspace_id, user_id, role, added_by)
          SELECT id, owner_id, 'owner', owner_id FROM workspaces WHERE owner_id IS NOT NULL",
@@ -447,6 +448,67 @@ impl SqliteStore {
                 }
             }
         })
+    }
+
+    /// The SQL for a principal's display name as this scope sees it: another
+    /// person's agent reads `claude:x (Aoife)`, so attribution says whose it
+    /// is (ADR 0004). System/Local: the stored name.
+    pub(crate) fn principal_name_sql(&self) -> String {
+        match self.scope.user() {
+            None => "display_name".into(),
+            Some(u) => format!(
+                "CASE WHEN kind = 'agent' AND COALESCE(owner_user, {INSTANCE_OWNER_SQL}) IS NOT '{u}'
+                      THEN display_name || ' (' || COALESCE((SELECT name FROM auth_users WHERE id = COALESCE(owner_user, {INSTANCE_OWNER_SQL})), '?') || ')'
+                      ELSE display_name END"
+            ),
+        }
+    }
+
+    /// SQL: is principal `col`'s person the scope's? (System/Local: the
+    /// unowned and the instance owner's.)
+    fn agent_mine_sql(&self) -> String {
+        match self.scope.user() {
+            Some(u) => format!("COALESCE(owner_user, {INSTANCE_OWNER_SQL}) = '{u}'"),
+            None => format!("(owner_user IS NULL OR owner_user = {INSTANCE_OWNER_SQL})"),
+        }
+    }
+
+    /// The scope's own agent principal named `name` (oldest first).
+    pub fn agent_named(&self, name: &str) -> Result<Option<crate::Principal>> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT id FROM principals WHERE kind = 'agent' AND display_name = ?1 AND {} ORDER BY id LIMIT 1",
+                    self.agent_mine_sql()
+                ),
+                params![name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => Ok(Some(crate::BlockStore::get_principal(self, parse(id, "principals.id")?)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Is agent `id` the scope's own (an `as` by id may only pick your own)?
+    pub fn agent_is_mine(&self, id: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM principals WHERE id = ?1 AND kind = 'agent' AND {})", self.agent_mine_sql()),
+            params![id.to_string()],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Does a non-agent (human/remote) principal carry this name? An agent
+    /// never takes a human's name.
+    pub fn name_is_a_persons(&self, name: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM principals WHERE kind != 'agent' AND display_name = ?1)",
+            params![name],
+            |r| r.get(0),
+        )?)
     }
 
     /// Every block id the scope may see (None: System/Local, no filter) —

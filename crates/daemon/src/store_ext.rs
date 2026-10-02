@@ -48,7 +48,8 @@ pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
 /// under ("scribe"), created on first use.
 pub fn scribe_principal(store: &mut SqliteStore) -> taisce_store::Result<Uuid> {
     const NAME: &str = "scribe";
-    if let Some(p) = store.principal_named(PrincipalKind::Agent, NAME)? {
+    // per person (ADR 0004): the scope's own scribe
+    if let Some(p) = store.agent_named(NAME)? {
         return Ok(p.id);
     }
     Ok(store.create_principal(PrincipalKind::Agent, NAME, None)?.id)

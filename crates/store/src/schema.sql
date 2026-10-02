@@ -9,7 +9,10 @@ CREATE TABLE IF NOT EXISTS principals (
     id           TEXT PRIMARY KEY,
     kind         TEXT NOT NULL CHECK (kind IN ('human', 'agent', 'remote')),
     display_name TEXT NOT NULL,
-    pubkey       TEXT
+    pubkey       TEXT,
+    -- ADR 0004: an agent's person (auth_users.id); NULL = the instance owner.
+    -- Humans carry none (auth_users.principal_id points at them).
+    owner_user   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS docs (
