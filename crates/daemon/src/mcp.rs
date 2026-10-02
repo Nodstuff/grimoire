@@ -1170,7 +1170,7 @@ fn resolve_landing(
 
 // ─── the tools ───
 
-#[tool_router]
+#[tool_router(vis = "pub(crate)")]
 impl KsMcp {
     pub fn new(
         store: taisce_store::SharedStore,

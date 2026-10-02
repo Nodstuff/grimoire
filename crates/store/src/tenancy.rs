@@ -451,6 +451,20 @@ impl SqliteStore {
         }
     }
 
+    /// Content may move from doc `a` into doc `b` (a merge) only within one
+    /// tenant: the same space, or two spaces neither of which is shared.
+    /// Refusals are audited.
+    pub fn ensure_same_tenant(&mut self, a: Uuid, b: Uuid) -> Result<()> {
+        let (sa, sb) = (self.doc_space(a)?, self.doc_space(b)?);
+        if sa == sb || (!space_is_shared(&self.conn, sa)? && !space_is_shared(&self.conn, sb)?) {
+            return Ok(());
+        }
+        audit_conn(&self.conn, self.scope.user(), "refused.cross_tenant_merge", &a.to_string(), &serde_json::json!({"into": b}))?;
+        Err(StoreError::Forbidden(
+            "merging across workspaces when either is shared would copy content between people; move it as a human instead".into(),
+        ))
+    }
+
     /// Record an audit event as the current scope's user.
     pub fn audit(&mut self, event: &str, subject: &str, detail: serde_json::Value) -> Result<()> {
         audit_conn(&self.conn, self.scope.user(), event, subject, &detail)

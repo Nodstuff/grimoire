@@ -193,7 +193,7 @@ pub fn workspace_arg(store: &SqliteStore, raw: Option<&str>) -> Result<Option<Wo
     match raw.map(str::trim).filter(|w| !w.is_empty()) {
         None => Ok(None),
         Some(w) => store.parse_workspace_filter(w).map(Some).map_err(|e| {
-            let names: Vec<String> = store.list_workspaces().unwrap_or_default().into_iter().map(|w| w.name).collect();
+            let names: Vec<String> = store.list_workspaces().unwrap_or_default().into_iter().map(|w| w.display_name).collect();
             format!("workspace: {e} (known: {}, or \"unsorted\")", if names.is_empty() { "none".into() } else { names.join(", ") })
         }),
     }

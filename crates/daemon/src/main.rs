@@ -31,6 +31,8 @@ mod workspaces;
 mod viewer;
 #[cfg(test)]
 mod retrieval_probe;
+#[cfg(test)]
+mod isolation_tests;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};

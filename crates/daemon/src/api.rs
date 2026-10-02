@@ -732,6 +732,10 @@ async fn dismiss_flag(State(st): State<ApiState>, v: Viewer, Json(req): Json<Dis
 /// The opt-in surface — configure agents where the docs live.
 async fn tendings(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> Json<Value> {
     with_store(&st.store, v.scope, move |s| {
+        // an invisible doc answers exactly like a missing one
+        if let Err(e) = s.get_doc(id) {
+            return Json(json!({"error": e.to_string()}));
+        }
         // ancestor chain of this doc, self first
         let mut chain = vec![id];
         let mut cur = id;
