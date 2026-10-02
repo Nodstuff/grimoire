@@ -4,5 +4,10 @@
 <dict>
 	<key>aps-environment</key>
 	<string>production</string>
+	<key>com.apple.developer.associated-domains</key>
+	<array>
+		<string>applinks:$(TAISCE_APP_LINK_HOST)</string>
+		<string>webcredentials:$(TAISCE_APP_LINK_HOST)</string>
+	</array>
 </dict>
 </plist>

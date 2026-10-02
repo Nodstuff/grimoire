@@ -33,7 +33,7 @@ struct TaisceCommands: Commands {
                 Divider()
                 let picker = model.workspacePicker
                 ForEach(Array(picker.options.prefix(9).enumerated()), id: \.offset) { i, scope in
-                    item(picker.name(scope), .workspace(i + 1))
+                    item(picker.menuTitle(scope), .workspace(i + 1))
                         .keyboardShortcut(KeyEquivalent(Character(String(i + 1))))
                 }
             }
@@ -44,7 +44,10 @@ struct TaisceCommands: Commands {
 
     private func item(_ title: String, _ command: AppCommand) -> some View {
         Button(title) { run(command) }
-            .disabled(!(router?.canPerform(command, signedIn: signedIn, picker: model.workspacePicker) ?? false))
+            .disabled(!(router?.canPerform(
+                command, signedIn: signedIn, picker: model.workspacePicker,
+                canEdit: { model.access(for: $0).canEdit }, canCreate: model.currentAccess.canCreate
+            ) ?? false))
     }
 
     private func run(_ command: AppCommand) {

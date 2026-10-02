@@ -32,15 +32,85 @@ struct WorkspacePicker: Hashable, Sendable {
         return options[n - 1]
     }
 
+    /// What the switcher shows: `display_name` ("Work · Aoife" when someone
+    /// else's workspace clashes with another), or the name on older servers.
     func name(_ scope: WorkspaceScope) -> String {
         switch scope {
         case .unsorted: "Unsorted"
-        case .id(let id): workspaces.first { $0.id == id }?.name ?? "Workspace"
+        case .id(let id): workspace(id)?.label ?? "Workspace"
         }
     }
 
     func color(_ scope: WorkspaceScope) -> String? {
-        scope.workspaceID.flatMap { id in workspaces.first { $0.id == id }?.color }
+        scope.workspaceID.flatMap { workspace($0)?.color }
+    }
+
+    func workspace(_ id: WorkspaceID) -> Workspace? {
+        workspaces.first { $0.id == id }
+    }
+
+    /// More than one member (yours shared out, or someone else's shared with you).
+    func isShared(_ scope: WorkspaceScope) -> Bool {
+        scope.workspaceID.flatMap(workspace)?.shared ?? false
+    }
+
+    /// The switcher's VoiceOver name: "Family, shared by Aoife, view only".
+    func accessibilityName(_ scope: WorkspaceScope) -> String {
+        var parts = [name(scope)]
+        if let w = scope.workspaceID.flatMap(workspace), w.shared {
+            if !w.isOwn, let owner = w.ownerName, !owner.isEmpty {
+                parts.append("shared by \(owner)")
+            } else {
+                parts.append("shared")
+            }
+            if w.isViewOnly { parts.append("view only") }
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    /// The menu bar's title for ⌘n: the name, marked when shared.
+    func menuTitle(_ scope: WorkspaceScope) -> String {
+        isShared(scope) ? "\(name(scope)) (shared)" : name(scope)
+    }
+}
+
+/// What the signed-in user may change (ADR 0004): a pure function of the
+/// doc's (or screen's) workspace and their role in it. A viewer reads only;
+/// only a workspace's owner moves docs out of it; your Unsorted is yours.
+/// Pins are local, so they are never gated.
+struct EditAccess: Hashable, Sendable {
+    /// edit text, tick checkboxes and to-dos, add and snooze to-dos
+    var canEdit: Bool
+    /// new docs here (under a doc, or at the top of the current workspace)
+    var canCreate: Bool
+    /// "Move to workspace…" (a label change leaves this space)
+    var canMove: Bool
+    /// the doc screen's small note
+    var note: String?
+
+    static let full = EditAccess(canEdit: true, canCreate: true, canMove: true, note: nil)
+    static let viewOnly = EditAccess(canEdit: false, canCreate: false, canMove: false, note: "View only")
+
+    /// For a doc resolving to `workspaceID` (nil = your Unsorted). A
+    /// workspace this device doesn't know (an older server, a list not yet
+    /// loaded) is treated as yours: the server still refuses, and the outbox
+    /// says so.
+    static func forDoc(workspaceID: WorkspaceID?, workspaces: [Workspace]) -> EditAccess {
+        guard let id = workspaceID, let w = workspaces.first(where: { $0.id == id }) else { return .full }
+        if w.isViewOnly { return .viewOnly }
+        // an editor writes, but only the owner moves docs out
+        return EditAccess(canEdit: true, canCreate: true, canMove: w.isOwn, note: nil)
+    }
+
+    /// For a screen showing `scope` (Today, To-dos, Library, ⌘N): nil =
+    /// workspaces off (an older server), which is all yours.
+    static func forScope(_ scope: WorkspaceScope?, workspaces: [Workspace]) -> EditAccess {
+        forDoc(workspaceID: scope?.workspaceID, workspaces: workspaces)
+    }
+
+    /// Where a doc can be moved: not into a workspace you only view.
+    static func moveTargets(_ workspaces: [Workspace]) -> [Workspace] {
+        Workspace.ordered(workspaces).filter { !$0.isViewOnly }
     }
 }
 
@@ -93,6 +163,16 @@ struct WorkspacePreference {
 struct WorkspaceBadge: Hashable, Sendable {
     var name: String
     var color: String?
+    var shared = false
+    /// VoiceOver: the name, then "shared by …", "view only"
+    var accessibilityName: String = ""
+
+    init(name: String, color: String? = nil, shared: Bool = false, accessibilityName: String? = nil) {
+        self.name = name
+        self.color = color
+        self.shared = shared
+        self.accessibilityName = accessibilityName ?? name
+    }
 }
 
 /// What an empty workspace says.
@@ -179,6 +259,21 @@ extension AppModel {
     /// nil on a daemon without workspaces.
     var currentWorkspace: WorkspaceScope? { workspacePicker.current }
 
+    /// What you may change in this doc (ADR 0004: a viewer reads only).
+    func access(for id: DocID) -> EditAccess {
+        EditAccess.forDoc(workspaceID: index.byID[id]?.workspaceID, workspaces: workspaces)
+    }
+
+    /// What you may change in the current workspace (to-dos, new docs).
+    var currentAccess: EditAccess {
+        EditAccess.forScope(currentWorkspace, workspaces: workspaces)
+    }
+
+    /// Your own workspaces: the ones you can rename, recolour, reorder, delete.
+    var ownWorkspaces: [Workspace] {
+        Workspace.ordered(workspaces).filter(\.isOwn)
+    }
+
     /// This device's clock, addressed to the current workspace's list.
     func todoClock(now: Date = .now) -> TodoClock {
         TodoClock(now: now).in(currentWorkspace)
@@ -194,7 +289,8 @@ extension AppModel {
     func workspaceBadge(for id: DocID) -> WorkspaceBadge? {
         guard hasWorkspaces, let doc = index.byID[id] else { return nil }
         let scope = WorkspaceScope(doc.workspaceID)
-        return WorkspaceBadge(name: workspacePicker.name(scope), color: workspacePicker.color(scope))
+        let picker = workspacePicker
+        return WorkspaceBadge(name: picker.name(scope), color: picker.color(scope), shared: picker.isShared(scope), accessibilityName: picker.accessibilityName(scope))
     }
 
     /// Library's empty state for the current workspace.
@@ -284,7 +380,8 @@ extension AppModel {
 
     /// Drag to reorder: a key between the new neighbours.
     func moveWorkspace(_ id: WorkspaceID, to index: Int) async -> String? {
-        await updateWorkspace(id, sortKey: WorkspaceManagement.sortKey(moving: id, to: index, in: workspaces))
+        // among your own: the ones shared with you keep their owner's order, after yours
+        await updateWorkspace(id, sortKey: WorkspaceManagement.sortKey(moving: id, to: index, in: workspaces.filter(\.isOwn)))
     }
 
     /// The labels go, the docs stay. Deleting the current one switches to
@@ -300,6 +397,8 @@ extension AppModel {
         }
         let wasCurrent = currentWorkspace == .id(id)
         let fallback = WorkspaceManagement.fallback(afterDeleting: id, from: workspaces)
+        // (the server returns each contributor's labelled roots to them: the
+        // tree rows that follow say where; this is the local first guess)
         workspaces.removeAll { $0.id == id }
         try? await cache?.replaceWorkspaces(workspaces)
         // its docs re-resolve now (Unsorted or an outer workspace): nothing vanishes

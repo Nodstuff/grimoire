@@ -16,7 +16,8 @@ struct LibraryScreen: View {
                 loaded: model.treeLoaded,
                 pins: Set(model.pins),
                 onTogglePin: model.togglePin,
-                onNewDoc: { router.newDoc(in: $0) }
+                // a workspace you only view takes no new docs (ADR 0004)
+                onNewDoc: model.currentAccess.canCreate ? { router.newDoc(in: $0) } : nil
             )
             .refreshable { try? await model.sync?.catchUp() }
             .safeAreaInset(edge: .top, spacing: 0) { WorkspaceBar(triage: true) }

@@ -21,7 +21,8 @@ struct TodayScreen: View {
             onOpen: { router.open(.doc($0)) },
             onUnpin: model.togglePin,
             checked: taps.checked,
-            onToggleDone: { e in taps.tap(e) { await model.markDone($0) } }
+            // a viewer's list is read-only (ADR 0004)
+            onToggleDone: model.currentAccess.canEdit ? { e in taps.tap(e) { await model.markDone($0) } } : nil
         )
         .safeAreaInset(edge: .top, spacing: 0) { WorkspaceBar() } // workspaces
         .refreshable { await reload() }

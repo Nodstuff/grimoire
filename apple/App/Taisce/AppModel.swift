@@ -78,6 +78,22 @@ final class AppModel {
     private(set) var settledTodos: Set<String> = []
     /// a doc just created here: its screen opens in edit mode
     var pendingEditDoc: DocID?
+    /// ADR 0004: docs just unshared from you, for every window to close
+    private(set) var revocation: Revocation?
+    /// the gentle note after an open doc was closed for that
+    var accessNotice: String?
+    /// a sign-in just happened (not a launch with stored tokens): the
+    /// cache's owner check treats unclaimed data as someone else's
+    @ObservationIgnored private var freshSignIn = false
+    /// the cache's owner was checked for this connection
+    @ObservationIgnored private var ownerChecked = false
+
+    struct Revocation: Equatable {
+        var docs: Set<DocID>
+        var serial: Int
+    }
+
+    static let revokedNotice = "This doc is no longer shared with you."
 
     private var observeTask: Task<Void, Never>?
     private var authTask: Task<Void, Never>?
@@ -130,6 +146,8 @@ final class AppModel {
 
     func startSync() async {
         guard authPhase == .signedIn || authPhase == .notRequired else { return }
+        // ADR 0004: whose cache this is, before anything reads or writes it
+        await checkCacheOwner()
         await sync?.start()
         startPolling()
         // never awaited: the notification center's XPC can stall, and the
@@ -161,20 +179,76 @@ final class AppModel {
                 await startSync()
                 return
             }
+            // consumed by the owner check when the state stream says signed in
+            freshSignIn = true
+            ownerChecked = false
             try await auth.signIn(using: SystemWebAuthenticator())
             // the state stream flips authPhase and starts sync
         } catch AuthError.cancelled {
+            freshSignIn = false
         } catch {
+            freshSignIn = false
             lastError = "Sign-in failed: \(error)"
         }
     }
 
-    /// Revoke the grant on the server and clear the Keychain. The cache
-    /// stays (it is per server, and the next sign-in resumes from it).
+    /// Revoke the grant on the server and clear the Keychain, then forget
+    /// this person's data on this device (ADR 0004: the next person to sign
+    /// in starts from nothing): the cache (docs, bodies, search index,
+    /// to-dos, workspaces, cursor, queued writes), pins, the remembered
+    /// workspace, and the due alerts planned from their lists. The client
+    /// id stays (it is the app's, not the person's).
     func signOut() async {
         await stopSync()
         await pushSessionEnding() // push: before the revoke, while the bearer works
         await auth?.signOut()
+        await forgetUserData()
+    }
+
+    /// Wipe everything this device holds for the signed-in person on this
+    /// server: the cache and the per-user settings, then re-plan alerts
+    /// (from nothing, so every pending one goes).
+    func forgetUserData() async {
+        do {
+            try await cache?.wipe()
+        } catch {
+            lastError = "Couldn't clear this device's copy: \(error.localizedDescription)"
+        }
+        await clearUserState()
+        ownerChecked = false
+    }
+
+    /// The per-person state beside the cache: settings in UserDefaults,
+    /// what the model holds in memory, and the alerts planned from it.
+    private func clearUserState() async {
+        UserSettings(server: serverURL).forget()
+        pins = []
+        storedWorkspace = nil
+        workspaces = []
+        workspacesSupported = false
+        editMeta = [:]
+        settledTodos = []
+        pendingEditDoc = nil
+        pendingWrites = 0
+        failedWrites = 0
+        failedDocs = [:]
+        cursor = 0
+        hasSynced = false
+        await sync?.setAlwaysFetch([])
+        await dueAlerts.reconcile()
+    }
+
+    /// The cache must be the signed-in person's (`CacheOwnership`): another
+    /// person's (or unclaimed data under a fresh sign-in) is wiped first.
+    /// Once per connection; LOCAL mode has one person and skips it.
+    func checkCacheOwner() async {
+        guard !ownerChecked, auth != nil, authPhase == .signedIn, let cache, let api else { return }
+        ownerChecked = true
+        let fresh = freshSignIn
+        freshSignIn = false
+        guard let decision = try? await CacheOwnership.reconcile(cache: cache, api: api, freshSignIn: fresh) else { return }
+        // the cache is wiped; the settings that went with it go too
+        if case .wipe = decision { await clearUserState() }
     }
 
     private func authChanged(_ state: AuthSession.State) async {
@@ -182,6 +256,11 @@ final class AppModel {
         if state == .signedIn {
             await startSync()
         } else {
+            // a sign-out we didn't ask for (the grant was revoked or ran
+            // out) keeps the data: the same person signing back in keeps
+            // their queued writes; anyone else gets a wiped cache
+            // (`checkCacheOwner`)
+            ownerChecked = false
             await stopSync()
             await pushSessionEnding() // push
         }
@@ -203,7 +282,9 @@ final class AppModel {
     /// LOCAL-mode one can be reached by name). Unreachable and no tokens:
     /// a loopback daemon is assumed LOCAL, anything else asks to sign in.
     static func authSession(for url: URL) async throws -> AuthSession? {
-        let auth = AuthSession(oauth: OAuthClient(baseURL: url), store: try KeychainTokenStore(), shield: Self.backgroundTask)
+        // the universal-link sign-in where this build claims the host (Release: taisce.null.ie)
+        let oauth = OAuthClient(baseURL: url, appLinkHosts: AppLinks.hosts())
+        let auth = AuthSession(oauth: oauth, store: try KeychainTokenStore(), shield: Self.backgroundTask)
         if await auth.state == .signedIn { return auth }
         do {
             return try await auth.requiresAuth() ? auth : nil
@@ -227,6 +308,7 @@ final class AppModel {
         todoObserveTask?.cancel()
         observedTodoDoc = nil
         hasSynced = false
+        ownerChecked = false
         guard let url = URL(string: serverURL) else {
             lastError = "not a URL: \(serverURL)"
             authPhase = .notRequired
@@ -313,9 +395,27 @@ final class AppModel {
     private func synced(_ u: SyncUpdate) {
         lastSynced = .now
         if u.treeChanged || u.docIDs.contains(where: { $0 == todoDocID }) { todoRevision += 1 }
-        // a label change journals tree rows: names and counts may have moved
-        if u.treeChanged { refreshWorkspaces() }
+        // a label change journals tree rows: names and counts may have moved;
+        // an access change (a share, an unshare, a role) too
+        if u.treeChanged || u.accessChanged { refreshWorkspaces() }
         for id in u.docIDs { editMeta[id] = nil }
+        if !u.revokedDocIDs.isEmpty { revoked(u.revokedDocIDs) }
+    }
+
+    /// ADR 0004: docs no longer shared with you. Sync has dropped them from
+    /// the cache (bodies, search, to-dos, queued writes); pins and per-doc
+    /// state go here; windows showing one close it (`Router.drop`).
+    func revoked(_ ids: Set<DocID>) {
+        let before = pins
+        pins.removeAll { ids.contains($0) }
+        if pins != before {
+            UserDefaults.standard.set(pins, forKey: pinsKey)
+            let keep = Set(pins)
+            Task { await sync?.setAlwaysFetch(keep) }
+        }
+        for id in ids { editMeta[id] = nil }
+        if let p = pendingEditDoc, ids.contains(p) { pendingEditDoc = nil }
+        revocation = Revocation(docs: ids, serial: (revocation?.serial ?? 0) + 1)
     }
 
     /// The indicator reads the engine and outbox every couple of seconds
@@ -352,17 +452,20 @@ final class AppModel {
         guard let api, let cache, !replaying else { return }
         replaying = true
         defer { replaying = false }
-        try? await OutboxReplayer(api: api, cache: cache).replay()
+        let report = try? await OutboxReplayer(api: api, cache: cache).replay()
         pendingWrites = (try? await cache.pendingOutbox().count) ?? pendingWrites
         if pendingWrites == 0 { todoRevision += 1 }
+        if let report, report.forbidden > 0 {
+            // ADR 0004: the role changed under us; the switcher and the
+            // editing affordances follow the server's answer
+            lastError = OutboxReplayer.readOnlyMessage
+            refreshWorkspaces()
+        }
     }
 
     // MARK: pins (local for now)
 
-    private var pinsKey: String {
-        let url = URL(string: serverURL)
-        return "pins-\(url?.host() ?? "server")-\(url?.port ?? 0)"
-    }
+    private var pinsKey: String { UserSettings(server: serverURL).pinsKey }
 
     func isPinned(_ id: DocID) -> Bool { pins.contains(id) }
 
@@ -394,10 +497,7 @@ final class AppModel {
         todoRevision += 1
     }
 
-    var workspaceKey: String {
-        let url = URL(string: serverURL)
-        return "workspace-\(url?.host() ?? "server")-\(url?.port ?? 0)"
-    }
+    var workspaceKey: String { UserSettings(server: serverURL).workspaceKey }
 
     /// Who last edited the doc, from its ledger; cached until the doc changes.
     func loadEditMeta(_ id: DocID) async {

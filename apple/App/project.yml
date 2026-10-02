@@ -59,13 +59,23 @@ targets:
           CODE_SIGN_ENTITLEMENTS: Support/Taisce-Debug.entitlements
           # the Mac adds the App Sandbox (network client only)
           "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": Support/Taisce-Mac-Debug.entitlements
+          # no universal links in Debug (scratch daemons are http; the Mac
+          # test runs need no Associated Domains in the profile): the
+          # custom-scheme sign-in, as every build before
+          TAISCE_APP_LINK_HOST: ""
         Release:
           CODE_SIGN_ENTITLEMENTS: Support/Taisce-Release.entitlements
           "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": Support/Taisce-Mac-Release.entitlements
+          # the server whose /oauth/app-callback this build claims (applinks +
+          # webcredentials in the Release entitlements, TaisceAppLinkHosts in
+          # Info.plist so the app knows): the sign-in redirect only this app can catch
+          TAISCE_APP_LINK_HOST: taisce.null.ie
     info:
       path: Taisce/Info.plist
       properties:
         CFBundleDisplayName: Taisce
+        # the Associated Domains host (AppLinks.hosts): empty in Debug
+        TaisceAppLinkHosts: $(TAISCE_APP_LINK_HOST)
         # the OAuth redirect (ie.null.taisce:/oauth/callback);
         # ASWebAuthenticationSession catches it, this makes the scheme ours
         CFBundleURLTypes:

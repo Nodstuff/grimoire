@@ -126,14 +126,51 @@ final class Router {
     }
 
     /// Whether a command applies now. Nothing works before sign-in; ⌘E
-    /// needs a doc in front; ⌘n needs an nth workspace.
-    func canPerform(_ command: AppCommand, signedIn: Bool, picker: WorkspacePicker) -> Bool {
+    /// needs a doc in front that you may edit (ADR 0004: not a viewer's);
+    /// ⌘N needs a workspace you may add to; ⌘n needs an nth workspace.
+    func canPerform(_ command: AppCommand, signedIn: Bool, picker: WorkspacePicker, canEdit: (DocID) -> Bool = { _ in true }, canCreate: Bool = true) -> Bool {
         guard signedIn else { return false }
         switch command {
-        case .toggleEdit: return editingDoc != nil || focusedDoc != nil
+        case .toggleEdit:
+            // finishing an edit is always allowed
+            if editingDoc != nil { return true }
+            return focusedDoc.map(canEdit) ?? false
+        case .newDoc: return canCreate
         case .workspace(let n): return picker.shortcut(n) != nil
         default: return true
         }
+    }
+
+    /// ADR 0004: docs no longer shared with you leave every stack (and the
+    /// sidebar's selection). True when one was showing in this window.
+    @discardableResult
+    func drop(_ docs: Set<DocID>) -> Bool {
+        guard !docs.isEmpty else { return false }
+        let shown = docs.contains { visibleDocs.contains($0) }
+        func keep(_ r: Route) -> Bool { if case .doc(let id) = r { return !docs.contains(id) }; return true }
+        // a stack is cut at the first dropped doc: what was pushed above it came from it
+        func cut(_ path: [Route]) -> [Route] { Array(path.prefix { keep($0) }) }
+        todayPath = cut(todayPath)
+        libraryPath = cut(libraryPath)
+        todosPath = cut(todosPath)
+        searchPath = cut(searchPath)
+        padPath = cut(padPath)
+        if case .doc(let id)? = padItem, docs.contains(id) {
+            padItem = .today
+            padPath = []
+        }
+        if let e = editingDoc, docs.contains(e) { editingDoc = nil }
+        return shown
+    }
+
+    /// Every doc on a stack in this window, and the sidebar's.
+    var visibleDocs: Set<DocID> {
+        var out: Set<DocID> = []
+        for path in [todayPath, libraryPath, todosPath, searchPath, padPath] {
+            for case .doc(let id) in path { out.insert(id) }
+        }
+        if case .doc(let id)? = padItem { out.insert(id) }
+        return out
     }
 
     /// Do the navigation part of a command; the rest comes back as an effect.
