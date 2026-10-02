@@ -7,11 +7,14 @@ What it is now: ONE personal server, **Taisce** (`https://taisce.null.ie`), plus
   rate-limiting (`--trusted-proxy`), APNs nudges the iOS app. **LOCAL** (no public URL): the
   Mac app's daemon on `127.0.0.1:7425`, loopback-only (DNS-rebinding guard), `/admin/*` behind
   the per-boot `admin.token`.
-- Clients: this web UI (embedded in the binary), the native Apple app under `apple/` on
-  branch `ios-ui` (TaisceKit + the Taisce app), Claude over MCP at `/mcp`.
-- The server box: `infra/` on branch `infra` (Terraform for the EC2 instance, systemd units for
-  taisce + portus + litestream, `deploy/install.sh` run over SSM from a release bundle in the
-  backup bucket). Zero ingress; SSM only.
+- Clients: this web UI (embedded in the binary), the native Apple app under `apple/`
+  (TaisceKit + the Taisce app; Mac Catalyst on branch `catalyst`), Claude over MCP at `/mcp`.
+- The server box: https://taisce.null.ie, EC2 `i-0fe83118e910aac2b` (t4g.micro, eu-west-1,
+  personal account 895102116452, `AWS_PROFILE=taisce-tom`), 443-only SG, SSM only. `infra/` holds
+  OpenTofu (state in `s3://taisce-tfstate-895102116452`, never local) and the systemd units for
+  taisce + portus + litestream; `infra/deploy/install.sh` runs over SSM from the release bundle in
+  `s3://taisce-backups-895102116452/releases/current/` (regenerate SHA256SUMS every deploy).
+  Rebuild `ui/dist` (`cd ui && npm run build`) before the zigbuild: the UI is embedded.
 - Cut on 2026-10-01 and gone from the code: peer-to-peer federation (iroh, shares, mirrors,
   hubs), hot docs and agents in the room, canvases, doc freshness views, the status chip, the
   reviewer gardener. ADRs 0002/0003 are marked superseded; a store migration dropped the
@@ -34,11 +37,11 @@ account may be flipped to the work account by other sessions — push with
 - Big builds: a fresh general-purpose agent (forks inherit the whole conversation and die on
   context), in an isolated worktree if a release may build concurrently; commit as you go.
 - The server target must keep building: `cargo zigbuild --release -p taisce --target
-  aarch64-unknown-linux-gnu`; ship it with the `infra` branch's SSM deploy. Never point a test
+  aarch64-unknown-linux-gnu`; ship it with the SSM deploy above. Never point a test
   daemon at the server or at `~/.grimoire`.
 
 ## Where the truth is
-- **System docs**: the `[[Grimoire]]` doc tree in Taisce itself (MCP server registered as `grimoire`):
+- **System docs**: the `[[Grimoire]]` doc tree in Taisce itself (MCP server registered as `taisce`):
   Architecture, Review Gate, Gardeners, Agent Guide, Using the App, Development, Roadmap
   (its Federation and Hot Docs pages describe removed features). `PROJECT.md` is the founding
   design record and its status section says what has since been built and cut.
