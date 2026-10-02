@@ -290,7 +290,8 @@ struct SoftPasskeyAuthenticator: WebAuthenticator {
     let binary: String
     let enrollURL: String
 
-    func authenticate(url: URL, callbackScheme: String) async throws -> URL {
+    func authenticate(url: URL, callback: OAuthCallback) async throws -> URL {
+        let callbackScheme = URL(string: callback.redirectURI)?.scheme
         let p = Process()
         p.executableURL = URL(fileURLWithPath: binary)
         p.arguments = [enrollURL, url.absoluteString]

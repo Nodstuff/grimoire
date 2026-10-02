@@ -138,11 +138,20 @@ public struct WorkspaceRecord: Codable, Sendable, Hashable, FetchableRecord, Per
     public var icon: String?
     public var sortKey: String?
     public var docCount: Int
+    // multi-user (v4): kept so a viewer stays read-only offline
+    public var role: String?
+    public var ownerID: String?
+    public var ownerName: String?
+    public var displayName: String?
+    public var shared: Bool
 
     public enum CodingKeys: String, CodingKey, ColumnExpression {
-        case id, name, color, icon
+        case id, name, color, icon, role, shared
         case sortKey = "sort_key"
         case docCount = "doc_count"
+        case ownerID = "owner_id"
+        case ownerName = "owner_name"
+        case displayName = "display_name"
     }
 
     init(_ w: Workspace) {
@@ -152,9 +161,17 @@ public struct WorkspaceRecord: Codable, Sendable, Hashable, FetchableRecord, Per
         icon = w.icon
         sortKey = w.sortKey
         docCount = w.docCount
+        role = w.role
+        ownerID = w.ownerID
+        ownerName = w.ownerName
+        displayName = w.displayName
+        shared = w.shared
     }
 
     public var workspace: Workspace {
-        Workspace(id: id, name: name, color: color, icon: icon, sortKey: sortKey, docCount: docCount)
+        Workspace(
+            id: id, name: name, color: color, icon: icon, sortKey: sortKey, docCount: docCount,
+            role: role, ownerID: ownerID, ownerName: ownerName, displayName: displayName, shared: shared
+        )
     }
 }

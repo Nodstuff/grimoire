@@ -4,7 +4,9 @@ import Foundation
 /// The app implements it with `ASWebAuthenticationSession` (shared, not
 /// ephemeral, so iCloud Keychain passkeys work); tests script it.
 public protocol WebAuthenticator: Sendable {
-    func authenticate(url: URL, callbackScheme: String) async throws -> URL
+    /// `callback` is where the server will redirect: the custom scheme, or
+    /// the universal link on the server's host.
+    func authenticate(url: URL, callback: OAuthCallback) async throws -> URL
 }
 
 /// One server's sign-in state and the `TokenProvider` every request goes
@@ -103,11 +105,11 @@ public actor AuthSession: TokenProvider {
     /// Register (once per server), run the browser sign-in, exchange the code.
     public func signIn(using web: any WebAuthenticator) async throws {
         let d = try await discovered()
-        let clientID = try await registeredClient(d)
-        let req = try oauth.authorizationRequest(d, clientID: clientID)
+        let (clientID, via) = try await registeredClient(d)
+        let req = try oauth.authorizationRequest(d, clientID: clientID, redirectURI: via.redirectURI)
         let callback: URL
         do {
-            callback = try await web.authenticate(url: req.url, callbackScheme: OAuthClient.callbackScheme)
+            callback = try await web.authenticate(url: req.url, callback: via)
         } catch is CancellationError {
             throw AuthError.cancelled
         }
@@ -163,15 +165,33 @@ public actor AuthSession: TokenProvider {
         return d
     }
 
-    /// The cached DCR client id, or a fresh registration. A cached id the
-    /// server no longer knows (a wiped server) is replaced.
-    func registeredClient(_ d: OAuthDiscovery) async throws -> String {
-        if let id = try store.clientID(for: server) {
-            if await oauth.clientIsKnown(id, d) != false { return id }
+    /// The client to sign in with and the redirect to use: the cached DCR
+    /// client id, or a fresh registration. A cached id the server no longer
+    /// knows (a wiped server) is replaced.
+    ///
+    /// Where the universal link is possible (`OAuthClient.appLinkCallback`)
+    /// it comes first: the cached client if it holds that redirect, else a
+    /// registration of it beside the custom scheme (the server maps that to
+    /// its pinned app client). A server that refuses it (one from before
+    /// the universal link) leaves everything exactly as before: the custom
+    /// scheme with the cached or a custom-scheme-only client. Only a sign-in
+    /// runs this; a signed-in device keeps its tokens and client.
+    func registeredClient(_ d: OAuthDiscovery) async throws -> (String, OAuthCallback) {
+        let cached = try store.clientID(for: server)
+        if let link = oauth.appLinkCallback {
+            if let cached, await oauth.clientIsKnown(cached, d, redirectURI: link.redirectURI) == true {
+                return (cached, link)
+            }
+            if let reg = try? await oauth.register(d, redirectURIs: [link.redirectURI, OAuthClient.redirectURI]),
+               reg.redirectURIs.contains(link.redirectURI) {
+                try store.setClientID(reg.clientID, for: server)
+                return (reg.clientID, link)
+            }
         }
+        if let cached, await oauth.clientIsKnown(cached, d) != false { return (cached, .custom) }
         let id = try await oauth.register(d)
         try store.setClientID(id, for: server)
-        return id
+        return (id, .custom)
     }
 
     private func refresh(from t: TokenSet) async throws -> TokenSet {

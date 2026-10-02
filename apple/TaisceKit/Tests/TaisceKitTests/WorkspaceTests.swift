@@ -139,7 +139,7 @@ import Testing
         }
         let cache = try Cache(writer: q)
         let applied = try await q.read { db in try Cache.migrator.appliedIdentifiers(db) }
-        #expect(applied == ["v1", "v2", "v2-workspaces", "v3"])
+        #expect(applied == ["v1", "v2", "v2-workspaces", "v3", "v4-multi-user"])
         let (outbox, docCols, todoCols, wsTable) = try await q.read { db in
             (try db.columns(in: "outbox").map(\.name), try db.columns(in: "docs").map(\.name),
              try db.columns(in: "todos").map(\.name), try db.tableExists("workspaces"))

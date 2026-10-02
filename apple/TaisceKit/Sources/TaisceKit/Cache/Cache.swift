@@ -5,11 +5,13 @@ import GRDB
 /// parsed from the To-do doc, the sync cursor and the write outbox.
 public final class Cache: Sendable {
     let db: any DatabaseWriter
+    /// the database file (nil in memory)
+    let path: String?
 
     /// On-disk cache (WAL). Pass a path under Application Support.
     public convenience init(path: String) throws {
         try Cache.protectDirectory(ofDatabaseAt: path)
-        try self.init(writer: DatabasePool(path: path))
+        try self.init(writer: DatabasePool(path: path), path: path)
         try Cache.protectFiles(ofDatabaseAt: path)
     }
 
@@ -18,8 +20,9 @@ public final class Cache: Sendable {
         try Cache(writer: DatabaseQueue())
     }
 
-    init(writer: any DatabaseWriter) throws {
+    init(writer: any DatabaseWriter, path: String? = nil) throws {
         db = writer
+        self.path = path
         try Self.migrator.migrate(db)
     }
 
@@ -120,7 +123,68 @@ public final class Cache: Sendable {
             // editor reopens with the conflict still standing
             try db.alter(table: "outbox") { t in t.add(column: "conflict", .boolean).notNull().defaults(to: false) }
         }
+        m.registerMigration("v4-multi-user") { db in
+            // ADR 0004: the signed-in user's role in each workspace (a viewer
+            // stays read-only offline) and who the cache belongs to
+            try db.alter(table: "workspaces") { t in
+                t.add(column: "role", .text)
+                t.add(column: "owner_id", .text)
+                t.add(column: "owner_name", .text)
+                t.add(column: "display_name", .text)
+                t.add(column: "shared", .boolean).notNull().defaults(to: false)
+            }
+            try db.create(table: "cache_meta") { t in
+                t.primaryKey("key", .text)
+                t.column("value", .text).notNull()
+            }
+        }
         return m
+    }
+
+    // MARK: whose cache this is (ADR 0004)
+
+    /// The signed-in user this cache holds data for (their human principal
+    /// id from `/api/profile`), nil before it was ever recorded.
+    public func owner() async throws -> String? {
+        try await db.read { db in try String.fetchOne(db, sql: "SELECT value FROM cache_meta WHERE key = 'owner'") }
+    }
+
+    public func setOwner(_ id: String) async throws {
+        try await db.write { db in
+            try db.execute(sql: "INSERT INTO cache_meta(key, value) VALUES ('owner', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", arguments: [id])
+        }
+    }
+
+    /// Whether anything is cached at all (docs, workspaces or queued writes).
+    public func isEmpty() async throws -> Bool {
+        try await db.read { db in
+            try Int.fetchOne(db, sql: "SELECT (SELECT count(*) FROM docs) + (SELECT count(*) FROM workspaces) + (SELECT count(*) FROM outbox)") == 0
+        }
+    }
+
+    /// Forget everything: the tree, bodies (and with them the search
+    /// index), to-dos, workspaces, the cursor, queued writes and the owner.
+    /// Freed pages are zeroed (`secure_delete`), the file is compacted and
+    /// the WAL truncated, so a signed-out user's content doesn't linger on
+    /// disk for the next person on this device.
+    public func wipe() async throws {
+        try await db.write { db in
+            try db.execute(sql: "PRAGMA secure_delete = ON")
+            // blocks go with their docs (cascade), and blocks_fts with them (triggers)
+            try db.execute(sql: "DELETE FROM blocks")
+            try db.execute(sql: "DELETE FROM docs")
+            try db.execute(sql: "DELETE FROM todos")
+            try db.execute(sql: "DELETE FROM workspaces")
+            try db.execute(sql: "DELETE FROM outbox")
+            try db.execute(sql: "DELETE FROM sync_state")
+            try db.execute(sql: "DELETE FROM cache_meta")
+            // FTS5 shadow tables keep deleted terms until merged: rebuild from the (now empty) blocks
+            try db.execute(sql: "INSERT INTO blocks_fts(blocks_fts) VALUES ('rebuild')")
+        }
+        try await db.vacuum()
+        try await db.writeWithoutTransaction { db in try db.checkpoint(.truncate) }
+        // SQLite may have recreated the WAL/SHM: give them the cache's class again
+        if let path { try Cache.protectFiles(ofDatabaseAt: path) }
     }
 
     // MARK: sync cursor
@@ -172,6 +236,7 @@ public final class Cache: Sendable {
             let keep = Set(summaries.map(\.id))
             for id in bodyEpochs.keys where !keep.contains(id) {
                 _ = try DocRecord.deleteOne(db, key: id)
+                try TodoRecord.filter(TodoRecord.Columns.docID == id).deleteAll(db)
             }
             for s in summaries {
                 try DocRecord(s, bodyEpoch: bodyEpochs[s.id] ?? nil).upsert(db)
@@ -256,8 +321,28 @@ public final class Cache: Sendable {
         }
     }
 
+    /// Drop a doc, its blocks (and their search index) and, for a To-do
+    /// doc, its parsed items (which plan due alerts).
     public func deleteDoc(_ id: DocID) async throws {
-        try await db.write { db in _ = try DocRecord.deleteOne(db, key: id) }
+        try await db.write { db in
+            _ = try DocRecord.deleteOne(db, key: id)
+            try TodoRecord.filter(TodoRecord.Columns.docID == id).deleteAll(db)
+        }
+    }
+
+    /// Every cached doc below `roots` (not the roots themselves).
+    public func descendants(of roots: Set<DocID>) async throws -> Set<DocID> {
+        try await db.read { db in
+            let rows = try Row.fetchAll(db, sql: "SELECT id, parent_id FROM docs WHERE parent_id IS NOT NULL")
+            var children: [DocID: [DocID]] = [:]
+            for r in rows { children[r["parent_id"] as DocID, default: []].append(r["id"]) }
+            var out: Set<DocID> = []
+            var stack = Array(roots)
+            while let next = stack.popLast() {
+                for c in children[next] ?? [] where !roots.contains(c) && out.insert(c).inserted { stack.append(c) }
+            }
+            return out
+        }
     }
 
     /// Offline full-text search over cached bodies.

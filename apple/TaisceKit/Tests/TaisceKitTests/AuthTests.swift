@@ -19,6 +19,15 @@ final class FakeAuthServer: Sendable {
         var refreshDelay: TimeInterval = 0.05
         /// GET /.well-known answers with the SPA, as a LOCAL-mode daemon does
         var localMode = false
+        /// the server takes the universal-link redirect (this build's server);
+        /// false = an older one, which refuses it at registration
+        var appLinks = false
+        /// redirects per client beyond the custom scheme (default: custom only)
+        var clientRedirects: [String: [String]] = [:]
+        /// every registration's redirect_uris
+        var registered: [[String]] = []
+        /// the callback each sign-in was told to wait for
+        var callbacks: [OAuthCallback] = []
     }
 
     final class Box: Sendable {
@@ -45,6 +54,14 @@ final class FakeAuthServer: Sendable {
     func oauth() -> OAuthClient {
         OAuthClient(baseURL: URL(string: Self.base)!, session: server.session)
     }
+
+    /// As the release app sees taisce.null.ie: an https origin whose host
+    /// the build claims (the mock answers any URL the session sends).
+    func appLinkOAuth(available: Bool = true) -> OAuthClient {
+        OAuthClient(baseURL: URL(string: Self.httpsBase)!, appLinkHosts: ["mock.local"], httpsCallbackAvailable: available, session: server.session)
+    }
+
+    static let httpsBase = "https://mock.local"
 
     func api(_ provider: any TokenProvider) -> APIClient {
         APIClient(config: ServerConfig(baseURL: URL(string: Self.base)!, tokenProvider: provider), session: server.session)
@@ -80,19 +97,32 @@ final class FakeAuthServer: Sendable {
             "client_id_metadata_document_supported":true,"authorization_response_iss_parameter_supported":true}
             """)
         case ("POST", "/oauth/register"):
-            let id = state.withLock { s in
+            struct Body: Decodable { var redirect_uris: [String] }
+            let uris = (r.httpBody.flatMap { try? JSONDecoder().decode(Body.self, from: $0) })?.redirect_uris ?? []
+            let link = uris.first { $0.hasPrefix("https://") }
+            let reply: MockServer.Reply = state.withLock { s in
+                s.registered.append(uris)
+                if let link {
+                    // an older server: not an allowed redirect; this one: the pinned app client
+                    guard s.appLinks else { return Self.oauthError("invalid_redirect_uri") }
+                    s.knownClients.insert("taisce-app")
+                    s.clientRedirects["taisce-app"] = [OAuthClient.redirectURI, link]
+                    return MockServer.Reply(status: 201, chunks: [Data(#"{"client_id":"taisce-app","redirect_uris":["\#(OAuthClient.redirectURI)","\#(link)"]}"#.utf8)])
+                }
                 s.registrations += 1
                 let id = "dcr_\(s.registrations)"
                 s.knownClients.insert(id)
-                return id
+                return MockServer.Reply(status: 201, chunks: [Data(#"{"client_id":"\#(id)","token_endpoint_auth_method":"none"}"#.utf8)])
             }
-            return MockServer.Reply(status: 201, chunks: [Data(#"{"client_id":"\#(id)","token_endpoint_auth_method":"none"}"#.utf8)])
+            return reply
         case ("GET", "/oauth/authorize"):
             // the probe: known client → redirect with invalid_request (no PKCE)
-            guard snapshot.knownClients.contains(r.query["client_id"] ?? "") else {
+            let id = r.query["client_id"] ?? ""
+            let redirect = r.query["redirect_uri"] ?? OAuthClient.redirectURI
+            guard snapshot.knownClients.contains(id), (snapshot.clientRedirects[id] ?? [OAuthClient.redirectURI]).contains(redirect) else {
                 return MockServer.Reply(status: 400, chunks: [Data("<p>Unknown client</p>".utf8)], contentType: "text/html")
             }
-            return MockServer.Reply(status: 302, chunks: [], headers: ["Location": "ie.null.taisce:/oauth/callback?error=invalid_request"])
+            return MockServer.Reply(status: 302, chunks: [], headers: ["Location": "\(redirect)?error=invalid_request"])
         case ("POST", "/oauth/token"):
             return token(Self.form(r), state)
         case ("POST", "/oauth/revoke"):
@@ -152,10 +182,13 @@ struct ScriptedWeb: WebAuthenticator {
     var server: FakeAuthServer
     var mangle: @Sendable (inout [URLQueryItem]) -> Void = { _ in }
 
-    func authenticate(url: URL, callbackScheme: String) async throws -> URL {
+    func authenticate(url: URL, callback: OAuthCallback) async throws -> URL {
         let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-        server.state.withLock { $0.challenge = q.first { $0.name == "code_challenge" }?.value }
-        var c = URLComponents(string: "\(callbackScheme):/oauth/callback")!
+        server.state.withLock {
+            $0.challenge = q.first { $0.name == "code_challenge" }?.value
+            $0.callbacks.append(callback)
+        }
+        var c = URLComponents(string: callback.redirectURI)!
         var items = [
             URLQueryItem(name: "code", value: "code1"),
             URLQueryItem(name: "iss", value: FakeAuthServer.base),
@@ -246,6 +279,102 @@ struct ScriptedWeb: WebAuthenticator {
         try await auth.signIn(using: ScriptedWeb(server: fake))
         #expect(fake.snapshot.registrations == 1)
         #expect(fake.server.requests.contains { $0.path == "/oauth/authorize" && $0.query["client_id"] == "dcr_1" })
+    }
+
+    // MARK: the universal-link redirect (ADR 0004 follow-up)
+
+    func appLinkSession(_ fake: FakeAuthServer, store: MemoryTokenStore, available: Bool = true) -> AuthSession {
+        let clock = self.clock
+        return AuthSession(oauth: fake.appLinkOAuth(available: available), store: store, now: { clock.withLock { $0 } })
+    }
+
+    static let appLink = "https://mock.local/oauth/app-callback"
+
+    @Test func aNewServerSignsInThroughTheUniversalLink() async throws {
+        let fake = FakeAuthServer { $0.appLinks = true }
+        let store = MemoryTokenStore()
+        let auth = appLinkSession(fake, store: store)
+        try await auth.signIn(using: ScriptedWeb(server: fake))
+        #expect(await auth.state == .signedIn)
+        // registered with the https redirect first, beside the custom scheme
+        #expect(fake.snapshot.registered == [[Self.appLink, OAuthClient.redirectURI]])
+        #expect(try store.clientID(for: FakeAuthServer.httpsBase) == "taisce-app")
+        #expect(fake.snapshot.callbacks == [.https(host: "mock.local", path: "/oauth/app-callback")])
+        let f = try #require(fake.snapshot.tokenForms.first)
+        #expect(f["redirect_uri"] == Self.appLink, "the code is exchanged at the redirect it came back on")
+        // next sign-in: the cached client holds the link, so no new registration
+        await auth.signOut()
+        try await auth.signIn(using: ScriptedWeb(server: fake))
+        #expect(fake.snapshot.registered.count == 1)
+        #expect(fake.snapshot.callbacks.last == .https(host: "mock.local", path: "/oauth/app-callback"))
+    }
+
+    @Test func anOlderServerKeepsTheCustomScheme() async throws {
+        // the server deployed before this build refuses the https redirect
+        let fake = FakeAuthServer { $0.appLinks = false }
+        let store = MemoryTokenStore()
+        let auth = appLinkSession(fake, store: store)
+        try await auth.signIn(using: ScriptedWeb(server: fake))
+        #expect(await auth.state == .signedIn)
+        #expect(fake.snapshot.registered == [[Self.appLink, OAuthClient.redirectURI], [OAuthClient.redirectURI]])
+        #expect(try store.clientID(for: FakeAuthServer.httpsBase) == "dcr_1")
+        #expect(fake.snapshot.callbacks == [.custom])
+        #expect(fake.snapshot.tokenForms.first?["redirect_uri"] == OAuthClient.redirectURI)
+    }
+
+    @Test func aCachedCustomSchemeClientMovesToTheLinkOnlyAtSignIn() async throws {
+        // a device signed in with the custom scheme keeps its tokens and
+        // client: nothing re-registers until it signs in again
+        let fake = FakeAuthServer {
+            $0.appLinks = true
+            $0.knownClients = ["dcr_0"]
+        }
+        let now = clock.withLock { $0 }
+        let store = MemoryTokenStore(
+            tokens: [FakeAuthServer.httpsBase: TokenSet(accessToken: "a0", refreshToken: "r0", expiresAt: now.addingTimeInterval(3600))],
+            clients: [FakeAuthServer.httpsBase: "dcr_0"]
+        )
+        let auth = appLinkSession(fake, store: store)
+        #expect(await auth.state == .signedIn)
+        #expect(try await auth.token() == "a0")
+        #expect(fake.snapshot.registered.isEmpty && fake.snapshot.tokenForms.isEmpty)
+        // a later sign-in: dcr_0 doesn't hold the link, so the app registers it
+        await auth.signOut()
+        try await auth.signIn(using: ScriptedWeb(server: fake))
+        #expect(try store.clientID(for: FakeAuthServer.httpsBase) == "taisce-app")
+        #expect(fake.snapshot.callbacks == [.https(host: "mock.local", path: "/oauth/app-callback")])
+    }
+
+    @Test func withoutTheOSCallbackTheCustomSchemeIsUsed() async throws {
+        let fake = FakeAuthServer { $0.appLinks = true }
+        let auth = appLinkSession(fake, store: MemoryTokenStore(), available: false)
+        try await auth.signIn(using: ScriptedWeb(server: fake))
+        #expect(fake.snapshot.registered == [[OAuthClient.redirectURI]])
+        #expect(fake.snapshot.callbacks == [.custom])
+    }
+
+    @Test func redirectSelectionByOSVersionAndServer() {
+        let v = { (major: Int, minor: Int) in OperatingSystemVersion(majorVersion: major, minorVersion: minor, patchVersion: 0) }
+        // iOS 17.4 and macOS 14.4 brought ASWebAuthenticationSession's https callback
+        #expect(!OAuthCallback.httpsSupported(v(17, 3), mac: false))
+        #expect(OAuthCallback.httpsSupported(v(17, 4), mac: false))
+        #expect(OAuthCallback.httpsSupported(v(26, 0), mac: false))
+        #expect(!OAuthCallback.httpsSupported(v(14, 3), mac: true))
+        #expect(OAuthCallback.httpsSupported(v(14, 4), mac: true))
+        #expect(OAuthCallback.httpsSupported(v(26, 0), mac: true))
+        // this build's targets are above both floors
+        #expect(OAuthCallback.httpsSupported(ProcessInfo.processInfo.operatingSystemVersion, mac: OAuthCallback.runningOnMac))
+
+        let hosts: Set<String> = ["taisce.null.ie"]
+        let prod = URL(string: "https://taisce.null.ie")!
+        #expect(OAuthCallback.appLink(for: prod, claimedHosts: hosts, available: true) == .https(host: "taisce.null.ie", path: "/oauth/app-callback"))
+        #expect(OAuthCallback.appLink(for: prod, claimedHosts: hosts, available: true)?.redirectURI == "https://taisce.null.ie/oauth/app-callback")
+        #expect(OAuthCallback.appLink(for: prod, claimedHosts: hosts, available: false) == nil, "an older OS")
+        #expect(OAuthCallback.appLink(for: prod, claimedHosts: [], available: true) == nil, "a build without the entitlement (Debug)")
+        #expect(OAuthCallback.appLink(for: URL(string: "http://127.0.0.1:7531")!, claimedHosts: ["127.0.0.1"], available: true) == nil, "plain http")
+        #expect(OAuthCallback.appLink(for: URL(string: "https://other.example")!, claimedHosts: hosts, available: true) == nil, "another host")
+        #expect(OAuthCallback.appLink(for: URL(string: "https://taisce.null.ie:8443")!, claimedHosts: hosts, available: true) == nil, "universal links are port 443")
+        #expect(OAuthCallback.custom.redirectURI == "ie.null.taisce:/oauth/callback")
     }
 
     @Test func authorizationURLCarriesPKCEStateAndResource() async throws {
@@ -414,5 +543,5 @@ struct ScriptedWeb: WebAuthenticator {
 
 /// The user closed the sign-in sheet.
 struct CancellingWeb: WebAuthenticator {
-    func authenticate(url: URL, callbackScheme: String) async throws -> URL { throw AuthError.cancelled }
+    func authenticate(url: URL, callback: OAuthCallback) async throws -> URL { throw AuthError.cancelled }
 }

@@ -86,7 +86,35 @@ public struct TodoParseHint: Decodable, Sendable, Hashable {
     }
 }
 
+/// `GET /api/profile`: the signed-in person (SERVER mode: the token's user;
+/// LOCAL: the one human). `principal_id` is what the cache is keyed to.
+public struct Profile: Decodable, Sendable, Hashable {
+    public var name: String
+    public var principalID: String?
+
+    public init(name: String, principalID: String?) {
+        self.name = name
+        self.principalID = principalID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case principalID = "principal_id"
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        principalID = try c.decodeIfPresent(String.self, forKey: .principalID)
+    }
+}
+
 extension APIClient {
+    /// Who the token belongs to. Read-only.
+    public func profile() async throws -> Profile {
+        try await get("/api/profile")
+    }
+
     /// The doc's op ledger, newest first (the server caps it at 100).
     public func docHistory(_ id: DocID) async throws -> [DocHistoryEntry] {
         try await get("/api/doc/\(id)/history")

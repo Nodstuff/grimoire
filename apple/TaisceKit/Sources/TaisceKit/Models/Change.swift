@@ -70,18 +70,27 @@ public struct Change: Codable, Sendable, Hashable {
     public var epoch: Int?
     public var at: String
     public var doc: DocState?
+    /// ADR 0004: set on a row addressed to the signed-in user alone:
+    /// `revoked` (kind `deleted`: the doc is no longer shared with you; drop
+    /// it, it is not in your Trash) or `granted` (kind `tree`: newly shared
+    /// with you; fetch it). Absent on ordinary rows and older servers.
+    public var access: String?
 
-    public init(seq: Int, docID: DocID, kind: Kind, epoch: Int? = nil, at: String = "", doc: DocState? = nil) {
+    public init(seq: Int, docID: DocID, kind: Kind, epoch: Int? = nil, at: String = "", doc: DocState? = nil, access: String? = nil) {
         self.seq = seq
         self.docID = docID
         self.kind = kind
         self.epoch = epoch
         self.at = at
         self.doc = doc
+        self.access = access
     }
 
+    public var isRevoked: Bool { access == "revoked" }
+    public var isGranted: Bool { access == "granted" }
+
     enum CodingKeys: String, CodingKey {
-        case seq, kind, epoch, at, doc
+        case seq, kind, epoch, at, doc, access
         case docID = "doc_id"
     }
 }

@@ -267,6 +267,10 @@ extension Cache {
         }
     }
 
+    public func dropOutboxEntry(_ id: Int64) async throws {
+        try await db.write { db in _ = try OutboxEntry.deleteOne(db, key: id) }
+    }
+
     /// Entries the server refused, oldest first.
     public func failedOutbox() async throws -> [OutboxEntry] {
         try await db.read { db in
@@ -282,6 +286,32 @@ extension Cache {
             for id in ids {
                 try db.execute(sql: "UPDATE outbox SET state = 'pending', last_error = NULL WHERE id = ?", arguments: [id])
             }
+        }
+    }
+
+    /// The doc a queued write addresses, if any: a propose's `doc_id`, or
+    /// the id in a `/api/doc/{id}/…` or `/api/docs/{id}/…` path.
+    static func docID(of e: OutboxEntry) -> DocID? {
+        if let (doc, _) = OutboxReplayer.proposeBase(e) { return doc }
+        let parts = e.path.split(separator: "/")
+        if parts.count >= 3, parts[0] == "api", parts[1] == "doc" || parts[1] == "docs" { return String(parts[2]) }
+        return nil
+    }
+
+    /// Drop every write for `docIDs`, queued, refused or landed (ADR 0004:
+    /// no longer shared with us, so it can never land, and a landed one's
+    /// body is that doc's text). Other entries are untouched.
+    @discardableResult
+    public func dropOutbox(forDocs docIDs: Set<DocID>) async throws -> Int {
+        guard !docIDs.isEmpty else { return 0 }
+        return try await db.write { db in
+            var n = 0
+            for e in try OutboxEntry.fetchAll(db) {
+                guard let doc = Cache.docID(of: e), docIDs.contains(doc) else { continue }
+                _ = try e.delete(db)
+                n += 1
+            }
+            return n
         }
     }
 
@@ -331,7 +361,20 @@ public struct OutboxReplayer: Sendable {
         self.cache = cache
     }
 
-    public func replay() async throws {
+    /// What a replay ran into, beyond what it sent.
+    public struct Report: Sendable, Hashable {
+        /// entries the server refused as read-only (403: a viewer's write)
+        public var forbidden = 0
+        /// entries dropped because their target is gone or no longer shared (404)
+        public var dropped = 0
+    }
+
+    /// Stored on an entry refused with 403: the workspace is view-only for you.
+    public static let readOnlyMessage = "You can only view this workspace, so this change wasn't saved."
+
+    @discardableResult
+    public func replay() async throws -> Report {
+        var report = Report()
         for queued in try await cache.pendingOutbox() {
             // claim as it stands now: an earlier landing may have rebased it,
             // a coalescing save may have rewritten it
@@ -361,24 +404,34 @@ public struct OutboxReplayer: Sendable {
             } catch let APIError.server(msg) where msg.hasPrefix(Self.liveSessionRefusal) {
                 // a live session freezes the doc's epoch: retry after it ends
                 try await cache.markOutbox(id, state: .pending, error: msg)
-                return
+                return report
             } catch APIError.unauthorized {
                 // signed out or mid-refresh: not this entry's fault, keep it and the order
                 try await cache.markOutbox(id, state: .pending, error: String(describing: APIError.unauthorized))
-                return
+                return report
             } catch let e as APIError where e.isTransient {
                 // 5xx, 408, 429, or a proxy's HTML page: try again later, keep order
                 try await cache.markOutbox(id, state: .pending, error: String(describing: e))
-                return
+                return report
+            } catch let e as APIError where e.isForbidden {
+                // ADR 0004: read-only here (a viewer, or the role changed
+                // under us). Never retried on its own; the rest carry on.
+                try await cache.markOutbox(id, state: .failed, error: Self.readOnlyMessage)
+                report.forbidden += 1
+            } catch APIError.notFound {
+                // gone, or no longer shared with us: it can never land
+                try await cache.dropOutboxEntry(id)
+                report.dropped += 1
             } catch let e as APIError {
                 // the server answered: retrying the same request won't help
                 try await cache.markOutbox(id, state: .failed, error: String(describing: e))
             } catch {
                 // transport failure: leave it for the next replay, keep order
                 try await cache.markOutbox(id, state: .pending, error: String(describing: error))
-                return
+                return report
             }
         }
+        return report
     }
 
     /// `HotRegistry::assert_cold`'s refusal (crates/daemon/src/hot.rs).

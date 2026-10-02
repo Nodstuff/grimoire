@@ -17,8 +17,19 @@ public struct Workspace: Codable, Sendable, Hashable, Identifiable {
     public var docIDs: [DocID]
     /// live docs resolving to it
     public var docCount: Int
+    // ADR 0004 (multi-user servers); all absent on older servers
+    /// the signed-in user's role in it: "owner", "editor" or "viewer"
+    public var role: String?
+    public var ownerID: String?
+    /// the owner's display name
+    public var ownerName: String?
+    /// what a switcher shows: the name, or "Work · Aoife" when someone
+    /// else's workspace clashes with another visible one
+    public var displayName: String?
+    /// it has more than one member
+    public var shared: Bool
 
-    public init(id: WorkspaceID, name: String, color: String? = nil, icon: String? = nil, sortKey: String? = nil, createdAt: String = "", docIDs: [DocID] = [], docCount: Int = 0) {
+    public init(id: WorkspaceID, name: String, color: String? = nil, icon: String? = nil, sortKey: String? = nil, createdAt: String = "", docIDs: [DocID] = [], docCount: Int = 0, role: String? = nil, ownerID: String? = nil, ownerName: String? = nil, displayName: String? = nil, shared: Bool = false) {
         self.id = id
         self.name = name
         self.color = color
@@ -27,14 +38,22 @@ public struct Workspace: Codable, Sendable, Hashable, Identifiable {
         self.createdAt = createdAt
         self.docIDs = docIDs
         self.docCount = docCount
+        self.role = role
+        self.ownerID = ownerID
+        self.ownerName = ownerName
+        self.displayName = displayName
+        self.shared = shared
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, color, icon
+        case id, name, color, icon, role, shared
         case sortKey = "sort_key"
         case createdAt = "created_at"
         case docIDs = "doc_ids"
         case docCount = "doc_count"
+        case ownerID = "owner_id"
+        case ownerName = "owner_name"
+        case displayName = "display_name"
     }
 
     public init(from decoder: any Decoder) throws {
@@ -47,11 +66,31 @@ public struct Workspace: Codable, Sendable, Hashable, Identifiable {
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
         docIDs = try c.decodeIfPresent([DocID].self, forKey: .docIDs) ?? []
         docCount = try c.decodeIfPresent(Int.self, forKey: .docCount) ?? 0
+        role = try c.decodeIfPresent(String.self, forKey: .role)
+        ownerID = try c.decodeIfPresent(String.self, forKey: .ownerID)
+        ownerName = try c.decodeIfPresent(String.self, forKey: .ownerName)
+        displayName = try c.decodeIfPresent(String.self, forKey: .displayName)
+        shared = try c.decodeIfPresent(Bool.self, forKey: .shared) ?? false
     }
 
-    /// Sidebar order: sort key, then name.
+    /// What a switcher shows: `display_name`, else (older servers) the name.
+    public var label: String {
+        guard let displayName, !displayName.isEmpty else { return name }
+        return displayName
+    }
+
+    /// The signed-in user owns it (an older server, without roles, means yes).
+    public var isOwn: Bool { role == nil || role == "owner" }
+
+    /// Read-only for the signed-in user.
+    public var isViewOnly: Bool { role == "viewer" }
+
+    /// Sidebar order: your own workspaces, then the ones shared with you;
+    /// each by sort key, then name.
     public static func ordered(_ all: [Workspace]) -> [Workspace] {
-        all.sorted { ($0.sortKey ?? "", $0.name.lowercased()) < ($1.sortKey ?? "", $1.name.lowercased()) }
+        all.sorted {
+            ($0.isOwn ? 0 : 1, $0.sortKey ?? "", $0.name.lowercased(), $0.id) < ($1.isOwn ? 0 : 1, $1.sortKey ?? "", $1.name.lowercased(), $1.id)
+        }
     }
 }
 
