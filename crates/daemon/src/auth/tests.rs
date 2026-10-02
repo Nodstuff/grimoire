@@ -30,7 +30,7 @@ fn harness_with(cfg: AuthConfig) -> H {
     let agent = store.create_principal(PrincipalKind::Agent, "claude", None).unwrap().id;
     let owner = store.auth_ensure_owner(human, "tom", now()).unwrap().id;
     let store = Arc::new(Mutex::new(store));
-    let dir = std::env::temp_dir().join(format!("grimoire-auth-test-{}", uuid::Uuid::now_v7()));
+    let dir = std::env::temp_dir().join(format!("taisce-auth-test-{}", uuid::Uuid::now_v7()));
     let dedupe = crate::mcp::new_dedupe();
     let st = AuthState::new(cfg, store.clone()).unwrap();
     let hosts = vec![st.cfg.authority(), st.cfg.rp_id.clone()];
@@ -46,7 +46,8 @@ fn harness_with(cfg: AuthConfig) -> H {
         .merge(crate::push::router(crate::push::DevicesState { store: store.clone(), default_env: "production".into() }))
         .merge(router(st.clone()))
         .fallback(|| async { "<!doctype html>ui" })
-        .layer(axum::middleware::from_fn_with_state(st.clone(), require_auth));
+        .layer(axum::middleware::from_fn_with_state(st.clone(), require_auth))
+        .layer(axum::middleware::from_fn(crate::legacy::rename_headers));
     H { app, st, owner, passkey: WebauthnAuthenticator::new(SoftPasskey::new(true)) }
 }
 
@@ -500,10 +501,11 @@ async fn a_connector_token_cannot_name_someone_else() {
     let doc = h.doc("pinned");
     let tom_id = h.st.store.lock().unwrap().auth_owner().unwrap().unwrap().principal_id.to_string();
     // header, ?as= and ?cwd= are not identity sources under a token
-    let spoof = [("x-grimoire-principal", "tom")];
+    let spoof = [("taisce-principal", "tom")];
     let (e, out) = tool(&h.app, &access, "/mcp?as=claude:q&cwd=/x/y", &spoof, "append", json!({"doc_id": doc, "markdown": "a"})).await;
     assert!(!e, "{out}");
     assert_eq!(h.last_writer(doc), "claude:claude");
+    // the pre-rename header name is stripped the same way (legacy.rs)
     let (e, out) = tool(&h.app, &access, "/mcp", &[("x-grimoire-principal", "claude:spoof")], "append", json!({"doc_id": doc, "markdown": "b"})).await;
     assert!(!e, "{out}");
     assert_eq!(h.last_writer(doc), "claude:claude");
@@ -525,7 +527,7 @@ async fn a_connector_token_cannot_name_someone_else() {
     let mut req = post_json("/api/propose", json!({"doc_id": doc, "base_epoch": 0, "ops": [{"kind": {"op": "insert",
         "block_id": uuid::Uuid::now_v7(), "parent_id": null, "order_key": "", "block_type": "paragraph", "content": "api"}}]}));
     req.headers_mut().insert("authorization", format!("Bearer {access}").parse().unwrap());
-    req.headers_mut().insert("x-grimoire-principal", "tom".parse().unwrap());
+    req.headers_mut().insert("taisce-principal", "tom".parse().unwrap());
     let r = send(&h.app, req).await;
     assert!(r.json()["verdicts"].is_array(), "{}", r.body);
     assert_eq!(h.last_writer(doc), "claude:claude");
@@ -537,7 +539,7 @@ async fn the_owners_app_writes_as_the_human_and_ignores_as() {
     assert!(h.enroll().await.status.is_success());
     let app = h.token_for("Taisce iOS", APP_REDIRECT).await;
     let doc = h.doc("from the phone");
-    let (e, out) = tool(&h.app, &app, "/mcp", &[("x-grimoire-principal", "claude:spoof")], "append",
+    let (e, out) = tool(&h.app, &app, "/mcp", &[("taisce-principal", "claude:spoof")], "append",
         json!({"doc_id": doc, "markdown": "a", "as": "claude:whoever"})).await;
     assert!(!e, "{out}");
     assert_eq!(h.last_writer(doc), "tom");

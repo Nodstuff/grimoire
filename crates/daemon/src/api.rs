@@ -32,7 +32,7 @@ pub struct ApiState {
 /// (find-or-create by name, the `identify` rule) instead of the human. Lets
 /// an HTTP client such as workbox get the same provenance an MCP agent gets —
 /// its writes go through the gate as an agent's. Absent → the human.
-pub const PRINCIPAL_HEADER: &str = "x-grimoire-principal";
+pub const PRINCIPAL_HEADER: &str = "taisce-principal";
 
 fn resolve_principal(st: &ApiState, headers: &HeaderMap, s: &mut SqliteStore) -> Result<Uuid, String> {
     match headers.get(PRINCIPAL_HEADER) {
@@ -313,7 +313,7 @@ struct ProposeReq {
     request_id: Option<Uuid>,
 }
 
-/// Writes: propose as the human (or the `X-Grimoire-Principal` agent) —
+/// Writes: propose as the human (or the `Taisce-Principal` agent) —
 /// current-epoch ops green and apply directly, stale ones are scored per op.
 async fn propose(State(st): State<ApiState>, headers: HeaderMap, Json(req): Json<ProposeReq>) -> Json<Value> {
     if let Some(m) = refuse_new_canvas(&req.ops) {
@@ -780,14 +780,14 @@ async fn stamp(State(st): State<ApiState>) -> Json<Value> {
 /// UI build stamp. The app polls this and reloads itself when it changes —
 /// no manual ⌘R after a deploy. With the embedded frontend the stamp is a
 /// hash of the bundled index.html (changes exactly when the UI does); under
-/// the GRIMOIRE_UI_DIST dev override it is that file's mtime. Never a
+/// the TAISCE_UI_DIST dev override it is that file's mtime. Never a
 /// machine-specific path.
 async fn buildinfo() -> Json<Value> {
     Json(json!({"build": build_stamp(), "version": env!("CARGO_PKG_VERSION"), "git": crate::GIT_SHA}))
 }
 
 fn build_stamp() -> u64 {
-    match std::env::var("GRIMOIRE_UI_DIST") {
+    match std::env::var("TAISCE_UI_DIST") {
         Ok(dist) => std::fs::metadata(format!("{dist}/index.html"))
             .and_then(|m| m.modified())
             .ok()
@@ -1010,7 +1010,7 @@ async fn export_vault(State(st): State<ApiState>) -> Json<Value> {
     let stamp = chrono::Utc::now().format("%Y-%m-%d-%H%M").to_string();
     let dir = std::path::PathBuf::from(home)
         .join("Downloads")
-        .join(format!("grimoire-export-{stamp}"));
+        .join(format!("taisce-export-{stamp}"));
     let store = st.store.clone();
     let out = dir.clone();
     let res = tokio::task::spawn_blocking(move || {
@@ -1035,7 +1035,7 @@ async fn doc_markdown(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<
 }
 
 /// One doc to `~/Downloads/<title>.md` — the single-file escape hatch, for
-/// sharing a doc outside Grimoire without exporting the whole vault. A name
+/// sharing a doc outside Taisce without exporting the whole vault. A name
 /// already taken gets ` (2)`, ` (3)`… rather than overwriting.
 async fn export_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
     let (title, md) = match with_store(&st.store, move |s| {
@@ -1298,7 +1298,7 @@ mod http_client_tests {
     fn app() -> (Router, Uuid) {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let human = store.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
-        let dir = std::env::temp_dir().join(format!("grimoire-api-test-{}", Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("taisce-api-test-{}", Uuid::now_v7()));
         let store = Arc::new(Mutex::new(store));
         let st = ApiState {
             changes: crate::changes::Feed::new(&store),
@@ -1476,7 +1476,7 @@ mod http_client_tests {
         let doc = new_doc(&app, &[(PRINCIPAL_HEADER, "workbox")]).await;
         let agent = doc["created_by"].as_str().unwrap().to_string();
         assert_ne!(agent, human.to_string());
-        let doc2 = new_doc(&app, &[("X-Grimoire-Principal", "workbox")]).await;
+        let doc2 = new_doc(&app, &[("Taisce-Principal", "workbox")]).await;
         assert_eq!(doc2["created_by"], agent);
         let ps = call(&app, "GET", "/api/principals", &[], None).await;
         let p = ps.as_array().unwrap().iter().find(|p| p["id"] == agent).unwrap();
@@ -1521,7 +1521,7 @@ mod http_client_tests {
     /// the phone retries after a lost reply and a daemon restart.
     #[tokio::test]
     async fn create_doc_request_id_never_creates_twice() {
-        let dir = std::env::temp_dir().join(format!("grimoire-api-create-idem-{}", Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("taisce-api-create-idem-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("ks.db");
         let human = SqliteStore::open(&db).unwrap().create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
@@ -1552,7 +1552,7 @@ mod http_client_tests {
     /// doc moves exactly once.
     #[tokio::test]
     async fn request_id_replays_after_the_memory_window_and_a_restart() {
-        let dir = std::env::temp_dir().join(format!("grimoire-api-idem-{}", Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("taisce-api-idem-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("ks.db");
         let human = SqliteStore::open(&db).unwrap().create_principal(PrincipalKind::Human, "tom", None).unwrap().id;

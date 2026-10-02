@@ -26,7 +26,7 @@ fn main() {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    println!("cargo:rustc-env=GRIMOIRE_GIT_SHA={sha}");
+    println!("cargo:rustc-env=TAISCE_GIT_SHA={sha}");
     // Re-run when the sha could have changed. `.git/HEAD` alone is not enough:
     // it only moves on a checkout, so a commit on the SAME branch left the
     // stamp stale. Watch the ref HEAD points at, and packed-refs (a gc packs

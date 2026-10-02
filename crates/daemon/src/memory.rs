@@ -1,4 +1,4 @@
-//! Claude memory → Grimoire. Claude Code keeps a curated, per-project memory
+//! Claude memory → Taisce. Claude Code keeps a curated, per-project memory
 //! under `~/.claude/projects/<slug>/memory/*.md` (frontmatter + prose). That
 //! corpus is exactly what ask-the-vault should know, so the daemon mirrors
 //! it into a `Claude Memory` folder: one doc per memory file, filed under

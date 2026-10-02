@@ -1,6 +1,6 @@
 //! Passkeys (webauthn-rs) and the two server-rendered pages that use them:
 //! the sign-in/consent page behind `/oauth/authorize` and the one-time
-//! enrollment page `grimoire auth enroll` links to. No framework, no CDN:
+//! enrollment page `taisce auth enroll` links to. No framework, no CDN:
 //! one inline script and stylesheet, each carrying the response's CSP nonce.
 //!
 //! Ceremony state (the challenge) lives in memory only, keyed by a random
@@ -254,7 +254,7 @@ async fn enroll_page(State(st): State<AuthState>, Query(q): Query<EnrollQuery>, 
     if !ok {
         return error_page(
             StatusCode::GONE,
-            "This enrollment link has expired or was already used. Run `grimoire auth enroll` again.",
+            "This enrollment link has expired or was already used. Run `taisce auth enroll` again.",
         );
     }
     page(

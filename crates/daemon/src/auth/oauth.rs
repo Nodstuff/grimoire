@@ -405,7 +405,7 @@ async fn authorize(State(st): State<AuthState>, headers: HeaderMap, Query(q): Qu
     if !has_passkey {
         return super::passkey::error_page(
             StatusCode::SERVICE_UNAVAILABLE,
-            "No passkey is enrolled yet. On the server, run `grimoire auth enroll` and open the link it prints.",
+            "No passkey is enrolled yet. On the server, run `taisce auth enroll` and open the link it prints.",
         );
     }
     let pending = super::passkey::AuthzRequest {

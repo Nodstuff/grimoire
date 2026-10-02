@@ -448,7 +448,7 @@ pub fn first_line(content: &str, max: usize) -> String {
 
 /// The heading level new root-level sections get when `append` creates a
 /// path that does not exist: the doc's existing root-level section level
-/// (`##` when its sections are `##`). `#` is a doc's title in Grimoire, never
+/// (`##` when its sections are `##`). `#` is a doc's title in Taisce, never
 /// a section, so a doc with only an H1 — or no headings at all — gets `##`
 /// (the first live `append(create_missing)` on an empty daily doc produced
 /// `# grimoire` / `## Done`, 2026-09-11).

@@ -1,6 +1,6 @@
 // taisce-shell: native chrome over the daemon's UI (PROJECT.md §3.2a).
 //
-// The sidecar model: the daemon (`grimoire`) is bundled inside the .app and
+// The sidecar model: the daemon (`taisce`) is bundled inside the .app and
 // the shell owns it. On launch the shell attaches to a daemon already
 // answering on 127.0.0.1:7425 (another shell instance, or one started by
 // hand) or spawns the bundled binary as a child, which dies with the app on
@@ -8,7 +8,8 @@
 // window keeps the ◈ in the menu bar; only the tray's Quit exits.
 //
 // The daemon owns its log (~/.grimoire/ksd.<date>.log, rotated daily) — the
-// shell no longer redirects stdout into a second file.
+// shell no longer redirects stdout into a second file. The data dir keeps its
+// pre-rename name; this legacy app is retired before anything moves it.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -78,9 +79,9 @@ fn parse_version(v: &str) -> (u64, u64, u64) {
     (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
 }
 
-/// The pid of a `grimoire` daemon listening on our port that is NOT the
-/// child we spawned — a leftover from a previous app version, or one started
-/// by hand. Anything else on the port is left alone.
+/// The pid of a `taisce` (or pre-rename `grimoire`) daemon listening on our
+/// port that is NOT the child we spawned — a leftover from a previous app
+/// version, or one started by hand. Anything else on the port is left alone.
 #[cfg(unix)]
 fn foreign_daemon_pid() -> Option<i32> {
     let out = Command::new("lsof").args(["-ti", "tcp:7425", "-sTCP:LISTEN"]).output().ok()?;
@@ -93,7 +94,10 @@ fn foreign_daemon_pid() -> Option<i32> {
             Command::new("ps")
                 .args(["-o", "comm=", "-p", &pid.to_string()])
                 .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains("grimoire"))
+                .map(|o| {
+                    let comm = String::from_utf8_lossy(&o.stdout);
+                    comm.contains("taisce") || comm.contains("grimoire")
+                })
                 .unwrap_or(false)
         })
 }
@@ -104,7 +108,7 @@ fn foreign_daemon_pid() -> Option<i32> {
 #[cfg(unix)]
 fn stop_foreign_daemon() -> bool {
     let Some(pid) = foreign_daemon_pid() else { return !daemon_up() };
-    // SAFETY: kill(2) on a pid we just confirmed is a grimoire daemon
+    // SAFETY: kill(2) on a pid we just confirmed is a taisce daemon
     unsafe {
         libc::kill(pid, libc::SIGTERM);
     }
@@ -175,7 +179,7 @@ fn spawn_sidecar() {
         return;
     };
     let Some(dir) = exe.parent() else { return };
-    let ksd = dir.join("grimoire");
+    let ksd = dir.join("taisce");
     if !ksd.exists() {
         return;
     }
@@ -204,7 +208,7 @@ fn spawn_sidecar() {
     // the daemon exits on its own when this shell is gone (a crash, or the
     // updater swapping the app out from under it), so it can never outlive
     // the app and greet the next version as a stale attach target
-    cmd.env("GRIMOIRE_PARENT_PID", std::process::id().to_string());
+    cmd.env("TAISCE_PARENT_PID", std::process::id().to_string());
     // the daemon writes its own rotating log; a GUI child has no terminal
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
@@ -292,7 +296,7 @@ fn error_page() -> String {
     let log_path = log_path();
     let ui = ui_url(&[]);
     format!(
-        r#"<!doctype html><meta charset="utf-8"><title>Grimoire</title>
+        r#"<!doctype html><meta charset="utf-8"><title>Taisce</title>
 <style>
 :root{{color-scheme:light dark}}
 body{{margin:0;min-height:100vh;display:grid;place-items:center;font:14px -apple-system,system-ui,sans-serif;background:#111;color:#ddd}}
@@ -306,7 +310,7 @@ button:hover{{background:#262626}}
 </style>
 <main data-tauri-drag-region>
 <div style="font-size:36px;opacity:.5;margin-bottom:16px">◈</div>
-<h1>Waiting for Grimoire’s background service</h1>
+<h1>Waiting for Taisce’s background service</h1>
 <p>Your notes are safe. The service that stores and serves them is not answering on port 7425 yet — after an update its first start can take a few seconds. This page switches to your notes as soon as it answers.</p>
 <p>If it never does, its log is in <code>{log_path}</code></p>
 <button onclick="retry()">Try again</button>
@@ -319,7 +323,7 @@ function probe(){{return fetch('{DAEMON_URL}api/stamp',{{mode:'no-cors',cache:'n
 function go(){{location.replace(ui)}}
 function retry(){{
   s.textContent='checking…';
-  probe().then(go).catch(()=>{{s.textContent='still not running — quit Grimoire from the ◈ menu and open it again, or check the log'}});
+  probe().then(go).catch(()=>{{s.textContent='still not running — quit Taisce from the ◈ menu and open it again, or check the log'}});
 }}
 setInterval(()=>probe().then(go).catch(()=>{{}}),3000);
 </script>"#
@@ -336,7 +340,7 @@ fn navigate(app: &AppHandle, target: &str) {
 
 /// The event the page listens for (ui/src/tauri.ts CAPTURE_EVENT): open the
 /// quick-capture palette. Emitted by the global hotkey and the tray item.
-const CAPTURE_EVENT: &str = "grimoire:capture";
+const CAPTURE_EVENT: &str = "taisce:capture";
 
 /// ⌥⌘G system-wide: quick capture from anywhere on the Mac. Not yet
 /// configurable — the constant is the one place to change it.
@@ -373,7 +377,7 @@ fn show_window_with(app: &AppHandle, extra: &[(&str, &str)]) {
         WebviewUrl::CustomProtocol(ERROR_URL.parse().unwrap())
     };
     let built = WebviewWindowBuilder::new(app, "main", url)
-        .title("Grimoire")
+        .title("Taisce")
         .inner_size(1240.0, 860.0)
         .hidden_title(true)
         .title_bar_style(tauri::TitleBarStyle::Overlay)
@@ -382,9 +386,9 @@ fn show_window_with(app: &AppHandle, extra: &[(&str, &str)]) {
         // a window that fails to build leaves a tray and nothing else; say so
         eprintln!("could not create the main window: {e}");
         app.dialog()
-            .message(format!("Grimoire could not open its window.\n\n{e}"))
+            .message(format!("Taisce could not open its window.\n\n{e}"))
             .kind(MessageDialogKind::Error)
-            .title("Grimoire")
+            .title("Taisce")
             .show(|_| {});
         return;
     }
@@ -411,7 +415,7 @@ fn post_admin(path: &str) -> Result<u16, String> {
         .map_err(|e| format!("not running ({e})"))?;
     // gardener runs take minutes; wait for the reply so failures surface
     s.set_read_timeout(Some(Duration::from_secs(30 * 60))).ok();
-    let token = admin_token().map(|t| format!("X-Grimoire-Admin: {t}\r\n")).unwrap_or_default();
+    let token = admin_token().map(|t| format!("Taisce-Admin: {t}\r\n")).unwrap_or_default();
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: {DAEMON_ADDR}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n{token}Connection: close\r\n\r\n{{}}"
     );
@@ -445,7 +449,7 @@ fn run_gardeners_now(app: AppHandle) {
         }
         Ok(code) => app
             .dialog()
-            .message(format!("Grimoire refused the request (HTTP {code}). Open the app and check Gardeners."))
+            .message(format!("Taisce refused the request (HTTP {code}). Open the app and check Gardeners."))
             .kind(MessageDialogKind::Warning)
             .title("Gardeners did not run")
             .show(|_| {}),
@@ -474,7 +478,7 @@ fn check_for_updates(app: AppHandle, interactive: bool) {
         Ok(None) => {
             if interactive {
                 app.dialog()
-                    .message(format!("Grimoire {} is the latest version.", app.package_info().version))
+                    .message(format!("Taisce {} is the latest version.", app.package_info().version))
                     .kind(MessageDialogKind::Info)
                     .title("Up to date")
                     .blocking_show();
@@ -503,7 +507,7 @@ fn check_for_updates(app: AppHandle, interactive: bool) {
     let install = app
         .dialog()
         .message(format!(
-            "Grimoire {} is available (you have {}).{notes}\n\nInstall and relaunch now? Your notes are untouched.",
+            "Taisce {} is available (you have {}).{notes}\n\nInstall and relaunch now? Your notes are untouched.",
             update.version, update.current_version
         ))
         .kind(MessageDialogKind::Info)
@@ -574,7 +578,7 @@ fn main() {
                 eprintln!("could not register the ⌥⌘G quick-capture hotkey: {e}");
             }
 
-            let open = MenuItemBuilder::with_id("open", "Open Grimoire").build(app)?;
+            let open = MenuItemBuilder::with_id("open", "Open Taisce").build(app)?;
             let capture = MenuItemBuilder::with_id("capture", "Quick capture")
                 .accelerator("Alt+Super+G")
                 .build(app)?;
@@ -641,7 +645,7 @@ fn main() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("error building Grimoire shell")
+        .expect("error building Taisce shell")
         .run(|_app, event| {
             match event {
                 // keep running with zero windows; only the tray Quit exits

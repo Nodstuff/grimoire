@@ -18,6 +18,7 @@ mod home;
 mod inbox;
 mod living;
 mod local_guard;
+mod legacy;
 mod mcp;
 mod memory;
 mod nav;
@@ -91,7 +92,7 @@ pub fn ui_build_stamp() -> u64 {
 
 /// Short git sha of the checkout this binary was built from (build.rs); None
 /// when built outside a git checkout.
-pub const GIT_SHA: Option<&str> = option_env!("GRIMOIRE_GIT_SHA");
+pub const GIT_SHA: Option<&str> = option_env!("TAISCE_GIT_SHA");
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -161,7 +162,7 @@ fn content_type_for(name: &str) -> &'static str {
 }
 
 #[derive(Parser)]
-#[command(name = "grimoire", about = "Grimoire daemon")]
+#[command(name = "taisce", about = "Taisce daemon")]
 struct Cli {
     /// Path to the SQLite database.
     #[arg(long, default_value_os_t = default_db())]
@@ -172,7 +173,7 @@ struct Cli {
     port: u16,
     /// SERVER mode: the public origin clients reach this daemon at, through
     /// a TLS reverse proxy (`https://taisce.example`). Unset = LOCAL mode.
-    #[arg(long, global = true, env = "GRIMOIRE_PUBLIC_URL")]
+    #[arg(long, global = true, env = "TAISCE_PUBLIC_URL")]
     public_url: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
@@ -219,11 +220,11 @@ enum Cmd {
     Serve {
         /// SERVER mode: rate-limit by the reverse proxy's X-Forwarded-For
         /// (its last hop) instead of the socket peer.
-        #[arg(long, env = "GRIMOIRE_TRUSTED_PROXY")]
+        #[arg(long, env = "TAISCE_TRUSTED_PROXY")]
         trusted_proxy: bool,
         /// SERVER mode: an extra OAuth redirect URI to accept (exact match;
         /// repeatable). Claude's callback, loopback and the app's scheme are built in.
-        #[arg(long = "allow-redirect", env = "GRIMOIRE_OAUTH_REDIRECTS", value_delimiter = ',')]
+        #[arg(long = "allow-redirect", env = "TAISCE_OAUTH_REDIRECTS", value_delimiter = ',')]
         allow_redirect: Vec<String>,
         /// SERVER mode: APNs push to the Taisce app (off unless configured).
         #[command(flatten)]
@@ -247,6 +248,8 @@ enum AuthCmd {
     Revoke { id: String },
 }
 
+/// Still `~/.grimoire` after the rename: the legacy desktop app's data lives
+/// there and is not moved. The server passes `--db` explicitly.
 fn default_db() -> PathBuf {
     dirs_home().join(".grimoire/ks.db")
 }
@@ -414,14 +417,14 @@ fn admin_client(db: &std::path::Path, timeout: Option<std::time::Duration>) -> a
     Ok(b.build()?)
 }
 
-/// When spawned by the shell (`GRIMOIRE_PARENT_PID`), exit when that shell
+/// When spawned by the shell (`TAISCE_PARENT_PID`), exit when that shell
 /// is gone. macOS has no PDEATHSIG, and a shell that crashes or is replaced
 /// by the updater leaves its child running; the next app version then
 /// attaches to a stale daemon (0.7.2 shipped this way). Raising SIGTERM on
 /// ourselves takes the normal graceful path, children included.
 #[cfg(unix)]
 async fn watch_parent() {
-    let Some(pid) = std::env::var("GRIMOIRE_PARENT_PID").ok().and_then(|p| p.parse::<i32>().ok()) else {
+    let Some(pid) = std::env::var("TAISCE_PARENT_PID").ok().and_then(|p| p.parse::<i32>().ok()) else {
         return;
     };
     loop {
@@ -481,7 +484,7 @@ fn human_name(store: &SqliteStore) -> String {
         .unwrap_or_else(|| "owner".into())
 }
 
-/// `grimoire auth …`: straight against the db (WAL lets the daemon run on).
+/// `taisce auth …`: straight against the db (WAL lets the daemon run on).
 fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, human: uuid::Uuid) -> anyhow::Result<()> {
     let now = auth::now();
     let fmt_time = |t: i64| {
@@ -533,8 +536,17 @@ fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, h
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // before the runtime's threads exist: the env shim calls set_var
+    let legacy_env = legacy::adopt_env();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the tokio runtime")?
+        .block_on(run(legacy_env))
+}
+
+async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
     install_crypto_provider();
     let cli = Cli::parse();
     let db_dir = cli
@@ -545,6 +557,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&db_dir).context("creating db directory")?;
     // logging first: a store that will not open must say so in the log
     let (_log_guard, log_level) = init_logging(&db_dir);
+    legacy::log_adopted(&legacy_env);
     let mut store = match SqliteStore::open(&cli.db) {
         Ok(s) => s,
         Err(e) => {
@@ -667,7 +680,7 @@ async fn main() -> anyhow::Result<()> {
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
-                    tracing::error!("port {port} is taken ({e}); another Grimoire is already serving — exiting");
+                    tracing::error!("port {port} is taken ({e}); another Taisce is already serving — exiting");
                     return Err(anyhow::anyhow!("port {port} in use: {e}"));
                 }
             };
@@ -780,9 +793,9 @@ async fn main() -> anyhow::Result<()> {
                 None => app,
             };
             // The frontend is EMBEDDED in this binary (rust-embed over ui/dist),
-            // so the app is self-contained on any machine. GRIMOIRE_UI_DIST is a
+            // so the app is self-contained on any machine. TAISCE_UI_DIST is a
             // dev override: set it to serve a live build off disk instead.
-            let app = match std::env::var("GRIMOIRE_UI_DIST") {
+            let app = match std::env::var("TAISCE_UI_DIST") {
                 Ok(dir) => app.fallback_service(
                     tower_http::services::ServeDir::new(&dir)
                         .fallback(tower_http::services::ServeFile::new(format!("{dir}/index.html"))),
@@ -797,6 +810,8 @@ async fn main() -> anyhow::Result<()> {
                 // a request whose Host/Origin is not a loopback name is refused
                 None => app.layer(axum::middleware::from_fn(local_guard::require_loopback)),
             };
+            // outermost: the pre-rename X-Grimoire-* headers, read as Taisce-*
+            let app = app.layer(axum::middleware::from_fn(legacy::rename_headers));
             tracing::info!("ksd serving MCP (streamable HTTP) at http://{addr}/mcp");
             axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .with_graceful_shutdown(async {

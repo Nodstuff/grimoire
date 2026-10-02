@@ -448,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_refreshes_stale_answers_without_a_synthesis_and_records_new_sources() {
         // point the resolver at a path that is not a file so the test never spawns claude
-        unsafe { std::env::set_var("GRIMOIRE_CLAUDE_BIN", "/nonexistent/claude") };
+        unsafe { std::env::set_var("TAISCE_CLAUDE_BIN", "/nonexistent/claude") };
         let (store, tom, _, doc, excerpts) = seed();
         let lines = refresh_sweep(store.clone(), None).await;
         assert_eq!(lines, vec!["living answers: nothing stale".to_string()]);

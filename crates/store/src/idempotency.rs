@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn survives_reopen() {
-        let dir = std::env::temp_dir().join(format!("grimoire-idem-{}", Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("taisce-idem-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("ks.db");
         let (p, k) = (Uuid::now_v7(), Uuid::now_v7());

@@ -210,7 +210,7 @@ mod tests {
     pub(crate) fn app() -> (Router, Arc<Mutex<SqliteStore>>, Uuid) {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let human = store.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
-        let dir = std::env::temp_dir().join(format!("grimoire-ws-test-{}", Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("taisce-ws-test-{}", Uuid::now_v7()));
         let store = Arc::new(Mutex::new(store));
         let st = ApiState {
             changes: crate::changes::Feed::new(&store),

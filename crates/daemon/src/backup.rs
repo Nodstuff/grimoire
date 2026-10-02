@@ -226,7 +226,7 @@ mod tests {
         store.create_doc("kept", None, tom.id).unwrap();
 
         let dest = tempfile::tempdir().unwrap();
-        let target = dest.path().join("grimoire-2026-09-07.db");
+        let target = dest.path().join("taisce-2026-09-07.db");
         let info = backup_to(&db_path, &target).unwrap();
         assert_eq!(Path::new(&info.path), target);
         let copy = SqliteStore::open(&target).unwrap();
@@ -234,7 +234,7 @@ mod tests {
         // a second run replaces the file rather than failing on "exists"
         backup_to(&db_path, &target).unwrap();
         // no temp file left behind
-        assert!(!dest.path().join(".grimoire-2026-09-07.db.partial").exists());
+        assert!(!dest.path().join(".taisce-2026-09-07.db.partial").exists());
 
         // the chosen backup never counts as a daily snapshot
         assert!(list_backups(&db_path).is_empty());

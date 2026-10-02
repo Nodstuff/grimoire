@@ -133,7 +133,7 @@ fn human_accepting_an_auditor_fix_verifies_the_doc_but_other_accepts_do_not() {
 /// widened kind CHECK, and opening it again changes nothing.
 #[test]
 fn migration_adds_verified_at_and_filer_kind_idempotently() {
-    let dir = std::env::temp_dir().join(format!("grimoire-freshness-mig-{}", Uuid::now_v7()));
+    let dir = std::env::temp_dir().join(format!("taisce-freshness-mig-{}", Uuid::now_v7()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("ks.db");
     let (p1, g1) = (Uuid::now_v7(), Uuid::now_v7());

@@ -113,12 +113,12 @@ fn compose_tagging(store: &SqliteStore, g: &Gardener) -> taisce_store::Result<(S
 }
 
 /// One shot of `claude -p`, wall-clock bounded. Returns (result_text, tokens).
-/// Where Claude Code is. `GRIMOIRE_CLAUDE_BIN` wins; otherwise `claude` is
+/// Where Claude Code is. `TAISCE_CLAUDE_BIN` wins; otherwise `claude` is
 /// looked up on PATH and in the usual install dirs a GUI-launched daemon's
 /// bare PATH misses. One resolver for the preflight route AND the spawn, so
 /// the UI can never say "installed" and the run then fail to find it.
 pub fn claude_bin() -> Option<std::path::PathBuf> {
-    if let Some(explicit) = std::env::var_os("GRIMOIRE_CLAUDE_BIN") {
+    if let Some(explicit) = std::env::var_os("TAISCE_CLAUDE_BIN") {
         let p = std::path::PathBuf::from(explicit);
         return p.is_file().then_some(p);
     }
@@ -556,7 +556,7 @@ title: {}
     let mut prompt = format!(
         "{preamble}
 
-{GRIMOIRE_PRIMER}
+{TAISCE_PRIMER}
 
 ## Task
 {}
@@ -788,7 +788,7 @@ async fn run_auditor(
 }
 
 /// Injected into every doc-writing gardener prompt: the house rules.
-const GRIMOIRE_PRIMER: &str = "## How Grimoire works (follow exactly)\n\
+const TAISCE_PRIMER: &str = "## How Taisce works (follow exactly)\n\
 - Docs are trees of markdown blocks; a paragraph separated by blank lines is one block.\n\
 - Link between docs with [[Exact Doc Title]] — resolved by full title. Deep-link a specific block with [[Doc Title#^block-uuid]] (block ids appear as [block <uuid>] markers when you are shown doc content). No other link syntax counts.\n\
 - Tags live ONLY in YAML frontmatter as the doc's first block:\n---\ntags:\n  - kebab-case-tag\n---\n\
@@ -958,7 +958,7 @@ async fn run_scribe(
                 exemplars = "(none provided — use clean, dense technical markdown)".into();
             }
             let mut p = format!(
-                "{SCRIBE_PREAMBLE}\n\n{GRIMOIRE_PRIMER}\n\n## Instructions for this scope\n{}\n\n\
+                "{SCRIBE_PREAMBLE}\n\n{TAISCE_PRIMER}\n\n## Instructions for this scope\n{}\n\n\
                  ## Source repositories (read with your tools)\n{}\n\n\
                  ## Style exemplars — imitate these\n{}\n\
                  ## What already exists in the scope (do NOT recreate)\n{}\n\n\

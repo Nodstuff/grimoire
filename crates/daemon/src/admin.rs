@@ -211,7 +211,7 @@ async fn set_policy(State(AdminState { store, .. }): State<AdminState>, Json(req
 pub struct AdminToken(Arc<str>);
 
 pub const ADMIN_TOKEN_FILE: &str = "admin.token";
-pub const ADMIN_HEADER: &str = "x-grimoire-admin";
+pub const ADMIN_HEADER: &str = "taisce-admin";
 
 impl AdminToken {
     /// Mint a fresh token and write it beside the db (overwriting the last
@@ -283,7 +283,7 @@ async fn require_admin(
     (
         axum::http::StatusCode::UNAUTHORIZED,
         Json(json!({
-            "error": "this action needs the app's admin token — open Grimoire from the app, or add ?admin_token=<contents of ~/.grimoire/admin.token> to the URL",
+            "error": "this action needs the app's admin token — open Taisce from the app, or add ?admin_token=<contents of ~/.grimoire/admin.token> to the URL",
             "code": "admin_token",
         })),
     )

@@ -167,7 +167,7 @@ mod tests {
             "127.0.0.1:abc",
             "",
             "10.0.0.5:7425",
-            "grimoire.local:7425",
+            "taisce.local:7425",
         ] {
             assert!(!host_is_loopback(h), "{h}");
         }

@@ -158,7 +158,7 @@ pub(crate) mod testing {
     pub fn app() -> (Router, Uuid) {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let human = store.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
-        let dir = std::env::temp_dir().join(format!("grimoire-home-test-{}", Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("taisce-home-test-{}", Uuid::now_v7()));
         let store = Arc::new(Mutex::new(store));
         let st = ApiState {
             changes: crate::changes::Feed::new(&store),
@@ -218,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn since_lists_only_non_human_docs_after_the_stamp() {
         let (app, _) = app();
-        // a human doc never shows; an agent doc does (X-Grimoire-Principal)
+        // a human doc never shows; an agent doc does (Taisce-Principal)
         call(&app, "POST", "/api/docs", Some(json!({"title": "mine", "parent_doc_id": null}))).await;
         let early = chrono::Utc::now().to_rfc3339();
         std::thread::sleep(std::time::Duration::from_millis(5));

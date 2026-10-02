@@ -134,7 +134,7 @@ pub async fn fetch(client_id: &str, allow_insecure: bool) -> Result<ClientDoc, S
         .no_proxy()
         .timeout(FETCH_TIMEOUT)
         .connect_timeout(Duration::from_secs(3))
-        .user_agent(concat!("grimoire/", env!("CARGO_PKG_VERSION"), " (client-metadata)"));
+        .user_agent(concat!("taisce/", env!("CARGO_PKG_VERSION"), " (client-metadata)"));
     if matches!(url.host(), Some(url::Host::Domain(_))) {
         // pin the connection to the addresses just vetted
         b = b.resolve_to_addrs(&host, &addrs);

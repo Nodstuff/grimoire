@@ -42,11 +42,12 @@ pub const ACCESS_TTL: i64 = 3600;
 pub const REFRESH_TTL: i64 = 30 * 86400;
 pub const CODE_TTL: i64 = 120;
 pub const ENROLL_TTL: i64 = 15 * 60;
-/// The one scope: full access as the authorizing user.
+/// The one scope: full access as the authorizing user. Still `grimoire`
+/// after the rename: issued tokens and registered clients carry it.
 pub const SCOPE: &str = "grimoire";
 
-/// Audit lines go to this target (`RUST_LOG=grimoire::audit=info`).
-pub const AUDIT: &str = "grimoire::audit";
+/// Audit lines go to this target (`RUST_LOG=taisce::audit=info`).
+pub const AUDIT: &str = "taisce::audit";
 
 /// Server-mode configuration, fixed at startup.
 #[derive(Debug, Clone)]
@@ -213,7 +214,7 @@ fn is_owner_app(redirect_uris: &[String]) -> bool {
 }
 
 /// Who a request authenticated as (an extension on authenticated requests).
-/// In SERVER mode identity is pinned to the token: `X-Grimoire-Principal`,
+/// In SERVER mode identity is pinned to the token: `Taisce-Principal`,
 /// `?as=` and `?cwd=` are ignored, and the MCP `as` argument is only a label
 /// inside the token's own `claude:` namespace (`mcp::Pinned`).
 #[derive(Debug, Clone)]

@@ -29,7 +29,7 @@ const STOP: &[&str] = &[
     "under", "after", "before", "between", "because", "also", "just", "like", "some", "any",
     "our", "your", "its", "for", "not", "but", "you", "can", "all", "one", "two", "use", "used",
     "using", "make", "made", "need", "want", "know", "tell", "show", "give", "decide", "decided",
-    "decision", "decisions", "explain", "summarise", "summarize", "list", "please", "grimoire",
+    "decision", "decisions", "explain", "summarise", "summarize", "list", "please", "grimoire", "taisce",
 ];
 
 /// Content words worth searching: ≥3 chars, not a stopword, deduped, in order.

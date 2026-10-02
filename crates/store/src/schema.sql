@@ -314,7 +314,7 @@ CREATE TABLE IF NOT EXISTS auth_credentials (
     last_used_at INTEGER
 );
 
--- One-time owner enrollment links minted by `grimoire auth enroll`.
+-- One-time owner enrollment links minted by `taisce auth enroll`.
 CREATE TABLE IF NOT EXISTS auth_enrollments (
     token_hash TEXT PRIMARY KEY,
     user_id    TEXT NOT NULL REFERENCES auth_users (id) ON DELETE CASCADE,

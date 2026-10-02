@@ -5,7 +5,7 @@
 //! MCP 2026-07-28 has no sessions (SEP-2567) and rmcp serves it with a fresh
 //! `KsMcp` per request, so nothing survives between calls; the principal is
 //! resolved per call from, in precedence order: the tool's `as` argument, the
-//! `X-Grimoire-Principal` header, `?as=<name>` on the `/mcp` URL,
+//! `Taisce-Principal` header, `?as=<name>` on the `/mcp` URL,
 //! `?cwd=<path>` (→ `claude:<basename>`), else the shared `claude`. In
 //! SERVER mode a bearer token pins the principal instead (`Pinned`): the
 //! header and query hints are ignored and `as` is only a `claude:` label.
@@ -25,7 +25,7 @@ use taisce_store::locate::{self, short_ref};
 use taisce_store::{Block, BlockNode, BlockStore, OpInput, OpKind, ProposeOutcome, ReviewDecision, SqliteStore};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager,
@@ -183,7 +183,7 @@ pub fn valid_principal_name(name: &str) -> Result<&str, String> {
 }
 
 /// Find-or-create the Agent principal named `name` (the `as` rule, shared
-/// with the HTTP `X-Grimoire-Principal` header). Creation is capped per
+/// with the HTTP `Taisce-Principal` header). Creation is capped per
 /// boot; existing agent names always resolve. A Human or Remote principal
 /// carrying the name is refused: an agent never acts as the human.
 pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uuid, String> {
@@ -215,7 +215,7 @@ pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uu
 }
 
 /// Header carrying the acting principal on `/mcp` (same as the HTTP API).
-pub const PRINCIPAL_HEADER: &str = "x-grimoire-principal";
+pub const PRINCIPAL_HEADER: &str = "taisce-principal";
 
 /// The per-request principal hints from the HTTP layer, in precedence order
 /// below the tool's own `as` argument: header > `?as=` > `?cwd=`. Read from
@@ -757,7 +757,7 @@ pub struct EditDocParams {
     pub new: String,
     /// Replace every occurrence (default false: >1 match is an error listing them).
     pub replace_all: Option<bool>,
-    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
+    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the Taisce-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
     /// true: the full JSON verdicts instead of the one-line summary.
@@ -780,7 +780,7 @@ pub struct AppendParams {
     /// section takes the level of the doc's existing top-level headings, or
     /// `#` when it has none). An ambiguous path is still an error.
     pub create_missing: Option<bool>,
-    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
+    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the Taisce-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
     /// true: the full JSON verdicts instead of the one-line summary.
@@ -821,7 +821,7 @@ pub struct DocOpParams {
     pub workspace: Option<String>,
     /// workspace: create the workspace when no name matches (default false).
     pub create_missing: Option<bool>,
-    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
+    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the Taisce-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
     /// true: the full JSON verdicts instead of the one-line summary.
@@ -840,7 +840,7 @@ pub struct ProposeParams {
     /// block_type, content, optional block_id. replace: target, content.
     /// delete: target. move: target, new_parent, new_order_key.
     pub ops: Value,
-    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
+    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the Taisce-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
     /// true: the full JSON verdicts instead of the one-line summary.
@@ -855,7 +855,7 @@ pub struct ProposeMarkdownParams {
     pub base_epoch: i64,
     /// The doc's complete new markdown (frontmatter included; `^abc123` ref lines may stay).
     pub markdown: String,
-    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
+    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the Taisce-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
     /// true: the full JSON verdicts instead of the one-line summary.
@@ -881,7 +881,7 @@ pub struct ProposalsParams {
     pub limit: Option<u32>,
     /// Include full prior blocks and op bookkeeping (default false).
     pub verbose: Option<bool>,
-    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
+    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the Taisce-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
 }
@@ -892,7 +892,7 @@ pub struct ResolveParams {
     pub annotation_id: String,
     /// "accept" or "decline".
     pub decision: String,
-    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
+    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the Taisce-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
     /// true: the full JSON receipt instead of the one-line summary.
@@ -914,7 +914,7 @@ pub struct CreateDocParams {
     /// with. A doc with a parent always inherits the parent's workspace;
     /// naming a different one there is an error.
     pub workspace: Option<String>,
-    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
+    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the Taisce-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
     /// true: JSON {id, title, parent_id, epoch, reused} instead of the one-line summary.
@@ -928,7 +928,7 @@ pub struct AddCommentParams {
     pub text: String,
     /// Comment to reply to (ref or UUID, same thread); omit for a new thread.
     pub reply_to: Option<String>,
-    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the X-Grimoire-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
+    #[doc = "Who this call acts as: 'claude:<project>-<task>' or an agent principal UUID. Beats the Taisce-Principal header and ?as=/?cwd= on the /mcp URL; without any, writes land on the shared 'claude'."]
     #[serde(rename = "as")]
     pub as_: Option<String>,
     /// true: the comment block as JSON instead of the one-line summary.
@@ -2152,14 +2152,17 @@ fn tree_first_line(roots: &[BlockNode], id: Option<Uuid>) -> String {
 #[tool_handler]
 impl ServerHandler for KsMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Grimoire: docs as block trees behind a review gate. Every write answers with \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            // rmcp's default is its own crate name and version
+            .with_server_info(Implementation::new("taisce", env!("CARGO_PKG_VERSION")).with_title("Taisce"))
+            .with_instructions(
+            "Taisce: docs as block trees behind a review gate. Every write answers with \
              one line: green = applied, yellow = applied + flagged for a human, red = \
              parked until a human accepts.\n\
              Who you are: pass as: 'claude:<project>-<task>' on writes, or configure it \
              once — /mcp?as=<name>, /mcp?cwd=<dir> (→ claude:<dirname>) or the \
-             X-Grimoire-Principal header. No sessions: nothing else survives a call.\n\
-             The loop: find_doc(query) → optionally read_doc(doc_id, section: 'grimoire › \
+             Taisce-Principal header. No sessions: nothing else survives a call.\n\
+             The loop: find_doc(query) → optionally read_doc(doc_id, section: 'taisce › \
              Plans') → edit_doc(doc_id, old, new) or append(doc_id, markdown, to: \
              'heading path', create_missing: true for a daily log) → read the verdict. \
              No epochs needed on those two. Refs: ^abc123 = a block (read_doc refs: true \
@@ -2345,7 +2348,7 @@ mod tests {
         let h = RequestHint::from_parts(&parts("/mcp?cwd=/Users/me/grimoire", &[]));
         assert_eq!(h.default_name().as_deref(), Some("claude:grimoire"));
 
-        let h = RequestHint::from_parts(&parts("/mcp?as=claude:q", &[("X-Grimoire-Principal", "claude:hdr")]));
+        let h = RequestHint::from_parts(&parts("/mcp?as=claude:q", &[("Taisce-Principal", "claude:hdr")]));
         assert_eq!(h.default_name().as_deref(), Some("claude:hdr"), "header beats query");
 
         let h = RequestHint::from_parts(&parts("/mcp", &[]));
@@ -3128,7 +3131,7 @@ mod tests {
     /// cache, same db) inside the window replays instead of applying twice.
     #[tokio::test]
     async fn mcp_propose_paths_replay_across_a_restart() {
-        let dir = std::env::temp_dir().join(format!("grimoire-mcp-idem-{}", Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("taisce-mcp-idem-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("ks.db");
         let (claude, doc) = {

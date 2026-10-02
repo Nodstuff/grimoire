@@ -57,21 +57,21 @@ const SANDBOX_HOST: &str = "https://api.sandbox.push.apple.com";
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct ApnsArgs {
     /// APNs auth key (.p8, PEM) file.
-    #[arg(long, env = "GRIMOIRE_APNS_KEY_FILE")]
+    #[arg(long, env = "TAISCE_APNS_KEY_FILE")]
     pub apns_key_file: Option<std::path::PathBuf>,
     /// APNs auth key PEM content (instead of --apns-key-file; literal `\n`
     /// escapes and bare base64 are accepted).
-    #[arg(long, env = "GRIMOIRE_APNS_KEY", hide_env_values = true)]
+    #[arg(long, env = "TAISCE_APNS_KEY", hide_env_values = true)]
     pub apns_key: Option<String>,
-    #[arg(long, env = "GRIMOIRE_APNS_KEY_ID")]
+    #[arg(long, env = "TAISCE_APNS_KEY_ID")]
     pub apns_key_id: Option<String>,
-    #[arg(long, env = "GRIMOIRE_APNS_TEAM_ID")]
+    #[arg(long, env = "TAISCE_APNS_TEAM_ID")]
     pub apns_team_id: Option<String>,
     /// The app's bundle id.
-    #[arg(long, env = "GRIMOIRE_APNS_TOPIC", default_value = "ie.null.taisce")]
+    #[arg(long, env = "TAISCE_APNS_TOPIC", default_value = "ie.null.taisce")]
     pub apns_topic: String,
     /// The env assumed for a registration that names none.
-    #[arg(long, env = "GRIMOIRE_APNS_ENV", default_value = "production", value_parser = ["production", "sandbox"])]
+    #[arg(long, env = "TAISCE_APNS_ENV", default_value = "production", value_parser = ["production", "sandbox"])]
     pub apns_env: String,
 }
 
@@ -100,7 +100,7 @@ impl ApnsArgs {
                 topic: self.apns_topic.clone(),
                 default_env: self.apns_env.clone(),
             })),
-            _ => anyhow::bail!("APNs needs all of a key (--apns-key-file or GRIMOIRE_APNS_KEY), --apns-key-id and --apns-team-id"),
+            _ => anyhow::bail!("APNs needs all of a key (--apns-key-file or TAISCE_APNS_KEY), --apns-key-id and --apns-team-id"),
         }
     }
 }
@@ -256,7 +256,7 @@ impl ApnsSender {
             .no_proxy()
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(5))
-            .user_agent(concat!("grimoire/", env!("CARGO_PKG_VERSION"), " (apns)"))
+            .user_agent(concat!("taisce/", env!("CARGO_PKG_VERSION"), " (apns)"))
             .build()?;
         Ok(Self { client, jwt: TokenCache::new(cfg.signer), topic: cfg.topic })
     }
@@ -775,16 +775,16 @@ mod tests {
 /// Live check against the APNs sandbox with a real key and a bogus token:
 /// `400 BadDeviceToken` proves TLS, HTTP/2 and the JWT were accepted (a bad
 /// JWT answers 403). Run by hand:
-/// `GRIMOIRE_APNS_TEST_KEY_FILE=… GRIMOIRE_APNS_KEY_ID=… GRIMOIRE_APNS_TEAM_ID=… cargo test -p taisce live_sandbox -- --ignored`
+/// `TAISCE_APNS_TEST_KEY_FILE=… TAISCE_APNS_KEY_ID=… TAISCE_APNS_TEAM_ID=… cargo test -p taisce live_sandbox -- --ignored`
 #[cfg(test)]
 #[tokio::test]
 #[ignore]
 async fn live_sandbox_accepts_the_jwt() {
     let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} unset"));
     let args = ApnsArgs {
-        apns_key_file: Some(var("GRIMOIRE_APNS_TEST_KEY_FILE").into()),
-        apns_key_id: Some(var("GRIMOIRE_APNS_KEY_ID")),
-        apns_team_id: Some(var("GRIMOIRE_APNS_TEAM_ID")),
+        apns_key_file: Some(var("TAISCE_APNS_TEST_KEY_FILE").into()),
+        apns_key_id: Some(var("TAISCE_APNS_KEY_ID")),
+        apns_team_id: Some(var("TAISCE_APNS_TEAM_ID")),
         apns_topic: "ie.null.taisce".into(),
         apns_env: "sandbox".into(),
         ..Default::default()
