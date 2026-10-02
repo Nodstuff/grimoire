@@ -1329,6 +1329,20 @@ fn project(tx: &Transaction, doc_id: Uuid, epoch: i64, principal: Uuid, op: &OpK
             if let Some(p) = parent_id {
                 live_block(tx, doc_id, *p, "parent")?;
             }
+            // ADR 0004: a comment anchors to a block of ITS OWN doc. A
+            // cross-doc anchor would let a writer point at a block they
+            // cannot (or can no longer) see and read it back through the
+            // anchor (flags, comment threads).
+            if let Some(r) = refers_to {
+                let same_doc: bool = tx
+                    .prepare_cached("SELECT EXISTS (SELECT 1 FROM blocks WHERE id = ?1 AND doc_id = ?2)")?
+                    .query_row(params![r.to_string(), doc_id.to_string()], |row| row.get(0))?;
+                if !same_doc {
+                    return Err(StoreError::InvalidOp(format!(
+                        "insert: refers_to {r} is not a block of this doc"
+                    )));
+                }
+            }
             // An insert under an id that already exists is a conflict — unless
             // the row is a tombstone, in which case this is a resurrection
             // (declining a reviewed delete) and the block comes back in place
@@ -1769,7 +1783,7 @@ impl BlockStore for SqliteStore {
              ORDER BY epoch_applied, id"
         ))?;
         let rows = stmt.query_map(params![doc_id.to_string(), since_epoch], row_to_op)?;
-        rows.map(|r| build_op(r?)).collect()
+        rows.map(|r| build_op(r?).map(|o| self.mask_op(o))).collect()
     }
 
     fn effective_policy(&self, doc_id: Uuid) -> Result<ReviewPolicy> {
@@ -1879,9 +1893,13 @@ impl BlockStore for SqliteStore {
             )
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("doc {doc_id} is not in the trash")))?;
+        let scope = self.scope;
         let tx = self.conn.transaction()?;
         let before = tenancy::access_snapshot(&tx)?;
-        // the subtree that fell with it: descendants sharing the stamp
+        // the subtree that fell with it: descendants sharing the stamp —
+        // only those the restorer can write (ADR 0004: an editor restoring a
+        // shared subtree never revives, or counts, someone's private docs;
+        // those stay in their owner's Trash)
         let mut to_restore = vec![doc_id];
         let mut i = 0;
         while i < to_restore.len() {
@@ -1894,7 +1912,10 @@ impl BlockStore for SqliteStore {
                 rows.collect::<rusqlite::Result<_>>()?
             };
             for k in kids {
-                to_restore.push(uuid_col(k, "docs.id")?);
+                let k = uuid_col(k, "docs.id")?;
+                if tenancy::ensure_write_conn(&tx, scope, k).is_ok() {
+                    to_restore.push(k);
+                }
             }
             i += 1;
         }
@@ -2033,13 +2054,15 @@ impl BlockStore for SqliteStore {
     }
 
     fn list_comments(&self, target_block: Uuid) -> Result<Vec<Block>> {
-        self.read_block(target_block)?;
+        let target = self.read_block(target_block)?;
+        // a comment's visibility is its doc's: only the threads that live in
+        // the target's own doc (older rows could anchor across docs)
         let sql = format!(
             "SELECT {BLOCK_COLS} FROM blocks
-             WHERE refers_to = ?1 AND deleted = 0 ORDER BY id"
+             WHERE refers_to = ?1 AND doc_id = ?2 AND deleted = 0 ORDER BY id"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![target_block.to_string()], row_to_block)?;
+        let rows = stmt.query_map(params![target_block.to_string(), target.doc_id.to_string()], row_to_block)?;
         rows.map(|r| build_block(r?)).collect()
     }
 
@@ -2233,6 +2256,7 @@ impl BlockStore for SqliteStore {
                 let rewritten = rewrite_inbound_links_tx(
                     &tx,
                     scope,
+                    doc_id,
                     from_title,
                     title,
                     principal,
@@ -2630,7 +2654,7 @@ impl BlockStore for SqliteStore {
                         .map(|p| uuid_col(p, "annotations.resolved_by"))
                         .transpose()?,
                 },
-                op: build_op(raw_op)?,
+                op: self.mask_op(build_op(raw_op)?),
             })
         })
         .collect()
@@ -2971,6 +2995,7 @@ fn resolve_doc_op(
                 let n = rewrite_inbound_links_tx(
                     tx,
                     scope,
+                    doc_id,
                     from_title,
                     title,
                     reviewer,
@@ -3081,6 +3106,7 @@ fn linking_blocks_conn(conn: &Connection, scope: Scope, title: &str) -> Result<V
 fn rewrite_inbound_links_tx(
     tx: &Transaction,
     scope: Scope,
+    renamed: Uuid,
     old: &str,
     new: &str,
     principal: Uuid,
@@ -3091,8 +3117,9 @@ fn rewrite_inbound_links_tx(
     }
     let mut by_doc: std::collections::HashMap<Uuid, Vec<(Uuid, String)>> = Default::default();
     for (block, doc, content) in linking_blocks_conn(tx, scope, old)? {
-        // a rename never writes into a doc the renamer cannot write
-        if tenancy::ensure_write_conn(tx, scope, doc).is_err() {
+        // a rename never writes into a doc the renamer cannot write, nor
+        // rewrites a link that may mean another person's doc of that title
+        if tenancy::ensure_write_conn(tx, scope, doc).is_err() || !tenancy::link_reaches(tx, doc, renamed)? {
             continue;
         }
         by_doc.entry(doc).or_default().push((block, content));
@@ -3217,8 +3244,12 @@ fn parse_annotation_status(s: &str) -> Result<AnnotationStatus> {
 impl SqliteStore {
     /// Blocks whose [[wikilinks]] point at this title (exact or path form),
     /// for rewrite-on-rename. Returns (block_id, doc_id, content).
-    pub fn linking_blocks(&self, title: &str) -> Result<Vec<(Uuid, Uuid, String)>> {
-        linking_blocks_conn(&self.conn, self.scope, title)
+    pub fn linking_blocks(&self, renamed: Uuid, title: &str) -> Result<Vec<(Uuid, Uuid, String)>> {
+        // only links that mean THIS doc for everyone who reads them
+        Ok(linking_blocks_conn(&self.conn, self.scope, title)?
+            .into_iter()
+            .filter(|(_, doc, _)| tenancy::link_reaches(&self.conn, *doc, renamed).unwrap_or(false))
+            .collect())
     }
 
     /// Outcome feedback for an agent: its recent ops with the annotation
@@ -3254,7 +3285,7 @@ impl SqliteStore {
         })?;
         rows.map(|r| {
             let (raw, status, resolver) = r?;
-            Ok((build_op(raw)?, status, resolver))
+            Ok((self.mask_op(build_op(raw)?), status, resolver))
         })
         .collect()
     }
@@ -3432,7 +3463,7 @@ impl SqliteStore {
     /// Nothing reads the stamp since the freshness views went; the column and
     /// the bookkeeping stay so a future view has the history.
     pub fn set_doc_verified(&mut self, doc_id: Uuid) -> Result<()> {
-        self.see(doc_id)?;
+        self.may_write(doc_id)?;
         let n = self.conn.execute(
             "UPDATE docs SET verified_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
             params![doc_id.to_string()],
@@ -3475,10 +3506,11 @@ impl SqliteStore {
              FROM blocks b
              JOIN docs d ON d.id = b.doc_id
              JOIN principals p ON p.id = b.created_by AND p.kind = 'agent'
-             LEFT JOIN blocks t ON t.id = b.refers_to
+             LEFT JOIN blocks t ON t.id = b.refers_to AND t.doc_id = b.doc_id AND {}
              WHERE b.block_type = 'comment' AND b.deleted = 0 AND {}
              ORDER BY b.id DESC",
             b_cols(),
+            self.vis("t.doc_id"),
             self.vis("d.id")
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -3652,7 +3684,7 @@ impl SqliteStore {
              ORDER BY epoch_applied DESC, id DESC LIMIT ?2"
         ))?;
         let rows = stmt.query_map(params![doc_id.to_string(), limit as i64], row_to_op)?;
-        rows.map(|r| build_op(r?)).collect()
+        rows.map(|r| build_op(r?).map(|o| self.mask_op(o))).collect()
     }
 
     /// Docs whose content is a canvas scene (for tree/type badges).
@@ -3842,6 +3874,23 @@ fn check_move(
         },
     };
     tenancy::check_space_change(conn, scope, from, to)?;
+    // a workspace's labelled root carries its label wherever it goes, so
+    // moving it out from where it sits (other than deeper into the same
+    // workspace) re-homes the whole workspace's tree: the owner's call
+    // (ADR 0004; otherwise an editor could park it under their own doc and
+    // inherit it when the owner deletes the workspace)
+    if !scope.sees_all()
+        && let Some(w) = crate::workspaces::label_conn(conn, doc)?
+        && new_parent != doc_parent_of(conn, doc)?
+    {
+        let inside = match new_parent {
+            Some(p) => tenancy::space_conn(conn, p)? == tenancy::Space::Workspace(w),
+            None => false,
+        };
+        if !inside && tenancy::access_conn(conn, scope, tenancy::Space::Workspace(w))? != Some(crate::Role::Owner) {
+            return Err(StoreError::Forbidden("only the workspace owner can move its top-level docs".into()));
+        }
+    }
     Ok((from, to))
 }
 
@@ -3889,6 +3938,46 @@ impl SqliteStore {
     /// The visibility predicate on a doc-id column.
     pub(crate) fn vis(&self, col: &str) -> String {
         tenancy::vis_pred(self.scope, col)
+    }
+
+    /// ADR 0004: an op's payload may name OTHER docs (a doc move's old and
+    /// new parent, with their titles, captured as its pre-image). A reader
+    /// sees those names only for docs they can see; the rest read as the
+    /// root. The stored row is untouched (decline-revert needs it).
+    pub(crate) fn mask_op(&self, mut op: LedgerOp) -> LedgerOp {
+        if self.scope.sees_all() {
+            return op;
+        }
+        let hidden = |d: &Option<Uuid>| d.is_some_and(|d| tenancy::ensure_visible_conn(&self.conn, self.scope, d).is_err());
+        if let OpKind::MoveDoc { new_parent, new_parent_title, from_parent, from_parent_title, from_sort_key, .. } = &mut op.kind {
+            if hidden(new_parent) {
+                *new_parent = None;
+                *new_parent_title = None;
+            }
+            if hidden(from_parent) {
+                *from_parent = None;
+                *from_parent_title = None;
+                *from_sort_key = None;
+            }
+        }
+        // provenance strings that quote another doc's title (a rename's
+        // link rewrite) are dropped unless that doc is visible
+        let refs = std::mem::take(&mut op.source_refs);
+        op.source_refs = refs.into_iter().filter(|r| !r.starts_with("rename:") || self.rename_ref_visible(r)).collect();
+        op
+    }
+
+    /// A link-rewrite op's `rename:Old → New` provenance is only kept when
+    /// the reader can see a doc carrying the new title (the renamed doc).
+    fn rename_ref_visible(&self, r: &str) -> bool {
+        let Some(new) = r.split(" → ").nth(1) else { return false };
+        self.conn
+            .query_row(
+                &format!("SELECT EXISTS (SELECT 1 FROM docs WHERE title = ?1 AND {})", self.vis("id")),
+                params![new],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
     }
 
     /// Hide a parent the viewer cannot see (the doc is a root for them).

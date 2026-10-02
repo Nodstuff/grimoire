@@ -207,6 +207,46 @@ pub(crate) fn space_is_shared(conn: &Connection, space: Space) -> Result<bool> {
     }
 }
 
+/// Who can see a space: its members (a workspace) or its owner (an
+/// Unsorted). None = a database with no users (LOCAL): everyone.
+pub(crate) fn audience_conn(conn: &Connection, space: Space) -> Result<Option<HashSet<Uuid>>> {
+    if instance_owner_conn(conn)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(match space {
+        Space::Unsorted(o) => o.into_iter().collect(),
+        Space::Workspace(w) => {
+            let mut st = conn.prepare_cached("SELECT user_id FROM workspace_members WHERE workspace_id = ?1")?;
+            let mut out = HashSet::new();
+            for r in st.query_map(params![w.to_string()], |r| r.get::<_, String>(0))? {
+                out.insert(parse(r?, "workspace_members.user_id")?);
+            }
+            let unowned: Option<Option<String>> = conn
+                .query_row("SELECT owner_id FROM workspaces WHERE id = ?1", params![w.to_string()], |r| r.get(0))
+                .optional()?;
+            if let Some(None) = unowned
+                && let Some(o) = instance_owner_conn(conn)?
+            {
+                out.insert(o);
+            }
+            out
+        }
+    }))
+}
+
+/// Does a `[[title]]` link in `linking` mean the doc `target` for everyone
+/// who reads `linking`? Only then may a rename of `target` rewrite it: every
+/// reader of the linking doc must be able to see the target, else the link
+/// may mean someone else's doc of that title (ADR 0004).
+pub(crate) fn link_reaches(conn: &Connection, linking: Uuid, target: Uuid) -> Result<bool> {
+    let (Some(readers), Some(seers)) =
+        (audience_conn(conn, space_conn(conn, linking)?)?, audience_conn(conn, space_conn(conn, target)?)?)
+    else {
+        return Ok(true);
+    };
+    Ok(readers.is_subset(&seers))
+}
+
 /// Is `principal` an agent (the share gate's subject)?
 pub(crate) fn is_agent_conn(conn: &Connection, principal: Uuid) -> Result<bool> {
     let kind: Option<String> = conn

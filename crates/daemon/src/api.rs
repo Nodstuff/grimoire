@@ -916,7 +916,7 @@ async fn rename_doc(
         let new_title = req.title.trim();
         let mut rewritten = 0usize;
         if old_title != new_title {
-            let linkers = s.linking_blocks(&old_title).unwrap_or_default();
+            let linkers = s.linking_blocks(id, &old_title).unwrap_or_default();
             // group by doc so each doc gets one epoch
             let mut by_doc: std::collections::HashMap<Uuid, Vec<(Uuid, String)>> = Default::default();
             for (block, doc, content) in linkers {

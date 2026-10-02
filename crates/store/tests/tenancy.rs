@@ -145,7 +145,7 @@ fn b_sees_only_her_own_and_the_shared_docs() {
     assert!(s.raw_tending().unwrap().iter().all(|(d, _)| *d != t.a_secret.to_string()));
     assert!(s.untagged_docs(100).unwrap().iter().all(|d| d.id != t.a_secret && d.id != t.a_loose));
     assert!(s.block_vecs().unwrap().is_empty() || true);
-    assert!(s.linking_blocks("Family plan").unwrap().is_empty());
+    assert!(s.linking_blocks(t.shared_doc, "Family plan").unwrap().is_empty());
     assert!(s.workspace_map().unwrap().keys().all(|d| *d != t.a_secret && *d != t.a_loose));
     assert!(s.stale_block_vectors(1000).unwrap().iter().all(|(b, _, _)| *b != t.a_secret_block));
     assert!(s.blocks_as_hits(&[t.a_secret_block, t.shared_block]).unwrap().iter().all(|h| h.block.id != t.a_secret_block));
@@ -604,13 +604,14 @@ fn agent_labels_are_only_visible_where_they_wrote() {
 fn agent_link_rewrites_and_resolves_in_a_shared_workspace_stay_with_humans() {
     let t = setup();
     let mut s = t.store.lock(Scope::User(t.a));
-    // a shared doc that links to A's private doc by title
+    // a shared doc that links to another shared doc by title
+    let budget = s.create_doc("Family budget", Some(t.shared_doc), t.a_human).unwrap().id;
     let e = s.get_doc(t.shared_doc).unwrap().current_epoch;
-    s.propose(t.shared_doc, e, t.a_human, vec![para("see [[Salary review]]")]).unwrap();
+    s.propose(t.shared_doc, e, t.a_human, vec![para("see [[Family budget]]")]).unwrap();
     let open = s.review_queue(Some(t.shared_doc)).unwrap().len();
-    // an agent renames the private doc: the link inside the shared doc is
-    // rewritten, but flagged, not green
-    s.propose_doc_op(t.a_secret, t.agent, OpKind::RenameDoc { title: "Pay review".into(), from_title: String::new() }, vec![]).unwrap();
+    // an agent renames it: the link inside the shared doc is rewritten, but
+    // flagged, not green
+    s.propose_doc_op(budget, t.agent, OpKind::RenameDoc { title: "Household budget".into(), from_title: String::new() }, vec![]).unwrap();
     let q = s.review_queue(Some(t.shared_doc)).unwrap();
     assert_eq!(q.len(), open + 1, "the rewrite in the shared doc is flagged");
     assert_eq!(q.last().unwrap().op.verdict, Some(Verdict::Yellow));
@@ -620,4 +621,184 @@ fn agent_link_rewrites_and_resolves_in_a_shared_workspace_stay_with_humans() {
     forbidden(s.resolve(ann, other_agent, ReviewDecision::Accept));
     // a human member can
     s.resolve(ann, t.a_human, ReviewDecision::Accept).unwrap();
+}
+
+// ---- regressions from the adversarial review (probes p1–p7) ----
+
+fn move_kind(p: Option<Uuid>) -> OpKind {
+    OpKind::MoveDoc { new_parent: p, sort_key: None, new_parent_title: None, from_parent: None, from_sort_key: None, from_parent_title: None }
+}
+
+fn comment_op(target: Uuid, text: &str) -> OpInput {
+    OpInput {
+        kind: OpKind::Insert {
+            block_id: Uuid::now_v7(),
+            parent_id: None,
+            order_key: String::new(),
+            block_type: BlockType::Comment,
+            content: text.into(),
+            refers_to: Some(target),
+        },
+        source_refs: vec![],
+    }
+}
+
+/// p1: a move op's pre-image names the old parent; B never reads the title
+/// or id of a parent she cannot see, in history or in the review queue.
+#[test]
+fn p1_move_op_payload_never_names_a_hidden_parent() {
+    let t = setup();
+    let d = {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let p = s.create_doc("Divorce lawyer notes", None, t.a_human).unwrap().id;
+        let d = s.create_doc("Holiday dates", Some(p), t.a_human).unwrap().id;
+        s.set_doc_workspace(d, Some(t.family), t.a_human).unwrap();
+        s.propose_doc_op(d, t.a_human, move_kind(Some(t.shared_doc)), vec![]).unwrap();
+        (d, p)
+    };
+    let (d, p) = d;
+    let s = t.store.lock(Scope::User(t.b));
+    let dump = |ops: Vec<LedgerOp>| serde_json::to_string(&ops).unwrap();
+    let hist = dump(s.ops_for_doc_limited(d, 100).unwrap());
+    let since = dump(s.ops_since(d, 0).unwrap());
+    let queue = serde_json::to_string(&s.review_queue(None).unwrap()).unwrap();
+    for (what, text) in [("history", &hist), ("ops_since", &since), ("review queue", &queue)] {
+        assert!(!text.contains("Divorce lawyer notes") && !text.contains(&p.to_string()), "{what} leaks the hidden parent: {text}");
+    }
+    assert!(hist.contains("Family plan"), "the visible new parent still reads: {hist}");
+    drop(s);
+    // the owner still sees the full pre-image, and declining reverts
+    let s = t.store.lock(Scope::User(t.a));
+    assert!(serde_json::to_string(&s.ops_for_doc_limited(d, 100).unwrap()).unwrap().contains("Divorce lawyer notes"));
+}
+
+/// p2 + review finding 4: a comment anchors only to a block of its own doc;
+/// threads list only comments of the target's doc.
+#[test]
+fn p2_comments_never_anchor_across_docs() {
+    let t = setup();
+    // B, in her own doc, points a comment at A's private block: never applied
+    {
+        let mut s = t.store.lock(Scope::User(t.b));
+        let e = s.get_doc(t.b_loose).unwrap().current_epoch;
+        let out = s.propose(t.b_loose, e, t.b_human, vec![comment_op(t.a_secret_block, "INJECTED by B")]).unwrap();
+        assert!(!out.verdicts[0].applied && out.verdicts[0].verdict == Verdict::Red, "{:?}", out.verdicts);
+        assert!(s.apply(t.b_loose, out.epoch, t.b_human, vec![comment_op(t.a_secret_block, "INJECTED")]).is_err());
+    }
+    let a_sees: Vec<String> = t.store.lock(Scope::User(t.a)).list_comments(t.a_secret_block).unwrap().into_iter().map(|b| b.content).collect();
+    assert!(a_sees.iter().all(|c| !c.contains("INJECTED")), "{a_sees:?}");
+    // A, in her private doc, points a comment at the shared block: never applied
+    {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let e = s.get_doc(t.a_loose).unwrap().current_epoch;
+        let out = s.propose(t.a_loose, e, t.a_human, vec![comment_op(t.shared_block, "A PRIVATE musing")]).unwrap();
+        assert!(!out.verdicts[0].applied);
+    }
+    let b_sees: Vec<String> = t.store.lock(Scope::User(t.b)).list_comments(t.shared_block).unwrap().into_iter().map(|b| b.content).collect();
+    assert!(b_sees.iter().all(|c| !c.contains("PRIVATE")), "{b_sees:?}");
+    // the normal path still works: a comment on a block of the same doc
+    t.store.lock(Scope::User(t.a)).add_comment(t.shared_block, t.a_human, "on the shared block", None).unwrap();
+    assert_eq!(t.store.lock(Scope::User(t.b)).list_comments(t.shared_block).unwrap().len(), 1);
+    // and B (a viewer) cannot comment there at all
+    forbidden(t.store.lock(Scope::User(t.b)).add_comment(t.shared_block, t.b_human, "x", None));
+}
+
+/// p3: restoring a shared subtree revives only what the restorer can write,
+/// and the count says so.
+#[test]
+fn p3_restore_revives_only_writable_descendants() {
+    let t = setup();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    let c = {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let c = s.create_doc("Private child", Some(t.shared_doc), t.a_human).unwrap().id;
+        s.set_doc_workspace(c, Some(t.a_work), t.a_human).unwrap();
+        s.delete_doc(t.shared_doc).unwrap();
+        c
+    };
+    let n = t.store.lock(Scope::User(t.b)).restore_doc(t.shared_doc).unwrap();
+    assert_eq!(n, 1, "only the shared doc");
+    assert!(t.store.lock(Scope::System).doc_is_tombstoned(c).unwrap(), "A's private child stays in her Trash");
+    assert!(t.store.lock(Scope::User(t.a)).list_trash().unwrap().iter().any(|e| e.doc.id == c));
+}
+
+/// p4: an editor cannot carry a workspace's labelled root off under her own
+/// doc; and deleting a workspace leaves its docs with its owner.
+#[test]
+fn p4_a_workspace_root_stays_with_its_owner() {
+    let t = setup();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    let holder = t.store.lock(Scope::User(t.b)).create_doc("B private holder", None, t.b_human).unwrap().id;
+    forbidden(t.store.lock(Scope::User(t.b)).move_doc(t.shared_doc, Some(holder), None));
+    forbidden(t.store.lock(Scope::User(t.b)).propose_doc_op(t.shared_doc, t.b_human, move_kind(Some(holder)), vec![]).map(|_| ()));
+    // an editor may still nest a doc deeper inside the workspace
+    let kid = t.store.lock(Scope::User(t.b)).create_doc("B in Family", Some(t.shared_doc), t.b_human).unwrap().id;
+    t.store.lock(Scope::User(t.b)).move_doc(kid, Some(t.shared_doc), None).unwrap();
+    // however a labelled root ended up under someone else's doc, deleting the
+    // workspace brings it back to the owner, never into the other's Unsorted
+    t.store.lock(Scope::System).move_doc(t.shared_doc, Some(holder), None).unwrap();
+    t.store.lock(Scope::User(t.a)).delete_workspace(t.family).unwrap();
+    assert!(t.store.lock(Scope::User(t.a)).get_doc(t.shared_doc).is_ok(), "the owner keeps it");
+    not_found(t.store.lock(Scope::User(t.b)).get_doc(t.shared_doc));
+}
+
+/// p5 + review finding 10: stamping verified is a write.
+#[test]
+fn p5_a_viewer_cannot_stamp_verified() {
+    let t = setup();
+    forbidden(t.store.lock(Scope::User(t.b)).set_doc_verified(t.shared_doc));
+    not_found(t.store.lock(Scope::User(t.b)).set_doc_verified(t.a_secret));
+}
+
+/// p6: after unshare, an anchor to a block B once saw cannot read it back
+/// (agent flags dereference only same-doc, visible targets).
+#[test]
+fn p6_flags_never_read_a_block_through_a_stale_anchor() {
+    let t = setup();
+    let remembered = t.shared_block;
+    assert!(t.store.lock(Scope::User(t.a)).unshare_workspace(t.family, t.b).unwrap());
+    {
+        let mut s = t.store.lock(Scope::User(t.a));
+        let e = s.get_doc(t.shared_doc).unwrap().current_epoch;
+        s.apply(t.shared_doc, e, t.a_human, vec![OpInput { kind: OpKind::Replace { target: remembered, content: "written AFTER unshare".into() }, source_refs: vec![] }]).unwrap();
+    }
+    {
+        let mut s = t.store.lock(Scope::User(t.b));
+        let e = s.get_doc(t.b_loose).unwrap().current_epoch;
+        let out = s.propose(t.b_loose, e, t.agent, vec![comment_op(remembered, "probe")]).unwrap();
+        assert!(!out.verdicts[0].applied);
+    }
+    let flags = t.store.lock(Scope::User(t.b)).agent_flags().unwrap();
+    assert!(flags.iter().all(|f| f.3.as_deref().is_none_or(|c| !c.contains("AFTER unshare"))), "{flags:?}");
+}
+
+/// p7: a rename only rewrites links that mean the renamed doc for every
+/// reader of the linking doc.
+#[test]
+fn p7_a_private_rename_never_rewrites_a_shared_link() {
+    let t = setup();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    {
+        let mut s = t.store.lock(Scope::User(t.b));
+        s.create_doc("Groceries", None, t.b_human).unwrap();
+        let e = s.get_doc(t.shared_doc).unwrap().current_epoch;
+        s.propose(t.shared_doc, e, t.b_human, vec![para("shopping: see [[Groceries]]")]).unwrap();
+    }
+    let a_doc = t.store.lock(Scope::User(t.a)).create_doc("Groceries", None, t.a_human).unwrap().id;
+    t.store
+        .lock(Scope::User(t.a))
+        .propose_doc_op(a_doc, t.a_human, OpKind::RenameDoc { title: "Fertility clinic shortlist".into(), from_title: String::new() }, vec![])
+        .unwrap();
+    assert!(t.store.lock(Scope::User(t.a)).linking_blocks(a_doc, "Fertility clinic shortlist").unwrap().is_empty());
+    let s = t.store.lock(Scope::User(t.b));
+    let all = serde_json::to_string(&s.read_doc(t.shared_doc).unwrap()).unwrap();
+    assert!(!all.contains("Fertility") && all.contains("[[Groceries]]"), "{all}");
+    let hist = serde_json::to_string(&s.ops_for_doc_limited(t.shared_doc, 50).unwrap()).unwrap();
+    assert!(!hist.contains("Fertility"), "{hist}");
+    drop(s);
+    // a link inside A's own private space still follows the rename
+    let mut s = t.store.lock(Scope::User(t.a));
+    let (mine, _) = s.create_doc_with_ops("My list", None, t.a_human, vec![para("see [[Fertility clinic shortlist]]")]).unwrap();
+    s.propose_doc_op(a_doc, t.a_human, OpKind::RenameDoc { title: "Clinics".into(), from_title: String::new() }, vec![]).unwrap();
+    assert!(serde_json::to_string(&s.read_doc(mine.id).unwrap()).unwrap().contains("[[Clinics]]"));
 }

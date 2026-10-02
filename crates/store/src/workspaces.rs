@@ -434,10 +434,42 @@ impl SqliteStore {
     pub fn delete_workspace(&mut self, id: Uuid) -> Result<usize> {
         self.owned_workspace(id)?;
         let docs = self.ws_doc_ids_all(id)?;
+        let ws_owner = self.get_workspace(id)?.owner_id;
+        let labelled: Vec<Uuid> = {
+            let mut st = self.conn.prepare("SELECT doc_id FROM doc_workspace WHERE workspace_id = ?1")?;
+            st.query_map(params![id.to_string()], |r| r.get::<_, String>(0))?
+                .map(|r| r.map_err(StoreError::from).and_then(parse_id))
+                .collect::<Result<_>>()?
+        };
         let tx = self.conn.unchecked_transaction()?;
         let before = tenancy::access_snapshot(&tx)?;
         let labels = tx.execute("DELETE FROM doc_workspace WHERE workspace_id = ?1", params![id.to_string()])?;
         tx.execute("DELETE FROM workspaces WHERE id = ?1", params![id.to_string()])?;
+        // its docs stay with its owner (ADR 0004): a labelled root that would
+        // now fall into someone else's space comes to the owner's root
+        if let Some(owner) = ws_owner {
+            for d in labelled {
+                let lands = match tenancy::space_conn(&tx, d) {
+                    Ok(Space::Unsorted(o)) => o,
+                    Ok(Space::Workspace(x)) => tx
+                        .query_row(
+                            &format!("SELECT COALESCE(owner_id, {}) FROM workspaces WHERE id = ?1", tenancy::INSTANCE_OWNER_SQL),
+                            params![x.to_string()],
+                            |r| r.get::<_, Option<String>>(0),
+                        )
+                        .optional()?
+                        .flatten()
+                        .and_then(|o| Uuid::parse_str(&o).ok()),
+                    Err(_) => continue,
+                };
+                if lands != Some(owner) {
+                    tx.execute(
+                        "UPDATE docs SET parent_id = NULL, owner_id = ?1 WHERE id = ?2",
+                        params![owner.to_string(), d.to_string()],
+                    )?;
+                }
+            }
+        }
         emit_tree_conn(&tx, &docs)?;
         tenancy::journal_access_diff(&tx, before)?;
         tenancy::audit_conn(&tx, self.scope.user(), "workspace.delete", &id.to_string(), &serde_json::json!({}))?;
