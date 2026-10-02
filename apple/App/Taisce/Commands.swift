@@ -59,14 +59,19 @@ struct TaisceCommands: Commands {
 
 #if targetEnvironment(macCatalyst)
 /// The Mac window's size: a floor under which the split view stops
-/// working, and a first-launch size (after that macOS restores the user's).
+/// working, and a first-launch size. macOS restores the user's size after
+/// that; a window still at Catalyst's untouched 1024×768 gets ours.
 enum MacWindow {
     static let minimum = CGSize(width: 820, height: 560)
     static let initial = CGSize(width: 1280, height: 860)
-    static let sizedKey = "macWindowSized"
+    static let catalystDefault = CGSize(width: 1024, height: 768)
+
+    static func size(replacing current: CGSize) -> CGSize? {
+        current == catalystDefault ? initial : nil
+    }
 }
 
-/// Finds the window scene from inside SwiftUI and sizes it once.
+/// Finds the window scene from inside SwiftUI and sizes it.
 struct MacWindowSetup: UIViewRepresentable {
     func makeUIView(context: Context) -> SceneProbe { SceneProbe() }
     func updateUIView(_ view: SceneProbe, context: Context) {}
@@ -76,11 +81,12 @@ struct MacWindowSetup: UIViewRepresentable {
             super.didMoveToWindow()
             guard let scene = window?.windowScene else { return }
             scene.sizeRestrictions?.minimumSize = MacWindow.minimum
-            let d = UserDefaults.standard
-            guard !d.bool(forKey: MacWindow.sizedKey) else { return }
-            d.set(true, forKey: MacWindow.sizedKey)
-            let origin = scene.effectiveGeometry.systemFrame.origin
-            scene.requestGeometryUpdate(.Mac(systemFrame: CGRect(origin: origin, size: MacWindow.initial)))
+            // after the scene has finished connecting, or the request is dropped
+            DispatchQueue.main.async {
+                let frame = scene.effectiveGeometry.systemFrame
+                guard let size = MacWindow.size(replacing: frame.size) else { return }
+                scene.requestGeometryUpdate(.Mac(systemFrame: CGRect(origin: frame.origin, size: size)))
+            }
         }
     }
 }

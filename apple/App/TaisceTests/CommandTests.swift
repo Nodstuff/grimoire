@@ -114,3 +114,13 @@ private let picker = WorkspacePicker(workspaces: [work, home], unsortedCount: 2,
         #expect(r.perform(.workspace(9), picker: picker) == .none)
     }
 }
+
+#if targetEnvironment(macCatalyst)
+@Suite struct MacWindowTests {
+    @Test func onlyAnUntouchedWindowIsResized() {
+        #expect(MacWindow.size(replacing: CGSize(width: 1024, height: 768)) == MacWindow.initial)
+        #expect(MacWindow.size(replacing: CGSize(width: 1400, height: 900)) == nil)
+        #expect(MacWindow.initial.width >= MacWindow.minimum.width && MacWindow.initial.height >= MacWindow.minimum.height)
+    }
+}
+#endif
