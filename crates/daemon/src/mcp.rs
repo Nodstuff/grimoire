@@ -192,10 +192,9 @@ pub fn valid_principal_name(name: &str) -> Result<&str, String> {
 /// carrying the name is refused: an agent never acts as the human.
 pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uuid, String> {
     let name = valid_principal_name(name)?;
-    let existing = store
-        .list_principals()
-        .ok()
-        .and_then(|ps| ps.into_iter().find(|pr| pr.display_name == name));
+    // unscoped by name: a user scope's principal list is filtered, and a
+    // miss there must never mint a second principal of the same name
+    let existing = store.principal_by_name(name).ok().flatten();
     if let Some(pr) = existing {
         return match pr.kind {
             taisce_store::PrincipalKind::Agent => Ok(pr.id),

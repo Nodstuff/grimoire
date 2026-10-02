@@ -958,6 +958,10 @@ fn every_route_and_tool_is_covered() {
     }
     assert!(seen >= 60, "the route scan found only {seen} routes — has the router shape changed?");
     for t in crate::mcp::KsMcp::tool_router().list_all() {
+        // sharing is a human surface: no MCP tool may touch membership
+        for word in ["share", "member", "user", "invite"] {
+            assert!(!t.name.contains(word), "MCP tool {} looks like a sharing surface", t.name);
+        }
         let key = format!("mcp:{}", t.name);
         assert!(covered.contains(key.as_str()), "MCP tool {} has no row in isolation_tests::COVERAGE", t.name);
     }

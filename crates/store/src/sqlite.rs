@@ -1485,6 +1485,8 @@ impl BlockStore for SqliteStore {
     }
 
     fn get_principal(&self, id: Uuid) -> Result<Principal> {
+        // identity lookups (who wrote this op you can see) are not filtered:
+        // a principal id only reaches a viewer through data they can see
         let raw: Option<(String, String, String, Option<String>)> = self
             .conn
             .query_row(
@@ -1566,18 +1568,28 @@ impl BlockStore for SqliteStore {
     }
 
     fn list_principals(&self) -> Result<Vec<Principal>> {
-        // a user sees agents, their own human principal, and the people they
-        // share a workspace with — not everyone on the server
+        // a user sees their own human principal, the people they share a
+        // workspace with, and the agents that wrote in (or created) a doc they
+        // can see or work for them — not every name on the server: an agent's
+        // label can say what someone else is working on (ADR 0004)
         let filter = match self.scope.user() {
             None => String::new(),
-            Some(u) => format!(
-                "WHERE kind != 'human'
-                    OR id NOT IN (SELECT principal_id FROM auth_users)
-                    OR id IN (SELECT a.principal_id FROM auth_users a
-                              WHERE a.id = '{u}'
-                                 OR a.id IN (SELECT m.user_id FROM workspace_members m
-                                             WHERE m.workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = '{u}')))"
-            ),
+            Some(u) => {
+                let vis = self.vis("v.id");
+                format!(
+                    "WHERE (kind = 'human' AND (
+                            id NOT IN (SELECT principal_id FROM auth_users)
+                            OR id IN (SELECT a.principal_id FROM auth_users a
+                                      WHERE a.id = '{u}'
+                                         OR a.id IN (SELECT m.user_id FROM workspace_members m
+                                                     WHERE m.workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = '{u}')))))
+                       OR (kind != 'human' AND (
+                            id IN (SELECT o.principal FROM ops o JOIN docs v ON v.id = o.doc_id WHERE {vis})
+                            OR id IN (SELECT v.created_by FROM docs v WHERE {vis})
+                            OR id IN (SELECT g.principal FROM gardeners g WHERE {gard})))",
+                    gard = self.gardener_pred("g.owner_id")
+                )
+            }
         };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT id, kind, display_name, pubkey FROM principals {filter} ORDER BY display_name",
@@ -3725,6 +3737,38 @@ impl SqliteStore {
             out.insert(uuid_col(d, "blocks.doc_id")?, n);
         }
         Ok(out)
+    }
+}
+
+impl SqliteStore {
+    /// The principal of `kind` named `name`, unscoped: server-side identity
+    /// resolution (an `as` handle, the shared `scribe`), never handed to a
+    /// viewer as a list. Oldest first, so duplicates never fork identity.
+    pub fn principal_named(&self, kind: PrincipalKind, name: &str) -> Result<Option<Principal>> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM principals WHERE kind = ?1 AND display_name = ?2 ORDER BY id LIMIT 1",
+                params![kind.as_str(), name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => Ok(Some(self.get_principal(uuid_col(id, "principals.id")?)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Any principal named `name`, whatever its kind (oldest first).
+    pub fn principal_by_name(&self, name: &str) -> Result<Option<Principal>> {
+        let id: Option<String> = self
+            .conn
+            .query_row("SELECT id FROM principals WHERE display_name = ?1 ORDER BY id LIMIT 1", params![name], |r| r.get(0))
+            .optional()?;
+        match id {
+            Some(id) => Ok(Some(self.get_principal(uuid_col(id, "principals.id")?)?)),
+            None => Ok(None),
+        }
     }
 }
 

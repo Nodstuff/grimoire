@@ -563,3 +563,21 @@ CREATE TABLE workspaces (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')));
 CREATE TABLE doc_workspace (doc_id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces (id) ON DELETE CASCADE);
 ";
+
+#[test]
+fn agent_labels_are_only_visible_where_they_wrote() {
+    let t = setup();
+    // B's agent writes in B's own doc: its label says what B is working on
+    let label = t.store.lock(Scope::System).create_principal(PrincipalKind::Agent, "claude:aoife-private-project", None).unwrap().id;
+    {
+        let mut s = t.store.lock(Scope::User(t.b));
+        let e = s.get_doc(t.b_doc).unwrap().current_epoch;
+        s.propose(t.b_doc, e, label, vec![para("agent note")]).unwrap();
+        assert!(s.list_principals().unwrap().iter().any(|p| p.id == label), "B sees her own agent");
+    }
+    let s = t.store.lock(Scope::User(t.a));
+    assert!(s.list_principals().unwrap().iter().all(|p| p.id != label), "A never sees B's agent label");
+    // identity resolution by name is unscoped, so no duplicate is ever minted
+    assert_eq!(s.principal_by_name("claude:aoife-private-project").unwrap().unwrap().id, label);
+    assert_eq!(s.principal_named(PrincipalKind::Agent, "claude:test").unwrap().unwrap().id, t.agent);
+}
