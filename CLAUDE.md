@@ -80,6 +80,16 @@ account may be flipped to the work account by other sessions — push with
   MCP 2026-07-28 has no sessions (`identify` is gone). A running Claude Code session needs `/mcp`
   reconnect to see tools or parameters added by a daemon you just deployed.
 
+## MCP from Claude Code: one PAT via headersHelper
+- Every Claude Code account can share one personal access token instead of an OAuth sign-in each.
+  Mint it on the box over SSM: `taisce --db <server db> auth token create --name claude-code`
+  (prints `tsk_…` once; `auth token list` / `auth token revoke <name|id>`). It opens `/mcp` only.
+- Store it in a 0600 file (`~/.config/taisce/token`) and register the server with a
+  `headersHelper` so the secret never sits in the MCP config:
+  `"taisce": {"type": "http", "url": "https://taisce.null.ie/mcp", "headersHelper":
+  "printf '{\"Authorization\":\"Bearer %s\"}' \"$(cat ~/.config/taisce/token)\""}`.
+- Writes default to `claude:<token name>`; `as: "claude:<project>-<task>"` still labels each call.
+
 ## Traps
 - `window.alert`/`confirm` are silent no-ops in Tauri's WKWebView — use inline UI.
 - Markdown-it's commonmark preset has no tables.

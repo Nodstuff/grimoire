@@ -80,6 +80,13 @@ additions give an HTTP client the same contract MCP agents get:
 - SERVER mode (`--public-url`): identity is the bearer token's. `Taisce-Principal`, `?as=`
   and `?cwd=` are ignored; the owner's app (redirect `ie.null.taisce:`) writes as the human, a
   connector as `claude:<client>`, and MCP `as` may only name a `claude:<label>` sub-principal.
+- SERVER mode personal access tokens: `taisce auth token create --name <n> [--user <id>]` (on the
+  box) prints a `tsk_…` bearer once; only its SHA-256 is stored. It opens `/mcp` and nothing else
+  (`/api`, `/ws` → 401 `invalid_token`), as the owner with the same pin as a connector: default
+  principal `claude:<n>`, MCP `as` may name a `claude:<label>`. `taisce auth token list` shows
+  name, id, created, last used (updated at most once a minute) and revoked, never the value;
+  `taisce auth token revoke <name|id>` ends it. Create, revoke and first use go to the
+  `taisce::audit` log.
 - SERVER mode push (APNs, `push.rs`): the app registers with `POST /api/devices`
   `{token, platform: "ios", env: "sandbox"|"production", app_version}` and removes itself with
   `DELETE /api/devices/{token}` (owner's app token only). Each journal change sends every active
