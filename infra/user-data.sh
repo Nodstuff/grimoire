@@ -1,5 +1,5 @@
 #!/bin/bash
-# First boot only. Binaries (grimoire daemon, portus, litestream) and their
+# First boot only. Binaries (taisce daemon, portus, litestream) and their
 # systemd units are shipped later over SSM; this just prepares the box.
 set -euo pipefail
 

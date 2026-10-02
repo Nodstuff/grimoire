@@ -1,7 +1,7 @@
 [Unit]
 Description=Litestream replication of the Taisce db to S3
-After=grimoire.service
-Requires=grimoire.service
+After=taisce.service
+Requires=taisce.service
 
 [Service]
 User=taisce

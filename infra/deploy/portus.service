@@ -1,6 +1,6 @@
 [Unit]
 Description=Portus reverse proxy (TLS via ACME tls-alpn-01)
-After=network-online.target grimoire.service
+After=network-online.target taisce.service
 Wants=network-online.target
 
 [Service]

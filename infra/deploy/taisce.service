@@ -1,0 +1,30 @@
+[Unit]
+Description=Taisce daemon (SERVER mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=taisce
+Group=taisce
+Environment=HOME=/var/lib/taisce
+Environment=TAISCE_PUBLIC_URL=https://taisce.null.ie
+Environment=TAISCE_TRUSTED_PROXY=true
+ExecStartPre=-+/opt/taisce/bin/apns-key.sh
+Environment=TAISCE_APNS_KEY_FILE=/run/taisce/apns.p8
+Environment=TAISCE_APNS_KEY_ID=WT3Q587Y97
+Environment=TAISCE_APNS_TEAM_ID=6UP35L9425
+Environment=TAISCE_APNS_TOPIC=ie.null.taisce
+Environment=TAISCE_APNS_ENV=production
+ExecStart=/opt/taisce/bin/taisce --db /var/lib/taisce/ks.db --port 7425 serve
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/taisce
+RuntimeDirectory=taisce
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target
