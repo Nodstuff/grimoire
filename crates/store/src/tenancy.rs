@@ -238,13 +238,31 @@ pub(crate) fn audience_conn(conn: &Connection, space: Space) -> Result<Option<Ha
 /// who reads `linking`? Only then may a rename of `target` rewrite it: every
 /// reader of the linking doc must be able to see the target, else the link
 /// may mean someone else's doc of that title (ADR 0004).
-pub(crate) fn link_reaches(conn: &Connection, linking: Uuid, target: Uuid) -> Result<bool> {
+pub(crate) fn link_reaches(conn: &Connection, linking: Uuid, target: Uuid, title: &str) -> Result<bool> {
     let (Some(readers), Some(seers)) =
         (audience_conn(conn, space_conn(conn, linking)?)?, audience_conn(conn, space_conn(conn, target)?)?)
     else {
         return Ok(true);
     };
-    Ok(readers.is_subset(&seers))
+    if !readers.is_subset(&seers) {
+        return Ok(false);
+    }
+    // the link resolved to the renamed doc before the rename only if no
+    // reader of the linking doc could also see another doc of that title
+    // (then it may mean theirs): ambiguous links are left alone
+    let others: Vec<String> = {
+        let mut st = conn.prepare_cached("SELECT id FROM docs WHERE title = ?1 AND deleted = 0 AND id != ?2")?;
+        st.query_map(params![title, target.to_string()], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+    };
+    for o in others {
+        let o = parse(o, "docs.id")?;
+        if let Some(theirs) = audience_conn(conn, space_conn(conn, o)?)?
+            && !theirs.is_disjoint(&readers)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Is a display name taken by another principal (a person or an agent) or

@@ -130,6 +130,7 @@ impl AuthState {
             .rp_name("Taisce")
             .build()
             .map_err(|e| anyhow::anyhow!("webauthn config: {e}"))?;
+        ensure_first_party(&mut store.lock(taisce_store::Scope::System), now())?;
         Ok(Self {
             cfg: Arc::new(cfg),
             store,
@@ -219,9 +220,33 @@ pub fn client_principal(client_id: &str, client_name: &str) -> String {
 /// The native app's redirect scheme. A client whose every redirect URI is
 /// on it is the owner's own app: it writes as the human, not as an agent.
 pub const APP_REDIRECT_SCHEME: &str = "ie.null.taisce:";
+/// The one redirect the Taisce app uses (TaisceKit `OAuthClient.redirectURI`).
+pub const APP_REDIRECT_URI: &str = "ie.null.taisce:/oauth/callback";
+/// The app's fixed, server-registered client (ADR 0004, review round 2).
+/// First party is decided by client_id (`oauth_first_party`), never by the
+/// redirect a client declares: DCR maps the app's exact registration to this
+/// client and refuses any other use of the scheme.
+pub const FIRST_PARTY_APP_CLIENT: &str = "taisce-app";
 
-fn is_owner_app(redirect_uris: &[String]) -> bool {
-    !redirect_uris.is_empty() && redirect_uris.iter().all(|u| u.starts_with(APP_REDIRECT_SCHEME))
+/// Register the fixed app client and pin first-party clients (idempotent).
+pub fn ensure_first_party(s: &mut SqliteStore, now: i64) -> taisce_store::Result<()> {
+    if s.oauth_client(FIRST_PARTY_APP_CLIENT)?.is_none() {
+        s.oauth_upsert_client(&taisce_store::auth::OAuthClient {
+            client_id: FIRST_PARTY_APP_CLIENT.into(),
+            kind: "dcr".into(),
+            client_name: "Taisce".into(),
+            redirect_uris: vec![APP_REDIRECT_URI.into()],
+            metadata: "{\"first_party\":true}".into(),
+            created_at: now,
+            refresh_at: None,
+        })?;
+    }
+    // the app's DCR clients from before this pin keep their sessions
+    let n = s.oauth_grandfather_first_party(APP_REDIRECT_SCHEME, now)?;
+    if n > 0 {
+        tracing::info!(target: AUDIT, event = "client.first_party_grandfathered", clients = n);
+    }
+    s.oauth_mark_first_party(FIRST_PARTY_APP_CLIENT, now)
 }
 
 /// Who a request authenticated as (an extension on authenticated requests).
@@ -321,7 +346,8 @@ pub async fn authenticate(st: &AuthState, token: &str) -> Option<Authenticated> 
             user_id: grant.user_id,
             grant_id: grant.id,
             principal: client_principal(&grant.client_id, &name),
-            owner_app: client.is_some_and(|c| is_owner_app(&c.redirect_uris)),
+            // first party by client_id only (never by a declared redirect)
+            owner_app: s.oauth_is_first_party(&grant.client_id).unwrap_or(false) && client.is_some(),
             human,
             client_id: grant.client_id,
             instance_owner,

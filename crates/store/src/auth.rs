@@ -431,6 +431,55 @@ impl SqliteStore {
 
     // ---- clients ----
 
+    /// Is this client the person's own app (first party)?
+    pub fn oauth_is_first_party(&self, client_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM oauth_first_party WHERE client_id = ?1)",
+            [client_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Mark a client first party (the server's own fixed app client).
+    pub fn oauth_mark_first_party(&mut self, client_id: &str, now: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO oauth_first_party (client_id, added_at) VALUES (?1, ?2)",
+            params![client_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Once per database: the DCR clients registered before first-party
+    /// clients were pinned whose every redirect is the app's scheme become
+    /// first party, so the app's live sessions keep working. Returns how
+    /// many; later registrations never go through here.
+    pub fn oauth_grandfather_first_party(&mut self, app_scheme: &str, now: i64) -> Result<usize> {
+        const KEY: &str = "auth.first_party_grandfathered";
+        let done: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [KEY], |r| r.get(0))
+            .optional()?;
+        if done.is_some() {
+            return Ok(0);
+        }
+        let rows: Vec<(String, String)> = {
+            let mut st = self.conn.prepare("SELECT client_id, redirect_uris FROM oauth_clients WHERE kind = 'dcr'")?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        let mut n = 0;
+        for (id, uris) in rows {
+            let uris: Vec<String> = serde_json::from_str(&uris).unwrap_or_default();
+            if !uris.is_empty() && uris.iter().all(|u| u.starts_with(app_scheme)) {
+                tx.execute("INSERT OR IGNORE INTO oauth_first_party (client_id, added_at) VALUES (?1, ?2)", params![id, now])?;
+                n += 1;
+            }
+        }
+        tx.execute("INSERT INTO settings (key, value) VALUES (?1, '1') ON CONFLICT (key) DO NOTHING", [KEY])?;
+        tx.commit()?;
+        Ok(n)
+    }
+
     pub fn oauth_upsert_client(&mut self, c: &OAuthClient) -> Result<()> {
         self.conn.execute(
             "INSERT INTO oauth_clients (client_id, kind, client_name, redirect_uris, metadata, created_at, refresh_at)

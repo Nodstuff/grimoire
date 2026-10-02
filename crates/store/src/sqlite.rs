@@ -3142,7 +3142,7 @@ fn rewrite_inbound_links_tx(
     for (block, doc, content) in linking_blocks_conn(tx, scope, old)? {
         // a rename never writes into a doc the renamer cannot write, nor
         // rewrites a link that may mean another person's doc of that title
-        if tenancy::ensure_write_conn(tx, scope, doc).is_err() || !tenancy::link_reaches(tx, doc, renamed)? {
+        if tenancy::ensure_write_conn(tx, scope, doc).is_err() || !tenancy::link_reaches(tx, doc, renamed, old)? {
             continue;
         }
         by_doc.entry(doc).or_default().push((block, content));
@@ -3271,7 +3271,7 @@ impl SqliteStore {
         // only links that mean THIS doc for everyone who reads them
         Ok(linking_blocks_conn(&self.conn, self.scope, title)?
             .into_iter()
-            .filter(|(_, doc, _)| tenancy::link_reaches(&self.conn, *doc, renamed).unwrap_or(false))
+            .filter(|(_, doc, _)| tenancy::link_reaches(&self.conn, *doc, renamed, title).unwrap_or(false))
             .collect())
     }
 

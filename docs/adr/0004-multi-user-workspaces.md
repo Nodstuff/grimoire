@@ -158,8 +158,10 @@ gained (the client fetches them).
   to-dos, profile) answers 403 for them (`viewer::refuse_connector_writes`).
 - **Restore** revives only the docs the restorer can write and counts only those.
 - **A workspace's labelled root moves only with the owner** (unless deeper into the same
-  workspace), and deleting a workspace brings any labelled root that would fall into someone
-  else's space back to the owner's root.
+  workspace). Deleting a workspace returns each labelled root to its **contributor** (the
+  doc's owner: the workspace owner, or a member who filed their own doc in): it stays where it
+  now falls if they can write there, else it comes to their own root, in their Unsorted.
+  Ownership never changes hands as a side effect of someone else's delete (round 2, N1).
 - **Agent principals are per person** (`principals.owner_user`; NULL and every pre-0004 agent
   = the instance owner): the same `claude:<label>` or PAT name under two users is two
   principals, an `as` by id must be one of your own agents, the scribe is per person, and
@@ -170,6 +172,33 @@ gained (the client fetches them).
   are generic; an unlabel toward a hidden parent is a generic Forbidden; a viewer's GET of a
   shared workspace's missing To-do creates nothing. The instance owner still replays
   pre-0004 idempotency rows (bare principal key).
+
+### 5b. Review round 2
+
+- **History starts at access (N2).** A reader sees a doc's ops only from the moment it entered
+  their view — their latest `granted` access row for it (written by the access journal on a
+  share, label or move). Earlier ops, including text deleted before the share, are hidden
+  from them on every history path (`ops_since`/`diff_since`, `/api/doc/{id}/history`, the
+  review queue, proposal outcomes); members who saw the doc all along have no such row and
+  see everything. A diff from an epoch before the access point simply starts there (no
+  error); the current content and `propose_markdown`'s stale-base/missed-ops path work as
+  before. The share CLI says "history before today stays private".
+- **People's names are unique (N3)**, case-insensitively across users, human principals and
+  agents, on rename and on user add; a CLI `--user <name>` must match exactly one user, and an
+  ambiguous one is refused with the candidates' ids.
+- **A GET is read-only for any non-first-party token (N4).** The only GET that wrote was
+  `GET /api/todo` (find-or-create, carry-forward); for connectors it now only finds and
+  answers 404 when there is no list.
+- **First party is a pinned client_id (N5).** `oauth_first_party` holds the fixed,
+  server-registered app client (`taisce-app`) and — once, at the first start of this build —
+  the app's DCR clients that already existed (every redirect on `ie.null.taisce:`), so live
+  app sessions keep working without a new sign-in. DCR maps the shipped app's exact
+  registration (`ie.null.taisce:/oauth/callback` alone) to the fixed client and refuses any
+  other use of the scheme; a client that merely declares the app's redirect is a connector.
+  (The current app registers by DCR once per server and persists the `client_id`; it keeps
+  working unchanged. A later app could ship `taisce-app` and skip DCR.)
+- **Renames leave ambiguous links alone.** A link is rewritten only if every reader of the
+  linking doc can see the renamed doc and none of them can see another doc of that title.
 
 **Stored cross-doc references and how each is scoped**
 

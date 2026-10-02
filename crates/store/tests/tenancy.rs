@@ -929,3 +929,29 @@ fn n3_names_are_unique_and_lookups_unambiguous() {
     let names: Vec<String> = t.store.lock(Scope::User(t.a)).list_principals().unwrap().into_iter().filter(|p| p.kind == PrincipalKind::Human).map(|p| p.display_name).collect();
     assert!(!names.iter().any(|n| n == "Tom" && names.iter().filter(|m| *m == "Tom").count() > 1), "{names:?}");
 }
+
+/// Round-2 minor: a rename never rewrites a reader's own same-titled link:
+/// B's private note links [[Groceries]] meaning her own doc; A renaming the
+/// shared "Groceries" leaves it alone, while a link that only ever meant the
+/// shared doc follows the rename.
+#[test]
+fn a_rename_leaves_ambiguous_links_alone() {
+    let t = setup();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    let shared_g = t.store.lock(Scope::User(t.a)).create_doc("Groceries", Some(t.shared_doc), t.a_human).unwrap().id;
+    let (b_note, b_other) = {
+        let mut s = t.store.lock(Scope::User(t.b));
+        s.create_doc("Groceries", None, t.b_human).unwrap();
+        let (n, _) = s.create_doc_with_ops("B list", None, t.b_human, vec![para("my [[Groceries]]")]).unwrap();
+        let (o, _) = s.create_doc_with_ops("Family notes", Some(t.shared_doc), t.b_human, vec![para("see [[Chores]]")]).unwrap();
+        (n.id, o.id)
+    };
+    let chores = t.store.lock(Scope::User(t.a)).create_doc("Chores", Some(t.shared_doc), t.a_human).unwrap().id;
+    let mut s = t.store.lock(Scope::User(t.a));
+    s.propose_doc_op(shared_g, t.a_human, OpKind::RenameDoc { title: "Shopping".into(), from_title: String::new() }, vec![]).unwrap();
+    s.propose_doc_op(chores, t.a_human, OpKind::RenameDoc { title: "Jobs".into(), from_title: String::new() }, vec![]).unwrap();
+    drop(s);
+    let s = t.store.lock(Scope::User(t.b));
+    assert!(serde_json::to_string(&s.read_doc(b_note).unwrap()).unwrap().contains("[[Groceries]]"), "her own link stands");
+    assert!(serde_json::to_string(&s.read_doc(b_other).unwrap()).unwrap().contains("[[Jobs]]"), "an unambiguous link follows");
+}

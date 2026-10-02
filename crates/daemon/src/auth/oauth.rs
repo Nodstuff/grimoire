@@ -266,9 +266,39 @@ async fn register(State(st): State<AuthState>, req: Request) -> Response {
     if !subset("response_types", &["code"]) {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", "response_types: code only");
     }
+    // the app's scheme is first party: its exact registration (what the
+    // shipped Taisce app sends) gets the fixed, server-registered app client;
+    // any other use of the scheme is refused (ADR 0004, review round 2)
+    let app_scheme = uris.iter().any(|u| u.starts_with(super::APP_REDIRECT_SCHEME));
+    if app_scheme && uris.iter().any(|u| u != super::APP_REDIRECT_URI) {
+        tracing::warn!(target: AUDIT, event = "client.register_refused", why = "app scheme", ip);
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri", "that redirect scheme is reserved for the Taisce app");
+    }
+    let now = now();
+    if app_scheme {
+        let ok = with_store(&st.store, taisce_store::Scope::System, move |s| super::ensure_first_party(s, now)).await;
+        if let Err(e) = ok {
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e.to_string());
+        }
+        tracing::info!(target: AUDIT, event = "client.register_app", client = super::FIRST_PARTY_APP_CLIENT, ip);
+        return no_store(
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "client_id": super::FIRST_PARTY_APP_CLIENT,
+                    "client_id_issued_at": now,
+                    "client_name": "Taisce",
+                    "redirect_uris": [super::APP_REDIRECT_URI],
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"],
+                    "token_endpoint_auth_method": "none",
+                })),
+            )
+                .into_response(),
+        );
+    }
     let name = clean_name(body.get("client_name").and_then(Value::as_str).unwrap_or(""));
     let name = if name.is_empty() { "OAuth client".to_string() } else { name };
-    let now = now();
     let client = OAuthClient {
         client_id: format!("dcr_{}", &random_token()[..24]),
         kind: "dcr".into(),

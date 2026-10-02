@@ -131,6 +131,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/docs/{id}/workspace", "unlabel_into_a_hidden_parent_is_a_generic_refusal"),
     ("mcp:append", "agent_principals_are_per_person"),
     ("/api/todo", "a_connectors_get_writes_nothing"),
+    ("/api/devices", "first_party_is_a_pinned_client_not_a_declared_redirect"),
     ("/api/doc/{id}/history", "agent_principals_are_per_person"),
 ];
 
@@ -206,6 +207,10 @@ fn mint(s: &mut SqliteStore, user: Uuid, name: &str, app: bool) -> String {
     };
     s.oauth_issue_grant(None, &grant, &hash_secret(&access), now() + 3600, &hash_secret(&random_token()), now() + 86400)
         .unwrap();
+    if app {
+        // first party is a pinned client_id, never a declared redirect
+        s.oauth_mark_first_party(&grant.client_id, now()).unwrap();
+    }
     access
 }
 
@@ -1166,4 +1171,71 @@ async fn a_connectors_get_writes_nothing() {
         .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(fx.store.lock(Scope::System).latest_change_seq().unwrap(), n1, "no carry-forward by a connector");
+}
+
+/// Round-2 N5: the person's own app is a pinned client_id, never whatever
+/// redirect a client declares. DCR gives the app's exact registration the
+/// fixed app client and refuses any other use of its scheme; a client that
+/// merely claims the scheme gets no app powers; the app's pre-existing DCR
+/// clients are grandfathered once so live sessions keep working.
+#[tokio::test]
+async fn first_party_is_a_pinned_client_not_a_declared_redirect() {
+    let fx = fixture();
+    let register = |uris: Value| {
+        Request::post("/oauth/register")
+            .header("host", "localhost:7513")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"client_name": "Taisce", "redirect_uris": uris}).to_string()))
+            .unwrap()
+    };
+    let res = fx.app.clone().oneshot(register(json!([crate::auth::APP_REDIRECT_URI]))).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let v: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(v["client_id"], crate::auth::FIRST_PARTY_APP_CLIENT, "the shipped app's registration maps to the fixed client");
+    for uris in [json!([crate::auth::APP_REDIRECT_URI, "https://claude.ai/api/mcp/auth_callback"]), json!(["ie.null.taisce:/evil"])] {
+        let res = fx.app.clone().oneshot(register(uris.clone())).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{uris}");
+    }
+    // a client row that only DECLARES the app redirect (as any DCR client
+    // could before) is not first party: no device registration, no /api writes
+    let sneaky = {
+        let mut s = fx.store.lock(Scope::System);
+        let tok = random_token();
+        let cid = "dcr_sneaky".to_string();
+        s.oauth_upsert_client(&OAuthClient {
+            client_id: cid.clone(),
+            kind: "dcr".into(),
+            client_name: "Totally the app".into(),
+            redirect_uris: vec![crate::auth::APP_REDIRECT_URI.into()],
+            metadata: "{}".into(),
+            created_at: now(),
+            refresh_at: None,
+        })
+        .unwrap();
+        let grant = Grant { id: Uuid::now_v7(), client_id: cid, user_id: fx.b, resource: None, scope: crate::auth::SCOPE.into(), created_at: now(), revoked_at: None, revoke_why: None };
+        s.oauth_issue_grant(None, &grant, &hash_secret(&tok), now() + 3600, &hash_secret(&random_token()), now() + 86400).unwrap();
+        tok
+    };
+    let (st, _) = fx.call(&sneaky, "POST", "/api/devices", Some(json!({"token": "ab".repeat(32), "platform": "ios"}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = fx.call(&sneaky, "POST", &format!("/api/doc/{}/rename", fx.b_doc), Some(json!({"title": "x"}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // grandfathering: an app-scheme DCR client from before the pin is first
+    // party after the one-time pass; the pass never runs again
+    let mut raw = SqliteStore::open_in_memory().unwrap();
+    let old = OAuthClient {
+        client_id: "dcr_old_app".into(),
+        kind: "dcr".into(),
+        client_name: "Taisce".into(),
+        redirect_uris: vec![crate::auth::APP_REDIRECT_URI.into()],
+        metadata: "{}".into(),
+        created_at: 1,
+        refresh_at: None,
+    };
+    raw.oauth_upsert_client(&old).unwrap();
+    crate::auth::ensure_first_party(&mut raw, now()).unwrap();
+    assert!(raw.oauth_is_first_party("dcr_old_app").unwrap(), "the app's live session keeps working");
+    raw.oauth_upsert_client(&OAuthClient { client_id: "dcr_new_claim".into(), ..old }).unwrap();
+    crate::auth::ensure_first_party(&mut raw, now()).unwrap();
+    assert!(!raw.oauth_is_first_party("dcr_new_claim").unwrap(), "a later claim is never grandfathered");
 }

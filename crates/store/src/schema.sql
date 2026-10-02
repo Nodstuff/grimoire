@@ -459,3 +459,13 @@ CREATE TABLE IF NOT EXISTS audit_events (
     detail  TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS audit_events_at ON audit_events (at);
+
+-- ADR 0004 (review round 2): first-party clients — the person's own app —
+-- are known by client_id, never by what a client says its redirect is.
+-- The fixed app client the server registers itself, plus the app's DCR
+-- clients that existed before this table (grandfathered once, so live app
+-- sessions keep working).
+CREATE TABLE IF NOT EXISTS oauth_first_party (
+    client_id TEXT PRIMARY KEY,
+    added_at  INTEGER NOT NULL
+);
