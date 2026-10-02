@@ -1,5 +1,7 @@
 #!/bin/zsh
-# Signed, notarized, distributable Grimoire dmg (ADR 0002 distribution).
+# Signed, notarized, distributable dmg of the legacy desktop app (ADR 0002
+# distribution). It keeps its pre-rename bundle name and id (Grimoire.app,
+# ie.null.grimoire), notary profile and updater key so installs update in place.
 #
 # One-time setup (account holder only):
 #   1. Developer ID Application cert: Xcode → Settings → Accounts → Manage
@@ -59,7 +61,7 @@ echo "→ ui build"
 (cd ui && npm run build --silent | tail -1)
 echo "→ daemon release build"
 cargo build --release -p taisce 2>&1 | tail -1
-cp target/release/taisce crates/shell/binaries/grimoire-aarch64-apple-darwin
+cp target/release/taisce crates/shell/binaries/taisce-aarch64-apple-darwin
 
 echo "→ signed app + dmg"
 # Tauri's dmg step drives Finder via AppleScript and occasionally flakes in
@@ -97,7 +99,7 @@ version, sig, feed, tarball = sys.argv[1:]
 name = os.path.basename(tarball)
 json.dump({
   "version": version,
-  "notes": f"Grimoire {version} — see the release page for details.",
+  "notes": f"Taisce {version} — see the release page for details.",
   "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
   "platforms": {
     "darwin-aarch64": {

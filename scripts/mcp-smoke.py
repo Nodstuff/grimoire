@@ -8,7 +8,7 @@ Usage:
 
 Checks: edit_doc with 0/1/many matches, append to an ambiguous path (must
 error), append with create_missing, read_doc(refs) round-tripping through
-propose_markdown as zero ops, ?as= / ?cwd= / X-Grimoire-Principal attribution
+propose_markdown as zero ops, ?as= / ?cwd= / Taisce-Principal attribution
 visible in proposals(kind: mine). Prints the byte size of read_doc (default,
 refs, section) and of an edit_doc and an append result.
 
@@ -196,7 +196,7 @@ def run(base):
     err, out = c.call("proposals", kind="mine")
     check("?cwd= → claude:portus visible in proposals", not err and len(json.loads(out)["proposals"]) == 1
           and json.loads(out)["proposals"][0]["op"]["kind"]["content"] == "by cwd", out)
-    h = Mcp(url + "?as=claude:loser", headers={"X-Grimoire-Principal": "claude:via-header"})
+    h = Mcp(url + "?as=claude:loser", headers={"Taisce-Principal": "claude:via-header"})
     err, out = h.call("append", doc_id=doc, markdown="by header")
     check("header write ok", not err, out)
     err, out = h.call("proposals", kind="mine")
@@ -208,7 +208,7 @@ def run(base):
     req = urllib.request.Request(base + "/api/profile", data=json.dumps({"name": "smokehuman"}).encode(), method="POST")
     req.add_header("Content-Type", "application/json")
     urllib.request.urlopen(req, timeout=10).read()
-    err, out = Mcp(url, headers={"X-Grimoire-Principal": "smokehuman"}).call("append", doc_id=doc, markdown="nope")
+    err, out = Mcp(url, headers={"Taisce-Principal": "smokehuman"}).call("append", doc_id=doc, markdown="nope")
     check("the human is refused by header", err and "not an agent" in out, out)
     err, out = m.call("append", doc_id=doc, markdown="nope", **{"as": "smokehuman"})
     check("the human is refused by `as`", err and "not an agent" in out, out)
@@ -236,10 +236,10 @@ def main():
         run(base)
     else:
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        binary = os.path.join(repo, "target", "release", "grimoire")
+        binary = os.path.join(repo, "target", "release", "taisce")
         if not os.path.exists(binary):
             sys.exit(f"{binary} missing: cargo build --release -p taisce first")
-        scratch = tempfile.mkdtemp(prefix="grimoire-mcp-smoke.")
+        scratch = tempfile.mkdtemp(prefix="taisce-mcp-smoke.")
         env = dict(os.environ, HOME=scratch)
         log = open(os.path.join(scratch, "log"), "w")
         proc = subprocess.Popen([binary, "--db", os.path.join(scratch, "ks.db"), "--port", str(PORT), "serve"],

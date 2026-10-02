@@ -1,4 +1,4 @@
-# Grimoire
+# Taisce
 
 A knowledge system for people who work with AI agents. Your notes are markdown
 blocks in one SQLite file; humans and agents write through the same **review gate**.
@@ -7,7 +7,9 @@ native Apple clients) or as the Mac app's local daemon (LOCAL mode).
 
 **Download:** [latest release](https://github.com/Nodstuff/grimoire/releases/latest)
 (macOS, Apple Silicon, signed + notarized; SHA-256 in each release’s notes).
-Open the dmg, drag Grimoire to Applications. Data lives in `~/.grimoire`.
+Open the dmg, drag Grimoire.app to Applications (the desktop app keeps its pre-rename
+bundle name until the Mac Catalyst app replaces it). Data lives in `~/.grimoire`, the
+daemon's default `--db` dir; it is not moved by the rename.
 The app checks for updates daily (◈ menu → *Check for updates…*); updates are
 minisign-verified against the key in `crates/shell/tauri.conf.json`.
 
@@ -33,7 +35,7 @@ minisign-verified against the key in `crates/shell/tauri.conf.json`.
 | Path | What |
 |---|---|
 | `crates/store` | SQLite ledger + projection, the gate, import/export, markdown diff |
-| `crates/daemon` | The `grimoire` binary: MCP, JSON API, OAuth + passkeys, APNs push, change feed, gardeners, backups |
+| `crates/daemon` | The `taisce` binary: MCP, JSON API, OAuth + passkeys, APNs push, change feed, gardeners, backups |
 | `crates/shell` | Tauri app — a window and tray around the daemon, which it bundles as a sidecar |
 | `ui/` | React + Tiptap frontend, embedded into the daemon binary |
 | `docs/adr/` | Decisions: 0001 storage; 0002 federation and 0003 hot docs (both superseded) |
@@ -57,7 +59,7 @@ given) and `?capture=1` (open quick capture).
 ## HTTP API for other local clients (0.6.2+)
 
 Everything the UI uses is plain JSON under `/api/*` on `127.0.0.1:7425` (errors are
-`{"error": …}` with HTTP 200; only `/admin/*` needs the `X-Grimoire-Admin` token). Three
+`{"error": …}` with HTTP 200; only `/admin/*` needs the `Taisce-Admin` token). Three
 additions give an HTTP client the same contract MCP agents get:
 
 - `POST /api/propose_markdown` `{doc_id, base_epoch, markdown, request_id?}` — the whole doc's
@@ -65,7 +67,7 @@ additions give an HTTP client the same contract MCP agents get:
   (unchanged blocks keep their ids). A stale `base_epoch` returns
   `{"error":"stale_base", base_epoch, current_epoch, missed_ops, recover}`; identical markdown
   returns `{…, "verdicts": [], "note": "no changes"}`.
-- `X-Grimoire-Principal: <name>` (1–60 chars) on `POST /api/propose`, `/api/propose_markdown`,
+- `Taisce-Principal: <name>` (1–60 chars) on `POST /api/propose`, `/api/propose_markdown`,
   `/api/docs` and `/api/comment` attributes the write to that Agent principal (created on first
   use — the same rule as the MCP `as` argument; a human's name is refused) instead
   of you, so it goes through review as an agent's. Absent → the human, as before. Over MCP, pass
@@ -75,7 +77,7 @@ additions give an HTTP client the same contract MCP agents get:
   id returns the first outcome instead of double-applying. Per principal, kept 7 days in the
   store (survives restarts).
 - `GET /api/docs` answers with `Taisce-Seq: <change-journal head>` for that snapshot.
-- SERVER mode (`--public-url`): identity is the bearer token's. `X-Grimoire-Principal`, `?as=`
+- SERVER mode (`--public-url`): identity is the bearer token's. `Taisce-Principal`, `?as=`
   and `?cwd=` are ignored; the owner's app (redirect `ie.null.taisce:`) writes as the human, a
   connector as `claude:<client>`, and MCP `as` may only name a `claude:<label>` sub-principal.
 - SERVER mode push (APNs, `push.rs`): the app registers with `POST /api/devices`
@@ -83,9 +85,13 @@ additions give an HTTP client the same contract MCP agents get:
   `DELETE /api/devices/{token}` (owner's app token only). Each journal change sends every active
   device one silent nudge (`content-available`, collapse id `changes`, at most one per device per
   30 s); 410 / `BadDeviceToken` / `Unregistered` disable the token. Configure with
-  `GRIMOIRE_APNS_KEY_FILE` (or `GRIMOIRE_APNS_KEY`, the PEM), `GRIMOIRE_APNS_KEY_ID`,
-  `GRIMOIRE_APNS_TEAM_ID`, optional `GRIMOIRE_APNS_TOPIC` (default `ie.null.taisce`) and
-  `GRIMOIRE_APNS_ENV` (default env for a registration naming none; `production`); unset = off.
+  `TAISCE_APNS_KEY_FILE` (or `TAISCE_APNS_KEY`, the PEM), `TAISCE_APNS_KEY_ID`,
+  `TAISCE_APNS_TEAM_ID`, optional `TAISCE_APNS_TOPIC` (default `ie.null.taisce`) and
+  `TAISCE_APNS_ENV` (default env for a registration naming none; `production`); unset = off.
+
+Renamed from Grimoire in 0.9: the daemon still reads `GRIMOIRE_*` env vars (as `TAISCE_*`,
+with a deprecation warning in the log) and the `X-Grimoire-Admin` / `X-Grimoire-Principal`
+headers (as `Taisce-*`) for one release; both go in 0.10 (`crates/daemon/src/legacy.rs`).
 
 The daemon's version is `GET /api/buildinfo` → `{"version": "0.6.2", "build": <stamp>}`.
 

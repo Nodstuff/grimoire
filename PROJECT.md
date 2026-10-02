@@ -12,7 +12,9 @@
 > ask-the-vault with living answers, workspaces, the change feed for offline clients, quick
 > capture with the filer, to-dos, Claude memory sync, import/export, daily backups. Where
 > this file describes phase 2 (§6, §7), read it as history. The repo is `Nodstuff/grimoire`
-> (renamed from `knowledge-system`).
+> (renamed from `knowledge-system`). The product, binary and crates were renamed Grimoire →
+> **Taisce** on 2026-10-02 (`taisce`, `taisce-store`; `TAISCE_*` env, `Taisce-*` headers);
+> below, "Grimoire" is the same system under its old name.
 
 # PROJECT.md — Personal Knowledge System That Maintains Itself
 

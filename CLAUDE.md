@@ -1,28 +1,28 @@
-# Grimoire — working rules for Claude sessions
+# Taisce (formerly Grimoire) — working rules for Claude sessions
 
 What it is now: ONE personal server, **Taisce** (`https://taisce.null.ie`), plus clients.
-- The `grimoire` binary runs in two modes. **SERVER** (`--public-url` /
-  `GRIMOIRE_PUBLIC_URL` set): every data route needs an OAuth 2.1 bearer token, sign-in is
-  passkeys (`grimoire auth enroll|list|revoke` on the box), the proxy is trusted for
+- The `taisce` binary runs in two modes. **SERVER** (`--public-url` /
+  `TAISCE_PUBLIC_URL` set): every data route needs an OAuth 2.1 bearer token, sign-in is
+  passkeys (`taisce auth enroll|list|revoke` on the box), the proxy is trusted for
   rate-limiting (`--trusted-proxy`), APNs nudges the iOS app. **LOCAL** (no public URL): the
   Mac app's daemon on `127.0.0.1:7425`, loopback-only (DNS-rebinding guard), `/admin/*` behind
   the per-boot `admin.token`.
 - Clients: this web UI (embedded in the binary), the native Apple app under `apple/` on
   branch `ios-ui` (TaisceKit + the Taisce app), Claude over MCP at `/mcp`.
 - The server box: `infra/` on branch `infra` (Terraform for the EC2 instance, systemd units for
-  grimoire + portus + litestream, `deploy/install.sh` run over SSM from a release bundle in the
+  taisce + portus + litestream, `deploy/install.sh` run over SSM from a release bundle in the
   backup bucket). Zero ingress; SSM only.
 - Cut on 2026-10-01 and gone from the code: peer-to-peer federation (iroh, shares, mirrors,
   hubs), hot docs and agents in the room, canvases, doc freshness views, the status chip, the
   reviewer gardener. ADRs 0002/0003 are marked superseded; a store migration dropped the
   federation tables.
 
-Repo: github.com/Nodstuff/grimoire (personal account `Nodstuff`; `gh`'s active
+Repo: github.com/Nodstuff/grimoire (the repo keeps its old name; personal account `Nodstuff`; `gh`'s active
 account may be flipped to the work account by other sessions — push with
 `git -c credential.helper= -c 'credential.helper=!f() { echo username=Nodstuff; echo password=$(gh auth token --user Nodstuff); }; f' push origin main`).
 
 ## Start here
-- **[[Roadmap]]** in Grimoire (under the `[[Grimoire]]` tree) is the outstanding list — read it first in any
+- **[[Roadmap]]** in Taisce (under the `[[Grimoire]]` tree — doc titles are data, not renamed) is the outstanding list — read it first in any
   new session; the daily doc carries narrative, the roadmap carries the work.
 - Test with `cargo test -p taisce -p taisce-store` (the shell crate's build.rs needs the sidecar
   binary; a bare workspace `cargo test` fails in a fresh worktree). In a fresh worktree the daemon
@@ -38,7 +38,7 @@ account may be flipped to the work account by other sessions — push with
   daemon at the server or at `~/.grimoire`.
 
 ## Where the truth is
-- **System docs**: the `[[Grimoire]]` doc tree in Grimoire itself (MCP server `grimoire`):
+- **System docs**: the `[[Grimoire]]` doc tree in Taisce itself (MCP server registered as `grimoire`):
   Architecture, Review Gate, Gardeners, Agent Guide, Using the App, Development, Roadmap
   (its Federation and Hot Docs pages describe removed features). `PROJECT.md` is the founding
   design record and its status section says what has since been built and cut.
@@ -53,14 +53,19 @@ account may be flipped to the work account by other sessions — push with
   builds do not refresh `target/release/taisce`; a stale scratch daemon has burned hours.
   The shell cwd drifts into `ui/` after npm commands; always `cd` to the repo root first.
 - Scratch daemons (LOCAL mode): `HOME=<dir> ./target/release/taisce --db <dir>/ks.db --port 751x serve`
-  (`--port` is global; the UI is embedded, no `GRIMOIRE_UI_DIST` needed). Admin routes need
-  `-H "X-Grimoire-Admin: $(cat <dir>/admin.token)"`. Add `--public-url https://…` for SERVER
-  mode. Never point one at `~/.grimoire`.
+  (`--port` is global; the UI is embedded, no `TAISCE_UI_DIST` needed). Admin routes need
+  `-H "Taisce-Admin: $(cat <dir>/admin.token)"`. Add `--public-url https://…` for SERVER
+  mode. Never point one at `~/.grimoire` (still the default `--db` dir; the rename moved no data).
+- Renamed from Grimoire in 0.9: `GRIMOIRE_*` env vars and `X-Grimoire-Admin` /
+  `X-Grimoire-Principal` are still read for one release (`crates/daemon/src/legacy.rs`, with a
+  log warning for env); delete that file in 0.10. OAuth scope stays `grimoire` (issued tokens).
+  The legacy Tauri app keeps `Grimoire.app`, `ie.null.grimoire`, `grimoire-notary` and
+  `~/.grimoire-release/updater.key` so installs update in place.
 - `scripts/mcp-smoke.py` drives a scratch daemon over MCP end to end.
 - `./deploy.sh` = fast unsigned local deploy of the Mac app (restarts the daemon on 7425 —
   in-flight gardener runs get orphaned). `./release.sh` = signed + notarized dmg.
 
-## Writing to Grimoire over MCP (this repo's own docs live in it)
+## Writing to Taisce over MCP (this repo's own docs live in it)
 - 16 tools (AX 2): `find_doc`, `orient`, `read_doc`, `edit_doc`, `append`, `propose_markdown`,
   `propose`, `diff_since`, `search`, `grep`, `related`, `create_doc`, `doc_op`, `add_comment`,
   `resolve`, `proposals`. `edit_doc(old, new)` and `append(markdown, to, create_missing)` need no
@@ -68,7 +73,7 @@ account may be flipped to the work account by other sessions — push with
 - Attribution: pass `as: "claude:grimoire-<task>"` on every attributing call (`edit_doc`, `append`,
   `propose`, `propose_markdown`, `create_doc`, `doc_op`, `add_comment`, `resolve`, `proposals`), or
   register the server as `/mcp?as=<name>` / `/mcp?cwd=${PWD}` (→ `claude:<dirname>`) or send
-  `X-Grimoire-Principal`. Precedence: tool `as` > header > `?as=` > `?cwd=` > shared `claude`.
+  `Taisce-Principal`. Precedence: tool `as` > header > `?as=` > `?cwd=` > shared `claude`.
   MCP 2026-07-28 has no sessions (`identify` is gone). A running Claude Code session needs `/mcp`
   reconnect to see tools or parameters added by a daemon you just deployed.
 
