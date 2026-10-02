@@ -10,6 +10,7 @@
 
 use crate::api::ApiState;
 use crate::store_ext::with_store;
+use crate::viewer::Viewer;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -61,15 +62,11 @@ pub fn inbox_markdown(text: &str) -> String {
     format!("---\ntags:\n  - inbox\n---\n\n{}\n", text.trim_end())
 }
 
-/// The root doc titled Inbox, created (by `principal`) when absent. Never a
-/// duplicate: an existing root with that title is reused, whichever
-/// principal made it.
+/// The viewer's own root doc titled Inbox, created (by `principal`) when
+/// absent. Never a duplicate: an existing root of theirs with that title is
+/// reused, whichever principal made it. Each person has their own (ADR 0004).
 pub fn find_or_create_inbox(s: &mut SqliteStore, principal: Uuid) -> taisce_store::Result<Doc> {
-    if let Some(d) = s
-        .list_docs()?
-        .into_iter()
-        .find(|d| d.parent_id.is_none() && d.title == INBOX_TITLE)
-    {
+    if let Some(d) = s.own_root_titled(INBOX_TITLE)? {
         return Ok(d);
     }
     s.create_doc(INBOX_TITLE, None, principal)
@@ -80,12 +77,12 @@ struct CaptureReq {
     text: String,
 }
 
-async fn capture(State(st): State<ApiState>, Json(req): Json<CaptureReq>) -> Json<Value> {
+async fn capture(State(st): State<ApiState>, v: Viewer, Json(req): Json<CaptureReq>) -> Json<Value> {
     if req.text.trim().is_empty() {
         return Json(json!({"error": "nothing to capture"}));
     }
-    let human = st.human;
-    with_store(&st.store, move |s| {
+    let human = v.human;
+    with_store(&st.store, v.scope, move |s| {
         let inbox = match find_or_create_inbox(s, human) {
             Ok(d) => d,
             Err(e) => return Json(json!({"error": e.to_string()})),
@@ -101,13 +98,13 @@ async fn capture(State(st): State<ApiState>, Json(req): Json<CaptureReq>) -> Jso
     .await
 }
 
-async fn list(State(st): State<ApiState>) -> Json<Value> {
-    with_store(&st.store, move |s| {
+async fn list(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
         let docs = match s.list_docs() {
             Ok(d) => d,
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
-        let Some(inbox) = docs.iter().find(|d| d.parent_id.is_none() && d.title == INBOX_TITLE) else {
+        let Some(inbox) = s.own_root_titled(INBOX_TITLE).ok().flatten() else {
             return Json(json!({"doc_id": null, "items": []}));
         };
         let mut rows: Vec<(i64, Value)> = docs

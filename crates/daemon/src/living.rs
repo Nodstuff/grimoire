@@ -12,13 +12,14 @@
 //! whose sources went stale longest ago first.
 
 use crate::store_ext::with_store;
+use taisce_store::Scope;
 use axum::extract::{Path, State};
 use axum::Json;
 use taisce_store::{AnswerSource, BlockNode, BlockStore, DocTree, OpInput, OpKind, SearchHit, SqliteStore, order_key};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -203,13 +204,21 @@ pub fn refreshed_body(synthesis: Option<&str>, excerpts: &[SearchHit], changed: 
 
 /// Refresh one answer. Returns a run-log line; `Err` lines are skips.
 pub async fn refresh_one(
-    store: Arc<Mutex<SqliteStore>>,
+    store: taisce_store::SharedStore,
     doc_id: Uuid,
 ) -> Result<String, String> {
     let embedder = embedder();
+    // ADR 0004: re-ask as the answer's owner, and only over what everyone who
+    // can read the answer can read (its shared workspace, when it is in one)
+    let scope = with_store(&store, Scope::System, move |s| {
+        let owner = s.doc_home_user(doc_id)?;
+        s.writer_scope_for(owner, doc_id)
+    })
+    .await
+    .map_err(|e| format!("{doc_id}: {e}"))?;
     // phase 1: what changed, the question, fresh retrieval
     let (question, excerpts, changed, total, agent) = {
-        with_store(&store, move |s| -> Result<_, String> {
+        with_store(&store, scope, move |s| -> Result<_, String> {
             let tree = s.read_doc(doc_id).map_err(|e| e.to_string())?;
             let sources = s.answer_sources(doc_id).map_err(|e| e.to_string())?;
             let changed = sources.iter().filter(|x| x.changed).count();
@@ -240,7 +249,7 @@ pub async fn refresh_one(
         None
     };
     // phase 3: land as reviewable yellows, re-record the sources
-    with_store(&store, move |s| -> Result<String, String> {
+    with_store(&store, scope, move |s| -> Result<String, String> {
         let tree = s.read_doc(doc_id).map_err(|e| e.to_string())?;
         let refreshable = refreshable_blocks(s, &tree, agent);
         let body = refreshed_body(synthesis.as_deref(), &excerpts, changed, total);
@@ -283,10 +292,11 @@ pub fn stale_answers(store: &SqliteStore, only: Option<Uuid>) -> Vec<Uuid> {
 /// One sweep: up to `REFRESH_BUDGET` stale answers. Logged like a gardener
 /// run (one line per answer); returns the lines.
 pub async fn refresh_sweep(
-    store: Arc<Mutex<SqliteStore>>,
+    store: taisce_store::SharedStore,
     only: Option<Uuid>,
 ) -> Vec<String> {
-    let candidates = with_store(&store, move |s| stale_answers(s, only)).await;
+    // every answer doc on the box (each is then refreshed in its owner's scope)
+    let candidates = with_store(&store, Scope::System, move |s| stale_answers(s, only)).await;
     let mut lines = Vec::new();
     if candidates.is_empty() {
         lines.push("living answers: nothing stale".into());
@@ -306,8 +316,19 @@ pub async fn refresh_sweep(
 // --- routes ---
 
 /// `GET /api/doc/{id}/living`
-pub async fn living_status(State(st): State<crate::api::ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    with_store(&st.store, move |s| Json(json!(status(s, id)))).await
+pub async fn living_status(
+    State(st): State<crate::api::ApiState>,
+    v: crate::viewer::Viewer,
+    Path(id): Path<Uuid>,
+) -> Json<Value> {
+    with_store(&st.store, v.scope, move |s| {
+        // an invisible doc answers exactly like a missing one
+        if let Err(e) = s.get_doc(id) {
+            return Json(json!({"error": e.to_string()}));
+        }
+        Json(json!(status(s, id)))
+    })
+    .await
 }
 
 #[derive(Deserialize, Default)]
@@ -330,7 +351,7 @@ mod tests {
     use super::*;
     use taisce_store::{PrincipalKind, Verdict, import::import_markdown};
 
-    fn seed() -> (Arc<Mutex<SqliteStore>>, Uuid, Uuid, Uuid, Vec<SearchHit>) {
+    fn seed() -> (taisce_store::SharedStore, Uuid, Uuid, Uuid, Vec<SearchHit>) {
         let mut s = SqliteStore::open_in_memory().unwrap();
         let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
         let human_folder = crate::ask::ANSWERS_FOLDER;
@@ -351,7 +372,7 @@ mod tests {
         )
         .unwrap();
         record_sources(&mut s, doc, &excerpts).unwrap();
-        (Arc::new(Mutex::new(s)), tom, agent, doc, excerpts)
+        (taisce_store::SharedStore::new(s), tom, agent, doc, excerpts)
     }
 
     #[test]
@@ -377,7 +398,7 @@ mod tests {
     #[test]
     fn a_changed_cited_block_marks_the_answer_stale_and_an_unchanged_one_does_not() {
         let (store, tom, _, doc, excerpts) = seed();
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock(taisce_store::Scope::System);
         let st = status(&s, doc);
         assert!(st.is_answer && st.changed == 0);
         assert_eq!(st.question.as_deref(), Some("how does the grant flow work?"));
@@ -407,7 +428,7 @@ mod tests {
     #[test]
     fn refresh_ops_replace_only_agent_blocks_and_land_under_the_h1() {
         let (store, tom, agent, doc, excerpts) = seed();
-        let mut s = store.lock().unwrap();
+        let mut s = store.lock(taisce_store::Scope::System);
         // a human adds a note into the answer
         let tree = s.read_doc(doc).unwrap();
         let h1 = tree.roots.iter().find(|n| n.block.content.starts_with("# ")).unwrap().block.clone();
@@ -454,7 +475,7 @@ mod tests {
         assert_eq!(lines, vec!["living answers: nothing stale".to_string()]);
 
         {
-            let mut s = store.lock().unwrap();
+            let mut s = store.lock(taisce_store::Scope::System);
             let src = excerpts[0].block.doc_id;
             let epoch = s.get_doc(src).unwrap().current_epoch;
             s.apply(src, epoch, tom, vec![OpInput { kind: OpKind::Replace { target: excerpts[0].block.id, content: "The grant flow uses temporary delegation and expires fast.".into() }, source_refs: vec![] }]).unwrap();
@@ -463,7 +484,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("1 of"), "{lines:?}");
         {
-            let s = store.lock().unwrap();
+            let s = store.lock(taisce_store::Scope::System);
             let st = status(&s, doc);
             assert_eq!(st.changed, 0, "sources re-recorded at their new epochs");
             assert!(s.answer_sources(doc).unwrap().iter().any(|x| x.block_id == excerpts[0].block.id));

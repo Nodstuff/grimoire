@@ -113,6 +113,7 @@
 
 use crate::api::ApiState;
 use crate::store_ext::with_store;
+use crate::viewer::Viewer;
 use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -891,9 +892,17 @@ pub fn find_todo(s: &SqliteStore, scope: TodoScope) -> taisce_store::Result<Opti
     let ws = s.workspace_map()?;
     let ws_of = |d: &Doc| ws.get(&d.id).copied().flatten();
     let todos: Vec<&Doc> = docs.iter().filter(|d| d.title == TODO_TITLE).collect();
-    let root_unsorted = todos.iter().find(|d| d.parent_id.is_none() && ws_of(d).is_none());
+    // ADR 0004: the Unsorted list is the viewer's own (a doc in someone
+    // else's Unsorted is invisible; a shared root is never "theirs")
+    let own_root = s.own_root_titled(TODO_TITLE)?;
+    let me = taisce_store::Space::Unsorted(s.scope().user().or(s.instance_owner()?));
+    let root_unsorted = todos
+        .iter()
+        .find(|d| d.parent_id.is_none() && ws_of(d).is_none() && s.doc_space(d.id).ok() == Some(me));
     let found = match scope {
-        TodoScope::Legacy => root_unsorted.or_else(|| todos.iter().find(|d| d.parent_id.is_none())),
+        TodoScope::Legacy => root_unsorted.or_else(|| {
+            todos.iter().find(|d| d.parent_id.is_none() && (s.scope().sees_all() || own_root.as_ref().is_some_and(|o| o.id == d.id)))
+        }),
         TodoScope::In(WorkspaceFilter::Unsorted) => root_unsorted,
         TodoScope::In(WorkspaceFilter::Id(w)) => {
             let by_id: HashMap<Uuid, &Doc> = docs.iter().map(|d| (d.id, d)).collect();
@@ -913,7 +922,13 @@ pub fn find_or_create_todo_in(s: &mut SqliteStore, human: Uuid, scope: TodoScope
     let TodoScope::In(WorkspaceFilter::Id(w)) = scope else {
         return s.create_doc(TODO_TITLE, None, human);
     };
-    let labelled: std::collections::HashSet<Uuid> = s.get_workspace(w)?.doc_ids.into_iter().collect();
+    let ws = s.get_workspace(w)?;
+    // a viewer reads a workspace's list but never creates one (nothing may
+    // land in their own Unsorted on a GET)
+    if !ws.role.can_write() {
+        return Err(taisce_store::StoreError::Forbidden("read-only: this workspace has no To-do list yet".into()));
+    }
+    let labelled: std::collections::HashSet<Uuid> = ws.doc_ids.into_iter().collect();
     let docs = s.list_docs()?;
     let by_id: HashMap<Uuid, &Doc> = docs.iter().map(|d| (d.id, d)).collect();
     let parent = docs
@@ -925,7 +940,7 @@ pub fn find_or_create_todo_in(s: &mut SqliteStore, human: Uuid, scope: TodoScope
         Some(p) => s.create_doc(TODO_TITLE, Some(p), human),
         None => {
             let d = s.create_doc(TODO_TITLE, None, human)?;
-            s.set_doc_workspace(d.id, Some(w))?;
+            s.set_doc_workspace(d.id, Some(w), human)?;
             Ok(d)
         }
     }
@@ -976,6 +991,7 @@ fn check_date(d: &str) -> Result<(), String> {
 /// warning.
 async fn mutate(
     st: ApiState,
+    v: Viewer,
     server: bool,
     clock: ClientClock,
     date: String,
@@ -988,8 +1004,8 @@ async fn mutate(
         Ok(c) => c,
         Err(m) => return Json(json!({"error": m})),
     };
-    let human = st.human;
-    with_store(&st.store, move |s| {
+    let human = v.human;
+    with_store(&st.store, v.scope, move |s| {
         let scope = match scope_of(s, clock.workspace.as_deref()) {
             Ok(sc) => sc,
             Err(m) => return Json(json!({"error": m})),
@@ -1024,7 +1040,7 @@ struct DayQuery {
     clock: ClientClock,
 }
 
-async fn get_day(State(st): State<ApiState>, server: Server, Query(q): Query<DayQuery>) -> Json<Value> {
+async fn get_day(State(st): State<ApiState>, v: Viewer, server: Server, Query(q): Query<DayQuery>) -> Json<Value> {
     let today = match client(&q.clock, server.is_some()) {
         Ok((t, _)) => t,
         Err(m) => return Json(json!({"error": m})),
@@ -1033,15 +1049,20 @@ async fn get_day(State(st): State<ApiState>, server: Server, Query(q): Query<Day
     if let Err(m) = check_date(&date) {
         return Json(json!({"error": m}));
     }
-    let human = st.human;
+    let human = v.human;
     let ws = q.clock.workspace.clone();
-    with_store(&st.store, move |s| {
+    // a GET is read-only for anything but the person's own app (ADR 0004):
+    // a connector's GET never creates a list or carries items forward
+    let may_write = v.human_surface;
+    with_store(&st.store, v.scope, move |s| {
         let scope = match scope_of(s, ws.as_deref()) {
             Ok(sc) => sc,
             Err(m) => return Json(json!({"error": m})),
         };
-        let doc = match find_or_create_todo_in(s, human, scope) {
-            Ok(d) => d,
+        let found = if may_write { find_or_create_todo_in(s, human, scope).map(Some) } else { find_todo(s, scope) };
+        let doc = match found {
+            Ok(Some(d)) => d,
+            Ok(None) => return Json(json!({"error": "not found: no To-do list here yet"})),
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
         let md = match taisce_store::export::export_doc(&*s, doc.id) {
@@ -1049,7 +1070,7 @@ async fn get_day(State(st): State<ApiState>, server: Server, Query(q): Query<Day
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
         let mut carried = 0;
-        if should_carry(&md, &date, &today) {
+        if may_write && should_carry(&md, &date, &today) {
             let (new_md, n) = carry_forward(&md, &date, &today);
             if n > 0 {
                 if let Err(e) = save(s, doc.id, human, &new_md) {
@@ -1074,9 +1095,9 @@ struct AddReq {
     clock: ClientClock,
 }
 
-async fn add(State(st): State<ApiState>, server: Server, Json(req): Json<AddReq>) -> Json<Value> {
+async fn add(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<AddReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, server.is_some(), req.clock, req.date, move |md, today, zone| add_item(md, &date, today, zone, &req.text)).await
+    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, zone| add_item(md, &date, today, zone, &req.text)).await
 }
 
 #[derive(Deserialize)]
@@ -1088,7 +1109,7 @@ struct DueQuery {
 
 /// Read-only across days: no carry-forward, and an absent To-do doc stays
 /// absent (find, never create).
-async fn due(State(st): State<ApiState>, Query(q): Query<DueQuery>) -> axum::response::Response {
+async fn due(State(st): State<ApiState>, v: Viewer, Query(q): Query<DueQuery>) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let fail = |code: StatusCode, e: String| (code, Json(json!({"error": e}))).into_response();
@@ -1107,7 +1128,7 @@ async fn due(State(st): State<ApiState>, Query(q): Query<DueQuery>) -> axum::res
     };
     let until_echo = q.until.clone();
     let ws = q.clock.workspace.clone();
-    with_store(&st.store, move |s| {
+    with_store(&st.store, v.scope, move |s| {
         let now = chrono::Utc::now();
         let scope = match scope_of(s, ws.as_deref()) {
             Ok(sc) => sc,
@@ -1159,7 +1180,14 @@ fn due_lists(s: &SqliteStore, scope: TodoScope) -> taisce_store::Result<Vec<(Doc
     let mut scopes = vec![scope];
     if scope == TodoScope::Legacy {
         scopes.push(TodoScope::In(WorkspaceFilter::Unsorted));
-        scopes.extend(s.list_workspaces()?.into_iter().map(|w| TodoScope::In(WorkspaceFilter::Id(w.id))));
+        // ADR 0004: alerts only for the viewer's own lists — their own
+        // workspaces, not ones someone else shares with them
+        scopes.extend(
+            s.list_workspaces()?
+                .into_iter()
+                .filter(|w| w.role == taisce_store::Role::Owner)
+                .map(|w| TodoScope::In(WorkspaceFilter::Id(w.id))),
+        );
     }
     let mut out: Vec<(Doc, Option<Uuid>)> = Vec::new();
     for sc in scopes {
@@ -1214,9 +1242,9 @@ struct ToggleReq {
     clock: ClientClock,
 }
 
-async fn toggle(State(st): State<ApiState>, server: Server, Json(req): Json<ToggleReq>) -> Json<Value> {
+async fn toggle(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<ToggleReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, server.is_some(), req.clock, req.date, move |md, today, _| {
+    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, _| {
         toggle_item(md, &date, today, req.item_id.as_deref(), req.text.as_deref(), req.done).map(|m| (m, None))
     })
     .await
@@ -1231,9 +1259,9 @@ struct EditReq {
     clock: ClientClock,
 }
 
-async fn edit(State(st): State<ApiState>, server: Server, Json(req): Json<EditReq>) -> Json<Value> {
+async fn edit(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<EditReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, server.is_some(), req.clock, req.date, move |md, today, zone| {
+    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, zone| {
         edit_item(md, &date, today, zone, &req.item_id, &req.text)
     })
     .await
@@ -1247,9 +1275,9 @@ struct RemoveReq {
     clock: ClientClock,
 }
 
-async fn remove(State(st): State<ApiState>, server: Server, Json(req): Json<RemoveReq>) -> Json<Value> {
+async fn remove(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<RemoveReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, server.is_some(), req.clock, req.date, move |md, today, _| remove_item(md, &date, today, &req.item_id).map(|m| (m, None))).await
+    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, _| remove_item(md, &date, today, &req.item_id).map(|m| (m, None))).await
 }
 
 #[derive(Deserialize)]
@@ -1261,9 +1289,9 @@ struct MoveReq {
     clock: ClientClock,
 }
 
-async fn mv(State(st): State<ApiState>, server: Server, Json(req): Json<MoveReq>) -> Json<Value> {
+async fn mv(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<MoveReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, server.is_some(), req.clock, req.date, move |md, today, _| move_item(md, &date, today, &req.item_id, &req.to_date).map(|m| (m, None))).await
+    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, _| move_item(md, &date, today, &req.item_id, &req.to_date).map(|m| (m, None))).await
 }
 
 #[derive(Deserialize)]
@@ -1280,9 +1308,9 @@ struct DeadlineReq {
     clock: ClientClock,
 }
 
-async fn deadline(State(st): State<ApiState>, server: Server, Json(req): Json<DeadlineReq>) -> Json<Value> {
+async fn deadline(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<DeadlineReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, server.is_some(), req.clock, req.date, move |md, today, _| {
+    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, _| {
         let blank = |x: &Option<String>| x.as_deref().map(str::trim).filter(|d| !d.is_empty()).map(str::to_string);
         let (dl, at) = (blank(&req.deadline), blank(&req.due_at));
         set_deadline(md, &date, today, &req.item_id, dl.as_deref(), at.as_deref()).map(|m| (m, None))
@@ -1300,9 +1328,9 @@ struct NoteReq {
     clock: ClientClock,
 }
 
-async fn note(State(st): State<ApiState>, server: Server, Json(req): Json<NoteReq>) -> Json<Value> {
+async fn note(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<NoteReq>) -> Json<Value> {
     let date = req.date.clone();
-    mutate(st, server.is_some(), req.clock, req.date, move |md, today, _| set_note(md, &date, today, &req.item_id, &req.note).map(|m| (m, None))).await
+    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, _| set_note(md, &date, today, &req.item_id, &req.note).map(|m| (m, None))).await
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -1852,6 +1880,7 @@ mod tests {
             principal: "claude:taisce-ios".into(),
             owner_app: true,
             human,
+            instance_owner: false,
         };
         let get = |uri: &str| {
             let mut r = Request::get(uri).body(Body::empty()).unwrap();

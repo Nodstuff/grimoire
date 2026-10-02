@@ -93,7 +93,7 @@ fn trashed_doc_leaves_every_read_surface() {
     assert!(s.list_tags().unwrap().iter().any(|(t, _)| t == "trashme"));
     assert_eq!(s.block_vecs().unwrap().len(), 1);
     assert_eq!(s.blocks_as_hits(&[block]).unwrap().len(), 1);
-    assert_eq!(s.linking_blocks("Target").unwrap().len(), 1);
+    assert_eq!(s.linking_blocks(target, "Target").unwrap().len(), 1);
     assert_eq!(s.raw_links().unwrap().len(), 1);
     assert_eq!(s.raw_doc_tags().unwrap().len(), 1);
 
@@ -113,7 +113,7 @@ fn trashed_doc_leaves_every_read_surface() {
         "blocks_as_hits"
     );
     assert!(
-        s.linking_blocks("Target").unwrap().is_empty(),
+        s.linking_blocks(target, "Target").unwrap().is_empty(),
         "linking_blocks"
     );
     assert!(s.raw_links().unwrap().is_empty(), "raw_links");

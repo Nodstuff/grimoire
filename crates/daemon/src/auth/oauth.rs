@@ -182,7 +182,15 @@ pub fn clean_name(s: &str) -> String {
 /// document URL, fetched (or served from the cache while fresh).
 pub async fn resolve_client(st: &AuthState, client_id: &str) -> Result<OAuthClient, String> {
     let id = client_id.to_string();
-    let cached = with_store(&st.store, move |s| s.oauth_client(&id)).await.map_err(|e| e.to_string())?;
+    let cached = with_store(&st.store, taisce_store::Scope::System, move |s| {
+        if super::lapsed_app_client(s, &id) {
+            // looks unknown: the app's probe re-registers on this 400
+            return Ok(None);
+        }
+        s.oauth_client(&id)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     if !cimd::is_cimd(client_id) {
         return match cached {
             Some(c) if c.kind == "dcr" => Ok(c),
@@ -207,7 +215,7 @@ pub async fn resolve_client(st: &AuthState, client_id: &str) -> Result<OAuthClie
         refresh_at: Some(now + cimd::CACHE_TTL),
     };
     let c = client.clone();
-    with_store(&st.store, move |s| s.oauth_upsert_client(&c)).await.map_err(|e| e.to_string())?;
+    with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_upsert_client(&c)).await.map_err(|e| e.to_string())?;
     tracing::info!(target: AUDIT, event = "client.cimd_fetch", client = client.client_id, name = client.client_name);
     Ok(client)
 }
@@ -266,9 +274,39 @@ async fn register(State(st): State<AuthState>, req: Request) -> Response {
     if !subset("response_types", &["code"]) {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", "response_types: code only");
     }
+    // the app's scheme is first party: its exact registration (what the
+    // shipped Taisce app sends) gets the fixed, server-registered app client;
+    // any other use of the scheme is refused (ADR 0004, review round 2)
+    let app_scheme = uris.iter().any(|u| u.starts_with(super::APP_REDIRECT_SCHEME));
+    if app_scheme && uris.iter().any(|u| u != super::APP_REDIRECT_URI) {
+        tracing::warn!(target: AUDIT, event = "client.register_refused", why = "app scheme", ip);
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri", "that redirect scheme is reserved for the Taisce app");
+    }
+    let now = now();
+    if app_scheme {
+        let ok = with_store(&st.store, taisce_store::Scope::System, move |s| super::ensure_first_party(s, now)).await;
+        if let Err(e) = ok {
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e.to_string());
+        }
+        tracing::info!(target: AUDIT, event = "client.register_app", client = super::FIRST_PARTY_APP_CLIENT, ip);
+        return no_store(
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "client_id": super::FIRST_PARTY_APP_CLIENT,
+                    "client_id_issued_at": now,
+                    "client_name": "Taisce",
+                    "redirect_uris": [super::APP_REDIRECT_URI],
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"],
+                    "token_endpoint_auth_method": "none",
+                })),
+            )
+                .into_response(),
+        );
+    }
     let name = clean_name(body.get("client_name").and_then(Value::as_str).unwrap_or(""));
     let name = if name.is_empty() { "OAuth client".to_string() } else { name };
-    let now = now();
     let client = OAuthClient {
         client_id: format!("dcr_{}", &random_token()[..24]),
         kind: "dcr".into(),
@@ -279,7 +317,7 @@ async fn register(State(st): State<AuthState>, req: Request) -> Response {
         refresh_at: None,
     };
     let c = client.clone();
-    if let Err(e) = with_store(&st.store, move |s| s.oauth_upsert_client(&c)).await {
+    if let Err(e) = with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_upsert_client(&c)).await {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e.to_string());
     }
     tracing::info!(target: AUDIT, event = "client.register", client = client.client_id, name = client.client_name, ip);
@@ -401,7 +439,7 @@ async fn authorize(State(st): State<AuthState>, headers: HeaderMap, Query(q): Qu
     {
         return error_redirect(&st, &redirect, state, "invalid_target", "resource is not served here");
     }
-    let has_passkey = with_store(&st.store, |s| s.auth_credentials(None).map(|c| !c.is_empty()).unwrap_or(false)).await;
+    let has_passkey = with_store(&st.store, taisce_store::Scope::System, |s| s.auth_credentials(None).map(|c| !c.is_empty()).unwrap_or(false)).await;
     if !has_passkey {
         return super::passkey::error_page(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -436,7 +474,7 @@ pub async fn issue_code(st: &AuthState, req: &super::passkey::AuthzRequest, user
         scope: req.scope.clone(),
         expires_at: now() + super::CODE_TTL,
     };
-    with_store(&st.store, move |s| s.oauth_insert_code(&row)).await.map_err(|e| e.to_string())?;
+    with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_insert_code(&row)).await.map_err(|e| e.to_string())?;
     tracing::info!(target: AUDIT, event = "code.issue", client = req.client_id, user = %user_id);
     let mut p = vec![("code", code.as_str()), ("iss", st.cfg.base.as_str())];
     if let Some(s) = req.state.as_deref() {
@@ -483,6 +521,12 @@ async fn token(State(st): State<AuthState>, req: Request) -> Response {
     let Some(client_id) = get("client_id") else {
         return oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", "client_id is required (public client)");
     };
+    {
+        let id = client_id.to_string();
+        if with_store(&st.store, taisce_store::Scope::System, move |s| super::lapsed_app_client(s, &id)).await {
+            return oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", "unknown client_id");
+        }
+    }
     if let Some(r) = get("resource")
         && !st.cfg.resource_ok(r)
     {
@@ -518,7 +562,7 @@ async fn code_grant(
     let code_hash = hash_secret(code);
     let now = now();
     let h = code_hash.clone();
-    let outcome = match with_store(&st.store, move |s| s.oauth_consume_code(&h, now)).await {
+    let outcome = match with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_consume_code(&h, now)).await {
         Ok(o) => o,
         Err(e) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e.to_string()),
     };
@@ -551,7 +595,7 @@ async fn code_grant(
     };
     let (access, refresh) = (random_token(), random_token());
     let (ah, rh, g) = (hash_secret(&access), hash_secret(&refresh), grant.clone());
-    let res = with_store(&st.store, move |s| {
+    let res = with_store(&st.store, taisce_store::Scope::System, move |s| {
         s.oauth_issue_grant(Some(&code_hash), &g, &ah, now + super::ACCESS_TTL, &rh, now + super::REFRESH_TTL)
     })
     .await;
@@ -566,7 +610,7 @@ async fn refresh_grant(st: &AuthState, client_id: &str, refresh: &str, ip: &str)
     let now = now();
     let (access, next) = (random_token(), random_token());
     let (old, ah, rh) = (hash_secret(refresh), hash_secret(&access), hash_secret(&next));
-    let outcome = with_store(&st.store, move |s| {
+    let outcome = with_store(&st.store, taisce_store::Scope::System, move |s| {
         s.oauth_rotate_refresh(&old, now, &ah, now + super::ACCESS_TTL, &rh, now + super::REFRESH_TTL)
     })
     .await;
@@ -583,7 +627,7 @@ async fn refresh_grant(st: &AuthState, client_id: &str, refresh: &str, ip: &str)
         Ok(RefreshOutcome::Rotated(g) | RefreshOutcome::Reissued(g)) => {
             // another client holding this client's refresh token: stolen
             let gid = g.id.to_string();
-            let _ = with_store(&st.store, move |s| s.oauth_revoke_grant(&gid, "refresh token presented by another client", now)).await;
+            let _ = with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_revoke_grant(&gid, "refresh token presented by another client", now)).await;
             tracing::warn!(target: AUDIT, event = "token.revoke", why = "client mismatch", client = client_id, grant = %g.id, ip);
             oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "refresh token was issued to another client")
         }
@@ -609,7 +653,7 @@ async fn revoke(State(st): State<AuthState>, req: Request) -> Response {
     };
     let h = hash_secret(&tok);
     let now = now();
-    if let Ok(Some(g)) = with_store(&st.store, move |s| s.oauth_revoke_by_token(&h, "revoked by client", now)).await {
+    if let Ok(Some(g)) = with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_revoke_by_token(&h, "revoked by client", now)).await {
         tracing::info!(target: AUDIT, event = "token.revoke", why = "client request", grant = %g, ip);
     }
     no_store(StatusCode::OK.into_response())

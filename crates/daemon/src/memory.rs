@@ -18,7 +18,6 @@
 use taisce_store::{BlockStore, SqliteStore};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 pub const ROOT_TITLE: &str = "Claude Memory";
@@ -185,7 +184,7 @@ pub fn scan(root: &Path) -> HashMap<String, Vec<PathBuf>> {
 /// Every file is read BEFORE the store is locked, and the lock is taken per
 /// doc: a sync across dozens of projects never holds the UI for its whole
 /// duration.
-pub fn sync(store: &Arc<Mutex<SqliteStore>>, root: &Path, human: Uuid) -> taisce_store::Result<SyncReport> {
+pub fn sync(store: &taisce_store::SharedStore, scope: taisce_store::Scope, root: &Path, human: Uuid) -> taisce_store::Result<SyncReport> {
     let files = scan(root);
     let mut report = SyncReport { projects: files.len(), ..Default::default() };
     // phase 1: disk, no lock
@@ -205,11 +204,16 @@ pub fn sync(store: &Arc<Mutex<SqliteStore>>, root: &Path, human: Uuid) -> taisce
         projects.push((project, read));
     }
     // phase 2: the store, one short lock per doc
-    let lock = || store.lock().unwrap_or_else(|p| p.into_inner());
+    // the box's Claude Code memory is the instance owner's (ADR 0004): the
+    // caller passes their scope, so the root is THEIR `Claude Memory`
+    let lock = || store.lock(scope);
     let (agent, root_doc) = {
         let mut s = lock();
         let agent = crate::store_ext::scribe_principal(&mut s)?;
-        let root_doc = ensure_folder(&mut s, None, ROOT_TITLE, human)?;
+        let root_doc = match s.own_root_titled(ROOT_TITLE)? {
+            Some(d) => d.id,
+            None => s.create_doc(ROOT_TITLE, None, human)?.id,
+        };
         (agent, root_doc)
     };
     for (project, files) in projects {
@@ -255,13 +259,21 @@ pub fn sync(store: &Arc<Mutex<SqliteStore>>, root: &Path, human: Uuid) -> taisce
 
 /// Start-up sync, then every 10 minutes. A missing `~/.claude/projects` is
 /// simply "nothing to do".
-pub async fn memory_loop(store: Arc<Mutex<SqliteStore>>, human: Uuid) {
+pub async fn memory_loop(store: taisce_store::SharedStore, human: Uuid) {
     let root = memory_root();
     loop {
         if root.is_dir() {
             let s = store.clone();
             let r = root.clone();
-            match tokio::task::spawn_blocking(move || sync(&s, &r, human)).await {
+            let scope = crate::store_ext::with_store(&store, taisce_store::Scope::System, |s| s.owner_scope())
+                .await
+                .unwrap_or(taisce_store::Scope::Local);
+            // the owner's own human principal on a server; the LOCAL one otherwise
+            let owner_human = crate::store_ext::with_store(&store, taisce_store::Scope::System, move |s| {
+                s.auth_owner().ok().flatten().map(|u| u.principal_id).unwrap_or(human)
+            })
+            .await;
+            match tokio::task::spawn_blocking(move || sync(&s, scope, &r, owner_human)).await {
                 Ok(Ok(rep)) if rep.imported + rep.updated > 0 => {
                     tracing::info!(imported = rep.imported, updated = rep.updated, files = rep.files, "claude memory synced")
                 }
@@ -310,14 +322,14 @@ mod tests {
         std::fs::write(mem.join("thing.md"), "---\nname: thing\ntype: project\n---\n\nFirst version.\n").unwrap();
         let mut s = SqliteStore::open_in_memory().unwrap();
         let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
-        let store = Arc::new(Mutex::new(s));
+        let store = taisce_store::SharedStore::new(s);
 
-        let r = sync(&store, dir.path(), tom.id).unwrap();
+        let r = sync(&store, taisce_store::Scope::Local, dir.path(), tom.id).unwrap();
         assert_eq!((r.files, r.imported, r.updated, r.unchanged), (1, 1, 0, 0));
-        let r = sync(&store, dir.path(), tom.id).unwrap();
+        let r = sync(&store, taisce_store::Scope::Local, dir.path(), tom.id).unwrap();
         assert_eq!((r.imported, r.updated, r.unchanged), (0, 0, 1));
         {
-            let s = store.lock().unwrap();
+            let s = store.lock(taisce_store::Scope::System);
             let docs = s.list_docs().unwrap();
             let root = docs.iter().find(|d| d.title == ROOT_TITLE && d.parent_id.is_none()).unwrap();
             let proj = docs.iter().find(|d| d.title == "personal-foo" && d.parent_id == Some(root.id)).unwrap();
@@ -338,9 +350,9 @@ mod tests {
         }
         // the model rewrites the memory → a reviewable yellow, not a silent overwrite
         std::fs::write(mem.join("thing.md"), "---\nname: thing\ntype: project\n---\n\nSecond version.\n").unwrap();
-        let r = sync(&store, dir.path(), tom.id).unwrap();
+        let r = sync(&store, taisce_store::Scope::Local, dir.path(), tom.id).unwrap();
         assert_eq!((r.imported, r.updated), (0, 1));
-        let s = store.lock().unwrap();
+        let s = store.lock(taisce_store::Scope::System);
         let q = s.review_queue(None).unwrap();
         assert_eq!(q.len(), 1, "one reviewable change");
         assert!(q[0].op.source_refs.iter().any(|r| r.starts_with("claude-memory: personal-foo/thing.md")));

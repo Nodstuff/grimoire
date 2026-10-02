@@ -8,6 +8,8 @@ export interface Doc {
   status: 'draft' | 'in-review' | 'decided' | 'superseded' | null
   sort_key: string | null
   is_tended?: boolean
+  /** resolved workspace (null = Unsorted); GET /api/docs carries it */
+  workspace_id?: string | null
 }
 
 /** GET /api/profile — the owner's display name. */

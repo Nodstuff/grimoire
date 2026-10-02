@@ -175,6 +175,8 @@ pub fn merge(
     if from_ids.contains(&into) {
         return Err("into_doc_id is inside from_doc_id's subtree — trashing from would trash it too".into());
     }
+    // ADR 0004: never across tenants
+    store.ensure_same_tenant(from, into).map_err(|e| e.to_string())?;
     let from_tree = store.read_doc(from).map_err(|e| e.to_string())?;
     let into_tree = store.read_doc(into).map_err(|e| e.to_string())?;
     // from's blocks minus frontmatter, as markdown appended to into's own

@@ -11,9 +11,10 @@ use taisce_store::{
     BlockStore, ConfidencePolicy, Gardener, GardenerKind, OpInput, OpKind, SqliteStore, order_key,
 };
 use crate::store_ext::with_store;
+use taisce_store::Scope;
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -580,7 +581,7 @@ JSON array of          {{\"doc_id\": \"<uuid>\", \"block_id\": \"<uuid from a [b
 /// Called from the stdout-reading async task, so the store lock is taken on
 /// the blocking pool (fire-and-forget), never on a tokio worker; the 2s
 /// throttle keeps the write rate to one row update at a time in practice.
-fn progress_to_run(store: &Arc<Mutex<SqliteStore>>, run_id: Uuid) -> impl FnMut(String) {
+fn progress_to_run(store: &taisce_store::SharedStore, run_id: Uuid) -> impl FnMut(String) {
     let store = store.clone();
     let mut last = std::time::Instant::now() - std::time::Duration::from_secs(10);
     move |msg: String| {
@@ -590,9 +591,8 @@ fn progress_to_run(store: &Arc<Mutex<SqliteStore>>, run_id: Uuid) -> impl FnMut(
         last = std::time::Instant::now();
         let store = store.clone();
         tokio::task::spawn_blocking(move || {
-            let mut s = store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // run-log bookkeeping, not tenant data
+            let mut s = store.lock(Scope::System);
             let _ = s.update_run_progress(run_id, &msg);
         });
     }
@@ -706,7 +706,8 @@ fn apply_audit_findings(
 }
 
 async fn run_auditor(
-    store: Arc<Mutex<SqliteStore>>,
+    store: taisce_store::SharedStore,
+    tscope: Scope,
     g: &Gardener,
     run_id: Uuid,
 ) -> (String, String, Option<i64>) {
@@ -723,7 +724,7 @@ async fn run_auditor(
     };
     let (prompt, doc_count, doc_ids) = {
         let g = g.clone();
-        match with_store(&store, move |s| compose_audit(s, &g, scope)).await {
+        match with_store(&store, tscope, move |s| compose_audit(s, &g, scope)).await {
             Ok(p) => p,
             Err(e) => return ("failed".into(), format!("compose: {e}"), None),
         }
@@ -772,7 +773,7 @@ async fn run_auditor(
     };
     let (g, dirs) = (g.clone(), dirs.clone());
     let (lines, flagged, corrected) =
-        with_store(&store, move |s| apply_audit_findings(s, &g, &dirs, &doc_ids, findings)).await;
+        with_store(&store, tscope, move |s| apply_audit_findings(s, &g, &dirs, &doc_ids, findings)).await;
     (
         "ok".into(),
         format!(
@@ -906,7 +907,8 @@ fn scope_outline(store: &SqliteStore, scope: Uuid) -> taisce_store::Result<Strin
 }
 
 async fn run_scribe(
-    store: Arc<Mutex<SqliteStore>>,
+    store: taisce_store::SharedStore,
+    tscope: Scope,
     g: &Gardener,
     run_id: Uuid,
 ) -> (String, String, Option<i64>) {
@@ -927,7 +929,7 @@ async fn run_scribe(
     }
     let prompt = {
         let (g, dirs) = (g.clone(), dirs.clone());
-        let composed = with_store(&store, move |s| -> Result<String, String> {
+        let composed = with_store(&store, tscope, move |s| -> Result<String, String> {
             let outline = scope_outline(s, scope).map_err(|e| format!("outline: {e}"))?;
             // style exemplars: full content of the named docs
             let mut exemplars = String::new();
@@ -1009,7 +1011,7 @@ async fn run_scribe(
     };
 
     let g = g.clone();
-    let (lines, written) = with_store(&store, move |s| {
+    let (lines, written) = with_store(&store, tscope, move |s| {
         let mut lines = Vec::new();
         let mut written = 0usize;
         for nd in new_docs.into_iter().take(SCRIBE_DOCS_PER_RUN) {
@@ -1155,14 +1157,14 @@ pub(crate) fn verdict_counts(out: &taisce_store::ProposeOutcome) -> String {
 
 /// Close the run row and build the outcome (store work on the blocking pool).
 async fn finish_run(
-    store: Arc<Mutex<SqliteStore>>,
+    store: taisce_store::SharedStore,
     run_id: Uuid,
     status: String,
     summary: String,
     tokens: Option<i64>,
 ) -> RunOutcome {
     let (st, sm) = (status.clone(), summary.clone());
-    with_store(&store, move |s| {
+    with_store(&store, Scope::System, move |s| {
         let _ = s.finish_run(run_id, &st, &sm, tokens, Some(0));
     })
     .await;
@@ -1171,7 +1173,7 @@ async fn finish_run(
 
 /// Run one gardener end to end. Never panics the daemon; all failure modes
 /// land in the run log (ticket 4.6: never a hang, never silent).
-pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOutcome {
+pub async fn run_gardener(store: taisce_store::SharedStore, g: Gardener) -> RunOutcome {
     // one run per gardener: a run-now during the daily cut (or a double
     // click) must not spawn a second claude against the same scope
     let Some(_claim) = claim_run(g.id) else {
@@ -1181,9 +1183,20 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
             summary: format!("{} is already running; not started again", g.name),
         };
     };
+    // ADR 0004: a gardener works for its owner and only sees what they
+    // see; tending a shared workspace it reads that workspace alone
+    let tscope = {
+        let (owner, scope_doc) = (g.owner_id, g.scope_doc);
+        with_store(&store, Scope::System, move |s| match scope_doc {
+            Some(d) => s.writer_scope_for(owner, d),
+            None => Ok(Scope::for_owner(owner)),
+        })
+        .await
+        .unwrap_or(Scope::for_owner(g.owner_id))
+    };
     let run_id = {
         let gid = g.id;
-        match with_store(&store, move |s| s.start_run(gid)).await {
+        match with_store(&store, Scope::System, move |s| s.start_run(gid)).await {
             Ok(id) => id,
             Err(e) => {
                 return RunOutcome {
@@ -1194,7 +1207,7 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
             }
         }
     };
-    let finish = |store: &Arc<Mutex<SqliteStore>>, status: &str, summary: &str, tokens: Option<i64>| {
+    let finish = |store: &taisce_store::SharedStore, status: &str, summary: &str, tokens: Option<i64>| {
         finish_run(store.clone(), run_id, status.to_string(), summary.to_string(), tokens)
     };
 
@@ -1204,22 +1217,22 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
         return finish(&store, "ok", "reviewer gardeners were retired: nothing to do", Some(0)).await;
     }
     if g.kind == GardenerKind::Scribe {
-        let (status, summary, tokens) = run_scribe(store.clone(), &g, run_id).await;
+        let (status, summary, tokens) = run_scribe(store.clone(), tscope, &g, run_id).await;
         return finish(&store, &status, &summary, tokens).await;
     }
     if g.kind == GardenerKind::Auditor || g.kind == GardenerKind::Keeper {
-        let (status, summary, tokens) = run_auditor(store.clone(), &g, run_id).await;
+        let (status, summary, tokens) = run_auditor(store.clone(), tscope, &g, run_id).await;
         return finish(&store, &status, &summary, tokens).await;
     }
     if g.kind == GardenerKind::Filer {
-        let (status, summary, tokens) = crate::filer::run(store.clone(), &g, run_id).await;
+        let (status, summary, tokens) = crate::filer::run(store.clone(), tscope, &g, run_id).await;
         return finish(&store, &status, &summary, tokens).await;
     }
 
     // compose (lock released before the long claude call)
     let (prompt, doc_count) = {
         let g = g.clone();
-        match with_store(&store, move |s| compose_tagging(s, &g)).await {
+        match with_store(&store, tscope, move |s| compose_tagging(s, &g)).await {
             Ok(p) => p,
             Err(e) => return finish(&store, "failed", &format!("compose: {e}"), None).await,
         }
@@ -1253,7 +1266,7 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
 
     // submit through the gate as the gardener's principal
     let g2 = g.clone();
-    let (counts, lines) = with_store(&store, move |s| {
+    let (counts, lines) = with_store(&store, tscope, move |s| {
         let g = g2;
         let mut counts = (0usize, 0usize, 0usize); // green, yellow, red
         let mut lines = Vec::new();

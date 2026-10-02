@@ -193,7 +193,7 @@ pub fn workspace_arg(store: &SqliteStore, raw: Option<&str>) -> Result<Option<Wo
     match raw.map(str::trim).filter(|w| !w.is_empty()) {
         None => Ok(None),
         Some(w) => store.parse_workspace_filter(w).map(Some).map_err(|e| {
-            let names: Vec<String> = store.list_workspaces().unwrap_or_default().into_iter().map(|w| w.name).collect();
+            let names: Vec<String> = store.list_workspaces().unwrap_or_default().into_iter().map(|w| w.display_name).collect();
             format!("workspace: {e} (known: {}, or \"unsorted\")", if names.is_empty() { "none".into() } else { names.join(", ") })
         }),
     }
@@ -378,7 +378,7 @@ pub fn search_ranked(store: &SqliteStore, embedder: Option<&Embedder>, query: &s
         .collect();
     let mut legs = vec![keyword, trigram];
     if let Some(emb) = embedder {
-        let scored = emb.search(q, DENSE_POOL);
+        let scored = emb.search(store, q, DENSE_POOL);
         let top = scored.first().map(|(_, s)| *s).unwrap_or(0.0);
         let ids: Vec<Uuid> = scored
             .into_iter()
@@ -668,7 +668,7 @@ pub fn related(store: &SqliteStore, embedder: Option<&Embedder>, anchor: Anchor,
     match embedder {
         Some(emb) if !text.trim().is_empty() => {
             let scored: Vec<(Uuid, f32)> = emb
-                .search(&text, limit + DENSE_POOL)
+                .search(store, &text, limit + DENSE_POOL)
                 .into_iter()
                 .filter(|(id, s)| Some(*id) != anchor_block && *s >= crate::ask::DENSE_FLOOR)
                 .collect();
@@ -1101,9 +1101,9 @@ mod tests {
         let a = doc(&mut s, tom, "Backups", None, "The backup runs nightly with VACUUM INTO a snapshot file.\n\nA second paragraph about the same backup schedule.\n");
         doc(&mut s, tom, "Snapshots", None, "Database snapshots are taken every night and kept for a week.\n");
         doc(&mut s, tom, "Bread", None, "Sourdough wants a long cold proof.\n");
-        let shared = std::sync::Arc::new(std::sync::Mutex::new(s));
+        let shared = taisce_store::SharedStore::new(s);
         emb.embed_stale(&shared).unwrap();
-        let s = shared.lock().unwrap();
+        let s = shared.lock(taisce_store::Scope::System);
         let blk = s.read_doc(a).unwrap().roots[0].block.id;
         let out = related(&s, Some(&emb), Anchor::Block(blk), 3).unwrap();
         assert!(out.embedder && out.note.is_none());

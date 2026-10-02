@@ -29,7 +29,7 @@ fn harness_with(cfg: AuthConfig) -> H {
     let human = store.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
     let agent = store.create_principal(PrincipalKind::Agent, "claude", None).unwrap().id;
     let owner = store.auth_ensure_owner(human, "tom", now()).unwrap().id;
-    let store = Arc::new(Mutex::new(store));
+    let store = taisce_store::SharedStore::new(store);
     let dir = std::env::temp_dir().join(format!("taisce-auth-test-{}", uuid::Uuid::now_v7()));
     let dedupe = crate::mcp::new_dedupe();
     let st = AuthState::new(cfg, store.clone()).unwrap();
@@ -39,6 +39,7 @@ fn harness_with(cfg: AuthConfig) -> H {
             changes: crate::changes::Feed::new(&store),
             store: store.clone(),
             human,
+            server_mode: false,
             db_path: dir.join("ks.db"),
             embedder: None,
             dedupe,
@@ -102,7 +103,7 @@ impl H {
     async fn enroll(&mut self) -> Res {
         let t = random_token();
         let (h, owner) = (hash_secret(&t), self.owner);
-        self.st.store.lock().unwrap().auth_add_enrollment(&h, owner, now() + ENROLL_TTL).unwrap();
+        self.st.store.lock(taisce_store::Scope::System).auth_add_enrollment(&h, owner, now() + ENROLL_TTL).unwrap();
         let page = send(&self.app, get(&format!("/auth/enroll?t={t}"))).await;
         assert_eq!(page.status, StatusCode::OK, "{}", page.body);
         let begin = send(&self.app, post_json("/auth/enroll/begin", json!({"t": t, "label": "soft"}))).await;
@@ -438,7 +439,7 @@ async fn the_connector_writes_as_its_own_principal() {
     let r = send(&h.app, mcp(call, Some(&access), session.as_deref())).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     let names: Vec<String> =
-        h.st.store.lock().unwrap().list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
+        h.st.store.lock(taisce_store::Scope::System).list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
     assert!(names.contains(&"claude:claude".to_string()), "{names:?}");
 }
 
@@ -457,13 +458,13 @@ impl H {
     }
 
     fn doc(&self, title: &str) -> uuid::Uuid {
-        let human = self.st.store.lock().unwrap().auth_owner().unwrap().unwrap().principal_id;
-        self.st.store.lock().unwrap().create_doc(title, None, human).unwrap().id
+        let human = self.st.store.lock(taisce_store::Scope::System).auth_owner().unwrap().unwrap().principal_id;
+        self.st.store.lock(taisce_store::Scope::System).create_doc(title, None, human).unwrap().id
     }
 
     /// Display name of the principal behind the doc's newest op.
     fn last_writer(&self, doc: uuid::Uuid) -> String {
-        let s = self.st.store.lock().unwrap();
+        let s = self.st.store.lock(taisce_store::Scope::System);
         let op = s.ops_for_doc_limited(doc, 1).unwrap().remove(0);
         s.get_principal(op.principal).unwrap().display_name
     }
@@ -499,7 +500,7 @@ async fn a_connector_token_cannot_name_someone_else() {
     // a second connector: its principal is not a label this token may take
     h.token_for("Claude Code", REDIRECT).await;
     let doc = h.doc("pinned");
-    let tom_id = h.st.store.lock().unwrap().auth_owner().unwrap().unwrap().principal_id.to_string();
+    let tom_id = h.st.store.lock(taisce_store::Scope::System).auth_owner().unwrap().unwrap().principal_id.to_string();
     // header, ?as= and ?cwd= are not identity sources under a token
     let spoof = [("taisce-principal", "tom")];
     let (e, out) = tool(&h.app, &access, "/mcp?as=claude:q&cwd=/x/y", &spoof, "append", json!({"doc_id": doc, "markdown": "a"})).await;
@@ -519,7 +520,7 @@ async fn a_connector_token_cannot_name_someone_else() {
         assert!(out.starts_with("as: "), "{out}");
     }
     assert_eq!(h.last_writer(doc), "claude:grimoire-task", "no refused write landed");
-    let names: Vec<String> = h.st.store.lock().unwrap().list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
+    let names: Vec<String> = h.st.store.lock(taisce_store::Scope::System).list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
     for n in ["claude:q", "claude:y", "claude:spoof", "workbox"] {
         assert!(!names.contains(&n.to_string()), "{n} must not exist: {names:?}");
     }
@@ -550,7 +551,7 @@ async fn the_owners_app_writes_as_the_human_and_ignores_as() {
     let r = send(&h.app, req).await;
     assert!(r.json()["verdicts"].is_array(), "{}", r.body);
     assert_eq!(h.last_writer(doc), "tom");
-    let names: Vec<String> = h.st.store.lock().unwrap().list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
+    let names: Vec<String> = h.st.store.lock(taisce_store::Scope::System).list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
     assert!(!names.iter().any(|n| n == "claude:spoof" || n == "claude:whoever"), "{names:?}");
 }
 
@@ -649,7 +650,7 @@ async fn wrong_resource_is_invalid_target() {
 async fn expired_tokens_are_rejected() {
     let mut h = harness();
     let (_, access, refresh) = h.tokens().await;
-    let s = &mut *h.st.store.lock().unwrap();
+    let s = &mut *h.st.store.lock(taisce_store::Scope::System);
     let ah = hash_secret(&access);
     assert!(s.oauth_access_grant(&ah, now() + 60).unwrap().is_some());
     assert!(s.oauth_access_grant(&ah, now() + ACCESS_TTL + 1).unwrap().is_none());
@@ -663,7 +664,7 @@ async fn enrollment_link_is_single_use() {
     let mut h = harness();
     let t = random_token();
     let (hsh, owner) = (hash_secret(&t), h.owner);
-    h.st.store.lock().unwrap().auth_add_enrollment(&hsh, owner, now() + ENROLL_TTL).unwrap();
+    h.st.store.lock(taisce_store::Scope::System).auth_add_enrollment(&hsh, owner, now() + ENROLL_TTL).unwrap();
     let begin = send(&h.app, post_json("/auth/enroll/begin", json!({"t": t}))).await.json();
     let ccr: CreationChallengeResponse = serde_json::from_value(begin["options"].clone()).unwrap();
     let cred = h.passkey.do_registration(Url::parse(BASE).unwrap(), ccr).unwrap();
@@ -685,7 +686,7 @@ async fn a_second_passkey_signs_in_too() {
     // a second device: its own soft passkey, its own link
     let first = std::mem::replace(&mut h.passkey, WebauthnAuthenticator::new(SoftPasskey::new(true)));
     assert!(h.enroll().await.status.is_success());
-    assert_eq!(h.st.store.lock().unwrap().auth_credentials(Some(h.owner)).unwrap().len(), 2);
+    assert_eq!(h.st.store.lock(taisce_store::Scope::System).auth_credentials(Some(h.owner)).unwrap().len(), 2);
     let client = h.register("Claude", REDIRECT).await;
     let _ = h.code_for(&client).await;
     h.passkey = first;
@@ -717,7 +718,7 @@ async fn cimd_client_is_fetched_validated_and_cached() {
     let (r, req) = h.authorize(&q).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert!(r.body.contains("Doc Client"));
-    let c = h.st.store.lock().unwrap().oauth_client(&id).unwrap().unwrap();
+    let c = h.st.store.lock(taisce_store::Scope::System).oauth_client(&id).unwrap().unwrap();
     assert_eq!((c.kind.as_str(), c.redirect_uris.clone()), ("cimd", vec![REDIRECT.to_string()]));
     // a redirect the document does not list
     let q2 = q.replace("33418/callback", "33418/elsewhere");
@@ -804,7 +805,7 @@ async fn devices_need_the_owners_app_token() {
     assert_eq!(send(&h.app, with(Some(&connector))).await.status, StatusCode::FORBIDDEN);
     let r = send(&h.app, with(Some(&app))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    let d = h.st.store.lock().unwrap().push_device(&token).unwrap().unwrap();
+    let d = h.st.store.lock(taisce_store::Scope::System).push_device(&token).unwrap().unwrap();
     assert_eq!((d.user_id, d.env.as_str()), (h.owner, "sandbox"));
 }
 
@@ -812,7 +813,7 @@ async fn devices_need_the_owners_app_token() {
 
 impl H {
     fn pat(&self, name: &str) -> (taisce_store::auth::ApiToken, String) {
-        let (t, secret) = create_api_token(&mut self.st.store.lock().unwrap(), None, name, None, now()).unwrap();
+        let (t, secret) = create_api_token(&mut self.st.store.lock(taisce_store::Scope::System), None, name, None, now()).unwrap();
         (t, secret.unwrap())
     }
 }
@@ -849,12 +850,12 @@ async fn a_pat_opens_mcp_as_its_owner() {
         let (e, out) = tool(&h.app, &secret, "/mcp", &[], "append", json!({"doc_id": doc, "markdown": "x", "as": bad})).await;
         assert!(e && out.starts_with("as: "), "as {bad:?} must be refused: {out}");
     }
-    let names: Vec<String> = h.st.store.lock().unwrap().list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
+    let names: Vec<String> = h.st.store.lock(taisce_store::Scope::System).list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
     for n in ["claude:q", "claude:y", "claude:spoof", "workbox"] {
         assert!(!names.contains(&n.to_string()), "{n} must not exist: {names:?}");
     }
     // the use was recorded
-    let row = h.st.store.lock().unwrap().auth_api_tokens().unwrap().remove(0);
+    let row = h.st.store.lock(taisce_store::Scope::System).auth_api_tokens().unwrap().remove(0);
     assert_eq!(row.id, t.id);
     assert!(row.last_used_at.is_some_and(|u| u >= t.created_at), "{row:?}");
 }
@@ -898,15 +899,15 @@ async fn revoked_and_unknown_pats_are_refused() {
             format!("Bearer resource_metadata=\"{BASE}/.well-known/oauth-protected-resource/mcp\", error=\"invalid_token\"")
         );
     }
-    let revoked = revoke_api_token(&mut h.st.store.lock().unwrap(), &t.id.to_string(), now()).unwrap();
+    let revoked = revoke_api_token(&mut h.st.store.lock(taisce_store::Scope::System), &t.id.to_string(), now()).unwrap();
     assert_eq!(revoked.id, t.id);
     let r = send(&h.app, mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}), Some(&secret), None)).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
     // the name is free again; the old secret stays dead
     let (_, again) = h.pat("laptop");
     assert_eq!(mcp_tools(&h.app, &again).await.status, StatusCode::OK);
-    assert!(revoke_api_token(&mut h.st.store.lock().unwrap(), "laptop", now()).is_ok());
-    assert!(revoke_api_token(&mut h.st.store.lock().unwrap(), "laptop", now()).is_err());
+    assert!(revoke_api_token(&mut h.st.store.lock(taisce_store::Scope::System), "laptop", now()).is_ok());
+    assert!(revoke_api_token(&mut h.st.store.lock(taisce_store::Scope::System), "laptop", now()).is_err());
 }
 
 #[tokio::test]
@@ -956,12 +957,12 @@ fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
 #[tokio::test(flavor = "multi_thread")]
 async fn pat_secrets_never_reach_the_log_or_the_list() {
     let h = harness();
-    let ((t, secret), log) = logged(|| create_api_token(&mut h.st.store.lock().unwrap(), None, "laptop", None, now()).unwrap());
+    let ((t, secret), log) = logged(|| create_api_token(&mut h.st.store.lock(taisce_store::Scope::System), None, "laptop", None, now()).unwrap());
     let secret = secret.unwrap();
     assert!(log.contains("pat.create") && log.contains(&t.id.to_string()), "{log}");
     assert!(!log.contains(&secret) && !log.contains(&secret[4..]), "{log}");
     assert!(!log.contains(&hash_secret(&secret)), "{log}");
-    let lines = api_token_lines(&h.st.store.lock().unwrap()).unwrap();
+    let lines = api_token_lines(&h.st.store.lock(taisce_store::Scope::System)).unwrap();
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("laptop") && lines[0].contains("never") && lines[0].contains("live"), "{lines:?}");
     assert!(!lines[0].contains(&secret[4..]) && !lines[0].contains(&hash_secret(&secret)), "{lines:?}");
@@ -975,9 +976,9 @@ async fn pat_secrets_never_reach_the_log_or_the_list() {
     assert!(log.contains("pat.first_use") && !log.contains(&secret[4..]), "{log}");
     let (who, log) = use_it();
     assert!(who.is_some() && !log.contains("pat.first_use"), "{log}");
-    let (_, log) = logged(|| revoke_api_token(&mut h.st.store.lock().unwrap(), "laptop", now()).unwrap());
+    let (_, log) = logged(|| revoke_api_token(&mut h.st.store.lock(taisce_store::Scope::System), "laptop", now()).unwrap());
     assert!(log.contains("pat.revoke") && !log.contains(&secret[4..]), "{log}");
-    assert!(api_token_lines(&h.st.store.lock().unwrap()).unwrap()[0].contains("revoked"));
+    assert!(api_token_lines(&h.st.store.lock(taisce_store::Scope::System)).unwrap()[0].contains("revoked"));
 }
 
 #[test]
@@ -997,11 +998,87 @@ async fn a_pat_registered_by_hash_opens_mcp() {
     let h = harness();
     let secret = new_api_token();
     let (t, none) =
-        create_api_token(&mut h.st.store.lock().unwrap(), None, "laptop", Some(&hash_secret(&secret)), now()).unwrap();
+        create_api_token(&mut h.st.store.lock(taisce_store::Scope::System), None, "laptop", Some(&hash_secret(&secret)), now()).unwrap();
     assert!(none.is_none());
     let who = authenticate_pat(&h.st, &secret, "1.2.3.4".into()).await.unwrap();
     assert_eq!((who.user_id, who.grant_id), (h.owner, t.id));
     for bad in ["", "abc", &"A".repeat(64), &format!("{}g", "a".repeat(63))] {
-        assert!(create_api_token(&mut h.st.store.lock().unwrap(), None, "other", Some(bad), now()).is_err(), "{bad:?}");
+        assert!(create_api_token(&mut h.st.store.lock(taisce_store::Scope::System), None, "other", Some(bad), now()).is_err(), "{bad:?}");
     }
+}
+
+
+/// Review round 4: a device whose app grant had lapsed (or been revoked) when
+/// the one-time grandfathering ran must not stay a connector forever. Its DCR
+/// client looks unknown to the unchanged app's probe (400 → re-register), the
+/// register call hands back the pinned `taisce-app`, and the new sign-in is
+/// first party. Its old tokens stop working. A live, grandfathered client is
+/// unaffected.
+#[tokio::test]
+async fn a_lapsed_app_client_re_registers_as_the_pinned_app() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    let t0 = now();
+    let make = |h: &H, id: &str| {
+        let mut s = h.st.store.lock(taisce_store::Scope::System);
+        s.oauth_upsert_client(&taisce_store::auth::OAuthClient {
+            client_id: id.into(),
+            kind: "dcr".into(),
+            client_name: "Taisce".into(),
+            redirect_uris: vec![APP_REDIRECT.into()],
+            metadata: "{}".into(),
+            created_at: t0,
+            refresh_at: None,
+        })
+        .unwrap();
+        let access = random_token();
+        let refresh = random_token();
+        let g = taisce_store::auth::Grant {
+            id: uuid::Uuid::now_v7(),
+            client_id: id.into(),
+            user_id: h.owner,
+            resource: None,
+            scope: SCOPE.into(),
+            created_at: t0,
+            revoked_at: None,
+            revoke_why: None,
+        };
+        s.oauth_issue_grant(None, &g, &hash_secret(&access), t0 + 3600, &hash_secret(&refresh), t0 + 86400).unwrap();
+        (access, refresh)
+    };
+    // the lapsed device: its client exists but was never pinned
+    let (lapsed_access, lapsed_refresh) = make(&h, "dcr_lapsed_ipad");
+    // a live device grandfathered at first start
+    let (live_access, _) = make(&h, "dcr_live_iphone");
+    h.st.store.lock(taisce_store::Scope::System).oauth_mark_first_party("dcr_live_iphone", t0).unwrap();
+    let probe = |id: &str| get(&format!("/oauth/authorize?client_id={id}&redirect_uri={APP_REDIRECT}&response_type=code"));
+    // 1. the app's probe: unknown (400) for the lapsed client, known (a redirect) for the live one
+    assert_eq!(send(&h.app, probe("dcr_lapsed_ipad")).await.status, StatusCode::BAD_REQUEST);
+    let live = send(&h.app, probe("dcr_live_iphone")).await;
+    assert!(live.status.is_redirection(), "{} {}", live.status, live.body);
+    assert!(live.headers["location"].to_str().unwrap().starts_with(APP_REDIRECT));
+    // its old tokens are dead: no lingering connector session
+    let docs = |t: &str| with_bearer(get("/api/docs"), t);
+    assert_eq!(send(&h.app, docs(&lapsed_access)).await.status, StatusCode::UNAUTHORIZED);
+    let r = h.refresh("dcr_lapsed_ipad", &lapsed_refresh).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+    assert!(r.body.contains("invalid_client"), "{}", r.body);
+    // the live one keeps working
+    assert_eq!(send(&h.app, docs(&live_access)).await.status, StatusCode::OK);
+    // 2. the app re-registers: it gets the pinned client
+    let client = h.register("Taisce", APP_REDIRECT).await;
+    assert_eq!(client, FIRST_PARTY_APP_CLIENT);
+    // 3. authorize + token: the new session is first party
+    let code = h.code_for_at(&client, APP_REDIRECT).await;
+    let t = h.exchange_at(&client, &code, VERIFIER, APP_REDIRECT).await;
+    assert_eq!(t.status, StatusCode::OK, "{}", t.body);
+    let access = t.json()["access_token"].as_str().unwrap().to_string();
+    let who = authenticate(&h.st, &access).await.expect("a live token");
+    assert!(who.owner_app, "first party again");
+    let mut req = post_json("/api/devices", json!({"token": "cd".repeat(32), "platform": "ios"}));
+    req.headers_mut().insert(header::AUTHORIZATION, format!("Bearer {access}").parse().unwrap());
+    assert_eq!(send(&h.app, req).await.status, StatusCode::OK, "app powers (device registration) are back");
+    // and a revoked grant behaves the same: its client is unpinned and unknown
+    let (_, _) = make(&h, "dcr_revoked_mac");
+    assert_eq!(send(&h.app, probe("dcr_revoked_mac")).await.status, StatusCode::BAD_REQUEST);
 }

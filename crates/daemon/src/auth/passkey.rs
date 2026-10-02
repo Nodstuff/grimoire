@@ -144,7 +144,7 @@ async fn login_begin(State(st): State<AuthState>, req: Request) -> Response {
     };
     // every user's passkeys: the assertion names the credential, and the
     // credential names the user (no username field to type)
-    let creds = with_store(&st.store, |s| s.auth_credentials(None).unwrap_or_default()).await;
+    let creds = with_store(&st.store, taisce_store::Scope::System, |s| s.auth_credentials(None).unwrap_or_default()).await;
     let keys = passkeys_of(&creds);
     if keys.is_empty() {
         return json_err(StatusCode::SERVICE_UNAVAILABLE, "no passkey enrolled");
@@ -198,7 +198,7 @@ async fn login_finish(State(st): State<AuthState>, req: Request) -> Response {
     };
     let cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(result.cred_id().as_ref());
     let now = now();
-    let user = with_store(&st.store, move |s| {
+    let user = with_store(&st.store, taisce_store::Scope::System, move |s| {
         let c = s.auth_credential_by_cred_id(&cred_id).ok()??;
         if let Ok(mut pk) = serde_json::from_str::<Passkey>(&c.passkey) {
             pk.update_credential(&result);
@@ -250,7 +250,7 @@ async fn enroll_page(State(st): State<AuthState>, Query(q): Query<EnrollQuery>, 
         return error_page(StatusCode::BAD_REQUEST, "This enrollment link is incomplete.");
     };
     let h = hash_secret(&t);
-    let ok = with_store(&st.store, move |s| s.auth_peek_enrollment(&h, now()).ok().flatten().is_some()).await;
+    let ok = with_store(&st.store, taisce_store::Scope::System, move |s| s.auth_peek_enrollment(&h, now()).ok().flatten().is_some()).await;
     if !ok {
         return error_page(
             StatusCode::GONE,
@@ -291,7 +291,7 @@ async fn enroll_begin(State(st): State<AuthState>, req: Request) -> Response {
     };
     let token_hash = hash_secret(&body.t);
     let h = token_hash.clone();
-    let found = with_store(&st.store, move |s| {
+    let found = with_store(&st.store, taisce_store::Scope::System, move |s| {
         let uid = s.auth_peek_enrollment(&h, now()).ok()??;
         let user = s.auth_user(uid).ok()??;
         let creds = s.auth_credentials(Some(uid)).unwrap_or_default();
@@ -370,7 +370,7 @@ async fn enroll_finish(State(st): State<AuthState>, req: Request) -> Response {
         last_used_at: None,
     };
     let (c, h) = (cred.clone(), e.token_hash.clone());
-    let res = with_store(&st.store, move |s| {
+    let res = with_store(&st.store, taisce_store::Scope::System, move |s| {
         if s.auth_credential_by_cred_id(&c.cred_id).ok().flatten().is_some() {
             return Err("this passkey is already registered".to_string());
         }

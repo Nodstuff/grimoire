@@ -38,12 +38,13 @@ use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::StreamExt as _;
 use futures_util::stream::{self, Stream};
-use taisce_store::{Change, SqliteStore};
+use crate::viewer::Viewer;
+use taisce_store::{Change, Scope, SharedStore};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Once};
 use std::time::Duration;
 use tokio::sync::{Notify, watch};
 
@@ -67,7 +68,7 @@ fn error(status: StatusCode, msg: impl std::fmt::Display) -> Response {
 pub struct Feed(Arc<Inner>);
 
 struct Inner {
-    store: Arc<Mutex<SqliteStore>>,
+    store: SharedStore,
     wake: Arc<Notify>,
     head: watch::Sender<i64>,
     pump: Once,
@@ -76,13 +77,10 @@ struct Inner {
 impl Feed {
     /// Install the commit hook on `store`. The pump starts with the first
     /// stream, so constructing a feed needs no runtime.
-    pub fn new(store: &Arc<Mutex<SqliteStore>>) -> Self {
+    pub fn new(store: &SharedStore) -> Self {
         let wake = Arc::new(Notify::new());
         let w = wake.clone();
-        store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .on_commit(move || w.notify_one());
+        store.lock(Scope::System).on_commit(move || w.notify_one());
         let (head, _) = watch::channel(0);
         Feed(Arc::new(Inner { store: store.clone(), wake, head, pump: Once::new() }))
     }
@@ -99,7 +97,7 @@ impl Feed {
 async fn pump(inner: Arc<Inner>) {
     loop {
         // a commit landing during the read leaves a permit: no lost wake-up
-        if let Ok(seq) = with_store(&inner.store, |s| s.latest_change_seq()).await {
+        if let Ok(seq) = with_store(&inner.store, Scope::System, |s| s.latest_change_seq()).await {
             inner.head.send_if_modified(|h| {
                 let moved = *h != seq;
                 *h = seq;
@@ -120,21 +118,22 @@ struct ChangesQuery {
     limit: Option<usize>,
 }
 
-async fn changes(State(st): State<ApiState>, q: Result<Query<ChangesQuery>, QueryRejection>) -> Response {
+async fn changes(State(st): State<ApiState>, v: Viewer, q: Result<Query<ChangesQuery>, QueryRejection>) -> Response {
     let Query(q) = match q {
         Ok(q) => q,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
     // limit=0 asks for the head alone: the cursor to start from, no rows
     if q.limit == Some(0) {
-        return with_store(&st.store, |s| match s.latest_change_seq() {
+        return with_store(&st.store, v.scope, |s| match s.latest_change_seq() {
             Ok(seq) => Json(json!({"seq": seq, "changes": [], "more": false})).into_response(),
             Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
         })
         .await;
     }
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    with_store(&st.store, move |s| match s.changes_since(q.since, limit) {
+    // only the rows this viewer can see, plus the ones addressed to them
+    with_store(&st.store, v.scope, move |s| match s.changes_since(q.since, limit) {
         Ok(page) => Json(json!(page)).into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
     })
@@ -157,7 +156,8 @@ fn resume_from(headers: &HeaderMap, since: Option<i64>) -> i64 {
 }
 
 struct Cursor {
-    store: Arc<Mutex<SqliteStore>>,
+    store: SharedStore,
+    scope: Scope,
     head: watch::Receiver<i64>,
     after: i64,
     queue: VecDeque<Change>,
@@ -183,7 +183,7 @@ async fn next_change(mut cur: Cursor) -> Option<(Result<Event, Infallible>, Curs
         // still wakes `changed()` below
         cur.head.borrow_and_update();
         let after = cur.after;
-        match with_store(&cur.store, move |s| s.changes_since(after, STREAM_PAGE)).await {
+        match with_store(&cur.store, cur.scope, move |s| s.changes_since(after, STREAM_PAGE)).await {
             Ok(page) if !page.changes.is_empty() => {
                 cur.queue.extend(page.changes);
                 continue;
@@ -199,13 +199,14 @@ async fn next_change(mut cur: Cursor) -> Option<(Result<Event, Infallible>, Curs
     }
 }
 
-fn change_stream(feed: &Feed, store: Arc<Mutex<SqliteStore>>, after: i64) -> impl Stream<Item = Result<Event, Infallible>> + use<> {
-    let cur = Cursor { store, head: feed.subscribe(), after, queue: VecDeque::new() };
+fn change_stream(feed: &Feed, store: SharedStore, scope: Scope, after: i64) -> impl Stream<Item = Result<Event, Infallible>> + use<> {
+    let cur = Cursor { store, scope, head: feed.subscribe(), after, queue: VecDeque::new() };
     stream::once(async { Ok(Event::default().retry(RETRY)) }).chain(stream::unfold(cur, next_change))
 }
 
 async fn changes_stream(
     State(st): State<ApiState>,
+    v: Viewer,
     headers: HeaderMap,
     q: Result<Query<StreamQuery>, QueryRejection>,
 ) -> Response {
@@ -215,11 +216,11 @@ async fn changes_stream(
     };
     // fail before the 200: a store that cannot answer is a 500, not an
     // empty stream
-    if let Err(e) = with_store(&st.store, |s| s.latest_change_seq()).await {
+    if let Err(e) = with_store(&st.store, v.scope, |s| s.latest_change_seq()).await {
         return error(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
     let after = resume_from(&headers, q.since);
-    Sse::new(change_stream(&st.changes, st.store.clone(), after))
+    Sse::new(change_stream(&st.changes, st.store.clone(), v.scope, after))
         .keep_alive(KeepAlive::new().interval(HEARTBEAT).text("ping"))
         .into_response()
 }
@@ -405,27 +406,27 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_write_outside_any_route_wakes_the_stream() {
-        let store = Arc::new(Mutex::new(SqliteStore::open_in_memory().unwrap()));
+        let store = SharedStore::new(taisce_store::SqliteStore::open_in_memory().unwrap());
         let feed = Feed::new(&store);
         let tom = {
-            let mut s = store.lock().unwrap();
+            let mut s = store.lock(Scope::System);
             let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
             for i in 0..3 {
                 s.create_doc(&format!("d{i}"), None, tom).unwrap();
             }
             tom
         };
-        let mut st = Box::pin(change_stream(&feed, store.clone(), 2));
+        let mut st = Box::pin(change_stream(&feed, store.clone(), Scope::Local, 2));
         let _retry = st.next().await;
         let first = tokio::time::timeout(Duration::from_secs(5), st.next()).await.unwrap();
         assert!(first.is_some());
         // a write from outside any HTTP route (a gardener, MCP) still wakes it
         let s2 = store.clone();
-        tokio::task::spawn_blocking(move || s2.lock().unwrap().create_doc("bg", None, tom).unwrap())
+        tokio::task::spawn_blocking(move || s2.lock(Scope::System).create_doc("bg", None, tom).unwrap())
             .await
             .unwrap();
         let second = tokio::time::timeout(Duration::from_secs(5), st.next()).await.unwrap();
         assert!(second.is_some());
-        assert_eq!(store.lock().unwrap().latest_change_seq().unwrap(), 4);
+        assert_eq!(store.lock(Scope::System).latest_change_seq().unwrap(), 4);
     }
 }

@@ -6,6 +6,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, Doc } from './types'
+import WorkspaceSwitcher from './WorkspaceSwitcher'
+import { WorkspaceSel, docsInWorkspace } from './workspaces'
 import { notify, errText } from './Notice'
 import { restoreDoc } from './Trash'
 import { keyForPosition } from './editor/diff'
@@ -60,7 +62,7 @@ function Collapse({ open, children }: { open: boolean; children: React.ReactNode
 }
 
 export default function DocTree({
-  docs,
+  docs: allDocs,
   selected,
   onSelect,
   onClose,
@@ -72,6 +74,22 @@ export default function DocTree({
   onClose: () => void
   onChanged: () => void
 }) {
+  // the workspace switcher (ADR 0004): the tree shows one workspace, or all
+  const [ws, setWs] = useState<WorkspaceSel>(() => {
+    try {
+      return localStorage.getItem('taisce.tree.workspace') || 'all'
+    } catch {
+      return 'all'
+    }
+  })
+  useEffect(() => {
+    try {
+      localStorage.setItem('taisce.tree.workspace', ws)
+    } catch {
+      /* storage blocked: the choice lasts this session */
+    }
+  }, [ws])
+  const docs = useMemo(() => docsInWorkspace(allDocs, ws), [allDocs, ws])
   const childrenOf = useMemo(() => childrenIndex(docs), [docs])
   const byId = useMemo(() => new Map(docs.map((d) => [d.id, d])), [docs])
   const groups = useMemo(() => groupRoot(docs, childrenOf), [docs, childrenOf])
@@ -348,6 +366,7 @@ export default function DocTree({
         <button type="button" className="tree-close" onClick={onClose} title="close the tree (⌘T)">
           ⌘T
         </button>
+        <WorkspaceSwitcher value={ws} onChange={setWs} />
       </div>
       <div
         className="tree-root"

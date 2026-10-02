@@ -32,7 +32,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
-use taisce_store::SqliteStore;
+use taisce_store::{Scope, SharedStore, SqliteStore};
 use sha2::Digest as _;
 use std::sync::{Arc, Mutex};
 use webauthn_rs::prelude::Url;
@@ -116,20 +116,21 @@ impl AuthConfig {
 #[derive(Clone)]
 pub struct AuthState {
     pub cfg: Arc<AuthConfig>,
-    pub store: Arc<Mutex<SqliteStore>>,
+    pub store: SharedStore,
     pub webauthn: Arc<webauthn_rs::Webauthn>,
     pub pending: Arc<Mutex<passkey::Pending>>,
     pub limiter: ratelimit::Limiter,
 }
 
 impl AuthState {
-    pub fn new(cfg: AuthConfig, store: Arc<Mutex<SqliteStore>>) -> anyhow::Result<Self> {
+    pub fn new(cfg: AuthConfig, store: SharedStore) -> anyhow::Result<Self> {
         let origin = Url::parse(&cfg.base)?;
         let webauthn = webauthn_rs::WebauthnBuilder::new(&cfg.rp_id, &origin)
             .map_err(|e| anyhow::anyhow!("webauthn config: {e}"))?
             .rp_name("Taisce")
             .build()
             .map_err(|e| anyhow::anyhow!("webauthn config: {e}"))?;
+        ensure_first_party(&mut store.lock(taisce_store::Scope::System), now())?;
         Ok(Self {
             cfg: Arc::new(cfg),
             store,
@@ -219,9 +220,53 @@ pub fn client_principal(client_id: &str, client_name: &str) -> String {
 /// The native app's redirect scheme. A client whose every redirect URI is
 /// on it is the owner's own app: it writes as the human, not as an agent.
 pub const APP_REDIRECT_SCHEME: &str = "ie.null.taisce:";
+/// The one redirect the Taisce app uses (TaisceKit `OAuthClient.redirectURI`).
+pub const APP_REDIRECT_URI: &str = "ie.null.taisce:/oauth/callback";
+/// The app's fixed, server-registered client (ADR 0004, review round 2).
+/// First party is decided by client_id (`oauth_first_party`), never by the
+/// redirect a client declares: DCR maps the app's exact registration to this
+/// client and refuses any other use of the scheme.
+pub const FIRST_PARTY_APP_CLIENT: &str = "taisce-app";
 
-fn is_owner_app(redirect_uris: &[String]) -> bool {
-    !redirect_uris.is_empty() && redirect_uris.iter().all(|u| u.starts_with(APP_REDIRECT_SCHEME))
+/// A "lapsed" app client (ADR 0004, review round 4): a DCR client whose
+/// only redirect is the app's, but which is not pinned first party — a
+/// device whose grant had lapsed (or was revoked) when the one-time
+/// grandfathering ran. It must look UNKNOWN everywhere the unchanged app
+/// asks, so the app re-registers on its own and gets `taisce-app`: the app's
+/// probe (`OAuthClient.clientIsKnown`, GET /oauth/authorize without PKCE)
+/// re-registers on a 400; a refresh answers `invalid_client`; its old access
+/// tokens answer 401. Otherwise its next sign-in would mint a connector token
+/// for the person's own app, forever.
+pub fn lapsed_app_client(s: &SqliteStore, client_id: &str) -> bool {
+    if client_id == FIRST_PARTY_APP_CLIENT {
+        return false;
+    }
+    let Ok(Some(c)) = s.oauth_client(client_id) else { return false };
+    c.kind == "dcr"
+        && c.redirect_uris.len() == 1
+        && c.redirect_uris[0] == APP_REDIRECT_URI
+        && !s.oauth_is_first_party(client_id).unwrap_or(false)
+}
+
+/// Register the fixed app client and pin first-party clients (idempotent).
+pub fn ensure_first_party(s: &mut SqliteStore, now: i64) -> taisce_store::Result<()> {
+    if s.oauth_client(FIRST_PARTY_APP_CLIENT)?.is_none() {
+        s.oauth_upsert_client(&taisce_store::auth::OAuthClient {
+            client_id: FIRST_PARTY_APP_CLIENT.into(),
+            kind: "dcr".into(),
+            client_name: "Taisce".into(),
+            redirect_uris: vec![APP_REDIRECT_URI.into()],
+            metadata: "{\"first_party\":true}".into(),
+            created_at: now,
+            refresh_at: None,
+        })?;
+    }
+    // the app's DCR clients from before this pin keep their sessions
+    let n = s.oauth_grandfather_first_party(APP_REDIRECT_URI, now)?;
+    if n > 0 {
+        tracing::info!(target: AUDIT, event = "client.first_party_grandfathered", clients = n);
+    }
+    s.oauth_mark_first_party(FIRST_PARTY_APP_CLIENT, now)
 }
 
 /// Who a request authenticated as (an extension on authenticated requests).
@@ -239,6 +284,9 @@ pub struct Authenticated {
     pub owner_app: bool,
     /// The authorizing user's human principal.
     pub human: uuid::Uuid,
+    /// ADR 0004: the user is the instance owner (the first `owner`-role
+    /// user): server-level surfaces (backups, diagnostics) are theirs.
+    pub instance_owner: bool,
 }
 
 /// Paths reachable with no token: discovery, the OAuth endpoints, the
@@ -308,18 +356,26 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 pub async fn authenticate(st: &AuthState, token: &str) -> Option<Authenticated> {
     let hash = hash_secret(token);
     let now = now();
-    crate::store_ext::with_store(&st.store, move |s| {
+    crate::store_ext::with_store(&st.store, Scope::System, move |s| {
         let grant = s.oauth_access_grant(&hash, now).ok()??;
+        // a lapsed app client's old tokens stop working (the app re-signs in
+        // and re-registers as the pinned app client)
+        if lapsed_app_client(s, &grant.client_id) {
+            return None;
+        }
         let client = s.oauth_client(&grant.client_id).ok().flatten();
         let name = client.as_ref().map(|c| c.client_name.clone()).unwrap_or_default();
         let human = s.auth_user(grant.user_id).ok().flatten()?.principal_id;
+        let instance_owner = s.instance_owner().ok().flatten() == Some(grant.user_id);
         Some(Authenticated {
             user_id: grant.user_id,
             grant_id: grant.id,
             principal: client_principal(&grant.client_id, &name),
-            owner_app: client.is_some_and(|c| is_owner_app(&c.redirect_uris)),
+            // first party by client_id only (never by a declared redirect)
+            owner_app: s.oauth_is_first_party(&grant.client_id).unwrap_or(false) && client.is_some(),
             human,
             client_id: grant.client_id,
+            instance_owner,
         })
     })
     .await
@@ -332,12 +388,13 @@ pub async fn authenticate(st: &AuthState, token: &str) -> Option<Authenticated> 
 pub async fn authenticate_pat(st: &AuthState, token: &str, ip: String) -> Option<Authenticated> {
     let hash = hash_secret(token);
     let now = now();
-    let (t, human, first) = crate::store_ext::with_store(&st.store, move |s| {
+    let (t, human, first, instance_owner) = crate::store_ext::with_store(&st.store, Scope::System, move |s| {
         let t = s.auth_api_token_by_hash(&hash).ok()??;
         let human = s.auth_user(t.user_id).ok().flatten()?.principal_id;
         let stale = t.last_used_at.is_none_or(|u| u <= now - taisce_store::auth::API_TOKEN_TOUCH_EVERY);
         let first = stale && s.auth_touch_api_token(t.id, now).unwrap_or(false) && t.last_used_at.is_none();
-        Some((t, human, first))
+        let instance_owner = s.instance_owner().ok().flatten() == Some(t.user_id);
+        Some((t, human, first, instance_owner))
     })
     .await?;
     if first {
@@ -351,6 +408,7 @@ pub async fn authenticate_pat(st: &AuthState, token: &str, ip: String) -> Option
         owner_app: false,
         human,
         client_id,
+        instance_owner,
     })
 }
 
@@ -534,7 +592,7 @@ fn rpc_summary(body: &[u8]) -> (String, String) {
 /// Sweep expired codes/tokens/links and stale login ceremonies, every 10 min.
 pub async fn cleanup_loop(st: AuthState) {
     loop {
-        let n = crate::store_ext::with_store(&st.store, |s| s.oauth_cleanup(now())).await;
+        let n = crate::store_ext::with_store(&st.store, Scope::System, |s| s.oauth_cleanup(now())).await;
         match n {
             Ok(n) if n > 0 => tracing::info!(rows = n, "auth cleanup"),
             Ok(_) => {}

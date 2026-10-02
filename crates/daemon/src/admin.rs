@@ -7,18 +7,20 @@ use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::response::IntoResponse;
 use axum::{Json, Router};
-use taisce_store::{BlockStore, ConfidencePolicy, GardenerKind, ReviewPolicy, SqliteStore};
+use taisce_store::{BlockStore, ConfidencePolicy, GardenerKind, ReviewPolicy, Scope};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use uuid::Uuid;
 
-pub type Store = Arc<Mutex<SqliteStore>>;
+pub type Store = taisce_store::SharedStore;
 
 /// Gardener/admin route state.
 #[derive(Clone)]
 pub struct AdminState {
     pub store: Store,
+    /// SERVER mode: `/api/profile` is the signed-in user's own profile.
+    pub server_mode: bool,
 }
 
 #[derive(Deserialize)]
@@ -43,7 +45,7 @@ pub struct RunsQuery {
 }
 
 async fn list_gardeners(State(AdminState { store, .. }): State<AdminState>) -> Json<Value> {
-    with_store(&store, move |s| {
+    with_store(&store, Scope::System, move |s| {
         match s.list_gardeners() {
             Ok(g) => Json(json!(g)),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -70,7 +72,7 @@ async fn create_gardener(
             None => return Json(json!({"error": format!("bad kind: {k}")})),
         },
     };
-    with_store(&store, move |s| {
+    with_store(&store, Scope::System, move |s| {
         match s.create_gardener(&req.name, kind, &req.task_prompt, req.scope_doc, policy) {
             Ok(g) => Json(json!(g)),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -83,10 +85,10 @@ async fn create_gardener(
 /// click, or the daily cut got there first); a mixed batch reports the
 /// running ones with status "running" and runs the rest.
 async fn run_now(
-    State(AdminState { store }): State<AdminState>,
+    State(AdminState { store, .. }): State<AdminState>,
     Json(req): Json<RunReq>,
 ) -> axum::response::Response {
-    let gardeners = match with_store(&store, |s| s.list_gardeners()).await {
+    let gardeners = match with_store(&store, Scope::System, |s| s.list_gardeners()).await {
         Ok(g) => g,
         Err(e) => return Json(json!({"error": e.to_string()})).into_response(),
     };
@@ -127,7 +129,7 @@ async fn run_now(
 }
 
 async fn list_runs(State(AdminState { store, .. }): State<AdminState>, Query(q): Query<RunsQuery>) -> Json<Value> {
-    with_store(&store, move |s| {
+    with_store(&store, Scope::System, move |s| {
         match s.list_runs(q.limit.unwrap_or(20)) {
             Ok(r) => Json(json!(r)),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -155,7 +157,7 @@ async fn update_gardener(
     let Some(policy) = ConfidencePolicy::parse(&req.confidence_policy) else {
         return Json(json!({"error": format!("bad confidence_policy: {}", req.confidence_policy)}));
     };
-    with_store(&store, move |s| {
+    with_store(&store, Scope::System, move |s| {
         let bindings = if req.bindings.is_null() {
             serde_json::json!([])
         } else {
@@ -192,7 +194,7 @@ async fn set_policy(State(AdminState { store, .. }): State<AdminState>, Json(req
             None => return Json(json!({"error": format!("bad policy: {p}")})),
         },
     };
-    with_store(&store, move |s| {
+    with_store(&store, Scope::System, move |s| {
         match s.set_review_policy(req.doc_id, policy) {
             Ok(()) => Json(json!({"ok": true})),
             Err(e) => Json(json!({"error": e.to_string()})),
@@ -292,13 +294,29 @@ async fn require_admin(
 
 /// The instance owner's profile: display name and whether the name was
 /// ever confirmed by the user.
-async fn get_profile(State(AdminState { store, .. }): State<AdminState>) -> Json<Value> {
-    with_store(&store, move |s| {
-        let human = s
+/// The person a profile request is for: the signed-in user's own human
+/// principal (SERVER), else the instance's one human (LOCAL).
+fn profile_human(s: &taisce_store::SqliteStore, v: &crate::viewer::Viewer) -> Option<taisce_store::Principal> {
+    match v.user {
+        Some(_) => s.get_principal(v.human).ok(),
+        None => s
             .list_principals()
             .unwrap_or_default()
             .into_iter()
-            .find(|p| p.kind == taisce_store::PrincipalKind::Human);
+            .find(|p| p.kind == taisce_store::PrincipalKind::Human),
+    }
+}
+
+impl axum::extract::FromRequestParts<AdminState> for crate::viewer::Viewer {
+    type Rejection = axum::response::Response;
+    async fn from_request_parts(parts: &mut axum::http::request::Parts, st: &AdminState) -> Result<Self, Self::Rejection> {
+        Self::from_parts(parts, st.server_mode, Uuid::nil())
+    }
+}
+
+async fn get_profile(State(AdminState { store, .. }): State<AdminState>, v: crate::viewer::Viewer) -> Json<Value> {
+    with_store(&store, v.scope, move |s| {
+        let human = profile_human(s, &v);
         let Some(human) = human else {
             return Json(json!({"error": "no human principal"}));
         };
@@ -317,13 +335,13 @@ pub struct ProfileReq {
     pub name: String,
 }
 
-async fn set_profile(State(AdminState { store, .. }): State<AdminState>, Json(req): Json<ProfileReq>) -> Json<Value> {
-    with_store(&store, move |s| {
-        let human = s
-            .list_principals()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|p| p.kind == taisce_store::PrincipalKind::Human);
+async fn set_profile(
+    State(AdminState { store, .. }): State<AdminState>,
+    v: crate::viewer::Viewer,
+    Json(req): Json<ProfileReq>,
+) -> Json<Value> {
+    with_store(&store, v.scope, move |s| {
+        let human = profile_human(s, &v);
         let Some(human) = human else {
             return Json(json!({"error": "no human principal"}));
         };
@@ -338,12 +356,13 @@ async fn set_profile(State(AdminState { store, .. }): State<AdminState>, Json(re
     .await
 }
 
-pub fn router(store: Store, token: AdminToken) -> Router {
-    let state = AdminState { store };
+pub fn router(store: Store, token: AdminToken, server_mode: bool) -> Router {
+    let state = AdminState { store, server_mode };
     // the profile is not gate-weakening (your own name): it stays open so
     // the first-run prompt works from any local client
     let open_routes = Router::new()
         .route("/api/profile", get(get_profile).post(set_profile))
+        .layer(axum::middleware::from_fn(crate::viewer::refuse_connector_writes))
         .with_state(state.clone());
     Router::new()
         .route(
@@ -368,8 +387,8 @@ mod token_tests {
     use tower::ServiceExt;
 
     fn app() -> Router {
-        let store: Store = Arc::new(Mutex::new(SqliteStore::open_in_memory().unwrap()));
-        router(store, AdminToken::fixed("s3cret"))
+        let store: Store = taisce_store::SharedStore::new(taisce_store::SqliteStore::open_in_memory().unwrap());
+        router(store, AdminToken::fixed("s3cret"), false)
     }
 
     #[tokio::test]
@@ -505,7 +524,7 @@ pub async fn daily_loop(store: Store) {
         tokio::time::sleep(wait).await;
 
         let gardeners = {
-            with_store(&store, move |s| {
+            with_store(&store, Scope::System, move |s| {
                 s.list_gardeners().unwrap_or_default()
             })
             .await

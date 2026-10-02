@@ -14,7 +14,7 @@
 
 use taisce_store::{BlockStore, SqliteStore};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 #[derive(rust_embed::RustEmbed)]
@@ -68,7 +68,18 @@ impl Embedder {
 
     /// Nearest blocks to `query` by cosine (vectors are unit length, so a
     /// dot product), best first. Only live blocks are ever in the index.
-    pub fn search(&self, query: &str, k: usize) -> Vec<(Uuid, f32)> {
+    /// The index is global (the embed loop is System work), so the store's
+    /// scope cuts the candidates to the viewer's visible blocks BEFORE the
+    /// top-k (ADR 0004): taking the store here makes that impossible to
+    /// forget.
+    pub fn search(&self, store: &SqliteStore, query: &str, k: usize) -> Vec<(Uuid, f32)> {
+        let allowed = match store.visible_block_ids() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("dense search: visible blocks unreadable ({e}); no dense hits");
+                return Vec::new();
+            }
+        };
         let q = self.encode_one(query);
         if q.iter().all(|x| *x == 0.0) {
             return Vec::new();
@@ -76,6 +87,7 @@ impl Embedder {
         let index = self.index.read().unwrap_or_else(|p| p.into_inner());
         let mut scored: Vec<(Uuid, f32)> = index
             .iter()
+            .filter(|(id, _)| allowed.as_ref().is_none_or(|a| a.contains(id)))
             .map(|(id, v)| (*id, v.iter().zip(&q).map(|(a, b)| a * b).sum::<f32>()))
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -106,9 +118,10 @@ impl Embedder {
     /// One pass: embed up to BATCH stale blocks, store, update the index.
     /// Returns how many were (re)embedded. Frontmatter/`---` blocks get an
     /// empty vector so they count as done without polluting search.
-    pub fn embed_stale(&self, store: &Arc<Mutex<SqliteStore>>) -> taisce_store::Result<usize> {
+    pub fn embed_stale(&self, store: &taisce_store::SharedStore) -> taisce_store::Result<usize> {
+        // indexing every block is System work; reads filter by scope later
         let stale = {
-            let s = store.lock().unwrap_or_else(|p| p.into_inner());
+            let s = store.lock(taisce_store::Scope::System);
             s.stale_block_vectors(BATCH)?
         };
         if stale.is_empty() {
@@ -119,7 +132,7 @@ impl Embedder {
             .partition(|(_, _, c)| c.trim().is_empty() || taisce_store::import::is_frontmatter(c));
         let texts: Vec<String> = embed.iter().map(|(_, _, c)| c.clone()).collect();
         let vecs = if texts.is_empty() { Vec::new() } else { self.encode(&texts) };
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+        let mut s = store.lock(taisce_store::Scope::System);
         let mut index = self.index.write().unwrap_or_else(|p| p.into_inner());
         for (id, epoch, _) in &skip {
             s.set_block_vec(*id, *epoch, &[])?;
@@ -132,8 +145,8 @@ impl Embedder {
         Ok(skip.len() + embed.len())
     }
 
-    pub fn purge(&self, store: &Arc<Mutex<SqliteStore>>) -> taisce_store::Result<usize> {
-        let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+    pub fn purge(&self, store: &taisce_store::SharedStore) -> taisce_store::Result<usize> {
+        let mut s = store.lock(taisce_store::Scope::System);
         let n = s.purge_block_vecs()?;
         if n > 0 {
             let live: std::collections::HashSet<Uuid> =
@@ -148,7 +161,7 @@ impl Embedder {
 /// Keeps `block_vec` current: a full catch-up at start (a few thousand
 /// blocks take seconds), then a 2s poll that is one cheap query when idle.
 /// Purges vectors of deleted blocks once a minute.
-pub async fn embed_loop(embedder: Arc<Embedder>, store: Arc<Mutex<SqliteStore>>) {
+pub async fn embed_loop(embedder: Arc<Embedder>, store: taisce_store::SharedStore) {
     let started = std::time::Instant::now();
     let mut total = 0usize;
     let mut ticks = 0u64;
@@ -195,31 +208,31 @@ mod tests {
         let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap();
         let (doc, _) = import_markdown(&mut s, "Notes", None, tom.id,
             "---\ntags:\n  - x\n---\n\nThe backup runs nightly with VACUUM INTO.\n\nSourdough wants a long cold proof.\n").unwrap();
-        let store = Arc::new(Mutex::new(s));
+        let store = taisce_store::SharedStore::new(s);
         // first pass embeds everything (frontmatter gets an empty marker)
         let n = embedder.embed_stale(&store).unwrap();
         assert_eq!(n, 3);
         assert_eq!(embedder.indexed(), 2, "frontmatter is not searchable");
         assert_eq!(embedder.embed_stale(&store).unwrap(), 0, "nothing stale");
         // semantic: a paraphrase finds the right block
-        let hits = embedder.search("how are database snapshots taken?", 1);
-        let top = store.lock().unwrap().read_block(hits[0].0).unwrap();
+        let hits = embedder.search(&store.lock(taisce_store::Scope::System), "how are database snapshots taken?", 1);
+        let top = store.lock(taisce_store::Scope::System).read_block(hits[0].0).unwrap();
         assert!(top.content.contains("backup"), "got {:?}", top.content);
         // edit one block → exactly one becomes stale
-        let tree = store.lock().unwrap().read_doc(doc).unwrap();
+        let tree = store.lock(taisce_store::Scope::System).read_doc(doc).unwrap();
         let target = tree.roots.iter().flat_map(|n| std::iter::once(&n.block).chain(n.children.iter().map(|c| &c.block)))
             .find(|b| b.content.contains("Sourdough")).unwrap().id;
-        store.lock().unwrap().apply(doc, tree.doc.current_epoch, tom.id, vec![taisce_store::OpInput {
+        store.lock(taisce_store::Scope::System).apply(doc, tree.doc.current_epoch, tom.id, vec![taisce_store::OpInput {
             kind: taisce_store::OpKind::Replace { target, content: "Bread needs a twelve hour rise.".into() },
             source_refs: vec![],
         }]).unwrap();
         assert_eq!(embedder.embed_stale(&store).unwrap(), 1);
         // delete the doc → vectors purged, index shrinks
-        store.lock().unwrap().delete_doc(doc).unwrap();
+        store.lock(taisce_store::Scope::System).delete_doc(doc).unwrap();
         // tombstoning blocks is doc-level here; block rows stay but the doc is deleted —
         // block_vecs joins on block.deleted, so emulate a block delete
         let bid = target;
-        store.lock().unwrap().apply(doc, tree.doc.current_epoch + 1, tom.id, vec![taisce_store::OpInput {
+        store.lock(taisce_store::Scope::System).apply(doc, tree.doc.current_epoch + 1, tom.id, vec![taisce_store::OpInput {
             kind: taisce_store::OpKind::Delete { target: bid },
             source_refs: vec![],
         }]).ok();

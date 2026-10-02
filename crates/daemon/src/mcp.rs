@@ -22,7 +22,7 @@
 
 use crate::store_ext::with_store;
 use taisce_store::locate::{self, short_ref};
-use taisce_store::{Block, BlockNode, BlockStore, OpInput, OpKind, ProposeOutcome, ReviewDecision, SqliteStore};
+use taisce_store::{Block, BlockNode, BlockStore, OpInput, OpKind, ProposeOutcome, ReviewDecision, Scope, SqliteStore};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
@@ -50,23 +50,26 @@ use uuid::Uuid;
 /// instead of clearing — a retry storm never wipes an in-window entry.
 /// Every write path (the MCP write tools, HTTP `request_id`) also goes through `durable_get`/`durable_put`, which back it
 /// with the store's `idempotency` table so a retry survives a restart.
-pub type DedupeCache = Arc<Mutex<std::collections::HashMap<(Uuid, Uuid), (u64, Instant, Value)>>>;
+/// The key also carries the scope's user (ADR 0004): agent principals are
+/// shared between people, so (principal, key) alone could replay one
+/// person's outcome to another.
+pub type DedupeCache = Arc<Mutex<std::collections::HashMap<(Option<Uuid>, Uuid, Uuid), (u64, Instant, Value)>>>;
 
 pub const DEDUPE_CAPACITY: usize = 512;
 /// How long a repeated identical write is treated as a retry.
 pub const DEDUPE_TTL: Duration = Duration::from_secs(120);
 static DEDUPE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-pub fn dedupe_get(cache: &DedupeCache, principal: Uuid, id: Uuid) -> Option<Value> {
+pub fn dedupe_get(cache: &DedupeCache, user: Option<Uuid>, principal: Uuid, id: Uuid) -> Option<Value> {
     cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&(principal, id))
+        .get(&(user, principal, id))
         .filter(|(_, at, _)| at.elapsed() < DEDUPE_TTL)
         .map(|(_, _, v)| v.clone())
 }
 
-pub fn dedupe_put(cache: &DedupeCache, principal: Uuid, id: Uuid, v: Value) {
+pub fn dedupe_put(cache: &DedupeCache, user: Option<Uuid>, principal: Uuid, id: Uuid, v: Value) {
     let mut c = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -80,7 +83,7 @@ pub fn dedupe_put(cache: &DedupeCache, principal: Uuid, id: Uuid, v: Value) {
         c.retain(|_, (seq, _, _)| *seq >= cutoff);
     }
     let seq = DEDUPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    c.insert((principal, id), (seq, Instant::now(), v));
+    c.insert((user, principal, id), (seq, Instant::now(), v));
 }
 
 /// How long an HTTP `request_id`'s outcome replays: a phone retrying after
@@ -98,7 +101,7 @@ fn unix_now() -> i64 {
 /// first, then a row recorded within `window` — so a retry after a restart
 /// (or, for a `request_id`, days later) still replays.
 pub fn durable_get(store: &SqliteStore, cache: &DedupeCache, principal: Uuid, id: Uuid, window: Duration) -> Option<Value> {
-    if let Some(v) = dedupe_get(cache, principal, id) {
+    if let Some(v) = dedupe_get(cache, store.scope().user(), principal, id) {
         return Some(v);
     }
     let since = unix_now() - window.as_secs() as i64;
@@ -112,14 +115,15 @@ pub fn durable_put(store: &mut SqliteStore, cache: &DedupeCache, principal: Uuid
     if let Err(e) = store.idempotency_put(principal, id, &v.to_string(), unix_now(), window.as_secs() as i64) {
         tracing::warn!("idempotency record failed: {e}");
     }
-    dedupe_put(cache, principal, id, v);
+    dedupe_put(cache, store.scope().user(), principal, id, v);
 }
 
 /// Sweep idempotency rows past the longest window (`REQUEST_ID_TTL`), hourly.
-pub async fn idempotency_cleanup_loop(store: Arc<Mutex<SqliteStore>>) {
+pub async fn idempotency_cleanup_loop(store: taisce_store::SharedStore) {
+    // the sweep is bookkeeping over every user's rows: System
     loop {
         let before = unix_now() - REQUEST_ID_TTL.as_secs() as i64;
-        match with_store(&store, move |s| s.idempotency_cleanup(before)).await {
+        match with_store(&store, Scope::System, move |s| s.idempotency_cleanup(before)).await {
             Ok(n) if n > 0 => tracing::info!(rows = n, "idempotency cleanup"),
             Ok(_) => {}
             Err(e) => tracing::warn!("idempotency cleanup failed: {e}"),
@@ -188,18 +192,14 @@ pub fn valid_principal_name(name: &str) -> Result<&str, String> {
 /// carrying the name is refused: an agent never acts as the human.
 pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uuid, String> {
     let name = valid_principal_name(name)?;
-    let existing = store
-        .list_principals()
-        .ok()
-        .and_then(|ps| ps.into_iter().find(|pr| pr.display_name == name));
-    if let Some(pr) = existing {
-        return match pr.kind {
-            taisce_store::PrincipalKind::Agent => Ok(pr.id),
-            kind => Err(format!(
-                "{name:?} is the {} principal, not an agent: agents cannot act as it",
-                kind.as_str()
-            )),
-        };
+    // ADR 0004: agents are per person — the scope's own agent of that name,
+    // never someone else's (the same label under two users is two principals)
+    if let Some(pr) = store.agent_named(name).map_err(|e| e.to_string())? {
+        return Ok(pr.id);
+    }
+    // an agent never takes a person's name; the refusal does not say whose
+    if store.name_is_a_persons(name).map_err(|e| e.to_string())? {
+        return Err(format!("{name:?} is not an agent name you can use"));
     }
     if AUTO_CREATED.load(std::sync::atomic::Ordering::Relaxed) >= MAX_AUTO_PRINCIPALS_PER_BOOT {
         return Err(format!(
@@ -228,6 +228,9 @@ pub struct RequestHint {
     /// SERVER mode: the bearer token fixed who this is (the other hints are
     /// then empty — a token's request cannot name someone else).
     pub pinned: Option<Pinned>,
+    /// SERVER mode: the token's user (OAuth grant or PAT owner). Every
+    /// store call of the request runs in their scope (ADR 0004).
+    pub user: Option<Uuid>,
 }
 
 /// Identity fixed by an OAuth token (`auth::Authenticated`).
@@ -244,7 +247,7 @@ impl RequestHint {
     pub fn from_parts(parts: &axum::http::request::Parts) -> Self {
         if let Some(who) = parts.extensions.get::<crate::auth::Authenticated>() {
             let pin = if who.owner_app { Pinned::Owner(who.human) } else { Pinned::Client(who.principal.clone()) };
-            return Self { pinned: Some(pin), ..Self::default() };
+            return Self { pinned: Some(pin), user: Some(who.user_id), ..Self::default() };
         }
         let header = parts
             .headers
@@ -262,7 +265,7 @@ impl RequestHint {
                 _ => {}
             }
         }
-        Self { header, query_as, cwd, pinned: None }
+        Self { header, query_as, cwd, pinned: None, user: None }
     }
 
     pub fn from_ctx(ctx: &RequestContext<RoleServer>) -> Self {
@@ -359,27 +362,23 @@ pub fn acting_principal(
         },
     };
     let key = raw.trim();
-    if let Some(id) = cached_principal(names, key) {
+    let cache_key = name_key(store.scope().user(), key);
+    if let Some(id) = cached_principal(names, &cache_key) {
         return Ok(id);
     }
     let id = match Uuid::parse_str(key) {
-        Ok(id) => match store.get_principal(id) {
-            Ok(pr) if pr.kind == taisce_store::PrincipalKind::Agent => id,
-            Ok(pr) => {
-                return Err(format!(
-                    "as: {id} is the {} principal {:?}, not an agent: agents cannot act as it",
-                    pr.kind.as_str(),
-                    pr.display_name
-                ));
-            }
-            Err(_) => return Err(format!("as: no principal with id {id}; pass a name to create one")),
+        // by id: only one of the caller's own agents (System/Local: the
+        // instance's); anything else answers as if it did not exist
+        Ok(id) => match store.agent_is_mine(id) {
+            Ok(true) => id,
+            _ => return Err(format!("as: no principal with id {id} among your agents; pass a name to create one")),
         },
         Err(_) => agent_principal_by_name(store, key).map_err(|m| format!("as: {m}"))?,
     };
     names
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key.to_string(), id);
+        .insert(cache_key, id);
     Ok(id)
 }
 
@@ -405,8 +404,11 @@ pub fn pinned_label(store: &SqliteStore, base: &str, label: &str) -> Result<Stri
         return refuse("has an empty label");
     }
     valid_principal_name(label).map_err(|m| format!("as: {m}"))?;
+    // only the caller's own connectors: agent principals are per person, so
+    // another person's client names are none of this token's business
+    let me = store.scope().user();
     let grants = store.oauth_grants(false).map_err(|e| e.to_string())?;
-    let mut clients: Vec<String> = grants.into_iter().map(|g| g.client_id).collect();
+    let mut clients: Vec<String> = grants.into_iter().filter(|g| me.is_none_or(|u| g.user_id == u)).map(|g| g.client_id).collect();
     clients.sort();
     clients.dedup();
     for c in clients {
@@ -416,6 +418,11 @@ pub fn pinned_label(store: &SqliteStore, base: &str, label: &str) -> Result<Stri
         }
     }
     Ok(label.to_string())
+}
+
+/// The `as` cache key: a name means a different principal per person.
+pub fn name_key(user: Option<Uuid>, name: &str) -> String {
+    format!("{}|{}", user.map(|u| u.to_string()).unwrap_or_default(), name.trim())
 }
 
 fn cached_principal(names: &NameCache, key: &str) -> Option<Uuid> {
@@ -430,7 +437,10 @@ fn cached_principal(names: &NameCache, key: &str) -> Option<Uuid> {
 
 #[derive(Clone)]
 pub struct KsMcp {
-    store: Arc<Mutex<SqliteStore>>,
+    store: taisce_store::SharedStore,
+    /// SERVER mode: a call without a token's user is refused, never served
+    /// as the local user (ADR 0004: deny by default).
+    server_mode: bool,
     dedupe: DedupeCache,
     /// The shared default principal (`claude`).
     agent: Uuid,
@@ -448,17 +458,19 @@ impl KsMcp {
     /// The principal this call acts as (`acting_principal`). Skips the store
     /// when no handle is given or it is already cached.
     async fn acting(&self, as_: Option<&str>, hint: &RequestHint) -> Result<Uuid, String> {
+        // principals resolve in the caller's scope: agents are per person
+        let scope = self.scope_of(hint)?;
         match &hint.pinned {
             Some(Pinned::Owner(human)) => return Ok(*human),
             Some(Pinned::Client(base)) => {
                 let (base, label) = (base.clone(), as_.map(|a| a.trim().to_string()));
                 if label.is_none()
-                    && let Some(id) = cached_principal(&self.names, &base)
+                    && let Some(id) = cached_principal(&self.names, &name_key(scope.user(), &base))
                 {
                     return Ok(id);
                 }
                 let (names, default) = (self.names.clone(), self.agent);
-                return with_store(&self.store, move |store| {
+                return with_store(&self.store, scope, move |store| {
                     let raw = match label {
                         Some(l) => pinned_label(store, &base, &l)?,
                         None => base,
@@ -476,11 +488,11 @@ impl KsMcp {
                 None => return Ok(self.agent),
             },
         };
-        if let Some(id) = cached_principal(&self.names, &raw) {
+        if let Some(id) = cached_principal(&self.names, &name_key(scope.user(), &raw)) {
             return Ok(id);
         }
         let (names, default) = (self.names.clone(), self.agent);
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             acting_principal(store, &names, Some(&raw), &RequestHint::default(), default)
         })
         .await
@@ -489,6 +501,21 @@ impl KsMcp {
     pub fn with_embedder(mut self, embedder: Option<Arc<crate::embed::Embedder>>) -> Self {
         self.embedder = embedder;
         self
+    }
+
+    pub fn with_server_mode(mut self, server_mode: bool) -> Self {
+        self.server_mode = server_mode;
+        self
+    }
+
+    /// The scope a call runs in: the token's user (SERVER), else LOCAL's
+    /// single user. A SERVER call with no user is refused.
+    pub(crate) fn scope_of(&self, hint: &RequestHint) -> Result<Scope, String> {
+        match hint.user {
+            Some(u) => Ok(Scope::User(u)),
+            None if !self.server_mode => Ok(Scope::Local),
+            None => Err("authentication required".into()),
+        }
     }
 }
 
@@ -642,7 +669,13 @@ fn answer(ops: &[OpInput], out: &ProposeOutcome, before: i64, verbose: bool) -> 
 /// doc_op "workspace": label (or, with no workspace, unlabel) a doc; its
 /// subtree follows. Applied directly, not gated: a label moves nothing and
 /// weakens nothing. The store journals the tree rows.
-fn file_doc(store: &mut SqliteStore, doc_id: Uuid, workspace: Option<&str>, create_missing: bool) -> Result<(String, Value), String> {
+fn file_doc(
+    store: &mut SqliteStore,
+    doc_id: Uuid,
+    workspace: Option<&str>,
+    create_missing: bool,
+    principal: Uuid,
+) -> Result<(String, Value), String> {
     let doc = store.get_doc(doc_id).map_err(|e| e.to_string())?;
     let mut created = false;
     let target = match workspace.map(str::trim).filter(|w| !w.is_empty() && !w.eq_ignore_ascii_case("null")) {
@@ -661,7 +694,7 @@ fn file_doc(store: &mut SqliteStore, doc_id: Uuid, workspace: Option<&str>, crea
             }
         },
     };
-    let resolved = store.set_doc_workspace(doc_id, target.as_ref().map(|w| w.id)).map_err(|e| e.to_string())?;
+    let resolved = store.set_doc_workspace(doc_id, target.as_ref().map(|w| w.id), principal).map_err(|e| e.to_string())?;
     let count = 1 + store.doc_subtree_ids(doc_id).map(|v| v.len().saturating_sub(1)).unwrap_or(0);
     let name_of = |id: Option<Uuid>| match id {
         None => "Unsorted".to_string(),
@@ -1139,16 +1172,17 @@ fn resolve_landing(
 
 // ─── the tools ───
 
-#[tool_router]
+#[tool_router(vis = "pub(crate)")]
 impl KsMcp {
     pub fn new(
-        store: Arc<Mutex<SqliteStore>>,
+        store: taisce_store::SharedStore,
         agent: Uuid,
         dedupe: DedupeCache,
         names: NameCache,
     ) -> Self {
         Self {
             store,
+            server_mode: false,
             dedupe,
             agent,
             names,
@@ -1160,13 +1194,25 @@ impl KsMcp {
     #[tool(
         description = "Find docs by name: fuzzy match over titles and breadcrumb paths ('Folder › Sub › Title'), typo-tolerant, ranked exact > prefix > substring > path words > fuzzy. Returns {id, title, path, parent_id, epoch, status}. Start here; then read_doc or edit_doc with the id."
     )]
-    async fn find_doc(&self, Parameters(p): Parameters<FindDocParams>) -> Result<CallToolResult, McpError> {
+    async fn find_doc(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<FindDocParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.find_doc_impl(RequestHint::from_ctx(&ctx), p).await
+    }
+
+    pub(crate) async fn find_doc_impl(&self, hint: RequestHint, p: FindDocParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let parent = match parse_opt_uuid(p.parent_doc_id.as_deref(), "parent_doc_id") {
             Ok(u) => u,
             Err(m) => return err(m),
         };
         let limit = p.limit.unwrap_or(8).clamp(1, 50) as usize;
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             let ws = match crate::retrieval::workspace_arg(store, p.workspace.as_deref()) {
                 Ok(w) => w,
                 Err(m) => return err(m),
@@ -1190,14 +1236,26 @@ impl KsMcp {
     #[tool(
         description = "The map: the doc tree to `depth` (default 2) with ids and block counts, then the most-linked docs with their first paragraph and the tags in scope, within a token budget. Call once to orient in the corpus or a subtree (root_doc_id); says when truncated."
     )]
-    async fn orient(&self, Parameters(p): Parameters<crate::retrieval::OrientParams>) -> Result<CallToolResult, McpError> {
+    async fn orient(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<crate::retrieval::OrientParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.orient_impl(RequestHint::from_ctx(&ctx), p).await
+    }
+
+    pub(crate) async fn orient_impl(&self, hint: RequestHint, p: crate::retrieval::OrientParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let root = match parse_opt_uuid(p.root_doc_id.as_deref(), "root_doc_id") {
             Ok(u) => u,
             Err(m) => return err(m),
         };
         let max_tokens = p.max_tokens.unwrap_or(1500).clamp(100, 20_000) as usize;
         let depth = p.depth.unwrap_or(2).clamp(1, 12) as usize;
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             let ws = match crate::retrieval::workspace_arg(store, p.workspace.as_deref()) {
                 Ok(w) => w,
                 Err(m) => return err(m),
@@ -1220,7 +1278,19 @@ impl KsMcp {
     #[tool(
         description = "Read a doc as markdown: first line 'doc <id> · epoch <N> · <path>', then the content (comments and canvases excluded). refs: true puts a ^abc123 line above each block; section: a heading path or ref reads just that section; block: just one block; comments: true appends the comment threads; mode 'outline' gives the JSON shape instead."
     )]
-    async fn read_doc(&self, Parameters(p): Parameters<ReadDocParams>) -> Result<CallToolResult, McpError> {
+    async fn read_doc(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<ReadDocParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.read_doc_impl(RequestHint::from_ctx(&ctx), p).await
+    }
+
+    pub(crate) async fn read_doc_impl(&self, hint: RequestHint, p: ReadDocParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
             Ok(u) => u,
             Err(m) => return err(m),
@@ -1230,7 +1300,7 @@ impl KsMcp {
             return err(format!("mode must be outline or omitted (markdown), got {mode}"));
         }
         let refs = p.refs.unwrap_or(false);
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             let tree = match store.read_doc(doc_id) {
                 Ok(t) => t,
                 Err(e) => return err(e.to_string()),
@@ -1339,12 +1409,24 @@ impl KsMcp {
     }
 
     #[tool(description = "Ops applied to a doc after an epoch — what you missed. Use after a stale-epoch refusal, or to see what changed.")]
-    async fn diff_since(&self, Parameters(p): Parameters<DiffSinceParams>) -> Result<CallToolResult, McpError> {
+    async fn diff_since(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<DiffSinceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.diff_since_impl(RequestHint::from_ctx(&ctx), p).await
+    }
+
+    pub(crate) async fn diff_since_impl(&self, hint: RequestHint, p: DiffSinceParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
             Ok(u) => u,
             Err(m) => return err(m),
         };
-        with_store(&self.store, move |store| match store.ops_since(doc_id, p.since_epoch) {
+        with_store(&self.store, scope, move |store| match store.ops_since(doc_id, p.since_epoch) {
             Ok(ops) => ok_json(&ops),
             Err(e) => err(e.to_string()),
         })
@@ -1354,8 +1436,20 @@ impl KsMcp {
     #[tool(
         description = "Ranked search over live blocks: exact phrase first, then all-words, then fuzzy and by-meaning. Compact hits {doc_id, path, block_id, snippet, score}; kind 'docs' groups by doc; scope_doc_id restricts to a subtree."
     )]
-    async fn search(&self, Parameters(p): Parameters<crate::retrieval::SearchParams>) -> Result<CallToolResult, McpError> {
-        let scope = match parse_opt_uuid(p.scope_doc_id.as_deref(), "scope_doc_id") {
+    async fn search(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<crate::retrieval::SearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.search_impl(RequestHint::from_ctx(&ctx), p).await
+    }
+
+    pub(crate) async fn search_impl(&self, hint: RequestHint, p: crate::retrieval::SearchParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
+        let scope_doc = match parse_opt_uuid(p.scope_doc_id.as_deref(), "scope_doc_id") {
             Ok(u) => u,
             Err(m) => return err(m),
         };
@@ -1364,13 +1458,13 @@ impl KsMcp {
             return err(format!("kind must be blocks|docs, got {kind}"));
         }
         let mut opts = crate::retrieval::SearchOpts {
-            scope,
+            scope: scope_doc,
             workspace: None,
             exclude_answers: p.exclude_answers.unwrap_or(true),
             limit: p.limit.unwrap_or(10).clamp(1, 100) as usize,
         };
         let embedder = self.embedder.clone();
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             opts.workspace = match crate::retrieval::workspace_arg(store, p.workspace.as_deref()) {
                 Ok(w) => w,
                 Err(m) => return err(m),
@@ -1392,19 +1486,31 @@ impl KsMcp {
     #[tool(
         description = "Exhaustive regex sweep (Rust syntax, per line of block content) grouped by doc: every match with totals and a truncated flag — raise max_groups/max_matches_per_group for the rest. Comments and frontmatter skipped unless include_hidden."
     )]
-    async fn grep(&self, Parameters(p): Parameters<crate::retrieval::GrepParams>) -> Result<CallToolResult, McpError> {
-        let scope = match parse_opt_uuid(p.scope_doc_id.as_deref(), "scope_doc_id") {
+    async fn grep(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<crate::retrieval::GrepParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.grep_impl(RequestHint::from_ctx(&ctx), p).await
+    }
+
+    pub(crate) async fn grep_impl(&self, hint: RequestHint, p: crate::retrieval::GrepParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
+        let scope_doc = match parse_opt_uuid(p.scope_doc_id.as_deref(), "scope_doc_id") {
             Ok(u) => u,
             Err(m) => return err(m),
         };
         let opts = crate::retrieval::GrepOpts {
-            scope,
+            scope: scope_doc,
             case_insensitive: p.case_insensitive.unwrap_or(false),
             max_groups: p.max_groups.unwrap_or(20).clamp(1, 500) as usize,
             max_matches_per_group: p.max_matches_per_group.unwrap_or(5).clamp(1, 200) as usize,
             include_hidden: p.include_hidden.unwrap_or(false),
         };
-        with_store(&self.store, move |store| match crate::retrieval::grep(store, &p.pattern, opts) {
+        with_store(&self.store, scope, move |store| match crate::retrieval::grep(store, &p.pattern, opts) {
             Ok(out) => ok_json(&out),
             Err(m) => err(m),
         })
@@ -1414,9 +1520,21 @@ impl KsMcp {
     #[tool(
         description = "From a block or doc, what else matters: docs that [[link]] to it (why=backlink), nearest blocks by meaning (why=similar), same-folder docs (why=sibling). by: 'tag' + tag lists the docs carrying a tag; tags: true lists every tag with counts."
     )]
-    async fn related(&self, Parameters(p): Parameters<crate::retrieval::RelatedParams>) -> Result<CallToolResult, McpError> {
+    async fn related(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<crate::retrieval::RelatedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.related_impl(RequestHint::from_ctx(&ctx), p).await
+    }
+
+    pub(crate) async fn related_impl(&self, hint: RequestHint, p: crate::retrieval::RelatedParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         if p.tags.unwrap_or(false) {
-            return with_store(&self.store, move |store| match store.list_tags() {
+            return with_store(&self.store, scope, move |store| match store.list_tags() {
                 Ok(t) => ok_json(&t.into_iter().map(|(tag, n)| json!({"tag": tag, "docs": n})).collect::<Vec<_>>()),
                 Err(e) => err(e.to_string()),
             })
@@ -1426,7 +1544,7 @@ impl KsMcp {
             let Some(tag) = p.tag.clone().filter(|t| !t.trim().is_empty()) else {
                 return err("by: 'tag' needs tag".into());
             };
-            return with_store(&self.store, move |store| match store.docs_by_tag(tag.trim()) {
+            return with_store(&self.store, scope, move |store| match store.docs_by_tag(tag.trim()) {
                 Ok(docs) => {
                     let crumbs = store.list_docs().map(|all| crate::nav::breadcrumbs(&all)).unwrap_or_default();
                     ok_json(
@@ -1447,7 +1565,7 @@ impl KsMcp {
         }
         let limit = p.limit.unwrap_or(8).clamp(1, 50) as usize;
         let embedder = self.embedder.clone();
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             let anchor = match (p.block_id.as_deref(), p.doc_id.as_deref()) {
                 (Some(b), _) => match resolve_block(store, b) {
                     Ok(b) => crate::retrieval::Anchor::Block(b.id),
@@ -1527,6 +1645,10 @@ impl KsMcp {
 
 impl KsMcp {
     pub(crate) async fn edit_doc_impl(&self, hint: RequestHint, p: EditDocParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
             Ok(u) => u,
             Err(m) => return err(m),
@@ -1541,11 +1663,11 @@ impl KsMcp {
             Some(doc_id),
             &json!({"old": p.old, "new": p.new, "replace_all": p.replace_all.unwrap_or(false)}),
         );
-        if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
+        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
             return replay(&prev, verbose);
         }
         let dedupe = self.dedupe.clone();
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
                 return replay(&prev, verbose);
             }
@@ -1605,6 +1727,10 @@ impl KsMcp {
     }
 
     pub(crate) async fn append_impl(&self, hint: RequestHint, p: AppendParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
             Ok(u) => u,
             Err(m) => return err(m),
@@ -1627,11 +1753,11 @@ impl KsMcp {
             Some(doc_id),
             &json!({"markdown": p.markdown, "to": p.to, "at": at_start, "create_missing": p.create_missing.unwrap_or(false)}),
         );
-        if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
+        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
             return replay(&prev, verbose);
         }
         let dedupe = self.dedupe.clone();
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
                 return replay(&prev, verbose);
             }
@@ -1670,6 +1796,10 @@ impl KsMcp {
     }
 
     pub(crate) async fn propose_impl(&self, hint: RequestHint, p: ProposeParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
             Ok(u) => u,
             Err(m) => return err(m),
@@ -1687,11 +1817,11 @@ impl KsMcp {
             Err(m) => return err(m),
         };
         let key = dedupe_key("propose", Some(doc_id), &json!({"base_epoch": p.base_epoch, "ops": p.ops}));
-        if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
+        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
             return replay(&prev, verbose);
         }
         let dedupe = self.dedupe.clone();
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
                 return replay(&prev, verbose);
             }
@@ -1707,6 +1837,10 @@ impl KsMcp {
     }
 
     pub(crate) async fn propose_markdown_impl(&self, hint: RequestHint, p: ProposeMarkdownParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
             Ok(u) => u,
             Err(m) => return err(m),
@@ -1717,11 +1851,11 @@ impl KsMcp {
             Err(m) => return err(m),
         };
         let key = dedupe_key("propose_markdown", Some(doc_id), &json!({"base_epoch": p.base_epoch, "markdown": p.markdown}));
-        if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
+        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
             return replay(&prev, verbose);
         }
         let dedupe = self.dedupe.clone();
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
                 return replay(&prev, verbose);
             }
@@ -1775,6 +1909,10 @@ impl KsMcp {
     }
 
     pub(crate) async fn create_doc_impl(&self, hint: RequestHint, p: CreateDocParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let parent = match parse_opt_uuid(p.parent_doc_id.as_deref(), "parent_doc_id") {
             Ok(u) => u,
             Err(m) => return err(m),
@@ -1795,11 +1933,11 @@ impl KsMcp {
         };
         let ws_arg = p.workspace.as_deref().map(str::trim).filter(|w| !w.is_empty()).map(str::to_string);
         let key = dedupe_key("create_doc", parent, &json!({"title": title, "markdown": p.markdown, "reuse": reuse, "workspace": ws_arg}));
-        if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
+        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
             return replay(&prev, verbose);
         }
         let dedupe = self.dedupe.clone();
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
                 return replay(&prev, verbose);
             }
@@ -1826,9 +1964,17 @@ impl KsMcp {
             }
             // one lock for the whole find-or-create: two sessions racing on
             // the same daily title cannot both create
-            let existing = match store.list_docs() {
-                Ok(docs) => docs.into_iter().find(|d| d.parent_id == parent && d.title == title),
-                Err(e) => return err(e.to_string()),
+            let existing = match parent {
+                // a root: only ever the caller's own (ADR 0004), never a shared
+                // doc that merely looks like a root to them
+                None => match store.own_root_titled(&title) {
+                    Ok(d) => d,
+                    Err(e) => return err(e.to_string()),
+                },
+                Some(_) => match store.list_docs() {
+                    Ok(docs) => docs.into_iter().find(|d| d.parent_id == parent && d.title == title),
+                    Err(e) => return err(e.to_string()),
+                },
             };
             let render = |d: &taisce_store::Doc, reused: bool| {
                 let full = json!({"id": d.id, "title": d.title, "parent_id": d.parent_id, "epoch": d.current_epoch, "reused": reused});
@@ -1860,9 +2006,12 @@ impl KsMcp {
             match store.create_doc_with_ops(&title, parent, principal, ops) {
                 Ok((d, _)) => {
                     if let (Some(w), None) = (&ws, parent)
-                        && let Err(e) = store.set_doc_workspace(d.id, Some(w.id))
+                        && let Err(e) = store.set_doc_workspace(d.id, Some(w.id), principal)
                     {
-                        return err(format!("created doc {} but could not label it: {e}", d.id));
+                        return err(format!(
+                            "created doc {} but could not label it: {e} — to write into a shared workspace, pass a parent_doc_id inside it",
+                            d.id
+                        ));
                     }
                     let (text, full) = render(&d, false);
                     durable_put(store, &dedupe, principal, key, stored(&text, &full), DEDUPE_TTL);
@@ -1875,6 +2024,10 @@ impl KsMcp {
     }
 
     pub(crate) async fn doc_op_impl(&self, hint: RequestHint, p: DocOpParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
             Ok(u) => u,
             Err(m) => return err(m),
@@ -1894,11 +2047,11 @@ impl KsMcp {
             "workspace": p.workspace, "create_missing": p.create_missing,
         });
         let key = dedupe_key("doc_op", Some(doc_id), &payload);
-        if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
+        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
             return replay(&prev, verbose);
         }
         let dedupe = self.dedupe.clone();
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
                 return replay(&prev, verbose);
             }
@@ -1930,7 +2083,7 @@ impl KsMcp {
                 Err(m) => err(m),
             };
             match op.as_str() {
-                "workspace" => match file_doc(store, doc_id, p.workspace.as_deref(), p.create_missing.unwrap_or(false)) {
+                "workspace" => match file_doc(store, doc_id, p.workspace.as_deref(), p.create_missing.unwrap_or(false), principal) {
                     Ok((text, full)) => {
                         durable_put(store, &dedupe, principal, key, stored(&text, &full), DEDUPE_TTL);
                         if verbose { ok_json(&full) } else { ok_text(text) }
@@ -1993,17 +2146,21 @@ impl KsMcp {
     }
 
     pub(crate) async fn add_comment_impl(&self, hint: RequestHint, p: AddCommentParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let verbose = p.verbose.unwrap_or(false);
         let principal = match self.acting(p.as_.as_deref(), &hint).await {
             Ok(id) => id,
             Err(m) => return err(m),
         };
         let key = dedupe_key("add_comment", None, &json!({"block_id": p.block_id, "text": p.text, "reply_to": p.reply_to}));
-        if let Some(prev) = dedupe_get(&self.dedupe, principal, key) {
+        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
             return replay(&prev, verbose);
         }
         let dedupe = self.dedupe.clone();
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
                 return replay(&prev, verbose);
             }
@@ -2029,6 +2186,10 @@ impl KsMcp {
     }
 
     pub(crate) async fn resolve_impl(&self, hint: RequestHint, p: ResolveParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let id = match parse_uuid(&p.annotation_id, "annotation_id") {
             Ok(u) => u,
             Err(m) => return err(m),
@@ -2043,7 +2204,7 @@ impl KsMcp {
             Ok(id) => id,
             Err(m) => return err(m),
         };
-        with_store(&self.store, move |store| {
+        with_store(&self.store, scope, move |store| {
             match store.resolve(id, principal, decision) {
                 Ok(receipt) => {
                     if verbose {
@@ -2062,6 +2223,10 @@ impl KsMcp {
     }
 
     pub(crate) async fn proposals_impl(&self, hint: RequestHint, p: ProposalsParams) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
         let kind = p.kind.clone().unwrap_or_else(|| "mine".into());
         let verbose = p.verbose.unwrap_or(false);
         match kind.as_str() {
@@ -2071,7 +2236,7 @@ impl KsMcp {
                     Err(m) => return err(m),
                 };
                 let limit = p.limit.unwrap_or(20).max(1) as usize;
-                with_store(&self.store, move |store| match store.proposal_outcomes(principal, limit) {
+                with_store(&self.store, scope, move |store| match store.proposal_outcomes(principal, limit) {
                     Ok(rows) => ok_json(&json!({
                         "principal": principal,
                         "proposals": rows
@@ -2106,7 +2271,7 @@ impl KsMcp {
                     Err(m) => return err(m),
                 };
                 let limit = p.limit.unwrap_or(50).max(1) as usize;
-                with_store(&self.store, move |store| match store.review_queue(doc_id) {
+                with_store(&self.store, scope, move |store| match store.review_queue(doc_id) {
                     Ok(q) => {
                         let total = q.len();
                         let mut items: Vec<Value> = q.iter().take(limit).map(|e| json!(e)).collect();
@@ -2171,7 +2336,10 @@ impl ServerHandler for KsMcp {
              Surgical block ops: propose. Tree: doc_op(op: rename|move|status|delete|merge) \
              — yellows, delete always red. create_doc(if_exists: 'reuse') is find-or-create.\n\
              proposals(kind: 'mine') shows what happened to yours; 'pending' what awaits a \
-             human. Human-only, never here: review policy, shares, trust, gardeners.",
+             human. Human-only, never here: review policy, shares, trust, gardeners. \
+             Workspace names are yours: your own wins over one shared with you; an \
+             ambiguous name answers with the candidates' ids. Writes into a shared \
+             workspace always land flagged for its members.",
         )
     }
 }
@@ -2185,7 +2353,7 @@ pub const MAX_MCP_BODY: usize = 16 * 1024 * 1024;
 /// (None = keyword-only, the tools say so).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn router(
-    store: Arc<Mutex<SqliteStore>>,
+    store: taisce_store::SharedStore,
     agent: Uuid,
     dedupe: DedupeCache,
     embedder: Option<Arc<crate::embed::Embedder>>,
@@ -2196,7 +2364,7 @@ pub fn router(
 /// `router` with rmcp's inbound Host allowlist replaced: server mode adds the
 /// public host (rmcp's default admits loopback names only).
 pub fn router_with_hosts(
-    store: Arc<Mutex<SqliteStore>>,
+    store: taisce_store::SharedStore,
     agent: Uuid,
     dedupe: DedupeCache,
     embedder: Option<Arc<crate::embed::Embedder>>,
@@ -2204,16 +2372,19 @@ pub fn router_with_hosts(
 ) -> axum::Router {
     let mut config = rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default()
         .with_max_request_body_bytes(MAX_MCP_BODY);
-    if let Some(hosts) = allowed_hosts {
+    if let Some(hosts) = allowed_hosts.clone() {
         config = config.with_allowed_hosts(hosts);
     }
     // one `as` cache for every request: rmcp builds a fresh KsMcp per request
     // on stateless protocol versions, so anything cross-call lives out here
     let names = new_name_cache();
+    // the host allowlist is set exactly in SERVER mode (main.rs)
+    let server_mode = allowed_hosts.is_some();
     let service = StreamableHttpService::new(
         move || {
             Ok(KsMcp::new(store.clone(), agent, dedupe.clone(), names.clone())
-                .with_embedder(embedder.clone()))
+                .with_embedder(embedder.clone())
+                .with_server_mode(server_mode))
         },
         LocalSessionManager::default().into(),
         config,
@@ -2275,15 +2446,15 @@ mod tests {
         let p = Uuid::now_v7();
         let ids: Vec<Uuid> = (0..DEDUPE_CAPACITY).map(|_| Uuid::now_v7()).collect();
         for (i, id) in ids.iter().enumerate() {
-            dedupe_put(&cache, p, *id, json!(i));
+            dedupe_put(&cache, None, p, *id, json!(i));
         }
         let extra = Uuid::now_v7();
-        dedupe_put(&cache, p, extra, json!("new"));
+        dedupe_put(&cache, None, p, extra, json!("new"));
         let n = cache.lock().unwrap().len();
         assert_eq!(n, DEDUPE_CAPACITY / 2 + 1);
-        assert!(dedupe_get(&cache, p, ids[0]).is_none(), "oldest evicted");
-        assert_eq!(dedupe_get(&cache, p, ids[DEDUPE_CAPACITY - 1]), Some(json!(DEDUPE_CAPACITY - 1)), "newest kept");
-        assert_eq!(dedupe_get(&cache, p, extra), Some(json!("new")));
+        assert!(dedupe_get(&cache, None, p, ids[0]).is_none(), "oldest evicted");
+        assert_eq!(dedupe_get(&cache, None, p, ids[DEDUPE_CAPACITY - 1]), Some(json!(DEDUPE_CAPACITY - 1)), "newest kept");
+        assert_eq!(dedupe_get(&cache, None, p, extra), Some(json!("new")));
     }
 
     #[test]
@@ -2298,12 +2469,12 @@ mod tests {
 
         let cache = new_dedupe();
         let p = Uuid::now_v7();
-        dedupe_put(&cache, p, a, json!("once"));
-        assert_eq!(dedupe_get(&cache, p, a), Some(json!("once")));
-        assert!(dedupe_get(&cache, Uuid::now_v7(), a).is_none(), "keyed by principal");
+        dedupe_put(&cache, None, p, a, json!("once"));
+        assert_eq!(dedupe_get(&cache, None, p, a), Some(json!("once")));
+        assert!(dedupe_get(&cache, None, Uuid::now_v7(), a).is_none(), "keyed by principal");
         // age the entry past the TTL
-        cache.lock().unwrap().get_mut(&(p, a)).unwrap().1 = Instant::now() - DEDUPE_TTL - Duration::from_secs(1);
-        assert!(dedupe_get(&cache, p, a).is_none(), "expired");
+        cache.lock().unwrap().get_mut(&(None, p, a)).unwrap().1 = Instant::now() - DEDUPE_TTL - Duration::from_secs(1);
+        assert!(dedupe_get(&cache, None, p, a).is_none(), "expired");
     }
 
     #[test]
@@ -2402,7 +2573,7 @@ mod tests {
             .create_principal(taisce_store::PrincipalKind::Agent, "claude", None)
             .unwrap()
             .id;
-        let app = router(Arc::new(Mutex::new(store)), agent, new_dedupe(), None);
+        let app = router(taisce_store::SharedStore::new(store), agent, new_dedupe(), None);
 
         let send = |body: Vec<u8>| {
             let app = app.clone();
@@ -2453,7 +2624,7 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
-    const NONE: RequestHint = RequestHint { header: None, query_as: None, cwd: None, pinned: None };
+    const NONE: RequestHint = RequestHint { header: None, query_as: None, cwd: None, pinned: None, user: None };
 
     /// `workspace` on search / find_doc / orient / create_doc: subtree
     /// semantics, case-insensitive names, "unsorted", inheritance on create.
@@ -2466,26 +2637,26 @@ mod tests {
         let home = store.create_workspace("Home", None, None, None).unwrap().id;
         let (root, _) = import_markdown(&mut store, "Office", None, tom, "The needle alpha lives here.\n").unwrap();
         import_markdown(&mut store, "Loose Notes", None, tom, "The needle beta lives here.\n").unwrap();
-        store.set_doc_workspace(root, Some(work)).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        store.set_doc_workspace(root, Some(work), tom).unwrap();
+        let store = taisce_store::SharedStore::new(store);
         let mcp = KsMcp::new(store.clone(), agent, new_dedupe(), new_name_cache());
 
         let titles = |v: &Value, key: &str| -> Vec<String> { v.as_array().unwrap().iter().map(|h| h[key].as_str().unwrap().to_string()).collect() };
-        let (_, all) = text_of(mcp.search(Parameters(p(json!({"query": "needle"})))).await.unwrap());
+        let (_, all) = text_of(mcp.search_impl(NONE, p(json!({"query": "needle"}))).await.unwrap());
         assert_eq!(all.as_array().unwrap().len(), 2, "everywhere by default");
-        let (_, w) = text_of(mcp.search(Parameters(p(json!({"query": "needle", "workspace": "WORK"})))).await.unwrap());
+        let (_, w) = text_of(mcp.search_impl(NONE, p(json!({"query": "needle", "workspace": "WORK"}))).await.unwrap());
         assert_eq!(titles(&w, "doc_title"), ["Office"]);
-        let (_, u) = text_of(mcp.search(Parameters(p(json!({"query": "needle", "workspace": "unsorted", "kind": "docs"})))).await.unwrap());
+        let (_, u) = text_of(mcp.search_impl(NONE, p(json!({"query": "needle", "workspace": "unsorted", "kind": "docs"}))).await.unwrap());
         assert_eq!(titles(&u, "title"), ["Loose Notes"]);
-        let (is_err, msg) = text_of(mcp.search(Parameters(p(json!({"query": "needle", "workspace": "Gym"})))).await.unwrap());
+        let (is_err, msg) = text_of(mcp.search_impl(NONE, p(json!({"query": "needle", "workspace": "Gym"}))).await.unwrap());
         assert!(is_err && msg.as_str().unwrap().contains("Work, Home"), "{msg}");
 
-        let (_, f) = text_of(mcp.find_doc(Parameters(p(json!({"query": "o", "workspace": work.to_string()})))).await.unwrap());
+        let (_, f) = text_of(mcp.find_doc_impl(NONE, p(json!({"query": "o", "workspace": work.to_string()}))).await.unwrap());
         assert_eq!(titles(&f, "title"), ["Office"]);
-        let (_, f) = text_of(mcp.find_doc(Parameters(p(json!({"query": "office", "workspace": "home"})))).await.unwrap());
+        let (_, f) = text_of(mcp.find_doc_impl(NONE, p(json!({"query": "office", "workspace": "home"}))).await.unwrap());
         assert!(f.as_array().unwrap().is_empty());
 
-        let (_, map) = raw(mcp.orient(Parameters(p(json!({"workspace": "work"})))).await.unwrap());
+        let (_, map) = raw(mcp.orient_impl(NONE, p(json!({"workspace": "work"}))).await.unwrap());
         assert!(map.starts_with("# Workspace Work — 1 docs"), "{map}");
         assert!(map.contains("Office") && !map.contains("Loose Notes"), "{map}");
 
@@ -2493,11 +2664,11 @@ mod tests {
         let (is_err, child) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "Child", "parent_doc_id": root.to_string(), "verbose": true}))).await.unwrap());
         assert!(!is_err, "{child}");
         let child_id: Uuid = child["id"].as_str().unwrap().parse().unwrap();
-        assert_eq!(store.lock().unwrap().doc_workspace(child_id).unwrap(), Some(work));
+        assert_eq!(store.lock(taisce_store::Scope::System).doc_workspace(child_id).unwrap(), Some(work));
         let (is_err, top) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "Garden", "workspace": "home", "verbose": true}))).await.unwrap());
         assert!(!is_err, "{top}");
         let top_id: Uuid = top["id"].as_str().unwrap().parse().unwrap();
-        assert_eq!(store.lock().unwrap().doc_label(top_id).unwrap(), Some(home));
+        assert_eq!(store.lock(taisce_store::Scope::System).doc_label(top_id).unwrap(), Some(home));
         let (is_err, msg) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "Shed", "parent_doc_id": root.to_string(), "workspace": "Home"}))).await.unwrap());
         assert!(is_err && msg.as_str().unwrap().contains("inherits"), "{msg}");
         let (is_err, _) = text_of(mcp.create_doc_impl(NONE, p(json!({"title": "Deep", "parent_doc_id": root.to_string(), "workspace": "work"}))).await.unwrap());
@@ -2517,33 +2688,33 @@ mod tests {
         let top = store.create_doc("Life", None, tom).unwrap().id;
         let gp = store.create_doc("GP visits", Some(top), tom).unwrap().id;
         let kid = store.create_doc("2026", Some(gp), tom).unwrap().id;
-        store.set_doc_workspace(top, Some(outer)).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        store.set_doc_workspace(top, Some(outer), tom).unwrap();
+        let store = taisce_store::SharedStore::new(store);
         let mcp = KsMcp::new(store.clone(), agent, new_dedupe(), new_name_cache());
         let op = |v: Value| mcp.doc_op_impl(NONE, p(v));
 
         let (is_err, msg) = raw(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": "Health"})).await.unwrap());
         assert!(is_err && msg.contains("create_missing"), "{msg}");
-        assert!(store.lock().unwrap().find_workspace("Health").unwrap().is_none(), "nothing created without create_missing");
+        assert!(store.lock(taisce_store::Scope::System).find_workspace("Health").unwrap().is_none(), "nothing created without create_missing");
 
-        let seq = store.lock().unwrap().latest_change_seq().unwrap();
+        let seq = store.lock(taisce_store::Scope::System).latest_change_seq().unwrap();
         let (is_err, msg) = raw(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": "Health", "create_missing": true})).await.unwrap());
         assert!(!is_err, "{msg}");
         assert!(msg.starts_with("ok · filed “GP visits” under Health (created) · 2 docs"), "{msg}");
-        let health = store.lock().unwrap().find_workspace("health").unwrap().unwrap().id;
+        let health = store.lock(taisce_store::Scope::System).find_workspace("health").unwrap().unwrap().id;
         {
-            let s = store.lock().unwrap();
+            let s = store.lock(taisce_store::Scope::System);
             assert_eq!(s.doc_workspace(kid).unwrap(), Some(health), "the subtree follows");
             assert_eq!(s.doc_workspace(top).unwrap(), Some(outer));
             let rows: Vec<String> = s.changes_since(seq, 100).unwrap().changes.into_iter().filter(|c| c.kind == "tree").map(|c| c.doc_id).collect();
             assert_eq!(rows, [gp.to_string(), kid.to_string()]);
         }
         // a replay within the window answers the first outcome and writes nothing
-        let seq = store.lock().unwrap().latest_change_seq().unwrap();
+        let seq = store.lock(taisce_store::Scope::System).latest_change_seq().unwrap();
         let (_, again) = raw(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": "Health", "create_missing": true})).await.unwrap());
         assert_eq!(again, msg);
-        assert_eq!(store.lock().unwrap().latest_change_seq().unwrap(), seq);
-        assert_eq!(store.lock().unwrap().list_workspaces().unwrap().len(), 2);
+        assert_eq!(store.lock(taisce_store::Scope::System).latest_change_seq().unwrap(), seq);
+        assert_eq!(store.lock(taisce_store::Scope::System).list_workspaces().unwrap().len(), 2);
 
         // an existing name, case-insensitively, by id, then unlabel back to the outer workspace
         let (is_err, msg) = raw(op(json!({"op": "workspace", "doc_id": kid.to_string(), "workspace": "HOME"})).await.unwrap());
@@ -2554,7 +2725,7 @@ mod tests {
         assert_eq!(full["workspace"], "Home");
         let (_, msg) = raw(op(json!({"op": "workspace", "doc_id": top.to_string()})).await.unwrap());
         assert!(msg.contains("now Unsorted"), "{msg}");
-        assert_eq!(store.lock().unwrap().doc_workspace(gp).unwrap(), None);
+        assert_eq!(store.lock(taisce_store::Scope::System).doc_workspace(gp).unwrap(), None);
         let (is_err, _) = raw(op(json!({"op": "workspace", "doc_id": Uuid::now_v7().to_string(), "workspace": health.to_string()})).await.unwrap());
         assert!(is_err, "unknown doc");
     }
@@ -2569,9 +2740,9 @@ mod tests {
         let agent = store.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let (shell, _) = import_markdown(&mut store, "Shell", None, tom, "---\ntags:\n  - ui\n---\n\nDrag the window by its title bar.\n").unwrap();
         import_markdown(&mut store, "Entitlements", None, tom, "The entitlement check runs at login.\n").unwrap();
-        let mcp = KsMcp::new(Arc::new(Mutex::new(store)), agent, new_dedupe(), new_name_cache());
+        let mcp = KsMcp::new(taisce_store::SharedStore::new(store), agent, new_dedupe(), new_name_cache());
 
-        let (is_err, hits) = text_of(mcp.search(Parameters(p(json!({"query": "title bar"})))).await.unwrap());
+        let (is_err, hits) = text_of(mcp.search_impl(NONE, p(json!({"query": "title bar"}))).await.unwrap());
         assert!(!is_err);
         assert_eq!(hits[0]["doc_title"], "Shell");
         assert_eq!(hits[0]["path"], "Shell");
@@ -2579,45 +2750,45 @@ mod tests {
         assert!(hits[0].get("block_id").is_some() && hits[0].get("score").is_some());
         assert!(hits[0].get("block").is_none(), "compact: no full block");
 
-        let (is_err, docs) = text_of(mcp.search(Parameters(p(json!({"query": "title bar", "kind": "docs"})))).await.unwrap());
+        let (is_err, docs) = text_of(mcp.search_impl(NONE, p(json!({"query": "title bar", "kind": "docs"}))).await.unwrap());
         assert!(!is_err);
         assert_eq!(docs[0]["hits"], 1);
-        let (is_err, msg) = text_of(mcp.search(Parameters(p(json!({"query": "x", "kind": "pages"})))).await.unwrap());
+        let (is_err, msg) = text_of(mcp.search_impl(NONE, p(json!({"query": "x", "kind": "pages"}))).await.unwrap());
         assert!(is_err && msg.as_str().unwrap().contains("kind must be"));
 
-        let (is_err, msg) = text_of(mcp.grep(Parameters(p(json!({"pattern": "(oops"})))).await.unwrap());
+        let (is_err, msg) = text_of(mcp.grep_impl(NONE, p(json!({"pattern": "(oops"}))).await.unwrap());
         assert!(is_err && msg.as_str().unwrap().starts_with("invalid regex:"), "{msg}");
-        let (_, out) = text_of(mcp.grep(Parameters(p(json!({"pattern": "title|entitlement"})))).await.unwrap());
+        let (_, out) = text_of(mcp.grep_impl(NONE, p(json!({"pattern": "title|entitlement"}))).await.unwrap());
         assert_eq!(out["total_groups"], 2);
         assert_eq!(out["truncated"], false);
 
-        let (is_err, out) = text_of(mcp.related(Parameters(p(json!({"doc_id": shell.to_string()})))).await.unwrap());
+        let (is_err, out) = text_of(mcp.related_impl(NONE, p(json!({"doc_id": shell.to_string()}))).await.unwrap());
         assert!(!is_err);
         assert_eq!(out["embedder"], false);
         assert!(out["note"].as_str().unwrap().contains("similar"));
         assert!(out["related"].as_array().unwrap().iter().any(|r| r["why"] == "sibling" && r["title"] == "Entitlements"));
-        let (is_err, msg) = text_of(mcp.related(Parameters(p(json!({})))).await.unwrap());
+        let (is_err, msg) = text_of(mcp.related_impl(NONE, p(json!({}))).await.unwrap());
         assert!(is_err && msg.as_str().unwrap().contains("block_id or doc_id"));
         // tags absorbed into related
-        let (is_err, tags) = text_of(mcp.related(Parameters(p(json!({"tags": true})))).await.unwrap());
+        let (is_err, tags) = text_of(mcp.related_impl(NONE, p(json!({"tags": true}))).await.unwrap());
         assert!(!is_err);
         assert_eq!(tags[0]["tag"], "ui");
         assert_eq!(tags[0]["docs"], 1);
-        let (is_err, by) = text_of(mcp.related(Parameters(p(json!({"by": "tag", "tag": "ui"})))).await.unwrap());
+        let (is_err, by) = text_of(mcp.related_impl(NONE, p(json!({"by": "tag", "tag": "ui"}))).await.unwrap());
         assert!(!is_err, "{by}");
         assert_eq!(by[0]["title"], "Shell");
-        let (is_err, _) = text_of(mcp.related(Parameters(p(json!({"by": "tag"})))).await.unwrap());
+        let (is_err, _) = text_of(mcp.related_impl(NONE, p(json!({"by": "tag"}))).await.unwrap());
         assert!(is_err);
         // a block ref anchors related too
         let bid = Uuid::parse_str(hits[0]["block_id"].as_str().unwrap()).unwrap();
-        let (is_err, out) = text_of(mcp.related(Parameters(p(json!({"block_id": short_ref(bid)})))).await.unwrap());
+        let (is_err, out) = text_of(mcp.related_impl(NONE, p(json!({"block_id": short_ref(bid)}))).await.unwrap());
         assert!(!is_err, "{out}");
 
-        let (is_err, map) = text_of(mcp.orient(Parameters(p(json!({})))).await.unwrap());
+        let (is_err, map) = text_of(mcp.orient_impl(NONE, p(json!({}))).await.unwrap());
         assert!(!is_err);
         let map = map.as_str().unwrap();
         assert!(map.starts_with("# Corpus — 2 docs") && map.contains("- Shell · "), "{map}");
-        let (_, deep) = text_of(mcp.orient(Parameters(p(json!({"depth": 5})))).await.unwrap());
+        let (_, deep) = text_of(mcp.orient_impl(NONE, p(json!({"depth": 5}))).await.unwrap());
         assert!(deep.as_str().unwrap().contains("- Shell · "));
     }
 
@@ -2643,6 +2814,7 @@ mod tests {
             query_as: q.map(String::from),
             cwd: cwd.map(String::from),
             pinned: None,
+            user: None,
         };
 
         // precedence
@@ -2662,9 +2834,10 @@ mod tests {
         let e = act(&mut store, Some(&Uuid::now_v7().to_string()), &NONE).unwrap_err();
         assert!(e.contains("no principal with id"), "{e}");
         // never the human or a remote peer — by argument or by header
+        // (by id the refusal is the generic "no principal": it never says whose)
         for (label, as_) in [("human name", "tom".to_string()), ("human id", tom.to_string()), ("remote name", "laptop".into()), ("remote id", peer.to_string())] {
             let e = act(&mut store, Some(&as_), &NONE).unwrap_err();
-            assert!(e.contains("not an agent"), "{label}: {e}");
+            assert!(e.contains("not an agent") || (label.ends_with("id") && e.contains("no principal with id")), "{label}: {e}");
         }
         let e = act(&mut store, None, &hint(Some("tom"), None, None)).unwrap_err();
         assert!(e.contains("not an agent"), "header: {e}");
@@ -2687,13 +2860,13 @@ mod tests {
         let claude = store.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let names = new_name_cache();
         let ghost = Uuid::now_v7();
-        names.lock().unwrap().insert("claude:elsewhere".into(), ghost);
+        names.lock().unwrap().insert(name_key(None, "claude:elsewhere"), ghost);
         assert_eq!(acting_principal(&mut store, &names, Some("claude:elsewhere"), &NONE, claude), Ok(ghost));
         assert!(store.get_principal(ghost).is_err(), "the store never saw it");
 
         let fresh = acting_principal(&mut store, &names, Some("claude:fresh"), &NONE, claude).unwrap();
-        assert_eq!(cached_principal(&names, "claude:fresh"), Some(fresh));
-        assert_eq!(cached_principal(&names, &fresh.to_string()), None, "cached under the string given");
+        assert_eq!(cached_principal(&names, &name_key(None, "claude:fresh")), Some(fresh));
+        assert_eq!(cached_principal(&names, &name_key(None, &fresh.to_string())), None, "cached under the string given");
         // at the creation cap the cached name still resolves (no store scan, no create)
         swap_auto_created_for_test(MAX_AUTO_PRINCIPALS_PER_BOOT);
         assert_eq!(acting_principal(&mut store, &names, Some("claude:fresh"), &NONE, claude), Ok(fresh));
@@ -2701,7 +2874,7 @@ mod tests {
     }
 
     struct Fx {
-        store: Arc<Mutex<SqliteStore>>,
+        store: taisce_store::SharedStore,
         mcp: KsMcp,
         doc: Uuid,
         tom: Uuid,
@@ -2715,17 +2888,17 @@ mod tests {
         let tom = store.create_principal(taisce_store::PrincipalKind::Human, "tom", None).unwrap().id;
         let claude = store.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let (doc, _) = import_markdown(&mut store, "2026-09-10", None, tom, md).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = taisce_store::SharedStore::new(store);
         let mcp = KsMcp::new(store.clone(), claude, new_dedupe(), new_name_cache());
         Fx { store, mcp, doc, tom, claude }
     }
 
     impl Fx {
         fn export(&self) -> String {
-            taisce_store::export::export_doc(&*self.store.lock().unwrap(), self.doc).unwrap()
+            taisce_store::export::export_doc(&*self.store.lock(taisce_store::Scope::System), self.doc).unwrap()
         }
         fn epoch(&self) -> i64 {
-            self.store.lock().unwrap().get_doc(self.doc).unwrap().current_epoch
+            self.store.lock(taisce_store::Scope::System).get_doc(self.doc).unwrap().current_epoch
         }
         async fn edit(&self, v: Value) -> (bool, String) {
             let mut v = v;
@@ -2740,7 +2913,7 @@ mod tests {
         async fn read(&self, v: Value) -> (bool, String) {
             let mut v = v;
             v["doc_id"] = json!(self.doc.to_string());
-            raw(self.mcp.read_doc(Parameters(p(v))).await.unwrap())
+            raw(self.mcp.read_doc_impl(NONE, p(v)).await.unwrap())
         }
     }
 
@@ -2753,7 +2926,7 @@ mod tests {
         assert_eq!(out, format!("ok · 1 replace · epoch {e0}→{}", e0 + 1));
         assert!(fx.export().contains("- plan q (done)\n\n## portus"));
         // the op is attributed to the shared default
-        let ops = fx.store.lock().unwrap().ops_since(fx.doc, e0).unwrap();
+        let ops = fx.store.lock(taisce_store::Scope::System).ops_since(fx.doc, e0).unwrap();
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].principal, fx.claude);
         // no-ops
@@ -2854,7 +3027,7 @@ mod tests {
         let (is_err, _) = fx.append(json!({"markdown": "tail"})).await;
         assert!(!is_err);
         assert!(fx.export().ends_with("deep\n\ntail\n"));
-        let shipped = fx.store.lock().unwrap().read_doc(fx.doc).unwrap();
+        let shipped = fx.store.lock(taisce_store::Scope::System).read_doc(fx.doc).unwrap();
         let shipped = locate::content_blocks(&shipped.roots).iter().find(|b| b.content == "- shipped x").unwrap().id;
         let (is_err, out) = fx.append(json!({"markdown": "- shipped y", "to": short_ref(shipped)})).await;
         assert!(!is_err, "{out}");
@@ -2879,7 +3052,7 @@ mod tests {
         let (_, with_refs) = fx.read(json!({"refs": true})).await;
         let body = with_refs.split_once("\n\n").unwrap().1;
         assert!(body.starts_with('^'), "{body}");
-        let tree = fx.store.lock().unwrap().read_doc(fx.doc).unwrap();
+        let tree = fx.store.lock(taisce_store::Scope::System).read_doc(fx.doc).unwrap();
         assert!(taisce_store::mddiff::markdown_to_ops(&tree.roots, body).is_empty());
         let (is_err, out) = raw(
             fx.mcp
@@ -2946,12 +3119,11 @@ mod tests {
         let fx = fixture(DAILY);
         let e0 = fx.epoch();
         // a stale propose against a block someone else changed → non-green lines
-        let tree = fx.store.lock().unwrap().read_doc(fx.doc).unwrap();
+        let tree = fx.store.lock(taisce_store::Scope::System).read_doc(fx.doc).unwrap();
         let plan_q = locate::content_blocks(&tree.roots).iter().find(|b| b.content == "- plan q").unwrap().id;
         let intro = locate::content_blocks(&tree.roots).iter().find(|b| b.content == "intro line").unwrap().id;
         fx.store
-            .lock()
-            .unwrap()
+            .lock(taisce_store::Scope::System)
             .apply(fx.doc, e0, fx.tom, vec![OpInput { kind: OpKind::Replace { target: plan_q, content: "- plan q v2".into() }, source_refs: vec![] }])
             .unwrap();
         let (is_err, out) = raw(
@@ -2994,7 +3166,7 @@ mod tests {
         assert!(!is_err, "{out}");
         assert!(out.starts_with("ok · 1 rename · 1 yellow (flagged) · epoch"), "{out}");
         assert!(out.lines().nth(1).unwrap().starts_with("yellow doc"), "{out}");
-        assert_eq!(fx.store.lock().unwrap().get_doc(fx.doc).unwrap().title, "Renamed");
+        assert_eq!(fx.store.lock(taisce_store::Scope::System).get_doc(fx.doc).unwrap().title, "Renamed");
         let (is_err, out) = raw(fx.mcp.doc_op_impl(NONE, p(json!({"op": "status", "doc_id": fx.doc.to_string(), "status": "decided"}))).await.unwrap());
         assert!(!is_err && out.starts_with("ok · 1 status · 1 yellow"), "{out}");
         let (is_err, out) = raw(fx.mcp.doc_op_impl(NONE, p(json!({"op": "delete", "doc_id": fx.doc.to_string()}))).await.unwrap());
@@ -3007,7 +3179,7 @@ mod tests {
         assert!(is_err && out.contains("op must be"));
         // merge: the other doc into this one
         let other = {
-            let mut s = fx.store.lock().unwrap();
+            let mut s = fx.store.lock(taisce_store::Scope::System);
             import_markdown(&mut *s, "Other", None, fx.tom, "## other\n\nbody\n").unwrap().0
         };
         let (is_err, out) = raw(
@@ -3073,7 +3245,7 @@ mod tests {
         let claude = store.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let (doc, _) = import_markdown(&mut store, "Notes", None, tom, "first\n").unwrap();
         let epoch = store.read_doc(doc).unwrap().doc.current_epoch;
-        let store = Arc::new(Mutex::new(store));
+        let store = taisce_store::SharedStore::new(store);
         let (dedupe, names) = (new_dedupe(), new_name_cache());
         let fresh = || KsMcp::new(store.clone(), claude, dedupe.clone(), names.clone());
         let hint = |q: Option<&str>, cwd: Option<&str>, h: Option<&str>| RequestHint {
@@ -3081,43 +3253,44 @@ mod tests {
             query_as: q.map(String::from),
             cwd: cwd.map(String::from),
             pinned: None,
+            user: None,
         };
 
         let (is_err, out) = raw(fresh().append_impl(NONE, p(json!({"doc_id": doc.to_string(), "markdown": "by task", "as": "claude:proj-task"}))).await.unwrap());
         assert!(!is_err, "{out}");
-        let task = names.lock().unwrap().get("claude:proj-task").copied().expect("as cached");
+        let task = names.lock().unwrap().get(&name_key(None, "claude:proj-task")).copied().expect("as cached");
         assert_ne!(task, claude);
-        let ops = store.lock().unwrap().ops_since(doc, epoch).unwrap();
+        let ops = store.lock(taisce_store::Scope::System).ops_since(doc, epoch).unwrap();
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].principal, task, "the op is attributed to the `as` principal");
 
         // ?as= on the URL
         let (is_err, out) = raw(fresh().append_impl(hint(Some("claude:via-query"), None, None), p(json!({"doc_id": doc.to_string(), "markdown": "by query"}))).await.unwrap());
         assert!(!is_err, "{out}");
-        let ops = store.lock().unwrap().ops_since(doc, epoch).unwrap();
-        assert_eq!(ops[1].principal, agent_principal_by_name(&mut store.lock().unwrap(), "claude:via-query").unwrap());
+        let ops = store.lock(taisce_store::Scope::System).ops_since(doc, epoch).unwrap();
+        assert_eq!(ops[1].principal, agent_principal_by_name(&mut store.lock(taisce_store::Scope::System), "claude:via-query").unwrap());
         // ?cwd=
         let (is_err, out) = raw(fresh().append_impl(hint(None, Some("/Users/me/portus"), None), p(json!({"doc_id": doc.to_string(), "markdown": "by cwd"}))).await.unwrap());
         assert!(!is_err, "{out}");
-        let ops = store.lock().unwrap().ops_since(doc, epoch).unwrap();
-        assert_eq!(ops[2].principal, agent_principal_by_name(&mut store.lock().unwrap(), "claude:portus").unwrap());
+        let ops = store.lock(taisce_store::Scope::System).ops_since(doc, epoch).unwrap();
+        assert_eq!(ops[2].principal, agent_principal_by_name(&mut store.lock(taisce_store::Scope::System), "claude:portus").unwrap());
         // header beats both, `as` beats the header
         let (is_err, _) = raw(fresh().append_impl(hint(Some("claude:q"), Some("/x/c"), Some("claude:hdr")), p(json!({"doc_id": doc.to_string(), "markdown": "by header"}))).await.unwrap());
         assert!(!is_err);
         let (is_err, _) = raw(fresh().append_impl(hint(Some("claude:q"), Some("/x/c"), Some("claude:hdr")), p(json!({"doc_id": doc.to_string(), "markdown": "by arg", "as": "claude:proj-task"}))).await.unwrap());
         assert!(!is_err);
-        let ops = store.lock().unwrap().ops_since(doc, epoch).unwrap();
-        assert_eq!(ops[3].principal, agent_principal_by_name(&mut store.lock().unwrap(), "claude:hdr").unwrap());
+        let ops = store.lock(taisce_store::Scope::System).ops_since(doc, epoch).unwrap();
+        assert_eq!(ops[3].principal, agent_principal_by_name(&mut store.lock(taisce_store::Scope::System), "claude:hdr").unwrap());
         assert_eq!(ops[4].principal, task);
         // no hint, no as → the shared default
         let (is_err, _) = raw(fresh().append_impl(NONE, p(json!({"doc_id": doc.to_string(), "markdown": "by default"}))).await.unwrap());
         assert!(!is_err);
-        assert_eq!(store.lock().unwrap().ops_since(doc, epoch).unwrap()[5].principal, claude);
+        assert_eq!(store.lock(taisce_store::Scope::System).ops_since(doc, epoch).unwrap()[5].principal, claude);
 
         // the human is refused at the tool boundary, nothing written
         let (is_err, msg) = raw(fresh().append_impl(NONE, p(json!({"doc_id": doc.to_string(), "markdown": "nope", "as": "tom"}))).await.unwrap());
         assert!(is_err && msg.contains("not an agent"), "{msg}");
-        assert_eq!(store.lock().unwrap().ops_since(doc, epoch).unwrap().len(), 6);
+        assert_eq!(store.lock(taisce_store::Scope::System).ops_since(doc, epoch).unwrap().len(), 6);
 
         let (_, mine) = text_of(fresh().proposals_impl(NONE, p(json!({"as": "claude:proj-task"}))).await.unwrap());
         assert_eq!(mine["principal"], json!(task));
@@ -3140,7 +3313,7 @@ mod tests {
             let claude = s.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
             (claude, import_markdown(&mut s, "d", None, tom, "first\n").unwrap().0)
         };
-        let boot = || KsMcp::new(Arc::new(Mutex::new(SqliteStore::open(&db).unwrap())), claude, new_dedupe(), new_name_cache());
+        let boot = || KsMcp::new(taisce_store::SharedStore::new(SqliteStore::open(&db).unwrap()), claude, new_dedupe(), new_name_cache());
         let e0 = SqliteStore::open(&db).unwrap().get_doc(doc).unwrap().current_epoch;
         let args = json!({"doc_id": doc.to_string(), "markdown": "once"});
         let (is_err, a) = raw(boot().append_impl(NONE, p(args.clone())).await.unwrap());

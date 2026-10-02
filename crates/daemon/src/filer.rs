@@ -16,7 +16,6 @@ use crate::store_ext::with_store;
 use taisce_store::{BlockStore, ConfidencePolicy, Doc, Gardener, SqliteStore};
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 pub const INBOX_TITLE: &str = "Inbox";
@@ -48,14 +47,11 @@ pub struct FileProposal {
     pub rationale: String,
 }
 
-/// The root doc titled `Inbox`, if a capture ever created it.
+/// The viewer's own root doc titled `Inbox`, if a capture ever created it
+/// (ADR 0004: each person has their own; someone else's shared Inbox is
+/// never it).
 pub fn inbox_id(store: &SqliteStore) -> Option<Uuid> {
-    store
-        .list_docs()
-        .ok()?
-        .into_iter()
-        .find(|d| d.parent_id.is_none() && d.title == INBOX_TITLE)
-        .map(|d| d.id)
+    store.own_root_titled(INBOX_TITLE).ok().flatten().map(|d| d.id)
 }
 
 /// Direct children of the Inbox, oldest first (UUIDv7 ids are time-ordered).
@@ -244,13 +240,14 @@ pub fn apply(
 
 /// One filer run. Same return shape as the other kinds' runners.
 pub async fn run(
-    store: Arc<Mutex<SqliteStore>>,
+    store: taisce_store::SharedStore,
+    scope: taisce_store::Scope,
     g: &Gardener,
     _run_id: Uuid,
 ) -> (String, String, Option<i64>) {
     let composed = {
         let g = g.clone();
-        with_store(&store, move |s| {
+        with_store(&store, scope, move |s| {
             let inbox = inbox_id(s)?;
             let (prompt, notes) = compose(s, &g, inbox);
             Some((inbox, prompt, notes))
@@ -277,7 +274,7 @@ pub async fn run(
     let g = g.clone();
     let n = notes.len();
     let (lines, moved, renamed, tagged) =
-        with_store(&store, move |s| apply(s, &g, inbox, &notes, proposals)).await;
+        with_store(&store, scope, move |s| apply(s, &g, inbox, &notes, proposals)).await;
     (
         "ok".into(),
         format!("notes considered: {n}; filed {moved}, renamed {renamed}, tagged {tagged}\n{}", lines.join("\n")),
@@ -400,12 +397,12 @@ mod tests {
     #[tokio::test]
     async fn no_inbox_or_an_empty_inbox_is_a_no_op_run() {
         let (s, tom, g) = setup();
-        let store = Arc::new(Mutex::new(s));
-        let (status, summary, tokens) = run(store.clone(), &g, Uuid::now_v7()).await;
+        let store = taisce_store::SharedStore::new(s);
+        let (status, summary, tokens) = run(store.clone(), taisce_store::Scope::Local, &g, Uuid::now_v7()).await;
         assert_eq!((status.as_str(), tokens), ("ok", Some(0)));
         assert!(summary.contains("no Inbox"));
-        store.lock().unwrap().create_doc(INBOX_TITLE, None, tom).unwrap();
-        let (status, summary, _) = run(store.clone(), &g, Uuid::now_v7()).await;
+        store.lock(taisce_store::Scope::System).create_doc(INBOX_TITLE, None, tom).unwrap();
+        let (status, summary, _) = run(store.clone(), taisce_store::Scope::Local, &g, Uuid::now_v7()).await;
         assert_eq!(status, "ok");
         assert!(summary.contains("Inbox is empty"), "{summary}");
     }

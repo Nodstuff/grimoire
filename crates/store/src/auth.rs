@@ -178,11 +178,74 @@ impl SqliteStore {
             return Ok(u);
         }
         let id = Uuid::now_v7();
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO auth_users (id, principal_id, name, role, created_at) VALUES (?1, ?2, ?3, 'owner', ?4)",
             params![id.to_string(), principal_id.to_string(), name, now],
         )?;
+        // ADR 0004: a database that served LOCAL first becomes the owner's
+        crate::tenancy::adopt_unowned_conn(&tx, id)?;
+        crate::tenancy::audit_conn(&tx, None, "user.create", &id.to_string(), &serde_json::json!({"name": name, "role": "owner"}))?;
+        tx.commit()?;
         self.auth_user(id)?.ok_or_else(|| StoreError::NotFound(format!("auth user {id}")))
+    }
+
+    /// Add another person (ADR 0004): a `member` user with their own human
+    /// principal. System scope only (the box's CLI). Names are unique
+    /// case-insensitively so `--user <name>` stays unambiguous.
+    pub fn auth_add_user(&mut self, name: &str, now: i64) -> Result<AuthUser> {
+        if self.scope() != crate::Scope::System {
+            return Err(StoreError::Forbidden("users are added on the box's CLI".into()));
+        }
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 64 {
+            return Err(StoreError::InvalidOp("a user's name must be 1..64 characters".into()));
+        }
+        crate::tenancy::check_person_name(name)?;
+        if crate::tenancy::name_taken_conn(&self.conn, name, None)? {
+            return Err(StoreError::InvalidOp(format!("the name {name:?} is taken (a person or an agent has it)")));
+        }
+        if self.auth_owner()?.is_none() {
+            return Err(StoreError::InvalidOp("no owner yet: serve once in server mode (or `auth enroll`) first".into()));
+        }
+        let principal = Uuid::now_v7();
+        let id = Uuid::now_v7();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO principals (id, kind, display_name, name_key) VALUES (?1, 'human', ?2, ?3)",
+            params![principal.to_string(), name, crate::tenancy::name_key(name)],
+        )
+        .map_err(crate::tenancy::name_conflict)?;
+        tx.execute(
+            "INSERT INTO auth_users (id, principal_id, name, role, created_at) VALUES (?1, ?2, ?3, 'member', ?4)",
+            params![id.to_string(), principal.to_string(), name, now],
+        )?;
+        crate::tenancy::audit_conn(&tx, None, "user.create", &id.to_string(), &serde_json::json!({"name": name, "role": "member"}))?;
+        tx.commit()?;
+        self.auth_user(id)?.ok_or_else(|| StoreError::NotFound(format!("auth user {id}")))
+    }
+
+    /// A user by id, unique id prefix, or (case-insensitive) name.
+    /// A user by id, unique id prefix, or (case-insensitive) name — only
+    /// when exactly one user matches.
+    pub fn auth_find_user(&self, key: &str) -> Result<Option<AuthUser>> {
+        let mut hits = self.auth_users_matching(key)?;
+        Ok(if hits.len() == 1 { hits.pop() } else { None })
+    }
+
+    /// Every user a key could mean: by name (case-insensitive), else by id
+    /// prefix. The CLI prints them when there is not exactly one.
+    pub fn auth_users_matching(&self, key: &str) -> Result<Vec<AuthUser>> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Ok(Vec::new());
+        }
+        let users = self.auth_users()?;
+        let by_name: Vec<AuthUser> = users.iter().filter(|u| u.name.eq_ignore_ascii_case(key)).cloned().collect();
+        if !by_name.is_empty() {
+            return Ok(by_name);
+        }
+        Ok(users.into_iter().filter(|u| u.id.to_string().starts_with(&key.to_lowercase())).collect())
     }
 
     pub fn auth_owner(&self) -> Result<Option<AuthUser>> {
@@ -369,6 +432,64 @@ impl SqliteStore {
     }
 
     // ---- clients ----
+
+    /// Is this client the person's own app (first party)?
+    pub fn oauth_is_first_party(&self, client_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM oauth_first_party WHERE client_id = ?1)",
+            [client_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Mark a client first party (the server's own fixed app client).
+    pub fn oauth_mark_first_party(&mut self, client_id: &str, now: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO oauth_first_party (client_id, added_at) VALUES (?1, ?2)",
+            params![client_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Once per database: the DCR clients registered before first-party
+    /// clients were pinned whose every redirect is the app's scheme become
+    /// first party, so the app's live sessions keep working. Returns how
+    /// many; later registrations never go through here.
+    pub fn oauth_grandfather_first_party(&mut self, app_redirect: &str, now: i64) -> Result<usize> {
+        const KEY: &str = "auth.first_party_grandfathered";
+        let done: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [KEY], |r| r.get(0))
+            .optional()?;
+        if done.is_some() {
+            return Ok(0);
+        }
+        // only clients someone actually signed in with: the app's exact
+        // redirect AND a live grant (unrevoked, with an unexpired refresh
+        // token). A registration nobody completed — anyone could DCR the
+        // scheme before this build — is never pinned.
+        let rows: Vec<(String, String)> = {
+            let mut st = self.conn.prepare(
+                "SELECT c.client_id, c.redirect_uris FROM oauth_clients c
+                 WHERE c.kind = 'dcr' AND EXISTS (
+                     SELECT 1 FROM oauth_grants g JOIN oauth_refresh_tokens t ON t.grant_id = g.id
+                     WHERE g.client_id = c.client_id AND g.revoked_at IS NULL AND t.expires_at > ?1)",
+            )?;
+            st.query_map([now], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        let mut n = 0;
+        for (id, uris) in rows {
+            let uris: Vec<String> = serde_json::from_str(&uris).unwrap_or_default();
+            if uris.len() == 1 && uris[0] == app_redirect {
+                tx.execute("INSERT OR IGNORE INTO oauth_first_party (client_id, added_at) VALUES (?1, ?2)", params![id, now])?;
+                n += 1;
+            }
+        }
+        tx.execute("INSERT INTO settings (key, value) VALUES (?1, '1') ON CONFLICT (key) DO NOTHING", [KEY])?;
+        tx.commit()?;
+        Ok(n)
+    }
 
     pub fn oauth_upsert_client(&mut self, c: &OAuthClient) -> Result<()> {
         self.conn.execute(
