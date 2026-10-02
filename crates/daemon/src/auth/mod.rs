@@ -370,13 +370,15 @@ pub fn valid_token_name(name: &str) -> anyhow::Result<&str> {
 
 /// Mint a personal access token for `user` (or the owner). The secret is
 /// returned once and stored only as its hash; the audit line names the
-/// token, never its value.
+/// token, never its value. With `hash` (a token minted elsewhere, by its
+/// lowercase-hex SHA-256) nothing is minted and no secret is returned.
 pub fn create_api_token(
     store: &mut SqliteStore,
     user: Option<&str>,
     name: &str,
+    hash: Option<&str>,
     now: i64,
-) -> anyhow::Result<(taisce_store::auth::ApiToken, String)> {
+) -> anyhow::Result<(taisce_store::auth::ApiToken, Option<String>)> {
     let name = valid_token_name(name)?;
     let user_id = match user.map(str::trim) {
         None => store.auth_owner()?.ok_or_else(|| anyhow::anyhow!("no owner yet: serve once in server mode"))?.id,
@@ -392,9 +394,20 @@ pub fn create_api_token(
             }
         }
     };
-    let secret = new_api_token();
-    let t = store.auth_create_api_token(user_id, name, &hash_secret(&secret), now)?;
-    tracing::info!(target: AUDIT, event = "pat.create", token = %t.id, name = t.name, user = %t.user_id);
+    let (hash, secret) = match hash.map(str::trim) {
+        Some(h) => {
+            if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                anyhow::bail!("--hash: 64 lowercase hex chars (sha256 of the tsk_… token)");
+            }
+            (h.to_string(), None)
+        }
+        None => {
+            let secret = new_api_token();
+            (hash_secret(&secret), Some(secret))
+        }
+    };
+    let t = store.auth_create_api_token(user_id, name, &hash, now)?;
+    tracing::info!(target: AUDIT, event = "pat.create", token = %t.id, name = t.name, user = %t.user_id, minted_here = secret.is_some());
     Ok((t, secret))
 }
 

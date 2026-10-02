@@ -812,7 +812,8 @@ async fn devices_need_the_owners_app_token() {
 
 impl H {
     fn pat(&self, name: &str) -> (taisce_store::auth::ApiToken, String) {
-        create_api_token(&mut self.st.store.lock().unwrap(), None, name, now()).unwrap()
+        let (t, secret) = create_api_token(&mut self.st.store.lock().unwrap(), None, name, None, now()).unwrap();
+        (t, secret.unwrap())
     }
 }
 
@@ -955,7 +956,8 @@ fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
 #[tokio::test(flavor = "multi_thread")]
 async fn pat_secrets_never_reach_the_log_or_the_list() {
     let h = harness();
-    let ((t, secret), log) = logged(|| create_api_token(&mut h.st.store.lock().unwrap(), None, "laptop", now()).unwrap());
+    let ((t, secret), log) = logged(|| create_api_token(&mut h.st.store.lock().unwrap(), None, "laptop", None, now()).unwrap());
+    let secret = secret.unwrap();
     assert!(log.contains("pat.create") && log.contains(&t.id.to_string()), "{log}");
     assert!(!log.contains(&secret) && !log.contains(&secret[4..]), "{log}");
     assert!(!log.contains(&hash_secret(&secret)), "{log}");
@@ -985,5 +987,21 @@ fn token_names() {
     }
     for bad in ["", " ", "has space", "tsk_x", "slash/no", &"x".repeat(41)] {
         assert!(valid_token_name(bad).is_err(), "{bad:?}");
+    }
+}
+
+/// A token minted on the laptop is registered by its hash alone: the box
+/// never sees the secret, yet the secret opens /mcp.
+#[tokio::test]
+async fn a_pat_registered_by_hash_opens_mcp() {
+    let h = harness();
+    let secret = new_api_token();
+    let (t, none) =
+        create_api_token(&mut h.st.store.lock().unwrap(), None, "laptop", Some(&hash_secret(&secret)), now()).unwrap();
+    assert!(none.is_none());
+    let who = authenticate_pat(&h.st, &secret, "1.2.3.4".into()).await.unwrap();
+    assert_eq!((who.user_id, who.grant_id), (h.owner, t.id));
+    for bad in ["", "abc", &"A".repeat(64), &format!("{}g", "a".repeat(63))] {
+        assert!(create_api_token(&mut h.st.store.lock().unwrap(), None, "other", Some(bad), now()).is_err(), "{bad:?}");
     }
 }
