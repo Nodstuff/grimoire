@@ -1220,10 +1220,12 @@ async fn first_party_is_a_pinned_client_not_a_declared_redirect() {
         s.oauth_issue_grant(None, &grant, &hash_secret(&tok), now() + 3600, &hash_secret(&random_token()), now() + 86400).unwrap();
         tok
     };
+    // (round 4: an unpinned app-redirect client is a lapsed app client — its
+    // tokens are not accepted at all, so the app re-registers as taisce-app)
     let (st, _) = fx.call(&sneaky, "POST", "/api/devices", Some(json!({"token": "ab".repeat(32), "platform": "ios"}))).await;
-    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
     let (st, _) = fx.call(&sneaky, "POST", &format!("/api/doc/{}/rename", fx.b_doc), Some(json!({"title": "x"}))).await;
-    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
     // grandfathering (round 3): only the app's exact redirect AND a live
     // grant. Tom's iPhone and Mac (signed in, refresh tokens live) carry
     // over; a registration nobody signed in with, or a revoked one, does not;

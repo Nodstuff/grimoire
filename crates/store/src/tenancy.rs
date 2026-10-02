@@ -275,14 +275,29 @@ pub(crate) fn name_taken_conn(conn: &Connection, name: &str, except: Option<Uuid
     // closes the race between two writers
     let key = name_key(name);
     let except = except.map(|e| e.to_string());
+    // a legacy human principal from before people had keys (NULL name_key,
+    // no user row) is the instance owner's own: it never blocks the owner
+    let renamer_is_owner: bool = match &except {
+        Some(p) => conn.query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM auth_users WHERE principal_id = ?1 AND id = {INSTANCE_OWNER_SQL})"),
+            params![p],
+            |r| r.get(0),
+        )?,
+        None => false,
+    };
     let mut st = conn.prepare_cached(
-        "SELECT id, display_name FROM principals
-         UNION ALL SELECT principal_id, name FROM auth_users",
+        "SELECT id, display_name,
+                kind = 'human' AND name_key IS NULL AND id NOT IN (SELECT principal_id FROM auth_users)
+         FROM principals
+         UNION ALL SELECT principal_id, name, 0 FROM auth_users",
     )?;
-    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))?;
     for row in rows {
-        let (id, n) = row?;
-        if Some(&id) != except.as_ref() && name_key(&n) == key {
+        let (id, n, legacy_own) = row?;
+        if Some(&id) == except.as_ref() || (legacy_own && renamer_is_owner) {
+            continue;
+        }
+        if name_key(&n) == key {
             return Ok(true);
         }
     }

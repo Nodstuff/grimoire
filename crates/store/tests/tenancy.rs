@@ -1080,3 +1080,32 @@ fn r3_confusable_names_are_taken() {
     // the index closes the race: a second human with the same key cannot be inserted
     assert!(t.store.lock(Scope::System).create_principal(PrincipalKind::Human, "tom", None).is_err());
 }
+
+/// Round-4 nit: renaming yourself back to your own name always works, even
+/// beside a legacy duplicate of your own (a pre-key human principal with no
+/// user row — the instance owner's), while another person still cannot.
+#[test]
+fn renaming_back_to_your_own_name_never_clashes_with_yourself() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ks.db");
+    let (a_human, b_human) = {
+        let mut s = SqliteStore::open(&path).unwrap();
+        let a_human = s.create_principal(PrincipalKind::Human, "Tom", None).unwrap().id;
+        s.auth_ensure_owner(a_human, "Tom", 1).unwrap();
+        let b = s.auth_add_user("Aoife", 2).unwrap();
+        (a_human, b.principal_id)
+    };
+    // a legacy row from before name keys: a second "Tom" human, no key, no user
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("INSERT INTO principals (id, kind, display_name) VALUES (?1, 'human', 'Tom')", [Uuid::now_v7().to_string()])
+        .unwrap();
+    let store = SharedStore::new(SqliteStore::open(&path).unwrap());
+    let owner = store.lock(Scope::System).instance_owner().unwrap().unwrap();
+    let mut s = store.lock(Scope::User(owner));
+    s.rename_principal(a_human, "Tom").expect("back to his own name");
+    s.rename_principal(a_human, "TOM").expect("case only");
+    drop(s);
+    let b = store.lock(Scope::System).auth_find_user("Aoife").unwrap().unwrap().id;
+    assert!(store.lock(Scope::User(b)).rename_principal(b_human, "tom").is_err(), "never another person's");
+}

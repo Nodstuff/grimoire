@@ -228,6 +228,26 @@ pub const APP_REDIRECT_URI: &str = "ie.null.taisce:/oauth/callback";
 /// client and refuses any other use of the scheme.
 pub const FIRST_PARTY_APP_CLIENT: &str = "taisce-app";
 
+/// A "lapsed" app client (ADR 0004, review round 4): a DCR client whose
+/// only redirect is the app's, but which is not pinned first party — a
+/// device whose grant had lapsed (or was revoked) when the one-time
+/// grandfathering ran. It must look UNKNOWN everywhere the unchanged app
+/// asks, so the app re-registers on its own and gets `taisce-app`: the app's
+/// probe (`OAuthClient.clientIsKnown`, GET /oauth/authorize without PKCE)
+/// re-registers on a 400; a refresh answers `invalid_client`; its old access
+/// tokens answer 401. Otherwise its next sign-in would mint a connector token
+/// for the person's own app, forever.
+pub fn lapsed_app_client(s: &SqliteStore, client_id: &str) -> bool {
+    if client_id == FIRST_PARTY_APP_CLIENT {
+        return false;
+    }
+    let Ok(Some(c)) = s.oauth_client(client_id) else { return false };
+    c.kind == "dcr"
+        && c.redirect_uris.len() == 1
+        && c.redirect_uris[0] == APP_REDIRECT_URI
+        && !s.oauth_is_first_party(client_id).unwrap_or(false)
+}
+
 /// Register the fixed app client and pin first-party clients (idempotent).
 pub fn ensure_first_party(s: &mut SqliteStore, now: i64) -> taisce_store::Result<()> {
     if s.oauth_client(FIRST_PARTY_APP_CLIENT)?.is_none() {
@@ -338,6 +358,11 @@ pub async fn authenticate(st: &AuthState, token: &str) -> Option<Authenticated> 
     let now = now();
     crate::store_ext::with_store(&st.store, Scope::System, move |s| {
         let grant = s.oauth_access_grant(&hash, now).ok()??;
+        // a lapsed app client's old tokens stop working (the app re-signs in
+        // and re-registers as the pinned app client)
+        if lapsed_app_client(s, &grant.client_id) {
+            return None;
+        }
         let client = s.oauth_client(&grant.client_id).ok().flatten();
         let name = client.as_ref().map(|c| c.client_name.clone()).unwrap_or_default();
         let human = s.auth_user(grant.user_id).ok().flatten()?.principal_id;

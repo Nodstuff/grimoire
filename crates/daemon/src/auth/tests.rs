@@ -1006,3 +1006,79 @@ async fn a_pat_registered_by_hash_opens_mcp() {
         assert!(create_api_token(&mut h.st.store.lock(taisce_store::Scope::System), None, "other", Some(bad), now()).is_err(), "{bad:?}");
     }
 }
+
+
+/// Review round 4: a device whose app grant had lapsed (or been revoked) when
+/// the one-time grandfathering ran must not stay a connector forever. Its DCR
+/// client looks unknown to the unchanged app's probe (400 → re-register), the
+/// register call hands back the pinned `taisce-app`, and the new sign-in is
+/// first party. Its old tokens stop working. A live, grandfathered client is
+/// unaffected.
+#[tokio::test]
+async fn a_lapsed_app_client_re_registers_as_the_pinned_app() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    let t0 = now();
+    let make = |h: &H, id: &str| {
+        let mut s = h.st.store.lock(taisce_store::Scope::System);
+        s.oauth_upsert_client(&taisce_store::auth::OAuthClient {
+            client_id: id.into(),
+            kind: "dcr".into(),
+            client_name: "Taisce".into(),
+            redirect_uris: vec![APP_REDIRECT.into()],
+            metadata: "{}".into(),
+            created_at: t0,
+            refresh_at: None,
+        })
+        .unwrap();
+        let access = random_token();
+        let refresh = random_token();
+        let g = taisce_store::auth::Grant {
+            id: uuid::Uuid::now_v7(),
+            client_id: id.into(),
+            user_id: h.owner,
+            resource: None,
+            scope: SCOPE.into(),
+            created_at: t0,
+            revoked_at: None,
+            revoke_why: None,
+        };
+        s.oauth_issue_grant(None, &g, &hash_secret(&access), t0 + 3600, &hash_secret(&refresh), t0 + 86400).unwrap();
+        (access, refresh)
+    };
+    // the lapsed device: its client exists but was never pinned
+    let (lapsed_access, lapsed_refresh) = make(&h, "dcr_lapsed_ipad");
+    // a live device grandfathered at first start
+    let (live_access, _) = make(&h, "dcr_live_iphone");
+    h.st.store.lock(taisce_store::Scope::System).oauth_mark_first_party("dcr_live_iphone", t0).unwrap();
+    let probe = |id: &str| get(&format!("/oauth/authorize?client_id={id}&redirect_uri={APP_REDIRECT}&response_type=code"));
+    // 1. the app's probe: unknown (400) for the lapsed client, known (a redirect) for the live one
+    assert_eq!(send(&h.app, probe("dcr_lapsed_ipad")).await.status, StatusCode::BAD_REQUEST);
+    let live = send(&h.app, probe("dcr_live_iphone")).await;
+    assert!(live.status.is_redirection(), "{} {}", live.status, live.body);
+    assert!(live.headers["location"].to_str().unwrap().starts_with(APP_REDIRECT));
+    // its old tokens are dead: no lingering connector session
+    let docs = |t: &str| with_bearer(get("/api/docs"), t);
+    assert_eq!(send(&h.app, docs(&lapsed_access)).await.status, StatusCode::UNAUTHORIZED);
+    let r = h.refresh("dcr_lapsed_ipad", &lapsed_refresh).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+    assert!(r.body.contains("invalid_client"), "{}", r.body);
+    // the live one keeps working
+    assert_eq!(send(&h.app, docs(&live_access)).await.status, StatusCode::OK);
+    // 2. the app re-registers: it gets the pinned client
+    let client = h.register("Taisce", APP_REDIRECT).await;
+    assert_eq!(client, FIRST_PARTY_APP_CLIENT);
+    // 3. authorize + token: the new session is first party
+    let code = h.code_for_at(&client, APP_REDIRECT).await;
+    let t = h.exchange_at(&client, &code, VERIFIER, APP_REDIRECT).await;
+    assert_eq!(t.status, StatusCode::OK, "{}", t.body);
+    let access = t.json()["access_token"].as_str().unwrap().to_string();
+    let who = authenticate(&h.st, &access).await.expect("a live token");
+    assert!(who.owner_app, "first party again");
+    let mut req = post_json("/api/devices", json!({"token": "cd".repeat(32), "platform": "ios"}));
+    req.headers_mut().insert(header::AUTHORIZATION, format!("Bearer {access}").parse().unwrap());
+    assert_eq!(send(&h.app, req).await.status, StatusCode::OK, "app powers (device registration) are back");
+    // and a revoked grant behaves the same: its client is unpinned and unknown
+    let (_, _) = make(&h, "dcr_revoked_mac");
+    assert_eq!(send(&h.app, probe("dcr_revoked_mac")).await.status, StatusCode::BAD_REQUEST);
+}

@@ -182,7 +182,15 @@ pub fn clean_name(s: &str) -> String {
 /// document URL, fetched (or served from the cache while fresh).
 pub async fn resolve_client(st: &AuthState, client_id: &str) -> Result<OAuthClient, String> {
     let id = client_id.to_string();
-    let cached = with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_client(&id)).await.map_err(|e| e.to_string())?;
+    let cached = with_store(&st.store, taisce_store::Scope::System, move |s| {
+        if super::lapsed_app_client(s, &id) {
+            // looks unknown: the app's probe re-registers on this 400
+            return Ok(None);
+        }
+        s.oauth_client(&id)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     if !cimd::is_cimd(client_id) {
         return match cached {
             Some(c) if c.kind == "dcr" => Ok(c),
@@ -513,6 +521,12 @@ async fn token(State(st): State<AuthState>, req: Request) -> Response {
     let Some(client_id) = get("client_id") else {
         return oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", "client_id is required (public client)");
     };
+    {
+        let id = client_id.to_string();
+        if with_store(&st.store, taisce_store::Scope::System, move |s| super::lapsed_app_client(s, &id)).await {
+            return oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", "unknown client_id");
+        }
+    }
     if let Some(r) = get("resource")
         && !st.cfg.resource_ok(r)
     {

@@ -222,6 +222,12 @@ gained (the client fetches them).
   unicode-rs crate rustc's confusable lints use); mixed-script names (e.g. Latin + Cyrillic)
   and names carrying invisible characters are refused. `principals.name_key` has a partial
   UNIQUE index for humans, so a CLI and the server cannot race two people into one name.
+- **A lapsed app client re-registers itself (round 4).** A DCR client whose only redirect is
+  the app's but which was not pinned (its grant had lapsed or was revoked when the one-time
+  grandfathering ran) looks unknown everywhere the unchanged app asks: `GET /oauth/authorize`
+  answers the 400 error page (the app's `clientIsKnown` probe then re-registers and gets
+  `taisce-app`), the token endpoint answers `invalid_client`, and its old access tokens 401.
+  It can never keep working as a connector for the person's own app.
 - **Revocation is per grant**: every app sign-in shares the client `taisce-app`; the CLI
   revokes grants and tokens by id, never by client (noted in `taisce auth revoke --help`).
 
