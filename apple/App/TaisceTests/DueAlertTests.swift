@@ -185,6 +185,11 @@ final class StalledAlertCenter: DueAlertCenter {
         }
         let cache = try Cache(path: path)
         try await cache.setLastSeq(1)
+        #if targetEnvironment(macCatalyst)
+        // no protection classes on the Mac: the cache opens without setting one
+        #expect(!Cache.appliesFileProtection)
+        return
+        #endif
         for file in [path, path + "-wal", path + "-shm"] {
             #expect(try protection(file) == .completeUntilFirstUserAuthentication, "\(file)")
         }

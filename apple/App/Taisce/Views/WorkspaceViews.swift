@@ -71,21 +71,51 @@ struct WorkspaceSwitcher: View {
     }
 }
 
+extension EnvironmentValues {
+    /// true under the split view, whose sidebar has the workspace switcher
+    @Entry var sidebarCarriesWorkspaces = false
+}
+
+/// The split view's switcher, at the top of the sidebar.
+struct SidebarWorkspaceRow: View {
+    @Environment(AppModel.self) private var model
+    @State private var creating = false
+    @State private var managing = false
+
+    var body: some View {
+        HStack {
+            WorkspaceSwitcher(picker: model.workspacePicker, onSelect: model.selectWorkspace, onNew: { creating = true }, onManage: { managing = true })
+                .help("Switch workspace (⌘1–⌘9)")
+            Spacer()
+        }
+        .sheet(isPresented: $creating) { NewWorkspaceSheet() }
+        .sheet(isPresented: $managing) { ManageWorkspacesSheet() }
+    }
+}
+
 /// The row above Today, Library and To-dos: the switcher, and (Library in
-/// Unsorted) "Select" for triage.
+/// Unsorted) "Select" for triage. Under the split view the sidebar has the
+/// switcher, so the bar shows only for triage.
 struct WorkspaceBar: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.sidebarCarriesWorkspaces) private var inSidebar
     var triage = false
     @State private var creating = false
     @State private var selecting = false
     @State private var managing = false
 
+    private var showsTriage: Bool {
+        triage && model.currentWorkspace == .unsorted && !model.unsortedDocs.isEmpty
+    }
+
     var body: some View {
-        if model.hasWorkspaces {
+        if model.hasWorkspaces, !inSidebar || showsTriage {
             HStack {
-                WorkspaceSwitcher(picker: model.workspacePicker, onSelect: model.selectWorkspace, onNew: { creating = true }, onManage: { managing = true })
+                if !inSidebar {
+                    WorkspaceSwitcher(picker: model.workspacePicker, onSelect: model.selectWorkspace, onNew: { creating = true }, onManage: { managing = true })
+                }
                 Spacer()
-                if triage, model.currentWorkspace == .unsorted, !model.unsortedDocs.isEmpty {
+                if showsTriage {
                     Button("Select") { selecting = true }
                         .font(.caption.weight(.medium))
                         .foregroundStyle(Theme.accentActive)

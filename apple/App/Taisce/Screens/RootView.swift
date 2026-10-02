@@ -15,7 +15,7 @@ struct RootView: View {
                 LaunchView()
             } else if model.needsSignIn {
                 SignInScreen()
-            } else if sizeClass == .regular {
+            } else if RootLayout.make(horizontal: sizeClass) == .split {
                 PadRoot()
             } else {
                 PhoneRoot()
@@ -27,7 +27,12 @@ struct RootView: View {
         .sheet(isPresented: $router.showNewDoc) {
             NewDocSheet(parent: router.newDocParent).environment(router)
         }
-        .onChange(of: sizeClass, initial: true) { _, size in router.isPad = size == .regular }
+        .onChange(of: sizeClass, initial: true) { _, size in router.isPad = RootLayout.make(horizontal: size) == .split }
+        // the menu bar's commands act on the window in front
+        .focusedSceneValue(\.router, router)
+        #if targetEnvironment(macCatalyst)
+        .background(MacWindowSetup())
+        #endif
         .onChange(of: model.treeLoaded) { _, loaded in
             guard loaded, !appliedLaunchArguments else { return }
             appliedLaunchArguments = true
@@ -36,6 +41,16 @@ struct RootView: View {
         .onChange(of: model.docs.count) {
             if appliedLaunchArguments { _ = router.openLaunchDoc(index: model.index) }
         }
+    }
+}
+
+/// Which root a window shows. Regular width (iPad, every Mac window) gets
+/// the split view; compact width (iPhone, iPad slide-over) the tab bar.
+enum RootLayout: Equatable {
+    case tabs, split
+
+    static func make(horizontal: UserInterfaceSizeClass?) -> RootLayout {
+        horizontal == .regular ? .split : .tabs
     }
 }
 
@@ -99,6 +114,8 @@ struct PadRoot: View {
             }
         }
         .navigationSplitViewStyle(.balanced)
+        // the sidebar carries the switcher; screens drop their bar
+        .environment(\.sidebarCarriesWorkspaces, true)
     }
 
     @ViewBuilder private var detail: some View {
@@ -118,8 +135,13 @@ struct PadSidebar: View {
 
     var body: some View {
         @Bindable var router = router
-        let selection = Binding<PadItem?>(get: { router.padItem }, set: { if let item = $0 { router.select(item) } })
+        let selection = Binding<PadItem?>(get: { router.sidebarSelection }, set: { if let item = $0 { router.select(item) } })
         List(selection: selection) {
+            if model.hasWorkspaces {
+                SidebarWorkspaceRow()
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
+            }
             Section {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass").foregroundStyle(Theme.secondary).accessibilityHidden(true)
@@ -138,8 +160,12 @@ struct PadSidebar: View {
                 .onChange(of: router.searchQuery) { _, q in
                     if !q.isEmpty, router.padItem != .search { router.select(.search) }
                 }
-                Label("Today", systemImage: "house").tag(PadItem.today)
+                .onChange(of: router.searchFocusRequest) { searchFocused = true }
+                // the tag goes last: a badge wrapping it hides it from the
+                // List's selection on the Mac, so Today couldn't be clicked
+                Label("Today", systemImage: "house")
                     .badge(model.dueCount)
+                    .tag(PadItem.today)
                 Label("To-dos", systemImage: "checkmark.circle").tag(PadItem.todos)
             }
             Section("Library") {
@@ -158,19 +184,27 @@ struct PadSidebar: View {
         .navigationTitle("Taisce")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
+                // ⌘N is the menu bar's (TaisceCommands)
                 Button { router.newDoc() } label: { Image(systemName: "square.and.pencil") }
                     .accessibilityLabel("New doc")
-                    .keyboardShortcut("n", modifiers: .command)
+                    .help("New doc (⌘N)")
             }
         }
         .safeAreaInset(edge: .bottom) {
             HStack {
                 SyncChip(badge: SyncBadge.make(status: model.syncStatus, pending: model.pendingWrites))
                 Spacer()
+                // no pull to refresh with a pointer
+                Button { Task { try? await model.sync?.catchUp() } } label: {
+                    Image(systemName: "arrow.clockwise").frame(width: Theme.minTarget, height: Theme.minTarget)
+                }
+                .accessibilityLabel("Refresh")
+                .help("Refresh (⌘R)")
                 Button { router.showSettings = true } label: {
                     Image(systemName: "gearshape").frame(width: Theme.minTarget, height: Theme.minTarget)
                 }
                 .accessibilityLabel("Settings")
+                .help("Settings (⌘,)")
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 6)

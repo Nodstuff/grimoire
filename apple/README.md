@@ -1,4 +1,4 @@
-# Taisce for iPhone, iPad (and later Mac)
+# Taisce for iPhone, iPad and Mac
 
 **Naming:** the product is now **Taisce** (Irish: treasure kept safe). On the
 Apple side that means the app target and display name `Taisce`, the bundle id
@@ -9,8 +9,8 @@ header is `Taisce-Seq` (TaisceKit falls back to the old `X-Grimoire-Seq`).
 The app never sends `Taisce-Principal`: in SERVER mode identity is the token.
 
 A native SwiftUI client for a Grimoire (Taisce) server: a view into its docs with an
-offline cache. No web views for UI. iPhone + iPad first; Mac via Mac Catalyst
-later.
+offline cache. No web views for UI. iPhone and iPad, and the Mac via Mac
+Catalyst from the same target (see **Mac** below).
 
 ## Layout
 
@@ -312,7 +312,7 @@ App (`App/Taisce/Editor/`): `EditorText` maps content ↔ the text view's
 attributed string (list markers are tagged text the caret skips);
 `BlockTextView` handles Backspace at the start, atomic wikilinks, paste
 (markdown into an empty paragraph becomes blocks), checkbox taps and the
-hardware keys (⌘B ⌘I ⌘E, ⌘K link / `[[`, Tab ⇧Tab, ↑↓ between blocks, Esc);
+hardware keys (⌘B ⌘I, ⇧⌘E inline code, ⌘K link / `[[`, Tab ⇧Tab, ↑↓ between blocks, Esc);
 `FormattingBar` is the input accessory; `EditorModel` ties it together.
 Queued edits also show in the reading view until they land.
 
@@ -333,7 +333,48 @@ markdown. `LaunchTests` needs a doc titled "Welcome" headed "Welcome to Taisce".
   an error there (whole-doc diff), so they are not chained.
 - Pins are local (UserDefaults, per server); pinned docs are always fetched by sync.
 - D2 and canvases render as labelled cards; full Vega (not -Lite) too.
-- Mac Catalyst.
+- Mac: one window (no multiple windows or tabs), no Format menu (the
+  formatting bar and ⌘B ⌘I ⇧⌘E ⌘K carry it), not notarized or distributed.
+
+## Mac (Catalyst)
+
+The same `Taisce` target, built for `platform=macOS,variant=Mac Catalyst`.
+
+- Idiom: **Optimize interface for Mac** (`TARGETED_DEVICE_FAMILY` `1,2,6`),
+  not the scaled iPad idiom: text is native size and controls are AppKit's.
+  The editor is `UITextView`, which the Mac idiom supports fully; it only
+  ignores input accessory views, so on the Mac the formatting bar is pinned
+  above the blocks (`EditorChrome.barIsInline`) without Hide keyboard.
+- One bundle id everywhere (`DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER`
+  NO): the APNs topic and the Keychain items are `ie.null.taisce` on the Mac
+  too, and the device registers as `platform: "ios"` (APNs treats a
+  Catalyst token like an iOS one). Signing is automatic; the first build
+  on a new Mac needs `-allowProvisioningUpdates -allowProvisioningDeviceRegistration`.
+- Entitlements: `Support/Taisce-Mac-{Debug,Release}.entitlements` (picked
+  by `CODE_SIGN_ENTITLEMENTS[sdk=macosx*]`) add the App Sandbox with network
+  client only; hardened runtime is on. Xcode signs `aps-environment` as
+  `com.apple.developer.aps-environment` too, and `PushConfig` reads the
+  profile from `Contents/embedded.provisionprofile` with either key.
+- The cache skips data-protection classes on the Mac (`Cache.appliesFileProtection`);
+  the sandbox container and FileVault cover it there.
+- Layout: regular width (every Mac window, iPad) is the split view
+  (`RootLayout`): sidebar with the workspace switcher, search, Today,
+  To-dos and the Library tree; the doc on the right. Compact width (iPhone)
+  keeps the tab bar. Minimum window 820×560, first launch 1280×860; macOS
+  restores the size after that.
+- Menu bar (`TaisceCommands`, routed through the front window's `Router`):
+  ⌘N new doc, ⌘, Settings, Doc › Edit / Done ⌘E and Refresh ⌘R, Go › Search
+  ⌘F, Today, To-dos and the workspaces ⌘1…⌘9. Nothing is enabled before
+  sign-in. ⌘E used to be inline code in the editor; that is now ⇧⌘E. iPad
+  hardware keyboards get the same commands.
+
+```sh
+cd apple/App && xcodegen generate
+xcodebuild -scheme Taisce -destination 'platform=macOS,variant=Mac Catalyst' \
+  -allowProvisioningUpdates -allowProvisioningDeviceRegistration build
+xcodebuild -scheme Taisce -destination 'platform=macOS,variant=Mac Catalyst' \
+  -allowProvisioningUpdates -only-testing:TaisceTests test
+```
 
 ## Charts and diagrams
 

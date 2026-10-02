@@ -48,7 +48,34 @@ struct DocEditorView: View {
             }
         }
         .groundBackground()
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if EditorChrome.barIsInline { InlineFormattingBar(bar: model.formattingBar) }
+        }
         .overlay { CompletionOverlay(model: model) }
+    }
+}
+
+/// Where the formatting bar lives: above the keyboard on iPhone and iPad,
+/// pinned above the blocks on the Mac (no software keyboard, and the Mac
+/// idiom ignores input accessory views).
+enum EditorChrome {
+    static var barIsInline: Bool {
+        #if targetEnvironment(macCatalyst)
+        true
+        #else
+        false
+        #endif
+    }
+}
+
+/// The editor's UIToolbar, hosted in SwiftUI.
+private struct InlineFormattingBar: UIViewRepresentable {
+    let bar: FormattingBar
+
+    func makeUIView(context: Context) -> FormattingBar { bar }
+    func updateUIView(_ view: FormattingBar, context: Context) {}
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: FormattingBar, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? 320, height: 44)
     }
 }
 

@@ -31,9 +31,18 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce
-        TARGETED_DEVICE_FAMILY: "1,2"
-        # Mac Catalyst comes later; flip to YES when the Mac pass starts
-        SUPPORTS_MACCATALYST: NO
+        # 6 = Mac Catalyst with the Mac idiom ("Optimize interface for
+        # Mac"): native-size text and AppKit-style controls, not the iPad
+        # UI scaled to 77%. The editor is UITextView, which the Mac idiom
+        # supports fully (it loses only the input accessory bar; the menu
+        # bar carries those commands instead).
+        TARGETED_DEVICE_FAMILY: "1,2,6"
+        SUPPORTS_MACCATALYST: YES
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        # one bundle id on every platform: the server's APNs topic and
+        # the Keychain items are ie.null.taisce on the Mac too
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+        ENABLE_HARDENED_RUNTIME: YES
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
@@ -48,8 +57,11 @@ targets:
           INFOPLIST_FILE: Support/Info-Debug.plist
           # APNs (push): a Debug build's token is a sandbox one
           CODE_SIGN_ENTITLEMENTS: Support/Taisce-Debug.entitlements
+          # the Mac adds the App Sandbox (network client only)
+          "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": Support/Taisce-Mac-Debug.entitlements
         Release:
           CODE_SIGN_ENTITLEMENTS: Support/Taisce-Release.entitlements
+          "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": Support/Taisce-Mac-Release.entitlements
     info:
       path: Taisce/Info.plist
       properties:
@@ -79,6 +91,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce.tests
         GENERATE_INFOPLIST_FILE: YES
+        SUPPORTS_MACCATALYST: YES
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 6UP35L9425
   TaisceUITests:
@@ -99,6 +113,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce.uitests
         GENERATE_INFOPLIST_FILE: YES
+        SUPPORTS_MACCATALYST: YES
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: 6UP35L9425
         TEST_TARGET_NAME: Taisce

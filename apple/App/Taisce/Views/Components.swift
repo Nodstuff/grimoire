@@ -175,6 +175,7 @@ struct DocCard: View {
         .padding(12)
         .frame(maxWidth: .infinity, minHeight: 92, alignment: .topLeading)
         .card()
+        .hoverWash()
         .contentShape(.rect(cornerRadius: Theme.radius))
         .accessibilityElement(children: .combine)
     }

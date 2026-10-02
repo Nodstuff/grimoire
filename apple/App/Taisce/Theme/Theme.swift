@@ -61,8 +61,27 @@ struct CardBackground: ViewModifier {
     }
 }
 
+/// A faint wash under the pointer (Mac, iPad with a trackpad); touch never sees it.
+struct HoverWash: ViewModifier {
+    var radius: CGFloat = Theme.radius
+    @State private var hovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .overlay {
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .fill(Theme.text.opacity(hovering ? 0.05 : 0))
+                    .allowsHitTesting(false)
+            }
+            .onHover { hovering = $0 }
+            .animation(.easeOut(duration: 0.12), value: hovering)
+    }
+}
+
 extension View {
     func card(_ fill: Color = Theme.surface) -> some View { modifier(CardBackground(fill: fill)) }
+
+    func hoverWash(radius: CGFloat = Theme.radius) -> some View { modifier(HoverWash(radius: radius)) }
 
     /// The screen ground behind scroll content and lists.
     func groundBackground() -> some View {

@@ -257,11 +257,9 @@ final class SystemDueAlertCenter: DueAlertCenter {
     }
 
     func pending() async -> [PlannedAlert] {
-        await withCheckedContinuation { done in
-            center.getPendingNotificationRequests { requests in
-                done.resume(returning: requests.compactMap(Self.plannedAlert(from:)))
-            }
-        }
+        // the async form: a callback closure here would inherit @MainActor
+        // and trap if the system calls it off the main queue
+        await center.pendingNotificationRequests().compactMap(Self.plannedAlert(from:))
     }
 
     func add(_ alert: PlannedAlert) async throws {
