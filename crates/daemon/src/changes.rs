@@ -38,7 +38,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::StreamExt as _;
 use futures_util::stream::{self, Stream};
-use grimoire_store::{Change, SqliteStore};
+use taisce_store::{Change, SqliteStore};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -244,7 +244,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use futures_util::StreamExt;
-    use grimoire_store::{BlockStore, PrincipalKind};
+    use taisce_store::{BlockStore, PrincipalKind};
     use serde_json::Value;
     use tower::ServiceExt;
 

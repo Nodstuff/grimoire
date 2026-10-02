@@ -4,7 +4,7 @@
 //! anything that trashes a doc, red (parked until a human accepts in the
 //! queue).
 
-use grimoire_store::{BlockStore, DocStatus, OpKind, ProposeOutcome, SqliteStore, order_key};
+use taisce_store::{BlockStore, DocStatus, OpKind, ProposeOutcome, SqliteStore, order_key};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -181,19 +181,19 @@ pub fn merge(
     let from_roots: Vec<_> = from_tree
         .roots
         .iter()
-        .filter(|n| !grimoire_store::import::is_frontmatter(&n.block.content))
+        .filter(|n| !taisce_store::import::is_frontmatter(&n.block.content))
         .cloned()
         .collect();
-    let appended = grimoire_store::export::markdown_of(&from_roots, false);
+    let appended = taisce_store::export::markdown_of(&from_roots, false);
     let content_outcome = if appended.trim().is_empty() {
         None
     } else {
-        let mut combined = grimoire_store::export::markdown_of(&into_tree.roots, false);
+        let mut combined = taisce_store::export::markdown_of(&into_tree.roots, false);
         if !combined.is_empty() {
             combined.push('\n');
         }
         combined.push_str(&appended);
-        let ops = grimoire_store::mddiff::markdown_to_ops(&into_tree.roots, &combined);
+        let ops = taisce_store::mddiff::markdown_to_ops(&into_tree.roots, &combined);
         if ops.is_empty() {
             None
         } else {
@@ -219,7 +219,7 @@ pub fn merge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grimoire_store::{
+    use taisce_store::{
         AnnotationKind, AnnotationStatus, BlockStore, PrincipalKind, ReviewDecision, Verdict,
         import::import_markdown,
     };
@@ -240,7 +240,7 @@ mod tests {
         assert_eq!(out.verdicts[0].verdict, Verdict::Yellow);
         assert!(out.verdicts[0].applied);
         assert_eq!(s.get_doc(d.id).unwrap().title, "New");
-        assert!(grimoire_store::export::export_doc(&s, linker).unwrap().contains("[[New]] and [[New|alias]]"));
+        assert!(taisce_store::export::export_doc(&s, linker).unwrap().contains("[[New]] and [[New|alias]]"));
         let q = s.review_queue(Some(d.id)).unwrap();
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].annotation.kind, AnnotationKind::Review);
@@ -248,7 +248,7 @@ mod tests {
 
         s.resolve(q[0].annotation.id, tom, ReviewDecision::Decline).unwrap();
         assert_eq!(s.get_doc(d.id).unwrap().title, "Old");
-        assert!(grimoire_store::export::export_doc(&s, linker).unwrap().contains("[[Old]] and [[Old|alias]]"));
+        assert!(taisce_store::export::export_doc(&s, linker).unwrap().contains("[[Old]] and [[Old|alias]]"));
         assert!(s.review_queue(None).unwrap().is_empty());
         // same title again is a refusal, not a no-op yellow
         assert!(rename(&mut s, d.id, "Old", bot).is_err());
@@ -355,7 +355,7 @@ mod tests {
         let verdicts = out["into"]["verdicts"].as_array().unwrap();
         assert_eq!(verdicts.len(), 2, "heading + paragraph, no frontmatter: {out}");
         assert!(verdicts.iter().all(|v| v["verdict"] == "yellow"));
-        let md = grimoire_store::export::export_doc(&s, into).unwrap();
+        let md = taisce_store::export::export_doc(&s, into).unwrap();
         assert_eq!(md, "---\ntags:\n  - daily\n---\n\n# A\n\none\n\n# B\n\ntwo\n");
         assert!(!s.doc_is_tombstoned(from).unwrap());
         assert_eq!(s.review_queue(None).unwrap().len(), 3);

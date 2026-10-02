@@ -1,4 +1,4 @@
-//! Workspaces over HTTP (store: `grimoire_store::workspaces`). A workspace
+//! Workspaces over HTTP (store: `taisce_store::workspaces`). A workspace
 //! is a label on a doc, inherited by its subtree; unlabelled docs are
 //! Unsorted. Nothing here moves or deletes a doc.
 //!
@@ -30,7 +30,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, put};
 use axum::{Json, Router};
-use grimoire_store::{SqliteStore, StoreError, Workspace, WorkspaceFilter, WorkspacePatch};
+use taisce_store::{SqliteStore, StoreError, Workspace, WorkspaceFilter, WorkspacePatch};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -53,7 +53,7 @@ fn ws_json(w: &Workspace, counts: &HashMap<Option<Uuid>, usize>) -> Value {
     v
 }
 
-fn counts(s: &SqliteStore) -> grimoire_store::Result<HashMap<Option<Uuid>, usize>> {
+fn counts(s: &SqliteStore) -> taisce_store::Result<HashMap<Option<Uuid>, usize>> {
     let mut out = HashMap::new();
     for ws in s.workspace_map()?.into_values() {
         *out.entry(ws).or_default() += 1;
@@ -63,7 +63,7 @@ fn counts(s: &SqliteStore) -> grimoire_store::Result<HashMap<Option<Uuid>, usize
 
 async fn list(State(st): State<ApiState>) -> Response {
     with_store(&st.store, |s| {
-        let run = || -> grimoire_store::Result<Value> {
+        let run = || -> taisce_store::Result<Value> {
             let c = counts(s)?;
             let all: Vec<Value> = s.list_workspaces()?.iter().map(|w| ws_json(w, &c)).collect();
             Ok(json!({"workspaces": all, "unsorted_count": c.get(&None).copied().unwrap_or(0)}))
@@ -203,7 +203,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use grimoire_store::{BlockStore, PrincipalKind};
+    use taisce_store::{BlockStore, PrincipalKind};
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
 
@@ -240,7 +240,7 @@ mod tests {
         let (app, store, human) = app();
         let (a, b, loose) = {
             let mut s = store.lock().unwrap();
-            let ops = |md: &str| grimoire_store::import::to_ops(grimoire_store::import::segment(md));
+            let ops = |md: &str| taisce_store::import::to_ops(taisce_store::import::segment(md));
             let a = s.create_doc("Projects", None, human).unwrap().id;
             let b = s.create_doc_with_ops("Grimoire", Some(a), human, ops("workspace needle here\n")).unwrap().0.id;
             let loose = s.create_doc_with_ops("Loose", None, human, ops("workspace needle there\n")).unwrap().0.id;

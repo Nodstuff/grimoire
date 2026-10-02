@@ -1,6 +1,6 @@
 //! Acceptance tests for #19 links, #24 FTS5 trigram, #25 comments.
 
-use grimoire_store::*;
+use taisce_store::*;
 use uuid::Uuid;
 
 fn seed() -> (SqliteStore, Principal) {

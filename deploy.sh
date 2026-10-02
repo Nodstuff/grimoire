@@ -10,12 +10,12 @@ echo "→ embedding model"
 echo "→ ui build"
 (cd ui && npm run build --silent | tail -1)
 echo "→ daemon release build"
-cargo build --release -p grimoire 2>&1 | tail -1
-cp target/release/grimoire crates/shell/binaries/grimoire-aarch64-apple-darwin
+cargo build --release -p taisce 2>&1 | tail -1
+cp target/release/taisce crates/shell/binaries/grimoire-aarch64-apple-darwin
 echo "→ app bundle"
 (cd crates/shell && ../../ui/node_modules/.bin/tauri build --bundles app 2>&1 | rg "Finished 1 bundle" || true)
 osascript -e 'quit app "Grimoire"' 2>/dev/null; osascript -e 'quit app "knowledge-system"' 2>/dev/null || true
-sleep 1; pkill -f grimoire-shell 2>/dev/null || true; sleep 0.5
+sleep 1; pkill -f taisce-shell 2>/dev/null || true; sleep 0.5
 rm -rf /Applications/knowledge-system.app /Applications/Grimoire.app
 cp -R target/release/bundle/macos/Grimoire.app /Applications/
 # Sign with the Developer ID when one is present (same lookup as release.sh).

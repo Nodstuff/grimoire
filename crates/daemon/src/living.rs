@@ -14,7 +14,7 @@
 use crate::store_ext::with_store;
 use axum::extract::{Path, State};
 use axum::Json;
-use grimoire_store::{AnswerSource, BlockNode, BlockStore, DocTree, OpInput, OpKind, SearchHit, SqliteStore, order_key};
+use taisce_store::{AnswerSource, BlockNode, BlockStore, DocTree, OpInput, OpKind, SearchHit, SqliteStore, order_key};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -51,7 +51,7 @@ pub fn question_frontmatter(question: &str) -> String {
 pub fn question_of(tree: &DocTree) -> Option<String> {
     for n in &tree.roots {
         let c = n.block.content.as_str();
-        if grimoire_store::import::is_frontmatter(c) {
+        if taisce_store::import::is_frontmatter(c) {
             for line in c.lines() {
                 if let Some(v) = line.strip_prefix("question:") {
                     let v = v.trim();
@@ -74,7 +74,7 @@ pub fn question_of(tree: &DocTree) -> Option<String> {
 }
 
 /// Record what an answer rests on, at the epochs it was read.
-pub fn record_sources(store: &mut SqliteStore, answer: Uuid, excerpts: &[SearchHit]) -> grimoire_store::Result<()> {
+pub fn record_sources(store: &mut SqliteStore, answer: Uuid, excerpts: &[SearchHit]) -> taisce_store::Result<()> {
     let rows: Vec<(Uuid, i64)> = excerpts.iter().map(|h| (h.block.id, h.block.epoch)).collect();
     store.record_answer_sources(answer, &rows)
 }
@@ -127,9 +127,9 @@ pub fn refreshable_blocks(store: &SqliteStore, tree: &DocTree, agent: Uuid) -> V
     all.into_iter()
         .filter(|n| n.block.created_by == agent)
         .filter(|n| !touched_by_others.contains(&n.block.id))
-        .filter(|n| !grimoire_store::import::is_frontmatter(&n.block.content))
-        .filter(|n| grimoire_store::import::heading_level(&n.block.content) != Some(1))
-        .filter(|n| n.block.block_type != grimoire_store::BlockType::Comment)
+        .filter(|n| !taisce_store::import::is_frontmatter(&n.block.content))
+        .filter(|n| taisce_store::import::heading_level(&n.block.content) != Some(1))
+        .filter(|n| n.block.block_type != taisce_store::BlockType::Comment)
         .map(|n| n.block.id)
         .collect()
 }
@@ -143,7 +143,7 @@ pub fn refresh_ops(tree: &DocTree, refreshable: &[Uuid], body_md: &str, source_r
     let h1 = tree
         .roots
         .iter()
-        .find(|n| grimoire_store::import::heading_level(&n.block.content) == Some(1));
+        .find(|n| taisce_store::import::heading_level(&n.block.content) == Some(1));
     let (parent, surviving_first) = match h1 {
         Some(h) => (
             Some(h.block.id),
@@ -154,7 +154,7 @@ pub fn refresh_ops(tree: &DocTree, refreshable: &[Uuid], body_md: &str, source_r
             tree.roots
                 .iter()
                 .filter(|n| !gone.contains(&n.block.id))
-                .filter(|n| !grimoire_store::import::is_frontmatter(&n.block.content))
+                .filter(|n| !taisce_store::import::is_frontmatter(&n.block.content))
                 .map(|n| n.block.order_key.clone())
                 .next(),
         ),
@@ -165,7 +165,7 @@ pub fn refresh_ops(tree: &DocTree, refreshable: &[Uuid], body_md: &str, source_r
         .map(|t| OpInput { kind: OpKind::Delete { target: *t }, source_refs: refs.clone() })
         .collect();
     let mut prev: Option<String> = None;
-    for mut op in grimoire_store::import::to_ops(grimoire_store::import::segment(body_md)) {
+    for mut op in taisce_store::import::to_ops(taisce_store::import::segment(body_md)) {
         if let OpKind::Insert { parent_id, order_key, .. } = &mut op.kind
             && parent_id.is_none()
         {
@@ -328,7 +328,7 @@ pub async fn refresh_now(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grimoire_store::{PrincipalKind, Verdict, import::import_markdown};
+    use taisce_store::{PrincipalKind, Verdict, import::import_markdown};
 
     fn seed() -> (Arc<Mutex<SqliteStore>>, Uuid, Uuid, Uuid, Vec<SearchHit>) {
         let mut s = SqliteStore::open_in_memory().unwrap();
@@ -347,7 +347,7 @@ mod tests {
             crate::ask::receipts_markdown(&excerpts)
         );
         let (doc, _) = crate::garden::create_doc_through_gate(
-            &mut s, "how does the grant flow work", Some(answers), agent, &md, grimoire_store::ConfidencePolicy::Gate,
+            &mut s, "how does the grant flow work", Some(answers), agent, &md, taisce_store::ConfidencePolicy::Gate,
         )
         .unwrap();
         record_sources(&mut s, doc, &excerpts).unwrap();
@@ -358,7 +358,7 @@ mod tests {
     fn question_round_trips_through_frontmatter_with_quotes() {
         let q = r#"what did we "decide" about C:\paths?"#;
         let fm = question_frontmatter(q);
-        assert!(grimoire_store::import::is_frontmatter(&fm));
+        assert!(taisce_store::import::is_frontmatter(&fm));
         let mut s = SqliteStore::open_in_memory().unwrap();
         let tom = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
         let (d, _) = import_markdown(&mut s, "A", None, tom, &format!("{fm}\n\n# {q}\n\nbody\n")).unwrap();
@@ -388,7 +388,7 @@ mod tests {
         s.apply(src, epoch, tom, vec![OpInput {
             kind: OpKind::Insert {
                 block_id: Uuid::now_v7(), parent_id: None, order_key: order_key::between(Some("zz"), None),
-                block_type: grimoire_store::BlockType::Paragraph, content: "unrelated addition".into(), refers_to: None,
+                block_type: taisce_store::BlockType::Paragraph, content: "unrelated addition".into(), refers_to: None,
             },
             source_refs: vec![],
         }]).unwrap();
@@ -414,7 +414,7 @@ mod tests {
         s.apply(doc, tree.doc.current_epoch, tom, vec![OpInput {
             kind: OpKind::Insert {
                 block_id: Uuid::now_v7(), parent_id: Some(h1.id), order_key: order_key::between(Some("zzz"), None),
-                block_type: grimoire_store::BlockType::Paragraph, content: "HUMAN NOTE: keep this".into(), refers_to: None,
+                block_type: taisce_store::BlockType::Paragraph, content: "HUMAN NOTE: keep this".into(), refers_to: None,
             },
             source_refs: vec![],
         }]).unwrap();
@@ -433,7 +433,7 @@ mod tests {
         let ops = refresh_ops(&tree, &refreshable, &body, "living-answer: refreshed, 1 of 2 cited blocks changed");
         let out = s.propose_reviewed(doc, tree.doc.current_epoch, agent, ops).unwrap();
         assert!(out.verdicts.iter().all(|v| v.verdict == Verdict::Yellow), "every change is reviewable");
-        let md = grimoire_store::export::export_doc(&*s, doc).unwrap();
+        let md = taisce_store::export::export_doc(&*s, doc).unwrap();
         assert!(md.contains("HUMAN NOTE: keep this"));
         assert!(md.contains("New synthesis."));
         assert!(md.contains("Refreshed "));
@@ -467,7 +467,7 @@ mod tests {
             let st = status(&s, doc);
             assert_eq!(st.changed, 0, "sources re-recorded at their new epochs");
             assert!(s.answer_sources(doc).unwrap().iter().any(|x| x.block_id == excerpts[0].block.id));
-            let md = grimoire_store::export::export_doc(&*s, doc).unwrap();
+            let md = taisce_store::export::export_doc(&*s, doc).unwrap();
             assert!(md.contains("expires fast"), "new receipt text landed: {md}");
             assert!(!md.contains(crate::ask::SYNTH_PLACEHOLDER), "no placeholder without a synthesis");
             let q = s.review_queue(Some(doc)).unwrap();

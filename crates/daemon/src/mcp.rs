@@ -21,8 +21,8 @@
 //! with a one-line verdict (`render_outcome`) unless `verbose`.
 
 use crate::store_ext::with_store;
-use grimoire_store::locate::{self, short_ref};
-use grimoire_store::{Block, BlockNode, BlockStore, OpInput, OpKind, ProposeOutcome, ReviewDecision, SqliteStore};
+use taisce_store::locate::{self, short_ref};
+use taisce_store::{Block, BlockNode, BlockStore, OpInput, OpKind, ProposeOutcome, ReviewDecision, SqliteStore};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
@@ -194,7 +194,7 @@ pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uu
         .and_then(|ps| ps.into_iter().find(|pr| pr.display_name == name));
     if let Some(pr) = existing {
         return match pr.kind {
-            grimoire_store::PrincipalKind::Agent => Ok(pr.id),
+            taisce_store::PrincipalKind::Agent => Ok(pr.id),
             kind => Err(format!(
                 "{name:?} is the {} principal, not an agent: agents cannot act as it",
                 kind.as_str()
@@ -208,7 +208,7 @@ pub fn agent_principal_by_name(store: &mut SqliteStore, name: &str) -> Result<Uu
         ));
     }
     let pr = store
-        .create_principal(grimoire_store::PrincipalKind::Agent, name, None)
+        .create_principal(taisce_store::PrincipalKind::Agent, name, None)
         .map_err(|e| e.to_string())?;
     AUTO_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(pr.id)
@@ -364,7 +364,7 @@ pub fn acting_principal(
     }
     let id = match Uuid::parse_str(key) {
         Ok(id) => match store.get_principal(id) {
-            Ok(pr) if pr.kind == grimoire_store::PrincipalKind::Agent => id,
+            Ok(pr) if pr.kind == taisce_store::PrincipalKind::Agent => id,
             Ok(pr) => {
                 return Err(format!(
                     "as: {id} is the {} principal {:?}, not an agent: agents cannot act as it",
@@ -569,9 +569,9 @@ fn plural(n: usize, word: &str) -> String {
 pub fn render_outcome(ops: &[OpInput], out: &ProposeOutcome, before: i64) -> String {
     let mut parts: Vec<String> = Vec::new();
     let applied = out.verdicts.iter().filter(|v| v.applied).count();
-    let greens = out.verdicts.iter().filter(|v| v.verdict == grimoire_store::Verdict::Green).count();
-    let yellows = out.verdicts.iter().filter(|v| v.verdict == grimoire_store::Verdict::Yellow).count();
-    let reds = out.verdicts.iter().filter(|v| v.verdict == grimoire_store::Verdict::Red).count();
+    let greens = out.verdicts.iter().filter(|v| v.verdict == taisce_store::Verdict::Green).count();
+    let yellows = out.verdicts.iter().filter(|v| v.verdict == taisce_store::Verdict::Yellow).count();
+    let reds = out.verdicts.iter().filter(|v| v.verdict == taisce_store::Verdict::Red).count();
     parts.push(if applied == 0 && reds > 0 { "parked" } else { "ok" }.to_string());
 
     // op kinds, in first-seen order
@@ -604,7 +604,7 @@ pub fn render_outcome(ops: &[OpInput], out: &ProposeOutcome, before: i64) -> Str
     }
     let mut text = parts.join(" · ");
 
-    for v in out.verdicts.iter().filter(|v| v.verdict != grimoire_store::Verdict::Green) {
+    for v in out.verdicts.iter().filter(|v| v.verdict != taisce_store::Verdict::Green) {
         let target = v.block_id.map(short_ref).unwrap_or_else(|| "doc".into());
         let note = v.note.trim();
         text.push('\n');
@@ -708,7 +708,7 @@ fn finish(
     principal: Uuid,
     key: Uuid,
     ops: &[OpInput],
-    res: grimoire_store::Result<ProposeOutcome>,
+    res: taisce_store::Result<ProposeOutcome>,
     before: i64,
     verbose: bool,
 ) -> Result<CallToolResult, McpError> {
@@ -958,7 +958,7 @@ fn flatten(nodes: &[BlockNode], depth: usize, out: &mut Vec<FlatBlock>) {
 }
 
 /// `doc <uuid> · epoch <N> · <Folder › Sub › Title>`.
-fn doc_header(store: &SqliteStore, doc: &grimoire_store::Doc) -> String {
+fn doc_header(store: &SqliteStore, doc: &taisce_store::Doc) -> String {
     let path = store
         .list_docs()
         .ok()
@@ -992,7 +992,7 @@ fn render_blocks(blocks: &[&Block], refs: bool) -> String {
 fn render_comments(store: &SqliteStore, roots: &[BlockNode]) -> String {
     fn walk<'a>(nodes: &'a [BlockNode], out: &mut Vec<&'a Block>) {
         for n in nodes {
-            if n.block.block_type == grimoire_store::BlockType::Comment {
+            if n.block.block_type == taisce_store::BlockType::Comment {
                 out.push(&n.block);
             }
             walk(&n.children, out);
@@ -1204,8 +1204,8 @@ impl KsMcp {
             };
             let named = ws.map(|w| {
                 let name = match w {
-                    grimoire_store::WorkspaceFilter::Unsorted => "Unsorted".to_string(),
-                    grimoire_store::WorkspaceFilter::Id(id) => store.get_workspace(id).map(|w| w.name).unwrap_or_default(),
+                    taisce_store::WorkspaceFilter::Unsorted => "Unsorted".to_string(),
+                    taisce_store::WorkspaceFilter::Id(id) => store.get_workspace(id).map(|w| w.name).unwrap_or_default(),
                 };
                 (w, name)
             });
@@ -1594,7 +1594,7 @@ impl KsMcp {
             for r in ranges.iter().rev() {
                 new_md = locate::splice_replace(&new_md, r.clone(), &p.new);
             }
-            let ops = grimoire_store::mddiff::markdown_to_ops_from(&tree.roots, &new_md, "edit_doc");
+            let ops = taisce_store::mddiff::markdown_to_ops_from(&tree.roots, &new_md, "edit_doc");
             if ops.is_empty() {
                 return no_changes(epoch);
             }
@@ -1659,7 +1659,7 @@ impl KsMcp {
             }
             text.push_str(p.markdown.trim_matches('\n'));
             let new_md = locate::splice_insert(&export, landing.offset, &text);
-            let ops = grimoire_store::mddiff::markdown_to_ops_from(&tree.roots, &new_md, "append");
+            let ops = taisce_store::mddiff::markdown_to_ops_from(&tree.roots, &new_md, "append");
             if ops.is_empty() {
                 return no_changes(epoch);
             }
@@ -1764,7 +1764,7 @@ impl KsMcp {
                     summary.join(", ")
                 ));
             }
-            let ops = grimoire_store::mddiff::markdown_to_ops(&tree.roots, &p.markdown);
+            let ops = taisce_store::mddiff::markdown_to_ops(&tree.roots, &p.markdown);
             if ops.is_empty() {
                 return no_changes(tree.doc.current_epoch);
             }
@@ -1830,7 +1830,7 @@ impl KsMcp {
                 Ok(docs) => docs.into_iter().find(|d| d.parent_id == parent && d.title == title),
                 Err(e) => return err(e.to_string()),
             };
-            let render = |d: &grimoire_store::Doc, reused: bool| {
+            let render = |d: &taisce_store::Doc, reused: bool| {
                 let full = json!({"id": d.id, "title": d.title, "parent_id": d.parent_id, "epoch": d.current_epoch, "reused": reused});
                 let text = format!(
                     "ok · {} “{}” · doc {} · epoch {}",
@@ -1855,7 +1855,7 @@ impl KsMcp {
                 .markdown
                 .as_deref()
                 .filter(|m| !m.trim().is_empty())
-                .map(|m| grimoire_store::import::to_ops(grimoire_store::import::segment(m)))
+                .map(|m| taisce_store::import::to_ops(taisce_store::import::segment(m)))
                 .unwrap_or_default();
             match store.create_doc_with_ops(&title, parent, principal, ops) {
                 Ok((d, _)) => {
@@ -2228,7 +2228,7 @@ pub fn router_with_hosts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grimoire_store::import::import_markdown;
+    use taisce_store::import::import_markdown;
 
     pub const TOOLS: [&str; 16] = [
         "find_doc",
@@ -2396,7 +2396,7 @@ mod tests {
 
         let mut store = SqliteStore::open_in_memory().unwrap();
         let agent = store
-            .create_principal(grimoire_store::PrincipalKind::Agent, "claude", None)
+            .create_principal(taisce_store::PrincipalKind::Agent, "claude", None)
             .unwrap()
             .id;
         let app = router(Arc::new(Mutex::new(store)), agent, new_dedupe(), None);
@@ -2457,8 +2457,8 @@ mod tests {
     #[tokio::test]
     async fn workspace_params_filter_reads_and_label_creates() {
         let mut store = SqliteStore::open_in_memory().unwrap();
-        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
-        let agent = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let tom = store.create_principal(taisce_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let agent = store.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let work = store.create_workspace("Work", None, None, None).unwrap().id;
         let home = store.create_workspace("Home", None, None, None).unwrap().id;
         let (root, _) = import_markdown(&mut store, "Office", None, tom, "The needle alpha lives here.\n").unwrap();
@@ -2508,8 +2508,8 @@ mod tests {
     #[tokio::test]
     async fn doc_op_workspace_files_and_unfiles_a_subtree() {
         let mut store = SqliteStore::open_in_memory().unwrap();
-        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
-        let agent = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let tom = store.create_principal(taisce_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let agent = store.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let outer = store.create_workspace("Home", None, None, None).unwrap().id;
         let top = store.create_doc("Life", None, tom).unwrap().id;
         let gp = store.create_doc("GP visits", Some(top), tom).unwrap().id;
@@ -2562,8 +2562,8 @@ mod tests {
     #[tokio::test]
     async fn ax_tools_return_compact_shapes_and_clear_errors() {
         let mut store = SqliteStore::open_in_memory().unwrap();
-        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
-        let agent = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let tom = store.create_principal(taisce_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let agent = store.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let (shell, _) = import_markdown(&mut store, "Shell", None, tom, "---\ntags:\n  - ui\n---\n\nDrag the window by its title bar.\n").unwrap();
         import_markdown(&mut store, "Entitlements", None, tom, "The entitlement check runs at login.\n").unwrap();
         let mcp = KsMcp::new(Arc::new(Mutex::new(store)), agent, new_dedupe(), new_name_cache());
@@ -2627,10 +2627,10 @@ mod tests {
         let _serial = AUTO_CREATED_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = swap_auto_created_for_test(0);
         let mut store = SqliteStore::open_in_memory().unwrap();
-        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
-        let peer = store.create_principal(grimoire_store::PrincipalKind::Remote, "laptop", None).unwrap().id;
-        let claude = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
-        let session = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude:session", None).unwrap().id;
+        let tom = store.create_principal(taisce_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let peer = store.create_principal(taisce_store::PrincipalKind::Remote, "laptop", None).unwrap().id;
+        let claude = store.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let session = store.create_principal(taisce_store::PrincipalKind::Agent, "claude:session", None).unwrap().id;
         let names = new_name_cache();
         let act = |store: &mut SqliteStore, as_: Option<&str>, hint: &RequestHint| {
             acting_principal(store, &names, as_, hint, claude)
@@ -2681,7 +2681,7 @@ mod tests {
         let _serial = AUTO_CREATED_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = swap_auto_created_for_test(0);
         let mut store = SqliteStore::open_in_memory().unwrap();
-        let claude = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let claude = store.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let names = new_name_cache();
         let ghost = Uuid::now_v7();
         names.lock().unwrap().insert("claude:elsewhere".into(), ghost);
@@ -2709,8 +2709,8 @@ mod tests {
 
     fn fixture(md: &str) -> Fx {
         let mut store = SqliteStore::open_in_memory().unwrap();
-        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
-        let claude = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let tom = store.create_principal(taisce_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let claude = store.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let (doc, _) = import_markdown(&mut store, "2026-09-10", None, tom, md).unwrap();
         let store = Arc::new(Mutex::new(store));
         let mcp = KsMcp::new(store.clone(), claude, new_dedupe(), new_name_cache());
@@ -2719,7 +2719,7 @@ mod tests {
 
     impl Fx {
         fn export(&self) -> String {
-            grimoire_store::export::export_doc(&*self.store.lock().unwrap(), self.doc).unwrap()
+            taisce_store::export::export_doc(&*self.store.lock().unwrap(), self.doc).unwrap()
         }
         fn epoch(&self) -> i64 {
             self.store.lock().unwrap().get_doc(self.doc).unwrap().current_epoch
@@ -2877,7 +2877,7 @@ mod tests {
         let body = with_refs.split_once("\n\n").unwrap().1;
         assert!(body.starts_with('^'), "{body}");
         let tree = fx.store.lock().unwrap().read_doc(fx.doc).unwrap();
-        assert!(grimoire_store::mddiff::markdown_to_ops(&tree.roots, body).is_empty());
+        assert!(taisce_store::mddiff::markdown_to_ops(&tree.roots, body).is_empty());
         let (is_err, out) = raw(
             fx.mcp
                 .propose_markdown_impl(NONE, p(json!({"doc_id": fx.doc.to_string(), "base_epoch": fx.epoch(), "markdown": body})))
@@ -2891,7 +2891,7 @@ mod tests {
         assert!(!is_err, "{out}");
         assert!(out.lines().nth(1).unwrap() == "section qompass › Plans", "{out}");
         let body = out.split_once("\n\n").unwrap().1;
-        assert_eq!(grimoire_store::mddiff::strip_block_markers(body), "### Plans\n\n- plan q\n");
+        assert_eq!(taisce_store::mddiff::strip_block_markers(body), "### Plans\n\n- plan q\n");
         let (is_err, out) = fx.read(json!({"section": "Plans"})).await;
         assert!(is_err && out.contains("ambiguous"), "{out}");
 
@@ -3066,8 +3066,8 @@ mod tests {
         let _serial = AUTO_CREATED_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = swap_auto_created_for_test(0);
         let mut store = SqliteStore::open_in_memory().unwrap();
-        let tom = store.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
-        let claude = store.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+        let tom = store.create_principal(taisce_store::PrincipalKind::Human, "tom", None).unwrap().id;
+        let claude = store.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
         let (doc, _) = import_markdown(&mut store, "Notes", None, tom, "first\n").unwrap();
         let epoch = store.read_doc(doc).unwrap().doc.current_epoch;
         let store = Arc::new(Mutex::new(store));
@@ -3133,8 +3133,8 @@ mod tests {
         let db = dir.join("ks.db");
         let (claude, doc) = {
             let mut s = SqliteStore::open(&db).unwrap();
-            let tom = s.create_principal(grimoire_store::PrincipalKind::Human, "tom", None).unwrap().id;
-            let claude = s.create_principal(grimoire_store::PrincipalKind::Agent, "claude", None).unwrap().id;
+            let tom = s.create_principal(taisce_store::PrincipalKind::Human, "tom", None).unwrap().id;
+            let claude = s.create_principal(taisce_store::PrincipalKind::Agent, "claude", None).unwrap().id;
             (claude, import_markdown(&mut s, "d", None, tom, "first\n").unwrap().0)
         };
         let boot = || KsMcp::new(Arc::new(Mutex::new(SqliteStore::open(&db).unwrap())), claude, new_dedupe(), new_name_cache());
@@ -3147,7 +3147,7 @@ mod tests {
         assert_eq!(a, b, "the replay is the original verdict");
         let s = SqliteStore::open(&db).unwrap();
         assert_eq!(s.get_doc(doc).unwrap().current_epoch, e0 + 1, "applied once");
-        assert_eq!(grimoire_store::export::export_doc(&s, doc).unwrap().matches("once").count(), 1);
+        assert_eq!(taisce_store::export::export_doc(&s, doc).unwrap().matches("once").count(), 1);
         // create_doc, doc_op and add_comment replay across a restart too
         let (is_err, c1) = raw(boot().create_doc_impl(NONE, p(json!({"title": "From the phone"}))).await.unwrap());
         assert!(!is_err, "{c1}");

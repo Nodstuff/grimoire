@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
-use grimoire_store::auth::{AuthCode, CodeOutcome, Grant, OAuthClient, RefreshOutcome};
+use taisce_store::auth::{AuthCode, CodeOutcome, Grant, OAuthClient, RefreshOutcome};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Digest as _;

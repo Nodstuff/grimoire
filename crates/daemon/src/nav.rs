@@ -3,7 +3,7 @@
 //! unit-testable without a store; the MCP tools in `mcp.rs` are thin
 //! wrappers (`find_doc`, and the `doc <id> · epoch · path` header of `read_doc`).
 
-use grimoire_store::{Doc, DocStatus};
+use taisce_store::{Doc, DocStatus};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;

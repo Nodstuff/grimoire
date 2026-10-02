@@ -58,7 +58,7 @@ fn port_ok(p: &str) -> bool {
 /// shell's `data:` error page probes; see `NULL_ORIGIN_GETS`.
 pub fn origin_is_local(origin: &str) -> bool {
     let origin = origin.trim();
-    if origin == "tauri://localhost" || origin.starts_with("grimoire-shell://") {
+    if origin == "tauri://localhost" || origin.starts_with("taisce-shell://") {
         return true;
     }
     let rest = origin

@@ -16,7 +16,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
-use grimoire_store::auth::AuthCredential;
+use taisce_store::auth::AuthCredential;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;

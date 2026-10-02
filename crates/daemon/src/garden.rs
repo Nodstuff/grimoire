@@ -7,7 +7,7 @@
 //! proposals, which land as reviewable verdicts with provenance (the
 //! injection firewall is the gate, §3.4).
 
-use grimoire_store::{
+use taisce_store::{
     BlockStore, ConfidencePolicy, Gardener, GardenerKind, OpInput, OpKind, SqliteStore, order_key,
 };
 use crate::store_ext::with_store;
@@ -65,7 +65,7 @@ pub struct RunOutcome {
 }
 
 /// Compose the tagging gardener's prompt: untagged docs + existing vocabulary.
-fn compose_tagging(store: &SqliteStore, g: &Gardener) -> grimoire_store::Result<(String, usize)> {
+fn compose_tagging(store: &SqliteStore, g: &Gardener) -> taisce_store::Result<(String, usize)> {
     let vocab: Vec<String> = store.list_tags()?.into_iter().map(|(t, _)| t).collect();
     let docs = store.untagged_docs(DOCS_PER_RUN)?;
     let mut sections = Vec::new();
@@ -78,8 +78,8 @@ fn compose_tagging(store: &SqliteStore, g: &Gardener) -> grimoire_store::Result<
         }
         let tree = store.read_doc(doc.id)?;
         let mut preview = String::new();
-        let mut walk = |nodes: &[grimoire_store::BlockNode]| {
-            fn rec(nodes: &[grimoire_store::BlockNode], out: &mut String) {
+        let mut walk = |nodes: &[taisce_store::BlockNode]| {
+            fn rec(nodes: &[taisce_store::BlockNode], out: &mut String) {
                 for n in nodes {
                     for line in n.block.content.lines().take(3) {
                         out.push_str(line);
@@ -410,7 +410,7 @@ pub(crate) fn tag_ops(
     doc_id: Uuid,
     add: &[String],
     refs: Vec<String>,
-) -> grimoire_store::Result<Vec<OpInput>> {
+) -> taisce_store::Result<Vec<OpInput>> {
     let tree = store.read_doc(doc_id)?;
     let tags_yaml = |tags: &[String]| {
         let items: Vec<String> = tags.iter().map(|t| format!("  - {t}")).collect();
@@ -443,7 +443,7 @@ pub(crate) fn tag_ops(
                 block_id: Uuid::now_v7(),
                 parent_id: None,
                 order_key: order_key::between(None, first_key),
-                block_type: grimoire_store::BlockType::Code,
+                block_type: taisce_store::BlockType::Code,
                 content: format!("---\ntags:\n{}\n---", tags_yaml(add)),
                 refers_to: None,
             },
@@ -516,16 +516,16 @@ fn compose_audit(
     store: &SqliteStore,
     g: &Gardener,
     scope: Uuid,
-) -> grimoire_store::Result<(String, usize, Vec<Uuid>)> {
+) -> taisce_store::Result<(String, usize, Vec<Uuid>)> {
     let docs = store.audit_candidates(g.principal, scope, AUDIT_DOCS_PER_RUN)?;
     let mut sections = Vec::new();
     let mut doc_ids = Vec::new();
     for doc in &docs {
         let tree = store.read_doc(doc.id)?;
         let mut body = String::new();
-        fn rec(nodes: &[grimoire_store::BlockNode], out: &mut String) {
+        fn rec(nodes: &[taisce_store::BlockNode], out: &mut String) {
             for n in nodes {
-                if n.block.block_type != grimoire_store::BlockType::Comment {
+                if n.block.block_type != taisce_store::BlockType::Comment {
                     out.push_str(&format!(
                         "[block {}]
 {}
@@ -874,9 +874,9 @@ fn parse_scribe_docs(result: &str) -> Result<Vec<ScribeDoc>, String> {
     Ok(docs)
 }
 
-fn scope_outline(store: &SqliteStore, scope: Uuid) -> grimoire_store::Result<String> {
+fn scope_outline(store: &SqliteStore, scope: Uuid) -> taisce_store::Result<String> {
     let docs = store.doc_subtree(scope)?;
-    let by_id: std::collections::HashMap<Uuid, &grimoire_store::Doc> =
+    let by_id: std::collections::HashMap<Uuid, &taisce_store::Doc> =
         docs.iter().map(|d| (d.id, d)).collect();
     let mut out = String::new();
     for d in &docs {
@@ -940,9 +940,9 @@ async fn run_scribe(
                     && let Ok(tree) = s.read_doc(doc.id)
                 {
                     let mut body = String::new();
-                    fn rec(nodes: &[grimoire_store::BlockNode], out: &mut String) {
+                    fn rec(nodes: &[taisce_store::BlockNode], out: &mut String) {
                         for n in nodes {
-                            if n.block.block_type != grimoire_store::BlockType::Comment {
+                            if n.block.block_type != taisce_store::BlockType::Comment {
                                 out.push_str(&n.block.content);
                                 out.push_str("\n\n");
                             }
@@ -1125,12 +1125,12 @@ pub(crate) fn create_doc_through_gate(
     principal: Uuid,
     md: &str,
     policy: ConfidencePolicy,
-) -> grimoire_store::Result<(Uuid, grimoire_store::ProposeOutcome)> {
-    use grimoire_store::import::{segment, to_ops};
+) -> taisce_store::Result<(Uuid, taisce_store::ProposeOutcome)> {
+    use taisce_store::import::{segment, to_ops};
     let doc = s.create_doc(title, parent, principal)?;
     let ops = to_ops(segment(md));
     let outcome = if ops.is_empty() {
-        grimoire_store::ProposeOutcome { doc_id: doc.id, epoch: 0, verdicts: vec![] }
+        taisce_store::ProposeOutcome { doc_id: doc.id, epoch: 0, verdicts: vec![] }
     } else {
         match policy {
             ConfidencePolicy::Review => s.propose_reviewed(doc.id, 0, principal, ops)?,
@@ -1141,13 +1141,13 @@ pub(crate) fn create_doc_through_gate(
 }
 
 /// "3 green / 1 yellow / 0 red" for a run-log line.
-pub(crate) fn verdict_counts(out: &grimoire_store::ProposeOutcome) -> String {
+pub(crate) fn verdict_counts(out: &taisce_store::ProposeOutcome) -> String {
     let mut c = (0, 0, 0);
     for v in &out.verdicts {
         match v.verdict {
-            grimoire_store::Verdict::Green => c.0 += 1,
-            grimoire_store::Verdict::Yellow => c.1 += 1,
-            grimoire_store::Verdict::Red => c.2 += 1,
+            taisce_store::Verdict::Green => c.0 += 1,
+            taisce_store::Verdict::Yellow => c.1 += 1,
+            taisce_store::Verdict::Red => c.2 += 1,
         }
     }
     format!("{} green / {} yellow / {} red", c.0, c.1, c.2)
@@ -1288,9 +1288,9 @@ pub async fn run_gardener(store: Arc<Mutex<SqliteStore>>, g: Gardener) -> RunOut
                 Ok(out) => {
                     for v in &out.verdicts {
                         match v.verdict {
-                            grimoire_store::Verdict::Green => counts.0 += 1,
-                            grimoire_store::Verdict::Yellow => counts.1 += 1,
-                            grimoire_store::Verdict::Red => counts.2 += 1,
+                            taisce_store::Verdict::Green => counts.0 += 1,
+                            taisce_store::Verdict::Yellow => counts.1 += 1,
+                            taisce_store::Verdict::Red => counts.2 += 1,
                         }
                     }
                     lines.push(format!(
@@ -1396,7 +1396,7 @@ mod scribe_parse_tests {
 #[cfg(test)]
 mod gate_path_tests {
     use super::*;
-    use grimoire_store::PrincipalKind;
+    use taisce_store::PrincipalKind;
 
     #[test]
     fn new_docs_land_through_the_gate_with_a_verdict_on_every_block() {
@@ -1440,7 +1440,7 @@ mod gate_path_tests {
 #[cfg(test)]
 mod freshness_tests {
     use super::*;
-    use grimoire_store::{PrincipalKind, import::import_markdown};
+    use taisce_store::{PrincipalKind, import::import_markdown};
 
     #[test]
     fn a_no_finding_evaluation_verifies_the_doc_and_a_finding_does_not() {
@@ -1476,7 +1476,7 @@ mod freshness_tests {
         assert!(s.audit_candidates(g.principal, scope.id, 10).unwrap().is_empty());
         // the human accepting the parked fix verifies the flagged doc
         let q = s.review_queue(Some(flagged)).unwrap();
-        s.resolve(q[0].annotation.id, tom, grimoire_store::ReviewDecision::Accept).unwrap();
+        s.resolve(q[0].annotation.id, tom, taisce_store::ReviewDecision::Accept).unwrap();
         assert!(s.doc_verified_at(flagged).unwrap().is_some());
     }
 }

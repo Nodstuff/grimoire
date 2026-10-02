@@ -181,7 +181,7 @@ pub async fn backup_loop(db_path: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grimoire_store::{BlockStore, PrincipalKind, SqliteStore};
+    use taisce_store::{BlockStore, PrincipalKind, SqliteStore};
     use std::sync::{Arc, Mutex};
 
     #[test]

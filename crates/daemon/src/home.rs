@@ -14,7 +14,7 @@ use crate::store_ext::with_store;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use grimoire_store::{BlockStore, PrincipalKind};
+use taisce_store::{BlockStore, PrincipalKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -151,7 +151,7 @@ pub(crate) mod testing {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use grimoire_store::SqliteStore;
+    use taisce_store::SqliteStore;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
 

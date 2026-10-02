@@ -15,7 +15,7 @@
 //!
 //! Runs at start and every 10 minutes; `POST /api/memory/sync` for now.
 
-use grimoire_store::{BlockStore, SqliteStore};
+use taisce_store::{BlockStore, SqliteStore};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -151,7 +151,7 @@ fn find_child(store: &SqliteStore, parent: Option<Uuid>, title: &str) -> Option<
         .map(|d| d.id)
 }
 
-fn ensure_folder(store: &mut SqliteStore, parent: Option<Uuid>, title: &str, principal: Uuid) -> grimoire_store::Result<Uuid> {
+fn ensure_folder(store: &mut SqliteStore, parent: Option<Uuid>, title: &str, principal: Uuid) -> taisce_store::Result<Uuid> {
     if let Some(id) = find_child(store, parent, title) {
         return Ok(id);
     }
@@ -185,7 +185,7 @@ pub fn scan(root: &Path) -> HashMap<String, Vec<PathBuf>> {
 /// Every file is read BEFORE the store is locked, and the lock is taken per
 /// doc: a sync across dozens of projects never holds the UI for its whole
 /// duration.
-pub fn sync(store: &Arc<Mutex<SqliteStore>>, root: &Path, human: Uuid) -> grimoire_store::Result<SyncReport> {
+pub fn sync(store: &Arc<Mutex<SqliteStore>>, root: &Path, human: Uuid) -> taisce_store::Result<SyncReport> {
     let files = scan(root);
     let mut report = SyncReport { projects: files.len(), ..Default::default() };
     // phase 1: disk, no lock
@@ -225,7 +225,7 @@ pub fn sync(store: &Arc<Mutex<SqliteStore>>, root: &Path, human: Uuid) -> grimoi
             }
             match find_child(&s, Some(folder), &title) {
                 None => {
-                    let (doc_id, _) = grimoire_store::import::import_markdown(&mut *s, &title, Some(folder), agent, &doc_md)?;
+                    let (doc_id, _) = taisce_store::import::import_markdown(&mut *s, &title, Some(folder), agent, &doc_md)?;
                     // provenance on the import's ops: they were created green by
                     // import; record the origin on the doc's first op via a
                     // no-op-safe setting alongside the hash
@@ -234,7 +234,7 @@ pub fn sync(store: &Arc<Mutex<SqliteStore>>, root: &Path, human: Uuid) -> grimoi
                 }
                 Some(doc_id) => {
                     let tree = s.read_doc(doc_id)?;
-                    let mut ops = grimoire_store::mddiff::markdown_to_ops(&tree.roots, &doc_md);
+                    let mut ops = taisce_store::mddiff::markdown_to_ops(&tree.roots, &doc_md);
                     if ops.is_empty() {
                         report.unchanged += 1;
                     } else {
@@ -277,7 +277,7 @@ pub async fn memory_loop(store: Arc<Mutex<SqliteStore>>, human: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grimoire_store::PrincipalKind;
+    use taisce_store::PrincipalKind;
 
     #[test]
     fn project_names_drop_the_account_prefix_and_scratch_dirs() {
@@ -324,7 +324,7 @@ mod tests {
             let doc = docs.iter().find(|d| d.title == "Thing" && d.parent_id == Some(proj.id)).unwrap();
             let tree = s.read_doc(doc.id).unwrap();
             // the heading parents the body (heading-stack rule): search the whole tree
-            fn texts(ns: &[grimoire_store::BlockNode], out: &mut Vec<String>) {
+            fn texts(ns: &[taisce_store::BlockNode], out: &mut Vec<String>) {
                 for n in ns {
                     out.push(n.block.content.clone());
                     texts(&n.children, out);

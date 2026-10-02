@@ -30,7 +30,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
-use grimoire_store::SqliteStore;
+use taisce_store::SqliteStore;
 use sha2::Digest as _;
 use std::sync::{Arc, Mutex};
 use webauthn_rs::prelude::Url;

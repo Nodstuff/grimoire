@@ -24,7 +24,7 @@ account may be flipped to the work account by other sessions — push with
 ## Start here
 - **[[Roadmap]]** in Grimoire (under the `[[Grimoire]]` tree) is the outstanding list — read it first in any
   new session; the daily doc carries narrative, the roadmap carries the work.
-- Test with `cargo test -p grimoire -p grimoire-store` (the shell crate's build.rs needs the sidecar
+- Test with `cargo test -p taisce -p taisce-store` (the shell crate's build.rs needs the sidecar
   binary; a bare workspace `cargo test` fails in a fresh worktree). In a fresh worktree the daemon
   also needs `ui/dist/` to exist (rust-embed): `mkdir -p ui/dist && touch ui/dist/index.html` or
   copy the main checkout's `ui/dist` before `cargo test`. Then `cd ui && npx vitest run`.
@@ -33,7 +33,7 @@ account may be flipped to the work account by other sessions — push with
   switched this shared checkout); `release.sh` enforces this and tags the exact HEAD.
 - Big builds: a fresh general-purpose agent (forks inherit the whole conversation and die on
   context), in an isolated worktree if a release may build concurrently; commit as you go.
-- The server target must keep building: `cargo zigbuild --release -p grimoire --target
+- The server target must keep building: `cargo zigbuild --release -p taisce --target
   aarch64-unknown-linux-gnu`; ship it with the `infra` branch's SSM deploy. Never point a test
   daemon at the server or at `~/.grimoire`.
 
@@ -50,9 +50,9 @@ account may be flipped to the work account by other sessions — push with
   Lockstep families (Tiptap) move together. Toolchains count (rustup update).
 - `cargo test` (daemon + store) and `cd ui && npx vitest run` before committing.
 - **Before any live smoke test: `cd <repo> && cargo build --release`** — `cargo test`/debug
-  builds do not refresh `target/release/grimoire`; a stale scratch daemon has burned hours.
+  builds do not refresh `target/release/taisce`; a stale scratch daemon has burned hours.
   The shell cwd drifts into `ui/` after npm commands; always `cd` to the repo root first.
-- Scratch daemons (LOCAL mode): `HOME=<dir> ./target/release/grimoire --db <dir>/ks.db --port 751x serve`
+- Scratch daemons (LOCAL mode): `HOME=<dir> ./target/release/taisce --db <dir>/ks.db --port 751x serve`
   (`--port` is global; the UI is embedded, no `GRIMOIRE_UI_DIST` needed). Admin routes need
   `-H "X-Grimoire-Admin: $(cat <dir>/admin.token)"`. Add `--public-url https://…` for SERVER
   mode. Never point one at `~/.grimoire`.

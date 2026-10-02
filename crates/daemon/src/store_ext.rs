@@ -7,7 +7,7 @@
 //! hands the result back; the Mutex type and the store signatures stay as
 //! they are.
 
-use grimoire_store::{BlockStore, PrincipalKind, SqliteStore};
+use taisce_store::{BlockStore, PrincipalKind, SqliteStore};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -46,7 +46,7 @@ pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
 
 /// The agent principal ask-the-vault, living answers and memory sync write
 /// under ("scribe"), created on first use.
-pub fn scribe_principal(store: &mut SqliteStore) -> grimoire_store::Result<Uuid> {
+pub fn scribe_principal(store: &mut SqliteStore) -> taisce_store::Result<Uuid> {
     const NAME: &str = "scribe";
     if let Some(p) = store
         .list_principals()?

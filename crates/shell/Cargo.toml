@@ -1,5 +1,5 @@
 [package]
-name = "grimoire-shell"
+name = "taisce-shell"
 version = "0.8.0"
 edition = "2021"
 license = "MIT"

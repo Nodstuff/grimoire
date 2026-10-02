@@ -2,7 +2,7 @@
 //! out of every read surface, imports are atomic, the change
 //! stamp sees every docs mutation.
 
-use grimoire_store::*;
+use taisce_store::*;
 use uuid::Uuid;
 
 fn seed() -> (SqliteStore, Principal) {

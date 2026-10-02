@@ -32,7 +32,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, post};
 use axum::{Extension, Json, Router};
 use base64::Engine as _;
-use grimoire_store::SqliteStore;
+use taisce_store::SqliteStore;
 use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
 use serde::Deserialize;
@@ -517,7 +517,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use grimoire_store::{BlockStore, PrincipalKind};
+    use taisce_store::{BlockStore, PrincipalKind};
     use serde_json::Value;
     use tower::ServiceExt;
 
@@ -775,7 +775,7 @@ mod tests {
 /// Live check against the APNs sandbox with a real key and a bogus token:
 /// `400 BadDeviceToken` proves TLS, HTTP/2 and the JWT were accepted (a bad
 /// JWT answers 403). Run by hand:
-/// `GRIMOIRE_APNS_TEST_KEY_FILE=… GRIMOIRE_APNS_KEY_ID=… GRIMOIRE_APNS_TEAM_ID=… cargo test -p grimoire live_sandbox -- --ignored`
+/// `GRIMOIRE_APNS_TEST_KEY_FILE=… GRIMOIRE_APNS_KEY_ID=… GRIMOIRE_APNS_TEAM_ID=… cargo test -p taisce live_sandbox -- --ignored`
 #[cfg(test)]
 #[tokio::test]
 #[ignore]

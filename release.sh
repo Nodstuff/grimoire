@@ -58,8 +58,8 @@ echo "→ embedding model"
 echo "→ ui build"
 (cd ui && npm run build --silent | tail -1)
 echo "→ daemon release build"
-cargo build --release -p grimoire 2>&1 | tail -1
-cp target/release/grimoire crates/shell/binaries/grimoire-aarch64-apple-darwin
+cargo build --release -p taisce 2>&1 | tail -1
+cp target/release/taisce crates/shell/binaries/grimoire-aarch64-apple-darwin
 
 echo "→ signed app + dmg"
 # Tauri's dmg step drives Finder via AppleScript and occasionally flakes in

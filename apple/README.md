@@ -54,7 +54,7 @@ signed in headlessly with the daemon's `softpasskey` example; temp dirs,
 killed on exit):
 
 ```sh
-# in the grimoire checkout: cargo build --release -p grimoire && cargo build --release -p grimoire --example softpasskey
+# in the grimoire checkout: cargo build --release -p taisce && cargo build --release -p taisce --example softpasskey
 apple/scripts/integration.sh [path to the grimoire checkout]
 # binaries built elsewhere (e.g. another branch):
 GRIMOIRE_BIN=… SOFTPASSKEY_BIN=… apple/scripts/integration.sh

@@ -6,7 +6,7 @@ use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use crate::store_ext::with_store;
-use grimoire_store::{BlockStore, DocStatus, OpInput, ReviewDecision, SqliteStore};
+use taisce_store::{BlockStore, DocStatus, OpInput, ReviewDecision, SqliteStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -53,7 +53,7 @@ pub(crate) fn refuse_new_canvas(ops: &[OpInput]) -> Option<String> {
         .any(|o| {
             matches!(
                 o.kind,
-                grimoire_store::OpKind::Insert { block_type: grimoire_store::BlockType::CanvasScene, .. }
+                taisce_store::OpKind::Insert { block_type: taisce_store::BlockType::CanvasScene, .. }
             )
         })
         .then(|| "canvas_scene blocks can no longer be created (canvases were removed)".into())
@@ -84,7 +84,7 @@ async fn docs(State(st): State<ApiState>, Query(q): Query<DocsQuery>) -> ([(&'st
     ([(SEQ_HEADER, seq.to_string())], body)
 }
 
-fn docs_json(s: &mut SqliteStore, filter: Option<grimoire_store::WorkspaceFilter>) -> Json<Value> {
+fn docs_json(s: &mut SqliteStore, filter: Option<taisce_store::WorkspaceFilter>) -> Json<Value> {
     {
         // every entry carries its resolved workspace (null = Unsorted)
         let ws_map = s.workspace_map().unwrap_or_default();
@@ -126,7 +126,7 @@ async fn doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> axum::response
     use axum::response::IntoResponse;
     with_store(&st.store, move |s| match s.read_doc(id) {
         Ok(t) => Json(json!(t)).into_response(),
-        Err(e @ grimoire_store::StoreError::NotFound(_)) => {
+        Err(e @ taisce_store::StoreError::NotFound(_)) => {
             (axum::http::StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))).into_response()
         }
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
@@ -146,7 +146,7 @@ async fn backlinks(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Val
 
 /// Decorate review items for rendering: doc titles, proposer names, and the
 /// live content of the target block (what a red would replace).
-pub(crate) fn decorate_review_items(s: &SqliteStore, q: Vec<grimoire_store::ReviewItem>) -> Vec<Value> {
+pub(crate) fn decorate_review_items(s: &SqliteStore, q: Vec<taisce_store::ReviewItem>) -> Vec<Value> {
     q.into_iter()
         .map(|item| {
             let doc_title = s
@@ -393,7 +393,7 @@ async fn propose_markdown(
                 "recover": "re-read the doc, re-apply your edit to the fresh markdown, re-send with the current epoch",
             }));
         }
-        let ops = grimoire_store::mddiff::markdown_to_ops(&tree.roots, &req.markdown);
+        let ops = taisce_store::mddiff::markdown_to_ops(&tree.roots, &req.markdown);
         if ops.is_empty() {
             return Json(json!({
                 "doc_id": req.doc_id, "epoch": tree.doc.current_epoch, "verdicts": [], "note": "no changes"
@@ -699,7 +699,7 @@ async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -
     let st = st.clone();
     with_store(&store, move |s| {
         let block = match s.read_block(req.comment_id) {
-            Ok(b) if b.block_type == grimoire_store::BlockType::Comment => b,
+            Ok(b) if b.block_type == taisce_store::BlockType::Comment => b,
             Ok(_) => return Json(json!({"error": "not a comment block"})),
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
@@ -708,7 +708,7 @@ async fn dismiss_flag(State(st): State<ApiState>, Json(req): Json<DismissReq>) -
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
         let op = OpInput {
-            kind: grimoire_store::OpKind::Delete {
+            kind: taisce_store::OpKind::Delete {
                 target: req.comment_id,
             },
             source_refs: vec!["flag:dismissed".into()],
@@ -876,7 +876,7 @@ struct RenameReq {
 /// Rewrite [[Old Title]] / [[Path/Old|alias]] / [[Old#anchor]] link forms.
 /// One rule for the human rename here and the gated agent rename (store).
 fn rewrite_links(content: &str, old: &str, new: &str) -> String {
-    grimoire_store::rewrite_links(content, old, new)
+    taisce_store::rewrite_links(content, old, new)
 }
 
 async fn rename_doc(
@@ -928,8 +928,8 @@ async fn rename_doc(
     .await
 }
 
-fn ks_store_op_replace(target: Uuid, content: String) -> grimoire_store::OpKind {
-    grimoire_store::OpKind::Replace { target, content }
+fn ks_store_op_replace(target: Uuid, content: String) -> taisce_store::OpKind {
+    taisce_store::OpKind::Replace { target, content }
 }
 
 async fn delete_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
@@ -1015,7 +1015,7 @@ async fn export_vault(State(st): State<ApiState>) -> Json<Value> {
     let out = dir.clone();
     let res = tokio::task::spawn_blocking(move || {
         let s = store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        grimoire_store::export::export_vault(&*s, &out)
+        taisce_store::export::export_vault(&*s, &out)
     })
     .await;
     match res {
@@ -1027,7 +1027,7 @@ async fn export_vault(State(st): State<ApiState>) -> Json<Value> {
 
 /// One doc as markdown, for "copy as Markdown" in the app.
 async fn doc_markdown(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
-    with_store(&st.store, move |s| match grimoire_store::export::export_doc(&*s, id) {
+    with_store(&st.store, move |s| match taisce_store::export::export_doc(&*s, id) {
         Ok(md) => Json(json!({"markdown": md})),
         Err(e) => Json(json!({"error": e.to_string()})),
     })
@@ -1040,8 +1040,8 @@ async fn doc_markdown(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<
 async fn export_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Value> {
     let (title, md) = match with_store(&st.store, move |s| {
         let doc = s.get_doc(id)?;
-        let md = grimoire_store::export::export_doc(&*s, id)?;
-        Ok::<_, grimoire_store::StoreError>((doc.title, md))
+        let md = taisce_store::export::export_doc(&*s, id)?;
+        Ok::<_, taisce_store::StoreError>((doc.title, md))
     })
     .await
     {
@@ -1050,7 +1050,7 @@ async fn export_doc(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Json<Va
     };
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let dir = std::path::PathBuf::from(home).join("Downloads");
-    let base = grimoire_store::export::safe_name(title.trim());
+    let base = taisce_store::export::safe_name(title.trim());
     let base = if base.is_empty() { "untitled".to_string() } else { base };
     let res = tokio::task::spawn_blocking(move || -> std::io::Result<std::path::PathBuf> {
         std::fs::create_dir_all(&dir)?;
@@ -1132,8 +1132,8 @@ fn import_files(
     store: &Arc<Mutex<SqliteStore>>,
     human: Uuid,
     mut files: Vec<ImportFile>,
-) -> grimoire_store::Result<grimoire_store::import::ImportReport> {
-    use grimoire_store::import::{ImportReport, segment, to_ops};
+) -> taisce_store::Result<taisce_store::import::ImportReport> {
+    use taisce_store::import::{ImportReport, segment, to_ops};
     files.sort_by(|a, b| a.path.cmp(&b.path));
     let mut report = ImportReport::default();
     // folder path → doc id, created on first use
@@ -1292,7 +1292,7 @@ mod http_client_tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use grimoire_store::PrincipalKind;
+    use taisce_store::PrincipalKind;
     use tower::ServiceExt;
 
     fn app() -> (Router, Uuid) {

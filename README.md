@@ -43,9 +43,9 @@ minisign-verified against the key in `crates/shell/tauri.conf.json`.
 
 ```sh
 cd ui && npm install && npx vite build && cd ..
-cargo build --release              # target/release/grimoire
+cargo build --release              # target/release/taisce
 cargo test && (cd ui && npx vitest run)
-./target/release/grimoire serve    # http://127.0.0.1:7425
+./target/release/taisce serve    # http://127.0.0.1:7425
 ```
 
 The UI accepts a few query params on load, all scrubbed off the URL once read:

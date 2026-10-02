@@ -5,7 +5,7 @@
 use super::*;
 use axum::Router;
 use axum::http::Request as HttpRequest;
-use grimoire_store::{BlockStore, PrincipalKind};
+use taisce_store::{BlockStore, PrincipalKind};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use webauthn_authenticator_rs::WebauthnAuthenticator;
@@ -653,7 +653,7 @@ async fn expired_tokens_are_rejected() {
     assert!(s.oauth_access_grant(&ah, now() + ACCESS_TTL + 1).unwrap().is_none());
     let later = now() + REFRESH_TTL + 10;
     let out = s.oauth_rotate_refresh(&hash_secret(&refresh), later, "x", later + 1, "y", later + 2).unwrap();
-    assert_eq!(out, grimoire_store::auth::RefreshOutcome::Invalid);
+    assert_eq!(out, taisce_store::auth::RefreshOutcome::Invalid);
 }
 
 #[tokio::test]

@@ -17,7 +17,7 @@
 //! own fusion, filters and tiers, so the answer path's ranking cannot drift.
 
 use crate::embed::Embedder;
-use grimoire_store::{BlockStore, BlockType, Doc, SearchHit, SqliteStore, WorkspaceFilter};
+use taisce_store::{BlockStore, BlockType, Doc, SearchHit, SqliteStore, WorkspaceFilter};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -202,7 +202,7 @@ pub fn workspace_arg(store: &SqliteStore, raw: Option<&str>) -> Result<Option<Wo
 fn is_hidden(h: &SearchHit) -> bool {
     h.block.block_type == BlockType::Comment
         || h.block.block_type == BlockType::CanvasScene
-        || grimoire_store::import::is_frontmatter(&h.block.content)
+        || taisce_store::import::is_frontmatter(&h.block.content)
 }
 
 /// One line, whitespace collapsed, ≤ `max` chars with an ellipsis.
@@ -618,10 +618,10 @@ fn doc_gist(store: &SqliteStore, doc_id: Uuid) -> String {
     let Ok(tree) = store.read_doc(doc_id) else { return String::new() };
     let mut parts = vec![tree.doc.title.clone()];
     let mut n = 0;
-    let mut stack: Vec<&grimoire_store::BlockNode> = tree.roots.iter().rev().collect();
+    let mut stack: Vec<&taisce_store::BlockNode> = tree.roots.iter().rev().collect();
     while let Some(node) = stack.pop() {
         let b = &node.block;
-        if b.block_type != BlockType::Comment && !grimoire_store::import::is_frontmatter(&b.content) && !b.content.trim().is_empty() {
+        if b.block_type != BlockType::Comment && !taisce_store::import::is_frontmatter(&b.content) && !b.content.trim().is_empty() {
             parts.push(b.content.clone());
             n += 1;
             if n >= 3 {
@@ -746,11 +746,11 @@ impl Budget {
 
 fn first_paragraph(store: &SqliteStore, doc_id: Uuid) -> Option<String> {
     let tree = store.read_doc(doc_id).ok()?;
-    let mut stack: Vec<&grimoire_store::BlockNode> = tree.roots.iter().rev().collect();
+    let mut stack: Vec<&taisce_store::BlockNode> = tree.roots.iter().rev().collect();
     while let Some(node) = stack.pop() {
         let b = &node.block;
         let visible = matches!(b.block_type, BlockType::Paragraph | BlockType::Decision)
-            && !grimoire_store::import::is_frontmatter(&b.content)
+            && !taisce_store::import::is_frontmatter(&b.content)
             && !b.content.trim().is_empty();
         if visible {
             return Some(one_line(&b.content, ORIENT_GIST_CHARS));
@@ -935,7 +935,7 @@ pub fn orient(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grimoire_store::{PrincipalKind, import::import_markdown};
+    use taisce_store::{PrincipalKind, import::import_markdown};
 
     fn store() -> (SqliteStore, Uuid) {
         let mut s = SqliteStore::open_in_memory().unwrap();

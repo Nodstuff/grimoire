@@ -2,7 +2,7 @@
 """AX 2 smoke + byte measurement against a scratch daemon (never 7425 / ~/.grimoire).
 
 Usage:
-  cargo build --release -p grimoire
+  cargo build --release -p taisce
   scripts/mcp-smoke.py                 # starts a scratch daemon on 7519, runs, stops it
   scripts/mcp-smoke.py --url http://127.0.0.1:7519/mcp   # against a daemon you started
 
@@ -238,7 +238,7 @@ def main():
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         binary = os.path.join(repo, "target", "release", "grimoire")
         if not os.path.exists(binary):
-            sys.exit(f"{binary} missing: cargo build --release -p grimoire first")
+            sys.exit(f"{binary} missing: cargo build --release -p taisce first")
         scratch = tempfile.mkdtemp(prefix="grimoire-mcp-smoke.")
         env = dict(os.environ, HOME=scratch)
         log = open(os.path.join(scratch, "log"), "w")

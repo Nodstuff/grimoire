@@ -1,4 +1,4 @@
-// grimoire-shell: native chrome over the daemon's UI (PROJECT.md §3.2a).
+// taisce-shell: native chrome over the daemon's UI (PROJECT.md §3.2a).
 //
 // The sidecar model: the daemon (`grimoire`) is bundled inside the .app and
 // the shell owns it. On launch the shell attaches to a daemon already
@@ -282,7 +282,7 @@ fn ui_url(extra: &[(&str, &str)]) -> String {
 /// `data:` URL handed to `WebviewWindowBuilder` — and on macOS that build
 /// silently failed, so a launch with a slow or absent daemon produced a tray
 /// and no window at all (the page below had never once been seen).
-const ERROR_URL: &str = "grimoire-shell://localhost/waiting";
+const ERROR_URL: &str = "taisce-shell://localhost/waiting";
 
 /// What the window shows while the daemon is not answering: no white
 /// screen, no dead app. The page probes the daemon every 3s and replaces
@@ -545,9 +545,9 @@ fn main() {
                 })
                 .build(),
         )
-        // `grimoire-shell://localhost/waiting`: the page shown while the
+        // `taisce-shell://localhost/waiting`: the page shown while the
         // daemon is not answering (see ERROR_URL)
-        .register_uri_scheme_protocol("grimoire-shell", |_ctx, _req| {
+        .register_uri_scheme_protocol("taisce-shell", |_ctx, _req| {
             tauri::http::Response::builder()
                 .header("Content-Type", "text/html; charset=utf-8")
                 .body(error_page().into_bytes())

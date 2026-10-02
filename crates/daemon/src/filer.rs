@@ -13,7 +13,7 @@
 //! fatal. No Inbox = nothing to do.
 
 use crate::store_ext::with_store;
-use grimoire_store::{BlockStore, ConfidencePolicy, Doc, Gardener, SqliteStore};
+use taisce_store::{BlockStore, ConfidencePolicy, Doc, Gardener, SqliteStore};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -104,10 +104,10 @@ fn destination_docs(store: &SqliteStore, inbox: Uuid) -> Vec<Doc> {
 fn note_text(store: &SqliteStore, doc: Uuid) -> String {
     let Ok(tree) = store.read_doc(doc) else { return String::new() };
     let mut out = String::new();
-    fn rec(nodes: &[grimoire_store::BlockNode], out: &mut String) {
+    fn rec(nodes: &[taisce_store::BlockNode], out: &mut String) {
         for n in nodes {
-            if n.block.block_type != grimoire_store::BlockType::Comment
-                && !grimoire_store::import::is_frontmatter(&n.block.content)
+            if n.block.block_type != taisce_store::BlockType::Comment
+                && !taisce_store::import::is_frontmatter(&n.block.content)
             {
                 out.push_str(&n.block.content);
                 out.push_str("\n\n");
@@ -288,7 +288,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grimoire_store::{GardenerKind, OpKind, PrincipalKind, Verdict, import::import_markdown};
+    use taisce_store::{GardenerKind, OpKind, PrincipalKind, Verdict, import::import_markdown};
 
     fn setup() -> (SqliteStore, Uuid, Gardener) {
         let mut s = SqliteStore::open_in_memory().unwrap();
@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(d.parent_id, Some(projects.id));
         assert_eq!(d.title, "k3d deploy notes");
         assert_eq!(s.get_doc(keep).unwrap().title, "Good title", "unchanged title → no rename op");
-        let md = grimoire_store::export::export_doc(&s, note).unwrap();
+        let md = taisce_store::export::export_doc(&s, note).unwrap();
         assert!(md.starts_with("---\ntags:\n  - infra\n  - k3d\n---"), "{md}");
         let q = s.review_queue(None).unwrap();
         assert_eq!(q.len(), 4, "tags + rename + 2 moves: {q:?}");
@@ -371,7 +371,7 @@ mod tests {
         assert!(q.iter().any(|i| matches!(&i.op.kind, OpKind::RenameDoc { .. })));
         // declining the move puts it back in the Inbox
         let mv = q.iter().find(|i| matches!(&i.op.kind, OpKind::MoveDoc { .. }) && i.annotation.doc_id == note).unwrap();
-        s.resolve(mv.annotation.id, tom, grimoire_store::ReviewDecision::Decline).unwrap();
+        s.resolve(mv.annotation.id, tom, taisce_store::ReviewDecision::Decline).unwrap();
         assert_eq!(s.get_doc(note).unwrap().parent_id, Some(inbox.id));
     }
 

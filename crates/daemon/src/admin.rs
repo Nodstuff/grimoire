@@ -7,7 +7,7 @@ use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::response::IntoResponse;
 use axum::{Json, Router};
-use grimoire_store::{BlockStore, ConfidencePolicy, GardenerKind, ReviewPolicy, SqliteStore};
+use taisce_store::{BlockStore, ConfidencePolicy, GardenerKind, ReviewPolicy, SqliteStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -298,7 +298,7 @@ async fn get_profile(State(AdminState { store, .. }): State<AdminState>) -> Json
             .list_principals()
             .unwrap_or_default()
             .into_iter()
-            .find(|p| p.kind == grimoire_store::PrincipalKind::Human);
+            .find(|p| p.kind == taisce_store::PrincipalKind::Human);
         let Some(human) = human else {
             return Json(json!({"error": "no human principal"}));
         };
@@ -323,7 +323,7 @@ async fn set_profile(State(AdminState { store, .. }): State<AdminState>, Json(re
             .list_principals()
             .unwrap_or_default()
             .into_iter()
-            .find(|p| p.kind == grimoire_store::PrincipalKind::Human);
+            .find(|p| p.kind == taisce_store::PrincipalKind::Human);
         let Some(human) = human else {
             return Json(json!({"error": "no human principal"}));
         };

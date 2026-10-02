@@ -2013,73 +2013,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "grimoire"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.23.1",
- "chrono",
- "clap",
- "futures-util",
- "getrandom 0.4.3",
- "grimoire-store",
- "hex",
- "libc",
- "model2vec-rs",
- "openssl",
- "regex",
- "reqwest",
- "ring",
- "rmcp",
- "rusqlite",
- "rust-embed",
- "rustls",
- "schemars 1.2.2",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "url",
- "uuid",
- "webauthn-authenticator-rs",
- "webauthn-rs",
-]
-
-[[package]]
-name = "grimoire-shell"
-version = "0.8.0"
-dependencies = [
- "libc",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-global-shortcut",
- "tauri-plugin-notification",
- "tauri-plugin-updater",
- "tauri-plugin-window-state",
-]
-
-[[package]]
-name = "grimoire-store"
-version = "0.8.0"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "uuid",
-]
-
-[[package]]
 name = "gtk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5058,6 +4991,73 @@ dependencies = [
  "pkg-config",
  "toml 0.8.2",
  "version-compare",
+]
+
+[[package]]
+name = "taisce"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "clap",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "libc",
+ "model2vec-rs",
+ "openssl",
+ "regex",
+ "reqwest",
+ "ring",
+ "rmcp",
+ "rusqlite",
+ "rust-embed",
+ "rustls",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "taisce-store",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "webauthn-authenticator-rs",
+ "webauthn-rs",
+]
+
+[[package]]
+name = "taisce-shell"
+version = "0.8.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-global-shortcut",
+ "tauri-plugin-notification",
+ "tauri-plugin-updater",
+ "tauri-plugin-window-state",
+]
+
+[[package]]
+name = "taisce-store"
+version = "0.8.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]

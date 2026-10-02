@@ -118,7 +118,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use crate::due::Due;
 use chrono::{FixedOffset, NaiveDate};
-use grimoire_store::{BlockStore, Doc, SqliteStore, WorkspaceFilter};
+use taisce_store::{BlockStore, Doc, SqliteStore, WorkspaceFilter};
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -886,7 +886,7 @@ fn depth(docs: &HashMap<Uuid, &Doc>, id: Uuid) -> usize {
 
 /// The scope's To-do doc, if it exists (never creates). A workspace's is
 /// the shallowest doc titled To-do resolving to it, in sidebar order.
-pub fn find_todo(s: &SqliteStore, scope: TodoScope) -> grimoire_store::Result<Option<Doc>> {
+pub fn find_todo(s: &SqliteStore, scope: TodoScope) -> taisce_store::Result<Option<Doc>> {
     let docs = s.list_docs()?;
     let ws = s.workspace_map()?;
     let ws_of = |d: &Doc| ws.get(&d.id).copied().flatten();
@@ -906,7 +906,7 @@ pub fn find_todo(s: &SqliteStore, scope: TodoScope) -> grimoire_store::Result<Op
 /// The scope's To-do doc, created (by the human) when absent: a
 /// workspace's goes under its first labelled root (shallowest, in sidebar
 /// order), else at the root, labelled.
-pub fn find_or_create_todo_in(s: &mut SqliteStore, human: Uuid, scope: TodoScope) -> grimoire_store::Result<Doc> {
+pub fn find_or_create_todo_in(s: &mut SqliteStore, human: Uuid, scope: TodoScope) -> taisce_store::Result<Doc> {
     if let Some(d) = find_todo(s, scope)? {
         return Ok(d);
     }
@@ -935,7 +935,7 @@ pub fn find_or_create_todo_in(s: &mut SqliteStore, human: Uuid, scope: TodoScope
 /// the text is unchanged). Returns the epoch afterwards.
 fn save(s: &mut SqliteStore, doc: Uuid, human: Uuid, new_md: &str) -> Result<i64, String> {
     let tree = s.read_doc(doc).map_err(|e| e.to_string())?;
-    let ops = grimoire_store::mddiff::markdown_to_ops_from(&tree.roots, new_md, "todo");
+    let ops = taisce_store::mddiff::markdown_to_ops_from(&tree.roots, new_md, "todo");
     if ops.is_empty() {
         return Ok(tree.doc.current_epoch);
     }
@@ -949,7 +949,7 @@ fn save(s: &mut SqliteStore, doc: Uuid, human: Uuid, new_md: &str) -> Result<i64
 }
 
 fn day_json(s: &SqliteStore, doc: &Doc, date: &str, today: &str, carried: usize, warning: Option<&str>) -> Result<Value, String> {
-    let md = grimoire_store::export::export_doc(s, doc.id).map_err(|e| e.to_string())?;
+    let md = taisce_store::export::export_doc(s, doc.id).map_err(|e| e.to_string())?;
     let tree = s.read_doc(doc.id).map_err(|e| e.to_string())?;
     let mut v = json!({
         "doc_id": doc.id,
@@ -998,7 +998,7 @@ async fn mutate(
             Ok(d) => d,
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
-        let md = match grimoire_store::export::export_doc(&*s, doc.id) {
+        let md = match taisce_store::export::export_doc(&*s, doc.id) {
             Ok(m) => m,
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
@@ -1044,7 +1044,7 @@ async fn get_day(State(st): State<ApiState>, server: Server, Query(q): Query<Day
             Ok(d) => d,
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
-        let md = match grimoire_store::export::export_doc(&*s, doc.id) {
+        let md = match taisce_store::export::export_doc(&*s, doc.id) {
             Ok(m) => m,
             Err(e) => return Json(json!({"error": e.to_string()})),
         };
@@ -1122,7 +1122,7 @@ async fn due(State(st): State<ApiState>, Query(q): Query<DueQuery>) -> axum::res
         let mut items: Vec<(String, Value)> = Vec::new();
         let mut docs = Vec::new();
         for (d, ws_id) in &lists {
-            let md = match grimoire_store::export::export_doc(&*s, d.id) {
+            let md = match taisce_store::export::export_doc(&*s, d.id) {
                 Ok(m) => m,
                 Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             };
@@ -1155,7 +1155,7 @@ async fn due(State(st): State<ApiState>, Query(q): Query<DueQuery>) -> axum::res
 /// The To-do docs `due` reads (found, never created) with each one's
 /// resolved workspace: one for a scope; for Legacy (no param) the legacy
 /// list first, then every workspace's, each doc once.
-fn due_lists(s: &SqliteStore, scope: TodoScope) -> grimoire_store::Result<Vec<(Doc, Option<Uuid>)>> {
+fn due_lists(s: &SqliteStore, scope: TodoScope) -> taisce_store::Result<Vec<(Doc, Option<Uuid>)>> {
     let mut scopes = vec![scope];
     if scope == TodoScope::Legacy {
         scopes.push(TodoScope::In(WorkspaceFilter::Unsorted));

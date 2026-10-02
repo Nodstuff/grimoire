@@ -5,15 +5,15 @@
 # ~/.grimoire, never port 7425. Daemons are killed on exit.
 #
 # Usage: apple/scripts/integration.sh [path to the grimoire checkout]
-#   (default: the main checkout; it needs target/release/grimoire and
+#   (default: the main checkout; it needs target/release/taisce and
 #   target/release/examples/softpasskey, built with
-#   `cargo build --release -p grimoire && cargo build --release -p grimoire --example softpasskey`;
+#   `cargo build --release -p taisce && cargo build --release -p taisce --example softpasskey`;
 #   GRIMOIRE_BIN / SOFTPASSKEY_BIN point at binaries built elsewhere)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="${1:-${GRIMOIRE_REPO:-$HOME/personal/knowledge-system}}"
-BIN="${GRIMOIRE_BIN:-$REPO/target/release/grimoire}"
+BIN="${GRIMOIRE_BIN:-$REPO/target/release/taisce}"
 SOFTPASSKEY="${SOFTPASSKEY_BIN:-$REPO/target/release/examples/softpasskey}"
 LOCAL_PORT=7515
 SERVER_PORT=7516

@@ -32,7 +32,7 @@ mod retrieval_probe;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use grimoire_store::{BlockStore, PrincipalKind, SqliteStore};
+use taisce_store::{BlockStore, PrincipalKind, SqliteStore};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -557,7 +557,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Import { dir } => {
-            let report = grimoire_store::import::import_vault(&mut store, &dir, tom)?;
+            let report = taisce_store::import::import_vault(&mut store, &dir, tom)?;
             println!(
                 "imported {} docs, {} blocks; skipped {} files",
                 report.docs,
@@ -569,7 +569,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Export { dir } => {
-            let report = grimoire_store::export::export_vault(&store, &dir)?;
+            let report = taisce_store::export::export_vault(&store, &dir)?;
             println!("exported {} files to {}", report.files, dir.display());
         }
         Cmd::Gardener { cmd } => {

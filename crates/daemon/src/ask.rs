@@ -11,7 +11,7 @@
 //! gardened and auditable (its `source_refs` are the cited block ids).
 
 use crate::store_ext::with_store;
-use grimoire_store::{BlockStore, SearchHit, SqliteStore};
+use taisce_store::{BlockStore, SearchHit, SqliteStore};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -59,8 +59,8 @@ pub fn keywords(question: &str) -> Vec<String> {
 pub fn retrieve(store: &SqliteStore, embedder: Option<&crate::embed::Embedder>, question: &str) -> Vec<SearchHit> {
     let answers = answers_folder_id(store);
     let usable = |h: &SearchHit| {
-        h.block.block_type != grimoire_store::BlockType::Comment
-            && !grimoire_store::import::is_frontmatter(&h.block.content)
+        h.block.block_type != taisce_store::BlockType::Comment
+            && !taisce_store::import::is_frontmatter(&h.block.content)
             && !is_bare_heading(&h.block.content)
             && !under_answers(store, h.block.doc_id, answers)
     };
@@ -182,8 +182,8 @@ pub fn retrieve_keyword_with(store: &SqliteStore, question: &str, per_word_limit
     // we want the opposite — a block counts for a word only if it really
     // contains it, so the model never sees a near-miss as evidence
     let mut consider = |hit: SearchHit, weight: usize| {
-        if hit.block.block_type == grimoire_store::BlockType::Comment
-            || grimoire_store::import::is_frontmatter(&hit.block.content)
+        if hit.block.block_type == taisce_store::BlockType::Comment
+            || taisce_store::import::is_frontmatter(&hit.block.content)
         {
             return;
         }
@@ -263,7 +263,7 @@ distinct parts, no preamble, no closing summary, no mention of \"excerpts\"."
 }
 
 /// Ensure the `Answers` root folder exists (owned by the human).
-fn answers_folder(store: &mut SqliteStore, human: Uuid) -> grimoire_store::Result<Uuid> {
+fn answers_folder(store: &mut SqliteStore, human: Uuid) -> taisce_store::Result<Uuid> {
     if let Some(d) = store
         .list_docs()?
         .into_iter()
@@ -341,7 +341,7 @@ pub async fn ask(
                 Some(folder),
                 agent,
                 &md,
-                grimoire_store::ConfidencePolicy::Gate,
+                taisce_store::ConfidencePolicy::Gate,
             )
             .map_err(|e| e.to_string())?;
             if let Err(e) = s.record_answer_sources(doc_id, &cited) {
@@ -375,8 +375,8 @@ pub async fn ask(
                     .find(|b| b.content == SYNTH_PLACEHOLDER)
                     .map(|b| b.id);
                 let Some(target) = placeholder else { return };
-                let op = grimoire_store::OpInput {
-                    kind: grimoire_store::OpKind::Replace { target, content: text },
+                let op = taisce_store::OpInput {
+                    kind: taisce_store::OpKind::Replace { target, content: text },
                     source_refs: vec!["ask-the-vault: synthesis".into()],
                 };
                 if let Err(e) = s.propose(doc_id, tree.doc.current_epoch, agent, vec![op]) {
@@ -397,7 +397,7 @@ pub async fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grimoire_store::{PrincipalKind, import::import_markdown};
+    use taisce_store::{PrincipalKind, import::import_markdown};
 
     #[test]
     fn keywords_drop_stopwords_and_dedupe() {

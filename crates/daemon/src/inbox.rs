@@ -13,7 +13,7 @@ use crate::store_ext::with_store;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
-use grimoire_store::{BlockStore, Doc, SqliteStore};
+use taisce_store::{BlockStore, Doc, SqliteStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -64,7 +64,7 @@ pub fn inbox_markdown(text: &str) -> String {
 /// The root doc titled Inbox, created (by `principal`) when absent. Never a
 /// duplicate: an existing root with that title is reused, whichever
 /// principal made it.
-pub fn find_or_create_inbox(s: &mut SqliteStore, principal: Uuid) -> grimoire_store::Result<Doc> {
+pub fn find_or_create_inbox(s: &mut SqliteStore, principal: Uuid) -> taisce_store::Result<Doc> {
     if let Some(d) = s
         .list_docs()?
         .into_iter()
@@ -92,7 +92,7 @@ async fn capture(State(st): State<ApiState>, Json(req): Json<CaptureReq>) -> Jso
         };
         let title = inbox_title(&req.text);
         let md = inbox_markdown(&req.text);
-        let ops = grimoire_store::mddiff::markdown_to_ops_from(&[], &md, "inbox");
+        let ops = taisce_store::mddiff::markdown_to_ops_from(&[], &md, "inbox");
         match s.create_doc_with_ops(&title, Some(inbox.id), human, ops) {
             Ok((doc, _)) => Json(json!({"doc_id": doc.id, "title": doc.title, "inbox_id": inbox.id})),
             Err(e) => Json(json!({"error": e.to_string()})),

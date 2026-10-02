@@ -2,8 +2,8 @@
 //! lands as op + projection in one transaction; batch bumps epoch exactly once;
 //! zero integer IDs anywhere.
 
-use grimoire_store::order_key::between;
-use grimoire_store::*;
+use taisce_store::order_key::between;
+use taisce_store::*;
 use uuid::Uuid;
 
 fn store_with_tom() -> (SqliteStore, Principal) {

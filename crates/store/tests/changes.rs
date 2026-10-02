@@ -2,7 +2,7 @@
 //! triggers, the cursor pages with since/limit/more, the v6 migration seeds
 //! one row per live doc, and the commit hook fires.
 
-use grimoire_store::*;
+use taisce_store::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;

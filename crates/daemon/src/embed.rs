@@ -12,7 +12,7 @@
 //! in-memory index mirrors the `block_vec` table for brute-force cosine
 //! search — a few thousand 256-d vectors is a couple of MB and a sub-ms scan.
 
-use grimoire_store::{BlockStore, SqliteStore};
+use taisce_store::{BlockStore, SqliteStore};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use uuid::Uuid;
@@ -92,7 +92,7 @@ impl Embedder {
     }
 
     /// Bring the in-memory index in line with the table (start-up).
-    pub fn load_index(&self, store: &SqliteStore) -> grimoire_store::Result<usize> {
+    pub fn load_index(&self, store: &SqliteStore) -> taisce_store::Result<usize> {
         let rows = store.block_vecs()?;
         let n = rows.len();
         let mut index = self.index.write().unwrap_or_else(|p| p.into_inner());
@@ -106,7 +106,7 @@ impl Embedder {
     /// One pass: embed up to BATCH stale blocks, store, update the index.
     /// Returns how many were (re)embedded. Frontmatter/`---` blocks get an
     /// empty vector so they count as done without polluting search.
-    pub fn embed_stale(&self, store: &Arc<Mutex<SqliteStore>>) -> grimoire_store::Result<usize> {
+    pub fn embed_stale(&self, store: &Arc<Mutex<SqliteStore>>) -> taisce_store::Result<usize> {
         let stale = {
             let s = store.lock().unwrap_or_else(|p| p.into_inner());
             s.stale_block_vectors(BATCH)?
@@ -116,7 +116,7 @@ impl Embedder {
         }
         let (skip, embed): (Vec<_>, Vec<_>) = stale
             .into_iter()
-            .partition(|(_, _, c)| c.trim().is_empty() || grimoire_store::import::is_frontmatter(c));
+            .partition(|(_, _, c)| c.trim().is_empty() || taisce_store::import::is_frontmatter(c));
         let texts: Vec<String> = embed.iter().map(|(_, _, c)| c.clone()).collect();
         let vecs = if texts.is_empty() { Vec::new() } else { self.encode(&texts) };
         let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
@@ -132,7 +132,7 @@ impl Embedder {
         Ok(skip.len() + embed.len())
     }
 
-    pub fn purge(&self, store: &Arc<Mutex<SqliteStore>>) -> grimoire_store::Result<usize> {
+    pub fn purge(&self, store: &Arc<Mutex<SqliteStore>>) -> taisce_store::Result<usize> {
         let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
         let n = s.purge_block_vecs()?;
         if n > 0 {
@@ -185,7 +185,7 @@ pub async fn embed_loop(embedder: Arc<Embedder>, store: Arc<Mutex<SqliteStore>>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grimoire_store::{PrincipalKind, import::import_markdown};
+    use taisce_store::{PrincipalKind, import::import_markdown};
 
     #[test]
     fn embeds_stale_blocks_once_reembeds_on_edit_and_purges_deleted() {
@@ -209,8 +209,8 @@ mod tests {
         let tree = store.lock().unwrap().read_doc(doc).unwrap();
         let target = tree.roots.iter().flat_map(|n| std::iter::once(&n.block).chain(n.children.iter().map(|c| &c.block)))
             .find(|b| b.content.contains("Sourdough")).unwrap().id;
-        store.lock().unwrap().apply(doc, tree.doc.current_epoch, tom.id, vec![grimoire_store::OpInput {
-            kind: grimoire_store::OpKind::Replace { target, content: "Bread needs a twelve hour rise.".into() },
+        store.lock().unwrap().apply(doc, tree.doc.current_epoch, tom.id, vec![taisce_store::OpInput {
+            kind: taisce_store::OpKind::Replace { target, content: "Bread needs a twelve hour rise.".into() },
             source_refs: vec![],
         }]).unwrap();
         assert_eq!(embedder.embed_stale(&store).unwrap(), 1);
@@ -219,8 +219,8 @@ mod tests {
         // tombstoning blocks is doc-level here; block rows stay but the doc is deleted —
         // block_vecs joins on block.deleted, so emulate a block delete
         let bid = target;
-        store.lock().unwrap().apply(doc, tree.doc.current_epoch + 1, tom.id, vec![grimoire_store::OpInput {
-            kind: grimoire_store::OpKind::Delete { target: bid },
+        store.lock().unwrap().apply(doc, tree.doc.current_epoch + 1, tom.id, vec![taisce_store::OpInput {
+            kind: taisce_store::OpKind::Delete { target: bid },
             source_refs: vec![],
         }]).ok();
         let purged = embedder.purge(&store).unwrap();

@@ -1,6 +1,6 @@
 //! Tuning harness for ask-the-vault retrieval, ignored by default. Run it
 //! against a real vault to see what each question actually retrieves:
-//!   PROBE_DB=/path/to/ks.db cargo test -p grimoire probe -- --ignored --nocapture
+//!   PROBE_DB=/path/to/ks.db cargo test -p taisce probe -- --ignored --nocapture
 //! Keep the question list honest: things you know the vault answers.
 #[cfg(test)]
 mod probe {
@@ -8,18 +8,18 @@ mod probe {
     #[ignore]
     fn score_distribution() {
         let db = std::env::var("PROBE_DB").unwrap();
-        let s = grimoire_store::SqliteStore::open(&db).unwrap();
+        let s = taisce_store::SqliteStore::open(&db).unwrap();
         let e = crate::embed::Embedder::load().unwrap();
         e.load_index(&s).unwrap();
         // where does the block we KNOW is right sit, for Q1?
         {
-            use grimoire_store::BlockStore;
+            use taisce_store::BlockStore;
             let q = "what rules do I follow about pinning dependency versions?";
             let qv = e.encode_one(q);
             let words = crate::ask::keywords(q);
             for d in s.list_docs().unwrap().iter().filter(|d| d.title.contains("Verify Latest") || d.title == "Review Gate") {
                 let t = s.read_doc(d.id).unwrap();
-                fn walk(ns: &[grimoire_store::BlockNode], out: &mut Vec<grimoire_store::Block>) { for n in ns { out.push(n.block.clone()); walk(&n.children, out); } }
+                fn walk(ns: &[taisce_store::BlockNode], out: &mut Vec<taisce_store::Block>) { for n in ns { out.push(n.block.clone()); walk(&n.children, out); } }
                 let mut bs = Vec::new(); walk(&t.roots, &mut bs);
                 for b in bs {
                     let c = e.score(&qv, b.id);

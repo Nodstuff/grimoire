@@ -1,7 +1,7 @@
 //! Living answers (answer_sources) and doc freshness (docs.verified_at):
 //! table round-trips, the resolve hook, migration idempotence.
 
-use grimoire_store::*;
+use taisce_store::*;
 use uuid::Uuid;
 
 fn seed() -> (SqliteStore, Uuid) {
