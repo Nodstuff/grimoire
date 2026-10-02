@@ -246,6 +246,27 @@ enum AuthCmd {
     List,
     /// Revoke an OAuth grant, or delete a passkey, by id (or unique prefix).
     Revoke { id: String },
+    /// Personal access tokens: static bearers for /mcp only.
+    Token {
+        #[command(subcommand)]
+        cmd: TokenCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCmd {
+    /// Mint a token and print it once (it is stored only as a hash).
+    Create {
+        #[arg(long)]
+        name: String,
+        /// The user it acts for, by id (or unique prefix); default the owner.
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// List tokens (never their values).
+    List,
+    /// Revoke a live token by name or id (or unique prefix).
+    Revoke { key: String },
 }
 
 /// Still `~/.grimoire` after the rename: the legacy desktop app's data lives
@@ -520,6 +541,20 @@ fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, h
                 let name = store.oauth_client(&g.client_id)?.map(|c| c.client_name).unwrap_or_default();
                 println!("grant {}  {}  [{}]  since {}", g.id, name, g.client_id, fmt_time(g.created_at));
             }
+        }
+        AuthCmd::Token { cmd: TokenCmd::Create { name, user } } => {
+            let (t, secret) = auth::create_api_token(store, user.as_deref(), &name, now)?;
+            println!("{secret}");
+            eprintln!("(token {:?} {} — shown once; it opens /mcp only)", t.name, t.id);
+        }
+        AuthCmd::Token { cmd: TokenCmd::List } => {
+            for line in auth::api_token_lines(store)? {
+                println!("{line}");
+            }
+        }
+        AuthCmd::Token { cmd: TokenCmd::Revoke { key } } => {
+            let t = auth::revoke_api_token(store, &key, now)?;
+            println!("revoked token {} {}", t.name, t.id);
         }
         AuthCmd::Revoke { id } => {
             if let Some(g) = store.oauth_revoke_grant(&id, "revoked from the CLI", now)? {

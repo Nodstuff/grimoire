@@ -6,6 +6,8 @@
 //! behind a TLS reverse proxy on the same box — every proxied request comes
 //! from 127.0.0.1, so loopback means nothing and `local_guard` is replaced by
 //! [`require_auth`]: `/api`, `/mcp` and `/ws` need a bearer access token.
+//! A personal access token (`tsk_…`, minted by `taisce auth token create`)
+//! is the one other bearer, and it opens `/mcp` only.
 //!
 //! - `oauth`: RFC 8414 / RFC 9728 metadata, DCR (RFC 7591), authorize (PKCE
 //!   S256 only), token (code + rotating refresh), revoke.
@@ -161,6 +163,15 @@ pub fn random_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }
 
+/// Personal access tokens start with this, so `require_auth` can tell them
+/// from OAuth access tokens without a second lookup.
+pub const PAT_PREFIX: &str = "tsk_";
+
+/// A fresh personal access token: `tsk_` + 256 random bits, base64url.
+pub fn new_api_token() -> String {
+    format!("{PAT_PREFIX}{}", random_token())
+}
+
 /// How a secret is stored: lowercase hex SHA-256.
 pub fn hash_secret(s: &str) -> String {
     hex::encode(sha2::Sha256::digest(s.as_bytes()))
@@ -314,6 +325,107 @@ pub async fn authenticate(st: &AuthState, token: &str) -> Option<Authenticated> 
     .await
 }
 
+/// Resolve a personal access token to its owner, with the identity an OAuth
+/// connector token for that user would carry: client `pat:<name>`, principal
+/// `claude:<name>`, never the owner's app. `grant_id` is the token's id.
+/// Records the use (at most once a minute) and audits the first one.
+pub async fn authenticate_pat(st: &AuthState, token: &str, ip: String) -> Option<Authenticated> {
+    let hash = hash_secret(token);
+    let now = now();
+    let (t, human, first) = crate::store_ext::with_store(&st.store, move |s| {
+        let t = s.auth_api_token_by_hash(&hash).ok()??;
+        let human = s.auth_user(t.user_id).ok().flatten()?.principal_id;
+        let stale = t.last_used_at.is_none_or(|u| u <= now - taisce_store::auth::API_TOKEN_TOUCH_EVERY);
+        let first = stale && s.auth_touch_api_token(t.id, now).unwrap_or(false) && t.last_used_at.is_none();
+        Some((t, human, first))
+    })
+    .await?;
+    if first {
+        tracing::info!(target: AUDIT, event = "pat.first_use", token = %t.id, name = t.name, user = %t.user_id, ip);
+    }
+    let client_id = format!("pat:{}", t.name);
+    Some(Authenticated {
+        user_id: t.user_id,
+        grant_id: t.id,
+        principal: client_principal(&client_id, &t.name),
+        owner_app: false,
+        human,
+        client_id,
+    })
+}
+
+/// A token name: what `revoke` and the audit log call it, and the label of
+/// its default principal (`claude:<name>`).
+pub fn valid_token_name(name: &str) -> anyhow::Result<&str> {
+    let name = name.trim();
+    let ok = !name.is_empty()
+        && name.len() <= 40
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !name.starts_with(PAT_PREFIX);
+    if !ok {
+        anyhow::bail!("token name {name:?}: 1-40 of [A-Za-z0-9._-]");
+    }
+    Ok(name)
+}
+
+/// Mint a personal access token for `user` (or the owner). The secret is
+/// returned once and stored only as its hash; the audit line names the
+/// token, never its value.
+pub fn create_api_token(
+    store: &mut SqliteStore,
+    user: Option<&str>,
+    name: &str,
+    now: i64,
+) -> anyhow::Result<(taisce_store::auth::ApiToken, String)> {
+    let name = valid_token_name(name)?;
+    let user_id = match user.map(str::trim) {
+        None => store.auth_owner()?.ok_or_else(|| anyhow::anyhow!("no owner yet: serve once in server mode"))?.id,
+        Some(key) => {
+            let users: Vec<_> = store
+                .auth_users()?
+                .into_iter()
+                .filter(|u| !key.is_empty() && u.id.to_string().starts_with(key))
+                .collect();
+            match users.as_slice() {
+                [u] => u.id,
+                _ => anyhow::bail!("no single user matches {key:?}"),
+            }
+        }
+    };
+    let secret = new_api_token();
+    let t = store.auth_create_api_token(user_id, name, &hash_secret(&secret), now)?;
+    tracing::info!(target: AUDIT, event = "pat.create", token = %t.id, name = t.name, user = %t.user_id);
+    Ok((t, secret))
+}
+
+/// Revoke a live personal access token by name or id (prefix).
+pub fn revoke_api_token(store: &mut SqliteStore, key: &str, now: i64) -> anyhow::Result<taisce_store::auth::ApiToken> {
+    let t = store
+        .auth_revoke_api_token(key, now)?
+        .ok_or_else(|| anyhow::anyhow!("no live token matches {key:?} (ambiguous prefix?)"))?;
+    tracing::info!(target: AUDIT, event = "pat.revoke", token = %t.id, name = t.name, user = %t.user_id);
+    Ok(t)
+}
+
+/// `taisce auth token list`: one line per token, revoked ones included.
+/// Only metadata is stored, so there is no secret here to leak.
+pub fn api_token_lines(store: &SqliteStore) -> anyhow::Result<Vec<String>> {
+    let at = |t: i64| {
+        chrono::DateTime::from_timestamp(t, 0)
+            .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_default()
+    };
+    Ok(store
+        .auth_api_tokens()?
+        .into_iter()
+        .map(|t| {
+            let used = t.last_used_at.map(at).unwrap_or_else(|| "never".into());
+            let state = t.revoked_at.map(|r| format!("revoked {}", at(r))).unwrap_or_else(|| "live".into());
+            format!("token {}  {:<20}  user {}  created {}  last used {}  {}", t.id, t.name, t.user_id, at(t.created_at), used, state)
+        })
+        .collect())
+}
+
 /// The server-mode layer over the whole router (it replaces `local_guard`).
 pub async fn require_auth(State(st): State<AuthState>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
@@ -339,10 +451,21 @@ pub async fn require_auth(State(st): State<AuthState>, mut req: Request, next: N
     let Some(token) = bearer(req.headers()).map(str::to_string) else {
         return unauthorized(&st.cfg, &path, None);
     };
-    let Some(who) = authenticate(&st, &token).await else {
+    let is_mcp = under(&path, "/mcp");
+    // a PAT opens MCP and nothing else: elsewhere only OAuth tokens are
+    // looked up, so a PAT there is just an unknown token
+    let pat = if is_mcp && token.starts_with(PAT_PREFIX) {
+        authenticate_pat(&st, &token, client_ip(&st.cfg, req.headers(), req.extensions())).await
+    } else {
+        None
+    };
+    let who = match pat {
+        Some(w) => Some(w),
+        None => authenticate(&st, &token).await,
+    };
+    let Some(who) = who else {
         return unauthorized(&st.cfg, &path, Some("invalid_token"));
     };
-    let is_mcp = under(&path, "/mcp");
     // identity is the token's: whatever the request names itself is dropped.
     // The HTTP API reads the header slot, so a connector's token fills it
     // with its own principal and the owner's app leaves it empty (→ the

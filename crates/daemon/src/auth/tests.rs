@@ -807,3 +807,183 @@ async fn devices_need_the_owners_app_token() {
     let d = h.st.store.lock().unwrap().push_device(&token).unwrap().unwrap();
     assert_eq!((d.user_id, d.env.as_str()), (h.owner, "sandbox"));
 }
+
+// ---- personal access tokens ----
+
+impl H {
+    fn pat(&self, name: &str) -> (taisce_store::auth::ApiToken, String) {
+        create_api_token(&mut self.st.store.lock().unwrap(), None, name, now()).unwrap()
+    }
+}
+
+fn with_bearer(mut req: HttpRequest<Body>, token: &str) -> HttpRequest<Body> {
+    req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+    req
+}
+
+#[tokio::test]
+async fn a_pat_opens_mcp_as_its_owner() {
+    let h = harness();
+    let (t, secret) = h.pat("laptop");
+    assert!(secret.starts_with(PAT_PREFIX) && secret.len() == 4 + 43, "{secret}");
+    let r = mcp_tools(&h.app, &secret).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let tools = rpc_body(&r.body)["result"]["tools"].as_array().cloned().unwrap_or_default();
+    assert!(tools.iter().any(|t| t["name"] == "append"), "{}", r.body);
+    // writes: its own claude:<name> by default, `as` picks a label
+    let doc = h.doc("pat");
+    let (e, out) = tool(&h.app, &secret, "/mcp", &[], "append", json!({"doc_id": doc, "markdown": "a"})).await;
+    assert!(!e, "{out}");
+    assert_eq!(h.last_writer(doc), "claude:laptop");
+    let (e, out) = tool(&h.app, &secret, "/mcp", &[], "append", json!({"doc_id": doc, "markdown": "b", "as": "claude:grimoire-pat"})).await;
+    assert!(!e, "{out}");
+    assert_eq!(h.last_writer(doc), "claude:grimoire-pat");
+    // the pin holds: client-sent identity is dropped, as under OAuth
+    for spoof in [("taisce-principal", "tom"), ("x-grimoire-principal", "claude:spoof")] {
+        let (e, out) = tool(&h.app, &secret, "/mcp?as=claude:q&cwd=/x/y", &[spoof], "append", json!({"doc_id": doc, "markdown": "c"})).await;
+        assert!(!e, "{out}");
+        assert_eq!(h.last_writer(doc), "claude:laptop", "{spoof:?}");
+    }
+    for bad in ["tom", "claude", "workbox"] {
+        let (e, out) = tool(&h.app, &secret, "/mcp", &[], "append", json!({"doc_id": doc, "markdown": "x", "as": bad})).await;
+        assert!(e && out.starts_with("as: "), "as {bad:?} must be refused: {out}");
+    }
+    let names: Vec<String> = h.st.store.lock().unwrap().list_principals().unwrap().into_iter().map(|p| p.display_name).collect();
+    for n in ["claude:q", "claude:y", "claude:spoof", "workbox"] {
+        assert!(!names.contains(&n.to_string()), "{n} must not exist: {names:?}");
+    }
+    // the use was recorded
+    let row = h.st.store.lock().unwrap().auth_api_tokens().unwrap().remove(0);
+    assert_eq!(row.id, t.id);
+    assert!(row.last_used_at.is_some_and(|u| u >= t.created_at), "{row:?}");
+}
+
+#[tokio::test]
+async fn a_pat_is_refused_off_mcp() {
+    let h = harness();
+    let (_, secret) = h.pat("laptop");
+    let challenge = format!("Bearer resource_metadata=\"{BASE}/.well-known/oauth-protected-resource\", error=\"invalid_token\"");
+    let doc = h.doc("x");
+    let reqs = [
+        get("/api/docs"),
+        get(&format!("/api/docs/{doc}")),
+        post_json("/api/docs", json!({"title": "nope"})),
+        get("/ws"),
+        post_json("/api/push/devices", json!({"token": "ab", "env": "production"})),
+        post_json("/anything", json!({})),
+    ];
+    for req in reqs {
+        let path = req.uri().path().to_string();
+        let r = send(&h.app, with_bearer(req, &secret)).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{path}: {}", r.body);
+        assert_eq!(r.headers["www-authenticate"], challenge.as_str(), "{path}");
+    }
+    // a path that merely starts with /mcp is not the MCP surface
+    let r = send(&h.app, with_bearer(post_json("/mcpx", json!({})), &secret)).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn revoked_and_unknown_pats_are_refused() {
+    let h = harness();
+    let (t, secret) = h.pat("laptop");
+    assert_eq!(mcp_tools(&h.app, &secret).await.status, StatusCode::OK);
+    let unknown = new_api_token();
+    for bad in [unknown.as_str(), "tsk_", "tsk_short"] {
+        let r = send(&h.app, mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}), Some(bad), None)).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{bad}");
+        assert_eq!(
+            r.headers["www-authenticate"],
+            format!("Bearer resource_metadata=\"{BASE}/.well-known/oauth-protected-resource/mcp\", error=\"invalid_token\"")
+        );
+    }
+    let revoked = revoke_api_token(&mut h.st.store.lock().unwrap(), &t.id.to_string(), now()).unwrap();
+    assert_eq!(revoked.id, t.id);
+    let r = send(&h.app, mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}), Some(&secret), None)).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    // the name is free again; the old secret stays dead
+    let (_, again) = h.pat("laptop");
+    assert_eq!(mcp_tools(&h.app, &again).await.status, StatusCode::OK);
+    assert!(revoke_api_token(&mut h.st.store.lock().unwrap(), "laptop", now()).is_ok());
+    assert!(revoke_api_token(&mut h.st.store.lock().unwrap(), "laptop", now()).is_err());
+}
+
+#[tokio::test]
+async fn oauth_tokens_are_unchanged_beside_pats() {
+    let mut h = harness();
+    let (_, access, _) = h.tokens().await;
+    h.pat("laptop");
+    assert_eq!(mcp_tools(&h.app, &access).await.status, StatusCode::OK);
+    let r = send(&h.app, with_bearer(get("/api/docs"), &access)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let doc = h.doc("oauth");
+    let (e, out) = tool(&h.app, &access, "/mcp", &[], "append", json!({"doc_id": doc, "markdown": "a"})).await;
+    assert!(!e, "{out}");
+    assert_eq!(h.last_writer(doc), "claude:claude");
+}
+
+/// Captures every log line (all targets, all levels) written inside `f`.
+fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Buf::default();
+    let w = buf.clone();
+    let sub = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(move || w.clone())
+        .finish();
+    let out = tracing::subscriber::with_default(sub, || {
+        // a callsite first hit by a parallel test with no subscriber caches
+        // "never"; re-ask every live dispatcher, this one included
+        tracing::callsite::rebuild_interest_cache();
+        f()
+    });
+    let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    (out, text)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pat_secrets_never_reach_the_log_or_the_list() {
+    let h = harness();
+    let ((t, secret), log) = logged(|| create_api_token(&mut h.st.store.lock().unwrap(), None, "laptop", now()).unwrap());
+    assert!(log.contains("pat.create") && log.contains(&t.id.to_string()), "{log}");
+    assert!(!log.contains(&secret) && !log.contains(&secret[4..]), "{log}");
+    assert!(!log.contains(&hash_secret(&secret)), "{log}");
+    let lines = api_token_lines(&h.st.store.lock().unwrap()).unwrap();
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("laptop") && lines[0].contains("never") && lines[0].contains("live"), "{lines:?}");
+    assert!(!lines[0].contains(&secret[4..]) && !lines[0].contains(&hash_secret(&secret)), "{lines:?}");
+    // first use is audited once, without the value
+    let use_it = || {
+        let (st, s) = (h.st.clone(), secret.clone());
+        logged(|| tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(authenticate_pat(&st, &s, "1.2.3.4".into()))))
+    };
+    let (who, log) = use_it();
+    assert_eq!(who.unwrap().user_id, h.owner);
+    assert!(log.contains("pat.first_use") && !log.contains(&secret[4..]), "{log}");
+    let (who, log) = use_it();
+    assert!(who.is_some() && !log.contains("pat.first_use"), "{log}");
+    let (_, log) = logged(|| revoke_api_token(&mut h.st.store.lock().unwrap(), "laptop", now()).unwrap());
+    assert!(log.contains("pat.revoke") && !log.contains(&secret[4..]), "{log}");
+    assert!(api_token_lines(&h.st.store.lock().unwrap()).unwrap()[0].contains("revoked"));
+}
+
+#[test]
+fn token_names() {
+    for ok in ["laptop", "work-box_2", "a.b"] {
+        assert!(valid_token_name(ok).is_ok(), "{ok}");
+    }
+    for bad in ["", " ", "has space", "tsk_x", "slash/no", &"x".repeat(41)] {
+        assert!(valid_token_name(bad).is_err(), "{bad:?}");
+    }
+}
