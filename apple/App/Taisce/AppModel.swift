@@ -87,6 +87,12 @@ final class AppModel {
     @ObservationIgnored private var freshSignIn = false
     /// the cache's owner was checked for this connection
     @ObservationIgnored private var ownerChecked = false
+    /// the check answered (keep, adopt or wipe done): queued writes may go
+    @ObservationIgnored private var ownerSettled = false
+    /// the cache has a recorded owner
+    @ObservationIgnored private var ownerRecorded = false
+    @ObservationIgnored private var ownerRecordTask: Task<Void, Never>?
+    @ObservationIgnored private var lastOwnerRecordAttempt: Date?
 
     struct Revocation: Equatable {
         var docs: Set<DocID>
@@ -146,8 +152,18 @@ final class AppModel {
 
     func startSync() async {
         guard authPhase == .signedIn || authPhase == .notRequired else { return }
-        // ADR 0004: whose cache this is, before anything reads or writes it
-        await checkCacheOwner()
+        // ADR 0004: whose cache this is. A launch with stored tokens doesn't
+        // wait for the profile (it is almost always "keep"): sync starts at
+        // once and only a wipe stops it; queued writes wait for the answer.
+        // Right after a sign-in it is awaited, so a new person never sees
+        // the last person's docs while it answers.
+        if ownerCheckNeeded {
+            if freshSignIn {
+                await checkCacheOwner()
+            } else {
+                Task { await self.checkCacheOwner() }
+            }
+        }
         await sync?.start()
         startPolling()
         // never awaited: the notification center's XPC can stall, and the
@@ -182,6 +198,7 @@ final class AppModel {
             // consumed by the owner check when the state stream says signed in
             freshSignIn = true
             ownerChecked = false
+            ownerSettled = false
             try await auth.signIn(using: SystemWebAuthenticator())
             // the state stream flips authPhase and starts sync
         } catch AuthError.cancelled {
@@ -205,6 +222,19 @@ final class AppModel {
         await forgetUserData()
     }
 
+    /// Before signing out: one last try at sending queued writes, then how
+    /// many would be lost (still queued, or refused). Settings asks before
+    /// signing out when this isn't zero (`SignOutCheck`).
+    func unsentChangesBeforeSignOut() async -> Int {
+        await replayOutbox()
+        guard let cache else { return 0 }
+        let pending = (try? await cache.pendingOutbox().count) ?? 0
+        let failed = (try? await cache.failedOutbox().count) ?? 0
+        pendingWrites = pending
+        failedWrites = failed
+        return pending + failed
+    }
+
     /// Wipe everything this device holds for the signed-in person on this
     /// server: the cache and the per-user settings, then re-plan alerts
     /// (from nothing, so every pending one goes).
@@ -216,6 +246,8 @@ final class AppModel {
         }
         await clearUserState()
         ownerChecked = false
+        ownerSettled = false
+        ownerRecorded = false
     }
 
     /// The per-person state beside the cache: settings in UserDefaults,
@@ -242,13 +274,48 @@ final class AppModel {
     /// person's (or unclaimed data under a fresh sign-in) is wiped first.
     /// Once per connection; LOCAL mode has one person and skips it.
     func checkCacheOwner() async {
-        guard !ownerChecked, auth != nil, authPhase == .signedIn, let cache, let api else { return }
+        guard ownerCheckNeeded, let cache, let api else { return }
         ownerChecked = true
         let fresh = freshSignIn
         freshSignIn = false
-        guard let decision = try? await CacheOwnership.reconcile(cache: cache, api: api, freshSignIn: fresh) else { return }
-        // the cache is wiped; the settings that went with it go too
-        if case .wipe = decision { await clearUserState() }
+        let decision = (try? await CacheOwnership.decision(cache: cache, api: api, freshSignIn: fresh)) ?? .keep
+        if case .wipe = decision {
+            // someone else's data: stop sync (and the replay) before wiping,
+            // clear the settings that went with it, start again from nothing
+            let wasRunning = syncStatus != .idle || pollTask != nil
+            await stopSync()
+            try? await CacheOwnership.apply(decision, to: cache)
+            await clearUserState()
+            ownerSettled = true
+            ownerRecorded = (try? await cache.owner()) != nil
+            if wasRunning { await startSync() }
+            return
+        }
+        try? await CacheOwnership.apply(decision, to: cache)
+        ownerSettled = true
+        ownerRecorded = (try? await cache.owner()) != nil
+    }
+
+    /// The check is due: signed in to a SERVER-mode daemon, not yet done.
+    private var ownerCheckNeeded: Bool { !ownerChecked && auth != nil && authPhase == .signedIn }
+
+    /// Queued writes go out only once the cache is known to be the
+    /// signed-in person's (LOCAL mode: always one person).
+    var mayReplay: Bool { auth == nil || ownerSettled }
+
+    /// A cache still unclaimed after the check (its profile read failed) is
+    /// claimed at the next profile read that works (`recordIfUnclaimed`),
+    /// at most every 30 s, so a later fresh sign-in by the same person keeps it.
+    private func recordOwnerIfUnclaimed() {
+        guard auth != nil, ownerSettled, !ownerRecorded, ownerRecordTask == nil, let cache, let api,
+              lastOwnerRecordAttempt.map({ Date.now.timeIntervalSince($0) > 30 }) ?? true
+        else { return }
+        lastOwnerRecordAttempt = .now
+        ownerRecordTask = Task { [weak self] in
+            let ok = await CacheOwnership.recordIfUnclaimed(cache: cache, api: api)
+            self?.ownerRecorded = ok
+            self?.ownerRecordTask = nil
+        }
     }
 
     private func authChanged(_ state: AuthSession.State) async {
@@ -261,6 +328,7 @@ final class AppModel {
             // their queued writes; anyone else gets a wiped cache
             // (`checkCacheOwner`)
             ownerChecked = false
+            ownerSettled = false
             await stopSync()
             await pushSessionEnding() // push
         }
@@ -309,6 +377,8 @@ final class AppModel {
         observedTodoDoc = nil
         hasSynced = false
         ownerChecked = false
+        ownerSettled = false
+        ownerRecorded = false
         guard let url = URL(string: serverURL) else {
             lastError = "not a URL: \(serverURL)"
             authPhase = .notRequired
@@ -445,11 +515,13 @@ final class AppModel {
         let pending = (try? await cache.pendingOutbox().count) ?? 0
         pendingWrites = pending
         if pending > 0, status == .live { await replayOutbox() }
+        if status == .live { recordOwnerIfUnclaimed() }
     }
 
     /// Send queued writes in order. Single-flight; failures stay on the row.
     func replayOutbox() async {
-        guard let api, let cache, !replaying else { return }
+        // never send one person's queued writes under another's token
+        guard let api, let cache, !replaying, mayReplay else { return }
         replaying = true
         defer { replaying = false }
         let report = try? await OutboxReplayer(api: api, cache: cache).replay()

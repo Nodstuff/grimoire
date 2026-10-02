@@ -317,10 +317,18 @@ Additive and idempotent, one transaction for the data part:
   time, all escaped, with "Didn't start this sign-in yourself? Choose Deny."
 - **The app**: switcher shows `display_name`, own before shared, `person.2` on shared ones;
   a viewer gets no write affordance; a 403 replay fails that entry with a read-only message
-  (never retried) and a 404 drops it; `revoked` rows drop the doc, its bodies, search rows,
-  to-dos and queued writes, close open screens with a note; `granted` rows fetch the doc;
-  the cache is keyed to `/api/profile` `principal_id` and wiped on sign-out (and when
-  someone else signs in); due alerts come only from the person's own lists.
+  (never retried); a plain 404 also fails it, kept ("This doc no longer exists, so this
+  change wasn't saved."), so text typed into a doc deleted elsewhere stays recoverable where
+  refused writes are shown: only a `revoked` row drops queued writes. `revoked` rows drop the
+  doc, its bodies, search rows, to-dos and queued writes, close open screens with a note;
+  `granted` rows fetch the doc. The cache is keyed to `/api/profile` `principal_id`
+  (recorded at the first profile read that works, so the same person's fresh sign-in keeps
+  it), checked beside a resumed sync (queued writes wait for the answer; only a wipe stops
+  sync) and before a fresh sign-in's sync; it is wiped on sign-out, after a last replay and,
+  if writes are still unsent, a "N changes haven't been sent and will be lost" confirmation,
+  and when someone else signs in. The wipe checks that the WAL was truncated. Due alerts
+  come only from the person's own lists. The universal link is accepted at authorize only
+  for `taisce-app` (a CIMD document listing it is refused).
 
 The API stays backward compatible: every existing field is still present, new fields are
 additive, and a single-user server answers exactly as before.

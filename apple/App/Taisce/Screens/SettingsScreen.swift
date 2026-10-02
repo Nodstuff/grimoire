@@ -6,6 +6,9 @@ import TaisceKit
 struct SettingsScreen: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    /// "N changes haven't been sent and will be lost." (nil = not asking)
+    @State private var unsentPrompt: String?
+    @State private var checkingSignOut = false
 
     var body: some View {
         NavigationStack {
@@ -25,15 +28,42 @@ struct SettingsScreen: View {
                 onSave: { url in Task { await model.setServerURL(url) } },
                 onEnableAlerts: { Task { await model.dueAlerts.requestAuthorization() } },
                 onSignOut: {
+                    guard !checkingSignOut else { return }
+                    checkingSignOut = true
                     Task {
-                        await model.signOut()
-                        dismiss()
+                        // one last send; ask before wiping anything still queued
+                        let unsent = await model.unsentChangesBeforeSignOut()
+                        checkingSignOut = false
+                        if let prompt = SignOutCheck.prompt(unsent: unsent) {
+                            unsentPrompt = prompt
+                        } else {
+                            await signOut()
+                        }
                     }
                 },
                 onDone: { dismiss() }
             )
             .task { await model.dueAlerts.refresh() }
+            // a dialog, not window.confirm: works on iPhone and Mac Catalyst
+            .confirmationDialog(
+                unsentPrompt ?? "",
+                isPresented: Binding(get: { unsentPrompt != nil }, set: { if !$0 { unsentPrompt = nil } }),
+                titleVisibility: .visible
+            ) {
+                Button(SignOutCheck.confirm, role: .destructive) {
+                    unsentPrompt = nil
+                    Task { await signOut() }
+                }
+                Button(SignOutCheck.cancel, role: .cancel) { unsentPrompt = nil }
+            }
         }
+    }
+}
+
+extension SettingsScreen {
+    private func signOut() async {
+        await model.signOut()
+        dismiss()
     }
 }
 

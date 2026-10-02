@@ -133,7 +133,7 @@ stale and is listed in `SyncEngine.failedDocs`. UI listens via `updates()`
 
 Outbox replay retries later on 5xx, 408, 429 and HTML (proxy) answers and
 fails an entry only on the server's own refusal (a 4xx or `{error}`;
-a 403 with the read-only message, a 404 is dropped: gone or no longer shared);
+a 403 with the read-only message, a 404 with "This doc no longer exists…", both kept as failed; only a revoked row drops writes);
 a live session's refusal waits too. A landed propose rebases the queued ones
 for that doc only when the epoch moved by exactly our write (+1).
 
@@ -228,7 +228,7 @@ One server, several people (ADR 0004):
   (`EditAccess`) gets no edit mode, ⌘E, new doc, checkboxes, to-do add/done/snooze
   or move; an editor can't move docs out of someone else's workspace; Manage
   workspaces edits only your own. A 403 on replay fails that entry ("You can only
-  view this workspace…", never retried); a 404 drops it.
+  view this workspace…", never retried); a 404 fails it too, kept, so the text is recoverable. Sign-out tries one last replay and asks before losing unsent changes.
 - `access: revoked` rows drop the doc with its bodies, search rows, to-dos and
   queued writes, unpin it and close it in every window ("This doc is no longer
   shared with you."); `granted` rows apply the state and fetch the body. Due

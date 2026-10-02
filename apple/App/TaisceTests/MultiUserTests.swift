@@ -200,6 +200,32 @@ private let all = [theirs, viewed, mine, homeShared]
         #expect(UserDefaults.standard.object(forKey: settings.workspaceKey) == nil)
     }
 
+    @Test func signOutAsksBeforeLosingUnsentChanges() {
+        #expect(SignOutCheck.prompt(unsent: 0) == nil, "nothing to lose: sign out at once")
+        #expect(SignOutCheck.prompt(unsent: 1) == "1 change hasn't been sent and will be lost.")
+        #expect(SignOutCheck.prompt(unsent: 3) == "3 changes haven't been sent and will be lost.")
+        #expect(SignOutCheck.confirm == "Sign out anyway" && SignOutCheck.cancel == "Cancel")
+    }
+
+    @Test func unsentChangesCountQueuedAndRefusedAfterALastTry() async throws {
+        // nothing listens on 127.0.0.1:29: the last replay can't send
+        UserDefaults.standard.set("http://127.0.0.1:29", forKey: AppModel.serverURLKey)
+        defer { UserDefaults.standard.removeObject(forKey: AppModel.serverURLKey) }
+        let m = AppModel()
+        m.discover = { _ in nil }
+        await m.boot()
+        await m.stopSync()
+        let cache = try #require(m.cache)
+        try await cache.wipe()
+        #expect(await m.unsentChangesBeforeSignOut() == 0)
+        let queued = try await cache.enqueue(ProposeRequest(docID: "d", baseEpoch: 1, ops: [.replace(target: "b", content: "typed")]))
+        let refused = try await cache.enqueue(ProposeRequest(docID: "d", baseEpoch: 1, ops: [.replace(target: "c", content: "refused")]))
+        try await cache.markOutbox(try #require(refused.id), state: .failed, error: "x")
+        #expect(await m.unsentChangesBeforeSignOut() == 2, "one still queued after the try, one refused")
+        #expect(try await cache.outboxEntry(try #require(queued.id))?.state == .pending, "the try kept it")
+        try await cache.wipe()
+    }
+
     @Test func aWipedCacheKeepsItsProtectionClassAndLeavesNoText() async throws {
         let dir = FileManager.default.temporaryDirectory.appending(path: "wipe-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

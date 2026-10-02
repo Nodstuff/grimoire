@@ -25,6 +25,22 @@ struct UserSettings {
     }
 }
 
+/// Sign-out wipes the outbox (ADR 0004): with writes still unsent after a
+/// last replay, Settings asks first.
+enum SignOutCheck {
+    /// nil = nothing would be lost, sign out at once; else the question.
+    static func prompt(unsent: Int) -> String? {
+        switch unsent {
+        case ..<1: nil
+        case 1: "1 change hasn't been sent and will be lost."
+        default: "\(unsent) changes haven't been sent and will be lost."
+        }
+    }
+
+    static let confirm = "Sign out anyway"
+    static let cancel = "Cancel"
+}
+
 /// The hosts this build claims universal links for: the Associated Domains
 /// entitlement's host, mirrored into Info.plist (`TaisceAppLinkHosts`, from
 /// the `TAISCE_APP_LINK_HOST` build setting) because an app can't read its
