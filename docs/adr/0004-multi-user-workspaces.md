@@ -136,6 +136,61 @@ gained (the client fetches them).
   lists (their Unsorted and the workspaces they own). Settings written in a user scope are
   that user's (`user.<id>.<key>`); the instance owner still reads the pre-0004 keys.
 
+### 5a. After the adversarial review (2026-10-02)
+
+- **Cross-doc references are same-doc or masked.** A comment's `refers_to` must be a block of
+  its own doc (checked at projection, so `apply`, `propose`, `park` and a later accept all
+  refuse it; a gated cross-doc anchor parks red and never applies); comment threads and
+  agent flags dereference only same-doc, visible targets. An op's payload naming another doc
+  (a doc move's old/new parent and their titles) is masked per reader on every read path
+  (`mask_op`: history, `ops_since`, review queue, proposal outcomes); the stored row keeps
+  the pre-image for decline-revert. A link rewrite's `rename:Old → New` provenance is shown
+  only if the reader can see the renamed doc. Answer sources list only citations the reader
+  can see.
+- **Renames rewrite a `[[link]]` only when every reader of the linking doc can see the
+  renamed doc** (`tenancy::link_reaches`: the linking space's audience ⊆ the renamed doc's);
+  a bare title match is never enough.
+- **Connector tokens on `/api`** (third-party OAuth clients — anything but the person's own
+  app): the safer option was taken. They may write only through the gated routes
+  (`/api/propose`, `/api/propose_markdown`, `/api/comment`, `POST /api/docs`), attributed to
+  their agent principal so the share gate applies exactly as over MCP; every other `/api`
+  write (move, rename, status, delete/restore, resolve, labels, workspaces, members, import,
+  to-dos, profile) answers 403 for them (`viewer::refuse_connector_writes`).
+- **Restore** revives only the docs the restorer can write and counts only those.
+- **A workspace's labelled root moves only with the owner** (unless deeper into the same
+  workspace), and deleting a workspace brings any labelled root that would fall into someone
+  else's space back to the owner's root.
+- **Agent principals are per person** (`principals.owner_user`; NULL and every pre-0004 agent
+  = the instance owner): the same `claude:<label>` or PAT name under two users is two
+  principals, an `as` by id must be one of your own agents, the scribe is per person, and
+  another person's agent reads `claude:x (Name)` in names shown to you. `pinned_label`
+  consults only the caller's own connectors.
+- **No existence probes**: the share route takes a user id (names are resolved on the box's
+  CLI) and answers an unknown id exactly like a known one; refusals of `as` names and ids
+  are generic; an unlabel toward a hidden parent is a generic Forbidden; a viewer's GET of a
+  shared workspace's missing To-do creates nothing. The instance owner still replays
+  pre-0004 idempotency rows (bare principal key).
+
+**Stored cross-doc references and how each is scoped**
+
+| Reference | Where | Scoped by |
+|---|---|---|
+| `blocks.refers_to` | comment anchors | same doc enforced on insert; reads join same-doc + `vis()` |
+| `blocks.parent_id`, block `Move.new_parent` | block trees | `live_block(doc)`: same doc |
+| `ops.payload` MoveDoc `new_parent`/`from_parent` + titles | doc moves | masked per reader (`mask_op`) |
+| `ops.payload` RenameDoc `from_title`, DeleteDoc `title`/`doc_count` | same doc | the doc's own visibility; delete needs the whole subtree writable |
+| `ops.prior` | pre-image | same-doc block |
+| `ops.source_refs` `rename:Old → New` | link rewrites | shown only if the renamed doc is visible; rewrite only where `link_reaches` |
+| `annotations` | doc + op | the doc's visibility (`vis(a.doc_id)`) |
+| `answer_sources.block_id` | answers | rows of invisible/gone blocks dropped per reader |
+| `audits.doc_id` | auditor coverage | read only by `audit_candidates` (`vis()`) |
+| `gardeners.scope_doc` | tendings | gardener owner (`gardener_pred`); tendings 404 for invisible docs |
+| `edges.to_target` (a title) | wikilinks | resolved at read with `vis()` on both ends |
+| `doc_workspace`, `workspaces.doc_ids` | labels | `vis()` on the labelled docs |
+| `changes.doc_id` | feed | visibility now, or rows addressed to the reader |
+| `idempotency.response` | retries | keyed by user |
+| settings `memory.origin.<doc>` | memory sync | per-user setting namespace |
+
 ### 6. Human-only sharing surfaces
 
 - Box CLI: `taisce workspace list|members|share|unshare`, `taisce auth user add`.
@@ -222,3 +277,11 @@ additive, and a single-user server answers exactly as before.
    that such descendants exist, never which.
 10. A visible doc whose parent the viewer cannot see is a root for them (`parent_id` is
     masked to null in lists, reads and change summaries).
+
+Accepted as is after the review (no change): the global change-feed `seq` and the head the
+stream wakes on; `change_stamp`'s user variant still moves with corpus-wide bm25 statistics
+only indirectly (FTS ranking uses whole-corpus stats); the admin diagnostics log tail
+(owner-only, may name any doc); an inherited review policy is not explained to a viewer who
+cannot see the ancestor that sets it; a gardener's scope is chosen at run start (its writes
+are still gated); the SSE stream re-scans invisible rows after each wake; deleting a subtree
+with hidden descendants answers a generic Forbidden.
