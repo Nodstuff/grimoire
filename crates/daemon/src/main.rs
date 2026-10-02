@@ -670,7 +670,8 @@ fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, h
     Ok(())
 }
 
-/// A workspace by id, unique id prefix, `Name@owner`, or a name only one
+/// A workspace by id, unique id prefix, `Name@owner` (owner name or its
+/// start: `Work@aoife`), or a name only one
 /// workspace carries (the CLI is System scope: it sees every person's).
 fn cli_workspace(store: &SqliteStore, key: &str) -> anyhow::Result<taisce_store::Workspace> {
     let all = store.list_workspaces()?;
@@ -684,7 +685,7 @@ fn cli_workspace(store: &SqliteStore, key: &str) -> anyhow::Result<taisce_store:
         .filter(|w| {
             w.id.to_string().starts_with(&key.to_lowercase())
                 || (w.name.eq_ignore_ascii_case(name)
-                    && owner.as_ref().is_none_or(|o| w.owner_name.as_deref().is_some_and(|n| n.to_lowercase() == *o)))
+                    && owner.as_ref().is_none_or(|o| w.owner_name.as_deref().is_some_and(|n| n.to_lowercase().starts_with(o.as_str()))))
         })
         .collect();
     match hits.as_slice() {
