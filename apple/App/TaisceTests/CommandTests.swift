@@ -28,6 +28,20 @@ private let picker = WorkspacePicker(workspaces: [work, home], unsortedCount: 2,
         #expect(off.shortcut(1) == nil)
     }
 
+    @Test func docTextSizeStepsAlongDynamicTypeAndStopsAtTheEnds() {
+        #expect(DocTextSize.size(DocTextSize.actual) == .large)
+        #expect(DocTextSize.size(DocTextSize.bigger(DocTextSize.actual)) == .xLarge)
+        #expect(DocTextSize.smaller(0) == 0 && !DocTextSize.canShrink(0))
+        let top = DocTextSize.steps.count - 1
+        #expect(DocTextSize.bigger(top) == top && !DocTextSize.canGrow(top))
+        // a stored value from a longer scale never crashes
+        #expect(DocTextSize.size(99) == DocTextSize.steps.last && DocTextSize.size(-3) == .medium)
+        // read mode scales by hand (Catalyst ignores dynamicTypeSize): 1 at actual size, growing per step
+        #expect(DocTextSize.scale(DocTextSize.actual) == 1)
+        #expect(DocTextSize.scale(DocTextSize.actual + 1) > 1 && DocTextSize.scale(DocTextSize.actual + 2) > DocTextSize.scale(DocTextSize.actual + 1))
+        #expect(DocTextSize.scale(0) < 1)
+    }
+
     @Test func todayIsClickableAgainAfterOpeningADocFromIt() {
         let r = Router()
         r.isPad = true
