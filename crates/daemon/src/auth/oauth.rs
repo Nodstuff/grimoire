@@ -36,6 +36,10 @@ pub fn router(st: AuthState) -> axum::Router {
         // RFC 8414 path-suffixed form, which some clients (Claude Code's SDK)
         // probe for the /mcp resource: the same server, so the same document
         .route("/.well-known/oauth-authorization-server/mcp", get(server_metadata))
+        // Apple's universal links and shared web credentials for the app
+        .route("/.well-known/apple-app-site-association", get(apple_app_site_association))
+        // (a literal, so isolation_tests' route scan sees it; = APP_HTTPS_CALLBACK_PATH)
+        .route("/oauth/app-callback", get(app_callback_page))
         // anything else under .well-known (openid-configuration, …) is a JSON
         // 404, never the web UI's HTML, so a client's discovery fallback can parse it
         .route("/.well-known/{*rest}", get(well_known_missing))
@@ -44,6 +48,40 @@ pub fn router(st: AuthState) -> axum::Router {
         .route("/oauth/token", post(token).options(preflight))
         .route("/oauth/revoke", post(revoke).options(preflight))
         .with_state(st)
+}
+
+/// The `apple-app-site-association` document (no auth, no redirect, JSON):
+/// the app claims `/oauth/app-callback` as a universal link, so the sign-in
+/// redirect reaches only the Taisce app, and may use this host's passkeys
+/// (`webcredentials`). Apple's CDN fetches it from the public URL.
+pub fn apple_app_site_association_json() -> Value {
+    json!({
+        "applinks": {
+            "details": [{
+                "appIDs": [super::APPLE_APP_ID],
+                "components": [{"/": super::APP_HTTPS_CALLBACK_PATH, "comment": "the app's OAuth sign-in redirect"}],
+            }],
+        },
+        "webcredentials": {"apps": [super::APPLE_APP_ID]},
+    })
+}
+
+async fn apple_app_site_association() -> Response {
+    let mut r = Json(apple_app_site_association_json()).into_response();
+    // short-lived: a team or bundle change should reach Apple's CDN quickly
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("max-age=3600"));
+    r
+}
+
+/// `/oauth/app-callback` reached in a browser: the Taisce app catches this
+/// URL before it loads, so landing here means no app was there to catch it.
+/// The page never echoes the query (it may carry a code).
+async fn app_callback_page() -> Response {
+    super::passkey::notice_page(
+        "Open Taisce",
+        "Open this on a device with the Taisce app",
+        "This link finishes signing in to the Taisce app. It does nothing in a browser: start the sign-in again from the app.",
+    )
 }
 
 async fn well_known_missing() -> Response {
@@ -238,11 +276,14 @@ async fn register(State(st): State<AuthState>, req: Request) -> Response {
         },
         _ => return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri", "1-10 redirect_uris required"),
     };
+    // the app's universal link passes here; that only the app's own
+    // registration may carry it is checked below (`app_registration`)
+    let app_https = st.cfg.app_https_redirect();
     for u in &uris {
         if let Err(e) = check_redirect_shape(u) {
             return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri", &e);
         }
-        if !redirect_allowed(&st.cfg.extra_redirects, u) {
+        if !redirect_allowed(&st.cfg.extra_redirects, u) && *u != app_https {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_redirect_uri",
@@ -274,17 +315,19 @@ async fn register(State(st): State<AuthState>, req: Request) -> Response {
     if !subset("response_types", &["code"]) {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", "response_types: code only");
     }
-    // the app's scheme is first party: its exact registration (what the
-    // shipped Taisce app sends) gets the fixed, server-registered app client;
-    // any other use of the scheme is refused (ADR 0004, review round 2)
-    let app_scheme = uris.iter().any(|u| u.starts_with(super::APP_REDIRECT_SCHEME));
-    if app_scheme && uris.iter().any(|u| u != super::APP_REDIRECT_URI) {
-        tracing::warn!(target: AUDIT, event = "client.register_refused", why = "app scheme", ip);
-        return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri", "that redirect scheme is reserved for the Taisce app");
+    // the app's redirects are first party: its exact registrations (the
+    // custom scheme alone, as every shipped build sends; the universal link
+    // alone; or both, as newer builds send) get the fixed, server-registered
+    // app client; any other use of either is refused (ADR 0004, round 2)
+    let app_registration = super::app_registration(&uris, &app_https);
+    if app_registration == Some(false) {
+        tracing::warn!(target: AUDIT, event = "client.register_refused", why = "app redirect", ip);
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri", "that redirect is reserved for the Taisce app");
     }
     let now = now();
-    if app_scheme {
-        let ok = with_store(&st.store, taisce_store::Scope::System, move |s| super::ensure_first_party(s, now)).await;
+    if app_registration == Some(true) {
+        let https = app_https.clone();
+        let ok = with_store(&st.store, taisce_store::Scope::System, move |s| super::ensure_first_party(s, now, &https)).await;
         if let Err(e) = ok {
             return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &e.to_string());
         }
@@ -296,7 +339,7 @@ async fn register(State(st): State<AuthState>, req: Request) -> Response {
                     "client_id": super::FIRST_PARTY_APP_CLIENT,
                     "client_id_issued_at": now,
                     "client_name": "Taisce",
-                    "redirect_uris": [super::APP_REDIRECT_URI],
+                    "redirect_uris": [super::APP_REDIRECT_URI, app_https],
                     "grant_types": ["authorization_code", "refresh_token"],
                     "response_types": ["code"],
                     "token_endpoint_auth_method": "none",
@@ -422,7 +465,8 @@ async fn authorize(State(st): State<AuthState>, headers: HeaderMap, Query(q): Qu
         None if client.redirect_uris.len() == 1 => client.redirect_uris[0].clone(),
         None => return super::passkey::error_page(StatusCode::BAD_REQUEST, "redirect_uri is required."),
     };
-    if !redirect_allowed(&st.cfg.extra_redirects, &redirect) {
+    // (the app's universal link is registered only on the fixed app client)
+    if !redirect_allowed(&st.cfg.extra_redirects, &redirect) && redirect != st.cfg.app_https_redirect() {
         return super::passkey::error_page(StatusCode::BAD_REQUEST, "This server does not send sign-ins to that redirect_uri.");
     }
     let state = q.state.as_deref();
@@ -458,7 +502,18 @@ async fn authorize(State(st): State<AuthState>, headers: HeaderMap, Query(q): Qu
         ceremony: None,
     };
     let id = st.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).add_authz(pending);
-    super::passkey::login_page(&id, &client.client_name, &client.client_id)
+    let cid = client.client_id.clone();
+    let first_party = with_store(&st.store, taisce_store::Scope::System, move |s| s.oauth_is_first_party(&cid).unwrap_or(false)).await;
+    super::passkey::login_page(
+        &id,
+        &super::passkey::LoginContext {
+            client_name: &client.client_name,
+            client_id: &client.client_id,
+            first_party,
+            user_agent: headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()),
+            at: now(),
+        },
+    )
 }
 
 /// After the passkey: mint the single-use code and the redirect carrying it.

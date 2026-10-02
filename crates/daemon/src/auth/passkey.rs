@@ -466,21 +466,103 @@ img-src 'none'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'"
     r
 }
 
-/// The sign-in + consent page: names the client, then one passkey tap
-/// both authenticates and approves.
-pub fn login_page(req_id: &str, client_name: &str, client_id: &str) -> Response {
+/// Who is asking, for the sign-in page: the client, and the device and
+/// time the request came from, so a person can spot a sign-in they did not
+/// start (someone else's link opened on their phone).
+pub struct LoginContext<'a> {
+    pub client_name: &'a str,
+    pub client_id: &'a str,
+    /// a pinned first-party client (the person's own Taisce app), not a
+    /// connector: a connector may call itself anything, "Taisce" included
+    pub first_party: bool,
+    /// the browser's `User-Agent` (summarised, never shown raw)
+    pub user_agent: Option<&'a str>,
+    /// unix seconds on the server
+    pub at: i64,
+}
+
+/// A coarse, privacy-light summary of a `User-Agent`: the device family and
+/// the browser, e.g. "iPhone · Safari", "Mac · Chrome". Unknown parts are
+/// left out; nothing from the header is copied through except via this
+/// fixed vocabulary.
+pub fn device_summary(user_agent: Option<&str>) -> String {
+    let Some(ua) = user_agent.filter(|u| !u.trim().is_empty()) else {
+        return "an unknown device".into();
+    };
+    let device = if ua.contains("iPhone") {
+        Some("iPhone")
+    } else if ua.contains("iPad") {
+        Some("iPad")
+    } else if ua.contains("Android") {
+        Some("Android")
+    } else if ua.contains("CrOS") {
+        Some("Chromebook")
+    } else if ua.contains("Macintosh") || ua.contains("Mac OS X") {
+        Some("Mac")
+    } else if ua.contains("Windows") {
+        Some("Windows PC")
+    } else if ua.contains("Linux") {
+        Some("Linux PC")
+    } else {
+        None
+    };
+    // order matters: Edge and Chrome both say Safari; Chrome says Chrome
+    let browser = if ua.contains("Edg/") || ua.contains("EdgiOS") || ua.contains("EdgA/") {
+        Some("Edge")
+    } else if ua.contains("Firefox/") || ua.contains("FxiOS") {
+        Some("Firefox")
+    } else if ua.contains("Chrome/") || ua.contains("CriOS") {
+        Some("Chrome")
+    } else if ua.contains("Safari/") || ua.contains("AppleWebKit") {
+        Some("Safari")
+    } else {
+        None
+    };
+    match (device, browser) {
+        (Some(d), Some(b)) => format!("{d} · {b}"),
+        (Some(d), None) => d.into(),
+        (None, Some(b)) => b.into(),
+        (None, None) => "an unknown device".into(),
+    }
+}
+
+/// "2 Oct 2026, 14:03 UTC": the server's clock, so it is the same for
+/// every reader (the page has no script for the visitor's zone).
+pub fn server_time(at: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(at, 0)
+        .map(|t| t.format("%-d %b %Y, %H:%M UTC").to_string())
+        .unwrap_or_default()
+}
+
+/// The sign-in + consent page: names the client, the device and the time
+/// of the request, then one passkey tap both authenticates and approves.
+pub fn login_page(req_id: &str, cx: &LoginContext) -> Response {
     page(
         "Sign in to Taisce",
         &format!(
             r#"<h1>Sign in to Taisce</h1>
-<p><span class="client">{name}</span> wants full access to your Taisce: reading and editing your docs.</p>
+<p><span class="client">{name}</span> ({kind}) wants full access to your Taisce: reading and editing your docs.</p>
+<p>Requested from <span class="client">{device}</span> at <span class="client">{time}</span>.</p>
+<p class="muted">Didn’t start this sign-in yourself? Choose Deny.</p>
 <p class="muted">Client: {id}</p>
 <button id="go">Continue with passkey</button> <button id="deny" class="alt">Deny</button>
 <p id="msg" role="status"></p>"#,
-            name = esc(client_name),
-            id = esc(client_id)
+            name = esc(cx.client_name),
+            kind = if cx.first_party { "the Taisce app" } else { "a connected app, not the Taisce app" },
+            device = esc(&device_summary(cx.user_agent)),
+            time = esc(&server_time(cx.at)),
+            id = esc(cx.client_id)
         ),
         &[("mode", "login"), ("req", req_id)],
+    )
+}
+
+/// A plain page with a heading and one paragraph (no buttons).
+pub fn notice_page(title: &str, heading: &str, message: &str) -> Response {
+    page(
+        title,
+        &format!("<h1>{}</h1><p>{}</p><p id=\"msg\"></p><button id=\"go\" hidden></button>", esc(heading), esc(message)),
+        &[("mode", "notice")],
     )
 }
 

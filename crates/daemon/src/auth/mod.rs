@@ -99,6 +99,14 @@ impl AuthConfig {
         format!("{}/mcp", self.base)
     }
 
+    /// The app's universal-link sign-in redirect on this server
+    /// (`https://<public host>/oauth/app-callback`): a second exact redirect
+    /// of the pinned `taisce-app` client, claimed by the app through the
+    /// `apple-app-site-association` file, so no other app can catch it.
+    pub fn app_https_redirect(&self) -> String {
+        format!("{}{APP_HTTPS_CALLBACK_PATH}", self.base)
+    }
+
     /// The public authority (`host[:port]`) for rmcp's Host allowlist.
     pub fn authority(&self) -> String {
         self.base.split_once("://").map(|(_, a)| a.to_string()).unwrap_or_default()
@@ -130,7 +138,7 @@ impl AuthState {
             .rp_name("Taisce")
             .build()
             .map_err(|e| anyhow::anyhow!("webauthn config: {e}"))?;
-        ensure_first_party(&mut store.lock(taisce_store::Scope::System), now())?;
+        ensure_first_party(&mut store.lock(taisce_store::Scope::System), now(), &cfg.app_https_redirect())?;
         Ok(Self {
             cfg: Arc::new(cfg),
             store,
@@ -227,6 +235,22 @@ pub const APP_REDIRECT_URI: &str = "ie.null.taisce:/oauth/callback";
 /// redirect a client declares: DCR maps the app's exact registration to this
 /// client and refuses any other use of the scheme.
 pub const FIRST_PARTY_APP_CLIENT: &str = "taisce-app";
+/// The path of the app's universal-link redirect (`AuthConfig::app_https_redirect`).
+pub const APP_HTTPS_CALLBACK_PATH: &str = "/oauth/app-callback";
+/// The Apple app the `apple-app-site-association` file names:
+/// `<team id>.<bundle id>`, from `apple/App/project.yml` (`DEVELOPMENT_TEAM`
+/// 6UP35L9425, `PRODUCT_BUNDLE_IDENTIFIER` ie.null.taisce). The Mac
+/// (Catalyst) build shares the bundle id, so one entry covers both.
+pub const APPLE_APP_ID: &str = "6UP35L9425.ie.null.taisce";
+
+/// Is `uris` a registration of the Taisce app: exactly the custom-scheme
+/// redirect, exactly the universal-link one, or both. `Some(false)` when
+/// it uses either but adds anything else (refused: reserved for the app);
+/// `None` when it uses neither (an ordinary client).
+pub fn app_registration(uris: &[String], app_https: &str) -> Option<bool> {
+    let claims = uris.iter().any(|u| u.starts_with(APP_REDIRECT_SCHEME) || u == app_https);
+    claims.then(|| uris.iter().all(|u| u == APP_REDIRECT_URI || u == app_https))
+}
 
 /// A "lapsed" app client (ADR 0004, review round 4): a DCR client whose
 /// only redirect is the app's, but which is not pinned first party — a
@@ -249,15 +273,20 @@ pub fn lapsed_app_client(s: &SqliteStore, client_id: &str) -> bool {
 }
 
 /// Register the fixed app client and pin first-party clients (idempotent).
-pub fn ensure_first_party(s: &mut SqliteStore, now: i64) -> taisce_store::Result<()> {
-    if s.oauth_client(FIRST_PARTY_APP_CLIENT)?.is_none() {
+/// Its redirects are the custom scheme (every app build) and `app_https`,
+/// the universal link on this server's public URL (newer builds); a row from
+/// an earlier build, or from another public URL, is brought up to date.
+pub fn ensure_first_party(s: &mut SqliteStore, now: i64, app_https: &str) -> taisce_store::Result<()> {
+    let redirects = vec![APP_REDIRECT_URI.to_string(), app_https.to_string()];
+    let existing = s.oauth_client(FIRST_PARTY_APP_CLIENT)?;
+    if existing.as_ref().is_none_or(|c| c.redirect_uris != redirects) {
         s.oauth_upsert_client(&taisce_store::auth::OAuthClient {
             client_id: FIRST_PARTY_APP_CLIENT.into(),
             kind: "dcr".into(),
             client_name: "Taisce".into(),
-            redirect_uris: vec![APP_REDIRECT_URI.into()],
+            redirect_uris: redirects,
             metadata: "{\"first_party\":true}".into(),
-            created_at: now,
+            created_at: existing.map_or(now, |c| c.created_at),
             refresh_at: None,
         })?;
     }

@@ -137,6 +137,19 @@ const COVERAGE: &[(&str, &str)] = &[
     ("mcp:add_comment", "a_pre_access_tombstone_is_gone_on_every_block_path"),
     ("mcp:related", "a_pre_access_tombstone_is_gone_on_every_block_path"),
     ("/api/doc/{id}/history", "agent_principals_are_per_person"),
+    // auth/oauth.rs: public (no token), server-level documents and the OAuth
+    // endpoints; none reads a tenant's data
+    ("/.well-known/oauth-protected-resource", "public_auth_routes_carry_no_tenant_data"),
+    ("/.well-known/oauth-protected-resource/mcp", "public_auth_routes_carry_no_tenant_data"),
+    ("/.well-known/oauth-authorization-server", "public_auth_routes_carry_no_tenant_data"),
+    ("/.well-known/oauth-authorization-server/mcp", "public_auth_routes_carry_no_tenant_data"),
+    ("/.well-known/apple-app-site-association", "public_auth_routes_carry_no_tenant_data"),
+    ("/.well-known/{*rest}", "public_auth_routes_carry_no_tenant_data"),
+    ("/oauth/app-callback", "public_auth_routes_carry_no_tenant_data"),
+    ("/oauth/register", "public_auth_routes_carry_no_tenant_data (client rows only; auth::tests covers DCR)"),
+    ("/oauth/authorize", "public_auth_routes_carry_no_tenant_data (the passkey decides the user; auth::tests)"),
+    ("/oauth/token", "public_auth_routes_carry_no_tenant_data (a code or refresh token names its user; auth::tests)"),
+    ("/oauth/revoke", "public_auth_routes_carry_no_tenant_data"),
 ];
 
 struct Fx {
@@ -965,6 +978,42 @@ async fn a_server_request_without_identity_is_refused() {
     assert_eq!(bare.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
 }
 
+/// The public auth routes (discovery, the AASA file, the app's callback
+/// page, the OAuth endpoints without credentials) answer without a token
+/// and carry nothing of anyone's docs, workspaces or names.
+#[tokio::test]
+async fn public_auth_routes_carry_no_tenant_data() {
+    let fx = fixture();
+    let raw = |method: &str, path: &str, body: Option<&str>| {
+        let mut b = Request::builder().method(method).uri(path).header("host", "localhost:7513");
+        if body.is_some() {
+            b = b.header("content-type", "application/x-www-form-urlencoded");
+        }
+        b.body(Body::from(body.unwrap_or("").to_string())).unwrap()
+    };
+    for (method, path, body) in [
+        ("GET", "/.well-known/oauth-protected-resource", None),
+        ("GET", "/.well-known/oauth-protected-resource/mcp", None),
+        ("GET", "/.well-known/oauth-authorization-server", None),
+        ("GET", "/.well-known/oauth-authorization-server/mcp", None),
+        ("GET", "/.well-known/apple-app-site-association", None),
+        ("GET", "/.well-known/openid-configuration", None),
+        ("GET", "/oauth/app-callback?code=x&state=y", None),
+        ("GET", "/oauth/authorize?client_id=taisce-app&redirect_uri=ie.null.taisce:/oauth/callback&response_type=code", None),
+        ("POST", "/oauth/token", Some("grant_type=refresh_token&refresh_token=nope&client_id=taisce-app")),
+        ("POST", "/oauth/revoke", Some("token=nope&client_id=taisce-app")),
+    ] {
+        let res = fx.app.clone().oneshot(raw(method, path, body)).await.unwrap();
+        let status = res.status();
+        assert_ne!(status, StatusCode::UNAUTHORIZED, "{path} is public");
+        let text = String::from_utf8_lossy(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()).into_owned();
+        fx.no_leak(path, &text);
+        for name in ["Aoife", "familyshared", "Family plan", "aoifeown"] {
+            assert!(!text.contains(name), "{path} names {name}");
+        }
+    }
+}
+
 /// Every `.route("<path>", …)` in the routers' sources, and every MCP tool,
 /// must have a row in `COVERAGE` — a new route cannot ship untested.
 #[test]
@@ -978,6 +1027,7 @@ fn every_route_and_tool_is_covered() {
         include_str!("todo.rs"),
         include_str!("push.rs"),
         include_str!("admin.rs"),
+        include_str!("auth/oauth.rs"),
     ];
     let re = regex::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
     let covered: std::collections::HashSet<&str> = COVERAGE.iter().map(|(p, _)| *p).collect();
@@ -1254,13 +1304,13 @@ async fn first_party_is_a_pinned_client_not_a_declared_redirect() {
     grant(&mut raw, "dcr_tom_mac");
     let gone = grant(&mut raw, "dcr_revoked");
     raw.oauth_revoke_grant(&gone.to_string(), "test", now()).unwrap();
-    crate::auth::ensure_first_party(&mut raw, now()).unwrap();
+    crate::auth::ensure_first_party(&mut raw, now(), &format!("{BASE}/oauth/app-callback")).unwrap();
     assert!(raw.oauth_is_first_party("dcr_tom_iphone").unwrap() && raw.oauth_is_first_party("dcr_tom_mac").unwrap(), "Tom's live app sessions carry over");
     assert!(!raw.oauth_is_first_party("dcr_squatter").unwrap(), "a pre-registered client nobody signed in with is not pinned");
     assert!(!raw.oauth_is_first_party("dcr_revoked").unwrap(), "a revoked grant does not pin");
     raw.oauth_upsert_client(&client("dcr_new_claim", crate::auth::APP_REDIRECT_URI)).unwrap();
     grant(&mut raw, "dcr_new_claim");
-    crate::auth::ensure_first_party(&mut raw, now()).unwrap();
+    crate::auth::ensure_first_party(&mut raw, now(), &format!("{BASE}/oauth/app-callback")).unwrap();
     assert!(!raw.oauth_is_first_party("dcr_new_claim").unwrap(), "a later claim is never grandfathered");
 }
 
