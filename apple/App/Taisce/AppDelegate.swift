@@ -12,6 +12,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // the Mac's first unsandboxed launch: the old container's cache and
         // preferences come over before the model reads either
         let report = AppPaths.migrateSandboxContainer()
+        #if targetEnvironment(macCatalyst)
+        // runs a crash or force quit left behind
+        if !AppPaths.isTestHost { CodeRun.sweepStaleRuns() }
+        #endif
         model = AppModel(migrationBlocked: SandboxMigration.blockingReason(report))
         super.init()
     }

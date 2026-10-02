@@ -186,6 +186,14 @@ public final class CodeRun: Sendable {
         Task.detached { await run.execute(request, environment: environment) }
     }
 
+    /// Remove what earlier launches' runs left in `<tempRoot>/taisce-run`
+    /// (a crash, a force quit). Called at launch, before any run.
+    public static func sweepStaleRuns(tempRoot: URL = URL(fileURLWithPath: NSTemporaryDirectory())) {
+        let dir = tempRoot.appendingPathComponent("taisce-run", isDirectory: true)
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
+        for n in names { try? FileManager.default.removeItem(at: dir.appendingPathComponent(n)) }
+    }
+
     public func stop() {
         let p = state.withLock { s in
             s.stopped = true
@@ -297,6 +305,7 @@ public final class CodeRun: Sendable {
     func capture(_ spec: SpawnSpec, deadline: ContinuousClock.Instant) async throws -> ProcessCapture.Result {
         let remaining = max(.milliseconds(1), deadline - ContinuousClock.now)
         let run = self
+        defer { state.withLock { $0.current = nil } }
         return try await ProcessCapture.run(spec, timeout: remaining, started: { p in
             let stopped = run.state.withLock { s in
                 s.current = p
@@ -325,6 +334,8 @@ public final class CodeRun: Sendable {
                         run.state.withLock { $0.collector.add(bytes, from: kind) }
                     }, onExit: { st in
                         done.withLock { $0 = true }
+                        // a late Stop must not signal a finished (reusable) group
+                        run.state.withLock { $0.current = nil }
                         cont.resume(returning: st)
                     })
                     let stopped = state.withLock { s in

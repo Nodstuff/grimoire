@@ -353,7 +353,12 @@ import Darwin
         run.stop()
         let o = await collecting.value
         #expect(o.result?.stopped == true)
-        #expect(kill(pid, 0) == -1 && errno == ESRCH, "the backgrounded sleep is gone too")
+        var gone = false
+        for _ in 0..<50 where !gone {
+            gone = kill(pid, 0) == -1 && errno == ESRCH
+            if !gone { try await Task.sleep(for: .milliseconds(20)) }
+        }
+        #expect(gone, "the backgrounded sleep is gone too")
     }
 
     @Test func timeoutFires() async throws {

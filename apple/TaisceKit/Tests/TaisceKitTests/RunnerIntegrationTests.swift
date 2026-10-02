@@ -93,7 +93,47 @@ import Testing
         let o = await collecting.value
         #expect(ContinuousClock.now - start < .seconds(4))
         #expect(o.result?.stopped == true)
-        #expect(kill(pid, 0) == -1 && errno == ESRCH, "no orphaned sleep")
+        #expect(await Self.gone(pid), "no orphaned sleep")
+    }
+
+    /// Up to 1 s for a pid to be gone (an orphan is reaped by launchd, not us).
+    static func gone(_ pid: pid_t) async -> Bool {
+        for _ in 0..<50 {
+            if kill(pid, 0) == -1 && errno == ESRCH { return true }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return false
+    }
+
+    /// S3: a backgrounded child that let go of the pipes is ended with the
+    /// run, every time (not only when the waiter happened to see the leader
+    /// go first).
+    @Test func aDetachedBackgroundChildNeverOutlivesTheRun() async throws {
+        for round in 0..<8 {
+            let marker = FileManager.default.temporaryDirectory.appendingPathComponent("bg-\(UUID().uuidString)")
+            let code = "sleep 20 >/dev/null 2>&1 &\necho $! > '\(marker.path)'\necho done"
+            let run = CodeRun(RunRequest(language: .shell(interpreter: "/bin/bash"), code: code), environment: await Self.env(), options: try Self.options())
+            let o = await Self.collect(run)
+            #expect(o.result?.exitCode == 0 && o.log.text == "done\n")
+            let pid = pid_t((try? String(contentsOf: marker, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
+            #expect(pid > 0)
+            let isGone = await Self.gone(pid)
+            #expect(isGone, "round \(round): the background sleep \(pid) outlived the run")
+            if !isGone { kill(pid, SIGKILL) }
+            // N3: the finished run holds no process: a late Stop signals nothing
+            #expect(run.state.withLock { $0.current } == nil)
+            run.stop()
+        }
+    }
+
+    @Test func staleRunDirectoriesAreSwept() throws {
+        let opts = try Self.options()
+        let stale = opts.tempRoot.appendingPathComponent("taisce-run/\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: stale, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: stale.appendingPathComponent("block.sh"))
+        CodeRun.sweepStaleRuns(tempRoot: opts.tempRoot)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: opts.tempRoot.appendingPathComponent("taisce-run").path).isEmpty)
+        CodeRun.sweepStaleRuns(tempRoot: opts.tempRoot.appendingPathComponent("nothing-here"))
     }
 
     @Test func aTrappedTermIsKilledAfterTheGrace() async throws {

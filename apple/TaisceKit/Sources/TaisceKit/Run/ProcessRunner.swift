@@ -181,18 +181,19 @@ public final class SpawnedProcess: Sendable {
         if let report { onExit(report) }
     }
 
+    /// The leader is gone: ALWAYS end the rest of its group (a backgrounded
+    /// child, with or without the pipes), and wait, bounded, until none of
+    /// it is left before the exit counts. Escapes by `setsid` or a double
+    /// fork into another group are out of reach, as for any process group.
     func leaderExited(_ status: ProcessStatus, _ onExit: @escaping @Sendable (ProcessStatus) -> Void) {
+        terminateGroup()
+        let deadline = ContinuousClock.now + Self.killGrace + .seconds(1)
+        while kill(-pid, 0) == 0, ContinuousClock.now < deadline { usleep(5_000) }
         let report: ProcessStatus? = state.withLock { s in
             s.status = status
             return reportIfDone(&s)
         }
-        if let report {
-            onExit(report)
-            return
-        }
-        // the leader is gone but its pipes are still open: a backgrounded
-        // child holds them. End the group so the run can finish.
-        terminateGroup()
+        if let report { onExit(report) }
     }
 
     private func reportIfDone(_ s: inout State) -> ProcessStatus? {
@@ -207,9 +208,11 @@ public final class SpawnedProcess: Sendable {
     /// SIGTERM to the whole group, then SIGKILL after `killGrace` if any of
     /// it is still there. Safe to call more than once.
     public func terminateGroup() {
+        // after the exit is reported the group is gone and its id may be
+        // reused: never signal it then
         let first = state.withLock { s in
             defer { s.terminating = true }
-            return !s.terminating
+            return !s.terminating && !s.exitReported
         }
         guard first else { return }
         let pgid = pid

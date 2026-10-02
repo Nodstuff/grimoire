@@ -410,9 +410,18 @@ The same `Taisce` target, built for `platform=macOS,variant=Mac Catalyst`.
 the model reads a preference): the sandboxed builds kept everything in
 `~/Library/Containers/ie.null.taisce/Data/Library/`. On the first unsandboxed
 launch the caches (`cache-*.sqlite` with `-wal`/`-shm`: docs, bodies, to-dos,
-cursor and the outbox of unsent writes) are copied to the new folder unless a
-cache of that name is already there, and the container's preferences are
-merged in key by key (a key already set keeps its value). The container is
+cursor and the outbox of unsent writes) are staged beside the new folder and
+moved in database-last (a failed move takes back what it moved), and the
+container's preferences are merged in key by key (a key already set keeps
+its value). A cache already at the destination is kept if the migration put
+it there (`migration.sandboxContainer.created`), set aside under
+`.replaced-<time>/` and replaced if it has no owner and no queued writes, kept
+if the container's copy has nothing unsent, and otherwise left with an error:
+the pass is never marked done while the container holds writes that weren't
+copied. While a pass is incomplete (unreadable container, a failed copy, that
+conflict) the app opens no cache at all and shows "Quit and open Taisce from
+Finder to finish moving your data" (`MigrationBlockedView`), so it can never
+create the empty cache a later pass would mistake for data. The container is
 never changed or deleted; `Caches/diagrams` is not copied (re-rendered). A
 marker key (`migration.sandboxContainer.v1`) makes later launches return at
 once; each pass is logged (file and key names, never values) to
@@ -447,8 +456,11 @@ and duration, "compiled ✓" for a Go block that only compiles.
 - Isolation: every run is its own process group (`posix_spawn` with
   `POSIX_SPAWN_SETPGROUP`; Foundation's `Process` isn't on Catalyst) in
   `$TMPDIR/taisce-run/<uuid>`, deleted before the run reports done; stdin is
-  /dev/null. Nothing is shared between runs. When the leader exits, anything
-  left in its group is ended too.
+  /dev/null. Nothing is shared between runs. When the leader exits, the rest
+  of its group is always sent SIGTERM (SIGKILL 2 s later) and the run
+  reports done only once the group is gone, so a backgrounded child never
+  outlives it. A program that leaves its group (`setsid`, a double fork into
+  a new group) is out of reach, as for any process group.
 - Environment: your login shell's (`$SHELL -l -c 'env -0'` from a minimal
   seed, once per launch, 5 s bound, else the app's own). cwd is the run's
   temp dir, or the fence's `cwd=` (```` ```bash cwd=~/code/portus ````; `~`
@@ -473,15 +485,25 @@ and duration, "compiled ✓" for a Go block that only compiles.
   through the outbox like an editor save (the review gate applies). Practice
   text and try lines last for the session.
 - Trust (`RunTrust`, pure): the doc's ledger (`/api/doc/{id}/history`
-  carries each op's principal, target block and epoch) says who last wrote
-  the block's content (insert/replace). Yours (`/api/profile` principal id)
+  carries each op's principal, target block, epoch, `source_refs` and
+  content) says who last wrote the block's content (insert/replace). Ops that
+  carry your principal but someone else's words are not taken at face
+  value: a decline's revert (`review:decline:`) is unknown, a rename's link
+  rewrite (`rename:`) looks further back, and a write of yours repeating
+  content someone else wrote earlier (a whole-doc save re-inserting their
+  block) is theirs. Run shows "Checking who wrote this…" while the ledger
+  and profile load (5 s at most; then, or on an error, it asks and says
+  why). Yours (`/api/profile` principal id)
   runs; anyone else's (an agent, another person), or unknown (offline,
   history hidden, older than the last 100 ops) first shows the code with
   "Last edited by <name>. Run it on this Mac?". A yes is remembered per doc
   on this device (`RunApprovals`, per server, forgotten at sign-out) until
   someone other than you changes the doc: the newest op by others must be
   no newer than at approval (offline: the doc's epoch must not have moved).
-  Practice text you typed never asks. No server change was needed.
+  Practice text you typed never asks; untouched practice text follows the
+  doc's code (and its trust), so a Run never executes an older version.
+  The sheet says the code runs as you with your login environment, tokens
+  included. No server change was needed.
 - Layout: regular width (every Mac window, iPad) is the split view
   (`RootLayout`): sidebar with the workspace switcher, search, Today,
   To-dos and the Library tree; the doc on the right. Compact width (iPhone)
