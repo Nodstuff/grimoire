@@ -75,4 +75,14 @@ extension APIError {
         default: false
         }
     }
+
+    /// A 403: the server refuses this write for you. On a multi-user server
+    /// (ADR 0004) that is a viewer's write: `{"error": "forbidden: read-only: …"}`.
+    public var isForbidden: Bool {
+        switch self {
+        case .http(403): true
+        case let .server(msg): msg.hasPrefix("forbidden")
+        default: false
+        }
+    }
 }

@@ -45,7 +45,7 @@ struct DocScreen: View {
         }
         .onChange(of: editable, initial: true) { _, ok in
             // a doc just created here opens straight into edit mode
-            if ok, model.pendingEditDoc == docID {
+            if ok, access.canEdit, model.pendingEditDoc == docID {
                 model.pendingEditDoc = nil
                 Task { await startEditing() }
             }
@@ -60,10 +60,15 @@ struct DocScreen: View {
             Task {
                 if editor != nil {
                     await finishEditing()
-                } else if editable, page != nil {
+                } else if editable, access.canEdit, page != nil {
                     await startEditing()
                 }
             }
+        }
+        // ADR 0004: made a viewer while editing: save what's typed (the
+        // server says no, and the chip shows it) and go back to reading
+        .onChange(of: access.canEdit) { _, can in
+            if !can, editor != nil { Task { await finishEditing() } }
         }
         .onChange(of: editor == nil) { _, closed in
             if !closed {
@@ -89,8 +94,14 @@ struct DocScreen: View {
             .environment(\.openURL, OpenURLAction { _ in .handled })
     }
 
+    /// ADR 0004: what you may change here (a viewer reads only; pins are local)
+    private var access: EditAccess { model.access(for: docID) }
+
     private var reading: some View {
         let doc = model.index.byID[docID]
+        let access = access
+        let onToggle: ((BlockID, Int, Bool) -> Void)? = access.canEdit ? { toggle($0, $1, $2) } : nil
+        let onNewDocHere: (() -> Void)? = access.canCreate ? { router.newDoc(in: docID) } : nil
         return DocContent(
             title: doc?.title ?? "",
             breadcrumb: model.index.breadcrumb(of: docID),
@@ -99,19 +110,20 @@ struct DocScreen: View {
             loadError: loadError,
             pinned: model.isPinned(docID),
             overrides: overrides,
-            onToggle: toggle,
+            onToggle: onToggle,
             onTogglePin: { model.togglePin(docID) },
             onRetry: { Task { await refresh(force: true) } },
-            onEdit: editable && page != nil && !opening ? { Task { await startEditing() } } : nil,
+            onEdit: editable && access.canEdit && page != nil && !opening ? { Task { await startEditing() } } : nil,
+            accessNote: access.note,
             workspace: model.workspaceBadge(for: docID),
-            onMoveWorkspace: model.hasWorkspaces ? { movingWorkspace = true } : nil,
+            onMoveWorkspace: model.hasWorkspaces && access.canMove ? { movingWorkspace = true } : nil,
             children: DocChildrenLayout.make(
                 pageEmpty: page.map(\.isEmpty),
                 children: DocChildrenLayout.children(of: docID, index: model.index, meta: model.editMeta)
             ),
             childCounts: model.index.childCount,
             onOpenChild: { router.open(.doc($0)) },
-            onNewDocHere: { router.newDoc(in: docID) }
+            onNewDocHere: onNewDocHere
         )
         .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
         // children's "edited … ago" (a handful; each is cached until it changes)
@@ -207,6 +219,20 @@ struct DocScreen: View {
     }
 }
 
+/// The doc header's "View only": you can read this workspace, not change it.
+struct ViewOnlyNote: View {
+    let text: String
+
+    var body: some View {
+        Label(text, systemImage: "eye")
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(Theme.secondary)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(text): you can read this workspace but not change it")
+            .accessibilityIdentifier("doc.viewOnly")
+    }
+}
+
 private struct MetaKey: Hashable {
     var doc: DocID
     var missing: Bool
@@ -227,6 +253,8 @@ struct DocContent: View {
     var onRetry: () -> Void = {}
     /// nil when the doc can't be edited here (yet)
     var onEdit: (() -> Void)?
+    /// "View only" in a workspace where you are a viewer (ADR 0004)
+    var accessNote: String?
     // workspaces: the header chip and the … menu's "Move to workspace…"
     var workspace: WorkspaceBadge?
     var onMoveWorkspace: (() -> Void)?
@@ -240,7 +268,12 @@ struct DocContent: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 VStack(alignment: .leading, spacing: 10) {
-                    if let workspace { WorkspaceChip(badge: workspace) }
+                    if workspace != nil || accessNote != nil {
+                        HStack(spacing: 8) {
+                            if let workspace { WorkspaceChip(badge: workspace) }
+                            if let accessNote { ViewOnlyNote(text: accessNote) }
+                        }
+                    }
                     Text(title)
                         .font(Theme.serif(.largeTitle))
                         .foregroundStyle(Theme.text)

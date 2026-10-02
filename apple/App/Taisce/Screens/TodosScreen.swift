@@ -16,6 +16,7 @@ struct TodosScreen: View {
         TodosContent(
             board: TodoBoard.shown(board, hasSynced: model.hasSynced, status: model.syncStatus),
             offline: offline,
+            readOnly: !model.currentAccess.canEdit,
             alertStatus: model.dueAlerts.status,
             onEnableAlerts: { Task { await model.dueAlerts.requestAuthorization() } },
             draft: $draft,
@@ -55,6 +56,8 @@ struct TodosContent: View {
     /// nil while loading
     let board: TodoBoard?
     var offline = false
+    /// a workspace you only view (ADR 0004): no add, done, snooze
+    var readOnly = false
     var alertStatus: DueAlertStatus = .allowed
     var onEnableAlerts: () -> Void = {}
     @Binding var draft: String
@@ -70,11 +73,22 @@ struct TodosContent: View {
     @State private var snoozing: TodoEntry?
     @FocusState private var fieldFocused: Bool
 
+    static func kicker(offline: Bool, readOnly: Bool) -> String? {
+        switch (offline, readOnly) {
+        case (true, true): "View only · offline"
+        case (false, true): "View only"
+        case (true, false): "Offline · from this device"
+        case (false, false): nil
+        }
+    }
+
     var body: some View {
         List {
             Section {
-                ScreenHeader(title: "To-dos", kicker: offline ? "Offline · from this device" : nil) {
-                    CircleIconButton(systemImage: "plus", label: "New to-do", filled: true) { fieldFocused = true }
+                ScreenHeader(title: "To-dos", kicker: TodosContent.kicker(offline: offline, readOnly: readOnly)) {
+                    if !readOnly {
+                        CircleIconButton(systemImage: "plus", label: "New to-do", filled: true) { fieldFocused = true }
+                    }
                 }
                 .listRowBackground(Color.clear)
                 .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 0))
@@ -111,10 +125,12 @@ struct TodosContent: View {
         .groundBackground()
         .toolbarVisibility(.hidden, for: .navigationBar)
         .safeAreaInset(edge: .bottom) {
-            NewTodoField(draft: $draft, hint: hint, now: now, focused: $fieldFocused, onAdd: onAdd)
-                .padding(.horizontal, Theme.gutter)
-                .padding(.bottom, 8)
-                .frame(maxWidth: Theme.readingWidth)
+            if !readOnly {
+                NewTodoField(draft: $draft, hint: hint, now: now, focused: $fieldFocused, onAdd: onAdd)
+                    .padding(.horizontal, Theme.gutter)
+                    .padding(.bottom, 8)
+                    .frame(maxWidth: Theme.readingWidth)
+            }
         }
         .confirmationDialog("Snooze until", isPresented: Binding(get: { snoozing != nil }, set: { if !$0 { snoozing = nil } }), titleVisibility: .visible, presenting: snoozing) { entry in
             ForEach(Snooze.allCases, id: \.self) { s in
@@ -127,17 +143,23 @@ struct TodosContent: View {
         if !items.isEmpty {
             Section {
                 ForEach(items) { entry in
-                    TodoRow(entry: entry, now: now, done: checked.contains(entry.id), onToggle: onToggleDone.map { f in { f(entry) } })
-                        .listRowInsets(EdgeInsets())
-                        .listRowBackground(Theme.surface)
-                        .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                            Button("Done", systemImage: "checkmark") { onDone(entry) }.tint(Theme.green)
-                        }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            Button("Snooze", systemImage: "clock") { snoozing = entry }.tint(Theme.amber)
-                        }
-                        .accessibilityAction(named: "Done") { onDone(entry) }
-                        .accessibilityAction(named: "Snooze") { snoozing = entry }
+                    if readOnly {
+                        TodoRow(entry: entry, now: now, done: false, onToggle: nil)
+                            .listRowInsets(EdgeInsets())
+                            .listRowBackground(Theme.surface)
+                    } else {
+                        TodoRow(entry: entry, now: now, done: checked.contains(entry.id), onToggle: onToggleDone.map { f in { f(entry) } })
+                            .listRowInsets(EdgeInsets())
+                            .listRowBackground(Theme.surface)
+                            .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                                Button("Done", systemImage: "checkmark") { onDone(entry) }.tint(Theme.green)
+                            }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                Button("Snooze", systemImage: "clock") { snoozing = entry }.tint(Theme.amber)
+                            }
+                            .accessibilityAction(named: "Done") { onDone(entry) }
+                            .accessibilityAction(named: "Snooze") { snoozing = entry }
+                    }
                 }
             } header: {
                 Text(title.uppercased())

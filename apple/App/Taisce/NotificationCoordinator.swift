@@ -128,11 +128,27 @@ final class NotificationCoordinator: DueAlertPermission {
     /// same set `/api/todo/due` with no `workspace` reads, without a network
     /// wait at launch (and it works offline).
     func reconcile() async {
-        guard let cache, let records = try? await cache.todos() else { return }
+        guard let cache, let all = try? await cache.todos() else { return }
         let tz = timeZone()
         let docs = (try? await cache.docs()) ?? []
+        // ADR 0004: alerts for your own lists only, as the server's /api/todo/due
+        let records = Self.alerting(all, docs: docs, workspaces: (try? await cache.workspaces()) ?? [])
         lists = Self.lists(records, docs: docs)
         await reconcile(with: records.compactMap { DueAlertInput($0, timeZone: tz) })
+    }
+
+    /// The items whose list is yours: in your Unsorted or a workspace you
+    /// own. A shared workspace's list (someone else's) is read on its
+    /// screen but never alerts here; a workspace this device doesn't know
+    /// (an older server) counts as yours.
+    nonisolated static func alerting(_ records: [TodoRecord], docs: [DocRecord], workspaces: [Workspace]) -> [TodoRecord] {
+        let foreign = Set(workspaces.filter { !$0.isOwn }.map(\.id))
+        guard !foreign.isEmpty else { return records }
+        let ws = Dictionary(docs.map { ($0.id, $0.workspaceID) }, uniquingKeysWith: { a, _ in a })
+        return records.filter { r in
+            guard let resolved = ws[r.docID] ?? nil else { return true }
+            return !foreign.contains(resolved)
+        }
     }
 
     nonisolated static func lists(_ records: [TodoRecord], docs: [DocRecord]) -> [String: WorkspaceScope] {

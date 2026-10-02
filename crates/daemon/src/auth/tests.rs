@@ -729,6 +729,29 @@ async fn cimd_client_is_fetched_validated_and_cached() {
     assert_eq!(h.exchange(&id, &code, VERIFIER).await.status, StatusCode::OK);
 }
 
+/// A client metadata document may list any redirect it likes; the app's
+/// universal link still goes only to the fixed app client.
+#[tokio::test]
+async fn a_cimd_client_cannot_claim_the_apps_universal_link() {
+    let mut cfg = AuthConfig::from_public_url(BASE).unwrap();
+    cfg.cimd_allow_insecure = true;
+    let mut h = harness_with(cfg);
+    assert!(h.enroll().await.status.is_success());
+    let link = format!("{BASE}{APP_HTTPS_CALLBACK_PATH}");
+    let listed = link.clone();
+    let id = serve_doc(move |id| json!({"client_id": id, "client_name": "Taisce", "redirect_uris": [listed, REDIRECT]}).to_string()).await;
+    let q = format!("response_type=code&client_id={id}&redirect_uri={link}&code_challenge={CHALLENGE}&code_challenge_method=S256");
+    let (r, req) = h.authorize(&q).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(req.is_none(), "no sign-in page, no code");
+    // its other redirect still works; the app client still gets the link
+    let q = format!("response_type=code&client_id={id}&redirect_uri={REDIRECT}&code_challenge={CHALLENGE}&code_challenge_method=S256");
+    assert_eq!(h.authorize(&q).await.0.status, StatusCode::OK);
+    register_uris(&h, json!([link])).await;
+    let code = h.code_for_at(FIRST_PARTY_APP_CLIENT, &link).await;
+    assert!(!code.is_empty());
+}
+
 #[tokio::test]
 async fn cimd_document_must_name_itself() {
     let mut cfg = AuthConfig::from_public_url(BASE).unwrap();
@@ -1081,4 +1104,188 @@ async fn a_lapsed_app_client_re_registers_as_the_pinned_app() {
     // and a revoked grant behaves the same: its client is unpinned and unknown
     let (_, _) = make(&h, "dcr_revoked_mac");
     assert_eq!(send(&h.app, probe("dcr_revoked_mac")).await.status, StatusCode::BAD_REQUEST);
+}
+
+// ---- the app's universal-link redirect, the AASA file, the sign-in page ----
+
+fn app_https() -> String {
+    format!("{BASE}{APP_HTTPS_CALLBACK_PATH}")
+}
+
+async fn register_uris(h: &H, uris: Value) -> Res {
+    send(&h.app, post_json("/oauth/register", json!({"client_name": "Taisce", "redirect_uris": uris}))).await
+}
+
+/// Newer app builds register the universal link (alone or beside the custom
+/// scheme) and sign in through it; both map to the pinned app client, which
+/// keeps the custom scheme for every older build.
+#[tokio::test]
+async fn the_app_signs_in_through_its_universal_link() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    for uris in [json!([app_https(), APP_REDIRECT]), json!([app_https()]), json!([APP_REDIRECT, app_https()])] {
+        let r = register_uris(&h, uris.clone()).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{uris}: {}", r.body);
+        let j = r.json();
+        assert_eq!(j["client_id"], FIRST_PARTY_APP_CLIENT, "{uris}");
+        let got: Vec<&str> = j["redirect_uris"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert_eq!(got, vec![APP_REDIRECT, app_https().as_str()], "the app learns both redirects");
+    }
+    // the universal link is the app's alone: never beside anything else, never for another client
+    for uris in [
+        json!([app_https(), "https://claude.ai/api/mcp/auth_callback"]),
+        json!([app_https(), "http://127.0.0.1:9/cb"]),
+    ] {
+        let r = register_uris(&h, uris.clone()).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uris}: {}", r.body);
+    }
+    // on a real (https) public URL, nothing else on the host is a redirect
+    let prod = harness_with(AuthConfig::from_public_url("https://taisce.example").unwrap());
+    for uris in [json!(["https://taisce.example/oauth/app-callback/evil"]), json!(["https://taisce.example/oauth/authorize"])] {
+        let r = register_uris(&prod, uris.clone()).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uris}: {}", r.body);
+    }
+    let r = register_uris(&prod, json!(["https://taisce.example/oauth/app-callback"])).await;
+    assert_eq!(r.json()["client_id"], FIRST_PARTY_APP_CLIENT);
+    let claude = h.register("Claude", REDIRECT).await;
+    let q = format!("response_type=code&client_id={claude}&redirect_uri={}&code_challenge={CHALLENGE}&code_challenge_method=S256", app_https());
+    let (page, _) = h.authorize(&q).await;
+    assert_eq!(page.status, StatusCode::BAD_REQUEST, "a connector cannot borrow the app's link");
+    // the code comes back on the universal link and is exchanged there
+    let code = h.code_for_at(FIRST_PARTY_APP_CLIENT, &app_https()).await;
+    let t = h.exchange_at(FIRST_PARTY_APP_CLIENT, &code, VERIFIER, &app_https()).await;
+    assert_eq!(t.status, StatusCode::OK, "{}", t.body);
+    let who = authenticate(&h.st, t.json()["access_token"].as_str().unwrap()).await.expect("a live token");
+    assert!(who.owner_app, "the universal-link sign-in is first party");
+    // a code minted for one redirect is not redeemable at the other
+    let code = h.code_for_at(FIRST_PARTY_APP_CLIENT, &app_https()).await;
+    let t = h.exchange_at(FIRST_PARTY_APP_CLIENT, &code, VERIFIER, APP_REDIRECT).await;
+    assert_eq!(t.status, StatusCode::BAD_REQUEST, "{}", t.body);
+    // the custom scheme keeps working for the builds already installed
+    let code = h.code_for_at(FIRST_PARTY_APP_CLIENT, APP_REDIRECT).await;
+    let t = h.exchange_at(FIRST_PARTY_APP_CLIENT, &code, VERIFIER, APP_REDIRECT).await;
+    assert_eq!(t.status, StatusCode::OK, "{}", t.body);
+    // the app's probe (`clientIsKnown`) answers for either redirect
+    for redirect in [APP_REDIRECT.to_string(), app_https()] {
+        let r = send(&h.app, get(&format!("/oauth/authorize?client_id={FIRST_PARTY_APP_CLIENT}&redirect_uri={redirect}&response_type=code"))).await;
+        assert!(r.status.is_redirection(), "{redirect}: {}", r.status);
+        assert!(r.headers["location"].to_str().unwrap().starts_with(&redirect));
+    }
+}
+
+/// A `taisce-app` row from the build before (custom scheme only) gains the
+/// universal link at the next start and stays pinned; live sessions are untouched.
+#[test]
+fn the_pinned_app_client_gains_the_universal_link() {
+    let mut s = SqliteStore::open_in_memory().unwrap();
+    s.oauth_upsert_client(&taisce_store::auth::OAuthClient {
+        client_id: FIRST_PARTY_APP_CLIENT.into(),
+        kind: "dcr".into(),
+        client_name: "Taisce".into(),
+        redirect_uris: vec![APP_REDIRECT_URI.into()],
+        metadata: "{\"first_party\":true}".into(),
+        created_at: 7,
+        refresh_at: None,
+    })
+    .unwrap();
+    s.oauth_mark_first_party(FIRST_PARTY_APP_CLIENT, 7).unwrap();
+    ensure_first_party(&mut s, now(), "https://taisce.example/oauth/app-callback").unwrap();
+    let c = s.oauth_client(FIRST_PARTY_APP_CLIENT).unwrap().unwrap();
+    assert_eq!(c.redirect_uris, vec![APP_REDIRECT_URI.to_string(), "https://taisce.example/oauth/app-callback".into()]);
+    assert_eq!(c.created_at, 7, "the row is updated, not recreated");
+    assert!(s.oauth_is_first_party(FIRST_PARTY_APP_CLIENT).unwrap());
+    // the public URL comes from config: a moved server follows it
+    ensure_first_party(&mut s, now(), "https://other.example/oauth/app-callback").unwrap();
+    let c = s.oauth_client(FIRST_PARTY_APP_CLIENT).unwrap().unwrap();
+    assert_eq!(c.redirect_uris[1], "https://other.example/oauth/app-callback");
+}
+
+#[test]
+fn app_registrations_are_exact() {
+    let https = "https://t.example/oauth/app-callback";
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(app_registration(&v(&[APP_REDIRECT_URI]), https), Some(true));
+    assert_eq!(app_registration(&v(&[https]), https), Some(true));
+    assert_eq!(app_registration(&v(&[https, APP_REDIRECT_URI]), https), Some(true));
+    assert_eq!(app_registration(&v(&[https, "https://claude.ai/api/mcp/auth_callback"]), https), Some(false));
+    assert_eq!(app_registration(&v(&["ie.null.taisce:/evil"]), https), Some(false));
+    assert_eq!(app_registration(&v(&["https://claude.ai/api/mcp/auth_callback"]), https), None);
+}
+
+/// The AASA file: JSON at the exact path, no token, no redirect, naming the
+/// app by team + bundle id for the callback path and for web credentials.
+#[tokio::test]
+async fn the_apple_app_site_association_file() {
+    let h = harness();
+    let r = send(&h.app, get("/.well-known/apple-app-site-association")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.headers["content-type"].to_str().unwrap().starts_with("application/json"));
+    assert!(!r.headers.contains_key(header::LOCATION));
+    let j = r.json();
+    assert_eq!(APPLE_APP_ID, "6UP35L9425.ie.null.taisce", "team id + bundle id from apple/App/project.yml");
+    assert_eq!(j["applinks"]["details"][0]["appIDs"], json!([APPLE_APP_ID]));
+    assert_eq!(j["applinks"]["details"][0]["components"][0]["/"], APP_HTTPS_CALLBACK_PATH);
+    assert_eq!(j["webcredentials"]["apps"], json!([APPLE_APP_ID]));
+}
+
+/// The callback path opened in a browser: a plain page, never the code.
+#[tokio::test]
+async fn the_app_callback_in_a_browser_says_open_the_app() {
+    let h = harness();
+    let r = send(&h.app, get("/oauth/app-callback?code=zzsecretcode&state=s&iss=x")).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.headers["content-type"].to_str().unwrap().starts_with("text/html"));
+    assert!(r.body.contains("Open this on a device with the Taisce app"), "{}", r.body);
+    assert!(!r.body.contains("zzsecretcode"), "the page never echoes the code");
+    assert_eq!(r.headers[header::REFERRER_POLICY], "no-referrer");
+}
+
+/// The sign-in page says which app is asking, from which device and when,
+/// with every part escaped.
+#[tokio::test]
+async fn the_sign_in_page_names_the_app_the_device_and_the_time() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    let evil = h.register("<script>alert(1)</script>Taisce", REDIRECT).await;
+    let page = |client: &str, redirect: &str, ua: &str| {
+        HttpRequest::get(format!(
+            "/oauth/authorize?response_type=code&client_id={client}&redirect_uri={redirect}&code_challenge={CHALLENGE}&code_challenge_method=S256"
+        ))
+        .header("host", "localhost:7512")
+        .header(header::USER_AGENT, ua)
+        .body(Body::empty())
+        .unwrap()
+    };
+    let iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
+    let r = send(&h.app, page(&evil, REDIRECT, iphone)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.body.contains("&lt;script&gt;alert(1)&lt;/script&gt;Taisce"), "{}", r.body);
+    assert!(!r.body.contains("<script>alert"), "the client name is escaped");
+    assert!(r.body.contains("a connected app, not the Taisce app"), "a connector calling itself Taisce is still a connector");
+    assert!(r.body.contains("iPhone · Safari"), "{}", r.body);
+    let year = chrono::Utc::now().format("%Y").to_string();
+    assert!(r.body.contains(" UTC") && r.body.contains(&year), "the server time");
+    assert!(r.body.contains("Choose Deny"));
+    // a UA with markup in it is never copied through
+    let r = send(&h.app, page(&evil, REDIRECT, "<img src=x onerror=alert(1)> Windows")).await;
+    assert!(!r.body.contains("<img"), "the user agent is summarised, not echoed");
+    assert!(r.body.contains("Windows PC"));
+    // the person's own app reads as the app
+    register_uris(&h, json!([APP_REDIRECT])).await;
+    let mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+    let r = send(&h.app, page(FIRST_PARTY_APP_CLIENT, APP_REDIRECT, mac)).await;
+    assert!(r.body.contains("(the Taisce app)"), "{}", r.body);
+    assert!(r.body.contains("Mac · Safari"));
+}
+
+#[test]
+fn device_summaries_are_coarse() {
+    use passkey::device_summary as d;
+    assert_eq!(d(Some("Mozilla/5.0 (iPad; CPU OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/140.0 Mobile/15E148 Safari/604.1")), "iPad · Chrome");
+    assert_eq!(d(Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36 Edg/140.0")), "Windows PC · Edge");
+    assert_eq!(d(Some("Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0")), "Linux PC · Firefox");
+    assert_eq!(d(Some("Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36")), "Android · Chrome");
+    assert_eq!(d(Some("curl/8.7.1")), "an unknown device");
+    assert_eq!(d(None), "an unknown device");
+    assert_eq!(passkey::server_time(1_790_000_000), "21 Sep 2026, 14:13 UTC");
 }

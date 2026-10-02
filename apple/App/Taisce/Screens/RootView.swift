@@ -41,6 +41,45 @@ struct RootView: View {
         .onChange(of: model.docs.count) {
             if appliedLaunchArguments { _ = router.openLaunchDoc(index: model.index) }
         }
+        // ADR 0004: an unshared doc closes, with a gentle note
+        .onChange(of: model.revocation) { _, r in
+            guard let r, router.drop(r.docs) else { return }
+            model.accessNotice = AppModel.revokedNotice
+        }
+        .overlay(alignment: .top) {
+            if let note = model.accessNotice {
+                AccessNoticeBanner(text: note) { model.accessNotice = nil }
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .task(id: note) {
+                        try? await Task.sleep(for: .seconds(5))
+                        if model.accessNotice == note { model.accessNotice = nil }
+                    }
+            }
+        }
+        .animation(.default, value: model.accessNotice)
+    }
+}
+
+/// "This doc is no longer shared with you." A capsule at the top that goes
+/// by itself; tap to dismiss. VoiceOver announces it.
+struct AccessNoticeBanner: View {
+    let text: String
+    var onDismiss: () -> Void = {}
+
+    var body: some View {
+        Button(action: onDismiss) {
+            Label(text, systemImage: "person.2.slash")
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(Theme.text)
+                .padding(.horizontal, 16)
+                .frame(minHeight: Theme.minTarget)
+                .glassEffect(.regular, in: .capsule)
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Dismisses this note")
+        .accessibilityIdentifier("access.notice")
+        .onAppear { AccessibilityNotification.Announcement(text).post() }
     }
 }
 
@@ -175,7 +214,9 @@ struct PadSidebar: View {
                         .contextMenu {
                             Button(model.isPinned(node.id) ? "Unpin from Today" : "Pin to Today",
                                    systemImage: model.isPinned(node.id) ? "pin.slash" : "pin") { model.togglePin(node.id) }
-                            Button("New doc here", systemImage: "plus") { router.newDoc(in: node.id) }
+                            if model.access(for: node.id).canCreate {
+                                Button("New doc here", systemImage: "plus") { router.newDoc(in: node.id) }
+                            }
                         }
                 }
             }
@@ -188,6 +229,7 @@ struct PadSidebar: View {
                 Button { router.newDoc() } label: { Image(systemName: "square.and.pencil") }
                     .accessibilityLabel("New doc")
                     .help("New doc (⌘N)")
+                    .disabled(!model.currentAccess.canCreate)
             }
         }
         .safeAreaInset(edge: .bottom) {

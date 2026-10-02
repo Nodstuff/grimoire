@@ -31,6 +31,18 @@ struct WorkspaceDot: View {
     }
 }
 
+/// The subtle mark on a shared workspace (decorative: the row's label says "shared").
+struct WorkspaceSharedGlyph: View {
+    static let symbol = "person.2"
+
+    var body: some View {
+        Image(systemName: Self.symbol)
+            .font(.caption2)
+            .foregroundStyle(Theme.secondary)
+            .accessibilityHidden(true)
+    }
+}
+
 /// The switcher pill: current workspace's dot and name; the menu lists the
 /// others and "New workspace…".
 struct WorkspaceSwitcher: View {
@@ -44,12 +56,16 @@ struct WorkspaceSwitcher: View {
             Menu {
                 ForEach(picker.options, id: \.self) { scope in
                     Button { onSelect(scope) } label: {
+                        // the current one is ticked; a shared one wears person.2
                         if scope == current {
                             Label(picker.name(scope), systemImage: "checkmark")
+                        } else if picker.isShared(scope) {
+                            Label(picker.name(scope), systemImage: WorkspaceSharedGlyph.symbol)
                         } else {
                             Text(picker.name(scope))
                         }
                     }
+                    .accessibilityLabel(picker.accessibilityName(scope))
                 }
                 Divider()
                 Button("New workspace\u{2026}", systemImage: "plus", action: onNew)
@@ -58,6 +74,7 @@ struct WorkspaceSwitcher: View {
                 HStack(spacing: 6) {
                     WorkspaceDot(color: picker.color(current))
                     Text(picker.name(current)).font(.caption.weight(.semibold)).foregroundStyle(Theme.text)
+                    if picker.isShared(current) { WorkspaceSharedGlyph() }
                     Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(Theme.secondary)
                 }
                 .padding(.horizontal, 12)
@@ -66,7 +83,7 @@ struct WorkspaceSwitcher: View {
                 .frame(minHeight: Theme.minTarget)
                 .contentShape(.rect)
             }
-            .accessibilityLabel("Workspace: \(picker.name(current))")
+            .accessibilityLabel("Workspace: \(picker.accessibilityName(current))")
         }
     }
 }
@@ -196,7 +213,8 @@ struct MoveToWorkspaceSheet: View {
         let picker = model.workspacePicker
         NavigationStack {
             List {
-                ForEach(picker.ordered) { w in
+                // not into a workspace you only view
+                ForEach(EditAccess.moveTargets(picker.workspaces)) { w in
                     target(.id(w.id), picker: picker)
                 }
                 target(.unsorted, picker: picker)
@@ -218,12 +236,14 @@ struct MoveToWorkspaceSheet: View {
             HStack(spacing: 10) {
                 WorkspaceDot(color: picker.color(scope), size: 10)
                 Text(picker.name(scope)).foregroundStyle(Theme.text)
+                if picker.isShared(scope) { WorkspaceSharedGlyph() }
                 Spacer()
                 if docIDs.count == 1, model.index.byID[docIDs[0]].map({ WorkspaceScope($0.workspaceID) == scope }) ?? false {
                     Image(systemName: "checkmark").foregroundStyle(Theme.accent)
                 }
             }
         }
+        .accessibilityLabel(picker.accessibilityName(scope))
     }
 }
 
@@ -270,11 +290,20 @@ struct ManageWorkspacesSheet: View {
     @State private var error: String?
 
     var body: some View {
-        let ordered = model.workspacePicker.ordered
+        // only your own can be renamed, recoloured, reordered or deleted
+        let ordered = model.ownWorkspaces
+        let sharedWithYou = model.workspacePicker.ordered.filter { !$0.isOwn }
         NavigationStack {
             List {
                 if let error {
                     Text(error).font(.footnote).foregroundStyle(Theme.rose)
+                }
+                if !sharedWithYou.isEmpty {
+                    Section("Shared with you") {
+                        ForEach(sharedWithYou) { w in
+                            SharedWorkspaceRow(workspace: w)
+                        }
+                    }
                 }
                 Section {
                     ForEach(ordered) { w in
@@ -311,6 +340,32 @@ struct ManageWorkspacesSheet: View {
 
     private func run(_ op: @escaping @MainActor () async -> String?) {
         Task { error = await op() }
+    }
+}
+
+/// Someone else's workspace in "Manage workspaces": who owns it and your
+/// role; nothing to change (sharing is set on the server, by its owner).
+struct SharedWorkspaceRow: View {
+    let workspace: Workspace
+
+    var subtitle: String {
+        let owner = workspace.ownerName.map { "Shared by \($0)" } ?? "Shared with you"
+        let role = workspace.isViewOnly ? "view only" : "you can edit"
+        return "\(owner) \u{00B7} \(role)"
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            WorkspaceDot(color: workspace.color, size: 12)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(workspace.label).foregroundStyle(Theme.text)
+                Text(subtitle).font(.caption).foregroundStyle(Theme.secondary)
+            }
+            Spacer()
+            WorkspaceSharedGlyph()
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -385,12 +440,13 @@ struct WorkspaceChip: View {
         HStack(spacing: 5) {
             WorkspaceDot(color: badge.color, size: 7)
             Text(badge.name).font(.caption2.weight(.medium)).foregroundStyle(Theme.secondary)
+            if badge.shared { WorkspaceSharedGlyph() }
         }
         .padding(.horizontal, 8)
         .frame(minHeight: 22)
         .background(Theme.surface2, in: .capsule)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Workspace: \(badge.name)")
+        .accessibilityLabel("Workspace: \(badge.accessibilityName)")
     }
 }
 
@@ -406,7 +462,8 @@ struct WorkspaceMoveHost: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .environment(\.moveToWorkspace, model.hasWorkspaces ? { moving = $0 } : nil)
+            // only out of a space you own (your Unsorted, your workspaces)
+            .environment(\.moveToWorkspace, model.hasWorkspaces && model.currentAccess.canMove ? { moving = $0 } : nil)
             .sheet(item: Binding(get: { moving.map(MovingDoc.init) }, set: { moving = $0?.id })) { m in
                 MoveToWorkspaceSheet(docIDs: [m.id])
             }

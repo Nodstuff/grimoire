@@ -33,6 +33,8 @@
 	<string>1</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Taisce connects to your server on this network.</string>
+	<key>TaisceAppLinkHosts</key>
+	<string>$(TAISCE_APP_LINK_HOST)</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>

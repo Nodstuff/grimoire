@@ -49,7 +49,8 @@ xcodebuild -project Taisce.xcodeproj -scheme Taisce -sdk iphonesimulator \
   -destination 'generic/platform=iOS Simulator' build
 ```
 
-Integration against real scratch daemons (LOCAL on 7515, SERVER on 7516
+Integration against real scratch daemons (LOCAL on 7515, SERVER on 7516,
+or `TAISCE_IT_LOCAL_PORT` / `TAISCE_IT_SERVER_PORT`
 signed in headlessly with the daemon's `softpasskey` example; temp dirs,
 killed on exit):
 
@@ -131,7 +132,8 @@ stale and is listed in `SyncEngine.failedDocs`. UI listens via `updates()`
 (AsyncStream) and GRDB `ValueObservation`.
 
 Outbox replay retries later on 5xx, 408, 429 and HTML (proxy) answers and
-fails an entry only on the server's own refusal (a 4xx or `{error}`);
+fails an entry only on the server's own refusal (a 4xx or `{error}`;
+a 403 with the read-only message, a 404 with "This doc no longer exists…", both kept as failed; only a revoked row drops writes);
 a live session's refusal waits too. A landed propose rebases the queued ones
 for that doc only when the epoch moved by exactly our write (+1).
 
@@ -195,7 +197,42 @@ Flow (`AuthSession`, driven by `AppModel`):
    suspension mid-rotation doesn't cost the grant.
 5. Sign out (Settings): `POST /oauth/revoke` with the refresh token
    (revokes the grant server-side; best effort offline), then clear the
-   Keychain tokens. The client id and the per-server cache stay.
+   Keychain tokens. The client id stays; the person's data goes (below).
+
+Universal link (ADR 0004 follow-up): a Release build claims
+`https://taisce.null.ie/oauth/app-callback` (Associated Domains `applinks:` and
+`webcredentials:` for `TAISCE_APP_LINK_HOST`, mirrored into Info.plist as
+`TaisceAppLinkHosts`; the server serves the `apple-app-site-association` file).
+When the OS has `ASWebAuthenticationSession`'s `.https(host:path:)` callback
+(iOS 17.4 / macOS 14.4; below the targets), the server is https and its host
+is claimed (`OAuthCallback.appLink`), sign-in uses the cached client if it holds
+that redirect, else registers `[https, custom]` (the server maps it to
+`taisce-app`); a server that refuses it gets the custom scheme as before.
+Debug builds have no Associated Domains (scratch daemons are http, and Mac test
+runs need no profile change) and always use the custom scheme. A signed-in
+device keeps its tokens and client.
+
+One server, several people (ADR 0004):
+
+- The cache is keyed to the signed-in person (`/api/profile` `principal_id`,
+  `Cache.owner`). Sign-out wipes it (`Cache.wipe`: docs, bodies, FTS, to-dos,
+  workspaces, cursor, outbox; `secure_delete`, VACUUM, WAL truncated, the
+  iPhone's protection class re-applied) and the person's settings
+  (`UserSettings`: pins, last workspace, Library folders), and re-plans alerts.
+  At launch and after a sign-in, `CacheOwnership` wipes another person's (or,
+  under a fresh sign-in, unclaimed) data before sync starts. A sign-out the app
+  didn't ask for (revoked or expired grant) keeps the data until the next
+  sign-in decides, so the same person keeps their queued writes.
+- Workspaces carry `role`, `owner_name`, `display_name`, `shared`: the switcher
+  shows `display_name`, your own first, `person.2` on shared ones. A viewer
+  (`EditAccess`) gets no edit mode, ⌘E, new doc, checkboxes, to-do add/done/snooze
+  or move; an editor can't move docs out of someone else's workspace; Manage
+  workspaces edits only your own. A 403 on replay fails that entry ("You can only
+  view this workspace…", never retried); a 404 fails it too, kept, so the text is recoverable. Sign-out tries one last replay and asks before losing unsent changes.
+- `access: revoked` rows drop the doc with its bodies, search rows, to-dos and
+  queued writes, unpin it and close it in every window ("This doc is no longer
+  shared with you."); `granted` rows apply the state and fetch the body. Due
+  alerts come only from your own lists.
 
 To sign in: run the app, tap **Sign in**, and approve with your passkey
 on the server's page. To enrol a passkey first, use an enrolment link from

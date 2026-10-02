@@ -78,6 +78,51 @@ struct TokenResponse: Decodable {
     }
 }
 
+/// Where the sign-in browser hands back the code: the app's custom scheme
+/// (any app could declare it), or a universal link on the server's own host
+/// that only this app can claim (`apple-app-site-association`).
+public enum OAuthCallback: Sendable, Hashable {
+    case customScheme(String)
+    case https(host: String, path: String)
+
+    public static let custom = OAuthCallback.customScheme(OAuthClient.callbackScheme)
+
+    /// The `redirect_uri` the server registers and redirects to.
+    public var redirectURI: String {
+        switch self {
+        case .customScheme: OAuthClient.redirectURI
+        case let .https(host, path): "https://\(host)\(path)"
+        }
+    }
+
+    /// `ASWebAuthenticationSession`'s `.https(host:path:)` callback exists
+    /// from iOS 17.4 and macOS 14.4 (Mac Catalyst reports the macOS
+    /// version). The app's deployment targets (26) are above both today;
+    /// this keeps the choice honest if they ever drop.
+    public static func httpsSupported(_ v: OperatingSystemVersion, mac: Bool) -> Bool {
+        let floor = mac ? (14, 4) : (17, 4)
+        return (v.majorVersion, v.minorVersion) >= floor
+    }
+
+    public static var runningOnMac: Bool {
+        #if targetEnvironment(macCatalyst) || os(macOS)
+        true
+        #else
+        false
+        #endif
+    }
+
+    /// The universal-link callback for `server`, when the OS supports it,
+    /// the server is https and the app claims its host; else nil (use the
+    /// custom scheme).
+    public static func appLink(for server: URL, claimedHosts: Set<String>, available: Bool) -> OAuthCallback? {
+        guard available, server.scheme?.lowercased() == "https", let host = server.host()?.lowercased(),
+              claimedHosts.contains(where: { $0.lowercased() == host }), server.port == nil || server.port == 443
+        else { return nil }
+        return .https(host: host, path: OAuthClient.appLinkPath)
+    }
+}
+
 /// An authorization request in flight: the URL to open and the secrets to
 /// check the callback against and finish the exchange with.
 public struct AuthorizationRequest: Sendable, Hashable {

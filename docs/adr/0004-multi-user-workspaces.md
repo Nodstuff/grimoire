@@ -291,12 +291,44 @@ Additive and idempotent, one transaction for the data part:
 - Sign-out / account switch: wipe the per-user cache (docs, blocks, cursor, pending writes);
   cursors are per user, never shared across accounts on one device.
 - 403 `forbidden` on a write means "read-only here" (viewer), not a bug.
-- Follow-up (round 3, recorded, not built): first-party sign-in through a universal-link
+- Follow-up (round 3; built, see 8a): first-party sign-in through a universal-link
   https redirect (an `apple-app-site-association` file on taisce.null.ie and an
   `https://taisce.null.ie/...` redirect the app claims) instead of the `ie.null.taisce:`
   custom scheme any local app could claim; and the passkey page showing which device and
   when is asking to sign in. Both need the app; until then first party rests on the pinned
   client_id plus the custom-scheme redirect.
+
+### 8a. Built (the app follow-up, 2026-10-02)
+
+- **Universal-link sign-in.** The server serves `/.well-known/apple-app-site-association`
+  (applinks for `/oauth/app-callback`, webcredentials; app id `6UP35L9425.ie.null.taisce`
+  from `apple/App/project.yml`) and gives `taisce-app` a second exact redirect,
+  `<public url>/oauth/app-callback` (from config; an existing row is updated at start). DCR
+  of exactly the https callback, or it and the custom scheme, maps to `taisce-app`; any other
+  use of either is refused. The custom scheme keeps working for every installed build. The
+  callback path opened in a browser is a plain "Open this on a device with the Taisce app"
+  page that never echoes the query. Release builds carry Associated Domains for
+  `taisce.null.ie` and register `[https, custom]` first; a server that refuses it gets the
+  custom scheme exactly as before. A signed-in device keeps its tokens and client; it moves
+  to the link only at its next sign-in.
+- **The passkey page** names the client (marked "the Taisce app" for a pinned first-party
+  client, "a connected app, not the Taisce app" otherwise, since a connector may call itself
+  anything), a coarse device summary from the User-Agent ("iPhone · Safari") and the server
+  time, all escaped, with "Didn't start this sign-in yourself? Choose Deny."
+- **The app**: switcher shows `display_name`, own before shared, `person.2` on shared ones;
+  a viewer gets no write affordance; a 403 replay fails that entry with a read-only message
+  (never retried); a plain 404 also fails it, kept ("This doc no longer exists, so this
+  change wasn't saved."), so text typed into a doc deleted elsewhere stays recoverable where
+  refused writes are shown: only a `revoked` row drops queued writes. `revoked` rows drop the
+  doc, its bodies, search rows, to-dos and queued writes, close open screens with a note;
+  `granted` rows fetch the doc. The cache is keyed to `/api/profile` `principal_id`
+  (recorded at the first profile read that works, so the same person's fresh sign-in keeps
+  it), checked beside a resumed sync (queued writes wait for the answer; only a wipe stops
+  sync) and before a fresh sign-in's sync; it is wiped on sign-out, after a last replay and,
+  if writes are still unsent, a "N changes haven't been sent and will be lost" confirmation,
+  and when someone else signs in. The wipe checks that the WAL was truncated. Due alerts
+  come only from the person's own lists. The universal link is accepted at authorize only
+  for `taisce-app` (a CIMD document listing it is refused).
 
 The API stays backward compatible: every existing field is still present, new fields are
 additive, and a single-user server answers exactly as before.

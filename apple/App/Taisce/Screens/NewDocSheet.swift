@@ -29,7 +29,9 @@ struct NewDocSheet: View {
                 }
                 .listRowBackground(Theme.surface)
                 Section {
-                    folderRow(nil, title: "Top level", crumb: nil)
+                    if model.currentAccess.canCreate {
+                        folderRow(nil, title: "Top level", crumb: nil)
+                    }
                     ForEach(folders, id: \.id) { d in
                         folderRow(d.id, title: d.title, crumb: model.index.breadcrumb(of: d.id))
                     }
@@ -59,14 +61,15 @@ struct NewDocSheet: View {
         }
     }
 
-    /// Every doc can hold docs; the filter matches titles and paths.
+    /// Every doc you may add to can hold docs (not one in a workspace you
+    /// only view); the filter matches titles and paths.
     var folders: [DocInfo] {
         let q = filter.trimmingCharacters(in: .whitespaces)
-        let all = model.docs.sorted { (model.index.breadcrumb(of: $0.id) ?? "", $0.title) < (model.index.breadcrumb(of: $1.id) ?? "", $1.title) }
+        let all = model.docs.filter { model.access(for: $0.id).canCreate }.sorted { (model.index.breadcrumb(of: $0.id) ?? "", $0.title) < (model.index.breadcrumb(of: $1.id) ?? "", $1.title) }
         guard !q.isEmpty else { return all }
         let candidates = all.map { WikiCandidate(id: $0.id, title: $0.title, breadcrumb: model.index.breadcrumb(of: $0.id)) }
         let ranked = WikiCompletion.rank(q, in: candidates, limit: 50).map(\.id)
-        return ranked.compactMap { model.index.byID[$0] }
+        return ranked.compactMap { id in all.first { $0.id == id } }
     }
 
     func folderRow(_ id: DocID?, title: String, crumb: String?) -> some View {

@@ -6,8 +6,13 @@ public struct SyncUpdate: Sendable, Hashable {
     public var docIDs: Set<DocID>
     /// the doc tree (titles, parents, order, membership) changed
     public var treeChanged: Bool
+    /// ADR 0004: docs no longer shared with the signed-in user (dropped
+    /// from the cache, their queued writes with them): open screens close
+    public var revokedDocIDs: Set<DocID> = []
+    /// a row granted or revoked access: workspaces and roles may have moved
+    public var accessChanged = false
 
-    public var isEmpty: Bool { docIDs.isEmpty && !treeChanged }
+    public var isEmpty: Bool { docIDs.isEmpty && !treeChanged && revokedDocIDs.isEmpty && !accessChanged }
 }
 
 public enum SyncStatus: Sendable, Hashable {
@@ -29,6 +34,9 @@ public actor SyncEngine {
     let backoff: Backoff
     let sleep: @Sendable (Duration) async throws -> Void
     let pageSize: Int
+
+    /// Bodies fetched at once for docs newly shared with us, per batch.
+    static let grantedFetchLimit = 25
 
     public private(set) var status: SyncStatus = .idle
     /// Docs whose bodies are fetched on change even if never opened
@@ -232,6 +240,20 @@ public actor SyncEngine {
             last[c.docID] = c
         }
         var update = SyncUpdate(docIDs: [], treeChanged: false)
+        // ADR 0004: a doc no longer shared with us goes with everything we
+        // held for it (blocks and their search index, to-dos, queued writes)
+        let revoked = Set(order.filter { last[$0]?.kind == .deleted && last[$0]?.isRevoked == true })
+        var orphaned = false
+        if !revoked.isEmpty {
+            // the server sends a row per doc lost; a cached descendant
+            // without one may still be ours (a parent we can no longer see
+            // makes it a root): the server's tree decides
+            orphaned = try await cache.descendants(of: revoked).contains { !revoked.contains($0) }
+            try await cache.dropOutbox(forDocs: revoked)
+            update.revokedDocIDs = revoked
+            update.accessChanged = true
+            for id in revoked { failedDocs[id] = nil }
+        }
         for id in order where last[id]?.kind == .deleted {
             try await cache.deleteDoc(id)
             update.docIDs.insert(id)
@@ -240,10 +262,14 @@ public actor SyncEngine {
         // every row carries the doc's serve-time state: apply it first, so
         // titles and epochs update before any body refetch
         let live = order.compactMap { last[$0] }.filter { $0.kind != .deleted }
-        if live.contains(where: { ($0.kind == .tree || $0.kind == .restored) && $0.doc == nil }) {
+        if orphaned || live.contains(where: { ($0.kind == .tree || $0.kind == .restored) && $0.doc == nil }) {
             try await cache.replaceTree(api.tree())
             update.treeChanged = true
         }
+        if live.contains(where: \.isGranted) { update.accessChanged = true }
+        // newly shared with us: fetch the bodies (a few per batch; the rest
+        // are fetched when opened), so the doc reads offline like our own
+        var grantedFetches = Self.grantedFetchLimit
         for c in live {
             guard let s = c.doc else { continue }
             let before = try await cache.doc(c.docID)
@@ -257,8 +283,12 @@ public actor SyncEngine {
             // the serve-time epoch is newer than or equal to the row's
             let target = c.doc?.currentEpoch ?? c.epoch
             let cached = try await cache.doc(id)
-            let wanted = alwaysFetch.contains(id)
+            var wanted = alwaysFetch.contains(id)
                 || (cached.map { $0.title == TodoParser.todoDocTitle } ?? false)
+            if c.isGranted, cached?.bodyEpoch == nil, grantedFetches > 0 {
+                grantedFetches -= 1
+                wanted = true
+            }
             let held = cached?.bodyEpoch != nil
             if held || wanted {
                 if let have = cached?.bodyEpoch, let target, have >= target { continue }

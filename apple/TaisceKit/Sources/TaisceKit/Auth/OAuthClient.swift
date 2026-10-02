@@ -8,15 +8,37 @@ public struct OAuthClient: Sendable {
     /// Allowed by every server (`FIXED_REDIRECTS`) without configuration.
     public static let redirectURI = "ie.null.taisce:/oauth/callback"
     public static let callbackScheme = "ie.null.taisce"
+    /// The universal-link redirect's path on a server that serves the
+    /// `apple-app-site-association` file (ADR 0004 follow-up).
+    public static let appLinkPath = "/oauth/app-callback"
 
     public let baseURL: URL
     public var clientName: String
+    /// Hosts this build claims universal links for (the Associated Domains
+    /// entitlement; empty = custom scheme only, as in Debug builds).
+    public var appLinkHosts: Set<String>
+    /// The OS can finish `ASWebAuthenticationSession` on an https callback.
+    public var httpsCallbackAvailable: Bool
     let session: URLSession
 
-    public init(baseURL: URL, clientName: String = "Taisce iOS", session: URLSession = .shared) {
+    public init(
+        baseURL: URL, clientName: String = "Taisce iOS", appLinkHosts: Set<String> = [],
+        httpsCallbackAvailable: Bool = OAuthCallback.httpsSupported(ProcessInfo.processInfo.operatingSystemVersion, mac: OAuthCallback.runningOnMac),
+        session: URLSession = .shared
+    ) {
         self.baseURL = baseURL
         self.clientName = clientName
+        self.appLinkHosts = appLinkHosts
+        self.httpsCallbackAvailable = httpsCallbackAvailable
         self.session = session
+    }
+
+    /// The universal-link callback when this build, this OS and this server
+    /// can all use it: an https server whose host the app claims. Anything
+    /// else (a Debug build, a scratch daemon on http, another host) uses the
+    /// custom scheme.
+    public var appLinkCallback: OAuthCallback? {
+        OAuthCallback.appLink(for: baseURL, claimedHosts: appLinkHosts, available: httpsCallbackAvailable)
     }
 
     /// The origin, no trailing slash: the key for stored tokens and what the
@@ -76,6 +98,17 @@ public struct OAuthClient: Sendable {
     /// RFC 7591: register this app as a public client. Done once per server;
     /// the caller persists the `client_id`.
     public func register(_ d: OAuthDiscovery) async throws -> String {
+        try await register(d, redirectURIs: [Self.redirectURI]).clientID
+    }
+
+    /// A registration: the client id, and the redirects the server says it
+    /// holds (older servers may not answer them; then it is what we sent).
+    public struct Registration: Sendable, Hashable {
+        public var clientID: String
+        public var redirectURIs: [String]
+    }
+
+    public func register(_ d: OAuthDiscovery, redirectURIs: [String]) async throws -> Registration {
         guard let url = d.server.registrationEndpoint else {
             throw AuthError.unsupportedServer("no registration_endpoint")
         }
@@ -86,25 +119,29 @@ public struct OAuthClient: Sendable {
             var response_types = ["code"]
             var token_endpoint_auth_method = "none"
         }
-        struct Registered: Decodable { var client_id: String }
+        struct Registered: Decodable {
+            var client_id: String
+            var redirect_uris: [String]?
+        }
         var r = jsonRequest(url, method: "POST")
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        r.httpBody = try JSONEncoder().encode(Body(client_name: clientName, redirect_uris: [Self.redirectURI]))
+        r.httpBody = try JSONEncoder().encode(Body(client_name: clientName, redirect_uris: redirectURIs))
         let data = try await sendOAuth(r)
         let reg: Registered = try decode(data)
-        return reg.client_id
+        return Registration(clientID: reg.client_id, redirectURIs: reg.redirect_uris ?? redirectURIs)
     }
 
     /// Does the server still know `clientID` (a wiped hub forgets DCR
     /// clients)? The authorize endpoint shows an error page for an unknown
     /// client but redirects a known one with `invalid_request` when PKCE is
     /// missing; nothing is created either way. Nil = can't tell (offline,
-    /// rate-limited), so keep the cached id.
-    public func clientIsKnown(_ clientID: String, _ d: OAuthDiscovery) async -> Bool? {
+    /// rate-limited), so keep the cached id. `redirectURI` asks about one
+    /// redirect: a client that doesn't hold it answers false too.
+    public func clientIsKnown(_ clientID: String, _ d: OAuthDiscovery, redirectURI: String = OAuthClient.redirectURI) async -> Bool? {
         guard var c = URLComponents(url: d.server.authorizationEndpoint, resolvingAgainstBaseURL: false) else { return nil }
         c.queryItems = [
             URLQueryItem(name: "client_id", value: clientID),
-            URLQueryItem(name: "redirect_uri", value: Self.redirectURI),
+            URLQueryItem(name: "redirect_uri", value: redirectURI),
             URLQueryItem(name: "response_type", value: "code"),
         ]
         guard let url = c.url,
@@ -113,7 +150,7 @@ public struct OAuthClient: Sendable {
         else { return nil }
         switch http.statusCode {
         case 300..<400:
-            return http.value(forHTTPHeaderField: "Location")?.hasPrefix(Self.redirectURI) == true ? true : nil
+            return http.value(forHTTPHeaderField: "Location")?.hasPrefix(redirectURI) == true ? true : nil
         case 400: return false
         default: return nil
         }
@@ -121,14 +158,14 @@ public struct OAuthClient: Sendable {
 
     // MARK: authorization code + PKCE
 
-    public func authorizationRequest(_ d: OAuthDiscovery, clientID: String, pkce: PKCE = PKCE(), state: String = PKCE.randomURLSafe(bytes: 24)) throws -> AuthorizationRequest {
+    public func authorizationRequest(_ d: OAuthDiscovery, clientID: String, redirectURI: String = OAuthClient.redirectURI, pkce: PKCE = PKCE(), state: String = PKCE.randomURLSafe(bytes: 24)) throws -> AuthorizationRequest {
         guard var c = URLComponents(url: d.server.authorizationEndpoint, resolvingAgainstBaseURL: false) else {
             throw APIError.badURL(d.server.authorizationEndpoint.absoluteString)
         }
         var q = [
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "client_id", value: clientID),
-            URLQueryItem(name: "redirect_uri", value: Self.redirectURI),
+            URLQueryItem(name: "redirect_uri", value: redirectURI),
             URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "code_challenge", value: pkce.challenge),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
@@ -139,7 +176,7 @@ public struct OAuthClient: Sendable {
         }
         c.queryItems = q
         guard let url = c.url else { throw APIError.badURL("authorize") }
-        return AuthorizationRequest(url: url, state: state, verifier: pkce.verifier, redirectURI: Self.redirectURI, clientID: clientID)
+        return AuthorizationRequest(url: url, state: state, verifier: pkce.verifier, redirectURI: redirectURI, clientID: clientID)
     }
 
     /// The code from the redirect, after checking `state` and `iss`.

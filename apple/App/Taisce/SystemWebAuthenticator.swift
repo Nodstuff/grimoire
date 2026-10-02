@@ -9,16 +9,27 @@ import UIKit
 final class SystemWebAuthenticator: NSObject, WebAuthenticator, ASWebAuthenticationPresentationContextProviding {
     private var session: ASWebAuthenticationSession?
 
-    func authenticate(url: URL, callbackScheme: String) async throws -> URL {
+    func authenticate(url: URL, callback: OAuthCallback) async throws -> URL {
         defer { session = nil }
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, any Error>) in
-            let s = ASWebAuthenticationSession(url: url, callback: .customScheme(callbackScheme), completionHandler: Self.completion(cont))
+            let s = ASWebAuthenticationSession(url: url, callback: Self.sessionCallback(callback), completionHandler: Self.completion(cont))
             s.presentationContextProvider = self
             s.prefersEphemeralWebBrowserSession = false
             session = s
             if !s.start() {
                 cont.resume(throwing: AuthError.cancelled)
             }
+        }
+    }
+
+    /// The universal link (`.https`, iOS 17.4 / macOS 14.4, below this
+    /// app's targets) when sign-in chose it: only this app can claim it,
+    /// through the server's `apple-app-site-association` file and the
+    /// Associated Domains entitlement. Else the custom scheme, as before.
+    nonisolated static func sessionCallback(_ callback: OAuthCallback) -> ASWebAuthenticationSession.Callback {
+        switch callback {
+        case let .https(host, path): .https(host: host, path: path)
+        case let .customScheme(scheme): .customScheme(scheme)
         }
     }
 
