@@ -134,7 +134,9 @@ struct DocScreen: View {
             ),
             childCounts: model.index.childCount,
             onOpenChild: { router.open(.doc($0)) },
-            onNewDocHere: onNewDocHere
+            onNewDocHere: onNewDocHere,
+            docID: docID,
+            canEdit: editable && access.canEdit
         )
         .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
         // children's "edited … ago" (a handful; each is cached until it changes)
@@ -274,6 +276,9 @@ struct DocContent: View {
     var childCounts: [DocID: Int] = [:]
     var onOpenChild: (DocID) -> Void = { _ in }
     var onNewDocHere: (() -> Void)?
+    /// runnable code blocks (Mac): which doc, and whether a practice edit may be saved
+    var docID: DocID?
+    var canEdit = false
 
     var body: some View {
         ScrollView {
@@ -353,6 +358,7 @@ struct DocContent: View {
                         overrides: overrides[block.id] ?? [:],
                         action: onToggle.map { f in { i, v in f(block.id, i, v) } }
                     ))
+                    .environment(\.codeRunContext, docID.map { CodeRunContext(doc: $0, block: block.id, canSave: canEdit) })
             }
             .environment(\.docTables, page.chartTables)
             DocChildrenList(layout: children, childCounts: childCounts, now: now, onOpen: onOpenChild)

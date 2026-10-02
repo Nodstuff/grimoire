@@ -1,6 +1,58 @@
 import SwiftUI
 import TaisceKit
 
+/// The Mac's data move didn't finish: nothing opens until a launch from
+/// Finder (which may read the old container) completes it.
+struct MigrationBlockedView: View {
+    let reason: String
+    var conflicts: [SandboxMigration.Conflict] = []
+    var resolve: (Bool) -> Void = { _ in }
+
+    var unsent: String {
+        let known = conflicts.compactMap(\.unsent)
+        guard known.count == conflicts.count else { return "an unknown number of unsent changes" }
+        let n = known.reduce(0, +)
+        return n == 1 ? "1 unsent change" : "\(n) unsent changes"
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "shippingbox")
+                .font(.system(size: 40))
+                .foregroundStyle(Theme.accent)
+            Text("Moving your data")
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(Theme.text)
+            Text(reason)
+                .font(.body)
+                .foregroundStyle(Theme.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 420)
+            if !conflicts.isEmpty {
+                Text("This Mac already has a copy here, and the old one has \(unsent).")
+                    .font(.callout)
+                    .foregroundStyle(Theme.text)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 420)
+                Button("Use the copy already here (the old one stays untouched)") { resolve(true) }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("migration.keepHere")
+                Button("Use the old copy, with its unsent changes (this one is set aside)") { resolve(false) }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("migration.useOld")
+            }
+            Button("Quit Taisce") { exit(0) }
+                .buttonStyle(.borderedProminent)
+                .tint(Theme.accent)
+                .accessibilityIdentifier("migration.quit")
+        }
+        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .groundBackground()
+        .accessibilityIdentifier("migration.blocked")
+    }
+}
+
 /// Sign-in, or the phone tabs / pad split view by size class.
 struct RootView: View {
     @Environment(AppModel.self) private var model
@@ -11,7 +63,11 @@ struct RootView: View {
     var body: some View {
         @Bindable var router = router
         Group {
-            if model.isCheckingAuth {
+            if let reason = model.migrationBlocked {
+                MigrationBlockedView(reason: reason, conflicts: model.migrationConflicts) { keepHere in
+                    Task { await model.resolveMigration(keepHere: keepHere) }
+                }
+            } else if model.isCheckingAuth {
                 LaunchView()
             } else if model.needsSignIn {
                 SignInScreen()

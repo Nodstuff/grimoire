@@ -25,6 +25,8 @@ apple/
       Cache/                   GRDB cache (docs, blocks + FTS5, todos, sync_state, outbox)
       Sync/                    SSEParser, changeStream, Backoff, SyncEngine (actor)
       Render/                  block markdown → RenderNode (swift-markdown), inline/wikilinks
+      Run/                     runnable code blocks: FenceInfo, GoProgram, RunTrust, output, posix_spawn runner (Mac)
+      Migration/               SandboxMigration (the Mac's old App Sandbox container → ~/Library)
       Todo/                    Deadline (all-day | UTC instant), TodoClock, offline To-do parser
       Library/                 doc tree for the sidebar, wikilink lookups
     Tests/TaisceKitTests/    Swift Testing + a URLProtocol mock server
@@ -388,12 +390,142 @@ The same `Taisce` target, built for `platform=macOS,variant=Mac Catalyst`.
   Catalyst token like an iOS one). Signing is automatic; the first build
   on a new Mac needs `-allowProvisioningUpdates -allowProvisioningDeviceRegistration`.
 - Entitlements: `Support/Taisce-Mac-{Debug,Release}.entitlements` (picked
-  by `CODE_SIGN_ENTITLEMENTS[sdk=macosx*]`) add the App Sandbox with network
-  client only; hardened runtime is on. Xcode signs `aps-environment` as
+  by `CODE_SIGN_ENTITLEMENTS[sdk=macosx*]`): push (and Associated Domains in
+  Release), **no App Sandbox** (runnable code blocks run your own tools on
+  your own files); hardened runtime is on. Xcode signs `aps-environment` as
   `com.apple.developer.aps-environment` too, and `PushConfig` reads the
   profile from `Contents/embedded.provisionprofile` with either key.
+- Files (`AppPaths`): unsandboxed, `~/Library/Application Support` and
+  `~/Library/Caches` are shared by every app, so the Mac keeps its caches in
+  `Application Support/ie.null.taisce/` and diagrams in
+  `Caches/ie.null.taisce/diagrams/`; preferences are
+  `~/Library/Preferences/ie.null.taisce.plist`. A test host (XCTest inside
+  the app) never boots the model, never migrates, and keeps its caches in a
+  temp folder, so a Mac test run doesn't touch the real app's data (its
+  `UserDefaults.standard` is still the app's domain: tests clean up the keys they set).
 - The cache skips data-protection classes on the Mac (`Cache.appliesFileProtection`);
-  the sandbox container and FileVault cover it there.
+  FileVault covers it there.
+
+**Leaving the sandbox** (`SandboxMigration`, run by `AppDelegate.init` before
+the model reads a preference): the sandboxed builds kept everything in
+`~/Library/Containers/ie.null.taisce/Data/Library/`. On the first unsandboxed
+launch the caches (`cache-*.sqlite` with `-wal`/`-shm`: docs, bodies, to-dos,
+cursor and the outbox of unsent writes) are staged beside the new folder and
+moved in database-last (a failed move takes back what it moved), and the
+container's preferences are merged in key by key (a key already set keeps
+its value). A cache already at the destination is kept if the migration put
+it there (`migration.sandboxContainer.created`), set aside under
+`.replaced-<time>/` and replaced if it has no owner and no queued writes, kept
+if the container's copy has nothing unsent, and otherwise left with an error:
+the pass is never marked done while the container holds writes that weren't
+copied. A destination byte-identical (size and SHA-256) to the staged copy
+counts as the migration's own (a crash before it was recorded, an older
+build's copy). When both really have data, the blocked screen offers "Use the
+copy already here (the old one stays untouched)", which logs the old copy's
+unsent count, or "Use the old copy, with its unsent changes", which sets this
+one aside under `.replaced-<time>/`; either way the migration runs again and
+the app opens. While a pass is incomplete (unreadable container, a failed copy, that
+conflict) the app opens no cache at all and shows "Quit and open Taisce from
+Finder to finish moving your data" (`MigrationBlockedView`), so it can never
+create the empty cache a later pass would mistake for data. The container is
+never changed or deleted; `Caches/diagrams` is not copied (re-rendered). A
+marker key (`migration.sandboxContainer.v1`) makes later launches return at
+once; each pass is logged (file and key names, never values) to
+`Application Support/ie.null.taisce/migration.log`.
+
+- macOS app-data protection: a container is readable only by the app it
+  belongs to, and only when that app is its own "responsible process" —
+  launched by Launch Services (Finder, Dock, `open`). Started from a shell
+  (or anything that makes the shell responsible) the reads fail with EPERM:
+  the pass is logged as incomplete and retried at the next launch, never
+  marked done. Verified 2026-10-02 with a throwaway bundle id
+  (`ie.null.taisce.migtest`): a sandboxed build wrote a file, a preference and
+  a data-protection Keychain item; the same bundle id rebuilt unsandboxed
+  read all three when opened with `open`, and none of the files when its
+  binary was run from a shell. Then the real app, built unsandboxed as
+  `ie.null.taisce.migtest` and opened with `open`, migrated a seeded
+  container (a cache with two pending outbox rows, three preferences):
+  both rows and every key arrived, and a second launch did nothing.
+- The Keychain doesn't move: Valet uses the data-protection keychain with
+  the default access group, `6UP35L9425.ie.null.taisce` (the
+  `application-identifier` from the provisioning profile), which the
+  sandbox doesn't change, so the sign-in tokens stay readable. A build
+  signed without that profile (e.g. Developer ID, no `application-identifier`)
+  can't see them.
+
+**Runnable code blocks** (Mac only; the iPhone shows the plain card). In
+read mode, ```` ```go ````, `bash`, `sh` and `zsh` fences get ▶ Run (⌘↩ while
+the try line or practice text has focus), Stop, and the output beneath:
+stdout and stderr interleaved in arrival order, stderr rose, the exit code
+and duration, "compiled ✓" for a Go block that only compiles.
+
+- Isolation: every run is its own process group (`posix_spawn` with
+  `POSIX_SPAWN_SETPGROUP`; Foundation's `Process` isn't on Catalyst) in
+  `$TMPDIR/taisce-run/<uuid>`, deleted before the run reports done; stdin is
+  /dev/null. Nothing is shared between runs. When the leader exits, the rest
+  of its group is always sent SIGTERM (SIGKILL 2 s later) and the run
+  reports done only once the group is gone, so a backgrounded child never
+  outlives it: `nohup … &`, `caffeinate &`, `ssh -f` and the like end with
+  the block. To leave something running, hand it to something that
+  outlives the run: `launchctl` / `brew services`, or a terminal. A program
+  that leaves its group (`setsid`, a double fork into a new group) is out of
+  reach, as for any process group.
+- Environment: your login shell's (`$SHELL -l -c 'env -0'` from a minimal
+  seed, once per launch, 5 s bound, else the app's own). cwd is the run's
+  temp dir, or the fence's `cwd=` (```` ```bash cwd=~/code/portus ````; `~`
+  expanded). `FenceInfo` splits the info string (cmark hands over the whole
+  string as the "language"); `RenderNode.code` carries `attributes`.
+- Go (`GoProgram`, pure): `package main` + `func main` runs as written;
+  top-level declarations get `package main` and a `main` that prints the
+  try line (`fmt.Println(<expr>)`, so `pairSum(xs, 9)` prints `1 3 true`;
+  empty = compile only); bare statements are wrapped in `func main()` with
+  any func/type declarations hoisted. Imports: `goimports` when it's on your
+  PATH, else standard-library packages inferred from qualified names (a fixed
+  table; names the block declares are never imported), and an "imported and
+  not used" build error drops that import and builds again (wrapped shapes).
+  Built with a minimal `go.mod` (`module run`, the toolchain's version) as
+  `go build`, then the binary runs; the build cache is Go's usual one.
+- Limits: 5 minutes, then (or on Stop) SIGTERM to the whole group and
+  SIGKILL 2 s later; 1 MB of output per run, then "(output truncated)";
+  ANSI escapes stripped; output reaches the main actor in ~50 ms batches and
+  only the last 64 K characters are laid out (Copy output has all of it).
+- Edit to try: the code becomes editable in place (monospaced, no edit
+  mode); Run uses it; Revert goes back; Save to doc replaces the fence body
+  through the outbox like an editor save (the review gate applies). Practice
+  text and try lines last for the session.
+- Trust (`RunTrust`, pure): the doc's ledger (`/api/doc/{id}/history`
+  carries each op's principal, target block, epoch, `source_refs`, content,
+  and `principal_is_yours`, which the server works out for the caller) says
+  who last wrote the block's content (insert/replace). **You** are the
+  signed-in human, or one of your own agents (`principal_is_yours`, from ADR
+  0004 `owner_user`, never a name) in a workspace only you can see (not
+  shared; Unsorted counts as yours alone). So Claude writing code at your
+  request in your own workspace runs without a question; in a shared
+  workspace every agent asks, your own included, and other people and their
+  agents always ask. An older server (no `principal_is_yours`) or unknown
+  sharing asks. The caveat: a prompt-injected edit by your own agent in a
+  private workspace runs without a prompt; the block's history still shows
+  which agent wrote it. Provenance is read only on your own (the human's)
+  ops: a decline's revert (`review:decline:`) is unknown; a rename's link
+  rewrite (`rename:`) that changed nothing outside `[[…]]` looks to the
+  write before it (unknown if that isn't in the history), one that changed
+  more is an ordinary write of yours; the same tags on anyone else's op mean
+  nothing. The server refuses those prefixes (and its other reserved ones)
+  from callers. A write of yours repeating content someone else wrote
+  earlier (a whole-doc save re-inserting their block) is theirs; that look
+  back covers only the history the server returns (the newest 100 ops). Run shows "Checking who wrote this…" while the ledger
+  and profile load (5 s at most; then, or on an error, it asks and says
+  why). Yours (`/api/profile` principal id)
+  runs; anyone else's (an agent, another person), or unknown (offline,
+  history hidden, older than the last 100 ops) first shows the code with
+  "Last edited by <name>. Run it on this Mac?". A yes is remembered per doc
+  on this device (`RunApprovals`, per server, forgotten at sign-out) until
+  someone other than you changes the doc: the newest op by others must be
+  no newer than at approval (offline: the doc's epoch must not have moved).
+  Practice text you typed never asks; untouched practice text follows the
+  doc's code (and its trust), so a Run never executes an older version.
+  The sheet says the code runs as you with your login environment, tokens
+  included. No server change was needed.
 - Layout: regular width (every Mac window, iPad) is the split view
   (`RootLayout`): sidebar with the workspace switcher, search, Today,
   To-dos and the Library tree; the doc on the right. Compact width (iPhone)

@@ -6,7 +6,7 @@ extension Cache {
     public static let fileProtection = FileProtectionType.completeUntilFirstUserAuthentication
 
     /// Data protection classes are an iOS device feature: macOS (and Mac
-    /// Catalyst) keeps the cache in the user's container under FileVault.
+    /// Catalyst, unsandboxed) keeps the cache under FileVault.
     public static var appliesFileProtection: Bool {
         #if os(iOS) && !targetEnvironment(macCatalyst)
         true

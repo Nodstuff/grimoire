@@ -7,12 +7,40 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
     public var principalName: String
     public var principalKind: String
     public var applied: Bool
+    /// the op's principal (`op.principal`); `Profile.principalID` is yours
+    public var principalID: String?
+    /// the epoch the op landed in (`op.epoch_applied`)
+    public var epoch: Int?
+    /// the block it wrote (`kind.target`, or `kind.block_id` for an insert);
+    /// nil for doc ops (rename, move, status)
+    public var targetBlock: BlockID?
+    /// `insert`, `replace`, `delete`, `move`, `rename_doc`, …
+    public var opType: String?
+    /// the op's provenance (`review:decline:<id>` for a decline's revert,
+    /// `rename:Old → New` for a link rewrite, …)
+    public var sourceRefs: [String]
+    /// what an insert or replace wrote
+    public var content: String?
+    /// the server's answer to "is this the caller, or one of the caller's
+    /// own agents?" (`principal_is_yours`); nil from an older server
+    public var principalIsYours: Bool?
 
-    public init(opID: String, principalName: String, principalKind: String, applied: Bool = true) {
+    public init(
+        opID: String, principalName: String, principalKind: String, applied: Bool = true,
+        principalID: String? = nil, epoch: Int? = nil, targetBlock: BlockID? = nil, opType: String? = nil,
+        sourceRefs: [String] = [], content: String? = nil, principalIsYours: Bool? = nil
+    ) {
         self.opID = opID
         self.principalName = principalName
         self.principalKind = principalKind
         self.applied = applied
+        self.principalID = principalID
+        self.epoch = epoch
+        self.targetBlock = targetBlock
+        self.opType = opType
+        self.sourceRefs = sourceRefs
+        self.content = content
+        self.principalIsYours = principalIsYours
     }
 
     /// When the op was written, from its UUIDv7 id; nil for any other id.
@@ -29,12 +57,23 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
     struct Op: Decodable {
         var id: String
         var epoch_applied: Int?
+        var principal: String?
+        var kind: Kind?
+        var source_refs: [String]?
+
+        struct Kind: Decodable {
+            var op: String?
+            var target: String?
+            var block_id: String?
+            var content: String?
+        }
     }
 
     enum CodingKeys: String, CodingKey {
         case op
         case principalName = "principal_name"
         case principalKind = "principal_kind"
+        case principalIsYours = "principal_is_yours"
     }
 
     public init(from decoder: any Decoder) throws {
@@ -42,8 +81,15 @@ public struct DocHistoryEntry: Decodable, Sendable, Hashable {
         let op = try c.decode(Op.self, forKey: .op)
         opID = op.id
         applied = op.epoch_applied != nil
+        epoch = op.epoch_applied
+        principalID = op.principal?.lowercased()
+        opType = op.kind?.op
+        targetBlock = (op.kind?.target ?? op.kind?.block_id)?.lowercased()
+        sourceRefs = op.source_refs ?? []
+        content = op.kind?.content
         principalName = try c.decodeIfPresent(String.self, forKey: .principalName) ?? ""
         principalKind = try c.decodeIfPresent(String.self, forKey: .principalKind) ?? ""
+        principalIsYours = try c.decodeIfPresent(Bool.self, forKey: .principalIsYours)
     }
 }
 

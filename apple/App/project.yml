@@ -30,7 +30,11 @@ targets:
       - package: TaisceKit
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce
+        # overridable for UI test runs on the Mac, which must not run as the
+        # installed app (its data, preferences and Keychain):
+        # xcodebuild … TAISCE_BUNDLE_ID=ie.null.taisce.migtest
+        TAISCE_BUNDLE_ID: ie.null.taisce
+        PRODUCT_BUNDLE_IDENTIFIER: $(TAISCE_BUNDLE_ID)
         # 6 = Mac Catalyst with the Mac idiom ("Optimize interface for
         # Mac"): native-size text and AppKit-style controls, not the iPad
         # UI scaled to 77%. The editor is UITextView, which the Mac idiom
@@ -57,7 +61,7 @@ targets:
           INFOPLIST_FILE: Support/Info-Debug.plist
           # APNs (push): a Debug build's token is a sandbox one
           CODE_SIGN_ENTITLEMENTS: Support/Taisce-Debug.entitlements
-          # the Mac adds the App Sandbox (network client only)
+          # the Mac: push, no App Sandbox (runnable code blocks run your own tools)
           "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": Support/Taisce-Mac-Debug.entitlements
           # no universal links in Debug (scratch daemons are http; the Mac
           # test runs need no Associated Domains in the profile): the

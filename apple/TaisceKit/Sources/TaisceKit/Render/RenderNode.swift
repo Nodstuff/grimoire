@@ -8,7 +8,9 @@ public indirect enum RenderNode: Sendable, Hashable {
     case list(ordered: Bool, start: Int, items: [ListItem])
     /// `> [!INFO]`-style callouts carry their kind; plain quotes have nil
     case quote(callout: String?, children: [RenderNode])
-    case code(language: String?, code: String)
+    /// `language` is the fence's first word; `attributes` its `key=value`
+    /// words after that (`FenceInfo`), e.g. `cwd` for a runnable block
+    case code(language: String?, code: String, attributes: [String: String] = [:])
     case table(Table)
     /// mermaid, reladraw, vega-lite (drawn on the device), d2 (a labelled card)
     case diagram(kind: String, source: String)

@@ -110,12 +110,25 @@ final class AppModel {
     private var observedTodoDoc: DocID?
     /// rendered blocks by (block id, content hash), shared across doc views
     let renderCache = RenderCache()
+    /// runnable code blocks (Mac): this session's runs, try lines, practice text
+    let codeRuns = CodeRunStore()
+
+    /// The Mac's move out of the sandbox didn't finish this launch (the
+    /// container couldn't be read, or a copy failed): the app opens no
+    /// cache at all, so it can't create one the next pass would mistake for
+    /// data, and shows why instead (`MigrationBlockedView`).
+    private(set) var migrationBlocked: String?
+    /// caches both here and in the old container, for a person to decide
+    private(set) var migrationConflicts: [SandboxMigration.Conflict] = []
 
     /// `dueAlerts`: tests pass one over a fake notification center.
-    init(dueAlerts: NotificationCoordinator = NotificationCoordinator()) {
+    init(dueAlerts: NotificationCoordinator = NotificationCoordinator(), migration: SandboxMigration.Report? = nil) {
         self.dueAlerts = dueAlerts
+        self.migrationBlocked = SandboxMigration.blockingReason(migration)
+        self.migrationConflicts = migration?.complete == false ? migration?.conflicts ?? [] : []
         let stored = UserDefaults.standard.string(forKey: Self.serverURLKey).flatMap { ServerConfig.normalizedURL($0)?.absoluteString }
         serverURL = stored.flatMap { ServerURLPolicy.accepts($0) ? $0 : nil } ?? Self.defaultServerURL
+        codeRuns.app = self
     }
 
     var needsSignIn: Bool { authPhase == .signedOut }
@@ -148,6 +161,20 @@ final class AppModel {
         UserDefaults.standard.set(trimmed, forKey: Self.serverURLKey)
         await connect()
         await startSync()
+    }
+
+    /// The "both have data" way out: keep the copy here (the old one stays
+    /// untouched in the container) or use the old one (this one is set
+    /// aside). Then the migration runs again; once it finishes, the app
+    /// opens as usual.
+    func resolveMigration(keepHere: Bool) async {
+        for c in migrationConflicts {
+            AppPaths.resolveMigrationConflict(c, keepHere: keepHere)
+        }
+        let report = AppPaths.migrateSandboxContainer()
+        migrationBlocked = SandboxMigration.blockingReason(report)
+        migrationConflicts = report?.complete == false ? report?.conflicts ?? [] : []
+        if migrationBlocked == nil { await boot() }
     }
 
     func startSync() async {
@@ -259,6 +286,7 @@ final class AppModel {
         workspaces = []
         workspacesSupported = false
         editMeta = [:]
+        codeRuns.reset()
         settledTodos = []
         pendingEditDoc = nil
         pendingWrites = 0
@@ -370,11 +398,14 @@ final class AppModel {
 
     /// One cache file per server, so switching servers never mixes docs.
     private func connect(withAuth: Bool = true) async {
+        // never a cache while the migration is unfinished (see migrationBlocked)
+        guard migrationBlocked == nil else { return }
         observeTask?.cancel()
         authTask?.cancel()
         updatesTask?.cancel()
         todoObserveTask?.cancel()
         observedTodoDoc = nil
+        codeRuns.reset()
         hasSynced = false
         ownerChecked = false
         ownerSettled = false
@@ -385,7 +416,8 @@ final class AppModel {
             return
         }
         do {
-            let dir = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            // Application Support (the Mac: its ie.null.taisce folder, AppPaths)
+            let dir = try AppPaths.supportDirectory()
             let name = "cache-\(url.host() ?? "server")-\(url.port ?? 0).sqlite"
             let cache = try Cache(path: dir.appending(path: name).path(percentEncoded: false))
             authPhase = .checking
@@ -571,6 +603,17 @@ final class AppModel {
 
     var workspaceKey: String { UserSettings(server: serverURL).workspaceKey }
 
+    /// Runnable code blocks: is the doc's workspace yours alone? Unsorted
+    /// is (ADR 0004: your own Unsorted); a listed workspace is when it isn't
+    /// shared and you own it. nil = can't tell (a server without
+    /// workspaces, or one not in the list yet), which asks before running.
+    func workspaceIsPrivate(_ doc: DocID) -> Bool? {
+        guard workspacesSupported, let info = index.byID[doc] else { return nil }
+        guard let ws = info.workspaceID else { return true }
+        guard let w = workspaces.first(where: { $0.id == ws }) else { return nil }
+        return !w.shared && (w.role == nil || w.role == "owner")
+    }
+
     /// Who last edited the doc, from its ledger; cached until the doc changes.
     func loadEditMeta(_ id: DocID) async {
         guard editMeta[id] == nil, let api else { return }
@@ -599,6 +642,20 @@ final class AppModel {
         guard var editor = try await cache.editor(for: doc), let current = editor.blocks[block],
               let text = Checkbox.toggled(current.content, index: index, checked: checked)
         else { throw TodoWriteError.notFound }
+        try await cache.enqueue([.replaceText(block, text)], on: &editor)
+        pendingWrites += 1
+        await replayOutbox()
+    }
+
+    /// Rewrite one block's markdown (a code block's practice edit saved to
+    /// the doc): a `replace` through the outbox, then an immediate replay,
+    /// exactly like an editor save, so the review gate applies.
+    func replaceBlockText(doc: DocID, block: BlockID, _ transform: (String) -> String?) async throws {
+        guard let cache else { throw TodoWriteError.notFound }
+        guard var editor = try await cache.editor(for: doc), let current = editor.blocks[block],
+              let text = transform(current.content)
+        else { throw TodoWriteError.notFound }
+        guard text != current.content else { return }
         try await cache.enqueue([.replaceText(block, text)], on: &editor)
         pendingWrites += 1
         await replayOutbox()

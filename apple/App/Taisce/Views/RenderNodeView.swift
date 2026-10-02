@@ -36,8 +36,8 @@ struct RenderNodeView: View {
             } else {
                 QuoteView(children: children, checkboxBase: checkboxBase)
             }
-        case let .code(language, code):
-            CodeBlockView(label: language, code: code)
+        case let .code(language, code, attributes):
+            RunnableCodeBlock(language: language, code: code, attributes: attributes)
         case let .table(table):
             TableBlock(table: table)
         case let .diagram(kind, source):
