@@ -321,7 +321,6 @@ struct TrustSheet: View {
         }
         .padding(20)
         .frame(minWidth: 460, idealWidth: 560)
-        .accessibilityIdentifier("code.trust")
     }
 }
 #endif

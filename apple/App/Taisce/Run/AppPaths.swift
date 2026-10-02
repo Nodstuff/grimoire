@@ -19,6 +19,16 @@ enum AppPaths {
         return env["XCTestConfigurationFilePath"] != nil || env["XCTestBundlePath"] != nil || env["XCTestSessionIdentifier"] != nil
     }
 
+    /// A Debug build launched by a UI test (`TAISCE_UI_TEST=1`) under a
+    /// throwaway bundle id: no container to move.
+    static var skipsMigrationForUITests: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.environment["TAISCE_UI_TEST"] == "1"
+        #else
+        false
+        #endif
+    }
+
     /// Running inside an App Sandbox container (the iPhone always is).
     static var isSandboxed: Bool {
         #if targetEnvironment(macCatalyst)
@@ -55,7 +65,7 @@ enum AppPaths {
     @discardableResult
     static func migrateSandboxContainer() -> SandboxMigration.Report? {
         #if targetEnvironment(macCatalyst)
-        guard !isTestHost, !isSandboxed, let dest = try? supportDirectory() else { return nil }
+        guard !isTestHost, !isSandboxed, !skipsMigrationForUITests, let dest = try? supportDirectory() else { return nil }
         let container = URL(fileURLWithPath: Account.current.home)
             .appending(path: "Library/Containers/\(bundleID)/Data", directoryHint: .isDirectory)
         let report = SandboxMigration.run(
