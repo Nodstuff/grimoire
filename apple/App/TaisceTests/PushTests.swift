@@ -107,8 +107,8 @@ struct HangingRegistry: DeviceRegistry {
 }
 
 @Suite struct PushEnvironmentFromProfileTests {
-    func profile(_ aps: String?) -> Data {
-        let ents = aps.map { "<key>aps-environment</key><string>\($0)</string>" } ?? ""
+    func profile(_ aps: String?, key: String = "aps-environment") -> Data {
+        let ents = aps.map { "<key>\(key)</key><string>\($0)</string>" } ?? ""
         let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Entitlements</key><dict>\(ents)</dict></dict></plist>"
         // a provisioning profile is CMS-wrapped: binary bytes around the plist
         return Data([0x30, 0x82, 0x01, 0x00]) + Data(xml.utf8) + Data([0xA0, 0x00])
@@ -122,5 +122,27 @@ struct HangingRegistry: DeviceRegistry {
     @Test func noProfileMeansProduction() {
         #expect(PushConfig.environment(profile: nil) == .production)
         #expect(PushConfig.environment(profile: profile(nil)) == .production)
+    }
+    @Test func macProfileUsesTheDeveloperKey() {
+        let key = "com.apple.developer.aps-environment"
+        #expect(PushConfig.environment(profile: profile("development", key: key)) == .sandbox)
+        #expect(PushConfig.environment(profile: profile("production", key: key)) == .production)
+    }
+    @Test func profileLivesWhereEachPlatformPutsIt() {
+        let app = URL(filePath: "/x/Taisce.app")
+        #expect(PushConfig.profileURL(bundle: app, mac: false).path(percentEncoded: false) == "/x/Taisce.app/embedded.mobileprovision")
+        #expect(PushConfig.profileURL(bundle: app, mac: true).path(percentEncoded: false) == "/x/Taisce.app/Contents/embedded.provisionprofile")
+        #if targetEnvironment(macCatalyst)
+        #expect(PushConfig.isMac)
+        #else
+        #expect(!PushConfig.isMac)
+        #endif
+    }
+    /// The installed build's own profile: Xcode signs every test host with
+    /// a development one.
+    @Test func thisBuildsProfileIsFound() throws {
+        let url = PushConfig.profileURL(bundle: Bundle.main.bundleURL, mac: PushConfig.isMac)
+        guard FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) else { return } // simulator: unsigned
+        #expect(PushConfig.environment == .sandbox)
     }
 }

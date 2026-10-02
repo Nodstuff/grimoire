@@ -10,10 +10,26 @@ enum PushConfig {
     /// development profile (`aps-environment` development → a sandbox token).
     /// No embedded profile (App Store) means production.
     static var environment: PushEnvironment {
-        let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision")
-        return environment(profile: url.flatMap { try? Data(contentsOf: $0) })
+        environment(profile: (try? Data(contentsOf: profileURL(bundle: Bundle.main.bundleURL, mac: isMac))))
     }
 
+    static var isMac: Bool {
+        #if targetEnvironment(macCatalyst)
+        true
+        #else
+        false
+        #endif
+    }
+
+    /// Where the signing profile sits: `embedded.mobileprovision` at the top
+    /// of an iOS bundle, `Contents/embedded.provisionprofile` in a Mac one.
+    static func profileURL(bundle: URL, mac: Bool) -> URL {
+        mac ? bundle.appending(path: "Contents/embedded.provisionprofile")
+            : bundle.appending(path: "embedded.mobileprovision")
+    }
+
+    /// The entitlement is `aps-environment` in an iOS profile and
+    /// `com.apple.developer.aps-environment` in a Mac (Catalyst) one.
     static func environment(profile: Data?) -> PushEnvironment {
         guard let profile,
               let text = String(data: profile, encoding: .isoLatin1),
@@ -22,7 +38,7 @@ enum PushConfig {
               let xml = String(text[start.lowerBound..<end.upperBound]).data(using: .isoLatin1),
               let plist = try? PropertyListSerialization.propertyList(from: xml, format: nil) as? [String: Any],
               let ents = plist["Entitlements"] as? [String: Any],
-              let aps = ents["aps-environment"] as? String
+              let aps = (ents["aps-environment"] ?? ents["com.apple.developer.aps-environment"]) as? String
         else { return .production }
         return aps == "development" ? .sandbox : .production
     }
