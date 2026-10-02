@@ -543,6 +543,11 @@ fn auth_cli(store: &mut SqliteStore, cmd: AuthCmd, public_url: Option<String>, h
             }
         }
         AuthCmd::Token { cmd: TokenCmd::Create { name, user } } => {
+            if user.is_none() {
+                // as `enroll`: the owner exists before the box ever served
+                let owner_name = human_name(store);
+                store.auth_ensure_owner(human, &owner_name, now)?;
+            }
             let (t, secret) = auth::create_api_token(store, user.as_deref(), &name, now)?;
             println!("{secret}");
             eprintln!("(token {:?} {} — shown once; it opens /mcp only)", t.name, t.id);
