@@ -12,20 +12,28 @@ final class SystemWebAuthenticator: NSObject, WebAuthenticator, ASWebAuthenticat
     func authenticate(url: URL, callbackScheme: String) async throws -> URL {
         defer { session = nil }
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, any Error>) in
-            let s = ASWebAuthenticationSession(url: url, callback: .customScheme(callbackScheme)) { callback, error in
-                if let callback {
-                    cont.resume(returning: callback)
-                } else if let e = error as? ASWebAuthenticationSessionError, e.code == .canceledLogin {
-                    cont.resume(throwing: AuthError.cancelled)
-                } else {
-                    cont.resume(throwing: error ?? AuthError.cancelled)
-                }
-            }
+            let s = ASWebAuthenticationSession(url: url, callback: .customScheme(callbackScheme), completionHandler: Self.completion(cont))
             s.presentationContextProvider = self
             s.prefersEphemeralWebBrowserSession = false
             session = s
             if !s.start() {
                 cont.resume(throwing: AuthError.cancelled)
+            }
+        }
+    }
+
+    /// The session's completion handler. It must not be main-actor isolated:
+    /// on the Mac, AuthenticationServices calls it on an XPC queue, and a
+    /// closure inferred `@MainActor` from this class traps there
+    /// (`_dispatch_assert_queue_fail`) right after a successful sign-in.
+    nonisolated static func completion(_ cont: CheckedContinuation<URL, any Error>) -> @Sendable (URL?, (any Error)?) -> Void {
+        { callback, error in
+            if let callback {
+                cont.resume(returning: callback)
+            } else if let e = error as? ASWebAuthenticationSessionError, e.code == .canceledLogin {
+                cont.resume(throwing: AuthError.cancelled)
+            } else {
+                cont.resume(throwing: error ?? AuthError.cancelled)
             }
         }
     }
