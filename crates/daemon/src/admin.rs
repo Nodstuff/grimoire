@@ -362,6 +362,7 @@ pub fn router(store: Store, token: AdminToken, server_mode: bool) -> Router {
     // the first-run prompt works from any local client
     let open_routes = Router::new()
         .route("/api/profile", get(get_profile).post(set_profile))
+        .layer(axum::middleware::from_fn(crate::viewer::refuse_connector_writes))
         .with_state(state.clone());
     Router::new()
         .route(

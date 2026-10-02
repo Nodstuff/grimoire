@@ -113,6 +113,20 @@ const COVERAGE: &[(&str, &str)] = &[
     ("mcp:add_comment", "mcp_writes_answer_not_found_or_read_only"),
     ("mcp:resolve", "mcp_writes_answer_not_found_or_read_only"),
     ("mcp:proposals", "mcp_reads_never_show_a_private_doc"),
+    // regressions from the adversarial review (a route may carry several rows)
+    ("/api/flags", "unshare_then_a_stale_anchor_reads_nothing_through_flags"),
+    ("mcp:propose", "unshare_then_a_stale_anchor_reads_nothing_through_flags"),
+    ("/api/resolve", "connector_tokens_on_api_get_the_agent_treatment"),
+    ("/api/resolve_bulk", "connector_tokens_on_api_get_the_agent_treatment"),
+    ("/api/docs/{id}/workspace", "connector_tokens_on_api_get_the_agent_treatment"),
+    ("/api/doc/{id}/move", "connector_tokens_on_api_get_the_agent_treatment"),
+    ("/api/doc/{id}/rename", "connector_tokens_on_api_get_the_agent_treatment"),
+    ("/api/doc/{id}/status", "connector_tokens_on_api_get_the_agent_treatment"),
+    ("/api/doc/{id}/delete", "connector_tokens_on_api_get_the_agent_treatment"),
+    ("/api/workspaces", "connector_tokens_on_api_get_the_agent_treatment"),
+    ("/api/profile", "connector_tokens_on_api_get_the_agent_treatment"),
+    ("/api/import", "connector_tokens_on_api_get_the_agent_treatment"),
+    ("/api/propose", "connector_tokens_on_api_get_the_agent_treatment"),
 ];
 
 struct Fx {
@@ -971,4 +985,75 @@ fn every_route_and_tool_is_covered() {
         let name = test.split(' ').next().unwrap();
         assert!(me.contains(&format!("async fn {name}()")) || me.contains(&format!("fn {name}()")), "COVERAGE names a missing test {name}");
     }
+}
+
+/// Review finding 5: a connector token (Claude over OAuth) on /api is the
+/// agent, not the human: it cannot label, move, resolve or manage
+/// workspaces there, and its gated writes into a shared workspace land
+/// flagged exactly as over MCP.
+#[tokio::test]
+async fn connector_tokens_on_api_get_the_agent_treatment() {
+    let fx = fixture();
+    fx.store.lock(Scope::User(fx.a)).share_workspace(fx.family, fx.b, Role::Editor).unwrap();
+    let doc = fx.b_doc;
+    for (m, path, body) in [
+        ("PUT", format!("/api/docs/{doc}/workspace"), json!({"workspace_id": fx.family})),
+        ("POST", format!("/api/doc/{doc}/move"), json!({"parent_id": fx.shared_doc})),
+        ("POST", format!("/api/doc/{doc}/rename"), json!({"title": "x"})),
+        ("POST", format!("/api/doc/{doc}/status"), json!({"status": "draft"})),
+        ("POST", format!("/api/doc/{doc}/delete"), json!({})),
+        ("POST", "/api/resolve".to_string(), json!({"annotation_id": Uuid::now_v7(), "decision": "accept"})),
+        ("POST", "/api/resolve_bulk".to_string(), json!({"annotation_ids": [], "decision": "accept"})),
+        ("POST", "/api/workspaces".to_string(), json!({"name": "Sneaky"})),
+        ("POST", "/api/profile".to_string(), json!({"name": "Claude"})),
+        ("POST", "/api/import".to_string(), json!({"files": []})),
+    ] {
+        let (st, out) = fx.call(&fx.b_conn, m, &path, Some(body)).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "connector {m} {path}: {out}");
+    }
+    // an agent's flagged write in the shared doc cannot be accepted by the
+    // connector on /api, nor by an agent over MCP
+    let e = fx.store.lock(Scope::User(fx.b)).get_doc(fx.shared_doc).unwrap().current_epoch;
+    let (st, out) = fx
+        .call(&fx.b_conn, "POST", "/api/propose", Some(json!({"doc_id": fx.shared_doc, "base_epoch": e, "ops": [para("connector text").1]})))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert!(out.contains("\"yellow\"") && !out.contains("\"green\""), "the share gate flags it: {out}");
+    let ann = fx.store.lock(Scope::User(fx.b)).review_queue(Some(fx.shared_doc)).unwrap().last().unwrap().annotation.id;
+    let (st, _) = fx.call(&fx.b_conn, "POST", "/api/resolve", Some(json!({"annotation_id": ann, "decision": "accept"}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (is_err, out) = fx.tool(&fx.b_pat, "resolve", json!({"annotation_id": ann.to_string(), "decision": "accept"})).await;
+    assert!(is_err, "{out}");
+    // B's own app (a human surface) still can
+    let (st, out) = fx.b("POST", "/api/resolve", Some(json!({"annotation_id": ann, "decision": "accept"}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    // reads stay open to the connector, scoped
+    let (st, docs) = fx.call(&fx.b_conn, "GET", "/api/docs", None).await;
+    assert_eq!(st, StatusCode::OK);
+    fx.no_leak("connector GET /api/docs", &docs);
+}
+
+/// Probe p6 end to end: after unshare, a comment anchored to a block B once
+/// saw never reads it back through /api/flags.
+#[tokio::test]
+async fn unshare_then_a_stale_anchor_reads_nothing_through_flags() {
+    let fx = fixture();
+    let remembered = fx.shared_block;
+    fx.store.lock(Scope::User(fx.a)).unshare_workspace(fx.family, fx.b).unwrap();
+    {
+        let mut s = fx.store.lock(Scope::User(fx.a));
+        let e = s.get_doc(fx.shared_doc).unwrap().current_epoch;
+        s.apply(fx.shared_doc, e, fx.a_human, vec![OpInput { kind: OpKind::Replace { target: remembered, content: "zebrasecret written after unshare".into() }, source_refs: vec![] }])
+            .unwrap();
+    }
+    let e = fx.store.lock(Scope::User(fx.b)).get_doc(fx.b_doc).unwrap().current_epoch;
+    let (_, out) = fx
+        .tool(&fx.b_pat, "propose", json!({"doc_id": fx.b_doc.to_string(), "base_epoch": e,
+            "ops": [{"kind": {"op": "insert", "parent_id": null, "order_key": "", "block_type": "comment", "content": "probe", "refers_to": remembered.to_string()}, "source_refs": []}]}))
+        .await;
+    assert!(out.starts_with("parked"), "a cross-doc anchor never applies: {out}");
+    let (st, flags) = fx.b("GET", "/api/flags", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(!flags.contains("written after unshare"), "{flags}");
+    fx.no_leak("/api/flags", &flags);
 }

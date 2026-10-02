@@ -90,6 +90,29 @@ impl FromRequestParts<crate::api::ApiState> for Viewer {
     }
 }
 
+/// The `/api` writes a connector token (a third-party OAuth client such as
+/// Claude, as opposed to the person's own app) may make: the gated content
+/// writes, attributed to the connector's agent principal (its
+/// `Taisce-Principal` is pinned by `require_auth`), so the store's share gate
+/// treats them exactly as MCP. Every other write — moves, renames, labels,
+/// status, delete/restore, resolve, workspaces and membership, imports,
+/// to-dos, profile — is refused for connectors (ADR 0004, review finding 5):
+/// those store paths are human paths with no gate.
+pub const CONNECTOR_WRITES: [&str; 4] = ["/api/propose", "/api/propose_markdown", "/api/comment", "/api/docs"];
+
+pub async fn refuse_connector_writes(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let write = !matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD);
+    if write
+        && let Some(who) = req.extensions().get::<Authenticated>()
+        && !who.owner_app
+        && !CONNECTOR_WRITES.contains(&req.uri().path())
+    {
+        tracing::warn!(target: crate::auth::AUDIT, event = "refused.connector_write", user = %who.user_id, client = who.client_id, path = req.uri().path());
+        return forbidden("this token is a connector: it writes through the gate (MCP, or /api/propose); other changes are made from the Taisce app");
+    }
+    next.run(req).await
+}
+
 /// The `/api` status layer: a handler that answered `200 {"error": "not
 /// found: …"}` (the long-standing shape) answers 404, `forbidden: …` 403.
 /// One place, so every route — and every new one — reports an invisible doc

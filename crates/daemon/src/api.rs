@@ -1350,6 +1350,8 @@ pub fn router(state: ApiState) -> Router {
         .merge(crate::changes::router(state.clone()))
         .merge(crate::workspaces::router(state.clone()))
         .merge(crate::todo::router(state))
+        // connectors write only through the gated routes (ADR 0004)
+        .layer(axum::middleware::from_fn(crate::viewer::refuse_connector_writes))
         // one place maps `{error: "not found: …"}` to 404 for every route
         .layer(axum::middleware::from_fn(crate::viewer::error_status))
 }
