@@ -157,6 +157,7 @@ struct SearchResultCard: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .card()
+        .hoverWash()
         .contentShape(.rect(cornerRadius: Theme.radius))
         .accessibilityElement(children: .combine)
     }

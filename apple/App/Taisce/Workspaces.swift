@@ -26,6 +26,12 @@ struct WorkspacePicker: Hashable, Sendable {
         return ordered.first.map { .id($0.id) } ?? .unsorted
     }
 
+    /// ⌘1…⌘9: the nth option (1-based); nil past the end or with workspaces off.
+    func shortcut(_ n: Int) -> WorkspaceScope? {
+        guard enabled, n >= 1, n <= options.count else { return nil }
+        return options[n - 1]
+    }
+
     func name(_ scope: WorkspaceScope) -> String {
         switch scope {
         case .unsorted: "Unsorted"

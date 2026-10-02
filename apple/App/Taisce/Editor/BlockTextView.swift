@@ -27,7 +27,8 @@ final class BlockTextView: UITextView {
             command("b", .command, #selector(cmdBold), "Bold"),
             command("i", .command, #selector(cmdItalic), "Italic"),
             command("k", .command, #selector(cmdLink), "Link"),
-            command("e", .command, #selector(cmdCode), "Inline Code"),
+            // ⌘E is the menu bar's Edit / Done; inline code takes ⇧⌘E
+            command("e", [.command, .shift], #selector(cmdCode), "Inline Code"),
             command("\t", [], #selector(cmdIndent), "Indent"),
             command("\t", .shift, #selector(cmdOutdent), "Outdent"),
         ]
@@ -93,7 +94,8 @@ struct BlockEditorView: UIViewRepresentable {
         tv.handler = c
         c.textView = tv
         c.onResize = onResize
-        tv.inputAccessoryView = model.formattingBar
+        // the Mac has no keyboard to ride on: DocEditorView pins the bar on top
+        if !EditorChrome.barIsInline { tv.inputAccessoryView = model.formattingBar }
         let tap = UITapGestureRecognizer(target: c, action: #selector(BlockTextCoordinator.tapped(_:)))
         tap.delegate = c
         tap.cancelsTouchesInView = false

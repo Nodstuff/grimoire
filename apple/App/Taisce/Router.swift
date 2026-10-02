@@ -12,10 +12,29 @@ enum Route: Hashable {
     case todos
 }
 
-/// iPad sidebar selection.
+/// iPad and Mac sidebar selection.
 enum PadItem: Hashable {
     case today, todos, search
     case doc(DocID)
+}
+
+/// A menu-bar command (the Mac's menus, an iPad's hardware keyboard).
+enum AppCommand: Hashable {
+    case newDoc, search, toggleEdit, refresh, settings, today, todos
+    /// ⌘1…⌘9: the nth workspace in the switcher's order (1-based)
+    case workspace(Int)
+}
+
+/// The part of a command the router can't do itself.
+enum CommandEffect: Equatable {
+    case none, refresh
+    case selectWorkspace(WorkspaceScope)
+}
+
+/// ⌘E on the doc in front: start editing it, or finish.
+struct EditRequest: Equatable {
+    var doc: DocID
+    var serial: Int
 }
 
 /// Which tab / sidebar item is showing and each stack's path. One per
@@ -37,6 +56,12 @@ final class Router {
     var newDocParent: DocID?
     /// set by the pad layout, so `open` pushes onto the detail stack
     var isPad = false
+    /// the doc whose editor is open, as `DocScreen` reports it
+    var editingDoc: DocID?
+    /// ⌘E: the doc screen showing `doc` toggles edit mode
+    private(set) var editRequest: EditRequest?
+    /// ⌘F on the split view: bumped to focus the sidebar's search field
+    private(set) var searchFocusRequest = 0
 
     func open(_ route: Route) {
         if isPad {
@@ -68,6 +93,60 @@ final class Router {
 
     func showSearch() {
         if isPad { select(.search) } else { tab = .search }
+    }
+
+    /// The doc at the front of this window: the top of the visible stack.
+    var focusedDoc: DocID? {
+        let path: [Route]
+        if isPad {
+            if padPath.isEmpty, case .doc(let id)? = padItem { return id }
+            path = padPath
+        } else {
+            switch tab {
+            case .today: path = todayPath
+            case .library: path = libraryPath
+            case .todos: path = todosPath
+            case .search: path = searchPath
+            }
+        }
+        if case .doc(let id)? = path.last { return id }
+        return nil
+    }
+
+    /// Whether a command applies now. Nothing works before sign-in; ⌘E
+    /// needs a doc in front; ⌘n needs an nth workspace.
+    func canPerform(_ command: AppCommand, signedIn: Bool, picker: WorkspacePicker) -> Bool {
+        guard signedIn else { return false }
+        switch command {
+        case .toggleEdit: return editingDoc != nil || focusedDoc != nil
+        case .workspace(let n): return picker.shortcut(n) != nil
+        default: return true
+        }
+    }
+
+    /// Do the navigation part of a command; the rest comes back as an effect.
+    func perform(_ command: AppCommand, picker: WorkspacePicker) -> CommandEffect {
+        switch command {
+        case .newDoc:
+            newDoc(in: nil)
+        case .search:
+            showSearch()
+            if isPad { searchFocusRequest += 1 }
+        case .toggleEdit:
+            guard let doc = editingDoc ?? focusedDoc else { break }
+            editRequest = EditRequest(doc: doc, serial: (editRequest?.serial ?? 0) + 1)
+        case .refresh:
+            return .refresh
+        case .settings:
+            showSettings = true
+        case .today:
+            if isPad { select(.today) } else { tab = .today }
+        case .todos:
+            showTodos()
+        case .workspace(let n):
+            if let scope = picker.shortcut(n) { return .selectWorkspace(scope) }
+        }
+        return .none
     }
 
     /// Development launch arguments, for screenshots and UI runs:

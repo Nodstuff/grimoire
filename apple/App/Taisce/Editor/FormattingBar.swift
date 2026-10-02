@@ -42,7 +42,9 @@ final class FormattingBar: UIToolbar {
         }
         // iOS 26 groups bar items into capsules and overflows the rest:
         // indent lives in the block menu so Hide keyboard stays in view
-        items = [bold, italic, code, wiki, todo, kind, .flexibleSpace(), hide]
+        items = EditorChrome.barIsInline
+            ? [bold, italic, code, wiki, todo, kind, .flexibleSpace()]
+            : [bold, italic, code, wiki, todo, kind, .flexibleSpace(), hide]
     }
 
     required init?(coder: NSCoder) { fatalError("not from a nib") }

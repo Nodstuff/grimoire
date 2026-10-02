@@ -14,6 +14,7 @@ struct TaisceApp: App {
                 .environment(model)
                 .task { await model.boot() }
         }
+        .commands { TaisceCommands(model: model) }
         .onChange(of: scenePhase) { _, phase in
             // the stream is foreground-only; silent pushes catch up in the background (AppDelegate)
             Task {

@@ -52,6 +52,25 @@ struct DocScreen: View {
         }
         .onDisappear {
             if let editor { Task { await editor.flush(); editor.stop() } }
+            if router.editingDoc == docID { router.editingDoc = nil }
+        }
+        // ⌘E (the menu bar): edit this doc, or finish
+        .onChange(of: router.editRequest) { _, req in
+            guard let req, req.doc == docID else { return }
+            Task {
+                if editor != nil {
+                    await finishEditing()
+                } else if editable, page != nil {
+                    await startEditing()
+                }
+            }
+        }
+        .onChange(of: editor == nil) { _, closed in
+            if !closed {
+                router.editingDoc = docID
+            } else if router.editingDoc == docID {
+                router.editingDoc = nil
+            }
         }
     }
 

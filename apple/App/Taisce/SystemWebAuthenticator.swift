@@ -31,7 +31,9 @@ final class SystemWebAuthenticator: NSObject, WebAuthenticator, ASWebAuthenticat
     }
 
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        // the window in front first: a Mac can have the app's window behind another app's
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .sorted { ($0.activationState == .foregroundActive ? 0 : 1) < ($1.activationState == .foregroundActive ? 0 : 1) }
         if let key = scenes.lazy.compactMap(\.keyWindow).first { return key }
         // sign-in starts from a button, so a scene exists
         guard let scene = scenes.first else { preconditionFailure("sign-in with no window scene") }
