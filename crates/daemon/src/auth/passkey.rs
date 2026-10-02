@@ -94,6 +94,11 @@ impl Pending {
         Some(id)
     }
 
+    #[cfg(test)]
+    pub fn has_authz(&self, id: &str) -> bool {
+        self.authz.contains_key(id)
+    }
+
     /// Hold a web UI sign-in challenge, under the same per-IP rule.
     pub(super) fn add_web(&mut self, c: WebCeremony) -> Option<String> {
         self.sweep(c.at);

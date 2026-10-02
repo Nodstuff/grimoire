@@ -253,6 +253,29 @@ gained (the client fetches them).
   styles for mermaid/the editor, `img-src 'self' data: blob: https:`, `connect-src 'self'`,
   `frame-ancestors 'none'`), `X-Frame-Options: DENY`, `Referrer-Policy: same-origin` and
   `nosniff`; the nonce'd passkey pages keep their own CSP. LOCAL mode is unchanged.
+  `img-src https:` is a trade-off: a remote image in a shared doc tells its host your IP (and
+  when you opened the doc) — `Referrer-Policy` keeps the page URL from it, nothing hides the
+  fetch itself.
+- **SameSite is per registrable domain**: `Strict` treats every `*.null.ie` host as same-site,
+  so the cookie rides on requests a page on another null.ie host makes. That is fine while
+  nobody else hosts pages there; the Origin + `Taisce-CSRF` check is what refuses such a
+  page's writes regardless.
+- **Sign-in is discoverable** (review round): both passkey sign-ins (`/auth/web/begin` and the
+  OAuth page's `/oauth/authorize/begin`) send an empty `allowCredentials`, so nobody learns
+  which credentials or how many people are enrolled (the Origin check is only a browser rule).
+  The assertion's credential id names the passkey and the passkey names the user; a
+  `userHandle`, when present, must be that user. Enrollment asks for `residentKey: required`.
+  Passkeys enrolled earlier were registered `residentKey: discouraged`; platform passkeys
+  (iCloud Keychain, Google Password Manager) are discoverable regardless, a bare security
+  key may not be — such a key no longer signs in, and the recovery is `taisce auth enroll`
+  on the box (the app's existing grants are unaffected).
+- **A passkey's sign-ins die with it**: codes, grants and web sessions record the passkey
+  (`credential_id`; grants from before carry NULL). `taisce auth revoke <passkey>` revokes the
+  sessions and grants it opened and prints what still signs that person in;
+  `taisce auth revoke --user <name> --all` (a lost device) deletes every passkey and revokes
+  every session and grant of that user (PATs are named separately).
+- **Pending sign-ins** are held per IP (at most 8 each; a flood evicts only its own oldest; a
+  full map refuses new ones instead of evicting), and a passkey challenge lives two minutes.
 
 **Stored cross-doc references and how each is scoped**
 

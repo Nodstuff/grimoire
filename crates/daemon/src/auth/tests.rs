@@ -1660,3 +1660,236 @@ async fn server_mode_ui_responses_carry_the_security_headers() {
     let page = send(&h.app, get(&format!("/auth/enroll?t={t}"))).await;
     assert!(page.headers.get(header::CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap().contains("'nonce-"));
 }
+
+// ---- review round: discoverable sign-in, passkey revocation, ceremonies ----
+
+/// The status of an MCP initialize as `token`.
+async fn mcp_status(app: &Router, token: &str) -> StatusCode {
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+    send(app, mcp(init, Some(token), None)).await.status
+}
+
+#[tokio::test]
+async fn sign_in_challenges_name_no_credential() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    // a second person with a passkey of their own
+    let other = h.st.store.lock(taisce_store::Scope::System).auth_add_user("aoife", now()).unwrap();
+    h.st.store
+        .lock(taisce_store::Scope::System)
+        .auth_add_credential(&taisce_store::auth::AuthCredential {
+            id: uuid::Uuid::now_v7(),
+            user_id: other.id,
+            cred_id: "c2Vjb25kLWNyZWRlbnRpYWw".into(),
+            passkey: "{}".into(),
+            label: "theirs".into(),
+            created_at: now(),
+            last_used_at: None,
+        })
+        .unwrap();
+    let ids: Vec<String> = h.st.store.lock(taisce_store::Scope::System).auth_credentials(None).unwrap().into_iter().map(|c| c.cred_id).collect();
+    assert_eq!(ids.len(), 2);
+    // the web UI's challenge, and the OAuth sign-in page's
+    let web = send(&h.app, post_json("/auth/web/begin", json!({}))).await;
+    let client = h.register("Claude", REDIRECT).await;
+    let q = format!(
+        "response_type=code&client_id={client}&redirect_uri={REDIRECT}&code_challenge={CHALLENGE}&code_challenge_method=S256&state=xyz&resource={BASE}/mcp"
+    );
+    let (_, req) = h.authorize(&q).await;
+    let oauth = send(&h.app, post_json("/oauth/authorize/begin", json!({"req": req.unwrap()}))).await;
+    for (what, r, opts) in [("web", &web, web.json()["options"].clone()), ("oauth", &oauth, oauth.json())] {
+        assert_eq!(r.status, StatusCode::OK, "{what}: {}", r.body);
+        assert_eq!(opts["publicKey"]["allowCredentials"], json!([]), "{what}");
+        assert_eq!(opts["publicKey"]["userVerification"], "required", "{what}");
+        for id in &ids {
+            assert!(!r.body.contains(id.as_str()), "{what} leaks credential {id}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_user_handle_must_name_the_credentials_owner() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    for (handle, want) in [(Some(uuid::Uuid::now_v7()), StatusCode::UNAUTHORIZED), (Some(h.owner), StatusCode::OK), (None, StatusCode::OK)] {
+        let b = send(&h.app, post_json("/auth/web/begin", json!({}))).await.json();
+        let rcr = h.discover(&b["options"]);
+        let cred = h.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
+        let mut v = serde_json::to_value(&cred).unwrap();
+        if let Some(u) = handle {
+            v["response"]["userHandle"] = json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(u.as_bytes()));
+        }
+        let r = send(&h.app, post_json("/auth/web/finish", json!({"ceremony": b["ceremony"], "credential": v}))).await;
+        assert_eq!(r.status, want, "handle {handle:?}: {}", r.body);
+    }
+    // a credential this server does not know (deleted since): the same
+    // refusal as a bad signature
+    let b = send(&h.app, post_json("/auth/web/begin", json!({}))).await.json();
+    let rcr = h.discover(&b["options"]);
+    let cred = h.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
+    let id = h.st.store.lock(taisce_store::Scope::System).auth_credentials(None).unwrap()[0].id.to_string();
+    h.st.store.lock(taisce_store::Scope::System).auth_revoke_credential(&id, now()).unwrap().unwrap();
+    let r = send(&h.app, post_json("/auth/web/finish", json!({"ceremony": b["ceremony"], "credential": cred}))).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (StatusCode::UNAUTHORIZED, Some("passkey not accepted")));
+}
+
+#[tokio::test]
+async fn deleting_a_passkey_ends_the_web_sessions_and_grants_it_opened() {
+    let mut h = harness();
+    let (_, cookie) = h.web_sign_in().await;
+    let client = h.register("Claude", REDIRECT).await;
+    let code = h.code_for(&client).await;
+    let t = h.exchange(&client, &code, VERIFIER).await.json();
+    let (access, refresh) = (t["access_token"].as_str().unwrap().to_string(), t["refresh_token"].as_str().unwrap().to_string());
+    let creds = h.st.store.lock(taisce_store::Scope::System).auth_credentials(None).unwrap();
+    assert_eq!(creds.len(), 1);
+    let cred = creds[0].id;
+    // both sign-ins record the passkey that opened them
+    assert_eq!(h.sessions()[0].credential_id, Some(cred));
+    assert_eq!(h.st.store.lock(taisce_store::Scope::System).oauth_grants(false).unwrap()[0].credential_id, Some(cred));
+    // a sign-in from before passkeys were recorded (NULL) survives the delete, and is listed
+    let old = {
+        let mut s = h.st.store.lock(taisce_store::Scope::System);
+        let g = taisce_store::auth::Grant {
+            id: uuid::Uuid::now_v7(),
+            client_id: client.clone(),
+            user_id: h.owner,
+            resource: None,
+            scope: SCOPE.into(),
+            created_at: now(),
+            revoked_at: None,
+            revoke_why: None,
+            credential_id: None,
+        };
+        s.oauth_issue_grant(None, &g, &hash_secret("old-access"), now() + 3600, &hash_secret("old-refresh"), now() + 86400).unwrap();
+        g.id
+    };
+    let out = cli_revoke(&mut h.st.store.lock(taisce_store::Scope::System), &cred.to_string()[..18], now()).unwrap();
+    assert!(out.starts_with(&format!("deleted passkey {cred}")), "{out}");
+    assert!(out.contains("revoked the 1 web session(s) and 1 grant(s) it opened"), "{out}");
+    assert!(out.contains("still live for this user") && out.contains(&old.to_string()) && out.contains("(passkey not recorded)"), "{out}");
+    // the browser and the connector are signed out
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &cookie)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(mcp_status(&h.app, &access).await, StatusCode::UNAUTHORIZED);
+    let r = h.refresh(&client, &refresh).await;
+    assert_eq!((r.status, r.json()["error"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_grant")));
+    let audits: Vec<String> = h.st.store.lock(taisce_store::Scope::System).audit_events(20).unwrap().into_iter().map(|e| e.event).collect();
+    assert!(audits.contains(&"passkey.delete".to_string()), "{audits:?}");
+}
+
+#[tokio::test]
+async fn deleting_the_last_sign_in_says_nothing_remains() {
+    let mut h = harness();
+    let (_, _cookie) = h.web_sign_in().await;
+    let cred = h.st.store.lock(taisce_store::Scope::System).auth_credentials(None).unwrap()[0].id;
+    let out = cli_revoke(&mut h.st.store.lock(taisce_store::Scope::System), &cred.to_string(), now()).unwrap();
+    assert!(out.ends_with("no live sessions or grants remain for this user"), "{out}");
+}
+
+#[tokio::test]
+async fn revoke_all_for_a_lost_device_ends_every_sign_in_of_that_user_only() {
+    let mut h = harness();
+    let (_, cookie) = h.web_sign_in().await;
+    let (_, connector, refresh) = h.tokens().await;
+    let (_, pat) = h.pat("laptop");
+    // someone else, signed in too
+    let other = h.st.store.lock(taisce_store::Scope::System).auth_add_user("aoife", now()).unwrap();
+    let theirs = random_token();
+    h.st.store.lock(taisce_store::Scope::System).auth_create_web_session(other.id, None, &hash_secret(&theirs), "", now()).unwrap();
+    let owner = h.st.store.lock(taisce_store::Scope::System).auth_user(h.owner).unwrap().unwrap();
+    let out = cli_revoke_user_all(&mut h.st.store.lock(taisce_store::Scope::System), &owner, now()).unwrap();
+    assert!(out.starts_with("tom: deleted 2 passkey(s), revoked 1 web session(s) and 1 grant(s)"), "{out}");
+    assert!(out.contains("no live sessions or grants remain") && out.contains("1 personal access token(s) still live"), "{out}");
+    assert!(h.st.store.lock(taisce_store::Scope::System).auth_credentials(Some(h.owner)).unwrap().is_empty());
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &cookie)).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(mcp_status(&h.app, &connector).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(h.refresh("x", &refresh).await.status, StatusCode::BAD_REQUEST);
+    // another person's session lives on; PATs are a separate, named revoke
+    assert_eq!(send(&h.app, with_cookie(get("/api/docs"), &theirs)).await.status, StatusCode::OK);
+    assert_eq!(mcp_status(&h.app, &pat).await, StatusCode::OK);
+    let audits: Vec<String> = h.st.store.lock(taisce_store::Scope::System).audit_events(20).unwrap().into_iter().map(|e| e.event).collect();
+    assert!(audits.contains(&"user.revoke_all".to_string()), "{audits:?}");
+}
+
+#[tokio::test]
+async fn one_ip_cannot_evict_another_ips_sign_in() {
+    let mut h = harness_with(AuthConfig { trusted_proxy: true, ..AuthConfig::from_public_url(BASE).unwrap() });
+    assert!(h.enroll().await.status.is_success());
+    let begin_from = |ip: &'static str| {
+        let mut r = post_json("/auth/web/begin", json!({}));
+        r.headers_mut().insert("x-forwarded-for", ip.parse().unwrap());
+        r
+    };
+    let tom = send(&h.app, begin_from("198.51.100.1")).await.json();
+    for _ in 0..16 {
+        assert_eq!(send(&h.app, begin_from("203.0.113.66")).await.status, StatusCode::OK);
+    }
+    // the flood keeps at most MAX_PENDING_PER_IP of its own, and evicts nothing else
+    {
+        let p = h.st.pending.lock().unwrap();
+        assert_eq!(p.web.values().filter(|c| c.ip == "203.0.113.66").count(), passkey::MAX_PENDING_PER_IP);
+        assert_eq!(p.web.values().filter(|c| c.ip == "198.51.100.1").count(), 1);
+    }
+    let finish = |h: &mut H, b: &Value| {
+        let rcr = h.discover(&b["options"]);
+        let cred = h.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
+        post_json("/auth/web/finish", json!({"ceremony": b["ceremony"], "credential": cred}))
+    };
+    let r = finish(&mut h, &tom);
+    assert_eq!(send(&h.app, r).await.status, StatusCode::OK, "Tom's open sign-in survived the flood");
+}
+
+#[tokio::test]
+async fn a_ceremony_lasts_two_minutes() {
+    let mut h = harness();
+    assert!(h.enroll().await.status.is_success());
+    let b = send(&h.app, post_json("/auth/web/begin", json!({}))).await.json();
+    let id = b["ceremony"].as_str().unwrap().to_string();
+    h.st.pending.lock().unwrap().web.get_mut(&id).unwrap().at -= passkey::CEREMONY_TTL;
+    let rcr = h.discover(&b["options"]);
+    let cred = h.passkey.do_authentication(Url::parse(BASE).unwrap(), rcr).unwrap();
+    let r = send(&h.app, post_json("/auth/web/finish", json!({"ceremony": id, "credential": cred}))).await;
+    assert_eq!(r.status, StatusCode::GONE, "{}", r.body);
+}
+
+#[test]
+fn a_full_pending_map_refuses_new_sign_ins_rather_than_evicting() {
+    let h = harness();
+    let mut p = passkey::Pending::default();
+    let cer = || h.st.webauthn.start_discoverable_authentication().unwrap().1;
+    let t = now();
+    // per IP: the ninth from one address replaces that address's oldest
+    let mine: Vec<String> = (0..passkey::MAX_PENDING_PER_IP)
+        .map(|_| p.add_web(passkey::WebCeremony { ip: "a".into(), at: t, ceremony: cer() }).unwrap())
+        .collect();
+    let other = p.add_web(passkey::WebCeremony { ip: "b".into(), at: t, ceremony: cer() }).unwrap();
+    p.add_web(passkey::WebCeremony { ip: "a".into(), at: t + 1, ceremony: cer() }).unwrap();
+    assert_eq!(p.web.keys().filter(|k| mine.contains(k)).count(), passkey::MAX_PENDING_PER_IP - 1);
+    assert!(p.web.contains_key(&other));
+    // whole map full (many IPs): a new address is refused, nobody is evicted
+    let mut i = 0;
+    while p.web.len() < 1000 {
+        p.add_web(passkey::WebCeremony { ip: format!("ip{i}"), at: t + 1, ceremony: cer() }).unwrap();
+        i += 1;
+    }
+    assert!(p.add_web(passkey::WebCeremony { ip: "late".into(), at: t + 1, ceremony: cer() }).is_none());
+    assert!(p.web.contains_key(&other), "the open sign-in is still there");
+    // OAuth sign-in requests follow the same per-IP rule
+    let req = |ip: &str| passkey::AuthzRequest {
+        client_id: "c".into(),
+        client_name: "c".into(),
+        redirect_uri: REDIRECT.into(),
+        state: None,
+        code_challenge: CHALLENGE.into(),
+        resource: None,
+        scope: SCOPE.into(),
+        created: t,
+        ip: ip.into(),
+        ceremony: None,
+    };
+    let toms = p.add_authz(req("tom")).unwrap();
+    let flood: Vec<String> = (0..20).map(|_| p.add_authz(req("flood")).unwrap()).collect();
+    assert!(p.has_authz(&toms));
+    assert_eq!(flood.iter().filter(|id| p.has_authz(id)).count(), passkey::MAX_PENDING_PER_IP);
+}
