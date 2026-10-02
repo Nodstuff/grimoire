@@ -115,6 +115,9 @@ account may be flipped to the work account by other sessions — push with
 
 ## Traps
 - `window.alert`/`confirm` are silent no-ops in Tauri's WKWebView — use inline UI.
+- Mac Catalyst answers every text-style size at `.large`: `.dynamicTypeSize(…)` and
+  `UIFont.preferredFont(…, compatibleWith:)` change nothing there. Doc text scales by hand
+  (`DocTextSize`, `docScale`, `DocScaleTrait` in `apple/App/Taisce/Presentation/TextSize.swift`).
 - Markdown-it's commonmark preset has no tables.
 - Old databases still hold `canvas_scene` blocks and `remote` principals: both stay valid in
   the schema (the editor, export and retrieval skip canvas blocks; new ones are refused).
