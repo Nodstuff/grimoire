@@ -84,6 +84,27 @@ pub struct ApiToken {
 /// costs one UPDATE a minute, not one per request.
 pub const API_TOKEN_TOUCH_EVERY: i64 = 60;
 
+/// A web UI session (the cookie's value is never stored, only its hash).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSession {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub created_at: i64,
+    pub last_used_at: i64,
+    /// the absolute end (sign-in + `WEB_SESSION_ABSOLUTE`)
+    pub expires_at: i64,
+    /// coarse device summary, e.g. "Mac · Safari"
+    pub user_agent: String,
+    pub revoked_at: Option<i64>,
+}
+
+/// A web session ends after 14 idle days…
+pub const WEB_SESSION_IDLE: i64 = 14 * 86400;
+/// …or 90 days after sign-in, whichever comes first.
+pub const WEB_SESSION_ABSOLUTE: i64 = 90 * 86400;
+/// Seconds between `last_used_at` writes for one session.
+pub const WEB_SESSION_TOUCH_EVERY: i64 = 60;
+
 /// What presenting an authorization code did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodeOutcome {
@@ -163,6 +184,19 @@ fn api_token_row(r: &rusqlite::Row) -> rusqlite::Result<ApiToken> {
     })
 }
 
+fn web_session_row(r: &rusqlite::Row) -> rusqlite::Result<WebSession> {
+    Ok(WebSession {
+        id: uuid_of(r.get(0)?)?,
+        user_id: uuid_of(r.get(1)?)?,
+        created_at: r.get(2)?,
+        last_used_at: r.get(3)?,
+        expires_at: r.get(4)?,
+        user_agent: r.get(5)?,
+        revoked_at: r.get(6)?,
+    })
+}
+
+const WEB_SESSION_COLS: &str = "id, user_id, created_at, last_used_at, expires_at, user_agent, revoked_at";
 const USER_COLS: &str = "id, principal_id, name, role, created_at";
 const CRED_COLS: &str = "id, user_id, cred_id, passkey, label, created_at, last_used_at";
 const API_TOKEN_COLS: &str = "id, user_id, name, created_at, last_used_at, revoked_at";
@@ -429,6 +463,101 @@ impl SqliteStore {
             params![t.id.to_string(), now],
         )?;
         Ok(Some(ApiToken { revoked_at: Some(now), ..(*t).clone() }))
+    }
+
+    // ---- web sessions ----
+
+    /// A new web session for `user_id` (signed in now), ending at the latest
+    /// `WEB_SESSION_ABSOLUTE` from now.
+    pub fn auth_create_web_session(&mut self, user_id: Uuid, token_hash: &str, user_agent: &str, now: i64) -> Result<WebSession> {
+        let s = WebSession {
+            id: Uuid::now_v7(),
+            user_id,
+            created_at: now,
+            last_used_at: now,
+            expires_at: now + WEB_SESSION_ABSOLUTE,
+            user_agent: user_agent.chars().take(80).collect(),
+            revoked_at: None,
+        };
+        self.conn.execute(
+            "INSERT INTO auth_web_sessions (id, user_id, token_hash, created_at, last_used_at, expires_at, user_agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![s.id.to_string(), user_id.to_string(), token_hash, now, now, s.expires_at, s.user_agent],
+        )?;
+        Ok(s)
+    }
+
+    /// The live session behind a cookie's hash: unrevoked, inside its
+    /// absolute lifetime, used within the idle window, its user present.
+    pub fn auth_web_session_by_hash(&self, token_hash: &str, now: i64) -> Result<Option<WebSession>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {WEB_SESSION_COLS} FROM auth_web_sessions
+                     WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2 AND last_used_at > ?2 - ?3
+                       AND user_id IN (SELECT id FROM auth_users)"
+                ),
+                params![token_hash, now, WEB_SESSION_IDLE],
+                web_session_row,
+            )
+            .optional()?)
+    }
+
+    /// Roll `last_used_at` forward, unless it moved in the last minute.
+    /// True when it wrote.
+    pub fn auth_touch_web_session(&mut self, id: Uuid, now: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE auth_web_sessions SET last_used_at = ?2
+             WHERE id = ?1 AND revoked_at IS NULL AND last_used_at <= ?2 - ?3",
+            params![id.to_string(), now, WEB_SESSION_TOUCH_EVERY],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Every session, revoked and lapsed ones included, oldest first.
+    pub fn auth_web_sessions(&self) -> Result<Vec<WebSession>> {
+        let mut st = self.conn.prepare(&format!("SELECT {WEB_SESSION_COLS} FROM auth_web_sessions ORDER BY created_at, id"))?;
+        let rows = st.query_map([], web_session_row)?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Revoke a session by its cookie's hash (sign-out). The session, when
+    /// one was live.
+    pub fn auth_revoke_web_session_by_hash(&mut self, token_hash: &str, now: i64) -> Result<Option<WebSession>> {
+        let found = self
+            .conn
+            .query_row(
+                &format!("SELECT {WEB_SESSION_COLS} FROM auth_web_sessions WHERE token_hash = ?1 AND revoked_at IS NULL"),
+                [token_hash],
+                web_session_row,
+            )
+            .optional()?;
+        let Some(s) = found else { return Ok(None) };
+        self.conn.execute("UPDATE auth_web_sessions SET revoked_at = ?2 WHERE id = ?1", params![s.id.to_string(), now])?;
+        Ok(Some(WebSession { revoked_at: Some(now), ..s }))
+    }
+
+    /// Revoke an unrevoked session by id or a unique id prefix. None when
+    /// nothing (or more than one session) matches.
+    pub fn auth_revoke_web_session(&mut self, key: &str, now: i64) -> Result<Option<WebSession>> {
+        let key = key.trim().to_lowercase();
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let hits: Vec<WebSession> = self
+            .auth_web_sessions()?
+            .into_iter()
+            .filter(|s| s.revoked_at.is_none() && s.id.to_string().starts_with(&key))
+            .collect();
+        let [s] = hits.as_slice() else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            "UPDATE auth_web_sessions SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+            params![s.id.to_string(), now],
+        )?;
+        Ok(Some(WebSession { revoked_at: Some(now), ..s.clone() }))
     }
 
     // ---- clients ----
@@ -813,6 +942,13 @@ impl SqliteStore {
         )?;
         n += tx.execute("DELETE FROM oauth_grants WHERE revoked_at IS NOT NULL AND revoked_at <= ?1 - 2592000", [now])?;
         n += tx.execute("DELETE FROM auth_enrollments WHERE expires_at <= ?1", [now])?;
+        // web sessions: gone 30 days after they ended (revoked, lapsed, idle),
+        // so `auth list` still shows a recent sign-out
+        n += tx.execute(
+            "DELETE FROM auth_web_sessions
+             WHERE MIN(COALESCE(revoked_at, expires_at), expires_at, last_used_at + ?2) <= ?1 - 2592000",
+            params![now, WEB_SESSION_IDLE],
+        )?;
         tx.commit()?;
         Ok(n)
     }
@@ -895,6 +1031,47 @@ mod tests {
         let again = s.auth_ensure_owner(u.principal_id, "other", 200).unwrap();
         assert_eq!(again, u);
         assert_eq!(s.auth_users().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn web_sessions_expire_idle_and_absolute_and_revoke() {
+        let (mut s, u) = store_with_owner();
+        let t0 = 1_000_000;
+        let w = s.auth_create_web_session(u.id, "w1", "Mac · Safari", t0).unwrap();
+        assert_eq!(w.expires_at, t0 + WEB_SESSION_ABSOLUTE);
+        assert_eq!(s.auth_web_session_by_hash("w1", t0 + 1).unwrap().unwrap().id, w.id);
+        assert!(s.auth_web_session_by_hash("nope", t0 + 1).unwrap().is_none());
+        // idle: one second short of 14 days is live, 14 days is not
+        assert!(s.auth_web_session_by_hash("w1", t0 + WEB_SESSION_IDLE - 1).unwrap().is_some());
+        assert!(s.auth_web_session_by_hash("w1", t0 + WEB_SESSION_IDLE).unwrap().is_none());
+        // rolling: touched once a minute at most
+        assert!(!s.auth_touch_web_session(w.id, t0 + 59).unwrap());
+        assert!(s.auth_touch_web_session(w.id, t0 + 60).unwrap());
+        // keep it busy: every 13 days, so idle never ends it, but 90 days does
+        let mut t = t0 + 60;
+        while t + 13 * 86400 < t0 + WEB_SESSION_ABSOLUTE {
+            t += 13 * 86400;
+            assert!(s.auth_web_session_by_hash("w1", t).unwrap().is_some(), "live at {t}");
+            assert!(s.auth_touch_web_session(w.id, t).unwrap());
+        }
+        assert!(s.auth_web_session_by_hash("w1", t0 + WEB_SESSION_ABSOLUTE).unwrap().is_none(), "absolute end");
+        // revoke by prefix and by hash
+        let w2 = s.auth_create_web_session(u.id, "w2", "iPhone · Safari", t0).unwrap();
+        let w3 = s.auth_create_web_session(u.id, "w3", "", t0).unwrap();
+        assert!(s.auth_revoke_web_session("", t0).unwrap().is_none());
+        let r = s.auth_revoke_web_session(&w2.id.to_string()[..30], t0 + 5).unwrap().unwrap();
+        assert_eq!((r.id, r.revoked_at), (w2.id, Some(t0 + 5)));
+        assert!(s.auth_web_session_by_hash("w2", t0 + 6).unwrap().is_none());
+        assert!(s.auth_revoke_web_session(&w2.id.to_string(), t0 + 7).unwrap().is_none(), "already revoked");
+        assert_eq!(s.auth_revoke_web_session_by_hash("w3", t0 + 8).unwrap().unwrap().id, w3.id);
+        assert!(s.auth_revoke_web_session_by_hash("w3", t0 + 9).unwrap().is_none());
+        assert_eq!(s.auth_web_sessions().unwrap().len(), 3);
+        // cleanup drops sessions 30 days after they ended
+        s.oauth_cleanup(t0 + 10).unwrap();
+        assert_eq!(s.auth_web_sessions().unwrap().len(), 3);
+        s.oauth_cleanup(t0 + 8 + 2_592_000).unwrap();
+        let left: Vec<Uuid> = s.auth_web_sessions().unwrap().into_iter().map(|x| x.id).collect();
+        assert_eq!(left, vec![w.id], "w2 and w3 ended at sign-out; w1 is still within 30 days of its end");
     }
 
     #[test]

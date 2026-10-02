@@ -425,6 +425,26 @@ CREATE TABLE IF NOT EXISTS auth_api_tokens (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS auth_api_tokens_name ON auth_api_tokens (user_id, name) WHERE revoked_at IS NULL;
 
+-- Web sessions: the embedded web UI's first-party sign-in in SERVER mode
+-- (passkey → `__Host-taisce_session` cookie). Only the cookie value's
+-- SHA-256 is stored. A session lives until it is idle for 14 days or 90 days
+-- after sign-in (`expires_at`), whichever comes first, or until revoked
+-- (sign-out, `taisce auth revoke`). Accepted on /api only.
+CREATE TABLE IF NOT EXISTS auth_web_sessions (
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES auth_users (id) ON DELETE CASCADE,
+    token_hash   TEXT NOT NULL UNIQUE,
+    created_at   INTEGER NOT NULL,
+    -- rolling: touched at most once a minute (`auth_touch_web_session`)
+    last_used_at INTEGER NOT NULL,
+    -- the absolute end: created_at + 90 days
+    expires_at   INTEGER NOT NULL,
+    -- a coarse device summary ("Mac · Safari"), never the raw User-Agent
+    user_agent   TEXT NOT NULL DEFAULT '',
+    revoked_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS auth_web_sessions_user ON auth_web_sessions (user_id);
+
 -- Idempotency: (principal, key) → the first outcome of a write, so a retry
 -- (HTTP `request_id`, or an MCP write's content key) replays it instead of
 -- applying twice — across restarts. Readers pass their own window; rows
