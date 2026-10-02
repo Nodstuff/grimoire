@@ -84,7 +84,9 @@ import Darwin
 public actor LoginEnvironmentCache {
     public static let shared = LoginEnvironmentCache()
     var captured: [String: String]?
-    var inFlight: Task<[String: String], Never>?
+    /// why the login environment wasn't used (the app's own was), if so
+    var captureNote: String?
+    var inFlight: Task<(env: [String: String], note: String?), Never>?
     let timeout: Duration
 
     public init(timeout: Duration = .seconds(5)) {
@@ -93,27 +95,37 @@ public actor LoginEnvironmentCache {
 
     public func environment() async -> [String: String] {
         if let captured { return captured }
-        if let inFlight { return await inFlight.value }
+        if let inFlight { return await inFlight.value.env }
         let timeout = timeout
         let t = Task.detached { await Self.capture(timeout: timeout) }
         inFlight = t
-        let env = await t.value
+        let (env, note) = await t.value
         captured = env
+        captureNote = note
         inFlight = nil
         return env
     }
 
-    static func capture(timeout: Duration) async -> [String: String] {
+    /// Set when the login shell couldn't be read and the app's own
+    /// environment is used instead (a run shows it).
+    public func note() -> String? { captureNote }
+
+    static func capture(timeout: Duration) async -> (env: [String: String], note: String?) {
         let me = Account.current
         let seed = LoginEnvironment.seed(home: me.home, user: me.user, shell: me.shell, tmpdir: ProcessInfo.processInfo.environment["TMPDIR"])
         let spec = SpawnSpec(executable: me.shell, arguments: ["-l", "-c", "env -0"], environment: seed, directory: me.home)
-        if let r = try? await ProcessCapture.run(spec, timeout: timeout), !r.timedOut, r.status.exitCode == 0 {
+        var why: String
+        do {
+            let r = try await ProcessCapture.run(spec, timeout: timeout)
             let env = LoginEnvironment.parse(r.stdout)
-            if env["PATH"] != nil { return env }
+            if !r.timedOut, r.status.exitCode == 0, env["PATH"] != nil { return (env, nil) }
+            why = r.timedOut ? "it took over \(timeout)" : "\(me.shell) -l exited \(r.status.exitCode.map(String.init) ?? "on a signal")"
+        } catch {
+            why = error.localizedDescription
         }
         var env = ProcessInfo.processInfo.environment
         for k in LoginEnvironment.dropped { env[k] = nil }
-        return env
+        return (env, "couldn't read your login environment (\(why)); using the app's own, so PATH may be short")
     }
 }
 

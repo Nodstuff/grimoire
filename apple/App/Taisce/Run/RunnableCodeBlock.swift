@@ -46,6 +46,9 @@ private struct RunnableCodeCard: View {
 
     var body: some View {
         let s = store.state(context)
+        // read here so the card follows it (a sheet's binding getter is
+        // called outside body, where Observation doesn't track)
+        let prompt = s.trustPrompt
         VStack(alignment: .leading, spacing: 0) {
             header(s)
             codeArea(s)
@@ -60,9 +63,12 @@ private struct RunnableCodeCard: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .card(Theme.surface2)
-        .sheet(item: Binding(get: { s.trustPrompt }, set: { if $0 == nil { store.cancelPrompt(s) } })) { prompt in
-            TrustSheet(prompt: prompt, onRun: { Task { await store.confirm(s) } }, onCancel: { store.cancelPrompt(s) })
+        .sheet(item: TrustFlow.presentation(store, s)) { p in
+            TrustSheet(prompt: p, store: store, state: s)
         }
+        .accessibilityValue(prompt == nil ? "" : "asking before it runs")
+        // an untouched practice text follows the doc's code
+        .onChange(of: code) { _, new in s.followDoc(new) }
         .accessibilityElement(children: .contain)
     }
 
@@ -86,7 +92,7 @@ private struct RunnableCodeCard: View {
                     .disabled(s.isSaving)
                 if context.canSave {
                     Button(s.isSaving ? "Saving\u{2026}" : "Save to doc") { Task { await store.save(s, context: context) } }
-                        .disabled(s.isSaving || !s.isPracticeEdited(doc: code))
+                        .disabled(s.isSaving || !s.isPracticeEdited)
                         .help("Propose this change to the doc, like an edit")
                 }
             } else {
@@ -106,7 +112,10 @@ private struct RunnableCodeCard: View {
     }
 
     @ViewBuilder private func runButton(_ s: BlockRunState) -> some View {
-        if s.isRunning {
+        if s.isChecking {
+            ProgressView().controlSize(.small)
+                .accessibilityLabel("Checking who wrote this")
+        } else if s.isRunning {
             Button(role: .destructive) { store.stop(s) } label: {
                 Label("Stop", systemImage: "stop.fill")
             }
@@ -249,7 +258,7 @@ private struct RunOutputView: View {
     }
 
     @ViewBuilder private var status: some View {
-        if state.isRunning {
+        if state.isChecking || state.isRunning {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
                 TimelineView(.periodic(from: .now, by: 0.1)) { ctx in
@@ -270,10 +279,10 @@ private struct RunOutputView: View {
     }
 }
 
-private struct TrustSheet: View {
+struct TrustSheet: View {
     let prompt: TrustPrompt
-    let onRun: () -> Void
-    let onCancel: () -> Void
+    let store: CodeRunStore
+    let state: BlockRunState
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -283,6 +292,7 @@ private struct TrustSheet: View {
             Text("Last edited by \(prompt.lastEditedBy). Run it on this Mac?")
                 .font(.subheadline)
                 .foregroundStyle(Theme.secondary)
+                .accessibilityIdentifier("code.trust.question")
             ScrollView([.vertical, .horizontal]) {
                 Text(prompt.code)
                     .font(.system(.footnote, design: .monospaced))
@@ -294,30 +304,24 @@ private struct TrustSheet: View {
             }
             .frame(minHeight: 120, maxHeight: 420)
             .background(Theme.surface2, in: .rect(cornerRadius: 10, style: .continuous))
-            if let cwd = prompt.request.cwd {
-                Text("Runs in \(cwd), with your login environment.")
-                    .font(.caption)
-                    .foregroundStyle(Theme.secondary)
-            }
+            Text("It runs \(prompt.request.cwd.map { "in \($0) " } ?? "")as you, with your login environment, including any tokens or keys in it.")
+                .font(.caption)
+                .foregroundStyle(Theme.secondary)
             HStack {
                 Spacer()
-                Button("Cancel", role: .cancel) {
-                    onCancel()
-                    dismiss()
-                }
-                .keyboardShortcut(.cancelAction)
-                Button("Run") {
-                    dismiss()
-                    onRun()
-                }
-                .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
-                .tint(Theme.accent)
-                .accessibilityIdentifier("code.trust.run")
+                Button("Cancel", role: .cancel) { TrustFlow.cancelPressed(store, state) { dismiss() } }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("code.trust.cancel")
+                Button("Run") { TrustFlow.runPressed(store, state, prompt) { dismiss() } }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.accent)
+                    .accessibilityIdentifier("code.trust.run")
             }
         }
         .padding(20)
         .frame(minWidth: 460, idealWidth: 560)
+        .accessibilityIdentifier("code.trust")
     }
 }
 #endif

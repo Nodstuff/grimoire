@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 import Testing
 import TaisceKit
 @testable import Taisce
@@ -29,9 +30,9 @@ import Darwin
         #expect(store.state(CodeRunContext(doc: "d", block: "b2", canSave: true)) !== s)
         // practice text: only a real change counts as yours
         store.beginPractice(s, docCode: "echo hi")
-        #expect(s.practice == "echo hi" && !s.isPracticeEdited(doc: "echo hi"))
+        #expect(s.practice == "echo hi" && !s.isPracticeEdited)
         s.practice = "echo bye"
-        #expect(s.isPracticeEdited(doc: "echo hi") && s.code(doc: "echo hi") == "echo bye")
+        #expect(s.isPracticeEdited && s.code(doc: "echo hi") == "echo bye")
         store.revert(s)
         #expect(s.practice == nil && s.code(doc: "echo hi") == "echo hi")
         store.reset()
@@ -121,10 +122,14 @@ import Darwin
         // nothing listens on :9, so no ledger: who wrote it is unknown → ask
         await m.codeRuns.run(s, req, context: ctx, docCode: "echo hi")
         let prompt = try #require(s.trustPrompt)
-        #expect(prompt.lastEditedBy.contains("offline"))
+        #expect(prompt.lastEditedBy.hasPrefix("someone (couldn't check who: "), "\(prompt.lastEditedBy)")
         #expect(prompt.code == "echo hi")
-        #expect(!s.isRunning)
-        await m.codeRuns.confirm(s)
+        #expect(!s.isRunning && !s.isChecking)
+        // the sheet's Run button, exactly as wired: its dismiss goes through
+        // the sheet's binding (which clears the prompt) — the run still starts
+        let binding = TrustFlow.presentation(m.codeRuns, s)
+        #expect(binding.wrappedValue?.id == prompt.id)
+        await TrustFlow.runPressed(m.codeRuns, s, prompt) { binding.wrappedValue = nil }.value
         #expect(s.trustPrompt == nil)
         #expect(s.result?.exitCode == 0)
         #expect(s.log.text == "hi\n")
@@ -138,6 +143,114 @@ import Darwin
         s2.practice = "echo typed"
         await m.codeRuns.run(s2, RunRequest(language: .shell(interpreter: "/bin/sh"), code: "echo typed"), context: other, docCode: "echo a")
         #expect(s2.trustPrompt == nil && s2.log.text == "typed\n")
+        RunApprovals(server: m.serverURL).forget()
+        try await m.cache?.deleteDoc(doc)
+    }
+    #endif
+
+    /// The order 38ccf95 used (dismiss first, then run) works too, and
+    /// Cancel starts nothing; a prompt left over never wedges the block.
+    @Test func trustSheetButtonsInEitherOrder() async throws {
+        let (m, doc, block) = try await modelWithCodeDoc()
+        let ctx = CodeRunContext(doc: doc, block: block, canSave: true)
+        let s = m.codeRuns.state(ctx)
+        let req = RunRequest(language: .shell(interpreter: "/bin/bash"), code: "echo hi")
+        let binding = TrustFlow.presentation(m.codeRuns, s)
+        await m.codeRuns.run(s, req, context: ctx, docCode: "echo hi")
+        let p1 = try #require(s.trustPrompt)
+        TrustFlow.cancelPressed(m.codeRuns, s) { binding.wrappedValue = nil }
+        #expect(s.trustPrompt == nil && s.result == nil && !s.isBusy)
+        // a stale prompt (set, never shown) is replaced by the next Run
+        s.trustPrompt = p1
+        await m.codeRuns.run(s, req, context: ctx, docCode: "echo hi")
+        let p2 = try #require(s.trustPrompt)
+        #expect(p2.id != p1.id)
+        binding.wrappedValue = nil
+        await m.codeRuns.confirm(s, p2)
+        #if targetEnvironment(macCatalyst)
+        #expect(s.result?.exitCode == 0 && s.log.text == "hi\n")
+        #else
+        #expect(s.result?.message == "Code runs on the Mac.")
+        #endif
+        RunApprovals(server: m.serverURL).forget()
+        try await m.cache?.deleteDoc(doc)
+    }
+
+    /// A slow server: "Checking who wrote this…" shows at once, and after
+    /// the limit it asks anyway, saying why.
+    @Test func aSlowTrustCheckAsksAfterTheLimit() async throws {
+        let (m, doc, block) = try await modelWithCodeDoc()
+        // a server that accepts and never answers
+        let listener = try SilentListener()
+        defer { listener.close() }
+        await m.setServerURL("http://127.0.0.1:\(listener.port)")
+        await m.stopSync()
+        UserDefaults.standard.removeObject(forKey: AppModel.serverURLKey)
+        m.codeRuns.trustCheckLimit = .milliseconds(400)
+        let ctx = CodeRunContext(doc: doc, block: block, canSave: true)
+        let s = m.codeRuns.state(ctx)
+        let running = Task { await m.codeRuns.run(s, RunRequest(language: .shell(interpreter: "/bin/bash"), code: "echo hi"), context: ctx, docCode: "echo hi") }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(s.isChecking && s.phase == "Checking who wrote this\u{2026}" && s.hasOutput)
+        await running.value
+        #expect(!s.isChecking)
+        #expect(s.trustPrompt?.lastEditedBy.contains("didn't answer") == true, "\(String(describing: s.trustPrompt?.lastEditedBy))")
+    }
+
+    /// S1: practice text opened on v1 and left untouched; the doc moves to
+    /// v2 (someone else's): Run runs v2, with v2's trust, never v1.
+    @Test func untouchedPracticeTextFollowsTheDoc() async throws {
+        let (m, doc, block) = try await modelWithCodeDoc()
+        let ctx = CodeRunContext(doc: doc, block: block, canSave: true)
+        let s = m.codeRuns.state(ctx)
+        m.codeRuns.beginPractice(s, docCode: "echo v1")
+        #expect(!s.isPracticeEdited)
+        await m.codeRuns.run(s, RunRequest(language: .shell(interpreter: "/bin/bash"), code: s.code(doc: "echo v2")), context: ctx, docCode: "echo v2")
+        let p = try #require(s.trustPrompt, "untouched practice text is the doc's: it asks")
+        #expect(p.code == "echo v2" && p.request.code == "echo v2")
+        #expect(s.practice == "echo v2")
+        // typed text is yours: it runs as typed, no question
+        s.trustPrompt = nil
+        s.practice = "echo mine"
+        #expect(s.isPracticeEdited)
+        s.followDoc("echo v3")
+        #expect(s.practice == "echo mine", "typed text never follows the doc")
+        await m.codeRuns.run(s, RunRequest(language: .shell(interpreter: "/bin/bash"), code: "echo mine"), context: ctx, docCode: "echo v3")
+        #expect(s.trustPrompt == nil)
+        try await m.cache?.deleteDoc(doc)
+    }
+
+    #if targetEnvironment(macCatalyst)
+    /// The card in a real window: Run on a block nobody can vouch for
+    /// presents the trust sheet (a UIKit presentation, not just state).
+    @Test func runPresentsTheTrustSheetOnScreen() async throws {
+        let (m, doc, block) = try await modelWithCodeDoc()
+        let ctx = CodeRunContext(doc: doc, block: block, canSave: true)
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        let host = UIHostingController(rootView: AnyView(
+            RunnableCodeBlock(language: "bash", code: "echo hi").environment(m).environment(\.codeRunContext, ctx)
+        ))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        host.view.layoutIfNeeded()
+        let s = m.codeRuns.state(ctx)
+        // what the Run button calls
+        await m.codeRuns.run(s, RunRequest(language: .shell(interpreter: "/bin/bash"), code: "echo hi"), context: ctx, docCode: "echo hi")
+        #expect(s.trustPrompt != nil)
+        for _ in 0..<100 where host.presentedViewController == nil {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(host.presentedViewController != nil, "the sheet is on screen")
+        // its Run button's action, then the sheet goes and the run happens
+        let p = try #require(s.trustPrompt)
+        await TrustFlow.runPressed(m.codeRuns, s, p) { s.trustPrompt = nil }.value
+        for _ in 0..<100 where host.presentedViewController != nil {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(host.presentedViewController == nil)
+        #expect(s.result?.exitCode == 0 && s.log.text == "hi\n")
         RunApprovals(server: m.serverURL).forget()
         try await m.cache?.deleteDoc(doc)
     }
@@ -289,3 +402,29 @@ import Darwin
     var count = 0
 }
 #endif
+
+/// A TCP listener on loopback that accepts and never answers.
+final class SilentListener: @unchecked Sendable {
+    let fd: Int32
+    let port: UInt16
+    var accepted: [Int32] = []
+
+    init() throws {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        addr.sin_port = 0
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let ok = withUnsafeMutablePointer(to: &addr) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(sock, $0, len) == 0 && listen(sock, 8) == 0 && getsockname(sock, $0, &len) == 0 }
+        }
+        guard ok else { throw POSIXError(.EADDRINUSE) }
+        fd = sock
+        port = UInt16(bigEndian: addr.sin_port)
+    }
+
+    func close() {
+        Darwin.close(fd)
+    }
+}
