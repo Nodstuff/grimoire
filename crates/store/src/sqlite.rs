@@ -2762,6 +2762,13 @@ impl BlockStore for SqliteStore {
             return Err(StoreError::NotFound(format!("annotation {annotation_id}")));
         }
         tenancy::ensure_write_conn(&tx, scope, doc_id)?;
+        // a shared workspace is reviewed by its people: an agent may not
+        // accept or decline there (ADR 0004 §5)
+        if tenancy::agent_into_shared(&tx, doc_id, reviewer)? {
+            return Err(StoreError::Forbidden(
+                "proposals in a shared workspace are resolved by its members, not by an agent".into(),
+            ));
+        }
         let before = tenancy::access_snapshot(&tx)?;
         let kind = parse_annotation_kind(&kind_s)?;
         if parse_annotation_status(&status_s)? != AnnotationStatus::Open {
@@ -3110,7 +3117,15 @@ fn rewrite_inbound_links_tx(
         }
         rewritten += ops.len();
         let current = doc_epoch(tx, doc)?;
-        apply_in_tx(tx, doc, current, principal, ops)?;
+        let receipt = apply_in_tx(tx, doc, current, principal, ops)?;
+        // the share gate: an agent's link rewrite inside a shared workspace
+        // is applied but flagged for its members, never green
+        if tenancy::agent_into_shared(tx, doc, principal)? {
+            for op in receipt.op_ids {
+                tx.execute("UPDATE ops SET verdict = 'yellow' WHERE id = ?1", params![op.to_string()])?;
+                insert_annotation(tx, doc, op, AnnotationKind::Review)?;
+            }
+        }
     }
     Ok(rewritten)
 }

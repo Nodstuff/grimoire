@@ -505,7 +505,25 @@ fn migration_v8_on_a_realistic_db() {
         let hits = s.search_blocks("lorem", 20).unwrap();
         assert_eq!(hits.len(), 20);
         eprintln!("scoped list+search on the migrated db: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
         assert_eq!(s.workspace_map().unwrap().len(), 900);
+        eprintln!("  workspace_map: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let n = s.list_docs().unwrap().len();
+        eprintln!("  list_docs ({n}): {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        s.list_principals().unwrap();
+        eprintln!("  list_principals: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let page = s.changes_since(0, 500).unwrap();
+        eprintln!("  changes_since(0, 500) -> {}: {:?}", page.changes.len(), t.elapsed());
+        let t = std::time::Instant::now();
+        let d = s.list_docs().unwrap()[450].id;
+        s.read_doc(d).unwrap();
+        eprintln!("  read_doc: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        s.visible_block_ids().unwrap();
+        eprintln!("  visible_block_ids: {:?}", t.elapsed());
     }
     // a second user sees nothing of it
     let b = shared.lock(Scope::System).auth_add_user("Aoife", 5).unwrap().id;
@@ -580,4 +598,26 @@ fn agent_labels_are_only_visible_where_they_wrote() {
     // identity resolution by name is unscoped, so no duplicate is ever minted
     assert_eq!(s.principal_by_name("claude:aoife-private-project").unwrap().unwrap().id, label);
     assert_eq!(s.principal_named(PrincipalKind::Agent, "claude:test").unwrap().unwrap().id, t.agent);
+}
+
+#[test]
+fn agent_link_rewrites_and_resolves_in_a_shared_workspace_stay_with_humans() {
+    let t = setup();
+    let mut s = t.store.lock(Scope::User(t.a));
+    // a shared doc that links to A's private doc by title
+    let e = s.get_doc(t.shared_doc).unwrap().current_epoch;
+    s.propose(t.shared_doc, e, t.a_human, vec![para("see [[Salary review]]")]).unwrap();
+    let open = s.review_queue(Some(t.shared_doc)).unwrap().len();
+    // an agent renames the private doc: the link inside the shared doc is
+    // rewritten, but flagged, not green
+    s.propose_doc_op(t.a_secret, t.agent, OpKind::RenameDoc { title: "Pay review".into(), from_title: String::new() }, vec![]).unwrap();
+    let q = s.review_queue(Some(t.shared_doc)).unwrap();
+    assert_eq!(q.len(), open + 1, "the rewrite in the shared doc is flagged");
+    assert_eq!(q.last().unwrap().op.verdict, Some(Verdict::Yellow));
+    // and an agent may not resolve it there
+    let ann = q.last().unwrap().annotation.id;
+    let other_agent = s.create_principal(PrincipalKind::Agent, "claude:other", None).unwrap().id;
+    forbidden(s.resolve(ann, other_agent, ReviewDecision::Accept));
+    // a human member can
+    s.resolve(ann, t.a_human, ReviewDecision::Accept).unwrap();
 }
