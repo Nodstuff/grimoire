@@ -6,7 +6,7 @@ Apple side that means the app target and display name `Taisce`, the bundle id
 open in-app as `taisce://wiki/<title>`. Server-side, the crate, `~/.grimoire`,
 API paths and the MCP server keep the name "grimoire" for now; the bootstrap
 header is `Taisce-Seq` (TaisceKit falls back to the old `X-Grimoire-Seq`).
-The app never sends `X-Grimoire-Principal`: in SERVER mode identity is the token.
+The app never sends `Taisce-Principal`: in SERVER mode identity is the token.
 
 A native SwiftUI client for a Grimoire (Taisce) server: a view into its docs with an
 offline cache. No web views for UI. iPhone + iPad first; Mac via Mac Catalyst
@@ -57,7 +57,7 @@ killed on exit):
 # in the grimoire checkout: cargo build --release -p taisce && cargo build --release -p taisce --example softpasskey
 apple/scripts/integration.sh [path to the grimoire checkout]
 # binaries built elsewhere (e.g. another branch):
-GRIMOIRE_BIN=… SOFTPASSKEY_BIN=… apple/scripts/integration.sh
+TAISCE_BIN=… SOFTPASSKEY_BIN=… apple/scripts/integration.sh
 ```
 
 The UI launch test (`TaisceUITests`) needs a LOCAL daemon serving a doc

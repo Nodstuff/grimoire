@@ -344,6 +344,6 @@ import Testing
         _ = try await server.client().tree()
         _ = try? await server.client().propose(ProposeRequest(docID: "d", baseEpoch: 0, ops: []))
         #expect(!server.requests.isEmpty)
-        #expect(server.requests.allSatisfy { $0.value(forHTTPHeaderField: "X-Grimoire-Principal") == nil })
+        #expect(server.requests.allSatisfy { $0.value(forHTTPHeaderField: "Taisce-Principal") == nil })
     }
 }

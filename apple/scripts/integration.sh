@@ -8,12 +8,12 @@
 #   (default: the main checkout; it needs target/release/taisce and
 #   target/release/examples/softpasskey, built with
 #   `cargo build --release -p taisce && cargo build --release -p taisce --example softpasskey`;
-#   GRIMOIRE_BIN / SOFTPASSKEY_BIN point at binaries built elsewhere)
+#   TAISCE_BIN / SOFTPASSKEY_BIN point at binaries built elsewhere)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-REPO="${1:-${GRIMOIRE_REPO:-$HOME/personal/knowledge-system}}"
-BIN="${GRIMOIRE_BIN:-$REPO/target/release/taisce}"
+REPO="${1:-${TAISCE_REPO:-${GRIMOIRE_REPO:-$HOME/personal/knowledge-system}}}"
+BIN="${TAISCE_BIN:-${GRIMOIRE_BIN:-$REPO/target/release/taisce}}"
 SOFTPASSKEY="${SOFTPASSKEY_BIN:-$REPO/target/release/examples/softpasskey}"
 LOCAL_PORT=7515
 SERVER_PORT=7516
@@ -40,8 +40,7 @@ done
 start() { # name port [extra global args...]
   local name=$1 port=$2; shift 2
   mkdir -p "$ROOT/$name"
-  GRIMOIRE_IDENTITY_FILE="$ROOT/$name/identity.key" \
-    "$BIN" --db "$ROOT/$name/ks.db" --port "$port" "$@" serve >"$ROOT/$name/daemon.log" 2>&1 &
+  "$BIN" --db "$ROOT/$name/ks.db" --port "$port" "$@" serve >"$ROOT/$name/daemon.log" 2>&1 &
   PIDS+=($!)
 }
 
@@ -60,8 +59,7 @@ wait_for "http://127.0.0.1:$LOCAL_PORT/api/docs" 200
 wait_for "http://localhost:$SERVER_PORT/.well-known/oauth-authorization-server" 200
 
 # a one-time enrollment link (the CLI writes the db directly; WAL lets the daemon run on)
-ENROLL=$(GRIMOIRE_IDENTITY_FILE="$ROOT/server/identity.key" \
-  "$BIN" --db "$ROOT/server/ks.db" --public-url "http://localhost:$SERVER_PORT" auth enroll | head -1)
+ENROLL=$("$BIN" --db "$ROOT/server/ks.db" --public-url "http://localhost:$SERVER_PORT" auth enroll | head -1)
 [[ "$ENROLL" == http* ]] || { echo "no enrollment link: $ENROLL" >&2; exit 1; }
 
 cd "$HERE/TaisceKit"
