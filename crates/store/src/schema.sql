@@ -33,7 +33,11 @@ CREATE TABLE IF NOT EXISTS docs (
     -- nothing, or a human accepted one of its fixes. Never set by ordinary
     -- edits; NULL = never verified.
     verified_at   TEXT,
-    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- ADR 0004: the auth_users id whose Unsorted this tree is in when it is
+    -- the root (children carry their root's owner too). NULL = the
+    -- instance owner (a LOCAL database that never had users).
+    owner_id      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS blocks (
@@ -173,7 +177,10 @@ CREATE TABLE IF NOT EXISTS gardeners (
     -- 'review' = all proposals land as reviewable yellows; 'gate' = normal verdicts
     confidence_policy TEXT NOT NULL DEFAULT 'review' CHECK (confidence_policy IN ('review', 'gate')),
     enabled       INTEGER NOT NULL DEFAULT 1,
-    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- ADR 0004: the user this gardener works for (it runs in their scope);
+    -- NULL = the instance owner
+    owner_id      TEXT
 );
 
 -- Run log (ticket 4.5): epoch cut provenance + budget accounting.
@@ -251,7 +258,11 @@ CREATE TABLE IF NOT EXISTS changes (
     -- reordered; deleted: tombstoned (or purged); restored: out of the Trash
     kind   TEXT NOT NULL CHECK (kind IN ('doc', 'tree', 'deleted', 'restored')),
     epoch  INTEGER,
-    at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- ADR 0004: NULL = a global row (filtered by the reader's visibility);
+    -- set = a row for that user only: access gained ('tree') or revoked
+    -- ('deleted', the client drops the doc)
+    user_id TEXT
 );
 
 CREATE TRIGGER IF NOT EXISTS changes_docs_ai AFTER INSERT ON docs BEGIN
@@ -431,3 +442,17 @@ CREATE TABLE IF NOT EXISTS push_devices (
     disabled_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS push_devices_user ON push_devices (user_id);
+
+-- ADR 0004: membership changes, user creation and refused cross-tenant
+-- writes. (`audits` above is the auditor gardener's per-doc coverage, keyed
+-- by doc; these events are not about one doc.)
+CREATE TABLE IF NOT EXISTS audit_events (
+    id      TEXT PRIMARY KEY,
+    at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- the auth_users id that acted (NULL = the box's CLI / System)
+    actor   TEXT,
+    event   TEXT NOT NULL,
+    subject TEXT NOT NULL DEFAULT '',
+    detail  TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS audit_events_at ON audit_events (at);

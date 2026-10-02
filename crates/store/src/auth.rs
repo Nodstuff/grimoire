@@ -178,11 +178,66 @@ impl SqliteStore {
             return Ok(u);
         }
         let id = Uuid::now_v7();
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO auth_users (id, principal_id, name, role, created_at) VALUES (?1, ?2, ?3, 'owner', ?4)",
             params![id.to_string(), principal_id.to_string(), name, now],
         )?;
+        // ADR 0004: a database that served LOCAL first becomes the owner's
+        crate::tenancy::adopt_unowned_conn(&tx, id)?;
+        crate::tenancy::audit_conn(&tx, None, "user.create", &id.to_string(), &serde_json::json!({"name": name, "role": "owner"}))?;
+        tx.commit()?;
         self.auth_user(id)?.ok_or_else(|| StoreError::NotFound(format!("auth user {id}")))
+    }
+
+    /// Add another person (ADR 0004): a `member` user with their own human
+    /// principal. System scope only (the box's CLI). Names are unique
+    /// case-insensitively so `--user <name>` stays unambiguous.
+    pub fn auth_add_user(&mut self, name: &str, now: i64) -> Result<AuthUser> {
+        if self.scope() != crate::Scope::System {
+            return Err(StoreError::Forbidden("users are added on the box's CLI".into()));
+        }
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 64 {
+            return Err(StoreError::InvalidOp("a user's name must be 1..64 characters".into()));
+        }
+        if self.auth_users()?.iter().any(|u| u.name.eq_ignore_ascii_case(name)) {
+            return Err(StoreError::InvalidOp(format!("a user named {name:?} already exists")));
+        }
+        if self.auth_owner()?.is_none() {
+            return Err(StoreError::InvalidOp("no owner yet: serve once in server mode (or `auth enroll`) first".into()));
+        }
+        let principal = Uuid::now_v7();
+        let id = Uuid::now_v7();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO principals (id, kind, display_name) VALUES (?1, 'human', ?2)",
+            params![principal.to_string(), name],
+        )?;
+        tx.execute(
+            "INSERT INTO auth_users (id, principal_id, name, role, created_at) VALUES (?1, ?2, ?3, 'member', ?4)",
+            params![id.to_string(), principal.to_string(), name, now],
+        )?;
+        crate::tenancy::audit_conn(&tx, None, "user.create", &id.to_string(), &serde_json::json!({"name": name, "role": "member"}))?;
+        tx.commit()?;
+        self.auth_user(id)?.ok_or_else(|| StoreError::NotFound(format!("auth user {id}")))
+    }
+
+    /// A user by id, unique id prefix, or (case-insensitive) name.
+    pub fn auth_find_user(&self, key: &str) -> Result<Option<AuthUser>> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let users = self.auth_users()?;
+        if let Some(u) = users.iter().find(|u| u.name.eq_ignore_ascii_case(key)) {
+            return Ok(Some(u.clone()));
+        }
+        let hits: Vec<&AuthUser> = users.iter().filter(|u| u.id.to_string().starts_with(&key.to_lowercase())).collect();
+        Ok(match hits.as_slice() {
+            [u] => Some((*u).clone()),
+            _ => None,
+        })
     }
 
     pub fn auth_owner(&self) -> Result<Option<AuthUser>> {

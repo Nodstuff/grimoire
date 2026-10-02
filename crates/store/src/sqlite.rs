@@ -1,4 +1,6 @@
 use crate::gate::{Scored, score_stale_op};
+use crate::scope::Scope;
+use crate::tenancy;
 use crate::types::*;
 use crate::{BlockStore, Result, StoreError};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -10,6 +12,10 @@ const WORKSPACES_SCHEMA: &str = include_str!("workspaces.sql");
 
 pub struct SqliteStore {
     pub(crate) conn: Connection,
+    /// Who every call runs for (ADR 0004). A store opened directly by a
+    /// process (the CLI, tests) is that process's System context; the
+    /// daemon only reaches one through `SharedStore::lock(scope)`.
+    pub(crate) scope: Scope,
 }
 
 impl SqliteStore {
@@ -49,7 +55,23 @@ impl SqliteStore {
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(WORKSPACES_SCHEMA)?;
         backfill(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, scope: Scope::System })
+    }
+
+    /// Set the scope (crate-private: only `SharedStore::lock` and tests in
+    /// this crate change it).
+    pub(crate) fn set_scope(&mut self, scope: Scope) {
+        self.scope = scope;
+    }
+
+    /// Tests: run `f` with the store in `scope`, then restore it.
+    #[doc(hidden)]
+    pub fn with_scope_for_test<T>(&mut self, scope: Scope, f: impl FnOnce(&mut Self) -> T) -> T {
+        let prev = self.scope;
+        self.scope = scope;
+        let out = f(self);
+        self.scope = prev;
+        out
     }
 }
 
@@ -115,6 +137,22 @@ fn migrate_pre_schema(conn: &Connection) -> Result<()> {
     {
         widen_gardeners_kind_check(conn)?;
     }
+    // workspaces (ADR 0004): names unique per owner, not server-wide
+    let has_ws: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'workspaces'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_ws > 0 {
+        let has_owner: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('workspaces') WHERE name = 'owner_id'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_owner == 0 {
+            rebuild_workspaces_with_owner(conn)?;
+        }
+    }
     Ok(())
 }
 
@@ -176,12 +214,13 @@ fn widen_gardeners_kind_check(conn: &Connection) -> Result<()> {
                  schedule      TEXT NOT NULL DEFAULT 'daily',
                  confidence_policy TEXT NOT NULL DEFAULT 'review' CHECK (confidence_policy IN ('review', 'gate')),
                  enabled       INTEGER NOT NULL DEFAULT 1,
-                 created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                 created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                 owner_id      TEXT
              );
              INSERT INTO gardeners_new (id, name, kind, principal, scope_doc, task_prompt, bindings,
-                                        creds_ref, schedule, confidence_policy, enabled, created_at)
+                                        creds_ref, schedule, confidence_policy, enabled, created_at, owner_id)
                  SELECT id, name, kind, principal, scope_doc, task_prompt, bindings,
-                        creds_ref, schedule, confidence_policy, enabled, created_at FROM gardeners;
+                        creds_ref, schedule, confidence_policy, enabled, created_at, owner_id FROM gardeners;
              DROP TABLE gardeners;
              ALTER TABLE gardeners_new RENAME TO gardeners;
              COMMIT;",
@@ -273,7 +312,9 @@ fn additive_column_migrations(conn: &Connection) -> Result<()> {
         if has_verified == 0 {
             conn.execute("ALTER TABLE docs ADD COLUMN verified_at TEXT", [])?;
         }
+        add_column_if_missing(conn, "docs", "owner_id", "TEXT")?;
     }
+    add_column_if_missing(conn, "changes", "user_id", "TEXT")?;
     let has_gardeners: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'gardeners'",
         [],
@@ -291,6 +332,69 @@ fn additive_column_migrations(conn: &Connection) -> Result<()> {
                 [],
             )?;
         }
+        add_column_if_missing(conn, "gardeners", "owner_id", "TEXT")?;
+    }
+    Ok(())
+}
+
+/// `ALTER TABLE … ADD COLUMN` when the table exists and lacks the column.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let has_table: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |r| r.get(0),
+    )?;
+    if has_table == 0 {
+        return Ok(());
+    }
+    let has: i64 = conn.query_row(
+        &format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+        [column],
+        |r| r.get(0),
+    )?;
+    if has == 0 {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+    }
+    Ok(())
+}
+
+/// v8 (ADR 0004): rebuild `workspaces` without the server-wide UNIQUE on
+/// `name`, with `owner_id`; names become unique per owner via the
+/// `workspaces_owner_name` index (workspaces.sql). Same dance as the ops
+/// rebuild: ids preserved, foreign keys off for the swap, checked after.
+fn rebuild_workspaces_with_owner(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = (|| -> Result<()> {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE workspaces_new (
+                 id         TEXT PRIMARY KEY,
+                 owner_id   TEXT,
+                 name       TEXT NOT NULL COLLATE NOCASE,
+                 color      TEXT,
+                 icon       TEXT,
+                 sort_key   TEXT,
+                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             );
+             INSERT INTO workspaces_new (id, name, color, icon, sort_key, created_at)
+                 SELECT id, name, color, icon, sort_key, created_at FROM workspaces;
+             DROP TABLE workspaces;
+             ALTER TABLE workspaces_new RENAME TO workspaces;
+             COMMIT;",
+        )?;
+        Ok(())
+    })();
+    conn.pragma_update(None, "foreign_keys", true)?;
+    result?;
+    let violations: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_foreign_key_check('doc_workspace')",
+        [],
+        |r| r.get(0),
+    )?;
+    if violations > 0 {
+        return Err(StoreError::InvalidOp(format!(
+            "workspaces rebuild left {violations} dangling doc_workspace rows"
+        )));
     }
     Ok(())
 }
@@ -372,7 +476,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -397,6 +501,13 @@ fn backfill(conn: &Connection) -> Result<()> {
     }
     if version < 7 {
         retire_reviewer_gardeners(&tx)?;
+    }
+    if version < 8 {
+        // ADR 0004: everything existing becomes the instance owner's (a
+        // database with no users yet adopts when the owner is created)
+        if let Some(owner) = tenancy::instance_owner_conn(&tx)? {
+            tenancy::adopt_unowned_conn(&tx, owner)?;
+        }
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -722,16 +833,18 @@ fn insert_doc_row(
     title: &str,
     parent: Option<Uuid>,
     created_by: Uuid,
+    owner: Option<Uuid>,
 ) -> Result<()> {
     let sort_key = next_doc_sort_key(conn, parent)?;
     conn.execute(
-        "INSERT INTO docs (id, parent_id, title, created_by, sort_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO docs (id, parent_id, title, created_by, sort_key, owner_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             id.to_string(),
             parent.map(|p| p.to_string()),
             title,
             created_by.to_string(),
-            sort_key
+            sort_key,
+            owner.map(|o| o.to_string()),
         ],
     )?;
     Ok(())
@@ -803,7 +916,7 @@ fn block_by_id(tx: &Transaction, doc_id: Uuid, id: Uuid) -> Result<Option<Block>
         .transpose()
 }
 
-fn doc_epoch(tx: &Transaction, doc_id: Uuid) -> Result<i64> {
+fn doc_epoch(tx: &Connection, doc_id: Uuid) -> Result<i64> {
     tx.query_row(
         "SELECT current_epoch FROM docs WHERE id = ?1",
         params![doc_id.to_string()],
@@ -1396,6 +1509,20 @@ impl BlockStore for SqliteStore {
         if name.is_empty() || name.chars().count() > 64 {
             return Err(StoreError::InvalidOp("display name must be 1..64 characters".into()));
         }
+        if let Some(u) = self.scope.user() {
+            let mine: bool = self.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM auth_users WHERE id = ?1 AND principal_id = ?2)",
+                params![u.to_string(), id.to_string()],
+                |r| r.get(0),
+            )?;
+            if !mine {
+                return Err(StoreError::NotFound(format!("principal {id}")));
+            }
+            self.conn.execute(
+                "UPDATE auth_users SET name = ?1 WHERE id = ?2",
+                params![name, u.to_string()],
+            )?;
+        }
         let n = self.conn.execute(
             "UPDATE principals SET display_name = ?1 WHERE id = ?2",
             params![name, id.to_string()],
@@ -1407,13 +1534,29 @@ impl BlockStore for SqliteStore {
     }
 
     fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
-            .optional()?)
+        let get = |k: &str| -> Result<Option<String>> {
+            Ok(self
+                .conn
+                .query_row("SELECT value FROM settings WHERE key = ?1", params![k], |r| r.get(0))
+                .optional()?)
+        };
+        match self.scope.user() {
+            None => get(key),
+            // a user's settings are theirs (ADR 0004); the instance owner
+            // still reads what the single-user install recorded
+            Some(u) => match get(&user_setting_key(u, key))? {
+                Some(v) => Ok(Some(v)),
+                None if self.instance_owner()? == Some(u) => get(key),
+                None => Ok(None),
+            },
+        }
     }
 
     fn set_setting(&mut self, key: &str, value: &str) -> Result<()> {
+        let key = &match self.scope.user() {
+            Some(u) => user_setting_key(u, key),
+            None => key.to_string(),
+        };
         self.conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -1423,9 +1566,22 @@ impl BlockStore for SqliteStore {
     }
 
     fn list_principals(&self) -> Result<Vec<Principal>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, kind, display_name, pubkey FROM principals ORDER BY display_name",
-        )?;
+        // a user sees agents, their own human principal, and the people they
+        // share a workspace with — not everyone on the server
+        let filter = match self.scope.user() {
+            None => String::new(),
+            Some(u) => format!(
+                "WHERE kind != 'human'
+                    OR id NOT IN (SELECT principal_id FROM auth_users)
+                    OR id IN (SELECT a.principal_id FROM auth_users a
+                              WHERE a.id = '{u}'
+                                 OR a.id IN (SELECT m.user_id FROM workspace_members m
+                                             WHERE m.workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = '{u}')))"
+            ),
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, kind, display_name, pubkey FROM principals {filter} ORDER BY display_name",
+        ))?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -1449,7 +1605,8 @@ impl BlockStore for SqliteStore {
 
     fn create_doc(&mut self, title: &str, parent: Option<Uuid>, created_by: Uuid) -> Result<Doc> {
         let id = Uuid::now_v7();
-        insert_doc_row(&self.conn, id, title, parent, created_by)?;
+        let owner = self.new_doc_owner(parent)?;
+        insert_doc_row(&self.conn, id, title, parent, created_by, owner)?;
         self.get_doc(id)
     }
 
@@ -1462,26 +1619,58 @@ impl BlockStore for SqliteStore {
     ) -> Result<(Doc, usize)> {
         let id = Uuid::now_v7();
         let n = ops.len();
+        let owner = self.new_doc_owner(parent)?;
+        // the share gate: an agent's first content in a shared workspace
+        // lands as flagged yellows, not greens
+        let gated = n > 0
+            && match parent {
+                Some(p) => {
+                    tenancy::is_agent_conn(&self.conn, created_by)?
+                        && tenancy::space_is_shared(&self.conn, tenancy::space_conn(&self.conn, p)?)?
+                }
+                None => false,
+            };
         let tx = self.conn.transaction()?;
-        insert_doc_row(&tx, id, title, parent, created_by)?;
-        if n > 0 {
+        insert_doc_row(&tx, id, title, parent, created_by, owner)?;
+        let ops = if n > 0 && !gated {
             apply_in_tx(&tx, id, 0, created_by, ops)?;
-        }
+            Vec::new()
+        } else {
+            ops
+        };
         tx.commit()?;
+        if gated {
+            self.propose_impl(id, 0, created_by, ops, true)?;
+        }
         Ok((self.get_doc(id)?, n))
     }
 
     fn list_docs(&self) -> Result<Vec<Doc>> {
-        let mut stmt = self.conn.prepare_cached(
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT id, parent_id, title, review_policy, current_epoch, created_by, status, sort_key
-             FROM docs WHERE deleted = 0 ORDER BY sort_key IS NULL, sort_key, title",
-        )?;
+             FROM docs WHERE deleted = 0 AND {} ORDER BY sort_key IS NULL, sort_key, title",
+            self.vis("id")
+        ))?;
         let rows = stmt.query_map([], row_to_doc)?;
-        rows.map(|r| build_doc(r?)).collect()
+        let mut docs: Vec<Doc> = rows.map(|r| build_doc(r?)).collect::<Result<_>>()?;
+        if !self.scope.sees_all() {
+            // a visible doc under a parent the viewer cannot see is a root
+            // for them: the parent's id is not theirs to know
+            let ids: std::collections::HashSet<Uuid> = docs.iter().map(|d| d.id).collect();
+            for d in docs.iter_mut() {
+                if d.parent_id.is_some_and(|p| !ids.contains(&p)) {
+                    d.parent_id = None;
+                }
+            }
+        }
+        Ok(docs)
     }
 
     fn get_doc(&self, id: Uuid) -> Result<Doc> {
-        get_doc_conn(&self.conn, id)
+        self.see(id)?;
+        let mut doc = get_doc_conn(&self.conn, id)?;
+        self.mask_parent(&mut doc);
+        Ok(doc)
     }
 
     fn read_doc(&self, id: Uuid) -> Result<DocTree> {
@@ -1519,7 +1708,11 @@ impl BlockStore for SqliteStore {
             .query_row(params![id.to_string()], row_to_block)
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("block {id}")))?;
-        build_block(raw)
+        let block = build_block(raw)?;
+        if tenancy::ensure_visible_conn(&self.conn, self.scope, block.doc_id).is_err() {
+            return Err(StoreError::NotFound(format!("block {id}")));
+        }
+        Ok(block)
     }
 
     fn apply(
@@ -1532,6 +1725,24 @@ impl BlockStore for SqliteStore {
         if ops.is_empty() {
             return Err(StoreError::InvalidOp("apply: empty op list".into()));
         }
+        self.may_write(doc_id)?;
+        // the share gate (ADR 0004): an agent's direct write into a shared
+        // workspace still applies, but flagged for review — never green
+        if tenancy::agent_into_shared(&self.conn, doc_id, principal)? {
+            let current = doc_epoch(&self.conn, doc_id)?;
+            if base_epoch != current {
+                return Err(StoreError::StaleBase { base: base_epoch, current });
+            }
+            let out = self.propose_impl(doc_id, base_epoch, principal, ops, true)?;
+            if let Some(v) = out.verdicts.iter().find(|v| !v.applied) {
+                return Err(StoreError::InvalidOp(format!("apply: {}", v.note)));
+            }
+            return Ok(ApplyReceipt {
+                doc_id,
+                epoch: out.epoch,
+                op_ids: out.verdicts.iter().map(|v| v.op_id).collect(),
+            });
+        }
         let tx = self.conn.transaction()?;
         let receipt = apply_in_tx(&tx, doc_id, base_epoch, principal, ops)?;
         tx.commit()?;
@@ -1539,6 +1750,7 @@ impl BlockStore for SqliteStore {
     }
 
     fn ops_since(&self, doc_id: Uuid, since_epoch: i64) -> Result<Vec<LedgerOp>> {
+        self.see(doc_id)?;
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {OP_COLS} FROM ops
              WHERE doc_id = ?1 AND epoch_applied IS NOT NULL AND epoch_applied > ?2
@@ -1549,9 +1761,11 @@ impl BlockStore for SqliteStore {
     }
 
     fn effective_policy(&self, doc_id: Uuid) -> Result<ReviewPolicy> {
+        self.see(doc_id)?;
         let mut cursor = doc_id;
         loop {
-            let doc = self.get_doc(cursor)?;
+            // the walk crosses ancestors the viewer may not see: unscoped
+            let doc = get_doc_conn(&self.conn, cursor)?;
             if let Some(p) = doc.review_policy {
                 return Ok(p);
             }
@@ -1568,10 +1782,20 @@ impl BlockStore for SqliteStore {
         new_parent: Option<Uuid>,
         sort_key: Option<&str>,
     ) -> Result<()> {
-        move_doc_conn(&self.conn, doc_id, new_parent, sort_key)
+        let scope = self.scope;
+        check_move(&self.conn, scope, doc_id, new_parent)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let before = tenancy::access_snapshot(&tx)?;
+        move_doc_conn(&tx, doc_id, new_parent, sort_key)?;
+        reroot_owner(&tx, scope, doc_id, new_parent)?;
+        tenancy::journal_access_diff(&tx, before)?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn delete_doc(&mut self, doc_id: Uuid) -> Result<usize> {
+        self.may_write(doc_id)?;
+        check_subtree_writable(&self.conn, self.scope, doc_id)?;
         let tx = self.conn.transaction()?;
         let n = delete_subtree(&tx, doc_id)?;
         tx.commit()?;
@@ -1583,11 +1807,11 @@ impl BlockStore for SqliteStore {
         // absent. Docs a remote principal created are tombstones federation
         // left behind (dropped mirrors of a revoked share), not the user's own
         // deletions, and stay out of the Trash.
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by,
                     d.status, d.sort_key, d.deleted_at,
                     (SELECT count(*) FROM docs c
-                      WHERE c.deleted = 1 AND c.deleted_at = d.deleted_at AND c.id != d.id
+                      WHERE c.deleted = 1 AND c.deleted_at = d.deleted_at AND c.id != d.id AND {vis_c}
                         AND c.id IN (WITH RECURSIVE sub(id) AS (
                               SELECT id FROM docs WHERE parent_id = d.id
                               UNION ALL
@@ -1597,10 +1821,13 @@ impl BlockStore for SqliteStore {
              JOIN principals p ON p.id = d.created_by
              WHERE d.deleted = 1
                AND p.kind != 'remote'
+               AND {}
                AND (d.parent_id IS NULL
                     OR NOT EXISTS (SELECT 1 FROM docs pd WHERE pd.id = d.parent_id AND pd.deleted = 1))
              ORDER BY d.deleted_at DESC, d.title",
-        )?;
+            self.vis("d.id"),
+            vis_c = self.vis("c.id")
+        ))?;
         let rows = stmt.query_map([], |r| {
             let raw: RawDoc = (
                 r.get(0)?,
@@ -1618,8 +1845,10 @@ impl BlockStore for SqliteStore {
         })?;
         rows.map(|r| {
             let (raw, deleted_at, descendants) = r?;
+            let mut doc = build_doc(raw)?;
+            self.mask_parent(&mut doc);
             Ok(TrashEntry {
-                doc: build_doc(raw)?,
+                doc,
                 deleted_at: deleted_at.unwrap_or_default(),
                 descendants: descendants as usize,
             })
@@ -1628,6 +1857,7 @@ impl BlockStore for SqliteStore {
     }
 
     fn restore_doc(&mut self, doc_id: Uuid) -> Result<usize> {
+        self.may_write(doc_id)?;
         let (stamp, parent): (Option<String>, Option<String>) = self
             .conn
             .query_row(
@@ -1638,6 +1868,7 @@ impl BlockStore for SqliteStore {
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("doc {doc_id} is not in the trash")))?;
         let tx = self.conn.transaction()?;
+        let before = tenancy::access_snapshot(&tx)?;
         // the subtree that fell with it: descendants sharing the stamp
         let mut to_restore = vec![doc_id];
         let mut i = 0;
@@ -1677,32 +1908,41 @@ impl BlockStore for SqliteStore {
                 )?;
             }
         }
+        tenancy::journal_access_diff(&tx, before)?;
         tx.commit()?;
         Ok(n)
     }
 
     fn doc_subtree_ids(&self, doc_id: Uuid) -> Result<Vec<Uuid>> {
-        let mut stmt = self.conn.prepare(
+        self.see(doc_id)?;
+        let mut stmt = self.conn.prepare(&format!(
             "WITH RECURSIVE sub(id) AS (
                  SELECT id FROM docs WHERE id = ?1
                  UNION ALL
                  SELECT docs.id FROM docs JOIN sub ON docs.parent_id = sub.id
                  WHERE docs.deleted = 0)
-             SELECT id FROM sub",
-        )?;
+             SELECT id FROM sub WHERE {}",
+            self.vis("id")
+        ))?;
         let rows = stmt.query_map(params![doc_id.to_string()], |r| r.get::<_, String>(0))?;
         rows.map(|r| uuid_col(r?, "docs.id")).collect()
     }
 
     fn rename_doc(&mut self, doc_id: Uuid, title: &str) -> Result<()> {
+        self.may_write(doc_id)?;
         rename_doc_conn(&self.conn, doc_id, title)
     }
 
     fn set_doc_status(&mut self, doc_id: Uuid, status: Option<DocStatus>) -> Result<()> {
+        self.may_write(doc_id)?;
         set_doc_status_conn(&self.conn, doc_id, status)
     }
 
     fn set_review_policy(&mut self, doc_id: Uuid, policy: Option<ReviewPolicy>) -> Result<()> {
+        // weakening the gate is the space owner's call, not an editor's
+        if !self.scope.sees_all() && self.doc_role(doc_id)? != crate::Role::Owner {
+            return Err(StoreError::Forbidden("only the workspace owner sets review policy".into()));
+        }
         let n = self.conn.execute(
             "UPDATE docs SET review_policy = ?1 WHERE id = ?2",
             params![policy.map(|p| p.as_str()), doc_id.to_string()],
@@ -1719,10 +1959,11 @@ impl BlockStore for SqliteStore {
             "SELECT DISTINCT {}, d.title FROM edges e
              JOIN blocks b ON b.id = e.from_block
              JOIN docs d ON d.id = b.doc_id
-             WHERE b.deleted = 0 AND d.deleted = 0
+             WHERE b.deleted = 0 AND d.deleted = 0 AND {}
                AND (e.to_target = ?1 OR e.to_target LIKE '%/' || ?1)
              ORDER BY d.title, b.order_key",
-            b_cols()
+            b_cols(),
+            self.vis("d.id")
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![doc.title], |r| {
@@ -1748,6 +1989,8 @@ impl BlockStore for SqliteStore {
         reply_to: Option<Uuid>,
     ) -> Result<Block> {
         let target = self.read_block(target_block)?;
+        // comments are writes: a viewer cannot leave one
+        self.may_write(target.doc_id)?;
         if let Some(r) = reply_to {
             let parent = self.read_block(r)?;
             if parent.block_type != BlockType::Comment || parent.refers_to != Some(target_block) {
@@ -1778,6 +2021,7 @@ impl BlockStore for SqliteStore {
     }
 
     fn list_comments(&self, target_block: Uuid) -> Result<Vec<Block>> {
+        self.read_block(target_block)?;
         let sql = format!(
             "SELECT {BLOCK_COLS} FROM blocks
              WHERE refers_to = ?1 AND deleted = 0 ORDER BY id"
@@ -1796,9 +2040,10 @@ impl BlockStore for SqliteStore {
                 "SELECT {}, d.title FROM blocks_fts f
                  JOIN blocks b ON b.rowid = f.rowid
                  JOIN docs d ON d.id = b.doc_id
-                 WHERE blocks_fts MATCH ?1 AND b.deleted = 0 AND d.deleted = 0
+                 WHERE blocks_fts MATCH ?1 AND b.deleted = 0 AND d.deleted = 0 AND {}
                  ORDER BY bm25(blocks_fts) LIMIT ?2",
-                b_cols()
+                b_cols(),
+                self.vis("d.id")
             );
             let mut stmt = self.conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(params![match_q, limit as i64], |r| {
@@ -1823,9 +2068,10 @@ impl BlockStore for SqliteStore {
         let pattern = format!("%{escaped}%");
         let sql = format!(
             "SELECT {}, d.title FROM blocks b JOIN docs d ON d.id = b.doc_id
-             WHERE b.deleted = 0 AND d.deleted = 0 AND b.content LIKE ?1 ESCAPE '\\'
+             WHERE b.deleted = 0 AND d.deleted = 0 AND {} AND b.content LIKE ?1 ESCAPE '\\'
              ORDER BY d.title, b.order_key LIMIT ?2",
-            b_cols()
+            b_cols(),
+            self.vis("d.id")
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![pattern, limit as i64], |r| {
@@ -1850,6 +2096,7 @@ impl BlockStore for SqliteStore {
         principal: Uuid,
         ops: Vec<OpInput>,
     ) -> Result<ProposeOutcome> {
+        self.may_write(doc_id)?;
         self.propose_impl(doc_id, base_epoch, principal, ops, false)
     }
 
@@ -1860,6 +2107,7 @@ impl BlockStore for SqliteStore {
         principal: Uuid,
         ops: Vec<OpInput>,
     ) -> Result<ProposeOutcome> {
+        self.may_write(doc_id)?;
         self.propose_impl(doc_id, base_epoch, principal, ops, true)
     }
 
@@ -1876,11 +2124,30 @@ impl BlockStore for SqliteStore {
                 kind.op_type()
             )));
         }
+        let scope = self.scope;
+        self.may_write(doc_id)?;
+        // a move that changes the doc's space is a share: authorized like a
+        // human move, and an agent taking a doc into or out of a SHARED
+        // workspace parks red for a human (ADR 0004 §5)
+        let mut share_red = false;
+        if let OpKind::MoveDoc { new_parent, .. } = &kind {
+            let (from, to) = check_move(&self.conn, scope, doc_id, *new_parent)?;
+            if from != to
+                && tenancy::is_agent_conn(&self.conn, principal)?
+                && (tenancy::space_is_shared(&self.conn, from)? || tenancy::space_is_shared(&self.conn, to)?)
+            {
+                share_red = true;
+            }
+        }
+        if matches!(kind, OpKind::DeleteDoc { .. }) {
+            check_subtree_writable(&self.conn, scope, doc_id)?;
+        }
         let tx = self.conn.transaction()?;
         if !doc_is_live(&tx, doc_id)? {
             return Err(StoreError::NotFound(format!("doc {doc_id}")));
         }
         let doc = get_doc_conn(&tx, doc_id)?;
+        let before = tenancy::access_snapshot(&tx)?;
         let current = doc.current_epoch;
         let parent_title = |p: Option<Uuid>| -> Result<Option<String>> {
             p.map(|p| get_doc_conn(&tx, p).map(|d| d.title)).transpose()
@@ -1939,14 +2206,21 @@ impl BlockStore for SqliteStore {
                 if *doc_count == 1 { "" } else { "s" }
             );
             (Verdict::Red, 0.5, false)
+        } else if share_red {
+            note = "parked: moving a doc into or out of a shared workspace needs a human accept".into();
+            (Verdict::Red, 0.5, false)
         } else {
             // a cycle / bad key / missing parent is the caller's mistake: an
             // error, not a parked red that could never apply
             project_doc_op(&tx, doc_id, &kind)?;
+            if let OpKind::MoveDoc { new_parent, .. } = &kind {
+                reroot_owner(&tx, scope, doc_id, *new_parent)?;
+            }
             let mut n = String::from("applied; flagged for review (declining reverts it)");
             if let OpKind::RenameDoc { title, from_title } = &kind {
                 let rewritten = rewrite_inbound_links_tx(
                     &tx,
+                    scope,
                     from_title,
                     title,
                     principal,
@@ -1980,6 +2254,7 @@ impl BlockStore for SqliteStore {
                 AnnotationKind::Parked
             },
         )?;
+        tenancy::journal_access_diff(&tx, before)?;
         tx.commit()?;
         Ok(ProposeOutcome {
             doc_id,
@@ -2008,10 +2283,19 @@ impl BlockStore for SqliteStore {
         }
         // each gardener is its own principal: provenance is per-gardener
         let principal = self.create_principal(PrincipalKind::Agent, name, None)?;
+        if let Some(d) = scope_doc {
+            self.see(d)?;
+        }
         let id = Uuid::now_v7();
+        // a gardener works for someone: the creating user, else (the admin
+        // CLI) the instance owner
+        let owner = match self.scope.user() {
+            Some(u) => Some(u),
+            None => self.instance_owner()?,
+        };
         self.conn.execute(
-            "INSERT INTO gardeners (id, name, kind, principal, scope_doc, task_prompt, confidence_policy)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO gardeners (id, name, kind, principal, scope_doc, task_prompt, confidence_policy, owner_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id.to_string(),
                 name,
@@ -2020,6 +2304,7 @@ impl BlockStore for SqliteStore {
                 scope_doc.map(|d| d.to_string()),
                 task_prompt,
                 confidence_policy.as_str(),
+                owner.map(|o| o.to_string()),
             ],
         )?;
         Ok(Gardener {
@@ -2038,11 +2323,12 @@ impl BlockStore for SqliteStore {
     }
 
     fn list_gardeners(&self) -> Result<Vec<Gardener>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT id, name, kind, principal, scope_doc, task_prompt, bindings, creds_ref,
                     schedule, confidence_policy, enabled
-             FROM gardeners ORDER BY name",
-        )?;
+             FROM gardeners WHERE {} ORDER BY name",
+            self.gardener_pred("gardeners.owner_id")
+        ))?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -2095,7 +2381,7 @@ impl BlockStore for SqliteStore {
 
     fn set_gardener_enabled(&mut self, id: Uuid, enabled: bool) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE gardeners SET enabled = ?1 WHERE id = ?2",
+            &format!("UPDATE gardeners SET enabled = ?1 WHERE id = ?2 AND {}", self.gardener_pred("owner_id")),
             params![enabled, id.to_string()],
         )?;
         if n == 0 {
@@ -2114,10 +2400,16 @@ impl BlockStore for SqliteStore {
         enabled: bool,
         bindings: serde_json::Value,
     ) -> Result<()> {
+        if let Some(d) = scope_doc {
+            self.see(d)?;
+        }
         let n = self.conn.execute(
-            "UPDATE gardeners SET task_prompt = ?1, schedule = ?2, confidence_policy = ?3,
-                    scope_doc = ?4, enabled = ?5, bindings = ?6
-             WHERE id = ?7",
+            &format!(
+                "UPDATE gardeners SET task_prompt = ?1, schedule = ?2, confidence_policy = ?3,
+                        scope_doc = ?4, enabled = ?5, bindings = ?6
+                 WHERE id = ?7 AND {}",
+                self.gardener_pred("owner_id")
+            ),
             params![
                 task_prompt,
                 schedule,
@@ -2162,11 +2454,13 @@ impl BlockStore for SqliteStore {
     }
 
     fn list_runs(&self, limit: usize) -> Result<Vec<GardenerRun>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT r.id, r.gardener, g.name, r.started_at, r.status, r.summary, r.tokens_used, r.tool_calls
              FROM gardener_runs r JOIN gardeners g ON g.id = r.gardener
+             WHERE {}
              ORDER BY r.started_at DESC LIMIT ?1",
-        )?;
+            self.gardener_pred("g.owner_id")
+        ))?;
         let rows = stmt.query_map(params![limit as i64], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -2196,36 +2490,40 @@ impl BlockStore for SqliteStore {
     }
 
     fn list_tags(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT t.tag, count(DISTINCT t.doc_id) FROM doc_tags t
              JOIN docs d ON d.id = t.doc_id AND d.deleted = 0
+             WHERE {}
              GROUP BY t.tag ORDER BY 2 DESC, t.tag",
-        )?;
+            self.vis("d.id")
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.map(|r| Ok(r?)).collect()
     }
 
     fn docs_by_tag(&self, tag: &str) -> Result<Vec<Doc>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status, d.sort_key
              FROM docs d JOIN doc_tags t ON t.doc_id = d.id
-             WHERE t.tag = ?1 AND d.deleted = 0 GROUP BY d.id ORDER BY d.title",
-        )?;
+             WHERE t.tag = ?1 AND d.deleted = 0 AND {} GROUP BY d.id ORDER BY d.title",
+            self.vis("d.id")
+        ))?;
         let rows = stmt.query_map(params![tag.to_lowercase()], row_to_doc)?;
-        rows.map(|r| build_doc(r?)).collect()
+        self.masked(rows.map(|r| build_doc(r?)).collect())
     }
 
     fn untagged_docs(&self, limit: usize) -> Result<Vec<Doc>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status, d.sort_key
              FROM docs d
-             WHERE d.deleted = 0
+             WHERE d.deleted = 0 AND {}
                AND EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0)
                AND NOT EXISTS (SELECT 1 FROM doc_tags t WHERE t.doc_id = d.id)
              ORDER BY d.title LIMIT ?1",
-        )?;
+            self.vis("d.id")
+        ))?;
         let rows = stmt.query_map(params![limit as i64], row_to_doc)?;
-        rows.map(|r| build_doc(r?)).collect()
+        self.masked(rows.map(|r| build_doc(r?)).collect())
     }
 
     fn park(
@@ -2238,6 +2536,7 @@ impl BlockStore for SqliteStore {
         if ops.is_empty() {
             return Err(StoreError::InvalidOp("park: empty op list".into()));
         }
+        self.may_write(doc_id)?;
         let tx = self.conn.transaction()?;
         let base = doc_epoch(&tx, doc_id)?;
         let mut op_ids = Vec::with_capacity(ops.len());
@@ -2272,17 +2571,21 @@ impl BlockStore for SqliteStore {
     }
 
     fn review_queue(&self, doc_id: Option<Uuid>) -> Result<Vec<ReviewItem>> {
+        if let Some(d) = doc_id {
+            self.see(d)?;
+        }
         let sql = format!(
             "SELECT a.id, a.doc_id, a.op_id, a.kind, a.status, a.resolved_by,
                     {}
              FROM annotations a JOIN ops o ON o.id = a.op_id
-             WHERE a.status = 'open' AND (?1 IS NULL OR a.doc_id = ?1)
+             WHERE a.status = 'open' AND (?1 IS NULL OR a.doc_id = ?1) AND {}
              ORDER BY a.created_at, a.id",
             OP_COLS
                 .split(", ")
                 .map(|c| format!("o.{c}"))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            self.vis("a.doc_id")
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![doc_id.map(|d| d.to_string())], |r| {
@@ -2317,15 +2620,16 @@ impl BlockStore for SqliteStore {
     }
 
     fn stale_block_vectors(&self, limit: usize) -> Result<Vec<(Uuid, i64, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT b.id, b.epoch, b.content FROM blocks b
              JOIN docs d ON d.id = b.doc_id
              LEFT JOIN block_vec v ON v.block_id = b.id
              WHERE b.deleted = 0 AND b.block_type != 'comment'
-               AND d.deleted = 0
+               AND d.deleted = 0 AND {}
                AND (v.block_id IS NULL OR v.epoch < b.epoch)
              ORDER BY b.epoch DESC LIMIT ?1",
-        )?;
+            self.vis("d.id")
+        ))?;
         let rows = stmt.query_map(params![limit as i64], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
         })?;
@@ -2337,6 +2641,7 @@ impl BlockStore for SqliteStore {
     }
 
     fn set_block_vec(&mut self, block_id: Uuid, epoch: i64, vec: &[f32]) -> Result<()> {
+        self.read_block(block_id)?;
         let mut blob = Vec::with_capacity(vec.len() * 4);
         for f in vec {
             blob.extend_from_slice(&f.to_le_bytes());
@@ -2350,12 +2655,13 @@ impl BlockStore for SqliteStore {
     }
 
     fn block_vecs(&self) -> Result<Vec<(Uuid, Vec<f32>)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT v.block_id, v.vec FROM block_vec v
              JOIN blocks b ON b.id = v.block_id
              JOIN docs d ON d.id = b.doc_id
-             WHERE b.deleted = 0 AND d.deleted = 0 AND v.dim > 0",
-        )?;
+             WHERE b.deleted = 0 AND d.deleted = 0 AND v.dim > 0 AND {}",
+            self.vis("d.id")
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
         rows.map(|r| {
             let (id, blob) = r?;
@@ -2369,6 +2675,9 @@ impl BlockStore for SqliteStore {
     }
 
     fn purge_block_vecs(&mut self) -> Result<usize> {
+        if self.scope != Scope::System && self.scope != Scope::Local {
+            return Err(StoreError::Forbidden("purge_block_vecs is System work".into()));
+        }
         let n = self.conn.execute(
             "DELETE FROM block_vec WHERE block_id IN (
                  SELECT v.block_id FROM block_vec v LEFT JOIN blocks b ON b.id = v.block_id
@@ -2402,6 +2711,7 @@ impl BlockStore for SqliteStore {
     }
 
     fn doc_is_tombstoned(&self, id: Uuid) -> Result<bool> {
+        self.see(id)?;
         self.conn
             .query_row(
                 "SELECT deleted FROM docs WHERE id = ?1",
@@ -2430,6 +2740,12 @@ impl BlockStore for SqliteStore {
         let (doc_id_s, kind_s, status_s, op_id_s) =
             raw.ok_or_else(|| StoreError::NotFound(format!("annotation {annotation_id}")))?;
         let doc_id = uuid_col(doc_id_s, "annotations.doc_id")?;
+        let scope = self.scope;
+        if tenancy::ensure_visible_conn(&tx, scope, doc_id).is_err() {
+            return Err(StoreError::NotFound(format!("annotation {annotation_id}")));
+        }
+        tenancy::ensure_write_conn(&tx, scope, doc_id)?;
+        let before = tenancy::access_snapshot(&tx)?;
         let kind = parse_annotation_kind(&kind_s)?;
         if parse_annotation_status(&status_s)? != AnnotationStatus::Open {
             return Err(StoreError::InvalidOp(format!(
@@ -2468,8 +2784,18 @@ impl BlockStore for SqliteStore {
         // pre-image; they resolve on their own path
         let doc_op = op.kind.is_doc_op();
         if doc_op {
+            if decision == ReviewDecision::Accept
+                && let OpKind::MoveDoc { new_parent, .. } = &op.kind
+            {
+                // a parked (share) move applies now: authorize it as the reviewer's own
+                check_move(&tx, scope, doc_id, *new_parent)?;
+            }
+            if decision == ReviewDecision::Accept && matches!(op.kind, OpKind::DeleteDoc { .. }) {
+                check_subtree_writable(&tx, scope, doc_id)?;
+            }
             receipt = resolve_doc_op(
                 &tx,
+                scope,
                 doc_id,
                 annotation_id,
                 &op,
@@ -2586,6 +2912,7 @@ impl BlockStore for SqliteStore {
                 )?;
             }
         }
+        tenancy::journal_access_diff(&tx, before)?;
         tx.commit()?;
         Ok(receipt)
     }
@@ -2599,6 +2926,7 @@ impl BlockStore for SqliteStore {
 #[expect(clippy::too_many_arguments)]
 fn resolve_doc_op(
     tx: &Transaction,
+    scope: Scope,
     doc_id: Uuid,
     annotation_id: Uuid,
     op: &LedgerOp,
@@ -2618,6 +2946,7 @@ fn resolve_doc_op(
                 // links were rewritten from_title → title on propose; put them back
                 let n = rewrite_inbound_links_tx(
                     tx,
+                    scope,
                     from_title,
                     title,
                     reviewer,
@@ -2654,6 +2983,9 @@ fn resolve_doc_op(
         }
         (AnnotationKind::Parked, ReviewDecision::Accept) => {
             project_doc_op(tx, doc_id, &op.kind)?;
+            if let OpKind::MoveDoc { new_parent, .. } = &op.kind {
+                reroot_owner(tx, scope, doc_id, *new_parent)?;
+            }
             tx.execute(
                 "UPDATE ops SET epoch_applied = ?1 WHERE id = ?2",
                 params![current, op.id.to_string()],
@@ -2692,14 +3024,15 @@ fn doc_is_live(conn: &Connection, id: Uuid) -> Result<bool> {
 
 /// Blocks whose [[wikilinks]] point at `title` (exact or path form):
 /// (block_id, doc_id, content).
-fn linking_blocks_conn(conn: &Connection, title: &str) -> Result<Vec<(Uuid, Uuid, String)>> {
-    let mut stmt = conn.prepare(
+fn linking_blocks_conn(conn: &Connection, scope: Scope, title: &str) -> Result<Vec<(Uuid, Uuid, String)>> {
+    let mut stmt = conn.prepare(&format!(
         "SELECT DISTINCT b.id, b.doc_id, b.content
          FROM edges e JOIN blocks b ON b.id = e.from_block
          JOIN docs d ON d.id = b.doc_id
-         WHERE b.deleted = 0 AND d.deleted = 0
+         WHERE b.deleted = 0 AND d.deleted = 0 AND {}
            AND (e.to_target = ?1 OR e.to_target LIKE '%/' || ?1)",
-    )?;
+        tenancy::vis_pred(scope, "d.id")
+    ))?;
     let rows = stmt.query_map(params![title], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -2723,6 +3056,7 @@ fn linking_blocks_conn(conn: &Connection, title: &str) -> Result<Vec<(Uuid, Uuid
 /// rename in the API). Returns how many blocks were rewritten.
 fn rewrite_inbound_links_tx(
     tx: &Transaction,
+    scope: Scope,
     old: &str,
     new: &str,
     principal: Uuid,
@@ -2732,7 +3066,11 @@ fn rewrite_inbound_links_tx(
         return Ok(0);
     }
     let mut by_doc: std::collections::HashMap<Uuid, Vec<(Uuid, String)>> = Default::default();
-    for (block, doc, content) in linking_blocks_conn(tx, old)? {
+    for (block, doc, content) in linking_blocks_conn(tx, scope, old)? {
+        // a rename never writes into a doc the renamer cannot write
+        if tenancy::ensure_write_conn(tx, scope, doc).is_err() {
+            continue;
+        }
         by_doc.entry(doc).or_default().push((block, content));
     }
     let mut rewritten = 0usize;
@@ -2848,7 +3186,7 @@ impl SqliteStore {
     /// Blocks whose [[wikilinks]] point at this title (exact or path form),
     /// for rewrite-on-rename. Returns (block_id, doc_id, content).
     pub fn linking_blocks(&self, title: &str) -> Result<Vec<(Uuid, Uuid, String)>> {
-        linking_blocks_conn(&self.conn, title)
+        linking_blocks_conn(&self.conn, self.scope, title)
     }
 
     /// Outcome feedback for an agent: its recent ops with the annotation
@@ -2864,13 +3202,14 @@ impl SqliteStore {
              FROM ops o
              LEFT JOIN annotations a ON a.op_id = o.id
              LEFT JOIN principals p ON p.id = a.resolved_by
-             WHERE o.principal = ?1
+             WHERE o.principal = ?1 AND {}
              ORDER BY o.id DESC LIMIT ?2",
             OP_COLS
                 .split(", ")
                 .map(|c| format!("o.{c}"))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            self.vis("o.doc_id")
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![principal.to_string(), limit as i64], |r| {
@@ -2918,7 +3257,10 @@ impl SqliteStore {
         if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_hexdigit()) {
             return Ok(Vec::new());
         }
-        let sql = format!("SELECT {BLOCK_COLS} FROM blocks WHERE id LIKE ?1 AND deleted = 0 ORDER BY id");
+        let sql = format!(
+            "SELECT {BLOCK_COLS} FROM blocks WHERE id LIKE ?1 AND deleted = 0 AND {} ORDER BY id",
+            self.vis("doc_id")
+        );
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![format!("%{suffix}")], row_to_block)?;
         rows.map(|r| build_block(r?)).collect()
@@ -2927,7 +3269,8 @@ impl SqliteStore {
     /// All live docs in a subtree, the scope root included — the opt-in
     /// boundary every scoped gardener works within.
     pub fn doc_subtree(&self, root: Uuid) -> Result<Vec<Doc>> {
-        let mut stmt = self.conn.prepare(
+        self.see(root)?;
+        let mut stmt = self.conn.prepare(&format!(
             "WITH RECURSIVE sub(id) AS (
                  SELECT ?1
                  UNION
@@ -2935,17 +3278,19 @@ impl SqliteStore {
              )
              SELECT d.id, d.parent_id, d.title, d.review_policy, d.current_epoch, d.created_by, d.status, d.sort_key
              FROM docs d JOIN sub ON sub.id = d.id
-             WHERE d.deleted = 0
+             WHERE d.deleted = 0 AND {}
              ORDER BY d.sort_key IS NULL, d.sort_key, d.title",
-        )?;
+            self.vis("d.id")
+        ))?;
         let rows = stmt.query_map(params![root.to_string()], row_to_doc)?;
-        rows.map(|r| build_doc(r?)).collect()
+        self.masked(rows.map(|r| build_doc(r?)).collect())
     }
 
     /// Stalest docs first (oldest last-op) within a scope, excluding docs
     /// this gardener already covered — the scoped sweep worklist.
     pub fn audit_candidates(&self, auditor: Uuid, scope: Uuid, limit: usize) -> Result<Vec<Doc>> {
-        let mut stmt = self.conn.prepare(
+        self.see(scope)?;
+        let mut stmt = self.conn.prepare(&format!(
             "WITH RECURSIVE sub(id) AS (
                  SELECT ?3
                  UNION
@@ -2960,13 +3305,15 @@ impl SqliteStore {
                AND EXISTS (SELECT 1 FROM blocks b WHERE b.doc_id = d.id AND b.deleted = 0
                            AND b.block_type != 'comment')
                AND NOT EXISTS (SELECT 1 FROM audits a WHERE a.doc_id = d.id AND a.principal = ?1)
+               AND {}
              ORDER BY o.last ASC LIMIT ?2",
-        )?;
+            self.vis("d.id")
+        ))?;
         let rows = stmt.query_map(
             params![auditor.to_string(), limit as i64, scope.to_string()],
             row_to_doc,
         )?;
-        rows.map(|r| build_doc(r?)).collect()
+        self.masked(rows.map(|r| build_doc(r?)).collect())
     }
 
     // --- living answers: cited blocks at the epoch they were read ---
@@ -2974,6 +3321,7 @@ impl SqliteStore {
     /// Replace an answer doc's cited-block set (called on create and after
     /// every refresh).
     pub fn record_answer_sources(&mut self, answer_doc: Uuid, sources: &[(Uuid, i64)]) -> Result<()> {
+        self.may_write(answer_doc)?;
         let tx = self.conn.transaction()?;
         tx.execute(
             "DELETE FROM answer_sources WHERE answer_doc_id = ?1",
@@ -2993,14 +3341,19 @@ impl SqliteStore {
     /// state (epoch now, tombstoned/gone) so a caller can tell stale from
     /// fresh without a second round-trip.
     pub fn answer_sources(&self, answer_doc: Uuid) -> Result<Vec<AnswerSource>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT a.block_id, a.epoch_at_answer, a.recorded_at, b.epoch, b.deleted, d.title
+        self.see(answer_doc)?;
+        // a cited block in a doc the viewer cannot see is reported without
+        // its doc's title
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT a.block_id, a.epoch_at_answer, a.recorded_at, b.epoch, b.deleted,
+                    CASE WHEN {} THEN d.title END
              FROM answer_sources a
              LEFT JOIN blocks b ON b.id = a.block_id
              LEFT JOIN docs d ON d.id = b.doc_id
              WHERE a.answer_doc_id = ?1
              ORDER BY a.recorded_at, a.block_id",
-        )?;
+            self.vis("d.id")
+        ))?;
         let rows = stmt.query_map(params![answer_doc.to_string()], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -3029,12 +3382,13 @@ impl SqliteStore {
 
     /// Every live doc with recorded answer sources, oldest recorded first.
     pub fn answer_docs(&self) -> Result<Vec<Uuid>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT a.answer_doc_id, min(a.recorded_at) AS first
              FROM answer_sources a JOIN docs d ON d.id = a.answer_doc_id
-             WHERE d.deleted = 0
+             WHERE d.deleted = 0 AND {}
              GROUP BY a.answer_doc_id ORDER BY first",
-        )?;
+            self.vis("d.id")
+        ))?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.map(|r| uuid_col(r?, "answer_sources.answer_doc_id")).collect()
     }
@@ -3046,6 +3400,7 @@ impl SqliteStore {
     /// Nothing reads the stamp since the freshness views went; the column and
     /// the bookkeeping stay so a future view has the history.
     pub fn set_doc_verified(&mut self, doc_id: Uuid) -> Result<()> {
+        self.see(doc_id)?;
         let n = self.conn.execute(
             "UPDATE docs SET verified_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
             params![doc_id.to_string()],
@@ -3057,6 +3412,7 @@ impl SqliteStore {
     }
 
     pub fn doc_verified_at(&self, doc_id: Uuid) -> Result<Option<String>> {
+        self.see(doc_id)?;
         self.conn
             .query_row(
                 "SELECT verified_at FROM docs WHERE id = ?1",
@@ -3070,6 +3426,7 @@ impl SqliteStore {
     /// Mark docs as covered by an auditor (re-audit = delete the rows).
     pub fn record_audits(&mut self, principal: Uuid, doc_ids: &[Uuid]) -> Result<()> {
         for d in doc_ids {
+            self.see(*d)?;
             self.conn.execute(
                 "INSERT OR REPLACE INTO audits (doc_id, principal) VALUES (?1, ?2)",
                 params![d.to_string(), principal.to_string()],
@@ -3087,9 +3444,10 @@ impl SqliteStore {
              JOIN docs d ON d.id = b.doc_id
              JOIN principals p ON p.id = b.created_by AND p.kind = 'agent'
              LEFT JOIN blocks t ON t.id = b.refers_to
-             WHERE b.block_type = 'comment' AND b.deleted = 0
+             WHERE b.block_type = 'comment' AND b.deleted = 0 AND {}
              ORDER BY b.id DESC",
-            b_cols()
+            b_cols(),
+            self.vis("d.id")
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
@@ -3112,6 +3470,25 @@ impl SqliteStore {
     /// land, docs are created/moved/deleted/statused, annotations resolve, or
     /// gardener runs progress. The app polls this to live-refresh.
     pub fn change_stamp(&self) -> Result<i64> {
+        if let Some(sub) = tenancy::vis_sub(self.scope) {
+            return self
+                .conn
+                .query_row(
+                    &format!(
+                        "WITH v(id) AS ({sub})
+                         SELECT (SELECT COALESCE(max(rowid), 0) FROM ops WHERE doc_id IN (SELECT id FROM v))
+                              + (SELECT count(*) FROM docs WHERE deleted = 0 AND id IN (SELECT id FROM v)) * 1000003
+                              + (SELECT COALESCE(sum(current_epoch), 0) FROM docs WHERE id IN (SELECT id FROM v))
+                              + (SELECT count(*) FROM annotations WHERE status != 'open' AND doc_id IN (SELECT id FROM v)) * 7919
+                              + (SELECT COALESCE(sum(length(coalesce(sort_key,'')) + length(coalesce(parent_id,'')) + length(title)
+                                                     + length(coalesce(status,''))), 0)
+                                 FROM docs WHERE deleted = 0 AND id IN (SELECT id FROM v))",
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(Into::into);
+        }
         self.conn
             .query_row(
                 "SELECT (SELECT COALESCE(max(rowid), 0) FROM ops)
@@ -3151,16 +3528,31 @@ impl SqliteStore {
     /// Journal rows with `seq > since`, oldest first, at most `limit`;
     /// `more` says rows remain past the page.
     pub fn changes_since(&self, since: i64, limit: usize) -> Result<ChangePage> {
-        let mut stmt = self.conn.prepare_cached(
+        // global rows the viewer can see now, plus the rows addressed to
+        // them (access gained / revoked); System/Local read global rows only
+        let filter = match self.scope.user() {
+            None => "c.user_id IS NULL".to_string(),
+            Some(u) => format!(
+                "((c.user_id IS NULL AND {}) OR c.user_id = '{u}')",
+                self.vis("c.doc_id")
+            ),
+        };
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT c.seq, c.doc_id, c.kind, c.epoch, c.at,
-                    d.id, d.title, d.parent_id, d.sort_key, d.status, d.current_epoch, d.deleted
+                    d.id, d.title, d.parent_id, d.sort_key, d.status, d.current_epoch, d.deleted,
+                    c.user_id IS NOT NULL
              FROM changes c LEFT JOIN docs d ON d.id = c.doc_id
-             WHERE c.seq > ?1 ORDER BY c.seq LIMIT ?2",
-        )?;
+             WHERE c.seq > ?1 AND {filter} ORDER BY c.seq LIMIT ?2"
+        ))?;
         let mut changes: Vec<Change> = stmt
             .query_map(params![since, limit as i64 + 1], |r| {
+                let targeted: bool = r.get(12)?;
+                let kind: String = r.get(2)?;
+                // a revoked doc is gone for this viewer: no summary at all
+                let revoked = targeted && kind == "deleted";
+                let access = targeted.then(|| if revoked { "revoked" } else { "granted" }.to_string());
                 let doc = match r.get::<_, Option<String>>(5)? {
-                    Some(_) => Some(DocSummary {
+                    Some(_) if !revoked => Some(DocSummary {
                         title: r.get(6)?,
                         parent_id: r.get(7)?,
                         sort_key: r.get(8)?,
@@ -3169,15 +3561,16 @@ impl SqliteStore {
                         deleted: r.get::<_, i64>(11)? != 0,
                         workspace_id: None,
                     }),
-                    None => None,
+                    _ => None,
                 };
                 Ok(Change {
                     seq: r.get(0)?,
                     doc_id: r.get(1)?,
-                    kind: r.get(2)?,
+                    kind,
                     epoch: r.get(3)?,
                     at: r.get(4)?,
                     doc,
+                    access,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -3194,6 +3587,13 @@ impl SqliteStore {
                 resolved.insert(c.doc_id.clone(), ws);
             }
             doc.workspace_id = resolved[&c.doc_id].clone();
+            // the parent's id only when the viewer can see the parent too
+            if !self.scope.sees_all()
+                && let Some(p) = doc.parent_id.as_deref().and_then(|p| Uuid::parse_str(p).ok())
+                && tenancy::ensure_visible_conn(&self.conn, self.scope, p).is_err()
+            {
+                doc.parent_id = None;
+            }
         }
         Ok(ChangePage { seq: self.latest_change_seq()?, changes, more })
     }
@@ -3213,6 +3613,7 @@ impl SqliteStore {
     /// descending), capped at `limit` — the history panel's page, fetched
     /// in one bounded query instead of the whole ledger reversed and cut.
     pub fn ops_for_doc_limited(&self, doc_id: Uuid, limit: usize) -> Result<Vec<LedgerOp>> {
+        self.see(doc_id)?;
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {OP_COLS} FROM ops
              WHERE doc_id = ?1 AND epoch_applied IS NOT NULL
@@ -3224,33 +3625,37 @@ impl SqliteStore {
 
     /// Docs whose content is a canvas scene (for tree/type badges).
     pub fn canvas_doc_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT doc_id FROM blocks WHERE block_type = 'canvas_scene' AND deleted = 0",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT doc_id FROM blocks WHERE block_type = 'canvas_scene' AND deleted = 0 AND {}",
+            self.vis("doc_id")
+        ))?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.map(|r| Ok(r?)).collect()
     }
 
     /// (doc_id, principal) of each doc's last applied op — "who tends this".
     pub fn raw_tending(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT doc_id, principal, max(epoch_applied) FROM ops
-             WHERE epoch_applied IS NOT NULL GROUP BY doc_id",
-        )?;
+             WHERE epoch_applied IS NOT NULL AND {} GROUP BY doc_id",
+            self.vis("doc_id")
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         rows.map(|r| Ok(r?)).collect()
     }
 
     /// Doc-to-doc edges: wikilinks resolved by title (graph view, 5.10).
     pub fn raw_links(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT DISTINCT b.doc_id, d2.id
              FROM edges e
              JOIN blocks b ON b.id = e.from_block AND b.deleted = 0
              JOIN docs d1 ON d1.id = b.doc_id AND d1.deleted = 0
              JOIN docs d2 ON (e.to_target = d2.title OR e.to_target LIKE '%/' || d2.title)
-             WHERE b.doc_id != d2.id AND d2.deleted = 0",
-        )?;
+             WHERE b.doc_id != d2.id AND d2.deleted = 0 AND {} AND {}",
+            self.vis("d1.id"),
+            self.vis("d2.id")
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         rows.map(|r| Ok(r?)).collect()
     }
@@ -3259,11 +3664,13 @@ impl SqliteStore {
     pub fn raw_doc_tags(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT t.doc_id, t.tag FROM doc_tags t
                  JOIN docs d ON d.id = t.doc_id AND d.deleted = 0
+                 WHERE {}
                  ORDER BY t.doc_id",
-            )?;
+                self.vis("d.id")
+            ))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
         for r in rows {
@@ -3278,9 +3685,10 @@ impl SqliteStore {
     pub fn live_blocks_with_titles(&self) -> Result<Vec<SearchHit>> {
         let sql = format!(
             "SELECT {}, d.title FROM blocks b JOIN docs d ON d.id = b.doc_id
-             WHERE b.deleted = 0 AND d.deleted = 0
+             WHERE b.deleted = 0 AND d.deleted = 0 AND {}
              ORDER BY b.doc_id, b.parent_id IS NOT NULL, b.order_key",
-            b_cols()
+            b_cols(),
+            self.vis("d.id")
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map([], |r| {
@@ -3300,10 +3708,11 @@ impl SqliteStore {
 
     /// doc id → live block count (size hints for the `orient` map).
     pub fn block_counts(&self) -> Result<std::collections::HashMap<Uuid, i64>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT b.doc_id, count(*) FROM blocks b JOIN docs d ON d.id = b.doc_id
-             WHERE b.deleted = 0 AND d.deleted = 0 GROUP BY b.doc_id",
-        )?;
+             WHERE b.deleted = 0 AND d.deleted = 0 AND {} GROUP BY b.doc_id",
+            self.vis("d.id")
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         let mut out = std::collections::HashMap::new();
         for r in rows {
@@ -3311,6 +3720,151 @@ impl SqliteStore {
             out.insert(uuid_col(d, "blocks.doc_id")?, n);
         }
         Ok(out)
+    }
+}
+
+/// A user's own copy of a setting key (ADR 0004).
+fn user_setting_key(user: Uuid, key: &str) -> String {
+    format!("user.{user}.{key}")
+}
+
+/// The root owner of `doc`'s tree (None = unowned: the instance owner).
+fn root_owner_conn(conn: &Connection, doc: Uuid) -> Result<Option<Uuid>> {
+    let o: Option<Option<String>> = conn
+        .prepare_cached(
+            "WITH RECURSIVE up(id, parent_id, owner, depth) AS (
+                 SELECT id, parent_id, owner_id, 0 FROM docs WHERE id = ?1
+                 UNION ALL
+                 SELECT d.id, d.parent_id, d.owner_id, up.depth + 1 FROM docs d JOIN up ON d.id = up.parent_id
+                 WHERE up.depth < 256)
+             SELECT owner FROM up ORDER BY depth DESC LIMIT 1",
+        )?
+        .query_row(params![doc.to_string()], |r| r.get(0))
+        .optional()?;
+    o.flatten().map(|o| uuid_col(o, "docs.owner_id")).transpose()
+}
+
+/// Authorize a move of `doc` under `new_parent` (None = the root) for
+/// `scope`: write on the doc and the new parent, and — when the doc's space
+/// changes — ownership of the source and write on the destination. Returns
+/// (from, to) spaces.
+fn check_move(
+    conn: &Connection,
+    scope: Scope,
+    doc: Uuid,
+    new_parent: Option<Uuid>,
+) -> Result<(tenancy::Space, tenancy::Space)> {
+    tenancy::ensure_write_conn(conn, scope, doc)?;
+    if let Some(p) = new_parent {
+        tenancy::ensure_write_conn(conn, scope, p).map_err(|e| match e {
+            StoreError::NotFound(_) => StoreError::NotFound(format!("new_parent doc {p}")),
+            e => e,
+        })?;
+    }
+    let from = tenancy::space_conn(conn, doc)?;
+    // an own label travels with the doc; otherwise it takes the new
+    // parent's space, or (at the root) the mover's Unsorted
+    let to = match crate::workspaces::label_conn(conn, doc)? {
+        Some(w) => tenancy::Space::Workspace(w),
+        None => match new_parent {
+            Some(p) => tenancy::space_conn(conn, p)?,
+            None => match scope.user() {
+                Some(_) => tenancy::own_unsorted(conn, scope)?,
+                None => match root_owner_conn(conn, doc)? {
+                    Some(o) => tenancy::Space::Unsorted(Some(o)),
+                    None => tenancy::Space::Unsorted(tenancy::instance_owner_conn(conn)?),
+                },
+            },
+        },
+    };
+    tenancy::check_space_change(conn, scope, from, to)?;
+    Ok((from, to))
+}
+
+/// A doc moved to the root becomes a root of its own: in a user scope, the
+/// mover's. (System/Local keep whatever owner it had.)
+fn reroot_owner(conn: &Connection, scope: Scope, doc: Uuid, new_parent: Option<Uuid>) -> Result<()> {
+    if new_parent.is_none()
+        && let Some(u) = scope.user()
+    {
+        conn.execute(
+            "UPDATE docs SET owner_id = ?1 WHERE id = ?2",
+            params![u.to_string(), doc.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+/// A subtree delete may not reach into docs the scope cannot write (a
+/// descendant labelled into someone else's workspace).
+fn check_subtree_writable(conn: &Connection, scope: Scope, doc: Uuid) -> Result<()> {
+    if scope.sees_all() {
+        return Ok(());
+    }
+    for d in subtree_ids_conn(conn, doc)? {
+        if tenancy::ensure_write_conn(conn, scope, d).is_err() {
+            return Err(StoreError::Forbidden(
+                "this subtree holds docs you cannot write; move them out first".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl SqliteStore {
+    /// NotFound unless the scope can see `doc`.
+    pub(crate) fn see(&self, doc: Uuid) -> Result<()> {
+        tenancy::ensure_visible_conn(&self.conn, self.scope, doc)
+    }
+
+    /// NotFound when invisible, Forbidden when read-only.
+    pub(crate) fn may_write(&self, doc: Uuid) -> Result<()> {
+        tenancy::ensure_write_conn(&self.conn, self.scope, doc)
+    }
+
+    /// The visibility predicate on a doc-id column.
+    pub(crate) fn vis(&self, col: &str) -> String {
+        tenancy::vis_pred(self.scope, col)
+    }
+
+    /// Hide a parent the viewer cannot see (the doc is a root for them).
+    pub(crate) fn mask_parent(&self, doc: &mut Doc) {
+        if !self.scope.sees_all()
+            && let Some(p) = doc.parent_id
+            && tenancy::ensure_visible_conn(&self.conn, self.scope, p).is_err()
+        {
+            doc.parent_id = None;
+        }
+    }
+
+    pub(crate) fn masked(&self, docs: Result<Vec<Doc>>) -> Result<Vec<Doc>> {
+        let mut docs = docs?;
+        for d in docs.iter_mut() {
+            self.mask_parent(d);
+        }
+        Ok(docs)
+    }
+
+    /// Gardeners a scope may see: its user's own (NULL owner = the instance
+    /// owner's); System/Local see all.
+    pub(crate) fn gardener_pred(&self, col: &str) -> String {
+        match self.scope.user() {
+            None => "1".into(),
+            Some(u) => format!("COALESCE({col}, {}) = '{u}'", tenancy::INSTANCE_OWNER_SQL),
+        }
+    }
+
+    /// The owner a new doc gets: a child takes its root's owner (after a
+    /// write check on the parent); a root, the creating user (None in
+    /// System/Local = the instance owner).
+    pub(crate) fn new_doc_owner(&self, parent: Option<Uuid>) -> Result<Option<Uuid>> {
+        match parent {
+            Some(p) => {
+                self.may_write(p)?;
+                root_owner_conn(&self.conn, p)
+            }
+            None => Ok(self.scope.user()),
+        }
     }
 }
 
@@ -3363,6 +3917,10 @@ impl SqliteStore {
             )));
         }
         let policy = self.effective_policy(doc_id)?;
+        // the share gate (ADR 0004 §5): an agent writing into a shared
+        // workspace never lands green, and `auto` cannot clean it
+        let shared_cap = tenancy::agent_into_shared(&self.conn, doc_id, principal)?;
+        let cap_review = cap_review || shared_cap;
         let tx = self.conn.transaction()?;
         let current = doc_epoch(&tx, doc_id)?;
         if base_epoch > current {
@@ -3393,7 +3951,11 @@ impl SqliteStore {
             // auto-tagging as reviewable yellows, declinable as a batch)
             if cap_review && scored.verdict == Verdict::Green {
                 scored.verdict = Verdict::Yellow;
-                scored.note = format!("review requested by proposer; {}", scored.note);
+                scored.note = if shared_cap {
+                    format!("shared workspace: an agent's edit is flagged for its members; {}", scored.note)
+                } else {
+                    format!("review requested by proposer; {}", scored.note)
+                };
             }
 
             let prior = match op.kind.target_block() {
@@ -3708,7 +4270,7 @@ mod tests {
         assert!(gs.iter().find(|g| g.kind == GardenerKind::Tagging).unwrap().enabled);
         assert!(s.create_gardener("r2", GardenerKind::Reviewer, "r", None, ConfidencePolicy::Review).is_err());
         let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 7);
+        assert_eq!(v, SCHEMA_VERSION);
     }
 
     const FEDERATION_DDL: &str = "

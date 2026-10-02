@@ -9,13 +9,23 @@ use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
 impl SqliteStore {
+    /// The principal column of an idempotency row: in a user scope the
+    /// user is part of it (ADR 0004), so agents shared between people (the
+    /// same `claude:<name>` principal) never replay each other's outcomes.
+    fn idem_principal(&self, principal: Uuid) -> String {
+        match self.scope.user() {
+            Some(u) => format!("{principal}@{u}"),
+            None => principal.to_string(),
+        }
+    }
+
     /// The recorded outcome for (principal, key), if recorded at or after `since`.
     pub fn idempotency_get(&self, principal: Uuid, key: Uuid, since: i64) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
                 "SELECT response FROM idempotency WHERE principal = ?1 AND key = ?2 AND created_at >= ?3",
-                params![principal.to_string(), key.to_string(), since],
+                params![self.idem_principal(principal), key.to_string(), since],
                 |r| r.get(0),
             )
             .optional()?)
@@ -28,7 +38,7 @@ impl SqliteStore {
             "INSERT INTO idempotency (principal, key, response, created_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (principal, key) DO UPDATE SET response = excluded.response, created_at = excluded.created_at
              WHERE idempotency.created_at < ?5",
-            params![principal.to_string(), key.to_string(), response, now, now - horizon],
+            params![self.idem_principal(principal), key.to_string(), response, now, now - horizon],
         )?;
         Ok(())
     }

@@ -12,12 +12,16 @@ pub mod locate;
 pub mod mddiff;
 pub mod order_key;
 pub mod push;
+pub mod scope;
 mod sqlite;
+pub mod tenancy;
 mod types;
 pub mod workspaces;
 
 pub use sqlite::SqliteStore;
 pub use types::*;
+pub use scope::{Role, Scope, ScopedStore, SharedStore};
+pub use tenancy::{AuditEvent, Member, Space};
 pub use workspaces::{Workspace, WorkspaceFilter, WorkspacePatch};
 use uuid::Uuid;
 
@@ -32,6 +36,11 @@ pub enum StoreError {
     NotFound(String),
     #[error("invalid op: {0}")]
     InvalidOp(String),
+    /// Visible but not writable by this scope (a viewer), or a cross-tenant
+    /// move/share refused (ADR 0004). Never used for things the scope cannot
+    /// see: those are NotFound, so existence never leaks.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]

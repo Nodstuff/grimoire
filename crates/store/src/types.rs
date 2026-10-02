@@ -580,6 +580,11 @@ pub struct Change {
     /// row is gone (hard delete).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<DocSummary>,
+    /// ADR 0004: set on a row addressed to one user — `revoked` (kind
+    /// `deleted`: drop the doc, it is not in your Trash) or `granted` (kind
+    /// `tree`: fetch it). Absent on ordinary rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
 }
 
 /// The tree-facing fields of a doc, riding on a [`Change`].
