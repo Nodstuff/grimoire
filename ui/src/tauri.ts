@@ -46,7 +46,7 @@ export async function saveDialog(opts: SaveDialogOpts): Promise<string | null> {
 
 /** The event the shell emits when the global capture hotkey (⌥⌘G) or the
  * tray's "Quick capture" fires; the page opens the capture palette. */
-export const CAPTURE_EVENT = 'grimoire:capture'
+export const CAPTURE_EVENT = 'taisce:capture'
 
 /** Subscribe to an event the shell emits (`app.emit(name, …)`). Needs
  * `core:event:allow-listen` in capabilities/main.json; in a browser tab this
@@ -70,8 +70,8 @@ export function onShellEvent(name: string, cb: (payload: unknown) => void): () =
   }
 }
 
-/** `grimoire-YYYY-MM-DD.db` — what the Save sheet proposes for a backup. */
+/** `taisce-YYYY-MM-DD.db` — what the Save sheet proposes for a backup. */
 export function backupFileName(now: Date = new Date()): string {
   const p = (n: number) => String(n).padStart(2, '0')
-  return `grimoire-${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}.db`
+  return `taisce-${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}.db`
 }

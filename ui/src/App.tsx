@@ -359,7 +359,7 @@ export default function App() {
       <Notices />
       {daemonDown && (
         <div className="daemon-banner" role="status" data-tauri-drag-region>
-          Grimoire’s background service is not responding — edits are kept in the editor and will save when it is back
+          Taisce’s background service is not responding — edits are kept in the editor and will save when it is back
         </div>
       )}
       {treeOpen && (
@@ -377,7 +377,7 @@ export default function App() {
             {docs.length === 0 && <div className="home-mark">◈</div>}
             {docs.length === 0 ? (
               <div className="home-start">
-                <div className="home-start-title">Welcome to Grimoire</div>
+                <div className="home-start-title">Welcome to Taisce</div>
                 <div><kbd>⌘N</kbd> create your first doc</div>
                 <div>
                   <ImportFolder

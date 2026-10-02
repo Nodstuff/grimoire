@@ -10,7 +10,7 @@ try {
   const params = new URLSearchParams(location.search)
   const token = params.get('admin_token')
   if (token) {
-    sessionStorage.setItem('grimoire.admin_token', token)
+    sessionStorage.setItem('taisce.admin_token', token)
     params.delete('admin_token')
     const rest = params.toString()
     history.replaceState(null, '', location.pathname + (rest ? `?${rest}` : '') + location.hash)

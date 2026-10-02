@@ -148,7 +148,7 @@ export default function Profile({
     try {
       const d = await api<Diagnostics>('/api/diagnostics')
       const lines = [
-        `Grimoire ${d.version}`,
+        `Taisce ${d.version}`,
         `log: ${d.log_path ?? '—'}`,
         '',
         d.log_tail,
@@ -184,7 +184,7 @@ export default function Profile({
     return (
       <div className="queue">
         <h1 className="queue-title">profile</h1>
-        <div className="palette-empty">Grimoire is out of date — reinstall the latest release</div>
+        <div className="palette-empty">Taisce is out of date — reinstall the latest release</div>
       </div>
     )
   }

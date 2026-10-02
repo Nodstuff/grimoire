@@ -141,7 +141,7 @@ export function buildCommands({ queueCount, docId, inboxId, onAction, onOpenDoc 
       run: () => {
         onAction('close')
         saveDialog({
-          title: 'Back up Grimoire database',
+          title: 'Back up Taisce database',
           defaultPath: backupFileName(),
           filters: [{ name: 'SQLite database', extensions: ['db'] }],
         })

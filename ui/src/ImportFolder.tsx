@@ -1,6 +1,6 @@
 // "I have a folder of markdown": the browser cannot hand the daemon a path,
 // so we read the chosen folder's .md files here and POST {path, content}
-// pairs; the daemon runs the same import as `grimoire import`. Folders become
+// pairs; the daemon runs the same import as `taisce import`. Folders become
 // docs with children, files become docs — one round-trip, one notice.
 
 import { useRef, useState } from 'react'

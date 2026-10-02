@@ -76,7 +76,7 @@ export function rankDocs(docs: Doc[], q: string, limit = 5): Doc[] {
 
 /* ---------- recent docs ---------- */
 
-export const RECENT_KEY = 'grimoire.recentDocs'
+export const RECENT_KEY = 'grimoire.recentDocs' // pre-rename key: kept so stored state survives
 export const RECENT_MAX = 8
 
 export function loadRecentIds(): string[] {

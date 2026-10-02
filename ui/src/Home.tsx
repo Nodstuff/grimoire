@@ -19,7 +19,7 @@ import { addDays, openItems, summaryLine, type TodoDay } from './todo'
 import { api, type Doc, type GardenerRun } from './types'
 import type { Gardener } from './Gardeners'
 
-const COLLAPSED_KEY = 'grimoire.home.collapsed'
+const COLLAPSED_KEY = 'grimoire.home.collapsed' // pre-rename key: kept so stored state survives
 
 function loadCollapsed(): Set<string> {
   try {

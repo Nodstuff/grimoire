@@ -139,7 +139,7 @@ export function descendantCounts(children: Map<string | null, Doc[]>): Map<strin
 
 /* ---------- persisted open state ---------- */
 
-export const TREE_STATE_KEY = 'grimoire.tree.v1'
+export const TREE_STATE_KEY = 'grimoire.tree.v1' // pre-rename key: kept so stored state survives
 
 export interface TreeState {
   /** collapsed sections (open is the default, so we store the exceptions) */

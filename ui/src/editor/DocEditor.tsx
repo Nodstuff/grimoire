@@ -22,7 +22,7 @@ import { AfterSave, afterSave } from './savePlan'
 
 /** transaction meta marking DocEditor's own post-save blockId stamping, so
  * onUpdate can tell it apart from a real edit. */
-const STAMP_META = 'grimoire-stamp'
+const STAMP_META = 'taisce-stamp'
 
 const TOP_LEVEL_TYPES = [
   'paragraph',

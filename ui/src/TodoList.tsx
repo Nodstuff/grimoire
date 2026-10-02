@@ -129,7 +129,7 @@ export default function Todo({
     }
   }, [menu])
 
-  if (missing) return <div className="home-empty">this Grimoire is older than the to-do list — update it</div>
+  if (missing) return <div className="home-empty">this Taisce is older than the to-do list — update it</div>
   if (!day) return <div className="home-empty todo-loading">…</div>
 
   const today = day.today

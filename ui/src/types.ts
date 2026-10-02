@@ -111,13 +111,13 @@ export class ApiError extends Error {
 /** The per-boot admin token (picked up from the URL at boot by main.tsx). */
 export function adminToken(): string | null {
   try {
-    return sessionStorage.getItem('grimoire.admin_token')
+    return sessionStorage.getItem('taisce.admin_token')
   } catch {
     return null
   }
 }
 
-const ADMIN_HEADER = 'X-Grimoire-Admin'
+const ADMIN_HEADER = 'Taisce-Admin'
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   // gate-weakening surfaces live under /admin/ and need the token
@@ -133,7 +133,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const j = await r.json().catch(() => null)
   if (r.status === 401 && path.startsWith('/admin/')) {
     throw new ApiError(
-      'open Grimoire from the app (or add ?admin_token=… from ~/.grimoire/admin.token to the URL)',
+      'open Taisce from the app (or add ?admin_token=… from ~/.grimoire/admin.token to the URL)',
       'admin_token',
     )
   }

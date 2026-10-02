@@ -19,7 +19,7 @@ describe('tauri bridge', () => {
 
   it('invokes the dialog plugin and unwraps either reply shape', async () => {
     const calls: [string, unknown][] = []
-    let reply: unknown = '/Volumes/Stick/grimoire-2026-09-07.db'
+    let reply: unknown = '/Volumes/Stick/taisce-2026-09-07.db'
     g.__TAURI_INTERNALS__ = {
       invoke: async (cmd, args) => {
         calls.push([cmd, args])
@@ -27,8 +27,8 @@ describe('tauri bridge', () => {
       },
     }
     expect(inTauri()).toBe(true)
-    const opts = { title: 'Back up', defaultPath: 'grimoire-2026-09-07.db', filters: [{ name: 'SQLite', extensions: ['db'] }] }
-    expect(await saveDialog(opts)).toBe('/Volumes/Stick/grimoire-2026-09-07.db')
+    const opts = { title: 'Back up', defaultPath: 'taisce-2026-09-07.db', filters: [{ name: 'SQLite', extensions: ['db'] }] }
+    expect(await saveDialog(opts)).toBe('/Volumes/Stick/taisce-2026-09-07.db')
     expect(calls).toEqual([['plugin:dialog|save', { options: opts }]])
     reply = { path: '/tmp/a.db' }
     expect(await saveDialog(opts)).toBe('/tmp/a.db')
@@ -55,16 +55,16 @@ describe('tauri bridge', () => {
     const got: unknown[] = []
     const off = onShellEvent(CAPTURE_EVENT, (p) => got.push(p))
     await Promise.resolve()
-    expect(calls[0]).toEqual(['plugin:event|listen', { event: 'grimoire:capture', target: { kind: 'Any' }, handler: 7 }])
+    expect(calls[0]).toEqual(['plugin:event|listen', { event: 'taisce:capture', target: { kind: 'Any' }, handler: 7 }])
     callbacks.get(7)!({ event: CAPTURE_EVENT, id: 42, payload: { from: 'hotkey' } })
     expect(got).toEqual([{ from: 'hotkey' }])
     off()
     await new Promise((r) => setTimeout(r, 0))
-    expect(calls[1]).toEqual(['plugin:event|unlisten', { event: 'grimoire:capture', eventId: 42 }])
+    expect(calls[1]).toEqual(['plugin:event|unlisten', { event: 'taisce:capture', eventId: 42 }])
   })
 
   it('proposes a dated .db name, zero-padded', () => {
-    expect(backupFileName(new Date(2026, 8, 7))).toBe('grimoire-2026-09-07.db')
-    expect(backupFileName(new Date(2026, 11, 25))).toBe('grimoire-2026-12-25.db')
+    expect(backupFileName(new Date(2026, 8, 7))).toBe('taisce-2026-09-07.db')
+    expect(backupFileName(new Date(2026, 11, 25))).toBe('taisce-2026-12-25.db')
   })
 })

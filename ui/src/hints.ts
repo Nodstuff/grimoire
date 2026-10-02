@@ -6,7 +6,7 @@
 export function saveErrorText(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e)
   if (/fetch|network|ECONN/i.test(raw)) {
-    return 'not saved: Grimoire is not responding — your edit is kept here and will retry'
+    return 'not saved: Taisce is not responding — your edit is kept here and will retry'
   }
   if (/stale base|ahead of doc epoch/i.test(raw)) {
     return 'not saved: this doc changed underneath you — retrying against the new version'
