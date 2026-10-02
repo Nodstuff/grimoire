@@ -150,7 +150,25 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/oauth/authorize", "public_auth_routes_carry_no_tenant_data (the passkey decides the user; auth::tests)"),
     ("/oauth/token", "public_auth_routes_carry_no_tenant_data (a code or refresh token names its user; auth::tests)"),
     ("/oauth/revoke", "public_auth_routes_carry_no_tenant_data"),
+    // auth/web.rs: the web UI's sign-in (public: a passkey decides the user)
+    ("/auth/web/begin", "web_session_routes_answer_only_for_the_caller (a passkey challenge; auth::tests)"),
+    ("/auth/web/finish", "web_session_routes_answer_only_for_the_caller (the passkey names the user; auth::tests)"),
+    ("/auth/web/logout", "web_session_routes_answer_only_for_the_caller"),
+    ("/auth/web/session", "web_session_routes_answer_only_for_the_caller"),
+    // the web UI's session cookie on every /api route above (the suites re-run as B's browser)
+    ("/api/docs", "a_web_session_for_b_sees_none_of_as_data"),
+    ("/api/workspaces/{id}/members", "the_owner_shares_from_the_web_ui_and_a_session_get_writes_nothing"),
+    ("/api/todo", "the_owner_shares_from_the_web_ui_and_a_session_get_writes_nothing"),
 ];
+
+thread_local! {
+    /// Re-run a suite with B signed in through the web UI's session cookie
+    /// instead of her app's bearer token (`a_web_session_for_b_sees_none_of_as_data`).
+    static B_VIA_COOKIE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `Fx::b_app` when B is a browser: the cookie's value behind this prefix.
+const COOKIE_TOKEN: &str = "cookie:";
 
 struct Fx {
     app: Router,
@@ -176,6 +194,8 @@ struct Fx {
     shared_doc: Uuid,
     shared_block: Uuid,
     b_doc: Uuid,
+    /// B is signed in through the web UI (`b_app` is `cookie:<value>`)
+    cookie: bool,
 }
 
 fn para(content: &str) -> (Uuid, OpInput) {
@@ -243,6 +263,8 @@ fn fixture() -> Fx {
     let b_app = mint(&mut raw, b, "Taisce", true);
     let b_conn = mint(&mut raw, b, "Claude", false);
     let b_pat = crate::auth::create_api_token(&mut raw, Some(&b.to_string()), "claude-code", None, now()).unwrap().1.unwrap();
+    let cookie = B_VIA_COOKIE.with(|c| c.get());
+    let b_app = if cookie { web_session(&mut raw, b) } else { b_app };
     let store = SharedStore::new(raw);
 
     let (a_work, family, a_secret, a_secret_block, a_comment, a_ann, a_loose, a_trash, shared_doc, shared_block) = {
@@ -318,6 +340,30 @@ fn fixture() -> Fx {
         shared_doc,
         shared_block,
         b_doc,
+        cookie,
+    }
+}
+
+/// A web UI session for `user`, minted straight into the store (the passkey
+/// ceremony is `auth::tests`' job): `cookie:<value>` for `Fx::call`.
+fn web_session(s: &mut SqliteStore, user: Uuid) -> String {
+    let value = random_token();
+    s.auth_create_web_session(user, &hash_secret(&value), "Mac · Safari", now()).unwrap();
+    format!("{COOKIE_TOKEN}{value}")
+}
+
+/// Authenticate a request as `token`: a bearer, or (`cookie:…`) the web UI's
+/// session cookie with the same-origin headers the UI sends on writes.
+fn authed(mut b: axum::http::request::Builder, token: &str, method: &str) -> axum::http::request::Builder {
+    match token.strip_prefix(COOKIE_TOKEN) {
+        Some(value) => {
+            b = b.header("cookie", format!("{}={value}", crate::auth::web::COOKIE));
+            if method != "GET" && method != "HEAD" {
+                b = b.header("origin", BASE).header(crate::auth::web::CSRF_HEADER, "1");
+            }
+            b
+        }
+        None => b.header("authorization", format!("Bearer {token}")),
     }
 }
 
@@ -358,11 +404,7 @@ impl Fx {
     }
 
     async fn call(&self, token: &str, method: &str, path: &str, body: Option<Value>) -> (StatusCode, String) {
-        let mut b = Request::builder()
-            .method(method)
-            .uri(path)
-            .header("host", "localhost:7513")
-            .header("authorization", format!("Bearer {token}"));
+        let mut b = authed(Request::builder().method(method).uri(path).header("host", "localhost:7513"), token, method);
         let body = match body {
             Some(v) => {
                 b = b.header("content-type", "application/json");
@@ -552,9 +594,7 @@ async fn the_feed_shows_only_visible_docs_and_tells_b_to_drop_revoked_ones() {
     assert!(page.contains(&fx.shared_doc.to_string()));
     let seq = serde_json::from_str::<Value>(&page).unwrap()["seq"].as_i64().unwrap();
     // the stream's replay is filtered the same way
-    let req = Request::get("/api/changes/stream?since=0")
-        .header("host", "localhost:7513")
-        .header("authorization", format!("Bearer {}", fx.b_app))
+    let req = authed(Request::get("/api/changes/stream?since=0").header("host", "localhost:7513"), &fx.b_app, "GET")
         .body(Body::empty())
         .unwrap();
     let res = fx.app.clone().oneshot(req).await.unwrap();
@@ -616,7 +656,9 @@ async fn home_inbox_and_todo_are_each_users_own() {
         "/api/home/visit".to_string(),
     ] {
         let (st, body) = fx.b("GET", &path, None).await;
-        assert_eq!(st, StatusCode::OK, "{path}: {body}");
+        // a browser session's GET never creates B's (missing) list
+        let read_only_404 = fx.cookie && path.starts_with("/api/todo?") && st == StatusCode::NOT_FOUND;
+        assert!(st == StatusCode::OK || read_only_404, "{path}: {st} {body}");
         fx.no_leak(&path, &body);
     }
     // B's writes land in B's own list; A's item ids mean nothing there
@@ -746,10 +788,8 @@ async fn admin_routes_are_the_boxs_cli() {
     let fx = fixture();
     for path in ["/admin/gardeners", "/admin/runs"] {
         // through the proxy (forwarded): refused, whatever the token
-        let req = Request::get(path)
-            .header("host", "localhost:7513")
+        let req = authed(Request::get(path).header("host", "localhost:7513"), &fx.b_app, "GET")
             .header("x-forwarded-for", "203.0.113.9")
-            .header("authorization", format!("Bearer {}", fx.b_app))
             .header("taisce-admin", "admintok")
             .body(Body::empty())
             .unwrap();
@@ -1028,6 +1068,7 @@ fn every_route_and_tool_is_covered() {
         include_str!("push.rs"),
         include_str!("admin.rs"),
         include_str!("auth/oauth.rs"),
+        include_str!("auth/web.rs"),
     ];
     let re = regex::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
     let covered: std::collections::HashSet<&str> = COVERAGE.iter().map(|(p, _)| *p).collect();
@@ -1174,7 +1215,10 @@ async fn a_viewer_reading_a_shared_todo_creates_nothing() {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let before = fx.store.lock(Scope::System).list_docs().unwrap().len();
     let (st, out) = fx.b("GET", &format!("/api/todo?date={today}&today={today}&workspace={}", fx.family), None).await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "{out}");
+    // the app is refused the create (403); a browser session never tries
+    // one on a GET, so it simply finds no list (404)
+    let want = if fx.cookie { StatusCode::NOT_FOUND } else { StatusCode::FORBIDDEN };
+    assert_eq!(st, want, "{out}");
     assert_eq!(fx.store.lock(Scope::System).list_docs().unwrap().len(), before, "no stray To-do root");
 }
 
@@ -1353,4 +1397,126 @@ async fn a_pre_access_tombstone_is_gone_on_every_block_path() {
     // the history of the doc starts at her access: no pre-share ops
     let (_, hist) = fx.b("GET", &format!("/api/doc/{d}/history"), None).await;
     assert!(!hist.contains("90k"), "{hist}");
+}
+
+/// The isolation suites again, with B signed in through the web UI's session
+/// cookie (and the same-origin headers on writes) instead of her app's
+/// bearer: a browser session gets exactly the app's Viewer and Scope, so B
+/// sees none of A's data on any /api route. (`#[tokio::test]` fns are plain
+/// fns that build their own runtime on this thread, so the thread-local
+/// switch reaches each fixture.)
+#[test]
+fn a_web_session_for_b_sees_none_of_as_data() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            B_VIA_COOKIE.with(|c| c.set(false));
+        }
+    }
+    let _reset = Reset;
+    B_VIA_COOKIE.with(|c| c.set(true));
+    assert!(fixture().b_app.starts_with(COOKIE_TOKEN));
+    api_reads_never_show_a_private_doc();
+    api_lists_are_per_user();
+    api_writes_answer_404_or_403();
+    the_feed_shows_only_visible_docs_and_tells_b_to_drop_revoked_ones();
+    home_inbox_and_todo_are_each_users_own();
+    workspaces_and_membership_routes();
+    server_level_routes_are_the_owners();
+    admin_routes_are_the_boxs_cli();
+    import_and_ask_stay_in_the_callers_tenant();
+    unknown_api_paths_are_404();
+    unshare_then_a_stale_anchor_reads_nothing_through_flags();
+    a_viewer_reading_a_shared_todo_creates_nothing();
+    unlabel_into_a_hidden_parent_is_a_generic_refusal();
+    a_pre_access_tombstone_is_gone_on_every_block_path();
+}
+
+/// The members panel works from the web UI in SERVER mode (a session is a
+/// human surface, like the app), sharing stays human-only (a connector and a
+/// PAT are still refused), and a session's GETs write nothing — not even
+/// GET /api/todo's find-or-create or carry-forward.
+#[tokio::test]
+async fn the_owner_shares_from_the_web_ui_and_a_session_get_writes_nothing() {
+    let fx = fixture();
+    let tom = web_session(&mut fx.store.lock(Scope::System), fx.a);
+    // the owner lists and changes members of her workspace from the browser
+    let (st, members) = fx.call(&tom, "GET", &format!("/api/workspaces/{}/members", fx.family), None).await;
+    assert_eq!(st, StatusCode::OK, "{members}");
+    assert!(members.contains("Aoife"), "{members}");
+    let (st, out) = fx.call(&tom, "POST", &format!("/api/workspaces/{}/members", fx.a_work), Some(json!({"user": fx.b.to_string(), "role": "viewer"}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let (st, out) = fx.call(&tom, "DELETE", &format!("/api/workspaces/{}/members/{}", fx.a_work, fx.b), None).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    // without the CSRF header the same share is refused
+    let req = Request::post(format!("/api/workspaces/{}/members", fx.a_work))
+        .header("host", "localhost:7513")
+        .header("origin", BASE)
+        .header("content-type", "application/json")
+        .header("cookie", format!("{}={}", crate::auth::web::COOKIE, tom.strip_prefix(COOKIE_TOKEN).unwrap()))
+        .body(Body::from(json!({"user": fx.b.to_string(), "role": "editor"}).to_string()))
+        .unwrap();
+    assert_eq!(fx.app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+    // B's browser is not the owner of Family: 403, as from her app
+    let b = web_session(&mut fx.store.lock(Scope::System), fx.b);
+    let (st, _) = fx.call(&b, "POST", &format!("/api/workspaces/{}/members", fx.family), Some(json!({"user": fx.b.to_string(), "role": "editor"}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // connectors and PATs are still refused on the members routes
+    let (st, _) = fx.call(&fx.b_conn, "POST", &format!("/api/workspaces/{}/members", fx.b_work), Some(json!({"user": fx.a.to_string(), "role": "viewer"}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = fx.call(&fx.b_pat, "GET", &format!("/api/workspaces/{}/members", fx.b_work), None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    // GETs from the browser write nothing anywhere
+    let today = "2026-10-02";
+    let docs0 = fx.store.lock(Scope::System).list_docs().unwrap().len();
+    let n0 = fx.store.lock(Scope::System).latest_change_seq().unwrap();
+    for path in [
+        format!("/api/todo?date={today}&today={today}&utc_offset=%2B00:00"),
+        format!("/api/todo/due?today={today}"),
+        "/api/docs".into(),
+        "/api/inbox".into(),
+        "/api/home/visit".into(),
+        "/api/home/since".into(),
+        "/api/profile".into(),
+        "/api/workspaces".into(),
+        "/api/queue".into(),
+        "/api/flags".into(),
+        "/api/changes?since=0".into(),
+        format!("/api/doc/{}", fx.b_doc),
+        format!("/api/doc/{}/history", fx.b_doc),
+    ] {
+        let (st, out) = fx.call(&b, "GET", &path, None).await;
+        assert!(st == StatusCode::OK || (path.starts_with("/api/todo?") && st == StatusCode::NOT_FOUND), "{path}: {st} {out}");
+    }
+    assert_eq!(fx.store.lock(Scope::System).latest_change_seq().unwrap(), n0, "a browser session's GETs wrote");
+    assert_eq!(fx.store.lock(Scope::System).list_docs().unwrap().len(), docs0, "no To-do was created by a GET");
+    // a write from the browser makes the list; a later day's GET does not carry forward
+    let (st, out) = fx.call(&b, "POST", "/api/todo", Some(json!({"date": today, "text": "aoife errand", "today": today, "utc_offset": "+00:00"}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let n1 = fx.store.lock(Scope::System).latest_change_seq().unwrap();
+    let (st, out) = fx.call(&b, "GET", "/api/todo?date=2026-10-05&today=2026-10-05&utc_offset=%2B00:00", None).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert_eq!(fx.store.lock(Scope::System).latest_change_seq().unwrap(), n1, "no carry-forward by a browser GET");
+}
+
+/// The web sign-in routes: the session route names only the caller, and a
+/// sign-out ends only the caller's own session.
+#[tokio::test]
+async fn web_session_routes_answer_only_for_the_caller() {
+    let fx = fixture();
+    let tom = web_session(&mut fx.store.lock(Scope::System), fx.a);
+    let b = web_session(&mut fx.store.lock(Scope::System), fx.b);
+    let (st, me) = fx.call(&b, "GET", "/auth/web/session", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(me.contains("Aoife") && !me.contains("Tom"), "{me}");
+    fx.no_leak("/auth/web/session", &me);
+    let (st, out) = fx.call(&b, "POST", "/auth/web/logout", Some(json!({}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert_eq!(fx.call(&b, "GET", "/api/docs", None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(fx.call(&tom, "GET", "/api/docs", None).await.0, StatusCode::OK, "Tom's browser is still signed in");
+    // begin is a bare challenge: nothing of anyone's docs
+    let req = Request::post("/auth/web/begin").header("host", "localhost:7513").header("origin", BASE).body(Body::empty()).unwrap();
+    let res = fx.app.clone().oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    fx.no_leak("/auth/web/begin", &String::from_utf8_lossy(&bytes));
 }
