@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+*.xcodeproj/
+App/build/
+DerivedData/
+.build-*/
+*.log
+screenshots/
