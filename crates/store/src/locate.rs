@@ -298,6 +298,28 @@ pub fn section_insert_offsets(roots: &[BlockNode], id: Uuid) -> Option<(usize, u
     Some((end_of(first)?, end_of(last)?))
 }
 
+/// Where text goes for "the start of the doc" (append with `at: "start"`
+/// and no `to`): after a leading frontmatter block, and right under the
+/// doc's `# Title` when its first content is one; otherwise byte 0.
+pub fn doc_start_offset(roots: &[BlockNode]) -> usize {
+    let (_, spans) = export_with_offsets(roots);
+    let blocks = content_blocks(roots);
+    let mut offset = 0;
+    let mut i = 0;
+    if let Some(b) = blocks.first()
+        && crate::import::is_frontmatter(&b.content)
+    {
+        offset = spans[0].1.end;
+        i = 1;
+    }
+    if let Some(b) = blocks.get(i)
+        && heading_level(&b.content) == Some(1)
+    {
+        offset = spans[i].1.end;
+    }
+    offset
+}
+
 /// Insert `text` into the export at byte `at` (the end of some block), with
 /// blank-line separation on both sides. `at == export.len()` with an empty
 /// export creates the doc's first content.
@@ -467,6 +489,19 @@ mod tests {
     use crate::{BlockStore, PrincipalKind, SqliteStore, import::import_markdown};
 
     const DAILY: &str = "---\ntags:\n  - daily\n---\n\n## qompass\n\n### Done\n\n- shipped x\n\n### Plans\n\n- plan q\n\n## portus\n\n### Plans\n\n- plan p\n\n## grimoire\n\nintro line\n";
+
+    #[test]
+    fn doc_start_is_under_frontmatter_and_the_title() {
+        let start = |md: &str| {
+            let (_, _, roots) = tree(md);
+            let (export, _) = export_with_offsets(&roots);
+            splice_insert(&export, doc_start_offset(&roots), "> NOTE")
+        };
+        assert_eq!(start("---\ntags:\n  - x\n---\n\n# Title\n\nbody\n"), "---\ntags:\n  - x\n---\n\n# Title\n\n> NOTE\n\nbody\n");
+        assert_eq!(start("# Title\n\nbody\n"), "# Title\n\n> NOTE\n\nbody\n");
+        assert_eq!(start("---\ntags:\n  - x\n---\n\n## Section\n\nbody\n"), "---\ntags:\n  - x\n---\n\n> NOTE\n\n## Section\n\nbody\n");
+        assert_eq!(start("intro\n\n## S\n"), "> NOTE\n\nintro\n\n## S\n");
+    }
 
     fn tree(md: &str) -> (SqliteStore, Uuid, Vec<BlockNode>) {
         let mut s = SqliteStore::open_in_memory().unwrap();
