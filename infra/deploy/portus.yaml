@@ -1,0 +1,23 @@
+# Portus standalone config for the Taisce server (hot-reloaded on edit).
+# Issued from Let's Encrypt production (staging verified 2026-10-01).
+dns_refresh_secs: 0
+
+acme:
+  directory: letsencrypt
+  cache_dir: /var/lib/portus/acme
+  challenge: tls-alpn-01
+
+listeners:
+  - port: 443
+    protocol: HTTPS
+    tls:
+      acme:
+        domains: [taisce.null.ie]
+    routes:
+      - hosts: [taisce.null.ie]
+        backends:
+          - address: "127.0.0.1:7425"
+        max_request_body_bytes: 26214400
+        response_headers:
+          set:
+            Strict-Transport-Security: "max-age=31536000; includeSubDomains"
