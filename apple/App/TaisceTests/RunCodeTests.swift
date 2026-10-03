@@ -425,11 +425,31 @@ import Darwin
         #expect(gone, "the backgrounded sleep is gone too")
     }
 
+    /// As in TaisceKit: the deadline counts only once "start" was printed
+    /// (an attempt where setup ate it is retried with twice the time).
     @Test func timeoutFires() async throws {
-        let o = await Self.collect(CodeRun(RunRequest(language: .shell(interpreter: "/bin/sh"), code: "echo start\nsleep 30"), environment: await Self.env(), options: try Self.options(timeout: .milliseconds(1500))))
-        #expect(o.result?.timedOut == true)
-        #expect(o.log.text == "start\n")
-        #expect((o.result?.duration ?? .zero) < .seconds(6))
+        let env = await Self.env()
+        var timeout = Duration.milliseconds(1500)
+        for _ in 0..<4 {
+            let o = await Self.collect(CodeRun(RunRequest(language: .shell(interpreter: "/bin/sh"), code: "sleep 30 &\necho \"start $!\"\nwait"), environment: env, options: try Self.options(timeout: timeout)))
+            guard o.log.text.hasPrefix("start ") else {
+                #expect(o.result?.timedOut == true, "no start, so it can only have run out of time: \(o.log.text)")
+                timeout *= 2
+                continue
+            }
+            #expect(o.result?.timedOut == true)
+            let pid = try #require(Int32(o.log.text.dropFirst("start ".count).trimmingCharacters(in: .whitespacesAndNewlines)), "\(o.log.text)")
+            #expect(o.log.text == "start \(pid)\n", "the output before the timeout is kept")
+            #expect((o.result?.duration ?? .zero) < timeout + .seconds(4.5))
+            var gone = false
+            for _ in 0..<100 where !gone {
+                gone = kill(pid, 0) == -1 && errno == ESRCH
+                if !gone { try await Task.sleep(for: .milliseconds(20)) }
+            }
+            #expect(gone, "the group's backgrounded sleep is killed too")
+            return
+        }
+        Issue.record("\"start\" never printed within \(timeout / 2)")
     }
 
     @Test func goPairSumFromTheTryLine() async throws {
