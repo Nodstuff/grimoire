@@ -166,6 +166,9 @@ import Darwin
         // approved for this doc at this epoch: the next run doesn't ask
         await m.codeRuns.run(s, req, context: ctx, docCode: "echo hi")
         #expect(s.trustPrompt == nil && s.result?.exitCode == 0)
+        // ...but that yes doesn't cover a SQL block in the same doc
+        let (sql, _) = await m.codeRuns.trust(ctx, practiceEdited: false, kind: .sql)
+        #expect(sql != .run)
         // your own practice edit never asks, even in a doc never approved
         let other = CodeRunContext(doc: "\(doc)-2", block: "b", canSave: false)
         let s2 = m.codeRuns.state(other)
@@ -325,10 +328,13 @@ import Darwin
         let d = try #require(UserDefaults(suiteName: suite))
         defer { d.removePersistentDomain(forName: suite) }
         let settings = UserSettings(defaults: d, server: "https://taisce.test")
-        RunApprovals(defaults: d, server: "https://taisce.test").approve("doc", .init(docEpoch: 1, othersEpoch: nil))
-        #expect(d.object(forKey: settings.runApprovalsKey) != nil)
+        for kind in RunApprovals.Kind.allCases {
+            RunApprovals(defaults: d, server: "https://taisce.test", kind: kind).approve("doc", .init(docEpoch: 1, othersEpoch: nil))
+        }
+        #expect(settings.runApprovalsKeys.count == 2)
+        #expect(settings.runApprovalsKeys.allSatisfy { d.object(forKey: $0) != nil })
         settings.forget()
-        #expect(d.object(forKey: settings.runApprovalsKey) == nil)
+        #expect(settings.runApprovalsKeys.allSatisfy { d.object(forKey: $0) == nil })
     }
 }
 

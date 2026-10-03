@@ -242,13 +242,16 @@ final class CodeRunStore {
 
     // MARK: trust
 
-    var approvals: RunApprovals? {
-        app.map { RunApprovals(server: $0.serverURL) }
+    /// go/shell blocks' approvals; SQL blocks keep theirs apart
+    var approvals: RunApprovals? { approvals(.code) }
+
+    func approvals(_ kind: RunApprovals.Kind) -> RunApprovals? {
+        app.map { RunApprovals(server: $0.serverURL, kind: kind) }
     }
 
     /// Who wrote it, bounded by `trustCheckLimit`: a slow or failing check
     /// counts as unknown (so it asks), and the prompt says why.
-    func trust(_ c: CodeRunContext, practiceEdited: Bool) async -> (RunTrust.Decision, RunTrust.Approval) {
+    func trust(_ c: CodeRunContext, practiceEdited: Bool, kind: RunApprovals.Kind = .code) async -> (RunTrust.Decision, RunTrust.Approval) {
         let docEpoch = (try? await app?.cache?.doc(c.doc))?.currentEpoch ?? 0
         var history: [DocHistoryEntry]?
         var why: String?
@@ -267,7 +270,7 @@ final class CodeRunStore {
         if let history { remember(c.doc, epoch: docEpoch, history: history, me: me) }
         var decision = RunTrust.decide(
             block: c.block, history: history, me: me, practiceEditedByMe: practiceEdited,
-            approval: approvals?.approval(for: c.doc), docEpoch: docEpoch
+            approval: approvals(kind)?.approval(for: c.doc), docEpoch: docEpoch
         )
         if case .ask = decision, history == nil, let why {
             decision = .ask(lastEditedBy: "someone (couldn't check who: \(why))")

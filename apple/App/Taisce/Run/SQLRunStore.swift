@@ -79,7 +79,7 @@ final class SQLRunStore {
         s.isChecking = true
         s.startedAt = .now
         s.outcome = nil
-        let (decision, approval) = await app.codeRuns.trust(context, practiceEdited: edit.isPracticeEdited)
+        let (decision, approval) = await app.codeRuns.trust(context, practiceEdited: edit.isPracticeEdited, kind: .sql)
         s.isChecking = false
         var asker: String?
         if case .ask(let name) = decision { asker = name }
@@ -95,7 +95,7 @@ final class SQLRunStore {
     func confirm(_ s: SQLBlockState, _ p: SQLPrompt) async {
         if s.prompt?.id == p.id { s.prompt = nil }
         guard !s.isBusy else { return }
-        if p.lastEditedBy != nil { app?.codeRuns.approvals?.approve(p.doc, p.approval) }
+        if p.lastEditedBy != nil { app?.codeRuns.approvals(.sql)?.approve(p.doc, p.approval) }
         await start(s, code: p.code, source: p.source, picked: p.pickedSource)
     }
 

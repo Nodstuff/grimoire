@@ -20,9 +20,10 @@ struct UserSettings {
     static let libraryExpandedKey = "library.expanded"
 
     /// runnable code blocks: the docs you said yes to running on this device
-    var runApprovalsKey: String { RunApprovals(defaults: defaults, server: server).key }
+    /// (go/shell and SQL apart)
+    var runApprovalsKeys: [String] { RunApprovals.Kind.allCases.map { RunApprovals(defaults: defaults, server: server, kind: $0).key } }
 
-    var keys: [String] { [pinsKey, workspaceKey, Self.libraryExpandedKey, runApprovalsKey] }
+    var keys: [String] { [pinsKey, workspaceKey, Self.libraryExpandedKey] + runApprovalsKeys }
 
     func forget() {
         for key in keys { defaults.removeObject(forKey: key) }

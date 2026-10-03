@@ -167,13 +167,17 @@ import TaisceKit
         // approved: the next run goes straight through
         await m.sqlRuns.run(s, edit: e, context: ctx, docCode: "SELECT count(*) FROM t", source: src, picked: false)
         #expect(s.prompt == nil)
+        // ...but a go/shell block in the same doc still asks
+        let (code, _) = await m.codeRuns.trust(ctx, practiceEdited: false)
+        #expect(code != .run)
+        #expect(m.codeRuns.approvals?.approval(for: doc) == nil)
         #expect(s.outcome?.lastResultSet?.rows == [["1200"]])
         // read-only: the database refuses a write
         m.codeRuns.beginPractice(e, docCode: "SELECT 1")
         e.practice = "DELETE FROM t"
         await m.sqlRuns.run(s, edit: e, context: ctx, docCode: "SELECT 1", source: src, picked: false)
         #expect(s.outcome?.failure?.error.contains("readonly") == true)
-        RunApprovals(server: m.serverURL).forget()
+        RunApprovals(server: m.serverURL, kind: .sql).forget()
         try await m.cache?.deleteDoc(doc)
     }
 
@@ -202,7 +206,7 @@ import TaisceKit
         #expect(s.prompt == nil && !s.isBusy)
         let count = try await SQLiteDriver(path: path, allowWrites: false).run("SELECT count(*) FROM t WHERE n = 9", cap: 1)
         #expect(count.last?.outcome == .rows(SQLResultSet(columns: [SQLColumn("count(*)")], rows: [["2"]])))
-        RunApprovals(server: m.serverURL).forget()
+        RunApprovals(server: m.serverURL, kind: .sql).forget()
         try await m.cache?.deleteDoc(doc)
     }
 

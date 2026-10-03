@@ -214,16 +214,27 @@ public enum RunTrust {
     }
 }
 
-/// Approvals per doc, kept in UserDefaults on this device (per server).
+/// Approvals per doc, kept in UserDefaults on this device (per server and
+/// per kind of block: a yes to a doc's SQL never covers its go/shell
+/// blocks, nor the other way round).
 public struct RunApprovals: @unchecked Sendable {
+    public enum Kind: String, Sendable, CaseIterable {
+        /// go and shell blocks
+        case code
+        /// SQL blocks
+        case sql
+    }
+
     let defaults: UserDefaults
     /// the UserDefaults key (forgotten on sign-out with the person's settings)
     public let key: String
 
-    public init(defaults: UserDefaults = .standard, server: String) {
+    public init(defaults: UserDefaults = .standard, server: String, kind: Kind = .code) {
         self.defaults = defaults
         let url = URL(string: server)
-        key = "run.approvals-\(url?.host() ?? "server")-\(url?.port ?? 0)"
+        // code keeps the key it had before SQL blocks existed
+        let prefix = kind == .code ? "run.approvals" : "run.approvals.\(kind.rawValue)"
+        key = "\(prefix)-\(url?.host() ?? "server")-\(url?.port ?? 0)"
     }
 
     public func approval(for doc: DocID) -> RunTrust.Approval? {

@@ -468,6 +468,25 @@ import Testing
         #expect(a.approval(for: "doc1") == nil)
     }
 
+    /// A yes to a doc's SQL never covers its go/shell blocks, and the other
+    /// way round; go/shell keep the key they always had.
+    @Test func sqlAndCodeApprovalsAreApart() throws {
+        let suite = "taisce.tests.approvals.\(UUID().uuidString)"
+        let d = try #require(UserDefaults(suiteName: suite))
+        defer { d.removePersistentDomain(forName: suite) }
+        let code = RunApprovals(defaults: d, server: "https://taisce.test:8443")
+        let sql = RunApprovals(defaults: d, server: "https://taisce.test:8443", kind: .sql)
+        #expect(code.key == "run.approvals-taisce.test-8443")
+        #expect(sql.key != code.key)
+        sql.approve("doc1", .init(docEpoch: 3, othersEpoch: 2))
+        #expect(code.approval(for: "doc1") == nil)
+        code.approve("doc2", .init(docEpoch: 1, othersEpoch: nil))
+        #expect(sql.approval(for: "doc2") == nil)
+        #expect(sql.approval(for: "doc1") != nil && code.approval(for: "doc2") != nil)
+        sql.forget()
+        #expect(code.approval(for: "doc2") != nil)
+    }
+
     @Test func historyDecodesProvenance() throws {
         let json = """
         [{"op":{"id":"0199a0b0-c0d0-7abc-8def-0123456789ab","doc_id":"d1","principal":"0199A0B0-0000-7000-8000-000000000001","epoch_applied":4,
