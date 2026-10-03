@@ -90,12 +90,14 @@ import TaisceKit
         #expect(SQLStatus.line(SQLRunOutcome(message: "No database file at /x")) == ("No database file at /x", false))
     }
 
+    #if targetEnvironment(macCatalyst)
     @Test func columnWidthsFollowTheContent() {
         let set = SQLResultSet(columns: [SQLColumn("id", type: "INTEGER"), SQLColumn("body")], rows: [["1", String(repeating: "x", count: 200)], ["22", nil]])
         let w = SQLTable.columnWidths(set)
         #expect(w[0] == 7 * SQLTable.charWidth + 16)
         #expect(w[1] == 48 * SQLTable.charWidth + 16)
     }
+    #endif
 
     // MARK: in the app, against a real SQLite file
 

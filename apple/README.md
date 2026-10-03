@@ -26,9 +26,11 @@ apple/
       Sync/                    SSEParser, changeStream, Backoff, SyncEngine (actor)
       Render/                  block markdown → RenderNode (swift-markdown), inline/wikilinks
       Run/                     runnable code blocks: FenceInfo, GoProgram, RunTrust, output, posix_spawn runner (Mac)
+      SQL/                     SQL blocks: SQLDriver, SQLite and ClickHouse drivers, results, data sources
       Migration/               SandboxMigration (the Mac's old App Sandbox container → ~/Library)
       Todo/                    Deadline (all-day | UTC instant), TodoClock, offline To-do parser
       Library/                 doc tree for the sidebar, wikilink lookups
+    Sources/TaisceSQLPostgres/ SQL blocks' Postgres driver (PostgresNIO; the app links it on the Mac only)
     Tests/TaisceKitTests/    Swift Testing + a URLProtocol mock server
   App/                         the iOS app (xcodegen)
     project.yml
@@ -83,7 +85,8 @@ type-checked against the simulator SDK by cross-building TaisceKit
 (`swift build --triple arm64-apple-ios26.0-simulator --sdk $(xcrun --sdk iphonesimulator --show-sdk-path)`)
 and running `swiftc -typecheck` over `App/Taisce/*.swift`.
 
-Dependencies (SPM only): GRDB.swift 7.11.1, swift-markdown 0.9.0 (pulls
+Dependencies (SPM only): GRDB.swift 7.11.1, swift-markdown 0.9.0, Valet 5.1.1, and on the Mac
+postgres-nio 1.33.1 (SwiftNIO, NIOSSL, swift-crypto, swift-log; SQL blocks) (swift-markdown pulls
 swift-cmark 0.9.0). SSE is hand-rolled (`SSEParser`, ~120 lines) rather than a
 package: `URLSession.AsyncBytes.lines` drops the blank lines that end SSE
 events, the resume cursor is ours (cache `last_seq`, not a library's
@@ -526,6 +529,33 @@ and duration, "compiled ✓" for a Go block that only compiles.
   doc's code (and its trust), so a Run never executes an older version.
   The sheet says the code runs as you with your login environment, tokens
   included. No server change was needed.
+- **SQL blocks** (Mac only): ```` ```sql db=<name> ```` (also `sqlite`,
+  `postgres`/`postgresql`, `clickhouse`, which only accept a source of that
+  kind) runs on a data source defined in Settings › SQL blocks › Data
+  sources: name (what `db=` says, unique, letters/digits/`-_.`), kind and
+  connection (SQLite file; Postgres host, port, database, user, TLS mode;
+  ClickHouse HTTP URL, database, user) and **Allow writes** (off by
+  default). The list is `datasources.json` beside the cache; passwords are
+  in the Keychain (Valet identifier `ie.null.taisce.datasource`, account =
+  source id). Never synced, never sent to the server. No `db=`: Run is a
+  menu of the sources, and after a run "Save db=<name> to doc" writes it
+  into the fence through the outbox. An unknown name says so, with Add….
+  Read-only is the database's: SQLite opens the file `SQLITE_OPEN_READONLY`,
+  Postgres sessions start with `default_transaction_read_only=on` (a
+  statement can turn it back off: use a SELECT-only role for a hard
+  boundary), ClickHouse gets `readonly=2` (writes refused, `readonly`
+  can't be changed; 2 rather than 1 so a query's own `SETTINGS` work).
+  Statements run in order and stop at the first error; the last one's
+  rows show as a table (types where known, NULL dimmed, 1000 rows kept,
+  the rest counted), Copy as TSV / Markdown. Same 5 min limit; Stop
+  cancels (SQLite `sqlite3_interrupt`, Postgres `pg_cancel_backend` from a
+  second connection, ClickHouse `KILL QUERY` by `query_id`). Trust is the
+  RunTrust rule above, and a source with Allow writes asks before every
+  run. Drivers live in TaisceKit `SQL/` behind `SQLDriver`; Postgres is
+  PostgresNIO 1.33.1 in its own product `TaisceSQLPostgres`, linked on Mac
+  Catalyst only (the iPhone app has no NIO). Server tests:
+  `eval "$(apple/scripts/sql-servers.sh)" && (cd apple/TaisceKit && swift test --filter ServerTests)`
+  (Apple `container` or Docker; skipped without the variables).
 - Layout: regular width (every Mac window, iPad) is the split view
   (`RootLayout`): sidebar with the workspace switcher, search, Today,
   To-dos and the Library tree; the doc on the right. Compact width (iPhone)
