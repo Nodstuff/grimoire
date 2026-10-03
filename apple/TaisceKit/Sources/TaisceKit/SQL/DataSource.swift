@@ -162,11 +162,12 @@ public struct DataSource: Codable, Sendable, Hashable, Identifiable {
         }
     }
 
-    /// localhost, 127.0.0.0/8 or ::1 (brackets allowed).
+    /// localhost, 127.0.0.0/8 or ::1 (brackets allowed); not `*.localhost`,
+    /// which a resolver may send anywhere.
     public static func isLoopback(_ host: String) -> Bool {
         var h = host.trimmingCharacters(in: .whitespaces).lowercased()
         if h.hasPrefix("["), h.hasSuffix("]") { h = String(h.dropFirst().dropLast()) }
-        if h == "localhost" || h.hasSuffix(".localhost") || h == "::1" || h == "0:0:0:0:0:0:0:1" { return true }
+        if h == "localhost" || h == "::1" || h == "0:0:0:0:0:0:0:1" { return true }
         let parts = h.split(separator: ".", omittingEmptySubsequences: false)
         return parts.count == 4 && parts[0] == "127" && parts.allSatisfy { UInt8($0) != nil }
     }

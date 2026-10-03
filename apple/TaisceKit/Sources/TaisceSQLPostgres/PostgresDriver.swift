@@ -145,13 +145,16 @@ public struct PostgresDriver: SQLDriver {
     /// The read-only run's transaction: begun by the driver, and checked
     /// after each statement to be the same one, still read-only.
     struct ReadOnlyGuard {
-        /// `now()`: the transaction's start, fixed for its life
+        /// `pg_catalog.now()` as epoch seconds (float8, whose text form is
+        /// exact): the transaction's start,
+        /// fixed for its life (no text form, which `SET TimeZone` or
+        /// `DateStyle` would change)
         let started: String
 
         static func begin(_ conn: PostgresConnection) async throws -> ReadOnlyGuard {
             do {
                 _ = try await one(conn, "BEGIN TRANSACTION READ ONLY")
-                guard let started = try await one(conn, "SELECT now()::text") else { throw SQLDriverError("Postgres didn't say when the transaction began") }
+                guard let started = try await one(conn, "SELECT pg_catalog.date_part('epoch', pg_catalog.now())::pg_catalog.text") else { throw SQLDriverError("Postgres didn't say when the transaction began") }
                 return ReadOnlyGuard(started: started)
             } catch let e as SQLDriverError {
                 throw e
@@ -164,13 +167,19 @@ public struct PostgresDriver: SQLDriver {
         /// nil: still the driver's read-only transaction; else why the run
         /// stops (the transaction is then rolled back).
         func check(_ conn: PostgresConnection) async -> String? {
-            let r = try? await conn.query(PostgresQuery(unsafeSQL: "SELECT now()::text, current_setting('transaction_read_only')"), logger: logger).get()
+            // compared in SQL, schema-qualified so a user's function can't
+            // stand in for now() or current_setting()
+            let started = started.replacingOccurrences(of: "'", with: "''")
+            let r = try? await conn.query(PostgresQuery(unsafeSQL: """
+                SELECT (pg_catalog.date_part('epoch', pg_catalog.now()) = '\(started)'::pg_catalog.float8)::pg_catalog.text, \
+                pg_catalog.current_setting('transaction_read_only')
+                """), logger: logger).get()
             let cells = r?.rows.first.map { row in row.map(PostgresText.format) }
             guard let cells, cells.count == 2 else {
                 _ = try? await one(conn, "ROLLBACK")
                 return Self.escaped
             }
-            if cells[0] != started || cells[1] != "on" {
+            if cells[0] != "true" || cells[1] != "on" {
                 _ = try? await one(conn, "ROLLBACK")
                 return Self.escaped
             }

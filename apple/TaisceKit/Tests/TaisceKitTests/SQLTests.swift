@@ -198,12 +198,12 @@ import Testing
         // Prefer (it can fall back to plain text) only for this Mac
         pg.tlsMode = .prefer
         #expect(pg.problem(among: [])?.contains("only for a server on this Mac") == true)
-        for local in ["localhost", "127.0.0.1", "127.1.2.3", "::1", "[::1]", "db.localhost"] {
+        for local in ["localhost", "127.0.0.1", "127.1.2.3", "::1", "[::1]"] {
             pg.host = local
             #expect(pg.problem(among: []) == nil, "\(local)")
             #expect(pg.transportWarning != nil)
         }
-        for remote in ["db", "10.0.0.1", "127.0.0.1.example.com", "128.0.0.1", "localhost.example.com"] {
+        for remote in ["db", "10.0.0.1", "127.0.0.1.example.com", "128.0.0.1", "localhost.example.com", "db.localhost"] {
             pg.host = remote
             #expect(pg.problem(among: []) != nil, "\(remote)")
         }
@@ -344,6 +344,9 @@ import Testing
             let create = try await d.run("ATTACH DATABASE '\(fresh)' AS f; CREATE TABLE f.x (y)", cap: 1)
             #expect(create.first?.error != nil)
             #expect(!FileManager.default.fileExists(atPath: fresh))
+            // VACUUM attaches too: said plainly
+            let plain = try await d.run("VACUUM", cap: 1)
+            #expect(plain.last?.error?.hasPrefix("VACUUM isn't available from SQL blocks") == true, "\(plain)")
             // defensive mode: no writable_schema
             if writes {
                 let schema = try await d.run("PRAGMA writable_schema = ON; UPDATE sqlite_schema SET sql = 'x' WHERE name = 't'", cap: 1)

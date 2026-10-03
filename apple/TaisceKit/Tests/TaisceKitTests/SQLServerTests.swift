@@ -170,6 +170,9 @@ enum SQLServers {
         #expect(caught.count == 1 && caught[0].error?.contains("read-only transaction the block runs in") == true)
         let n = try await rw.run("SELECT count(*) FROM \(table)", cap: 1)
         #expect(n.last?.outcome == .rows(SQLResultSet(columns: [SQLColumn("count", type: "bigint")], rows: [["0"]])))
+        // changing how times print doesn't trip the same-transaction check
+        let tz = try await ro.run("SET TimeZone = 'UTC'; SET DateStyle = 'SQL, DMY'; SELECT 1 AS one", cap: 1)
+        #expect(tz.count == 3 && tz.allSatisfy { $0.error == nil }, "\(tz)")
         // and an ordinary read-only run still works, temp state and all
         let ok = try await ro.run("SET search_path = public; SELECT count(*) FROM \(table)", cap: 1)
         #expect(ok.allSatisfy { $0.error == nil } && ok.count == 2)

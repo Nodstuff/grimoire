@@ -127,7 +127,8 @@ final class SQLiteConnection: Sendable {
                 if rc != SQLITE_OK {
                     if isCancelled { throw CancellationError() }
                     let rest = String(cString: cur).trimmingCharacters(in: .whitespacesAndNewlines)
-                    results.append(SQLStatementResult(sql: Self.firstStatementGuess(rest), outcome: .failed(String(cString: sqlite3_errmsg(db)))))
+                    let guess = Self.firstStatementGuess(rest)
+                    results.append(SQLStatementResult(sql: guess, outcome: .failed(Self.explain(String(cString: sqlite3_errmsg(db)), sql: guess))))
                     sqlite3_finalize(stmt)
                     return
                 }
@@ -135,7 +136,8 @@ final class SQLiteConnection: Sendable {
                 guard let stmt else { continue } // only whitespace or a comment
                 defer { sqlite3_finalize(stmt) }
                 let text = SQLStatements.droppingLeadingComments(sqlite3_sql(stmt).map { String(cString: $0) } ?? "")
-                let outcome = try step(stmt, db: db, cap: cap)
+                var outcome = try step(stmt, db: db, cap: cap)
+                if case .failed(let e) = outcome { outcome = .failed(Self.explain(e, sql: text)) }
                 results.append(SQLStatementResult(sql: text, outcome: outcome))
                 if case .failed = outcome { return }
             }
@@ -190,6 +192,16 @@ final class SQLiteConnection: Sendable {
                 return SQLCell.text(shown, total: len)
             }
         }
+    }
+
+    /// SQLite's message, or what it means here: VACUUM attaches a temporary
+    /// database, which no connection allows (see the type's comment).
+    static func explain(_ message: String, sql: String) -> String {
+        let first = SQLStatements.droppingLeadingComments(sql).prefix(6).uppercased()
+        if message.contains("too many attached databases"), first.hasPrefix("VACUUM") {
+            return "VACUUM isn't available from SQL blocks (it needs to attach a database, which they don't allow). Run it with the sqlite3 tool."
+        }
+        return message
     }
 
     /// For an error before a statement could be prepared: its first line.
