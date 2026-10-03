@@ -19,8 +19,9 @@ public enum DataSourceKind: String, Codable, Sendable, Hashable, CaseIterable, I
 }
 
 /// Postgres TLS, named as libpq's `sslmode`: `prefer` and `require`
-/// encrypt without checking the certificate, `verifyFull` checks it and
-/// the host name.
+/// encrypt without checking the certificate, `verifyFull` (the default)
+/// checks it and the host name. `prefer` (which falls back to plain text)
+/// is for a server on this Mac only.
 public enum PostgresTLSMode: String, Codable, Sendable, Hashable, CaseIterable, Identifiable {
     case disable, prefer, require, verifyFull = "verify-full"
 
@@ -29,7 +30,7 @@ public enum PostgresTLSMode: String, Codable, Sendable, Hashable, CaseIterable, 
     public var label: String {
         switch self {
         case .disable: "Off"
-        case .prefer: "Prefer (unverified)"
+        case .prefer: "Prefer (unverified; this Mac only)"
         case .require: "Require (unverified)"
         case .verifyFull: "Require and verify"
         }
@@ -51,8 +52,9 @@ public struct DataSource: Codable, Sendable, Hashable, Identifiable {
     public var port: Int = 5432
     public var database: String = ""
     public var user: String = ""
-    public var tlsMode: PostgresTLSMode = .prefer
-    /// ClickHouse: the HTTP(S) interface, e.g. https://host:8443
+    public var tlsMode: PostgresTLSMode = .verifyFull
+    /// ClickHouse: the HTTP(S) interface, e.g. https://host:8443 (http://
+    /// only for a server on this Mac)
     public var url: String = ""
     /// off: the database itself refuses writes (read-only open, a
     /// read-only session or setting)
@@ -79,7 +81,7 @@ public struct DataSource: Codable, Sendable, Hashable, Identifiable {
         port = try c.decodeIfPresent(Int.self, forKey: .port) ?? 5432
         database = try c.decodeIfPresent(String.self, forKey: .database) ?? ""
         user = try c.decodeIfPresent(String.self, forKey: .user) ?? ""
-        tlsMode = try c.decodeIfPresent(PostgresTLSMode.self, forKey: .tlsMode) ?? .prefer
+        tlsMode = try c.decodeIfPresent(PostgresTLSMode.self, forKey: .tlsMode) ?? .verifyFull
         url = try c.decodeIfPresent(String.self, forKey: .url) ?? ""
         allowWrites = try c.decodeIfPresent(Bool.self, forKey: .allowWrites) ?? false
     }
@@ -109,12 +111,63 @@ public struct DataSource: Codable, Sendable, Hashable, Identifiable {
             if host.trimmingCharacters(in: .whitespaces).isEmpty { return "Enter the host." }
             if !(1...65535).contains(port) { return "The port is 1-65535." }
             if user.trimmingCharacters(in: .whitespaces).isEmpty { return "Enter the user." }
+            if let p = transportProblem { return p }
         case .clickhouse:
             guard let u = URL(string: url.trimmingCharacters(in: .whitespaces)), let s = u.scheme?.lowercased(), s == "http" || s == "https", u.host() != nil else {
                 return "Enter the HTTP interface's URL, e.g. https://host:8443."
             }
+            if let p = transportProblem { return p }
         }
         return nil
+    }
+
+    /// A connection that would send the password where it can be read, and
+    /// isn't to this Mac: refused (by validation and by the drivers).
+    public var transportProblem: String? {
+        switch kind {
+        case .sqlite:
+            return nil
+        case .postgres:
+            if tlsMode == .prefer, !Self.isLoopback(host) {
+                return "Prefer can fall back to no encryption, so it is only for a server on this Mac. Choose Require and verify."
+            }
+            return nil
+        case .clickhouse:
+            guard let u = URL(string: url.trimmingCharacters(in: .whitespaces)), u.scheme?.lowercased() == "http" else { return nil }
+            if !Self.isLoopback(u.host() ?? "") {
+                return "Use https://: over http:// the password and every row cross the network in the clear (http:// is only for a server on this Mac)."
+            }
+            return nil
+        }
+    }
+
+    /// For the editor: what a weaker-than-verified connection gives up
+    /// (nil: TLS verified, or a local file).
+    public var transportWarning: String? {
+        if let p = transportProblem { return p }
+        switch kind {
+        case .sqlite:
+            return nil
+        case .postgres:
+            switch tlsMode {
+            case .verifyFull: return nil
+            case .disable: return "TLS is off: the password, every query and every row cross the network in the clear."
+            case .require: return "Encrypted, but the server's certificate isn't checked: anyone on the way can pose as the server and read the password."
+            case .prefer: return "Unverified, and plain text if the server has no TLS (fine for a server on this Mac)."
+            }
+        case .clickhouse:
+            return URL(string: url.trimmingCharacters(in: .whitespaces))?.scheme?.lowercased() == "http"
+                ? "Plain http:// (fine for a server on this Mac): the password goes in the clear." : nil
+        }
+    }
+
+    /// localhost, 127.0.0.0/8 or ::1 (brackets allowed).
+    public static func isLoopback(_ host: String) -> Bool {
+        var h = host.trimmingCharacters(in: .whitespaces).lowercased()
+        if h.hasPrefix("["), h.hasSuffix("]") { h = String(h.dropFirst().dropLast()) }
+        if h == "localhost" || h.hasSuffix(".localhost") || h == "::1" || h == "0:0:0:0:0:0:0:1" { return true }
+        let parts = h.split(separator: ".", omittingEmptySubsequences: false)
+        return parts.count == 4 && parts[0] == "127" && parts.allSatisfy { UInt8($0) != nil }
     }
 
     public static func isValidName(_ s: String) -> Bool {

@@ -138,8 +138,28 @@ import Testing
         pg.port = 0
         #expect(pg.problem(among: [])?.contains("port") == true)
         pg.port = 5432
+        #expect(pg.tlsMode == .verifyFull)
         #expect(pg.problem(among: []) == nil)
+        #expect(pg.transportWarning == nil)
         #expect(pg.summary == "me@db:5432/")
+        // Prefer (it can fall back to plain text) only for this Mac
+        pg.tlsMode = .prefer
+        #expect(pg.problem(among: [])?.contains("only for a server on this Mac") == true)
+        for local in ["localhost", "127.0.0.1", "127.1.2.3", "::1", "[::1]", "db.localhost"] {
+            pg.host = local
+            #expect(pg.problem(among: []) == nil, "\(local)")
+            #expect(pg.transportWarning != nil)
+        }
+        for remote in ["db", "10.0.0.1", "127.0.0.1.example.com", "128.0.0.1", "localhost.example.com"] {
+            pg.host = remote
+            #expect(pg.problem(among: []) != nil, "\(remote)")
+        }
+        // weaker modes are allowed anywhere, and the editor says what they give up
+        pg.tlsMode = .disable
+        #expect(pg.problem(among: []) == nil)
+        #expect(pg.transportWarning?.contains("in the clear") == true)
+        pg.tlsMode = .require
+        #expect(pg.transportWarning?.contains("certificate isn't checked") == true)
 
         var ch = DataSource(name: "ch", kind: .clickhouse)
         #expect(ch.user == "default")
@@ -147,7 +167,16 @@ import Testing
         #expect(ch.problem(among: []) != nil)
         ch.url = "https://ch.example:8443"
         #expect(ch.problem(among: []) == nil)
+        #expect(ch.transportWarning == nil)
         #expect(!ch.allowWrites)
+        // http:// only to this Mac
+        ch.url = "http://ch.example:8123"
+        #expect(ch.problem(among: [])?.contains("Use https://") == true)
+        #expect(throws: SQLDriverError.self) { try ClickHouseDriver(ch, password: "pw") }
+        ch.url = "http://127.0.0.1:8123"
+        #expect(ch.problem(among: []) == nil)
+        #expect(ch.transportWarning?.contains("http://") == true)
+        #expect((try? ClickHouseDriver(ch, password: nil))?.url.scheme == "http")
     }
 
     @Test func fileRoundTripAndDefaults() throws {
@@ -169,7 +198,7 @@ import Testing
         let loaded = try #require(try file.load().first)
         #expect(loaded.url == "http://h:8123")
         #expect(!loaded.allowWrites)
-        #expect(loaded.tlsMode == .prefer)
+        #expect(loaded.tlsMode == .verifyFull)
     }
 
     @Test func memorySecrets() throws {

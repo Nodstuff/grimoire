@@ -277,6 +277,12 @@ import TaisceKit
         try AppModelTests().render(RunnableCodeBlock(language: "sql", code: "SELEC 1", attributes: ["db": src.name]).environment(m).environment(\.codeRunContext, ctx))
         try AppModelTests().render(NavigationStack { DataSourcesScreen() }.environment(m))
         try AppModelTests().render(NavigationStack { DataSourceEditor(original: src, isNew: false) }.environment(m))
+        // a weaker connection says what it gives up
+        var plain = DataSource(name: "plain", kind: .postgres)
+        plain.host = "db.example"
+        plain.tlsMode = .disable
+        #expect(plain.transportWarning != nil)
+        try AppModelTests().render(NavigationStack { DataSourceEditor(original: plain, isNew: true) }.environment(m))
         try await m.cache?.deleteDoc(doc)
     }
 

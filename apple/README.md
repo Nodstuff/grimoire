@@ -544,7 +544,11 @@ and duration, "compiled ✓" for a Go block that only compiles.
   sources: name (what `db=` says, unique, letters/digits/`-_.`), kind and
   connection (SQLite file; Postgres host, port, database, user, TLS mode;
   ClickHouse HTTP URL, database, user) and **Allow writes** (off by
-  default). The list is `datasources.json` beside the cache; passwords are
+  default). TLS defaults to verify-full; Prefer (which can fall back to
+  plain text) is refused unless the host is this Mac (localhost,
+  127.0.0.0/8, ::1), and ClickHouse needs https:// unless the host is this
+  Mac; Off, Require (unverified) and a local http:// are allowed, and the
+  editor says plainly what they give up. The list is `datasources.json` beside the cache; passwords are
   in the Keychain (Valet identifier `ie.null.taisce.datasource`, account =
   source id). Never synced, never sent to the server. No `db=`: Run is a
   menu of the sources, and after a run "Save db=<name> to doc" writes it

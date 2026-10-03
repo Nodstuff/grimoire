@@ -49,6 +49,9 @@ public struct PostgresDriver: SQLDriver {
 
     /// The connection settings (pure but for building the TLS context).
     public func configuration() throws -> PostgresConnection.Configuration {
+        if tlsMode == .prefer, !DataSource.isLoopback(host) {
+            throw SQLDriverError("TLS Prefer is only for a server on this Mac: choose Require and verify for \(host).")
+        }
         let tls: PostgresConnection.Configuration.TLS
         switch tlsMode {
         case .disable:

@@ -31,6 +31,7 @@ public struct ClickHouseDriver: SQLDriver {
         guard let u = URL(string: source.url.trimmingCharacters(in: .whitespaces)), u.host() != nil else {
             throw SQLDriverError("\(source.name): not a URL: \(source.url)")
         }
+        if let p = source.transportProblem { throw SQLDriverError("\(source.name): \(p)") }
         self.init(url: u, database: source.database, user: source.user, password: password, allowWrites: source.allowWrites, session: session)
     }
 

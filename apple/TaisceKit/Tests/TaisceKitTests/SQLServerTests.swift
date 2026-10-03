@@ -88,7 +88,12 @@ import Testing
         #expect(c.options.additionalStartupParameters.contains { $0 == ("default_transaction_read_only", "on") })
         s.tlsMode = .require
         #expect(try PostgresDriver(s, password: nil).configuration().tls.isEnforced)
+        s.tlsMode = .verifyFull
+        #expect(try PostgresDriver(s, password: nil).configuration().tls.isEnforced)
+        // Prefer only to this Mac
         s.tlsMode = .prefer
+        #expect(throws: SQLDriverError.self) { try PostgresDriver(s, password: nil).configuration() }
+        s.host = "localhost"
         let prefer = try PostgresDriver(s, password: nil).configuration().tls
         #expect(prefer.isAllowed && !prefer.isEnforced)
     }

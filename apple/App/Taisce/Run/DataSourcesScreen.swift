@@ -108,7 +108,7 @@ struct DataSourceEditor: View {
             }
             .listRowBackground(Theme.surface)
 
-            Section("Connection") {
+            Section {
                 switch draft.kind {
                 case .sqlite:
                     HStack {
@@ -135,6 +135,14 @@ struct DataSourceEditor: View {
                     field("Database", $draft.database)
                     field("User", $draft.user)
                     passwordField
+                }
+            } header: {
+                Text("Connection")
+            } footer: {
+                if let w = draft.transportWarning {
+                    Label(w, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(Theme.amber)
+                        .accessibilityIdentifier("datasource.transportWarning")
                 }
             }
             .listRowBackground(Theme.surface)
@@ -227,8 +235,8 @@ struct DataSourceEditor: View {
     private var writesFooter: String {
         switch draft.kind {
         case .sqlite: draft.allowWrites ? "The file is opened read-write. Every run asks first." : "The file is opened read-only: SQLite refuses any change."
-        case .postgres: draft.allowWrites ? "Writes are allowed. Every run asks first." : "Sessions start read-only (default_transaction_read_only). For a hard guarantee, connect as a role with only SELECT."
-        case .clickhouse: draft.allowWrites ? "Writes are allowed. Every run asks first." : "Queries run with readonly=2: ClickHouse refuses changes."
+        case .postgres: draft.allowWrites ? "Writes are allowed. Every run asks first." : "Each run is one read-only transaction, rolled back at the end. For a hard guarantee, connect as a role with only SELECT."
+        case .clickhouse: draft.allowWrites ? "Writes are allowed. Every run asks first." : "Queries run with readonly=1: ClickHouse refuses changes, table functions (url, s3, remote, file) and SETTINGS."
         }
     }
 
