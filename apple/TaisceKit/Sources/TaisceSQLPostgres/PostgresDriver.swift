@@ -16,7 +16,12 @@ import TaisceKit
 /// pg_execute_server_program; a read-only transaction doesn't stop it).
 ///
 /// Statements run one by one on the same connection (the extended protocol
-/// takes one statement per query). Stop closes the connection and asks
+/// takes one statement per query). Rows stop being read at the first one
+/// past the cap. A read-only run then cancels the statement on the server
+/// (each statement runs after a `SAVEPOINT`, rolled back to after the
+/// cancel, so the run goes on). With Allow writes the rest is discarded
+/// unread as it arrives instead (a capped `INSERT … RETURNING` must still
+/// finish), so a huge result there takes as long as it takes to send. Stop closes the connection and asks
 /// the server to cancel the backend (`pg_cancel_backend`), best effort.
 public struct PostgresDriver: SQLDriver {
     public var host: String
@@ -105,7 +110,16 @@ public struct PostgresDriver: SQLDriver {
             }
             for statement in SQLStatements.split(sql, dialect: .postgres) {
                 try Task.checkCancellation()
-                let outcome = try await Self.runOne(conn, statement, cap: cap)
+                if guardrail != nil { _ = try await Self.one(conn, "SAVEPOINT taisce_statement") }
+                // read-only, one past the cap: nothing was written, so stop
+                // the server sending the rest
+                let cancelAtCap = guardrail != nil ? backend.withLock { $0 } : nil
+                let outcome = try await Self.runOne(conn, statement, cap: cap) {
+                    if let cancelAtCap { await me.cancelBackend(cancelAtCap) }
+                }
+                if guardrail != nil, case .rows(let set) = outcome, set.isCapped {
+                    _ = try? await Self.one(conn, "ROLLBACK TO SAVEPOINT taisce_statement")
+                }
                 if case .failed = outcome {
                     results.append(SQLStatementResult(sql: statement, outcome: outcome))
                     break
@@ -116,7 +130,8 @@ public struct PostgresDriver: SQLDriver {
                 }
                 results.append(SQLStatementResult(sql: statement, outcome: outcome))
             }
-            if guardrail != nil { _ = try? await Self.one(conn, "ROLLBACK") }
+            // stopped: the connection is closing, which rolls back anyway
+            if guardrail != nil, !Task.isCancelled { _ = try? await Self.one(conn, "ROLLBACK") }
             return results
         } onCancel: {
             let pid = backend.withLock { $0 }
@@ -178,15 +193,24 @@ public struct PostgresDriver: SQLDriver {
         return PostgresText.format(cell)
     }
 
-    static func runOne(_ conn: PostgresConnection, _ statement: String, cap: Int) async throws -> SQLStatementResult.Outcome {
-        let collected = Mutex((rows: SQLRowCollector(cap: cap), columns: [SQLColumn]?.none))
+    /// Thrown from the row handler at the first row past the cap: PostgresNIO
+    /// then discards the rest unread (its query fails only once the server
+    /// has finished sending, so `onCap` starts at once from the handler).
+    struct CapReached: Error {}
+
+    static func runOne(_ conn: PostgresConnection, _ statement: String, cap: Int, onCap: @escaping @Sendable () async -> Void = {}) async throws -> SQLStatementResult.Outcome {
+        let collected = Mutex((rows: SQLRowCollector(cap: cap), columns: [SQLColumn]?.none, onCap: Task<Void, Never>?.none))
         do {
             let meta = try await conn.query(PostgresQuery(unsafeSQL: statement), logger: logger) { row in
-                collected.withLock { c in
+                try collected.withLock { c in
                     if c.columns == nil {
                         c.columns = row.map { SQLColumn($0.columnName, type: PostgresText.typeName($0.dataType)) }
                     }
-                    if c.rows.isFull { c.rows.count() } else { c.rows.add(row.map(PostgresText.format)) }
+                    c.rows.add(row.map(PostgresText.format))
+                    if c.rows.isDone {
+                        if c.onCap == nil { c.onCap = Task.detached { await onCap() } }
+                        throw CapReached()
+                    }
                 }
             }.get()
             let (rows, columns) = collected.withLock { ($0.rows, $0.columns) }
@@ -194,6 +218,25 @@ public struct PostgresDriver: SQLDriver {
             // no rows: a SELECT still shows its (empty) result
             if ["SELECT", "SHOW", "FETCH", "VALUES", "TABLE"].contains(meta.command) { return .rows(SQLResultSet(columns: [])) }
             return .done(rowsAffected: meta.rows)
+        } catch {
+            let (rows, columns, capTask) = collected.withLock { ($0.rows, $0.columns, $0.onCap) }
+            // done with it before the next statement (a cancel arriving
+            // late would hit that one)
+            await capTask?.value
+            // past the cap the stream ends as PostgresNIO's queryCancelled,
+            // or the server's query_canceled when onCap cancelled it
+            let canceled = error is CapReached || (error as? PSQLError)?.code == .queryCancelled
+                || (error as? PSQLError)?.serverInfo?[.sqlState] == "57014"
+            if rows.isDone, canceled, !Task.isCancelled {
+                return .rows(rows.result(columns ?? []))
+            }
+            return try fail(error)
+        }
+    }
+
+    private static func fail(_ error: any Error) throws -> SQLStatementResult.Outcome {
+        do {
+            throw error
         } catch let e as PSQLError where e.code == .server {
             return .failed(describe(e, connecting: nil))
         } catch {

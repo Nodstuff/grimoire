@@ -12,23 +12,28 @@ public struct SQLColumn: Sendable, Hashable {
 }
 
 /// The rows a statement returned, as display text (nil = SQL NULL), at most
-/// `cap` of them; `totalRows` counts every row the database sent.
+/// `cap` of them; `isCapped` when the database had more (the drivers stop
+/// at the first row past the cap, so how many more is never known).
 public struct SQLResultSet: Sendable, Hashable {
     public static let defaultCap = 1000
 
     public var columns: [SQLColumn]
     public var rows: [[String?]]
-    public var totalRows: Int
+    /// there was at least one more row than `rows` holds
+    public var isCapped: Bool
 
-    public init(columns: [SQLColumn], rows: [[String?]] = [], totalRows: Int? = nil) {
+    public init(columns: [SQLColumn], rows: [[String?]] = [], isCapped: Bool = false) {
         self.columns = columns
         self.rows = rows
-        self.totalRows = totalRows ?? rows.count
+        self.isCapped = isCapped
     }
 
-    /// Rows past the cap (counted, never kept).
-    public var droppedRows: Int { max(0, totalRows - rows.count) }
-    public var isCapped: Bool { droppedRows > 0 }
+    /// "1,000+ rows" / "3 rows" / "1 row"
+    public var rowCountText: String {
+        let n = rows.count
+        if isCapped { return "\(n.formatted())+ rows" }
+        return n == 1 ? "1 row" : "\(n.formatted()) rows"
+    }
 
     /// Tab-separated, a header line first; tabs and newlines in cells
     /// become spaces, NULL is empty.
@@ -53,32 +58,30 @@ public struct SQLResultSet: Sendable, Hashable {
         var lines = ["| " + columns.map { cell($0.name) }.joined(separator: " | ") + " |"]
         lines.append("|" + String(repeating: " --- |", count: columns.count))
         for r in rows { lines.append("| " + r.map(cell).joined(separator: " | ") + " |") }
-        if isCapped { lines.append("\n+\(droppedRows) more rows (capped)") }
+        if isCapped { lines.append("\n(the first \(rows.count) rows; there are more)") }
         return lines.joined(separator: "\n") + "\n"
     }
 }
 
-/// Collects rows up to the cap and counts the rest.
+/// Collects rows up to the cap; the row after that only marks the result
+/// capped, and the driver stops reading (`isDone`).
 public struct SQLRowCollector: Sendable {
     public let cap: Int
     public private(set) var rows: [[String?]] = []
-    public private(set) var total = 0
+    /// a row past the cap arrived
+    public private(set) var isDone = false
 
     public init(cap: Int = SQLResultSet.defaultCap) {
         self.cap = cap
     }
 
+    /// The row is only built while there is room for it.
     public mutating func add(_ row: @autoclosure () -> [String?]) {
-        total += 1
-        if rows.count < cap { rows.append(row()) }
+        if rows.count < cap { rows.append(row()) } else { isDone = true }
     }
 
-    /// Past the cap: the caller may skip decoding the row and just `count()`.
-    public var isFull: Bool { rows.count >= cap }
-    public mutating func count() { total += 1 }
-
     public func result(_ columns: [SQLColumn]) -> SQLResultSet {
-        SQLResultSet(columns: columns, rows: rows, totalRows: total)
+        SQLResultSet(columns: columns, rows: rows, isCapped: isDone)
     }
 }
 

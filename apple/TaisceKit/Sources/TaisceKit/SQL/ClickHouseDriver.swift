@@ -58,7 +58,7 @@ public struct ClickHouseDriver: SQLDriver {
 
     /// The POST for one statement. Settings go in the URL; credentials in
     /// headers, never the URL.
-    public func request(_ statement: String, queryID: String, session: String? = nil, readOnly: Bool? = nil) -> URLRequest {
+    public func request(_ statement: String, queryID: String, session: String? = nil, cap: Int? = nil, readOnly: Bool? = nil) -> URLRequest {
         var c = URLComponents(url: url, resolvingAgainstBaseURL: false) ?? URLComponents()
         var items = c.queryItems ?? []
         // readonly first: settings after it are still applied by the server
@@ -67,6 +67,13 @@ public struct ClickHouseDriver: SQLDriver {
         if let session { items.append(URLQueryItem(name: "session_id", value: session)) }
         items.append(URLQueryItem(name: "default_format", value: Self.format))
         if !database.isEmpty { items.append(URLQueryItem(name: "database", value: database)) }
+        if let cap {
+            // the server stops near the first row past the cap (a block's
+            // worth: `break` is approximate) instead of sending everything
+            items.append(URLQueryItem(name: "max_result_rows", value: String(cap + 1)))
+            items.append(URLQueryItem(name: "result_overflow_mode", value: "break"))
+            items.append(URLQueryItem(name: "cancel_http_readonly_queries_on_client_close", value: "1"))
+        }
         c.queryItems = items
         if c.path.isEmpty { c.path = "/" }
         var r = URLRequest(url: c.url ?? url)
@@ -104,7 +111,7 @@ public struct ClickHouseDriver: SQLDriver {
         let session = session
         let kill = killRequest(queryID: id)
         return try await withTaskCancellationHandler {
-            let (bytes, response) = try await session.bytes(for: request(statement, queryID: id, session: sessionID))
+            let (bytes, response) = try await session.bytes(for: request(statement, queryID: id, session: sessionID, cap: cap))
             guard let http = response as? HTTPURLResponse else { throw SQLDriverError("Not an HTTP response from \(url.host() ?? "the server")") }
             var parser = ClickHouseResultParser(cap: cap, format: http.value(forHTTPHeaderField: "X-ClickHouse-Format"))
             if http.statusCode != 200 {
@@ -125,7 +132,11 @@ public struct ClickHouseDriver: SQLDriver {
             }
             for try await line in bytes.lines {
                 parser.add(line)
+                if parser.isDone { break }
             }
+            // stop the rest of the response (the server stops the query when
+            // the client goes: cancel_http_readonly_queries_on_client_close)
+            if parser.isDone { bytes.task.cancel() }
             return parser.outcome(summary: http.value(forHTTPHeaderField: "X-ClickHouse-Summary"))
         } onCancel: {
             Task.detached { _ = try? await session.data(for: kill) }
@@ -160,6 +171,9 @@ public struct ClickHouseResultParser: Sendable {
         rawFormat = (format == nil || format == ClickHouseDriver.format) ? nil : format
     }
 
+    /// A row past the cap arrived: the caller stops reading.
+    public var isDone: Bool { collector.isDone }
+
     public mutating func add(_ line: String) {
         if let rawFormat {
             if names == nil { names = ["output (\(rawFormat))"]; types = [] }
@@ -178,8 +192,9 @@ public struct ClickHouseResultParser: Sendable {
         } else if types == nil {
             guard let t = Self.elements(trimmed) else { return fail(line) }
             types = t.map { $0 ?? "" }
-        } else if collector.isFull, trimmed.hasPrefix("[") {
-            collector.count()
+        } else if collector.rows.count >= collector.cap, trimmed.hasPrefix("[") {
+            // one past the cap: no need to parse it
+            collector.add([])
         } else if let row = Self.elements(trimmed) {
             collector.add(row)
         } else {

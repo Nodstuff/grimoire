@@ -250,7 +250,7 @@ private struct SQLOutputView: View {
                 } else if let set = o.lastResultSet, !set.columns.isEmpty {
                     SQLTable(set: set)
                     if set.isCapped {
-                        Text("+\(set.droppedRows.formatted()) more rows (capped)")
+                        Text("The first \(set.rows.count.formatted()) rows; there are more")
                             .docFont(.caption2)
                             .foregroundStyle(Theme.amber)
                     }

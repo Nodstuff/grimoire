@@ -180,7 +180,25 @@ enum SQLServers {
         let r = try await ro.run("SELECT 1 AS a; SELECT g FROM generate_series(1, 1500) g", cap: 1000)
         guard case .rows(let set) = r.last?.outcome else { Issue.record("no rows"); return }
         #expect(set.rows.count == 1000)
-        #expect(set.totalRows == 1500)
+        #expect(set.isCapped)
+        // an endless result stops at the cap: the server isn't left sending
+        let t0 = ContinuousClock.now
+        let endless = await SQLRunner.run(ro, sql: "SELECT generate_series(1, 1000000000) AS g", cap: 1000, timeout: .seconds(20)).statements
+        #expect(endless.last?.outcome == .rows(SQLResultSet(columns: [SQLColumn("g", type: "integer")], rows: (1...1000).map { [String($0)] }, isCapped: true)))
+        #expect(ContinuousClock.now - t0 < .seconds(10))
+        // with more statements after it, the run goes on in the same transaction
+        let t1 = ContinuousClock.now
+        let then = await SQLRunner.run(ro, sql: "SET search_path = public; SELECT generate_series(1, 1000000000) AS g; SELECT 2 AS two, current_setting('search_path') AS p", cap: 10, timeout: .seconds(20))
+        #expect(then.statements.count == 3 && then.lastResultSet == SQLResultSet(columns: [SQLColumn("two", type: "integer"), SQLColumn("p", type: "text")], rows: [["2", "public"]]), "\(then)")
+        #expect(ContinuousClock.now - t1 < .seconds(10))
+        // with Allow writes a capped INSERT … RETURNING still inserts every row
+        let table = "taisce_r_\(UUID().uuidString.prefix(8).lowercased())"
+        let rw = SQLServers.postgres(writes: true)
+        _ = try await rw.run("CREATE TABLE \(table) (n int)", cap: 1)
+        defer { Task { _ = try? await rw.run("DROP TABLE \(table)", cap: 1) } }
+        let ins = await SQLRunner.run(rw, sql: "INSERT INTO \(table) SELECT g FROM generate_series(1, 5000) g RETURNING n; SELECT count(*) FROM \(table)", cap: 1000, timeout: .seconds(20))
+        #expect(ins.statements.first.flatMap { if case .rows(let s) = $0.outcome { s.isCapped } else { nil } } == true)
+        #expect(ins.lastResultSet?.rows == [["5000"]])
         let bad = try await ro.run("SELECT 1; SELEC 2; SELECT 3", cap: 10)
         #expect(bad.count == 2)
         #expect(bad.last?.error?.contains("syntax error") == true)
@@ -273,7 +291,12 @@ enum SQLServers {
         let r = try await ro.run("SELECT 1; SELECT number FROM numbers(1500)", cap: 1000)
         guard case .rows(let set) = r.last?.outcome else { Issue.record("no rows"); return }
         #expect(set.rows.count == 1000)
-        #expect(set.totalRows == 1500)
+        #expect(set.isCapped)
+        let t0 = ContinuousClock.now
+        let endless = try await ro.run("SELECT number FROM system.numbers", cap: 1000)
+        guard case .rows(let big) = endless.last?.outcome else { Issue.record("no rows"); return }
+        #expect(big.rows.count == 1000 && big.isCapped)
+        #expect(ContinuousClock.now - t0 < .seconds(10))
         let bad = try await ro.run("SELECT 1; SELEC 2", cap: 10)
         #expect(bad.last?.error?.contains("Syntax error") == true)
 

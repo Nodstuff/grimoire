@@ -77,9 +77,11 @@ import TaisceKit
     }
 
     @Test func statusLines() {
-        let rows = SQLStatementResult(sql: "SELECT", outcome: .rows(SQLResultSet(columns: [SQLColumn("a")], rows: [["1"]], totalRows: 1500)))
-        #expect(SQLStatus.line(SQLRunOutcome(statements: [rows], duration: .milliseconds(120))) == ("1,500 rows · 0.12 s", true))
-        #expect(SQLStatus.line(SQLRunOutcome(statements: [rows, rows], duration: .seconds(1))).text == "2 statements · 1,500 rows · 1.00 s")
+        let rows = SQLStatementResult(sql: "SELECT", outcome: .rows(SQLResultSet(columns: [SQLColumn("a")], rows: Array(repeating: ["1"], count: 1000), isCapped: true)))
+        #expect(SQLStatus.line(SQLRunOutcome(statements: [rows], duration: .milliseconds(120))) == ("1,000+ rows · 0.12 s", true))
+        #expect(SQLStatus.line(SQLRunOutcome(statements: [rows, rows], duration: .seconds(1))).text == "2 statements · 1,000+ rows · 1.00 s")
+        let one = SQLStatementResult(sql: "SELECT", outcome: .rows(SQLResultSet(columns: [SQLColumn("a")], rows: [["1"]])))
+        #expect(SQLStatus.line(SQLRunOutcome(statements: [one], duration: .seconds(1))).text == "1 row · 1.00 s")
         #expect(SQLStatus.line(SQLRunOutcome(statements: [SQLStatementResult(sql: "INSERT", outcome: .done(rowsAffected: 1))], duration: .seconds(1))).text == "1 row affected · 1.00 s")
         #expect(SQLStatus.line(SQLRunOutcome(statements: [SQLStatementResult(sql: "CREATE", outcome: .done(rowsAffected: nil))], duration: .seconds(1))).text == "OK · 1.00 s")
         let failed = SQLRunOutcome(statements: [rows, SQLStatementResult(sql: "SELEC", outcome: .failed("syntax"))], duration: .seconds(1))
@@ -161,7 +163,7 @@ import TaisceKit
         #expect(s.prompt == nil)
         let set = try #require(s.outcome?.lastResultSet)
         #expect(set.columns == [SQLColumn("n", type: "INTEGER"), SQLColumn("s", type: "TEXT")])
-        #expect(set.rows.count == 1000 && set.totalRows == 1200)
+        #expect(set.rows.count == 1000 && set.isCapped)
         #expect(set.rows[0] == ["1", "row 1"] && set.rows[1] == ["2", nil])
         #expect(s.sourceName == src.name && s.pickedSource)
         // approved: the next run goes straight through
@@ -259,7 +261,7 @@ import TaisceKit
         let ctx = CodeRunContext(doc: doc, block: block, canSave: true)
         let s = m.sqlRuns.state(ctx)
         s.outcome = SQLRunOutcome(statements: [SQLStatementResult(sql: "SELECT", outcome: .rows(SQLResultSet(
-            columns: [SQLColumn("n", type: "INTEGER"), SQLColumn("s")], rows: [["1", "a"], ["2", nil]], totalRows: 1002
+            columns: [SQLColumn("n", type: "INTEGER"), SQLColumn("s")], rows: [["1", "a"], ["2", nil]], isCapped: true
         )))], duration: .milliseconds(30))
         s.sourceName = src.name
         s.pickedSource = true

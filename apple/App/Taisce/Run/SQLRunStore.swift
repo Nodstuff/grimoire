@@ -182,7 +182,7 @@ enum SQLStatus {
         let prefix = n > 1 ? "\(n) statements · " : ""
         switch last.outcome {
         case .rows(let r):
-            return ("\(prefix)\(rows(r.totalRows)) · \(t)", true)
+            return ("\(prefix)\(r.rowCountText) · \(t)", true)
         case .done(let affected):
             return ("\(prefix)\(affected.map { "\(rows($0)) affected" } ?? "OK") · \(t)", true)
         case .failed:

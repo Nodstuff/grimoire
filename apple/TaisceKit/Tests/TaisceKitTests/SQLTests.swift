@@ -97,20 +97,29 @@ import Testing
 }
 
 @Suite struct SQLResultTests {
-    @Test func collectorCapsAndCounts() {
+    @Test func collectorStopsOnePastTheCap() {
         var c = SQLRowCollector(cap: 2)
-        for i in 0..<5 {
-            if c.isFull { c.count() } else { c.add(["\(i)"]) }
+        var built = 0
+        func row(_ i: Int) -> [String?] { built += 1; return ["\(i)"] }
+        var i = 0
+        while !c.isDone {
+            c.add(row(i))
+            i += 1
         }
+        // the third row only says there are more; it is never built
+        #expect(i == 3 && built == 2)
         let r = c.result([SQLColumn("n")])
         #expect(r.rows == [["0"], ["1"]])
-        #expect(r.totalRows == 5)
-        #expect(r.droppedRows == 3)
         #expect(r.isCapped)
+        #expect(r.rowCountText == "2+ rows")
+        var exact = SQLRowCollector(cap: 2)
+        exact.add(["a"]); exact.add(["b"])
+        #expect(!exact.isDone && !exact.result([]).isCapped)
+        #expect(exact.result([]).rowCountText == "2 rows")
     }
 
     @Test func tsvAndMarkdown() {
-        let r = SQLResultSet(columns: [SQLColumn("a", type: "TEXT"), SQLColumn("b|c")], rows: [["x\ty", nil], ["1|2", "line\nbreak"]], totalRows: 4)
+        let r = SQLResultSet(columns: [SQLColumn("a", type: "TEXT"), SQLColumn("b|c")], rows: [["x\ty", nil], ["1|2", "line\nbreak"]], isCapped: true)
         #expect(r.tsv == "a\tb|c\nx y\t\n1|2\tline break\n")
         #expect(r.markdown == """
         | a | b\\|c |
@@ -118,7 +127,7 @@ import Testing
         | x\ty | NULL |
         | 1\\|2 | line<br>break |
 
-        +2 more rows (capped)
+        (the first 2 rows; there are more)
 
         """)
         #expect(SQLResultSet(columns: []).markdown == "")
@@ -338,9 +347,14 @@ import Testing
         let outcome = await SQLRunner.run(SQLiteDriver(path: path, allowWrites: false), sql: "SELECT * FROM t")
         let set = try #require(outcome.lastResultSet)
         #expect(set.rows.count == 1000)
-        #expect(set.totalRows == 1500)
-        #expect(set.droppedRows == 500)
+        #expect(set.isCapped && set.rowCountText == "1,000+ rows")
         #expect(outcome.succeeded)
+        // exactly at the cap: not capped
+        let exact = await SQLRunner.run(SQLiteDriver(path: path, allowWrites: false), sql: "SELECT * FROM t LIMIT 1000")
+        #expect(exact.lastResultSet?.rows.count == 1000 && exact.lastResultSet?.isCapped == false)
+        // stops stepping: a never-ending query comes back at once
+        let endless = await SQLRunner.run(SQLiteDriver(path: path, allowWrites: false), sql: "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c", timeout: .seconds(5))
+        #expect(endless.lastResultSet?.isCapped == true && !endless.timedOut)
     }
 
     @Test func multipleStatementsRunInOrderAndStopAtAnError() async throws {
@@ -474,7 +488,7 @@ import Testing
         for l in [#"["a", "b"]"#, #"["UInt8", "Nullable(String)"]"#, #"[1, "x"]"#, #"[2, null]"#, #"[3, "z"]"#] { p.add(l) }
         #expect(p.outcome(summary: nil) == .rows(SQLResultSet(
             columns: [SQLColumn("a", type: "UInt8"), SQLColumn("b", type: "Nullable(String)")],
-            rows: [["1", "x"], ["2", nil]], totalRows: 3
+            rows: [["1", "x"], ["2", nil]], isCapped: true
         )))
     }
 

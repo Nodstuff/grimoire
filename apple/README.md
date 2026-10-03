@@ -567,8 +567,13 @@ and duration, "compiled ✓" for a Go block that only compiles.
   changed; 1 rather than 2, which still runs table functions, so a query's
   own `SETTINGS` clause is refused too).
   Statements run in order and stop at the first error; the last one's
-  rows show as a table (types where known, NULL dimmed, 1000 rows kept,
-  the rest counted), Copy as TSV / Markdown. Same 5 min limit; Stop
+  rows show as a table (types where known, NULL dimmed, 1000 rows kept;
+  reading stops at the 1001st and the status says "1,000+ rows": SQLite
+  stops stepping, ClickHouse gets `max_result_rows=1001` with
+  `result_overflow_mode=break` and the response is dropped, a read-only
+  Postgres run cancels the statement (rolled back to a savepoint so the
+  run goes on), and with Allow writes Postgres discards the rest unread so
+  a capped `INSERT … RETURNING` still finishes), Copy as TSV / Markdown. Same 5 min limit; Stop
   cancels (SQLite `sqlite3_interrupt`, Postgres `pg_cancel_backend` from a
   second connection, ClickHouse `KILL QUERY` by `query_id`). Trust is the
   RunTrust rule above, and a source with Allow writes asks before every

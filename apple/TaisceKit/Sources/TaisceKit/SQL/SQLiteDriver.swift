@@ -156,7 +156,9 @@ final class SQLiteConnection: Sendable {
             if isCancelled { throw CancellationError() }
             let rc = sqlite3_step(stmt)
             if rc == SQLITE_ROW {
-                if rows.isFull { rows.count() } else { rows.add(Self.row(stmt, n)) }
+                rows.add(Self.row(stmt, n))
+                // one past the cap: stop stepping
+                if rows.isDone { break }
             } else if rc == SQLITE_DONE {
                 break
             } else {
