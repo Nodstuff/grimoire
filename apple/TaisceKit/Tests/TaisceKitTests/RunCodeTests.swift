@@ -334,6 +334,40 @@ import Testing
         #expect(RunTrust.decide(block: "b1", history: h, me: me, practiceEditedByMe: false, approval: nil, docEpoch: 9) == .ask(lastEditedBy: "someone else"))
     }
 
+    /// Only `review:decline:` is the server's: any other `review:` ref on
+    /// your op is a note of yours, and the write is yours.
+    @Test func otherReviewRefsAreOrdinaryWrites() {
+        for note in ["review: looks good", "review:pr/12", "reviewed"] {
+            let mine = DocHistoryEntry(opID: "o9", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 9, targetBlock: "b1", opType: "replace", sourceRefs: [note], content: "echo mine")
+            let h = [mine, op("p-claude", "claude:x", epoch: 8, block: "b1")]
+            #expect(RunTrust.author(of: "b1", history: h, me: me) == .me, "\(note)")
+        }
+        #expect(RunTrust.declineRevertPrefix == "review:decline:")
+    }
+
+    // "written by" beside Run
+
+    @Test func writtenByNamesAnyoneButYou() {
+        let mine = RunTrust.Me(principalID: "p-tom", name: "Tom", privateWorkspace: true)
+        // your own human write: nothing
+        #expect(RunTrust.writtenBy("b1", history: [op("p-tom", "Tom", epoch: 4, block: "b1", type: "insert")], me: mine) == nil)
+        // your own agent in a private workspace runs without asking, and is still named
+        #expect(RunTrust.decide(block: "b1", history: [agentOp(true)], me: mine, practiceEditedByMe: false, approval: nil, docEpoch: 7) == .run)
+        #expect(RunTrust.writtenBy("b1", history: [agentOp(true)], me: mine) == "claude:x")
+        // another person's agent, another person: their display name
+        #expect(RunTrust.writtenBy("b1", history: [agentOp(false, name: "claude:x (Aoife)")], me: mine) == "claude:x (Aoife)")
+        #expect(RunTrust.writtenBy("b1", history: [DocHistoryEntry(opID: "o", principalName: "Aoife", principalKind: "human", principalID: "p-aoife", epoch: 3, targetBlock: "b1", opType: "replace")], me: mine) == "Aoife")
+        // your re-insert of your agent's words is your agent's
+        let theirs = DocHistoryEntry(opID: "o3", principalName: "claude:x", principalKind: "agent", principalID: "p-claude", epoch: 3, targetBlock: "b1", opType: "insert", content: "rm -rf x", principalIsYours: true)
+        let reinsert = DocHistoryEntry(opID: "o6", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 6, targetBlock: "b2", opType: "insert", content: "rm -rf x")
+        #expect(RunTrust.writtenBy("b2", history: [reinsert, theirs], me: mine) == "claude:x")
+        // unknown (offline, too old, a decline's revert): nothing to say
+        #expect(RunTrust.writtenBy("b1", history: nil, me: mine) == nil)
+        #expect(RunTrust.writtenBy("b1", history: [], me: mine) == nil)
+        let decline = DocHistoryEntry(opID: "o9", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 9, targetBlock: "b1", opType: "replace", sourceRefs: ["review:decline:a"], content: "x")
+        #expect(RunTrust.writtenBy("b1", history: [decline, agentOp(false)], me: mine) == nil)
+    }
+
     @Test func linkRewritesLookFurtherBack() {
         let rewrite = DocHistoryEntry(opID: "o7", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 7, targetBlock: "b1", opType: "replace", sourceRefs: ["rename:Old → New"], content: "see [[New]]")
         func before(_ who: String, _ name: String) -> DocHistoryEntry {

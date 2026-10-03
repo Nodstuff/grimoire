@@ -93,6 +93,36 @@ import Darwin
 
     func store(_ m: AppModel) -> CodeRunStore { m.codeRuns }
 
+    /// "written by …" comes from the store's cached ledger (one per doc and
+    /// epoch), never from a fetch per render; nothing for your own writes.
+    @Test func writtenByComesFromTheCachedLedger() async throws {
+        let (m, doc, block) = try await modelWithCodeDoc()
+        let ctx = CodeRunContext(doc: doc, block: block, canSave: true)
+        let me = RunTrust.Me(principalID: "p-tom", name: "Tom", privateWorkspace: true)
+        #expect(m.codeRuns.writtenBy(ctx) == nil, "nothing cached yet")
+        // an unreachable server: nothing cached, nothing shown
+        m.codeRuns.trustCheckLimit = .milliseconds(300)
+        await m.codeRuns.loadAuthors(ctx)
+        #expect(m.codeRuns.histories[doc] == nil && m.codeRuns.writtenBy(ctx) == nil)
+        let agents = DocHistoryEntry(opID: "o2", principalName: "claude:grimoire-x", principalKind: "agent", principalID: "p-agent", epoch: 2, targetBlock: block, opType: "insert", content: "```bash\necho hi\n```", principalIsYours: true)
+        m.codeRuns.remember(doc, epoch: 2, history: [agents], me: me)
+        #expect(m.codeRuns.writtenBy(ctx) == "claude:grimoire-x", "your own agent is named even where it runs without asking")
+        // an older fetch never replaces a newer one
+        m.codeRuns.remember(doc, epoch: 1, history: [], me: me)
+        #expect(m.codeRuns.writtenBy(ctx) == "claude:grimoire-x")
+        // cached at the doc's epoch: no refetch (the server is unreachable; a fetch would clear nothing but must not run)
+        await m.codeRuns.loadAuthors(ctx)
+        #expect(m.codeRuns.histories[doc]?.history.count == 1)
+        try AppModelTests().render(RunnableCodeBlock(language: "bash", code: "echo hi").environment(m).environment(\.codeRunContext, ctx))
+        // your own write: nothing
+        let mine = DocHistoryEntry(opID: "o3", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 3, targetBlock: block, opType: "replace", content: "```bash\necho mine\n```")
+        m.codeRuns.remember(doc, epoch: 3, history: [mine, agents], me: me)
+        #expect(m.codeRuns.writtenBy(ctx) == nil)
+        m.codeRuns.reset()
+        #expect(m.codeRuns.histories.isEmpty)
+        try await m.cache?.deleteDoc(doc)
+    }
+
     @Test func saveToDocQueuesAReplaceThroughTheOutbox() async throws {
         let (m, doc, block) = try await modelWithCodeDoc()
         let cache = try #require(m.cache)

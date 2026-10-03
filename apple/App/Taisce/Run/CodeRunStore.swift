@@ -106,6 +106,17 @@ final class CodeRunStore {
     @ObservationIgnored private var meServer: String?
     /// how long "Checking who wrote this…" may take before it asks anyway
     @ObservationIgnored var trustCheckLimit: Duration = .seconds(5)
+    /// Each doc's ledger as last fetched (by a Run's trust check or for the
+    /// "written by" line), with the doc's epoch then: one fetch per doc and
+    /// epoch, shared by every block in it. Observed: the line follows it.
+    private(set) var histories: [DocID: FetchedHistory] = [:]
+    @ObservationIgnored private var fetching: Set<DocID> = []
+
+    struct FetchedHistory {
+        var epoch: Int
+        var history: [DocHistoryEntry]
+        var me: RunTrust.Me
+    }
 
     func state(_ c: CodeRunContext) -> BlockRunState {
         let key = "\(c.doc)/\(c.block)"
@@ -121,6 +132,37 @@ final class CodeRunStore {
         states = [:]
         me = nil
         meServer = nil
+        histories = [:]
+        fetching = []
+    }
+
+    // MARK: who wrote it
+
+    /// "written by …" for a block, when someone other than you (your own
+    /// agents included) last wrote it; from the cached ledger only.
+    func writtenBy(_ c: CodeRunContext) -> String? {
+        guard let h = histories[c.doc] else { return nil }
+        return RunTrust.writtenBy(c.block, history: h.history, me: h.me)
+    }
+
+    /// Fetch the doc's ledger for the "written by" line, unless it is
+    /// already cached at the doc's current epoch or on its way. Failures
+    /// leave nothing cached (the line stays empty); the next epoch retries.
+    func loadAuthors(_ c: CodeRunContext) async {
+        guard let app, let api = app.api, !fetching.contains(c.doc) else { return }
+        let epoch = (try? await app.cache?.doc(c.doc))?.currentEpoch ?? 0
+        if let h = histories[c.doc], h.epoch >= epoch { return }
+        fetching.insert(c.doc)
+        defer { fetching.remove(c.doc) }
+        let id = c.doc
+        guard case .finished(let history) = await withTimeLimit(trustCheckLimit, { try await api.docHistory(id) }) else { return }
+        remember(c.doc, epoch: epoch, history: history, me: await currentMe())
+    }
+
+    /// Keep a fetched ledger (only if newer than what's cached).
+    func remember(_ doc: DocID, epoch: Int, history: [DocHistoryEntry], me: RunTrust.Me) {
+        if let h = histories[doc], h.epoch > epoch { return }
+        histories[doc] = FetchedHistory(epoch: epoch, history: history, me: me)
     }
 
     // MARK: running
@@ -222,6 +264,7 @@ final class CodeRunStore {
         }
         var me = await currentMe()
         me.privateWorkspace = app?.workspaceIsPrivate(c.doc)
+        if let history { remember(c.doc, epoch: docEpoch, history: history, me: me) }
         var decision = RunTrust.decide(
             block: c.block, history: history, me: me, practiceEditedByMe: practiceEdited,
             approval: approvals?.approval(for: c.doc), docEpoch: docEpoch

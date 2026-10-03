@@ -69,6 +69,8 @@ private struct RunnableCodeCard: View {
         .accessibilityValue(prompt == nil ? "" : "asking before it runs")
         // an untouched practice text follows the doc's code
         .onChange(of: code) { _, new in s.followDoc(new) }
+        // who wrote it: one ledger fetch per doc and epoch, cached in the store
+        .task(id: code) { await store.loadAuthors(context) }
         .accessibilityElement(children: .contain)
     }
 
@@ -87,6 +89,15 @@ private struct RunnableCodeCard: View {
                     .truncationMode(.middle)
             }
             Spacer(minLength: 8)
+            if s.practice == nil, let who = store.writtenBy(context) {
+                Text("written by \(who)")
+                    .docFont(.caption2)
+                    .foregroundStyle(Theme.secondary.opacity(0.8))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help("The last change to this code was by \(who)")
+                    .accessibilityIdentifier("code.writtenBy")
+            }
             if s.practice != nil {
                 Button("Revert") { store.revert(s) }
                     .disabled(s.isSaving)

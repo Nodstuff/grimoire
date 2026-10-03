@@ -511,7 +511,9 @@ and duration, "compiled ✓" for a Go block that only compiles.
   write before it (unknown if that isn't in the history), one that changed
   more is an ordinary write of yours; the same tags on anyone else's op mean
   nothing. The server refuses those prefixes (and its other reserved ones)
-  from callers. A write of yours repeating content someone else wrote
+  from callers; of `review:` only `review:decline:` is reserved (the only
+  form the server writes), so any other `review:…` ref is a caller's note
+  and the write is theirs. A write of yours repeating content someone else wrote
   earlier (a whole-doc save re-inserting their block) is theirs; that look
   back covers only the history the server returns (the newest 100 ops). Run shows "Checking who wrote this…" while the ledger
   and profile load (5 s at most; then, or on an error, it asks and says
@@ -526,6 +528,13 @@ and duration, "compiled ✓" for a Go block that only compiles.
   doc's code (and its trust), so a Run never executes an older version.
   The sheet says the code runs as you with your login environment, tokens
   included. No server change was needed.
+- "written by <principal>" sits quietly beside Run (read mode) whenever
+  someone other than the signed-in human last wrote the block, your own
+  agents included even where they run without asking (`RunTrust.writtenBy`,
+  same rules as the trust check). Nothing for your own writes or when it
+  can't tell. It reads `CodeRunStore`'s cached ledger: one
+  `/api/doc/{id}/history` fetch per doc and epoch, shared by every block in
+  the doc and refreshed by each Run's trust check; never one per render.
 - Layout: regular width (every Mac window, iPad) is the split view
   (`RootLayout`): sidebar with the workspace switcher, search, Today,
   To-dos and the Library tree; the doc on the right. Compact width (iPhone)
