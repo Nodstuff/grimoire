@@ -52,8 +52,53 @@ import TaisceKit
         #expect(!store.hasPassword(pg))
     }
 
+    /// A password the Keychain won't take: the list goes back to what it
+    /// was, nothing is half-saved, and the message says so.
+    @Test func aPasswordThatCantBeStoredSavesNothing() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "taisce-ds-tests-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = DataSourceFile(url: dir.appending(path: "datasources.json"))
+        let secrets = FailingSecrets()
+        let store = DataSourceStore(file: file, secrets: { secrets })
+        var kept = DataSource(name: "kept", kind: .sqlite)
+        kept.path = "/tmp/k.db"
+        try store.save(kept, password: nil)
+        var pg = DataSource(name: "warehouse", kind: .postgres)
+        pg.host = "db.example"
+        pg.user = "me"
+        #expect {
+            try store.save(pg, password: "pw")
+        } throws: { e in
+            (e as? SQLDriverError)?.message.contains("wasn't saved") == true
+        }
+        #expect(store.sources == [kept])
+        #expect(try file.load() == [kept])
+    }
+
+    /// This launch's test identifier is stamped (so another test host can
+    /// tell it from an orphan), and no orphan of an earlier launch is left
+    /// in the Keychain: the sweep at launch took them.
+    @Test func noOrphanedTestKeychainItems() throws {
+        let id = AppPaths.dataSourceKeychainIdentifier
+        #expect(!KeychainDataSourceSecrets.isRemovableTestIdentifier(id, current: nil, cutoff: .now.addingTimeInterval(-1800)))
+        // an orphan made now, stamped two hours ago, is swept; this
+        // launch's own item is not (until the launch ends)
+        let orphanID = KeychainDataSourceSecrets.testIdentifier(now: .now.addingTimeInterval(-7200))
+        let orphan = try KeychainDataSourceSecrets(identifier: orphanID)
+        try orphan.setPassword("old", for: "src")
+        let mine = try KeychainDataSourceSecrets(identifier: id)
+        try mine.setPassword("mine", for: "src-sweep")
+        defer { try? mine.setPassword(nil, for: "src-sweep") }
+        #expect(AppPaths.sweepTestKeychain(current: nil) >= 1)
+        #expect(try orphan.password(for: "src") == nil)
+        #expect(try mine.password(for: "src-sweep") == "mine")
+        // and at the end of a launch its own go too
+        AppPaths.sweepTestKeychain(current: id)
+        #expect(try mine.password(for: "src-sweep") == nil)
+    }
+
     @Test func keychainPasswordsUnderAThrowawayIdentifier() throws {
-        let id = "ie.null.taisce.tests.datasource.\(UUID().uuidString.prefix(8))"
+        let id = KeychainDataSourceSecrets.testIdentifier()
         let k = try KeychainDataSourceSecrets(identifier: id)
         defer { try? k.removeAll() }
         try k.setPassword("s3cret", for: "src-1")
@@ -332,4 +377,14 @@ import TaisceKit
         try await m.cache?.deleteDoc(doc)
     }
     #endif
+}
+
+/// A Keychain that refuses every password.
+final class FailingSecrets: DataSourceSecrets {
+    struct Refused: Error, LocalizedError {
+        var errorDescription: String? { "the Keychain said no" }
+    }
+
+    func password(for id: String) throws -> String? { nil }
+    func setPassword(_ password: String?, for id: String) throws { throw Refused() }
 }

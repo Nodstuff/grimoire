@@ -63,12 +63,25 @@ final class DataSourceStore {
         var all = sources.filter { $0.id != s.id }
         all.append(s)
         all.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        // the list first: a password is never stored for a source that
+        // isn't saved; if the password can't be stored, the list goes back
+        try file.save(all)
         if let password, s.kind.hasPassword {
-            try secrets().setPassword(password, for: s.id)
+            do {
+                try secrets().setPassword(password, for: s.id)
+            } catch let keychain {
+                let why = SQLRunner.describe(keychain)
+                do {
+                    try file.save(sources)
+                } catch {
+                    sources = all
+                    throw SQLDriverError("Saved \(s.name), but couldn't store its password (\(why)). Enter the password again.")
+                }
+                throw SQLDriverError("Couldn't store the password in the Keychain, so \(s.name) wasn't saved: \(why)")
+            }
         } else if !s.kind.hasPassword {
             try? secrets().setPassword(nil, for: s.id)
         }
-        try file.save(all)
         sources = all
     }
 

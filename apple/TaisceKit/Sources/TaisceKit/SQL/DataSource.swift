@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import Synchronization
 import Valet
 
@@ -240,6 +241,73 @@ public struct KeychainDataSourceSecrets: DataSourceSecrets {
     /// Every password under this identifier (tests' cleanup).
     public func removeAll() throws {
         try valet.removeAllObjects()
+    }
+
+    // MARK: test hosts' throwaway identifiers
+
+    /// What every test identifier starts with (the real one,
+    /// `ie.null.taisce.datasource`, never does).
+    public static let testIdentifierPrefix = "ie.null.taisce.tests.datasource."
+
+    /// A throwaway identifier for one test host launch, stamped with when
+    /// it was made so a later launch can tell an orphan from a run still
+    /// going: `ie.null.taisce.tests.datasource.<unix seconds>.<random>`.
+    public static func testIdentifier(now: Date = .now) -> String {
+        "\(testIdentifierPrefix)\(Int(now.timeIntervalSince1970)).\(UUID().uuidString.prefix(8).lowercased())"
+    }
+
+    /// Whether test-host items made under `identifier` should go: it is a
+    /// test identifier, and either `identifier` itself (`current`), or
+    /// stamped before `cutoff`, or unstamped (from before stamps). Pure.
+    public static func isRemovableTestIdentifier(_ identifier: String, current: String?, cutoff: Date) -> Bool {
+        guard identifier.hasPrefix(testIdentifierPrefix) else { return false }
+        if identifier == current { return true }
+        let rest = identifier.dropFirst(testIdentifierPrefix.count)
+        guard let dot = rest.firstIndex(of: "."), let stamp = Int(rest[..<dot]) else { return true }
+        return Date(timeIntervalSince1970: TimeInterval(stamp)) < cutoff
+    }
+
+    /// The identifier inside a Valet item's `kSecAttrService`
+    /// (`VAL_…_initWithIdentifier:accessibility:_<identifier>_<accessibility>`),
+    /// when it is a test identifier.
+    public static func testIdentifier(inService service: String) -> String? {
+        guard let start = service.range(of: "_" + testIdentifierPrefix) else { return nil }
+        let tail = service[service.index(after: start.lowerBound)...]
+        guard let end = tail.firstIndex(of: "_") else { return nil }
+        return String(tail[..<end])
+    }
+
+    /// Delete this app's data-source Keychain items made by test hosts:
+    /// `current` (this launch's, at its end) and any older than `cutoff`
+    /// or unstamped (orphans of launches that never cleaned up). Never an
+    /// item under the real identifier. Returns how many went.
+    @discardableResult
+    public static func removeTestItems(current: String?, cutoff: Date) -> Int {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecUseDataProtectionKeychain as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecReturnAttributes as String: true,
+        ]
+        var found: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &found) == errSecSuccess, let items = found as? [[String: Any]] else { return 0 }
+        var services = Set<String>()
+        for item in items {
+            guard let service = item[kSecAttrService as String] as? String,
+                  let id = testIdentifier(inService: service),
+                  isRemovableTestIdentifier(id, current: current, cutoff: cutoff) else { continue }
+            services.insert(service)
+        }
+        var removed = 0
+        for service in services {
+            let q: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecUseDataProtectionKeychain as String: true,
+                kSecAttrService as String: service,
+            ]
+            if SecItemDelete(q as CFDictionary) == errSecSuccess { removed += 1 }
+        }
+        return removed
     }
 }
 

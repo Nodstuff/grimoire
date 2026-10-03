@@ -58,9 +58,23 @@ enum AppPaths {
 
     /// The Keychain identifier for data-source passwords: a throwaway one
     /// per test-host launch, so tests never touch the real app's items.
-    static let dataSourceKeychainIdentifier: String = isTestHost
-        ? "ie.null.taisce.tests.datasource.\(UUID().uuidString.prefix(8))"
-        : KeychainDataSourceSecrets.defaultIdentifier
+    /// A test host clears up after itself (`sweepTestKeychain`).
+    static let dataSourceKeychainIdentifier: String = {
+        guard isTestHost else { return KeychainDataSourceSecrets.defaultIdentifier }
+        sweepTestKeychain(current: nil)
+        // and this launch's own items when it ends
+        atexit { AppPaths.sweepTestKeychain(current: AppPaths.dataSourceKeychainIdentifier) }
+        return KeychainDataSourceSecrets.testIdentifier()
+    }()
+
+    /// Test hosts' data-source Keychain items: `current`'s, and orphans of
+    /// earlier launches (unstamped, or over half an hour old: a run still
+    /// going in another test host is younger). Never the real identifier's.
+    @discardableResult
+    static func sweepTestKeychain(current: String?) -> Int {
+        guard isTestHost else { return 0 }
+        return KeychainDataSourceSecrets.removeTestItems(current: current, cutoff: .now.addingTimeInterval(-1800))
+    }
 
     /// Rendered diagrams (regenerated on demand).
     static var diagramCache: URL {

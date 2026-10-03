@@ -254,6 +254,24 @@ import Testing
         #expect(loaded.tlsMode == .verifyFull)
     }
 
+    /// Test hosts' Keychain identifiers: stamped, recognised in a Valet
+    /// service name, and only test ones (never the real one) removable.
+    @Test func testIdentifiersAndWhichMayGo() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let id = KeychainDataSourceSecrets.testIdentifier(now: now)
+        #expect(id.hasPrefix("ie.null.taisce.tests.datasource.1800000000."))
+        let cutoff = now.addingTimeInterval(-1800)
+        typealias K = KeychainDataSourceSecrets
+        #expect(!K.isRemovableTestIdentifier(id, current: nil, cutoff: cutoff), "a run still going")
+        #expect(K.isRemovableTestIdentifier(id, current: id, cutoff: cutoff), "this launch's, at its end")
+        #expect(K.isRemovableTestIdentifier(K.testIdentifier(now: now.addingTimeInterval(-3600)), current: nil, cutoff: cutoff), "an orphan")
+        #expect(K.isRemovableTestIdentifier("ie.null.taisce.tests.datasource.1a2b3c4d", current: nil, cutoff: cutoff), "unstamped: from before stamps")
+        #expect(!K.isRemovableTestIdentifier(K.defaultIdentifier, current: K.defaultIdentifier, cutoff: .distantFuture), "never the real one")
+        let service = "VAL_VALValet_initWithIdentifier:accessibility:_\(id)_AccessibleAfterFirstUnlockThisDeviceOnly"
+        #expect(K.testIdentifier(inService: service) == id)
+        #expect(K.testIdentifier(inService: "VAL_VALValet_initWithIdentifier:accessibility:_ie.null.taisce.datasource_AccessibleAfterFirstUnlockThisDeviceOnly") == nil)
+    }
+
     @Test func memorySecrets() throws {
         let s = MemoryDataSourceSecrets()
         try s.setPassword("pw", for: "1")
