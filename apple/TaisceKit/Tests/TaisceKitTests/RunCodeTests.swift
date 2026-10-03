@@ -414,6 +414,39 @@ import Testing
         #expect(RunTrust.onlyLinksDiffer("a [[X|y]] b", "a [[Z]] b") && !RunTrust.onlyLinksDiffer("a [[X]] b", "a [[X]] c"))
     }
 
+    /// "Save db=<name> to doc" changes only the fence's info string: the
+    /// agent who wrote the query is still its author (it asks, and "written
+    /// by" names them); a change to the query itself is yours.
+    @Test func savingDbIntoTheFenceKeepsTheAuthor() {
+        let agent = DocHistoryEntry(opID: "o5", principalName: "claude:x", principalKind: "agent", principalID: "p-claude", epoch: 5, targetBlock: "b1", opType: "insert", content: "Count:\n```sql\nSELECT 1\n```")
+        let saved = DocHistoryEntry(opID: "o6", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 6, targetBlock: "b1", opType: "replace", content: "Count:\n```sql db=warehouse\nSELECT 1\n```")
+        #expect(RunTrust.author(of: "b1", history: [saved, agent], me: me) == .other("claude:x"))
+        #expect(RunTrust.writtenBy("b1", history: [saved, agent], me: me) == "claude:x")
+        #expect(RunTrust.decide(block: "b1", history: [saved, agent], me: me, practiceEditedByMe: false, approval: nil, docEpoch: 6) == .ask(lastEditedBy: "claude:x"))
+        // twice over (another db=), still the agent
+        var again = saved
+        again.opID = "o7"; again.epoch = 7
+        again.content = "Count:\n```sql db=other\nSELECT 1\n```"
+        #expect(RunTrust.author(of: "b1", history: [again, saved, agent], me: me) == .other("claude:x"))
+        // the query changed too: yours
+        var edited = saved
+        edited.content = "Count:\n```sql db=warehouse\nSELECT 2\n```"
+        #expect(RunTrust.author(of: "b1", history: [edited, agent], me: me) == .me)
+        // text outside the fence changed: yours
+        edited.content = "Total:\n```sql db=warehouse\nSELECT 1\n```"
+        #expect(RunTrust.author(of: "b1", history: [edited, agent], me: me) == .me)
+        // the agent's own fence edit is still the agent's
+        let theirs = DocHistoryEntry(opID: "o8", principalName: "claude:x", principalKind: "agent", principalID: "p-claude", epoch: 8, targetBlock: "b1", opType: "replace", content: "Count:\n```sql db=x\nSELECT 1\n```")
+        #expect(RunTrust.author(of: "b1", history: [theirs, saved], me: me) == .other("claude:x"))
+        // your write over your own: yours
+        let mine = DocHistoryEntry(opID: "o4", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 4, targetBlock: "b1", opType: "insert", content: "Count:\n```sql\nSELECT 1\n```")
+        #expect(RunTrust.author(of: "b1", history: [saved, mine], me: me) == .me)
+        #expect(RunTrust.onlyFenceInfoDiffers("```sql\nx\n```", "```sql db=a\nx\n```"))
+        #expect(RunTrust.onlyFenceInfoDiffers("~~~~ sql\nx\n~~~~", "~~~~\nx\n~~~~"))
+        #expect(!RunTrust.onlyFenceInfoDiffers("```sql\nx\n```", "```sql\ny\n```"))
+        #expect(!RunTrust.onlyFenceInfoDiffers("```sql\nx\n```", "````sql\nx\n````"))
+    }
+
     // option A: your own agents in a workspace only you can see are you
 
     func agentOp(_ yours: Bool?, epoch: Int = 7, refs: [String] = [], name: String = "claude:x") -> DocHistoryEntry {

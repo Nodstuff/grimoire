@@ -85,6 +85,11 @@ public enum RunTrust {
     ///   `[[…]]` links: the write before it says who wrote the rest (unknown
     ///   if that write isn't in the history). One that changed anything else
     ///   is an ordinary write of yours.
+    /// - a write that changed nothing but code fences' info strings (Save
+    ///   db=<name> to doc, or an edited language or `cwd=`) keeps the
+    ///   author of the write before it, so naming a data source doesn't
+    ///   make an agent's query yours. (If that write isn't in the history,
+    ///   it counts as yours, as an untagged write can't be told apart.)
     /// The same tags on anyone else's op mean nothing: it is their write.
     /// And a write of yours whose content an earlier op by someone else
     /// wrote word for word (a whole-doc save re-inserting an agent's block
@@ -135,6 +140,10 @@ public enum RunTrust {
                     let prev = history[writes[pos + 1]]
                     if let c = row.content, let p = prev.content, onlyLinksDiffer(c, p) { continue }
                 }
+                if pos + 1 < writes.count, let c = row.content, let p = history[writes[pos + 1]].content,
+                   c != p, onlyFenceInfoDiffers(c, p) {
+                    continue
+                }
             }
             guard me.matches(row) else { return .other(row) }
             if let content = row.content,
@@ -150,6 +159,15 @@ public enum RunTrust {
     static func onlyLinksDiffer(_ a: String, _ b: String) -> Bool {
         func blank(_ s: String) -> String {
             s.replacingOccurrences(of: #"\[\[[^\]\n]*\]\]"#, with: "[[]]", options: .regularExpression)
+        }
+        return blank(a) == blank(b)
+    }
+
+    /// `a` and `b` are the same text apart from code fences' info strings
+    /// (what follows the opening ``` or ~~~).
+    static func onlyFenceInfoDiffers(_ a: String, _ b: String) -> Bool {
+        func blank(_ s: String) -> String {
+            s.replacingOccurrences(of: #"(?m)^( {0,3})(`{3,}|~{3,})[^\n]*$"#, with: "$1$2", options: .regularExpression)
         }
         return blank(a) == blank(b)
     }
