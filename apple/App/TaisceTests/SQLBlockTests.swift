@@ -275,6 +275,38 @@ import TaisceKit
         try AppModelTests().render(NavigationStack { DataSourceEditor(original: src, isNew: false) }.environment(m))
         try await m.cache?.deleteDoc(doc)
     }
+
+    /// The SQL card's "written by …" reads the go/shell card's cached ledger
+    /// (CodeRunStore), never a fetch per render; nothing for your own writes.
+    @Test func sqlWrittenByComesFromTheCachedLedger() async throws {
+        let (m, doc, block) = try await modelWithSQLDoc("```sql\nSELECT 1\n```")
+        let ctx = CodeRunContext(doc: doc, block: block, canSave: true)
+        let me = RunTrust.Me(principalID: "p-tom", name: "Tom", privateWorkspace: true)
+        let card = { RunnableCodeBlock(language: "sql", code: "SELECT 1", attributes: ["db": "x"]).environment(m).environment(\.codeRunContext, ctx) }
+        #expect(m.codeRuns.writtenBy(ctx) == nil, "nothing cached yet")
+        // an unreachable server: nothing cached, nothing shown
+        m.codeRuns.trustCheckLimit = .milliseconds(300)
+        await m.codeRuns.loadAuthors(ctx)
+        #expect(m.codeRuns.histories[doc] == nil)
+        try AppModelTests().render(card())
+        let agents = DocHistoryEntry(opID: "o2", principalName: "claude:grimoire-sql", principalKind: "agent", principalID: "p-agent", epoch: 2, targetBlock: block, opType: "insert", content: "```sql\nSELECT 1\n```", principalIsYours: true)
+        m.codeRuns.remember(doc, epoch: 2, history: [agents], me: me)
+        #expect(m.codeRuns.writtenBy(ctx) == "claude:grimoire-sql")
+        // cached at the doc's epoch: no refetch
+        await m.codeRuns.loadAuthors(ctx)
+        #expect(m.codeRuns.histories[doc]?.history.count == 1)
+        try AppModelTests().render(card())
+        // while trying an edit the label gives way to Revert / Save
+        let e = m.codeRuns.state(ctx)
+        m.codeRuns.beginPractice(e, docCode: "SELECT 1")
+        try AppModelTests().render(card())
+        m.codeRuns.revert(e)
+        let mine = DocHistoryEntry(opID: "o3", principalName: "Tom", principalKind: "human", principalID: "p-tom", epoch: 3, targetBlock: block, opType: "replace", content: "```sql\nSELECT 2\n```")
+        m.codeRuns.remember(doc, epoch: 3, history: [mine, agents], me: me)
+        #expect(m.codeRuns.writtenBy(ctx) == nil)
+        m.codeRuns.reset()
+        try await m.cache?.deleteDoc(doc)
+    }
     #else
     @Test func theIPhoneShowsAPlainCodeCard() async throws {
         let (m, doc, block) = try await modelWithSQLDoc("```sql\nSELECT 1\n```")

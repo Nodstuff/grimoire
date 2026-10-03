@@ -46,6 +46,8 @@ struct SQLCodeCard: View {
             NavigationStack { DataSourceEditor(original: draft, isNew: true) }
         }
         .onChange(of: code) { _, new in e.followDoc(new) }
+        // who wrote it: the same cached ledger as the go/shell card
+        .task(id: code) { await edits.loadAuthors(context) }
         .accessibilityElement(children: .contain)
     }
 
@@ -63,6 +65,15 @@ struct SQLCodeCard: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
+            if e.practice == nil, let who = edits.writtenBy(context) {
+                Text("written by \(who)")
+                    .docFont(.caption2)
+                    .foregroundStyle(Theme.secondary.opacity(0.8))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help("The last change to this query was by \(who)")
+                    .accessibilityIdentifier("sql.writtenBy")
+            }
             if e.practice != nil {
                 Button("Revert") { edits.revert(e) }
                     .disabled(e.isSaving)
