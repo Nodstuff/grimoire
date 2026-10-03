@@ -549,10 +549,16 @@ and duration, "compiled ✓" for a Go block that only compiles.
   source id). Never synced, never sent to the server. No `db=`: Run is a
   menu of the sources, and after a run "Save db=<name> to doc" writes it
   into the fence through the outbox. An unknown name says so, with Add….
-  Read-only is the database's: SQLite opens the file `SQLITE_OPEN_READONLY`,
-  Postgres sessions start with `default_transaction_read_only=on` (a
-  statement can turn it back off: use a SELECT-only role for a hard
-  boundary), ClickHouse gets `readonly=2` (writes refused, `readonly`
+  Read-only is the database's: SQLite opens the file `SQLITE_OPEN_READONLY`
+  (and every SQLite connection, writable or not, allows no `ATTACH`, so no
+  `VACUUM INTO` either, and runs in defensive mode), a read-only Postgres
+  run is one `BEGIN TRANSACTION READ ONLY`, always rolled back, checked
+  after every statement to be the same transaction (`now()`) and still
+  read-only, else rolled back and stopped (so `COMMIT; BEGIN READ WRITE`,
+  `SET default_transaction_read_only=off` or a `DO` block's `COMMIT` write
+  nothing). Use a SELECT-only role for a hard boundary all the same: a
+  read-only transaction doesn't stop `COPY … TO PROGRAM`, which needs a
+  role without superuser or `pg_execute_server_program`. ClickHouse gets `readonly=2` (writes refused, `readonly`
   can't be changed; 2 rather than 1 so a query's own `SETTINGS` work).
   Statements run in order and stop at the first error; the last one's
   rows show as a table (types where known, NULL dimmed, 1000 rows kept,

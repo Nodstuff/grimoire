@@ -5,10 +5,15 @@ import Synchronization
 import TaisceKit
 
 /// Postgres through PostgresNIO, one connection per run. Without Allow
-/// writes the session starts with `default_transaction_read_only=on`, so
-/// the server refuses writes in every transaction. (A statement that sets
-/// it back off gets round that: it guards against mistakes; a role with
-/// only SELECT is the real boundary.)
+/// writes the whole run is one `BEGIN TRANSACTION READ ONLY` (the session
+/// also starts with `default_transaction_read_only=on`), always rolled
+/// back. A statement can't make it read-write once it has begun, but one
+/// could end it (`COMMIT`, `ROLLBACK`) and the next could start another:
+/// so after every statement the driver checks that it is still the same
+/// transaction (`now()` unchanged) and still read-only, and otherwise rolls
+/// back and stops the run. A role with only SELECT is still the real
+/// boundary (`COPY … TO PROGRAM` needs superuser or
+/// pg_execute_server_program; a read-only transaction doesn't stop it).
 ///
 /// Statements run one by one on the same connection (the extended protocol
 /// takes one statement per query). Stop closes the connection and asks
@@ -91,12 +96,24 @@ public struct PostgresDriver: SQLDriver {
                 backend.withLock { $0 = pid }
             }
             var results: [SQLStatementResult] = []
+            var guardrail: ReadOnlyGuard?
+            if !me.allowWrites {
+                guardrail = try await ReadOnlyGuard.begin(conn)
+            }
             for statement in SQLStatements.split(sql, dialect: .postgres) {
                 try Task.checkCancellation()
                 let outcome = try await Self.runOne(conn, statement, cap: cap)
+                if case .failed = outcome {
+                    results.append(SQLStatementResult(sql: statement, outcome: outcome))
+                    break
+                }
+                if let guardrail, let escaped = await guardrail.check(conn) {
+                    results.append(SQLStatementResult(sql: statement, outcome: .failed(escaped)))
+                    break
+                }
                 results.append(SQLStatementResult(sql: statement, outcome: outcome))
-                if case .failed = outcome { break }
             }
+            if guardrail != nil { _ = try? await Self.one(conn, "ROLLBACK") }
             return results
         } onCancel: {
             let pid = backend.withLock { $0 }
@@ -105,6 +122,44 @@ public struct PostgresDriver: SQLDriver {
                 try? await conn.close()
             }
         }
+    }
+
+    /// The read-only run's transaction: begun by the driver, and checked
+    /// after each statement to be the same one, still read-only.
+    struct ReadOnlyGuard {
+        /// `now()`: the transaction's start, fixed for its life
+        let started: String
+
+        static func begin(_ conn: PostgresConnection) async throws -> ReadOnlyGuard {
+            do {
+                _ = try await one(conn, "BEGIN TRANSACTION READ ONLY")
+                guard let started = try await one(conn, "SELECT now()::text") else { throw SQLDriverError("Postgres didn't say when the transaction began") }
+                return ReadOnlyGuard(started: started)
+            } catch let e as SQLDriverError {
+                throw e
+            } catch {
+                if Task.isCancelled { throw CancellationError() }
+                throw SQLDriverError("Couldn't start a read-only transaction: \(describe(error, connecting: nil))")
+            }
+        }
+
+        /// nil: still the driver's read-only transaction; else why the run
+        /// stops (the transaction is then rolled back).
+        func check(_ conn: PostgresConnection) async -> String? {
+            let r = try? await conn.query(PostgresQuery(unsafeSQL: "SELECT now()::text, current_setting('transaction_read_only')"), logger: logger).get()
+            let cells = r?.rows.first.map { row in row.map(PostgresText.format) }
+            guard let cells, cells.count == 2 else {
+                _ = try? await one(conn, "ROLLBACK")
+                return Self.escaped
+            }
+            if cells[0] != started || cells[1] != "on" {
+                _ = try? await one(conn, "ROLLBACK")
+                return Self.escaped
+            }
+            return nil
+        }
+
+        static let escaped = "Stopped: this statement ended or changed the read-only transaction the block runs in, so the run was rolled back. Allow writes on the data source to run it."
     }
 
     /// A second connection asks the server to stop the first's query.

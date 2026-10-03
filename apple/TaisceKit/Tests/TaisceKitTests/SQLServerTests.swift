@@ -137,6 +137,39 @@ enum SQLServers {
         #expect(none.last?.outcome == .rows(SQLResultSet(columns: [])))
     }
 
+    /// Statements that would end or reopen the read-only transaction are
+    /// refused (by the server or the driver's check) and write nothing.
+    @Test func readOnlyCantBeUndone() async throws {
+        let table = "taisce_e_\(UUID().uuidString.prefix(8).lowercased())"
+        let rw = SQLServers.postgres(writes: true)
+        _ = try await rw.run("CREATE TABLE \(table) (n int)", cap: 1)
+        defer { Task { _ = try? await rw.run("DROP TABLE \(table)", cap: 1) } }
+        let ro = SQLServers.postgres(writes: false)
+        let escapes = [
+            "BEGIN READ WRITE; INSERT INTO \(table) VALUES (1)",
+            "SET default_transaction_read_only = off; INSERT INTO \(table) VALUES (2)",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE; INSERT INTO \(table) VALUES (3)",
+            "SET TRANSACTION READ WRITE; INSERT INTO \(table) VALUES (4)",
+            "DO $$ BEGIN COMMIT; INSERT INTO \(table) VALUES (5); COMMIT; END $$",
+            "COMMIT; BEGIN READ WRITE; INSERT INTO \(table) VALUES (6); COMMIT",
+            "ROLLBACK; SET default_transaction_read_only = off; INSERT INTO \(table) VALUES (7)",
+            "COMMIT AND CHAIN; INSERT INTO \(table) VALUES (8)",
+            "SET default_transaction_read_only = off; COMMIT; INSERT INTO \(table) VALUES (9)",
+        ]
+        for sql in escapes {
+            let r = try await ro.run(sql, cap: 1)
+            #expect(r.last?.error != nil, "\(sql)")
+            #expect(!r.contains { $0.sql.hasPrefix("INSERT") && $0.error == nil }, "\(sql)")
+        }
+        let caught = try await ro.run("COMMIT; INSERT INTO \(table) VALUES (10)", cap: 1)
+        #expect(caught.count == 1 && caught[0].error?.contains("read-only transaction the block runs in") == true)
+        let n = try await rw.run("SELECT count(*) FROM \(table)", cap: 1)
+        #expect(n.last?.outcome == .rows(SQLResultSet(columns: [SQLColumn("count", type: "bigint")], rows: [["0"]])))
+        // and an ordinary read-only run still works, temp state and all
+        let ok = try await ro.run("SET search_path = public; SELECT count(*) FROM \(table)", cap: 1)
+        #expect(ok.allSatisfy { $0.error == nil } && ok.count == 2)
+    }
+
     @Test func multiStatementCapAndErrors() async throws {
         let ro = SQLServers.postgres(writes: false)
         let r = try await ro.run("SELECT 1 AS a; SELECT g FROM generate_series(1, 1500) g", cap: 1000)
