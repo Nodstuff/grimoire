@@ -19,7 +19,9 @@ struct RunnableCodeBlock: View {
 
     var body: some View {
         #if targetEnvironment(macCatalyst)
-        if let runnable = RunnableLanguage(language), let context {
+        if let sql = SQLFence(language), let context {
+            SQLCodeCard(language: language ?? "sql", fence: sql, code: code, attributes: attributes, context: context)
+        } else if let runnable = RunnableLanguage(language), let context {
             RunnableCodeCard(language: language ?? "", runnable: runnable, code: code, attributes: attributes, context: context)
         } else {
             CodeBlockView(label: language, code: code)

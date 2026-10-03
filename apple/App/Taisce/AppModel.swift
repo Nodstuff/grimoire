@@ -112,6 +112,10 @@ final class AppModel {
     let renderCache = RenderCache()
     /// runnable code blocks (Mac): this session's runs, try lines, practice text
     let codeRuns = CodeRunStore()
+    /// SQL blocks (Mac): this session's runs
+    let sqlRuns = SQLRunStore()
+    /// this Mac's SQL data sources (kept across sign-outs: they're the Mac's)
+    let dataSources = DataSourceStore()
 
     /// The Mac's move out of the sandbox didn't finish this launch (the
     /// container couldn't be read, or a copy failed): the app opens no
@@ -129,6 +133,7 @@ final class AppModel {
         let stored = UserDefaults.standard.string(forKey: Self.serverURLKey).flatMap { ServerConfig.normalizedURL($0)?.absoluteString }
         serverURL = stored.flatMap { ServerURLPolicy.accepts($0) ? $0 : nil } ?? Self.defaultServerURL
         codeRuns.app = self
+        sqlRuns.app = self
     }
 
     var needsSignIn: Bool { authPhase == .signedOut }
@@ -287,6 +292,7 @@ final class AppModel {
         workspacesSupported = false
         editMeta = [:]
         codeRuns.reset()
+        sqlRuns.reset()
         settledTodos = []
         pendingEditDoc = nil
         pendingWrites = 0
@@ -406,6 +412,7 @@ final class AppModel {
         todoObserveTask?.cancel()
         observedTodoDoc = nil
         codeRuns.reset()
+        sqlRuns.reset()
         hasSynced = false
         ownerChecked = false
         ownerSettled = false

@@ -28,6 +28,11 @@ targets:
         buildPhase: resources
     dependencies:
       - package: TaisceKit
+        product: TaisceKit
+      # SQL blocks' Postgres driver (PostgresNIO, SwiftNIO, NIOSSL): the Mac only
+      - package: TaisceKit
+        product: TaisceSQLPostgres
+        platformFilter: maccatalyst
     settings:
       base:
         # overridable for UI test runs on the Mac, which must not run as the

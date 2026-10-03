@@ -51,6 +51,17 @@ enum AppPaths {
         return dir
     }
 
+    /// This Mac's SQL data sources (passwords are in the Keychain).
+    static var dataSourcesFile: URL? {
+        try? supportDirectory().appending(path: "datasources.json")
+    }
+
+    /// The Keychain identifier for data-source passwords: a throwaway one
+    /// per test-host launch, so tests never touch the real app's items.
+    static let dataSourceKeychainIdentifier: String = isTestHost
+        ? "ie.null.taisce.tests.datasource.\(UUID().uuidString.prefix(8))"
+        : KeychainDataSourceSecrets.defaultIdentifier
+
     /// Rendered diagrams (regenerated on demand).
     static var diagramCache: URL {
         if isTestHost { return FileManager.default.temporaryDirectory.appending(path: "taisce-test-host/diagrams", directoryHint: .isDirectory) }

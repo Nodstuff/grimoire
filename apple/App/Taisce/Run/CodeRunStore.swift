@@ -200,13 +200,13 @@ final class CodeRunStore {
 
     // MARK: trust
 
-    private var approvals: RunApprovals? {
+    var approvals: RunApprovals? {
         app.map { RunApprovals(server: $0.serverURL) }
     }
 
     /// Who wrote it, bounded by `trustCheckLimit`: a slow or failing check
     /// counts as unknown (so it asks), and the prompt says why.
-    private func trust(_ c: CodeRunContext, practiceEdited: Bool) async -> (RunTrust.Decision, RunTrust.Approval) {
+    func trust(_ c: CodeRunContext, practiceEdited: Bool) async -> (RunTrust.Decision, RunTrust.Approval) {
         let docEpoch = (try? await app?.cache?.doc(c.doc))?.currentEpoch ?? 0
         var history: [DocHistoryEntry]?
         var why: String?

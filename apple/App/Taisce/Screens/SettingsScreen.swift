@@ -144,6 +144,18 @@ struct SettingsContent: View {
             }
             .listRowBackground(Theme.surface)
 
+            #if targetEnvironment(macCatalyst)
+            Section {
+                NavigationLink("Data sources") { DataSourcesScreen() }
+                    .accessibilityIdentifier("settings.dataSources")
+            } header: {
+                Text("SQL blocks")
+            } footer: {
+                Text("Databases ```sql db=<name>``` blocks run on, on this Mac only.")
+            }
+            .listRowBackground(Theme.surface)
+            #endif
+
             Section {
                 let prompt = DueAlertPrompt(info.alerts)
                 switch prompt {
