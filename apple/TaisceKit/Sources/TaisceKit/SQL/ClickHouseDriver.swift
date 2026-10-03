@@ -35,13 +35,22 @@ public struct ClickHouseDriver: SQLDriver {
         self.init(url: u, database: source.database, user: source.user, password: password, allowWrites: source.allowWrites, session: session)
     }
 
+    /// Never follows a redirect: the password header (`X-ClickHouse-Key`)
+    /// would go along to wherever it points. A 3xx is then the answer, and
+    /// the run says so.
     public static let defaultSession: URLSession = {
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = 310
         c.urlCache = nil
         c.httpCookieStorage = nil
-        return URLSession(configuration: c)
+        return URLSession(configuration: c, delegate: NoRedirects(), delegateQueue: nil)
     }()
+
+    final class NoRedirects: NSObject, URLSessionTaskDelegate, Sendable {
+        func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest) async -> URLRequest? {
+            nil
+        }
+    }
 
     // MARK: requests (pure)
 
@@ -100,6 +109,10 @@ public struct ClickHouseDriver: SQLDriver {
                     if body.count > 64 * 1024 { break }
                 }
                 let text = String(decoding: body, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                if (300..<400).contains(http.statusCode) {
+                    let to = http.value(forHTTPHeaderField: "Location").map { " to \($0)" } ?? ""
+                    throw SQLDriverError("ClickHouse answered with a redirect (HTTP \(http.statusCode))\(to); not followed, so the password stays put. Use the URL it points to.")
+                }
                 if http.statusCode == 401 || http.statusCode == 403 || text.contains("(AUTHENTICATION_FAILED)") || text.contains("(REQUIRED_PASSWORD)") {
                     throw SQLDriverError(text.isEmpty ? "ClickHouse refused the user or password (HTTP \(http.statusCode))" : text)
                 }

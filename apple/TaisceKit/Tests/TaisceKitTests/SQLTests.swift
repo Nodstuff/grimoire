@@ -411,6 +411,21 @@ import Testing
         #expect(w.value(forHTTPHeaderField: "X-ClickHouse-Key") == nil)
     }
 
+    /// A redirect is never followed: the password header would go along.
+    @Test func redirectsAreNotFollowed() async throws {
+        let server = try await TinyHTTPServer { r in
+            r.path.hasPrefix("/elsewhere")
+                ? "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                : "HTTP/1.1 307 Temporary Redirect\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        }
+        let d = ClickHouseDriver(url: server.url, database: "", user: "me", password: "s3cret", allowWrites: false)
+        let outcome = await SQLRunner.run(d, sql: "SELECT 1", timeout: .seconds(10))
+        #expect(outcome.message?.contains("redirect (HTTP 307) to /elsewhere") == true, "\(outcome)")
+        #expect(server.requests.map(\.path).allSatisfy { !$0.hasPrefix("/elsewhere") })
+        #expect(server.requests.count == 1)
+        #expect(server.requests.first?.headers["x-clickhouse-key"] == "s3cret")
+    }
+
     @Test func killQuery() throws {
         let k = driver.killRequest(queryID: "a'b")
         #expect(k.httpBody == Data("KILL QUERY WHERE query_id = 'a\\'b' ASYNC".utf8))
