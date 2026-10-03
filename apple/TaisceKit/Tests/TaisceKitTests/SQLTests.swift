@@ -118,6 +118,24 @@ import Testing
         #expect(exact.result([]).rowCountText == "2 rows")
     }
 
+    @Test func hugeCellsAreCut() {
+        let small = String(repeating: "a", count: 100)
+        #expect(SQLCell.clip(small) == small)
+        let big = String(repeating: "é", count: 40_000) // 80,000 bytes
+        let cut = SQLCell.clip(big)
+        #expect(cut.hasSuffix("[cut at 64 KB of 80,000 bytes]"))
+        let kept = cut.prefix { $0 == "é" }
+        #expect(kept.utf8.count == SQLCell.limit, "whole characters only")
+        // already cut by a driver: left alone
+        #expect(SQLCell.clip(cut) == cut)
+        // a collector cuts every cell
+        var c = SQLRowCollector(cap: 2)
+        c.add([big, nil, "x"])
+        #expect(c.rows[0][0] == cut && c.rows[0][1] == nil && c.rows[0][2] == "x")
+        // NUL bytes count and stay
+        #expect(SQLCell.text([0x61, 0x00, 0x62], total: 3) == "a\u{0}b")
+    }
+
     @Test func tsvAndMarkdown() {
         let r = SQLResultSet(columns: [SQLColumn("a", type: "TEXT"), SQLColumn("b|c")], rows: [["x\ty", nil], ["1|2", "line\nbreak"]], isCapped: true)
         #expect(r.tsv == "a\tb|c\nx y\t\n1|2\tline break\n")
@@ -316,6 +334,21 @@ import Testing
         }
         let still = try await SQLiteDriver(path: path, allowWrites: false).run("SELECT count(*) FROM t", cap: 1)
         #expect(still.last?.outcome == .rows(SQLResultSet(columns: [SQLColumn("count(*)")], rows: [["3"]])))
+    }
+
+    /// Text is read by its length (a NUL inside doesn't end it), and a huge
+    /// value is cut at 64 KB without being copied whole.
+    @Test func textByLengthAndHugeValuesCut() async throws {
+        let path = try await Self.makeDB()
+        defer { Self.cleanup(path) }
+        let ro = SQLiteDriver(path: path, allowWrites: false)
+        let r = try await ro.run("SELECT 'a' || char(0) || 'b' AS nul, printf('%.*c', 200000, 'x') AS big", cap: 1)
+        guard case .rows(let set) = r.last?.outcome else { Issue.record("\(r)"); return }
+        #expect(set.rows[0][0] == "a\u{0}b")
+        let big = try #require(set.rows[0][1])
+        #expect(big.hasPrefix(String(repeating: "x", count: 100)))
+        #expect(big.hasSuffix("[cut at 64 KB of 200,000 bytes]"))
+        #expect(big.utf8.count < SQLCell.limit + 100)
     }
 
     @Test func allowWritesPermitsThem() async throws {

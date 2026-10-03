@@ -573,7 +573,9 @@ and duration, "compiled ✓" for a Go block that only compiles.
   `result_overflow_mode=break` and the response is dropped, a read-only
   Postgres run cancels the statement (rolled back to a savepoint so the
   run goes on), and with Allow writes Postgres discards the rest unread so
-  a capped `INSERT … RETURNING` still finishes), Copy as TSV / Markdown. Same 5 min limit; Stop
+  a capped `INSERT … RETURNING` still finishes); a cell over 64 KB is cut
+  with a marker (`SQLCell`; SQLite text is read by its length, so a NUL
+  inside doesn't end it), Copy as TSV / Markdown. Same 5 min limit; Stop
   cancels (SQLite `sqlite3_interrupt`, Postgres `pg_cancel_backend` from a
   second connection, ClickHouse `KILL QUERY` by `query_id`). Trust is the
   RunTrust rule above, and a source with Allow writes asks before every

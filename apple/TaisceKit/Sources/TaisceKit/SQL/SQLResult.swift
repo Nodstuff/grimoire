@@ -77,7 +77,7 @@ public struct SQLRowCollector: Sendable {
 
     /// The row is only built while there is room for it.
     public mutating func add(_ row: @autoclosure () -> [String?]) {
-        if rows.count < cap { rows.append(row()) } else { isDone = true }
+        if rows.count < cap { rows.append(row().map { $0.map(SQLCell.clip) }) } else { isDone = true }
     }
 
     public func result(_ columns: [SQLColumn]) -> SQLResultSet {
@@ -140,4 +140,43 @@ public struct SQLRunOutcome: Sendable, Hashable {
     }
 
     public var succeeded: Bool { message == nil && !timedOut && !stopped && failure == nil }
+}
+
+/// One cell's display text, at most `limit` bytes of UTF-8 (a huge JSON or
+/// text value would otherwise sit whole in memory and in the table). Pure.
+public enum SQLCell {
+    public static let limit = 64 * 1024
+
+    /// `s`, or its first `limit` bytes (whole characters) and a marker. A
+    /// value a driver already cut (`text`: the limit plus its marker) is
+    /// left as it is.
+    public static func clip(_ s: String) -> String {
+        let total = s.utf8.count
+        guard total > limit + slack else { return s }
+        return text(Array(s.utf8.prefix(limit + 4)), total: total)
+    }
+
+    /// UTF-8 `bytes` (the start of a value `total` bytes long) as text, cut
+    /// at `limit` on a character boundary, with the marker when cut. NUL
+    /// bytes are kept.
+    public static func text<C: Collection<UInt8>>(_ bytes: C, total: Int) -> String {
+        guard total > limit else { return String(decoding: bytes, as: UTF8.self) }
+        var head = Array(bytes.prefix(limit))
+        // don't split a character: drop a trailing partial sequence
+        var k = head.count
+        while k > 0, head[k - 1] & 0xC0 == 0x80 { k -= 1 }
+        if k > 0, head[k - 1] & 0x80 != 0 {
+            let lead = head[k - 1]
+            let need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1
+            if head.count - (k - 1) < need { head.removeSubrange((k - 1)...) }
+        }
+        return String(decoding: head, as: UTF8.self) + marker(total)
+    }
+
+    /// room for the marker
+    static let slack = 64
+
+    static func marker(_ total: Int) -> String {
+        "\u{2026} [cut at 64 KB of \(total.formatted()) bytes]"
+    }
 }

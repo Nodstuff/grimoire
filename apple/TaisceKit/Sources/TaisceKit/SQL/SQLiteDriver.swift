@@ -183,8 +183,11 @@ final class SQLiteConnection: Sendable {
                 let hex = shown.map { String(format: "%02x", $0) }.joined()
                 return len > 32 ? "x'\(hex)…' (\(len) bytes)" : "x'\(hex)'"
             default:
+                // by length, not to the first NUL; only the shown part copied
                 guard let t = sqlite3_column_text(stmt, c) else { return "" }
-                return String(cString: t)
+                let len = Int(sqlite3_column_bytes(stmt, c))
+                let shown = UnsafeRawBufferPointer(start: t, count: min(len, SQLCell.limit + 4))
+                return SQLCell.text(shown, total: len)
             }
         }
     }
