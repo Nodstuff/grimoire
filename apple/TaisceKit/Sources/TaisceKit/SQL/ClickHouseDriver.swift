@@ -6,7 +6,9 @@ import Foundation
 /// from the query. 1, not 2: `readonly=2` still runs table functions
 /// (`url()`, `s3()`, `remote()`, `file()`, …), which reach other servers
 /// and files with the server's own access; the cost is that a query's own
-/// `SETTINGS …` clause is refused too. Results as `JSONCompactEachRowWithNamesAndTypes`. Stop cancels the
+/// `SETTINGS …` clause is refused too. Statements of one run share a
+/// `session_id`, so `SET` and temporary tables carry from one to the next
+/// (with Allow writes; read-only refuses both). Results as `JSONCompactEachRowWithNamesAndTypes`. Stop cancels the
 /// request and sends `KILL QUERY` for its `query_id`, best effort.
 public struct ClickHouseDriver: SQLDriver {
     public static let format = "JSONCompactEachRowWithNamesAndTypes"
@@ -56,12 +58,13 @@ public struct ClickHouseDriver: SQLDriver {
 
     /// The POST for one statement. Settings go in the URL; credentials in
     /// headers, never the URL.
-    public func request(_ statement: String, queryID: String, readOnly: Bool? = nil) -> URLRequest {
+    public func request(_ statement: String, queryID: String, session: String? = nil, readOnly: Bool? = nil) -> URLRequest {
         var c = URLComponents(url: url, resolvingAgainstBaseURL: false) ?? URLComponents()
         var items = c.queryItems ?? []
         // readonly first: settings after it are still applied by the server
         if readOnly ?? !allowWrites { items.append(URLQueryItem(name: "readonly", value: "1")) }
         items.append(URLQueryItem(name: "query_id", value: queryID))
+        if let session { items.append(URLQueryItem(name: "session_id", value: session)) }
         items.append(URLQueryItem(name: "default_format", value: Self.format))
         if !database.isEmpty { items.append(URLQueryItem(name: "database", value: database)) }
         c.queryItems = items
@@ -75,7 +78,8 @@ public struct ClickHouseDriver: SQLDriver {
         return r
     }
 
-    /// `KILL QUERY` for a stopped statement (never read-only: KILL isn't a read).
+    /// `KILL QUERY` for a stopped statement (never read-only: KILL isn't a
+    /// read; outside the run's session, which the stopped query holds).
     public func killRequest(queryID: String) -> URLRequest {
         let escaped = queryID.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
         return request("KILL QUERY WHERE query_id = '\(escaped)' ASYNC", queryID: UUID().uuidString, readOnly: false)
@@ -85,21 +89,22 @@ public struct ClickHouseDriver: SQLDriver {
 
     public func run(_ sql: String, cap: Int) async throws -> [SQLStatementResult] {
         var results: [SQLStatementResult] = []
+        let session = UUID().uuidString
         for statement in SQLStatements.split(sql, dialect: .clickhouse) {
             try Task.checkCancellation()
-            let outcome = try await runOne(statement, cap: cap)
+            let outcome = try await runOne(statement, cap: cap, session: session)
             results.append(SQLStatementResult(sql: statement, outcome: outcome))
             if case .failed = outcome { break }
         }
         return results
     }
 
-    func runOne(_ statement: String, cap: Int) async throws -> SQLStatementResult.Outcome {
+    func runOne(_ statement: String, cap: Int, session sessionID: String? = nil) async throws -> SQLStatementResult.Outcome {
         let id = UUID().uuidString
         let session = session
         let kill = killRequest(queryID: id)
         return try await withTaskCancellationHandler {
-            let (bytes, response) = try await session.bytes(for: request(statement, queryID: id))
+            let (bytes, response) = try await session.bytes(for: request(statement, queryID: id, session: sessionID))
             guard let http = response as? HTTPURLResponse else { throw SQLDriverError("Not an HTTP response from \(url.host() ?? "the server")") }
             var parser = ClickHouseResultParser(cap: cap, format: http.value(forHTTPHeaderField: "X-ClickHouse-Format"))
             if http.statusCode != 200 {

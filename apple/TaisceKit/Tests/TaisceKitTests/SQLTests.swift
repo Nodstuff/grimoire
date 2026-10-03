@@ -435,6 +435,8 @@ import Testing
         let w = rw.request("INSERT", queryID: "q2")
         #expect(w.url?.absoluteString == "https://ch.example:8443/?query_id=q2&default_format=JSONCompactEachRowWithNamesAndTypes")
         #expect(w.value(forHTTPHeaderField: "X-ClickHouse-Key") == nil)
+        // a run's statements share a session
+        #expect(driver.request("SELECT 1", queryID: "q3", session: "s1").url?.query()?.contains("session_id=s1") == true)
     }
 
     /// A redirect is never followed: the password header would go along.

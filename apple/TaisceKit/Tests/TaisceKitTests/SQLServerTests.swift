@@ -237,6 +237,18 @@ enum SQLServers {
         )))
     }
 
+    /// One session per run: SET and temporary tables carry across its
+    /// statements (with Allow writes), and not into the next run.
+    @Test func aRunIsOneSession() async throws {
+        let rw = SQLServers.clickhouse(writes: true)
+        let r = try await rw.run("SET max_threads = 3; CREATE TEMPORARY TABLE tmp (x UInt8); INSERT INTO tmp VALUES (7); SELECT x, getSetting('max_threads') FROM tmp", cap: 10)
+        #expect(r.allSatisfy { $0.error == nil }, "\(r)")
+        guard case .rows(let set) = r.last?.outcome else { Issue.record("no rows"); return }
+        #expect(set.rows == [["7", "3"]])
+        let next = try await rw.run("SELECT * FROM tmp", cap: 10)
+        #expect(next.last?.error != nil)
+    }
+
     /// Table functions reach other servers and files with the server's own
     /// access: read-only refuses them for access, before any connection is
     /// tried (readonly=2 tried to connect: "Connection refused").
