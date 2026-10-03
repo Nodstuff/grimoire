@@ -558,8 +558,10 @@ and duration, "compiled ✓" for a Go block that only compiles.
   `SET default_transaction_read_only=off` or a `DO` block's `COMMIT` write
   nothing). Use a SELECT-only role for a hard boundary all the same: a
   read-only transaction doesn't stop `COPY … TO PROGRAM`, which needs a
-  role without superuser or `pg_execute_server_program`. ClickHouse gets `readonly=2` (writes refused, `readonly`
-  can't be changed; 2 rather than 1 so a query's own `SETTINGS` work).
+  role without superuser or `pg_execute_server_program`. ClickHouse gets `readonly=1` (writes and table functions
+  such as `url()`, `s3()`, `remote()`, `file()` refused, no setting can be
+  changed; 1 rather than 2, which still runs table functions, so a query's
+  own `SETTINGS` clause is refused too).
   Statements run in order and stop at the first error; the last one's
   rows show as a table (types where known, NULL dimmed, 1000 rows kept,
   the rest counted), Copy as TSV / Markdown. Same 5 min limit; Stop

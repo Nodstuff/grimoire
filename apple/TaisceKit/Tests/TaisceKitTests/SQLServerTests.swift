@@ -221,14 +221,34 @@ enum SQLServers {
         #expect(unset.last?.error?.contains("readonly") == true)
         let sneaky = try await ro.run("INSERT INTO \(table) SETTINGS readonly = 0 VALUES (3, 'c')", cap: 10)
         #expect(sneaky.last?.error != nil)
-        // other settings are fine (readonly=2)
+        // readonly=1: a query's own SETTINGS are refused too (the price of
+        // refusing table functions, below)
         let settings = try await ro.run("SELECT count() FROM numbers(10) SETTINGS max_block_size = 1", cap: 10)
-        #expect(settings.last?.error == nil)
+        #expect(settings.last?.error?.contains("readonly") == true)
         let rows = try await ro.run("SELECT * FROM \(table) ORDER BY n", cap: 10)
         #expect(rows.last?.outcome == .rows(SQLResultSet(
             columns: [SQLColumn("n", type: "UInt32"), SQLColumn("s", type: "Nullable(String)")],
             rows: [["1", "a"], ["2", nil]]
         )))
+    }
+
+    /// Table functions reach other servers and files with the server's own
+    /// access: read-only refuses them for access, before any connection is
+    /// tried (readonly=2 tried to connect: "Connection refused").
+    @Test func tableFunctionsAreRefusedReadOnly() async throws {
+        let ro = SQLServers.clickhouse(writes: false)
+        for sql in [
+            "SELECT * FROM url('http://127.0.0.1:1/x', 'CSV', 'a String')",
+            "SELECT * FROM remote('127.0.0.1:1', system.one)",
+            "SELECT * FROM s3('http://127.0.0.1:1/bucket/dir/x.csv', 'CSV', 'a String')",
+            "SELECT * FROM file('x.csv', 'CSV', 'a String')",
+            "SELECT * FROM postgresql('127.0.0.1:1', 'd', 't', 'u', 'p')",
+        ] {
+            let r = try await ro.run(sql, cap: 1)
+            let e = r.last?.error ?? ""
+            #expect(e.contains("(READONLY)"), "\(sql): \(e)")
+            #expect(!e.contains("onnection refused") && !e.contains("NETWORK_ERROR"), "\(sql): \(e)")
+        }
     }
 
     @Test func capErrorsAndStop() async throws {
@@ -240,7 +260,7 @@ enum SQLServers {
         let bad = try await ro.run("SELECT 1; SELEC 2", cap: 10)
         #expect(bad.last?.error?.contains("Syntax error") == true)
 
-        let task = Task { await SQLRunner.run(ro, sql: "SELECT sleepEachRow(1) FROM numbers(30) SETTINGS max_block_size = 1") }
+        let task = Task { await SQLRunner.run(ro, sql: "SELECT sum(number) FROM numbers(100000000000)") }
         try await Task.sleep(for: .milliseconds(800))
         task.cancel()
         let outcome = await task.value

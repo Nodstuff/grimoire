@@ -1,10 +1,12 @@
 import Foundation
 
 /// ClickHouse over its HTTP interface. One POST per statement with
-/// `readonly=2` unless the source allows writes: the server refuses
-/// anything but reads, and `readonly` itself can't be changed from the
-/// query (2, not 1: 1 also refuses a query's own `SETTINGS …` clause);
-/// results as `JSONCompactEachRowWithNamesAndTypes`. Stop cancels the
+/// `readonly=1` unless the source allows writes: the server refuses
+/// anything but reads, and no setting (`readonly` included) can be changed
+/// from the query. 1, not 2: `readonly=2` still runs table functions
+/// (`url()`, `s3()`, `remote()`, `file()`, …), which reach other servers
+/// and files with the server's own access; the cost is that a query's own
+/// `SETTINGS …` clause is refused too. Results as `JSONCompactEachRowWithNamesAndTypes`. Stop cancels the
 /// request and sends `KILL QUERY` for its `query_id`, best effort.
 public struct ClickHouseDriver: SQLDriver {
     public static let format = "JSONCompactEachRowWithNamesAndTypes"
@@ -48,7 +50,7 @@ public struct ClickHouseDriver: SQLDriver {
         var c = URLComponents(url: url, resolvingAgainstBaseURL: false) ?? URLComponents()
         var items = c.queryItems ?? []
         // readonly first: settings after it are still applied by the server
-        if readOnly ?? !allowWrites { items.append(URLQueryItem(name: "readonly", value: "2")) }
+        if readOnly ?? !allowWrites { items.append(URLQueryItem(name: "readonly", value: "1")) }
         items.append(URLQueryItem(name: "query_id", value: queryID))
         items.append(URLQueryItem(name: "default_format", value: Self.format))
         if !database.isEmpty { items.append(URLQueryItem(name: "database", value: database)) }

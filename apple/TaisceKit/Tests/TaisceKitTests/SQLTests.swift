@@ -366,7 +366,7 @@ import Testing
     @Test func requestCarriesReadOnlyAndNoSecretsInTheURL() throws {
         let r = driver.request("SELECT 1", queryID: "q1")
         let url = try #require(r.url?.absoluteString)
-        #expect(url == "https://ch.example:8443/?readonly=2&query_id=q1&default_format=JSONCompactEachRowWithNamesAndTypes&database=analytics")
+        #expect(url == "https://ch.example:8443/?readonly=1&query_id=q1&default_format=JSONCompactEachRowWithNamesAndTypes&database=analytics")
         #expect(!url.contains("s3cret"))
         #expect(r.httpMethod == "POST")
         #expect(r.httpBody == Data("SELECT 1".utf8))
