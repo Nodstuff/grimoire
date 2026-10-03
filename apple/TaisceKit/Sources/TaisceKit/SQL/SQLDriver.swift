@@ -104,7 +104,8 @@ public enum SQLRunner {
 }
 
 /// Splits a script into statements at top-level `;`, skipping quotes,
-/// comments and (Postgres) dollar quoting. Statements that are only
+/// comments, (Postgres) dollar quoting and `E'…'` escape strings, and
+/// (ClickHouse) `# ` / `#!` line comments. Statements that are only
 /// whitespace and comments are dropped. Pure.
 ///
 /// Only for running statements one by one: never a read-only check.
@@ -113,9 +114,13 @@ public enum SQLStatements {
         public var dollarQuotes = false
         public var backslashEscapes = false
         public var nestedBlockComments = false
+        /// `E'…'`: backslash escapes in that one string (Postgres)
+        public var escapeStrings = false
+        /// `# …` and `#!…` comment to the end of the line (ClickHouse)
+        public var hashComments = false
 
-        public static let postgres = Dialect(dollarQuotes: true, nestedBlockComments: true)
-        public static let clickhouse = Dialect(backslashEscapes: true)
+        public static let postgres = Dialect(dollarQuotes: true, nestedBlockComments: true, escapeStrings: true)
+        public static let clickhouse = Dialect(backslashEscapes: true, hashComments: true)
         public static let standard = Dialect()
     }
 
@@ -139,7 +144,8 @@ public enum SQLStatements {
                 flush()
                 i += 1
                 continue
-            case "-" where at(i + 1) == "-":
+            case "-" where at(i + 1) == "-",
+                 "#" where dialect.hashComments && (at(i + 1) == " " || at(i + 1) == "!" || at(i + 1) == "\n" || at(i + 1) == nil):
                 while i < chars.count, chars[i] != "\n" { cur.append(chars[i]); i += 1 }
                 continue
             case "/" where at(i + 1) == "*":
@@ -159,13 +165,16 @@ public enum SQLStatements {
                 continue
             case "'", "\"", "`":
                 hasCode = true
+                // E'…' (not the end of an identifier such as `name'`)
+                let escapes = dialect.backslashEscapes || (dialect.escapeStrings && c == "'" && i > 0
+                    && (chars[i - 1] == "E" || chars[i - 1] == "e") && (i < 2 || !isIdentifier(chars[i - 2])))
                 cur.append(c)
                 i += 1
                 while i < chars.count {
                     let d = chars[i]
                     cur.append(d)
                     i += 1
-                    if dialect.backslashEscapes, d == "\\", i < chars.count {
+                    if escapes, d == "\\", i < chars.count {
                         cur.append(chars[i]); i += 1
                         continue
                     }
@@ -177,7 +186,8 @@ public enum SQLStatements {
                 }
                 continue
             case "$" where dialect.dollarQuotes:
-                if let tag = dollarTag(chars, i) {
+                // `a$b$` is an identifier with dollars in it, not a quote
+                if i == 0 || !isIdentifier(chars[i - 1]), let tag = dollarTag(chars, i) {
                     hasCode = true
                     let t = Array(tag.unicodeScalars)
                     for s in t { cur.append(s) }
@@ -217,6 +227,10 @@ public enum SQLStatements {
             }
         }
         return rest.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func isIdentifier(_ c: Unicode.Scalar) -> Bool {
+        c == "_" || c == "$" || c.properties.isAlphabetic || ("0"..."9").contains(c)
     }
 
     /// `$$` or `$tag$` starting at `i` (a tag is an identifier).

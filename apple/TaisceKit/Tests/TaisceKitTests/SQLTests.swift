@@ -68,6 +68,32 @@ import Testing
     @Test func clickhouseBackslashEscapes() {
         #expect(SQLStatements.split("SELECT 'a\\';b'; SELECT 2", dialect: .clickhouse) == ["SELECT 'a\\';b'", "SELECT 2"])
     }
+
+    @Test func postgresEscapeStrings() {
+        // E'\'' is one quote inside an escape string
+        let e = #"SELECT E'it\'s; fine'"#
+        #expect(SQLStatements.split(e + "; SELECT 2", dialect: .postgres) == [e, "SELECT 2"])
+        #expect(SQLStatements.split(#"SELECT e'\\'; SELECT 2"#, dialect: .postgres) == [#"SELECT e'\\'"#, "SELECT 2"])
+        // a plain string's backslash is just a character
+        #expect(SQLStatements.split(#"SELECT 'a\'; SELECT 2"#, dialect: .postgres) == [#"SELECT 'a\'"#, "SELECT 2"])
+        // nor is the E at the end of an identifier a prefix
+        #expect(SQLStatements.split(#"SELECT name'a\'; SELECT 2"#, dialect: .postgres) == [#"SELECT name'a\'"#, "SELECT 2"])
+    }
+
+    @Test func postgresDollarsInIdentifiers() {
+        // a$b$ is an identifier, not the start of a $b$ quote
+        #expect(SQLStatements.split("SELECT a$b$ FROM t; SELECT 2", dialect: .postgres) == ["SELECT a$b$ FROM t", "SELECT 2"])
+        #expect(SQLStatements.split("SELECT x$$ ; SELECT 2", dialect: .postgres) == ["SELECT x$$", "SELECT 2"])
+        // after an operator or space it is a quote
+        #expect(SQLStatements.split("SELECT 1||$q$;$q$; SELECT 2", dialect: .postgres) == ["SELECT 1||$q$;$q$", "SELECT 2"])
+    }
+
+    @Test func clickhouseHashComments() {
+        #expect(SQLStatements.split("# a; comment\nSELECT 1; #! b;\nSELECT 2", dialect: .clickhouse) == ["# a; comment\nSELECT 1", "#! b;\nSELECT 2"])
+        #expect(SQLStatements.split("# only; a comment", dialect: .clickhouse) == [])
+        // not a comment elsewhere
+        #expect(SQLStatements.split("SELECT 1 # x; SELECT 2") == ["SELECT 1 # x", "SELECT 2"])
+    }
 }
 
 @Suite struct SQLResultTests {
