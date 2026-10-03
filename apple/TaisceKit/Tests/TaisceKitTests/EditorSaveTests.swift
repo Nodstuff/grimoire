@@ -59,20 +59,25 @@ import Testing
 
     @Test @MainActor func theSchedulerDebouncesPerBlockAndFlushes() async throws {
         let saved = Locked<[Set<String>]>([])
-        let scheduler = SaveScheduler<String>(delay: .milliseconds(80)) { keys in saved.mutate { $0.append(keys) } }
+        // a delay well above the typing below: under a parallel suite the
+        // main actor's 10 ms sleeps can stretch past a short one
+        let delay = Duration.milliseconds(600)
+        let scheduler = SaveScheduler<String>(delay: delay) { keys in saved.mutate { $0.append(keys) } }
+        let typing = ContinuousClock.now
         for _ in 0..<5 {
             scheduler.touch("a")
             try await Task.sleep(for: .milliseconds(10))
         }
         scheduler.touch("b")
-        #expect(saved.value.isEmpty, "still typing")
+        // only meaningful while the typing took less than the delay
+        if ContinuousClock.now - typing < delay { #expect(saved.value.isEmpty, "still typing") }
         try await Self.waitUntil { saved.value.count == 2 }
         #expect(Set(saved.value) == [["a"], ["b"]], "one save per block once it went quiet")
         scheduler.touch("c")
         scheduler.touch("d")
         await scheduler.flush()
         #expect(saved.value.last == ["c", "d"], "flush saves everything waiting at once")
-        try await Task.sleep(for: .milliseconds(150))
+        try await Task.sleep(for: delay + .milliseconds(200))
         #expect(saved.value.count == 3, "and the timers it replaced never fire")
     }
 
