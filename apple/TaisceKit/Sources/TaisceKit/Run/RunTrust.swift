@@ -91,6 +91,36 @@ public enum RunTrust {
     /// under a new id) is theirs; this looks back only as far as the history
     /// goes (the newest 100 ops).
     public static func author(of block: BlockID, history: [DocHistoryEntry]?, me: Me) -> Author {
+        switch writer(of: block, history: history, me: me) {
+        case .me: return .me
+        case .other(let e): return .other(name(e, me: me))
+        case .unknown: return .unknown
+        }
+    }
+
+    /// "written by …" beside Run: who last wrote the block when that isn't
+    /// the signed-in human, by the same rules as `author`, except that your
+    /// own agents count as someone else here even where they are trusted
+    /// to run (the point is to see who wrote it). nil: you wrote it, or
+    /// nobody can tell (no history, the block too old, a decline's revert).
+    public static func writtenBy(_ block: BlockID, history: [DocHistoryEntry]?, me: Me) -> String? {
+        var human = me
+        human.privateWorkspace = false  // `matches` is then the human alone
+        guard case .other(let e) = writer(of: block, history: history, me: human) else { return nil }
+        return e.principalName.isEmpty ? "someone else" : e.principalName
+    }
+
+    /// The provenance prefix of a decline's revert (the server writes it and
+    /// refuses it from callers; other `review:` refs are callers' notes).
+    static let declineRevertPrefix = "review:decline:"
+
+    enum Writer {
+        case me
+        case other(DocHistoryEntry)
+        case unknown
+    }
+
+    static func writer(of block: BlockID, history: [DocHistoryEntry]?, me: Me) -> Writer {
         guard let history else { return .unknown }
         let writes = history.indices.filter { i in
             let e = history[i]
@@ -99,17 +129,17 @@ public enum RunTrust {
         for (pos, i) in writes.enumerated() {
             let row = history[i]
             if me.isHuman(row) {
-                if row.sourceRefs.contains(where: { $0.hasPrefix("review:decline:") }) { return .unknown }
+                if row.sourceRefs.contains(where: { $0.hasPrefix(declineRevertPrefix) }) { return .unknown }
                 if row.sourceRefs.contains(where: { $0.hasPrefix("rename:") }) {
                     guard pos + 1 < writes.count else { return .unknown }
                     let prev = history[writes[pos + 1]]
                     if let c = row.content, let p = prev.content, onlyLinksDiffer(c, p) { continue }
                 }
             }
-            guard me.matches(row) else { return .other(name(row, me: me)) }
+            guard me.matches(row) else { return .other(row) }
             if let content = row.content,
                let earlier = history[(i + 1)...].first(where: { $0.applied && $0.content == content && !me.matches($0) }) {
-                return .other(name(earlier, me: me))
+                return .other(earlier)
             }
             return .me
         }

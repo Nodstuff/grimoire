@@ -3259,6 +3259,16 @@ mod tests {
         }
         assert_eq!(fx.epoch(), e0, "nothing applied");
         assert!(!fx.export().contains("curl evil"));
+        // a `review:` note that isn't a decline's revert is the caller's own
+        let ops = json!([{"kind": {"op": "insert", "parent_id": null, "order_key": "zz", "block_type": "paragraph",
+            "content": "noted"}, "source_refs": ["review: looks good"]}]);
+        let (is_err, out) = raw(
+            fx.mcp
+                .propose_impl(NONE, p(json!({"doc_id": fx.doc.to_string(), "base_epoch": e0, "ops": ops, "as": "claude:mallory"})))
+                .await
+                .unwrap(),
+        );
+        assert!(!is_err && !out.contains("reserved"), "{out}");
     }
 
     /// Through the tool: a write with `as` records that principal on the
