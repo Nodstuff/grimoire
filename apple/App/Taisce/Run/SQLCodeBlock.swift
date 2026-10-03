@@ -167,7 +167,7 @@ struct SQLCodeCard: View {
 
     @ViewBuilder private func codeArea(_ e: BlockRunState) -> some View {
         if e.practice != nil {
-            TextEditor(text: Binding(get: { e.practice ?? code }, set: { e.practice = $0 }))
+            TextEditor(text: Binding(get: { e.practice ?? code }, set: { e.practice = PlainTyping.straighten(old: e.practice ?? code, new: $0) }))
                 .docFont(.footnote, design: .monospaced)
                 .foregroundStyle(Theme.text)
                 .autocorrectionDisabled()

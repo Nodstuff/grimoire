@@ -148,7 +148,7 @@ private struct RunnableCodeCard: View {
 
     @ViewBuilder private func codeArea(_ s: BlockRunState) -> some View {
         if s.practice != nil {
-            TextEditor(text: Binding(get: { s.practice ?? code }, set: { s.practice = $0 }))
+            TextEditor(text: Binding(get: { s.practice ?? code }, set: { s.practice = PlainTyping.straighten(old: s.practice ?? code, new: $0) }))
                 .docFont(.footnote, design: .monospaced)
                 .foregroundStyle(Theme.text)
                 .autocorrectionDisabled()
@@ -177,7 +177,7 @@ private struct RunnableCodeCard: View {
             Text("try")
                 .docFont(.caption2, weight: .medium)
                 .foregroundStyle(Theme.secondary)
-            TextField(tryPlaceholder(s), text: Binding(get: { s.tryLine }, set: { s.tryLine = $0 }))
+            TextField(tryPlaceholder(s), text: Binding(get: { s.tryLine }, set: { s.tryLine = PlainTyping.straighten(old: s.tryLine, new: $0) }))
                 .docFont(.footnote, design: .monospaced)
                 .textFieldStyle(.plain)
                 .autocorrectionDisabled()
