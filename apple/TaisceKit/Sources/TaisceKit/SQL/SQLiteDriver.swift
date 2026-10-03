@@ -1,10 +1,15 @@
+import CSQLiteShim
 import Foundation
 import SQLite3
 import Synchronization
 
 /// A SQLite file through the system's libsqlite3. Without Allow writes the
-/// file is opened `SQLITE_OPEN_READONLY`, so SQLite itself refuses any
-/// write (and an ATTACH inherits it). Never creates a file.
+/// file is opened `SQLITE_OPEN_READONLY`, so SQLite refuses writes to it.
+/// That alone doesn't stop `VACUUM INTO 'file'` (it writes a new file) or
+/// `ATTACH` (it opens any database the app can reach, writable), so every
+/// connection, read-only or not, allows no attached databases (which is
+/// also what `VACUUM INTO` needs) and runs in defensive mode (no
+/// `writable_schema`, no shadow-table writes). Never creates a file.
 public struct SQLiteDriver: SQLDriver {
     public var path: String
     public var allowWrites: Bool
@@ -55,6 +60,12 @@ final class SQLiteConnection: Sendable {
             sqlite3_close_v2(db)
             if !FileManager.default.fileExists(atPath: path) { throw SQLDriverError("No database file at \(path)") }
             throw SQLDriverError("Couldn't open \(path): \(msg)")
+        }
+        // no ATTACH, and so no VACUUM INTO (it attaches its output file)
+        sqlite3_limit(db, SQLITE_LIMIT_ATTACHED, 0)
+        guard taisce_sqlite3_set_defensive(db, 1) == SQLITE_OK else {
+            sqlite3_close_v2(db)
+            throw SQLDriverError("Couldn't open \(path) safely (SQLite's defensive mode is unavailable)")
         }
         sqlite3_busy_timeout(db, 5000)
         sqlite3_extended_result_codes(db, 1)

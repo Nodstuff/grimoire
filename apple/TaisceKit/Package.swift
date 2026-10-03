@@ -19,9 +19,12 @@ let package = Package(
         .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.33.1"),
     ],
     targets: [
+        // a C shim for the variadic sqlite3_db_config (SQL blocks' SQLite)
+        .target(name: "CSQLiteShim", linkerSettings: [.linkedLibrary("sqlite3")]),
         .target(
             name: "TaisceKit",
             dependencies: [
+                "CSQLiteShim",
                 .product(name: "GRDB", package: "GRDB.swift"),
                 .product(name: "Markdown", package: "swift-markdown"),
                 .product(name: "Valet", package: "Valet"),

@@ -221,6 +221,39 @@ import Testing
         #expect(count.last?.outcome == .rows(SQLResultSet(columns: [SQLColumn("n")], rows: [["3"]])))
     }
 
+    /// `VACUUM INTO` writes a new file and `ATTACH` opens another database
+    /// even on a read-only connection: both are refused, with or without
+    /// Allow writes, and no file appears.
+    @Test func vacuumIntoAndAttachAreRefused() async throws {
+        let path = try await Self.makeDB()
+        defer { Self.cleanup(path) }
+        let dir = (path as NSString).deletingLastPathComponent
+        // another database the app could reach
+        let other = (dir as NSString).appendingPathComponent("other.db")
+        FileManager.default.createFile(atPath: other, contents: nil)
+        _ = try await SQLiteDriver(path: other, allowWrites: true).run("CREATE TABLE secret (x); INSERT INTO secret VALUES ('hidden')", cap: 1)
+        for writes in [false, true] {
+            let d = SQLiteDriver(path: path, allowWrites: writes)
+            let out = (dir as NSString).appendingPathComponent("out-\(writes).db")
+            let vacuum = try await d.run("VACUUM INTO '\(out)'", cap: 1)
+            #expect(vacuum.last?.error != nil, "VACUUM INTO, writes \(writes)")
+            #expect(!FileManager.default.fileExists(atPath: out))
+            let attach = try await d.run("ATTACH DATABASE '\(other)' AS o; SELECT * FROM o.secret", cap: 1)
+            #expect(attach.count == 1 && attach[0].error?.contains("too many attached databases") == true, "ATTACH, writes \(writes)")
+            let fresh = (dir as NSString).appendingPathComponent("fresh-\(writes).db")
+            let create = try await d.run("ATTACH DATABASE '\(fresh)' AS f; CREATE TABLE f.x (y)", cap: 1)
+            #expect(create.first?.error != nil)
+            #expect(!FileManager.default.fileExists(atPath: fresh))
+            // defensive mode: no writable_schema
+            if writes {
+                let schema = try await d.run("PRAGMA writable_schema = ON; UPDATE sqlite_schema SET sql = 'x' WHERE name = 't'", cap: 1)
+                #expect(schema.last?.error != nil)
+            }
+        }
+        let still = try await SQLiteDriver(path: path, allowWrites: false).run("SELECT count(*) FROM t", cap: 1)
+        #expect(still.last?.outcome == .rows(SQLResultSet(columns: [SQLColumn("count(*)")], rows: [["3"]])))
+    }
+
     @Test func allowWritesPermitsThem() async throws {
         let path = try await Self.makeDB()
         defer { Self.cleanup(path) }
