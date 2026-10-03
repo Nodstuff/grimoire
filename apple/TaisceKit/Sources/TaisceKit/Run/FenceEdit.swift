@@ -25,6 +25,38 @@ public enum FenceEdit {
         return out.joined(separator: "\n")
     }
 
+    /// The block with `key=value` set on its first fence's info string
+    /// (replacing that key if present, else appended), e.g. `db=analytics`
+    /// on ```` ```sql ````. The code is untouched. nil when `content` has no
+    /// fenced code block, or its fence names no language.
+    public static func settingAttribute(_ key: String, _ value: String, in content: String) -> String? {
+        var lines = content.components(separatedBy: "\n")
+        guard let open = lines.firstIndex(where: { fence($0) != nil }), let (ch, len, info) = fence(lines[open]) else { return nil }
+        let quoted = value.contains(where: \.isWhitespace) || value.isEmpty ? "\"\(value)\"" : value
+        let words = FenceInfo.words(info)
+        // a bare fence: the attribute would read as its language
+        guard !words.isEmpty else { return nil }
+        var parts: [String] = []
+        // rebuild from the words, re-quoting any with spaces
+        func q(_ w: String) -> String {
+            guard let eq = w.firstIndex(of: "="), w.contains(where: \.isWhitespace) else { return w }
+            return w[...eq] + "\"" + w[w.index(after: eq)...] + "\""
+        }
+        var replaced = false
+        for (i, w) in words.enumerated() {
+            if i > 0, let eq = w.firstIndex(of: "="), w[..<eq].lowercased() == key.lowercased() {
+                if !replaced { parts.append("\(key)=\(quoted)") }
+                replaced = true
+            } else {
+                parts.append(q(w))
+            }
+        }
+        if !replaced { parts.append("\(key)=\(quoted)") }
+        let indent = String(lines[open].prefix { $0 == " " })
+        lines[open] = indent + String(repeating: ch, count: len) + parts.joined(separator: " ")
+        return lines.joined(separator: "\n")
+    }
+
     /// A fence line: up to three spaces, then three or more ` or ~.
     static func fence(_ line: String) -> (char: Character, length: Int, info: String)? {
         let indent = line.prefix { $0 == " " }
