@@ -139,6 +139,26 @@ private func entry(_ id: String, _ due: String?, overdue: Bool = false, text: St
         #expect(g.children?[1].subtitle == "1 doc")
     }
 
+    @Test func ancestorsFollowTheTreeNotTheParentField() {
+        let nodes = LibraryNode.build([
+            DocInfo(id: "g", title: "Grimoire"),
+            DocInfo(id: "i", parentID: "g", title: "iOS app"),
+            DocInfo(id: "d", parentID: "i", title: "Design"),
+            DocInfo(id: "o", parentID: "gone", title: "Orphan"),
+        ])
+        #expect(LibraryNode.ancestors(of: "d", in: nodes) == ["g", "i"])
+        #expect(LibraryNode.ancestors(of: "g", in: nodes) == [])
+        #expect(LibraryNode.ancestors(of: "o", in: nodes) == [], "an orphan sits at the root")
+        #expect(LibraryNode.ancestors(of: "elsewhere", in: nodes) == nil, "another workspace's doc")
+    }
+
+    @Test func deletePromptSaysWhatGoesWithIt() {
+        #expect(DocDeletePrompt.title("Plans") == "Delete \u{201C}Plans\u{201D}?")
+        #expect(DocDeletePrompt.message(below: 0) == "It moves to the Trash. You can restore it from the Trash in the web app.")
+        #expect(DocDeletePrompt.message(below: 1) == "It moves to the Trash with the 1 doc under it. You can restore it from the Trash in the web app.")
+        #expect(DocDeletePrompt.message(below: 4).contains("with the 4 docs under it"))
+    }
+
     @Test func breadcrumbsAndWikilinks() {
         let index = PreviewData.index
         #expect(index.breadcrumb(of: "g-ios-design") == "Grimoire › iOS app")

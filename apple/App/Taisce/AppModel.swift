@@ -686,6 +686,37 @@ final class AppModel {
         return doc.id
     }
 
+    /// The doc and every doc under it, as the tree has them.
+    func subtree(of id: DocID) -> Set<DocID> {
+        var children: [DocID: [DocID]] = [:]
+        for d in docs { if let p = d.parentID { children[p, default: []].append(d.id) } }
+        var out: Set<DocID> = [id]
+        var stack = [id]
+        while let next = stack.popLast() {
+            for c in children[next] ?? [] where out.insert(c).inserted { stack.append(c) }
+        }
+        return out
+    }
+
+    /// Move a doc and its subtree to the Trash. Online only: the server
+    /// decides (the whole subtree must be writable), so nothing is queued.
+    /// The sync that follows drops them from the cache; pins and open
+    /// windows let go the same way as an unshare. Nil, or the reason it failed.
+    func deleteDoc(_ id: DocID) async -> String? {
+        guard let api else { return "Not connected." }
+        let gone = subtree(of: id)
+        do {
+            try await api.deleteDoc(id)
+        } catch APIError.server(let msg) {
+            return msg
+        } catch {
+            return error.localizedDescription
+        }
+        try? await sync?.catchUp()
+        revoked(gone)
+        return nil
+    }
+
     // MARK: to-dos
 
     /// Open to-dos: dated ones from the server's read-only due list (`api.todoDue`; overdue

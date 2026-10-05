@@ -22,6 +22,7 @@ struct LibraryScreen: View {
             .refreshable { try? await model.sync?.catchUp() }
             .safeAreaInset(edge: .top, spacing: 0) { WorkspaceBar(triage: true) }
             .modifier(WorkspaceMoveHost())
+            .modifier(DocDeleteHost())
         }
     }
 }
@@ -89,6 +90,7 @@ struct LibraryTreeRows: View {
     let onTogglePin: (DocID) -> Void
     var onNewDoc: ((DocID?) -> Void)?
     @Environment(\.moveToWorkspace) private var moveToWorkspace
+    @Environment(\.docDeletion) private var docDeletion
 
     var body: some View {
         ForEach(nodes) { node in
@@ -128,6 +130,10 @@ struct LibraryTreeRows: View {
             }
             if let moveToWorkspace {
                 Button("Move to workspace\u{2026}", systemImage: "square.stack") { moveToWorkspace(node.id) }
+            }
+            if let docDeletion, docDeletion.canDelete(node.id) {
+                Divider()
+                Button("Delete\u{2026}", systemImage: "trash", role: .destructive) { docDeletion.ask(node.id) }
             }
         }
     }

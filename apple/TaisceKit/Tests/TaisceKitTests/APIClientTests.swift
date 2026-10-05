@@ -17,6 +17,20 @@ import Testing
         }
     }
 
+    @Test func deleteDocPostsAndCountsTheSubtree() async throws {
+        let server = MockServer { _ in .json(#"{"ok":true,"deleted":3}"#) }
+        #expect(try await server.client().deleteDoc("d1") == 3)
+        let r = try #require(server.requests.last)
+        #expect(r.httpMethod == "POST" && r.url?.path() == "/api/doc/d1/delete")
+    }
+
+    @Test func deleteDocSurfacesTheServersRefusal() async throws {
+        let server = MockServer { _ in .json(#"{"error":"forbidden: part of the subtree is read-only"}"#) }
+        await #expect(throws: APIError.server("forbidden: part of the subtree is read-only")) {
+            try await server.client().deleteDoc("d1")
+        }
+    }
+
     @Test func httpErrorStatusThrows() async throws {
         let server = MockServer { _ in MockServer.Reply(status: 502, chunks: [Data("bad gateway".utf8)]) }
         await #expect(throws: APIError.http(status: 502)) {

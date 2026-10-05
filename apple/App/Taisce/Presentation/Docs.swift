@@ -106,6 +106,16 @@ struct LibraryNode: Identifiable, Hashable, Sendable {
         return roots
     }
 
+    /// The folders above `id` in `nodes`, outermost first; nil when the
+    /// tree doesn't hold it (another workspace's doc).
+    static func ancestors(of id: DocID, in nodes: [LibraryNode]) -> [DocID]? {
+        for n in nodes {
+            if n.id == id { return [] }
+            if let kids = n.children, let below = ancestors(of: id, in: kids) { return [n.id] + below }
+        }
+        return nil
+    }
+
     /// Folders say how much is inside; nested leaves say where they live.
     static func subtitle(_ d: DocInfo, kids: Int, index: DocIndex) -> String? {
         if kids > 0 { return kids == 1 ? "1 doc" : "\(kids) docs" }

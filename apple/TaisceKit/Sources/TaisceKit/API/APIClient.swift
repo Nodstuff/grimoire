@@ -86,6 +86,17 @@ public struct APIClient: Sendable {
         return try await post("/api/docs", body: Body(title: title, parent_doc_id: parent, request_id: requestID, workspace_id: parent == nil ? workspaceID : nil))
     }
 
+    /// Move a doc and everything under it to the Trash (restorable from the
+    /// web UI). Answers how many docs went; the `deleted` change rows follow
+    /// through sync.
+    @discardableResult
+    public func deleteDoc(_ id: DocID) async throws -> Int {
+        struct Empty: Encodable {}
+        struct Deleted: Decodable { var deleted: Int }
+        let d: Deleted = try await post("/api/doc/\(id)/delete", body: Empty())
+        return d.deleted
+    }
+
     /// Op ids on `docID` waiting for a human (`GET /api/doc/{id}/review`).
     public func openReviewOps(_ docID: DocID) async throws -> Set<String> {
         struct Row: Decodable {

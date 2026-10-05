@@ -202,7 +202,7 @@ struct PadRoot: View {
     var body: some View {
         @Bindable var router = router
         NavigationSplitView {
-            PadSidebar()
+            PadSidebar().modifier(DocDeleteHost())
         } detail: {
             NavigationStack(path: $router.padPath) {
                 detail.navigationDestination(for: Route.self) { RouteView(route: $0) }
@@ -226,11 +226,28 @@ struct PadRoot: View {
 struct PadSidebar: View {
     @Environment(AppModel.self) private var model
     @Environment(Router.self) private var router
+    @Environment(\.docDeletion) private var docDeletion
     @FocusState private var searchFocused: Bool
+    /// folders opened by hand (the ones above the doc in front open by themselves)
+    @State private var expanded: Set<DocID> = []
+
+    /// What the List selects, and the folders that must be open for its row.
+    private var sidebarFront: (selection: PadItem?, reveal: Set<DocID>) {
+        let front = router.sidebarSelection
+        guard case .doc(let id)? = front else { return (front, []) }
+        guard let above = LibraryNode.ancestors(of: id, in: model.library) else { return (router.padItem, []) }
+        return (front, Set(above))
+    }
 
     var body: some View {
         @Bindable var router = router
-        let selection = Binding<PadItem?>(get: { router.sidebarSelection }, set: { if let item = $0 { router.select(item) } })
+        // The List must have a row for whatever it selects: told to select a
+        // doc it has no row for (inside a closed folder, or outside this
+        // workspace), SwiftUI empties the detail stack and the doc never
+        // opens. So the folders above the doc in front stay open, and a doc
+        // the tree doesn't hold leaves the selection where it was.
+        let (shown, reveal) = sidebarFront
+        let selection = Binding<PadItem?>(get: { shown }, set: { if let item = $0 { router.select(item) } })
         List(selection: selection) {
             if model.hasWorkspaces {
                 SidebarWorkspaceRow()
@@ -264,20 +281,12 @@ struct PadSidebar: View {
                 Label("To-dos", systemImage: "checkmark.circle").tag(PadItem.todos)
             }
             Section("Library") {
-                OutlineGroup(model.library, children: \.children) { node in
-                    Label(node.doc.title, systemImage: node.isFolder ? "folder" : "doc.text")
-                        .tag(PadItem.doc(node.id))
-                        .contextMenu {
-                            Button(model.isPinned(node.id) ? "Unpin from Today" : "Pin to Today",
-                                   systemImage: model.isPinned(node.id) ? "pin.slash" : "pin") { model.togglePin(node.id) }
-                            if model.access(for: node.id).canCreate {
-                                Button("New doc here", systemImage: "plus") { router.newDoc(in: node.id) }
-                            }
-                        }
-                }
+                SidebarTreeRows(nodes: model.library, expanded: $expanded, reveal: reveal, docDeletion: docDeletion)
             }
         }
         .listStyle(.sidebar)
+        // what opened itself stays open after you move on
+        .onChange(of: reveal) { _, r in expanded.formUnion(r) }
         .navigationTitle("Taisce")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
@@ -308,6 +317,55 @@ struct PadSidebar: View {
             .padding(.vertical, 6)
         }
         .refreshable { try? await model.sync?.catchUp() }
+    }
+}
+
+/// The sidebar's Library tree. A folder in `reveal` is open whatever
+/// `expanded` says: closing it while its doc is in front would leave the
+/// List selecting a row it doesn't have.
+private struct SidebarTreeRows: View {
+    let nodes: [LibraryNode]
+    @Binding var expanded: Set<DocID>
+    let reveal: Set<DocID>
+    let docDeletion: DocDeletion?
+    @Environment(AppModel.self) private var model
+    @Environment(Router.self) private var router
+
+    var body: some View {
+        ForEach(nodes) { node in
+            if let kids = node.children {
+                DisclosureGroup(isExpanded: open(node.id)) {
+                    SidebarTreeRows(nodes: kids, expanded: $expanded, reveal: reveal, docDeletion: docDeletion)
+                } label: {
+                    row(node)
+                }
+            } else {
+                row(node)
+            }
+        }
+    }
+
+    private func open(_ id: DocID) -> Binding<Bool> {
+        Binding(
+            get: { expanded.contains(id) || reveal.contains(id) },
+            set: { if $0 { expanded.insert(id) } else { expanded.remove(id) } }
+        )
+    }
+
+    private func row(_ node: LibraryNode) -> some View {
+        Label(node.doc.title, systemImage: node.isFolder ? "folder" : "doc.text")
+            .tag(PadItem.doc(node.id))
+            .contextMenu {
+                Button(model.isPinned(node.id) ? "Unpin from Today" : "Pin to Today",
+                       systemImage: model.isPinned(node.id) ? "pin.slash" : "pin") { model.togglePin(node.id) }
+                if model.access(for: node.id).canCreate {
+                    Button("New doc here", systemImage: "plus") { router.newDoc(in: node.id) }
+                }
+                if let docDeletion, docDeletion.canDelete(node.id) {
+                    Divider()
+                    Button("Delete\u{2026}", systemImage: "trash", role: .destructive) { docDeletion.ask(node.id) }
+                }
+            }
     }
 }
 
