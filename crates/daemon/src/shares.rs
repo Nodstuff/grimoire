@@ -678,12 +678,19 @@ async fn update(
     let done = with_store(&st.store, v.scope, move |s| {
         // the caller's own link first: someone else's is 404 and spends nothing
         let cur = s.share_get(id).map_err(fail)?;
+        let live = !cur.is_gone(now());
         if let Some(snap) = &p.snapshot {
             if !limiter.allow(Class::ShareSnapshot, &id.to_string()) {
                 return Err(err(StatusCode::TOO_MANY_REQUESTS, "30 new snapshots an hour per link: try again later"));
             }
-            let live = !cur.is_gone(now());
             if let Some(r) = over_caps(s.share_usage(now(), Some(id)).map_err(fail)?, snap.bytes(), !live) {
+                return Err(r);
+            }
+        } else if !live && cur.revoked_at.is_none() && p.expires_at.is_some() {
+            // a new expiry opens an expired link again: it counts as a new
+            // live link holding its old snapshot
+            let bytes = s.share_snapshot_bytes(id).map_err(fail)?;
+            if let Some(r) = over_caps(s.share_usage(now(), Some(id)).map_err(fail)?, bytes, true) {
                 return Err(r);
             }
         }
