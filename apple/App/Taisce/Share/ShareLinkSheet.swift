@@ -43,7 +43,9 @@ struct ShareLinkForm: View {
     var body: some View {
         let shares = store.shares(for: docID).filter { only == nil || $0.id == only }
         let live = shares.filter { $0.state() == .active }
-        let ended = shares.filter { $0.state() != .active }
+        // an expired link can still be updated or given a new expiry; only a revoked one is over
+        let manageable = shares.filter { $0.state() != .revoked }
+        let ended = shares.filter { $0.state() == .revoked }
         Form {
             if only == nil {
                 Section {
@@ -58,7 +60,7 @@ struct ShareLinkForm: View {
             } else if only == nil && (live.isEmpty || newLink) {
                 createSection
             }
-            ForEach(live) { share in
+            ForEach(manageable) { share in
                 ShareLinkSection(share: share, theme: ShareSnapshot.Theme(scheme), showComments: only != nil)
             }
             if only == nil, !live.isEmpty, !newLink {
@@ -69,7 +71,7 @@ struct ShareLinkForm: View {
                 .listRowBackground(Theme.surface)
             }
             if !ended.isEmpty {
-                Section(only == nil ? "Ended links" : "") {
+                Section(only == nil ? "Revoked links" : "") {
                     ForEach(ended) { share in
                         if only != nil {
                             EndedLinkSummary(share: share)
@@ -168,6 +170,7 @@ struct ShareLinkSection: View {
     let share: Share
     let theme: ShareSnapshot.Theme
     var showComments = false
+    var now: Date = .now
     @Environment(AppModel.self) private var model
     @State private var busy: String?
     @State private var error: String?
@@ -244,6 +247,11 @@ struct ShareLinkSection: View {
                 }
             } else {
                 Button("Change expiry\u{2026}", systemImage: "clock") { changingExpiry = true }
+            }
+            if share.state(now: now) == .expired {
+                Text("This link has expired: readers see that it's gone. Give it a new expiry to open it again.")
+                    .font(.caption)
+                    .foregroundStyle(Theme.amber)
             }
             Button(role: .destructive) {
                 confirmRevoke = true

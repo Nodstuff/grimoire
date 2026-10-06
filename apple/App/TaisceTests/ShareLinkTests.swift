@@ -180,6 +180,16 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         #expect(ShareErrorText.message(APIError.http(status: 502)).contains("HTTP 502"))
     }
 
+    @Test func anExpiredLinkCanGetANewExpiry() async throws {
+        let fake = FakeShares(existing: [FakeShares.share("s1", expires: .now.addingTimeInterval(-60))])
+        let s = store(fake)
+        try await s.load(doc: "d1")
+        let expired = try #require(s.shares(for: "d1").first)
+        #expect(expired.state() == .expired)
+        try await s.setExpiry(expired, to: .now.addingTimeInterval(86400))
+        #expect(s.shares(for: "d1").first?.state() == .active)
+    }
+
     @Test func resetForgetsEverything() async throws {
         let s = store(FakeShares(existing: [FakeShares.share("s1")]))
         try await s.loadAll()
