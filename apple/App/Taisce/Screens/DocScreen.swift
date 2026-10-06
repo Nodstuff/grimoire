@@ -24,6 +24,7 @@ struct DocScreen: View {
     @State private var pdfFile: PDFExportFile?
     @State private var savingPDF = false
     @State private var pdfError: String?
+    @State private var pdfDocument: PDFDocumentFile?
     @AppStorage(DocTextSize.key) private var textSize = DocTextSize.actual
 
     var body: some View {
@@ -120,12 +121,13 @@ struct DocScreen: View {
         #if targetEnvironment(macCatalyst)
         .fileExporter(
             isPresented: $savingPDF,
-            document: (try? Data(contentsOf: pdfFile?.url ?? URL(fileURLWithPath: "/dev/null"))).map(PDFDocumentFile.init(data:)),
+            document: pdfDocument,
             contentType: .pdf,
             defaultFilename: pdfFile?.url.lastPathComponent
         ) { result in
             if case let .failure(error) = result { model.lastError = error.localizedDescription }
             pdfFile = nil
+            pdfDocument = nil
         }
         #else
         .sheet(item: $pdfFile) { file in ActivityView(items: [file.url]).presentationDetents([.medium, .large]) }
@@ -218,6 +220,7 @@ struct DocScreen: View {
                 let file = try await model.exportPDF(docID)
                 pdfFile = file
                 #if targetEnvironment(macCatalyst)
+                pdfDocument = PDFDocumentFile(data: try Data(contentsOf: file.url))
                 savingPDF = true
                 #endif
             } catch {
