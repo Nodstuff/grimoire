@@ -81,6 +81,11 @@ public struct ShareSnapshotResult: Sendable, Hashable {
     public var snapshot: ShareSnapshot
     /// one line per visual or image that failed or was left out
     public var problems: [String]
+
+    public init(snapshot: ShareSnapshot, problems: [String] = []) {
+        self.snapshot = snapshot
+        self.problems = problems
+    }
 }
 
 /// Turns a doc into the snapshot a share link publishes:
