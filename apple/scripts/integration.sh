@@ -2,7 +2,9 @@
 # TaisceKit against REAL scratch daemons: a LOCAL-mode one on 7515 and a
 # SERVER-mode one on 7516 (--public-url http://localhost:7516), signed in
 # headlessly with the daemon's softpasskey example. Temp dirs only: never
-# ~/.grimoire, never port 7425. Daemons are killed on exit.
+# ~/.grimoire, never port 7425. Daemons are killed on exit. Every daemon and
+# CLI call runs with a scratch HOME under the temp dir, so nothing reads or
+# writes the real one (~/.claude memory, ~/.grimoire, admin tokens).
 #
 # Usage: apple/scripts/integration.sh [path to the grimoire checkout]
 #   (default: the main checkout; it needs target/release/taisce and
@@ -37,10 +39,17 @@ for port in $LOCAL_PORT $SERVER_PORT; do
   fi
 done
 
+# the daemon binary with a scratch HOME (and no TAISCE_*/GRIMOIRE_* from the caller's shell)
+taisce() { # name taisce-args...
+  local name=$1; shift
+  mkdir -p "$ROOT/$name/home"
+  env -u TAISCE_PUBLIC_URL -u GRIMOIRE_PUBLIC_URL HOME="$ROOT/$name/home" "$BIN" "$@"
+}
+
 start() { # name port [extra global args...]
   local name=$1 port=$2; shift 2
   mkdir -p "$ROOT/$name"
-  "$BIN" --db "$ROOT/$name/ks.db" --port "$port" "$@" serve >"$ROOT/$name/daemon.log" 2>&1 &
+  taisce "$name" --db "$ROOT/$name/ks.db" --port "$port" "$@" serve >"$ROOT/$name/daemon.log" 2>&1 &
   PIDS+=($!)
 }
 
@@ -59,7 +68,7 @@ wait_for "http://127.0.0.1:$LOCAL_PORT/api/docs" 200
 wait_for "http://localhost:$SERVER_PORT/.well-known/oauth-authorization-server" 200
 
 # a one-time enrollment link (the CLI writes the db directly; WAL lets the daemon run on)
-ENROLL=$("$BIN" --db "$ROOT/server/ks.db" --public-url "http://localhost:$SERVER_PORT" auth enroll | head -1)
+ENROLL=$(taisce server --db "$ROOT/server/ks.db" --port "$SERVER_PORT" --public-url "http://localhost:$SERVER_PORT" auth enroll | head -1)
 [[ "$ENROLL" == http* ]] || { echo "no enrollment link: $ENROLL" >&2; exit 1; }
 
 cd "$HERE/TaisceKit"
