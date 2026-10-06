@@ -89,12 +89,26 @@ pub const PER_SHARE_DAY: i64 = 200;
 const ALLOWED_TYPES: [&str; 4] = ["image/svg+xml", "image/png", "image/jpeg", "image/webp"];
 
 /// The page's Content-Security-Policy, around this response's nonce.
-pub fn page_csp(nonce: &str) -> String {
+/// `origin` (the server's public origin) is named as well as `'self'`: the
+/// sandbox gives the page an opaque origin, and WebKit then matches `'self'`
+/// against nothing, so Safari refused the comment fetches and the images.
+pub fn page_csp(nonce: &str, origin: &str) -> String {
+    let o = if origin.is_empty() { String::new() } else { format!(" {origin}") };
     format!(
-        "default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; \
-script-src 'nonce-{nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; \
+        "default-src 'none'; img-src 'self'{o} data:; style-src 'self' 'unsafe-inline'; font-src 'self'{o} data:; \
+script-src 'nonce-{nonce}'; connect-src 'self'{o}; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; \
 sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox"
     )
+}
+
+/// `https://host[:port]` of the public URL, for the page's CSP.
+fn public_origin(base: &str) -> String {
+    let rest = base.split_once("://").map_or("", |(_, r)| r);
+    let host = rest.split('/').next().unwrap_or("");
+    match base.split_once("://") {
+        Some((scheme, _)) if !host.is_empty() => format!("{scheme}://{host}"),
+        _ => String::new(),
+    }
 }
 
 /// The page runs sandboxed in an opaque origin (no `allow-same-origin`): its
@@ -904,11 +918,11 @@ fn public_headers(h: &mut HeaderMap) {
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
 }
 
-fn html_response(status: StatusCode, html: String, nonce: Option<&str>) -> Response {
+fn html_response(status: StatusCode, html: String, nonce: Option<&str>, origin: &str) -> Response {
     let mut r = (status, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response();
     let csp = match nonce {
-        Some(n) => page_csp(n),
-        None => page_csp("none").replace("'nonce-none'", "'none'"),
+        Some(n) => page_csp(n, origin),
+        None => page_csp("none", origin).replace("'nonce-none'", "'none'"),
     };
     if let Ok(v) = HeaderValue::from_str(&csp) {
         r.headers_mut().insert(header::CONTENT_SECURITY_POLICY, v);
@@ -972,10 +986,11 @@ async fn public_page(State(st): State<SharesState>, Path(token): Path<String>, r
     };
     let sh = match found {
         Found::Live(sh) => sh,
-        Found::Gone => return html_response(StatusCode::GONE, gone_page("This link has expired or was turned off."), None),
-        Found::Unknown => return html_response(StatusCode::NOT_FOUND, gone_page("There is nothing at this link."), None),
+        Found::Gone => return html_response(StatusCode::GONE, gone_page("This link has expired or was turned off."), None, ""),
+        Found::Unknown => return html_response(StatusCode::NOT_FOUND, gone_page("There is nothing at this link."), None, ""),
     };
     let Some(server) = &st.server else { return not_found() };
+    let origin = public_origin(&server.cfg.base);
     let (id, rev) = (sh.id, sh.revision);
     let cached = lock(&server.caches.renders).get(&(id, rev));
     let body = match cached {
@@ -1017,7 +1032,7 @@ async fn public_page(State(st): State<SharesState>, Path(token): Path<String>, r
         nonce: Some(&nonce),
         comments_enabled: sh.comments_enabled,
     });
-    html_response(StatusCode::OK, html, Some(&nonce))
+    html_response(StatusCode::OK, html, Some(&nonce), &origin)
 }
 
 async fn public_asset(State(st): State<SharesState>, Path((token, name)): Path<(String, String)>, req: Request) -> Response {
@@ -1311,5 +1326,16 @@ mod tests {
         assert_eq!(ip_key("::ffff:1.2.3.4"), "1.2.3.4");
         assert_eq!(ip_key("1.2.3.4"), "1.2.3.4");
         assert_eq!(ip_key("unknown"), "unknown");
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    #[test]
+    fn public_origin_is_scheme_and_host() {
+        assert_eq!(super::public_origin("https://taisce.null.ie"), "https://taisce.null.ie");
+        assert_eq!(super::public_origin("https://taisce.null.ie/"), "https://taisce.null.ie");
+        assert_eq!(super::public_origin("http://127.0.0.1:7519/x"), "http://127.0.0.1:7519");
+        assert_eq!(super::public_origin("nonsense"), "");
     }
 }

@@ -1806,10 +1806,13 @@ async fn share_link_page_headers_expiry_and_revoke() {
     assert_eq!(page.status, StatusCode::OK);
     let nonce = page.body.split("<script nonce=\"").nth(1).unwrap().split('"').next().unwrap();
     assert!(nonce.len() >= 32, "a fresh random nonce: {nonce}");
-    assert_eq!(page.h("content-security-policy"), crate::shares::page_csp(nonce));
+    assert_eq!(page.h("content-security-policy"), crate::shares::page_csp(nonce, BASE.trim_end_matches('/')));
+    // the origin is named beside 'self': in the sandbox's opaque origin
+    // WebKit matches 'self' against nothing (Safari's comment fetch failed)
+    let o = BASE.trim_end_matches('/');
     assert_eq!(
         page.h("content-security-policy"),
-        format!("default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'nonce-{nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox")
+        format!("default-src 'none'; img-src 'self' {o} data:; style-src 'self' 'unsafe-inline'; font-src 'self' {o} data:; script-src 'nonce-{nonce}'; connect-src 'self' {o}; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox")
     );
     assert_eq!(page.h("x-robots-tag"), "noindex, nofollow");
     assert_eq!(page.h("referrer-policy"), "no-referrer");
