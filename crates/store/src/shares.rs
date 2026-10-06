@@ -261,6 +261,12 @@ impl SqliteStore {
         Ok(ShareUsage { live, bytes })
     }
 
+    /// The bytes a link's snapshot holds (the caller's own link, else NotFound).
+    pub fn share_snapshot_bytes(&self, id: Uuid) -> Result<i64> {
+        self.share_get(id)?;
+        Ok(self.conn.query_row("SELECT snapshot_bytes FROM share_links WHERE id = ?1", [id.to_string()], |r| r.get(0))?)
+    }
+
     /// The caller's shares, newest first; of one doc when `doc` is given.
     pub fn shares_list(&self, doc: Option<Uuid>) -> Result<Vec<Share>> {
         let owner = self.share_owner()?;

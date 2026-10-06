@@ -2218,6 +2218,19 @@ async fn share_link_caps_per_person_and_per_link() {
     // other changes are not snapshots
     let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"comments_enabled": false}))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    // an expired link opened again by a new expiry is a new live link: at
+    // 100 it is refused, after a revoke it is let through
+    let expired = {
+        let snapshot = taisce_store::shares::ShareSnapshot { title: "t".into(), markdown: "x".into(), theme: "auto".into(), assets: vec![] };
+        let mut s = fx.store.lock(Scope::User(fx.a));
+        s.share_create(Uuid::now_v7(), fx.a_loose, "expired-hash", &snapshot, Some(1), true, 0).unwrap().id
+    };
+    let reopen = json!({"expires_at": null});
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{expired}"), Some(reopen.clone())).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
+    assert_eq!(fx.raw(Some(&fx.a_app), "DELETE", &format!("/api/shares/{id}"), None).await.status, StatusCode::NO_CONTENT);
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{expired}"), Some(reopen)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
 }
 
 /// A link needs owner or editor on its doc to be made or changed, and dies
