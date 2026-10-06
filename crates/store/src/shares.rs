@@ -179,6 +179,24 @@ fn comment_row(r: &Row) -> rusqlite::Result<ShareComment> {
     })
 }
 
+/// When `user` leaves workspace `ws`: revoke their live links to docs that
+/// now resolve to it (they can no longer publish what they cannot read).
+pub(crate) fn revoke_on_unshare(conn: &rusqlite::Connection, ws: Uuid, user: Uuid) -> Result<usize> {
+    let links: Vec<(String, String)> = {
+        let mut st = conn.prepare("SELECT id, doc_id FROM share_links WHERE owner_id = ?1 AND revoked_at IS NULL")?;
+        st.query_map(params![user.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let mut n = 0;
+    for (id, doc) in links {
+        let Ok(doc) = Uuid::parse_str(&doc) else { continue };
+        if crate::tenancy::space_conn(conn, doc).ok() == Some(crate::tenancy::Space::Workspace(ws)) {
+            n += revoke_conn(conn, "id = ?1", &id, now)?;
+        }
+    }
+    Ok(n)
+}
+
 /// A dead link is deleted outright this long after it was revoked or expired.
 pub const PURGE_AFTER: i64 = 30 * 86400;
 /// A commenter's IP hash is kept this long (the longest rate-limit window).
@@ -280,7 +298,9 @@ impl SqliteStore {
         now: i64,
     ) -> Result<Share> {
         let owner = self.share_owner()?;
-        self.see(doc)?;
+        // owner or editor of the doc's workspace (Unsorted: its owner):
+        // invisible is NotFound, read-only is Forbidden
+        self.may_write(doc)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO share_links (id, owner_id, doc_id, token_hash, title, markdown, theme,
@@ -312,6 +332,9 @@ impl SqliteStore {
         if cur.revoked_at.is_some() {
             return Err(StoreError::InvalidOp("this link was revoked; make a new one".into()));
         }
+        // still owner or editor of the doc: a link is not a way to keep
+        // publishing a doc you can no longer change
+        self.may_write(cur.doc_id)?;
         let tx = self.conn.unchecked_transaction()?;
         if let Some(snap) = &patch.snapshot {
             tx.execute(
@@ -585,6 +608,24 @@ mod tests {
             theme: "auto".into(),
             assets: vec![ShareAsset { name: "d1.svg".into(), content_type: "image/svg+xml".into(), data: b"<svg/>".to_vec(), width: Some(10), height: None }],
         }
+    }
+
+    /// A doc deleted for good (there is no such path today; the trigger
+    /// covers any future one) revokes its links; trashing does not.
+    #[test]
+    fn a_purged_doc_revokes_its_links() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let a = s.auth_ensure_owner(p, "Tom", 1).unwrap().id;
+        let doc = s.create_doc_with_ops("D", None, p, vec![]).unwrap().0.id;
+        let id = s.with_scope_for_test(Scope::User(a), |s| s.share_create(Uuid::now_v7(), doc, "h", &snap("D"), None, true, 0).unwrap().id);
+        s.delete_doc(doc).unwrap();
+        assert!(s.share_get(id).unwrap().revoked_at.is_none(), "the trash keeps the link");
+        s.conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        s.conn.execute("DELETE FROM docs WHERE id = ?1", [doc.to_string()]).unwrap();
+        let sh = s.share_get(id).unwrap();
+        assert!(sh.revoked_at.is_some(), "purged doc → revoked link");
+        assert!(s.with_scope_for_test(Scope::Public, |s| s.share_public_asset(id, "d1.svg")).unwrap().is_none());
     }
 
     #[test]

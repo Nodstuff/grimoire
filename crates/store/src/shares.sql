@@ -32,6 +32,16 @@ CREATE TABLE IF NOT EXISTS share_links (
     last_viewed_at   INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS share_links_token_hash ON share_links (token_hash);
+CREATE INDEX IF NOT EXISTS share_links_by_doc ON share_links (doc_id);
+
+-- A doc deleted for good (not trashed) takes its links with it: revoked,
+-- their snapshot dropped (the rows stay for the 410 until the purge).
+CREATE TRIGGER IF NOT EXISTS share_links_doc_purged AFTER DELETE ON docs BEGIN
+    DELETE FROM share_link_assets WHERE share_id IN (SELECT id FROM share_links WHERE doc_id = OLD.id AND revoked_at IS NULL);
+    UPDATE share_links SET revoked_at = CAST(strftime('%s', 'now') AS INTEGER), updated_at = CAST(strftime('%s', 'now') AS INTEGER),
+        markdown = '', snapshot_bytes = 0
+    WHERE doc_id = OLD.id AND revoked_at IS NULL;
+END;
 CREATE INDEX IF NOT EXISTS share_links_by_owner_doc ON share_links (owner_id, doc_id, created_at);
 
 -- The snapshot's images (diagrams rendered to SVG by the app, pictures).

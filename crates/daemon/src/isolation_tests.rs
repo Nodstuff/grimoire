@@ -163,6 +163,7 @@ const COVERAGE: &[(&str, &str)] = &[
     // share links (shares.rs): the owner's routes are hers alone; the public
     // routes read only the share tables, one token's snapshot each
     ("/api/shares", "share_links_are_the_owners_alone"),
+    ("/api/shares", "links_follow_their_makers_access"),
     ("/api/shares/preview", "share_links_are_the_owners_alone"),
     ("/api/shares/{id}", "share_links_are_the_owners_alone"),
     ("/api/shares/{id}", "share_link_caps_per_person_and_per_link"),
@@ -1716,10 +1717,9 @@ async fn share_links_are_the_owners_alone() {
     assert_eq!((got.0, none.0), (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND), "{} / {}", got.1, none.1);
     assert_eq!(got.1.replace(&fx.a_secret.to_string(), "ID"), none.1.replace(&nodoc.to_string(), "ID"));
     fx.no_leak_besides("POST /api/shares", &got.1, &[fx.a_secret]);
-    // ...but may publish what she can see (the shared Family doc, her own)
-    if !fx.cookie {
-        fx.make_share(&fx.b_app, fx.shared_doc, "Family", "familysnap", "f.svg").await;
-    }
+    // a viewer of the shared Family doc may not publish it (403: she can see it)
+    let r = fx.raw(Some(&fx.b_app), "POST", "/api/shares", Some(json!({"doc_id": fx.shared_doc, "snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
     // connectors are refused (403); a PAT never opens /api (401)
     for (m, path, body) in [
         ("GET", "/api/shares".to_string(), None),
@@ -2208,4 +2208,34 @@ async fn share_link_caps_per_person_and_per_link() {
     // other changes are not snapshots
     let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"comments_enabled": false}))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+}
+
+/// A link needs owner or editor on its doc to be made or changed, and dies
+/// with its maker's access: unsharing the workspace revokes their links to
+/// its docs (and only those).
+#[tokio::test]
+async fn links_follow_their_makers_access() {
+    let fx = fixture();
+    let snap = snapshot("Family", "familysnap", "f.svg");
+    // a viewer: 403; an editor: 201
+    let r = fx.raw(Some(&fx.b_app), "POST", "/api/shares", Some(json!({"doc_id": fx.shared_doc, "snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
+    fx.store.lock(Scope::User(fx.a)).share_workspace(fx.family, fx.b, Role::Editor).unwrap();
+    let fam = fx.make_share(&fx.b_app, fx.shared_doc, "Family", "familysnap", "f.svg").await;
+    let own = fx.make_share(&fx.b_app, fx.b_doc, "Mine", "minesnap", "m.svg").await;
+    // demoted to viewer: the link lives (she can still read it) but cannot be changed
+    fx.store.lock(Scope::User(fx.a)).share_workspace(fx.family, fx.b, Role::Viewer).unwrap();
+    let id = fam["id"].as_str().unwrap();
+    let r = fx.raw(Some(&fx.b_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
+    assert_eq!(fx.raw(None, "GET", &link_path(&fam), None).await.status, StatusCode::OK);
+    // unshared: the Family link is revoked, her own doc's is not
+    fx.store.lock(Scope::User(fx.a)).unshare_workspace(fx.family, fx.b).unwrap();
+    assert_eq!(fx.raw(None, "GET", &link_path(&fam), None).await.status, StatusCode::GONE);
+    assert_eq!(fx.raw(None, "GET", &format!("{}/a/f.svg", link_path(&fam)), None).await.status, StatusCode::GONE);
+    assert_eq!(fx.raw(None, "GET", &link_path(&own), None).await.status, StatusCode::OK);
+    let (_, out) = fx.call(&fx.b_app, "GET", "/api/shares", None).await;
+    let listed: Value = serde_json::from_str(&out).unwrap();
+    let revoked = |id: &Value| listed["shares"].as_array().unwrap().iter().find(|s| s["id"] == *id).unwrap()["revoked_at"].is_string();
+    assert!(revoked(&fam["id"]) && !revoked(&own["id"]), "{out}");
 }

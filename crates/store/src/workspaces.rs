@@ -668,7 +668,9 @@ impl SqliteStore {
             params![ws.to_string(), user.to_string()],
         )?;
         tenancy::journal_access_diff(&tx, before)?;
-        tenancy::audit_conn(&tx, self.scope.user(), "workspace.unshare", &ws.to_string(), &serde_json::json!({"user": user, "removed": n > 0}))?;
+        // their links to its docs die with their access
+        let revoked = if n > 0 { crate::shares::revoke_on_unshare(&tx, ws, user)? } else { 0 };
+        tenancy::audit_conn(&tx, self.scope.user(), "workspace.unshare", &ws.to_string(), &serde_json::json!({"user": user, "removed": n > 0, "links_revoked": revoked}))?;
         tx.commit()?;
         Ok(n > 0)
     }
