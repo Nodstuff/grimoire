@@ -1991,3 +1991,39 @@ async fn share_link_preview_stores_nothing_and_limits_hold() {
         assert_eq!(local.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND, "LOCAL {m} {path}");
     }
 }
+
+/// `Scope::Public` (a share link's reader) has no user, like System/Local:
+/// every list and read keyed on `scope.user()` must come back empty or
+/// refused for it, never unfiltered, and it may write nothing.
+#[tokio::test]
+async fn scope_public_reads_and_writes_nothing() {
+    let fx = fixture();
+    fx.store.lock(Scope::System).set_setting("global.key", "zebrasecret").unwrap();
+    fx.store.lock(Scope::User(fx.a)).set_setting("mine", "zebrasecret").unwrap();
+    let mut s = fx.store.lock(Scope::Public);
+    assert!(s.list_docs().unwrap().is_empty(), "docs");
+    assert!(s.list_workspaces().unwrap().is_empty(), "workspaces");
+    assert!(s.list_principals().unwrap().is_empty(), "principals");
+    assert_eq!(s.get_setting("global.key").unwrap(), None, "global settings");
+    assert_eq!(s.get_setting("mine").unwrap(), None, "user settings");
+    assert!(s.changes_since(0, 1000).unwrap().changes.is_empty(), "change feed");
+    assert!(s.list_gardeners().unwrap().is_empty(), "gardeners");
+    assert!(s.list_tags().unwrap().is_empty(), "tags");
+    assert!(s.review_queue(None).unwrap().is_empty(), "review queue");
+    assert!(s.list_trash().unwrap().is_empty(), "trash");
+    assert!(s.search_blocks("zebrasecret", 10).unwrap().is_empty(), "search");
+    assert!(s.own_root_titled("Salary review").unwrap().is_none(), "own roots");
+    assert!(s.agent_named("claude").unwrap().is_none(), "agents");
+    assert!(s.read_doc(fx.a_secret).is_err() && s.get_doc(fx.shared_doc).is_err(), "by-id reads");
+    assert!(s.ops_since(fx.a_secret, 0).map(|o| o.is_empty()).unwrap_or(true), "history");
+    assert!(s.idempotency_get(fx.a_human, Uuid::now_v7(), 0).unwrap().is_none());
+    // and it writes nothing
+    assert!(s.set_setting("global.key", "x").is_err(), "set_setting");
+    assert!(s.create_doc("x", None, fx.a_human).is_err(), "create_doc");
+    assert!(s.create_workspace("x", None, None, None).is_err(), "create_workspace");
+    assert!(s.create_principal(PrincipalKind::Agent, "claude:x", None).is_err(), "create_principal");
+    assert!(s.rename_principal(fx.a_human, "x").is_err(), "rename_principal");
+    assert!(s.idempotency_put(fx.a_human, Uuid::now_v7(), "{}", 0, 0).is_err(), "idempotency_put");
+    let text = format!("{:?}", s.list_docs());
+    fx.no_leak("Scope::Public", &text);
+}

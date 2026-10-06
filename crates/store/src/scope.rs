@@ -45,6 +45,14 @@ impl Scope {
         matches!(self, Scope::System | Scope::Local)
     }
 
+    /// A share link's anonymous reader. `user()` is None for it as for
+    /// System/Local, so every `user()`-keyed predicate must deny it first
+    /// (`SqliteStore::deny_public`, or an empty predicate): it owns, sees and
+    /// may write nothing outside the share tables.
+    pub fn is_public(self) -> bool {
+        matches!(self, Scope::Public)
+    }
+
     /// `User(u)` for an owned thing, else Local — for background work that
     /// belongs to someone (a gardener, the memory sync) on a database that
     /// may never have had users (LOCAL mode).

@@ -31,6 +31,9 @@ impl SqliteStore {
                 )
                 .optional()?)
         };
+        if self.scope.is_public() {
+            return Ok(None);
+        }
         if let Some(v) = get(self.idem_principal(principal))? {
             return Ok(Some(v));
         }
@@ -45,6 +48,7 @@ impl SqliteStore {
     /// Record an outcome. A live row is kept (the first outcome wins); one
     /// already past every window is replaced.
     pub fn idempotency_put(&mut self, principal: Uuid, key: Uuid, response: &str, now: i64, horizon: i64) -> Result<()> {
+        self.deny_public()?;
         self.conn.execute(
             "INSERT INTO idempotency (principal, key, response, created_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (principal, key) DO UPDATE SET response = excluded.response, created_at = excluded.created_at
