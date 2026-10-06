@@ -672,6 +672,50 @@ web view. `ChartSpec.parse` (TaisceKit `Charts/`, pure) maps the JSON to a
   upscaled); tap opens full screen with pinch-zoom, pan and double-tap.
   Errors (mermaid's parse message, the timeout) show as a card.
 
+## Share links and PDF export (SERVER mode)
+
+Design: Taisce doc "Grimoire › Share links"; server side on `share-links-server`.
+Everything here is hidden for LOCAL daemons and signed-out accounts
+(`ShareLinkStore.isAvailable` = signed in).
+
+- **Snapshot** (`ShareSnapshotBuilder`, TaisceKit `Share/`): the cached blocks
+  (queued edits included) in order, comments/deleted/canvas blocks out,
+  frontmatter and a leading `# <title>` stripped. Each ```` mermaid ````,
+  ```` reladraw ```` and ```` vega-lite ```` fence becomes
+  `![alt](taisce-asset:dN.svg)`: diagrams are SVG from a dedicated offscreen
+  `DiagramWebView` (`renderSVG`, `format: 'svg'` in the page function), charts
+  PNG from Swift Charts via `ImageRenderer` (no vector export). One draw at a
+  time, each bounded (15 s); a failure or timeout becomes `dN-error.svg`, a
+  small card with the renderer's message, and is listed in "Not everything made
+  it". `![alt](https://…)` images are fetched (`URLSessionShareImageLoader`:
+  2 MB, PNG/JPEG/WebP/SVG by magic bytes) as `iN.ext`, else become a plain link.
+  The server's limits (2 MB an asset, 200 assets, 10 MB) are kept; an asset
+  over them is left out with a note. Theme: the app's current appearance.
+- **Client**: `APIClient` conforms to `ShareService` (create, list, PATCH with a
+  tri-state `expires_at`, revoke, preview, comments, owner reply, delete).
+- **UI**: the doc's ⋯ menu › Share link… (Mac: also Doc › Share Link…):
+  create with an expiry (1 hour, 1 day, 7 days default, 30 days, custom, never)
+  and comments on/off; then Copy link, comments toggle, Update link
+  (republishes the current doc at the same URL), Change expiry…, Revoke (asks
+  first); views, last opened, expired/revoked. Settings › Shared links lists
+  them all with unread badges. A doc whose links have comments shows
+  "Comments from shared links (N new)", which opens `LinkCommentsScreen`
+  (threads with author, quote, body; reply as owner; delete). Reading marks
+  them read.
+- **Push**: the server's alert push `{"kind":"share_comment","doc_id",…}`; a
+  tap (`DueAlertDelegate` → `ShareCommentPush`) opens that doc and its link
+  comments.
+- **PDF**: a light snapshot → `POST /api/shares/preview` → offscreen WKWebView
+  (no JavaScript) → `UIPrintPageRenderer` over its print formatter, paginated on
+  A4 (Letter in US/CA/…, `PaperSize`), 40 pt margins; one long page via
+  `createPDF` only if the formatter gives no pages. Mac: File › Export as PDF…
+  ⌥⌘E (⌘E is Edit, ⇧⌘E inline code) and a save panel; iPhone: the share sheet.
+  The file is named after the doc.
+- Tests: `ShareTests` (kit, mock server), `ShareLinkTests` (app: store against a
+  fake server, commands, push, real SVG/PNG renders, a long page printed to
+  several A4 pages), and `ServerIntegrationTests.t3d_shareLinksEndToEnd`
+  against a SERVER daemon (`apple/scripts/integration.sh`).
+
 ## Running the app against a scratch daemon
 
 Launch arguments (UserDefaults' argument domain) make screenshots and UI
