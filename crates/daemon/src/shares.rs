@@ -353,7 +353,7 @@ fn check_snapshot(s: SnapshotIn) -> Result<Checked, Response> {
         t @ ("light" | "dark" | "auto") => t.to_string(),
         t => return Err(err(StatusCode::BAD_REQUEST, format!("theme: light, dark or auto, got {t:?}"))),
     };
-    let title: String = s.title.nfc().filter(|c| !c.is_control()).collect::<String>().trim().chars().take(MAX_TITLE).collect();
+    let title: String = clean_label(&s.title).chars().take(MAX_TITLE).collect();
     let title = if title.is_empty() { "Untitled".to_string() } else { title };
     let mut total = s.markdown.len();
     let mut assets = Vec::with_capacity(s.assets.len());
@@ -751,18 +751,47 @@ async fn owner_delete_comment(
 
 // ---- comment text ----
 
-/// NFC, controls dropped (newlines and tabs kept), trimmed.
-fn clean_text(s: &str, keep_lines: bool) -> String {
+/// The bidi controls (embeddings, overrides, isolates and marks): they can
+/// make a comment or a name read differently from what it is.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Invisible or layout-changing in a one-line label: format characters
+/// (Cf: bidi controls, zero-width characters, the BOM) and the line and
+/// paragraph separators (Zl, Zp).
+fn invisible(c: char) -> bool {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    matches!(c.general_category(), GeneralCategory::Format | GeneralCategory::LineSeparator | GeneralCategory::ParagraphSeparator)
+}
+
+/// A one-line label (a commenter's name, a title, a quote): NFC, with
+/// controls and `invisible` characters dropped, trimmed. A notification
+/// shows these verbatim.
+fn clean_label(s: &str) -> String {
+    s.nfc().filter(|c| !c.is_control() && !invisible(*c)).collect::<String>().trim().to_string()
+}
+
+/// A comment body: NFC, controls and bidi controls dropped (newlines and
+/// tabs kept), trimmed.
+fn clean_text(s: &str) -> String {
     s.nfc()
         .map(|c| if c == '\r' { '\n' } else { c })
-        .filter(|c| !c.is_control() || (keep_lines && (*c == '\n' || *c == '\t')))
+        .filter(|c| (!c.is_control() || *c == '\n' || *c == '\t') && !is_bidi_control(*c))
         .collect::<String>()
         .trim()
         .to_string()
 }
 
+/// Does a commenter's name read as the link owner's? (NFKC, case folded,
+/// spaces collapsed)
+fn same_name(a: &str, b: &str) -> bool {
+    let fold = |s: &str| s.nfkc().collect::<String>().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    !b.trim().is_empty() && fold(a) == fold(b)
+}
+
 fn clean_body(b: &str) -> Result<String, Response> {
-    let b = clean_text(b, true);
+    let b = clean_text(b);
     match b.chars().count() {
         0 => Err(err(StatusCode::BAD_REQUEST, "body: empty")),
         n if n > MAX_COMMENT => Err(err(StatusCode::BAD_REQUEST, format!("body: at most {MAX_COMMENT} characters"))),
@@ -771,7 +800,7 @@ fn clean_body(b: &str) -> Result<String, Response> {
 }
 
 fn clean_name(n: &str) -> Result<String, Response> {
-    let n = clean_text(n, false);
+    let n = clean_label(n);
     match n.chars().count() {
         0 => Err(err(StatusCode::BAD_REQUEST, "name: empty")),
         c if c > MAX_NAME => Err(err(StatusCode::BAD_REQUEST, format!("name: at most {MAX_NAME} characters"))),
@@ -783,7 +812,7 @@ fn clean_name(n: &str) -> Result<String, Response> {
 fn clean_anchor(a: Option<Value>) -> Result<Option<Value>, Response> {
     let Some(a) = a.filter(|a| !a.is_null()) else { return Ok(None) };
     let block = a.get("block").and_then(Value::as_u64).filter(|b| *b <= 1_000_000);
-    let quote = a.get("quote").and_then(Value::as_str).map(|q| clean_text(q, false));
+    let quote = a.get("quote").and_then(Value::as_str).map(clean_label);
     match (block, quote) {
         (Some(b), Some(q)) if q.chars().count() <= MAX_QUOTE => Ok(Some(json!({"block": b, "quote": q}))),
         _ => Err(err(StatusCode::BAD_REQUEST, format!("anchor: {{block: n, quote: ≤{MAX_QUOTE} characters}}"))),
@@ -1001,6 +1030,8 @@ async fn public_comment(State(st): State<SharesState>, Path(token): Path<String>
         return public_json(StatusCode::BAD_REQUEST, json!({"error": "expected {name, body}"}));
     };
     let (name, body, anchor) = match (clean_name(&b.name), clean_body(&b.body), clean_anchor(b.anchor)) {
+        // a reader cannot sign as the link's owner (whose replies say so)
+        (Ok(n), Ok(t), Ok(a)) if same_name(&n, &sh.owner_name) => (format!("{n} (guest)"), t, a),
         (Ok(n), Ok(t), Ok(a)) => (n, t, a),
         (Err(r), _, _) | (_, Err(r), _) | (_, _, Err(r)) => {
             let mut r = r;
@@ -1094,6 +1125,27 @@ mod tests {
         assert_ne!(k1.ip_hash(id, "1.2.3.4"), k1.ip_hash(Uuid::now_v7(), "1.2.3.4"), "per link");
         std::fs::write(&path, b"short").unwrap();
         assert!(ShareKey::load_or_create(dir.path()).is_err(), "a damaged key is an error, never silently replaced");
+    }
+
+    #[test]
+    fn labels_lose_invisible_and_layout_characters_and_bodies_lose_bidi_controls() {
+        // RLO, zero-width space and joiner, BOM, LRI/PDI, line and paragraph separators
+        let name = " Ao\u{202E}ife\u{200B}\u{200D}\u{FEFF}\u{2066}x\u{2069}\u{2028}\u{2029}\u{0007} ";
+        assert_eq!(clean_label(name), "Aoifex");
+        assert_eq!(clean_name("\u{200B}\u{202E}").map_err(|r| r.status()), Err(StatusCode::BAD_REQUEST), "nothing visible left");
+        let body = "line one\r\n\u{202E}gnp.exe\u{202C} and \u{2067}x\u{2069} \u{200F}ok 👩\u{200D}💻";
+        assert_eq!(clean_text(body), "line one\n\ngnp.exe and x ok 👩\u{200D}💻", "bidi controls go; an emoji's joiner stays in a body");
+        assert_eq!(clean_label("Cafe\u{0301}"), "Café", "NFC");
+    }
+
+    #[test]
+    fn a_reader_named_like_the_owner_is_a_guest() {
+        assert!(same_name("tom", "Tom"));
+        assert!(same_name("  Tom   Meaney ", "tom meaney"));
+        assert!(same_name("Ｔｏｍ", "Tom"), "fullwidth folds under NFKC");
+        assert!(same_name("ﬁona", "Fiona"), "ligatures fold");
+        assert!(!same_name("Tomás", "Tom"));
+        assert!(!same_name("Tom", ""));
     }
 
     #[test]

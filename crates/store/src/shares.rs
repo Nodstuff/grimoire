@@ -61,6 +61,8 @@ pub struct Share {
     pub last_viewed_at: Option<i64>,
     pub comment_count: i64,
     pub unread_comments: i64,
+    /// the owner's display name (a reader cannot comment under it)
+    pub owner_name: String,
 }
 
 impl Share {
@@ -115,7 +117,8 @@ pub struct CommentCounts {
 const SHARE_COLS: &str = "s.id, s.owner_id, s.doc_id, s.title, s.theme, s.revision, s.comments_enabled,
     s.created_at, s.updated_at, s.snapshot_at, s.expires_at, s.revoked_at, s.views, s.last_viewed_at,
     (SELECT count(*) FROM share_link_comments c WHERE c.share_id = s.id),
-    (SELECT count(*) FROM share_link_comments c WHERE c.share_id = s.id AND c.is_owner = 0 AND c.read_at IS NULL)";
+    (SELECT count(*) FROM share_link_comments c WHERE c.share_id = s.id AND c.is_owner = 0 AND c.read_at IS NULL),
+    (SELECT u.name FROM auth_users u WHERE u.id = s.owner_id)";
 
 fn uuid_at(r: &Row, i: usize) -> rusqlite::Result<Uuid> {
     let s: String = r.get(i)?;
@@ -140,6 +143,7 @@ fn share_row(r: &Row) -> rusqlite::Result<Share> {
         last_viewed_at: r.get(13)?,
         comment_count: r.get(14)?,
         unread_comments: r.get(15)?,
+        owner_name: r.get::<_, Option<String>>(16)?.unwrap_or_default(),
     })
 }
 

@@ -173,6 +173,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/s/{token}", "share_link_page_headers_expiry_and_revoke"),
     ("/s/{token}/comments", "share_link_comments_honeypot_limits_and_push"),
     ("/s/{token}/comments", "the_sandboxed_page_reaches_only_its_comment_routes"),
+    ("/s/{token}/comments", "a_reader_cannot_sign_as_the_owner"),
     ("/api/shares/preview", "share_link_preview_stores_nothing_and_limits_hold"),
 ];
 
@@ -2103,4 +2104,21 @@ async fn the_sandboxed_page_reaches_only_its_comment_routes() {
     }
     let (_, out) = fx.call(&fx.a_app, "GET", "/api/shares", None).await;
     assert!(out.contains("\"revoked_at\":null"), "the link survived: {out}");
+}
+
+/// A reader cannot sign as the link's owner, nor smuggle bidi or
+/// zero-width characters into the owner's notification.
+#[tokio::test]
+async fn a_reader_cannot_sign_as_the_owner() {
+    let fx = fixture();
+    let share = fx.make_share(&fx.a_app, fx.a_secret, "Shared plan", "guesttext", "d1.svg").await;
+    let path = format!("{}/comments", link_path(&share));
+    let r = fx.raw(None, "POST", &path, Some(json!({"name": "TOM\u{200B}", "body": "it is me"}))).await;
+    assert_eq!(r.json()["author"], "TOM (guest)", "{}", r.body);
+    let r = fx.raw(None, "POST", &path, Some(json!({"name": "Rua\u{202E}nimda", "body": "\u{202E}x"}))).await;
+    assert_eq!((r.json()["author"].as_str(), r.json()["body"].as_str()), (Some("Ruanimda"), Some("x")));
+    assert_eq!(fx.alerts.lock().unwrap().last().unwrap().author, "Ruanimda");
+    // the owner's own reply keeps her name
+    let r = fx.raw(Some(&fx.a_app), "POST", &format!("/api/shares/{}/comments", share["id"].as_str().unwrap()), Some(json!({"body": "hi"}))).await;
+    assert_eq!(r.json()["author"], "Tom");
 }
