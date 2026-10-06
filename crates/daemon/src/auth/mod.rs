@@ -327,12 +327,15 @@ pub struct Authenticated {
 }
 
 /// Paths reachable with no token: discovery, the OAuth endpoints, the
-/// login/enroll pages, and the health check.
+/// login/enroll pages, the health check, and share links (`/s/…`: the
+/// link's token is the credential; `shares.rs` reads only the share tables,
+/// rate-limited per IP).
 fn is_public(path: &str) -> bool {
     path == "/healthz"
         || path.starts_with("/.well-known/")
         || path.starts_with("/oauth/")
         || path.starts_with("/auth/")
+        || path.starts_with("/s/")
 }
 
 fn under(path: &str, prefix: &str) -> bool {

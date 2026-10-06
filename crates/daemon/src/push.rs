@@ -20,7 +20,8 @@
 //!   every 20 minutes).
 //!
 //! Visible due alerts are not sent from here (the app schedules local
-//! notifications); a new [`Push`] variant is the seam for them.
+//! notifications). The one visible push is `Push::ShareComment`: someone
+//! commented on one of the person's share links (`shares.rs`).
 
 use crate::auth::Authenticated;
 use crate::changes::Feed;
@@ -182,34 +183,75 @@ impl TokenCache {
 
 // ---- what is sent, and what APNs said ----
 
-/// One push. Only change nudges for now; a visible due alert (`alert`
-/// push type, priority 10, its own collapse id per to-do) goes here when the
-/// server starts sending them.
+/// One push: a silent change nudge, or a visible alert that someone
+/// commented on one of the person's share links.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Push {
     /// Silent: the journal head moved to `seq`.
     Changes { seq: i64 },
+    /// Visible: "<author> commented on <title>". The app routes a tap on
+    /// `kind: share_comment` to that doc's link comments.
+    ShareComment { title: String, author: String, doc_id: uuid::Uuid, share_id: uuid::Uuid },
 }
 
 impl Push {
     pub fn payload(&self) -> String {
         match self {
             Push::Changes { seq } => json!({"aps": {"content-available": 1}, "seq": seq}).to_string(),
+            Push::ShareComment { title, author, doc_id, share_id } => json!({
+                "aps": {
+                    "alert": {"title": title, "body": format!("{author} commented on {title}")},
+                    "sound": "default",
+                    "thread-id": format!("share:{share_id}"),
+                },
+                "kind": "share_comment",
+                "doc_id": doc_id,
+                "share_id": share_id,
+            })
+            .to_string(),
         }
     }
     pub fn push_type(&self) -> &'static str {
         match self {
             Push::Changes { .. } => "background",
+            Push::ShareComment { .. } => "alert",
         }
     }
     pub fn priority(&self) -> &'static str {
         match self {
             Push::Changes { .. } => "5",
+            Push::ShareComment { .. } => "10",
         }
     }
-    pub fn collapse_id(&self) -> &'static str {
+    /// Change nudges collapse into the newest; every comment alert shows.
+    pub fn collapse_id(&self) -> Option<&'static str> {
         match self {
-            Push::Changes { .. } => "changes",
+            Push::Changes { .. } => Some("changes"),
+            Push::ShareComment { .. } => None,
+        }
+    }
+}
+
+/// Send a share-comment alert to every active device of `owner`, recording
+/// each outcome as the change nudges do. Fire and forget (spawned).
+pub async fn notify_share_comment<S: Sender>(store: taisce_store::SharedStore, sender: Arc<S>, owner: uuid::Uuid, push: Push) {
+    let devices = with_store(&store, Scope::System, move |s| s.push_devices_for_user(owner)).await;
+    let devices = match devices {
+        Ok(d) => d.into_iter().filter(|d| d.disabled_at.is_none()).collect::<Vec<_>>(),
+        Err(e) => return tracing::warn!("push: reading devices failed: {e}"),
+    };
+    for d in devices {
+        let out = sender.send(&d.env, &d.token, &push).await;
+        let (err, disable) = match &out {
+            Outcome::Delivered => (None, false),
+            Outcome::Gone(m) => (Some(m.clone()), true),
+            Outcome::Failed(m) => (Some(m.clone()), false),
+        };
+        let t = d.token.clone();
+        if let Err(e) =
+            with_store(&store, Scope::System, move |s| s.push_device_result(&t, err.as_deref(), disable, crate::auth::now())).await
+        {
+            tracing::warn!("push: recording the outcome failed: {e}");
         }
     }
 }
@@ -270,19 +312,19 @@ impl Sender for ApnsSender {
             Err(e) => return Outcome::Failed(e.to_string()),
         };
         let host = if env == "sandbox" { SANDBOX_HOST } else { PRODUCTION_HOST };
-        let res = self
+        let mut req = self
             .client
             .post(format!("{host}/3/device/{token}"))
             .header("authorization", format!("bearer {jwt}"))
             .header("apns-topic", &self.topic)
             .header("apns-push-type", push.push_type())
             .header("apns-priority", push.priority())
-            .header("apns-collapse-id", push.collapse_id())
             .header("apns-expiration", (now + EXPIRATION).to_string())
-            .header("content-type", "application/json")
-            .body(push.payload())
-            .send()
-            .await;
+            .header("content-type", "application/json");
+        if let Some(c) = push.collapse_id() {
+            req = req.header("apns-collapse-id", c);
+        }
+        let res = req.body(push.payload()).send().await;
         let out = match res {
             Ok(r) => {
                 let status = r.status().as_u16();
@@ -603,7 +645,7 @@ mod tests {
         assert_eq!(classify(503, "junk"), Outcome::Failed("503".into()));
         let p = Push::Changes { seq: 42 };
         assert_eq!(serde_json::from_str::<Value>(&p.payload()).unwrap(), json!({"aps": {"content-available": 1}, "seq": 42}));
-        assert_eq!((p.push_type(), p.priority(), p.collapse_id()), ("background", "5", "changes"));
+        assert_eq!((p.push_type(), p.priority(), p.collapse_id()), ("background", "5", Some("changes")));
     }
 
     #[test]
@@ -729,8 +771,12 @@ mod tests {
 
     impl Sender for Mock {
         async fn send(&self, env: &str, token: &str, push: &Push) -> Outcome {
-            let Push::Changes { seq } = push;
-            self.sent.lock().unwrap().push((env.to_string(), token.to_string(), *seq));
+            // a share-comment alert records as seq -1
+            let seq = match push {
+                Push::Changes { seq } => *seq,
+                Push::ShareComment { .. } => -1,
+            };
+            self.sent.lock().unwrap().push((env.to_string(), token.to_string(), seq));
             if token.starts_with("dead") {
                 Outcome::Gone("410 Unregistered".into())
             } else {
@@ -745,6 +791,33 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// A link comment is a visible alert to the share owner's active devices
+    /// only, in the payload the app routes on (`kind: share_comment`).
+    #[tokio::test]
+    async fn a_share_comment_alerts_only_the_owners_devices() {
+        let t = setup();
+        let other = t.store.lock(taisce_store::Scope::System).auth_add_user("Aoife", 1).unwrap().id;
+        let (mine, off, theirs) = ("aa".repeat(32), "bb".repeat(32), "cc".repeat(32));
+        {
+            let mut s = t.store.lock(taisce_store::Scope::System);
+            s.push_device_upsert(t.tom, &mine, "ios", "sandbox", "", 1).unwrap();
+            s.push_device_upsert(t.tom, &off, "ios", "production", "", 1).unwrap();
+            s.push_device_result(&off, Some("410"), true, 2).unwrap();
+            s.push_device_upsert(other, &theirs, "ios", "production", "", 1).unwrap();
+        }
+        let (doc, share) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let push = Push::ShareComment { title: "Plan".into(), author: "Aoife".into(), doc_id: doc, share_id: share };
+        let v: serde_json::Value = serde_json::from_str(&push.payload()).unwrap();
+        assert_eq!(v["aps"]["alert"]["body"], "Aoife commented on Plan");
+        assert_eq!(v["aps"]["alert"]["title"], "Plan");
+        assert_eq!(v["aps"]["thread-id"], format!("share:{share}"));
+        assert_eq!((v["kind"].as_str(), v["doc_id"].as_str(), v["share_id"].as_str()), (Some("share_comment"), Some(doc.to_string().as_str()), Some(share.to_string().as_str())));
+        assert_eq!((push.push_type(), push.priority(), push.collapse_id()), ("alert", "10", None));
+        let mock = Arc::new(Mock::default());
+        notify_share_comment(t.store.clone(), mock.clone(), t.tom, push).await;
+        assert_eq!(*mock.sent.lock().unwrap(), vec![("sandbox".to_string(), mine, -1)]);
     }
 
     #[tokio::test]

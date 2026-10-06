@@ -24,6 +24,11 @@ pub enum Scope {
     /// sits in a shared workspace read only from that workspace, so nothing
     /// private to one member is copied where the others read it.
     Within { user: Uuid, workspace: Uuid },
+    /// A reader of a public share link (`/s/{token}`): no person, and no doc
+    /// is visible (every visibility predicate is false). The share routes
+    /// read only the share tables (shares.sql); this scope makes an
+    /// accidental doc read there a NotFound instead of a leak.
+    Public,
 }
 
 impl Scope {
@@ -31,13 +36,21 @@ impl Scope {
     pub fn user(self) -> Option<Uuid> {
         match self {
             Scope::User(u) | Scope::Within { user: u, .. } => Some(u),
-            Scope::System | Scope::Local => None,
+            Scope::System | Scope::Local | Scope::Public => None,
         }
     }
 
     /// Unfiltered: System or Local.
     pub fn sees_all(self) -> bool {
         matches!(self, Scope::System | Scope::Local)
+    }
+
+    /// A share link's anonymous reader. `user()` is None for it as for
+    /// System/Local, so every `user()`-keyed predicate must deny it first
+    /// (`SqliteStore::deny_public`, or an empty predicate): it owns, sees and
+    /// may write nothing outside the share tables.
+    pub fn is_public(self) -> bool {
+        matches!(self, Scope::Public)
     }
 
     /// `User(u)` for an owned thing, else Local — for background work that

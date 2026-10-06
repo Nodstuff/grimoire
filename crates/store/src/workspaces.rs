@@ -191,6 +191,9 @@ pub(crate) fn label_conn(conn: &Connection, doc: Uuid) -> Result<Option<Uuid>> {
 /// Which workspaces a scope lists: its memberships (and, for the instance
 /// owner, any workspace with no owner recorded). System/Local: all.
 fn ws_pred(scope: Scope, col: &str) -> String {
+    if scope.is_public() {
+        return "0".into();
+    }
     match scope.user() {
         None => "1".into(),
         Some(u) => format!(
@@ -347,6 +350,7 @@ impl SqliteStore {
     /// Create a workspace owned by the scope's user (System/Local: no
     /// recorded owner = the instance owner); no sort key appends it.
     pub fn create_workspace(&mut self, name: &str, color: Option<&str>, icon: Option<&str>, sort_key: Option<&str>) -> Result<Workspace> {
+        self.deny_public()?;
         let name = clean_name(name)?;
         let color = clean_attr("color", color)?;
         let icon = clean_attr("icon", icon)?;
@@ -664,7 +668,9 @@ impl SqliteStore {
             params![ws.to_string(), user.to_string()],
         )?;
         tenancy::journal_access_diff(&tx, before)?;
-        tenancy::audit_conn(&tx, self.scope.user(), "workspace.unshare", &ws.to_string(), &serde_json::json!({"user": user, "removed": n > 0}))?;
+        // their links to its docs die with their access
+        let revoked = if n > 0 { crate::shares::revoke_on_unshare(&tx, ws, user)? } else { 0 };
+        tenancy::audit_conn(&tx, self.scope.user(), "workspace.unshare", &ws.to_string(), &serde_json::json!({"user": user, "removed": n > 0, "links_revoked": revoked}))?;
         tx.commit()?;
         Ok(n > 0)
     }

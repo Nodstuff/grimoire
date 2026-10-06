@@ -4,6 +4,15 @@
 //! redirect (carrying the code). Never part of the shipped binary.
 //!
 //!   cargo run --example softpasskey -- <enroll-url> <authorize-url>
+//!
+//! The server enrolls discoverable passkeys (`residentKey: required`) and
+//! signs in with an empty `allowCredentials` (ADR 0004). webauthn-rs's
+//! SoftPasskey is U2F underneath: it can neither store a resident key nor
+//! find one, so this tool plays that part the way `auth::tests` does: it
+//! drops the legacy `requireResidentKey` flag after checking enrollment asks
+//! for a discoverable credential, and at sign-in names the credential it
+//! just made, as a platform authenticator finding its own passkey would.
+//! The signed clientData is the server's challenge, unchanged.
 
 use serde_json::{Value, json};
 use webauthn_authenticator_rs::WebauthnAuthenticator;
@@ -28,8 +37,15 @@ async fn main() -> anyhow::Result<()> {
 
     let t = enroll.query_pairs().find(|(k, _)| k == "t").map(|(_, v)| v.into_owned()).unwrap_or_default();
     let b: Value = post("/auth/enroll/begin", json!({"t": t, "label": "softpasskey"})).await?.json().await?;
-    let ccr: CreationChallengeResponse = serde_json::from_value(b["options"].clone())?;
+    let mut options = b["options"].clone();
+    let sel = options
+        .pointer_mut("/publicKey/authenticatorSelection")
+        .ok_or_else(|| anyhow::anyhow!("enrollment options without authenticatorSelection"))?;
+    anyhow::ensure!(sel["residentKey"] == "required", "the server no longer asks for a discoverable passkey: {sel}");
+    sel["requireResidentKey"] = json!(false);
+    let ccr: CreationChallengeResponse = serde_json::from_value(options)?;
     let cred = pk.do_registration(origin.clone(), ccr).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let cred_id = serde_json::to_value(&cred)?["id"].as_str().unwrap_or_default().to_string();
     let f: Value = post("/auth/enroll/finish", json!({"ceremony": b["ceremony"], "credential": cred})).await?.json().await?;
     eprintln!("enroll: {f}");
 
@@ -38,7 +54,10 @@ async fn main() -> anyhow::Result<()> {
         .captures(&page)
         .map(|c| c[1].to_string())
         .ok_or_else(|| anyhow::anyhow!("no sign-in request on the authorize page:\n{page}"))?;
-    let rcr: RequestChallengeResponse = post("/oauth/authorize/begin", json!({"req": req})).await?.json().await?;
+    let mut options: Value = post("/oauth/authorize/begin", json!({"req": req})).await?.json().await?;
+    anyhow::ensure!(options["publicKey"]["allowCredentials"] == json!([]), "sign-in names a credential: {options}");
+    options["publicKey"]["allowCredentials"] = json!([{"type": "public-key", "id": cred_id}]);
+    let rcr: RequestChallengeResponse = serde_json::from_value(options)?;
     let a = pk.do_authentication(origin, rcr).map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let r: Value = post("/oauth/authorize/finish", json!({"req": req, "credential": a})).await?.json().await?;
     println!("{}", r["redirect"].as_str().unwrap_or(&r.to_string()));

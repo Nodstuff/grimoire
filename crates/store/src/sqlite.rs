@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("schema.sql");
 const WORKSPACES_SCHEMA: &str = include_str!("workspaces.sql");
+const SHARES_SCHEMA: &str = include_str!("shares.sql");
 
 pub struct SqliteStore {
     pub(crate) conn: Connection,
@@ -54,6 +55,7 @@ impl SqliteStore {
         migrate_pre_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(WORKSPACES_SCHEMA)?;
+        conn.execute_batch(SHARES_SCHEMA)?;
         backfill(&conn)?;
         Ok(Self { conn, scope: Scope::System })
     }
@@ -484,7 +486,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -537,6 +539,10 @@ fn backfill(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // v10: share links (shares.sql: share_links, share_link_assets,
+    // share_link_comments and the doc-purge trigger; never a table named
+    // `shares`, which drop_federation_tables removes). Created IF NOT EXISTS
+    // by init; nothing to backfill.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -1519,6 +1525,7 @@ impl BlockStore for SqliteStore {
         display_name: &str,
         pubkey: Option<&str>,
     ) -> Result<Principal> {
+        self.deny_public()?;
         let id = Uuid::now_v7();
         // ADR 0004: an agent belongs to the person it acts for — the same
         // label under two users is two principals (NULL = the instance owner)
@@ -1583,6 +1590,7 @@ impl BlockStore for SqliteStore {
                 return Err(StoreError::InvalidOp("that name is taken".into()));
             }
         }
+        self.deny_public()?;
         if let Some(u) = self.scope.user() {
             let mine: bool = self.conn.query_row(
                 "SELECT EXISTS (SELECT 1 FROM auth_users WHERE id = ?1 AND principal_id = ?2)",
@@ -1619,6 +1627,7 @@ impl BlockStore for SqliteStore {
                 .optional()?)
         };
         match self.scope.user() {
+            None if self.scope.is_public() => Ok(None),
             None => get(key),
             // a user's settings are theirs (ADR 0004); the instance owner
             // still reads what the single-user install recorded
@@ -1631,6 +1640,7 @@ impl BlockStore for SqliteStore {
     }
 
     fn set_setting(&mut self, key: &str, value: &str) -> Result<()> {
+        self.deny_public()?;
         let key = &match self.scope.user() {
             Some(u) => user_setting_key(u, key),
             None => key.to_string(),
@@ -1649,6 +1659,7 @@ impl BlockStore for SqliteStore {
         // can see or work for them — not every name on the server: an agent's
         // label can say what someone else is working on (ADR 0004)
         let filter = match self.scope.user() {
+            None if self.scope.is_public() => "WHERE 0".to_string(),
             None => String::new(),
             Some(u) => {
                 let vis = self.vis("v.id");
@@ -2396,6 +2407,7 @@ impl BlockStore for SqliteStore {
         let id = Uuid::now_v7();
         // a gardener works for someone: the creating user, else (the admin
         // CLI) the instance owner
+        self.deny_public()?;
         let owner = match self.scope.user() {
             Some(u) => Some(u),
             None => self.instance_owner()?,
@@ -3674,6 +3686,7 @@ impl SqliteStore {
         // global rows the viewer can see now, plus the rows addressed to
         // them (access gained / revoked); System/Local read global rows only
         let filter = match self.scope.user() {
+            None if self.scope.is_public() => "0".to_string(),
             None => "c.user_id IS NULL".to_string(),
             Some(u) => format!(
                 "((c.user_id IS NULL AND {} AND {}) OR c.user_id = '{u}')",
@@ -4007,6 +4020,15 @@ fn check_subtree_writable(conn: &Connection, scope: Scope, doc: Uuid) -> Result<
 }
 
 impl SqliteStore {
+    /// Refuse a share-link reader (`Scope::Public`) on any path keyed by
+    /// `scope.user()`, where None would otherwise mean System/Local.
+    pub(crate) fn deny_public(&self) -> Result<()> {
+        if self.scope.is_public() {
+            return Err(StoreError::NotFound("not available to a share-link reader".into()));
+        }
+        Ok(())
+    }
+
     /// NotFound unless the scope can see `doc`.
     pub(crate) fn see(&self, doc: Uuid) -> Result<()> {
         tenancy::ensure_visible_conn(&self.conn, self.scope, doc)
@@ -4128,6 +4150,9 @@ impl SqliteStore {
     /// Gardeners a scope may see: its user's own (NULL owner = the instance
     /// owner's); System/Local see all.
     pub(crate) fn gardener_pred(&self, col: &str) -> String {
+        if self.scope.is_public() {
+            return "0".into();
+        }
         match self.scope.user() {
             None => "1".into(),
             Some(u) => format!("COALESCE({col}, {}) = '{u}'", tenancy::INSTANCE_OWNER_SQL),
@@ -4138,6 +4163,7 @@ impl SqliteStore {
     /// write check on the parent); a root, the creating user (None in
     /// System/Local = the instance owner).
     pub(crate) fn new_doc_owner(&self, parent: Option<Uuid>) -> Result<Option<Uuid>> {
+        self.deny_public()?;
         match parent {
             Some(p) => {
                 self.may_write(p)?;

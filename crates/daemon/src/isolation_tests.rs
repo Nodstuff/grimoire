@@ -160,6 +160,27 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/docs", "a_web_session_for_b_sees_none_of_as_data"),
     ("/api/workspaces/{id}/members", "the_owner_shares_from_the_web_ui_and_a_session_get_writes_nothing"),
     ("/api/todo", "the_owner_shares_from_the_web_ui_and_a_session_get_writes_nothing"),
+    // share links (shares.rs): the owner's routes are hers alone; the public
+    // routes read only the share tables, one token's snapshot each
+    ("/api/shares", "share_links_are_the_owners_alone"),
+    ("/api/shares", "links_follow_their_makers_access"),
+    ("/api/shares/preview", "share_links_are_the_owners_alone"),
+    ("/api/shares/{id}", "share_links_are_the_owners_alone"),
+    ("/api/shares/{id}", "share_link_caps_per_person_and_per_link"),
+    ("/api/shares/{id}/comments", "share_links_are_the_owners_alone"),
+    ("/api/shares/{id}/comments/{cid}", "share_links_are_the_owners_alone"),
+    ("/api/shares/{id}/comments/read", "share_links_are_the_owners_alone"),
+    ("/api/shares/{id}/comments/read", "share_link_comments_honeypot_limits_and_push"),
+    ("/s/{token}", "a_share_link_serves_only_its_own_snapshot"),
+    ("/s/{token}/a/{name}", "a_share_link_serves_only_its_own_snapshot"),
+    ("/s/{token}/a/{name}", "a_hammered_link_is_limited_per_link_and_images_are_cached"),
+    ("/s/{token}/comments", "a_share_link_serves_only_its_own_snapshot"),
+    ("/s/{token}", "share_link_page_headers_expiry_and_revoke"),
+    ("/s/{token}/comments", "share_link_comments_honeypot_limits_and_push"),
+    ("/s/{token}/comments", "the_sandboxed_page_reaches_only_its_comment_routes"),
+    ("/s/{token}/comments", "a_reader_cannot_sign_as_the_owner"),
+    ("/s/{token}/comments", "public_comment_content_type_and_preview_images"),
+    ("/api/shares/preview", "share_link_preview_stores_nothing_and_limits_hold"),
 ];
 
 thread_local! {
@@ -197,6 +218,8 @@ struct Fx {
     b_doc: Uuid,
     /// B is signed in through the web UI (`b_app` is `cookie:<value>`)
     cookie: bool,
+    /// share-link comment alerts the notifier was handed (APNs stand-in)
+    alerts: std::sync::Arc<std::sync::Mutex<Vec<crate::shares::CommentAlert>>>,
 }
 
 fn para(content: &str) -> (Uuid, OpInput) {
@@ -303,6 +326,7 @@ fn fixture() -> Fx {
 
     let cfg = AuthConfig::from_public_url(BASE).unwrap();
     let st = AuthState::new(cfg, store.clone()).unwrap();
+    let alerts: std::sync::Arc<std::sync::Mutex<Vec<crate::shares::CommentAlert>>> = Default::default();
     let hosts = vec![st.cfg.authority(), st.cfg.rp_id.clone()];
     let dedupe = crate::mcp::new_dedupe();
     let dir = std::env::temp_dir().join(format!("taisce-isolation-{}", Uuid::now_v7()));
@@ -319,6 +343,20 @@ fn fixture() -> Fx {
         .merge(crate::admin::router(store.clone(), crate::admin::AdminToken::fixed("admintok"), true))
         .merge(crate::push::router(crate::push::DevicesState { store: store.clone(), default_env: "production".into() }))
         .merge(crate::auth::router(st.clone()))
+        .merge(crate::shares::router(crate::shares::SharesState {
+            store: store.clone(),
+            local_human: a_human,
+            server: Some(crate::shares::ServerSide {
+                cfg: st.cfg.clone(),
+                    caches: Default::default(),
+                key: std::sync::Arc::new(crate::shares::ShareKey::from_bytes(&[7; 32])),
+                limiter: st.limiter.clone(),
+                notify: Some({
+                    let alerts = alerts.clone();
+                    std::sync::Arc::new(move |a| alerts.lock().unwrap().push(a))
+                }),
+            }),
+        }))
         .layer(axum::middleware::from_fn_with_state(st, require_auth));
     Fx {
         app,
@@ -343,6 +381,7 @@ fn fixture() -> Fx {
         shared_block,
         b_doc,
         cookie,
+        alerts,
     }
 }
 
@@ -1071,6 +1110,7 @@ fn every_route_and_tool_is_covered() {
         include_str!("admin.rs"),
         include_str!("auth/oauth.rs"),
         include_str!("auth/web.rs"),
+        include_str!("shares.rs"),
     ];
     let re = regex::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
     let covered: std::collections::HashSet<&str> = COVERAGE.iter().map(|(p, _)| *p).collect();
@@ -1563,4 +1603,680 @@ async fn web_session_routes_answer_only_for_the_caller() {
     let res = fx.app.clone().oneshot(req).await.unwrap();
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     fx.no_leak("/auth/web/begin", &String::from_utf8_lossy(&bytes));
+}
+
+// ---- share links (shares.rs) ----
+
+/// A diagram that tries to run script: served, but never as a document
+/// that can.
+const EVIL_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><script>alert(document.cookie)</script><rect width="10" height="10"/></svg>"#;
+
+fn b64(b: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+/// A snapshot as the app uploads it: frontmatter, raw HTML, a javascript:
+/// link and one SVG asset (`asset`).
+fn snapshot(title: &str, text: &str, asset: &str) -> Value {
+    json!({
+        "title": title,
+        "markdown": format!("---\ntags: [hiddenfront]\n---\n# {title}\n\n{text}\n\n![diagram](taisce-asset:{asset})\n\n<script>alert(1)</script>\n\n[bad](javascript:alert(1))\n"),
+        "assets": [{"name": asset, "content_type": "image/svg+xml", "data": b64(EVIL_SVG.as_bytes()), "width": 640, "height": 320}],
+        "theme": "auto",
+    })
+}
+
+struct Raw {
+    status: StatusCode,
+    headers: axum::http::HeaderMap,
+    body: String,
+}
+
+impl Raw {
+    fn h(&self, k: &str) -> &str {
+        self.headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("")
+    }
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.body).unwrap_or(Value::Null)
+    }
+}
+
+impl Fx {
+    /// A request with its headers back; `token` None = anonymous.
+    async fn raw(&self, token: Option<&str>, method: &str, path: &str, body: Option<Value>) -> Raw {
+        let mut b = Request::builder().method(method).uri(path).header("host", "localhost:7513");
+        if let Some(t) = token {
+            b = authed(b, t, method);
+        }
+        let body = match body {
+            Some(v) => {
+                b = b.header("content-type", "application/json");
+                Body::from(v.to_string())
+            }
+            None => Body::empty(),
+        };
+        let res = self.app.clone().oneshot(b.body(body).unwrap()).await.unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        Raw { status, headers, body: String::from_utf8_lossy(&bytes).into_owned() }
+    }
+
+    /// Publish `doc` as `token`'s person; the Share.
+    async fn make_share(&self, token: &str, doc: Uuid, title: &str, text: &str, asset: &str) -> Value {
+        let r = self
+            .raw(Some(token), "POST", "/api/shares", Some(json!({"doc_id": doc, "snapshot": snapshot(title, text, asset), "expires_at": null, "comments_enabled": true})))
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+        r.json()
+    }
+}
+
+fn link_path(share: &Value) -> String {
+    let url = share["url"].as_str().unwrap();
+    assert!(url.starts_with(&format!("{BASE}/s/")), "{url}");
+    url[BASE.len()..].to_string()
+}
+
+/// ADR 0004 for share links: B cannot list, change, revoke or read the
+/// comments of A's links, nor share a doc of A's she cannot see; each
+/// answers exactly like a share or doc that never existed. Connectors and
+/// PATs are refused (human-only, like membership).
+#[tokio::test]
+async fn share_links_are_the_owners_alone() {
+    let fx = fixture();
+    let a_share = fx.make_share(&fx.a_app, fx.a_secret, "Shared plan", "ownersnapshot", "d1.svg").await;
+    let id = a_share["id"].as_str().unwrap().to_string();
+    let token = link_path(&a_share).trim_start_matches("/s/").to_string();
+    // B's lists are empty
+    for path in ["/api/shares".to_string(), format!("/api/shares?doc_id={}", fx.a_secret)] {
+        let (st, out) = fx.b("GET", &path, None).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["shares"], json!([]), "{path}: {out}");
+        assert!(!out.contains(&id) && !out.contains(&token), "{out}");
+        fx.no_leak(&path, &out);
+    }
+    // every by-id route on A's share: 404, as for a share that never was
+    let missing = Uuid::now_v7().to_string();
+    for (m, tail, body) in [
+        ("PATCH", "", Some(json!({"comments_enabled": false}))),
+        ("DELETE", "", None),
+        ("GET", "/comments", None),
+        ("POST", "/comments", Some(json!({"body": "sneaky"}))),
+        ("POST", "/comments/read", Some(json!({}))),
+        ("DELETE", &format!("/comments/{}", Uuid::now_v7()), None),
+    ] {
+        let got = fx.b(m, &format!("/api/shares/{id}{tail}"), body.clone()).await;
+        let none = fx.b(m, &format!("/api/shares/{missing}{tail}"), body).await;
+        assert_eq!(got.0, StatusCode::NOT_FOUND, "{m} {tail}: {}", got.1);
+        assert_eq!(none.0, StatusCode::NOT_FOUND, "{m} {tail} (missing): {}", none.1);
+        assert_eq!(got.1.replace(&id, "ID"), none.1.replace(&missing, "ID"), "{m} {tail}");
+        fx.no_leak(m, &got.1);
+    }
+    // B cannot publish A's private doc: like a doc that never existed
+    let snap = snapshot("x", "y", "d1.svg");
+    let nodoc = Uuid::now_v7();
+    let got = fx.b("POST", "/api/shares", Some(json!({"doc_id": fx.a_secret, "snapshot": snap}))).await;
+    let none = fx.b("POST", "/api/shares", Some(json!({"doc_id": nodoc, "snapshot": snap}))).await;
+    assert_eq!((got.0, none.0), (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND), "{} / {}", got.1, none.1);
+    assert_eq!(got.1.replace(&fx.a_secret.to_string(), "ID"), none.1.replace(&nodoc.to_string(), "ID"));
+    fx.no_leak_besides("POST /api/shares", &got.1, &[fx.a_secret]);
+    // a viewer of the shared Family doc may not publish it (403: she can see it)
+    let r = fx.raw(Some(&fx.b_app), "POST", "/api/shares", Some(json!({"doc_id": fx.shared_doc, "snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
+    // connectors are refused (403); a PAT never opens /api (401)
+    for (m, path, body) in [
+        ("GET", "/api/shares".to_string(), None),
+        ("POST", "/api/shares".to_string(), Some(json!({"doc_id": fx.b_doc, "snapshot": snap}))),
+        ("POST", "/api/shares/preview".to_string(), Some(json!({"snapshot": snap}))),
+        ("GET", format!("/api/shares/{id}/comments"), None),
+    ] {
+        let (st, out) = fx.call(&fx.b_conn, m, &path, body.clone()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "connector {m} {path}: {out}");
+        let (st, _) = fx.call(&fx.b_pat, m, &path, body).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "PAT {m} {path}");
+    }
+    // A's own share is untouched, and her browser may make one too
+    let (st, out) = fx.call(&fx.a_app, "GET", &format!("/api/shares?doc_id={}", fx.a_secret), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let mine: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(mine["shares"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!((mine["shares"][0]["revoked_at"].clone(), mine["shares"][0]["comments_enabled"].clone()), (Value::Null, json!(true)));
+    let tom = web_session(&mut fx.store.lock(Scope::System), fx.a);
+    fx.make_share(&tom, fx.a_loose, "From the browser", "websnap", "w.svg").await;
+    // the token is never in the database (nor so in a backup or replica)
+    let token = link_path(&a_share).trim_start_matches("/s/").to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("copy.db");
+    fx.store.lock(Scope::System).backup_to(&copy).unwrap();
+    let bytes = std::fs::read(&copy).unwrap();
+    assert!(!bytes.windows(token.len()).any(|w| w == token.as_bytes()), "the link token is stored");
+    assert!(bytes.windows(64).any(|w| w == hash_secret(&token).as_bytes()), "its hash is");
+}
+
+/// The public routes serve one token's snapshot and nothing else: never the
+/// live doc, never another link's text, images or comments.
+#[tokio::test]
+async fn a_share_link_serves_only_its_own_snapshot() {
+    let fx = fixture();
+    let a = fx.make_share(&fx.a_app, fx.a_secret, "Shared plan", "snapshottext", "d1.svg").await;
+    let b = fx.make_share(&fx.b_app, fx.b_doc, "Aoife plan", "aoifesnapshot", "b1.svg").await;
+    let (pa, pb) = (link_path(&a), link_path(&b));
+    let page = fx.raw(None, "GET", &pa, None).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(page.body.contains("snapshottext") && page.body.contains("Shared plan"), "{}", page.body);
+    for not in ["aoifesnapshot", "zebrasecret", "Salary review", "hiddenfront", "javascript:alert"] {
+        assert!(!page.body.contains(not), "the page shows {not:?}");
+    }
+    assert_eq!(page.body.matches("<script").count(), 1, "only the nonce'd comment script runs");
+    assert!(page.body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(page.body.contains(&format!("<img src=\"{pa}/a/d1.svg\"")), "taisce-asset: rewritten");
+    assert!(page.body.contains("data-b=\"0\"") && page.body.contains("Shared from Taisce · snapshot of"));
+    // images: its own, never another link's
+    assert_eq!(fx.raw(None, "GET", &format!("{pa}/a/d1.svg"), None).await.status, StatusCode::OK);
+    assert_eq!(fx.raw(None, "GET", &format!("{pa}/a/b1.svg"), None).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(fx.raw(None, "GET", &format!("{pb}/a/b1.svg"), None).await.status, StatusCode::OK);
+    // comments: each link's own
+    let r = fx.raw(None, "POST", &format!("{pb}/comments"), Some(json!({"name": "Rua", "body": "onlyonb"}))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let ca = fx.raw(None, "GET", &format!("{pa}/comments"), None).await;
+    assert_eq!(ca.status, StatusCode::OK);
+    assert_eq!(ca.json()["comments"], json!([]), "{}", ca.body);
+    assert!(fx.raw(None, "GET", &format!("{pb}/comments"), None).await.body.contains("onlyonb"));
+    // an unknown or malformed token is 404, and a bearer changes nothing
+    let unknown = format!("/s/{}", random_token());
+    for path in [unknown.clone(), format!("{unknown}/comments"), format!("{unknown}/a/d1.svg"), "/s/short".into(), "/s/short/comments".into()] {
+        let r = fx.raw(None, "GET", &path, None).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{path}: {}", r.body);
+        fx.no_leak(&path, &r.body);
+    }
+    let with_bearer = fx.raw(Some(&fx.b_app), "GET", &pa, None).await;
+    assert!(with_bearer.body.contains("snapshottext") && !with_bearer.body.contains("aoifesnapshot"));
+}
+
+/// Every header the contract names, on the page, an image and a 404/410;
+/// views count; expiry and revoke answer 410 everywhere.
+#[tokio::test]
+async fn share_link_page_headers_expiry_and_revoke() {
+    let fx = fixture();
+    let share = fx.make_share(&fx.a_app, fx.a_secret, "Shared plan", "headertext", "d1.svg").await;
+    let id: Uuid = share["id"].as_str().unwrap().parse().unwrap();
+    let p = link_path(&share);
+    let page = fx.raw(None, "GET", &p, None).await;
+    assert_eq!(page.status, StatusCode::OK);
+    let nonce = page.body.split("<script nonce=\"").nth(1).unwrap().split('"').next().unwrap();
+    assert!(nonce.len() >= 32, "a fresh random nonce: {nonce}");
+    assert_eq!(page.h("content-security-policy"), crate::shares::page_csp(nonce));
+    assert_eq!(
+        page.h("content-security-policy"),
+        format!("default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'nonce-{nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox")
+    );
+    assert_eq!(page.h("x-robots-tag"), "noindex, nofollow");
+    assert_eq!(page.h("referrer-policy"), "no-referrer");
+    assert_eq!(page.h("cache-control"), "private, no-store");
+    assert!(page.h("content-type").starts_with("text/html"));
+    let again = fx.raw(None, "GET", &p, None).await;
+    assert_ne!(again.h("content-security-policy"), page.h("content-security-policy"), "a nonce per response");
+    // views
+    let (_, out) = fx.call(&fx.a_app, "GET", "/api/shares", None).await;
+    let listed: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(listed["shares"][0]["views"], 1, "two views in a minute count once: {out}");
+    assert!(listed["shares"][0]["last_viewed_at"].is_string());
+    // the malicious SVG: served as itself, sandboxed, never sniffed
+    let svg = fx.raw(None, "GET", &format!("{p}/a/d1.svg"), None).await;
+    assert_eq!(svg.status, StatusCode::OK);
+    assert_eq!(svg.body, EVIL_SVG);
+    assert_eq!(svg.h("content-type"), "image/svg+xml");
+    assert_eq!(svg.h("content-security-policy"), "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+    assert_eq!(svg.h("x-content-type-options"), "nosniff");
+    assert_eq!(svg.h("content-disposition"), "inline");
+    assert_eq!(svg.h("x-robots-tag"), "noindex, nofollow");
+    // a new snapshot: same link, next revision
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"snapshot": snapshot("Shared plan", "secondrev", "d2.svg")}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!((r.json()["revision"].clone(), r.json()["url"].clone()), (json!(2), share["url"].clone()));
+    let page = fx.raw(None, "GET", &p, None).await;
+    assert!(page.body.contains("secondrev") && !page.body.contains("headertext"));
+    assert_eq!(fx.raw(None, "GET", &format!("{p}/a/d1.svg"), None).await.status, StatusCode::NOT_FOUND, "the old images went with the old snapshot");
+    // an expiry in the past is refused; one that passes answers 410 everywhere
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"expires_at": "2020-01-01T00:00:00Z"}))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"expires_at": "2099-01-01T00:00:00Z"}))).await;
+    assert_eq!(r.json()["expires_at"], "2099-01-01T00:00:00Z");
+    fx.store
+        .lock(Scope::System)
+        .share_update(id, taisce_store::shares::SharePatch { expires_at: Some(Some(now() - 1)), ..Default::default() }, now())
+        .unwrap();
+    let f = &fx;
+    let gone = |path: String| async move { f.raw(None, "GET", &path, None).await };
+    for path in [p.clone(), format!("{p}/a/d2.svg"), format!("{p}/comments")] {
+        let r = gone(path.clone()).await;
+        assert_eq!(r.status, StatusCode::GONE, "expired {path}: {}", r.body);
+        assert_eq!(r.h("x-robots-tag"), "noindex, nofollow");
+        assert!(!r.body.contains("secondrev"));
+    }
+    assert!(fx.raw(None, "GET", &p, None).await.h("content-security-policy").contains("script-src 'none'"));
+    let r = fx.raw(None, "POST", &format!("{p}/comments"), Some(json!({"name": "R", "body": "late"}))).await;
+    assert_eq!(r.status, StatusCode::GONE);
+    // revoke: 204, the row stays with revoked_at, the link is dead for good
+    let s2 = fx.make_share(&fx.a_app, fx.a_secret, "Second", "revoketext", "d1.svg").await;
+    let p2 = link_path(&s2);
+    assert_eq!(fx.raw(None, "GET", &p2, None).await.status, StatusCode::OK);
+    let r = fx.raw(Some(&fx.a_app), "DELETE", &format!("/api/shares/{}", s2["id"].as_str().unwrap()), None).await;
+    assert_eq!((r.status, r.body.as_str()), (StatusCode::NO_CONTENT, ""));
+    for path in [p2.clone(), format!("{p2}/a/d1.svg"), format!("{p2}/comments")] {
+        assert_eq!(fx.raw(None, "GET", &path, None).await.status, StatusCode::GONE, "revoked {path}");
+    }
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{}", s2["id"].as_str().unwrap()), Some(json!({"comments_enabled": false}))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    let (_, out) = fx.call(&fx.a_app, "GET", "/api/shares", None).await;
+    let all: Value = serde_json::from_str(&out).unwrap();
+    assert!(all["shares"].as_array().unwrap().iter().any(|s| s["id"] == s2["id"] && s["revoked_at"].is_string()), "{out}");
+}
+
+/// Comments from a link: stored and pushed to the owner; the honeypot
+/// stores nothing; per-IP limits answer 429; comments off answers 403; the
+/// owner reads (marking read), replies and deletes.
+#[tokio::test]
+async fn share_link_comments_honeypot_limits_and_push() {
+    let fx = fixture();
+    let share = fx.make_share(&fx.a_app, fx.a_secret, "Shared plan", "commenttext", "d1.svg").await;
+    let id = share["id"].as_str().unwrap().to_string();
+    let p = link_path(&share);
+    let f = &fx;
+    let post = |body: Value| {
+        let path = format!("{p}/comments");
+        async move { f.raw(None, "POST", &path, Some(body)).await }
+    };
+    let r = post(json!({"name": " Aoife\u{0007} ", "body": "  Cafe\u{0301} looks good  ", "anchor": {"block": 1, "quote": "commenttext"}})).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let c = r.json();
+    assert_eq!((c["author"].as_str(), c["body"].as_str(), c["is_owner"].as_bool()), (Some("Aoife"), Some("Café looks good"), Some(false)), "NFC, trimmed, controls dropped");
+    assert_eq!(c["anchor"], json!({"block": 1, "quote": "commenttext"}));
+    assert_eq!(r.h("cache-control"), "private, no-store");
+    {
+        let alerts = fx.alerts.lock().unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!((alerts[0].owner, alerts[0].title.as_str(), alerts[0].author.as_str()), (fx.a, "Shared plan", "Aoife"));
+        assert_eq!(alerts[0].doc_id, fx.a_secret);
+    }
+    // the honeypot: 201, nothing stored, nothing pushed
+    let r = post(json!({"name": "Bot", "body": "buy now", "website": "http://spam.example"})).await;
+    assert_eq!(r.status, StatusCode::CREATED);
+    assert_eq!(fx.alerts.lock().unwrap().len(), 1);
+    let listed = fx.raw(None, "GET", &format!("{p}/comments"), None).await.json();
+    assert_eq!(listed["comments"].as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed["enabled"], true);
+    // bad input
+    for bad in [json!({"name": "x".repeat(61), "body": "b"}), json!({"name": "n", "body": "   "}), json!({"name": "n", "body": "y".repeat(4001)}), json!({"name": "", "body": "b"}), json!({"name": "n", "body": "b", "anchor": {"block": "x"}})] {
+        assert_eq!(post(bad.clone()).await.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    // the owner: unread, read, reply (signed with her name), delete
+    let (_, out) = fx.call(&fx.a_app, "GET", "/api/shares", None).await;
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["shares"][0]["unread_comments"], 1, "{out}");
+    let r = fx.raw(Some(&fx.a_app), "GET", &format!("/api/shares/{id}/comments"), None).await;
+    assert_eq!(r.json()["comments"].as_array().unwrap().len(), 1, "{}", r.body);
+    let (_, out) = fx.call(&fx.a_app, "GET", "/api/shares", None).await;
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["shares"][0]["unread_comments"], 1, "a GET marks nothing: {out}");
+    // B cannot mark A's; A marks hers
+    assert_eq!(fx.raw(Some(&fx.b_app), "POST", &format!("/api/shares/{id}/comments/read"), Some(json!({}))).await.status, StatusCode::NOT_FOUND);
+    let r = fx.raw(Some(&fx.a_app), "POST", &format!("/api/shares/{id}/comments/read"), Some(json!({}))).await;
+    assert_eq!(r.json(), json!({"marked": 1}), "{}", r.body);
+    let (_, out) = fx.call(&fx.a_app, "GET", "/api/shares", None).await;
+    let s0 = &serde_json::from_str::<Value>(&out).unwrap()["shares"][0];
+    assert_eq!((s0["unread_comments"].clone(), s0["comment_count"].clone()), (json!(0), json!(1)), "{out}");
+    let r = fx.raw(Some(&fx.a_app), "POST", &format!("/api/shares/{id}/comments"), Some(json!({"body": "thanks", "parent_id": c["id"]}))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let reply = r.json();
+    assert_eq!((reply["author"].as_str(), reply["is_owner"].as_bool(), reply["parent_id"].clone()), (Some("Tom"), Some(true), c["id"].clone()));
+    assert_eq!(fx.raw(None, "GET", &format!("{p}/comments"), None).await.json()["comments"].as_array().unwrap().len(), 2);
+    // a reader's reply to the owner's reply threads under the root
+    let r = post(json!({"name": "Aoife", "body": "great", "parent_id": reply["id"]})).await;
+    assert_eq!(r.json()["parent_id"], c["id"]);
+    // the per-IP limit: 10 an hour (two used), then 429
+    for i in 0..8 {
+        assert_eq!(post(json!({"name": "Aoife", "body": format!("n{i}")})).await.status, StatusCode::CREATED, "comment {i}");
+    }
+    let r = post(json!({"name": "Aoife", "body": "one too many"})).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
+    // delete: the comment and its replies
+    let r = fx.raw(Some(&fx.a_app), "DELETE", &format!("/api/shares/{id}/comments/{}", c["id"].as_str().unwrap()), None).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let left = fx.raw(None, "GET", &format!("{p}/comments"), None).await.json();
+    assert!(left["comments"].as_array().unwrap().iter().all(|x| x["id"] != c["id"] && x["parent_id"] != c["id"]), "{left}");
+    let r = fx.raw(Some(&fx.a_app), "DELETE", &format!("/api/shares/{id}/comments/{}", c["id"].as_str().unwrap()), None).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // comments off: 403 to post, an empty disabled list to read, no panel
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"comments_enabled": false}))).await;
+    assert_eq!(r.json()["comments_enabled"], false);
+    assert_eq!(post(json!({"name": "R", "body": "hi"})).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(fx.raw(None, "GET", &format!("{p}/comments"), None).await.json(), json!({"comments": [], "enabled": false}));
+    let page = fx.raw(None, "GET", &p, None).await;
+    assert!(page.body.contains("data-comments=\"off\"") && !page.body.contains("id=\"comments\""));
+    // and every /s/ request draws from the per-IP bucket: 429 once spent
+    let mut limited = false;
+    for _ in 0..200 {
+        if fx.raw(None, "GET", &p, None).await.status == StatusCode::TOO_MANY_REQUESTS {
+            limited = true;
+            break;
+        }
+    }
+    assert!(limited, "the per-IP limit never answered 429");
+}
+
+/// Preview renders the page (images inline as data: URLs, no script) and
+/// stores nothing; the snapshot limits answer 413, bad assets 400; LOCAL
+/// mode has no share links at all.
+#[tokio::test]
+async fn share_link_preview_stores_nothing_and_limits_hold() {
+    let fx = fixture();
+    let count = || fx.store.lock(Scope::User(fx.a)).shares_list(None).unwrap().len();
+    let r = fx.raw(Some(&fx.a_app), "POST", "/api/shares/preview", Some(json!({"snapshot": snapshot("Preview", "previewtext", "d1.svg")}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let html = r.json()["html"].as_str().unwrap().to_string();
+    assert!(html.contains("previewtext") && html.contains("<img src=\"data:image/svg+xml;base64,"), "{html}");
+    assert!(!html.contains("<script"), "{html}");
+    assert_eq!(count(), 0, "preview stored a share");
+    // over 10 MB: 413 (six 1.9 MB images), on create and preview alike
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.resize(1_900_000, 0);
+    let big: Vec<Value> = (0..6).map(|i| json!({"name": format!("p{i}.png"), "content_type": "image/png", "data": b64(&png)})).collect();
+    let snap = json!({"title": "Big", "markdown": "x", "assets": big});
+    for path in ["/api/shares", "/api/shares/preview"] {
+        let r = fx.raw(Some(&fx.a_app), "POST", path, Some(json!({"doc_id": fx.a_secret, "snapshot": snap}))).await;
+        assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "{path}: {}", r.body);
+        assert!(r.body.contains("10 MB"), "{}", r.body);
+    }
+    let mut one = png.clone();
+    one.resize(2 * 1024 * 1024 + 1, 0);
+    for (what, snap) in [
+        ("an asset over 2 MB", json!({"title": "t", "markdown": "x", "assets": [{"name": "a.png", "content_type": "image/png", "data": b64(&one)}]})),
+        ("markdown over 2 MB", json!({"title": "t", "markdown": "x".repeat(2 * 1024 * 1024 + 1)})),
+        ("201 assets", json!({"title": "t", "markdown": "x", "assets": (0..201).map(|i| json!({"name": format!("a{i}.svg"), "content_type": "image/svg+xml", "data": b64(b"<svg/>")})).collect::<Vec<_>>()})),
+    ] {
+        let r = fx.raw(Some(&fx.a_app), "POST", "/api/shares", Some(json!({"doc_id": fx.a_secret, "snapshot": snap}))).await;
+        assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "{what}: {}", r.body);
+    }
+    for (what, asset) in [
+        ("a type outside the list", json!({"name": "a.html", "content_type": "text/html", "data": b64(b"<svg/>")})),
+        ("a path in the name", json!({"name": "../a.svg", "content_type": "image/svg+xml", "data": b64(b"<svg/>")})),
+        ("a dot name", json!({"name": "..", "content_type": "image/svg+xml", "data": b64(b"<svg/>")})),
+        ("bytes that are not the type", json!({"name": "a.png", "content_type": "image/png", "data": b64(b"<html>")})),
+        ("not base64", json!({"name": "a.svg", "content_type": "image/svg+xml", "data": "%%%"})),
+    ] {
+        let r = fx.raw(Some(&fx.a_app), "POST", "/api/shares", Some(json!({"doc_id": fx.a_secret, "snapshot": {"title": "t", "markdown": "x", "assets": [asset]}}))).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{what}: {}", r.body);
+    }
+    assert_eq!(count(), 0, "a refused snapshot stored a share");
+    // LOCAL mode: no share links
+    let local = crate::shares::router(crate::shares::SharesState { store: fx.store.clone(), local_human: fx.a_human, server: None });
+    for (m, path) in [("GET", "/api/shares".to_string()), ("POST", "/api/shares/preview".into()), ("GET", format!("/s/{}", random_token()))] {
+        let req = Request::builder().method(m).uri(&path).header("content-type", "application/json").body(Body::from("{}")).unwrap();
+        assert_eq!(local.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND, "LOCAL {m} {path}");
+    }
+}
+
+/// `Scope::Public` (a share link's reader) has no user, like System/Local:
+/// every list and read keyed on `scope.user()` must come back empty or
+/// refused for it, never unfiltered, and it may write nothing.
+#[tokio::test]
+async fn scope_public_reads_and_writes_nothing() {
+    let fx = fixture();
+    fx.store.lock(Scope::System).set_setting("global.key", "zebrasecret").unwrap();
+    fx.store.lock(Scope::User(fx.a)).set_setting("mine", "zebrasecret").unwrap();
+    let mut s = fx.store.lock(Scope::Public);
+    assert!(s.list_docs().unwrap().is_empty(), "docs");
+    assert!(s.list_workspaces().unwrap().is_empty(), "workspaces");
+    assert!(s.list_principals().unwrap().is_empty(), "principals");
+    assert_eq!(s.get_setting("global.key").unwrap(), None, "global settings");
+    assert_eq!(s.get_setting("mine").unwrap(), None, "user settings");
+    assert!(s.changes_since(0, 1000).unwrap().changes.is_empty(), "change feed");
+    assert!(s.list_gardeners().unwrap().is_empty(), "gardeners");
+    assert!(s.list_tags().unwrap().is_empty(), "tags");
+    assert!(s.review_queue(None).unwrap().is_empty(), "review queue");
+    assert!(s.list_trash().unwrap().is_empty(), "trash");
+    assert!(s.search_blocks("zebrasecret", 10).unwrap().is_empty(), "search");
+    assert!(s.own_root_titled("Salary review").unwrap().is_none(), "own roots");
+    assert!(s.agent_named("claude").unwrap().is_none(), "agents");
+    assert!(s.read_doc(fx.a_secret).is_err() && s.get_doc(fx.shared_doc).is_err(), "by-id reads");
+    assert!(s.ops_since(fx.a_secret, 0).map(|o| o.is_empty()).unwrap_or(true), "history");
+    assert!(s.idempotency_get(fx.a_human, Uuid::now_v7(), 0).unwrap().is_none());
+    // and it writes nothing
+    assert!(s.set_setting("global.key", "x").is_err(), "set_setting");
+    assert!(s.create_doc("x", None, fx.a_human).is_err(), "create_doc");
+    assert!(s.create_workspace("x", None, None, None).is_err(), "create_workspace");
+    assert!(s.create_principal(PrincipalKind::Agent, "claude:x", None).is_err(), "create_principal");
+    assert!(s.rename_principal(fx.a_human, "x").is_err(), "rename_principal");
+    assert!(s.idempotency_put(fx.a_human, Uuid::now_v7(), "{}", 0, 0).is_err(), "idempotency_put");
+    let text = format!("{:?}", s.list_docs());
+    fx.no_leak("Scope::Public", &text);
+}
+
+/// The public page runs in an opaque origin (CSP sandbox without
+/// allow-same-origin): its fetches carry `Origin: null`. Only the public
+/// comment routes answer that origin (no credentials), and /api refuses it
+/// even with the session cookie and the CSRF header.
+#[tokio::test]
+async fn the_sandboxed_page_reaches_only_its_comment_routes() {
+    let fx = fixture();
+    let share = fx.make_share(&fx.a_app, fx.a_secret, "Shared plan", "sandboxtext", "d1.svg").await;
+    let p = link_path(&share);
+    let page = fx.raw(None, "GET", &p, None).await;
+    let csp = page.h("content-security-policy").to_string();
+    assert!(csp.ends_with("sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox"), "{csp}");
+    assert!(!csp.contains("allow-same-origin"), "{csp}");
+    let send = |method: &str, path: String, body: Option<Value>, origin: &str| {
+        let mut b = Request::builder().method(method).uri(path).header("host", "localhost:7513").header("origin", origin.to_string());
+        if body.is_some() {
+            b = b.header("content-type", "application/json");
+        }
+        if method == "OPTIONS" {
+            b = b.header("access-control-request-method", "POST").header("access-control-request-headers", "content-type");
+        }
+        let req = b.body(body.map_or_else(Body::empty, |v| Body::from(v.to_string()))).unwrap();
+        let app = fx.app.clone();
+        async move { app.oneshot(req).await.unwrap() }
+    };
+    let pre = send("OPTIONS", format!("{p}/comments"), None, "null").await;
+    assert_eq!(pre.status(), StatusCode::NO_CONTENT);
+    assert_eq!(pre.headers()["access-control-allow-origin"], "null");
+    assert!(pre.headers()["access-control-allow-headers"].to_str().unwrap().contains("content-type"));
+    assert!(pre.headers().get("access-control-allow-credentials").is_none());
+    let post = send("POST", format!("{p}/comments"), Some(json!({"name": "R", "body": "from the sandbox"})), "null").await;
+    assert_eq!(post.status(), StatusCode::CREATED);
+    assert_eq!(post.headers()["access-control-allow-origin"], "null");
+    assert!(post.headers().get("access-control-allow-credentials").is_none());
+    let get = send("GET", format!("{p}/comments"), None, "null").await;
+    assert_eq!(get.headers()["access-control-allow-origin"], "null");
+    // no other origin is answered, and the page and images never are
+    let other = send("GET", format!("{p}/comments"), None, "https://evil.example").await;
+    assert!(other.headers().get("access-control-allow-origin").is_none());
+    assert!(send("GET", p.clone(), None, "null").await.headers().get("access-control-allow-origin").is_none());
+    // /api refuses Origin: null, cookie and CSRF header or not
+    let tom = web_session(&mut fx.store.lock(Scope::System), fx.a);
+    let cookie = format!("{}={}", crate::auth::web::COOKIE, tom.strip_prefix(COOKIE_TOKEN).unwrap());
+    for (m, path, body) in [
+        ("POST", "/api/shares".to_string(), Some(json!({"doc_id": fx.a_loose, "snapshot": snapshot("x", "y", "d1.svg")}))),
+        ("DELETE", format!("/api/shares/{}", share["id"].as_str().unwrap()), None),
+        ("POST", "/api/docs".to_string(), Some(json!({"title": "x", "parent_doc_id": null}))),
+    ] {
+        let req = Request::builder()
+            .method(m)
+            .uri(&path)
+            .header("host", "localhost:7513")
+            .header("origin", "null")
+            .header("cookie", &cookie)
+            .header(crate::auth::web::CSRF_HEADER, "1")
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |v| Body::from(v.to_string())))
+            .unwrap();
+        let res = fx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{m} {path} with Origin: null");
+        assert!(res.headers().get("access-control-allow-origin").is_none());
+    }
+    let (_, out) = fx.call(&fx.a_app, "GET", "/api/shares", None).await;
+    assert!(out.contains("\"revoked_at\":null"), "the link survived: {out}");
+}
+
+/// A reader cannot sign as the link's owner, nor smuggle bidi or
+/// zero-width characters into the owner's notification.
+#[tokio::test]
+async fn a_reader_cannot_sign_as_the_owner() {
+    let fx = fixture();
+    let share = fx.make_share(&fx.a_app, fx.a_secret, "Shared plan", "guesttext", "d1.svg").await;
+    let path = format!("{}/comments", link_path(&share));
+    let r = fx.raw(None, "POST", &path, Some(json!({"name": "TOM\u{200B}", "body": "it is me"}))).await;
+    assert_eq!(r.json()["author"], "TOM (guest)", "{}", r.body);
+    let r = fx.raw(None, "POST", &path, Some(json!({"name": "Rua\u{202E}nimda", "body": "\u{202E}x"}))).await;
+    assert_eq!((r.json()["author"].as_str(), r.json()["body"].as_str()), (Some("Ruanimda"), Some("x")));
+    assert_eq!(fx.alerts.lock().unwrap().last().unwrap().author, "Ruanimda");
+    // the owner's own reply keeps her name
+    let r = fx.raw(Some(&fx.a_app), "POST", &format!("/api/shares/{}/comments", share["id"].as_str().unwrap()), Some(json!({"body": "hi"}))).await;
+    assert_eq!(r.json()["author"], "Tom");
+}
+
+/// Every /s/ request also draws from a per-link bucket, so many addresses
+/// cannot hammer one link (and the store behind it); images come from
+/// memory after the first request.
+#[tokio::test]
+async fn a_hammered_link_is_limited_per_link_and_images_are_cached() {
+    let fx = fixture();
+    let share = fx.make_share(&fx.a_app, fx.a_secret, "Shared plan", "busytext", "d1.svg").await;
+    let p = link_path(&share);
+    let mut cfg = AuthConfig::from_public_url(BASE).unwrap();
+    cfg.trusted_proxy = true;
+    let caches: std::sync::Arc<crate::shares::Caches> = Default::default();
+    let app = crate::shares::router(crate::shares::SharesState {
+        store: fx.store.clone(),
+        local_human: fx.a_human,
+        server: Some(crate::shares::ServerSide {
+            cfg: std::sync::Arc::new(cfg),
+            caches: caches.clone(),
+            key: std::sync::Arc::new(crate::shares::ShareKey::from_bytes(&[7; 32])),
+            limiter: Default::default(),
+            notify: None,
+        }),
+    });
+    let get = |path: String, ip: String| {
+        let app = app.clone();
+        async move {
+            let req = Request::get(path).header("x-forwarded-for", ip).body(Body::empty()).unwrap();
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+    assert_eq!(get(format!("{p}/a/d1.svg"), "10.0.0.1".into()).await, StatusCode::OK);
+    assert_eq!(caches.assets.lock().unwrap().bytes(), EVIL_SVG.len(), "the image is cached");
+    // a fresh address every request: the per-IP bucket never empties, the per-link one does
+    let mut limited = None;
+    for i in 0..400 {
+        if get(format!("{p}/a/d1.svg"), format!("10.1.{}.{}", i / 250, i % 250)).await == StatusCode::TOO_MANY_REQUESTS {
+            limited = Some(i);
+            break;
+        }
+    }
+    let n = limited.expect("the per-link bucket never answered 429");
+    assert!(n >= 250, "the per-link limit is generous: limited after {n}");
+    // another link is unaffected
+    let other = fx.make_share(&fx.a_app, fx.a_loose, "Other", "othertext", "d1.svg").await;
+    assert_eq!(get(link_path(&other), "10.2.0.1".into()).await, StatusCode::OK);
+}
+
+/// Per person: at most 100 live links (429 past it, a revoked one frees a
+/// place), and 30 new snapshots an hour per link (429); someone else's
+/// PATCH attempts spend none of the owner's budget.
+#[tokio::test]
+async fn share_link_caps_per_person_and_per_link() {
+    let fx = fixture();
+    let snap = json!({"title": "t", "markdown": "x"});
+    let mut first = None;
+    for i in 0..100 {
+        let r = fx.raw(Some(&fx.a_app), "POST", "/api/shares", Some(json!({"doc_id": fx.a_loose, "snapshot": snap}))).await;
+        assert_eq!(r.status, StatusCode::CREATED, "link {i}: {}", r.body);
+        first.get_or_insert(r.json()["id"].as_str().unwrap().to_string());
+    }
+    let r = fx.raw(Some(&fx.a_app), "POST", "/api/shares", Some(json!({"doc_id": fx.a_loose, "snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
+    assert!(r.body.contains("100 live links"), "{}", r.body);
+    // B is not affected by A's count
+    let r = fx.raw(Some(&fx.b_app), "POST", "/api/shares", Some(json!({"doc_id": fx.b_doc, "snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let first = first.unwrap();
+    assert_eq!(fx.raw(Some(&fx.a_app), "DELETE", &format!("/api/shares/{first}"), None).await.status, StatusCode::NO_CONTENT);
+    let r = fx.raw(Some(&fx.a_app), "POST", "/api/shares", Some(json!({"doc_id": fx.a_loose, "snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "a revoked link frees a place: {}", r.body);
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    // B hammering A's link spends nothing of its budget
+    for _ in 0..40 {
+        assert_eq!(fx.raw(Some(&fx.b_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"snapshot": snap}))).await.status, StatusCode::NOT_FOUND);
+    }
+    for i in 0..30 {
+        let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"snapshot": snap}))).await;
+        assert_eq!(r.status, StatusCode::OK, "snapshot {i}: {}", r.body);
+    }
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
+    // other changes are not snapshots
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"comments_enabled": false}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+}
+
+/// A link needs owner or editor on its doc to be made or changed, and dies
+/// with its maker's access: unsharing the workspace revokes their links to
+/// its docs (and only those).
+#[tokio::test]
+async fn links_follow_their_makers_access() {
+    let fx = fixture();
+    let snap = snapshot("Family", "familysnap", "f.svg");
+    // a viewer: 403; an editor: 201
+    let r = fx.raw(Some(&fx.b_app), "POST", "/api/shares", Some(json!({"doc_id": fx.shared_doc, "snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
+    fx.store.lock(Scope::User(fx.a)).share_workspace(fx.family, fx.b, Role::Editor).unwrap();
+    let fam = fx.make_share(&fx.b_app, fx.shared_doc, "Family", "familysnap", "f.svg").await;
+    let own = fx.make_share(&fx.b_app, fx.b_doc, "Mine", "minesnap", "m.svg").await;
+    // demoted to viewer: the link lives (she can still read it) but cannot be changed
+    fx.store.lock(Scope::User(fx.a)).share_workspace(fx.family, fx.b, Role::Viewer).unwrap();
+    let id = fam["id"].as_str().unwrap();
+    let r = fx.raw(Some(&fx.b_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
+    assert_eq!(fx.raw(None, "GET", &link_path(&fam), None).await.status, StatusCode::OK);
+    // unshared: the Family link is revoked, her own doc's is not
+    fx.store.lock(Scope::User(fx.a)).unshare_workspace(fx.family, fx.b).unwrap();
+    assert_eq!(fx.raw(None, "GET", &link_path(&fam), None).await.status, StatusCode::GONE);
+    assert_eq!(fx.raw(None, "GET", &format!("{}/a/f.svg", link_path(&fam)), None).await.status, StatusCode::GONE);
+    assert_eq!(fx.raw(None, "GET", &link_path(&own), None).await.status, StatusCode::OK);
+    let (_, out) = fx.call(&fx.b_app, "GET", "/api/shares", None).await;
+    let listed: Value = serde_json::from_str(&out).unwrap();
+    let revoked = |id: &Value| listed["shares"].as_array().unwrap().iter().find(|s| s["id"] == *id).unwrap()["revoked_at"].is_string();
+    assert!(revoked(&fam["id"]) && !revoked(&own["id"]), "{out}");
+}
+
+/// The public comment POST takes JSON only (415 otherwise); a 500 on a
+/// public route still carries the public headers; the preview's images load
+/// eagerly (a printed page never scrolls).
+#[tokio::test]
+async fn public_comment_content_type_and_preview_images() {
+    let fx = fixture();
+    let share = fx.make_share(&fx.a_app, fx.a_secret, "Shared plan", "ctypetext", "d1.svg").await;
+    let path = format!("{}/comments", link_path(&share));
+    for ct in [Some("text/plain"), Some("application/x-www-form-urlencoded"), Some("multipart/form-data; boundary=x"), None] {
+        let mut b = Request::post(&path).header("host", "localhost:7513");
+        if let Some(ct) = ct {
+            b = b.header("content-type", ct);
+        }
+        let res = fx.app.clone().oneshot(b.body(Body::from(r#"{"name":"R","body":"b"}"#)).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct:?}");
+        assert_eq!(res.headers()["x-robots-tag"], "noindex, nofollow");
+    }
+    let res = fx
+        .app
+        .clone()
+        .oneshot(Request::post(&path).header("content-type", "Application/JSON; charset=utf-8").body(Body::from(r#"{"name":"R","body":"b"}"#)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let r = fx.raw(Some(&fx.a_app), "POST", "/api/shares/preview", Some(json!({"snapshot": snapshot("P", "previewtext", "d1.svg")}))).await;
+    let html = r.json()["html"].as_str().unwrap().to_string();
+    assert!(html.contains("<img src=\"data:image/svg+xml;base64,") && !html.contains("loading="), "{html}");
+    let page = fx.raw(None, "GET", &link_path(&share), None).await;
+    assert!(page.body.contains("loading=\"lazy\""), "the public page keeps lazy images");
 }

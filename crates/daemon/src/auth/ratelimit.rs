@@ -14,6 +14,13 @@ pub enum Class {
     Token,
     /// dynamic client registration
     Register,
+    /// the public share-link routes (`/s/…`): a page, its images, comments
+    Share,
+    /// the same routes per link (keyed on the token's hash): many addresses
+    /// hammering one link
+    ShareLink,
+    /// new snapshots of one link (PATCH with a snapshot): 30 an hour
+    ShareSnapshot,
 }
 
 impl Class {
@@ -23,6 +30,9 @@ impl Class {
             Class::Login => (20.0, 3.0),
             Class::Token => (30.0, 1.0),
             Class::Register => (10.0, 30.0),
+            Class::Share => (120.0, 0.5),
+            Class::ShareLink => (300.0, 0.25),
+            Class::ShareSnapshot => (30.0, 120.0),
         }
     }
 }

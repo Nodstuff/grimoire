@@ -60,6 +60,8 @@ pub(crate) fn vis_sub(scope: Scope) -> Option<String> {
         Scope::System | Scope::Local => None,
         Scope::User(u) => Some(vis_subquery(u, None)),
         Scope::Within { user, workspace } => Some(vis_subquery(user, Some(workspace))),
+        // a share link's reader sees no doc at all
+        Scope::Public => Some("SELECT NULL WHERE 0".into()),
     }
 }
 
@@ -122,6 +124,9 @@ pub(crate) fn space_conn(conn: &Connection, doc: Uuid) -> Result<Space> {
 
 /// The space a new root doc created in `scope` lands in.
 pub(crate) fn own_unsorted(conn: &Connection, scope: Scope) -> Result<Space> {
+    if scope.is_public() {
+        return Err(StoreError::NotFound("no space for a share-link reader".into()));
+    }
     Ok(match scope.user() {
         Some(u) => Space::Unsorted(Some(u)),
         None => Space::Unsorted(instance_owner_conn(conn)?),
@@ -162,6 +167,7 @@ pub(crate) fn access_conn(conn: &Connection, scope: Scope, space: Space) -> Resu
             Space::Workspace(w) if w == workspace => member_role_conn(conn, w, user),
             _ => Ok(None),
         },
+        Scope::Public => Ok(None),
     }
 }
 
@@ -308,6 +314,9 @@ pub(crate) fn name_taken_conn(conn: &Connection, name: &str, except: Option<Uuid
 /// rowid is after the reader's latest grant mark for the doc. No grant row =
 /// they saw it all along.
 pub(crate) fn history_pred(scope: Scope, doc_col: &str, rowid_col: &str) -> String {
+    if scope.is_public() {
+        return "0".into();
+    }
     match scope.user() {
         None => "1".into(),
         Some(u) => format!(
@@ -595,6 +604,9 @@ impl SqliteStore {
     /// SQL: is principal `col`'s person the scope's? (System/Local: the
     /// unowned and the instance owner's.)
     fn agent_mine_sql(&self) -> String {
+        if self.scope.is_public() {
+            return "0".into();
+        }
         match self.scope.user() {
             Some(u) => format!("COALESCE(owner_user, {INSTANCE_OWNER_SQL}) = '{u}'"),
             None => format!("(owner_user IS NULL OR owner_user = {INSTANCE_OWNER_SQL})"),
@@ -660,6 +672,7 @@ impl SqliteStore {
     /// owner is the viewer; System/Local: any root. Oldest first.
     pub fn own_root_titled(&self, title: &str) -> Result<Option<crate::Doc>> {
         let owner = match self.scope.user() {
+            None if self.scope.is_public() => "0".to_string(),
             None => "1".to_string(),
             Some(u) => format!("COALESCE(owner_id, {INSTANCE_OWNER_SQL}) = '{u}'"),
         };

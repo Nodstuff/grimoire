@@ -20,6 +20,7 @@ export type CommandAction =
   | 'trash'
   | 'capture'
   | 'close'
+  | 'share'
 
 export interface CommandCtx {
   queueCount: number
@@ -84,6 +85,9 @@ export function buildCommands({ queueCount, signedIn, onSignOut, docId, inboxId,
       },
     },
   ]
+  if (docId && signedIn) {
+    cmds.push({ id: 'share-link', label: 'Share link…', hint: 'a public, read-only snapshot of this doc', run: () => onAction('share') })
+  }
   if (docId) {
     cmds.push(
       {
