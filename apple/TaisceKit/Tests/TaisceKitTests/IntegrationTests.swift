@@ -86,7 +86,12 @@ struct LocalIntegrationTests {
     }
 
     @Test func shareLinksAreServerModeOnly() async throws {
-        await #expect(throws: APIError.self) { _ = try await api.shares(docID: nil) }
+        do {
+            _ = try await api.shares(docID: nil)
+            Issue.record("LOCAL mode answered /api/shares")
+        } catch let e as ShareAPIError {
+            #expect(e.status == 404)
+        }
     }
 
     @Test func treeBootstrapsFromTheSeqHeader() async throws {
