@@ -179,6 +179,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/s/{token}/comments", "share_link_comments_honeypot_limits_and_push"),
     ("/s/{token}/comments", "the_sandboxed_page_reaches_only_its_comment_routes"),
     ("/s/{token}/comments", "a_reader_cannot_sign_as_the_owner"),
+    ("/s/{token}/comments", "public_comment_content_type_and_preview_images"),
     ("/api/shares/preview", "share_link_preview_stores_nothing_and_limits_hold"),
 ];
 
@@ -2247,4 +2248,35 @@ async fn links_follow_their_makers_access() {
     let listed: Value = serde_json::from_str(&out).unwrap();
     let revoked = |id: &Value| listed["shares"].as_array().unwrap().iter().find(|s| s["id"] == *id).unwrap()["revoked_at"].is_string();
     assert!(revoked(&fam["id"]) && !revoked(&own["id"]), "{out}");
+}
+
+/// The public comment POST takes JSON only (415 otherwise); a 500 on a
+/// public route still carries the public headers; the preview's images load
+/// eagerly (a printed page never scrolls).
+#[tokio::test]
+async fn public_comment_content_type_and_preview_images() {
+    let fx = fixture();
+    let share = fx.make_share(&fx.a_app, fx.a_secret, "Shared plan", "ctypetext", "d1.svg").await;
+    let path = format!("{}/comments", link_path(&share));
+    for ct in [Some("text/plain"), Some("application/x-www-form-urlencoded"), Some("multipart/form-data; boundary=x"), None] {
+        let mut b = Request::post(&path).header("host", "localhost:7513");
+        if let Some(ct) = ct {
+            b = b.header("content-type", ct);
+        }
+        let res = fx.app.clone().oneshot(b.body(Body::from(r#"{"name":"R","body":"b"}"#)).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct:?}");
+        assert_eq!(res.headers()["x-robots-tag"], "noindex, nofollow");
+    }
+    let res = fx
+        .app
+        .clone()
+        .oneshot(Request::post(&path).header("content-type", "Application/JSON; charset=utf-8").body(Body::from(r#"{"name":"R","body":"b"}"#)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let r = fx.raw(Some(&fx.a_app), "POST", "/api/shares/preview", Some(json!({"snapshot": snapshot("P", "previewtext", "d1.svg")}))).await;
+    let html = r.json()["html"].as_str().unwrap().to_string();
+    assert!(html.contains("<img src=\"data:image/svg+xml;base64,") && !html.contains("loading="), "{html}");
+    let page = fx.raw(None, "GET", &link_path(&share), None).await;
+    assert!(page.body.contains("loading=\"lazy\""), "the public page keeps lazy images");
 }

@@ -10,7 +10,7 @@
 //!   it renders as a link to it.
 //! - Frontmatter is stripped. Each top-level block carries `data-b="<n>"`.
 
-use pulldown_cmark::{CodeBlockKind, CowStr, Event, MetadataBlockKind, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, LinkType, MetadataBlockKind, Options, Parser, Tag, TagEnd};
 use std::collections::HashMap;
 
 /// What the renderer needs to know about one asset.
@@ -65,7 +65,7 @@ pub fn strip_frontmatter(md: &str) -> &str {
 
 const ASSET_SCHEME: &str = "taisce-asset:";
 
-fn image_html(dest: &str, alt: &str, title: &str, assets: &HashMap<String, AssetInfo>) -> String {
+fn image_html(dest: &str, alt: &str, title: &str, assets: &HashMap<String, AssetInfo>, lazy: bool) -> String {
     let alt_e = esc(alt);
     let title_attr = if title.is_empty() { String::new() } else { format!(" title=\"{}\"", esc(title)) };
     if let Some(name) = dest.trim().strip_prefix(ASSET_SCHEME) {
@@ -73,10 +73,11 @@ fn image_html(dest: &str, alt: &str, title: &str, assets: &HashMap<String, Asset
             Some(a) => {
                 let dim = |k: &str, v: Option<i64>| v.filter(|v| *v > 0).map(|v| format!(" {k}=\"{v}\"")).unwrap_or_default();
                 format!(
-                    "<img src=\"{}\" alt=\"{alt_e}\"{title_attr}{}{} loading=\"lazy\" decoding=\"async\">",
+                    "<img src=\"{}\" alt=\"{alt_e}\"{title_attr}{}{}{}>",
                     esc(&a.url),
                     dim("width", a.width),
-                    dim("height", a.height)
+                    dim("height", a.height),
+                    if lazy { " loading=\"lazy\" decoding=\"async\"" } else { "" }
                 )
             }
             None => format!(
@@ -92,8 +93,14 @@ fn image_html(dest: &str, alt: &str, title: &str, assets: &HashMap<String, Asset
     }
 }
 
-/// Render a snapshot's markdown to the page body.
+/// Render a snapshot's markdown to the page body (images load lazily).
 pub fn render_body(markdown: &str, assets: &HashMap<String, AssetInfo>) -> String {
+    render_body_with(markdown, assets, true)
+}
+
+/// `lazy: false` for a page that is printed (the PDF preview): a printed
+/// page never scrolls, so a lazy image would never load.
+pub fn render_body_with(markdown: &str, assets: &HashMap<String, AssetInfo>, lazy: bool) -> String {
     let md = strip_frontmatter(markdown);
     let opts = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
@@ -111,8 +118,13 @@ pub fn render_body(markdown: &str, assets: &HashMap<String, AssetInfo>) -> Strin
             Event::Start(Tag::HtmlBlock) => events.push(Event::Start(Tag::CodeBlock(CodeBlockKind::Indented))),
             Event::End(TagEnd::HtmlBlock) => events.push(Event::End(TagEnd::CodeBlock)),
             Event::Html(s) | Event::InlineHtml(s) => events.push(Event::Text(s)),
-            Event::Start(Tag::Link { dest_url, title, .. }) => {
-                let href = safe_href(&dest_url).unwrap_or_else(|| "#".into());
+            Event::Start(Tag::Link { link_type, dest_url, title, .. }) => {
+                // an email autolink (<a@b.c>) arrives without its scheme
+                let dest = match link_type {
+                    LinkType::Email if !dest_url.contains(':') => format!("mailto:{dest_url}"),
+                    _ => dest_url.to_string(),
+                };
+                let href = safe_href(&dest).unwrap_or_else(|| "#".into());
                 let title = if title.is_empty() { String::new() } else { format!(" title=\"{}\"", esc(&title)) };
                 events.push(Event::Html(CowStr::from(format!(
                     "<a href=\"{}\"{title} rel=\"nofollow noopener noreferrer\">",
@@ -139,7 +151,7 @@ pub fn render_body(markdown: &str, assets: &HashMap<String, AssetInfo>) -> Strin
                         _ => {}
                     }
                 }
-                events.push(Event::Html(CowStr::from(image_html(&dest_url, &alt, &title, assets))));
+                events.push(Event::Html(CowStr::from(image_html(&dest_url, &alt, &title, assets, lazy))));
             }
             ev => events.push(ev),
         }
@@ -285,6 +297,21 @@ mod tests {
         assert!(out.contains("href=\"https://example.com/a?b=1&amp;c=%222%22\""), "{out}");
         assert!(out.contains("href=\"mailto:a@b.c\"") && out.contains("href=\"#top\""), "{out}");
         assert!(out.contains("rel=\"nofollow noopener noreferrer\""), "{out}");
+    }
+
+    #[test]
+    fn email_autolinks_become_mailto() {
+        let out = render_body("write to <aoife@example.com> or [me](mailto:tom@example.com)", &assets());
+        assert!(out.contains("<a href=\"mailto:aoife@example.com\""), "{out}");
+        assert!(out.contains("<a href=\"mailto:tom@example.com\""), "{out}");
+    }
+
+    #[test]
+    fn a_printed_page_loads_its_images_eagerly() {
+        let lazy = render_body("![d](taisce-asset:d1.svg)", &assets());
+        let eager = render_body_with("![d](taisce-asset:d1.svg)", &assets(), false);
+        assert!(lazy.contains("loading=\"lazy\""), "{lazy}");
+        assert!(!eager.contains("loading=") && eager.contains("<img src=\"/s/T/a/d1.svg\""), "{eager}");
     }
 
     #[test]

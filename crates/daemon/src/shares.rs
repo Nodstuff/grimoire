@@ -28,7 +28,7 @@
 use crate::auth::ratelimit::{Class, Limiter};
 use crate::auth::{AuthConfig, hash_secret, now, random_token};
 use std::path::Path as FsPath;
-use crate::share_render::{AssetInfo, PageParts, gone_page, page, render_body};
+use crate::share_render::{AssetInfo, PageParts, gone_page, page};
 use crate::store_ext::with_store;
 use crate::viewer::Viewer;
 use axum::extract::rejection::JsonRejection;
@@ -497,10 +497,11 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Render a body; `url` gives each asset's `src`.
-fn render_with(markdown: &str, assets: impl Iterator<Item = (String, Option<i64>, Option<i64>, String)>) -> String {
+/// Render a body; `url` gives each asset's `src`. `lazy`: images load as
+/// they scroll in (the public page), else at once (the printed preview).
+fn render_with(markdown: &str, assets: impl Iterator<Item = (String, Option<i64>, Option<i64>, String)>, lazy: bool) -> String {
     let infos: HashMap<String, AssetInfo> = assets.map(|(name, width, height, url)| (name, AssetInfo { url, width, height })).collect();
-    render_body(markdown, &infos)
+    crate::share_render::render_body_with(markdown, &infos, lazy)
 }
 
 fn asset_path(token: &str, name: &str) -> String {
@@ -728,7 +729,7 @@ async fn preview(State(st): State<SharesState>, v: Viewer, headers: HeaderMap, b
         Err(r) => return r,
     };
     let html = tokio::task::spawn_blocking(move || {
-        let body = render_with(&checked.markdown, checked.assets.iter().map(|a| (a.name.clone(), a.width, a.height, data_url(a))));
+        let body = render_with(&checked.markdown, checked.assets.iter().map(|a| (a.name.clone(), a.width, a.height, data_url(a))), false);
         page(&PageParts {
             title: &checked.title,
             body_html: &body,
@@ -953,7 +954,7 @@ async fn lookup(st: &SharesState, req_headers: &HeaderMap, ext: &axum::http::Ext
         Ok(Some(sh)) if sh.is_gone(now()) => (Found::Gone, ip),
         Ok(Some(sh)) => (Found::Live(sh), ip),
         Ok(None) => (Found::Unknown, ip),
-        Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
+        Err(e) => return Err(public_500(e)),
     })
 }
 
@@ -980,10 +981,14 @@ async fn public_page(State(st): State<SharesState>, Path(token): Path<String>, r
             };
             let t = token.clone();
             let rendered = tokio::task::spawn_blocking(move || {
-                render_with(&input.markdown, input.assets.into_iter().map(|(n, w, h)| {
-                    let url = asset_path(&t, &n);
-                    (n, w, h, url)
-                }))
+                render_with(
+                    &input.markdown,
+                    input.assets.into_iter().map(|(n, w, h)| {
+                        let url = asset_path(&t, &n);
+                        (n, w, h, url)
+                    }),
+                    true,
+                )
             })
             .await;
             let Ok(b) = rendered else { return public_500("render failed") };
@@ -1072,7 +1077,7 @@ async fn public_comments(State(st): State<SharesState>, Path(token): Path<String
     let id = sh.id;
     match with_store(&st.store, Scope::Public, move |s| s.share_public_comments(id)).await {
         Ok(cs) => public_json(StatusCode::OK, json!({"comments": cs.iter().map(comment_json).collect::<Vec<_>>(), "enabled": true})),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => public_500(e),
     }
 }
 
@@ -1101,6 +1106,17 @@ async fn public_comment(State(st): State<SharesState>, Path(token): Path<String>
         Found::Gone => return public_json(StatusCode::GONE, json!({"error": "this link has expired or was turned off"})),
         Found::Unknown => return public_json(StatusCode::NOT_FOUND, json!({"error": "not found"})),
     };
+    // a JSON body only: a cross-site form (urlencoded, multipart, text/plain)
+    // is refused before anything is read
+    let json_body = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"));
+    if !json_body {
+        return public_json(StatusCode::UNSUPPORTED_MEDIA_TYPE, json!({"error": "send the comment as application/json"}));
+    }
     if !sh.comments_enabled {
         return public_json(StatusCode::FORBIDDEN, json!({"error": "comments are off for this link"}));
     }
@@ -1153,7 +1169,7 @@ async fn public_comment(State(st): State<SharesState>, Path(token): Path<String>
         Err(StoreError::NotFound(_)) => public_json(StatusCode::GONE, json!({"error": "this link has expired or was turned off"})),
         Err(StoreError::Forbidden(m)) => public_json(StatusCode::FORBIDDEN, json!({"error": m})),
         Err(StoreError::InvalidOp(m)) => public_json(StatusCode::BAD_REQUEST, json!({"error": m})),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => public_500(e),
     }
 }
 
@@ -1268,6 +1284,16 @@ mod tests {
         assert!(over_caps(u(100, 0), 10, false).is_none(), "a new snapshot of a live link is not a new link");
         assert!(over_caps(u(1, MAX_USER_BYTES - 10), 10, true).is_none());
         assert_eq!(over_caps(u(1, MAX_USER_BYTES - 10), 11, false).unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn a_public_500_carries_the_public_headers_and_no_detail() {
+        let r = public_500("disk on fire at /var/lib/taisce/ks.db");
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        for (k, v) in [("x-robots-tag", "noindex, nofollow"), ("referrer-policy", "no-referrer"), ("cache-control", "private, no-store"), ("x-content-type-options", "nosniff")] {
+            assert_eq!(r.headers()[k], v, "{k}");
+        }
+        assert!(r.headers().contains_key("content-security-policy"));
     }
 
     #[test]
