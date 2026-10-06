@@ -12,6 +12,7 @@ public enum ShareImageRejection: Error, Sendable, Hashable, LocalizedError {
     case tooLarge
     case notAnImage
     case http(Int)
+    case notApproved
 
     public var errorDescription: String? {
         switch self {
@@ -24,6 +25,7 @@ public enum ShareImageRejection: Error, Sendable, Hashable, LocalizedError {
         case .tooLarge: "larger than 2 MB"
         case .notAnImage: "not a PNG, JPEG, WebP or SVG image"
         case let .http(s): "the server answered \(s)"
+        case .notApproved: "its site wasn't one you agreed to fetch from"
         }
     }
 }
@@ -179,6 +181,9 @@ public final class SafeShareImageLoader: NSObject, ShareImageLoading, URLSession
     let policy: ShareImagePolicy
     let configuration: URLSessionConfiguration
     let maxBytes: Int
+    /// The sites the person agreed to fetch from (the first URL's host must
+    /// be one; redirects are checked by the policy). nil: any public site.
+    public var allowedHosts: Set<String>?
 
     /// `configuration`: tests pass one routed to a mock; it is made ephemeral
     /// regardless (no cookies, cache or credential storage).
@@ -191,6 +196,9 @@ public final class SafeShareImageLoader: NSObject, ShareImageLoading, URLSession
         c.urlCache = nil
         c.requestCachePolicy = .reloadIgnoringLocalCacheData
         c.urlCredentialStorage = nil
+        // a system proxy or PAC file would resolve and connect for itself,
+        // past the address check: never use one
+        c.connectionProxyDictionary = [:]
         c.timeoutIntervalForRequest = 10
         c.timeoutIntervalForResource = 20
         self.configuration = c
@@ -198,9 +206,13 @@ public final class SafeShareImageLoader: NSObject, ShareImageLoading, URLSession
     }
 
     public func load(_ url: URL) async throws -> RenderedVisual {
+        if let allowedHosts, !allowedHosts.contains(url.host()?.lowercased() ?? "") { throw ShareImageRejection.notApproved }
         if let r = await policy.allows(url) { throw r }
         let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
-        defer { session.finishTasksAndInvalidate() }
+        defer {
+            session.invalidateAndCancel()
+            forget(session)
+        }
         var request = URLRequest(url: url)
         request.setValue("image/png, image/jpeg, image/webp, image/svg+xml", forHTTPHeaderField: "Accept")
         let (bytes, response) = try await session.bytes(for: request)
@@ -222,7 +234,7 @@ public final class SafeShareImageLoader: NSObject, ShareImageLoading, URLSession
 
     /// Every hop is checked like the first, and there are at most 3.
     public func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest) async -> URLRequest? {
-        await allowRedirect(to: request.url, hops: redirectCount(task) + 1) ? request : nil
+        await allowRedirect(to: request.url, hops: redirectCount(session, task) + 1) ? request : nil
     }
 
     func allowRedirect(to url: URL?, hops: Int) async -> Bool {
@@ -231,14 +243,23 @@ public final class SafeShareImageLoader: NSObject, ShareImageLoading, URLSession
     }
 
     private let hops = NSLock()
-    private var counts: [Int: Int] = [:]
+    /// Hops so far per (session, task): each load has its own session, whose
+    /// task identifiers start again at 1, so the session is part of the key.
+    private var counts: [HopKey: Int] = [:]
+    private struct HopKey: Hashable { let session: ObjectIdentifier; let task: Int }
 
-    private func redirectCount(_ task: URLSessionTask) -> Int {
+    private func redirectCount(_ session: URLSession, _ task: URLSessionTask) -> Int {
         hops.withLock {
-            let n = counts[task.taskIdentifier, default: 0]
-            counts[task.taskIdentifier] = n + 1
+            let k = HopKey(session: ObjectIdentifier(session), task: task.taskIdentifier)
+            let n = counts[k, default: 0]
+            counts[k] = n + 1
             return n
         }
+    }
+
+    private func forget(_ session: URLSession) {
+        let id = ObjectIdentifier(session)
+        hops.withLock { counts = counts.filter { $0.key.session != id } }
     }
 
     /// No credentials, ever (server trust still gets the system's checks).

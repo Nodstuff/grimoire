@@ -119,6 +119,9 @@ extension AppModel {
     /// - visuals drawn; linked images fetched only when `fetchImages`.
     func shareSnapshot(_ docID: DocID, theme: ShareSnapshot.Theme, fetchImages: Bool, purpose: SnapshotPurpose) async throws -> ShareSnapshotResult {
         guard let cache, let sync else { throw ShareLinkError.notAvailable }
+        // the sites the person was asked about came from this copy: a refresh
+        // that adds a new one (a collaborator, an agent) doesn't get it fetched
+        let asked = fetchImages ? await linkedImageHosts(docID) : []
         var stale: String?
         do {
             try await sync.refresh(docID)
@@ -128,7 +131,9 @@ extension AppModel {
         }
         let (blocks, unsent) = try await cache.shareBlocks(for: docID)
         let title = index.byID[docID]?.title ?? "Untitled"
-        let builder = ShareSnapshotBuilder(renderer: AppShareVisualRenderer.shared, images: fetchImages ? SafeShareImageLoader() : nil)
+        let loader = SafeShareImageLoader()
+        loader.allowedHosts = Set(asked)
+        let builder = ShareSnapshotBuilder(renderer: AppShareVisualRenderer.shared, images: fetchImages ? loader : nil)
         var result = await builder.build(title: title, blocks: blocks, theme: theme)
         result.includesUnsentEdits = unsent
         if let stale { result.problems.insert(stale, at: 0) }
