@@ -539,8 +539,10 @@ fn backfill(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
-    // v10: share links (shares.sql: shares, share_assets, share_comments).
-    // The tables are created IF NOT EXISTS above; nothing to backfill.
+    // v10: share links (shares.sql: share_links, share_link_assets,
+    // share_link_comments and the doc-purge trigger; never a table named
+    // `shares`, which drop_federation_tables removes). Created IF NOT EXISTS
+    // by init; nothing to backfill.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
