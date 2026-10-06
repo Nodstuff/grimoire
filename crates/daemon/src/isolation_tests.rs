@@ -169,6 +169,8 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/shares/{id}", "share_link_caps_per_person_and_per_link"),
     ("/api/shares/{id}/comments", "share_links_are_the_owners_alone"),
     ("/api/shares/{id}/comments/{cid}", "share_links_are_the_owners_alone"),
+    ("/api/shares/{id}/comments/read", "share_links_are_the_owners_alone"),
+    ("/api/shares/{id}/comments/read", "share_link_comments_honeypot_limits_and_push"),
     ("/s/{token}", "a_share_link_serves_only_its_own_snapshot"),
     ("/s/{token}/a/{name}", "a_share_link_serves_only_its_own_snapshot"),
     ("/s/{token}/a/{name}", "a_hammered_link_is_limited_per_link_and_images_are_cached"),
@@ -1700,6 +1702,7 @@ async fn share_links_are_the_owners_alone() {
         ("DELETE", "", None),
         ("GET", "/comments", None),
         ("POST", "/comments", Some(json!({"body": "sneaky"}))),
+        ("POST", "/comments/read", Some(json!({}))),
         ("DELETE", &format!("/comments/{}", Uuid::now_v7()), None),
     ] {
         let got = fx.b(m, &format!("/api/shares/{id}{tail}"), body.clone()).await;
@@ -1912,6 +1915,12 @@ async fn share_link_comments_honeypot_limits_and_push() {
     assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["shares"][0]["unread_comments"], 1, "{out}");
     let r = fx.raw(Some(&fx.a_app), "GET", &format!("/api/shares/{id}/comments"), None).await;
     assert_eq!(r.json()["comments"].as_array().unwrap().len(), 1, "{}", r.body);
+    let (_, out) = fx.call(&fx.a_app, "GET", "/api/shares", None).await;
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["shares"][0]["unread_comments"], 1, "a GET marks nothing: {out}");
+    // B cannot mark A's; A marks hers
+    assert_eq!(fx.raw(Some(&fx.b_app), "POST", &format!("/api/shares/{id}/comments/read"), Some(json!({}))).await.status, StatusCode::NOT_FOUND);
+    let r = fx.raw(Some(&fx.a_app), "POST", &format!("/api/shares/{id}/comments/read"), Some(json!({}))).await;
+    assert_eq!(r.json(), json!({"marked": 1}), "{}", r.body);
     let (_, out) = fx.call(&fx.a_app, "GET", "/api/shares", None).await;
     let s0 = &serde_json::from_str::<Value>(&out).unwrap()["shares"][0];
     assert_eq!((s0["unread_comments"].clone(), s0["comment_count"].clone()), (json!(0), json!(1)), "{out}");

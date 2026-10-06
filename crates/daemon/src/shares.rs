@@ -15,7 +15,8 @@
 //! - `PATCH /api/shares/{id} {snapshot?, expires_at?, comments_enabled?}` → Share
 //! - `DELETE /api/shares/{id}` → 204 (revoked for good; the row stays)
 //! - `POST /api/shares/preview {snapshot}` → `{html}` (stores nothing)
-//! - `GET /api/shares/{id}/comments` → `{comments}` (marks them read)
+//! - `GET /api/shares/{id}/comments` → `{comments}`
+//! - `POST /api/shares/{id}/comments/read` → `{marked}`: marks them read
 //! - `POST /api/shares/{id}/comments {body, parent_id?, anchor?}` → 201 Comment
 //! - `DELETE /api/shares/{id}/comments/{cid}` → 204
 //!
@@ -748,8 +749,20 @@ async fn owner_comments(State(st): State<SharesState>, v: Viewer, headers: Heade
     if let Err(r) = owner_gate(&st, &v, &headers) {
         return r;
     }
-    match with_store(&st.store, v.scope, move |s| s.share_comments_for_owner(id, now())).await {
+    match with_store(&st.store, v.scope, move |s| s.share_comments_for_owner(id)).await {
         Ok(cs) => Json(json!({"comments": cs.iter().map(comment_json).collect::<Vec<_>>()})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// `POST /api/shares/{id}/comments/read` → `{marked: n}`: the GET reads,
+/// this marks (a GET never writes).
+async fn owner_mark_read(State(st): State<SharesState>, v: Viewer, headers: HeaderMap, Path(id): Path<Uuid>) -> Response {
+    if let Err(r) = owner_gate(&st, &v, &headers) {
+        return r;
+    }
+    match with_store(&st.store, v.scope, move |s| s.share_mark_read(id, now())).await {
+        Ok(n) => Json(json!({"marked": n})).into_response(),
         Err(e) => fail(e),
     }
 }
@@ -1163,6 +1176,7 @@ pub fn router(state: SharesState) -> Router {
         .route("/api/shares/preview", post(preview))
         .route("/api/shares/{id}", patch(update).delete(revoke))
         .route("/api/shares/{id}/comments", get(owner_comments).post(owner_reply))
+        .route("/api/shares/{id}/comments/read", post(owner_mark_read))
         .route("/api/shares/{id}/comments/{cid}", delete(owner_delete_comment))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         // connectors write only through the gated routes (ADR 0004)

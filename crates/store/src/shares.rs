@@ -394,15 +394,20 @@ impl SqliteStore {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The comments on one of the caller's shares, marked read.
-    pub fn share_comments_for_owner(&mut self, id: Uuid, now: i64) -> Result<Vec<ShareComment>> {
+    /// The comments on one of the caller's shares (a read: nothing changes).
+    pub fn share_comments_for_owner(&self, id: Uuid) -> Result<Vec<ShareComment>> {
         self.share_get(id)?;
-        let out = self.comments_of(id)?;
-        self.conn.execute(
+        self.comments_of(id)
+    }
+
+    /// Mark every comment on one of the caller's shares read; how many were
+    /// unread.
+    pub fn share_mark_read(&mut self, id: Uuid, now: i64) -> Result<usize> {
+        self.share_get(id)?;
+        Ok(self.conn.execute(
             "UPDATE share_link_comments SET read_at = ?2 WHERE share_id = ?1 AND read_at IS NULL",
             params![id.to_string(), now],
-        )?;
-        Ok(out)
+        )?)
     }
 
     /// A reply is threaded under its root: a parent that is itself a reply
@@ -684,7 +689,8 @@ mod tests {
             assert!(s.shares_list(None).unwrap().is_empty());
             assert!(matches!(s.share_get(sh.id), Err(StoreError::NotFound(_))));
             assert!(s.share_revoke(sh.id, 20).is_err());
-            assert!(s.share_comments_for_owner(sh.id, 20).is_err());
+            assert!(s.share_comments_for_owner(sh.id).is_err());
+            assert!(s.share_mark_read(sh.id, 20).is_err());
             assert!(s.share_by_token_hash("hash").is_err(), "a user scope is not the public side");
         });
         // the public side by hash; a comment; the owner reads and it is read
@@ -699,7 +705,9 @@ mod tests {
         });
         s.with_scope_for_test(Scope::User(a), |s| {
             assert_eq!(s.share_get(sh.id).unwrap().unread_comments, 1);
-            assert_eq!(s.share_comments_for_owner(sh.id, 40).unwrap().len(), 1);
+            assert_eq!(s.share_comments_for_owner(sh.id).unwrap().len(), 1);
+            assert_eq!(s.share_get(sh.id).unwrap().unread_comments, 1, "reading is not marking");
+            assert_eq!(s.share_mark_read(sh.id, 40).unwrap(), 1);
             assert_eq!(s.share_get(sh.id).unwrap().unread_comments, 0);
             let up = s.share_update(sh.id, SharePatch { snapshot: Some(snap("D2")), ..Default::default() }, 50).unwrap();
             assert_eq!((up.revision, up.title.as_str(), up.id), (2, "D2", sh.id));
