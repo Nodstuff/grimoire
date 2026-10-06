@@ -10,6 +10,7 @@ Environment=HOME=/var/lib/taisce
 Environment=TAISCE_PUBLIC_URL=https://taisce.null.ie
 Environment=TAISCE_TRUSTED_PROXY=true
 ExecStartPre=-+/opt/taisce/bin/apns-key.sh
+ExecStartPre=-+/opt/taisce/bin/share-key.sh
 Environment=TAISCE_APNS_KEY_FILE=/run/taisce/apns.p8
 Environment=TAISCE_APNS_KEY_ID=WT3Q587Y97
 Environment=TAISCE_APNS_TEAM_ID=6UP35L9425

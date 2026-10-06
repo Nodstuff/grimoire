@@ -49,7 +49,9 @@ account may be flipped to the work account by other sessions — push with
   `share_links*` tables, never docs or blocks: a link serves the snapshot the owner uploaded.
   `Scope::Public` has `user() == None` like System/Local: a new store path keyed on the user
   must deny it (`deny_public`). Tokens are HMACs under `<db dir>/share-links.key` (not in the
-  db; losing it breaks every link URL). Never name a table `shares` (an open drops it).
+  db; losing it breaks every link URL). On the box its copy is the SSM SecureString
+  `/taisce/share-links/key` (base64), written to the file before every start by
+  `infra/deploy/share-key.sh`. Never name a table `shares` (an open drops it).
 
 ## Start here
 - **[[Roadmap]]** in Taisce (under the `[[Grimoire]]` tree — doc titles are data, not renamed) is the outstanding list — read it first in any

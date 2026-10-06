@@ -184,7 +184,10 @@ resource "aws_iam_role_policy" "backups" {
 data "aws_iam_policy_document" "apns" {
   statement {
     actions   = ["ssm:GetParameter", "ssm:GetParameters"]
-    resources = ["arn:aws:ssm:${var.region}:${var.account_id}:parameter/taisce/apns/*"]
+    resources = [
+      "arn:aws:ssm:${var.region}:${var.account_id}:parameter/taisce/apns/*",
+      "arn:aws:ssm:${var.region}:${var.account_id}:parameter/taisce/share-links/*",
+    ]
   }
 }
 

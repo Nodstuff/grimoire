@@ -62,8 +62,10 @@ bytes in `share-links.key` beside the database (created on first start, 0600), n
 database: litestream replicates only `ks.db` (`infra/deploy/litestream.yml`), and backups are
 `VACUUM INTO` copies of the database alone. Only the token's SHA-256 is stored, behind a
 unique index that every public request is looked up by; the owner's URL is recomputed on
-demand. Losing the key changes every link's URL (the old ones answer 404), so it belongs in
-the box's own backup of `/var/lib/taisce`. Revoke is permanent; a passed `expires_at` answers
+demand. Losing the key changes every link's URL (the old ones answer 404), so on the box it
+is kept in SSM as the SecureString `/taisce/share-links/key` (base64, made on the laptop and
+never printed): `infra/deploy/share-key.sh` runs before every start and writes it to the file,
+so a rebuilt box keeps every link. The instance role may only read `/taisce/share-links/*`. Revoke is permanent; a passed `expires_at` answers
 410 as well.
 
 ### 4. The page is hostile-content safe
