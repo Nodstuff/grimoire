@@ -85,6 +85,10 @@ struct LocalIntegrationTests {
         return try await api.doc(doc.id)
     }
 
+    @Test func shareLinksAreServerModeOnly() async throws {
+        await #expect(throws: APIError.self) { _ = try await api.shares(docID: nil) }
+    }
+
     @Test func treeBootstrapsFromTheSeqHeader() async throws {
         let seeded = try await seed("Bootstrap")
         let (docs, seq) = try await api.treeWithSeq()
@@ -413,6 +417,90 @@ struct ServerIntegrationTests {
         let (aasa, response) = try await URLSession.shared.data(from: base.appending(path: ".well-known/apple-app-site-association"))
         #expect((response as? HTTPURLResponse)?.statusCode == 200 && response.mimeType == "application/json")
         #expect(String(decoding: aasa, as: UTF8.self).contains("6UP35L9425.ie.null.taisce"))
+    }
+
+    /// Share links end to end: a doc built into a snapshot (one diagram
+    /// drawn, one failed), published, read by a stranger, commented on,
+    /// answered, republished, closed to comments, revoked.
+    @Test func t3d_shareLinksEndToEnd() async throws {
+        let api = api(session())
+        let doc = try await api.createDoc(title: "Shared \(UUID().uuidString.prefix(6))")
+        let md = "---\ntags: [x]\n---\n\n# Intro\n\nHello **world**.\n\n```mermaid\ngraph TD; A-->B\n```\n\n```reladraw\nbroken\n```"
+        _ = try await api.proposeMarkdown(ProposeMarkdownRequest(docID: doc.id, baseEpoch: doc.currentEpoch, markdown: md))
+        let tree = try await api.doc(doc.id)
+        struct Draw: ShareVisualRendering {
+            func render(_ v: ShareVisual) async throws -> RenderedVisual {
+                if v.kind == .reladraw { throw DiagramRenderError(message: "line 1: nope") }
+                return RenderedVisual(data: Data("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"20\"><rect width=\"40\" height=\"20\"/></svg>".utf8), contentType: "image/svg+xml", width: 40, height: 20)
+            }
+        }
+        let built = await ShareSnapshotBuilder(renderer: Draw()).build(title: doc.title, blocks: tree.flattened().map(\.block), theme: .dark)
+        #expect(built.snapshot.assets.map(\.name) == ["d1.svg", "d2-error.svg"])
+        #expect(!built.snapshot.markdown.contains("tags:"))
+
+        // owner: create, list
+        let share = try await api.createShare(docID: doc.id, snapshot: built.snapshot, expiresAt: .now.addingTimeInterval(86400), commentsEnabled: true)
+        #expect(share.docID == doc.id && share.revision == 1 && share.state() == .active && share.views == 0)
+        #expect(try await api.shares(docID: doc.id).map(\.id) == [share.id])
+        #expect(try await api.shares(docID: nil).contains { $0.id == share.id })
+
+        // preview: the page HTML with assets inline (PDF export)
+        let html = try await api.sharePreviewHTML(built.snapshot)
+        #expect(html.contains("data:image/svg+xml") && html.contains("world"))
+        // for the app's PDF run against the real page (TAISCE_IT_PREVIEW_OUT)
+        if let out = IT.env["TAISCE_IT_PREVIEW_OUT"] { try html.write(toFile: out, atomically: true, encoding: .utf8) }
+
+        // a stranger opens it
+        let page = try #require(URL(string: share.url))
+        let (body, response) = try await URLSession.shared.data(from: page)
+        let http = try #require(response as? HTTPURLResponse)
+        #expect(http.statusCode == 200)
+        #expect(http.value(forHTTPHeaderField: "X-Robots-Tag")?.contains("noindex") == true)
+        #expect(http.value(forHTTPHeaderField: "Content-Security-Policy")?.contains("default-src 'none'") == true)
+        let text = String(decoding: body, as: UTF8.self)
+        #expect(text.contains("<strong>world</strong>") && text.contains("d1.svg"))
+        let (asset, ar) = try await URLSession.shared.data(from: page.appending(path: "a/d1.svg"))
+        #expect((ar as? HTTPURLResponse)?.statusCode == 200 && String(decoding: asset, as: UTF8.self).contains("<svg"))
+        let viewed = try await IT.eventually("a view counted") { try await api.shares(docID: doc.id).first { $0.views > 0 } }
+        #expect(viewed.lastViewedAt != nil)
+
+        // ... and comments
+        func comment(_ payload: [String: Any]) async throws -> Int {
+            var r = URLRequest(url: page.appending(path: "comments"))
+            r.httpMethod = "POST"
+            r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            r.httpBody = try JSONSerialization.data(withJSONObject: payload)
+            return (try await URLSession.shared.data(for: r).1 as? HTTPURLResponse)?.statusCode ?? 0
+        }
+        #expect(try await comment(["name": "Aoife", "body": "Love the diagram", "anchor": ["block": 1, "quote": "world"]]) == 201)
+        let unread = try await api.shares(docID: doc.id).first
+        #expect(unread?.commentCount == 1 && unread?.unreadComments == 1)
+
+        // the owner reads (marks read), replies, deletes
+        let list = try await api.shareComments(share.id)
+        let root = try #require(list.first)
+        #expect(root.author == "Aoife" && !root.isOwner && root.anchor?.quote == "world")
+        #expect(try await api.shares(docID: doc.id).first?.unreadComments == 0)
+        let reply = try await api.replyToShareComment(share.id, body: "Thanks!", parentID: root.id)
+        #expect(reply.isOwner && reply.parentID == root.id)
+        let threads = ShareThread.group(try await api.shareComments(share.id))
+        #expect(threads.count == 1 && threads[0].replies.map(\.body) == ["Thanks!"])
+        try await api.deleteShareComment(share.id, commentID: reply.id)
+        #expect(try await api.shareComments(share.id).map(\.id) == [root.id])
+
+        // republish, expiry, comments off
+        let updated = try await api.updateShare(share.id, snapshot: built.snapshot)
+        #expect(updated.revision == 2 && updated.url == share.url)
+        let never = try await api.updateShare(share.id, expiresAt: .set(nil))
+        #expect(never.expiresAt == nil)
+        let closed = try await api.updateShare(share.id, commentsEnabled: false)
+        #expect(!closed.commentsEnabled)
+        #expect(try await comment(["name": "Bob", "body": "late"]) == 403)
+
+        // revoke: gone for good
+        try await api.revokeShare(share.id)
+        #expect((try await URLSession.shared.data(from: page).1 as? HTTPURLResponse)?.statusCode == 410)
+        #expect(try await api.shares(docID: doc.id).first?.state() == .revoked)
     }
 
     @Test func t4_refreshRotatesAndStillWorks() async throws {

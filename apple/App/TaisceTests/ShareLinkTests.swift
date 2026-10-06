@@ -267,3 +267,20 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         #expect(doc.string?.contains("Paragraph 120") == true)
     }
 }
+
+/// The real server's preview page printed (apple/scripts/integration.sh
+/// writes it; `TEST_RUNNER_TAISCE_IT_PREVIEW_HTML=<file>` points here).
+@MainActor
+@Suite(.enabled(if: ProcessInfo.processInfo.environment["TAISCE_IT_PREVIEW_HTML"] != nil))
+struct SharePreviewPDFTests {
+    @Test func theServersPagePrintsToPages() async throws {
+        let path = try #require(ProcessInfo.processInfo.environment["TAISCE_IT_PREVIEW_HTML"])
+        let html = try String(contentsOfFile: path, encoding: .utf8)
+        let (data, layout) = try await PDFRenderer.pdf(html: html, title: "Shared", paper: .letter)
+        let doc = try #require(PDFDocument(data: data))
+        #expect(layout == .paged(pages: doc.pageCount))
+        #expect(doc.string?.contains("world") == true)
+        let box = try #require(doc.page(at: 0)?.bounds(for: .mediaBox))
+        #expect(box.width == 612 && box.height == 792)
+    }
+}
