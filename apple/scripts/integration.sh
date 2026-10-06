@@ -39,11 +39,11 @@ for port in $LOCAL_PORT $SERVER_PORT; do
   fi
 done
 
-# the daemon binary with a scratch HOME (and no TAISCE_*/GRIMOIRE_* from the caller's shell)
+# the daemon binary with a scratch HOME and an empty environment (nothing from the caller's shell)
 taisce() { # name taisce-args...
   local name=$1; shift
   mkdir -p "$ROOT/$name/home"
-  env -u TAISCE_PUBLIC_URL -u GRIMOIRE_PUBLIC_URL HOME="$ROOT/$name/home" "$BIN" "$@"
+  env -i PATH="$PATH" HOME="$ROOT/$name/home" TMPDIR="$ROOT/$name/home" "$BIN" "$@"
 }
 
 start() { # name port [extra global args...]
