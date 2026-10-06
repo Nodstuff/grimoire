@@ -94,6 +94,7 @@ fn image_html(dest: &str, alt: &str, title: &str, assets: &HashMap<String, Asset
 }
 
 /// Render a snapshot's markdown to the page body (images load lazily).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn render_body(markdown: &str, assets: &HashMap<String, AssetInfo>) -> String {
     render_body_with(markdown, assets, true)
 }
