@@ -40,6 +40,9 @@ base64 = "0.23.1"
 rust-embed = "8.12"
 libc = "0.2"
 regex = "1.13.1"
+# share links: the snapshot page (raw HTML escaped, links checked)
+pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
+unicode-normalization = "0.1.25"
 model2vec-rs = { version = "0.2.1", default-features = false, features = ["onig", "local-only"] }
 
 [build-dependencies]

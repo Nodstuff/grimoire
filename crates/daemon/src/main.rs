@@ -24,6 +24,8 @@ mod memory;
 mod nav;
 mod push;
 mod retrieval;
+mod share_render;
+mod shares;
 mod store_ext;
 mod due;
 mod todo;
@@ -999,12 +1001,15 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                 }
             };
             let default_env = apns_cfg.as_ref().map_or_else(|| apns.apns_env.clone(), |c| c.default_env.clone());
+            let mut apns_sender: Option<Arc<push::ApnsSender>> = None;
             match (apns_cfg, auth_state.is_some()) {
                 (Some(cfg), true) => {
                     tracing::info!(topic = cfg.topic, "APNs enabled: change nudges to registered devices");
                     match push::ApnsSender::new(cfg) {
                         Ok(sender) => {
-                            let (store, feed, sender) = (store.clone(), feed.clone(), Arc::new(sender));
+                            let sender = Arc::new(sender);
+                            apns_sender = Some(sender.clone());
+                            let (store, feed) = (store.clone(), feed.clone());
                             supervise("push", move || {
                                 push::push_loop(store.clone(), feed.clone(), sender.clone(), push::COALESCE)
                             });
@@ -1018,9 +1023,28 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
             // ADR 0004: SERVER mode is multi-user; a request without a token's
             // identity is refused, never served as the local user
             let server_mode = auth_state.is_some();
+            // share links: the owner routes (/api/shares) and the public
+            // page (/s/{token}); every one answers 404 in LOCAL mode
+            let shares_state = shares::SharesState {
+                store: store.clone(),
+                local_human: tom,
+                server: auth_state.as_ref().map(|st| shares::ServerSide {
+                    cfg: st.cfg.clone(),
+                    limiter: st.limiter.clone(),
+                    notify: apns_sender.clone().map(|sender| {
+                        let store = store.clone();
+                        Arc::new(move |a: shares::CommentAlert| {
+                            let (store, sender) = (store.clone(), sender.clone());
+                            let push = push::Push::ShareComment { title: a.title, author: a.author, doc_id: a.doc_id, share_id: a.share_id };
+                            tokio::spawn(push::notify_share_comment(store, sender, a.owner, push));
+                        }) as shares::Notifier
+                    }),
+                }),
+            };
             let app = mcp::router_with_hosts(store.clone(), claude, dedupe.clone(), embedder.clone(), mcp_hosts)
                 .merge(admin::router(store.clone(), admin_token, server_mode))
                 .merge(push::router(push::DevicesState { store: store.clone(), default_env }))
+                .merge(shares::router(shares_state))
                 .merge(api::router(api::ApiState {
                     changes: feed,
                     store,
