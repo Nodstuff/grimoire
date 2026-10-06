@@ -101,6 +101,7 @@ final class DiagramWebView: NSObject, WKNavigationDelegate {
         el.style.maxWidth = 'none';
         const xml = new XMLSerializer().serializeToString(el);
         host.innerHTML = '';
+        if (format === 'svg') { return { svg: xml, width: w, height: h }; }
         const img = new Image();
         img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(xml);
         await img.decode();
@@ -124,7 +125,7 @@ final class DiagramWebView: NSObject, WKNavigationDelegate {
         let web = try await ready()
         let result = try await web.callAsyncJavaScript(
             Self.renderFunction,
-            arguments: ["kind": request.kind.rawValue, "source": request.source, "theme": request.theme.rawValue, "width": request.width, "scale": request.scale],
+            arguments: Self.arguments(request, format: "png"),
             contentWorld: .page
         )
         guard let dict = result as? [String: Any] else { throw DiagramRenderError(message: "The diagram renderer gave no answer.") }
@@ -133,6 +134,32 @@ final class DiagramWebView: NSObject, WKNavigationDelegate {
             throw DiagramRenderError(message: "The diagram renderer returned no image.")
         }
         return data
+    }
+
+    /// The diagram as SVG markup (share links: drawn inside an `<img>`, so
+    /// it can't run script), with its laid-out size in points.
+    func renderSVG(_ request: DiagramRequest) async throws -> (svg: Data, width: Int, height: Int) {
+        let web = try await ready()
+        let result = try await web.callAsyncJavaScript(Self.renderFunction, arguments: Self.arguments(request, format: "svg"), contentWorld: .page)
+        guard let dict = result as? [String: Any] else { throw DiagramRenderError(message: "The diagram renderer gave no answer.") }
+        if let error = dict["error"] as? String { throw DiagramRenderError(message: Self.tidy(error)) }
+        guard let svg = dict["svg"] as? String, !svg.isEmpty else { throw DiagramRenderError(message: "The diagram renderer returned no SVG.") }
+        let w = (dict["width"] as? NSNumber)?.doubleValue ?? 0, h = (dict["height"] as? NSNumber)?.doubleValue ?? 0
+        return (Data(Self.standalone(svg).utf8), Int(w.rounded(.up)), Int(h.rounded(.up)))
+    }
+
+    nonisolated static func arguments(_ request: DiagramRequest, format: String) -> [String: Any] {
+        ["kind": request.kind.rawValue, "source": request.source, "theme": request.theme.rawValue, "width": request.width, "scale": request.scale, "format": format]
+    }
+
+    /// An SVG file needs its namespace (XMLSerializer adds it for an
+    /// element from an HTML page only sometimes) and an XML prolog.
+    nonisolated static func standalone(_ svg: String) -> String {
+        var s = svg
+        if !s.contains("xmlns=\"http://www.w3.org/2000/svg\""), let r = s.range(of: "<svg") {
+            s.replaceSubrange(r, with: "<svg xmlns=\"http://www.w3.org/2000/svg\"")
+        }
+        return s.hasPrefix("<?xml") ? s : "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" + s
     }
 
     /// Mermaid's parse errors carry a multi-line caret excerpt; keep it short

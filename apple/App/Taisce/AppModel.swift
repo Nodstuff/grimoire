@@ -116,6 +116,8 @@ final class AppModel {
     let sqlRuns = SQLRunStore()
     /// this Mac's SQL data sources (kept across sign-outs: they're the Mac's)
     let dataSources = DataSourceStore()
+    /// share links and their comments (SERVER mode only)
+    let shareLinks = ShareLinkStore()
 
     /// The Mac's move out of the sandbox didn't finish this launch (the
     /// container couldn't be read, or a copy failed): the app opens no
@@ -133,6 +135,7 @@ final class AppModel {
         let stored = UserDefaults.standard.string(forKey: Self.serverURLKey).flatMap { ServerConfig.normalizedURL($0)?.absoluteString }
         serverURL = stored.flatMap { ServerURLPolicy.accepts($0) ? $0 : nil } ?? Self.defaultServerURL
         codeRuns.app = self
+        shareLinks.app = self
         sqlRuns.app = self
     }
 
@@ -293,6 +296,7 @@ final class AppModel {
         editMeta = [:]
         codeRuns.reset()
         sqlRuns.reset()
+        shareLinks.reset()
         settledTodos = []
         pendingEditDoc = nil
         pendingWrites = 0
@@ -447,6 +451,7 @@ final class AppModel {
             pins = UserDefaults.standard.stringArray(forKey: pinsKey) ?? []
             await loadCachedWorkspaces(cache) // workspaces
             editMeta = [:]
+            shareLinks.reset()
             treeLoaded = false
             await sync.setAlwaysFetch(Set(pins))
             observeTask = Task { [weak self] in

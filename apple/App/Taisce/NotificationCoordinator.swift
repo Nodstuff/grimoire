@@ -330,6 +330,10 @@ final class DueAlertDelegate: NSObject, UNUserNotificationCenterDelegate, Sendab
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         let info = response.notification.request.content.userInfo
+        if let doc = ShareCommentPush.docID(from: info) {
+            await MainActor.run { ShareCommentPush.deliver(doc) }
+            return
+        }
         guard let action = DueAlertAction(rawValue: response.actionIdentifier),
               let day = info["day"] as? String, let itemID = info["itemID"] as? String
         else { return }

@@ -33,12 +33,18 @@ struct TaisceCommands: Commands {
         CommandGroup(replacing: .newItem) {
             item("New Doc", .newDoc).keyboardShortcut("n")
         }
+        // ⌥⌘E: ⌘E is Edit Doc and ⇧⌘E inline code in the editor
+        CommandGroup(replacing: .importExport) {
+            item("Export as PDF\u{2026}", .exportPDF).keyboardShortcut("e", modifiers: [.command, .option])
+        }
         CommandGroup(replacing: .appSettings) {
             item("Settings\u{2026}", .settings).keyboardShortcut(",")
         }
         CommandMenu("Doc") {
             item(router?.editingDoc != nil ? "Done Editing" : "Edit Doc", .toggleEdit).keyboardShortcut("e")
             item("Refresh", .refresh).keyboardShortcut("r")
+            Divider()
+            item("Share Link\u{2026}", .shareLink)
         }
         CommandMenu("Go") {
             item("Search", .search).keyboardShortcut("f")
@@ -61,7 +67,8 @@ struct TaisceCommands: Commands {
         Button(title) { run(command) }
             .disabled(!(router?.canPerform(
                 command, signedIn: signedIn, picker: model.workspacePicker,
-                canEdit: { model.access(for: $0).canEdit }, canCreate: model.currentAccess.canCreate
+                canEdit: { model.access(for: $0).canEdit }, canCreate: model.currentAccess.canCreate,
+                shares: model.shareLinks.isAvailable
             ) ?? false))
     }
 

@@ -21,6 +21,8 @@ enum PadItem: Hashable {
 /// A menu-bar command (the Mac's menus, an iPad's hardware keyboard).
 enum AppCommand: Hashable {
     case newDoc, search, toggleEdit, refresh, settings, today, todos
+    /// the doc in front: Share link… and Export as PDF… (SERVER mode)
+    case shareLink, exportPDF
     /// ⌘1…⌘9: the nth workspace in the switcher's order (1-based)
     case workspace(Int)
 }
@@ -34,6 +36,15 @@ enum CommandEffect: Equatable {
 /// ⌘E on the doc in front: start editing it, or finish.
 struct EditRequest: Equatable {
     var doc: DocID
+    var serial: Int
+}
+
+/// Something the doc screen showing `doc` should open: the share sheet,
+/// a PDF export, or its link comments (a push tap).
+struct DocAction: Equatable {
+    enum Kind: Equatable { case shareLink, exportPDF, linkComments }
+    var doc: DocID
+    var kind: Kind
     var serial: Int
 }
 
@@ -60,6 +71,8 @@ final class Router {
     var editingDoc: DocID?
     /// ⌘E: the doc screen showing `doc` toggles edit mode
     private(set) var editRequest: EditRequest?
+    /// a doc action waiting for that doc's screen (it clears it when done)
+    var docAction: DocAction?
     /// ⌘F on the split view: bumped to focus the sidebar's search field
     private(set) var searchFocusRequest = 0
 
@@ -128,9 +141,12 @@ final class Router {
     /// Whether a command applies now. Nothing works before sign-in; ⌘E
     /// needs a doc in front that you may edit (ADR 0004: not a viewer's);
     /// ⌘N needs a workspace you may add to; ⌘n needs an nth workspace.
-    func canPerform(_ command: AppCommand, signedIn: Bool, picker: WorkspacePicker, canEdit: (DocID) -> Bool = { _ in true }, canCreate: Bool = true) -> Bool {
+    func canPerform(_ command: AppCommand, signedIn: Bool, picker: WorkspacePicker, canEdit: (DocID) -> Bool = { _ in true }, canCreate: Bool = true, shares: Bool = false) -> Bool {
         guard signedIn else { return false }
         switch command {
+        case .shareLink, .exportPDF:
+            // SERVER mode only, a doc in front, not mid-edit
+            return shares && focusedDoc != nil && editingDoc == nil
         case .toggleEdit:
             // finishing an edit is always allowed
             if editingDoc != nil { return true }
@@ -186,6 +202,10 @@ final class Router {
             editRequest = EditRequest(doc: doc, serial: (editRequest?.serial ?? 0) + 1)
         case .refresh:
             return .refresh
+        case .shareLink:
+            if let doc = focusedDoc { request(.shareLink, on: doc) }
+        case .exportPDF:
+            if let doc = focusedDoc { request(.exportPDF, on: doc) }
         case .settings:
             showSettings = true
         case .today:
@@ -196,6 +216,18 @@ final class Router {
             if let scope = picker.shortcut(n) { return .selectWorkspace(scope) }
         }
         return .none
+    }
+
+    func request(_ kind: DocAction.Kind, on doc: DocID) {
+        docAction = DocAction(doc: doc, kind: kind, serial: (docAction?.serial ?? 0) + 1)
+    }
+
+    /// A push about comments on a doc's link: show the doc, then its link comments.
+    func openLinkComments(_ doc: DocID) {
+        if focusedDoc != doc {
+            if isPad { select(.doc(doc)) } else { tab = .library; libraryPath = [.doc(doc)] }
+        }
+        request(.linkComments, on: doc)
     }
 
     /// Development launch arguments, for screenshots and UI runs:

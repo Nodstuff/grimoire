@@ -17,6 +17,13 @@ struct DocScreen: View {
     @State private var editable = false
     @State private var opening = false
     @State private var movingWorkspace = false // workspaces
+    // share links and PDF export (SERVER mode)
+    @State private var sharing = false
+    @State private var showingLinkComments = false
+    @State private var exportingPDF = false
+    @State private var pdfFile: PDFExportFile?
+    @State private var savingPDF = false
+    @State private var pdfError: String?
     @AppStorage(DocTextSize.key) private var textSize = DocTextSize.actual
 
     var body: some View {
@@ -81,6 +88,48 @@ struct DocScreen: View {
         .onChange(of: access.canEdit) { _, can in
             if !can, editor != nil { Task { await finishEditing() } }
         }
+        // the menu bar's Share Link… / Export as PDF…, or a comment push
+        .onChange(of: router.docAction, initial: true) { _, action in
+            guard let action, action.doc == docID else { return }
+            router.docAction = nil
+            switch action.kind {
+            case .shareLink: if model.shareLinks.isAvailable { sharing = true }
+            case .exportPDF: exportPDF()
+            case .linkComments: showingLinkComments = true
+            }
+        }
+        .task(id: docID) {
+            guard model.shareLinks.isAvailable else { return }
+            try? await model.shareLinks.load(doc: docID)
+        }
+        .sheet(isPresented: $sharing) { ShareLinkSheet(docID: docID) }
+        .alert("Couldn't export the PDF", isPresented: Binding(get: { pdfError != nil }, set: { if !$0 { pdfError = nil } })) {
+            Button("OK", role: .cancel) { pdfError = nil }
+        } message: {
+            Text(pdfError ?? "")
+        }
+        .sheet(isPresented: $showingLinkComments) {
+            NavigationStack {
+                LinkCommentsScreen(docID: docID)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) { Button("Done") { showingLinkComments = false } }
+                    }
+            }
+            .tint(Theme.accent)
+        }
+        #if targetEnvironment(macCatalyst)
+        .fileExporter(
+            isPresented: $savingPDF,
+            document: (try? Data(contentsOf: pdfFile?.url ?? URL(fileURLWithPath: "/dev/null"))).map(PDFDocumentFile.init(data:)),
+            contentType: .pdf,
+            defaultFilename: pdfFile?.url.lastPathComponent
+        ) { result in
+            if case let .failure(error) = result { model.lastError = error.localizedDescription }
+            pdfFile = nil
+        }
+        #else
+        .sheet(item: $pdfFile) { file in ActivityView(items: [file.url]).presentationDetents([.medium, .large]) }
+        #endif
         .onChange(of: editor == nil) { _, closed in
             if !closed {
                 router.editingDoc = docID
@@ -136,7 +185,12 @@ struct DocScreen: View {
             onOpenChild: { router.open(.doc($0)) },
             onNewDocHere: onNewDocHere,
             docID: docID,
-            canEdit: editable && access.canEdit
+            canEdit: editable && access.canEdit,
+            linkComments: model.shareLinks.isAvailable ? model.shareLinks.commentSummary(for: docID).title : nil,
+            onOpenLinkComments: { showingLinkComments = true },
+            onShareLink: model.shareLinks.isAvailable && page != nil ? { sharing = true } : nil,
+            onExportPDF: model.shareLinks.isAvailable && page != nil && !exportingPDF ? { exportPDF() } : nil,
+            exportingPDF: exportingPDF
         )
         .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
         // children's "edited … ago" (a handful; each is cached until it changes)
@@ -151,6 +205,25 @@ struct DocScreen: View {
             }
             return .systemAction
         })
+    }
+
+    /// PDF export: the server's page for a light snapshot, printed. The
+    /// Mac asks where to save it; the iPhone hands it to the share sheet.
+    private func exportPDF() {
+        guard !exportingPDF, model.shareLinks.isAvailable else { return }
+        exportingPDF = true
+        Task {
+            defer { exportingPDF = false }
+            do {
+                let file = try await model.exportPDF(docID)
+                pdfFile = file
+                #if targetEnvironment(macCatalyst)
+                savingPDF = true
+                #endif
+            } catch {
+                pdfError = error.localizedDescription
+            }
+        }
     }
 
     /// Canvases and federation mirrors are read-only here.
@@ -279,6 +352,12 @@ struct DocContent: View {
     /// runnable code blocks (Mac): which doc, and whether a practice edit may be saved
     var docID: DocID?
     var canEdit = false
+    // share links (SERVER mode): the comments entry and the … menu's items
+    var linkComments: String?
+    var onOpenLinkComments: () -> Void = {}
+    var onShareLink: (() -> Void)?
+    var onExportPDF: (() -> Void)?
+    var exportingPDF = false
 
     var body: some View {
         ScrollView {
@@ -307,6 +386,19 @@ struct DocContent: View {
                     }
                 }
                 .padding(.bottom, 6)
+                if let linkComments {
+                    Button(action: onOpenLinkComments) {
+                        Label(linkComments, systemImage: "bubble.left.and.text.bubble.right")
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(Theme.accent)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .card(Theme.surface)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("doc.linkComments")
+                }
                 content
             }
             .padding(.horizontal, Theme.gutter)
@@ -336,6 +428,18 @@ struct DocContent: View {
                     Button(pinned ? "Unpin from Today" : "Pin to Today", systemImage: pinned ? "pin.slash" : "pin", action: onTogglePin)
                     if let onMoveWorkspace {
                         Button("Move to workspace\u{2026}", systemImage: "square.stack", action: onMoveWorkspace)
+                    }
+                    if onShareLink != nil || onExportPDF != nil || exportingPDF {
+                        Divider()
+                    }
+                    if let onShareLink {
+                        Button("Share link\u{2026}", systemImage: "link", action: onShareLink)
+                            .accessibilityIdentifier("doc.shareLink")
+                    }
+                    if let onExportPDF {
+                        Button("Export as PDF\u{2026}", systemImage: "doc.richtext", action: onExportPDF)
+                    } else if exportingPDF {
+                        Text("Exporting PDF\u{2026}")
                     }
                 } label: {
                     Image(systemName: "ellipsis")

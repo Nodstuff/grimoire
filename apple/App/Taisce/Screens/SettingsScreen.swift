@@ -23,7 +23,8 @@ struct SettingsScreen: View {
                     lastError: model.lastError,
                     syncError: model.syncError,
                     failedDocs: model.failedDocs.map { (model.index.byID[$0.key]?.title ?? $0.key, $0.value) }.sorted { $0.0 < $1.0 },
-                    alerts: model.dueAlerts.status
+                    alerts: model.dueAlerts.status,
+                    sharedLinks: model.shareLinks.isAvailable ? model.shareLinks.unreadTotal : nil
                 ),
                 onSave: { url in Task { await model.setServerURL(url) } },
                 onEnableAlerts: { Task { await model.dueAlerts.requestAuthorization() } },
@@ -44,6 +45,7 @@ struct SettingsScreen: View {
                 onDone: { dismiss() }
             )
             .task { await model.dueAlerts.refresh() }
+            .task { if model.shareLinks.isAvailable { try? await model.shareLinks.loadAll() } }
             // a dialog, not window.confirm: works on iPhone and Mac Catalyst
             .confirmationDialog(
                 unsentPrompt ?? "",
@@ -79,6 +81,8 @@ struct SettingsInfo {
     /// (doc title, why) for docs whose body couldn't be fetched
     var failedDocs: [(String, String)] = []
     var alerts: DueAlertStatus = .allowed
+    /// unread link comments; nil hides Shared links (LOCAL mode, signed out)
+    var sharedLinks: Int?
 }
 
 struct SettingsContent: View {
@@ -143,6 +147,24 @@ struct SettingsContent: View {
                 Text("Edits made offline wait in the outbox and send in order when the connection is back.")
             }
             .listRowBackground(Theme.surface)
+
+            if let unread = info.sharedLinks {
+                Section {
+                    NavigationLink {
+                        SharedLinksScreen()
+                    } label: {
+                        HStack {
+                            Text("Shared links")
+                            Spacer()
+                            if unread > 0 { UnreadBadge(count: unread) }
+                        }
+                    }
+                    .accessibilityIdentifier("settings.sharedLinks")
+                } footer: {
+                    Text("Links you've made to docs, their views and comments.")
+                }
+                .listRowBackground(Theme.surface)
+            }
 
             #if targetEnvironment(macCatalyst)
             Section {

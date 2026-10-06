@@ -69,6 +69,27 @@ enum SilentPush {
     }
 }
 
+/// The server's alert push for a comment on one of your share links:
+/// `{"aps":{"alert":…},"kind":"share_comment","doc_id":…,"share_id":…}`.
+/// A tap opens that doc's link comments.
+enum ShareCommentPush {
+    static let kind = "share_comment"
+
+    static func docID(from userInfo: [AnyHashable: Any]) -> DocID? {
+        guard userInfo["kind"] as? String == kind, let doc = userInfo["doc_id"] as? String, !doc.isEmpty else { return nil }
+        return doc
+    }
+
+    /// The front window's router opens it (`RootView` sets this).
+    @MainActor static var open: ((DocID) -> Void)?
+    /// A tap that arrived before any window could take it (a cold launch).
+    @MainActor static var pending: DocID?
+
+    @MainActor static func deliver(_ doc: DocID) {
+        if let open { open(doc) } else { pending = doc }
+    }
+}
+
 extension UIBackgroundFetchResult {
     init(_ result: BackgroundRefreshResult) {
         switch result {

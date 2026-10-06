@@ -97,6 +97,18 @@ struct RootView: View {
         .onChange(of: model.docs.count) {
             if appliedLaunchArguments { _ = router.openLaunchDoc(index: model.index) }
         }
+        // a tap on "X commented on Y": that doc's link comments
+        .onAppear {
+            ShareCommentPush.open = { [router, model] doc in
+                router.openLinkComments(doc)
+                Task { try? await model.shareLinks.load(doc: doc) }
+            }
+        }
+        .onChange(of: model.treeLoaded, initial: true) { _, loaded in
+            guard loaded, let doc = ShareCommentPush.pending else { return }
+            ShareCommentPush.pending = nil
+            router.openLinkComments(doc)
+        }
         // ADR 0004: an unshared doc closes, with a gentle note
         .onChange(of: model.revocation) { _, r in
             guard let r, router.drop(r.docs) else { return }
