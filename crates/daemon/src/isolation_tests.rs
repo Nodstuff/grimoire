@@ -169,6 +169,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/shares/{id}/comments/{cid}", "share_links_are_the_owners_alone"),
     ("/s/{token}", "a_share_link_serves_only_its_own_snapshot"),
     ("/s/{token}/a/{name}", "a_share_link_serves_only_its_own_snapshot"),
+    ("/s/{token}/a/{name}", "a_hammered_link_is_limited_per_link_and_images_are_cached"),
     ("/s/{token}/comments", "a_share_link_serves_only_its_own_snapshot"),
     ("/s/{token}", "share_link_page_headers_expiry_and_revoke"),
     ("/s/{token}/comments", "share_link_comments_honeypot_limits_and_push"),
@@ -1814,7 +1815,7 @@ async fn share_link_page_headers_expiry_and_revoke() {
     // views
     let (_, out) = fx.call(&fx.a_app, "GET", "/api/shares", None).await;
     let listed: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(listed["shares"][0]["views"], 2, "{out}");
+    assert_eq!(listed["shares"][0]["views"], 1, "two views in a minute count once: {out}");
     assert!(listed["shares"][0]["last_viewed_at"].is_string());
     // the malicious SVG: served as itself, sandboxed, never sniffed
     let svg = fx.raw(None, "GET", &format!("{p}/a/d1.svg"), None).await;
@@ -2121,4 +2122,50 @@ async fn a_reader_cannot_sign_as_the_owner() {
     // the owner's own reply keeps her name
     let r = fx.raw(Some(&fx.a_app), "POST", &format!("/api/shares/{}/comments", share["id"].as_str().unwrap()), Some(json!({"body": "hi"}))).await;
     assert_eq!(r.json()["author"], "Tom");
+}
+
+/// Every /s/ request also draws from a per-link bucket, so many addresses
+/// cannot hammer one link (and the store behind it); images come from
+/// memory after the first request.
+#[tokio::test]
+async fn a_hammered_link_is_limited_per_link_and_images_are_cached() {
+    let fx = fixture();
+    let share = fx.make_share(&fx.a_app, fx.a_secret, "Shared plan", "busytext", "d1.svg").await;
+    let p = link_path(&share);
+    let mut cfg = AuthConfig::from_public_url(BASE).unwrap();
+    cfg.trusted_proxy = true;
+    let caches: std::sync::Arc<crate::shares::Caches> = Default::default();
+    let app = crate::shares::router(crate::shares::SharesState {
+        store: fx.store.clone(),
+        local_human: fx.a_human,
+        server: Some(crate::shares::ServerSide {
+            cfg: std::sync::Arc::new(cfg),
+            caches: caches.clone(),
+            key: std::sync::Arc::new(crate::shares::ShareKey::from_bytes(&[7; 32])),
+            limiter: Default::default(),
+            notify: None,
+        }),
+    });
+    let get = |path: String, ip: String| {
+        let app = app.clone();
+        async move {
+            let req = Request::get(path).header("x-forwarded-for", ip).body(Body::empty()).unwrap();
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+    assert_eq!(get(format!("{p}/a/d1.svg"), "10.0.0.1".into()).await, StatusCode::OK);
+    assert_eq!(caches.assets.lock().unwrap().bytes(), EVIL_SVG.len(), "the image is cached");
+    // a fresh address every request: the per-IP bucket never empties, the per-link one does
+    let mut limited = None;
+    for i in 0..400 {
+        if get(format!("{p}/a/d1.svg"), format!("10.1.{}.{}", i / 250, i % 250)).await == StatusCode::TOO_MANY_REQUESTS {
+            limited = Some(i);
+            break;
+        }
+    }
+    let n = limited.expect("the per-link bucket never answered 429");
+    assert!(n >= 250, "the per-link limit is generous: limited after {n}");
+    // another link is unaffected
+    let other = fx.make_share(&fx.a_app, fx.a_loose, "Other", "othertext", "d1.svg").await;
+    assert_eq!(get(link_path(&other), "10.2.0.1".into()).await, StatusCode::OK);
 }

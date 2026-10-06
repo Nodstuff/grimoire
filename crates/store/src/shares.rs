@@ -417,14 +417,16 @@ impl SqliteStore {
         Ok(RenderInput { markdown, assets })
     }
 
-    /// Count a page view.
-    pub fn share_public_viewed(&mut self, id: Uuid, now: i64) -> Result<()> {
+    /// Count a page view: at most one a minute per link, so a busy (or
+    /// hammered) link costs one write a minute, not one per request.
+    pub fn share_public_viewed(&mut self, id: Uuid, now: i64) -> Result<bool> {
         self.public_only()?;
-        self.conn.execute(
-            "UPDATE share_links SET views = views + 1, last_viewed_at = ?2 WHERE id = ?1",
+        let n = self.conn.execute(
+            "UPDATE share_links SET views = views + 1, last_viewed_at = ?2
+             WHERE id = ?1 AND (last_viewed_at IS NULL OR last_viewed_at < ?2 - 60)",
             params![id.to_string(), now],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     pub fn share_public_asset(&self, id: Uuid, name: &str) -> Result<Option<ShareAsset>> {

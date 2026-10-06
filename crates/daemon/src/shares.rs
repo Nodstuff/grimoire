@@ -452,13 +452,21 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> Lru<K, V> {
 /// per snapshot and the running renderer is always the one used.
 pub const RENDER_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Images by (link, revision, name): served without touching the store
+/// (and its mutex) after the first request.
+pub const ASSET_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
 pub struct Caches {
     pub renders: std::sync::Mutex<Lru<(Uuid, i64), Arc<String>>>,
+    pub assets: std::sync::Mutex<Lru<(Uuid, i64, String), Arc<ShareAsset>>>,
 }
 
 impl Default for Caches {
     fn default() -> Self {
-        Self { renders: std::sync::Mutex::new(Lru::new(RENDER_CACHE_BYTES)) }
+        Self {
+            renders: std::sync::Mutex::new(Lru::new(RENDER_CACHE_BYTES)),
+            assets: std::sync::Mutex::new(Lru::new(ASSET_CACHE_BYTES)),
+        }
     }
 }
 
@@ -878,6 +886,9 @@ async fn lookup(st: &SharesState, req_headers: &HeaderMap, ext: &axum::http::Ext
         return Ok((Found::Unknown, ip));
     }
     let hash = hash_secret(token);
+    if !server.limiter.allow(Class::ShareLink, &hash) {
+        return Err(public_json(StatusCode::TOO_MANY_REQUESTS, json!({"error": "this link is busy; try again shortly"})));
+    }
     let found = with_store(&st.store, Scope::Public, move |s| s.share_by_token_hash(&hash)).await;
     Ok(match found {
         Ok(Some(sh)) if sh.is_gone(now()) => (Found::Gone, ip),
@@ -957,13 +968,25 @@ async fn public_asset(State(st): State<SharesState>, Path((token, name)): Path<(
     if !valid_asset_name(&name) {
         return plain(StatusCode::NOT_FOUND, "not found");
     }
-    let id = sh.id;
-    let asset = match with_store(&st.store, Scope::Public, move |s| s.share_public_asset(id, &name)).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return plain(StatusCode::NOT_FOUND, "not found"),
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    let Some(server) = &st.server else { return not_found() };
+    let key = (sh.id, sh.revision, name.clone());
+    let cached = lock(&server.caches.assets).get(&key);
+    let asset = match cached {
+        Some(a) => a,
+        None => {
+            let id = sh.id;
+            match with_store(&st.store, Scope::Public, move |s| s.share_public_asset(id, &name)).await {
+                Ok(Some(a)) => {
+                    let a = Arc::new(a);
+                    lock(&server.caches.assets).put(key, a.clone(), a.data.len());
+                    a
+                }
+                Ok(None) => return plain(StatusCode::NOT_FOUND, "not found"),
+                Err(e) => return public_500(e),
+            }
+        }
     };
-    let mut r = asset.data.into_response();
+    let mut r = axum::body::Body::from(axum::body::Bytes::copy_from_slice(&asset.data)).into_response();
     let h = r.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&asset.content_type) {
         h.insert(header::CONTENT_TYPE, v);
@@ -1146,6 +1169,21 @@ mod tests {
         assert!(same_name("ﬁona", "Fiona"), "ligatures fold");
         assert!(!same_name("Tomás", "Tom"));
         assert!(!same_name("Tom", ""));
+    }
+
+    #[test]
+    fn the_lru_keeps_under_its_cap_and_drops_the_oldest() {
+        let mut l: Lru<u32, Arc<Vec<u8>>> = Lru::new(100);
+        l.put(1, Arc::new(vec![0; 40]), 40);
+        l.put(2, Arc::new(vec![0; 40]), 40);
+        assert!(l.get(&1).is_some(), "touch 1: now 2 is the oldest");
+        l.put(3, Arc::new(vec![0; 40]), 40);
+        assert!(l.get(&2).is_none() && l.get(&1).is_some() && l.get(&3).is_some());
+        assert!(l.bytes() <= 100);
+        l.put(4, Arc::new(vec![0; 101]), 101);
+        assert!(l.get(&4).is_none(), "too big to cache");
+        l.put(3, Arc::new(vec![0; 10]), 10);
+        assert_eq!(l.bytes(), 50, "a replaced entry's weight is released");
     }
 
     #[test]
