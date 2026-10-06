@@ -1,5 +1,7 @@
 // Taisce share link: the comment panel. Plain DOM, no dependencies; every
-// piece of text goes in through textContent, never innerHTML.
+// piece of text goes in through textContent, never innerHTML. The page is
+// sandboxed into an opaque origin (CSP `sandbox`), so storage may throw and
+// every fetch is a credential-less CORS request with Origin: null.
 (function () {
   "use strict";
   if (document.body.getAttribute("data-comments") !== "on") return;
@@ -51,7 +53,7 @@
       var payload = { name: n, body: b, website: site.value };
       if (opts.anchor) payload.anchor = opts.anchor;
       if (opts.parent) payload.parent_id = opts.parent;
-      fetch(api, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) })
+      fetch(api, { method: "POST", credentials: "omit", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) })
         .then(function (r) {
           if (r.status === 201) { f.remove(); done(); return; }
           return r.json().catch(function () { return {}; }).then(function (j) {
@@ -111,7 +113,7 @@
   }
 
   function load() {
-    fetch(api, { headers: { accept: "application/json" } })
+    fetch(api, { credentials: "omit", headers: { accept: "application/json" } })
       .then(function (r) { return r.ok ? r.json() : { comments: [], enabled: false }; })
       .then(function (j) {
         if (j.enabled === false) { var p = document.getElementById("comments"); if (p) p.remove(); return; }

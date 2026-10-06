@@ -69,8 +69,38 @@ const ALLOWED_TYPES: [&str; 4] = ["image/svg+xml", "image/png", "image/jpeg", "i
 pub fn page_csp(nonce: &str) -> String {
     format!(
         "default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; \
-script-src 'nonce-{nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+script-src 'nonce-{nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; \
+sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox"
     )
+}
+
+/// The page runs sandboxed in an opaque origin (no `allow-same-origin`): its
+/// script cannot reach the web UI's cookie, storage or same-origin `/api`,
+/// and its own comment fetches arrive with `Origin: null`. Only the public
+/// comment routes answer that origin, without credentials.
+async fn cors_for_sandboxed_page(req: Request, next: axum::middleware::Next) -> Response {
+    let null = req.headers().get(header::ORIGIN).is_some_and(|o| o.as_bytes() == b"null");
+    let mut res = next.run(req).await;
+    if null {
+        let h = res.headers_mut();
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("null"));
+        h.insert(header::VARY, HeaderValue::from_static("Origin"));
+    }
+    res
+}
+
+/// The CORS preflight for the page's comment POST (JSON body).
+async fn comments_preflight(headers: HeaderMap) -> Response {
+    if headers.get(header::ORIGIN).is_none_or(|o| o.as_bytes() != b"null") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut r = StatusCode::NO_CONTENT.into_response();
+    let h = r.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("content-type"));
+    h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
+    public_headers(h);
+    r
 }
 /// An image is a document of its own (an SVG can carry script): nothing runs.
 pub const ASSET_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
@@ -1027,7 +1057,13 @@ pub fn router(state: SharesState) -> Router {
     Router::new()
         .route("/s/{token}", get(public_page))
         .route("/s/{token}/a/{name}", get(public_asset))
-        .route("/s/{token}/comments", get(public_comments).post(public_comment))
+        .route(
+            "/s/{token}/comments",
+            get(public_comments)
+                .post(public_comment)
+                .options(comments_preflight)
+                .layer(axum::middleware::from_fn(cors_for_sandboxed_page)),
+        )
         .merge(owner)
         .with_state(state)
 }

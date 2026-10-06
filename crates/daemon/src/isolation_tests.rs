@@ -172,6 +172,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/s/{token}/comments", "a_share_link_serves_only_its_own_snapshot"),
     ("/s/{token}", "share_link_page_headers_expiry_and_revoke"),
     ("/s/{token}/comments", "share_link_comments_honeypot_limits_and_push"),
+    ("/s/{token}/comments", "the_sandboxed_page_reaches_only_its_comment_routes"),
     ("/api/shares/preview", "share_link_preview_stores_nothing_and_limits_hold"),
 ];
 
@@ -1801,7 +1802,7 @@ async fn share_link_page_headers_expiry_and_revoke() {
     assert_eq!(page.h("content-security-policy"), crate::shares::page_csp(nonce));
     assert_eq!(
         page.h("content-security-policy"),
-        format!("default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'nonce-{nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+        format!("default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'nonce-{nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox")
     );
     assert_eq!(page.h("x-robots-tag"), "noindex, nofollow");
     assert_eq!(page.h("referrer-policy"), "no-referrer");
@@ -2036,4 +2037,70 @@ async fn scope_public_reads_and_writes_nothing() {
     assert!(s.idempotency_put(fx.a_human, Uuid::now_v7(), "{}", 0, 0).is_err(), "idempotency_put");
     let text = format!("{:?}", s.list_docs());
     fx.no_leak("Scope::Public", &text);
+}
+
+/// The public page runs in an opaque origin (CSP sandbox without
+/// allow-same-origin): its fetches carry `Origin: null`. Only the public
+/// comment routes answer that origin (no credentials), and /api refuses it
+/// even with the session cookie and the CSRF header.
+#[tokio::test]
+async fn the_sandboxed_page_reaches_only_its_comment_routes() {
+    let fx = fixture();
+    let share = fx.make_share(&fx.a_app, fx.a_secret, "Shared plan", "sandboxtext", "d1.svg").await;
+    let p = link_path(&share);
+    let page = fx.raw(None, "GET", &p, None).await;
+    let csp = page.h("content-security-policy").to_string();
+    assert!(csp.ends_with("sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox"), "{csp}");
+    assert!(!csp.contains("allow-same-origin"), "{csp}");
+    let send = |method: &str, path: String, body: Option<Value>, origin: &str| {
+        let mut b = Request::builder().method(method).uri(path).header("host", "localhost:7513").header("origin", origin.to_string());
+        if body.is_some() {
+            b = b.header("content-type", "application/json");
+        }
+        if method == "OPTIONS" {
+            b = b.header("access-control-request-method", "POST").header("access-control-request-headers", "content-type");
+        }
+        let req = b.body(body.map_or_else(Body::empty, |v| Body::from(v.to_string()))).unwrap();
+        let app = fx.app.clone();
+        async move { app.oneshot(req).await.unwrap() }
+    };
+    let pre = send("OPTIONS", format!("{p}/comments"), None, "null").await;
+    assert_eq!(pre.status(), StatusCode::NO_CONTENT);
+    assert_eq!(pre.headers()["access-control-allow-origin"], "null");
+    assert!(pre.headers()["access-control-allow-headers"].to_str().unwrap().contains("content-type"));
+    assert!(pre.headers().get("access-control-allow-credentials").is_none());
+    let post = send("POST", format!("{p}/comments"), Some(json!({"name": "R", "body": "from the sandbox"})), "null").await;
+    assert_eq!(post.status(), StatusCode::CREATED);
+    assert_eq!(post.headers()["access-control-allow-origin"], "null");
+    assert!(post.headers().get("access-control-allow-credentials").is_none());
+    let get = send("GET", format!("{p}/comments"), None, "null").await;
+    assert_eq!(get.headers()["access-control-allow-origin"], "null");
+    // no other origin is answered, and the page and images never are
+    let other = send("GET", format!("{p}/comments"), None, "https://evil.example").await;
+    assert!(other.headers().get("access-control-allow-origin").is_none());
+    assert!(send("GET", p.clone(), None, "null").await.headers().get("access-control-allow-origin").is_none());
+    // /api refuses Origin: null, cookie and CSRF header or not
+    let tom = web_session(&mut fx.store.lock(Scope::System), fx.a);
+    let cookie = format!("{}={}", crate::auth::web::COOKIE, tom.strip_prefix(COOKIE_TOKEN).unwrap());
+    for (m, path, body) in [
+        ("POST", "/api/shares".to_string(), Some(json!({"doc_id": fx.a_loose, "snapshot": snapshot("x", "y", "d1.svg")}))),
+        ("DELETE", format!("/api/shares/{}", share["id"].as_str().unwrap()), None),
+        ("POST", "/api/docs".to_string(), Some(json!({"title": "x", "parent_doc_id": null}))),
+    ] {
+        let req = Request::builder()
+            .method(m)
+            .uri(&path)
+            .header("host", "localhost:7513")
+            .header("origin", "null")
+            .header("cookie", &cookie)
+            .header(crate::auth::web::CSRF_HEADER, "1")
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |v| Body::from(v.to_string())))
+            .unwrap();
+        let res = fx.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "{m} {path} with Origin: null");
+        assert!(res.headers().get("access-control-allow-origin").is_none());
+    }
+    let (_, out) = fx.call(&fx.a_app, "GET", "/api/shares", None).await;
+    assert!(out.contains("\"revoked_at\":null"), "the link survived: {out}");
 }
