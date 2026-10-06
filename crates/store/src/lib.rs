@@ -13,6 +13,7 @@ pub mod mddiff;
 pub mod order_key;
 pub mod push;
 pub mod scope;
+pub mod shares;
 mod sqlite;
 pub mod tenancy;
 mod types;

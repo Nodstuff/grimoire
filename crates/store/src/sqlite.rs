@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("schema.sql");
 const WORKSPACES_SCHEMA: &str = include_str!("workspaces.sql");
+const SHARES_SCHEMA: &str = include_str!("shares.sql");
 
 pub struct SqliteStore {
     pub(crate) conn: Connection,
@@ -54,6 +55,7 @@ impl SqliteStore {
         migrate_pre_schema(&conn)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(WORKSPACES_SCHEMA)?;
+        conn.execute_batch(SHARES_SCHEMA)?;
         backfill(&conn)?;
         Ok(Self { conn, scope: Scope::System })
     }
@@ -484,7 +486,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -537,6 +539,8 @@ fn backfill(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // v10: share links (shares.sql: shares, share_assets, share_comments).
+    // The tables are created IF NOT EXISTS above; nothing to backfill.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())

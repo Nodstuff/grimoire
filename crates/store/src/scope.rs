@@ -24,6 +24,11 @@ pub enum Scope {
     /// sits in a shared workspace read only from that workspace, so nothing
     /// private to one member is copied where the others read it.
     Within { user: Uuid, workspace: Uuid },
+    /// A reader of a public share link (`/s/{token}`): no person, and no doc
+    /// is visible (every visibility predicate is false). The share routes
+    /// read only the share tables (shares.sql); this scope makes an
+    /// accidental doc read there a NotFound instead of a leak.
+    Public,
 }
 
 impl Scope {
@@ -31,7 +36,7 @@ impl Scope {
     pub fn user(self) -> Option<Uuid> {
         match self {
             Scope::User(u) | Scope::Within { user: u, .. } => Some(u),
-            Scope::System | Scope::Local => None,
+            Scope::System | Scope::Local | Scope::Public => None,
         }
     }
 

@@ -60,6 +60,8 @@ pub(crate) fn vis_sub(scope: Scope) -> Option<String> {
         Scope::System | Scope::Local => None,
         Scope::User(u) => Some(vis_subquery(u, None)),
         Scope::Within { user, workspace } => Some(vis_subquery(user, Some(workspace))),
+        // a share link's reader sees no doc at all
+        Scope::Public => Some("SELECT NULL WHERE 0".into()),
     }
 }
 
@@ -162,6 +164,7 @@ pub(crate) fn access_conn(conn: &Connection, scope: Scope, space: Space) -> Resu
             Space::Workspace(w) if w == workspace => member_role_conn(conn, w, user),
             _ => Ok(None),
         },
+        Scope::Public => Ok(None),
     }
 }
 
