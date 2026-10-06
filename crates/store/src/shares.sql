@@ -9,15 +9,15 @@ CREATE TABLE IF NOT EXISTS share_links (
     owner_id         TEXT NOT NULL REFERENCES auth_users (id) ON DELETE CASCADE,
     -- the doc it was taken from (no FK: a purged doc leaves the snapshot)
     doc_id           TEXT NOT NULL,
-    -- 32 random bytes, base64url: kept so the owner's Share.url can be shown
-    -- again; looked up only by its SHA-256 (token_hash)
-    token            TEXT NOT NULL,
+    -- SHA-256 (hex) of the link's token. The token itself is never stored:
+    -- it is b64url(HMAC-SHA256(<db dir>/share-links.key, id)), recomputed
+    -- for the owner's URL (the key file is not in the db or its replicas)
     token_hash       TEXT NOT NULL,
     title            TEXT NOT NULL,
     markdown         TEXT NOT NULL,
     theme            TEXT NOT NULL CHECK (theme IN ('light', 'dark', 'auto')),
-    -- the rendered page body (escaped, asset URLs rewritten), made on write
-    body_html        TEXT NOT NULL,
+    -- (the page is rendered from `markdown` when served, by the running
+    -- renderer, and cached in memory: nothing rendered is stored)
     revision         INTEGER NOT NULL DEFAULT 1,
     comments_enabled INTEGER NOT NULL DEFAULT 1,
     -- unix seconds

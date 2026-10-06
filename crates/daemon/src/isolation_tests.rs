@@ -340,6 +340,8 @@ fn fixture() -> Fx {
             local_human: a_human,
             server: Some(crate::shares::ServerSide {
                 cfg: st.cfg.clone(),
+                    caches: Default::default(),
+                key: std::sync::Arc::new(crate::shares::ShareKey::from_bytes(&[7; 32])),
                 limiter: st.limiter.clone(),
                 notify: Some({
                     let alerts = alerts.clone();
@@ -1734,6 +1736,14 @@ async fn share_links_are_the_owners_alone() {
     assert_eq!((mine["shares"][0]["revoked_at"].clone(), mine["shares"][0]["comments_enabled"].clone()), (Value::Null, json!(true)));
     let tom = web_session(&mut fx.store.lock(Scope::System), fx.a);
     fx.make_share(&tom, fx.a_loose, "From the browser", "websnap", "w.svg").await;
+    // the token is never in the database (nor so in a backup or replica)
+    let token = link_path(&a_share).trim_start_matches("/s/").to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("copy.db");
+    fx.store.lock(Scope::System).backup_to(&copy).unwrap();
+    let bytes = std::fs::read(&copy).unwrap();
+    assert!(!bytes.windows(token.len()).any(|w| w == token.as_bytes()), "the link token is stored");
+    assert!(bytes.windows(64).any(|w| w == hash_secret(&token).as_bytes()), "its hash is");
 }
 
 /// The public routes serve one token's snapshot and nothing else: never the

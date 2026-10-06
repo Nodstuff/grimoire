@@ -1028,8 +1028,12 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
             let shares_state = shares::SharesState {
                 store: store.clone(),
                 local_human: tom,
-                server: auth_state.as_ref().map(|st| shares::ServerSide {
+                server: match &auth_state {
+                    None => None,
+                    Some(st) => Some(shares::ServerSide {
                     cfg: st.cfg.clone(),
+                    caches: Default::default(),
+                    key: Arc::new(shares::ShareKey::load_or_create(&db_dir).context("the share-link key")?),
                     limiter: st.limiter.clone(),
                     notify: apns_sender.clone().map(|sender| {
                         let store = store.clone();
@@ -1039,7 +1043,8 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                             tokio::spawn(push::notify_share_comment(store, sender, a.owner, push));
                         }) as shares::Notifier
                     }),
-                }),
+                    }),
+                },
             };
             let app = mcp::router_with_hosts(store.clone(), claude, dedupe.clone(), embedder.clone(), mcp_hosts)
                 .merge(admin::router(store.clone(), admin_token, server_mode))

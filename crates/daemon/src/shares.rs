@@ -26,6 +26,7 @@
 
 use crate::auth::ratelimit::{Class, Limiter};
 use crate::auth::{AuthConfig, hash_secret, now, random_token};
+use std::path::Path as FsPath;
 use crate::share_render::{AssetInfo, PageParts, gone_page, page, render_body};
 use crate::store_ext::with_store;
 use crate::viewer::Viewer;
@@ -74,6 +75,87 @@ script-src 'nonce-{nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri
 /// An image is a document of its own (an SVG can carry script): nothing runs.
 pub const ASSET_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
+// ---- the link key ----
+
+/// The key file beside the database (never inside it, so never in a backup
+/// or a litestream replica of it).
+pub const KEY_FILE: &str = "share-links.key";
+
+/// The secret every link token and comment IP hash is derived from. Losing
+/// it changes every link's URL (the old ones answer 404); the box keeps it in
+/// `/var/lib/taisce` next to `ks.db`.
+pub struct ShareKey(ring::hmac::Key);
+
+impl ShareKey {
+    pub fn from_bytes(b: &[u8; 32]) -> Self {
+        Self(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b))
+    }
+
+    /// Read `<dir>/share-links.key`, or create it (32 random bytes, 0600).
+    pub fn load_or_create(dir: &FsPath) -> anyhow::Result<Self> {
+        let path = dir.join(KEY_FILE);
+        match std::fs::read(&path) {
+            Ok(b) => {
+                let b: [u8; 32] = b.try_into().map_err(|_| anyhow::anyhow!("{}: expected 32 bytes", path.display()))?;
+                Ok(Self::from_bytes(&b))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut b = [0u8; 32];
+                getrandom::fill(&mut b).map_err(|e| anyhow::anyhow!("entropy: {e}"))?;
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                use std::io::Write;
+                let mut f = opts.open(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+                f.write_all(&b)?;
+                f.sync_all()?;
+                tracing::info!(path = %path.display(), "created the share-link key");
+                Ok(Self::from_bytes(&b))
+            }
+            Err(e) => Err(anyhow::anyhow!("{}: {e}", path.display())),
+        }
+    }
+
+    fn mac(&self, parts: &[&[u8]]) -> ring::hmac::Tag {
+        let mut ctx = ring::hmac::Context::with_key(&self.0);
+        for p in parts {
+            ctx.update(p);
+        }
+        ctx.sign()
+    }
+
+    /// The link's token: b64url(HMAC-SHA256(key, "token" ‖ id)), 43 chars.
+    /// Only its SHA-256 is stored.
+    pub fn token(&self, id: Uuid) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.mac(&[b"taisce-share-token\0", id.as_bytes()]).as_ref())
+    }
+
+    /// What the comment rate limit stores for a commenter: HMAC(key, link ‖ ip).
+    pub fn ip_hash(&self, share: Uuid, ip: &str) -> String {
+        hex::encode(self.mac(&[b"taisce-share-ip\0", share.as_bytes(), b"|", ip.as_bytes()]).as_ref())
+    }
+}
+
+/// The address a limit is keyed on: an IPv6 client by its /64 (one host
+/// usually holds the whole prefix), an IPv4 (or v4-mapped) one by itself.
+pub fn ip_key(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+        Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
+        Err(_) => ip.to_string(),
+    }
+}
+
 /// A new comment alert for the link's owner (`push::notify_share_comment`).
 #[derive(Debug, Clone)]
 pub struct CommentAlert {
@@ -90,6 +172,10 @@ pub type Notifier = Arc<dyn Fn(CommentAlert) + Send + Sync>;
 #[derive(Clone)]
 pub struct ServerSide {
     pub cfg: Arc<AuthConfig>,
+    /// rendered pages (and, from group 5, images) in memory
+    pub caches: Arc<Caches>,
+    /// derives link tokens and comment IP hashes (`ShareKey`)
+    pub key: Arc<ShareKey>,
     pub limiter: Limiter,
     /// APNs, when configured
     pub notify: Option<Notifier>,
@@ -135,11 +221,11 @@ fn rfc3339(t: i64) -> String {
         .unwrap_or_default()
 }
 
-fn share_json(base: &str, s: &Share) -> Value {
+fn share_json(base: &str, key: &ShareKey, s: &Share) -> Value {
     json!({
         "id": s.id,
         "doc_id": s.doc_id,
-        "url": format!("{base}/s/{}", s.token),
+        "url": format!("{base}/s/{}", key.token(s.id)),
         "created_at": rfc3339(s.created_at),
         "updated_at": rfc3339(s.updated_at),
         "expires_at": s.expires_at.map(rfc3339),
@@ -276,12 +362,84 @@ fn check_snapshot(s: SnapshotIn) -> Result<Checked, Response> {
     Ok(Checked { title, markdown: s.markdown, theme, assets })
 }
 
-/// Render a checked snapshot; `url` gives each asset's `src`.
-fn rendered(c: Checked, url: impl Fn(&ShareAsset) -> String) -> ShareSnapshot {
-    let infos: HashMap<String, AssetInfo> =
-        c.assets.iter().map(|a| (a.name.clone(), AssetInfo { url: url(a), width: a.width, height: a.height })).collect();
-    let body_html = render_body(&c.markdown, &infos);
-    ShareSnapshot { title: c.title, markdown: c.markdown, theme: c.theme, body_html, assets: c.assets }
+impl Checked {
+    fn into_snapshot(self) -> ShareSnapshot {
+        ShareSnapshot { title: self.title, markdown: self.markdown, theme: self.theme, assets: self.assets }
+    }
+}
+
+// ---- small in-memory LRU caches (rendered pages, images) ----
+
+/// A byte-capped LRU. Eviction scans for the oldest entry: the caches hold
+/// at most a few hundred entries.
+pub struct Lru<K, V> {
+    map: HashMap<K, (V, usize, u64)>,
+    tick: u64,
+    total: usize,
+    cap: usize,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V: Clone> Lru<K, V> {
+    pub fn new(cap: usize) -> Self {
+        Self { map: HashMap::new(), tick: 0, total: 0, cap }
+    }
+
+    pub fn get(&mut self, k: &K) -> Option<V> {
+        self.tick += 1;
+        let t = self.tick;
+        self.map.get_mut(k).map(|e| {
+            e.2 = t;
+            e.0.clone()
+        })
+    }
+
+    /// Insert `v` weighing `weight` bytes; anything over the cap alone is
+    /// not cached.
+    pub fn put(&mut self, k: K, v: V, weight: usize) {
+        if weight > self.cap {
+            return;
+        }
+        self.tick += 1;
+        if let Some((_, w, _)) = self.map.insert(k, (v, weight, self.tick)) {
+            self.total -= w;
+        }
+        self.total += weight;
+        while self.total > self.cap {
+            let Some(oldest) = self.map.iter().min_by_key(|(_, e)| e.2).map(|(k, _)| k.clone()) else { break };
+            if let Some((_, w, _)) = self.map.remove(&oldest) {
+                self.total -= w;
+            }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn bytes(&self) -> usize {
+        self.total
+    }
+}
+
+/// Rendered page bodies by (link, revision), so a busy link renders once
+/// per snapshot and the running renderer is always the one used.
+pub const RENDER_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+pub struct Caches {
+    pub renders: std::sync::Mutex<Lru<(Uuid, i64), Arc<String>>>,
+}
+
+impl Default for Caches {
+    fn default() -> Self {
+        Self { renders: std::sync::Mutex::new(Lru::new(RENDER_CACHE_BYTES)) }
+    }
+}
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Render a body; `url` gives each asset's `src`.
+fn render_with(markdown: &str, assets: impl Iterator<Item = (String, Option<i64>, Option<i64>, String)>) -> String {
+    let infos: HashMap<String, AssetInfo> = assets.map(|(name, width, height, url)| (name, AssetInfo { url, width, height })).collect();
+    render_body(markdown, &infos)
 }
 
 fn asset_path(token: &str, name: &str) -> String {
@@ -315,7 +473,7 @@ fn future_expiry(v: Option<&str>) -> Result<Option<i64>, Response> {
 
 /// The guard every owner route runs first: SERVER mode, a person (not a
 /// connector, not an agent principal). Returns the public base URL.
-fn owner_gate(st: &SharesState, v: &Viewer, headers: &HeaderMap) -> Result<String, Response> {
+fn owner_gate(st: &SharesState, v: &Viewer, headers: &HeaderMap) -> Result<(String, Arc<ShareKey>), Response> {
     let Some(server) = &st.server else { return Err(not_found()) };
     v.require_human_surface()?;
     // require_auth puts a connector's principal here and strips it for the
@@ -323,7 +481,7 @@ fn owner_gate(st: &SharesState, v: &Viewer, headers: &HeaderMap) -> Result<Strin
     if headers.contains_key(crate::mcp::PRINCIPAL_HEADER) {
         return Err(crate::viewer::forbidden("share links are made by a person, not an agent"));
     }
-    Ok(server.cfg.base.clone())
+    Ok((server.cfg.base.clone(), server.key.clone()))
 }
 
 fn json_or_400<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, Response> {
@@ -349,7 +507,7 @@ fn yes() -> bool {
 }
 
 async fn create(State(st): State<SharesState>, v: Viewer, headers: HeaderMap, body: Result<Json<CreateReq>, JsonRejection>) -> Response {
-    let base = match owner_gate(&st, &v, &headers) {
+    let (base, key) = match owner_gate(&st, &v, &headers) {
         Ok(b) => b,
         Err(r) => return r,
     };
@@ -365,19 +523,16 @@ async fn create(State(st): State<SharesState>, v: Viewer, headers: HeaderMap, bo
         Ok(c) => c,
         Err(r) => return r,
     };
-    let token = random_token();
+    let id = Uuid::now_v7();
+    let token = key.token(id);
     let hash = hash_secret(&token);
-    let snap = {
-        let t = token.clone();
-        tokio::task::spawn_blocking(move || rendered(checked, |a| asset_path(&t, &a.name))).await
-    };
-    let Ok(snap) = snap else { return err(StatusCode::INTERNAL_SERVER_ERROR, "render failed") };
+    let snap = checked.into_snapshot();
     let (doc, on) = (req.doc_id, req.comments_enabled);
-    let made = with_store(&st.store, v.scope, move |s| s.share_create(doc, &token, &hash, &snap, expires, on, now())).await;
+    let made = with_store(&st.store, v.scope, move |s| s.share_create(id, doc, &hash, &snap, expires, on, now())).await;
     match made {
         Ok(sh) => {
             tracing::info!(target: crate::auth::AUDIT, event = "share.create", share = %sh.id, doc = %sh.doc_id, user = ?v.user);
-            (StatusCode::CREATED, Json(share_json(&base, &sh))).into_response()
+            (StatusCode::CREATED, Json(share_json(&base, &key, &sh))).into_response()
         }
         Err(e) => fail(e),
     }
@@ -390,12 +545,12 @@ struct ListQ {
 }
 
 async fn list(State(st): State<SharesState>, v: Viewer, headers: HeaderMap, Query(q): Query<ListQ>) -> Response {
-    let base = match owner_gate(&st, &v, &headers) {
+    let (base, key) = match owner_gate(&st, &v, &headers) {
         Ok(b) => b,
         Err(r) => return r,
     };
     match with_store(&st.store, v.scope, move |s| s.shares_list(q.doc_id)).await {
-        Ok(all) => Json(json!({"shares": all.iter().map(|s| share_json(&base, s)).collect::<Vec<_>>()})).into_response(),
+        Ok(all) => Json(json!({"shares": all.iter().map(|s| share_json(&base, &key, s)).collect::<Vec<_>>()})).into_response(),
         Err(e) => fail(e),
     }
 }
@@ -422,7 +577,7 @@ async fn update(
     Path(id): Path<Uuid>,
     body: Result<Json<PatchReq>, JsonRejection>,
 ) -> Response {
-    let base = match owner_gate(&st, &v, &headers) {
+    let (base, key) = match owner_gate(&st, &v, &headers) {
         Ok(b) => b,
         Err(r) => return r,
     };
@@ -438,11 +593,6 @@ async fn update(
             Err(r) => return r,
         },
     };
-    // the token (for the asset URLs) comes from the caller's own share
-    let cur = match with_store(&st.store, v.scope, move |s| s.share_get(id)).await {
-        Ok(c) => c,
-        Err(e) => return fail(e),
-    };
     let snapshot = match req.snapshot {
         None => None,
         Some(s) => {
@@ -450,16 +600,12 @@ async fn update(
                 Ok(c) => c,
                 Err(r) => return r,
             };
-            let t = cur.token.clone();
-            match tokio::task::spawn_blocking(move || rendered(checked, |a| asset_path(&t, &a.name))).await {
-                Ok(s) => Some(s),
-                Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "render failed"),
-            }
+            Some(checked.into_snapshot())
         }
     };
     let p = SharePatch { snapshot, expires_at, comments_enabled: req.comments_enabled };
     match with_store(&st.store, v.scope, move |s| s.share_update(id, p, now())).await {
-        Ok(sh) => Json(share_json(&base, &sh)).into_response(),
+        Ok(sh) => Json(share_json(&base, &key, &sh)).into_response(),
         Err(e) => fail(e),
     }
 }
@@ -497,11 +643,11 @@ async fn preview(State(st): State<SharesState>, v: Viewer, headers: HeaderMap, b
         Err(r) => return r,
     };
     let html = tokio::task::spawn_blocking(move || {
-        let snap = rendered(checked, data_url);
+        let body = render_with(&checked.markdown, checked.assets.iter().map(|a| (a.name.clone(), a.width, a.height, data_url(a))));
         page(&PageParts {
-            title: &snap.title,
-            body_html: &snap.body_html,
-            theme: &snap.theme,
+            title: &checked.title,
+            body_html: &body,
+            theme: &checked.theme,
             snapshot_date: &chrono::Utc::now().format("%Y-%m-%d").to_string(),
             nonce: None,
             comments_enabled: false,
@@ -637,6 +783,13 @@ fn html_response(status: StatusCode, html: String, nonce: Option<&str>) -> Respo
     r
 }
 
+/// A 500 on a public route: the public headers, a plain message (the
+/// detail goes to the log only).
+fn public_500(e: impl std::fmt::Display) -> Response {
+    tracing::error!("share link: {e}");
+    public_json(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "something went wrong"}))
+}
+
 fn public_json(status: StatusCode, v: Value) -> Response {
     let mut r = (status, Json(v)).into_response();
     r.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"));
@@ -658,7 +811,7 @@ fn token_shape(t: &str) -> bool {
 /// The per-IP limit, then the share the token names (by its hash).
 async fn lookup(st: &SharesState, req_headers: &HeaderMap, ext: &axum::http::Extensions, token: &str) -> Result<(Found, String), Response> {
     let Some(server) = &st.server else { return Err(not_found()) };
-    let ip = crate::auth::client_ip(&server.cfg, req_headers, ext);
+    let ip = ip_key(&crate::auth::client_ip(&server.cfg, req_headers, ext));
     if !server.limiter.allow(Class::Share, &ip) {
         return Err(public_json(StatusCode::TOO_MANY_REQUESTS, json!({"error": "too many requests; try again shortly"})));
     }
@@ -685,17 +838,34 @@ async fn public_page(State(st): State<SharesState>, Path(token): Path<String>, r
         Found::Gone => return html_response(StatusCode::GONE, gone_page("This link has expired or was turned off."), None),
         Found::Unknown => return html_response(StatusCode::NOT_FOUND, gone_page("There is nothing at this link."), None),
     };
-    let id = sh.id;
-    let body = with_store(&st.store, Scope::Public, move |s| {
-        let b = s.share_public_body(id)?;
-        s.share_public_viewed(id, now())?;
-        Ok::<_, StoreError>(b)
-    })
-    .await;
-    let body = match body {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    let Some(server) = &st.server else { return not_found() };
+    let (id, rev) = (sh.id, sh.revision);
+    let cached = lock(&server.caches.renders).get(&(id, rev));
+    let body = match cached {
+        Some(b) => b,
+        None => {
+            let input = with_store(&st.store, Scope::Public, move |s| s.share_public_render_input(id)).await;
+            let input = match input {
+                Ok(i) => i,
+                Err(e) => return public_500(e),
+            };
+            let t = token.clone();
+            let rendered = tokio::task::spawn_blocking(move || {
+                render_with(&input.markdown, input.assets.into_iter().map(|(n, w, h)| {
+                    let url = asset_path(&t, &n);
+                    (n, w, h, url)
+                }))
+            })
+            .await;
+            let Ok(b) = rendered else { return public_500("render failed") };
+            let b = Arc::new(b);
+            lock(&server.caches.renders).put((id, rev), b.clone(), b.len());
+            b
+        }
     };
+    if let Err(e) = with_store(&st.store, Scope::Public, move |s| s.share_public_viewed(id, now())).await {
+        tracing::warn!("share: counting a view failed: {e}");
+    }
     let nonce = random_token();
     let date = chrono::DateTime::from_timestamp(sh.snapshot_at, 0).map(|d| d.format("%-d %B %Y").to_string()).unwrap_or_default();
     let html = page(&PageParts {
@@ -817,7 +987,8 @@ async fn public_comment(State(st): State<SharesState>, Path(token): Path<String>
         tracing::info!(target: crate::auth::AUDIT, event = "share.comment_honeypot", share = %sh.id);
         return public_json(StatusCode::CREATED, fake(name, body, anchor));
     }
-    let ip_hash = hash_secret(&format!("{}|{ip}", sh.id));
+    let Some(server) = &st.server else { return not_found() };
+    let ip_hash = server.key.ip_hash(sh.id, &ip);
     let (id, parent) = (sh.id, b.parent_id);
     let made = with_store(&st.store, Scope::Public, move |s| {
         let n = s.share_comment_counts(id, &ip_hash, now())?;
@@ -859,4 +1030,43 @@ pub fn router(state: SharesState) -> Router {
         .route("/s/{token}/comments", get(public_comments).post(public_comment))
         .merge(owner)
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_key_file_is_created_once_private_and_derives_stable_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let k1 = ShareKey::load_or_create(dir.path()).unwrap();
+        let path = dir.path().join(KEY_FILE);
+        assert_eq!(std::fs::read(&path).unwrap().len(), 32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let id = Uuid::now_v7();
+        let t = k1.token(id);
+        assert!(token_shape(&t), "{t}");
+        assert_eq!(ShareKey::load_or_create(dir.path()).unwrap().token(id), t, "reloaded key, same URL");
+        assert_ne!(k1.token(Uuid::now_v7()), t, "per link");
+        assert_ne!(ShareKey::from_bytes(&[1; 32]).token(id), t, "per key");
+        // the ip hash is keyed: not a plain digest anyone can recompute
+        assert_ne!(k1.ip_hash(id, "1.2.3.4"), hash_secret(&format!("{id}|1.2.3.4")));
+        assert_ne!(k1.ip_hash(id, "1.2.3.4"), k1.ip_hash(Uuid::now_v7(), "1.2.3.4"), "per link");
+        std::fs::write(&path, b"short").unwrap();
+        assert!(ShareKey::load_or_create(dir.path()).is_err(), "a damaged key is an error, never silently replaced");
+    }
+
+    #[test]
+    fn ipv6_is_keyed_on_its_64() {
+        assert_eq!(ip_key("2001:db8:1:2:aaaa::1"), ip_key("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_eq!(ip_key("2001:db8:1:2::9"), "2001:db8:1:2::/64");
+        assert_ne!(ip_key("2001:db8:1:2::1"), ip_key("2001:db8:1:3::1"));
+        assert_eq!(ip_key("::ffff:1.2.3.4"), "1.2.3.4");
+        assert_eq!(ip_key("1.2.3.4"), "1.2.3.4");
+        assert_eq!(ip_key("unknown"), "unknown");
+    }
 }

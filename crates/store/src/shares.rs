@@ -23,15 +23,23 @@ pub struct ShareAsset {
     pub height: Option<i64>,
 }
 
-/// What the owner publishes: already validated and rendered by the daemon.
+/// What the owner publishes, validated by the daemon. The page is rendered
+/// from `markdown` when it is served.
 #[derive(Debug, Clone)]
 pub struct ShareSnapshot {
     pub title: String,
     pub markdown: String,
     /// light | dark | auto
     pub theme: String,
-    pub body_html: String,
     pub assets: Vec<ShareAsset>,
+}
+
+/// What rendering a link's page needs: its markdown and its images' names
+/// and sizes (no bytes).
+#[derive(Debug, Clone)]
+pub struct RenderInput {
+    pub markdown: String,
+    pub assets: Vec<(String, Option<i64>, Option<i64>)>,
 }
 
 /// A share as its owner sees it (the public side uses the same row).
@@ -40,7 +48,6 @@ pub struct Share {
     pub id: Uuid,
     pub owner_id: Uuid,
     pub doc_id: Uuid,
-    pub token: String,
     pub title: String,
     pub theme: String,
     pub revision: i64,
@@ -105,7 +112,7 @@ pub struct CommentCounts {
     pub share_day: i64,
 }
 
-const SHARE_COLS: &str = "s.id, s.owner_id, s.doc_id, s.token, s.title, s.theme, s.revision, s.comments_enabled,
+const SHARE_COLS: &str = "s.id, s.owner_id, s.doc_id, s.title, s.theme, s.revision, s.comments_enabled,
     s.created_at, s.updated_at, s.snapshot_at, s.expires_at, s.revoked_at, s.views, s.last_viewed_at,
     (SELECT count(*) FROM share_link_comments c WHERE c.share_id = s.id),
     (SELECT count(*) FROM share_link_comments c WHERE c.share_id = s.id AND c.is_owner = 0 AND c.read_at IS NULL)";
@@ -120,20 +127,19 @@ fn share_row(r: &Row) -> rusqlite::Result<Share> {
         id: uuid_at(r, 0)?,
         owner_id: uuid_at(r, 1)?,
         doc_id: uuid_at(r, 2)?,
-        token: r.get(3)?,
-        title: r.get(4)?,
-        theme: r.get(5)?,
-        revision: r.get(6)?,
-        comments_enabled: r.get(7)?,
-        created_at: r.get(8)?,
-        updated_at: r.get(9)?,
-        snapshot_at: r.get(10)?,
-        expires_at: r.get(11)?,
-        revoked_at: r.get(12)?,
-        views: r.get(13)?,
-        last_viewed_at: r.get(14)?,
-        comment_count: r.get(15)?,
-        unread_comments: r.get(16)?,
+        title: r.get(3)?,
+        theme: r.get(4)?,
+        revision: r.get(5)?,
+        comments_enabled: r.get(6)?,
+        created_at: r.get(7)?,
+        updated_at: r.get(8)?,
+        snapshot_at: r.get(9)?,
+        expires_at: r.get(10)?,
+        revoked_at: r.get(11)?,
+        views: r.get(12)?,
+        last_viewed_at: r.get(13)?,
+        comment_count: r.get(14)?,
+        unread_comments: r.get(15)?,
     })
 }
 
@@ -204,13 +210,14 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Publish a snapshot of `doc` (which the caller must be able to see).
-    /// `token` is the link's secret, `token_hash` its SHA-256.
+    /// Publish a snapshot of `doc` (which the caller must be able to see)
+    /// as link `id`; `token_hash` is the SHA-256 of the token derived from
+    /// `id` (the token itself is never stored).
     #[allow(clippy::too_many_arguments)]
     pub fn share_create(
         &mut self,
+        id: Uuid,
         doc: Uuid,
-        token: &str,
         token_hash: &str,
         snap: &ShareSnapshot,
         expires_at: Option<i64>,
@@ -219,22 +226,19 @@ impl SqliteStore {
     ) -> Result<Share> {
         let owner = self.share_owner()?;
         self.see(doc)?;
-        let id = Uuid::now_v7();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO share_links (id, owner_id, doc_id, token, token_hash, title, markdown, theme, body_html,
+            "INSERT INTO share_links (id, owner_id, doc_id, token_hash, title, markdown, theme,
                  revision, comments_enabled, created_at, updated_at, snapshot_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?11, ?11, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?9, ?9, ?10)",
             params![
                 id.to_string(),
                 owner.to_string(),
                 doc.to_string(),
-                token,
                 token_hash,
                 snap.title,
                 snap.markdown,
                 snap.theme,
-                snap.body_html,
                 comments_enabled,
                 now,
                 expires_at
@@ -255,9 +259,9 @@ impl SqliteStore {
         let tx = self.conn.unchecked_transaction()?;
         if let Some(snap) = &patch.snapshot {
             tx.execute(
-                "UPDATE share_links SET title = ?2, markdown = ?3, theme = ?4, body_html = ?5, revision = revision + 1,
-                     snapshot_at = ?6, updated_at = ?6 WHERE id = ?1",
-                params![id.to_string(), snap.title, snap.markdown, snap.theme, snap.body_html, now],
+                "UPDATE share_links SET title = ?2, markdown = ?3, theme = ?4, revision = revision + 1,
+                     snapshot_at = ?5, updated_at = ?5 WHERE id = ?1",
+                params![id.to_string(), snap.title, snap.markdown, snap.theme, now],
             )?;
             Self::put_assets(&tx, id, &snap.assets)?;
         }
@@ -394,13 +398,19 @@ impl SqliteStore {
             .optional()?)
     }
 
-    /// The rendered snapshot body.
-    pub fn share_public_body(&self, id: Uuid) -> Result<String> {
+    /// What the page is rendered from.
+    pub fn share_public_render_input(&self, id: Uuid) -> Result<RenderInput> {
         self.public_only()?;
-        self.conn
-            .query_row("SELECT body_html FROM share_links WHERE id = ?1", params![id.to_string()], |r| r.get(0))
+        let markdown: String = self
+            .conn
+            .query_row("SELECT markdown FROM share_links WHERE id = ?1", params![id.to_string()], |r| r.get(0))
             .optional()?
-            .ok_or_else(|| not_found(id))
+            .ok_or_else(|| not_found(id))?;
+        let mut st = self.conn.prepare("SELECT name, width, height FROM share_link_assets WHERE share_id = ?1")?;
+        let assets = st
+            .query_map(params![id.to_string()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(RenderInput { markdown, assets })
     }
 
     /// Count a page view.
@@ -481,7 +491,7 @@ mod tests {
             let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
             let a = s.auth_ensure_owner(p, "Tom", 1).unwrap().id;
             let doc = s.create_doc_with_ops("D", None, p, vec![]).unwrap().0.id;
-            s.with_scope_for_test(Scope::User(a), |s| s.share_create(doc, "tok", "hash", &snap("D"), None, true, 10).unwrap().id)
+            s.with_scope_for_test(Scope::User(a), |s| s.share_create(Uuid::now_v7(), doc, "hash", &snap("D"), None, true, 10).unwrap().id)
         };
         let s = SqliteStore::open(&path).unwrap();
         assert_eq!(s.share_get(id).unwrap().title, "D");
@@ -493,7 +503,6 @@ mod tests {
             title: title.into(),
             markdown: "# hi".into(),
             theme: "auto".into(),
-            body_html: "<h1>hi</h1>".into(),
             assets: vec![ShareAsset { name: "d1.svg".into(), content_type: "image/svg+xml".into(), data: b"<svg/>".to_vec(), width: Some(10), height: None }],
         }
     }
@@ -506,9 +515,9 @@ mod tests {
         let b = s.auth_add_user("Aoife", 1).unwrap().id;
         let doc = s.with_scope_for_test(Scope::User(a), |s| s.create_doc_with_ops("D", None, p, vec![]).unwrap().0.id);
         // B cannot share A's doc
-        let e = s.with_scope_for_test(Scope::User(b), |s| s.share_create(doc, "t", "h", &snap("D"), None, true, 10));
+        let e = s.with_scope_for_test(Scope::User(b), |s| s.share_create(Uuid::now_v7(), doc, "h", &snap("D"), None, true, 10));
         assert!(matches!(e, Err(StoreError::NotFound(_))), "{e:?}");
-        let sh = s.with_scope_for_test(Scope::User(a), |s| s.share_create(doc, "tok", "hash", &snap("D"), None, true, 10).unwrap());
+        let sh = s.with_scope_for_test(Scope::User(a), |s| s.share_create(Uuid::now_v7(), doc, "hash", &snap("D"), None, true, 10).unwrap());
         assert_eq!(sh.revision, 1);
         // B sees nothing of it
         s.with_scope_for_test(Scope::User(b), |s| {
@@ -533,7 +542,7 @@ mod tests {
             assert_eq!(s.share_comments_for_owner(sh.id, 40).unwrap().len(), 1);
             assert_eq!(s.share_get(sh.id).unwrap().unread_comments, 0);
             let up = s.share_update(sh.id, SharePatch { snapshot: Some(snap("D2")), ..Default::default() }, 50).unwrap();
-            assert_eq!((up.revision, up.title.as_str(), up.token.as_str()), (2, "D2", "tok"));
+            assert_eq!((up.revision, up.title.as_str(), up.id), (2, "D2", sh.id));
             s.share_revoke(sh.id, 60).unwrap();
             assert!(s.share_get(sh.id).unwrap().is_gone(61));
             assert!(s.share_update(sh.id, SharePatch::default(), 70).is_err());
