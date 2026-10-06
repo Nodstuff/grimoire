@@ -1,6 +1,6 @@
 //! Share links (SERVER mode): a read-only snapshot of a doc at
 //! `<public url>/s/<token>`, with optional comments from whoever holds the
-//! link. The contract is `docs/adr/0005-share-links.md`; the store side is
+//! link. The decisions are `docs/adr/0005-share-links.md`; the store side is
 //! `taisce_store::shares`. In LOCAL mode every route here answers 404.
 //!
 //! Owner routes (`/api/shares…`) are human-only, like workspace membership

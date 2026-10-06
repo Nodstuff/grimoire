@@ -43,6 +43,11 @@ account may be flipped to the work account by other sessions — push with
 - **Sharing is human-only**: `taisce workspace share|unshare|members` on the box, or
   `/api/workspaces/{id}/members` from a person's own app. Never MCP, never a connector or PAT
   token. An agent's write into a shared workspace always lands flagged (the share gate).
+- **Share links are human-only too** (ADR 0005, `crates/daemon/src/shares.rs`): `/api/shares`
+  answers only the person's own app or web session (connector 403, PAT 401), never MCP. The
+  public `/s/{token}` routes run in `Scope::Public` (sees no doc) and read only the
+  `share_links*` tables, never docs or blocks: a link serves the snapshot the owner uploaded.
+  Never name a table `shares` (an open drops it: federation's old table).
 
 ## Start here
 - **[[Roadmap]]** in Taisce (under the `[[Grimoire]]` tree — doc titles are data, not renamed) is the outstanding list — read it first in any
