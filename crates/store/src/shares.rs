@@ -179,6 +179,29 @@ fn comment_row(r: &Row) -> rusqlite::Result<ShareComment> {
     })
 }
 
+/// A dead link is deleted outright this long after it was revoked or expired.
+pub const PURGE_AFTER: i64 = 30 * 86400;
+/// A commenter's IP hash is kept this long (the longest rate-limit window).
+pub const IP_HASH_TTL: i64 = 86400;
+
+/// Revoke the links matching `pred` (one `?1` parameter): the snapshot's
+/// markdown and images go now, the row stays (410) until the purge.
+pub(crate) fn revoke_conn(conn: &rusqlite::Connection, pred: &str, arg: &str, now: i64) -> Result<usize> {
+    conn.execute(
+        &format!(
+            "DELETE FROM share_link_assets WHERE share_id IN (SELECT id FROM share_links WHERE {pred} AND revoked_at IS NULL)"
+        ),
+        params![arg],
+    )?;
+    Ok(conn.execute(
+        &format!(
+            "UPDATE share_links SET revoked_at = ?2, updated_at = ?2, markdown = '', snapshot_bytes = 0
+             WHERE {pred} AND revoked_at IS NULL"
+        ),
+        params![arg, now],
+    )?)
+}
+
 fn not_found(id: Uuid) -> StoreError {
     StoreError::NotFound(format!("share {id}"))
 }
@@ -309,13 +332,35 @@ impl SqliteStore {
     }
 
     /// Revoke for good: the row stays (with `revoked_at`), the link is dead.
+    /// The snapshot (markdown and images) goes at once; the row stays so the
+    /// link answers 410, and the comments until the purge.
     pub fn share_revoke(&mut self, id: Uuid, now: i64) -> Result<()> {
         self.share_get(id)?;
-        self.conn.execute(
-            "UPDATE share_links SET revoked_at = COALESCE(revoked_at, ?2), updated_at = ?2 WHERE id = ?1",
-            params![id.to_string(), now],
-        )?;
+        let tx = self.conn.unchecked_transaction()?;
+        revoke_conn(&tx, "id = ?1", &id.to_string(), now)?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Housekeeping (System): links revoked or expired more than 30 days
+    /// ago go entirely (comments included); comment IP hashes older than a
+    /// day are cleared (the day limit no longer needs them). Returns
+    /// (links purged, hashes cleared).
+    pub fn share_maintenance(&mut self, now: i64) -> Result<(usize, usize)> {
+        if self.scope != Scope::System {
+            return Err(StoreError::InvalidOp("share maintenance runs as System".into()));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let purged = tx.execute(
+            "DELETE FROM share_links WHERE revoked_at < ?1 OR expires_at < ?1",
+            params![now - PURGE_AFTER],
+        )?;
+        let cleared = tx.execute(
+            "UPDATE share_link_comments SET ip_hash = NULL WHERE ip_hash IS NOT NULL AND created_at < ?1",
+            params![now - IP_HASH_TTL],
+        )?;
+        tx.commit()?;
+        Ok((purged, cleared))
     }
 
     fn comments_of(&self, id: Uuid) -> Result<Vec<ShareComment>> {
@@ -540,6 +585,45 @@ mod tests {
             theme: "auto".into(),
             assets: vec![ShareAsset { name: "d1.svg".into(), content_type: "image/svg+xml".into(), data: b"<svg/>".to_vec(), width: Some(10), height: None }],
         }
+    }
+
+    #[test]
+    fn revoke_drops_the_snapshot_and_the_purge_drops_the_rest() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let a = s.auth_ensure_owner(p, "Tom", 1).unwrap().id;
+        let doc = s.create_doc_with_ops("D", None, p, vec![]).unwrap().0.id;
+        let day = 86400;
+        let mk = |s: &mut SqliteStore, hash: &str, exp: Option<i64>| {
+            s.with_scope_for_test(Scope::User(a), |s| s.share_create(Uuid::now_v7(), doc, hash, &snap("D"), exp, true, 0).unwrap().id)
+        };
+        let (old, recent, expired, live) = (mk(&mut s, "h1", None), mk(&mut s, "h2", None), mk(&mut s, "h3", Some(1)), mk(&mut s, "h4", None));
+        let c = NewShareComment { author: "R".into(), body: "b".into(), parent_id: None, anchor: None, ip_hash: Some("ip".into()) };
+        s.with_scope_for_test(Scope::Public, |s| {
+            s.share_public_comment(old, c.clone(), 5).unwrap();
+            s.share_public_comment(live, c.clone(), 39 * day).unwrap();
+            s.share_public_comment(live, c.clone(), 40 * day + day / 2).unwrap();
+        });
+        s.with_scope_for_test(Scope::User(a), |s| {
+            s.share_revoke(old, 10).unwrap();
+            s.share_revoke(recent, 39 * day).unwrap();
+        });
+        // revoked: no images, no markdown, the row (and its comments) kept
+        s.with_scope_for_test(Scope::Public, |s| {
+            assert!(s.share_public_asset(old, "d1.svg").unwrap().is_none());
+            assert_eq!(s.share_public_render_input(old).unwrap().markdown, "");
+            assert_eq!(s.share_public_comments(old).unwrap().len(), 1);
+        });
+        assert!(s.with_scope_for_test(Scope::User(a), |s| s.share_maintenance(41 * day)).is_err(), "System only");
+        let (purged, cleared) = s.share_maintenance(41 * day).unwrap();
+        assert_eq!(purged, 2, "revoked and expired more than 30 days ago");
+        assert!(s.share_get(old).is_err() && s.share_get(expired).is_err());
+        assert!(s.share_get(recent).is_ok() && s.share_get(live).is_ok());
+        let left: i64 = s.conn.query_row("SELECT count(*) FROM share_link_comments WHERE share_id = ?1", [old.to_string()], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "the comments went with it");
+        assert_eq!(cleared, 1, "only the hash older than a day");
+        let hashes: i64 = s.conn.query_row("SELECT count(ip_hash) FROM share_link_comments", [], |r| r.get(0)).unwrap();
+        assert_eq!(hashes, 1);
     }
 
     #[test]

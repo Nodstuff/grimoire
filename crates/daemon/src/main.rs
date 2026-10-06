@@ -973,6 +973,10 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                 let store = store.clone();
                 supervise("idempotency.cleanup", move || mcp::idempotency_cleanup_loop(store.clone()));
             }
+            {
+                let store = store.clone();
+                supervise("shares.maintenance", move || shares::maintenance_loop(store.clone()));
+            }
             let auth_state = match auth_cfg {
                 Some(cfg) => {
                     let st = auth::AuthState::new(cfg, store.clone())?;

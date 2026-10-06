@@ -1144,6 +1144,19 @@ async fn public_comment(State(st): State<SharesState>, Path(token): Path<String>
     }
 }
 
+/// Housekeeping, at start and then hourly: purge links dead for 30 days,
+/// clear comment IP hashes older than a day.
+pub async fn maintenance_loop(store: SharedStore) {
+    loop {
+        match with_store(&store, Scope::System, |s| s.share_maintenance(now())).await {
+            Ok((0, 0)) => {}
+            Ok((purged, cleared)) => tracing::info!(purged, cleared, "share links: housekeeping"),
+            Err(e) => tracing::warn!("share links: housekeeping failed: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
+}
+
 pub fn router(state: SharesState) -> Router {
     let owner = Router::new()
         .route("/api/shares", get(list).post(create))
