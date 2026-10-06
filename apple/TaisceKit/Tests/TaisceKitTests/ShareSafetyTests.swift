@@ -106,6 +106,38 @@ private let png: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0
         #expect(server.requests.allSatisfy { $0.value(forHTTPHeaderField: "Cookie") == nil && $0.value(forHTTPHeaderField: "Authorization") == nil })
     }
 
+    @Test func onlyTheSitesAskedAboutAreFetched() async throws {
+        let server = MockServer { _ in MockServer.Reply(chunks: [Data(png)], contentType: "image/png") }
+        let resolver = FakeResolver(table: ["images.example.com": [publicIP], "added.example.com": [publicIP]])
+        let l = loader(server, resolver: resolver)
+        l.allowedHosts = ["images.example.com"]
+        _ = try await l.load(URL(string: "https://Images.example.com/a.png")!)
+        await #expect(throws: ShareImageRejection.notApproved) { _ = try await l.load(URL(string: "https://added.example.com/a.png")!) }
+        #expect(server.requests.count == 1)
+    }
+
+    @Test func neverThroughAProxy() {
+        let c = URLSessionConfiguration.ephemeral
+        c.connectionProxyDictionary = [kCFNetworkProxiesHTTPEnable as String: true, kCFNetworkProxiesHTTPProxy as String: "10.0.0.1"]
+        #expect(SafeShareImageLoader(configuration: c).configuration.connectionProxyDictionary?.isEmpty == true)
+    }
+
+    @Test func eachLoadHasItsOwnRedirectBudget() async {
+        // every load's session numbers its tasks from 1: one image's hops
+        // must not count against the next one's
+        let server = MockServer { _ in .json("{}") }
+        let l = loader(server)
+        let resp = HTTPURLResponse(url: URL(string: "https://images.example.com/a.png")!, statusCode: 302, httpVersion: nil, headerFields: nil)!
+        let next = URLRequest(url: URL(string: "https://images.example.com/b.png")!)
+        for _ in 0..<2 {
+            let s = URLSession(configuration: .ephemeral)
+            let task = s.dataTask(with: URL(string: "https://images.example.com/a.png")!)
+            for _ in 0..<3 { #expect(await l.urlSession(s, task: task, willPerformHTTPRedirection: resp, newRequest: next) != nil) }
+            #expect(await l.urlSession(s, task: task, willPerformHTTPRedirection: resp, newRequest: next) == nil)
+            s.invalidateAndCancel()
+        }
+    }
+
     @Test func sizeIsCappedByHeaderAndByStream() async throws {
         let declared = MockServer { _ in MockServer.Reply(chunks: [Data(png)], contentType: "image/png", headers: ["Content-Length": "3000000"]) }
         await #expect(throws: ShareImageRejection.tooLarge) { _ = try await loader(declared).load(URL(string: "https://images.example.com/a.png")!) }
