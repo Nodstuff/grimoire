@@ -59,6 +59,28 @@ pub const MAX_NAME: usize = 60;
 pub const MAX_COMMENT: usize = 4000;
 pub const MAX_QUOTE: usize = 500;
 pub const MAX_TITLE: usize = 300;
+/// Per person: live links, and the bytes their snapshots hold.
+pub const MAX_LIVE_LINKS: i64 = 100;
+pub const MAX_USER_BYTES: i64 = 250 * 1024 * 1024;
+
+/// The per-person caps, for a new snapshot of `adding` bytes on top of
+/// `usage` (which leaves out a link being replaced). `new_link`: the
+/// snapshot makes a new live link.
+fn over_caps(usage: taisce_store::shares::ShareUsage, adding: i64, new_link: bool) -> Option<Response> {
+    if new_link && usage.live >= MAX_LIVE_LINKS {
+        return Some(err(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("you have {MAX_LIVE_LINKS} live links, the most there can be: revoke one first"),
+        ));
+    }
+    if usage.bytes + adding > MAX_USER_BYTES {
+        return Some(too_large(format!(
+            "your live links would hold {} MB of snapshots; the most is 250 MB: revoke a link first",
+            (usage.bytes + adding) / (1024 * 1024)
+        )));
+    }
+    None
+}
 /// Public comments: per IP and link an hour / a day, per link a day.
 pub const PER_IP_HOUR: i64 = 10;
 pub const PER_IP_DAY: i64 = 30;
@@ -566,13 +588,21 @@ async fn create(State(st): State<SharesState>, v: Viewer, headers: HeaderMap, bo
     let hash = hash_secret(&token);
     let snap = checked.into_snapshot();
     let (doc, on) = (req.doc_id, req.comments_enabled);
-    let made = with_store(&st.store, v.scope, move |s| s.share_create(id, doc, &hash, &snap, expires, on, now())).await;
+    let made = with_store(&st.store, v.scope, move |s| {
+        // the doc first (an invisible doc is 404 whatever the caps say)
+        s.doc_role(doc).map_err(fail)?;
+        if let Some(r) = over_caps(s.share_usage(now(), None).map_err(fail)?, snap.bytes(), true) {
+            return Err(r);
+        }
+        s.share_create(id, doc, &hash, &snap, expires, on, now()).map_err(fail)
+    })
+    .await;
     match made {
         Ok(sh) => {
             tracing::info!(target: crate::auth::AUDIT, event = "share.create", share = %sh.id, doc = %sh.doc_id, user = ?v.user);
             (StatusCode::CREATED, Json(share_json(&base, &key, &sh))).into_response()
         }
-        Err(e) => fail(e),
+        Err(r) => r,
     }
 }
 
@@ -642,9 +672,25 @@ async fn update(
         }
     };
     let p = SharePatch { snapshot, expires_at, comments_enabled: req.comments_enabled };
-    match with_store(&st.store, v.scope, move |s| s.share_update(id, p, now())).await {
+    let limiter = st.server.as_ref().map(|s| s.limiter.clone()).unwrap_or_default();
+    let done = with_store(&st.store, v.scope, move |s| {
+        // the caller's own link first: someone else's is 404 and spends nothing
+        let cur = s.share_get(id).map_err(fail)?;
+        if let Some(snap) = &p.snapshot {
+            if !limiter.allow(Class::ShareSnapshot, &id.to_string()) {
+                return Err(err(StatusCode::TOO_MANY_REQUESTS, "30 new snapshots an hour per link: try again later"));
+            }
+            let live = !cur.is_gone(now());
+            if let Some(r) = over_caps(s.share_usage(now(), Some(id)).map_err(fail)?, snap.bytes(), !live) {
+                return Err(r);
+            }
+        }
+        s.share_update(id, p, now()).map_err(fail)
+    })
+    .await;
+    match done {
         Ok(sh) => Json(share_json(&base, &key, &sh)).into_response(),
-        Err(e) => fail(e),
+        Err(r) => r,
     }
 }
 
@@ -1184,6 +1230,17 @@ mod tests {
         assert!(l.get(&4).is_none(), "too big to cache");
         l.put(3, Arc::new(vec![0; 10]), 10);
         assert_eq!(l.bytes(), 50, "a replaced entry's weight is released");
+    }
+
+    #[test]
+    fn the_per_person_caps() {
+        use taisce_store::shares::ShareUsage;
+        let u = |live, bytes| ShareUsage { live, bytes };
+        assert!(over_caps(u(99, 0), 10, true).is_none());
+        assert_eq!(over_caps(u(100, 0), 10, true).unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(over_caps(u(100, 0), 10, false).is_none(), "a new snapshot of a live link is not a new link");
+        assert!(over_caps(u(1, MAX_USER_BYTES - 10), 10, true).is_none());
+        assert_eq!(over_caps(u(1, MAX_USER_BYTES - 10), 11, false).unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

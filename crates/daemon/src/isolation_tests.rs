@@ -165,6 +165,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/shares", "share_links_are_the_owners_alone"),
     ("/api/shares/preview", "share_links_are_the_owners_alone"),
     ("/api/shares/{id}", "share_links_are_the_owners_alone"),
+    ("/api/shares/{id}", "share_link_caps_per_person_and_per_link"),
     ("/api/shares/{id}/comments", "share_links_are_the_owners_alone"),
     ("/api/shares/{id}/comments/{cid}", "share_links_are_the_owners_alone"),
     ("/s/{token}", "a_share_link_serves_only_its_own_snapshot"),
@@ -2168,4 +2169,43 @@ async fn a_hammered_link_is_limited_per_link_and_images_are_cached() {
     // another link is unaffected
     let other = fx.make_share(&fx.a_app, fx.a_loose, "Other", "othertext", "d1.svg").await;
     assert_eq!(get(link_path(&other), "10.2.0.1".into()).await, StatusCode::OK);
+}
+
+/// Per person: at most 100 live links (429 past it, a revoked one frees a
+/// place), and 30 new snapshots an hour per link (429); someone else's
+/// PATCH attempts spend none of the owner's budget.
+#[tokio::test]
+async fn share_link_caps_per_person_and_per_link() {
+    let fx = fixture();
+    let snap = json!({"title": "t", "markdown": "x"});
+    let mut first = None;
+    for i in 0..100 {
+        let r = fx.raw(Some(&fx.a_app), "POST", "/api/shares", Some(json!({"doc_id": fx.a_loose, "snapshot": snap}))).await;
+        assert_eq!(r.status, StatusCode::CREATED, "link {i}: {}", r.body);
+        first.get_or_insert(r.json()["id"].as_str().unwrap().to_string());
+    }
+    let r = fx.raw(Some(&fx.a_app), "POST", "/api/shares", Some(json!({"doc_id": fx.a_loose, "snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
+    assert!(r.body.contains("100 live links"), "{}", r.body);
+    // B is not affected by A's count
+    let r = fx.raw(Some(&fx.b_app), "POST", "/api/shares", Some(json!({"doc_id": fx.b_doc, "snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+    let first = first.unwrap();
+    assert_eq!(fx.raw(Some(&fx.a_app), "DELETE", &format!("/api/shares/{first}"), None).await.status, StatusCode::NO_CONTENT);
+    let r = fx.raw(Some(&fx.a_app), "POST", "/api/shares", Some(json!({"doc_id": fx.a_loose, "snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "a revoked link frees a place: {}", r.body);
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    // B hammering A's link spends nothing of its budget
+    for _ in 0..40 {
+        assert_eq!(fx.raw(Some(&fx.b_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"snapshot": snap}))).await.status, StatusCode::NOT_FOUND);
+    }
+    for i in 0..30 {
+        let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"snapshot": snap}))).await;
+        assert_eq!(r.status, StatusCode::OK, "snapshot {i}: {}", r.body);
+    }
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"snapshot": snap}))).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.body);
+    // other changes are not snapshots
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"comments_enabled": false}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
 }

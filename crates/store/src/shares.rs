@@ -34,6 +34,20 @@ pub struct ShareSnapshot {
     pub assets: Vec<ShareAsset>,
 }
 
+impl ShareSnapshot {
+    /// What it costs against the owner's cap: markdown and image bytes.
+    pub fn bytes(&self) -> i64 {
+        (self.markdown.len() + self.assets.iter().map(|a| a.data.len()).sum::<usize>()) as i64
+    }
+}
+
+/// A person's live links (not revoked, not expired) and their snapshot bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShareUsage {
+    pub live: i64,
+    pub bytes: i64,
+}
+
 /// What rendering a link's page needs: its markdown and its images' names
 /// and sizes (no bytes).
 #[derive(Debug, Clone)]
@@ -192,6 +206,20 @@ impl SqliteStore {
             .ok_or_else(|| not_found(id))
     }
 
+    /// The caller's live links and their bytes, leaving out `except` (the
+    /// link a PATCH replaces).
+    pub fn share_usage(&self, now: i64, except: Option<Uuid>) -> Result<ShareUsage> {
+        let owner = self.share_owner()?;
+        let (live, bytes) = self.conn.query_row(
+            "SELECT count(*), COALESCE(sum(snapshot_bytes), 0) FROM share_links
+             WHERE owner_id = ?1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?2)
+               AND (?3 IS NULL OR id != ?3)",
+            params![owner.to_string(), now, except.map(|e| e.to_string())],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(ShareUsage { live, bytes })
+    }
+
     /// The caller's shares, newest first; of one doc when `doc` is given.
     pub fn shares_list(&self, doc: Option<Uuid>) -> Result<Vec<Share>> {
         let owner = self.share_owner()?;
@@ -233,8 +261,8 @@ impl SqliteStore {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO share_links (id, owner_id, doc_id, token_hash, title, markdown, theme,
-                 revision, comments_enabled, created_at, updated_at, snapshot_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?9, ?9, ?10)",
+                 revision, comments_enabled, created_at, updated_at, snapshot_at, expires_at, snapshot_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?9, ?9, ?10, ?11)",
             params![
                 id.to_string(),
                 owner.to_string(),
@@ -245,7 +273,8 @@ impl SqliteStore {
                 snap.theme,
                 comments_enabled,
                 now,
-                expires_at
+                expires_at,
+                snap.bytes()
             ],
         )?;
         Self::put_assets(&tx, id, &snap.assets)?;
@@ -264,8 +293,8 @@ impl SqliteStore {
         if let Some(snap) = &patch.snapshot {
             tx.execute(
                 "UPDATE share_links SET title = ?2, markdown = ?3, theme = ?4, revision = revision + 1,
-                     snapshot_at = ?5, updated_at = ?5 WHERE id = ?1",
-                params![id.to_string(), snap.title, snap.markdown, snap.theme, now],
+                     snapshot_at = ?5, updated_at = ?5, snapshot_bytes = ?6 WHERE id = ?1",
+                params![id.to_string(), snap.title, snap.markdown, snap.theme, now, snap.bytes()],
             )?;
             Self::put_assets(&tx, id, &snap.assets)?;
         }

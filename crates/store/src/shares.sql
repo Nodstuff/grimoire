@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS share_links (
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL,
     snapshot_at      INTEGER NOT NULL,
+    -- markdown + image bytes of the current snapshot (the per-person cap)
+    snapshot_bytes   INTEGER NOT NULL DEFAULT 0,
     expires_at       INTEGER,
     revoked_at       INTEGER,
     views            INTEGER NOT NULL DEFAULT 0,
