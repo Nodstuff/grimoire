@@ -15,11 +15,12 @@ import Home from './Home'
 import Capture from './Capture'
 import Omnibox from './Omnibox'
 import { buildCommands } from './commands'
+import SharePanel from './SharePanel'
 import { signOut, webSession } from './auth'
 import { loadRecentIds, pushRecentId, storeRecentIds, type OmniMode } from './omni'
 
 /** The doc side panels, owned by App so a doc switch does not close one. */
-type Panel = 'none' | 'history' | 'comments' | 'tend' | 'review'
+type Panel = 'none' | 'history' | 'comments' | 'tend' | 'review' | 'share'
 
 type Stamp = { stamp: number; build?: number; version?: string }
 
@@ -339,6 +340,7 @@ export default function App() {
           if (a === 'trash') setView({ kind: 'trash' })
           if (a === 'home') setView({ kind: 'home' })
           if (a === 'tree') setTreeOpen((t) => !t)
+          if (a === 'share') setDocPanel('share')
           if (a === 'capture' || a === 'newdoc') {
             setPalette(a)
             return
@@ -429,6 +431,7 @@ export default function App() {
             reviewIntent={reviewIntent}
             panel={docPanel}
             setPanel={setDocPanel}
+            signedIn={signedIn}
           />
         )}
         {view.kind === 'review' && (
@@ -677,6 +680,7 @@ function DocView({
   reviewIntent = false,
   panel,
   setPanel,
+  signedIn = false,
 }: {
   docId: string
   onOpenDoc: OpenDoc
@@ -688,6 +692,8 @@ function DocView({
   /** owned by App so it outlives this component's per-doc remount */
   panel: Panel
   setPanel: (p: Panel) => void
+  /** SERVER mode, signed in through this browser: share links are offered */
+  signedIn?: boolean
 }) {
   const [tree, setTree] = useState<DocTree | null>(null)
   const [backlinks, setBacklinks] = useState<SearchHit[]>([])
@@ -929,6 +935,15 @@ function DocView({
           >
             {docs.find((d) => d.id === docId)?.is_tended ? '🌿 tended' : 'tend'}
           </button>
+          {signedIn && (
+            <button
+              className={`chip ${panel === 'share' ? 'on' : ''}`}
+              title="a public, read-only link to a snapshot of this doc"
+              onClick={() => setPanel(panel === 'share' ? 'none' : 'share')}
+            >
+              share link…
+            </button>
+          )}
           {reviewItems.length > 0 && (
             <button
               className={`chip review-chip ${panel === 'review' ? 'on' : ''}`}
@@ -986,6 +1001,9 @@ function DocView({
         </span>
       )}
       {panel === 'history' && <HistoryPanel docId={docId} onClose={() => setPanel('none')} />}
+      {panel === 'share' && signedIn && (
+        <SharePanel docId={docId} title={tree.doc.title} onClose={() => setPanel('none')} />
+      )}
       {panel === 'review' && (
         <ReviewRail items={reviewItems} onChanged={afterResolve} onClose={() => setPanel('none')} />
       )}

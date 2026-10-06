@@ -1497,3 +1497,13 @@ kbd {
 }
 .signin-go:disabled { opacity: 0.6; cursor: default; }
 .signin-msg { min-height: 1.7em; }
+
+/* ---------- share links (SharePanel) ---------- */
+.share-panel p.meta { line-height: 1.5; margin: 0 0 12px; }
+.share-new { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; }
+.share-new select { background: var(--panel2); color: var(--fg); border: none; border-radius: 6px; font-size: 11px; height: 22px; }
+.share-row { border-top: 1px solid var(--border); padding: 10px 0; }
+.share-url { font-size: 12px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.share-actions { display: flex; gap: 6px; margin-top: 6px; }
+.share-actions .danger { color: var(--red); }
+.share-empty { padding: 6px 0; }
