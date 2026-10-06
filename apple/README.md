@@ -700,8 +700,11 @@ Everything here is hidden for LOCAL daemons and signed-out accounts
   first); views, last opened, expired/revoked. Settings › Shared links lists
   them all with unread badges. A doc whose links have comments shows
   "Comments from shared links (N new)", which opens `LinkCommentsScreen`
-  (threads with author, quote, body; reply as owner; delete). Reading marks
-  them read.
+  (threads with author, quote, body; reply as owner; delete). Opening them
+  marks them read (`POST /api/shares/{id}/comments/read`). Viewers (ADR 0004)
+  get no Share link… (the server wants owner or editor) but can export a PDF.
+  Refusals (403, 413, 429 per-user caps) show the server's own message. An
+  expired link can be given a new expiry; only a revoked one is over.
 - **Push**: the server's alert push `{"kind":"share_comment","doc_id",…}`; a
   tap (`DueAlertDelegate` → `ShareCommentPush`) opens that doc and its link
   comments.
