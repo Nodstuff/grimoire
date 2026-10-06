@@ -689,6 +689,16 @@ Everything here is hidden for LOCAL daemons and signed-out accounts
   small card with the renderer's message, and is listed in "Not everything made
   it". `![alt](https://…)` images are fetched (`URLSessionShareImageLoader`:
   2 MB, PNG/JPEG/WebP/SVG by magic bytes) as `iN.ext`, else become a plain link.
+  `SafeShareImageLoader` fetches https only, refuses IP literals and local or
+  single-label names, checks every resolved address (and every redirect, at most
+  3) against private, loopback, CGNAT, link-local, ULA and multicast ranges, uses
+  an ephemeral session (no cookies, cache or credentials; auth challenges
+  refused) and stops at 2 MB. A DNS rebind between the check and the fetch is
+  still possible (accepted). The sheet (and PDF export) first asks "Include N
+  images from x.com, y.org?" or keeps them as links. Only paragraph, heading,
+  code, mermaid/D2 diagram and decision blocks are published. A link is built
+  from a fresh server copy plus only this doc's pending writes (refused offline);
+  a PDF may use this device's copy, with a note.
   The server's limits (2 MB an asset, 200 assets, 10 MB) are kept; an asset
   over them is left out with a note. Theme: the app's current appearance.
 - **Client**: `APIClient` conforms to `ShareService` (create, list, PATCH with a
