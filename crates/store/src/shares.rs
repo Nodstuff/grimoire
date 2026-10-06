@@ -107,8 +107,8 @@ pub struct CommentCounts {
 
 const SHARE_COLS: &str = "s.id, s.owner_id, s.doc_id, s.token, s.title, s.theme, s.revision, s.comments_enabled,
     s.created_at, s.updated_at, s.snapshot_at, s.expires_at, s.revoked_at, s.views, s.last_viewed_at,
-    (SELECT count(*) FROM share_comments c WHERE c.share_id = s.id),
-    (SELECT count(*) FROM share_comments c WHERE c.share_id = s.id AND c.is_owner = 0 AND c.read_at IS NULL)";
+    (SELECT count(*) FROM share_link_comments c WHERE c.share_id = s.id),
+    (SELECT count(*) FROM share_link_comments c WHERE c.share_id = s.id AND c.is_owner = 0 AND c.read_at IS NULL)";
 
 fn uuid_at(r: &Row, i: usize) -> rusqlite::Result<Uuid> {
     let s: String = r.get(i)?;
@@ -174,7 +174,7 @@ impl SqliteStore {
         };
         self.conn
             .query_row(
-                &format!("SELECT {SHARE_COLS} FROM shares s WHERE s.id = ?1 AND (?2 IS NULL OR s.owner_id = ?2)"),
+                &format!("SELECT {SHARE_COLS} FROM share_links s WHERE s.id = ?1 AND (?2 IS NULL OR s.owner_id = ?2)"),
                 params![id.to_string(), owner.map(|o| o.to_string())],
                 share_row,
             )
@@ -186,7 +186,7 @@ impl SqliteStore {
     pub fn shares_list(&self, doc: Option<Uuid>) -> Result<Vec<Share>> {
         let owner = self.share_owner()?;
         let mut st = self.conn.prepare(&format!(
-            "SELECT {SHARE_COLS} FROM shares s WHERE s.owner_id = ?1 AND (?2 IS NULL OR s.doc_id = ?2)
+            "SELECT {SHARE_COLS} FROM share_links s WHERE s.owner_id = ?1 AND (?2 IS NULL OR s.doc_id = ?2)
              ORDER BY s.created_at DESC, s.id DESC"
         ))?;
         let rows = st.query_map(params![owner.to_string(), doc.map(|d| d.to_string())], share_row)?;
@@ -194,9 +194,9 @@ impl SqliteStore {
     }
 
     fn put_assets(tx: &rusqlite::Transaction, share: Uuid, assets: &[ShareAsset]) -> Result<()> {
-        tx.execute("DELETE FROM share_assets WHERE share_id = ?1", params![share.to_string()])?;
+        tx.execute("DELETE FROM share_link_assets WHERE share_id = ?1", params![share.to_string()])?;
         let mut ins = tx.prepare(
-            "INSERT INTO share_assets (share_id, name, content_type, data, width, height) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO share_link_assets (share_id, name, content_type, data, width, height) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for a in assets {
             ins.execute(params![share.to_string(), a.name, a.content_type, a.data, a.width, a.height])?;
@@ -222,7 +222,7 @@ impl SqliteStore {
         let id = Uuid::now_v7();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO shares (id, owner_id, doc_id, token, token_hash, title, markdown, theme, body_html,
+            "INSERT INTO share_links (id, owner_id, doc_id, token, token_hash, title, markdown, theme, body_html,
                  revision, comments_enabled, created_at, updated_at, snapshot_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?11, ?11, ?12)",
             params![
@@ -255,17 +255,17 @@ impl SqliteStore {
         let tx = self.conn.unchecked_transaction()?;
         if let Some(snap) = &patch.snapshot {
             tx.execute(
-                "UPDATE shares SET title = ?2, markdown = ?3, theme = ?4, body_html = ?5, revision = revision + 1,
+                "UPDATE share_links SET title = ?2, markdown = ?3, theme = ?4, body_html = ?5, revision = revision + 1,
                      snapshot_at = ?6, updated_at = ?6 WHERE id = ?1",
                 params![id.to_string(), snap.title, snap.markdown, snap.theme, snap.body_html, now],
             )?;
             Self::put_assets(&tx, id, &snap.assets)?;
         }
         if let Some(exp) = patch.expires_at {
-            tx.execute("UPDATE shares SET expires_at = ?2, updated_at = ?3 WHERE id = ?1", params![id.to_string(), exp, now])?;
+            tx.execute("UPDATE share_links SET expires_at = ?2, updated_at = ?3 WHERE id = ?1", params![id.to_string(), exp, now])?;
         }
         if let Some(on) = patch.comments_enabled {
-            tx.execute("UPDATE shares SET comments_enabled = ?2, updated_at = ?3 WHERE id = ?1", params![id.to_string(), on, now])?;
+            tx.execute("UPDATE share_links SET comments_enabled = ?2, updated_at = ?3 WHERE id = ?1", params![id.to_string(), on, now])?;
         }
         tx.commit()?;
         self.share_get(id)
@@ -275,7 +275,7 @@ impl SqliteStore {
     pub fn share_revoke(&mut self, id: Uuid, now: i64) -> Result<()> {
         self.share_get(id)?;
         self.conn.execute(
-            "UPDATE shares SET revoked_at = COALESCE(revoked_at, ?2), updated_at = ?2 WHERE id = ?1",
+            "UPDATE share_links SET revoked_at = COALESCE(revoked_at, ?2), updated_at = ?2 WHERE id = ?1",
             params![id.to_string(), now],
         )?;
         Ok(())
@@ -284,7 +284,7 @@ impl SqliteStore {
     fn comments_of(&self, id: Uuid) -> Result<Vec<ShareComment>> {
         let mut st = self
             .conn
-            .prepare(&format!("SELECT {COMMENT_COLS} FROM share_comments WHERE share_id = ?1 ORDER BY created_at, id"))?;
+            .prepare(&format!("SELECT {COMMENT_COLS} FROM share_link_comments WHERE share_id = ?1 ORDER BY created_at, id"))?;
         let rows = st.query_map(params![id.to_string()], comment_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -294,7 +294,7 @@ impl SqliteStore {
         self.share_get(id)?;
         let out = self.comments_of(id)?;
         self.conn.execute(
-            "UPDATE share_comments SET read_at = ?2 WHERE share_id = ?1 AND read_at IS NULL",
+            "UPDATE share_link_comments SET read_at = ?2 WHERE share_id = ?1 AND read_at IS NULL",
             params![id.to_string(), now],
         )?;
         Ok(out)
@@ -307,7 +307,7 @@ impl SqliteStore {
         let row: Option<Option<String>> = self
             .conn
             .query_row(
-                "SELECT parent_id FROM share_comments WHERE id = ?1 AND share_id = ?2",
+                "SELECT parent_id FROM share_link_comments WHERE id = ?1 AND share_id = ?2",
                 params![p.to_string(), share.to_string()],
                 |r| r.get(0),
             )
@@ -325,7 +325,7 @@ impl SqliteStore {
         let anchor = c.anchor.as_ref().map(|a| a.to_string());
         let read_at = is_owner.then_some(now);
         self.conn.execute(
-            "INSERT INTO share_comments (id, share_id, parent_id, author, is_owner, body, anchor, created_at, revision, ip_hash, read_at)
+            "INSERT INTO share_link_comments (id, share_id, parent_id, author, is_owner, body, anchor, created_at, revision, ip_hash, read_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id.to_string(),
@@ -367,7 +367,7 @@ impl SqliteStore {
     pub fn share_delete_comment(&mut self, id: Uuid, comment: Uuid) -> Result<()> {
         self.share_get(id)?;
         let n = self.conn.execute(
-            "DELETE FROM share_comments WHERE share_id = ?1 AND (id = ?2 OR parent_id = ?2)",
+            "DELETE FROM share_link_comments WHERE share_id = ?1 AND (id = ?2 OR parent_id = ?2)",
             params![id.to_string(), comment.to_string()],
         )?;
         if n == 0 {
@@ -390,7 +390,7 @@ impl SqliteStore {
         self.public_only()?;
         Ok(self
             .conn
-            .query_row(&format!("SELECT {SHARE_COLS} FROM shares s WHERE s.token_hash = ?1"), params![hash], share_row)
+            .query_row(&format!("SELECT {SHARE_COLS} FROM share_links s WHERE s.token_hash = ?1"), params![hash], share_row)
             .optional()?)
     }
 
@@ -398,7 +398,7 @@ impl SqliteStore {
     pub fn share_public_body(&self, id: Uuid) -> Result<String> {
         self.public_only()?;
         self.conn
-            .query_row("SELECT body_html FROM shares WHERE id = ?1", params![id.to_string()], |r| r.get(0))
+            .query_row("SELECT body_html FROM share_links WHERE id = ?1", params![id.to_string()], |r| r.get(0))
             .optional()?
             .ok_or_else(|| not_found(id))
     }
@@ -407,7 +407,7 @@ impl SqliteStore {
     pub fn share_public_viewed(&mut self, id: Uuid, now: i64) -> Result<()> {
         self.public_only()?;
         self.conn.execute(
-            "UPDATE shares SET views = views + 1, last_viewed_at = ?2 WHERE id = ?1",
+            "UPDATE share_links SET views = views + 1, last_viewed_at = ?2 WHERE id = ?1",
             params![id.to_string(), now],
         )?;
         Ok(())
@@ -418,7 +418,7 @@ impl SqliteStore {
         Ok(self
             .conn
             .query_row(
-                "SELECT name, content_type, data, width, height FROM share_assets WHERE share_id = ?1 AND name = ?2",
+                "SELECT name, content_type, data, width, height FROM share_link_assets WHERE share_id = ?1 AND name = ?2",
                 params![id.to_string(), name],
                 |r| Ok(ShareAsset { name: r.get(0)?, content_type: r.get(1)?, data: r.get(2)?, width: r.get(3)?, height: r.get(4)? }),
             )
@@ -439,7 +439,7 @@ impl SqliteStore {
                  count(CASE WHEN ip_hash = ?2 AND created_at > ?3 THEN 1 END),
                  count(CASE WHEN ip_hash = ?2 AND created_at > ?4 THEN 1 END),
                  count(CASE WHEN ip_hash IS NOT NULL AND created_at > ?4 THEN 1 END)
-             FROM share_comments WHERE share_id = ?1 AND created_at > ?4",
+             FROM share_link_comments WHERE share_id = ?1 AND created_at > ?4",
             params![id.to_string(), ip_hash, now - 3600, now - 86400],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
@@ -452,7 +452,7 @@ impl SqliteStore {
         self.public_only()?;
         let share: Share = self
             .conn
-            .query_row(&format!("SELECT {SHARE_COLS} FROM shares s WHERE s.id = ?1"), params![id.to_string()], share_row)
+            .query_row(&format!("SELECT {SHARE_COLS} FROM share_links s WHERE s.id = ?1"), params![id.to_string()], share_row)
             .optional()?
             .ok_or_else(|| not_found(id))?;
         if share.is_gone(now) {
@@ -469,6 +469,24 @@ impl SqliteStore {
 mod tests {
     use super::*;
     use crate::{BlockStore, PrincipalKind};
+
+    /// Federation's old `shares` table is dropped on every open; share
+    /// links live under another name and survive a reopen.
+    #[test]
+    fn share_links_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ks.db");
+        let id = {
+            let mut s = SqliteStore::open(&path).unwrap();
+            let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+            let a = s.auth_ensure_owner(p, "Tom", 1).unwrap().id;
+            let doc = s.create_doc_with_ops("D", None, p, vec![]).unwrap().0.id;
+            s.with_scope_for_test(Scope::User(a), |s| s.share_create(doc, "tok", "hash", &snap("D"), None, true, 10).unwrap().id)
+        };
+        let s = SqliteStore::open(&path).unwrap();
+        assert_eq!(s.share_get(id).unwrap().title, "D");
+        assert!(s.share_public_asset(id, "d1.svg").unwrap().is_some());
+    }
 
     fn snap(title: &str) -> ShareSnapshot {
         ShareSnapshot {
