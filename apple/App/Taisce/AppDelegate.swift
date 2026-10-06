@@ -17,7 +17,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         if !AppPaths.isTestHost { CodeRun.sweepStaleRuns() }
         #endif
         model = AppModel(migration: report)
+        if !AppPaths.isTestHost { PDFExportFile.sweep() }
         super.init()
+        ShareCommentPush.model = model
     }
     /// why iOS gave no token (no network, no entitlement in a dev build)
     private(set) var registrationError: String?

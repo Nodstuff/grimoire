@@ -69,6 +69,34 @@ enum SilentPush {
     }
 }
 
+/// The server's alert push for a comment on one of your share links:
+/// `{"aps":{"alert":…},"kind":"share_comment","doc_id":…,"share_id":…}`.
+/// A tap opens that doc's link comments.
+enum ShareCommentPush {
+    static let kind = "share_comment"
+
+    static func docID(from userInfo: [AnyHashable: Any]) -> DocID? {
+        guard userInfo["kind"] as? String == kind, let doc = userInfo["doc_id"] as? String, !doc.isEmpty else { return nil }
+        return doc
+    }
+
+    /// The app's model (the delegate owns it): taps become its request,
+    /// which the frontmost window takes (`RootView`); no window holds a
+    /// closure here, so a closed window can't swallow one.
+    @MainActor static weak var model: AppModel?
+
+    /// A tap on the notification.
+    @MainActor static func deliver(_ doc: DocID) {
+        model?.requestLinkComments(doc)
+    }
+
+    /// One arrived while the app is open: refresh the badges.
+    @MainActor static func arrived(_ doc: DocID) {
+        guard let model else { return }
+        Task { await model.shareLinks.commentArrived(on: doc) }
+    }
+}
+
 extension UIBackgroundFetchResult {
     init(_ result: BackgroundRefreshResult) {
         switch result {

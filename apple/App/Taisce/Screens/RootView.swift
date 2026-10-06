@@ -1,5 +1,6 @@
 import SwiftUI
 import TaisceKit
+import UIKit
 
 /// The Mac's data move didn't finish: nothing opens until a launch from
 /// Finder (which may read the old container) completes it.
@@ -59,6 +60,8 @@ struct RootView: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var router = Router()
     @State private var appliedLaunchArguments = false
+    @State private var window = WindowHolder()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         @Bindable var router = router
@@ -97,6 +100,13 @@ struct RootView: View {
         .onChange(of: model.docs.count) {
             if appliedLaunchArguments { _ = router.openLaunchDoc(index: model.index) }
         }
+        // a tap on "X commented on Y": the frontmost window shows that doc's link comments
+        .background(WindowReader(holder: window))
+        .onChange(of: model.linkCommentsRequest, initial: true) { openLinkCommentsIfFront() }
+        .onChange(of: scenePhase) { openLinkCommentsIfFront() }
+        .onChange(of: model.treeLoaded) { openLinkCommentsIfFront() }
+        // sign-out or another account: nothing queued for the last one survives
+        .onChange(of: model.authPhase) { router.docAction = nil }
         // ADR 0004: an unshared doc closes, with a gentle note
         .onChange(of: model.revocation) { _, r in
             guard let r, router.drop(r.docs) else { return }
@@ -114,6 +124,61 @@ struct RootView: View {
             }
         }
         .animation(.default, value: model.accessNotice)
+    }
+}
+
+extension RootView {
+    /// Takes a waiting comment-push request if this window is the one in
+    /// front: the key window, or, with none key (the tap just launched or
+    /// woke the app), the first active one.
+    func openLinkCommentsIfFront() {
+        guard model.linkCommentsRequest != nil, model.treeLoaded,
+              FrontWindow.isFront(window.window, scenePhase: scenePhase)
+        else { return }
+        guard let doc = model.takeLinkCommentsRequest() else { return }
+        router.openLinkComments(doc)
+        Task { try? await model.shareLinks.load(doc: doc) }
+    }
+}
+
+/// Which window takes a request meant for "the one in front".
+enum FrontWindow {
+    @MainActor static func isFront(_ window: UIWindow?, scenePhase: ScenePhase) -> Bool {
+        guard scenePhase == .active, let window else { return false }
+        if window.isKeyWindow { return true }
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let anyKey = scenes.contains { $0.windows.contains(where: \.isKeyWindow) }
+        guard !anyKey else { return false }
+        return scenes.first { $0.activationState == .foregroundActive } === window.windowScene
+    }
+}
+
+/// The UIWindow a SwiftUI view sits in.
+@MainActor final class WindowHolder {
+    weak var window: UIWindow?
+}
+
+struct WindowReader: UIViewRepresentable {
+    let holder: WindowHolder
+
+    func makeUIView(context: Context) -> Probe { Probe(holder: holder) }
+    func updateUIView(_ view: Probe, context: Context) {}
+
+    final class Probe: UIView {
+        let holder: WindowHolder
+        init(holder: WindowHolder) {
+            self.holder = holder
+            super.init(frame: .zero)
+            isUserInteractionEnabled = false
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError() }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            holder.window = window
+        }
     }
 }
 

@@ -81,6 +81,8 @@ struct DocScreen: View {
         .onChange(of: access.canEdit) { _, can in
             if !can, editor != nil { Task { await finishEditing() } }
         }
+        // Share link…, Export as PDF… and link comments (menus, the menu bar, a comment push)
+        .modifier(DocShareActions(docID: docID, canShare: access.canEdit, pageLoaded: page != nil))
         .onChange(of: editor == nil) { _, closed in
             if !closed {
                 router.editingDoc = docID
@@ -136,7 +138,12 @@ struct DocScreen: View {
             onOpenChild: { router.open(.doc($0)) },
             onNewDocHere: onNewDocHere,
             docID: docID,
-            canEdit: editable && access.canEdit
+            canEdit: editable && access.canEdit,
+            linkComments: model.shareLinks.isAvailable ? model.shareLinks.commentSummary(for: docID).title : nil,
+            onOpenLinkComments: { router.request(.linkComments, on: docID) },
+            // ADR 0004: creating or updating a link needs owner or editor
+            onShareLink: model.shareLinks.isAvailable && access.canEdit && page != nil ? { router.request(.shareLink, on: docID) } : nil,
+            onExportPDF: model.shareLinks.isAvailable && page != nil ? { router.request(.exportPDF, on: docID) } : nil
         )
         .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
         // children's "edited … ago" (a handful; each is cached until it changes)
@@ -279,6 +286,12 @@ struct DocContent: View {
     /// runnable code blocks (Mac): which doc, and whether a practice edit may be saved
     var docID: DocID?
     var canEdit = false
+    // share links (SERVER mode): the comments entry and the … menu's items
+    var linkComments: String?
+    var onOpenLinkComments: () -> Void = {}
+    var onShareLink: (() -> Void)?
+    var onExportPDF: (() -> Void)?
+    var exportingPDF = false
 
     var body: some View {
         ScrollView {
@@ -307,6 +320,19 @@ struct DocContent: View {
                     }
                 }
                 .padding(.bottom, 6)
+                if let linkComments {
+                    Button(action: onOpenLinkComments) {
+                        Label(linkComments, systemImage: "bubble.left.and.text.bubble.right")
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(Theme.accent)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .card(Theme.surface)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("doc.linkComments")
+                }
                 content
             }
             .padding(.horizontal, Theme.gutter)
@@ -336,6 +362,18 @@ struct DocContent: View {
                     Button(pinned ? "Unpin from Today" : "Pin to Today", systemImage: pinned ? "pin.slash" : "pin", action: onTogglePin)
                     if let onMoveWorkspace {
                         Button("Move to workspace\u{2026}", systemImage: "square.stack", action: onMoveWorkspace)
+                    }
+                    if onShareLink != nil || onExportPDF != nil || exportingPDF {
+                        Divider()
+                    }
+                    if let onShareLink {
+                        Button("Share link\u{2026}", systemImage: "link", action: onShareLink)
+                            .accessibilityIdentifier("doc.shareLink")
+                    }
+                    if let onExportPDF {
+                        Button("Export as PDF\u{2026}", systemImage: "doc.richtext", action: onExportPDF)
+                    } else if exportingPDF {
+                        Text("Exporting PDF\u{2026}")
                     }
                 } label: {
                     Image(systemName: "ellipsis")

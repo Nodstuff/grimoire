@@ -116,6 +116,10 @@ final class AppModel {
     let sqlRuns = SQLRunStore()
     /// this Mac's SQL data sources (kept across sign-outs: they're the Mac's)
     let dataSources = DataSourceStore()
+    /// share links and their comments (SERVER mode only)
+    let shareLinks = ShareLinkStore()
+    /// a comment push was tapped: the frontmost window opens that doc's link comments
+    private(set) var linkCommentsRequest: LinkCommentsRequest?
 
     /// The Mac's move out of the sandbox didn't finish this launch (the
     /// container couldn't be read, or a copy failed): the app opens no
@@ -133,6 +137,7 @@ final class AppModel {
         let stored = UserDefaults.standard.string(forKey: Self.serverURLKey).flatMap { ServerConfig.normalizedURL($0)?.absoluteString }
         serverURL = stored.flatMap { ServerURLPolicy.accepts($0) ? $0 : nil } ?? Self.defaultServerURL
         codeRuns.app = self
+        shareLinks.app = self
         sqlRuns.app = self
     }
 
@@ -293,6 +298,8 @@ final class AppModel {
         editMeta = [:]
         codeRuns.reset()
         sqlRuns.reset()
+        shareLinks.reset()
+        linkCommentsRequest = nil
         settledTodos = []
         pendingEditDoc = nil
         pendingWrites = 0
@@ -447,6 +454,7 @@ final class AppModel {
             pins = UserDefaults.standard.stringArray(forKey: pinsKey) ?? []
             await loadCachedWorkspaces(cache) // workspaces
             editMeta = [:]
+            shareLinks.reset()
             treeLoaded = false
             await sync.setAlwaysFetch(Set(pins))
             observeTask = Task { [weak self] in
@@ -859,4 +867,22 @@ enum TodoWriteError: Error, LocalizedError {
     case notFound
 
     var errorDescription: String? { "That item changed on the server; pull to refresh." }
+}
+
+/// A tapped "X commented on Y", waiting for a window to show it.
+struct LinkCommentsRequest: Equatable {
+    var doc: DocID
+    var serial: Int
+}
+
+extension AppModel {
+    func requestLinkComments(_ doc: DocID) {
+        linkCommentsRequest = LinkCommentsRequest(doc: doc, serial: (linkCommentsRequest?.serial ?? 0) + 1)
+    }
+
+    /// The frontmost window takes it, once.
+    func takeLinkCommentsRequest() -> DocID? {
+        defer { linkCommentsRequest = nil }
+        return linkCommentsRequest?.doc
+    }
 }
