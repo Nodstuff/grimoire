@@ -117,7 +117,7 @@ struct LinkCommentsScreen: View {
             threads = out
             error = nil
         } catch {
-            self.error = error.localizedDescription
+            self.error = ShareErrorText.message(error)
         }
         loading = false
     }
@@ -132,7 +132,7 @@ struct LinkCommentsScreen: View {
             replyingTo = nil
             await load()
         } catch {
-            self.error = error.localizedDescription
+            self.error = ShareErrorText.message(error)
         }
     }
 
@@ -142,7 +142,7 @@ struct LinkCommentsScreen: View {
             try await store.delete(comment, on: current)
             await load()
         } catch {
-            self.error = error.localizedDescription
+            self.error = ShareErrorText.message(error)
         }
     }
 }

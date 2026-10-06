@@ -144,8 +144,11 @@ final class Router {
     func canPerform(_ command: AppCommand, signedIn: Bool, picker: WorkspacePicker, canEdit: (DocID) -> Bool = { _ in true }, canCreate: Bool = true, shares: Bool = false) -> Bool {
         guard signedIn else { return false }
         switch command {
-        case .shareLink, .exportPDF:
-            // SERVER mode only, a doc in front, not mid-edit
+        case .shareLink:
+            // SERVER mode only, a doc in front you may edit (owner or editor), not mid-edit
+            return shares && editingDoc == nil && (focusedDoc.map(canEdit) ?? false)
+        case .exportPDF:
+            // reading is enough to print
             return shares && focusedDoc != nil && editingDoc == nil
         case .toggleEdit:
             // finishing an edit is always allowed

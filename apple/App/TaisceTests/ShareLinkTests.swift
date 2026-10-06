@@ -18,13 +18,19 @@ private final class FakeShares: ShareService, @unchecked Sendable {
 
     let existing: [Share]
     let comments: [ShareComment]
-    init(existing: [Share] = [], comments: [ShareComment] = []) {
+    /// what create / update / mark-read answer instead (403, 429…)
+    let refusal: ShareAPIError?
+    let readRefusal: ShareAPIError?
+    init(existing: [Share] = [], comments: [ShareComment] = [], refusal: ShareAPIError? = nil, readRefusal: ShareAPIError? = nil) {
         self.existing = existing
         self.comments = comments
+        self.refusal = refusal
+        self.readRefusal = readRefusal
     }
 
     func createShare(docID: DocID, snapshot: ShareSnapshot, expiresAt: Date?, commentsEnabled: Bool) async throws -> Share {
         log("create \(docID) \(snapshot.markdown) \(expiresAt == nil ? "never" : "dated") comments=\(commentsEnabled) theme=\(snapshot.theme.rawValue)")
+        if let refusal { throw refusal }
         var s = Self.share("new", doc: docID, expires: expiresAt, created: 100)
         s.commentsEnabled = commentsEnabled
         return s
@@ -37,6 +43,7 @@ private final class FakeShares: ShareService, @unchecked Sendable {
 
     func updateShare(_ id: String, snapshot: ShareSnapshot?, expiresAt: ShareExpiryChange, commentsEnabled: Bool?) async throws -> Share {
         log("patch \(id) snapshot=\(snapshot != nil) expiry=\(expiresAt == .keep ? "keep" : "set") comments=\(commentsEnabled.map(String.init) ?? "-")")
+        if let refusal { throw refusal }
         var s = existing.first { $0.id == id } ?? Self.share(id)
         if snapshot != nil { s.revision += 1 }
         if case let .set(d) = expiresAt { s.expiresAt = d }
@@ -50,6 +57,11 @@ private final class FakeShares: ShareService, @unchecked Sendable {
     func shareComments(_ shareID: String) async throws -> [ShareComment] {
         log("comments \(shareID)")
         return comments
+    }
+
+    func markShareCommentsRead(_ shareID: String) async throws {
+        log("read \(shareID)")
+        if let readRefusal { throw readRefusal }
     }
 
     func replyToShareComment(_ shareID: String, body: String, parentID: String?, anchor: ShareAnchor?) async throws -> ShareComment {
@@ -124,11 +136,48 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         let share = try #require(s.all.first)
         let list = try await s.comments(for: share)
         #expect(list == [root])
+        #expect(fake.calls.suffix(2) == ["comments s1", "read s1"], "opening them marks them read through its own route")
         #expect(s.unreadTotal == 0)
         #expect(s.commentSummary(for: "d1").title == "Comments from shared links")
         _ = try await s.reply(to: s.all[0], body: "  Thanks  ", parent: root)
         try await s.delete(root, on: s.all[0])
         #expect(fake.calls.suffix(2) == ["reply s1 c1 Thanks", "delete s1/c1"])
+    }
+
+    @Test func aFailedMarkKeepsTheBadgeButShowsTheComments() async throws {
+        let root = ShareComment(id: "c1", author: "Aoife", body: "Nice")
+        let fake = FakeShares(existing: [FakeShares.share("s1", comments: 1, unread: 1)], comments: [root], readRefusal: ShareAPIError(status: 500, message: nil))
+        let s = store(fake)
+        try await s.loadAll()
+        #expect(try await s.comments(for: s.all[0]) == [root])
+        #expect(s.unreadTotal == 1)
+        // nothing new: no mark sent
+        let quiet = FakeShares(existing: [FakeShares.share("s2", comments: 1, unread: 0)], comments: [root])
+        let q = store(quiet)
+        try await q.loadAll()
+        _ = try await q.comments(for: q.all[0])
+        #expect(!quiet.calls.contains("read s2"))
+    }
+
+    @Test func refusalsReachThePersonInTheServersWords() async throws {
+        let viewer = store(FakeShares(refusal: ShareAPIError(status: 403, message: "only the owner or an editor can share this doc")))
+        do {
+            _ = try await viewer.create(doc: "d1", expiresAt: nil, commentsEnabled: true, theme: .light)
+            Issue.record("expected a refusal")
+        } catch {
+            #expect(ShareErrorText.message(error) == "only the owner or an editor can share this doc")
+        }
+        let capped = store(FakeShares(existing: [FakeShares.share("s1")], refusal: ShareAPIError(status: 429, message: "you have 100 live links; revoke some first")))
+        try await capped.loadAll()
+        do {
+            try await capped.republish(capped.all[0], theme: .light)
+            Issue.record("expected a refusal")
+        } catch {
+            #expect(ShareErrorText.message(error) == "you have 100 live links; revoke some first")
+        }
+        #expect(ShareErrorText.message(ShareAPIError(status: 413, message: nil)) == "This doc is too large to share.")
+        #expect(ShareErrorText.message(APIError.server("this link was revoked; make a new one")) == "this link was revoked; make a new one")
+        #expect(ShareErrorText.message(APIError.http(status: 502)).contains("HTTP 502"))
     }
 
     @Test func resetForgetsEverything() async throws {
@@ -192,6 +241,9 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         r.editingDoc = "d1"
         #expect(!r.canPerform(.shareLink, signedIn: true, picker: picker, shares: true))
         r.editingDoc = nil
+        // a viewer (ADR 0004) may print but not share
+        #expect(!r.canPerform(.shareLink, signedIn: true, picker: picker, canEdit: { _ in false }, shares: true))
+        #expect(r.canPerform(.exportPDF, signedIn: true, picker: picker, canEdit: { _ in false }, shares: true))
         _ = r.perform(.exportPDF, picker: picker)
         #expect(r.docAction?.doc == "d1" && r.docAction?.kind == .exportPDF)
         _ = r.perform(.shareLink, picker: picker)

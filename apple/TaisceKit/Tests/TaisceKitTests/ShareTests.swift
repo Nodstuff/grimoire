@@ -76,13 +76,43 @@ private func json(_ r: URLRequest) -> [String: Any] {
         #expect(server.requests.map(\.path) == ["/api/shares/s1", "/api/shares/s1/comments/c1"])
     }
 
-    @Test func refusalCarriesTheServersMessage() async throws {
-        let server = MockServer { _ in MockServer.Reply(status: 403, chunks: [Data(#"{"error":"shares are human-only"}"#.utf8)]) }
-        await #expect(throws: APIError.server("shares are human-only")) {
-            try await server.client().revokeShare("s1")
+    @Test func refusalsCarryTheServersMessage() async throws {
+        func refusing(_ status: Int, _ body: String) -> MockServer {
+            MockServer { _ in MockServer.Reply(status: status, chunks: [Data(body.utf8)]) }
         }
-        let missing = MockServer { _ in MockServer.Reply(status: 404, chunks: [Data(#"{"error":"not found"}"#.utf8)]) }
-        await #expect(throws: APIError.self) { _ = try await missing.client().shares(docID: nil) }
+        let viewer = refusing(403, #"{"error":"only the owner or an editor can share this doc"}"#)
+        await #expect(throws: ShareAPIError(status: 403, message: "only the owner or an editor can share this doc")) {
+            _ = try await viewer.client().createShare(docID: "d1", snapshot: ShareSnapshot(title: "t", markdown: "", theme: .light), expiresAt: nil, commentsEnabled: true)
+        }
+        // a per-user cap is a 429 with words, not a silent "retry later"
+        let capped = refusing(429, #"{"error":"you have 100 live links; revoke some first"}"#)
+        do {
+            _ = try await capped.client().updateShare("s1", commentsEnabled: true)
+            Issue.record("expected a refusal")
+        } catch let e as ShareAPIError {
+            #expect(e.isLimit && e.localizedDescription == "you have 100 live links; revoke some first")
+        }
+        let big = refusing(413, #"{"error":"snapshots are 10 MB at most"}"#)
+        await #expect(throws: ShareAPIError(status: 413, message: "snapshots are 10 MB at most")) {
+            _ = try await big.client().sharePreviewHTML(ShareSnapshot(title: "t", markdown: "", theme: .light))
+        }
+        // no message: still something a person can read
+        let bare = MockServer { _ in MockServer.Reply(status: 429, chunks: [], contentType: "text/plain") }
+        await #expect(throws: ShareAPIError(status: 429, message: nil)) { try await bare.client().revokeShare("s1") }
+        #expect(ShareAPIError(status: 403, message: nil).localizedDescription == "Only the doc's owner or an editor can share it.")
+        let missing = refusing(404, #"{"error":"not found"}"#)
+        await #expect(throws: ShareAPIError(status: 404, message: "not found")) { _ = try await missing.client().shares(docID: nil) }
+        let unauthorized = refusing(401, #"{"error":"no"}"#)
+        await #expect(throws: APIError.unauthorized) { _ = try await unauthorized.client().shares(docID: nil) }
+    }
+
+    @Test func markReadPostsToItsOwnRoute() async throws {
+        let server = MockServer { r in
+            #expect(r.httpMethod == "POST" && r.path == "/api/shares/s1/comments/read")
+            return MockServer.Reply(status: 204, chunks: [], contentType: "")
+        }
+        try await server.client().markShareCommentsRead("s1")
+        #expect(server.requests.count == 1)
     }
 
     @Test func previewReturnsHTML() async throws {

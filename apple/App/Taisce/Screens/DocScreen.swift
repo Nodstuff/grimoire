@@ -94,7 +94,7 @@ struct DocScreen: View {
             guard let action, action.doc == docID else { return }
             router.docAction = nil
             switch action.kind {
-            case .shareLink: if model.shareLinks.isAvailable { sharing = true }
+            case .shareLink: if model.shareLinks.isAvailable, access.canEdit { sharing = true }
             case .exportPDF: exportPDF()
             case .linkComments: showingLinkComments = true
             }
@@ -190,7 +190,8 @@ struct DocScreen: View {
             canEdit: editable && access.canEdit,
             linkComments: model.shareLinks.isAvailable ? model.shareLinks.commentSummary(for: docID).title : nil,
             onOpenLinkComments: { showingLinkComments = true },
-            onShareLink: model.shareLinks.isAvailable && page != nil ? { sharing = true } : nil,
+            // ADR 0004: creating or updating a link needs owner or editor
+            onShareLink: model.shareLinks.isAvailable && access.canEdit && page != nil ? { sharing = true } : nil,
             onExportPDF: model.shareLinks.isAvailable && page != nil && !exportingPDF ? { exportPDF() } : nil,
             exportingPDF: exportingPDF
         )
@@ -224,7 +225,7 @@ struct DocScreen: View {
                 savingPDF = true
                 #endif
             } catch {
-                pdfError = error.localizedDescription
+                pdfError = ShareErrorText.message(error)
             }
         }
     }

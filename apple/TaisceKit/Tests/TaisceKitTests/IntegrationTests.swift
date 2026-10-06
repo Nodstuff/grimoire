@@ -476,10 +476,12 @@ struct ServerIntegrationTests {
         let unread = try await api.shares(docID: doc.id).first
         #expect(unread?.commentCount == 1 && unread?.unreadComments == 1)
 
-        // the owner reads (marks read), replies, deletes
+        // the owner reads, marks them read, replies, deletes
         let list = try await api.shareComments(share.id)
         let root = try #require(list.first)
         #expect(root.author == "Aoife" && !root.isOwner && root.anchor?.quote == "world")
+        #expect(try await api.shares(docID: doc.id).first?.unreadComments == 1, "a GET alone doesn't mark them read")
+        try await api.markShareCommentsRead(share.id)
         #expect(try await api.shares(docID: doc.id).first?.unreadComments == 0)
         let reply = try await api.replyToShareComment(share.id, body: "Thanks!", parentID: root.id)
         #expect(reply.isOwner && reply.parentID == root.id)

@@ -95,12 +95,17 @@ final class ShareLinkStore {
 
     // MARK: comments
 
-    /// Reading them marks them read (server side; mirrored here).
+    /// The owner opening a link's comments: fetch them, then mark them
+    /// read (`POST …/comments/read`). The badge clears only when the
+    /// server took the mark; a failed mark leaves it, and the comments show.
     func comments(for share: Share) async throws -> [ShareComment] {
+        let service = try service
         let list = try await service.shareComments(share.id)
         var s = share
-        s.unreadComments = 0
         s.commentCount = list.count
+        if share.unreadComments > 0 {
+            if (try? await service.markShareCommentsRead(share.id)) != nil { s.unreadComments = 0 }
+        }
         apply(s)
         return list
     }
@@ -151,6 +156,28 @@ final class ShareLinkStore {
             let la = a.state() == .active, lb = b.state() == .active
             if la != lb { return la }
             return (a.createdAt ?? .distantPast) > (b.createdAt ?? .distantPast)
+        }
+    }
+}
+
+/// What to tell a person when a share call fails: the server's own words
+/// (403 not yours to share, 413 too large, 429 a per-user cap), else a
+/// plain sentence rather than an error type's name.
+enum ShareErrorText {
+    static func message(_ error: any Error) -> String {
+        switch error {
+        case let e as ShareAPIError: return e.localizedDescription
+        case let e as ShareLinkError: return e.localizedDescription
+        case let e as APIError:
+            switch e {
+            case let .server(m), let .notFound(m): return m
+            case .unauthorized: return "Your sign-in has expired. Sign in again in Settings."
+            case let .http(status): return "The server couldn't do that just now (HTTP \(status)). Try again."
+            case .notAPIRoute: return "This server doesn't have share links."
+            case .decoding: return "The server's answer didn't make sense to this version of the app."
+            case let .badURL(u): return "Bad server address: \(u)"
+            }
+        default: return error.localizedDescription
         }
     }
 }

@@ -97,7 +97,7 @@ struct ShareLinkForm: View {
                 try await store.load(doc: docID)
                 error = nil
             } catch {
-                self.error = error.localizedDescription
+                self.error = ShareErrorText.message(error)
             }
             loaded = true
         }
@@ -140,7 +140,7 @@ struct ShareLinkForm: View {
             newLink = false
             error = nil
         } catch {
-            self.error = error.localizedDescription
+            self.error = ShareErrorText.message(error)
         }
     }
 }
@@ -279,7 +279,7 @@ struct ShareLinkSection: View {
                 try await work()
                 error = nil
             } catch {
-                self.error = error.localizedDescription
+                self.error = ShareErrorText.message(error)
             }
             busy = nil
         }

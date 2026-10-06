@@ -59,7 +59,7 @@ struct SharedLinksScreen: View {
             try await model.shareLinks.loadAll()
             error = nil
         } catch {
-            self.error = error.localizedDescription
+            self.error = ShareErrorText.message(error)
         }
         loading = false
     }
