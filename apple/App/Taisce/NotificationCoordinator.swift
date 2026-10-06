@@ -325,7 +325,10 @@ final class DueAlertDelegate: NSObject, UNUserNotificationCenterDelegate, Sendab
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
-        [.banner, .list, .sound]
+        if let doc = ShareCommentPush.docID(from: notification.request.content.userInfo) {
+            await MainActor.run { ShareCommentPush.arrived(doc) }
+        }
+        return [.banner, .list, .sound]
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {

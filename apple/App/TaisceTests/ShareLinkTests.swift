@@ -76,8 +76,8 @@ private final class FakeShares: ShareService, @unchecked Sendable {
 private func store(_ fake: FakeShares) -> ShareLinkStore {
     let s = ShareLinkStore()
     s.serviceOverride = fake
-    s.snapshotOverride = { doc, theme in
-        ShareSnapshotResult(snapshot: ShareSnapshot(title: "Plan", markdown: "md-\(doc)", theme: theme), problems: ["Chart couldn't render: x"])
+    s.snapshotOverride = { doc, theme, fetch in
+        ShareSnapshotResult(snapshot: ShareSnapshot(title: "Plan", markdown: "md-\(doc)\(fetch ? "+images" : "")", theme: theme), problems: ["Chart couldn't render: x"], includesUnsentEdits: doc == "dirty")
     }
     return s
 }
@@ -86,10 +86,15 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
     @Test func createPublishesTheSnapshotAndKeepsTheLink() async throws {
         let fake = FakeShares()
         let s = store(fake)
-        let share = try await s.create(doc: "d1", expiresAt: nil, commentsEnabled: false, theme: .dark)
-        #expect(fake.calls == ["create d1 md-d1 never comments=false theme=dark"])
+        let share = try await s.create(doc: "d1", expiry: .never, custom: nil, commentsEnabled: false, theme: .dark, fetchImages: true)
+        #expect(fake.calls == ["create d1 md-d1+images never comments=false theme=dark"])
         #expect(s.shares(for: "d1") == [share])
-        #expect(s.lastProblems == ["Chart couldn't render: x"])
+        #expect(s.problems["d1"] == ["Chart couldn't render: x"] && s.problems["d2"] == nil, "notes are per doc")
+        #expect(s.unsentEdits["d1"] == false)
+        _ = try await s.create(doc: "dirty", expiry: .week, custom: nil, commentsEnabled: true, theme: .light, fetchImages: false)
+        #expect(s.unsentEdits["dirty"] == true)
+        s.clearNotes(for: "d1")
+        #expect(s.problems["d1"] == nil && s.problems["dirty"] != nil)
     }
 
     @Test func liveLinksSortFirst() async throws {
@@ -110,8 +115,8 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         let s = store(fake)
         try await s.loadAll()
         let share = try #require(s.all.first)
-        try await s.republish(share, theme: .light)
-        try await s.setExpiry(share, to: nil)
+        try await s.republish(share, theme: .light, fetchImages: false)
+        try await s.setExpiry(share, expiry: .never, custom: nil)
         try await s.setComments(share, enabled: false)
         try await s.revoke(share)
         #expect(fake.calls == [
@@ -141,7 +146,8 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         #expect(s.commentSummary(for: "d1").title == "Comments from shared links")
         _ = try await s.reply(to: s.all[0], body: "  Thanks  ", parent: root)
         try await s.delete(root, on: s.all[0])
-        #expect(fake.calls.suffix(2) == ["reply s1 c1 Thanks", "delete s1/c1"])
+        // a delete takes the replies too: the counts come back from the server
+        #expect(fake.calls.suffix(3) == ["reply s1 c1 Thanks", "delete s1/c1", "list d1"])
     }
 
     @Test func aFailedMarkKeepsTheBadgeButShowsTheComments() async throws {
@@ -162,7 +168,7 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
     @Test func refusalsReachThePersonInTheServersWords() async throws {
         let viewer = store(FakeShares(refusal: ShareAPIError(status: 403, message: "only the owner or an editor can share this doc")))
         do {
-            _ = try await viewer.create(doc: "d1", expiresAt: nil, commentsEnabled: true, theme: .light)
+            _ = try await viewer.create(doc: "d1", expiry: .week, custom: nil, commentsEnabled: true, theme: .light, fetchImages: false)
             Issue.record("expected a refusal")
         } catch {
             #expect(ShareErrorText.message(error) == "only the owner or an editor can share this doc")
@@ -170,7 +176,7 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         let capped = store(FakeShares(existing: [FakeShares.share("s1")], refusal: ShareAPIError(status: 429, message: "you have 100 live links; revoke some first")))
         try await capped.loadAll()
         do {
-            try await capped.republish(capped.all[0], theme: .light)
+            try await capped.republish(capped.all[0], theme: .light, fetchImages: false)
             Issue.record("expected a refusal")
         } catch {
             #expect(ShareErrorText.message(error) == "you have 100 live links; revoke some first")
@@ -186,8 +192,63 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         try await s.load(doc: "d1")
         let expired = try #require(s.shares(for: "d1").first)
         #expect(expired.state() == .expired)
-        try await s.setExpiry(expired, to: .now.addingTimeInterval(86400))
+        try await s.setExpiry(expired, expiry: .day, custom: nil)
         #expect(s.shares(for: "d1").first?.state() == .active)
+    }
+
+    @Test func aClosedSheetPublishesNothing() async throws {
+        let fake = FakeShares()
+        let s = store(fake)
+        let started = AsyncStream.makeStream(of: Void.self)
+        s.snapshotOverride = { doc, theme, _ in
+            started.continuation.yield()
+            try? await Task.sleep(for: .milliseconds(300))
+            return ShareSnapshotResult(snapshot: ShareSnapshot(title: "Plan", markdown: "md", theme: theme))
+        }
+        let task = Task { try await s.create(doc: "d1", expiry: .week, custom: nil, commentsEnabled: true, theme: .light, fetchImages: false) }
+        for await _ in started.stream { break }
+        task.cancel()
+        await #expect(throws: CancellationError.self) { _ = try await task.value }
+        #expect(!fake.calls.contains { $0.hasPrefix("create") })
+    }
+
+    @Test func aCustomExpiryIsCheckedAfterTheBuild() async throws {
+        let fake = FakeShares()
+        let s = store(fake)
+        // fine when picked, too close by the time the slow build finishes
+        let custom = Date.now.addingTimeInterval(ShareExpiry.minimumLead + 0.2)
+        s.snapshotOverride = { _, theme, _ in
+            try? await Task.sleep(for: .milliseconds(400))
+            return ShareSnapshotResult(snapshot: ShareSnapshot(title: "Plan", markdown: "md", theme: theme))
+        }
+        do {
+            _ = try await s.create(doc: "d1", expiry: .custom, custom: custom, commentsEnabled: true, theme: .light, fetchImages: false)
+            Issue.record("expected the expiry to be refused")
+        } catch {
+            #expect(ShareErrorText.message(error) == "Pick an expiry at least 5 minutes from now.")
+        }
+        #expect(!fake.calls.contains { $0.hasPrefix("create") })
+    }
+
+    @Test func offlineRefusesALink() async throws {
+        let fake = FakeShares()
+        let s = store(fake)
+        s.snapshotOverride = { _, _, _ in throw ShareLinkError.offline }
+        do {
+            _ = try await s.create(doc: "d1", expiry: .week, custom: nil, commentsEnabled: true, theme: .light, fetchImages: false)
+            Issue.record("expected a refusal")
+        } catch {
+            #expect(ShareErrorText.message(error).hasPrefix("You're offline."))
+        }
+        #expect(fake.calls.isEmpty)
+    }
+
+    @Test func aForegroundCommentRefreshesTheBadges() async throws {
+        let fake = FakeShares(existing: [FakeShares.share("s1", comments: 1, unread: 1)])
+        let s = store(fake)
+        try await s.loadAll()
+        await s.commentArrived(on: "d1")
+        #expect(fake.calls == ["list all", "list d1", "list all"])
     }
 
     @Test func resetForgetsEverything() async throws {
@@ -229,6 +290,50 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         #expect(ShareLinkText.comments(off) == "Comments off")
     }
 
+    @Test func changeExpiryStartsFromTheLinksOwn() {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let ahead = now.addingTimeInterval(3 * 86400)
+        #expect(ExpirySeed.seed(ahead, now: now) == (.custom, ahead))
+        #expect(ExpirySeed.seed(nil, now: now).0 == .never)
+        #expect(ExpirySeed.seed(now.addingTimeInterval(-60), now: now).0 == .week, "an expired link starts from the default")
+    }
+
+    @Test func theImageQuestionNamesTheHosts() throws {
+        let urls = ["https://x.com/a.png", "https://y.org/b.png", "https://X.com/c.png"].map { URL(string: $0)! }
+        let q = try #require(ImageQuestion(urls: urls))
+        #expect(q.title == "Include 3 images from x.com, y.org?")
+        #expect(ImageQuestion(urls: []) == nil)
+        let many = ImageQuestion(count: 5, hosts: ["a.com", "b.com", "c.com", "d.com", "e.com"])
+        #expect(many.title == "Include 5 images from a.com, b.com, c.com and 2 more?")
+    }
+
+    @Test func staleDocActionsAreDropped() {
+        let fresh = DocAction(doc: "d1", kind: .exportPDF, serial: 1)
+        #expect(fresh.isFresh())
+        let old = DocAction(doc: "d1", kind: .exportPDF, serial: 1, at: .now.addingTimeInterval(-60))
+        #expect(!old.isFresh())
+    }
+
+    @Test func pdfTempFilesGo() throws {
+        let root = PDFExportFile.root
+        let dir = root.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appending(path: "Plan.pdf")
+        try Data("%PDF".utf8).write(to: url)
+        PDFExportFile(url: url, layout: .singlePage).cleanUp()
+        #expect(!FileManager.default.fileExists(atPath: dir.path))
+        // only its own folder under pdf-export, never anything else
+        let elsewhere = FileManager.default.temporaryDirectory.appending(path: "keep-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+        PDFExportFile(url: elsewhere.appending(path: "x.pdf"), layout: .singlePage).cleanUp()
+        #expect(FileManager.default.fileExists(atPath: elsewhere.path))
+        try FileManager.default.removeItem(at: elsewhere)
+        let sweepRoot = FileManager.default.temporaryDirectory.appending(path: "sweep-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: sweepRoot.appending(path: "old"), withIntermediateDirectories: true)
+        PDFExportFile.sweep(root: sweepRoot)
+        #expect(!FileManager.default.fileExists(atPath: sweepRoot.path))
+    }
+
     @Test func pdfFileNamesAndPaper() {
         #expect(PDFExportFile.filename("Q3 plan: v2/final") == "Q3 plan- v2-final.pdf")
         #expect(PDFExportFile.filename("  ..  ") == "Untitled.pdf")
@@ -268,6 +373,17 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         pad.isPad = true
         pad.openLinkComments("d9")
         #expect(pad.padItem == .doc("d9") && pad.docAction?.doc == "d9")
+    }
+
+    @Test func aTapWaitsInTheModelForTheFrontWindowOnce() async {
+        let m = AppModel()
+        m.requestLinkComments("d1")
+        #expect(m.linkCommentsRequest?.doc == "d1")
+        #expect(m.takeLinkCommentsRequest() == "d1")
+        #expect(m.takeLinkCommentsRequest() == nil, "taken once")
+        m.requestLinkComments("d2")
+        await m.forgetUserData()
+        #expect(m.linkCommentsRequest == nil, "sign-out drops it")
     }
 
     @Test func pushPayload() {
@@ -344,5 +460,95 @@ struct SharePreviewPDFTests {
         #expect(doc.string?.contains("world") == true)
         let box = try #require(doc.page(at: 0)?.bounds(for: .mediaBox))
         #expect(box.width == 612 && box.height == 792)
+    }
+}
+
+/// The renderer survives a draw that never returns.
+@MainActor @Suite struct ShareRendererHangTests {
+    @Test func aHungDrawIsDroppedAndTheNextOneRuns() async throws {
+        let r = AppShareVisualRenderer(timeout: .milliseconds(300))
+        final class Flag { var hang = true }
+        let flag = Flag()
+        r.drawOverride = { v in
+            if flag.hang {
+                // never answers (a wedged web view)
+                try? await Task.sleep(for: .seconds(3600))
+            }
+            return RenderedVisual(data: Data("<svg/>".utf8), contentType: "image/svg+xml")
+        }
+        do {
+            _ = try await r.render(ShareVisual(kind: .mermaid, source: "graph", theme: .light))
+            Issue.record("expected a timeout")
+        } catch let e as DiagramRenderError {
+            #expect(e.timedOut)
+        }
+        #expect(r.dropped == 1 && r.web == nil)
+        flag.hang = false
+        let ok = try await r.render(ShareVisual(kind: .mermaid, source: "graph", theme: .light))
+        #expect(ok.contentType == "image/svg+xml")
+    }
+}
+
+/// PDF printing: nothing but data: loads, and every image (lazy ones too)
+/// is in the pages.
+@MainActor @Suite(.serialized) struct PDFSafetyTests {
+    @Test func theCSPGoesFirstInTheHead() {
+        let html = PDFRenderer.lockedDown("<!doctype html><html><head><title>x</title></head><body></body></html>")
+        #expect(html.hasPrefix("<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\""))
+        #expect(PDFRenderer.lockedDown("<p>bare</p>").hasPrefix("<head><meta"))
+        #expect(PDFRenderer.csp.contains("default-src 'none'") && PDFRenderer.csp.contains("img-src data:"))
+    }
+
+    @Test func theRuleListCompiles() async throws {
+        _ = try await PDFRenderer.dataOnlyRules()
+    }
+
+    @Test func aLazyImageOnALaterPageIsPrinted() async throws {
+        let dot = UIGraphicsImageRenderer(size: CGSize(width: 40, height: 40)).pngData { ctx in
+            UIColor.systemRed.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 40, height: 40))
+        }
+        let paras = (1...150).map { "<p>Paragraph \($0): the quick brown fox jumps over the lazy dog.</p>" }.joined()
+        let html = "<!doctype html><html><head><meta charset=utf-8></head><body>\(paras)<img loading=\"lazy\" width=\"40\" height=\"40\" src=\"data:image/png;base64,\(dot.base64EncodedString())\"><img src=\"https://127.0.0.1:1/x.png\"></body></html>"
+        let (data, layout) = try await PDFRenderer.pdf(html: html, title: "Lazy", paper: .a4)
+        guard case let .paged(pages) = layout, pages > 1 else {
+            Issue.record("expected several pages, got \(layout)")
+            return
+        }
+        let doc = try #require(CGPDFDocument(CGDataProvider(data: data as CFData)!))
+        #expect(PDFImages.count(doc.page(at: doc.numberOfPages)) >= 1, "the last page carries the lazy image")
+        #expect(PDFImages.count(doc.page(at: 1)) == 0)
+    }
+}
+
+/// Image XObjects on a PDF page.
+enum PDFImages {
+    static func count(_ page: CGPDFPage?) -> Int {
+        guard let dict = page?.dictionary else { return 0 }
+        var resources: CGPDFDictionaryRef?
+        guard CGPDFDictionaryGetDictionary(dict, "Resources", &resources), let resources else { return 0 }
+        return count(resources)
+    }
+
+    static func count(_ resources: CGPDFDictionaryRef) -> Int {
+        var xobjects: CGPDFDictionaryRef?
+        guard CGPDFDictionaryGetDictionary(resources, "XObject", &xobjects), let xobjects else { return 0 }
+        final class Box { var n = 0 }
+        let box = Box()
+        CGPDFDictionaryApplyBlock(xobjects, { _, object, info in
+            let box = Unmanaged<Box>.fromOpaque(info!).takeUnretainedValue()
+            var stream: CGPDFStreamRef?
+            guard CGPDFObjectGetValue(object, .stream, &stream), let stream, let d = CGPDFStreamGetDictionary(stream) else { return true }
+            var subtype: UnsafePointer<CChar>?
+            if CGPDFDictionaryGetName(d, "Subtype", &subtype), let subtype {
+                let name = String(cString: subtype)
+                if name == "Image" { box.n += 1 }
+                // a form XObject may wrap the image
+                var inner: CGPDFDictionaryRef?
+                if name == "Form", CGPDFDictionaryGetDictionary(d, "Resources", &inner), let inner { box.n += PDFImages.count(inner) }
+            }
+            return true
+        }, Unmanaged.passUnretained(box).toOpaque())
+        return box.n
     }
 }

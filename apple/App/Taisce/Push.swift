@@ -80,13 +80,20 @@ enum ShareCommentPush {
         return doc
     }
 
-    /// The front window's router opens it (`RootView` sets this).
-    @MainActor static var open: ((DocID) -> Void)?
-    /// A tap that arrived before any window could take it (a cold launch).
-    @MainActor static var pending: DocID?
+    /// The app's model (the delegate owns it): taps become its request,
+    /// which the frontmost window takes (`RootView`); no window holds a
+    /// closure here, so a closed window can't swallow one.
+    @MainActor static weak var model: AppModel?
 
+    /// A tap on the notification.
     @MainActor static func deliver(_ doc: DocID) {
-        if let open { open(doc) } else { pending = doc }
+        model?.requestLinkComments(doc)
+    }
+
+    /// One arrived while the app is open: refresh the badges.
+    @MainActor static func arrived(_ doc: DocID) {
+        guard let model else { return }
+        Task { await model.shareLinks.commentArrived(on: doc) }
     }
 }
 

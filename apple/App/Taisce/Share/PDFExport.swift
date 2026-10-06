@@ -54,6 +54,8 @@ final class PDFRenderer: NSObject, WKNavigationDelegate {
         // the page's comment script is for readers: nothing runs here
         config.defaultWebpagePreferences.allowsContentJavaScript = false
         config.dataDetectorTypes = []
+        // nothing but data: URLs loads (the page's own images are inlined)
+        config.userContentController.add(try await Self.dataOnlyRules())
         let printable = paper.size.width - 2 * PaperSize.margin
         let web = WKWebView(frame: CGRect(x: 0, y: 0, width: printable, height: paper.size.height), configuration: config)
         web.navigationDelegate = self
@@ -67,14 +69,65 @@ final class PDFRenderer: NSObject, WKNavigationDelegate {
         defer { timer.cancel() }
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, any Error>) in
             waiting = c
-            web.loadHTMLString(html, baseURL: nil)
+            web.loadHTMLString(Self.lockedDown(html), baseURL: nil)
         }
-        // data: images decode after didFinish on a busy page
-        try? await Task.sleep(for: .milliseconds(150))
+        // every image loaded and decoded (lazy ones too), and the view as
+        // tall as the page, so the print formatter lays out all of it
+        let height = try await Self.settle(web)
+        web.frame.size.height = min(max(height, paper.size.height), 400_000)
+        web.layoutIfNeeded()
 
         if let paged = Self.paged(web, title: title, paper: paper) { return paged }
         let data = try await web.pdf(configuration: WKPDFConfiguration())
         return (data, .singlePage)
+    }
+
+    /// Runs as the app (`.defaultClient`), not the page: the page itself has
+    /// JavaScript off. Images go eager and are awaited; returns the content height.
+    static let settleScript = """
+        const imgs = Array.from(document.images);
+        for (const i of imgs) { i.loading = 'eager'; }
+        await Promise.all(imgs.map(i => i.decode().catch(() => null)));
+        const d = document.documentElement, b = document.body;
+        return Math.ceil(Math.max(d.scrollHeight, d.offsetHeight, b ? b.scrollHeight : 0));
+        """
+
+    static func settle(_ web: WKWebView) async throws -> CGFloat {
+        let h = try await web.callAsyncJavaScript(settleScript, arguments: [:], in: nil, contentWorld: .defaultClient)
+        return CGFloat((h as? NSNumber)?.doubleValue ?? 0)
+    }
+
+    /// A CSP as the head's first element: images only from data:, inline
+    /// styles, nothing else (no script, no fetches, no frames).
+    static let csp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:"
+
+    static func lockedDown(_ html: String) -> String {
+        let meta = "<meta http-equiv=\"Content-Security-Policy\" content=\"\(csp)\">"
+        if let head = html.range(of: "<head[^>]*>", options: [.regularExpression, .caseInsensitive]) {
+            return html.replacingCharacters(in: head, with: html[head] + meta)
+        }
+        if let doctype = html.range(of: "<!doctype[^>]*>", options: [.regularExpression, .caseInsensitive]) {
+            return html.replacingCharacters(in: doctype, with: html[doctype] + "<head>" + meta + "</head>")
+        }
+        return "<head>" + meta + "</head>" + html
+    }
+
+    /// Blocks every load except data: URLs (and the about:blank document).
+    static let ruleJSON = """
+        [{"trigger":{"url-filter":".*"},"action":{"type":"block"}},
+         {"trigger":{"url-filter":"^data:"},"action":{"type":"ignore-previous-rules"}},
+         {"trigger":{"url-filter":"^about:"},"action":{"type":"ignore-previous-rules"}}]
+        """
+
+    private static var compiled: WKContentRuleList?
+
+    static func dataOnlyRules() async throws -> WKContentRuleList {
+        if let compiled { return compiled }
+        guard let store = WKContentRuleListStore.default(),
+              let list = try await store.compileContentRuleList(forIdentifier: "taisce-pdf-data-only", encodedContentRuleList: ruleJSON)
+        else { throw PDFExportError.rendererStopped }
+        compiled = list
+        return list
     }
 
     /// UIPrintPageRenderer over the web view's print formatter: real page breaks.
@@ -136,7 +189,23 @@ enum PDFExportError: LocalizedError {
 struct PDFExportFile: Identifiable, Equatable {
     let url: URL
     let layout: PDFLayout
+    /// what didn't make it, or that it came from this device's copy
+    var notes: [String] = []
     var id: URL { url }
+
+    static var root: URL { FileManager.default.temporaryDirectory.appending(path: "pdf-export", directoryHint: .isDirectory) }
+
+    /// The export's own folder goes once the file was saved or shared.
+    func cleanUp() {
+        let dir = url.deletingLastPathComponent()
+        guard dir.deletingLastPathComponent().standardizedFileURL == Self.root.standardizedFileURL else { return }
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    /// At launch: whatever an earlier run left behind.
+    static func sweep(root: URL = PDFExportFile.root) {
+        try? FileManager.default.removeItem(at: root)
+    }
 
     /// The doc title as a file name: no path separators or colons, not empty, not too long.
     static func filename(_ title: String) -> String {
@@ -150,18 +219,20 @@ struct PDFExportFile: Identifiable, Equatable {
 }
 
 extension AppModel {
-    /// The doc as PDF: a light-theme snapshot (paper), the server's page
-    /// for it, printed to pages.
-    func exportPDF(_ docID: DocID) async throws -> PDFExportFile {
+    /// The doc as PDF: a light-theme snapshot (paper; this device's copy if
+    /// the server can't be reached, with a note), the server's page for it,
+    /// printed to pages. The file sits in a folder of its own under
+    /// tmp/pdf-export until `PDFExportFile.cleanUp`.
+    func exportPDF(_ docID: DocID, fetchImages: Bool) async throws -> PDFExportFile {
         guard authPhase == .signedIn, let api else { throw ShareLinkError.notAvailable }
-        let built = try await shareSnapshot(docID, theme: .light)
+        let built = try await shareSnapshot(docID, theme: .light, fetchImages: fetchImages, purpose: .pdf)
         let html = try await api.sharePreviewHTML(built.snapshot)
         let (data, layout) = try await PDFRenderer.pdf(html: html, title: built.snapshot.title)
-        let dir = FileManager.default.temporaryDirectory.appending(path: "pdf-export/\(UUID().uuidString)", directoryHint: .isDirectory)
+        let dir = PDFExportFile.root.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appending(path: PDFExportFile.filename(built.snapshot.title))
         try data.write(to: url, options: .atomic)
-        return PDFExportFile(url: url, layout: layout)
+        return PDFExportFile(url: url, layout: layout, notes: built.problems)
     }
 }
 

@@ -17,14 +17,6 @@ struct DocScreen: View {
     @State private var editable = false
     @State private var opening = false
     @State private var movingWorkspace = false // workspaces
-    // share links and PDF export (SERVER mode)
-    @State private var sharing = false
-    @State private var showingLinkComments = false
-    @State private var exportingPDF = false
-    @State private var pdfFile: PDFExportFile?
-    @State private var savingPDF = false
-    @State private var pdfError: String?
-    @State private var pdfDocument: PDFDocumentFile?
     @AppStorage(DocTextSize.key) private var textSize = DocTextSize.actual
 
     var body: some View {
@@ -89,49 +81,8 @@ struct DocScreen: View {
         .onChange(of: access.canEdit) { _, can in
             if !can, editor != nil { Task { await finishEditing() } }
         }
-        // the menu bar's Share Link… / Export as PDF…, or a comment push
-        .onChange(of: router.docAction, initial: true) { _, action in
-            guard let action, action.doc == docID else { return }
-            router.docAction = nil
-            switch action.kind {
-            case .shareLink: if model.shareLinks.isAvailable, access.canEdit { sharing = true }
-            case .exportPDF: exportPDF()
-            case .linkComments: showingLinkComments = true
-            }
-        }
-        .task(id: docID) {
-            guard model.shareLinks.isAvailable else { return }
-            try? await model.shareLinks.load(doc: docID)
-        }
-        .sheet(isPresented: $sharing) { ShareLinkSheet(docID: docID) }
-        .alert("Couldn't export the PDF", isPresented: Binding(get: { pdfError != nil }, set: { if !$0 { pdfError = nil } })) {
-            Button("OK", role: .cancel) { pdfError = nil }
-        } message: {
-            Text(pdfError ?? "")
-        }
-        .sheet(isPresented: $showingLinkComments) {
-            NavigationStack {
-                LinkCommentsScreen(docID: docID)
-                    .toolbar {
-                        ToolbarItem(placement: .confirmationAction) { Button("Done") { showingLinkComments = false } }
-                    }
-            }
-            .tint(Theme.accent)
-        }
-        #if targetEnvironment(macCatalyst)
-        .fileExporter(
-            isPresented: $savingPDF,
-            document: pdfDocument,
-            contentType: .pdf,
-            defaultFilename: pdfFile?.url.lastPathComponent
-        ) { result in
-            if case let .failure(error) = result { model.lastError = error.localizedDescription }
-            pdfFile = nil
-            pdfDocument = nil
-        }
-        #else
-        .sheet(item: $pdfFile) { file in ActivityView(items: [file.url]).presentationDetents([.medium, .large]) }
-        #endif
+        // Share link…, Export as PDF… and link comments (menus, the menu bar, a comment push)
+        .modifier(DocShareActions(docID: docID, canShare: access.canEdit, pageLoaded: page != nil))
         .onChange(of: editor == nil) { _, closed in
             if !closed {
                 router.editingDoc = docID
@@ -189,11 +140,10 @@ struct DocScreen: View {
             docID: docID,
             canEdit: editable && access.canEdit,
             linkComments: model.shareLinks.isAvailable ? model.shareLinks.commentSummary(for: docID).title : nil,
-            onOpenLinkComments: { showingLinkComments = true },
+            onOpenLinkComments: { router.request(.linkComments, on: docID) },
             // ADR 0004: creating or updating a link needs owner or editor
-            onShareLink: model.shareLinks.isAvailable && access.canEdit && page != nil ? { sharing = true } : nil,
-            onExportPDF: model.shareLinks.isAvailable && page != nil && !exportingPDF ? { exportPDF() } : nil,
-            exportingPDF: exportingPDF
+            onShareLink: model.shareLinks.isAvailable && access.canEdit && page != nil ? { router.request(.shareLink, on: docID) } : nil,
+            onExportPDF: model.shareLinks.isAvailable && page != nil ? { router.request(.exportPDF, on: docID) } : nil
         )
         .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
         // children's "edited … ago" (a handful; each is cached until it changes)
@@ -208,26 +158,6 @@ struct DocScreen: View {
             }
             return .systemAction
         })
-    }
-
-    /// PDF export: the server's page for a light snapshot, printed. The
-    /// Mac asks where to save it; the iPhone hands it to the share sheet.
-    private func exportPDF() {
-        guard !exportingPDF, model.shareLinks.isAvailable else { return }
-        exportingPDF = true
-        Task {
-            defer { exportingPDF = false }
-            do {
-                let file = try await model.exportPDF(docID)
-                pdfFile = file
-                #if targetEnvironment(macCatalyst)
-                pdfDocument = PDFDocumentFile(data: try Data(contentsOf: file.url))
-                savingPDF = true
-                #endif
-            } catch {
-                pdfError = ShareErrorText.message(error)
-            }
-        }
     }
 
     /// Canvases and federation mirrors are read-only here.

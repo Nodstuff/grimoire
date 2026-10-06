@@ -10,13 +10,15 @@ final class ShareLinkStore {
     @ObservationIgnored weak var app: AppModel?
     /// tests: a fake server and a fixed snapshot
     @ObservationIgnored var serviceOverride: (any ShareService)?
-    @ObservationIgnored var snapshotOverride: ((DocID, ShareSnapshot.Theme) async throws -> ShareSnapshotResult)?
+    @ObservationIgnored var snapshotOverride: ((DocID, ShareSnapshot.Theme, Bool) async throws -> ShareSnapshotResult)?
 
     private(set) var byDoc: [DocID: [Share]] = [:]
     private(set) var all: [Share] = []
     private(set) var allLoaded = false
-    /// what the last publish left out or couldn't draw
-    private(set) var lastProblems: [String] = []
+    /// what each doc's last publish left out or couldn't draw
+    private(set) var problems: [DocID: [String]] = [:]
+    /// each doc's last publish carried edits still in the outbox
+    private(set) var unsentEdits: [DocID: Bool] = [:]
 
     var isAvailable: Bool {
         serviceOverride != nil || app?.authPhase == .signedIn
@@ -34,7 +36,14 @@ final class ShareLinkStore {
         byDoc = [:]
         all = []
         allLoaded = false
-        lastProblems = []
+        problems = [:]
+        unsentEdits = [:]
+    }
+
+    /// The sheet opening afresh: an earlier publish's notes no longer apply.
+    func clearNotes(for doc: DocID) {
+        problems[doc] = nil
+        unsentEdits[doc] = nil
     }
 
     // MARK: reading
@@ -63,26 +72,41 @@ final class ShareLinkStore {
 
     // MARK: publishing
 
-    func create(doc: DocID, expiresAt: Date?, commentsEnabled: Bool, theme: ShareSnapshot.Theme) async throws -> Share {
-        let built = try await snapshot(doc, theme)
-        lastProblems = built.problems
+    /// Build, then (unless cancelled meanwhile: the sheet closed) publish.
+    /// The expiry is resolved after the build, just before the POST, so a
+    /// slow build can't send a custom date that has come too close.
+    func create(doc: DocID, expiry: ShareExpiry, custom: Date?, commentsEnabled: Bool, theme: ShareSnapshot.Theme, fetchImages: Bool) async throws -> Share {
+        let service = try service
+        let built = try await snapshot(doc, theme, fetchImages)
+        note(built, for: doc)
+        try Task.checkCancellation()
+        let expiresAt = try expiry.resolve(custom: custom)
         let share = try await service.createShare(docID: doc, snapshot: built.snapshot, expiresAt: expiresAt, commentsEnabled: commentsEnabled)
         apply(share)
         return share
     }
 
     /// Update link: the doc as it is now, at the same URL.
-    func republish(_ share: Share, theme: ShareSnapshot.Theme) async throws {
-        let built = try await snapshot(share.docID, theme)
-        lastProblems = built.problems
+    func republish(_ share: Share, theme: ShareSnapshot.Theme, fetchImages: Bool) async throws {
+        let service = try service
+        let built = try await snapshot(share.docID, theme, fetchImages)
+        note(built, for: share.docID)
+        try Task.checkCancellation()
         apply(try await service.updateShare(share.id, snapshot: built.snapshot, expiresAt: .keep, commentsEnabled: nil))
+    }
+
+    private func note(_ built: ShareSnapshotResult, for doc: DocID) {
+        problems[doc] = built.problems.isEmpty ? nil : built.problems
+        unsentEdits[doc] = built.includesUnsentEdits
     }
 
     func setComments(_ share: Share, enabled: Bool) async throws {
         apply(try await service.updateShare(share.id, snapshot: nil, expiresAt: .keep, commentsEnabled: enabled))
     }
 
-    func setExpiry(_ share: Share, to date: Date?) async throws {
+    /// A new expiry, for a live or an expired link (the server refuses a revoked one).
+    func setExpiry(_ share: Share, expiry: ShareExpiry, custom: Date?) async throws {
+        let date = try expiry.resolve(custom: custom)
         apply(try await service.updateShare(share.id, snapshot: nil, expiresAt: .set(date), commentsEnabled: nil))
     }
 
@@ -119,19 +143,24 @@ final class ShareLinkStore {
         return c
     }
 
+    /// Deleting a comment takes its replies too: the counts come back from the server.
     func delete(_ comment: ShareComment, on share: Share) async throws {
         try await service.deleteShareComment(share.id, commentID: comment.id)
-        var s = share
-        s.commentCount = max(0, s.commentCount - 1)
-        apply(s)
+        try await load(doc: share.docID)
+    }
+
+    /// A comment push in the foreground: that doc's badges, and the list's.
+    func commentArrived(on doc: DocID) async {
+        try? await load(doc: doc)
+        if allLoaded { try? await loadAll() }
     }
 
     // MARK: plumbing
 
-    private func snapshot(_ doc: DocID, _ theme: ShareSnapshot.Theme) async throws -> ShareSnapshotResult {
-        if let snapshotOverride { return try await snapshotOverride(doc, theme) }
+    private func snapshot(_ doc: DocID, _ theme: ShareSnapshot.Theme, _ fetchImages: Bool) async throws -> ShareSnapshotResult {
+        if let snapshotOverride { return try await snapshotOverride(doc, theme, fetchImages) }
         guard let app else { throw ShareLinkError.notAvailable }
-        return try await app.shareSnapshot(doc, theme: theme)
+        return try await app.shareSnapshot(doc, theme: theme, fetchImages: fetchImages, purpose: .link)
     }
 
     /// A share the server answered with (or changed here) replaces its row everywhere.
@@ -168,6 +197,7 @@ enum ShareErrorText {
         switch error {
         case let e as ShareAPIError: return e.localizedDescription
         case let e as ShareLinkError: return e.localizedDescription
+        case let e as ShareExpiryTooSoon: return e.localizedDescription
         case let e as APIError:
             switch e {
             case let .server(m), let .notFound(m): return m

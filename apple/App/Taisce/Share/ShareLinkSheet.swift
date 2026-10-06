@@ -36,6 +36,10 @@ struct ShareLinkForm: View {
     @State private var expiry = ShareExpiry.default
     @State private var customDate = Date.now.addingTimeInterval(14 * 86400)
     @State private var commentsOn = true
+    /// the publish in flight: cancelled if the sheet closes
+    @State private var publishTask: Task<Void, Never>?
+    @State private var visible = false
+    @State private var imageQuestion: ImageQuestion?
 
     private var store: ShareLinkStore { model.shareLinks }
     private var title: String { model.index.byID[docID]?.title ?? "This doc" }
@@ -82,9 +86,18 @@ struct ShareLinkForm: View {
                 }
                 .listRowBackground(Theme.surface)
             }
-            if !store.lastProblems.isEmpty {
+            if store.unsentEdits[docID] == true {
+                Section {
+                    Label("Includes unsent edits: changes on this device that haven't reached the server yet.", systemImage: "arrow.up.circle")
+                        .font(.footnote)
+                        .foregroundStyle(Theme.amber)
+                        .accessibilityIdentifier("share.unsent")
+                }
+                .listRowBackground(Theme.surface)
+            }
+            if let problems = store.problems[docID], !problems.isEmpty {
                 Section("Not everything made it") {
-                    ForEach(store.lastProblems, id: \.self) { Text($0).font(.footnote).foregroundStyle(Theme.amber) }
+                    ForEach(problems, id: \.self) { Text($0).font(.footnote).foregroundStyle(Theme.amber) }
                 }
                 .listRowBackground(Theme.surface)
             }
@@ -94,6 +107,22 @@ struct ShareLinkForm: View {
             }
         }
         .groundBackground()
+        .onAppear {
+            visible = true
+            if only == nil { store.clearNotes(for: docID) }
+        }
+        .onDisappear {
+            visible = false
+            publishTask?.cancel()
+            publishTask = nil
+        }
+        .confirmationDialog(imageQuestion?.title ?? "", isPresented: Binding(get: { imageQuestion != nil }, set: { if !$0 { imageQuestion = nil } }), titleVisibility: .visible) {
+            Button(ImageQuestion.include) { imageQuestion = nil; startCreate(fetchImages: true) }
+            Button(ImageQuestion.keepLinks) { imageQuestion = nil; startCreate(fetchImages: false) }
+            Button("Cancel", role: .cancel) { imageQuestion = nil }
+        } message: {
+            Text(ImageQuestion.message)
+        }
         .task(id: docID) {
             do {
                 try await store.load(doc: docID)
@@ -111,7 +140,7 @@ struct ShareLinkForm: View {
             Toggle("Allow comments", isOn: $commentsOn)
                 .accessibilityIdentifier("share.comments")
             Button {
-                Task { await create() }
+                Task { await askThenCreate() }
             } label: {
                 HStack {
                     Text(creating ? "Publishing\u{2026}" : "Create link")
@@ -131,18 +160,34 @@ struct ShareLinkForm: View {
         .listRowBackground(Theme.surface)
     }
 
-    private func create() async {
+    /// Linked images on other sites: ask before fetching any.
+    private func askThenCreate() async {
+        guard !creating else { return }
+        let hosts = await model.linkedImageHosts(docID)
+        let count = await model.linkedImageCount(docID)
+        if count > 0 {
+            imageQuestion = ImageQuestion(count: count, hosts: hosts)
+        } else {
+            startCreate(fetchImages: false)
+        }
+    }
+
+    private func startCreate(fetchImages: Bool) {
+        publishTask?.cancel()
         creating = true
-        defer { creating = false }
-        do {
-            let share = try await store.create(
-                doc: docID, expiresAt: expiry.date(custom: customDate), commentsEnabled: commentsOn, theme: ShareSnapshot.Theme(scheme)
-            )
-            UIPasteboard.general.string = share.url
-            newLink = false
-            error = nil
-        } catch {
-            self.error = ShareErrorText.message(error)
+        let (expiry, custom, comments, theme) = (expiry, customDate, commentsOn, ShareSnapshot.Theme(scheme))
+        publishTask = Task {
+            defer { creating = false }
+            do {
+                let share = try await store.create(doc: docID, expiry: expiry, custom: custom, commentsEnabled: comments, theme: theme, fetchImages: fetchImages)
+                // only into the clipboard if the person is still looking
+                if visible, !Task.isCancelled { UIPasteboard.general.string = share.url }
+                newLink = false
+                error = nil
+            } catch is CancellationError {
+            } catch {
+                self.error = ShareErrorText.message(error)
+            }
         }
     }
 }
@@ -159,7 +204,7 @@ struct ExpiryPicker: View {
         }
         .accessibilityIdentifier("share.expiry")
         if expiry == .custom {
-            DatePicker("Expires on", selection: $customDate, in: Date.now.addingTimeInterval(60)..., displayedComponents: [.date, .hourAndMinute])
+            DatePicker("Expires on", selection: $customDate, in: Date.now.addingTimeInterval(ShareExpiry.minimumLead + 60)..., displayedComponents: [.date, .hourAndMinute])
         }
     }
 }
@@ -179,6 +224,8 @@ struct ShareLinkSection: View {
     @State private var changingExpiry = false
     @State private var expiry = ShareExpiry.default
     @State private var customDate = Date.now.addingTimeInterval(14 * 86400)
+    @State private var current: Task<Void, Never>?
+    @State private var imageQuestion: ImageQuestion?
 
     private var store: ShareLinkStore { model.shareLinks }
 
@@ -224,7 +271,7 @@ struct ShareLinkSection: View {
                 }
             }
             Button {
-                run("update") { try await store.republish(share, theme: theme) }
+                Task { await askThenUpdate() }
             } label: {
                 busyLabel("Update link", icon: "arrow.triangle.2.circlepath", key: "update")
             }
@@ -236,9 +283,9 @@ struct ShareLinkSection: View {
                     Button("Cancel") { changingExpiry = false }.buttonStyle(.borderless)
                     Spacer()
                     Button("Apply") {
-                        let date = expiry.date(custom: customDate)
+                        let (expiry, custom) = (expiry, customDate)
                         run("expiry") {
-                            try await store.setExpiry(share, to: date)
+                            try await store.setExpiry(share, expiry: expiry, custom: custom)
                             changingExpiry = false
                         }
                     }
@@ -246,7 +293,11 @@ struct ShareLinkSection: View {
                     .disabled(busy != nil)
                 }
             } else {
-                Button("Change expiry\u{2026}", systemImage: "clock") { changingExpiry = true }
+                Button("Change expiry\u{2026}", systemImage: "clock") {
+                    (expiry, customDate) = ExpirySeed.seed(share.expiresAt)
+                    changingExpiry = true
+                }
+                .accessibilityIdentifier("share.changeExpiry")
             }
             if share.state(now: now) == .expired {
                 Text("This link has expired: readers see that it's gone. Give it a new expiry to open it again.")
@@ -265,6 +316,17 @@ struct ShareLinkSection: View {
             }
         }
         .listRowBackground(Theme.surface)
+        .onDisappear {
+            current?.cancel()
+            current = nil
+        }
+        .confirmationDialog(imageQuestion?.title ?? "", isPresented: Binding(get: { imageQuestion != nil }, set: { if !$0 { imageQuestion = nil } }), titleVisibility: .visible) {
+            Button(ImageQuestion.include) { imageQuestion = nil; update(fetchImages: true) }
+            Button(ImageQuestion.keepLinks) { imageQuestion = nil; update(fetchImages: false) }
+            Button("Cancel", role: .cancel) { imageQuestion = nil }
+        } message: {
+            Text(ImageQuestion.message)
+        }
         .confirmationDialog("Revoke this link?", isPresented: $confirmRevoke, titleVisibility: .visible) {
             Button("Revoke", role: .destructive) { run("revoke") { try await store.revoke(share) } }
             Button("Cancel", role: .cancel) {}
@@ -280,12 +342,28 @@ struct ShareLinkSection: View {
         }
     }
 
+    private func askThenUpdate() async {
+        guard busy == nil else { return }
+        let count = await model.linkedImageCount(share.docID)
+        if count > 0 {
+            imageQuestion = ImageQuestion(count: count, hosts: await model.linkedImageHosts(share.docID))
+        } else {
+            update(fetchImages: false)
+        }
+    }
+
+    private func update(fetchImages: Bool) {
+        let theme = theme
+        run("update") { try await store.republish(share, theme: theme, fetchImages: fetchImages) }
+    }
+
     private func run(_ key: String, _ work: @escaping @MainActor () async throws -> Void) {
         busy = key
-        Task {
+        current = Task {
             do {
                 try await work()
                 error = nil
+            } catch is CancellationError {
             } catch {
                 self.error = ShareErrorText.message(error)
             }
@@ -352,5 +430,15 @@ struct UnreadBadge: View {
             .padding(.vertical, 1)
             .background(Theme.accent, in: Capsule())
             .accessibilityLabel("\(count) new")
+    }
+}
+
+/// Change expiry starts from the link's own: its date if still ahead,
+/// "never" for a link without one, else the default (an expired link).
+enum ExpirySeed {
+    static func seed(_ current: Date?, now: Date = .now) -> (ShareExpiry, Date) {
+        guard let current else { return (.never, now.addingTimeInterval(14 * 86400)) }
+        if current > now.addingTimeInterval(ShareExpiry.minimumLead) { return (.custom, current) }
+        return (.default, now.addingTimeInterval(14 * 86400))
     }
 }

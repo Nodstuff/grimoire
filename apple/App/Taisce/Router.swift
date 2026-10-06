@@ -46,6 +46,12 @@ struct DocAction: Equatable {
     var doc: DocID
     var kind: Kind
     var serial: Int
+    var at: Date = .now
+
+    /// How long a request waits for its doc's screen.
+    static let lifetime: TimeInterval = 15
+
+    func isFresh(now: Date = .now) -> Bool { now.timeIntervalSince(at) < Self.lifetime }
 }
 
 /// Which tab / sidebar item is showing and each stack's path. One per
