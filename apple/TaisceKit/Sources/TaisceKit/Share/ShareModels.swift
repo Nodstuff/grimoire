@@ -314,3 +314,23 @@ public enum ShareExpiry: Sendable, Hashable, CaseIterable, Identifiable {
         }
     }
 }
+
+/// A custom expiry too close to now (by the time the snapshot was built and sent).
+public struct ShareExpiryTooSoon: Error, Sendable, Hashable, LocalizedError {
+    public init() {}
+    public var errorDescription: String? { "Pick an expiry at least 5 minutes from now." }
+}
+
+extension ShareExpiry {
+    /// A custom date must be at least this far ahead when the request goes out.
+    public static let minimumLead: TimeInterval = 5 * 60
+
+    /// The `expires_at` to send now (nil = never), checked: a custom date
+    /// less than `minimumLead` away throws. Call it after the build, just
+    /// before the request, so a slow build cannot send a date in the past.
+    public func resolve(now: Date = .now, custom: Date?) throws -> Date? {
+        let d = date(from: now, custom: custom)
+        if self == .custom, let d, d < now.addingTimeInterval(Self.minimumLead) { throw ShareExpiryTooSoon() }
+        return d
+    }
+}

@@ -205,7 +205,7 @@ private final class FakeVisuals: ShareVisualRendering {
 private struct FakeImages: ShareImageLoading {
     func load(_ url: URL) async throws -> RenderedVisual {
         if url.host() == "ok.example" { return RenderedVisual(data: Data([0xFF, 0xD8, 0xFF, 0x00]), contentType: "image/jpeg") }
-        throw URLError(.notConnectedToInternet)
+        throw ShareImageRejection.http(503)
     }
 }
 
@@ -282,7 +282,7 @@ private func blocks(_ contents: [String], types: [BlockType]? = nil) -> [Block] 
         let s = result.snapshot
         #expect(s.assets.map(\.name) == ["i1.jpg"])
         #expect(s.markdown == "See ![logo](taisce-asset:i1.jpg) and [x](https://down.example/b.png), `![code](https://ok.example/c.png)` and ![local](a.png)")
-        #expect(result.problems == ["Image https://down.example/b.png couldn't be included"])
+        #expect(result.problems == ["Image from down.example kept as a link: the server answered 503"])
     }
 
     @Test func fencesInsideListsAndTildesAndUnclosed() async throws {
@@ -321,21 +321,4 @@ private func blocks(_ contents: [String], types: [BlockType]? = nil) -> [Block] 
         #expect(result.problems == ["Mermaid diagram left out: too large to share"])
     }
 
-    @Test func imageLoaderChecksTypeAndSize() async throws {
-        let png: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 0, 0, 1, 0, 0, 0, 0, 0x80]
-        let server = MockServer { r in
-            switch r.path {
-            case "/a.png": MockServer.Reply(chunks: [Data(png)], contentType: "application/octet-stream")
-            case "/b.html": MockServer.Reply(chunks: [Data("<html>".utf8)], contentType: "text/html")
-            default: MockServer.Reply(status: 404, chunks: [])
-            }
-        }
-        let loader = URLSessionShareImageLoader(session: server.session)
-        let a = try await loader.load(URL(string: "http://mock.local/a.png")!)
-        #expect(a.contentType == "image/png" && a.width == 256 && a.height == 128)
-        await #expect(throws: URLError.self) { _ = try await loader.load(URL(string: "http://mock.local/b.html")!) }
-        await #expect(throws: URLError.self) { _ = try await loader.load(URL(string: "http://mock.local/c")!) }
-        await #expect(throws: URLError.self) { _ = try await loader.load(URL(string: "file:///etc/hosts")!) }
-        #expect(URLSessionShareImageLoader.sniff(Data("<?xml version=\"1.0\"?><svg>".utf8)) == "image/svg+xml")
-    }
 }

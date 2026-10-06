@@ -81,27 +81,38 @@ public struct ShareSnapshotResult: Sendable, Hashable {
     public var snapshot: ShareSnapshot
     /// one line per visual or image that failed or was left out
     public var problems: [String]
+    /// the blocks included edits still waiting in this device's outbox
+    public var includesUnsentEdits: Bool
 
-    public init(snapshot: ShareSnapshot, problems: [String] = []) {
+    public init(snapshot: ShareSnapshot, problems: [String] = [], includesUnsentEdits: Bool = false) {
         self.snapshot = snapshot
         self.problems = problems
+        self.includesUnsentEdits = includesUnsentEdits
     }
 }
 
 /// Turns a doc into the snapshot a share link publishes:
 ///
-/// - blocks in document order, comments and deleted blocks left out;
+/// - blocks in document order, of the published types only (`publishedTypes`;
+///   comments, canvases and anything unknown stay out);
 /// - frontmatter stripped, and a leading H1 that repeats the title (the page shows the title);
 /// - each mermaid / reladraw / vega-lite fence drawn by `renderer` and
 ///   replaced by `![alt](taisce-asset:dN.svg)`; every render waits at most
 ///   `timeout`, and a failure becomes a small SVG card saying so (never a gap);
-/// - `![alt](https://…)` images fetched by `images` when they can be (else
-///   the image becomes a plain link), within the server's limits.
+/// - `![alt](https://…)` images fetched by `images` (`SafeShareImageLoader`)
+///   when given and allowed, else kept as a plain link; within the server's limits.
 public struct ShareSnapshotBuilder: Sendable {
     public var renderer: any ShareVisualRendering
+    /// nil: linked images stay links (the person chose not to fetch them)
     public var images: (any ShareImageLoading)?
     public var timeout: Duration
     public var imageTimeout: Duration
+
+    /// The block types a link publishes. Everything else is left out.
+    public static let publishedTypes: Set<String> = [
+        BlockType.paragraph.rawValue, BlockType.heading.rawValue, BlockType.code.rawValue,
+        BlockType.diagramMermaid.rawValue, BlockType.diagramD2.rawValue, BlockType.decision.rawValue,
+    ]
 
     public init(renderer: any ShareVisualRendering, images: (any ShareImageLoading)? = nil, timeout: Duration = .seconds(15), imageTimeout: Duration = .seconds(10)) {
         self.renderer = renderer
@@ -110,38 +121,26 @@ public struct ShareSnapshotBuilder: Sendable {
         self.imageTimeout = imageTimeout
     }
 
-    public func build(title: String, blocks: [Block], theme: ShareSnapshot.Theme) async -> ShareSnapshotResult {
-        let kept = blocks.filter { !$0.deleted && $0.blockType != .comment && $0.blockType != .canvasScene }
-        let tables = ChartTables(blocks: kept.map { (id: $0.id, nodes: BlockRenderer.render($0)) })
-        let diagramTheme: DiagramTheme = theme == .dark ? .dark : .light
-
-        // 1. markdown with placeholders, and the work list
-        var parts: [String] = []
-        var pieces: [Piece] = []
-        for (i, b) in kept.enumerated() {
-            var content = b.content
-            if i == 0 || parts.isEmpty {
-                content = Self.strippingFrontmatter(content)
-                content = Self.strippingTitleHeading(content, title: title)
-            }
-            if case .diagramMermaid = b.blockType {
-                let body = BlockRenderer.fenceBody(content)
-                pieces.append(.visual(ShareVisual(kind: .mermaid, source: body, theme: diagramTheme, tables: tables)))
-                parts.append(Self.token(pieces.count - 1))
-                continue
-            }
-            let (text, found) = Self.scan(content, theme: diagramTheme, tables: tables, startAt: pieces.count)
-            pieces.append(contentsOf: found)
-            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { parts.append(text) }
+    /// The linked images a build would fetch (http and https), in order: the
+    /// share sheet asks about their hosts first.
+    public static func linkedImages(title: String, blocks: [Block]) -> [URL] {
+        prepare(title: title, blocks: blocks, theme: .light).pieces.compactMap {
+            if case let .image(_, url, _) = $0 { return url }
+            return nil
         }
-        var markdown = parts.joined(separator: "\n\n")
+    }
 
-        // 2. draw / fetch, one at a time, each bounded
+    public func build(title: String, blocks: [Block], theme: ShareSnapshot.Theme) async -> ShareSnapshotResult {
+        let diagramTheme: DiagramTheme = theme == .dark ? .dark : .light
+        let prepared = Self.prepare(title: title, blocks: blocks, theme: diagramTheme)
+        var markdown = prepared.markdown
+        var problems = prepared.problems
+
+        // draw / fetch, one at a time, each bounded
         var assets: [ShareAsset] = []
-        var problems: [String] = []
         var total = markdown.utf8.count
         var diagramN = 0, imageN = 0
-        for (index, piece) in pieces.enumerated() {
+        for (index, piece) in prepared.pieces.enumerated() {
             let replacement: String
             switch piece {
             case let .visual(v):
@@ -171,20 +170,67 @@ public struct ShareSnapshotBuilder: Sendable {
                     }
                 }
             case let .image(alt, url, original):
+                // the share page only shows its own images: anything not fetched stays a link
+                let link = "[\(alt.isEmpty ? "Image" : alt)](\(original))"
+                guard images != nil else {
+                    replacement = link
+                    break
+                }
                 imageN += 1
-                if let r = await fetch(url), let asset = Self.admit(r, name: "i\(imageN).\(r.fileExtension)", assets: assets, total: total) {
-                    assets.append(asset)
-                    total += asset.data.count / 3 * 4
-                    replacement = "![\(alt)](taisce-asset:\(asset.name))"
-                } else {
-                    problems.append("Image \(url.absoluteString) couldn't be included")
-                    // the share page only shows its own images: keep it reachable as a link
-                    replacement = "[\(alt.isEmpty ? "Image" : alt)](\(original))"
+                switch await fetch(url) {
+                case let .success(r):
+                    if let asset = Self.admit(r, name: "i\(imageN).\(r.fileExtension)", assets: assets, total: total) {
+                        assets.append(asset)
+                        total += asset.data.count / 3 * 4
+                        replacement = "![\(alt)](taisce-asset:\(asset.name))"
+                    } else {
+                        problems.append("Image from \(url.host() ?? "?") kept as a link: too large to share")
+                        replacement = link
+                    }
+                case let .failure(why):
+                    problems.append("Image from \(url.host() ?? "?") kept as a link: \(why.message)")
+                    replacement = link
                 }
             }
             markdown = markdown.replacingOccurrences(of: Self.token(index), with: replacement)
         }
         return ShareSnapshotResult(snapshot: ShareSnapshot(title: title, markdown: markdown, assets: assets, theme: theme), problems: problems)
+    }
+
+    struct Prepared {
+        var markdown: String
+        var pieces: [Piece]
+        var problems: [String]
+    }
+
+    /// The markdown with placeholders, the work list, and what was left out.
+    static func prepare(title: String, blocks: [Block], theme: DiagramTheme) -> Prepared {
+        var problems: [String] = []
+        let live = blocks.filter { !$0.deleted }
+        let kept = live.filter { publishedTypes.contains($0.blockType.rawValue) }
+        let skipped = Set(live.map(\.blockType.rawValue)).subtracting(publishedTypes).subtracting([BlockType.comment.rawValue])
+        for type in skipped.sorted() {
+            problems.append(type == BlockType.canvasScene.rawValue ? "Canvases aren't shared" : "A block of type \u{201C}\(type)\u{201D} was left out")
+        }
+        let tables = ChartTables(blocks: kept.map { (id: $0.id, nodes: BlockRenderer.render($0)) })
+        var parts: [String] = []
+        var pieces: [Piece] = []
+        for b in kept {
+            var content = b.content
+            if parts.isEmpty {
+                content = strippingFrontmatter(content)
+                content = strippingTitleHeading(content, title: title)
+            }
+            if case .diagramMermaid = b.blockType {
+                pieces.append(.visual(ShareVisual(kind: .mermaid, source: BlockRenderer.fenceBody(content), theme: theme, tables: tables)))
+                parts.append(token(pieces.count - 1))
+                continue
+            }
+            let (text, found) = scan(content, theme: theme, tables: tables, startAt: pieces.count)
+            pieces.append(contentsOf: found)
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { parts.append(text) }
+        }
+        return Prepared(markdown: parts.joined(separator: "\n\n"), pieces: pieces, problems: problems)
     }
 
     enum Piece: Sendable {
@@ -216,10 +262,20 @@ public struct ShareSnapshotBuilder: Sendable {
         }
     }
 
-    func fetch(_ url: URL) async -> RenderedVisual? {
-        guard let images else { return nil }
-        if case let .finished(r) = await withTimeLimit(imageTimeout, { try await images.load(url) }) { return r }
-        return nil
+    func fetch(_ url: URL) async -> Result<RenderedVisual, ShareRenderFailure> {
+        guard let images else { return .failure(ShareRenderFailure(message: "not fetched")) }
+        let limited = await withTimeLimit(imageTimeout) { () async -> Result<RenderedVisual, ShareRenderFailure> in
+            do {
+                return .success(try await images.load(url))
+            } catch {
+                return .failure(ShareRenderFailure(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription))
+            }
+        }
+        switch limited {
+        case let .finished(r): return r
+        case .timedOut: return .failure(ShareRenderFailure(message: "it took too long"))
+        case let .threw(m): return .failure(ShareRenderFailure(message: m))
+        }
     }
 
     /// A placeholder no doc contains (U+E000 private use).
@@ -236,69 +292,135 @@ public struct ShareSnapshotBuilder: Sendable {
 
     // MARK: markdown
 
-    /// Fences of the visual languages become placeholders; `![](http…)`
-    /// images outside fences too. Other fences are left alone.
+    /// A line split into its container prefix (indentation and blockquote
+    /// markers) and the rest.
+    static func split(_ line: Substring) -> (prefix: Substring, rest: Substring) {
+        var i = line.startIndex
+        while i < line.endIndex {
+            let c = line[i]
+            if c == " " || c == "\t" {
+                i = line.index(after: i)
+            } else if c == ">" {
+                i = line.index(after: i)
+            } else {
+                break
+            }
+        }
+        return (line[..<i], line[i...])
+    }
+
+    /// Indentation width, tabs to the next multiple of 4.
+    static func width(_ s: Substring) -> Int {
+        s.reduce(0) { w, c in c == "\t" ? (w / 4 + 1) * 4 : w + 1 }
+    }
+
+    static func isListItem(_ rest: Substring) -> Bool {
+        if let f = rest.first, "-*+".contains(f) {
+            return rest.dropFirst().first.map { $0 == " " || $0 == "\t" } ?? true
+        }
+        let digits = rest.prefix { $0.isASCII && $0.isNumber }
+        guard !digits.isEmpty, digits.count <= 9 else { return false }
+        let after = rest.dropFirst(digits.count)
+        guard let d = after.first, d == "." || d == ")" else { return false }
+        return after.dropFirst().first.map { $0 == " " || $0 == "\t" } ?? true
+    }
+
+    /// Fences of the visual languages become placeholders, also inside
+    /// blockquotes and (tab- or space-) indented lists; `![](http…)` images
+    /// outside code too. Other fences and indented code blocks are left alone.
     static func scan(_ md: String, theme: DiagramTheme, tables: ChartTables, startAt: Int) -> (String, [Piece]) {
         var out: [String] = []
         var pieces: [Piece] = []
         var lines = md.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n", omittingEmptySubsequences: false)[...]
+        var inList = false
+        var prevBlank = true
+        var inIndentedCode = false
         while let line = lines.popFirst() {
-            let indent = line.prefix { $0 == " " }
-            let t = line.dropFirst(indent.count)
-            guard let fenceChar = t.first, fenceChar == "`" || fenceChar == "~", t.hasPrefix(String(repeating: fenceChar, count: 3)) else {
-                out.append(images(in: String(line), pieces: &pieces, startAt: startAt))
+            let (prefix, rest) = split(line)
+            let quoted = prefix.contains(">")
+            if rest.isEmpty {
+                out.append(String(line))
+                prevBlank = true
                 continue
             }
-            let fence = t.prefix { $0 == fenceChar }
-            let info = FenceInfo(String(t.dropFirst(fence.count)).trimmingCharacters(in: .whitespaces))
+            let indent = width(prefix)
+            // 4-space (or tab) indented code, outside lists and quotes: verbatim
+            if !quoted, !inList, indent >= 4, prevBlank || inIndentedCode {
+                out.append(String(line))
+                inIndentedCode = true
+                prevBlank = false
+                continue
+            }
+            inIndentedCode = false
+            if !quoted, indent < 4, isListItem(rest) {
+                inList = true
+            } else if !quoted, indent == 0, prevBlank {
+                inList = false
+            }
+            prevBlank = false
+
+            guard let fenceChar = rest.first, fenceChar == "`" || fenceChar == "~", rest.hasPrefix(String(repeating: fenceChar, count: 3)) else {
+                out.append(String(prefix) + images(in: String(rest), pieces: &pieces, startAt: startAt))
+                continue
+            }
+            let fence = rest.prefix { $0 == fenceChar }
+            let info = FenceInfo(String(rest.dropFirst(fence.count)).trimmingCharacters(in: .whitespaces))
             var body: [Substring] = []
+            var raw: [Substring] = []
             var closed = false
-            while let l = lines.popFirst() {
-                let lt = l.drop { $0 == " " }
+            while let l = lines.first {
+                // a quoted fence ends with its quote
+                let inner: Substring
+                if l.hasPrefix(prefix) {
+                    inner = l.dropFirst(prefix.count)
+                } else if quoted {
+                    break
+                } else {
+                    // a shorter indent inside a list: take what indentation there is
+                    inner = l.drop { $0 == " " || $0 == "\t" }
+                }
+                lines.removeFirst()
+                raw.append(l)
+                let lt = inner.drop { $0 == " " || $0 == "\t" }
                 if lt.hasPrefix(fence), lt.drop(while: { $0 == fenceChar }).allSatisfy(\.isWhitespace) {
                     closed = true
                     break
                 }
-                body.append(l)
+                body.append(inner)
             }
             if let lang = info.normalizedLanguage, let kind = ShareVisual.Kind(language: lang) {
-                let source = body.map { $0.hasPrefix(indent) ? String($0.dropFirst(indent.count)) : String($0) }.joined(separator: "\n")
-                pieces.append(.visual(ShareVisual(kind: kind, source: source, theme: theme, tables: tables)))
-                out.append(String(indent) + token(startAt + pieces.count - 1))
+                pieces.append(.visual(ShareVisual(kind: kind, source: body.joined(separator: "\n"), theme: theme, tables: tables)))
+                out.append(String(prefix) + token(startAt + pieces.count - 1))
             } else {
                 out.append(String(line))
-                out.append(contentsOf: body.map(String.init))
-                if closed { out.append(String(indent) + String(fence)) }
+                out.append(contentsOf: raw.map(String.init))
             }
+            _ = closed
         }
         return (out.joined(separator: "\n"), pieces)
     }
 
-    /// `![alt](http(s)://… "title")` → a placeholder. Inline code spans are skipped.
+    /// `![alt](http(s)://… "title")` → a placeholder. Inline code spans are
+    /// skipped; parentheses in the URL may nest (`(a_(b))`), and an
+    /// `<…>` destination may hold anything but `>`.
     static func images(in line: String, pieces: inout [Piece], startAt: Int) -> String {
         guard line.contains("![") else { return line }
         var result = ""
         var rest = Substring(line)
         while let open = rest.range(of: "![") {
-            // inside a code span? (an odd number of backticks before it)
-            let before = rest[..<open.lowerBound]
-            result += before
-            let ticks = (result.filter { $0 == "`" }).count
+            result += rest[..<open.lowerBound]
+            let ticks = result.filter { $0 == "`" }.count
             guard ticks % 2 == 0, let closeAlt = rest[open.upperBound...].firstIndex(of: "]"),
                   rest.index(after: closeAlt) < rest.endIndex, rest[rest.index(after: closeAlt)] == "(",
-                  let closeParen = rest[closeAlt...].firstIndex(of: ")")
+                  let (target, closeParen) = destination(rest, from: rest.index(closeAlt, offsetBy: 2))
             else {
                 result += "!["
                 rest = rest[open.upperBound...]
                 continue
             }
             let alt = String(rest[open.upperBound..<closeAlt])
-            let dest = String(rest[rest.index(closeAlt, offsetBy: 2)..<closeParen])
-            var target = dest.trimmingCharacters(in: .whitespaces)
-            if let space = target.firstIndex(of: " ") { target = String(target[..<space]) }
-            target = target.trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
             if let url = URL(string: target), let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http", url.host() != nil {
-                pieces.append(.image(alt: alt, url: url, original: target))
+                pieces.append(.image(alt: alt, url: url, original: target.contains(" ") || target.contains("(") || target.contains(")") ? "<\(target)>" : target))
                 result += token(startAt + pieces.count - 1)
             } else {
                 result += rest[open.lowerBound...closeParen]
@@ -306,6 +428,42 @@ public struct ShareSnapshotBuilder: Sendable {
             rest = rest[rest.index(after: closeParen)...]
         }
         return result + rest
+    }
+
+    /// The link destination starting at `start` (just after `(`) and the
+    /// index of the `)` that closes it, skipping an optional title.
+    static func destination(_ s: Substring, from start: Substring.Index) -> (String, Substring.Index)? {
+        var i = start
+        while i < s.endIndex, s[i] == " " { i = s.index(after: i) }
+        var target = ""
+        if i < s.endIndex, s[i] == "<" {
+            guard let close = s[i...].firstIndex(of: ">") else { return nil }
+            target = String(s[s.index(after: i)..<close])
+            i = s.index(after: close)
+        } else {
+            var depth = 0
+            while i < s.endIndex {
+                let c = s[i]
+                if c == "(" { depth += 1 }
+                if c == ")" {
+                    if depth == 0 { break }
+                    depth -= 1
+                }
+                if c == " " && depth == 0 { break }
+                target.append(c)
+                i = s.index(after: i)
+            }
+        }
+        // an optional "title" or 'title', then the closing paren
+        while i < s.endIndex, s[i] == " " { i = s.index(after: i) }
+        if i < s.endIndex, s[i] == "\"" || s[i] == "'" {
+            let q = s[i]
+            guard let endQ = s[s.index(after: i)...].firstIndex(of: q) else { return nil }
+            i = s.index(after: endQ)
+            while i < s.endIndex, s[i] == " " { i = s.index(after: i) }
+        }
+        guard i < s.endIndex, s[i] == ")" else { return nil }
+        return (target, i)
     }
 
     /// A leading `---` … `---` block goes; the rest of the block stays.
@@ -379,50 +537,6 @@ public struct ShareSnapshotBuilder: Sendable {
     static func xml(_ s: String) -> String {
         s.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;").replacingOccurrences(of: "\"", with: "&quot;")
-    }
-}
-
-/// Fetches linked images over URLSession: http(s) only, 2 MB at most, and
-/// only the types a share accepts (by header, else by magic bytes).
-public struct URLSessionShareImageLoader: ShareImageLoading {
-    let session: URLSession
-
-    public init(session: URLSession = .shared) {
-        self.session = session
-    }
-
-    public func load(_ url: URL) async throws -> RenderedVisual {
-        guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http" else { throw URLError(.unsupportedURL) }
-        var request = URLRequest(url: url, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 10)
-        request.setValue("image/*", forHTTPHeaderField: "Accept")
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), !data.isEmpty,
-              data.count <= ShareLimits.assetBytes
-        else { throw URLError(.badServerResponse) }
-        let declared = http.mimeType?.lowercased()
-        guard let type = Self.sniff(data) ?? declared.flatMap({ ShareAsset.allowedTypes.contains($0) ? $0 : nil }) else {
-            throw URLError(.cannotDecodeContentData)
-        }
-        let size = type == "image/png" ? Self.pngSize(data) : nil
-        return RenderedVisual(data: data, contentType: type, width: size?.0, height: size?.1)
-    }
-
-    static func sniff(_ d: Data) -> String? {
-        let b = [UInt8](d.prefix(16))
-        if b.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "image/png" }
-        if b.starts(with: [0xFF, 0xD8, 0xFF]) { return "image/jpeg" }
-        if b.count >= 12, b.starts(with: Array("RIFF".utf8)), Array(b[8..<12]) == Array("WEBP".utf8) { return "image/webp" }
-        let head = String(decoding: d.prefix(512), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if head.hasPrefix("<svg") || (head.hasPrefix("<?xml") && head.contains("<svg")) { return "image/svg+xml" }
-        return nil
-    }
-
-    /// Width and height from a PNG's IHDR.
-    static func pngSize(_ d: Data) -> (Int, Int)? {
-        let b = [UInt8](d.prefix(24))
-        guard b.count == 24 else { return nil }
-        func be(_ i: Int) -> Int { Int(b[i]) << 24 | Int(b[i + 1]) << 16 | Int(b[i + 2]) << 8 | Int(b[i + 3]) }
-        return (be(16), be(20))
     }
 }
 
