@@ -63,16 +63,33 @@ function svgSize(svg: string): { width?: number; height?: number } {
   return { width, height }
 }
 
+/** A diagram drawn in the editor: its fence's language and code, and the SVG. */
+export interface RenderedDiagram {
+  lang: string
+  code: string
+  svg: string
+}
+
+/** Code compared without trailing spaces or surrounding blank lines. */
+export function codeKey(lang: string, code: string): string {
+  return `${lang.toLowerCase()}\n${code.split('\n').map((l) => l.trimEnd()).join('\n').trim()}`
+}
+
 /**
- * The snapshot of a doc: `svgs[i]` is the rendered SVG of the i-th visual
- * fence in the markdown (null when it has none on screen). Frontmatter is
- * left for the server to strip.
+ * The snapshot of a doc. A visual fence becomes its image only when a drawn
+ * diagram has the same language and code (each drawing used once); one that
+ * cannot be paired stays as code, so an unpaired fence never shifts the
+ * others onto the wrong picture. Frontmatter is left for the server.
  */
-export function buildSnapshot(title: string, markdown: string, svgs: (string | null)[], theme: Snapshot['theme'] = 'auto'): Snapshot {
+export function buildSnapshot(title: string, markdown: string, drawn: RenderedDiagram[], theme: Snapshot['theme'] = 'auto'): Snapshot {
   const assets: SnapshotAsset[] = []
   const lines = markdown.split('\n')
   const out: string[] = []
-  let visual = 0
+  const pool = new Map<string, string[]>()
+  for (const d of drawn) {
+    const k = codeKey(d.lang, d.code)
+    pool.set(k, [...(pool.get(k) ?? []), d.svg])
+  }
   for (let i = 0; i < lines.length; i++) {
     const open = lines[i].match(/^(\s{0,3})(`{3,}|~{3,})\s*([\w-]+)?.*$/)
     if (!open) {
@@ -90,7 +107,7 @@ export function buildSnapshot(title: string, markdown: string, svgs: (string | n
     const lang = (open[3] ?? '').toLowerCase()
     const block = lines.slice(i, Math.min(j + 1, lines.length))
     if (VISUAL_LANGS.has(lang)) {
-      const svg = svgs[visual++] ?? null
+      const svg = pool.get(codeKey(lang, lines.slice(i + 1, j).join('\n')))?.shift()
       if (svg) {
         const name = `d${assets.length + 1}.svg`
         assets.push({ name, content_type: 'image/svg+xml', data: base64Utf8(svg), ...svgSize(svg) })
@@ -105,14 +122,15 @@ export function buildSnapshot(title: string, markdown: string, svgs: (string | n
   return { title, markdown: out.join('\n'), assets, theme }
 }
 
-/** The rendered SVG of every visual code block in the open editor, in order. */
-export function renderedDiagrams(root: ParentNode = document): (string | null)[] {
-  const out: (string | null)[] = []
+/** Every diagram drawn in the open editor, with the code it was drawn from. */
+export function renderedDiagrams(root: ParentNode = document): RenderedDiagram[] {
+  const out: RenderedDiagram[] = []
   root.querySelectorAll('.codeblock-view').forEach((v) => {
-    const lang = v.querySelector('pre')?.getAttribute('data-language')?.toLowerCase() ?? ''
-    if (!VISUAL_LANGS.has(lang)) return
+    const pre = v.querySelector('pre')
+    const lang = pre?.getAttribute('data-language')?.toLowerCase() ?? ''
     const svg = v.querySelector('.diagram svg')
-    out.push(svg ? new XMLSerializer().serializeToString(svg) : null)
+    if (!pre || !svg || !VISUAL_LANGS.has(lang)) return
+    out.push({ lang, code: pre.textContent ?? '', svg: new XMLSerializer().serializeToString(svg) })
   })
   return out
 }
