@@ -10,6 +10,23 @@
   var doc = document.getElementById("doc");
   var NAME_KEY = "taisce.share.name";
   var comments = [];
+  var panel = document.getElementById("comments");
+  var toggle = document.getElementById("comments-toggle");
+  var countEl = document.getElementById("comments-count");
+  var wide = window.matchMedia("(min-width: 1180px)");
+
+  // the drawer: closed until asked for (the toggle, a new comment, #comments)
+  function setOpen(open) {
+    document.body.classList.toggle("comments-open", open);
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) panel.removeAttribute("inert"); else panel.setAttribute("inert", "");
+  }
+  function isOpen() { return document.body.classList.contains("comments-open"); }
+  setOpen(location.hash === "#comments");
+  document.getElementById("topbar").hidden = false;
+  toggle.addEventListener("click", function () { setOpen(!isOpen()); });
+  document.getElementById("comments-close").addEventListener("click", function () { setOpen(false); toggle.focus(); });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape" && isOpen()) { setOpen(false); toggle.focus(); } });
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -72,6 +89,8 @@
     var marked = doc.querySelectorAll(".has-comments");
     for (var m = 0; m < marked.length; m++) marked[m].classList.remove("has-comments");
     var roots = comments.filter(function (c) { return !c.parent_id; });
+    countEl.textContent = comments.length ? String(comments.length) : "";
+    toggle.setAttribute("aria-label", comments.length ? "Comments (" + comments.length + ")" : "Comments");
     if (!roots.length) threadsEl.appendChild(el("p", "empty-note", "No comments yet. Select text in the document to comment on it."));
     roots.forEach(function (root) {
       var t = el("div", "thread");
@@ -81,6 +100,7 @@
         if (b) {
           b.classList.add("has-comments");
           q.addEventListener("click", function () {
+            if (!wide.matches) setOpen(false); // the drawer covers the doc here
             b.scrollIntoView({ behavior: "smooth", block: "center" });
             b.classList.add("flash");
             setTimeout(function () { b.classList.remove("flash"); }, 1200);
@@ -116,7 +136,7 @@
     fetch(api, { credentials: "omit", headers: { accept: "application/json" } })
       .then(function (r) { return r.ok ? r.json() : { comments: [], enabled: false }; })
       .then(function (j) {
-        if (j.enabled === false) { var p = document.getElementById("comments"); if (p) p.remove(); return; }
+        if (j.enabled === false) { panel.remove(); document.getElementById("topbar").remove(); document.body.classList.remove("comments-open"); return; }
         comments = j.comments || [];
         render();
       })
@@ -157,7 +177,8 @@
     t.appendChild(el("div", "quote", anchor.quote));
     t.appendChild(form({ anchor: anchor, onCancel: function () { t.remove(); } }, load));
     threadsEl.insertBefore(t, threadsEl.firstChild);
-    t.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    setOpen(true);
+    panel.scrollTop = 0;
   });
 
   load();

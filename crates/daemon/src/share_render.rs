@@ -220,10 +220,17 @@ pub fn page(p: &PageParts) -> String {
         None => String::new(),
     };
     let comments = p.nonce.is_some() && p.comments_enabled;
-    let panel = if comments {
-        "<aside id=\"comments\" class=\"comments\" aria-label=\"Comments\"><h2>Comments</h2><div id=\"threads\"></div></aside>"
+    // the toggle's bar above the page, and the drawer it slides out
+    let (bar, drawer) = if comments {
+        (
+            "<div id=\"topbar\" class=\"topbar\" hidden><button id=\"comments-toggle\" class=\"comments-toggle\" type=\"button\" aria-controls=\"comments\" aria-expanded=\"false\">\
+Comments<span id=\"comments-count\" class=\"count\"></span></button></div>",
+            "<aside id=\"comments\" class=\"comments\" aria-label=\"Comments\"><div class=\"comments-head\"><h2>Comments</h2>\
+<button id=\"comments-close\" class=\"close\" type=\"button\" aria-label=\"Close comments\">\u{00d7}</button></div>\
+<div id=\"threads\"></div></aside>",
+        )
     } else {
-        ""
+        ("", "")
     };
     format!(
         "<!doctype html>\n<html lang=\"en\" data-theme=\"{theme}\"><head><meta charset=\"utf-8\">\
@@ -231,9 +238,9 @@ pub fn page(p: &PageParts) -> String {
 <meta name=\"robots\" content=\"noindex, nofollow\"><meta name=\"referrer\" content=\"no-referrer\">\
 <meta name=\"color-scheme\" content=\"{scheme}\">\
 <title>{title}</title><style>{PAGE_CSS}</style></head>\
-<body class=\"{layout}\" data-comments=\"{on}\"><div class=\"wrap\"><main class=\"doc\"><header><h1 class=\"doc-title\">{title}</h1></header>\
+<body class=\"{layout}\" data-comments=\"{on}\">{bar}<div class=\"wrap\"><main class=\"doc\"><header><h1 class=\"doc-title\">{title}</h1></header>\
 <article id=\"doc\">{body}</article>\
-<footer class=\"foot\">Shared from Taisce · snapshot of {date}</footer></main>{panel}</div>{script}</body></html>\n",
+<footer class=\"foot\">Shared from Taisce · snapshot of {date}</footer></main>{drawer}</div>{script}</body></html>\n",
         scheme = if theme == "auto" { "light dark" } else { theme },
         title = esc(p.title),
         layout = if comments { "with-comments" } else { "plain" },
@@ -347,7 +354,12 @@ mod tests {
         assert!(p.contains("&lt;b&gt;T&lt;/b&gt;") && !p.contains("<b>T</b>"));
         assert!(p.contains("<script nonce=\"abc\">") && p.contains("data-theme=\"dark\""));
         assert!(p.contains("Shared from Taisce · snapshot of 2026-10-06"));
+        // comments are a drawer behind a toggle in a bar above the page: the
+        // bar comes before the doc, the drawer after it, both closed at first
+        let (bar, drawer, doc) = (p.find("id=\"topbar\"").unwrap(), p.find("id=\"comments\"").unwrap(), p.find("id=\"doc\"").unwrap());
+        assert!(bar < doc && doc < drawer, "{p}");
+        assert!(p.contains("aria-expanded=\"false\"") && p.contains("<body class=\"with-comments\""));
         let p = page(&PageParts { title: "T", body_html: "", theme: "x", snapshot_date: "d", nonce: None, comments_enabled: true });
-        assert!(!p.contains("<script") && p.contains("data-theme=\"auto\"") && !p.contains("id=\"comments\""));
+        assert!(!p.contains("<script") && p.contains("data-theme=\"auto\"") && !p.contains("id=\"comments\"") && !p.contains("topbar\""));
     }
 }
