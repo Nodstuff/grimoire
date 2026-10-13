@@ -68,6 +68,34 @@ extension Cache {
         return out
     }
 
+    /// Our ops on `docID` the gate parked (red, not applied) that still
+    /// the server's review queue still holds (`openOps`, as fetched from the
+    /// server: never guessed), oldest first, each with the epoch it was
+    /// proposed on. An open editor keeps showing them as ours, on the
+    /// conflict path, until a human decides (`ParkedEdits`).
+    public func parkedOps(for docID: DocID, openOps: Set<String>, now: Date = .now) async throws -> [ParkedOp] {
+        let rows = try await db.read { db in
+            try OutboxEntry
+                .filter(OutboxEntry.Columns.state == OutboxEntry.State.done.rawValue)
+                .filter(OutboxEntry.Columns.path == "/api/propose")
+                .filter(OutboxEntry.Columns.outcome != nil)
+                .filter(OutboxEntry.Columns.createdAt >= now.addingTimeInterval(-Cache.reviewWindow))
+                .order(OutboxEntry.Columns.id)
+                .fetchAll(db)
+        }
+        var out: [ParkedOp] = []
+        for e in rows {
+            guard let body = e.body, let data = e.outcome,
+                  let req = try? JSONDecoder().decode(ProposeRequest.self, from: body), req.docID == docID,
+                  let outcome = try? JSONDecoder().decode(ProposeOutcome.self, from: data)
+            else { continue }
+            for (i, v) in outcome.verdicts.enumerated() where !v.applied && i < req.ops.count && openOps.contains(v.opID) {
+                out.append(ParkedOp(kind: req.ops[i].kind, baseEpoch: req.baseEpoch, opID: v.opID))
+            }
+        }
+        return out
+    }
+
     /// The newest epoch one of our proposes for `docID` landed at: a cached
     /// body older than this predates our own write.
     public func lastLandedEpoch(_ docID: DocID) async throws -> Int? {

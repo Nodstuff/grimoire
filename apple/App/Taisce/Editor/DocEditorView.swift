@@ -1,74 +1,38 @@
 import SwiftUI
 import TaisceKit
 
-/// Edit mode: one text view per block, in document order, with review
-/// marks and the `[[` popup.
-struct DocEditorView: View {
-    let title: String
-    let model: EditorModel
+/// The doc as one live surface: the text view (header and children ride
+/// inside it), the formatting bar on the Mac, conflict and refusal notes,
+/// the `[[` popup, and the source sheet for non-text blocks.
+struct DocSurfaceContent: View {
+    let model: SurfaceModel
     @Environment(\.dynamicTypeSize) private var dynamicType
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(title)
-                        .font(Theme.serif(.largeTitle))
-                        .foregroundStyle(Theme.text)
-                        .accessibilityAddTraits(.isHeader)
-                        .padding(.bottom, 10)
-                    LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(model.items) { item in
-                            BlockRow(item: item, model: model, review: model.reviews[item.id], failed: model.failedBlocks.contains(item.id), dynamicType: dynamicType)
-                                .id(item.id)
-                        }
-                    }
-                    // the space below the last block adds a paragraph there
-                    Color.clear
-                        .frame(maxWidth: .infinity, minHeight: 200)
-                        .contentShape(.rect)
-                        .onTapGesture { model.tapAtEnd() }
-                        .accessibilityElement()
-                        .accessibilityLabel("Add a paragraph at the end")
-                        .accessibilityAddTraits(.isButton)
-                        .accessibilityIdentifier("editor.end")
+        DocSurfaceView(model: model, dynamicType: dynamicType)
+            .groundBackground()
+            .safeAreaInset(edge: .top, spacing: 0) {
+                VStack(spacing: 0) {
+                    if model.editable, EditorChrome.barIsInline { InlineFormattingBar(bar: model.formattingBar) }
+                    SurfaceNotes(model: model)
                 }
-                .padding(.horizontal, Theme.gutter)
-                .padding(.top, 4)
-                .frame(maxWidth: Theme.readingWidth, alignment: .leading)
-                .frame(maxWidth: .infinity)
             }
-            .scrollDismissesKeyboard(.interactively)
-            // the [[ popup is pinned to where the caret was: a scroll drops it
-            .onScrollPhaseChange { _, phase in
-                if phase == .interacting { model.dismissCompletion() }
+            .overlay { CompletionOverlay(model: model) }
+            .sheet(item: Binding(get: { model.sourceEditing.map(SourceRef.init) }, set: { model.sourceEditing = $0?.id })) { ref in
+                SourceEditorSheet(
+                    blockID: ref.id, text: model.source(of: ref.id),
+                    onSave: { model.saveSource(ref.id, $0) },
+                    onDelete: { model.deleteBlock(ref.id) }
+                )
             }
-            .onChange(of: model.pendingFocus) { _, f in
-                if let f { proxy.scrollTo(f.id) }
-            }
-        }
-        .groundBackground()
-        .safeAreaInset(edge: .top, spacing: 0) {
-            if EditorChrome.barIsInline { InlineFormattingBar(bar: model.formattingBar) }
-        }
-        .overlay { CompletionOverlay(model: model) }
     }
 }
 
-/// Where the formatting bar lives: above the keyboard on iPhone and iPad,
-/// pinned above the blocks on the Mac (no software keyboard, and the Mac
-/// idiom ignores input accessory views).
-enum EditorChrome {
-    static var barIsInline: Bool {
-        #if targetEnvironment(macCatalyst)
-        true
-        #else
-        false
-        #endif
-    }
+private struct SourceRef: Identifiable {
+    let id: BlockID
 }
 
-/// The editor's UIToolbar, hosted in SwiftUI.
+/// The editor's UIToolbar, hosted in SwiftUI (the Mac).
 private struct InlineFormattingBar: UIViewRepresentable {
     let bar: FormattingBar
 
@@ -79,80 +43,52 @@ private struct InlineFormattingBar: UIViewRepresentable {
     }
 }
 
-/// One block: its text view, outlined when the gate flagged or parked our edit.
-private struct BlockRow: View {
-    let item: EditorSession.Item
-    let model: EditorModel
-    let review: BlockReview?
-    var failed = false
-    let dynamicType: DynamicTypeSize
-    @State private var layoutToken = 0
-
-    /// the outline: refused (rose), conflict or parked (rose), flagged (amber)
-    var outline: Color? {
-        if failed || item.remoteText != nil || review?.verdict == .red { return Theme.rose }
-        if review?.verdict == .yellow { return Theme.amber }
-        return nil
-    }
+/// Blocks the server changed under an edit (Keep mine / Take theirs) and
+/// saves it refused (Retry / Discard), above the text. The blocks
+/// themselves are tinted in the text.
+private struct SurfaceNotes: View {
+    let model: SurfaceModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            BlockEditorView(item: item, model: model, dynamicType: dynamicType, layoutToken: layoutToken) {
-                layoutToken &+= 1
-            }
-            .padding(.top, Self.topPadding(item.content))
-            if failed {
-                HStack(spacing: 12) {
-                    Label("Couldn't save", systemImage: "exclamationmark.triangle").foregroundStyle(Theme.rose)
-                    Spacer()
-                    Button("Retry") { Task { await model.retryFailed() } }.accessibilityIdentifier("block.retry")
-                    Button("Discard", role: .destructive) { Task { await model.discardFailed() } }.accessibilityIdentifier("block.discard")
-                }
-                .font(.caption)
-                .buttonStyle(.borderless)
-                .padding(.bottom, 4)
-            } else if let theirs = item.remoteText {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("Changed on desktop", systemImage: "arrow.triangle.branch").foregroundStyle(Theme.rose)
-                    Text(theirs).font(.caption).foregroundStyle(Theme.secondary).lineLimit(3)
-                        .accessibilityLabel("Their version: \(theirs)")
-                    HStack(spacing: 16) {
-                        Button("Keep mine") { Task { await model.keepMine(item.id) } }.accessibilityIdentifier("block.keepMine")
-                        Button("Take theirs") { Task { await model.takeTheirs(item.id) } }.accessibilityIdentifier("block.takeTheirs")
+        let conflicts = model.conflicts.filter { $0.value.theirs != nil }.sorted { $0.key < $1.key }
+        if !conflicts.isEmpty || !model.failedBlocks.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                if !model.failedBlocks.isEmpty {
+                    HStack(spacing: 12) {
+                        Label(model.failedBlocks.count == 1 ? "1 block couldn't be saved" : "\(model.failedBlocks.count) blocks couldn't be saved",
+                              systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(Theme.rose)
+                        Spacer()
+                        Button("Retry") { Task { await model.retryFailed() } }.accessibilityIdentifier("block.retry")
+                        Button("Discard", role: .destructive) { Task { await model.discardFailed() } }.accessibilityIdentifier("block.discard")
                     }
-                    .buttonStyle(.borderless)
                 }
-                .font(.caption)
-                .padding(.bottom, 4)
-            } else if let review {
-                Label(review.verdict == .red ? "Waiting for review on desktop" : "Flagged for review on desktop",
-                      systemImage: review.verdict == .red ? "hourglass" : "flag")
-                    .font(.caption)
-                    .foregroundStyle(review.verdict == .red ? Theme.rose : Theme.amber)
-                    .padding(.bottom, 4)
+                ForEach(conflicts, id: \.key) { id, c in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("Changed on another device while you edited", systemImage: "arrow.triangle.branch").foregroundStyle(Theme.rose)
+                        Text(c.theirs ?? "").foregroundStyle(Theme.secondary).lineLimit(2)
+                            .accessibilityLabel("Their version: \(c.theirs ?? "")")
+                        HStack(spacing: 16) {
+                            Button("Keep mine") { Task { await model.keepMine(id) } }.accessibilityIdentifier("block.keepMine")
+                            Button("Take theirs") { Task { await model.takeTheirs(id) } }.accessibilityIdentifier("block.takeTheirs")
+                        }
+                    }
+                }
             }
+            .font(.caption)
+            .buttonStyle(.borderless)
+            .padding(10)
+            .frame(maxWidth: Theme.readingWidth, alignment: .leading)
+            .background(Theme.rose.opacity(0.08), in: .rect(cornerRadius: 10, style: .continuous))
+            .padding(.horizontal, Theme.gutter)
+            .padding(.vertical, 6)
         }
-        .padding(.horizontal, outline == nil ? 0 : 10)
-        .overlay {
-            if let outline {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(outline, lineWidth: 1.5)
-                    .allowsHitTesting(false)
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityHint(review.map { $0.verdict == .red ? "Your edit is waiting for review on the desktop" : "Your edit was flagged for review" } ?? "")
-    }
-
-    static func topPadding(_ c: EditorBlockContent) -> CGFloat {
-        if case let .heading(level, _) = c { return level <= 2 ? 12 : 6 }
-        return 0
     }
 }
 
 /// The `[[` suggestions, above the caret (below it near the top).
 private struct CompletionOverlay: View {
-    let model: EditorModel
+    let model: SurfaceModel
 
     var body: some View {
         GeometryReader { geo in
@@ -173,7 +109,7 @@ private struct CompletionOverlay: View {
 }
 
 private struct CompletionList: View {
-    let completion: EditorModel.Completion
+    let completion: SurfaceModel.Completion
     let onPick: (WikiCandidate) -> Void
 
     var body: some View {
@@ -212,7 +148,7 @@ private struct CompletionList: View {
     }
 }
 
-/// The edit-mode chip in the nav bar.
+/// The sync chip in the nav bar: what happened to what you typed.
 struct EditorChipView: View {
     let chip: EditorChip
     var onRetry: () -> Void = {}

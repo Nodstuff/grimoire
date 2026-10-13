@@ -20,7 +20,7 @@ enum PadItem: Hashable {
 
 /// A menu-bar command (the Mac's menus, an iPad's hardware keyboard).
 enum AppCommand: Hashable {
-    case newDoc, search, toggleEdit, refresh, settings, today, todos
+    case newDoc, search, refresh, settings, today, todos
     /// the doc in front: Share link… and Export as PDF… (SERVER mode)
     case shareLink, exportPDF
     /// ⌘1…⌘9: the nth workspace in the switcher's order (1-based)
@@ -31,12 +31,6 @@ enum AppCommand: Hashable {
 enum CommandEffect: Equatable {
     case none, refresh
     case selectWorkspace(WorkspaceScope)
-}
-
-/// ⌘E on the doc in front: start editing it, or finish.
-struct EditRequest: Equatable {
-    var doc: DocID
-    var serial: Int
 }
 
 /// Something the doc screen showing `doc` should open: the share sheet,
@@ -73,10 +67,6 @@ final class Router {
     var newDocParent: DocID?
     /// set by the pad layout, so `open` pushes onto the detail stack
     var isPad = false
-    /// the doc whose editor is open, as `DocScreen` reports it
-    var editingDoc: DocID?
-    /// ⌘E: the doc screen showing `doc` toggles edit mode
-    private(set) var editRequest: EditRequest?
     /// a doc action waiting for that doc's screen (it clears it when done)
     var docAction: DocAction?
     /// ⌘F on the split view: bumped to focus the sidebar's search field
@@ -144,22 +134,18 @@ final class Router {
         return nil
     }
 
-    /// Whether a command applies now. Nothing works before sign-in; ⌘E
-    /// needs a doc in front that you may edit (ADR 0004: not a viewer's);
-    /// ⌘N needs a workspace you may add to; ⌘n needs an nth workspace.
+    /// Whether a command applies now. Nothing works before sign-in; Share
+    /// link needs a doc in front that you may edit (ADR 0004: not a
+    /// viewer's); ⌘N needs a workspace you may add to; ⌘n needs an nth workspace.
     func canPerform(_ command: AppCommand, signedIn: Bool, picker: WorkspacePicker, canEdit: (DocID) -> Bool = { _ in true }, canCreate: Bool = true, shares: Bool = false) -> Bool {
         guard signedIn else { return false }
         switch command {
         case .shareLink:
-            // SERVER mode only, a doc in front you may edit (owner or editor), not mid-edit
-            return shares && editingDoc == nil && (focusedDoc.map(canEdit) ?? false)
+            // SERVER mode only, a doc in front you may edit (owner or editor)
+            return shares && (focusedDoc.map(canEdit) ?? false)
         case .exportPDF:
             // reading is enough to print
-            return shares && focusedDoc != nil && editingDoc == nil
-        case .toggleEdit:
-            // finishing an edit is always allowed
-            if editingDoc != nil { return true }
-            return focusedDoc.map(canEdit) ?? false
+            return shares && focusedDoc != nil
         case .newDoc: return canCreate
         case .workspace(let n): return picker.shortcut(n) != nil
         default: return true
@@ -184,7 +170,6 @@ final class Router {
             padItem = .today
             padPath = []
         }
-        if let e = editingDoc, docs.contains(e) { editingDoc = nil }
         return shown
     }
 
@@ -206,9 +191,6 @@ final class Router {
         case .search:
             showSearch()
             if isPad { searchFocusRequest += 1 }
-        case .toggleEdit:
-            guard let doc = editingDoc ?? focusedDoc else { break }
-            editRequest = EditRequest(doc: doc, serial: (editRequest?.serial ?? 0) + 1)
         case .refresh:
             return .refresh
         case .shareLink:

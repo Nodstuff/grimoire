@@ -2,9 +2,11 @@ import SwiftUI
 import UIKit
 import TaisceKit
 
-/// Reading view: renders the cached blocks, refreshes them when missing or
-/// stale, and re-renders whenever sync rewrites them. Checkboxes queue a
-/// `replace` through the outbox.
+/// One doc: an always-live text surface (`SurfaceModel`) once the body is
+/// in the offline cache. You may edit it → editable, the caret where you
+/// click; a viewer, a canvas or a mirror → the same surface read-only,
+/// links tap to follow. Before the body is cached: loading, an error, or
+/// a folder view (`DocContent`).
 struct DocScreen: View {
     @Environment(AppModel.self) private var model
     @Environment(Router.self) private var router
@@ -12,17 +14,19 @@ struct DocScreen: View {
     let docID: DocID
     @State private var page: DocPage?
     @State private var loadError: String?
-    @State private var overrides: [BlockID: [Int: Bool]] = [:]
-    @State private var editor: EditorModel?
-    @State private var editable = false
+    @State private var surface: SurfaceModel?
+    /// not a canvas or a mirror (nil until the cache said)
+    @State private var editableKind: Bool?
     @State private var opening = false
+    /// the body isn't in the offline cache: the page shows read-only
+    @State private var surfaceFailed = false
     @State private var movingWorkspace = false // workspaces
     @AppStorage(DocTextSize.key) private var textSize = DocTextSize.actual
 
     var body: some View {
         Group {
-            if let editor {
-                editing(editor)
+            if let surface {
+                surfaceView(surface)
             } else {
                 reading
             }
@@ -40,93 +44,147 @@ struct DocScreen: View {
         .task(id: docID) { await observe() }
         .task(id: docID) { await refresh(force: false) }
         .task(id: docID) { await checkEditable() }
+        // the surface opens once the body is cached and we know what it may be
+        .task(id: OpenKey(doc: docID, loaded: page != nil, kindKnown: editableKind != nil)) { await openSurface() }
         // queued edits show while they wait (offline, a live session)
         .task(id: model.pendingWrites) { await reloadPage() }
         // a sync write drops the cached meta: load it again
         .task(id: MetaKey(doc: docID, missing: model.editMeta[docID] == nil)) { await model.loadEditMeta(docID) }
         .onChange(of: scenePhase) { _, phase in
             // finish writing to the outbox even if iOS suspends us mid-flush
-            if phase != .active, let editor {
+            if phase != .active, let surface {
                 let id = UIApplication.shared.beginBackgroundTask(withName: "editor flush")
                 Task {
-                    await editor.flush()
+                    await surface.flush()
                     UIApplication.shared.endBackgroundTask(id)
                 }
             }
         }
-        .onChange(of: editable, initial: true) { _, ok in
-            // a doc just created here opens straight into edit mode
-            if ok, access.canEdit, model.pendingEditDoc == docID {
-                model.pendingEditDoc = nil
-                Task { await startEditing() }
-            }
-        }
         .onDisappear {
-            if let editor { Task { await editor.flush(); editor.stop() } }
-            if router.editingDoc == docID { router.editingDoc = nil }
+            if let surface { Task { await surface.flush(); surface.stop(); await model.replayOutbox() } }
         }
-        // ⌘E (the menu bar): edit this doc, or finish
-        .onChange(of: router.editRequest) { _, req in
-            guard let req, req.doc == docID else { return }
+        // ADR 0004: made a viewer while editing: what's typed is saved
+        // (the server says no, and the chip shows it), then read-only in place
+        .onChange(of: canWrite) { _, can in
+            guard let surface else { return }
             Task {
-                if editor != nil {
-                    await finishEditing()
-                } else if editable, access.canEdit, page != nil {
-                    await startEditing()
-                }
+                if !can { await surface.flush() }
+                surface.setEditable(can)
+                await model.replayOutbox()
             }
-        }
-        // ADR 0004: made a viewer while editing: save what's typed (the
-        // server says no, and the chip shows it) and go back to reading
-        .onChange(of: access.canEdit) { _, can in
-            if !can, editor != nil { Task { await finishEditing() } }
         }
         // Share link…, Export as PDF… and link comments (menus, the menu bar, a comment push)
         .modifier(DocShareActions(docID: docID, canShare: access.canEdit, pageLoaded: page != nil))
-        .onChange(of: editor == nil) { _, closed in
-            if !closed {
-                router.editingDoc = docID
-            } else if router.editingDoc == docID {
-                router.editingDoc = nil
-            }
-        }
-    }
-
-    private func editing(_ editor: EditorModel) -> some View {
-        DocEditorView(title: model.index.byID[docID]?.title ?? "", model: editor)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    EditorChipView(chip: editor.chip) { Task { await editor.retryFailed() } }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { Task { await finishEditing() } }
-                        .accessibilityIdentifier("editor.done")
-                }
-            }
-            .environment(\.openURL, OpenURLAction { _ in .handled })
     }
 
     /// ADR 0004: what you may change here (a viewer reads only; pins are local)
     private var access: EditAccess { model.access(for: docID) }
 
+    /// Editable here: you may edit it, and it isn't a canvas or a mirror.
+    private var canWrite: Bool { (editableKind ?? false) && access.canEdit }
+
+    private func surfaceView(_ surface: SurfaceModel) -> some View {
+        DocSurfaceContent(model: surface)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    HStack(spacing: 8) {
+                        Text(model.index.breadcrumb(of: docID) ?? title)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(Theme.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.head)
+                        if surface.editable {
+                            EditorChipView(chip: surface.chip) { Task { await surface.retryFailed() } }
+                        }
+                    }
+                }
+            }
+            .modifier(DocMenu(
+                pinned: model.isPinned(docID),
+                onTogglePin: { model.togglePin(docID) },
+                onMoveWorkspace: model.hasWorkspaces && access.canMove ? { movingWorkspace = true } : nil,
+                onShareLink: model.shareLinks.isAvailable && access.canEdit && page != nil ? { shareLink(surface) } : nil,
+                onExportPDF: model.shareLinks.isAvailable && page != nil ? { exportPDF(surface) } : nil
+            ))
+            .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
+            .onChange(of: chrome, initial: true) { _, c in
+                surface.setChrome(
+                    header: hosted(DocHeader(chrome: c, onOpenLinkComments: { router.request(.linkComments, on: docID) })),
+                    footer: c.children.cards.isEmpty ? nil : hosted(DocChildrenList(
+                        layout: c.children, childCounts: model.index.childCount, onOpen: { router.open(.doc($0)) },
+                        onNewDocHere: access.canCreate ? { router.newDoc(in: docID) } : nil
+                    ))
+                )
+            }
+            .onChange(of: page) { _, p in surface.chartTables = p?.chartTables ?? ChartTables() }
+            .task(id: docID) {
+                let kids = DocChildrenLayout.children(of: docID, index: model.index, meta: [:]).prefix(20)
+                for kid in kids { await model.loadEditMeta(kid.id) }
+            }
+    }
+
+    /// What's typed is in the outbox before a link snapshots the doc.
+    private func shareLink(_ surface: SurfaceModel) {
+        Task {
+            await surface.flush()
+            router.request(.shareLink, on: docID)
+        }
+    }
+
+    private func exportPDF(_ surface: SurfaceModel) {
+        Task {
+            await surface.flush()
+            router.request(.exportPDF, on: docID)
+        }
+    }
+
+    /// A SwiftUI view for the text view's header or footer, with what it reads.
+    private func hosted(_ v: some View) -> AnyView {
+        #if targetEnvironment(macCatalyst)
+        AnyView(v.environment(model).environment(router)
+            .dynamicTypeSize(DocTextSize.size(textSize))
+            .environment(\.docScale, DocTextSize.scale(textSize)))
+        #else
+        AnyView(v.environment(model).environment(router))
+        #endif
+    }
+
+    private var title: String { model.index.byID[docID]?.title ?? "" }
+
+    /// What the header and footer show: an empty body with children is a
+    /// folder (New doc here), else "Inside this doc".
+    private var chrome: DocChrome {
+        let empty = surface.map { s in !s.hasContent } ?? false
+        return DocChrome(
+            title: title,
+            tags: page?.tags ?? [],
+            meta: model.editMeta[docID],
+            accessNote: access.note,
+            workspace: model.workspaceBadge(for: docID),
+            linkComments: model.shareLinks.isAvailable ? model.shareLinks.commentSummary(for: docID).title : nil,
+            children: DocChildrenLayout.make(
+                pageEmpty: empty,
+                children: DocChildrenLayout.children(of: docID, index: model.index, meta: model.editMeta)
+            )
+        )
+    }
+
     private var reading: some View {
         let doc = model.index.byID[docID]
         let access = access
-        let onToggle: ((BlockID, Int, Bool) -> Void)? = access.canEdit ? { toggle($0, $1, $2) } : nil
         let onNewDocHere: (() -> Void)? = access.canCreate ? { router.newDoc(in: docID) } : nil
         return DocContent(
             title: doc?.title ?? "",
             breadcrumb: model.index.breadcrumb(of: docID),
-            page: page,
+            // the body shows in the surface; this view waits for it (or
+            // shows the page when the body can't be cached)
+            page: surfaceFailed ? page : nil,
             meta: model.editMeta[docID],
             loadError: loadError,
             pinned: model.isPinned(docID),
-            overrides: overrides,
-            onToggle: onToggle,
             onTogglePin: { model.togglePin(docID) },
             onRetry: { Task { await refresh(force: true) } },
-            onEdit: editable && access.canEdit && page != nil && !opening ? { Task { await startEditing() } } : nil,
             accessNote: access.note,
             workspace: model.workspaceBadge(for: docID),
             onMoveWorkspace: model.hasWorkspaces && access.canMove ? { movingWorkspace = true } : nil,
@@ -137,8 +195,6 @@ struct DocScreen: View {
             childCounts: model.index.childCount,
             onOpenChild: { router.open(.doc($0)) },
             onNewDocHere: onNewDocHere,
-            docID: docID,
-            canEdit: editable && access.canEdit,
             linkComments: model.shareLinks.isAvailable ? model.shareLinks.commentSummary(for: docID).title : nil,
             onOpenLinkComments: { router.request(.linkComments, on: docID) },
             // ADR 0004: creating or updating a link needs owner or editor
@@ -146,46 +202,45 @@ struct DocScreen: View {
             onExportPDF: model.shareLinks.isAvailable && page != nil ? { router.request(.exportPDF, on: docID) } : nil
         )
         .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
-        // children's "edited … ago" (a handful; each is cached until it changes)
-        .task(id: docID) {
-            let kids = DocChildrenLayout.children(of: docID, index: model.index, meta: [:]).prefix(20)
-            for kid in kids { await model.loadEditMeta(kid.id) }
-        }
-        .environment(\.openURL, OpenURLAction { url in
-            if let target = InlineMarkdown.wikiTarget(url) {
-                if let doc = model.index.doc(titled: target) { router.open(.doc(doc.id)) }
-                return .handled
-            }
-            return .systemAction
-        })
+    }
+
+    private func openWiki(_ target: String) {
+        if let doc = model.index.doc(titled: target) { router.open(.doc(doc.id)) }
     }
 
     /// Canvases and federation mirrors are read-only here.
     private func checkEditable() async {
-        guard let cache = model.cache, let rec = try? await cache.doc(docID) else { return }
-        editable = !rec.isCanvas && rec.mirrorPermission == nil
+        guard let cache = model.cache, let rec = try? await cache.doc(docID) else {
+            if editableKind == nil { editableKind = model.cache == nil ? false : nil }
+            return
+        }
+        editableKind = !rec.isCanvas && rec.mirrorPermission == nil
     }
 
-    private func startEditing() async {
-        guard editor == nil, !opening else { return }
+    /// The surface over the cached body (fetched first if need be). Nil
+    /// while it isn't cached: the reading states show meanwhile.
+    private func openSurface() async {
+        if editableKind == nil, page != nil { await checkEditable() }
+        guard surface == nil, !opening, page != nil, editableKind != nil else { return }
         opening = true
         defer { opening = false }
-        if let e = await EditorModel.open(docID, app: model) {
-            editor = e
-        } else {
-            model.lastError = "This doc isn't available offline yet."
+        guard let s = await SurfaceModel.open(docID, app: model, editable: canWrite) else {
+            surfaceFailed = true
+            return
         }
-    }
-
-    private func finishEditing() async {
-        guard let e = editor else { return }
-        e.activeCoordinator?.textView?.resignFirstResponder()
-        // only the local write is awaited; sending happens in the background
-        await e.flush()
-        e.stop()
-        editor = nil
-        await reloadPage()
-        Task { await model.replayOutbox() }
+        surfaceFailed = false
+        s.onOpenWiki = { target in openWiki(target) }
+        s.chartTables = page?.chartTables ?? ChartTables()
+        if docID == model.todoDocID {
+            // the To-do doc's boxes are to-do items: they go through the to-do API
+            s.onTodoCheckbox = { block, index, checked in toggleTodo(block, index, checked) }
+        }
+        surface = s
+        // a doc just created here opens with the caret at its start
+        if canWrite, model.pendingEditDoc == docID {
+            model.pendingEditDoc = nil
+            s.focusAtStart()
+        }
     }
 
     private func reloadPage() async {
@@ -199,7 +254,6 @@ struct DocScreen: View {
             for try await records in cache.observeBlocks(of: docID) {
                 guard !records.isEmpty || page != nil else { continue }
                 page = await model.page(for: docID, records: records)
-                overrides = [:]
             }
         } catch {
             loadError = error.localizedDescription
@@ -221,36 +275,23 @@ struct DocScreen: View {
         }
     }
 
-    private func toggle(_ block: BlockID, _ index: Int, _ checked: Bool) {
-        overrides[block, default: [:]][index] = checked
+    /// A To-do doc box: the to-do API, not a block edit.
+    private func toggleTodo(_ block: BlockID, _ index: Int, _ checked: Bool) {
         Task {
             do {
-                if docID == model.todoDocID {
-                    guard let at = TodoDocAddress.locate(page?.blocks ?? [], block: block, index: index) else { throw TodoWriteError.notFound }
-                    try await model.setTodoDone(date: at.date, position: at.position, done: checked)
-                } else {
-                    try await model.setCheckbox(doc: docID, block: block, index: index, checked: checked)
-                }
+                guard let at = TodoDocAddress.locate(page?.blocks ?? [], block: block, index: index) else { throw TodoWriteError.notFound }
+                try await model.setTodoDone(date: at.date, position: at.position, done: checked)
             } catch {
-                overrides[block]?[index] = nil
                 model.lastError = error.localizedDescription
             }
         }
     }
 }
 
-/// The doc header's "View only": you can read this workspace, not change it.
-struct ViewOnlyNote: View {
-    let text: String
-
-    var body: some View {
-        Label(text, systemImage: "eye")
-            .font(.caption2.weight(.medium))
-            .foregroundStyle(Theme.secondary)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("\(text): you can read this workspace but not change it")
-            .accessibilityIdentifier("doc.viewOnly")
-    }
+private struct OpenKey: Hashable {
+    var doc: DocID
+    var loaded: Bool
+    var kindKnown: Bool
 }
 
 private struct MetaKey: Hashable {
@@ -258,105 +299,80 @@ private struct MetaKey: Hashable {
     var missing: Bool
 }
 
-struct DocContent: View {
-    let title: String
-    let breadcrumb: String?
-    /// nil while the first load is in flight
-    let page: DocPage?
+/// What the surface's header and footer show.
+struct DocChrome: Equatable {
+    var title: String
+    var tags: [String]
     var meta: EditMeta?
-    var loadError: String?
-    var pinned = false
-    var overrides: [BlockID: [Int: Bool]] = [:]
-    var now: Date = .now
-    var onToggle: ((BlockID, Int, Bool) -> Void)?
-    var onTogglePin: () -> Void = {}
-    var onRetry: () -> Void = {}
-    /// nil when the doc can't be edited here (yet)
-    var onEdit: (() -> Void)?
-    /// "View only" in a workspace where you are a viewer (ADR 0004)
     var accessNote: String?
-    // workspaces: the header chip and the … menu's "Move to workspace…"
     var workspace: WorkspaceBadge?
-    var onMoveWorkspace: (() -> Void)?
-    // children: a folder view for an empty body, else "Inside this doc"
-    var children: DocChildrenLayout = .none
-    var childCounts: [DocID: Int] = [:]
-    var onOpenChild: (DocID) -> Void = { _ in }
-    var onNewDocHere: (() -> Void)?
-    /// runnable code blocks (Mac): which doc, and whether a practice edit may be saved
-    var docID: DocID?
-    var canEdit = false
-    // share links (SERVER mode): the comments entry and the … menu's items
     var linkComments: String?
+    var children: DocChildrenLayout
+}
+
+/// The doc's title block: workspace chip or "View only", title, tags and
+/// "edited by", and the link-comments entry.
+struct DocHeader: View {
+    let chrome: DocChrome
+    var now: Date = .now
     var onOpenLinkComments: () -> Void = {}
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 10) {
+                if chrome.workspace != nil || chrome.accessNote != nil {
+                    HStack(spacing: 8) {
+                        if let w = chrome.workspace { WorkspaceChip(badge: w) }
+                        if let n = chrome.accessNote { ViewOnlyNote(text: n) }
+                    }
+                }
+                Text(chrome.title)
+                    .docFont(.largeTitle, design: .serif, weight: .semibold)
+                    .foregroundStyle(Theme.text)
+                    .accessibilityAddTraits(.isHeader)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !chrome.tags.isEmpty || chrome.meta != nil {
+                    // "#design #mobile · edited by claude 2 h ago"
+                    FlowRow(spacing: 6) {
+                        ForEach(chrome.tags, id: \.self) { TagChip(tag: $0) }
+                        if let meta = chrome.meta {
+                            Text("\(chrome.tags.isEmpty ? "" : "· ")edited by \(meta.author) \(RelativeTime.string(meta.date, now: now))")
+                                .font(.caption2)
+                                .foregroundStyle(Theme.secondary)
+                        }
+                    }
+                }
+            }
+            if let linkComments = chrome.linkComments {
+                Button(action: onOpenLinkComments) {
+                    Label(linkComments, systemImage: "bubble.left.and.text.bubble.right")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(Theme.accent)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .card(Theme.surface)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("doc.linkComments")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, 4)
+    }
+}
+
+/// The doc's … menu: pin, move to workspace, share link, export.
+struct DocMenu: ViewModifier {
+    var pinned: Bool
+    var onTogglePin: () -> Void
+    var onMoveWorkspace: (() -> Void)?
     var onShareLink: (() -> Void)?
     var onExportPDF: (() -> Void)?
     var exportingPDF = false
 
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                VStack(alignment: .leading, spacing: 10) {
-                    if workspace != nil || accessNote != nil {
-                        HStack(spacing: 8) {
-                            if let workspace { WorkspaceChip(badge: workspace) }
-                            if let accessNote { ViewOnlyNote(text: accessNote) }
-                        }
-                    }
-                    Text(title)
-                        .docFont(.largeTitle, design: .serif, weight: .semibold)
-                        .foregroundStyle(Theme.text)
-                        .accessibilityAddTraits(.isHeader)
-                    if !metaLine.isEmpty {
-                        // "#design #mobile · edited by claude 2 h ago"
-                        FlowRow(spacing: 6) {
-                            ForEach(page?.tags ?? [], id: \.self) { TagChip(tag: $0) }
-                            if let meta {
-                                Text("\(page?.tags.isEmpty == false ? "· " : "")edited by \(meta.author) \(RelativeTime.string(meta.date, now: now))")
-                                    .font(.caption2)
-                                    .foregroundStyle(Theme.secondary)
-                            }
-                        }
-                    }
-                }
-                .padding(.bottom, 6)
-                if let linkComments {
-                    Button(action: onOpenLinkComments) {
-                        Label(linkComments, systemImage: "bubble.left.and.text.bubble.right")
-                            .font(.footnote.weight(.medium))
-                            .foregroundStyle(Theme.accent)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .card(Theme.surface)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier("doc.linkComments")
-                }
-                content
-            }
-            .padding(.horizontal, Theme.gutter)
-            .padding(.top, 4)
-            .padding(.bottom, 40)
-            .frame(maxWidth: Theme.readingWidth, alignment: .leading)
-            .frame(maxWidth: .infinity)
-        }
-        .groundBackground()
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                Text(breadcrumb ?? title)
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(Theme.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.head)
-            }
-            if let onEdit {
-                ToolbarItem(placement: .primaryAction) {
-                    Button("Edit", action: onEdit)
-                        .accessibilityIdentifier("doc.edit")
-                }
-            }
+    func body(content: Content) -> some View {
+        content.toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Menu {
                     Button(pinned ? "Unpin from Today" : "Pin to Today", systemImage: pinned ? "pin.slash" : "pin", action: onTogglePin)
@@ -382,21 +398,87 @@ struct DocContent: View {
             }
         }
     }
+}
 
-    /// whether the tags / "edited by" line has anything to show
-    var metaLine: String {
-        ((page?.tags ?? []) + (meta.map { [$0.author] } ?? [])).joined()
+/// The doc header's "View only": you can read this workspace, not change it.
+struct ViewOnlyNote: View {
+    let text: String
+
+    var body: some View {
+        Label(text, systemImage: "eye")
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(Theme.secondary)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(text): you can read this workspace but not change it")
+            .accessibilityIdentifier("doc.viewOnly")
+    }
+}
+
+/// A doc rendered read-only by the SwiftUI renderer: the loading and error
+/// states before the surface opens, a folder's children, and previews.
+struct DocContent: View {
+    let title: String
+    let breadcrumb: String?
+    /// nil while the first load is in flight
+    let page: DocPage?
+    var meta: EditMeta?
+    var loadError: String?
+    var pinned = false
+    var now: Date = .now
+    var onTogglePin: () -> Void = {}
+    var onRetry: () -> Void = {}
+    /// "View only" in a workspace where you are a viewer (ADR 0004)
+    var accessNote: String?
+    // workspaces: the header chip and the … menu's "Move to workspace…"
+    var workspace: WorkspaceBadge?
+    var onMoveWorkspace: (() -> Void)?
+    // children: a folder view for an empty body, else "Inside this doc"
+    var children: DocChildrenLayout = .none
+    var childCounts: [DocID: Int] = [:]
+    var onOpenChild: (DocID) -> Void = { _ in }
+    var onNewDocHere: (() -> Void)?
+    // share links (SERVER mode): the comments entry and the … menu's items
+    var linkComments: String?
+    var onOpenLinkComments: () -> Void = {}
+    var onShareLink: (() -> Void)?
+    var onExportPDF: (() -> Void)?
+    var exportingPDF = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                DocHeader(
+                    chrome: DocChrome(title: title, tags: page?.tags ?? [], meta: meta, accessNote: accessNote,
+                                      workspace: workspace, linkComments: linkComments, children: children),
+                    now: now, onOpenLinkComments: onOpenLinkComments
+                )
+                content
+            }
+            .padding(.horizontal, Theme.gutter)
+            .padding(.top, 4)
+            .padding(.bottom, 40)
+            .frame(maxWidth: Theme.readingWidth, alignment: .leading)
+            .frame(maxWidth: .infinity)
+        }
+        .groundBackground()
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                Text(breadcrumb ?? title)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+            }
+        }
+        .modifier(DocMenu(pinned: pinned, onTogglePin: onTogglePin, onMoveWorkspace: onMoveWorkspace,
+                          onShareLink: onShareLink, onExportPDF: onExportPDF, exportingPDF: exportingPDF))
     }
 
     @ViewBuilder private var content: some View {
         if let page, !page.isEmpty {
             ForEach(page.blocks) { block in
                 NodeStack(nodes: block.nodes)
-                    .environment(\.checkboxToggle, CheckboxToggle(
-                        overrides: overrides[block.id] ?? [:],
-                        action: onToggle.map { f in { i, v in f(block.id, i, v) } }
-                    ))
-                    .environment(\.codeRunContext, docID.map { CodeRunContext(doc: $0, block: block.id, canSave: canEdit) })
             }
             .environment(\.docTables, page.chartTables)
             DocChildrenList(layout: children, childCounts: childCounts, now: now, onOpen: onOpenChild)
@@ -420,8 +502,7 @@ struct DocContent: View {
     NavigationStack {
         DocContent(
             title: "Design spec", breadcrumb: "Grimoire › iOS app", page: PreviewData.page,
-            meta: EditMeta(author: "claude", date: PreviewData.ago(7200)), overrides: [:], now: PreviewData.now,
-            onToggle: { _, _, _ in }
+            meta: EditMeta(author: "claude", date: PreviewData.ago(7200)), now: PreviewData.now
         )
     }
     .preferredColorScheme(.dark)

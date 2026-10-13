@@ -2,11 +2,11 @@ import UIKit
 import TaisceKit
 
 /// The bar above the keyboard: bold, italic, inline code, `[[`, to-do,
-/// block type (with indent / outdent), hide keyboard. It acts on whichever block
-/// has the caret.
+/// block type (with indent / outdent), hide keyboard. It acts on the block
+/// under the caret.
 @MainActor
 final class FormattingBar: UIToolbar {
-    weak var model: EditorModel?
+    weak var model: SurfaceModel?
     private var bold: UIBarButtonItem!
     private var italic: UIBarButtonItem!
     private var code: UIBarButtonItem!
@@ -14,7 +14,7 @@ final class FormattingBar: UIToolbar {
     private var todo: UIBarButtonItem!
     private var kind: UIBarButtonItem!
 
-    init(model: EditorModel) {
+    init(model: SurfaceModel) {
         self.model = model
         super.init(frame: CGRect(x: 0, y: 0, width: 320, height: 44))
         sizeToFit()
@@ -27,10 +27,10 @@ final class FormattingBar: UIToolbar {
             b.accessibilityIdentifier = id
             return b
         }
-        bold = item("bold", "Bold", "bar.bold") { [weak self] in self?.model?.activeCoordinator?.toggle(.bold) }
-        italic = item("italic", "Italic", "bar.italic") { [weak self] in self?.model?.activeCoordinator?.toggle(.italic) }
-        code = item("chevron.left.forwardslash.chevron.right", "Inline code", "bar.code") { [weak self] in self?.model?.activeCoordinator?.toggle(.code) }
-        wiki = UIBarButtonItem(title: "[[ ]]", primaryAction: UIAction { [weak self] _ in self?.model?.activeCoordinator?.insertWikiOpener() })
+        bold = item("bold", "Bold", "bar.bold") { [weak self] in self?.model?.toggle(.bold) }
+        italic = item("italic", "Italic", "bar.italic") { [weak self] in self?.model?.toggle(.italic) }
+        code = item("chevron.left.forwardslash.chevron.right", "Inline code", "bar.code") { [weak self] in self?.model?.toggle(.code) }
+        wiki = UIBarButtonItem(title: "[[ ]]", primaryAction: UIAction { [weak self] _ in self?.model?.insertWikiOpener() })
         wiki.accessibilityLabel = "Link to a doc"
         wiki.accessibilityIdentifier = "bar.wiki"
         todo = item("checklist", "To-do", "bar.todo") { [weak self] in self?.model?.toggleTodo() }
@@ -38,7 +38,7 @@ final class FormattingBar: UIToolbar {
         kind.accessibilityLabel = "Block type"
         kind.accessibilityIdentifier = "bar.kind"
         let hide = item("keyboard.chevron.compact.down", "Hide keyboard", "bar.hide") { [weak self] in
-            self?.model?.activeCoordinator?.textView?.resignFirstResponder()
+            self?.model?.textView.resignFirstResponder()
         }
         // iOS 26 groups bar items into capsules and overflows the rest:
         // indent lives in the block menu so Hide keyboard stays in view
@@ -64,8 +64,8 @@ final class FormattingBar: UIToolbar {
             UIAction(title: title, image: UIImage(systemName: symbol)) { [weak self] _ in self?.model?.setKind(choice) }
         }
         let nesting = UIMenu(options: .displayInline, children: [
-            UIAction(title: "Indent", image: UIImage(systemName: "increase.indent")) { [weak self] _ in self?.model?.activeCoordinator?.indent(+1) },
-            UIAction(title: "Outdent", image: UIImage(systemName: "decrease.indent")) { [weak self] _ in self?.model?.activeCoordinator?.indent(-1) },
+            UIAction(title: "Indent", image: UIImage(systemName: "increase.indent")) { [weak self] _ in self?.model?.indent(+1) },
+            UIAction(title: "Outdent", image: UIImage(systemName: "decrease.indent")) { [weak self] _ in self?.model?.indent(-1) },
         ])
         return UIMenu(title: "Block type", children: kinds + [nesting])
     }

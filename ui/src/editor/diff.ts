@@ -98,6 +98,44 @@ export function inferBlockType(content: string): string {
   return 'paragraph'
 }
 
+/** A block's heading level from its markdown (0 = not a heading). */
+export function headingLevel(content: string): number {
+  const m = /^(#{1,6}) /.exec(content)
+  return m ? m[1].length : 0
+}
+
+/** Pre-order of the tree the placements make (children in entries order;
+ * a parent that isn't an entry counts as the top level). Returns the
+ * indices [came early, expected] at the first place it differs from the
+ * entries order, or null when it reads in order. */
+export function firstOutOfOrder(placed: { tempId: string; parent: string | null }[]): [number, number] | null {
+  const index = new Map(placed.map((p, i) => [p.tempId, i]))
+  const kids = new Map<number | null, number[]>()
+  placed.forEach((p, i) => {
+    const k = p.parent != null && index.has(p.parent) ? index.get(p.parent)! : null
+    if (!kids.has(k)) kids.set(k, [])
+    kids.get(k)!.push(i)
+  })
+  const order: number[] = []
+  const seen = new Set<number>()
+  const walk = (k: number | null) => {
+    for (const c of kids.get(k) ?? []) {
+      if (seen.has(c)) continue // a cycle never reads in order
+      seen.add(c)
+      order.push(c)
+      walk(c)
+    }
+  }
+  walk(null)
+  for (let i = 0; i < placed.length; i++) {
+    if (order[i] !== i) {
+      // unreachable (a cycle): the expected one is out of place
+      return [order[i] ?? i, i]
+    }
+  }
+  return null
+}
+
 interface Placed {
   entry: Entry
   parent: string | null // block id, or the placeholder id for new headings
@@ -109,6 +147,8 @@ export function computeOps(
   baseline: BaselineBlock[],
   entries: Entry[],
   newId: () => string = () => crypto.randomUUID(),
+  /** filled in for tests: blocks the order check (2c) re-homed */
+  stats?: { orderFallback: string[] },
 ): Op[] {
   const old = new Map(baseline.map((b) => [b.id, b]))
   const ops: Op[] = []
@@ -132,6 +172,79 @@ export function computeOps(
     const tempId = e.id ?? newId()
     placed.push({ entry: e, parent, tempId })
     if (e.level > 0) stack.push({ level: e.level, id: tempId })
+  }
+
+  // 2b. where each baseline block belonged before this edit, by the same
+  //     rule. A block keeps its STORED parent unless this edit changed
+  //     where it belongs (or deleted that parent): nesting the server holds
+  //     that disagrees with the headings is left alone, so a typo fix never
+  //     re-parents anything.
+  const before = new Map<string, string | null>()
+  {
+    const st: { level: number; id: string }[] = []
+    for (const b of baseline) {
+      const lv = headingLevel(b.content)
+      if (lv > 0) {
+        while (st.length && st[st.length - 1].level >= lv) st.pop()
+      }
+      before.set(b.id, st.length ? st[st.length - 1].id : null)
+      if (lv > 0) st.push({ level: lv, id: b.id })
+    }
+  }
+  //     A new or re-homed block goes where its neighbour above went when
+  //     both belong to the same section, so it lands next to it.
+  const inferred = placed.map((p) => p.parent)
+  placed.forEach((p, i) => {
+    const id = p.entry.id
+    const prev = id ? old.get(id) : undefined
+    // kept: its section didn't change, or the server never nested it by
+    // its section anyway (flat or misnested): a heading edit elsewhere
+    // says nothing about where it belongs
+    if (prev && (before.get(prev.id) === inferred[i] || prev.parent !== before.get(prev.id))) {
+      const storedGone = prev.parent != null && old.has(prev.parent) && !liveIds.has(prev.parent)
+      if (!storedGone) {
+        p.parent = prev.parent
+        return
+      }
+    }
+    if (i > 0 && inferred[i - 1] === inferred[i]) p.parent = placed[i - 1].parent
+  })
+
+  // 2c. the server's tree must read in the editor's order: walk it in
+  //     pre-order (siblings in entries order, as step 3 keys them). At the
+  //     first block out of place, the one that came too early goes back to
+  //     its inferred parent (or, if it is there already, the one expected).
+  //     All-inferred nesting reads in order by construction: the last resort.
+  const tried = placed.map(() => 0)
+  for (let guard = 0; ; guard++) {
+    const bad = firstOutOfOrder(placed)
+    if (bad == null) break
+    if (guard > 2 * placed.length) {
+      placed.forEach((p, i) => (p.parent = inferred[i]))
+      stats?.orderFallback.push(...placed.map((p) => p.tempId))
+      break
+    }
+    // each block steps at most twice: back to where the server has it
+    // (moving nothing), then to its inferred parent
+    const [early, expected] = bad
+    const step = (i: number): boolean => {
+      const stored = placed[i].entry.id ? old.get(placed[i].entry.id!)?.parent : undefined
+      const storedLive = stored !== undefined && (stored == null || !old.has(stored) || liveIds.has(stored))
+      if (tried[i] === 0 && storedLive && placed[i].parent !== stored) {
+        placed[i].parent = stored!
+        tried[i] = 1
+        return true
+      }
+      if (tried[i] < 2 && placed[i].parent !== inferred[i]) {
+        placed[i].parent = inferred[i]
+        tried[i] = 2
+        stats?.orderFallback.push(placed[i].tempId)
+        return true
+      }
+      tried[i] = 2
+      return false
+    }
+    if (!step(early) && !step(expected)) guard = 2 * placed.length
   }
 
   // 3. group by parent, keep a greedy increasing run of undisturbed survivors,

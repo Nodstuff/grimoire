@@ -64,12 +64,9 @@ private let picker = WorkspacePicker(workspaces: [work, home], unsortedCount: 2,
         #expect(!r.canPerform(.workspace(4), signedIn: true, picker: picker))
     }
 
-    @Test func editNeedsADocInFront() {
+    @Test func theDocInFront() {
         let r = Router()
         #expect(r.focusedDoc == nil)
-        #expect(!r.canPerform(.toggleEdit, signedIn: true, picker: picker))
-        #expect(r.perform(.toggleEdit, picker: picker) == .none)
-        #expect(r.editRequest == nil)
 
         // phone: the top of the current tab's stack
         r.tab = .library
@@ -86,21 +83,6 @@ private let picker = WorkspacePicker(workspaces: [work, home], unsortedCount: 2,
         #expect(r.focusedDoc == "c")
         r.open(.doc("d"))
         #expect(r.focusedDoc == "d")
-        #expect(r.canPerform(.toggleEdit, signedIn: true, picker: picker))
-        _ = r.perform(.toggleEdit, picker: picker)
-        #expect(r.editRequest == EditRequest(doc: "d", serial: 1))
-        _ = r.perform(.toggleEdit, picker: picker)
-        #expect(r.editRequest == EditRequest(doc: "d", serial: 2), "a second ⌘E is a new request")
-    }
-
-    @Test func doneGoesToTheDocBeingEditedEvenIfAnotherIsInFront() {
-        let r = Router()
-        r.isPad = true
-        r.select(.today)
-        r.editingDoc = "e"
-        #expect(r.canPerform(.toggleEdit, signedIn: true, picker: picker))
-        _ = r.perform(.toggleEdit, picker: picker)
-        #expect(r.editRequest?.doc == "e")
     }
 
     @Test func navigationCommandsMoveTheRightLayout() {

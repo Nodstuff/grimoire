@@ -33,7 +33,7 @@ struct TaisceCommands: Commands {
         CommandGroup(replacing: .newItem) {
             item("New Doc", .newDoc).keyboardShortcut("n")
         }
-        // ⌥⌘E: ⌘E is Edit Doc and ⇧⌘E inline code in the editor
+        // ⌥⌘E (⇧⌘E is inline code in the editor)
         CommandGroup(replacing: .importExport) {
             item("Export as PDF\u{2026}", .exportPDF).keyboardShortcut("e", modifiers: [.command, .option])
         }
@@ -41,7 +41,6 @@ struct TaisceCommands: Commands {
             item("Settings\u{2026}", .settings).keyboardShortcut(",")
         }
         CommandMenu("Doc") {
-            item(router?.editingDoc != nil ? "Done Editing" : "Edit Doc", .toggleEdit).keyboardShortcut("e")
             item("Refresh", .refresh).keyboardShortcut("r")
             Divider()
             item("Share Link\u{2026}", .shareLink)

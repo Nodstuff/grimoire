@@ -1,0 +1,1696 @@
+{
+ "_comment": "Shared vectors for the doc diff: ui/src/editor/diff.ts (diff.vectors.test.ts) and apple/TaisceKit DocDiff (DocDiffTests). Inserts mint new-1, new-2, ... per case. Regenerate only when diff.ts changes on purpose.",
+ "cases": [
+  {
+   "name": "no changes",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "parent": "h1",
+     "order_key": "q"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "level": 1
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "level": 0
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "level": 0
+    }
+   ],
+   "ops": []
+  },
+  {
+   "name": "content change is one replace",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "parent": "h1",
+     "order_key": "q"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "level": 1
+    },
+    {
+     "id": "p1",
+     "content": "edited",
+     "level": 0
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "replace",
+     "target": "p1",
+     "content": "edited"
+    }
+   ]
+  },
+  {
+   "name": "removed entry is a delete",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "parent": "h1",
+     "order_key": "q"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "level": 1
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "delete",
+     "target": "p2"
+    }
+   ]
+  },
+  {
+   "name": "new entry between siblings",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "parent": "h1",
+     "order_key": "q"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "level": 1
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "inserted",
+     "level": 0
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": "h1",
+     "order_key": "m",
+     "block_type": "paragraph",
+     "content": "inserted",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "swapped siblings move one",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "parent": "h1",
+     "order_key": "q"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "level": 1
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "level": 0
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "move",
+     "target": "p1",
+     "new_parent": "h1",
+     "new_order_key": "v"
+    }
+   ]
+  },
+  {
+   "name": "deleting a heading reparents its children",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "parent": "h1",
+     "order_key": "q"
+    }
+   ],
+   "entries": [
+    {
+     "id": "p1",
+     "content": "first para",
+     "level": 0
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "delete",
+     "target": "h1"
+    },
+    {
+     "op": "move",
+     "target": "p1",
+     "new_parent": null,
+     "new_order_key": "i"
+    },
+    {
+     "op": "move",
+     "target": "p2",
+     "new_parent": null,
+     "new_order_key": "r"
+    }
+   ]
+  },
+  {
+   "name": "new heading adopts following paragraphs",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "parent": "h1",
+     "order_key": "q"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "level": 1
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "level": 0
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "## New Section",
+     "level": 2
+    },
+    {
+     "id": null,
+     "content": "section body",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": "h1",
+     "order_key": "v",
+     "block_type": "heading",
+     "content": "## New Section",
+     "refers_to": null
+    },
+    {
+     "op": "insert",
+     "block_id": "new-2",
+     "parent_id": "new-1",
+     "order_key": "i",
+     "block_type": "paragraph",
+     "content": "section body",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "empty doc gets inserts",
+   "baseline": [],
+   "entries": [
+    {
+     "id": null,
+     "content": "# A",
+     "level": 1
+    },
+    {
+     "id": null,
+     "content": "body",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "## B",
+     "level": 2
+    },
+    {
+     "id": null,
+     "content": "more",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": null,
+     "order_key": "i",
+     "block_type": "heading",
+     "content": "# A",
+     "refers_to": null
+    },
+    {
+     "op": "insert",
+     "block_id": "new-2",
+     "parent_id": "new-1",
+     "order_key": "i",
+     "block_type": "paragraph",
+     "content": "body",
+     "refers_to": null
+    },
+    {
+     "op": "insert",
+     "block_id": "new-3",
+     "parent_id": "new-1",
+     "order_key": "r",
+     "block_type": "heading",
+     "content": "## B",
+     "refers_to": null
+    },
+    {
+     "op": "insert",
+     "block_id": "new-4",
+     "parent_id": "new-3",
+     "order_key": "i",
+     "block_type": "paragraph",
+     "content": "more",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "heading promoted from h2 to h1 leaves its parent",
+   "baseline": [
+    {
+     "id": "a",
+     "content": "# A",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "b",
+     "content": "## B",
+     "parent": "a",
+     "order_key": "i"
+    },
+    {
+     "id": "c",
+     "content": "c text",
+     "parent": "b",
+     "order_key": "i"
+    }
+   ],
+   "entries": [
+    {
+     "id": "a",
+     "content": "# A",
+     "level": 1
+    },
+    {
+     "id": "b",
+     "content": "# B",
+     "level": 1
+    },
+    {
+     "id": "c",
+     "content": "c text",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "move",
+     "target": "b",
+     "new_parent": null,
+     "new_order_key": "r"
+    },
+    {
+     "op": "replace",
+     "target": "b",
+     "content": "# B"
+    }
+   ]
+  },
+  {
+   "name": "split: first half keeps the id, the second is new",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "parent": "h1",
+     "order_key": "q"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "level": 1
+    },
+    {
+     "id": "p1",
+     "content": "first",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "para",
+     "level": 0
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "replace",
+     "target": "p1",
+     "content": "first"
+    },
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": "h1",
+     "order_key": "m",
+     "block_type": "paragraph",
+     "content": "para",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "merge: the second goes, the first takes the text",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "parent": "h1",
+     "order_key": "q"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "level": 1
+    },
+    {
+     "id": "p1",
+     "content": "first parasecond para",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "delete",
+     "target": "p2"
+    },
+    {
+     "op": "replace",
+     "target": "p1",
+     "content": "first parasecond para"
+    }
+   ]
+  },
+  {
+   "name": "a client-minted id not in the baseline is an insert with that id",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "parent": "h1",
+     "order_key": "q"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "level": 1
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "level": 0
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "level": 0
+    },
+    {
+     "id": "minted-1",
+     "content": "typed",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "minted-1",
+     "parent_id": "h1",
+     "order_key": "v",
+     "block_type": "paragraph",
+     "content": "typed",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "moving a section before another",
+   "baseline": [
+    {
+     "id": "a",
+     "content": "# A",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "a1",
+     "content": "a body",
+     "parent": "a",
+     "order_key": "i"
+    },
+    {
+     "id": "b",
+     "content": "# B",
+     "parent": null,
+     "order_key": "r"
+    },
+    {
+     "id": "b1",
+     "content": "b body",
+     "parent": "b",
+     "order_key": "i"
+    }
+   ],
+   "entries": [
+    {
+     "id": "b",
+     "content": "# B",
+     "level": 1
+    },
+    {
+     "id": "b1",
+     "content": "b body",
+     "level": 0
+    },
+    {
+     "id": "a",
+     "content": "# A",
+     "level": 1
+    },
+    {
+     "id": "a1",
+     "content": "a body",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "move",
+     "target": "a",
+     "new_parent": null,
+     "new_order_key": "v"
+    }
+   ]
+  },
+  {
+   "name": "deleting a middle heading",
+   "baseline": [
+    {
+     "id": "a",
+     "content": "# A",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "b",
+     "content": "## B",
+     "parent": "a",
+     "order_key": "i"
+    },
+    {
+     "id": "c",
+     "content": "c text",
+     "parent": "b",
+     "order_key": "i"
+    },
+    {
+     "id": "d",
+     "content": "d text",
+     "parent": "b",
+     "order_key": "r"
+    }
+   ],
+   "entries": [
+    {
+     "id": "a",
+     "content": "# A",
+     "level": 1
+    },
+    {
+     "id": "c",
+     "content": "c text",
+     "level": 0
+    },
+    {
+     "id": "d",
+     "content": "d text",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "delete",
+     "target": "b"
+    },
+    {
+     "op": "move",
+     "target": "c",
+     "new_parent": "a",
+     "new_order_key": "i"
+    },
+    {
+     "op": "move",
+     "target": "d",
+     "new_parent": "a",
+     "new_order_key": "r"
+    }
+   ]
+  },
+  {
+   "name": "rotation keeps the longest increasing run",
+   "baseline": [
+    {
+     "id": "a",
+     "content": "a",
+     "parent": null,
+     "order_key": "c"
+    },
+    {
+     "id": "bb",
+     "content": "b",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "c",
+     "content": "c",
+     "parent": null,
+     "order_key": "r"
+    }
+   ],
+   "entries": [
+    {
+     "id": "c",
+     "content": "c",
+     "level": 0
+    },
+    {
+     "id": "a",
+     "content": "a",
+     "level": 0
+    },
+    {
+     "id": "bb",
+     "content": "b",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "move",
+     "target": "a",
+     "new_parent": null,
+     "new_order_key": "v"
+    },
+    {
+     "op": "move",
+     "target": "bb",
+     "new_parent": null,
+     "new_order_key": "x"
+    }
+   ]
+  },
+  {
+   "name": "nesting the server holds is left alone",
+   "baseline": [
+    {
+     "id": "l",
+     "content": "- list",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "x",
+     "content": "child of list",
+     "parent": "l",
+     "order_key": "i"
+    }
+   ],
+   "entries": [
+    {
+     "id": "l",
+     "content": "- list",
+     "level": 0
+    },
+    {
+     "id": "x",
+     "content": "child of list",
+     "level": 0
+    }
+   ],
+   "ops": []
+  },
+  {
+   "name": "a misnested doc plus a typo is one replace and no moves",
+   "baseline": [
+    {
+     "id": "h",
+     "content": "# H",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "parent": null,
+     "order_key": "r"
+    },
+    {
+     "id": "q",
+     "content": "qara",
+     "parent": null,
+     "order_key": "v"
+    },
+    {
+     "id": "h2",
+     "content": "## Sub",
+     "parent": null,
+     "order_key": "x"
+    },
+    {
+     "id": "s",
+     "content": "sub body",
+     "parent": null,
+     "order_key": "y"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h",
+     "content": "# H",
+     "level": 1
+    },
+    {
+     "id": "p",
+     "content": "para, fixed",
+     "level": 0
+    },
+    {
+     "id": "q",
+     "content": "qara",
+     "level": 0
+    },
+    {
+     "id": "h2",
+     "content": "## Sub",
+     "level": 2
+    },
+    {
+     "id": "s",
+     "content": "sub body",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "replace",
+     "target": "p",
+     "content": "para, fixed"
+    }
+   ]
+  },
+  {
+   "name": "inserting a heading above a block moves it under the heading",
+   "baseline": [
+    {
+     "id": "p",
+     "content": "one",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "q",
+     "content": "two",
+     "parent": null,
+     "order_key": "r"
+    }
+   ],
+   "entries": [
+    {
+     "id": "p",
+     "content": "one",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "# New",
+     "level": 1
+    },
+    {
+     "id": "q",
+     "content": "two",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": null,
+     "order_key": "r",
+     "block_type": "heading",
+     "content": "# New",
+     "refers_to": null
+    },
+    {
+     "op": "move",
+     "target": "q",
+     "new_parent": "new-1",
+     "new_order_key": "i"
+    }
+   ]
+  },
+  {
+   "name": "a new paragraph in a misnested doc lands beside its neighbour",
+   "baseline": [
+    {
+     "id": "h",
+     "content": "# H",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "parent": null,
+     "order_key": "r"
+    },
+    {
+     "id": "q",
+     "content": "qara",
+     "parent": null,
+     "order_key": "v"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h",
+     "content": "# H",
+     "level": 1
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "new",
+     "level": 0
+    },
+    {
+     "id": "q",
+     "content": "qara",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": null,
+     "order_key": "t",
+     "block_type": "paragraph",
+     "content": "new",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "a new paragraph right under a heading goes first in its section",
+   "baseline": [
+    {
+     "id": "h",
+     "content": "# H",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "parent": null,
+     "order_key": "r"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h",
+     "content": "# H",
+     "level": 1
+    },
+    {
+     "id": null,
+     "content": "new",
+     "level": 0
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": "h",
+     "order_key": "i",
+     "block_type": "paragraph",
+     "content": "new",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "deleting a stored parent re-homes its child",
+   "baseline": [
+    {
+     "id": "l",
+     "content": "- list",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "x",
+     "content": "child of list",
+     "parent": "l",
+     "order_key": "i"
+    },
+    {
+     "id": "z",
+     "content": "after",
+     "parent": null,
+     "order_key": "r"
+    }
+   ],
+   "entries": [
+    {
+     "id": "x",
+     "content": "child of list",
+     "level": 0
+    },
+    {
+     "id": "z",
+     "content": "after",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "delete",
+     "target": "l"
+    },
+    {
+     "op": "move",
+     "target": "x",
+     "new_parent": null,
+     "new_order_key": "d"
+    }
+   ]
+  },
+  {
+   "name": "promoting a subheading keeps the server tree in the editor order",
+   "baseline": [
+    {
+     "id": "A",
+     "content": "## A",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "S",
+     "content": "### S",
+     "parent": "A",
+     "order_key": "i"
+    },
+    {
+     "id": "s1",
+     "content": "s1",
+     "parent": "S",
+     "order_key": "i"
+    },
+    {
+     "id": "a2",
+     "content": "a2",
+     "parent": "A",
+     "order_key": "r"
+    },
+    {
+     "id": "B",
+     "content": "## B",
+     "parent": null,
+     "order_key": "r"
+    }
+   ],
+   "entries": [
+    {
+     "id": "A",
+     "content": "## A",
+     "level": 2
+    },
+    {
+     "id": "S",
+     "content": "## S",
+     "level": 2
+    },
+    {
+     "id": "s1",
+     "content": "s1",
+     "level": 0
+    },
+    {
+     "id": "a2",
+     "content": "a2",
+     "level": 0
+    },
+    {
+     "id": "B",
+     "content": "## B",
+     "level": 2
+    }
+   ],
+   "ops": [
+    {
+     "op": "move",
+     "target": "S",
+     "new_parent": null,
+     "new_order_key": "m"
+    },
+    {
+     "op": "replace",
+     "target": "S",
+     "content": "## S"
+    },
+    {
+     "op": "move",
+     "target": "a2",
+     "new_parent": "S",
+     "new_order_key": "r"
+    }
+   ]
+  },
+  {
+   "name": "a heading level change in a flat doc moves nothing else",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# H1",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "p1",
+     "parent": null,
+     "order_key": "m"
+    },
+    {
+     "id": "h5",
+     "content": "# H5",
+     "parent": null,
+     "order_key": "q"
+    },
+    {
+     "id": "h3",
+     "content": "### H3",
+     "parent": null,
+     "order_key": "u"
+    },
+    {
+     "id": "h4",
+     "content": "### H4",
+     "parent": null,
+     "order_key": "w"
+    },
+    {
+     "id": "p3",
+     "content": "p3",
+     "parent": null,
+     "order_key": "x"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# H1",
+     "level": 1
+    },
+    {
+     "id": "p1",
+     "content": "p1",
+     "level": 0
+    },
+    {
+     "id": "h5",
+     "content": "### H5",
+     "level": 3
+    },
+    {
+     "id": "h3",
+     "content": "### H3",
+     "level": 3
+    },
+    {
+     "id": "h4",
+     "content": "### H4",
+     "level": 3
+    },
+    {
+     "id": "p3",
+     "content": "p3",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "replace",
+     "target": "h5",
+     "content": "### H5"
+    }
+   ]
+  },
+  {
+   "name": "a heading level change in a nested doc re-homes only its changed section",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# H1",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "p1",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "h2",
+     "content": "# H2",
+     "parent": null,
+     "order_key": "r"
+    },
+    {
+     "id": "p2",
+     "content": "p2",
+     "parent": "h2",
+     "order_key": "i"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# H1",
+     "level": 1
+    },
+    {
+     "id": "p1",
+     "content": "p1",
+     "level": 0
+    },
+    {
+     "id": "h2",
+     "content": "## H2",
+     "level": 2
+    },
+    {
+     "id": "p2",
+     "content": "p2",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "move",
+     "target": "h2",
+     "new_parent": "h1",
+     "new_order_key": "r"
+    },
+    {
+     "op": "replace",
+     "target": "h2",
+     "content": "## H2"
+    }
+   ]
+  },
+  {
+   "name": "a heading demoted to text releases its section",
+   "baseline": [
+    {
+     "id": "h",
+     "content": "# H",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "parent": "h",
+     "order_key": "i"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h",
+     "content": "H",
+     "level": 0
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "replace",
+     "target": "h",
+     "content": "H"
+    },
+    {
+     "op": "move",
+     "target": "p",
+     "new_parent": null,
+     "new_order_key": "r"
+    }
+   ]
+  },
+  {
+   "name": "insert at the front of the top level",
+   "baseline": [
+    {
+     "id": "a",
+     "content": "a",
+     "parent": null,
+     "order_key": "i"
+    }
+   ],
+   "entries": [
+    {
+     "id": null,
+     "content": "new first",
+     "level": 0
+    },
+    {
+     "id": "a",
+     "content": "a",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": null,
+     "order_key": "9",
+     "block_type": "paragraph",
+     "content": "new first",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "block types are inferred from the content",
+   "baseline": [],
+   "entries": [
+    {
+     "id": null,
+     "content": "```mermaid\ngraph TD\n```",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "```d2\na -> b\n```",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "```swift\nlet x = 1\n```",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "---\ntags: [a]\n---",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "DECISION: ship it",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "- [ ] task",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "#nospace",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": null,
+     "order_key": "i",
+     "block_type": "diagram_mermaid",
+     "content": "```mermaid\ngraph TD\n```",
+     "refers_to": null
+    },
+    {
+     "op": "insert",
+     "block_id": "new-2",
+     "parent_id": null,
+     "order_key": "r",
+     "block_type": "diagram_d2",
+     "content": "```d2\na -> b\n```",
+     "refers_to": null
+    },
+    {
+     "op": "insert",
+     "block_id": "new-3",
+     "parent_id": null,
+     "order_key": "v",
+     "block_type": "code",
+     "content": "```swift\nlet x = 1\n```",
+     "refers_to": null
+    },
+    {
+     "op": "insert",
+     "block_id": "new-4",
+     "parent_id": null,
+     "order_key": "x",
+     "block_type": "code",
+     "content": "---\ntags: [a]\n---",
+     "refers_to": null
+    },
+    {
+     "op": "insert",
+     "block_id": "new-5",
+     "parent_id": null,
+     "order_key": "y",
+     "block_type": "decision",
+     "content": "DECISION: ship it",
+     "refers_to": null
+    },
+    {
+     "op": "insert",
+     "block_id": "new-6",
+     "parent_id": null,
+     "order_key": "z",
+     "block_type": "paragraph",
+     "content": "- [ ] task",
+     "refers_to": null
+    },
+    {
+     "op": "insert",
+     "block_id": "new-7",
+     "parent_id": null,
+     "order_key": "zi",
+     "block_type": "paragraph",
+     "content": "#nospace",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "equal sibling keys still order",
+   "baseline": [
+    {
+     "id": "a",
+     "content": "a",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "bb",
+     "content": "b",
+     "parent": null,
+     "order_key": "i"
+    }
+   ],
+   "entries": [
+    {
+     "id": "a",
+     "content": "a",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "mid",
+     "level": 0
+    },
+    {
+     "id": "bb",
+     "content": "b",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": null,
+     "order_key": "r",
+     "block_type": "paragraph",
+     "content": "mid",
+     "refers_to": null
+    },
+    {
+     "op": "move",
+     "target": "bb",
+     "new_parent": null,
+     "new_order_key": "v"
+    }
+   ]
+  },
+  {
+   "name": "unicode content round-trips",
+   "baseline": [
+    {
+     "id": "a",
+     "content": "café ☕️ 日本",
+     "parent": null,
+     "order_key": "i"
+    }
+   ],
+   "entries": [
+    {
+     "id": "a",
+     "content": "café ☕️ 日本語 😀",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "replace",
+     "target": "a",
+     "content": "café ☕️ 日本語 😀"
+    }
+   ]
+  },
+  {
+   "name": "everything deleted",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# Title",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "first para",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "p2",
+     "content": "second para",
+     "parent": "h1",
+     "order_key": "q"
+    }
+   ],
+   "entries": [],
+   "ops": [
+    {
+     "op": "delete",
+     "target": "h1"
+    },
+    {
+     "op": "delete",
+     "target": "p1"
+    },
+    {
+     "op": "delete",
+     "target": "p2"
+    }
+   ]
+  },
+  {
+   "name": "adjacent keys bisect deeper",
+   "baseline": [
+    {
+     "id": "a",
+     "content": "a",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "bb",
+     "content": "b",
+     "parent": null,
+     "order_key": "j"
+    }
+   ],
+   "entries": [
+    {
+     "id": "a",
+     "content": "a",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "x",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "y",
+     "level": 0
+    },
+    {
+     "id": "bb",
+     "content": "b",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": null,
+     "order_key": "ii",
+     "block_type": "paragraph",
+     "content": "x",
+     "refers_to": null
+    },
+    {
+     "op": "insert",
+     "block_id": "new-2",
+     "parent_id": null,
+     "order_key": "ir",
+     "block_type": "paragraph",
+     "content": "y",
+     "refers_to": null
+    }
+   ]
+  }
+ ]
+}
