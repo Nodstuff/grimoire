@@ -302,50 +302,55 @@ changed elsewhere; the alerts themselves stay local. The server sends
 
 ## Library tree
 
-The Library (compact width) and the sidebar's Library section (iPad, Mac)
-show the current workspace's slice of the doc tree. A folder is any doc with
-children. Context menu: Pin, New doc here, **Move to…**, Move to workspace…,
+The Library (iPhone tab) and the sidebar's Library section (iPad, Mac) are
+`LibraryTree` (`Views/LibraryTree.swift`): the tree drawn row by row in a
+plain `ScrollView`, not a `List`. List rows never receive drops on iOS or
+Mac Catalyst (a row could be lifted and put nowhere), so the tree owns its
+rows: selection and hover highlight, a chevron strip (the row's leading
+edge) that opens and closes a folder, a click or tap elsewhere opens the
+doc, arrow keys in the sidebar (after a click: up/down move, right opens or
+enters, left closes or goes to the parent), VoiceOver rows (one element
+each, Expand/Collapse on folders). A folder is any doc with children.
+Context menu: Pin, New doc here, **Move to…**, Move to workspace… (iPhone),
 Delete.
 
 Moving a doc (`POST /api/doc/{id}/move` `{parent_id, sort_key}`):
 
-- **Drag** a row onto another row: it becomes that doc's last child (the
-  target opens, and becomes a folder if it wasn't). Drag onto the **Library
-  header** for the top level. A drag carries the doc id as
-  `UTType.taisceDoc` (`ie.null.taisce.doc-reference`, declared in
-  `UTExportedTypeDeclarations` in `project.yml` and `Support/Info-Debug.plist`;
-  data, not text, visible to this app only), so the editor and other apps
-  never take a row, and rows take nothing else. Drop targets use a
-  `DropDelegate` and know the dragged doc from the drag's start: a target it
-  can't go to shows the forbidden badge and no outline, and a drop that still
-  can't go there says why in the "Couldn't move" alert.
+- **Drag** a row (iPhone: press, then move) onto another. Each row has three
+  zones: its top quarter puts the doc just **before** it, the middle
+  **inside** it (the last child; the folder opens), the bottom quarter just
+  **after** it; on an open folder the bottom edge means first inside it. An
+  insertion line or an outlined row shows where; a place it can't go shows
+  nothing and refuses the drop. A closed folder opens after a drag rests on
+  it for 0.7 s; the space under the last row and the Library header are the
+  top level; a drag near the top or bottom edge scrolls the tree
+  (`TreeScroller`). A drag carries the doc id as `UTType.taisceDoc`
+  (`ie.null.taisce.doc-reference`, declared in `UTExportedTypeDeclarations`
+  in `project.yml` and `Support/Info-Debug.plist`; data, this app only), so
+  the editor and other apps never take a row.
 - **Move to…** (`MoveDocSheet`): a searchable list of the docs in the same
-  workspace it can go under, plus Top level; the non-drag path for touch,
-  VoiceOver and the keyboard.
-- Rules (`DocMoves`, pure; `DocPlacement` in TaisceKit): never into itself or
-  its own subtree (the server refuses the cycle too), only within its own
-  workspace (a workspace change is Move to workspace…), never in a workspace
-  you only view (`EditAccess.canReparent`: owner or editor; LOCAL mode and
-  Unsorted are yours). The top level is an owner's call (`canMove`): the
-  server files an unlabelled root in the mover's Unsorted and lets only a
-  workspace's owner re-home its top-level docs. So a doc whose workspace
-  comes from its parent is labelled with it first (a queued `PUT
-  /api/docs/{id}/workspace` with its own UUID `request_id`, which the move
-  waits on); if the label lands and the move is then refused, the label is
-  undone (`workspace_id: null`), which leaves the doc resolving where it was.
+  workspace it can go under, plus Top level; the non-drag path. Sheets shown
+  from the sidebar get `AppModel` passed by hand (`.environment(model)`):
+  without it, Move to… trapped on the Mac.
+- Rules (`DocMoves`, pure): never into itself or its own subtree, only within
+  its own workspace (a workspace change is Move to workspace…), never in a
+  workspace you only view (`EditAccess.canReparent`: owner or editor; LOCAL
+  mode and Unsorted are yours). The top level is an owner's call
+  (`canMove`). Before/after (`DocMoves.place`) is a reorder among siblings,
+  otherwise the same rules; never beside a doc with no order key (it sorts
+  last and bounds nothing). A move to the top level labels a doc whose
+  workspace comes from its parent first (a queued `PUT
+  /api/docs/{id}/workspace`), undone if the move is then refused.
 - Offline first: `Cache.enqueueDocMove` queues the write and places the
-  cached row at once. An append sends `sort_key: null`, so the server picks
-  the key when it lands; meanwhile the row shows after the last keyed
-  sibling. Tree refreshes and change rows keep showing queued moves until
-  they land. A refusal (cycle, 403, 404) puts the doc back where the server
-  has it (`GET /api/doc/{id}`; a gone doc is dropped; a later queued move of
-  the same doc is laid back on top) and settles the row as done with the
-  reason, so sign-out doesn't count it as unsent. A move made this session
-  says why in the "Couldn't move" alert; one queued in an earlier session and
-  refused on a later replay says it in the top banner instead (and Settings
-  keeps it as the last error).
-- Not yet: dropping between rows to reorder siblings (`DocPlacement.place`
-  computes before/after keys; there is no drop indicator for it yet).
+  cached row at once (an append's key the server picks when it lands). A
+  refusal puts the doc back and says why ("Couldn't move" alert this
+  session, the top banner for an older one).
+- UI tests: `MoveDocUITests` drive real drags against a LOCAL daemon
+  (`TEST_RUNNER_TAISCE_UI_URL`): a click-drag on the Mac
+  (`click(forDuration:thenDragTo:)`; a touch-style press starts nothing
+  there), press-and-move on iPhone (held still, the long-press shows the
+  menu). Mac UI runs need Automation Mode
+  (`sudo automationmodetool enable-automationmode-without-authentication`).
 
 ## Editing
 
