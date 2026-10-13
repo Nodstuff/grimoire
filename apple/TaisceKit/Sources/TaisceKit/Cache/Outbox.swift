@@ -363,6 +363,21 @@ public struct OutboxReplayer: Sendable {
         public var forbidden = 0
         /// entries whose doc is gone (404): failed, kept, never retried on their own
         public var gone = 0
+        /// tree moves the server refused, oldest first (each rolled back
+        /// in the cache and its row settled as done, with the reason)
+        public var refusedMoves: [RefusedMove] = []
+
+        public var movesRefused: Int { refusedMoves.count }
+        /// the last refused move's words, for the UI
+        public var moveError: String? { refusedMoves.last?.message }
+    }
+
+    /// A move the server refused: its outbox key (the app knows which
+    /// moves it made this session), the doc, and why.
+    public struct RefusedMove: Sendable, Hashable {
+        public var key: String
+        public var doc: DocID
+        public var message: String
     }
 
     /// Stored on an entry refused with 403: the workspace is view-only for you.
@@ -373,63 +388,89 @@ public struct OutboxReplayer: Sendable {
     @discardableResult
     public func replay() async throws -> Report {
         var report = Report()
-        for queued in try await cache.pendingOutbox() {
-            // claim as it stands now: an earlier landing may have rebased it,
-            // a coalescing save may have rewritten it
-            guard let id = queued.id, let entry = try await cache.claimOutbox(id) else { continue }
-            do {
-                var r = try await api.request(entry.path, method: entry.method)
-                r.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                r.httpBody = entry.body
-                // sent on the base its blocks really have, given our own landed writes
-                if entry.path == "/api/propose", let body = entry.body,
-                   var req = try? JSONDecoder().decode(ProposeRequest.self, from: body) {
-                    let base = try await cache.adjustedBase(req)
-                    if base != req.baseEpoch {
-                        req.baseEpoch = base
-                        r.httpBody = try JSONEncoder().encode(req)
+        // a second pass only for follow-ups queued during the first (the
+        // label undo after a refused move)
+        for _ in 0..<2 {
+            var followUp = false
+            for queued in try await cache.pendingOutbox() {
+                // claim as it stands now: an earlier landing may have rebased it,
+                // a coalescing save may have rewritten it
+                guard let id = queued.id, let entry = try await cache.claimOutbox(id) else { continue }
+                let move = Cache.docMove(of: entry)
+                // a move to the top level waits on its label: refused, the move
+                // would file the doc in Unsorted instead
+                if let move, let label = try await cache.outboxEntry(key: Cache.labelKey(forMove: entry.idempotencyKey)), label.state == .failed {
+                    let msg = Self.moveRefusal(.server(label.lastError ?? "its workspace label was refused"))
+                    followUp = try await refuseMove(entry, move, message: msg, report: &report) || followUp
+                    continue
+                }
+                do {
+                    var r = try await api.request(entry.path, method: entry.method)
+                    r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    r.httpBody = entry.body
+                    // sent on the base its blocks really have, given our own landed writes
+                    if entry.path == "/api/propose", let body = entry.body,
+                       var req = try? JSONDecoder().decode(ProposeRequest.self, from: body) {
+                        let base = try await cache.adjustedBase(req)
+                        if base != req.baseEpoch {
+                            req.baseEpoch = base
+                            r.httpBody = try JSONEncoder().encode(req)
+                        }
                     }
+                    let data = try await api.send(raw: r)
+                    let isPropose = entry.path == "/api/propose" || entry.path == "/api/propose_markdown"
+                    try await cache.markOutbox(id, state: .done, outcome: isPropose ? data : nil)
+                    // whole-doc proposes (no per-block bases) rebase only onto our
+                    // own write: an epoch that jumped further means someone else wrote
+                    if entry.path == "/api/propose_markdown", let (doc, base) = Self.proposeBase(entry),
+                       let outcome = try? JSONDecoder().decode(Landed.self, from: data), outcome.epoch == base + 1 {
+                        try await cache.rebaseOutbox(docID: doc, from: base, to: outcome.epoch)
+                    }
+                } catch let APIError.server(msg) where msg.hasPrefix(Self.liveSessionRefusal) {
+                    // a live session freezes the doc's epoch: retry after it ends
+                    try await cache.markOutbox(id, state: .pending, error: msg)
+                    return report
+                } catch APIError.unauthorized {
+                    // signed out or mid-refresh: not this entry's fault, keep it and the order
+                    try await cache.markOutbox(id, state: .pending, error: String(describing: APIError.unauthorized))
+                    return report
+                } catch let e as APIError where e.isTransient {
+                    // 5xx, 408, 429, or a proxy's HTML page: try again later, keep order
+                    try await cache.markOutbox(id, state: .pending, error: String(describing: e))
+                    return report
+                } catch let e as APIError where move != nil {
+                    // the server refused a move (a cycle, no write access on the
+                    // doc or the new parent, a doc gone): it never lands, so the
+                    // doc goes back to where the server has it
+                    if let move { followUp = try await refuseMove(entry, move, message: Self.moveRefusal(e), report: &report) || followUp }
+                } catch let e as APIError where Cache.moveLabelRole(of: entry) == .label {
+                    // a move's label: failed, so the move after it is held back
+                    // (and settles both); not a viewer's write to report
+                    try await cache.markOutbox(id, state: .failed, error: Self.moveRefusal(e))
+                } catch let e as APIError where Cache.moveLabelRole(of: entry) == .undo {
+                    // undoing a refused move's label: nothing left to send
+                    try await cache.markOutbox(id, state: .done, error: Self.moveRefusal(e))
+                } catch let e as APIError where e.isForbidden {
+                    // ADR 0004: read-only here (a viewer, or the role changed
+                    // under us). Never retried on its own; the rest carry on.
+                    try await cache.markOutbox(id, state: .failed, error: Self.readOnlyMessage)
+                    report.forbidden += 1
+                } catch APIError.notFound {
+                    // the doc is gone (hard-deleted elsewhere): kept as failed, so
+                    // the text stays where refused writes are shown and can be
+                    // copied out. Only a `revoked` row drops writes (dropOutbox).
+                    try await cache.markOutbox(id, state: .failed, error: Self.goneMessage)
+                    report.gone += 1
+                } catch let e as APIError {
+                    // the server answered: retrying the same request won't help
+                    try await cache.markOutbox(id, state: .failed, error: String(describing: e))
+                } catch {
+                    // transport failure: leave it for the next replay, keep order
+                    try await cache.markOutbox(id, state: .pending, error: String(describing: error))
+                    return report
                 }
-                let data = try await api.send(raw: r)
-                let isPropose = entry.path == "/api/propose" || entry.path == "/api/propose_markdown"
-                try await cache.markOutbox(id, state: .done, outcome: isPropose ? data : nil)
-                // whole-doc proposes (no per-block bases) rebase only onto our
-                // own write: an epoch that jumped further means someone else wrote
-                if entry.path == "/api/propose_markdown", let (doc, base) = Self.proposeBase(entry),
-                   let outcome = try? JSONDecoder().decode(Landed.self, from: data), outcome.epoch == base + 1 {
-                    try await cache.rebaseOutbox(docID: doc, from: base, to: outcome.epoch)
-                }
-            } catch let APIError.server(msg) where msg.hasPrefix(Self.liveSessionRefusal) {
-                // a live session freezes the doc's epoch: retry after it ends
-                try await cache.markOutbox(id, state: .pending, error: msg)
-                return report
-            } catch APIError.unauthorized {
-                // signed out or mid-refresh: not this entry's fault, keep it and the order
-                try await cache.markOutbox(id, state: .pending, error: String(describing: APIError.unauthorized))
-                return report
-            } catch let e as APIError where e.isTransient {
-                // 5xx, 408, 429, or a proxy's HTML page: try again later, keep order
-                try await cache.markOutbox(id, state: .pending, error: String(describing: e))
-                return report
-            } catch let e as APIError where e.isForbidden {
-                // ADR 0004: read-only here (a viewer, or the role changed
-                // under us). Never retried on its own; the rest carry on.
-                try await cache.markOutbox(id, state: .failed, error: Self.readOnlyMessage)
-                report.forbidden += 1
-            } catch APIError.notFound {
-                // the doc is gone (hard-deleted elsewhere): kept as failed, so
-                // the text stays where refused writes are shown and can be
-                // copied out. Only a `revoked` row drops writes (dropOutbox).
-                try await cache.markOutbox(id, state: .failed, error: Self.goneMessage)
-                report.gone += 1
-            } catch let e as APIError {
-                // the server answered: retrying the same request won't help
-                try await cache.markOutbox(id, state: .failed, error: String(describing: e))
-            } catch {
-                // transport failure: leave it for the next replay, keep order
-                try await cache.markOutbox(id, state: .pending, error: String(describing: error))
-                return report
             }
+            if !followUp { break }
         }
         return report
     }

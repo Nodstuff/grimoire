@@ -39,6 +39,8 @@ final class MockServer: Sendable {
 
     func handle(_ r: URLRequest) -> Reply {
         log.withLock { $0.append(r) }
+        // what the daemon's extractors refuse never reaches a handler
+        if let refused = ServerShapes.reject(r) { return refused }
         return handler(r)
     }
 
@@ -111,6 +113,40 @@ extension URLRequest {
     }
 
     var path: String { url?.path() ?? "" }
+}
+
+/// The daemon's axum extractors for the routes the app queues, so a body the
+/// real server can't read fails here too: `POST /api/doc/{id}/move`
+/// (`Path<Uuid>`, `MoveDocReq {parent_id: Option<Uuid>, sort_key:
+/// Option<String>}`) and `PUT /api/docs/{id}/workspace` (`AssignReq
+/// {workspace_id: Option<Uuid>, request_id: Option<Uuid>}`). A bad path is a
+/// 400, a bad body a 422, both plain text (as axum answers).
+enum ServerShapes {
+    static func reject(_ r: URLRequest) -> MockServer.Reply? {
+        let parts = r.path.split(separator: "/")
+        guard parts.count == 4, parts[0] == "api" else { return nil }
+        let isMove = r.httpMethod == "POST" && parts[1] == "doc" && parts[3] == "move"
+        let isLabel = r.httpMethod == "PUT" && parts[1] == "docs" && parts[3] == "workspace"
+        guard isMove || isLabel else { return nil }
+        guard UUID(uuidString: String(parts[2])) != nil else { return text(400, "Invalid URL: Cannot parse `\(parts[2])` to a `Uuid`") }
+        guard let data = r.httpBody, let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return text(422, "Failed to deserialize the JSON body into the target type")
+        }
+        func optUUID(_ k: String) -> Bool {
+            guard let v = obj[k], !(v is NSNull) else { return true }
+            return (v as? String).flatMap(UUID.init(uuidString:)) != nil
+        }
+        func optString(_ k: String) -> Bool {
+            guard let v = obj[k], !(v is NSNull) else { return true }
+            return v is String
+        }
+        let ok = isMove ? optUUID("parent_id") && optString("sort_key") : optUUID("workspace_id") && optUUID("request_id")
+        return ok ? nil : text(422, "Failed to deserialize the JSON body into the target type")
+    }
+
+    static func text(_ status: Int, _ s: String) -> MockServer.Reply {
+        MockServer.Reply(status: status, chunks: [Data(s.utf8)], contentType: "text/plain; charset=utf-8")
+    }
 }
 
 /// JSON fixtures in the daemon's real shapes (captured from /api/docs and /api/doc/{id}).

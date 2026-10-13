@@ -83,13 +83,18 @@ struct EditAccess: Hashable, Sendable {
     var canEdit: Bool
     /// new docs here (under a doc, or at the top of the current workspace)
     var canCreate: Bool
-    /// "Move to workspace…" (a label change leaves this space)
+    /// "Move to workspace…" (a label change leaves this space); also a move
+    /// to the top level (the server files it in the mover's space otherwise,
+    /// and only an owner may re-home a workspace's top-level docs)
     var canMove: Bool
     /// the doc screen's small note
     var note: String?
+    /// drag into a folder / "Move to…" within this workspace: an owner or an
+    /// editor (the server checks the doc and the new parent)
+    var canReparent: Bool = true
 
-    static let full = EditAccess(canEdit: true, canCreate: true, canMove: true, note: nil)
-    static let viewOnly = EditAccess(canEdit: false, canCreate: false, canMove: false, note: "View only")
+    static let full = EditAccess(canEdit: true, canCreate: true, canMove: true, note: nil, canReparent: true)
+    static let viewOnly = EditAccess(canEdit: false, canCreate: false, canMove: false, note: "View only", canReparent: false)
 
     /// For a doc resolving to `workspaceID` (nil = your Unsorted). A
     /// workspace this device doesn't know (an older server, a list not yet
@@ -99,7 +104,7 @@ struct EditAccess: Hashable, Sendable {
         guard let id = workspaceID, let w = workspaces.first(where: { $0.id == id }) else { return .full }
         if w.isViewOnly { return .viewOnly }
         // an editor writes, but only the owner moves docs out
-        return EditAccess(canEdit: true, canCreate: true, canMove: w.isOwn, note: nil)
+        return EditAccess(canEdit: true, canCreate: true, canMove: w.isOwn, note: nil, canReparent: true)
     }
 
     /// For a screen showing `scope` (Today, To-dos, Library, ⌘N): nil =

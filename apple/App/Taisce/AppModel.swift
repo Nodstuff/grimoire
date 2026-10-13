@@ -33,6 +33,14 @@ final class AppModel {
     /// whether the cache has delivered the tree at least once
     private(set) var treeLoaded = false
     var lastError: String?
+    /// a refused tree move made in this session, or a drop that can't go
+    /// there: the Library's "Couldn't move" alert (DocMoves.swift)
+    var moveError: String?
+    /// outbox keys of the moves made this session: their refusals get the
+    /// alert; one replayed from an earlier session gets the banner
+    @ObservationIgnored var movesThisSession: Set<String> = []
+    /// the Library row being dragged, so drop targets can refuse while hovering
+    @ObservationIgnored var draggingDoc: DocID?
     let dueAlerts: NotificationCoordinator
     // push: APNs token registration (Push.swift)
     let push = PushRegistrar(store: UserDefaultsPushStore(), environment: PushConfig.environment, appVersion: PushConfig.appVersion())
@@ -579,6 +587,17 @@ final class AppModel {
             // editing affordances follow the server's answer
             lastError = OutboxReplayer.readOnlyMessage
             refreshWorkspaces()
+        }
+        if let report, let last = report.refusedMoves.last {
+            // the doc is already back where the server has it; say why, once:
+            // the alert for a move you just made, the banner for one queued
+            // in an earlier session (out of context by now)
+            lastError = last.message
+            if let mine = report.refusedMoves.last(where: { movesThisSession.contains($0.key) }) {
+                moveError = mine.message
+            } else {
+                accessNotice = last.message
+            }
         }
     }
 

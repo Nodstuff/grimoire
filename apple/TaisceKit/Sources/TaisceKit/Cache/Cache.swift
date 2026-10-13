@@ -269,6 +269,7 @@ public final class Cache: Sendable {
             for s in summaries {
                 try DocRecord(s, bodyEpoch: bodyEpochs[s.id] ?? nil).upsert(db)
             }
+            try Self.reapplyQueuedMoves(db)
         }
     }
 
@@ -289,6 +290,7 @@ public final class Cache: Sendable {
             rec.workspaceID = s.workspaceID
             rec.currentEpoch = max(rec.currentEpoch, s.currentEpoch)
             try rec.upsert(db)
+            try Self.reapplyQueuedMoves(db)
         }
     }
 
@@ -327,6 +329,7 @@ public final class Cache: Sendable {
                 rec.workspaceID = existing.workspaceID
             }
             try rec.upsert(db)
+            try Self.reapplyQueuedMoves(db)
             try BlockRecord.filter(BlockRecord.Columns.docID == tree.doc.id).deleteAll(db)
             for (i, item) in flat.enumerated() {
                 let b = item.block
