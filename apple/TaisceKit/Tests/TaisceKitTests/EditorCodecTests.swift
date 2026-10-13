@@ -109,18 +109,32 @@ import Testing
     }
 
     @Test func untouchedBlocksSendNothing() throws {
+        // nested the way the importer nests (under the heading before it):
+        // the surface's diff derives parents from heading levels
+        var stack: [(Int, BlockID)] = []
+        var lastKey: [BlockID: String] = [:]
         let blocks = Self.corpus.enumerated().map { i, c in
-            Block(id: "b\(i)", docID: "d", parentID: nil, orderKey: OrderKey.between(nil, nil) + String(repeating: "i", count: i), blockType: c.0.hasPrefix("#") ? .heading : c.0.hasPrefix("```") ? .code : .paragraph, content: c.0)
+            let type: BlockType = c.0.hasPrefix("#") ? .heading : c.0.hasPrefix("```") ? .code : .paragraph
+            var level = 0
+            if case let .heading(l, _) = EditorBlockContent.parse(Block(id: "", docID: "d", parentID: nil, orderKey: "i", blockType: type, content: c.0)) { level = l }
+            if level > 0 { while let top = stack.last, top.0 >= level { stack.removeLast() } }
+            let parent = stack.last?.1
+            let key = OrderKey.between(lastKey[parent ?? ""], nil)
+            lastKey[parent ?? ""] = key
+            if level > 0 { stack.append((level, "b\(i)")) }
+            return Block(id: "b\(i)", docID: "d", parentID: parent, orderKey: key, blockType: type, content: c.0)
         }
-        var session = EditorSession(editor: DocEditor(docID: "d", baseEpoch: 3, blocks: blocks))
-        #expect(session.commitText().isEmpty, "opening a doc to edit writes nothing")
+        let (surfaceBlocks, baseline) = Surface.load(DocEditor(docID: "d", baseEpoch: 3, blocks: blocks))
+        let s = Surface.document(surfaceBlocks)
+        let known = Set(baseline.map(\.id))
+        let first = DocDiff.computeOps(baseline: baseline, entries: Surface.entries(s, known: known))
+        #expect(first.isEmpty, "opening a doc to edit writes nothing: \(first)")
         // editing one block writes only that block
-        let target = try #require(session.items.first { $0.content.markdown == "Plain paragraph." })
-        session.update(target.id, content: .paragraph(AttributedString("Plain paragraph, edited.")))
-        let reqs = session.commitText()
-        #expect(reqs.count == 1)
-        #expect(reqs.first?.ops.map(\.kind) == [.replace(target: target.id, content: "Plain paragraph, edited.")])
-        #expect(session.commitText().isEmpty)
+        let target = try #require(Surface.blocks(s).first { $0.content.markdown == "Plain paragraph." })
+        let at = target.range.location + "Plain paragraph".utf16.count
+        Surface.replace(s, NSRange(location: at, length: 1), with: ", edited.").apply(to: s)
+        let ops = DocDiff.computeOps(baseline: baseline, entries: Surface.entries(s, known: known))
+        #expect(ops == [.replace(target: target.id, content: "Plain paragraph, edited.")])
     }
 
     // MARK: the model

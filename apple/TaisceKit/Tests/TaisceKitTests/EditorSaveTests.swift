@@ -94,22 +94,38 @@ import Testing
         do {
             let cache = try Cache(path: path)
             try await seed(cache)
-            var session = EditorSession(editor: try #require(try await cache.editor(for: "d1")))
-            session.update("p1", content: .paragraph(AttributedString("alpha, offline")))
-            for r in session.commitText() { try await cache.enqueueCoalescing(r) }
-            let changeResult = session.returnKey("p1", caret: EditorCaret(offset: 14))
-            let change = try #require(changeResult)
-            try await cache.enqueue(try #require(change.request))
-            session.update(change.focus, content: .paragraph(AttributedString("a new block, offline")))
-            for r in session.commitText() { try await cache.enqueueCoalescing(r) }
+            let editor = try #require(try await cache.editor(for: "d1"))
+            let (blocks, start) = Surface.load(editor)
+            let s = Surface.document(blocks)
+            var baseline = start
+            func save() async throws {
+                let entries = Surface.entries(s, known: Set(baseline.map(\.id)))
+                let ops = DocDiff.computeOps(baseline: baseline, entries: entries)
+                guard !ops.isEmpty else { return }
+                try await cache.enqueueCoalescing(ProposeRequest(docID: "d1", baseEpoch: editor.baseEpoch, ops: ops, requestID: UUID().uuidString))
+                baseline = DocDiff.rebuildBaseline(baseline, entries: entries, ops: ops)
+            }
+            let p1 = try #require(Surface.blocks(s).first { $0.id == "p1" })
+            let end = p1.range.location + p1.range.length - 1
+            Surface.replace(s, NSRange(location: end, length: 0), with: ", offline").apply(to: s)
+            try await save()
+            var sel = NSRange()
+            let split = try #require(Surface.returnKey(s, at: end + ", offline".utf16.count))
+            split.apply(to: s)
+            sel = split.selection
+            Surface.normalize(s, selection: &sel)
+            try await save()
+            Surface.replace(s, sel, with: "a new block, offline").apply(to: s)
+            try await save()
         }
         // the app relaunches: a new cache on the same file
         let cache = try Cache(path: path)
-        #expect(try await cache.pendingOutbox().count == 3)
-        let restored = EditorSession(editor: try #require(try await cache.editor(for: "d1")))
-        #expect(restored.items.map(\.content.markdown) == ["# One", "alpha, offline", "a new block, offline", "bravo"])
-        var again = restored
-        #expect(again.commitText().isEmpty, "nothing to resend: the queue already holds it")
+        #expect(try await cache.pendingOutbox().count == 2)
+        let restored = Surface.load(try #require(try await cache.editor(for: "d1")))
+        #expect(restored.blocks.map(\.content.markdown) == ["# One", "alpha, offline", "a new block, offline", "bravo"])
+        let s = Surface.document(restored.blocks)
+        #expect(DocDiff.computeOps(baseline: restored.baseline, entries: Surface.entries(s, known: Set(restored.baseline.map(\.id)))).isEmpty,
+                "nothing to resend: the queue already holds it")
     }
 
     func green(_ epoch: Int, _ block: String) -> MockServer.Reply {

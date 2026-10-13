@@ -41,6 +41,13 @@ public enum Surface {
 
     public static func newID() -> BlockID { UUID().uuidString.lowercased() }
 
+    /// The characters without copying them (a text storage's own string;
+    /// `.string` bridges a copy, O(n) per call).
+    static func text(_ s: NSAttributedString) -> NSString {
+        if let m = s as? NSMutableAttributedString { return m.mutableString }
+        return s.string as NSString
+    }
+
     /// What a line is.
     public enum LineStyle: Hashable, Sendable {
         case paragraph
@@ -112,7 +119,7 @@ public enum Surface {
     }
 
     public static func lines(_ s: NSAttributedString) -> [Line] {
-        let ns = s.string as NSString
+        let ns = text(s)
         var out: [Line] = []
         var start = 0
         let n = ns.length
@@ -197,7 +204,7 @@ public enum Surface {
         var runs: [InlineRun] = []
         s.enumerateAttributes(in: range) { a, r, _ in
             guard a[marker] == nil else { return }
-            var text = (s.string as NSString).substring(with: r)
+            var text = text(s).substring(with: r)
             text = text.replacingOccurrences(of: softBreak, with: "\n").replacingOccurrences(of: attachment, with: "")
             guard !text.isEmpty else { return }
             runs.append(InlineRun(text, marks: InlineMarks(rawValue: (a[marks] as? Int) ?? 0), link: a[link] as? String, wiki: a[wiki] as? String))
@@ -478,7 +485,7 @@ public enum Surface {
         if let id = l.id { a[block] = id }
         if location > l.textRange.location, location - 1 < s.length {
             let before = s.attributes(at: location - 1, effectiveRange: nil)
-            if before[marker] == nil, (s.string as NSString).character(at: location - 1) != newline {
+            if before[marker] == nil, text(s).character(at: location - 1) != newline {
                 if let m = before[marks] as? Int, m != 0 { a[marks] = m }
                 // a link continues only inside it
                 if let lk = before[link] as? String, location < s.length, (s.attribute(link, at: location, effectiveRange: nil) as? String) == lk {
@@ -503,7 +510,7 @@ public enum Surface {
         let first = lineIndex(ls, at: range.location)
         var last = max(first, lineIndex(ls, at: max(range.location, range.location + range.length - 1)))
         let end = range.location + range.length
-        if range.length > 0, end < s.length, (s.string as NSString).character(at: end - 1) == newline {
+        if range.length > 0, end < s.length, Surface.text(s).character(at: end - 1) == newline {
             // the range takes a line's terminator: the next line joins this one
             last = max(last, lineIndex(ls, at: end))
         }
@@ -550,7 +557,7 @@ public enum Surface {
     /// block's whole line.
     public static func expandDeletion(_ range: NSRange, in s: NSAttributedString) -> NSRange {
         guard range.length > 0 else { return range }
-        let ns = s.string as NSString
+        let ns = text(s)
         let last = range.location + range.length - 1
         if ns.character(at: last) == objectChar, last + 1 < ns.length, ns.character(at: last + 1) == newline {
             return NSRange(location: range.location, length: range.length + 1)
@@ -593,7 +600,8 @@ public enum Surface {
     /// markers are where they belong and numbered. `selection` follows the
     /// text. True when anything changed.
     @discardableResult
-    public static func normalize(_ s: NSMutableAttributedString, selection: inout NSRange, mint: () -> BlockID = newID) -> Bool {
+    public static func normalize(_ s: NSMutableAttributedString, selection: inout NSRange, around: NSRange? = nil,
+                                 mint: () -> BlockID = newID) -> Bool {
         var changed = false
         func replace(_ r: NSRange, _ with: NSAttributedString) {
             s.replaceCharacters(in: r, with: with)
@@ -603,37 +611,56 @@ public enum Surface {
         // 1. a final terminator
         if s.length == 0 {
             replace(NSRange(location: 0, length: 0), render(.paragraph(AttributedString()), id: mint()))
-        } else if (s.string as NSString).character(at: s.length - 1) != newline {
+        } else if text(s).character(at: s.length - 1) != newline {
             let a = s.attributes(at: s.length - 1, effectiveRange: nil).filter { $0.key == block || $0.key == line }
             let keep = selection
             replace(NSRange(location: s.length, length: 0), NSAttributedString(string: "\n", attributes: a))
             selection = keep
         }
+        // `around`: only the lines it touches can be out of shape (typing
+        // in a line); nil: anywhere (an undo, a rebuild)
+        var scope: NSRange?
+        if let around {
+            let ns = text(s)
+            let lo = min(max(0, around.location), ns.length - 1)
+            let hi = min(max(lo, around.location + around.length), ns.length - 1)
+            let a = ns.paragraphRange(for: NSRange(location: max(0, lo - 1), length: 0))
+            let b = ns.paragraphRange(for: NSRange(location: min(ns.length - 1, hi + 1), length: 0))
+            scope = NSRange(location: a.location, length: b.location + b.length - a.location)
+        }
         // 2. non-text blocks alone on their lines; stray U+FFFC go
-        var ns = s.string as NSString
-        var i = ns.length - 1
-        while i >= 0 {
-            if ns.character(at: i) == objectChar {
-                let src = s.attribute(raw, at: i, effectiveRange: nil) as? String
-                if src == nil {
-                    replace(NSRange(location: i, length: 1), NSAttributedString())
-                } else {
-                    let a = s.attributes(at: i, effectiveRange: nil)
-                    let id = (a[block] as? String) ?? mint()
-                    if i + 1 < s.length, (s.string as NSString).character(at: i + 1) != newline {
-                        replace(NSRange(location: i + 1, length: 0), NSAttributedString(string: "\n", attributes: [block: id, line: LineStyle.raw.encoded]))
-                    } else if i + 1 < s.length {
-                        s.addAttributes([block: id, line: LineStyle.raw.encoded], range: NSRange(location: i + 1, length: 1))
-                    }
-                    if i > 0, (s.string as NSString).character(at: i - 1) != newline {
-                        let before = s.attributes(at: i - 1, effectiveRange: nil).filter { $0.key == block || $0.key == line }
-                        replace(NSRange(location: i, length: 0), NSAttributedString(string: "\n", attributes: before))
-                    }
+        var ns = text(s)
+        var searchEnd = scope.map { $0.location + $0.length } ?? ns.length
+        let searchStart = scope?.location ?? 0
+        while searchEnd > searchStart {
+            let found = text(s).range(of: attachment, options: [.literal, .backwards],
+                                      range: NSRange(location: searchStart, length: searchEnd - searchStart))
+            guard found.location != NSNotFound else { break }
+            let i = found.location
+            searchEnd = i
+            let src = s.attribute(raw, at: i, effectiveRange: nil) as? String
+            if src == nil {
+                replace(NSRange(location: i, length: 1), NSAttributedString())
+            } else {
+                let a = s.attributes(at: i, effectiveRange: nil)
+                let id = (a[block] as? String) ?? mint()
+                if i + 1 < s.length, text(s).character(at: i + 1) != newline {
+                    replace(NSRange(location: i + 1, length: 0), NSAttributedString(string: "\n", attributes: [block: id, line: LineStyle.raw.encoded]))
+                } else if i + 1 < s.length {
+                    s.addAttributes([block: id, line: LineStyle.raw.encoded], range: NSRange(location: i + 1, length: 1))
+                }
+                if i > 0, text(s).character(at: i - 1) != newline {
+                    let before = s.attributes(at: i - 1, effectiveRange: nil).filter { $0.key == block || $0.key == line }
+                    replace(NSRange(location: i, length: 0), NSAttributedString(string: "\n", attributes: before))
                 }
             }
-            i -= 1
         }
-        ns = s.string as NSString
+        if let sc = scope {
+            // the scope grew by what step 2 inserted
+            let grown = text(s).paragraphRange(for: NSRange(location: min(sc.location, max(0, s.length - 1)), length: 0))
+            scope = NSRange(location: grown.location, length: max(0, min(s.length, sc.location + sc.length + (s.length - ns.length)) - grown.location))
+        }
+        ns = text(s)
         // 3. ids and kinds, line by line
         let ls = lines(s)
         var used: Set<BlockID> = []
@@ -683,6 +710,9 @@ public enum Surface {
             let l = ls[idx]
             let (id, style) = plan[idx]
             let want = [block: id, line: style.encoded] as [NSAttributedString.Key: Any]
+            let inScope = scope.map { NSIntersectionRange($0, l.range).length > 0 || NSLocationInRange(l.range.location, $0) } ?? true
+            // outside the scope only a line whose id or kind the plan changed needs work
+            guard inScope || id != l.id || style != l.style else { continue }
             var uniform = true
             s.enumerateAttributes(in: l.range) { a, _, stop in
                 if (a[block] as? String) != id || (a[line] as? String) != style.encoded { uniform = false; stop.pointee = true }
@@ -702,9 +732,9 @@ public enum Surface {
             for r in strays.reversed() { replace(r, NSAttributedString()) }
             if case let .item(p) = style {
                 var lead = 0
-                while l.range.location + lead < s.length, (s.string as NSString).character(at: l.range.location + lead) != newline,
+                while l.range.location + lead < s.length, text(s).character(at: l.range.location + lead) != newline,
                       s.attribute(marker, at: l.range.location + lead, effectiveRange: nil) != nil { lead += 1 }
-                let current = (s.string as NSString).substring(with: NSRange(location: l.range.location, length: lead))
+                let current = text(s).substring(with: NSRange(location: l.range.location, length: lead))
                 let enc = encode(p)
                 let markerOK = current == markerText(p) && lead > 0 && (s.attribute(marker, at: l.range.location, effectiveRange: nil) as? String) == enc
                 if !markerOK {
