@@ -21,6 +21,8 @@ struct DocScreen: View {
     /// the body isn't in the offline cache: the page shows read-only
     @State private var surfaceFailed = false
     @State private var movingWorkspace = false // workspaces
+    /// on screen (not under a pushed doc)
+    @State private var appeared = false
     @AppStorage(DocTextSize.key) private var textSize = DocTextSize.actual
 
     var body: some View {
@@ -49,18 +51,31 @@ struct DocScreen: View {
         // queued edits show while they wait (offline, a live session)
         .task(id: model.pendingWrites) { await reloadPage() }
         // a sync write drops the cached meta: load it again
-        .task(id: MetaKey(doc: docID, missing: model.editMeta[docID] == nil)) { await model.loadEditMeta(docID) }
+        .task(id: MetaKey(doc: docID, missing: model.editMeta[docID] == nil || model.staleMeta.contains(docID))) { await model.loadEditMeta(docID) }
         .onChange(of: scenePhase) { _, phase in
             // finish writing to the outbox even if iOS suspends us mid-flush
             if phase != .active, let surface {
+                surface.stop()
                 let id = UIApplication.shared.beginBackgroundTask(withName: "editor flush")
                 Task {
                     await surface.flush(final: true)
                     UIApplication.shared.endBackgroundTask(id)
                 }
+            } else if phase == .active, let surface, appeared {
+                // back in the foreground: catch up, then watch again
+                surface.start()
+            }
+        }
+        // back on screen (a pushed doc popped): catch up, then watch again
+        .onAppear {
+            appeared = true
+            if let surface {
+                surface.start()
+                router.snapshotPrep[docID] = { [weak surface] in await surface?.flush(final: true) }
             }
         }
         .onDisappear {
+            appeared = false
             router.snapshotPrep[docID] = nil
             if let surface { Task { await surface.flush(final: true); surface.stop(); await model.replayOutbox() } }
         }

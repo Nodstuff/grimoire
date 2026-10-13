@@ -34,27 +34,64 @@ final class SurfaceTextView: UITextView {
     var gutter: CGFloat = 20
     var readingWidth: CGFloat = 720
 
+    /// the header or footer's content changed: measure them again
+    var chromeDirty = true
+    /// the text changed: the footer's place below it is due again
+    var footerPlacementDirty = true
+    private var headerSize: CGSize?
+    private var footerSize: CGSize?
+    private var footerY: CGFloat = 0
+
+    /// Header and footer sizes are cached (measured again only when their
+    /// content or the column width changes, never per scroll frame); the
+    /// footer goes below the fully laid-out text, placed again only when
+    /// the text changed and it is near the screen. A header that changes
+    /// height moves the content by the same amount, so the text under the
+    /// caret stays where it is.
     override func layoutSubviews() {
         super.layoutSubviews()
         let w = bounds.width
         guard w > 0 else { return }
         let column = max(100, min(w - gutter * 2, readingWidth))
         let side = floor((w - column) / 2)
+        func measure(_ v: UIView, _ cached: CGSize?) -> CGSize {
+            if let cached, cached.width == column, !chromeDirty { return cached }
+            return CGSize(width: column, height: ceil(v.sizeThatFits(CGSize(width: column, height: .greatestFiniteMagnitude)).height))
+        }
         var top: CGFloat = 8
         if let header {
-            let h = header.sizeThatFits(CGSize(width: column, height: .greatestFiniteMagnitude)).height
-            header.frame = CGRect(x: side, y: 4, width: column, height: h)
-            top = h + 14
+            let size = measure(header, headerSize)
+            headerSize = size
+            header.frame = CGRect(x: side, y: 4, width: column, height: size.height)
+            top = size.height + 14
+        } else {
+            headerSize = nil
         }
         var bottom: CGFloat = 120
         if let footer {
-            let h = footer.sizeThatFits(CGSize(width: column, height: .greatestFiniteMagnitude)).height
-            let textBottom = top + (textLayoutManager?.usageBoundsForTextContainer.maxY ?? 0) + 12
-            footer.frame = CGRect(x: side, y: textBottom, width: column, height: h)
-            bottom = h + 60
+            let size = measure(footer, footerSize)
+            if footerSize?.width != size.width { footerPlacementDirty = true }
+            footerSize = size
+            let near = footerY == 0 || contentOffset.y + bounds.height * 2 >= footerY
+            if footerPlacementDirty || top != textContainerInset.top, near, let tlm = textLayoutManager {
+                tlm.ensureLayout(for: tlm.documentRange)
+                footerY = top + tlm.usageBoundsForTextContainer.maxY + 12
+                footerPlacementDirty = false
+            }
+            footer.frame = CGRect(x: side, y: footerY, width: column, height: size.height)
+            bottom = size.height + 60
+        } else {
+            footerSize = nil
         }
+        chromeDirty = false
         let inset = UIEdgeInsets(top: top, left: side, bottom: bottom, right: side)
-        if inset != textContainerInset { textContainerInset = inset }
+        if inset != textContainerInset {
+            let dy = inset.top - textContainerInset.top
+            let atTop = contentOffset.y <= -adjustedContentInset.top + 1
+            textContainerInset = inset
+            // the text stays put (at the very top, the header shows whole)
+            if dy != 0, !atTop { contentOffset.y += dy }
+        }
     }
 
     /// A tap on the header or the children list is theirs: it doesn't
@@ -64,6 +101,10 @@ final class SurfaceTextView: UITextView {
             let p = g.location(in: self)
             if let header, header.frame.contains(p) { return false }
             if let footer, footer.frame.contains(p) { return false }
+            // a tap on a link or a checkbox is the surface's own (follow /
+            // tick): the text view's taps don't place the caret or raise
+            // the keyboard there. Long-press and the keys still edit it.
+            if g is UITapGestureRecognizer, let model, g !== model.ownTap, model.hit(at: p) != nil { return false }
         }
         return super.gestureRecognizerShouldBegin(g)
     }

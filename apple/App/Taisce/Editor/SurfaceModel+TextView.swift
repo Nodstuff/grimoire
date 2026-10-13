@@ -145,35 +145,72 @@ extension SurfaceModel: UITextViewDelegate, UIGestureRecognizerDelegate {
         return UIMenu(children: [open] + suggestedActions)
     }
 
-    // MARK: taps: checkboxes, ⌘-click on links
+    // MARK: taps: links and checkboxes
+
+    /// What a tap at `p` lands on: a link run (followed, as in Notes: no
+    /// caret, no keyboard) or a checkbox (ticked, no keyboard). Anywhere
+    /// else is the text's: the caret goes there.
+    enum TapHit: Equatable {
+        case link(URL)
+        /// the checkbox line's start
+        case checkbox(Int)
+    }
+
+    func hit(at p: CGPoint) -> TapHit? {
+        let tv = textView
+        let s = tv.textStorage
+        guard s.length > 0, let pos = tv.closestPosition(to: p) else { return nil }
+        let loc = min(tv.offset(from: tv.beginningOfDocument, to: pos), s.length - 1)
+        guard let l = Surface.line(at: loc, in: s) else { return nil }
+        if let prefix = l.style.prefix, prefix.checkbox != nil, editable || onTodoCheckbox != nil {
+            // the box itself: left of the item's text, on its line
+            let indent = CGFloat(prefix.indent) * SurfaceLook.indentStep
+            if p.x < tv.textContainerInset.left + indent + 26, let r = textRange(l.range), let tlm = tv.textLayoutManager,
+               let frag = tlm.textLayoutFragment(for: r.location) {
+                let f = frag.layoutFragmentFrame
+                if p.y >= f.minY + tv.textContainerInset.top - 4, p.y <= f.maxY + tv.textContainerInset.top + 4 { return .checkbox(l.range.location) }
+            }
+        }
+        // read-only text follows its links itself (the .link attribute)
+        guard editable else { return nil }
+        for c in [loc, loc - 1] where c >= 0 && c < s.length {
+            guard let url = link(at: c), let start = tv.position(from: tv.beginningOfDocument, offset: c),
+                  let end = tv.position(from: start, offset: 1), let range = tv.textRange(from: start, to: end) else { continue }
+            if tv.selectionRects(for: range).contains(where: { $0.rect.insetBy(dx: -2, dy: -3).contains(p) }) { return .link(url) }
+        }
+        return nil
+    }
 
     @objc func tapped(_ g: UITapGestureRecognizer) {
-        let tv = textView
-        let p = g.location(in: tv)
-        guard let pos = tv.closestPosition(to: p) else { return }
-        let loc = tv.offset(from: tv.beginningOfDocument, to: pos)
-        if editable, g.modifierFlags.contains(.command), let url = link(at: loc) ?? link(at: loc - 1) {
+        guard let hit = hit(at: g.location(in: textView)) else { return }
+        switch hit {
+        case let .link(url):
             follow(url)
-            return
+        case let .checkbox(at):
+            let s = textView.textStorage
+            let ls = Surface.lines(s)
+            let li = Surface.lineIndex(ls, at: at)
+            guard let checked = ls[li].style.prefix?.checkbox else { return }
+            setChecked(line: li, !checked)
         }
-        let s = tv.textStorage
-        let ls = Surface.lines(s)
-        guard !ls.isEmpty else { return }
-        let li = Surface.lineIndex(ls, at: min(loc, s.length - 1))
-        let l = ls[li]
-        guard let prefix = l.style.prefix, let checked = prefix.checkbox else { return }
-        // only a tap on the box itself (left of the text)
-        let indent = CGFloat(prefix.indent) * SurfaceLook.indentStep
-        guard p.x < tv.textContainerInset.left + indent + 24 else { return }
-        guard let r = textRange(l.range), let tlm = tv.textLayoutManager,
-              let frag = tlm.textLayoutFragment(for: r.location) else { return }
-        let y = frag.layoutFragmentFrame
-        guard p.y >= y.minY + tv.textContainerInset.top - 4, p.y <= y.maxY + tv.textContainerInset.top + 4 else { return }
-        guard editable || onTodoCheckbox != nil else { return }
-        setChecked(line: li, !checked)
     }
 
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+
+    /// Every touch reaches the surface's own tap first: one landing on a
+    /// link or a checkbox keeps the text view from taking focus for it.
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        if g === ownTap, !textView.isFirstResponder, hit(at: touch.location(in: textView)) != nil {
+            focusHeldUntil = Date().addingTimeInterval(0.8)
+        }
+        return true
+    }
+
+    func textViewShouldBeginEditing(_ textView: UITextView) -> Bool {
+        // a tap on a link or a checkbox follows / ticks: no caret, no keyboard
+        if let until = focusHeldUntil, Date() < until { return false }
+        return true
+    }
 }
 
 /// Text dropped from another app: inserted through `Surface.replace`, so

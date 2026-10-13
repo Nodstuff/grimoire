@@ -81,6 +81,11 @@ final class SurfaceModel: NSObject {
     @ObservationIgnored lazy var formattingBar: FormattingBar = FormattingBar(model: self)
     @ObservationIgnored private var headerHost: UIHostingController<AnyView>?
     @ObservationIgnored private var footerHost: UIHostingController<AnyView>?
+    /// the surface's own tap (links, checkboxes); the text view's taps
+    /// stand back where it lands on one (`SurfaceTextView`)
+    @ObservationIgnored weak var ownTap: UITapGestureRecognizer?
+    /// a touch on a link or a checkbox: no editing begins for it until then
+    @ObservationIgnored var focusHeldUntil: Date?
     /// what the last `shouldChangeTextIn` let UIKit insert (for shortcuts)
     @ObservationIgnored var lastTyped: String?
     /// where UIKit is about to insert typed text (scopes the normalise after it)
@@ -116,8 +121,9 @@ final class SurfaceModel: NSObject {
     static func open(_ docID: DocID, app: AppModel, editable: Bool) async -> SurfaceModel? {
         guard let cache = app.cache else { return nil }
         if (try? await cache.doc(docID))?.bodyEpoch == nil { try? await app.sync?.refresh(docID) }
-        let queue: Set<String>? = if editable, let api = app.api, app.isOnline { try? await api.openReviewOps(docID) } else { nil }
-        let model = await open(docID, cache: cache, api: app.api, app: app, editable: editable, reviewQueue: queue)
+        // straight from the cache: the review queue comes with the first
+        // poll, in the background (parked edits show when it arrives)
+        let model = await open(docID, cache: cache, api: app.api, app: app, editable: editable, reviewQueue: nil)
         model?.start()
         return model
     }
@@ -135,6 +141,12 @@ final class SurfaceModel: NSObject {
         var parked: Set<BlockID> = []
         if editable, let queue = reviewQueue, let ops = try? await cache.parkedOps(for: docID, openOps: queue) {
             parked = ParkedEdits.apply(ops, on: &editor, conflicts: &conflicts, parkedBefore: [])
+        } else if editable, let held = try? await cache.unappliedBlocks(for: docID) {
+            // the queue isn't known yet: blocks our unapplied ops wrote are
+            // held (in conflict on their epoch), so no save quietly reverts
+            // a parked edit; the queue, when it comes, settles them
+            for (b, base) in held where conflicts[b] == nil { conflicts[b] = SurfaceConflict(base: base) }
+            parked = Set(held.keys)
         }
         let model = SurfaceModel(docID: docID, editor: editor, cache: cache, api: api, app: app, editable: editable, saveDelay: saveDelay)
         // these conflicts' flagged writes went out before: nothing re-sent
@@ -176,6 +188,7 @@ final class SurfaceModel: NSObject {
         tap.delegate = self
         tap.cancelsTouchesInView = false
         tv.addGestureRecognizer(tap)
+        ownTap = tap
     }
 
     /// Blocks as the surface shows them: the editor's visible blocks; a
@@ -208,29 +221,42 @@ final class SurfaceModel: NSObject {
         forgetUndo()
     }
 
+    /// Watch the cached body and poll the outbox and review queue. Safe
+    /// to call again (back on screen after a pushed doc, the app active
+    /// again): the old watchers go, the doc catches up at once, then
+    /// they resume. Polling backs off (3 s → 30 s) while nothing changes.
     func start() {
+        observeTask?.cancel()
+        pollTask?.cancel()
         observeTask = Task { [weak self, cache, docID] in
             guard let cache else { return }
             do {
-                var first = true
+                // the first value is the body as it is now: what changed
+                // while we weren't watching merges in straight away
                 for try await _ in cache.observeBlocks(of: docID) {
-                    if first { first = false; continue }
+                    guard !Task.isCancelled else { return }
                     await self?.remoteChanged()
                 }
             } catch {}
         }
         pollTask = Task { [weak self] in
+            var wait: Duration = .seconds(3)
             while !Task.isCancelled {
                 guard let self else { return }
-                await self.poll()
-                try? await Task.sleep(for: .seconds(3))
+                let changed = await self.poll()
+                wait = changed ? .seconds(3) : min(wait * 2, .seconds(30))
+                try? await Task.sleep(for: wait)
             }
         }
     }
 
+    var isWatching: Bool { observeTask != nil && !(observeTask?.isCancelled ?? true) }
+
     func stop() {
         observeTask?.cancel()
         pollTask?.cancel()
+        observeTask = nil
+        pollTask = nil
         saver.cancelAll()
     }
 
@@ -259,6 +285,7 @@ final class SurfaceModel: NSObject {
             footerHost = nil
             textView.footer = nil
         }
+        textView.chromeDirty = true
         textView.setNeedsLayout()
     }
 
@@ -578,6 +605,7 @@ final class SurfaceModel: NSObject {
     /// The text changed: save after a pause.
     func changed() {
         // the children list follows the text's new height
+        textView.footerPlacementDirty = true
         textView.setNeedsLayout()
         guard editable, !quiet else { return }
         unsaved = 1
@@ -1243,22 +1271,42 @@ final class SurfaceModel: NSObject {
 
     // MARK: status
 
-    func poll() async {
-        guard let cache else { return }
-        let tintsBefore = (reviews, failedBlocks)
+    /// The outbox state, refusals and review marks; the review queue from
+    /// the server (at once the first time, then every 15 s, each fetch
+    /// bounded to 10 s). True when anything changed.
+    @discardableResult
+    func poll() async -> Bool {
+        guard let cache else { return false }
+        let before = (reviews, failedBlocks, outbox, openOps)
         if let s = try? await cache.outboxState(for: docID), s != outbox { outbox = s }
         if let f = try? await cache.failedBlocks(docID), f != failedBlocks { failedBlocks = f }
-        if let api, app?.isOnline == true, Date().timeIntervalSince(lastReviewFetch) > 15 {
+        if let api, app?.isOnline == true, openOps == nil || Date().timeIntervalSince(lastReviewFetch) > 15 {
             lastReviewFetch = Date()
-            // a failed fetch keeps the last set the server gave us
-            if let fetched = try? await api.openReviewOps(docID), fetched != openOps {
+            // a failed or slow fetch keeps the last set the server gave us
+            if let fetched = await Self.fetchReviewQueue(api, docID), fetched != openOps {
                 openOps = fetched
                 // a decision (or a new park) shows now, not at the next sync
                 await remoteChanged()
             }
         }
         if let r = try? await cache.reviews(for: docID, openOps: openOps), r != reviews { reviews = r }
-        if tintsBefore.0 != reviews || tintsBefore.1 != failedBlocks { restyle() }
+        if before.0 != reviews || before.1 != failedBlocks { restyle() }
+        return before.0 != reviews || before.1 != failedBlocks || before.2 != outbox || before.3 != openOps
+    }
+
+    /// The doc's open review queue, or nil after 10 s (a captive network
+    /// never holds the editor up).
+    static func fetchReviewQueue(_ api: APIClient, _ docID: DocID, timeout: Duration = .seconds(10)) async -> Set<String>? {
+        await withTaskGroup(of: Set<String>?.self) { group in
+            group.addTask { try? await api.openReviewOps(docID) }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
     }
 
     var chip: EditorChip {

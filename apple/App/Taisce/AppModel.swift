@@ -73,7 +73,10 @@ final class AppModel {
 
     // local state
     private(set) var pins: [DocID] = []
-    private(set) var editMeta: [DocID: EditMeta] = [:]
+    var editMeta: [DocID: EditMeta] = [:]
+    /// docs whose "edited by" is due again (a sync touched them): the old
+    /// one shows until the new one arrives, so the header never jumps
+    private(set) var staleMeta: Set<DocID> = []
     /// to-dos marked done or snoozed here, hidden until the server's list catches up
     private(set) var settledTodos: Set<String> = []
     /// a doc just created here: its screen opens in edit mode
@@ -515,7 +518,7 @@ final class AppModel {
         // a label change journals tree rows: names and counts may have moved;
         // an access change (a share, an unshare, a role) too
         if u.treeChanged || u.accessChanged { refreshWorkspaces() }
-        for id in u.docIDs { editMeta[id] = nil }
+        metaChanged(u.docIDs)
         if !u.revokedDocIDs.isEmpty { revoked(u.revokedDocIDs) }
     }
 
@@ -631,10 +634,17 @@ final class AppModel {
 
     /// Who last edited the doc, from its ledger; cached until the doc changes.
     func loadEditMeta(_ id: DocID) async {
-        guard editMeta[id] == nil, let api else { return }
+        guard editMeta[id] == nil || staleMeta.contains(id), let api else { return }
         if let history = try? await api.docHistory(id), let meta = EditMeta(history: history) {
             editMeta[id] = meta
         }
+        staleMeta.remove(id)
+    }
+
+    /// A sync touched these docs (our own save's echo included): their
+    /// "edited by" is fetched again, the old one showing meanwhile.
+    func metaChanged(_ ids: some Sequence<DocID>) {
+        staleMeta.formUnion(ids)
     }
 
     /// The doc's page: cached blocks, parsed off the main actor; blocks

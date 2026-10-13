@@ -92,6 +92,55 @@ final class EditorUITests: XCTestCase {
         XCTAssertEqual(try markdown(id), "First lineSecond line\n")
     }
 
+    /// A point in the text column, `fraction` of the way down the surface,
+    /// `dx` points into the column (iPhone: the column starts 20 pt in).
+    func columnPoint(_ surface: XCUIElement, dx: CGFloat, fraction: CGFloat) -> XCUICoordinate {
+        surface.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: fraction)).withOffset(CGVector(dx: 20 + dx, dy: 0))
+    }
+
+    /// As in Notes: a tap on a link follows it; no caret, no keyboard.
+    func testTappingAWikilinkFollowsItWithoutTheKeyboard() throws {
+        let tag = String(UUID().uuidString.prefix(6))
+        let target = "Target \(tag)"
+        _ = try makeDoc(target, markdown: "You followed the link.")
+        // links fill every line, so the tap lands on one
+        let line = Array(repeating: "[[\(target)]]", count: 12).joined(separator: " ")
+        _ = try makeDoc("Links \(tag)", markdown: Array(repeating: line, count: 12).joined(separator: "\n\n"))
+
+        let app = XCUIApplication()
+        app.launchArguments = ["-serverURL", base.absoluteString, "-openDoc", "Links \(tag)"]
+        app.launch()
+        let surface = app.textViews["surface.text"]
+        XCTAssertTrue(surface.waitForExistence(timeout: 20))
+        columnPoint(surface, dx: 6, fraction: 0.55).tap()
+        XCTAssertTrue(app.staticTexts[target].waitForExistence(timeout: 10), "the link was followed")
+        XCTAssertEqual(app.keyboards.count, 0, "no keyboard")
+    }
+
+    /// A tick: no caret, no keyboard, and it's saved.
+    func testTickingABoxDoesNotRaiseTheKeyboard() throws {
+        let tag = String(UUID().uuidString.prefix(6))
+        let title = "Ticks \(tag)"
+        let items = (1...30).map { "- [ ] item \($0)" }.joined(separator: "\n")
+        let id = try makeDoc(title, markdown: items)
+        let app = XCUIApplication()
+        app.launchArguments = ["-serverURL", base.absoluteString, "-openDoc", title]
+        app.launch()
+        let surface = app.textViews["surface.text"]
+        XCTAssertTrue(surface.waitForExistence(timeout: 20))
+        XCTAssertEqual(app.keyboards.count, 0, "no keyboard before")
+        columnPoint(surface, dx: 8, fraction: 0.55).tap()
+        XCTAssertTrue((surface.value as? String ?? "").contains("☑"), "a box was ticked")
+        XCTAssertEqual(app.keyboards.count, 0, "no keyboard")
+        var got = ""
+        for _ in 0..<40 {
+            got = try markdown(id)
+            if got.contains("- [x]") { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        XCTAssertTrue(got.contains("- [x]"), "the tick was saved")
+    }
+
     func testTypeSplitMergeLinkInTheLiveSurface() throws {
         let tag = String(UUID().uuidString.prefix(6))
         let title = "Editor \(tag)"
