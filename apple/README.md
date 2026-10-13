@@ -338,10 +338,11 @@ Model (TaisceKit `Edit/`):
   order keys are per-sibling base-36 fractions, exactly as on the web: the
   shared vectors in `ui/src/editor/diff.vectors.json` are read by both
   `DocDiffTests` and `diff.vectors.test.ts`. A save moves a block only when
-  the edit changed where it belongs (its heading section before vs after):
-  nesting the server holds that disagrees with the headings is left alone,
-  so a typo fix never re-parents anything; a new block lands beside its
-  neighbour above. The server tree after a save always reads in the
+  the edit changed where it belongs (its heading section before vs after)
+  and the server had nested it by that section: nesting the server holds
+  that disagrees with the headings (flat, misnested) is left alone, so a
+  typo fix or a heading level change never re-parents untouched blocks; a
+  new block lands beside its neighbour above. The server tree after a save always reads in the
   editor's order (a block whose kept parent would put it out of place goes
   to its heading-rule parent); every vector and 2000 random edits check it.
 - `SurfaceMerge`: a sync refresh while the doc is open. Untouched blocks take
@@ -413,6 +414,13 @@ markdown after autosave. `LaunchTests` needs a doc titled "Welcome" headed
 - Editing: no rich table editing (tables are raw source), no title rename,
   no drag to reorder blocks, no soft line breaks typed (Return splits); an
   input method's composition clears the undo history.
+- Editor follow-ups: the random diff sweep has no "paragraph as parent"
+  mode; the server-order check treats a parent that isn't on the surface
+  (a comment, frontmatter) as the top level; a failed review-queue fetch
+  keeps the last queue (it can be stale until the next good fetch); pasting
+  "x\n" into text leaves an empty paragraph after it; a parked block's
+  conflict has no `theirs`, so it shows no Keep mine / Take theirs until a
+  reviewer decides.
 - Outbox idempotency: main's daemon keeps `request_id` dedupe in memory for
   120 s (server-identity makes it durable for 7 days). Client-minted insert
   ids make a doubled insert fail instead of duplicating; `replace` and

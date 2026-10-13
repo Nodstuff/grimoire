@@ -184,7 +184,10 @@ public enum DocDiff {
         }
         let inferred = placed.map(\.parent)
         for i in placed.indices {
-            if let id = placed[i].entry.id, let prev = old[id], let was = before[id], was == inferred[i] {
+            // kept: its section didn't change, or the server never nested it
+            // by its section anyway (flat or misnested): a heading edit
+            // elsewhere says nothing about where it belongs
+            if let id = placed[i].entry.id, let prev = old[id], let was = before[id], was == inferred[i] || prev.parent != was {
                 let storedGone = prev.parent.map { old[$0] != nil && !live.contains($0) } ?? false
                 if !storedGone {
                     placed[i].parent = prev.parent
@@ -200,14 +203,35 @@ public enum DocDiff {
         //     back to its inferred parent (or, if it is there already, the one
         //     expected). All-inferred nesting reads in order by construction:
         //     the last resort.
+        //     Each block steps at most twice: back to where the server has
+        //     it (moving nothing), then to its inferred parent.
         var guardCount = 0
+        var tried = Array(repeating: 0, count: placed.count)
+        func step(_ i: Int) -> Bool {
+            if tried[i] == 0, let id = placed[i].entry.id, let prev = old[id] {
+                let stored = prev.parent
+                let storedLive = stored.map { old[$0] == nil || live.contains($0) } ?? true
+                if storedLive, placed[i].parent != stored {
+                    placed[i].parent = stored
+                    tried[i] = 1
+                    return true
+                }
+            }
+            if tried[i] < 2, placed[i].parent != inferred[i] {
+                placed[i].parent = inferred[i]
+                tried[i] = 2
+                return true
+            }
+            tried[i] = 2
+            return false
+        }
         while let (early, expected) = firstOutOfOrder(placed.map { ($0.tempID, $0.parent) }) {
             guardCount += 1
             if guardCount > 2 * placed.count + 1 {
                 for i in placed.indices { placed[i].parent = inferred[i] }
                 break
             }
-            if placed[early].parent != inferred[early] { placed[early].parent = inferred[early] } else { placed[expected].parent = inferred[expected] }
+            if !step(early), !step(expected) { guardCount = 2 * placed.count + 1 }
         }
 
         // 3. group by parent (first-appearance order), keep a greedy

@@ -1194,6 +1194,150 @@
    ]
   },
   {
+   "name": "a heading level change in a flat doc moves nothing else",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# H1",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "p1",
+     "parent": null,
+     "order_key": "m"
+    },
+    {
+     "id": "h5",
+     "content": "# H5",
+     "parent": null,
+     "order_key": "q"
+    },
+    {
+     "id": "h3",
+     "content": "### H3",
+     "parent": null,
+     "order_key": "u"
+    },
+    {
+     "id": "h4",
+     "content": "### H4",
+     "parent": null,
+     "order_key": "w"
+    },
+    {
+     "id": "p3",
+     "content": "p3",
+     "parent": null,
+     "order_key": "x"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# H1",
+     "level": 1
+    },
+    {
+     "id": "p1",
+     "content": "p1",
+     "level": 0
+    },
+    {
+     "id": "h5",
+     "content": "### H5",
+     "level": 3
+    },
+    {
+     "id": "h3",
+     "content": "### H3",
+     "level": 3
+    },
+    {
+     "id": "h4",
+     "content": "### H4",
+     "level": 3
+    },
+    {
+     "id": "p3",
+     "content": "p3",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "replace",
+     "target": "h5",
+     "content": "### H5"
+    }
+   ]
+  },
+  {
+   "name": "a heading level change in a nested doc re-homes only its changed section",
+   "baseline": [
+    {
+     "id": "h1",
+     "content": "# H1",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p1",
+     "content": "p1",
+     "parent": "h1",
+     "order_key": "i"
+    },
+    {
+     "id": "h2",
+     "content": "# H2",
+     "parent": null,
+     "order_key": "r"
+    },
+    {
+     "id": "p2",
+     "content": "p2",
+     "parent": "h2",
+     "order_key": "i"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h1",
+     "content": "# H1",
+     "level": 1
+    },
+    {
+     "id": "p1",
+     "content": "p1",
+     "level": 0
+    },
+    {
+     "id": "h2",
+     "content": "## H2",
+     "level": 2
+    },
+    {
+     "id": "p2",
+     "content": "p2",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "move",
+     "target": "h2",
+     "new_parent": "h1",
+     "new_order_key": "r"
+    },
+    {
+     "op": "replace",
+     "target": "h2",
+     "content": "## H2"
+    }
+   ]
+  },
+  {
    "name": "a heading demoted to text releases its section",
    "baseline": [
     {

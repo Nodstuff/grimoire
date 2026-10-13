@@ -3,7 +3,7 @@
 // and entries into the same ops. Every vector, and random docs and edits,
 // also check the invariant: the server's tree after the ops reads (pre-order,
 // siblings by order key) in exactly the editor's order.
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { BaselineBlock, Entry, Op, computeOps, headingLevel, keyBetween } from './diff'
 
@@ -131,5 +131,95 @@ describe('random docs and edits keep the server tree in the editor order', () =>
       const got = serverOrder(baseline, ops)
       expect(got, `seed ${seed}`).toEqual(entryIds(entries))
     }
+  })
+})
+
+/** Heading-rule parents for a sequence of (id, level). */
+function inferredParents(items: { id: string; level: number }[]): Map<string, string | null> {
+  const out = new Map<string, string | null>()
+  const st: { level: number; id: string }[] = []
+  for (const it of items) {
+    if (it.level > 0) while (st.length && st[st.length - 1].level >= it.level) st.pop()
+    out.set(it.id, st.length ? st[st.length - 1].id : null)
+    if (it.level > 0) st.push({ level: it.level, id: it.id })
+  }
+  return out
+}
+
+describe('saves move only what the edit re-homed', () => {
+  const modes = ['heading', 'flat', 'random'] as const
+  it('typos and retitles are one replace; a level change moves only blocks whose section changed (or out-of-order ones)', () => {
+    const counts: Record<string, { cases: number; bursts: number; extra: number }> = {}
+    for (const mode of modes) {
+      counts[mode] = { cases: 0, bursts: 0, extra: 0 }
+      for (let seed = 1; seed <= 1000; seed++) {
+        const r = rng(seed * 7 + mode.length)
+        const n = 4 + Math.floor(r() * 10)
+        const contents = Array.from({ length: n }, (_, i) => (r() < 0.4 ? `${'#'.repeat(1 + Math.floor(r() * 3))} H${i}` : `p${i}`))
+        const items = contents.map((c, i) => ({ id: `b${i}`, level: headingLevel(c) }))
+        const inferredBase = inferredParents(items)
+        const baseline: BaselineBlock[] = []
+        const lastKey = new Map<string | null, string | null>()
+        const path: string[] = []
+        contents.forEach((c, i) => {
+          const id = `b${i}`
+          let parent: string | null
+          if (mode === 'heading') parent = inferredBase.get(id) ?? null
+          else if (mode === 'flat') parent = null
+          else {
+            const depth = Math.floor(r() * (path.length + 1))
+            path.length = depth
+            parent = depth > 0 ? path[depth - 1] : null
+            path.push(id)
+          }
+          const key = keyBetween(lastKey.get(parent) ?? null, null)
+          lastKey.set(parent, key)
+          baseline.push({ id, content: c, parent, order_key: key })
+        })
+        const entries = (): Entry[] => baseline.map((b) => ({ id: b.id, content: b.content, level: headingLevel(b.content) }))
+        // a paragraph typo
+        const paras = baseline.filter((b) => headingLevel(b.content) === 0)
+        if (paras.length) {
+          const e = entries()
+          const pick = paras[Math.floor(r() * paras.length)].id
+          const t = e.find((x) => x.id === pick)!
+          t.content += ' typo'
+          const ops = computeOps(baseline, e, () => 'new')
+          expect(ops.map((o) => o.kind.op), `${mode} ${seed} typo`).toEqual(['replace'])
+        }
+        const heads = baseline.filter((b) => headingLevel(b.content) > 0)
+        if (!heads.length) continue
+        // a heading retitled at its level
+        {
+          const e = entries()
+          const pickH = heads[Math.floor(r() * heads.length)].id
+          const t = e.find((x) => x.id === pickH)!
+          t.content += ' retitled'
+          const ops = computeOps(baseline, e, () => 'new')
+          expect(ops.map((o) => o.kind.op), `${mode} ${seed} retitle`).toEqual(['replace'])
+        }
+        // a heading's level changed
+        const e = entries()
+        const pickL = heads[Math.floor(r() * heads.length)].id
+        const t = e.find((x) => x.id === pickL)!
+        const lv = 1 + ((t.level + Math.floor(r() * 2)) % 3)
+        t.level = lv === t.level ? (lv % 3) + 1 : lv
+        t.content = `${'#'.repeat(t.level)} ${t.content.replace(/^#+ /, '')}`
+        const stats = { orderFallback: [] as string[] }
+        const ops = computeOps(baseline, e, () => 'new', stats)
+        expect(serverOrder(baseline, ops), `${mode} ${seed} order`).toEqual(e.map((x) => x.id!))
+        const after = inferredParents(e.map((x) => ({ id: x.id!, level: x.level })))
+        const changed = new Set(e.filter((x) => after.get(x.id!) !== inferredBase.get(x.id!)).map((x) => x.id!))
+        changed.add(t.id!)
+        const moved = ops.filter((o) => o.kind.op === 'move').map((o) => o.kind.target as string)
+        const allowed = new Set([...changed, ...stats.orderFallback])
+        expect(moved.filter((m) => !allowed.has(m)), `${mode} ${seed} level change moved untouched blocks`).toEqual([])
+        counts[mode].cases++
+        if (moved.length > n / 2) counts[mode].bursts++
+        counts[mode].extra += moved.filter((m) => !changed.has(m)).length
+      }
+    }
+    // DIFF_STATS=<file> writes the numbers (cases, bursts = moves > half the doc, moves outside the changed sections)
+    if (process.env.DIFF_STATS) writeFileSync(process.env.DIFF_STATS, JSON.stringify(counts))
   })
 })

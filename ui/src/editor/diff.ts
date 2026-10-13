@@ -147,6 +147,8 @@ export function computeOps(
   baseline: BaselineBlock[],
   entries: Entry[],
   newId: () => string = () => crypto.randomUUID(),
+  /** filled in for tests: blocks the order check (2c) re-homed */
+  stats?: { orderFallback: string[] },
 ): Op[] {
   const old = new Map(baseline.map((b) => [b.id, b]))
   const ops: Op[] = []
@@ -195,7 +197,10 @@ export function computeOps(
   placed.forEach((p, i) => {
     const id = p.entry.id
     const prev = id ? old.get(id) : undefined
-    if (prev && before.get(prev.id) === inferred[i]) {
+    // kept: its section didn't change, or the server never nested it by
+    // its section anyway (flat or misnested): a heading edit elsewhere
+    // says nothing about where it belongs
+    if (prev && (before.get(prev.id) === inferred[i] || prev.parent !== before.get(prev.id))) {
       const storedGone = prev.parent != null && old.has(prev.parent) && !liveIds.has(prev.parent)
       if (!storedGone) {
         p.parent = prev.parent
@@ -210,16 +215,36 @@ export function computeOps(
   //     first block out of place, the one that came too early goes back to
   //     its inferred parent (or, if it is there already, the one expected).
   //     All-inferred nesting reads in order by construction: the last resort.
+  const tried = placed.map(() => 0)
   for (let guard = 0; ; guard++) {
     const bad = firstOutOfOrder(placed)
     if (bad == null) break
     if (guard > 2 * placed.length) {
       placed.forEach((p, i) => (p.parent = inferred[i]))
+      stats?.orderFallback.push(...placed.map((p) => p.tempId))
       break
     }
+    // each block steps at most twice: back to where the server has it
+    // (moving nothing), then to its inferred parent
     const [early, expected] = bad
-    if (placed[early].parent !== inferred[early]) placed[early].parent = inferred[early]
-    else placed[expected].parent = inferred[expected]
+    const step = (i: number): boolean => {
+      const stored = placed[i].entry.id ? old.get(placed[i].entry.id!)?.parent : undefined
+      const storedLive = stored !== undefined && (stored == null || !old.has(stored) || liveIds.has(stored))
+      if (tried[i] === 0 && storedLive && placed[i].parent !== stored) {
+        placed[i].parent = stored!
+        tried[i] = 1
+        return true
+      }
+      if (tried[i] < 2 && placed[i].parent !== inferred[i]) {
+        placed[i].parent = inferred[i]
+        tried[i] = 2
+        stats?.orderFallback.push(placed[i].tempId)
+        return true
+      }
+      tried[i] = 2
+      return false
+    }
+    if (!step(early) && !step(expected)) guard = 2 * placed.length
   }
 
   // 3. group by parent, keep a greedy increasing run of undisturbed survivors,
