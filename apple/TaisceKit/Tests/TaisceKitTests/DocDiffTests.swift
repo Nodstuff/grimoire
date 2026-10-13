@@ -37,7 +37,42 @@ import Testing
                 return "new-\(n)"
             }
             #expect(ops == c.ops, "\(c.name)")
+            var k = 0
+            let want = c.entries.map { e -> BlockID in
+                if let id = e.id { return id }
+                k += 1
+                return "new-\(k)"
+            }
+            #expect(Self.serverOrder(c.baseline, ops) == want, "the server tree reads in the editor's order: \(c.name)")
         }
+    }
+
+    /// The server's blocks after `ops`, read in pre-order (siblings by key).
+    static func serverOrder(_ baseline: [DocDiff.BaselineBlock], _ ops: [BlockOp]) -> [BlockID] {
+        var blocks: [BlockID: (parent: BlockID?, key: String)] = [:]
+        for b in baseline { blocks[b.id] = (b.parent, b.orderKey) }
+        for op in ops {
+            switch op {
+            case let .delete(t): blocks[t] = nil
+            case let .insert(id?, parent, key, _, _): blocks[id] = (parent, key)
+            case let .move(t, parent, key): blocks[t] = (parent, key)
+            default: break
+            }
+        }
+        var kids: [BlockID?: [BlockID]] = [:]
+        for (id, b) in blocks {
+            let p = b.parent.flatMap { blocks[$0] != nil ? $0 : nil }
+            kids[p, default: []].append(id)
+        }
+        var out: [BlockID] = []
+        func walk(_ p: BlockID?) {
+            for id in (kids[p] ?? []).sorted(by: { (blocks[$0]!.key, $0) < (blocks[$1]!.key, $1) }) {
+                out.append(id)
+                walk(id)
+            }
+        }
+        walk(nil)
+        return out
     }
 
     // MARK: keyBetween (diff.ts's vectors)

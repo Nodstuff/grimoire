@@ -104,6 +104,38 @@ export function headingLevel(content: string): number {
   return m ? m[1].length : 0
 }
 
+/** Pre-order of the tree the placements make (children in entries order;
+ * a parent that isn't an entry counts as the top level). Returns the
+ * indices [came early, expected] at the first place it differs from the
+ * entries order, or null when it reads in order. */
+export function firstOutOfOrder(placed: { tempId: string; parent: string | null }[]): [number, number] | null {
+  const index = new Map(placed.map((p, i) => [p.tempId, i]))
+  const kids = new Map<number | null, number[]>()
+  placed.forEach((p, i) => {
+    const k = p.parent != null && index.has(p.parent) ? index.get(p.parent)! : null
+    if (!kids.has(k)) kids.set(k, [])
+    kids.get(k)!.push(i)
+  })
+  const order: number[] = []
+  const seen = new Set<number>()
+  const walk = (k: number | null) => {
+    for (const c of kids.get(k) ?? []) {
+      if (seen.has(c)) continue // a cycle never reads in order
+      seen.add(c)
+      order.push(c)
+      walk(c)
+    }
+  }
+  walk(null)
+  for (let i = 0; i < placed.length; i++) {
+    if (order[i] !== i) {
+      // unreachable (a cycle): the expected one is out of place
+      return [order[i] ?? i, i]
+    }
+  }
+  return null
+}
+
 interface Placed {
   entry: Entry
   parent: string | null // block id, or the placeholder id for new headings
@@ -172,6 +204,23 @@ export function computeOps(
     }
     if (i > 0 && inferred[i - 1] === inferred[i]) p.parent = placed[i - 1].parent
   })
+
+  // 2c. the server's tree must read in the editor's order: walk it in
+  //     pre-order (siblings in entries order, as step 3 keys them). At the
+  //     first block out of place, the one that came too early goes back to
+  //     its inferred parent (or, if it is there already, the one expected).
+  //     All-inferred nesting reads in order by construction: the last resort.
+  for (let guard = 0; ; guard++) {
+    const bad = firstOutOfOrder(placed)
+    if (bad == null) break
+    if (guard > 2 * placed.length) {
+      placed.forEach((p, i) => (p.parent = inferred[i]))
+      break
+    }
+    const [early, expected] = bad
+    if (placed[early].parent !== inferred[early]) placed[early].parent = inferred[early]
+    else placed[expected].parent = inferred[expected]
+  }
 
   // 3. group by parent, keep a greedy increasing run of undisturbed survivors,
   //    key everything else between its neighbours

@@ -1113,6 +1113,87 @@
    ]
   },
   {
+   "name": "promoting a subheading keeps the server tree in the editor order",
+   "baseline": [
+    {
+     "id": "A",
+     "content": "## A",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "S",
+     "content": "### S",
+     "parent": "A",
+     "order_key": "i"
+    },
+    {
+     "id": "s1",
+     "content": "s1",
+     "parent": "S",
+     "order_key": "i"
+    },
+    {
+     "id": "a2",
+     "content": "a2",
+     "parent": "A",
+     "order_key": "r"
+    },
+    {
+     "id": "B",
+     "content": "## B",
+     "parent": null,
+     "order_key": "r"
+    }
+   ],
+   "entries": [
+    {
+     "id": "A",
+     "content": "## A",
+     "level": 2
+    },
+    {
+     "id": "S",
+     "content": "## S",
+     "level": 2
+    },
+    {
+     "id": "s1",
+     "content": "s1",
+     "level": 0
+    },
+    {
+     "id": "a2",
+     "content": "a2",
+     "level": 0
+    },
+    {
+     "id": "B",
+     "content": "## B",
+     "level": 2
+    }
+   ],
+   "ops": [
+    {
+     "op": "move",
+     "target": "S",
+     "new_parent": null,
+     "new_order_key": "m"
+    },
+    {
+     "op": "replace",
+     "target": "S",
+     "content": "## S"
+    },
+    {
+     "op": "move",
+     "target": "a2",
+     "new_parent": "S",
+     "new_order_key": "r"
+    }
+   ]
+  },
+  {
    "name": "a heading demoted to text releases its section",
    "baseline": [
     {

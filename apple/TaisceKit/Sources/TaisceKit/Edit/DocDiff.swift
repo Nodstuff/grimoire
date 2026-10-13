@@ -107,6 +107,33 @@ public enum DocDiff {
         return hashes
     }
 
+    /// diff.ts `firstOutOfOrder`: the pre-order of the tree the placements
+    /// make (children in entries order; a parent that isn't an entry counts
+    /// as the top level) against the entries order. (came early, expected)
+    /// at the first difference; nil when it reads in order.
+    static func firstOutOfOrder(_ placed: [(id: BlockID, parent: BlockID?)]) -> (Int, Int)? {
+        var index: [BlockID: Int] = [:]
+        for (i, p) in placed.enumerated() where index[p.id] == nil { index[p.id] = i }
+        var kids: [Int: [Int]] = [:]
+        var roots: [Int] = []
+        for (i, p) in placed.enumerated() {
+            if let par = p.parent, let k = index[par] { kids[k, default: []].append(i) } else { roots.append(i) }
+        }
+        var order: [Int] = []
+        var seen = Set<Int>()
+        func walk(_ ns: [Int]) {
+            for c in ns where seen.insert(c).inserted {
+                order.append(c)
+                walk(kids[c] ?? [])
+            }
+        }
+        walk(roots)
+        for i in placed.indices where i >= order.count || order[i] != i {
+            return (i < order.count ? order[i] : i, i)
+        }
+        return nil
+    }
+
     private struct Placed {
         var entry: Entry
         var parent: BlockID?
@@ -165,6 +192,22 @@ public enum DocDiff {
                 }
             }
             if i > 0, inferred[i - 1] == inferred[i] { placed[i].parent = placed[i - 1].parent }
+        }
+
+        // 2c. the server's tree must read in the editor's order: walk it in
+        //     pre-order (siblings in entries order, as step 3 keys them). At
+        //     the first block out of place, the one that came too early goes
+        //     back to its inferred parent (or, if it is there already, the one
+        //     expected). All-inferred nesting reads in order by construction:
+        //     the last resort.
+        var guardCount = 0
+        while let (early, expected) = firstOutOfOrder(placed.map { ($0.tempID, $0.parent) }) {
+            guardCount += 1
+            if guardCount > 2 * placed.count + 1 {
+                for i in placed.indices { placed[i].parent = inferred[i] }
+                break
+            }
+            if placed[early].parent != inferred[early] { placed[early].parent = inferred[early] } else { placed[expected].parent = inferred[expected] }
         }
 
         // 3. group by parent (first-appearance order), keep a greedy
