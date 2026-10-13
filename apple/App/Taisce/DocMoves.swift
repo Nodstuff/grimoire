@@ -1,5 +1,6 @@
 import Foundation
 import TaisceKit
+import UniformTypeIdentifiers
 
 /// One row of the "Move to…" picker: a doc to go under, or the top level.
 struct DocMoveOption: Identifiable, Hashable, Sendable {
@@ -22,15 +23,38 @@ enum DocMoves {
         DocPlacement(docs.map { DocPlacement.Row(id: $0.id, parentID: $0.parentID, sortKey: $0.sortKey) })
     }
 
+    /// Why `dragged` can't go onto `target` (nil = the top level); nil when it can.
+    static func refusal(_ dragged: DocID, onto target: DocID?, index: DocIndex, placement: DocPlacement, access: (DocID) -> EditAccess) -> String? {
+        guard let doc = index.byID[dragged] else { return "That doc isn't here any more." }
+        guard access(dragged).canReparent else { return "You can only view this workspace, so its docs stay where they are." }
+        guard let target else {
+            if doc.parentID == nil { return "It's already at the top level." }
+            // the server files it in your Unsorted, and only the owner re-homes
+            return access(dragged).canMove ? nil : "Only the workspace's owner can move docs to its top level."
+        }
+        guard let into = index.byID[target] else { return "That doc isn't here any more." }
+        guard into.workspaceID == doc.workspaceID else { return "Docs move within their workspace; use Move to workspace\u{2026} first." }
+        guard access(target).canReparent else { return "You can only view that workspace." }
+        guard placement.canPlace(dragged, under: target) else {
+            return dragged == target ? "A doc can't go inside itself." : "A doc can't go inside one of its own docs."
+        }
+        return nil
+    }
+
     /// Whether `dragged` may be dropped onto `target` (nil = the top level).
     static func canDrop(_ dragged: DocID, onto target: DocID?, index: DocIndex, placement: DocPlacement, access: (DocID) -> EditAccess) -> Bool {
-        guard let doc = index.byID[dragged], access(dragged).canReparent else { return false }
-        guard let target else {
-            // already there; otherwise only an owner re-homes to the top
-            return doc.parentID != nil && access(dragged).canMove
-        }
-        guard let into = index.byID[target], into.workspaceID == doc.workspaceID, access(target).canReparent else { return false }
-        return placement.canPlace(dragged, under: target)
+        refusal(dragged, onto: target, index: index, placement: placement, access: access) == nil
+    }
+
+    /// A move to the top level labels the doc with its workspace first, but
+    /// only when that workspace comes from its parent: a doc with its own
+    /// label carries it anyway, and the label's undo after a refusal must
+    /// leave the doc resolving where it was (its parent's workspace).
+    static func labelForTopLevel(_ id: DocID, index: DocIndex) -> WorkspaceID? {
+        guard let doc = index.byID[id], let w = doc.workspaceID,
+              let parent = doc.parentID.flatMap({ index.byID[$0] }), parent.workspaceID == w
+        else { return nil }
+        return w
     }
 
     /// Every place `id` can go, the top level first, then docs in path
@@ -59,19 +83,24 @@ enum DocMoves {
     }
 }
 
-/// What a drag carries: a doc id, as tagged text so plain text dragged in
-/// from elsewhere is refused (no custom UTType, so no Info.plist change).
-struct DocDrag: Hashable, Sendable {
-    static let prefix = "taisce-doc:"
-    var id: DocID
+extension UTType {
+    /// A dragged Library row (declared in Info.plist's
+    /// UTExportedTypeDeclarations). Data, not text: the editor and other
+    /// apps don't take it, and only Library rows accept it.
+    static let taisceDoc = UTType(exportedAs: "ie.null.taisce.doc-reference", conformingTo: .data)
+}
 
-    var token: String { Self.prefix + id }
-
-    init(id: DocID) { self.id = id }
-
-    init?(token: String) {
-        guard token.hasPrefix(Self.prefix), token.count > Self.prefix.count else { return nil }
-        id = String(token.dropFirst(Self.prefix.count))
+/// What a drag carries: the doc id under `UTType.taisceDoc`, visible to this
+/// app only.
+enum DocDrag {
+    static func provider(_ id: DocID) -> NSItemProvider {
+        let p = NSItemProvider()
+        let data = Data(id.utf8)
+        p.registerDataRepresentation(forTypeIdentifier: UTType.taisceDoc.identifier, visibility: .ownProcess) { done in
+            done(data, nil)
+            return nil
+        }
+        return p
     }
 }
 
@@ -81,35 +110,45 @@ extension AppModel {
         index.byID[id] != nil && access(for: id).canReparent
     }
 
+    func moveRefusal(_ dragged: DocID, onto target: DocID?) -> String? {
+        DocMoves.refusal(dragged, onto: target, index: index, placement: DocMoves.placement(docs), access: access(for:))
+    }
+
     func canDrop(_ dragged: DocID, onto target: DocID?) -> Bool {
-        DocMoves.canDrop(dragged, onto: target, index: index, placement: DocMoves.placement(docs), access: access(for:))
+        moveRefusal(dragged, onto: target) == nil
     }
 
     func moveOptions(for id: DocID, query: String = "") -> [DocMoveOption] {
         DocMoves.options(moving: id, index: index, access: access(for:), query: query)
     }
 
-    /// A drop: false (refused at once) when it can't go there.
+    /// A drop. One that can't go there says why (the hover already showed
+    /// it refused where SwiftUI lets us); false then.
     @discardableResult
     func dropDoc(_ dragged: DocID, onto target: DocID?) -> Bool {
-        guard canDrop(dragged, onto: target) else { return false }
+        draggingDoc = nil
+        if let why = moveRefusal(dragged, onto: target) {
+            moveError = "Couldn't move it: \(why)"
+            return false
+        }
         Task { await moveDoc(dragged, into: target) }
         return true
     }
 
     /// Make `id` the last child of `parent` (nil = the top level of its
-    /// workspace) through the outbox: Library shows it at once, the write
-    /// lands when online, a refusal puts it back and sets `moveError`.
+    /// workspace) through the outbox: Library shows it at once, the server
+    /// picks the key when it lands (an append), a refusal puts it back and
+    /// sets `moveError`.
     func moveDoc(_ id: DocID, into parent: DocID?) async {
-        guard let cache, let doc = index.byID[id] else { return }
-        let key = DocMoves.placement(docs).appendKey(moving: id, under: parent)
-        // at the top level an unlabelled doc would leave its workspace
-        let keep = parent == nil && hasWorkspaces ? doc.workspaceID : nil
+        guard let cache, index.byID[id] != nil else { return }
+        // at the top level an inherited workspace would be lost
+        let keep = parent == nil && hasWorkspaces ? DocMoves.labelForTopLevel(id, index: index) : nil
+        let key = UUID().uuidString.lowercased()
+        movesThisSession.insert(key)
         do {
-            try await cache.enqueueDocMove(id, parent: parent, sortKey: key, keepWorkspace: keep)
+            try await cache.enqueueDocMove(id, parent: parent, keepWorkspace: keep, key: key)
         } catch {
             moveError = "Couldn't move it: \(error.localizedDescription)"
-            lastError = moveError
             return
         }
         await replayOutbox()

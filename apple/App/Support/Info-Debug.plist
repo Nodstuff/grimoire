@@ -52,5 +52,18 @@
 	</array>
 	<key>TaisceAppLinkHosts</key>
 	<string>$(TAISCE_APP_LINK_HOST)</string>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Taisce doc</string>
+			<key>UTTypeIdentifier</key>
+			<string>ie.null.taisce.doc-reference</string>
+		</dict>
+	</array>
 </dict>
 </plist>

@@ -311,8 +311,14 @@ Moving a doc (`POST /api/doc/{id}/move` `{parent_id, sort_key}`):
 
 - **Drag** a row onto another row: it becomes that doc's last child (the
   target opens, and becomes a folder if it wasn't). Drag onto the **Library
-  header** for the top level. Rows carry `DocDrag` (`taisce-doc:<id>` text,
-  so plain text dragged in is refused; no custom UTType).
+  header** for the top level. A drag carries the doc id as
+  `UTType.taisceDoc` (`ie.null.taisce.doc-reference`, declared in
+  `UTExportedTypeDeclarations` in `project.yml` and `Support/Info-Debug.plist`;
+  data, not text, visible to this app only), so the editor and other apps
+  never take a row, and rows take nothing else. Drop targets use a
+  `DropDelegate` and know the dragged doc from the drag's start: a target it
+  can't go to shows the forbidden badge and no outline, and a drop that still
+  can't go there says why in the "Couldn't move" alert.
 - **Move to…** (`MoveDocSheet`): a searchable list of the docs in the same
   workspace it can go under, plus Top level; the non-drag path for touch,
   VoiceOver and the keyboard.
@@ -322,16 +328,22 @@ Moving a doc (`POST /api/doc/{id}/move` `{parent_id, sort_key}`):
   you only view (`EditAccess.canReparent`: owner or editor; LOCAL mode and
   Unsorted are yours). The top level is an owner's call (`canMove`): the
   server files an unlabelled root in the mover's Unsorted and lets only a
-  workspace's owner re-home its top-level docs, so a move to the top of a
-  workspace labels the doc with it first (a queued `PUT
-  /api/docs/{id}/workspace` the move waits on).
+  workspace's owner re-home its top-level docs. So a doc whose workspace
+  comes from its parent is labelled with it first (a queued `PUT
+  /api/docs/{id}/workspace` with its own UUID `request_id`, which the move
+  waits on); if the label lands and the move is then refused, the label is
+  undone (`workspace_id: null`), which leaves the doc resolving where it was.
 - Offline first: `Cache.enqueueDocMove` queues the write and places the
-  cached row at once (the sort key is minted on the device, after the last
-  keyed sibling, as the web's `keyForPosition`); tree refreshes and change
-  rows keep showing queued moves until they land. A refusal (cycle, 403,
-  404) puts the doc back where the server has it (`GET /api/doc/{id}`; a
-  gone doc is dropped), keeps the entry as failed with the server's reason,
-  and Library shows it in a "Couldn't move" alert (also Settings' last error).
+  cached row at once. An append sends `sort_key: null`, so the server picks
+  the key when it lands; meanwhile the row shows after the last keyed
+  sibling. Tree refreshes and change rows keep showing queued moves until
+  they land. A refusal (cycle, 403, 404) puts the doc back where the server
+  has it (`GET /api/doc/{id}`; a gone doc is dropped; a later queued move of
+  the same doc is laid back on top) and settles the row as done with the
+  reason, so sign-out doesn't count it as unsent. A move made this session
+  says why in the "Couldn't move" alert; one queued in an earlier session and
+  refused on a later replay says it in the top banner instead (and Settings
+  keeps it as the last error).
 - Not yet: dropping between rows to reorder siblings (`DocPlacement.place`
   computes before/after keys; there is no drop indicator for it yet).
 

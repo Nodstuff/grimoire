@@ -1,15 +1,6 @@
-import CoreTransferable
 import SwiftUI
 import TaisceKit
-
-extension DocDrag: Transferable {
-    static var transferRepresentation: some TransferRepresentation {
-        ProxyRepresentation(exporting: \.token) { (token: String) in
-            guard let drag = DocDrag(token: token) else { throw CocoaError(.coderReadCorrupt) }
-            return drag
-        }
-    }
-}
+import UniformTypeIdentifiers
 
 /// Moving docs in the tree from Library rows: drag one onto another (it
 /// becomes that doc's last child), onto the Library header (the top
@@ -18,7 +9,13 @@ struct DocMover {
     var canMove: (DocID) -> Bool
     /// "Move to…": the picker
     var ask: (DocID) -> Void
-    /// a drop; false when it can't go there
+    /// a drag began on this doc's row
+    var began: (DocID) -> Void
+    /// the doc being dragged, if a drag began here
+    var dragging: () -> DocID?
+    /// may the dragged doc go onto this target (nil = the top level)?
+    var canDrop: (DocID, DocID?) -> Bool
+    /// a drop; false (and the reason shown) when it can't go there
     var drop: (DocID, DocID?) -> Bool
 }
 
@@ -37,6 +34,9 @@ struct DocMoveHost: ViewModifier {
             .environment(\.docMover, DocMover(
                 canMove: { model.canReparent($0) },
                 ask: { moving = $0 },
+                began: { model.draggingDoc = $0 },
+                dragging: { model.draggingDoc },
+                canDrop: { model.canDrop($0, onto: $1) },
                 drop: { model.dropDoc($0, onto: $1) }
             ))
             .sheet(item: Binding(get: { moving.map(MovingDoc.init) }, set: { moving = $0?.id })) { m in
@@ -120,6 +120,49 @@ extension View {
     }
 }
 
+/// A drop target for dragged Library rows only (`UTType.taisceDoc`). While
+/// hovering it knows the dragged doc (`DocMover.dragging`, set when the drag
+/// began), so a target it can't go to shows the forbidden badge and no
+/// outline; a drop it can't take still says why (`dropDoc`).
+struct DocDropDelegate: DropDelegate {
+    /// nil = the top level
+    let target: DocID?
+    let mover: DocMover
+    @Binding var targeted: Bool
+    var onDropped: () -> Void = {}
+
+    private var allowed: Bool {
+        guard let dragged = mover.dragging() else { return true }
+        return mover.canDrop(dragged, target)
+    }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [.taisceDoc])
+    }
+
+    func dropEntered(info: DropInfo) {
+        targeted = allowed
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: allowed ? .move : .forbidden)
+    }
+
+    func dropExited(info: DropInfo) {
+        targeted = false
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        targeted = false
+        // our own type, visible to this process only: the drag began on a
+        // Library row, which recorded the doc
+        guard info.hasItemsConforming(to: [.taisceDoc]), let dragged = mover.dragging() else { return false }
+        guard mover.drop(dragged, target) else { return false }
+        onDropped()
+        return true
+    }
+}
+
 private struct DocDragDrop: ViewModifier {
     let id: DocID
     let mover: DocMover?
@@ -129,11 +172,7 @@ private struct DocDragDrop: ViewModifier {
     func body(content: Content) -> some View {
         if let mover {
             dragged(content, mover: mover)
-                .dropDestination(for: DocDrag.self) { items, _ in
-                    guard let drag = items.first, drag.id != id, mover.drop(drag.id, id) else { return false }
-                    onDroppedInside()
-                    return true
-                } isTargeted: { targeted = $0 }
+                .onDrop(of: [.taisceDoc], delegate: DocDropDelegate(target: id, mover: mover, targeted: $targeted, onDropped: onDroppedInside))
                 .background {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .strokeBorder(Theme.accent, lineWidth: 2)
@@ -148,7 +187,10 @@ private struct DocDragDrop: ViewModifier {
 
     @ViewBuilder private func dragged(_ content: Content, mover: DocMover) -> some View {
         if mover.canMove(id) {
-            content.draggable(DocDrag(id: id))
+            content.onDrag {
+                mover.began(id)
+                return DocDrag.provider(id)
+            }
         } else {
             content
         }
@@ -162,10 +204,7 @@ private struct DocTopLevelDrop: ViewModifier {
     func body(content: Content) -> some View {
         if let mover {
             content
-                .dropDestination(for: DocDrag.self) { items, _ in
-                    guard let drag = items.first else { return false }
-                    return mover.drop(drag.id, nil)
-                } isTargeted: { targeted = $0 }
+                .onDrop(of: [.taisceDoc], delegate: DocDropDelegate(target: nil, mover: mover, targeted: $targeted))
                 .overlay(alignment: .bottomTrailing) {
                     if targeted {
                         Text("Move to the top level")

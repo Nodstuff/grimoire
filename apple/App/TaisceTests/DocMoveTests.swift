@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import TaisceKit
+import UniformTypeIdentifiers
 @testable import Taisce
 
 private let mine = Workspace(id: "w1", name: "Work", sortKey: "a", role: "owner")
@@ -78,10 +79,40 @@ private func access(_ id: DocID) -> EditAccess {
         #expect(options.first?.isCurrent == true)
     }
 
-    @Test func aDragCarriesOnlyTaggedIDs() {
-        #expect(DocDrag(id: "d1").token == "taisce-doc:d1")
-        #expect(DocDrag(token: "taisce-doc:d1")?.id == "d1")
-        #expect(DocDrag(token: "some text") == nil)
-        #expect(DocDrag(token: "taisce-doc:") == nil)
+    /// Not text: the editor (and other apps) never take a dragged row, and
+    /// rows take nothing else. The type is declared by the app's Info.plist.
+    @Test func aDragCarriesOnlyTheAppsOwnType() async throws {
+        #expect(UTType.taisceDoc.isDeclared && UTType.taisceDoc.conforms(to: .data))
+        #expect(!UTType.taisceDoc.conforms(to: .text))
+        let p = DocDrag.provider("d1")
+        #expect(p.registeredTypeIdentifiers == ["ie.null.taisce.doc-reference"])
+        #expect(!p.hasItemConformingToTypeIdentifier(UTType.plainText.identifier))
+        let data: Data = try await withCheckedThrowingContinuation { c in
+            _ = p.loadDataRepresentation(forTypeIdentifier: UTType.taisceDoc.identifier) { d, e in
+                if let d { c.resume(returning: d) } else { c.resume(throwing: e ?? CocoaError(.fileReadUnknown)) }
+            }
+        }
+        #expect(String(decoding: data, as: UTF8.self) == "d1")
+    }
+
+    @Test func aRefusedDropSaysWhy() {
+        func why(_ d: DocID, _ t: DocID?) -> String? { DocMoves.refusal(d, onto: t, index: index, placement: placement, access: access) }
+        #expect(why("proj", "proj") == "A doc can't go inside itself.")
+        #expect(why("proj", "deep") == "A doc can't go inside one of its own docs.")
+        #expect(why("loose", nil) == "It's already at the top level.")
+        #expect(why("recipes", nil) == "Only the workspace's owner can move docs to its top level.")
+        #expect(why("club", "club")?.hasPrefix("You can only view") == true)
+        #expect(why("loose", "fam")?.contains("Move to workspace") == true)
+        #expect(why("loose", "spec") == nil)
+    }
+
+    /// Only a doc whose workspace comes from its parent is labelled on the
+    /// way to the top (and so only such a label is ever undone).
+    @Test func onlyAnInheritedWorkspaceIsLabelledOnTheWayUp() {
+        #expect(DocMoves.labelForTopLevel("spec", index: index) == "w1")
+        #expect(DocMoves.labelForTopLevel("loose", index: index) == nil, "a root carries its own")
+        #expect(DocMoves.labelForTopLevel("inbox", index: index) == nil, "Unsorted")
+        let away = DocIndex(docs + [DocInfo(id: "own", parentID: "proj", title: "Own", workspaceID: "w2")])
+        #expect(DocMoves.labelForTopLevel("own", index: away) == nil, "labelled away from its parent: its own label travels")
     }
 }
