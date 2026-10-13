@@ -60,6 +60,22 @@ import Testing
         #expect(st.local.map { $0.content.markdown } == ["alpha", "beta!?"])
     }
 
+    /// Reopened: the surface was loaded from the server's text ("beta");
+    /// the first refresh with the queue shows our parked "beta!" and no
+    /// save ever proposes "beta".
+    @Test func reopenedTheParkedTextShowsAndNothingIsProposed() {
+        var st = State(local: [("a", .paragraph(AttributedString("alpha"))), ("b", .paragraph(AttributedString("beta")))],
+                       baseline: Surface.load(DocEditor(docID: "d", baseEpoch: 4, blocks: Self.server)).baseline)
+        let r = st.refresh(Self.server, parked: Self.parked, epoch: 5)
+        #expect(r.changed)
+        #expect(st.local.map { $0.content.markdown } == ["alpha", "beta!"])
+        let entries = st.local.map { DocDiff.Entry(id: $0.id, content: $0.content.markdown, level: 0) }
+        #expect(DocDiff.computeOps(baseline: st.baseline, entries: entries).isEmpty, "nothing to send, flagged or not")
+        _ = st.refresh(Self.server, parked: Self.parked, epoch: 6)
+        #expect(st.local.map { $0.content.markdown } == ["alpha", "beta!"])
+        #expect(DocDiff.computeOps(baseline: st.baseline, entries: st.local.map { DocDiff.Entry(id: $0.id, content: $0.content.markdown, level: 0) }).isEmpty)
+    }
+
     @Test func rejectedTheServersTextComesBack() {
         var st = Self.start()
         _ = st.refresh(Self.server, parked: Self.parked, epoch: 4)

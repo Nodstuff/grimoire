@@ -577,6 +577,27 @@ public enum Surface {
             return Edit(range: NSRange(location: 0, length: s.length), replacement: out, selection: NSRange(location: (typed as NSString).length, length: 0))
         }
         var range = range
+        // text put beside a non-text block (a paste or a drop with the caret
+        // at the start or the end of its line): new paragraphs before or
+        // after it; the block and its neighbours are untouched
+        func paragraphs(at location: Int) -> Edit {
+            let out = NSMutableAttributedString()
+            var attrs = typing
+            for k in [block, line, marker, wiki, raw] { attrs[k] = nil }
+            var parts = typed.components(separatedBy: "\n")
+            if parts.count > 1, parts.last == "" { parts.removeLast() } // "x\n" is one line
+            for part in parts {
+                var a = attrs
+                a[block] = mint()
+                a[line] = LineStyle.paragraph.encoded
+                out.append(NSAttributedString(string: part + "\n", attributes: a))
+            }
+            return Edit(range: NSRange(location: location, length: 0), replacement: out,
+                        selection: NSRange(location: location + out.length - 1, length: 0))
+        }
+        if range.length == 0, !typed.isEmpty, let l = line(at: range.location, in: s), l.style == .raw {
+            return paragraphs(at: range.location <= l.range.location ? l.range.location : l.end)
+        }
         // never start inside a non-text block's line past its U+FFFC (its
         // own line break stays): start on the next line
         if let l = line(at: range.location, in: s), l.style == .raw, range.location > l.range.location {
@@ -584,20 +605,6 @@ public enum Surface {
             let start = min(l.end, ns.length)
             range = NSRange(location: start, length: max(0, end - start))
             if range.location >= ns.length { range = NSRange(location: ns.length, length: 0) }
-        }
-        // text put in front of a non-text block (a paste or a drop at its
-        // line's start): new paragraphs above it, the block untouched
-        if range.length == 0, !typed.isEmpty, let l = line(at: range.location, in: s), l.style == .raw, range.location == l.range.location {
-            let out = NSMutableAttributedString()
-            var attrs = typing
-            for k in [block, line, marker, wiki, raw] { attrs[k] = nil }
-            for part in typed.components(separatedBy: "\n") {
-                var a = attrs
-                a[block] = mint()
-                a[line] = LineStyle.paragraph.encoded
-                out.append(NSAttributedString(string: part + "\n", attributes: a))
-            }
-            return Edit(range: range, replacement: out, selection: NSRange(location: range.location + out.length - 1, length: 0))
         }
         // whole lines deleted up to a non-text block: those blocks go, no join
         if typed.isEmpty, range.length > 0, range.location + range.length < ns.length,

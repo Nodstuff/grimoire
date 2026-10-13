@@ -61,7 +61,15 @@ public enum SurfaceMerge {
                 let md = l.markdown
                 if var c = conflicts[s.id] {
                     if parked.contains(s.id) {
-                        // our parked edit (overlaid): in conflict until a human decides
+                        // our parked edit (overlaid): in conflict until a human
+                        // decides. Untouched here (a reopened doc showing the
+                        // server's text): show the parked text, so no save
+                        // ever proposes reverting it
+                        if md == b.content, sc != md {
+                            pieces.append(Piece(id: s.id, content: EditorBlockContent.parse(s), local: false))
+                            newBase.append(theirs)
+                            continue
+                        }
                     } else if sc == md {
                         // the other side took ours (accepted on the desktop): over
                         conflicts[s.id] = nil

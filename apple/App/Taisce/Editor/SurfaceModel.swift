@@ -105,9 +105,24 @@ final class SurfaceModel: NSObject {
     static func open(_ docID: DocID, app: AppModel, editable: Bool) async -> SurfaceModel? {
         guard let cache = app.cache else { return nil }
         if (try? await cache.doc(docID))?.bodyEpoch == nil { try? await app.sync?.refresh(docID) }
-        guard let editor = try? await cache.editor(for: docID) else { return nil }
-        let conflicts = (try? await cache.conflictedBlocks(docID)) ?? [:]
-        let model = SurfaceModel(docID: docID, editor: editor, cache: cache, api: app.api, app: app, editable: editable, conflicts: conflicts)
+        guard var editor = try? await cache.editor(for: docID) else { return nil }
+        var conflicts: [BlockID: SurfaceConflict] = [:]
+        for (b, base) in (try? await cache.conflictedBlocks(docID)) ?? [:] { conflicts[b] = SurfaceConflict(base: base) }
+        // our parked edits show from the start (when the server's review
+        // queue can be fetched now; otherwise the first poll that gets it)
+        var open: Set<String>?
+        var parked: Set<BlockID> = []
+        if editable, let api = app.api, app.isOnline, let fetched = try? await api.openReviewOps(docID) {
+            open = fetched
+            if let ops = try? await cache.parkedOps(for: docID, openOps: fetched) {
+                parked = ParkedEdits.apply(ops, on: &editor, conflicts: &conflicts, parkedBefore: [])
+            }
+        }
+        let model = SurfaceModel(docID: docID, editor: editor, cache: cache, api: app.api, app: app, editable: editable)
+        model.conflicts = conflicts
+        model.openOps = open
+        model.parkedBlocks = parked
+        if open != nil { model.lastReviewFetch = Date() }
         model.start()
         return model
     }

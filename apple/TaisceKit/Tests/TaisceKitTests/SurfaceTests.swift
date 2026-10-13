@@ -417,6 +417,17 @@ import Testing
         for text in ["x\ny\nz", "# Head\n\n- a\n- b", "plain", "\n"] {
             for at in 0..<length {
                 var h = Harness(doc)
+                // the block the caret is in may change (unless it's a
+                // non-text block); every other keeps its content
+                let before = Dictionary(uniqueKeysWithValues: h.blocks.map { ($0.id, $0.content.markdown) })
+                let here = Surface.block(at: at, in: h.s)
+                let mayChange: BlockID? = here.flatMap { $0.content.isRaw ? nil : $0.id }
+                defer {
+                    let after = Dictionary(uniqueKeysWithValues: h.blocks.map { ($0.id, $0.content.markdown) })
+                    for (id, md) in before where id != mayChange {
+                        #expect(after[id] == md, "\(text.debugDescription) at \(at): \(id) was \(md.debugDescription), now \(after[id]?.debugDescription ?? "gone")")
+                    }
+                }
                 Surface.$allowsRepair.withValue(true) {
                     h.replace(NSRange(location: at, length: 0), with: text)
                 }
@@ -427,6 +438,16 @@ import Testing
                 }
             }
         }
+        }
+    }
+
+    @Test func pastingAtTheEndOfANonTextBlocksLineAddsParagraphsAfterIt() {
+        for (text, want) in [("x\ny", ["x", "y"]), ("x", ["x"]), ("x\n", ["x"])] {
+            var h = Harness([Self.b("c", "```\ncode\n```", key: "i", type: .code), Self.b("n", "november", key: "r")])
+            h.replace(NSRange(location: h.location(of: Surface.attachment) + 1, length: 0), with: text)
+            #expect(h.markdown == ["```\ncode\n```"] + want + ["november"], "\(text.debugDescription)")
+            #expect(h.ids.first == "c" && h.ids.last == "n")
+            #expect(!h.ops().contains { if case .replace = $0 { true } else { false } }, "nothing existing changes")
         }
     }
 
