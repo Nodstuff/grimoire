@@ -105,8 +105,9 @@ struct SidebarWorkspaceRow: View {
                 .help("Switch workspace (⌘1–⌘9)")
             Spacer()
         }
-        .sheet(isPresented: $creating) { NewWorkspaceSheet() }
-        .sheet(isPresented: $managing) { ManageWorkspacesSheet() }
+        // passed on by hand: a sheet from the sidebar may not inherit it (Move to… trapped)
+        .sheet(isPresented: $creating) { NewWorkspaceSheet().environment(model) }
+        .sheet(isPresented: $managing) { ManageWorkspacesSheet().environment(model) }
     }
 }
 
@@ -465,7 +466,8 @@ struct WorkspaceMoveHost: ViewModifier {
             // only out of a space you own (your Unsorted, your workspaces)
             .environment(\.moveToWorkspace, model.hasWorkspaces && model.currentAccess.canMove ? { moving = $0 } : nil)
             .sheet(item: Binding(get: { moving.map(MovingDoc.init) }, set: { moving = $0?.id })) { m in
-                MoveToWorkspaceSheet(docIDs: [m.id])
+                // passed on by hand, as for Move to… (a sidebar sheet may not inherit it)
+                MoveToWorkspaceSheet(docIDs: [m.id]).environment(model)
             }
     }
 

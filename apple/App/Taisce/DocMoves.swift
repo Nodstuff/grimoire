@@ -46,6 +46,26 @@ enum DocMoves {
         refusal(dragged, onto: target, index: index, placement: placement, access: access) == nil
     }
 
+    /// Where `dragged` lands just before or after `target` (its parent and
+    /// key), or why it can't (why nil and no spot: a no-op, onto itself).
+    /// Among its own siblings it is a reorder; elsewhere the move rules hold.
+    static func place(_ dragged: DocID, _ side: DocPlacement.Side, _ target: DocID, index: DocIndex, placement: DocPlacement,
+                      access: (DocID) -> EditAccess) -> (spot: (parent: DocID?, sortKey: String)?, why: String?) {
+        guard let doc = index.byID[dragged] else { return (nil, "That doc isn't here any more.") }
+        guard dragged != target else { return (nil, nil) }
+        guard let t = index.byID[target] else { return (nil, "That doc isn't here any more.") }
+        guard t.workspaceID == doc.workspaceID else { return (nil, "Docs move within their workspace; use Move to workspace\u{2026} first.") }
+        // a doc with no order key (an old one) sorts last and bounds nothing:
+        // beside it the doc would land somewhere else, so only inside it
+        guard t.sortKey != nil else { return (nil, "That doc has no place in the order yet; drop onto it instead.") }
+        guard let spot = placement.place(dragged, side, target) else { return (nil, "A doc can't go inside one of its own docs.") }
+        if spot.parent == doc.parentID {
+            return access(dragged).canReparent ? (spot, nil) : (nil, "You can only view this workspace, so its docs stay where they are.")
+        }
+        if let why = refusal(dragged, onto: spot.parent, index: index, placement: placement, access: access) { return (nil, why) }
+        return (spot, nil)
+    }
+
     /// A move to the top level labels the doc with its workspace first, but
     /// only when that workspace comes from its parent: a doc with its own
     /// label carries it anyway, and the label's undo after a refusal must
@@ -135,18 +155,40 @@ extension AppModel {
         return true
     }
 
+    /// Where `dragged` lands just before or after `target`, or why it can't.
+    func placeRefusal(_ dragged: DocID, _ side: DocPlacement.Side, _ target: DocID) -> (spot: (parent: DocID?, sortKey: String)?, why: String?) {
+        DocMoves.place(dragged, side, target, index: index, placement: DocMoves.placement(docs), access: access(for:))
+    }
+
+    func canPlace(_ dragged: DocID, _ side: DocPlacement.Side, _ target: DocID) -> Bool {
+        placeRefusal(dragged, side, target).spot != nil
+    }
+
+    /// A drop just before or after a row: its sibling there.
+    @discardableResult
+    func placeDoc(_ dragged: DocID, _ side: DocPlacement.Side, _ target: DocID) -> Bool {
+        draggingDoc = nil
+        let r = placeRefusal(dragged, side, target)
+        guard let spot = r.spot else {
+            if let why = r.why { moveError = "Couldn't move it: \(why)" }
+            return false
+        }
+        Task { await moveDoc(dragged, into: spot.parent, sortKey: spot.sortKey) }
+        return true
+    }
+
     /// Make `id` the last child of `parent` (nil = the top level of its
-    /// workspace) through the outbox: Library shows it at once, the server
-    /// picks the key when it lands (an append), a refusal puts it back and
-    /// sets `moveError`.
-    func moveDoc(_ id: DocID, into parent: DocID?) async {
+    /// workspace), or put it at `sortKey` there, through the outbox:
+    /// Library shows it at once (an append's key the server picks when it
+    /// lands); a refusal puts it back and sets `moveError`.
+    func moveDoc(_ id: DocID, into parent: DocID?, sortKey: String? = nil) async {
         guard let cache, index.byID[id] != nil else { return }
         // at the top level an inherited workspace would be lost
         let keep = parent == nil && hasWorkspaces ? DocMoves.labelForTopLevel(id, index: index) : nil
         let key = UUID().uuidString.lowercased()
         movesThisSession.insert(key)
         do {
-            try await cache.enqueueDocMove(id, parent: parent, keepWorkspace: keep, key: key)
+            try await cache.enqueueDocMove(id, parent: parent, sortKey: sortKey, keepWorkspace: keep, key: key)
         } catch {
             moveError = "Couldn't move it: \(error.localizedDescription)"
             return

@@ -56,6 +56,49 @@ private func access(_ id: DocID) -> EditAccess {
         #expect(!DocMoves.canDrop("missing", onto: "proj", index: index, placement: placement, access: access))
     }
 
+    /// Dropped on a row's top or bottom edge: its sibling, just before or after.
+    @Test func besideARowIsItsSibling() throws {
+        func place(_ d: DocID, _ side: DocPlacement.Side, _ t: DocID) -> (spot: (parent: DocID?, sortKey: String)?, why: String?) {
+            DocMoves.place(d, side, t, index: index, placement: placement, access: access)
+        }
+        // a reorder among siblings: notes before spec (keys a, i → before a)
+        let r = try #require(place("notes", .before, "spec").spot)
+        #expect(r.parent == "proj" && r.sortKey < "a")
+        // out of a folder to the top level, after proj (an owner's call: w1 is mine)
+        let out = try #require(place("spec", .after, "proj").spot)
+        #expect(out.parent == nil && out.sortKey > "a" && out.sortKey < "i")
+        // into another folder's children, beside one of them
+        let into = try #require(place("loose", .after, "deep").spot)
+        #expect(into.parent == "notes" && into.sortKey > "a")
+        // never below itself, never across workspaces, never in a viewer's
+        #expect(place("proj", .after, "deep").spot == nil)
+        #expect(place("loose", .before, "fam").spot == nil)
+        #expect(place("club", .before, "club").spot == nil && place("club", .before, "club").why == nil, "onto itself: nothing")
+        #expect(place("inbox", .before, "proj").spot == nil, "Unsorted and w1 are different spaces")
+        // an editor reorders within a shared workspace, but the top level is the owner's
+        #expect(place("recipes", .before, "fam").spot == nil, "w2's top level is Aoife's")
+        // beside a doc with no order key: nowhere (only inside it)
+        let unkeyed = docs + [DocInfo(id: "old", title: "Old", workspaceID: "w1")]
+        let ui = DocIndex(unkeyed)
+        #expect(DocMoves.place("loose", .before, "old", index: ui, placement: DocMoves.placement(unkeyed), access: access).spot == nil)
+    }
+
+    @Test func theDropZoneFollowsThePointer() {
+        #expect(DocDropZone.at(2, height: 30) == .before)
+        #expect(DocDropZone.at(15, height: 30) == .into)
+        #expect(DocDropZone.at(28, height: 30) == .after)
+        #expect(DocDropZone.at(10, height: 0) == .into)
+    }
+
+    @Test func theTreeShowsOpenFoldersOnly() {
+        let nodes = LibraryNode.build(docs)
+        let closed = DocTreeLine.lines(nodes, isOpen: { _ in false }).map(\.id)
+        #expect(closed == ["proj", "loose", "fam", "club", "inbox"])
+        let open = DocTreeLine.lines(nodes, isOpen: { $0 == "proj" || $0 == "notes" })
+        #expect(open.map(\.id) == ["proj", "spec", "notes", "deep", "loose", "fam", "club", "inbox"])
+        #expect(open.map(\.depth) == [0, 1, 1, 2, 0, 0, 0, 0])
+    }
+
     @Test func theTopLevelIsAnOwnersCall() {
         #expect(DocMoves.canDrop("spec", onto: nil, index: index, placement: placement, access: access))
         #expect(!DocMoves.canDrop("loose", onto: nil, index: index, placement: placement, access: access), "already there")

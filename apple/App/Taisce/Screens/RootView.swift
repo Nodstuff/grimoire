@@ -296,64 +296,73 @@ struct PadSidebar: View {
     @FocusState private var searchFocused: Bool
     /// folders opened by hand (the ones above the doc in front open by themselves)
     @State private var expanded: Set<DocID> = []
+    @State private var scroller = TreeScroller()
+    /// the selection changed by a click in the tree (already in view: no scroll)
+    @State private var fromTree = false
 
-    /// What the List selects, and the folders that must be open for its row.
-    private var sidebarFront: (selection: PadItem?, reveal: Set<DocID>) {
+    /// The doc in front, and the folders above it (open, so its row shows).
+    private var front: (selection: PadItem?, reveal: Set<DocID>) {
         let front = router.sidebarSelection
-        guard case .doc(let id)? = front else { return (front, []) }
-        guard let above = LibraryNode.ancestors(of: id, in: model.library) else { return (router.padItem, []) }
+        guard case .doc(let id)? = front, let above = LibraryNode.ancestors(of: id, in: model.library) else { return (front, []) }
         return (front, Set(above))
     }
 
     var body: some View {
         @Bindable var router = router
-        // The List must have a row for whatever it selects: told to select a
-        // doc it has no row for (inside a closed folder, or outside this
-        // workspace), SwiftUI empties the detail stack and the doc never
-        // opens. So the folders above the doc in front stay open, and a doc
-        // the tree doesn't hold leaves the selection where it was.
-        let (shown, reveal) = sidebarFront
-        let selection = Binding<PadItem?>(get: { shown }, set: { if let item = $0 { router.select(item) } })
-        List(selection: selection) {
-            if model.hasWorkspaces {
-                SidebarWorkspaceRow()
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
-            }
-            Section {
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(Theme.secondary).accessibilityHidden(true)
-                    TextField("Search", text: $router.searchQuery)
-                        .focused($searchFocused)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .submitLabel(.search)
-                        .onSubmit { router.select(.search) }
+        let (shown, reveal) = front
+        let selectedDoc: DocID? = if case .doc(let id)? = shown { id } else { nil }
+        // Not a List: List rows never receive drops (iOS and the Mac), so
+        // the Library is a LibraryTree in a plain scroll view.
+        ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    if model.hasWorkspaces {
+                        SidebarWorkspaceRow().padding(.horizontal, 2)
+                    }
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass").foregroundStyle(Theme.secondary).accessibilityHidden(true)
+                        TextField("Search", text: $router.searchQuery)
+                            .focused($searchFocused)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .submitLabel(.search)
+                            .onSubmit { router.select(.search) }
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(minHeight: 34)
+                    .background(Theme.surface2, in: .rect(cornerRadius: 10, style: .continuous))
+                    .padding(.vertical, 6)
+                    .onChange(of: router.searchQuery) { _, q in
+                        if !q.isEmpty, router.padItem != .search { router.select(.search) }
+                    }
+                    .onChange(of: router.searchFocusRequest) { searchFocused = true }
+                    SidebarItem(title: "Today", systemImage: "house", badge: model.dueCount, selected: shown == .today) { router.select(.today) }
+                    SidebarItem(title: "To-dos", systemImage: "checkmark.circle", selected: shown == .todos) { router.select(.todos) }
+                    // drop a dragged doc on the header: the top level
+                    Text("Library")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.secondary)
+                        .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+                        .padding(.top, 12)
+                        .padding(.leading, 6)
+                        .docTopLevelDrop(mover: docMover)
+                        .accessibilityAddTraits(.isHeader)
+                    LibraryTree(nodes: model.library, expanded: $expanded, reveal: reveal, selected: selectedDoc,
+                            pins: Set(model.pins), style: .sidebar, onOpen: { fromTree = true; router.select(.doc($0)) }) { node in
+                        rowMenu(node)
+                    }
                 }
                 .padding(.horizontal, 10)
-                .frame(minHeight: 38)
-                .background(Theme.surface2, in: .rect(cornerRadius: 10, style: .continuous))
-                .listRowBackground(Color.clear)
-                .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
-                .onChange(of: router.searchQuery) { _, q in
-                    if !q.isEmpty, router.padItem != .search { router.select(.search) }
-                }
-                .onChange(of: router.searchFocusRequest) { searchFocused = true }
-                // the tag goes last: a badge wrapping it hides it from the
-                // List's selection on the Mac, so Today couldn't be clicked
-                Label("Today", systemImage: "house")
-                    .badge(model.dueCount)
-                    .tag(PadItem.today)
-                Label("To-dos", systemImage: "checkmark.circle").tag(PadItem.todos)
-            }
-            Section {
-                SidebarTreeRows(nodes: model.library, expanded: $expanded, reveal: reveal, docDeletion: docDeletion, docMover: docMover)
-            } header: {
-                // drop a dragged doc on the header: the top level
-                Text("Library").frame(maxWidth: .infinity, alignment: .leading).docTopLevelDrop(mover: docMover)
-            }
+                .padding(.vertical, 6)
         }
-        .listStyle(.sidebar)
+        .scrollDismissesKeyboard(.immediately)
+        // drags near the top or bottom edge scroll it
+        .treeScrolling(scroller)
+        // the doc in front comes into view (a link followed, a search hit)
+        .onChange(of: selectedDoc) { _, id in
+            defer { fromTree = false }
+            guard let id, !fromTree else { return }
+            withAnimation { scroller.position.scrollTo(id: id, anchor: .center) }
+        }
         // what opened itself stays open after you move on
         .onChange(of: reveal) { _, r in expanded.formUnion(r) }
         .navigationTitle("Taisce")
@@ -384,63 +393,57 @@ struct PadSidebar: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 6)
+            // the tree scrolls under it: a bar, not text over rows
+            .background(.bar)
         }
         .refreshable { try? await model.sync?.catchUp() }
     }
-}
 
-/// The sidebar's Library tree. A folder in `reveal` is open whatever
-/// `expanded` says: closing it while its doc is in front would leave the
-/// List selecting a row it doesn't have.
-private struct SidebarTreeRows: View {
-    let nodes: [LibraryNode]
-    @Binding var expanded: Set<DocID>
-    let reveal: Set<DocID>
-    let docDeletion: DocDeletion?
-    let docMover: DocMover?
-    @Environment(AppModel.self) private var model
-    @Environment(Router.self) private var router
-
-    var body: some View {
-        ForEach(nodes) { node in
-            if let kids = node.children {
-                DisclosureGroup(isExpanded: open(node.id)) {
-                    SidebarTreeRows(nodes: kids, expanded: $expanded, reveal: reveal, docDeletion: docDeletion, docMover: docMover)
-                } label: {
-                    row(node)
-                }
-            } else {
-                row(node)
-            }
+    @ViewBuilder private func rowMenu(_ node: LibraryNode) -> some View {
+        Button(model.isPinned(node.id) ? "Unpin from Today" : "Pin to Today",
+               systemImage: model.isPinned(node.id) ? "pin.slash" : "pin") { model.togglePin(node.id) }
+        if model.access(for: node.id).canCreate {
+            Button("New doc here", systemImage: "plus") { router.newDoc(in: node.id) }
+        }
+        if let docMover, docMover.canMove(node.id) {
+            Button("Move to\u{2026}", systemImage: "folder") { docMover.ask(node.id) }
+        }
+        if let docDeletion, docDeletion.canDelete(node.id) {
+            Divider()
+            Button("Delete\u{2026}", systemImage: "trash", role: .destructive) { docDeletion.ask(node.id) }
         }
     }
+}
 
-    private func open(_ id: DocID) -> Binding<Bool> {
-        Binding(
-            get: { expanded.contains(id) || reveal.contains(id) },
-            set: { if $0 { expanded.insert(id) } else { expanded.remove(id) } }
-        )
-    }
+/// Today and To-dos in the sidebar: a row that selects its screen.
+private struct SidebarItem: View {
+    let title: String
+    let systemImage: String
+    var badge = 0
+    let selected: Bool
+    let action: () -> Void
+    @State private var pointer = false
 
-    private func row(_ node: LibraryNode) -> some View {
-        Label(node.doc.title, systemImage: node.isFolder ? "folder" : "doc.text")
-            .tag(PadItem.doc(node.id))
-            // drag onto another row: inside it (open it, so the doc stays in view)
-            .docDragAndDrop(node.id, mover: docMover) { expanded.insert(node.id) }
-            .contextMenu {
-                Button(model.isPinned(node.id) ? "Unpin from Today" : "Pin to Today",
-                       systemImage: model.isPinned(node.id) ? "pin.slash" : "pin") { model.togglePin(node.id) }
-                if model.access(for: node.id).canCreate {
-                    Button("New doc here", systemImage: "plus") { router.newDoc(in: node.id) }
-                }
-                if let docMover, docMover.canMove(node.id) {
-                    Button("Move to\u{2026}", systemImage: "folder") { docMover.ask(node.id) }
-                }
-                if let docDeletion, docDeletion.canDelete(node.id) {
-                    Divider()
-                    Button("Delete\u{2026}", systemImage: "trash", role: .destructive) { docDeletion.ask(node.id) }
-                }
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage).foregroundStyle(Theme.accent).frame(width: 22).accessibilityHidden(true)
+            Text(title).foregroundStyle(Theme.text)
+            Spacer(minLength: 0)
+            if badge > 0 {
+                Text("\(badge)").font(.caption.weight(.semibold)).foregroundStyle(Theme.secondary)
             }
+        }
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+            .fill(selected ? Theme.accent.opacity(0.16) : pointer ? Theme.text.opacity(0.06) : .clear))
+        .contentShape(.rect)
+        .onHover { pointer = $0 }
+        .onTapGesture(perform: action)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(badge > 0 ? "\(title), \(badge)" : title)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction { action() }
     }
 }
 

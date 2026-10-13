@@ -17,6 +17,10 @@ struct DocMover {
     var canDrop: (DocID, DocID?) -> Bool
     /// a drop; false (and the reason shown) when it can't go there
     var drop: (DocID, DocID?) -> Bool
+    /// may the dragged doc go just before / after this row (a sibling)?
+    var canPlace: (DocID, DocPlacement.Side, DocID) -> Bool = { _, _, _ in false }
+    /// a drop just before / after a row
+    var place: (DocID, DocPlacement.Side, DocID) -> Bool = { _, _, _ in false }
 }
 
 extension EnvironmentValues {
@@ -37,10 +41,14 @@ struct DocMoveHost: ViewModifier {
                 began: { model.draggingDoc = $0 },
                 dragging: { model.draggingDoc },
                 canDrop: { model.canDrop($0, onto: $1) },
-                drop: { model.dropDoc($0, onto: $1) }
+                drop: { model.dropDoc($0, onto: $1) },
+                canPlace: { model.canPlace($0, $1, $2) },
+                place: { model.placeDoc($0, $1, $2) }
             ))
             .sheet(item: Binding(get: { moving.map(MovingDoc.init) }, set: { moving = $0?.id })) { m in
-                MoveDocSheet(docID: m.id)
+                // the model is passed on by hand: a sheet presented from the
+                // Mac sidebar didn't inherit it (SwiftUI trapped on the lookup)
+                MoveDocSheet(docID: m.id).environment(model)
             }
             .alert(
                 "Couldn't move",
@@ -108,12 +116,6 @@ struct MoveDocSheet: View {
 }
 
 extension View {
-    /// A Library row you can drag (when you may move its doc) and drop
-    /// another doc onto (it goes inside, as the last child).
-    func docDragAndDrop(_ id: DocID, mover: DocMover?, onDroppedInside: @escaping () -> Void = {}) -> some View {
-        modifier(DocDragDrop(id: id, mover: mover, onDroppedInside: onDroppedInside))
-    }
-
     /// The top-level drop target (a Library header).
     func docTopLevelDrop(mover: DocMover?) -> some View {
         modifier(DocTopLevelDrop(mover: mover))
@@ -160,40 +162,6 @@ struct DocDropDelegate: DropDelegate {
         guard mover.drop(dragged, target) else { return false }
         onDropped()
         return true
-    }
-}
-
-private struct DocDragDrop: ViewModifier {
-    let id: DocID
-    let mover: DocMover?
-    let onDroppedInside: () -> Void
-    @State private var targeted = false
-
-    func body(content: Content) -> some View {
-        if let mover {
-            dragged(content, mover: mover)
-                .onDrop(of: [.taisceDoc], delegate: DocDropDelegate(target: id, mover: mover, targeted: $targeted, onDropped: onDroppedInside))
-                .background {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(Theme.accent, lineWidth: 2)
-                        .opacity(targeted ? 1 : 0)
-                        .padding(-4)
-                        .allowsHitTesting(false)
-                }
-        } else {
-            content
-        }
-    }
-
-    @ViewBuilder private func dragged(_ content: Content, mover: DocMover) -> some View {
-        if mover.canMove(id) {
-            content.onDrag {
-                mover.began(id)
-                return DocDrag.provider(id)
-            }
-        } else {
-            content
-        }
     }
 }
 

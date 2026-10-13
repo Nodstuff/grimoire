@@ -14,9 +14,13 @@ final class LaunchTests: XCTestCase {
         // the tree lives in Library: a tab on iPhone, the sidebar on iPad
         let library = app.tabBars.buttons["Library"]
         if library.waitForExistence(timeout: 10) { library.tap() }
-        let doc = app.staticTexts["Welcome"]
+        let doc = app.descendants(matching: .any)["tree.Welcome"].firstMatch
         XCTAssertTrue(doc.waitForExistence(timeout: 15), "the synced tree lists the seeded doc")
+        #if targetEnvironment(macCatalyst)
+        doc.click()
+        #else
         doc.tap()
+        #endif
         XCTAssertTrue(app.staticTexts["Welcome to Taisce"].waitForExistence(timeout: 15), "the body rendered")
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.lifetime = .keepAlways

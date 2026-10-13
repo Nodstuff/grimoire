@@ -17,7 +17,8 @@ struct LibraryScreen: View {
                 pins: Set(model.pins),
                 onTogglePin: model.togglePin,
                 // a workspace you only view takes no new docs (ADR 0004)
-                onNewDoc: model.currentAccess.canCreate ? { router.newDoc(in: $0) } : nil
+                onNewDoc: model.currentAccess.canCreate ? { router.newDoc(in: $0) } : nil,
+                onOpen: { router.open(.doc($0)) }
             )
             .refreshable { try? await model.sync?.catchUp() }
             .safeAreaInset(edge: .top, spacing: 0) { WorkspaceBar(triage: true) }
@@ -35,41 +36,48 @@ struct LibraryContent: View {
     var onTogglePin: (DocID) -> Void = { _ in }
     /// nil parent = top level
     var onNewDoc: ((DocID?) -> Void)?
+    var onOpen: (DocID) -> Void = { _ in }
     /// folders start closed; the ones you open are remembered across launches
     @AppStorage("library.expanded") private var expandedStore = ""
-    @State private var expanded: Set<DocID>?
+    @State private var expanded: Set<DocID> = []
+    @State private var restored = false
+    @State private var scroller = TreeScroller()
     @Environment(\.docMover) private var docMover
+    @Environment(\.moveToWorkspace) private var moveToWorkspace
+    @Environment(\.docDeletion) private var docDeletion
 
     var body: some View {
-        List {
-            Section {
-                if nodes.isEmpty {
-                    Group {
-                        if loaded {
-                            EmptyCard(icon: "folder", title: "Your library is empty", hint: "Docs you create on the desktop or through an agent appear here.")
-                        } else {
-                            HStack { Spacer(); ProgressView(); Spacer() }.frame(minHeight: 120)
-                        }
-                    }
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets())
-                } else {
-                    LibraryTreeRows(nodes: nodes, pins: pins, expanded: $expanded, onTogglePin: onTogglePin, onNewDoc: onNewDoc)
-                }
-            } header: {
+        // Not a List: List rows never receive drops, so a doc could be
+        // picked up but put nowhere. The tree is drawn row by row.
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
                 ScreenHeader(title: "Library") {
                     if let onNewDoc {
                         CircleIconButton(systemImage: "plus", label: "New doc", filled: true) { onNewDoc(nil) }
                     }
                 }
-                    .textCase(nil)
-                    // drop a dragged doc here: the top level
-                    .docTopLevelDrop(mover: docMover)
-                    .padding(.bottom, 8)
-                    .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
+                // drop a dragged doc here: the top level
+                .docTopLevelDrop(mover: docMover)
+                .padding(.horizontal, 4)
+                if nodes.isEmpty {
+                    if loaded {
+                        EmptyCard(icon: "folder", title: "Your library is empty", hint: "Docs you create on the desktop or through an agent appear here.")
+                    } else {
+                        HStack { Spacer(); ProgressView(); Spacer() }.frame(minHeight: 120)
+                    }
+                } else {
+                    LibraryTree(nodes: nodes, expanded: $expanded, pins: pins, style: .library, onOpen: onOpen) { node in
+                        menu(node)
+                    }
+                    .padding(6)
+                    .background(Theme.surface, in: .rect(cornerRadius: 12, style: .continuous))
+                }
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
         }
-        .listStyle(.insetGrouped)
+        // drags near the top or bottom edge scroll it
+        .treeScrolling(scroller)
         // reading width on iPad, centred on the ground
         .frame(maxWidth: Theme.readingWidth)
         .frame(maxWidth: .infinity)
@@ -78,100 +86,31 @@ struct LibraryContent: View {
         .groundBackground()
         .toolbarVisibility(.hidden, for: .navigationBar)
         .onAppear {
-            if expanded == nil { expanded = Set(expandedStore.split(separator: ",").map(String.init)) }
+            guard !restored else { return }
+            restored = true
+            expanded = Set(expandedStore.split(separator: ",").map(String.init))
         }
         .onChange(of: expanded) { _, now in
-            expandedStore = (now ?? []).sorted().joined(separator: ",")
-        }
-    }
-}
-
-/// The tree as rows: folders disclose their children, every row opens its doc.
-struct LibraryTreeRows: View {
-    let nodes: [LibraryNode]
-    let pins: Set<DocID>
-    @Binding var expanded: Set<DocID>?
-    let onTogglePin: (DocID) -> Void
-    var onNewDoc: ((DocID?) -> Void)?
-    @Environment(\.moveToWorkspace) private var moveToWorkspace
-    @Environment(\.docDeletion) private var docDeletion
-    @Environment(\.docMover) private var docMover
-
-    var body: some View {
-        ForEach(nodes) { node in
-            if let kids = node.children {
-                DisclosureGroup(isExpanded: binding(node.id)) {
-                    LibraryTreeRows(nodes: kids, pins: pins, expanded: $expanded, onTogglePin: onTogglePin, onNewDoc: onNewDoc)
-                } label: {
-                    link(node)
-                }
-                .listRowBackground(Theme.surface)
-            } else {
-                link(node).listRowBackground(Theme.surface)
-            }
+            expandedStore = now.sorted().joined(separator: ",")
         }
     }
 
-    func binding(_ id: DocID) -> Binding<Bool> {
-        Binding(
-            get: { expanded?.contains(id) ?? false },
-            set: { open in
-                var set = expanded ?? []
-                if open { set.insert(id) } else { set.remove(id) }
-                expanded = set
-            }
-        )
-    }
-
-    func link(_ node: LibraryNode) -> some View {
-        NavigationLink(value: Route.doc(node.id)) {
-            LibraryRow(node: node, pinned: pins.contains(node.id))
+    @ViewBuilder private func menu(_ node: LibraryNode) -> some View {
+        Button(pins.contains(node.id) ? "Unpin from Today" : "Pin to Today",
+               systemImage: pins.contains(node.id) ? "pin.slash" : "pin") { onTogglePin(node.id) }
+        if let onNewDoc {
+            Button("New doc here", systemImage: "plus") { onNewDoc(node.id) }
         }
-        // drag onto another row: inside it (open it, so the doc stays in view)
-        .docDragAndDrop(node.id, mover: docMover) { expanded = (expanded ?? []).union([node.id]) }
-        .contextMenu {
-            Button(pins.contains(node.id) ? "Unpin from Today" : "Pin to Today",
-                   systemImage: pins.contains(node.id) ? "pin.slash" : "pin") { onTogglePin(node.id) }
-            if let onNewDoc {
-                Button("New doc here", systemImage: "plus") { onNewDoc(node.id) }
-            }
-            if let docMover, docMover.canMove(node.id) {
-                Button("Move to\u{2026}", systemImage: "folder") { docMover.ask(node.id) }
-            }
-            if let moveToWorkspace {
-                Button("Move to workspace\u{2026}", systemImage: "square.stack") { moveToWorkspace(node.id) }
-            }
-            if let docDeletion, docDeletion.canDelete(node.id) {
-                Divider()
-                Button("Delete\u{2026}", systemImage: "trash", role: .destructive) { docDeletion.ask(node.id) }
-            }
+        if let docMover, docMover.canMove(node.id) {
+            Button("Move to\u{2026}", systemImage: "folder") { docMover.ask(node.id) }
         }
-    }
-}
-
-struct LibraryRow: View {
-    let node: LibraryNode
-    var pinned = false
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: node.isFolder ? "folder" : "doc.text")
-                .font(.subheadline)
-                .foregroundStyle(node.isFolder ? Theme.accent : Theme.secondary)
-                .frame(width: 24)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(node.doc.title).font(.subheadline).foregroundStyle(Theme.text).lineLimit(2)
-                if let sub = node.subtitle {
-                    Text(sub).font(.caption2).foregroundStyle(Theme.secondary).lineLimit(1)
-                }
-            }
-            Spacer(minLength: 0)
-            if pinned {
-                Image(systemName: "pin.fill").font(.caption).foregroundStyle(Theme.accent).accessibilityLabel("Pinned")
-            }
+        if let moveToWorkspace {
+            Button("Move to workspace\u{2026}", systemImage: "square.stack") { moveToWorkspace(node.id) }
         }
-        .frame(minHeight: Theme.minTarget)
+        if let docDeletion, docDeletion.canDelete(node.id) {
+            Divider()
+            Button("Delete\u{2026}", systemImage: "trash", role: .destructive) { docDeletion.ask(node.id) }
+        }
     }
 }
 

@@ -30,15 +30,32 @@ final class DeleteDocUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-serverURL", base.absoluteString]
         app.launch()
-        let row = app.staticTexts[title]
+        // iPhone: the Library tab; iPad and the Mac: the sidebar
+        let tab = app.tabBars.buttons["Library"]
+        if tab.waitForExistence(timeout: 3) { tab.tap() }
+        // a Library tree row (LibraryTree: one element per row)
+        let row = app.descendants(matching: .any)["tree.\(title)"].firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: 20), "the sidebar lists the seeded doc")
+        #if targetEnvironment(macCatalyst)
+        row.rightClick()
+        let menuItem = app.menuItems["Delete\u{2026}"].firstMatch
+        #else
         row.press(forDuration: 1.2)
-        let menuItem = app.buttons["Delete\u{2026}"]
+        let menuItem = app.buttons["Delete\u{2026}"].firstMatch
+        #endif
         XCTAssertTrue(menuItem.waitForExistence(timeout: 5), "the context menu offers Delete…")
+        #if targetEnvironment(macCatalyst)
+        menuItem.click()
+        #else
         menuItem.tap()
-        let confirm = app.alerts.buttons["Delete"]
+        #endif
+        let confirm = app.alerts.buttons["Delete"].firstMatch
         XCTAssertTrue(confirm.waitForExistence(timeout: 5), "it asks first")
+        #if targetEnvironment(macCatalyst)
+        confirm.click()
+        #else
         confirm.tap()
+        #endif
 
         XCTAssertTrue(row.waitForNonExistence(timeout: 15), "the row went")
         let trash = try XCTUnwrap(try call("/api/trash") as? [[String: Any]], "trash is a list")
