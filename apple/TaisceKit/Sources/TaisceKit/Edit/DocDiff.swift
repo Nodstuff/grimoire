@@ -98,10 +98,13 @@ public enum DocDiff {
     }
 
     /// `/^#{1,6} /`
-    static func isHeading(_ s: String) -> Bool {
+    static func isHeading(_ s: String) -> Bool { level(s) > 0 }
+
+    /// A block's heading level from its markdown (0 = not a heading); diff.ts `headingLevel`.
+    public static func level(_ s: String) -> Int {
         let hashes = s.prefix { $0 == "#" }.count
-        guard (1...6).contains(hashes) else { return false }
-        return s.dropFirst(hashes).first == " "
+        guard (1...6).contains(hashes), s.dropFirst(hashes).first == " " else { return 0 }
+        return hashes
     }
 
     private struct Placed {
@@ -135,6 +138,33 @@ public enum DocDiff {
             let temp = e.id ?? newID()
             placed.append(Placed(entry: e, parent: parent, tempID: temp))
             if e.level > 0 { stack.append((e.level, temp)) }
+        }
+
+        // 2b. where each baseline block belonged before this edit, by the
+        //     same rule. A block keeps its STORED parent unless this edit
+        //     changed where it belongs (or deleted that parent): nesting the
+        //     server holds that disagrees with the headings is left alone,
+        //     so a typo fix never re-parents anything. A new or re-homed
+        //     block goes where its neighbour above went when both belong to
+        //     the same section, so it lands next to it.
+        var before: [BlockID: BlockID?] = [:]
+        var st: [(level: Int, id: BlockID)] = []
+        for b in baseline {
+            let lv = level(b.content)
+            if lv > 0 { while let top = st.last, top.level >= lv { st.removeLast() } }
+            before[b.id] = .some(st.last?.id)
+            if lv > 0 { st.append((lv, b.id)) }
+        }
+        let inferred = placed.map(\.parent)
+        for i in placed.indices {
+            if let id = placed[i].entry.id, let prev = old[id], let was = before[id], was == inferred[i] {
+                let storedGone = prev.parent.map { old[$0] != nil && !live.contains($0) } ?? false
+                if !storedGone {
+                    placed[i].parent = prev.parent
+                    continue
+                }
+            }
+            if i > 0, inferred[i - 1] == inferred[i] { placed[i].parent = placed[i - 1].parent }
         }
 
         // 3. group by parent (first-appearance order), keep a greedy

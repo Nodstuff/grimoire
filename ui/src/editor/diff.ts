@@ -98,6 +98,12 @@ export function inferBlockType(content: string): string {
   return 'paragraph'
 }
 
+/** A block's heading level from its markdown (0 = not a heading). */
+export function headingLevel(content: string): number {
+  const m = /^(#{1,6}) /.exec(content)
+  return m ? m[1].length : 0
+}
+
 interface Placed {
   entry: Entry
   parent: string | null // block id, or the placeholder id for new headings
@@ -133,6 +139,39 @@ export function computeOps(
     placed.push({ entry: e, parent, tempId })
     if (e.level > 0) stack.push({ level: e.level, id: tempId })
   }
+
+  // 2b. where each baseline block belonged before this edit, by the same
+  //     rule. A block keeps its STORED parent unless this edit changed
+  //     where it belongs (or deleted that parent): nesting the server holds
+  //     that disagrees with the headings is left alone, so a typo fix never
+  //     re-parents anything.
+  const before = new Map<string, string | null>()
+  {
+    const st: { level: number; id: string }[] = []
+    for (const b of baseline) {
+      const lv = headingLevel(b.content)
+      if (lv > 0) {
+        while (st.length && st[st.length - 1].level >= lv) st.pop()
+      }
+      before.set(b.id, st.length ? st[st.length - 1].id : null)
+      if (lv > 0) st.push({ level: lv, id: b.id })
+    }
+  }
+  //     A new or re-homed block goes where its neighbour above went when
+  //     both belong to the same section, so it lands next to it.
+  const inferred = placed.map((p) => p.parent)
+  placed.forEach((p, i) => {
+    const id = p.entry.id
+    const prev = id ? old.get(id) : undefined
+    if (prev && before.get(prev.id) === inferred[i]) {
+      const storedGone = prev.parent != null && old.has(prev.parent) && !liveIds.has(prev.parent)
+      if (!storedGone) {
+        p.parent = prev.parent
+        return
+      }
+    }
+    if (i > 0 && inferred[i - 1] === inferred[i]) p.parent = placed[i - 1].parent
+  })
 
   // 3. group by parent, keep a greedy increasing run of undisturbed survivors,
   //    key everything else between its neighbours

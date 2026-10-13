@@ -815,7 +815,7 @@
    ]
   },
   {
-   "name": "agent nesting is flattened to the heading rule",
+   "name": "nesting the server holds is left alone",
    "baseline": [
     {
      "id": "l",
@@ -842,10 +842,313 @@
      "level": 0
     }
    ],
+   "ops": []
+  },
+  {
+   "name": "a misnested doc plus a typo is one replace and no moves",
+   "baseline": [
+    {
+     "id": "h",
+     "content": "# H",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "parent": null,
+     "order_key": "r"
+    },
+    {
+     "id": "q",
+     "content": "qara",
+     "parent": null,
+     "order_key": "v"
+    },
+    {
+     "id": "h2",
+     "content": "## Sub",
+     "parent": null,
+     "order_key": "x"
+    },
+    {
+     "id": "s",
+     "content": "sub body",
+     "parent": null,
+     "order_key": "y"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h",
+     "content": "# H",
+     "level": 1
+    },
+    {
+     "id": "p",
+     "content": "para, fixed",
+     "level": 0
+    },
+    {
+     "id": "q",
+     "content": "qara",
+     "level": 0
+    },
+    {
+     "id": "h2",
+     "content": "## Sub",
+     "level": 2
+    },
+    {
+     "id": "s",
+     "content": "sub body",
+     "level": 0
+    }
+   ],
    "ops": [
+    {
+     "op": "replace",
+     "target": "p",
+     "content": "para, fixed"
+    }
+   ]
+  },
+  {
+   "name": "inserting a heading above a block moves it under the heading",
+   "baseline": [
+    {
+     "id": "p",
+     "content": "one",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "q",
+     "content": "two",
+     "parent": null,
+     "order_key": "r"
+    }
+   ],
+   "entries": [
+    {
+     "id": "p",
+     "content": "one",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "# New",
+     "level": 1
+    },
+    {
+     "id": "q",
+     "content": "two",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": null,
+     "order_key": "r",
+     "block_type": "heading",
+     "content": "# New",
+     "refers_to": null
+    },
+    {
+     "op": "move",
+     "target": "q",
+     "new_parent": "new-1",
+     "new_order_key": "i"
+    }
+   ]
+  },
+  {
+   "name": "a new paragraph in a misnested doc lands beside its neighbour",
+   "baseline": [
+    {
+     "id": "h",
+     "content": "# H",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "parent": null,
+     "order_key": "r"
+    },
+    {
+     "id": "q",
+     "content": "qara",
+     "parent": null,
+     "order_key": "v"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h",
+     "content": "# H",
+     "level": 1
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "new",
+     "level": 0
+    },
+    {
+     "id": "q",
+     "content": "qara",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": null,
+     "order_key": "t",
+     "block_type": "paragraph",
+     "content": "new",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "a new paragraph right under a heading goes first in its section",
+   "baseline": [
+    {
+     "id": "h",
+     "content": "# H",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "parent": null,
+     "order_key": "r"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h",
+     "content": "# H",
+     "level": 1
+    },
+    {
+     "id": null,
+     "content": "new",
+     "level": 0
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": "h",
+     "order_key": "i",
+     "block_type": "paragraph",
+     "content": "new",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "deleting a stored parent re-homes its child",
+   "baseline": [
+    {
+     "id": "l",
+     "content": "- list",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "x",
+     "content": "child of list",
+     "parent": "l",
+     "order_key": "i"
+    },
+    {
+     "id": "z",
+     "content": "after",
+     "parent": null,
+     "order_key": "r"
+    }
+   ],
+   "entries": [
+    {
+     "id": "x",
+     "content": "child of list",
+     "level": 0
+    },
+    {
+     "id": "z",
+     "content": "after",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "delete",
+     "target": "l"
+    },
     {
      "op": "move",
      "target": "x",
+     "new_parent": null,
+     "new_order_key": "d"
+    }
+   ]
+  },
+  {
+   "name": "a heading demoted to text releases its section",
+   "baseline": [
+    {
+     "id": "h",
+     "content": "# H",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "parent": "h",
+     "order_key": "i"
+    }
+   ],
+   "entries": [
+    {
+     "id": "h",
+     "content": "H",
+     "level": 0
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "replace",
+     "target": "h",
+     "content": "H"
+    },
+    {
+     "op": "move",
+     "target": "p",
      "new_parent": null,
      "new_order_key": "r"
     }
