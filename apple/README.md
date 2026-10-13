@@ -370,7 +370,17 @@ against the baseline (`DocDiff`) and queues one propose on the session's base
 epoch; a single `replace` goes through `Cache.enqueueCoalescing` (typing in one
 block makes one write). Ops on a block in conflict go in their own propose on
 its older epoch, flagged (`Cache.enqueue(_:conflict:)`), so the gate scores
-it. The saved entries become the new baseline. `Cache.enqueue` still lifts a
+it. One disputed block has at most one pending flagged write: autosave sends
+the first (so the text is safe in the outbox, offline too), later saves
+rewrite that row in place while it waits (`Cache.rewriteUnsentPropose`);
+once it has gone out, more typing in the block waits for leaving the doc
+(or backgrounding, or demotion), which sends it once, and the same text is
+never proposed twice (a refresh moving the block's baseline is no reason).
+A conflict ends only on the server's own text (its cached body, never our
+queued write overlaid) or on Keep mine / Take theirs; Keep mine drops the
+pending flagged write and writes ours on the current epoch. Blocks the
+surface leaves out (frontmatter, comments) keep their place: a new first
+block goes after the frontmatter. The saved entries become the new baseline. `Cache.enqueue` still lifts a
 propose's base past our own landed writes; queued-but-unwritten proposes are
 overlaid on a refresh so nothing saved rolls back on screen. Review marks:
 `Cache.reviews(for:openOps:)` tints the block's text (amber flagged, rose
