@@ -56,7 +56,10 @@ final class SurfaceModel: NSObject {
     @ObservationIgnored private var queue: Task<Void, Never>?
     @ObservationIgnored private var observeTask: Task<Void, Never>?
     @ObservationIgnored private var pollTask: Task<Void, Never>?
+    /// the doc's review queue as the server last gave it (nil: never fetched)
     @ObservationIgnored private var openOps: Set<String>?
+    /// blocks whose shown text is our parked edit (`ParkedEdits`)
+    @ObservationIgnored private var parkedBlocks: Set<BlockID> = []
     @ObservationIgnored private var lastReviewFetch = Date.distantPast
     @ObservationIgnored var pendingMarks: InlineMarks?
     @ObservationIgnored var reloading = false
@@ -129,8 +132,10 @@ final class SurfaceModel: NSObject {
         tv.textDragInteraction?.isEnabled = false
         // dropped text goes through Surface (block ids), not UIKit's insert
         tv.textDropDelegate = self
-        // Writing Tools rewrites ranges behind the delegate's back: the panel only
-        tv.writingToolsBehavior = .limited
+        // Writing Tools: nothing documents that its rewrites (Replace) go
+        // through the delegate, and a rewrite UIKit applies itself would lose
+        // block ids. Off on the surface until it can be routed through Surface
+        tv.writingToolsBehavior = .none
         if editable, !EditorChrome.barIsInline { tv.inputAccessoryView = formattingBar }
         let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
         tap.delegate = self
@@ -482,6 +487,22 @@ final class SurfaceModel: NSObject {
     func remapUndo(span: NSRange, newLength: Int) {
         closeTyping()
         guard let um = undo else { return }
+        // ids the refreshed text now holds: a step that would put one back
+        // (a block the refresh resurrected) can't run either
+        var fresh: Set<BlockID> = []
+        let st = textView.textStorage
+        let newSpan = NSRange(location: span.location, length: min(newLength, max(0, st.length - span.location)))
+        if newSpan.length > 0 {
+            st.enumerateAttribute(Surface.block, in: newSpan) { v, _, _ in if let id = v as? String { fresh.insert(id) } }
+        }
+        func carries(_ r: UndoRecord) -> Bool {
+            guard r.replacement.length > 0, !fresh.isEmpty else { return false }
+            var hit = false
+            r.replacement.enumerateAttribute(Surface.block, in: NSRange(location: 0, length: r.replacement.length)) { v, _, stop in
+                if let id = v as? String, fresh.contains(id) { hit = true; stop.pointee = true }
+            }
+            return hit
+        }
         func drop(_ r: UndoRecord) {
             um.removeAllActions(withTarget: r)
             records.removeAll { $0 === r }
@@ -491,7 +512,7 @@ final class SurfaceModel: NSObject {
         let delta = newLength - span.length
         var dead = false
         for r in records.reversed() {
-            if dead { drop(r); continue }
+            if dead || carries(r) { dead = true; drop(r); continue }
             let end = r.range.location + r.range.length
             if end <= x.location {
                 // undoing r shifts where the refreshed text sits
@@ -686,7 +707,9 @@ final class SurfaceModel: NSObject {
         guard let c = cutBlocks, UIPasteboard.general.changeCount == c.changeCount, UIPasteboard.general.string == c.text else { return nil }
         let s = textView.textStorage
         let sel = textView.selectedRange
-        guard sel.length == 0, let line = Surface.line(at: sel.location, in: s), sel.location <= line.textRange.location else { return nil }
+        guard sel.length == 0, let line = Surface.line(at: sel.location, in: s), sel.location <= line.textRange.location,
+              // at a block's first line only: between two items it would split the list
+              Surface.block(at: sel.location, in: s)?.range.location == line.range.location else { return nil }
         let ids = Set(Surface.blocks(c.lines).map(\.id))
         // only while those ids aren't back already (a second paste is new text)
         guard Surface.blocks(s).allSatisfy({ !ids.contains($0.id) }) else { return nil }
@@ -1014,8 +1037,15 @@ final class SurfaceModel: NSObject {
            let body = rec.bodyEpoch, body < landed { return }
         let before = abandoned + unpersisted
         guard var fresh = try? await cache.editor(for: docID) else { return }
-        // our edits parked for review stay on screen as ours until a human decides
-        if let parked = try? await cache.parkedOps(for: docID, openOps: openOps) { fresh.overlay(parked) }
+        // our edits parked for review stay on screen as ours, in conflict
+        // on their propose's epoch, until a human decides. Only from a
+        // review queue the server gave us: unknown (offline, not fetched
+        // yet, a failed fetch with nothing known) overlays nothing
+        if let open = openOps, let parked = try? await cache.parkedOps(for: docID, openOps: open) {
+            var c = conflicts
+            parkedBlocks = ParkedEdits.apply(parked, on: &fresh, conflicts: &c, parkedBefore: parkedBlocks)
+            if c != conflicts { conflicts = c }
+        }
         var seen: Set<String> = []
         for r in before + abandoned + unpersisted where seen.insert(r.requestID ?? "").inserted {
             fresh.overlay(r.ops.map(\.kind))
@@ -1039,7 +1069,7 @@ final class SurfaceModel: NSObject {
             : fresh.ordered().map(\.block).filter { $0.blockType != .comment && !$0.content.hasPrefix("---") }
         for b in server { blockTypes[b.id] = b.blockType }
         let r = SurfaceMerge.merge(local: current.map { ($0.id, $0.content) }, baseline: baseline, conflicts: conflicts,
-                                   oldEpoch: baseEpoch, server: server)
+                                   oldEpoch: baseEpoch, server: server, parked: parkedBlocks)
         baseline = r.baseline
         if r.conflicts != conflicts { conflicts = r.conflicts }
         baseEpoch = fresh.baseEpoch
@@ -1113,7 +1143,12 @@ final class SurfaceModel: NSObject {
         if let f = try? await cache.failedBlocks(docID), f != failedBlocks { failedBlocks = f }
         if let api, app?.isOnline == true, Date().timeIntervalSince(lastReviewFetch) > 15 {
             lastReviewFetch = Date()
-            openOps = try? await api.openReviewOps(docID)
+            // a failed fetch keeps the last set the server gave us
+            if let fetched = try? await api.openReviewOps(docID), fetched != openOps {
+                openOps = fetched
+                // a decision (or a new park) shows now, not at the next sync
+                await remoteChanged()
+            }
         }
         if let r = try? await cache.reviews(for: docID, openOps: openOps), r != reviews { reviews = r }
         if tintsBefore.0 != reviews || tintsBefore.1 != failedBlocks { restyle() }

@@ -341,7 +341,9 @@ Model (TaisceKit `Edit/`):
   the edit changed where it belongs (its heading section before vs after):
   nesting the server holds that disagrees with the headings is left alone,
   so a typo fix never re-parents anything; a new block lands beside its
-  neighbour above.
+  neighbour above. The server tree after a save always reads in the
+  editor's order (a block whose kept parent would put it out of place goes
+  to its heading-rule parent); every vector and 2000 random edits check it.
 - `SurfaceMerge`: a sync refresh while the doc is open. Untouched blocks take
   the server's text; a block changed on both sides stays ours and is in
   conflict on the older epoch (`SurfaceConflict`); one the server deleted but
@@ -349,8 +351,10 @@ Model (TaisceKit `Edit/`):
   they edited goes out as a delete on the older epoch; new and reordered
   remote blocks land in place. The app rebuilds only the blocks that differ,
   keeping the caret (block + offset) and the scroll position. Our edits the
-  gate parked (red, `Cache.parkedOps`) stay on screen as ours until a human
-  decides.
+  gate parked (red, `ParkedEdits`, only from a review queue the server gave
+  us) stay on screen as ours, in conflict on their propose's epoch so later
+  saves stay flagged, until a human decides; then the overlay and the
+  conflict go.
 - `InlineCodec` (inline markdown ↔ `AttributedString`: marks, links,
   `[[wikilinks]]`; canonical serialisation), `EditorBlockContent` (paragraph /
   heading / quote / list / raw; a block is structured only when its canonical
@@ -389,7 +393,9 @@ Undo is the surface's own stack (UIKit doesn't record typing on it): typing
 groups into runs, each command is one step; a refresh keeps the steps that
 don't touch the refreshed blocks (the first that does, and older ones, go;
 redo clears); demotion to viewer clears it. Drops from other apps go through
-`Surface` (a text drop delegate); Writing Tools is limited to its panel.
+`Surface` (a text drop delegate, anchored to its block while the items
+load); Writing Tools is off on the surface (nothing shows its rewrites go
+through the delegate, and one that didn't would lose block ids).
 Checkbox taps tick the box (the To-do doc's
 go through the to-do API). Links: a tap places the caret; ⌘-click (Mac) and
 the edit menu (long-press on iOS, right-click on the Mac: "Open …") follow

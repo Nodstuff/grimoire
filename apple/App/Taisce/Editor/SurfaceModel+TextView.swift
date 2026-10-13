@@ -188,14 +188,28 @@ extension SurfaceModel: UITextDropDelegate {
     }
 
     func textDroppableView(_ textDroppableView: UIView & UITextDroppable, willPerformDrop drop: UITextDropRequest) {
+        // where it goes, as (block, offset in it): the text may change
+        // while the dropped items load
         let at = textView.offset(from: textView.beginningOfDocument, to: drop.dropPosition)
+        let s = textView.textStorage
+        let anchor = Surface.block(at: min(at, max(0, s.length - 1)), in: s).map { ($0.id, at - $0.range.location) }
         _ = drop.dropSession.loadObjects(ofClass: NSString.self) { [weak self] items in
             guard let text = items.first as? String else { return }
-            Task { @MainActor in self?.dropText(text, at: at) }
+            Task { @MainActor in
+                guard let self else { return }
+                self.dropText(text, at: self.resolve(anchor, fallback: at))
+            }
         }
     }
 
     func textDroppableView(_ textDroppableView: UIView & UITextDroppable, dropSessionDidEnter session: any UIDropSession) {}
+
+    /// A (block, offset) anchor in the text as it is now.
+    func resolve(_ anchor: (BlockID, Int)?, fallback: Int) -> Int {
+        let s = textView.textStorage
+        guard let (id, off) = anchor, let b = Surface.blocks(s).first(where: { $0.id == id }) else { return min(fallback, max(0, s.length - 1)) }
+        return b.range.location + min(off, max(0, b.range.length - 1))
+    }
 
     /// Insert dropped text at `location`.
     func dropText(_ text: String, at location: Int) {

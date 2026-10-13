@@ -339,6 +339,82 @@ import UIKit
         #expect(h.tv.selectedRange.location + h.tv.selectedRange.length == one)
     }
 
+    // MARK: fix round 2
+
+    @Test func pastingCutBlocksInsideAListIsPlainText() async throws {
+        let h = try Harness(blocks("para", "- one\n- two\n- three"))
+        h.tv.selectedRange = h.blocks[0].range
+        #expect(h.model.handleCut())
+        h.tv.selectedRange = NSRange(location: h.location(of: "two"), length: 0)
+        #expect(h.model.handlePaste())
+        #expect(Set(h.ids).count == h.ids.count, "no list split into two runs with one id: \(h.ids)")
+        #expect(h.markdown.contains { $0.contains("para") })
+    }
+
+    /// Every place a paste or a drop can land that could split a block.
+    @Test func pastesAndDropsNeverSplitABlockIntoDuplicateIDs() throws {
+        let doc = ["para", "- one\n- two\n- three", "> a quote", "```\ncode\n```", "end"]
+        let texts = ["x\ny\nz", "# Head\n\n- a\n- b", "plain"]
+        func spots(_ h: Harness) -> [Int] {
+            [h.location(of: "two"), h.location(of: "two") + 1, h.location(of: "three") + 5,
+             h.location(of: "a quote"), h.location(of: "quote"),
+             h.location(of: Surface.attachment), h.location(of: Surface.attachment) + 1, h.location(of: "end")]
+        }
+        for text in texts {
+            for i in spots(try Harness(blocks(doc[0], doc[1], doc[2], doc[3], doc[4]))).indices {
+                for via in ["paste", "drop"] {
+                    let h = try Harness(blocks(doc[0], doc[1], doc[2], doc[3], doc[4]))
+                    let at = spots(h)[i]
+                    if via == "paste" {
+                        UIPasteboard.general.string = text
+                        h.tv.selectedRange = NSRange(location: at, length: 0)
+                        _ = h.model.handlePaste()
+                    } else {
+                        h.model.dropText(text, at: at)
+                    }
+                    #expect(Set(h.ids).count == h.ids.count, "\(via) \(text.debugDescription) at \(i): \(h.ids)")
+                    #expect(h.ids.contains("b1") && h.ids.contains("b3"), "\(via) at \(i): the list and the code block keep their ids")
+                }
+            }
+        }
+    }
+
+    @Test func undoNeverPutsBackABlockARefreshResurrected() async throws {
+        let h = try Harness(blocks("alpha", "x-ray", "zulu"))
+        guard let undo = h.tv.undoManager else { Issue.record("no undo manager"); return }
+        // delete the whole x-ray line, save it
+        let x = h.blocks[1].range
+        #expect(!h.model.textView(h.tv, shouldChangeTextIn: x, replacementText: ""))
+        #expect(h.ids == ["b0", "b2"])
+        await h.model.flush()
+        // the server brings it back (the delete was refused, or re-added)
+        let remote = [
+            Block(id: "b0", docID: "d", parentID: nil, orderKey: "i", blockType: .paragraph, content: "alpha"),
+            Block(id: "b1", docID: "d", parentID: nil, orderKey: "r", blockType: .paragraph, content: "x-ray"),
+            Block(id: "b2", docID: "d", parentID: nil, orderKey: "v", blockType: .paragraph, content: "zulu"),
+        ]
+        h.model.applyRemote(DocEditor(docID: "d", baseEpoch: 2, blocks: remote))
+        #expect(h.ids == ["b0", "b1", "b2"])
+        var steps = 0
+        while undo.canUndo, steps < 5 { undo.undo(); steps += 1 }
+        #expect(Set(h.ids).count == h.ids.count, "no duplicate: \(h.ids)")
+    }
+
+    @Test func aDropFindsItsPlaceAfterTheTextChanged() throws {
+        let h = try Harness(blocks("alpha", "bravo"))
+        let s = h.tv.textStorage
+        let b = try #require(Surface.block(at: h.location(of: "bravo"), in: s))
+        let anchor = (b.id, 2)
+        h.type("XXXX", at: 0) // the text moves while the drop loads
+        let at = h.model.resolve(anchor, fallback: 0)
+        #expect(at == h.location(of: "bravo") + 2)
+    }
+
+    @Test func writingToolsAreOff() throws {
+        let h = try Harness(blocks("a"))
+        #expect(h.tv.writingToolsBehavior == .none)
+    }
+
     // MARK: non-text blocks
 
     @Test func codeBlocksAreAttachments() async throws {
