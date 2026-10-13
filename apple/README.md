@@ -329,22 +329,28 @@ Model (TaisceKit `Edit/`):
   one; a join keeps the first line's id. New blocks get a client-minted id at
   once (an id the baseline lacks saves as an insert with that id). `normalize`
   restores the invariants after any change (final `\n`, U+FFFC alone on its
-  line, one id per line, a duplicate id → fresh, markers numbered); scoped to
-  the typed lines while typing.
+  line, one id per line, markers numbered); scoped to the typed lines while
+  typing. If it ever has to mint an id (a duplicate, a line without one) it
+  asserts in debug builds: every edit is meant to keep ids whole, and every
+  `SurfaceTests` sequence checks it.
 - `DocDiff`: a port of `ui/src/editor/diff.ts` (`computeOps`, `keyBetween`,
   `inferBlockType`, `rebuildBaseline`). Parents come from heading levels and
   order keys are per-sibling base-36 fractions, exactly as on the web: the
   shared vectors in `ui/src/editor/diff.vectors.json` are read by both
-  `DocDiffTests` and `diff.vectors.test.ts`. As on the web, a doc whose
-  server nesting doesn't follow its headings (an agent wrote it flat) gets
-  `move`s on its first save.
+  `DocDiffTests` and `diff.vectors.test.ts`. A save moves a block only when
+  the edit changed where it belongs (its heading section before vs after):
+  nesting the server holds that disagrees with the headings is left alone,
+  so a typo fix never re-parents anything; a new block lands beside its
+  neighbour above.
 - `SurfaceMerge`: a sync refresh while the doc is open. Untouched blocks take
   the server's text; a block changed on both sides stays ours and is in
   conflict on the older epoch (`SurfaceConflict`); one the server deleted but
-  we edited comes back as an insert under a fresh id; new and reordered
+  we edited comes back as an insert under a fresh id; one we deleted but
+  they edited goes out as a delete on the older epoch; new and reordered
   remote blocks land in place. The app rebuilds only the blocks that differ,
-  keeping the caret (block + offset) and the scroll position; the undo
-  history ends there.
+  keeping the caret (block + offset) and the scroll position. Our edits the
+  gate parked (red, `Cache.parkedOps`) stay on screen as ours until a human
+  decides.
 - `InlineCodec` (inline markdown ↔ `AttributedString`: marks, links,
   `[[wikilinks]]`; canonical serialisation), `EditorBlockContent` (paragraph /
   heading / quote / list / raw; a block is structured only when its canonical
@@ -377,7 +383,14 @@ review tints, links). Non-text blocks are `BlockAttachment`s whose view
 provider hosts the reading view's renderer (`NodeStack`: Run on code, charts,
 mermaid / vega / reladraw, tables, callouts); tapping one (or its pencil)
 opens `SourceEditorSheet` on its markdown; saving it replaces that block
-(text again if it now is text). Checkbox taps tick the box (the To-do doc's
+(text again if it now is text). Whole blocks cut and pasted back unchanged
+in the same doc keep their ids (a move, so comments and `^refs` survive).
+Undo is the surface's own stack (UIKit doesn't record typing on it): typing
+groups into runs, each command is one step; a refresh keeps the steps that
+don't touch the refreshed blocks (the first that does, and older ones, go;
+redo clears); demotion to viewer clears it. Drops from other apps go through
+`Surface` (a text drop delegate); Writing Tools is limited to its panel.
+Checkbox taps tick the box (the To-do doc's
 go through the to-do API). Links: a tap places the caret; ⌘-click (Mac) and
 the edit menu (long-press on iOS, right-click on the Mac: "Open …") follow
 `[[wikilinks]]` and URLs. Keys: ⌘B ⌘I, ⇧⌘E inline code, ⌘K link / `[[`,
@@ -392,8 +405,8 @@ markdown after autosave. `LaunchTests` needs a doc titled "Welcome" headed
 ## What's stubbed
 
 - Editing: no rich table editing (tables are raw source), no title rename,
-  no drag to reorder blocks, no soft line breaks typed (Return splits); a
-  remote change while a doc is open ends its undo history.
+  no drag to reorder blocks, no soft line breaks typed (Return splits); an
+  input method's composition clears the undo history.
 - Outbox idempotency: main's daemon keeps `request_id` dedupe in memory for
   120 s (server-identity makes it durable for 7 days). Client-minted insert
   ids make a doubled insert fail instead of duplicating; `replace` and
