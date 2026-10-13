@@ -353,9 +353,6 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         #expect(r.canPerform(.shareLink, signedIn: true, picker: picker, shares: true))
         #expect(r.canPerform(.exportPDF, signedIn: true, picker: picker, shares: true))
         #expect(!r.canPerform(.exportPDF, signedIn: true, picker: picker, shares: false))
-        r.editingDoc = "d1"
-        #expect(!r.canPerform(.shareLink, signedIn: true, picker: picker, shares: true))
-        r.editingDoc = nil
         // a viewer (ADR 0004) may print but not share
         #expect(!r.canPerform(.shareLink, signedIn: true, picker: picker, canEdit: { _ in false }, shares: true))
         #expect(r.canPerform(.exportPDF, signedIn: true, picker: picker, canEdit: { _ in false }, shares: true))

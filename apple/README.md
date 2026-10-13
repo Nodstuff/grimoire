@@ -230,7 +230,7 @@ One server, several people (ADR 0004):
   sign-in decides, so the same person keeps their queued writes.
 - Workspaces carry `role`, `owner_name`, `display_name`, `shared`: the switcher
   shows `display_name`, your own first, `person.2` on shared ones. A viewer
-  (`EditAccess`) gets no edit mode, ⌘E, new doc, checkboxes, to-do add/done/snooze
+  (`EditAccess`) gets a read-only surface, no new doc, checkboxes, to-do add/done/snooze
   or move; an editor can't move docs out of someone else's workspace; Manage
   workspaces edits only your own. A 403 on replay fails that entry ("You can only
   view this workspace…", never retried); a 404 fails it too, kept, so the text is recoverable. Sign-out tries one last replay and asks before losing unsent changes.
@@ -300,73 +300,100 @@ changed elsewhere; the alerts themselves stay local. The server sends
   newData / noData / failed. A push whose `seq` the cursor already passed,
   or one arriving while the stream is live, only reconciles.
 
-## Editing (groundwork, no UI)
 ## Editing
 
-**Edit** on a doc (not canvases or mirrors) swaps the reading view for one
-`UITextView` (TextKit 2) per block; **Done** saves and goes back. The nav bar
-chip says what happened: Saved · Saving… · Offline · N pending · Doc is open
-in a live session · will retry · Waiting for review (amber = applied and
-flagged, rose = parked) · N edits not saved (refused; tap to retry, never dropped).
+A doc is ONE always-live text surface, as on the web (Tiptap) and in any doc
+app: no Edit/Done, no ⌘E, no visible blocks. Opening a doc you may edit puts
+you in it (a click places the caret; a doc just made here opens with the caret
+at its start). Viewers (ADR 0004), canvases, mirrors get the same surface,
+not editable, links tap-to-follow. Made a viewer mid-edit: what's typed is
+flushed to the outbox, then the surface turns read-only in place. Until the
+body is in the offline cache the screen shows loading / error / folder
+(`DocContent`). The nav bar chip says what happened: Saved · Saving… · Offline
+· N pending · Doc is open in a live session · will retry · Waiting for review
+· N edits not saved (refused; tap to retry, never dropped).
 
 Model (TaisceKit `Edit/`):
 
-- `InlineCodec`: inline markdown ↔ `AttributedString` with Taisce attributes
-  (`taisceMarks` bold/italic/code/strike, `taisceLink`, `taisceWiki` = the
-  text between `[[ ]]`, alias and `#^ref` included). `parse` returns nil for
-  anything it can't hold exactly (images, HTML, hard breaks, titled links).
-  `serialize` is canonical (`**`, `*`, `~~`, minimal escapes) and checks
-  itself by re-parsing. Parsing uses `.disableSmartOpts` (no curly quotes).
-- `EditorBlockContent`: paragraph / heading / quote / list (items with
-  `ListPrefix`: depth, bullet or number, task box) / raw. A block is shown
-  structured only when its canonical form parses to the same document
-  (`sameMeaning`); otherwise it is edited as raw markdown source (code,
-  mermaid/vega/d2, tables, callouts, frontmatter, anything unusual). An
-  untouched block is never written; an edited one is written canonically.
-- `EditorCommands`: Return (split, new list item, leave a list on an empty
-  item, ```` ``` ```` + Return = code block), Backspace at the start (heading/quote/list item
-  → text, nested item → outdent, paragraph → merge into the block above),
-  shortcuts at a block's start (`# `…`###### `, `- `/`* `/`+ `, `1. `, `[ ] `, `> `),
-  indent/outdent, block kinds, to-do toggle.
-- `EditorSession`: the visible blocks over a `DocEditor`. Structure changes
-  become one propose at once (a block after a heading becomes its first
-  child; a merged-away block hands its children to its parent first).
-  Text is committed on demand. `refresh` takes a server change without
-  touching the focused or unsaved blocks; a block the server changed under
-  you is proposed on its older epoch (the gate scores the conflict instead
-  of it silently winning), one it deleted comes back as a draft insert.
-- Saving: `SaveScheduler` debounces 600 ms per block; leaving a block,
-  structure changes, Done and backgrounding flush. `Cache.enqueueCoalescing`
-  rewrites the newest never-sent replace of the same block instead of
-  queueing another. `Cache.enqueue` moves a propose's base up past our own
-  landed writes (`base → base+1`, recorded in the outbox's new `outcome`
-  column). The replayer claims rows atomically (`claimOutbox`).
-- Review marks: `Cache.reviews(for:openOps:)` from landed outcomes (newest per
-  block; green clears), filtered by the doc's open queue
-  (`APIClient.openReviewOps`, `GET /api/doc/{id}/review`) when online.
-- `[[` completion: `WikiCompletion.query/rank/target` (titles and
-  breadcrumbs, diacritic-folded, `Folder/Title` when titles clash).
-- New doc: `NewDoc.create` (`POST /api/docs` with a `request_id`; after a
-  lost answer it looks for the doc before trying again, as the REST route
-  doesn't dedupe creates; only MCP `create_doc` does).
+- `Surface`: the doc as one attributed string. One line per paragraph,
+  heading, quote, list item or non-text block, each ended by `\n` (the string
+  always ends with one); a soft break inside a block is U+2028; a non-text
+  block (code, diagrams, tables, callouts, anything `EditorBlockContent` keeps
+  raw) is one U+FFFC carrying its markdown (`taisce.raw`). Every character
+  carries hidden `taisce.block` (the block id) and `taisce.line` (the line's
+  kind). A line's identity is its terminator's attributes, so typing anywhere,
+  even into an empty line, can't change which block it is. Edits that join or
+  split lines are made by `Surface` (never by UIKit): Return and Backspace at
+  a line's start (via `EditorCommands`), deletions and typing across lines,
+  paste, cut. A split's first half keeps the id and the new half gets a fresh
+  one; a join keeps the first line's id. New blocks get a client-minted id at
+  once (an id the baseline lacks saves as an insert with that id). `normalize`
+  restores the invariants after any change (final `\n`, U+FFFC alone on its
+  line, one id per line, a duplicate id → fresh, markers numbered); scoped to
+  the typed lines while typing.
+- `DocDiff`: a port of `ui/src/editor/diff.ts` (`computeOps`, `keyBetween`,
+  `inferBlockType`, `rebuildBaseline`). Parents come from heading levels and
+  order keys are per-sibling base-36 fractions, exactly as on the web: the
+  shared vectors in `ui/src/editor/diff.vectors.json` are read by both
+  `DocDiffTests` and `diff.vectors.test.ts`. As on the web, a doc whose
+  server nesting doesn't follow its headings (an agent wrote it flat) gets
+  `move`s on its first save.
+- `SurfaceMerge`: a sync refresh while the doc is open. Untouched blocks take
+  the server's text; a block changed on both sides stays ours and is in
+  conflict on the older epoch (`SurfaceConflict`); one the server deleted but
+  we edited comes back as an insert under a fresh id; new and reordered
+  remote blocks land in place. The app rebuilds only the blocks that differ,
+  keeping the caret (block + offset) and the scroll position; the undo
+  history ends there.
+- `InlineCodec` (inline markdown ↔ `AttributedString`: marks, links,
+  `[[wikilinks]]`; canonical serialisation), `EditorBlockContent` (paragraph /
+  heading / quote / list / raw; a block is structured only when its canonical
+  form means the same; an untouched block is never written),
+  `EditorCommands` (Return, Backspace at the start, shortcuts `# `…, `- `,
+  `1. `, `[ ] `, `> `, ```` ``` ```` + Return, indent/outdent, kinds, to-do),
+  `WikiCompletion`, `SaveScheduler`, `NewDoc` are unchanged.
 
-App (`App/Taisce/Editor/`): `EditorText` maps content ↔ the text view's
-attributed string (list markers are tagged text the caret skips);
-`BlockTextView` handles Backspace at the start, atomic wikilinks, paste
-(markdown into an empty paragraph becomes blocks), checkbox taps and the
-hardware keys (⌘B ⌘I, ⇧⌘E inline code, ⌘K link / `[[`, Tab ⇧Tab, ↑↓ between blocks, Esc);
-`FormattingBar` is the input accessory; `EditorModel` ties it together.
-Queued edits also show in the reading view until they land.
+Saving: `SaveScheduler` debounces 800 ms after the last change; leaving the
+doc, backgrounding and a demotion flush. A save diffs the surface's entries
+against the baseline (`DocDiff`) and queues one propose on the session's base
+epoch; a single `replace` goes through `Cache.enqueueCoalescing` (typing in one
+block makes one write). Ops on a block in conflict go in their own propose on
+its older epoch, flagged (`Cache.enqueue(_:conflict:)`), so the gate scores
+it. The saved entries become the new baseline. `Cache.enqueue` still lifts a
+propose's base past our own landed writes; queued-but-unwritten proposes are
+overlaid on a refresh so nothing saved rolls back on screen. Review marks:
+`Cache.reviews(for:openOps:)` tints the block's text (amber flagged, rose
+parked / refused / in conflict); notes above the text offer Keep mine / Take
+theirs and Retry / Discard.
+
+App (`App/Taisce/Editor/`): `SurfaceModel` owns the one `SurfaceTextView`
+(TextKit 2, scrolls itself, header and children list as subviews, own undo
+stack) and is its delegate: plain typing in a line is UIKit's; Return,
+Backspace at a line's start, cross-line edits, wikilink edits (atomic, the
+caret never inside one), deletions touching a non-text block, paste, cut and
+copy (markdown, attachments as source) are `Surface` edits, each one undoable
+step. `SurfaceLook` draws the model attributes (fonts, colours, list markers,
+review tints, links). Non-text blocks are `BlockAttachment`s whose view
+provider hosts the reading view's renderer (`NodeStack`: Run on code, charts,
+mermaid / vega / reladraw, tables, callouts); tapping one (or its pencil)
+opens `SourceEditorSheet` on its markdown; saving it replaces that block
+(text again if it now is text). Checkbox taps tick the box (the To-do doc's
+go through the to-do API). Links: a tap places the caret; ⌘-click (Mac) and
+the edit menu (long-press on iOS, right-click on the Mac: "Open …") follow
+`[[wikilinks]]` and URLs. Keys: ⌘B ⌘I, ⇧⌘E inline code, ⌘K link / `[[`,
+Tab ⇧Tab, Esc; `FormattingBar` rides the keyboard (inline on the Mac).
 
 UI test: `EditorUITests` seeds a doc on a LOCAL daemon
-(`TEST_RUNNER_TAISCE_UI_URL`, default `http://127.0.0.1:7518`), edits it
-(type, Return, Backspace-merge, `[[` pick, Done) and checks the daemon's
-markdown. `LaunchTests` needs a doc titled "Welcome" headed "Welcome to Taisce".
+(`TEST_RUNNER_TAISCE_UI_URL`, default `http://127.0.0.1:7518`), edits it in
+the surface (type, Return, Backspace-merge, `[[` pick) and checks the daemon's
+markdown after autosave. `LaunchTests` needs a doc titled "Welcome" headed
+"Welcome to Taisce".
 
 ## What's stubbed
 
 - Editing: no rich table editing (tables are raw source), no title rename,
-  no drag to reorder blocks, no soft line breaks typed (Return splits).
+  no drag to reorder blocks, no soft line breaks typed (Return splits); a
+  remote change while a doc is open ends its undo history.
 - Outbox idempotency: main's daemon keeps `request_id` dedupe in memory for
   120 s (server-identity makes it durable for 7 days). Client-minted insert
   ids make a doubled insert fail instead of duplicating; `replace` and
@@ -590,9 +617,9 @@ and duration, "compiled ✓" for a Go block that only compiles.
   keeps the tab bar. Minimum window 820×560, first launch 1280×860; macOS
   restores the size after that.
 - Menu bar (`TaisceCommands`, routed through the front window's `Router`):
-  ⌘N new doc, ⌘, Settings, Doc › Edit / Done ⌘E and Refresh ⌘R, Go › Search
+  ⌘N new doc, ⌘, Settings, Doc › Refresh ⌘R and Share Link…, Go › Search
   ⌘F, Today, To-dos and the workspaces ⌘1…⌘9. Nothing is enabled before
-  sign-in. ⌘E used to be inline code in the editor; that is now ⇧⌘E. iPad
+  sign-in. Docs are always live (no Edit / Done); inline code is ⇧⌘E. iPad
   hardware keyboards get the same commands.
 
 ```sh
@@ -722,7 +749,7 @@ Everything here is hidden for LOCAL daemons and signed-out accounts
   (no JavaScript) → `UIPrintPageRenderer` over its print formatter, paginated on
   A4 (Letter in US/CA/…, `PaperSize`), 40 pt margins; one long page via
   `createPDF` only if the formatter gives no pages. Mac: File › Export as PDF…
-  ⌥⌘E (⌘E is Edit, ⇧⌘E inline code) and a save panel; iPhone: the share sheet.
+  ⌥⌘E (⇧⌘E is inline code) and a save panel; iPhone: the share sheet.
   The file is named after the doc.
 - Tests: `ShareTests` (kit, mock server), `ShareLinkTests` (app: store against a
   fake server, commands, push, real SVG/PNG renders, a long page printed to

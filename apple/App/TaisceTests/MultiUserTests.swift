@@ -72,12 +72,9 @@ private let all = [theirs, viewed, mine, homeShared]
         let r = Router()
         r.open(.doc("viewed-doc"))
         let canEdit: (DocID) -> Bool = { $0 != "viewed-doc" }
-        #expect(!r.canPerform(.toggleEdit, signedIn: true, picker: picker, canEdit: canEdit), "⌘E on a viewer's doc")
+        #expect(!r.canPerform(.shareLink, signedIn: true, picker: picker, canEdit: canEdit, shares: true), "Share link on a viewer's doc")
         r.open(.doc("own-doc"))
-        #expect(r.canPerform(.toggleEdit, signedIn: true, picker: picker, canEdit: canEdit))
-        // finishing an edit is always allowed (made a viewer mid-edit)
-        r.editingDoc = "viewed-doc"
-        #expect(r.canPerform(.toggleEdit, signedIn: true, picker: picker, canEdit: { _ in false }))
+        #expect(r.canPerform(.shareLink, signedIn: true, picker: picker, canEdit: canEdit, shares: true))
         #expect(!r.canPerform(.newDoc, signedIn: true, picker: picker, canCreate: false))
         #expect(r.canPerform(.newDoc, signedIn: true, picker: picker, canCreate: true))
         #expect(r.canPerform(.search, signedIn: true, picker: picker, canEdit: { _ in false }, canCreate: false), "reading is never gated")
