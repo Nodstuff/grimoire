@@ -402,6 +402,34 @@ import Testing
         #expect(Set(h.ops()) == [.delete(target: "c"), .replace(target: "a", content: "al")])
     }
 
+    /// A paste or drop at every position of a mixed doc never splits a
+    /// block into duplicate ids, never re-mints one, never loses one.
+    @Test func pastingAnywhereKeepsIDsWhole() {
+        let docs = [
+            [Self.b("p", "para", key: "i"), Self.b("l", "- one\n- two\n- three", key: "m"), Self.b("q", "> a quote", key: "q"),
+             Self.b("c", "```\ncode\n```", key: "u", type: .code), Self.b("e", "end", key: "x")],
+            // a non-text block first and last
+            [Self.b("c", "```\ncode\n```", key: "i", type: .code), Self.b("p", "para", key: "m"), Self.b("l", "- one\n- two\n- three", key: "q"),
+             Self.b("q", "> a quote", key: "u"), Self.b("e", "```\nlast\n```", key: "x", type: .code)],
+        ]
+        for doc in docs {
+        let length = Harness(doc).s.length
+        for text in ["x\ny\nz", "# Head\n\n- a\n- b", "plain", "\n"] {
+            for at in 0..<length {
+                var h = Harness(doc)
+                Surface.$allowsRepair.withValue(true) {
+                    h.replace(NSRange(location: at, length: 0), with: text)
+                }
+                let stray = Set(h.ids).subtracting(h.minter.allowed)
+                #expect(stray.isEmpty, "\(text.debugDescription) at \(at) (\(String(h.s.string.prefix(at)).debugDescription)): \(h.markdown)")
+                for id in ["p", "l", "q", "c", "e"] {
+                    #expect(h.ids.contains(id), "\(text.debugDescription) at \(at): \(id) kept, ids \(h.ids)")
+                }
+            }
+        }
+        }
+    }
+
     @Test func deletingAWholeLineAboveANonTextBlockDeletesThatBlock() {
         var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("c", "```\ncode\n```", key: "m", type: .code), Self.b("z", "zed", key: "r")])
         h.replace(NSRange(location: 0, length: 6), with: "")

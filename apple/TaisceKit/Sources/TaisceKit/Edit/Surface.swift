@@ -580,9 +580,24 @@ public enum Surface {
         // never start inside a non-text block's line past its U+FFFC (its
         // own line break stays): start on the next line
         if let l = line(at: range.location, in: s), l.style == .raw, range.location > l.range.location {
-            let cut = min(l.end, range.location + range.length) - range.location
-            range = NSRange(location: range.location + max(0, cut), length: max(0, range.length - max(0, cut)))
+            let end = range.location + range.length
+            let start = min(l.end, ns.length)
+            range = NSRange(location: start, length: max(0, end - start))
             if range.location >= ns.length { range = NSRange(location: ns.length, length: 0) }
+        }
+        // text put in front of a non-text block (a paste or a drop at its
+        // line's start): new paragraphs above it, the block untouched
+        if range.length == 0, !typed.isEmpty, let l = line(at: range.location, in: s), l.style == .raw, range.location == l.range.location {
+            let out = NSMutableAttributedString()
+            var attrs = typing
+            for k in [block, line, marker, wiki, raw] { attrs[k] = nil }
+            for part in typed.components(separatedBy: "\n") {
+                var a = attrs
+                a[block] = mint()
+                a[line] = LineStyle.paragraph.encoded
+                out.append(NSAttributedString(string: part + "\n", attributes: a))
+            }
+            return Edit(range: range, replacement: out, selection: NSRange(location: range.location + out.length - 1, length: 0))
         }
         // whole lines deleted up to a non-text block: those blocks go, no join
         if typed.isEmpty, range.length > 0, range.location + range.length < ns.length,
@@ -671,7 +686,18 @@ public enum Surface {
                 }
             }
             if style == .raw { style = .paragraph }
-            sub.addAttributes([block: id, line: style.encoded], range: l.range)
+            // stamp the line, but never a non-text block's U+FFFC caught in it
+            // (normalize gives it its own line, with its own id)
+            var from = l.range.location
+            let lineText = Surface.text(sub)
+            for i in l.range.location..<(l.range.location + l.range.length)
+            where lineText.character(at: i) == objectChar && sub.attribute(raw, at: i, effectiveRange: nil) != nil {
+                if i > from { sub.addAttributes([block: id, line: style.encoded], range: NSRange(location: from, length: i - from)) }
+                from = i + 1
+            }
+            if l.range.location + l.range.length > from {
+                sub.addAttributes([block: id, line: style.encoded], range: NSRange(location: from, length: l.range.location + l.range.length - from))
+            }
             // markers stay only at an item's start: any other is deleted
             var strays: [NSRange] = []
             sub.enumerateAttribute(marker, in: c) { v, r, _ in
