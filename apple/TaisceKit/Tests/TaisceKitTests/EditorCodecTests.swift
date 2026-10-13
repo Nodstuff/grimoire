@@ -127,13 +127,13 @@ import Testing
         let (surfaceBlocks, baseline) = Surface.load(DocEditor(docID: "d", baseEpoch: 3, blocks: blocks))
         let s = Surface.document(surfaceBlocks)
         let known = Set(baseline.map(\.id))
-        let first = DocDiff.computeOps(baseline: baseline, entries: Surface.entries(s, known: known))
+        let first = DocDiff.computeOps(baseline: Compound.fold(baseline), entries: Compound.fold(Surface.entries(s, known: known)))
         #expect(first.isEmpty, "opening a doc to edit writes nothing: \(first)")
         // editing one block writes only that block
         let target = try #require(Surface.blocks(s).first { $0.content.markdown == "Plain paragraph." })
         let at = target.range.location + "Plain paragraph".utf16.count
         Surface.replace(s, NSRange(location: at, length: 1), with: ", edited.").apply(to: s)
-        let ops = DocDiff.computeOps(baseline: baseline, entries: Surface.entries(s, known: known))
+        let ops = DocDiff.computeOps(baseline: Compound.fold(baseline), entries: Compound.fold(Surface.entries(s, known: known)))
         #expect(ops == [.replace(target: target.id, content: "Plain paragraph, edited.")])
     }
 
@@ -149,10 +149,10 @@ import Testing
         let (surfaceBlocks, baseline) = Surface.load(DocEditor(docID: "d", baseEpoch: 3, blocks: blocks))
         let s = Surface.document(surfaceBlocks)
         let known = Set(baseline.map(\.id))
-        #expect(DocDiff.computeOps(baseline: baseline, entries: Surface.entries(s, known: known)).isEmpty)
+        #expect(DocDiff.computeOps(baseline: Compound.fold(baseline), entries: Compound.fold(Surface.entries(s, known: known))).isEmpty)
         let target = try #require(Surface.blocks(s).first { $0.content.markdown == "Plain paragraph." })
         Surface.replace(s, NSRange(location: target.range.location + "Plain paragraph".utf16.count, length: 1), with: ", edited.").apply(to: s)
-        #expect(DocDiff.computeOps(baseline: baseline, entries: Surface.entries(s, known: known)) == [.replace(target: target.id, content: "Plain paragraph, edited.")])
+        #expect(DocDiff.computeOps(baseline: Compound.fold(baseline), entries: Compound.fold(Surface.entries(s, known: known))) == [.replace(target: target.id, content: "Plain paragraph, edited.")])
     }
 
     // MARK: the model

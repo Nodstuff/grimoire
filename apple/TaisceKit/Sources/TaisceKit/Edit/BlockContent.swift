@@ -102,7 +102,32 @@ public enum EditorBlockContent: Hashable, Sendable {
     public static func sameMeaning(_ a: String, _ b: String) -> Bool {
         if a == b { return true }
         let opts: ParseOptions = [.disableSmartOpts]
-        return Document(parsing: a, options: opts).format() == Document(parsing: b, options: opts).format()
+        if Document(parsing: a, options: opts).format() == Document(parsing: b, options: opts).format() { return true }
+        // a line wrapped inside a list item (a soft break) reads as a space
+        var r = SoftBreakAsSpace()
+        let fa = r.visit(Document(parsing: a, options: opts))?.format()
+        let fb = r.visit(Document(parsing: b, options: opts))?.format()
+        return fa != nil && fa == fb
+    }
+
+    struct SoftBreakAsSpace: MarkupRewriter {
+        func visitSoftBreak(_ softBreak: SoftBreak) -> (any Markup)? { Text(" ") }
+    }
+
+    /// The text of a heading or list item: what reads as block syntax at
+    /// its start ("1. LRU cache", "- x") is the text itself there.
+    static func lineText(_ s: String) -> AttributedString? {
+        if let t = InlineCodec.parse(s) { return t }
+        var escaped = s
+        if let r = s.range(of: #"^\d{1,9}[.)](?=\s|$)"#, options: .regularExpression) {
+            let dot = s.index(before: r.upperBound)
+            escaped = String(s[..<dot]) + "\\" + String(s[dot...])
+        } else if let f = s.first, "-+*#>".contains(f) {
+            escaped = "\\" + s
+        } else {
+            return nil
+        }
+        return InlineCodec.parse(escaped)
     }
 
     static func structured(_ md: String) -> EditorBlockContent? {
@@ -114,7 +139,7 @@ public enum EditorBlockContent: Hashable, Sendable {
         switch children[0] {
         case is Heading:
             guard md.first == "#", !md.contains("\n") else { return nil } // ATX only
-            return headingInline(md).flatMap { level, inline in InlineCodec.parse(inline).map { .heading(level: level, $0) } }
+            return headingInline(md).flatMap { level, inline in lineText(inline).map { .heading(level: level, $0) } }
         case is Paragraph:
             return InlineCodec.parse(md).map { .paragraph($0) }
         case let q as BlockQuote:
@@ -179,12 +204,22 @@ public enum EditorBlockContent: Hashable, Sendable {
             return true
         }
         guard walk(root, depth: 0) else { return nil }
-        let lines = md.split(separator: "\n", omittingEmptySubsequences: false)
+        // an item's wrapped lines (indented continuations) join its first
+        var lines: [String] = []
+        for line in md.split(separator: "\n", omittingEmptySubsequences: false) {
+            if itemPrefix(String(line), depth: 0) == nil, let last = lines.popLast() {
+                let more = line.trimmingCharacters(in: .whitespaces)
+                guard !more.isEmpty else { return nil }
+                lines.append(last + " " + more)
+            } else {
+                lines.append(String(line))
+            }
+        }
         guard lines.count == depths.count else { return nil }
         var items: [EditorListItem] = []
         for (line, (depth, box)) in zip(lines, depths) {
-            guard let (prefix, rest) = itemPrefix(String(line), depth: depth), prefix.checkbox == box,
-                  let text = InlineCodec.parse(rest)
+            guard let (prefix, rest) = itemPrefix(line, depth: depth), prefix.checkbox == box,
+                  let text = lineText(rest)
             else { return nil }
             items.append(EditorListItem(prefix, text))
         }

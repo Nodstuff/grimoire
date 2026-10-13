@@ -202,7 +202,7 @@ final class SurfaceModel: NSObject {
         if editable { return Surface.load(editor) }
         var blocks: [(id: BlockID, content: EditorBlockContent)] = []
         var baseline: [DocDiff.BaselineBlock] = []
-        for (b, _) in editor.ordered() where b.blockType != .comment && !b.content.hasPrefix("---") {
+        for b in Compound.split(editor.ordered().map(\.block).filter { $0.blockType != .comment && !$0.content.hasPrefix("---") }) {
             let c = EditorBlockContent.parse(b)
             blocks.append((b.id, c))
             // what it shows is its baseline, canvases too, so a refresh updates them
@@ -1063,8 +1063,11 @@ final class SurfaceModel: NSObject {
             return
         }
         unsaved = 0
-        let entries = Surface.entries(textView.textStorage, known: Set(baseline.map(\.id)))
-        let ops = DocDiff.computeOps(baseline: baseline, entries: entries, hidden: hidden)
+        // compound blocks (shown as their parts) are saved as the one server block
+        let surfaceEntries = Surface.entries(textView.textStorage, known: Set(baseline.map(\.id)))
+        let entries = Compound.fold(surfaceEntries)
+        let folded = Compound.fold(baseline)
+        let ops = DocDiff.computeOps(baseline: folded, entries: entries, hidden: hidden)
         guard !ops.isEmpty else { return }
         var normal: [BlockOp] = []
         var disputed: [BlockID: [BlockOp]] = [:]
@@ -1096,7 +1099,8 @@ final class SurfaceModel: NSObject {
         }
         // a held block stays as it was in the baseline, so it still differs
         let before = Dictionary(baseline.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        baseline = DocDiff.rebuildBaseline(baseline, entries: entries, ops: ops.filter { $0.target.map { !held.contains($0) } ?? true })
+        baseline = Compound.unfold(DocDiff.rebuildBaseline(folded, entries: entries, ops: ops.filter { $0.target.map { !held.contains($0) } ?? true }),
+                                   entries: surfaceEntries)
         for t in held { if let k = baseline.firstIndex(where: { $0.id == t }), let old = before[t] { baseline[k] = old } }
     }
 
@@ -1249,8 +1253,8 @@ final class SurfaceModel: NSObject {
         pendingRemote = nil
         let storage = textView.textStorage
         let current = Surface.blocks(storage)
-        let server = editable ? fresh.ordered().map(\.block).filter { !Surface.isHidden($0) }
-            : fresh.ordered().map(\.block).filter { $0.blockType != .comment && !$0.content.hasPrefix("---") }
+        let server = Compound.split(editable ? fresh.ordered().map(\.block).filter { !Surface.isHidden($0) }
+            : fresh.ordered().map(\.block).filter { $0.blockType != .comment && !$0.content.hasPrefix("---") })
         for b in server { blockTypes[b.id] = b.blockType }
         let r = SurfaceMerge.merge(local: current.map { ($0.id, $0.content) }, baseline: baseline, conflicts: conflicts,
                                    oldEpoch: baseEpoch, server: server, parked: parkedBlocks, serverText: serverText)

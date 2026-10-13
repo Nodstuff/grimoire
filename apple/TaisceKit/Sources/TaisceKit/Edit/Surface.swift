@@ -1080,7 +1080,7 @@ public enum Surface {
     public static func load(_ editor: DocEditor) -> (blocks: [(id: BlockID, content: EditorBlockContent)], baseline: [DocDiff.BaselineBlock]) {
         var blocks: [(id: BlockID, content: EditorBlockContent)] = []
         var baseline: [DocDiff.BaselineBlock] = []
-        for (b, _) in editor.ordered() where !isHidden(b) {
+        for b in Compound.split(editor.ordered().map(\.block).filter { !isHidden($0) }) {
             let c = EditorBlockContent.parse(b)
             blocks.append((b.id, c))
             baseline.append(DocDiff.BaselineBlock(id: b.id, content: c.markdown, parent: b.parentID, orderKey: b.orderKey))
