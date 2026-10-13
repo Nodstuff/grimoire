@@ -15,7 +15,7 @@ import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block } from '../types'
 import { notify } from '../Notice'
 import { saveErrorText } from '../hints'
-import { BaselineBlock, Entry, computeOps } from './diff'
+import { BaselineBlock, Entry, HiddenBlock, computeOps } from './diff'
 import { debounce } from '../timing'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
 import { AfterSave, afterSave } from './savePlan'
@@ -85,6 +85,8 @@ export interface EditableDoc {
   epoch: number
   /** pre-order flattened live blocks, comments and frontmatter excluded */
   blocks: Block[]
+  /** the blocks left out (comments, frontmatter, old canvases), in place */
+  hidden?: HiddenBlock[]
 }
 
 type SaveState = 'clean' | 'dirty' | 'saving'
@@ -231,11 +233,17 @@ export default function DocEditor({
     const snapshot = editor.state.doc
     const entries = extractEntries()
     const assigned: string[] = []
-    const ops = computeOps(baselineRef.current, entries, () => {
-      const id = crypto.randomUUID()
-      assigned.push(id)
-      return id
-    })
+    const ops = computeOps(
+      baselineRef.current,
+      entries,
+      () => {
+        const id = crypto.randomUUID()
+        assigned.push(id)
+        return id
+      },
+      undefined,
+      doc.hidden ?? [],
+    )
     if (ops.length === 0) {
       setSaveState('clean')
       return

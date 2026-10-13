@@ -137,6 +137,24 @@ import Testing
         #expect(ops == [.replace(target: target.id, content: "Plain paragraph, edited.")])
     }
 
+    /// The same corpus stored flat (an agent wrote it without nesting):
+    /// opening it writes nothing, a typo writes one replace.
+    @Test func untouchedBlocksSendNothingInAFlatDoc() throws {
+        var key: String?
+        let blocks = Self.corpus.enumerated().map { i, c in
+            key = OrderKey.between(key, nil)
+            return Block(id: "b\(i)", docID: "d", parentID: nil, orderKey: key!,
+                         blockType: c.0.hasPrefix("#") ? .heading : c.0.hasPrefix("```") ? .code : .paragraph, content: c.0)
+        }
+        let (surfaceBlocks, baseline) = Surface.load(DocEditor(docID: "d", baseEpoch: 3, blocks: blocks))
+        let s = Surface.document(surfaceBlocks)
+        let known = Set(baseline.map(\.id))
+        #expect(DocDiff.computeOps(baseline: baseline, entries: Surface.entries(s, known: known)).isEmpty)
+        let target = try #require(Surface.blocks(s).first { $0.content.markdown == "Plain paragraph." })
+        Surface.replace(s, NSRange(location: target.range.location + "Plain paragraph".utf16.count, length: 1), with: ", edited.").apply(to: s)
+        #expect(DocDiff.computeOps(baseline: baseline, entries: Surface.entries(s, known: known)) == [.replace(target: target.id, content: "Plain paragraph, edited.")])
+    }
+
     // MARK: the model
 
     func runs(_ md: String) throws -> [InlineRun] {

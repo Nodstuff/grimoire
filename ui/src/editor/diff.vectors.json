@@ -1338,6 +1338,134 @@
    ]
   },
   {
+   "name": "a new first block goes after hidden frontmatter",
+   "baseline": [
+    {
+     "id": "p",
+     "content": "para",
+     "parent": null,
+     "order_key": "r"
+    }
+   ],
+   "hidden": [
+    {
+     "id": "fm",
+     "content": "---\ntags: [a]\n---",
+     "parent": null,
+     "order_key": "i",
+     "after": null
+    }
+   ],
+   "entries": [
+    {
+     "id": null,
+     "content": "new top",
+     "level": 0
+    },
+    {
+     "id": "p",
+     "content": "para",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": null,
+     "order_key": "m",
+     "block_type": "paragraph",
+     "content": "new top",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "first typing in a frontmatter-only doc goes after it",
+   "baseline": [],
+   "hidden": [
+    {
+     "id": "fm",
+     "content": "---\ntags: [a]\n---",
+     "parent": null,
+     "order_key": "i",
+     "after": null
+    }
+   ],
+   "entries": [
+    {
+     "id": null,
+     "content": "typed",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": null,
+     "order_key": "r",
+     "block_type": "paragraph",
+     "content": "typed",
+     "refers_to": null
+    }
+   ]
+  },
+  {
+   "name": "a comment keeps its place under its block",
+   "baseline": [
+    {
+     "id": "p",
+     "content": "para",
+     "parent": null,
+     "order_key": "i"
+    },
+    {
+     "id": "q",
+     "content": "qara",
+     "parent": null,
+     "order_key": "r"
+    }
+   ],
+   "hidden": [
+    {
+     "id": "cm",
+     "content": "a comment",
+     "parent": "p",
+     "order_key": "i",
+     "after": "p"
+    }
+   ],
+   "entries": [
+    {
+     "id": "p",
+     "content": "para",
+     "level": 0
+    },
+    {
+     "id": null,
+     "content": "between",
+     "level": 0
+    },
+    {
+     "id": "q",
+     "content": "qara",
+     "level": 0
+    }
+   ],
+   "ops": [
+    {
+     "op": "insert",
+     "block_id": "new-1",
+     "parent_id": null,
+     "order_key": "m",
+     "block_type": "paragraph",
+     "content": "between",
+     "refers_to": null
+    }
+   ]
+  },
+  {
    "name": "a heading demoted to text releases its section",
    "baseline": [
     {

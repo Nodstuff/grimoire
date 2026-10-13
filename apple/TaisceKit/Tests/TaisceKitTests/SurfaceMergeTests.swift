@@ -47,8 +47,19 @@ import Testing
     @Test func aConflictEndsWhenTheServerShowsOurs() {
         let server = [Self.b("a", "alpha!", key: "i"), Self.b("b", "beta", key: "m"), Self.b("c", "gamma", key: "r")]
         let r = SurfaceMerge.merge(local: Self.local([("a", "alpha!"), ("b", "beta"), ("c", "gamma")]), baseline: Self.baseline,
-                                   conflicts: ["a": SurfaceConflict(base: 1, theirs: "x")], oldEpoch: 2, server: server)
-        #expect(r.conflicts.isEmpty)
+                                   conflicts: ["a": SurfaceConflict(base: 1, theirs: "x")], oldEpoch: 2, server: server,
+                                   serverText: ["a": "alpha!"])
+        #expect(r.conflicts.isEmpty, "the server's own body has ours")
+    }
+
+    /// The view the editor gets overlays our queued writes: our pending
+    /// flagged write looks like the server taking ours, and isn't.
+    @Test func ourOwnOverlaidWriteDoesNotEndAConflict() {
+        let overlaid = [Self.b("a", "alpha!", key: "i"), Self.b("b", "beta", key: "m"), Self.b("c", "gamma", key: "r")]
+        let r = SurfaceMerge.merge(local: Self.local([("a", "alpha!"), ("b", "beta"), ("c", "gamma")]), baseline: Self.baseline,
+                                   conflicts: ["a": SurfaceConflict(base: 1, theirs: "ALPHA")], oldEpoch: 2, server: overlaid,
+                                   serverText: ["a": "ALPHA"])
+        #expect(r.conflicts["a"] == SurfaceConflict(base: 1, theirs: "ALPHA"))
     }
 
     @Test func newRemoteBlocksArriveInPlace() {

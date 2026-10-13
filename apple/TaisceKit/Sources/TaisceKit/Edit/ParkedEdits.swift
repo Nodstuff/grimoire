@@ -34,8 +34,12 @@ public enum ParkedEdits {
     @discardableResult
     public static func apply(
         _ parked: [ParkedOp], on editor: inout DocEditor,
-        conflicts: inout [BlockID: SurfaceConflict], parkedBefore: Set<BlockID>
+        conflicts: inout [BlockID: SurfaceConflict], parkedBefore: Set<BlockID>,
+        released: Set<BlockID> = []
     ) -> Set<BlockID> {
+        // a block the user already settled (Keep mine) shows their text,
+        // not the parked one, and isn't put back in conflict
+        let parked = parked.filter { $0.block.map { !released.contains($0) } ?? true }
         editor.overlay(parked.map(\.kind))
         var now: [BlockID: Int] = [:]
         for p in parked {

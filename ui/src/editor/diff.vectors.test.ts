@@ -3,20 +3,37 @@
 // and entries into the same ops. Every vector, and random docs and edits,
 // also check the invariant: the server's tree after the ops reads (pre-order,
 // siblings by order key) in exactly the editor's order.
-import { readFileSync, writeFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { BaselineBlock, Entry, Op, computeOps, headingLevel, keyBetween } from './diff'
+import { BaselineBlock, Entry, HiddenBlock, Op, computeOps, headingLevel, keyBetween } from './diff'
+import vectorsJson from './diff.vectors.json'
 
 interface Vector {
   name: string
   baseline: BaselineBlock[]
   entries: Entry[]
+  /** blocks the editor doesn't show (frontmatter, comments): kept in place */
+  hidden?: HiddenBlock[]
   ops: Record<string, unknown>[]
 }
 
-const vectors: { cases: Vector[] } = JSON.parse(
-  readFileSync(new URL('./diff.vectors.json', import.meta.url), 'utf8'),
-)
+/** The editor's order with each hidden block after the visible block it
+ * followed (or the nearest surviving one before that; else first). */
+function withHidden(baseline: BaselineBlock[], ids: string[], hidden: HiddenBlock[]): string[] {
+  const live = new Set(ids)
+  const order = baseline.map((b) => b.id)
+  const anchor = (a: string | null) => {
+    for (let k = a == null ? -1 : order.indexOf(a); k >= 0; k--) if (live.has(order[k])) return order[k]
+    return null
+  }
+  const out = hidden.filter((h) => anchor(h.after) == null).map((h) => h.id)
+  for (const id of ids) {
+    out.push(id)
+    out.push(...hidden.filter((h) => anchor(h.after) === id).map((h) => h.id))
+  }
+  return out
+}
+
+const vectors = vectorsJson as unknown as { cases: Vector[] }
 
 /** The server's blocks after `ops`, read in pre-order (siblings by key). */
 export function serverOrder(baseline: BaselineBlock[], ops: Op[]): string[] {
@@ -65,9 +82,10 @@ describe('shared diff vectors', () => {
   for (const c of vectors.cases) {
     it(c.name, () => {
       let n = 0
-      const ops = computeOps(c.baseline, c.entries, () => `new-${++n}`)
+      const hidden = c.hidden ?? []
+      const ops = computeOps(c.baseline, c.entries, () => `new-${++n}`, undefined, hidden)
       expect(ops.map((o) => o.kind)).toEqual(c.ops)
-      expect(serverOrder(c.baseline, ops)).toEqual(entryIds(c.entries))
+      expect(serverOrder([...c.baseline, ...hidden], ops)).toEqual(withHidden(c.baseline, entryIds(c.entries), hidden))
     })
   }
 })
@@ -219,7 +237,11 @@ describe('saves move only what the edit re-homed', () => {
         counts[mode].extra += moved.filter((m) => !changed.has(m)).length
       }
     }
-    // DIFF_STATS=<file> writes the numbers (cases, bursts = moves > half the doc, moves outside the changed sections)
-    if (process.env.DIFF_STATS) writeFileSync(process.env.DIFF_STATS, JSON.stringify(counts))
+    // bursts = a level change moving more than half the doc; extra = moves of
+    // blocks whose section didn't change (all from the order check).
+    // Measured: heading 0/0, flat 0/0, random 2 bursts / 40 extra.
+    expect(counts.heading).toMatchObject({ bursts: 0, extra: 0 })
+    expect(counts.flat).toMatchObject({ bursts: 0, extra: 0 })
+    expect(counts.random.bursts).toBeLessThanOrEqual(5)
   })
 })

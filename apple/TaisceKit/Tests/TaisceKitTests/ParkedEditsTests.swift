@@ -31,11 +31,6 @@ import Testing
             return r
         }
 
-        /// The ops a save would send on the normal path (not in conflict).
-        func normalOps() -> [BlockOp] {
-            let entries = local.map { DocDiff.Entry(id: $0.id, content: $0.content.markdown, level: 0) }
-            return DocDiff.computeOps(baseline: baseline, entries: entries).filter { op in op.target.map { conflicts[$0] == nil } ?? true }
-        }
     }
 
     static func start() -> State {
@@ -51,9 +46,8 @@ import Testing
         #expect(!r.changed, "still shows our parked text")
         #expect(st.local.map { $0.content.markdown } == ["alpha", "beta!"])
         #expect(st.conflicts["b"]?.base == 3, "later saves of b go on the parked propose's epoch")
-        // a keystroke in it: never on the normal path
+        // a keystroke in it: still disputed (the model saves it flagged)
         st.local[1].content = .paragraph(AttributedString("beta!?"))
-        #expect(st.normalOps().isEmpty)
         // another refresh while it waits changes nothing
         _ = st.refresh(Self.server, parked: Self.parked, epoch: 5)
         #expect(st.conflicts["b"]?.base == 3)
@@ -69,11 +63,10 @@ import Testing
         let r = st.refresh(Self.server, parked: Self.parked, epoch: 5)
         #expect(r.changed)
         #expect(st.local.map { $0.content.markdown } == ["alpha", "beta!"])
-        let entries = st.local.map { DocDiff.Entry(id: $0.id, content: $0.content.markdown, level: 0) }
-        #expect(DocDiff.computeOps(baseline: st.baseline, entries: entries).isEmpty, "nothing to send, flagged or not")
+        #expect(st.baseline.first { $0.id == "b" }?.content == "beta!", "shown and baseline agree: nothing differs to send")
         _ = st.refresh(Self.server, parked: Self.parked, epoch: 6)
         #expect(st.local.map { $0.content.markdown } == ["alpha", "beta!"])
-        #expect(DocDiff.computeOps(baseline: st.baseline, entries: st.local.map { DocDiff.Entry(id: $0.id, content: $0.content.markdown, level: 0) }).isEmpty)
+        #expect(st.baseline.first { $0.id == "b" }?.content == "beta!")
     }
 
     @Test func rejectedTheServersTextComesBack() {
@@ -93,8 +86,7 @@ import Testing
         let r = st.refresh(accepted, parked: [], epoch: 5)
         #expect(!r.changed)
         #expect(st.conflicts.isEmpty)
-        st.local[1].content = .paragraph(AttributedString("beta!!"))
-        #expect(st.normalOps() == [.replace(target: "b", content: "beta!!")], "back on the normal path")
+        #expect(st.conflicts["b"] == nil, "back on the normal path")
     }
 
     @Test func rejectedAfterMoreTypingIsAConflictToResolve() {

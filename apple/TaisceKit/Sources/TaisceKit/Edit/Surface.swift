@@ -970,6 +970,22 @@ public enum Surface {
         b.blockType == .comment || b.blockType == .canvasScene || b.content.hasPrefix("---")
     }
 
+    /// The blocks the surface leaves out (frontmatter, comments, canvases),
+    /// each with the visible block it follows: the diff keys new blocks
+    /// around them, so nothing lands before a doc's frontmatter.
+    public static func hidden(_ editor: DocEditor) -> [DocDiff.HiddenBlock] {
+        var out: [DocDiff.HiddenBlock] = []
+        var last: BlockID?
+        for (b, _) in editor.ordered() {
+            if isHidden(b) {
+                out.append(DocDiff.HiddenBlock(id: b.id, content: b.content, parent: b.parentID, orderKey: b.orderKey, after: last))
+            } else {
+                last = b.id
+            }
+        }
+        return out
+    }
+
     /// The surface's blocks and baseline for an editor's view of a doc.
     public static func load(_ editor: DocEditor) -> (blocks: [(id: BlockID, content: EditorBlockContent)], baseline: [DocDiff.BaselineBlock]) {
         var blocks: [(id: BlockID, content: EditorBlockContent)] = []

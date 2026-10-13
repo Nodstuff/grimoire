@@ -37,6 +37,71 @@ public enum DocDiff {
         }
     }
 
+    /// A block the editor doesn't show (frontmatter, a comment, an old
+    /// canvas) and the visible block it follows in the doc (nil: before
+    /// every visible one): diff.ts `HiddenBlock`.
+    public struct HiddenBlock: Hashable, Sendable, Codable {
+        public var id: BlockID
+        public var content: String
+        public var parent: BlockID?
+        public var orderKey: String
+        public var after: BlockID?
+
+        public init(id: BlockID, content: String, parent: BlockID?, orderKey: String, after: BlockID?) {
+            self.id = id
+            self.content = content
+            self.parent = parent
+            self.orderKey = orderKey
+            self.after = after
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case id, content, parent, after
+            case orderKey = "order_key"
+        }
+
+        public init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(BlockID.self, forKey: .id)
+            content = try c.decode(String.self, forKey: .content)
+            parent = try c.decodeIfPresent(BlockID.self, forKey: .parent)
+            orderKey = try c.decode(String.self, forKey: .orderKey)
+            after = try c.decodeIfPresent(BlockID.self, forKey: .after)
+        }
+
+        var plain: BaselineBlock { BaselineBlock(id: id, content: content, parent: parent, orderKey: orderKey) }
+    }
+
+    /// diff.ts `withHiddenBlocks`: the baseline and entries with the hidden
+    /// blocks in their places (each after the visible block it followed, or
+    /// the nearest surviving one before that; first, if none). They are
+    /// unchanged entries: never written, only keyed around.
+    public static func withHiddenBlocks(_ baseline: [BaselineBlock], _ entries: [Entry], _ hidden: [HiddenBlock]) -> ([BaselineBlock], [Entry]) {
+        let order = baseline.map(\.id)
+        let live = Set(entries.compactMap(\.id))
+        func anchor(_ a: BlockID?) -> BlockID? {
+            guard let a, var k = order.firstIndex(of: a) else { return nil }
+            while k >= 0 {
+                if live.contains(order[k]) { return order[k] }
+                k -= 1
+            }
+            return nil
+        }
+        func asEntry(_ h: HiddenBlock) -> Entry { Entry(id: h.id, content: h.content, level: 0) }
+        var outEntries = hidden.filter { anchor($0.after) == nil }.map(asEntry)
+        for e in entries {
+            outEntries.append(e)
+            if let id = e.id { outEntries += hidden.filter { anchor($0.after) == id }.map(asEntry) }
+        }
+        let known = Set(order)
+        var outBase = hidden.filter { $0.after == nil || !known.contains($0.after!) }.map(\.plain)
+        for b in baseline {
+            outBase.append(b)
+            outBase += hidden.filter { $0.after == b.id }.map(\.plain)
+        }
+        return (outBase, outEntries)
+    }
+
     public struct Entry: Hashable, Sendable, Codable {
         /// nil (or an id the baseline doesn't have) = new: an insert
         public var id: BlockID?
@@ -143,8 +208,13 @@ public enum DocDiff {
     /// The ops turning `baseline` into `entries` (diff.ts `computeOps`).
     public static func computeOps(
         baseline: [BaselineBlock], entries: [Entry],
+        hidden: [HiddenBlock] = [],
         newID: () -> BlockID = { UUID().uuidString.lowercased() }
     ) -> [BlockOp] {
+        var baseline = baseline
+        var entries = entries
+        if !hidden.isEmpty { (baseline, entries) = withHiddenBlocks(baseline, entries, hidden) }
+        let hiddenIDs = Set(hidden.map(\.id))
         let old = Dictionary(baseline.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         var ops: [BlockOp] = []
 
@@ -194,7 +264,11 @@ public enum DocDiff {
                     continue
                 }
             }
-            if i > 0, inferred[i - 1] == inferred[i] { placed[i].parent = placed[i - 1].parent }
+            // (the neighbour is the nearest visible one: a hidden comment's
+            // parent says nothing about where new text goes)
+            var j = i - 1
+            while j >= 0, let id = placed[j].entry.id, hiddenIDs.contains(id) { j -= 1 }
+            if j >= 0, inferred[j] == inferred[i] { placed[i].parent = placed[j].parent }
         }
 
         // 2c. the server's tree must read in the editor's order: walk it in

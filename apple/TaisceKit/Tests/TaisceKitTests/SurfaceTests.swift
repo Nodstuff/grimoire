@@ -292,6 +292,13 @@ import Testing
         h.backspace()
         #expect(h.ids.first == "h")
         #expect(h.markdown.first == "Title")
+        // the heading's section goes with it: its children move up, nothing else
+        let ops = h.ops()
+        #expect(ops.contains(.replace(target: "h", content: "Title")))
+        let moved = ops.compactMap { op -> (BlockID, BlockID?)? in if case let .move(t, p, _) = op { (t, p) } else { nil } }
+        #expect(Set(moved.map(\.0)) == ["p1", "l", "c", "q", "p2"])
+        #expect(moved.allSatisfy { $0.1 == nil })
+        #expect(ops.count == 1 + moved.count)
     }
 
     @Test func backspaceOnASecondItemSplitsTheList() {
@@ -300,6 +307,42 @@ import Testing
         h.backspace()
         #expect(h.markdown == ["- a", "b", "- c"])
         #expect(h.ids[0] == "l")
+        let ops = h.ops()
+        #expect(ops.contains(.replace(target: "l", content: "- a")))
+        let inserts = ops.compactMap { op -> (String, String)? in if case let .insert(_, nil, key, _, content) = op { (key, content) } else { nil } }
+        #expect(inserts.map(\.1) == ["b", "- c"])
+        #expect(inserts.allSatisfy { $0.0 > "i" }, "after the list")
+        #expect(inserts[0].0 < inserts[1].0)
+        #expect(ops.count == 3)
+    }
+
+    @Test func aSplitBeforeASiblingKeysBetweenThem() {
+        var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("z", "zulu", key: "r")])
+        h.sel = NSRange(location: 2, length: 0)
+        h.returnKey()
+        let ops = h.ops()
+        #expect(ops.contains(.replace(target: "a", content: "al")))
+        let keys = ops.compactMap { op -> String? in if case let .insert(_, _, key, _, "pha") = op { key } else { nil } }
+        #expect(keys.count == 1 && keys[0] > "i" && keys[0] < "r", "strictly between: \(keys)")
+    }
+
+    @Test func hiddenBlocksStayOut() {
+        let editor = DocEditor(docID: "d", baseEpoch: 1, blocks: [
+            Self.b("fm", "---\ntags: [a]\n---", key: "i"),
+            Self.b("p", "para", key: "r"),
+            Self.b("cm", "a comment", parent: "p", key: "i", type: .comment),
+            Self.b("q", "qara", key: "v"),
+        ])
+        let (blocks, baseline) = Surface.load(editor)
+        let hidden = Surface.hidden(editor)
+        #expect(blocks.map(\.id) == ["p", "q"])
+        #expect(hidden.map(\.id) == ["fm", "cm"])
+        #expect(hidden.map(\.after) == [nil, "p"])
+        let s = Surface.document(blocks)
+        let known = Set(baseline.map(\.id))
+        #expect(DocDiff.computeOps(baseline: baseline, entries: Surface.entries(s, known: known), hidden: hidden).isEmpty, "untouched: nothing")
+        Surface.replace(s, NSRange(location: 4, length: 0), with: "!").apply(to: s)
+        #expect(DocDiff.computeOps(baseline: baseline, entries: Surface.entries(s, known: known), hidden: hidden) == [.replace(target: "p", content: "para!")])
     }
 
     @Test func backspaceInsideTextDeletesACharacter() {
