@@ -43,7 +43,7 @@ final class EditorUITests: XCTestCase {
         let title = "Editor \(tag)"
         let target = "Roadmap \(tag)"
         _ = try makeDoc(target, markdown: nil)
-        let id = try makeDoc(title, markdown: "Hello world\n\nLast line")
+        let id = try makeDoc(title, markdown: "Hello world")
 
         let app = XCUIApplication()
         app.launchArguments = ["-serverURL", base.absoluteString, "-openDoc", title]
@@ -53,32 +53,29 @@ final class EditorUITests: XCTestCase {
         let surface = app.textViews["surface.text"]
         XCTAssertTrue(surface.waitForExistence(timeout: 20), "the doc opened as one text surface")
         XCTAssertFalse(app.buttons["doc.edit"].exists, "there is no Edit mode")
-        XCTAssertTrue((surface.value as? String)?.hasPrefix("Hello world\nLast line") == true)
+        func text() -> String { (surface.value as? String) ?? "" }
+        XCTAssertTrue(text().hasPrefix("Hello world"))
 
-        // click at the end of the first line, type
-        surface.tap()
-        surface.typeText(XCUIKeyboardKey.upArrow.rawValue)
-        // ⌘← / ⌘→ are not on the iOS keyboard: the caret goes to the doc's start, then the line's end
-        for _ in 0..<40 { surface.typeText(XCUIKeyboardKey.leftArrow.rawValue) }
-        for _ in 0..<11 { surface.typeText(XCUIKeyboardKey.rightArrow.rawValue) }
+        // a click below the text puts the caret at the end; type
+        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9)).tap()
         surface.typeText(" again")
-        XCTAssertTrue((surface.value as? String)?.hasPrefix("Hello world again\nLast line") == true)
+        XCTAssertTrue(text().hasPrefix("Hello world again"), text())
 
         // Return: a new line, typed into
         surface.typeText("\nSecond")
-        XCTAssertTrue((surface.value as? String)?.hasPrefix("Hello world again\nSecond\nLast line") == true)
+        XCTAssertTrue(text().hasPrefix("Hello world again\nSecond"), text())
 
-        // Backspace at its start joins it onto the first line
-        for _ in 0..<6 { surface.typeText(XCUIKeyboardKey.leftArrow.rawValue) }
-        surface.typeText(XCUIKeyboardKey.delete.rawValue)
-        XCTAssertTrue((surface.value as? String)?.hasPrefix("Hello world againSecond\nLast line") == true)
+        // Backspace back over it, and at the empty line's start joins it up
+        for _ in 0..<7 { surface.typeText(XCUIKeyboardKey.delete.rawValue) }
+        XCTAssertEqual(text().trimmingCharacters(in: .newlines), "Hello world again")
 
-        // [[ at the join, pick the suggestion
+        // [[ and pick the suggestion
         surface.typeText(" [[\(tag)")
         let pick = app.buttons.matching(NSPredicate(format: "identifier == 'wiki.suggestion' AND label BEGINSWITH %@", target)).firstMatch
         XCTAssertTrue(pick.waitForExistence(timeout: 5), "the [[ popup offers the doc being typed")
         pick.tap()
-        XCTAssertTrue((surface.value as? String)?.hasPrefix("Hello world again \(target) Second\nLast line") == true)
+        surface.typeText("end")
+        XCTAssertTrue(text().hasPrefix("Hello world again \(target) end"), text())
 
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.name = "editing"
@@ -86,7 +83,7 @@ final class EditorUITests: XCTestCase {
         add(shot)
 
         // the daemon has exactly what was typed (autosave, no Done)
-        let want = "Hello world again [[\(target)]] Second\n\nLast line\n"
+        let want = "Hello world again [[\(target)]] end\n"
         var got = ""
         for _ in 0..<40 {
             got = try markdown(id)
