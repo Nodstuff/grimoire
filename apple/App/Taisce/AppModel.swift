@@ -33,6 +33,8 @@ final class AppModel {
     /// whether the cache has delivered the tree at least once
     private(set) var treeLoaded = false
     var lastError: String?
+    /// a refused tree move, for the Library's alert (DocMoves.swift)
+    var moveError: String?
     let dueAlerts: NotificationCoordinator
     // push: APNs token registration (Push.swift)
     let push = PushRegistrar(store: UserDefaultsPushStore(), environment: PushConfig.environment, appVersion: PushConfig.appVersion())
@@ -579,6 +581,11 @@ final class AppModel {
             // editing affordances follow the server's answer
             lastError = OutboxReplayer.readOnlyMessage
             refreshWorkspaces()
+        }
+        if let report, report.movesRefused > 0, let why = report.moveError {
+            // the doc is already back where the server has it; say why
+            lastError = why
+            moveError = why
         }
     }
 

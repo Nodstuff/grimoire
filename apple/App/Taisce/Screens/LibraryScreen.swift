@@ -23,6 +23,7 @@ struct LibraryScreen: View {
             .safeAreaInset(edge: .top, spacing: 0) { WorkspaceBar(triage: true) }
             .modifier(WorkspaceMoveHost())
             .modifier(DocDeleteHost())
+            .modifier(DocMoveHost())
         }
     }
 }
@@ -37,6 +38,7 @@ struct LibraryContent: View {
     /// folders start closed; the ones you open are remembered across launches
     @AppStorage("library.expanded") private var expandedStore = ""
     @State private var expanded: Set<DocID>?
+    @Environment(\.docMover) private var docMover
 
     var body: some View {
         List {
@@ -61,6 +63,8 @@ struct LibraryContent: View {
                     }
                 }
                     .textCase(nil)
+                    // drop a dragged doc here: the top level
+                    .docTopLevelDrop(mover: docMover)
                     .padding(.bottom, 8)
                     .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
             }
@@ -91,6 +95,7 @@ struct LibraryTreeRows: View {
     var onNewDoc: ((DocID?) -> Void)?
     @Environment(\.moveToWorkspace) private var moveToWorkspace
     @Environment(\.docDeletion) private var docDeletion
+    @Environment(\.docMover) private var docMover
 
     var body: some View {
         ForEach(nodes) { node in
@@ -122,11 +127,16 @@ struct LibraryTreeRows: View {
         NavigationLink(value: Route.doc(node.id)) {
             LibraryRow(node: node, pinned: pins.contains(node.id))
         }
+        // drag onto another row: inside it (open it, so the doc stays in view)
+        .docDragAndDrop(node.id, mover: docMover) { expanded = (expanded ?? []).union([node.id]) }
         .contextMenu {
             Button(pins.contains(node.id) ? "Unpin from Today" : "Pin to Today",
                    systemImage: pins.contains(node.id) ? "pin.slash" : "pin") { onTogglePin(node.id) }
             if let onNewDoc {
                 Button("New doc here", systemImage: "plus") { onNewDoc(node.id) }
+            }
+            if let docMover, docMover.canMove(node.id) {
+                Button("Move to\u{2026}", systemImage: "folder") { docMover.ask(node.id) }
             }
             if let moveToWorkspace {
                 Button("Move to workspace\u{2026}", systemImage: "square.stack") { moveToWorkspace(node.id) }

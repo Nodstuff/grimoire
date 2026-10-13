@@ -267,7 +267,7 @@ struct PadRoot: View {
     var body: some View {
         @Bindable var router = router
         NavigationSplitView {
-            PadSidebar().modifier(DocDeleteHost())
+            PadSidebar().modifier(DocDeleteHost()).modifier(DocMoveHost())
         } detail: {
             NavigationStack(path: $router.padPath) {
                 detail.navigationDestination(for: Route.self) { RouteView(route: $0) }
@@ -292,6 +292,7 @@ struct PadSidebar: View {
     @Environment(AppModel.self) private var model
     @Environment(Router.self) private var router
     @Environment(\.docDeletion) private var docDeletion
+    @Environment(\.docMover) private var docMover
     @FocusState private var searchFocused: Bool
     /// folders opened by hand (the ones above the doc in front open by themselves)
     @State private var expanded: Set<DocID> = []
@@ -345,8 +346,11 @@ struct PadSidebar: View {
                     .tag(PadItem.today)
                 Label("To-dos", systemImage: "checkmark.circle").tag(PadItem.todos)
             }
-            Section("Library") {
-                SidebarTreeRows(nodes: model.library, expanded: $expanded, reveal: reveal, docDeletion: docDeletion)
+            Section {
+                SidebarTreeRows(nodes: model.library, expanded: $expanded, reveal: reveal, docDeletion: docDeletion, docMover: docMover)
+            } header: {
+                // drop a dragged doc on the header: the top level
+                Text("Library").frame(maxWidth: .infinity, alignment: .leading).docTopLevelDrop(mover: docMover)
             }
         }
         .listStyle(.sidebar)
@@ -393,6 +397,7 @@ private struct SidebarTreeRows: View {
     @Binding var expanded: Set<DocID>
     let reveal: Set<DocID>
     let docDeletion: DocDeletion?
+    let docMover: DocMover?
     @Environment(AppModel.self) private var model
     @Environment(Router.self) private var router
 
@@ -400,7 +405,7 @@ private struct SidebarTreeRows: View {
         ForEach(nodes) { node in
             if let kids = node.children {
                 DisclosureGroup(isExpanded: open(node.id)) {
-                    SidebarTreeRows(nodes: kids, expanded: $expanded, reveal: reveal, docDeletion: docDeletion)
+                    SidebarTreeRows(nodes: kids, expanded: $expanded, reveal: reveal, docDeletion: docDeletion, docMover: docMover)
                 } label: {
                     row(node)
                 }
@@ -420,11 +425,16 @@ private struct SidebarTreeRows: View {
     private func row(_ node: LibraryNode) -> some View {
         Label(node.doc.title, systemImage: node.isFolder ? "folder" : "doc.text")
             .tag(PadItem.doc(node.id))
+            // drag onto another row: inside it (open it, so the doc stays in view)
+            .docDragAndDrop(node.id, mover: docMover) { expanded.insert(node.id) }
             .contextMenu {
                 Button(model.isPinned(node.id) ? "Unpin from Today" : "Pin to Today",
                        systemImage: model.isPinned(node.id) ? "pin.slash" : "pin") { model.togglePin(node.id) }
                 if model.access(for: node.id).canCreate {
                     Button("New doc here", systemImage: "plus") { router.newDoc(in: node.id) }
+                }
+                if let docMover, docMover.canMove(node.id) {
+                    Button("Move to\u{2026}", systemImage: "folder") { docMover.ask(node.id) }
                 }
                 if let docDeletion, docDeletion.canDelete(node.id) {
                     Divider()
