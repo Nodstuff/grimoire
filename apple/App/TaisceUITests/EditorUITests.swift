@@ -38,6 +38,60 @@ final class EditorUITests: XCTestCase {
         return try XCTUnwrap(m["markdown"] as? String)
     }
 
+    /// The doc's live blocks as (id, content), from the daemon's tree.
+    func blocks(_ id: String) throws -> [(id: String, content: String)] {
+        let tree = try XCTUnwrap(try call("/api/doc/\(id)") as? [String: Any])
+        var out: [(String, String)] = []
+        func walk(_ nodes: [[String: Any]]) {
+            for n in nodes {
+                if let b = n["block"] as? [String: Any], let bid = b["id"] as? String, let c = b["content"] as? String,
+                   (b["deleted"] as? Bool) != true {
+                    out.append((bid, c))
+                }
+                walk(n["children"] as? [[String: Any]] ?? [])
+            }
+        }
+        walk(tree["roots"] as? [[String: Any]] ?? [])
+        return out
+    }
+
+    /// Two SAVED blocks joined: Backspace at the second's start. The first
+    /// keeps its id and takes the text; the second's id is gone.
+    func testBackspaceJoinsTwoSavedBlocks() throws {
+        let tag = String(UUID().uuidString.prefix(6))
+        let title = "Join \(tag)"
+        let id = try makeDoc(title, markdown: "First line\n\nSecond line")
+        let before = try blocks(id)
+        XCTAssertEqual(before.map(\.content), ["First line", "Second line"])
+        let (firstID, secondID) = (before[0].id, before[1].id)
+
+        let app = XCUIApplication()
+        app.launchArguments = ["-serverURL", base.absoluteString, "-openDoc", title]
+        app.launch()
+        let surface = app.textViews["surface.text"]
+        XCTAssertTrue(surface.waitForExistence(timeout: 20))
+        func text() -> String { (surface.value as? String) ?? "" }
+        XCTAssertEqual(text(), "First line\nSecond line\n")
+
+        // the caret at the end, then to the start of "Second line" (⌘←)
+        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9)).tap()
+        surface.typeKey(.leftArrow, modifierFlags: .command)
+        surface.typeText(XCUIKeyboardKey.delete.rawValue)
+        XCTAssertEqual(text(), "First lineSecond line\n")
+
+        // the daemon, after the autosave: exactly that, under the first id
+        var got: [(id: String, content: String)] = []
+        for _ in 0..<40 {
+            got = try blocks(id)
+            if got.count == 1 { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        XCTAssertEqual(got.map(\.content), ["First lineSecond line"])
+        XCTAssertEqual(got.map(\.id), [firstID])
+        XCTAssertFalse(got.contains { $0.id == secondID }, "the joined block is gone")
+        XCTAssertEqual(try markdown(id), "First lineSecond line\n")
+    }
+
     func testTypeSplitMergeLinkInTheLiveSurface() throws {
         let tag = String(UUID().uuidString.prefix(6))
         let title = "Editor \(tag)"
@@ -54,20 +108,20 @@ final class EditorUITests: XCTestCase {
         XCTAssertTrue(surface.waitForExistence(timeout: 20), "the doc opened as one text surface")
         XCTAssertFalse(app.buttons["doc.edit"].exists, "there is no Edit mode")
         func text() -> String { (surface.value as? String) ?? "" }
-        XCTAssertTrue(text().hasPrefix("Hello world"))
+        XCTAssertEqual(text(), "Hello world\n")
 
         // a click below the text puts the caret at the end; type
         surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9)).tap()
         surface.typeText(" again")
-        XCTAssertTrue(text().hasPrefix("Hello world again"), text())
+        XCTAssertEqual(text(), "Hello world again\n")
 
         // Return: a new line, typed into
         surface.typeText("\nSecond")
-        XCTAssertTrue(text().hasPrefix("Hello world again\nSecond"), text())
+        XCTAssertEqual(text(), "Hello world again\nSecond\n")
 
         // Backspace back over it, and at the empty line's start joins it up
         for _ in 0..<7 { surface.typeText(XCUIKeyboardKey.delete.rawValue) }
-        XCTAssertEqual(text().trimmingCharacters(in: .newlines), "Hello world again")
+        XCTAssertEqual(text(), "Hello world again\n")
 
         // [[ and pick the suggestion
         surface.typeText(" [[\(tag)")
@@ -75,7 +129,7 @@ final class EditorUITests: XCTestCase {
         XCTAssertTrue(pick.waitForExistence(timeout: 5), "the [[ popup offers the doc being typed")
         pick.tap()
         surface.typeText("end")
-        XCTAssertTrue(text().hasPrefix("Hello world again \(target) end"), text())
+        XCTAssertEqual(text(), "Hello world again \(target) end\n")
 
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.name = "editing"

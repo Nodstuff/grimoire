@@ -18,6 +18,38 @@ import UIKit
                                  editable: editable, saveDelay: .milliseconds(50))
         }
 
+        init(model: SurfaceModel, cache: Cache) {
+            self.model = model
+            self.cache = cache
+        }
+
+        /// The doc stored in the cache first (the server's body at
+        /// `epoch`) and opened the way the app opens it, so refreshes,
+        /// restored conflicts and parked edits take the real paths.
+        static func stored(_ blocks: [Block], epoch: Int = 1, cache: Cache? = nil, reviewQueue: Set<String>? = nil) async throws -> Harness {
+            let cache = try cache ?? Cache.inMemory()
+            try await store(blocks, epoch: epoch, in: cache)
+            // saves only when a test asks (no debounce racing the refreshes)
+            let model = try #require(await SurfaceModel.open("d", cache: cache, api: nil, app: nil, editable: true,
+                                                            reviewQueue: reviewQueue, saveDelay: .seconds(3600)))
+            return Harness(model: model, cache: cache)
+        }
+
+        /// The server's body for "d" at `epoch`, as sync stores it.
+        static func store(_ blocks: [Block], epoch: Int, in cache: Cache) async throws {
+            let ed = DocEditor(docID: "d", baseEpoch: epoch, blocks: blocks)
+            func node(_ b: Block) -> BlockNode { BlockNode(block: b, children: ed.children(of: b.id).map(node)) }
+            try await cache.storeDoc(DocTree(doc: DocSummary(id: "d", parentID: nil, title: "D", currentEpoch: epoch),
+                                             roots: ed.children(of: nil).map(node)))
+        }
+
+        /// Pending outbox rows as proposes, with their flag.
+        func rows() async throws -> [(req: ProposeRequest, conflict: Bool)] {
+            try await cache.pendingOutbox().compactMap { e in
+                (try? JSONDecoder().decode(ProposeRequest.self, from: e.body ?? Data())).map { ($0, e.conflict) }
+            }
+        }
+
         var tv: SurfaceTextView { model.textView }
         var text: String { tv.text }
         var blocks: [Surface.SurfaceBlock] { Surface.blocks(tv.textStorage) }
@@ -282,7 +314,7 @@ import UIKit
         guard let undo = h.tv.undoManager else { Issue.record("no undo manager"); return }
         h.type("\n", at: 1)
         await h.model.flush()
-        h.model.setEditable(false)
+        await h.model.setEditable(false)
         #expect(!undo.canUndo)
         h.model.deleteBlock("b0")
         h.model.saveSource("b0", "changed")
@@ -413,6 +445,308 @@ import UIKit
     @Test func writingToolsAreOff() throws {
         let h = try Harness(blocks("a"))
         #expect(h.tv.writingToolsBehavior == .none)
+    }
+
+    // MARK: fix round 4: conflicts, refreshes, hidden blocks
+
+    static func blk(_ id: String, _ c: String, parent: String? = nil, key: String, type: BlockType = .paragraph) -> Block {
+        Block(id: id, docID: "d", parentID: parent, orderKey: key, blockType: type, content: c)
+    }
+
+    /// "mine" typed to "mine!" while the server changed it to "theirs"
+    /// (epoch 2): b0 in conflict on epoch 1, nothing saved yet.
+    func conflicted() async throws -> Harness {
+        let h = try await Harness.stored([Self.blk("b0", "mine", key: "i"), Self.blk("b1", "other", key: "r")])
+        h.type("!", at: 4)
+        try await Harness.store([Self.blk("b0", "theirs", key: "i"), Self.blk("b1", "other", key: "r")], epoch: 2, in: h.cache)
+        await h.model.refreshFromCache()
+        #expect(h.model.conflicts["b0"] == SurfaceConflict(base: 1, theirs: "theirs"))
+        #expect(h.markdown == ["mine!", "other"])
+        return h
+    }
+
+    func flagged(_ h: Harness, _ block: BlockID = "b0") async throws -> [ProposeRequest] {
+        try await h.rows().filter { $0.conflict && $0.req.ops.contains { $0.kind.target == block } }.map(\.req)
+    }
+
+    /// D1: a disputed block keeps ONE pending flagged write, rewritten in place.
+    @Test func aConflictedBlockHasOnePendingFlaggedWrite() async throws {
+        let h = try await conflicted()
+        await h.model.flush()
+        #expect(try await flagged(h).map(\.baseEpoch) == [1])
+        h.type("?", at: 5)
+        h.model.save()
+        await h.model.settle()
+        h.type("#", at: 6)
+        await h.model.flush()
+        let rows = try await flagged(h)
+        #expect(rows.count == 1, "one disputed block, one pending flagged write: \(rows.count)")
+        #expect(rows.first?.ops.map(\.kind) == [.replace(target: "b0", content: "mine!?#")])
+        #expect(rows.first?.baseEpoch == 1)
+    }
+
+    /// D1: once sent, a refresh moving the baseline never re-proposes it;
+    /// more typing is held until leaving the doc, then sent once.
+    @Test func aSentConflictIsNotReproposed() async throws {
+        let h = try await conflicted()
+        await h.model.flush()
+        let row = try #require(try await h.cache.pendingOutbox().first { $0.conflict })
+        try await h.cache.markOutbox(try #require(row.id), state: .done)
+        await h.model.refreshFromCache()
+        h.type("+", at: h.location(of: "other") + 5)
+        await h.model.flush()
+        #expect(try await flagged(h).isEmpty, "the refresh moved b0's baseline: not a reason to propose it again")
+        #expect(try await h.rows().map(\.req.ops).flatMap { $0.map(\.kind) } == [.replace(target: "b1", content: "other+")])
+        // more typing in it waits for leaving the doc
+        h.type("~", at: 5)
+        await h.model.flush()
+        #expect(try await flagged(h).isEmpty)
+        await h.model.flush(final: true)
+        let sent = try await flagged(h)
+        #expect(sent.count == 1 && sent.first?.baseEpoch == 1)
+        #expect(sent.first?.ops.map(\.kind) == [.replace(target: "b0", content: "mine!~")])
+        await h.model.flush(final: true)
+        #expect(try await flagged(h).count == 1, "not again: nothing new")
+    }
+
+    /// D2: our own queued write, overlaid, is not the server taking ours.
+    @Test func ourOwnQueuedWriteNeverEndsAConflict() async throws {
+        let h = try await conflicted()
+        await h.model.flush()
+        await h.model.refreshFromCache()
+        #expect(h.model.conflicts["b0"] != nil, "still disputed: only our own row says mine!")
+        // the server's own body now has ours (accepted on the desktop)
+        try await Harness.store([Self.blk("b0", "mine!", key: "i"), Self.blk("b1", "other", key: "r")], epoch: 3, in: h.cache)
+        await h.model.refreshFromCache()
+        #expect(h.model.conflicts["b0"] == nil)
+    }
+
+    /// D3: a new first block goes after the doc's frontmatter.
+    @Test func aNewFirstBlockGoesAfterFrontmatter() async throws {
+        let h = try await Harness.stored([Self.blk("fm", "---\ntags: [a]\n---", key: "i"), Self.blk("p", "para", key: "r")])
+        #expect(h.markdown == ["para"])
+        h.type("\n", at: 0)
+        h.type("top", at: 0)
+        await h.model.flush()
+        let inserts = try await h.rows().flatMap(\.req.ops).compactMap { op -> (BlockID?, String)? in
+            if case let .insert(_, parent, key, _, _) = op.kind { return (parent, key) } else { return nil }
+        }
+        #expect(inserts.count == 1)
+        #expect(inserts.first?.0 == nil)
+        #expect(inserts.first.map { $0.1 > "i" && $0.1 < "r" } == true, "after the frontmatter: \(inserts)")
+    }
+
+    @Test func firstTypingInAFrontmatterOnlyDocGoesAfterIt() async throws {
+        let h = try await Harness.stored([Self.blk("fm", "---\ntags: [a]\n---", key: "i")])
+        h.type("typed", at: 0)
+        await h.model.flush()
+        let keys = try await h.rows().flatMap(\.req.ops).compactMap { op -> String? in
+            if case let .insert(_, _, key, _, _) = op.kind { return key } else { return nil }
+        }
+        #expect(keys.count == 1 && keys[0] > "i", "\(keys)")
+    }
+
+    /// T1, case 1: a refresh arrives while our write is still on its way to
+    /// the outbox (persist hangs).
+    @Test func aRefreshBeforeTheOutboxWriteKeepsTypedText() async throws {
+        let h = try await Harness.stored([Self.blk("b0", "hello", key: "i"), Self.blk("b1", "other", key: "r")])
+        let gate = Gate()
+        let real = h.model.persist
+        h.model.persist = { req, c, k in
+            await gate.wait()
+            try await real(req, c, k)
+        }
+        h.type(" world", at: 5)
+        h.model.save()
+        h.type("\n")
+        h.type("new")
+        h.model.save()
+        try await Harness.store([Self.blk("b0", "hello", key: "i"), Self.blk("b1", "other, edited remotely", key: "r")], epoch: 1, in: h.cache)
+        await h.model.refreshFromCache()
+        #expect(h.markdown == ["hello world", "new", "other, edited remotely"])
+        gate.open()
+        await h.model.settle()
+        let inserts = try await h.rows().flatMap(\.req.ops).filter { if case .insert = $0.kind { true } else { false } }
+        #expect(inserts.count == 1, "the new block is inserted once")
+    }
+
+    /// T1, case 2: the write is in the outbox and its send hangs in flight.
+    @Test func aRefreshWhileTheSendHangsKeepsTypedText() async throws {
+        let h = try await Harness.stored([Self.blk("b0", "hello", key: "i")])
+        let gate = Gate()
+        h.model.replay = { await gate.wait() }
+        h.type(" world", at: 5)
+        await h.model.flush()
+        try await Harness.store([Self.blk("b0", "hello", key: "i")], epoch: 1, in: h.cache)
+        await h.model.refreshFromCache()
+        #expect(h.markdown == ["hello world"])
+        #expect(h.model.conflicts.isEmpty)
+        gate.open()
+    }
+
+    /// T2 (i) + (iii): Keep mine is a plain write on the current epoch; the
+    /// pending flagged one goes.
+    @Test func keepMineReplacesTheFlaggedWrite() async throws {
+        let h = try await conflicted()
+        await h.model.flush()
+        #expect(try await flagged(h).count == 1)
+        await h.model.keepMine("b0")
+        await h.model.flush()
+        let rows = try await h.rows()
+        #expect(rows.filter(\.conflict).isEmpty, "no stale flagged write beside it")
+        #expect(rows.map(\.req.ops).flatMap { $0.map(\.kind) } == [.replace(target: "b0", content: "mine!")])
+        #expect(rows.first?.req.baseEpoch == 2)
+        #expect(try await h.cache.conflictedBlocks("d").isEmpty)
+    }
+
+    /// T2 (ii): a conflict remembered by the outbox (theirs unknown).
+    @Test func keepMineOnARestoredConflictQueuesOneReplace() async throws {
+        let cache = try Cache.inMemory()
+        let row = try await cache.enqueue(ProposeRequest(docID: "d", baseEpoch: 1, ops: [.replace(target: "b0", content: "mine!")], requestID: "c1"), conflict: true)
+        try await cache.markOutbox(try #require(row.id), state: .done)
+        let h = try await Harness.stored([Self.blk("b0", "theirs", key: "i")], epoch: 2, cache: cache)
+        #expect(h.model.conflicts["b0"]?.base == 1)
+        await h.model.keepMine("b0")
+        await h.model.flush()
+        let rows = try await h.rows()
+        #expect(rows.count == 1 && !rows[0].conflict, "\(rows)")
+        #expect(rows.first?.req.ops.map(\.kind) == [.replace(target: "b0", content: "theirs")])
+    }
+
+    /// T2 (iv): Keep mine on a parked block isn't undone by the next refresh.
+    @Test func keepMineOnAParkedBlockSticks() async throws {
+        let cache = try Cache.inMemory()
+        let row = try await cache.enqueue(ProposeRequest(docID: "d", baseEpoch: 1, ops: [.replace(target: "b0", content: "beta!")], requestID: "p1"))
+        let outcome = #"{"doc_id":"d","epoch":2,"verdicts":[{"op_id":"op1","block_id":"b0","verdict":"red","confidence":0.1,"applied":false,"note":""}]}"#
+        try await cache.markOutbox(try #require(row.id), state: .done, outcome: Data(outcome.utf8))
+        let h = try await Harness.stored([Self.blk("b0", "beta", key: "i")], epoch: 2, cache: cache, reviewQueue: ["op1"])
+        #expect(h.markdown == ["beta!"], "the parked edit shows on reopen")
+        #expect(h.model.conflicts["b0"] != nil)
+        await h.model.keepMine("b0")
+        await h.model.refreshFromCache()
+        #expect(h.model.conflicts["b0"] == nil, "the next refresh doesn't put it back")
+        await h.model.flush()
+        let rows = try await h.rows()
+        #expect(rows.allSatisfy { !$0.conflict })
+        #expect(rows.map(\.req.ops).flatMap { $0.map(\.kind) } == [.replace(target: "b0", content: "beta!")])
+    }
+
+    /// Reopened with a parked edit: it shows, and nothing is proposed.
+    @Test func aParkedEditShowsOnReopenAndNothingIsProposed() async throws {
+        let cache = try Cache.inMemory()
+        let row = try await cache.enqueue(ProposeRequest(docID: "d", baseEpoch: 1, ops: [.replace(target: "b0", content: "beta!")], requestID: "p1"))
+        let outcome = #"{"doc_id":"d","epoch":2,"verdicts":[{"op_id":"op1","block_id":"b0","verdict":"red","confidence":0.1,"applied":false,"note":""}]}"#
+        try await cache.markOutbox(try #require(row.id), state: .done, outcome: Data(outcome.utf8))
+        let h = try await Harness.stored([Self.blk("b0", "beta", key: "i"), Self.blk("b1", "other", key: "r")], epoch: 2, cache: cache, reviewQueue: ["op1"])
+        #expect(h.markdown == ["beta!", "other"])
+        h.type("+", at: h.location(of: "other") + 5)
+        await h.model.flush(final: true)
+        await h.model.refreshFromCache()
+        await h.model.flush(final: true)
+        let ops = try await h.rows().map(\.req.ops).flatMap { $0.map(\.kind) }
+        #expect(ops == [.replace(target: "b1", content: "other+")], "no write of b0 at all: \(ops)")
+    }
+
+    /// T3: one flush, a disputed block and a normal one.
+    @Test func aMixedSaveSplitsByConflict() async throws {
+        let h = try await conflicted()
+        h.type("+", at: h.location(of: "other") + 5)
+        await h.model.flush()
+        let rows = try await h.rows()
+        let disputed = rows.filter(\.conflict)
+        let normal = rows.filter { !$0.conflict }
+        #expect(disputed.count == 1 && disputed[0].req.baseEpoch == 1 && disputed[0].req.ops.map(\.kind) == [.replace(target: "b0", content: "mine!")])
+        #expect(normal.count == 1 && normal[0].req.baseEpoch == 2 && normal[0].req.ops.map(\.kind) == [.replace(target: "b1", content: "other+")])
+    }
+
+    /// T4: a conflict the outbox remembers, on reopen: typing waits, and
+    /// leaving sends it on the old epoch, flagged.
+    @Test func aRestoredConflictStaysOnItsEpoch() async throws {
+        let cache = try Cache.inMemory()
+        let row = try await cache.enqueue(ProposeRequest(docID: "d", baseEpoch: 1, ops: [.replace(target: "b0", content: "mine!")], requestID: "c1"), conflict: true)
+        try await cache.markOutbox(try #require(row.id), state: .done)
+        let h = try await Harness.stored([Self.blk("b0", "theirs", key: "i")], epoch: 2, cache: cache)
+        h.type("?", at: 6)
+        await h.model.flush()
+        #expect(try await flagged(h).isEmpty, "held while the doc is open")
+        await h.model.flush(final: true)
+        let rows = try await flagged(h)
+        #expect(rows.count == 1 && rows[0].baseEpoch == 1)
+        #expect(rows.first?.ops.map(\.kind) == [.replace(target: "b0", content: "theirs?")])
+    }
+
+    /// T5: made a viewer: what's typed is saved first, by setEditable itself.
+    @Test func demotionSavesBeforeGoingReadOnly() async throws {
+        let h = try Harness(blocks("a"))
+        h.type("b", at: 1)
+        await h.model.setEditable(false)
+        #expect(!h.tv.isEditable)
+        #expect(try await h.queuedOps() == [.replace(target: "b0", content: "ab")])
+    }
+
+    /// T6: Share link / Export from the menu bar flushes the open doc first.
+    @Test func aSnapshotFlushesTheOpenDocFirst() async throws {
+        let h = try Harness(blocks("a"))
+        let router = Router()
+        router.snapshotPrep["d"] = { [model = h.model] in await model.flush(final: true) }
+        h.type("b", at: 1)
+        await router.prepareSnapshot("d")
+        #expect(try await h.queuedOps() == [.replace(target: "b0", content: "ab")])
+    }
+
+    /// T8: a block deleted there while edited here comes back in its place.
+    @Test func aResurrectedBlockKeepsItsPlace() async throws {
+        let nested = [Self.blk("h", "# H", key: "i", type: .heading), Self.blk("a", "alpha", parent: "h", key: "i"),
+                      Self.blk("bb", "beta", parent: "h", key: "r"), Self.blk("c", "gamma", parent: "h", key: "v")]
+        let h = try await Harness.stored(nested)
+        h.type("!", at: h.location(of: "beta") + 4)
+        try await Harness.store(nested.filter { $0.id != "bb" }, epoch: 2, in: h.cache)
+        await h.model.refreshFromCache()
+        #expect(h.markdown == ["# H", "alpha", "beta!", "gamma"])
+        await h.model.flush()
+        let inserts = try await h.rows().flatMap(\.req.ops).compactMap { op -> (BlockID?, BlockID?, String)? in
+            if case let .insert(id, parent, key, _, _) = op.kind { return (id, parent, key) } else { return nil }
+        }
+        #expect(inserts.count == 1)
+        #expect(inserts.first?.0 != "bb", "a new id: the old one is deleted there")
+        #expect(inserts.first?.1 == "h")
+        #expect(inserts.first.map { $0.2 > "i" && $0.2 < "v" } == true, "between alpha and gamma: \(inserts)")
+    }
+
+    /// Offline edits made through the surface are in the outbox, and a
+    /// relaunch (a new cache on the same file) opens them as typed, with
+    /// nothing to send again.
+    @Test func offlineEditsSurviveARelaunch() async throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "taisce-surface-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appending(path: "cache.sqlite").path(percentEncoded: false)
+        let doc = [Self.blk("h", "# One", key: "i", type: .heading), Self.blk("p1", "alpha", parent: "h", key: "i"),
+                   Self.blk("p2", "bravo", parent: "h", key: "r")]
+        do {
+            let h = try await Harness.stored(doc, cache: try Cache(path: path))
+            h.type(", offline", at: h.location(of: "alpha") + 5)
+            h.type("\n")
+            h.type("a new block, offline")
+            await h.model.flush(final: true)
+        }
+        let cache = try Cache(path: path)
+        let queued = try await cache.pendingOutbox().count
+        #expect(queued >= 1)
+        let model = try #require(await SurfaceModel.open("d", cache: cache, api: nil, app: nil, editable: true, reviewQueue: nil, saveDelay: .seconds(3600)))
+        let h = Harness(model: model, cache: cache)
+        #expect(h.markdown == ["# One", "alpha, offline", "a new block, offline", "bravo"])
+        await h.model.flush(final: true)
+        #expect(try await cache.pendingOutbox().count == queued, "nothing to resend: the queue already holds it")
+    }
+
+    /// T9: who gets an editable surface.
+    @Test func theWriteGate() {
+        #expect(DocWriteGate.canWrite(isCanvas: false, isMirror: false, canEdit: true))
+        #expect(!DocWriteGate.canWrite(isCanvas: true, isMirror: false, canEdit: true), "a canvas")
+        #expect(!DocWriteGate.canWrite(isCanvas: false, isMirror: true, canEdit: true), "a mirror")
+        #expect(!DocWriteGate.canWrite(isCanvas: false, isMirror: false, canEdit: false), "a viewer")
+        #expect(!DocWriteGate.canWrite(isCanvas: nil, isMirror: nil, canEdit: true), "not known yet")
     }
 
     // MARK: non-text blocks
@@ -574,6 +908,7 @@ import UIKit
         h.tv.setMarkedText("## ", selectedRange: NSRange(location: 3, length: 0))
         #expect(h.tv.markedTextRange != nil, "the composition really opened")
         #expect(h.text.hasPrefix("## "), "not turned into a heading mid-composition")
+        #expect(h.blocks.map(\.content) == [.paragraph(AttributedString("## "))], "still a paragraph holding the typed text")
         h.tv.unmarkText()
         h.tv.resignFirstResponder()
     }
@@ -609,7 +944,7 @@ import UIKit
         let h = try Harness(blocks("a"))
         h.type("b", at: 1)
         await h.model.flush()
-        h.model.setEditable(false)
+        await h.model.setEditable(false)
         #expect(!h.tv.isEditable)
         #expect(try await h.queuedOps() == [.replace(target: "b0", content: "ab")])
         #expect(h.tv.textStorage.attribute(.link, at: 0, effectiveRange: nil) == nil)

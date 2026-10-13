@@ -15,8 +15,8 @@ struct DocScreen: View {
     @State private var page: DocPage?
     @State private var loadError: String?
     @State private var surface: SurfaceModel?
-    /// not a canvas or a mirror (nil until the cache said)
-    @State private var editableKind: Bool?
+    /// what the cache says this doc is (nil until it said)
+    @State private var kind: DocKind?
     @State private var opening = false
     /// the body isn't in the offline cache: the page shows read-only
     @State private var surfaceFailed = false
@@ -45,7 +45,7 @@ struct DocScreen: View {
         .task(id: docID) { await refresh(force: false) }
         .task(id: docID) { await checkEditable() }
         // the surface opens once the body is cached and we know what it may be
-        .task(id: OpenKey(doc: docID, loaded: page != nil, kindKnown: editableKind != nil)) { await openSurface() }
+        .task(id: OpenKey(doc: docID, loaded: page != nil, kindKnown: kind != nil)) { await openSurface() }
         // queued edits show while they wait (offline, a live session)
         .task(id: model.pendingWrites) { await reloadPage() }
         // a sync write drops the cached meta: load it again
@@ -55,21 +55,22 @@ struct DocScreen: View {
             if phase != .active, let surface {
                 let id = UIApplication.shared.beginBackgroundTask(withName: "editor flush")
                 Task {
-                    await surface.flush()
+                    await surface.flush(final: true)
                     UIApplication.shared.endBackgroundTask(id)
                 }
             }
         }
         .onDisappear {
-            if let surface { Task { await surface.flush(); surface.stop(); await model.replayOutbox() } }
+            router.snapshotPrep[docID] = nil
+            if let surface { Task { await surface.flush(final: true); surface.stop(); await model.replayOutbox() } }
         }
         // ADR 0004: made a viewer while editing: what's typed is saved
         // (the server says no, and the chip shows it), then read-only in place
         .onChange(of: canWrite) { _, can in
             guard let surface else { return }
             Task {
-                if !can { await surface.flush() }
-                surface.setEditable(can)
+                // made a viewer: setEditable saves what's typed first
+                await surface.setEditable(can)
                 await model.replayOutbox()
             }
         }
@@ -81,7 +82,7 @@ struct DocScreen: View {
     private var access: EditAccess { model.access(for: docID) }
 
     /// Editable here: you may edit it, and it isn't a canvas or a mirror.
-    private var canWrite: Bool { (editableKind ?? false) && access.canEdit }
+    private var canWrite: Bool { DocWriteGate.canWrite(isCanvas: kind?.canvas, isMirror: kind?.mirror, canEdit: access.canEdit) }
 
     private func surfaceView(_ surface: SurfaceModel) -> some View {
         DocSurfaceContent(model: surface)
@@ -124,20 +125,10 @@ struct DocScreen: View {
             }
     }
 
-    /// What's typed is in the outbox before a link snapshots the doc.
-    private func shareLink(_ surface: SurfaceModel) {
-        Task {
-            await surface.flush()
-            router.request(.shareLink, on: docID)
-        }
-    }
+    /// (the snapshot preparation flushes the surface first)
+    private func shareLink(_ surface: SurfaceModel) { router.request(.shareLink, on: docID) }
 
-    private func exportPDF(_ surface: SurfaceModel) {
-        Task {
-            await surface.flush()
-            router.request(.exportPDF, on: docID)
-        }
-    }
+    private func exportPDF(_ surface: SurfaceModel) { router.request(.exportPDF, on: docID) }
 
     /// A SwiftUI view for the text view's header or footer, with what it reads.
     private func hosted(_ v: some View) -> AnyView {
@@ -211,17 +202,17 @@ struct DocScreen: View {
     /// Canvases and federation mirrors are read-only here.
     private func checkEditable() async {
         guard let cache = model.cache, let rec = try? await cache.doc(docID) else {
-            if editableKind == nil { editableKind = model.cache == nil ? false : nil }
+            if kind == nil, model.cache == nil { kind = DocKind(canvas: false, mirror: true) }
             return
         }
-        editableKind = !rec.isCanvas && rec.mirrorPermission == nil
+        kind = DocKind(canvas: rec.isCanvas, mirror: rec.mirrorPermission != nil)
     }
 
     /// The surface over the cached body (fetched first if need be). Nil
     /// while it isn't cached: the reading states show meanwhile.
     private func openSurface() async {
-        if editableKind == nil, page != nil { await checkEditable() }
-        guard surface == nil, !opening, page != nil, editableKind != nil else { return }
+        if kind == nil, page != nil { await checkEditable() }
+        guard surface == nil, !opening, page != nil, kind != nil else { return }
         opening = true
         defer { opening = false }
         guard let s = await SurfaceModel.open(docID, app: model, editable: canWrite) else {
@@ -236,6 +227,8 @@ struct DocScreen: View {
             s.onTodoCheckbox = { block, index, checked in toggleTodo(block, index, checked) }
         }
         surface = s
+        // Share link / Export as PDF (menus, menu bar) flush it first
+        router.snapshotPrep[docID] = { [weak s] in await s?.flush(final: true) }
         // a doc just created here opens with the caret at its start
         if canWrite, model.pendingEditDoc == docID {
             model.pendingEditDoc = nil
@@ -285,6 +278,22 @@ struct DocScreen: View {
                 model.lastError = error.localizedDescription
             }
         }
+    }
+}
+
+/// What a doc is, for the write gate.
+struct DocKind: Hashable {
+    var canvas: Bool
+    var mirror: Bool
+}
+
+/// Who gets an editable surface: you may edit the doc (ADR 0004: not a
+/// viewer), it isn't a canvas or a federation mirror, and the cache has
+/// said which (unknown reads only).
+enum DocWriteGate {
+    static func canWrite(isCanvas: Bool?, isMirror: Bool?, canEdit: Bool) -> Bool {
+        guard let isCanvas, let isMirror else { return false }
+        return canEdit && !isCanvas && !isMirror
     }
 }
 

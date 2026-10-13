@@ -85,8 +85,16 @@ struct DocShareActions: ViewModifier {
         // a request left over from a while ago (the doc wasn't open then) is dropped
         guard action.isFresh() else { return }
         switch action.kind {
-        case .shareLink: if model.shareLinks.isAvailable, canShare, pageLoaded { sharing = true }
-        case .exportPDF: if model.shareLinks.isAvailable { askThenExport() }
+        case .shareLink, .exportPDF:
+            // what's typed reaches the outbox before the doc is snapshotted
+            Task {
+                await router.prepareSnapshot(docID)
+                if action.kind == .shareLink {
+                    if model.shareLinks.isAvailable, canShare, pageLoaded { sharing = true }
+                } else if model.shareLinks.isAvailable {
+                    askThenExport()
+                }
+            }
         case .linkComments: showingLinkComments = true
         }
     }
