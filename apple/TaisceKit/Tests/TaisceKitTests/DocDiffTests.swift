@@ -11,6 +11,7 @@ import Testing
             var name: String
             var baseline: [DocDiff.BaselineBlock]
             var entries: [DocDiff.Entry]
+            var hidden: [DocDiff.HiddenBlock]?
             var ops: [BlockOp]
         }
         var cases: [Case]
@@ -32,7 +33,7 @@ import Testing
         #expect(v.cases.count > 10)
         for c in v.cases {
             var n = 0
-            let ops = DocDiff.computeOps(baseline: c.baseline, entries: c.entries) {
+            let ops = DocDiff.computeOps(baseline: c.baseline, entries: c.entries, hidden: c.hidden ?? []) {
                 n += 1
                 return "new-\(n)"
             }
@@ -43,7 +44,9 @@ import Testing
                 k += 1
                 return "new-\(k)"
             }
-            #expect(Self.serverOrder(c.baseline, ops) == want, "the server tree reads in the editor's order: \(c.name)")
+            let hidden = c.hidden ?? []
+            let full = DocDiff.withHiddenBlocks(c.baseline, want.map { DocDiff.Entry(id: $0, content: "", level: 0) }, hidden).1.compactMap(\.id)
+            #expect(Self.serverOrder(c.baseline + hidden.map(\.plain), ops) == full, "the server tree reads in the editor's order: \(c.name)")
         }
     }
 

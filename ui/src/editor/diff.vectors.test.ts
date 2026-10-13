@@ -3,20 +3,37 @@
 // and entries into the same ops. Every vector, and random docs and edits,
 // also check the invariant: the server's tree after the ops reads (pre-order,
 // siblings by order key) in exactly the editor's order.
-import { readFileSync, writeFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { BaselineBlock, Entry, Op, computeOps, headingLevel, keyBetween } from './diff'
+import { BaselineBlock, Entry, HiddenBlock, Op, computeOps, headingLevel, keyBetween } from './diff'
+import vectorsJson from './diff.vectors.json'
 
 interface Vector {
   name: string
   baseline: BaselineBlock[]
   entries: Entry[]
+  /** blocks the editor doesn't show (frontmatter, comments): kept in place */
+  hidden?: HiddenBlock[]
   ops: Record<string, unknown>[]
 }
 
-const vectors: { cases: Vector[] } = JSON.parse(
-  readFileSync(new URL('./diff.vectors.json', import.meta.url), 'utf8'),
-)
+/** The editor's order with each hidden block after the visible block it
+ * followed (or the nearest surviving one before that; else first). */
+function withHidden(baseline: BaselineBlock[], ids: string[], hidden: HiddenBlock[]): string[] {
+  const live = new Set(ids)
+  const order = baseline.map((b) => b.id)
+  const anchor = (a: string | null) => {
+    for (let k = a == null ? -1 : order.indexOf(a); k >= 0; k--) if (live.has(order[k])) return order[k]
+    return null
+  }
+  const out = hidden.filter((h) => anchor(h.after) == null).map((h) => h.id)
+  for (const id of ids) {
+    out.push(id)
+    out.push(...hidden.filter((h) => anchor(h.after) === id).map((h) => h.id))
+  }
+  return out
+}
+
+const vectors = vectorsJson as unknown as { cases: Vector[] }
 
 /** The server's blocks after `ops`, read in pre-order (siblings by key). */
 export function serverOrder(baseline: BaselineBlock[], ops: Op[]): string[] {
@@ -65,9 +82,10 @@ describe('shared diff vectors', () => {
   for (const c of vectors.cases) {
     it(c.name, () => {
       let n = 0
-      const ops = computeOps(c.baseline, c.entries, () => `new-${++n}`)
+      const hidden = c.hidden ?? []
+      const ops = computeOps(c.baseline, c.entries, () => `new-${++n}`, undefined, hidden)
       expect(ops.map((o) => o.kind)).toEqual(c.ops)
-      expect(serverOrder(c.baseline, ops)).toEqual(entryIds(c.entries))
+      expect(serverOrder([...c.baseline, ...hidden], ops)).toEqual(withHidden(c.baseline, entryIds(c.entries), hidden))
     })
   }
 })
@@ -148,10 +166,11 @@ function inferredParents(items: { id: string; level: number }[]): Map<string, st
 
 describe('saves move only what the edit re-homed', () => {
   const modes = ['heading', 'flat', 'random'] as const
-  it('typos and retitles are one replace; a level change moves only blocks whose section changed (or out-of-order ones)', () => {
-    const counts: Record<string, { cases: number; bursts: number; extra: number }> = {}
-    for (const mode of modes) {
-      counts[mode] = { cases: 0, bursts: 0, extra: 0 }
+  // one test per nesting style (each a fraction of a second; one test for
+  // all three ran past vitest's 5 s timeout on a loaded machine)
+  for (const mode of modes) {
+    it(`${mode} docs: typos and retitles are one replace; a level change moves only changed sections (or out-of-order blocks)`, () => {
+      const counts = { cases: 0, bursts: 0, extra: 0 }
       for (let seed = 1; seed <= 1000; seed++) {
         const r = rng(seed * 7 + mode.length)
         const n = 4 + Math.floor(r() * 10)
@@ -214,12 +233,15 @@ describe('saves move only what the edit re-homed', () => {
         const moved = ops.filter((o) => o.kind.op === 'move').map((o) => o.kind.target as string)
         const allowed = new Set([...changed, ...stats.orderFallback])
         expect(moved.filter((m) => !allowed.has(m)), `${mode} ${seed} level change moved untouched blocks`).toEqual([])
-        counts[mode].cases++
-        if (moved.length > n / 2) counts[mode].bursts++
-        counts[mode].extra += moved.filter((m) => !changed.has(m)).length
+        counts.cases++
+        if (moved.length > n / 2) counts.bursts++
+        counts.extra += moved.filter((m) => !changed.has(m)).length
       }
-    }
-    // DIFF_STATS=<file> writes the numbers (cases, bursts = moves > half the doc, moves outside the changed sections)
-    if (process.env.DIFF_STATS) writeFileSync(process.env.DIFF_STATS, JSON.stringify(counts))
-  })
+      // bursts = a level change moving more than half the doc; extra = moves
+      // of blocks whose section didn't change (all from the order check).
+      // Measured: heading 0/0, flat 0/0, random 2 bursts / 40 extra.
+      if (mode === 'random') expect(counts.bursts).toBeLessThanOrEqual(5)
+      else expect(counts).toMatchObject({ bursts: 0, extra: 0 })
+    })
+  }
 })

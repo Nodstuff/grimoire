@@ -44,6 +44,10 @@ public enum SurfaceMerge {
         oldEpoch: Int,
         server: [Block],
         parked: Set<BlockID> = [],
+        /// the server's OWN text for blocks in conflict (its cached body,
+        /// without our queued writes overlaid): only this ends a conflict.
+        /// Nil: `server` is the server's own text.
+        serverText: [BlockID: String]? = nil,
         mint: () -> BlockID = Surface.newID
     ) -> Result {
         let base = Dictionary(baseline.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
@@ -70,11 +74,14 @@ public enum SurfaceMerge {
                             newBase.append(theirs)
                             continue
                         }
-                    } else if sc == md {
-                        // the other side took ours (accepted on the desktop): over
+                    } else if (serverText?[s.id] ?? sc) == md {
+                        // the server itself has ours now (accepted on the
+                        // desktop): over. Our own queued write, overlaid,
+                        // is never evidence
                         conflicts[s.id] = nil
                     } else {
-                        c.theirs = sc
+                        let own = serverText?[s.id] ?? sc
+                        if own != md { c.theirs = own }
                         conflicts[s.id] = c
                     }
                     pieces.append(Piece(id: s.id, content: l, local: true))

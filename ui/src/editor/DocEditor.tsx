@@ -15,7 +15,7 @@ import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block } from '../types'
 import { notify } from '../Notice'
 import { saveErrorText } from '../hints'
-import { BaselineBlock, Entry, computeOps } from './diff'
+import { BaselineBlock, Entry, HiddenBlock, computeOps } from './diff'
 import { debounce } from '../timing'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
 import { AfterSave, afterSave } from './savePlan'
@@ -85,6 +85,8 @@ export interface EditableDoc {
   epoch: number
   /** pre-order flattened live blocks, comments and frontmatter excluded */
   blocks: Block[]
+  /** the blocks left out (comments, frontmatter, old canvases), in place */
+  hidden?: HiddenBlock[]
 }
 
 type SaveState = 'clean' | 'dirty' | 'saving'
@@ -120,26 +122,7 @@ export default function DocEditor({
   const lastPlan = useRef<AfterSave>('clean')
 
   // baseline: per block, the round-tripped markdown (comparison form) + structure
-  const initial = useMemo(() => {
-    const nodes: PMNode[] = []
-    const baseline: BaselineBlock[] = []
-    for (const b of doc.blocks) {
-      const parsed = parser.parse(b.content)
-      if (!parsed || parsed.childCount === 0) continue
-      const children: PMNode[] = []
-      parsed.forEach((child) => {
-        children.push(child.type.create({ ...child.attrs, blockId: b.id }, child.content, child.marks))
-      })
-      nodes.push(...children)
-      baseline.push({
-        id: b.id,
-        content: nodesToMarkdown(serializer, schema, children),
-        parent: b.parent_id,
-        order_key: b.order_key,
-      })
-    }
-    return { nodes, baseline }
-  }, [doc.docId])
+  const initial = useMemo(() => loadDoc(doc), [doc.docId])
 
   const baselineRef = useRef(initial.baseline)
   const epochRef = useRef(doc.epoch)
@@ -187,41 +170,7 @@ export default function DocEditor({
   }, [editor, reviewMap])
 
   // extract entries (grouping consecutive nodes that share a blockId)
-  const extractEntries = (): Entry[] => {
-    if (!editor) return []
-    const entries: Entry[] = []
-    let run: { id: string; nodes: PMNode[] } | null = null
-    const flushRun = () => {
-      if (run) {
-        entries.push({
-          id: run.id,
-          content: nodesToMarkdown(serializer, schema, run.nodes),
-          level: run.nodes[0].type.name === 'heading' ? run.nodes[0].attrs.level : 0,
-        })
-        run = null
-      }
-    }
-    editor.state.doc.forEach((node) => {
-      if (node.type.name === 'paragraph' && node.content.size === 0 && !node.attrs.blockId) {
-        return // empty unsaved paragraphs are not blocks
-      }
-      const id: string | null = node.attrs.blockId ?? null
-      if (id && run && run.id === id) {
-        run.nodes.push(node)
-        return
-      }
-      flushRun()
-      if (id) run = { id, nodes: [node] }
-      else
-        entries.push({
-          id: null,
-          content: nodesToMarkdown(serializer, schema, [node]),
-          level: node.type.name === 'heading' ? node.attrs.level : 0,
-        })
-    })
-    flushRun()
-    return entries
-  }
+  const extractEntries = (): Entry[] => (editor ? entriesOf(editor.state.doc) : [])
 
   const runSave = async () => {
     if (!editor) return
@@ -231,11 +180,17 @@ export default function DocEditor({
     const snapshot = editor.state.doc
     const entries = extractEntries()
     const assigned: string[] = []
-    const ops = computeOps(baselineRef.current, entries, () => {
-      const id = crypto.randomUUID()
-      assigned.push(id)
-      return id
-    })
+    const ops = computeOps(
+      baselineRef.current,
+      entries,
+      () => {
+        const id = crypto.randomUUID()
+        assigned.push(id)
+        return id
+      },
+      undefined,
+      doc.hidden ?? [],
+    )
     if (ops.length === 0) {
       setSaveState('clean')
       return
@@ -351,6 +306,66 @@ export default function DocEditor({
       </span>
     </>
   )
+}
+
+/** The editor's nodes (each carrying its block id) and the baseline
+ * (per block, the round-tripped markdown + structure) for a doc. */
+export function loadDoc(doc: EditableDoc): { nodes: PMNode[]; baseline: BaselineBlock[] } {
+  const nodes: PMNode[] = []
+  const baseline: BaselineBlock[] = []
+  for (const b of doc.blocks) {
+    const parsed = parser.parse(b.content)
+    if (!parsed || parsed.childCount === 0) continue
+    const children: PMNode[] = []
+    parsed.forEach((child) => {
+      children.push(child.type.create({ ...child.attrs, blockId: b.id }, child.content, child.marks))
+    })
+    nodes.push(...children)
+    baseline.push({
+      id: b.id,
+      content: nodesToMarkdown(serializer, schema, children),
+      parent: b.parent_id,
+      order_key: b.order_key,
+    })
+  }
+  return { nodes, baseline }
+}
+
+/** The editor doc's top-level entries for the diff (consecutive nodes
+ * sharing a blockId are one block; empty unsaved paragraphs are none). */
+export function entriesOf(doc: PMNode): Entry[] {
+  const entries: Entry[] = []
+  let run: { id: string; nodes: PMNode[] } | null = null
+  const flushRun = () => {
+    if (run) {
+      entries.push({
+        id: run.id,
+        content: nodesToMarkdown(serializer, schema, run.nodes),
+        level: run.nodes[0].type.name === 'heading' ? run.nodes[0].attrs.level : 0,
+      })
+      run = null
+    }
+  }
+  doc.forEach((node) => {
+    if (node.type.name === 'paragraph' && node.content.size === 0 && !node.attrs.blockId) {
+      return // empty unsaved paragraphs are not blocks
+    }
+    const id: string | null = node.attrs.blockId ?? null
+    if (id && run && run.id === id) {
+      run.nodes.push(node)
+      return
+    }
+    flushRun()
+    if (id) run = { id, nodes: [node] }
+    else
+      entries.push({
+        id: null,
+        content: nodesToMarkdown(serializer, schema, [node]),
+        level: node.type.name === 'heading' ? node.attrs.level : 0,
+      })
+  })
+  flushRun()
+  return entries
 }
 
 /** After a successful save the written entries ARE the new baseline. */

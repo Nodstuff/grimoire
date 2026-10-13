@@ -98,6 +98,40 @@ export function inferBlockType(content: string): string {
   return 'paragraph'
 }
 
+/** A block the editor doesn't show, and the visible block it follows in
+ * the doc (null: before every visible one). */
+export interface HiddenBlock extends BaselineBlock {
+  after: string | null
+}
+
+/** The baseline and entries with the hidden blocks in their places: each
+ * after the visible block it followed, or the nearest surviving one before
+ * that (first, if none). They are unchanged entries, so they are never
+ * written, only keyed around. */
+export function withHiddenBlocks(baseline: BaselineBlock[], entries: Entry[], hidden: HiddenBlock[]): [BaselineBlock[], Entry[]] {
+  const order = baseline.map((b) => b.id)
+  const live = new Set(entries.map((e) => e.id).filter((x): x is string => x != null))
+  const anchor = (a: string | null): string | null => {
+    for (let k = a == null ? -1 : order.indexOf(a); k >= 0; k--) if (live.has(order[k])) return order[k]
+    return null
+  }
+  const asEntry = (h: HiddenBlock): Entry => ({ id: h.id, content: h.content, level: 0 })
+  const plain = (h: HiddenBlock): BaselineBlock => ({ id: h.id, content: h.content, parent: h.parent, order_key: h.order_key })
+  const outEntries: Entry[] = hidden.filter((h) => anchor(h.after) == null).map(asEntry)
+  for (const e of entries) {
+    outEntries.push(e)
+    if (e.id != null) outEntries.push(...hidden.filter((h) => anchor(h.after) === e.id).map(asEntry))
+  }
+  // the baseline in doc order too (the sections before the edit)
+  const known = new Set(order)
+  const outBase: BaselineBlock[] = hidden.filter((h) => h.after == null || !known.has(h.after)).map(plain)
+  for (const b of baseline) {
+    outBase.push(b)
+    outBase.push(...hidden.filter((h) => h.after === b.id).map(plain))
+  }
+  return [outBase, outEntries]
+}
+
 /** A block's heading level from its markdown (0 = not a heading). */
 export function headingLevel(content: string): number {
   const m = /^(#{1,6}) /.exec(content)
@@ -149,7 +183,13 @@ export function computeOps(
   newId: () => string = () => crypto.randomUUID(),
   /** filled in for tests: blocks the order check (2c) re-homed */
   stats?: { orderFallback: string[] },
+  /** blocks the editor doesn't show (frontmatter, comments): they keep
+   * their place next to the visible block they followed, so a new block
+   * never lands before a doc's frontmatter or takes its key */
+  hidden: HiddenBlock[] = [],
 ): Op[] {
+  if (hidden.length) [baseline, entries] = withHiddenBlocks(baseline, entries, hidden)
+  const hiddenIds = new Set(hidden.map((h) => h.id))
   const old = new Map(baseline.map((b) => [b.id, b]))
   const ops: Op[] = []
 
@@ -207,7 +247,11 @@ export function computeOps(
         return
       }
     }
-    if (i > 0 && inferred[i - 1] === inferred[i]) p.parent = placed[i - 1].parent
+    // (the neighbour is the nearest visible one: a hidden comment's parent
+    // says nothing about where new text goes)
+    let j = i - 1
+    while (j >= 0 && placed[j].entry.id != null && hiddenIds.has(placed[j].entry.id!)) j--
+    if (j >= 0 && inferred[j] === inferred[i]) p.parent = placed[j].parent
   })
 
   // 2c. the server's tree must read in the editor's order: walk it in

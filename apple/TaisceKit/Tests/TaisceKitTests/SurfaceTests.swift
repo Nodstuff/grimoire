@@ -292,6 +292,13 @@ import Testing
         h.backspace()
         #expect(h.ids.first == "h")
         #expect(h.markdown.first == "Title")
+        // the heading's section goes with it: its children move up, nothing else
+        let ops = h.ops()
+        #expect(ops.contains(.replace(target: "h", content: "Title")))
+        let moved = ops.compactMap { op -> (BlockID, BlockID?)? in if case let .move(t, p, _) = op { (t, p) } else { nil } }
+        #expect(Set(moved.map(\.0)) == ["p1", "l", "c", "q", "p2"])
+        #expect(moved.allSatisfy { $0.1 == nil })
+        #expect(ops.count == 1 + moved.count)
     }
 
     @Test func backspaceOnASecondItemSplitsTheList() {
@@ -300,6 +307,42 @@ import Testing
         h.backspace()
         #expect(h.markdown == ["- a", "b", "- c"])
         #expect(h.ids[0] == "l")
+        let ops = h.ops()
+        #expect(ops.contains(.replace(target: "l", content: "- a")))
+        let inserts = ops.compactMap { op -> (String, String)? in if case let .insert(_, nil, key, _, content) = op { (key, content) } else { nil } }
+        #expect(inserts.map(\.1) == ["b", "- c"])
+        #expect(inserts.allSatisfy { $0.0 > "i" }, "after the list")
+        #expect(inserts[0].0 < inserts[1].0)
+        #expect(ops.count == 3)
+    }
+
+    @Test func aSplitBeforeASiblingKeysBetweenThem() {
+        var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("z", "zulu", key: "r")])
+        h.sel = NSRange(location: 2, length: 0)
+        h.returnKey()
+        let ops = h.ops()
+        #expect(ops.contains(.replace(target: "a", content: "al")))
+        let keys = ops.compactMap { op -> String? in if case let .insert(_, _, key, _, "pha") = op { key } else { nil } }
+        #expect(keys.count == 1 && keys[0] > "i" && keys[0] < "r", "strictly between: \(keys)")
+    }
+
+    @Test func hiddenBlocksStayOut() {
+        let editor = DocEditor(docID: "d", baseEpoch: 1, blocks: [
+            Self.b("fm", "---\ntags: [a]\n---", key: "i"),
+            Self.b("p", "para", key: "r"),
+            Self.b("cm", "a comment", parent: "p", key: "i", type: .comment),
+            Self.b("q", "qara", key: "v"),
+        ])
+        let (blocks, baseline) = Surface.load(editor)
+        let hidden = Surface.hidden(editor)
+        #expect(blocks.map(\.id) == ["p", "q"])
+        #expect(hidden.map(\.id) == ["fm", "cm"])
+        #expect(hidden.map(\.after) == [nil, "p"])
+        let s = Surface.document(blocks)
+        let known = Set(baseline.map(\.id))
+        #expect(DocDiff.computeOps(baseline: baseline, entries: Surface.entries(s, known: known), hidden: hidden).isEmpty, "untouched: nothing")
+        Surface.replace(s, NSRange(location: 4, length: 0), with: "!").apply(to: s)
+        #expect(DocDiff.computeOps(baseline: baseline, entries: Surface.entries(s, known: known), hidden: hidden) == [.replace(target: "p", content: "para!")])
     }
 
     @Test func backspaceInsideTextDeletesACharacter() {
@@ -414,7 +457,8 @@ import Testing
         ]
         for doc in docs {
         let length = Harness(doc).s.length
-        for text in ["x\ny\nz", "# Head\n\n- a\n- b", "plain", "\n"] {
+        for viaPaste in [false, true] {
+        for text in ["x\ny\nz", "# Head\n\n- a\n- b", "plain", "\n", "**bold** [[Doc]]"] {
             for at in 0..<length {
                 var h = Harness(doc)
                 // the block the caret is in may change (unless it's a
@@ -429,7 +473,11 @@ import Testing
                     }
                 }
                 Surface.$allowsRepair.withValue(true) {
-                    h.replace(NSRange(location: at, length: 0), with: text)
+                    if viaPaste {
+                        h.apply(Surface.paste(h.s, NSRange(location: at, length: 0), markdown: text, mint: h.mint))
+                    } else {
+                        h.replace(NSRange(location: at, length: 0), with: text)
+                    }
                 }
                 let stray = Set(h.ids).subtracting(h.minter.allowed)
                 #expect(stray.isEmpty, "\(text.debugDescription) at \(at) (\(String(h.s.string.prefix(at)).debugDescription)): \(h.markdown)")
@@ -437,6 +485,7 @@ import Testing
                     #expect(h.ids.contains(id), "\(text.debugDescription) at \(at): \(id) kept, ids \(h.ids)")
                 }
             }
+        }
         }
         }
     }
@@ -449,6 +498,40 @@ import Testing
             #expect(h.ids.first == "c" && h.ids.last == "n")
             #expect(!h.ops().contains { if case .replace = $0 { true } else { false } }, "nothing existing changes")
         }
+    }
+
+    // MARK: copy and paste as markdown
+
+    @Test func copyIsMarkdownAndPasteBringsTheBlocksBack() {
+        let a = Harness([Self.b("h", "## Plan", key: "i", type: .heading),
+                         Self.b("l", "- **bold** item\n- see [[Other Doc]]", key: "m"),
+                         Self.b("c", "```sh\necho hi\n```", key: "q", type: .code),
+                         Self.b("p", "end", key: "u")])
+        let all = NSRange(location: 0, length: a.location(of: "end") - 1)
+        let md = Surface.markdown(of: a.s, range: all)
+        #expect(md == "## Plan\n\n- **bold** item\n- see [[Other Doc]]\n\n```sh\necho hi\n```")
+        // within one line: just its inline markdown
+        #expect(Surface.markdown(of: a.s, range: NSRange(location: a.location(of: "bold"), length: 8)) == "**bold** ite")
+        // into another doc, on an empty line: the same blocks, new ids
+        var b = Harness([Self.b("x", "first", key: "i"), Self.b("e", "", key: "r")])
+        b.sel = NSRange(location: b.blocks[1].range.location, length: 0)
+        b.apply(Surface.paste(b.s, b.sel, markdown: md, mint: b.mint))
+        #expect(b.markdown == ["first", "## Plan", "- **bold** item\n- see [[Other Doc]]", "```sh\necho hi\n```"])
+        #expect(b.ids[0] == "x" && b.ids[1] == "e", "the empty line's block takes the first part")
+    }
+
+    @Test func pastingAtALineStartInsertsBlocksBeforeIt() {
+        var h = Harness([Self.b("x", "keep me", key: "i")])
+        h.apply(Surface.paste(h.s, NSRange(location: 0, length: 0), markdown: "- one\n- two", mint: h.mint))
+        #expect(h.markdown == ["- one\n- two", "keep me"])
+        #expect(h.ids.last == "x")
+    }
+
+    @Test func pastingInsideALineKeepsInlineFormatting() {
+        var h = Harness([Self.b("x", "a  b", key: "i")])
+        h.apply(Surface.paste(h.s, NSRange(location: 2, length: 0), markdown: "**bold** and [[Doc]]", mint: h.mint))
+        #expect(h.markdown == ["a **bold** and [[Doc]] b"])
+        #expect(h.ids == ["x"])
     }
 
     @Test func deletingAWholeLineAboveANonTextBlockDeletesThatBlock() {

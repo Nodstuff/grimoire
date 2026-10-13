@@ -18,10 +18,27 @@ struct DocSurfaceContent: View {
                 }
             }
             .overlay { CompletionOverlay(model: model) }
+            // a brief, non-blocking notice ("Images can't be pasted here yet")
+            .overlay(alignment: .bottom) {
+                if let notice = model.notice {
+                    Text(notice)
+                        .font(.footnote.weight(.medium))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .glassEffect(.regular, in: .capsule)
+                        .padding(.bottom, 16)
+                        .accessibilityIdentifier("surface.notice")
+                        .task(id: notice) {
+                            try? await Task.sleep(for: .seconds(3))
+                            if model.notice == notice { model.notice = nil }
+                        }
+                }
+            }
             .sheet(item: Binding(get: { model.sourceEditing.map(SourceRef.init) }, set: { model.sourceEditing = $0?.id })) { ref in
                 SourceEditorSheet(
                     blockID: ref.id, text: model.source(of: ref.id),
                     onSave: { model.saveSource(ref.id, $0) },
+                    onInsertAsNew: { model.insertBlocks($0) },
                     onDelete: { model.deleteBlock(ref.id) }
                 )
             }

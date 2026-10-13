@@ -79,14 +79,30 @@ struct DocShareActions: ViewModifier {
         .tint(Theme.accent)
     }
 
+    /// Before a Share link or a PDF of the doc (its … menu, the Mac menu
+    /// bar's Share Link… and Export as PDF… ⌥⌘E): the open doc's typing goes
+    /// to the outbox first.
+    static func prepare(_ action: DocAction, router: Router) async {
+        guard action.kind == .shareLink || action.kind == .exportPDF else { return }
+        await router.prepareSnapshot(action.doc)
+    }
+
     private func handle(_ action: DocAction?) {
         guard let action, action.doc == docID else { return }
         router.docAction = nil
         // a request left over from a while ago (the doc wasn't open then) is dropped
         guard action.isFresh() else { return }
         switch action.kind {
-        case .shareLink: if model.shareLinks.isAvailable, canShare, pageLoaded { sharing = true }
-        case .exportPDF: if model.shareLinks.isAvailable { askThenExport() }
+        case .shareLink, .exportPDF:
+            // what's typed reaches the outbox before the doc is snapshotted
+            Task {
+                await Self.prepare(action, router: router)
+                if action.kind == .shareLink {
+                    if model.shareLinks.isAvailable, canShare, pageLoaded { sharing = true }
+                } else if model.shareLinks.isAvailable {
+                    askThenExport()
+                }
+            }
         case .linkComments: showingLinkComments = true
         }
     }

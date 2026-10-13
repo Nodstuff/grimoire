@@ -970,6 +970,112 @@ public enum Surface {
         b.blockType == .comment || b.blockType == .canvasScene || b.content.hasPrefix("---")
     }
 
+    // MARK: copy and paste
+
+    /// The selection as markdown (what Copy puts on the pasteboard): within
+    /// one line, its inline markdown; across lines, each block as markdown
+    /// (headings, lists, quotes, a non-text block's source), blank-line
+    /// separated, so another doc, the web or Slack gets it readable.
+    public static func markdown(of s: NSAttributedString, range: NSRange) -> String {
+        guard range.length > 0, s.length > 0 else { return "" }
+        let ls = lines(s, in: range)
+        let end = range.location + range.length
+        if ls.count == 1, let l = ls.first, !(range.location <= l.textRange.location && end >= l.textRange.location + l.textRange.length) {
+            if l.style == .raw { return (s.attribute(raw, at: l.range.location, effectiveRange: nil) as? String) ?? "" }
+            return InlineCodec.serialize(inline(s, NSIntersectionRange(range, l.textRange)))
+        }
+        var blocks: [String] = []
+        var items: [EditorListItem] = []
+        var listID: BlockID?
+        func flushList() {
+            if !items.isEmpty { blocks.append(EditorBlockContent.list(items).markdown) }
+            items = []
+            listID = nil
+        }
+        for l in ls {
+            let part = NSIntersectionRange(range, l.textRange)
+            if case let .item(p) = l.style {
+                if listID != l.id { flushList() }
+                listID = l.id
+                items.append(EditorListItem(p, inline(s, part)))
+                continue
+            }
+            flushList()
+            switch l.style {
+            case .raw:
+                if NSLocationInRange(l.range.location, range), let src = s.attribute(raw, at: l.range.location, effectiveRange: nil) as? String { blocks.append(src) }
+            case let .heading(n): blocks.append(EditorBlockContent.heading(level: n, inline(s, part)).markdown)
+            case .quote: blocks.append(EditorBlockContent.quote(inline(s, part)).markdown)
+            default:
+                if part.length > 0 || l.textRange.length == 0 { blocks.append(EditorBlockContent.paragraph(inline(s, part)).markdown) }
+            }
+        }
+        flushList()
+        return blocks.joined(separator: "\n\n")
+    }
+
+    /// Paste `markdown` over `range`. At a line's start (pasting whole
+    /// lines) it becomes blocks: lists, headings, bold, links, code, each a
+    /// new block with a minted id, put before the line (or in place of an
+    /// empty line). Inside a line, one line of it keeps its inline
+    /// formatting (bold, links, [[wikilinks]]); several lines go in as text.
+    public static func paste(_ s: NSAttributedString, _ range: NSRange, markdown: String,
+                             typing: [NSAttributedString.Key: Any] = [:], mint: () -> BlockID = newID) -> Edit {
+        let md = markdown.replacingOccurrences(of: "\r\n", with: "\n")
+        let parts = MarkdownSegments.split(md).map(EditorBlockContent.parse(markdown:))
+        let looksLikeBlocks = parts.count > 1 || parts.contains { if case .paragraph = $0 { false } else { true } }
+        if range.length == 0, looksLikeBlocks, let l = line(at: range.location, in: s), l.style != .raw,
+           range.location <= l.textRange.location || l.textRange.length == 0,
+           // at a block's first line only: between two items it would split the list
+           block(at: range.location, in: s)?.range.location == l.range.location {
+            let out = NSMutableAttributedString()
+            let emptyHere = l.textRange.length == 0 && l.style == .paragraph
+            for (i, c) in parts.enumerated() {
+                // an empty line pasted over: its block takes the first part
+                out.append(render(c, id: i == 0 && emptyHere ? (l.id ?? mint()) : mint()))
+            }
+            let at = NSRange(location: l.range.location, length: emptyHere ? l.range.length : 0)
+            return Edit(range: at, replacement: out, selection: NSRange(location: l.range.location + out.length - 1, length: 0))
+        }
+        if !md.contains("\n"), let inline = InlineCodec.parse(md) {
+            let plain = String(inline.characters)
+            var e = replace(s, range, with: plain, typing: typing, mint: mint)
+            let m = NSMutableAttributedString(attributedString: e.replacement)
+            let start = e.selection.location - e.range.location - (plain as NSString).length
+            var at = start
+            for r in InlineCodec.runs(inline) {
+                let len = (r.text as NSString).length
+                let rr = NSRange(location: at, length: len)
+                if rr.location >= 0, rr.location + rr.length <= m.length {
+                    for k in [marks, link, wiki] { m.removeAttribute(k, range: rr) }
+                    if !r.marks.isEmpty { m.addAttribute(marks, value: r.marks.rawValue, range: rr) }
+                    if let lk = r.link { m.addAttribute(link, value: lk, range: rr) }
+                    if let w = r.wiki { m.addAttribute(wiki, value: w, range: rr) }
+                }
+                at += len
+            }
+            e.replacement = m
+            return e
+        }
+        return replace(s, range, with: md, typing: typing, mint: mint)
+    }
+
+    /// The blocks the surface leaves out (frontmatter, comments, canvases),
+    /// each with the visible block it follows: the diff keys new blocks
+    /// around them, so nothing lands before a doc's frontmatter.
+    public static func hidden(_ editor: DocEditor) -> [DocDiff.HiddenBlock] {
+        var out: [DocDiff.HiddenBlock] = []
+        var last: BlockID?
+        for (b, _) in editor.ordered() {
+            if isHidden(b) {
+                out.append(DocDiff.HiddenBlock(id: b.id, content: b.content, parent: b.parentID, orderKey: b.orderKey, after: last))
+            } else {
+                last = b.id
+            }
+        }
+        return out
+    }
+
     /// The surface's blocks and baseline for an editor's view of a doc.
     public static func load(_ editor: DocEditor) -> (blocks: [(id: BlockID, content: EditorBlockContent)], baseline: [DocDiff.BaselineBlock]) {
         var blocks: [(id: BlockID, content: EditorBlockContent)] = []

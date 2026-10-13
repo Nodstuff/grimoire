@@ -1,5 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DocEditor from './editor/DocEditor'
+import { splitTree } from './editor/splitTree'
 import TendPanel from './TendPanel'
 import Gardeners from './Gardeners'
 import PaletteShell from './PaletteShell'
@@ -886,23 +887,9 @@ function DocView({
         allBlocks: [] as Block[],
         removedCanvases: 0,
       }
-    const blocks: Block[] = []
-    const comments: Block[] = []
-    const allBlocks: Block[] = []
-    let removedCanvases = 0
-    const walk = (nodes: BlockNode[]) => {
-      for (const n of nodes) {
-        allBlocks.push(n.block)
-        if (n.block.block_type === 'comment') comments.push(n.block)
-        // the canvas editor is gone; old scenes stay in the store, unrendered
-        else if (n.block.block_type === 'canvas_scene') removedCanvases++
-        else if (!n.block.content.startsWith('---')) blocks.push(n.block)
-        walk(n.children)
-      }
-    }
-    walk(tree.roots)
+    const { blocks, comments, allBlocks, hidden, removedCanvases } = splitTree(tree.roots)
     return {
-      editable: { docId, epoch: tree.doc.current_epoch, blocks },
+      editable: { docId, epoch: tree.doc.current_epoch, blocks, hidden },
       comments,
       allBlocks,
       removedCanvases,

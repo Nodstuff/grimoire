@@ -96,6 +96,33 @@ extension Cache {
         return out
     }
 
+    /// Blocks of `docID` our recent ops wrote that the gate didn't apply
+    /// (parked, or refused at review), with the epoch they were proposed
+    /// on, whatever the review queue says: before the queue is known, an
+    /// editor holds these blocks (no save may quietly revert a parked edit).
+    public func unappliedBlocks(for docID: DocID, now: Date = .now) async throws -> [BlockID: Int] {
+        let rows = try await db.read { db in
+            try OutboxEntry
+                .filter(OutboxEntry.Columns.state == OutboxEntry.State.done.rawValue)
+                .filter(OutboxEntry.Columns.path == "/api/propose")
+                .filter(OutboxEntry.Columns.outcome != nil)
+                .filter(OutboxEntry.Columns.createdAt >= now.addingTimeInterval(-Cache.reviewWindow))
+                .fetchAll(db)
+        }
+        var out: [BlockID: Int] = [:]
+        for e in rows {
+            guard let body = e.body, let data = e.outcome,
+                  let req = try? JSONDecoder().decode(ProposeRequest.self, from: body), req.docID == docID,
+                  let outcome = try? JSONDecoder().decode(ProposeOutcome.self, from: data)
+            else { continue }
+            for (i, v) in outcome.verdicts.enumerated() where !v.applied && i < req.ops.count {
+                let p = ParkedOp(kind: req.ops[i].kind, baseEpoch: req.baseEpoch, opID: v.opID)
+                if let b = p.block { out[b] = min(out[b] ?? req.baseEpoch, req.baseEpoch) }
+            }
+        }
+        return out
+    }
+
     /// The newest epoch one of our proposes for `docID` landed at: a cached
     /// body older than this predates our own write.
     public func lastLandedEpoch(_ docID: DocID) async throws -> Int? {

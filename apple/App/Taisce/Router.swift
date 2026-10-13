@@ -53,6 +53,14 @@ struct DocAction: Equatable {
 @MainActor @Observable
 final class Router {
     var tab: AppTab = .today
+    /// what an open doc does before it is snapshotted (Share link, Export
+    /// as PDF): its surface writes what's typed to the outbox first
+    @ObservationIgnored var snapshotPrep: [DocID: @MainActor () async -> Void] = [:]
+
+    /// Run the open doc's preparation, if it has one.
+    @MainActor func prepareSnapshot(_ doc: DocID) async {
+        await snapshotPrep[doc]?()
+    }
     var todayPath: [Route] = []
     var libraryPath: [Route] = []
     var todosPath: [Route] = []

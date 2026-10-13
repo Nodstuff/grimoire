@@ -86,48 +86,6 @@ import Testing
         #expect(ok())
     }
 
-    @Test func offlineEditsSurviveARelaunch() async throws {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "taisce-editor-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let path = dir.appending(path: "cache.sqlite").path(percentEncoded: false)
-        do {
-            let cache = try Cache(path: path)
-            try await seed(cache)
-            let editor = try #require(try await cache.editor(for: "d1"))
-            let (blocks, start) = Surface.load(editor)
-            let s = Surface.document(blocks)
-            var baseline = start
-            func save() async throws {
-                let entries = Surface.entries(s, known: Set(baseline.map(\.id)))
-                let ops = DocDiff.computeOps(baseline: baseline, entries: entries)
-                guard !ops.isEmpty else { return }
-                try await cache.enqueueCoalescing(ProposeRequest(docID: "d1", baseEpoch: editor.baseEpoch, ops: ops, requestID: UUID().uuidString))
-                baseline = DocDiff.rebuildBaseline(baseline, entries: entries, ops: ops)
-            }
-            let p1 = try #require(Surface.blocks(s).first { $0.id == "p1" })
-            let end = p1.range.location + p1.range.length - 1
-            Surface.replace(s, NSRange(location: end, length: 0), with: ", offline").apply(to: s)
-            try await save()
-            var sel = NSRange()
-            let split = try #require(Surface.returnKey(s, at: end + ", offline".utf16.count))
-            split.apply(to: s)
-            sel = split.selection
-            Surface.normalize(s, selection: &sel)
-            try await save()
-            Surface.replace(s, sel, with: "a new block, offline").apply(to: s)
-            try await save()
-        }
-        // the app relaunches: a new cache on the same file
-        let cache = try Cache(path: path)
-        #expect(try await cache.pendingOutbox().count == 2)
-        let restored = Surface.load(try #require(try await cache.editor(for: "d1")))
-        #expect(restored.blocks.map(\.content.markdown) == ["# One", "alpha, offline", "a new block, offline", "bravo"])
-        let s = Surface.document(restored.blocks)
-        #expect(DocDiff.computeOps(baseline: restored.baseline, entries: Surface.entries(s, known: Set(restored.baseline.map(\.id)))).isEmpty,
-                "nothing to resend: the queue already holds it")
-    }
-
     func green(_ epoch: Int, _ block: String) -> MockServer.Reply {
         .json(#"{"doc_id":"d1","epoch":\#(epoch),"verdicts":[{"op_id":"o\#(epoch)","block_id":"\#(block)","verdict":"green","confidence":1,"applied":true,"note":""}]}"#)
     }

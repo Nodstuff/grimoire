@@ -117,6 +117,23 @@ extension Cache {
         return out
     }
 
+    /// Rewrite the ops of a propose still waiting to be sent (never tried),
+    /// in place: same row, same base, same request id. False when it has
+    /// gone (sent, in flight, failed) or never existed. A block in conflict
+    /// keeps ONE pending flagged write this way, however often it's saved.
+    public func rewriteUnsentPropose(key: String, ops: [BlockOp]) async throws -> Bool {
+        try await db.write { db in
+            guard var e = try OutboxEntry.filter(OutboxEntry.Columns.idempotencyKey == key).fetchOne(db),
+                  e.state == .pending, e.attempts == 0, e.path == "/api/propose", let body = e.body,
+                  var req = try? JSONDecoder().decode(ProposeRequest.self, from: body)
+            else { return false }
+            req.ops = ops.map { ProposeRequest.Op(kind: $0, sourceRefs: []) }
+            e.body = try JSONEncoder().encode(req)
+            try e.update(db)
+            return true
+        }
+    }
+
     /// Queue a text save: when the newest queued write is a never-sent
     /// replace of the same block, rewrite it instead of adding another
     /// (typing in one block makes one write, not one per pause). Anything

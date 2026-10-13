@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 import TaisceKit
 
 /// One open doc: ONE always-live text surface (`SurfaceTextView`), its
@@ -60,6 +61,17 @@ final class SurfaceModel: NSObject {
     @ObservationIgnored private var openOps: Set<String>?
     /// blocks whose shown text is our parked edit (`ParkedEdits`)
     @ObservationIgnored private var parkedBlocks: Set<BlockID> = []
+    /// parked blocks the user settled with Keep mine: shown and saved as theirs to decide no more
+    @ObservationIgnored private var released: Set<BlockID> = []
+    /// For each block in conflict, its flagged write: the outbox row's key
+    /// ("" when it went out before this session) and what it said. One
+    /// disputed block has at most one pending flagged write: later saves
+    /// rewrite it in place; once it has gone out, more typing in the block
+    /// waits for a final flush (leaving the doc, backgrounding, demotion),
+    /// and the same text is never proposed twice.
+    @ObservationIgnored private var conflictWrites: [BlockID: (key: String, text: String)] = [:]
+    /// the blocks the surface leaves out (frontmatter, comments), in place
+    @ObservationIgnored private var hidden: [DocDiff.HiddenBlock] = []
     @ObservationIgnored private var lastReviewFetch = Date.distantPast
     @ObservationIgnored var pendingMarks: InlineMarks?
     @ObservationIgnored var reloading = false
@@ -70,6 +82,11 @@ final class SurfaceModel: NSObject {
     @ObservationIgnored lazy var formattingBar: FormattingBar = FormattingBar(model: self)
     @ObservationIgnored private var headerHost: UIHostingController<AnyView>?
     @ObservationIgnored private var footerHost: UIHostingController<AnyView>?
+    /// the surface's own tap (links, checkboxes); the text view's taps
+    /// stand back where it lands on one (`SurfaceTextView`)
+    @ObservationIgnored weak var ownTap: UITapGestureRecognizer?
+    /// a touch on a link or a checkbox: no editing begins for it until then
+    @ObservationIgnored var focusHeldUntil: Date?
     /// what the last `shouldChangeTextIn` let UIKit insert (for shortcuts)
     @ObservationIgnored var lastTyped: String?
     /// where UIKit is about to insert typed text (scopes the normalise after it)
@@ -105,25 +122,41 @@ final class SurfaceModel: NSObject {
     static func open(_ docID: DocID, app: AppModel, editable: Bool) async -> SurfaceModel? {
         guard let cache = app.cache else { return nil }
         if (try? await cache.doc(docID))?.bodyEpoch == nil { try? await app.sync?.refresh(docID) }
+        // straight from the cache: the review queue comes with the first
+        // poll, in the background (parked edits show when it arrives)
+        let model = await open(docID, cache: cache, api: app.api, app: app, editable: editable, reviewQueue: nil)
+        model?.start()
+        return model
+    }
+
+    /// The surface over the cached body (plus everything queued), with the
+    /// conflicts the outbox remembers and, given the server's review queue,
+    /// our parked edits shown. Nil when the body was never fetched.
+    static func open(_ docID: DocID, cache: Cache, api: APIClient?, app: AppModel?, editable: Bool,
+                     reviewQueue: Set<String>?, saveDelay: Duration = .milliseconds(800)) async -> SurfaceModel? {
         guard var editor = try? await cache.editor(for: docID) else { return nil }
         var conflicts: [BlockID: SurfaceConflict] = [:]
         for (b, base) in (try? await cache.conflictedBlocks(docID)) ?? [:] { conflicts[b] = SurfaceConflict(base: base) }
         // our parked edits show from the start (when the server's review
-        // queue can be fetched now; otherwise the first poll that gets it)
-        var open: Set<String>?
+        // queue is known now; otherwise the first poll that gets it)
         var parked: Set<BlockID> = []
-        if editable, let api = app.api, app.isOnline, let fetched = try? await api.openReviewOps(docID) {
-            open = fetched
-            if let ops = try? await cache.parkedOps(for: docID, openOps: fetched) {
-                parked = ParkedEdits.apply(ops, on: &editor, conflicts: &conflicts, parkedBefore: [])
-            }
+        if editable, let queue = reviewQueue, let ops = try? await cache.parkedOps(for: docID, openOps: queue) {
+            parked = ParkedEdits.apply(ops, on: &editor, conflicts: &conflicts, parkedBefore: [])
+        } else if editable, let held = try? await cache.unappliedBlocks(for: docID) {
+            // the queue isn't known yet: blocks our unapplied ops wrote are
+            // held (in conflict on their epoch), so no save quietly reverts
+            // a parked edit; the queue, when it comes, settles them
+            for (b, base) in held where conflicts[b] == nil { conflicts[b] = SurfaceConflict(base: base) }
+            parked = Set(held.keys)
         }
-        let model = SurfaceModel(docID: docID, editor: editor, cache: cache, api: app.api, app: app, editable: editable)
+        let model = SurfaceModel(docID: docID, editor: editor, cache: cache, api: api, app: app, editable: editable, saveDelay: saveDelay)
+        // these conflicts' flagged writes went out before: nothing re-sent
+        // until there's something new and the doc is left
+        for b in conflicts.keys { model.conflictWrites[b] = ("", "") }
         model.conflicts = conflicts
-        model.openOps = open
+        model.openOps = reviewQueue
         model.parkedBlocks = parked
-        if open != nil { model.lastReviewFetch = Date() }
-        model.start()
+        if reviewQueue != nil { model.lastReviewFetch = Date() }
         return model
     }
 
@@ -156,6 +189,7 @@ final class SurfaceModel: NSObject {
         tap.delegate = self
         tap.cancelsTouchesInView = false
         tv.addGestureRecognizer(tap)
+        ownTap = tap
     }
 
     /// Blocks as the surface shows them: the editor's visible blocks; a
@@ -177,6 +211,7 @@ final class SurfaceModel: NSObject {
     private func load(_ editor: DocEditor) {
         let (blocks, base) = surfaceBlocks(editor)
         baseline = base
+        hidden = Surface.hidden(editor)
         baseEpoch = editor.baseEpoch
         reloading = true
         let doc = Surface.document(blocks)
@@ -187,29 +222,42 @@ final class SurfaceModel: NSObject {
         forgetUndo()
     }
 
+    /// Watch the cached body and poll the outbox and review queue. Safe
+    /// to call again (back on screen after a pushed doc, the app active
+    /// again): the old watchers go, the doc catches up at once, then
+    /// they resume. Polling backs off (3 s → 30 s) while nothing changes.
     func start() {
+        observeTask?.cancel()
+        pollTask?.cancel()
         observeTask = Task { [weak self, cache, docID] in
             guard let cache else { return }
             do {
-                var first = true
+                // the first value is the body as it is now: what changed
+                // while we weren't watching merges in straight away
                 for try await _ in cache.observeBlocks(of: docID) {
-                    if first { first = false; continue }
+                    guard !Task.isCancelled else { return }
                     await self?.remoteChanged()
                 }
             } catch {}
         }
         pollTask = Task { [weak self] in
+            var wait: Duration = .seconds(3)
             while !Task.isCancelled {
                 guard let self else { return }
-                await self.poll()
-                try? await Task.sleep(for: .seconds(3))
+                let changed = await self.poll()
+                wait = changed ? .seconds(3) : min(wait * 2, .seconds(30))
+                try? await Task.sleep(for: wait)
             }
         }
     }
 
+    var isWatching: Bool { observeTask != nil && !(observeTask?.isCancelled ?? true) }
+
     func stop() {
         observeTask?.cancel()
         pollTask?.cancel()
+        observeTask = nil
+        pollTask = nil
         saver.cancelAll()
     }
 
@@ -238,6 +286,7 @@ final class SurfaceModel: NSObject {
             footerHost = nil
             textView.footer = nil
         }
+        textView.chromeDirty = true
         textView.setNeedsLayout()
     }
 
@@ -266,8 +315,11 @@ final class SurfaceModel: NSObject {
 
     /// A viewer now (ADR 0004) or an editor again: the same surface,
     /// editable or not. Callers flush first.
-    func setEditable(_ on: Bool) {
+    func setEditable(_ on: Bool) async {
         guard on != editable else { return }
+        // made a viewer: what's typed goes to the outbox first (the server
+        // says no and the chip shows it; nothing typed is dropped)
+        if !on { await flush(final: true) }
         if !on {
             textView.resignFirstResponder()
             completion = nil
@@ -554,6 +606,7 @@ final class SurfaceModel: NSObject {
     /// The text changed: save after a pause.
     func changed() {
         // the children list follows the text's new height
+        textView.footerPlacementDirty = true
         textView.setNeedsLayout()
         guard editable, !quiet else { return }
         unsaved = 1
@@ -615,6 +668,7 @@ final class SurfaceModel: NSObject {
         textView.typingAttributes = a
         let m = InlineMarks(rawValue: (a[Surface.marks] as? Int) ?? 0)
         if m != activeMarks { activeMarks = m }
+        textView.accessibilityHint = reviewHint(for: (a[Surface.block] as? String))
         formattingBar.update(for: currentBlock?.content ?? .paragraph(AttributedString()), marks: m)
     }
 
@@ -659,20 +713,44 @@ final class SurfaceModel: NSObject {
 
     /// Paste: markdown into an empty line becomes blocks; anything else
     /// is plain text in the line's look (lines become paragraphs).
+    /// a short note at the bottom of the doc, gone after a few seconds
+    var notice: String?
+
+    /// Paste: markdown becomes blocks at a line's start and keeps its
+    /// inline formatting inside a line (`Surface.paste`); rich text from
+    /// another app (Safari) comes as markdown with its links; an image
+    /// says it can't be pasted here (yet).
     func handlePaste() -> Bool {
-        guard editable, let text = UIPasteboard.general.string else { return false }
+        guard editable else { return false }
+        let pb = UIPasteboard.general
         if let e = pasteCutBlocks() { return perform(e) }
-        let s = textView.textStorage
-        let sel = textView.selectedRange
-        if sel.length == 0, let b = currentBlock, case .paragraph = b.content, b.content.isEmpty,
-           text.contains("\n") || text.hasPrefix("#") || text.hasPrefix("- ") || text.hasPrefix("> ") || text.hasPrefix("```") {
-            let parts = MarkdownSegments.split(text).map(EditorBlockContent.parse(markdown:))
-            guard !parts.isEmpty else { return true }
-            let out = NSMutableAttributedString()
-            for (i, c) in parts.enumerated() { out.append(Surface.render(c, id: i == 0 ? b.id : Surface.newID())) }
-            return perform(Surface.Edit(range: b.range, replacement: out, selection: NSRange(location: b.range.location + out.length - 1, length: 0)))
+        var text = pb.string
+        if text == nil || !pb.contains(pasteboardTypes: [Self.markdownType]),
+           let rich = RichPaste.markdown(from: pb), !rich.isEmpty, rich != text {
+            text = rich
         }
-        return perform(Surface.replace(s, sel, with: text, typing: textView.typingAttributes))
+        guard let text else {
+            if pb.hasImages { notice = "Images can't be pasted into a doc here yet." }
+            return true
+        }
+        let sel = textView.selectedRange
+        let s = textView.textStorage
+        if sel.length > 0 {
+            // what's selected goes first, then the paste lands at its start
+            perform(Surface.replace(s, Surface.expandDeletion(sel, in: s), with: "", typing: textView.typingAttributes))
+        }
+        return perform(Surface.paste(textView.textStorage, textView.selectedRange, markdown: text, typing: textView.typingAttributes))
+    }
+
+    static let markdownType = "net.daringfireball.markdown"
+
+    /// The selection on the pasteboard as markdown (plain text and the
+    /// markdown type): structure, bold and links survive into another
+    /// doc, and the web or Slack get readable markdown.
+    func copyMarkdown(_ r: NSRange) -> String {
+        let md = Surface.markdown(of: textView.textStorage, range: r)
+        UIPasteboard.general.items = [[UTType.plainText.identifier: md, UTType.utf8PlainText.identifier: md, Self.markdownType: md]]
+        return md
     }
 
     /// The selection as markdown-ish plain text: non-text blocks as their
@@ -692,7 +770,7 @@ final class SurfaceModel: NSObject {
     func handleCopy() -> Bool {
         let r = textView.selectedRange
         guard r.length > 0 else { return false }
-        UIPasteboard.general.string = plainText(r)
+        _ = copyMarkdown(r)
         return true
     }
 
@@ -705,8 +783,7 @@ final class SurfaceModel: NSObject {
         let s = textView.textStorage
         let r = Surface.expandDeletion(textView.selectedRange, in: s)
         guard r.length > 0 else { return false }
-        let text = plainText(textView.selectedRange)
-        UIPasteboard.general.string = text
+        let text = copyMarkdown(textView.selectedRange)
         let ns = s.mutableString
         let startsLine = r.location == 0 || ns.character(at: r.location - 1) == 10
         let endsLine = ns.character(at: r.location + r.length - 1) == 10
@@ -841,10 +918,29 @@ final class SurfaceModel: NSObject {
     }
 
     /// The sheet saved: the block takes the new markdown (text, if it now is text).
-    func saveSource(_ id: BlockID, _ markdown: String) {
-        guard editable else { return }
+    /// False when the block is gone (a refresh removed it meanwhile).
+    @discardableResult
+    func saveSource(_ id: BlockID, _ markdown: String) -> Bool {
+        guard editable else { return false }
         let content = EditorBlockContent.parse(markdown: markdown)
-        perform(Surface.replaceBlock(textView.textStorage, id: id, with: content, selection: textView.selectedRange))
+        guard let e = Surface.replaceBlock(textView.textStorage, id: id, with: content, selection: textView.selectedRange) else { return false }
+        return perform(e)
+    }
+
+    /// Markdown put in as new blocks at the caret's line (a block's source
+    /// whose block was removed meanwhile, kept by choice).
+    func insertBlocks(_ markdown: String) {
+        guard editable else { return }
+        let s = textView.textStorage
+        let at = Surface.line(at: min(textView.selectedRange.location, max(0, s.length - 1)), in: s)?.range.location ?? 0
+        perform(Surface.paste(s, NSRange(location: at, length: 0), markdown: markdown.contains("\n\n") || markdown.hasPrefix("```") ? markdown : markdown + "\n\n"))
+    }
+
+    /// Tick a box inside a non-text block (a callout, a quote, a complex
+    /// list): its markdown, rewritten; no sheet, no keyboard.
+    func toggleRawCheckbox(_ id: BlockID, index: Int, checked: Bool) {
+        guard editable, let toggled = Checkbox.toggled(source(of: id), index: index, checked: checked) else { return }
+        saveSource(id, toggled)
     }
 
     func deleteBlock(_ id: BlockID) {
@@ -951,7 +1047,7 @@ final class SurfaceModel: NSObject {
     /// The debounce ran out (or a flush): diff the surface against the
     /// baseline and queue the ops. Ops on a block in conflict go in their
     /// own propose on its older epoch, flagged.
-    func save() {
+    func save(final: Bool = false) {
         guard editable else { unsaved = 0; return }
         // an input method's composition isn't text yet: save once it commits
         if textView.markedTextRange != nil {
@@ -960,21 +1056,63 @@ final class SurfaceModel: NSObject {
         }
         unsaved = 0
         let entries = Surface.entries(textView.textStorage, known: Set(baseline.map(\.id)))
-        let ops = DocDiff.computeOps(baseline: baseline, entries: entries)
+        let ops = DocDiff.computeOps(baseline: baseline, entries: entries, hidden: hidden)
         guard !ops.isEmpty else { return }
         var normal: [BlockOp] = []
-        var stale: [Int: [BlockOp]] = [:]
+        var disputed: [BlockID: [BlockOp]] = [:]
         for op in ops {
-            if let t = op.target, let c = conflicts[t] { stale[c.base, default: []].append(op) } else { normal.append(op) }
+            if let t = op.target, conflicts[t] != nil { disputed[t, default: []].append(op) } else { normal.append(op) }
         }
-        for (base, o) in stale.sorted(by: { $0.key < $1.key }) {
-            enqueue(ProposeRequest(docID: docID, baseEpoch: base, ops: o, requestID: Surface.newID()), coalescing: false, conflict: true)
+        var held: Set<BlockID> = []
+        for (t, o) in disputed.sorted(by: { $0.key < $1.key }) {
+            guard let base = conflicts[t]?.base else { continue }
+            let text = String(describing: o)
+            if let w = conflictWrites[t] {
+                // the same text again (a refresh moved the baseline): nothing to send
+                if w.text == text { continue }
+                if !w.key.isEmpty {
+                    // still waiting to go: rewrite it; gone already: wait (or, final, send anew)
+                    writeConflict(t, ops: o, base: base, text: text, rewriting: w.key, final: final)
+                    continue
+                }
+                if !final {
+                    held.insert(t)
+                    continue
+                }
+            }
+            writeConflict(t, ops: o, base: base, text: text, rewriting: nil, final: final)
         }
         if !normal.isEmpty {
             let single: Bool = if normal.count == 1, case .replace = normal[0] { true } else { false }
             enqueue(ProposeRequest(docID: docID, baseEpoch: baseEpoch, ops: normal, requestID: Surface.newID()), coalescing: single)
         }
-        baseline = DocDiff.rebuildBaseline(baseline, entries: entries, ops: ops)
+        // a held block stays as it was in the baseline, so it still differs
+        let before = Dictionary(baseline.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        baseline = DocDiff.rebuildBaseline(baseline, entries: entries, ops: ops.filter { $0.target.map { !held.contains($0) } ?? true })
+        for t in held { if let k = baseline.firstIndex(where: { $0.id == t }), let old = before[t] { baseline[k] = old } }
+    }
+
+    /// One disputed block's flagged write, on its conflict's epoch: the
+    /// pending row rewritten in place if it's still waiting; if it has gone
+    /// out, a new row only on a final flush (otherwise the text waits).
+    private func writeConflict(_ t: BlockID, ops: [BlockOp], base: Int, text: String, rewriting: String?, final: Bool) {
+        let previous = conflictWrites[t]
+        let req = ProposeRequest(docID: docID, baseEpoch: base, ops: ops, requestID: Surface.newID())
+        conflictWrites[t] = (rewriting ?? req.requestID ?? "", text)
+        let baselineBefore = baseline.first { $0.id == t }
+        enqueue(req, coalescing: false, conflict: true) { [weak self] in
+            guard let self, let cache = self.cache, let key = rewriting else { return false }
+            if (try? await cache.rewriteUnsentPropose(key: key, ops: ops)) == true { return true }
+            if final {
+                // gone out: this one is new
+                self.conflictWrites[t] = (req.requestID ?? "", text)
+                return false
+            }
+            // gone out meanwhile: wait for the final flush, still dirty
+            self.conflictWrites[t] = previous.map { ("", $0.text) }
+            if let b = baselineBefore, let k = self.baseline.firstIndex(where: { $0.id == t }) { self.baseline[k] = b }
+            return true
+        }
     }
 
     /// How a propose is written to the outbox (tests swap it to fail).
@@ -993,12 +1131,18 @@ final class SurfaceModel: NSObject {
 
     /// Writes reach the outbox in the order they were made; sending them
     /// is a separate, unawaited step.
-    private func enqueue(_ req: ProposeRequest, coalescing: Bool, conflict: Bool = false) {
+    private func enqueue(_ req: ProposeRequest, coalescing: Bool, conflict: Bool = false,
+                         handled: (@MainActor () async -> Bool)? = nil) {
         let prev = queue
         unpersisted.append(req)
         queue = Task { [weak self] in
             await prev?.value
             guard let self else { return }
+            // already written another way (a rewrite in place) or held
+            if let handled, await handled() {
+                self.unpersisted.removeAll { $0.requestID == req.requestID }
+                return
+            }
             var attempt = 0
             while true {
                 do {
@@ -1031,19 +1175,28 @@ final class SurfaceModel: NSObject {
 
     /// Everything typed, written to the outbox before this returns (never
     /// waits on the network): leaving the doc, backgrounding, a demotion.
-    func flush() async {
+    func flush(final: Bool = false) async {
         if textView.markedTextRange != nil { textView.unmarkText() }
         let retry = abandoned
         abandoned = []
         persistFailures = 0
         for r in retry { enqueue(r, coalescing: false) }
         await saver.flush()
-        save()
+        save(final: final)
         await queue?.value
         unsaved = 0
     }
 
     // MARK: remote changes
+
+    // MARK: hooks for tests (the same paths the app takes)
+
+    /// The cached body changed (what the cache observer does).
+    func refreshFromCache() async { await remoteChanged() }
+    /// The review queue as if just fetched from the server.
+    func setReviewQueue(_ ops: Set<String>) { openOps = ops }
+    /// Every queued outbox write has landed in the outbox.
+    func settle() async { await queue?.value }
 
     /// The cached body was rewritten (sync): merge it in.
     private func remoteChanged() async {
@@ -1058,20 +1211,28 @@ final class SurfaceModel: NSObject {
         // yet, a failed fetch with nothing known) overlays nothing
         if let open = openOps, let parked = try? await cache.parkedOps(for: docID, openOps: open) {
             var c = conflicts
-            parkedBlocks = ParkedEdits.apply(parked, on: &fresh, conflicts: &c, parkedBefore: parkedBlocks)
+            parkedBlocks = ParkedEdits.apply(parked, on: &fresh, conflicts: &c, parkedBefore: parkedBlocks, released: released)
+            // a decision on a released block: nothing to hold back any more
+            released = released.filter { b in parked.contains { $0.block == b } }
             if c != conflicts { conflicts = c }
+        }
+        // what the server itself has for blocks in conflict (its body, no
+        // overlay of our queued writes): only that ends a conflict
+        var own: [BlockID: String] = [:]
+        if !conflicts.isEmpty, let records = try? await cache.blocks(of: docID) {
+            for r in records where conflicts[r.block.id] != nil { own[r.block.id] = Surface.baselineContent(r.block) }
         }
         var seen: Set<String> = []
         for r in before + abandoned + unpersisted where seen.insert(r.requestID ?? "").inserted {
             fresh.overlay(r.ops.map(\.kind))
         }
-        applyRemote(fresh)
+        applyRemote(fresh, serverText: own)
     }
 
     /// Take a server view of the doc: untouched blocks take theirs, edited
     /// ones keep ours (in conflict when both changed), the caret and the
     /// scroll position stay.
-    func applyRemote(_ fresh: DocEditor) {
+    func applyRemote(_ fresh: DocEditor, serverText: [BlockID: String]? = nil) {
         guard textView.markedTextRange == nil else {
             // never under an open composition: after it
             pendingRemote = fresh
@@ -1084,8 +1245,11 @@ final class SurfaceModel: NSObject {
             : fresh.ordered().map(\.block).filter { $0.blockType != .comment && !$0.content.hasPrefix("---") }
         for b in server { blockTypes[b.id] = b.blockType }
         let r = SurfaceMerge.merge(local: current.map { ($0.id, $0.content) }, baseline: baseline, conflicts: conflicts,
-                                   oldEpoch: baseEpoch, server: server, parked: parkedBlocks)
+                                   oldEpoch: baseEpoch, server: server, parked: parkedBlocks, serverText: serverText)
         baseline = r.baseline
+        hidden = Surface.hidden(fresh)
+        // a conflict that ended takes its flagged-write record with it
+        for b in conflictWrites.keys where r.conflicts[b] == nil { conflictWrites[b] = nil }
         if r.conflicts != conflicts { conflicts = r.conflicts }
         baseEpoch = fresh.baseEpoch
         guard r.changed else { return }
@@ -1151,22 +1315,64 @@ final class SurfaceModel: NSObject {
 
     // MARK: status
 
-    func poll() async {
-        guard let cache else { return }
-        let tintsBefore = (reviews, failedBlocks)
+    /// The outbox state, refusals and review marks; the review queue from
+    /// the server (at once the first time, then every 15 s, each fetch
+    /// bounded to 10 s). True when anything changed.
+    @discardableResult
+    func poll() async -> Bool {
+        guard let cache else { return false }
+        let before = (reviews, failedBlocks, outbox, openOps)
         if let s = try? await cache.outboxState(for: docID), s != outbox { outbox = s }
         if let f = try? await cache.failedBlocks(docID), f != failedBlocks { failedBlocks = f }
-        if let api, app?.isOnline == true, Date().timeIntervalSince(lastReviewFetch) > 15 {
+        if let api, app?.isOnline == true, openOps == nil || Date().timeIntervalSince(lastReviewFetch) > 15 {
             lastReviewFetch = Date()
-            // a failed fetch keeps the last set the server gave us
-            if let fetched = try? await api.openReviewOps(docID), fetched != openOps {
+            // a failed or slow fetch keeps the last set the server gave us
+            if let fetched = await Self.fetchReviewQueue(api, docID), fetched != openOps {
                 openOps = fetched
                 // a decision (or a new park) shows now, not at the next sync
                 await remoteChanged()
             }
         }
         if let r = try? await cache.reviews(for: docID, openOps: openOps), r != reviews { reviews = r }
-        if tintsBefore.0 != reviews || tintsBefore.1 != failedBlocks { restyle() }
+        if before.0 != reviews || before.1 != failedBlocks { restyle() }
+        return before.0 != reviews || before.1 != failedBlocks || before.2 != outbox || before.3 != openOps
+    }
+
+    /// The doc's open review queue, or nil after 10 s (a captive network
+    /// never holds the editor up).
+    static func fetchReviewQueue(_ api: APIClient, _ docID: DocID, timeout: Duration = .seconds(10)) async -> Set<String>? {
+        await withTaskGroup(of: Set<String>?.self) { group in
+            group.addTask { try? await api.openReviewOps(docID) }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
+
+    /// What VoiceOver says about the caret's block beyond its text: the
+    /// colour of the tint, in words.
+    func reviewHint(for id: BlockID?) -> String? {
+        guard let id else { return nil }
+        if failedBlocks.contains(id) { return "This block couldn't be saved." }
+        if let c = conflicts[id] { return c.theirs != nil ? "Changed on another device while you edited it." : "Your edit here waits for review." }
+        switch reviews[id]?.verdict {
+        case .red?: return "Your edit here is waiting for review."
+        case .yellow?: return "Your edit here was flagged for review."
+        default: return nil
+        }
+    }
+
+    /// The doc's title and what the header and children list offer, for
+    /// VoiceOver on the text view (they are drawn inside it).
+    func setAccessibilityChrome(title: String, actions: [(String, () -> Void)]) {
+        textView.accessibilityLabel = title.isEmpty ? "Doc" : title
+        textView.accessibilityCustomActions = actions.map { name, run in
+            UIAccessibilityCustomAction(name: name) { _ in run(); return true }
+        }
     }
 
     var chip: EditorChip {
@@ -1183,6 +1389,7 @@ final class SurfaceModel: NSObject {
         save()
         await queue?.value
         conflicts[id] = nil
+        conflictWrites[id] = nil
         perform(Surface.replaceBlock(textView.textStorage, id: id, with: EditorBlockContent.parse(markdown: theirs), selection: textView.selectedRange))
         if let k = baseline.firstIndex(where: { $0.id == id }) { baseline[k].content = EditorBlockContent.parse(markdown: theirs).markdown }
         saver.cancelAll()
@@ -1196,7 +1403,13 @@ final class SurfaceModel: NSObject {
     /// Ours wins, by choice: proposed on the current epoch.
     func keepMine(_ id: BlockID) async {
         guard let c = conflicts[id] else { return }
+        await queue?.value
         conflicts[id] = nil
+        conflictWrites[id] = nil
+        // a parked edit settled here stays settled; a pending flagged write
+        // for the block goes (the plain write below supersedes it)
+        if parkedBlocks.contains(id) { released.insert(id) }
+        try? await cache?.discardPending(docID, block: id)
         try? await cache?.clearConflict(docID, block: id)
         if let k = baseline.firstIndex(where: { $0.id == id }) { baseline[k].content = c.theirs ?? "\u{0}" }
         save()

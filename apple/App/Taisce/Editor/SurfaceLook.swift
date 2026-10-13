@@ -20,7 +20,7 @@ enum SurfaceLook {
     /// The display keys a restyle owns (cleared and set again).
     static let displayKeys: [NSAttributedString.Key] = [
         .font, .foregroundColor, .paragraphStyle, .backgroundColor, .strikethroughStyle,
-        .underlineStyle, .underlineColor, .link, .attachment, .kern,
+        .underlineStyle, .underlineColor, .link, .attachment, .kern, .accessibilityTextHeadingLevel,
     ]
 
     static func font(_ style: UIFont.TextStyle, serif: Bool = false, bold: Bool = false, traits: UITraitCollection?) -> UIFont {
@@ -157,8 +157,11 @@ enum SurfaceLook {
             }
             if l.style == .raw, l.contentRange.length == 1, let src = s.attribute(Surface.raw, at: l.range.location, effectiveRange: nil) as? String,
                let id = l.id, let att = ctx.attachment(id, src) {
+                att.accessibilityLabel = AttachmentContent.label(src)
                 s.addAttribute(.attachment, value: att, range: NSRange(location: l.range.location, length: 1))
             }
+            // VoiceOver's headings rotor
+            if case let .heading(n) = l.style { s.addAttribute(.accessibilityTextHeadingLevel, value: n, range: l.range) }
         }
     }
 
