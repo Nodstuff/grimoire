@@ -118,30 +118,82 @@ public enum Surface {
         }
     }
 
-    public static func lines(_ s: NSAttributedString) -> [Line] {
+    /// The line starting at `start`.
+    static func line(startingAt start: Int, in s: NSAttributedString) -> Line {
         let ns = text(s)
-        var out: [Line] = []
-        var start = 0
         let n = ns.length
+        let nl = ns.range(of: "\n", options: .literal, range: NSRange(location: start, length: n - start))
+        let terminated = nl.location != NSNotFound
+        let end = terminated ? nl.location + 1 : n
+        let r = NSRange(location: start, length: end - start)
+        let probe = terminated ? nl.location : start
+        let id = r.length > 0 ? s.attribute(block, at: probe, effectiveRange: nil) as? String : nil
+        var style = r.length > 0 ? (s.attribute(line, at: probe, effectiveRange: nil) as? String).map(LineStyle.init(encoded:)) ?? .paragraph : .paragraph
+        if !terminated, r.length == 0 { style = .paragraph }
+        var markerLength = 0
+        if style.isItem {
+            var i = start
+            while i < end - (terminated ? 1 : 0), s.attribute(marker, at: i, effectiveRange: nil) != nil { i += 1 }
+            markerLength = i - start
+        }
+        return Line(range: r, terminated: terminated, id: id, style: style, markerLength: markerLength)
+    }
+
+    /// Every line, or only those touching `range` (no whole-doc scan).
+    public static func lines(_ s: NSAttributedString, in range: NSRange? = nil) -> [Line] {
+        let ns = text(s)
+        let n = ns.length
+        guard n > 0 else { return [] }
+        var start = 0
+        var stop = n
+        if let range {
+            start = lineStart(ns, at: min(max(0, range.location), n - 1))
+            stop = min(n, max(range.location + range.length, range.location + 1))
+        }
+        var out: [Line] = []
         while start < n {
-            let nl = ns.range(of: "\n", options: .literal, range: NSRange(location: start, length: n - start))
-            let terminated = nl.location != NSNotFound
-            let end = terminated ? nl.location + 1 : n
-            let r = NSRange(location: start, length: end - start)
-            let probe = terminated ? nl.location : start
-            let id = s.attribute(block, at: probe, effectiveRange: nil) as? String
-            var style = (s.attribute(line, at: probe, effectiveRange: nil) as? String).map(LineStyle.init(encoded:)) ?? .paragraph
-            if !terminated, r.length == 0 { style = .paragraph }
-            var markerLength = 0
-            if style.isItem {
-                var i = start
-                while i < end - (terminated ? 1 : 0), s.attribute(marker, at: i, effectiveRange: nil) != nil { i += 1 }
-                markerLength = i - start
-            }
-            out.append(Line(range: r, terminated: terminated, id: id, style: style, markerLength: markerLength))
-            start = end
+            let l = line(startingAt: start, in: s)
+            out.append(l)
+            start = l.end
+            if start >= stop { break }
         }
         return out
+    }
+
+    /// Where the line holding `location` starts.
+    static func lineStart(_ ns: NSString, at location: Int) -> Int {
+        guard location > 0 else { return 0 }
+        let r = ns.range(of: "\n", options: [.literal, .backwards], range: NSRange(location: 0, length: min(location, ns.length)))
+        return r.location == NSNotFound ? 0 : r.location + 1
+    }
+
+    /// The line holding `location`, found locally.
+    public static func line(at location: Int, in s: NSAttributedString) -> Line? {
+        let ns = text(s)
+        guard ns.length > 0 else { return nil }
+        return line(startingAt: lineStart(ns, at: min(max(0, location), ns.length - 1)), in: s)
+    }
+
+    /// The block holding `location`, found locally (its own lines only).
+    public static func block(at location: Int, in s: NSAttributedString) -> SurfaceBlock? {
+        guard let l = line(at: location, in: s) else { return nil }
+        var ls = [l]
+        if l.style.isItem, let id = l.id {
+            var cur = l
+            while cur.range.location > 0, let prev = line(at: cur.range.location - 1, in: s), prev.id == id, prev.style.isItem {
+                ls.insert(prev, at: 0)
+                cur = prev
+            }
+            cur = l
+            while cur.end < s.length {
+                let next = line(startingAt: cur.end, in: s)
+                guard next.id == id, next.style.isItem else { break }
+                ls.append(next)
+                cur = next
+            }
+        }
+        let range = NSRange(location: ls[0].range.location, length: ls[ls.count - 1].end - ls[0].range.location)
+        return SurfaceBlock(id: l.id ?? "", lines: 0..<ls.count, range: range, content: content(s, ls[...]))
     }
 
     /// The index of the line holding `location` (a location at a line's
@@ -164,7 +216,17 @@ public enum Surface {
         public var range: NSRange
         public var content: EditorBlockContent
 
-        public var level: Int { if case let .heading(l, _) = content { l } else { 0 } }
+        /// a heading's level; a heading kept as source (inline HTML, an
+        /// image) counts too, so its section keeps its children
+        public var level: Int { Surface.level(of: content) }
+    }
+
+    public static func level(of content: EditorBlockContent) -> Int {
+        switch content {
+        case let .heading(l, _): return l
+        case let .raw(src): return DocDiff.level(src)
+        default: return 0
+        }
     }
 
     public static func blocks(_ s: NSAttributedString, lines ls: [Line]? = nil) -> [SurfaceBlock] {
@@ -478,9 +540,7 @@ public enum Surface {
 
     /// Model attributes a typed character carries, for `typingAttributes`.
     public static func typingAttributes(_ s: NSAttributedString, at location: Int) -> [NSAttributedString.Key: Any] {
-        let ls = lines(s)
-        guard !ls.isEmpty else { return [:] }
-        let l = ls[lineIndex(ls, at: location)]
+        guard let l = line(at: location, in: s) else { return [:] }
         var a: [NSAttributedString.Key: Any] = [line: l.style.encoded]
         if let id = l.id { a[block] = id }
         if location > l.textRange.location, location - 1 < s.length {
@@ -497,42 +557,100 @@ public enum Surface {
     }
 
     /// Replace `range` with plain `text` (typed, pasted, or a deletion
-    /// across lines), keeping the block model straight: the line the range
-    /// starts in keeps its id and kind; lines the text adds are new
-    /// paragraphs (new items of the same list, in a list).
+    /// across lines), keeping the block model straight:
+    /// - the joined line keeps the id and kind of the line the range starts
+    ///   in, unless the range takes all of that line's text and ends at the
+    ///   next line's start (a whole line deleted): then the next line's;
+    /// - lines the text adds are new paragraphs (new items of the same
+    ///   list, in a list), each with a fresh id;
+    /// - a non-text block is never joined to text: an edit that would put
+    ///   text on its line stops at its line break instead, and its U+FFFC
+    ///   never takes another block's id; text typed over a selected one
+    ///   replaces it with a new paragraph;
+    /// - list markers caught in a join are deleted, never kept as text.
     public static func replace(_ s: NSAttributedString, _ range: NSRange, with text: String,
                                typing: [NSAttributedString.Key: Any] = [:], mint: () -> BlockID = newID) -> Edit {
-        let ls = lines(s)
-        guard !ls.isEmpty else {
-            let out = NSMutableAttributedString(string: text + "\n", attributes: [block: mint(), line: LineStyle.paragraph.encoded])
-            return Edit(range: NSRange(location: 0, length: s.length), replacement: out, selection: NSRange(location: (text as NSString).length, length: 0))
+        let ns = Surface.text(s)
+        let typed = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        guard ns.length > 0 else {
+            let out = NSMutableAttributedString(string: typed + "\n", attributes: [block: mint(), line: LineStyle.paragraph.encoded])
+            return Edit(range: NSRange(location: 0, length: s.length), replacement: out, selection: NSRange(location: (typed as NSString).length, length: 0))
         }
-        let first = lineIndex(ls, at: range.location)
-        var last = max(first, lineIndex(ls, at: max(range.location, range.location + range.length - 1)))
-        let end = range.location + range.length
-        if range.length > 0, end < s.length, Surface.text(s).character(at: end - 1) == newline {
+        var range = range
+        // never start inside a non-text block's line past its U+FFFC (its
+        // own line break stays): start on the next line
+        if let l = line(at: range.location, in: s), l.style == .raw, range.location > l.range.location {
+            let cut = min(l.end, range.location + range.length) - range.location
+            range = NSRange(location: range.location + max(0, cut), length: max(0, range.length - max(0, cut)))
+            if range.location >= ns.length { range = NSRange(location: ns.length, length: 0) }
+        }
+        // never end by taking the line break before a non-text block
+        // (that would join it to the text above): keep that break
+        var end = range.location + range.length
+        if range.length > 0, end < ns.length, ns.character(at: end - 1) == newline,
+           let next = line(at: end, in: s), next.style == .raw {
+            range.length -= 1
+            end -= 1
+        }
+        if range.length == 0, typed.isEmpty {
+            // nothing left to delete: a deletion at a non-text block selects it
+            if let l = line(at: range.location, in: s), l.style == .raw { return .select(NSRange(location: l.range.location, length: 1)) }
+            if range.location < ns.length, let next = line(at: range.location + 1, in: s), next.style == .raw, ns.character(at: range.location) == newline {
+                return .select(NSRange(location: next.range.location, length: 1))
+            }
+            return .select(range)
+        }
+        let ls = lines(s, in: NSRange(location: range.location, length: max(range.length, 0)))
+        var lastIdx = 0
+        for (i, l) in ls.enumerated() where l.range.location <= max(range.location, end - 1) { lastIdx = i }
+        if range.length > 0, end < ns.length, ns.character(at: end - 1) == newline {
             // the range takes a line's terminator: the next line joins this one
-            last = max(last, lineIndex(ls, at: end))
+            if lastIdx + 1 < ls.count, ls[lastIdx + 1].range.location == end { lastIdx += 1 }
+            else if let next = line(at: end, in: s), next.range.location == end {
+                return replaceJoining(s, range, typed, typing, mint, ls + [next])
+            }
         }
-        let span = NSRange(location: ls[first].range.location, length: ls[last].end - ls[first].range.location)
+        return replaceJoining(s, range, typed, typing, mint, Array(ls[0...lastIdx]))
+    }
+
+    private static func replaceJoining(_ s: NSAttributedString, _ range: NSRange, _ typed: String,
+                                       _ typing: [NSAttributedString.Key: Any], _ mint: () -> BlockID, _ ls: [Line]) -> Edit {
+        let firstLine = ls[0]
+        let lastLine = ls[ls.count - 1]
+        let end = range.location + range.length
+        let span = NSRange(location: firstLine.range.location, length: lastLine.end - firstLine.range.location)
         let sub = NSMutableAttributedString(attributedString: s.attributedSubstring(from: span))
         let local = NSRange(location: range.location - span.location, length: range.length)
         var attrs = typing
         for k in [block, line, marker, wiki, raw] { attrs[k] = nil }
-        let typed = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
         sub.replaceCharacters(in: local, with: NSAttributedString(string: typed, attributes: attrs))
-        // the joined line is the first line's, unless that was a whole
-        // non-text block (deleted as a unit): then the line after it
-        let keeper = ls[first].style == .raw && range.location == ls[first].range.location && last > first ? last : first
-        let aID = ls[keeper].id ?? mint()
-        let aStyle = ls[keeper].style
+        // whose line the joined one is
+        var keeper = firstLine
+        let wholeFirst = range.location <= firstLine.textRange.location && ls.count > 1 && end == lastLine.range.location
+        if wholeFirst || (firstLine.style == .raw && range.location <= firstLine.range.location && ls.count > 1) {
+            keeper = lastLine
+        }
+        var aID = keeper.id ?? mint()
+        var aStyle = keeper.style
+        if aStyle == .raw, keeper.range.location == firstLine.range.location, range.location <= firstLine.range.location {
+            // typed over a selected non-text block: it becomes new text
+            aID = mint()
+            aStyle = .paragraph
+        }
+        // the caret after the typed text (stray markers removed before it shift it)
+        var sel = local.location + (typed as NSString).length
         var subLines = lines(sub)
         // an unterminated tail (the range ran to the doc's end): terminate it
         if let tail = subLines.last, !tail.terminated {
             sub.append(NSAttributedString(string: "\n"))
             subLines = lines(sub)
         }
-        for (i, l) in subLines.enumerated() {
+        for (i, l) in subLines.enumerated().reversed() {
+            // a non-text block's own line keeps its own attributes
+            let c = l.contentRange
+            if c.length == 1, Surface.text(sub).character(at: c.location) == objectChar, sub.attribute(raw, at: c.location, effectiveRange: nil) != nil {
+                continue
+            }
             var id = aID
             var style = aStyle
             if i > 0 {
@@ -543,26 +661,34 @@ public enum Surface {
                     style = .paragraph
                 }
             }
+            if style == .raw { style = .paragraph }
             sub.addAttributes([block: id, line: style.encoded], range: l.range)
-            if i > 0 || !style.isItem {
-                // markers are rebuilt by `normalize`; text never becomes one
-                sub.removeAttribute(marker, range: i == 0 ? NSRange(location: l.range.location + l.markerLength, length: l.range.length - l.markerLength) : l.range)
+            // markers stay only at an item's start: any other is deleted
+            var strays: [NSRange] = []
+            sub.enumerateAttribute(marker, in: c) { v, r, _ in
+                guard v != nil else { return }
+                if style.isItem, r.location == c.location { return }
+                strays.append(r)
+            }
+            for r in strays.reversed() {
+                sub.replaceCharacters(in: r, with: "")
+                if r.location < sel { sel -= min(r.length, sel - r.location) }
             }
         }
-        let sel = span.location + local.location + (typed as NSString).length
-        return Edit(range: span, replacement: sub, selection: NSRange(location: sel, length: 0))
+        return Edit(range: span, replacement: sub, selection: NSRange(location: span.location + sel, length: 0))
     }
 
-    /// A deletion that would leave half a non-text block: it takes the
-    /// block's whole line.
+    /// A deletion that would leave half a non-text block: when it starts
+    /// at a line's start and ends on the U+FFFC, it takes the block's line
+    /// break too (the whole block goes). Starting mid-text, the break stays,
+    /// so the text after the block isn't pulled up.
     public static func expandDeletion(_ range: NSRange, in s: NSAttributedString) -> NSRange {
         guard range.length > 0 else { return range }
         let ns = text(s)
         let last = range.location + range.length - 1
-        if ns.character(at: last) == objectChar, last + 1 < ns.length, ns.character(at: last + 1) == newline {
-            return NSRange(location: range.location, length: range.length + 1)
-        }
-        return range
+        guard ns.character(at: last) == objectChar, last + 1 < ns.length, ns.character(at: last + 1) == newline else { return range }
+        let startsLine = range.location == 0 || ns.character(at: range.location - 1) == newline
+        return startsLine ? NSRange(location: range.location, length: range.length + 1) : range
     }
 
     /// Wikilink runs overlapping `range` (an insertion point strictly
@@ -592,6 +718,16 @@ public enum Surface {
     }
 
     // MARK: normalize
+
+    /// Set where a test deliberately breaks the invariants (duplicate ids,
+    /// a bare U+FFFC): `normalize` may repair them without tripping.
+    @TaskLocal public static var allowsRepair = false
+
+    /// `normalize` had to mint an id: every edit is supposed to keep ids
+    /// whole, so in debug builds this stops right here.
+    static func repaired(_ what: String) {
+        assert(allowsRepair, "Surface invariant: \(what)")
+    }
 
     /// Restore the invariants after any edit (ours, the text view's, an
     /// undo): the string ends with "\n"; a non-text block is alone on its
@@ -643,7 +779,7 @@ public enum Surface {
                 replace(NSRange(location: i, length: 1), NSAttributedString())
             } else {
                 let a = s.attributes(at: i, effectiveRange: nil)
-                let id = (a[block] as? String) ?? mint()
+                let id = (a[block] as? String) ?? { repaired("a non-text block without an id"); return mint() }()
                 if i + 1 < s.length, text(s).character(at: i + 1) != newline {
                     replace(NSRange(location: i + 1, length: 0), NSAttributedString(string: "\n", attributes: [block: id, line: LineStyle.raw.encoded]))
                 } else if i + 1 < s.length {
@@ -661,8 +797,21 @@ public enum Surface {
             scope = NSRange(location: grown.location, length: max(0, min(s.length, sc.location + sc.length + (s.length - ns.length)) - grown.location))
         }
         ns = text(s)
-        // 3. ids and kinds, line by line
-        let ls = lines(s)
+        // 3. ids and kinds, line by line (in scope: those lines, widened to
+        //    whole lists so numbering and ids hold)
+        var ls: [Line]
+        if let sc = scope {
+            ls = lines(s, in: sc)
+            while let f = ls.first, f.style.isItem, f.range.location > 0,
+                  let prev = line(at: f.range.location - 1, in: s), prev.style.isItem, prev.id == f.id { ls.insert(prev, at: 0) }
+            while let l = ls.last, l.style.isItem, l.end < s.length {
+                let next = line(startingAt: l.end, in: s)
+                guard next.style.isItem, next.id == l.id else { break }
+                ls.append(next)
+            }
+        } else {
+            ls = lines(s)
+        }
         var used: Set<BlockID> = []
         var prevOrig: BlockID?
         var prevAssigned: BlockID?
@@ -687,6 +836,9 @@ public enum Surface {
             } else if let o = orig, !used.contains(o) {
                 assigned = o
             } else {
+                // a line with no id, a duplicate, or what's left of a deleted
+                // non-text block: every edit is meant to prevent this
+                repaired("normalize gave a line a fresh id (was \(orig ?? "none"))")
                 assigned = mint()
             }
             used.insert(assigned)

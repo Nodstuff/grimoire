@@ -6,27 +6,42 @@ import Testing
 /// Return, Backspace, paste, cut and undo, or saves turn into delete +
 /// insert and comment anchors / ^refs break.
 @Suite struct SurfaceTests {
+    /// Ids an operation may legitimately create (Return, paste, insert).
+    final class Minter: @unchecked Sendable {
+        var allowed: Set<BlockID> = []
+        var n = 0
+        func mint() -> BlockID {
+            n += 1
+            let id = "m\(n)"
+            allowed.insert(id)
+            return id
+        }
+    }
+
     /// A doc on the surface with a fake text view's behaviour: typing
     /// inserts with typing attributes, every change is normalised, and
     /// edits can be undone (attributed text restored, as UIKit does).
+    /// After every step the invariant holds: ids are unique, each comes
+    /// from the doc or from an edit allowed to mint one, and `normalize`
+    /// mints nothing (it asserts in debug builds if it would).
     struct Harness {
         var s: NSMutableAttributedString
         var sel = NSRange(location: 0, length: 0)
         var baseline: [DocDiff.BaselineBlock]
         var undo: [(NSRange, NSAttributedString, NSRange)] = []
-        var minted = 0
+        let minter = Minter()
+        /// skip the invariant (a test that breaks it on purpose)
+        var checking = true
 
         init(_ blocks: [Block]) {
             let (bs, base) = Surface.load(DocEditor(docID: "d", baseEpoch: 1, blocks: blocks))
-            s = Surface.document(bs)
+            s = Surface.document(bs, mint: minter.mint)
             baseline = base
+            minter.allowed.formUnion(base.map(\.id))
+            minter.allowed.formUnion(Surface.blocks(s).map(\.id))
         }
 
-        mutating func mint() -> BlockID {
-            minted += 1
-            return "m\(minted)"
-        }
-
+        var mint: () -> BlockID { minter.mint }
         var text: String { s.string }
         var blocks: [Surface.SurfaceBlock] { Surface.blocks(s) }
         var ids: [BlockID] { blocks.map(\.id) }
@@ -38,9 +53,21 @@ import Testing
             return r.location
         }
 
+        func check(sourceLocation: SourceLocation = #_sourceLocation) {
+            guard checking else { return }
+            let ids = self.ids
+            #expect(Set(ids).count == ids.count, "ids unique: \(ids)", sourceLocation: sourceLocation)
+            let stray = Set(ids).subtracting(minter.allowed)
+            #expect(stray.isEmpty, "ids no edit made: \(stray)", sourceLocation: sourceLocation)
+            #expect(s.string.hasSuffix("\n"), sourceLocation: sourceLocation)
+        }
+
         mutating func normalize() {
-            var n = 0
-            Surface.normalize(s, selection: &sel) { n += 1; return "n\(n)-\(UUID().uuidString.prefix(4))" }
+            Surface.normalize(s, selection: &sel) {
+                Issue.record("normalize minted an id")
+                return "n-\(UUID().uuidString.prefix(4))"
+            }
+            check()
         }
 
         mutating func apply(_ e: Surface.Edit?) {
@@ -52,6 +79,11 @@ import Testing
             }
             sel = e.selection
             normalize()
+        }
+
+        /// The surface's own replace (deletion, typing across lines, paste).
+        mutating func replace(_ r: NSRange, with t: String) {
+            apply(Surface.replace(s, r, with: t, mint: mint))
         }
 
         /// UIKit typing: the text goes in with the typing attributes.
@@ -74,17 +106,22 @@ import Testing
         }
 
         mutating func returnKey() {
-            var m = 0
-            apply(Surface.returnKey(s, at: sel.location) { m += 1; return "r\(m)-\(UUID().uuidString.prefix(4))" })
+            apply(Surface.returnKey(s, at: sel.location, mint: mint))
         }
 
         mutating func backspace() {
-            if let e = Surface.backspace(s, at: sel.location) {
+            if let e = Surface.backspace(s, at: sel.location, mint: mint) {
                 apply(e)
             } else {
                 let r = Surface.expandDeletion(NSRange(location: sel.location - 1, length: 1), in: s)
-                apply(Surface.replace(s, r, with: ""))
+                replace(r, with: "")
             }
+        }
+
+        /// Forward delete (fn-Delete) at the caret.
+        mutating func forwardDelete() {
+            let r = Surface.expandDeletion(NSRange(location: sel.location, length: 1), in: s)
+            replace(r, with: "")
         }
 
         func ops() -> [BlockOp] {
@@ -295,30 +332,104 @@ import Testing
         var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("b", "beta", key: "m"), Self.b("c", "gamma", key: "r")])
         let from = h.location(of: "pha")
         let to = h.location(of: "mma")
-        h.apply(Surface.replace(h.s, NSRange(location: from, length: to - from), with: ""))
+        h.replace(NSRange(location: from, length: to - from), with: "")
         #expect(h.ids == ["a"])
         #expect(h.markdown == ["almma"])
         #expect(Set(h.ops()) == [.delete(target: "b"), .delete(target: "c"), .replace(target: "a", content: "almma")])
     }
 
-    @Test func cuttingAWholeLineJoinsTheNextIntoIt() {
-        var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("b", "beta", key: "m"), Self.b("c", "gamma", key: "r")])
-        let from = h.location(of: "beta")
-        h.apply(Surface.replace(h.s, NSRange(location: from, length: 5), with: ""))
-        #expect(h.markdown == ["alpha", "gamma"])
-        #expect(h.ids == ["a", "b"])
+    @Test func deletingAWholeLineDeletesThatBlockOnly() {
+        var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("b", "bravo", key: "m"), Self.b("c", "charlie", key: "r")])
+        h.replace(NSRange(location: h.location(of: "bravo"), length: 6), with: "")
+        #expect(h.markdown == ["alpha", "charlie"])
+        #expect(h.ids == ["a", "c"])
+        #expect(h.ops() == [.delete(target: "b")])
+    }
+
+    @Test func deletingAHeadingLineLeavesTheParagraphAParagraph() {
+        var h = Harness([Self.b("h", "## Head", key: "i", type: .heading), Self.b("p", "body", parent: "h", key: "i")])
+        h.replace(NSRange(location: 0, length: 5), with: "")
+        #expect(h.markdown == ["body"])
+        #expect(h.ids == ["p"])
+    }
+
+    @Test func deletingTheLastListItemLeavesTheNextParagraphAlone() {
+        var h = Harness([Self.b("l", "- one\n- two", key: "i"), Self.b("p", "after", key: "r")])
+        let two = h.location(of: "two")
+        let lineStart = two - 2 // the marker
+        h.replace(NSRange(location: lineStart, length: h.location(of: "after") - lineStart), with: "")
+        #expect(h.markdown == ["- one", "after"])
+        #expect(h.ids == ["l", "p"])
+    }
+
+    @Test func aJoinNeverTurnsMarkersIntoText() {
+        var h = Harness([Self.b("a", "para", key: "i"), Self.b("l", "- one\n- two", key: "r")])
+        let from = h.location(of: "ra")
+        let to = h.location(of: "one") - 2 // the start of the item line, before its marker
+        h.replace(NSRange(location: from, length: to - from), with: "")
+        #expect(h.markdown.first == "paone")
+        #expect(!h.text.contains("•\tone"))
+        #expect(h.ids == ["a", "l"])
+        #expect(h.markdown.last == "- two")
+    }
+
+    @Test func forwardDeleteBeforeANonTextBlockSelectsIt() {
+        var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("c", "```\ncode\n```", key: "m", type: .code), Self.b("z", "zed", key: "r")])
+        h.sel = NSRange(location: 5, length: 0)
+        h.forwardDelete()
+        #expect(h.ids == ["a", "c", "z"])
+        #expect(h.sel == NSRange(location: h.location(of: Surface.attachment), length: 1))
+        #expect(h.ops().isEmpty)
+    }
+
+    @Test func typingOverAJoinAfterANonTextBlockKeepsTheParagraph() {
+        var h = Harness([Self.b("c", "```\ncode\n```", key: "i", type: .code), Self.b("n", "November", key: "r")])
+        // from just after the U+FFFC (its line break) into the next paragraph
+        let from = h.location(of: Surface.attachment) + 1
+        h.replace(NSRange(location: from, length: h.location(of: "ember") - from), with: "x")
+        #expect(h.markdown == ["```\ncode\n```", "xember"])
+        #expect(h.ids == ["c", "n"])
+        #expect(h.ops() == [.replace(target: "n", content: "xember")])
+    }
+
+    @Test func deletingThroughANonTextBlockFromMidTextKeepsTheNextParagraph() {
+        var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("c", "```\ncode\n```", key: "m", type: .code), Self.b("z", "zed", key: "r")])
+        let from = h.location(of: "pha")
+        let r = Surface.expandDeletion(NSRange(location: from, length: h.location(of: Surface.attachment) + 1 - from), in: h.s)
+        h.replace(r, with: "")
+        #expect(h.markdown == ["al", "zed"])
+        #expect(h.ids == ["a", "z"])
+        #expect(Set(h.ops()) == [.delete(target: "c"), .replace(target: "a", content: "al")])
+    }
+
+    @Test func typingOverASelectedNonTextBlockReplacesIt() {
+        var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("c", "```\ncode\n```", key: "m", type: .code), Self.b("z", "zed", key: "r")])
+        h.replace(NSRange(location: h.location(of: Surface.attachment), length: 1), with: "x")
+        #expect(h.markdown == ["alpha", "x", "zed"])
+        #expect(h.ids[0] == "a" && h.ids[2] == "z" && h.ids[1] != "c")
+        #expect(h.ops().contains(.delete(target: "c")))
+    }
+
+    @Test func aRawHeadingKeepsItsSection() {
+        let blocks = [Self.b("h", "## Head <b>x</b>", key: "i", type: .heading), Self.b("p", "body", parent: "h", key: "i")]
+        var h = Harness(blocks)
+        #expect(h.blocks[0].content.isRaw)
+        #expect(h.blocks[0].level == 2)
+        h.sel = NSRange(location: h.location(of: "body") + 4, length: 0)
+        h.type("!")
+        #expect(h.ops() == [.replace(target: "p", content: "body!")])
     }
 
     @Test func deletingTheLineBreakAtALineEndJoins() {
         var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("b", "beta", key: "m")])
-        h.apply(Surface.replace(h.s, NSRange(location: 5, length: 1), with: ""))
+        h.replace(NSRange(location: 5, length: 1), with: "")
         #expect(h.ids == ["a"])
         #expect(h.markdown == ["alphabeta"])
     }
 
     @Test func selectAllAndDeleteLeavesOneLine() {
         var h = Harness(Self.sample)
-        h.apply(Surface.replace(h.s, NSRange(location: 0, length: h.s.length - 1), with: ""))
+        h.replace(NSRange(location: 0, length: h.s.length - 1), with: "")
         #expect(h.blocks.count == 1)
         #expect(h.ids == ["h"])
         #expect(h.text == "\n")
@@ -327,7 +438,7 @@ import Testing
     @Test func pastingLinesMidParagraph() {
         var h = Harness([Self.b("a", "start end", key: "i")])
         h.sel = NSRange(location: 6, length: 0)
-        h.apply(Surface.replace(h.s, h.sel, with: "one\ntwo\nthree "))
+        h.replace(h.sel, with: "one\ntwo\nthree ")
         #expect(h.markdown == ["start one", "two", "three end"])
         #expect(h.ids[0] == "a")
         #expect(Set(h.ids).count == 3)
@@ -339,7 +450,7 @@ import Testing
     @Test func pastingLinesIntoAListAddsItems() {
         var h = Harness([Self.b("l", "- a\n- b", key: "i")])
         h.sel = NSRange(location: h.location(of: "a") + 1, length: 0)
-        h.apply(Surface.replace(h.s, h.sel, with: "\nx\ny"))
+        h.replace(h.sel, with: "\nx\ny")
         #expect(h.ids == ["l"])
         #expect(h.markdown == ["- a\n- x\n- y\n- b"])
     }
@@ -371,7 +482,7 @@ import Testing
         #expect(h.sel == NSRange(location: c.range.location, length: 1), "the block is selected")
         // the text view deletes the selection: the whole block goes
         let r = Surface.expandDeletion(h.sel, in: h.s)
-        h.apply(Surface.replace(h.s, r, with: ""))
+        h.replace(r, with: "")
         #expect(!h.ids.contains("c"))
         #expect(h.ids.contains("q"))
         #expect(h.ops().contains(.delete(target: "c")))
@@ -381,7 +492,7 @@ import Testing
         var h = Harness(Self.sample)
         // delete the line break between the code block and the quote
         let c = h.blocks[3]
-        h.apply(Surface.replace(h.s, NSRange(location: c.range.location + 1, length: 1), with: ""))
+        h.replace(NSRange(location: c.range.location + 1, length: 1), with: "")
         #expect(h.ids.contains("c"))
         #expect(h.blocks.first { $0.id == "c" }?.content.isRaw == true)
         #expect(h.markdown.contains("> quoted") || h.markdown.contains("quoted"))
@@ -427,7 +538,7 @@ import Testing
 
     @Test func undoRestoresACrossLineDeletion() {
         var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("b", "beta", key: "m"), Self.b("c", "gamma", key: "r")])
-        h.apply(Surface.replace(h.s, NSRange(location: 2, length: 10), with: "Z"))
+        h.replace(NSRange(location: 2, length: 10), with: "Z")
         #expect(h.ids == ["a"])
         h.undoLast()
         #expect(h.ids == ["a", "b", "c"])
@@ -442,7 +553,7 @@ import Testing
         s.append(Surface.render(.paragraph(AttributedString("two")), id: "x"))
         s.append(Surface.render(.list([EditorListItem(.bullet, AttributedString("a")), EditorListItem(.bullet, AttributedString("b"))]), id: "l"))
         var sel = NSRange(location: 0, length: 0)
-        Surface.normalize(s, selection: &sel)
+        Surface.$allowsRepair.withValue(true) { _ = Surface.normalize(s, selection: &sel) }
         let ids = Surface.blocks(s).map(\.id)
         #expect(ids.count == 3)
         #expect(ids[0] == "x" && ids[1] != "x" && ids[2] == "l")
@@ -452,7 +563,7 @@ import Testing
         var h = Harness([Self.b("l", "1. a\n2. b\n3. c", key: "i")])
         let from = h.location(of: "a") + 1
         let to = h.location(of: "b") + 1
-        h.apply(Surface.replace(h.s, NSRange(location: from, length: to - from), with: ""))
+        h.replace(NSRange(location: from, length: to - from), with: "")
         #expect(h.markdown == ["1. a\n2. c"])
         #expect(h.text.contains("2.\tc"))
         #expect(!h.text.contains("3."))
@@ -472,7 +583,8 @@ import Testing
         let c = h.blocks[3]
         // only the U+FFFC goes (something bypassed expandDeletion)
         h.s.replaceCharacters(in: NSRange(location: c.range.location, length: 1), with: "")
-        h.normalize()
+        var sel = h.sel
+        Surface.$allowsRepair.withValue(true) { _ = Surface.normalize(h.s, selection: &sel) }
         #expect(!h.ids.contains("c"))
         #expect(h.ops().contains(.delete(target: "c")))
     }
