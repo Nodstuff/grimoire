@@ -78,8 +78,11 @@ public enum SurfaceMerge {
                     pieces.append(Piece(id: s.id, content: l, local: true))
                 }
                 newBase.append(theirs)
-            case (_?, nil):
-                // deleted here, not saved yet: stays deleted (the save deletes it)
+            case let (b?, nil):
+                // deleted here (or merged away), not saved yet: stays deleted.
+                // If it changed there meanwhile, our delete goes out on the
+                // older epoch, so the gate scores it instead of it winning
+                if sc != b.content, conflicts[s.id] == nil { conflicts[s.id] = SurfaceConflict(base: oldEpoch) }
                 newBase.append(theirs)
             case let (nil, l?):
                 pieces.append(Piece(id: s.id, content: l, local: true))
@@ -107,6 +110,10 @@ public enum SurfaceMerge {
             let at = anchor.flatMap { a in pieces.firstIndex { ($0.from ?? $0.id) == a } }.map { $0 + 1 } ?? 0
             pieces.insert(piece, at: at)
         }
+
+        // a conflict on a block neither side still has is over
+        let present = theirIDs.union(pieces.map(\.id))
+        conflicts = conflicts.filter { present.contains($0.key) }
 
         let before = local.map(\.id)
         let after = pieces.map { $0.from ?? $0.id }

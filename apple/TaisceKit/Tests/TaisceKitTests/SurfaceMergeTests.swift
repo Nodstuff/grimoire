@@ -84,6 +84,16 @@ import Testing
         #expect(DocDiff.computeOps(baseline: r.baseline, entries: entries).isEmpty, "the reorder is not sent back")
     }
 
+    @Test func aLocalDeleteOfABlockEditedThereIsAConflict() {
+        let server = [Self.b("a", "alpha", key: "i"), Self.b("b", "beta, edited there", key: "m"), Self.b("c", "gamma", key: "r")]
+        let r = SurfaceMerge.merge(local: Self.local([("a", "alpha"), ("c", "gamma")]), baseline: Self.baseline,
+                                   conflicts: [:], oldEpoch: 4, server: server)
+        #expect(r.blocks.map(\.id) == ["a", "c"])
+        #expect(r.conflicts["b"] == SurfaceConflict(base: 4))
+        let entries = r.blocks.map { DocDiff.Entry(id: $0.id, content: $0.content.markdown, level: 0) }
+        #expect(DocDiff.computeOps(baseline: r.baseline, entries: entries) == [.delete(target: "b")], "the delete, on the conflict path")
+    }
+
     @Test func aLocalDeleteStaysDeleted() {
         let r = SurfaceMerge.merge(local: Self.local([("a", "alpha"), ("c", "gamma")]), baseline: Self.baseline,
                                    conflicts: [:], oldEpoch: 1, server: Self.server0)
