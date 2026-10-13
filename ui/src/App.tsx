@@ -1,6 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DocEditor from './editor/DocEditor'
-import type { HiddenBlock } from './editor/diff'
+import { splitTree } from './editor/splitTree'
 import TendPanel from './TendPanel'
 import Gardeners from './Gardeners'
 import PaletteShell from './PaletteShell'
@@ -887,36 +887,7 @@ function DocView({
         allBlocks: [] as Block[],
         removedCanvases: 0,
       }
-    const blocks: Block[] = []
-    const comments: Block[] = []
-    const allBlocks: Block[] = []
-    // blocks the editor doesn't show keep their place next to the visible
-    // block they follow (a new first block goes after the frontmatter)
-    const hidden: HiddenBlock[] = []
-    let lastVisible: string | null = null
-    let removedCanvases = 0
-    const hide = (b: Block) =>
-      hidden.push({ id: b.id, content: b.content, parent: b.parent_id, order_key: b.order_key, after: lastVisible })
-    const walk = (nodes: BlockNode[]) => {
-      for (const n of nodes) {
-        allBlocks.push(n.block)
-        if (n.block.block_type === 'comment') {
-          comments.push(n.block)
-          hide(n.block)
-        }
-        // the canvas editor is gone; old scenes stay in the store, unrendered
-        else if (n.block.block_type === 'canvas_scene') {
-          removedCanvases++
-          hide(n.block)
-        } else if (n.block.content.startsWith('---')) hide(n.block)
-        else {
-          blocks.push(n.block)
-          lastVisible = n.block.id
-        }
-        walk(n.children)
-      }
-    }
-    walk(tree.roots)
+    const { blocks, comments, allBlocks, hidden, removedCanvases } = splitTree(tree.roots)
     return {
       editable: { docId, epoch: tree.doc.current_epoch, blocks, hidden },
       comments,

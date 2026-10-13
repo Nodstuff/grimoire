@@ -77,9 +77,11 @@ final class BlockAttachmentViewProvider: NSTextAttachmentViewProvider {
     }
 }
 
-/// The SwiftUI inside an attachment: the rendered block, tappable to edit
-/// its source when the surface is editable. Reports size changes so the
-/// text lays out around the new height.
+/// The SwiftUI inside an attachment: the rendered block with its own
+/// controls (Run, the try line, a practice edit, ticking a box). A plain tap
+/// does nothing else; its source opens from the pencil, a double-tap, or
+/// Return with the block selected. Reports size changes so the text lays
+/// out around the new height.
 struct AttachmentContent: View {
     let attachment: BlockAttachment
     let model: SurfaceModel
@@ -91,6 +93,8 @@ struct AttachmentContent: View {
             .environment(\.docTables, model.chartTables)
             .environment(\.docScale, model.docScale)
             .environment(\.openURL, OpenURLAction { url in model.follow(url) ? .handled : .systemAction })
+            // a box inside a callout, quote or complex list: ticked in the block's markdown
+            .environment(\.checkboxToggle, CheckboxToggle(action: model.editable ? { i, v in model.toggleRawCheckbox(attachment.blockID, index: i, checked: v) } : nil))
             .frame(maxWidth: .infinity, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
             .onGeometryChange(for: CGFloat.self) { ceil($0.size.height) } action: { h in
@@ -113,8 +117,10 @@ struct AttachmentContent: View {
                 }
             }
             .contentShape(.rect)
-            .onTapGesture { if model.editable { model.editSource(attachment.blockID) } }
+            .onTapGesture(count: 2) { if model.editable { model.editSource(attachment.blockID) } }
             .accessibilityElement(children: .contain)
+            .accessibilityLabel(Self.label(attachment.source))
+            .accessibilityAction(named: "Edit source") { if model.editable { model.editSource(attachment.blockID) } }
             .accessibilityIdentifier("surface.block")
         if let app {
             content.environment(app)
@@ -122,47 +128,152 @@ struct AttachmentContent: View {
             content
         }
     }
+
+    /// What VoiceOver calls a non-text block: "Code block, bash",
+    /// "Diagram, mermaid", "Chart", "Table, 3 rows", "Callout, note"…
+    nonisolated static func label(_ source: String) -> String {
+        let first = source.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
+        if first.hasPrefix("```") || first.hasPrefix("~~~") {
+            let lang = first.dropFirst(3).trimmingCharacters(in: .whitespaces).split(separator: " ").first.map(String.init) ?? ""
+            switch lang {
+            case "mermaid", "d2", "reladraw": return "Diagram, \(lang)"
+            case "vega-lite", "vega": return "Chart"
+            case "": return "Code block"
+            default: return "Code block, \(lang)"
+            }
+        }
+        if first.hasPrefix("|") {
+            let rows = source.split(separator: "\n").filter { $0.hasPrefix("|") }.count
+            return "Table, \(max(0, rows - 2)) rows"
+        }
+        if first.hasPrefix("> [!") {
+            let kind = first.dropFirst(4).prefix { $0 != "]" }.lowercased()
+            return "Callout, \(kind)"
+        }
+        if first.hasPrefix(">") { return "Quote" }
+        if first.hasPrefix("---") { return "Properties" }
+        if first.hasPrefix("- ") || first.hasPrefix("* ") || first.first?.isNumber == true { return "List" }
+        return "Block"
+    }
 }
 
-/// The markdown source of one non-text block, edited in a sheet.
+/// A code editor for a block's markdown source: a UITextView with no smart
+/// quotes or dashes, no autocorrect, spell check or capitalisation, in a
+/// monospaced font (what main's editor did for raw blocks).
+struct CodeTextEditor: UIViewRepresentable {
+    @Binding var text: String
+
+    static func configure(_ tv: UITextView) {
+        tv.smartQuotesType = .no
+        tv.smartDashesType = .no
+        tv.smartInsertDeleteType = .no
+        tv.autocorrectionType = .no
+        tv.spellCheckingType = .no
+        tv.autocapitalizationType = .none
+        tv.keyboardType = .asciiCapable
+        tv.font = UIFont.monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .footnote).pointSize, weight: .regular)
+        tv.adjustsFontForContentSizeCategory = true
+        tv.backgroundColor = .clear
+        tv.accessibilityIdentifier = "source.text"
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let tv = UITextView()
+        Self.configure(tv)
+        tv.delegate = context.coordinator
+        tv.text = text
+        return tv
+    }
+
+    func updateUIView(_ tv: UITextView, context: Context) {
+        if tv.text != text { tv.text = text }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var text: Binding<String>
+        init(text: Binding<String>) { self.text = text }
+        func textViewDidChange(_ tv: UITextView) { text.wrappedValue = tv.text }
+    }
+}
+
+/// The markdown source of one non-text block, edited in a sheet. Closing it
+/// with changes asks first (inline); a block removed meanwhile (a refresh)
+/// is said so, with the choice to put the text back as a new block.
 struct SourceEditorSheet: View {
     let blockID: BlockID
+    let original: String
     @State var text: String
-    let onSave: (String) -> Void
+    /// false: the block is gone
+    let onSave: (String) -> Bool
+    let onInsertAsNew: (String) -> Void
     let onDelete: () -> Void
     @Environment(\.dismiss) private var dismiss
+    @State private var confirmingDiscard = false
+    @State private var blockGone = false
+
+    init(blockID: BlockID, text: String, onSave: @escaping (String) -> Bool, onInsertAsNew: @escaping (String) -> Void, onDelete: @escaping () -> Void) {
+        self.blockID = blockID
+        original = text
+        _text = State(initialValue: text)
+        self.onSave = onSave
+        self.onInsertAsNew = onInsertAsNew
+        self.onDelete = onDelete
+    }
+
+    var edited: Bool { text != original }
 
     var body: some View {
         NavigationStack {
-            TextEditor(text: $text)
-                .font(.system(.footnote, design: .monospaced))
-                .autocorrectionDisabled()
-                .textInputAutocapitalization(.never)
-                .scrollContentBackground(.hidden)
-                .padding(.horizontal, 12)
-                .background(Theme.surface2)
-                .accessibilityIdentifier("source.text")
-                .navigationTitle("Block source")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel") { dismiss() }
+            VStack(spacing: 0) {
+                if blockGone {
+                    note("This block was removed in the meantime (on another device).") {
+                        Button("Insert as a new block") { onInsertAsNew(text); dismiss() }.accessibilityIdentifier("source.insertNew")
+                        Button("Discard", role: .destructive) { dismiss() }
                     }
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Save") {
-                            onSave(text)
-                            dismiss()
-                        }
-                        .accessibilityIdentifier("source.save")
-                    }
-                    ToolbarItem(placement: .bottomBar) {
-                        Button("Delete block", role: .destructive) {
-                            onDelete()
-                            dismiss()
-                        }
+                } else if confirmingDiscard {
+                    note("Discard your changes to this block?") {
+                        Button("Discard", role: .destructive) { dismiss() }.accessibilityIdentifier("source.discard")
+                        Button("Keep editing") { confirmingDiscard = false }
                     }
                 }
+                CodeTextEditor(text: $text)
+                    .padding(.horizontal, 12)
+                    .background(Theme.surface2)
+            }
+            .navigationTitle("Block source")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { if edited { confirmingDiscard = true } else { dismiss() } }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        if onSave(text) { dismiss() } else { blockGone = true }
+                    }
+                    .accessibilityIdentifier("source.save")
+                }
+                ToolbarItem(placement: .bottomBar) {
+                    Button("Delete block", role: .destructive) {
+                        onDelete()
+                        dismiss()
+                    }
+                }
+            }
         }
+        // a swipe down with changes doesn't drop them: Cancel asks
+        .interactiveDismissDisabled(edited)
         .tint(Theme.accent)
+    }
+
+    private func note(_ text: String, @ViewBuilder actions: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(text).font(.footnote)
+            HStack(spacing: 16) { actions() }.font(.footnote.weight(.medium)).buttonStyle(.borderless)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.amber.opacity(0.12))
     }
 }

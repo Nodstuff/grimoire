@@ -831,6 +831,129 @@ import UIKit
         #expect(rows.count == 1 && !rows[0].conflict && rows[0].req.ops.map(\.kind) == [.replace(target: "b0", content: "beta?")])
     }
 
+    // MARK: fix round 5, MEDIUM
+
+    /// 6: the Mac menu bar's Share Link… / Export as PDF… go through the
+    /// router to DocShareActions, which flushes the open doc first.
+    @Test func theMenuBarShareAndExportFlushFirst() async throws {
+        for command in [AppCommand.shareLink, .exportPDF] {
+            let h = try Harness(blocks("a"))
+            let router = Router()
+            router.open(.doc("d"))
+            router.snapshotPrep["d"] = { [model = h.model] in await model.flush(final: true) }
+            h.type("b", at: 1)
+            _ = router.perform(command, picker: WorkspacePicker(workspaces: [], unsortedCount: 0, stored: nil))
+            let action = try #require(router.docAction)
+            await DocShareActions.prepare(action, router: router)
+            #expect(try await h.queuedOps() == [.replace(target: "b0", content: "ab")], "\(command)")
+        }
+    }
+
+    /// 7: the source sheet's editor types code, not prose.
+    @Test func theSourceEditorTypesCode() {
+        let tv = UITextView()
+        CodeTextEditor.configure(tv)
+        #expect(tv.smartQuotesType == .no && tv.smartDashesType == .no && tv.smartInsertDeleteType == .no)
+        #expect(tv.autocorrectionType == .no && tv.spellCheckingType == .no && tv.autocapitalizationType == UITextAutocapitalizationType.none)
+        #expect(tv.font?.fontDescriptor.symbolicTraits.contains(.traitMonoSpace) == true)
+    }
+
+    /// 8: Return with a block selected opens its source; nothing is typed.
+    @Test func returnOnASelectedBlockOpensItsSource() throws {
+        let h = try Harness(blocks("a", "```\ncode\n```", "z"))
+        let at = h.location(of: Surface.attachment)
+        h.tv.selectedRange = NSRange(location: at, length: 1)
+        #expect(!h.model.textView(h.tv, shouldChangeTextIn: h.tv.selectedRange, replacementText: "\n"))
+        #expect(h.model.sourceEditing == "b1")
+        #expect(h.markdown == ["a", "```\ncode\n```", "z"])
+    }
+
+    /// 8: a block removed meanwhile: saving its source says so.
+    @Test func savingTheSourceOfARemovedBlockSaysSo() throws {
+        let h = try Harness(blocks("a", "```\ncode\n```"))
+        h.model.deleteBlock("b1")
+        #expect(!h.model.saveSource("b1", "```\nnew\n```"))
+        h.model.insertBlocks("```\nnew\n```")
+        #expect(h.markdown.contains("```\nnew\n```"))
+    }
+
+    /// 9: copy is markdown; pasted into another doc it is the same blocks.
+    @Test func copyAndPasteKeepStructure() throws {
+        let a = try Harness(blocks("- **bold** item\n- see [[Other Doc]]", "after"))
+        a.tv.selectedRange = NSRange(location: 0, length: a.location(of: "after"))
+        #expect(a.model.handleCopy())
+        #expect(UIPasteboard.general.string == "- **bold** item\n- see [[Other Doc]]")
+        let b = try Harness(blocks("first", ""))
+        b.tv.selectedRange = NSRange(location: b.blocks[1].range.location, length: 0)
+        #expect(b.model.handlePaste())
+        #expect(b.markdown == ["first", "- **bold** item\n- see [[Other Doc]]"])
+    }
+
+    @Test func richTextKeepsItsLinks() {
+        let a = NSMutableAttributedString(string: "Read the ")
+        a.append(NSAttributedString(string: "docs", attributes: [.link: URL(string: "https://example.org/docs")!]))
+        a.append(NSAttributedString(string: " now", attributes: [.font: UIFont.boldSystemFont(ofSize: 12)]))
+        #expect(RichPaste.markdown(from: a) == "Read the [docs](https://example.org/docs) **now**")
+    }
+
+    /// 10: headings carry their level for VoiceOver; blocks have names;
+    /// review state is spoken.
+    @Test func voiceOverGetsHeadingsBlocksAndReviewState() throws {
+        let h = try Harness(blocks("## Plan", "```bash\nls\n```"))
+        #expect(h.tv.textStorage.attribute(.accessibilityTextHeadingLevel, at: 0, effectiveRange: nil) as? Int == 2)
+        let att = h.tv.textStorage.attribute(.attachment, at: h.location(of: Surface.attachment), effectiveRange: nil) as? NSTextAttachment
+        #expect(att?.accessibilityLabel == "Code block, bash")
+        #expect(AttachmentContent.label("| a |\n|---|\n| 1 |\n| 2 |\n| 3 |") == "Table, 3 rows")
+        #expect(AttachmentContent.label("```mermaid\ngraph TD\n```") == "Diagram, mermaid")
+        #expect(h.model.reviewHint(for: "b0") == nil)
+    }
+
+    /// 11: a box inside a callout ticks in the block's markdown.
+    @Test func aBoxInsideACalloutTicks() async throws {
+        let callout = "> [!TODO]\n> - [ ] one\n> - [ ] two"
+        let h = try Harness(blocks(callout))
+        h.model.toggleRawCheckbox("b0", index: 1, checked: true)
+        await h.model.flush()
+        #expect(try await h.queuedOps() == [.replace(target: "b0", content: "> [!TODO]\n> - [ ] one\n> - [x] two")])
+        #expect(h.model.sourceEditing == nil)
+    }
+
+    /// 12: the children list sits below the fully laid-out text.
+    @Test func theFooterSitsBelowTheText() throws {
+        let h = try Harness(blocks((0..<200).map { "paragraph number \($0) with a little text" }.joined(separator: "\n\n")))
+        let window = try h.inWindow()
+        defer { window.isHidden = true }
+        let footer = UIView()
+        h.tv.footer = footer
+        h.tv.setNeedsLayout()
+        h.tv.layoutIfNeeded()
+        h.tv.contentOffset.y = h.tv.contentSize.height - h.tv.bounds.height
+        h.tv.layoutIfNeeded()
+        let end = try #require(h.tv.position(from: h.tv.endOfDocument, offset: -1))
+        let last = h.tv.caretRect(for: end)
+        #expect(footer.frame.minY >= last.maxY, "below the last line: \(footer.frame.minY) vs \(last.maxY)")
+    }
+
+    /// R4-a: a cached body older than our own landed write is ignored (it
+    /// would roll our text back on screen).
+    @Test func aBodyOlderThanOurLandedWriteIsIgnored() async throws {
+        let h = try await Harness.stored([Self.blk("b0", "alpha", key: "i")])
+        h.type("!", at: 5)
+        await h.model.flush()
+        let row = try #require(try await h.cache.pendingOutbox().first)
+        let outcome = #"{"doc_id":"d","epoch":5,"verdicts":[{"op_id":"o5","block_id":"b0","verdict":"green","confidence":1,"applied":true,"note":""}]}"#
+        try await h.cache.markOutbox(try #require(row.id), state: .done, outcome: Data(outcome.utf8))
+        #expect(try await h.cache.lastLandedEpoch("d") == 5)
+        // a body from epoch 3 (before our write landed) arrives
+        try await Harness.store([Self.blk("b0", "alpha", key: "i")], epoch: 3, in: h.cache)
+        await h.model.refreshFromCache()
+        #expect(h.markdown == ["alpha!"], "not rolled back")
+        // the body at our epoch is taken
+        try await Harness.store([Self.blk("b0", "alpha!", key: "i")], epoch: 5, in: h.cache)
+        await h.model.refreshFromCache()
+        #expect(h.markdown == ["alpha!"])
+    }
+
     /// T9: who gets an editable surface.
     @Test func theWriteGate() {
         #expect(DocWriteGate.canWrite(isCanvas: false, isMirror: false, canEdit: true))

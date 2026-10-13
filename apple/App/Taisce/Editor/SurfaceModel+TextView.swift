@@ -14,6 +14,12 @@ extension SurfaceModel: UITextViewDelegate, UIGestureRecognizerDelegate {
         if textView.markedTextRange != nil { return true }
         let s = self.textView.textStorage
         if text == "\n" {
+            // Return with a non-text block selected opens its source
+            if range.length == 1, s.mutableString.character(at: range.location) == 0xFFFC,
+               let id = s.attribute(Surface.block, at: range.location, effectiveRange: nil) as? String {
+                editSource(id)
+                return false
+            }
             if let c = completion {
                 if !c.results.isEmpty { acceptCompletion(); return false }
                 dismissCompletion()

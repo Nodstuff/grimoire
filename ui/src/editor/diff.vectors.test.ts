@@ -166,10 +166,11 @@ function inferredParents(items: { id: string; level: number }[]): Map<string, st
 
 describe('saves move only what the edit re-homed', () => {
   const modes = ['heading', 'flat', 'random'] as const
-  it('typos and retitles are one replace; a level change moves only blocks whose section changed (or out-of-order ones)', () => {
-    const counts: Record<string, { cases: number; bursts: number; extra: number }> = {}
-    for (const mode of modes) {
-      counts[mode] = { cases: 0, bursts: 0, extra: 0 }
+  // one test per nesting style (each a fraction of a second; one test for
+  // all three ran past vitest's 5 s timeout on a loaded machine)
+  for (const mode of modes) {
+    it(`${mode} docs: typos and retitles are one replace; a level change moves only changed sections (or out-of-order blocks)`, () => {
+      const counts = { cases: 0, bursts: 0, extra: 0 }
       for (let seed = 1; seed <= 1000; seed++) {
         const r = rng(seed * 7 + mode.length)
         const n = 4 + Math.floor(r() * 10)
@@ -232,16 +233,15 @@ describe('saves move only what the edit re-homed', () => {
         const moved = ops.filter((o) => o.kind.op === 'move').map((o) => o.kind.target as string)
         const allowed = new Set([...changed, ...stats.orderFallback])
         expect(moved.filter((m) => !allowed.has(m)), `${mode} ${seed} level change moved untouched blocks`).toEqual([])
-        counts[mode].cases++
-        if (moved.length > n / 2) counts[mode].bursts++
-        counts[mode].extra += moved.filter((m) => !changed.has(m)).length
+        counts.cases++
+        if (moved.length > n / 2) counts.bursts++
+        counts.extra += moved.filter((m) => !changed.has(m)).length
       }
-    }
-    // bursts = a level change moving more than half the doc; extra = moves of
-    // blocks whose section didn't change (all from the order check).
-    // Measured: heading 0/0, flat 0/0, random 2 bursts / 40 extra.
-    expect(counts.heading).toMatchObject({ bursts: 0, extra: 0 })
-    expect(counts.flat).toMatchObject({ bursts: 0, extra: 0 })
-    expect(counts.random.bursts).toBeLessThanOrEqual(5)
-  })
+      // bursts = a level change moving more than half the doc; extra = moves
+      // of blocks whose section didn't change (all from the order check).
+      // Measured: heading 0/0, flat 0/0, random 2 bursts / 40 extra.
+      if (mode === 'random') expect(counts.bursts).toBeLessThanOrEqual(5)
+      else expect(counts).toMatchObject({ bursts: 0, extra: 0 })
+    })
+  }
 })

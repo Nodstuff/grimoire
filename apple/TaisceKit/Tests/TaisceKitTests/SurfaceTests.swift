@@ -457,7 +457,8 @@ import Testing
         ]
         for doc in docs {
         let length = Harness(doc).s.length
-        for text in ["x\ny\nz", "# Head\n\n- a\n- b", "plain", "\n"] {
+        for viaPaste in [false, true] {
+        for text in ["x\ny\nz", "# Head\n\n- a\n- b", "plain", "\n", "**bold** [[Doc]]"] {
             for at in 0..<length {
                 var h = Harness(doc)
                 // the block the caret is in may change (unless it's a
@@ -472,7 +473,11 @@ import Testing
                     }
                 }
                 Surface.$allowsRepair.withValue(true) {
-                    h.replace(NSRange(location: at, length: 0), with: text)
+                    if viaPaste {
+                        h.apply(Surface.paste(h.s, NSRange(location: at, length: 0), markdown: text, mint: h.mint))
+                    } else {
+                        h.replace(NSRange(location: at, length: 0), with: text)
+                    }
                 }
                 let stray = Set(h.ids).subtracting(h.minter.allowed)
                 #expect(stray.isEmpty, "\(text.debugDescription) at \(at) (\(String(h.s.string.prefix(at)).debugDescription)): \(h.markdown)")
@@ -480,6 +485,7 @@ import Testing
                     #expect(h.ids.contains(id), "\(text.debugDescription) at \(at): \(id) kept, ids \(h.ids)")
                 }
             }
+        }
         }
         }
     }
@@ -492,6 +498,40 @@ import Testing
             #expect(h.ids.first == "c" && h.ids.last == "n")
             #expect(!h.ops().contains { if case .replace = $0 { true } else { false } }, "nothing existing changes")
         }
+    }
+
+    // MARK: copy and paste as markdown
+
+    @Test func copyIsMarkdownAndPasteBringsTheBlocksBack() {
+        let a = Harness([Self.b("h", "## Plan", key: "i", type: .heading),
+                         Self.b("l", "- **bold** item\n- see [[Other Doc]]", key: "m"),
+                         Self.b("c", "```sh\necho hi\n```", key: "q", type: .code),
+                         Self.b("p", "end", key: "u")])
+        let all = NSRange(location: 0, length: a.location(of: "end") - 1)
+        let md = Surface.markdown(of: a.s, range: all)
+        #expect(md == "## Plan\n\n- **bold** item\n- see [[Other Doc]]\n\n```sh\necho hi\n```")
+        // within one line: just its inline markdown
+        #expect(Surface.markdown(of: a.s, range: NSRange(location: a.location(of: "bold"), length: 8)) == "**bold** ite")
+        // into another doc, on an empty line: the same blocks, new ids
+        var b = Harness([Self.b("x", "first", key: "i"), Self.b("e", "", key: "r")])
+        b.sel = NSRange(location: b.blocks[1].range.location, length: 0)
+        b.apply(Surface.paste(b.s, b.sel, markdown: md, mint: b.mint))
+        #expect(b.markdown == ["first", "## Plan", "- **bold** item\n- see [[Other Doc]]", "```sh\necho hi\n```"])
+        #expect(b.ids[0] == "x" && b.ids[1] == "e", "the empty line's block takes the first part")
+    }
+
+    @Test func pastingAtALineStartInsertsBlocksBeforeIt() {
+        var h = Harness([Self.b("x", "keep me", key: "i")])
+        h.apply(Surface.paste(h.s, NSRange(location: 0, length: 0), markdown: "- one\n- two", mint: h.mint))
+        #expect(h.markdown == ["- one\n- two", "keep me"])
+        #expect(h.ids.last == "x")
+    }
+
+    @Test func pastingInsideALineKeepsInlineFormatting() {
+        var h = Harness([Self.b("x", "a  b", key: "i")])
+        h.apply(Surface.paste(h.s, NSRange(location: 2, length: 0), markdown: "**bold** and [[Doc]]", mint: h.mint))
+        #expect(h.markdown == ["a **bold** and [[Doc]] b"])
+        #expect(h.ids == ["x"])
     }
 
     @Test func deletingAWholeLineAboveANonTextBlockDeletesThatBlock() {

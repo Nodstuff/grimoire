@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 import TaisceKit
 
 /// One open doc: ONE always-live text surface (`SurfaceTextView`), its
@@ -667,6 +668,7 @@ final class SurfaceModel: NSObject {
         textView.typingAttributes = a
         let m = InlineMarks(rawValue: (a[Surface.marks] as? Int) ?? 0)
         if m != activeMarks { activeMarks = m }
+        textView.accessibilityHint = reviewHint(for: (a[Surface.block] as? String))
         formattingBar.update(for: currentBlock?.content ?? .paragraph(AttributedString()), marks: m)
     }
 
@@ -711,20 +713,44 @@ final class SurfaceModel: NSObject {
 
     /// Paste: markdown into an empty line becomes blocks; anything else
     /// is plain text in the line's look (lines become paragraphs).
+    /// a short note at the bottom of the doc, gone after a few seconds
+    var notice: String?
+
+    /// Paste: markdown becomes blocks at a line's start and keeps its
+    /// inline formatting inside a line (`Surface.paste`); rich text from
+    /// another app (Safari) comes as markdown with its links; an image
+    /// says it can't be pasted here (yet).
     func handlePaste() -> Bool {
-        guard editable, let text = UIPasteboard.general.string else { return false }
+        guard editable else { return false }
+        let pb = UIPasteboard.general
         if let e = pasteCutBlocks() { return perform(e) }
-        let s = textView.textStorage
-        let sel = textView.selectedRange
-        if sel.length == 0, let b = currentBlock, case .paragraph = b.content, b.content.isEmpty,
-           text.contains("\n") || text.hasPrefix("#") || text.hasPrefix("- ") || text.hasPrefix("> ") || text.hasPrefix("```") {
-            let parts = MarkdownSegments.split(text).map(EditorBlockContent.parse(markdown:))
-            guard !parts.isEmpty else { return true }
-            let out = NSMutableAttributedString()
-            for (i, c) in parts.enumerated() { out.append(Surface.render(c, id: i == 0 ? b.id : Surface.newID())) }
-            return perform(Surface.Edit(range: b.range, replacement: out, selection: NSRange(location: b.range.location + out.length - 1, length: 0)))
+        var text = pb.string
+        if text == nil || !pb.contains(pasteboardTypes: [Self.markdownType]),
+           let rich = RichPaste.markdown(from: pb), !rich.isEmpty, rich != text {
+            text = rich
         }
-        return perform(Surface.replace(s, sel, with: text, typing: textView.typingAttributes))
+        guard let text else {
+            if pb.hasImages { notice = "Images can't be pasted into a doc here yet." }
+            return true
+        }
+        let sel = textView.selectedRange
+        let s = textView.textStorage
+        if sel.length > 0 {
+            // what's selected goes first, then the paste lands at its start
+            perform(Surface.replace(s, Surface.expandDeletion(sel, in: s), with: "", typing: textView.typingAttributes))
+        }
+        return perform(Surface.paste(textView.textStorage, textView.selectedRange, markdown: text, typing: textView.typingAttributes))
+    }
+
+    static let markdownType = "net.daringfireball.markdown"
+
+    /// The selection on the pasteboard as markdown (plain text and the
+    /// markdown type): structure, bold and links survive into another
+    /// doc, and the web or Slack get readable markdown.
+    func copyMarkdown(_ r: NSRange) -> String {
+        let md = Surface.markdown(of: textView.textStorage, range: r)
+        UIPasteboard.general.items = [[UTType.plainText.identifier: md, UTType.utf8PlainText.identifier: md, Self.markdownType: md]]
+        return md
     }
 
     /// The selection as markdown-ish plain text: non-text blocks as their
@@ -744,7 +770,7 @@ final class SurfaceModel: NSObject {
     func handleCopy() -> Bool {
         let r = textView.selectedRange
         guard r.length > 0 else { return false }
-        UIPasteboard.general.string = plainText(r)
+        _ = copyMarkdown(r)
         return true
     }
 
@@ -757,8 +783,7 @@ final class SurfaceModel: NSObject {
         let s = textView.textStorage
         let r = Surface.expandDeletion(textView.selectedRange, in: s)
         guard r.length > 0 else { return false }
-        let text = plainText(textView.selectedRange)
-        UIPasteboard.general.string = text
+        let text = copyMarkdown(textView.selectedRange)
         let ns = s.mutableString
         let startsLine = r.location == 0 || ns.character(at: r.location - 1) == 10
         let endsLine = ns.character(at: r.location + r.length - 1) == 10
@@ -893,10 +918,29 @@ final class SurfaceModel: NSObject {
     }
 
     /// The sheet saved: the block takes the new markdown (text, if it now is text).
-    func saveSource(_ id: BlockID, _ markdown: String) {
-        guard editable else { return }
+    /// False when the block is gone (a refresh removed it meanwhile).
+    @discardableResult
+    func saveSource(_ id: BlockID, _ markdown: String) -> Bool {
+        guard editable else { return false }
         let content = EditorBlockContent.parse(markdown: markdown)
-        perform(Surface.replaceBlock(textView.textStorage, id: id, with: content, selection: textView.selectedRange))
+        guard let e = Surface.replaceBlock(textView.textStorage, id: id, with: content, selection: textView.selectedRange) else { return false }
+        return perform(e)
+    }
+
+    /// Markdown put in as new blocks at the caret's line (a block's source
+    /// whose block was removed meanwhile, kept by choice).
+    func insertBlocks(_ markdown: String) {
+        guard editable else { return }
+        let s = textView.textStorage
+        let at = Surface.line(at: min(textView.selectedRange.location, max(0, s.length - 1)), in: s)?.range.location ?? 0
+        perform(Surface.paste(s, NSRange(location: at, length: 0), markdown: markdown.contains("\n\n") || markdown.hasPrefix("```") ? markdown : markdown + "\n\n"))
+    }
+
+    /// Tick a box inside a non-text block (a callout, a quote, a complex
+    /// list): its markdown, rewritten; no sheet, no keyboard.
+    func toggleRawCheckbox(_ id: BlockID, index: Int, checked: Bool) {
+        guard editable, let toggled = Checkbox.toggled(source(of: id), index: index, checked: checked) else { return }
+        saveSource(id, toggled)
     }
 
     func deleteBlock(_ id: BlockID) {
@@ -1306,6 +1350,28 @@ final class SurfaceModel: NSObject {
             let first = await group.next() ?? nil
             group.cancelAll()
             return first
+        }
+    }
+
+    /// What VoiceOver says about the caret's block beyond its text: the
+    /// colour of the tint, in words.
+    func reviewHint(for id: BlockID?) -> String? {
+        guard let id else { return nil }
+        if failedBlocks.contains(id) { return "This block couldn't be saved." }
+        if let c = conflicts[id] { return c.theirs != nil ? "Changed on another device while you edited it." : "Your edit here waits for review." }
+        switch reviews[id]?.verdict {
+        case .red?: return "Your edit here is waiting for review."
+        case .yellow?: return "Your edit here was flagged for review."
+        default: return nil
+        }
+    }
+
+    /// The doc's title and what the header and children list offer, for
+    /// VoiceOver on the text view (they are drawn inside it).
+    func setAccessibilityChrome(title: String, actions: [(String, () -> Void)]) {
+        textView.accessibilityLabel = title.isEmpty ? "Doc" : title
+        textView.accessibilityCustomActions = actions.map { name, run in
+            UIAccessibilityCustomAction(name: name) { _ in run(); return true }
         }
     }
 

@@ -125,6 +125,11 @@ struct DocScreen: View {
             ))
             .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
             .onChange(of: chrome, initial: true) { _, c in
+                // the header and children list, reachable for VoiceOver from the text
+                var actions: [(String, () -> Void)] = []
+                if c.linkComments != nil { actions.append(("Link comments", { router.request(.linkComments, on: docID) })) }
+                for kid in c.children.cards { actions.append(("Open \(kid.title)", { router.open(.doc(kid.id)) })) }
+                surface.setAccessibilityChrome(title: c.title, actions: actions)
                 surface.setChrome(
                     header: hosted(DocHeader(chrome: c, onOpenLinkComments: { router.request(.linkComments, on: docID) })),
                     footer: c.children.cards.isEmpty ? nil : hosted(DocChildrenList(
