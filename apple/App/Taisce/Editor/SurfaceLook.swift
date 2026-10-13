@@ -129,18 +129,23 @@ enum SurfaceLook {
 
     /// Restyle every line touching `range` (all of it when nil).
     static func restyle(_ s: NSMutableAttributedString, range: NSRange? = nil, ctx: Context) {
-        let ls = Surface.lines(s)
+        guard s.length > 0 else { return }
+        // only the lines touched (no whole-doc scan per keystroke), plus
+        // the line after (a list's last item gets the block spacing)
+        var ls = range.map { r in
+            Surface.lines(s, in: NSRange(location: min(r.location, s.length - 1), length: min(r.length, s.length - min(r.location, s.length - 1))))
+        } ?? Surface.lines(s)
         guard !ls.isEmpty else { return }
-        let r = range ?? NSRange(location: 0, length: s.length)
-        let firstLine = Surface.lineIndex(ls, at: max(0, min(r.location, s.length - 1)))
-        let lastLine = Surface.lineIndex(ls, at: max(0, min(r.location + r.length, s.length - 1)))
-        // a list's last item gets the block spacing: widen to whole blocks
-        var lo = firstLine, hi = lastLine
-        while lo > 0, ls[lo - 1].style.isItem, ls[lo - 1].id == ls[lo].id { lo -= 1 }
-        while hi < ls.count - 1, ls[hi + 1].style.isItem, ls[hi + 1].id == ls[hi].id { hi += 1 }
-        for i in lo...hi {
+        // a list restyles whole: widen to its first and last items
+        while let f = ls.first, f.style.isItem, f.range.location > 0,
+              let prev = Surface.line(at: f.range.location - 1, in: s), prev.style.isItem, prev.id == f.id { ls.insert(prev, at: 0) }
+        while let l = ls.last, l.style.isItem, l.end < s.length,
+              let next = Surface.line(at: l.end, in: s), next.style.isItem, next.id == l.id { ls.append(next) }
+        let after = ls.last.flatMap { $0.end < s.length ? Surface.line(at: $0.end, in: s) : nil }
+        for i in ls.indices {
             let l = ls[i]
-            let lastItem = i == ls.count - 1 || ls[i + 1].id != l.id || !ls[i + 1].style.isItem
+            let following = i + 1 < ls.count ? ls[i + 1] : after
+            let lastItem = following.map { $0.id != l.id || !$0.style.isItem } ?? true
             let para = paragraphStyle(l.style, first: i == 0, last: lastItem)
             let tint = l.id.flatMap { ctx.tints[$0] }
             for k in displayKeys { s.removeAttribute(k, range: l.range) }

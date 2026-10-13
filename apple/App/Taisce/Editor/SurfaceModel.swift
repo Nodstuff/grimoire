@@ -127,6 +127,10 @@ final class SurfaceModel: NSObject {
         tv.readingWidth = Theme.readingWidth
         tv.accessibilityIdentifier = "surface.text"
         tv.textDragInteraction?.isEnabled = false
+        // dropped text goes through Surface (block ids), not UIKit's insert
+        tv.textDropDelegate = self
+        // Writing Tools rewrites ranges behind the delegate's back: the panel only
+        tv.writingToolsBehavior = .limited
         if editable, !EditorChrome.barIsInline { tv.inputAccessoryView = formattingBar }
         let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
         tap.delegate = self
@@ -140,10 +144,14 @@ final class SurfaceModel: NSObject {
         blockTypes = Dictionary(editor.blocks.values.map { ($0.id, $0.blockType) }, uniquingKeysWith: { a, _ in a })
         if editable { return Surface.load(editor) }
         var blocks: [(id: BlockID, content: EditorBlockContent)] = []
+        var baseline: [DocDiff.BaselineBlock] = []
         for (b, _) in editor.ordered() where b.blockType != .comment && !b.content.hasPrefix("---") {
-            blocks.append((b.id, EditorBlockContent.parse(b)))
+            let c = EditorBlockContent.parse(b)
+            blocks.append((b.id, c))
+            // what it shows is its baseline, canvases too, so a refresh updates them
+            baseline.append(DocDiff.BaselineBlock(id: b.id, content: c.markdown, parent: b.parentID, orderKey: b.orderKey))
         }
-        return (blocks, Surface.load(editor).baseline)
+        return (blocks, baseline)
     }
 
     private func load(_ editor: DocEditor) {
@@ -243,6 +251,8 @@ final class SurfaceModel: NSObject {
         if !on {
             textView.resignFirstResponder()
             completion = nil
+            // ⌘Z must not change a read-only surface
+            forgetUndo()
         }
         editable = on
         textView.isEditable = on
@@ -354,6 +364,8 @@ final class SurfaceModel: NSObject {
     }
 
     private func apply(_ e: Surface.Edit, undoSelection: NSRange) {
+        // read-only (a viewer now): nothing changes the text, undo included
+        guard editable || quiet else { return }
         let storage = textView.textStorage
         let before = NSAttributedString(attributedString: storage)
         reloading = true
@@ -376,10 +388,8 @@ final class SurfaceModel: NSObject {
         let newRange = NSRange(location: lo, length: max(0, oldRange.length + new.length - old.length))
         let oldText = before.attributedSubstring(from: oldRange)
         let redoSelection = sel
-        undoStep {
-            $0.registerUndo(withTarget: self) { m in
-                m.apply(Surface.Edit(range: newRange, replacement: oldText, selection: undoSelection), undoSelection: redoSelection)
-            }
+        undoStep { um in
+            register(UndoRecord(range: newRange, replacement: oldText, selection: undoSelection, redoSelection: redoSelection), on: um)
         }
         SurfaceLook.restyle(storage, range: NSRange(location: newRange.location, length: newRange.length), ctx: lookContext)
         textView.selectedRange = sel
@@ -428,10 +438,72 @@ final class SurfaceModel: NSObject {
             typingGroupOpen = true
         }
         let newRange = NSRange(location: range.location, length: max(0, length))
-        let after = textView.selectedRange
-        um.registerUndo(withTarget: self) { m in
-            m.closeTyping()
-            m.apply(Surface.Edit(range: newRange, replacement: old, selection: selectionBefore), undoSelection: after)
+        register(UndoRecord(range: newRange, replacement: old, selection: selectionBefore, redoSelection: textView.selectedRange), on: um)
+    }
+
+    /// One registered undo (or redo) action. It is its own target, so a
+    /// refresh can shift it or drop just it (`remapUndo`).
+    final class UndoRecord {
+        var range: NSRange
+        let replacement: NSAttributedString
+        var selection: NSRange
+        var redoSelection: NSRange
+        /// registered while undoing: a redo action
+        var isRedo = false
+
+        init(range: NSRange, replacement: NSAttributedString, selection: NSRange, redoSelection: NSRange) {
+            self.range = range
+            self.replacement = replacement
+            self.selection = selection
+            self.redoSelection = redoSelection
+        }
+    }
+
+    /// live records, oldest first (the manager doesn't keep its targets)
+    @ObservationIgnored private var records: [UndoRecord] = []
+
+    private func register(_ r: UndoRecord, on um: UndoManager) {
+        r.isRedo = um.isUndoing
+        records.append(r)
+        um.registerUndo(withTarget: r) { [weak self] rec in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.records.removeAll { $0 === rec }
+                self.closeTyping()
+                self.apply(Surface.Edit(range: rec.range, replacement: rec.replacement, selection: rec.selection), undoSelection: rec.redoSelection)
+            }
+        }
+    }
+
+    /// A refresh replaced `span` (current text) with `newLength` characters.
+    /// Undo steps that don't touch it survive (shifted past it); the first
+    /// one that does, and every older one, go (they would undo text that
+    /// isn't there any more). Redo steps go.
+    func remapUndo(span: NSRange, newLength: Int) {
+        closeTyping()
+        guard let um = undo else { return }
+        func drop(_ r: UndoRecord) {
+            um.removeAllActions(withTarget: r)
+            records.removeAll { $0 === r }
+        }
+        for r in records where r.isRedo { drop(r) }
+        var x = span
+        let delta = newLength - span.length
+        var dead = false
+        for r in records.reversed() {
+            if dead { drop(r); continue }
+            let end = r.range.location + r.range.length
+            if end <= x.location {
+                // undoing r shifts where the refreshed text sits
+                x.location += r.replacement.length - r.range.length
+            } else if r.range.location >= x.location + x.length {
+                r.range.location += delta
+                if r.selection.location >= x.location + x.length { r.selection.location += delta }
+                if r.redoSelection.location >= x.location + x.length { r.redoSelection.location += delta }
+            } else {
+                dead = true
+                drop(r)
+            }
         }
     }
 
@@ -440,6 +512,7 @@ final class SurfaceModel: NSObject {
     func forgetUndo() {
         closeTyping()
         undo?.removeAllActions()
+        records = []
     }
 
     /// The text changed: save after a pause.
@@ -474,10 +547,8 @@ final class SurfaceModel: NSObject {
             SurfaceLook.restyle(storage, range: NSRange(location: typed.location, length: max(typed.length, 1)), ctx: lookContext)
         } else if reshaped {
             SurfaceLook.restyle(storage, ctx: lookContext)
-        } else {
-            let ls = Surface.lines(storage)
-            let li = Surface.lineIndex(ls, at: min(sel.location, max(0, storage.length - 1)))
-            SurfaceLook.restyle(storage, range: ls[li].range, ctx: lookContext)
+        } else if let l = Surface.line(at: min(sel.location, max(0, storage.length - 1)), in: storage) {
+            SurfaceLook.restyle(storage, range: l.range, ctx: lookContext)
         }
         storage.endEditing()
         if textView.selectedRange != sel { textView.selectedRange = sel }
@@ -514,11 +585,11 @@ final class SurfaceModel: NSObject {
     /// Whether the doc has any text or block (an empty doc is one empty line).
     var hasContent: Bool { textView.textStorage.length > 1 }
 
+    /// The block under the caret, found locally (no whole-doc scan).
     var currentBlock: Surface.SurfaceBlock? {
         let s = textView.textStorage
         guard s.length > 0 else { return nil }
-        let loc = min(textView.selectedRange.location, s.length - 1)
-        return Surface.blocks(s).first { NSLocationInRange(loc, $0.range) }
+        return Surface.block(at: min(textView.selectedRange.location, s.length - 1), in: s)
     }
 
     // MARK: keys and commands
@@ -554,6 +625,7 @@ final class SurfaceModel: NSObject {
     /// is plain text in the line's look (lines become paragraphs).
     func handlePaste() -> Bool {
         guard editable, let text = UIPasteboard.general.string else { return false }
+        if let e = pasteCutBlocks() { return perform(e) }
         let s = textView.textStorage
         let sel = textView.selectedRange
         if sel.length == 0, let b = currentBlock, case .paragraph = b.content, b.content.isEmpty,
@@ -588,12 +660,40 @@ final class SurfaceModel: NSObject {
         return true
     }
 
+    /// Whole blocks cut here: pasted back unchanged into this doc they keep
+    /// their ids (a move, so comments and ^refs survive), not delete + insert.
+    @ObservationIgnored private var cutBlocks: (text: String, lines: NSAttributedString, changeCount: Int)?
+
     func handleCut() -> Bool {
         guard editable else { return false }
-        let r = textView.selectedRange
+        let s = textView.textStorage
+        let r = Surface.expandDeletion(textView.selectedRange, in: s)
         guard r.length > 0 else { return false }
-        UIPasteboard.general.string = plainText(r)
-        return perform(Surface.replace(textView.textStorage, Surface.expandDeletion(r, in: textView.textStorage), with: ""))
+        let text = plainText(textView.selectedRange)
+        UIPasteboard.general.string = text
+        let ns = s.mutableString
+        let startsLine = r.location == 0 || ns.character(at: r.location - 1) == 10
+        let endsLine = ns.character(at: r.location + r.length - 1) == 10
+        cutBlocks = startsLine && endsLine
+            ? (text, s.attributedSubstring(from: r), UIPasteboard.general.changeCount)
+            : nil
+        return perform(Surface.replace(s, r, with: ""))
+    }
+
+    /// Paste of the blocks just cut, unchanged, at a line's start: the
+    /// lines go back with their ids. Nil when this isn't that paste.
+    private func pasteCutBlocks() -> Surface.Edit? {
+        guard let c = cutBlocks, UIPasteboard.general.changeCount == c.changeCount, UIPasteboard.general.string == c.text else { return nil }
+        let s = textView.textStorage
+        let sel = textView.selectedRange
+        guard sel.length == 0, let line = Surface.line(at: sel.location, in: s), sel.location <= line.textRange.location else { return nil }
+        let ids = Set(Surface.blocks(c.lines).map(\.id))
+        // only while those ids aren't back already (a second paste is new text)
+        guard Surface.blocks(s).allSatisfy({ !ids.contains($0.id) }) else { return nil }
+        cutBlocks = nil
+        let empty = line.textRange.length == 0 && line.style == .paragraph && !baseline.contains { $0.id == line.id }
+        let at = NSRange(location: line.range.location, length: empty ? line.range.length : 0)
+        return Surface.Edit(range: at, replacement: c.lines, selection: NSRange(location: line.range.location + c.lines.length - 1, length: 0))
     }
 
     func toggle(_ mark: InlineMarks) {
@@ -630,7 +730,7 @@ final class SurfaceModel: NSObject {
             return
         }
         askForLink { [weak self] url in
-            guard let self, let url, !url.isEmpty else { return }
+            guard let self, self.editable, let url, !url.isEmpty else { return }
             let m = NSMutableAttributedString(attributedString: self.textView.textStorage.attributedSubstring(from: r))
             m.addAttribute(Surface.link, value: url, range: NSRange(location: 0, length: m.length))
             self.perform(Surface.Edit(range: r, replacement: m, selection: NSRange(location: r.location + r.length, length: 0)))
@@ -679,8 +779,11 @@ final class SurfaceModel: NSObject {
             quiet = true // shown at once, never proposed from here
             perform(e)
             quiet = false
-            if let b = Surface.blocks(s).first(where: { $0.id == id }), let k = baseline.firstIndex(where: { $0.id == id }) {
-                baseline[k].content = b.content.markdown
+            // the baseline takes the tick only: anything else typed in the
+            // list is still unsaved and still saves
+            if let k = baseline.firstIndex(where: { $0.id == id }),
+               let ticked = Checkbox.toggled(baseline[k].content, index: index, checked: checked) {
+                baseline[k].content = EditorBlockContent.parse(markdown: ticked).markdown
             }
             return
         }
@@ -701,11 +804,13 @@ final class SurfaceModel: NSObject {
 
     /// The sheet saved: the block takes the new markdown (text, if it now is text).
     func saveSource(_ id: BlockID, _ markdown: String) {
+        guard editable else { return }
         let content = EditorBlockContent.parse(markdown: markdown)
         perform(Surface.replaceBlock(textView.textStorage, id: id, with: content, selection: textView.selectedRange))
     }
 
     func deleteBlock(_ id: BlockID) {
+        guard editable else { return }
         guard let b = Surface.blocks(textView.textStorage).first(where: { $0.id == id }) else { return }
         perform(Surface.Edit(range: b.range, replacement: NSAttributedString(), selection: NSRange(location: b.range.location, length: 0)))
     }
@@ -757,9 +862,7 @@ final class SurfaceModel: NSObject {
             return
         }
         let s = tv.textStorage
-        let ls = Surface.lines(s)
-        guard !ls.isEmpty else { return }
-        let l = ls[Surface.lineIndex(ls, at: tv.selectedRange.location)]
+        guard let l = Surface.line(at: tv.selectedRange.location, in: s) else { return }
         let loc = tv.selectedRange.location
         guard loc >= l.textRange.location else { completion = nil; return }
         let before = (s.string as NSString).substring(with: NSRange(location: l.textRange.location, length: loc - l.textRange.location))
@@ -811,8 +914,13 @@ final class SurfaceModel: NSObject {
     /// baseline and queue the ops. Ops on a block in conflict go in their
     /// own propose on its older epoch, flagged.
     func save() {
+        guard editable else { unsaved = 0; return }
+        // an input method's composition isn't text yet: save once it commits
+        if textView.markedTextRange != nil {
+            saver.touch(0)
+            return
+        }
         unsaved = 0
-        guard editable else { return }
         let entries = Surface.entries(textView.textStorage, known: Set(baseline.map(\.id)))
         let ops = DocDiff.computeOps(baseline: baseline, entries: entries)
         guard !ops.isEmpty else { return }
@@ -906,6 +1014,8 @@ final class SurfaceModel: NSObject {
            let body = rec.bodyEpoch, body < landed { return }
         let before = abandoned + unpersisted
         guard var fresh = try? await cache.editor(for: docID) else { return }
+        // our edits parked for review stay on screen as ours until a human decides
+        if let parked = try? await cache.parkedOps(for: docID, openOps: openOps) { fresh.overlay(parked) }
         var seen: Set<String> = []
         for r in before + abandoned + unpersisted where seen.insert(r.requestID ?? "").inserted {
             fresh.overlay(r.ops.map(\.kind))
@@ -976,13 +1086,16 @@ final class SurfaceModel: NSObject {
         storage.replaceCharacters(in: old, with: out)
         var s = NSRange(location: caret ?? Surface.shifted(sel, by: old, newLength: out.length).location, length: 0)
         if caret == nil, sel.location < old.location { s = sel }
-        Surface.normalize(storage, selection: &s)
-        SurfaceLook.restyle(storage, range: NSRange(location: old.location, length: out.length), ctx: lookContext)
+        let lengthBefore = storage.length
+        Surface.normalize(storage, selection: &s, around: NSRange(location: old.location, length: out.length))
+        let outLength = out.length + storage.length - lengthBefore
+        SurfaceLook.restyle(storage, range: NSRange(location: old.location, length: outLength), ctx: lookContext)
         storage.endEditing()
         textView.selectedRange = s
         textView.contentOffset = offset
         reloading = false
-        forgetUndo()
+        // undo outside the refreshed blocks survives
+        remapUndo(span: old, newLength: outLength)
         updateTyping()
     }
 

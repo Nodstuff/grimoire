@@ -40,7 +40,8 @@ extension SurfaceModel: UITextViewDelegate, UIGestureRecognizerDelegate {
             return false
         }
         let ns = s.mutableString
-        let crosses = range.length > 0 && ns.range(of: "\n", options: .literal, range: range).location != NSNotFound
+        let crosses = range.length > 0 && (ns.range(of: "\n", options: .literal, range: range).location != NSNotFound
+            || ns.range(of: Surface.attachment, options: .literal, range: range).location != NSNotFound)
         if crosses || text.contains("\n") || text.contains("\r") {
             perform(Surface.replace(s, range, with: text, typing: textView.typingAttributes))
             return false
@@ -90,13 +91,21 @@ extension SurfaceModel: UITextViewDelegate, UIGestureRecognizerDelegate {
                 let loc = min(sel.location, s.length - 1)
                 sel = NSRange(location: loc, length: max(0, s.length - 1 - loc))
             }
-            if sel.length == 0 {
-                // never inside a list marker
-                let ls = Surface.lines(s)
-                let l = ls[Surface.lineIndex(ls, at: sel.location)]
-                if l.markerLength > 0, sel.location >= l.range.location, sel.location < l.range.location + l.markerLength {
-                    sel.location = l.range.location + l.markerLength
+            // neither end inside a list marker
+            if let l = Surface.line(at: sel.location, in: s), l.markerLength > 0,
+               sel.location >= l.range.location, sel.location < l.range.location + l.markerLength,
+               sel.length == 0 || sel.location > l.range.location {
+                let end = sel.location + sel.length
+                sel.location = l.range.location + l.markerLength
+                sel.length = max(0, end - sel.location)
+            }
+            if sel.length > 0, let l = Surface.line(at: sel.location + sel.length, in: s), l.markerLength > 0 {
+                let end = sel.location + sel.length
+                if end > l.range.location, end < l.range.location + l.markerLength {
+                    sel.length = l.range.location + l.markerLength - sel.location
                 }
+            }
+            if sel.length == 0 {
                 // nor inside a wikilink: to its nearer edge
                 if let run = Surface.expandToWikiLinks(sel, in: s) {
                     let loc = sel.location
@@ -165,4 +174,34 @@ extension SurfaceModel: UITextViewDelegate, UIGestureRecognizerDelegate {
     }
 
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+}
+
+/// Text dropped from another app: inserted through `Surface.replace`, so
+/// its lines become blocks the usual way (UIKit's own insert is cancelled).
+extension SurfaceModel: UITextDropDelegate {
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable, proposalForDrop drop: UITextDropRequest) -> UITextDropProposal {
+        guard editable, drop.dropSession.canLoadObjects(ofClass: NSString.self) else { return UITextDropProposal(operation: .forbidden) }
+        let proposal = UITextDropProposal(operation: .copy)
+        // we insert it (willPerformDrop), the view doesn't
+        proposal.dropPerformer = .delegate
+        return proposal
+    }
+
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable, willPerformDrop drop: UITextDropRequest) {
+        let at = textView.offset(from: textView.beginningOfDocument, to: drop.dropPosition)
+        _ = drop.dropSession.loadObjects(ofClass: NSString.self) { [weak self] items in
+            guard let text = items.first as? String else { return }
+            Task { @MainActor in self?.dropText(text, at: at) }
+        }
+    }
+
+    func textDroppableView(_ textDroppableView: UIView & UITextDroppable, dropSessionDidEnter session: any UIDropSession) {}
+
+    /// Insert dropped text at `location`.
+    func dropText(_ text: String, at location: Int) {
+        guard editable else { return }
+        let s = textView.textStorage
+        let at = min(max(0, location), max(0, s.length - 1))
+        perform(Surface.replace(s, NSRange(location: at, length: 0), with: text, typing: SurfaceLook.typing(s, at: at, pending: nil, ctx: lookContext)))
+    }
 }

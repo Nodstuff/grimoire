@@ -215,6 +215,130 @@ import UIKit
         h.tv.resignFirstResponder()
     }
 
+    // MARK: fix round 1
+
+    @Test func cutAndPasteOfWholeBlocksIsAMove() async throws {
+        let h = try Harness(blocks("one", "two", "three", ""))
+        let two = h.blocks[1].range
+        h.tv.selectedRange = two
+        #expect(h.model.handleCut())
+        #expect(h.markdown == ["one", "three", ""])
+        h.tv.selectedRange = NSRange(location: h.blocks[2].range.location, length: 0)
+        #expect(h.model.handlePaste())
+        #expect(h.markdown == ["one", "three", "two", ""])
+        #expect(h.ids.prefix(3) == ["b0", "b2", "b1"])
+        await h.model.flush()
+        let ops = try await h.queuedOps()
+        #expect(!ops.contains { if case .insert = $0 { true } else { false } }, "no insert: \(ops)")
+        #expect(!ops.contains(.delete(target: "b1")))
+        #expect(ops.contains { if case .move = $0 { true } else { false } })
+    }
+
+    @Test func aSecondPasteIsNewText() throws {
+        let h = try Harness(blocks("one", "two", ""))
+        h.tv.selectedRange = h.blocks[1].range
+        _ = h.model.handleCut()
+        h.tv.selectedRange = NSRange(location: h.blocks[1].range.location, length: 0)
+        _ = h.model.handlePaste()
+        h.tv.selectedRange = NSRange(location: h.blocks[2].range.location, length: 0)
+        _ = h.model.handlePaste()
+        #expect(Set(h.ids).count == h.ids.count, "no duplicate ids")
+    }
+
+    @Test func undoSurvivesARefreshOfAnotherBlock() throws {
+        let h = try Harness(blocks("first", "second", "third"))
+        guard let undo = h.tv.undoManager else { Issue.record("no undo manager"); return }
+        h.type("\n", at: h.location(of: "third") + 2) // a split, undoable
+        #expect(h.markdown == ["first", "second", "th", "ird"])
+        let remote = [
+            Block(id: "b0", docID: "d", parentID: nil, orderKey: "i", blockType: .paragraph, content: "first, longer now"),
+            Block(id: "b1", docID: "d", parentID: nil, orderKey: "r", blockType: .paragraph, content: "second"),
+            Block(id: "b2", docID: "d", parentID: nil, orderKey: "v", blockType: .paragraph, content: "third"),
+        ]
+        h.model.applyRemote(DocEditor(docID: "d", baseEpoch: 2, blocks: remote + [Block(id: h.ids[3], docID: "d", parentID: nil, orderKey: "x", blockType: .paragraph, content: "ird")]))
+        #expect(h.markdown.first == "first, longer now")
+        #expect(undo.canUndo, "the split is still undoable")
+        undo.undo()
+        #expect(h.markdown == ["first, longer now", "second", "third"])
+    }
+
+    @Test func undoOfABlockARefreshChangedIsDropped() async throws {
+        let h = try Harness(blocks("first", "second"))
+        guard let undo = h.tv.undoManager else { Issue.record("no undo manager"); return }
+        h.type("\n", at: 2)
+        await h.model.flush() // saved: the refresh may take theirs
+        let remote = [
+            Block(id: "b0", docID: "d", parentID: nil, orderKey: "i", blockType: .paragraph, content: "FI"),
+            Block(id: h.ids[1], docID: "d", parentID: nil, orderKey: "m", blockType: .paragraph, content: "rst"),
+            Block(id: "b1", docID: "d", parentID: nil, orderKey: "r", blockType: .paragraph, content: "second"),
+        ]
+        h.model.applyRemote(DocEditor(docID: "d", baseEpoch: 2, blocks: remote))
+        #expect(h.markdown.first == "FI")
+        #expect(!undo.canUndo, "that step would undo text that isn't there")
+    }
+
+    @Test func aViewerCantUndo() async throws {
+        let h = try Harness(blocks("a"))
+        guard let undo = h.tv.undoManager else { Issue.record("no undo manager"); return }
+        h.type("\n", at: 1)
+        await h.model.flush()
+        h.model.setEditable(false)
+        #expect(!undo.canUndo)
+        h.model.deleteBlock("b0")
+        h.model.saveSource("b0", "changed")
+        #expect(h.markdown == ["a", ""])
+    }
+
+    @Test func aToDoTickKeepsOtherTypingUnsaved() async throws {
+        let h = try Harness(blocks("- [ ] one\n- [ ] two"))
+        var ticked: [(BlockID, Int, Bool)] = []
+        h.model.onTodoCheckbox = { ticked.append(($0, $1, $2)) }
+        h.type("!", at: h.location(of: "one") + 3)
+        h.model.setChecked(line: 1, true)
+        #expect(ticked.count == 1 && ticked[0].1 == 1)
+        await h.model.flush()
+        #expect(try await h.queuedOps() == [.replace(target: "b0", content: "- [ ] one!\n- [x] two")], "the typing still saves")
+    }
+
+    @Test func nothingSavesMidComposition() async throws {
+        let h = try Harness(blocks("ab"))
+        let window = try h.inWindow()
+        defer { window.isHidden = true }
+        h.tv.becomeFirstResponder()
+        h.tv.selectedRange = NSRange(location: 2, length: 0)
+        h.tv.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0))
+        h.model.save()
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(try await h.queued().isEmpty)
+        h.tv.unmarkText()
+        h.tv.resignFirstResponder()
+    }
+
+    @Test func aReadOnlyCanvasRefreshes() throws {
+        let canvas = Block(id: "cv", docID: "d", parentID: nil, orderKey: "i", blockType: .canvasScene, content: "{\"v\":1}")
+        let h = try Harness([canvas], editable: false)
+        #expect(h.text.contains(Surface.attachment))
+        var changed = canvas
+        changed.content = "{\"v\":2}"
+        h.model.applyRemote(DocEditor(docID: "d", baseEpoch: 2, blocks: [changed]))
+        #expect(h.blocks.first?.content.markdown == "{\"v\":2}")
+    }
+
+    @Test func typingOverASelectedBlockReplacesIt() throws {
+        let h = try Harness(blocks("a", "```\ncode\n```", "z"))
+        h.tv.selectedRange = NSRange(location: h.location(of: Surface.attachment), length: 1)
+        #expect(!h.model.textView(h.tv, shouldChangeTextIn: h.tv.selectedRange, replacementText: "x"))
+        #expect(h.markdown == ["a", "x", "z"])
+    }
+
+    @Test func aRangedSelectionNeverEndsInsideAMarker() throws {
+        let h = try Harness(blocks("para", "- one"))
+        let one = h.location(of: "one")
+        h.tv.selectedRange = NSRange(location: 2, length: one - 1 - 2) // ends between • and the tab
+        h.model.textViewDidChangeSelection(h.tv)
+        #expect(h.tv.selectedRange.location + h.tv.selectedRange.length == one)
+    }
+
     // MARK: non-text blocks
 
     @Test func codeBlocksAreAttachments() async throws {
