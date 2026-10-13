@@ -26,9 +26,15 @@ import Testing
                 s.replaceCharacters(in: sel, with: NSAttributedString(string: "x", attributes: Surface.typingAttributes(s, at: sel.location)))
                 sel.location += 1
                 Surface.normalize(s, selection: &sel, around: NSRange(location: sel.location - 1, length: 1))
+                // what the app does next per keystroke: the caret's block
+                // (typing attributes, the bar) and the lines to restyle
+                _ = Surface.block(at: sel.location, in: s)
+                _ = Surface.block(at: sel.location, in: s)
+                _ = Surface.typingAttributes(s, at: sel.location)
+                _ = Surface.lines(s, in: NSRange(location: sel.location - 1, length: 1))
             }
         }
         print("10 keystrokes in a \(s.length)-character doc: \(took)")
-        #expect(took < .seconds(2))
+        #expect(took < .milliseconds(300), "under 30 ms a keystroke, debug build")
     }
 }
