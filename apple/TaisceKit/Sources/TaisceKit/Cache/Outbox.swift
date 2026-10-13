@@ -363,6 +363,10 @@ public struct OutboxReplayer: Sendable {
         public var forbidden = 0
         /// entries whose doc is gone (404): failed, kept, never retried on their own
         public var gone = 0
+        /// tree moves the server refused (each rolled back in the cache)
+        public var movesRefused = 0
+        /// the last refused move's words, for the UI
+        public var moveError: String?
     }
 
     /// Stored on an entry refused with 403: the workspace is view-only for you.
@@ -377,6 +381,17 @@ public struct OutboxReplayer: Sendable {
             // claim as it stands now: an earlier landing may have rebased it,
             // a coalescing save may have rewritten it
             guard let id = queued.id, let entry = try await cache.claimOutbox(id) else { continue }
+            let move = Cache.docMove(of: entry)
+            // a move to the top level waits on its label: refused, the move
+            // would file the doc in Unsorted instead
+            if let move, let label = try await cache.outboxEntry(key: Cache.labelKey(forMove: entry.idempotencyKey)), label.state == .failed {
+                let msg = Self.moveRefusal(.server(label.lastError ?? "its workspace label was refused"))
+                try await cache.markOutbox(id, state: .failed, error: msg)
+                await rollBackMove(move.doc)
+                report.movesRefused += 1
+                report.moveError = msg
+                continue
+            }
             do {
                 var r = try await api.request(entry.path, method: entry.method)
                 r.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -411,6 +426,15 @@ public struct OutboxReplayer: Sendable {
                 // 5xx, 408, 429, or a proxy's HTML page: try again later, keep order
                 try await cache.markOutbox(id, state: .pending, error: String(describing: e))
                 return report
+            } catch let e as APIError where move != nil {
+                // the server refused a move (a cycle, no write access on the
+                // doc or the new parent, a doc gone): it never lands, so the
+                // doc goes back to where the server has it
+                let msg = Self.moveRefusal(e)
+                try await cache.markOutbox(id, state: .failed, error: msg)
+                if let move { await rollBackMove(move.doc) }
+                report.movesRefused += 1
+                report.moveError = msg
             } catch let e as APIError where e.isForbidden {
                 // ADR 0004: read-only here (a viewer, or the role changed
                 // under us). Never retried on its own; the rest carry on.
