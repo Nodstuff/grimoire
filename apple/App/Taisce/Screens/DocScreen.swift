@@ -77,7 +77,8 @@ struct DocScreen: View {
         .onDisappear {
             appeared = false
             router.snapshotPrep[docID] = nil
-            if let surface { Task { await surface.flush(final: true); surface.stop(); await model.replayOutbox() } }
+            // back again before the flush ends (a quick Back): keep it running
+            if let surface { Task { await surface.flush(final: true); if !appeared { surface.stop() }; await model.replayOutbox() } }
         }
         // ADR 0004: made a viewer while editing: what's typed is saved
         // (the server says no, and the chip shows it), then read-only in place

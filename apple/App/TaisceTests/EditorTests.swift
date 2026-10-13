@@ -2,6 +2,7 @@ import Foundation
 import Testing
 import TaisceKit
 import UIKit
+import UniformTypeIdentifiers
 @testable import Taisce
 
 /// The one-surface editor's UIKit half: the real `SurfaceTextView`, driven
@@ -894,6 +895,20 @@ import UIKit
         a.append(NSAttributedString(string: "docs", attributes: [.link: URL(string: "https://example.org/docs")!]))
         a.append(NSAttributedString(string: " now", attributes: [.font: UIFont.boldSystemFont(ofSize: 12)]))
         #expect(RichPaste.markdown(from: a) == "Read the [docs](https://example.org/docs) **now**")
+    }
+
+    /// Code or plain prose copied as rich text (an editor, a terminal,
+    /// GitHub) pastes as its plain text: indentation and `#` lines kept.
+    @Test func richTextWithoutLinksOrWithCodeIsPlainText() throws {
+        let code = NSAttributedString(string: "# comment\n    indented()", attributes: [.font: UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)])
+        #expect(!RichPaste.worthConverting(code))
+        let plain = NSAttributedString(string: "just *prose*")
+        #expect(!RichPaste.worthConverting(plain))
+        let linked = NSAttributedString(string: "docs", attributes: [.link: URL(string: "https://example.org")!])
+        #expect(RichPaste.worthConverting(linked))
+        let html = Data("<pre># comment\n    indented()</pre>".utf8)
+        UIPasteboard.general.items = [[UTType.html.identifier: html, UTType.utf8PlainText.identifier: "# comment\n    indented()"]]
+        #expect(RichPaste.markdown(from: UIPasteboard.general) == nil)
     }
 
     /// 10: headings carry their level for VoiceOver; blocks have names;

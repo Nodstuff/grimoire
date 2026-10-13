@@ -146,8 +146,11 @@ final class SurfaceModel: NSObject {
             // the queue isn't known yet: blocks our unapplied ops wrote are
             // held (in conflict on their epoch), so no save quietly reverts
             // a parked edit; the queue, when it comes, settles them
+            // (a block already in a real conflict stays out of `parked`, so
+            // the queue settling the held ones never ends that conflict)
+            let real = Set(conflicts.keys)
             for (b, base) in held where conflicts[b] == nil { conflicts[b] = SurfaceConflict(base: base) }
-            parked = Set(held.keys)
+            parked = Set(held.keys).subtracting(real)
         }
         let model = SurfaceModel(docID: docID, editor: editor, cache: cache, api: api, app: app, editable: editable, saveDelay: saveDelay)
         // these conflicts' flagged writes went out before: nothing re-sent
@@ -287,6 +290,7 @@ final class SurfaceModel: NSObject {
             textView.footer = nil
         }
         textView.chromeDirty = true
+        textView.footerPlacementDirty = true
         textView.setNeedsLayout()
     }
 
@@ -366,6 +370,7 @@ final class SurfaceModel: NSObject {
 
     /// Restyle lines touching `range` (everything when nil).
     func restyle(_ range: NSRange? = nil) {
+        textView.footerPlacementDirty = true
         let storage = textView.textStorage
         let sel = textView.selectedRange
         let was = reloading
@@ -410,6 +415,7 @@ final class SurfaceModel: NSObject {
         }
         guard let r = found, let range = textRange(r) else { return }
         tlm.invalidateLayout(for: range)
+        textView.footerPlacementDirty = true
         textView.setNeedsLayout()
     }
 
@@ -468,7 +474,9 @@ final class SurfaceModel: NSObject {
         reloading = false
         updateTyping()
         changed()
-        textView.scrollRangeToVisible(textView.selectedRange)
+        // only an edit at the caret scrolls to it: a tick or a source save
+        // on an unfocused doc keeps the view where it is
+        if textView.isFirstResponder { textView.scrollRangeToVisible(textView.selectedRange) }
     }
 
     // MARK: undo
@@ -1290,6 +1298,7 @@ final class SurfaceModel: NSObject {
             }
         }
         let offset = textView.contentOffset
+        textView.footerPlacementDirty = true
         reloading = true
         storage.beginEditing()
         storage.replaceCharacters(in: old, with: out)

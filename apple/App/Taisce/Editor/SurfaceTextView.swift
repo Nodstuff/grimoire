@@ -72,7 +72,8 @@ final class SurfaceTextView: UITextView {
             let size = measure(footer, footerSize)
             if footerSize?.width != size.width { footerPlacementDirty = true }
             footerSize = size
-            let near = footerY == 0 || contentOffset.y + bounds.height * 2 >= footerY
+            // near the end, or the text shrank under a stale placement
+            let near = footerY == 0 || contentOffset.y + bounds.height * 2 >= footerY || footerY > contentSize.height
             if footerPlacementDirty || top != textContainerInset.top, near, let tlm = textLayoutManager {
                 tlm.ensureLayout(for: tlm.documentRange)
                 footerY = top + tlm.usageBoundsForTextContainer.maxY + 12
