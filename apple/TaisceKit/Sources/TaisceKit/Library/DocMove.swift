@@ -147,17 +147,26 @@ extension Cache {
     /// Queue a move (survives offline) and show it at once: the cached row
     /// takes its new parent and key now, and keeps them through tree
     /// refreshes until the write lands or is refused (then the replayer puts
-    /// the server's placement back).
+    /// the server's placement back and settles the row).
+    ///
+    /// `sortKey` nil = append: the server picks the key when the move lands
+    /// (`next_doc_sort_key`, after whatever siblings exist by then); the
+    /// cached row shows it after the last keyed sibling it knows of meanwhile.
     ///
     /// `keepWorkspace`: a move to the top level would drop an inherited
     /// workspace (the server files an unlabelled root in the mover's
     /// Unsorted), so the doc is labelled with it first, as its own queued
-    /// write; the move waits on that label (`labelKey`).
+    /// write; the move waits on that label (`labelKey`). Pass it only for a
+    /// doc whose workspace comes from its parent: if the move is refused
+    /// after the label landed, the label is undone (`workspace_id: null`),
+    /// which leaves such a doc resolving where it was.
     @discardableResult
-    public func enqueueDocMove(_ id: DocID, parent: DocID?, sortKey: String?, keepWorkspace: WorkspaceID? = nil, key: String = UUID().uuidString.lowercased(), now: Date = .now) async throws -> OutboxEntry {
+    public func enqueueDocMove(_ id: DocID, parent: DocID?, sortKey: String? = nil, keepWorkspace: WorkspaceID? = nil, key: String = UUID().uuidString.lowercased(), now: Date = .now) async throws -> OutboxEntry {
         let body = try JSONEncoder().encode(APIClient.MoveDocBody(parentID: parent, sortKey: sortKey))
+        // the server's request_id is a UUID: a fresh one, stored in the body,
+        // so every replay of this row sends the same one
         let label: Data? = try (parent == nil ? keepWorkspace : nil).map {
-            try JSONEncoder().encode(APIClient.DocWorkspaceBody(workspaceID: $0, requestID: Self.labelKey(forMove: key)))
+            try JSONEncoder().encode(APIClient.DocWorkspaceBody(workspaceID: $0, requestID: UUID().uuidString.lowercased()))
         }
         return try await db.write { db in
             if let existing = try OutboxEntry.filter(OutboxEntry.Columns.idempotencyKey == key).fetchOne(db) {
@@ -175,13 +184,31 @@ extension Cache {
                 path: "/api/doc/\(id)/move", body: body, state: .pending, attempts: 0, lastError: nil
             )
             try e.insert(db)
-            try Self.place(db, id, parent: parent, sortKey: sortKey)
+            try Self.place(db, id, parent: parent, sortKey: sortKey ?? Self.appendKey(db, id, under: parent))
             return e
         }
     }
 
     /// The label write a move to the top level waits on.
     public static func labelKey(forMove key: String) -> String { "\(key):label" }
+    /// Undoing that label after the move was refused.
+    public static func unlabelKey(forMove key: String) -> String { "\(key):unlabel" }
+
+    enum MoveLabelRole { case label, undo }
+
+    /// Whether `e` is a move's label write or its undo.
+    static func moveLabelRole(of e: OutboxEntry) -> MoveLabelRole? {
+        guard e.method == "PUT", e.path.hasSuffix("/workspace") else { return nil }
+        if e.idempotencyKey.hasSuffix(":label") { return .label }
+        if e.idempotencyKey.hasSuffix(":unlabel") { return .undo }
+        return nil
+    }
+
+    /// Queue the undo of a refused move's landed label.
+    func enqueueUnlabel(_ id: DocID, moveKey: String, now: Date = .now) async throws {
+        let body = try JSONEncoder().encode(APIClient.DocWorkspaceBody(workspaceID: nil, requestID: UUID().uuidString.lowercased()))
+        try await enqueue(method: "PUT", path: "/api/docs/\(id)/workspace", body: body, key: Self.unlabelKey(forMove: moveKey), now: now)
+    }
 
     public func outboxEntry(key: String) async throws -> OutboxEntry? {
         try await db.read { db in try OutboxEntry.filter(OutboxEntry.Columns.idempotencyKey == key).fetchOne(db) }
@@ -214,6 +241,13 @@ extension Cache {
         try db.execute(sql: "UPDATE docs SET parent_id = ?, sort_key = ? WHERE id = ?", arguments: [parent, sortKey, id])
     }
 
+    /// After the last keyed sibling under `parent` (not counting `id`): what
+    /// the server's `next_doc_sort_key` does when the append lands.
+    static func appendKey(_ db: Database, _ id: DocID, under parent: DocID?) throws -> String {
+        let last = try String.fetchOne(db, sql: "SELECT MAX(sort_key) FROM docs WHERE parent_id IS ? AND id != ?", arguments: [parent, id])
+        return OrderKey.between(last, nil)
+    }
+
     static func queuedMoves(_ db: Database) throws -> [QueuedDocMove] {
         try OutboxEntry
             .filter([OutboxEntry.State.pending.rawValue, OutboxEntry.State.inflight.rawValue].contains(OutboxEntry.Columns.state))
@@ -226,7 +260,10 @@ extension Cache {
     /// The server's tree rows don't know about our queued moves yet: keep
     /// showing them (the newest per doc wins, as it will on the server).
     static func reapplyQueuedMoves(_ db: Database) throws {
-        for m in try queuedMoves(db) { try place(db, m.doc, parent: m.parent, sortKey: m.sortKey) }
+        for m in try queuedMoves(db) {
+            let key = try m.sortKey ?? appendKey(db, m.doc, under: m.parent)
+            try place(db, m.doc, parent: m.parent, sortKey: key)
+        }
     }
 }
 
@@ -242,13 +279,40 @@ extension OutboxReplayer {
         if why.contains("nest under itself") { return "Couldn't move it: a doc can't go inside itself." }
         if case .notFound = e { return "Couldn't move it: that doc or folder no longer exists." }
         var text = why
-        for prefix in ["forbidden: ", "invalid op: ", "move: "] where text.hasPrefix(prefix) { text.removeFirst(prefix.count) }
+        for prefix in ["Couldn't move it: ", "forbidden: ", "invalid op: ", "move: "] where text.hasPrefix(prefix) {
+            text.removeFirst(prefix.count)
+        }
         return "Couldn't move it: \(text)"
     }
 
+    /// Settle a refused move: its row (and a refused label's) is done, with
+    /// the reason, so it never counts as an unsent change; the doc goes back
+    /// where the server has it; a label that already landed is undone.
+    /// Returns whether a follow-up write was queued.
+    func refuseMove(_ entry: OutboxEntry, _ move: QueuedDocMove, message: String, report: inout Report) async throws -> Bool {
+        guard let id = entry.id else { return false }
+        try await cache.markOutbox(id, state: .done, error: message)
+        var undo = false
+        if let label = try await cache.outboxEntry(key: Cache.labelKey(forMove: entry.idempotencyKey)), let lid = label.id {
+            switch label.state {
+            case .failed:
+                try await cache.markOutbox(lid, state: .done, error: label.lastError)
+            case .done where label.lastError == nil:
+                try await cache.enqueueUnlabel(move.doc, moveKey: entry.idempotencyKey)
+                undo = true
+            default:
+                break
+            }
+        }
+        await rollBackMove(move.doc)
+        report.refusedMoves.append(RefusedMove(key: entry.idempotencyKey, doc: move.doc, message: message))
+        return undo
+    }
+
     /// A move was refused: put the doc back where the server has it (or
-    /// drop it, if it's gone). Best effort: offline, the next tree refresh
-    /// settles it (the refused row no longer counts as queued).
+    /// drop it, if it's gone), with any later queued moves laid back on top.
+    /// Best effort: offline, the next tree refresh settles it (the refused
+    /// row no longer counts as queued).
     func rollBackMove(_ doc: DocID) async {
         do {
             let tree = try await api.doc(doc)

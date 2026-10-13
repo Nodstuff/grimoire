@@ -9,6 +9,11 @@ import Testing
     {"id":"w2","name":"Home","color":null,"icon":null,"sort_key":"a","created_at":"2026-10-01T09:00:00Z","doc_ids":[],"doc_count":0}],"unsorted_count":2}
     """#
 
+    // the PUT route's ids are UUIDs (MockServer checks, as the daemon does)
+    static let d1 = "0199a000-0000-7000-8000-0000000000d1"
+    static let w1 = "0199a000-0000-7000-8000-0000000000e1"
+    static let r1 = "0199a000-0000-7000-8000-0000000000c1"
+
     func body(_ r: URLRequest) throws -> [String: Any] {
         let data = try #require(r.httpBody)
         return try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -34,17 +39,17 @@ import Testing
 
     @Test func moveToSendsPutWithRequestID() async throws {
         let server = MockServer { _ in .json(#"{"doc_id":"d1","label":"w1","workspace_id":"w1"}"#) }
-        let out = try await server.client().setDocWorkspace("d1", workspaceID: "w1", requestID: "r1")
+        let out = try await server.client().setDocWorkspace(Self.d1, workspaceID: Self.w1, requestID: Self.r1)
         #expect(out.workspaceID == "w1" && out.label == "w1")
         let r = try #require(server.requests.last)
-        #expect(r.httpMethod == "PUT" && r.url?.path() == "/api/docs/d1/workspace")
+        #expect(r.httpMethod == "PUT" && r.url?.path() == "/api/docs/\(Self.d1)/workspace")
         let b = try body(r)
-        #expect(b["workspace_id"] as? String == "w1" && b["request_id"] as? String == "r1")
+        #expect(b["workspace_id"] as? String == Self.w1 && b["request_id"] as? String == Self.r1)
     }
 
     @Test func moveToUnsortedSendsAnExplicitNull() async throws {
         let server = MockServer { _ in .json(#"{"doc_id":"d1","label":null,"workspace_id":null}"#) }
-        _ = try await server.client().setDocWorkspace("d1", workspaceID: nil, requestID: "r2")
+        _ = try await server.client().setDocWorkspace(Self.d1, workspaceID: nil, requestID: UUID().uuidString)
         let last = try #require(server.requests.last)
         let b = try body(last)
         #expect(b.keys.contains("workspace_id") && b["workspace_id"] is NSNull)
