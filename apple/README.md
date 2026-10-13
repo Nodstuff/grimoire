@@ -300,6 +300,41 @@ changed elsewhere; the alerts themselves stay local. The server sends
   newData / noData / failed. A push whose `seq` the cursor already passed,
   or one arriving while the stream is live, only reconciles.
 
+## Library tree
+
+The Library (compact width) and the sidebar's Library section (iPad, Mac)
+show the current workspace's slice of the doc tree. A folder is any doc with
+children. Context menu: Pin, New doc here, **Move to…**, Move to workspace…,
+Delete.
+
+Moving a doc (`POST /api/doc/{id}/move` `{parent_id, sort_key}`):
+
+- **Drag** a row onto another row: it becomes that doc's last child (the
+  target opens, and becomes a folder if it wasn't). Drag onto the **Library
+  header** for the top level. Rows carry `DocDrag` (`taisce-doc:<id>` text,
+  so plain text dragged in is refused; no custom UTType).
+- **Move to…** (`MoveDocSheet`): a searchable list of the docs in the same
+  workspace it can go under, plus Top level; the non-drag path for touch,
+  VoiceOver and the keyboard.
+- Rules (`DocMoves`, pure; `DocPlacement` in TaisceKit): never into itself or
+  its own subtree (the server refuses the cycle too), only within its own
+  workspace (a workspace change is Move to workspace…), never in a workspace
+  you only view (`EditAccess.canReparent`: owner or editor; LOCAL mode and
+  Unsorted are yours). The top level is an owner's call (`canMove`): the
+  server files an unlabelled root in the mover's Unsorted and lets only a
+  workspace's owner re-home its top-level docs, so a move to the top of a
+  workspace labels the doc with it first (a queued `PUT
+  /api/docs/{id}/workspace` the move waits on).
+- Offline first: `Cache.enqueueDocMove` queues the write and places the
+  cached row at once (the sort key is minted on the device, after the last
+  keyed sibling, as the web's `keyForPosition`); tree refreshes and change
+  rows keep showing queued moves until they land. A refusal (cycle, 403,
+  404) puts the doc back where the server has it (`GET /api/doc/{id}`; a
+  gone doc is dropped), keeps the entry as failed with the server's reason,
+  and Library shows it in a "Couldn't move" alert (also Settings' last error).
+- Not yet: dropping between rows to reorder siblings (`DocPlacement.place`
+  computes before/after keys; there is no drop indicator for it yet).
+
 ## Editing (groundwork, no UI)
 ## Editing
 
