@@ -69,10 +69,11 @@ extension Cache {
     }
 
     /// Our ops on `docID` the gate parked (red, not applied) that still
-    /// wait for a human (in `openOps` when known), oldest first: an open
-    /// editor overlays them so a parked edit stays on screen as ours until
-    /// it is accepted or rejected (a rejection drops it from the queue).
-    public func parkedOps(for docID: DocID, openOps: Set<String>? = nil, now: Date = .now) async throws -> [BlockOp] {
+    /// the server's review queue still holds (`openOps`, as fetched from the
+    /// server: never guessed), oldest first, each with the epoch it was
+    /// proposed on. An open editor keeps showing them as ours, on the
+    /// conflict path, until a human decides (`ParkedEdits`).
+    public func parkedOps(for docID: DocID, openOps: Set<String>, now: Date = .now) async throws -> [ParkedOp] {
         let rows = try await db.read { db in
             try OutboxEntry
                 .filter(OutboxEntry.Columns.state == OutboxEntry.State.done.rawValue)
@@ -82,15 +83,14 @@ extension Cache {
                 .order(OutboxEntry.Columns.id)
                 .fetchAll(db)
         }
-        var out: [BlockOp] = []
+        var out: [ParkedOp] = []
         for e in rows {
             guard let body = e.body, let data = e.outcome,
                   let req = try? JSONDecoder().decode(ProposeRequest.self, from: body), req.docID == docID,
                   let outcome = try? JSONDecoder().decode(ProposeOutcome.self, from: data)
             else { continue }
-            for (i, v) in outcome.verdicts.enumerated() where !v.applied && i < req.ops.count {
-                if let open = openOps, !open.contains(v.opID) { continue }
-                out.append(req.ops[i].kind)
+            for (i, v) in outcome.verdicts.enumerated() where !v.applied && i < req.ops.count && openOps.contains(v.opID) {
+                out.append(ParkedOp(kind: req.ops[i].kind, baseEpoch: req.baseEpoch, opID: v.opID))
             }
         }
         return out

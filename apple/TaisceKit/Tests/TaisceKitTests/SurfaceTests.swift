@@ -402,6 +402,13 @@ import Testing
         #expect(Set(h.ops()) == [.delete(target: "c"), .replace(target: "a", content: "al")])
     }
 
+    @Test func deletingAWholeLineAboveANonTextBlockDeletesThatBlock() {
+        var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("c", "```\ncode\n```", key: "m", type: .code), Self.b("z", "zed", key: "r")])
+        h.replace(NSRange(location: 0, length: 6), with: "")
+        #expect(h.ids == ["c", "z"])
+        #expect(h.ops() == [.delete(target: "a")])
+    }
+
     @Test func typingOverASelectedNonTextBlockReplacesIt() {
         var h = Harness([Self.b("a", "alpha", key: "i"), Self.b("c", "```\ncode\n```", key: "m", type: .code), Self.b("z", "zed", key: "r")])
         h.replace(NSRange(location: h.location(of: Surface.attachment), length: 1), with: "x")

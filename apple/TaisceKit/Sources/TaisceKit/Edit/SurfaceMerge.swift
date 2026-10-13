@@ -43,6 +43,7 @@ public enum SurfaceMerge {
         conflicts: [BlockID: SurfaceConflict],
         oldEpoch: Int,
         server: [Block],
+        parked: Set<BlockID> = [],
         mint: () -> BlockID = Surface.newID
     ) -> Result {
         let base = Dictionary(baseline.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
@@ -59,7 +60,9 @@ public enum SurfaceMerge {
             case let (b?, l?):
                 let md = l.markdown
                 if var c = conflicts[s.id] {
-                    if sc == md {
+                    if parked.contains(s.id) {
+                        // our parked edit (overlaid): in conflict until a human decides
+                    } else if sc == md {
                         // the other side took ours (accepted on the desktop): over
                         conflicts[s.id] = nil
                     } else {

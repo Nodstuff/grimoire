@@ -584,6 +584,15 @@ public enum Surface {
             range = NSRange(location: range.location + max(0, cut), length: max(0, range.length - max(0, cut)))
             if range.location >= ns.length { range = NSRange(location: ns.length, length: 0) }
         }
+        // whole lines deleted up to a non-text block: those blocks go, no join
+        if typed.isEmpty, range.length > 0, range.location + range.length < ns.length,
+           ns.character(at: range.location + range.length - 1) == newline,
+           let next = line(at: range.location + range.length, in: s), next.style == .raw,
+           let first = line(at: range.location, in: s), range.location <= first.textRange.location {
+            let start = first.range.location
+            return Edit(range: NSRange(location: start, length: range.location + range.length - start), replacement: NSAttributedString(),
+                        selection: NSRange(location: start, length: 0))
+        }
         // never end by taking the line break before a non-text block
         // (that would join it to the text above): keep that break
         var end = range.location + range.length

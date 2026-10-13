@@ -218,9 +218,9 @@ import Testing
         let after = try await cache.reviews(for: "d1", openOps: ["y1"])
         #expect(after["p1"] == nil && after["p2"]?.verdict == .yellow)
         // a parked op stays ours on screen while it waits, not after
-        #expect(try await cache.parkedOps(for: "d1") == [.replace(target: "p1", content: "x")])
-        #expect(try await cache.parkedOps(for: "d1", openOps: ["r1"]) == [.replace(target: "p1", content: "x")])
-        #expect(try await cache.parkedOps(for: "d1", openOps: ["y1"]).isEmpty)
+        #expect(try await cache.parkedOps(for: "d1", openOps: ["r1"]) == [ParkedOp(kind: .replace(target: "p1", content: "x"), baseEpoch: 5, opID: "r1")])
+        #expect(try await cache.parkedOps(for: "d1", openOps: ["y1"]).isEmpty, "decided: no longer parked")
+        #expect(try await cache.parkedOps(for: "d1", openOps: []).isEmpty)
         // a later green for the same block clears it
         try await cache.enqueue(replace("p2", "y2"))
         let green = MockServer { _ in .json(#"{"doc_id":"d1","epoch":7,"verdicts":[{"op_id":"g2","block_id":"p2","verdict":"green","confidence":1,"applied":true,"note":""}]}"#) }
