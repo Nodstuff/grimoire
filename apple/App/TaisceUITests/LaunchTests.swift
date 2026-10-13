@@ -21,7 +21,14 @@ final class LaunchTests: XCTestCase {
         #else
         doc.tap()
         #endif
-        XCTAssertTrue(app.staticTexts["Welcome to Taisce"].waitForExistence(timeout: 15), "the body rendered")
+        // the doc is one editing surface (a text view), not static texts
+        let body = app.textViews.firstMatch
+        XCTAssertTrue(body.waitForExistence(timeout: 15), "the doc opened")
+        let end = Date().addingTimeInterval(15)
+        while !((body.value as? String) ?? "").contains("Welcome to Taisce"), Date() < end {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        }
+        XCTAssertTrue(((body.value as? String) ?? "").contains("Welcome to Taisce"), "the body rendered")
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.lifetime = .keepAlways
         add(shot)
