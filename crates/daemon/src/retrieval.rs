@@ -536,6 +536,8 @@ pub fn grep(store: &SqliteStore, pattern: &str, opts: GrepOpts) -> Result<GrepOu
     let blocks = store.live_blocks_with_titles().map_err(|e| e.to_string())?;
     let docs = DocMap::load(store);
     let answers = if opts.exclude_answers { crate::ask::answers_folder_id(store) } else { None };
+    // once, not a doc lookup per block per level
+    let answer_docs = crate::ask::answers_subtree(store, answers);
 
     let mut groups: Vec<GrepGroup> = Vec::new();
     let mut index: HashMap<Uuid, usize> = HashMap::new();
@@ -543,7 +545,7 @@ pub fn grep(store: &SqliteStore, pattern: &str, opts: GrepOpts) -> Result<GrepOu
     for h in blocks.iter() {
         if scope.as_ref().is_some_and(|s| !s.contains(&h.block.doc_id))
             || (!opts.include_hidden && is_hidden(h))
-            || crate::ask::under_answers(store, h.block.doc_id, answers)
+            || answer_docs.contains(&h.block.doc_id)
         {
             continue;
         }

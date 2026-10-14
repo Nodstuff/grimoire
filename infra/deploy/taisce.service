@@ -7,6 +7,9 @@ Wants=network-online.target
 User=taisce
 Group=taisce
 Environment=HOME=/var/lib/taisce
+# the box's clock for "today" (read_doc's header) and local-time schedules:
+# the people on this server are in Ireland (the box itself runs UTC)
+Environment=TZ=Europe/Dublin
 Environment=TAISCE_PUBLIC_URL=https://taisce.null.ie
 Environment=TAISCE_TRUSTED_PROXY=true
 ExecStartPre=-+/opt/taisce/bin/apns-key.sh

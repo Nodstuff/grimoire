@@ -122,7 +122,7 @@ def run(base):
     m = Mcp(url)
     step("tools")
     names = m.tools()
-    check("16 tools", len(names) == 16, ", ".join(sorted(names)))
+    check("17 tools", len(names) == 17, ", ".join(sorted(names)))
     for gone in ["identify", "tree", "list_docs", "read_block", "list_comments", "my_proposals", "review_queue", "rename_doc", "backlinks"]:
         check(f"{gone} removed", gone not in names)
 
@@ -216,7 +216,9 @@ def run(base):
     step("dedupe: an identical retry replays")
     err, first = m.call("append", doc_id=doc, markdown="once only", **{"as": "claude:smoke"})
     err2, again = m.call("append", doc_id=doc, markdown="once only", **{"as": "claude:smoke"})
-    check("replayed verdict", not err and not err2 and first == again, again)
+    # a replay says so on its first line, then repeats the original verdict
+    replay_line, _, replayed = again.partition("\n")
+    check("replayed verdict", not err and not err2 and replay_line.startswith("replay · ") and replayed == first, again)
     err, out = m.call("read_doc", doc_id=doc)
     check("applied once", out.count("once only") == 1)
 

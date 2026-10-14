@@ -98,9 +98,9 @@ account may be flipped to the work account by other sessions — push with
   in-flight gardener runs get orphaned). `./release.sh` = signed + notarized dmg.
 
 ## Writing to Taisce over MCP (this repo's own docs live in it)
-- 16 tools (AX 2): `find_doc`, `orient`, `read_doc`, `edit_doc`, `append`, `propose_markdown`,
+- 17 tools (AX 2): `find_doc`, `orient`, `read_doc`, `edit_doc`, `append`, `propose_markdown`,
   `propose`, `diff_since`, `search`, `grep`, `related`, `create_doc`, `doc_op`, `add_comment`,
-  `resolve`, `proposals`. `edit_doc(old, new)` and `append(markdown, to, create_missing)` need no
+  `resolve`, `proposals`, `style_guide` (the caller's own doc titled "Technical Style Guide"). `edit_doc(old, new)` and `append(markdown, to, create_missing)` need no
   epoch; `read_doc` is text (`doc <id> · epoch N · path` + markdown; `refs: true` for `^abc123`).
 - Attribution: pass `as: "claude:grimoire-<task>"` on every attributing call (`edit_doc`, `append`,
   `propose`, `propose_markdown`, `create_doc`, `doc_op`, `add_comment`, `resolve`, `proposals`), or

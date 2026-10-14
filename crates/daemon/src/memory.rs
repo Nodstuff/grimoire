@@ -238,7 +238,9 @@ pub fn sync(store: &taisce_store::SharedStore, scope: taisce_store::Scope, root:
                 }
                 Some(doc_id) => {
                     let tree = s.read_doc(doc_id)?;
-                    let mut ops = taisce_store::mddiff::markdown_to_ops(&tree.roots, &doc_md);
+                    // the mirror follows the file exactly: a header the file
+                    // dropped goes too (not the agent path's keep-what-was-omitted)
+                    let mut ops = taisce_store::mddiff::markdown_to_ops_from(&tree.roots, &doc_md, "memory");
                     if ops.is_empty() {
                         report.unchanged += 1;
                     } else {

@@ -770,7 +770,7 @@ fn replay(prev: &Value, age: Option<Duration>, verbose: bool) -> Result<CallTool
         ok_json(&full)
     } else {
         ok_text(format!(
-            "replay · an identical call was answered {}; not re-applied\n{}",
+            "replay · an identical call was answered {}; not re-applied (to add the same text again on purpose, make the call differ, e.g. its wording or `to`)\n{}",
             ago,
             prev["text"].as_str().unwrap_or_default()
         ))
@@ -1061,12 +1061,15 @@ fn doc_header(store: &SqliteStore, doc: &taisce_store::Doc) -> String {
         .map(|docs| crate::nav::breadcrumbs(&docs))
         .and_then(|c| c.get(&doc.id).cloned())
         .unwrap_or_else(|| doc.title.clone());
-    format!(
-        "doc {} · epoch {} · {path} · today {}",
-        doc.id,
-        doc.current_epoch,
-        chrono::Local::now().format("%Y-%m-%d")
-    )
+    format!("doc {} · epoch {} · {path} · today {}", doc.id, doc.current_epoch, server_today())
+}
+
+/// The server's date and its UTC offset ("2026-10-14 UTC+01:00"): the box's
+/// clock (its `TZ`), labeled with the offset because it may not be the
+/// reader's — an agent can see what "today" means and correct for its own.
+pub(crate) fn server_today() -> String {
+    let now = chrono::Local::now();
+    format!("{} UTC{}", now.format("%Y-%m-%d"), now.format("%:z"))
 }
 
 /// Blocks as markdown, optionally each under its `^ref` line.
@@ -1348,7 +1351,7 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Read a doc as markdown: first line 'doc <id> · epoch <N> · <path> · today <YYYY-MM-DD>', then the content (comments and canvases excluded). refs: true puts a ^abc123 line above each block; section: a heading path or ref reads just that section; block: just one block; comments: true appends the comment threads; mode 'outline' gives the JSON shape instead.",
+        description = "Read a doc as markdown: first line 'doc <id> · epoch <N> · <path> · today <YYYY-MM-DD UTC±hh:mm>' (the server's date and offset), then the content (comments and canvases excluded). refs: true puts a ^abc123 line above each block; section: a heading path or ref reads just that section; block: just one block; comments: true appends the comment threads; mode 'outline' gives the JSON shape instead.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_doc(
@@ -1439,7 +1442,8 @@ impl KsMcp {
 
     #[tool(
         description = "Edit like the Edit tool: replace `old` (exact text from read_doc; whitespace-tolerant) with `new` in one doc — no epoch needed, the diff is taken against the live doc and proposed through the gate. Exactly one match unless replace_all; zero matches names the closest block, several list their ^refs so you can widen `old`. Answers with a one-line verdict.",
-        annotations(idempotent_hint = true, open_world_hint = false)
+        // replacing text can remove it (through the gate); a repeat finds no `old`
+        annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn edit_doc(
         &self,
@@ -1451,7 +1455,8 @@ impl KsMcp {
 
     #[tool(
         description = "Add markdown to a doc without an epoch: at the end (default), or into a section named by heading path ('grimoire › Plans', '## x / ### y') or block ref, at: 'end' | 'start'. create_missing: true creates absent headings (the daily-log case). One-line verdict.",
-        annotations(idempotent_hint = true, open_world_hint = false)
+        // additive; not idempotent (an identical call after the replay window adds again)
+        annotations(destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     async fn append(
         &self,
@@ -1463,7 +1468,8 @@ impl KsMcp {
 
     #[tool(
         description = "Full rewrite: hand over the doc's complete new markdown with the epoch from your read_doc; the server diffs it against the current blocks (unchanged blocks keep ids and comments) and proposes the minimal ops. A stale epoch is refused with the missed ops — re-read and re-send. Prefer edit_doc/append for local changes.",
-        annotations(idempotent_hint = true, open_world_hint = false)
+        // a rewrite can remove blocks; the same markdown again is no change
+        annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn propose_markdown(
         &self,
@@ -1475,7 +1481,8 @@ impl KsMcp {
 
     #[tool(
         description = "Surgical block ops (insert/replace/delete/move by block id) at a base_epoch from read_doc; a stale base is scored per op (unchanged targets still green) and a refused one lists the missed ops (diff_since). Inserts may omit block_id; order_key '' appends, 'after:<uuid>' places. Use edit_doc/append unless you need explicit ops.",
-        annotations(idempotent_hint = true, open_world_hint = false)
+        // explicit deletes; repeated inserts add again
+        annotations(destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn propose(
         &self,
@@ -1667,19 +1674,25 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "This vault's documentation style guide — the conventions every doc here should follow. Call it before writing, restructuring or formatting docs. Serves the doc titled 'Technical Style Guide'; edit that doc to change what it serves.",
+        description = "Your documentation style guide — the conventions docs here should follow. Call it before writing, restructuring or formatting docs. Serves the doc titled 'Technical Style Guide' that you can see (yours, or one shared with you); edit that doc to change what it serves.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
-    async fn style_guide(&self) -> Result<CallToolResult, McpError> {
-        self.style_guide_impl().await
+    async fn style_guide(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+        self.style_guide_impl(RequestHint::from_ctx(&ctx)).await
     }
 
-    pub(crate) async fn style_guide_impl(&self) -> Result<CallToolResult, McpError> {
-        with_store(&self.store, Scope::System, |store| {
-            // The guide is instance-level: one per vault, there for every
-            // user's agents, so it is read under System rather than the
-            // caller's scope. Exact title; v7 ids are time-ordered, so the
-            // oldest doc wins if two share the title.
+    pub(crate) async fn style_guide_impl(&self, hint: RequestHint) -> Result<CallToolResult, McpError> {
+        let scope = match self.scope_of(&hint) {
+            Ok(s) => s,
+            Err(m) => return err(m),
+        };
+        with_store(&self.store, scope, |store| {
+            // In the caller's scope, like every request (CLAUDE.md, the Scope
+            // rule): a guide is a doc, and a doc is only ever served to whoever
+            // may see it — under System, anyone naming a doc this title would
+            // have it served (and its instructions followed) by every user's
+            // agents. Exact title; v7 ids are time-ordered, so the oldest doc
+            // the caller can see wins if two share the title.
             let doc = store
                 .list_docs()
                 .ok()
@@ -1703,7 +1716,8 @@ impl KsMcp {
 
     #[tool(
         description = "Create a doc, optionally with its whole markdown in the same call. if_exists 'reuse' is an atomic find-or-create by exact title under the parent (use it for daily docs); the default 'error' refuses a duplicate. Answers 'ok · created|reused \"Title\" · doc <id> · epoch N'.",
-        annotations(idempotent_hint = true, open_world_hint = false)
+        // additive; a repeat reuses or refuses the duplicate
+        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn create_doc(
         &self,
@@ -1727,7 +1741,8 @@ impl KsMcp {
 
     #[tool(
         description = "Comment on a block (^abc123 or UUID), or reply within a thread via reply_to. Comments are blocks with provenance; threads survive edits. Read them with read_doc(comments: true).",
-        annotations(idempotent_hint = true, open_world_hint = false)
+        // additive; not idempotent past the replay window
+        annotations(destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     async fn add_comment(
         &self,
@@ -2019,16 +2034,12 @@ impl KsMcp {
                     summary.join(", ")
                 ));
             }
-            let ops = taisce_store::mddiff::markdown_to_ops(&tree.roots, &p.markdown);
-            // "omitted means unchanged": if the doc carried frontmatter and
-            // the markdown doesn't, mddiff preserved it — say so, or the
-            // agent believes its omission was applied.
-            let note = (tree
-                .roots
-                .iter()
-                .any(|n| taisce_store::import::is_frontmatter(&n.block.content))
-                && !taisce_store::mddiff::markdown_has_frontmatter(&p.markdown))
-            .then(|| "frontmatter preserved — the markdown carried none; pass it explicitly to change it");
+            // "omitted means unchanged": when mddiff kept frontmatter the
+            // markdown left out, say so (from mddiff's own report, so the note
+            // can't disagree with what was done), or the agent believes its
+            // omission was applied.
+            let (ops, kept) = taisce_store::mddiff::markdown_to_ops_report(&tree.roots, &p.markdown);
+            let note = kept.then_some("frontmatter preserved — the markdown carried none; pass it explicitly to change it");
             if ops.is_empty() {
                 return match note {
                     Some(n) => ok_text(format!(
@@ -2597,11 +2608,23 @@ mod tests {
             assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
             assert_ne!(a.destructive_hint, Some(true), "{name} must not be destructive");
         }
-        for name in ["doc_op", "resolve"] {
-            assert_eq!(ann(name).destructive_hint, Some(true), "{name} should be destructive");
+        // rmcp/MCP read a missing destructive_hint as true: every write says
+        for name in ["doc_op", "resolve", "edit_doc", "propose", "propose_markdown"] {
+            assert_eq!(ann(name).destructive_hint, Some(true), "{name} can remove content");
         }
-        for name in ["edit_doc", "append", "propose", "propose_markdown", "create_doc", "add_comment"] {
-            assert_eq!(ann(name).idempotent_hint, Some(true), "{name} retries replay safely");
+        for name in ["append", "create_doc", "add_comment"] {
+            assert_eq!(ann(name).destructive_hint, Some(false), "{name} only adds");
+        }
+        // idempotent only where a repeat truly changes nothing (not just within the replay window)
+        for name in ["edit_doc", "propose_markdown", "create_doc"] {
+            assert_eq!(ann(name).idempotent_hint, Some(true), "{name}: a repeat changes nothing");
+        }
+        for name in ["append", "add_comment", "propose"] {
+            assert_eq!(ann(name).idempotent_hint, Some(false), "{name}: a repeat after the window adds again");
+        }
+        for t in &tools {
+            let a = t.annotations.clone().unwrap_or_else(|| panic!("{} has no annotations", t.name));
+            assert!(a.read_only_hint == Some(true) || a.destructive_hint.is_some(), "{}: say whether it's destructive", t.name);
         }
     }
 
@@ -3214,15 +3237,12 @@ mod tests {
         assert!(!is_err);
         let mut lines = out.lines();
         let header = lines.next().unwrap().to_string();
-        assert_eq!(
-            header,
-            format!(
-                "doc {} · epoch {} · 2026-09-10 · today {}",
-                fx.doc,
-                fx.epoch(),
-                chrono::Local::now().format("%Y-%m-%d")
-            )
-        );
+        // the date is the server's with its offset; taken either side of the
+        // read, so a run across midnight still matches one of them
+        let before = server_today();
+        let expect = |today: &str| format!("doc {} · epoch {} · 2026-09-10 · today {today}", fx.doc, fx.epoch());
+        assert!(header == expect(&before) || header == expect(&server_today()), "{header}");
+        assert!(header.contains(" UTC+") || header.contains(" UTC-"), "the offset is labeled: {header}");
         assert_eq!(lines.next().unwrap(), "");
         assert_eq!(out.split_once("\n\n").unwrap().1, DAILY);
 
