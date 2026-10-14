@@ -1,8 +1,21 @@
 //! Who is asking (ADR 0004). Every store read and write that touches docs,
 //! blocks, workspaces or anything derived from them is filtered by the
-//! store's current [`Scope`]; the daemon can only reach a store through
-//! [`SharedStore::lock`], which takes one, so forgetting the scope is a
-//! compile error rather than a leak.
+//! store's current [`Scope`].
+//!
+//! What the compiler checks: the daemon reaches its store only through
+//! [`SharedStore::lock`], which takes a scope, and `set_scope` is
+//! crate-private, so a request cannot ACQUIRE the store without naming who it
+//! runs for. (A `SqliteStore` opened directly — the box CLI, tests — runs as
+//! `System`; `with_scope_for_test` is public but hidden, for tests only.)
+//!
+//! What the compiler does not check: that each store method HONORS the
+//! scope. Every query filters with `vis` / `see` / `may_write` /
+//! `deny_public` by discipline, and a query that forgot to would compile and
+//! leak. That half is guaranteed by tests: the store's tenancy suite
+//! (`crates/store/tests/tenancy.rs`) and the daemon's two-tenant isolation
+//! suite (`crates/daemon/src/isolation_tests.rs`), whose
+//! `every_route_and_tool_is_covered` fails the build when a route or MCP tool
+//! has no isolation test in `COVERAGE`.
 
 use crate::sqlite::SqliteStore;
 use std::sync::{Arc, Mutex, MutexGuard};
