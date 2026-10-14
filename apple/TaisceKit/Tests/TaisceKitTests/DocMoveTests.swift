@@ -188,8 +188,44 @@ private let W1 = "0199a000-0000-7000-8000-0000000000f1"
         #expect(try body(r)["parent_id"] as? String == A)
         #expect(try await cache.pendingOutbox().isEmpty)
         #expect(try await cache.queuedMoves().isEmpty)
+        // just landed: a row with another key reads as stale, ours stands
         try await cache.applyDocState(B, Change.DocState(title: "B", parentID: A, sortKey: "u", currentEpoch: 1))
+        #expect(try await cache.doc(B)?.sortKey == "t")
+        // after the grace the server's row wins
+        try await cache.db.write { db in
+            try db.execute(sql: "UPDATE docs SET sort_key = 'u' WHERE id = ?", arguments: [B])
+            try Cache.reapplyQueuedMoves(db, now: Date().addingTimeInterval(Cache.landedMoveGrace + 5))
+        }
         #expect(try await cache.doc(B)?.sortKey == "u")
+    }
+
+    /// A tree fetched just before a move landed, arriving just after, must
+    /// not put the doc back (it looked like the move hadn't taken, and Tom
+    /// moved each doc twice); once the grace is over the server's rows win.
+    @Test func aStaleTreeAfterTheMoveLandedDoesNotUndoIt() async throws {
+        let cache = try await seeded()
+        try await cache.enqueueDocMove(B, parent: A, key: "m1")
+        let server = MockServer { _ in Self.ok }
+        _ = try await OutboxReplayer(api: server.client(), cache: cache).replay()
+        #expect(try await cache.queuedMoves().isEmpty, "landed")
+        // the stale tree: B still at the top level
+        let stale = [
+            DocSummary(id: A, parentID: nil, title: "A", currentEpoch: 1, sortKey: "a"),
+            DocSummary(id: A1, parentID: A, title: "A1", currentEpoch: 1, sortKey: "i"),
+            DocSummary(id: B, parentID: nil, title: "B", currentEpoch: 1, sortKey: "i"),
+        ]
+        try await cache.replaceTree(stale)
+        #expect(try await cache.doc(B)?.parentID == A, "still shown inside A")
+        // a fresh tree agreeing on the parent: its key stands
+        try await cache.replaceTree([stale[0], stale[1], DocSummary(id: B, parentID: A, title: "B", currentEpoch: 2, sortKey: "s")])
+        #expect(try await cache.doc(B)?.sortKey == "s")
+        // after the grace, the server's rows win whatever they say
+        let later = Date().addingTimeInterval(Cache.landedMoveGrace + 5)
+        try await cache.db.write { db in
+            try db.execute(sql: "UPDATE docs SET parent_id = NULL WHERE id = ?", arguments: [B])
+            try Cache.reapplyQueuedMoves(db, now: later)
+        }
+        #expect(try await cache.doc(B)?.parentID == nil)
     }
 
     @Test func aRefusedMoveRollsBackAndIsSettled() async throws {

@@ -257,10 +257,43 @@ extension Cache {
             .compactMap(docMove)
     }
 
+    /// How long a landed move keeps showing over the server's tree rows: a
+    /// tree fetched just before it landed can arrive just after, and would
+    /// put the doc back where it was (it looked like the move didn't take).
+    public static let landedMoveGrace: TimeInterval = 30
+
+    /// Moves to keep showing: every one not yet landed or refused (`landed`
+    /// false), and those landed in the last `landedMoveGrace` seconds
+    /// (refused ones carry their reason in `last_error` and are left out),
+    /// oldest first.
+    static func shownMoves(_ db: Database, now: Date = .now) throws -> [(move: QueuedDocMove, landed: Bool)] {
+        let since = now.addingTimeInterval(-landedMoveGrace)
+        return try OutboxEntry
+            .filter(OutboxEntry.Columns.path.like("/api/doc/%/move"))
+            .filter(
+                [OutboxEntry.State.pending.rawValue, OutboxEntry.State.inflight.rawValue].contains(OutboxEntry.Columns.state)
+                    || (OutboxEntry.Columns.state == OutboxEntry.State.done.rawValue
+                        && OutboxEntry.Columns.lastError == nil
+                        && OutboxEntry.Columns.createdAt > since)
+            )
+            .order(OutboxEntry.Columns.id)
+            .fetchAll(db)
+            .compactMap { e in docMove(of: e).map { ($0, e.state == .done) } }
+    }
+
     /// The server's tree rows don't know about our queued moves yet: keep
-    /// showing them (the newest per doc wins, as it will on the server).
-    static func reapplyQueuedMoves(_ db: Database) throws {
-        for m in try queuedMoves(db) {
+    /// showing them (the newest per doc wins, as it will on the server). A
+    /// move that just landed is shown again only where the row still has
+    /// the doc somewhere else (a tree fetched before it landed): another
+    /// parent, or another key for a move that sent one; where the server
+    /// agrees, its row stands.
+    static func reapplyQueuedMoves(_ db: Database, now: Date = .now) throws {
+        for (m, landed) in try shownMoves(db, now: now) {
+            if landed, let row = try Row.fetchOne(db, sql: "SELECT parent_id, sort_key FROM docs WHERE id = ?", arguments: [m.doc]) {
+                let parent: String? = row["parent_id"], key: String? = row["sort_key"]
+                // an append's key is the server's to pick; a placed one is ours as sent
+                if parent == m.parent, m.sortKey == nil || key == m.sortKey { continue }
+            }
             let key = try m.sortKey ?? appendKey(db, m.doc, under: m.parent)
             try place(db, m.doc, parent: m.parent, sortKey: key)
         }
