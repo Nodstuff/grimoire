@@ -581,10 +581,17 @@ struct DocRowDropDelegate: DropDelegate {
     func performDrop(info: DropInfo) -> Bool {
         let zone = DocDropZone.at(info.location.y, height: height)
         setHover(nil)
-        guard let dragged = mover.dragging(), dragged != target else { return false }
-        if let s = spot(zone) { return s.target != dragged && mover.place(dragged, s.side, s.target) }
-        guard mover.drop(dragged, target) else { return false }
-        onDroppedInto()
+        guard info.hasItemsConforming(to: [.taisceDoc]) else { return false }
+        // the doc the drag carries, not the one noted when a drag began
+        let (target, s, mover, onDroppedInto) = (self.target, spot(zone), self.mover, self.onDroppedInto)
+        DocDrag.dropped(info, hint: mover.dragging()) { dragged in
+            guard dragged != target else { return }
+            if let s {
+                if s.target != dragged { _ = mover.place(dragged, s.side, s.target) }
+                return
+            }
+            if mover.drop(dragged, target) { onDroppedInto() }
+        }
         return true
     }
 }

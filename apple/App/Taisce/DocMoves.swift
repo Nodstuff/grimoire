@@ -1,3 +1,4 @@
+import SwiftUI
 import Foundation
 import TaisceKit
 import UniformTypeIdentifiers
@@ -113,6 +114,33 @@ extension UTType {
 /// What a drag carries: the doc id under `UTType.taisceDoc`, visible to this
 /// app only.
 enum DocDrag {
+    /// The doc a drop carries, read from the drag itself. On the Mac a new
+    /// drag also fires the previous drag source's handler (seen: a drag of B
+    /// re-fired A's 45 ms later), so "the doc being dragged" kept on the side
+    /// can name the wrong doc; the payload can't. With several, the one the
+    /// side note names if it's among them, else the first.
+    @MainActor static func dropped(_ info: DropInfo, hint: DocID?, then use: @escaping @MainActor (DocID) -> Void) {
+        let providers = info.itemProviders(for: [.taisceDoc])
+        guard !providers.isEmpty else { return }
+        let group = DispatchGroup()
+        let lock = NSLock()
+        nonisolated(unsafe) var ids: [Int: DocID] = [:]
+        for (i, p) in providers.enumerated() {
+            group.enter()
+            _ = p.loadDataRepresentation(forTypeIdentifier: UTType.taisceDoc.identifier) { data, _ in
+                if let data, let id = String(data: data, encoding: .utf8), !id.isEmpty {
+                    lock.withLock { ids[i] = id }
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            let found = lock.withLock { ids.sorted { $0.key < $1.key }.map(\.value) }
+            let id = hint.flatMap { h in found.contains(h) ? h : nil } ?? found.first
+            MainActor.assumeIsolated { if let id { use(id) } }
+        }
+    }
+
     static func provider(_ id: DocID) -> NSItemProvider {
         let p = NSItemProvider()
         let data = Data(id.utf8)
@@ -124,7 +152,18 @@ enum DocDrag {
     }
 }
 
+
 extension AppModel {
+    /// A drag began on `id`'s row. On the Mac starting a drag also re-fires
+    /// the previous drag source's handler a moment later: a second call
+    /// for another doc within half a second of the first is that echo, and
+    /// doesn't replace the doc in hand.
+    func dragBegan(_ id: DocID, now: Date = .now) {
+        if let current = draggingDoc, current != id, let since = draggingSince, now.timeIntervalSince(since) < 0.5 { return }
+        draggingDoc = id
+        draggingSince = now
+    }
+
     /// May this doc be dragged or "Move to…"'d? (Not in a workspace you only view.)
     func canReparent(_ id: DocID) -> Bool {
         index.byID[id] != nil && access(for: id).canReparent

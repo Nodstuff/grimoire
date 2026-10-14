@@ -83,6 +83,19 @@ private func access(_ id: DocID) -> EditAccess {
         #expect(DocMoves.place("loose", .before, "old", index: ui, placement: DocMoves.placement(unkeyed), access: access).spot == nil)
     }
 
+    /// The Mac re-fires the previous drag's handler just after a new drag
+    /// starts: that echo doesn't replace the doc in hand.
+    @Test @MainActor func aReFiredDragHandlerDoesNotReplaceTheDocInHand() {
+        let model = AppModel()
+        let t = Date()
+        model.dragBegan("b", now: t)
+        model.dragBegan("a", now: t.addingTimeInterval(0.045))
+        #expect(model.draggingDoc == "b")
+        // a new drag later is a new drag
+        model.dragBegan("c", now: t.addingTimeInterval(3))
+        #expect(model.draggingDoc == "c")
+    }
+
     @Test func theDropZoneFollowsThePointer() {
         #expect(DocDropZone.at(2, height: 30) == .before)
         #expect(DocDropZone.at(15, height: 30) == .into)

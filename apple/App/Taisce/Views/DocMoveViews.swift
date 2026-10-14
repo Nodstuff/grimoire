@@ -38,7 +38,7 @@ struct DocMoveHost: ViewModifier {
             .environment(\.docMover, DocMover(
                 canMove: { model.canReparent($0) },
                 ask: { moving = $0 },
-                began: { model.draggingDoc = $0 },
+                began: { model.dragBegan($0) },
                 dragging: { model.draggingDoc },
                 canDrop: { model.canDrop($0, onto: $1) },
                 drop: { model.dropDoc($0, onto: $1) },
@@ -156,11 +156,13 @@ struct DocDropDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         targeted = false
-        // our own type, visible to this process only: the drag began on a
-        // Library row, which recorded the doc
-        guard info.hasItemsConforming(to: [.taisceDoc]), let dragged = mover.dragging() else { return false }
-        guard mover.drop(dragged, target) else { return false }
-        onDropped()
+        // our own type, visible to this process only; the doc is the one
+        // the drag carries (not the one noted when a drag began)
+        guard info.hasItemsConforming(to: [.taisceDoc]) else { return false }
+        let (target, mover, onDropped) = (self.target, self.mover, self.onDropped)
+        DocDrag.dropped(info, hint: mover.dragging()) { dragged in
+            if mover.drop(dragged, target) { onDropped() }
+        }
         return true
     }
 }

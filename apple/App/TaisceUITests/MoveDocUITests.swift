@@ -414,4 +414,67 @@ final class MoveDocUITests: XCTestCase {
         let made = try XCTUnwrap(try docNamed("Inner \(n)"))
         XCTAssertEqual(made.parent, p, "made inside P")
     }
+
+    /// The tree shows a drop at once, whatever the server is doing: the app
+    /// talks to a slow server (a proxy holding each request 3 s, :7520);
+    /// within a second of the drop the doc is where it was put.
+    func testTheTreeMovesAtOnceOnASlowServer() throws {
+        let slow = ProcessInfo.processInfo.environment["TAISCE_SLOW_URL"] ?? "http://127.0.0.1:7520"
+        let n = Int.random(in: 1000...9999)
+        _ = try makeDoc("Fast A \(n)"); _ = try makeDoc("Fast B \(n)")
+        let x = try makeDoc("Fast X \(n)"); _ = try makeDoc("Fast Z \(n)")
+        _ = x
+        let app = XCUIApplication()
+        app.launchArguments = ["-serverURL", slow, "-library.expanded", ""]
+        app.launch()
+        let tab = app.tabBars.buttons["Library"]
+        if tab.waitForExistence(timeout: 5) { tab.tap() }
+        let rowA = row(app, "Fast A \(n)"), rowB = row(app, "Fast B \(n)")
+        let rowX = row(app, "Fast X \(n)"), rowZ = row(app, "Fast Z \(n)")
+        XCTAssertTrue(rowA.waitForExistence(timeout: 60) && rowB.exists && rowX.exists && rowZ.exists, "the Library lists them")
+        sleep(4) // let the first sync settle
+        // into B: shown inside B at once
+        drag(rowA, onto: rowB, at: 0.5)
+        let t0 = Date()
+        var inside = false
+        while Date().timeIntervalSince(t0) < 1.0 {
+            if rowB.value as? String == "folder, open", rowA.exists, rowA.frame.minY > rowB.frame.minY { inside = true; break }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        if !inside { shot("not moved at once") }
+        XCTAssertTrue(inside, "A shows inside B within a second of the drop")
+        // and it stays there while the server catches up
+        RunLoop.current.run(until: Date().addingTimeInterval(8))
+        XCTAssertGreaterThan(rowA.frame.minY, rowB.frame.minY, "A is still inside B after the server answered")
+        XCTAssertEqual(rowB.value as? String, "folder, open")
+        // a reorder: Z before X, at once
+        drag(rowZ, onto: rowX, at: 0.1)
+        let t1 = Date()
+        var above = false
+        while Date().timeIntervalSince(t1) < 1.0 {
+            if rowZ.frame.minY < rowX.frame.minY { above = true; break }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        if !above { shot("not reordered at once") }
+        XCTAssertTrue(above, "Z shows above X within a second of the drop")
+        RunLoop.current.run(until: Date().addingTimeInterval(8))
+        XCTAssertLessThan(rowZ.frame.minY, rowX.frame.minY, "Z is still above X after the server answered")
+    }
+
+    /// Two moves in a row, each a different doc: the second moves the doc
+    /// in hand, not the one dragged before it (on the Mac a new drag
+    /// re-fired the previous drag's handler and the drop moved that doc).
+    func testTwoDragsInARowEachMoveTheirOwnDoc() throws {
+        let n = Int.random(in: 1000...9999)
+        let f = try makeDoc("Target F \(n)")
+        let a = try makeDoc("First A \(n)"), b = try makeDoc("Second B \(n)")
+        let app = launch()
+        let rowF = row(app, "Target F \(n)"), rowA = row(app, "First A \(n)"), rowB = row(app, "Second B \(n)")
+        XCTAssertTrue(rowF.waitForExistence(timeout: 20) && rowA.exists && rowB.exists)
+        drag(rowA, onto: rowF, at: 0.5)
+        try waitForParent(of: a, f)
+        drag(rowB, onto: rowF, at: 0.5)
+        try waitForParent(of: b, f)
+        XCTAssertEqual(try parent(of: a), f, "A stayed where it was put")
+    }
 }

@@ -41,6 +41,8 @@ final class AppModel {
     @ObservationIgnored var movesThisSession: Set<String> = []
     /// the Library row being dragged, so drop targets can refuse while hovering
     @ObservationIgnored var draggingDoc: DocID?
+    /// when that drag began (a re-fired handler for another doc right after is ignored)
+    @ObservationIgnored var draggingSince: Date?
     let dueAlerts: NotificationCoordinator
     // push: APNs token registration (Push.swift)
     let push = PushRegistrar(store: UserDefaultsPushStore(), environment: PushConfig.environment, appVersion: PushConfig.appVersion())
