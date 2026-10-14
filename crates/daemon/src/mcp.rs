@@ -38,6 +38,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// `?` for a tool body: an `Err` (a message or a store error) becomes the
+/// tool's error answer through `err`, so it carries the same text and hint.
+/// Inside a `with_store` closure it returns from the closure, as `?` would.
+macro_rules! or_err {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(m) => return err(m.to_string()),
+        }
+    };
+}
+
 // ─── dedupe cache ───
 
 /// Idempotency cache: (principal, key) → serialized outcome. Bounded,
@@ -511,6 +523,35 @@ impl KsMcp {
         let (names, default) = (self.names.clone(), self.agent);
         with_store(&self.store, scope, move |store| {
             acting_principal(store, &names, Some(&raw), &RequestHint::default(), default)
+        })
+        .await
+    }
+
+    /// Every deduped MCP write runs through here: the acting principal
+    /// (`acting`: tool `as` > header > `?as=` > `?cwd=` > shared), then a
+    /// replay if an identical call (`key`, from `dedupe_key`) was answered
+    /// within DEDUPE_TTL — the in-memory cache, then the durable table under
+    /// the store lock — else `f` with the store locked for `scope`. `f`
+    /// records its own answer under `key` (`finish` / `durable_put`).
+    async fn deduped_write(
+        &self,
+        hint: &RequestHint,
+        scope: Scope,
+        as_: Option<String>,
+        key: Uuid,
+        verbose: bool,
+        f: impl FnOnce(&mut SqliteStore, Uuid, &DedupeCache) -> Result<CallToolResult, McpError> + Send + 'static,
+    ) -> Result<CallToolResult, McpError> {
+        let principal = or_err!(self.acting(as_.as_deref(), hint).await);
+        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
+            return replay(&prev, Some(age), verbose);
+        }
+        let dedupe = self.dedupe.clone();
+        with_store(&self.store, scope, move |store| {
+            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, age, verbose);
+            }
+            f(store, principal, &dedupe)
         })
         .await
     }
@@ -1277,24 +1318,12 @@ impl KsMcp {
     }
 
     pub(crate) async fn find_doc_impl(&self, hint: RequestHint, p: FindDocParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let parent = match parse_opt_uuid(p.parent_doc_id.as_deref(), "parent_doc_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let parent = or_err!(parse_opt_uuid(p.parent_doc_id.as_deref(), "parent_doc_id"));
         let limit = p.limit.unwrap_or(8).clamp(1, 50) as usize;
         with_store(&self.store, scope, move |store| {
-            let ws = match crate::retrieval::workspace_arg(store, p.workspace.as_deref()) {
-                Ok(w) => w,
-                Err(m) => return err(m),
-            };
-            let docs = match store.list_docs() {
-                Ok(d) => d,
-                Err(e) => return err(e.to_string()),
-            };
+            let ws = or_err!(crate::retrieval::workspace_arg(store, p.workspace.as_deref()));
+            let docs = or_err!(store.list_docs());
             let docs = match ws {
                 None => docs,
                 Some(w) => match store.workspace_doc_ids(w) {
@@ -1320,21 +1349,12 @@ impl KsMcp {
     }
 
     pub(crate) async fn orient_impl(&self, hint: RequestHint, p: crate::retrieval::OrientParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let root = match parse_opt_uuid(p.root_doc_id.as_deref(), "root_doc_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let root = or_err!(parse_opt_uuid(p.root_doc_id.as_deref(), "root_doc_id"));
         let max_tokens = p.max_tokens.unwrap_or(1500).clamp(100, 20_000) as usize;
         let depth = p.depth.unwrap_or(2).clamp(1, 12) as usize;
         with_store(&self.store, scope, move |store| {
-            let ws = match crate::retrieval::workspace_arg(store, p.workspace.as_deref()) {
-                Ok(w) => w,
-                Err(m) => return err(m),
-            };
+            let ws = or_err!(crate::retrieval::workspace_arg(store, p.workspace.as_deref()));
             let named = ws.map(|w| {
                 let name = match w {
                     taisce_store::WorkspaceFilter::Unsorted => "Unsorted".to_string(),
@@ -1363,24 +1383,15 @@ impl KsMcp {
     }
 
     pub(crate) async fn read_doc_impl(&self, hint: RequestHint, p: ReadDocParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let doc_id = or_err!(parse_uuid(&p.doc_id, "doc_id"));
         let mode = p.mode.clone().unwrap_or_else(|| "markdown".into());
         if !matches!(mode.as_str(), "outline" | "markdown") {
             return err(format!("mode must be outline or omitted (markdown), got {mode}"));
         }
         let refs = p.refs.unwrap_or(false);
         with_store(&self.store, scope, move |store| {
-            let tree = match store.read_doc(doc_id) {
-                Ok(t) => t,
-                Err(e) => return err(e.to_string()),
-            };
+            let tree = or_err!(store.read_doc(doc_id));
             if mode == "outline" {
                 let doc = json!({
                     "id": tree.doc.id,
@@ -1401,10 +1412,7 @@ impl KsMcp {
             let mut out = doc_header(store, &tree.doc);
             out.push('\n');
             if let Some(b) = p.block.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                let block = match resolve_block(store, b) {
-                    Ok(b) => b,
-                    Err(m) => return err(m),
-                };
+                let block = or_err!(resolve_block(store, b));
                 if block.doc_id != doc_id {
                     return err(format!("{b} is in another doc ({})", block.doc_id));
                 }
@@ -1502,14 +1510,8 @@ impl KsMcp {
     }
 
     pub(crate) async fn diff_since_impl(&self, hint: RequestHint, p: DiffSinceParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let doc_id = or_err!(parse_uuid(&p.doc_id, "doc_id"));
         with_store(&self.store, scope, move |store| match store.ops_since(doc_id, p.since_epoch) {
             Ok(ops) => ok_json(&ops),
             Err(e) => err(e.to_string()),
@@ -1530,14 +1532,8 @@ impl KsMcp {
     }
 
     pub(crate) async fn search_impl(&self, hint: RequestHint, p: crate::retrieval::SearchParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let scope_doc = match parse_opt_uuid(p.scope_doc_id.as_deref(), "scope_doc_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let scope_doc = or_err!(parse_opt_uuid(p.scope_doc_id.as_deref(), "scope_doc_id"));
         let kind = p.kind.clone().unwrap_or_else(|| "blocks".into());
         if kind != "blocks" && kind != "docs" {
             return err(format!("kind must be blocks|docs, got {kind}"));
@@ -1581,14 +1577,8 @@ impl KsMcp {
     }
 
     pub(crate) async fn grep_impl(&self, hint: RequestHint, p: crate::retrieval::GrepParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let scope_doc = match parse_opt_uuid(p.scope_doc_id.as_deref(), "scope_doc_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let scope_doc = or_err!(parse_opt_uuid(p.scope_doc_id.as_deref(), "scope_doc_id"));
         let opts = crate::retrieval::GrepOpts {
             scope: scope_doc,
             case_insensitive: p.case_insensitive.unwrap_or(false),
@@ -1617,10 +1607,7 @@ impl KsMcp {
     }
 
     pub(crate) async fn related_impl(&self, hint: RequestHint, p: crate::retrieval::RelatedParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
         if p.tags.unwrap_or(false) {
             return with_store(&self.store, scope, move |store| match store.list_tags() {
                 Ok(t) => ok_json(&t.into_iter().map(|(tag, n)| json!({"tag": tag, "docs": n})).collect::<Vec<_>>()),
@@ -1682,10 +1669,7 @@ impl KsMcp {
     }
 
     pub(crate) async fn style_guide_impl(&self, hint: RequestHint) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
         with_store(&self.store, scope, |store| {
             // In the caller's scope, like every request (CLAUDE.md, the Scope
             // rule): a guide is a doc, and a doc is only ever served to whoever
@@ -1705,10 +1689,7 @@ impl KsMcp {
                     "no doc titled {STYLE_GUIDE_TITLE:?} — create it (plain markdown) and this tool serves it"
                 ));
             };
-            let tree = match store.read_doc(doc.id) {
-                Ok(t) => t,
-                Err(e) => return err(e.to_string()),
-            };
+            let tree = or_err!(store.read_doc(doc.id));
             ok_text(render_blocks(&locate::content_blocks(&tree.roots), false))
         })
         .await
@@ -1781,36 +1762,16 @@ impl KsMcp {
 
 impl KsMcp {
     pub(crate) async fn edit_doc_impl(&self, hint: RequestHint, p: EditDocParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let doc_id = or_err!(parse_uuid(&p.doc_id, "doc_id"));
         let verbose = p.verbose.unwrap_or(false);
-        let principal = match self.acting(p.as_.as_deref(), &hint).await {
-            Ok(id) => id,
-            Err(m) => return err(m),
-        };
         let key = dedupe_key(
             "edit_doc",
             Some(doc_id),
             &json!({"old": p.old, "new": p.new, "replace_all": p.replace_all.unwrap_or(false)}),
         );
-        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, Some(age), verbose);
-        }
-        let dedupe = self.dedupe.clone();
-        with_store(&self.store, scope, move |store| {
-            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, age, verbose);
-            }
-            let tree = match store.read_doc(doc_id) {
-                Ok(t) => t,
-                Err(e) => return err(e.to_string()),
-            };
+        self.deduped_write(&hint, scope, p.as_.clone(), key, verbose, move |store, principal, dedupe| {
+            let tree = or_err!(store.read_doc(doc_id));
             let epoch = tree.doc.current_epoch;
             if p.old == p.new {
                 return no_changes(epoch);
@@ -1857,20 +1818,14 @@ impl KsMcp {
                 return no_changes(epoch);
             }
             let res = store.propose(doc_id, epoch, principal, ops.clone());
-            finish(store, &dedupe, principal, key, &ops, res, epoch, verbose, None)
+            finish(store, dedupe, principal, key, &ops, res, epoch, verbose, None)
         })
         .await
     }
 
     pub(crate) async fn append_impl(&self, hint: RequestHint, p: AppendParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let doc_id = or_err!(parse_uuid(&p.doc_id, "doc_id"));
         let at_start = match p.at.as_deref().map(str::trim).unwrap_or("end") {
             "end" | "" => false,
             "start" => true,
@@ -1880,30 +1835,16 @@ impl KsMcp {
             return err("markdown must not be empty".into());
         }
         let verbose = p.verbose.unwrap_or(false);
-        let principal = match self.acting(p.as_.as_deref(), &hint).await {
-            Ok(id) => id,
-            Err(m) => return err(m),
-        };
         let key = dedupe_key(
             "append",
             Some(doc_id),
             &json!({"markdown": p.markdown, "to": p.to, "at": at_start, "create_missing": p.create_missing.unwrap_or(false)}),
         );
-        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, Some(age), verbose);
-        }
-        let dedupe = self.dedupe.clone();
-        with_store(&self.store, scope, move |store| {
-            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, age, verbose);
-            }
-            let tree = match store.read_doc(doc_id) {
-                Ok(t) => t,
-                Err(e) => return err(e.to_string()),
-            };
+        self.deduped_write(&hint, scope, p.as_.clone(), key, verbose, move |store, principal, dedupe| {
+            let tree = or_err!(store.read_doc(doc_id));
             let epoch = tree.doc.current_epoch;
             let (export, _) = locate::export_with_offsets(&tree.roots);
-            let landing = match resolve_landing(
+            let landing = or_err!(resolve_landing(
                 store,
                 doc_id,
                 &tree.roots,
@@ -1911,10 +1852,7 @@ impl KsMcp {
                 p.to.as_deref(),
                 at_start,
                 p.create_missing.unwrap_or(false),
-            ) {
-                Ok(l) => l,
-                Err(m) => return err(m),
-            };
+            ));
             let mut text = landing.new_headings.join("\n\n");
             if !text.is_empty() {
                 text.push_str("\n\n");
@@ -1926,20 +1864,14 @@ impl KsMcp {
                 return no_changes(epoch);
             }
             let res = store.propose(doc_id, epoch, principal, ops.clone());
-            finish(store, &dedupe, principal, key, &ops, res, epoch, verbose, None)
+            finish(store, dedupe, principal, key, &ops, res, epoch, verbose, None)
         })
         .await
     }
 
     pub(crate) async fn propose_impl(&self, hint: RequestHint, p: ProposeParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let doc_id = or_err!(parse_uuid(&p.doc_id, "doc_id"));
         let ops: Vec<OpInput> = match serde_json::from_value(p.ops.clone()) {
             Ok(o) => o,
             Err(e) => return err(format!("ops did not parse: {e}")),
@@ -1948,57 +1880,26 @@ impl KsMcp {
             return err(m);
         }
         let verbose = p.verbose.unwrap_or(false);
-        let principal = match self.acting(p.as_.as_deref(), &hint).await {
-            Ok(id) => id,
-            Err(m) => return err(m),
-        };
         let key = dedupe_key("propose", Some(doc_id), &json!({"base_epoch": p.base_epoch, "ops": p.ops}));
-        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, Some(age), verbose);
-        }
-        let dedupe = self.dedupe.clone();
-        with_store(&self.store, scope, move |store| {
-            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, age, verbose);
-            }
+        self.deduped_write(&hint, scope, p.as_.clone(), key, verbose, move |store, principal, dedupe| {
             // block ops against a stale base are SCORED per op (the gate's whole
             // point: unchanged targets still green, conflicts yellow/red) — a
             // stale base is not an error here; see propose_markdown for the
             // whole-doc path, where it is.
             let before = store.get_doc(doc_id).map(|d| d.current_epoch).unwrap_or(p.base_epoch);
             let res = store.propose(doc_id, p.base_epoch, principal, ops.clone());
-            finish(store, &dedupe, principal, key, &ops, res, before, verbose, None)
+            finish(store, dedupe, principal, key, &ops, res, before, verbose, None)
         })
         .await
     }
 
     pub(crate) async fn propose_markdown_impl(&self, hint: RequestHint, p: ProposeMarkdownParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let doc_id = or_err!(parse_uuid(&p.doc_id, "doc_id"));
         let verbose = p.verbose.unwrap_or(false);
-        let principal = match self.acting(p.as_.as_deref(), &hint).await {
-            Ok(id) => id,
-            Err(m) => return err(m),
-        };
         let key = dedupe_key("propose_markdown", Some(doc_id), &json!({"base_epoch": p.base_epoch, "markdown": p.markdown}));
-        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, Some(age), verbose);
-        }
-        let dedupe = self.dedupe.clone();
-        with_store(&self.store, scope, move |store| {
-            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, age, verbose);
-            }
-            let tree = match store.read_doc(doc_id) {
-                Ok(t) => t,
-                Err(e) => return err(e.to_string()),
-            };
+        self.deduped_write(&hint, scope, p.as_.clone(), key, verbose, move |store, principal, dedupe| {
+            let tree = or_err!(store.read_doc(doc_id));
             // Whole-doc semantics: the markdown was written against base_epoch,
             // but the diff can only be taken against the CURRENT blocks. If the
             // doc moved on, that diff would silently re-apply the agent's stale
@@ -2050,20 +1951,14 @@ impl KsMcp {
                 };
             }
             let res = store.propose(doc_id, p.base_epoch, principal, ops.clone());
-            finish(store, &dedupe, principal, key, &ops, res, tree.doc.current_epoch, verbose, note)
+            finish(store, dedupe, principal, key, &ops, res, tree.doc.current_epoch, verbose, note)
         })
         .await
     }
 
     pub(crate) async fn create_doc_impl(&self, hint: RequestHint, p: CreateDocParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let parent = match parse_opt_uuid(p.parent_doc_id.as_deref(), "parent_doc_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let parent = or_err!(parse_opt_uuid(p.parent_doc_id.as_deref(), "parent_doc_id"));
         let reuse = match p.if_exists.as_deref().unwrap_or("error") {
             "reuse" => true,
             "error" => false,
@@ -2074,20 +1969,9 @@ impl KsMcp {
             return err("title must not be empty".into());
         }
         let verbose = p.verbose.unwrap_or(false);
-        let principal = match self.acting(p.as_.as_deref(), &hint).await {
-            Ok(id) => id,
-            Err(m) => return err(m),
-        };
         let ws_arg = p.workspace.as_deref().map(str::trim).filter(|w| !w.is_empty()).map(str::to_string);
         let key = dedupe_key("create_doc", parent, &json!({"title": title, "markdown": p.markdown, "reuse": reuse, "workspace": ws_arg}));
-        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, Some(age), verbose);
-        }
-        let dedupe = self.dedupe.clone();
-        with_store(&self.store, scope, move |store| {
-            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, age, verbose);
-            }
+        self.deduped_write(&hint, scope, p.as_.clone(), key, verbose, move |store, principal, dedupe| {
             // a parent's workspace is inherited, never overridden here
             let ws = match ws_arg.as_deref() {
                 None => None,
@@ -2161,7 +2045,7 @@ impl KsMcp {
                         ));
                     }
                     let (text, full) = render(&d, false);
-                    durable_put(store, &dedupe, principal, key, stored(&text, &full), DEDUPE_TTL);
+                    durable_put(store, dedupe, principal, key, stored(&text, &full), DEDUPE_TTL);
                     if verbose { ok_json(&full) } else { ok_text(text) }
                 }
                 Err(e) => err(e.to_string()),
@@ -2171,37 +2055,20 @@ impl KsMcp {
     }
 
     pub(crate) async fn doc_op_impl(&self, hint: RequestHint, p: DocOpParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let doc_id = match parse_uuid(&p.doc_id, "doc_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let doc_id = or_err!(parse_uuid(&p.doc_id, "doc_id"));
         let op = p.op.trim().to_lowercase();
         if !matches!(op.as_str(), "rename" | "move" | "status" | "delete" | "merge" | "workspace") {
             return err(format!("op must be rename | move | status | delete | merge | workspace, got {}", p.op));
         }
         let verbose = p.verbose.unwrap_or(false);
-        let principal = match self.acting(p.as_.as_deref(), &hint).await {
-            Ok(id) => id,
-            Err(m) => return err(m),
-        };
         let payload = json!({
             "op": op, "title": p.title, "new_parent_id": p.new_parent_id, "after_doc_id": p.after_doc_id,
             "status": p.status, "into_doc_id": p.into_doc_id,
             "workspace": p.workspace, "create_missing": p.create_missing,
         });
         let key = dedupe_key("doc_op", Some(doc_id), &payload);
-        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, Some(age), verbose);
-        }
-        let dedupe = self.dedupe.clone();
-        with_store(&self.store, scope, move |store| {
-            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, age, verbose);
-            }
+        self.deduped_write(&hint, scope, p.as_.clone(), key, verbose, move |store, principal, dedupe| {
             let before = store.get_doc(doc_id).map(|d| d.current_epoch).unwrap_or(0);
             let single = |store: &mut SqliteStore, ops_kind: &str, res: Result<ProposeOutcome, String>| match res {
                 Ok(out) => {
@@ -2224,7 +2091,7 @@ impl KsMcp {
                     }];
                     let text = render_outcome(&fake, &out, before);
                     let v = stored(&text, &serde_json::to_value(&out).unwrap_or_default());
-                    durable_put(store, &dedupe, principal, key, v, DEDUPE_TTL);
+                    durable_put(store, dedupe, principal, key, v, DEDUPE_TTL);
                     if verbose { ok_json(&out) } else { ok_text(text) }
                 }
                 Err(m) => err(m),
@@ -2232,7 +2099,7 @@ impl KsMcp {
             match op.as_str() {
                 "workspace" => match file_doc(store, doc_id, p.workspace.as_deref(), p.create_missing.unwrap_or(false), principal) {
                     Ok((text, full)) => {
-                        durable_put(store, &dedupe, principal, key, stored(&text, &full), DEDUPE_TTL);
+                        durable_put(store, dedupe, principal, key, stored(&text, &full), DEDUPE_TTL);
                         if verbose { ok_json(&full) } else { ok_text(text) }
                     }
                     Err(m) => err(m),
@@ -2245,22 +2112,13 @@ impl KsMcp {
                     single(store, "rename", res)
                 }
                 "move" => {
-                    let new_parent = match parse_opt_uuid(p.new_parent_id.as_deref(), "new_parent_id") {
-                        Ok(u) => u,
-                        Err(m) => return err(m),
-                    };
-                    let after = match parse_opt_uuid(p.after_doc_id.as_deref(), "after_doc_id") {
-                        Ok(u) => u,
-                        Err(m) => return err(m),
-                    };
+                    let new_parent = or_err!(parse_opt_uuid(p.new_parent_id.as_deref(), "new_parent_id"));
+                    let after = or_err!(parse_opt_uuid(p.after_doc_id.as_deref(), "after_doc_id"));
                     let res = crate::docops::move_doc(store, doc_id, new_parent, after, principal);
                     single(store, "move", res)
                 }
                 "status" => {
-                    let status = match crate::docops::parse_status(p.status.as_deref()) {
-                        Ok(s) => s,
-                        Err(m) => return err(m),
-                    };
+                    let status = or_err!(crate::docops::parse_status(p.status.as_deref()));
                     let res = crate::docops::set_status(store, doc_id, status, principal);
                     single(store, "status", res)
                 }
@@ -2281,7 +2139,7 @@ impl KsMcp {
                                 "ok · merge · {appended} appended (yellow, flagged) · delete parked red — {}",
                                 out["note"].as_str().unwrap_or("")
                             );
-                            durable_put(store, &dedupe, principal, key, stored(&text, &out), DEDUPE_TTL);
+                            durable_put(store, dedupe, principal, key, stored(&text, &out), DEDUPE_TTL);
                             if verbose { ok_json(&out) } else { ok_text(text) }
                         }
                         Err(m) => err(m),
@@ -2293,28 +2151,11 @@ impl KsMcp {
     }
 
     pub(crate) async fn add_comment_impl(&self, hint: RequestHint, p: AddCommentParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
         let verbose = p.verbose.unwrap_or(false);
-        let principal = match self.acting(p.as_.as_deref(), &hint).await {
-            Ok(id) => id,
-            Err(m) => return err(m),
-        };
         let key = dedupe_key("add_comment", None, &json!({"block_id": p.block_id, "text": p.text, "reply_to": p.reply_to}));
-        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, Some(age), verbose);
-        }
-        let dedupe = self.dedupe.clone();
-        with_store(&self.store, scope, move |store| {
-            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, age, verbose);
-            }
-            let target = match resolve_block(store, &p.block_id) {
-                Ok(b) => b,
-                Err(m) => return err(m),
-            };
+        self.deduped_write(&hint, scope, p.as_.clone(), key, verbose, move |store, principal, dedupe| {
+            let target = or_err!(resolve_block(store, &p.block_id));
             let reply_to = match p.reply_to.as_deref().map(|r| resolve_block(store, r)) {
                 Some(Ok(b)) => Some(b.id),
                 Some(Err(m)) => return err(m),
@@ -2323,7 +2164,7 @@ impl KsMcp {
             match store.add_comment(target.id, principal, &p.text, reply_to) {
                 Ok(c) => {
                     let text = format!("ok · comment {} on {} · epoch {}", short_ref(c.id), short_ref(target.id), c.epoch);
-                    durable_put(store, &dedupe, principal, key, stored(&text, &json!(c)), DEDUPE_TTL);
+                    durable_put(store, dedupe, principal, key, stored(&text, &json!(c)), DEDUPE_TTL);
                     if verbose { ok_json(&c) } else { ok_text(text) }
                 }
                 Err(e) => err(e.to_string()),
@@ -2333,24 +2174,15 @@ impl KsMcp {
     }
 
     pub(crate) async fn resolve_impl(&self, hint: RequestHint, p: ResolveParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
-        let id = match parse_uuid(&p.annotation_id, "annotation_id") {
-            Ok(u) => u,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
+        let id = or_err!(parse_uuid(&p.annotation_id, "annotation_id"));
         let decision = match p.decision.trim() {
             "accept" => ReviewDecision::Accept,
             "decline" => ReviewDecision::Decline,
             other => return err(format!("decision must be accept|decline, got {other}")),
         };
         let verbose = p.verbose.unwrap_or(false);
-        let principal = match self.acting(p.as_.as_deref(), &hint).await {
-            Ok(id) => id,
-            Err(m) => return err(m),
-        };
+        let principal = or_err!(self.acting(p.as_.as_deref(), &hint).await);
         with_store(&self.store, scope, move |store| {
             match store.resolve(id, principal, decision) {
                 Ok(receipt) => {
@@ -2370,18 +2202,12 @@ impl KsMcp {
     }
 
     pub(crate) async fn proposals_impl(&self, hint: RequestHint, p: ProposalsParams) -> Result<CallToolResult, McpError> {
-        let scope = match self.scope_of(&hint) {
-            Ok(s) => s,
-            Err(m) => return err(m),
-        };
+        let scope = or_err!(self.scope_of(&hint));
         let kind = p.kind.clone().unwrap_or_else(|| "mine".into());
         let verbose = p.verbose.unwrap_or(false);
         match kind.as_str() {
             "mine" => {
-                let principal = match self.acting(p.as_.as_deref(), &hint).await {
-                    Ok(id) => id,
-                    Err(m) => return err(m),
-                };
+                let principal = or_err!(self.acting(p.as_.as_deref(), &hint).await);
                 let limit = p.limit.unwrap_or(20).max(1) as usize;
                 with_store(&self.store, scope, move |store| match store.proposal_outcomes(principal, limit) {
                     Ok(rows) => ok_json(&json!({
@@ -2413,10 +2239,7 @@ impl KsMcp {
                 .await
             }
             "pending" => {
-                let doc_id = match parse_opt_uuid(p.doc_id.as_deref(), "doc_id") {
-                    Ok(u) => u,
-                    Err(m) => return err(m),
-                };
+                let doc_id = or_err!(parse_opt_uuid(p.doc_id.as_deref(), "doc_id"));
                 let limit = p.limit.unwrap_or(50).max(1) as usize;
                 with_store(&self.store, scope, move |store| match store.review_queue(doc_id) {
                     Ok(q) => {
