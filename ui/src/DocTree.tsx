@@ -20,6 +20,7 @@ import {
   groupRoot,
   loadTreeState,
   saveTreeState,
+  isEmptyFolder,
 } from './tree'
 
 type Drop = { id: string; mode: 'into' | 'before' | 'after' } | null
@@ -227,7 +228,7 @@ export default function DocTree({
   const renderRow = (d: Doc, depth: number, rootSection: Section | null): React.ReactNode => {
     if (!isVisible(d.id)) return null
     const kids = childrenOf.get(d.id) ?? []
-    const isDir = kids.length > 0
+    const isDir = kids.length > 0 || isEmptyFolder(d)
     const open = isDir && isOpen(d.id)
     const dropHere = drop?.id === d.id ? drop.mode : null
     const isSel = selected === d.id

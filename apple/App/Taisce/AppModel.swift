@@ -707,7 +707,7 @@ final class AppModel {
 
     /// A new doc under `parent` (nil = top level), created once even if
     /// the answer is lost, and put in the tree at once.
-    func createDoc(title: String, parent: DocID?) async throws -> DocID {
+    func createDoc(title: String, parent: DocID?, open: Bool = true) async throws -> DocID {
         guard let api, let cache else { throw TodoWriteError.notFound }
         // workspaces: a root doc lands in the current workspace; a child inherits
         let doc = try await NewDoc.create(
@@ -719,7 +719,7 @@ final class AppModel {
             title: doc.title, parentID: doc.parentID, sortKey: doc.sortKey, status: doc.status, currentEpoch: doc.currentEpoch,
             workspaceID: doc.workspaceID ?? inherited ?? (parent == nil ? currentWorkspace?.workspaceID : nil)
         ))
-        pendingEditDoc = doc.id
+        if open { pendingEditDoc = doc.id }
         return doc.id
     }
 

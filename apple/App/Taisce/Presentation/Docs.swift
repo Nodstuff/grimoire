@@ -9,18 +9,24 @@ struct DocInfo: Identifiable, Hashable, Sendable {
     var sortKey: String?
     /// resolved workspace (nil = Unsorted)
     var workspaceID: WorkspaceID?
+    /// 0: nothing was ever written in it (a folder made with New folder)
+    var currentEpoch: Int
 
-    init(id: DocID, parentID: DocID? = nil, title: String, sortKey: String? = nil, workspaceID: WorkspaceID? = nil) {
+    init(id: DocID, parentID: DocID? = nil, title: String, sortKey: String? = nil, workspaceID: WorkspaceID? = nil, currentEpoch: Int = 1) {
         self.id = id
         self.parentID = parentID
         self.title = title
         self.sortKey = sortKey
         self.workspaceID = workspaceID
+        self.currentEpoch = currentEpoch
     }
 
     init(_ r: DocRecord) {
-        self.init(id: r.id, parentID: r.parentID, title: r.title, sortKey: r.sortKey, workspaceID: r.workspaceID)
+        self.init(id: r.id, parentID: r.parentID, title: r.title, sortKey: r.sortKey, workspaceID: r.workspaceID, currentEpoch: r.currentEpoch)
     }
+
+    /// Never written in: no page behind it, only what's inside (a folder).
+    var isEmpty: Bool { currentEpoch == 0 }
 }
 
 /// Lookups over the flat tree: ancestors, breadcrumbs, wikilink targets.
@@ -85,7 +91,9 @@ struct LibraryNode: Identifiable, Hashable, Sendable {
     var subtitle: String?
     var children: [LibraryNode]?
     var id: DocID { doc.id }
-    var isFolder: Bool { children != nil }
+    /// A doc with docs in it, or an empty one (New folder: a folder before
+    /// anything is in it; every device sees it the same way)
+    var isFolder: Bool { children != nil || doc.isEmpty }
 
     static func build(_ docs: [DocInfo]) -> [LibraryNode] {
         let index = DocIndex(docs)

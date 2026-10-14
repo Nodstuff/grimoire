@@ -7,6 +7,7 @@ import {
   descendantCounts,
   filterDocs,
   groupRoot,
+  isEmptyFolder,
   loadTreeState,
   saveTreeState,
   TREE_STATE_KEY,
@@ -47,6 +48,16 @@ describe('groupRoot', () => {
     expect(g.folders.map((d) => d.id)).toEqual(['alpha', 'zeta'])
     // server order: sort_key asc (loose2 'a' before loose 'b')
     expect(g.notes.map((d) => d.id)).toEqual(['loose2', 'loose'])
+  })
+})
+
+describe('empty folders', () => {
+  it('a never-written root doc is a folder (New folder in the Apple app)', () => {
+    const extra = [...docs, doc('box', 'Box', null, { current_epoch: 0 })]
+    const g = groupRoot(extra, childrenIndex(extra))
+    expect(g.folders.map((d) => d.id)).toEqual(['alpha', 'box', 'zeta'])
+    expect(isEmptyFolder({ current_epoch: 0 })).toBe(true)
+    expect(isEmptyFolder({ current_epoch: 2 })).toBe(false)
   })
 })
 

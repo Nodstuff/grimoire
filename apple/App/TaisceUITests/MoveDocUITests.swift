@@ -330,4 +330,88 @@ final class MoveDocUITests: XCTestCase {
         }
         #endif
     }
+
+    /// The doc with this title on the daemon (id, parent, epoch).
+    func docNamed(_ title: String) throws -> (id: String, parent: String?, epoch: Int)? {
+        var r = URLRequest(url: base.appending(path: "/api/docs"))
+        r.timeoutInterval = 10
+        let done = expectation(description: "docs")
+        var out: Data?
+        URLSession.shared.dataTask(with: r) { d, _, _ in out = d; done.fulfill() }.resume()
+        wait(for: [done], timeout: 15)
+        let list = try XCTUnwrap(try JSONSerialization.jsonObject(with: try XCTUnwrap(out)) as? [[String: Any]])
+        guard let d = list.first(where: { $0["title"] as? String == title }), let id = d["id"] as? String else { return nil }
+        return (id, d["parent_id"] as? String, (d["current_epoch"] as? Int) ?? -1)
+    }
+
+    /// Name the folder in the New folder prompt and create it.
+    func nameFolder(_ app: XCUIApplication, _ name: String) {
+        let alert = app.alerts["New folder"].firstMatch
+        if !alert.waitForExistence(timeout: 5) { shot("no New folder prompt") }
+        XCTAssertTrue(alert.exists, "New folder asks for a name")
+        let field = alert.textFields.firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 3), "the prompt has a name field")
+        hit(field)
+        field.typeText(name)
+        hit(alert.buttons["Create"].firstMatch)
+    }
+
+    /// New folder at the top level: an empty folder (not opened as a doc),
+    /// a click opens it, and a doc dropped on its "Empty" line goes in.
+    func testNewFolderIsAnEmptyFolderToDropInto() throws {
+        let n = Int.random(in: 1000...9999)
+        let x = try makeDoc("Loose X \(n)")
+        let app = launch()
+        let rowX = row(app, "Loose X \(n)")
+        XCTAssertTrue(rowX.waitForExistence(timeout: 20))
+        #if targetEnvironment(macCatalyst)
+        let button = app.buttons["tree.newFolder"].firstMatch
+        #else
+        let button = app.buttons["New folder"].firstMatch
+        #endif
+        XCTAssertTrue(button.waitForExistence(timeout: 5), "there is a New folder button")
+        hit(button)
+        nameFolder(app, "Box \(n)")
+        let folder = row(app, "Box \(n)")
+        XCTAssertTrue(folder.waitForExistence(timeout: 15), "the folder is in the tree")
+        XCTAssertEqual(folder.value as? String, "folder, closed", "it shows as a folder")
+        let made = try XCTUnwrap(try docNamed("Box \(n)"))
+        XCTAssertEqual(made.epoch, 0, "nothing written in it")
+        XCTAssertNil(made.parent, "at the top level")
+        XCTAssertFalse(app.textViews.firstMatch.exists, "it didn't open as a doc")
+        // its chevron opens it (a click on the row opens its page, as for any doc)
+        let chevron = folder.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: 10, dy: 0))
+        #if targetEnvironment(macCatalyst)
+        chevron.click()
+        #else
+        chevron.tap()
+        #endif
+        let empty = app.descendants(matching: .any)["tree.empty"].firstMatch
+        XCTAssertTrue(empty.waitForExistence(timeout: 5), "an open empty folder says so")
+        XCTAssertEqual(folder.value as? String, "folder, open")
+        drag(rowX, onto: empty, at: 0.5)
+        try waitForParent(of: x, made.id)
+    }
+
+    /// New folder here (the row's menu): made inside that doc.
+    func testNewFolderHereFromTheMenu() throws {
+        let n = Int.random(in: 1000...9999)
+        let p = try makeDoc("Parent P \(n)")
+        let app = launch()
+        let rowP = row(app, "Parent P \(n)")
+        XCTAssertTrue(rowP.waitForExistence(timeout: 20))
+        #if targetEnvironment(macCatalyst)
+        rowP.rightClick()
+        let item = app.menuItems["New folder here"].firstMatch
+        #else
+        rowP.press(forDuration: 1.2)
+        let item = app.buttons["New folder here"].firstMatch
+        #endif
+        XCTAssertTrue(item.waitForExistence(timeout: 5), "the menu offers New folder here")
+        hit(item)
+        nameFolder(app, "Inner \(n)")
+        XCTAssertTrue(row(app, "Inner \(n)").waitForExistence(timeout: 15), "the new folder shows, its parent opened")
+        let made = try XCTUnwrap(try docNamed("Inner \(n)"))
+        XCTAssertEqual(made.parent, p, "made inside P")
+    }
 }

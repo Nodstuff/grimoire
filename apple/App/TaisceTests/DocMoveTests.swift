@@ -90,6 +90,18 @@ private func access(_ id: DocID) -> EditAccess {
         #expect(DocDropZone.at(10, height: 0) == .into)
     }
 
+    /// An empty, never-written doc (New folder) is a folder before anything is in it.
+    @Test func anEmptyDocIsAFolder() {
+        let nodes = LibraryNode.build([
+            DocInfo(id: "box", title: "Box", sortKey: "a", currentEpoch: 0),
+            DocInfo(id: "page", title: "Page", sortKey: "b", currentEpoch: 3),
+        ])
+        #expect(nodes[0].isFolder && nodes[0].children == nil)
+        #expect(!nodes[1].isFolder)
+        let open = DocTreeLine.lines(nodes, isOpen: { _ in true })
+        #expect(open.map(\.isOpen) == [true, false], "an empty folder opens; a page doesn't")
+    }
+
     @Test func theTreeShowsOpenFoldersOnly() {
         let nodes = LibraryNode.build(docs)
         let closed = DocTreeLine.lines(nodes, isOpen: { _ in false }).map(\.id)

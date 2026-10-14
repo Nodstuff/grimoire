@@ -20,7 +20,7 @@ enum PadItem: Hashable {
 
 /// A menu-bar command (the Mac's menus, an iPad's hardware keyboard).
 enum AppCommand: Hashable {
-    case newDoc, search, refresh, settings, today, todos
+    case newDoc, newFolder, search, refresh, settings, today, todos
     /// the doc in front: Share link… and Export as PDF… (SERVER mode)
     case shareLink, exportPDF
     /// ⌘1…⌘9: the nth workspace in the switcher's order (1-based)
@@ -73,6 +73,12 @@ final class Router {
     /// the "New doc" sheet, and the folder it starts in
     var showNewDoc = false
     var newDocParent: DocID?
+    /// the "New folder" name prompt, and where the folder goes (nil = top level)
+    var showNewFolder = false
+    var newFolderParent: DocID?
+    /// a doc the Library should bring into view (a folder just made): its
+    /// folders open, the tree scrolls to it
+    var revealDoc: DocID?
     /// set by the pad layout, so `open` pushes onto the detail stack
     var isPad = false
     /// a doc action waiting for that doc's screen (it clears it when done)
@@ -116,6 +122,11 @@ final class Router {
         showNewDoc = true
     }
 
+    func newFolder(in parent: DocID? = nil) {
+        newFolderParent = parent
+        showNewFolder = true
+    }
+
     func showTodos() {
         if isPad { select(.todos) } else { tab = .todos }
     }
@@ -154,7 +165,7 @@ final class Router {
         case .exportPDF:
             // reading is enough to print
             return shares && focusedDoc != nil
-        case .newDoc: return canCreate
+        case .newDoc, .newFolder: return canCreate
         case .workspace(let n): return picker.shortcut(n) != nil
         default: return true
         }
@@ -196,6 +207,8 @@ final class Router {
         switch command {
         case .newDoc:
             newDoc(in: nil)
+        case .newFolder:
+            newFolder(in: nil)
         case .search:
             showSearch()
             if isPad { searchFocusRequest += 1 }

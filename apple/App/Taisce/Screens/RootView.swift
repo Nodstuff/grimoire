@@ -86,6 +86,7 @@ struct RootView: View {
         .sheet(isPresented: $router.showNewDoc) {
             NewDocSheet(parent: router.newDocParent).environment(router)
         }
+        .modifier(NewFolderPrompt(router: router, model: model))
         .onChange(of: sizeClass, initial: true) { _, size in router.isPad = RootLayout.make(horizontal: size) == .split }
         // the menu bar's commands act on the window in front
         .focusedSceneValue(\.router, router)
@@ -338,14 +339,28 @@ struct PadSidebar: View {
                     SidebarItem(title: "Today", systemImage: "house", badge: model.dueCount, selected: shown == .today) { router.select(.today) }
                     SidebarItem(title: "To-dos", systemImage: "checkmark.circle", selected: shown == .todos) { router.select(.todos) }
                     // drop a dragged doc on the header: the top level
-                    Text("Library")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(Theme.secondary)
-                        .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
-                        .padding(.top, 12)
-                        .padding(.leading, 6)
-                        .docTopLevelDrop(mover: docMover)
-                        .accessibilityAddTraits(.isHeader)
+                    HStack {
+                        Text("Library")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Theme.secondary)
+                            .accessibilityAddTraits(.isHeader)
+                        Spacer()
+                        if model.currentAccess.canCreate {
+                            Button { router.newFolder(in: nil) } label: {
+                                Image(systemName: "folder.badge.plus").foregroundStyle(Theme.secondary)
+                                    .frame(width: 30, height: 30).contentShape(.rect)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("New folder")
+                            .accessibilityIdentifier("tree.newFolder")
+                            .help("New folder (⇧⌘N)")
+                        }
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+                    .padding(.top, 12)
+                    .padding(.leading, 6)
+                    .contentShape(.rect)
+                    .docTopLevelDrop(mover: docMover)
                     LibraryTree(nodes: model.library, expanded: $expanded, reveal: reveal, selected: selectedDoc,
                             pins: Set(model.pins), style: .sidebar, onOpen: { fromTree = true; router.select(.doc($0)) }) { node in
                         rowMenu(node)
@@ -365,6 +380,9 @@ struct PadSidebar: View {
         }
         // what opened itself stays open after you move on
         .onChange(of: reveal) { _, r in expanded.formUnion(r) }
+        // a folder just made: the folders above it open, the tree scrolls to it
+        .onChange(of: model.docs.count) { revealIfReady() }
+        .onChange(of: router.revealDoc) { revealIfReady() }
         .navigationTitle("Taisce")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
@@ -399,11 +417,22 @@ struct PadSidebar: View {
         .refreshable { try? await model.sync?.catchUp() }
     }
 
+    private func revealIfReady() {
+        guard let id = router.revealDoc, let above = LibraryNode.ancestors(of: id, in: model.library) else { return }
+        router.revealDoc = nil
+        withAnimation(.snappy(duration: 0.2)) { expanded.formUnion(above) }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            withAnimation { scroller.position.scrollTo(id: id, anchor: .center) }
+        }
+    }
+
     @ViewBuilder private func rowMenu(_ node: LibraryNode) -> some View {
         Button(model.isPinned(node.id) ? "Unpin from Today" : "Pin to Today",
                systemImage: model.isPinned(node.id) ? "pin.slash" : "pin") { model.togglePin(node.id) }
         if model.access(for: node.id).canCreate {
             Button("New doc here", systemImage: "plus") { router.newDoc(in: node.id) }
+            Button("New folder here", systemImage: "folder.badge.plus") { router.newFolder(in: node.id) }
         }
         if let docMover, docMover.canMove(node.id) {
             Button("Move to\u{2026}", systemImage: "folder") { docMover.ask(node.id) }
@@ -411,6 +440,48 @@ struct PadSidebar: View {
         if let docDeletion, docDeletion.canDelete(node.id) {
             Divider()
             Button("Delete\u{2026}", systemImage: "trash", role: .destructive) { docDeletion.ask(node.id) }
+        }
+    }
+}
+
+/// "New folder": its name, then an empty doc made where asked, not opened
+/// (a folder until something is written in it; drop docs into it).
+struct NewFolderPrompt: ViewModifier {
+    let router: Router
+    let model: AppModel
+    @State private var name = ""
+    @State private var failure: String?
+
+    func body(content: Content) -> some View {
+        @Bindable var router = router
+        content
+            .alert("New folder", isPresented: $router.showNewFolder) {
+                TextField("Name", text: $name)
+                    .accessibilityIdentifier("newfolder.name")
+                Button("Cancel", role: .cancel) { name = "" }
+                Button("Create") { create() }
+                    .accessibilityIdentifier("newfolder.create")
+            } message: {
+                Text(router.newFolderParent.flatMap { model.index.byID[$0]?.title }.map { "Inside \u{201C}\($0)\u{201D}" } ?? "At the top level")
+            }
+            .alert("Couldn't make the folder", isPresented: Binding(get: { failure != nil }, set: { if !$0 { failure = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(failure ?? "")
+            }
+    }
+
+    private func create() {
+        let title = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        name = ""
+        let parent = router.newFolderParent
+        Task { @MainActor in
+            do {
+                let id = try await model.createDoc(title: title.isEmpty ? "New folder" : title, parent: parent, open: false)
+                router.revealDoc = id
+            } catch {
+                failure = error.localizedDescription
+            }
         }
     }
 }

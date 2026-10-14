@@ -5,6 +5,12 @@
 import { compareSortKey } from './editor/diff'
 import type { Doc } from './types'
 
+/** A doc never written in (current_epoch 0): a folder before anything is in
+ * it (the Apple app's New folder makes these). Same rule on every client. */
+export function isEmptyFolder(d: Pick<Doc, 'current_epoch'>): boolean {
+  return d.current_epoch === 0
+}
+
 /** System folders the daemon/gardeners own: pinned above everything else. */
 export const PINNED_TITLES = new Set(['Daily', 'Answers', 'Claude Memory', 'Worktrees'])
 
@@ -37,7 +43,7 @@ export function groupRoot(docs: Doc[], children: Map<string | null, Doc[]>): Roo
   const notes: Doc[] = []
   for (const d of children.get(null) ?? []) {
     if (PINNED_TITLES.has(d.title)) pinned.push(d)
-    else if (children.get(d.id)?.length) folders.push(d)
+    else if (children.get(d.id)?.length || isEmptyFolder(d)) folders.push(d)
     else notes.push(d)
   }
   const byTitle = (a: Doc, b: Doc) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' })

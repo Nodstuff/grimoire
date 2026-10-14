@@ -311,8 +311,18 @@ edge) that opens and closes a folder, a click or tap elsewhere opens the
 doc, arrow keys in the sidebar (after a click: up/down move, right opens or
 enters, left closes or goes to the parent), VoiceOver rows (one element
 each, Expand/Collapse on folders). A folder is any doc with children.
-Context menu: Pin, New doc here, **Move to…**, Move to workspace… (iPhone),
-Delete.
+Context menu: Pin, New doc here, **New folder here**, **Move to…**, Move to
+workspace… (iPhone), Delete.
+
+**New folder** (the folder button by the Library header on iPad and the Mac,
+next to + on iPhone; File › New Folder, ⇧⌘N; New folder here on a row): a
+name, then an empty doc made there, not opened, shown and scrolled to. A
+doc never written in (`current_epoch` 0) is a folder before anything is in
+it (`DocInfo.isEmpty`, `LibraryNode.isFolder`; the web's `isEmptyFolder`
+in `ui/src/tree.ts` is the same rule), so every client shows it the same
+way with no server change. Opening it shows an empty page (nothing is
+written unless you type); open in the tree it says "Empty — drag docs
+here", and a drop on that line goes in.
 
 Moving a doc (`POST /api/doc/{id}/move` `{parent_id, sort_key}`):
 
@@ -323,8 +333,8 @@ Moving a doc (`POST /api/doc/{id}/move` `{parent_id, sort_key}`):
   insertion line or an outlined row shows where; a place it can't go shows
   nothing and refuses the drop. A closed folder opens after a drag rests on
   it for 0.7 s; the space under the last row and the Library header are the
-  top level; a drag near the top or bottom edge scrolls the tree
-  (`TreeScroller`). A drag carries the doc id as `UTType.taisceDoc`
+  top level; a drag resting near the top or bottom edge (36 pt, after
+  0.4 s) scrolls the tree (`TreeScroller`). A drag carries the doc id as `UTType.taisceDoc`
   (`ie.null.taisce.doc-reference`, declared in `UTExportedTypeDeclarations`
   in `project.yml` and `Support/Info-Debug.plist`; data, this app only), so
   the editor and other apps never take a row.
@@ -343,6 +353,10 @@ Moving a doc (`POST /api/doc/{id}/move` `{parent_id, sort_key}`):
   /api/docs/{id}/workspace`), undone if the move is then refused.
 - Offline first: `Cache.enqueueDocMove` queues the write and places the
   cached row at once (an append's key the server picks when it lands). A
+  move that just landed keeps showing for `Cache.landedMoveGrace` (30 s)
+  wherever a tree row still has the doc elsewhere: a tree fetched just before
+  it landed can arrive just after, and put the doc back (it looked as if the
+  move hadn't taken, and Tom moved docs twice). A
   refusal puts the doc back and says why ("Couldn't move" alert this
   session, the top banner for an older one).
 - UI tests: `MoveDocUITests` drive real drags against a LOCAL daemon

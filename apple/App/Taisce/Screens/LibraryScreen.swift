@@ -18,7 +18,10 @@ struct LibraryScreen: View {
                 onTogglePin: model.togglePin,
                 // a workspace you only view takes no new docs (ADR 0004)
                 onNewDoc: model.currentAccess.canCreate ? { router.newDoc(in: $0) } : nil,
-                onOpen: { router.open(.doc($0)) }
+                onNewFolder: model.currentAccess.canCreate ? { router.newFolder(in: $0) } : nil,
+                onOpen: { router.open(.doc($0)) },
+                reveal: router.revealDoc,
+                onRevealed: { router.revealDoc = nil }
             )
             .refreshable { try? await model.sync?.catchUp() }
             .safeAreaInset(edge: .top, spacing: 0) { WorkspaceBar(triage: true) }
@@ -36,7 +39,11 @@ struct LibraryContent: View {
     var onTogglePin: (DocID) -> Void = { _ in }
     /// nil parent = top level
     var onNewDoc: ((DocID?) -> Void)?
+    var onNewFolder: ((DocID?) -> Void)?
     var onOpen: (DocID) -> Void = { _ in }
+    /// a doc to bring into view (a folder just made), and done when it is
+    var reveal: DocID?
+    var onRevealed: () -> Void = {}
     /// folders start closed; the ones you open are remembered across launches
     @AppStorage("library.expanded") private var expandedStore = ""
     @State private var expanded: Set<DocID> = []
@@ -52,8 +59,13 @@ struct LibraryContent: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
                 ScreenHeader(title: "Library") {
-                    if let onNewDoc {
-                        CircleIconButton(systemImage: "plus", label: "New doc", filled: true) { onNewDoc(nil) }
+                    HStack(spacing: 10) {
+                        if let onNewFolder {
+                            CircleIconButton(systemImage: "folder.badge.plus", label: "New folder") { onNewFolder(nil) }
+                        }
+                        if let onNewDoc {
+                            CircleIconButton(systemImage: "plus", label: "New doc", filled: true) { onNewDoc(nil) }
+                        }
                     }
                 }
                 // drop a dragged doc here: the top level
@@ -93,6 +105,20 @@ struct LibraryContent: View {
         .onChange(of: expanded) { _, now in
             expandedStore = now.sorted().joined(separator: ",")
         }
+        // a folder just made: once the tree has it, the folders above it
+        // open and the tree scrolls to it
+        .onChange(of: reveal) { revealIfReady() }
+        .onChange(of: nodes) { revealIfReady() }
+    }
+
+    private func revealIfReady() {
+        guard let id = reveal, let above = LibraryNode.ancestors(of: id, in: nodes) else { return }
+        onRevealed()
+        withAnimation(.snappy(duration: 0.2)) { expanded.formUnion(above) }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            withAnimation { scroller.position.scrollTo(id: id, anchor: .center) }
+        }
     }
 
     @ViewBuilder private func menu(_ node: LibraryNode) -> some View {
@@ -100,6 +126,9 @@ struct LibraryContent: View {
                systemImage: pins.contains(node.id) ? "pin.slash" : "pin") { onTogglePin(node.id) }
         if let onNewDoc {
             Button("New doc here", systemImage: "plus") { onNewDoc(node.id) }
+        }
+        if let onNewFolder {
+            Button("New folder here", systemImage: "folder.badge.plus") { onNewFolder(node.id) }
         }
         if let docMover, docMover.canMove(node.id) {
             Button("Move to\u{2026}", systemImage: "folder") { docMover.ask(node.id) }

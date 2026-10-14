@@ -32,6 +32,7 @@ struct TaisceCommands: Commands {
         #endif
         CommandGroup(replacing: .newItem) {
             item("New Doc", .newDoc).keyboardShortcut("n")
+            item("New Folder", .newFolder).keyboardShortcut("n", modifiers: [.command, .shift])
         }
         // ⌥⌘E (⇧⌘E is inline code in the editor)
         CommandGroup(replacing: .importExport) {

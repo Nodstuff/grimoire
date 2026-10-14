@@ -52,9 +52,15 @@ final class TreeScroller {
     /// what the bars cover at the top and bottom (a tab bar, a toolbar)
     @ObservationIgnored var insets: (top: CGFloat, bottom: CGFloat) = (0, 0)
     @ObservationIgnored private var last: Date = .distantPast
+    /// when the drag came into an edge band (nil: not in one), and the last update
+    @ObservationIgnored private var entered: Date?
+    @ObservationIgnored private var seen: Date?
 
-    /// The edge band (points) that scrolls, and how far one nudge goes.
-    static let band: CGFloat = 48
+    /// The edge band (points) that scrolls, how long a drag rests there
+    /// before it does (a drop on the last visible row isn't scrolled away),
+    /// and how far one nudge goes.
+    static let band: CGFloat = 36
+    static let dwell: TimeInterval = 0.4
     static let step: CGFloat = 18
 
     /// A drag is at global `y`: near an edge, scroll toward it (at most
@@ -62,7 +68,15 @@ final class TreeScroller {
     func drag(at y: CGFloat) {
         // the part you can see: not under the bars
         let top = viewport.minY + insets.top, bottom = viewport.maxY - insets.bottom
-        guard bottom - top > Self.band * 3, Date().timeIntervalSince(last) > 0.03 else { return }
+        guard bottom - top > Self.band * 3 else { return }
+        let now = Date()
+        // a gap in the updates: a new drag (the last one ended in the band)
+        if let seen, now.timeIntervalSince(seen) > 0.3 { entered = nil }
+        seen = now
+        let inBand = y < top + Self.band || y > bottom - Self.band
+        guard inBand else { entered = nil; return }
+        if entered == nil { entered = now }
+        guard now.timeIntervalSince(entered ?? now) >= Self.dwell, now.timeIntervalSince(last) > 0.03 else { return }
         var to = offset
         if y < top + Self.band { to = max(0, offset - Self.step) }
         else if y > bottom - Self.band { to = min(maxOffset, offset + Self.step) }
@@ -166,6 +180,11 @@ struct LibraryTree<Menu: View>: View {
                 )
                 .contextMenu { menu(line.node) }
                 .id(line.id)
+                if line.isOpen, line.node.children == nil {
+                    EmptyFolderLine(folder: line.id, depth: line.depth + 1, style: style, mover: docMover) {
+                        withAnimation(.snappy(duration: 0.2)) { _ = expanded.insert(line.id) }
+                    }
+                }
             }
             // under the last row: the top level
             if let docMover {
@@ -229,7 +248,7 @@ struct LibraryTree<Menu: View>: View {
     private func openOrEnter(_ lines: [DocTreeLine]) -> KeyPress.Result {
         guard let s = selected, let i = lines.firstIndex(where: { $0.id == s }), lines[i].node.isFolder else { return .ignored }
         if lines[i].isOpen {
-            if i + 1 < lines.count { onOpen(lines[i + 1].id) }
+            if i + 1 < lines.count, lines[i + 1].depth > lines[i].depth { onOpen(lines[i + 1].id) }
         } else {
             toggle(lines[i])
         }
@@ -396,6 +415,47 @@ private struct DocTreeRow: View {
         .padding(.leading, lead + 20)
         .offset(y: hover == .before ? -4 : 4)
         .allowsHitTesting(false)
+    }
+}
+
+/// Inside an open empty folder: says so, and a drop on it goes in.
+private struct EmptyFolderLine: View {
+    let folder: DocID
+    let depth: Int
+    let style: DocTreeStyle
+    let mover: DocMover?
+    let onDropped: () -> Void
+    @State private var targeted = false
+
+    var body: some View {
+        Text(targeted ? "Drop it in here" : "Empty \u{2014} drag docs here")
+            .font(.caption)
+            .foregroundStyle(targeted ? Theme.accent : Theme.secondary)
+            .padding(.leading, CGFloat(depth) * style.indent + 4 + 16 + 6)
+            .frame(maxWidth: .infinity, minHeight: style.rowHeight * 0.8, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(targeted ? Theme.accent.opacity(0.12) : .clear)
+                .padding(.leading, CGFloat(depth) * style.indent))
+            .contentShape(.rect)
+            .modifier(EmptyFolderDrop(folder: folder, mover: mover, targeted: $targeted, onDropped: onDropped))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Empty folder")
+            .accessibilityIdentifier("tree.empty")
+    }
+}
+
+private struct EmptyFolderDrop: ViewModifier {
+    let folder: DocID
+    let mover: DocMover?
+    @Binding var targeted: Bool
+    let onDropped: () -> Void
+
+    func body(content: Content) -> some View {
+        if let mover {
+            content.onDrop(of: [.taisceDoc], delegate: DocDropDelegate(target: folder, mover: mover, targeted: $targeted, onDropped: onDropped))
+        } else {
+            content
+        }
     }
 }
 
