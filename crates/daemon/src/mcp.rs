@@ -56,17 +56,27 @@ use uuid::Uuid;
 pub type DedupeCache = Arc<Mutex<std::collections::HashMap<(Option<Uuid>, Uuid, Uuid), (u64, Instant, Value)>>>;
 
 pub const DEDUPE_CAPACITY: usize = 512;
-/// How long a repeated identical write is treated as a retry.
-pub const DEDUPE_TTL: Duration = Duration::from_secs(120);
+/// How long a repeated identical write is treated as a retry. Longer than an
+/// agent tool call's worst timeout, shorter than a human's "do it again".
+pub const DEDUPE_TTL: Duration = Duration::from_secs(600);
 static DEDUPE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Test-only callers since the aged variant arrived; kept so tests can
+/// assert plain membership without unwrapping the age tuple.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn dedupe_get(cache: &DedupeCache, user: Option<Uuid>, principal: Uuid, id: Uuid) -> Option<Value> {
+    dedupe_get_aged(cache, user, principal, id).map(|(v, _)| v)
+}
+
+/// `dedupe_get` that also reports how long ago the answer was recorded — the
+/// replay marker says "answered 40s ago" instead of a bare duplicate.
+pub fn dedupe_get_aged(cache: &DedupeCache, user: Option<Uuid>, principal: Uuid, id: Uuid) -> Option<(Value, Duration)> {
     cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&(user, principal, id))
         .filter(|(_, at, _)| at.elapsed() < DEDUPE_TTL)
-        .map(|(_, _, v)| v.clone())
+        .map(|(_, at, v)| (v.clone(), at.elapsed()))
 }
 
 pub fn dedupe_put(cache: &DedupeCache, user: Option<Uuid>, principal: Uuid, id: Uuid, v: Value) {
@@ -101,12 +111,19 @@ fn unix_now() -> i64 {
 /// first, then a row recorded within `window` — so a retry after a restart
 /// (or, for a `request_id`, days later) still replays.
 pub fn durable_get(store: &SqliteStore, cache: &DedupeCache, principal: Uuid, id: Uuid, window: Duration) -> Option<Value> {
-    if let Some(v) = dedupe_get(cache, store.scope().user(), principal, id) {
-        return Some(v);
+    durable_get_aged(store, cache, principal, id, window).map(|(v, _)| v)
+}
+
+/// `durable_get` that also reports the answer's age: precise from the memory
+/// cache, only "within the window" from a durable row (which keeps no instant
+/// the caller can see).
+pub fn durable_get_aged(store: &SqliteStore, cache: &DedupeCache, principal: Uuid, id: Uuid, window: Duration) -> Option<(Value, Option<Duration>)> {
+    if let Some((v, age)) = dedupe_get_aged(cache, store.scope().user(), principal, id) {
+        return Some((v, Some(age)));
     }
     let since = unix_now() - window.as_secs() as i64;
     let row = store.idempotency_get(principal, id, since).ok().flatten()?;
-    serde_json::from_str(&row).ok()
+    serde_json::from_str(&row).ok().map(|v| (v, None))
 }
 
 /// `dedupe_put` that also records the outcome durably (kept for `window`; a
@@ -521,7 +538,8 @@ impl KsMcp {
 
 fn ok_json<T: Serialize>(v: &T) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
-        serde_json::to_string_pretty(v).unwrap_or_else(|e| format!("serialize error: {e}")),
+        // compact: the agent's client re-indents if it wants; tokens are not free
+        serde_json::to_string(v).unwrap_or_else(|e| format!("serialize error: {e}")),
     )]))
 }
 
@@ -530,7 +548,26 @@ fn ok_text(s: impl Into<String>) -> Result<CallToolResult, McpError> {
 }
 
 fn err(msg: String) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::error(vec![ContentBlock::text(msg)]))
+    Ok(CallToolResult::error(vec![ContentBlock::text(with_hint(&msg))]))
+}
+
+/// One next-step hint appended to the recurring store-error shapes, so an
+/// error that reaches the agent cold still says what to do. The bespoke
+/// handlers (stale propose_markdown, edit_doc's closest block) write fuller
+/// messages themselves and don't match these prefixes.
+fn with_hint(msg: &str) -> String {
+    let hint = if msg.starts_with("stale base epoch") {
+        " — read_doc again and re-send, or use edit_doc (no epoch needed)"
+    } else if msg.starts_with("not found:") {
+        " — find_doc or orient can confirm the path or id"
+    } else if msg.starts_with("forbidden:") {
+        " — the doc is visible to you but not writable (you are a viewer, or the move crosses workspaces)"
+    } else if msg.starts_with("authentication required") {
+        " — connect with OAuth or send a Taisce PAT (Authorization: Bearer tsk_…)"
+    } else {
+        return msg.to_string();
+    };
+    format!("{msg}{hint}")
 }
 
 fn parse_uuid(s: &str, what: &str) -> std::result::Result<Uuid, String> {
@@ -655,15 +692,6 @@ fn no_changes(epoch: i64) -> Result<CallToolResult, McpError> {
     ok_text(format!("ok · no changes · epoch {epoch}"))
 }
 
-/// A write's answer: the one-line verdict, or the full JSON with `verbose`.
-fn answer(ops: &[OpInput], out: &ProposeOutcome, before: i64, verbose: bool) -> Result<CallToolResult, McpError> {
-    if verbose {
-        ok_json(out)
-    } else {
-        ok_text(render_outcome(ops, out, before))
-    }
-}
-
 /// What the dedupe cache stores for a write: both renderings, so a replay
 /// answers in whichever shape the retry asks for.
 /// doc_op "workspace": label (or, with no workspace, unlabel) a doc; its
@@ -725,11 +753,27 @@ fn stored(text: &str, full: &Value) -> Value {
     json!({"text": text, "full": full})
 }
 
-fn replay(prev: &Value, verbose: bool) -> Result<CallToolResult, McpError> {
+/// A replayed identical call: the original answer, marked as a replay so the
+/// agent can tell "my retry" from "a new write" (an append must never double).
+fn replay(prev: &Value, age: Option<Duration>, verbose: bool) -> Result<CallToolResult, McpError> {
+    let ago = match age {
+        Some(d) if d.as_secs() < 2 => "just now".to_string(),
+        Some(d) => format!("{}s ago", d.as_secs()),
+        None => "earlier".to_string(),
+    };
     if verbose {
-        ok_json(&prev["full"])
+        let mut full = prev["full"].clone();
+        if let Some(o) = full.as_object_mut() {
+            o.insert("replayed".into(), json!(true));
+            o.insert("original_answered".into(), json!(ago));
+        }
+        ok_json(&full)
     } else {
-        ok_text(prev["text"].as_str().unwrap_or_default())
+        ok_text(format!(
+            "replay · an identical call was answered {}; not re-applied\n{}",
+            ago,
+            prev["text"].as_str().unwrap_or_default()
+        ))
     }
 }
 
@@ -744,13 +788,28 @@ fn finish(
     res: taisce_store::Result<ProposeOutcome>,
     before: i64,
     verbose: bool,
+    note: Option<&str>,
 ) -> Result<CallToolResult, McpError> {
     match res {
         Ok(out) => {
-            let text = render_outcome(ops, &out, before);
-            let v = stored(&text, &serde_json::to_value(&out).unwrap_or_default());
+            let mut text = render_outcome(ops, &out, before);
+            if let Some(n) = note {
+                text.push_str("\nnote: ");
+                text.push_str(n);
+            }
+            let mut full = serde_json::to_value(&out).unwrap_or_default();
+            if let Some(o) = full.as_object_mut() {
+                if let Some(n) = note {
+                    o.insert("note".into(), json!(n));
+                }
+            }
+            let v = stored(&text, &full);
             durable_put(store, dedupe, principal, key, v, DEDUPE_TTL);
-            answer(ops, &out, before, verbose)
+            if verbose {
+                ok_json(&full)
+            } else {
+                ok_text(text)
+            }
         }
         Err(e) => err(e.to_string()),
     }
@@ -991,7 +1050,10 @@ fn flatten(nodes: &[BlockNode], depth: usize, out: &mut Vec<FlatBlock>) {
     }
 }
 
-/// `doc <uuid> · epoch <N> · <Folder › Sub › Title>`.
+/// `doc <uuid> · epoch <N> · <Folder › Sub › Title> · today <YYYY-MM-DD>` —
+/// the trailing date is the server's "today", the clock agents otherwise
+/// lack (todo due dates, "as of" lines). Labeled, because a daily doc's
+/// path is itself a date.
 fn doc_header(store: &SqliteStore, doc: &taisce_store::Doc) -> String {
     let path = store
         .list_docs()
@@ -999,7 +1061,12 @@ fn doc_header(store: &SqliteStore, doc: &taisce_store::Doc) -> String {
         .map(|docs| crate::nav::breadcrumbs(&docs))
         .and_then(|c| c.get(&doc.id).cloned())
         .unwrap_or_else(|| doc.title.clone());
-    format!("doc {} · epoch {} · {path}", doc.id, doc.current_epoch)
+    format!(
+        "doc {} · epoch {} · {path} · today {}",
+        doc.id,
+        doc.current_epoch,
+        chrono::Local::now().format("%Y-%m-%d")
+    )
 }
 
 /// Blocks as markdown, optionally each under its `^ref` line.
@@ -1195,7 +1262,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Find docs by name: fuzzy match over titles and breadcrumb paths ('Folder › Sub › Title'), typo-tolerant, ranked exact > prefix > substring > path words > fuzzy. Returns {id, title, path, parent_id, epoch, status}. Start here; then read_doc or edit_doc with the id."
+        description = "Find docs by name: fuzzy match over titles and breadcrumb paths ('Folder › Sub › Title'), typo-tolerant, ranked exact > prefix > substring > path words > fuzzy. Returns {id, title, path, parent_id, epoch, status}. Start here; then read_doc or edit_doc with the id.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn find_doc(
         &self,
@@ -1237,7 +1305,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "The map: the doc tree to `depth` (default 2) with ids and block counts, then the most-linked docs with their first paragraph and the tags in scope, within a token budget. Call once to orient in the corpus or a subtree (root_doc_id); says when truncated."
+        description = "The map: the doc tree to `depth` (default 2) with ids and block counts, then the most-linked docs with their first paragraph and the tags in scope, within a token budget. Call once to orient in the corpus or a subtree (root_doc_id); says when truncated.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn orient(
         &self,
@@ -1279,7 +1348,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Read a doc as markdown: first line 'doc <id> · epoch <N> · <path>', then the content (comments and canvases excluded). refs: true puts a ^abc123 line above each block; section: a heading path or ref reads just that section; block: just one block; comments: true appends the comment threads; mode 'outline' gives the JSON shape instead."
+        description = "Read a doc as markdown: first line 'doc <id> · epoch <N> · <path> · today <YYYY-MM-DD>', then the content (comments and canvases excluded). refs: true puts a ^abc123 line above each block; section: a heading path or ref reads just that section; block: just one block; comments: true appends the comment threads; mode 'outline' gives the JSON shape instead.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_doc(
         &self,
@@ -1368,7 +1438,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Edit like the Edit tool: replace `old` (exact text from read_doc; whitespace-tolerant) with `new` in one doc — no epoch needed, the diff is taken against the live doc and proposed through the gate. Exactly one match unless replace_all; zero matches names the closest block, several list their ^refs so you can widen `old`. Answers with a one-line verdict."
+        description = "Edit like the Edit tool: replace `old` (exact text from read_doc; whitespace-tolerant) with `new` in one doc — no epoch needed, the diff is taken against the live doc and proposed through the gate. Exactly one match unless replace_all; zero matches names the closest block, several list their ^refs so you can widen `old`. Answers with a one-line verdict.",
+        annotations(idempotent_hint = true, open_world_hint = false)
     )]
     async fn edit_doc(
         &self,
@@ -1379,7 +1450,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Add markdown to a doc without an epoch: at the end (default), or into a section named by heading path ('grimoire › Plans', '## x / ### y') or block ref, at: 'end' | 'start'. create_missing: true creates absent headings (the daily-log case). One-line verdict."
+        description = "Add markdown to a doc without an epoch: at the end (default), or into a section named by heading path ('grimoire › Plans', '## x / ### y') or block ref, at: 'end' | 'start'. create_missing: true creates absent headings (the daily-log case). One-line verdict.",
+        annotations(idempotent_hint = true, open_world_hint = false)
     )]
     async fn append(
         &self,
@@ -1390,7 +1462,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Full rewrite: hand over the doc's complete new markdown with the epoch from your read_doc; the server diffs it against the current blocks (unchanged blocks keep ids and comments) and proposes the minimal ops. A stale epoch is refused with the missed ops — re-read and re-send. Prefer edit_doc/append for local changes."
+        description = "Full rewrite: hand over the doc's complete new markdown with the epoch from your read_doc; the server diffs it against the current blocks (unchanged blocks keep ids and comments) and proposes the minimal ops. A stale epoch is refused with the missed ops — re-read and re-send. Prefer edit_doc/append for local changes.",
+        annotations(idempotent_hint = true, open_world_hint = false)
     )]
     async fn propose_markdown(
         &self,
@@ -1401,7 +1474,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Surgical block ops (insert/replace/delete/move by block id) at a base_epoch from read_doc; a stale base is scored per op (unchanged targets still green). Inserts may omit block_id; order_key '' appends, 'after:<uuid>' places. Use edit_doc/append unless you need explicit ops."
+        description = "Surgical block ops (insert/replace/delete/move by block id) at a base_epoch from read_doc; a stale base is scored per op (unchanged targets still green) and a refused one lists the missed ops (diff_since). Inserts may omit block_id; order_key '' appends, 'after:<uuid>' places. Use edit_doc/append unless you need explicit ops.",
+        annotations(idempotent_hint = true, open_world_hint = false)
     )]
     async fn propose(
         &self,
@@ -1411,7 +1485,7 @@ impl KsMcp {
         self.propose_impl(RequestHint::from_ctx(&ctx), p).await
     }
 
-    #[tool(description = "Ops applied to a doc after an epoch — what you missed. Use after a stale-epoch refusal, or to see what changed.")]
+    #[tool(description = "Ops applied to a doc after an epoch — what you missed. Use after a stale-epoch refusal, or to see what changed.", annotations(read_only_hint = true, open_world_hint = false))]
     async fn diff_since(
         &self,
         ctx: RequestContext<RoleServer>,
@@ -1437,7 +1511,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Ranked search over live blocks: exact phrase first, then all-words, then fuzzy and by-meaning. Compact hits {doc_id, path, block_id, snippet, score}; kind 'docs' groups by doc; scope_doc_id restricts to a subtree."
+        description = "Ranked search over live blocks: exact phrase first, then all-words, then fuzzy and by-meaning. Compact hits {doc_id, path, block_id, snippet, score}; kind 'docs' groups by doc; scope_doc_id restricts to a subtree.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search(
         &self,
@@ -1487,7 +1562,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Exhaustive regex sweep (Rust syntax, per line of block content) grouped by doc: every match with totals and a truncated flag — raise max_groups/max_matches_per_group for the rest. Comments and frontmatter skipped unless include_hidden."
+        description = "Exhaustive regex sweep (Rust syntax, per line of block content) grouped by doc: every match with totals and a truncated flag — raise max_groups/max_matches_per_group for the rest. Comments, frontmatter and ask-the-vault answers are skipped unless include_hidden / exclude_answers: false.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn grep(
         &self,
@@ -1512,6 +1588,7 @@ impl KsMcp {
             max_groups: p.max_groups.unwrap_or(20).clamp(1, 500) as usize,
             max_matches_per_group: p.max_matches_per_group.unwrap_or(5).clamp(1, 200) as usize,
             include_hidden: p.include_hidden.unwrap_or(false),
+            exclude_answers: p.exclude_answers.unwrap_or(true),
         };
         with_store(&self.store, scope, move |store| match crate::retrieval::grep(store, &p.pattern, opts) {
             Ok(out) => ok_json(&out),
@@ -1521,7 +1598,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "From a block or doc, what else matters: docs that [[link]] to it (why=backlink), nearest blocks by meaning (why=similar), same-folder docs (why=sibling). by: 'tag' + tag lists the docs carrying a tag; tags: true lists every tag with counts."
+        description = "From a block or doc, what else matters: docs that [[link]] to it (why=backlink), nearest blocks by meaning (why=similar), same-folder docs (why=sibling). by: 'tag' + tag lists the docs carrying a tag; tags: true lists every tag with counts.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn related(
         &self,
@@ -1589,7 +1667,43 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Create a doc, optionally with its whole markdown in the same call. if_exists 'reuse' is an atomic find-or-create by exact title under the parent (use it for daily docs); the default 'error' refuses a duplicate. Answers 'ok · created|reused \"Title\" · doc <id> · epoch N'."
+        description = "This vault's documentation style guide — the conventions every doc here should follow. Call it before writing, restructuring or formatting docs. Serves the doc titled 'Technical Style Guide'; edit that doc to change what it serves.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn style_guide(&self) -> Result<CallToolResult, McpError> {
+        self.style_guide_impl().await
+    }
+
+    pub(crate) async fn style_guide_impl(&self) -> Result<CallToolResult, McpError> {
+        with_store(&self.store, Scope::System, |store| {
+            // The guide is instance-level: one per vault, there for every
+            // user's agents, so it is read under System rather than the
+            // caller's scope. Exact title; v7 ids are time-ordered, so the
+            // oldest doc wins if two share the title.
+            let doc = store
+                .list_docs()
+                .ok()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|d| d.title.trim().eq_ignore_ascii_case(STYLE_GUIDE_TITLE))
+                .min_by_key(|d| d.id);
+            let Some(doc) = doc else {
+                return err(format!(
+                    "no doc titled {STYLE_GUIDE_TITLE:?} — create it (plain markdown) and this tool serves it"
+                ));
+            };
+            let tree = match store.read_doc(doc.id) {
+                Ok(t) => t,
+                Err(e) => return err(e.to_string()),
+            };
+            ok_text(render_blocks(&locate::content_blocks(&tree.roots), false))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Create a doc, optionally with its whole markdown in the same call. if_exists 'reuse' is an atomic find-or-create by exact title under the parent (use it for daily docs); the default 'error' refuses a duplicate. Answers 'ok · created|reused \"Title\" · doc <id> · epoch N'.",
+        annotations(idempotent_hint = true, open_world_hint = false)
     )]
     async fn create_doc(
         &self,
@@ -1600,7 +1714,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Tree ops through the gate: op 'rename' (title), 'move' (new_parent_id, after_doc_id), 'status' (status) land as flagged yellows a reviewer can decline; 'delete' is always red (parked until a human trashes it); 'merge' (into_doc_id) appends doc_id's content as yellows then parks a red delete; 'workspace' (workspace: name or id, null to unlabel; create_missing) files doc_id and its subtree directly."
+        description = "Tree ops through the gate: op 'rename' (title), 'move' (new_parent_id, after_doc_id), 'status' (status) land as flagged yellows a reviewer can decline; 'delete' is always red (parked until a human trashes it); 'merge' (into_doc_id) appends doc_id's content as yellows then parks a red delete; 'workspace' (workspace: name or id, null to unlabel; create_missing) files doc_id and its subtree directly.",
+        annotations(destructive_hint = true, open_world_hint = false)
     )]
     async fn doc_op(
         &self,
@@ -1611,7 +1726,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Comment on a block (^abc123 or UUID), or reply within a thread via reply_to. Comments are blocks with provenance; threads survive edits. Read them with read_doc(comments: true)."
+        description = "Comment on a block (^abc123 or UUID), or reply within a thread via reply_to. Comments are blocks with provenance; threads survive edits. Read them with read_doc(comments: true).",
+        annotations(idempotent_hint = true, open_world_hint = false)
     )]
     async fn add_comment(
         &self,
@@ -1622,7 +1738,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "Resolve one review annotation (from proposals kind 'pending'): accept or decline, as this agent. You cannot resolve your own proposals (proposer ≠ approver)."
+        description = "Resolve one review annotation (from proposals kind 'pending'): accept or decline, as this agent. You cannot resolve your own proposals (proposer ≠ approver).",
+        annotations(destructive_hint = true, open_world_hint = false)
     )]
     async fn resolve(
         &self,
@@ -1633,7 +1750,8 @@ impl KsMcp {
     }
 
     #[tool(
-        description = "kind 'mine' (default): what happened to your proposals — each op, its verdict, whether its annotation was accepted/declined/open and by whom; learn from declines. kind 'pending': open yellows and parked reds awaiting a human, oldest first (doc_id to filter)."
+        description = "kind 'mine' (default): what happened to your proposals — each op, its verdict, whether its annotation was accepted/declined/open and by whom; learn from declines. kind 'pending': open yellows and parked reds awaiting a human, oldest first (doc_id to filter).",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn proposals(
         &self,
@@ -1666,13 +1784,13 @@ impl KsMcp {
             Some(doc_id),
             &json!({"old": p.old, "new": p.new, "replace_all": p.replace_all.unwrap_or(false)}),
         );
-        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, verbose);
+        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
+            return replay(&prev, Some(age), verbose);
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, scope, move |store| {
-            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, verbose);
+            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, age, verbose);
             }
             let tree = match store.read_doc(doc_id) {
                 Ok(t) => t,
@@ -1724,7 +1842,7 @@ impl KsMcp {
                 return no_changes(epoch);
             }
             let res = store.propose(doc_id, epoch, principal, ops.clone());
-            finish(store, &dedupe, principal, key, &ops, res, epoch, verbose)
+            finish(store, &dedupe, principal, key, &ops, res, epoch, verbose, None)
         })
         .await
     }
@@ -1756,13 +1874,13 @@ impl KsMcp {
             Some(doc_id),
             &json!({"markdown": p.markdown, "to": p.to, "at": at_start, "create_missing": p.create_missing.unwrap_or(false)}),
         );
-        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, verbose);
+        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
+            return replay(&prev, Some(age), verbose);
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, scope, move |store| {
-            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, verbose);
+            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, age, verbose);
             }
             let tree = match store.read_doc(doc_id) {
                 Ok(t) => t,
@@ -1793,7 +1911,7 @@ impl KsMcp {
                 return no_changes(epoch);
             }
             let res = store.propose(doc_id, epoch, principal, ops.clone());
-            finish(store, &dedupe, principal, key, &ops, res, epoch, verbose)
+            finish(store, &dedupe, principal, key, &ops, res, epoch, verbose, None)
         })
         .await
     }
@@ -1820,13 +1938,13 @@ impl KsMcp {
             Err(m) => return err(m),
         };
         let key = dedupe_key("propose", Some(doc_id), &json!({"base_epoch": p.base_epoch, "ops": p.ops}));
-        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, verbose);
+        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
+            return replay(&prev, Some(age), verbose);
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, scope, move |store| {
-            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, verbose);
+            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, age, verbose);
             }
             // block ops against a stale base are SCORED per op (the gate's whole
             // point: unchanged targets still green, conflicts yellow/red) — a
@@ -1834,7 +1952,7 @@ impl KsMcp {
             // whole-doc path, where it is.
             let before = store.get_doc(doc_id).map(|d| d.current_epoch).unwrap_or(p.base_epoch);
             let res = store.propose(doc_id, p.base_epoch, principal, ops.clone());
-            finish(store, &dedupe, principal, key, &ops, res, before, verbose)
+            finish(store, &dedupe, principal, key, &ops, res, before, verbose, None)
         })
         .await
     }
@@ -1854,13 +1972,13 @@ impl KsMcp {
             Err(m) => return err(m),
         };
         let key = dedupe_key("propose_markdown", Some(doc_id), &json!({"base_epoch": p.base_epoch, "markdown": p.markdown}));
-        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, verbose);
+        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
+            return replay(&prev, Some(age), verbose);
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, scope, move |store| {
-            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, verbose);
+            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, age, verbose);
             }
             let tree = match store.read_doc(doc_id) {
                 Ok(t) => t,
@@ -1902,11 +2020,26 @@ impl KsMcp {
                 ));
             }
             let ops = taisce_store::mddiff::markdown_to_ops(&tree.roots, &p.markdown);
+            // "omitted means unchanged": if the doc carried frontmatter and
+            // the markdown doesn't, mddiff preserved it — say so, or the
+            // agent believes its omission was applied.
+            let note = (tree
+                .roots
+                .iter()
+                .any(|n| taisce_store::import::is_frontmatter(&n.block.content))
+                && !taisce_store::mddiff::markdown_has_frontmatter(&p.markdown))
+            .then(|| "frontmatter preserved — the markdown carried none; pass it explicitly to change it");
             if ops.is_empty() {
-                return no_changes(tree.doc.current_epoch);
+                return match note {
+                    Some(n) => ok_text(format!(
+                        "ok · no changes · epoch {}\nnote: {n}",
+                        tree.doc.current_epoch
+                    )),
+                    None => no_changes(tree.doc.current_epoch),
+                };
             }
             let res = store.propose(doc_id, p.base_epoch, principal, ops.clone());
-            finish(store, &dedupe, principal, key, &ops, res, tree.doc.current_epoch, verbose)
+            finish(store, &dedupe, principal, key, &ops, res, tree.doc.current_epoch, verbose, note)
         })
         .await
     }
@@ -1936,13 +2069,13 @@ impl KsMcp {
         };
         let ws_arg = p.workspace.as_deref().map(str::trim).filter(|w| !w.is_empty()).map(str::to_string);
         let key = dedupe_key("create_doc", parent, &json!({"title": title, "markdown": p.markdown, "reuse": reuse, "workspace": ws_arg}));
-        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, verbose);
+        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
+            return replay(&prev, Some(age), verbose);
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, scope, move |store| {
-            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, verbose);
+            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, age, verbose);
             }
             // a parent's workspace is inherited, never overridden here
             let ws = match ws_arg.as_deref() {
@@ -2050,13 +2183,13 @@ impl KsMcp {
             "workspace": p.workspace, "create_missing": p.create_missing,
         });
         let key = dedupe_key("doc_op", Some(doc_id), &payload);
-        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, verbose);
+        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
+            return replay(&prev, Some(age), verbose);
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, scope, move |store| {
-            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, verbose);
+            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, age, verbose);
             }
             let before = store.get_doc(doc_id).map(|d| d.current_epoch).unwrap_or(0);
             let single = |store: &mut SqliteStore, ops_kind: &str, res: Result<ProposeOutcome, String>| match res {
@@ -2159,13 +2292,13 @@ impl KsMcp {
             Err(m) => return err(m),
         };
         let key = dedupe_key("add_comment", None, &json!({"block_id": p.block_id, "text": p.text, "reply_to": p.reply_to}));
-        if let Some(prev) = dedupe_get(&self.dedupe, scope.user(), principal, key) {
-            return replay(&prev, verbose);
+        if let Some((prev, age)) = dedupe_get_aged(&self.dedupe, scope.user(), principal, key) {
+            return replay(&prev, Some(age), verbose);
         }
         let dedupe = self.dedupe.clone();
         with_store(&self.store, scope, move |store| {
-            if let Some(prev) = durable_get(store, &dedupe, principal, key, DEDUPE_TTL) {
-                return replay(&prev, verbose);
+            if let Some((prev, age)) = durable_get_aged(store, &dedupe, principal, key, DEDUPE_TTL) {
+                return replay(&prev, age, verbose);
             }
             let target = match resolve_block(store, &p.block_id) {
                 Ok(b) => b,
@@ -2352,6 +2485,11 @@ impl ServerHandler for KsMcp {
 /// silently truncated a big `propose_markdown` long before the axum layer.
 pub const MAX_MCP_BODY: usize = 16 * 1024 * 1024;
 
+/// The doc the `style_guide` tool serves, matched by exact (case-insensitive)
+/// title. Edit that doc to change what the tool serves — the tool is the
+/// stable contract, the doc is the mutable backing.
+pub const STYLE_GUIDE_TITLE: &str = "Technical Style Guide";
+
 /// `embedder`: the block embedder for the dense legs of `search`/`related`
 /// (None = keyword-only, the tools say so).
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2407,7 +2545,7 @@ mod tests {
     use super::*;
     use taisce_store::import::import_markdown;
 
-    pub const TOOLS: [&str; 16] = [
+    pub const TOOLS: [&str; 17] = [
         "find_doc",
         "orient",
         "read_doc",
@@ -2419,6 +2557,7 @@ mod tests {
         "search",
         "grep",
         "related",
+        "style_guide",
         "create_doc",
         "doc_op",
         "add_comment",
@@ -2427,19 +2566,42 @@ mod tests {
     ];
 
     #[test]
-    fn exactly_sixteen_tools_and_no_request_id() {
+    fn exactly_seventeen_tools_and_no_request_id() {
         let tools = KsMcp::tool_router().list_all();
         let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
         names.sort();
         let mut want: Vec<String> = TOOLS.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(names, want);
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         for t in &tools {
             let schema = serde_json::to_string(&t.input_schema).unwrap();
             assert!(!schema.contains("request_id"), "{}: {schema}", t.name);
             let desc = t.description.as_deref().unwrap_or("");
             assert!(desc.split(". ").count() <= 3, "≤3 sentences — {}: {desc}", t.name);
+        }
+    }
+
+    #[test]
+    fn read_tools_are_marked_read_only() {
+        let tools = KsMcp::tool_router().list_all();
+        let ann = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.annotations.clone())
+                .unwrap_or_else(|| panic!("{name} has no annotations"))
+        };
+        for name in ["find_doc", "orient", "read_doc", "diff_since", "search", "grep", "related", "proposals", "style_guide"] {
+            let a = ann(name);
+            assert_eq!(a.read_only_hint, Some(true), "{name} should be read-only");
+            assert_ne!(a.destructive_hint, Some(true), "{name} must not be destructive");
+        }
+        for name in ["doc_op", "resolve"] {
+            assert_eq!(ann(name).destructive_hint, Some(true), "{name} should be destructive");
+        }
+        for name in ["edit_doc", "append", "propose", "propose_markdown", "create_doc", "add_comment"] {
+            assert_eq!(ann(name).idempotent_hint, Some(true), "{name} retries replay safely");
         }
     }
 
@@ -2715,7 +2877,7 @@ mod tests {
         // a replay within the window answers the first outcome and writes nothing
         let seq = store.lock(taisce_store::Scope::System).latest_change_seq().unwrap();
         let (_, again) = raw(op(json!({"op": "workspace", "doc_id": gp.to_string(), "workspace": "Health", "create_missing": true})).await.unwrap());
-        assert_eq!(again, msg);
+        assert!(again.starts_with("replay · ") && again.ends_with(&msg), "a retry replays the original answer, marked: {again}");
         assert_eq!(store.lock(taisce_store::Scope::System).latest_change_seq().unwrap(), seq);
         assert_eq!(store.lock(taisce_store::Scope::System).list_workspaces().unwrap().len(), 2);
 
@@ -2984,7 +3146,7 @@ mod tests {
         let e0 = fx.epoch();
         let (_, first) = fx.edit(json!({"old": "- plan q", "new": "- plan Q"})).await;
         let (_, again) = fx.edit(json!({"old": "- plan q", "new": "- plan Q"})).await;
-        assert_eq!(first, again, "a retry replays the original verdict");
+        assert!(again.starts_with("replay · ") && again.ends_with(&first), "a retry replays the original verdict, marked: {again}");
         assert_eq!(fx.epoch(), e0 + 1, "and applies nothing");
         let (_, again_json) = fx.edit(json!({"old": "- plan q", "new": "- plan Q", "verbose": true})).await;
         assert!(again_json.starts_with('{'), "a verbose retry replays the JSON: {again_json}");
@@ -3051,7 +3213,16 @@ mod tests {
         let (is_err, out) = fx.read(json!({})).await;
         assert!(!is_err);
         let mut lines = out.lines();
-        assert_eq!(lines.next().unwrap(), format!("doc {} · epoch {} · 2026-09-10", fx.doc, fx.epoch()));
+        let header = lines.next().unwrap().to_string();
+        assert_eq!(
+            header,
+            format!(
+                "doc {} · epoch {} · 2026-09-10 · today {}",
+                fx.doc,
+                fx.epoch(),
+                chrono::Local::now().format("%Y-%m-%d")
+            )
+        );
         assert_eq!(lines.next().unwrap(), "");
         assert_eq!(out.split_once("\n\n").unwrap().1, DAILY);
 
@@ -3360,7 +3531,7 @@ mod tests {
         assert!(!is_err, "{a}");
         let (is_err, b) = raw(boot().append_impl(NONE, p(args)).await.unwrap());
         assert!(!is_err, "{b}");
-        assert_eq!(a, b, "the replay is the original verdict");
+        assert!(b.starts_with("replay · ") && b.ends_with(&a), "the replay is the original verdict, marked: {b}");
         let s = SqliteStore::open(&db).unwrap();
         assert_eq!(s.get_doc(doc).unwrap().current_epoch, e0 + 1, "applied once");
         assert_eq!(taisce_store::export::export_doc(&s, doc).unwrap().matches("once").count(), 1);
@@ -3368,7 +3539,7 @@ mod tests {
         let (is_err, c1) = raw(boot().create_doc_impl(NONE, p(json!({"title": "From the phone"}))).await.unwrap());
         assert!(!is_err, "{c1}");
         let (_, c2) = raw(boot().create_doc_impl(NONE, p(json!({"title": "From the phone"}))).await.unwrap());
-        assert_eq!(c1, c2, "a replay, not 'already exists'");
+        assert!(c2.starts_with("replay · ") && c2.ends_with(&c1), "a replay, not 'already exists': {c2}");
         let s = SqliteStore::open(&db).unwrap();
         assert_eq!(s.list_docs().unwrap().iter().filter(|d| d.title == "From the phone").count(), 1, "created once");
         let block_id = s.read_doc(doc).unwrap().roots[0].block.id;
@@ -3378,12 +3549,12 @@ mod tests {
         let (is_err, r1) = raw(boot().doc_op_impl(NONE, p(rename.clone())).await.unwrap());
         assert!(!is_err, "{r1}");
         let (_, r2) = raw(boot().doc_op_impl(NONE, p(rename)).await.unwrap());
-        assert_eq!(r1, r2);
+        assert!(r2.starts_with("replay · ") && r2.ends_with(&r1), "replay marked: {r2}");
         let comment = json!({"block_id": block, "text": "once"});
         let (is_err, m1) = raw(boot().add_comment_impl(NONE, p(comment.clone())).await.unwrap());
         assert!(!is_err, "{m1}");
         let (_, m2) = raw(boot().add_comment_impl(NONE, p(comment)).await.unwrap());
-        assert_eq!(m1, m2);
+        assert!(m2.starts_with("replay · ") && m2.ends_with(&m1), "replay marked: {m2}");
         let s = SqliteStore::open(&db).unwrap();
         let renames = s.ops_for_doc_limited(doc, 50).unwrap().into_iter().filter(|o| matches!(o.kind, OpKind::RenameDoc { .. })).count();
         assert_eq!(renames, 1, "renamed once");

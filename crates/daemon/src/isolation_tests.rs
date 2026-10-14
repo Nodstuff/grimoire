@@ -113,6 +113,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("mcp:add_comment", "mcp_writes_answer_not_found_or_read_only"),
     ("mcp:resolve", "mcp_writes_answer_not_found_or_read_only"),
     ("mcp:proposals", "mcp_reads_never_show_a_private_doc"),
+    ("mcp:style_guide", "the_style_guide_is_instance_level"),
     // regressions from the adversarial review (a route may carry several rows)
     ("/api/flags", "unshare_then_a_stale_anchor_reads_nothing_through_flags"),
     ("mcp:propose", "unshare_then_a_stale_anchor_reads_nothing_through_flags"),
@@ -943,6 +944,27 @@ async fn mcp_reads_never_show_a_private_doc() {
     // a connector token: same isolation
     let (_, out) = fx.tool(&fx.b_conn, "search", json!({"query": "zebrasecret"})).await;
     fx.no_leak("connector search", &out);
+}
+
+#[tokio::test]
+async fn the_style_guide_is_instance_level() {
+    // The style guide is one doc per vault, served by System scope to every
+    // user's agents. The test pins the two sides of that: B's agent (no
+    // access to A's vault) still gets the guide, and the answer carries
+    // nothing of A's private docs.
+    let fx = fixture();
+    {
+        let mut s = fx.store.lock(Scope::System);
+        s.create_doc_with_ops("Technical Style Guide", None, fx.a_human, vec![para("Present tense, active voice, second person: the gate scores each op.").1]).unwrap();
+    }
+    let (is_err, out) = fx.tool(&fx.b_pat, "style_guide", json!({})).await;
+    assert!(!is_err, "style_guide must serve the instance-level doc: {out}");
+    assert!(out.contains("Present tense"), "{out}");
+    fx.no_leak("style_guide", &out);
+    // a vault without the doc says so, helpfully
+    let fx2 = fixture();
+    let (is_err, out) = fx2.tool(&fx2.b_pat, "style_guide", json!({})).await;
+    assert!(is_err && out.contains("no doc titled"), "{out}");
 }
 
 #[tokio::test]

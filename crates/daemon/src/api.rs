@@ -1693,9 +1693,9 @@ mod http_client_tests {
             "block_type": "paragraph", "content": "once"}}]});
         let first = call(&app, "POST", "/api/propose", &[], Some(body.clone())).await;
         assert_eq!(first["epoch"], 1, "{first}");
-        // simulated 121s: every memory entry is past DEDUPE_TTL
+        // simulated past-the-window: every memory entry is older than DEDUPE_TTL
         for (_, at, _) in st.dedupe.lock().unwrap().values_mut() {
-            *at = std::time::Instant::now() - std::time::Duration::from_secs(121);
+            *at = std::time::Instant::now() - crate::mcp::DEDUPE_TTL - std::time::Duration::from_secs(1);
         }
         assert!(crate::mcp::dedupe_get(&st.dedupe, None, human, rid).is_none(), "memory window passed");
         let late = call(&app, "POST", "/api/propose", &[], Some(body.clone())).await;
