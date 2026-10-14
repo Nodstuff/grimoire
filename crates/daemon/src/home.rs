@@ -45,7 +45,7 @@ fn parse_iso_millis(s: &str) -> Option<i64> {
 async fn get_visit(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
     with_store(&st.store, v.scope, move |s| match s.get_setting(LAST_VISIT_KEY) {
         Ok(v) => Json(json!({"last_visit": v})),
-        Err(e) => Json(json!({"error": e.to_string()})),
+        Err(e) => crate::api::api_err(&e),
     })
     .await
 }
@@ -74,11 +74,11 @@ async fn post_visit(State(st): State<ApiState>, v: Viewer, body: axum::body::Byt
     with_store(&st.store, v.scope, move |s| {
         let previous = match s.get_setting(LAST_VISIT_KEY) {
             Ok(v) => v,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return crate::api::api_err(&e),
         };
         match s.set_setting(LAST_VISIT_KEY, &at) {
             Ok(()) => Json(json!({"last_visit": at, "previous": previous})),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => crate::api::api_err(&e),
         }
     })
     .await
@@ -99,11 +99,11 @@ async fn since(State(st): State<ApiState>, v: Viewer, Query(q): Query<SinceQuery
     with_store(&st.store, v.scope, move |s| {
         let principals: HashMap<Uuid, (String, PrincipalKind)> = match s.list_principals() {
             Ok(ps) => ps.into_iter().map(|p| (p.id, (p.display_name, p.kind))).collect(),
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return crate::api::api_err(&e),
         };
         let docs = match s.list_docs() {
             Ok(d) => d,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return crate::api::api_err(&e),
         };
         let mut rows: Vec<(i64, Value)> = docs
             .into_iter()

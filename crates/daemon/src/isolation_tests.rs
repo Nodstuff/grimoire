@@ -2316,3 +2316,44 @@ async fn public_comment_content_type_and_preview_images() {
     let page = fx.raw(None, "GET", &link_path(&share), None).await;
     assert!(page.body.contains("loading=\"lazy\""), "the public page keeps lazy images");
 }
+
+/// `/api` errors carry a stable `code` beside the unchanged prose and status
+/// (`api::api_err`): an invisible doc is `not_found` exactly like a missing
+/// one (never `forbidden`), a viewer's write `forbidden`, a stale whole-doc
+/// write `stale_base`, a refused op `invalid` (still 200).
+#[tokio::test]
+async fn api_errors_carry_a_stable_code() {
+    let fx = fixture();
+    let code = |out: &str| serde_json::from_str::<Value>(out).unwrap()["code"].clone();
+    let (secret, shared) = (fx.a_secret, fx.shared_doc);
+    for (m, path, body) in [
+        ("GET", format!("/api/doc/{secret}"), None),
+        ("GET", format!("/api/doc/{secret}/history"), None),
+        ("POST", "/api/propose".to_string(), Some(json!({"doc_id": secret, "base_epoch": 1, "ops": []}))),
+        ("POST", format!("/api/doc/{secret}/rename"), Some(json!({"title": "mine"}))),
+        ("POST", "/api/resolve".to_string(), Some(json!({"annotation_id": fx.a_ann, "decision": "accept"}))),
+    ] {
+        let (st, out) = fx.b(m, &path, body.clone()).await;
+        assert_eq!((st, code(&out)), (StatusCode::NOT_FOUND, json!("not_found")), "{m} {path}: {out}");
+        let missing = fx.b(m, &path.replace(&secret.to_string(), &MISSING.to_string()), body).await;
+        if path.contains(&secret.to_string()) {
+            assert_eq!(code(&missing.1), json!("not_found"), "{m} {path} (missing): {}", missing.1);
+        }
+    }
+    let e = fx.store.lock(Scope::System).get_doc(shared).unwrap().current_epoch;
+    for (m, path, body) in [
+        ("POST", "/api/propose".to_string(), json!({"doc_id": shared, "base_epoch": e, "ops": [para("x").1]})),
+        ("POST", format!("/api/doc/{shared}/rename"), json!({"title": "ours"})),
+        ("PUT", format!("/api/docs/{}/workspace", fx.b_doc), json!({"workspace_id": fx.family})),
+    ] {
+        let (st, out) = fx.b(m, &path, Some(body)).await;
+        assert_eq!((st, code(&out)), (StatusCode::FORBIDDEN, json!("forbidden")), "{m} {path}: {out}");
+        assert!(out.contains("\"error\":\"forbidden: "), "the prose is unchanged: {out}");
+    }
+    let (st, out) = fx.b("POST", "/api/propose_markdown", Some(json!({"doc_id": fx.b_doc, "base_epoch": 99, "markdown": "x"}))).await;
+    assert_eq!((st, code(&out)), (StatusCode::OK, json!("stale_base")), "{out}");
+    let b_doc = fx.b_doc;
+    let (st, out) = fx.b("POST", &format!("/api/doc/{b_doc}/move"), Some(json!({"parent_id": b_doc}))).await;
+    assert_eq!((st, code(&out)), (StatusCode::OK, json!("invalid")), "{out}");
+    assert!(out.contains("\"error\":\"invalid op: "), "{out}");
+}

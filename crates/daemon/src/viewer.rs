@@ -148,8 +148,18 @@ pub async fn error_status(req: axum::extract::Request, next: axum::middleware::N
         Ok(b) => b,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "body").into_response(),
     };
-    let head = &bytes[..bytes.len().min(64)];
-    let starts = |p: &str| head.starts_with(format!("{{\"error\":\"{p}").as_bytes());
+    let mut head = &bytes[..bytes.len().min(160)];
+    // `api_err` adds a `code` beside `error`; keys serialize sorted, so it
+    // comes first. Step over it: the status still follows `error` alone.
+    if let Some(rest) = head.strip_prefix(b"{\"code\":\"")
+        && let Some(end) = rest.iter().position(|&c| c == b'"')
+        && let Some(after) = rest[end + 1..].strip_prefix(b",")
+    {
+        head = after;
+    } else if let Some(after) = head.strip_prefix(b"{") {
+        head = after;
+    }
+    let starts = |p: &str| head.starts_with(format!("\"error\":\"{p}").as_bytes());
     if starts("not found") {
         parts.status = StatusCode::NOT_FOUND;
     } else if starts("forbidden") {
