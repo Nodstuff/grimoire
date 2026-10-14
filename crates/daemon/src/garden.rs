@@ -174,7 +174,7 @@ async fn invoke_claude_streaming(
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let bin = claude_bin().ok_or_else(|| {
-        "Claude Code is not installed on this Mac (no `claude` on PATH) — gardeners need it"
+        "Claude Code is not installed on this machine (no `claude` on PATH) — gardeners need it"
             .to_string()
     })?;
     let mut args: Vec<String> = vec![

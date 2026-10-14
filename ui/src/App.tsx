@@ -611,8 +611,8 @@ function NewDocPalette({ onCreated, onClose }: { onCreated: (id: string) => void
 
 /* ---------- doc view ---------- */
 
-/** Click-to-rename doc title. Inbound [[wikilinks]] resolve by title and are
- * not rewritten on rename — they dangle until edited. */
+/** Click-to-rename doc title. The server rewrites inbound [[wikilinks]] to
+ * the new title in docs the renamer can write (`rename_doc`). */
 function DocTitle({ doc, onRenamed }: { doc: Doc; onRenamed: () => void }) {
   const [editing, setEditing] = useState(false)
   const [value, setValue] = useState(doc.title)

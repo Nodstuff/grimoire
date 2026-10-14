@@ -1,9 +1,9 @@
 //! Ask the vault, with receipts: a question → an answer doc whose every
 //! claim links `[[Doc Title#^block-id]]` to the exact block it rests on.
 //!
-//! Retrieval is the block-granular search the app already has (FTS5
-//! trigram): the question's content words are each searched, hits are
-//! scored by how many words they carry, and the top blocks go to the model
+//! Retrieval is hybrid (`retrieve`): a keyword leg over FTS5 trigram, one
+//! search per content word, and a dense leg over the block vectors, fused;
+//! keyword only when no embedder is loaded. The top blocks go to the model
 //! as numbered excerpts with their ids. The model may ONLY use those
 //! excerpts and must cite; if they don't answer the question it says so.
 //! The answer becomes a doc under the `Answers` folder, written through the
