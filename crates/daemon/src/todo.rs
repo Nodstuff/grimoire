@@ -1012,11 +1012,11 @@ async fn mutate(
         };
         let doc = match find_or_create_todo_in(s, human, scope) {
             Ok(d) => d,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return crate::api::api_err(&e),
         };
         let md = match taisce_store::export::export_doc(&*s, doc.id) {
             Ok(m) => m,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return crate::api::api_err(&e),
         };
         let (new_md, warning) = match f(&md, &today, zone) {
             Ok(m) => m,
@@ -1064,11 +1064,11 @@ async fn get_day(State(st): State<ApiState>, v: Viewer, server: Server, Query(q)
         let doc = match found {
             Ok(Some(d)) => d,
             Ok(None) => return Json(json!({"error": "not found: no To-do list here yet"})),
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return crate::api::api_err(&e),
         };
         let md = match taisce_store::export::export_doc(&*s, doc.id) {
             Ok(m) => m,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return crate::api::api_err(&e),
         };
         let mut carried = 0;
         if may_write && should_carry(&md, &date, &today) {

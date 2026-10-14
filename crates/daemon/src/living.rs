@@ -324,7 +324,7 @@ pub async fn living_status(
     with_store(&st.store, v.scope, move |s| {
         // an invisible doc answers exactly like a missing one
         if let Err(e) = s.get_doc(id) {
-            return Json(json!({"error": e.to_string()}));
+            return crate::api::api_err(&e);
         }
         Json(json!(status(s, id)))
     })

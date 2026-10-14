@@ -85,14 +85,14 @@ async fn capture(State(st): State<ApiState>, v: Viewer, Json(req): Json<CaptureR
     with_store(&st.store, v.scope, move |s| {
         let inbox = match find_or_create_inbox(s, human) {
             Ok(d) => d,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return crate::api::api_err(&e),
         };
         let title = inbox_title(&req.text);
         let md = inbox_markdown(&req.text);
         let ops = taisce_store::mddiff::markdown_to_ops_from(&[], &md, "inbox");
         match s.create_doc_with_ops(&title, Some(inbox.id), human, ops) {
             Ok((doc, _)) => Json(json!({"doc_id": doc.id, "title": doc.title, "inbox_id": inbox.id})),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => crate::api::api_err(&e),
         }
     })
     .await
@@ -102,7 +102,7 @@ async fn list(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
     with_store(&st.store, v.scope, move |s| {
         let docs = match s.list_docs() {
             Ok(d) => d,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return crate::api::api_err(&e),
         };
         let Some(inbox) = s.own_root_titled(INBOX_TITLE).ok().flatten() else {
             return Json(json!({"doc_id": null, "items": []}));
