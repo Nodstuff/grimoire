@@ -1050,7 +1050,7 @@ fn flatten(nodes: &[BlockNode], depth: usize, out: &mut Vec<FlatBlock>) {
     }
 }
 
-/// `doc <uuid> · epoch <N> · <Folder › Sub › Title> · today <YYYY-MM-DD>` —
+/// `doc <uuid> · epoch <N> · <Folder › Sub › Title> · today <YYYY-MM-DD UTC±hh:mm>` —
 /// the trailing date is the server's "today", the clock agents otherwise
 /// lack (todo due dates, "as of" lines). Labeled, because a daily doc's
 /// path is itself a date.

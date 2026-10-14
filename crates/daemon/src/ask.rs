@@ -123,7 +123,6 @@ pub(crate) fn answers_folder_id(store: &SqliteStore) -> Option<Uuid> {
     store.own_root_titled(ANSWERS_FOLDER).ok().flatten().map(|d| d.id)
 }
 
-/// Answer docs must never be evidence for the next answer (they'd echo).
 /// Every doc at or under the answers folder, worked out once from one doc
 /// listing (a per-block `under_answers` walk costs a lookup per level).
 pub(crate) fn answers_subtree(store: &SqliteStore, answers: Option<Uuid>) -> std::collections::HashSet<Uuid> {
@@ -145,6 +144,7 @@ pub(crate) fn answers_subtree(store: &SqliteStore, answers: Option<Uuid>) -> std
     out
 }
 
+/// Answer docs must never be evidence for the next answer (they'd echo).
 pub(crate) fn under_answers(store: &SqliteStore, doc_id: Uuid, answers: Option<Uuid>) -> bool {
     let Some(a) = answers else { return false };
     let mut cur = Some(doc_id);
