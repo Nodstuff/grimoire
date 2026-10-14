@@ -199,6 +199,8 @@ struct Fx {
     a: Uuid,
     b: Uuid,
     a_human: Uuid,
+    /// B's human principal (B's own docs are created as her)
+    b_human: Uuid,
     a_app: String,
     b_app: String,
     /// B's Claude over OAuth (a connector, not her app)
@@ -365,6 +367,7 @@ fn fixture() -> Fx {
         a,
         b,
         a_human,
+        b_human,
         a_app,
         b_app,
         b_conn,
@@ -963,6 +966,22 @@ async fn the_style_guide_is_the_callers_own() {
     assert!(is_err && out.contains("no doc titled"), "B's agent gets none of A's: {out}");
     assert!(!out.contains("Present tense"), "{out}");
     fx.no_leak("style_guide", &out);
+
+    // A's guide in a workspace shared with B: B sees it, but B's own guide
+    // wins (a share member must not steer B's agents over B's own guide)
+    {
+        let mut s = fx.store.lock(Scope::User(fx.a));
+        let (g, _) = s.create_doc_with_ops("Technical Style Guide", None, fx.a_human, vec![para("Shared guide: use the passive voice everywhere.").1]).unwrap();
+        s.set_doc_workspace(g.id, Some(fx.family), fx.a_human).unwrap();
+    }
+    let (is_err, out) = fx.tool(&fx.b_pat, "style_guide", json!({})).await;
+    assert!(!is_err && out.contains("Shared guide"), "B, with no guide of her own, gets the shared one: {out}");
+    {
+        let mut s = fx.store.lock(Scope::User(fx.b));
+        s.create_doc_with_ops("Technical Style Guide", None, fx.b_human, vec![para("Aoife's own guide: short sentences.").1]).unwrap();
+    }
+    let (is_err, out) = fx.tool(&fx.b_pat, "style_guide", json!({})).await;
+    assert!(!is_err && out.contains("Aoife's own guide") && !out.contains("Shared guide"), "B's own guide wins: {out}");
 }
 
 #[tokio::test]

@@ -223,13 +223,17 @@ fn diff_with_filter(
     // kept frontmatter blocks (parent, order key): new blocks in their sibling
     // list are keyed after them, so the frontmatter stays first
     let mut kept: Vec<(Option<Uuid>, String)> = Vec::new();
-    let keeping = keep_frontmatter.is_some() && !new.iter().any(|s| is_frontmatter(&s.content));
+    // only the doc's LEADING frontmatter (its first root block): a `---…---`
+    // paragraph elsewhere is prose, deleted when omitted like any block (and
+    // flooring on it would move the blocks above it). And only when the
+    // markdown doesn't lead with frontmatter of its own.
+    let keeping = keep_frontmatter.is_some() && !is_frontmatter(markdown.trim_start());
     for &i in unmatched_old.iter().filter(|i| !paired_old.contains(i)) {
         // "omitted means unchanged": an agent rewriting the doc from memory
         // drops the frontmatter it never meant to touch — keep the block
         // (and its tags) instead of deleting it. A markdown that DOES carry
         // frontmatter is an explicit edit: delete + insert as before.
-        if keeping && is_frontmatter(&old[i].content) {
+        if keeping && i == 0 && old[0].parent.is_none() && is_frontmatter(&old[i].content) {
             kept.push((old[i].parent, old[i].order_key.clone()));
             continue;
         }
@@ -567,6 +571,22 @@ mod tests {
         // and nothing kept, nothing reported, when the markdown carries it
         let (_, kept) = markdown_to_ops_report(&after.roots, "---\ntags:\n  - other\n---\n\nbody");
         assert!(!kept);
+    }
+
+    #[test]
+    fn only_the_leading_frontmatter_is_kept() {
+        // a `---…---` paragraph mid-doc is prose: omitted, it is deleted like
+        // any block, and nothing above it moves (keeping it as a floor moved
+        // p1 below the note)
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "t", None).unwrap();
+        let (doc, _) = import_markdown(&mut s, "d", None, tom.id, "# H\n\np1\n\n---\nnote\n---\n\np2").unwrap();
+        let note = find_by_content(&s, doc, "---\nnote\n---");
+        let tree = s.read_doc(doc).unwrap();
+        let (ops, kept) = markdown_to_ops_report(&tree.roots, "# H\n\np1\n\np2");
+        assert!(!kept, "{ops:?}");
+        assert_eq!(ops.len(), 1, "only the note's delete: {ops:?}");
+        assert!(matches!(&ops[0].kind, OpKind::Delete { target } if *target == note.id), "{ops:?}");
     }
 
     #[test]

@@ -1442,8 +1442,9 @@ impl KsMcp {
 
     #[tool(
         description = "Edit like the Edit tool: replace `old` (exact text from read_doc; whitespace-tolerant) with `new` in one doc — no epoch needed, the diff is taken against the live doc and proposed through the gate. Exactly one match unless replace_all; zero matches names the closest block, several list their ^refs so you can widen `old`. Answers with a one-line verdict.",
-        // replacing text can remove it (through the gate); a repeat finds no `old`
-        annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = false)
+        // replacing text can remove it (through the gate); not idempotent: when
+        // `new` contains `old` a repeat matches again, and a parked edit repeats
+        annotations(destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn edit_doc(
         &self,
@@ -1468,8 +1469,9 @@ impl KsMcp {
 
     #[tool(
         description = "Full rewrite: hand over the doc's complete new markdown with the epoch from your read_doc; the server diffs it against the current blocks (unchanged blocks keep ids and comments) and proposes the minimal ops. A stale epoch is refused with the missed ops — re-read and re-send. Prefer edit_doc/append for local changes.",
-        // a rewrite can remove blocks; the same markdown again is no change
-        annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = false)
+        // a rewrite can remove blocks; not idempotent: a parked (red) rewrite
+        // doesn't move the epoch, so a repeat parks a second copy
+        annotations(destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn propose_markdown(
         &self,
@@ -1693,13 +1695,18 @@ impl KsMcp {
             // have it served (and its instructions followed) by every user's
             // agents. Exact title; v7 ids are time-ordered, so the oldest doc
             // the caller can see wins if two share the title.
-            let doc = store
-                .list_docs()
-                .ok()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|d| d.title.trim().eq_ignore_ascii_case(STYLE_GUIDE_TITLE))
-                .min_by_key(|d| d.id);
+            // The caller's own top-level guide first: a guide in a workspace
+            // shared with them must not override theirs (its owner could
+            // otherwise steer their agents); else any guide they can see.
+            let doc = store.own_root_titled(STYLE_GUIDE_TITLE).ok().flatten().or_else(|| {
+                store
+                    .list_docs()
+                    .ok()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|d| d.title.trim().eq_ignore_ascii_case(STYLE_GUIDE_TITLE))
+                    .min_by_key(|d| d.id)
+            });
             let Some(doc) = doc else {
                 return err(format!(
                     "no doc titled {STYLE_GUIDE_TITLE:?} — create it (plain markdown) and this tool serves it"
@@ -2616,10 +2623,8 @@ mod tests {
             assert_eq!(ann(name).destructive_hint, Some(false), "{name} only adds");
         }
         // idempotent only where a repeat truly changes nothing (not just within the replay window)
-        for name in ["edit_doc", "propose_markdown", "create_doc"] {
-            assert_eq!(ann(name).idempotent_hint, Some(true), "{name}: a repeat changes nothing");
-        }
-        for name in ["append", "add_comment", "propose"] {
+        assert_eq!(ann("create_doc").idempotent_hint, Some(true), "create_doc: a repeat reuses or refuses");
+        for name in ["append", "add_comment", "propose", "edit_doc", "propose_markdown"] {
             assert_eq!(ann(name).idempotent_hint, Some(false), "{name}: a repeat after the window adds again");
         }
         for t in &tools {
