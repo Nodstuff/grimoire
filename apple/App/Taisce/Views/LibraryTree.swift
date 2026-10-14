@@ -209,8 +209,10 @@ struct LibraryTree<Menu: View>: View {
         }
         // a drag resting on a closed folder's middle opens it
         .task(id: hover) {
+            // not an empty one: there is nothing inside to show, and opening
+            // it (its "Empty" line) changed the tree under the drag and lost the drop
             guard let h = hover, h.zone == .into,
-                  let line = lines.first(where: { $0.id == h.id }), line.node.isFolder, !line.isOpen else { return }
+                  let line = lines.first(where: { $0.id == h.id }), line.node.children != nil, !line.isOpen else { return }
             try? await Task.sleep(for: .milliseconds(700))
             guard !Task.isCancelled, hover == h else { return }
             withAnimation(.snappy(duration: 0.2)) { _ = expanded.insert(h.id) }

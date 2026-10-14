@@ -35,7 +35,8 @@ final class MoveDocUITests: XCTestCase {
         return try JSONSerialization.jsonObject(with: try XCTUnwrap(out, "no answer from \(path)"))
     }
 
-    /// A counter for order keys made in the same millisecond.
+    /// This test's start (ms) and a counter, for order keys.
+    private lazy var testStamp = Int(Date().timeIntervalSince1970 * 1000)
     private var nextKey = 0
 
     /// A top-level doc, placed at the top of the tree (other suites leave
@@ -43,10 +44,13 @@ final class MoveDocUITests: XCTestCase {
     func makeDoc(_ title: String) throws -> String {
         let doc = try XCTUnwrap(try call("/api/docs", ["title": title]) as? [String: Any])
         let id = try XCTUnwrap(doc["id"] as? String)
-        // unique across tests and in creation order: "1" + base-36 time
-        // (milliseconds) + a counter, ending in a non-zero digit
-        let ms = Int(Date().timeIntervalSince1970 * 1000)
-        let key = "1" + String(ms, radix: 36) + String(nextKey, radix: 36) + "i"
+        // a later test's docs sort before an earlier one's (its leftovers
+        // stay put below), and within a test in creation order: "1" + the
+        // time to a far-off moment (shrinks as tests go on, fixed width) +
+        // a counter, ending in a non-zero digit
+        let left = 99_999_999_999_999 - testStamp
+        let pad = { (v: Int, w: Int) -> String in let t = String(v, radix: 36); return String(repeating: "0", count: max(0, w - t.count)) + t }
+        let key = "1" + pad(left, 10) + pad(nextKey, 3) + "i"
         nextKey += 1
         let moved = try call("/api/doc/\(id)/move", ["parent_id": NSNull(), "sort_key": key])
         XCTAssertEqual((moved as? [String: Any])?["ok"] as? Bool, true, "placed at the top: \(moved)")
@@ -101,15 +105,26 @@ final class MoveDocUITests: XCTestCase {
     /// inside; 0.1 = its top edge: before it; 0.9 = after it), at a hand's
     /// pace, resting before letting go.
     func drag(_ from: XCUIElement, onto to: XCUIElement, at fraction: CGFloat) {
+        #if targetEnvironment(macCatalyst)
         let start = from.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
         let end = to.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: fraction))
-        #if targetEnvironment(macCatalyst)
         // a mouse drag (a touch-style press doesn't start one on the Mac)
         start.click(forDuration: 0.3, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 1)
         #else
-        // lift and move straight away, as a finger does (held still, the
-        // long-press shows the row's menu instead)
-        start.press(forDuration: 0.6, thenDragTo: end, withVelocity: .default, thenHoldForDuration: 1)
+        // lift and move, as a finger does. A synthetic press sometimes ends
+        // as the row's menu instead (iOS: held, not moved, it's the menu):
+        // then the menu is dismissed and the drag tried again.
+        let app = XCUIApplication()
+        for _ in 0..<3 {
+            let start = from.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            let end = to.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: fraction))
+            start.press(forDuration: 0.6, thenDragTo: end, withVelocity: .default, thenHoldForDuration: 1)
+            let menu = app.buttons["Pin to Today"].firstMatch
+            guard menu.exists || app.buttons["Unpin from Today"].firstMatch.exists else { return }
+            // dismiss the menu (a tap well away from it) and try again
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.06)).tap()
+            RunLoop.current.run(until: Date().addingTimeInterval(1))
+        }
         #endif
     }
 
@@ -466,11 +481,20 @@ final class MoveDocUITests: XCTestCase {
     /// re-fired the previous drag's handler and the drop moved that doc).
     func testTwoDragsInARowEachMoveTheirOwnDoc() throws {
         let n = Int.random(in: 1000...9999)
-        let f = try makeDoc("Target F \(n)")
+        // a few rows apart: on iPhone a press that moves one row (44 pt)
+        // can turn into the row's menu rather than a drag
         let a = try makeDoc("First A \(n)"), b = try makeDoc("Second B \(n)")
+        for i in 0..<3 { _ = try makeDoc("Spacer \(i) \(n)") }
+        let f = try makeDoc("Target F \(n)")
         let app = launch()
         let rowF = row(app, "Target F \(n)"), rowA = row(app, "First A \(n)"), rowB = row(app, "Second B \(n)")
         XCTAssertTrue(rowF.waitForExistence(timeout: 20) && rowA.exists && rowB.exists)
+        // the tree settles first (the docs were made and placed just before launch)
+        let settle = Date().addingTimeInterval(10)
+        while !(rowA.frame.minY < rowB.frame.minY && rowB.frame.minY < rowF.frame.minY), Date() < settle {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
+        RunLoop.current.run(until: Date().addingTimeInterval(2))
         drag(rowA, onto: rowF, at: 0.5)
         try waitForParent(of: a, f)
         drag(rowB, onto: rowF, at: 0.5)
