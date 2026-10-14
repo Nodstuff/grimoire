@@ -2301,6 +2301,8 @@ impl ServerHandler for KsMcp {
             "Taisce: docs as block trees behind a review gate. Every write answers with \
              one line: green = applied, yellow = applied + flagged for a human, red = \
              parked until a human accepts.\n\
+             Before writing, rewriting or restructuring any doc, call style_guide once and \
+             follow it: it is how every doc here is written, logs and notes included.\n\
              Who you are: pass as: 'claude:<project>-<task>' on writes, or configure it \
              once — /mcp?as=<name>, /mcp?cwd=<dir> (→ claude:<dirname>) or the \
              Taisce-Principal header. No sessions: nothing else survives a call.\n\
