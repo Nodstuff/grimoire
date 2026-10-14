@@ -17,7 +17,7 @@
 //! reads the header and query string from there — no tower layer or
 //! task-local needed (see `RequestHint`).
 //!
-//! Sixteen tools (asserted by `exactly_sixteen_tools`); write tools answer
+//! Seventeen tools (asserted by `exactly_seventeen_tools_and_no_request_id`); write tools answer
 //! with a one-line verdict (`render_outcome`) unless `verbose`.
 
 use crate::store_ext::with_store;
