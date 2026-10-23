@@ -65,6 +65,9 @@ pub struct GrepParams {
     pub max_matches_per_group: Option<u32>,
     /// Also search comments and frontmatter (default false).
     pub include_hidden: Option<bool>,
+    /// Skip ask-the-vault answers (default true): they quote the vault, and a
+    /// stale quote grepped up as live text misleads.
+    pub exclude_answers: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -479,6 +482,7 @@ pub struct GrepOpts {
     pub max_groups: usize,
     pub max_matches_per_group: usize,
     pub include_hidden: bool,
+    pub exclude_answers: bool,
 }
 
 impl Default for GrepOpts {
@@ -489,6 +493,7 @@ impl Default for GrepOpts {
             max_groups: 20,
             max_matches_per_group: 5,
             include_hidden: false,
+            exclude_answers: true,
         }
     }
 }
@@ -530,12 +535,18 @@ pub fn grep(store: &SqliteStore, pattern: &str, opts: GrepOpts) -> Result<GrepOu
     let scope = scope_set(store, opts.scope)?;
     let blocks = store.live_blocks_with_titles().map_err(|e| e.to_string())?;
     let docs = DocMap::load(store);
+    let answers = if opts.exclude_answers { crate::ask::answers_folder_id(store) } else { None };
+    // once, not a doc lookup per block per level
+    let answer_docs = crate::ask::answers_subtree(store, answers);
 
     let mut groups: Vec<GrepGroup> = Vec::new();
     let mut index: HashMap<Uuid, usize> = HashMap::new();
     let mut total_matches = 0usize;
     for h in blocks.iter() {
-        if scope.as_ref().is_some_and(|s| !s.contains(&h.block.doc_id)) || (!opts.include_hidden && is_hidden(h)) {
+        if scope.as_ref().is_some_and(|s| !s.contains(&h.block.doc_id))
+            || (!opts.include_hidden && is_hidden(h))
+            || answer_docs.contains(&h.block.doc_id)
+        {
             continue;
         }
         for (i, line) in h.block.content.lines().enumerate() {

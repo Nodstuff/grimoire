@@ -74,7 +74,7 @@ export default function Gardeners({ dataVersion = 0 }: { dataVersion?: number })
       </div>
       {claude === false && (
         <div className="gardeners-empty">
-          Gardeners run on Claude Code, which is not installed on this Mac. Install it from{' '}
+          Gardeners run on Claude Code, which is not installed where Taisce runs. Install it from{' '}
           <span className="mono">{CLAUDE_CODE_URL}</span>{' '}
           <button
             className="chip"

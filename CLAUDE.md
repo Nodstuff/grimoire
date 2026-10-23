@@ -54,7 +54,7 @@ account may be flipped to the work account by other sessions — push with
   `infra/deploy/share-key.sh`. Never name a table `shares` (an open drops it).
 
 ## Start here
-- **[[Roadmap]]** in Taisce (under the `[[Grimoire]]` tree — doc titles are data, not renamed) is the outstanding list — read it first in any
+- **[[Roadmap]]** in Taisce (under the `[[Taisce]]` tree, renamed from Grimoire on 2026-10-14) is the outstanding list — read it first in any
   new session; the daily doc carries narrative, the roadmap carries the work.
 - Test with `cargo test -p taisce -p taisce-store` (the shell crate's build.rs needs the sidecar
   binary; a bare workspace `cargo test` fails in a fresh worktree). In a fresh worktree the daemon
@@ -70,9 +70,9 @@ account may be flipped to the work account by other sessions — push with
   daemon at the server or at `~/.grimoire`.
 
 ## Where the truth is
-- **System docs**: the `[[Grimoire]]` doc tree in Taisce itself (MCP server registered as `taisce`):
+- **System docs**: the `[[Taisce]]` doc tree in Taisce itself (MCP server registered as `taisce`); design records and work logs live under its `History` folder. Write them to the `Technical Style Guide` (the `style_guide` MCP tool serves it):
   Architecture, Review Gate, Gardeners, Agent Guide, Using the App, Development, Roadmap
-  (its Federation and Hot Docs pages describe removed features). `PROJECT.md` is the founding
+  (History holds the removed features: Federation, Hot Docs, Doc freshness). `PROJECT.md` is the founding
   design record and its status section says what has since been built and cut.
 - **Decisions**: `docs/adr/` (0001 storage; 0002 federation and 0003 hot docs, both superseded).
 - **Backlog**: GitHub issues; milestones M1–M9 are complete.
@@ -98,9 +98,9 @@ account may be flipped to the work account by other sessions — push with
   in-flight gardener runs get orphaned). `./release.sh` = signed + notarized dmg.
 
 ## Writing to Taisce over MCP (this repo's own docs live in it)
-- 16 tools (AX 2): `find_doc`, `orient`, `read_doc`, `edit_doc`, `append`, `propose_markdown`,
+- 17 tools (AX 2): `find_doc`, `orient`, `read_doc`, `edit_doc`, `append`, `propose_markdown`,
   `propose`, `diff_since`, `search`, `grep`, `related`, `create_doc`, `doc_op`, `add_comment`,
-  `resolve`, `proposals`. `edit_doc(old, new)` and `append(markdown, to, create_missing)` need no
+  `resolve`, `proposals`, `style_guide` (the caller's own doc titled "Technical Style Guide"). `edit_doc(old, new)` and `append(markdown, to, create_missing)` need no
   epoch; `read_doc` is text (`doc <id> · epoch N · path` + markdown; `refs: true` for `^abc123`).
 - Attribution: pass `as: "claude:grimoire-<task>"` on every attributing call (`edit_doc`, `append`,
   `propose`, `propose_markdown`, `create_doc`, `doc_op`, `add_comment`, `resolve`, `proposals`), or

@@ -15,6 +15,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// A store error as `/api` answers it: `{"error": <the prose, unchanged>,
+/// "code": <StoreError::code>}`. The prose stays for people and older
+/// clients; `code` is the stable class for clients to branch on —
+/// `not_found` | `forbidden` | `stale_base` | `invalid` | `internal`. (The
+/// auth layers add `unauthorized` and `csrf`; the gardener route
+/// `gardener_running`; the workspace routes `conflict` for a duplicate name,
+/// which they answer 409.) Status codes are untouched: `viewer::error_status`
+/// still turns `not found` into 404 and `forbidden` into 403, the rest stay 200.
+pub fn api_err(e: &taisce_store::StoreError) -> Json<Value> {
+    Json(json!({"error": e.to_string(), "code": e.code()}))
+}
+
 #[derive(Clone)]
 pub struct ApiState {
     pub store: SharedStore,
@@ -107,7 +119,7 @@ async fn docs(State(st): State<ApiState>, v: Viewer, Query(q): Query<DocsQuery>)
             Err(m) => return (0, Json(json!({"error": m}))),
         };
         let snap = s.read_snapshot(|s| (s.latest_change_seq().unwrap_or(0), docs_json(s, filter)));
-        snap.unwrap_or_else(|e| (0, Json(json!({"error": e.to_string()}))))
+        snap.unwrap_or_else(|e| (0, api_err(&e)))
     })
     .await;
     ([(SEQ_HEADER, seq.to_string())], body)
@@ -145,7 +157,7 @@ fn docs_json(s: &mut SqliteStore, filter: Option<taisce_store::WorkspaceFilter>)
                         .collect::<Vec<_>>()
                 ))
             }
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     }
 }
@@ -156,9 +168,9 @@ async fn doc(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> axu
     with_store(&st.store, v.scope, move |s| match s.read_doc(id) {
         Ok(t) => Json(json!(t)).into_response(),
         Err(e @ taisce_store::StoreError::NotFound(_)) => {
-            (axum::http::StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))).into_response()
+            (axum::http::StatusCode::NOT_FOUND, api_err(&e)).into_response()
         }
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, api_err(&e)).into_response(),
     })
     .await
 }
@@ -167,7 +179,7 @@ async fn backlinks(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) 
     with_store(&st.store, v.scope, move |s| {
         match s.backlinks(id) {
             Ok(b) => Json(json!(b)),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -208,7 +220,7 @@ async fn doc_review(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>)
     with_store(&st.store, v.scope, move |s| {
         match s.review_queue(Some(id)) {
             Ok(q) => Json(json!(decorate_review_items(&s, q))),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -218,7 +230,7 @@ async fn queue(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
     with_store(&st.store, v.scope, move |s| {
         match s.review_queue(None) {
             Ok(q) => Json(json!(decorate_review_items(&s, q))),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -241,7 +253,7 @@ async fn resolve(State(st): State<ApiState>, v: Viewer, Json(req): Json<ResolveR
     with_store(&store, v.scope, move |s| {
         match s.resolve(req.annotation_id, v.human, decision) {
             Ok(receipt) => Json(json!({"ok": true, "receipt": receipt})),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -315,7 +327,7 @@ async fn tags(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
     with_store(&st.store, v.scope, move |s| {
         match s.list_tags() {
             Ok(t) => Json(json!(t)),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -325,7 +337,7 @@ async fn runs(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
     with_store(&st.store, v.scope, move |s| {
         match s.list_runs(20) {
             Ok(r) => Json(json!(r)),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -369,7 +381,7 @@ async fn propose(State(st): State<ApiState>, v: Viewer, headers: HeaderMap, Json
                 }
                 Json(v)
             }
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -410,12 +422,13 @@ async fn propose_markdown(
         }
         let tree = match s.read_doc(req.doc_id) {
             Ok(t) => t,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return api_err(&e),
         };
         if req.base_epoch != tree.doc.current_epoch {
             let missed = s.ops_since(req.doc_id, req.base_epoch).unwrap_or_default();
             return Json(json!({
                 "error": "stale_base",
+                "code": "stale_base",
                 "base_epoch": req.base_epoch,
                 "current_epoch": tree.doc.current_epoch,
                 "missed_ops": missed,
@@ -436,7 +449,7 @@ async fn propose_markdown(
                 }
                 Json(v)
             }
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -472,7 +485,7 @@ async fn create_doc(State(st): State<ApiState>, v: Viewer, headers: HeaderMap, J
         }
         if let Some(w) = req.workspace_id {
             if let Err(e) = s.get_workspace(w) {
-                return Json(json!({"error": e.to_string()}));
+                return api_err(&e);
             }
             if let Some(p) = req.parent_doc_id
                 && s.doc_workspace(p).ok().flatten() != Some(w)
@@ -485,7 +498,7 @@ async fn create_doc(State(st): State<ApiState>, v: Viewer, headers: HeaderMap, J
                 if let (Some(w), None) = (req.workspace_id, req.parent_doc_id)
                     && let Err(e) = s.set_doc_workspace(d.id, Some(w), principal)
                 {
-                    return Json(json!({"error": e.to_string()}));
+                    return api_err(&e);
                 }
                 let mut v = json!(d);
                 v["workspace_id"] = json!(s.doc_workspace(d.id).ok().flatten());
@@ -494,7 +507,7 @@ async fn create_doc(State(st): State<ApiState>, v: Viewer, headers: HeaderMap, J
                 }
                 Json(v)
             }
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -504,7 +517,7 @@ async fn principals(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
     with_store(&st.store, v.scope, move |s| {
         match s.list_principals() {
             Ok(p) => Json(json!(p)),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -537,7 +550,7 @@ async fn history(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) ->
                     .collect();
                 Json(json!(rows))
             }
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -561,7 +574,7 @@ async fn add_comment(State(st): State<ApiState>, v: Viewer, headers: HeaderMap, 
         };
         match s.add_comment(req.block_id, principal, &req.text, req.reply_to) {
             Ok(c) => Json(json!(c)),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -573,7 +586,7 @@ async fn graph(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
     with_store(&st.store, v.scope, move |s| {
         let docs = match s.list_docs() {
             Ok(d) => d,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return api_err(&e),
         };
         let mut tenders: std::collections::HashMap<String, String> = Default::default();
         let mut names: std::collections::HashMap<String, String> = Default::default();
@@ -696,7 +709,7 @@ async fn set_status(
     with_store(&st.store, v.scope, move |s| {
         match s.set_doc_status(id, status) {
             Ok(()) => Json(json!({"ok": true})),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -716,7 +729,7 @@ async fn flags(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
                     }))
                     .collect::<Vec<_>>()
             )),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -735,11 +748,11 @@ async fn dismiss_flag(State(st): State<ApiState>, v: Viewer, Json(req): Json<Dis
         let block = match s.read_block(req.comment_id) {
             Ok(b) if b.block_type == taisce_store::BlockType::Comment => b,
             Ok(_) => return Json(json!({"error": "not a comment block"})),
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return api_err(&e),
         };
         let epoch = match s.get_doc(block.doc_id) {
             Ok(d) => d.current_epoch,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return api_err(&e),
         };
         let op = OpInput {
             kind: taisce_store::OpKind::Delete {
@@ -749,7 +762,7 @@ async fn dismiss_flag(State(st): State<ApiState>, v: Viewer, Json(req): Json<Dis
         };
         match s.propose(block.doc_id, epoch, v.human, vec![op]) {
             Ok(_) => Json(json!({"ok": true})),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -761,7 +774,7 @@ async fn tendings(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -
     with_store(&st.store, v.scope, move |s| {
         // an invisible doc answers exactly like a missing one
         if let Err(e) = s.get_doc(id) {
-            return Json(json!({"error": e.to_string()}));
+            return api_err(&e);
         }
         // ancestor chain of this doc, self first
         let mut chain = vec![id];
@@ -795,7 +808,7 @@ async fn tendings(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -
                     .collect();
                 Json(json!(rows))
             }
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -809,7 +822,7 @@ async fn stamp(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
         match s.change_stamp() {
             // version/build ride along so the app needs one poll, not two
             Ok(v) => Json(json!({"stamp": v, "version": env!("CARGO_PKG_VERSION"), "build": build_stamp(), "git": crate::GIT_SHA})),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -907,7 +920,7 @@ async fn move_doc(
     with_store(&st.store, v.scope, move |s| {
         match s.move_doc(id, req.parent_id, req.sort_key.as_deref()) {
             Ok(()) => Json(json!({"ok": true})),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -934,10 +947,10 @@ async fn rename_doc(
     with_store(&store, v.scope, move |s| {
         let old_title = match s.get_doc(id) {
             Ok(d) => d.title,
-            Err(e) => return Json(json!({"error": e.to_string()})),
+            Err(e) => return api_err(&e),
         };
         if let Err(e) = s.rename_doc(id, &req.title) {
-            return Json(json!({"error": e.to_string()}));
+            return api_err(&e);
         }
         // no more link-rot: rewrite every inbound [[wikilink]] through the gate
         let new_title = req.title.trim();
@@ -983,7 +996,7 @@ fn ks_store_op_replace(target: Uuid, content: String) -> taisce_store::OpKind {
 async fn delete_doc(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> Json<Value> {
     with_store(&st.store, v.scope, move |s| match s.delete_doc(id) {
         Ok(n) => Json(json!({"ok": true, "deleted": n})),
-        Err(e) => Json(json!({"error": e.to_string()})),
+        Err(e) => api_err(&e),
     })
     .await
 }
@@ -1096,7 +1109,7 @@ async fn export_vault_inner(st: ApiState, v: Viewer) -> Json<Value> {
     .await;
     match res {
         Ok(Ok(report)) => Json(json!({"path": dir.to_string_lossy(), "files": report.files})),
-        Ok(Err(e)) => Json(json!({"error": e.to_string()})),
+        Ok(Err(e)) => api_err(&e),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
@@ -1105,7 +1118,7 @@ async fn export_vault_inner(st: ApiState, v: Viewer) -> Json<Value> {
 async fn doc_markdown(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>) -> Json<Value> {
     with_store(&st.store, v.scope, move |s| match taisce_store::export::export_doc(&*s, id) {
         Ok(md) => Json(json!({"markdown": md})),
-        Err(e) => Json(json!({"error": e.to_string()})),
+        Err(e) => api_err(&e),
     })
     .await
 }
@@ -1129,7 +1142,7 @@ async fn export_doc_inner(st: ApiState, v: Viewer, id: Uuid) -> Json<Value> {
     .await
     {
         Ok(v) => v,
-        Err(e) => return Json(json!({"error": e.to_string()})),
+        Err(e) => return api_err(&e),
     };
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let dir = std::path::PathBuf::from(home).join("Downloads");
@@ -1204,7 +1217,7 @@ async fn import_markdown(State(st): State<ApiState>, v: Viewer, Json(req): Json<
             "blocks": report.blocks,
             "skipped": report.skipped.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
         })),
-        Ok(Err(e)) => Json(json!({"error": e.to_string()})),
+        Ok(Err(e)) => api_err(&e),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
@@ -1296,7 +1309,7 @@ async fn memory_sync_inner(st: ApiState, v: Viewer) -> Json<Value> {
     }
     match tokio::task::spawn_blocking(move || crate::memory::sync(&store, scope, &root, human)).await {
         Ok(Ok(r)) => Json(json!(r)),
-        Ok(Err(e)) => Json(json!({"error": e.to_string()})),
+        Ok(Err(e)) => api_err(&e),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
 }
@@ -1305,7 +1318,7 @@ async fn trash(State(st): State<ApiState>, v: Viewer) -> Json<Value> {
     with_store(&st.store, v.scope, move |s| {
         match s.list_trash() {
             Ok(rows) => Json(json!(rows)),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -1315,7 +1328,7 @@ async fn restore_doc(State(st): State<ApiState>, v: Viewer, Path(id): Path<Uuid>
     with_store(&st.store, v.scope, move |s| {
         match s.restore_doc(id) {
             Ok(n) => Json(json!({"ok": true, "restored": n})),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => api_err(&e),
         }
     })
     .await
@@ -1693,9 +1706,9 @@ mod http_client_tests {
             "block_type": "paragraph", "content": "once"}}]});
         let first = call(&app, "POST", "/api/propose", &[], Some(body.clone())).await;
         assert_eq!(first["epoch"], 1, "{first}");
-        // simulated 121s: every memory entry is past DEDUPE_TTL
+        // simulated past-the-window: every memory entry is older than DEDUPE_TTL
         for (_, at, _) in st.dedupe.lock().unwrap().values_mut() {
-            *at = std::time::Instant::now() - std::time::Duration::from_secs(121);
+            *at = std::time::Instant::now() - crate::mcp::DEDUPE_TTL - std::time::Duration::from_secs(1);
         }
         assert!(crate::mcp::dedupe_get(&st.dedupe, None, human, rid).is_none(), "memory window passed");
         let late = call(&app, "POST", "/api/propose", &[], Some(body.clone())).await;

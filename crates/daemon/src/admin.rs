@@ -48,7 +48,7 @@ async fn list_gardeners(State(AdminState { store, .. }): State<AdminState>) -> J
     with_store(&store, Scope::System, move |s| {
         match s.list_gardeners() {
             Ok(g) => Json(json!(g)),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => crate::api::api_err(&e),
         }
     })
     .await
@@ -75,7 +75,7 @@ async fn create_gardener(
     with_store(&store, Scope::System, move |s| {
         match s.create_gardener(&req.name, kind, &req.task_prompt, req.scope_doc, policy) {
             Ok(g) => Json(json!(g)),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => crate::api::api_err(&e),
         }
     })
     .await
@@ -90,7 +90,7 @@ async fn run_now(
 ) -> axum::response::Response {
     let gardeners = match with_store(&store, Scope::System, |s| s.list_gardeners()).await {
         Ok(g) => g,
-        Err(e) => return Json(json!({"error": e.to_string()})).into_response(),
+        Err(e) => return crate::api::api_err(&e).into_response(),
     };
     let mut outcomes = Vec::new();
     let mut started = 0usize;
@@ -132,7 +132,7 @@ async fn list_runs(State(AdminState { store, .. }): State<AdminState>, Query(q):
     with_store(&store, Scope::System, move |s| {
         match s.list_runs(q.limit.unwrap_or(20)) {
             Ok(r) => Json(json!(r)),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => crate::api::api_err(&e),
         }
     })
     .await
@@ -173,7 +173,7 @@ async fn update_gardener(
             bindings,
         ) {
             Ok(()) => Json(json!({"ok": true})),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => crate::api::api_err(&e),
         }
     })
     .await
@@ -197,7 +197,7 @@ async fn set_policy(State(AdminState { store, .. }): State<AdminState>, Json(req
     with_store(&store, Scope::System, move |s| {
         match s.set_review_policy(req.doc_id, policy) {
             Ok(()) => Json(json!({"ok": true})),
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => crate::api::api_err(&e),
         }
     })
     .await
@@ -350,7 +350,7 @@ async fn set_profile(
                 s.set_setting("profile.confirmed", "1").ok();
                 Json(json!({"ok": true, "name": req.name.trim()}))
             }
-            Err(e) => Json(json!({"error": e.to_string()})),
+            Err(e) => crate::api::api_err(&e),
         }
     })
     .await

@@ -57,7 +57,9 @@ fn fail(e: StoreError) -> Response {
         StoreError::InvalidOp(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (code, Json(json!({"error": e.to_string()}))).into_response()
+    // the duplicate-name refusal is the one InvalidOp with its own status
+    let class = if code == StatusCode::CONFLICT { "conflict" } else { e.code() };
+    (code, Json(json!({"error": e.to_string(), "code": class}))).into_response()
 }
 
 /// A workspace as the API hands it out, with its resolved doc count.

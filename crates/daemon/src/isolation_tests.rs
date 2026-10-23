@@ -113,6 +113,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("mcp:add_comment", "mcp_writes_answer_not_found_or_read_only"),
     ("mcp:resolve", "mcp_writes_answer_not_found_or_read_only"),
     ("mcp:proposals", "mcp_reads_never_show_a_private_doc"),
+    ("mcp:style_guide", "the_style_guide_is_the_callers_own"),
     // regressions from the adversarial review (a route may carry several rows)
     ("/api/flags", "unshare_then_a_stale_anchor_reads_nothing_through_flags"),
     ("mcp:propose", "unshare_then_a_stale_anchor_reads_nothing_through_flags"),
@@ -237,6 +238,8 @@ struct Fx {
     a: Uuid,
     b: Uuid,
     a_human: Uuid,
+    /// B's human principal (B's own docs are created as her)
+    b_human: Uuid,
     a_app: String,
     b_app: String,
     /// B's Claude over OAuth (a connector, not her app)
@@ -490,6 +493,7 @@ fn fixture() -> Fx {
         a,
         b,
         a_human,
+        b_human,
         a_app,
         b_app,
         b_conn,
@@ -1075,6 +1079,41 @@ async fn mcp_reads_never_show_a_private_doc() {
     // a connector token: same isolation
     let (_, out) = fx.tool(&fx.b_conn, "search", json!({"query": "zebrasecret"})).await;
     fx.no_leak("connector search", &out);
+}
+
+#[tokio::test]
+async fn the_style_guide_is_the_callers_own() {
+    // The style guide is a doc, served in the caller's scope like any read:
+    // A's private guide reaches A's agent, never B's (served to every user it
+    // would also carry A's instructions into B's agents). B has none: B's agent
+    // is told so, with nothing of A's in the answer.
+    let fx = fixture();
+    {
+        let mut s = fx.store.lock(Scope::User(fx.a));
+        s.create_doc_with_ops("Technical Style Guide", None, fx.a_human, vec![para("Present tense, active voice, second person: the gate scores each op.").1]).unwrap();
+    }
+    let (is_err, out) = fx.tool(&fx.a_app, "style_guide", json!({})).await;
+    assert!(!is_err && out.contains("Present tense"), "A's agent gets A's guide: {out}");
+    let (is_err, out) = fx.tool(&fx.b_pat, "style_guide", json!({})).await;
+    assert!(is_err && out.contains("no doc titled"), "B's agent gets none of A's: {out}");
+    assert!(!out.contains("Present tense"), "{out}");
+    fx.no_leak("style_guide", &out);
+
+    // A's guide in a workspace shared with B: B sees it, but B's own guide
+    // wins (a share member must not steer B's agents over B's own guide)
+    {
+        let mut s = fx.store.lock(Scope::User(fx.a));
+        let (g, _) = s.create_doc_with_ops("Technical Style Guide", None, fx.a_human, vec![para("Shared guide: use the passive voice everywhere.").1]).unwrap();
+        s.set_doc_workspace(g.id, Some(fx.family), fx.a_human).unwrap();
+    }
+    let (is_err, out) = fx.tool(&fx.b_pat, "style_guide", json!({})).await;
+    assert!(!is_err && out.contains("Shared guide"), "B, with no guide of her own, gets the shared one: {out}");
+    {
+        let mut s = fx.store.lock(Scope::User(fx.b));
+        s.create_doc_with_ops("Technical Style Guide", None, fx.b_human, vec![para("Aoife's own guide: short sentences.").1]).unwrap();
+    }
+    let (is_err, out) = fx.tool(&fx.b_pat, "style_guide", json!({})).await;
+    assert!(!is_err && out.contains("Aoife's own guide") && !out.contains("Shared guide"), "B's own guide wins: {out}");
 }
 
 #[tokio::test]
@@ -2688,4 +2727,45 @@ async fn opds_downloads_serve_only_the_device_owners_books() {
         assert_eq!(st, StatusCode::FOUND, "{kind}");
         assert!(h["location"].to_str().unwrap().contains(&format!("library/{}/", fx.a)));
     }
+}
+
+/// `/api` errors carry a stable `code` beside the unchanged prose and status
+/// (`api::api_err`): an invisible doc is `not_found` exactly like a missing
+/// one (never `forbidden`), a viewer's write `forbidden`, a stale whole-doc
+/// write `stale_base`, a refused op `invalid` (still 200).
+#[tokio::test]
+async fn api_errors_carry_a_stable_code() {
+    let fx = fixture();
+    let code = |out: &str| serde_json::from_str::<Value>(out).unwrap()["code"].clone();
+    let (secret, shared) = (fx.a_secret, fx.shared_doc);
+    for (m, path, body) in [
+        ("GET", format!("/api/doc/{secret}"), None),
+        ("GET", format!("/api/doc/{secret}/history"), None),
+        ("POST", "/api/propose".to_string(), Some(json!({"doc_id": secret, "base_epoch": 1, "ops": []}))),
+        ("POST", format!("/api/doc/{secret}/rename"), Some(json!({"title": "mine"}))),
+        ("POST", "/api/resolve".to_string(), Some(json!({"annotation_id": fx.a_ann, "decision": "accept"}))),
+    ] {
+        let (st, out) = fx.b(m, &path, body.clone()).await;
+        assert_eq!((st, code(&out)), (StatusCode::NOT_FOUND, json!("not_found")), "{m} {path}: {out}");
+        let missing = fx.b(m, &path.replace(&secret.to_string(), &MISSING.to_string()), body).await;
+        if path.contains(&secret.to_string()) {
+            assert_eq!(code(&missing.1), json!("not_found"), "{m} {path} (missing): {}", missing.1);
+        }
+    }
+    let e = fx.store.lock(Scope::System).get_doc(shared).unwrap().current_epoch;
+    for (m, path, body) in [
+        ("POST", "/api/propose".to_string(), json!({"doc_id": shared, "base_epoch": e, "ops": [para("x").1]})),
+        ("POST", format!("/api/doc/{shared}/rename"), json!({"title": "ours"})),
+        ("PUT", format!("/api/docs/{}/workspace", fx.b_doc), json!({"workspace_id": fx.family})),
+    ] {
+        let (st, out) = fx.b(m, &path, Some(body)).await;
+        assert_eq!((st, code(&out)), (StatusCode::FORBIDDEN, json!("forbidden")), "{m} {path}: {out}");
+        assert!(out.contains("\"error\":\"forbidden: "), "the prose is unchanged: {out}");
+    }
+    let (st, out) = fx.b("POST", "/api/propose_markdown", Some(json!({"doc_id": fx.b_doc, "base_epoch": 99, "markdown": "x"}))).await;
+    assert_eq!((st, code(&out)), (StatusCode::OK, json!("stale_base")), "{out}");
+    let b_doc = fx.b_doc;
+    let (st, out) = fx.b("POST", &format!("/api/doc/{b_doc}/move"), Some(json!({"parent_id": b_doc}))).await;
+    assert_eq!((st, code(&out)), (StatusCode::OK, json!("invalid")), "{out}");
+    assert!(out.contains("\"error\":\"invalid op: "), "{out}");
 }

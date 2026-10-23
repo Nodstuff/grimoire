@@ -1,9 +1,9 @@
 //! Ask the vault, with receipts: a question → an answer doc whose every
 //! claim links `[[Doc Title#^block-id]]` to the exact block it rests on.
 //!
-//! Retrieval is the block-granular search the app already has (FTS5
-//! trigram): the question's content words are each searched, hits are
-//! scored by how many words they carry, and the top blocks go to the model
+//! Retrieval is hybrid (`retrieve`): a keyword leg over FTS5 trigram, one
+//! search per content word, and a dense leg over the block vectors, fused;
+//! keyword only when no embedder is loaded. The top blocks go to the model
 //! as numbered excerpts with their ids. The model may ONLY use those
 //! excerpts and must cite; if they don't answer the question it says so.
 //! The answer becomes a doc under the `Answers` folder, written through the
@@ -121,6 +121,27 @@ pub(crate) fn is_bare_heading(content: &str) -> bool {
 /// The viewer's own `Answers` root (ADR 0004: one per person).
 pub(crate) fn answers_folder_id(store: &SqliteStore) -> Option<Uuid> {
     store.own_root_titled(ANSWERS_FOLDER).ok().flatten().map(|d| d.id)
+}
+
+/// Every doc at or under the answers folder, worked out once from one doc
+/// listing (a per-block `under_answers` walk costs a lookup per level).
+pub(crate) fn answers_subtree(store: &SqliteStore, answers: Option<Uuid>) -> std::collections::HashSet<Uuid> {
+    let mut out = std::collections::HashSet::new();
+    let Some(a) = answers else { return out };
+    let docs = store.list_docs().unwrap_or_default();
+    let mut children: std::collections::HashMap<Uuid, Vec<Uuid>> = std::collections::HashMap::new();
+    for d in &docs {
+        if let Some(p) = d.parent_id {
+            children.entry(p).or_default().push(d.id);
+        }
+    }
+    let mut stack = vec![a];
+    while let Some(id) = stack.pop() {
+        if out.insert(id) {
+            stack.extend(children.get(&id).into_iter().flatten().copied());
+        }
+    }
+    out
 }
 
 /// Answer docs must never be evidence for the next answer (they'd echo).

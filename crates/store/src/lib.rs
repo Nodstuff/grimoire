@@ -49,6 +49,24 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
 }
 
+impl StoreError {
+    /// The stable machine-readable class of this error, sent beside the
+    /// prose as `/api`'s `code` (clients branch on it, never on the text):
+    /// `stale_base`, `not_found` (also everything the scope cannot see:
+    /// invisible is NotFound, never Forbidden), `forbidden` (visible, not
+    /// writable), `invalid` (a refused op or argument), `internal`
+    /// (database or serialization failure).
+    pub fn code(&self) -> &'static str {
+        match self {
+            StoreError::StaleBase { .. } => "stale_base",
+            StoreError::NotFound(_) => "not_found",
+            StoreError::InvalidOp(_) => "invalid",
+            StoreError::Forbidden(_) => "forbidden",
+            StoreError::Sqlite(_) | StoreError::Json(_) => "internal",
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Blocks the editor never sees. Mirrors the UI's block-list filter

@@ -94,15 +94,36 @@ fn lcs_match(old: &[Existing], new: &[Segment]) -> Vec<Option<usize>> {
 /// Compute the minimal op set turning the doc's current content into
 /// `markdown` — the agent path (`propose_markdown`): `markdown` is the whole
 /// doc, frontmatter included, so only comments and canvases are skipped.
+///
+/// One forgiveness: an old frontmatter block whose counterpart is missing
+/// from `markdown` is preserved, not deleted. An agent rewriting a doc from
+/// memory routinely drops the YAML header it never intended to touch —
+/// omission is not deletion, and tags are data. An agent that sends a
+/// different frontmatter block still gets delete+insert (an explicit change);
+/// `markdown_has_frontmatter` lets the caller say what happened.
 pub fn markdown_to_ops(roots: &[BlockNode], markdown: &str) -> Vec<OpInput> {
-    markdown_to_ops_from(roots, markdown, "propose_markdown")
+    markdown_to_ops_report(roots, markdown).0
+}
+
+/// `markdown_to_ops`, also saying whether it kept a frontmatter block the
+/// markdown left out — the caller's note reports what was done, not a guess.
+pub fn markdown_to_ops_report(roots: &[BlockNode], markdown: &str) -> (Vec<OpInput>, bool) {
+    let mut kept = false;
+    let ops = diff_with_filter(roots, markdown, &skip_non_content, "propose_markdown", Some(&mut kept));
+    (ops, kept)
 }
 
 /// `markdown_to_ops` with the caller's name in every op's `source_refs`, so
 /// provenance says which tool made the change (`edit_doc`, `append`, `todo`,
 /// `inbox`) rather than blaming `propose_markdown` for all of them.
 pub fn markdown_to_ops_from(roots: &[BlockNode], markdown: &str, source: &str) -> Vec<OpInput> {
-    diff_with_filter(roots, markdown, &skip_non_content, source)
+    diff_with_filter(roots, markdown, &skip_non_content, source, None)
+}
+
+/// Does `markdown` begin with a frontmatter block (after block markers are
+/// stripped)? A lone leading `---` with no closer is a rule, not frontmatter.
+pub fn markdown_has_frontmatter(markdown: &str) -> bool {
+    is_frontmatter(strip_block_markers(markdown).trim_start())
 }
 
 /// The editor path: `markdown` is what the editor showed, which never
@@ -110,7 +131,7 @@ pub fn markdown_to_ops_from(roots: &[BlockNode], markdown: &str, source: &str) -
 /// (`is_editor_hidden`). Those blocks are left exactly as they are — a hot
 /// session's flatten must not delete what the editor merely could not seed.
 pub fn markdown_to_ops_editor(roots: &[BlockNode], markdown: &str) -> Vec<OpInput> {
-    diff_with_filter(roots, markdown, &is_editor_hidden, "editor")
+    diff_with_filter(roots, markdown, &is_editor_hidden, "editor", None)
 }
 
 /// The block-id marker `read_doc(mode: "markdown")` puts on its own line
@@ -163,6 +184,8 @@ fn diff_with_filter(
     markdown: &str,
     skip: &dyn Fn(&Block) -> bool,
     source: &str,
+    // Some: keep frontmatter the markdown omits, and report whether it did
+    keep_frontmatter: Option<&mut bool>,
 ) -> Vec<OpInput> {
     let mut old = Vec::new();
     flatten(roots, skip, &mut old);
@@ -197,7 +220,23 @@ fn diff_with_filter(
         paired_old.insert(i);
         cursor = k + 1;
     }
+    // kept frontmatter blocks (parent, order key): new blocks in their sibling
+    // list are keyed after them, so the frontmatter stays first
+    let mut kept: Vec<(Option<Uuid>, String)> = Vec::new();
+    // only the doc's LEADING frontmatter (its first root block): a `---…---`
+    // paragraph elsewhere is prose, deleted when omitted like any block (and
+    // flooring on it would move the blocks above it). And only when the
+    // markdown doesn't lead with frontmatter of its own.
+    let keeping = keep_frontmatter.is_some() && !is_frontmatter(markdown.trim_start());
     for &i in unmatched_old.iter().filter(|i| !paired_old.contains(i)) {
+        // "omitted means unchanged": an agent rewriting the doc from memory
+        // drops the frontmatter it never meant to touch — keep the block
+        // (and its tags) instead of deleting it. A markdown that DOES carry
+        // frontmatter is an explicit edit: delete + insert as before.
+        if keeping && i == 0 && old[0].parent.is_none() && is_frontmatter(&old[i].content) {
+            kept.push((old[i].parent, old[i].order_key.clone()));
+            continue;
+        }
         ops.push(OpInput {
             kind: OpKind::Delete { target: old[i].id },
             source_refs: src(),
@@ -243,10 +282,16 @@ fn diff_with_filter(
         groups.get_mut(&p.parent).unwrap().push(idx);
     }
 
+    if let Some(report) = keep_frontmatter {
+        *report = !kept.is_empty();
+    }
     for parent in group_order {
         let idxs = &groups[&parent];
+        // a kept frontmatter block in this sibling list is the floor: every
+        // key here sorts after it
+        let floor: Option<String> = kept.iter().filter(|(p, _)| *p == parent).map(|(_, k)| k.clone()).max();
         let mut stable = vec![false; idxs.len()];
-        let mut last_key = String::new();
+        let mut last_key = floor.clone().unwrap_or_default();
         for (gi, &pi) in idxs.iter().enumerate() {
             let p = &placed[pi];
             if let Some(oi) = p.old_idx
@@ -264,7 +309,7 @@ fn diff_with_filter(
             .collect();
         for gi in 0..idxs.len() {
             if keys[gi].is_none() {
-                let prev = if gi > 0 { keys[gi - 1].clone() } else { None };
+                let prev = if gi > 0 { keys[gi - 1].clone() } else { floor.clone() };
                 let next = keys[gi + 1..].iter().flatten().next().cloned();
                 keys[gi] = Some(order_key::between(prev.as_deref(), next.as_deref()));
             }
@@ -468,8 +513,9 @@ mod tests {
     #[test]
     fn agent_diff_never_pairs_frontmatter_with_prose() {
         // whole-doc path: an agent that drops the frontmatter and edits the
-        // body gets Delete(frontmatter) + Replace(body) — never a Replace that
-        // overwrites the frontmatter block with prose.
+        // body must never overwrite the frontmatter block with prose — and,
+        // since 0.10, omission preserves the block: the edit lands, the tags
+        // survive, and the verdict notes what happened.
         let mut s = SqliteStore::open_in_memory().unwrap();
         let tom = s.create_principal(PrincipalKind::Human, "t", None).unwrap();
         let (doc, _) = import_markdown(
@@ -483,15 +529,93 @@ mod tests {
         let fm = find_by_content(&s, doc, "---\ntags:\n  - keep\n---");
         let body = find_by_content(&s, doc, "body");
         let tree = s.read_doc(doc).unwrap();
-        let ops = markdown_to_ops(&tree.roots, "body edited");
-        assert_eq!(ops.len(), 2, "{ops:?}");
+        let markdown = "body edited";
+        let ops = markdown_to_ops(&tree.roots, markdown);
+        assert_eq!(ops.len(), 1, "frontmatter preserved, body replaced: {ops:?}");
         assert!(
-            ops.iter()
-                .any(|o| matches!(&o.kind, OpKind::Delete { target } if *target == fm.id))
+            !ops.iter()
+                .any(|o| matches!(&o.kind, OpKind::Delete { target } if *target == fm.id)),
+            "omitted frontmatter is not deleted"
         );
         assert!(ops.iter().any(
             |o| matches!(&o.kind, OpKind::Replace { target, content } if *target == body.id && content == "body edited")
         ));
+        assert!(markdown_has_frontmatter(markdown) == false);
+        assert!(markdown_has_frontmatter("---\ntags: [x]\n---\n\nbody") == true);
+    }
+
+    #[test]
+    fn kept_frontmatter_stays_first_when_a_new_block_leads() {
+        // the markdown omits the frontmatter and starts with a new heading:
+        // the frontmatter is kept, so the heading's key must sort after it
+        // (it was keyed as if the frontmatter weren't there, and could lead)
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "t", None).unwrap();
+        let (doc, _) = import_markdown(&mut s, "d", None, tom.id, "---\ntags:\n  - keep\n---\n\nbody").unwrap();
+        let fm = find_by_content(&s, doc, "---\ntags:\n  - keep\n---");
+        let tree = s.read_doc(doc).unwrap();
+        let (ops, kept) = markdown_to_ops_report(&tree.roots, "# New heading\n\nbody");
+        assert!(kept, "the omitted frontmatter is kept and reported");
+        let key = ops
+            .iter()
+            .find_map(|o| match &o.kind {
+                OpKind::Insert { content, order_key, parent_id: None, .. } if content == "# New heading" => Some(order_key.clone()),
+                _ => None,
+            })
+            .expect("the heading is inserted at the root");
+        assert!(key > fm.order_key, "heading {key} sorts after the frontmatter {}", fm.order_key);
+        // applied, the frontmatter is still the first block
+        s.propose(doc, tree.doc.current_epoch, tom.id, ops).unwrap();
+        let after = s.read_doc(doc).unwrap();
+        assert_eq!(after.roots[0].block.id, fm.id, "frontmatter first: {:?}", after.roots.iter().map(|n| &n.block.content).collect::<Vec<_>>());
+        // and nothing kept, nothing reported, when the markdown carries it
+        let (_, kept) = markdown_to_ops_report(&after.roots, "---\ntags:\n  - other\n---\n\nbody");
+        assert!(!kept);
+    }
+
+    #[test]
+    fn only_the_leading_frontmatter_is_kept() {
+        // a `---…---` paragraph mid-doc is prose: omitted, it is deleted like
+        // any block, and nothing above it moves (keeping it as a floor moved
+        // p1 below the note)
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "t", None).unwrap();
+        let (doc, _) = import_markdown(&mut s, "d", None, tom.id, "# H\n\np1\n\n---\nnote\n---\n\np2").unwrap();
+        let note = find_by_content(&s, doc, "---\nnote\n---");
+        let tree = s.read_doc(doc).unwrap();
+        let (ops, kept) = markdown_to_ops_report(&tree.roots, "# H\n\np1\n\np2");
+        assert!(!kept, "{ops:?}");
+        assert_eq!(ops.len(), 1, "only the note's delete: {ops:?}");
+        assert!(matches!(&ops[0].kind, OpKind::Delete { target } if *target == note.id), "{ops:?}");
+    }
+
+    #[test]
+    fn agent_diff_with_explicit_frontmatter_is_delete_plus_insert() {
+        // frontmatter present in the markdown is an explicit change: the old
+        // block goes, the new one lands (may_pair still refuses pairing it
+        // with prose, so a tags edit never mangles body text).
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let tom = s.create_principal(PrincipalKind::Human, "t", None).unwrap();
+        let (doc, _) = import_markdown(
+            &mut s,
+            "d",
+            None,
+            tom.id,
+            "---\ntags:\n  - keep\n---\n\nbody",
+        )
+        .unwrap();
+        let fm = find_by_content(&s, doc, "---\ntags:\n  - keep\n---");
+        let tree = s.read_doc(doc).unwrap();
+        let ops = markdown_to_ops(&tree.roots, "---\ntags:\n  - changed\n---\n\nbody");
+        assert!(
+            ops.iter()
+                .any(|o| matches!(&o.kind, OpKind::Delete { target } if *target == fm.id)),
+            "explicit frontmatter change deletes the old block: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|o| matches!(&o.kind, OpKind::Insert { content, .. } if content.contains("changed"))),
+            "{ops:?}"
+        );
     }
 
     #[test]
