@@ -8,7 +8,7 @@ export const TABS = ['home', 'review', 'runs', 'graph', 'settings', 'profile', '
 export type Tab = (typeof TABS)[number]
 
 /** The sections of the Settings view. */
-export type SettingsSection = 'profile' | 'ereaders'
+export type SettingsSection = 'profile' | 'ereaders' | 'uploads'
 
 /** Where a `?tab=` lands. `profile` and `ereaders` were views of their own;
  * they are sections of Settings now, and the old links land on them. */

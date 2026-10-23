@@ -59,6 +59,16 @@ export interface Ereader {
   revoked_at: string | null
 }
 
+/** A book upload token as the owner routes list it: never the secret. */
+export interface UploadToken {
+  id: string
+  label: string
+  created_at: string
+  last_used_at: string | null
+  /** RFC 3339 when the token was removed; null while it uploads */
+  revoked_at: string | null
+}
+
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
 /* ---------- books ---------- */
@@ -233,6 +243,35 @@ export function rotateEreader(id: string): Promise<{ password: string }> {
 
 export function deleteEreader(id: string): Promise<void> {
   return del(`/api/ereaders/${id}`)
+}
+
+/* ---------- book upload tokens ---------- */
+
+export function listUploadTokens(): Promise<UploadToken[]> {
+  return api<{ upload_tokens: UploadToken[] }>('/api/upload-tokens').then((r) => r.upload_tokens)
+}
+
+/** The token is in the reply exactly once — the caller must show it now. */
+export function createUploadToken(label: string): Promise<{ upload_token: UploadToken; token: string }> {
+  return api<{ upload_token: UploadToken; token: string }>('/api/upload-tokens', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ label }),
+  })
+}
+
+export function deleteUploadToken(id: string): Promise<void> {
+  return del(`/api/upload-tokens/${id}`)
+}
+
+/** Live tokens only: removed ones stay in the server's list but not here. */
+export function activeUploadTokens(list: UploadToken[]): UploadToken[] {
+  return list.filter((t) => !t.revoked_at)
+}
+
+/** The ready-to-paste upload command for a fresh token. */
+export function uploadCurl(origin: string, token: string): string {
+  return `curl -H "Authorization: Bearer ${token}" -F files=@"$path" ${origin.replace(/\/+$/, '')}/api/books`
 }
 
 /* ---------- device setup (the show-once card) ---------- */

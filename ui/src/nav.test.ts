@@ -56,9 +56,18 @@ describe('palettes render', () => {
     const html = renderToString(createElement(SearchPalette, { initial: '? ', onOpenDoc: noop, onClose: noop }))
     expect(html).toContain('Ask your notes')
   })
-  it('Settings: E-readers tab in SERVER mode only', () => {
+  it('Settings: E-readers and Upload tokens tabs in SERVER mode only', () => {
     const props = { section: 'profile' as const, onSection: noop, dataVersion: 0, version: null, onProfileChanged: noop }
-    expect(renderToString(createElement(Settings, { ...props, server: true }))).toContain('E-readers')
-    expect(renderToString(createElement(Settings, { ...props, server: false }))).not.toContain('E-readers')
+    const server = renderToString(createElement(Settings, { ...props, server: true }))
+    expect(server).toContain('E-readers')
+    expect(server).toContain('Upload tokens')
+    const local = renderToString(createElement(Settings, { ...props, server: false }))
+    expect(local).not.toContain('E-readers')
+    expect(local).not.toContain('Upload tokens')
+  })
+  it('Settings › Upload tokens renders its add card', () => {
+    const props = { onSection: noop, dataVersion: 0, version: null, onProfileChanged: noop }
+    const html = renderToString(createElement(Settings, { ...props, section: 'uploads' as const, server: true }))
+    expect(html).toContain('add an upload token')
   })
 })

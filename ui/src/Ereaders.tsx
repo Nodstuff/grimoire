@@ -210,7 +210,7 @@ function SetupCard({
   )
 }
 
-function CopyButton({ what, value }: { what: string; value: string }) {
+export function CopyButton({ what, value }: { what: string; value: string }) {
   return (
     <button
       className="chip"

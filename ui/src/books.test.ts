@@ -7,6 +7,12 @@ import {
   Book,
   Ereader,
   PROGRESS_CHUNK,
+  UploadToken,
+  activeUploadTokens,
+  createUploadToken,
+  deleteUploadToken,
+  listUploadTokens,
+  uploadCurl,
   UPLOAD_BATCH_BYTES,
   UploadResult,
   activeEreaders,
@@ -48,13 +54,13 @@ function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 }
 
-function mockFetch(routes: Record<string, () => Response>) {
+function mockFetch(routes: Record<string, (init?: RequestInit) => Response>) {
   calls = []
   vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
     calls.push({ url, init })
     const r = routes[url.split('?')[0]]
     if (!r) throw new Error(`unexpected fetch ${url}`)
-    return r()
+    return r(init)
   })
 }
 
@@ -390,6 +396,34 @@ describe('ereaders', () => {
     const r = await createEreader('kobo', true)
     expect(r.password).toBe('pw1')
     expect(JSON.parse(String(calls[0].init?.body))).toEqual({ label: 'kobo', stream_downloads: true })
+  })
+})
+
+describe('upload tokens', () => {
+  const tok: UploadToken = { id: 't1', label: 'chaptarr', created_at: '2026-01-01T00:00:00Z', last_used_at: null, revoked_at: null }
+  it('lists, creates (the token comes back once), removes', async () => {
+    mockFetch({
+      '/api/upload-tokens': (init) =>
+        init?.method === 'POST' ? json(201, { upload_token: tok, token: 'tbu_x' }) : json(200, { upload_tokens: [tok] }),
+      '/api/upload-tokens/t1': () => new Response(null, { status: 204 }),
+    })
+    expect(await listUploadTokens()).toEqual([tok])
+    expect((await createUploadToken('chaptarr')).token).toBe('tbu_x')
+    await deleteUploadToken('t1')
+    expect(calls.map((c) => [c.url, c.init?.method ?? 'GET'])).toEqual([
+      ['/api/upload-tokens', 'GET'],
+      ['/api/upload-tokens', 'POST'],
+      ['/api/upload-tokens/t1', 'DELETE'],
+    ])
+    expect(JSON.parse(String(calls[1].init?.body))).toEqual({ label: 'chaptarr' })
+  })
+  it('hides removed tokens', () => {
+    expect(activeUploadTokens([tok, { ...tok, id: 't2', revoked_at: '2026-01-02T00:00:00Z' }]).map((t) => t.id)).toEqual(['t1'])
+  })
+  it('the curl line names the token, a files field and this origin', () => {
+    expect(uploadCurl('https://taisce.example/', 'tbu_abc')).toBe(
+      'curl -H "Authorization: Bearer tbu_abc" -F files=@"$path" https://taisce.example/api/books',
+    )
   })
 })
 

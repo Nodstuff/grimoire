@@ -43,11 +43,14 @@ describe('settings deep links', () => {
   it('other tabs are their own views', () => {
     for (const t of ['home', 'review', 'runs', 'graph', 'trash', 'books'] as const) expect(tabTarget(t)).toEqual({ kind: t })
   })
-  it('E-readers shows in SERVER mode only; asked for in LOCAL, Settings opens on Profile', () => {
+  it('E-readers and Upload tokens show in SERVER mode only; asked for in LOCAL, Settings opens on Profile', () => {
     expect(settingsSections(true, 'ereaders')).toMatchObject({ active: 'ereaders' })
-    expect(settingsSections(true, 'ereaders').shown.map((s) => s.id)).toEqual(['profile', 'ereaders'])
-    const local = settingsSections(false, 'ereaders')
-    expect(local.active).toBe('profile')
-    expect(local.shown.map((s) => s.id)).toEqual(['profile'])
+    expect(settingsSections(true, 'uploads')).toMatchObject({ active: 'uploads' })
+    expect(settingsSections(true, 'ereaders').shown.map((s) => s.id)).toEqual(['profile', 'ereaders', 'uploads'])
+    for (const want of ['ereaders', 'uploads'] as const) {
+      const local = settingsSections(false, want)
+      expect(local.active).toBe('profile')
+      expect(local.shown.map((s) => s.id)).toEqual(['profile'])
+    }
   })
 })
