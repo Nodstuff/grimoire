@@ -7,6 +7,7 @@
 //   /doc/<uuid>[?block=<uuid>]   a doc (scrolled to a block)
 //   /library[/<workspace>][?folder=<uuid>]  the Library (all, `unsorted`, or a
 //                           workspace id; a folder's page)
+//   /todos                  the To-dos screen
 //   /review                 the review queue
 //   /search[?q=…]           Search & Ask
 //   /books                  the EPUB library (SERVER mode)
@@ -26,6 +27,7 @@ export type Route =
   | { kind: 'home' }
   | { kind: 'doc'; id: string; block?: string }
   | { kind: 'library'; workspace: string | null; folder?: string }
+  | { kind: 'todos' }
   | { kind: 'review' }
   | { kind: 'search'; q: string }
   | { kind: 'books' }
@@ -69,6 +71,9 @@ export function parseRoute(pathname: string, search = ''): Route {
       if (parts.length === 2) return { kind: 'library', workspace: parts[1], ...f }
       break
     }
+    case 'todos':
+      if (parts.length === 1) return { kind: 'todos' }
+      break
     case 'review':
       if (parts.length === 1) return { kind: 'review' }
       break
@@ -107,6 +112,8 @@ export function routePath(r: Route): string {
         (r.workspace && r.workspace !== 'all' ? `/library/${encodeURIComponent(r.workspace)}` : '/library') +
         (r.folder ? `?folder=${r.folder}` : '')
       )
+    case 'todos':
+      return '/todos'
     case 'review':
       return '/review'
     case 'search':

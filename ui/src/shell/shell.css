@@ -713,6 +713,12 @@ button.lp-side-sec:hover {
   .lp-crumb-here {
     font-weight: 600;
   }
+  /* screens whose page title says where you are (Settings, Library,
+     Search, To-dos): the crumb would only repeat it (Home hides its whole
+     top bar the same way, home.css) */
+  .lp-main:has(> .stage-settings, > .stage-library, > .stage-search, > .stage-todos) > .lp-top .lp-crumb {
+    visibility: hidden;
+  }
   .lp-main > .stage {
     padding-bottom: calc(var(--tabbar-h) + 48px);
   }

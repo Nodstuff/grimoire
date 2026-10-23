@@ -15,19 +15,23 @@ const D = '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d'
 const noop = () => {}
 
 describe('shell nav', () => {
-  it('primary places in canvas order; Inbox/To-dos only once their docs exist; Books in SERVER mode', () => {
-    expect(primaryNav({ server: false, counts, inboxDoc: null, todoDoc: null }).map((i) => i.id)).toEqual(['home', 'review', 'search'])
-    expect(primaryNav({ server: true, counts, inboxDoc: D, todoDoc: D }).map((i) => i.id)).toEqual(['home', 'inbox', 'todos', 'review', 'search', 'books'])
+  it('primary places in canvas order; Inbox only once its doc exists, To-dos always (its own screen); Books in SERVER mode', () => {
+    expect(primaryNav({ server: false, counts, inboxDoc: null }).map((i) => i.id)).toEqual(['home', 'todos', 'review', 'search'])
+    expect(primaryNav({ server: true, counts, inboxDoc: D }).map((i) => i.id)).toEqual(['home', 'inbox', 'todos', 'review', 'search', 'books'])
     expect(secondaryNav(counts).map((i) => i.id)).toEqual(['runs', 'trash', 'settings'])
     expect(tabNav({ server: true, counts }).map((i) => i.id)).toEqual(['home', 'library', 'review', 'books', 'search'])
     expect(tabNav({ server: false, counts }).map((i) => i.id)).not.toContain('books')
   })
   it('the current row follows the route; doc-backed rows light for their doc', () => {
-    const [home, inbox] = primaryNav({ server: false, counts, inboxDoc: D, todoDoc: null })
+    const [home, inbox] = primaryNav({ server: false, counts, inboxDoc: D })
     expect(isCurrent(home, { kind: 'home' })).toBe(true)
     expect(isCurrent(home, { kind: 'review' })).toBe(false)
     expect(isCurrent(inbox, { kind: 'doc', id: D })).toBe(true)
     expect(isCurrent(inbox, { kind: 'doc', id: '11111111-2222-4333-8444-555555555555' })).toBe(false)
+    const todos = primaryNav({ server: false, counts, inboxDoc: null }).find((i) => i.id === 'todos')!
+    expect(todos.to).toEqual({ kind: 'todos' })
+    expect(isCurrent(todos, { kind: 'todos' })).toBe(true)
+    expect(isCurrent(todos, { kind: 'doc', id: D })).toBe(false)
   })
   it('sidebar open by default and remembered', () => {
     const m = new Map<string, string>()
@@ -45,7 +49,7 @@ describe('shell render', () => {
     const html = renderToString(
       createElement(Sidebar, {
         route: { kind: 'review' },
-        primary: primaryNav({ server: true, counts, inboxDoc: D, todoDoc: null }),
+        primary: primaryNav({ server: true, counts, inboxDoc: D }),
         secondary: secondaryNav(counts),
         workspaceMenu: createElement('div', { id: 'wsm' }),
         tree: createElement('div', { id: 'tree' }),

@@ -15,6 +15,7 @@ describe('routes', () => {
       { kind: 'library', workspace: B },
       { kind: 'library', workspace: null, folder: A },
       { kind: 'library', workspace: 'unsorted', folder: A },
+      { kind: 'todos' },
       { kind: 'review' },
       { kind: 'search', q: '' },
       { kind: 'search', q: 'review gate & co' },
@@ -40,6 +41,9 @@ describe('routes', () => {
   })
   it('paths read as the design names them', () => {
     expect(routePath({ kind: 'home' })).toBe('/')
+    expect(routePath({ kind: 'todos' })).toBe('/todos')
+    expect(parseRoute('/Todos/')).toEqual({ kind: 'todos' })
+    expect(parseRoute('/todos/extra').kind).toBe('notfound')
     expect(routePath({ kind: 'doc', id: A })).toBe(`/doc/${A}`)
     expect(routePath({ kind: 'runs' })).toBe('/gardeners')
     expect(routePath({ kind: 'settings', section: 'profile' })).toBe('/settings')

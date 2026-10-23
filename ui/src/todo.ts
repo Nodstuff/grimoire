@@ -31,6 +31,8 @@ export interface TodoDay {
   epoch: number
   /** an add/edit whose trailing `due …` phrase could not be read */
   warning?: string
+  /** the list's workspace (null: the unlabelled root To-do) */
+  workspace_id?: string | null
 }
 
 /** `GET /api/todo/parse?text=…`: what the daemon makes of a typed line. The

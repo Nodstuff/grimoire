@@ -1,0 +1,515 @@
+/* The To-dos screen (/todos): the Home "Today" card's language (canvas Main,
+   Mobile-Home, Lapis-System) at page scale. Checkbox (.hm-check), deadline
+   pill (.hm-pill) and the ⋯ menu (.hm-menu) are the Today card's own. */
+
+.lp-page.td-page {
+  max-width: 920px;
+}
+.td-actions {
+  align-items: center;
+  gap: 14px;
+}
+.td-md {
+  position: relative;
+}
+.td-md-menu {
+  right: 0;
+  top: calc(100% + 6px);
+}
+.td-ws {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+/* ---------- the add field ---------- */
+.td-add {
+  padding: 8px 10px 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.td-add:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.td-add-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.td-add-plus {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.td-add-input {
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 16px;
+  outline: none;
+}
+.td-add-input::placeholder {
+  color: var(--ink3);
+}
+.td-chip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: var(--r-pill);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  white-space: nowrap;
+  animation: td-pop 0.16s var(--ease);
+}
+.td-chip.warn {
+  background: var(--yellow-soft);
+  color: var(--yellow);
+}
+@keyframes td-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+}
+.td-add-note {
+  margin-left: 44px;
+  width: calc(100% - 44px);
+}
+.td-add-foot {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 4px 0 44px;
+  min-height: 28px;
+  flex-wrap: wrap;
+}
+.td-add-hint {
+  margin-left: auto;
+  font-size: var(--text-sm);
+  color: var(--ink3);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ---------- the list ---------- */
+.td-list {
+  overflow: visible;
+}
+.td-loading {
+  padding: 18px;
+}
+.td-allclear {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 18px;
+  color: var(--green);
+  font-size: var(--text-md);
+}
+.td-group + .td-group {
+  border-top: 1px solid var(--line);
+}
+.td-group-head {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 18px 8px;
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--ink3);
+}
+.td-group-overdue .td-group-head {
+  color: var(--red);
+}
+.td-group-today .td-group-head {
+  color: var(--ink);
+}
+.td-group-sub {
+  font-weight: 400;
+  color: var(--ink3);
+}
+.td-done-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.td-done-toggle:hover {
+  color: var(--ink);
+}
+.td-group-done .td-group-head {
+  padding-bottom: 14px;
+}
+.td-group-done .td-rows {
+  margin-top: -6px;
+}
+.td-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 6px;
+}
+.td-rows.drop-end {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.td-row {
+  position: relative;
+  border-top: 1px solid var(--line);
+  outline: none;
+  transition:
+    opacity 0.3s var(--ease),
+    background 0.12s;
+}
+.td-row:focus-visible,
+.td-row.sel:focus-within {
+  background: var(--hover);
+}
+.td-row:focus-visible {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.td-row.busy {
+  opacity: 0.6;
+}
+.td-row.drop-before {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.td-main {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px 10px 18px;
+  min-height: 24px;
+  background: var(--card);
+  transition: transform 0.18s var(--ease);
+}
+.td-row:hover .td-main,
+.td-row:focus-visible .td-main,
+.td-row.sel:focus-within .td-main {
+  background: var(--hover);
+}
+.td-row.swipe-r .td-main,
+.td-row.swipe-l .td-main {
+  transition: none;
+}
+.td-grip {
+  position: absolute;
+  left: 5px;
+  top: 50%;
+  width: 6px;
+  height: 12px;
+  margin-top: -6px;
+  opacity: 0;
+  cursor: grab;
+  background-image: radial-gradient(circle, var(--ink3) 1.1px, transparent 1.3px);
+  background-size: 3px 4px;
+  transition: opacity 0.12s;
+}
+.td-row:hover .td-grip {
+  opacity: 0.8;
+}
+.td-check {
+  transition:
+    background 0.2s var(--ease),
+    border-color 0.2s var(--ease),
+    transform 0.2s var(--ease);
+}
+.td-row.ticking .td-check {
+  transform: scale(1.12);
+}
+.td-text {
+  flex: 1;
+  min-width: 0;
+  cursor: text;
+  overflow-wrap: anywhere;
+  font-size: var(--text-base);
+  transition: color 0.3s var(--ease);
+}
+.td-row.done .td-text {
+  color: var(--ink3);
+  text-decoration: line-through;
+  text-decoration-color: var(--ink3);
+  cursor: default;
+}
+.td-row.ticking {
+  opacity: 0.7;
+}
+.td-sub {
+  color: var(--ink3);
+  font-size: var(--text-xs);
+  margin-left: 8px;
+}
+.td-ws-tag {
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--ink3);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.td-edit-wrap {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.td-edit {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: var(--text-base);
+  color: var(--ink);
+  background: var(--card2);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 2px 7px;
+  margin: -3px 0;
+  outline: none;
+}
+.td-note-btn,
+.td-more {
+  flex: none;
+}
+.td-more {
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.td-row:hover .td-more,
+.td-row.menu-open .td-more,
+.td-row:focus-within .td-more,
+.td-row:focus-visible .td-more {
+  opacity: 1;
+}
+.td-row.done .hm-pill {
+  opacity: 0.6;
+}
+.td-note {
+  display: block;
+  margin: -4px 18px 10px 48px;
+  font-size: var(--text-md);
+  color: var(--ink2);
+  white-space: pre-wrap;
+  cursor: text;
+  position: relative;
+  z-index: 1;
+}
+button.td-note.preview {
+  font: inherit;
+  font-size: var(--text-md);
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 0;
+  max-width: calc(100% - 66px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  color: var(--ink3);
+}
+.td-note-edit {
+  margin: -2px 18px 10px 48px;
+  width: calc(100% - 66px);
+  font-size: var(--text-md);
+}
+.td-menu {
+  right: 10px;
+}
+.td-menu .hm-menu-pick > .lp-btn {
+  align-self: flex-start;
+}
+.td-time {
+  max-width: 110px;
+}
+.td-confirm {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px 10px 48px;
+  font-size: var(--text-md);
+  color: var(--red);
+  animation: td-pop 0.14s var(--ease);
+}
+.td-confirm > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.td-keys {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 10px 18px 14px;
+  border-top: 1px solid var(--line);
+  font-size: var(--text-xs);
+  color: var(--ink3);
+}
+
+/* swipe backdrop (phone) */
+.td-swipe-bg {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 18px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.td-swipe-bg > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  opacity: 0;
+}
+.td-row.swipe-r .td-swipe-bg {
+  background: var(--green-soft);
+}
+.td-row.swipe-r .td-swipe-done {
+  opacity: 1;
+  color: var(--green);
+}
+.td-row.swipe-l .td-swipe-bg {
+  background: var(--yellow-soft);
+}
+.td-row.swipe-l .td-swipe-snooze {
+  opacity: 1;
+  color: var(--yellow);
+}
+
+.td-fab {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .td-row,
+  .td-main,
+  .td-check,
+  .td-text,
+  .td-chip {
+    transition: none;
+    animation: none;
+  }
+}
+
+/* ---------- phone (Mobile-Home's rows: 44px+, no hover) ---------- */
+@media (max-width: 760px) {
+  .td-page {
+    gap: 16px;
+  }
+  .td-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .td-add {
+    padding: 6px 8px 8px 6px;
+  }
+  .td-add-hint,
+  .td-keys {
+    display: none;
+  }
+  .td-add-foot {
+    padding-left: 44px;
+  }
+  .td-add-note {
+    margin-left: 0;
+    width: 100%;
+  }
+  .td-group-head {
+    padding: 14px 16px 8px;
+  }
+  .td-main {
+    min-height: 48px;
+    padding: 0 8px 0 16px;
+    touch-action: pan-y;
+  }
+  .td-check {
+    width: 22px;
+    height: 22px;
+    border-radius: 7px;
+  }
+  .td-more {
+    opacity: 0.7;
+  }
+  .td-ws-tag {
+    display: none;
+  }
+  .td-note,
+  .td-note-edit,
+  button.td-note.preview {
+    margin-left: 50px;
+  }
+  button.td-note.preview {
+    display: block;
+    margin: -8px 16px 10px 50px;
+  }
+  .td-confirm {
+    padding-left: 16px;
+  }
+  .td-grip {
+    display: none;
+  }
+  /* the screen's own + (focuses the add field) replaces Capture's */
+  .lp-app:has(.stage-todos) > .lp-fab {
+    display: none;
+  }
+  .td-fab {
+    display: grid;
+    place-items: center;
+    position: fixed;
+    right: 20px;
+    bottom: calc(max(16px, env(safe-area-inset-bottom)) + var(--tabbar-h) + 16px);
+    z-index: 44;
+    width: 56px;
+    height: 56px;
+    border-radius: 18px;
+    border: 0;
+    background: var(--accent);
+    color: var(--on-accent);
+    box-shadow: var(--shadow-fab);
+    cursor: pointer;
+  }
+}
+
+/* the card glows instead: no field ring inside it */
+.td-add .td-add-input:focus,
+.td-add .td-add-input:focus-visible {
+  outline: none;
+  box-shadow: none;
+  border: 0;
+}

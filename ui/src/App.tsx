@@ -24,6 +24,7 @@ import ShortcutHelp from './ShortcutHelp'
 import NewDocPalette from './NewDocPalette'
 import DocView, { type Panel } from './screens/DocView'
 import ReviewQueue from './screens/ReviewQueue'
+import Todos from './screens/Todos'
 import Library, { pendingByDoc } from './screens/Library'
 import { isEmptyFolder } from './tree'
 import SearchScreen from './screens/Search'
@@ -628,6 +629,9 @@ export default function App() {
         />
       )
       break
+    case 'todos':
+      screen = <Todos dataVersion={dataVersion} workspaces={workspaces} onOpenDoc={openDoc} />
+      break
     case 'review':
       screen = <ReviewQueue onChange={setQueueCount} onOpenDoc={openDoc} dataVersion={dataVersion} docs={docs} workspaces={workspaces} />
       break
@@ -687,7 +691,7 @@ export default function App() {
     <Sidebar
       route={route}
       drawer={isPhone}
-      primary={primaryNav({ server, counts, inboxDoc: side.inboxDoc, todoDoc: side.todoDoc })}
+      primary={primaryNav({ server, counts, inboxDoc: side.inboxDoc })}
       secondary={secondaryNav(counts)}
       workspaceMenu={<WorkspaceMenu value={ws} list={workspaces} docCount={docs.length} onChange={pickWorkspace} onMembers={setMembersOf} onCreated={loadWorkspaces} />}
       tree={

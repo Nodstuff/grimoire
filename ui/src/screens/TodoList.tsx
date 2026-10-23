@@ -12,9 +12,8 @@ import { Button, Icon, IconButton, SkeletonLines } from '../lapis'
 import { duePill, groupTodos } from '../homeData'
 import { errText, notify } from '../Notice'
 import { api } from '../types'
-import { addDays, clientClock, dueDate, emptyDay, fmtDay, hasDuePhrase, isNoListYet, moveDueAt, nextMonday, previewLabel, type DueParse, type TodoDay, type TodoItem } from '../todo'
-
-const JSON_HEADERS = { 'Content-Type': 'application/json' }
+import { addDays, clientClock, dueDate, emptyDay, fmtDay, isNoListYet, moveDueAt, nextMonday, previewLabel, type TodoDay, type TodoItem } from '../todo'
+import { postTodo, useDuePreview } from './todoHooks'
 
 type Menu = { id: string; pane: 'root' | 'move' | 'deadline' } | null
 
@@ -38,7 +37,6 @@ export default function Todo({
   const [missing, setMissing] = useState(false)
   const [busy, setBusy] = useState(false)
   const [draft, setDraft] = useState('')
-  const [preview, setPreview] = useState<DueParse | null>(null)
   const [editing, setEditing] = useState<string | null>(null)
   const [noteOpen, setNoteOpen] = useState<Set<string>>(new Set())
   const [noteEdit, setNoteEdit] = useState<string | null>(null)
@@ -79,7 +77,7 @@ export default function Todo({
   const post = async (path: string, body: Record<string, unknown>) => {
     setBusy(true)
     try {
-      const d = await api<TodoDay>(path, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ date, ...clientClock(), ...body }) })
+      const d = await postTodo<TodoDay>(path, { date, ...body })
       apply(d)
       if (d.warning) notify(`${d.warning} — kept as typed; set it from the ⋯ menu`, 'warn')
       return true
@@ -96,29 +94,12 @@ export default function Todo({
     const text = draft.trim()
     if (!text) return
     setDraft('')
-    setPreview(null)
     if (!(await post('/api/todo', { text }))) setDraft(text)
   }
 
   // the live hint: a draft ending in `due …` / `by …` is shown to the daemon
   // (debounced) and its reading echoed beside the row; the rules live there
-  useEffect(() => {
-    if (!hasDuePhrase(draft)) {
-      setPreview(null)
-      return
-    }
-    let live = true
-    const t = setTimeout(() => {
-      const c = clientClock()
-      api<DueParse>(`/api/todo/parse?text=${encodeURIComponent(draft.trim())}&today=${c.today}&utc_offset=${encodeURIComponent(c.utc_offset)}`)
-        .then((r) => live && setPreview(r))
-        .catch(() => live && setPreview(null))
-    }, 150)
-    return () => {
-      live = false
-      clearTimeout(t)
-    }
-  }, [draft])
+  const preview = useDuePreview(draft)
 
   // the ⋯ menu closes on Esc and on a click anywhere else
   useEffect(() => {

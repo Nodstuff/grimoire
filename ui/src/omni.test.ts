@@ -146,9 +146,9 @@ describe('Open (⌘O) ranking', () => {
 })
 
 describe('places', () => {
-  it('Home, Review, Gardeners, Graph, Trash and Settings always; Books and E-readers only with the library', () => {
+  it('Home, To-dos, Review, Gardeners, Graph, Trash and Settings always; Books and E-readers only with the library', () => {
     const local = buildPlaces({ library: false }).map((p) => p.id)
-    expect(local).toEqual(['home', 'review', 'runs', 'graph', 'trash', 'settings'])
+    expect(local).toEqual(['home', 'todos', 'review', 'runs', 'graph', 'trash', 'settings'])
     const server = buildPlaces({ library: true }).map((p) => p.id)
     expect(server).toEqual(expect.arrayContaining([...local, 'books', 'ereaders']))
   })

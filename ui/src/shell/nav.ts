@@ -27,22 +27,20 @@ export interface NavItem {
 }
 
 /** Sidebar, top group (canvas Main): Home, Inbox, To-dos, Review, Search &
- * Ask, Books. Inbox and To-dos open their docs (absent until they exist);
- * Books only in SERVER mode. */
+ * Ask, Books. Inbox opens its doc (absent until it exists); To-dos is its
+ * own screen (/todos); Books only in SERVER mode. */
 export function primaryNav({
   server,
   counts,
   inboxDoc,
-  todoDoc,
 }: {
   server: boolean
   counts: ShellCounts
   inboxDoc: string | null
-  todoDoc: string | null
 }): NavItem[] {
   const items: NavItem[] = [{ id: 'home', label: 'Home', icon: 'home', to: { kind: 'home' }, match: ['home'], kbd: '⌘⇧H' }]
   if (inboxDoc) items.push({ id: 'inbox', label: 'Inbox', icon: 'inbox', to: { kind: 'doc', id: inboxDoc }, match: [], count: counts.inbox })
-  if (todoDoc) items.push({ id: 'todos', label: 'To-dos', icon: 'todo', to: { kind: 'doc', id: todoDoc }, match: [], count: counts.todos })
+  items.push({ id: 'todos', label: 'To-dos', icon: 'todo', to: { kind: 'todos' }, match: ['todos'], count: counts.todos })
   items.push(
     { id: 'review', label: 'Review', icon: 'review', to: { kind: 'review' }, match: ['review'], count: counts.review, badge: true },
     { id: 'search', label: 'Search & Ask', icon: 'search', to: { kind: 'search', q: '' }, match: ['search'], kbd: '⌘⇧F' },
@@ -73,7 +71,7 @@ export function tabNav({ server, counts }: { server: boolean; counts: ShellCount
   return items
 }
 
-/** Is `item` the current place? Doc-backed rows (Inbox, To-dos) light when
+/** Is `item` the current place? A doc-backed row (Inbox) lights when
  * their doc is open. */
 export function isCurrent(item: NavItem, route: Route): boolean {
   if (item.to?.kind === 'doc') return route.kind === 'doc' && route.id === item.to.id
@@ -87,6 +85,8 @@ export function placeTitle(route: Route): string {
       return 'Home'
     case 'library':
       return 'Library'
+    case 'todos':
+      return 'To-dos'
     case 'review':
       return 'Review'
     case 'search':

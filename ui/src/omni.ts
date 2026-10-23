@@ -169,7 +169,7 @@ export function recentDocs(ids: string[], docs: Doc[]): Doc[] {
 
 /* ---------- places (⌘O) ---------- */
 
-export type PlaceId = 'home' | 'books' | 'review' | 'trash' | 'graph' | 'runs' | 'settings' | 'ereaders'
+export type PlaceId = 'home' | 'todos' | 'books' | 'review' | 'trash' | 'graph' | 'runs' | 'settings' | 'ereaders'
 
 export interface Place {
   id: PlaceId
@@ -186,6 +186,7 @@ export interface Place {
 export function buildPlaces({ library, queueCount = 0 }: { library: boolean; queueCount?: number }): Place[] {
   const places: Place[] = [
     { id: 'home', icon: 'home', label: 'Home', hint: 'the briefing', keys: '⌘⇧H', keywords: 'briefing start' },
+    { id: 'todos', icon: 'todo', label: 'To-dos', hint: 'overdue, today, upcoming', keywords: 'todo tasks checklist deadlines due' },
     ...(library ? [{ id: 'books' as const, icon: 'books' as const, label: 'Books', hint: 'your EPUB library', keywords: 'epub library reading' }] : []),
     {
       id: 'review',
