@@ -297,17 +297,23 @@ textarea.hm-field {
   margin: -2px 0;
   outline: none;
 }
+/* ⋯ and × take no room until the row is hovered or focused */
 .hm-todo-actions {
   display: inline-flex;
   gap: 0;
-  opacity: 0;
-  transition: opacity 0.12s;
   flex: none;
+  max-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  margin-right: -12px;
+  transition: opacity 0.12s;
 }
 .hm-todo-item:hover .hm-todo-actions,
 .hm-todo-item.menu-open .hm-todo-actions,
 .hm-todo-item:focus-within .hm-todo-actions {
+  max-width: 60px;
   opacity: 1;
+  margin-right: 0;
 }
 .hm-todo-remove:hover {
   color: var(--red);
@@ -420,6 +426,9 @@ textarea.hm-field {
 .hm-menu > button:hover,
 .hm-menu > button:focus-visible {
   background: var(--hover);
+}
+.hm-menu > button.danger {
+  color: var(--red);
 }
 .hm-menu-pick {
   display: flex;
@@ -846,8 +855,26 @@ a.hm-book {
     height: 22px;
     border-radius: 7px;
   }
+  /* no hover on a phone: ⋯ always there (Remove is in its menu) */
   .hm-todo-actions {
+    max-width: none;
     opacity: 1;
+    margin-right: -6px;
+  }
+  .hm-todo-remove {
+    display: none !important;
+  }
+  .hm-todo-more {
+    color: var(--ink3);
+    opacity: 0.7;
+  }
+  .hm-todo-doc {
+    display: none;
+  }
+  /* the stage's 36px top pad sits under the phone's own top bar: Home's
+     date row starts closer (Mobile-Home) */
+  .lp-main > .stage.stage-home {
+    padding-top: 12px;
   }
   .hm-todo-note {
     margin-left: 50px;

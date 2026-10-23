@@ -440,6 +440,9 @@ function TodoRow({
               <button type="button" role="menuitem" onClick={onNoteEdit}>
                 {it.note ? 'Edit note' : 'Add a note'}
               </button>
+              <button type="button" role="menuitem" className="danger" disabled={busy} onClick={onRemove}>
+                Remove
+              </button>
             </>
           )}
           {menu === 'move' && (
