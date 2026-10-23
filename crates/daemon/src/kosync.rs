@@ -401,7 +401,7 @@ fn api_user(st: &KosyncState, v: &Viewer) -> Option<Uuid> {
 /// device-sent 0..1 fraction; the UI's `BookProgress` contract is
 /// percents) and `updated_at` RFC 3339 — both unlike the device protocol,
 /// which passes the fraction through and stamps unix seconds.
-fn progress_json(p: &KosyncProgress) -> Value {
+pub(crate) fn progress_json(p: &KosyncProgress) -> Value {
     json!({
         "percentage": p.percentage * 100.0,
         "device": p.device,

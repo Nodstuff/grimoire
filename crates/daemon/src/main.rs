@@ -13,6 +13,7 @@ mod changes;
 mod children;
 mod docops;
 mod embed;
+mod epub;
 mod filer;
 mod garden;
 mod home;
@@ -29,6 +30,7 @@ mod opds;
 mod push;
 mod retrieval;
 mod s3sign;
+mod sentdocs;
 mod share_render;
 mod shares;
 mod store_ext;
@@ -1099,6 +1101,7 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                 .merge(library::router(library_state))
                 .merge(opds::router(opds_state))
                 .merge(kosync::router(kosync_state))
+                .merge(sentdocs::router(sentdocs::SentState { store: store.clone(), server_mode, local_human: tom }))
                 .merge(api::router(api::ApiState {
                     changes: feed,
                     store,

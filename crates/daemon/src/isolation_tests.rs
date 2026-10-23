@@ -228,6 +228,16 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/opds/book/{id}/cover", "opds_downloads_serve_only_the_device_owners_books"),
     ("/opds/{secret}/book/{id}/file", "opds_downloads_serve_only_the_device_owners_books"),
     ("/opds/{secret}/book/{id}/cover", "opds_downloads_serve_only_the_device_owners_books"),
+    // docs sent to e-readers (sentdocs.rs, opds.rs; EPUB proposal Phase 2):
+    // a doc is a book only for the person who tagged it, read in their scope
+    ("/api/docs/{id}/epub", "sent_docs_are_the_taggers_alone"),
+    ("/api/docs/{id}/ereader", "sent_docs_are_the_taggers_alone"),
+    ("/api/docs/{id}/epub-images", "sent_docs_are_the_taggers_alone"),
+    ("/api/ereader/sent", "sent_docs_are_the_taggers_alone"),
+    ("/opds/docs", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
+    ("/opds/doc/{id}/file", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
+    ("/opds/{secret}/docs", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
+    ("/opds/{secret}/doc/{id}/file", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
 ];
 
 thread_local! {
@@ -488,6 +498,7 @@ fn fixture() -> Fx {
             local_human: a_human,
             library: library.clone(),
         }))
+        .merge(crate::sentdocs::router(crate::sentdocs::SentState { store: store.clone(), server_mode: true, local_human: a_human }))
         .merge(crate::kosync::router(crate::kosync::KosyncState {
             store: store.clone(),
             server: Some(crate::kosync::ServerSide { cfg: st.cfg.clone(), limiter: st.limiter.clone() }),
@@ -1293,6 +1304,7 @@ fn every_route_and_tool_is_covered() {
         include_str!("library.rs"),
         include_str!("opds.rs"),
         include_str!("kosync.rs"),
+        include_str!("sentdocs.rs"),
     ];
     let re = regex::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
     let covered: std::collections::HashSet<&str> = COVERAGE.iter().map(|(p, _)| *p).collect();
@@ -2894,4 +2906,156 @@ async fn api_errors_carry_a_stable_code() {
     let (st, out) = fx.b("POST", &format!("/api/doc/{b_doc}/move"), Some(json!({"parent_id": b_doc}))).await;
     assert_eq!((st, code(&out)), (StatusCode::OK, json!("invalid")), "{out}");
     assert!(out.contains("\"error\":\"invalid op: "), "{out}");
+}
+
+
+// ---- docs sent to e-readers (sentdocs.rs, opds.rs) ----
+
+/// A request with raw bytes back (an EPUB is a zip, not text).
+async fn bytes_call(fx: &Fx, method: &str, path: &str, token: Option<&str>, headers: &[(&str, String)]) -> (StatusCode, Vec<u8>, axum::http::HeaderMap) {
+    let mut b = Request::builder().method(method).uri(path).header("host", "localhost:7513");
+    if let Some(t) = token {
+        b = authed(b, t, method);
+    }
+    for (k, v) in headers {
+        b = b.header(*k, v.as_str());
+    }
+    let res = fx.app.clone().oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+    let (status, h) = (res.status(), res.headers().clone());
+    (status, axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec(), h)
+}
+
+/// Every entry of an EPUB, inflated, as one string (for leak checks).
+fn epub_text(bytes: &[u8]) -> String {
+    crate::epub::tests::unzip(bytes).into_iter().map(|(n, b, _)| format!("{n}\n{}\n", String::from_utf8_lossy(&b))).collect()
+}
+
+/// A workspace A owns and shares with B as an EDITOR, with one doc in it.
+fn club(fx: &Fx) -> Uuid {
+    let mut s = fx.store.lock(Scope::User(fx.a));
+    let ws = s.create_workspace("Book club", None, None, None).unwrap().id;
+    let (d, _) = s.create_doc_with_ops("Club notes", None, fx.a_human, vec![para("clubshared reading list").1]).unwrap();
+    s.set_doc_workspace(d.id, Some(ws), fx.a_human).unwrap();
+    s.share_workspace(ws, fx.b, Role::Editor).unwrap();
+    d.id
+}
+
+#[tokio::test]
+async fn sent_docs_are_the_taggers_alone() {
+    let fx = fixture();
+    let secret = fx.a_secret;
+    // A sends her private doc (a folder of one) through the owner route
+    let (st, out) = fx.call(&fx.a_app, "POST", &format!("/api/docs/{secret}/ereader"), Some(json!({"send": true}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!((v["sent"].as_bool(), v["tagged"].as_bool()), (Some(true), Some(true)), "{out}");
+    let (_, list) = fx.call(&fx.a_app, "GET", "/api/ereader/sent", None).await;
+    assert!(list.contains(&secret.to_string()) && list.contains("Taisce - Salary review.epub"), "{list}");
+    let (st, bytes, h) = bytes_call(&fx, "GET", &format!("/api/docs/{secret}/epub"), Some(&fx.a_app), &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(h["content-type"], "application/epub+zip");
+    assert!(epub_text(&bytes).contains("zebrasecret salary figures"), "A's own book carries her text");
+
+    // B: every route on A's doc is the 404 of a doc that never existed
+    for (m, sub, body) in [
+        ("GET", "epub", None),
+        ("GET", "ereader", None),
+        ("POST", "ereader", Some(json!({"send": true}))),
+        ("POST", "ereader", Some(json!({"send": false}))),
+        ("POST", "epub-images", Some(json!({"images": [{"block_id": fx.a_secret_block, "source_hash": "x", "png": "iVBORw0KGgo=", "width": 1, "height": 1}]}))),
+    ] {
+        let got = fx.b(m, &format!("/api/docs/{secret}/{sub}"), body.clone()).await;
+        let missing = fx.b(m, &format!("/api/docs/{MISSING}/{sub}"), body).await;
+        same_as_missing(&fx, &format!("{m} {sub}"), got, missing);
+    }
+    let (st, list) = fx.b("GET", "/api/ereader/sent", None).await;
+    assert_eq!(st, StatusCode::OK);
+    fx.no_leak("B's sent list", &list);
+    assert_eq!(serde_json::from_str::<Value>(&list).unwrap()["docs"], json!([]));
+    // A's doc still sent, untouched by B's attempts
+    assert!(fx.store.lock(Scope::User(fx.a)).ereader_sent(secret).unwrap());
+
+    // a shared doc: B tags it → hers alone, though A sees the same doc
+    let club = club(&fx);
+    let (st, out) = fx.b("POST", &format!("/api/docs/{club}/ereader"), Some(json!({"send": true}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let (_, b_list) = fx.b("GET", "/api/ereader/sent", None).await;
+    assert!(b_list.contains(&club.to_string()), "{b_list}");
+    let (_, a_list) = fx.call(&fx.a_app, "GET", "/api/ereader/sent", None).await;
+    assert!(!a_list.contains(&club.to_string()), "B's tag is not A's: {a_list}");
+    let (_, a_info) = fx.call(&fx.a_app, "GET", &format!("/api/docs/{club}/ereader"), None).await;
+    let a_info: Value = serde_json::from_str(&a_info).unwrap();
+    assert_eq!((a_info["sent"].as_bool(), a_info["tagged"].as_bool()), (Some(false), Some(true)));
+    // and A cannot take B's doc off B's e-readers (nor send it as hers)
+    let (st, _) = fx.call(&fx.a_app, "POST", &format!("/api/docs/{club}/ereader"), Some(json!({"send": false}))).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    // a viewer (B on Family) cannot send at all
+    let (st, _) = fx.b("POST", &format!("/api/docs/{}/ereader", fx.shared_doc), Some(json!({"send": true}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // a connector token is not the person: refused on every route
+    for (m, path) in [("GET", format!("/api/docs/{club}/epub")), ("GET", "/api/ereader/sent".into()), ("POST", format!("/api/docs/{club}/ereader"))] {
+        let (st, out) = fx.call(&fx.b_conn, m, &path, Some(json!({"send": false}))).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{m} {path}: {out}");
+    }
+}
+
+#[tokio::test]
+async fn the_opds_docs_shelf_serves_only_the_owners_sent_docs() {
+    let fx = fixture();
+    let secret = fx.a_secret;
+    // nothing sent yet: no Docs shelf for anyone
+    let (_, root, _) = device_call(&fx, "GET", "/opds/", &[basic("Tom", &fx.a_pw)], None).await;
+    assert!(!root.contains("urn:taisce:docs"), "{root}");
+    let (st, _) = fx.call(&fx.a_app, "POST", &format!("/api/docs/{secret}/ereader"), Some(json!({"send": true}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let club = club(&fx);
+    let (st, _) = fx.b("POST", &format!("/api/docs/{club}/ereader"), Some(json!({"send": true}))).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // B's device, both auth forms: her doc only, never A's
+    for (prefix, headers) in [("/opds".to_string(), vec![basic("Aoife", &fx.b_pw)]), (format!("/opds/{}", fx.b_pw), vec![])] {
+        let (st, root, _) = device_call(&fx, "GET", &format!("{prefix}/"), &headers, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(root.contains(&format!("{prefix}/docs")), "B has a sent doc: {root}");
+        let (st, docs, _) = device_call(&fx, "GET", &format!("{prefix}/docs"), &headers, None).await;
+        assert_eq!(st, StatusCode::OK);
+        fx.no_leak(&format!("{prefix}/docs"), &docs);
+        assert!(docs.contains(&format!("{prefix}/doc/{club}/file")) && docs.contains("<name>Taisce</name>"), "{docs}");
+        for method in ["GET", "HEAD"] {
+            // A's sent doc, A's untagged doc and a missing id: one 404
+            for id in [secret, fx.a_loose, MISSING] {
+                let (st, out, _) = device_call(&fx, method, &format!("{prefix}/doc/{id}/file"), &headers, None).await;
+                assert_eq!(st, StatusCode::NOT_FOUND, "{method} {id}: {out}");
+                fx.no_leak_besides("doc file", &out, &[secret, fx.a_loose]);
+            }
+        }
+        let (st, bytes, h) = bytes_call(&fx, "GET", &format!("{prefix}/doc/{club}/file"), None, &headers).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(epub_text(&bytes).contains("clubshared reading list"));
+        assert!(h["content-disposition"].to_str().unwrap().contains("Taisce - Club notes.epub"));
+        let (st, head, hh) = bytes_call(&fx, "HEAD", &format!("{prefix}/doc/{club}/file"), None, &headers).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(head.is_empty());
+        assert_eq!(hh["content-length"].to_str().unwrap(), bytes.len().to_string());
+    }
+
+    // A's device: her doc, not B's (A can see the club doc; she did not tag it)
+    let (_, docs, _) = device_call(&fx, "GET", "/opds/docs", &[basic("Tom", &fx.a_pw)], None).await;
+    assert!(docs.contains(&format!("/opds/doc/{secret}/file")) && docs.contains("Salary review"), "{docs}");
+    assert!(!docs.contains(&club.to_string()), "{docs}");
+    let (st, _, _) = device_call(&fx, "GET", &format!("/opds/doc/{club}/file"), &[basic("Tom", &fx.a_pw)], None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, bytes, _) = bytes_call(&fx, "GET", &format!("/opds/doc/{secret}/file"), None, &[basic("Tom", &fx.a_pw)]).await;
+    assert_eq!(st, StatusCode::OK);
+    // the feed's bytes are the owner route's bytes (deterministic render)
+    let (_, again, _) = bytes_call(&fx, "GET", &format!("/api/docs/{secret}/epub"), Some(&fx.a_app), &[]).await;
+    assert_eq!(bytes, again);
+    // stop sending: gone from the feed and its file 404s
+    let (st, _) = fx.call(&fx.a_app, "POST", &format!("/api/docs/{secret}/ereader"), Some(json!({"send": false}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, _) = device_call(&fx, "GET", &format!("/opds/doc/{secret}/file"), &[basic("Tom", &fx.a_pw)], None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (_, root, _) = device_call(&fx, "GET", "/opds/", &[basic("Tom", &fx.a_pw)], None).await;
+    assert!(!root.contains("urn:taisce:docs"), "{root}");
 }

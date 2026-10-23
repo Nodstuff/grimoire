@@ -1323,7 +1323,7 @@ pub async fn book_file(
 /// fallback (anything else → `_`; the name never holds a quote or
 /// backslash, booknaming replaced them) plus the exact UTF-8 name in
 /// `filename*`. Every byte is visible ASCII, so it is always a valid header.
-fn content_disposition(filename: &str) -> String {
+pub(crate) fn content_disposition(filename: &str) -> String {
     let ascii: String = filename
         .chars()
         .map(|c| if c.is_ascii() && !c.is_ascii_control() { c } else { '_' })

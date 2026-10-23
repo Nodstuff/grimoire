@@ -613,9 +613,22 @@ pub(crate) fn book_entry_xml(book: &Book, link_prefix: &str) -> String {
 
 /// The top navigation feed: New, All, Authors, Series and Search (the
 /// OpenSearch description).
-fn root_xml(prefix: &str, updated: &str) -> String {
+fn root_xml(prefix: &str, updated: &str, docs: bool) -> String {
     let mut x = feed_head("urn:taisce:books", "Taisce books", updated);
     spine_links(&mut x, prefix, &format!("{prefix}/"), NAV_CT);
+    // the person's docs sent to e-readers (sentdocs.rs), first, only when any
+    if docs {
+        x.push_str(&nav_entry_xml(
+            "urn:taisce:docs",
+            "Docs",
+            &format!("{prefix}/docs"),
+            "subsection",
+            ACQ_CT,
+            "Docs sent from Taisce",
+            updated,
+        ));
+        x.push('\n');
+    }
     for (id, title, href, rel, ct, content) in [
         ("urn:taisce:books:new", "New", format!("{prefix}/new"), "subsection", ACQ_CT, "The newest books"),
         ("urn:taisce:books:all", "All", format!("{prefix}/all"), "subsection", ACQ_CT, "Every book, by title"),
@@ -778,8 +791,98 @@ async fn paged_feed(st: &OpdsState, client: &OpdsClient, feed: FeedRef, q: &Page
     xml(ACQ_CT, acq_xml(&client.prefix, &feed.id, &feed.title, &self_href, next_href.as_deref(), feed.up.as_deref(), &books, &rfc3339(now())))
 }
 
-async fn root_feed(Extension(client): Extension<OpdsClient>) -> Response {
-    xml(NAV_CT, root_xml(&client.prefix, &rfc3339(now())))
+async fn root_feed(State(st): State<OpdsState>, Extension(client): Extension<OpdsClient>) -> Response {
+    let user = client.ereader.user_id;
+    let docs = match with_store(&st.store, Scope::User(user), move |s| s.ereader_sent_docs()).await {
+        Ok(d) => !d.is_empty(),
+        Err(e) => return fail(e),
+    };
+    xml(NAV_CT, root_xml(&client.prefix, &rfc3339(now()), docs))
+}
+
+// ---- docs sent to e-readers (sentdocs.rs renders; ONLY docs the device's
+// owner tagged `ereader` themselves, in Scope::User(owner)) ----
+
+/// One sent doc as an acquisition entry: the feed title and the author
+/// "Taisce" are exactly what both clients derive `Taisce - <Title>.epub`
+/// from (booknaming's rule, the kosync key).
+fn doc_entry_xml(b: &crate::sentdocs::SentBook, size: usize, prefix: &str) -> String {
+    let n = b.spec.chapters.len();
+    let mut content = if n == 1 { "1 chapter".to_string() } else { format!("{n} chapters") };
+    if let Some(w) = &b.workspace {
+        content.push_str(&format!(" \u{b7} {w}"));
+    }
+    format!(
+        "<entry>\n\
+         <id>urn:uuid:{}</id>\n\
+         <title>{}</title>\n\
+         <author><name>{}</name></author>\n\
+         <updated>{}</updated>\n\
+         <content type=\"text\">{}</content>\n\
+         <link rel=\"http://opds-spec.org/acquisition\" type=\"application/epub+zip\" href=\"{prefix}/doc/{}/file\" length=\"{size}\"/>\n\
+         </entry>",
+        b.spec.id,
+        esc(&b.feed_title),
+        crate::sentdocs::FEED_AUTHOR,
+        esc(&b.spec.modified),
+        esc(&content),
+        b.spec.id,
+    )
+}
+
+async fn docs_feed(State(st): State<OpdsState>, Extension(client): Extension<OpdsClient>) -> Response {
+    let user = client.ereader.user_id;
+    let books = match with_store(&st.store, Scope::User(user), move |s| crate::sentdocs::sent_books(s, Some(user))).await {
+        Ok(b) => b,
+        Err(e) => return fail(e),
+    };
+    let prefix = &client.prefix;
+    let mut x = feed_head("urn:taisce:docs", "Docs", &rfc3339(now()));
+    spine_links(&mut x, prefix, &format!("{prefix}/docs"), ACQ_CT);
+    x.push_str(&format!("<link rel=\"up\" type=\"{NAV_CT}\" href=\"{prefix}/\"/>\n"));
+    for b in &books {
+        let size = match crate::epub::CACHE.get_or_render(&b.spec) {
+            Ok(bytes) => bytes.len(),
+            Err(e) => return crate::sentdocs::render_failed(e),
+        };
+        x.push_str(&doc_entry_xml(b, size, prefix));
+        x.push('\n');
+    }
+    x.push_str("</feed>");
+    xml(ACQ_CT, x)
+}
+
+/// `GET|HEAD /opds/doc/{id}/file`: a sent doc of the device's owner,
+/// rendered on demand (cached by content), streamed from the daemon. Any
+/// other id — untagged, tagged by someone else, a chapter of a sent folder,
+/// invisible — is the same 404.
+async fn doc_file(st: &OpdsState, client: &OpdsClient, id: Uuid) -> Response {
+    let user = client.ereader.user_id;
+    let found = with_store(&st.store, Scope::User(user), move |s| -> taisce_store::Result<Option<(crate::epub::BookSpec, String)>> {
+        match s.ereader_sent(id) {
+            Ok(true) => {}
+            Ok(false) | Err(StoreError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        Ok(crate::sentdocs::sent_books(s, Some(user))?.into_iter().find(|b| b.spec.id == id).map(|b| (b.spec, b.filename)))
+    })
+    .await;
+    match found {
+        Ok(Some((spec, name))) => match crate::epub::CACHE.get_or_render(&spec) {
+            Ok(bytes) => crate::sentdocs::epub_response(&bytes, &name),
+            Err(e) => crate::sentdocs::render_failed(e),
+        },
+        Ok(None) => not_found(),
+        Err(e) => fail(e),
+    }
+}
+
+async fn doc_file_dl(State(st): State<OpdsState>, Extension(client): Extension<OpdsClient>, Path(id): Path<Uuid>) -> Response {
+    doc_file(&st, &client, id).await
+}
+
+async fn doc_file_dl_s(State(st): State<OpdsState>, Extension(client): Extension<OpdsClient>, Path((_, id)): Path<(String, Uuid)>) -> Response {
+    doc_file(&st, &client, id).await
 }
 
 async fn opensearch_doc(Extension(client): Extension<OpdsClient>) -> Response {
@@ -992,6 +1095,10 @@ pub fn router(state: OpdsState) -> Router {
         .route("/opds/series", get(series_feed))
         .route("/opds/series/{name}", get(series_books_feed))
         .route("/opds/search", get(search_feed))
+        .route("/opds/docs", get(docs_feed))
+        .route("/opds/doc/{id}/file", get(doc_file_dl))
+        .route("/opds/{secret}/docs", get(docs_feed))
+        .route("/opds/{secret}/doc/{id}/file", get(doc_file_dl_s))
         .route("/opds/{secret}", get(root_feed))
         .route("/opds/{secret}/", get(root_feed))
         .route("/opds/{secret}/opensearch.xml", get(opensearch_doc))
@@ -1234,7 +1341,7 @@ mod tests {
 
     #[test]
     fn root_feed_links_keep_the_prefix() {
-        let x = root_xml("/opds/abcd-efgh-ijkl-mnop", "2026-01-01T00:00:00Z");
+        let x = root_xml("/opds/abcd-efgh-ijkl-mnop", "2026-01-01T00:00:00Z", false);
         for path in ["/new", "/all", "/authors", "/series", "/opensearch.xml"] {
             assert!(x.contains(&format!("href=\"/opds/abcd-efgh-ijkl-mnop{path}\"")), "{path}");
         }
