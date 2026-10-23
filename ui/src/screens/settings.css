@@ -293,6 +293,10 @@
   flex-direction: column;
   gap: 10px;
 }
+.st-ws-main > .st-row-text {
+  /* in this column flex the row text's 200px basis became a 200px height */
+  flex: none;
+}
 .st-ws-name {
   font-weight: 600;
 }
