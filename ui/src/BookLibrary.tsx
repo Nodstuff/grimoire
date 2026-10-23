@@ -11,6 +11,10 @@
 //
 // Above them all, "From Taisce": the docs this person sent to their
 // e-readers (ereader.ts), each a Download and a Stop sending.
+//
+// Colour covers (ColourCovers.tsx): "Find colour covers" in the head while a
+// loaded book has a black-and-white cover (or one not looked at yet) opens
+// the library pass; the details carry "Find a colour cover…".
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react'
 import { errText, notify } from './Notice'
@@ -37,9 +41,11 @@ import {
   listEreaders,
   parseSeriesIndex,
   searchFilter,
+  showColourPass,
   updateBook,
 } from './books'
 import { chaptersLabel, downloadEpub, listSentBooks, setSending, type SentBook } from './ereader'
+import { ColourCoverPanel, CoverReviewSheet } from './ColourCovers'
 import './screens/books.css'
 
 const PAGE = 60
@@ -105,6 +111,7 @@ export default function Books({ dataVersion }: { dataVersion: number }) {
   const [progress, setProgress] = useState<Record<string, BookProgress | null>>({})
   const [reading, setReading] = useState<ReadingBook[] | null>(null)
   const [ereaders, setEreaders] = useState<Ereader[] | null>(null)
+  const [reviewing, setReviewing] = useState(false)
   const wide = useSyncExternalStore(subscribeWide, isWideNow, () => true)
   // stale guard: a slow page-1 reload must not land on top of a newer query
   const gen = useRef(0)
@@ -270,6 +277,11 @@ export default function Books({ dataVersion }: { dataVersion: number }) {
               }}
               spellCheck={false}
             />
+            {showColourPass(books) && (
+              <Button size="sm" onClick={() => setReviewing(true)}>
+                Find colour covers
+              </Button>
+            )}
             <Button variant="primary" size="sm" icon="upload" onClick={() => document.getElementById('book-upload-input')?.click()}>
               Add EPUBs
             </Button>
@@ -388,6 +400,18 @@ export default function Books({ dataVersion }: { dataVersion: number }) {
         <EreadersCard list={ereaders} />
       </aside>
 
+      {reviewing && (
+        <CoverReviewSheet
+          onClose={() => {
+            setReviewing(false)
+            // the pass judged covers shelved before detection: page 1 again
+            gen.current++
+            load(query, null, true)
+          }}
+          onChanged={patched}
+        />
+      )}
+
       {!wide && pickedBook && (
         <Sheet title="Book details" onClose={() => setSelected(null)}>
           {detail}
@@ -498,7 +522,7 @@ function Bar({ pct, label }: { pct: number; label?: string }) {
 
 /** A cover: the book's own image, else (or when it fails to load) the
  * typographic one. `size` scales the type: grid, the reading card, the details. */
-export function Cover({ book, size, badge }: { book: Pick<Book, 'id' | 'title' | 'author' | 'has_cover'>; size: 'grid' | 'card' | 'detail'; badge?: string | null }) {
+export function Cover({ book, size, badge }: { book: Pick<Book, 'id' | 'title' | 'author' | 'has_cover' | 'cover_version'>; size: 'grid' | 'card' | 'detail'; badge?: string | null }) {
   const [broken, setBroken] = useState(false)
   const art = coverArt(book.id)
   const img = book.has_cover && !broken
@@ -506,7 +530,7 @@ export function Cover({ book, size, badge }: { book: Pick<Book, 'id' | 'title' |
   return (
     <span className={`bk-cover bk-cover-${size}${img ? ' bk-cover-img' : ''}${badge ? ' bk-cover-badged' : ''}`} style={style} aria-hidden>
       {img ? (
-        <img loading="lazy" src={coverUrl(book.id)} alt="" onError={() => setBroken(true)} />
+        <img loading="lazy" src={coverUrl(book.id, book.cover_version)} alt="" onError={() => setBroken(true)} />
       ) : (
         <>
           <span className="bk-cv-m" style={art.motif} />
@@ -644,6 +668,7 @@ function BookDetail({
         {book.original_filename} · {formatSize(book.size)} · added {relTime(book.added_at)}
       </div>
       <p className="muted bk-d-note">Changing the title or author renames the file on your e-readers at their next download.</p>
+      <ColourCoverPanel book={book} onPatched={onPatched} />
       <div className="bk-d-actions">
         <Button variant="primary" size="sm" disabled={!dirty || busy} onClick={save}>
           {busy ? 'Saving…' : 'Save changes'}

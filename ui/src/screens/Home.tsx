@@ -645,7 +645,7 @@ function Reading({ books }: { books: ReadingBook[] }) {
             <Link key={b.id} to={{ kind: 'books' }} className="hm-book" title={b.author ? `${b.title} by ${b.author}` : b.title}>
               <span className={`hm-cover${b.has_cover ? ' art' : ` tone-${coverTone(b.title)}`}`}>
                 {b.has_cover ? (
-                  <img loading="lazy" src={coverUrl(b.id)} alt="" />
+                  <img loading="lazy" src={coverUrl(b.id, b.cover_version)} alt="" />
                 ) : (
                   <>
                     <span className="hm-cover-motif" aria-hidden />

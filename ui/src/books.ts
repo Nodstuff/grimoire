@@ -17,7 +17,17 @@ export interface Book {
   book_identifier: string
   original_filename: string
   size: number
+  /** a cover to show: the colour one while chosen, else the book's own */
   has_cover: boolean
+  /** colour covers (BookCovers.tsx); absent from an older server */
+  has_embedded_cover?: boolean
+  has_color_cover?: boolean
+  /** the book's own cover: true = greyscale, false = colour, null = not looked at */
+  cover_greyscale?: boolean | null
+  /** who decided which cover shows: nobody, or the person (theirs / colour) */
+  cover_choice?: CoverChoice
+  /** moves whenever the shown cover does (cache-buster) */
+  cover_version?: number
   /** RFC 3339, e.g. "2026-01-01T00:00:00Z" */
   added_at: string
   /** RFC 3339 */
@@ -126,9 +136,123 @@ export function updateBook(id: string, patch: BookPatch): Promise<Book> {
   })
 }
 
-/** The <img> src for a cover. */
-export function coverUrl(id: string): string {
-  return `/api/books/${id}/cover`
+/** The <img> src for a cover: the shown one, or (`embedded`) the book's
+ * own even while a colour one is shown. `version` busts the browser cache
+ * when the shown cover changes. */
+export function coverUrl(id: string, version?: number, which?: 'embedded'): string {
+  const p = new URLSearchParams()
+  if (which) p.set('which', which)
+  if (version) p.set('v', String(version))
+  const q = p.toString()
+  return `/api/books/${id}/cover${q ? `?${q}` : ''}`
+}
+
+/* ---------- colour covers ---------- */
+
+export type CoverChoice = 'none' | 'embedded' | 'color'
+
+/** A colour cover the server found on Open Library and validated. `url`
+ * is the server's own route to the image: clients never fetch Open
+ * Library, and choose a candidate by its id. */
+export interface CoverCandidate {
+  id: string
+  source: 'isbn' | 'search'
+  width: number
+  height: number
+  colorfulness: number
+  url: string
+}
+
+export interface CoverCandidates {
+  book: Book
+  /** RFC 3339 of the cached lookup; null = never looked up */
+  looked_up_at: string | null
+  candidates: CoverCandidate[]
+  /** Open Library did not answer: try again later */
+  unavailable: boolean
+}
+
+export interface CoverReviewRow {
+  book: Book
+  /** false: no lookup yet (POST cover-candidates) */
+  looked_up: boolean
+  best: CoverCandidate | null
+}
+
+export interface CoverReview {
+  /** greyscale books nobody chose a cover for */
+  greyscale: number
+  /** covers not looked at yet (shelved before detection) */
+  unscanned: number
+  books: CoverReviewRow[]
+  /** POST only: covers looked at by this call */
+  scanned?: number
+}
+
+/** The cached candidates (no lookup). */
+export function coverCandidates(id: string): Promise<CoverCandidates> {
+  return api<CoverCandidates>(`/api/books/${id}/cover-candidates`)
+}
+
+/** Ask Open Library (the server does; a recent lookup is reused unless
+ * `refresh`). */
+export function findCoverCandidates(id: string, refresh = false): Promise<CoverCandidates> {
+  return api<CoverCandidates>(`/api/books/${id}/cover-candidates`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ refresh }),
+  })
+}
+
+/** Show a candidate, or (`'embedded'`) the book's own cover. `unlessChosen`
+ * is a library pass's accept: a cover the person already chose answers 409
+ * (code cover_chosen) and stays. */
+export function chooseCover(id: string, pick: { candidate: string } | 'embedded', unlessChosen = false): Promise<Book> {
+  const body = pick === 'embedded' ? { use: 'embedded' } : { candidate: pick.candidate }
+  return api<Book>(`/api/books/${id}/cover`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ ...body, unless_chosen: unlessChosen }),
+  })
+}
+
+export function coverReview(): Promise<CoverReview> {
+  return api<CoverReview>('/api/books/cover-review')
+}
+
+/** Look at the next batch of covers shelved before greyscale detection. */
+export function scanCoverReview(): Promise<CoverReview> {
+  return api<CoverReview>('/api/books/cover-review', { method: 'POST', headers: JSON_HEADERS, body: '{}' })
+}
+
+/** A colour match is worth offering: a greyscale cover nobody chose. */
+export function wantsColourCover(b: Pick<Book, 'cover_greyscale' | 'cover_choice' | 'has_color_cover'>): boolean {
+  return b.cover_greyscale === true && (b.cover_choice ?? 'none') === 'none' && !b.has_color_cover
+}
+
+/** Books shows "Find colour covers" when a loaded book wants one, or has a
+ * cover nobody has looked at yet (shelved before detection). */
+export function showColourPass(books: Book[]): boolean {
+  return books.some(
+    (b) =>
+      wantsColourCover(b) ||
+      (b.cover_greyscale === null && !!b.has_embedded_cover && (b.cover_choice ?? 'none') === 'none' && !b.has_color_cover),
+  )
+}
+
+/** The review rows "Accept all good matches" takes: a match, not skipped,
+ * not already settled. */
+export function goodMatches(rows: CoverReviewRow[], settled: Record<string, unknown>): CoverReviewRow[] {
+  return rows.filter((r) => r.best && !(r.book.id in settled))
+}
+
+/** Run `fn` over `items` one at a time (Open Library asks for gentle
+ * clients), stopping early when `stopped()` says so. */
+export async function oneAtATime<T>(items: T[], fn: (t: T) => Promise<void>, stopped: () => boolean = () => false): Promise<void> {
+  for (const t of items) {
+    if (stopped()) return
+    await fn(t)
+  }
 }
 
 /* ---------- upload ---------- */

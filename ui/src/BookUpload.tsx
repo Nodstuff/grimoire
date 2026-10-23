@@ -7,7 +7,8 @@
 // the Books page renders the same queue's pills.
 
 import { useRef, useState } from 'react'
-import { UploadResult } from './books'
+import { UploadResult, wantsColourCover } from './books'
+import { UploadColourOffer } from './ColourCovers'
 import { bookUploads, useBookUploads, type UploadJob } from './bookUploads'
 import { Button, Icon, Spinner } from './lapis'
 
@@ -132,6 +133,7 @@ function ResultPill({ r }: { r: UploadResult }) {
       )}
       <b>{r.filename}</b>
       <span>{text}</span>
+      {r.book && (r.status === 'added' || r.status === 'updated') && wantsColourCover(r.book) && <UploadColourOffer book={r.book} />}
     </li>
   )
 }
