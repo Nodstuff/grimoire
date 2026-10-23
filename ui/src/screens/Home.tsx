@@ -97,6 +97,7 @@ export default function Home({
   dataVersion,
   onDocsChanged,
   onOpenPalette,
+  onMenu,
 }: {
   docs: Doc[]
   workspaces: Workspace[]
@@ -107,6 +108,8 @@ export default function Home({
   onDocsChanged: () => void
   /** the phone's "Open or search…" field: the ⌘O palette */
   onOpenPalette: () => void
+  /** the phone's mark opens the menu drawer (Home has no top bar there) */
+  onMenu?: () => void
 }) {
   /* ---------- to-do ---------- */
   const todayTitle = localDateTitle()
@@ -254,7 +257,13 @@ export default function Home({
       {/* phone header (Mobile-Home) */}
       <header className="hm-phone-head hm-phone">
         <div className="hm-phone-top">
-          <LapisMark size={26} inset="var(--bg)" />
+          {onMenu ? (
+            <button type="button" className="hm-phone-menu" onClick={onMenu} aria-label="Menu">
+              <LapisMark size={26} inset="var(--bg)" />
+            </button>
+          ) : (
+            <LapisMark size={26} inset="var(--bg)" />
+          )}
           <span className="hm-date">{dateLine}</span>
           <Link to={{ kind: 'settings', section: 'profile' }} className="hm-phone-settings" aria-label="Settings">
             <Icon name="settings" size={20} />

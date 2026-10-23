@@ -793,6 +793,18 @@ a.hm-book {
     align-items: center;
     gap: 10px;
   }
+  .hm-phone-menu {
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    margin: -9px -9px -9px -9px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--r-md);
+    background: transparent;
+    cursor: pointer;
+  }
   .hm-phone-settings {
     margin-left: auto;
     width: 44px;
@@ -871,10 +883,13 @@ a.hm-book {
   .hm-todo-doc {
     display: none;
   }
-  /* the stage's 36px top pad sits under the phone's own top bar: Home's
-     date row starts closer (Mobile-Home) */
+  /* Mobile-Home has no top bar: the date row (mark = menu, Settings) is
+     the head, just under the status bar */
+  .lp-main:has(> .stage-home) > .lp-top {
+    display: none;
+  }
   .lp-main > .stage.stage-home {
-    padding-top: 12px;
+    padding-top: max(20px, env(safe-area-inset-top));
   }
   .hm-todo-note {
     margin-left: 50px;

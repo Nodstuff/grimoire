@@ -485,8 +485,16 @@ export default function App() {
         chain.unshift(cur)
         cur = cur.parent_id ? byId.get(cur.parent_id) : undefined
       }
+      // the workspace leads (canvas Doc: Work / Taisce / Architecture)
+      const wsOf = d.workspace_id ? workspaces.find((w) => w.id === d.workspace_id) : undefined
       return (
         <>
+          {wsOf && (
+            <span className="lp-crumb-step lp-crumb-ws">
+              <Link to={{ kind: 'library', workspace: wsOf.id }}>{wsOf.display_name || wsOf.name}</Link>
+              <span aria-hidden="true">/</span>
+            </span>
+          )}
           {chain.slice(0, -1).map((c) => (
             <span key={c.id} className="lp-crumb-step">
               <Link to={{ kind: 'doc', id: c.id }}>{c.title}</Link>
@@ -512,9 +520,15 @@ export default function App() {
       return (
         <>
           <span className="lp-crumb-step">
-            <Link to={{ kind: 'library', workspace: wsr }}>Library</Link>
+            <Link to={{ kind: 'library', workspace: null }}>Library</Link>
             <span aria-hidden="true">/</span>
           </span>
+          {wsr && (
+            <span className="lp-crumb-step lp-crumb-ws">
+              <Link to={{ kind: 'library', workspace: wsr }}>{workspaceSummary(wsr, workspaces, 0).name}</Link>
+              <span aria-hidden="true">/</span>
+            </span>
+          )}
           {chain.slice(0, -1).map((c) => (
             <span key={c.id} className="lp-crumb-step">
               <Link to={{ kind: 'library', workspace: wsr, folder: c.id }}>{c.title}</Link>
@@ -578,6 +592,7 @@ export default function App() {
               dataVersion={dataVersion}
               onDocsChanged={reloadDocs}
               onOpenPalette={() => setPalette('open')}
+              onMenu={() => setDrawerOpen(true)}
             />
           )}
         </div>
@@ -737,6 +752,7 @@ export default function App() {
           onNewDoc={() => togglePalette('newdoc')}
           onBack={goBack}
           onForward={goForward}
+          onDoc={route.kind === 'doc'}
         />
         <main id="main" className={`stage stage-${route.kind}`} tabIndex={-1} onClick={() => palette && setPalette(null)}>
           {screen}

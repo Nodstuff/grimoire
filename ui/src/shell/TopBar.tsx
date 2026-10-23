@@ -23,6 +23,7 @@ export default function TopBar({
   onNewDoc,
   onBack,
   onForward,
+  onDoc = false,
 }: {
   crumb: ReactNode
   /** desktop sidebar hidden, or phone (drawer): show the menu button */
@@ -34,6 +35,8 @@ export default function TopBar({
   onNewDoc: () => void
   onBack: () => void
   onForward: () => void
+  /** a doc is open: the phone's Actions button is the doc's More (Mobile-Doc) */
+  onDoc?: boolean
 }) {
   return (
     <header className="lp-top" data-tauri-drag-region>
@@ -54,7 +57,7 @@ export default function TopBar({
       <Button variant="ghost" size="sm" onClick={onActions} aria-label="Actions (⌘K)" className="lp-top-wide">
         Actions <Kbd>⌘K</Kbd>
       </Button>
-      <IconButton icon="actions" label="Actions" onClick={onActions} className="lp-top-phone" />
+      <IconButton icon={onDoc ? 'more' : 'actions'} label={onDoc ? 'More actions' : 'Actions'} onClick={onActions} className="lp-top-phone" />
       <Button size="sm" icon="capture" kbd="⌘⇧I" onClick={onCapture} className="lp-top-wide lp-top-capture">
         Capture
       </Button>
