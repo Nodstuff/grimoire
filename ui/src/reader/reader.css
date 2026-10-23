@@ -451,3 +451,9 @@
     animation: none;
   }
 }
+
+/* toasts (the "Synced from …" one) above the page, under the bar's height */
+.rd .lp-toasts {
+  z-index: 8;
+  top: 64px;
+}

@@ -253,6 +253,10 @@ gained (the client fetches them).
   styles for mermaid/the editor, `img-src 'self' data: blob: https:`, `connect-src 'self'`,
   `frame-ancestors 'none'`), `X-Frame-Options: DENY`, `Referrer-Policy: same-origin` and
   `nosniff`; the nonce'd passkey pages keep their own CSP. LOCAL mode is unchanged.
+  The web reader (2026-10-24) added the one frame the UI makes: `frame-src blob:`, with
+  `blob:` in `style-src` and `font-src`, because foliate-js renders each book section as a
+  `blob:` iframe document (which inherits this policy) with the book's CSS and fonts as
+  `blob:` URLs. `script-src` stays `'self'`, so a book's scripts never run.
   `img-src https:` is a trade-off: a remote image in a shared doc tells its host your IP (and
   when you opened the doc) — `Referrer-Policy` keeps the page URL from it, nothing hides the
   fetch itself.

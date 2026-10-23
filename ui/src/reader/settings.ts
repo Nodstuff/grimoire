@@ -89,7 +89,7 @@ export function bookCss(s: ReaderSettings, c: PaperColours, fontUrls: { normal: 
       ? `
     @font-face { font-family: 'Newsreader Variable'; font-style: normal; font-weight: 200 800; font-display: swap; src: url("${fontUrls.normal}") format('woff2-variations'); }
     @font-face { font-family: 'Newsreader Variable'; font-style: italic; font-weight: 200 800; font-display: swap; src: url("${fontUrls.italic}") format('woff2-variations'); }
-    html, body, p, li, blockquote, dd, dt, div, span, td, th { font-family: 'Newsreader Variable', Georgia, serif !important; }`
+    html, body, p, li, blockquote, dd, dt, div, span, td, th, h1, h2, h3, h4, h5, h6 { font-family: 'Newsreader Variable', Georgia, serif !important; }`
       : ''
   return `
     @namespace epub "http://www.idpf.org/2007/ops";
