@@ -57,6 +57,10 @@ pub struct Book {
     pub cover_choice_at: Option<i64>,
     /// When Open Library was last asked for this book's colour covers.
     pub color_lookup_at: Option<i64>,
+    /// The daemon's matcher version that made that lookup (None = before
+    /// versioning). A cached "none found" from an older matcher is stale:
+    /// newer rules may find what it missed.
+    pub color_lookup_matcher: Option<i64>,
 }
 
 impl Book {
@@ -246,7 +250,8 @@ pub struct KosyncProgress {
 
 const BOOK_COLS: &str = "id, user_id, title, author, series, series_index, book_identifier,
     original_filename, file_sha256, size, file_s3_key, cover_s3_key, added_at, updated_at, deleted_at,
-    cover_grey, isbns, color_cover_s3_key, cover_choice, cover_choice_by, cover_choice_at, color_lookup_at";
+    cover_grey, isbns, color_cover_s3_key, cover_choice, cover_choice_by, cover_choice_at, color_lookup_at,
+    color_lookup_matcher";
 
 const CANDIDATE_COLS: &str = "id, book_id, source, source_ref, rank, ext, width, height, colorfulness, created_at";
 
@@ -286,6 +291,7 @@ fn book_row(r: &Row) -> rusqlite::Result<Book> {
         cover_choice_by: r.get(19)?,
         cover_choice_at: r.get(20)?,
         color_lookup_at: r.get(21)?,
+        color_lookup_matcher: r.get(22)?,
     })
 }
 
@@ -678,8 +684,9 @@ impl SqliteStore {
     }
 
     /// Replace the candidates cached for one of the caller's live books
-    /// with a fresh lookup's (best first) and stamp `color_lookup_at`.
-    pub fn book_cover_candidates_replace(&mut self, id: Uuid, list: &[NewCoverCandidate], now: i64) -> Result<Vec<CoverCandidate>> {
+    /// with a fresh lookup's (best first) and stamp `color_lookup_at` and
+    /// the `matcher` version that made it.
+    pub fn book_cover_candidates_replace(&mut self, id: Uuid, list: &[NewCoverCandidate], now: i64, matcher: i64) -> Result<Vec<CoverCandidate>> {
         let book = self.book_get(id)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM book_cover_candidate WHERE book_id = ?1", params![id.to_string()])?;
@@ -704,7 +711,10 @@ impl SqliteStore {
                 ],
             )?;
         }
-        tx.execute("UPDATE book SET color_lookup_at = ?2 WHERE id = ?1", params![id.to_string(), now])?;
+        tx.execute(
+            "UPDATE book SET color_lookup_at = ?2, color_lookup_matcher = ?3 WHERE id = ?1",
+            params![id.to_string(), now, matcher],
+        )?;
         tx.commit()?;
         self.book_cover_candidates(id)
     }
@@ -1464,14 +1474,15 @@ mod tests {
             assert_eq!(titles(&s.book_list_cover_review(a, false, 10).unwrap()), ["Horus Rising"]);
             assert_eq!(titles(&s.book_list_cover_review(a, true, 10).unwrap()), ["Foundation"], "coverless books are never 'unscanned'");
 
-            let cs = s.book_cover_candidates_replace(grey.id, &[candidate("1"), candidate("2")], 20).unwrap();
+            let cs = s.book_cover_candidates_replace(grey.id, &[candidate("1"), candidate("2")], 20, 1).unwrap();
             assert_eq!(cs.iter().map(|c| (c.source_ref.as_str(), c.rank)).collect::<Vec<_>>(), [("1", 0), ("2", 1)]);
             assert!(cs[0].image.is_empty(), "the list carries no bytes");
             assert_eq!(s.book_cover_candidate(grey.id, cs[1].id).unwrap().image, b"jpeg-2");
             assert!(matches!(s.book_cover_candidate(unseen.id, cs[1].id), Err(StoreError::NotFound(_))), "another book's candidate");
-            assert_eq!(s.book_get(grey.id).unwrap().color_lookup_at, Some(20));
+            let g = s.book_get(grey.id).unwrap();
+            assert_eq!((g.color_lookup_at, g.color_lookup_matcher), (Some(20), Some(1)));
             // a fresh lookup replaces the cache
-            assert_eq!(s.book_cover_candidates_replace(grey.id, &[candidate("3")], 21).unwrap().len(), 1);
+            assert_eq!(s.book_cover_candidates_replace(grey.id, &[candidate("3")], 21, 1).unwrap().len(), 1);
             assert!(s.book_cover_candidate(grey.id, cs[0].id).is_err());
 
             // the person picks colour: shown everywhere, the review is done with it
@@ -1497,7 +1508,7 @@ mod tests {
         s.with_scope_for_test(Scope::User(b), |s| {
             assert!(matches!(s.book_set_cover_facts(grey.id, Some(false), None), Err(StoreError::NotFound(_))));
             assert!(matches!(s.book_choose_cover(grey.id, CoverPick::Embedded, false, "b", 40), Err(StoreError::NotFound(_))));
-            assert!(matches!(s.book_cover_candidates_replace(grey.id, &[candidate("x")], 40), Err(StoreError::NotFound(_))));
+            assert!(matches!(s.book_cover_candidates_replace(grey.id, &[candidate("x")], 40, 1), Err(StoreError::NotFound(_))));
             assert!(matches!(s.book_cover_candidates(grey.id), Err(StoreError::NotFound(_))));
             assert!(s.book_list_cover_review(a, false, 10).is_err());
             assert!(s.book_cover_review_counts(a).is_err());
@@ -1509,7 +1520,7 @@ mod tests {
         });
         // a soft delete drops the cache
         s.with_scope_for_test(Scope::User(a), |s| {
-            s.book_cover_candidates_replace(unseen.id, &[candidate("9")], 50).unwrap();
+            s.book_cover_candidates_replace(unseen.id, &[candidate("9")], 50, 1).unwrap();
             s.book_soft_delete(unseen.id, 51).unwrap();
         });
         let n: i64 = s.conn.query_row("SELECT count(*) FROM book_cover_candidate WHERE book_id = ?1", [unseen.id.to_string()], |r| r.get(0)).unwrap();
@@ -1530,7 +1541,7 @@ mod tests {
             let a = s.auth_ensure_owner(p, "Tom", 1).unwrap().id;
             let id = add_book(&mut s, a, &new_book("Dune", "Frank Herbert"), 10).id;
             // back to the v13 shape: drop every v14 column
-            for col in ["cover_grey", "isbns", "color_cover_s3_key", "cover_choice", "cover_choice_by", "cover_choice_at", "color_lookup_at"] {
+            for col in ["cover_grey", "isbns", "color_cover_s3_key", "cover_choice", "cover_choice_by", "cover_choice_at", "color_lookup_at", "color_lookup_matcher"] {
                 s.conn.execute(&format!("ALTER TABLE book DROP COLUMN {col}"), []).unwrap();
             }
             s.conn.execute("DROP TABLE book_cover_candidate", []).unwrap();
@@ -1539,9 +1550,9 @@ mod tests {
         };
         let mut s = SqliteStore::open(&path).unwrap();
         let b = s.book_get(id).unwrap();
-        assert_eq!((b.title.as_str(), b.cover_grey, b.isbns, b.cover_choice), ("Dune", None, None, CoverChoice::None));
+        assert_eq!((b.title.as_str(), b.cover_grey, b.isbns, b.cover_choice, b.color_lookup_matcher), ("Dune", None, None, CoverChoice::None, None));
         s.with_scope_for_test(Scope::User(a), |s| {
-            assert!(s.book_cover_candidates_replace(id, &[candidate("1")], 20).unwrap().len() == 1);
+            assert!(s.book_cover_candidates_replace(id, &[candidate("1")], 20, 1).unwrap().len() == 1);
         });
     }
 

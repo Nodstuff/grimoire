@@ -69,6 +69,8 @@ impl SqliteStore {
             ("cover_choice_by", "TEXT"),
             ("cover_choice_at", "INTEGER"),
             ("color_lookup_at", "INTEGER"),
+            // the matcher version of that lookup (NULL = before versioning)
+            ("color_lookup_matcher", "INTEGER"),
         ] {
             add_column_if_missing(&conn, "book", col, decl)?;
         }

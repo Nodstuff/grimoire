@@ -11,7 +11,9 @@
 //!   [`GREY_MAX`] the cover is greyscale. Ingest stores the verdict; the
 //!   cover review fills it in for books shelved before it existed.
 //! - Candidates come from Open Library only: the cover of each ISBN among
-//!   the OPF's identifiers, then a title and author search. The server
+//!   the OPF's identifiers, then title and author searches
+//!   ([`search_variants`]: as is, without series brackets, without a
+//!   subtitle, then the surname alone). The server
 //!   builds every URL itself, fetches only from Open Library's two hosts
 //!   (and the archive.org hosts their redirects lead to), validates each
 //!   image ([`validate_candidate`]) and caches the survivors in the store.
@@ -24,8 +26,10 @@
 //! connector writes, and none of this is an MCP tool):
 //!
 //! - `GET /api/books/{id}/cover-candidates` → the cached candidates
-//! - `POST /api/books/{id}/cover-candidates` `{refresh?}` → asks Open
-//!   Library (unless a lookup from the last 30 days is cached) and caches
+//! - `POST /api/books/{id}/cover-candidates` `{refresh?, title?, author?}`
+//!   → asks Open Library (unless a lookup from the last 30 days is cached;
+//!   a cached "none found" from an older [`MATCHER_VERSION`] is not) and
+//!   caches. `title` (+ `author`) searches with the person's own terms.
 //! - `GET /api/books/{id}/cover-candidates/{candidate}` → the image
 //! - `POST /api/books/{id}/cover` `{candidate} | {use: "embedded"}`,
 //!   `unless_chosen?` → the book
@@ -70,7 +74,16 @@ const MAX_FETCH_BYTES: usize = 4 * 1024 * 1024;
 /// Candidates offered per book.
 pub const MAX_CANDIDATES: usize = 4;
 /// Cover images fetched per lookup at most (some fail validation).
-const MAX_COVER_FETCHES: usize = 6;
+const MAX_COVER_FETCHES: usize = 8;
+/// Title searches per lookup at most ([`search_variants`]).
+const MAX_SEARCHES: usize = 4;
+/// The matching rules' version, stamped on every lookup. A cached "none
+/// found" from an older version is stale (newer rules may find what the
+/// old ones missed): the next find asks again. Bump it whenever the
+/// searches or the matching change.
+/// - 1: one search with the normalised title (unstamped rows)
+/// - 2: [`search_variants`] in turn; series-prefixed titles
+pub const MATCHER_VERSION: i64 = 2;
 /// ISBNs tried per lookup.
 const MAX_ISBNS: usize = 2;
 /// A lookup is cached this long; a person's "Find again" refreshes it.
@@ -267,18 +280,135 @@ fn norm_title(t: &str) -> String {
     words.join(" ")
 }
 
-/// The title to search Open Library with: the book's, without its series
-/// tag or subtitle.
-fn search_title(t: &str) -> String {
-    let n = norm_title(t);
-    if n.is_empty() { t.trim().to_string() } else { n }
+/// Words of a title fragment: lowercased letters and digits, nothing else.
+fn words(t: &str) -> Vec<String> {
+    t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect()
 }
 
-fn title_matches(book: &str, found: &str) -> bool {
+/// A title without its trailing parenthetical or bracketed groups, case
+/// kept: "Saturnine (The Horus Heresy: Siege of Terra Book 4)" →
+/// "Saturnine". The title itself when nothing would remain.
+fn strip_groups(t: &str) -> String {
+    let mut s = t.trim();
+    while let Some(close) = s.chars().last().filter(|c| matches!(c, ')' | ']')) {
+        let open = if close == ')' { '(' } else { '[' };
+        let mut depth = 0usize;
+        let mut cut = None;
+        for (i, c) in s.char_indices().rev() {
+            if c == close {
+                depth += 1;
+            } else if c == open {
+                depth -= 1;
+                if depth == 0 {
+                    cut = Some(i);
+                    break;
+                }
+            }
+        }
+        match cut {
+            Some(i) if !words(&s[..i]).is_empty() => s = s[..i].trim_end(),
+            _ => break,
+        }
+    }
+    s.to_string()
+}
+
+/// The text inside a title's trailing groups, as series words: the
+/// leading article and a trailing "Book 4" / "#4" / "Vol. 2" dropped
+/// ("Helsreach (Space Marine Battles)" → "space marine battles").
+fn series_words(t: &str) -> Vec<String> {
+    let t = t.trim();
+    let kept = strip_groups(t);
+    if kept.len() >= t.len() {
+        return Vec::new();
+    }
+    let mut w = words(&t[kept.len()..]);
+    while w.last().is_some_and(|x| x.chars().all(|c| c.is_ascii_digit()) || NUMBERING.contains(&x.as_str())) {
+        w.pop();
+    }
+    if matches!(w.first().map(String::as_str), Some("the" | "a" | "an")) && w.len() > 1 {
+        w.remove(0);
+    }
+    w
+}
+
+/// Words that number a book in a series ("Book 4", "nº 01/04", "Vol. 2").
+const NUMBERING: [&str; 11] = ["book", "books", "vol", "volume", "part", "no", "nº", "n", "number", "libro", "tomo"];
+
+/// The searches to try, in order, until one finds a matching cover: the
+/// title as it is; without its trailing series groups; without a
+/// subtitle after ':' (when a word remains); then the stripped title with
+/// the author's surname alone. Each keeps the author.
+pub fn search_variants(title: &str, author: &str) -> Vec<(String, String)> {
+    let full = title.trim().to_string();
+    let stripped = strip_groups(&full);
+    let short = stripped.split_once(':').map(|(head, _)| head.trim().to_string()).filter(|h| !words(h).is_empty());
+    let author = author.trim().to_string();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let push = |t: String, a: String, out: &mut Vec<(String, String)>| {
+        if !t.is_empty() && !out.iter().any(|(ot, oa)| ot.eq_ignore_ascii_case(&t) && oa.eq_ignore_ascii_case(&a)) {
+            out.push((t, a));
+        }
+    };
+    push(full, author.clone(), &mut out);
+    push(stripped.clone(), author.clone(), &mut out);
+    if let Some(short) = short {
+        push(short, author.clone(), &mut out);
+    }
+    if let Some(surname) = surname(&author).filter(|s| !s.eq_ignore_ascii_case(&author)) {
+        push(stripped, surname, &mut out);
+    }
+    out
+}
+
+/// The first author's surname: "Dan Abnett" and "Abnett, Dan" → "Abnett",
+/// "Aaron Dembski-Bowden & Graham McNeill" → "Dembski-Bowden".
+fn surname(author: &str) -> Option<String> {
+    let first = author.split([';', '&']).next()?.split(" and ").next()?.trim();
+    let s = match first.split_once(',') {
+        Some((last, _)) => last.trim(),
+        None => first.split_whitespace().last()?,
+    };
+    (!words(s).is_empty()).then(|| s.to_string())
+}
+
+/// How a search result's title matches the book's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleMatch {
+    /// the same title once both are normalised (series groups, subtitle,
+    /// a leading article dropped)
+    Exact,
+    /// Open Library's title is the book's series, a number and the title
+    /// ("Space Marine Battles nº 01/04 Helsreach" for "Helsreach (Space
+    /// Marine Battles)"): ranked after exact matches
+    SeriesPrefixed,
+}
+
+fn title_match(book: &str, found: &str) -> Option<TitleMatch> {
     // exact, after the normalising: a prefix would let "Foundation" take
     // "Foundation and Empire"'s cover
     let (a, b) = (norm_title(book), norm_title(found));
-    !a.is_empty() && a == b
+    if a.is_empty() {
+        return None;
+    }
+    if a == b {
+        return Some(TitleMatch::Exact);
+    }
+    // the series prefix: only the book's OWN series (from its brackets),
+    // then only numbering, then exactly the title
+    let series = series_words(book);
+    if series.is_empty() {
+        return None;
+    }
+    let fw = words(&strip_groups(found));
+    let rest = fw.strip_prefix(series.as_slice())?;
+    let skip = rest.iter().take_while(|w| w.chars().all(|c| c.is_ascii_digit()) || NUMBERING.contains(&w.as_str())).count();
+    (rest[skip..].join(" ") == a).then_some(TitleMatch::SeriesPrefixed)
+}
+
+#[cfg(test)]
+fn title_matches(book: &str, found: &str) -> bool {
+    title_match(book, found) == Some(TitleMatch::Exact)
 }
 
 /// The surname-ish last word of each name ("Abnett, Dan" and "Dan Abnett"
@@ -449,12 +579,13 @@ impl OpenLibrary {
         u
     }
 
-    /// The search: title and author, five results, only the fields used.
+    /// One search: title and author as given ([`search_variants`] makes
+    /// them), five results, only the fields used.
     pub fn search_url(title: &str, author: &str) -> Url {
         let mut u = Url::parse("https://openlibrary.org/search.json").unwrap();
         {
             let mut q = u.query_pairs_mut();
-            q.append_pair("title", &search_title(title));
+            q.append_pair("title", title.trim());
             if !author.trim().is_empty() {
                 q.append_pair("author", author.trim());
             }
@@ -465,32 +596,42 @@ impl OpenLibrary {
     }
 
     /// Up to [`MAX_CANDIDATES`] validated colour covers for a book, best
-    /// first: each ISBN's own cover (that edition), then the search's
-    /// matching results in Open Library's order. Duplicates (the same
-    /// bytes by two routes) are offered once. Requests run one at a time
-    /// per lookup and two across the daemon.
+    /// first: each ISBN's own cover (that edition), then search results
+    /// whose title and author match, in Open Library's order (exact title
+    /// matches before series-prefixed ones). The searches are
+    /// [`search_variants`], tried in order until one yields an exactly
+    /// matching cover. Duplicates (the same bytes by two routes) are
+    /// offered once. Requests run one at a time per lookup and two across
+    /// the daemon.
     pub async fn lookup(&self, title: &str, author: &str, isbns: &[String]) -> Lookup {
         let mut out: Vec<NewCoverCandidate> = Vec::new();
+        let mut weak: Vec<NewCoverCandidate> = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         let mut unavailable = false;
         let mut fetches = 0usize;
-        let mut offer = |bytes: Vec<u8>, source: &str, source_ref: String, out: &mut Vec<NewCoverCandidate>| {
+        let mut offer = |bytes: Vec<u8>, source: &str, source_ref: String, out: &mut Vec<NewCoverCandidate>| -> bool {
             use sha2::Digest as _;
             let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
             if !seen.insert(digest) {
-                return;
+                return false;
             }
             match validate_candidate(&bytes) {
-                Ok((a, ext)) => out.push(NewCoverCandidate {
-                    source: source.into(),
-                    source_ref,
-                    image: bytes,
-                    ext: ext.into(),
-                    width: a.width.into(),
-                    height: a.height.into(),
-                    colorfulness: a.colorfulness,
-                }),
-                Err(why) => tracing::debug!(source, "colour covers: candidate refused: {why}"),
+                Ok((a, ext)) => {
+                    out.push(NewCoverCandidate {
+                        source: source.into(),
+                        source_ref,
+                        image: bytes,
+                        ext: ext.into(),
+                        width: a.width.into(),
+                        height: a.height.into(),
+                        colorfulness: a.colorfulness,
+                    });
+                    true
+                }
+                Err(why) => {
+                    tracing::debug!(source, "colour covers: candidate refused: {why}");
+                    false
+                }
             }
         };
         for isbn in isbns.iter().take(MAX_ISBNS) {
@@ -499,7 +640,9 @@ impl OpenLibrary {
             }
             fetches += 1;
             match self.get(Self::isbn_cover_url(isbn)).await {
-                Ok(Some(bytes)) => offer(bytes, "isbn", isbn.clone(), &mut out),
+                Ok(Some(bytes)) => {
+                    offer(bytes, "isbn", isbn.clone(), &mut out);
+                }
                 Ok(None) => {}
                 Err(e) => {
                     tracing::info!("colour covers: {e}");
@@ -507,8 +650,12 @@ impl OpenLibrary {
                 }
             }
         }
-        if out.len() < MAX_CANDIDATES {
-            let docs = match self.get(Self::search_url(title, author)).await {
+        let mut covers_seen: HashSet<i64> = HashSet::new();
+        for (q_title, q_author) in search_variants(title, author).into_iter().take(MAX_SEARCHES) {
+            if out.len() + weak.len() >= MAX_CANDIDATES || fetches >= MAX_COVER_FETCHES {
+                break;
+            }
+            let docs = match self.get(Self::search_url(&q_title, &q_author)).await {
                 Ok(Some(body)) => match serde_json::from_slice::<SearchResponse>(&body) {
                     Ok(r) => r.docs,
                     Err(e) => {
@@ -524,21 +671,26 @@ impl OpenLibrary {
                     Vec::new()
                 }
             };
-            let mut covers_seen: HashSet<i64> = HashSet::new();
+            let mut found_exact = false;
             for d in docs {
-                if out.len() >= MAX_CANDIDATES || fetches >= MAX_COVER_FETCHES {
+                if out.len() + weak.len() >= MAX_CANDIDATES || fetches >= MAX_COVER_FETCHES {
                     break;
                 }
                 let Some(cover_i) = d.cover_i.filter(|c| *c > 0) else { continue };
-                if !d.title.as_deref().is_some_and(|t| title_matches(title, t)) || !author_matches(author, &d.author_name) {
-                    continue;
-                }
-                if !covers_seen.insert(cover_i) {
+                // matched against the book's own title and author, whatever
+                // the query was
+                let Some(how) = d.title.as_deref().and_then(|t| title_match(title, t)) else { continue };
+                if !author_matches(author, &d.author_name) || !covers_seen.insert(cover_i) {
                     continue;
                 }
                 fetches += 1;
                 match self.get(Self::id_cover_url(cover_i)).await {
-                    Ok(Some(bytes)) => offer(bytes, "search", cover_i.to_string(), &mut out),
+                    Ok(Some(bytes)) => {
+                        let into = if how == TitleMatch::Exact { &mut out } else { &mut weak };
+                        if offer(bytes, "search", cover_i.to_string(), into) && how == TitleMatch::Exact {
+                            found_exact = true;
+                        }
+                    }
                     Ok(None) => {}
                     Err(e) => {
                         tracing::info!("colour covers: {e}");
@@ -546,7 +698,12 @@ impl OpenLibrary {
                     }
                 }
             }
+            if found_exact {
+                break;
+            }
         }
+        out.extend(weak);
+        out.truncate(MAX_CANDIDATES);
         Lookup { candidates: out, unavailable }
     }
 }
@@ -603,6 +760,24 @@ pub(crate) struct FindReq {
     /// ask Open Library again even when a recent lookup is cached
     #[serde(default)]
     refresh: bool,
+    /// search with these terms instead of the book's own (the person's
+    /// "Search with a different title…"): always a fresh lookup, no ISBNs,
+    /// results matched against these terms. The server still builds every
+    /// URL itself.
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+/// Longest custom search term accepted.
+const MAX_TERM_CHARS: usize = 200;
+
+/// A lookup the cache can answer with: one was made, and either it found
+/// candidates or the current matcher made it (an older matcher's "none
+/// found" is stale).
+pub fn lookup_current(b: &Book, has_candidates: bool) -> bool {
+    b.color_lookup_at.is_some() && (has_candidates || b.color_lookup_matcher.unwrap_or(1) >= MATCHER_VERSION)
 }
 
 pub(crate) async fn candidates_find(State(st): State<LibraryState>, v: Viewer, Path(id): Path<Uuid>, body: axum::body::Bytes) -> Response {
@@ -629,22 +804,34 @@ pub(crate) async fn candidates_find(State(st): State<LibraryState>, v: Viewer, P
         Err(e) => return fail(e),
     };
     let now = crate::auth::now();
-    if !req.refresh && book.color_lookup_at.is_some_and(|at| now - at < LOOKUP_TTL) {
+    let custom = match custom_terms(&req) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let fresh = lookup_current(&book, !cached.is_empty()) && book.color_lookup_at.is_some_and(|at| now - at < LOOKUP_TTL);
+    if custom.is_none() && !req.refresh && fresh {
         return Json(candidates_json(&book, &cached, false)).into_response();
     }
-    let isbns = match &book.isbns {
-        Some(_) => book.isbn_list(),
-        None => read_isbns(&st, &v, &book).await,
+    let found = match &custom {
+        Some((title, author)) => st.covers.lookup(title, author, &[]).await,
+        None => {
+            let isbns = match &book.isbns {
+                Some(_) => book.isbn_list(),
+                None => read_isbns(&st, &v, &book).await,
+            };
+            st.covers.lookup(&book.title, &book.author, &isbns).await
+        }
     };
-    let found = st.covers.lookup(&book.title, &book.author, &isbns).await;
-    if found.unavailable && found.candidates.is_empty() {
+    if found.candidates.is_empty() && (found.unavailable || custom.is_some()) {
         // quietly: what was cached stays, nothing is stamped, a later
-        // find asks again
-        return Json(candidates_json(&book, &cached, true)).into_response();
+        // find asks again. A different title that found nothing answers
+        // nothing, and leaves the book's own lookup as it was.
+        let shown: &[CoverCandidate] = if custom.is_some() { &[] } else { &cached };
+        return Json(candidates_json(&book, shown, found.unavailable)).into_response();
     }
     let unavailable = found.unavailable;
     let stored = with_store(&st.store, v.scope, move |s| -> taisce_store::Result<_> {
-        let c = s.book_cover_candidates_replace(id, &found.candidates, now)?;
+        let c = s.book_cover_candidates_replace(id, &found.candidates, now, MATCHER_VERSION)?;
         Ok((s.book_get(id)?, c))
     })
     .await;
@@ -652,6 +839,26 @@ pub(crate) async fn candidates_find(State(st): State<LibraryState>, v: Viewer, P
         Ok((b, c)) => Json(candidates_json(&b, &c, unavailable)).into_response(),
         Err(e) => fail(e),
     }
+}
+
+/// The person's own search terms, trimmed (an empty author = none), or
+/// None for the book's; a 400 for an empty or over-long title.
+fn custom_terms(req: &FindReq) -> Result<Option<(String, String)>, Response> {
+    let Some(title) = req.title.as_deref() else {
+        if req.author.is_some() {
+            return Err(err(StatusCode::BAD_REQUEST, "a custom search needs a title"));
+        }
+        return Ok(None);
+    };
+    let clean = |t: &str| t.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().to_string();
+    let (title, author) = (clean(title), clean(req.author.as_deref().unwrap_or("")));
+    if words(&title).is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "a custom search needs a title"));
+    }
+    if title.chars().count() > MAX_TERM_CHARS || author.chars().count() > MAX_TERM_CHARS {
+        return Err(err(StatusCode::BAD_REQUEST, format!("search terms are at most {MAX_TERM_CHARS} characters")));
+    }
+    Ok(Some((title, author)))
 }
 
 /// A book shelved before ISBNs were kept: read them out of its EPUB (S3 →
@@ -828,7 +1035,7 @@ async fn review_json(st: &LibraryState, v: &Viewer, user: Uuid, scanned: Option<
                 "unscanned": unscanned,
                 "books": rows.iter().map(|(b, best)| json!({
                     "book": book_json(b),
-                    "looked_up": b.color_lookup_at.is_some(),
+                    "looked_up": lookup_current(b, best.is_some()),
                     "best": best.as_ref().map(|c| candidate_json(b.id, c)),
                 })).collect::<Vec<_>>(),
             });
@@ -988,7 +1195,54 @@ pub(crate) mod tests {
         assert!(author_matches("Dan Abnett", &["Abnett, Dan".into()]));
         assert!(!author_matches("Dan Abnett", &["Graham McNeill".into()]));
         assert!(author_matches("", &["Anyone".into()]), "no author to check");
-        assert_eq!(search_title("Horus Rising (The Horus Heresy Book 1)"), "horus rising");
+    }
+
+    /// Series brackets are stripped on BOTH sides; Open Library's own
+    /// series prefix counts only when it is the book's series.
+    #[test]
+    fn series_brackets_and_prefixes_match_only_the_books_own_series() {
+        assert_eq!(strip_groups("Saturnine (The Horus Heresy: Siege of Terra Book 4)"), "Saturnine");
+        assert_eq!(strip_groups("Red Tithe (Carcharodons Book 1) [Kindle]"), "Red Tithe");
+        assert_eq!(strip_groups("(Untitled)"), "(Untitled)", "nothing would remain");
+        assert_eq!(strip_groups("Night Lords: The Omnibus"), "Night Lords: The Omnibus");
+        assert!(title_matches("Red Tithe (Carcharodons Book 1)", "Red Tithe (Carcharodons)"));
+        assert!(title_matches("Red Tithe", "Red Tithe (Carcharodons)"));
+        assert!(title_matches("Betrayer (The Horus Heresy Book 24)", "Betrayer"));
+        assert!(title_matches("Saturnine (The Horus Heresy: Siege of Terra Book 4)", "Saturnine"));
+        assert!(!title_matches("Foundation (Foundation Book 1)", "Foundation and Empire (Foundation Book 2)"));
+        assert_eq!(series_words("Helsreach (Space Marine Battles)"), ["space", "marine", "battles"]);
+        assert_eq!(series_words("Betrayer (The Horus Heresy Book 24)"), ["horus", "heresy"]);
+        let h = "Helsreach (Space Marine Battles)";
+        assert_eq!(title_match(h, "Space Marine Battles nº 01/04 Helsreach"), Some(TitleMatch::SeriesPrefixed));
+        assert_eq!(title_match(h, "Space Marine Battles Helsreach"), Some(TitleMatch::SeriesPrefixed));
+        assert_eq!(title_match(h, "Helsreach"), Some(TitleMatch::Exact));
+        assert_eq!(title_match(h, "Space Marine Battles nº 02/04 Rynn's World"), None, "another book of the series");
+        assert_eq!(title_match(h, "Space Marine Battles nº 01/04 Helsreach and More"), None, "still exact after the prefix");
+        assert_eq!(title_match("Helsreach", "Space Marine Battles nº 01/04 Helsreach"), None, "no series of ours to strip");
+        assert_eq!(title_match("Helsreach (Black Library)", "Space Marine Battles Helsreach"), None, "not our series");
+    }
+
+    #[test]
+    fn searches_go_from_the_full_title_to_the_surname() {
+        let v = |t: &str, a: &str| search_variants(t, a).into_iter().map(|(t, a)| format!("{t} | {a}")).collect::<Vec<_>>();
+        assert_eq!(
+            v("Saturnine (The Horus Heresy: Siege of Terra Book 4)", "Dan Abnett"),
+            [
+                "Saturnine (The Horus Heresy: Siege of Terra Book 4) | Dan Abnett",
+                "Saturnine | Dan Abnett",
+                "Saturnine | Abnett",
+            ]
+        );
+        assert_eq!(
+            v("Night Lords: The Omnibus", "Aaron Dembski-Bowden"),
+            ["Night Lords: The Omnibus | Aaron Dembski-Bowden", "Night Lords | Aaron Dembski-Bowden", "Night Lords: The Omnibus | Dembski-Bowden"]
+        );
+        assert_eq!(v(": Omnibus", ""), [": Omnibus | "], "no subtitle cut leaves nothing; no author, no surname");
+        assert_eq!(v("Foundation", "Asimov"), ["Foundation | Asimov"], "duplicates once");
+        assert_eq!(surname("Abnett, Dan").as_deref(), Some("Abnett"));
+        assert_eq!(surname("Graham McNeill & Dan Abnett").as_deref(), Some("McNeill"));
+        assert_eq!(surname("Isaac Asimov and Robert Silverberg").as_deref(), Some("Asimov"));
+        assert_eq!(surname(""), None);
     }
 
     #[test]
@@ -996,8 +1250,8 @@ pub(crate) mod tests {
         assert_eq!(OpenLibrary::isbn_cover_url("9781849706186").as_str(), "https://covers.openlibrary.org/b/isbn/9781849706186-L.jpg?default=false");
         assert_eq!(OpenLibrary::id_cover_url(894713).as_str(), "https://covers.openlibrary.org/b/id/894713-L.jpg?default=false");
         assert_eq!(
-            OpenLibrary::search_url("Horus Rising (The Horus Heresy Book 1)", "Dan Abnett").as_str(),
-            "https://openlibrary.org/search.json?title=horus+rising&author=Dan+Abnett&limit=5&fields=key%2Ctitle%2Cauthor_name%2Ccover_i%2Cisbn%2Cfirst_publish_year"
+            OpenLibrary::search_url("Horus Rising ", "Dan Abnett").as_str(),
+            "https://openlibrary.org/search.json?title=Horus+Rising&author=Dan+Abnett&limit=5&fields=key%2Ctitle%2Cauthor_name%2Ccover_i%2Cisbn%2Cfirst_publish_year"
         );
         // a title cannot smuggle a path or a host
         let u = OpenLibrary::search_url("../../x?y=1#z", "a&b=c");
@@ -1080,5 +1334,156 @@ pub(crate) mod tests {
         // nothing anywhere (every URL a 404) is a real "none found"
         let got = ol.lookup("Nothing Like It", "Nobody", &["9780307749710".into()]).await;
         assert!(got.candidates.is_empty() && !got.unavailable);
+    }
+
+    fn docs(v: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({ "docs": v })).unwrap()
+    }
+
+    /// Tom's Warhammer 40k books, as Open Library answered them live: the
+    /// title with its series in brackets finds nothing (or a Spanish
+    /// edition), the bare title finds the book. Each comes through the
+    /// stripped search; the full one was asked first.
+    #[tokio::test]
+    async fn series_bracketed_titles_match_through_the_stripped_search() {
+        let cases: [(&str, &str, &str, Value, Vec<i64>); 4] = [
+            (
+                "Red Tithe (Carcharodons Book 1)",
+                "Robbie MacNiven",
+                "Red Tithe",
+                json!([{"title": "Red Tithe (Carcharodons)", "author_name": ["Robbie MacNiven"], "cover_i": 8446358}]),
+                vec![8446358],
+            ),
+            (
+                "Betrayer (The Horus Heresy Book 24)",
+                "Aaron Dembski-Bowden",
+                "Betrayer",
+                json!([
+                    {"title": "Betrayer", "author_name": ["Aaron Dembski-Bowden"], "cover_i": 14841144},
+                    {"title": "Betrayer", "author_name": ["Aaron Dembski-Bowden"], "cover_i": 10374176},
+                    {"title": "Legacies of Betrayal", "author_name": ["Graham McNeill", "Aaron Dembski-Bowden"], "cover_i": 99},
+                ]),
+                vec![14841144, 10374176],
+            ),
+            (
+                "Saturnine (The Horus Heresy: Siege of Terra Book 4)",
+                "Dan Abnett",
+                "Saturnine",
+                json!([
+                    {"title": "Saturnine", "author_name": ["Dan Abnett"], "cover_i": 10413534},
+                    {"title": "Saturnine", "author_name": ["Dan Abnett"]},
+                    {"title": "Saturnine", "author_name": ["Dan Abnett"], "cover_i": 14841168},
+                ]),
+                vec![10413534, 14841168],
+            ),
+            (
+                "Helsreach (Space Marine Battles)",
+                "Aaron Dembski-Bowden",
+                "Helsreach",
+                json!([
+                    {"title": "Helsreach", "author_name": ["Aaron Dembski-Bowden"], "cover_i": 7741218},
+                    {"title": "Helsreach", "author_name": ["Aaron Dembski-Bowden"], "cover_i": 9126586},
+                ]),
+                // the Spanish edition the full title found ranks last
+                vec![7741218, 9126586, 14120028],
+            ),
+        ];
+        for (title, author, stripped, found, want) in cases {
+            let ol = OpenLibrary::for_test();
+            let m = ol.mock.clone();
+            let full = if title.starts_with("Helsreach") {
+                json!([{"title": "Space Marine Battles nº 01/04 Helsreach", "author_name": ["Aaron Dembski-Bowden", "Vicky Charques"], "cover_i": 14120028}])
+            } else {
+                json!([])
+            };
+            m.answer(OpenLibrary::search_url(title, author).as_str(), 200, docs(full));
+            m.answer(OpenLibrary::search_url(stripped, author).as_str(), 200, docs(found));
+            for (i, id) in [8446358i64, 14841144, 10374176, 10413534, 14841168, 7741218, 9126586, 14120028, 99].into_iter().enumerate() {
+                m.answer(OpenLibrary::id_cover_url(id).as_str(), 200, jpeg(320 + i as u32, 500, true));
+            }
+            let got = ol.lookup(title, author, &[]).await;
+            assert!(!got.unavailable, "{title}");
+            let refs: Vec<i64> = got.candidates.iter().map(|c| c.source_ref.parse().unwrap()).collect();
+            assert_eq!(refs, want, "{title}");
+            let asked: Vec<String> = m.asked.lock().unwrap().iter().filter(|u| u.contains("search.json")).cloned().collect();
+            assert_eq!(
+                asked,
+                [OpenLibrary::search_url(title, author).to_string(), OpenLibrary::search_url(stripped, author).to_string()],
+                "{title}: the full title first, and the search stops at the first exact match"
+            );
+        }
+    }
+
+    /// Every variant is tried for Foundation, and none of them lets it take
+    /// Foundation and Empire's cover.
+    #[tokio::test]
+    async fn foundation_never_takes_foundation_and_empire() {
+        let ol = OpenLibrary::for_test();
+        let m = ol.mock.clone();
+        let other = docs(json!([{"title": "Foundation and Empire", "author_name": ["Isaac Asimov"], "cover_i": 5}]));
+        for (t, a) in search_variants("Foundation (Foundation Book 1)", "Isaac Asimov") {
+            m.answer(OpenLibrary::search_url(&t, &a).as_str(), 200, other.clone());
+        }
+        m.answer(OpenLibrary::id_cover_url(5).as_str(), 200, jpeg(330, 500, true));
+        let got = ol.lookup("Foundation (Foundation Book 1)", "Isaac Asimov", &[]).await;
+        assert!(got.candidates.is_empty() && !got.unavailable);
+        let asked = m.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 3, "full, stripped, surname: {asked:?}");
+        assert!(asked.iter().all(|u| u.contains("search.json")), "the other book's cover is never fetched: {asked:?}");
+        assert!(asked[2].contains("title=Foundation&author=Asimov"), "{asked:?}");
+    }
+
+    /// The surname-only search runs last, when everything else found nothing.
+    #[tokio::test]
+    async fn the_surname_alone_is_the_last_try() {
+        let ol = OpenLibrary::for_test();
+        let m = ol.mock.clone();
+        m.answer(
+            OpenLibrary::search_url("Helsreach", "Dembski-Bowden").as_str(),
+            200,
+            docs(json!([{"title": "Helsreach", "author_name": ["Aaron Dembski-Bowden"], "cover_i": 7}])),
+        );
+        m.answer(OpenLibrary::id_cover_url(7).as_str(), 200, jpeg(330, 500, true));
+        let got = ol.lookup("Helsreach (Space Marine Battles)", "Dembski-Bowden, Aaron", &[]).await;
+        assert_eq!(got.candidates.iter().map(|c| c.source_ref.as_str()).collect::<Vec<_>>(), ["7"]);
+    }
+
+    fn stamped(at: Option<i64>, matcher: Option<i64>) -> Book {
+        Book {
+            id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            title: "t".into(),
+            author: "a".into(),
+            series: None,
+            series_index: None,
+            book_identifier: None,
+            original_filename: "f.epub".into(),
+            file_sha256: "s".into(),
+            size: 1,
+            file_s3_key: "k".into(),
+            cover_s3_key: None,
+            added_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+            cover_grey: Some(true),
+            isbns: None,
+            color_cover_s3_key: None,
+            cover_choice: CoverChoice::None,
+            cover_choice_by: None,
+            cover_choice_at: None,
+            color_lookup_at: at,
+            color_lookup_matcher: matcher,
+        }
+    }
+
+    /// A miss cached by an older matcher is stale; one by this matcher, or
+    /// any lookup that found candidates, is current.
+    #[test]
+    fn an_older_matchers_miss_is_stale() {
+        assert!(!lookup_current(&stamped(None, None), false), "never looked up");
+        assert!(!lookup_current(&stamped(Some(1), None), false), "an unstamped (v1) miss");
+        assert!(!lookup_current(&stamped(Some(1), Some(MATCHER_VERSION - 1)), false));
+        assert!(lookup_current(&stamped(Some(1), Some(MATCHER_VERSION)), false));
+        assert!(lookup_current(&stamped(Some(1), None), true), "an old lookup's candidates still stand");
     }
 }

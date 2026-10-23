@@ -1148,6 +1148,7 @@ mod tests {
             cover_choice_by: None,
             cover_choice_at: None,
             color_lookup_at: None,
+            color_lookup_matcher: None,
         }
     }
 

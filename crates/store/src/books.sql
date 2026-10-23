@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS book (
     cover_choice_at   INTEGER,
     -- when Open Library was last asked for this book (the candidates cache)
     color_lookup_at   INTEGER,
+    -- the daemon's matcher version that made that lookup (NULL = before
+    -- versioning): a cached miss from an older matcher is stale
+    color_lookup_matcher INTEGER,
     added_at          INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
     -- soft delete: the row stays (its keys name the objects); the daemon

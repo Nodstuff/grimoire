@@ -2180,4 +2180,105 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
     }
 
+    /// A greyscale book with no ISBNs, for the colour-cover lookups.
+    fn grey_book(t: &TestLib, title: &str, author: &str) -> Uuid {
+        let id = Uuid::now_v7();
+        let mut s = t.store.lock(Scope::User(t.user));
+        s.book_insert(id, &NewBook {
+            title: title.into(),
+            author: author.into(),
+            series: None,
+            series_index: None,
+            book_identifier: None,
+            original_filename: "b.epub".into(),
+            file_sha256: format!("sha-{id}"),
+            size: 1,
+            file_s3_key: format!("library/{}/{id}.epub", t.user),
+            cover_s3_key: Some(format!("library/{}/{id}.cover.jpg", t.user)),
+        }, 10).unwrap();
+        s.book_set_cover_facts(id, Some(true), Some("")).unwrap();
+        id
+    }
+
+    /// A "none found" cached by the old matcher (before the series-bracket
+    /// searches) does not hide the book: the review says not looked up, the
+    /// next find asks Open Library again and stamps the current matcher;
+    /// that miss is then cached.
+    #[tokio::test]
+    async fn a_miss_cached_by_an_older_matcher_is_looked_up_again() {
+        let t = test_lib();
+        let id = grey_book(&t, "Red Tithe (Carcharodons Book 1)", "Robbie MacNiven");
+        let now = crate::auth::now();
+        t.store.lock(Scope::User(t.user)).book_cover_candidates_replace(id, &[], now - 60, 1).unwrap();
+        let (_, r) = t.send("GET", "/api/books/cover-review", None, vec![]).await;
+        assert_eq!(r["books"][0]["looked_up"], false, "{r}");
+        let ol = &t.covers.mock;
+        ol.answer(
+            crate::covers::OpenLibrary::search_url("Red Tithe", "Robbie MacNiven").as_str(),
+            200,
+            br#"{"docs":[{"title":"Red Tithe (Carcharodons)","author_name":["Robbie MacNiven"],"cover_i":8446358}]}"#.to_vec(),
+        );
+        ol.answer(crate::covers::OpenLibrary::id_cover_url(8446358).as_str(), 200, crate::covers::tests::jpeg(326, 500, true));
+        let (st, c) = t.send("POST", &format!("/api/books/{id}/cover-candidates"), None, vec![]).await;
+        assert_eq!(st, StatusCode::OK, "{c}");
+        assert_eq!(c["candidates"].as_array().map(Vec::len), Some(1), "the stale miss was asked again: {c}");
+        let b = t.store.lock(Scope::User(t.user)).book_get(id).unwrap();
+        assert_eq!(b.color_lookup_matcher, Some(crate::covers::MATCHER_VERSION));
+        let (_, r) = t.send("GET", "/api/books/cover-review", None, vec![]).await;
+        assert_eq!((r["books"][0]["looked_up"].as_bool(), r["books"][0]["best"].is_object()), (Some(true), true), "{r}");
+
+        // a miss by the current matcher is a cached miss: nothing asked
+        let other = grey_book(&t, "Nothing Like It", "Nobody");
+        let (_, c) = t.send("POST", &format!("/api/books/{other}/cover-candidates"), None, vec![]).await;
+        assert_eq!(c["candidates"].as_array().map(Vec::len), Some(0), "{c}");
+        let asked = ol.asked.lock().unwrap().len();
+        let (_, c) = t.send("POST", &format!("/api/books/{other}/cover-candidates"), None, vec![]).await;
+        assert!(c["looked_up_at"].is_string(), "{c}");
+        assert_eq!(ol.asked.lock().unwrap().len(), asked, "cached");
+    }
+
+    /// "Search with a different title…": the person's terms, the server's
+    /// URL. Always asked (never the cache), no ISBNs, matched against the
+    /// terms; a miss leaves the book's own cache alone; a bad title is 400.
+    #[tokio::test]
+    async fn a_custom_title_search_uses_the_persons_terms() {
+        let t = test_lib();
+        let id = grey_book(&t, "Night Lords: The Omnibus", "Aaron Dembski-Bowden");
+        let ol = &t.covers.mock;
+        let (_, c) = t.send("POST", &format!("/api/books/{id}/cover-candidates"), None, vec![]).await;
+        assert_eq!(c["candidates"].as_array().map(Vec::len), Some(0), "{c}");
+        let stamped = t.store.lock(Scope::User(t.user)).book_get(id).unwrap().color_lookup_at;
+        assert!(stamped.is_some());
+
+        ol.answer(
+            crate::covers::OpenLibrary::search_url("Soul Hunter", "Aaron Dembski-Bowden").as_str(),
+            200,
+            br#"{"docs":[{"title":"Soul Hunter","author_name":["Aaron Dembski-Bowden"],"cover_i":42},{"title":"Night Lords","author_name":["Aaron Dembski-Bowden"],"cover_i":43}]}"#.to_vec(),
+        );
+        ol.answer(crate::covers::OpenLibrary::id_cover_url(42).as_str(), 200, crate::covers::tests::jpeg(330, 500, true));
+        ol.answer(crate::covers::OpenLibrary::id_cover_url(43).as_str(), 200, crate::covers::tests::jpeg(331, 500, true));
+        ol.asked.lock().unwrap().clear();
+        let body = br#"{"title":"  Soul Hunter ","author":"Aaron Dembski-Bowden"}"#.to_vec();
+        let (st, c) = t.send("POST", &format!("/api/books/{id}/cover-candidates"), Some("application/json"), body).await;
+        assert_eq!(st, StatusCode::OK, "{c}");
+        assert_eq!(c["candidates"].as_array().map(Vec::len), Some(1), "matched against the person's title only: {c}");
+        let asked = ol.asked.lock().unwrap().clone();
+        assert_eq!(asked[0], crate::covers::OpenLibrary::search_url("Soul Hunter", "Aaron Dembski-Bowden").as_str());
+        assert!(asked.iter().all(|u| !u.contains("/b/isbn/") && (u.starts_with("https://openlibrary.org/") || u.starts_with("https://covers.openlibrary.org/"))), "{asked:?}");
+        let cid = c["candidates"][0]["id"].as_str().unwrap().to_string();
+
+        // a custom search that finds nothing answers nothing and keeps the cache
+        let (st, c) = t.send("POST", &format!("/api/books/{id}/cover-candidates"), Some("application/json"), br#"{"title":"No Such Book"}"#.to_vec()).await;
+        assert_eq!((st, c["candidates"].as_array().map(Vec::len)), (StatusCode::OK, Some(0)), "{c}");
+        let (_, c) = t.send("GET", &format!("/api/books/{id}/cover-candidates"), None, vec![]).await;
+        assert_eq!(c["candidates"][0]["id"].as_str(), Some(cid.as_str()), "{c}");
+        // the person's search asked for that title only, author-free
+        assert!(ol.asked.lock().unwrap().iter().any(|u| u.contains("title=No+Such+Book&limit=5")));
+
+        for bad in [r#"{"title":"  "}"#, r#"{"author":"Someone"}"#, &format!(r#"{{"title":"{}"}}"#, "x".repeat(201))] {
+            let (st, _) = t.send("POST", &format!("/api/books/{id}/cover-candidates"), Some("application/json"), bad.as_bytes().to_vec()).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}");
+        }
+    }
+
 }
