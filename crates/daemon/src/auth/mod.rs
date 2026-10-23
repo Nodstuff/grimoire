@@ -329,13 +329,17 @@ pub struct Authenticated {
 /// Paths reachable with no token: discovery, the OAuth endpoints, the
 /// login/enroll pages, the health check, and share links (`/s/…`: the
 /// link's token is the credential; `shares.rs` reads only the share tables,
-/// rate-limited per IP).
+/// rate-limited per IP). `/kosync/…` is here because of its PUT: a device
+/// syncs progress with its own x-auth headers (kosync.rs), and a Bearer
+/// challenge would only confuse it. (`/opds` needs no row: it is GET-only,
+/// and `needs_token` already lets GETs through to opds.rs's own basic auth.)
 fn is_public(path: &str) -> bool {
     path == "/healthz"
         || path.starts_with("/.well-known/")
         || path.starts_with("/oauth/")
         || path.starts_with("/auth/")
         || path.starts_with("/s/")
+        || path.starts_with("/kosync/")
 }
 
 fn under(path: &str, prefix: &str) -> bool {

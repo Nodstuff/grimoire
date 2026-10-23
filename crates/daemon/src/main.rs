@@ -17,14 +17,18 @@ mod filer;
 mod garden;
 mod home;
 mod inbox;
+mod kosync;
+mod library;
 mod living;
 mod local_guard;
 mod legacy;
 mod mcp;
 mod memory;
 mod nav;
+mod opds;
 mod push;
 mod retrieval;
+mod s3sign;
 mod share_render;
 mod shares;
 mod store_ext;
@@ -1051,10 +1055,47 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                     }),
                 },
             };
+            // the EPUB library (ADR 0006): /api/books CRUD + ingest, the
+            // OPDS catalog and KOSYNC progress sync. Object storage comes
+            // from the environment (configured exactly like APNs); a bad
+            // config is logged and the whole surface 404s, never fatal.
+            let s3 = match s3sign::S3Config::from_env().await {
+                Ok(c) => c.map(Arc::new),
+                Err(e) => {
+                    tracing::error!("EPUB library object storage disabled: {e:#}");
+                    None
+                }
+            };
+            let library_state = library::LibraryState {
+                store: store.clone(),
+                s3,
+                server_mode,
+                local_human: tom,
+                // upload spools live beside the db: the box's one disk, in
+                // the daemon's own permission domain (swept on every upload)
+                spool_dir: db_dir.join("book-spool"),
+            };
+            let opds_state = opds::OpdsState {
+                store: store.clone(),
+                server: auth_state.as_ref().map(|st| opds::OpdsServer {
+                    cfg: st.cfg.clone(),
+                    limiter: st.limiter.clone(),
+                }),
+                local_human: tom,
+                library: library_state.clone(),
+            };
+            let kosync_state = kosync::KosyncState {
+                store: store.clone(),
+                server: auth_state.as_ref().map(|_| kosync::ServerSide),
+                local_human: tom,
+            };
             let app = mcp::router_with_hosts(store.clone(), claude, dedupe.clone(), embedder.clone(), mcp_hosts)
                 .merge(admin::router(store.clone(), admin_token, server_mode))
                 .merge(push::router(push::DevicesState { store: store.clone(), default_env }))
                 .merge(shares::router(shares_state))
+                .merge(library::router(library_state))
+                .merge(opds::router(opds_state))
+                .merge(kosync::router(kosync_state))
                 .merge(api::router(api::ApiState {
                     changes: feed,
                     store,

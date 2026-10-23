@@ -137,6 +137,23 @@ impl S3Config {
         &self.http
     }
 
+    /// Tests: a dummy bucket with fixed credentials. Presigning is pure
+    /// computation, so every 302 path runs offline; only an actual PUT or
+    /// stream-through would touch the network (tests never do one).
+    #[cfg(test)]
+    pub(crate) fn for_test() -> S3Config {
+        S3Config {
+            bucket: "test-library".into(),
+            region: "us-east-1".into(),
+            creds: Creds::Fixed(Credentials {
+                access_key: "AKIATEST".into(),
+                secret_key: "testsecret".into(),
+                session_token: None,
+            }),
+            http: reqwest::Client::new(),
+        }
+    }
+
     /// The current credentials, refreshing the instance-profile cache when
     /// it is near expiry. A failed refresh is a hard error: signing with
     /// stale creds would mint URLs that only fail later, at the ereader.

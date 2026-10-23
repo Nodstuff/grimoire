@@ -290,6 +290,21 @@ impl SqliteStore {
         self.book_get(id)
     }
 
+    /// Re-key one of the caller's live books to a freshly uploaded file:
+    /// the hash, size and original filename follow the new bytes (the s3
+    /// key stays — the object was replaced in place under bucket
+    /// versioning), and `updated_at` moves. Without this a re-upload left
+    /// the row pointing at the FIRST file's hash, so the dedup (rule (a),
+    /// `book_find_by_sha256`) never matched the new bytes again.
+    pub fn book_replace_file(&mut self, id: Uuid, sha256: &str, size: i64, original_filename: &str, now: i64) -> Result<Book> {
+        self.book_get(id)?;
+        self.conn.execute(
+            "UPDATE book SET file_sha256 = ?2, size = ?3, original_filename = ?4, updated_at = ?5 WHERE id = ?1",
+            params![id.to_string(), sha256, size, original_filename, now],
+        )?;
+        self.book_get(id)
+    }
+
     /// Soft-delete one of the caller's live books: the row (and its s3
     /// keys) stays until the object-storage sweep; every read stops
     /// seeing it now.
@@ -641,6 +656,34 @@ mod tests {
     }
 
     #[test]
+    fn book_replace_file_rekeys_the_row() {
+        let (mut s, a, b) = store_with_users();
+        let dune = add_book(&mut s, a, &new_book("Dune", "Frank Herbert"), 10);
+        s.with_scope_for_test(Scope::User(a), |s| {
+            let b2 = s.book_replace_file(dune.id, "sha256:dune-v2", 8192, "Dune (revised).epub", 20).unwrap();
+            assert_eq!(
+                (b2.file_sha256.as_str(), b2.size, b2.original_filename.as_str(), b2.updated_at, b2.added_at),
+                ("sha256:dune-v2", 8192, "Dune (revised).epub", 20, 10)
+            );
+            // the dedup now matches the NEW bytes; the old hash finds nothing
+            assert_eq!(s.book_find_by_sha256(a, "sha256:dune-v2").unwrap().unwrap().id, dune.id);
+            assert!(s.book_find_by_sha256(a, "sha256:Dune").unwrap().is_none());
+        });
+        // another person's book is NotFound; System may still re-key it
+        s.with_scope_for_test(Scope::User(b), |s| {
+            assert!(matches!(s.book_replace_file(dune.id, "x", 1, "x.epub", 30), Err(StoreError::NotFound(_))));
+        });
+        let b3 = s.book_replace_file(dune.id, "sha256:dune-v3", 9000, "Dune v3.epub", 40).unwrap();
+        assert_eq!(b3.file_sha256, "sha256:dune-v3");
+        // a soft-deleted book cannot be re-keyed
+        s.with_scope_for_test(Scope::User(a), |s| s.book_soft_delete(dune.id, 50).unwrap());
+        assert!(matches!(
+            s.book_replace_file(dune.id, "x", 1, "x.epub", 60),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
     fn books_identity_finds() {
         let (mut s, a, b) = store_with_users();
         let mut dune = new_book("Dune", "Frank Herbert");
@@ -677,6 +720,7 @@ mod tests {
         s.with_scope_for_test(Scope::User(b), |s| {
             assert!(matches!(s.book_get(dune.id), Err(StoreError::NotFound(_))));
             assert!(matches!(s.book_update_metadata(dune.id, "x", "y", None, None, 20), Err(StoreError::NotFound(_))));
+            assert!(matches!(s.book_replace_file(dune.id, "x", 1, "x.epub", 20), Err(StoreError::NotFound(_))));
             assert!(matches!(s.book_soft_delete(dune.id, 20), Err(StoreError::NotFound(_))));
             assert!(matches!(s.book_set_cover(dune.id, "k", 20), Err(StoreError::NotFound(_))));
             assert!(matches!(s.ereader_get(kindle.id), Err(StoreError::NotFound(_))));
@@ -698,6 +742,7 @@ mod tests {
             assert!(s.book_list(a, &BookPage::default(), 10, None).is_err());
             assert!(s.book_insert(Uuid::now_v7(), &new_book("x", "y"), 1).is_err());
             assert!(s.book_update_metadata(dune.id, "x", "y", None, None, 1).is_err());
+            assert!(s.book_replace_file(dune.id, "x", 1, "x.epub", 1).is_err());
             assert!(s.book_soft_delete(dune.id, 1).is_err());
             assert!(s.book_set_cover(dune.id, "k", 1).is_err());
             assert!(s.book_find_by_sha256(a, "sha256:Dune").is_err());

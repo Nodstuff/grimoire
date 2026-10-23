@@ -683,7 +683,7 @@ async fn add_book(
         file_s3_key: file_key,
         cover_s3_key: cover_key,
     };
-    let written = with_store(&st.store, Scope::User(user), move |s| {
+    let written = with_store(&st.store, Scope::User(user), move |s| -> taisce_store::Result<Added> {
         // a concurrent upload of the same file may have landed while S3 was
         // being written: converge on the winner instead of double-shelving
         // (the loser's object sits at an unreferenced key; bucket lifecycle
@@ -703,15 +703,9 @@ async fn add_book(
 
 /// Rules (b)/(c): the same book, new bytes. The object is replaced at the
 /// SAME key (bucket versioning keeps the previous one for the 30-day
-/// undo) and the row's metadata follows the new file.
-///
-/// NOTE: the store has no update-for-new-file method, so the row's
-/// file_sha256/size/original_filename still describe the FIRST upload
-/// (`book_update_metadata` refreshes metadata + updated_at only). Until
-/// the store grows e.g. `book_replace_file(id, sha, size, filename, now)`,
-/// a re-upload of these same new bytes matches rule (b)/(c) again instead
-/// of (a), and BookJson.size reads stale. Flagged in the agent report;
-/// the store crate is deliberately untouched.
+/// undo) and the row's metadata follows the new file — including the hash
+/// and size (`book_replace_file`), so a later re-upload of these same
+/// bytes dedups by rule (a) instead of matching (b)/(c) forever.
 async fn update_book(
     st: &LibraryState,
     s3: &Arc<S3Config>,
@@ -744,7 +738,10 @@ async fn update_book(
         }
     };
     let now = crate::auth::now();
-    let written = with_store(&st.store, Scope::User(user), move |s| {
+    let sha = inspected.sha256.clone();
+    let size = inspected.size as i64;
+    let original_filename = filename.to_string();
+    let written = with_store(&st.store, Scope::User(user), move |s| -> taisce_store::Result<Book> {
         let b = s.book_update_metadata(
             existing.id,
             &inspected.title,
@@ -753,6 +750,7 @@ async fn update_book(
             inspected.series_index,
             now,
         )?;
+        let b = s.book_replace_file(b.id, &sha, size, &original_filename, now)?;
         // a re-upload with no embedded cover keeps the old one; a cover
         // under a new extension orphans the old object (lifecycle sweeps)
         let b = match &cover_key {
@@ -904,7 +902,10 @@ fn attr(
     e.try_get_attribute(name)
         .ok()
         .flatten()
-        .and_then(|a| a.decode_and_unescape_value(decoder).ok())
+        .and_then(|a| {
+            // the deprecated helper desugars to exactly this call
+            a.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder).ok()
+        })
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
 }
@@ -1313,6 +1314,32 @@ async fn resolve_book(
     .map_err(fail)
 }
 
+/// The web UI's own cover route (`coverUrl` in ui/src/books.ts): the
+/// person's Viewer scopes the book (someone else's is 404), then the same
+/// presigned 302 an ereader gets. No `stream_downloads` here — a browser
+/// follows the redirect like any image.
+async fn person_cover(
+    State(st): State<LibraryState>,
+    v: Viewer,
+    Path(id): Path<Uuid>,
+    method: Method,
+) -> Response {
+    let Some(s3) = st.s3.clone() else {
+        return not_found();
+    };
+    if v.user.is_none() {
+        return not_found();
+    }
+    let book = match with_store(&st.store, v.scope, move |s| s.book_get(id)).await {
+        Ok(b) => b,
+        Err(e) => return fail(e),
+    };
+    let Some(key) = book.cover_s3_key else {
+        return not_found();
+    };
+    redirect_object(&s3, &key, &method, None).await
+}
+
 fn s3_unavailable(e: anyhow::Error) -> Response {
     tracing::warn!("library: object storage: {e:#}");
     err(StatusCode::BAD_GATEWAY, "object storage is unavailable")
@@ -1428,6 +1455,7 @@ pub fn router(state: LibraryState) -> Router {
             post(upload_books).layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
         )
         .route("/api/books/{id}", patch(patch_book).delete(delete_book))
+        .route("/api/books/{id}/cover", get(person_cover))
         // the library is a person's shelf, not a connector surface (ADR
         // 0004); this travels with the router wherever it is merged
         .layer(axum::middleware::from_fn(

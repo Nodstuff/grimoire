@@ -33,10 +33,12 @@
 //! - `GET /opds/authors` · `/opds/series` navigation feeds
 //! - `GET /opds/opensearch.xml` the OpenSearch description
 //!
-//! `/opds/book/{id}/file` and `/cover` are the download agent's routes: they
-//! mount beside these under the same `opds_auth` layer (their handlers read
-//! the [`OpdsClient`] extension), and every link the feeds emit keeps the
-//! form — basic or path — the client came in with.
+//! `/opds/book/{id}/file` and `/cover` (and the `{secret}` path forms) are
+//! the downloads: they sit in this router under the same `opds_auth` layer,
+//! read the resolved device from the [`OpdsClient`] extension, and hand the
+//! bytes to `library::book_file`/`book_cover` (a 302 to a presigned URL, or
+//! a stream-through for `stream_downloads` devices). Every link the feeds
+//! emit keeps the form — basic or path — the client came in with.
 
 use crate::auth::ratelimit::{Class, Limiter};
 use crate::auth::{AuthConfig, client_ip, hash_secret, now};
@@ -97,6 +99,10 @@ pub struct OpdsState {
     pub server: Option<OpdsServer>,
     /// LOCAL mode's human (for the Viewer of a LOCAL request).
     pub local_human: Uuid,
+    /// The download half: the same `LibraryState` the `/api/books` router
+    /// serves from. The feed's book/cover links resolve the device here
+    /// (opds_auth) and library::book_file/book_cover serve the bytes.
+    pub library: crate::library::LibraryState,
 }
 
 impl FromRequestParts<OpdsState> for Viewer {
@@ -831,6 +837,49 @@ async fn search_feed(State(st): State<OpdsState>, Extension(client): Extension<O
     .await
 }
 
+// ---- the download routes (opds resolves the device, library serves the
+// bytes — the contract in library.rs's "downloads" section) ----
+
+/// `GET|HEAD /opds/book/{id}/file`: the ereader was resolved by the
+/// `opds_auth` layer (its `stream_downloads` picks the transport).
+async fn book_file_dl(
+    State(st): State<OpdsState>,
+    Extension(client): Extension<OpdsClient>,
+    Path(id): Path<Uuid>,
+    method: axum::http::Method,
+) -> Response {
+    crate::library::book_file(&st.library, &client.ereader, id, &method).await
+}
+
+async fn book_cover_dl(
+    State(st): State<OpdsState>,
+    Extension(client): Extension<OpdsClient>,
+    Path(id): Path<Uuid>,
+    method: axum::http::Method,
+) -> Response {
+    crate::library::book_cover(&st.library, &client.ereader, id, &method).await
+}
+
+/// The path-form variants (the first segment is the device password, which
+/// the auth layer already resolved).
+async fn book_file_dl_s(
+    State(st): State<OpdsState>,
+    Extension(client): Extension<OpdsClient>,
+    Path((_, id)): Path<(String, Uuid)>,
+    method: axum::http::Method,
+) -> Response {
+    crate::library::book_file(&st.library, &client.ereader, id, &method).await
+}
+
+async fn book_cover_dl_s(
+    State(st): State<OpdsState>,
+    Extension(client): Extension<OpdsClient>,
+    Path((_, id)): Path<(String, Uuid)>,
+    method: axum::http::Method,
+) -> Response {
+    crate::library::book_cover(&st.library, &client.ereader, id, &method).await
+}
+
 pub fn router(state: OpdsState) -> Router {
     let owner = Router::new()
         .route("/api/ereaders", get(list_ereaders).post(create_ereader))
@@ -864,6 +913,13 @@ pub fn router(state: OpdsState) -> Router {
         .route("/opds/{secret}/series", get(series_feed))
         .route("/opds/{secret}/series/{name}", get(series_books_feed_s))
         .route("/opds/{secret}/search", get(search_feed))
+        // the downloads (`get` answers HEAD too; the handler signs a HEAD
+        // URL of its own): basic-auth form, then the path form. Static
+        // "book" wins over {secret}, which never has its shape anyway.
+        .route("/opds/book/{id}/file", get(book_file_dl))
+        .route("/opds/book/{id}/cover", get(book_cover_dl))
+        .route("/opds/{secret}/book/{id}/file", get(book_file_dl_s))
+        .route("/opds/{secret}/book/{id}/cover", get(book_cover_dl_s))
         .layer(axum::middleware::from_fn_with_state(state.clone(), opds_auth));
     Router::new().merge(owner).merge(feeds).with_state(state)
 }
