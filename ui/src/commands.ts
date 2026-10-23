@@ -21,6 +21,8 @@ export type CommandAction =
   | 'capture'
   | 'close'
   | 'share'
+  | 'books'
+  | 'ereaders'
 
 export interface CommandCtx {
   queueCount: number
@@ -54,6 +56,17 @@ export function buildCommands({ queueCount, signedIn, onSignOut, docId, inboxId,
     { id: 'runs', label: 'Gardeners', keys: '⌘G', run: () => onAction('runs') },
     { id: 'profile', label: 'Profile', hint: 'your name, version, diagnostics', run: () => onAction('profile') },
     { id: 'graph', label: 'Graph view', run: () => onAction('graph') },
+    { id: 'books', label: 'Books', hint: 'your EPUB library', run: () => onAction('books') },
+    {
+      id: 'add-books',
+      label: 'Add EPUBs…',
+      hint: 'upload files into the library',
+      run: () => {
+        onAction('close')
+        document.getElementById('book-upload-input')?.click()
+      },
+    },
+    { id: 'ereaders', label: 'E-readers', hint: 'devices that read from the library', run: () => onAction('ereaders') },
     { id: 'trash', label: 'Trash', hint: 'restore deleted docs', run: () => onAction('trash') },
     { id: 'tree', label: 'Toggle file tree', keys: '⌘T', run: () => onAction('tree') },
     {

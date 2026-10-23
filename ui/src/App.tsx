@@ -15,6 +15,9 @@ import { CAPTURE_EVENT, onShellEvent } from './tauri'
 import Home from './Home'
 import Capture from './Capture'
 import Omnibox from './Omnibox'
+import Books from './Books'
+import BookUpload from './BookUpload'
+import Ereaders from './Ereaders'
 import { buildCommands } from './commands'
 import SharePanel from './SharePanel'
 import { signOut, webSession } from './auth'
@@ -60,6 +63,8 @@ type View =
   | { kind: 'profile' }
   | { kind: 'trash' }
   | { kind: 'home' }
+  | { kind: 'books' }
+  | { kind: 'ereaders' }
 /** `omnibox` is the one search-and-command palette (⌘K / ⌘O / ⌘P / ⌘/ all
  * open it, in different modes — see `omniMode`). */
 type Palette = null | 'omnibox' | 'newdoc' | 'help' | 'capture'
@@ -340,6 +345,8 @@ export default function App() {
           if (a === 'profile') setView({ kind: 'profile' })
           if (a === 'trash') setView({ kind: 'trash' })
           if (a === 'home') setView({ kind: 'home' })
+          if (a === 'books') setView({ kind: 'books' })
+          if (a === 'ereaders') setView({ kind: 'ereaders' })
           if (a === 'tree') setTreeOpen((t) => !t)
           if (a === 'share') setDocPanel('share')
           if (a === 'capture' || a === 'newdoc') {
@@ -417,6 +424,7 @@ export default function App() {
                 onOpenDoc={openDoc}
                 dataVersion={dataVersion}
                 onDocsChanged={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
+                onOpenBooks={() => setView({ kind: 'books' })}
               />
             )}
           </div>
@@ -458,6 +466,8 @@ export default function App() {
             onChanged={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
           />
         )}
+        {view.kind === 'books' && <Books dataVersion={dataVersion} />}
+        {view.kind === 'ereaders' && <Ereaders dataVersion={dataVersion} />}
         {view.kind === 'graph' && (
           <Suspense fallback={<Loading />}>
             <GraphView onOpenDoc={openDoc} />
@@ -471,6 +481,9 @@ export default function App() {
         inputId="import-folder-input"
         onDone={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
       />
+      {/* the ⌘K "Add EPUBs…" command clicks this input; the Books view
+          reloads itself off the store-stamp poll once the daemon has them */}
+      <BookUpload hiddenButton inputId="book-upload-input" />
 
       {queueCount > 0 && view.kind !== 'review' && (
         <button className="queue-chip" onClick={() => setView({ kind: 'review' })}>

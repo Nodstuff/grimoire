@@ -4,7 +4,7 @@
  * consumed by main.tsx; the rest is parsed here once on boot and scrubbed the
  * same way so a reload does not re-open the doc. */
 
-export const TABS = ['home', 'review', 'runs', 'graph', 'profile', 'trash'] as const
+export const TABS = ['home', 'review', 'runs', 'graph', 'profile', 'trash', 'books', 'ereaders'] as const
 export type Tab = (typeof TABS)[number]
 
 export interface DeepLink {

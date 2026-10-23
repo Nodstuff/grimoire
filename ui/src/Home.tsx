@@ -1,9 +1,10 @@
 // The briefing home: what the stage shows when no doc is open (also ⌘W and
 // ⌘K → Home). A calm morning page, not a dashboard: the date, one muted
-// summary line, then three regions — To-do (the per-day list in the To-do
-// doc, todo.rs), Inbox (what quick capture left waiting, when anything is),
-// and Since you were here (gardener runs, remote edits, agent-made docs after
-// the last-visit stamp, as a compact timeline). Two columns from 1200px: To-do
+// summary line, then the regions — Currently reading (the EPUB shelf, when
+// anything is on it), To-do (the per-day list in the To-do doc, todo.rs),
+// Inbox (what quick capture left waiting, when anything is), and Since you
+// were here (gardener runs, remote edits, agent-made docs after the
+// last-visit stamp, as a compact timeline). Two columns from 1200px: To-do
 // and Inbox left, Since right. Review lives in the header chip, staleness in
 // the file tree. Every region loads on its own and stays quiet when its route
 // is missing on an older daemon.
@@ -18,6 +19,7 @@ import { DAILY_ROOT, clockOf, findDailyDoc, findDailyRoot, localDateTitle, since
 import { addDays, openItems, summaryLine, type TodoDay } from './todo'
 import { api, type Doc, type GardenerRun } from './types'
 import type { Gardener } from './Gardeners'
+import { coverUrl, currentlyReading, initialsOf, type ReadingBook } from './books'
 
 const COLLAPSED_KEY = 'grimoire.home.collapsed' // pre-rename key: kept so stored state survives
 
@@ -104,11 +106,14 @@ export default function Home({
   onOpenDoc,
   dataVersion,
   onDocsChanged,
+  onOpenBooks,
 }: {
   docs: Doc[]
   onOpenDoc: OpenDoc
   dataVersion: number
   onDocsChanged: () => void
+  /** jump to the Books view (the shelf's click target) */
+  onOpenBooks: () => void
 }) {
   const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsed)
   const toggle = useCallback((id: string) => {
@@ -159,6 +164,15 @@ export default function Home({
     api<InboxList>('/api/inbox')
       .then((r) => setInbox(r && Array.isArray(r.items) ? r : null))
       .catch(() => setInbox(null))
+  }, [dataVersion])
+
+  /* ---------- currently reading (the EPUB shelf; nothing when empty or on
+     a daemon without the books routes) ---------- */
+  const [reading, setReading] = useState<ReadingBook[] | null>(null)
+  useEffect(() => {
+    currentlyReading()
+      .then((r) => setReading(Array.isArray(r) ? r : null))
+      .catch(() => setReading(null))
   }, [dataVersion])
   // the gardener list is an admin route (token present in the app; without
   // it the kind badges and the file-now button are simply absent)
@@ -230,6 +244,42 @@ export default function Home({
           )}
         </div>
       </header>
+
+      {reading && reading.length > 0 && (
+        <Section
+          id="reading"
+          title="Currently reading"
+          count={reading.length}
+          meta={
+            <button className="home-link dim" onClick={onOpenBooks}>
+              all books →
+            </button>
+          }
+          collapsed={collapsed.has('reading')}
+          onToggle={toggle}
+        >
+          <div className="book-shelf">
+            {reading.map((b) => (
+              <button key={b.id} className="book" onClick={onOpenBooks} title={b.author ? `${b.title} — ${b.author}` : b.title}>
+                <span className="book-cover">
+                  {b.has_cover ? (
+                    <img loading="lazy" src={coverUrl(b.id)} alt="" />
+                  ) : (
+                    <span className="book-fallback">
+                      <span className="book-fallback-title">{b.title}</span>
+                      <span className="book-fallback-initials">{initialsOf(b.author ?? b.title)}</span>
+                    </span>
+                  )}
+                </span>
+                <span className="book-progress">
+                  <span style={{ width: `${Math.max(0, Math.min(100, b.percentage))}%` }} />
+                </span>
+                <span className="book-title">{b.title}</span>
+              </button>
+            ))}
+          </div>
+        </Section>
+      )}
 
       <div className="home-grid">
         <div className="home-col">
