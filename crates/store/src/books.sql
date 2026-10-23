@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS book (
     cover_s3_key      TEXT,
     added_at          INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
-    -- soft delete: the row stays until the object-storage sweep catches up
+    -- soft delete: the row stays (its keys name the objects); the daemon
+    -- deletes the objects at once, leaving S3 noncurrent versions that the
+    -- bucket lifecycle expires after 30 days
     deleted_at        INTEGER
 );
 CREATE INDEX IF NOT EXISTS book_by_user_added ON book (user_id, added_at, id);

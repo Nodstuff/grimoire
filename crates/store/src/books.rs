@@ -383,8 +383,8 @@ impl SqliteStore {
     }
 
     /// Soft-delete one of the caller's live books: the row (and its s3
-    /// keys) stays until the object-storage sweep; every read stops
-    /// seeing it now.
+    /// keys) stays, every read stops seeing it now. The daemon deletes the
+    /// objects (`library::delete_book`).
     pub fn book_soft_delete(&mut self, id: Uuid, now: i64) -> Result<()> {
         self.book_get(id)?;
         self.conn

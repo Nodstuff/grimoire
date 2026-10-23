@@ -319,17 +319,43 @@ async fn patch_book(
     }
 }
 
+/// DELETE: the row is soft-deleted (every read stops seeing it) and its
+/// objects get an S3 DeleteObject. On the versioned bucket that only adds a
+/// delete marker: the bytes become a noncurrent version, which the bucket
+/// lifecycle expires after 30 days — the undo window, recoverable by hand
+/// from the bucket (there is no restore route). A failed S3 delete is
+/// logged and the answer is still 204: the row is gone either way, and the
+/// object is unreachable through Taisce.
 async fn delete_book(State(st): State<LibraryState>, v: Viewer, Path(id): Path<Uuid>) -> Response {
-    if st.s3.is_none() {
+    let Some(s3) = st.s3.clone() else {
         return not_found();
-    }
-    match with_store(&st.store, v.scope, move |s| {
-        s.book_soft_delete(id, crate::auth::now())
+    };
+    let deleted = with_store(&st.store, v.scope, move |s| -> taisce_store::Result<Book> {
+        let b = s.book_get(id)?;
+        s.book_soft_delete(id, crate::auth::now())?;
+        Ok(b)
     })
-    .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    .await;
+    match deleted {
+        Ok(b) => {
+            for key in std::iter::once(&b.file_s3_key).chain(b.cover_s3_key.as_ref()) {
+                if let Err(e) = s3.delete_object(key).await {
+                    tracing::error!(book = %b.id, key = %key, "library: deleting a deleted book's object failed: {e:#}");
+                }
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => fail(e),
+    }
+}
+
+/// Best-effort removal of objects an ingest wrote but no row references (a
+/// failed cover after the EPUB landed, the loser of a concurrent upload).
+async fn discard_objects(s3: &S3Config, keys: &[&str]) {
+    for key in keys {
+        if let Err(e) = s3.delete_object(key).await {
+            tracing::error!(key = %key, "library: removing an unreferenced object failed: {e:#}");
+        }
     }
 }
 
@@ -665,6 +691,8 @@ async fn add_book(
     let cover_key = match upload_cover(s3, user, id, &inspected).await {
         Ok(k) => k,
         Err(e) => {
+            // the EPUB landed but no row will reference it
+            discard_objects(s3, &[&file_key]).await;
             return file_result(
                 filename,
                 "error",
@@ -684,24 +712,30 @@ async fn add_book(
         original_filename: filename.to_string(),
         file_sha256: inspected.sha256,
         size: inspected.size as i64,
-        file_s3_key: file_key,
-        cover_s3_key: cover_key,
+        file_s3_key: file_key.clone(),
+        cover_s3_key: cover_key.clone(),
     };
     let written = with_store(&st.store, Scope::User(user), move |s| -> taisce_store::Result<Added> {
         // a concurrent upload of the same file may have landed while S3 was
         // being written: converge on the winner instead of double-shelving
-        // (the loser's object sits at an unreferenced key; bucket lifecycle
-        // sweeps it)
+        // (the loser's objects, under its own id, are removed below)
         if let Some(b) = s.book_find_by_sha256(user, &sha)? {
             return Ok(Added::Existing(b));
         }
         Ok(Added::New(s.book_insert(id, &new_book, now)?))
     })
     .await;
+    let ours: Vec<&str> = std::iter::once(file_key.as_str()).chain(cover_key.as_deref()).collect();
     match written {
         Ok(Added::New(b)) => file_result(filename, "added", Some(&b), None),
-        Ok(Added::Existing(b)) => file_result(filename, "already_here", Some(&b), None),
-        Err(e) => file_result(filename, "error", None, Some(e.to_string())),
+        Ok(Added::Existing(b)) => {
+            discard_objects(s3, &ours).await;
+            file_result(filename, "already_here", Some(&b), None)
+        }
+        Err(e) => {
+            discard_objects(s3, &ours).await;
+            file_result(filename, "error", None, Some(e.to_string()))
+        }
     }
 }
 
@@ -748,10 +782,11 @@ async fn update_book(
     let sha = inspected.sha256.clone();
     let size = inspected.size as i64;
     let original_filename = filename.to_string();
+    // a cover under a new extension leaves the old object unreferenced
+    let stale_cover = existing.cover_s3_key.clone().filter(|old| cover_key.as_ref().is_some_and(|k| k != old));
     let written = with_store(&st.store, Scope::User(user), move |s| -> taisce_store::Result<Book> {
         let b = s.book_replace_file(existing.id, &sha, size, &original_filename, now)?;
-        // a re-upload with no embedded cover keeps the old one; a cover
-        // under a new extension orphans the old object (lifecycle sweeps)
+        // a re-upload with no embedded cover keeps the old one
         let b = match &cover_key {
             Some(k) => s.book_set_cover(b.id, k, now)?,
             None => b,
@@ -760,7 +795,12 @@ async fn update_book(
     })
     .await;
     match written {
-        Ok(b) => file_result(filename, "updated", Some(&b), None),
+        Ok(b) => {
+            if let Some(old) = &stale_cover {
+                discard_objects(s3, &[old]).await;
+            }
+            file_result(filename, "updated", Some(&b), None)
+        }
         Err(e) => file_result(filename, "error", None, Some(e.to_string())),
     }
 }
@@ -1820,6 +1860,33 @@ mod tests {
         assert_eq!(b.original_filename, "dune-v2.epub", "the file did move");
         assert!(b.cover_s3_key.is_some(), "and its new cover");
         assert_eq!(t.s3.memory.keys().len(), 2, "epub + cover: {:?}", t.s3.memory.keys());
+    }
+
+    /// DELETE soft-deletes the row and deletes both objects (a delete
+    /// marker on the versioned bucket: the 30-day undo window).
+    #[tokio::test]
+    async fn delete_removes_the_row_and_its_objects() {
+        let t = test_lib();
+        let v = t.upload(&[("dune.epub", epub_of("Dune", "Frank Herbert", "urn:isbn:1", "S", "v1", true))]).await;
+        let id = v["results"][0]["book"]["id"].as_str().unwrap().to_string();
+        assert_eq!(t.s3.memory.keys().len(), 2);
+        let (st, _) = t.send("DELETE", &format!("/api/books/{id}"), None, vec![]).await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        assert!(t.s3.memory.keys().is_empty(), "{:?}", t.s3.memory.keys());
+        assert_eq!(t.s3.memory.deleted.lock().unwrap().len(), 2);
+        let (st, _) = t.send("DELETE", &format!("/api/books/{id}"), None, vec![]).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "already gone");
+    }
+
+    /// A cover PUT that fails after the EPUB landed leaves nothing behind.
+    #[tokio::test]
+    async fn a_failed_cover_removes_the_epub_it_followed() {
+        let t = test_lib();
+        *t.s3.memory.fail_put_suffix.lock().unwrap() = Some(".jpg".into());
+        let v = t.upload(&[("dune.epub", epub_of("Dune", "Frank Herbert", "urn:isbn:1", "S", "v1", true))]).await;
+        assert_eq!(v["results"][0]["status"], "error", "{v}");
+        assert!(t.s3.memory.keys().is_empty(), "{:?}", t.s3.memory.keys());
+        assert!(t.store.lock(Scope::User(t.user)).book_list(t.user, &BookPage::default(), 10, None).unwrap().is_empty());
     }
 
     #[test]
