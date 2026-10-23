@@ -28,7 +28,7 @@ export default function LivingChip({ docId, dataVersion }: { docId: string; data
           .join(', ')} — the next sweep proposes a refreshed answer for review`
       : `${status.sources.length} cited block${status.sources.length === 1 ? '' : 's'} unchanged since the answer was written`
   return (
-    <span className={`chip living-chip living-${livingTone(status)}`} title={title}>
+    <span className={`lp-chip living-chip lp-chip-${livingTone(status) === 'stale' ? 'yellow' : 'green'}`} title={title}>
       {label}
     </span>
   )

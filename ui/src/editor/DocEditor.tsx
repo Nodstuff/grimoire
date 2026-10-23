@@ -10,7 +10,8 @@ import CodeBlock from '@tiptap/extension-code-block'
 import { TableKit } from '@tiptap/extension-table'
 import CodeBlockView from './CodeBlockView'
 import { WikilinkDeco } from './WikilinkDeco'
-import { ReviewHighlight, ReviewMap, setReviewMap } from './ReviewHighlight'
+import { CodeHighlight } from './CodeHighlight'
+import { ReviewHighlight, ReviewMap, ReviewExtras, setReviewMap } from './ReviewHighlight'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import { api, Block } from '../types'
 import { notify } from '../Notice'
@@ -19,6 +20,7 @@ import { BaselineBlock, Entry, HiddenBlock, computeOps } from './diff'
 import { debounce } from '../timing'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
 import { AfterSave, afterSave } from './savePlan'
+import './editor.css'
 
 /** transaction meta marking DocEditor's own post-save blockId stamping, so
  * onUpdate can tell it apart from a real edit. */
@@ -71,6 +73,7 @@ export function makeExtensions() {
     }),
     TableKit.configure({ table: { resizable: false } }),
     WikilinkDeco,
+    CodeHighlight,
     BlockId,
     ReviewHighlight,
   ]
@@ -90,12 +93,17 @@ export interface EditableDoc {
 }
 
 type SaveState = 'clean' | 'dirty' | 'saving'
+/** What DocView's save indicator shows: `failed` = dirty after a save error. */
+export type EditorSaveState = SaveState | 'failed'
 
 export default function DocEditor({
   doc,
   onSaved,
   onSelectionBlock,
   reviewMap,
+  reviewExtras,
+  editable = true,
+  onSaveState,
 }: {
   doc: EditableDoc
   /** `docId` names the doc the save landed on: the unmount flush can fire
@@ -104,10 +112,24 @@ export default function DocEditor({
   onSelectionBlock?: (blockId: string | null) => void
   /** blocks under review → tone; painted as node decorations, no remount */
   reviewMap?: ReviewMap
+  /** the verdict bars, inline diffs and comment bubbles that ride on the map */
+  reviewExtras?: ReviewExtras
+  /** false for a viewer of a shared workspace: no typing, no saves */
+  editable?: boolean
+  /** every save-state change, for the doc header's indicator */
+  onSaveState?: (s: EditorSaveState) => void
 }) {
   const selCb = useRef(onSelectionBlock)
   selCb.current = onSelectionBlock
   const [saveState, setSaveState] = useState<SaveState>('clean')
+  const [failed, setFailed] = useState(false)
+  const stateCb = useRef(onSaveState)
+  stateCb.current = onSaveState
+  useEffect(() => {
+    stateCb.current?.(saveState === 'dirty' && failed ? 'failed' : saveState)
+  }, [saveState, failed])
+  const editableRef = useRef(editable)
+  editableRef.current = editable
   // autosave debounce, driven by the editor's update event: every keystroke
   // re-arms it, so the save lands 1.2s after the LAST edit. (An effect keyed
   // on editor.state.doc did not re-arm — Tiptap 3 does not re-render per
@@ -135,7 +157,7 @@ export default function DocEditor({
   const editor = useEditor(
     {
       extensions,
-      editable: true,
+      editable,
       content: {
         type: 'doc',
         content: initial.nodes.map((n) => n.toJSON()),
@@ -166,14 +188,19 @@ export default function DocEditor({
   // review marks follow the map from DocView; an empty map clears them
   useEffect(() => {
     if (!editor || editor.isDestroyed) return
-    setReviewMap(editor, reviewMap ?? {})
-  }, [editor, reviewMap])
+    setReviewMap(editor, reviewMap ?? {}, reviewExtras ?? {})
+  }, [editor, reviewMap, reviewExtras])
+
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return
+    if (editor.isEditable !== editable) editor.setEditable(editable, false)
+  }, [editor, editable])
 
   // extract entries (grouping consecutive nodes that share a blockId)
   const extractEntries = (): Entry[] => (editor ? entriesOf(editor.state.doc) : [])
 
   const runSave = async () => {
-    if (!editor) return
+    if (!editor || !editableRef.current) return
     autosave.current.cancel()
     // what this save writes; edits landing while the request is in flight
     // make the doc differ from it, and the editor must stay dirty for them
@@ -224,6 +251,7 @@ export default function DocEditor({
       baselineRef.current = rebuildBaseline(baselineRef.current, entries, ops)
       epochRef.current = out.epoch
       lastSaveError.current = null
+      setFailed(false)
       // typed during the request? those keystrokes are not in what landed
       const plan = afterSave({ editedMeanwhile, mounted: mounted.current })
       lastPlan.current = plan
@@ -241,6 +269,7 @@ export default function DocEditor({
       // below keeps trying. Say so ONCE per distinct cause — a silent
       // failure here was how unsaved edits used to vanish.
       setSaveState('dirty')
+      setFailed(true)
       const msg = saveErrorText(e)
       if (lastSaveError.current !== msg) {
         lastSaveError.current = msg
@@ -301,7 +330,9 @@ export default function DocEditor({
   return (
     <>
       <EditorContent editor={editor} />
-      <span className={`save-state ${saveState}`}>
+      {/* App's deploy reload looks for `.save-state.dirty|saving` before it
+          reloads over unsaved work; the visible indicator is DocView's */}
+      <span className={`save-state ${saveState}`} hidden>
         {saveState === 'clean' ? 'saved' : saveState === 'dirty' ? 'unsaved' : 'saving…'}
       </span>
     </>

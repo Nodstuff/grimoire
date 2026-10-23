@@ -1,25 +1,100 @@
-// The doc view: title, the head chips, the editor, side panels (history,
-// comments, tend, share, review rail) and backlinks. Moved out of App.tsx
-// unchanged for the Lapis shell; stage 2 rebuilds it to the Doc artboard.
+// The doc view (Lapis Doc / Mobile-Doc artboards): the head (workspace,
+// status and tag pills, the Newsreader title, who wrote it), the editor, the
+// "Linked from" cards, and the inspector (Review / Comments / History /
+// Share) at the right. The save state and Share sit in the top bar (a portal
+// into the shell's slot). On a phone the inspector is a bottom sheet opened
+// from a dock that replaces the tab bar.
+//
+// The editor engine (DocEditor: Tiptap, autosave, collisions, markdown
+// shortcuts) is unchanged; this file is the chrome around it.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import DocEditor from '../editor/DocEditor'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
+import DocEditor, { parser, type EditorSaveState } from '../editor/DocEditor'
 import { splitTree } from '../editor/splitTree'
-import TendPanel from '../TendPanel'
 import LivingChip from '../LivingChip'
-import ReviewRail from '../ReviewRail'
-import SharePanel from '../SharePanel'
 import { notify, errText } from '../Notice'
-import { buildHighlightMap } from '../review'
+import { actionLabels, buildHighlightMap, targetBlockOf, toneOf } from '../review'
 import { api, Block, Doc, DocTree, HistoryRow, QueueRow, SearchHit } from '../types'
 import type { OpenDoc } from '../App'
+import { navigate } from '../router'
+import type { Workspace } from '../workspaces'
+import { keyBetween } from '../editor/diff'
+import type { ReviewDetail, ReviewExtras } from '../editor/ReviewHighlight'
+import { backlinkSnippet, contributors, frontmatterTags, STATUSES, statusTone, withTag } from '../editor/docMeta'
+import { Avatar, Button, CountPill, Icon, IconButton, StatusDot, isAgentName, useFocusTrap, type SaveState } from '../lapis'
+import { DocInspector, type InspectorTab, type Principal } from './DocInspector'
+import './docview.css'
 
-/** The doc side panels, owned by App so a doc switch does not close one. */
-export type Panel = 'none' | 'history' | 'comments' | 'tend' | 'review' | 'share'
+/** Which inspector tab a doc shows, owned by App so a doc switch keeps it.
+ * 'none' = automatic (open on a wide window, on Review when something
+ * waits, else Comments; closed on a narrow one); 'closed' = hidden by hand. */
+export type Panel = 'none' | 'closed' | InspectorTab
+
+type HistRow = HistoryRow & { principal_is_yours?: boolean }
+
+/* ---------- small hooks and caches ---------- */
+
+function useMedia(query: string): boolean {
+  const get = () => {
+    try {
+      return matchMedia(query).matches
+    } catch {
+      return false
+    }
+  }
+  const [m, setM] = useState(get)
+  useEffect(() => {
+    let mq: MediaQueryList
+    try {
+      mq = matchMedia(query)
+    } catch {
+      return
+    }
+    const on = () => setM(mq.matches)
+    on()
+    mq.addEventListener('change', on)
+    return () => mq.removeEventListener('change', on)
+  }, [query])
+  return m
+}
+
+interface PrincipalRow {
+  id: string
+  kind: string
+  display_name: string
+}
+let principalsP: Promise<Map<string, PrincipalRow>> | null = null
+function loadPrincipals(force = false) {
+  if (!principalsP || force) {
+    principalsP = api<PrincipalRow[]>('/api/principals')
+      .then((rows) => new Map((Array.isArray(rows) ? rows : []).map((p) => [p.id, p])))
+      .catch(() => {
+        principalsP = null
+        return new Map()
+      })
+  }
+  return principalsP
+}
+let meP: Promise<string | null> | null = null
+function loadMe() {
+  if (!meP)
+    meP = api<{ principal_id: string }>('/api/profile')
+      .then((p) => p.principal_id ?? null)
+      .catch(() => {
+        meP = null
+        return null
+      })
+  return meP
+}
+
+const SAVE_OF: Record<EditorSaveState, SaveState> = { clean: 'saved', dirty: 'unsaved', saving: 'saving', failed: 'failed' }
+
+/* ---------- the title ---------- */
 
 /** Click-to-rename doc title. The server rewrites inbound [[wikilinks]] to
  * the new title in docs the renamer can write (`rename_doc`). */
-function DocTitle({ doc, onRenamed }: { doc: Doc; onRenamed: () => void }) {
+function DocTitle({ doc, onRenamed, readOnly }: { doc: Doc; onRenamed: () => void; readOnly: boolean }) {
   const [editing, setEditing] = useState(false)
   const [value, setValue] = useState(doc.title)
   // Enter unmounts the input, whose blur fires save again: one rename only
@@ -51,18 +126,27 @@ function DocTitle({ doc, onRenamed }: { doc: Doc; onRenamed: () => void }) {
     onRenamed()
   }
 
+  if (readOnly) return <h1 className="dv-title">{doc.title}</h1>
   if (!editing)
     return (
-      <h1 className="doc-title" title="click to rename" onClick={() => {
-        setValue(doc.title)
-        setEditing(true)
-      }}>
-        {doc.title}
+      <h1 className="dv-title">
+        <button
+          type="button"
+          className="dv-title-btn"
+          title="Rename"
+          onClick={() => {
+            setValue(doc.title)
+            setEditing(true)
+          }}
+        >
+          {doc.title}
+        </button>
       </h1>
     )
   return (
     <input
-      className="doc-title-edit"
+      className="dv-title dv-title-edit"
+      aria-label="Doc title"
       autoFocus
       value={value}
       onChange={(e) => setValue(e.target.value)}
@@ -77,6 +161,184 @@ function DocTitle({ doc, onRenamed }: { doc: Doc; onRenamed: () => void }) {
     />
   )
 }
+
+/* ---------- head pills ---------- */
+
+function StatusPill({ doc, readOnly, onChanged }: { doc: Doc; readOnly: boolean; onChanged: () => void }) {
+  const [open, setOpen] = useState(false)
+  const box = useRef<HTMLSpanElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const off = (e: MouseEvent) => {
+      if (!box.current?.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', off)
+    return () => document.removeEventListener('mousedown', off)
+  }, [open])
+  const set = async (status: string | null) => {
+    setOpen(false)
+    try {
+      await api(`/api/doc/${doc.id}/status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      })
+      onChanged()
+    } catch (e) {
+      notify(`status: ${errText(e)}`, 'warn')
+    }
+  }
+  const label = doc.status ?? 'No status'
+  if (readOnly)
+    return doc.status ? (
+      <span className="dv-pill">
+        <i className="dv-sdot" style={{ background: statusTone(doc.status) }} aria-hidden />
+        {doc.status}
+      </span>
+    ) : null
+  return (
+    <span className="dv-menu-wrap" ref={box}>
+      <button
+        type="button"
+        className={`dv-pill${doc.status ? '' : ' dv-pill-dashed'}`}
+        aria-label={`Status: ${label}`}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      >
+        {doc.status && <i className="dv-sdot" style={{ background: statusTone(doc.status) }} aria-hidden />}
+        {doc.status ?? 'Status'}
+        <Icon name="chevronDown" size={12} />
+      </button>
+      {open && (
+        <div
+          className="dv-menu"
+          role="menu"
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              e.stopPropagation()
+              setOpen(false)
+            }
+          }}
+        >
+          {STATUSES.map((s, i) => (
+            <button key={s} type="button" role="menuitemradio" aria-checked={doc.status === s} autoFocus={i === 0} onClick={() => set(s)}>
+              <i className="dv-sdot" style={{ background: statusTone(s) }} aria-hidden />
+              {s}
+              {doc.status === s && <Icon name="check" size={14} />}
+            </button>
+          ))}
+          {doc.status && (
+            <button type="button" role="menuitem" className="dv-menu-clear" onClick={() => set(null)}>
+              Clear status
+            </button>
+          )}
+        </div>
+      )}
+    </span>
+  )
+}
+
+/** "+ tag": writes the doc's frontmatter (a hidden block) through the gate. */
+function AddTag({ onAdd }: { onAdd: (tag: string) => Promise<void> }) {
+  const [editing, setEditing] = useState(false)
+  const [v, setV] = useState('')
+  if (!editing)
+    return (
+      <button type="button" className="dv-pill dv-pill-dashed" onClick={() => setEditing(true)}>
+        + tag
+      </button>
+    )
+  const done = async () => {
+    const t = v.trim().replace(/^#/, '')
+    setEditing(false)
+    setV('')
+    if (t) await onAdd(t)
+  }
+  return (
+    <input
+      className="dv-pill dv-tag-input"
+      autoFocus
+      aria-label="New tag"
+      placeholder="tag"
+      value={v}
+      onChange={(e) => setV(e.target.value.replace(/[,\s]/g, '-'))}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') done()
+        if (e.key === 'Escape') {
+          setV('')
+          setEditing(false)
+        }
+      }}
+      onBlur={done}
+    />
+  )
+}
+
+/* ---------- the byline ---------- */
+
+function Byline({ rows, epoch, onHistory }: { rows: HistRow[]; epoch: number; onHistory: () => void }) {
+  const people = contributors(rows)
+  const parts: ReactNode[] = []
+  people.forEach((p, i) => {
+    if (i > 0 && i === people.length - 1) parts.push(<span key={`j${i}`}>and</span>)
+    const comma = i < people.length - 2 ? ',' : ''
+    parts.push(
+      <span key={p.name} className="dv-by-who">
+        <Avatar name={p.name} agent={p.agent} />
+        {p.agent ? <span className="lp-agent-name">{p.name}</span> : <span>{p.yours ? 'You' : p.name}</span>}
+        {comma && <span className="dv-by-comma">{comma}</span>}
+      </span>,
+    )
+  })
+  return (
+    <div className="dv-byline">
+      {parts}
+      {parts.length > 0 && <span aria-hidden>·</span>}
+      <span>
+        <span className="dv-by-long">version </span>
+        <span className="dv-by-short">v</span>
+        {epoch}
+      </span>
+      <span aria-hidden className="dv-by-hist">·</span>
+      <button type="button" className="dv-link dv-by-hist" onClick={onHistory}>
+        History
+      </button>
+    </div>
+  )
+}
+
+/* ---------- the narrow inspector: a sheet ---------- */
+
+function InspectorSheet({ onClose, children }: { onClose: () => void; children: ReactNode }) {
+  const box = useRef<HTMLDivElement>(null)
+  const trap = useFocusTrap(box)
+  return (
+    <div className="dv-sheet-scrim" onMouseDown={onClose}>
+      <div
+        ref={box}
+        className="dv-sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Doc inspector"
+        onMouseDown={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') {
+            e.stopPropagation()
+            onClose()
+            return
+          }
+          trap(e)
+        }}
+      >
+        <div className="dv-sheet-grab" aria-hidden />
+        {children}
+      </div>
+    </div>
+  )
+}
+
+/* ---------- the view ---------- */
 
 export default function DocView({
   docId,
@@ -94,7 +356,7 @@ export default function DocView({
   docs: Doc[]
   dataVersion: number
   anchor?: string | null
-  /** opened from the review queue: open the rail on load */
+  /** opened from the review queue: open the Review tab on load */
   reviewIntent?: boolean
   /** owned by App so it outlives this component's per-doc remount */
   panel: Panel
@@ -115,10 +377,7 @@ export default function DocView({
       if (gen.current === g) gen.current++
     }
   }, [docId])
-  const fresh = useCallback(
-    (g: number) => gen.current === g,
-    [],
-  )
+  const fresh = useCallback((g: number) => gen.current === g, [])
   // open review items for THIS doc (yellow = applied+flagged, red = parked)
   const [reviewItems, setReviewItems] = useState<QueueRow[]>([])
   const loadReview = useCallback(() => {
@@ -127,12 +386,41 @@ export default function DocView({
       .then((r) => fresh(g) && setReviewItems(Array.isArray(r) ? r : []))
       .catch(() => fresh(g) && setReviewItems([]))
   }, [docId, fresh])
+  const [history, setHistory] = useState<HistRow[]>([])
+  const loadHistory = useCallback(() => {
+    const g = gen.current
+    api<HistRow[]>(`/api/doc/${docId}/history`)
+      .then((r) => fresh(g) && setHistory(Array.isArray(r) ? r : []))
+      .catch(() => {})
+  }, [docId, fresh])
+  const [principals, setPrincipals] = useState<Map<string, PrincipalRow>>(new Map())
+  const [me, setMe] = useState<string | null>(null)
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([])
+  useEffect(() => {
+    let live = true
+    loadPrincipals().then((m) => live && setPrincipals(m))
+    loadMe().then((id) => live && setMe(id))
+    api<{ workspaces: Workspace[] }>('/api/workspaces')
+      .then((r) => live && setWorkspaces(Array.isArray(r?.workspaces) ? r.workspaces : []))
+      .catch(() => {})
+    return () => {
+      live = false
+    }
+  }, [dataVersion])
+
   const [selBlock, setSelBlock] = useState<string | null>(null)
   const [selRect, setSelRect] = useState<{ x: number; y: number } | null>(null)
   const [commentTarget, setCommentTarget] = useState<string | null>(null)
+  const [focusThread, setFocusThread] = useState<string | null>(null)
   // epochs this editor produced itself — external changes are anything above
   const ownEpoch = useRef(0)
   const [editorGen, setEditorGen] = useState(0)
+  const [saveState, setSaveState] = useState<EditorSaveState>('clean')
+  const saveStateRef = useRef<EditorSaveState>('clean')
+  saveStateRef.current = saveState
+
+  const wide = useMedia('(min-width: 1280px)')
+  const phone = useMedia('(max-width: 760px)')
 
   // anchor the comment bubble just above the selected text
   const onSelectionBlock = useCallback((blockId: string | null) => {
@@ -158,32 +446,36 @@ export default function DocView({
       .then((t) => fresh(g) && setTree(t))
       .catch(console.error)
     api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
-      .then((b) => fresh(g) && setBacklinks(b))
+      .then((b) => fresh(g) && setBacklinks(Array.isArray(b) ? b : []))
       .catch(() => fresh(g) && setBacklinks([]))
   }, [docId, fresh])
 
   useEffect(() => {
     setTree(null)
-    // the panel choice is the user's, not the doc's: only a review-queue
-    // open overrides it (the same rule as the reviewIntent effect below)
+    // the tab choice is the user's, not the doc's: only a review-queue open
+    // overrides it (the same rule as the reviewIntent effect below)
     if (reviewIntent) setPanel('review')
     setCommentTarget(null)
     setReviewItems([])
+    setHistory([])
     ownEpoch.current = 0
     loadTree()
     loadReview()
+    loadHistory()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loadTree, loadReview])
+  }, [loadTree, loadReview, loadHistory])
 
-  // a later { review: true } open of the SAME doc still opens the rail
+  // a later { review: true } open of the SAME doc still opens Review
   useEffect(() => {
     if (reviewIntent) setPanel('review')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reviewIntent, anchor])
 
   useEffect(() => {
     if (dataVersion === 0) return
     loadReview()
-  }, [dataVersion, loadReview])
+    loadHistory()
+  }, [dataVersion, loadReview, loadHistory])
 
   // after a resolve: content may have moved (yellow decline reverts, red
   // accept applies) — refetch, remount the editor if the epoch moved
@@ -191,6 +483,7 @@ export default function DocView({
   treeRef.current = tree
   const afterResolve = useCallback(() => {
     loadReview()
+    loadHistory()
     const g = gen.current
     api<DocTree>(`/api/doc/${docId}`)
       .then((next) => {
@@ -203,9 +496,7 @@ export default function DocView({
         setTree(next)
       })
       .catch(() => {})
-  }, [docId, loadReview, fresh])
-
-  const highlightMap = useMemo(() => buildHighlightMap(reviewItems), [reviewItems])
+  }, [docId, loadReview, loadHistory, fresh])
 
   // live refresh: when the store changed and this doc moved past what our own
   // saves produced, reload it and remount the editor with the fresh content
@@ -218,7 +509,7 @@ export default function DocView({
       .then((next) => {
         if (!fresh(g)) return
         const known = Math.max(cur.doc.current_epoch, ownEpoch.current)
-        const dirty = document.querySelector('.save-state.dirty, .save-state.saving')
+        const dirty = saveStateRef.current !== 'clean'
         if (next.doc.current_epoch > known && !dirty) {
           setTree(next)
           setEditorGen((g) => g + 1)
@@ -226,7 +517,7 @@ export default function DocView({
           setTree(next)
         }
         api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
-          .then((b) => fresh(g) && setBacklinks(b))
+          .then((b) => fresh(g) && setBacklinks(Array.isArray(b) ? b : []))
           .catch(() => {})
       })
       .catch((e) => console.warn('doc refresh failed', docId, e))
@@ -238,6 +529,7 @@ export default function DocView({
   }, [dataVersion])
 
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
+  const listed = docs.find((d) => d.id === docId)
 
   // anchor from a link: [[Doc#^block-uuid]] finds the block by stable id,
   // [[Doc#Heading]] falls back to text match. Scroll + flash.
@@ -252,9 +544,9 @@ export default function DocView({
       if (!el) {
         const needle = anchor.replace(/^\^/, '').toLowerCase()
         el =
-          [...document.querySelectorAll(
-            '.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4, .ProseMirror p',
-          )].find((n) => n.textContent?.toLowerCase().includes(needle)) ?? null
+          [...document.querySelectorAll('.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4, .ProseMirror p')].find((n) =>
+            n.textContent?.toLowerCase().includes(needle),
+          ) ?? null
       }
       if (el) {
         el.scrollIntoView({ block: 'start' })
@@ -268,10 +560,139 @@ export default function DocView({
     return () => timers.forEach(clearTimeout)
   }, [anchor, tree])
 
-  // wikilink click-through: decorated targets carry data-target
+  const { editable, comments, allBlocks, removedCanvases, frontmatter } = useMemo(() => {
+    if (!tree)
+      return {
+        editable: null,
+        comments: [] as Block[],
+        allBlocks: [] as Block[],
+        removedCanvases: 0,
+        frontmatter: [] as Block[],
+      }
+    const { blocks, comments, allBlocks, hidden, removedCanvases } = splitTree(tree.roots)
+    return {
+      editable: { docId, epoch: tree.doc.current_epoch, blocks, hidden },
+      comments,
+      allBlocks,
+      removedCanvases,
+      frontmatter: allBlocks.filter((b) => b.block_type !== 'comment' && b.block_type !== 'canvas_scene' && b.content.startsWith('---')),
+    }
+  }, [tree, docId])
+
+  // the workspace the doc lives in, and whether this person may write it
+  const ws = useMemo(() => {
+    const id = listed?.workspace_id ?? null
+    return id ? (workspaces.find((w) => w.id === id) ?? null) : (workspaces.find((w) => w.doc_ids?.includes(docId)) ?? null)
+  }, [workspaces, listed, docId])
+  const readOnly = ws?.role === 'viewer'
+
+  const who = useCallback(
+    (id: string): Principal => {
+      const p = principals.get(id)
+      const name = p?.display_name ?? 'someone'
+      const agent = p ? p.kind !== 'human' : isAgentName(name)
+      return { name, agent, yours: !agent && !!me && id === me }
+    },
+    [principals, me],
+  )
+
+  /* ---------- review on the page ---------- */
+
+  const highlightMap = useMemo(() => buildHighlightMap(reviewItems), [reviewItems])
+  const commentCounts = useMemo(() => {
+    const isComment = new Set(comments.map((c) => c.id))
+    const out: Record<string, number> = {}
+    for (const c of comments) {
+      if (c.parent_id && isComment.has(c.parent_id)) continue
+      if (c.refers_to) out[c.refers_to] = (out[c.refers_to] ?? 0) + 1
+    }
+    return out
+  }, [comments])
+  const reviewExtras = useMemo<ReviewExtras>(() => {
+    const details: Record<string, ReviewDetail> = {}
+    for (const it of reviewItems) {
+      const id = targetBlockOf(it)
+      if (!id) continue
+      const tone = toneOf(it)
+      if (highlightMap[id] !== tone || details[id]) continue
+      const k = it.item.op.kind
+      const prior = it.item.op.prior?.content ?? null
+      let beforeText: string | null = null
+      if (tone === 'yellow' && k.op === 'replace' && prior != null) {
+        try {
+          beforeText = parser.parse(prior)?.textContent ?? null
+        } catch {
+          beforeText = null
+        }
+      }
+      const proposed = typeof k.content === 'string' ? k.content : null
+      const labels = actionLabels(it)
+      details[id] = {
+        annotationId: it.item.annotation.id,
+        tone,
+        who: it.proposer,
+        agent: isAgentName(it.proposer),
+        confidence: it.item.op.confidence,
+        source: it.item.op.source_refs[0] ?? null,
+        beforeText,
+        proposedText: tone === 'red' && k.op === 'replace' ? proposed : null,
+        accept: labels.accept,
+        decline: labels.decline,
+        canResolve: !readOnly,
+      }
+    }
+    return { details, comments: commentCounts }
+  }, [reviewItems, highlightMap, commentCounts, readOnly])
+
+  const [resolving, setResolving] = useState(false)
+  const resolveOne = useCallback(
+    async (annotationId: string, decision: 'accept' | 'decline') => {
+      if (resolving) return
+      setResolving(true)
+      try {
+        await api('/api/resolve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ annotation_id: annotationId, decision }),
+        })
+      } catch (e) {
+        notify(errText(e))
+      }
+      setResolving(false)
+      afterResolve()
+    },
+    [afterResolve, resolving],
+  )
+
+  /* ---------- the inspector ---------- */
+
+  const auto = panel === 'none'
+  const inspectorOpen = panel === 'closed' ? false : auto ? wide : true
+  const tab: InspectorTab = auto || panel === 'closed' ? (reviewItems.length > 0 ? 'review' : 'comments') : panel
+  const openTab = useCallback((t: InspectorTab) => setPanel(t), [setPanel])
+  const closeInspector = useCallback(() => setPanel(wide ? 'closed' : 'none'), [setPanel, wide])
+
+  // clicks inside the doc: wikilinks, a flagged block's Keep / Revert, a
+  // comment bubble
   const onStageClick = useCallback(
     (e: React.MouseEvent) => {
-      const el = (e.target as HTMLElement).closest('.wl-target') as HTMLElement | null
+      const t = e.target as HTMLElement
+      const res = t.closest('[data-resolve]') as HTMLElement | null
+      if (res) {
+        e.preventDefault()
+        const ann = res.dataset.ann
+        const d = res.dataset.resolve
+        if (ann && (d === 'accept' || d === 'decline')) resolveOne(ann, d)
+        return
+      }
+      const cb = t.closest('[data-comments-for]') as HTMLElement | null
+      if (cb) {
+        e.preventDefault()
+        setFocusThread(cb.dataset.commentsFor ?? null)
+        openTab('comments')
+        return
+      }
+      const el = t.closest('.wl-target') as HTMLElement | null
       if (!el) return
       const target = el.dataset.target ?? ''
       const [path, fragment] = target.split('#')
@@ -282,293 +703,254 @@ export default function DocView({
         onOpenDoc(id, fragment?.trim())
       }
     },
-    [byTitle, onOpenDoc],
+    [byTitle, onOpenDoc, resolveOne, openTab],
   )
 
-  const { editable, comments, allBlocks, removedCanvases } = useMemo(() => {
-    if (!tree)
-      return {
-        editable: null,
-        comments: [] as Block[],
-        allBlocks: [] as Block[],
-        removedCanvases: 0,
-      }
-    const { blocks, comments, allBlocks, hidden, removedCanvases } = splitTree(tree.roots)
-    return {
-      editable: { docId, epoch: tree.doc.current_epoch, blocks, hidden },
-      comments,
-      allBlocks,
-      removedCanvases,
-    }
-  }, [tree, docId])
+  /* ---------- tags ---------- */
 
-  if (!tree || !editable) return <div className="empty">…</div>
+  const tags = useMemo(() => frontmatterTags(frontmatter.map((b) => b.content)), [frontmatter])
+  const addTag = useCallback(
+    async (tag: string) => {
+      const cur = treeRef.current
+      if (!cur) return
+      if (tags.includes(tag)) return
+      if (saveStateRef.current !== 'clean') {
+        notify('wait for the doc to save, then add the tag', 'warn')
+        return
+      }
+      const fm = frontmatter[0] ?? null
+      const op = fm
+        ? { op: 'replace', target: fm.id, content: withTag(fm.content, tag) }
+        : {
+            op: 'insert',
+            block_id: crypto.randomUUID(),
+            parent_id: null,
+            order_key: keyBetween(null, cur.roots[0]?.block.order_key ?? null),
+            block_type: 'code',
+            content: withTag(null, tag),
+            refers_to: null,
+          }
+      try {
+        await api('/api/propose', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ doc_id: docId, base_epoch: cur.doc.current_epoch, ops: [{ kind: op, source_refs: [] }] }),
+        })
+        afterResolve()
+      } catch (e) {
+        notify(`tag: ${errText(e)}`, 'warn')
+      }
+    },
+    [docId, frontmatter, tags, afterResolve],
+  )
+
+  /* ---------- the top bar's slot ---------- */
+
+  const [slot, setSlot] = useState<HTMLElement | null>(null)
+  useEffect(() => {
+    setSlot(document.getElementById('lp-top-slot'))
+  }, [])
+
+  if (!tree || !editable)
+    return (
+      <div className="dv dv-loading" aria-busy="true">
+        <div className="dv-col">
+          <div className="dv-skel dv-skel-pills" />
+          <div className="dv-skel dv-skel-title" />
+          <div className="dv-skel dv-skel-line" />
+          <div className="dv-skel dv-skel-line" />
+          <div className="dv-skel dv-skel-line short" />
+        </div>
+      </div>
+    )
+
+  const doc = tree.doc
+  const saveIndicator: SaveState = readOnly ? 'readonly' : SAVE_OF[saveState]
+  const isTended = !!listed?.is_tended
+
+  const inspector = (
+    <DocInspector
+      tab={tab}
+      setTab={openTab}
+      onClose={closeInspector}
+      closeLabel={wide ? 'Hide inspector' : 'Close'}
+      doc={doc}
+      reviewItems={reviewItems}
+      afterResolve={afterResolve}
+      comments={comments}
+      allBlocks={allBlocks}
+      commentTarget={commentTarget}
+      setCommentTarget={setCommentTarget}
+      focusThread={focusThread}
+      onPosted={loadTree}
+      history={history}
+      who={who}
+      signedIn={signedIn}
+      readOnly={readOnly}
+      dataVersion={dataVersion}
+    />
+  )
+
+  const topActions = (
+    <>
+      <span className="dv-save" role="status" aria-live="polite">
+        <StatusDot state={saveIndicator} />
+      </span>
+      {signedIn && (
+        <>
+          <Button size="sm" icon="link" className="dv-top-share" onClick={() => openTab('share')}>
+            Share
+          </Button>
+          <IconButton icon="link" label="Share" className="dv-top-share-phone" onClick={() => openTab('share')} />
+        </>
+      )}
+      {!inspectorOpen && !phone && (
+        <IconButton icon="comment" label="Show the inspector (review, comments, history)" onClick={() => openTab(tab)} />
+      )}
+    </>
+  )
 
   return (
-    <article className="doc" onClick={onStageClick}>
-      <div className="doc-head">
-        <span className="head-actions">
-          {tree.doc.review_policy && <span className="meta policy">{tree.doc.review_policy}</span>}
-          <LivingChip docId={docId} dataVersion={dataVersion} />
-          <button
-            className={`chip ${panel === 'history' ? 'on' : ''}`}
-            onClick={() => setPanel(panel === 'history' ? 'none' : 'history')}
-          >
-            history
-          </button>
-          <button
-            className={`chip ${panel === 'comments' ? 'on' : ''}`}
-            onClick={() => setPanel(panel === 'comments' ? 'none' : 'comments')}
-          >
-            comments{comments.length > 0 ? ` ${comments.length}` : ''}
-          </button>
-          <button
-            className={`chip ${panel === 'tend' ? 'on' : ''} ${docs.find((d) => d.id === docId)?.is_tended ? 'tended' : ''}`}
-            onClick={() => setPanel(panel === 'tend' ? 'none' : 'tend')}
-          >
-            {docs.find((d) => d.id === docId)?.is_tended ? '🌿 tended' : 'tend'}
-          </button>
-          {signedIn && (
+    <div className={`dv${inspectorOpen && wide ? ' dv-with-ins' : ''}${readOnly ? ' dv-readonly' : ''}`}>
+      {slot && createPortal(topActions, slot)}
+      <article className="dv-article" onClick={onStageClick}>
+        <div className="dv-col">
+          <div className="dv-pills">
+            {ws && (
+              <button type="button" className="dv-pill" onClick={() => navigate({ kind: 'library', workspace: ws.id })}>
+                <i className="dv-wdot" style={{ background: ws.color ?? 'var(--ws-1)' }} aria-hidden />
+                {ws.display_name || ws.name}
+              </button>
+            )}
+            <StatusPill doc={doc} readOnly={readOnly} onChanged={refreshFromStore} />
+            {tags.map((t) => (
+              <button key={t} type="button" className="dv-pill" onClick={() => navigate({ kind: 'search', q: `#${t}` })}>
+                #{t}
+              </button>
+            ))}
+            {!readOnly && <AddTag onAdd={addTag} />}
+            <LivingChip docId={docId} dataVersion={dataVersion} />
+            {doc.review_policy && (
+              <span className="dv-pill dv-pill-quiet dv-pill-policy" title="who reviews changes to this doc">
+                <Icon name="review" size={13} />
+                {doc.review_policy}
+              </span>
+            )}
+            {readOnly && (
+              <span className="dv-pill dv-pill-quiet">
+                <Icon name="members" size={13} />
+                Viewer · read only
+              </span>
+            )}
             <button
-              className={`chip ${panel === 'share' ? 'on' : ''}`}
-              title="a public, read-only link to a snapshot of this doc"
-              onClick={() => setPanel(panel === 'share' ? 'none' : 'share')}
+              type="button"
+              className={`dv-pill dv-pill-quiet${isTended ? ' tended' : ''}`}
+              aria-pressed={inspectorOpen && tab === 'tend'}
+              onClick={() => openTab('tend')}
+              title="agents that look after this doc"
             >
-              share link…
+              <Icon name="gardeners" size={13} />
+              {isTended ? 'Tended' : 'Tend'}
             </button>
+          </div>
+          <DocTitle doc={doc} onRenamed={loadTree} readOnly={readOnly} />
+          <Byline rows={history} epoch={doc.current_epoch} onHistory={() => openTab('history')} />
+          {removedCanvases > 0 && (
+            <div className="dv-notice">
+              <Icon name="info" size={15} />
+              This doc holds {removedCanvases === 1 ? 'a canvas' : `${removedCanvases} canvases`} the app no longer shows.
+            </div>
           )}
-          {reviewItems.length > 0 && (
-            <button
-              className={`chip review-chip ${panel === 'review' ? 'on' : ''}`}
-              title="review changes in this doc"
-              onClick={() => setPanel(panel === 'review' ? 'none' : 'review')}
-            >
-              ⚠ {reviewItems.length} to review
-            </button>
+          <div className="dv-prose">
+            <DocEditor
+              key={`${docId}:${editorGen}`}
+              doc={editable}
+              reviewMap={highlightMap}
+              reviewExtras={reviewExtras}
+              editable={!readOnly}
+              onSaveState={setSaveState}
+              onSaved={(e, savedDocId) => {
+                // the unmount flush of a PREVIOUS doc's editor reports its own id
+                if (savedDocId !== docId) return
+                ownEpoch.current = Math.max(ownEpoch.current, e)
+                loadHistory()
+              }}
+              onSelectionBlock={onSelectionBlock}
+            />
+          </div>
+          {backlinks.length > 0 && (
+            <section className="dv-bl" aria-labelledby="dv-bl-h">
+              <h2 id="dv-bl-h">Linked from {backlinks.length}</h2>
+              <div className="dv-bl-grid">
+                {backlinks.map((b) => (
+                  <button key={b.block.id} type="button" className="dv-bl-card" onClick={() => onOpenDoc(b.block.doc_id)}>
+                    <b>{b.doc_title}</b>
+                    <span>{backlinkSnippet(b.block.content, doc.title)}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
           )}
-        </span>
-        <DocTitle doc={tree.doc} onRenamed={loadTree} />
-      </div>
-      {removedCanvases > 0 && (
-        <div className="meta canvas-removed">
-          Canvas (removed) · this doc holds {removedCanvases === 1 ? 'a canvas' : `${removedCanvases} canvases`} the
-          app no longer shows
         </div>
+      </article>
+
+      {inspectorOpen && wide && (
+        <aside className="dv-ins" aria-label="Doc inspector">
+          {inspector}
+        </aside>
       )}
-      <DocEditor
-        key={`${docId}:${editorGen}`}
-        doc={editable}
-        reviewMap={highlightMap}
-        onSaved={(e, savedDocId) => {
-          // the unmount flush of a PREVIOUS doc's editor reports its own id
-          if (savedDocId !== docId) return
-          ownEpoch.current = Math.max(ownEpoch.current, e)
-        }}
-        onSelectionBlock={onSelectionBlock}
-      />
-      {selBlock && selRect && panel !== 'comments' && (
-        <span className="sel-actions" style={{ left: selRect.x, top: selRect.y }}>
+      {inspectorOpen && !wide && <InspectorSheet onClose={closeInspector}>{inspector}</InspectorSheet>}
+
+      {selBlock && selRect && !readOnly && (
+        <span className="dv-sel" style={{ left: selRect.x, top: selRect.y }}>
           <button
-            title="comment on selection"
+            type="button"
+            title="Comment on this"
             onMouseDown={(e) => {
               e.preventDefault()
               setCommentTarget(selBlock)
-              setPanel('comments')
+              setFocusThread(selBlock)
+              openTab('comments')
               setSelRect(null)
             }}
           >
-            💬
+            <Icon name="comment" size={15} />
+            Comment
           </button>
           <button
-            title="copy block link"
+            type="button"
+            title="Copy a link to this block"
             onMouseDown={(e) => {
               e.preventDefault()
               navigator.clipboard
-                .writeText(`[[${tree.doc.title}#^${selBlock}]]`)
+                .writeText(`[[${doc.title}#^${selBlock}]]`)
+                .then(() => notify('block link copied', 'ok'))
                 .catch(() => {})
               setSelRect(null)
             }}
           >
-            🔗
+            <Icon name="link" size={15} />
+            Link
           </button>
         </span>
       )}
-      {panel === 'history' && <HistoryPanel docId={docId} onClose={() => setPanel('none')} />}
-      {panel === 'share' && signedIn && (
-        <SharePanel docId={docId} title={tree.doc.title} onClose={() => setPanel('none')} />
-      )}
-      {panel === 'review' && (
-        <ReviewRail items={reviewItems} onChanged={afterResolve} onClose={() => setPanel('none')} />
-      )}
-      {panel === 'tend' && (
-        <TendPanel doc={tree.doc} onClose={() => setPanel('none')} dataVersion={dataVersion} />
-      )}
-      {panel === 'comments' && (
-        <CommentsPanel
-          comments={comments}
-          allBlocks={allBlocks}
-          target={commentTarget}
-          setTarget={setCommentTarget}
-          onPosted={loadTree}
-          onClose={() => setPanel('none')}
-        />
-      )}
-      {backlinks.length > 0 && (
-        <div className="backlinks">
-          <span className="meta">linked from</span>
-          {backlinks.map((b) => (
-            <span key={b.block.id} className="backlink" onClick={() => onOpenDoc(b.block.doc_id)}>
-              {b.doc_title}
-            </span>
-          ))}
-        </div>
-      )}
-    </article>
-  )
-}
 
-/* ---------- provenance & comments panels (5.4 / 5.5) ---------- */
-
-function opSnippet(kind: Record<string, unknown> & { op: string }): string {
-  const c = typeof kind.content === 'string' ? (kind.content as string) : ''
-  return c ? c.split('\n')[0].slice(0, 90) : `${kind.op} ${String(kind.target ?? '').slice(0, 8)}`
-}
-
-function HistoryPanel({ docId, onClose }: { docId: string; onClose: () => void }) {
-  const [rows, setRows] = useState<HistoryRow[]>([])
-  useEffect(() => {
-    api<HistoryRow[]>(`/api/doc/${docId}/history`).then(setRows).catch(console.error)
-  }, [docId])
-
-  // one entry per epoch (a save/run), ops grouped beneath
-  const epochs = useMemo(() => {
-    const m = new Map<number, HistoryRow[]>()
-    for (const r of rows) {
-      const e = r.op.epoch_applied ?? -1
-      if (!m.has(e)) m.set(e, [])
-      m.get(e)!.push(r)
-    }
-    return [...m.entries()].sort((a, b) => b[0] - a[0])
-  }, [rows])
-
-  return (
-    <aside className="panel">
-      <div className="panel-head">
-        <span>history</span>
-        <button onClick={onClose}>esc</button>
-      </div>
-      {epochs.map(([epoch, ops]) => (
-        <div key={epoch} className="epoch-group">
-          <div className="epoch-line">
-            <span className="meta">epoch {epoch}</span>
-            <span className={`who ${ops[0].principal_kind}`}>{ops[0].principal_name}</span>
-            {ops[0].op.verdict && ops[0].op.verdict !== 'green' && (
-              <span className={`verdict v-${ops[0].op.verdict}`}>{ops[0].op.verdict}</span>
-            )}
-          </div>
-          {ops.map((r) => (
-            <div key={r.op.id} className="op-line">
-              <span className="op-type">{r.op.kind.op}</span>
-              <span className="op-snippet">{opSnippet(r.op.kind)}</span>
-            </div>
-          ))}
-          {ops[0].op.source_refs.length > 0 && (
-            <div className="refs">{ops[0].op.source_refs.join(' · ')}</div>
-          )}
-        </div>
-      ))}
-      {rows.length === 0 && <div className="palette-empty">no history</div>}
-    </aside>
-  )
-}
-
-function CommentsPanel({
-  comments,
-  allBlocks,
-  target,
-  setTarget,
-  onPosted,
-  onClose,
-}: {
-  comments: Block[]
-  allBlocks: Block[]
-  target: string | null
-  setTarget: (t: string | null) => void
-  onPosted: () => void
-  onClose: () => void
-}) {
-  const [text, setText] = useState('')
-  const [replyTo, setReplyTo] = useState<Block | null>(null)
-  const byId = useMemo(() => new Map(allBlocks.map((b) => [b.id, b])), [allBlocks])
-
-  const roots = comments.filter((c) => !c.parent_id || !byId.get(c.parent_id)?.refers_to)
-  const repliesOf = (id: string) => comments.filter((c) => c.parent_id === id)
-
-  const post = async () => {
-    const blockId = replyTo ? replyTo.refers_to : target
-    if (!text.trim() || !blockId) return
-    await api('/api/comment', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ block_id: blockId, text: text.trim(), reply_to: replyTo?.id ?? null }),
-    }).catch((e) => notify(String(e)))
-    setText('')
-    setReplyTo(null)
-    setTarget(null)
-    onPosted()
-  }
-
-  const snippet = (id: string | null) =>
-    id ? (byId.get(id)?.content ?? '').split('\n')[0].slice(0, 70) : ''
-
-  return (
-    <aside className="panel">
-      <div className="panel-head">
-        <span>comments</span>
-        <button onClick={onClose}>esc</button>
-      </div>
-      {roots.map((c) => (
-        <div key={c.id} className="thread">
-          <div className="thread-target">{snippet(c.refers_to)}</div>
-          <CommentRow c={c} />
-          {repliesOf(c.id).map((r) => (
-            <div key={r.id} className="reply">
-              <CommentRow c={r} />
-            </div>
-          ))}
-          <button className="chip" onClick={() => setReplyTo(c)}>
-            reply
-          </button>
-        </div>
-      ))}
-      {roots.length === 0 && !target && (
-        <div className="palette-empty">no comments — select text to start a thread</div>
-      )}
-      {(target || replyTo) && (
-        <div className="composer">
-          <div className="meta">
-            {replyTo ? `replying in thread` : `on: ${snippet(target)}`}
-          </div>
-          <textarea
-            autoFocus
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => {
-              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') post()
-            }}
-            placeholder="⌘Enter to post"
-          />
-        </div>
-      )}
-    </aside>
-  )
-}
-
-function CommentRow({ c }: { c: Block }) {
-  return (
-    <div className="comment">
-      <span className="comment-text">{c.content}</span>
-      <span className="meta">epoch {c.epoch}</span>
+      <nav className="dv-dock" aria-label="Doc panels">
+        <button type="button" onClick={() => openTab('review')} aria-pressed={inspectorOpen && tab === 'review'}>
+          <Icon name="review" size={18} />
+          Review
+          <CountPill n={reviewItems.length} tone="yellow" />
+        </button>
+        <button type="button" onClick={() => openTab('comments')} aria-pressed={inspectorOpen && tab === 'comments'}>
+          <Icon name="comment" size={18} />
+          Comments
+          <CountPill n={Object.values(commentCounts).reduce((a, b) => a + b, 0)} />
+        </button>
+        <button type="button" onClick={() => openTab('history')} aria-pressed={inspectorOpen && tab === 'history'}>
+          <Icon name="history" size={18} />
+          History
+        </button>
+      </nav>
     </div>
   )
 }
