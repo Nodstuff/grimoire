@@ -1,0 +1,67 @@
+/* Filter chips and their menus (Search, Library): canvas Search .chip. */
+
+.lp-fchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-size: var(--text-md);
+  padding: 0 10px;
+  height: 30px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line2);
+  background: var(--card);
+  color: var(--ink2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.lp-fchip:hover {
+  color: var(--ink);
+  background: var(--card2);
+}
+.lp-fchip.on {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--ink);
+}
+.lp-chipmenu {
+  position: relative;
+}
+.lp-chipmenu-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  min-width: 200px;
+  background: var(--pal);
+  border: 1px solid var(--line2);
+  border-radius: 12px;
+  box-shadow: var(--shadow-pop);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.lp-chipmenu-list button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.lp-chipmenu-list button:hover,
+.lp-chipmenu-list button:focus-visible,
+.lp-chipmenu-list button[aria-checked='true'] {
+  background: var(--accent-soft);
+}
+.lp-chipmenu-check {
+  margin-left: auto;
+  color: var(--accent);
+}
+

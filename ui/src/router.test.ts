@@ -13,6 +13,8 @@ describe('routes', () => {
       { kind: 'library', workspace: null },
       { kind: 'library', workspace: 'unsorted' },
       { kind: 'library', workspace: B },
+      { kind: 'library', workspace: null, folder: A },
+      { kind: 'library', workspace: 'unsorted', folder: A },
       { kind: 'review' },
       { kind: 'search', q: '' },
       { kind: 'search', q: 'review gate & co' },
@@ -43,6 +45,9 @@ describe('routes', () => {
     expect(routePath({ kind: 'settings', section: 'profile' })).toBe('/settings')
     expect(routePath({ kind: 'search', q: 'a b' })).toBe('/search?q=a%20b')
     expect(routePath({ kind: 'library', workspace: 'all' })).toBe('/library')
+    expect(routePath({ kind: 'library', workspace: null, folder: A })).toBe(`/library?folder=${A}`)
+    // a bad folder id is ignored, not a not-found
+    expect(parseRoute('/library', '?folder=nope')).toEqual({ kind: 'library', workspace: null })
   })
   it('forgives trailing slashes and case of fixed segments', () => {
     expect(parseRoute('/Review/')).toEqual({ kind: 'review' })
