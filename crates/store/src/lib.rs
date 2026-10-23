@@ -4,6 +4,7 @@
 //! written in the same transaction. One committed `apply` = one epoch.
 
 pub mod auth;
+pub mod books;
 pub mod export;
 pub mod gate;
 pub mod idempotency;
