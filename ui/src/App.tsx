@@ -29,6 +29,7 @@ import Library, { pendingByDoc } from './screens/Library'
 import { isEmptyFolder } from './tree'
 import SearchScreen from './screens/Search'
 import { buildCommands } from './commands'
+import { useEreaderStatus } from './ereader'
 import { signOut, webSession } from './auth'
 import { buildPlaces, docPath, loadRecentIds, pushRecentId, storeRecentIds, type PlaceId } from './omni'
 import { KEYS, resolveShortcut } from './shortcuts'
@@ -406,6 +407,9 @@ export default function App() {
   }, [go, togglePalette, openSearch, toggleSidebar])
 
   const docId = route.kind === 'doc' ? route.id : null
+  const ereader = useEreaderStatus(docId)
+  const docHasChildren = useMemo(() => !!docId && docs.some((d) => d.parent_id === docId), [docId, docs])
+  const docTitle = useMemo(() => (docId ? (docs.find((d) => d.id === docId)?.title ?? null) : null), [docId, docs])
 
   // the ⌘K action list
   const commands = useMemo(
@@ -418,6 +422,9 @@ export default function App() {
           signOutAndReload()
         },
         docId,
+        docTitle,
+        docHasChildren,
+        ereader,
         onAction: (a) => {
           switch (a) {
             case 'capture':
@@ -445,7 +452,7 @@ export default function App() {
           setPalette(null)
         },
       }),
-    [signedIn, server, docId, go, openSearch, toggleSidebar],
+    [signedIn, server, docId, docTitle, docHasChildren, ereader, go, openSearch, toggleSidebar],
   )
 
   // the ⌘O places

@@ -11,21 +11,10 @@ import { useEffect, useState } from 'react'
 import { api } from '../types'
 import { appTheme, renderReladraw } from './reladraw'
 import { DIAGRAM_LANGS } from './diagramLangs'
+import { loadMermaid } from './mermaidLoader'
 import { Icon, useTheme } from '../lapis'
 import { copyText } from '../Profile'
 import { notify } from '../Notice'
-
-// mermaid is ~2MB: fetched on the first mermaid fence, not at boot
-let mermaidMod: Promise<typeof import('mermaid')['default']> | null = null
-function loadMermaid() {
-  if (!mermaidMod) {
-    mermaidMod = import('mermaid').then((m) => m.default)
-    mermaidMod.catch(() => {
-      mermaidMod = null // let the next fence retry the fetch
-    })
-  }
-  return mermaidMod
-}
 
 function cssVar(name: string, fallback: string): string {
   try {

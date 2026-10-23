@@ -192,8 +192,9 @@ describe('Actions (⌘K)', () => {
   })
   it('the open doc’s actions come first; without a doc they are absent', () => {
     const withDoc = rankCommands(real('r'), '')
-    expect(withDoc.slice(0, 3).map((c) => c.scope)).toEqual(['doc', 'doc', 'doc'])
-    expect(withDoc.slice(3).every((c) => c.scope !== 'doc')).toBe(true)
+    // share link, export, copy, Download EPUB (Send appears once the e-reader status is known)
+    expect(withDoc.slice(0, 4).map((c) => c.scope)).toEqual(['doc', 'doc', 'doc', 'doc'])
+    expect(withDoc.slice(4).every((c) => c.scope !== 'doc')).toBe(true)
     expect(real(null).some((c) => c.scope === 'doc')).toBe(false)
   })
   it('the palette shortcuts are rows, with their keys', () => {

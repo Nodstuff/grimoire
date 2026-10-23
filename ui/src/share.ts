@@ -46,7 +46,7 @@ export function base64Utf8(s: string): string {
   return btoa(bin)
 }
 
-function svgSize(svg: string): { width?: number; height?: number } {
+export function svgSize(svg: string): { width?: number; height?: number } {
   const num = (attr: string) => {
     const m = svg.match(new RegExp(`<svg[^>]*\\s${attr}="([\\d.]+)(px)?"`))
     return m ? Math.round(Number(m[1])) || undefined : undefined

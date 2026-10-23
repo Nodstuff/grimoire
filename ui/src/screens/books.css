@@ -626,3 +626,20 @@
     display: none;
   }
 }
+
+/* ---------- From Taisce: docs sent to the e-readers ---------- */
+.bk-sent {
+  cursor: default;
+}
+.bk-sent-title {
+  color: inherit;
+  text-decoration: none;
+}
+.bk-sent-title:hover {
+  text-decoration: underline;
+}
+.bk-sent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}

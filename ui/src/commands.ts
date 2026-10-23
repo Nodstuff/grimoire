@@ -9,6 +9,7 @@ import { backupFileName, inTauri, saveDialog } from './tauri'
 import { api } from './types'
 import { KEYS } from './shortcuts'
 import type { OmniCommand } from './omni'
+import { downloadEpub, sendLabel, setSending, type EreaderStatus } from './ereader'
 import { THEME_LABEL, getThemePref, nextThemePref, setThemePref } from './lapis/theme'
 
 export type CommandAction =
@@ -31,10 +32,16 @@ export interface CommandCtx {
   onSignOut?: () => void
   /** the open doc, if any — enables the per-doc actions */
   docId: string | null
+  /** the open doc's title (the EPUB's fallback file name) */
+  docTitle?: string | null
+  /** the open doc has docs under it: it sends as a folder of chapters */
+  docHasChildren?: boolean
+  /** the open doc's e-reader status; null = unknown or no e-reader routes */
+  ereader?: EreaderStatus | null
   onAction: (a: CommandAction) => void
 }
 
-export function buildCommands({ signedIn, library, onSignOut, docId, onAction }: CommandCtx): OmniCommand[] {
+export function buildCommands({ signedIn, library, onSignOut, docId, docTitle, docHasChildren = false, ereader, onAction }: CommandCtx): OmniCommand[] {
   const cmds: OmniCommand[] = []
   if (docId && signedIn) {
     cmds.push({ id: 'share-link', icon: 'link', scope: 'doc', label: 'Share link…', hint: 'a public, read-only snapshot of this doc', run: () => onAction('share') })
@@ -69,6 +76,7 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
         },
       },
     )
+    cmds.push(...ereaderCommands(docId, docTitle ?? 'Untitled', docHasChildren, ereader ?? null, onAction))
   }
   cmds.push(
     { id: 'newdoc', icon: 'plus', group: 'Create', label: 'New doc…', keys: KEYS.newdoc, keywords: 'create page note', run: () => onAction('newdoc') },
@@ -191,6 +199,49 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
   cmds.push({ id: 'help', icon: 'keyboard', group: 'App', label: 'Keyboard shortcuts', keys: '?', keywords: 'keys cheatsheet help', run: () => onAction('help') })
   if (signedIn && onSignOut) {
     cmds.push({ id: 'sign-out', icon: 'signOut', group: 'App', label: 'Sign out', hint: 'end this browser’s session', keywords: 'log out logout', run: onSignOut })
+  }
+  return cmds
+}
+
+/** This doc as a book: Download EPUB always; Send / Stop sending once the
+ * daemon has answered the doc's e-reader status. */
+export function ereaderCommands(
+  docId: string,
+  title: string,
+  hasChildren: boolean,
+  status: EreaderStatus | null,
+  onAction: (a: CommandAction) => void,
+): OmniCommand[] {
+  const cmds: OmniCommand[] = [
+    {
+      id: 'epub-download', icon: 'download',
+      scope: 'doc',
+      label: 'Download EPUB',
+      hint: hasChildren ? 'this doc and everything under it, one chapter each' : 'this doc as an e-book',
+      keywords: 'epub ebook book export kindle kobo',
+      run: () => {
+        onAction('close')
+        downloadEpub(docId, title)
+          .then((name) => notify(`downloaded ${name}`, 'ok'))
+          .catch((e) => notify(errText(e)))
+      },
+    },
+  ]
+  if (status) {
+    const send = !status.sent
+    cmds.push({
+      id: 'ereader-send', icon: 'books',
+      scope: 'doc',
+      label: sendLabel(status, hasChildren),
+      hint: send ? 'a book in your e-readers’ catalog, updated as the doc changes' : 'takes it off your e-readers’ catalog',
+      keywords: 'epub ebook book kindle kobo ereader e-reader feed opds',
+      run: () => {
+        onAction('close')
+        setSending(docId, send)
+          .then(() => notify(send ? `sent “${title}” to your e-readers` : `stopped sending “${title}”`, 'ok'))
+          .catch((e) => notify(errText(e)))
+      },
+    })
   }
   return cmds
 }

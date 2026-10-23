@@ -8,6 +8,9 @@
 // A file dropped anywhere on the page uploads (or is swallowed): it never
 // navigates the browser away. Covers come from /api/books/{id}/cover; a
 // book without one wears the typographic cover (bookCovers.ts).
+//
+// Above them all, "From Taisce": the docs this person sent to their
+// e-readers (ereader.ts), each a Download and a Stop sending.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react'
 import { errText, notify } from './Notice'
@@ -36,6 +39,7 @@ import {
   searchFilter,
   updateBook,
 } from './books'
+import { chaptersLabel, downloadEpub, listSentBooks, setSending, type SentBook } from './ereader'
 import './screens/books.css'
 
 const PAGE = 60
@@ -272,6 +276,8 @@ export default function Books({ dataVersion }: { dataVersion: number }) {
           </div>
         </div>
 
+        {!query && <FromTaisce dataVersion={dataVersion} />}
+
         {reading && reading.length > 0 && !query && (
           <section aria-labelledby="bk-h-reading" className="bk-section">
             <h2 id="bk-h-reading" className="bk-h2">
@@ -388,6 +394,97 @@ export default function Books({ dataVersion }: { dataVersion: number }) {
         </Sheet>
       )}
     </div>
+  )
+}
+
+/** Under a sent book's title: "Work · 12 chapters · 1.2 MB". */
+export function sentBookLine(b: Pick<SentBook, 'workspace' | 'chapters' | 'size'>): string {
+  return [b.workspace ?? 'Unsorted', chaptersLabel(b.chapters), formatSize(b.size)].join(' · ')
+}
+
+/** The "From Taisce" shelf: GET /api/ereader/sent; hidden while it loads,
+ * when it is empty, and on a daemon without the route. */
+function FromTaisce({ dataVersion }: { dataVersion: number }) {
+  const [list, setList] = useState<SentBook[] | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const load = useCallback(() => {
+    listSentBooks()
+      .then(setList)
+      .catch(() => setList(null))
+  }, [])
+  useEffect(load, [load, dataVersion])
+  const stop = async (b: SentBook) => {
+    setBusy(b.id)
+    try {
+      await setSending(b.id, false)
+      notify(`stopped sending “${b.title}”`, 'ok')
+    } catch (e) {
+      notify(errText(e))
+    }
+    setBusy(null)
+    load()
+  }
+  const download = (b: SentBook) =>
+    downloadEpub(b.id, b.title)
+      .then((name) => notify(`downloaded ${name}`, 'ok'))
+      .catch((e) => notify(errText(e)))
+  return <SentShelf list={list} busy={busy} onDownload={download} onStop={stop} />
+}
+
+export function SentShelf({
+  list,
+  busy = null,
+  onDownload,
+  onStop,
+}: {
+  list: SentBook[] | null
+  /** the book whose Stop sending is in flight */
+  busy?: string | null
+  onDownload: (b: SentBook) => void
+  onStop: (b: SentBook) => void
+}) {
+  if (!list || list.length === 0) return null
+  return (
+    <section aria-labelledby="bk-h-sent" className="bk-section">
+      <h2 id="bk-h-sent" className="bk-h2">
+        From Taisce
+      </h2>
+      <div className="bk-reading">
+        {list.map((b) => {
+          const p = b.progress
+          const pct = pctOf(p)
+          return (
+            <Card key={b.id} className="bk-rcard bk-sent">
+              <span className="bk-rcard-body">
+                <Link to={{ kind: 'doc', id: b.id }} className="bk-rcard-title bk-sent-title">
+                  {b.title}
+                </Link>
+                <span className="muted bk-rcard-author">{sentBookLine(b)}</span>
+                <span className="bk-rcard-foot">
+                  {p && p.status !== 'unread' && (
+                    <>
+                      <span className="bk-rcard-line">
+                        <b>{pct}%</b>
+                        <span className="muted">{progressWhere(p)}</span>
+                      </span>
+                      <Bar pct={pct} label={`${b.title}: ${pct}% read`} />
+                    </>
+                  )}
+                  <span className="bk-sent-actions">
+                    <Button size="sm" icon="download" onClick={() => onDownload(b)}>
+                      Download
+                    </Button>
+                    <Button size="sm" variant="ghost" disabled={busy === b.id} onClick={() => onStop(b)}>
+                      {busy === b.id ? 'Stopping…' : 'Stop sending'}
+                    </Button>
+                  </span>
+                </span>
+              </span>
+            </Card>
+          )
+        })}
+      </div>
+    </section>
   )
 }
 

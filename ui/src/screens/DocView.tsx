@@ -13,6 +13,8 @@ import { createPortal } from 'react-dom'
 import DocEditor, { parser, type EditorSaveState } from '../editor/DocEditor'
 import { splitTree } from '../editor/splitTree'
 import LivingChip from '../LivingChip'
+import EreaderChip from '../EreaderChip'
+import { EREADER_EVENT, loadEreaderStatus, syncDiagramImages, useEreaderStatus } from '../ereader'
 import { notify, errText } from '../Notice'
 import { actionLabels, buildHighlightMap, targetBlockOf, toneOf } from '../review'
 import { api, Block, Doc, DocTree, HistoryRow, QueueRow, SearchHit } from '../types'
@@ -528,6 +530,25 @@ export default function DocView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dataVersion])
 
+  // e-readers: the doc's status (the chip, ⌘K's Send / Stop); a sent book's
+  // diagrams are drawn and uploaded in the background (once per hash set)
+  const ereader = useEreaderStatus(docId)
+  useEffect(() => {
+    const g = gen.current
+    loadEreaderStatus(docId).then((s) => {
+      if (fresh(g) && s?.sent) void syncDiagramImages(docId, { status: s })
+    })
+  }, [docId, dataVersion, fresh])
+  // Send / Stop rewrote the frontmatter server-side: show it now, not at the
+  // next stamp tick (refreshFromStore leaves a dirty editor alone)
+  useEffect(() => {
+    const on = (e: Event) => {
+      if ((e as CustomEvent<{ docId: string }>).detail?.docId === docId) refreshFromStore()
+    }
+    window.addEventListener(EREADER_EVENT, on)
+    return () => window.removeEventListener(EREADER_EVENT, on)
+  }, [docId, refreshFromStore])
+
   const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
   const listed = docs.find((d) => d.id === docId)
 
@@ -830,6 +851,7 @@ export default function DocView({
             ))}
             {!readOnly && <AddTag onAdd={addTag} />}
             <LivingChip docId={docId} dataVersion={dataVersion} />
+            <EreaderChip docId={docId} title={doc.title} status={ereader} onOpenDoc={(id) => onOpenDoc(id)} />
             {doc.review_policy && (
               <span className="dv-pill dv-pill-quiet dv-pill-policy" title="who reviews changes to this doc">
                 <Icon name="review" size={13} />
