@@ -7,7 +7,9 @@
 //! from 127.0.0.1, so loopback means nothing and `local_guard` is replaced by
 //! [`require_auth`]: `/api`, `/mcp` and `/ws` need a bearer access token.
 //! A personal access token (`tsk_…`, minted by `taisce auth token create`)
-//! is the one other bearer, and it opens `/mcp` only.
+//! opens `/mcp` only; a book upload token (`tbu_…`, minted by the person in
+//! Settings) opens `POST /api/books` only. Anywhere else either is just an
+//! unknown token.
 //!
 //! - `oauth`: RFC 8414 / RFC 9728 metadata, DCR (RFC 7591), authorize (PKCE
 //!   S256 only), token (code + rotating refresh), revoke.
@@ -185,6 +187,27 @@ pub fn new_api_token() -> String {
     format!("{PAT_PREFIX}{}", random_token())
 }
 
+/// Book upload tokens start with this: `tbu_` + 256 random bits, base64url.
+/// Distinct from `tsk_` (PATs) and from OAuth tokens (bare base64url).
+pub const UPLOAD_TOKEN_PREFIX: &str = "tbu_";
+
+/// A fresh book upload token.
+pub fn new_upload_token() -> String {
+    format!("{UPLOAD_TOKEN_PREFIX}{}", random_token())
+}
+
+/// The one route a book upload token opens: `POST /api/books`.
+pub fn upload_route(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::POST && path == "/api/books"
+}
+
+/// Constant-time compare (a credential hash is a secret), as
+/// `AdminToken::matches`.
+pub fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// How a secret is stored: lowercase hex SHA-256.
 pub fn hash_secret(s: &str) -> String {
     hex::encode(sha2::Sha256::digest(s.as_bytes()))
@@ -324,6 +347,11 @@ pub struct Authenticated {
     /// like the app (`owner_app`), but its GETs never write and it is not a
     /// push device.
     pub web_session: bool,
+    /// A book upload token (`tbu_…`): `require_auth` lets it reach
+    /// [`upload_route`] and nothing else, and `refuse_connector_writes`
+    /// lets that one write through. Never `owner_app`, never the instance
+    /// owner: it is not a person's surface.
+    pub book_upload: bool,
 }
 
 /// Paths reachable with no token: discovery, the OAuth endpoints, the
@@ -421,6 +449,7 @@ pub async fn authenticate(st: &AuthState, token: &str) -> Option<Authenticated> 
             client_id: grant.client_id,
             instance_owner,
             web_session: false,
+            book_upload: false,
         })
     })
     .await
@@ -455,7 +484,38 @@ pub async fn authenticate_pat(st: &AuthState, token: &str, ip: String) -> Option
         client_id,
         instance_owner,
         web_session: false,
+        book_upload: false,
     })
+}
+
+/// Resolve a book upload token to its owner. The identity carries
+/// `book_upload` and nothing a person's surface has: not `owner_app`, not
+/// the instance owner. `grant_id` is the token's id. Records the use (at
+/// most once a minute).
+pub async fn authenticate_upload_token(st: &AuthState, token: &str) -> Option<Authenticated> {
+    let hash = hash_secret(token);
+    let now = now();
+    crate::store_ext::with_store(&st.store, Scope::System, move |s| {
+        let t = s.upload_token_find_by_hash(&hash).ok()??;
+        // paranoia: the lookup was by this hash; a collation quirk stops here
+        if !ct_eq(&t.secret_hash, &hash) {
+            return None;
+        }
+        let human = s.auth_user(t.user_id).ok().flatten()?.principal_id;
+        let _ = s.upload_token_touch_last_used(t.id, now);
+        Some(Authenticated {
+            user_id: t.user_id,
+            grant_id: t.id,
+            client_id: format!("upload:{}", t.id),
+            principal: "claude:book-upload".into(),
+            owner_app: false,
+            human,
+            instance_owner: false,
+            web_session: false,
+            book_upload: true,
+        })
+    })
+    .await
 }
 
 /// A token name: what `revoke` and the audit log call it, and the label of
@@ -655,20 +715,41 @@ pub async fn require_auth(State(st): State<AuthState>, mut req: Request, next: N
         return unauthorized(&st.cfg, &path, None);
     };
     let is_mcp = under(&path, "/mcp");
-    // a PAT opens MCP and nothing else: elsewhere only OAuth tokens are
-    // looked up, so a PAT there is just an unknown token
-    let pat = if is_mcp && token.starts_with(PAT_PREFIX) {
+    // a PAT opens MCP and nothing else, a book upload token POST /api/books
+    // and nothing else: elsewhere only OAuth tokens are looked up, so either
+    // there is just an unknown token (the same 401)
+    let upload = token.starts_with(UPLOAD_TOKEN_PREFIX) && upload_route(req.method(), &path);
+    let special = if is_mcp && token.starts_with(PAT_PREFIX) {
         authenticate_pat(&st, &token, client_ip(&st.cfg, req.headers(), req.extensions())).await
+    } else if upload {
+        authenticate_upload_token(&st, &token).await
     } else {
         None
     };
-    let who = match pat {
+    let who = match special {
         Some(w) => Some(w),
         None => authenticate(&st, &token).await,
     };
     let Some(who) = who else {
+        if upload {
+            // guessing upload tokens: the strict per-IP failure bucket
+            let ip = crate::shares::ip_key(&client_ip(&st.cfg, req.headers(), req.extensions()));
+            tracing::warn!(target: AUDIT, event = "upload_token.auth_failed", ip);
+            if !st.limiter.allow(ratelimit::Class::UploadAuth, &ip) {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    Body::from("{\"error\":\"too many requests; try again shortly\",\"code\":\"rate_limited\"}"),
+                )
+                    .into_response();
+            }
+        }
         return unauthorized(&st.cfg, &path, Some("invalid_token"));
     };
+    // belt and braces: an upload identity past this point is on its route
+    if who.book_upload && !upload_route(req.method(), &path) {
+        return unauthorized(&st.cfg, &path, Some("invalid_token"));
+    }
     // identity is the token's: whatever the request names itself is dropped.
     // The HTTP API reads the header slot, so a connector's token fills it
     // with its own principal and the owner's app leaves it empty (→ the
@@ -706,6 +787,10 @@ pub async fn require_auth(State(st): State<AuthState>, mut req: Request, next: N
         return res;
     }
     let res = next.run(req).await;
+    if who.book_upload {
+        tracing::info!(target: AUDIT, event = "upload_token.upload", token = %who.grant_id, user = %who.user_id, ip,
+            status = res.status().as_u16());
+    }
     if is_mcp {
         tracing::info!(target: AUDIT, event = "mcp.request", client = who.client_id, grant = %who.grant_id, ip,
             method = %method, status = res.status().as_u16());

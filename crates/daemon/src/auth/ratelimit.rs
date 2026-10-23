@@ -28,6 +28,9 @@ pub enum Class {
     OpdsDevice,
     /// OPDS credential failures, per IP: guessing device passwords
     OpdsAuth,
+    /// book upload token failures on POST /api/books, per IP: guessing
+    /// `tbu_` tokens
+    UploadAuth,
 }
 
 impl Class {
@@ -44,6 +47,7 @@ impl Class {
             Class::Opds => (120.0, 0.5),
             Class::OpdsDevice => (300.0, 0.25),
             Class::OpdsAuth => (10.0, 6.0),
+            Class::UploadAuth => (10.0, 6.0),
         }
     }
 }

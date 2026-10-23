@@ -698,6 +698,7 @@ mod tests {
             human: uuid::Uuid::now_v7(),
             instance_owner: false,
             web_session: false,
+            book_upload: false,
         }
     }
 

@@ -1815,6 +1815,7 @@ mod tests {
                 human: self.human,
                 instance_owner: true,
                 web_session: false,
+                book_upload: false,
             });
             if let Some(ct) = content_type {
                 b = b.header("content-type", ct);

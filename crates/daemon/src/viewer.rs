@@ -117,6 +117,8 @@ pub async fn refuse_connector_writes(req: axum::extract::Request, next: axum::mi
         && let Some(who) = req.extensions().get::<Authenticated>()
         && !who.owner_app
         && !CONNECTOR_WRITES.contains(&req.uri().path())
+        // a book upload token's one write (require_auth admits it nowhere else)
+        && !(who.book_upload && crate::auth::upload_route(req.method(), req.uri().path()))
     {
         tracing::warn!(target: crate::auth::AUDIT, event = "refused.connector_write", user = %who.user_id, client = who.client_id, path = req.uri().path());
         return forbidden("this token is a connector: it writes through the gate (MCP, or /api/propose); other changes are made from the Taisce app");

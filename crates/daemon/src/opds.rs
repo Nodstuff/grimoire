@@ -16,6 +16,16 @@
 //! - `POST /api/ereaders/{id}/rotate` → `{password}` (the old one dies at once)
 //! - `DELETE /api/ereaders/{id}` → 204 (revoked; the row stays listed)
 //!
+//! Book upload tokens (`/api/upload-tokens…`, the same owner gate): a
+//! `tbu_…` bearer an integration (a Readarr/Chaptarr custom script) sends to
+//! `POST /api/books` and nowhere else (`auth::require_auth` enforces it).
+//!
+//! - `GET /api/upload-tokens` → `{upload_tokens}` (revoked included, never
+//!   a secret or hash)
+//! - `POST /api/upload-tokens {label}` → 201 `{upload_token, token}` (the
+//!   token exists only in this reply)
+//! - `DELETE /api/upload-tokens/{id}` → 204 (revoked; the row stays listed)
+//!
 //! Feed routes (`/opds…`) resolve the device password to its ereader in
 //! `Scope::System` — the hash IS the credential, exactly like
 //! `authenticate_pat` — then read that person's `book` rows in
@@ -41,7 +51,7 @@
 //! emit keeps the form — basic or path — the client came in with.
 
 use crate::auth::ratelimit::{Class, Limiter};
-use crate::auth::{AuthConfig, client_ip, hash_secret, now};
+use crate::auth::{AuthConfig, client_ip, ct_eq, hash_secret, now};
 use crate::share_render::esc;
 use crate::shares::ip_key;
 use crate::store_ext::with_store;
@@ -58,7 +68,7 @@ use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use taisce_store::books::{Book, BookField, BookFilter, BookPage, Ereader};
+use taisce_store::books::{Book, BookField, BookFilter, BookPage, Ereader, UploadToken};
 use taisce_store::{Scope, SharedStore, StoreError};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -179,12 +189,6 @@ fn looks_like_secret(seg: &str) -> bool {
     s.len() == SECRET_LEN && s.bytes().all(|b| BASE32.contains(&b))
 }
 
-/// Constant-time compare (a credential hash is a secret), as
-/// `AdminToken::matches`.
-fn ct_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
 
 // ---- owner routes (/api/ereaders, a person) ----
 
@@ -203,6 +207,10 @@ fn clean_label(s: &str) -> Result<String, Response> {
 /// The guard every owner route runs first: SERVER mode, a person (not a
 /// connector, not an agent principal). Returns the signed-in user.
 fn owner_gate(st: &OpdsState, v: &Viewer, headers: &HeaderMap) -> Result<Uuid, Response> {
+    owner_gate_for(st, v, headers, "pairing an ereader is done by a person, not an agent")
+}
+
+fn owner_gate_for(st: &OpdsState, v: &Viewer, headers: &HeaderMap, refusal: &str) -> Result<Uuid, Response> {
     if st.server.is_none() {
         return Err(not_found());
     }
@@ -210,7 +218,7 @@ fn owner_gate(st: &OpdsState, v: &Viewer, headers: &HeaderMap) -> Result<Uuid, R
     // require_auth puts a connector's principal here and strips it for the
     // person's own app: anything left is an agent identity
     if headers.contains_key(crate::mcp::PRINCIPAL_HEADER) {
-        return Err(crate::viewer::forbidden("pairing an ereader is done by a person, not an agent"));
+        return Err(crate::viewer::forbidden(refusal));
     }
     // SERVER mode always carries the signed-in user (LOCAL 404s above)
     v.user.ok_or_else(not_found)
@@ -303,6 +311,82 @@ async fn revoke_ereader(State(st): State<OpdsState>, v: Viewer, headers: HeaderM
     match with_store(&st.store, v.scope, move |s| s.ereader_revoke(id, now())).await {
         Ok(()) => {
             tracing::info!(target: crate::auth::AUDIT, event = "ereader.revoke", ereader = %id, user = ?v.user);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => fail(e),
+    }
+}
+
+// ---- book upload tokens (/api/upload-tokens, a person) ----
+
+fn upload_gate(st: &OpdsState, v: &Viewer, headers: &HeaderMap) -> Result<Uuid, Response> {
+    owner_gate_for(st, v, headers, "minting an upload token is done by a person, not an agent")
+}
+
+/// The token as the owner routes report it: never a hash, never the secret
+/// (that exists only in the create response).
+fn upload_token_json(t: &UploadToken) -> Value {
+    json!({
+        "id": t.id,
+        "label": t.label,
+        "created_at": rfc3339(t.created_at),
+        "last_used_at": t.last_used_at.map(rfc3339),
+        "revoked_at": t.revoked_at.map(rfc3339),
+    })
+}
+
+async fn list_upload_tokens(State(st): State<OpdsState>, v: Viewer, headers: HeaderMap) -> Response {
+    let user = match upload_gate(&st, &v, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    match with_store(&st.store, v.scope, move |s| s.upload_token_list(user)).await {
+        Ok(all) => Json(json!({"upload_tokens": all.iter().map(upload_token_json).collect::<Vec<_>>()})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateUploadTokenReq {
+    label: String,
+}
+
+async fn create_upload_token(
+    State(st): State<OpdsState>,
+    v: Viewer,
+    headers: HeaderMap,
+    body: Result<Json<CreateUploadTokenReq>, JsonRejection>,
+) -> Response {
+    if let Err(r) = upload_gate(&st, &v, &headers) {
+        return r;
+    }
+    let req = match json_or_400(body) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    let label = match clean_label(&req.label) {
+        Ok(l) => l,
+        Err(r) => return r,
+    };
+    let token = crate::auth::new_upload_token();
+    let hash = hash_secret(&token);
+    let id = Uuid::now_v7();
+    match with_store(&st.store, v.scope, move |s| s.upload_token_insert(id, &label, &hash, now())).await {
+        Ok(t) => {
+            tracing::info!(target: crate::auth::AUDIT, event = "upload_token.create", token = %t.id, label = %t.label.as_str(), user = ?v.user);
+            (StatusCode::CREATED, Json(json!({"upload_token": upload_token_json(&t), "token": token}))).into_response()
+        }
+        Err(e) => fail(e),
+    }
+}
+
+async fn revoke_upload_token(State(st): State<OpdsState>, v: Viewer, headers: HeaderMap, Path(id): Path<Uuid>) -> Response {
+    if let Err(r) = upload_gate(&st, &v, &headers) {
+        return r;
+    }
+    match with_store(&st.store, v.scope, move |s| s.upload_token_revoke(id, now())).await {
+        Ok(()) => {
+            tracing::info!(target: crate::auth::AUDIT, event = "upload_token.revoke", token = %id, user = ?v.user);
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => fail(e),
@@ -888,6 +972,8 @@ pub fn router(state: OpdsState) -> Router {
         .route("/api/ereaders", get(list_ereaders).post(create_ereader))
         .route("/api/ereaders/{id}/rotate", post(rotate_ereader))
         .route("/api/ereaders/{id}", delete(revoke_ereader))
+        .route("/api/upload-tokens", get(list_upload_tokens).post(create_upload_token))
+        .route("/api/upload-tokens/{id}", delete(revoke_upload_token))
         // labels and flags only
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
         // connectors write only through the gated routes (ADR 0004)
@@ -1031,6 +1117,7 @@ mod tests {
                 human,
                 instance_owner: true,
                 web_session: false,
+                book_upload: false,
             })
             .body(Body::from(r#"{"label":"Kobo"}"#))
             .unwrap();

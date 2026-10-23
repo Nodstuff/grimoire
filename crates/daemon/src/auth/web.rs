@@ -129,6 +129,7 @@ pub async fn authenticate_session(st: &AuthState, token: &str) -> Option<Authent
             human,
             instance_owner,
             web_session: true,
+            book_upload: false,
         })
     })
     .await

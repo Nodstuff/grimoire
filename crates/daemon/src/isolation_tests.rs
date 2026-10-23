@@ -189,6 +189,12 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/ereaders/{id}/rotate", "ereaders_are_the_pairers_alone"),
     ("/api/ereaders/{id}", "ereaders_are_the_pairers_alone"),
     ("/api/books", "books_are_the_callers_alone"),
+    // book upload tokens (opds.rs owner routes, auth::require_auth): minted
+    // by a person, listed and revoked by her alone; a `tbu_` token opens
+    // POST /api/books into its owner's shelf and nothing else
+    ("/api/upload-tokens", "upload_tokens_are_the_minters_alone"),
+    ("/api/upload-tokens/{id}", "upload_tokens_are_the_minters_alone"),
+    ("/api/books", "an_upload_token_opens_only_post_api_books"),
     ("/api/books/{id}", "books_are_the_callers_alone"),
     ("/api/books/{id}/cover", "books_are_the_callers_alone"),
     ("/api/books/progress", "kosync_progress_is_the_callers_alone"),
@@ -2604,6 +2610,124 @@ async fn books_are_the_callers_alone() {
     assert!(out.contains(&id.to_string()) && !out.contains("aoifeown"), "{out}");
     let (st, _) = fx.call(&fx.a_app, "GET", &format!("/api/books/{id}/cover"), None).await;
     assert_eq!(st, StatusCode::FOUND);
+}
+
+/// Mint a book upload token as `token` (a person's app or web session).
+async fn mint_upload_token(fx: &Fx, token: &str, label: &str) -> (Uuid, String) {
+    let (st, out) = fx.call(token, "POST", "/api/upload-tokens", Some(json!({"label": label}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let secret = v["token"].as_str().unwrap().to_string();
+    assert!(secret.starts_with(crate::auth::UPLOAD_TOKEN_PREFIX), "{secret}");
+    (v["upload_token"]["id"].as_str().unwrap().parse().unwrap(), secret)
+}
+
+#[tokio::test]
+async fn upload_tokens_are_the_minters_alone() {
+    let fx = fixture();
+    let (a_tok, a_secret) = mint_upload_token(&fx, &fx.a_app, "Tom zebrasecret chaptarr").await;
+    // the list never carries a secret or its hash
+    let (st, list) = fx.call(&fx.a_app, "GET", "/api/upload-tokens", None).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    assert!(list.contains(&a_tok.to_string()) && !list.contains(&a_secret) && !list.contains(&hash_secret(&a_secret)), "{list}");
+    // B: an empty list, and A's token by id is 404 exactly like a missing one
+    let (st, list) = fx.b("GET", "/api/upload-tokens", None).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    fx.no_leak("/api/upload-tokens", &list);
+    assert!(!list.contains(&a_tok.to_string()), "{list}");
+    let path = format!("/api/upload-tokens/{a_tok}");
+    let (st, out) = fx.b("DELETE", &path, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{out}");
+    fx.no_leak_besides(&path, &out, &[a_tok]);
+    let (st, _) = fx.b("DELETE", &format!("/api/upload-tokens/{MISSING}"), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // B's own browser session cannot revoke it either
+    let b_web = web_session(&mut fx.store.lock(Scope::System), fx.b);
+    assert_eq!(fx.call(&b_web, "DELETE", &path, None).await.0, StatusCode::NOT_FOUND);
+    // A's token still works: B's attempts changed nothing
+    assert!(fx.store.lock(Scope::User(fx.a)).upload_token_get(a_tok).unwrap().revoked_at.is_none());
+    let (st, out) = upload(&fx, &a_secret, "a.epub", tiny_epub("a token book", "Tom", "isbn:tok-a")).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    // minting is a person's: B's Claude (a connector) is refused, B's PAT
+    // never opens /api, and a token cannot mint (or list) more tokens
+    let (st, _) = fx.call(&fx.b_conn, "POST", "/api/upload-tokens", Some(json!({"label": "sneaky"}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = fx.call(&fx.b_conn, "GET", "/api/upload-tokens", None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = fx.call(&fx.b_pat, "POST", "/api/upload-tokens", Some(json!({"label": "sneaky"}))).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    for m in ["GET", "POST"] {
+        let (st, _) = fx.call(&a_secret, m, "/api/upload-tokens", Some(json!({"label": "more"}))).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{m}");
+    }
+    // B's browser mints her own; it lands on her shelf, and A revokes hers
+    let (_, b_secret) = mint_upload_token(&fx, &b_web, "Aoife script").await;
+    let (st, out) = upload(&fx, &b_secret, "b.epub", tiny_epub("aoifeown token book", "Aoife", "isbn:tok-b")).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    fx.no_leak("B's upload", &out);
+    assert_eq!(fx.call(&fx.a_app, "DELETE", &path, None).await.0, StatusCode::NO_CONTENT);
+    let (st, _) = upload(&fx, &a_secret, "a2.epub", tiny_epub("after revoke", "Tom", "isbn:tok-a2")).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "a revoked token stops at once");
+    let (_, list) = fx.call(&fx.a_app, "GET", "/api/upload-tokens", None).await;
+    let v: Value = serde_json::from_str(&list).unwrap();
+    assert!(v["upload_tokens"][0]["revoked_at"].is_string(), "revoked rows stay listed: {list}");
+}
+
+#[tokio::test]
+async fn an_upload_token_opens_only_post_api_books() {
+    let fx = fixture();
+    let (_, a_secret) = mint_upload_token(&fx, &fx.a_app, "chaptarr").await;
+    // the one route: A's token shelves into A's library, under A's prefix
+    let (st, out) = upload(&fx, &a_secret, "dune.epub", tiny_epub("token dune", "Frank Herbert", "isbn:tok-dune")).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["results"][0]["status"], "added", "{out}");
+    let id: Uuid = v["results"][0]["book"]["id"].as_str().unwrap_or_else(|| panic!("{out}")).parse().unwrap();
+    assert_eq!(fx.store.lock(Scope::User(fx.a)).book_get(id).unwrap().user_id, fx.a);
+    assert!(fx.store.lock(Scope::User(fx.b)).book_get(id).is_err(), "never on B's shelf");
+    let key = format!("library/{}/", fx.a);
+    assert!(fx.s3.memory.keys().iter().all(|k| k.starts_with(&key)), "{:?}", fx.s3.memory.keys());
+    assert!(fx.store.lock(Scope::User(fx.a)).upload_token_list(fx.a).unwrap()[0].last_used_at.is_some(), "the use is recorded");
+    // everywhere else the token answers exactly as an unknown one does
+    let unknown = format!("{}{}", crate::auth::UPLOAD_TOKEN_PREFIX, random_token());
+    let rpc = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
+    for (m, path, body) in [
+        ("GET", "/api/books".to_string(), None),
+        ("GET", "/api/books?search=dune".to_string(), None),
+        ("PATCH", format!("/api/books/{id}"), Some(json!({"title": "renamed"}))),
+        ("DELETE", format!("/api/books/{id}"), None),
+        ("GET", format!("/api/books/{id}/cover"), None),
+        ("GET", "/api/books/currently-reading".to_string(), None),
+        ("GET", "/api/docs".to_string(), None),
+        ("GET", format!("/api/doc/{}", fx.a_secret), None),
+        ("POST", "/api/propose_markdown".to_string(), Some(json!({"doc_id": fx.a_secret, "markdown": "x"}))),
+        ("GET", "/api/stamp".to_string(), None),
+        ("GET", "/api/ereaders".to_string(), None),
+        ("POST", "/api/ereaders".to_string(), Some(json!({"label": "x"}))),
+        ("GET", "/api/upload-tokens".to_string(), None),
+        ("GET", "/api/shares".to_string(), None),
+        ("GET", "/api/profile".to_string(), None),
+        ("GET", "/api/backups".to_string(), None),
+        ("POST", "/mcp".to_string(), Some(rpc.clone())),
+        ("GET", "/ws".to_string(), None),
+    ] {
+        let got = fx.call(&a_secret, m, &path, body.clone()).await;
+        let missing = fx.call(&unknown, m, &path, body).await;
+        assert_eq!(got.0, StatusCode::UNAUTHORIZED, "{m} {path}: {}", got.1);
+        assert_eq!(got, missing, "{m} {path}: a tbu_ token off its route is an unknown token");
+    }
+    assert_eq!(fx.store.lock(Scope::User(fx.a)).book_get(id).unwrap().title, "token dune", "nothing above wrote");
+    // an OAuth token still uploads (the route is not token-only)
+    let (st, _) = upload(&fx, &fx.a_app, "other.epub", tiny_epub("app book", "Tom", "isbn:app")).await;
+    assert_eq!(st, StatusCode::OK);
+    // guessing tokens on the route spends the strict per-IP bucket
+    let mut statuses = Vec::new();
+    for i in 0..12 {
+        let guess = format!("{}{}", crate::auth::UPLOAD_TOKEN_PREFIX, random_token());
+        statuses.push(upload(&fx, &guess, "g.epub", tiny_epub(&format!("guess {i}"), "x", "y")).await.0);
+    }
+    assert_eq!(statuses[0], StatusCode::UNAUTHORIZED);
+    assert_eq!(statuses.last(), Some(&StatusCode::TOO_MANY_REQUESTS), "{statuses:?}");
 }
 
 #[tokio::test]

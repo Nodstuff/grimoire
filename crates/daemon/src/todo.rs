@@ -1883,6 +1883,7 @@ mod tests {
             human,
             instance_owner: false,
             web_session: false,
+            book_upload: false,
         };
         let get = |uri: &str| {
             let mut r = Request::get(uri).body(Body::empty()).unwrap();

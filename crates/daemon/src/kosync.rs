@@ -654,6 +654,7 @@ mod tests {
                 human,
                 instance_owner: true,
                 web_session: false,
+                book_upload: false,
             })
             .body(Body::empty())
             .unwrap()
