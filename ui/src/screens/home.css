@@ -1,0 +1,944 @@
+/* Home (screens/Home.tsx): canvas Main at desktop, Mobile-Home at phone
+   width. Every value is lifted from those artboards; colours are tokens. */
+
+/* App wraps the screen in .home.briefing (the welcome state centres) */
+.home.briefing {
+  align-self: stretch;
+  text-align: left;
+  color: var(--ink);
+  width: 100%;
+}
+
+.hm {
+  gap: 28px;
+  padding-bottom: 20px;
+}
+.hm-phone,
+.hm-phone-flex {
+  display: none;
+}
+
+/* ---------- header ---------- */
+.hm-head {
+  display: flex;
+  flex-direction: column;
+}
+.hm-date {
+  font-size: var(--text-md);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--ink3);
+}
+.hm-hello {
+  margin: 4px 0 6px;
+  font-family: var(--font-serif);
+  font-size: 42px;
+  line-height: 1.1;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+  color: var(--ink);
+}
+.hm-lead {
+  color: var(--ink2);
+  font-size: var(--text-lg);
+}
+
+/* ---------- grids ---------- */
+.hm-grid {
+  display: grid;
+  gap: 18px;
+  align-items: start;
+}
+.hm-grid-3 {
+  grid-template-columns: repeat(auto-fit, minmax(min(330px, 100%), 1fr));
+}
+.hm-grid-2 {
+  grid-template-columns: repeat(auto-fit, minmax(min(460px, 100%), 1fr));
+}
+.hm-card {
+  min-width: 0;
+}
+.hm-card .lp-card-head h2 {
+  white-space: nowrap;
+}
+.hm-count {
+  line-height: 18px;
+}
+
+/* shared row (canvas .ev) */
+.hm-ev {
+  display: flex;
+  gap: 12px;
+  padding: 10px 18px;
+  border-top: 1px solid var(--line);
+  align-items: flex-start;
+  color: var(--ink);
+  text-decoration: none;
+}
+a.hm-ev-link {
+  color: var(--ink);
+}
+a.hm-ev-link:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+.hm-ev > time {
+  font-size: var(--text-sm);
+  color: var(--ink3);
+  flex: none;
+  padding-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.hm-since .hm-ev > time {
+  width: 40px;
+}
+.hm-ev-body {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.hm-ev-body b {
+  font-weight: 600;
+}
+.hm-ev-body .lp-agent-name {
+  font-size: var(--text-sm2);
+}
+.hm-person {
+  font-weight: 500;
+}
+.hm-ev-chip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+}
+.hm-bot {
+  width: 22px;
+  height: 22px;
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+}
+.hm-muted {
+  color: var(--ink3);
+}
+.hm-small {
+  font-size: var(--text-sm);
+}
+.hm-empty {
+  padding: 4px 18px 16px;
+  color: var(--ink3);
+  font-size: var(--text-md);
+}
+.hm-settled {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* text links in card headers (canvas: 12.5px accent, no underline) */
+.hm-link {
+  font: inherit;
+  font-size: var(--text-sm2);
+  color: var(--accent);
+  text-decoration: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+a.hm-link {
+  color: var(--accent);
+}
+.hm-link:hover,
+a.hm-link:hover {
+  color: var(--ink);
+}
+.hm-link.quiet {
+  color: var(--ink3);
+}
+.hm-link.quiet[aria-pressed='true'] {
+  color: var(--ink);
+}
+.hm-link:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* inset field (canvas .field) */
+.hm-field {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  height: 40px;
+  padding: 0 12px;
+  border-radius: var(--r-field);
+  border: 1px solid var(--line);
+  background: var(--card2);
+  color: var(--ink);
+  font: inherit;
+}
+.hm-field::placeholder {
+  color: var(--ink3);
+}
+.hm-field:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+textarea.hm-field {
+  height: auto;
+  padding: 10px 12px;
+  resize: none;
+  line-height: 1.45;
+}
+
+/* ---------- Today ---------- */
+.hm-todo-day {
+  padding: 0 18px 8px;
+  font-size: var(--text-sm);
+  color: var(--ink3);
+}
+.hm-todo-loading {
+  padding: 4px 18px 16px;
+}
+.hm-todo-label {
+  padding: 12px 18px 6px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--ink3);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.hm-todo-label.late {
+  color: var(--red);
+  padding-top: 2px;
+}
+.hm-todo-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.hm-todo-item {
+  position: relative;
+  border-top: 1px solid var(--line);
+}
+.hm-todo-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 18px;
+  min-height: 22px;
+}
+.hm-check {
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
+  border: 1.5px solid var(--line2);
+  margin: 0;
+  padding: 0;
+  flex: none;
+  cursor: pointer;
+  background: var(--card);
+  color: var(--on-accent);
+  display: inline-grid;
+  place-items: center;
+}
+.hm-check:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.hm-check.done {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.hm-check.carried {
+  border-style: dashed;
+  color: var(--ink3);
+}
+.hm-check:disabled {
+  cursor: default;
+}
+.hm-todo-text {
+  flex: 1;
+  min-width: 0;
+  cursor: text;
+  overflow-wrap: anywhere;
+}
+.hm-todo.readonly .hm-todo-text {
+  cursor: default;
+}
+.hm-todo-item.done .hm-todo-text {
+  color: var(--ink3);
+  text-decoration: line-through;
+}
+.hm-todo-item.carried .hm-todo-text {
+  color: var(--ink3);
+}
+.hm-todo-carried {
+  color: var(--ink3);
+  font-size: var(--text-xs);
+  margin-left: 8px;
+}
+.hm-todo-edit {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  color: var(--ink);
+  background: var(--card2);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 1px 6px;
+  margin: -2px 0;
+  outline: none;
+}
+.hm-todo-actions {
+  display: inline-flex;
+  gap: 0;
+  opacity: 0;
+  transition: opacity 0.12s;
+  flex: none;
+}
+.hm-todo-item:hover .hm-todo-actions,
+.hm-todo-item.menu-open .hm-todo-actions,
+.hm-todo-item:focus-within .hm-todo-actions {
+  opacity: 1;
+}
+.hm-todo-remove:hover {
+  color: var(--red);
+}
+.hm-todo-note-btn {
+  flex: none;
+}
+/* the deadline pill (canvas .pill / .warn / .late) */
+.hm-pill {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--text-sm);
+  padding: 0 8px;
+  line-height: 22px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line2);
+  color: var(--ink2);
+  white-space: nowrap;
+  flex: none;
+}
+.hm-pill.warn {
+  border-color: transparent;
+  background: var(--yellow-soft);
+  color: var(--yellow);
+}
+.hm-pill.late {
+  border-color: transparent;
+  background: var(--red-soft);
+  color: var(--red);
+}
+.hm-todo-item.done .hm-pill {
+  opacity: 0.6;
+}
+.hm-todo-note {
+  margin: -4px 18px 9px 48px;
+  font-size: var(--text-md);
+  color: var(--ink2);
+  white-space: pre-wrap;
+  cursor: text;
+}
+.hm-todo-note.preview {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  color: var(--ink3);
+}
+.hm-todo-note-edit {
+  margin: -2px 18px 10px 48px;
+  width: calc(100% - 66px);
+  font-size: var(--text-md);
+}
+.hm-todo-add {
+  padding: 10px 14px 14px;
+  border-top: 1px solid var(--line);
+}
+.hm-todo-add-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 4px 6px;
+  font-size: var(--text-sm);
+  color: var(--ink3);
+}
+.hm-todo-hint {
+  margin-left: auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.hm-todo-hint.warn {
+  color: var(--yellow);
+}
+.hm-todo-doc {
+  margin: 10px 4px 0;
+  color: var(--ink3);
+  font-size: var(--text-sm);
+}
+/* the row's ⋯ menu */
+.hm-menu {
+  position: absolute;
+  right: 14px;
+  top: calc(100% - 4px);
+  z-index: 20;
+  min-width: 200px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  background: var(--pal);
+  border: 1px solid var(--line2);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-pop);
+}
+.hm-menu > button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+  font: inherit;
+  font-size: var(--text-md);
+  color: var(--ink);
+  background: none;
+  border: 0;
+  border-radius: 7px;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+.hm-menu > button:hover,
+.hm-menu > button:focus-visible {
+  background: var(--hover);
+}
+.hm-menu-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 7px 10px;
+  font-size: var(--text-sm);
+  color: var(--ink3);
+}
+.hm-menu-pick > span {
+  display: flex;
+  gap: 6px;
+}
+.hm-menu-pick .hm-field {
+  height: 30px;
+  padding: 0 8px;
+  font-size: var(--text-md);
+}
+
+/* ---------- Needs you ---------- */
+.hm-needs-foot {
+  padding: 12px 18px 16px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  font-size: var(--text-sm2);
+}
+.hm-needs-foot a.lp-btn {
+  text-decoration: none;
+}
+
+/* ---------- Capture + Inbox ---------- */
+.hm-capture-field {
+  padding: 4px 14px 14px;
+}
+.hm-capture-field textarea {
+  height: 76px;
+}
+.hm-inbox-head {
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+.hm-capture-box + .hm-inbox-head {
+  padding-top: 14px;
+}
+.hm-inbox-row {
+  align-items: baseline;
+}
+a.hm-inbox-title {
+  flex: 1;
+  min-width: 0;
+  color: var(--ink);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+a.hm-inbox-title:hover {
+  color: var(--accent);
+}
+.hm-inbox-row time {
+  font-size: var(--text-sm);
+  padding: 0;
+}
+
+/* ---------- Pick up where you left off ---------- */
+.hm-recent {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.hm-recent-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.hm-recent-head h2 {
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: 600;
+}
+.hm-recent-head .hm-link {
+  margin-left: auto;
+  font-size: var(--text-md);
+}
+.hm-recent-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(200px, 100%), 1fr));
+  gap: 16px;
+}
+a.hm-doccard {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+  text-decoration: none;
+  color: var(--ink);
+}
+a.hm-doccard:hover {
+  color: var(--ink);
+  border-color: var(--line2);
+}
+.hm-doccard-page {
+  display: block;
+  background: var(--card2);
+  margin: 10px 10px 0;
+  border-radius: 9px;
+  padding: 14px 14px 0;
+  height: 112px;
+  box-sizing: border-box;
+  overflow: hidden;
+  border: 1px solid var(--line);
+}
+.hm-doccard-page b {
+  font-family: var(--font-serif);
+  font-size: 17px;
+  font-weight: 600;
+  display: block;
+  margin-bottom: 6px;
+  line-height: 1.15;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hm-doccard-page > span {
+  display: block;
+  font-family: var(--font-serif);
+  font-size: var(--text-md);
+  line-height: 1.45;
+  color: var(--ink2);
+}
+.hm-doccard-meta {
+  padding: 10px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: var(--text-sm);
+  color: var(--ink3);
+  min-width: 0;
+}
+.hm-doccard-meta > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hm-doccard-where {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink2);
+}
+.hm-doccard-meta .lp-agent-name {
+  font-size: var(--text-sm);
+}
+
+/* ---------- Currently reading ---------- */
+.hm-shelf {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  padding: 10px 18px 20px;
+}
+a.hm-book {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  text-decoration: none;
+  color: var(--ink);
+  min-width: 0;
+}
+.hm-cover {
+  aspect-ratio: 2 / 3;
+  border-radius: 4px 9px 9px 4px;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 14px 12px 12px 16px;
+  box-sizing: border-box;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.1) inset, 0 12px 26px rgba(0, 0, 0, 0.32);
+}
+.hm-cover::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 7px;
+  background: rgba(0, 0, 0, 0.18);
+  z-index: 1;
+}
+.hm-cover.art {
+  padding: 0;
+  background: var(--card2);
+}
+.hm-cover.art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+/* covers without art: book-jacket colours (content, not theme: the same in
+   light and dark, like a real cover) */
+.hm-cover.tone-1 { background: #1f3a4d; color: #f1e6cf; }
+.hm-cover.tone-2 { background: #e6e0d2; color: #1b2430; }
+.hm-cover.tone-3 { background: #2f5d46; color: #eaf2dc; }
+.hm-cover.tone-4 { background: #5a2e3a; color: #f6e3d8; }
+.hm-cover.tone-5 { background: #c9a15a; color: #1e1a12; }
+.hm-cover.tone-6 { background: #2b2f5c; color: #e4e6fb; }
+.hm-cover-motif {
+  position: absolute;
+  right: -34px;
+  bottom: -34px;
+  width: 130px;
+  height: 130px;
+  border-radius: 50%;
+  border: 10px solid currentColor;
+  opacity: 0.2;
+  pointer-events: none;
+}
+.hm-cover.tone-2 .hm-cover-motif,
+.hm-cover.tone-5 .hm-cover-motif {
+  border: 0;
+  right: 16px;
+  left: 16px;
+  bottom: 44px;
+  width: auto;
+  height: 46px;
+  border-radius: 0;
+  background: repeating-linear-gradient(90deg, currentColor 0 3px, transparent 3px 11px);
+  opacity: 0.6;
+}
+.hm-cover.tone-3 .hm-cover-motif,
+.hm-cover.tone-6 .hm-cover-motif {
+  border: 0;
+  right: -20px;
+  top: 46%;
+  bottom: auto;
+  width: 110px;
+  height: 110px;
+  border-radius: 50% 50% 0 50%;
+  background: currentColor;
+  opacity: 0.16;
+}
+.hm-cover-title {
+  font-family: var(--font-serif);
+  font-weight: 600;
+  font-size: 17px;
+  line-height: 1.08;
+  position: relative;
+  letter-spacing: -0.005em;
+  overflow-wrap: anywhere;
+}
+.hm-cover-author {
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  position: relative;
+  opacity: 0.85;
+}
+.hm-bar {
+  display: block;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--line2);
+  overflow: hidden;
+}
+.hm-bar > i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: var(--r-pill);
+}
+.hm-bar.agent > i {
+  background: var(--agent);
+}
+.hm-bar.indeterminate > i {
+  width: 40%;
+  animation: hm-slide 1.6s ease-in-out infinite;
+}
+@keyframes hm-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(250%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hm-bar.indeterminate > i {
+    animation: none;
+    width: 60%;
+  }
+}
+.hm-book-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: var(--text-sm);
+  color: var(--ink3);
+}
+.hm-book-meta > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- Since you were here ---------- */
+.hm-since-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.hm-run-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.hm-run-progress .hm-bar {
+  flex: 1;
+  max-width: 180px;
+}
+.hm-fail {
+  flex-basis: 100%;
+}
+
+/* ---------- phone (Mobile-Home) ---------- */
+@media (max-width: 760px) {
+  .hm {
+    gap: 16px;
+    font-size: var(--text-lg);
+  }
+  .hm-wide {
+    display: none !important;
+  }
+  .hm-wide-flex {
+    display: none !important;
+  }
+  .hm-phone {
+    display: block;
+  }
+  .hm-phone-flex {
+    display: flex;
+  }
+  .hm-grid {
+    display: contents;
+  }
+  /* Mobile-Home order: Today, the review card, Currently reading, then the
+     Inbox and Since cards below the fold */
+  .hm-today { order: 1; }
+  .hm-needs-phone { order: 2; }
+  .hm-reading { order: 3; }
+  .hm-capture { order: 4; }
+  .hm-since { order: 5; }
+
+  .hm-phone-head {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    order: 0;
+  }
+  .hm-phone-top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .hm-phone-settings {
+    margin-left: auto;
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    color: var(--ink2);
+    border-radius: var(--r-md);
+  }
+  .hm-phone-head .hm-hello {
+    margin: -6px 0 0;
+    font-size: var(--title-md);
+  }
+  .hm-phone-open {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 46px;
+    border-radius: var(--r-lg);
+    border: 1px solid var(--line);
+    background: var(--card);
+    color: var(--ink3);
+    font: inherit;
+    padding: 0 14px;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .hm-card {
+    border-radius: 16px;
+    box-shadow: none;
+  }
+  .hm-card .lp-card-head {
+    padding: 12px 16px 8px;
+  }
+  .hm-card .lp-card-head h2 {
+    font-size: var(--text-lg);
+  }
+  .hm-today .hm-count {
+    background: none;
+    border: 0;
+    padding: 0;
+    margin-left: -2px;
+  }
+  .hm-overdue-word {
+    margin-left: auto;
+    font-size: var(--text-sm2);
+    color: var(--red);
+    font-weight: 600;
+  }
+  .hm-todo-label {
+    display: none;
+  }
+  .hm-todo-main {
+    padding: 0 16px;
+    min-height: 48px;
+  }
+  .hm-check {
+    width: 22px;
+    height: 22px;
+    border-radius: 7px;
+  }
+  .hm-todo-actions {
+    opacity: 1;
+  }
+  .hm-todo-note {
+    margin-left: 50px;
+  }
+  .hm-todo-add {
+    padding: 10px 12px 14px;
+  }
+  .hm-todo-hint {
+    display: none;
+  }
+  .hm-ev {
+    padding: 10px 16px;
+  }
+  .hm-empty {
+    padding: 4px 16px 14px;
+  }
+
+  a.hm-needs-phone {
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px;
+    border-radius: 16px;
+    box-shadow: none;
+    text-decoration: none;
+    color: var(--ink);
+  }
+  .hm-needs-phone-mark {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    display: grid;
+    place-items: center;
+    background: var(--yellow-soft);
+    color: var(--yellow);
+    flex: none;
+  }
+  .hm-needs-phone-mark.calm {
+    background: var(--green-soft);
+    color: var(--green);
+  }
+  .hm-needs-phone-text {
+    flex: 1;
+    min-width: 0;
+  }
+  .hm-needs-phone-text b {
+    font-weight: 600;
+    display: block;
+  }
+  .hm-needs-phone-text > span {
+    display: block;
+    font-size: var(--text-sm2);
+    color: var(--ink3);
+  }
+
+  /* Currently reading sits on the ground, not in a card */
+  .hm-reading.lp-card {
+    background: none;
+    border: 0;
+    box-shadow: none;
+    overflow: visible;
+  }
+  .hm-reading .lp-card-head {
+    padding: 0 0 10px;
+  }
+  .hm-reading .lp-card-head .hm-link {
+    font-size: var(--text-md);
+  }
+  .hm-shelf {
+    gap: 12px;
+    padding: 0;
+  }
+  a.hm-book {
+    gap: 7px;
+  }
+  .hm-cover {
+    border-radius: 4px 8px 8px 4px;
+    padding: 10px 8px 9px 12px;
+    box-shadow: 0 10px 22px rgba(0, 0, 0, 0.35);
+  }
+  .hm-cover::before {
+    width: 6px;
+  }
+  .hm-cover-title {
+    font-size: 14px;
+    line-height: 1.05;
+  }
+  .hm-cover-author {
+    font-size: 7.5px;
+  }
+  .hm-cover-motif {
+    transform: scale(0.74);
+    transform-origin: bottom right;
+  }
+}

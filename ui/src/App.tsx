@@ -12,7 +12,7 @@ import ImportFolder from './ImportFolder'
 import DocTreePanel from './DocTree'
 import { notify, errText, Notices } from './Notice'
 import { CAPTURE_EVENT, onShellEvent } from './tauri'
-import Home from './Home'
+import Home from './screens/Home'
 import Capture from './Capture'
 import OpenPalette from './OpenPalette'
 import ActionsPalette from './ActionsPalette'
@@ -533,7 +533,15 @@ export default function App() {
               Write your first doc, or bring your notes along. Press <kbd className="lp-kbd">?</kbd> for every shortcut.
             </EmptyState>
           ) : (
-            <Home docs={docs} onOpenDoc={openDoc} dataVersion={dataVersion} onDocsChanged={reloadDocs} onOpenBooks={() => go({ kind: 'books' })} />
+            <Home
+              docs={docs}
+              workspaces={workspaces}
+              userName={profile?.name ?? null}
+              onOpenDoc={openDoc}
+              dataVersion={dataVersion}
+              onDocsChanged={reloadDocs}
+              onOpenPalette={() => setPalette('open')}
+            />
           )}
         </div>
       )

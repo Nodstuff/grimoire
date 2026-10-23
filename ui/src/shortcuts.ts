@@ -23,7 +23,7 @@ export type ShortcutAction =
   | 'reload' // ⌘R — reload
   | 'back' // ⌘[ — history back
   | 'forward' // ⌘] — history forward
-  | 'home' // ⌘W — home
+  | 'home' // ⌘⇧H — home (⌘W is the browser's close-tab and never reaches the page)
   | 'capture' // ⌘⇧I — quick capture to Inbox (⌘I alone is the editor's italic)
   | 'help' // ? — shortcut cheatsheet (no modifier; never while typing)
   | 'escape' // Esc — dismiss palette
@@ -85,8 +85,9 @@ export function resolveShortcut(e: KeyLike, ctx: KeyContext = {}): ShortcutActio
       return 'back'
     case ']':
       return 'forward'
-    case 'w':
-      return 'home'
+    case 'h':
+      // ⌘H alone is macOS's Hide; ⌘W closes the browser tab
+      return shift ? 'home' : null
     default:
       return null
   }

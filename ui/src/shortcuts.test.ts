@@ -31,7 +31,9 @@ describe('resolveShortcut', () => {
     ['⌘G → gardeners', meta('g'), 'gardeners'],
     ['⌘[ → back', meta('['), 'back'],
     ['⌘] → forward', meta(']'), 'forward'],
-    ['⌘W → home', meta('w'), 'home'],
+    ['⌘⇧H → home', meta('H', true), 'home'],
+    ['⌘H is not ours (macOS Hide)', meta('h'), null],
+    ['⌘W is not ours (closes the tab)', meta('w'), null],
     ['Esc → escape', { key: 'Escape', shiftKey: false, metaKey: false, ctrlKey: false }, 'escape'],
     ['? → help (no modifier)', { key: '?', shiftKey: true, metaKey: false, ctrlKey: false }, 'help'],
   ]

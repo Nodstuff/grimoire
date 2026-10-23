@@ -185,7 +185,7 @@ export interface Place {
  * exists (SERVER mode). */
 export function buildPlaces({ library, queueCount = 0 }: { library: boolean; queueCount?: number }): Place[] {
   const places: Place[] = [
-    { id: 'home', icon: 'home', label: 'Home', hint: 'the briefing', keys: '⌘W', keywords: 'briefing start' },
+    { id: 'home', icon: 'home', label: 'Home', hint: 'the briefing', keys: '⌘⇧H', keywords: 'briefing start' },
     ...(library ? [{ id: 'books' as const, icon: 'books' as const, label: 'Books', hint: 'your EPUB library', keywords: 'epub library reading' }] : []),
     {
       id: 'review',

@@ -154,7 +154,7 @@ describe('places', () => {
   })
   it('carry their shortcuts', () => {
     const keys = Object.fromEntries(buildPlaces({ library: true }).map((p) => [p.id, p.keys]))
-    expect(keys).toMatchObject({ home: '⌘W', review: '⌘⇧R', runs: '⌘G', settings: '⌘,' })
+    expect(keys).toMatchObject({ home: '⌘⇧H', review: '⌘⇧R', runs: '⌘G', settings: '⌘,' })
   })
   it('Review shows the open count', () => {
     expect(buildPlaces({ library: false, queueCount: 3 }).find((p) => p.id === 'review')!.hint).toBe('3 open')

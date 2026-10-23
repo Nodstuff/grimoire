@@ -13,7 +13,7 @@ export default function ShortcutHelp({ onClose }: { onClose: () => void }) {
         ['⌘/', 'ask the library — an answer doc with block citations (? in search; ⌘↵ asks)'],
         ['⌘,', 'settings — profile, e-readers'],
         ['⌘T', 'show or hide the sidebar'],
-        ['⌘W', 'home'],
+        ['⌘⇧H', 'home'],
         ['⌘[ / ⌘]', 'history back / forward'],
         ['⌘R', 'reload'],
       ],

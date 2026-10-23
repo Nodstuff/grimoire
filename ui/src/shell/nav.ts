@@ -40,7 +40,7 @@ export function primaryNav({
   inboxDoc: string | null
   todoDoc: string | null
 }): NavItem[] {
-  const items: NavItem[] = [{ id: 'home', label: 'Home', icon: 'home', to: { kind: 'home' }, match: ['home'], kbd: '⌘W' }]
+  const items: NavItem[] = [{ id: 'home', label: 'Home', icon: 'home', to: { kind: 'home' }, match: ['home'], kbd: '⌘⇧H' }]
   if (inboxDoc) items.push({ id: 'inbox', label: 'Inbox', icon: 'inbox', to: { kind: 'doc', id: inboxDoc }, match: [], count: counts.inbox })
   if (todoDoc) items.push({ id: 'todos', label: 'To-dos', icon: 'todo', to: { kind: 'doc', id: todoDoc }, match: [], count: counts.todos })
   items.push(
