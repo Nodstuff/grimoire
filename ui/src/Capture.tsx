@@ -71,7 +71,7 @@ export default function Capture({
           }}
         />
         <div className="capture-foot">
-          <span className="home-dim">{busy ? 'Saving…' : 'The first line becomes the title · saved to Inbox'}</span>
+          <span className="capture-hint">{busy ? 'Saving…' : 'The first line becomes the title · saved to Inbox'}</span>
           <Button variant="primary" size="sm" icon="capture" kbd="↵" disabled={busy || !text.trim()} onClick={save}>
             Capture
           </Button>

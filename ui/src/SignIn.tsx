@@ -5,6 +5,8 @@
 
 import { useEffect, useState, type ReactNode } from 'react'
 import { UNAUTHORIZED_EVENT, needsSignIn, signIn, signInError } from './auth'
+import { Button } from './lapis/Button'
+import { LapisMark } from './lapis/icons'
 
 /** checking: probing /api · signin: signed out, app not mounted ·
  * app: running · expired: running, session lapsed (overlay). */
@@ -38,17 +40,17 @@ export function SignIn({ expired = false, onSignedIn }: { expired?: boolean; onS
   return (
     <div className={`signin ${expired ? 'signin-overlay' : ''}`} role="dialog" aria-modal="true" aria-labelledby="signin-title">
       <div className="signin-card">
-        <div className="signin-mark">◈</div>
+        <LapisMark size={40} inset="var(--card)" />
         <h1 id="signin-title" className="signin-title">{expired ? 'Signed out' : 'Sign in to Taisce'}</h1>
-        <p className="meta">
+        <p className="signin-lead">
           {expired
             ? 'Your session ended. Sign in again to keep working; nothing you typed is lost.'
             : 'Use the passkey you enrolled for this server.'}
         </p>
-        <button className="accept signin-go" disabled={busy || !supported} onClick={go} autoFocus>
+        <Button variant="primary" className="signin-go" disabled={busy || !supported} onClick={go} autoFocus>
           Sign in with passkey
-        </button>
-        <p className="meta signin-msg" role="status">
+        </Button>
+        <p className="signin-msg" role="status">
           {supported ? msg : 'This browser does not support passkeys.'}
         </p>
       </div>

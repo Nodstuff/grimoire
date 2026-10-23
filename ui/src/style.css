@@ -60,89 +60,13 @@ kbd {
   margin-right: 6px;
 }
 
-.empty { align-self: center; color: var(--ink3); }
 .lazy-loading { padding: 24px; font-size: 12px; color: var(--ink3); opacity: 0.7; text-align: center; }
 
 /* ---------- doc ---------- */
 
 .meta { font-size: 11px; color: var(--ink3); }
-/* ---------- review queue ---------- */
-
-.queue { max-width: 860px; width: 100%; display: flex; flex-direction: column; gap: 14px; }
-.queue-title { font-size: 22px; font-weight: 650; margin: 0 0 10px; }
-.card {
-  background: var(--card);
-  border: 1px solid var(--line2);
-  border-radius: 12px;
-  padding: 14px 18px;
-}
-.card.yellow { border-left: 3px solid var(--yellow); }
-.card.red { border-left: 3px solid var(--red); }
-.card-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; }
-.verdict { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
-.v-yellow { color: var(--yellow); }
-.v-red { color: var(--red); }
-.card-doc { color: var(--accent); cursor: pointer; font-weight: 600; font-size: 14px; }
-.card-meta { color: var(--ink3); font-size: 12px; margin-left: auto; }
-
-.diff { display: flex; gap: 10px; }
-.diff-col { flex: 1; min-width: 0; }
-.diff-label {
-  font-size: 10px;
-  color: var(--ink3);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  margin-bottom: 4px;
-}
-.diff pre {
-  background: var(--bg);
-  border-radius: 8px;
-  padding: 10px 12px;
-  font: 12px/1.55 var(--font-mono);
-  white-space: pre-wrap;
-  margin: 0;
-  max-height: 240px;
-  overflow-y: auto;
-  color: var(--ink2);
-}
-.refs { color: var(--ink3); font-size: 12px; margin-top: 8px; }
-
-.actions { display: flex; gap: 8px; margin-top: 12px; }
-.actions button {
-  border: none;
-  border-radius: 7px;
-  padding: 5px 18px;
-  cursor: pointer;
-  font-weight: 600;
-  font-size: 13px;
-}
-.actions .accept { background: var(--green); color: var(--on-accent); }
-.actions .decline { background: none; color: var(--red); border: 1px solid var(--red); }
-.actions button:disabled { opacity: 0.4; }
-
-
-/* ---------- side panel (history / comments) ---------- */
-
-.chip {
-  background: none;
-  border: 1px solid var(--line2);
-  color: var(--ink3);
-  border-radius: 10px;
-  padding: 1px 8px;
-  font-size: 10px;
-  line-height: 1.5;
-  cursor: pointer;
-}
-.chip.on, .chip:hover { color: var(--ink); background: var(--card); }
-
-.who { font-size: 12px; font-weight: 600; }
-.who.human { color: var(--accent); }
-.who.agent { color: var(--yellow); }
-.who.remote { color: var(--red); }
-
 /* ---------- gardener management ---------- */
 
-.runs-title { font-size: 15px; color: var(--ink3); margin: 24px 0 4px; font-weight: 600; }
 .prompt-edit {
   width: 100%;
   background: var(--bg);
@@ -156,30 +80,8 @@ kbd {
   margin: 6px 0;
 }
 .prompt-edit:focus { border-color: var(--accent); }
-.gardener-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
-.gardener-actions .accept {
-  background: var(--green);
-  color: var(--on-accent);
-  border: none;
-  border-radius: 7px;
-  padding: 4px 14px;
-  font-weight: 600;
-  font-size: 12px;
-  cursor: pointer;
-}
+
 .toggle { display: flex; gap: 5px; align-items: center; font-size: 12px; color: var(--ink3); cursor: pointer; }
-
-
-.bulk-decline {
-  background: none;
-  color: var(--red);
-  border: 1px solid var(--red);
-  border-radius: 7px;
-  padding: 4px 14px;
-  font-weight: 600;
-  font-size: 12px;
-  cursor: pointer;
-}
 
 /* ---------- tables ---------- */
 
@@ -205,7 +107,6 @@ kbd {
 }
 /* freshness rides the same dot: amber = never verified / verified > 30d ago */
 
-.chip.tended { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
 .kind-badge {
   font-size: 10px;
   font-weight: 700;
@@ -220,27 +121,12 @@ kbd {
 .kind-filer { color: var(--ink3); background: color-mix(in srgb, var(--ink3) 15%, transparent); }
 .kind-tagging { color: var(--accent); background: color-mix(in srgb, var(--accent) 15%, transparent); }
 .kind-reviewer { color: var(--green); background: color-mix(in srgb, var(--green) 15%, transparent); }
-.join-input {
-  flex: 1;
-  background: var(--card2);
-  border: 1px solid var(--line2);
-  color: var(--ink);
-  border-radius: 8px;
-  padding: 6px 10px;
-  font-size: 12px;
-  font-family: var(--font-mono);
-}
-.mono { font-family: var(--font-mono); }
 
-.decline.armed { background: var(--red); color: var(--bg); }
+.mono { font-family: var(--font-mono); }
 
 .meta.err { color: var(--red); }
 
 /* doc freshness + living answers (header chips, Stale docs list) */
-.chip.verified { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
-.card.clickable { cursor: pointer; }
-.card.clickable:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--line2)); }
-.open-in-doc { margin-left: auto; }
 
 /* ---------- badges + profile ---------- */
 
@@ -258,16 +144,9 @@ kbd {
 
 .badge.tended { color: var(--green); border-color: color-mix(in srgb, var(--green) 50%, transparent); }
 
-.chip.armed, .decline.armed { background: var(--red); color: var(--bg); border-color: var(--red); }
-
-.profile-name-row { display: flex; gap: 8px; align-items: center; }
-.profile-name { font-family: inherit; font-size: 14px; }
-.profile-kv { display: grid; grid-template-columns: 90px 1fr auto; gap: 10px; align-items: center; padding: 4px 0; font-size: 13px; }
-
 /* ---------- small meta tones ---------- */
 
 .meta.ok { color: var(--green); }
-.meta.dim { opacity: 0.7; }
 
 /* ---------- run status pieces (RunStatus.tsx) ---------- */
 
@@ -322,8 +201,6 @@ kbd {
   text-overflow: ellipsis;
 }
 .run-progress-last { color: var(--ink3); }
-.run-failure { color: var(--red); font-size: 12.5px; line-height: 1.5; overflow-wrap: anywhere; }
-.run-note { color: var(--ink3); font-size: 12.5px; }
 
 /* ---------- palettes (OpenPalette, ActionsPalette, SearchPalette): group labels ---------- */
 
@@ -349,7 +226,6 @@ kbd {
 }
 @keyframes omni-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 .omni-ask em { font-style: normal; color: var(--accent); }
-.omni-list .palette-item .omni-place { color: var(--accent); }
 
 /* ---------- quick capture (Capture.tsx) ---------- */
 
@@ -357,9 +233,9 @@ kbd {
 .capture-text {
   background: none;
   border: none;
-  border-bottom: 1px solid var(--line2);
+  border-bottom: 1px solid var(--line);
   color: var(--ink);
-  padding: 15px 18px;
+  padding: 16px 18px;
   font: inherit;
   font-size: 15px;
   line-height: 1.6;
@@ -367,7 +243,9 @@ kbd {
   resize: none;
   min-height: 120px;
 }
-.capture-foot { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; gap: 12px; }
+.capture-text::placeholder { color: var(--ink3); }
+.capture-foot { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px 10px 18px; gap: 12px; }
+.capture-hint { font-size: var(--text-sm2); color: var(--ink3); }
 
 /* ---------- sign-in (SERVER mode) ---------- */
 
@@ -384,102 +262,49 @@ kbd {
 .signin-overlay { background: color-mix(in srgb, var(--bg) 92%, transparent); }
 .signin-card {
   width: 100%;
-  max-width: 360px;
-  padding: 28px 24px;
-  border: 1px solid var(--line2);
-  border-radius: 12px;
+  max-width: 400px;
+  padding: 36px 32px 28px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
   background: var(--card);
+  box-shadow: var(--shadow-pop);
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   text-align: center;
 }
-.signin-mark { font-size: 28px; color: var(--accent); }
-.signin-title { font-size: 18px; font-weight: 650; margin: 0; }
-.signin-card .meta { margin: 0; }
-.signin-go {
-  font: inherit;
-  padding: 8px 18px;
-  border: 0;
-  border-radius: 8px;
-  background: var(--green);
-  color: var(--on-accent);
-  cursor: pointer;
+.signin-title {
+  margin: 6px 0 0;
+  font-family: var(--font-serif);
+  font-size: var(--title-md);
+  font-weight: 500;
+  letter-spacing: var(--tracking-title);
+  line-height: 1.1;
 }
-.signin-go:disabled { opacity: 0.6; cursor: default; }
-.signin-msg { min-height: 1.7em; }
-
-/* ---------- share links (SharePanel) ---------- */
-.share-panel p.meta { line-height: 1.5; margin: 0 0 12px; }
-.share-new { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; }
-.share-new select { background: var(--card2); color: var(--ink); border: none; border-radius: 6px; font-size: 11px; height: 22px; }
-.share-row { border-top: 1px solid var(--line2); padding: 10px 0; }
-.share-url { font-size: 12px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.share-actions { display: flex; gap: 6px; margin-top: 6px; }
-.share-actions .danger { color: var(--red); }
-.share-empty { padding: 6px 0; }
+.signin-lead {
+  margin: 0;
+  font-size: var(--text-base);
+  color: var(--ink2);
+}
+.signin-go {
+  width: 100%;
+  justify-content: center;
+  margin-top: 8px;
+}
+.signin-msg {
+  margin: 0;
+  min-height: 1.7em;
+  font-size: var(--text-sm2);
+  color: var(--ink3);
+}
 
 /* ---------- books (EPUB library: Books / BookUpload / Ereaders / the Home shelf) ---------- */
 
 /* upload result cards: green = added/updated, dim = already here,
    .card.yellow/.card.red (clash/error) already exist */
-.card.green { border-left: 3px solid var(--green); }
-.card.dim { opacity: 0.65; }
-.v-green { color: var(--green); }
-.v-dim { color: var(--ink3); }
 
 /* the cover grid (and the Home shelf reuses .book/.book-cover) */
-.book-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 16px 12px; }
-.book {
-  background: none;
-  border: none;
-  padding: 0;
-  font: inherit;
-  color: var(--ink);
-  text-align: left;
-  cursor: pointer;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-width: 0;
-}
-.book-cover {
-  position: relative;
-  aspect-ratio: 2 / 3;
-  border-radius: 8px;
-  overflow: hidden;
-  background: var(--card);
-  border: 1px solid var(--line2);
-}
-.book:hover .book-cover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line2)); }
-.book-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.book-fallback { height: 100%; display: flex; flex-direction: column; justify-content: space-between; gap: 8px; padding: 10px; }
-.book-fallback-title {
-  font-size: 11px;
-  line-height: 1.4;
-  color: var(--ink);
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 4;
-  -webkit-box-orient: vertical;
-}
-.book-fallback-initials { align-self: flex-end; font-size: 16px; font-weight: 650; color: var(--ink3); }
-.book-badge { position: absolute; right: 6px; bottom: 6px; background: color-mix(in srgb, var(--bg) 80%, transparent); }
-.badge.reading { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 55%, transparent); }
-.badge.finished { color: var(--green); border-color: color-mix(in srgb, var(--green) 55%, transparent); }
-.book-title {
-  font-size: 11.5px;
-  line-height: 1.35;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-}
-.book-progress { height: 3px; border-radius: 2px; background: var(--card2); overflow: hidden; }
-.book-progress > span { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
 
 /* the Home "Currently reading" shelf: one horizontal row of covers */
-.book-shelf { display: flex; gap: 12px; overflow-x: auto; padding: 4px 0 8px; }
-.book-shelf .book { flex: 0 0 84px; }
 
