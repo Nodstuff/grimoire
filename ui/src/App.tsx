@@ -1,14 +1,14 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import DocEditor from './editor/DocEditor'
-import { splitTree } from './editor/splitTree'
-import TendPanel from './TendPanel'
+// The app: the Lapis shell (sidebar, top bar, phone tab bar) around one
+// screen, chosen by the URL (router.ts). App owns the shared data (the doc
+// list, the review count, the store stamp poll), the palettes and the global
+// keys; each screen lives in its own file (screens/, or the older top-level
+// ones: Home, Trash, BookLibrary, Settings, Gardeners, GraphView).
+
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import Gardeners from './Gardeners'
-import PaletteShell from './PaletteShell'
 import { FirstRunName, loadProfile } from './Profile'
 import Trash from './Trash'
-import LivingChip from './LivingChip'
 import ImportFolder from './ImportFolder'
-import ReviewRail from './ReviewRail'
 import DocTreePanel from './DocTree'
 import { notify, errText, Notices } from './Notice'
 import { CAPTURE_EVENT, onShellEvent } from './tauri'
@@ -20,13 +20,30 @@ import SearchPalette from './SearchPalette'
 import Settings from './Settings'
 import Books from './BookLibrary'
 import BookUpload from './BookUpload'
+import ShortcutHelp from './ShortcutHelp'
+import NewDocPalette from './NewDocPalette'
+import DocView, { type Panel } from './screens/DocView'
+import ReviewQueue from './screens/ReviewQueue'
+import Library from './screens/Library'
+import SearchScreen from './screens/Search'
 import { buildCommands } from './commands'
-import SharePanel from './SharePanel'
 import { signOut, webSession } from './auth'
-import { buildPlaces, loadRecentIds, pushRecentId, storeRecentIds, type PlaceId } from './omni'
-
-/** The doc side panels, owned by App so a doc switch does not close one. */
-type Panel = 'none' | 'history' | 'comments' | 'tend' | 'review' | 'share'
+import { buildPlaces, docPath, loadRecentIds, pushRecentId, storeRecentIds, type PlaceId } from './omni'
+import { resolveShortcut } from './shortcuts'
+import { goBack, goForward, navigate, useRoute, type Route } from './router'
+import Link from './Link'
+import { Button, EmptyState, Spinner } from './lapis'
+import Sidebar from './shell/Sidebar'
+import TopBar from './shell/TopBar'
+import TabBar from './shell/TabBar'
+import WorkspaceMenu from './shell/WorkspaceMenu'
+import WorkspaceMembers from './shell/WorkspaceMembers'
+import { placeTitle, primaryNav, secondaryNav, tabNav, type ShellCounts } from './shell/nav'
+import { useShellCounts } from './shell/useShellCounts'
+import { loadSidebarOpen, storeSidebarOpen, loadWorkspaceSel, storeWorkspaceSel, PHONE_QUERY } from './shell/prefs'
+import { api, ApiError, Doc, QueueRow, Profile as ProfileRow } from './types'
+import type { Workspace, WorkspaceSel } from './workspaces'
+import { workspaceColor, workspaceSummary } from './workspaces'
 
 type Stamp = { stamp: number; build?: number; version?: string }
 
@@ -39,40 +56,19 @@ const pollTimeout = () => AbortSignal.timeout(4000)
 const DIRTY_SELECTOR = '.save-state.dirty, .save-state.saving'
 // force-graph (graph) is not part of the boot bundle: it loads on first use
 const GraphView = lazy(() => import('./GraphView'))
-const Loading = () => <div className="lazy-loading">loading…</div>
-import { resolveShortcut } from './shortcuts'
-import { parseDeepLink, scrubDeepLink, tabTarget, type SettingsSection } from './deeplink'
-import { actionLabels, buildHighlightMap, describeChange, isDocOp, targetBlockOf } from './review'
-import {
-  api,
-  ApiError,
-  Block,
-  Doc,
-  DocTree,
-  BlockNode,
-  HistoryRow,
-  QueueRow,
-  SearchHit,
-  GardenerRun,
-  Profile as ProfileRow,
-} from './types'
+const Loading = () => (
+  <div className="lazy-loading">
+    <Spinner />
+  </div>
+)
 
-type View =
-  | { kind: 'doc'; id: string }
-  | { kind: 'review' }
-  | { kind: 'runs' }
-  | { kind: 'graph' }
-  | { kind: 'trash' }
-  | { kind: 'home' }
-  | { kind: 'books' }
-  | { kind: 'settings'; section: SettingsSection }
-/** The three palettes, one job each: `open` (⌘O docs + places), `actions`
- * (⌘K commands), `search` (⌘⇧F full text + ask). */
+/** The palettes, one job each: `open` (⌘O docs + places), `actions` (⌘K
+ * commands), `search` (⌘⇧F full text + ask). */
 type Palette = null | 'open' | 'actions' | 'search' | 'newdoc' | 'help' | 'capture'
 
 /** How a doc is opened: `anchor` is a [[Doc#fragment]] target (`^uuid` for a
  * block); `review` opens the in-editor review rail; `blockId` scrolls to that
- * block (sugar for anchor `^blockId`). */
+ * block (sugar for anchor `^blockId`, and it lands in the URL). */
 export interface OpenDocOpts {
   anchor?: string
   review?: boolean
@@ -87,45 +83,40 @@ export function signOutAndReload(): void {
     .catch((e) => notify(`could not sign out: ${errText(e)}`))
 }
 
+function subscribePhone(cb: () => void) {
+  try {
+    const m = matchMedia(PHONE_QUERY)
+    m.addEventListener('change', cb)
+    return () => m.removeEventListener('change', cb)
+  } catch {
+    return () => {}
+  }
+}
+function isPhoneNow() {
+  try {
+    return matchMedia(PHONE_QUERY).matches
+  } catch {
+    return false
+  }
+}
+
 export default function App() {
-  const [view, setViewRaw] = useState<View>({ kind: 'home' })
-  const [anchor, setAnchor] = useState<string | null>(null)
-  // opened FROM the review queue (or with { review: true }): DocView opens its rail
-  const [reviewIntent, setReviewIntent] = useState(false)
+  const { route, state: navState } = useRoute()
+  // a heading anchor or `^block` to scroll to, and "open the review rail",
+  // ride in history.state; a block id also lands in the URL (?block=)
+  const anchor = route.kind === 'doc' ? (navState.anchor ?? (route.block ? `^${route.block}` : null)) : null
+  const reviewIntent = route.kind === 'doc' && !!navState.review
   // which side panel a doc shows. Above DocView because that is keyed by
   // docId: kept here, the rail the user opened survives a doc switch.
   const [docPanel, setDocPanel] = useState<Panel>('none')
   // the poll's own reply carries version/build/git: no page needs its own
   // /api/buildinfo round-trip for them
   const [appStamp, setAppStamp] = useState<Stamp | null>(null)
+  const go = useCallback((r: Route) => navigate(r), [])
 
-  // ⌘[ / ⌘] history over views, browser-style
-  const history = useRef<View[]>([{ kind: 'home' }])
-  const historyIdx = useRef(0)
-  const setView = useCallback((v: View) => {
-    history.current = history.current.slice(0, historyIdx.current + 1)
-    history.current.push(v)
-    historyIdx.current = history.current.length - 1
-    setViewRaw(v)
-  }, [])
-  const goBack = useCallback(() => {
-    if (historyIdx.current > 0) {
-      historyIdx.current -= 1
-      setAnchor(null)
-      setReviewIntent(false)
-      setViewRaw(history.current[historyIdx.current])
-    }
-  }, [])
-  const goForward = useCallback(() => {
-    if (historyIdx.current < history.current.length - 1) {
-      historyIdx.current += 1
-      setAnchor(null)
-      setReviewIntent(false)
-      setViewRaw(history.current[historyIdx.current])
-    }
-  }, [])
   const [docs, setDocs] = useState<Doc[]>([])
-  const [treeOpen, setTreeOpen] = useState(false)
+  const [docsLoaded, setDocsLoaded] = useState(false)
+  const reloadDocs = useCallback(() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {}), [])
   const [palette, setPalette] = useState<Palette>(null)
   // what Search opens with: `?` from ⌘/, the typed text from ⌘O's ⌘↵
   const [searchInitial, setSearchInitial] = useState('')
@@ -168,27 +159,20 @@ export default function App() {
     ]).then(([q, f]) => setQueueCount(q + f))
   }, [])
 
-  // ?doc=<uuid>[&block=<uuid>][&tab=<name>]: the shell or an embedding host
-  // opens the page ON a doc or view. Read once, scrubbed off the URL like
-  // admin_token so a reload lands on home, not back on the doc.
-  const deepLink = useRef(parseDeepLink(location.search))
-
+  // first load: the doc list; a deep link to a doc that is not here says so
+  const bootRoute = useRef(route)
   useEffect(() => {
-    const link = deepLink.current
     api<Doc[]>('/api/docs')
       .then((list) => {
         setDocs(list)
-        if (!link?.doc) return
-        if (list.some((d) => d.id === link.doc)) openDocRef.current(link.doc, { blockId: link.block })
-        else notify('That doc is not here — it may have been deleted or moved to the Trash')
+        setDocsLoaded(true)
+        const r = bootRoute.current
+        if (r.kind === 'doc' && !list.some((d) => d.id === r.id)) {
+          notify('That doc is not here — it may have been deleted or moved to the Trash')
+        }
       })
       .catch(console.error)
     refreshQueue()
-    if (link) {
-      if (link.tab && link.tab !== 'home') setViewRaw(tabTarget(link.tab))
-      window.history.replaceState(null, '', location.pathname + scrubDeepLink(location.search) + location.hash)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshQueue])
 
   // live data: poll the store's change stamp; when it moves, every mounted
@@ -197,7 +181,6 @@ export default function App() {
   // the stamp poll doubles as the liveness check: three misses in a row
   // (7.5s) = the background service is down; one hit clears it
   const [daemonDown, setDaemonDown] = useState(false)
-  const openDocRef = useRef<OpenDoc>(() => {})
   useEffect(() => {
     let stamp: number | null = null
     let build: number | null = null
@@ -216,7 +199,7 @@ export default function App() {
         else if (r.stamp !== stamp) {
           stamp = r.stamp
           setDataVersion((v) => v + 1)
-          api<Doc[]>('/api/docs').then(setDocs).catch(() => {})
+          reloadDocs()
           refreshQueue()
         }
         // deploy landed → reload the bundle (deferred while an editor is dirty).
@@ -241,7 +224,94 @@ export default function App() {
       }
     }, 2500)
     return () => clearInterval(t)
-  }, [refreshQueue])
+  }, [refreshQueue, reloadDocs])
+
+  /* ---------- shell state: sidebar, drawer, workspace ---------- */
+
+  const isPhone = useSyncExternalStore(subscribePhone, isPhoneNow, () => false)
+  const [sidebarOpen, setSidebarOpenRaw] = useState(loadSidebarOpen)
+  const setSidebarOpen = useCallback((open: boolean) => {
+    setSidebarOpenRaw(open)
+    storeSidebarOpen(open)
+  }, [])
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  // bumped when ⌘T opens the sidebar: the tree's filter takes the caret
+  const [focusFilter, setFocusFilter] = useState(0)
+  const toggleSidebar = useCallback(() => {
+    if (isPhoneNow()) {
+      setDrawerOpen((o) => !o)
+      return
+    }
+    setSidebarOpenRaw((o) => {
+      storeSidebarOpen(!o)
+      if (!o) setFocusFilter((n) => n + 1)
+      return !o
+    })
+  }, [])
+  // the drawer closes when you go somewhere
+  useEffect(() => setDrawerOpen(false), [route])
+
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([])
+  const loadWorkspaces = useCallback(() => {
+    api<{ workspaces: Workspace[] }>('/api/workspaces')
+      .then((r) => setWorkspaces(Array.isArray(r?.workspaces) ? r.workspaces : []))
+      .catch(() => setWorkspaces([]))
+  }, [])
+  useEffect(loadWorkspaces, [loadWorkspaces, dataVersion])
+  const [ws, setWsRaw] = useState<WorkspaceSel>(loadWorkspaceSel)
+  const setWs = useCallback((sel: WorkspaceSel) => {
+    setWsRaw(sel)
+    storeWorkspaceSel(sel)
+  }, [])
+  // a selection that disappeared (unshared, deleted) falls back to All
+  useEffect(() => {
+    if (ws !== 'all' && ws !== 'unsorted' && workspaces.length > 0 && !workspaces.some((w) => w.id === ws)) setWs('all')
+  }, [ws, workspaces, setWs])
+  // /library/<ws> picks the workspace; picking one while on the Library moves the URL
+  useEffect(() => {
+    if (route.kind === 'library') {
+      const want = route.workspace ?? 'all'
+      if (want !== ws) setWs(want)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [route])
+  const pickWorkspace = useCallback(
+    (sel: WorkspaceSel) => {
+      setWs(sel)
+      if (route.kind === 'library') navigate({ kind: 'library', workspace: sel === 'all' ? null : sel }, { replace: true })
+    },
+    [route, setWs],
+  )
+  const [membersOf, setMembersOf] = useState<Workspace | null>(null)
+  const wsColor = useMemo(() => new Map(workspaces.map((w, i) => [w.id, workspaceColor(w, i)])), [workspaces])
+
+  const side = useShellCounts(dataVersion)
+  const counts: ShellCounts = { review: queueCount, inbox: side.inbox, todos: side.todos, trash: side.trash, docs: docs.length }
+
+  /* ---------- navigation helpers ---------- */
+
+  const openDoc = useCallback<OpenDoc>((id, opts) => {
+    const o: OpenDocOpts = typeof opts === 'string' ? { anchor: opts } : (opts ?? {})
+    const state = { anchor: o.anchor, review: o.review || undefined }
+    navigate(o.blockId ? { kind: 'doc', id, block: o.blockId } : { kind: 'doc', id }, {
+      state: state.anchor || state.review ? state : undefined,
+    })
+    setPalette(null)
+    // ⌘O's empty-query list
+    storeRecentIds(pushRecentId(loadRecentIds(), id))
+  }, [])
+
+  // a doc opened by URL (link, back/forward, reload) counts as recent too
+  useEffect(() => {
+    if (route.kind === 'doc') storeRecentIds(pushRecentId(loadRecentIds(), route.id))
+  }, [route])
+
+  const goPlace = useCallback((id: PlaceId) => {
+    setPalette(null)
+    if (id === 'settings') navigate({ kind: 'settings', section: 'profile' })
+    else if (id === 'ereaders') navigate({ kind: 'settings', section: 'ereaders' })
+    else navigate({ kind: id })
+  }, [])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -254,8 +324,9 @@ export default function App() {
       // Esc isn't a combo — leave its default (blur inputs etc.) intact.
       if (action === 'escape') {
         // a locked palette (ask in flight, first-run name) owns its own Esc
-        if (document.querySelector('.palette-backdrop[data-locked]')) return
+        if (document.querySelector('.palette-backdrop[data-locked], .lp-scrim[data-locked]')) return
         setPalette(null)
+        setDrawerOpen(false)
         return
       }
       // ours: ⌘O must not open the file dialog, ⌘, the browser's
@@ -263,7 +334,7 @@ export default function App() {
       e.preventDefault()
       // a locked palette (an ask in flight, the first-run name) is not
       // replaced by another one
-      if (document.querySelector('.palette-backdrop[data-locked]')) return
+      if (document.querySelector('.palette-backdrop[data-locked], .lp-scrim[data-locked]')) return
       switch (action) {
         case 'help':
           togglePalette('help')
@@ -287,22 +358,22 @@ export default function App() {
           break
         case 'settings':
           setPalette(null)
-          setView({ kind: 'settings', section: 'profile' })
+          go({ kind: 'settings', section: 'profile' })
           break
         case 'capture':
           togglePalette('capture')
           break
         case 'tree':
-          setTreeOpen((t) => !t)
+          toggleSidebar()
           break
         case 'newdoc':
           togglePalette('newdoc')
           break
         case 'review':
-          setView({ kind: 'review' })
+          go({ kind: 'review' })
           break
         case 'gardeners':
-          setView({ kind: 'runs' })
+          go({ kind: 'runs' })
           break
         case 'reload':
           location.reload()
@@ -314,27 +385,15 @@ export default function App() {
           goForward()
           break
         case 'home':
-          setView({ kind: 'home' })
+          go({ kind: 'home' })
           break
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [goBack, goForward, setView, togglePalette, openSearch])
+  }, [go, togglePalette, openSearch, toggleSidebar])
 
-  const openDoc = useCallback<OpenDoc>(
-    (id, opts) => {
-      const o: OpenDocOpts = typeof opts === 'string' ? { anchor: opts } : (opts ?? {})
-      setAnchor(o.anchor ?? (o.blockId ? `^${o.blockId}` : null))
-      setReviewIntent(!!o.review)
-      setView({ kind: 'doc', id })
-      setPalette(null)
-      // ⌘O's empty-query list
-      storeRecentIds(pushRecentId(loadRecentIds(), id))
-    },
-    [setView],
-  )
-  openDocRef.current = openDoc
+  const docId = route.kind === 'doc' ? route.id : null
 
   // the ⌘K action list
   const commands = useMemo(
@@ -346,7 +405,7 @@ export default function App() {
           setPalette(null)
           signOutAndReload()
         },
-        docId: view.kind === 'doc' ? view.id : null,
+        docId,
         onAction: (a) => {
           switch (a) {
             case 'capture':
@@ -362,10 +421,10 @@ export default function App() {
               openSearch('? ', false)
               return
             case 'books':
-              setView({ kind: 'books' })
+              go({ kind: 'books' })
               break
             case 'tree':
-              setTreeOpen((t) => !t)
+              toggleSidebar()
               break
             case 'share':
               setDocPanel('share')
@@ -374,20 +433,11 @@ export default function App() {
           setPalette(null)
         },
       }),
-    [signedIn, server, view, setView, openSearch],
+    [signedIn, server, docId, go, openSearch, toggleSidebar],
   )
 
   // the ⌘O places
   const places = useMemo(() => buildPlaces({ library: server, queueCount }), [server, queueCount])
-  const goPlace = useCallback(
-    (id: PlaceId) => {
-      setPalette(null)
-      if (id === 'settings') setView({ kind: 'settings', section: 'profile' })
-      else if (id === 'ereaders') setView({ kind: 'settings', section: 'ereaders' })
-      else setView({ kind: id })
-    },
-    [setView],
-  )
 
   // quick capture from outside the page: the shell's global hotkey (⌥⌘G) and
   // tray item emit CAPTURE_EVENT; a window the hotkey had to CREATE arrives
@@ -401,7 +451,7 @@ export default function App() {
     if (params.get('capture') === '1') {
       params.delete('capture')
       const rest = params.toString()
-      window.history.replaceState(null, '', location.pathname + (rest ? `?${rest}` : '') + location.hash)
+      window.history.replaceState(history.state, '', location.pathname + (rest ? `?${rest}` : '') + location.hash)
       open()
     }
     return () => {
@@ -410,148 +460,231 @@ export default function App() {
     }
   }, [])
 
+  /* ---------- the crumb ---------- */
+
+  const byId = useMemo(() => new Map(docs.map((d) => [d.id, d])), [docs])
+  const crumb = useMemo(() => {
+    if (route.kind === 'doc') {
+      const d = byId.get(route.id)
+      if (!d) return <span className="lp-crumb-here">Doc</span>
+      const chain: Doc[] = []
+      let cur: Doc | undefined = d
+      let guard = 0
+      while (cur && guard++ < 32) {
+        chain.unshift(cur)
+        cur = cur.parent_id ? byId.get(cur.parent_id) : undefined
+      }
+      return (
+        <>
+          {chain.slice(0, -1).map((c) => (
+            <span key={c.id} className="lp-crumb-step">
+              <Link to={{ kind: 'doc', id: c.id }}>{c.title}</Link>
+              <span aria-hidden="true">/</span>
+            </span>
+          ))}
+          <span className="lp-crumb-here" title={docPath(d, byId)}>
+            {d.title}
+          </span>
+        </>
+      )
+    }
+    if (route.kind === 'library') {
+      const { name } = workspaceSummary(route.workspace ?? 'all', workspaces, 0)
+      return (
+        <>
+          <span className="lp-crumb-step">
+            <Link to={{ kind: 'library', workspace: null }}>Library</Link>
+            {route.workspace && <span aria-hidden="true">/</span>}
+          </span>
+          {route.workspace && <span className="lp-crumb-here">{name}</span>}
+        </>
+      )
+    }
+    return <span className="lp-crumb-here">{placeTitle(route)}</span>
+  }, [route, byId, workspaces])
+
+  // the tab title follows the place
+  useEffect(() => {
+    const d = route.kind === 'doc' ? byId.get(route.id) : undefined
+    const what = route.kind === 'doc' ? (d?.title ?? 'Doc') : route.kind === 'home' ? null : placeTitle(route)
+    document.title = what ? `${what} · Taisce` : 'Taisce'
+  }, [route, byId])
+
+  /* ---------- the screen ---------- */
+
+  let screen: React.ReactNode
+  switch (route.kind) {
+    case 'home':
+      screen = (
+        <div className={`home ${docs.length === 0 ? '' : 'briefing'}`}>
+          {docsLoaded && docs.length === 0 ? (
+            <EmptyState
+              icon="doc"
+              title="Welcome to Taisce"
+              action={
+                <>
+                  <Button variant="primary" icon="plus" kbd="⌘N" onClick={() => setPalette('newdoc')}>
+                    New doc
+                  </Button>
+                  <ImportFolder label="Import a folder of Markdown…" onDone={reloadDocs} />
+                </>
+              }
+            >
+              Write your first doc, or bring your notes along. Press <kbd className="lp-kbd">?</kbd> for every shortcut.
+            </EmptyState>
+          ) : (
+            <Home docs={docs} onOpenDoc={openDoc} dataVersion={dataVersion} onDocsChanged={reloadDocs} onOpenBooks={() => go({ kind: 'books' })} />
+          )}
+        </div>
+      )
+      break
+    case 'doc':
+      screen = (
+        <DocView
+          key={route.id}
+          docId={route.id}
+          onOpenDoc={openDoc}
+          docs={docs}
+          dataVersion={dataVersion}
+          anchor={anchor}
+          reviewIntent={reviewIntent}
+          panel={docPanel}
+          setPanel={setDocPanel}
+          signedIn={signedIn}
+        />
+      )
+      break
+    case 'library':
+      screen = <Library docs={docs} workspace={route.workspace ?? 'all'} workspaces={workspaces} onNewDoc={() => setPalette('newdoc')} />
+      break
+    case 'review':
+      screen = <ReviewQueue onChange={setQueueCount} onOpenDoc={openDoc} dataVersion={dataVersion} />
+      break
+    case 'search':
+      screen = <SearchScreen q={route.q} onOpenDoc={openDoc} />
+      break
+    case 'runs':
+      screen = <Gardeners dataVersion={dataVersion} />
+      break
+    case 'settings':
+      screen = (
+        <Settings
+          section={route.section}
+          server={server}
+          onSection={(section) => go({ kind: 'settings', section })}
+          dataVersion={dataVersion}
+          version={appStamp?.version ?? null}
+          onProfileChanged={setProfile}
+          onSignOut={signedIn ? signOutAndReload : undefined}
+        />
+      )
+      break
+    case 'trash':
+      screen = <Trash dataVersion={dataVersion} onOpenDoc={openDoc} onChanged={reloadDocs} />
+      break
+    case 'books':
+      screen = server ? <Books dataVersion={dataVersion} /> : <NotHere what="The book library lives on the Taisce server; this app has none." />
+      break
+    case 'graph':
+      screen = (
+        <Suspense fallback={<Loading />}>
+          <GraphView onOpenDoc={openDoc} />
+        </Suspense>
+      )
+      break
+    case 'notfound':
+      screen = <NotHere what={`Nothing lives at ${route.path}.`} />
+      break
+  }
+
+  const showSidebar = isPhone ? drawerOpen : sidebarOpen
+  const sidebar = showSidebar && (
+    <Sidebar
+      route={route}
+      drawer={isPhone}
+      primary={primaryNav({ server, counts, inboxDoc: side.inboxDoc, todoDoc: side.todoDoc })}
+      secondary={secondaryNav(counts)}
+      workspaceMenu={<WorkspaceMenu value={ws} list={workspaces} docCount={docs.length} onChange={pickWorkspace} onMembers={setMembersOf} />}
+      tree={
+        <DocTreePanel
+          docs={docs}
+          selected={docId}
+          onSelect={(id) => openDoc(id)}
+          onChanged={reloadDocs}
+          workspace={ws}
+          wsColor={wsColor}
+          onNewDoc={() => setPalette('newdoc')}
+          focusFilter={focusFilter}
+        />
+      }
+      userName={profile?.name ?? null}
+      host={location.host}
+      onHide={() => (isPhone ? setDrawerOpen(false) : setSidebarOpen(false))}
+      onNavigate={() => setDrawerOpen(false)}
+    />
+  )
+
   return (
-    <div className="app">
+    <div className={`lp-app${showSidebar && !isPhone ? '' : ' lp-app-noside'}`}>
       {/* the window's title bar is transparent and the page runs under it
           (traffic lights float over the UI); this strip is what you grab
           to drag the window, and double-click to zoom it. Inert in a
           browser tab. */}
       <div className="titlebar" data-tauri-drag-region aria-hidden="true" />
+      <a href="#main" className="lp-skip">
+        Skip to content
+      </a>
       <Notices />
       {daemonDown && (
         <div className="daemon-banner" role="status" data-tauri-drag-region>
           Taisce’s background service is not responding — edits are kept in the editor and will save when it is back
         </div>
       )}
-      {treeOpen && (
-        <DocTreePanel
-          docs={docs}
-          selected={view.kind === 'doc' ? view.id : null}
-          onSelect={openDoc}
-          onClose={() => setTreeOpen(false)}
-          onOpenSettings={() => goPlace('settings')}
-          onChanged={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
-        />
-      )}
-      <main className="stage" onClick={() => palette && setPalette(null)}>
-        {view.kind === 'home' && (
-          <div className={`home ${docs.length === 0 ? '' : 'briefing'}`}>
-            {docs.length === 0 && <div className="home-mark">◈</div>}
-            {docs.length === 0 ? (
-              <div className="home-start">
-                <div className="home-start-title">Welcome to Taisce</div>
-                <div><kbd>⌘N</kbd> create your first doc</div>
-                <div>
-                  <ImportFolder
-                    label="Already have notes? Import a folder of Markdown…"
-                    onDone={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
-                  />
-                </div>
-                <div><kbd>?</kbd> all shortcuts</div>
-              </div>
-            ) : (
-              <Home
-                docs={docs}
-                onOpenDoc={openDoc}
-                dataVersion={dataVersion}
-                onDocsChanged={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
-                onOpenBooks={() => setView({ kind: 'books' })}
-              />
-            )}
+      {sidebar &&
+        (isPhone ? (
+          <div className="lp-drawer-scrim" onMouseDown={() => setDrawerOpen(false)}>
+            <div onMouseDown={(e) => e.stopPropagation()}>{sidebar}</div>
           </div>
-        )}
-        {view.kind === 'doc' && (
-          <DocView
-            key={view.id}
-            docId={view.id}
-            onOpenDoc={openDoc}
-            docs={docs}
-            dataVersion={dataVersion}
-            anchor={anchor}
-            reviewIntent={reviewIntent}
-            panel={docPanel}
-            setPanel={setDocPanel}
-            signedIn={signedIn}
-          />
-        )}
-        {view.kind === 'review' && (
-          <ReviewQueue
-            onChange={setQueueCount}
-            onOpenDoc={openDoc}
-            dataVersion={dataVersion}
-          />
-        )}
-        {view.kind === 'runs' && <Gardeners dataVersion={dataVersion} />}
-        {view.kind === 'settings' && (
-          <Settings
-            section={view.section}
-            server={server}
-            onSection={(section) => setView({ kind: 'settings', section })}
-            dataVersion={dataVersion}
-            version={appStamp?.version ?? null}
-            onProfileChanged={setProfile}
-            onSignOut={signedIn ? signOutAndReload : undefined}
-          />
-        )}
-        {view.kind === 'trash' && (
-          <Trash
-            dataVersion={dataVersion}
-            onOpenDoc={openDoc}
-            onChanged={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
-          />
-        )}
-        {view.kind === 'books' && server && <Books dataVersion={dataVersion} />}
-        {view.kind === 'graph' && (
-          <Suspense fallback={<Loading />}>
-            <GraphView onOpenDoc={openDoc} />
-          </Suspense>
-        )}
-      </main>
+        ) : (
+          sidebar
+        ))}
+      <div className="lp-main">
+        <TopBar
+          crumb={crumb}
+          sidebarHidden={!isPhone && !sidebarOpen}
+          onShowSidebar={() => (isPhone ? setDrawerOpen(true) : setSidebarOpen(true))}
+          onOpen={() => togglePalette('open')}
+          onActions={() => togglePalette('actions')}
+          onCapture={() => togglePalette('capture')}
+          onNewDoc={() => togglePalette('newdoc')}
+          onBack={goBack}
+          onForward={goForward}
+        />
+        <main id="main" className={`stage stage-${route.kind}`} tabIndex={-1} onClick={() => palette && setPalette(null)}>
+          {screen}
+        </main>
+      </div>
+      <TabBar items={tabNav({ server, counts })} route={route} onCapture={() => togglePalette('capture')} />
 
       {profile && !profile.confirmed && <FirstRunName profile={profile} onSaved={setProfile} />}
-      <ImportFolder
-        hiddenButton
-        inputId="import-folder-input"
-        onDone={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
-      />
+      <ImportFolder hiddenButton inputId="import-folder-input" onDone={reloadDocs} />
       {/* the ⌘K "Add EPUBs…" command clicks this input and shows the Books
           view, which renders the shared upload queue's chips and cards */}
       {server && <BookUpload hiddenButton inputId="book-upload-input" />}
-
-      <nav className="top-nav" aria-label="navigation">
-        {queueCount > 0 && view.kind !== 'review' && (
-          <button className="queue-chip" onClick={() => setView({ kind: 'review' })}>
-            {queueCount} to review
-          </button>
-        )}
-        <button className="nav-btn" title="Open a doc or place (⌘O)" onClick={() => togglePalette('open')}>
-          Open <kbd>⌘O</kbd>
-        </button>
-        <button className="nav-btn" title="Actions (⌘K)" onClick={() => togglePalette('actions')}>
-          Actions <kbd>⌘K</kbd>
-        </button>
-        <button
-          className={`nav-btn nav-icon ${view.kind === 'settings' ? 'on' : ''}`}
-          title="Settings (⌘,)"
-          aria-label="Settings"
-          onClick={() => goPlace('settings')}
-        >
-          ⚙
-        </button>
-      </nav>
+      {membersOf && <WorkspaceMembers workspace={membersOf} onClose={() => setMembersOf(null)} onChanged={loadWorkspaces} />}
 
       {palette === 'open' && (
         <OpenPalette
           docs={docs}
           places={places}
-          currentId={view.kind === 'doc' ? view.id : null}
+          currentId={docId}
           onOpenDoc={openDoc}
           onPlace={goPlace}
           onSearchText={(q) => openSearch(q, false)}
           onClose={() => setPalette(null)}
         />
       )}
-      {palette === 'actions' && <ActionsPalette commands={commands} onClose={() => setPalette(null)} />}
+      {palette === 'actions' && <ActionsPalette commands={commands} docTitle={docId ? byId.get(docId)?.title : null} onClose={() => setPalette(null)} />}
       {palette === 'search' && (
         <SearchPalette key={searchInitial} initial={searchInitial} onOpenDoc={openDoc} onClose={() => setPalette(null)} />
       )}
@@ -560,7 +693,7 @@ export default function App() {
         <Capture
           onClose={() => setPalette(null)}
           onCaptured={(c) => {
-            api<Doc[]>('/api/docs').then(setDocs).catch(() => {})
+            reloadDocs()
             notify(`captured → Inbox · ${c.title}`, 'ok', { onClick: () => openDoc(c.doc_id) })
           }}
         />
@@ -568,7 +701,7 @@ export default function App() {
       {palette === 'newdoc' && (
         <NewDocPalette
           onCreated={(id) => {
-            api<Doc[]>('/api/docs').then(setDocs).catch(() => {})
+            reloadDocs()
             openDoc(id)
           }}
           onClose={() => setPalette(null)}
@@ -578,892 +711,20 @@ export default function App() {
   )
 }
 
-/* ---------- palettes (PaletteShell lives in ./PaletteShell) ---------- */
-
-/** The full shortcut cheatsheet (opened with `?`). The home hint bar shows the
- * common few; this is the complete list, including the editor-only marks. */
-function ShortcutHelp({ onClose }: { onClose: () => void }) {
-  const groups: [string, [string, string][]][] = [
-    [
-      'Navigate',
-      [
-        ['⌘O', 'open a doc or place — fuzzy over titles and paths (recent when empty)'],
-        ['⌘K', 'actions — new doc, capture, export, backup, sign out… (this doc’s first)'],
-        ['⌘⇧F', 'search inside docs (⌘F and ⌘P too; ⌘S in a doc just confirms autosave)'],
-        ['⌘/', 'ask the library — an answer doc with block citations (? in search; ⌘↵ asks)'],
-        ['⌘,', 'settings — profile, e-readers'],
-        ['⌘T', 'toggle file tree'],
-        ['⌘W', 'home'],
-        ['⌘[ / ⌘]', 'history back / forward'],
-        ['⌘R', 'reload'],
-      ],
-    ],
-    [
-      'Create & act',
-      [
-        ['⌘N', 'new doc'],
-        ['⌘⇧I', 'quick capture → Inbox (⌥⌘G from anywhere on the Mac, in the app)'],
-        ['⌘⇧R', 'review queue'],
-        ['⌘G', 'gardeners'],
-      ],
-    ],
-    [
-      'In a doc',
-      [
-        ['⌘B / ⌘I / ⌘E', 'bold / italic / code'],
-        ['⌘↵', 'save now / post comment'],
-        ['Esc', 'close panel'],
-        ['?', 'this cheatsheet'],
-      ],
-    ],
-  ]
+function NotHere({ what }: { what: string }) {
   return (
-    <PaletteShell onClose={onClose}>
-      <div className="shortcut-help">
-        <div className="shortcut-help-title">Keyboard shortcuts</div>
-        {groups.map(([title, rows]) => (
-          <div className="shortcut-group" key={title}>
-            <div className="shortcut-group-title">{title}</div>
-            {rows.map(([keys, label]) => (
-              <div className="shortcut-row" key={keys}>
-                <span className="shortcut-keys">
-                  {keys.split(' ').map((k, i) =>
-                    k === '/' ? (
-                      <span key={i}> / </span>
-                    ) : (
-                      <kbd key={i}>{k}</kbd>
-                    ),
-                  )}
-                </span>
-                <span className="shortcut-label">{label}</span>
-              </div>
-            ))}
-          </div>
-        ))}
-      </div>
-    </PaletteShell>
-  )
-}
-
-function NewDocPalette({ onCreated, onClose }: { onCreated: (id: string) => void; onClose: () => void }) {
-  const [title, setTitle] = useState('')
-  const inputRef = useRef<HTMLInputElement>(null)
-  useEffect(() => inputRef.current?.focus(), [])
-
-  const create = async () => {
-    if (!title.trim()) return
-    const d = await api<Doc>('/api/docs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: title.trim() }),
-    })
-    onCreated(d.id)
-  }
-
-  return (
-    <PaletteShell onClose={onClose}>
-      <input
-        ref={inputRef}
-        placeholder="New doc title…"
-        value={title}
-        onChange={(e) => setTitle(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') create().catch((err) => notify(String(err)))
-        }}
-      />
-      <div className="palette-empty">Enter to create</div>
-    </PaletteShell>
-  )
-}
-
-/* ---------- tree ---------- */
-
-/* ---------- doc view ---------- */
-
-/** Click-to-rename doc title. The server rewrites inbound [[wikilinks]] to
- * the new title in docs the renamer can write (`rename_doc`). */
-function DocTitle({ doc, onRenamed }: { doc: Doc; onRenamed: () => void }) {
-  const [editing, setEditing] = useState(false)
-  const [value, setValue] = useState(doc.title)
-  // Enter unmounts the input, whose blur fires save again: one rename only
-  const saving = useRef(false)
-
-  const save = async () => {
-    if (saving.current) return
-    saving.current = true
-    setEditing(false)
-    const title = value.trim()
-    if (!title || title === doc.title) {
-      setValue(doc.title)
-      saving.current = false
-      return
-    }
-    try {
-      await api(`/api/doc/${doc.id}/rename`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title }),
-      })
-    } catch (e) {
-      console.error(e)
-      notify(`rename failed: ${errText(e)}`, 'warn')
-      setValue(doc.title)
-    } finally {
-      saving.current = false
-    }
-    onRenamed()
-  }
-
-  if (!editing)
-    return (
-      <h1 className="doc-title" title="click to rename" onClick={() => {
-        setValue(doc.title)
-        setEditing(true)
-      }}>
-        {doc.title}
-      </h1>
-    )
-  return (
-    <input
-      className="doc-title-edit"
-      autoFocus
-      value={value}
-      onChange={(e) => setValue(e.target.value)}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter') save()
-        if (e.key === 'Escape') {
-          setValue(doc.title)
-          setEditing(false)
+    <div className="lp-page">
+      <EmptyState
+        icon="info"
+        title="Nothing here"
+        action={
+          <Button variant="primary" icon="home" onClick={() => navigate({ kind: 'home' })}>
+            Go home
+          </Button>
         }
-      }}
-      onBlur={save}
-    />
-  )
-}
-
-function DocView({
-  docId,
-  onOpenDoc,
-  docs,
-  dataVersion,
-  anchor,
-  reviewIntent = false,
-  panel,
-  setPanel,
-  signedIn = false,
-}: {
-  docId: string
-  onOpenDoc: OpenDoc
-  docs: Doc[]
-  dataVersion: number
-  anchor?: string | null
-  /** opened from the review queue: open the rail on load */
-  reviewIntent?: boolean
-  /** owned by App so it outlives this component's per-doc remount */
-  panel: Panel
-  setPanel: (p: Panel) => void
-  /** SERVER mode, signed in through this browser: share links are offered */
-  signedIn?: boolean
-}) {
-  const [tree, setTree] = useState<DocTree | null>(null)
-  const [backlinks, setBacklinks] = useState<SearchHit[]>([])
-  // stale guard: DocView is keyed by docId (one instance per open doc), so a
-  // fetch that resolves after unmount — or after a doc switch — is for a doc
-  // that is no longer on screen. `gen` bumps on every docId change too, in
-  // case a caller ever reuses the instance.
-  const gen = useRef(0)
-  useEffect(() => {
-    const g = ++gen.current
-    return () => {
-      if (gen.current === g) gen.current++
-    }
-  }, [docId])
-  const fresh = useCallback(
-    (g: number) => gen.current === g,
-    [],
-  )
-  // open review items for THIS doc (yellow = applied+flagged, red = parked)
-  const [reviewItems, setReviewItems] = useState<QueueRow[]>([])
-  const loadReview = useCallback(() => {
-    const g = gen.current
-    api<QueueRow[]>(`/api/doc/${docId}/review`)
-      .then((r) => fresh(g) && setReviewItems(Array.isArray(r) ? r : []))
-      .catch(() => fresh(g) && setReviewItems([]))
-  }, [docId, fresh])
-  const [selBlock, setSelBlock] = useState<string | null>(null)
-  const [selRect, setSelRect] = useState<{ x: number; y: number } | null>(null)
-  const [commentTarget, setCommentTarget] = useState<string | null>(null)
-  // epochs this editor produced itself — external changes are anything above
-  const ownEpoch = useRef(0)
-  const [editorGen, setEditorGen] = useState(0)
-
-  // anchor the comment bubble just above the selected text
-  const onSelectionBlock = useCallback((blockId: string | null) => {
-    setSelBlock(blockId)
-    if (!blockId) {
-      setSelRect(null)
-      return
-    }
-    requestAnimationFrame(() => {
-      const sel = window.getSelection()
-      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
-        setSelRect(null)
-        return
-      }
-      const r = sel.getRangeAt(0).getBoundingClientRect()
-      setSelRect({ x: r.left + r.width / 2, y: r.top })
-    })
-  }, [])
-
-  const loadTree = useCallback(() => {
-    const g = gen.current
-    api<DocTree>(`/api/doc/${docId}`)
-      .then((t) => fresh(g) && setTree(t))
-      .catch(console.error)
-    api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
-      .then((b) => fresh(g) && setBacklinks(b))
-      .catch(() => fresh(g) && setBacklinks([]))
-  }, [docId, fresh])
-
-  useEffect(() => {
-    setTree(null)
-    // the panel choice is the user's, not the doc's: only a review-queue
-    // open overrides it (the same rule as the reviewIntent effect below)
-    if (reviewIntent) setPanel('review')
-    setCommentTarget(null)
-    setReviewItems([])
-    ownEpoch.current = 0
-    loadTree()
-    loadReview()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loadTree, loadReview])
-
-  // a later { review: true } open of the SAME doc still opens the rail
-  useEffect(() => {
-    if (reviewIntent) setPanel('review')
-  }, [reviewIntent, anchor])
-
-  useEffect(() => {
-    if (dataVersion === 0) return
-    loadReview()
-  }, [dataVersion, loadReview])
-
-  // after a resolve: content may have moved (yellow decline reverts, red
-  // accept applies) — refetch, remount the editor if the epoch moved
-  const treeRef = useRef<DocTree | null>(null)
-  treeRef.current = tree
-  const afterResolve = useCallback(() => {
-    loadReview()
-    const g = gen.current
-    api<DocTree>(`/api/doc/${docId}`)
-      .then((next) => {
-        if (!fresh(g)) return
-        const cur = treeRef.current
-        if (!cur || next.doc.current_epoch !== cur.doc.current_epoch) {
-          ownEpoch.current = Math.max(ownEpoch.current, next.doc.current_epoch)
-          setEditorGen((g) => g + 1)
-        }
-        setTree(next)
-      })
-      .catch(() => {})
-  }, [docId, loadReview, fresh])
-
-  const highlightMap = useMemo(() => buildHighlightMap(reviewItems), [reviewItems])
-
-  // live refresh: when the store changed and this doc moved past what our own
-  // saves produced, reload it and remount the editor with the fresh content
-  // (skipped while dirty — the pending autosave lands first, next tick catches up)
-  const refreshFromStore = useCallback(() => {
-    const cur = treeRef.current
-    if (!cur) return
-    const g = gen.current
-    api<DocTree>(`/api/doc/${docId}`)
-      .then((next) => {
-        if (!fresh(g)) return
-        const known = Math.max(cur.doc.current_epoch, ownEpoch.current)
-        const dirty = document.querySelector('.save-state.dirty, .save-state.saving')
-        if (next.doc.current_epoch > known && !dirty) {
-          setTree(next)
-          setEditorGen((g) => g + 1)
-        } else if (next.doc.status !== cur.doc.status) {
-          setTree(next)
-        }
-        api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
-          .then((b) => fresh(g) && setBacklinks(b))
-          .catch(() => {})
-      })
-      .catch((e) => console.warn('doc refresh failed', docId, e))
-  }, [docId, fresh])
-  useEffect(() => {
-    if (dataVersion === 0) return
-    refreshFromStore()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataVersion])
-
-  const byTitle = useMemo(() => new Map(docs.map((d) => [d.title, d.id])), [docs])
-
-  // anchor from a link: [[Doc#^block-uuid]] finds the block by stable id,
-  // [[Doc#Heading]] falls back to text match. Scroll + flash.
-  useEffect(() => {
-    if (!anchor || !tree) return
-    // retry across editor remounts (live refresh can race the first attempt)
-    const attempt = () => {
-      let el: Element | null = null
-      if (anchor.startsWith('^')) {
-        el = document.querySelector(`[data-block-id="${anchor.slice(1)}"]`)
-      }
-      if (!el) {
-        const needle = anchor.replace(/^\^/, '').toLowerCase()
-        el =
-          [...document.querySelectorAll(
-            '.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4, .ProseMirror p',
-          )].find((n) => n.textContent?.toLowerCase().includes(needle)) ?? null
-      }
-      if (el) {
-        el.scrollIntoView({ block: 'start' })
-        el.classList.add('anchor-flash')
-        setTimeout(() => el.classList.remove('anchor-flash'), 1600)
-        return true
-      }
-      return false
-    }
-    const timers = [250, 900, 1800].map((ms) => setTimeout(attempt, ms))
-    return () => timers.forEach(clearTimeout)
-  }, [anchor, tree])
-
-  // wikilink click-through: decorated targets carry data-target
-  const onStageClick = useCallback(
-    (e: React.MouseEvent) => {
-      const el = (e.target as HTMLElement).closest('.wl-target') as HTMLElement | null
-      if (!el) return
-      const target = el.dataset.target ?? ''
-      const [path, fragment] = target.split('#')
-      const name = path.split('/').pop()?.trim() ?? path
-      const id = byTitle.get(name)
-      if (id) {
-        e.preventDefault()
-        onOpenDoc(id, fragment?.trim())
-      }
-    },
-    [byTitle, onOpenDoc],
-  )
-
-  const { editable, comments, allBlocks, removedCanvases } = useMemo(() => {
-    if (!tree)
-      return {
-        editable: null,
-        comments: [] as Block[],
-        allBlocks: [] as Block[],
-        removedCanvases: 0,
-      }
-    const { blocks, comments, allBlocks, hidden, removedCanvases } = splitTree(tree.roots)
-    return {
-      editable: { docId, epoch: tree.doc.current_epoch, blocks, hidden },
-      comments,
-      allBlocks,
-      removedCanvases,
-    }
-  }, [tree, docId])
-
-  if (!tree || !editable) return <div className="empty">…</div>
-
-  return (
-    <article className="doc" onClick={onStageClick}>
-      <div className="doc-head">
-        <span className="head-actions">
-          {tree.doc.review_policy && <span className="meta policy">{tree.doc.review_policy}</span>}
-          <LivingChip docId={docId} dataVersion={dataVersion} />
-          <button
-            className={`chip ${panel === 'history' ? 'on' : ''}`}
-            onClick={() => setPanel(panel === 'history' ? 'none' : 'history')}
-          >
-            history
-          </button>
-          <button
-            className={`chip ${panel === 'comments' ? 'on' : ''}`}
-            onClick={() => setPanel(panel === 'comments' ? 'none' : 'comments')}
-          >
-            comments{comments.length > 0 ? ` ${comments.length}` : ''}
-          </button>
-          <button
-            className={`chip ${panel === 'tend' ? 'on' : ''} ${docs.find((d) => d.id === docId)?.is_tended ? 'tended' : ''}`}
-            onClick={() => setPanel(panel === 'tend' ? 'none' : 'tend')}
-          >
-            {docs.find((d) => d.id === docId)?.is_tended ? '🌿 tended' : 'tend'}
-          </button>
-          {signedIn && (
-            <button
-              className={`chip ${panel === 'share' ? 'on' : ''}`}
-              title="a public, read-only link to a snapshot of this doc"
-              onClick={() => setPanel(panel === 'share' ? 'none' : 'share')}
-            >
-              share link…
-            </button>
-          )}
-          {reviewItems.length > 0 && (
-            <button
-              className={`chip review-chip ${panel === 'review' ? 'on' : ''}`}
-              title="review changes in this doc"
-              onClick={() => setPanel(panel === 'review' ? 'none' : 'review')}
-            >
-              ⚠ {reviewItems.length} to review
-            </button>
-          )}
-        </span>
-        <DocTitle doc={tree.doc} onRenamed={loadTree} />
-      </div>
-      {removedCanvases > 0 && (
-        <div className="meta canvas-removed">
-          Canvas (removed) · this doc holds {removedCanvases === 1 ? 'a canvas' : `${removedCanvases} canvases`} the
-          app no longer shows
-        </div>
-      )}
-      <DocEditor
-        key={`${docId}:${editorGen}`}
-        doc={editable}
-        reviewMap={highlightMap}
-        onSaved={(e, savedDocId) => {
-          // the unmount flush of a PREVIOUS doc's editor reports its own id
-          if (savedDocId !== docId) return
-          ownEpoch.current = Math.max(ownEpoch.current, e)
-        }}
-        onSelectionBlock={onSelectionBlock}
-      />
-      {selBlock && selRect && panel !== 'comments' && (
-        <span className="sel-actions" style={{ left: selRect.x, top: selRect.y }}>
-          <button
-            title="comment on selection"
-            onMouseDown={(e) => {
-              e.preventDefault()
-              setCommentTarget(selBlock)
-              setPanel('comments')
-              setSelRect(null)
-            }}
-          >
-            💬
-          </button>
-          <button
-            title="copy block link"
-            onMouseDown={(e) => {
-              e.preventDefault()
-              navigator.clipboard
-                .writeText(`[[${tree.doc.title}#^${selBlock}]]`)
-                .catch(() => {})
-              setSelRect(null)
-            }}
-          >
-            🔗
-          </button>
-        </span>
-      )}
-      {panel === 'history' && <HistoryPanel docId={docId} onClose={() => setPanel('none')} />}
-      {panel === 'share' && signedIn && (
-        <SharePanel docId={docId} title={tree.doc.title} onClose={() => setPanel('none')} />
-      )}
-      {panel === 'review' && (
-        <ReviewRail items={reviewItems} onChanged={afterResolve} onClose={() => setPanel('none')} />
-      )}
-      {panel === 'tend' && (
-        <TendPanel doc={tree.doc} onClose={() => setPanel('none')} dataVersion={dataVersion} />
-      )}
-      {panel === 'comments' && (
-        <CommentsPanel
-          comments={comments}
-          allBlocks={allBlocks}
-          target={commentTarget}
-          setTarget={setCommentTarget}
-          onPosted={loadTree}
-          onClose={() => setPanel('none')}
-        />
-      )}
-      {backlinks.length > 0 && (
-        <div className="backlinks">
-          <span className="meta">linked from</span>
-          {backlinks.map((b) => (
-            <span key={b.block.id} className="backlink" onClick={() => onOpenDoc(b.block.doc_id)}>
-              {b.doc_title}
-            </span>
-          ))}
-        </div>
-      )}
-    </article>
-  )
-}
-
-/* ---------- provenance & comments panels (5.4 / 5.5) ---------- */
-
-function opSnippet(kind: Record<string, unknown> & { op: string }): string {
-  const c = typeof kind.content === 'string' ? (kind.content as string) : ''
-  return c ? c.split('\n')[0].slice(0, 90) : `${kind.op} ${String(kind.target ?? '').slice(0, 8)}`
-}
-
-function HistoryPanel({ docId, onClose }: { docId: string; onClose: () => void }) {
-  const [rows, setRows] = useState<HistoryRow[]>([])
-  useEffect(() => {
-    api<HistoryRow[]>(`/api/doc/${docId}/history`).then(setRows).catch(console.error)
-  }, [docId])
-
-  // one entry per epoch (a save/run), ops grouped beneath
-  const epochs = useMemo(() => {
-    const m = new Map<number, HistoryRow[]>()
-    for (const r of rows) {
-      const e = r.op.epoch_applied ?? -1
-      if (!m.has(e)) m.set(e, [])
-      m.get(e)!.push(r)
-    }
-    return [...m.entries()].sort((a, b) => b[0] - a[0])
-  }, [rows])
-
-  return (
-    <aside className="panel">
-      <div className="panel-head">
-        <span>history</span>
-        <button onClick={onClose}>esc</button>
-      </div>
-      {epochs.map(([epoch, ops]) => (
-        <div key={epoch} className="epoch-group">
-          <div className="epoch-line">
-            <span className="meta">epoch {epoch}</span>
-            <span className={`who ${ops[0].principal_kind}`}>{ops[0].principal_name}</span>
-            {ops[0].op.verdict && ops[0].op.verdict !== 'green' && (
-              <span className={`verdict v-${ops[0].op.verdict}`}>{ops[0].op.verdict}</span>
-            )}
-          </div>
-          {ops.map((r) => (
-            <div key={r.op.id} className="op-line">
-              <span className="op-type">{r.op.kind.op}</span>
-              <span className="op-snippet">{opSnippet(r.op.kind)}</span>
-            </div>
-          ))}
-          {ops[0].op.source_refs.length > 0 && (
-            <div className="refs">{ops[0].op.source_refs.join(' · ')}</div>
-          )}
-        </div>
-      ))}
-      {rows.length === 0 && <div className="palette-empty">no history</div>}
-    </aside>
-  )
-}
-
-function CommentsPanel({
-  comments,
-  allBlocks,
-  target,
-  setTarget,
-  onPosted,
-  onClose,
-}: {
-  comments: Block[]
-  allBlocks: Block[]
-  target: string | null
-  setTarget: (t: string | null) => void
-  onPosted: () => void
-  onClose: () => void
-}) {
-  const [text, setText] = useState('')
-  const [replyTo, setReplyTo] = useState<Block | null>(null)
-  const byId = useMemo(() => new Map(allBlocks.map((b) => [b.id, b])), [allBlocks])
-
-  const roots = comments.filter((c) => !c.parent_id || !byId.get(c.parent_id)?.refers_to)
-  const repliesOf = (id: string) => comments.filter((c) => c.parent_id === id)
-
-  const post = async () => {
-    const blockId = replyTo ? replyTo.refers_to : target
-    if (!text.trim() || !blockId) return
-    await api('/api/comment', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ block_id: blockId, text: text.trim(), reply_to: replyTo?.id ?? null }),
-    }).catch((e) => notify(String(e)))
-    setText('')
-    setReplyTo(null)
-    setTarget(null)
-    onPosted()
-  }
-
-  const snippet = (id: string | null) =>
-    id ? (byId.get(id)?.content ?? '').split('\n')[0].slice(0, 70) : ''
-
-  return (
-    <aside className="panel">
-      <div className="panel-head">
-        <span>comments</span>
-        <button onClick={onClose}>esc</button>
-      </div>
-      {roots.map((c) => (
-        <div key={c.id} className="thread">
-          <div className="thread-target">{snippet(c.refers_to)}</div>
-          <CommentRow c={c} />
-          {repliesOf(c.id).map((r) => (
-            <div key={r.id} className="reply">
-              <CommentRow c={r} />
-            </div>
-          ))}
-          <button className="chip" onClick={() => setReplyTo(c)}>
-            reply
-          </button>
-        </div>
-      ))}
-      {roots.length === 0 && !target && (
-        <div className="palette-empty">no comments — select text to start a thread</div>
-      )}
-      {(target || replyTo) && (
-        <div className="composer">
-          <div className="meta">
-            {replyTo ? `replying in thread` : `on: ${snippet(target)}`}
-          </div>
-          <textarea
-            autoFocus
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => {
-              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') post()
-            }}
-            placeholder="⌘Enter to post"
-          />
-        </div>
-      )}
-    </aside>
-  )
-}
-
-function CommentRow({ c }: { c: Block }) {
-  return (
-    <div className="comment">
-      <span className="comment-text">{c.content}</span>
-      <span className="meta">epoch {c.epoch}</span>
-    </div>
-  )
-}
-
-/* ---------- review queue ---------- */
-
-interface FlagRow {
-  block: Block
-  doc_title: string
-  author: string
-  target_content: string | null
-}
-
-function ReviewQueue({
-  onChange,
-  onOpenDoc,
-  dataVersion,
-}: {
-  onChange: (n: number) => void
-  onOpenDoc: OpenDoc
-  dataVersion: number
-}) {
-  const [rows, setRows] = useState<QueueRow[]>([])
-  // open the doc with its review rail up, scrolled to the op's block
-  const openInDoc = (r: QueueRow) =>
-    onOpenDoc(r.item.annotation.doc_id, { review: true, blockId: targetBlockOf(r) ?? undefined })
-  const [flags, setFlags] = useState<FlagRow[]>([])
-  const [busy, setBusy] = useState<string | null>(null)
-
-  const load = useCallback(() => {
-    Promise.all([
-      api<QueueRow[]>('/api/queue').catch(() => [] as QueueRow[]),
-      api<FlagRow[]>('/api/flags').catch(() => [] as FlagRow[]),
-    ]).then(([q, f]) => {
-      setRows(q)
-      setFlags(f)
-      onChange(q.length + f.length)
-    })
-  }, [onChange])
-
-  useEffect(load, [load, dataVersion])
-
-  const resolve = async (annotationId: string, decision: 'accept' | 'decline') => {
-    setBusy(annotationId)
-    try {
-      await api('/api/resolve', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ annotation_id: annotationId, decision }),
-      })
-    } catch (e) {
-      notify(errText(e))
-    }
-    setBusy(null)
-    load()
-  }
-
-  const dismiss = async (commentId: string) => {
-    setBusy(commentId)
-    await api('/api/flags/dismiss', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ comment_id: commentId }),
-    }).catch((e) => notify(String(e)))
-    setBusy(null)
-    load()
-  }
-
-  const bulk = async (ids: string[], decision: 'accept' | 'decline') => {
-    if (ids.length === 0) return
-    setBusy('bulk')
-    await api('/api/resolve_bulk', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ annotation_ids: ids, decision }),
-    }).catch((e) => notify(String(e)))
-    setBusy(null)
-    load()
-  }
-
-  // group proposals by proposer for bulk actions
-  const byProposer = new Map<string, QueueRow[]>()
-  for (const r of rows) {
-    if (!byProposer.has(r.proposer)) byProposer.set(r.proposer, [])
-    byProposer.get(r.proposer)!.push(r)
-  }
-
-  if (rows.length === 0 && flags.length === 0)
-    return <div className="empty">review queue is empty ✓</div>
-
-  return (
-    <div className="queue">
-      <h1 className="queue-title">review</h1>
-      {rows.length > 1 &&
-        [...byProposer.entries()].map(([who, group]) => (
-          <div key={who} className="bulk-bar">
-            <span className="who agent">{who}</span>
-            <span className="meta">{group.length} proposals</span>
-            <span className="gardener-actions">
-              <button
-                className="accept"
-                disabled={busy !== null}
-                onClick={() => bulk(group.map((r) => r.item.annotation.id), 'accept')}
-              >
-                accept all
-              </button>
-              <button
-                className="bulk-decline"
-                disabled={busy !== null}
-                onClick={() => bulk(group.map((r) => r.item.annotation.id), 'decline')}
-              >
-                decline all
-              </button>
-            </span>
-          </div>
-        ))}
-      {rows.map((r) => {
-        const op = r.item.op
-        const proposed =
-          typeof op.kind.content === 'string' ? (op.kind.content as string) : JSON.stringify(op.kind)
-        const parked = r.item.annotation.kind === 'parked'
-        // doc ops (an agent's rename / move / status / trash through the
-        // gate) have no block diff: the card is the sentence describeChange builds
-        const docOp = isDocOp(op.kind.op) ? describeChange(r) : null
-        const labels = actionLabels(r)
-        return (
-          <div
-            key={r.item.annotation.id}
-            className={`card ${parked ? 'red' : 'yellow'} clickable`}
-            title="open in doc"
-            onClick={() => openInDoc(r)}
-          >
-            <div className="card-head">
-              <span className={`verdict ${parked ? 'v-red' : 'v-yellow'}`}>
-                {parked ? 'parked' : 'applied'}
-              </span>
-              <span className="card-doc">{r.doc_title}</span>
-              <span className="card-meta">
-                {op.kind.op} · {r.proposer}
-                {op.confidence != null && ` · ${op.confidence.toFixed(2)}`}
-              </span>
-            </div>
-            {docOp ? (
-              <>
-                <div className="rail-headline">{docOp.headline}</div>
-                {(docOp.before || docOp.after) && (
-                  <div className="diff">
-                    {docOp.before && (
-                      <div className="diff-col">
-                        <div className="diff-label">{docOp.before.label}</div>
-                        <pre>{docOp.before.text}</pre>
-                      </div>
-                    )}
-                    {docOp.after && (
-                      <div className="diff-col">
-                        <div className="diff-label">{docOp.after.label}</div>
-                        <pre>{docOp.after.text}</pre>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </>
-            ) : (
-              <div className="diff">
-                {op.prior && (
-                  <div className="diff-col">
-                    <div className="diff-label">{parked ? 'current' : 'before'}</div>
-                    <pre>
-                      {(parked ? r.current_content ?? op.prior.content : op.prior.content).slice(0, 800)}
-                    </pre>
-                  </div>
-                )}
-                <div className="diff-col">
-                  <div className="diff-label">{parked ? 'proposed' : 'now'}</div>
-                  <pre>{proposed.slice(0, 800)}</pre>
-                </div>
-              </div>
-            )}
-            {op.source_refs.length > 0 && <div className="refs">{op.source_refs.join(' · ')}</div>}
-            <div className="actions" onClick={(e) => e.stopPropagation()}>
-              <button
-                className="accept"
-                disabled={busy === r.item.annotation.id}
-                onClick={() => resolve(r.item.annotation.id, 'accept')}
-              >
-                {labels.accept}
-              </button>
-              <button
-                className="decline"
-                disabled={busy === r.item.annotation.id}
-                onClick={() => resolve(r.item.annotation.id, 'decline')}
-              >
-                {labels.decline}
-              </button>
-              <button className="chip open-in-doc" onClick={() => openInDoc(r)}>
-                open in doc →
-              </button>
-            </div>
-          </div>
-        )
-      })}
-      {flags.length > 0 && (
-        <>
-          <h2 className="runs-title">audit flags</h2>
-          {flags.map((f) => (
-            <div key={f.block.id} className="card flag">
-              <div className="card-head">
-                <span className="who agent">{f.author}</span>
-                <span className="card-doc" onClick={() => onOpenDoc(f.block.doc_id)}>
-                  {f.doc_title}
-                </span>
-              </div>
-              {f.target_content && (
-                <div className="thread-target">{f.target_content.split('\n')[0].slice(0, 110)}</div>
-              )}
-              <div className="flag-text">{f.block.content}</div>
-              <div className="actions">
-                <button
-                  className="decline"
-                  disabled={busy === f.block.id}
-                  onClick={() => dismiss(f.block.id)}
-                >
-                  dismiss
-                </button>
-                <button className="chip" onClick={() => onOpenDoc(f.block.doc_id)}>
-                  open doc
-                </button>
-              </div>
-            </div>
-          ))}
-        </>
-      )}
+      >
+        {what}
+      </EmptyState>
     </div>
   )
 }

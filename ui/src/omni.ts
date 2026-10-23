@@ -7,6 +7,7 @@
 // list, the row builders, and the selection-stability rule.
 
 import type { Doc, SearchHit } from './types'
+import type { IconName } from './lapis/icons'
 
 /* ---------- fuzzy scoring ---------- */
 
@@ -172,6 +173,7 @@ export type PlaceId = 'home' | 'books' | 'review' | 'trash' | 'graph' | 'runs' |
 
 export interface Place {
   id: PlaceId
+  icon?: IconName
   label: string
   hint: string
   keys?: string
@@ -183,20 +185,22 @@ export interface Place {
  * exists (SERVER mode). */
 export function buildPlaces({ library, queueCount = 0 }: { library: boolean; queueCount?: number }): Place[] {
   const places: Place[] = [
-    { id: 'home', label: 'Home', hint: 'the briefing', keys: '⌘W', keywords: 'briefing start' },
-    ...(library ? [{ id: 'books' as const, label: 'Books', hint: 'your EPUB library', keywords: 'epub library reading' }] : []),
+    { id: 'home', icon: 'home', label: 'Home', hint: 'the briefing', keys: '⌘W', keywords: 'briefing start' },
+    ...(library ? [{ id: 'books' as const, icon: 'books' as const, label: 'Books', hint: 'your EPUB library', keywords: 'epub library reading' }] : []),
     {
       id: 'review',
+      icon: 'review',
       label: 'Review queue',
       hint: queueCount ? `${queueCount} open` : 'changes waiting for you',
       keys: '⌘⇧R',
       keywords: 'proposals flags gate',
     },
-    { id: 'runs', label: 'Gardeners', hint: 'agent runs', keys: '⌘G', keywords: 'runs agents' },
-    { id: 'graph', label: 'Graph', hint: 'docs as nodes, links as lines', keywords: 'links map' },
-    { id: 'trash', label: 'Trash', hint: 'restore deleted docs', keywords: 'deleted restore bin' },
+    { id: 'runs', icon: 'gardeners', label: 'Gardeners', hint: 'agent runs', keys: '⌘G', keywords: 'runs agents' },
+    { id: 'graph', icon: 'graph', label: 'Graph', hint: 'docs as nodes, links as lines', keywords: 'links map' },
+    { id: 'trash', icon: 'trash', label: 'Trash', hint: 'restore deleted docs', keywords: 'deleted restore bin' },
     {
       id: 'settings',
+      icon: 'settings',
       label: 'Settings',
       hint: library ? 'profile, e-readers' : 'profile, version, diagnostics',
       keys: '⌘,',
@@ -204,7 +208,7 @@ export function buildPlaces({ library, queueCount = 0 }: { library: boolean; que
     },
   ]
   if (library) {
-    places.push({ id: 'ereaders', label: 'E-readers', hint: 'Settings › E-readers', keywords: 'kobo kindle device opds' })
+    places.push({ id: 'ereaders', icon: 'books', label: 'E-readers', hint: 'Settings › E-readers', keywords: 'kobo kindle device opds' })
   }
   return places
 }
@@ -289,8 +293,14 @@ export interface OmniCommand {
   keywords?: string
   /** `doc` = acts on the open doc: listed first */
   scope?: 'doc' | 'app'
+  /** the row's icon (lapis/icons) */
+  icon?: IconName
+  /** the heading it lists under when nothing is typed (doc rows: This doc) */
+  group?: CommandGroup
   run: () => void
 }
+
+export type CommandGroup = 'Create' | 'Go' | 'Data' | 'App'
 
 /** Actions matching `q`, best first; with an empty query, the open doc's
  * actions first, then the rest in list order. */

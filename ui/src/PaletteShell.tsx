@@ -3,6 +3,7 @@
 // (and, via the data attribute, the global Esc in App).
 
 import { useEffect, useRef } from 'react'
+import { Icon, type IconName } from './lapis/icons'
 
 const FOCUSABLE =
   'input:not([disabled]), textarea:not([disabled]), button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
@@ -11,9 +12,15 @@ export default function PaletteShell({
   children,
   onClose,
   locked = false,
+  className,
+  label,
 }: {
   children: React.ReactNode
   onClose: () => void
+  /** extra class on the box (`palette-actions` is the narrower ⌘K) */
+  className?: string
+  /** the dialog's accessible name */
+  label?: string
   /** true → clicking the backdrop does nothing (caller also owns Esc) */
   locked?: boolean
 }) {
@@ -47,8 +54,9 @@ export default function PaletteShell({
     <div className="palette-backdrop" data-locked={locked || undefined} onMouseDown={locked ? undefined : onClose}>
       <div
         ref={box}
-        className="palette"
+        className={`palette${className ? ` ${className}` : ''}`}
         role="dialog"
+        aria-label={label}
         aria-modal="true"
         onMouseDown={(e) => e.stopPropagation()}
         onKeyDown={trapTab}
@@ -60,7 +68,7 @@ export default function PaletteShell({
 }
 
 /** The key hints along a palette's bottom edge: `[keys, label]` pairs. */
-export function PaletteFooter({ hints }: { hints: [string, string][] }) {
+export function PaletteFooter({ hints, end }: { hints: [string, string][]; end?: React.ReactNode }) {
   return (
     <div className="palette-foot" aria-hidden>
       {hints.map(([k, label]) => (
@@ -69,6 +77,19 @@ export function PaletteFooter({ hints }: { hints: [string, string][] }) {
           {label}
         </span>
       ))}
+      {end && <span className="end">{end}</span>}
+    </div>
+  )
+}
+
+/** The palette's input row: a leading icon, the field, and whatever sits at
+ * its right edge (an esc hint, the doc the actions act on). */
+export function PaletteInput({ icon, right, ...input }: React.InputHTMLAttributes<HTMLInputElement> & { icon: IconName; right?: React.ReactNode; ref?: React.Ref<HTMLInputElement> }) {
+  return (
+    <div className="palette-input">
+      <Icon name={icon} size={18} />
+      <input {...input} />
+      {right}
     </div>
   )
 }

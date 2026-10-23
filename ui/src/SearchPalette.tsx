@@ -6,7 +6,8 @@
 // the selected row keeps its identity (omni.ts stableSelection).
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import PaletteShell, { PaletteFooter, moveSelection } from './PaletteShell'
+import PaletteShell, { PaletteFooter, PaletteInput, moveSelection } from './PaletteShell'
+import { Icon } from './lapis/icons'
 import { errText, notify } from './Notice'
 import { api, type SearchHit } from './types'
 import type { OpenDoc } from './App'
@@ -19,13 +20,23 @@ export default function SearchPalette({
   initial = '',
   onOpenDoc,
   onClose,
+  inline = false,
+  onQuery,
 }: {
   /** prefilled query: `?` from ⌘/, or the text ⌘O handed over */
   initial?: string
   onOpenDoc: OpenDoc
   onClose: () => void
+  /** render in the page (the /search route) instead of as a palette */
+  inline?: boolean
+  /** the query as typed (the /search route keeps ?q= in step) */
+  onQuery?: (q: string) => void
 }) {
-  const [raw, setRaw] = useState(initial)
+  const [raw, setRawState] = useState(initial)
+  const setRaw = (v: string) => {
+    setRawState(v)
+    onQuery?.(v)
+  }
   const [hits, setHits] = useState<SearchHit[]>([])
   const [settled, setSettled] = useState(() => parseSearch(''))
   const [pending, setPending] = useState(false)
@@ -133,8 +144,9 @@ export default function SearchPalette({
         : null
 
   return (
-    <PaletteShell onClose={onClose} locked={asking}>
-      <input
+    <Frame inline={inline} onClose={onClose} locked={asking}>
+      <PaletteInput
+        icon={live.ask ? 'ask' : 'search'}
         ref={inputRef}
         placeholder={live.ask ? 'Ask your notes a question… every claim cites its block' : 'Search inside docs…  (? to ask)'}
         aria-label="Search inside docs"
@@ -152,7 +164,7 @@ export default function SearchPalette({
         }}
       />
       <div className="palette-list omni-list" ref={listRef} role="listbox">
-        {asking && <div className="palette-empty">🌿 reading your notes and writing the answer… (up to a minute)</div>}
+        {asking && <div className="palette-empty">Reading your notes and writing the answer… (up to a minute)</div>}
         {!asking && emptyText && <div className="palette-empty">{emptyText}</div>}
         {!asking && contentPending && contentRows === 0 && <div className="omni-pending" aria-hidden />}
         {!asking &&
@@ -174,8 +186,13 @@ export default function SearchPalette({
                   </div>
                 ) : (
                   <>
-                    <span>
-                      Ask the library: <em>“{r.query || '…'}”</em>
+                    <span className="omni-ico agent">
+                      <Icon name="ask" size={15} />
+                    </span>
+                    <span className="hit-body">
+                      <span>
+                        Ask the library: <em>“{r.query || '…'}”</em>
+                      </span>
                     </span>
                     <span className="hint">an answer doc with citations</span>
                   </>
@@ -193,6 +210,17 @@ export default function SearchPalette({
           ['esc', 'close'],
         ]}
       />
-    </PaletteShell>
+    </Frame>
   )
+}
+
+/** A palette, or (inline) the same body as a card in the page. */
+function Frame({ inline, onClose, locked, children }: { inline: boolean; onClose: () => void; locked: boolean; children: React.ReactNode }) {
+  if (!inline)
+    return (
+      <PaletteShell onClose={onClose} locked={locked}>
+        {children}
+      </PaletteShell>
+    )
+  return <div className="palette lp-palette-inline">{children}</div>
 }

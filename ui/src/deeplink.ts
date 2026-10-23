@@ -1,8 +1,8 @@
-/** Query-string deep links. The shell (and any host embedding the UI in a
- * frame, e.g. workbox) opens the page as
+/** The old query-string deep links. The shell (and any host embedding the
+ * UI in a frame, e.g. workbox) may open the page as
  * `/?admin_token=…&doc=<uuid>[&block=<uuid>][&tab=<name>]`. `admin_token` is
- * consumed by main.tsx; the rest is parsed here once on boot and scrubbed the
- * same way so a reload does not re-open the doc. */
+ * consumed by main.tsx; the rest is parsed here and rewritten to a real path
+ * (/doc/<uuid>, /review, …) by router.ts legacyRedirect on boot. */
 
 export const TABS = ['home', 'review', 'runs', 'graph', 'settings', 'profile', 'trash', 'books', 'ereaders'] as const
 export type Tab = (typeof TABS)[number]

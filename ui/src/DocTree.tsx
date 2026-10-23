@@ -1,12 +1,13 @@
-// The file tree (⌘T): a quiet library. Typography carries the hierarchy —
-// folders in --fg at weight 500, leaves in --fg-dim, a faint guide per
-// depth — and the root is grouped into Pinned / Folders / Notes. Behaviour
-// is unchanged from the old DocTreeNav: drag into/before/after,
-// arm-then-confirm delete with an undo toast.
+// The doc tree in the Lapis sidebar (shell/Sidebar.tsx): a Pinned group
+// (the system folders), then the Library (folders, then loose docs), shown
+// for the workspace the sidebar's switcher picked. Behaviour is unchanged
+// from the old ⌘T tree: drag into/before/after, drop on empty space = top
+// level, arm-then-confirm delete with an undo toast, a title filter.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, Doc } from './types'
-import WorkspaceSwitcher from './WorkspaceSwitcher'
+import { Icon, IconButton } from './lapis'
+import Link from './Link'
 import { WorkspaceSel, docsInWorkspace } from './workspaces'
 import { notify, errText } from './Notice'
 import { restoreDoc } from './Trash'
@@ -25,7 +26,7 @@ import {
 
 type Drop = { id: string; mode: 'into' | 'before' | 'after' } | null
 
-const SECTION_LABEL: Record<Section, string> = { pinned: 'Pinned', folders: 'Folders', notes: 'Notes' }
+const SECTION_LABEL: Record<Section, string> = { pinned: 'Pinned', folders: 'Library', notes: 'Library' }
 
 /** Expand/collapse with a 120ms grid-rows transition; children stay mounted
  * only while open or animating shut, so a collapsed vault is not all in the
@@ -66,34 +67,26 @@ export default function DocTree({
   docs: allDocs,
   selected,
   onSelect,
-  onClose,
   onChanged,
-  onOpenSettings,
+  workspace,
+  wsColor,
+  onNewDoc,
+  focusFilter = 0,
 }: {
   docs: Doc[]
   selected: string | null
   onSelect: (id: string) => void
-  onClose: () => void
   onChanged: () => void
-  /** the gear in the tree's head */
-  onOpenSettings?: () => void
+  /** which workspace the tree shows (the sidebar's switcher) */
+  workspace: WorkspaceSel
+  /** workspace id → colour, for the dot on top-level rows under All */
+  wsColor?: Map<string, string>
+  /** the + beside the Library label */
+  onNewDoc?: () => void
+  /** bump to put the caret in the filter (⌘T opening the sidebar) */
+  focusFilter?: number
 }) {
-  // the workspace switcher (ADR 0004): the tree shows one workspace, or all
-  const [ws, setWs] = useState<WorkspaceSel>(() => {
-    try {
-      return localStorage.getItem('taisce.tree.workspace') || 'all'
-    } catch {
-      return 'all'
-    }
-  })
-  useEffect(() => {
-    try {
-      localStorage.setItem('taisce.tree.workspace', ws)
-    } catch {
-      /* storage blocked: the choice lasts this session */
-    }
-  }, [ws])
-  const docs = useMemo(() => docsInWorkspace(allDocs, ws), [allDocs, ws])
+  const docs = useMemo(() => docsInWorkspace(allDocs, workspace), [allDocs, workspace])
   const childrenOf = useMemo(() => childrenIndex(docs), [docs])
   const byId = useMemo(() => new Map(docs.map((d) => [d.id, d])), [docs])
   const groups = useMemo(() => groupRoot(docs, childrenOf), [docs, childrenOf])
@@ -140,11 +133,10 @@ export default function DocTree({
   /* ---- filter ---- */
   const [filter, setFilter] = useState('')
   const filterRef = useRef<HTMLInputElement>(null)
-  // the tree only mounts when it is open, so mount = "the tree just opened":
-  // put the caret in the filter so ⌘T is followed straight by typing
+  // ⌘T opened the sidebar: put the caret in the filter so typing follows
   useEffect(() => {
-    filterRef.current?.focus()
-  }, [])
+    if (focusFilter) filterRef.current?.focus()
+  }, [focusFilter])
   const filtered = useMemo(() => filterDocs(docs, filter, byId), [docs, filter, byId])
   const isOpen = (id: string) => (filtered ? filtered.expanded.has(id) || openDirs.has(id) : openDirs.has(id))
   const isVisible = (id: string) => !filtered || filtered.visible.has(id)
@@ -239,6 +231,7 @@ export default function DocTree({
     // a drop there is always "into"
     const intoOnly = rootSection === 'folders' || rootSection === 'pinned'
     const match = filtered?.matches.has(d.id)
+    const dot = depth === 0 && workspace === 'all' && d.workspace_id ? wsColor?.get(d.workspace_id) : undefined
     return (
       <div key={d.id} className="tree-node">
         <div
@@ -254,8 +247,23 @@ export default function DocTree({
           ]
             .filter(Boolean)
             .join(' ')}
-          style={{ paddingLeft: 10 + depth * 14 }}
+          style={{ paddingLeft: 10 + depth * 24 }}
           draggable
+          role="treeitem"
+          aria-selected={isSel}
+          aria-expanded={isDir ? open : undefined}
+          tabIndex={0}
+          onKeyDown={(e) => {
+            if (e.target !== e.currentTarget) return
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              if (isDir) toggleDir(d.id)
+              onSelect(d.id)
+            } else if (isDir && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
+              e.preventDefault()
+              if ((e.key === 'ArrowRight') !== open) toggleDir(d.id)
+            }
+          }}
           onDragStart={(e) => {
             setDragging(d.id)
             e.dataTransfer.effectAllowed = 'move'
@@ -285,35 +293,35 @@ export default function DocTree({
           }}
           title={d.title}
         >
-          {isDir ? (
-            <svg width="10" height="10" viewBox="0 0 10 10" className={open ? 'chev open' : 'chev'} aria-hidden>
-              <path d="M3 1.5 L7 5 L3 8.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-            </svg>
-          ) : (
-            <span className="tree-leaf-slot" aria-hidden />
-          )}
+          {rootSection === 'pinned' ? (
+            <Icon name={isDir ? 'folder' : 'doc'} size={18} />
+          ) : isDir ? (
+            <Icon name={open ? 'chevronDown' : 'chevronRight'} size={15} className="chev" />
+          ) : depth === 0 ? (
+            <Icon name="doc" size={15} className="tree-doc-icon" />
+          ) : null}
+          {dot && <span className="lp-dot" style={{ background: dot }} aria-hidden />}
           <span className="tree-title">{d.title}</span>
           <span className="tree-badges">
-            {isDir && !open && <span className="tree-count">{counts.get(d.id) ?? 0}</span>}
             {d.is_tended && <span className="tend-dot" title="tended by agents" />}
+            {isDir && !open && <span className="tree-count">{counts.get(d.id) ?? 0}</span>}
             <button
+              type="button"
               className={`tree-delete ${armed === d.id ? 'armed' : ''}`}
-              title={armed === d.id ? 'click again to delete' : 'delete'}
+              title={armed === d.id ? 'click again to move to Trash' : 'move to Trash'}
+              aria-label={armed === d.id ? `Confirm: move ${d.title} to Trash` : `Move ${d.title} to Trash`}
               onClick={(e) => {
                 e.stopPropagation()
                 doDelete(d)
               }}
             >
-              {armed === d.id ? 'sure?' : '×'}
+              {armed === d.id ? 'Sure?' : <Icon name="close" size={13} />}
             </button>
           </span>
         </div>
         {isDir && (
           <Collapse open={open}>
-            <div
-              className="tree-children"
-              style={{ ['--guide' as string]: `${10 + depth * 14 + 5}px` } as React.CSSProperties}
-            >
+            <div className="tree-children" role="group">
               {kids.map((k) => renderRow(k, depth + 1, null))}
             </div>
           </Collapse>
@@ -322,63 +330,37 @@ export default function DocTree({
     )
   }
 
-  const renderSection = (s: Section, rows: Doc[]) => {
-    if (rows.length === 0) return null
-    const shown = rows.filter((d) => isVisible(d.id))
-    if (filtered && shown.length === 0) return null
-    const open = filtered ? true : !closedSections.has(s)
-    return (
-      <div key={s} className="tree-section">
-        <button className={`tree-section-head ${open ? 'open' : ''}`} onClick={() => toggleSection(s)}>
-          <svg width="8" height="8" viewBox="0 0 10 10" className={open ? 'chev open' : 'chev'} aria-hidden>
-            <path d="M3 1.5 L7 5 L3 8.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-          </svg>
-          {SECTION_LABEL[s]}
-          {!open && <span className="tree-count">{rows.length}</span>}
-        </button>
-        <Collapse open={open}>{shown.map((d) => renderRow(d, 0, s))}</Collapse>
-      </div>
-    )
-  }
+  const pinnedShown = groups.pinned.filter((d) => isVisible(d.id))
+  const libRows = [...groups.folders.map((d) => [d, 'folders'] as const), ...groups.notes.map((d) => [d, 'notes'] as const)]
+  const libShown = libRows.filter(([d]) => isVisible(d.id))
+  const pinnedOpen = filtered ? true : !closedSections.has('pinned')
 
   return (
-    <aside className="sidebar">
-      <div className="sidebar-head">
+    <div className="lp-tree">
+      <div className="lp-tree-filter">
+        <Icon name="search" size={14} />
         <input
           ref={filterRef}
-          className="tree-filter"
-          placeholder="filter · ⌘T to close"
+          placeholder="Filter titles"
+          aria-label="Filter the tree by title"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
           onKeyDown={(e) => {
             if (e.key !== 'Escape') return
-            // first Esc clears the filter, the second closes the tree; the
-            // global Esc (palettes) must not see either
+            // Esc clears the filter, then gives the keyboard back to the page;
+            // the global Esc (palettes) must not see either
             e.stopPropagation()
             e.preventDefault()
-            if (filter) {
-              setFilter('')
-              return
-            }
-            // closing leaves the input mounted for the exit animation; drop
-            // focus first so keystrokes go to the editor, not a dead field
-            filterRef.current?.blur()
-            onClose()
+            if (filter) setFilter('')
+            else filterRef.current?.blur()
           }}
           spellCheck={false}
         />
-        {onOpenSettings && (
-          <button type="button" className="tree-close tree-gear" onClick={onOpenSettings} title="Settings (⌘,)" aria-label="Settings">
-            ⚙
-          </button>
-        )}
-        <button type="button" className="tree-close" onClick={onClose} title="close the tree (⌘T)">
-          ⌘T
-        </button>
-        <WorkspaceSwitcher value={ws} onChange={setWs} />
       </div>
       <div
         className="tree-root"
+        role="tree"
+        aria-label="Docs"
         onDragOver={(e) => {
           // dropping on empty space = move to root
           if (dragging && e.target === e.currentTarget) e.preventDefault()
@@ -389,11 +371,30 @@ export default function DocTree({
           }
         }}
       >
-        {renderSection('pinned', groups.pinned)}
-        {renderSection('folders', groups.folders)}
-        {renderSection('notes', groups.notes)}
-        {filtered && filtered.matches.size === 0 && <div className="tree-empty">no titles match</div>}
+        {groups.pinned.length > 0 && (!filtered || pinnedShown.length > 0) && (
+          <div className="tree-section">
+            <button type="button" className="lp-side-sec tree-section-head" aria-expanded={pinnedOpen} onClick={() => toggleSection('pinned')}>
+              {SECTION_LABEL.pinned}
+              {!pinnedOpen && <span className="tree-count">{groups.pinned.length}</span>}
+            </button>
+            <Collapse open={pinnedOpen}>{pinnedShown.map((d) => renderRow(d, 0, 'pinned'))}</Collapse>
+          </div>
+        )}
+        <div className="tree-section">
+          <div className="lp-side-sec">
+            Library
+            <span className="lp-side-sec-r">
+              <Link to={{ kind: 'library', workspace }} className="lp-side-sec-link">
+                All docs
+              </Link>
+              {onNewDoc && <IconButton icon="plus" size="sm" label="New doc" onClick={onNewDoc} />}
+            </span>
+          </div>
+          {libShown.map(([d, sec]) => renderRow(d, 0, sec))}
+          {!filtered && libRows.length === 0 && <div className="tree-empty">No docs here yet</div>}
+        </div>
+        {filtered && filtered.matches.size === 0 && <div className="tree-empty">No titles match</div>}
       </div>
-    </aside>
+    </div>
   )
 }

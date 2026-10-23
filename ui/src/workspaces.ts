@@ -57,3 +57,24 @@ export function docsInWorkspace(docs: Doc[], sel: WorkspaceSel): Doc[] {
   const ids = new Set(keep.map((d) => d.id))
   return keep.map((d) => (d.parent_id && !ids.has(d.parent_id) ? { ...d, parent_id: null } : d))
 }
+
+/** A workspace's colour: its own, else one of the six token colours by
+ * position (stable for a given list order). */
+export function workspaceColor(w: Pick<Workspace, 'color'>, index: number): string {
+  if (w.color && /^#[0-9a-f]{3,8}$/i.test(w.color)) return w.color
+  return `var(--ws-${(index % 6) + 1})`
+}
+
+/** The switcher button's two lines for a selection. */
+export function workspaceSummary(sel: WorkspaceSel, list: Workspace[], docCount: number): { name: string; sub: string } {
+  if (sel === 'all') {
+    const names = ['Unsorted', ...list.map((w) => w.display_name || w.name)]
+    return { name: 'All workspaces', sub: names.join(', ') }
+  }
+  if (sel === 'unsorted') return { name: 'Unsorted', sub: `Not in a workspace · ${docCount} docs` }
+  const w = list.find((x) => x.id === sel)
+  if (!w) return { name: 'All workspaces', sub: '' }
+  const role = w.role ? w.role[0].toUpperCase() + w.role.slice(1) : 'Owner'
+  const n = w.doc_count ?? w.doc_ids.length
+  return { name: w.display_name || w.name, sub: `${role}${w.shared ? ' · shared' : ''} · ${n} doc${n === 1 ? '' : 's'}` }
+}

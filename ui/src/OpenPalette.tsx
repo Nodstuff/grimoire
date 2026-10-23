@@ -5,7 +5,8 @@
 // Enter opens; ⌘Enter hands the typed text to Search.
 
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
-import PaletteShell, { PaletteFooter, moveSelection } from './PaletteShell'
+import PaletteShell, { PaletteFooter, PaletteInput, moveSelection } from './PaletteShell'
+import { Icon } from './lapis/icons'
 import type { Doc } from './types'
 import type { OpenDoc } from './App'
 import { buildOpenRows, loadRecentIds, type OpenRow, type Place, type PlaceId } from './omni'
@@ -52,12 +53,69 @@ export default function OpenPalette({
     else onPlace(r.place.id)
   }
 
+  const item = (r: OpenRow, i: number) => (
+    <div
+      key={r.key}
+      data-idx={i}
+      role="option"
+      aria-selected={i === sel}
+      className={`palette-item ${i === sel ? 'sel' : ''}`}
+      // mousemove, not mouseenter: a list re-flowing under a
+      // stationary pointer must not steal the selection
+      onMouseMove={() => sel !== i && setSel(i)}
+      onClick={() => run(r)}
+    >
+      {r.kind === 'doc' ? (
+        <>
+          <span className="omni-ico">
+            <Icon name="doc" size={15} />
+          </span>
+          <span className="hit-body">
+            <span className="hit-title">{r.doc.title}</span>
+            {r.path !== r.doc.title && <span className="hit-text">{r.path.split(' › ').slice(0, -1).join(' › ')}</span>}
+          </span>
+          <span className="hint">
+            {typed && r.recent ? 'recent' : ''}
+            {i === sel && <kbd>↵</kbd>}
+          </span>
+        </>
+      ) : typed ? (
+        <>
+          <span className="omni-ico">
+            <Icon name={r.place.icon ?? 'home'} size={15} />
+          </span>
+          <span className="hit-body">
+            <span className="hit-title">{r.place.label}</span>
+            <span className="hit-text">{r.place.hint}</span>
+          </span>
+          <span className="hint">{r.place.keys ? <kbd>{r.place.keys}</kbd> : 'place'}</span>
+        </>
+      ) : (
+        <>
+          <Icon name={r.place.icon ?? 'home'} size={15} />
+          <span className="omni-place-label" title={r.place.hint}>
+            {r.place.label}
+          </span>
+          {r.place.keys && (
+            <span className="hint">
+              <kbd>{r.place.keys}</kbd>
+            </span>
+          )}
+        </>
+      )}
+    </div>
+  )
+
   return (
-    <PaletteShell onClose={onClose}>
-      <input
+    <PaletteShell onClose={onClose} label="Open a doc or place">
+      <PaletteInput
+        icon="search"
         ref={inputRef}
         placeholder="Open a doc or place…"
         aria-label="Open a doc or place"
+        role="combobox"
+        aria-expanded="true"
+        aria-controls="open-list"
         value={raw}
         onChange={(e) => setRaw(e.target.value)}
         onKeyDown={(e) => {
@@ -69,61 +127,47 @@ export default function OpenPalette({
             } else run(rows[sel])
           }
         }}
+        right={<kbd>esc</kbd>}
       />
-      <div className="palette-list omni-list" ref={listRef} role="listbox">
+      <div className="palette-list omni-list" ref={listRef} role="listbox" id="open-list" aria-label="Results">
         {rows.length === 0 && (
           <div className="palette-empty">
             {typed ? (
               <>
-                no titles match — <kbd>⌘↵</kbd>searches inside docs
+                No titles match — <kbd>⌘↵</kbd>searches inside docs
               </>
             ) : (
-              'no docs yet — ⌘N creates one'
+              'No docs yet — ⌘N creates one'
             )}
           </div>
         )}
-        {rows.map((r, i) => (
-          <div key={r.key}>
-            {!typed && i === 0 && recentCount > 0 && <div className="omni-group">Recent</div>}
-            {!typed && i === recentCount && <div className="omni-group">Places</div>}
-            <div
-              data-idx={i}
-              role="option"
-              aria-selected={i === sel}
-              className={`palette-item ${i === sel ? 'sel' : ''}`}
-              // mousemove, not mouseenter: a list re-flowing under a
-              // stationary pointer must not steal the selection
-              onMouseMove={() => sel !== i && setSel(i)}
-              onClick={() => run(r)}
-            >
-              {r.kind === 'doc' ? (
-                <>
-                  <span className="hit-body">
-                    <span>{r.doc.title}</span>
-                    {r.path !== r.doc.title && <span className="hit-text">{r.path}</span>}
-                  </span>
-                  <span className="hint">{typed && r.recent ? 'recent' : ''}</span>
-                </>
-              ) : (
-                <>
-                  <span className="hit-body">
-                    <span className="omni-place">{r.place.label}</span>
-                    <span className="hit-text">{r.place.hint}</span>
-                  </span>
-                  <span className="hint">{r.place.keys ? <kbd>{r.place.keys}</kbd> : 'place'}</span>
-                </>
-              )}
-            </div>
-          </div>
-        ))}
+        {typed ? (
+          rows.map(item)
+        ) : (
+          <>
+            {recentCount > 0 && <div className="omni-group">Recent</div>}
+            {rows.slice(0, recentCount).map(item)}
+            {rows.length > recentCount && (
+              <>
+                {recentCount > 0 && <div className="omni-sep" />}
+                <div className="omni-group">Places</div>
+                <div className="omni-places">{rows.slice(recentCount).map((r, j) => item(r, recentCount + j))}</div>
+              </>
+            )}
+          </>
+        )}
       </div>
       <PaletteFooter
         hints={[
+          ['↑↓', 'move'],
           ['↵', 'open'],
           ['⌘↵', 'search inside docs'],
-          ['⌘K', 'actions'],
-          ['esc', 'close'],
         ]}
+        end={
+          <>
+            <kbd>⌘K</kbd>actions
+          </>
+        }
       />
     </PaletteShell>
   )

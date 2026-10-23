@@ -8,6 +8,7 @@ import { copyText } from './Profile'
 import { backupFileName, inTauri, saveDialog } from './tauri'
 import { api } from './types'
 import type { OmniCommand } from './omni'
+import { THEME_LABEL, getThemePref, nextThemePref, setThemePref } from './lapis/theme'
 
 export type CommandAction =
   | 'tree'
@@ -35,12 +36,12 @@ export interface CommandCtx {
 export function buildCommands({ signedIn, library, onSignOut, docId, onAction }: CommandCtx): OmniCommand[] {
   const cmds: OmniCommand[] = []
   if (docId && signedIn) {
-    cmds.push({ id: 'share-link', scope: 'doc', label: 'Share link…', hint: 'a public, read-only snapshot of this doc', run: () => onAction('share') })
+    cmds.push({ id: 'share-link', icon: 'link', scope: 'doc', label: 'Share link…', hint: 'a public, read-only snapshot of this doc', run: () => onAction('share') })
   }
   if (docId) {
     cmds.push(
       {
-        id: 'export-doc',
+        id: 'export-doc', icon: 'download',
         scope: 'doc',
         label: 'Export this doc as Markdown…',
         hint: 'one .md file in ~/Downloads — for Slack, email, anywhere',
@@ -53,7 +54,7 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
         },
       },
       {
-        id: 'copy-doc',
+        id: 'copy-doc', icon: 'copy',
         scope: 'doc',
         label: 'Copy this doc as Markdown',
         hint: 'to the clipboard',
@@ -69,16 +70,16 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
     )
   }
   cmds.push(
-    { id: 'newdoc', label: 'New doc…', keys: '⌘N', keywords: 'create page note', run: () => onAction('newdoc') },
-    { id: 'capture', label: 'Quick capture…', hint: 'a note straight into Inbox', keys: '⌘⇧I', keywords: 'inbox jot', run: () => onAction('capture') },
-    { id: 'open', label: 'Open a doc or place…', keys: '⌘O', keywords: 'go to jump find title', run: () => onAction('open') },
-    { id: 'search', label: 'Search inside docs…', hint: 'full text, typos fine', keys: '⌘⇧F', keywords: 'find content text', run: () => onAction('search') },
-    { id: 'ask', label: 'Ask the library…', hint: 'an answer doc that cites its blocks', keys: '⌘/', keywords: 'question vault answer ai', run: () => onAction('ask') },
+    { id: 'newdoc', icon: 'plus', group: 'Create', label: 'New doc…', keys: '⌘N', keywords: 'create page note', run: () => onAction('newdoc') },
+    { id: 'capture', icon: 'capture', group: 'Create', label: 'Quick capture…', hint: 'a note straight into Inbox', keys: '⌘⇧I', keywords: 'inbox jot', run: () => onAction('capture') },
+    { id: 'open', icon: 'search', group: 'Go', label: 'Open a doc or place…', keys: '⌘O', keywords: 'go to jump find title', run: () => onAction('open') },
+    { id: 'search', icon: 'search', group: 'Go', label: 'Search inside docs…', hint: 'full text, typos fine', keys: '⌘⇧F', keywords: 'find content text', run: () => onAction('search') },
+    { id: 'ask', icon: 'ask', group: 'Go', label: 'Ask the library…', hint: 'an answer doc that cites its blocks', keys: '⌘/', keywords: 'question vault answer ai', run: () => onAction('ask') },
   )
   if (library) {
     // the EPUB library is SERVER-mode only (LOCAL has no books routes)
     cmds.push({
-      id: 'add-books',
+      id: 'add-books', icon: 'upload', group: 'Create',
       label: 'Add EPUBs…',
       hint: 'upload files into the library',
       keywords: 'books upload import epub',
@@ -91,9 +92,9 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
     })
   }
   cmds.push(
-    { id: 'tree', label: 'Toggle file tree', keys: '⌘T', keywords: 'sidebar folders', run: () => onAction('tree') },
+    { id: 'tree', icon: 'sidebar', group: 'Go', label: 'Toggle file tree', keys: '⌘T', keywords: 'sidebar folders', run: () => onAction('tree') },
     {
-      id: 'import',
+      id: 'import', icon: 'folder', group: 'Create',
       label: 'Import a folder of Markdown…',
       hint: 'files become docs, folders become sections',
       run: () => {
@@ -102,7 +103,7 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
       },
     },
     {
-      id: 'memory-sync',
+      id: 'memory-sync', icon: 'history', group: 'Data',
       label: 'Sync Claude Code memory now',
       hint: '~/.claude/projects/*/memory → Claude Memory (also runs every 10 min)',
       run: () => {
@@ -121,7 +122,7 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
       },
     },
     {
-      id: 'export-vault',
+      id: 'export-vault', icon: 'download', group: 'Data',
       label: 'Export all docs as Markdown…',
       hint: 'a folder in ~/Downloads',
       run: () => {
@@ -132,7 +133,7 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
       },
     },
     {
-      id: 'backup',
+      id: 'backup', icon: 'download', group: 'Data',
       label: 'Back up database now',
       hint: 'daily snapshot, kept beside your notes',
       run: () => {
@@ -146,7 +147,7 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
   // a native Save sheet needs the app; in a browser tab the row is absent
   if (inTauri()) {
     cmds.push({
-      id: 'backup-to',
+      id: 'backup-to', icon: 'download', group: 'Data',
       label: 'Back up database to…',
       hint: 'one self-contained file wherever you choose — a USB stick, iCloud Drive, a sync folder',
       run: () => {
@@ -169,7 +170,7 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
     })
   }
   cmds.push({
-    id: 'reveal-backups',
+    id: 'reveal-backups', icon: 'folder', group: 'Data',
     label: 'Show backups in Finder',
     hint: '~/.grimoire/backups — the folder to point Time Machine or a sync tool at',
     run: () => {
@@ -177,9 +178,18 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
       api<{ dir: string }>('/api/backups/reveal', { method: 'POST' }).catch((e) => notify(errText(e)))
     },
   })
-  cmds.push({ id: 'help', label: 'Keyboard shortcuts', keys: '?', keywords: 'keys cheatsheet help', run: () => onAction('help') })
+  cmds.push({
+    id: 'theme',
+    icon: 'sun',
+    group: 'App',
+    label: `Theme: ${THEME_LABEL[getThemePref()]} → ${THEME_LABEL[nextThemePref(getThemePref())]}`,
+    hint: 'system, light or dark',
+    keywords: 'appearance dark mode light mode colour',
+    run: () => setThemePref(nextThemePref(getThemePref())),
+  })
+  cmds.push({ id: 'help', icon: 'keyboard', group: 'App', label: 'Keyboard shortcuts', keys: '?', keywords: 'keys cheatsheet help', run: () => onAction('help') })
   if (signedIn && onSignOut) {
-    cmds.push({ id: 'sign-out', label: 'Sign out', hint: 'end this browser’s session', keywords: 'log out logout', run: onSignOut })
+    cmds.push({ id: 'sign-out', icon: 'signOut', group: 'App', label: 'Sign out', hint: 'end this browser’s session', keywords: 'log out logout', run: onSignOut })
   }
   return cmds
 }

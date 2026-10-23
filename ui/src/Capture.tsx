@@ -4,6 +4,7 @@
 // Works the same in a browser tab.
 
 import { useEffect, useRef, useState } from 'react'
+import { Button } from './lapis'
 import PaletteShell from './PaletteShell'
 import { errText, notify } from './Notice'
 
@@ -47,7 +48,7 @@ export default function Capture({
   }
 
   return (
-    <PaletteShell onClose={onClose} locked={busy}>
+    <PaletteShell onClose={onClose} locked={busy} label="Quick capture">
       <div className="capture">
         <textarea
           ref={ref}
@@ -70,10 +71,10 @@ export default function Capture({
           }}
         />
         <div className="capture-foot">
-          <span className="home-dim">{busy ? 'saving…' : 'first line becomes the title · tagged inbox'}</span>
-          <button className="home-cta" disabled={busy || !text.trim()} onClick={save}>
-            capture ↵
-          </button>
+          <span className="home-dim">{busy ? 'Saving…' : 'The first line becomes the title · saved to Inbox'}</span>
+          <Button variant="primary" size="sm" icon="capture" kbd="↵" disabled={busy || !text.trim()} onClick={save}>
+            Capture
+          </Button>
         </div>
       </div>
     </PaletteShell>

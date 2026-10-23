@@ -4,6 +4,7 @@
 // until clicked; ok notices auto-dismiss.
 
 import { useEffect, useState } from 'react'
+import { Toast } from './lapis/Toast'
 
 /** error: sticky until clicked. ok: auto-dismiss. warn: auto-dismiss (longer) —
  * "something happened you should know, nothing is broken". */
@@ -82,19 +83,23 @@ export function Notices() {
   }, [])
   if (list.length === 0) return null
   return (
-    <div className="notices" role="status" aria-live="polite">
+    <div className="lp-toasts" role="status" aria-live="polite">
       {list.map((n) => (
-        <div
+        <Toast
           key={n.id}
-          className={`notice notice-${n.kind} ${n.onClick ? 'notice-action' : ''}`}
-          onClick={() => {
-            dismiss(n.id)
-            n.onClick?.()
-          }}
-          title={n.onClick ? 'click to open' : n.kind === 'error' ? 'click to dismiss' : undefined}
+          kind={n.kind}
+          onClick={
+            n.onClick
+              ? () => {
+                  dismiss(n.id)
+                  n.onClick?.()
+                }
+              : undefined
+          }
+          onDismiss={() => dismiss(n.id)}
         >
           {n.message}
-        </div>
+        </Toast>
       ))}
     </div>
   )
