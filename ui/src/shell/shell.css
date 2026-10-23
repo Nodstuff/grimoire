@@ -166,7 +166,9 @@
 .lp-wsmenu {
   position: absolute;
   left: 0;
-  right: -140px;
+  /* inside the sidebar: it scrolls (overflow-y: auto), so a menu reaching
+     past its edge was clipped */
+  right: 0;
   top: calc(100% + 6px);
   z-index: 40;
   background: var(--pal);

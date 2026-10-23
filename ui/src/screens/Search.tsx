@@ -604,6 +604,24 @@ function AskCard({
     if (id) onOpenDoc(id, { blockId })
     else notify('That source is not in your docs any more', 'warn')
   }
+  // each receipt's section (Doc › heading), read from the source doc
+  const [heads, setHeads] = useState<Map<string, string | null>>(new Map())
+  useEffect(() => {
+    if (!parsed) return
+    let live = true
+    Promise.all(
+      parsed.receipts.map(async (r) => {
+        const id = titleToId(r.title)
+        const d = id ? byId.get(id) : undefined
+        const t = d ? await loadTree(d.id, d.current_epoch) : null
+        return [r.blockId, t ? headingOf(t.roots, r.blockId) : null] as const
+      }),
+    ).then((pairs) => live && setHeads(new Map(pairs)))
+    return () => {
+      live = false
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [parsed])
   const answerDoc = docId ? byId.get(docId) : undefined
   const verified = livingLabel(living)
 
@@ -711,6 +729,7 @@ function AskCard({
                   <div>
                     <button type="button" className="lp-rcpt-link" onClick={() => openCite(r.blockId, r.title)}>
                       {r.title || 'Source'}
+                      {heads.get(r.blockId) ? ` › ${heads.get(r.blockId)}` : ''}
                     </button>
                     {r.quote && <blockquote>{r.quote}</blockquote>}
                   </div>
