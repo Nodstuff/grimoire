@@ -1,26 +1,18 @@
-// Adding EPUBs: a dropzone (drop .epub files or click to pick) that uploads
-// in batches of UPLOAD_CHUNK per POST, with a live chip per file
-// (queued → uploading → done) and one result card per file as its batch
-// lands. One summary toast rolls the whole run up. Also mountable headless
-// (hiddenButton + inputId) so ⌘K's "Add EPUBs…" has an input to click —
-// the same trick as ImportFolder's "import-folder-input".
+// Adding EPUBs: a dropzone (drop .epub files, or click / Enter / Space to
+// pick) feeding the app's one upload queue (bookUploads.ts), with a live chip
+// per file (queued → uploading → done) and one result card per file as its
+// batch lands. Also mountable headless (hiddenButton + inputId) so ⌘K's
+// "Add EPUBs…" has an input to click — the palette then shows the Books
+// view, which renders the same queue's chips and cards.
 
 import { useRef, useState } from 'react'
-import { errText, notify } from './Notice'
-import { UploadResult, chunks, collectEpubs, uploadBooks, uploadResultSummary } from './books'
-
-interface Job {
-  name: string
-  state: 'queued' | 'uploading' | 'done'
-}
+import { UploadResult } from './books'
+import { bookUploads, useBookUploads } from './bookUploads'
 
 export default function BookUpload({
-  onUploaded,
   inputId,
   hiddenButton = false,
 }: {
-  /** called once per run with every batch's results (for the parent to reload) */
-  onUploaded?: (results: UploadResult[]) => void
   /** id on the file input so a palette command can trigger it */
   inputId?: string
   /** render only the input (the App-root instance behind ⌘K) */
@@ -28,43 +20,9 @@ export default function BookUpload({
 }) {
   const input = useRef<HTMLInputElement>(null)
   const [over, setOver] = useState(false)
-  const [jobs, setJobs] = useState<Job[]>([])
-  const [results, setResults] = useState<UploadResult[]>([])
-  const [busy, setBusy] = useState(false)
+  const { busy, jobs, results } = useBookUploads()
 
-  const run = async (picked: FileList | File[] | null) => {
-    if (!picked || busy) return
-    const epubs = collectEpubs(Array.from(picked))
-    if (input.current) input.current.value = ''
-    if (epubs.length === 0) {
-      notify('no .epub files there', 'warn')
-      return
-    }
-    setBusy(true)
-    setResults([])
-    setJobs(epubs.map((f) => ({ name: f.name, state: 'queued' })))
-    const all: UploadResult[] = []
-    // sequential batches: a big import should not hammer the daemon with
-    // parallel multi-MB POSTs
-    for (const batch of chunks(epubs.map((f, i) => ({ f, i })))) {
-      const idx = new Set(batch.map((x) => x.i))
-      setJobs((cur) => cur.map((j, i): Job => (idx.has(i) ? { ...j, state: 'uploading' } : j)))
-      let rs: UploadResult[]
-      try {
-        rs = await uploadBooks(batch.map((x) => x.f))
-      } catch (e) {
-        // the whole POST failed: every file in the batch gets the reason
-        rs = batch.map((x): UploadResult => ({ filename: x.f.name, status: 'error', message: errText(e) }))
-      }
-      all.push(...rs)
-      setJobs((cur) => cur.map((j, i): Job => (idx.has(i) ? { ...j, state: 'done' } : j)))
-      setResults((cur) => [...cur, ...rs])
-    }
-    const problems = all.some((r) => r.status === 'clash' || r.status === 'error')
-    notify(uploadResultSummary(all), problems ? 'warn' : 'ok', { ttlMs: 10_000 })
-    onUploaded?.(all)
-    setBusy(false)
-  }
+  const pick = () => input.current?.click()
 
   return (
     <>
@@ -73,20 +31,28 @@ export default function BookUpload({
           className={`book-drop ${over ? 'over' : ''}`}
           role="button"
           tabIndex={0}
-          onClick={() => !busy && input.current?.click()}
-          onKeyDown={(e) => e.key === 'Enter' && !busy && input.current?.click()}
+          aria-label="add EPUBs: drop files here, or press Enter to pick"
+          onClick={pick}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault()
+              pick()
+            }
+          }}
           onDragOver={(e) => {
             e.preventDefault()
             setOver(true)
           }}
           onDragLeave={() => setOver(false)}
           onDrop={(e) => {
+            // the page-level guard (Books) would take it too; one enqueue
             e.preventDefault()
+            e.stopPropagation()
             setOver(false)
-            run(e.dataTransfer.files)
+            bookUploads.enqueue(e.dataTransfer.files)
           }}
         >
-          {busy ? 'uploading…' : 'drop EPUBs here, or click to pick'}
+          {busy ? 'uploading… drop more to queue them' : 'drop EPUBs here, or click to pick'}
         </div>
       )}
       <input
@@ -96,7 +62,12 @@ export default function BookUpload({
         hidden
         multiple
         accept=".epub,application/epub+zip"
-        onChange={(e) => run(e.target.files)}
+        onChange={(e) => {
+          // copy before clearing: the FileList is live
+          const files = e.target.files ? Array.from(e.target.files) : []
+          e.target.value = ''
+          bookUploads.enqueue(files)
+        }}
       />
       {!hiddenButton && jobs.length > 0 && (
         <div className="book-jobs">

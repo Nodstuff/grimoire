@@ -1,6 +1,7 @@
 // The EPUB library (view kind 'books'): an upload dropzone up top, a search
-// box, then a cover grid with reading progress — "load more" pages through
-// next_before. A click opens the book's detail card: inline-editable
+// box, then a cover grid with reading progress, newest first like the pages —
+// "load more" pages through next_before. A file dropped anywhere on the page
+// uploads (or is swallowed): it never navigates the browser away. A click opens the book's detail card: inline-editable
 // title/author/series metadata (PATCH on save), the file facts, progress,
 // and an armed delete. Covers come from /api/books/{id}/cover.
 
@@ -8,6 +9,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { errText, notify } from './Notice'
 import { relTime } from './time'
 import BookUpload from './BookUpload'
+import { bookUploads, useBookUploads } from './bookUploads'
 import {
   Book,
   BookPatch,
@@ -18,9 +20,9 @@ import {
   formatSize,
   initialsOf,
   listBooks,
+  parseSeriesIndex,
   progressLabel,
   searchFilter,
-  sortByTitle,
   updateBook,
 } from './books'
 
@@ -73,6 +75,40 @@ export default function Books({ dataVersion }: { dataVersion: number }) {
     }
   }, [query, dataVersion, load])
 
+  // a finished upload run reloads page 1 (the stamp poll would too, later)
+  const { runs } = useBookUploads()
+  const firstRuns = useRef(runs)
+  useEffect(() => {
+    if (runs === firstRuns.current) return
+    firstRuns.current = runs
+    gen.current++
+    load(query, null, true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runs])
+
+  // the page-level drop guard: a file dropped anywhere on the Books page is
+  // an upload, never the browser opening the file in place of the app.
+  // The dropzone stops its own drops, so each drop is enqueued once.
+  useEffect(() => {
+    const hasFiles = (e: DragEvent) => !!e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files')
+    const over = (e: DragEvent) => {
+      if (!hasFiles(e)) return
+      e.preventDefault()
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+    }
+    const drop = (e: DragEvent) => {
+      if (!hasFiles(e)) return
+      e.preventDefault()
+      bookUploads.enqueue(e.dataTransfer?.files)
+    }
+    window.addEventListener('dragover', over)
+    window.addEventListener('drop', drop)
+    return () => {
+      window.removeEventListener('dragover', over)
+      window.removeEventListener('drop', drop)
+    }
+  }, [])
+
   // progress for the loaded ids, after every list change
   useEffect(() => {
     if (books.length === 0) {
@@ -95,14 +131,16 @@ export default function Books({ dataVersion }: { dataVersion: number }) {
     setSelected(null)
   }, [])
 
-  const shown = sortByTitle(searchFilter(books, query))
+  // the server's order (newest first) — the same order the pages arrive in,
+  // so "load more" appends below instead of reshuffling a partial page
+  const shown = searchFilter(books, query)
   const selectedBook = selected ? (books.find((b) => b.id === selected) ?? null) : null
 
   return (
     <div className="queue">
       <h1 className="queue-title">books</h1>
 
-      <BookUpload onUploaded={() => load(query, null, true)} />
+      <BookUpload />
 
       <input
         className="tree-filter"
@@ -186,8 +224,8 @@ function Cover({
   )
 }
 
-/** One metadata row: click the value to edit it in place; Enter/blur saves,
- * Esc cancels (the DocTitle dance). */
+/** One metadata row: click the value (or Tab to it and press Enter/Space) to
+ * edit it in place; Enter/blur saves, Esc cancels (the DocTitle dance). */
 function EditField({
   label,
   value,
@@ -227,16 +265,18 @@ function EditField({
     return (
       <div className="profile-kv">
         <span className="meta">{label}</span>
-        <span
+        <button
+          type="button"
           className="book-edit-val"
-          title="click to edit"
+          title={`edit ${label}`}
+          aria-label={`${label}: ${value || 'none'} — edit`}
           onClick={() => {
             setV(value)
             setEditing(true)
           }}
         >
           {value || <span className="meta dim">{placeholder}</span>}
-        </span>
+        </button>
       </div>
     )
   return (
@@ -244,6 +284,7 @@ function EditField({
       <span className="meta">{label}</span>
       <input
         className="join-input book-edit"
+        aria-label={label}
         autoFocus
         value={v}
         onChange={(e) => setV(e.target.value)}
@@ -305,12 +346,9 @@ function BookDetail({
   }
 
   const seriesIndex = book.series_index === null ? '' : String(book.series_index)
-  const saveSeriesIndex = async (v: string) => {
-    if (v === '') return patch({ series_index: null })
-    const n = Number(v)
-    if (!Number.isFinite(n)) throw new Error('series # must be a number')
-    return patch({ series_index: n })
-  }
+  // a non-number is refused here; an out-of-range one by the server (its 400
+  // message reaches the toast through EditField's catch)
+  const saveSeriesIndex = async (v: string) => patch({ series_index: parseSeriesIndex(v) })
 
   return (
     <div className="card book-detail">
@@ -331,7 +369,7 @@ function BookDetail({
         </span>
         <div className="book-detail-fields">
           <EditField label="title" value={book.title} onSave={(v) => patch({ title: v })} />
-          <EditField label="author" value={book.author ?? ''} onSave={(v) => patch({ author: v || null })} />
+          <EditField label="author" value={book.author ?? ''} onSave={(v) => patch({ author: v })} />
           <EditField label="series" value={book.series ?? ''} onSave={(v) => patch({ series: v || null })} />
           <EditField label="series #" value={seriesIndex} onSave={saveSeriesIndex} />
           <div className="profile-kv">

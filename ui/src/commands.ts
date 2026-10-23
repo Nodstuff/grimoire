@@ -28,6 +28,8 @@ export interface CommandCtx {
   queueCount: number
   /** SERVER mode, signed in through this browser: offer Sign out */
   signedIn?: boolean
+  /** SERVER mode: the EPUB library exists (Books, Add EPUBs, E-readers) */
+  library?: boolean
   onSignOut?: () => void
   /** the open doc, if any — enables the per-doc commands */
   docId: string | null
@@ -37,7 +39,7 @@ export interface CommandCtx {
   onOpenDoc: (id: string) => void
 }
 
-export function buildCommands({ queueCount, signedIn, onSignOut, docId, inboxId, onAction, onOpenDoc }: CommandCtx): OmniCommand[] {
+export function buildCommands({ queueCount, signedIn, library, onSignOut, docId, inboxId, onAction, onOpenDoc }: CommandCtx): OmniCommand[] {
   const cmds: OmniCommand[] = [
     { id: 'review', label: 'Review queue', hint: queueCount ? `${queueCount} open` : undefined, keys: '⌘⇧R', run: () => onAction('review') },
     {
@@ -56,17 +58,6 @@ export function buildCommands({ queueCount, signedIn, onSignOut, docId, inboxId,
     { id: 'runs', label: 'Gardeners', keys: '⌘G', run: () => onAction('runs') },
     { id: 'profile', label: 'Profile', hint: 'your name, version, diagnostics', run: () => onAction('profile') },
     { id: 'graph', label: 'Graph view', run: () => onAction('graph') },
-    { id: 'books', label: 'Books', hint: 'your EPUB library', run: () => onAction('books') },
-    {
-      id: 'add-books',
-      label: 'Add EPUBs…',
-      hint: 'upload files into the library',
-      run: () => {
-        onAction('close')
-        document.getElementById('book-upload-input')?.click()
-      },
-    },
-    { id: 'ereaders', label: 'E-readers', hint: 'devices that read from the library', run: () => onAction('ereaders') },
     { id: 'trash', label: 'Trash', hint: 'restore deleted docs', run: () => onAction('trash') },
     { id: 'tree', label: 'Toggle file tree', keys: '⌘T', run: () => onAction('tree') },
     {
@@ -98,6 +89,24 @@ export function buildCommands({ queueCount, signedIn, onSignOut, docId, inboxId,
       },
     },
   ]
+  if (library) {
+    // the EPUB library is SERVER-mode only (LOCAL has no books routes)
+    cmds.push(
+      { id: 'books', label: 'Books', hint: 'your EPUB library', run: () => onAction('books') },
+      {
+        id: 'add-books',
+        label: 'Add EPUBs…',
+        hint: 'upload files into the library',
+        run: () => {
+          // the Books view renders the upload queue's progress and result
+          // cards; the click stays inside the keypress's user gesture
+          onAction('books')
+          document.getElementById('book-upload-input')?.click()
+        },
+      },
+      { id: 'ereaders', label: 'E-readers', hint: 'devices that read from the library', run: () => onAction('ereaders') },
+    )
+  }
   if (docId && signedIn) {
     cmds.push({ id: 'share-link', label: 'Share link…', hint: 'a public, read-only snapshot of this doc', run: () => onAction('share') })
   }

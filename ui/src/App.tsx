@@ -15,7 +15,7 @@ import { CAPTURE_EVENT, onShellEvent } from './tauri'
 import Home from './Home'
 import Capture from './Capture'
 import Omnibox from './Omnibox'
-import Books from './Books'
+import Books from './BookLibrary'
 import BookUpload from './BookUpload'
 import Ereaders from './Ereaders'
 import { buildCommands } from './commands'
@@ -144,8 +144,14 @@ export default function App() {
   }, [])
   // SERVER mode: signed in through the browser (offer Sign out); LOCAL: never
   const [signedIn, setSignedIn] = useState(false)
+  // SERVER mode at all (the session route answers): the EPUB library lives
+  // only there — LOCAL has no books routes, so its commands and views hide
+  const [server, setServer] = useState(false)
   useEffect(() => {
-    webSession().then((w) => setSignedIn(!!w?.signed_in))
+    webSession().then((w) => {
+      setSignedIn(!!w?.signed_in)
+      setServer(!!w)
+    })
   }, [])
 
   const refreshQueue = useCallback(() => {
@@ -328,6 +334,7 @@ export default function App() {
       buildCommands({
         queueCount,
         signedIn,
+        library: server,
         onSignOut: () => {
           setPalette(null)
           signOutAndReload()
@@ -356,7 +363,7 @@ export default function App() {
           setPalette(null)
         },
       }),
-    [queueCount, signedIn, view, setView, docs],
+    [queueCount, signedIn, server, view, setView, docs],
   )
 
   // quick capture from outside the page: the shell's global hotkey (⌥⌘G) and
@@ -466,8 +473,8 @@ export default function App() {
             onChanged={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
           />
         )}
-        {view.kind === 'books' && <Books dataVersion={dataVersion} />}
-        {view.kind === 'ereaders' && <Ereaders dataVersion={dataVersion} />}
+        {view.kind === 'books' && server && <Books dataVersion={dataVersion} />}
+        {view.kind === 'ereaders' && server && <Ereaders dataVersion={dataVersion} />}
         {view.kind === 'graph' && (
           <Suspense fallback={<Loading />}>
             <GraphView onOpenDoc={openDoc} />
@@ -481,9 +488,9 @@ export default function App() {
         inputId="import-folder-input"
         onDone={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
       />
-      {/* the ⌘K "Add EPUBs…" command clicks this input; the Books view
-          reloads itself off the store-stamp poll once the daemon has them */}
-      <BookUpload hiddenButton inputId="book-upload-input" />
+      {/* the ⌘K "Add EPUBs…" command clicks this input and shows the Books
+          view, which renders the shared upload queue's chips and cards */}
+      {server && <BookUpload hiddenButton inputId="book-upload-input" />}
 
       {queueCount > 0 && view.kind !== 'review' && (
         <button className="queue-chip" onClick={() => setView({ kind: 'review' })}>

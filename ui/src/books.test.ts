@@ -5,29 +5,38 @@ import { CSRF_HEADER } from './auth'
 import { ApiError } from './types'
 import {
   Book,
+  Ereader,
+  PROGRESS_CHUNK,
+  UPLOAD_BATCH_BYTES,
   UploadResult,
+  activeEreaders,
+  byteBatches,
   chunks,
   collectEpubs,
   coverUrl,
   createEreader,
   currentlyReading,
   deleteBook,
+  deviceSetup,
   deleteEreader,
   fetchProgress,
   formatSize,
   initialsOf,
   listBooks,
   listEreaders,
+  parseSeriesIndex,
   progressLabel,
   rotateEreader,
   searchFilter,
-  sortByTitle,
+  skippedCount,
   updateBook,
   uploadBooks,
   uploadResultSummary,
 } from './books'
-import Books from './Books'
+import Books from './BookLibrary'
 import Ereaders from './Ereaders'
+import { buildCommands } from './commands'
+import { relTime } from './time'
 
 /* ---------- fetch mock (auth.test.ts pattern) ---------- */
 
@@ -65,8 +74,9 @@ function book(partial: Partial<Book>): Book {
     original_filename: 'a-book.epub',
     size: 1024,
     has_cover: false,
-    added_at: '2026-01-01T00:00:00Z',
-    updated_at: '2026-01-01T00:00:00Z',
+    // book_json: RFC 3339 strings, whole seconds, UTC "Z"
+    added_at: '2026-01-01T09:30:00Z',
+    updated_at: '2026-01-02T18:05:12Z',
     ...partial,
   }
 }
@@ -92,12 +102,70 @@ describe('searchFilter', () => {
   })
 })
 
-describe('sortByTitle', () => {
-  it('orders case-insensitively and does not mutate', () => {
-    const inList = [book({ title: 'beta' }), book({ title: 'Alpha' }), book({ title: 'Gamma' })]
-    const out = sortByTitle(inList)
-    expect(out.map((b) => b.title)).toEqual(['Alpha', 'beta', 'Gamma'])
-    expect(inList.map((b) => b.title)).toEqual(['beta', 'Alpha', 'Gamma'])
+describe('book dates', () => {
+  it('added_at/updated_at are RFC 3339 and read as relative times', () => {
+    const b = book({})
+    const now = Date.parse('2026-01-03T09:30:00Z')
+    expect(relTime(b.added_at, now)).toBe('2d ago')
+    expect(relTime(b.updated_at, now)).toBe('15h ago')
+  })
+  it('searchFilter keeps the server order (newest first): no title sort', () => {
+    const page = [book({ id: '3', title: 'Zed' }), book({ id: '2', title: 'Alpha' }), book({ id: '1', title: 'Mid' })]
+    expect(searchFilter(page, '').map((b) => b.id)).toEqual(['3', '2', '1'])
+  })
+})
+
+describe('parseSeriesIndex', () => {
+  it('"" clears, numbers pass through, junk is refused before the server', () => {
+    expect(parseSeriesIndex('')).toBeNull()
+    expect(parseSeriesIndex('  ')).toBeNull()
+    expect(parseSeriesIndex('2.5')).toBe(2.5)
+    expect(() => parseSeriesIndex('two')).toThrow('series # must be a number')
+  })
+})
+
+describe('deviceSetup', () => {
+  it('builds the OPDS, path-form OPDS and kosync URLs from the origin', () => {
+    expect(deviceSetup('https://taisce.null.ie/', 'tom', 'k7mq-4xpt')).toEqual({
+      username: 'tom',
+      opds: 'https://taisce.null.ie/opds/',
+      opdsPath: 'https://taisce.null.ie/opds/k7mq-4xpt/',
+      kosync: 'https://taisce.null.ie/kosync',
+    })
+  })
+})
+
+describe('activeEreaders', () => {
+  it('drops revoked devices', () => {
+    const d = (id: string, revoked_at: string | null): Ereader => ({
+      id,
+      label: id,
+      stream_downloads: false,
+      created_at: '2026-01-01T00:00:00Z',
+      last_used_at: null,
+      revoked_at,
+    })
+    expect(activeEreaders([d('a', null), d('b', '2026-02-01T00:00:00Z')]).map((x) => x.id)).toEqual(['a'])
+  })
+})
+
+describe('commands: the library is SERVER-mode only', () => {
+  const ids = (library: boolean) =>
+    buildCommands({ queueCount: 0, library, docId: null, inboxId: null, onAction: () => {}, onOpenDoc: () => {} }).map((c) => c.id)
+  it('LOCAL hides Books / Add EPUBs / E-readers; SERVER shows them', () => {
+    for (const id of ['books', 'add-books', 'ereaders']) {
+      expect(ids(false)).not.toContain(id)
+      expect(ids(true)).toContain(id)
+    }
+  })
+  it('Add EPUBs shows the Books view (where the upload cards render)', () => {
+    const acts: string[] = []
+    const cmd = buildCommands({ queueCount: 0, library: true, docId: null, inboxId: null, onAction: (a) => acts.push(a), onOpenDoc: () => {} }).find(
+      (c) => c.id === 'add-books',
+    )!
+    vi.stubGlobal('document', { getElementById: () => null })
+    cmd.run()
+    expect(acts).toEqual(['books'])
   })
 })
 
@@ -125,6 +193,10 @@ describe('uploadResultSummary', () => {
   })
   it('an empty run says so', () => {
     expect(uploadResultSummary([])).toBe('nothing uploaded')
+  })
+  it('counts the skipped non-EPUB files', () => {
+    expect(uploadResultSummary([{ filename: 'a.epub', status: 'added' }], 2)).toBe('1 added · 2 skipped (not EPUB)')
+    expect(uploadResultSummary([], 0)).toBe('nothing uploaded')
   })
 })
 
@@ -157,10 +229,28 @@ describe('initialsOf', () => {
   })
 })
 
-describe('collectEpubs / chunks', () => {
-  it('keeps only .epub, any case', () => {
+describe('collectEpubs / chunks / byteBatches', () => {
+  it('keeps only .epub, any case, and counts the rest', () => {
     const files = [new File(['x'], 'a.epub'), new File(['x'], 'b.EPUB'), new File(['x'], 'c.pdf')]
     expect(collectEpubs(files).map((f) => f.name)).toEqual(['a.epub', 'b.EPUB'])
+    expect(skippedCount(files)).toBe(1)
+  })
+  it('batches by bytes: ≤ 20 MB per request, in order', () => {
+    const MB = 1024 * 1024
+    expect(UPLOAD_BATCH_BYTES).toBe(20 * MB)
+    const sizes = [8 * MB, 8 * MB, 8 * MB, 1 * MB, 3 * MB]
+    expect(byteBatches(sizes, (n) => n)).toEqual([[8 * MB, 8 * MB], [8 * MB, 1 * MB, 3 * MB]])
+    // exactly the limit still fits
+    expect(byteBatches([10 * MB, 10 * MB], (n) => n)).toEqual([[10 * MB, 10 * MB]])
+  })
+  it('a file over the limit goes alone', () => {
+    const MB = 1024 * 1024
+    expect(byteBatches([1 * MB, 45 * MB, 2 * MB, 30 * MB], (n) => n)).toEqual([[1 * MB], [45 * MB], [2 * MB], [30 * MB]])
+    expect(byteBatches([45 * MB], (n) => n)).toEqual([[45 * MB]])
+    expect(byteBatches([], (n: number) => n)).toEqual([])
+  })
+  it('also caps the file count per request', () => {
+    expect(byteBatches([1, 1, 1, 1, 1], (n) => n, 100, 2)).toEqual([[1, 1], [1, 1], [1]])
   })
   it('batches in order', () => {
     expect(chunks([1, 2, 3, 4, 5], 2)).toEqual([[1, 2], [3, 4], [5]])
@@ -186,6 +276,18 @@ describe('fetchProgress', () => {
     mockFetch({ '/api/books/progress': () => json(200, { progress }) })
     expect(await fetchProgress(['u1', 'u2'])).toEqual(progress)
     expect(calls[0].url).toBe('/api/books/progress?ids=u1,u2')
+  })
+  it(`asks at most ${PROGRESS_CHUNK} ids per request and merges the replies`, async () => {
+    const ids = Array.from({ length: 450 }, (_, i) => `b${i}`)
+    calls = []
+    vi.stubGlobal('fetch', async (url: string) => {
+      calls.push({ url })
+      const asked = new URL(url, 'http://x').searchParams.get('ids')!.split(',')
+      return json(200, { progress: Object.fromEntries(asked.map((id) => [id, null])) })
+    })
+    const out = await fetchProgress(ids)
+    expect(calls.map((c) => new URL(c.url, 'http://x').searchParams.get('ids')!.split(',').length)).toEqual([200, 200, 50])
+    expect(Object.keys(out)).toHaveLength(450)
   })
   it('no ids means no request', async () => {
     mockFetch({})
@@ -255,7 +357,14 @@ describe('coverUrl', () => {
 })
 
 describe('ereaders', () => {
-  const dev = { id: 'e1', label: 'kobo', stream_downloads: false, created_at: '2026-01-01T00:00:00Z', last_used_at: null }
+  const dev: Ereader = {
+    id: 'e1',
+    label: 'kobo',
+    stream_downloads: false,
+    created_at: '2026-01-01T00:00:00Z',
+    last_used_at: null,
+    revoked_at: null,
+  }
   it('lists, creates, rotates, removes', async () => {
     mockFetch({
       '/api/ereaders': () => json(200, { ereaders: [dev] }),

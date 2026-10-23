@@ -1603,8 +1603,8 @@ kbd {
 .book-detail-body { display: flex; gap: 18px; align-items: flex-start; }
 .book-detail-cover { width: 120px; flex-shrink: 0; }
 .book-detail-fields { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.book-edit-val { cursor: pointer; border-radius: 6px; padding: 2px 6px; margin-left: -6px; overflow-wrap: anywhere; }
-.book-edit-val:hover { background: var(--panel2); }
+.book-edit-val { appearance: none; background: none; border: 0; font: inherit; color: inherit; text-align: left; cursor: pointer; border-radius: 6px; padding: 2px 6px; margin-left: -6px; overflow-wrap: anywhere; }
+.book-edit-val:hover, .book-edit-val:focus-visible { background: var(--panel2); }
 .book-edit { width: 100%; box-sizing: border-box; font-family: inherit; }
 .book-file { overflow-wrap: anywhere; }
 
@@ -1627,3 +1627,7 @@ kbd {
 .ereader-actions { display: flex; gap: 6px; }
 .ereader-pw { font-size: 15px; letter-spacing: 0.04em; overflow-wrap: anywhere; }
 .ereader-stream { display: inline-flex; gap: 6px; align-items: center; white-space: nowrap; cursor: pointer; }
+.ereader-warn { font-weight: 600; margin: 4px 0 10px; }
+.ereader-setup-row { grid-template-columns: 130px 1fr auto; row-gap: 2px; }
+.ereader-setup-row .ereader-pw { font-size: 13px; min-width: 0; }
+.ereader-setup-hint { grid-column: 2 / -1; font-size: 12px; }
