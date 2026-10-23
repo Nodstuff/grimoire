@@ -135,6 +135,16 @@ export default function DocTree({
       return n
     })
   }, [selected, byId])
+  // …and in view: the tree scrolls in its own band, so a doc opened from
+  // elsewhere (⌘O, a link) would otherwise sit highlighted out of sight.
+  // The shell's frame is overflow: clip, so this moves the band only.
+  useEffect(() => {
+    if (!selected) return
+    const t = setTimeout(() => {
+      document.querySelector<HTMLElement>('.lp-side-tree [role="treeitem"][aria-selected="true"]')?.scrollIntoView({ block: 'nearest' })
+    }, 0)
+    return () => clearTimeout(t)
+  }, [selected])
 
   /* ---- filter ---- */
   const [filter, setFilter] = useState('')

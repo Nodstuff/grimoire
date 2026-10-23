@@ -394,7 +394,8 @@ button.lp-side-sec:hover {
   display: flex;
   flex-direction: column;
   flex: 1 1 0;
-  min-height: 140px;
+  /* a short window keeps a usable tree: the sidebar itself scrolls then */
+  min-height: min(320px, 40vh);
   overflow-y: auto;
   margin: 0 -12px;
   padding: 0 12px;
@@ -836,6 +837,12 @@ button.lp-side-sec:hover {
 }
 .palette input::placeholder {
   color: var(--ink3);
+}
+.palette-ctx-t {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .palette-ctx {
   display: inline-flex;

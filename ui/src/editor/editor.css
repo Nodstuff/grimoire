@@ -4,8 +4,13 @@
    it. Sizes are the artboard's desktop values; the phone values (Mobile-Doc)
    are at the bottom. Imported by DocEditor. */
 
-.ProseMirror {
+.ProseMirror,
+.ProseMirror:focus-visible {
+  /* the page is the editor: no focus box around the whole doc (the caret
+     is the focus indicator, as in the Doc artboard) */
   outline: none;
+}
+.ProseMirror {
   min-height: 40vh;
   caret-color: var(--accent);
   font-family: var(--font-serif);

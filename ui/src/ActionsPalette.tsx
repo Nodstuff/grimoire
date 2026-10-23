@@ -66,7 +66,7 @@ export default function ActionsPalette({
           docTitle ? (
             <span className="palette-ctx" title={`Acting on ${docTitle}`}>
               <Icon name="doc" size={13} />
-              {docTitle}
+              <span className="palette-ctx-t">{docTitle}</span>
             </span>
           ) : undefined
         }
