@@ -2924,10 +2924,32 @@ impl BlockStore for SqliteStore {
         }
 
         let mut receipt = None;
+        // a declined yellow reverts only what is still its own: if a later
+        // change has touched the same field, restoring this op's pre-image
+        // would silently undo that later change (a reorder's decline moving a
+        // doc back out of the folder a later move put it in)
+        let mut moot = false;
+        if kind == AnnotationKind::Review && decision == ReviewDecision::Decline {
+            match decline_check(&tx, &op)? {
+                DeclineCheck::Revert => {}
+                DeclineCheck::Refuse(why) => return Err(StoreError::InvalidOp(why)),
+                DeclineCheck::Superseded(successor) => {
+                    if let Some(next) = successor {
+                        hand_pre_image_on(&tx, &op, *next)?;
+                    }
+                    moot = true;
+                    receipt = Some(ApplyReceipt {
+                        doc_id,
+                        epoch: doc_epoch(&tx, doc_id)?,
+                        op_ids: vec![],
+                    });
+                }
+            }
+        }
         // doc ops (AX slice B) never bump the epoch and carry their own
         // pre-image; they resolve on their own path
         let doc_op = op.kind.is_doc_op();
-        if doc_op {
+        if doc_op && !moot {
             if decision == ReviewDecision::Accept
                 && let OpKind::MoveDoc { new_parent, .. } = &op.kind
             {
@@ -2949,7 +2971,7 @@ impl BlockStore for SqliteStore {
             )?;
         }
         match (kind, decision) {
-            _ if doc_op => {}
+            _ if doc_op || moot => {}
             // yellow accepted: the edit is already live — just clear the flag
             (AnnotationKind::Review, ReviewDecision::Accept) => {}
             // yellow declined: revert via pre-image, as a green op by the reviewer
@@ -3060,6 +3082,191 @@ impl BlockStore for SqliteStore {
         tx.commit()?;
         Ok(receipt)
     }
+}
+
+/// What declining an applied yellow may do, given what has happened since.
+enum DeclineCheck {
+    /// The field still holds this op's effect and nothing later owns it:
+    /// apply the inverse.
+    Revert,
+    /// A later change owns the field now: decline without reverting. Carries
+    /// the next live op on that field when it is an open yellow, whose
+    /// pre-image is this op's post-image and must inherit this op's
+    /// pre-image (declining it later must not resurrect a declined effect).
+    Superseded(Option<Box<LedgerOp>>),
+    /// Reverting would destroy a later change and there is no partial
+    /// revert (an insert whose block was edited since).
+    Refuse(String),
+}
+
+/// The field an op owns, for supersession: op types that write it, and the
+/// block it is on (None = the doc row itself).
+fn owned_field(kind: &OpKind) -> Option<(&'static [&'static str], Option<Uuid>)> {
+    match kind {
+        OpKind::RenameDoc { .. } => Some((&["rename_doc"], None)),
+        OpKind::MoveDoc { .. } => Some((&["move_doc"], None)),
+        OpKind::SetStatus { .. } => Some((&["set_status"], None)),
+        OpKind::Replace { target, .. } => Some((&["replace"], Some(*target))),
+        OpKind::Move { target, .. } => Some((&["move"], Some(*target))),
+        OpKind::Insert { block_id, .. } => Some((&["replace", "move", "delete"], Some(*block_id))),
+        // a declined (capped) delete resurrects a tombstone nothing could
+        // have edited since; delete_doc is never a yellow
+        OpKind::Delete { .. } | OpKind::DeleteDoc { .. } => None,
+    }
+}
+
+/// The first APPLIED op after `op` on the same field that is still in
+/// effect: not itself declined, and not a decline's inverse (a later op and
+/// its inverse cancel out). Returns it with whether its annotation is an
+/// open review. "After": block ops by epoch (a parked red applies at its
+/// accept epoch); doc ops share the epoch, so by ledger id, or for a parked
+/// red by when it was accepted.
+fn later_live_op(
+    tx: &Transaction,
+    op: &LedgerOp,
+    types: &[&str],
+    block: Option<Uuid>,
+) -> Result<Option<(LedgerOp, bool)>> {
+    let cols = OP_COLS.split(", ").map(|c| format!("o.{c}")).collect::<Vec<_>>().join(", ");
+    let in_types = types.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", ");
+    let later = if op.kind.is_doc_op() {
+        // ?4 (the epoch) is unused: doc ops never bump it
+        "((a.kind IS NOT 'parked' AND o.id > ?3)
+          OR (a.kind = 'parked' AND a.resolved_at > (SELECT created_at FROM ops WHERE id = ?3)))
+          AND ?4 IS NOT NULL"
+    } else {
+        "(o.epoch_applied > ?4 OR (o.epoch_applied = ?4 AND o.id > ?3))"
+    };
+    let sql = format!(
+        "SELECT {cols}, a.kind = 'review' AND a.status = 'open'
+         FROM ops o LEFT JOIN annotations a ON a.op_id = o.id
+         WHERE o.doc_id = ?1 AND o.op_type IN ({in_types}) AND o.target_block IS ?2
+           AND o.id != ?3 AND o.epoch_applied IS NOT NULL
+           AND (a.status IS NULL OR a.status != 'declined')
+           AND o.source_refs NOT LIKE '%\"review:decline:%'
+           AND {later}
+         ORDER BY o.epoch_applied, o.id LIMIT 1"
+    );
+    let row = tx
+        .query_row(
+            &sql,
+            params![
+                op.doc_id.to_string(),
+                block.map(|b| b.to_string()),
+                op.id.to_string(),
+                op.epoch_applied.unwrap_or(0)
+            ],
+            |r| Ok((row_to_op(r)?, r.get::<_, Option<bool>>(10)?)),
+        )
+        .optional()?;
+    row.map(|(raw, open)| Ok((build_op(raw)?, open.unwrap_or(false))))
+        .transpose()
+}
+
+/// Decide what declining the applied yellow `op` may do (see `DeclineCheck`).
+/// Two signals: a later live ledger op on the same field, and the field's
+/// current value no longer being this op's post-image (a human's tree edit
+/// from the app is not ledgered).
+fn decline_check(tx: &Transaction, op: &LedgerOp) -> Result<DeclineCheck> {
+    let Some((types, block)) = owned_field(&op.kind) else {
+        return Ok(DeclineCheck::Revert);
+    };
+    let later = later_live_op(tx, op, types, block)?;
+    let cur_block = |t: Uuid| block_by_id(tx, op.doc_id, t).map(|b| b.filter(|b| !b.deleted));
+    let changed = match &op.kind {
+        OpKind::RenameDoc { title, .. } => get_doc_conn(tx, op.doc_id)?.title != *title,
+        OpKind::MoveDoc { new_parent, sort_key, .. } => {
+            let d = get_doc_conn(tx, op.doc_id)?;
+            d.parent_id != *new_parent || (sort_key.is_some() && d.sort_key != *sort_key)
+        }
+        OpKind::SetStatus { status, .. } => get_doc_conn(tx, op.doc_id)?.status != *status,
+        OpKind::Replace { target, content } => {
+            cur_block(*target)?.is_none_or(|b| b.content != *content)
+        }
+        OpKind::Move { target, new_parent, new_order_key } => cur_block(*target)?
+            .is_none_or(|b| b.parent_id != *new_parent || b.order_key != *new_order_key),
+        OpKind::Insert { block_id, .. } => {
+            return Ok(match later {
+                None => DeclineCheck::Revert,
+                // deleted since: declining the insert has nothing left to remove
+                Some((l, _)) if matches!(l.kind, OpKind::Delete { .. }) => DeclineCheck::Superseded(None),
+                Some((l, _)) => DeclineCheck::Refuse(format!(
+                    "superseded: block {block_id} was changed after this insert (a later {} op {}); \
+                     decline that change first, or accept this one",
+                    l.kind.op_type(),
+                    l.id
+                )),
+            });
+        }
+        OpKind::Delete { .. } | OpKind::DeleteDoc { .. } => false,
+    };
+    Ok(match later {
+        None if !changed => DeclineCheck::Revert,
+        Some((next, true)) => DeclineCheck::Superseded(Some(Box::new(next))),
+        _ => DeclineCheck::Superseded(None),
+    })
+}
+
+/// A superseded decline: `next` (the open yellow that followed `op` on the
+/// same field) recorded `op`'s post-image as its pre-image. `op` is now
+/// declined, so `next` inherits `op`'s pre-image — when the pre-image still
+/// chains (nothing unledgered happened in between). Declining `next` then
+/// lands where the field was before both, never on a declined value.
+fn hand_pre_image_on(tx: &Transaction, op: &LedgerOp, mut next: LedgerOp) -> Result<()> {
+    let mut prior = next.prior.clone();
+    let chained = match (&op.kind, &mut next.kind, &mut prior) {
+        (OpKind::RenameDoc { title, from_title }, OpKind::RenameDoc { from_title: nf, .. }, _) if nf == title => {
+            *nf = from_title.clone();
+            true
+        }
+        (
+            OpKind::MoveDoc { new_parent, sort_key, from_parent, from_sort_key, from_parent_title, .. },
+            OpKind::MoveDoc { from_parent: np, from_sort_key: nk, from_parent_title: nt, .. },
+            _,
+        ) if np == new_parent && nk == sort_key => {
+            *np = *from_parent;
+            *nk = from_sort_key.clone();
+            *nt = from_parent_title.clone();
+            true
+        }
+        (OpKind::SetStatus { status, from_status }, OpKind::SetStatus { from_status: nf, .. }, _) if nf == status => {
+            *nf = *from_status;
+            true
+        }
+        (OpKind::Replace { content, .. }, OpKind::Replace { .. }, Some(np)) if np.content == *content => {
+            match &op.prior {
+                Some(p) => {
+                    np.content = p.content.clone();
+                    true
+                }
+                None => false,
+            }
+        }
+        (OpKind::Move { new_parent, new_order_key, .. }, OpKind::Move { .. }, Some(np))
+            if np.parent_id == *new_parent && np.order_key == *new_order_key =>
+        {
+            match &op.prior {
+                Some(p) => {
+                    np.parent_id = p.parent_id;
+                    np.order_key = p.order_key.clone();
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    };
+    if chained {
+        tx.execute(
+            "UPDATE ops SET payload = ?1, prior = ?2 WHERE id = ?3",
+            params![
+                serde_json::to_string(&next.kind)?,
+                prior.as_ref().map(serde_json::to_string).transpose()?,
+                next.id.to_string()
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Resolve an annotation whose op is a doc op. Yellow accept: nothing to do.

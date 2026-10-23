@@ -2198,6 +2198,10 @@ impl KsMcp {
                     }
                     let word = if decision == ReviewDecision::Accept { "accepted" } else { "declined" };
                     match receipt {
+                        // a decline whose field a later change owns reverts nothing
+                        Some(r) if decision == ReviewDecision::Decline && r.op_ids.is_empty() => ok_text(format!(
+                            "ok · {word} · superseded by a later change to the same field; nothing reverted"
+                        )),
                         Some(r) => ok_text(format!("ok · {word} · epoch {}", r.epoch)),
                         None => ok_text(format!("ok · {word}")),
                     }
