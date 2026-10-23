@@ -2237,6 +2237,67 @@ mod tests {
         assert_eq!(ol.asked.lock().unwrap().len(), asked, "cached");
     }
 
+    /// A book with no cover at all is the review's second group, found
+    /// and accepted like a greyscale one; an explicit choice takes it out
+    /// of the pass and a pass's accept never overwrites it.
+    #[tokio::test]
+    async fn coverless_books_are_reviewed_too_and_a_choice_stands() {
+        let t = test_lib();
+        let grey = grey_book(&t, "Horus Rising", "Dan Abnett");
+        let mk = |title: &str| {
+            let id = Uuid::now_v7();
+            t.store.lock(Scope::User(t.user)).book_insert(id, &NewBook {
+                title: title.into(),
+                author: "Jane Austen".into(),
+                series: None,
+                series_index: None,
+                book_identifier: None,
+                original_filename: "p.epub".into(),
+                file_sha256: format!("sha-{id}"),
+                size: 1,
+                file_s3_key: format!("library/{}/{id}.epub", t.user),
+                cover_s3_key: None,
+            }, 20).unwrap();
+            id
+        };
+        let pride = mk("Pride and Prejudice");
+        let emma = mk("Emma");
+        let (_, r) = t.send("GET", "/api/books/cover-review", None, vec![]).await;
+        assert_eq!((r["greyscale"].as_u64(), r["unscanned"].as_u64(), r["coverless"].as_u64()), (Some(1), Some(0), Some(2)), "{r}");
+        let rows: Vec<(String, String)> = r["books"].as_array().unwrap().iter().map(|x| (x["kind"].as_str().unwrap().into(), x["book"]["id"].as_str().unwrap().into())).collect();
+        assert_eq!(rows, [("greyscale".into(), grey.to_string()), ("coverless".into(), pride.to_string()), ("coverless".into(), emma.to_string())]);
+
+        let ol = &t.covers.mock;
+        ol.answer(
+            crate::covers::OpenLibrary::search_url("Pride and Prejudice", "Jane Austen").as_str(),
+            200,
+            br#"{"docs":[{"title":"Pride and Prejudice","author_name":["Jane Austen"],"cover_i":14348537}]}"#.to_vec(),
+        );
+        ol.answer(crate::covers::OpenLibrary::id_cover_url(14348537).as_str(), 200, crate::covers::tests::jpeg(330, 500, true));
+        let (_, c) = t.send("POST", &format!("/api/books/{pride}/cover-candidates"), None, vec![]).await;
+        let cid = c["candidates"][0]["id"].as_str().unwrap_or_else(|| panic!("{c}")).to_string();
+        let (st, b) = t.send("POST", &format!("/api/books/{pride}/cover"), Some("application/json"), format!(r#"{{"candidate":"{cid}","unless_chosen":true}}"#).into_bytes()).await;
+        assert_eq!((st, b["has_cover"].as_bool(), b["has_embedded_cover"].as_bool()), (StatusCode::OK, Some(true), Some(false)), "{b}");
+
+        // Emma: the person says no cover, explicitly; the pass leaves it be
+        let (st, _) = t.send("POST", &format!("/api/books/{emma}/cover"), Some("application/json"), br#"{"use":"embedded"}"#.to_vec()).await;
+        assert_eq!(st, StatusCode::OK);
+        let (_, r) = t.send("GET", "/api/books/cover-review", None, vec![]).await;
+        assert_eq!((r["coverless"].as_u64(), r["books"].as_array().map(Vec::len)), (Some(0), Some(1)), "{r}");
+        ol.answer(
+            crate::covers::OpenLibrary::search_url("Emma", "Jane Austen").as_str(),
+            200,
+            br#"{"docs":[{"title":"Emma","author_name":["Jane Austen"],"cover_i":5}]}"#.to_vec(),
+        );
+        ol.answer(crate::covers::OpenLibrary::id_cover_url(5).as_str(), 200, crate::covers::tests::jpeg(331, 500, true));
+        let (_, c) = t.send("POST", &format!("/api/books/{emma}/cover-candidates"), Some("application/json"), br#"{"refresh":true}"#.to_vec()).await;
+        let cid = c["candidates"][0]["id"].as_str().unwrap_or_else(|| panic!("{c}")).to_string();
+        let (st, b) = t.send("POST", &format!("/api/books/{emma}/cover"), Some("application/json"), format!(r#"{{"candidate":"{cid}","unless_chosen":true}}"#).into_bytes()).await;
+        assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("cover_chosen")), "{b}");
+        let e = t.store.lock(Scope::User(t.user)).book_get(emma).unwrap();
+        assert_eq!((e.cover_choice, e.shown_cover_key()), (taisce_store::books::CoverChoice::Embedded, None), "still no cover, as chosen");
+    }
+
     /// "Search with a different title…": the person's terms, the server's
     /// URL. Always asked (never the cache), no ISBNs, matched against the
     /// terms; a miss leaves the book's own cache alone; a bad title is 400.

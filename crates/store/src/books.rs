@@ -757,29 +757,41 @@ impl SqliteStore {
     /// with `unscanned`, not looked at yet (it has a cover, no verdict).
     /// Oldest first, so a pass works through a library in a stable order.
     pub fn book_list_cover_review(&self, user: Uuid, unscanned: bool, limit: usize) -> Result<Vec<Book>> {
-        let owner = self.user_scoped(user)?;
         let verdict = if unscanned { "cover_grey IS NULL AND cover_s3_key IS NOT NULL" } else { "cover_grey = 1" };
+        self.book_list_cover_pass(user, verdict, limit)
+    }
+
+    /// `user`'s live books with no cover at all (none embedded, no colour
+    /// one, nobody chose): the pass's "No cover — add one?" group. Oldest
+    /// first.
+    pub fn book_list_coverless(&self, user: Uuid, limit: usize) -> Result<Vec<Book>> {
+        self.book_list_cover_pass(user, "cover_s3_key IS NULL", limit)
+    }
+
+    fn book_list_cover_pass(&self, user: Uuid, which: &str, limit: usize) -> Result<Vec<Book>> {
+        let owner = self.user_scoped(user)?;
         let mut st = self.conn.prepare(&format!(
             "SELECT {BOOK_COLS} FROM book
              WHERE user_id = ?1 AND deleted_at IS NULL AND cover_choice = 'none'
-               AND color_cover_s3_key IS NULL AND {verdict}
+               AND color_cover_s3_key IS NULL AND {which}
              ORDER BY added_at, id LIMIT ?2"
         ))?;
         let rows = st.query_map(params![owner.to_string(), limit as i64], book_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// How many of `user`'s live books [`Self::book_list_cover_review`]
-    /// would list: (greyscale, not looked at yet).
-    pub fn book_cover_review_counts(&self, user: Uuid) -> Result<(usize, usize)> {
+    /// How many of `user`'s live books the pass would list: (greyscale,
+    /// not looked at yet, no cover at all).
+    pub fn book_cover_review_counts(&self, user: Uuid) -> Result<(usize, usize, usize)> {
         let owner = self.user_scoped(user)?;
         Ok(self.conn.query_row(
             "SELECT coalesce(sum(cover_grey = 1), 0),
-                    coalesce(sum(cover_grey IS NULL AND cover_s3_key IS NOT NULL), 0)
+                    coalesce(sum(cover_grey IS NULL AND cover_s3_key IS NOT NULL), 0),
+                    coalesce(sum(cover_s3_key IS NULL), 0)
              FROM book WHERE user_id = ?1 AND deleted_at IS NULL AND cover_choice = 'none'
                AND color_cover_s3_key IS NULL",
             params![owner.to_string()],
-            |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize)),
+            |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize, r.get::<_, i64>(2)? as usize)),
         )?)
     }
 
@@ -1470,7 +1482,8 @@ mod tests {
             let g = s.book_set_cover_facts(grey.id, Some(true), Some("9781849706186,1849706182")).unwrap();
             assert_eq!((g.cover_grey, g.isbn_list(), g.updated_at), (Some(true), vec!["9781849706186".to_string(), "1849706182".into()], 10));
             assert_eq!(s.book_set_cover_facts(grey.id, Some(true), None).unwrap().isbns.as_deref(), Some("9781849706186,1849706182"), "None keeps the ISBNs");
-            assert_eq!(s.book_cover_review_counts(a).unwrap(), (1, 1));
+            assert_eq!(s.book_cover_review_counts(a).unwrap(), (1, 1, 1));
+            assert_eq!(titles(&s.book_list_coverless(a, 10).unwrap()), ["No Cover"]);
             assert_eq!(titles(&s.book_list_cover_review(a, false, 10).unwrap()), ["Horus Rising"]);
             assert_eq!(titles(&s.book_list_cover_review(a, true, 10).unwrap()), ["Foundation"], "coverless books are never 'unscanned'");
 
@@ -1490,7 +1503,7 @@ mod tests {
             assert_eq!((g.cover_choice, g.shown_cover_key(), g.cover_choice_by.as_deref(), g.cover_choice_at, g.updated_at, replaced),
                 (CoverChoice::Color, Some("u/horus.cover-color.jpg"), Some("tom"), Some(30), 30, None));
             assert!(s.book_cover_candidates(grey.id).unwrap().is_empty(), "choosing drops the cache");
-            assert_eq!(s.book_cover_review_counts(a).unwrap(), (0, 1));
+            assert_eq!(s.book_cover_review_counts(a).unwrap(), (0, 1, 1));
 
             // a pass never overwrites a choice: refused, nothing moves
             s.book_choose_cover(unseen.id, CoverPick::Embedded, false, "tom", 31).unwrap();
@@ -1512,7 +1525,8 @@ mod tests {
             assert!(matches!(s.book_cover_candidates(grey.id), Err(StoreError::NotFound(_))));
             assert!(s.book_list_cover_review(a, false, 10).is_err());
             assert!(s.book_cover_review_counts(a).is_err());
-            assert_eq!(s.book_cover_review_counts(b).unwrap(), (0, 0));
+            assert_eq!(s.book_cover_review_counts(b).unwrap(), (0, 0, 0));
+            assert!(s.book_list_coverless(a, 10).is_err(), "A's coverless books are not B's to list");
         });
         s.with_scope_for_test(Scope::Public, |s| {
             assert!(s.book_cover_candidates(grey.id).is_err());

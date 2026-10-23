@@ -3098,7 +3098,10 @@ async fn colour_covers_are_the_owners_alone() {
         let (st, out) = fx.b(m, "/api/books/cover-review", None).await;
         assert_eq!(st, StatusCode::OK, "{m}: {out}");
         let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!((v["greyscale"].as_u64(), v["books"].as_array().map(Vec::len)), (Some(0), Some(0)), "{out}");
+        assert_eq!(v["greyscale"].as_u64(), Some(0), "{out}");
+        // only her own coverless book, never A's
+        let ids: Vec<&str> = v["books"].as_array().unwrap().iter().map(|r| r["book"]["id"].as_str().unwrap()).collect();
+        assert_eq!((ids, v["coverless"].as_u64()), (vec![fx.b_book.to_string().as_str()], Some(1)), "{out}");
         assert_eq!(v["unscanned"], 0, "A's unscanned cover is not B's to scan: {out}");
         fx.no_leak_besides("/api/books/cover-review", &out, &[]);
     }

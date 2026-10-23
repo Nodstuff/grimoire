@@ -33,8 +33,9 @@
 //! - `GET /api/books/{id}/cover-candidates/{candidate}` → the image
 //! - `POST /api/books/{id}/cover` `{candidate} | {use: "embedded"}`,
 //!   `unless_chosen?` → the book
-//! - `GET /api/books/cover-review` → greyscale books with their best
-//!   cached candidate, and how many covers are not looked at yet
+//! - `GET /api/books/cover-review` → greyscale books, then books with no
+//!   cover at all, each with its best cached candidate, and how many
+//!   covers are not looked at yet
 //! - `POST /api/books/cover-review` → looks at the next batch of covers
 //!   shelved before greyscale detection, then answers like the GET
 
@@ -82,7 +83,9 @@ const MAX_SEARCHES: usize = 4;
 /// old ones missed): the next find asks again. Bump it whenever the
 /// searches or the matching change.
 /// - 1: one search with the normalised title (unstamped rows)
-/// - 2: [`search_variants`] in turn; series-prefixed titles
+/// - 2: [`search_variants`] in turn; series-prefixed titles; the whole
+///   title (subtitle kept) matches too; padded titles; authors written in
+///   another script
 pub const MATCHER_VERSION: i64 = 2;
 /// ISBNs tried per lookup.
 const MAX_ISBNS: usize = 2;
@@ -251,33 +254,54 @@ fn isbn10_to_13(d: &str) -> String {
 
 // ---- matching search results to the book ----
 
-/// A title for matching and searching: lowercased letters and digits, a
-/// series tag in brackets dropped ("Horus Rising (The Horus Heresy Book
-/// 1)"), a subtitle after ':' or a dash dropped (" - " too), a leading
-/// article dropped.
-fn norm_title(t: &str) -> String {
-    let t = t.split(" - ").next().unwrap_or(t);
+/// A title for matching: lowercased letters and digits, a series tag in
+/// brackets dropped ("Horus Rising (The Horus Heresy Book 1)"), a
+/// subtitle after ':' or a dash dropped (" - " too) unless `whole`, a
+/// leading article dropped, and anything after a run of three or more
+/// spaces dropped (Open Library pads some titles before a series blurb:
+/// "The First Heretic                Warhammer 40000 Novels").
+fn norm_words(t: &str, whole: bool) -> String {
+    let t = padded_head(t);
+    let t = if whole { t } else { t.split(" - ").next().unwrap_or(t) };
     let mut s = String::new();
     let mut depth = 0usize;
     for c in t.chars() {
         match c {
             '(' | '[' => depth += 1,
             ')' | ']' => depth = depth.saturating_sub(1),
-            ':' | '–' | '—' if depth == 0 => break,
+            ':' | '–' | '—' if depth == 0 && !whole => break,
             c if depth == 0 => s.push(c),
             _ => {}
         }
     }
-    let words: Vec<String> = s
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .collect();
+    let words = words(&s);
     let words = match words.first().map(String::as_str) {
         Some("the" | "a" | "an") if words.len() > 1 => &words[1..],
         _ => &words[..],
     };
     words.join(" ")
+}
+
+fn norm_title(t: &str) -> String {
+    norm_words(t, false)
+}
+
+/// The text before a run of three or more whitespace characters.
+fn padded_head(t: &str) -> &str {
+    let t = t.trim();
+    let mut run = 0usize;
+    for (i, c) in t.char_indices() {
+        if c.is_whitespace() {
+            run += 1;
+            if run == 3 {
+                let head = t[..i].trim_end();
+                return if words(head).is_empty() { t } else { head };
+            }
+        } else {
+            run = 0;
+        }
+    }
+    t
 }
 
 /// Words of a title fragment: lowercased letters and digits, nothing else.
@@ -391,7 +415,9 @@ fn title_match(book: &str, found: &str) -> Option<TitleMatch> {
     if a.is_empty() {
         return None;
     }
-    if a == b {
+    // the whole title too, subtitle and all: "2001: A Space Odyssey" is
+    // Open Library's "2001 A SPACE ODYSSEY"
+    if a == b || norm_words(book, true) == norm_words(found, true) {
         return Some(TitleMatch::Exact);
     }
     // the series prefix: only the book's OWN series (from its brackets),
@@ -417,9 +443,29 @@ fn name_words(n: &str) -> HashSet<String> {
     n.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() > 1).map(str::to_lowercase).collect()
 }
 
+#[cfg(test)]
 fn author_matches(book: &str, found: &[String]) -> bool {
+    author_match(book, found).is_some()
+}
+
+/// Whether a result's authors are the book's: `Some(true)` a shared name
+/// word (or no author of ours to check); `Some(false)` when the only names
+/// that could match are in another script ("刘慈欣" for Cixin Liu, "村上春樹"
+/// for Haruki Murakami: Open Library's search matched them through its
+/// alternate names, ours cannot compare), ranked after real matches;
+/// None when they are someone else.
+fn author_match(book: &str, found: &[String]) -> Option<bool> {
     let want = name_words(book);
-    want.is_empty() || found.iter().any(|f| !name_words(f).is_disjoint(&want))
+    if want.is_empty() || found.iter().any(|f| !name_words(f).is_disjoint(&want)) {
+        return Some(true);
+    }
+    found.iter().any(|f| other_script(f)).then_some(false)
+}
+
+/// A name with letters but none of them Latin.
+fn other_script(n: &str) -> bool {
+    let latin = |c: char| c.is_ascii_alphabetic() || ('\u{00C0}'..='\u{024F}').contains(&c);
+    n.chars().any(char::is_alphabetic) && !n.chars().any(|c| c.is_alphabetic() && latin(c))
 }
 
 // ---- Open Library ----
@@ -680,14 +726,16 @@ impl OpenLibrary {
                 // matched against the book's own title and author, whatever
                 // the query was
                 let Some(how) = d.title.as_deref().and_then(|t| title_match(title, t)) else { continue };
-                if !author_matches(author, &d.author_name) || !covers_seen.insert(cover_i) {
+                let Some(same_author) = author_match(author, &d.author_name) else { continue };
+                if !covers_seen.insert(cover_i) {
                     continue;
                 }
+                let strong = how == TitleMatch::Exact && same_author;
                 fetches += 1;
                 match self.get(Self::id_cover_url(cover_i)).await {
                     Ok(Some(bytes)) => {
-                        let into = if how == TitleMatch::Exact { &mut out } else { &mut weak };
-                        if offer(bytes, "search", cover_i.to_string(), into) && how == TitleMatch::Exact {
+                        let into = if strong { &mut out } else { &mut weak };
+                        if offer(bytes, "search", cover_i.to_string(), into) && strong {
                             found_exact = true;
                         }
                     }
@@ -1013,27 +1061,32 @@ async fn conflict_now(st: &LibraryState, v: &Viewer, id: Uuid) -> Response {
     }
 }
 
-/// The review list: every greyscale book nobody chose a cover for, oldest
-/// first, each with its best cached candidate (`looked_up` false = ask
-/// POST /cover-candidates), and how many covers are not looked at yet.
+/// The review list: every greyscale book nobody chose a cover for, then
+/// every book with no cover at all (`kind` "greyscale" | "coverless"),
+/// oldest first within each, each with its best cached candidate
+/// (`looked_up` false = ask POST /cover-candidates), and how many covers
+/// are not looked at yet.
 async fn review_json(st: &LibraryState, v: &Viewer, user: Uuid, scanned: Option<usize>) -> Response {
     let got = with_store(&st.store, v.scope, move |s| -> taisce_store::Result<_> {
-        let (grey, unscanned) = s.book_cover_review_counts(user)?;
-        let books = s.book_list_cover_review(user, false, 500)?;
-        let mut rows = Vec::with_capacity(books.len());
-        for b in books {
-            let best = s.book_cover_candidates(b.id)?.into_iter().next();
-            rows.push((b, best));
+        let (grey, unscanned, coverless) = s.book_cover_review_counts(user)?;
+        let mut rows = Vec::new();
+        for (kind, books) in [("greyscale", s.book_list_cover_review(user, false, 500)?), ("coverless", s.book_list_coverless(user, 500)?)] {
+            for b in books {
+                let best = s.book_cover_candidates(b.id)?.into_iter().next();
+                rows.push((kind, b, best));
+            }
         }
-        Ok((grey, unscanned, rows))
+        Ok((grey, unscanned, coverless, rows))
     })
     .await;
     match got {
-        Ok((grey, unscanned, rows)) => {
+        Ok((grey, unscanned, coverless, rows)) => {
             let mut out = json!({
                 "greyscale": grey,
                 "unscanned": unscanned,
-                "books": rows.iter().map(|(b, best)| json!({
+                "coverless": coverless,
+                "books": rows.iter().map(|(kind, b, best)| json!({
+                    "kind": kind,
                     "book": book_json(b),
                     "looked_up": lookup_current(b, best.is_some()),
                     "best": best.as_ref().map(|c| candidate_json(b.id, c)),
@@ -1485,5 +1538,99 @@ pub(crate) mod tests {
         assert!(!lookup_current(&stamped(Some(1), Some(MATCHER_VERSION - 1)), false));
         assert!(lookup_current(&stamped(Some(1), Some(MATCHER_VERSION)), false));
         assert!(lookup_current(&stamped(Some(1), None), true), "an old lookup's candidates still stand");
+    }
+
+    /// Live misses from Tom's library, with Open Library's answers as
+    /// they came (2026-10-23): each now finds its cover.
+    #[tokio::test]
+    async fn the_live_misses_match() {
+        let pad = format!("The First Heretic{}Warhammer 40000 Novels Horus Heresy", " ".repeat(28));
+        let cases: Vec<(&str, &str, &str, Value, Vec<i64>)> = vec![
+            (
+                "Vulkan Lives",
+                "Nick Kyme",
+                "Vulkan Lives",
+                json!([
+                    {"title": "Vulkan Lives", "author_name": ["Nick Kyme"], "cover_i": 10214975},
+                    {"title": "Vulkan Lives", "author_name": ["Nick Kyme"], "cover_i": 13718144},
+                ]),
+                vec![10214975, 13718144],
+            ),
+            (
+                "The First Heretic (The Horus Heresy Book 14)",
+                "Aaron Dembski-Bowden",
+                "The First Heretic",
+                json!([{"title": pad, "author_name": ["Aaron Dembski-Bowden"], "cover_i": 7724581}]),
+                vec![7724581],
+            ),
+            (
+                "2001: A Space Odyssey",
+                "Arthur C. Clarke",
+                "2001: A Space Odyssey",
+                json!([
+                    {"title": "2001 A SPACE ODYSSEY", "author_name": ["Arthur C. Clarke"], "cover_i": 15170836},
+                    {"title": "2001, a space odyssey ; The city and the stars ; The deep range ; A fall of moondust ; Rendezvous with Rama", "author_name": ["Arthur C. Clarke"], "cover_i": 12134736},
+                    {"title": "2001; a space odyssey", "author_name": ["Arthur C. Clarke"]},
+                ]),
+                vec![15170836],
+            ),
+            (
+                // Open Library writes the author in Chinese and truncates the title
+                "Death's End (The Three-Body Problem)",
+                "Cixin Liu",
+                "Death's End",
+                json!([
+                    {"title": "Death's End (The Three-Body Pr", "author_name": ["刘慈欣"], "cover_i": 7893958},
+                    {"title": "Cixin Liu Bestselling Collecting Books Series, Set of 4 Books. the Three-Body Problem, the Wandering Earth, the Dark Forest and Death's End", "author_name": ["Cixin Liu"], "cover_i": 1},
+                ]),
+                vec![7893958],
+            ),
+            (
+                // results without a cover are skipped
+                "After Dark",
+                "Haruki Murakami",
+                "After Dark",
+                json!([
+                    {"title": "After Dark", "author_name": ["村上春樹"]},
+                    {"title": "After dark", "author_name": ["村上春樹", "Albert Nolla Cabellos"], "cover_i": 13524033},
+                    {"title": "After Dark", "author_name": ["村上春樹"], "cover_i": null},
+                    {"title": "AFTER DARK", "author_name": ["村上春樹"], "cover_i": 12326861},
+                ]),
+                vec![13524033, 12326861],
+            ),
+            (
+                // our data's curly apostrophe, Open Library's straight one
+                "Foundation\u{2019}s Edge",
+                "Isaac Asimov",
+                "Foundation\u{2019}s Edge",
+                json!([
+                    {"title": "Foundation's Edge", "author_name": ["Isaac Asimov"], "cover_i": 6700720},
+                    {"title": "Novels (Foundation / Foundation and Empire / Foundation's Edge / Second Foundation)", "author_name": ["Isaac Asimov"], "cover_i": 6893876},
+                ]),
+                vec![6700720],
+            ),
+        ];
+        for (title, author, query, found, want) in cases {
+            let ol = OpenLibrary::for_test();
+            let m = ol.mock.clone();
+            if query != title {
+                m.answer(OpenLibrary::search_url(title, author).as_str(), 200, docs(json!([])));
+            }
+            m.answer(OpenLibrary::search_url(query, author).as_str(), 200, docs(found));
+            for (i, id) in [10214975i64, 13718144, 7724581, 15170836, 12134736, 7893958, 1, 13524033, 12326861, 6700720, 6893876].into_iter().enumerate() {
+                m.answer(OpenLibrary::id_cover_url(id).as_str(), 200, jpeg(320 + i as u32, 500, true));
+            }
+            let got = ol.lookup(title, author, &[]).await;
+            let refs: Vec<i64> = got.candidates.iter().map(|c| c.source_ref.parse().unwrap()).collect();
+            assert_eq!(refs, want, "{title}");
+        }
+        assert!(title_matches("Foundation's Edge", "Foundation\u{2019}s Edge"));
+        // another script is a weak match; a different Latin name is none
+        assert_eq!(author_match("Cixin Liu", &["刘慈欣".into()]), Some(false));
+        assert_eq!(author_match("Haruki Murakami", &["Albert Nolla Cabellos".into()]), None);
+        assert_eq!(author_match("Haruki Murakami", &["Albert Nolla Cabellos".into(), "村上春樹".into()]), Some(false));
+        assert!(!title_matches("2001: A Space Odyssey", "2001, a space odyssey ; The city and the stars"));
+        assert_eq!(padded_head("   Dune   "), "Dune");
+        assert_eq!(padded_head("Dune    Messiah"), "Dune");
     }
 }
