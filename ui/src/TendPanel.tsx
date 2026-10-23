@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, Doc, GardenerRun } from './types'
 import { notify } from './Notice'
+import { Button } from './lapis'
 
 interface Tending {
   id: string
@@ -37,11 +38,10 @@ function bindingsOf(t: Tending): { repos: string[]; style_docs: string[] } {
 
 export default function TendPanel({
   doc,
-  onClose,
   dataVersion,
 }: {
   doc: Doc
-  onClose: () => void
+  onClose?: () => void
   dataVersion: number
 }) {
   const [tendings, setTendings] = useState<Tending[]>([])
@@ -68,11 +68,7 @@ export default function TendPanel({
   }
 
   return (
-    <aside className="panel tend-panel">
-      <div className="panel-head">
-        <span>tending — {doc.title}</span>
-        <button onClick={onClose}>esc</button>
-      </div>
+    <div className="tend-pane">
       {tendings.length === 0 && !adding && (
         <div className="tend-empty">
           <p>
@@ -100,11 +96,11 @@ export default function TendPanel({
           load()
         }} />
       ) : (
-        <button className="chip tend-add" onClick={() => setAdding(true)}>
-          + attach a tending
-        </button>
+        <Button size="sm" icon="plus" className="tend-add" onClick={() => setAdding(true)}>
+          Attach a tending
+        </Button>
       )}
-    </aside>
+    </div>
   )
 }
 
@@ -191,13 +187,13 @@ function TendingCard({
           <option value="daily">daily at 16:00</option>
         </select>
         {dirty && (
-          <button className="accept" onClick={save}>
-            save
-          </button>
+          <Button size="sm" variant="primary" onClick={save}>
+            Save
+          </Button>
         )}
-        <button className="chip" disabled={running || !enabled} onClick={onRun}>
-          {running ? 'running…' : 'run now'}
-        </button>
+        <Button size="sm" disabled={running || !enabled} onClick={onRun}>
+          {running ? 'Running…' : 'Run now'}
+        </Button>
       </div>
       {lastRun && (
         <div className={`tend-lastrun ${lastRun.status}`}>
@@ -289,12 +285,12 @@ function NewTending({
       )}
       <div className="tending-foot">
         <span className="meta">starts manual-only; runs land in review</span>
-        <button className="accept" onClick={create}>
-          attach
-        </button>
-        <button className="chip" onClick={onDone}>
-          cancel
-        </button>
+        <Button size="sm" variant="primary" onClick={create}>
+          Attach
+        </Button>
+        <Button size="sm" variant="ghost" onClick={onDone}>
+          Cancel
+        </Button>
       </div>
     </div>
   )
