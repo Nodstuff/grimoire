@@ -1,12 +1,21 @@
 // Global keyboard-shortcut scheme. Kept as a pure function so the mapping is
 // unit-testable without a DOM: resolveShortcut maps a keydown into an action,
-// App.tsx's handler dispatches it. Every mod combo is preventDefault'd by the
-// caller — ⌘P (webview Print) and ⌘O (open-file dialog) would otherwise fire.
+// App.tsx's handler dispatches it and preventDefaults exactly the combos that
+// resolve (so ⌘O never opens the browser's file dialog and ⌘, never its
+// preferences, while unmapped combos like ⌘⇧O or ⌘C keep their default).
+//
+// The three palettes: ⌘O open (docs + places), ⌘K actions, ⌘⇧F search.
+// The editor binds no ⌘K (Tiptap's link mark has no shortcut), so ⌘K opens
+// Actions from inside a doc too; its own keys (⌘B/I/E/U, ⌘⇧S strike,
+// ⌘⇧7/8/9 lists, ⌘⇧B quote, ⌘↵) never resolve here.
 
 export type ShortcutAction =
-  | 'commands' // ⌘K — operations palette
-  | 'open' // ⌘O — open a doc by title
-  | 'search' // ⌘P / ⌘S / ⌘F — content (FTS) search
+  | 'actions' // ⌘K — the actions palette
+  | 'open' // ⌘O — open a doc or place
+  | 'search' // ⌘⇧F (and ⌘F, ⌘P, ⌘S outside a doc) — full-text search
+  | 'ask' // ⌘/ — search, in ask mode
+  | 'settings' // ⌘, — settings
+  | 'autosaved' // ⌘S inside the editor: say it autosaves
   | 'tree' // ⌘T — file tree
   | 'newdoc' // ⌘N — new doc
   | 'review' // ⌘⇧R — review queue
@@ -15,9 +24,8 @@ export type ShortcutAction =
   | 'back' // ⌘[ — history back
   | 'forward' // ⌘] — history forward
   | 'home' // ⌘W — home
-  | 'ask' // ⌘/ — ask the vault
   | 'capture' // ⌘⇧I — quick capture to Inbox (⌘I alone is the editor's italic)
-  | 'help' // ? — shortcut cheatsheet (no modifier; caller ignores it in inputs)
+  | 'help' // ? — shortcut cheatsheet (no modifier; never while typing)
   | 'escape' // Esc — dismiss palette
 
 export interface KeyLike {
@@ -25,46 +33,64 @@ export interface KeyLike {
   shiftKey: boolean
   metaKey: boolean
   ctrlKey: boolean
+  altKey?: boolean
 }
 
-/** Map a keydown to an action, or null if it isn't a shortcut. Case-folds the
- * key so shift-combos (⌘⇧R arrives as "R") resolve alongside their base key. */
-export function resolveShortcut(e: KeyLike): ShortcutAction | null {
+export interface KeyContext {
+  /** focus is in the doc editor (ProseMirror) */
+  inEditor?: boolean
+  /** focus is in any editable field (input, textarea, contenteditable) */
+  typing?: boolean
+}
+
+/** Map a keydown to an action, or null if it isn't one of ours. Case-folds
+ * the key so shift-combos (⌘⇧R arrives as "R") resolve alongside their base
+ * key. Alt combos are never ours (⌥ characters, the editor's ⌘⌥ keys). */
+export function resolveShortcut(e: KeyLike, ctx: KeyContext = {}): ShortcutAction | null {
   const key = e.key.toLowerCase()
   if (key === 'escape') return 'escape'
-  // `?` opens the cheatsheet with no modifier; the caller must ignore it while
-  // an editable field is focused (so typing `?` in a doc still types `?`).
-  if (key === '?') return 'help'
   const mod = e.metaKey || e.ctrlKey
-  if (!mod) return null
+  // `?` opens the cheatsheet with no modifier, except while typing
+  if (key === '?' && !mod) return ctx.typing || ctx.inEditor ? null : 'help'
+  if (!mod || e.altKey) return null
+  const shift = e.shiftKey
   switch (key) {
     case 'k':
-      return 'commands'
+      return shift ? null : 'actions'
     case 'o':
-      return 'open'
-    case 'p':
-    case 's':
+      return shift ? null : 'open'
     case 'f':
       return 'search'
+    case 'p':
+      return shift ? null : 'search'
+    case 's':
+      // ⌘⇧S is the editor's strikethrough; ⌘S in a doc means "save"
+      if (shift) return null
+      return ctx.inEditor ? 'autosaved' : 'search'
+    case '/':
+      return 'ask'
+    case ',':
+      return shift ? null : 'settings'
     case 't':
       return 'tree'
     case 'n':
-      return e.shiftKey ? null : 'newdoc'
+      return shift ? null : 'newdoc'
     case 'r':
-      return e.shiftKey ? 'review' : 'reload'
+      return shift ? 'review' : 'reload'
     case 'g':
       return 'gardeners'
     case 'i':
-      return e.shiftKey ? 'capture' : null
+      return shift ? 'capture' : null
     case '[':
       return 'back'
     case ']':
       return 'forward'
     case 'w':
       return 'home'
-    case '/':
-      return 'ask'
     default:
       return null
   }
 }
+
+/** The palette a palette shortcut toggles, for "same key again closes". */
+export type PaletteKind = 'open' | 'actions' | 'search'

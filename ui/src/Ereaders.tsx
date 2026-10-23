@@ -15,7 +15,7 @@ import { Ereader, activeEreaders, createEreader, deleteEreader, deviceSetup, lis
 /** The device-name limit the server enforces (opds.rs MAX_LABEL). */
 export const EREADER_LABEL_MAX = 60
 
-export default function Ereaders({ dataVersion }: { dataVersion: number }) {
+export default function Ereaders({ dataVersion, embedded = false }: { dataVersion: number; /** inside Settings: no title of its own */ embedded?: boolean }) {
   const [list, setList] = useState<Ereader[] | null>(null)
   const [label, setLabel] = useState('')
   const [stream, setStream] = useState(false)
@@ -98,8 +98,8 @@ export default function Ereaders({ dataVersion }: { dataVersion: number }) {
     })
 
   return (
-    <div className="queue">
-      <h1 className="queue-title">e-readers</h1>
+    <div className={embedded ? 'settings-section' : 'queue'}>
+      {!embedded && <h1 className="queue-title">e-readers</h1>}
 
       <div className="card">
         <div className="card-head">

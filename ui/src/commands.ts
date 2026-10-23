@@ -1,7 +1,7 @@
-// The ⌘K command list, as data: what the omnibox's Commands group ranks and
-// runs. Moved out of the old CommandPalette so the list is one place and the
-// omnibox stays a mixer. Context-dependent rows (per-doc export, the native
-// Save sheet) are included only when they apply.
+// The ⌘K action list, as data: what ActionsPalette ranks and runs. Actions
+// only — places (Home, Review, Trash, Settings…) live in ⌘O, docs in ⌘O,
+// content in ⌘⇧F. Rows that need a doc, a sign-in, the library or the desktop
+// app are included only when those apply; `scope: 'doc'` rows list first.
 
 import { notify, errText } from './Notice'
 import { copyText } from './Profile'
@@ -10,56 +10,88 @@ import { api } from './types'
 import type { OmniCommand } from './omni'
 
 export type CommandAction =
-  | 'review'
-  | 'runs'
   | 'tree'
-  | 'home'
   | 'newdoc'
-  | 'graph'
-  | 'profile'
-  | 'trash'
   | 'capture'
   | 'close'
   | 'share'
   | 'books'
-  | 'ereaders'
+  | 'open'
+  | 'search'
+  | 'ask'
+  | 'help'
 
 export interface CommandCtx {
-  queueCount: number
   /** SERVER mode, signed in through this browser: offer Sign out */
   signedIn?: boolean
-  /** SERVER mode: the EPUB library exists (Books, Add EPUBs, E-readers) */
+  /** SERVER mode: the EPUB library exists (Add EPUBs) */
   library?: boolean
   onSignOut?: () => void
-  /** the open doc, if any — enables the per-doc commands */
+  /** the open doc, if any — enables the per-doc actions */
   docId: string | null
-  /** the root doc titled Inbox, when quick capture has made one */
-  inboxId: string | null
   onAction: (a: CommandAction) => void
-  onOpenDoc: (id: string) => void
 }
 
-export function buildCommands({ queueCount, signedIn, library, onSignOut, docId, inboxId, onAction, onOpenDoc }: CommandCtx): OmniCommand[] {
-  const cmds: OmniCommand[] = [
-    { id: 'review', label: 'Review queue', hint: queueCount ? `${queueCount} open` : undefined, keys: '⌘⇧R', run: () => onAction('review') },
-    {
-      id: 'inbox',
-      label: 'Inbox',
-      hint: 'captured notes, waiting to be filed',
-      run: () => {
-        onAction('close')
-        if (inboxId) onOpenDoc(inboxId)
-        else notify('nothing captured yet — ⌘⇧I captures a note', 'ok')
+export function buildCommands({ signedIn, library, onSignOut, docId, onAction }: CommandCtx): OmniCommand[] {
+  const cmds: OmniCommand[] = []
+  if (docId && signedIn) {
+    cmds.push({ id: 'share-link', scope: 'doc', label: 'Share link…', hint: 'a public, read-only snapshot of this doc', run: () => onAction('share') })
+  }
+  if (docId) {
+    cmds.push(
+      {
+        id: 'export-doc',
+        scope: 'doc',
+        label: 'Export this doc as Markdown…',
+        hint: 'one .md file in ~/Downloads — for Slack, email, anywhere',
+        keywords: 'download save file',
+        run: () => {
+          onAction('close')
+          api<{ path: string }>(`/api/doc/${docId}/export`, { method: 'POST' })
+            .then((r) => notify(`saved ${r.path}`, 'ok', { ttlMs: 12_000 }))
+            .catch((e) => notify(errText(e)))
+        },
       },
-    },
-    { id: 'capture', label: 'Quick capture…', hint: 'a note straight into Inbox', keys: '⌘⇧I', run: () => onAction('capture') },
-    { id: 'newdoc', label: 'New doc…', keys: '⌘N', run: () => onAction('newdoc') },
-    { id: 'home', label: 'Home', hint: 'the briefing', keys: '⌘W', run: () => onAction('home') },
-    { id: 'runs', label: 'Gardeners', keys: '⌘G', run: () => onAction('runs') },
-    { id: 'profile', label: 'Profile', hint: 'your name, version, diagnostics', run: () => onAction('profile') },
-    { id: 'graph', label: 'Graph view', run: () => onAction('graph') },
-    { id: 'trash', label: 'Trash', hint: 'restore deleted docs', run: () => onAction('trash') },
-    { id: 'tree', label: 'Toggle file tree', keys: '⌘T', run: () => onAction('tree') },
+      {
+        id: 'copy-doc',
+        scope: 'doc',
+        label: 'Copy this doc as Markdown',
+        hint: 'to the clipboard',
+        keywords: 'clipboard',
+        run: () => {
+          onAction('close')
+          api<{ markdown: string }>(`/api/doc/${docId}/markdown`)
+            .then((r) => copyText(r.markdown))
+            .then(() => notify('copied as Markdown', 'ok'))
+            .catch((e) => notify(errText(e)))
+        },
+      },
+    )
+  }
+  cmds.push(
+    { id: 'newdoc', label: 'New doc…', keys: '⌘N', keywords: 'create page note', run: () => onAction('newdoc') },
+    { id: 'capture', label: 'Quick capture…', hint: 'a note straight into Inbox', keys: '⌘⇧I', keywords: 'inbox jot', run: () => onAction('capture') },
+    { id: 'open', label: 'Open a doc or place…', keys: '⌘O', keywords: 'go to jump find title', run: () => onAction('open') },
+    { id: 'search', label: 'Search inside docs…', hint: 'full text, typos fine', keys: '⌘⇧F', keywords: 'find content text', run: () => onAction('search') },
+    { id: 'ask', label: 'Ask the library…', hint: 'an answer doc that cites its blocks', keys: '⌘/', keywords: 'question vault answer ai', run: () => onAction('ask') },
+  )
+  if (library) {
+    // the EPUB library is SERVER-mode only (LOCAL has no books routes)
+    cmds.push({
+      id: 'add-books',
+      label: 'Add EPUBs…',
+      hint: 'upload files into the library',
+      keywords: 'books upload import epub',
+      run: () => {
+        // the Books view renders the upload queue's progress and result
+        // cards; the click stays inside the keypress's user gesture
+        onAction('books')
+        document.getElementById('book-upload-input')?.click()
+      },
+    })
+  }
+  cmds.push(
+    { id: 'tree', label: 'Toggle file tree', keys: '⌘T', keywords: 'sidebar folders', run: () => onAction('tree') },
     {
       id: 'import',
       label: 'Import a folder of Markdown…',
@@ -88,56 +120,6 @@ export function buildCommands({ queueCount, signedIn, library, onSignOut, docId,
           .catch((e) => notify(errText(e)))
       },
     },
-  ]
-  if (library) {
-    // the EPUB library is SERVER-mode only (LOCAL has no books routes)
-    cmds.push(
-      { id: 'books', label: 'Books', hint: 'your EPUB library', run: () => onAction('books') },
-      {
-        id: 'add-books',
-        label: 'Add EPUBs…',
-        hint: 'upload files into the library',
-        run: () => {
-          // the Books view renders the upload queue's progress and result
-          // cards; the click stays inside the keypress's user gesture
-          onAction('books')
-          document.getElementById('book-upload-input')?.click()
-        },
-      },
-      { id: 'ereaders', label: 'E-readers', hint: 'devices that read from the library', run: () => onAction('ereaders') },
-    )
-  }
-  if (docId && signedIn) {
-    cmds.push({ id: 'share-link', label: 'Share link…', hint: 'a public, read-only snapshot of this doc', run: () => onAction('share') })
-  }
-  if (docId) {
-    cmds.push(
-      {
-        id: 'export-doc',
-        label: 'Export this doc as Markdown…',
-        hint: 'one .md file in ~/Downloads — for Slack, email, anywhere',
-        run: () => {
-          onAction('close')
-          api<{ path: string }>(`/api/doc/${docId}/export`, { method: 'POST' })
-            .then((r) => notify(`saved ${r.path}`, 'ok', { ttlMs: 12_000 }))
-            .catch((e) => notify(errText(e)))
-        },
-      },
-      {
-        id: 'copy-doc',
-        label: 'Copy this doc as Markdown',
-        hint: 'to the clipboard',
-        run: () => {
-          onAction('close')
-          api<{ markdown: string }>(`/api/doc/${docId}/markdown`)
-            .then((r) => copyText(r.markdown))
-            .then(() => notify('copied as Markdown', 'ok'))
-            .catch((e) => notify(errText(e)))
-        },
-      },
-    )
-  }
-  cmds.push(
     {
       id: 'export-vault',
       label: 'Export all docs as Markdown…',
@@ -195,8 +177,9 @@ export function buildCommands({ queueCount, signedIn, library, onSignOut, docId,
       api<{ dir: string }>('/api/backups/reveal', { method: 'POST' }).catch((e) => notify(errText(e)))
     },
   })
+  cmds.push({ id: 'help', label: 'Keyboard shortcuts', keys: '?', keywords: 'keys cheatsheet help', run: () => onAction('help') })
   if (signedIn && onSignOut) {
-    cmds.push({ id: 'sign-out', label: 'Sign out', hint: 'end this browser’s session', run: onSignOut })
+    cmds.push({ id: 'sign-out', label: 'Sign out', hint: 'end this browser’s session', keywords: 'log out logout', run: onSignOut })
   }
   return cmds
 }

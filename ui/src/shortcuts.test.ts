@@ -16,11 +16,14 @@ const ctrl = (key: string, shiftKey = false): KeyLike => ({
 
 describe('resolveShortcut', () => {
   const cases: [string, KeyLike, ShortcutAction | null][] = [
-    ['⌘K → commands', meta('k'), 'commands'],
+    ['⌘K → actions', meta('k'), 'actions'],
     ['⌘O → open', meta('o'), 'open'],
-    ['⌘P → search', meta('p'), 'search'],
-    ['⌘S → search (alias)', meta('s'), 'search'],
+    ['⌘⇧F → search', meta('F', true), 'search'],
     ['⌘F → search (alias)', meta('f'), 'search'],
+    ['⌘P → search (alias)', meta('p'), 'search'],
+    ['⌘S → search outside a doc (alias)', meta('s'), 'search'],
+    ['⌘/ → ask', meta('/'), 'ask'],
+    ['⌘, → settings', meta(','), 'settings'],
     ['⌘T → tree', meta('t'), 'tree'],
     ['⌘N → newdoc', meta('n'), 'newdoc'],
     ['⌘R → reload', meta('r'), 'reload'],
@@ -37,7 +40,8 @@ describe('resolveShortcut', () => {
   }
 
   it('ctrl is treated as mod (non-mac)', () => {
-    expect(resolveShortcut(ctrl('k'))).toBe('commands')
+    expect(resolveShortcut(ctrl('k'))).toBe('actions')
+    expect(resolveShortcut(ctrl(','))).toBe('settings')
     expect(resolveShortcut(ctrl('R', true))).toBe('review')
   })
 
@@ -73,5 +77,38 @@ describe('resolveShortcut', () => {
   it('unmapped mod combos return null', () => {
     expect(resolveShortcut(meta('q'))).toBeNull()
     expect(resolveShortcut(meta('x'))).toBeNull()
+  })
+
+  it('in the editor: ⌘K still opens Actions (the editor binds no ⌘K), ⌘S says autosaved', () => {
+    const ed = { inEditor: true, typing: true }
+    expect(resolveShortcut(meta('k'), ed)).toBe('actions')
+    expect(resolveShortcut(meta('o'), ed)).toBe('open')
+    expect(resolveShortcut(meta('F', true), ed)).toBe('search')
+    expect(resolveShortcut(meta('s'), ed)).toBe('autosaved')
+  })
+
+  it('leaves the editor’s own keys alone', () => {
+    const ed = { inEditor: true, typing: true }
+    for (const [k, shift] of [['b', false], ['i', false], ['e', false], ['u', false], ['S', true], ['B', true], ['7', true], ['8', true], ['Enter', false], ['z', false]] as const) {
+      expect(resolveShortcut(meta(k, shift), ed)).toBeNull()
+    }
+    expect(resolveShortcut({ ...meta('c'), altKey: true }, ed)).toBeNull() // ⌘⌥C code block
+  })
+
+  it('? opens help only when not typing', () => {
+    const q = { key: '?', shiftKey: true, metaKey: false, ctrlKey: false }
+    expect(resolveShortcut(q)).toBe('help')
+    expect(resolveShortcut(q, { typing: true })).toBeNull()
+    expect(resolveShortcut(q, { inEditor: true })).toBeNull()
+  })
+
+  it('unhandled variants are null, so the caller never preventDefaults them', () => {
+    expect(resolveShortcut(meta('O', true))).toBeNull() // ⌘⇧O
+    expect(resolveShortcut(meta('K', true))).toBeNull() // ⌘⇧K
+    expect(resolveShortcut(meta('P', true))).toBeNull() // ⌘⇧P
+    expect(resolveShortcut({ ...meta('o'), altKey: true })).toBeNull() // ⌘⌥O
+    expect(resolveShortcut({ ...meta(','), altKey: true })).toBeNull()
+    expect(resolveShortcut({ key: 'o', shiftKey: false, metaKey: false, ctrlKey: false })).toBeNull()
+    expect(resolveShortcut({ key: ',', shiftKey: false, metaKey: false, ctrlKey: false })).toBeNull()
   })
 })

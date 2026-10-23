@@ -36,6 +36,7 @@ import {
 import Books from './BookLibrary'
 import Ereaders from './Ereaders'
 import { buildCommands } from './commands'
+import { buildPlaces } from './omni'
 import { relTime } from './time'
 
 /* ---------- fetch mock (auth.test.ts pattern) ---------- */
@@ -149,18 +150,22 @@ describe('activeEreaders', () => {
   })
 })
 
-describe('commands: the library is SERVER-mode only', () => {
-  const ids = (library: boolean) =>
-    buildCommands({ queueCount: 0, library, docId: null, inboxId: null, onAction: () => {}, onOpenDoc: () => {} }).map((c) => c.id)
-  it('LOCAL hides Books / Add EPUBs / E-readers; SERVER shows them', () => {
-    for (const id of ['books', 'add-books', 'ereaders']) {
-      expect(ids(false)).not.toContain(id)
-      expect(ids(true)).toContain(id)
+describe('the library is SERVER-mode only', () => {
+  const ids = (library: boolean) => buildCommands({ library, docId: null, onAction: () => {} }).map((c) => c.id)
+  it('LOCAL hides the Add EPUBs action; SERVER shows it', () => {
+    expect(ids(false)).not.toContain('add-books')
+    expect(ids(true)).toContain('add-books')
+  })
+  it('LOCAL hides the Books and E-readers places; SERVER shows them', () => {
+    const places = (library: boolean) => buildPlaces({ library }).map((p) => p.id)
+    for (const id of ['books', 'ereaders'] as const) {
+      expect(places(false)).not.toContain(id)
+      expect(places(true)).toContain(id)
     }
   })
   it('Add EPUBs shows the Books view (where the upload cards render)', () => {
     const acts: string[] = []
-    const cmd = buildCommands({ queueCount: 0, library: true, docId: null, inboxId: null, onAction: (a) => acts.push(a), onOpenDoc: () => {} }).find(
+    const cmd = buildCommands({ library: true, docId: null, onAction: (a) => acts.push(a) }).find(
       (c) => c.id === 'add-books',
     )!
     vi.stubGlobal('document', { getElementById: () => null })

@@ -1,4 +1,4 @@
-// The centred modal chrome shared by every palette (⌘K, ⌘O, ⌘P, help) and
+// The centred modal chrome shared by every palette (⌘O, ⌘K, ⌘⇧F, help) and
 // the first-run name prompt. `locked` disables the click-outside dismissal
 // (and, via the data attribute, the global Esc in App).
 
@@ -57,4 +57,29 @@ export default function PaletteShell({
       </div>
     </div>
   )
+}
+
+/** The key hints along a palette's bottom edge: `[keys, label]` pairs. */
+export function PaletteFooter({ hints }: { hints: [string, string][] }) {
+  return (
+    <div className="palette-foot" aria-hidden>
+      {hints.map(([k, label]) => (
+        <span key={k + label}>
+          <kbd>{k}</kbd>
+          {label}
+        </span>
+      ))}
+    </div>
+  )
+}
+
+/** Up/Down (and ⌃N/⌃P) move a palette selection; true when handled. */
+export function moveSelection(e: React.KeyboardEvent, len: number, setSel: (f: (s: number) => number) => void): boolean {
+  const down = e.key === 'ArrowDown' || (e.ctrlKey && !e.metaKey && e.key === 'n')
+  const up = e.key === 'ArrowUp' || (e.ctrlKey && !e.metaKey && e.key === 'p')
+  if (!down && !up) return false
+  e.preventDefault()
+  if (len === 0) return true
+  setSel((s) => (down ? Math.min(s + 1, len - 1) : Math.max(s - 1, 0)))
+  return true
 }

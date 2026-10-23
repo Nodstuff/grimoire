@@ -1,5 +1,5 @@
 // Profile: the owner's display name, the version and diagnostics. Two
-// surfaces share the same save path: the Profile page (⌘K → Profile) and the
+// surfaces share the same save path: the Settings page's Profile section (⌘,) and the
 // first-run prompt shown until the install-default name has been confirmed
 // once.
 
@@ -120,7 +120,10 @@ export default function Profile({
   onChanged,
   version: appVersion = null,
   onSignOut,
+  embedded = false,
 }: {
+  /** inside Settings: no page wrapper or title of its own */
+  embedded?: boolean
   dataVersion: number
   onChanged?: (p: ProfileRow) => void
   /** SERVER mode, signed in through this browser */
@@ -182,19 +185,24 @@ export default function Profile({
     setBusy(false)
   }
 
-  if (profile === undefined) return <div className="queue"><h1 className="queue-title">profile</h1></div>
-  if (profile === null) {
-    return (
+  // a plain function, not a component: a component defined in render would
+  // remount the name input on every keystroke
+  const wrap = (children?: React.ReactNode) =>
+    embedded ? (
+      <div className="settings-section">{children}</div>
+    ) : (
       <div className="queue">
         <h1 className="queue-title">profile</h1>
-        <div className="palette-empty">Taisce is out of date — reinstall the latest release</div>
+        {children}
       </div>
     )
+  if (profile === undefined) return wrap()
+  if (profile === null) {
+    return wrap(<div className="palette-empty">Taisce is out of date — reinstall the latest release</div>)
   }
 
-  return (
-    <div className="queue">
-      <h1 className="queue-title">profile</h1>
+  return wrap(
+    <>
 
       <div className="card">
         <div className="card-head">
@@ -246,6 +254,6 @@ export default function Profile({
           <button className="chip" onClick={copyDiagnostics}>copy diagnostics</button>
         </div>
       </div>
-    </div>
+    </>,
   )
 }

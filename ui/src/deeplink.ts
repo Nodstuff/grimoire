@@ -4,8 +4,29 @@
  * consumed by main.tsx; the rest is parsed here once on boot and scrubbed the
  * same way so a reload does not re-open the doc. */
 
-export const TABS = ['home', 'review', 'runs', 'graph', 'profile', 'trash', 'books', 'ereaders'] as const
+export const TABS = ['home', 'review', 'runs', 'graph', 'settings', 'profile', 'trash', 'books', 'ereaders'] as const
 export type Tab = (typeof TABS)[number]
+
+/** The sections of the Settings view. */
+export type SettingsSection = 'profile' | 'ereaders'
+
+/** Where a `?tab=` lands. `profile` and `ereaders` were views of their own;
+ * they are sections of Settings now, and the old links land on them. */
+export type TabTarget =
+  | { kind: 'home' | 'review' | 'runs' | 'graph' | 'trash' | 'books' }
+  | { kind: 'settings'; section: SettingsSection }
+
+export function tabTarget(tab: Tab): TabTarget {
+  switch (tab) {
+    case 'settings':
+    case 'profile':
+      return { kind: 'settings', section: 'profile' }
+    case 'ereaders':
+      return { kind: 'settings', section: 'ereaders' }
+    default:
+      return { kind: tab }
+  }
+}
 
 export interface DeepLink {
   doc?: string

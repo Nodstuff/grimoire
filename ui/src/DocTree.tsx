@@ -68,12 +68,15 @@ export default function DocTree({
   onSelect,
   onClose,
   onChanged,
+  onOpenSettings,
 }: {
   docs: Doc[]
   selected: string | null
   onSelect: (id: string) => void
   onClose: () => void
   onChanged: () => void
+  /** the gear in the tree's head */
+  onOpenSettings?: () => void
 }) {
   // the workspace switcher (ADR 0004): the tree shows one workspace, or all
   const [ws, setWs] = useState<WorkspaceSel>(() => {
@@ -364,6 +367,11 @@ export default function DocTree({
           }}
           spellCheck={false}
         />
+        {onOpenSettings && (
+          <button type="button" className="tree-close tree-gear" onClick={onOpenSettings} title="Settings (⌘,)" aria-label="Settings">
+            ⚙
+          </button>
+        )}
         <button type="button" className="tree-close" onClick={onClose} title="close the tree (⌘T)">
           ⌘T
         </button>

@@ -4,7 +4,7 @@ import { splitTree } from './editor/splitTree'
 import TendPanel from './TendPanel'
 import Gardeners from './Gardeners'
 import PaletteShell from './PaletteShell'
-import Profile, { FirstRunName, loadProfile } from './Profile'
+import { FirstRunName, loadProfile } from './Profile'
 import Trash from './Trash'
 import LivingChip from './LivingChip'
 import ImportFolder from './ImportFolder'
@@ -14,14 +14,16 @@ import { notify, errText, Notices } from './Notice'
 import { CAPTURE_EVENT, onShellEvent } from './tauri'
 import Home from './Home'
 import Capture from './Capture'
-import Omnibox from './Omnibox'
+import OpenPalette from './OpenPalette'
+import ActionsPalette from './ActionsPalette'
+import SearchPalette from './SearchPalette'
+import Settings from './Settings'
 import Books from './BookLibrary'
 import BookUpload from './BookUpload'
-import Ereaders from './Ereaders'
 import { buildCommands } from './commands'
 import SharePanel from './SharePanel'
 import { signOut, webSession } from './auth'
-import { loadRecentIds, pushRecentId, storeRecentIds, type OmniMode } from './omni'
+import { buildPlaces, loadRecentIds, pushRecentId, storeRecentIds, type PlaceId } from './omni'
 
 /** The doc side panels, owned by App so a doc switch does not close one. */
 type Panel = 'none' | 'history' | 'comments' | 'tend' | 'review' | 'share'
@@ -39,7 +41,7 @@ const DIRTY_SELECTOR = '.save-state.dirty, .save-state.saving'
 const GraphView = lazy(() => import('./GraphView'))
 const Loading = () => <div className="lazy-loading">loading…</div>
 import { resolveShortcut } from './shortcuts'
-import { parseDeepLink, scrubDeepLink } from './deeplink'
+import { parseDeepLink, scrubDeepLink, tabTarget, type SettingsSection } from './deeplink'
 import { actionLabels, buildHighlightMap, describeChange, isDocOp, targetBlockOf } from './review'
 import {
   api,
@@ -60,14 +62,13 @@ type View =
   | { kind: 'review' }
   | { kind: 'runs' }
   | { kind: 'graph' }
-  | { kind: 'profile' }
   | { kind: 'trash' }
   | { kind: 'home' }
   | { kind: 'books' }
-  | { kind: 'ereaders' }
-/** `omnibox` is the one search-and-command palette (⌘K / ⌘O / ⌘P / ⌘/ all
- * open it, in different modes — see `omniMode`). */
-type Palette = null | 'omnibox' | 'newdoc' | 'help' | 'capture'
+  | { kind: 'settings'; section: SettingsSection }
+/** The three palettes, one job each: `open` (⌘O docs + places), `actions`
+ * (⌘K commands), `search` (⌘⇧F full text + ask). */
+type Palette = null | 'open' | 'actions' | 'search' | 'newdoc' | 'help' | 'capture'
 
 /** How a doc is opened: `anchor` is a [[Doc#fragment]] target (`^uuid` for a
  * block); `review` opens the in-editor review rail; `blockId` scrolls to that
@@ -126,14 +127,20 @@ export default function App() {
   const [docs, setDocs] = useState<Doc[]>([])
   const [treeOpen, setTreeOpen] = useState(false)
   const [palette, setPalette] = useState<Palette>(null)
-  // which groups the omnibox leads with: ⌘K mixed, ⌘O docs, ⌘P content, ⌘/ ask
-  const [omniMode, setOmniMode] = useState<OmniMode>('mixed')
-  const omniModeRef = useRef<OmniMode>('mixed')
-  const openOmnibox = useCallback((mode: OmniMode) => {
-    setOmniMode(mode)
-    // the same key again closes it; a different alias just switches mode
-    setPalette((p) => (p === 'omnibox' && mode === omniModeRef.current ? null : 'omnibox'))
-    omniModeRef.current = mode
+  // what Search opens with: `?` from ⌘/, the typed text from ⌘O's ⌘↵
+  const [searchInitial, setSearchInitial] = useState('')
+  // a palette's own key again closes it; another palette's key switches
+  const togglePalette = useCallback((p: Exclude<Palette, null>) => {
+    setPalette((cur) => (cur === p ? null : p))
+  }, [])
+  // `toggle`: the same key again (⌘⇧F, or ⌘/ on an ask) closes it; ⌘/ on
+  // an open search switches it to ask
+  const searchInitialRef = useRef('')
+  const openSearch = useCallback((initial: string, toggle = true) => {
+    const same = searchInitialRef.current === initial
+    searchInitialRef.current = initial
+    setSearchInitial(initial)
+    setPalette((cur) => (toggle && same && cur === 'search' ? null : 'search'))
   }, [])
   const [queueCount, setQueueCount] = useState(0)
   // first-run name prompt: shown until the install-default name is confirmed.
@@ -178,7 +185,7 @@ export default function App() {
       .catch(console.error)
     refreshQueue()
     if (link) {
-      if (link.tab && link.tab !== 'home') setViewRaw({ kind: link.tab })
+      if (link.tab && link.tab !== 'home') setViewRaw(tabTarget(link.tab))
       window.history.replaceState(null, '', location.pathname + scrubDeepLink(location.search) + location.hash)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -238,7 +245,11 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const action = resolveShortcut(e)
+      const el = e.target as HTMLElement | null
+      const inEditor = !!el?.closest?.('.ProseMirror')
+      const typing = !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
+      const action = resolveShortcut(e, { inEditor, typing })
+      // not ours: the key keeps its default (browser, editor, field)
       if (!action) return
       // Esc isn't a combo — leave its default (blur inputs etc.) intact.
       if (action === 'escape') {
@@ -247,48 +258,45 @@ export default function App() {
         setPalette(null)
         return
       }
-      // `?` has no modifier: ignore it while typing so it still inserts a `?`.
-      if (action === 'help') {
-        const el = e.target as HTMLElement | null
-        const typing =
-          !!el &&
-          (el.tagName === 'INPUT' ||
-            el.tagName === 'TEXTAREA' ||
-            el.isContentEditable)
-        if (typing) return
-        e.preventDefault()
-        setPalette((p) => (p === 'help' ? null : 'help'))
-        return
-      }
-      // every mod combo: ⌘P is webview Print, ⌘O the open-file dialog, etc.
+      // ours: ⌘O must not open the file dialog, ⌘, the browser's
+      // preferences, ⌘P print
       e.preventDefault()
+      // a locked palette (an ask in flight, the first-run name) is not
+      // replaced by another one
+      if (document.querySelector('.palette-backdrop[data-locked]')) return
       switch (action) {
-        case 'commands':
-          openOmnibox('mixed')
+        case 'help':
+          togglePalette('help')
+          break
+        case 'actions':
+          togglePalette('actions')
           break
         case 'open':
-          openOmnibox('docs')
+          togglePalette('open')
           break
         case 'search':
-          // ⌘S while writing means "save" to every editor user: the doc
-          // autosaves, so just say so instead of opening search
-          if (e.key.toLowerCase() === 's' && (e.target as HTMLElement | null)?.closest('.ProseMirror')) {
-            notify('autosaved', 'ok', { ttlMs: 1500 })
-            break
-          }
-          openOmnibox('content')
+          openSearch('')
           break
         case 'ask':
-          openOmnibox('ask')
+          openSearch('? ')
+          break
+        case 'autosaved':
+          // ⌘S while writing means "save" to every editor user: the doc
+          // autosaves, so just say so
+          notify('autosaved', 'ok', { ttlMs: 1500 })
+          break
+        case 'settings':
+          setPalette(null)
+          setView({ kind: 'settings', section: 'profile' })
           break
         case 'capture':
-          setPalette((p) => (p === 'capture' ? null : 'capture'))
+          togglePalette('capture')
           break
         case 'tree':
           setTreeOpen((t) => !t)
           break
         case 'newdoc':
-          setPalette((p) => (p === 'newdoc' ? null : 'newdoc'))
+          togglePalette('newdoc')
           break
         case 'review':
           setView({ kind: 'review' })
@@ -312,7 +320,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [goBack, goForward, setView, openOmnibox])
+  }, [goBack, goForward, setView, togglePalette, openSearch])
 
   const openDoc = useCallback<OpenDoc>(
     (id, opts) => {
@@ -321,18 +329,17 @@ export default function App() {
       setReviewIntent(!!o.review)
       setView({ kind: 'doc', id })
       setPalette(null)
-      // the omnibox's empty-query list
+      // ⌘O's empty-query list
       storeRecentIds(pushRecentId(loadRecentIds(), id))
     },
     [setView],
   )
   openDocRef.current = openDoc
 
-  // the ⌘K command list (data for the omnibox's Commands group)
+  // the ⌘K action list
   const commands = useMemo(
     () =>
       buildCommands({
-        queueCount,
         signedIn,
         library: server,
         onSignOut: () => {
@@ -340,30 +347,46 @@ export default function App() {
           signOutAndReload()
         },
         docId: view.kind === 'doc' ? view.id : null,
-        inboxId: docs.find((d) => d.parent_id === null && d.title === 'Inbox')?.id ?? null,
-        onOpenDoc: (id) => {
-          setPalette(null)
-          openDocRef.current(id)
-        },
         onAction: (a) => {
-          if (a === 'review') setView({ kind: 'review' })
-          if (a === 'runs') setView({ kind: 'runs' })
-          if (a === 'graph') setView({ kind: 'graph' })
-          if (a === 'profile') setView({ kind: 'profile' })
-          if (a === 'trash') setView({ kind: 'trash' })
-          if (a === 'home') setView({ kind: 'home' })
-          if (a === 'books') setView({ kind: 'books' })
-          if (a === 'ereaders') setView({ kind: 'ereaders' })
-          if (a === 'tree') setTreeOpen((t) => !t)
-          if (a === 'share') setDocPanel('share')
-          if (a === 'capture' || a === 'newdoc') {
-            setPalette(a)
-            return
+          switch (a) {
+            case 'capture':
+            case 'newdoc':
+            case 'open':
+            case 'help':
+              setPalette(a)
+              return
+            case 'search':
+              openSearch('', false)
+              return
+            case 'ask':
+              openSearch('? ', false)
+              return
+            case 'books':
+              setView({ kind: 'books' })
+              break
+            case 'tree':
+              setTreeOpen((t) => !t)
+              break
+            case 'share':
+              setDocPanel('share')
+              break
           }
           setPalette(null)
         },
       }),
-    [queueCount, signedIn, server, view, setView, docs],
+    [signedIn, server, view, setView, openSearch],
+  )
+
+  // the ⌘O places
+  const places = useMemo(() => buildPlaces({ library: server, queueCount }), [server, queueCount])
+  const goPlace = useCallback(
+    (id: PlaceId) => {
+      setPalette(null)
+      if (id === 'settings') setView({ kind: 'settings', section: 'profile' })
+      else if (id === 'ereaders') setView({ kind: 'settings', section: 'ereaders' })
+      else setView({ kind: id })
+    },
+    [setView],
   )
 
   // quick capture from outside the page: the shell's global hotkey (⌥⌘G) and
@@ -406,6 +429,7 @@ export default function App() {
           selected={view.kind === 'doc' ? view.id : null}
           onSelect={openDoc}
           onClose={() => setTreeOpen(false)}
+          onOpenSettings={() => goPlace('settings')}
           onChanged={() => api<Doc[]>('/api/docs').then(setDocs).catch(() => {})}
         />
       )}
@@ -458,11 +482,14 @@ export default function App() {
           />
         )}
         {view.kind === 'runs' && <Gardeners dataVersion={dataVersion} />}
-        {view.kind === 'profile' && (
-          <Profile
+        {view.kind === 'settings' && (
+          <Settings
+            section={view.section}
+            server={server}
+            onSection={(section) => setView({ kind: 'settings', section })}
             dataVersion={dataVersion}
-            onChanged={setProfile}
             version={appStamp?.version ?? null}
+            onProfileChanged={setProfile}
             onSignOut={signedIn ? signOutAndReload : undefined}
           />
         )}
@@ -474,7 +501,6 @@ export default function App() {
           />
         )}
         {view.kind === 'books' && server && <Books dataVersion={dataVersion} />}
-        {view.kind === 'ereaders' && server && <Ereaders dataVersion={dataVersion} />}
         {view.kind === 'graph' && (
           <Suspense fallback={<Loading />}>
             <GraphView onOpenDoc={openDoc} />
@@ -492,20 +518,41 @@ export default function App() {
           view, which renders the shared upload queue's chips and cards */}
       {server && <BookUpload hiddenButton inputId="book-upload-input" />}
 
-      {queueCount > 0 && view.kind !== 'review' && (
-        <button className="queue-chip" onClick={() => setView({ kind: 'review' })}>
-          {queueCount} to review
+      <nav className="top-nav" aria-label="navigation">
+        {queueCount > 0 && view.kind !== 'review' && (
+          <button className="queue-chip" onClick={() => setView({ kind: 'review' })}>
+            {queueCount} to review
+          </button>
+        )}
+        <button className="nav-btn" title="Open a doc or place (⌘O)" onClick={() => togglePalette('open')}>
+          Open <kbd>⌘O</kbd>
         </button>
-      )}
+        <button className="nav-btn" title="Actions (⌘K)" onClick={() => togglePalette('actions')}>
+          Actions <kbd>⌘K</kbd>
+        </button>
+        <button
+          className={`nav-btn nav-icon ${view.kind === 'settings' ? 'on' : ''}`}
+          title="Settings (⌘,)"
+          aria-label="Settings"
+          onClick={() => goPlace('settings')}
+        >
+          ⚙
+        </button>
+      </nav>
 
-      {palette === 'omnibox' && (
-        <Omnibox
-          mode={omniMode}
+      {palette === 'open' && (
+        <OpenPalette
           docs={docs}
-          commands={commands}
+          places={places}
           onOpenDoc={openDoc}
+          onPlace={goPlace}
+          onSearchText={(q) => openSearch(q, false)}
           onClose={() => setPalette(null)}
         />
+      )}
+      {palette === 'actions' && <ActionsPalette commands={commands} onClose={() => setPalette(null)} />}
+      {palette === 'search' && (
+        <SearchPalette key={searchInitial} initial={searchInitial} onOpenDoc={openDoc} onClose={() => setPalette(null)} />
       )}
       {palette === 'help' && <ShortcutHelp onClose={() => setPalette(null)} />}
       {palette === 'capture' && (
@@ -539,10 +586,11 @@ function ShortcutHelp({ onClose }: { onClose: () => void }) {
     [
       'Navigate',
       [
-        ['⌘K', 'omnibox — docs, content, commands and ask in one box (> commands · ? ask)'],
-        ['⌘O', 'omnibox, docs first (recent when empty)'],
-        ['⌘P', 'omnibox, content search (⌘F too; ⌘S in an editor just confirms autosave)'],
-        ['⌘/', 'omnibox, ask the vault — an answer doc with block citations (⌘↵ asks from any row)'],
+        ['⌘O', 'open a doc or place — fuzzy over titles and paths (recent when empty)'],
+        ['⌘K', 'actions — new doc, capture, export, backup, sign out… (this doc’s first)'],
+        ['⌘⇧F', 'search inside docs (⌘F and ⌘P too; ⌘S in a doc just confirms autosave)'],
+        ['⌘/', 'ask the library — an answer doc with block citations (? in search; ⌘↵ asks)'],
+        ['⌘,', 'settings — profile, e-readers'],
         ['⌘T', 'toggle file tree'],
         ['⌘W', 'home'],
         ['⌘[ / ⌘]', 'history back / forward'],

@@ -1,46 +1,24 @@
 import { describe, expect, it } from 'vitest'
 import {
-  buildRows,
+  buildOpenRows,
+  buildPlaces,
+  buildSearchRows,
   crumbOf,
   docPath,
-  groupStarts,
-  parseQuery,
+  editDistance,
+  parseSearch,
   pushRecentId,
   rankCommands,
-  rankDocs,
   recentDocs,
+  scoreDoc,
+  scoreText,
   snippetOf,
   stableSelection,
   type OmniCommand,
-  type OmniRow,
+  type OpenRow,
+  type SearchRow,
 } from './omni'
-
-describe('stableSelection', () => {
-  const D = (id: string): OmniRow => ({ key: `docs:${id}`, group: 'docs', doc: doc(id, id), path: id })
-  const C = (id: string): OmniRow => ({ key: `content:${id}`, group: 'content', hit: hit(id, 'r', 'R', 'x'), crumb: 'R', snippet: 'x' })
-  const K = (id: string): OmniRow => ({ key: `cmd:${id}`, group: 'commands', cmd: cmd(id, id) })
-  const ASK: OmniRow = { key: 'ask', group: 'ask', query: 'q' }
-
-  it('keeps the selected row by key when content lands between docs and commands', () => {
-    const before = [D('a'), D('b'), K('review'), ASK]
-    const after = [D('a'), D('b'), C('h1'), C('h2'), K('review'), ASK]
-    expect(stableSelection(before, 1, after)).toBe(1)
-    expect(stableSelection(before, 2, after)).toBe(4) // the command moved down, selection follows it
-    expect(stableSelection(before, 3, after)).toBe(5)
-  })
-  it('a vanished row falls back to the same group at the same offset, clamped', () => {
-    const before = [D('a'), C('h1'), C('h2'), C('h3'), K('k')]
-    const after = [D('a'), C('h9'), C('h8'), K('k')]
-    expect(stableSelection(before, 3, after)).toBe(2) // third content hit → last content hit
-    expect(stableSelection(before, 1, after)).toBe(1)
-  })
-  it('a vanished group clamps the index; an empty list is 0', () => {
-    expect(stableSelection([D('a'), C('h1')], 1, [D('a')])).toBe(0)
-    expect(stableSelection([D('a')], 0, [])).toBe(0)
-    expect(stableSelection([], 0, [D('a'), D('b')])).toBe(0)
-    expect(stableSelection([D('a'), D('b'), D('c')], 2, [K('x')])).toBe(0)
-  })
-})
+import { buildCommands } from './commands'
 import type { Block, Doc, SearchHit } from './types'
 
 const doc = (id: string, title: string, parent_id: string | null = null): Doc => ({
@@ -70,7 +48,7 @@ const hit = (id: string, docId: string, docTitle: string, content: string, type 
   } as Block,
 })
 
-const cmd = (id: string, label: string, hint?: string): OmniCommand => ({ id, label, hint, run: () => {} })
+const cmd = (id: string, label: string, extra: Partial<OmniCommand> = {}): OmniCommand => ({ id, label, run: () => {}, ...extra })
 
 const docs = [
   doc('g', 'Grimoire'),
@@ -79,47 +57,102 @@ const docs = [
   doc('d', 'Daily'),
   doc('t', '2026-09-10', 'd'),
   doc('q', 'qompass notes'),
+  doc('bn', 'Book notes'),
+  doc('k', 'Kindle setup', 'bn'),
 ]
-const commands = [
-  cmd('review', 'Review queue', '⌘⇧R'),
-  cmd('newdoc', 'New doc…'),
-  cmd('gardeners', 'Gardeners'),
-  cmd('backup', 'Back up database now', 'daily snapshot'),
-  cmd('home', 'Home'),
-  cmd('trash', 'Trash', 'restore deleted docs'),
-  cmd('export', 'Export all docs as Markdown…'),
-]
+const ids = (rows: OpenRow[]) => rows.map((r) => (r.kind === 'doc' ? r.doc.id : `@${r.place.id}`))
 
-describe('parseQuery', () => {
-  it('> forces commands and ? forces ask, prefix stripped', () => {
-    expect(parseQuery('> back')).toEqual({ mode: 'commands', q: 'back' })
-    expect(parseQuery('  ?why is it slow')).toEqual({ mode: 'ask', q: 'why is it slow' })
-    expect(parseQuery('>')).toEqual({ mode: 'commands', q: '' })
+describe('scoreText', () => {
+  it('ranks the tiers: exact > prefix > word-start substring > substring > words > subsequence > typo', () => {
+    const s = (q: string, t: string) => scoreText(q, t) ?? -1
+    expect(s('roadmap', 'Roadmap')).toBe(1000)
+    expect(s('road', 'Roadmap')).toBeGreaterThan(s('map', 'Road map'))
+    expect(s('map', 'Road map')).toBeGreaterThan(s('map', 'Roadmap'))
+    expect(s('map', 'Roadmap')).toBeGreaterThan(s('road arch', 'Architecture of the roadmap'))
+    expect(s('road arch', 'Architecture of the roadmap')).toBeGreaterThan(s('rdmp', 'Roadmap'))
+    expect(s('rdmp', 'Roadmap')).toBeGreaterThan(s('raodmap', 'Roadmap'))
+    expect(s('raodmap', 'Roadmap')).toBeGreaterThan(0)
   })
-  it('otherwise keeps the mode the box opened in', () => {
-    expect(parseQuery(' road ')).toEqual({ mode: 'mixed', q: 'road' })
-    expect(parseQuery('road', 'docs')).toEqual({ mode: 'docs', q: 'road' })
-    expect(parseQuery('', 'ask')).toEqual({ mode: 'ask', q: '' })
+  it('word starts and runs beat scattered letters', () => {
+    expect(scoreText('qn', 'qompass notes')!).toBeGreaterThan(scoreText('qn', 'quinine')!)
+  })
+  it('a shorter title wins inside a tier', () => {
+    expect(scoreText('book', 'Books')!).toBeGreaterThan(scoreText('book', 'Book club notes')!)
+  })
+  it('tolerates one typo per word of four or more letters, not more', () => {
+    expect(scoreText('boosk', 'Books')).not.toBeNull() // transposition
+    expect(scoreText('archetecture', 'Architecture')).not.toBeNull() // substitution
+    expect(scoreText('arhci', 'Architecture')).not.toBeNull() // swapped prefix
+    expect(scoreText('bxxks', 'Books')).toBeNull()
+    expect(scoreText('zzz', 'Roadmap')).toBeNull()
+  })
+  it('restricted Damerau distance', () => {
+    expect(editDistance('books', 'boosk')).toBe(1)
+    expect(editDistance('books', 'books')).toBe(0)
+    expect(editDistance('abc', 'xyz', 1)).toBe(2) // bails out above max
   })
 })
 
-describe('rankDocs', () => {
-  it('exact > prefix > substring > path > fuzzy', () => {
-    expect(rankDocs(docs, 'roadmap').map((d) => d.id)).toEqual(['r'])
-    expect(rankDocs(docs, 'gri').map((d) => d.id)[0]).toBe('g')
-    // "grimoire" is in the PATH of Roadmap and Architecture, not their titles
-    expect(rankDocs(docs, 'grimoire').map((d) => d.id)).toEqual(['g', 'r', 'a'])
-    // fuzzy: q…s spans "qompass notes"
-    expect(rankDocs(docs, 'qns').map((d) => d.id)).toEqual(['q'])
-    expect(rankDocs(docs, 'zzz')).toEqual([])
-  })
-  it('caps at the limit and returns the head when the query is empty', () => {
-    expect(rankDocs(docs, '', 2).map((d) => d.id)).toEqual(['g', 'r'])
-  })
-  it('builds breadcrumb paths', () => {
+describe('Open (⌘O) ranking', () => {
+  const places = buildPlaces({ library: true })
+  const open = (q: string, recentIds: string[] = []) => buildOpenRows({ q, docs, places, recentIds })
+
+  it('a title match beats the same match on the path', () => {
+    // "grimoire" IS Grimoire's title, and only in Roadmap's and Architecture's path
+    expect(ids(open('grimoire'))).toEqual(['g', 'r', 'a'])
     const byId = new Map(docs.map((d) => [d.id, d]))
-    expect(docPath(docs[1], byId)).toBe('Grimoire › Roadmap')
-    expect(docPath(docs[0], byId)).toBe('Grimoire')
+    expect(scoreDoc('grimoire', 'Grimoire', 'Grimoire')!).toBeGreaterThan(scoreDoc('grimoire', 'Roadmap', docPath(docs[1], byId))!)
+  })
+  it('matches across the breadcrumb: parent and title words together', () => {
+    expect(ids(open('grim road'))[0]).toBe('r')
+    expect(ids(open('book kindle'))[0]).toBe('k')
+  })
+  it('finds a title through a typo', () => {
+    expect(ids(open('roadmpa'))[0]).toBe('r')
+    expect(ids(open('archtecture'))[0]).toBe('a')
+  })
+  it('"books" finds the Books place first (Tom: ⌘K buried it under everything else)', () => {
+    expect(ids(open('books'))[0]).toBe('@books')
+    expect(ids(open('boks'))[0]).toBe('@books')
+    expect(ids(open('book'))).toEqual(expect.arrayContaining(['@books', 'bn']))
+  })
+  it('places answer to their keywords: "profile" finds Settings, "kobo" E-readers', () => {
+    expect(ids(open('profile'))[0]).toBe('@settings')
+    expect(ids(open('kobo'))[0]).toBe('@ereaders')
+  })
+  it('a recently opened doc wins a tie', () => {
+    const two = [doc('x1', 'Notes'), doc('x2', 'Notes')]
+    expect(ids(buildOpenRows({ q: 'notes', docs: two, places: [], recentIds: ['x2'] }))).toEqual(['x2', 'x1'])
+  })
+  it('empty query: recent docs, then every place, nothing else', () => {
+    const rows = open('', ['t', 'gone', 'r'])
+    expect(ids(rows)).toEqual(['t', 'r', ...places.map((p) => `@${p.id}`)])
+  })
+  it('never lists actions or content: only doc and place rows', () => {
+    for (const q of ['', 'new doc', 'export', 'sign out', 'back up', 'omnibox']) {
+      for (const r of open(q)) expect(['doc', 'place']).toContain(r.kind)
+    }
+    expect(ids(open('sign out')).filter((x) => !x.startsWith('@') && !docs.some((d) => d.id === x))).toEqual([])
+  })
+  it('keys are unique', () => {
+    const rows = open('o')
+    expect(new Set(rows.map((r) => r.key)).size).toBe(rows.length)
+  })
+})
+
+describe('places', () => {
+  it('Home, Review, Gardeners, Graph, Trash and Settings always; Books and E-readers only with the library', () => {
+    const local = buildPlaces({ library: false }).map((p) => p.id)
+    expect(local).toEqual(['home', 'review', 'runs', 'graph', 'trash', 'settings'])
+    const server = buildPlaces({ library: true }).map((p) => p.id)
+    expect(server).toEqual(expect.arrayContaining([...local, 'books', 'ereaders']))
+  })
+  it('carry their shortcuts', () => {
+    const keys = Object.fromEntries(buildPlaces({ library: true }).map((p) => [p.id, p.keys]))
+    expect(keys).toMatchObject({ home: '⌘W', review: '⌘⇧R', runs: '⌘G', settings: '⌘,' })
+  })
+  it('Review shows the open count', () => {
+    expect(buildPlaces({ library: false, queueCount: 3 }).find((p) => p.id === 'review')!.hint).toBe('3 open')
   })
 })
 
@@ -131,80 +164,96 @@ describe('recent docs', () => {
   it('resolves to live docs only, in order', () => {
     expect(recentDocs(['t', 'gone', 'g'], docs).map((d) => d.id)).toEqual(['t', 'g'])
   })
-})
-
-describe('rankCommands', () => {
-  it('matches labels first, then all words across label+hint', () => {
-    expect(rankCommands(commands, 'back', 4).map((c) => c.id)).toEqual(['backup'])
-    expect(rankCommands(commands, 'restore', 4).map((c) => c.id)).toEqual(['trash'])
-    expect(rankCommands(commands, '', 2).map((c) => c.id)).toEqual(['review', 'newdoc'])
+  it('builds breadcrumb paths', () => {
+    const byId = new Map(docs.map((d) => [d.id, d]))
+    expect(docPath(docs[1], byId)).toBe('Grimoire › Roadmap')
+    expect(docPath(docs[0], byId)).toBe('Grimoire')
   })
 })
 
-describe('buildRows', () => {
+describe('Actions (⌘K)', () => {
+  const real = (docId: string | null, signedIn = true) =>
+    buildCommands({ signedIn, library: true, onSignOut: () => {}, docId, onAction: () => {} })
+
+  it('lists no docs and no places: every row is an action with a run()', () => {
+    const cmds = real('r')
+    const placeLabels = new Set(buildPlaces({ library: true }).map((p) => p.label))
+    for (const c of cmds) {
+      expect(typeof c.run).toBe('function')
+      expect(placeLabels.has(c.label)).toBe(false)
+      expect(docs.some((d) => d.title === c.label)).toBe(false)
+    }
+    expect(cmds.map((c) => c.id)).not.toEqual(expect.arrayContaining(['home', 'trash', 'profile', 'books', 'ereaders', 'inbox']))
+  })
+  it('the open doc’s actions come first; without a doc they are absent', () => {
+    const withDoc = rankCommands(real('r'), '')
+    expect(withDoc.slice(0, 3).map((c) => c.scope)).toEqual(['doc', 'doc', 'doc'])
+    expect(withDoc.slice(3).every((c) => c.scope !== 'doc')).toBe(true)
+    expect(real(null).some((c) => c.scope === 'doc')).toBe(false)
+  })
+  it('the palette shortcuts are rows, with their keys', () => {
+    const keys = Object.fromEntries(real(null).map((c) => [c.id, c.keys]))
+    expect(keys).toMatchObject({ newdoc: '⌘N', capture: '⌘⇧I', open: '⌘O', search: '⌘⇧F', ask: '⌘/', tree: '⌘T', help: '?' })
+  })
+  it('"Ask the library…" is an action', () => {
+    expect(rankCommands(real(null), 'ask')[0].id).toBe('ask')
+  })
+  it('filters fuzzily over labels, then hints and keywords', () => {
+    const cmds = [
+      cmd('backup', 'Back up database now', { hint: 'daily snapshot' }),
+      cmd('newdoc', 'New doc…'),
+      cmd('export', 'Export all docs as Markdown…'),
+      cmd('signout', 'Sign out', { keywords: 'log out logout' }),
+    ]
+    expect(rankCommands(cmds, 'back').map((c) => c.id)[0]).toBe('backup')
+    expect(rankCommands(cmds, 'snapshot').map((c) => c.id)).toEqual(['backup'])
+    expect(rankCommands(cmds, 'logout').map((c) => c.id)).toEqual(['signout'])
+    expect(rankCommands(cmds, 'exprot').map((c) => c.id)[0]).toBe('export') // typo
+    expect(rankCommands(cmds, 'zzz')).toEqual([])
+  })
+})
+
+describe('Search (⌘⇧F)', () => {
   const hits = [hit('b1', 'r', 'Roadmap', '## Omnibox\n', 'heading'), hit('b2', 'a', 'Architecture', 'the omnibox mixes three lists')]
 
-  it('empty mixed query → recent docs then top commands, no ask row', () => {
-    const rows = buildRows({ mode: 'mixed', q: '', docs, recentIds: ['t', 'r'], hits: [], commands })
-    expect(rows.map((r) => r.group)).toEqual(['recent', 'recent', ...Array(6).fill('commands')])
-    expect(rows[0].key).toBe('recent:t')
-    expect(rows.some((r) => r.group === 'ask')).toBe(false)
+  it('a leading ? asks; the prefix is stripped', () => {
+    expect(parseSearch('  ?why is it slow')).toEqual({ ask: true, q: 'why is it slow' })
+    expect(parseSearch(' road ')).toEqual({ ask: false, q: 'road' })
+    expect(parseSearch('>back')).toEqual({ ask: false, q: '>back' }) // no command mode here
   })
-
-  it('a typed mixed query → docs, content, commands, then the ask row, in that order', () => {
-    const rows = buildRows({ mode: 'mixed', q: 'omni', docs, recentIds: ['t'], hits, commands })
-    const groups = rows.map((r) => r.group)
-    expect(groups.filter((g) => g === 'recent')).toHaveLength(0)
-    expect(groups[groups.length - 1]).toBe('ask')
-    // strictly non-decreasing in group order
-    const order = ['docs', 'content', 'commands', 'ask']
-    for (let i = 1; i < groups.length; i++) expect(order.indexOf(groups[i])).toBeGreaterThanOrEqual(order.indexOf(groups[i - 1]))
-    expect(rows.filter((r) => r.group === 'content')).toHaveLength(2)
+  it('content hits, then the ask row; never a doc-title or command row', () => {
+    const rows = buildSearchRows({ ask: false, q: 'omni', hits })
+    expect(rows.map((r) => r.group)).toEqual(['content', 'content', 'ask'])
     const last = rows[rows.length - 1]
     expect(last.group === 'ask' && last.query).toBe('omni')
-    expect(new Set(rows.map((r) => r.key)).size).toBe(rows.length)
   })
-
-  it('caps docs at 5, content at 5 and commands at 4 in mixed mode', () => {
-    const many = Array.from({ length: 9 }, (_, i) => doc(`x${i}`, `xdoc ${i}`))
-    const manyHits = Array.from({ length: 9 }, (_, i) => hit(`h${i}`, 'x0', 'xdoc 0', `xdoc hit ${i}`))
-    const manyCmds = Array.from({ length: 9 }, (_, i) => cmd(`c${i}`, `xdoc command ${i}`))
-    const rows = buildRows({ mode: 'mixed', q: 'xdoc', docs: many, recentIds: [], hits: manyHits, commands: manyCmds })
-    const count = (g: string) => rows.filter((r) => r.group === g).length
-    expect([count('docs'), count('content'), count('commands'), count('ask')]).toEqual([5, 5, 4, 1])
+  it('? is the ask row alone; an empty query is nothing', () => {
+    expect(buildSearchRows({ ask: true, q: 'why', hits })).toEqual([{ key: 'ask', group: 'ask', query: 'why' }])
+    expect(buildSearchRows({ ask: false, q: '', hits })).toEqual([])
   })
-
-  it('> shows commands only, ? shows the ask row only', () => {
-    expect(buildRows({ mode: 'commands', q: 'back', docs, recentIds: [], hits, commands }).map((r) => r.key)).toEqual([
-      'cmd:backup',
-    ])
-    const ask = buildRows({ mode: 'ask', q: 'why', docs, recentIds: [], hits, commands })
-    expect(ask).toEqual([{ key: 'ask', group: 'ask', query: 'why' }])
-  })
-
-  it('docs mode lists recent then all docs when empty; content mode lists hits + ask', () => {
-    const d = buildRows({ mode: 'docs', q: '', docs, recentIds: ['r'], hits: [], commands })
-    expect(d[0].key).toBe('recent:r')
-    expect(d.filter((r) => r.group === 'docs').map((r) => r.key)).not.toContain('docs:r')
-    expect(d).toHaveLength(docs.length)
-    const c = buildRows({ mode: 'content', q: 'omni', docs, recentIds: [], hits, commands })
-    expect(c.map((r) => r.group)).toEqual(['content', 'content', 'ask'])
-  })
-
-  it('marks where each group starts', () => {
-    const rows = buildRows({ mode: 'mixed', q: 'omni', docs, recentIds: [], hits, commands })
-    const starts = [...groupStarts(rows)]
-    expect(starts[0]).toBe(0)
-    expect(starts.length).toBe(new Set(rows.map((r) => r.group)).size)
-  })
-})
-
-describe('content rows', () => {
   it('crumb adds the heading when the hit is one; snippet strips hashes and cuts', () => {
     expect(crumbOf(hit('b', 'r', 'Roadmap', '## Omnibox', 'heading'))).toBe('Roadmap › Omnibox')
     expect(crumbOf(hit('b', 'r', 'Roadmap', 'body'))).toBe('Roadmap')
     expect(snippetOf('---\ntags:\n---\n\n# Title line\nmore')).toBe('tags:')
     expect(snippetOf('# Heading only')).toBe('Heading only')
     expect(snippetOf('x'.repeat(200), 10)).toBe('xxxxxxxxx…')
+  })
+})
+
+describe('stableSelection', () => {
+  const C = (id: string): SearchRow => ({ key: `content:${id}`, group: 'content', hit: hit(id, 'r', 'R', 'x'), crumb: 'R', snippet: 'x' })
+  const ASK: SearchRow = { key: 'ask', group: 'ask', query: 'q' }
+
+  it('keeps the selected row by key when hits land around it', () => {
+    expect(stableSelection([C('a'), ASK], 1, [C('a'), C('b'), C('c'), ASK])).toBe(3)
+    expect(stableSelection([C('a'), C('b'), ASK], 1, [C('x'), C('b'), ASK])).toBe(1)
+  })
+  it('a vanished row falls back to the same group at the same offset, clamped', () => {
+    expect(stableSelection([C('h1'), C('h2'), C('h3'), ASK], 2, [C('h9'), C('h8'), ASK])).toBe(1)
+  })
+  it('a vanished group clamps the index; an empty list is 0', () => {
+    expect(stableSelection([C('a'), C('b')], 1, [ASK])).toBe(0)
+    expect(stableSelection([C('a')], 0, [])).toBe(0)
+    expect(stableSelection([], 0, [C('a'), C('b')])).toBe(0)
   })
 })

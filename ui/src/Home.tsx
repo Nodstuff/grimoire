@@ -1,5 +1,5 @@
 // The briefing home: what the stage shows when no doc is open (also ⌘W and
-// ⌘K → Home). A calm morning page, not a dashboard: the date, one muted
+// ⌘O → Home). A calm morning page, not a dashboard: the date, one muted
 // summary line, then the regions — Currently reading (the EPUB shelf, when
 // anything is on it), To-do (the per-day list in the To-do doc, todo.rs),
 // Inbox (what quick capture left waiting, when anything is), and Since you
@@ -373,19 +373,25 @@ export default function Home({
 
       <div className="home-hints">
         <span>
-          <kbd>⌘K</kbd> search &amp; commands
+          <kbd>⌘O</kbd> open
+        </span>
+        <span>
+          <kbd>⌘K</kbd> actions
+        </span>
+        <span>
+          <kbd>⌘⇧F</kbd> search
         </span>
         <span>
           <kbd>⌘⇧I</kbd> capture
         </span>
         <span>
-          <kbd>⌘T</kbd> tree
-        </span>
-        <span>
           <kbd>⌘N</kbd> new doc
         </span>
         <span>
-          <kbd>⌘⇧R</kbd> review
+          <kbd>⌘T</kbd> tree
+        </span>
+        <span>
+          <kbd>⌘,</kbd> settings
         </span>
         <span>
           <kbd>?</kbd> all shortcuts

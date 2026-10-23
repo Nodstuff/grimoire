@@ -1,43 +1,111 @@
-// Pure seams behind the omnibox (Omnibox.tsx): the prefix-mode parser, doc
-// ranking (what ⌘O did, plus paths), the recent-docs list, and the mixer that
-// lays docs / content hits / commands / the trailing ask row out as ONE keyed
-// list in a fixed group order so the arrow keys walk it as a whole.
+// Pure seams behind the three palettes. Each has one job and never shows the
+// others' rows:
+//   ⌘O  Open     (OpenPalette.tsx)    doc titles + breadcrumb paths + places
+//   ⌘K  Actions  (ActionsPalette.tsx) commands only
+//   ⌘⇧F Search   (SearchPalette.tsx)  full-text block hits + the ask row
+// Here: the fuzzy scorer all three rank with, the places list, the recent-docs
+// list, the row builders, and the selection-stability rule.
 
 import type { Doc, SearchHit } from './types'
 
-/* ---------- modes ---------- */
+/* ---------- fuzzy scoring ---------- */
 
-/** `mixed` is ⌘K; `docs` / `content` / `ask` are the ⌘O / ⌘P / ⌘/ aliases
- * (they only narrow which groups show — the same box, the same keys). `>`
- * and `?` typed into the box force `commands` / `ask` for that query. */
-export type OmniMode = 'mixed' | 'docs' | 'content' | 'commands' | 'ask'
-
-export interface ParsedQuery {
-  mode: OmniMode
-  /** the query without its prefix, trimmed */
-  q: string
-}
-
-/** `>` → commands only, `?` → ask only, otherwise the mode the box opened
- * in. The prefix is stripped from the query; whitespace around it is fine. */
-export function parseQuery(raw: string, base: OmniMode = 'mixed'): ParsedQuery {
-  const s = raw.trimStart()
-  if (s.startsWith('>')) return { mode: 'commands', q: s.slice(1).trim() }
-  if (s.startsWith('?')) return { mode: 'ask', q: s.slice(1).trim() }
-  return { mode: base, q: raw.trim() }
-}
-
-/* ---------- docs ---------- */
-
-/** Subsequence match (what ⌘O used): every char of needle appears in hay in order. */
+/** Subsequence match: every char of needle appears in hay in order. */
 export function fuzzyMatch(needle: string, hay: string): boolean {
   let i = 0
+  if (!needle) return true
   for (const c of hay) {
     if (c === needle[i]) i++
     if (i === needle.length) return true
   }
   return false
 }
+
+const WORD_SPLIT = /[\s›/\-_.:,()[\]]+/
+
+/** Restricted Damerau–Levenshtein distance, bailing out above `max`. */
+export function editDistance(a: string, b: string, max = 2): number {
+  if (Math.abs(a.length - b.length) > max) return max + 1
+  const prev2 = new Array<number>(b.length + 1).fill(0)
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j)
+  for (let i = 1; i <= a.length; i++) {
+    const cur = new Array<number>(b.length + 1)
+    cur[0] = i
+    let rowMin = cur[0]
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        cur[j] = Math.min(cur[j], prev2[j - 2] + 1)
+      }
+      rowMin = Math.min(rowMin, cur[j])
+    }
+    if (rowMin > max) return max + 1
+    for (let j = 0; j <= b.length; j++) prev2[j] = prev[j]
+    prev = cur
+  }
+  return prev[b.length]
+}
+
+/** A needle word of 4+ letters is within one edit of a hay word, or of that
+ * word's prefix of the same length (so "boosk" finds "books", "archi" →
+ * "architecture" stays a prefix, "arhci" → "archi…" is one swap). */
+function typoWord(w: string, hayWords: string[]): boolean {
+  if (w.length < 4) return hayWords.some((h) => h.startsWith(w))
+  return hayWords.some(
+    (h) =>
+      h.startsWith(w) ||
+      editDistance(w, h, 1) <= 1 ||
+      (h.length > w.length && editDistance(w, h.slice(0, w.length), 1) <= 1),
+  )
+}
+
+/** Subsequence score with word-start and run bonuses, or null. */
+function subsequenceScore(needle: string, hay: string): number | null {
+  let i = 0
+  let score = 0
+  let run = 0
+  let last = -2
+  for (let j = 0; j < hay.length && i < needle.length; j++) {
+    if (hay[j] !== needle[i]) continue
+    const wordStart = j === 0 || WORD_SPLIT.test(hay[j - 1])
+    score += wordStart ? 12 : 1
+    run = j === last + 1 ? run + 1 : 0
+    score += run * 4
+    last = j
+    i++
+  }
+  if (i < needle.length) return null
+  return score
+}
+
+/**
+ * How well `query` matches `text`, higher is better, null = no match. Tiers
+ * (each wins over every lower one): exact 1000 · prefix ~900 · substring at a
+ * word start ~800 · substring ~700 · every query word starts a word (any
+ * order) ~600 · subsequence 300–590 (word starts and runs score) · every word
+ * within one typo 200. Case-insensitive; the query is trimmed.
+ */
+export function scoreText(query: string, text: string): number | null {
+  const q = query.trim().toLowerCase()
+  if (!q) return 0
+  const t = text.toLowerCase()
+  if (t === q) return 1000
+  // shorter texts win inside a tier: "Books" over "Book club notes"
+  const shortness = Math.max(0, 40 - (t.length - q.length)) / 2
+  if (t.startsWith(q)) return 880 + shortness
+  const at = t.indexOf(q)
+  if (at > 0) return (WORD_SPLIT.test(t[at - 1]) ? 780 : 680) + shortness
+  const words = q.split(/\s+/).filter(Boolean)
+  const hayWords = t.split(WORD_SPLIT).filter(Boolean)
+  if (words.length > 1 && words.every((w) => hayWords.some((h) => h.startsWith(w)))) return 580 + shortness
+  const sub = subsequenceScore(q.replace(/\s+/g, ''), t)
+  if (sub !== null) return 300 + Math.min(270, sub) + shortness / 2
+  if (words.every((w) => typoWord(w, hayWords))) return 200 + shortness / 2
+  return null
+}
+
+/* ---------- docs ---------- */
 
 /** "Parent › Child › Title" for a doc (mirrors find_doc's breadcrumb). */
 export function docPath(doc: Doc, byId: Map<string, Doc>): string {
@@ -53,25 +121,15 @@ export function docPath(doc: Doc, byId: Map<string, Doc>): string {
   return parts.join(' › ')
 }
 
-/** Docs matching `q`, best first: exact title > title prefix > title
- * substring > path substring > fuzzy title. Ties keep list order. */
-export function rankDocs(docs: Doc[], q: string, limit = 5): Doc[] {
-  const needle = q.trim().toLowerCase()
-  if (!needle) return docs.slice(0, limit)
-  const byId = new Map(docs.map((d) => [d.id, d]))
-  const scored: { d: Doc; s: number }[] = []
-  for (const d of docs) {
-    const t = d.title.toLowerCase()
-    let s = 0
-    if (t === needle) s = 5
-    else if (t.startsWith(needle)) s = 4
-    else if (t.includes(needle)) s = 3
-    else if (docPath(d, byId).toLowerCase().includes(needle)) s = 2
-    else if (fuzzyMatch(needle, t)) s = 1
-    if (s) scored.push({ d, s })
-  }
-  scored.sort((a, b) => b.s - a.s)
-  return scored.slice(0, limit).map((x) => x.d)
+/** A path match counts for less than the same match on the title. */
+export const PATH_WEIGHT = 0.7
+
+/** A doc's score: its title, or its breadcrumb path at PATH_WEIGHT. */
+export function scoreDoc(q: string, title: string, path: string): number | null {
+  const t = scoreText(q, title)
+  const p = path !== title ? scoreText(q, path) : null
+  if (t === null && p === null) return null
+  return Math.max(t ?? -1, p === null ? -1 : p * PATH_WEIGHT)
 }
 
 /* ---------- recent docs ---------- */
@@ -108,58 +166,156 @@ export function recentDocs(ids: string[], docs: Doc[]): Doc[] {
   return ids.map((id) => byId.get(id)).filter((d): d is Doc => !!d)
 }
 
-/* ---------- commands ---------- */
+/* ---------- places (⌘O) ---------- */
+
+export type PlaceId = 'home' | 'books' | 'review' | 'trash' | 'graph' | 'runs' | 'settings' | 'ereaders'
+
+export interface Place {
+  id: PlaceId
+  label: string
+  hint: string
+  keys?: string
+  /** extra words the place answers to ("profile" finds Settings) */
+  keywords?: string
+}
+
+/** The places ⌘O lists. Books and E-readers only where the EPUB library
+ * exists (SERVER mode). */
+export function buildPlaces({ library, queueCount = 0 }: { library: boolean; queueCount?: number }): Place[] {
+  const places: Place[] = [
+    { id: 'home', label: 'Home', hint: 'the briefing', keys: '⌘W', keywords: 'briefing start' },
+    ...(library ? [{ id: 'books' as const, label: 'Books', hint: 'your EPUB library', keywords: 'epub library reading' }] : []),
+    {
+      id: 'review',
+      label: 'Review queue',
+      hint: queueCount ? `${queueCount} open` : 'changes waiting for you',
+      keys: '⌘⇧R',
+      keywords: 'proposals flags gate',
+    },
+    { id: 'runs', label: 'Gardeners', hint: 'agent runs', keys: '⌘G', keywords: 'runs agents' },
+    { id: 'graph', label: 'Graph', hint: 'docs as nodes, links as lines', keywords: 'links map' },
+    { id: 'trash', label: 'Trash', hint: 'restore deleted docs', keywords: 'deleted restore bin' },
+    {
+      id: 'settings',
+      label: 'Settings',
+      hint: library ? 'profile, e-readers' : 'profile, version, diagnostics',
+      keys: '⌘,',
+      keywords: 'profile preferences name version diagnostics account sign out',
+    },
+  ]
+  if (library) {
+    places.push({ id: 'ereaders', label: 'E-readers', hint: 'Settings › E-readers', keywords: 'kobo kindle device opds' })
+  }
+  return places
+}
+
+function scorePlace(q: string, p: Place): number | null {
+  const label = scoreText(q, p.label)
+  const extra = p.keywords ? scoreText(q, p.keywords) : null
+  if (label === null && extra === null) return null
+  return Math.max(label ?? -1, extra === null ? -1 : extra * PATH_WEIGHT)
+}
+
+/* ---------- the Open list (⌘O) ---------- */
+
+export type OpenRow =
+  | { key: string; kind: 'doc'; doc: Doc; path: string; recent: boolean }
+  | { key: string; kind: 'place'; place: Place }
+
+export const OPEN_LIMIT = 50
+
+/** Empty query: recent docs, then every place. Typed: docs (title or path)
+ * and places in one list, best first; on a tie a place beats a doc, then a
+ * recently opened doc beats an older one, then list order. Nothing else:
+ * no commands, no content hits. */
+export function buildOpenRows({
+  q,
+  docs,
+  places,
+  recentIds,
+  limit = OPEN_LIMIT,
+}: {
+  q: string
+  docs: Doc[]
+  places: Place[]
+  recentIds: string[]
+  limit?: number
+}): OpenRow[] {
+  const byId = new Map(docs.map((d) => [d.id, d]))
+  const recentRank = new Map(recentIds.map((id, i) => [id, i]))
+  const docRow = (d: Doc): OpenRow => ({
+    key: `doc:${d.id}`,
+    kind: 'doc',
+    doc: d,
+    path: docPath(d, byId),
+    recent: recentRank.has(d.id),
+  })
+  const placeRow = (p: Place): OpenRow => ({ key: `place:${p.id}`, kind: 'place', place: p })
+  const query = q.trim()
+  if (!query) return [...recentDocs(recentIds, docs).map(docRow), ...places.map(placeRow)]
+
+  const scored: { row: OpenRow; s: number; tie: number; i: number }[] = []
+  places.forEach((p, i) => {
+    const s = scorePlace(query, p)
+    if (s !== null) scored.push({ row: placeRow(p), s, tie: 0, i })
+  })
+  docs.forEach((d, i) => {
+    const path = docPath(d, byId)
+    const s = scoreDoc(query, d.title, path)
+    if (s === null) return
+    const r = recentRank.get(d.id)
+    scored.push({ row: { key: `doc:${d.id}`, kind: 'doc', doc: d, path, recent: r !== undefined }, s, tie: r === undefined ? 1000 : 1 + r, i })
+  })
+  scored.sort((a, b) => b.s - a.s || a.tie - b.tie || a.i - b.i)
+  return scored.slice(0, limit).map((x) => x.row)
+}
+
+/* ---------- actions (⌘K) ---------- */
 
 export interface OmniCommand {
   id: string
   label: string
   hint?: string
-  /** keyboard shortcut shown on the selected row */
+  /** keyboard shortcut, shown on every row */
   keys?: string
+  /** extra words the action answers to */
+  keywords?: string
+  /** `doc` = acts on the open doc: listed first */
+  scope?: 'doc' | 'app'
   run: () => void
 }
 
-export function rankCommands(cmds: OmniCommand[], q: string, limit: number): OmniCommand[] {
-  const needle = q.trim().toLowerCase()
-  if (!needle) return cmds.slice(0, limit)
-  const words = needle.split(/\s+/)
-  const scored = cmds
-    .map((c) => {
-      const l = c.label.toLowerCase()
-      const h = (c.hint ?? '').toLowerCase()
-      let s = 0
-      if (l.startsWith(needle)) s = 3
-      else if (l.includes(needle)) s = 2
-      else if (words.every((w) => l.includes(w) || h.includes(w))) s = 1
-      return { c, s }
-    })
-    .filter((x) => x.s > 0)
-  scored.sort((a, b) => b.s - a.s)
+/** Actions matching `q`, best first; with an empty query, the open doc's
+ * actions first, then the rest in list order. */
+export function rankCommands(cmds: OmniCommand[], q: string, limit = 50): OmniCommand[] {
+  const ordered = [...cmds.filter((c) => c.scope === 'doc'), ...cmds.filter((c) => c.scope !== 'doc')]
+  const query = q.trim()
+  if (!query) return ordered.slice(0, limit)
+  const scored: { c: OmniCommand; s: number; i: number }[] = []
+  ordered.forEach((c, i) => {
+    const l = scoreText(query, c.label)
+    const extra = scoreText(query, [c.hint, c.keywords].filter(Boolean).join(' '))
+    if (l === null && extra === null) return
+    scored.push({ c, s: Math.max(l ?? -1, extra === null ? -1 : extra * 0.5), i })
+  })
+  scored.sort((a, b) => b.s - a.s || a.i - b.i)
   return scored.slice(0, limit).map((x) => x.c)
 }
 
-/* ---------- the mixed list ---------- */
+/* ---------- search (⌘⇧F) ---------- */
 
-export type OmniGroup = 'recent' | 'docs' | 'content' | 'commands' | 'ask'
-
-export type OmniRow =
-  | { key: string; group: 'recent' | 'docs'; doc: Doc; path: string }
-  | { key: string; group: 'content'; hit: SearchHit; crumb: string; snippet: string }
-  | { key: string; group: 'commands'; cmd: OmniCommand }
-  | { key: string; group: 'ask'; query: string }
-
-export const GROUP_LABEL: Record<OmniGroup, string> = {
-  recent: 'Recent',
-  docs: 'Docs',
-  content: 'Content',
-  commands: 'Commands',
-  ask: 'Ask the vault',
+/** A leading `?` asks instead of searching; the prefix is stripped. */
+export function parseSearch(raw: string): { ask: boolean; q: string } {
+  const s = raw.trimStart()
+  if (s.startsWith('?')) return { ask: true, q: s.slice(1).trim() }
+  return { ask: false, q: raw.trim() }
 }
 
-/** Group order in the list, whatever the mode. */
-export const GROUP_ORDER: OmniGroup[] = ['recent', 'docs', 'content', 'commands', 'ask']
+export type SearchRow =
+  | { key: string; group: 'content'; hit: SearchHit; crumb: string; snippet: string }
+  | { key: string; group: 'ask'; query: string }
 
-export const LIMITS = { recent: RECENT_MAX, docs: 5, content: 5, commands: 4, topCommands: 6, docsOnly: 12, contentOnly: 12, commandsOnly: 20 }
+export const SEARCH_LIMIT = 20
 
 /** One line of a content hit: first non-empty line, hashes stripped, cut. */
 export function snippetOf(content: string, max = 110): string {
@@ -180,90 +336,29 @@ export function crumbOf(hit: SearchHit): string {
   return hit.doc_title
 }
 
-export interface MixInput {
-  mode: OmniMode
-  q: string
-  docs: Doc[]
-  recentIds: string[]
-  hits: SearchHit[]
-  commands: OmniCommand[]
-}
-
-/** The rows the omnibox shows, in group order, each with a stable key. */
-export function buildRows({ mode, q, docs, recentIds, hits, commands }: MixInput): OmniRow[] {
-  const byId = new Map(docs.map((d) => [d.id, d]))
-  const docRow = (group: 'recent' | 'docs') => (d: Doc): OmniRow => ({
-    key: `${group}:${d.id}`,
-    group,
-    doc: d,
-    path: docPath(d, byId),
-  })
-  const hitRow = (h: SearchHit): OmniRow => ({
+/** Content hits then the trailing ask row; `?` = the ask row alone. */
+export function buildSearchRows({ ask, q, hits }: { ask: boolean; q: string; hits: SearchHit[] }): SearchRow[] {
+  const askRow: SearchRow = { key: 'ask', group: 'ask', query: q }
+  if (ask) return [askRow]
+  if (!q) return []
+  const rows: SearchRow[] = hits.slice(0, SEARCH_LIMIT).map((h) => ({
     key: `content:${h.block.id}`,
     group: 'content',
     hit: h,
     crumb: crumbOf(h),
     snippet: snippetOf(h.block.content),
-  })
-  const cmdRow = (c: OmniCommand): OmniRow => ({ key: `cmd:${c.id}`, group: 'commands', cmd: c })
-  const askRow = (): OmniRow => ({ key: 'ask', group: 'ask', query: q })
-
-  const rows: OmniRow[] = []
-  switch (mode) {
-    case 'commands':
-      rows.push(...rankCommands(commands, q, LIMITS.commandsOnly).map(cmdRow))
-      return rows
-    case 'ask':
-      rows.push(askRow())
-      return rows
-    case 'docs':
-      if (!q) rows.push(...recentDocs(recentIds, docs).map(docRow('recent')))
-      rows.push(
-        ...rankDocs(docs, q, LIMITS.docsOnly)
-          .filter((d) => !rows.some((r) => r.group === 'recent' && r.doc.id === d.id))
-          .map(docRow('docs')),
-      )
-      return rows
-    case 'content':
-      rows.push(...hits.slice(0, LIMITS.contentOnly).map(hitRow))
-      if (q) rows.push(askRow())
-      return rows
-    case 'mixed':
-    default:
-      if (!q) {
-        rows.push(...recentDocs(recentIds, docs).map(docRow('recent')))
-        rows.push(...commands.slice(0, LIMITS.topCommands).map(cmdRow))
-        return rows
-      }
-      rows.push(...rankDocs(docs, q, LIMITS.docs).map(docRow('docs')))
-      rows.push(...hits.slice(0, LIMITS.content).map(hitRow))
-      rows.push(...rankCommands(commands, q, LIMITS.commands).map(cmdRow))
-      rows.push(askRow())
-      return rows
-  }
+  }))
+  rows.push(askRow)
+  return rows
 }
 
-/** Index of the first row of each group — where the group label renders. */
-export function groupStarts(rows: OmniRow[]): Set<number> {
-  const seen = new Set<OmniGroup>()
-  const starts = new Set<number>()
-  rows.forEach((r, i) => {
-    if (!seen.has(r.group)) {
-      seen.add(r.group)
-      starts.add(i)
-    }
-  })
-  return starts
-}
+/* ---------- selection ---------- */
 
 /** Where the selection lands after the rows change under it. The selected
- * row keeps its identity by KEY when it survives (the Content group landing
- * 120 ms after Docs must not move the highlight off the doc the user was on);
- * a vanished row falls back to the first row of the same group, then to the
- * same index clamped, then to 0. Pure — the root cause of the old "jumpy"
- * mixed mode was an index-based selection over a list whose groups arrive
- * at different times. */
-export function stableSelection(prevRows: OmniRow[], prevSel: number, nextRows: OmniRow[]): number {
+ * row keeps its identity by KEY when it survives (hits landing 120 ms later
+ * must not move the highlight); a vanished row falls back to the first row of
+ * the same group at the same offset, then to the same index clamped, then 0. */
+export function stableSelection<R extends { key: string; group?: string }>(prevRows: R[], prevSel: number, nextRows: R[]): number {
   if (nextRows.length === 0) return 0
   const prev = prevRows[prevSel]
   if (!prev) return Math.min(prevSel, nextRows.length - 1)
@@ -271,7 +366,6 @@ export function stableSelection(prevRows: OmniRow[], prevSel: number, nextRows: 
   if (byKey !== -1) return byKey
   const sameGroup = nextRows.findIndex((r) => r.group === prev.group)
   if (sameGroup !== -1) {
-    // same group, same offset within it where possible
     const prevGroupStart = prevRows.findIndex((r) => r.group === prev.group)
     const offset = Math.max(0, prevSel - prevGroupStart)
     let i = sameGroup
@@ -279,20 +373,4 @@ export function stableSelection(prevRows: OmniRow[], prevSel: number, nextRows: 
     return i
   }
   return Math.min(prevSel, nextRows.length - 1)
-}
-
-/** Placeholder for the box in each opening mode. */
-export function placeholderFor(mode: OmniMode): string {
-  switch (mode) {
-    case 'docs':
-      return 'Open a doc…  (> commands · ? ask)'
-    case 'content':
-      return 'Search everything… typos fine  (> commands · ? ask)'
-    case 'ask':
-      return 'Ask your notes a question… every claim cites its block'
-    case 'commands':
-      return 'Type a command…'
-    default:
-      return 'Search docs and content, run a command, or ask…  (> commands · ? ask)'
-  }
 }
