@@ -8,6 +8,7 @@ mod api;
 mod ask;
 mod auth;
 mod backup;
+mod booknaming;
 mod changes;
 mod children;
 mod docops;
