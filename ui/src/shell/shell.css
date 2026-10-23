@@ -388,9 +388,17 @@ button.lp-side-sec:hover {
 }
 
 /* ---------- the doc tree ---------- */
-.lp-side-tree {
+/* the tree scrolls in its own band so Gardeners / Trash / Settings and you
+   stay pinned at the bottom (canvas Main) however long the library is */
+.lp-side > .lp-side-tree {
   display: flex;
   flex-direction: column;
+  flex: 1 1 0;
+  min-height: 140px;
+  overflow-y: auto;
+  margin: 0 -12px;
+  padding: 0 12px;
+  scrollbar-width: thin;
 }
 .lp-tree {
   display: flex;
@@ -1009,4 +1017,68 @@ button.lp-side-sec:hover {
   .lp-top {
     border-bottom-color: transparent;
   }
+}
+
+/* ---------- the shortcut cheatsheet (?) ---------- */
+.palette.palette-help {
+  width: min(760px, calc(100vw - 32px));
+}
+.lp-help {
+  display: flex;
+  flex-direction: column;
+  max-height: min(680px, calc(100dvh - 128px));
+}
+.lp-help-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 14px 14px 20px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink3);
+}
+.lp-help-head h2 {
+  flex: 1;
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--ink);
+}
+.lp-help-groups {
+  overflow-y: auto;
+  padding: 16px 20px 20px;
+  columns: 2 300px;
+  column-gap: 28px;
+}
+.lp-help-group {
+  display: flex;
+  flex-direction: column;
+  break-inside: avoid;
+  margin-bottom: 18px;
+}
+.lp-help-group .lp-label {
+  margin-bottom: 4px;
+}
+.lp-help-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 34px;
+  border-top: 1px solid var(--line);
+}
+.lp-help-row:first-of-type {
+  border-top: 0;
+}
+.lp-help-label {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-md);
+  color: var(--ink2);
+}
+.lp-help-keys {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ink3);
+  font-size: var(--text-sm);
+  white-space: nowrap;
 }

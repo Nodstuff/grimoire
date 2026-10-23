@@ -7,7 +7,8 @@
 import { useEffect, useState } from 'react'
 import { Button } from './lapis/Button'
 import { CopyButton, Row, RowText, SettingsCard } from './screens/settingsParts'
-import PaletteShell from './PaletteShell'
+import { Dialog } from './lapis/Dialog'
+import { TextField } from './lapis/Field'
 import { api, Profile as ProfileRow } from './types'
 import { errText, notify } from './Notice'
 
@@ -88,33 +89,34 @@ export function FirstRunName({ profile, onSaved }: { profile: ProfileRow; onSave
   }
 
   return (
-    <PaletteShell onClose={() => {}} locked label="Your name">
-      <div className="first-run">
-        <div className="first-run-title">What should others call you?</div>
-        <div className="meta">
-          This is the name your edits and reviews are attributed to. You can change it later in
-          Settings › Profile.
-        </div>
-        <input
-          autoFocus
-          value={name}
-          maxLength={64}
-          placeholder="Your name"
-          aria-label="Your name"
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') save()
-            if (e.key === 'Escape') e.stopPropagation()
-          }}
-        />
-        <div className="first-run-actions">
-          {err && <span className="meta err">{err}</span>}
-          <Button variant="primary" disabled={!ok || busy} onClick={save}>
-            {busy ? 'Saving…' : 'Save'}
-          </Button>
-        </div>
-      </div>
-    </PaletteShell>
+    <Dialog
+      onClose={() => {}}
+      locked
+      title="What should others call you?"
+      description="Your edits and reviews are signed with this name. You can change it later in Settings › Profile."
+      footer={
+        <Button variant="primary" disabled={!ok || busy} onClick={save}>
+          {busy ? 'Saving…' : 'Save'}
+        </Button>
+      }
+    >
+      <TextField
+        autoFocus
+        data-autofocus
+        label="Your name"
+        hideLabel
+        value={name}
+        maxLength={64}
+        placeholder="Your name"
+        error={!!err}
+        help={err ?? undefined}
+        onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') save()
+          if (e.key === 'Escape') e.stopPropagation()
+        }}
+      />
+    </Dialog>
   )
 }
 
