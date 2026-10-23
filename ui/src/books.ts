@@ -194,14 +194,41 @@ export function coverCandidates(id: string): Promise<CoverCandidates> {
   return api<CoverCandidates>(`/api/books/${id}/cover-candidates`)
 }
 
+/** The person's own search terms for "Search with a different title…". */
+export interface CoverSearchTerms {
+  title: string
+  author?: string
+}
+
 /** Ask Open Library (the server does; a recent lookup is reused unless
- * `refresh`). */
-export function findCoverCandidates(id: string, refresh = false): Promise<CoverCandidates> {
+ * `refresh`). With `terms`, the server searches those instead of the
+ * book's own title and author (always asked; it still builds the URL). */
+export function findCoverCandidates(id: string, refresh = false, terms?: CoverSearchTerms): Promise<CoverCandidates> {
+  const body = terms ? { refresh: true, title: terms.title, author: terms.author ?? '' } : { refresh }
   return api<CoverCandidates>(`/api/books/${id}/cover-candidates`, {
     method: 'POST',
     headers: JSON_HEADERS,
-    body: JSON.stringify({ refresh }),
+    body: JSON.stringify(body),
   })
+}
+
+/** A title without its trailing series brackets ("Red Tithe (Carcharodons
+ * Book 1)" → "Red Tithe"), the start of a different-title search. */
+export function withoutSeries(title: string): string {
+  let t = title.trim()
+  for (;;) {
+    const m = /\s*[([][^()[\]]*[)\]]$/.exec(t)
+    if (!m || m.index === 0) return t
+    t = t.slice(0, m.index).trimEnd()
+  }
+}
+
+/** Terms from the different-title form, or null while the title is empty. */
+export function coverSearchTerms(title: string, author: string): CoverSearchTerms | null {
+  const t = title.trim()
+  if (!t) return null
+  const a = author.trim()
+  return a ? { title: t, author: a } : { title: t }
 }
 
 /** Show a candidate, or (`'embedded'`) the book's own cover. `unlessChosen`

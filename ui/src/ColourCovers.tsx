@@ -5,7 +5,9 @@
 //
 // - ColourCoverPanel, in a book's details: "Find a colour cover…" lays up
 //   to four candidates beside the current cover; "Use this cover" or "Keep
-//   mine"; "Revert to the book's own cover" while a colour one shows.
+//   mine"; "Search with a different title…" (a title and an optional
+//   author the server searches instead); "Revert to the book's own cover"
+//   while a colour one shows.
 // - UploadColourOffer, under an upload result whose cover is greyscale: the
 //   top match and "Use colour cover".
 // - CoverReviewSheet, the one-off library pass behind Books' "Find colour
@@ -18,19 +20,22 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { errText, notify } from './Notice'
-import { Button, Sheet, Spinner } from './lapis'
+import { Button, Sheet, Spinner, TextField } from './lapis'
 import {
   Book,
   CoverCandidate,
   CoverReviewRow,
+  type CoverSearchTerms,
   chooseCover,
   coverReview,
+  coverSearchTerms,
   coverUrl,
   findCoverCandidates,
   goodMatches,
   oneAtATime,
   scanCoverReview,
   wantsColourCover,
+  withoutSeries,
 } from './books'
 import { ApiError } from './types'
 
@@ -65,9 +70,39 @@ function Thumb({ src, label, on, onPick }: { src: string | null; label: string; 
   )
 }
 
+/** "Search with a different title…": a title and an optional author. */
+export function DifferentTitleForm({ book, busy, onSearch, onCancel }: { book: Book; busy: boolean; onSearch: (t: CoverSearchTerms) => void; onCancel: () => void }) {
+  const [title, setTitle] = useState(() => withoutSeries(book.title))
+  const [author, setAuthor] = useState(book.author ?? '')
+  const terms = coverSearchTerms(title, author)
+  return (
+    <form
+      className="bk-cc-alt"
+      aria-label="Search with a different title"
+      onSubmit={(e) => {
+        e.preventDefault()
+        if (terms && !busy) onSearch(terms)
+      }}
+    >
+      <TextField label="Title" value={title} maxLength={200} autoFocus onChange={(e) => setTitle(e.target.value)} />
+      <TextField label="Author (optional)" value={author} maxLength={200} onChange={(e) => setAuthor(e.target.value)} />
+      <div className="bk-d-actions">
+        <Button type="submit" variant="primary" size="sm" icon="search" disabled={!terms || busy}>
+          Search
+        </Button>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>
+          Cancel
+        </Button>
+      </div>
+    </form>
+  )
+}
+
 /** In a book's details: find, compare, choose, revert. */
 export function ColourCoverPanel({ book, onPatched }: { book: Book; onPatched: (b: Book) => void }) {
   const [open, setOpen] = useState(false)
+  const [alt, setAlt] = useState(false)
+  const [searched, setSearched] = useState<string | null>(null)
   const [busy, setBusy] = useState<'find' | 'choose' | null>(null)
   const [list, setList] = useState<CoverCandidate[] | null>(null)
   const [unavailable, setUnavailable] = useState(false)
@@ -80,12 +115,14 @@ export function ColourCoverPanel({ book, onPatched }: { book: Book; onPatched: (
     [],
   )
 
-  const find = async (refresh: boolean) => {
+  const find = async (refresh: boolean, terms?: CoverSearchTerms) => {
     setOpen(true)
     setBusy('find')
     try {
-      const r = await serially(() => findCoverCandidates(book.id, refresh))
+      const r = await serially(() => findCoverCandidates(book.id, refresh, terms))
       if (!alive.current) return
+      setAlt(false)
+      setSearched(terms ? terms.title : null)
       setList(r.candidates)
       setUnavailable(r.unavailable)
       setPicked(r.candidates[0]?.id ?? null)
@@ -138,7 +175,9 @@ export function ColourCoverPanel({ book, onPatched }: { book: Book; onPatched: (
             </div>
           )}
           {busy !== 'find' && list && list.length === 0 && (
-            <div className="bk-cc-row muted">{unavailable ? 'Open Library didn’t answer. Try again in a while.' : 'Open Library has no colour cover for this book.'}</div>
+            <div className="bk-cc-row muted">
+              {unavailable ? 'Open Library didn’t answer. Try again in a while.' : searched ? `Open Library has no colour cover for “${searched}”.` : 'Open Library has no colour cover for this book.'}
+            </div>
           )}
           {busy !== 'find' && list && list.length > 0 && (
             <div className="bk-cc-strip" role="group" aria-label="Covers to choose from">
@@ -148,6 +187,7 @@ export function ColourCoverPanel({ book, onPatched }: { book: Book; onPatched: (
               ))}
             </div>
           )}
+          {alt && <DifferentTitleForm book={book} busy={busy !== null} onSearch={(t) => find(true, t)} onCancel={() => setAlt(false)} />}
           <div className="bk-d-actions">
             {list && list.length > 0 && (
               <Button variant="primary" size="sm" disabled={!picked || busy !== null} onClick={() => picked && choose({ candidate: picked }, 'colour cover set')}>
@@ -160,7 +200,20 @@ export function ColourCoverPanel({ book, onPatched }: { book: Book; onPatched: (
             <Button size="sm" variant="ghost" disabled={busy !== null} onClick={() => find(true)}>
               Search again
             </Button>
-            <Button size="sm" variant="ghost" disabled={busy !== null} onClick={() => setOpen(false)}>
+            {!alt && (
+              <Button size="sm" variant="ghost" disabled={busy !== null} onClick={() => setAlt(true)}>
+                Search with a different title…
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={busy !== null}
+              onClick={() => {
+                setOpen(false)
+                setAlt(false)
+              }}
+            >
               Close
             </Button>
           </div>

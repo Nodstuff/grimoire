@@ -11,6 +11,7 @@ import {
   chooseCover,
   coverCandidates,
   coverReview,
+  coverSearchTerms,
   coverUrl,
   findCoverCandidates,
   goodMatches,
@@ -18,8 +19,9 @@ import {
   scanCoverReview,
   showColourPass,
   wantsColourCover,
+  withoutSeries,
 } from './books'
-import { ColourCoverPanel, candidateLabel, serially, settledText } from './ColourCovers'
+import { ColourCoverPanel, DifferentTitleForm, candidateLabel, serially, settledText } from './ColourCovers'
 
 type Call = { url: string; init?: RequestInit }
 let calls: Call[] = []
@@ -108,6 +110,16 @@ describe('the calls', () => {
     expect(calls.map((c) => c.init?.body ?? null)).toEqual([null, '{"refresh":false}', '{"refresh":true}'])
     expect(new Headers(calls[1].init?.headers).get(CSRF_HEADER)).toBe('1')
   })
+  it('a different-title search sends the terms (always a fresh lookup); never a URL', async () => {
+    mockFetch({ 'POST /api/books/b1/cover-candidates': () => json(200, { book: book(), looked_up_at: null, candidates: [], unavailable: false }) })
+    await findCoverCandidates('b1', false, { title: 'Soul Hunter', author: 'Aaron Dembski-Bowden' })
+    await findCoverCandidates('b1', true, { title: 'Soul Hunter' })
+    expect(calls.map((c) => JSON.parse(String(c.init?.body)))).toEqual([
+      { refresh: true, title: 'Soul Hunter', author: 'Aaron Dembski-Bowden' },
+      { refresh: true, title: 'Soul Hunter', author: '' },
+    ])
+    expect(calls.every((c) => c.url === '/api/books/b1/cover-candidates')).toBe(true)
+  })
   it('chooses a candidate by id or the embedded cover; a pass says unless_chosen', async () => {
     mockFetch({ 'POST /api/books/b1/cover': () => json(200, book({ cover_choice: 'color', has_color_cover: true })) })
     await chooseCover('b1', { candidate: 'c1' })
@@ -186,6 +198,23 @@ describe('the details panel', () => {
   it('a colour cover on a coverless book is removed, not reverted', () => {
     const html = renderToString(createElement(ColourCoverPanel, { book: book({ has_color_cover: true, cover_choice: 'color', has_embedded_cover: false }), onPatched: () => {} }))
     expect(html).toContain('Remove the colour cover')
+  })
+  it('the different-title form starts from the title without its series', () => {
+    const html = renderToString(
+      createElement(DifferentTitleForm, { book: book({ title: 'Red Tithe (Carcharodons Book 1)', author: 'Robbie MacNiven' }), busy: false, onSearch: () => {}, onCancel: () => {} }),
+    )
+    expect(html).toContain('value="Red Tithe"')
+    expect(html).toContain('value="Robbie MacNiven"')
+    expect(html).toContain('Author (optional)')
+  })
+  it('different-title terms: trimmed, the author optional, no title no search', () => {
+    expect(withoutSeries('Red Tithe (Carcharodons Book 1)')).toBe('Red Tithe')
+    expect(withoutSeries('Saturnine (The Horus Heresy: Siege of Terra Book 4) [Kindle]')).toBe('Saturnine')
+    expect(withoutSeries('Night Lords: The Omnibus')).toBe('Night Lords: The Omnibus')
+    expect(withoutSeries('(Untitled)')).toBe('(Untitled)')
+    expect(coverSearchTerms('  Soul Hunter ', ' ')).toEqual({ title: 'Soul Hunter' })
+    expect(coverSearchTerms('Soul Hunter', ' Aaron Dembski-Bowden')).toEqual({ title: 'Soul Hunter', author: 'Aaron Dembski-Bowden' })
+    expect(coverSearchTerms('  ', 'Someone')).toBeNull()
   })
   it('labels and settled states read plainly', () => {
     expect(candidateLabel(cand)).toBe('This edition · 330×500')
