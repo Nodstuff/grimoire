@@ -21,6 +21,13 @@ pub enum Class {
     ShareLink,
     /// new snapshots of one link (PATCH with a snapshot): 30 an hour
     ShareSnapshot,
+    /// the OPDS book feeds (`/opds/…`), per IP: browsing a library
+    Opds,
+    /// the same routes per device password (keyed on its hash): many
+    /// addresses hammering one ereader
+    OpdsDevice,
+    /// OPDS credential failures, per IP: guessing device passwords
+    OpdsAuth,
 }
 
 impl Class {
@@ -33,6 +40,10 @@ impl Class {
             Class::Share => (120.0, 0.5),
             Class::ShareLink => (300.0, 0.25),
             Class::ShareSnapshot => (30.0, 120.0),
+            // browsing is share-link-shaped; failures are login-shaped, halved
+            Class::Opds => (120.0, 0.5),
+            Class::OpdsDevice => (300.0, 0.25),
+            Class::OpdsAuth => (10.0, 6.0),
         }
     }
 }
