@@ -1,0 +1,558 @@
+//! Object storage for the EPUB library: hand-rolled AWS SigV4 presigning.
+//!
+//! Why hand-rolled: `aws-sdk-s3` is dozens of crates for what is here
+//! exactly three operations — presign a GET/HEAD, presign a PUT, and a
+//! streaming PUT. The daemon already vendors ring (HMAC) and sha2 (APNs
+//! signs its ES256 JWTs the same way), so SigV4 is a small module over
+//! those, with reqwest doing the talking.
+//!
+//! Configuration (`S3Config::from_env`, mirroring `push::ApnsArgs::config`):
+//! - `TAISCE_BOOKS_BUCKET` / `TAISCE_BOOKS_REGION`: the library's bucket
+//!   (region defaults to `us-east-1`). No bucket → `None`, and the whole
+//!   library surface 404s, like `shares::ServerSide` in LOCAL mode.
+//! - Credentials: explicit `TAISCE_BOOKS_ACCESS_KEY` /
+//!   `TAISCE_BOOKS_SECRET_KEY` (+ optional `TAISCE_BOOKS_SESSION_TOKEN`)
+//!   for dev, else the box's instance profile via IMDS, cached and
+//!   refreshed before it expires.
+//!
+//! Downloads 302 to presigned URLs (the box never holds the bytes); an
+//! ereader that opted into `stream_downloads` is proxied chunk-by-chunk
+//! instead — see `library::book_file`. Uploads are write-through: the
+//! request is answered only after the object is in the bucket.
+
+use sha2::Digest as _;
+use std::time::{Duration, SystemTime};
+
+/// Presigned URLs live this long: long enough for an ereader to follow a
+/// redirect, short enough that a leaked URL goes stale on its own.
+pub const PRESIGN_TTL: Duration = Duration::from_secs(300);
+
+const IMDS: &str = "http://169.254.169.254";
+/// Refresh instance-profile credentials when this close to their expiry.
+const IMDS_REFRESH_BEFORE: i64 = 600;
+
+/// The HTTP method a URL is signed for (the signature binds it; a HEAD
+/// download needs its own URL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    Get,
+    Head,
+    Put,
+}
+
+impl Method {
+    fn as_str(self) -> &'static str {
+        match self {
+            Method::Get => "GET",
+            Method::Head => "HEAD",
+            Method::Put => "PUT",
+        }
+    }
+}
+
+/// An access key plus its secret (and session token for temporary creds).
+/// Cloned out of the cache per signing; the secret never leaves the box.
+#[derive(Debug, Clone)]
+pub struct Credentials {
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: Option<String>,
+}
+
+struct CachedCredentials {
+    creds: Credentials,
+    /// unix seconds; refreshed once within `IMDS_REFRESH_BEFORE` of it
+    expires: i64,
+}
+
+enum Creds {
+    /// Explicit env credentials (dev): they don't expire.
+    Fixed(Credentials),
+    /// Instance-profile credentials: refreshed from IMDS before expiry.
+    Imds(std::sync::Mutex<Option<CachedCredentials>>),
+}
+
+/// The resolved bucket configuration: where, and how to sign for it.
+pub struct S3Config {
+    pub bucket: String,
+    pub region: String,
+    creds: Creds,
+    http: reqwest::Client,
+}
+
+fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+impl S3Config {
+    /// The library's object storage from the environment. `None` when no
+    /// bucket is configured (LOCAL mode, or a server without one) — every
+    /// library route then answers 404. An unreadable configuration (half
+    /// the env creds, no instance profile) is an error the caller logs,
+    /// like APNs.
+    pub async fn from_env() -> anyhow::Result<Option<S3Config>> {
+        let Some(bucket) = env_non_empty("TAISCE_BOOKS_BUCKET") else {
+            return Ok(None);
+        };
+        let region = env_non_empty("TAISCE_BOOKS_REGION").unwrap_or_else(|| "us-east-1".into());
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            // no total timeout: book bodies stream at the reader's pace,
+            // and a 100 MB EPUB upload must not be cut by a wall-clock cap
+            .user_agent(concat!("taisce/", env!("CARGO_PKG_VERSION"), " (library)"))
+            .build()?;
+        let creds = match (
+            env_non_empty("TAISCE_BOOKS_ACCESS_KEY"),
+            env_non_empty("TAISCE_BOOKS_SECRET_KEY"),
+        ) {
+            (Some(access_key), Some(secret_key)) => Creds::Fixed(Credentials {
+                access_key,
+                secret_key,
+                session_token: env_non_empty("TAISCE_BOOKS_SESSION_TOKEN"),
+            }),
+            (None, None) => {
+                // fetched now so a box with no profile fails loudly at boot
+                let cached = fetch_imds_credentials().await?;
+                Creds::Imds(std::sync::Mutex::new(Some(cached)))
+            }
+            _ => anyhow::bail!(
+                "TAISCE_BOOKS_ACCESS_KEY and TAISCE_BOOKS_SECRET_KEY must be set together"
+            ),
+        };
+        Ok(Some(S3Config {
+            bucket,
+            region,
+            creds,
+            http,
+        }))
+    }
+
+    /// The S3 HTTP client (no total timeout: book bodies stream at the
+    /// reader's pace). `library`'s stream-through downloads talk to
+    /// presigned URLs through it.
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// The current credentials, refreshing the instance-profile cache when
+    /// it is near expiry. A failed refresh is a hard error: signing with
+    /// stale creds would mint URLs that only fail later, at the ereader.
+    async fn credentials(&self) -> anyhow::Result<Credentials> {
+        match &self.creds {
+            Creds::Fixed(c) => Ok(c.clone()),
+            Creds::Imds(cache) => {
+                let now = crate::auth::now();
+                {
+                    let g = cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(c) = g.as_ref()
+                        && c.expires > now + IMDS_REFRESH_BEFORE
+                    {
+                        return Ok(c.creds.clone());
+                    }
+                }
+                let fresh = fetch_imds_credentials().await?;
+                let creds = fresh.creds.clone();
+                *cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fresh);
+                Ok(creds)
+            }
+        }
+    }
+
+    /// A presigned GET or HEAD URL for `key`, optionally with S3's
+    /// `response-content-disposition` override (how the ereader's download
+    /// gets its derived filename on a redirect).
+    pub async fn presign_get(
+        &self,
+        key: &str,
+        method: Method,
+        response_content_disposition: Option<&str>,
+        ttl: Duration,
+    ) -> anyhow::Result<String> {
+        debug_assert!(method != Method::Put);
+        let creds = self.credentials().await?;
+        Ok(presign(
+            &creds,
+            &self.bucket,
+            &self.region,
+            method,
+            key,
+            response_content_disposition,
+            ttl,
+            SystemTime::now(),
+        ))
+    }
+
+    /// A presigned PUT URL for `key`.
+    pub async fn presign_put(&self, key: &str, ttl: Duration) -> anyhow::Result<String> {
+        let creds = self.credentials().await?;
+        Ok(presign(
+            &creds,
+            &self.bucket,
+            &self.region,
+            Method::Put,
+            key,
+            None,
+            ttl,
+            SystemTime::now(),
+        ))
+    }
+
+    /// PUT an in-memory body (a cover: a few MB at most, capped at
+    /// ingest). Errors carry S3's own message (its XML names the reason).
+    pub async fn put_bytes(
+        &self,
+        key: &str,
+        body: &[u8],
+        content_type: &str,
+    ) -> anyhow::Result<()> {
+        let url = self.presign_put(key, PRESIGN_TTL).await?;
+        let res = self
+            .http
+            .put(url)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .header(reqwest::header::CONTENT_LENGTH, body.len())
+            .body(body.to_vec())
+            .send()
+            .await?;
+        put_result(res, key).await
+    }
+
+    /// PUT a file, streaming it: a 100 MB EPUB must never sit whole in
+    /// memory (the box has 1 GB and other work to do). `Content-Length`
+    /// comes from the file's metadata — S3 refuses a chunked presigned
+    /// PUT, and the spool doesn't change under us.
+    pub async fn put_file(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        content_type: &str,
+    ) -> anyhow::Result<()> {
+        let file = tokio::fs::File::open(path).await?;
+        let len = file.metadata().await?.len();
+        let url = self.presign_put(key, PRESIGN_TTL).await?;
+        let res = self
+            .http
+            .put(url)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .header(reqwest::header::CONTENT_LENGTH, len)
+            .body(reqwest::Body::from(file))
+            .send()
+            .await?;
+        put_result(res, key).await
+    }
+}
+
+async fn put_result(res: reqwest::Response, key: &str) -> anyhow::Result<()> {
+    if res.status().is_success() {
+        return Ok(());
+    }
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    let excerpt: String = body.chars().take(300).collect();
+    anyhow::bail!("S3 PUT {key}: {status} {excerpt}")
+}
+
+/// Instance-profile credentials from IMDS (v2, falling back to v1 on
+/// boxes without the token endpoint). The metadata address gets tiny
+/// timeouts and no proxy: it is loopback-only, and a proxying setup must
+/// fail fast rather than leak signing creds off-box.
+async fn fetch_imds_credentials() -> anyhow::Result<CachedCredentials> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(3))
+        .user_agent(concat!("taisce/", env!("CARGO_PKG_VERSION"), " (imds)"))
+        .build()?;
+    let token = client
+        .put(format!("{IMDS}/latest/api/token"))
+        .header("x-aws-ec2-metadata-token-ttl-seconds", "21600")
+        .send()
+        .await
+        .ok()
+        .filter(|r| r.status().is_success());
+    let token = match token {
+        Some(r) => Some(r.text().await.unwrap_or_default()),
+        None => None,
+    };
+    let get = |path: String| {
+        let req = client.get(format!("{IMDS}{path}"));
+        match &token {
+            Some(t) => req.header("x-aws-ec2-metadata-token", t.clone()),
+            None => req,
+        }
+    };
+    let role = get("/latest/meta-data/iam/security-credentials".into())
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let role = role
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("IMDS: this box has no instance profile"))?;
+    let doc = get(format!("/latest/meta-data/iam/security-credentials/{role}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let v: serde_json::Value = serde_json::from_str(&doc)?;
+    let field = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+    };
+    let access_key = field("AccessKeyId").ok_or_else(|| anyhow::anyhow!("IMDS: no AccessKeyId"))?;
+    let secret_key =
+        field("SecretAccessKey").ok_or_else(|| anyhow::anyhow!("IMDS: no SecretAccessKey"))?;
+    let session_token = field("Token");
+    let expires = field("Expiration")
+        .and_then(|e| chrono::DateTime::parse_from_rfc3339(&e).ok())
+        .map(|d| d.timestamp())
+        // an instance profile without an expiry: re-read it within the hour
+        .unwrap_or_else(|| crate::auth::now() + 3600);
+    Ok(CachedCredentials {
+        creds: Credentials {
+            access_key,
+            secret_key,
+            session_token,
+        },
+        expires,
+    })
+}
+
+// ---- the signing itself (pure: the clock is a parameter, so tests pin it) ----
+
+/// AWS's URI encode: unreserved `[A-Za-z0-9-._~]` pass through, everything
+/// else becomes `%XX` uppercase; `/` is kept in paths, encoded in values.
+fn uri_encode(s: &str, encode_slash: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'_' | b'.' | b'~')
+            || (b == b'/' && !encode_slash)
+        {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The canonical query: names and values encoded, sorted by (name, value),
+/// joined with `&`.
+fn canonical_query(params: Vec<(&str, String)>) -> String {
+    let mut encoded: Vec<(String, String)> = params
+        .into_iter()
+        .map(|(k, v)| (uri_encode(k, true), uri_encode(&v, true)))
+        .collect();
+    encoded.sort();
+    encoded
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    let tag = ring::hmac::sign(&key, data);
+    tag.as_ref().try_into().expect("HMAC-SHA256 is 32 bytes")
+}
+
+/// `kSigning`, the date/region/service derivation chain.
+fn signing_key(secret: &str, date: &str, region: &str) -> [u8; 32] {
+    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, b"s3");
+    hmac_sha256(&k_service, b"aws4_request")
+}
+
+/// One presigned URL. Virtual-hosted–style bucket addressing on the
+/// regional endpoint; only `host` is signed (a presigned URL's other
+/// headers are the caller's business), the payload is UNSIGNED-PAYLOAD.
+#[allow(clippy::too_many_arguments)]
+fn presign(
+    creds: &Credentials,
+    bucket: &str,
+    region: &str,
+    method: Method,
+    key: &str,
+    response_content_disposition: Option<&str>,
+    ttl: Duration,
+    now: SystemTime,
+) -> String {
+    let host = format!("{bucket}.s3.{region}.amazonaws.com");
+    let t: chrono::DateTime<chrono::Utc> = now.into();
+    let amz_date = t.format("%Y%m%dT%H%M%SZ").to_string();
+    let date = t.format("%Y%m%d").to_string();
+    let scope = format!("{date}/{region}/s3/aws4_request");
+    let mut params = vec![
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
+        ("X-Amz-Credential", format!("{}/{scope}", creds.access_key)),
+        ("X-Amz-Date", amz_date.clone()),
+        ("X-Amz-Expires", ttl.as_secs().to_string()),
+        ("X-Amz-SignedHeaders", "host".to_string()),
+    ];
+    if let Some(token) = &creds.session_token {
+        params.push(("X-Amz-Security-Token", token.clone()));
+    }
+    if let Some(d) = response_content_disposition {
+        params.push(("response-content-disposition", d.to_string()));
+    }
+    let query = canonical_query(params);
+    let uri = format!("/{}", uri_encode(key, false));
+    let canonical_request = format!(
+        "{}\n{}\n{}\nhost:{}\n\nhost\nUNSIGNED-PAYLOAD",
+        method.as_str(),
+        uri,
+        query,
+        host
+    );
+    let request_hash = hex::encode(sha2::Sha256::digest(canonical_request.as_bytes()));
+    let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{request_hash}");
+    let signature = hex::encode(hmac_sha256(
+        &signing_key(&creds.secret_key, &date, region),
+        string_to_sign.as_bytes(),
+    ));
+    format!("https://{host}{uri}?{query}&X-Amz-Signature={signature}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn docs_creds() -> Credentials {
+        Credentials {
+            access_key: "AKIAIOSFODNN7EXAMPLE".into(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+            session_token: None,
+        }
+    }
+
+    /// AWS's own documented SigV4 presigned-URL example ("GET Object",
+    /// docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html):
+    /// bucket examplebucket, key test.txt, 24 h from 2013-05-24T00:00:00Z.
+    /// The whole URL — canonical query, string to sign and signature — must
+    /// match byte for byte.
+    #[test]
+    fn aws_documented_presigned_get_object() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1369353600);
+        let url = presign(
+            &docs_creds(),
+            "examplebucket",
+            "us-east-1",
+            Method::Get,
+            "test.txt",
+            None,
+            Duration::from_secs(86400),
+            now,
+        );
+        assert_eq!(
+            url,
+            "https://examplebucket.s3.amazonaws.com/test.txt?\
+X-Amz-Algorithm=AWS4-HMAC-SHA256&\
+X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&\
+X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&\
+X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+        );
+    }
+
+    #[test]
+    fn uri_encode_keeps_unreserved_and_encodes_the_rest() {
+        assert_eq!(
+            uri_encode("library/u-1/Book (1).epub", false),
+            "library/u-1/Book%20%281%29.epub"
+        );
+        assert_eq!(uri_encode("a/b", true), "a%2Fb");
+        assert_eq!(uri_encode("~tömü_", true), "~t%C3%B6m%C3%BC_");
+    }
+
+    /// The canonical query sorts by encoded name: a session token lands
+    /// before SignedHeaders ("Se" < "Si"), the lowercase response-override
+    /// after every X-Amz-*.
+    #[test]
+    fn canonical_query_sorts_by_encoded_name() {
+        let q = canonical_query(vec![
+            ("response-content-disposition".into(), "attachment".into()),
+            ("X-Amz-SignedHeaders".into(), "host".into()),
+            ("X-Amz-Security-Token".into(), "tok en".into()),
+            ("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()),
+        ]);
+        assert_eq!(
+            q,
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Security-Token=tok%20en&X-Amz-SignedHeaders=host&response-content-disposition=attachment"
+        );
+    }
+
+    /// A session token is signed into the URL; a disposition changes the
+    /// signature (it is part of what S3 is asked to do).
+    #[test]
+    fn session_tokens_and_dispositions_are_signed() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1369353600);
+        let plain = presign(
+            &docs_creds(),
+            "b",
+            "us-east-1",
+            Method::Get,
+            "k",
+            None,
+            PRESIGN_TTL,
+            now,
+        );
+        let with_token = presign(
+            &Credentials {
+                session_token: Some("tok".into()),
+                ..docs_creds()
+            },
+            "b",
+            "us-east-1",
+            Method::Get,
+            "k",
+            None,
+            PRESIGN_TTL,
+            now,
+        );
+        assert!(with_token.contains("X-Amz-Security-Token=tok"));
+        assert_ne!(plain, with_token, "the token is part of the signature");
+        let with_disp = presign(
+            &docs_creds(),
+            "b",
+            "us-east-1",
+            Method::Get,
+            "k",
+            Some("attachment; filename=\"a.epub\""),
+            PRESIGN_TTL,
+            now,
+        );
+        assert!(
+            with_disp
+                .contains("response-content-disposition=attachment%3B%20filename%3D%22a.epub%22")
+        );
+        assert_ne!(plain, with_disp);
+        // HEAD signs its own method: GET and HEAD URLs differ
+        let head = presign(
+            &docs_creds(),
+            "b",
+            "us-east-1",
+            Method::Head,
+            "k",
+            None,
+            PRESIGN_TTL,
+            now,
+        );
+        assert_ne!(plain, head);
+    }
+}

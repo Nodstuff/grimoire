@@ -8,7 +8,8 @@ license.workspace = true
 taisce-store = { path = "../store" }
 rusqlite.workspace = true
 rmcp = { version = "3.2", features = ["server", "transport-streamable-http-server"] }
-axum = "0.8"
+# multipart: the EPUB library's upload (library.rs)
+axum = { version = "0.8", features = ["multipart"] }
 tower-http = { version = "0.6", features = ["fs", "limit"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "time"] }
 uuid.workspace = true
@@ -19,7 +20,9 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 chrono = "0.4"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "http2"] }
+# stream: the library streams EPUB bodies (spool → S3 PUT, S3 → ereader)
+# instead of ever holding one whole in memory (s3sign.rs, library.rs)
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "http2", "stream"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 # APNs provider JWTs (ES256); already in the tree under rustls
 ring = "0.17.14"
@@ -47,6 +50,11 @@ unicode-normalization = "0.1.25"
 # share links: strip format (Cf) and line/paragraph separators from names
 unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 model2vec-rs = { version = "0.2.1", default-features = false, features = ["onig", "local-only"] }
+# the EPUB library reads zips in place (never extracts); EPUBs are stored
+# or deflated, nothing else
+zip = { version = "4", default-features = false, features = ["deflate"] }
+# OPF / container.xml parsing at ingest (library.rs)
+quick-xml = "0.41"
 
 [build-dependencies]
 

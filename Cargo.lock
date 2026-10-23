@@ -5034,6 +5034,7 @@ dependencies = [
  "model2vec-rs",
  "openssl",
  "pulldown-cmark",
+ "quick-xml",
  "regex",
  "reqwest",
  "ring",
@@ -5059,6 +5060,7 @@ dependencies = [
  "uuid",
  "webauthn-authenticator-rs",
  "webauthn-rs",
+ "zip",
 ]
 
 [[package]]
