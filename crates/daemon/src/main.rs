@@ -29,6 +29,7 @@ mod memory;
 mod nav;
 mod opds;
 mod push;
+mod reader;
 mod retrieval;
 mod s3sign;
 mod sentdocs;
@@ -1069,6 +1070,7 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                     None
                 }
             };
+            let reader_state = reader::ReaderState { store: store.clone(), s3: s3.clone(), server_mode, local_human: tom };
             let library_state = library::LibraryState {
                 store: store.clone(),
                 s3,
@@ -1104,6 +1106,7 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                 .merge(push::router(push::DevicesState { store: store.clone(), default_env }))
                 .merge(shares::router(shares_state))
                 .merge(library::router(library_state))
+                .merge(reader::router(reader_state))
                 .merge(opds::router(opds_state))
                 .merge(kosync::router(kosync_state))
                 .merge(sentdocs::router(sentdocs::SentState { store: store.clone(), server_mode, local_human: tom }))

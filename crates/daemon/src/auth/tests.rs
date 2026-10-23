@@ -1649,6 +1649,15 @@ async fn server_mode_ui_responses_carry_the_security_headers() {
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.headers.get(header::CONTENT_SECURITY_POLICY).unwrap(), web::UI_CSP);
     assert!(web::UI_CSP.contains("frame-ancestors 'none'") && web::UI_CSP.contains("script-src 'self';"));
+    // the web reader's one exception: book sections in blob: frames, with
+    // their stylesheets and fonts as blob: URLs; nothing else may frame or run
+    let directive = |name: &str| {
+        web::UI_CSP.split(';').map(str::trim).find(|d| d.starts_with(&format!("{name} "))).unwrap_or_else(|| panic!("no {name}"))
+    };
+    assert_eq!(directive("frame-src"), "frame-src blob:");
+    assert_eq!(directive("script-src"), "script-src 'self'", "a book's scripts never run");
+    assert!(directive("style-src").ends_with(" blob:") && directive("font-src").ends_with(" blob:"));
+    assert!(!web::UI_CSP.contains("child-src") && !web::UI_CSP.contains("worker-src"), "no workers");
     assert_eq!(r.headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
     assert_eq!(r.headers.get(header::REFERRER_POLICY).unwrap(), "same-origin");
     assert_eq!(r.headers.get("x-content-type-options").unwrap(), "nosniff");

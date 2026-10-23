@@ -321,10 +321,17 @@ pub fn revoke_session(store: &mut taisce_store::SqliteStore, key: &str, now: i64
 /// The web UI's Content-Security-Policy (SERVER mode). The built UI loads
 /// only its own hashed module scripts and stylesheet; mermaid and the editor
 /// set inline `style` attributes; doc images may be remote or data/blob URLs;
-/// every fetch is same-origin. No eval, no wasm, no workers, no frames.
-pub const UI_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self'; object-src 'none'; \
-base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+/// every fetch is same-origin. No eval, no wasm, no workers.
+///
+/// One kind of frame: the web reader (foliate-js) shows each section of a
+/// book in an iframe whose document is a `blob:` URL, built from the EPUB in
+/// the page, and that document inherits this policy. So `frame-src blob:`
+/// (the only frames allowed), and `blob:` in `style-src` and `font-src` for
+/// the book's own stylesheets and fonts, which foliate also serves as blob
+/// URLs. `script-src` stays `'self'`: a book's scripts never run.
+pub const UI_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' blob:; \
+img-src 'self' data: blob: https:; font-src 'self' data: blob:; connect-src 'self'; frame-src blob:; \
+object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// SERVER mode only (LOCAL keeps today's headers): a CSP, framing refused,
 /// no referrer beyond this origin, no MIME sniffing. A response that set its

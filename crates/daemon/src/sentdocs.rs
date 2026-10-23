@@ -303,7 +303,7 @@ pub(crate) fn render_failed(e: anyhow::Error) -> Response {
 // ---- owner routes ----
 
 /// The person's own surface (their app, their web session, LOCAL mode).
-fn owner_gate(v: &Viewer, headers: &HeaderMap) -> Result<(), Response> {
+pub(crate) fn owner_gate(v: &Viewer, headers: &HeaderMap) -> Result<(), Response> {
     v.require_human_surface()?;
     if headers.contains_key(crate::mcp::PRINCIPAL_HEADER) {
         return Err(crate::viewer::forbidden("e-reader sending is done by a person, not an agent"));

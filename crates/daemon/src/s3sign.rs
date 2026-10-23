@@ -114,6 +114,56 @@ impl MemoryBucket {
     }
 }
 
+/// An object on its way to a client ([`S3Config::get_object`]): S3's
+/// status (200, 206 or 416), the length and range it named, the body.
+pub struct ObjectBody {
+    pub status: u16,
+    pub content_length: Option<String>,
+    pub content_range: Option<String>,
+    pub body: axum::body::Body,
+}
+
+#[cfg(test)]
+impl ObjectBody {
+    /// The stand-in bucket's answer, with S3's single-range semantics
+    /// (`bytes=a-b`, `bytes=a-`, `bytes=-n`); anything else is the whole
+    /// object, as S3 ignores a range it cannot parse.
+    fn from_memory(bytes: Vec<u8>, head: bool, range: Option<&str>) -> Self {
+        let len = bytes.len() as u64;
+        let parsed = range.and_then(|r| r.strip_prefix("bytes=")).and_then(|r| {
+            let (a, b) = r.split_once('-')?;
+            match (a.trim(), b.trim()) {
+                ("", n) => n.parse::<u64>().ok().map(|n| (len.saturating_sub(n), len.saturating_sub(1))),
+                (a, "") => a.parse::<u64>().ok().map(|a| (a, len.saturating_sub(1))),
+                (a, b) => Some((a.parse().ok()?, b.parse::<u64>().ok()?.min(len.saturating_sub(1)))),
+            }
+        });
+        match parsed {
+            Some((a, b)) if a >= len || a > b => ObjectBody {
+                status: 416,
+                content_length: None,
+                content_range: Some(format!("bytes */{len}")),
+                body: axum::body::Body::empty(),
+            },
+            Some((a, b)) => {
+                let slice = bytes[a as usize..=b as usize].to_vec();
+                ObjectBody {
+                    status: 206,
+                    content_length: Some(slice.len().to_string()),
+                    content_range: Some(format!("bytes {a}-{b}/{len}")),
+                    body: if head { axum::body::Body::empty() } else { slice.into() },
+                }
+            }
+            None => ObjectBody {
+                status: 200,
+                content_length: Some(len.to_string()),
+                content_range: None,
+                body: if head { axum::body::Body::empty() } else { bytes.into() },
+            },
+        }
+    }
+}
+
 fn env_non_empty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -381,6 +431,49 @@ impl S3Config {
             }
             file.flush().await?;
             Ok(true)
+        }
+    }
+
+    /// One object for a client, streamed through the daemon (the web
+    /// reader: a browser under `connect-src 'self'` cannot follow a 302 to
+    /// the bucket). `range` is the client's `Range` header, passed to S3 as
+    /// is (a presigned URL signs only `host`, so it rides unsigned); S3
+    /// answers 206 with `Content-Range`, or 416. `None` when there is no
+    /// such object. A HEAD asks S3 for a HEAD.
+    pub async fn get_object(&self, key: &str, head: bool, range: Option<&str>) -> anyhow::Result<Option<ObjectBody>> {
+        #[cfg(test)]
+        {
+            let got = self.memory.objects.lock().unwrap().get(key).cloned();
+            return Ok(got.map(|b| ObjectBody::from_memory(b, head, range)));
+        }
+        #[allow(unreachable_code)]
+        {
+            let m = if head { Method::Head } else { Method::Get };
+            let url = self.presign_get(key, m, None, PRESIGN_TTL).await?;
+            let req = if head { self.http.head(url) } else { self.http.get(url) };
+            let req = match range {
+                Some(r) => req.header(reqwest::header::RANGE, r),
+                None => req,
+            };
+            let res = req.send().await?;
+            let status = res.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            if !status.is_success() && status != reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                let body = res.text().await.unwrap_or_default();
+                let excerpt: String = body.chars().take(300).collect();
+                anyhow::bail!("S3 GET {key}: {status} {excerpt}");
+            }
+            let header = |h: reqwest::header::HeaderName| res.headers().get(h).and_then(|v| v.to_str().ok()).map(str::to_owned);
+            let content_length = header(reqwest::header::CONTENT_LENGTH);
+            let content_range = header(reqwest::header::CONTENT_RANGE);
+            let body = if head || status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                axum::body::Body::empty()
+            } else {
+                axum::body::Body::from_stream(res.bytes_stream())
+            };
+            Ok(Some(ObjectBody { status: status.as_u16(), content_length, content_range, body }))
         }
     }
 

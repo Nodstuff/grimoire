@@ -241,6 +241,10 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/docs/{id}/ereader", "sent_docs_are_the_taggers_alone"),
     ("/api/docs/{id}/epub-images", "sent_docs_are_the_taggers_alone"),
     ("/api/ereader/sent", "sent_docs_are_the_taggers_alone"),
+    // the web reader (reader.rs): the bytes and the kosync position
+    ("/api/books/{id}/file", "the_web_reader_reads_only_the_callers_books"),
+    ("/api/books/{id}/position", "the_web_reader_reads_only_the_callers_books"),
+    ("/api/docs/{id}/position", "web_reader_doc_positions_are_the_callers_alone"),
     ("/opds/docs", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
     ("/opds/doc/{id}/file", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
     ("/opds/{secret}/docs", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
@@ -503,6 +507,7 @@ fn fixture() -> Fx {
             }),
         }))
         .merge(crate::library::router(library.clone()))
+        .merge(crate::reader::router(crate::reader::ReaderState { store: store.clone(), s3: Some(s3.clone()), server_mode: true, local_human: a_human }))
         .merge(crate::opds::router(crate::opds::OpdsState {
             store: store.clone(),
             server: Some(crate::opds::OpdsServer { cfg: st.cfg.clone(), limiter: st.limiter.clone() }),
@@ -1318,6 +1323,7 @@ fn every_route_and_tool_is_covered() {
         include_str!("opds.rs"),
         include_str!("kosync.rs"),
         include_str!("sentdocs.rs"),
+        include_str!("reader.rs"),
     ];
     let re = regex::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
     let covered: std::collections::HashSet<&str> = COVERAGE.iter().map(|(p, _)| *p).collect();
@@ -3193,4 +3199,112 @@ async fn colour_covers_are_the_owners_alone() {
     assert!(out.contains(r#""cover_choice":"color""#), "{out}");
     let (_, out) = fx.b("GET", "/api/books", None).await;
     assert!(!out.contains(r#""cover_choice":"color""#), "{out}");
+}
+
+// ---- the web reader (reader.rs) ----
+
+#[tokio::test]
+async fn the_web_reader_reads_only_the_callers_books() {
+    let fx = fixture();
+    let a_key = format!("library/{}/zebrasecret.epub", fx.a);
+    let b_key = format!("library/{}/aoife.epub", fx.b);
+    fx.s3.memory.objects.lock().unwrap().insert(a_key, b"PK zebrasecret bytes".to_vec());
+    fx.s3.memory.objects.lock().unwrap().insert(b_key, b"PK aoifeown bytes".to_vec());
+
+    // the owner gets her bytes through the daemon (no redirect), ranged too
+    let (st, bytes, h) = bytes_call(&fx, "GET", &format!("/api/books/{}/file", fx.a_book), Some(&fx.a_app), &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(bytes, b"PK zebrasecret bytes");
+    assert_eq!(h["content-type"], "application/epub+zip");
+    assert!(h.get("location").is_none());
+    let (st, bytes, h) =
+        bytes_call(&fx, "GET", &format!("/api/books/{}/file", fx.a_book), Some(&fx.a_app), &[("range", "bytes=3-6".into())]).await;
+    assert_eq!((st, bytes.as_slice()), (StatusCode::PARTIAL_CONTENT, &b"zebr"[..]));
+    assert_eq!(h["content-range"], "bytes 3-6/20");
+
+    // B: A's book is the 404 of a book that never existed, on every route
+    for (m, sub, body) in [
+        ("GET", "file", None),
+        ("GET", "position", None),
+        ("PUT", "position", Some(json!({"progress": "/body/DocFragment[1]/body", "percentage": 0.9, "device_id": "b-web", "base": 0}))),
+    ] {
+        let got = fx.b(m, &format!("/api/books/{}/{sub}", fx.a_book), body.clone()).await;
+        let missing = fx.b(m, &format!("/api/books/{MISSING}/{sub}"), body).await;
+        assert_eq!((got.0, missing.0), (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND), "{m} {sub}: {}", got.1);
+        fx.no_leak_besides(&format!("{m} {sub}"), &got.1, &[fx.a_book]);
+        assert_eq!(got.1.replace(&fx.a_book.to_string(), "ID"), missing.1.replace(&MISSING.to_string(), "ID"));
+    }
+    // A's row is where the device left it
+    let digest = crate::booknaming::kosync_document_digest(A_BOOK_TITLE, A_BOOK_AUTHOR);
+    let row = fx.store.lock(Scope::User(fx.a)).kosync_get(fx.a, &digest).unwrap().unwrap();
+    assert_eq!((row.progress.as_str(), row.device.as_str()), ("/body/zebrasecret", "zebrasecret-device"));
+
+    // B's own book: her bytes, her (empty) position, then her write
+    let (st, bytes, _) = bytes_call(&fx, "GET", &format!("/api/books/{}/file", fx.b_book), Some(&fx.b_app), &[]).await;
+    assert_eq!((st, bytes.as_slice()), (StatusCode::OK, &b"PK aoifeown bytes"[..]));
+    let (st, out) = fx.b("GET", &format!("/api/books/{}/position", fx.b_book), None).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert!(serde_json::from_str::<Value>(&out).unwrap()["position"].is_null(), "{out}");
+    let put = json!({"progress": "/body/DocFragment[3]/body/p[2]/text()[1].5", "percentage": 0.25, "device_id": "b-web", "base": 0});
+    let (st, out) = fx.b("PUT", &format!("/api/books/{}/position", fx.b_book), Some(put)).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!((v["position"]["device"].as_str(), v["position"]["percentage"].as_f64()), (Some("Taisce web"), Some(0.25)));
+    // the same row the devices pull
+    let b_digest = crate::booknaming::kosync_document_digest("aoifeown book", "Aoife Author");
+    assert_eq!(v["document"], json!(b_digest));
+    assert!(fx.store.lock(Scope::User(fx.b)).kosync_get(fx.b, &b_digest).unwrap().is_some());
+
+    // A reads her own position: the device's row, as a device reads it
+    let (st, out) = fx.call(&fx.a_app, "GET", &format!("/api/books/{}/position", fx.a_book), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!((v["position"]["device"].as_str(), v["position"]["percentage"].as_f64()), (Some("zebrasecret-device"), Some(0.5)));
+    // and a write from a tab that never saw that row is refused with it
+    let stale = json!({"progress": "/body/DocFragment[1]/body", "percentage": 0.01, "device_id": "a-web", "base": 0});
+    let (st, out) = fx.call(&fx.a_app, "PUT", &format!("/api/books/{}/position", fx.a_book), Some(stale)).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{out}");
+    assert!(out.contains("zebrasecret-device"), "{out}");
+
+    // a connector token is not the person, even on her own book
+    for (m, path, body) in [
+        ("GET", format!("/api/books/{}/file", fx.b_book), None),
+        ("GET", format!("/api/books/{}/position", fx.b_book), None),
+        ("PUT", format!("/api/books/{}/position", fx.b_book), Some(json!({"progress": "x", "percentage": 0.5, "device_id": "c", "base": 0}))),
+    ] {
+        let (st, out) = fx.call(&fx.b_conn, m, &path, body).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{m} {path}: {out}");
+    }
+    // a PAT never opens /api
+    let (st, _) = fx.call(&fx.b_pat, "GET", &format!("/api/books/{}/position", fx.b_book), None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn web_reader_doc_positions_are_the_callers_alone() {
+    let fx = fixture();
+    let put = |p: &str| json!({"progress": p, "percentage": 0.4, "device_id": "web", "base": 0});
+    // B: A's private doc is the 404 of a missing doc
+    for (m, body) in [("GET", None), ("PUT", Some(put("/b")))] {
+        let got = fx.b(m, &format!("/api/docs/{}/position", fx.a_secret), body.clone()).await;
+        let missing = fx.b(m, &format!("/api/docs/{MISSING}/position"), body).await;
+        same_as_missing(&fx, &format!("{m} doc position"), got, missing);
+    }
+    // A shared doc both can see: each person's position is their own row
+    let doc = fx.shared_doc;
+    let (st, out) = fx.call(&fx.a_app, "PUT", &format!("/api/docs/{doc}/position"), Some(put("/a-place"))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let (st, out) = fx.b("GET", &format!("/api/docs/{doc}/position"), None).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert!(serde_json::from_str::<Value>(&out).unwrap()["position"].is_null(), "A's place is not B's: {out}");
+    let (st, _) = fx.b("PUT", &format!("/api/docs/{doc}/position"), Some(put("/b-place"))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, out) = fx.call(&fx.a_app, "GET", &format!("/api/docs/{doc}/position"), None).await;
+    assert!(out.contains("/a-place") && !out.contains("/b-place"), "{out}");
+    // the key is the name a device saves the doc under
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["document"], json!(crate::booknaming::md5_hex(b"Taisce - Family plan.epub")));
+    // a connector is refused
+    let (st, _) = fx.call(&fx.b_conn, "GET", &format!("/api/docs/{doc}/position"), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
 }
