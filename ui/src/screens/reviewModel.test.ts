@@ -135,9 +135,10 @@ describe('sentences and captions', () => {
       pre: 'set status ',
       strong: 'none → draft',
     })
-    expect(sentenceOf(row('1', 'A', 'a', 'parked', { op: 'delete_doc', title: 'Development' }))).toEqual({
+    // the doc's current title wins over the one captured at propose time
+    expect(sentenceOf(row('1', 'A', 'a', 'parked', { op: 'delete_doc', title: 'Old title' }))).toEqual({
       pre: 'wants to move ',
-      strong: 'Development',
+      strong: 'T-A',
       post: ' to Trash',
     })
   })

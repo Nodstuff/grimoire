@@ -355,9 +355,8 @@
     margin-left: 0;
     flex-basis: 100%;
   }
-  .rv-gh-acts {
-    margin-left: 0;
-    flex-basis: 100%;
+  .rv-gh {
+    padding: 12px 14px 12px 18px;
   }
   .rv-item.sel {
     box-shadow: none;

@@ -319,10 +319,11 @@ export default function ReviewQueue({
             {s.pre}
             {s.strong && <b>{s.strong}</b>}
             {s.post}
-            {showDocName && (
+            {showDocName && k.op !== 'delete_doc' && (
+              // block ops say where; doc ops already say "this doc", so name it
               <>
-                {' '}
-                in <b>{r.doc_title}</b>
+                {isDocOp(k.op) ? ' · ' : ' in '}
+                <b>{r.doc_title}</b>
               </>
             )}
           </span>
@@ -686,9 +687,18 @@ function DiffSide({ label, parts }: { label: string; parts: DiffPart[] }) {
     <div className="rv-dside">
       <div className="rv-lab">{label}</div>
       <p>
-        {parts.map((p, i) =>
-          p.kind === 'del' ? <del key={i}>{p.text}</del> : p.kind === 'ins' ? <ins key={i}>{p.text}</ins> : <Fragment key={i}>{p.text}</Fragment>,
-        )}
+        {parts.map((p, i) => {
+          if (p.kind === 'same') return <Fragment key={i}>{p.text}</Fragment>
+          // whitespace at a change's edges stays outside the mark
+          const [, lead, core, tail] = /^(\s*)([\s\S]*?)(\s*)$/.exec(p.text) ?? ['', '', p.text, '']
+          return (
+            <Fragment key={i}>
+              {lead}
+              {p.kind === 'del' ? <del>{core}</del> : <ins>{core}</ins>}
+              {tail}
+            </Fragment>
+          )
+        })}
       </p>
     </div>
   )

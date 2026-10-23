@@ -177,7 +177,8 @@ export function sentenceOf(r: QueueRow): { pre: string; strong?: string; post?: 
       return { pre: parked ? 'wants to set status ' : 'set status ', strong: `${from} → ${to}` }
     }
     case 'delete_doc':
-      return { pre: 'wants to move ', strong: str(k.title) || r.doc_title, post: ' to Trash' }
+      // the doc's title now (a later rename wins over the one captured at propose time)
+      return { pre: 'wants to move ', strong: r.doc_title || str(k.title) || 'this doc', post: ' to Trash' }
     default:
       return { pre: `${parked ? 'proposes' : 'made'} a ${k.op} change` }
   }
