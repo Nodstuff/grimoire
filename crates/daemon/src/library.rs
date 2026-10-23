@@ -516,6 +516,7 @@ async fn upload_books(
 // ---- the ingest pipeline ----
 
 /// What `inspect_spool` learned about one spooled EPUB.
+#[derive(Debug)]
 struct Inspected {
     sha256: String,
     size: u64,
@@ -608,14 +609,17 @@ fn decide(
     // derived name is what every OPDS client saves the download as (and
     // kosync keys on it): two books may never share one, and we never
     // auto-rename, because the rename would desync both devices.
-    let base = crate::booknaming::derived_base(title, author);
+    // Compared case-insensitively: e-readers save to FAT, where "Dune.epub"
+    // and "dune.epub" are one file.
+    let name = crate::booknaming::derived_book_filename(title, author);
+    let key = name.to_lowercase();
     let mut page = BookPage::default();
     loop {
         let books = s.book_list(user, &page, 500, None)?;
         for b in &books {
-            if crate::booknaming::derived_base(&b.title, &b.author) == base {
+            if crate::booknaming::derived_book_filename(&b.title, &b.author).to_lowercase() == key {
                 return Ok(Decision::Clash(format!(
-                    "would be saved as \"{base}.epub\", the same name as \"{}\" by {} already on the shelf — rename one of them first",
+                    "would be saved as \"{name}\", the same name as \"{}\" by {} already on the shelf — rename one of them first",
                     b.title, b.author
                 )));
             }
@@ -703,9 +707,12 @@ async fn add_book(
 
 /// Rules (b)/(c): the same book, new bytes. The object is replaced at the
 /// SAME key (bucket versioning keeps the previous one for the 30-day
-/// undo) and the row's metadata follows the new file — including the hash
-/// and size (`book_replace_file`), so a later re-upload of these same
-/// bytes dedups by rule (a) instead of matching (b)/(c) forever.
+/// undo) and the row follows the new FILE only — hash, size, original
+/// filename, cover (`book_replace_file`), so a later re-upload of these
+/// same bytes dedups by rule (a). Title, author and series never change
+/// here: they are the person's (a PATCH may have edited them), and they
+/// derive the filename the devices saved and the kosync key, which a
+/// re-upload must not move.
 async fn update_book(
     st: &LibraryState,
     s3: &Arc<S3Config>,
@@ -742,15 +749,7 @@ async fn update_book(
     let size = inspected.size as i64;
     let original_filename = filename.to_string();
     let written = with_store(&st.store, Scope::User(user), move |s| -> taisce_store::Result<Book> {
-        let b = s.book_update_metadata(
-            existing.id,
-            &inspected.title,
-            &inspected.author,
-            inspected.series.as_deref(),
-            inspected.series_index,
-            now,
-        )?;
-        let b = s.book_replace_file(b.id, &sha, size, &original_filename, now)?;
+        let b = s.book_replace_file(existing.id, &sha, size, &original_filename, now)?;
         // a re-upload with no embedded cover keeps the old one; a cover
         // under a new extension orphans the old object (lifecycle sweeps)
         let b = match &cover_key {
@@ -1249,10 +1248,8 @@ pub async fn book_file(
         Ok(b) => b,
         Err(r) => return r,
     };
-    // the derived name is ASCII by construction (booknaming normalizes to
-    // the clients' shared charset), so it embeds in a header safely
     let filename = crate::booknaming::derived_book_filename(&book.title, &book.author);
-    let disposition = format!("attachment; filename=\"{filename}\"");
+    let disposition = content_disposition(&filename);
     if ereader.stream_downloads {
         stream_object(
             &s3,
@@ -1265,6 +1262,25 @@ pub async fn book_file(
     } else {
         redirect_object(&s3, &book.file_s3_key, method, Some(disposition)).await
     }
+}
+
+/// `attachment` with the derived name (RFC 6266): an ASCII `filename`
+/// fallback (anything else → `_`; the name never holds a quote or
+/// backslash, booknaming replaced them) plus the exact UTF-8 name in
+/// `filename*`. Every byte is visible ASCII, so it is always a valid header.
+fn content_disposition(filename: &str) -> String {
+    let ascii: String = filename
+        .chars()
+        .map(|c| if c.is_ascii() && !c.is_ascii_control() { c } else { '_' })
+        .collect();
+    let mut enc = String::with_capacity(filename.len() * 3);
+    for b in filename.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => enc.push(b as char),
+            b => enc.push_str(&format!("%{b:02X}")),
+        }
+    }
+    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{enc}")
 }
 
 /// A cover download: same transport choice, no disposition, and a plain
@@ -1701,6 +1717,151 @@ mod tests {
         assert_eq!(parse_cursor(Some("")).unwrap(), None);
         assert!(parse_cursor(Some("junk")).is_err());
         assert!(parse_cursor(Some("12:not-a-uuid")).is_err());
+    }
+
+    /// A SERVER-mode library on the in-memory bucket, with one signed-in
+    /// person, plus a request builder that looks like require_auth ran.
+    struct TestLib {
+        app: Router,
+        store: SharedStore,
+        s3: Arc<S3Config>,
+        user: Uuid,
+        human: Uuid,
+        _dir: tempfile::TempDir,
+    }
+
+    fn test_lib() -> TestLib {
+        use taisce_store::{BlockStore, PrincipalKind};
+        let mut raw = SqliteStore::open_in_memory().unwrap();
+        let human = raw.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let user = raw.auth_ensure_owner(human, "Tom", 1).unwrap().id;
+        let store = SharedStore::new(raw);
+        let dir = tempfile::tempdir().unwrap();
+        let s3 = Arc::new(S3Config::for_test());
+        let app = router(LibraryState {
+            store: store.clone(),
+            s3: Some(s3.clone()),
+            server_mode: true,
+            local_human: human,
+            spool_dir: dir.path().join("spool"),
+        });
+        TestLib { app, store, s3, user, human, _dir: dir }
+    }
+
+    impl TestLib {
+        async fn send(&self, method: &str, uri: &str, content_type: Option<&str>, body: Vec<u8>) -> (StatusCode, Value) {
+            use tower::ServiceExt as _;
+            let mut b = axum::http::Request::builder().method(method).uri(uri).extension(crate::auth::Authenticated {
+                user_id: self.user,
+                grant_id: Uuid::now_v7(),
+                client_id: "test".into(),
+                principal: "claude:test".into(),
+                owner_app: true,
+                human: self.human,
+                instance_owner: true,
+                web_session: false,
+            });
+            if let Some(ct) = content_type {
+                b = b.header("content-type", ct);
+            }
+            let res = self.app.clone().oneshot(b.body(axum::body::Body::from(body)).unwrap()).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 24).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        }
+
+        async fn upload(&self, files: &[(&str, Vec<u8>)]) -> Value {
+            let boundary = "testboundary42";
+            let mut body = Vec::new();
+            for (name, bytes) in files {
+                body.extend_from_slice(
+                    format!("--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{name}\"\r\nContent-Type: application/epub+zip\r\n\r\n").as_bytes(),
+                );
+                body.extend_from_slice(bytes);
+                body.extend_from_slice(b"\r\n");
+            }
+            body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+            let (st, v) = self.send("POST", "/api/books", Some(&format!("multipart/form-data; boundary={boundary}")), body).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            v
+        }
+    }
+
+    fn epub_of(title: &str, author: &str, identifier: &str, series: &str, extra: &str, cover: bool) -> Vec<u8> {
+        let manifest = if cover { r#"<item id="c" href="cover.jpg" media-type="image/jpeg" properties="cover-image"/>"# } else { "" };
+        let opf = format!(
+            r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{title}</dc:title><dc:creator>{author}</dc:creator><dc:identifier id="id">{identifier}</dc:identifier><meta name="calibre:series" content="{series}"/><meta name="x" content="{extra}"/></metadata><manifest>{manifest}</manifest></package>"#
+        );
+        let mut entries: Vec<(&str, &[u8])> = vec![("META-INF/container.xml", ROOT_CONTAINER.as_bytes()), ("content.opf", opf.as_bytes())];
+        if cover {
+            entries.push(("cover.jpg", b"\xff\xd8\xffjpeg"));
+        }
+        build_epub(&entries)
+    }
+
+    /// An updated upload changes the FILE only: a title the person edited
+    /// survives a re-upload that still carries the old one (the edited
+    /// title is what the devices named their copy after).
+    #[tokio::test]
+    async fn an_updated_upload_never_touches_title_author_or_series() {
+        let t = test_lib();
+        let v = t.upload(&[("dune.epub", epub_of("Dune", "Frank Herbert", "urn:isbn:1", "Dune Chronicles", "v1", false))]).await;
+        assert_eq!(v["results"][0]["status"], "added", "{v}");
+        let id = v["results"][0]["book"]["id"].as_str().unwrap().to_string();
+        let (st, b) = t
+            .send("PATCH", &format!("/api/books/{id}"), Some("application/json"), br#"{"title":"Dune (my edit)","author":"F. Herbert","series":"Mine"}"#.to_vec())
+            .await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        // new bytes, same identifier, the OLD metadata inside
+        let v = t.upload(&[("dune-v2.epub", epub_of("Dune", "Frank Herbert", "urn:isbn:1", "Dune Chronicles", "v2", true))]).await;
+        assert_eq!(v["results"][0]["status"], "updated", "{v}");
+        let b = t.store.lock(Scope::User(t.user)).book_get(Uuid::parse_str(&id).unwrap()).unwrap();
+        assert_eq!((b.title.as_str(), b.author.as_str(), b.series.as_deref()), ("Dune (my edit)", "F. Herbert", Some("Mine")));
+        assert_eq!(b.original_filename, "dune-v2.epub", "the file did move");
+        assert!(b.cover_s3_key.is_some(), "and its new cover");
+        assert_eq!(t.s3.memory.keys().len(), 2, "epub + cover: {:?}", t.s3.memory.keys());
+    }
+
+    #[test]
+    fn disposition_carries_an_ascii_fallback_and_the_exact_utf8_name() {
+        assert_eq!(
+            content_disposition("Frank Herbert - Dune_ Messiah.epub"),
+            "attachment; filename=\"Frank Herbert - Dune_ Messiah.epub\"; filename*=UTF-8''Frank%20Herbert%20-%20Dune_%20Messiah.epub"
+        );
+        let d = content_disposition("Seán Ó Faoláin - Stories.epub");
+        assert!(d.starts_with("attachment; filename=\"Se_n _ Faol_in - Stories.epub\"; "), "{d}");
+        assert!(d.ends_with("filename*=UTF-8''Se%C3%A1n%20%C3%93%20Faol%C3%A1in%20-%20Stories.epub"), "{d}");
+        assert!(HeaderValue::from_str(&d).is_ok(), "always a valid header");
+    }
+
+    /// FAT is case-insensitive: two books whose derived names differ only in
+    /// case would overwrite each other on the device. SQLite's NOCASE (rule
+    /// (c)) folds ASCII only, so "Éire"/"ÉIRE" reaches the clash check.
+    #[test]
+    fn the_clash_check_compares_derived_names_case_insensitively() {
+        use taisce_store::{BlockStore, PrincipalKind};
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let user = s.auth_ensure_owner(p, "Tom", 1).unwrap().id;
+        s.with_scope_for_test(Scope::User(user), |s| {
+            let nb = NewBook {
+                title: "Éire: A History".into(),
+                author: "Ann".into(),
+                series: None,
+                series_index: None,
+                book_identifier: None,
+                original_filename: "x.epub".into(),
+                file_sha256: "sha".into(),
+                size: 1,
+                file_s3_key: "k".into(),
+                cover_s3_key: None,
+            };
+            s.book_insert(Uuid::now_v7(), &nb, 10).unwrap();
+            assert!(matches!(decide(s, user, "other", None, "ÉIRE_ A HISTORY", "ann").unwrap(), Decision::Clash(_)));
+            // ':' and '_' derive the same name too
+            assert!(matches!(decide(s, user, "other", None, "Éire_ A History", "Ann").unwrap(), Decision::Clash(_)));
+            assert!(matches!(decide(s, user, "other", None, "Éire: A Future", "Ann").unwrap(), Decision::Add));
+        });
     }
 
     #[test]

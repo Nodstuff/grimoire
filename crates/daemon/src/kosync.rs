@@ -15,7 +15,7 @@
 //! - `POST /kosync/users/create {username, password}` — the official server
 //!   CREATES accounts here; ours exist only when a person mints an ereader
 //!   at `/api/ereaders` (the feed agent's surface). So this VALIDATES the
-//!   pair against `ereader_find_kosync` like a login: 200 `{"username"}`
+//!   pair against `ereader_find_kosync` like a login: 201 `{"username"}`
 //!   when it resolves (CrossPoint's "Sign Up" treats any 2xx as success,
 //!   so an existing device password signs up cleanly; a KOReader user
 //!   simply uses Login), else the protocol's 401. No account is ever
@@ -34,7 +34,8 @@
 //!   handled by CrossPoint but reads as fatal in KOReader).
 //!
 //! Device auth: `x-auth-key` is the client-computed MD5 of the device
-//! password; the mint stored SHA-256 of it in `ereader.kosync_key_hash`.
+//! password exactly as typed; the mint stored SHA-256 of it for both ways a
+//! person types it (`kosync_key_hash` dashed as shown, `_alt` undashed).
 //! We SHA-256 the presented key (`auth::hash_secret`) and resolve
 //! pre-auth in `Scope::System` — the hash IS the credential, same pattern
 //! as `auth::authenticate`. The row's `user_id` scopes every progress
@@ -70,7 +71,7 @@ use crate::viewer::Viewer;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{Extensions, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -97,12 +98,17 @@ const PAGE: usize = 100;
 const CURRENTLY_READING_SCAN: usize = 500;
 const CURRENTLY_READING_LIMIT: usize = 20;
 
-/// SERVER mode's half of the state: presence alone. The device routes need
-/// `auth_users` rows to name in `x-auth-user` and the /api routes need a
-/// signed-in user to key a shelf to; LOCAL mode has neither, so every
-/// route answers 404.
+/// SERVER mode's half of the state. The device routes need `auth_users`
+/// rows to name in `x-auth-user` and the /api routes need a signed-in user
+/// to key a shelf to; LOCAL mode has neither, so every route answers 404.
+/// `cfg` finds the client address behind the proxy, `limiter` is the
+/// server's one limiter: a failed device sign-in spends the same strict
+/// per-IP bucket as a failed OPDS one (`Class::OpdsAuth`).
 #[derive(Clone)]
-pub struct ServerSide;
+pub struct ServerSide {
+    pub cfg: std::sync::Arc<crate::auth::AuthConfig>,
+    pub limiter: crate::auth::ratelimit::Limiter,
+}
 
 #[derive(Clone)]
 pub struct KosyncState {
@@ -181,10 +187,10 @@ pub(crate) fn status(percentage: f64) -> &'static str {
 /// pre-auth in `Scope::System` (the hash is the credential — same pattern
 /// as `auth::authenticate`). Its `user_id` is who the progress queries run
 /// for.
-async fn device(st: &KosyncState, headers: &HeaderMap) -> Result<Ereader, Response> {
-    if st.server.is_none() {
+async fn device(st: &KosyncState, headers: &HeaderMap, ext: &Extensions) -> Result<Ereader, Response> {
+    let Some(server) = &st.server else {
         return Err(not_found());
-    }
+    };
     let header = |name: &str| {
         headers
             .get(name)
@@ -194,7 +200,7 @@ async fn device(st: &KosyncState, headers: &HeaderMap) -> Result<Ereader, Respon
             .map(str::to_string)
     };
     let (Some(username), Some(key)) = (header("x-auth-user"), header("x-auth-key")) else {
-        return Err(unauthorized());
+        return Err(auth_failed(server, headers, ext));
     };
     let key_hash = hash_secret(&key);
     match with_store(&st.store, Scope::System, move |s| {
@@ -203,9 +209,20 @@ async fn device(st: &KosyncState, headers: &HeaderMap) -> Result<Ereader, Respon
     .await
     {
         Ok(Some(e)) => Ok(e),
-        Ok(None) => Err(unauthorized()),
+        Ok(None) => Err(auth_failed(server, headers, ext)),
         Err(e) => Err(fail(e)),
     }
+}
+
+/// A failed device sign-in: the protocol's 401, or 429 once this address
+/// has spent the strict per-IP failure bucket (shared with OPDS).
+fn auth_failed(server: &ServerSide, headers: &HeaderMap, ext: &Extensions) -> Response {
+    let ip = crate::shares::ip_key(&crate::auth::client_ip(&server.cfg, headers, ext));
+    tracing::warn!(target: crate::auth::AUDIT, event = "kosync.auth_failed", ip = %ip);
+    if !server.limiter.allow(crate::auth::ratelimit::Class::OpdsAuth, &ip) {
+        return kosync_err(StatusCode::TOO_MANY_REQUESTS, 2001, "too many failed sign-ins; try again shortly");
+    }
+    unauthorized()
 }
 
 #[derive(Deserialize)]
@@ -218,11 +235,13 @@ struct CreateUserReq {
 /// are minted only at `/api/ereaders`; see the module docs).
 async fn create_user(
     State(st): State<KosyncState>,
+    headers: HeaderMap,
+    ext: Extensions,
     body: Result<Json<CreateUserReq>, JsonRejection>,
 ) -> Response {
-    if st.server.is_none() {
+    let Some(server) = &st.server else {
         return not_found();
-    }
+    };
     let req = match body {
         Ok(Json(r)) => r,
         Err(e) => return bad_request(e.body_text()),
@@ -243,16 +262,18 @@ async fn create_user(
     .await;
     match found {
         // the account exists (it was minted with the ereader): the device
-        // hears the protocol's success and never learns it created nothing
-        Ok(Some(_)) => Json(json!({"username": username})).into_response(),
-        Ok(None) => unauthorized(),
+        // hears the protocol's success — 201, the only status KOReader's
+        // register accepts (KOSyncClient.lua: `res.status == 201`) — and
+        // never learns it created nothing
+        Ok(Some(_)) => (StatusCode::CREATED, Json(json!({"username": username}))).into_response(),
+        Ok(None) => auth_failed(server, &headers, &ext),
         Err(e) => fail(e),
     }
 }
 
 /// `GET /kosync/users/auth` — the credential check every client runs first.
-async fn authorize(State(st): State<KosyncState>, headers: HeaderMap) -> Response {
-    match device(&st, &headers).await {
+async fn authorize(State(st): State<KosyncState>, headers: HeaderMap, ext: Extensions) -> Response {
+    match device(&st, &headers, &ext).await {
         Ok(_) => Json(json!({"authorized": "OK"})).into_response(),
         Err(r) => r,
     }
@@ -274,9 +295,10 @@ struct ProgressIn {
 async fn put_progress(
     State(st): State<KosyncState>,
     headers: HeaderMap,
+    ext: Extensions,
     body: Result<Json<ProgressIn>, JsonRejection>,
 ) -> Response {
-    let dev = match device(&st, &headers).await {
+    let dev = match device(&st, &headers, &ext).await {
         Ok(d) => d,
         Err(r) => return r,
     };
@@ -339,9 +361,10 @@ fn progress_doc(p: &KosyncProgress) -> Value {
 async fn get_progress(
     State(st): State<KosyncState>,
     headers: HeaderMap,
+    ext: Extensions,
     Path(document): Path<String>,
 ) -> Response {
-    let dev = match device(&st, &headers).await {
+    let dev = match device(&st, &headers, &ext).await {
         Ok(d) => d,
         Err(r) => return r,
     };
@@ -579,17 +602,24 @@ mod tests {
                 Uuid::now_v7(),
                 "kindle",
                 "sh1",
-                &hash_secret(DEVICE_KEY),
+                (&hash_secret(DEVICE_KEY), ""),
                 true,
                 10,
             )
             .unwrap();
         let st = KosyncState {
             store: store.clone(),
-            server: Some(ServerSide),
+            server: Some(test_server()),
             local_human: human,
         };
         (router(st), store, user, human)
+    }
+
+    fn test_server() -> ServerSide {
+        ServerSide {
+            cfg: std::sync::Arc::new(crate::auth::AuthConfig::from_public_url("http://localhost:7513").unwrap()),
+            limiter: Default::default(),
+        }
     }
 
     fn get_req(url: &str, headers: &[(&str, &str)]) -> Request<Body> {
@@ -713,7 +743,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.status(), StatusCode::CREATED, "KOReader's register accepts only 201");
         assert_eq!(body_json(res).await, json!({"username": "Tom"}));
         // a bad pair: the protocol's 401 (code 2001), no hint which half failed
         let res = app

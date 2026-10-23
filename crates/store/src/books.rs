@@ -74,6 +74,8 @@ pub struct Ereader {
     pub label: String,
     pub secret_hash: String,
     pub kosync_key_hash: String,
+    /// the KOSYNC key typed another way (the undashed password); '' = none
+    pub kosync_key_hash_alt: String,
     pub stream_downloads: bool,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
@@ -100,7 +102,7 @@ const BOOK_COLS: &str = "id, user_id, title, author, series, series_index, book_
     original_filename, file_sha256, size, file_s3_key, cover_s3_key, added_at, updated_at, deleted_at";
 
 const EREADER_COLS: &str = "e.id, e.user_id, e.label, e.secret_hash, e.kosync_key_hash,
-    e.stream_downloads, e.created_at, e.last_used_at, e.revoked_at";
+    e.stream_downloads, e.created_at, e.last_used_at, e.revoked_at, e.kosync_key_hash_alt";
 
 const KOSYNC_COLS: &str = "user_id, document, progress, percentage, device, device_id, updated_at";
 
@@ -140,6 +142,7 @@ fn ereader_row(r: &Row) -> rusqlite::Result<Ereader> {
         created_at: r.get(6)?,
         last_used_at: r.get(7)?,
         revoked_at: r.get(8)?,
+        kosync_key_hash_alt: r.get(9)?,
     })
 }
 
@@ -377,22 +380,23 @@ impl SqliteStore {
 
     // ---- ereaders ----
 
-    /// Pair a new ereader for the caller. `secret_hash`/`kosync_key_hash`
-    /// are computed by the daemon; the store never sees the secrets.
+    /// Pair a new ereader for the caller. `secret_hash` and the two
+    /// `kosync_key_hashes` (primary, alt) are computed by the daemon; the
+    /// store never sees the secrets.
     pub fn ereader_insert(
         &mut self,
         id: Uuid,
         label: &str,
         secret_hash: &str,
-        kosync_key_hash: &str,
+        kosync_key_hashes: (&str, &str),
         stream_downloads: bool,
         now: i64,
     ) -> Result<Ereader> {
         let owner = self.library_owner()?;
         self.conn.execute(
-            "INSERT INTO ereader (id, user_id, label, secret_hash, kosync_key_hash, stream_downloads, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id.to_string(), owner.to_string(), label, secret_hash, kosync_key_hash, stream_downloads, now],
+            "INSERT INTO ereader (id, user_id, label, secret_hash, kosync_key_hash, kosync_key_hash_alt, stream_downloads, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id.to_string(), owner.to_string(), label, secret_hash, kosync_key_hashes.0, kosync_key_hashes.1, stream_downloads, now],
         )?;
         self.ereader_get(id)
     }
@@ -436,14 +440,14 @@ impl SqliteStore {
 
     /// Re-key one of the caller's live ereaders (a lost secret): both
     /// hashes change at once, so the old ones stop resolving immediately.
-    pub fn ereader_rotate(&mut self, id: Uuid, new_secret_hash: &str, new_kosync_key_hash: &str) -> Result<Ereader> {
+    pub fn ereader_rotate(&mut self, id: Uuid, new_secret_hash: &str, new_kosync_key_hashes: (&str, &str)) -> Result<Ereader> {
         let cur = self.ereader_get(id)?;
         if cur.revoked_at.is_some() {
             return Err(StoreError::InvalidOp("this ereader was revoked; pair a new one".into()));
         }
         self.conn.execute(
-            "UPDATE ereader SET secret_hash = ?2, kosync_key_hash = ?3 WHERE id = ?1",
-            params![id.to_string(), new_secret_hash, new_kosync_key_hash],
+            "UPDATE ereader SET secret_hash = ?2, kosync_key_hash = ?3, kosync_key_hash_alt = ?4 WHERE id = ?1",
+            params![id.to_string(), new_secret_hash, new_kosync_key_hashes.0, new_kosync_key_hashes.1],
         )?;
         self.ereader_get(id)
     }
@@ -476,7 +480,8 @@ impl SqliteStore {
     }
 
     /// The live ereader behind a KOSYNC login: the person's name (matched
-    /// case-insensitively, as auth finds users) plus the key's hash.
+    /// case-insensitively, as auth finds users) plus the key's hash, which
+    /// may match either stored form (dashed or undashed password).
     pub fn ereader_find_kosync(&self, username: &str, key_hash: &str) -> Result<Option<Ereader>> {
         self.deny_public()?;
         Ok(self
@@ -484,7 +489,7 @@ impl SqliteStore {
             .query_row(
                 &format!(
                     "SELECT {EREADER_COLS} FROM ereader e JOIN auth_users u ON u.id = e.user_id
-                     WHERE u.name = ?1 COLLATE NOCASE AND e.kosync_key_hash = ?2 AND e.revoked_at IS NULL"
+                     WHERE u.name = ?1 COLLATE NOCASE AND (e.kosync_key_hash = ?2 OR e.kosync_key_hash_alt = ?2) AND e.revoked_at IS NULL"
                 ),
                 params![username, key_hash],
                 ereader_row,
@@ -589,7 +594,7 @@ mod tests {
             let a = s.auth_ensure_owner(p, "Tom", 1).unwrap().id;
             let book = add_book(&mut s, a, &new_book("Dune", "Frank Herbert"), 10);
             let ereader = s.with_scope_for_test(Scope::User(a), |s| {
-                s.ereader_insert(Uuid::now_v7(), "kindle", "sh1", "kh1", true, 10).unwrap()
+                s.ereader_insert(Uuid::now_v7(), "kindle", "sh1", ("kh1", "kh1alt"), true, 10).unwrap()
             });
             s.with_scope_for_test(Scope::User(a), |s| {
                 s.kosync_upsert(a, "0123456789abcdef0123456789abcdef", "p", 0.5, "kindle", "k1", 20).unwrap()
@@ -714,7 +719,7 @@ mod tests {
         let (mut s, a, b) = store_with_users();
         let dune = add_book(&mut s, a, &new_book("Dune", "Frank Herbert"), 10);
         let kindle = s.with_scope_for_test(Scope::User(a), |s| {
-            s.ereader_insert(Uuid::now_v7(), "kindle", "sh1", "kh1", true, 10).unwrap()
+            s.ereader_insert(Uuid::now_v7(), "kindle", "sh1", ("kh1", "kh1alt"), true, 10).unwrap()
         });
 
         s.with_scope_for_test(Scope::User(b), |s| {
@@ -724,7 +729,7 @@ mod tests {
             assert!(matches!(s.book_soft_delete(dune.id, 20), Err(StoreError::NotFound(_))));
             assert!(matches!(s.book_set_cover(dune.id, "k", 20), Err(StoreError::NotFound(_))));
             assert!(matches!(s.ereader_get(kindle.id), Err(StoreError::NotFound(_))));
-            assert!(matches!(s.ereader_rotate(kindle.id, "x", "y"), Err(StoreError::NotFound(_))));
+            assert!(matches!(s.ereader_rotate(kindle.id, "x", ("y", "")), Err(StoreError::NotFound(_))));
             assert!(matches!(s.ereader_revoke(kindle.id, 20), Err(StoreError::NotFound(_))));
             assert!(!s.ereader_touch_last_used(kindle.id, 20).unwrap(), "a foreign touch writes nothing");
             assert!(s.ereader_list(a).is_err());
@@ -748,9 +753,9 @@ mod tests {
             assert!(s.book_find_by_sha256(a, "sha256:Dune").is_err());
             assert!(s.ereader_get(kindle.id).is_err());
             assert!(s.ereader_list(a).is_err());
-            assert!(s.ereader_insert(Uuid::now_v7(), "l", "s", "k", true, 1).is_err());
+            assert!(s.ereader_insert(Uuid::now_v7(), "l", "s", ("k", "kalt"), true, 1).is_err());
             assert!(s.ereader_touch_last_used(kindle.id, 1).is_err());
-            assert!(s.ereader_rotate(kindle.id, "x", "y").is_err());
+            assert!(s.ereader_rotate(kindle.id, "x", ("y", "")).is_err());
             assert!(s.ereader_revoke(kindle.id, 1).is_err());
             assert!(s.ereader_find_by_secret_hash("sh1").is_err());
             assert!(s.ereader_find_kosync("Tom", "kh1").is_err());
@@ -764,12 +769,12 @@ mod tests {
         let (mut s, a, _b) = store_with_users();
         let (id, kobo) = (Uuid::now_v7(), Uuid::now_v7());
         s.with_scope_for_test(Scope::User(a), |s| {
-            let e = s.ereader_insert(id, "kindle", "sh1", "kh1", true, 100).unwrap();
+            let e = s.ereader_insert(id, "kindle", "sh1", ("kh1", "kh1alt"), true, 100).unwrap();
             assert_eq!(
                 (e.user_id, e.label.as_str(), e.stream_downloads, e.created_at, e.last_used_at, e.revoked_at),
                 (a, "kindle", true, 100, None, None)
             );
-            let e2 = s.ereader_insert(kobo, "kobo", "sh2", "kh2", false, 110).unwrap();
+            let e2 = s.ereader_insert(kobo, "kobo", "sh2", ("kh2", "kh2alt"), false, 110).unwrap();
             assert!(!e2.stream_downloads);
             assert_eq!(s.ereader_list(a).unwrap().len(), 2);
 
@@ -784,7 +789,7 @@ mod tests {
             assert!(s.ereader_find_by_secret_hash("nope").unwrap().is_none());
 
             // rotation invalidates the old hashes at once
-            let e = s.ereader_rotate(id, "sh1b", "kh1b").unwrap();
+            let e = s.ereader_rotate(id, "sh1b", ("kh1b", "kh1balt")).unwrap();
             assert_eq!((e.secret_hash.as_str(), e.kosync_key_hash.as_str()), ("sh1b", "kh1b"));
             assert!(s.ereader_find_by_secret_hash("sh1").unwrap().is_none());
             assert_eq!(s.ereader_find_by_secret_hash("sh1b").unwrap().unwrap().id, id);
@@ -795,7 +800,7 @@ mod tests {
             s.ereader_revoke(id, 301).unwrap();
             assert_eq!(s.ereader_get(id).unwrap().revoked_at, Some(300));
             assert!(s.ereader_find_by_secret_hash("sh1b").unwrap().is_none());
-            assert!(matches!(s.ereader_rotate(id, "x", "y"), Err(StoreError::InvalidOp(_))));
+            assert!(matches!(s.ereader_rotate(id, "x", ("y", "")), Err(StoreError::InvalidOp(_))));
             assert!(!s.ereader_touch_last_used(id, 400).unwrap());
             assert_eq!(s.ereader_list(a).unwrap().len(), 2, "revoked rows stay listed");
         });
@@ -806,10 +811,12 @@ mod tests {
         let (mut s, a, _b) = store_with_users();
         let id = Uuid::now_v7();
         s.with_scope_for_test(Scope::User(a), |s| {
-            s.ereader_insert(id, "kindle", "sh1", "kh1", true, 100).unwrap();
+            s.ereader_insert(id, "kindle", "sh1", ("kh1", "kh1alt"), true, 100).unwrap();
             let e = s.ereader_find_kosync("tom", "kh1").unwrap().unwrap();
             assert_eq!((e.id, e.user_id), (id, a), "the name matches case-insensitively");
+            assert_eq!(s.ereader_find_kosync("tom", "kh1alt").unwrap().unwrap().id, id, "the alt form resolves too");
             assert!(s.ereader_find_kosync("tom", "wrong").unwrap().is_none());
+            assert!(s.ereader_find_kosync("tom", "").unwrap().is_none(), "an empty alt never matches");
             assert!(s.ereader_find_kosync("nobody", "kh1").unwrap().is_none());
             s.ereader_revoke(id, 200).unwrap();
             assert!(s.ereader_find_kosync("tom", "kh1").unwrap().is_none(), "revoked no longer resolves");

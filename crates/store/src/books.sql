@@ -44,8 +44,12 @@ CREATE TABLE IF NOT EXISTS ereader (
     label            TEXT NOT NULL,
     -- SHA-256 (hex) of the basic-auth password
     secret_hash      TEXT NOT NULL,
-    -- SHA-256 (hex) of the KOSYNC api key
+    -- SHA-256 (hex) of the KOSYNC api key: md5 of the password exactly as
+    -- the person types it on the device. The primary hash is the form the
+    -- UI shows (dashed, lowercase); the alt is the undashed form. '' never
+    -- matches (a presented key always hashes to 64 hex chars).
     kosync_key_hash  TEXT NOT NULL,
+    kosync_key_hash_alt TEXT NOT NULL DEFAULT '',
     -- 1: the daemon streams the file from object storage through itself;
     -- 0: it answers with a redirect to a presigned URL
     stream_downloads INTEGER NOT NULL DEFAULT 1,

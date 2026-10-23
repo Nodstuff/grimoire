@@ -181,6 +181,45 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/s/{token}/comments", "a_reader_cannot_sign_as_the_owner"),
     ("/s/{token}/comments", "public_comment_content_type_and_preview_images"),
     ("/api/shares/preview", "share_link_preview_stores_nothing_and_limits_hold"),
+    // the EPUB library (opds.rs, kosync.rs, library.rs; ADR 0006): shelves,
+    // devices and progress are the caller's alone; the device surfaces
+    // resolve one person's ereader and answer only her rows
+    ("/api/ereaders", "ereaders_are_the_pairers_alone"),
+    ("/api/ereaders/{id}/rotate", "ereaders_are_the_pairers_alone"),
+    ("/api/ereaders/{id}", "ereaders_are_the_pairers_alone"),
+    ("/api/books", "books_are_the_callers_alone"),
+    ("/api/books/{id}", "books_are_the_callers_alone"),
+    ("/api/books/{id}/cover", "books_are_the_callers_alone"),
+    ("/api/books/progress", "kosync_progress_is_the_callers_alone"),
+    ("/api/books/currently-reading", "kosync_progress_is_the_callers_alone"),
+    ("/kosync/users/create", "kosync_device_routes_serve_only_the_owner"),
+    ("/kosync/users/auth", "kosync_device_routes_serve_only_the_owner"),
+    ("/kosync/syncs/progress", "kosync_device_routes_serve_only_the_owner"),
+    ("/kosync/syncs/progress/{document}", "kosync_device_routes_serve_only_the_owner"),
+    ("/opds", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/opensearch.xml", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/new", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/all", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/authors", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/author/{name}", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/series", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/series/{name}", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/search", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/{secret}", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/{secret}/", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/{secret}/opensearch.xml", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/{secret}/new", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/{secret}/all", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/{secret}/authors", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/{secret}/author/{name}", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/{secret}/series", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/{secret}/series/{name}", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/{secret}/search", "the_opds_feed_serves_only_the_device_owners_books"),
+    ("/opds/book/{id}/file", "opds_downloads_serve_only_the_device_owners_books"),
+    ("/opds/book/{id}/cover", "opds_downloads_serve_only_the_device_owners_books"),
+    ("/opds/{secret}/book/{id}/file", "opds_downloads_serve_only_the_device_owners_books"),
+    ("/opds/{secret}/book/{id}/cover", "opds_downloads_serve_only_the_device_owners_books"),
 ];
 
 thread_local! {
@@ -220,7 +259,22 @@ struct Fx {
     cookie: bool,
     /// share-link comment alerts the notifier was handed (APNs stand-in)
     alerts: std::sync::Arc<std::sync::Mutex<Vec<crate::shares::CommentAlert>>>,
+    /// the EPUB library: A's book (title, series and progress carry
+    /// `zebrasecret`), A's and B's paired ereaders and their passwords
+    a_book: Uuid,
+    a_ereader: Uuid,
+    a_pw: String,
+    b_pw: String,
+    b_book: Uuid,
+    s3: std::sync::Arc<crate::s3sign::S3Config>,
 }
+
+/// A's book as the store holds it (and its kosync digest, which only the
+/// feed form of title/author derives).
+const A_BOOK_TITLE: &str = "zebrasecret tome";
+const A_BOOK_AUTHOR: &str = "Tom Author";
+const A_BOOK_SERIES: &str = "zebrasecret saga";
+const A_BOOK_ISBN: &str = "urn:isbn:zebrasecret";
 
 fn para(content: &str) -> (Uuid, OpInput) {
     let id = Uuid::now_v7();
@@ -315,6 +369,58 @@ fn fixture() -> Fx {
         s.share_workspace(family, b, Role::Viewer).unwrap();
         (a_work, family, secret.id, sb, comment, ann, loose.id, trash.id, fam.id, shb)
     };
+    let (a_book, a_ereader, a_pw) = {
+        let mut s = store.lock(Scope::User(a));
+        let book = s
+            .book_insert(
+                Uuid::now_v7(),
+                &taisce_store::books::NewBook {
+                    title: A_BOOK_TITLE.into(),
+                    author: A_BOOK_AUTHOR.into(),
+                    series: Some(A_BOOK_SERIES.into()),
+                    series_index: Some(1.0),
+                    book_identifier: Some(A_BOOK_ISBN.into()),
+                    original_filename: "zebrasecret.epub".into(),
+                    file_sha256: "zebrasecret-sha".into(),
+                    size: 1234,
+                    file_s3_key: format!("library/{a}/zebrasecret.epub"),
+                    cover_s3_key: Some(format!("library/{a}/zebrasecret.cover.jpg")),
+                },
+                now(),
+            )
+            .unwrap();
+        let pw = crate::opds::mint_device_secret();
+        let (h, k) = crate::opds::device_secret_hashes(&pw);
+        let e = s.ereader_insert(Uuid::now_v7(), "Tom zebrasecret Kobo", &h, (&k.0, &k.1), false, now()).unwrap();
+        let digest = crate::booknaming::kosync_document_digest(A_BOOK_TITLE, A_BOOK_AUTHOR);
+        s.kosync_upsert(a, &digest, "/body/zebrasecret", 0.5, "zebrasecret-device", "k1", now()).unwrap();
+        (book.id, e.id, pw)
+    };
+    let (b_pw, b_book) = {
+        let mut s = store.lock(Scope::User(b));
+        let book = s
+            .book_insert(
+                Uuid::now_v7(),
+                &taisce_store::books::NewBook {
+                    title: "aoifeown book".into(),
+                    author: "Aoife Author".into(),
+                    series: None,
+                    series_index: None,
+                    book_identifier: None,
+                    original_filename: "aoife.epub".into(),
+                    file_sha256: "aoife-sha".into(),
+                    size: 99,
+                    file_s3_key: format!("library/{b}/aoife.epub"),
+                    cover_s3_key: None,
+                },
+                now(),
+            )
+            .unwrap();
+        let pw = crate::opds::mint_device_secret();
+        let (h, k) = crate::opds::device_secret_hashes(&pw);
+        s.ereader_insert(Uuid::now_v7(), "Aoife Kindle", &h, (&k.0, &k.1), false, now()).unwrap();
+        (pw, book.id)
+    };
     let (b_work, b_doc) = {
         let mut s = store.lock(Scope::User(b));
         let b_work = s.create_workspace("Work", None, None, None).unwrap().id;
@@ -330,6 +436,14 @@ fn fixture() -> Fx {
     let hosts = vec![st.cfg.authority(), st.cfg.rp_id.clone()];
     let dedupe = crate::mcp::new_dedupe();
     let dir = std::env::temp_dir().join(format!("taisce-isolation-{}", Uuid::now_v7()));
+    let s3 = std::sync::Arc::new(crate::s3sign::S3Config::for_test());
+    let library = crate::library::LibraryState {
+        store: store.clone(),
+        s3: Some(s3.clone()),
+        server_mode: true,
+        local_human: a_human,
+        spool_dir: dir.join("book-spool"),
+    };
     let app = crate::mcp::router_with_hosts(store.clone(), agent, dedupe.clone(), None, Some(hosts))
         .merge(crate::api::router(crate::api::ApiState {
             changes: crate::changes::Feed::new(&store),
@@ -357,6 +471,18 @@ fn fixture() -> Fx {
                 }),
             }),
         }))
+        .merge(crate::library::router(library.clone()))
+        .merge(crate::opds::router(crate::opds::OpdsState {
+            store: store.clone(),
+            server: Some(crate::opds::OpdsServer { cfg: st.cfg.clone(), limiter: st.limiter.clone() }),
+            local_human: a_human,
+            library: library.clone(),
+        }))
+        .merge(crate::kosync::router(crate::kosync::KosyncState {
+            store: store.clone(),
+            server: Some(crate::kosync::ServerSide { cfg: st.cfg.clone(), limiter: st.limiter.clone() }),
+            local_human: a_human,
+        }))
         .layer(axum::middleware::from_fn_with_state(st, require_auth));
     Fx {
         app,
@@ -382,6 +508,12 @@ fn fixture() -> Fx {
         b_doc,
         cookie,
         alerts,
+        a_book,
+        a_ereader,
+        a_pw,
+        b_pw,
+        b_book,
+        s3,
     }
 }
 
@@ -1111,6 +1243,9 @@ fn every_route_and_tool_is_covered() {
         include_str!("auth/oauth.rs"),
         include_str!("auth/web.rs"),
         include_str!("shares.rs"),
+        include_str!("library.rs"),
+        include_str!("opds.rs"),
+        include_str!("kosync.rs"),
     ];
     let re = regex::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
     let covered: std::collections::HashSet<&str> = COVERAGE.iter().map(|(p, _)| *p).collect();
@@ -2295,4 +2430,262 @@ async fn public_comment_content_type_and_preview_images() {
     assert!(html.contains("<img src=\"data:image/svg+xml;base64,") && !html.contains("loading="), "{html}");
     let page = fx.raw(None, "GET", &link_path(&share), None).await;
     assert!(page.body.contains("loading=\"lazy\""), "the public page keeps lazy images");
+}
+
+// ---- the EPUB library (library.rs, opds.rs, kosync.rs) ----
+
+/// A device request: no bearer, only the headers a reader sends.
+async fn device_call(fx: &Fx, method: &str, path: &str, headers: &[(&str, String)], body: Option<Value>) -> (StatusCode, String, axum::http::HeaderMap) {
+    let mut b = Request::builder().method(method).uri(path).header("host", "localhost:7513");
+    for (k, v) in headers {
+        b = b.header(*k, v.as_str());
+    }
+    let body = match body {
+        Some(v) => {
+            b = b.header("content-type", "application/json");
+            Body::from(v.to_string())
+        }
+        None => Body::empty(),
+    };
+    let res = fx.app.clone().oneshot(b.body(body).unwrap()).await.unwrap();
+    let (status, headers) = (res.status(), res.headers().clone());
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned(), headers)
+}
+
+fn basic(user: &str, pw: &str) -> (&'static str, String) {
+    use base64::Engine as _;
+    ("authorization", format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pw}"))))
+}
+
+/// The KOSYNC headers a device sends: md5 of the password as typed.
+fn kosync_auth(user: &str, pw: &str) -> Vec<(&'static str, String)> {
+    vec![("x-auth-user", user.to_string()), ("x-auth-key", crate::booknaming::md5_hex(pw.as_bytes()))]
+}
+
+/// A minimal EPUB (container, OPF) for an upload.
+fn tiny_epub(title: &str, author: &str, identifier: &str) -> Vec<u8> {
+    use std::io::Write as _;
+    let container = r#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#;
+    let opf = format!(
+        r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{title}</dc:title><dc:creator>{author}</dc:creator><dc:identifier id="id">{identifier}</dc:identifier></metadata><manifest/></package>"#
+    );
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let o = zip::write::SimpleFileOptions::default();
+    w.start_file("META-INF/container.xml", o).unwrap();
+    w.write_all(container.as_bytes()).unwrap();
+    w.start_file("content.opf", o).unwrap();
+    w.write_all(opf.as_bytes()).unwrap();
+    w.finish().unwrap().into_inner()
+}
+
+/// POST /api/books (multipart, one `files` field) as `token`.
+async fn upload(fx: &Fx, token: &str, filename: &str, epub: Vec<u8>) -> (StatusCode, String) {
+    let boundary = "taisceboundary7";
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{filename}\"\r\nContent-Type: application/epub+zip\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(&epub);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let b = authed(Request::post("/api/books").header("host", "localhost:7513"), token, "POST")
+        .header("content-type", format!("multipart/form-data; boundary={boundary}"));
+    let res = fx.app.clone().oneshot(b.body(Body::from(body)).unwrap()).await.unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn ereaders_are_the_pairers_alone() {
+    let fx = fixture();
+    let (st, list) = fx.b("GET", "/api/ereaders", None).await;
+    assert_eq!(st, StatusCode::OK, "{list}");
+    fx.no_leak("/api/ereaders", &list);
+    assert!(list.contains("Aoife Kindle") && !list.contains(&fx.a_ereader.to_string()), "{list}");
+    // A's device by id: 404 exactly like a device that never existed
+    for (m, path) in [("POST", format!("/api/ereaders/{}/rotate", fx.a_ereader)), ("DELETE", format!("/api/ereaders/{}", fx.a_ereader))] {
+        let (st, out) = fx.b(m, &path, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{m} {path}: {out}");
+        fx.no_leak_besides(&path, &out, &[fx.a_ereader]);
+        let (st, _) = fx.b(m, &path.replace(&fx.a_ereader.to_string(), &MISSING.to_string()), None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+    // B's new device is hers: it reads her shelf, never A's
+    let (st, out) = fx.b("POST", "/api/ereaders", Some(json!({"label": "Aoife Kobo"}))).await;
+    assert_eq!(st, StatusCode::CREATED, "{out}");
+    let pw = serde_json::from_str::<Value>(&out).unwrap()["password"].as_str().unwrap().to_string();
+    let (st, feed, _) = device_call(&fx, "GET", "/opds/all", &[basic("Aoife", &pw)], None).await;
+    assert_eq!(st, StatusCode::OK);
+    fx.no_leak("B's new device's feed", &feed);
+    assert!(feed.contains("aoifeown book"));
+    // A's device still works after all that
+    let (st, _, _) = device_call(&fx, "GET", "/opds/", &[basic("Tom", &fx.a_pw)], None).await;
+    assert_eq!(st, StatusCode::OK);
+    // pairing is a person's: B's Claude (a connector) cannot
+    let (st, _) = fx.call(&fx.b_conn, "POST", "/api/ereaders", Some(json!({"label": "sneaky"}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn books_are_the_callers_alone() {
+    let fx = fixture();
+    for path in ["/api/books", "/api/books?search=zebrasecret", "/api/books?search=Tom%20Author"] {
+        let (st, out) = fx.b("GET", path, None).await;
+        assert_eq!(st, StatusCode::OK, "{path}: {out}");
+        fx.no_leak(path, &out);
+        assert!(!out.contains(&fx.a_book.to_string()), "{path}: {out}");
+    }
+    let id = fx.a_book;
+    for (m, path, body) in [
+        ("PATCH", format!("/api/books/{id}"), Some(json!({"title": "renamed by B"}))),
+        ("DELETE", format!("/api/books/{id}"), None),
+        ("GET", format!("/api/books/{id}/cover"), None),
+    ] {
+        let (st, out) = fx.b(m, &path, body.clone()).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{m} {path}: {out}");
+        fx.no_leak_besides(&path, &out, &[id]);
+        let (st, _) = fx.b(m, &path.replace(&id.to_string(), &MISSING.to_string()), body).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+    // B uploading A's exact book (same title, author, identifier) shelves
+    // HER copy: no dedup, update or clash against A's shelf
+    let (st, out) = upload(&fx, &fx.b_app, "zebra.epub", tiny_epub(A_BOOK_TITLE, A_BOOK_AUTHOR, A_BOOK_ISBN)).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["results"][0]["status"], "added", "{out}");
+    assert!(!out.contains(&id.to_string()), "{out}");
+    let key = format!("library/{}/", fx.b);
+    assert!(fx.s3.memory.keys().iter().all(|k| k.starts_with(&key)), "B's upload lands under B's prefix: {:?}", fx.s3.memory.keys());
+    // A's book is untouched, and A still reads it
+    let a = fx.store.lock(Scope::User(fx.a)).book_get(id).unwrap();
+    assert_eq!((a.title.as_str(), a.deleted_at), (A_BOOK_TITLE, None));
+    let (st, out) = fx.call(&fx.a_app, "GET", "/api/books", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(out.contains(&id.to_string()) && !out.contains("aoifeown"), "{out}");
+    let (st, _) = fx.call(&fx.a_app, "GET", &format!("/api/books/{id}/cover"), None).await;
+    assert_eq!(st, StatusCode::FOUND);
+}
+
+#[tokio::test]
+async fn kosync_progress_is_the_callers_alone() {
+    let fx = fixture();
+    let (st, out) = fx.b("GET", &format!("/api/books/progress?ids={},{}", fx.a_book, fx.b_book), None).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    fx.no_leak_besides("/api/books/progress", &out, &[fx.a_book]);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(v["progress"][fx.a_book.to_string()].is_null(), "{out}");
+    let (st, out) = fx.b("GET", "/api/books/currently-reading", None).await;
+    assert_eq!(st, StatusCode::OK);
+    fx.no_leak("/api/books/currently-reading", &out);
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["books"], json!([]));
+    // the owner sees hers
+    let (_, out) = fx.call(&fx.a_app, "GET", "/api/books/currently-reading", None).await;
+    assert!(out.contains(&fx.a_book.to_string()), "{out}");
+}
+
+#[tokio::test]
+async fn kosync_device_routes_serve_only_the_owner() {
+    let fx = fixture();
+    let digest = crate::booknaming::kosync_document_digest(A_BOOK_TITLE, A_BOOK_AUTHOR);
+    // B's key under A's name, and A's key under B's name: neither resolves
+    for (user, pw) in [("Tom", &fx.b_pw), ("Aoife", &fx.a_pw)] {
+        let (st, out, _) = device_call(&fx, "GET", "/kosync/users/auth", &kosync_auth(user, pw), None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{user}: {out}");
+        let (st, _, _) = device_call(&fx, "GET", &format!("/kosync/syncs/progress/{digest}"), &kosync_auth(user, pw), None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let key = crate::booknaming::md5_hex(pw.as_bytes());
+        let (st, _, _) = device_call(&fx, "POST", "/kosync/users/create", &[], Some(json!({"username": user, "password": key}))).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+    // B's own device on A's document: "no progress" (200 {}), exactly like a
+    // document nobody ever read
+    let b = kosync_auth("Aoife", &fx.b_pw);
+    let (st, out, _) = device_call(&fx, "GET", &format!("/kosync/syncs/progress/{digest}"), &b, None).await;
+    assert_eq!((st, out.as_str()), (StatusCode::OK, "{}"));
+    fx.no_leak("kosync pull", &out);
+    // B's push of the same document lands in her row, never A's
+    let (st, _, _) = device_call(
+        &fx,
+        "PUT",
+        "/kosync/syncs/progress",
+        &b,
+        Some(json!({"document": digest, "progress": "/b", "percentage": 0.9, "device": "aoife", "device_id": "a1"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let a_row = fx.store.lock(Scope::User(fx.a)).kosync_get(fx.a, &digest).unwrap().unwrap();
+    assert_eq!((a_row.progress.as_str(), a_row.percentage), ("/body/zebrasecret", 0.5));
+    // A's device reads A's row
+    let (st, out, _) = device_call(&fx, "GET", &format!("/kosync/syncs/progress/{digest}"), &kosync_auth("tom", &fx.a_pw), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(out.contains("/body/zebrasecret"), "{out}");
+}
+
+#[tokio::test]
+async fn the_opds_feed_serves_only_the_device_owners_books() {
+    let fx = fixture();
+    let feeds = [
+        "/",
+        "",
+        "/opensearch.xml",
+        "/new",
+        "/all",
+        "/authors",
+        "/author/Tom%20Author",
+        "/series",
+        "/series/zebrasecret%20saga",
+        "/search?q=zebrasecret",
+        "/search?q=Tom",
+    ];
+    for f in feeds {
+        // basic auth, then the path form
+        for (path, headers) in [(format!("/opds{f}"), vec![basic("Aoife", &fx.b_pw)]), (format!("/opds/{}{f}", fx.b_pw), vec![])] {
+            let (st, out, _) = device_call(&fx, "GET", &path, &headers, None).await;
+            assert_eq!(st, StatusCode::OK, "{path}: {out}");
+            // a named feed echoes the name B asked for in its title; what
+            // must never appear is an entry of A's
+            let asked = ["Tom Author", "zebrasecret saga", "zebrasecret"]
+                .into_iter()
+                .find(|n| f.contains(&n.replace(' ', "%20")) && f.contains('/') && f != "/");
+            let scrubbed = match asked {
+                Some(n) if f.contains("author/") || f.contains("series/") || f.starts_with("/search") => out.replace(n, "").replace(&n.replace(' ', "%20"), "").replace(&n.to_lowercase().replace(' ', "%20"), ""),
+                _ => out.clone(),
+            };
+            fx.no_leak(&path, &scrubbed);
+            assert!(!out.contains(&fx.a_book.to_string()) && !scrubbed.contains("Tom Author"), "{path}: {out}");
+            if asked.is_some() {
+                assert!(!out.contains("<entry>"), "{path}: {out}");
+            }
+        }
+    }
+    // B's password under A's name is no credential at all
+    let (st, _, _) = device_call(&fx, "GET", "/opds/all", &[basic("Tom", &fx.b_pw)], None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    // A's device does see A's book (the test is not vacuous)
+    let (st, out, _) = device_call(&fx, "GET", "/opds/all", &[basic("Tom", &fx.a_pw)], None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(out.contains(&fx.a_book.to_string()), "{out}");
+}
+
+#[tokio::test]
+async fn opds_downloads_serve_only_the_device_owners_books() {
+    let fx = fixture();
+    for kind in ["file", "cover"] {
+        for (path, headers) in [
+            (format!("/opds/book/{}/{kind}", fx.a_book), vec![basic("Aoife", &fx.b_pw)]),
+            (format!("/opds/{}/book/{}/{kind}", fx.b_pw, fx.a_book), vec![]),
+        ] {
+            for method in ["GET", "HEAD"] {
+                let (st, out, h) = device_call(&fx, method, &path, &headers, None).await;
+                assert_eq!(st, StatusCode::NOT_FOUND, "{method} {path}: {out}");
+                assert!(h.get("location").is_none());
+                fx.no_leak_besides(&path, &out, &[fx.a_book]);
+            }
+        }
+        // A's device gets the presigned redirect for A's book
+        let (st, _, h) = device_call(&fx, "GET", &format!("/opds/book/{}/{kind}", fx.a_book), &[basic("Tom", &fx.a_pw)], None).await;
+        assert_eq!(st, StatusCode::FOUND, "{kind}");
+        assert!(h["location"].to_str().unwrap().contains(&format!("library/{}/", fx.a)));
+    }
 }

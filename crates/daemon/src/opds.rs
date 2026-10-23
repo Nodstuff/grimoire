@@ -163,13 +163,18 @@ fn undash(s: &str) -> String {
     s.trim().chars().filter(|c| *c != '-').collect::<String>().to_ascii_lowercase()
 }
 
-/// The two stored hashes for a device password: SHA-256 of the password
-/// itself (the OPDS/basic-auth credential), and SHA-256 of the KOSYNC
-/// userkey a device derives from it — md5(password) as lowercase hex, as
-/// KOReader computes it — so one password serves both protocols.
-pub(crate) fn device_secret_hashes(secret: &str) -> (String, String) {
-    let s = undash(secret);
-    (hash_secret(&s), hash_secret(&crate::booknaming::md5_hex(s.as_bytes())))
+/// The stored hashes for a freshly minted device password (its displayed,
+/// dashed lowercase form): SHA-256 of the canonical (undashed) password —
+/// the OPDS/basic-auth credential, which [`undash`] normalizes on every
+/// request — and the KOSYNC userkeys a device derives from it. A device
+/// sends md5(password EXACTLY as typed) and we never see the password, so
+/// both ways a person plausibly types it are stored: the dashed form the UI
+/// shows (primary) and the undashed one (alt).
+pub(crate) fn device_secret_hashes(secret: &str) -> (String, (String, String)) {
+    let shown = secret.trim().to_ascii_lowercase();
+    let raw = undash(secret);
+    let key = |p: &str| hash_secret(&crate::booknaming::md5_hex(p.as_bytes()));
+    (hash_secret(&raw), (key(&shown), key(&raw)))
 }
 
 /// Is this path segment a presented device password (the minted shape, with
@@ -271,9 +276,9 @@ async fn create_ereader(State(st): State<OpdsState>, v: Viewer, headers: HeaderM
         Err(r) => return r,
     };
     let secret = mint_device_secret();
-    let (secret_hash, kosync_key_hash) = device_secret_hashes(&secret);
+    let (secret_hash, kosync) = device_secret_hashes(&secret);
     let (id, stream) = (Uuid::now_v7(), req.stream_downloads.unwrap_or(false));
-    match with_store(&st.store, v.scope, move |s| s.ereader_insert(id, &label, &secret_hash, &kosync_key_hash, stream, now())).await {
+    match with_store(&st.store, v.scope, move |s| s.ereader_insert(id, &label, &secret_hash, (&kosync.0, &kosync.1), stream, now())).await {
         Ok(e) => {
             tracing::info!(target: crate::auth::AUDIT, event = "ereader.pair", ereader = %e.id, label = %e.label.as_str(), user = ?v.user);
             (StatusCode::CREATED, Json(json!({"ereader": ereader_json(&e), "password": secret}))).into_response()
@@ -287,8 +292,8 @@ async fn rotate_ereader(State(st): State<OpdsState>, v: Viewer, headers: HeaderM
         return r;
     }
     let secret = mint_device_secret();
-    let (secret_hash, kosync_key_hash) = device_secret_hashes(&secret);
-    match with_store(&st.store, v.scope, move |s| s.ereader_rotate(id, &secret_hash, &kosync_key_hash)).await {
+    let (secret_hash, kosync) = device_secret_hashes(&secret);
+    match with_store(&st.store, v.scope, move |s| s.ereader_rotate(id, &secret_hash, (&kosync.0, &kosync.1))).await {
         Ok(e) => {
             tracing::info!(target: crate::auth::AUDIT, event = "ereader.rotate", ereader = %e.id, user = ?v.user);
             Json(json!({"password": secret})).into_response()
@@ -482,6 +487,12 @@ fn fmt_series_index(i: f64) -> String {
 /// and file links keep that form so its credentials carry over to the
 /// download routes.
 pub(crate) fn book_entry_xml(book: &Book, link_prefix: &str) -> String {
+    // the title/author the devices name the download from: booknaming's
+    // feed form, so both clients derive exactly `derived_book_filename`
+    // (the kosync key). `<author>` is always present, an empty `<name>` for
+    // a book without one: KOReader turns a MISSING author into "Unknown
+    // Author" and would name the file after that.
+    let (title, author) = crate::booknaming::feed_title(&book.title, &book.author);
     let mut x = format!(
         "<entry>\n\
          <id>urn:uuid:{}</id>\n\
@@ -490,8 +501,8 @@ pub(crate) fn book_entry_xml(book: &Book, link_prefix: &str) -> String {
          <updated>{}</updated>\n\
          <published>{}</published>\n",
         book.id,
-        esc(&book.title),
-        esc(&book.author),
+        esc(&title),
+        esc(&author),
         rfc3339(book.updated_at),
         rfc3339(book.added_at),
     );
@@ -967,13 +978,98 @@ mod tests {
     }
 
     #[test]
-    fn hashes_ignore_display_dashes_and_case() {
-        let (h1, k1) = device_secret_hashes("k7mq-4xpt-9wre-hz2c");
-        let (h2, k2) = device_secret_hashes("K7MQ4XPT9WREHZ2C ");
-        assert_eq!((h1.as_str(), k1.as_str()), (h2.as_str(), k2.as_str()));
-        assert!(h1.len() == 64 && h1.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
-        assert_eq!(k1.len(), 64);
-        assert_ne!(h1, k1, "the kosync key hash is sha256 of md5(secret), not of the secret");
+    fn hashes_cover_both_typed_forms_of_the_kosync_key() {
+        let (h, (dashed, raw)) = device_secret_hashes("k7mq-4xpt-9wre-hz2c");
+        assert_eq!(h, hash_secret("k7mq4xpt9wrehz2c"), "basic auth keys on the canonical form");
+        // the device sends md5(password as typed): both typings resolve
+        assert_eq!(dashed, hash_secret(&crate::booknaming::md5_hex(b"k7mq-4xpt-9wre-hz2c")));
+        assert_eq!(raw, hash_secret(&crate::booknaming::md5_hex(b"k7mq4xpt9wrehz2c")));
+        assert_ne!(dashed, raw);
+        assert!(h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+    }
+
+    /// The real mint path end to end: pair a device through /api/ereaders,
+    /// take the password the person is shown, and sign in the way each
+    /// client does — KOSYNC with md5(password exactly as typed), dashed or
+    /// not; OPDS basic auth with the password however the keyboard
+    /// capitalized it.
+    #[tokio::test]
+    async fn a_minted_password_signs_in_to_kosync_and_opds_as_typed() {
+        use crate::auth::Authenticated;
+        use axum::body::Body;
+        use axum::http::Request;
+        use taisce_store::{BlockStore, PrincipalKind, SqliteStore};
+        use tower::ServiceExt;
+        let mut raw = SqliteStore::open_in_memory().unwrap();
+        let human = raw.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let user = raw.auth_ensure_owner(human, "Tom", 1).unwrap().id;
+        let store = SharedStore::new(raw);
+        let dir = tempfile::tempdir().unwrap();
+        let library = crate::library::LibraryState {
+            store: store.clone(),
+            s3: None,
+            server_mode: true,
+            local_human: human,
+            spool_dir: dir.path().join("spool"),
+        };
+        let app = router(OpdsState {
+            store: store.clone(),
+            server: Some(OpdsServer {
+                cfg: Arc::new(AuthConfig::from_public_url("http://localhost:7513").unwrap()),
+                limiter: Limiter::default(),
+            }),
+            local_human: human,
+            library,
+        })
+        .merge(crate::kosync::router(crate::kosync::KosyncState {
+            store: store.clone(),
+            server: Some(crate::kosync::ServerSide {
+                cfg: Arc::new(AuthConfig::from_public_url("http://localhost:7513").unwrap()),
+                limiter: Limiter::default(),
+            }),
+            local_human: human,
+        }));
+        let mint = Request::post("/api/ereaders")
+            .header("content-type", "application/json")
+            .extension(Authenticated {
+                user_id: user,
+                grant_id: Uuid::now_v7(),
+                client_id: "test".into(),
+                principal: "claude:test".into(),
+                owner_app: true,
+                human,
+                instance_owner: true,
+                web_session: false,
+            })
+            .body(Body::from(r#"{"label":"Kobo"}"#))
+            .unwrap();
+        let res = app.clone().oneshot(mint).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let v: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();
+        let shown = v["password"].as_str().unwrap().to_string();
+        assert!(shown.contains('-'), "the UI shows the dashed form: {shown}");
+        let kosync = |typed: String| {
+            Request::get("/kosync/users/auth")
+                .header("x-auth-user", "tom")
+                .header("x-auth-key", crate::booknaming::md5_hex(typed.as_bytes()))
+                .body(Body::empty())
+                .unwrap()
+        };
+        for typed in [shown.clone(), shown.replace('-', "")] {
+            let res = app.clone().oneshot(kosync(typed.clone())).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "kosync with {typed:?}");
+        }
+        let res = app.clone().oneshot(kosync("not-the-password".into())).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // OPDS: an e-ink keyboard capitalizes the first letter
+        let mut caps = shown.clone();
+        caps[..1].make_ascii_uppercase();
+        for typed in [shown.clone(), caps] {
+            let basic = base64::engine::general_purpose::STANDARD.encode(format!("Tom:{typed}"));
+            let req = Request::get("/opds/").header("authorization", format!("Basic {basic}")).body(Body::empty()).unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "opds with {typed:?}");
+        }
     }
 
     #[test]
@@ -1034,6 +1130,21 @@ mod tests {
         assert!(x.contains("http://opds-spec.org/image/thumbnail"), "the cover links are on every entry");
         let basic = book_entry_xml(&book("T", "A", None, None), "/opds");
         assert!(basic.contains("href=\"/opds/book/"));
+    }
+
+    /// The feed serves booknaming's feed form, so both clients name the file
+    /// exactly `derived_book_filename` (the kosync key); the stored title is
+    /// untouched elsewhere.
+    #[test]
+    fn book_entry_serves_the_feed_form_of_title_and_author() {
+        let b = book("  Line\none: two  ", "  .Ann  Author ", None, None);
+        let x = book_entry_xml(&b, "/opds");
+        assert!(x.contains("<title>Line one: two</title>"), "{x}");
+        assert!(x.contains("<name>Ann Author</name>"), "{x}");
+        // no author: the element is still there, with an empty name (a
+        // MISSING author is "Unknown Author" to KOReader)
+        let x = book_entry_xml(&book("Solo", "", None, None), "/opds");
+        assert!(x.contains("<author><name></name></author>"), "{x}");
     }
 
     #[test]
@@ -1100,6 +1211,7 @@ mod tests {
             label: "kindle".into(),
             secret_hash: "sh".into(),
             kosync_key_hash: "kh".into(),
+            kosync_key_hash_alt: "ka".into(),
             stream_downloads: true,
             created_at: 1_700_000_000,
             last_used_at: None,
@@ -1107,7 +1219,7 @@ mod tests {
         };
         let v = ereader_json(&e);
         let s = serde_json::to_string(&v).unwrap();
-        assert!(!s.contains("hash") && !s.contains("sh") && !s.contains("kh"), "{s}");
+        assert!(!s.contains("hash") && !s.contains("sh") && !s.contains("kh") && !s.contains("\"ka\""), "{s}");
         assert_eq!(v["label"], "kindle");
         assert_eq!(v["stream_downloads"], true);
         assert!(v["last_used_at"].is_null());

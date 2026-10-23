@@ -1086,7 +1086,10 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
             };
             let kosync_state = kosync::KosyncState {
                 store: store.clone(),
-                server: auth_state.as_ref().map(|_| kosync::ServerSide),
+                server: auth_state.as_ref().map(|st| kosync::ServerSide {
+                    cfg: st.cfg.clone(),
+                    limiter: st.limiter.clone(),
+                }),
                 local_human: tom,
             };
             let app = mcp::router_with_hosts(store.clone(), claude, dedupe.clone(), embedder.clone(), mcp_hosts)

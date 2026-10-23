@@ -58,6 +58,8 @@ impl SqliteStore {
         conn.execute_batch(WORKSPACES_SCHEMA)?;
         conn.execute_batch(SHARES_SCHEMA)?;
         conn.execute_batch(BOOKS_SCHEMA)?;
+        // a pre-release books db (the column came after the table)
+        add_column_if_missing(&conn, "ereader", "kosync_key_hash_alt", "TEXT NOT NULL DEFAULT ''")?;
         backfill(&conn)?;
         Ok(Self { conn, scope: Scope::System })
     }

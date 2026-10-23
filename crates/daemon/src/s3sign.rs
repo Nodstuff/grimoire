@@ -8,8 +8,9 @@
 //!
 //! Configuration (`S3Config::from_env`, mirroring `push::ApnsArgs::config`):
 //! - `TAISCE_BOOKS_BUCKET` / `TAISCE_BOOKS_REGION`: the library's bucket
-//!   (region defaults to `us-east-1`). No bucket → `None`, and the whole
-//!   library surface 404s, like `shares::ServerSide` in LOCAL mode.
+//!   and its region (required with a bucket: no silent us-east-1). No
+//!   bucket → `None`, and the whole library surface 404s, like
+//!   `shares::ServerSide` in LOCAL mode.
 //! - Credentials: explicit `TAISCE_BOOKS_ACCESS_KEY` /
 //!   `TAISCE_BOOKS_SECRET_KEY` (+ optional `TAISCE_BOOKS_SESSION_TOKEN`)
 //!   for dev, else the box's instance profile via IMDS, cached and
@@ -38,6 +39,7 @@ pub enum Method {
     Get,
     Head,
     Put,
+    Delete,
 }
 
 impl Method {
@@ -46,6 +48,7 @@ impl Method {
             Method::Get => "GET",
             Method::Head => "HEAD",
             Method::Put => "PUT",
+            Method::Delete => "DELETE",
         }
     }
 }
@@ -78,6 +81,37 @@ pub struct S3Config {
     pub region: String,
     creds: Creds,
     http: reqwest::Client,
+    /// Tests: object writes and deletes land here instead of the network
+    /// (presigning still runs for real — it is pure computation).
+    #[cfg(test)]
+    pub(crate) memory: std::sync::Arc<MemoryBucket>,
+}
+
+/// Tests' stand-in bucket: what was PUT (key → bytes) and DELETEd, and a
+/// switch that fails PUTs to keys ending in a suffix (the error paths).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MemoryBucket {
+    pub objects: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    pub deleted: std::sync::Mutex<Vec<String>>,
+    pub fail_put_suffix: std::sync::Mutex<Option<String>>,
+}
+
+#[cfg(test)]
+impl MemoryBucket {
+    fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+        if let Some(sfx) = self.fail_put_suffix.lock().unwrap().as_deref()
+            && key.ends_with(sfx)
+        {
+            anyhow::bail!("S3 PUT {key}: 503 SlowDown (test)");
+        }
+        self.objects.lock().unwrap().insert(key.to_string(), bytes);
+        Ok(())
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        self.objects.lock().unwrap().keys().cloned().collect()
+    }
 }
 
 fn env_non_empty(key: &str) -> Option<String> {
@@ -97,7 +131,13 @@ impl S3Config {
         let Some(bucket) = env_non_empty("TAISCE_BOOKS_BUCKET") else {
             return Ok(None);
         };
-        let region = env_non_empty("TAISCE_BOOKS_REGION").unwrap_or_else(|| "us-east-1".into());
+        // no default region: a bucket signed for the wrong region answers
+        // every request with a redirect the presigned URLs cannot follow, so
+        // a bucket without its region is a configuration error (logged, and
+        // the library stays off) rather than a silent us-east-1
+        let region = env_non_empty("TAISCE_BOOKS_REGION").ok_or_else(|| {
+            anyhow::anyhow!("TAISCE_BOOKS_BUCKET is set but TAISCE_BOOKS_REGION is not (e.g. eu-west-1)")
+        })?;
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             // no total timeout: book bodies stream at the reader's pace,
@@ -127,6 +167,8 @@ impl S3Config {
             region,
             creds,
             http,
+            #[cfg(test)]
+            memory: Default::default(),
         }))
     }
 
@@ -142,6 +184,8 @@ impl S3Config {
     /// stream-through would touch the network (tests never do one).
     #[cfg(test)]
     pub(crate) fn for_test() -> S3Config {
+        // reqwest needs a process-wide rustls provider (main installs it)
+        let _ = rustls::crypto::ring::default_provider().install_default();
         S3Config {
             bucket: "test-library".into(),
             region: "us-east-1".into(),
@@ -151,6 +195,7 @@ impl S3Config {
                 session_token: None,
             }),
             http: reqwest::Client::new(),
+            memory: Default::default(),
         }
     }
 
@@ -229,6 +274,9 @@ impl S3Config {
         body: &[u8],
         content_type: &str,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        return self.memory.put(key, body.to_vec());
+        #[allow(unreachable_code)]
         let url = self.presign_put(key, PRESIGN_TTL).await?;
         let res = self
             .http
@@ -251,6 +299,9 @@ impl S3Config {
         path: &std::path::Path,
         content_type: &str,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        return self.memory.put(key, tokio::fs::read(path).await?);
+        #[allow(unreachable_code)]
         let file = tokio::fs::File::open(path).await?;
         let len = file.metadata().await?.len();
         let url = self.presign_put(key, PRESIGN_TTL).await?;
@@ -263,6 +314,32 @@ impl S3Config {
             .send()
             .await?;
         put_result(res, key).await
+    }
+}
+
+impl S3Config {
+    /// DELETE an object. On the versioned bucket this only adds a delete
+    /// marker: the object becomes a noncurrent version, which the bucket's
+    /// lifecycle expires after 30 days (the undo window). A key that does
+    /// not exist is a success (S3 answers 204 either way).
+    pub async fn delete_object(&self, key: &str) -> anyhow::Result<()> {
+        #[cfg(test)]
+        {
+            self.memory.objects.lock().unwrap().remove(key);
+            self.memory.deleted.lock().unwrap().push(key.to_string());
+            return Ok(());
+        }
+        #[allow(unreachable_code)]
+        let creds = self.credentials().await?;
+        let url = presign(&creds, &self.bucket, &self.region, Method::Delete, key, None, PRESIGN_TTL, SystemTime::now());
+        let res = self.http.delete(url).send().await?;
+        if res.status().is_success() {
+            return Ok(());
+        }
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        let excerpt: String = body.chars().take(300).collect();
+        anyhow::bail!("S3 DELETE {key}: {status} {excerpt}")
     }
 }
 
@@ -412,6 +489,23 @@ fn presign(
     now: SystemTime,
 ) -> String {
     let host = format!("{bucket}.s3.{region}.amazonaws.com");
+    presign_at(creds, &host, region, method, key, response_content_disposition, ttl, now)
+}
+
+/// [`presign`] against an explicit virtual host. Production always signs
+/// for the regional host; the test pins AWS's documented vector, which was
+/// published against the legacy global one (`examplebucket.s3.amazonaws.com`).
+#[allow(clippy::too_many_arguments)]
+fn presign_at(
+    creds: &Credentials,
+    host: &str,
+    region: &str,
+    method: Method,
+    key: &str,
+    response_content_disposition: Option<&str>,
+    ttl: Duration,
+    now: SystemTime,
+) -> String {
     let t: chrono::DateTime<chrono::Utc> = now.into();
     let amz_date = t.format("%Y%m%dT%H%M%SZ").to_string();
     let date = t.format("%Y%m%d").to_string();
@@ -467,9 +561,9 @@ mod tests {
     #[test]
     fn aws_documented_presigned_get_object() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1369353600);
-        let url = presign(
+        let url = presign_at(
             &docs_creds(),
-            "examplebucket",
+            "examplebucket.s3.amazonaws.com",
             "us-east-1",
             Method::Get,
             "test.txt",
