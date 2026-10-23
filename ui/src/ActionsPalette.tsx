@@ -6,7 +6,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import PaletteShell, { PaletteFooter, PaletteInput, moveSelection } from './PaletteShell'
 import { Icon } from './lapis/icons'
-import { rankCommands, type OmniCommand } from './omni'
+import { rankCommands, type CommandGroup, type OmniCommand } from './omni'
+
+const GROUP_ORDER: CommandGroup[] = ['Create', 'Go', 'Data', 'App']
 
 export default function ActionsPalette({
   commands,
@@ -24,7 +26,14 @@ export default function ActionsPalette({
   const listRef = useRef<HTMLDivElement>(null)
   useEffect(() => inputRef.current?.focus(), [])
 
-  const rows = useMemo(() => rankCommands(commands, raw), [commands, raw])
+  // nothing typed: grouped (This doc, Create, Go, Data, App), each group in
+  // its own order; typed: best match first
+  const rows = useMemo(() => {
+    const ranked = rankCommands(commands, raw)
+    if (raw.trim()) return ranked
+    const order = (c: OmniCommand) => (c.scope === 'doc' ? 0 : 1 + GROUP_ORDER.indexOf(c.group ?? 'App'))
+    return ranked.map((c, i) => ({ c, i })).sort((a, b) => order(a.c) - order(b.c) || a.i - b.i).map((x) => x.c)
+  }, [commands, raw])
   const typed = raw.trim().length > 0
   useEffect(() => setSel(0), [raw])
   useEffect(() => {

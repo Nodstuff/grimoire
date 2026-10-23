@@ -92,7 +92,7 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
     })
   }
   cmds.push(
-    { id: 'tree', icon: 'sidebar', group: 'Go', label: 'Toggle file tree', keys: '⌘T', keywords: 'sidebar folders', run: () => onAction('tree') },
+    { id: 'tree', icon: 'sidebar', group: 'Go', label: 'Show or hide the sidebar', keys: '⌘T', keywords: 'sidebar folders', run: () => onAction('tree') },
     {
       id: 'import', icon: 'folder', group: 'Create',
       label: 'Import a folder of Markdown…',

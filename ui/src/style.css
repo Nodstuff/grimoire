@@ -751,12 +751,20 @@ kbd {
 .chip.armed, .decline.armed { background: var(--red); color: var(--bg); border-color: var(--red); }
 
 .first-run { padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; }
-.first-run-title { font-size: 16px; font-weight: 650; }
+.first-run-title { font-family: var(--font-serif); font-size: 24px; font-weight: 500; letter-spacing: -0.01em; }
 .palette .first-run input {
+  height: 44px;
+  padding: 0 12px;
+  border-radius: var(--r-field);
   border: 1px solid var(--line2);
-  border-radius: 8px;
-  padding: 8px 12px;
   background: var(--card2);
+  color: var(--ink);
+  font-size: var(--text-lg);
+  outline: none;
+}
+.palette .first-run input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .first-run-actions { display: flex; align-items: center; gap: 12px; justify-content: flex-end; }
 .profile-name-row { display: flex; gap: 8px; align-items: center; }

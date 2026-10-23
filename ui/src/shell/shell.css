@@ -46,6 +46,9 @@
   flex-direction: column;
   gap: 22px;
 }
+.lp-page > * {
+  flex-shrink: 0;
+}
 .lp-page-head {
   display: flex;
   flex-wrap: wrap;
@@ -97,6 +100,9 @@
   flex-direction: column;
   gap: 18px;
   scrollbar-width: thin;
+}
+.lp-side > * {
+  flex-shrink: 0;
 }
 .tauri .lp-side {
   /* the traffic lights sit over the top-left corner */
@@ -364,7 +370,6 @@ button.lp-side-sec:hover {
 .lp-side-tree {
   display: flex;
   flex-direction: column;
-  min-height: 0;
 }
 .lp-tree {
   display: flex;
@@ -1053,4 +1058,13 @@ a.lp-lib-row:hover {
   color: var(--yellow);
   background: var(--yellow-soft);
   border-bottom: 1px solid var(--line);
+}
+/* no key hints on a touch drawer */
+.lp-side-drawer .lp-nav-kbd {
+  display: none;
+}
+@media (max-width: 760px) {
+  .lp-top {
+    border-bottom-color: transparent;
+  }
 }

@@ -4,6 +4,7 @@
 // once.
 
 import { useEffect, useState } from 'react'
+import { Button } from './lapis/Button'
 import PaletteShell from './PaletteShell'
 import { api, Profile as ProfileRow } from './types'
 import { errText, notify } from './Notice'
@@ -85,18 +86,19 @@ export function FirstRunName({ profile, onSaved }: { profile: ProfileRow; onSave
   }
 
   return (
-    <PaletteShell onClose={() => {}} locked>
+    <PaletteShell onClose={() => {}} locked label="Your name">
       <div className="first-run">
         <div className="first-run-title">What should others call you?</div>
         <div className="meta">
-          this is the name your edits and reviews are attributed to — you can change it later
-          under Profile
+          This is the name your edits and reviews are attributed to. You can change it later in
+          Settings › Profile.
         </div>
         <input
           autoFocus
           value={name}
           maxLength={64}
-          placeholder="your name"
+          placeholder="Your name"
+          aria-label="Your name"
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter') save()
@@ -105,9 +107,9 @@ export function FirstRunName({ profile, onSaved }: { profile: ProfileRow; onSave
         />
         <div className="first-run-actions">
           {err && <span className="meta err">{err}</span>}
-          <button className="accept" disabled={!ok || busy} onClick={save}>
-            {busy ? 'saving…' : 'save'}
-          </button>
+          <Button variant="primary" disabled={!ok || busy} onClick={save}>
+            {busy ? 'Saving…' : 'Save'}
+          </Button>
         </div>
       </div>
     </PaletteShell>

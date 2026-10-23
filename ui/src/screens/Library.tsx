@@ -79,7 +79,7 @@ export default function Library({
                   <Icon name={n > 0 ? 'folder' : 'doc'} size={15} />
                   <span>
                     <b>{d.title}</b>
-                    {path !== d.title && <span className="muted lp-lib-path">{path}</span>}
+                    {path !== d.title && <span className="muted lp-lib-path">{path.split(' › ').slice(0, -1).join(' › ')}</span>}
                   </span>
                 </span>
                 <span>{d.status ? <Chip tag tone={STATUS_TONE[d.status]}>{d.status}</Chip> : <span className="muted">—</span>}</span>
