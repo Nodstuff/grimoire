@@ -45,9 +45,12 @@ use uuid::Uuid;
 /// Per-file cap on an uploaded EPUB, enforced while spooling: a bigger
 /// field stops writing here and answers `error` for that file.
 const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
-/// Whole-request cap (every file plus multipart framing): bounds the spool
-/// disk one request can hold at once.
-const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
+/// Whole-request cap (every file plus multipart framing): one EPUB at the
+/// per-file cap plus framing. The web UI batches by bytes (≤ 20 MB a
+/// request, a bigger file alone), so a legitimate request never comes
+/// near it. The proxy's `max_request_body_bytes` (infra/deploy/portus.yaml)
+/// is set to exactly this; change the two together.
+const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
 /// Files per request: each costs a store lock and two S3 PUTs, so a
 /// 10 000-field body is a denial of service, not an upload.
 const MAX_FILES: usize = 100;

@@ -16,6 +16,10 @@ Environment=TAISCE_APNS_KEY_ID=WT3Q587Y97
 Environment=TAISCE_APNS_TEAM_ID=6UP35L9425
 Environment=TAISCE_APNS_TOPIC=ie.null.taisce
 Environment=TAISCE_APNS_ENV=production
+# the EPUB library (library/<user>/… in the backups bucket; the instance
+# role's credentials via IMDS). The region is required with the bucket.
+Environment=TAISCE_BOOKS_BUCKET=taisce-backups-895102116452
+Environment=TAISCE_BOOKS_REGION=eu-west-1
 ExecStart=/opt/taisce/bin/taisce --db /var/lib/taisce/ks.db --port 7425 serve
 Restart=on-failure
 RestartSec=3

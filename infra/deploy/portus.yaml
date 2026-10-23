@@ -17,7 +17,10 @@ listeners:
       - hosts: [taisce.null.ie]
         backends:
           - address: "127.0.0.1:7425"
-        max_request_body_bytes: 26214400
+        # = the daemon's EPUB upload cap (library.rs MAX_BODY_BYTES, 128 MiB:
+        # one 100 MB EPUB plus multipart framing); every other route keeps
+        # its own smaller axum limit. Change the two together.
+        max_request_body_bytes: 134217728
         response_headers:
           set:
             Strict-Transport-Security: "max-age=31536000; includeSubDomains"

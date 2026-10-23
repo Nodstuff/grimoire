@@ -136,6 +136,11 @@ resource "aws_s3_bucket_lifecycle_configuration" "backups" {
     noncurrent_version_expiration {
       noncurrent_days = 30
     }
+    # a deleted book leaves a delete marker over its noncurrent version;
+    # once that version expires the marker is alone, and this removes it
+    expiration {
+      expired_object_delete_marker = true
+    }
     abort_incomplete_multipart_upload {
       days_after_initiation = 7
     }
@@ -164,14 +169,38 @@ resource "aws_iam_role_policy_attachment" "ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# Each prefix gets only what its user does: litestream (litestream.yml)
+# replicates the db under litestream/; install.sh only reads releases/ (the
+# release bundle is uploaded from the laptop, never by the box); the daemon's
+# EPUB library (TAISCE_BOOKS_BUCKET) reads, writes and deletes library/.
 data "aws_iam_policy_document" "backups" {
   statement {
-    actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+    actions   = ["s3:GetBucketLocation"]
     resources = [aws_s3_bucket.backups.arn]
   }
   statement {
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.backups.arn]
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["litestream/*", "releases/*"]
+    }
+  }
+  statement {
+    sid       = "Litestream"
     actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
-    resources = ["${aws_s3_bucket.backups.arn}/*"]
+    resources = ["${aws_s3_bucket.backups.arn}/litestream/*"]
+  }
+  statement {
+    sid       = "Releases"
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.backups.arn}/releases/*"]
+  }
+  statement {
+    sid       = "Library"
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.backups.arn}/library/*"]
   }
 }
 
