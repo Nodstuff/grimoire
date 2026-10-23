@@ -216,6 +216,91 @@
   color-scheme: dark;
 }
 
+/* ---- the web reader's papers (ui/src/reader only) ----
+   The reader picks its paper apart from the app's theme: Light, Dark, or
+   Sepia (the reader's own). Each paper restates the surface and ink tokens
+   for the reader's subtree, so its bars, drawers and popovers (Lapis
+   primitives) sit on the same paper as the page. --read-* are the page
+   itself; the section iframes get them as values (settings.ts bookCss). */
+.rd[data-paper='light'] {
+  --bg: #f4f5f8;
+  --panel: #eceef3;
+  --card: #ffffff;
+  --card2: #f6f7fa;
+  --hover: #e4e7ef;
+  --pal: #ffffff;
+  --scrim: rgba(20, 26, 45, 0.32);
+  --line: rgba(20, 26, 45, 0.09);
+  --line2: rgba(20, 26, 45, 0.17);
+  --ink: #141821;
+  --ink2: #454d5e;
+  --ink3: #5e6779;
+  --accent: #3346d3;
+  --on-accent: #ffffff;
+  --accent-soft: rgba(51, 70, 211, 0.09);
+  --accent-ring: rgba(51, 70, 211, 0.25);
+  --focus: #3346d3;
+  --mark: #ffe7a3;
+  --shadow-pop: 0 16px 40px rgba(20, 26, 45, 0.18);
+  --read-paper: #ffffff;
+  --read-ink: #1b1f29;
+  --read-link: #3346d3;
+  --read-select: rgba(51, 70, 211, 0.2);
+  color-scheme: light;
+}
+.rd[data-paper='dark'] {
+  --bg: #0e1116;
+  --panel: #12161d;
+  --card: #181d26;
+  --card2: #1e2430;
+  --hover: #232a37;
+  --pal: #161b24;
+  --scrim: rgba(5, 7, 10, 0.62);
+  --line: rgba(226, 232, 255, 0.08);
+  --line2: rgba(226, 232, 255, 0.15);
+  --ink: #e8ebf2;
+  --ink2: #aeb6c6;
+  --ink3: #8d96a8;
+  --accent: #8e9dff;
+  --on-accent: #0b0e1a;
+  --accent-soft: rgba(142, 157, 255, 0.14);
+  --accent-ring: rgba(142, 157, 255, 0.35);
+  --focus: #8e9dff;
+  --mark: rgba(242, 193, 78, 0.28);
+  --shadow-pop: 0 16px 40px rgba(0, 0, 0, 0.45);
+  --read-paper: #12161d;
+  --read-ink: #d9dde6;
+  --read-link: #a3afff;
+  --read-select: rgba(142, 157, 255, 0.3);
+  color-scheme: dark;
+}
+.rd[data-paper='sepia'] {
+  --bg: #efe6d2;
+  --panel: #e9dfc8;
+  --card: #f7f0df;
+  --card2: #efe6d0;
+  --hover: #e6dbc2;
+  --pal: #f9f3e5;
+  --scrim: rgba(59, 45, 25, 0.3);
+  --line: rgba(76, 58, 32, 0.12);
+  --line2: rgba(76, 58, 32, 0.22);
+  --ink: #3b2f1f;
+  --ink2: #5f4e37;
+  --ink3: #766449;
+  --accent: #3346d3;
+  --on-accent: #ffffff;
+  --accent-soft: rgba(51, 70, 211, 0.1);
+  --accent-ring: rgba(51, 70, 211, 0.25);
+  --focus: #3346d3;
+  --mark: #f3d98b;
+  --shadow-pop: 0 16px 40px rgba(59, 45, 25, 0.2);
+  --read-paper: #f4ecd8;
+  --read-ink: #3b2f1f;
+  --read-link: #7a4b16;
+  --read-select: rgba(160, 110, 40, 0.25);
+  color-scheme: light;
+}
+
 @media (max-width: 760px) {
   :root {
     --gutter: 16px;

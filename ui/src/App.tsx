@@ -59,6 +59,8 @@ const pollTimeout = () => AbortSignal.timeout(4000)
 const DIRTY_SELECTOR = '.save-state.dirty, .save-state.saving'
 // force-graph (graph) is not part of the boot bundle: it loads on first use
 const GraphView = lazy(() => import('./GraphView'))
+// the web reader (foliate-js) loads only when a book is opened
+const Reader = lazy(() => import('./reader/Reader'))
 const Loading = () => (
   <div className="lazy-loading">
     <Spinner />
@@ -733,6 +735,15 @@ export default function App() {
       onNavigate={() => setDrawerOpen(false)}
     />
   )
+
+  // the web reader takes the whole window: no sidebar, bar or tab bar
+  if (route.kind === 'read') {
+    return (
+      <Suspense fallback={<Loading />}>
+        <Reader key={`${route.source}:${route.id}`} source={route.source} id={route.id} />
+      </Suspense>
+    )
+  }
 
   return (
     <div className={`lp-app${showSidebar && !isPhone ? '' : ' lp-app-noside'}`}>

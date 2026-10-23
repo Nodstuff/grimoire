@@ -11,6 +11,8 @@
 //   /review                 the review queue
 //   /search[?q=…]           Search & Ask
 //   /books                  the EPUB library (SERVER mode)
+//   /books/<uuid>/read      the web reader on a library book (SERVER mode)
+//   /doc/<uuid>/read        the web reader on a doc's EPUB (also /docs/…)
 //   /gardeners              gardener runs
 //   /graph                  the link graph
 //   /trash                  the Trash
@@ -31,6 +33,7 @@ export type Route =
   | { kind: 'review' }
   | { kind: 'search'; q: string }
   | { kind: 'books' }
+  | { kind: 'read'; source: 'book' | 'doc'; id: string }
   | { kind: 'runs' }
   | { kind: 'graph' }
   | { kind: 'trash' }
@@ -58,6 +61,10 @@ export function parseRoute(pathname: string, search = ''): Route {
   if (parts.length === 0) return { kind: 'home' }
   switch (head) {
     case 'doc':
+    case 'docs':
+      // the web reader on a doc's EPUB (`/docs/…/read` is an alias)
+      if (parts.length === 3 && UUID.test(parts[1]) && parts[2].toLowerCase() === 'read') return { kind: 'read', source: 'doc', id: parts[1] }
+      if (head === 'docs') break
       if (parts.length === 2 && UUID.test(parts[1])) {
         const block = params.get('block')
         return block && UUID.test(block) ? { kind: 'doc', id: parts[1], block } : { kind: 'doc', id: parts[1] }
@@ -82,6 +89,7 @@ export function parseRoute(pathname: string, search = ''): Route {
       break
     case 'books':
       if (parts.length === 1) return { kind: 'books' }
+      if (parts.length === 3 && UUID.test(parts[1]) && parts[2].toLowerCase() === 'read') return { kind: 'read', source: 'book', id: parts[1] }
       break
     case 'gardeners':
       if (parts.length === 1) return { kind: 'runs' }
@@ -120,6 +128,8 @@ export function routePath(r: Route): string {
       return r.q ? `/search?q=${encodeURIComponent(r.q)}` : '/search'
     case 'books':
       return '/books'
+    case 'read':
+      return r.source === 'book' ? `/books/${r.id}/read` : `/doc/${r.id}/read`
     case 'runs':
       return '/gardeners'
     case 'graph':

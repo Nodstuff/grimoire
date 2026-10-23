@@ -237,8 +237,8 @@ export function resolveXPointer(doc: Document, x: XPointer, st: Styling = tagSty
   let el: Element | null = doc.body ?? doc.getElementsByTagName('body')[0] ?? null
   if (!el) return null
   for (const step of x.steps) {
-    const kids = crengineChildren(el, st).filter((n): n is Element => n.nodeType === 1)
-    const same = kids.filter((k) => k.localName.toLowerCase() === step.name)
+    const kids: Element[] = crengineChildren(el, st).filter((n): n is Element => n.nodeType === 1)
+    const same: Element[] = kids.filter((k) => k.localName.toLowerCase() === step.name)
     const next: Element | undefined = same[step.index - 1]
     if (!next) return null
     el = next

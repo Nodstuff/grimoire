@@ -204,6 +204,17 @@ describe('the writer', () => {
     expect(w.pending).toBe(false)
   })
 
+  it('discard() drops the unwritten place (a newer one is being taken)', async () => {
+    const { w, puts, tick } = rig()
+    w.moved({ progress: 'p1', percentage: 0.1 })
+    await tick(0)
+    w.moved({ progress: 'p2', percentage: 0.2 })
+    w.discard()
+    await tick(20_000)
+    await w.flush(true)
+    expect(puts.map((p) => p.progress)).toEqual(['p1'])
+  })
+
   it('stop() ends writing', async () => {
     const { w, puts, tick } = rig()
     w.stop()

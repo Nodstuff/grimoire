@@ -642,7 +642,7 @@ function Reading({ books }: { books: ReadingBook[] }) {
         {books.slice(0, 3).map((b) => {
           const pct = Math.max(0, Math.min(100, Math.round(b.percentage)))
           return (
-            <Link key={b.id} to={{ kind: 'books' }} className="hm-book" title={b.author ? `${b.title} by ${b.author}` : b.title}>
+            <Link key={b.id} to={{ kind: 'read', source: 'book', id: b.id }} className="hm-book" title={b.author ? `${b.title} by ${b.author}` : b.title}>
               <span className={`hm-cover${b.has_cover ? ' art' : ` tone-${coverTone(b.title)}`}`}>
                 {b.has_cover ? (
                   <img loading="lazy" src={coverUrl(b.id, b.cover_version)} alt="" />

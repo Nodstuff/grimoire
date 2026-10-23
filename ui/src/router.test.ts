@@ -4,6 +4,24 @@ import { legacyRedirect, parseRoute, routePath, sameRoute, type Route } from './
 const A = '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d'
 const B = '11111111-2222-4333-8444-555555555555'
 
+describe('the web reader', () => {
+  it('reads a book at /books/<id>/read and a doc at /doc/<id>/read (or /docs/…)', () => {
+    expect(parseRoute(`/books/${A}/read`)).toEqual({ kind: 'read', source: 'book', id: A })
+    expect(parseRoute(`/doc/${A}/read`)).toEqual({ kind: 'read', source: 'doc', id: A })
+    expect(parseRoute(`/docs/${A}/read/`)).toEqual({ kind: 'read', source: 'doc', id: A })
+    expect(routePath({ kind: 'read', source: 'doc', id: A })).toBe(`/doc/${A}/read`)
+    expect(routePath({ kind: 'read', source: 'book', id: A })).toBe(`/books/${A}/read`)
+  })
+
+  it('a bad id or a stray segment is not found, and /docs alone is not a place', () => {
+    for (const p of ['/books/nope/read', `/books/${A}/open`, `/books/${A}`, `/docs/${A}`, '/docs']) {
+      expect(parseRoute(p).kind).toBe('notfound')
+    }
+    // a plain doc link is untouched
+    expect(parseRoute(`/doc/${A}`)).toEqual({ kind: 'doc', id: A })
+  })
+})
+
 describe('routes', () => {
   it('every route round-trips through its path', () => {
     const routes: Route[] = [
@@ -20,6 +38,8 @@ describe('routes', () => {
       { kind: 'search', q: '' },
       { kind: 'search', q: 'review gate & co' },
       { kind: 'books' },
+      { kind: 'read', source: 'book', id: A },
+      { kind: 'read', source: 'doc', id: B },
       { kind: 'runs' },
       { kind: 'graph' },
       { kind: 'trash' },

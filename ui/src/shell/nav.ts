@@ -93,6 +93,8 @@ export function placeTitle(route: Route): string {
       return 'Search & Ask'
     case 'books':
       return 'Books'
+    case 'read':
+      return 'Reading'
     case 'runs':
       return 'Gardeners'
     case 'graph':

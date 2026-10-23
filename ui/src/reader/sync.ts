@@ -265,6 +265,13 @@ export class PositionWriter {
     this.#inFlight = null
   }
 
+  /** Forget the unwritten place (another device's newer one is being taken). */
+  discard(): void {
+    this.#pending = null
+    if (this.#timer !== null) this.#deps.clearTimer(this.#timer)
+    this.#timer = null
+  }
+
   stop(): void {
     this.#stopped = true
     if (this.#timer !== null) this.#deps.clearTimer(this.#timer)

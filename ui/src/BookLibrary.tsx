@@ -23,8 +23,9 @@ import BookUpload from './BookUpload'
 import { bookUploads, useBookUploads } from './bookUploads'
 import { coverArt } from './bookCovers'
 import Link from './Link'
+import { navigate } from './router'
 import { DeviceIcon } from './screens/DeviceIcon'
-import { Button, Card, ConfirmButton, EmptyState, Sheet, Skeleton } from './lapis'
+import { Button, buttonClass, Card, ConfirmButton, EmptyState, Icon, Sheet, Skeleton } from './lapis'
 import {
   Book,
   BookPatch,
@@ -299,7 +300,13 @@ export default function Books({ dataVersion }: { dataVersion: number }) {
               {reading.map((b) => {
                 const pct = pctOf({ percentage: b.percentage, status: 'reading' })
                 return (
-                  <button key={b.id} type="button" className="lp-card bk-rcard" onClick={() => setSelected(b.id)} aria-pressed={detailBook?.id === b.id}>
+                  <button
+                    key={b.id}
+                    type="button"
+                    className="lp-card bk-rcard"
+                    onClick={() => navigate({ kind: 'read', source: 'book', id: b.id })}
+                    aria-label={`Read ${b.title}, ${pct}% through`}
+                  >
                     <Cover book={b} size="card" />
                     <span className="bk-rcard-body">
                       <span className="bk-rcard-title">{b.title}</span>
@@ -355,19 +362,23 @@ export default function Books({ dataVersion }: { dataVersion: number }) {
                 const badge = coverBadge(b, p)
                 const on = detailBook?.id === b.id
                 return (
-                  <button
-                    key={b.id}
-                    type="button"
-                    className={`bk-tile${on ? ' on' : ''}`}
-                    aria-pressed={on}
-                    onClick={() => setSelected(b.id)}
-                    title={b.author ? `${b.title} · ${b.author}` : b.title}
-                  >
-                    <Cover book={b} size="grid" badge={badge} />
-                    {p?.status === 'reading' && <Bar pct={pctOf(p)} label={`${pctOf(p)}% read`} />}
-                    <span className="bk-tile-title">{b.title}</span>
-                    {b.author && <span className="bk-tile-author">{b.author}</span>}
-                  </button>
+                  <div key={b.id} className={`bk-tile${on ? ' on' : ''}`}>
+                    {/* the cover opens the book; the words, its details */}
+                    <Link to={{ kind: 'read', source: 'book', id: b.id }} className="bk-tile-cover" aria-label={`Read ${b.title}`} title={`Read ${b.title}`}>
+                      <Cover book={b} size="grid" badge={badge} />
+                      {p?.status === 'reading' && <Bar pct={pctOf(p)} label={`${pctOf(p)}% read`} />}
+                    </Link>
+                    <button
+                      type="button"
+                      className="bk-tile-info"
+                      aria-pressed={on}
+                      onClick={() => setSelected(b.id)}
+                      title={b.author ? `${b.title} · ${b.author}` : b.title}
+                    >
+                      <span className="bk-tile-title">{b.title}</span>
+                      {b.author && <span className="bk-tile-author">{b.author}</span>}
+                    </button>
+                  </div>
                 )
               })}
             </div>
@@ -495,6 +506,10 @@ export function SentShelf({
                     </>
                   )}
                   <span className="bk-sent-actions">
+                    <Link to={{ kind: 'read', source: 'doc', id: b.id }} className={buttonClass('primary', 'sm')}>
+                      <Icon name="books" size={15} />
+                      Read
+                    </Link>
                     <Button size="sm" icon="download" onClick={() => onDownload(b)}>
                       Download
                     </Button>
@@ -636,6 +651,10 @@ function BookDetail({
             )}
           </span>
           <Bar pct={pct} />
+          <Link to={{ kind: 'read', source: 'book', id: book.id }} className={buttonClass('primary', 'sm', 'bk-d-read')}>
+            <Icon name="books" size={15} />
+            {progress && progress.status === 'reading' ? 'Continue reading' : 'Read'}
+          </Link>
         </div>
       </div>
       <form
