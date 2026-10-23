@@ -491,7 +491,7 @@ export default function Todos({
             ref={addRef}
             aria-label="Add a to-do"
             className="td-add-input"
-            placeholder="Add a to-do…   try “Renew the passport due fri 3pm”"
+            placeholder="Add a to-do…"
             value={draft}
             disabled={adding || addReadOnly}
             autoComplete="off"
@@ -770,7 +770,11 @@ function TodoRow({
       }
       if (Math.abs(ddx) < 10) return
       s.on = true
-      ;(e.currentTarget as HTMLElement).setPointerCapture(s.id)
+      try {
+        ;(e.currentTarget as HTMLElement).setPointerCapture(s.id)
+      } catch {
+        /* a pointer the browser no longer tracks */
+      }
     }
     setDx(Math.max(-140, Math.min(140, ddx)))
   }
