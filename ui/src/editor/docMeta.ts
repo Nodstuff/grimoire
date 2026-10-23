@@ -68,7 +68,38 @@ export function wordDiff(before: string, after: string): DiffSeg[] {
   }
   while (i < n) push('del', a[i++])
   while (j < m) push('ins', b[j++])
-  // whitespace alone between two changes reads better inside the change
+  return coalesce(out)
+}
+
+/** Reads like an editor's mark-up, not a word salad: a short unchanged run
+ * (under three words) between two changes joins the change, and each change
+ * run shows all of what went, then all of what came. */
+export function coalesce(segs: DiffSeg[]): DiffSeg[] {
+  const words = (s: string) => (s.match(/[^\s]+/g) ?? []).length
+  const out: DiffSeg[] = []
+  let del = ''
+  let ins = ''
+  const flush = () => {
+    if (del) out.push({ t: 'del', s: del })
+    if (ins) out.push({ t: 'ins', s: ins })
+    del = ins = ''
+  }
+  for (let k = 0; k < segs.length; k++) {
+    const g = segs[k]
+    if (g.t === 'del') del += g.s
+    else if (g.t === 'ins') ins += g.s
+    else {
+      const between = (del || ins) && k + 1 < segs.length && words(g.s) < 3
+      if (between) {
+        del += g.s
+        ins += g.s
+      } else {
+        flush()
+        out.push({ t: 'eq', s: g.s })
+      }
+    }
+  }
+  flush()
   return out
 }
 
@@ -155,7 +186,12 @@ export function versions(rows: (HistoryRow & { principal_is_yours?: boolean })[]
 
 /** The few words around the [[link]] to `title` in a backlinking block. */
 export function backlinkSnippet(content: string, title: string, radius = 48): string {
-  const flat = content.replace(/\s+/g, ' ').trim()
+  const flat = content
+    .replace(/```[^\n]*\n[\s\S]*?(```|$)/g, ' ')
+    .replace(/^\s*(#+|[-*+>]|\d+\.)\s+/gm, '')
+    .replace(/(\*\*|__|`)/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
   const lower = flat.toLowerCase()
   let at = lower.indexOf(`[[${title.toLowerCase()}`)
   if (at < 0) at = lower.indexOf(title.toLowerCase())

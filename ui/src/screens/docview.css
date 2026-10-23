@@ -1004,6 +1004,9 @@ button.dv-pill:hover {
   .dv-pills {
     margin-bottom: 12px;
   }
+  .dv-pill-policy {
+    display: none;
+  }
   .dv-pill {
     font-size: var(--text-sm2);
     line-height: 26px;

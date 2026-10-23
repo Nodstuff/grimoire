@@ -98,6 +98,7 @@ export function DocInspector({
             aria-selected={tab === t.id}
             aria-controls="ins-panel"
             tabIndex={tab === t.id ? 0 : -1}
+            data-autofocus={tab === t.id ? '' : undefined}
             className={tab === t.id ? 'on' : ''}
             onClick={() => setTab(t.id)}
             onKeyDown={(e) => onKey(e, i)}
@@ -140,6 +141,20 @@ export function DocInspector({
 
 /* ---------- comments ---------- */
 
+/** A block's first line as plain words: no heading or list marks, no
+ * emphasis or code ticks, wikilinks as their names. */
+export function plainLine(md: string): string {
+  return md
+    .split('\n')[0]
+    .replace(/^#+\s*/, '')
+    .replace(/^\s*([-*+]|\d+\.)\s+/, '')
+    .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2')
+    .replace(/\[\[([^\]]+)\]\]/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/(\*\*|__|\*|_|`)/g, '')
+    .trim()
+}
+
 function CommentsPane({
   comments,
   allBlocks,
@@ -170,7 +185,7 @@ function CommentsPane({
 
   const snippet = (id: string | null) => {
     const c = id ? (byId.get(id)?.content ?? '') : ''
-    const line = c.replace(/^#+\s*/, '').replace(/^[-*]\s+/, '').split('\n')[0]
+    const line = plainLine(c)
     return line.length > 90 ? line.slice(0, 90) + '…' : line
   }
 

@@ -831,7 +831,7 @@ export default function DocView({
             {!readOnly && <AddTag onAdd={addTag} />}
             <LivingChip docId={docId} dataVersion={dataVersion} />
             {doc.review_policy && (
-              <span className="dv-pill dv-pill-quiet" title="who reviews changes to this doc">
+              <span className="dv-pill dv-pill-quiet dv-pill-policy" title="who reviews changes to this doc">
                 <Icon name="review" size={13} />
                 {doc.review_policy}
               </span>

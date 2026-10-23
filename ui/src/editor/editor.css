@@ -532,9 +532,9 @@
   .rv-meta {
     display: none;
   }
+  /* no right margin to hang them in: the dock's Comments count says it */
   .cbub {
-    right: -16px;
-    top: -12px;
+    display: none;
   }
   .codeblock-view pre {
     padding: 12px 14px;
