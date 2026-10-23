@@ -30,7 +30,7 @@ import SearchScreen from './screens/Search'
 import { buildCommands } from './commands'
 import { signOut, webSession } from './auth'
 import { buildPlaces, docPath, loadRecentIds, pushRecentId, storeRecentIds, type PlaceId } from './omni'
-import { resolveShortcut } from './shortcuts'
+import { KEYS, resolveShortcut } from './shortcuts'
 import { goBack, goForward, navigate, useRoute, type Route } from './router'
 import Link from './Link'
 import { Button, EmptyState, Spinner } from './lapis'
@@ -246,7 +246,7 @@ export default function App() {
     storeSidebarOpen(open)
   }, [])
   const [drawerOpen, setDrawerOpen] = useState(false)
-  // bumped when ⌘T opens the sidebar: the tree's filter takes the caret
+  // bumped when ⌘\ opens the sidebar: the tree's filter takes the caret
   const [focusFilter, setFocusFilter] = useState(0)
   const toggleSidebar = useCallback(() => {
     if (isPhoneNow()) {
@@ -560,7 +560,7 @@ export default function App() {
               title="Welcome to Taisce"
               action={
                 <>
-                  <Button variant="primary" icon="plus" kbd="⌘N" onClick={() => setPalette('newdoc')}>
+                  <Button variant="primary" icon="plus" kbd={KEYS.newdoc} onClick={() => setPalette('newdoc')}>
                     New doc
                   </Button>
                   <ImportFolder label="Import a folder of Markdown…" onDone={reloadDocs} />

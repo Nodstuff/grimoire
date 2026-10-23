@@ -85,7 +85,7 @@ export default function DocTree({
   wsColor?: Map<string, string>
   /** the + beside the Library label */
   onNewDoc?: () => void
-  /** bump to put the caret in the filter (⌘T opening the sidebar) */
+  /** bump to put the caret in the filter (⌘\ opening the sidebar) */
   focusFilter?: number
   /** doc id → changes waiting (a yellow dot) or parked (a red square) */
   pending?: Map<string, { review: number; parked: number }>
@@ -139,7 +139,7 @@ export default function DocTree({
   /* ---- filter ---- */
   const [filter, setFilter] = useState('')
   const filterRef = useRef<HTMLInputElement>(null)
-  // ⌘T opened the sidebar: put the caret in the filter so typing follows
+  // ⌘\ opened the sidebar: put the caret in the filter so typing follows
   useEffect(() => {
     if (focusFilter) filterRef.current?.focus()
   }, [focusFilter])

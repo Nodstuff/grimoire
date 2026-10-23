@@ -16,7 +16,7 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   size?: ButtonSize
   /** a leading icon */
   icon?: IconName
-  /** a trailing key hint, e.g. "⌘N" (hidden on phones) */
+  /** a trailing key hint, e.g. "⌘⌥N" (hidden on phones) */
   kbd?: string
   children?: ReactNode
 }

@@ -198,7 +198,7 @@ describe('Actions (⌘K)', () => {
   })
   it('the palette shortcuts are rows, with their keys', () => {
     const keys = Object.fromEntries(real(null).map((c) => [c.id, c.keys]))
-    expect(keys).toMatchObject({ newdoc: '⌘N', capture: '⌘⇧I', open: '⌘O', search: '⌘⇧F', ask: '⌘/', tree: '⌘T', help: '?' })
+    expect(keys).toMatchObject({ newdoc: '⌘⌥N', capture: '⌘⇧I', open: '⌘O', search: '⌘⇧F', ask: '⌘/', tree: '⌘\\', help: '?' })
   })
   it('"Ask the library…" is an action', () => {
     expect(rankCommands(real(null), 'ask')[0].id).toBe('ask')

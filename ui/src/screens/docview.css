@@ -8,7 +8,7 @@
   padding: 0;
   display: block;
 }
-/* the doc's top bar (Doc artboard): no Capture / New doc here (⌘⇧I, ⌘N) */
+/* the doc's top bar (Doc artboard): no Capture / New doc here (⌘⇧I, ⌘⌥N) */
 .lp-main:has(> .stage-doc) .lp-top-capture,
 .lp-main:has(> .stage-doc) .lp-top-new {
   display: none;

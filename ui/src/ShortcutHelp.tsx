@@ -1,3 +1,4 @@
+import { KEYS } from './shortcuts'
 import PaletteShell from './PaletteShell'
 
 /** The full shortcut cheatsheet (opened with `?`). The home hint bar shows the
@@ -12,8 +13,8 @@ export default function ShortcutHelp({ onClose }: { onClose: () => void }) {
         ['⌘⇧F', 'search inside docs (⌘F and ⌘P too; ⌘S in a doc just confirms autosave)'],
         ['⌘/', 'ask the library — an answer doc with block citations (? in search; ⌘↵ asks)'],
         ['⌘,', 'settings — profile, e-readers'],
-        ['⌘T', 'show or hide the sidebar'],
-        ['⌘⇧H', 'home'],
+        [KEYS.tree, 'show or hide the sidebar'],
+        [KEYS.home, 'home'],
         ['⌘[ / ⌘]', 'history back / forward'],
         ['⌘R', 'reload'],
       ],
@@ -21,7 +22,7 @@ export default function ShortcutHelp({ onClose }: { onClose: () => void }) {
     [
       'Create & act',
       [
-        ['⌘N', 'new doc'],
+        [KEYS.newdoc, 'new doc'],
         ['⌘⇧I', 'quick capture → Inbox (⌥⌘G from anywhere on the Mac, in the app)'],
         ['⌘⇧R', 'review queue'],
         ['⌘G', 'gardeners'],

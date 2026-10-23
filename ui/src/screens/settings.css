@@ -535,3 +535,8 @@
     white-space: normal;
   }
 }
+
+/* a section scrolled to (the nav) sits just below the stage edge */
+[id^="settings-"] {
+  scroll-margin-top: 16px;
+}

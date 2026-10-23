@@ -1,5 +1,5 @@
 // The persistent left sidebar (canvas Main / Library): the ◈ Taisce brand
-// with the hide button (⌘T), the workspace switcher, the places (Home,
+// with the hide button (⌘\), the workspace switcher, the places (Home,
 // Inbox, To-dos, Review, Search & Ask, Books), the doc tree (Pinned, then
 // Library), and at the foot Gardeners, Trash, Settings and who you are.
 // On a phone the same panel is a drawer (AppShell decides).
@@ -57,7 +57,7 @@ export default function Sidebar({
       <div className="lp-brand">
         <LapisMark size={26} />
         <b>Taisce</b>
-        <IconButton icon={drawer ? 'close' : 'sidebar'} label={drawer ? 'Close menu' : 'Hide sidebar (⌘T)'} onClick={onHide} className="lp-brand-hide" />
+        <IconButton icon={drawer ? 'close' : 'sidebar'} label={drawer ? 'Close menu' : 'Hide sidebar (⌘\\)'} onClick={onHide} className="lp-brand-hide" />
       </div>
       {workspaceMenu}
       <div className="lp-nav">

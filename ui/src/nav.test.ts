@@ -49,7 +49,7 @@ describe('palettes render', () => {
       }),
     )
     expect(html.indexOf('This doc')).toBeLessThan(html.indexOf('New doc'))
-    expect(html).toContain('<kbd>⌘N</kbd>')
+    expect(html).toContain('<kbd>⌘⌥N</kbd>')
     expect(html).not.toContain('Trash')
   })
   it('Search: ? opens it asking', () => {

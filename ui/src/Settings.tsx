@@ -45,16 +45,11 @@ export function settingsSections(server: boolean, want: SettingsSection) {
   return { shown, active }
 }
 
-/** Scroll the page (the stage, not the window: scrollIntoView would also
- * nudge every scrollable ancestor) so a section's card sits at the top. */
+/** Bring a section's card to the top of the stage. The shell's frame boxes
+ * are `overflow: clip`, so scrollIntoView moves the stage and nothing else;
+ * the card's scroll-margin-top keeps it off the stage's edge. */
 function scrollToSection(id: SettingsSection, smooth: boolean) {
-  const el = document.getElementById(`settings-${id}`)
-  if (!el) return
-  let box: HTMLElement | null = el.parentElement
-  while (box && !(box.scrollHeight > box.clientHeight && /(auto|scroll)/.test(getComputedStyle(box).overflowY))) box = box.parentElement
-  if (!box) return
-  const top = el.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop - 16
-  box.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
+  document.getElementById(`settings-${id}`)?.scrollIntoView({ block: 'start', behavior: smooth ? 'smooth' : 'auto' })
 }
 
 export default function Settings({

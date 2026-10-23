@@ -7,6 +7,7 @@ import { notify, errText } from './Notice'
 import { copyText } from './Profile'
 import { backupFileName, inTauri, saveDialog } from './tauri'
 import { api } from './types'
+import { KEYS } from './shortcuts'
 import type { OmniCommand } from './omni'
 import { THEME_LABEL, getThemePref, nextThemePref, setThemePref } from './lapis/theme'
 
@@ -70,8 +71,8 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
     )
   }
   cmds.push(
-    { id: 'newdoc', icon: 'plus', group: 'Create', label: 'New doc…', keys: '⌘N', keywords: 'create page note', run: () => onAction('newdoc') },
-    { id: 'capture', icon: 'capture', group: 'Create', label: 'Quick capture…', hint: 'a note straight into Inbox', keys: '⌘⇧I', keywords: 'inbox jot', run: () => onAction('capture') },
+    { id: 'newdoc', icon: 'plus', group: 'Create', label: 'New doc…', keys: KEYS.newdoc, keywords: 'create page note', run: () => onAction('newdoc') },
+    { id: 'capture', icon: 'capture', group: 'Create', label: 'Quick capture…', hint: 'a note straight into Inbox', keys: KEYS.capture, keywords: 'inbox jot', run: () => onAction('capture') },
     { id: 'open', icon: 'search', group: 'Go', label: 'Open a doc or place…', keys: '⌘O', keywords: 'go to jump find title', run: () => onAction('open') },
     { id: 'search', icon: 'search', group: 'Go', label: 'Search inside docs…', hint: 'full text, typos fine', keys: '⌘⇧F', keywords: 'find content text', run: () => onAction('search') },
     { id: 'ask', icon: 'ask', group: 'Go', label: 'Ask the library…', hint: 'an answer doc that cites its blocks', keys: '⌘/', keywords: 'question vault answer ai', run: () => onAction('ask') },
@@ -92,7 +93,7 @@ export function buildCommands({ signedIn, library, onSignOut, docId, onAction }:
     })
   }
   cmds.push(
-    { id: 'tree', icon: 'sidebar', group: 'Go', label: 'Show or hide the sidebar', keys: '⌘T', keywords: 'sidebar folders', run: () => onAction('tree') },
+    { id: 'tree', icon: 'sidebar', group: 'Go', label: 'Show or hide the sidebar', keys: KEYS.tree, keywords: 'sidebar folders', run: () => onAction('tree') },
     {
       id: 'import', icon: 'folder', group: 'Create',
       label: 'Import a folder of Markdown…',

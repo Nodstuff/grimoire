@@ -137,7 +137,7 @@ export default function OpenPalette({
                 No titles match — <kbd>⌘↵</kbd>searches inside docs
               </>
             ) : (
-              'No docs yet — ⌘N creates one'
+              'No docs yet — ⌘⌥N creates one'
             )}
           </div>
         )}

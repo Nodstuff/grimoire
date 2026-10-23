@@ -37,7 +37,7 @@ export default function TopBar({
 }) {
   return (
     <header className="lp-top" data-tauri-drag-region>
-      {sidebarHidden && <IconButton icon="sidebar" label="Show sidebar (⌘T)" onClick={onShowSidebar} className="lp-top-side" />}
+      {sidebarHidden && <IconButton icon="sidebar" label={'Show sidebar (⌘\\)'} onClick={onShowSidebar} className="lp-top-side" />}
       <IconButton icon="menu" label="Menu" onClick={onShowSidebar} className="lp-top-menu" />
       <IconButton icon="back" label="Back (⌘[)" onClick={onBack} className="lp-top-hist lp-top-back" />
       <IconButton icon="forward" label="Forward (⌘])" onClick={onForward} className="lp-top-hist lp-top-fwd" />

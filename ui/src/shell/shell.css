@@ -4,23 +4,42 @@
    styling lives here: a screen styles itself. */
 
 /* ---------- frame ---------- */
+/* The window never scrolls: the shell is exactly the viewport and only the
+   stage (and the sidebar) scroll inside it. `overflow: clip` (not hidden)
+   on every frame box, because a hidden box is still programmatically
+   scrollable — scrollIntoView on a block inside the stage would otherwise
+   nudge the whole shell up under the top bar. */
+html:has(.lp-app),
+html:has(.lp-app) body,
+#root:has(> .lp-app) {
+  height: 100%;
+  overflow: clip;
+  overscroll-behavior: none;
+}
 .lp-app {
   display: flex;
   height: 100vh;
   height: 100dvh;
+  overflow: clip;
   background: var(--bg);
 }
 .lp-main {
   flex: 1 1 auto;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   height: 100%;
+  overflow: clip;
+}
+.lp-main > .lp-top {
+  flex: 0 0 auto;
 }
 .lp-main > .stage {
-  flex: 1;
+  flex: 1 1 0;
   min-height: 0;
   outline: none;
+  overscroll-behavior: contain;
 }
 .lp-skip {
   position: fixed;

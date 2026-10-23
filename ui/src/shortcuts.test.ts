@@ -24,8 +24,10 @@ describe('resolveShortcut', () => {
     ['⌘S → search outside a doc (alias)', meta('s'), 'search'],
     ['⌘/ → ask', meta('/'), 'ask'],
     ['⌘, → settings', meta(','), 'settings'],
-    ['⌘T → tree', meta('t'), 'tree'],
-    ['⌘N → newdoc', meta('n'), 'newdoc'],
+    ['⌘\\ → tree', meta('\\'), 'tree'],
+    ['⌘⌥N → newdoc (physical key: ⌥N is a dead key)', { ...meta('˜'), code: 'KeyN', altKey: true }, 'newdoc'],
+    ['⌘T → tree (Mac app alias; browsers keep ⌘T)', meta('t'), 'tree'],
+    ['⌘N → newdoc (Mac app alias; browsers keep ⌘N)', meta('n'), 'newdoc'],
     ['⌘R → reload', meta('r'), 'reload'],
     ['⌘⇧R → review', meta('R', true), 'review'],
     ['⌘G → gardeners', meta('g'), 'gardeners'],
@@ -102,6 +104,14 @@ describe('resolveShortcut', () => {
     expect(resolveShortcut(q)).toBe('help')
     expect(resolveShortcut(q, { typing: true })).toBeNull()
     expect(resolveShortcut(q, { inEditor: true })).toBeNull()
+  })
+
+  it('no advertised chord is one a browser reserves on macOS', async () => {
+    const { KEYS } = await import('./shortcuts')
+    const reserved = ['⌘W', '⌘⇧W', '⌘T', '⌘⇧T', '⌘N', '⌘⇧N', '⌘Q', '⌘M', '⌘H', '⌘L', '⌘D', ...'123456789'.split('').map((d) => `⌘${d}`)]
+    for (const k of Object.values(KEYS)) expect(reserved).not.toContain(k)
+    expect(resolveShortcut({ ...meta('n'), code: 'KeyN', altKey: true, shiftKey: true })).toBeNull() // ⌘⌥⇧N
+    expect(resolveShortcut(meta('|', true))).toBeNull() // ⌘⇧\
   })
 
   it('unhandled variants are null, so the caller never preventDefaults them', () => {
