@@ -490,7 +490,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -549,6 +549,8 @@ fn backfill(conn: &Connection) -> Result<()> {
     // by init; nothing to backfill.
     // v11: the EPUB library (books.sql: book, ereader, kosync_progress).
     // Created IF NOT EXISTS by init; nothing to backfill.
+    // v12: book upload tokens (books.sql: upload_token). Created IF NOT
+    // EXISTS by init; nothing to backfill.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -3635,8 +3637,8 @@ impl SqliteStore {
         Ok(self.doc_stamp()?.wrapping_add(library))
     }
 
-    /// The EPUB library's share of the stamp (books, ereaders, kosync
-    /// progress), keyed to the caller's own rows: an upload, an edit, a
+    /// The EPUB library's share of the stamp (books, ereaders, upload
+    /// tokens, kosync progress), keyed to the caller's own rows: an upload, an edit, a
     /// delete, a pairing or a pushed position refreshes the Books view.
     /// `last_used_at` is left out on purpose (a reading device would tick
     /// it every minute).
@@ -3654,6 +3656,8 @@ impl SqliteStore {
                                            + coalesce(series_index, 0) * 131), 0) FROM book {mine})
                           + (SELECT COALESCE(count(*) * 104729 + count(revoked_at) * 31 + sum(length(label))
                                      + sum(stream_downloads) * 17, 0) FROM ereader {mine})
+                          + (SELECT COALESCE(count(*) * 7727 + count(revoked_at) * 37 + sum(length(label)), 0)
+                             FROM upload_token {mine})
                           + (SELECT COALESCE(count(*) * 1299709 + sum(updated_at % 1000003) + sum(CAST(percentage * 10000 AS INTEGER)), 0)
                              FROM kosync_progress {mine})"
                 ),

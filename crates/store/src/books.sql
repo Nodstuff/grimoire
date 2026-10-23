@@ -62,6 +62,25 @@ CREATE TABLE IF NOT EXISTS ereader (
 CREATE UNIQUE INDEX IF NOT EXISTS ereader_secret_hash ON ereader (secret_hash);
 CREATE INDEX IF NOT EXISTS ereader_by_user ON ereader (user_id);
 
+-- A book upload token (schema v12): a bearer secret (`tbu_…`) an
+-- integration (a Readarr/Chaptarr custom script, a cron job) sends to
+-- POST /api/books, and nowhere else. Minted by the person in Settings,
+-- shown once, stored as its SHA-256 only; unique across all users, since
+-- the hash alone names the user. Revoking keeps the row (it stays listed)
+-- but ends every resolution.
+CREATE TABLE IF NOT EXISTS upload_token (
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES auth_users (id) ON DELETE CASCADE,
+    label        TEXT NOT NULL,
+    -- SHA-256 (hex) of the whole token, `tbu_` prefix included
+    secret_hash  TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    last_used_at INTEGER,
+    revoked_at   INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS upload_token_secret_hash ON upload_token (secret_hash);
+CREATE INDEX IF NOT EXISTS upload_token_by_user ON upload_token (user_id);
+
 -- KOSYNC reading progress: one row per (person, document), newest-wins —
 -- an upsert whose stamp is not newer than the stored one leaves the row
 -- untouched (books.rs kosync_upsert).

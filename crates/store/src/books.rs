@@ -10,8 +10,13 @@
 //! else's is `NotFound`, never 403), and user-keyed calls must name the
 //! caller — System (and Local) may act for anyone, for maintenance and
 //! the daemon's internal calls. The auth-resolution reads
-//! (`ereader_find_by_secret_hash`, `ereader_find_kosync`) run before a
-//! user scope exists: the hash IS the credential.
+//! (`ereader_find_by_secret_hash`, `ereader_find_kosync`,
+//! `upload_token_find_by_hash`) run before a user scope exists: the hash IS
+//! the credential.
+//!
+//! `upload_token` rows are book upload tokens (`tbu_…`): the bearer an
+//! integration sends to POST /api/books, and nowhere else (the daemon's
+//! `auth::require_auth` enforces the route).
 
 use crate::scope::Scope;
 use crate::sqlite::SqliteStore;
@@ -105,6 +110,22 @@ pub struct Ereader {
 /// costs one UPDATE a minute, not one per request.
 pub const EREADER_TOUCH_EVERY: i64 = 60;
 
+/// A book upload token (revoked rows included: they stay listed, they
+/// just no longer authenticate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadToken {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub label: String,
+    pub secret_hash: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+}
+
+/// Seconds between `last_used_at` writes for one upload token.
+pub const UPLOAD_TOKEN_TOUCH_EVERY: i64 = 60;
+
 /// One person's progress in one document.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KosyncProgress {
@@ -122,6 +143,8 @@ const BOOK_COLS: &str = "id, user_id, title, author, series, series_index, book_
 
 const EREADER_COLS: &str = "e.id, e.user_id, e.label, e.secret_hash, e.kosync_key_hash,
     e.stream_downloads, e.created_at, e.last_used_at, e.revoked_at, e.kosync_key_hash_alt";
+
+const UPLOAD_TOKEN_COLS: &str = "t.id, t.user_id, t.label, t.secret_hash, t.created_at, t.last_used_at, t.revoked_at";
 
 const KOSYNC_COLS: &str = "user_id, document, progress, percentage, device, device_id, updated_at";
 
@@ -165,6 +188,18 @@ fn ereader_row(r: &Row) -> rusqlite::Result<Ereader> {
     })
 }
 
+fn upload_token_row(r: &Row) -> rusqlite::Result<UploadToken> {
+    Ok(UploadToken {
+        id: uuid_at(r, 0)?,
+        user_id: uuid_at(r, 1)?,
+        label: r.get(2)?,
+        secret_hash: r.get(3)?,
+        created_at: r.get(4)?,
+        last_used_at: r.get(5)?,
+        revoked_at: r.get(6)?,
+    })
+}
+
 fn kosync_row(r: &Row) -> rusqlite::Result<KosyncProgress> {
     Ok(KosyncProgress {
         user_id: uuid_at(r, 0)?,
@@ -183,6 +218,10 @@ fn book_not_found(id: Uuid) -> StoreError {
 
 fn ereader_not_found(id: Uuid) -> StoreError {
     StoreError::NotFound(format!("ereader {id}"))
+}
+
+fn upload_token_not_found(id: Uuid) -> StoreError {
+    StoreError::NotFound(format!("upload token {id}"))
 }
 
 impl SqliteStore {
@@ -571,6 +610,85 @@ impl SqliteStore {
             .optional()?)
     }
 
+    // ---- book upload tokens ----
+
+    /// Mint an upload token for the caller. `secret_hash` is computed by the
+    /// daemon; the store never sees the secret.
+    pub fn upload_token_insert(&mut self, id: Uuid, label: &str, secret_hash: &str, now: i64) -> Result<UploadToken> {
+        let owner = self.library_owner()?;
+        self.conn.execute(
+            "INSERT INTO upload_token (id, user_id, label, secret_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id.to_string(), owner.to_string(), label, secret_hash, now],
+        )?;
+        self.upload_token_get(id)
+    }
+
+    /// One of the caller's own upload tokens (revoked included); anyone
+    /// else's is NotFound.
+    pub fn upload_token_get(&self, id: Uuid) -> Result<UploadToken> {
+        let owner = self.owner_scoped(upload_token_not_found(id))?;
+        self.conn
+            .query_row(
+                &format!("SELECT {UPLOAD_TOKEN_COLS} FROM upload_token t WHERE t.id = ?1 AND (?2 IS NULL OR t.user_id = ?2)"),
+                params![id.to_string(), owner.map(|o| o.to_string())],
+                upload_token_row,
+            )
+            .optional()?
+            .ok_or_else(|| upload_token_not_found(id))
+    }
+
+    /// `user`'s upload tokens, oldest first, revoked ones included.
+    pub fn upload_token_list(&self, user: Uuid) -> Result<Vec<UploadToken>> {
+        let owner = self.user_scoped(user)?;
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {UPLOAD_TOKEN_COLS} FROM upload_token t WHERE t.user_id = ?1 ORDER BY t.created_at, t.id"
+        ))?;
+        let rows = st.query_map(params![owner.to_string()], upload_token_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Record a use of one of the caller's live upload tokens, unless one
+    /// was recorded in the last minute. True when it wrote.
+    pub fn upload_token_touch_last_used(&mut self, id: Uuid, now: i64) -> Result<bool> {
+        let owner = self.owner_scoped(upload_token_not_found(id))?;
+        let n = self.conn.execute(
+            "UPDATE upload_token SET last_used_at = ?2
+             WHERE id = ?1 AND revoked_at IS NULL AND (?3 IS NULL OR user_id = ?3)
+               AND (last_used_at IS NULL OR last_used_at <= ?2 - ?4)",
+            params![id.to_string(), now, owner.map(|o| o.to_string()), UPLOAD_TOKEN_TOUCH_EVERY],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Revoke one of the caller's upload tokens: the row stays listed,
+    /// every resolution stops. Idempotent.
+    pub fn upload_token_revoke(&mut self, id: Uuid, now: i64) -> Result<()> {
+        self.upload_token_get(id)?;
+        self.conn.execute(
+            "UPDATE upload_token SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+            params![id.to_string(), now],
+        )?;
+        Ok(())
+    }
+
+    /// The live (unrevoked) upload token behind a secret's hash, its user
+    /// still present. Runs before a user scope exists (the daemon's auth
+    /// resolution, in System): the hash is the credential.
+    pub fn upload_token_find_by_hash(&self, secret_hash: &str) -> Result<Option<UploadToken>> {
+        self.deny_public()?;
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {UPLOAD_TOKEN_COLS} FROM upload_token t
+                     WHERE t.secret_hash = ?1 AND t.revoked_at IS NULL AND t.user_id IN (SELECT id FROM auth_users)"
+                ),
+                [secret_hash],
+                upload_token_row,
+            )
+            .optional()?)
+    }
+
     // ---- kosync progress ----
 
     /// Record `user`'s progress in `document`, newest-wins: an incoming
@@ -936,6 +1054,41 @@ mod tests {
             assert!(matches!(s.ereader_rotate(id, "x", ("y", "")), Err(StoreError::InvalidOp(_))));
             assert!(!s.ereader_touch_last_used(id, 400).unwrap());
             assert_eq!(s.ereader_list(a).unwrap().len(), 2, "revoked rows stay listed");
+        });
+    }
+
+    #[test]
+    fn upload_token_lifecycle_and_isolation() {
+        let (mut s, a, b) = store_with_users();
+        let id = Uuid::now_v7();
+        s.with_scope_for_test(Scope::User(a), |s| {
+            let t = s.upload_token_insert(id, "chaptarr", "uh1", 100).unwrap();
+            assert_eq!((t.user_id, t.label.as_str(), t.created_at, t.last_used_at, t.revoked_at), (a, "chaptarr", 100, None, None));
+            assert_eq!(s.upload_token_list(a).unwrap().len(), 1);
+            assert!(s.upload_token_touch_last_used(id, 200).unwrap(), "the first touch writes");
+            assert!(!s.upload_token_touch_last_used(id, 259).unwrap(), "inside the minute");
+            assert!(s.upload_token_touch_last_used(id, 260).unwrap());
+            assert_eq!(s.upload_token_find_by_hash("uh1").unwrap().unwrap().id, id);
+            assert!(s.upload_token_find_by_hash("nope").unwrap().is_none());
+        });
+        // B: A's token is NotFound by id, absent from B's list, and B cannot
+        // list A's shelf of tokens by naming A
+        s.with_scope_for_test(Scope::User(b), |s| {
+            assert!(matches!(s.upload_token_get(id), Err(StoreError::NotFound(_))));
+            assert!(matches!(s.upload_token_revoke(id, 300), Err(StoreError::NotFound(_))));
+            assert!(matches!(s.upload_token_touch_last_used(id, 400), Err(StoreError::NotFound(_)) | Ok(false)));
+            assert!(s.upload_token_list(b).unwrap().is_empty());
+            assert!(s.upload_token_list(a).is_err());
+        });
+        assert_eq!(s.upload_token_get(id).unwrap().revoked_at, None, "B's revoke changed nothing");
+        assert!(s.with_scope_for_test(Scope::Public, |s| s.upload_token_find_by_hash("uh1")).is_err(), "Public never resolves");
+        s.with_scope_for_test(Scope::User(a), |s| {
+            s.upload_token_revoke(id, 300).unwrap();
+            s.upload_token_revoke(id, 301).unwrap();
+            assert_eq!(s.upload_token_get(id).unwrap().revoked_at, Some(300));
+            assert!(s.upload_token_find_by_hash("uh1").unwrap().is_none(), "revoked no longer resolves");
+            assert!(!s.upload_token_touch_last_used(id, 500).unwrap());
+            assert_eq!(s.upload_token_list(a).unwrap().len(), 1, "revoked rows stay listed");
         });
     }
 
