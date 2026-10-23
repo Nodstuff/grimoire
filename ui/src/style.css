@@ -146,7 +146,6 @@ kbd {
 .who.human { color: var(--accent); }
 .who.agent { color: var(--yellow); }
 .who.remote { color: var(--red); }
-}
 
 /* ---------- gardener management ---------- */
 
