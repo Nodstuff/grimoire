@@ -24,6 +24,24 @@ CREATE TABLE IF NOT EXISTS book (
     size              INTEGER NOT NULL,
     file_s3_key       TEXT NOT NULL,
     cover_s3_key      TEXT,
+    -- colour covers (schema v14; sqlite.rs adds these to older tables):
+    -- the embedded cover's verdict, NULL = not looked at yet (a pre-v14
+    -- book, or one without a cover), 1 = greyscale, 0 = colour
+    cover_grey        INTEGER,
+    -- the ISBNs among the OPF's identifiers, comma-separated; NULL = never
+    -- read (pre-v14), '' = none
+    isbns             TEXT,
+    -- a colour cover found for the book, stored beside it (never inside
+    -- the EPUB): what every cover route serves while cover_choice='color'
+    color_cover_s3_key TEXT,
+    -- 'none' (nobody chose), 'embedded' (keep the book's own) or 'color';
+    -- an explicit choice is never overwritten by a library pass
+    cover_choice      TEXT NOT NULL DEFAULT 'none',
+    -- the human principal who chose, and when
+    cover_choice_by   TEXT,
+    cover_choice_at   INTEGER,
+    -- when Open Library was last asked for this book (the candidates cache)
+    color_lookup_at   INTEGER,
     added_at          INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
     -- soft delete: the row stays (its keys name the objects); the daemon
@@ -120,3 +138,29 @@ CREATE INDEX IF NOT EXISTS epub_image_by_doc ON epub_image (owner_key, doc_id);
 CREATE TRIGGER IF NOT EXISTS epub_image_doc_purged AFTER DELETE ON docs BEGIN
     DELETE FROM epub_image WHERE doc_id = OLD.id;
 END;
+
+-- Colour-cover candidates (schema v14, library covers.rs): images the
+-- server fetched from Open Library for one book and validated (decodes,
+-- tall enough, actually colourful). A cache, replaced on every lookup and
+-- dropped when the book's cover is chosen or the book is deleted; small
+-- (tens of KB each, at most a handful per book), so the bytes live here
+-- rather than in the bucket. Clients reference a candidate by this id,
+-- never by a URL: the server alone decides what it fetches.
+CREATE TABLE IF NOT EXISTS book_cover_candidate (
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES auth_users (id) ON DELETE CASCADE,
+    book_id      TEXT NOT NULL REFERENCES book (id) ON DELETE CASCADE,
+    -- 'isbn' (that edition's cover) or 'search' (title and author)
+    source       TEXT NOT NULL,
+    -- the ISBN or Open Library cover id it came from
+    source_ref   TEXT NOT NULL,
+    -- best first
+    rank         INTEGER NOT NULL,
+    image        BLOB NOT NULL,
+    ext          TEXT NOT NULL,
+    width        INTEGER NOT NULL,
+    height       INTEGER NOT NULL,
+    colorfulness REAL NOT NULL,
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS book_cover_candidate_by_book ON book_cover_candidate (user_id, book_id, rank);

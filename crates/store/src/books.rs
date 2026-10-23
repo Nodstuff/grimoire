@@ -43,6 +43,112 @@ pub struct Book {
     pub added_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
+    /// The embedded cover's verdict: None = not looked at yet, Some(true) =
+    /// greyscale (a colour match is worth offering), Some(false) = colour.
+    pub cover_grey: Option<bool>,
+    /// The ISBNs among the OPF's identifiers, comma-separated; None = never
+    /// read (a pre-v14 row), Some("") = the file carries none.
+    pub isbns: Option<String>,
+    /// A colour cover stored beside the book (never inside the EPUB).
+    pub color_cover_s3_key: Option<String>,
+    pub cover_choice: CoverChoice,
+    /// The human principal who made `cover_choice`, and when.
+    pub cover_choice_by: Option<String>,
+    pub cover_choice_at: Option<i64>,
+    /// When Open Library was last asked for this book's colour covers.
+    pub color_lookup_at: Option<i64>,
+}
+
+impl Book {
+    /// The cover every route shows: the colour one while it is chosen, else
+    /// the book's own. The EPUB itself is never touched either way.
+    pub fn shown_cover_key(&self) -> Option<&str> {
+        match (self.cover_choice, self.color_cover_s3_key.as_deref()) {
+            (CoverChoice::Color, Some(k)) => Some(k),
+            _ => self.cover_s3_key.as_deref(),
+        }
+    }
+
+    /// The ISBNs as a list (empty when none, or never read).
+    pub fn isbn_list(&self) -> Vec<String> {
+        self.isbns
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|i| !i.is_empty())
+            .map(String::from)
+            .collect()
+    }
+}
+
+/// Which cover a person picked for a book. `None` = nobody chose: a
+/// library pass may offer (and, accepted, set) a colour cover. Anything
+/// else is the person's and a pass never overwrites it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CoverChoice {
+    #[default]
+    None,
+    Embedded,
+    Color,
+}
+
+impl CoverChoice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CoverChoice::None => "none",
+            CoverChoice::Embedded => "embedded",
+            CoverChoice::Color => "color",
+        }
+    }
+
+    fn parse(s: &str) -> CoverChoice {
+        match s {
+            "embedded" => CoverChoice::Embedded,
+            "color" => CoverChoice::Color,
+            _ => CoverChoice::None,
+        }
+    }
+}
+
+/// A validated colour-cover candidate, as the daemon fetched it.
+#[derive(Debug, Clone)]
+pub struct NewCoverCandidate {
+    /// "isbn" or "search"
+    pub source: String,
+    /// the ISBN, or the Open Library cover id
+    pub source_ref: String,
+    pub image: Vec<u8>,
+    /// "jpg" | "png" | "webp" | "gif"
+    pub ext: String,
+    pub width: i64,
+    pub height: i64,
+    pub colorfulness: f64,
+}
+
+/// A stored candidate (`image` empty unless asked for).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoverCandidate {
+    pub id: Uuid,
+    pub book_id: Uuid,
+    pub source: String,
+    pub source_ref: String,
+    pub rank: i64,
+    pub ext: String,
+    pub width: i64,
+    pub height: i64,
+    pub colorfulness: f64,
+    pub created_at: i64,
+    pub image: Vec<u8>,
+}
+
+/// What [`SqliteStore::book_choose_cover`] sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverPick<'a> {
+    /// the book's own (embedded) cover, explicitly
+    Embedded,
+    /// a colour cover already stored at this key
+    Color(&'a str),
 }
 
 /// What the daemon validated about a new upload; the store keys it to the
@@ -139,7 +245,10 @@ pub struct KosyncProgress {
 }
 
 const BOOK_COLS: &str = "id, user_id, title, author, series, series_index, book_identifier,
-    original_filename, file_sha256, size, file_s3_key, cover_s3_key, added_at, updated_at, deleted_at";
+    original_filename, file_sha256, size, file_s3_key, cover_s3_key, added_at, updated_at, deleted_at,
+    cover_grey, isbns, color_cover_s3_key, cover_choice, cover_choice_by, cover_choice_at, color_lookup_at";
+
+const CANDIDATE_COLS: &str = "id, book_id, source, source_ref, rank, ext, width, height, colorfulness, created_at";
 
 const EREADER_COLS: &str = "e.id, e.user_id, e.label, e.secret_hash, e.kosync_key_hash,
     e.stream_downloads, e.created_at, e.last_used_at, e.revoked_at, e.kosync_key_hash_alt";
@@ -170,6 +279,29 @@ fn book_row(r: &Row) -> rusqlite::Result<Book> {
         added_at: r.get(12)?,
         updated_at: r.get(13)?,
         deleted_at: r.get(14)?,
+        cover_grey: r.get::<_, Option<i64>>(15)?.map(|v| v != 0),
+        isbns: r.get(16)?,
+        color_cover_s3_key: r.get(17)?,
+        cover_choice: CoverChoice::parse(&r.get::<_, String>(18)?),
+        cover_choice_by: r.get(19)?,
+        cover_choice_at: r.get(20)?,
+        color_lookup_at: r.get(21)?,
+    })
+}
+
+fn candidate_row(r: &Row) -> rusqlite::Result<CoverCandidate> {
+    Ok(CoverCandidate {
+        id: uuid_at(r, 0)?,
+        book_id: uuid_at(r, 1)?,
+        source: r.get(2)?,
+        source_ref: r.get(3)?,
+        rank: r.get(4)?,
+        ext: r.get(5)?,
+        width: r.get(6)?,
+        height: r.get(7)?,
+        colorfulness: r.get(8)?,
+        created_at: r.get(9)?,
+        image: Vec::new(),
     })
 }
 
@@ -428,6 +560,8 @@ impl SqliteStore {
         self.book_get(id)?;
         self.conn
             .execute("UPDATE book SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1", params![id.to_string(), now])?;
+        // the candidates cache dies with the book (the row stays, so no cascade)
+        self.conn.execute("DELETE FROM book_cover_candidate WHERE book_id = ?1", params![id.to_string()])?;
         Ok(())
     }
 
@@ -489,6 +623,154 @@ impl SqliteStore {
         self.conn
             .execute("UPDATE book SET cover_s3_key = ?2, updated_at = ?3 WHERE id = ?1", params![id.to_string(), cover_s3_key, now])?;
         self.book_get(id)
+    }
+
+    // ---- colour covers ----
+
+    /// Record what ingest (or the cover review) learned about one of the
+    /// caller's live books' own cover and identifiers: the greyscale
+    /// verdict (None = could not tell) and the ISBNs (`Some` replaces them;
+    /// `None` leaves them). Not a metadata change: `updated_at` stays.
+    pub fn book_set_cover_facts(&mut self, id: Uuid, cover_grey: Option<bool>, isbns: Option<&str>) -> Result<Book> {
+        self.book_get(id)?;
+        self.conn.execute(
+            "UPDATE book SET cover_grey = ?2, isbns = coalesce(?3, isbns) WHERE id = ?1",
+            params![id.to_string(), cover_grey.map(i64::from), isbns],
+        )?;
+        self.book_get(id)
+    }
+
+    /// Set the cover one of the caller's live books shows, as `by` (the
+    /// person's human principal). `Color(key)` stores the colour cover's
+    /// key; `Embedded` clears it. Either is an explicit choice. With
+    /// `unless_chosen` (a library pass's "accept"), a book whose cover the
+    /// person already chose is refused with `Forbidden` and left exactly as
+    /// it was: a pass never overwrites a choice. Returns the book and the
+    /// colour key it replaced (the daemon deletes that object). Bumps
+    /// `updated_at` (feeds re-fetch the cover) and drops the candidates.
+    pub fn book_choose_cover(
+        &mut self,
+        id: Uuid,
+        pick: CoverPick<'_>,
+        unless_chosen: bool,
+        by: &str,
+        now: i64,
+    ) -> Result<(Book, Option<String>)> {
+        let cur = self.book_get(id)?;
+        if unless_chosen && cur.cover_choice != CoverChoice::None {
+            return Err(StoreError::Forbidden(format!(
+                "this book's cover was already chosen ({}); a library pass never overwrites a choice",
+                cur.cover_choice.as_str()
+            )));
+        }
+        let (choice, key) = match pick {
+            CoverPick::Embedded => (CoverChoice::Embedded, None),
+            CoverPick::Color(k) => (CoverChoice::Color, Some(k)),
+        };
+        self.conn.execute(
+            "UPDATE book SET cover_choice = ?2, color_cover_s3_key = ?3, cover_choice_by = ?4,
+                 cover_choice_at = ?5, updated_at = ?5 WHERE id = ?1",
+            params![id.to_string(), choice.as_str(), key, by, now],
+        )?;
+        self.conn.execute("DELETE FROM book_cover_candidate WHERE book_id = ?1", params![id.to_string()])?;
+        let replaced = cur.color_cover_s3_key.filter(|old| Some(old.as_str()) != key);
+        Ok((self.book_get(id)?, replaced))
+    }
+
+    /// Replace the candidates cached for one of the caller's live books
+    /// with a fresh lookup's (best first) and stamp `color_lookup_at`.
+    pub fn book_cover_candidates_replace(&mut self, id: Uuid, list: &[NewCoverCandidate], now: i64) -> Result<Vec<CoverCandidate>> {
+        let book = self.book_get(id)?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM book_cover_candidate WHERE book_id = ?1", params![id.to_string()])?;
+        for (rank, c) in list.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO book_cover_candidate
+                     (id, user_id, book_id, source, source_ref, rank, image, ext, width, height, colorfulness, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    Uuid::now_v7().to_string(),
+                    book.user_id.to_string(),
+                    id.to_string(),
+                    c.source,
+                    c.source_ref,
+                    rank as i64,
+                    c.image,
+                    c.ext,
+                    c.width,
+                    c.height,
+                    c.colorfulness,
+                    now
+                ],
+            )?;
+        }
+        tx.execute("UPDATE book SET color_lookup_at = ?2 WHERE id = ?1", params![id.to_string(), now])?;
+        tx.commit()?;
+        self.book_cover_candidates(id)
+    }
+
+    /// The candidates cached for one of the caller's live books, best
+    /// first, without their bytes.
+    pub fn book_cover_candidates(&self, id: Uuid) -> Result<Vec<CoverCandidate>> {
+        let book = self.book_get(id)?;
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {CANDIDATE_COLS} FROM book_cover_candidate WHERE user_id = ?1 AND book_id = ?2 ORDER BY rank, id"
+        ))?;
+        let rows = st.query_map(params![book.user_id.to_string(), id.to_string()], candidate_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// One cached candidate of one of the caller's live books, bytes
+    /// included. Another book's candidate (or anyone else's) is NotFound.
+    pub fn book_cover_candidate(&self, id: Uuid, candidate: Uuid) -> Result<CoverCandidate> {
+        let book = self.book_get(id)?;
+        let not_found = || StoreError::NotFound(format!("cover candidate {candidate}"));
+        let mut c = self
+            .conn
+            .query_row(
+                &format!("SELECT {CANDIDATE_COLS} FROM book_cover_candidate WHERE id = ?1 AND book_id = ?2 AND user_id = ?3"),
+                params![candidate.to_string(), id.to_string(), book.user_id.to_string()],
+                candidate_row,
+            )
+            .optional()?
+            .ok_or_else(not_found)?;
+        c.image = self.conn.query_row(
+            "SELECT image FROM book_cover_candidate WHERE id = ?1",
+            params![candidate.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(c)
+    }
+
+    /// `user`'s live books a colour-cover pass should look at: nobody chose
+    /// a cover and none is set, and the embedded cover is greyscale — or,
+    /// with `unscanned`, not looked at yet (it has a cover, no verdict).
+    /// Oldest first, so a pass works through a library in a stable order.
+    pub fn book_list_cover_review(&self, user: Uuid, unscanned: bool, limit: usize) -> Result<Vec<Book>> {
+        let owner = self.user_scoped(user)?;
+        let verdict = if unscanned { "cover_grey IS NULL AND cover_s3_key IS NOT NULL" } else { "cover_grey = 1" };
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {BOOK_COLS} FROM book
+             WHERE user_id = ?1 AND deleted_at IS NULL AND cover_choice = 'none'
+               AND color_cover_s3_key IS NULL AND {verdict}
+             ORDER BY added_at, id LIMIT ?2"
+        ))?;
+        let rows = st.query_map(params![owner.to_string(), limit as i64], book_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many of `user`'s live books [`Self::book_list_cover_review`]
+    /// would list: (greyscale, not looked at yet).
+    pub fn book_cover_review_counts(&self, user: Uuid) -> Result<(usize, usize)> {
+        let owner = self.user_scoped(user)?;
+        Ok(self.conn.query_row(
+            "SELECT coalesce(sum(cover_grey = 1), 0),
+                    coalesce(sum(cover_grey IS NULL AND cover_s3_key IS NOT NULL), 0)
+             FROM book WHERE user_id = ?1 AND deleted_at IS NULL AND cover_choice = 'none'
+               AND color_cover_s3_key IS NULL",
+            params![owner.to_string()],
+            |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize)),
+        )?)
     }
 
     // ---- ereaders ----
@@ -1147,4 +1429,120 @@ mod tests {
         // and System may read anyone's (maintenance)
         assert_eq!(s.kosync_get(a, doc).unwrap().unwrap().updated_at, 150);
     }
+
+    fn candidate(source_ref: &str) -> NewCoverCandidate {
+        NewCoverCandidate {
+            source: "search".into(),
+            source_ref: source_ref.into(),
+            image: format!("jpeg-{source_ref}").into_bytes(),
+            ext: "jpg".into(),
+            width: 330,
+            height: 500,
+            colorfulness: 42.0,
+        }
+    }
+
+    /// The colour-cover lifecycle: facts, the review list, the candidates
+    /// cache, an explicit choice (which a pass's `unless_chosen` never
+    /// overwrites), revert; and none of it reachable from B's scope.
+    #[test]
+    fn colour_covers_choose_never_overwrite_and_stay_the_owners() {
+        let (mut s, a, b) = store_with_users();
+        let mut grey = new_book("Horus Rising", "Dan Abnett");
+        grey.cover_s3_key = Some("u/horus.cover.jpg".into());
+        let grey = add_book(&mut s, a, &grey, 10);
+        let mut unseen = new_book("Foundation", "Isaac Asimov");
+        unseen.cover_s3_key = Some("u/found.cover.jpg".into());
+        let unseen = add_book(&mut s, a, &unseen, 11);
+        add_book(&mut s, a, &new_book("No Cover", "Nobody"), 12);
+        assert_eq!((grey.cover_grey, grey.isbns.as_deref(), grey.cover_choice), (None, None, CoverChoice::None), "pre-scan defaults");
+        s.with_scope_for_test(Scope::User(a), |s| {
+            let g = s.book_set_cover_facts(grey.id, Some(true), Some("9781849706186,1849706182")).unwrap();
+            assert_eq!((g.cover_grey, g.isbn_list(), g.updated_at), (Some(true), vec!["9781849706186".to_string(), "1849706182".into()], 10));
+            assert_eq!(s.book_set_cover_facts(grey.id, Some(true), None).unwrap().isbns.as_deref(), Some("9781849706186,1849706182"), "None keeps the ISBNs");
+            assert_eq!(s.book_cover_review_counts(a).unwrap(), (1, 1));
+            assert_eq!(titles(&s.book_list_cover_review(a, false, 10).unwrap()), ["Horus Rising"]);
+            assert_eq!(titles(&s.book_list_cover_review(a, true, 10).unwrap()), ["Foundation"], "coverless books are never 'unscanned'");
+
+            let cs = s.book_cover_candidates_replace(grey.id, &[candidate("1"), candidate("2")], 20).unwrap();
+            assert_eq!(cs.iter().map(|c| (c.source_ref.as_str(), c.rank)).collect::<Vec<_>>(), [("1", 0), ("2", 1)]);
+            assert!(cs[0].image.is_empty(), "the list carries no bytes");
+            assert_eq!(s.book_cover_candidate(grey.id, cs[1].id).unwrap().image, b"jpeg-2");
+            assert!(matches!(s.book_cover_candidate(unseen.id, cs[1].id), Err(StoreError::NotFound(_))), "another book's candidate");
+            assert_eq!(s.book_get(grey.id).unwrap().color_lookup_at, Some(20));
+            // a fresh lookup replaces the cache
+            assert_eq!(s.book_cover_candidates_replace(grey.id, &[candidate("3")], 21).unwrap().len(), 1);
+            assert!(s.book_cover_candidate(grey.id, cs[0].id).is_err());
+
+            // the person picks colour: shown everywhere, the review is done with it
+            let (g, replaced) = s.book_choose_cover(grey.id, CoverPick::Color("u/horus.cover-color.jpg"), false, "tom", 30).unwrap();
+            assert_eq!((g.cover_choice, g.shown_cover_key(), g.cover_choice_by.as_deref(), g.cover_choice_at, g.updated_at, replaced),
+                (CoverChoice::Color, Some("u/horus.cover-color.jpg"), Some("tom"), Some(30), 30, None));
+            assert!(s.book_cover_candidates(grey.id).unwrap().is_empty(), "choosing drops the cache");
+            assert_eq!(s.book_cover_review_counts(a).unwrap(), (0, 1));
+
+            // a pass never overwrites a choice: refused, nothing moves
+            s.book_choose_cover(unseen.id, CoverPick::Embedded, false, "tom", 31).unwrap();
+            let r = s.book_choose_cover(unseen.id, CoverPick::Color("u/found.cover-color.jpg"), true, "pass", 32);
+            assert!(matches!(r, Err(StoreError::Forbidden(_))), "{r:?}");
+            let u = s.book_get(unseen.id).unwrap();
+            assert_eq!((u.cover_choice, u.shown_cover_key(), u.cover_choice_by.as_deref()), (CoverChoice::Embedded, Some("u/found.cover.jpg"), Some("tom")));
+            let r = s.book_choose_cover(grey.id, CoverPick::Color("u/other.jpg"), true, "pass", 33);
+            assert!(matches!(r, Err(StoreError::Forbidden(_))), "a colour choice is a choice too");
+            // the person may still change their mind; revert hands back the old key
+            let (g, replaced) = s.book_choose_cover(grey.id, CoverPick::Embedded, false, "tom", 34).unwrap();
+            assert_eq!((g.cover_choice, g.shown_cover_key(), replaced.as_deref()), (CoverChoice::Embedded, Some("u/horus.cover.jpg"), Some("u/horus.cover-color.jpg")));
+        });
+        // B: every call on A's book is NotFound, and her review is empty
+        s.with_scope_for_test(Scope::User(b), |s| {
+            assert!(matches!(s.book_set_cover_facts(grey.id, Some(false), None), Err(StoreError::NotFound(_))));
+            assert!(matches!(s.book_choose_cover(grey.id, CoverPick::Embedded, false, "b", 40), Err(StoreError::NotFound(_))));
+            assert!(matches!(s.book_cover_candidates_replace(grey.id, &[candidate("x")], 40), Err(StoreError::NotFound(_))));
+            assert!(matches!(s.book_cover_candidates(grey.id), Err(StoreError::NotFound(_))));
+            assert!(s.book_list_cover_review(a, false, 10).is_err());
+            assert!(s.book_cover_review_counts(a).is_err());
+            assert_eq!(s.book_cover_review_counts(b).unwrap(), (0, 0));
+        });
+        s.with_scope_for_test(Scope::Public, |s| {
+            assert!(s.book_cover_candidates(grey.id).is_err());
+            assert!(s.book_cover_review_counts(a).is_err());
+        });
+        // a soft delete drops the cache
+        s.with_scope_for_test(Scope::User(a), |s| {
+            s.book_cover_candidates_replace(unseen.id, &[candidate("9")], 50).unwrap();
+            s.book_soft_delete(unseen.id, 51).unwrap();
+        });
+        let n: i64 = s.conn.query_row("SELECT count(*) FROM book_cover_candidate WHERE book_id = ?1", [unseen.id.to_string()], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
+
+
+    /// v14 on a v13 database: the cover columns are added to the existing
+    /// `book` table, its rows read with the defaults (not looked at, nobody
+    /// chose), and the candidates table appears.
+    #[test]
+    fn a_v13_book_table_gains_the_cover_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ks.db");
+        let (a, id) = {
+            let mut s = SqliteStore::open(&path).unwrap();
+            let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+            let a = s.auth_ensure_owner(p, "Tom", 1).unwrap().id;
+            let id = add_book(&mut s, a, &new_book("Dune", "Frank Herbert"), 10).id;
+            // back to the v13 shape: drop every v14 column
+            for col in ["cover_grey", "isbns", "color_cover_s3_key", "cover_choice", "cover_choice_by", "cover_choice_at", "color_lookup_at"] {
+                s.conn.execute(&format!("ALTER TABLE book DROP COLUMN {col}"), []).unwrap();
+            }
+            s.conn.execute("DROP TABLE book_cover_candidate", []).unwrap();
+            s.conn.pragma_update(None, "user_version", 13).unwrap();
+            (a, id)
+        };
+        let mut s = SqliteStore::open(&path).unwrap();
+        let b = s.book_get(id).unwrap();
+        assert_eq!((b.title.as_str(), b.cover_grey, b.isbns, b.cover_choice), ("Dune", None, None, CoverChoice::None));
+        s.with_scope_for_test(Scope::User(a), |s| {
+            assert!(s.book_cover_candidates_replace(id, &[candidate("1")], 20).unwrap().len() == 1);
+        });
+    }
+
 }

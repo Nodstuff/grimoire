@@ -60,6 +60,18 @@ impl SqliteStore {
         conn.execute_batch(BOOKS_SCHEMA)?;
         // a pre-release books db (the column came after the table)
         add_column_if_missing(&conn, "ereader", "kosync_key_hash_alt", "TEXT NOT NULL DEFAULT ''")?;
+        // v14: colour covers (books.sql documents each column)
+        for (col, decl) in [
+            ("cover_grey", "INTEGER"),
+            ("isbns", "TEXT"),
+            ("color_cover_s3_key", "TEXT"),
+            ("cover_choice", "TEXT NOT NULL DEFAULT 'none'"),
+            ("cover_choice_by", "TEXT"),
+            ("cover_choice_at", "INTEGER"),
+            ("color_lookup_at", "INTEGER"),
+        ] {
+            add_column_if_missing(&conn, "book", col, decl)?;
+        }
         backfill(&conn)?;
         Ok(Self { conn, scope: Scope::System })
     }
@@ -490,7 +502,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -553,6 +565,10 @@ fn backfill(conn: &Connection) -> Result<()> {
     // EXISTS by init; nothing to backfill.
     // v13: diagram images for docs sent to e-readers (books.sql:
     // epub_image). Created IF NOT EXISTS by init; nothing to backfill.
+    // v14: colour covers (books.sql: the book cover_* columns, added by
+    // init when missing, and book_cover_candidate). Nothing to backfill:
+    // a NULL cover_grey / isbns means "not looked at yet", which the
+    // library's cover review fills in as the person runs it.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
