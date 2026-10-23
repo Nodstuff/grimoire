@@ -666,6 +666,16 @@
   flex-direction: column;
   gap: 12px;
 }
+.bk-cc-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.bk-cc-group-title {
+  margin: 4px 0 0;
+  font-size: var(--text-sm2);
+  font-weight: 600;
+}
 .bk-cc-alt {
   display: flex;
   flex-direction: column;

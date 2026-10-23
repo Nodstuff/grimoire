@@ -173,6 +173,9 @@ export interface CoverCandidates {
 }
 
 export interface CoverReviewRow {
+  /** greyscale: a black-and-white cover; coverless: no cover at all (an
+   * older server sends no kind: greyscale) */
+  kind?: 'greyscale' | 'coverless'
   book: Book
   /** false: no lookup yet (POST cover-candidates) */
   looked_up: boolean
@@ -184,6 +187,9 @@ export interface CoverReview {
   greyscale: number
   /** covers not looked at yet (shelved before detection) */
   unscanned: number
+  /** books with no cover at all nobody chose for */
+  coverless?: number
+  /** the greyscale ones, then the coverless ones */
   books: CoverReviewRow[]
   /** POST only: covers looked at by this call */
   scanned?: number
@@ -257,12 +263,20 @@ export function wantsColourCover(b: Pick<Book, 'cover_greyscale' | 'cover_choice
   return b.cover_greyscale === true && (b.cover_choice ?? 'none') === 'none' && !b.has_color_cover
 }
 
-/** Books shows "Find colour covers" when a loaded book wants one, or has a
- * cover nobody has looked at yet (shelved before detection). */
+/** A cover is worth finding: the book has none at all and nobody chose
+ * (an explicit "no cover" is cover_choice 'embedded'). */
+export function wantsCover(b: Pick<Book, 'has_cover' | 'has_embedded_cover' | 'cover_choice' | 'has_color_cover'>): boolean {
+  return !b.has_cover && !b.has_embedded_cover && !b.has_color_cover && (b.cover_choice ?? 'none') === 'none'
+}
+
+/** Books shows "Find colour covers" when a loaded book wants one (or any
+ * cover), or has a cover nobody has looked at yet (shelved before
+ * detection). */
 export function showColourPass(books: Book[]): boolean {
   return books.some(
     (b) =>
       wantsColourCover(b) ||
+      wantsCover(b) ||
       (b.cover_greyscale === null && !!b.has_embedded_cover && (b.cover_choice ?? 'none') === 'none' && !b.has_color_cover),
   )
 }

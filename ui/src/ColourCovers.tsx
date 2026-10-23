@@ -11,7 +11,8 @@
 // - UploadColourOffer, under an upload result whose cover is greyscale: the
 //   top match and "Use colour cover".
 // - CoverReviewSheet, the one-off library pass behind Books' "Find colour
-//   covers": every greyscale book with its best match, Accept / Skip each,
+//   covers": every greyscale book with its best match, then every book with
+//   no cover at all ("No cover — add one?"), Accept / Skip each,
 //   "Accept all good matches". An accept never overwrites a cover the person
 //   chose (the server refuses it, 409 cover_chosen).
 //
@@ -35,6 +36,7 @@ import {
   oneAtATime,
   scanCoverReview,
   wantsColourCover,
+  wantsCover,
   withoutSeries,
 } from './books'
 import { ApiError } from './types'
@@ -148,6 +150,7 @@ export function ColourCoverPanel({ book, onPatched }: { book: Book; onPatched: (
   }
 
   const current = book.has_cover ? coverUrl(book.id, book.cover_version) : null
+  const coverless = !book.has_cover && !book.has_embedded_cover
   return (
     <div className="bk-cc" aria-label="Colour cover">
       {book.has_color_cover ? (
@@ -161,8 +164,9 @@ export function ColourCoverPanel({ book, onPatched }: { book: Book; onPatched: (
         !open && (
           <div className="bk-cc-row">
             {wantsColourCover(book) && <span className="muted bk-cc-note">This cover is black and white.</span>}
+            {wantsCover(book) && <span className="muted bk-cc-note">This book has no cover.</span>}
             <Button size="sm" icon="search" disabled={busy !== null} onClick={() => find(false)}>
-              Find a colour cover…
+              {coverless ? 'Find a cover…' : 'Find a colour cover…'}
             </Button>
           </div>
         )
@@ -176,7 +180,11 @@ export function ColourCoverPanel({ book, onPatched }: { book: Book; onPatched: (
           )}
           {busy !== 'find' && list && list.length === 0 && (
             <div className="bk-cc-row muted">
-              {unavailable ? 'Open Library didn’t answer. Try again in a while.' : searched ? `Open Library has no colour cover for “${searched}”.` : 'Open Library has no colour cover for this book.'}
+              {unavailable ? 'Open Library didn’t answer. Try again in a while.' : searched
+                  ? `Open Library has no colour cover for “${searched}”.`
+                  : coverless
+                    ? 'Open Library has no cover for this book.'
+                    : 'Open Library has no colour cover for this book.'}
             </div>
           )}
           {busy !== 'find' && list && list.length > 0 && (
@@ -194,8 +202,8 @@ export function ColourCoverPanel({ book, onPatched }: { book: Book; onPatched: (
                 {busy === 'choose' ? 'Saving…' : 'Use this cover'}
               </Button>
             )}
-            <Button size="sm" disabled={busy !== null} onClick={() => choose('embedded', 'keeping the book’s own cover')}>
-              Keep mine
+            <Button size="sm" disabled={busy !== null} onClick={() => choose('embedded', coverless ? 'leaving it without a cover' : 'keeping the book’s own cover')}>
+              {coverless ? 'Leave without a cover' : 'Keep mine'}
             </Button>
             <Button size="sm" variant="ghost" disabled={busy !== null} onClick={() => find(true)}>
               Search again
@@ -363,7 +371,7 @@ export function CoverReviewSheet({ onClose, onChanged }: { onClose: () => void; 
   return (
     <Sheet title="Colour covers" onClose={onClose} footer={footer || undefined}>
       <div className="bk-cc-review">
-        <p className="muted bk-cc-intro">Black-and-white covers, each beside the best colour match from Open Library. Accepting shows the colour cover here and in the catalog feed; the book file is never changed, and a cover you chose yourself is never replaced.</p>
+        <p className="muted bk-cc-intro">Black-and-white covers, and books with no cover, each beside the best colour match from Open Library. Accepting shows the colour cover here and in the catalog feed; the book file is never changed, and a cover you chose yourself is never replaced.</p>
         {scanLeft !== null && (
           <div className="bk-cc-row muted">
             <Spinner size={14} /> Looking at covers… {scanLeft} to go
@@ -374,17 +382,32 @@ export function CoverReviewSheet({ onClose, onChanged }: { onClose: () => void; 
             <Spinner size={14} /> Loading…
           </div>
         )}
-        {rows && rows.length === 0 && <div className="bk-cc-row muted">No black-and-white covers left. Every book shows a colour cover, or the cover you chose.</div>}
-        {rows && rows.length > 0 && (
-          <ul className="bk-cc-list">
-            {rows.map((r) => (
-              <ReviewRow key={r.book.id} row={r} state={settled[r.book.id]} busy={busy === r.book.id || busy === 'all'} onAccept={() => accept(r)} onSkip={() => setSettled((s) => ({ ...s, [r.book.id]: 'skipped' }))} />
-            ))}
-          </ul>
-        )}
+        {rows && rows.length === 0 && <div className="bk-cc-row muted">No black-and-white or missing covers left. Every book shows a colour cover, or the cover you chose.</div>}
+        {rows &&
+          reviewGroups(rows).map((g) => (
+            <section key={g.kind} className="bk-cc-group" aria-label={g.title ?? 'Black-and-white covers'}>
+              {g.title && <h3 className="bk-cc-group-title">{g.title}</h3>}
+              <ul className="bk-cc-list">
+                {g.rows.map((r) => (
+                  <ReviewRow key={r.book.id} row={r} state={settled[r.book.id]} busy={busy === r.book.id || busy === 'all'} onAccept={() => accept(r)} onSkip={() => setSettled((s) => ({ ...s, [r.book.id]: 'skipped' }))} />
+                ))}
+              </ul>
+            </section>
+          ))}
       </div>
     </Sheet>
   )
+}
+
+/** The review's groups, in order: black-and-white covers (untitled, as
+ * before), then "No cover — add one?". Empty groups are left out. */
+export function reviewGroups(rows: CoverReviewRow[]): { kind: 'greyscale' | 'coverless'; title: string | null; rows: CoverReviewRow[] }[] {
+  const grey = rows.filter((r) => (r.kind ?? 'greyscale') === 'greyscale')
+  const none = rows.filter((r) => r.kind === 'coverless')
+  const out: { kind: 'greyscale' | 'coverless'; title: string | null; rows: CoverReviewRow[] }[] = []
+  if (grey.length) out.push({ kind: 'greyscale', title: none.length ? 'Black and white' : null, rows: grey })
+  if (none.length) out.push({ kind: 'coverless', title: 'No cover — add one?', rows: none })
+  return out
 }
 
 /** What a settled row says instead of its buttons. */

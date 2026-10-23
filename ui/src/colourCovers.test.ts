@@ -19,9 +19,10 @@ import {
   scanCoverReview,
   showColourPass,
   wantsColourCover,
+  wantsCover,
   withoutSeries,
 } from './books'
-import { ColourCoverPanel, DifferentTitleForm, candidateLabel, serially, settledText } from './ColourCovers'
+import { ColourCoverPanel, DifferentTitleForm, candidateLabel, reviewGroups, serially, settledText } from './ColourCovers'
 
 type Call = { url: string; init?: RequestInit }
 let calls: Call[] = []
@@ -81,9 +82,33 @@ describe('which books want a colour cover', () => {
     expect(showColourPass([book({ cover_greyscale: false })])).toBe(false)
     expect(showColourPass([book({ cover_greyscale: false }), book()])).toBe(true)
     expect(showColourPass([book({ cover_greyscale: null })])).toBe(true)
-    expect(showColourPass([book({ cover_greyscale: null, has_embedded_cover: false, has_cover: false })])).toBe(false)
+    // a book with no cover at all is in the pass too (its own group)
+    expect(showColourPass([book({ cover_greyscale: null, has_embedded_cover: false, has_cover: false })])).toBe(true)
+    expect(showColourPass([book({ cover_greyscale: null, has_embedded_cover: false, has_cover: false, cover_choice: 'embedded' })])).toBe(false)
     expect(showColourPass([book({ cover_greyscale: null, cover_choice: 'embedded' })])).toBe(false)
     expect(showColourPass([])).toBe(false)
+  })
+  it('a book with no cover at all wants one, unless the person chose none', () => {
+    const none = { has_cover: false, has_embedded_cover: false, has_color_cover: false, cover_greyscale: null, cover_choice: 'none' as const }
+    expect(wantsCover(book(none))).toBe(true)
+    expect(wantsCover(book({ ...none, cover_choice: 'embedded' }))).toBe(false)
+    expect(wantsCover(book())).toBe(false)
+    expect(showColourPass([book({ cover_greyscale: false }), book(none)])).toBe(true)
+    expect(showColourPass([book({ ...none, cover_choice: 'embedded' })])).toBe(false)
+  })
+  it('the review groups coverless books after the black-and-white ones; accept-all takes both', () => {
+    const rows: CoverReviewRow[] = [
+      { kind: 'greyscale', book: book({ id: 'a' }), looked_up: true, best: cand },
+      { kind: 'coverless', book: book({ id: 'p', title: 'Pride and Prejudice', has_cover: false, has_embedded_cover: false }), looked_up: true, best: cand },
+      { kind: 'coverless', book: book({ id: 'd', title: 'Dracula', has_cover: false, has_embedded_cover: false }), looked_up: true, best: null },
+    ]
+    expect(reviewGroups(rows).map((g) => [g.kind, g.title, g.rows.map((r) => r.book.id)])).toEqual([
+      ['greyscale', 'Black and white', ['a']],
+      ['coverless', 'No cover — add one?', ['p', 'd']],
+    ])
+    expect(reviewGroups([rows[0]]).map((g) => g.title)).toEqual([null])
+    expect(reviewGroups([{ ...rows[0], kind: undefined }])[0].kind).toBe('greyscale')
+    expect(goodMatches(rows, {}).map((r) => r.book.id)).toEqual(['a', 'p'])
   })
   it('accept-all takes rows with a match that are not settled', () => {
     const rows: CoverReviewRow[] = [
@@ -193,6 +218,12 @@ describe('the details panel', () => {
     const html = renderToString(createElement(ColourCoverPanel, { book: book({ has_color_cover: true, cover_choice: 'color' }), onPatched: () => {} }))
     expect(html).toContain('Revert to the book’s own cover')
     expect(html).toContain('The book itself is unchanged.')
+    expect(html).not.toContain('Find a colour cover')
+  })
+  it('offers to find a cover for a book with none', () => {
+    const html = renderToString(createElement(ColourCoverPanel, { book: book({ has_cover: false, has_embedded_cover: false, cover_greyscale: null }), onPatched: () => {} }))
+    expect(html).toContain('This book has no cover.')
+    expect(html).toContain('Find a cover…')
     expect(html).not.toContain('Find a colour cover')
   })
   it('a colour cover on a coverless book is removed, not reverted', () => {
