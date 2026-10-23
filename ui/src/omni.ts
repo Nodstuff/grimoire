@@ -224,7 +224,8 @@ export type OpenRow =
 
 export const OPEN_LIMIT = 50
 
-/** Empty query: recent docs, then every place. Typed: docs (title or path)
+/** Empty query: recent docs (minus the one already open, so Enter goes
+ * back to the previous doc), then every place. Typed: docs (title or path)
  * and places in one list, best first; on a tie a place beats a doc, then a
  * recently opened doc beats an older one, then list order. Nothing else:
  * no commands, no content hits. */
@@ -233,12 +234,15 @@ export function buildOpenRows({
   docs,
   places,
   recentIds,
+  currentId = null,
   limit = OPEN_LIMIT,
 }: {
   q: string
   docs: Doc[]
   places: Place[]
   recentIds: string[]
+  /** the doc on screen: left out of the empty-query Recent list */
+  currentId?: string | null
   limit?: number
 }): OpenRow[] {
   const byId = new Map(docs.map((d) => [d.id, d]))
@@ -252,7 +256,10 @@ export function buildOpenRows({
   })
   const placeRow = (p: Place): OpenRow => ({ key: `place:${p.id}`, kind: 'place', place: p })
   const query = q.trim()
-  if (!query) return [...recentDocs(recentIds, docs).map(docRow), ...places.map(placeRow)]
+  if (!query) {
+    const recent = recentDocs(recentIds, docs).filter((d) => d.id !== currentId)
+    return [...recent.map(docRow), ...places.map(placeRow)]
+  }
 
   const scored: { row: OpenRow; s: number; tie: number; i: number }[] = []
   places.forEach((p, i) => {

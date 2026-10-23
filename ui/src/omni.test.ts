@@ -128,6 +128,11 @@ describe('Open (⌘O) ranking', () => {
     const rows = open('', ['t', 'gone', 'r'])
     expect(ids(rows)).toEqual(['t', 'r', ...places.map((p) => `@${p.id}`)])
   })
+  it('empty query leaves the open doc out of Recent, so Enter goes back to the previous one', () => {
+    expect(ids(buildOpenRows({ q: '', docs, places: [], recentIds: ['r', 't'], currentId: 'r' }))).toEqual(['t'])
+    // typed, the open doc is still findable
+    expect(ids(buildOpenRows({ q: 'roadmap', docs, places: [], recentIds: ['r'], currentId: 'r' }))).toEqual(['r'])
+  })
   it('never lists actions or content: only doc and place rows', () => {
     for (const q of ['', 'new doc', 'export', 'sign out', 'back up', 'omnibox']) {
       for (const r of open(q)) expect(['doc', 'place']).toContain(r.kind)

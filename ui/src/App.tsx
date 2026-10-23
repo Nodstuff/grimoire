@@ -544,6 +544,7 @@ export default function App() {
         <OpenPalette
           docs={docs}
           places={places}
+          currentId={view.kind === 'doc' ? view.id : null}
           onOpenDoc={openDoc}
           onPlace={goPlace}
           onSearchText={(q) => openSearch(q, false)}

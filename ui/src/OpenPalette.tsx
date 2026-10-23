@@ -1,6 +1,6 @@
 // ⌘O Open: one input over doc titles, their breadcrumb paths, and places
 // (Home, Books, Review, Gardeners, Graph, Trash, Settings, E-readers). Empty →
-// recent docs, then places. Typed → one fuzzy-ranked list (omni.ts
+// recent docs (not the one open), then places. Typed → one fuzzy-ranked list (omni.ts
 // buildOpenRows). Nothing else: no actions (⌘K), no content hits (⌘⇧F).
 // Enter opens; ⌘Enter hands the typed text to Search.
 
@@ -13,6 +13,7 @@ import { buildOpenRows, loadRecentIds, type OpenRow, type Place, type PlaceId } 
 export default function OpenPalette({
   docs,
   places,
+  currentId = null,
   onOpenDoc,
   onPlace,
   onSearchText,
@@ -20,6 +21,8 @@ export default function OpenPalette({
 }: {
   docs: Doc[]
   places: Place[]
+  /** the doc on screen, left out of Recent */
+  currentId?: string | null
   onOpenDoc: OpenDoc
   onPlace: (id: PlaceId) => void
   /** ⌘Enter: search inside docs for what was typed */
@@ -35,7 +38,7 @@ export default function OpenPalette({
   useEffect(() => inputRef.current?.focus(), [])
   const recentIds = useMemo(loadRecentIds, [])
 
-  const rows = useMemo(() => buildOpenRows({ q, docs, places, recentIds }), [q, docs, places, recentIds])
+  const rows = useMemo(() => buildOpenRows({ q, docs, places, recentIds, currentId }), [q, docs, places, recentIds, currentId])
   const typed = q.trim().length > 0
   const recentCount = typed ? 0 : rows.filter((r) => r.kind === 'doc').length
   useEffect(() => setSel(0), [q])
