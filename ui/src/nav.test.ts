@@ -56,7 +56,7 @@ describe('palettes render', () => {
     const html = renderToString(createElement(SearchPalette, { initial: '? ', onOpenDoc: noop, onClose: noop }))
     expect(html).toContain('Ask your notes')
   })
-  it('Settings: E-readers and Upload tokens tabs in SERVER mode only', () => {
+  it('Settings: E-readers, Upload tokens and Share links in SERVER mode only', () => {
     const props = { section: 'profile' as const, onSection: noop, dataVersion: 0, version: null, onProfileChanged: noop }
     const server = renderToString(createElement(Settings, { ...props, server: true }))
     expect(server).toContain('E-readers')
@@ -64,10 +64,14 @@ describe('palettes render', () => {
     const local = renderToString(createElement(Settings, { ...props, server: false }))
     expect(local).not.toContain('E-readers')
     expect(local).not.toContain('Upload tokens')
+    expect(server).toContain('Share links')
+    expect(local).not.toContain('Share links')
+    for (const label of ['Profile', 'Appearance', 'Workspaces &amp; members', 'Gardeners', 'Data', 'About']) expect(local).toContain(label)
   })
   it('Settings › Upload tokens renders its add card', () => {
     const props = { onSection: noop, dataVersion: 0, version: null, onProfileChanged: noop }
     const html = renderToString(createElement(Settings, { ...props, section: 'uploads' as const, server: true }))
-    expect(html).toContain('add an upload token')
+    expect(html).toContain('Add an upload token')
+    expect(html).toContain('aria-current="true">Upload tokens')
   })
 })

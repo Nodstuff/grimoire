@@ -430,14 +430,20 @@ describe('upload tokens', () => {
 /* ---------- view smoke tests (initial paint only; effects do not run) ---------- */
 
 describe('views render their shells', () => {
-  it('Books', () => {
+  it('Books: title, Add EPUBs, the dropzone, the Library switch, the E-readers card', () => {
     const html = renderToString(createElement(Books, { dataVersion: 0 }))
-    expect(html).toContain('books')
-    expect(html).toContain('drop EPUBs')
+    expect(html).toContain('>Books</h1>')
+    expect(html).toContain('Add EPUBs')
+    expect(html).toContain('Drop EPUBs anywhere on this page')
+    expect(html).toContain('Choose files…')
+    expect(html).toMatch(/>All<.*>Unread<.*>Finished</)
+    expect(html).toContain('Newest first')
+    expect(html).toContain('Add an e-reader')
   })
-  it('Ereaders', () => {
+  it('Ereaders: the section card and its add-a-device row', () => {
     const html = renderToString(createElement(Ereaders, { dataVersion: 0 }))
-    expect(html).toContain('e-readers')
-    expect(html).toContain('add a device')
+    expect(html).toContain('>E-readers</h2>')
+    expect(html).toContain('Add a device')
+    expect(html).toContain('Stream downloads')
   })
 })

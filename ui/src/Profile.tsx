@@ -1,10 +1,12 @@
-// Profile: the owner's display name, the version and diagnostics. Two
-// surfaces share the same save path: the Settings page's Profile section (⌘,) and the
-// first-run prompt shown until the install-default name has been confirmed
-// once.
+// Profile: the owner's display name and who this browser is signed in as.
+// Two surfaces share the same save path: the Settings page's Profile section
+// (canvas Settings: name + Save, Account, Signed in) and the first-run
+// prompt shown until the install-default name has been confirmed once.
+// Also the version + diagnostics helpers the About section uses.
 
 import { useEffect, useState } from 'react'
 import { Button } from './lapis/Button'
+import { CopyButton, Row, RowText, SettingsCard } from './screens/settingsParts'
 import PaletteShell from './PaletteShell'
 import { api, Profile as ProfileRow } from './types'
 import { errText, notify } from './Notice'
@@ -116,57 +118,27 @@ export function FirstRunName({ profile, onSaved }: { profile: ProfileRow; onSave
   )
 }
 
-/** The Profile page (view kind 'profile'). */
+/** Settings › Profile (canvas Settings, #profile). */
 export default function Profile({
   dataVersion,
   onChanged,
-  version: appVersion = null,
   onSignOut,
-  embedded = false,
 }: {
-  /** inside Settings: no page wrapper or title of its own */
-  embedded?: boolean
   dataVersion: number
   onChanged?: (p: ProfileRow) => void
   /** SERVER mode, signed in through this browser */
   onSignOut?: () => void
-  /** the version off App's /api/stamp poll; null on a daemon too old to send it */
-  version?: string | null
 }) {
   const [profile, setProfile] = useState<ProfileRow | null | undefined>(undefined)
   const [name, setName] = useState('')
   const [busy, setBusy] = useState(false)
-  // App polls /api/stamp every 2.5s and newer daemons put the version on it;
-  // only an older daemon (no version there) costs a /api/buildinfo call
-  const [fetchedVersion, setFetchedVersion] = useState<string | null>(null)
-  const version = appVersion ?? fetchedVersion
 
   useEffect(() => {
     loadProfile().then((p) => {
       setProfile(p)
       if (p) setName(p.name)
     })
-    if (appVersion) return
-    api<{ version?: string }>('/api/buildinfo')
-      .then((b) => setFetchedVersion(b.version ?? null))
-      .catch(() => setFetchedVersion(null))
-  }, [dataVersion, appVersion])
-
-  const copyDiagnostics = async () => {
-    try {
-      const d = await api<Diagnostics>('/api/diagnostics')
-      const lines = [
-        `Taisce ${d.version}`,
-        `log: ${d.log_path ?? '—'}`,
-        '',
-        d.log_tail,
-      ]
-      await copyText(lines.join('\n'))
-      notify('diagnostics copied — paste them into your report', 'ok')
-    } catch (e) {
-      notify(`could not copy diagnostics: ${errText(e)}`)
-    }
-  }
+  }, [dataVersion])
 
   const dirty = profile ? name.trim() !== profile.name : false
   const ok = validName(name)
@@ -187,75 +159,77 @@ export default function Profile({
     setBusy(false)
   }
 
-  // a plain function, not a component: a component defined in render would
-  // remount the name input on every keystroke
-  const wrap = (children?: React.ReactNode) =>
-    embedded ? (
-      <div className="settings-section">{children}</div>
-    ) : (
-      <div className="queue">
-        <h1 className="queue-title">profile</h1>
-        {children}
-      </div>
-    )
-  if (profile === undefined) return wrap()
   if (profile === null) {
-    return wrap(<div className="palette-empty">Taisce is out of date — reinstall the latest release</div>)
+    return (
+      <SettingsCard id="profile" title="Profile">
+        <p className="st-note">Taisce is out of date: reinstall the latest release.</p>
+      </SettingsCard>
+    )
   }
 
-  return wrap(
-    <>
-
-      <div className="card">
-        <div className="card-head">
-          <span>name</span>
-          <span className="meta">your edits and reviews are attributed to it</span>
+  return (
+    <SettingsCard id="profile" title="Profile">
+      <form
+        className="st-inline-form"
+        onSubmit={(e) => {
+          e.preventDefault()
+          save()
+        }}
+      >
+        <div className="st-fld st-grow">
+          <label htmlFor="st-name">Your name</label>
+          <input id="st-name" className="st-inp" value={name} maxLength={64} disabled={profile === undefined} onChange={(e) => setName(e.target.value)} />
         </div>
-        <div className="profile-name-row">
-          <input
-            className="join-input profile-name"
-            value={name}
-            maxLength={64}
-            onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && save()}
-          />
-          <button className="accept" disabled={!ok || !dirty || busy} onClick={save}>
-            {busy ? 'saving…' : 'save'}
-          </button>
-        </div>
-        {!profile.confirmed && (
-          <div className="meta">still the install default — pick your own</div>
-        )}
-      </div>
-
-      <div className="card">
-        <div className="card-head">
-          <span>identity</span>
-        </div>
-        <div className="profile-kv">
-          <span className="meta">account id</span>
-          <span className="mono" title={profile.principal_id}>{shortId(profile.principal_id)}</span>
-        </div>
-        {onSignOut && (
-          <div className="profile-kv">
-            <span className="meta">this browser</span>
-            <span className="meta">signed in with a passkey</span>
-            <button className="chip" onClick={onSignOut}>sign out</button>
-          </div>
-        )}
-      </div>
-
-      <div className="card">
-        <div className="card-head">
-          <span>about</span>
-          <span className="meta">if something goes wrong, copy this and send it along</span>
-        </div>
-        <div className="profile-kv">
-          <span className="meta">version</span>
-          <span className="mono">{version ?? '—'}</span>
-          <button className="chip" onClick={copyDiagnostics}>copy diagnostics</button>
-        </div>
-      </div>
-    </>,
+        <Button type="submit" size="sm" className="st-tall" disabled={!ok || !dirty || busy}>
+          {busy ? 'Saving…' : 'Save'}
+        </Button>
+      </form>
+      <p className="st-note">
+        Your edits and reviews are attributed to this name.
+        {profile && !profile.confirmed && <b> It is still the install default: pick your own.</b>}
+      </p>
+      {profile && (
+        <Row>
+          <RowText>Account</RowText>
+          <span className="mono muted st-mono" title={profile.principal_id}>
+            {shortId(profile.principal_id)}
+          </span>
+          <CopyButton what="account id" value={profile.principal_id} variant="ghost" />
+        </Row>
+      )}
+      {onSignOut && (
+        <Row>
+          <RowText>Signed in with a passkey · {typeof location === 'undefined' ? 'this server' : location.host}</RowText>
+          <Button size="sm" onClick={onSignOut}>
+            Sign out
+          </Button>
+        </Row>
+      )}
+    </SettingsCard>
   )
+}
+
+/** The version line and Copy diagnostics (Settings › About). */
+export function useVersion(appVersion: string | null): string | null {
+  // App polls /api/stamp every 2.5s and newer daemons put the version on it;
+  // only an older daemon (no version there) costs a /api/buildinfo call
+  const [fetched, setFetched] = useState<string | null>(null)
+  useEffect(() => {
+    if (appVersion) return
+    api<{ version?: string }>('/api/buildinfo')
+      .then((b) => setFetched(b.version ?? null))
+      .catch(() => setFetched(null))
+  }, [appVersion])
+  return appVersion ?? fetched
+}
+
+export async function copyDiagnostics(): Promise<void> {
+  try {
+    const d = await api<Diagnostics>('/api/diagnostics')
+    const lines = [`Taisce ${d.version}`, `log: ${d.log_path ?? '—'}`, '', d.log_tail]
+    await copyText(lines.join('\n'))
+    notify('diagnostics copied — paste them into your report', 'ok')
+  } catch (e) {
+    notify(`could not copy diagnostics: ${errText(e)}`)
+  }
 }
