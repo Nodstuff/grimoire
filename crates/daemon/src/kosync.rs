@@ -160,7 +160,7 @@ fn fail(e: StoreError) -> Response {
     (code, Json(json!({"error": e.to_string()}))).into_response()
 }
 
-fn rfc3339(t: i64) -> String {
+pub(crate) fn rfc3339(t: i64) -> String {
     chrono::DateTime::from_timestamp(t, 0)
         .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
         .unwrap_or_default()

@@ -112,8 +112,10 @@ fn book_json(b: &Book) -> Value {
         "original_filename": b.original_filename.as_str(),
         "size": b.size,
         "has_cover": b.cover_s3_key.is_some(),
-        "added_at": b.added_at,
-        "updated_at": b.updated_at,
+        // RFC 3339, like every other instant the API sends (kosync's
+        // reading rows included)
+        "added_at": crate::kosync::rfc3339(b.added_at),
+        "updated_at": crate::kosync::rfc3339(b.updated_at),
     })
 }
 
@@ -230,7 +232,9 @@ where
 #[derive(Deserialize)]
 struct PatchReq {
     title: Option<String>,
-    author: Option<String>,
+    /// absent = unchanged; null or "" = no author
+    #[serde(default, deserialize_with = "nullable")]
+    author: Option<Option<String>>,
     #[serde(default, deserialize_with = "nullable")]
     series: Option<Option<String>>,
     #[serde(default, deserialize_with = "nullable")]
@@ -282,26 +286,34 @@ async fn patch_book(
         Ok(t) => t,
         Err(r) => return r,
     };
-    let author = match req
-        .author
-        .as_deref()
-        .map(|a| clean_label("author", a))
-        .transpose()
-    {
-        Ok(a) => a,
-        Err(r) => return r,
+    // an explicit null clears the author, and so does an empty string (a
+    // book may have none: the feed then names the file after the title)
+    let author = match req.author {
+        None => None,
+        Some(v) => match v.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+            None => Some(String::new()),
+            Some(a) => match clean_label("author", a) {
+                Ok(a) => Some(a),
+                Err(r) => return r,
+            },
+        },
     };
     let series = match req.series {
         None => None,
         // an explicit null clears, and so does an empty string
-        Some(v) => Some(v.and_then(|s| {
-            let s = s.trim().to_string();
-            (!s.is_empty() && s.chars().count() <= 1024).then_some(s)
-        })),
+        Some(v) => match v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => Some(None),
+            Some(s) => match clean_label("series", s) {
+                Ok(s) => Some(Some(s)),
+                Err(r) => return r,
+            },
+        },
     };
     let series_index = match req.series_index {
         None => None,
-        Some(v) => Some(v.filter(|n| n.is_finite() && *n >= 0.0 && *n <= 1_000_000.0)),
+        Some(None) => Some(None),
+        Some(Some(n)) if n.is_finite() && (0.0..=1_000_000.0).contains(&n) => Some(Some(n)),
+        Some(Some(_)) => return err(StatusCode::BAD_REQUEST, "series_index: a number from 0 to 1000000, or null"),
     };
     let now = crate::auth::now();
     let done = with_store(&st.store, v.scope, move |s| {
@@ -1887,6 +1899,37 @@ mod tests {
         assert_eq!(v["results"][0]["status"], "error", "{v}");
         assert!(t.s3.memory.keys().is_empty(), "{:?}", t.s3.memory.keys());
         assert!(t.store.lock(Scope::User(t.user)).book_list(t.user, &BookPage::default(), 10, None).unwrap().is_empty());
+    }
+
+    /// PATCH: null or "" clears the author; a series index out of range is a
+    /// 400, never a silent clear; the instants are RFC 3339.
+    #[tokio::test]
+    async fn patch_clears_author_and_rejects_a_bad_series_index() {
+        let t = test_lib();
+        let v = t.upload(&[("dune.epub", epub_of("Dune", "Frank Herbert", "urn:isbn:1", "S", "v1", false))]).await;
+        let id = v["results"][0]["book"]["id"].as_str().unwrap().to_string();
+        assert!(v["results"][0]["book"]["added_at"].as_str().unwrap().ends_with('Z'), "{v}");
+        let uri = format!("/api/books/{id}");
+        let (st, b) = t.send("PATCH", &uri, Some("application/json"), br#"{"author":null}"#.to_vec()).await;
+        assert_eq!((st, b["author"].as_str()), (StatusCode::OK, Some("")), "{b}");
+        let (_, b) = t.send("PATCH", &uri, Some("application/json"), br#"{"author":"Frank Herbert"}"#.to_vec()).await;
+        assert_eq!(b["author"], "Frank Herbert");
+        let (_, b) = t.send("PATCH", &uri, Some("application/json"), br#"{"author":"  "}"#.to_vec()).await;
+        assert_eq!(b["author"], "");
+        let (_, b) = t.send("PATCH", &uri, Some("application/json"), br#"{"title":"Dune!"}"#.to_vec()).await;
+        assert_eq!((b["title"].as_str(), b["author"].as_str()), (Some("Dune!"), Some("")), "absent = unchanged");
+        assert!(b["updated_at"].as_str().unwrap().contains('T'), "{b}");
+        for bad in [r#"{"series_index":-1}"#, r#"{"series_index":1e9}"#] {
+            let (st, b) = t.send("PATCH", &uri, Some("application/json"), bad.as_bytes().to_vec()).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}: {b}");
+        }
+        let (st, b) = t.send("PATCH", &uri, Some("application/json"), br#"{"series":"Dune","series_index":2.5}"#.to_vec()).await;
+        assert_eq!((st, b["series_index"].as_f64()), (StatusCode::OK, Some(2.5)));
+        let (_, b) = t.send("PATCH", &uri, Some("application/json"), br#"{"series_index":null}"#.to_vec()).await;
+        assert!(b["series_index"].is_null(), "{b}");
+        let long = format!(r#"{{"series":"{}"}}"#, "x".repeat(1025));
+        let (st, _) = t.send("PATCH", &uri, Some("application/json"), long.into_bytes()).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "an over-long series is refused, not cleared");
     }
 
     #[test]

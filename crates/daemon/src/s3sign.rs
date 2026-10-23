@@ -275,6 +275,8 @@ impl S3Config {
         content_type: &str,
     ) -> anyhow::Result<()> {
         #[cfg(test)]
+        let _ = content_type;
+        #[cfg(test)]
         return self.memory.put(key, body.to_vec());
         #[allow(unreachable_code)]
         let url = self.presign_put(key, PRESIGN_TTL).await?;
@@ -299,6 +301,8 @@ impl S3Config {
         path: &std::path::Path,
         content_type: &str,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        let _ = content_type;
         #[cfg(test)]
         return self.memory.put(key, tokio::fs::read(path).await?);
         #[allow(unreachable_code)]
