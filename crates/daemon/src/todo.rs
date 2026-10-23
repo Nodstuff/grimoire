@@ -93,6 +93,8 @@
 //! - `POST /api/todo/remove {date, item_id, today}`
 //! - `POST /api/todo/move {date, item_id, to_date, today}` (heading created in
 //!   date order)
+//! - `POST /api/todo/reorder {date, item_id, before?, today}` moves the item
+//!   block within its day, just before `before` (an item id) or last
 //! - `POST /api/todo/deadline {date, item_id, deadline | due_at | neither,
 //!   today}` — `deadline: "YYYY-MM-DD"` makes it all-day, `due_at` (RFC 3339
 //!   with a zone) timed, neither clears
@@ -780,6 +782,29 @@ pub fn move_item(md: &str, date: &str, today: &str, id: &str, to_date: &str) -> 
     Ok(render_doc(&chunks))
 }
 
+/// Move the item block within its day: just before the item `before`, or
+/// last in the day when `before` is absent. The list's order is the doc's
+/// order (a markdown list: reordering moves the block). Non-item text in the
+/// day stays where it was relative to the other blocks.
+pub fn reorder_item(md: &str, date: &str, today: &str, id: &str, before: Option<&str>) -> Result<String, String> {
+    let mut chunks = parse_doc(md, today_date(today));
+    let i = day_index(&chunks, date).ok_or_else(|| format!("no to-do list for {date}"))?;
+    let entries = entries_of(&chunks, date).ok_or_else(|| format!("no to-do list for {date}"))?;
+    let p = locate(entries, id)?;
+    let target = before.map(|b| locate(entries, b)).transpose()?;
+    if target == Some(p) {
+        return Ok(md.to_string());
+    }
+    touch_day(&mut chunks, i);
+    let entries = entries_mut(&mut chunks, i);
+    let entry = entries.remove(p);
+    match target {
+        Some(t) => entries.insert(if t > p { t - 1 } else { t }, entry),
+        None => entries.push(entry),
+    }
+    Ok(render_doc(&chunks))
+}
+
 /// Copy the open `[ ]` items of the newest day before `date` into `date`'s
 /// section and mark the sources `[>]`. Returns the new markdown and how many
 /// moved; unchanged markdown (and 0) when there is nothing to carry.
@@ -1296,6 +1321,24 @@ async fn mv(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Js
 }
 
 #[derive(Deserialize)]
+struct ReorderReq {
+    date: String,
+    item_id: String,
+    /// the item it now sits before; absent = last in the day
+    before: Option<String>,
+    #[serde(flatten)]
+    clock: ClientClock,
+}
+
+async fn reorder(State(st): State<ApiState>, v: Viewer, server: Server, Json(req): Json<ReorderReq>) -> Json<Value> {
+    let date = req.date.clone();
+    mutate(st, v, server.is_some(), req.clock, req.date, move |md, today, _| {
+        reorder_item(md, &date, today, &req.item_id, req.before.as_deref()).map(|m| (m, None))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
 struct DeadlineReq {
     date: String,
     item_id: String,
@@ -1343,6 +1386,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/todo/edit", post(edit))
         .route("/api/todo/remove", post(remove))
         .route("/api/todo/move", post(mv))
+        .route("/api/todo/reorder", post(reorder))
         .route("/api/todo/deadline", post(deadline))
         .route("/api/todo/note", post(note))
         .with_state(state)
@@ -1533,6 +1577,32 @@ mod tests {
         let md = toggle_item(&shifted, "2026-09-09", T, Some(&items[0].id), None, true).unwrap();
         assert!(md.contains("- [x] call the bank\n"));
         assert!(md.contains("- [ ] new agent item\n"));
+    }
+
+    #[test]
+    fn reorder_moves_the_block_within_its_day() {
+        let d = "2026-09-09";
+        let items = parse_day(DOC, d, T);
+        assert_eq!(texts(&items), ["call the bank", "ship 0.8.0", "rotate the token"]);
+        // last to first: the block moves, its deadline, note and stamp travel
+        let md = reorder_item(DOC, d, T, &items[2].id, Some(&items[0].id)).unwrap();
+        let after = parse_day(&md, d, T);
+        assert_eq!(texts(&after), ["rotate the token", "call the bank", "ship 0.8.0"]);
+        assert_eq!(after[0].carried_from.as_deref(), Some("2026-09-08"));
+        assert!(after[2].done && after[2].note.as_deref().unwrap().starts_with("needs Tom"));
+        // first to just before the last (moving down)
+        let md = reorder_item(DOC, d, T, &items[0].id, Some(&items[2].id)).unwrap();
+        assert_eq!(texts(&parse_day(&md, d, T)), ["ship 0.8.0", "call the bank", "rotate the token"]);
+        // no `before`: last in the day
+        let md = reorder_item(DOC, d, T, &items[0].id, None).unwrap();
+        assert_eq!(texts(&parse_day(&md, d, T)), ["ship 0.8.0", "rotate the token", "call the bank"]);
+        // the other day is untouched
+        assert_eq!(texts(&parse_day(&md, T, T)), ["write the report"]);
+        // before itself: unchanged, byte for byte
+        assert_eq!(reorder_item(DOC, d, T, &items[0].id, Some(&items[0].id)).unwrap(), DOC);
+        assert!(reorder_item(DOC, d, T, "0-deadbeef", None).is_err());
+        assert!(reorder_item(DOC, d, T, &items[0].id, Some("9-deadbeef")).is_err());
+        assert!(reorder_item(DOC, "2026-01-01", T, &items[0].id, None).is_err());
     }
 
     #[test]

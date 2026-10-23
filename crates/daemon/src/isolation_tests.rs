@@ -85,6 +85,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/todo/edit", "home_inbox_and_todo_are_each_users_own"),
     ("/api/todo/remove", "home_inbox_and_todo_are_each_users_own"),
     ("/api/todo/move", "home_inbox_and_todo_are_each_users_own"),
+    ("/api/todo/reorder", "home_inbox_and_todo_are_each_users_own"),
     ("/api/todo/deadline", "home_inbox_and_todo_are_each_users_own"),
     ("/api/todo/note", "home_inbox_and_todo_are_each_users_own"),
     ("/api/devices", "devices_and_profile_are_the_callers"),
@@ -853,6 +854,7 @@ async fn home_inbox_and_todo_are_each_users_own() {
         ("/api/todo/edit", json!({"date": today, "item_id": a_item, "text": "hijacked", "today": today})),
         ("/api/todo/remove", json!({"date": today, "item_id": a_item, "today": today})),
         ("/api/todo/move", json!({"date": today, "item_id": a_item, "to_date": "2030-01-01", "today": today})),
+        ("/api/todo/reorder", json!({"date": today, "item_id": a_item, "today": today})),
         ("/api/todo/deadline", json!({"date": today, "item_id": a_item, "deadline": "2030-01-01", "today": today})),
         ("/api/todo/note", json!({"date": today, "item_id": a_item, "note": "x", "today": today})),
     ] {
