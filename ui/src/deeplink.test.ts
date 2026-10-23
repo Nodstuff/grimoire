@@ -46,11 +46,12 @@ describe('settings deep links', () => {
   it('E-readers and Upload tokens show in SERVER mode only; asked for in LOCAL, Settings opens on Profile', () => {
     expect(settingsSections(true, 'ereaders')).toMatchObject({ active: 'ereaders' })
     expect(settingsSections(true, 'uploads')).toMatchObject({ active: 'uploads' })
-    expect(settingsSections(true, 'ereaders').shown.map((s) => s.id)).toEqual(['profile', 'ereaders', 'uploads'])
-    for (const want of ['ereaders', 'uploads'] as const) {
+    expect(settingsSections(true, 'ereaders').shown.map((s) => s.id)).toEqual(['profile', 'appearance', 'ereaders', 'uploads', 'workspaces', 'links', 'gardeners', 'data', 'about'])
+    for (const want of ['ereaders', 'uploads', 'links'] as const) {
       const local = settingsSections(false, want)
       expect(local.active).toBe('profile')
-      expect(local.shown.map((s) => s.id)).toEqual(['profile'])
+      expect(local.shown.map((s) => s.id)).toEqual(['profile', 'appearance', 'workspaces', 'gardeners', 'data', 'about'])
     }
+    expect(settingsSections(false, 'appearance').active).toBe('appearance')
   })
 })

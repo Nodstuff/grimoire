@@ -37,7 +37,7 @@ export type Route =
 export type RouteKind = Route['kind']
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-export const SETTINGS_SECTION_IDS: SettingsSection[] = ['profile', 'ereaders', 'uploads']
+export const SETTINGS_SECTION_IDS: SettingsSection[] = ['profile', 'appearance', 'ereaders', 'uploads', 'workspaces', 'links', 'gardeners', 'data', 'about']
 
 function isSection(s: string): s is SettingsSection {
   return (SETTINGS_SECTION_IDS as string[]).includes(s)

@@ -1,0 +1,536 @@
+/* /settings (canvas Settings.dc.html): the serif title, a 200px section
+   nav, and a column of section cards (.sect). Values lifted from the
+   artboard. */
+
+.st-page {
+  width: 100%;
+  max-width: 1116px;
+  margin: 0 auto;
+}
+.st-title {
+  margin: 0 0 24px;
+  font-family: var(--font-serif);
+  font-size: 40px;
+  font-weight: 500;
+  letter-spacing: var(--tracking-title);
+  line-height: 1.1;
+}
+.st-layout {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 28px;
+  align-items: flex-start;
+}
+.st-nav {
+  flex: 0 0 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  position: sticky;
+  top: 0;
+}
+.st-nav a {
+  padding: 7px 12px;
+  border-radius: var(--r-md);
+  color: var(--ink2);
+  text-decoration: none;
+  font-weight: 500;
+}
+.st-nav a:hover {
+  color: var(--ink);
+  background: var(--hover);
+}
+.st-nav a.on {
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: 0 0 0 1px var(--line);
+}
+.st-sections {
+  flex: 999 1 560px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.st-sections > * {
+  flex-shrink: 0;
+}
+
+/* ---------- a section card ---------- */
+.st-sect {
+  padding: 22px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  scroll-margin-top: 16px;
+}
+.st-sect h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+.st-sub {
+  margin: -10px 0 0;
+  color: var(--ink3);
+  font-size: 13.5px;
+}
+.st-note {
+  margin: -6px 0 0;
+  color: var(--ink3);
+  font-size: var(--text-md);
+}
+.st-note b {
+  color: var(--yellow);
+  font-weight: 600;
+}
+
+/* ---------- rows ---------- */
+.st-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+  min-width: 0;
+}
+.st-row-first {
+  border-top: 0;
+  padding-top: 0;
+}
+.st-row-start {
+  align-items: flex-start;
+}
+.st-row-end {
+  align-items: flex-end;
+}
+.st-row-text {
+  flex: 1;
+  min-width: 0;
+}
+.st-row-sub {
+  display: block;
+  color: var(--ink3);
+  font-size: var(--text-sm2);
+}
+.st-strong {
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.st-mono {
+  font-size: var(--text-md);
+}
+.st-grow {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+/* ---------- fields ---------- */
+.st-inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-end;
+}
+.st-fld {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.st-fld label {
+  font-size: var(--text-sm2);
+  color: var(--ink2);
+  font-weight: 500;
+}
+.st-inp {
+  height: 38px;
+  border-radius: var(--r-btn);
+  border: 1px solid var(--line2);
+  background: var(--card);
+  padding: 0 12px;
+  color: var(--ink);
+  min-width: 0;
+}
+.st-inp::placeholder {
+  color: var(--ink3);
+}
+.st-inp:focus-visible,
+.st-role:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.st-inp-sm {
+  height: 34px;
+}
+.lp-btn.st-tall {
+  height: 38px;
+}
+.st-check {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  height: 38px;
+  font-size: var(--text-md);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.st-check input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  margin: 0;
+}
+.st-role {
+  height: 30px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line2);
+  background: var(--card);
+  font-size: var(--text-md);
+  color: var(--ink);
+  padding: 0 8px;
+}
+
+/* ---------- segmented choice ---------- */
+.st-seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: var(--r-field);
+  background: var(--card2);
+  padding: 3px;
+  gap: 2px;
+}
+.st-seg button {
+  border: 0;
+  background: transparent;
+  font-size: var(--text-md);
+  font-weight: 500;
+  color: var(--ink3);
+  padding: 6px 14px;
+  border-radius: 7px;
+  cursor: pointer;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.st-seg button:hover {
+  color: var(--ink);
+}
+.st-seg button.on {
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgba(20, 26, 45, 0.12);
+}
+
+/* ---------- the show-once card ---------- */
+.st-secret {
+  border-radius: 12px;
+  box-shadow: 0 0 0 1.5px var(--accent);
+  background: var(--accent-soft);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.st-secret-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.st-secret-head b {
+  font-size: var(--text-lg);
+}
+.st-secret-warn {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  font-size: var(--text-md);
+  font-weight: 600;
+  color: var(--red);
+}
+.st-kv {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  font-size: 13.5px;
+}
+.st-kv code {
+  font-family: var(--font-mono);
+  font-size: var(--text-md);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.st-kv-hint {
+  grid-column: 2 / -1;
+  margin-top: -6px;
+  font-size: var(--text-sm);
+  color: var(--ink3);
+}
+
+/* ---------- workspaces ---------- */
+.st-ws-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: var(--r-xs);
+  flex: none;
+}
+.st-row-start .st-ws-dot {
+  margin-top: 3px;
+}
+.st-ws-main {
+  flex: 1 1 260px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.st-ws-name {
+  font-weight: 600;
+}
+.st-ws-actions {
+  display: inline-flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.st-swatches {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.st-swatch {
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  border: 0;
+  cursor: pointer;
+  padding: 0;
+}
+.st-swatch[aria-checked='true'] {
+  box-shadow: 0 0 0 2px var(--card), 0 0 0 4px var(--ink);
+}
+.st-members {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.st-member {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.st-member-name {
+  flex: 1;
+  min-width: 0;
+}
+.st-member-add {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.st-member-add .st-inp {
+  flex: 1;
+  min-width: 200px;
+}
+.st-members-none {
+  font-size: var(--text-md);
+}
+.st-members-help {
+  font-size: var(--text-sm);
+  color: var(--ink3);
+  display: inline-flex;
+  gap: 6px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+/* ---------- share links ---------- */
+.st-table-wrap {
+  overflow-x: auto;
+}
+.st-tbl {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+}
+.st-tbl th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--ink3);
+  font-size: var(--text-sm);
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.st-tbl td {
+  padding: 11px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+.st-tbl-doc {
+  text-decoration: none;
+  font-weight: 500;
+}
+.st-tbl-sub {
+  display: block;
+  color: var(--ink3);
+  font-size: var(--text-sm);
+}
+.st-tbl-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+.st-cmt-toggle {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+}
+.st-count,
+.st-new {
+  display: inline-block;
+  font-size: var(--text-sm);
+  color: var(--ink3);
+  padding: 0 7px;
+  border-radius: var(--r-pill);
+  background: var(--card2);
+  border: 1px solid var(--line);
+  line-height: 18px;
+}
+.st-new {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: transparent;
+  font-weight: 600;
+}
+.st-cmt-cell {
+  background: var(--card2);
+}
+.st-cmts {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.st-cmt {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.st-cmt-line {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.st-cmt-reply {
+  margin-left: 36px;
+}
+.st-guest {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: inline-grid;
+  place-items: center;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  background: var(--card);
+  color: var(--ink2);
+  border: 1px solid var(--line2);
+  flex: none;
+}
+.st-cmt-body {
+  flex: 1;
+  min-width: 0;
+}
+.st-cmt-body b {
+  font-weight: 500;
+}
+.st-cmt-when {
+  font-size: var(--text-sm);
+}
+.st-cmt-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.st-reply {
+  display: flex;
+  gap: 6px;
+  margin-left: 36px;
+}
+.st-reply .st-inp {
+  flex: 1;
+  height: 32px;
+}
+
+/* ---------- gardeners ---------- */
+.st-gd-name {
+  color: var(--agent);
+  font-size: var(--text-md);
+  width: 110px;
+  flex: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.st-gd-last {
+  font-size: var(--text-sm2);
+  color: var(--ink3);
+}
+.st-gd-last.running {
+  color: var(--agent);
+}
+
+/* ---------- phone ---------- */
+@media (max-width: 760px) {
+  .st-title {
+    font-size: var(--title-md);
+    margin-bottom: 16px;
+  }
+  .st-layout {
+    gap: 16px;
+  }
+  .st-nav {
+    flex: 1 1 100%;
+    flex-direction: row;
+    overflow-x: auto;
+    gap: 4px;
+    position: static;
+    margin: 0 calc(-1 * var(--gutter));
+    padding: 2px var(--gutter);
+    scrollbar-width: none;
+  }
+  .st-nav a {
+    white-space: nowrap;
+    flex: none;
+  }
+  .st-sections {
+    flex-basis: 100%;
+  }
+  .st-sect {
+    padding: 18px 16px;
+  }
+  .st-kv {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .st-kv > .muted {
+    grid-column: 1 / -1;
+    margin-bottom: -6px;
+  }
+  .st-kv-hint {
+    grid-column: 1 / -1;
+  }
+  .st-gd-name {
+    width: auto;
+    flex: 1 1 100%;
+  }
+  .st-tbl-actions {
+    white-space: normal;
+  }
+}

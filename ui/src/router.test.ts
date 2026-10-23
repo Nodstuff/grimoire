@@ -23,6 +23,12 @@ describe('routes', () => {
       { kind: 'settings', section: 'profile' },
       { kind: 'settings', section: 'ereaders' },
       { kind: 'settings', section: 'uploads' },
+      { kind: 'settings', section: 'appearance' },
+      { kind: 'settings', section: 'workspaces' },
+      { kind: 'settings', section: 'links' },
+      { kind: 'settings', section: 'gardeners' },
+      { kind: 'settings', section: 'data' },
+      { kind: 'settings', section: 'about' },
     ]
     for (const r of routes) {
       const p = routePath(r)

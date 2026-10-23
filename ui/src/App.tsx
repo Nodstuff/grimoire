@@ -576,6 +576,10 @@ export default function App() {
           version={appStamp?.version ?? null}
           onProfileChanged={setProfile}
           onSignOut={signedIn ? signOutAndReload : undefined}
+          workspaces={workspaces}
+          onWorkspacesChanged={loadWorkspaces}
+          onShortcuts={() => setPalette('help')}
+          onImported={reloadDocs}
         />
       )
       break
