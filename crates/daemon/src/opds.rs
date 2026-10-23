@@ -57,9 +57,8 @@ use axum::{Extension, Json, Router};
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::sync::Arc;
-use taisce_store::books::{Book, BookPage, Ereader};
+use taisce_store::books::{Book, BookField, BookFilter, BookPage, Ereader};
 use taisce_store::{Scope, SharedStore, StoreError};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -69,11 +68,6 @@ use uuid::Uuid;
 /// Acquisition feeds page at 50 (the proposal's): a page fits an e-ink
 /// screen, and one download.
 const PAGE: usize = 50;
-
-/// The in-memory universe for the title-sorted `/all` and the author/series
-/// indexes: the shelf's newest 10,000 books. A personal EPUB library is
-/// hundreds; past the cap those feeds simply end early.
-const ALL_CAP: usize = 10_000;
 
 /// Feed content types, as the OPDS 1.2 profile freezes them.
 const NAV_CT: &str = "application/atom+xml;profile=opds-catalog;kind=navigation";
@@ -384,7 +378,11 @@ pub(crate) async fn opds_auth(State(st): State<OpdsState>, mut req: Request, nex
     } else {
         match basic_credentials(req.headers()) {
             Some((u, p)) => (undash(&p), Some(u), "/opds".to_string(), "basic"),
-            None => return auth_failed(&server.limiter, &ip, "basic"),
+            // no Authorization header at all is the challenge round-trip
+            // every client makes first, not a guess: it answers the
+            // challenge without spending the strict failure bucket (the
+            // per-IP `Class::Opds` limit above still holds)
+            None => return auth_challenge(),
         }
     };
     let hash = hash_secret(&secret);
@@ -568,13 +566,14 @@ fn acq_xml(prefix: &str, id: &str, title: &str, self_href: &str, next_href: Opti
 
 /// The distinct values of one book field as a navigation feed of filtered
 /// feeds (`/opds/authors`, `/opds/series`), each entry carrying its count.
-fn index_xml(prefix: &str, feed_segment: &str, link_segment: &str, title: &str, entries: &[(String, String, usize)], updated: &str) -> String {
+fn index_xml(prefix: &str, feed_segment: &str, link_segment: &str, title: &str, entries: &[(String, usize)], updated: &str) -> String {
     let mut x = feed_head(&format!("urn:taisce:books:{feed_segment}"), title, updated);
     spine_links(&mut x, prefix, &format!("{prefix}/{feed_segment}"), NAV_CT);
-    for (key, name, n) in entries {
+    for (name, n) in entries {
+        let key = name.to_ascii_lowercase();
         let content = if *n == 1 { "1 book".to_string() } else { format!("{n} books") };
         x.push_str(&nav_entry_xml(
-            &format!("urn:taisce:books:{feed_segment}:{}", url_enc(key)),
+            &format!("urn:taisce:books:{feed_segment}:{}", url_enc(&key)),
             name,
             &format!("{prefix}/{link_segment}/{}", url_enc(name)),
             "subsection",
@@ -639,10 +638,13 @@ fn parse_cursor(c: Option<&str>) -> Result<BookPage, Response> {
     }
 }
 
-/// The whole shelf, newest first (capped): the universe the title-sorted
-/// and index feeds compute over.
-async fn shelf(st: &OpdsState, user: Uuid) -> taisce_store::Result<Vec<Book>> {
-    with_store(&st.store, Scope::User(user), move |s| s.book_list(user, &BookPage::default(), ALL_CAP, None)).await
+/// What a keyset-paged feed narrows to (the store's [`BookFilter`], owned).
+#[derive(Clone)]
+enum Narrow {
+    None,
+    Search(String),
+    Author(String),
+    Series(String),
 }
 
 /// What one keyset-paged acquisition feed is: its identity, its address
@@ -652,7 +654,7 @@ struct FeedRef {
     title: String,
     self_base: String,
     up: Option<String>,
-    search: Option<String>,
+    narrow: Narrow,
 }
 
 /// Fetch the page the cursor names — one extra row decides whether a `next`
@@ -663,8 +665,17 @@ async fn paged_feed(st: &OpdsState, client: &OpdsClient, feed: FeedRef, q: &Page
         Err(r) => return r,
     };
     let user = client.ereader.user_id;
-    let search = feed.search.clone();
-    let books = with_store(&st.store, Scope::User(user), move |s| s.book_list(user, &cursor, PAGE + 1, search.as_deref())).await;
+    let narrow = feed.narrow.clone();
+    let books = with_store(&st.store, Scope::User(user), move |s| {
+        let filter = match &narrow {
+            Narrow::None => BookFilter::All,
+            Narrow::Search(q) => BookFilter::Search(q),
+            Narrow::Author(a) => BookFilter::Author(a),
+            Narrow::Series(v) => BookFilter::Series(v),
+        };
+        s.book_list_where(user, &cursor, PAGE + 1, filter)
+    })
+    .await;
     let mut books = match books {
         Ok(b) => b,
         Err(e) => return fail(e),
@@ -696,76 +707,57 @@ async fn new_feed(State(st): State<OpdsState>, Extension(client): Extension<Opds
     paged_feed(
         &st,
         &client,
-        FeedRef { id: "urn:taisce:books:new".into(), title: "New".into(), self_base: format!("{prefix}/new"), up: None, search: None },
+        FeedRef { id: "urn:taisce:books:new".into(), title: "New".into(), self_base: format!("{prefix}/new"), up: None, narrow: Narrow::None },
         &q,
     )
     .await
 }
 
-/// `/all` is title-sorted: the store lists newest-first, so the shelf is
-/// read whole (capped), sorted in memory, and offset-paged with `start` — a
-/// keyset cannot name a page of an order that is computed, not stored.
+/// `/all` is title-sorted: the store orders by title and the feed pages by
+/// offset (`start`) — a keyset cannot name a page of a computed order. One
+/// extra row decides whether a `next` link exists; no cap, every book is
+/// reachable.
 async fn all_feed(State(st): State<OpdsState>, Extension(client): Extension<OpdsClient>, Query(q): Query<PageQ>) -> Response {
     let start = q.start.unwrap_or(0);
     let user = client.ereader.user_id;
-    let books = match shelf(&st, user).await {
+    let mut page = match with_store(&st.store, Scope::User(user), move |s| s.book_list_by_title(user, start, PAGE + 1)).await {
         Ok(b) => b,
         Err(e) => return fail(e),
     };
-    let mut books = books;
-    books.sort_by(|a, b| {
-        a.title
-            .to_lowercase()
-            .cmp(&b.title.to_lowercase())
-            .then_with(|| a.author.to_lowercase().cmp(&b.author.to_lowercase()))
-            .then_with(|| b.added_at.cmp(&a.added_at))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    let total = books.len();
-    let page: Vec<Book> = books.into_iter().skip(start).take(PAGE).collect();
+    let more = page.len() > PAGE;
+    page.truncate(PAGE);
     let prefix = &client.prefix;
     let base = format!("{prefix}/all");
     let self_href = if start == 0 { base.clone() } else { format!("{base}?start={start}") };
-    let next_href = (start + PAGE < total).then(|| format!("{base}?start={}", start + PAGE));
+    let next_href = more.then(|| format!("{base}?start={}", start + PAGE));
     xml(ACQ_CT, acq_xml(prefix, "urn:taisce:books:all", "All", &self_href, next_href.as_deref(), None, &page, &rfc3339(now())))
 }
 
-/// The distinct non-empty values of `field` over the shelf — (lowercase
-/// key, first-seen display form, count) — sorted by the key.
-fn index_of(books: &[Book], field: impl Fn(&Book) -> Option<&str>) -> Vec<(String, String, usize)> {
-    let mut seen: HashMap<String, (String, usize)> = HashMap::new();
-    for b in books {
-        let Some(v) = field(b).map(str::trim).filter(|v| !v.is_empty()) else { continue };
-        let e = seen.entry(v.to_lowercase()).or_insert_with(|| (v.to_string(), 0));
-        e.1 += 1;
-    }
-    let mut all: Vec<_> = seen.into_iter().map(|(k, (v, n))| (k, v, n)).collect();
-    all.sort_by(|a, b| a.0.cmp(&b.0));
-    all
+/// An author or series index: one navigation entry per distinct name
+/// (trimmed, case-insensitive), the whole shelf, no cap.
+async fn index_feed(st: &OpdsState, client: &OpdsClient, field: BookField) -> Response {
+    let user = client.ereader.user_id;
+    let names = match with_store(&st.store, Scope::User(user), move |s| s.book_index(user, field)).await {
+        Ok(n) => n,
+        Err(e) => return fail(e),
+    };
+    let (feed, link, title) = match field {
+        BookField::Author => ("authors", "author", "Authors"),
+        BookField::Series => ("series", "series", "Series"),
+    };
+    xml(NAV_CT, index_xml(&client.prefix, feed, link, title, &names, &rfc3339(now())))
 }
 
 async fn authors_feed(State(st): State<OpdsState>, Extension(client): Extension<OpdsClient>) -> Response {
-    let user = client.ereader.user_id;
-    let books = match shelf(&st, user).await {
-        Ok(b) => b,
-        Err(e) => return fail(e),
-    };
-    let names = index_of(&books, |b| Some(b.author.as_str()));
-    xml(NAV_CT, index_xml(&client.prefix, "authors", "author", "Authors", &names, &rfc3339(now())))
+    index_feed(&st, &client, BookField::Author).await
 }
 
 async fn series_feed(State(st): State<OpdsState>, Extension(client): Extension<OpdsClient>) -> Response {
-    let user = client.ereader.user_id;
-    let books = match shelf(&st, user).await {
-        Ok(b) => b,
-        Err(e) => return fail(e),
-    };
-    let names = index_of(&books, |b| b.series.as_deref());
-    xml(NAV_CT, index_xml(&client.prefix, "series", "series", "Series", &names, &rfc3339(now())))
+    index_feed(&st, &client, BookField::Series).await
 }
 
-/// One author's books: the store's search matches title, author and series
-/// (substring, case-insensitive), so a full name narrows to their shelf.
+/// One author's books: exactly that author (trimmed, case-insensitive — the
+/// key the index grouped by), never a substring of a title or series.
 async fn author_books(st: &OpdsState, client: &OpdsClient, name: String, q: &PageQ) -> Response {
     let prefix = client.prefix.clone();
     paged_feed(
@@ -776,7 +768,7 @@ async fn author_books(st: &OpdsState, client: &OpdsClient, name: String, q: &Pag
             title: name.clone(),
             self_base: format!("{prefix}/author/{}", url_enc(&name)),
             up: Some(format!("{prefix}/authors")),
-            search: Some(name),
+            narrow: Narrow::Author(name),
         },
         q,
     )
@@ -808,7 +800,7 @@ async fn series_books(st: &OpdsState, client: &OpdsClient, name: String, q: &Pag
             title: name.clone(),
             self_base: format!("{prefix}/series/{}", url_enc(&name)),
             up: Some(format!("{prefix}/series")),
-            search: Some(name),
+            narrow: Narrow::Series(name),
         },
         q,
     )
@@ -841,7 +833,7 @@ async fn search_feed(State(st): State<OpdsState>, Extension(client): Extension<O
             title,
             self_base: format!("{prefix}/search?q={}", url_enc(&query)),
             up: None,
-            search: Some(query),
+            narrow: Narrow::Search(query),
         },
         &q,
     )
@@ -938,7 +930,6 @@ pub fn router(state: OpdsState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
 
     fn book(title: &str, author: &str, series: Option<&str>, index: Option<f64>) -> Book {
         Book {
@@ -1184,23 +1175,75 @@ mod tests {
         assert!(x.contains("template=\"/opds/search?q={searchTerms}\""));
     }
 
+    /// The challenge round-trip (no Authorization header) never spends the
+    /// strict failure bucket; a wrong credential does, and a failed KOSYNC
+    /// sign-in spends the same bucket.
+    #[tokio::test]
+    async fn only_a_wrong_credential_spends_the_auth_failure_bucket() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use taisce_store::{BlockStore, PrincipalKind, SqliteStore};
+        use tower::ServiceExt;
+        let mut raw = SqliteStore::open_in_memory().unwrap();
+        let human = raw.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        raw.auth_ensure_owner(human, "Tom", 1).unwrap();
+        let store = SharedStore::new(raw);
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(AuthConfig::from_public_url("http://localhost:7513").unwrap());
+        let limiter = Limiter::default();
+        let library = crate::library::LibraryState {
+            store: store.clone(),
+            s3: None,
+            server_mode: true,
+            local_human: human,
+            spool_dir: dir.path().join("spool"),
+        };
+        let app = router(OpdsState {
+            store: store.clone(),
+            server: Some(OpdsServer { cfg: cfg.clone(), limiter: limiter.clone() }),
+            local_human: human,
+            library,
+        })
+        .merge(crate::kosync::router(crate::kosync::KosyncState {
+            store: store.clone(),
+            server: Some(crate::kosync::ServerSide { cfg, limiter }),
+            local_human: human,
+        }));
+        for _ in 0..30 {
+            let res = app.clone().oneshot(Request::get("/opds/").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "a bare request is the challenge, never 429");
+            assert!(res.headers().contains_key(header::WWW_AUTHENTICATE));
+        }
+        let wrong = || {
+            let basic = base64::engine::general_purpose::STANDARD.encode("Tom:k7mq-4xpt-9wre-hz2c");
+            Request::get("/opds/").header("authorization", format!("Basic {basic}")).body(Body::empty()).unwrap()
+        };
+        // half the bucket on OPDS guesses, the rest on KOSYNC ones
+        for _ in 0..5 {
+            assert_eq!(app.clone().oneshot(wrong()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        }
+        let kosync_wrong = || {
+            Request::get("/kosync/users/auth")
+                .header("x-auth-user", "Tom")
+                .header("x-auth-key", "0123456789abcdef0123456789abcdef")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let mut statuses = Vec::new();
+        for _ in 0..8 {
+            statuses.push(app.clone().oneshot(kosync_wrong()).await.unwrap().status());
+        }
+        assert!(statuses.contains(&StatusCode::TOO_MANY_REQUESTS), "kosync failures share the bucket: {statuses:?}");
+        assert_eq!(app.clone().oneshot(wrong()).await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
     #[test]
-    fn index_feed_dedupes_case_and_counts() {
-        let mut books = vec![
-            book("Dune", "Frank Herbert", None, None),
-            book("Dune Messiah", "frank herbert", None, None),
-            book("The Hobbit", "J. R. R. Tolkien", Some("Middle-earth"), None),
-        ];
-        books.push(book("No Author", "", None, None));
-        let authors = index_of(&books, |b| Some(b.author.as_str()));
-        assert_eq!(authors.len(), 2, "the empty author is skipped; casing folds");
-        assert_eq!(authors[0].1, "Frank Herbert", "first-seen casing wins");
-        assert_eq!(authors[0].2, 2);
-        let series = index_of(&books, |b| b.series.as_deref());
-        assert_eq!(series.len(), 1);
-        let x = index_xml("/opds", "authors", "author", "Authors", &authors, "2026-01-01T00:00:00Z");
+    fn index_feed_links_each_name_with_its_count() {
+        let names = vec![("Frank Herbert".to_string(), 2), ("J. R. R. Tolkien".to_string(), 1)];
+        let x = index_xml("/opds", "authors", "author", "Authors", &names, "2026-01-01T00:00:00Z");
         assert!(x.contains("href=\"/opds/author/Frank%20Herbert\""));
-        assert!(x.contains(">2 books</content>"));
+        assert!(x.contains("urn:taisce:books:authors:frank%20herbert"));
+        assert!(x.contains(">2 books</content>") && x.contains(">1 book</content>"));
     }
 
     #[test]

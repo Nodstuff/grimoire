@@ -3631,6 +3631,40 @@ impl SqliteStore {
     /// land, docs are created/moved/deleted/statused, annotations resolve, or
     /// gardener runs progress. The app polls this to live-refresh.
     pub fn change_stamp(&self) -> Result<i64> {
+        let library = self.library_stamp()?;
+        Ok(self.doc_stamp()?.wrapping_add(library))
+    }
+
+    /// The EPUB library's share of the stamp (books, ereaders, kosync
+    /// progress), keyed to the caller's own rows: an upload, an edit, a
+    /// delete, a pairing or a pushed position refreshes the Books view.
+    /// `last_used_at` is left out on purpose (a reading device would tick
+    /// it every minute).
+    fn library_stamp(&self) -> Result<i64> {
+        let mine = match self.scope.user() {
+            Some(u) => format!("WHERE user_id = '{u}'"),
+            None if self.scope.sees_all() => String::new(),
+            None => return Ok(0),
+        };
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT (SELECT COALESCE(count(*) * 1000003 + count(deleted_at) * 7919 + sum(updated_at % 1000003)
+                                     + sum(length(title) + length(author) + length(coalesce(series, '')) * 31
+                                           + coalesce(series_index, 0) * 131), 0) FROM book {mine})
+                          + (SELECT COALESCE(count(*) * 104729 + count(revoked_at) * 31 + sum(length(label))
+                                     + sum(stream_downloads) * 17, 0) FROM ereader {mine})
+                          + (SELECT COALESCE(count(*) * 1299709 + sum(updated_at % 1000003) + sum(CAST(percentage * 10000 AS INTEGER)), 0)
+                             FROM kosync_progress {mine})"
+                ),
+                [],
+                |r| r.get::<_, f64>(0),
+            )
+            .map(|v| v as i64)
+            .map_err(Into::into)
+    }
+
+    fn doc_stamp(&self) -> Result<i64> {
         if let Some(sub) = tenancy::vis_sub(self.scope) {
             return self
                 .conn

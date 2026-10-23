@@ -926,7 +926,7 @@ mod tests {
         let (app, store, user, human) = app();
         let older = add_book(&store, user, "Older", "A", 10);
         let newer = add_book(&store, user, "Newer", "B", 20);
-        let done = add_book(&store, user, "Done", "C", 30);
+        let _done = add_book(&store, user, "Done", "C", 30);
         let _shelf_only = add_book(&store, user, "Untouched", "D", 40);
         push_progress(&store, user, "Older", "A", 0.5, 100);
         push_progress(&store, user, "Newer", "B", 0.25, 200);

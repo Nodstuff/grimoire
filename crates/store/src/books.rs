@@ -65,6 +65,25 @@ pub struct BookPage {
     pub after: Option<(i64, Uuid)>,
 }
 
+/// What a book listing narrows to.
+#[derive(Clone, Copy, Debug)]
+pub enum BookFilter<'a> {
+    All,
+    /// substring of title, author or series (case-insensitive)
+    Search(&'a str),
+    /// exactly this author (trimmed, case-insensitive)
+    Author(&'a str),
+    /// exactly this series (trimmed, case-insensitive)
+    Series(&'a str),
+}
+
+/// A field [`SqliteStore::book_index`] groups by.
+#[derive(Clone, Copy, Debug)]
+pub enum BookField {
+    Author,
+    Series,
+}
+
 /// A paired ereader (revoked rows included: they stay listed, they just
 /// no longer authenticate).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +261,18 @@ impl SqliteStore {
     /// A page of `user`'s live books, newest first (added_at desc, id
     /// desc). `search` matches title, author or series case-insensitively.
     pub fn book_list(&self, user: Uuid, page: &BookPage, limit: usize, search: Option<&str>) -> Result<Vec<Book>> {
+        self.book_list_where(user, page, limit, search.map(BookFilter::Search).unwrap_or(BookFilter::All))
+    }
+
+    /// [`Self::book_list`] with an explicit filter: a substring search, or
+    /// one author's / one series' books exactly (trimmed, case-insensitive
+    /// — the same key [`Self::book_index`] groups by, so an index entry's
+    /// link lists exactly the books it counted).
+    pub fn book_list_where(&self, user: Uuid, page: &BookPage, limit: usize, filter: BookFilter<'_>) -> Result<Vec<Book>> {
+        let search = match filter {
+            BookFilter::Search(q) => Some(q),
+            _ => None,
+        };
         let owner = self.user_scoped(user)?;
         let mut sql = format!("SELECT {BOOK_COLS} FROM book WHERE user_id = ?1 AND deleted_at IS NULL");
         let mut args: Vec<Value> = vec![owner.to_string().into()];
@@ -267,10 +298,53 @@ impl SqliteStore {
             args.push(format!("%{escaped}%").into());
             next += 1;
         }
+        let exact = match filter {
+            BookFilter::Author(v) => Some(("author", v)),
+            BookFilter::Series(v) => Some(("series", v)),
+            _ => None,
+        };
+        if let Some((col, v)) = exact {
+            sql.push_str(&format!(" AND trim({col}) = ?{next} COLLATE NOCASE"));
+            args.push(v.trim().to_string().into());
+            next += 1;
+        }
         sql.push_str(&format!(" ORDER BY added_at DESC, id DESC LIMIT ?{next}"));
         args.push((limit as i64).into());
         let mut st = self.conn.prepare(&sql)?;
         let rows = st.query_map(params_from_iter(args), book_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A page of `user`'s live books in title order (then author, newest,
+    /// id): OPDS `/all`, offset-paged because the order is not a keyset the
+    /// feed can name. ASCII case-insensitive, like every other comparison
+    /// here.
+    pub fn book_list_by_title(&self, user: Uuid, offset: usize, limit: usize) -> Result<Vec<Book>> {
+        let owner = self.user_scoped(user)?;
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {BOOK_COLS} FROM book WHERE user_id = ?1 AND deleted_at IS NULL
+             ORDER BY title COLLATE NOCASE, author COLLATE NOCASE, added_at DESC, id
+             LIMIT ?2 OFFSET ?3"
+        ))?;
+        let rows = st.query_map(params![owner.to_string(), limit as i64, offset as i64], book_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// `user`'s live books grouped by author or series (trimmed,
+    /// case-insensitive; empty values skipped): (display form, count),
+    /// sorted by the key. The whole index, uncapped: one row per name.
+    pub fn book_index(&self, user: Uuid, field: BookField) -> Result<Vec<(String, usize)>> {
+        let owner = self.user_scoped(user)?;
+        let col = match field {
+            BookField::Author => "author",
+            BookField::Series => "series",
+        };
+        let mut st = self.conn.prepare(&format!(
+            "SELECT min(trim({col})), count(*) FROM book
+             WHERE user_id = ?1 AND deleted_at IS NULL AND trim(coalesce({col}, '')) != ''
+             GROUP BY trim({col}) COLLATE NOCASE ORDER BY trim({col}) COLLATE NOCASE"
+        ))?;
+        let rows = st.query_map(params![owner.to_string()], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -500,8 +574,9 @@ impl SqliteStore {
     // ---- kosync progress ----
 
     /// Record `user`'s progress in `document`, newest-wins: an incoming
-    /// stamp older than (or equal to) the stored one leaves the row
-    /// untouched. Either way, returns the row's final `updated_at` (the
+    /// stamp older than the stored one leaves the row untouched; an EQUAL
+    /// one wins (the daemon stamps in whole seconds, so two pushes in one
+    /// second are both "now" and the later arrival is the newer position). Either way, returns the row's final `updated_at` (the
     /// KOSYNC answer to a push).
     #[allow(clippy::too_many_arguments)]
     pub fn kosync_upsert(
@@ -522,7 +597,7 @@ impl SqliteStore {
                  progress = excluded.progress, percentage = excluded.percentage,
                  device = excluded.device, device_id = excluded.device_id,
                  updated_at = excluded.updated_at
-             WHERE excluded.updated_at > kosync_progress.updated_at",
+             WHERE excluded.updated_at >= kosync_progress.updated_at",
             params![owner.to_string(), document, progress, percentage, device, device_id, ts],
         )?;
         Ok(self.conn.query_row(
@@ -580,6 +655,64 @@ mod tests {
 
     fn titles(page: &[Book]) -> Vec<&str> {
         page.iter().map(|b| b.title.as_str()).collect()
+    }
+
+    /// The OPDS author/series feeds list one name's books EXACTLY (not a
+    /// substring across fields), the index counts the same key, and the
+    /// title order pages by offset with no cap.
+    #[test]
+    fn exact_author_and_series_filters_title_paging_and_the_index() {
+        let (mut s, a, _b) = store_with_users();
+        let mut dune = new_book("Dune", "Frank Herbert");
+        dune.series = Some("Dune Chronicles".into());
+        add_book(&mut s, a, &dune, 10);
+        add_book(&mut s, a, &new_book("Frank Herbert: A Life", "Someone Else"), 11);
+        add_book(&mut s, a, &new_book("Children of Dune", " frank herbert "), 12);
+        add_book(&mut s, a, &new_book("anathem", "Neal Stephenson"), 13);
+        s.with_scope_for_test(Scope::User(a), |s| {
+            let p = BookPage::default();
+            let by = s.book_list_where(a, &p, 50, BookFilter::Author("FRANK HERBERT")).unwrap();
+            assert_eq!(titles(&by), ["Children of Dune", "Dune"], "exact, trimmed, case-insensitive; never a title match");
+            let by = s.book_list_where(a, &p, 50, BookFilter::Series("dune chronicles")).unwrap();
+            assert_eq!(titles(&by), ["Dune"], "Children of Dune has no series; a substring of a title is not one");
+            assert!(s.book_list_where(a, &p, 50, BookFilter::Author("Frank")).unwrap().is_empty());
+            assert_eq!(s.book_list(a, &p, 50, Some("frank")).unwrap().len(), 3, "search stays a substring search");
+
+            let all: Vec<String> = (0..4).flat_map(|i| s.book_list_by_title(a, i, 1).unwrap()).map(|b| b.title).collect();
+            assert_eq!(all, ["anathem", "Children of Dune", "Dune", "Frank Herbert: A Life"]);
+            assert!(s.book_list_by_title(a, 4, 1).unwrap().is_empty());
+
+            let authors = s.book_index(a, BookField::Author).unwrap();
+            assert_eq!(authors.len(), 3);
+            assert_eq!(authors[0].1, 2, "{authors:?}");
+            assert!(authors[0].0.eq_ignore_ascii_case("frank herbert"));
+            assert_eq!(s.book_index(a, BookField::Series).unwrap(), [("Dune Chronicles".to_string(), 1)]);
+        });
+    }
+
+    /// Books, ereaders and progress move /api/stamp, for their owner only.
+    #[test]
+    fn library_changes_bump_the_change_stamp() {
+        let (mut s, a, b) = store_with_users();
+        let stamp = |s: &mut SqliteStore, u: Uuid| s.with_scope_for_test(Scope::User(u), |s| s.change_stamp().unwrap());
+        let (a0, b0) = (stamp(&mut s, a), stamp(&mut s, b));
+        let book = add_book(&mut s, a, &new_book("Dune", "Frank Herbert"), 10);
+        let a1 = stamp(&mut s, a);
+        assert_ne!(a0, a1, "an upload");
+        assert_eq!(stamp(&mut s, b), b0, "B's stamp never moves for A's shelf");
+        s.with_scope_for_test(Scope::User(a), |s| s.book_update_metadata(book.id, "Dune!", "F. Herbert", None, None, 10).unwrap());
+        let a2 = stamp(&mut s, a);
+        assert_ne!(a1, a2, "an edit in the same second");
+        s.with_scope_for_test(Scope::User(a), |s| s.ereader_insert(Uuid::now_v7(), "kobo", "sh", ("k", "k2"), true, 10).unwrap());
+        let a3 = stamp(&mut s, a);
+        assert_ne!(a2, a3, "a pairing");
+        s.with_scope_for_test(Scope::User(a), |s| s.kosync_upsert(a, "d", "p", 0.25, "kobo", "x", 10).unwrap());
+        let a4 = stamp(&mut s, a);
+        assert_ne!(a3, a4, "a pushed position");
+        s.with_scope_for_test(Scope::User(a), |s| s.kosync_upsert(a, "d", "p2", 0.5, "kobo", "x", 10).unwrap());
+        assert_ne!(a4, stamp(&mut s, a), "a second push in the same second still lands (>=) and moves it");
+        s.with_scope_for_test(Scope::User(a), |s| s.book_soft_delete(book.id, 10).unwrap());
+        assert_eq!(stamp(&mut s, b), b0);
     }
 
     /// The library tables survive a reopen (created IF NOT EXISTS by init;
