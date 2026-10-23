@@ -45,6 +45,18 @@ export function settingsSections(server: boolean, want: SettingsSection) {
   return { shown, active }
 }
 
+/** Scroll the page (the stage, not the window: scrollIntoView would also
+ * nudge every scrollable ancestor) so a section's card sits at the top. */
+function scrollToSection(id: SettingsSection, smooth: boolean) {
+  const el = document.getElementById(`settings-${id}`)
+  if (!el) return
+  let box: HTMLElement | null = el.parentElement
+  while (box && !(box.scrollHeight > box.clientHeight && /(auto|scroll)/.test(getComputedStyle(box).overflowY))) box = box.parentElement
+  if (!box) return
+  const top = el.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop - 16
+  box.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' })
+}
+
 export default function Settings({
   section,
   server,
@@ -78,19 +90,18 @@ export default function Settings({
   const [here, setHere] = useState<SettingsSection>(active)
 
   // /settings/<section>: scroll its card into view (the first one is the top)
-  const first = useRef(true)
+  // (again when SERVER mode resolves and its sections land above the target)
+  const last = useRef<string | null>(null)
   useEffect(() => {
     setHere(active)
-    const el = document.getElementById(`settings-${active}`)
-    if (!el) return
-    if (first.current && active === shown[0].id) {
-      first.current = false
-      return
-    }
-    el.scrollIntoView({ behavior: first.current ? 'auto' : 'smooth', block: 'start' })
-    first.current = false
+    const key = `${active}:${shown.length}`
+    if (last.current === key) return
+    const initial = last.current === null || last.current.startsWith(`${active}:`)
+    last.current = key
+    if (initial && active === shown[0].id) return
+    scrollToSection(active, !initial)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active])
+  }, [active, shown.length])
 
   // the nav follows the reading position (the card nearest the top)
   useEffect(() => {
@@ -122,7 +133,7 @@ export default function Settings({
                 if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
                 e.preventDefault()
                 setHere(s.id)
-                if (s.id === active) document.getElementById(`settings-${s.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                if (s.id === active) scrollToSection(s.id, true)
                 else onSection(s.id)
               }}
             >

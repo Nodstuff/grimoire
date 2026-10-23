@@ -111,7 +111,7 @@ export function resultLine(r: UploadResult): { tone: 'green' | 'dim' | 'yellow' 
     case 'already_here':
       return { tone: 'dim', text: 'already here' }
     case 'clash':
-      return { tone: 'yellow', text: r.message ? `clash · ${r.message}` : 'clashes with a book already here' }
+      return { tone: 'yellow', text: r.message || 'clashes with a book already here' }
     default:
       return { tone: 'red', text: r.message ? `failed · ${r.message}` : 'failed' }
   }

@@ -97,7 +97,7 @@ export default function Ereaders({ dataVersion }: { dataVersion: number }) {
             <ConfirmButton variant="secondary" confirmLabel="Rotate: old one stops" onConfirm={() => rotate(d)}>
               Rotate password…
             </ConfirmButton>
-            <ConfirmButton variant="ghost" confirmLabel="Remove" onConfirm={() => remove(d)}>
+            <ConfirmButton confirmLabel="Remove" onConfirm={() => remove(d)}>
               Remove…
             </ConfirmButton>
           </Row>

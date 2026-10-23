@@ -18,10 +18,6 @@
     gap: 32px;
     align-items: start;
   }
-  .bk-aside {
-    position: sticky;
-    top: 0;
-  }
 }
 .bk-main {
   min-width: 0;
@@ -182,6 +178,9 @@
 }
 .bk-cover-detail .bk-cv-a {
   font-size: 8px;
+}
+.bk-cover-badged .bk-cv-t {
+  margin-top: 20px;
 }
 .bk-badge {
   position: absolute;
@@ -545,9 +544,6 @@
 }
 .bk-d-del {
   margin-left: auto;
-}
-.bk-d-del > .lp-btn-ghost {
-  color: var(--red);
 }
 
 /* ---------- e-readers ---------- */

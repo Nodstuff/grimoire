@@ -106,7 +106,7 @@ export default function SettingsShareLinks({ dataVersion }: { dataVersion: numbe
                       >
                         Copy
                       </Button>
-                      <ConfirmButton variant="ghost" confirmLabel="Revoke" onConfirm={() => revoke(s)}>
+                      <ConfirmButton confirmLabel="Revoke" onConfirm={() => revoke(s)}>
                         Revoke…
                       </ConfirmButton>
                     </td>

@@ -69,7 +69,7 @@ export default function UploadTokens({ dataVersion }: { dataVersion: number }) {
             <RowText sub={`added ${relTime(t.created_at)}${t.last_used_at ? ` · last used ${relTime(t.last_used_at)}` : ' · never used'}`}>
               <b className="st-strong">{t.label}</b>
             </RowText>
-            <ConfirmButton variant="ghost" confirmLabel="Remove" onConfirm={() => remove(t)}>
+            <ConfirmButton confirmLabel="Remove" onConfirm={() => remove(t)}>
               Remove…
             </ConfirmButton>
           </Row>

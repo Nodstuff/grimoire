@@ -106,7 +106,7 @@
   align-items: flex-end;
 }
 .st-row-text {
-  flex: 1;
+  flex: 1 1 200px;
   min-width: 0;
 }
 .st-row-sub {
@@ -346,12 +346,13 @@
   font-size: var(--text-md);
 }
 .st-members-help {
+  display: block;
   font-size: var(--text-sm);
   color: var(--ink3);
-  display: inline-flex;
-  gap: 6px;
-  align-items: baseline;
-  flex-wrap: wrap;
+}
+.st-members-help .lp-icon {
+  vertical-align: -2px;
+  margin-right: 4px;
 }
 
 /* ---------- share links ---------- */

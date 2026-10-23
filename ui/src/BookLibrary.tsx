@@ -407,7 +407,7 @@ export function Cover({ book, size, badge }: { book: Pick<Book, 'id' | 'title' |
   const img = book.has_cover && !broken
   const style = { '--cv-bg': art.bg, '--cv-fg': art.fg } as CSSProperties
   return (
-    <span className={`bk-cover bk-cover-${size}${img ? ' bk-cover-img' : ''}`} style={style} aria-hidden>
+    <span className={`bk-cover bk-cover-${size}${img ? ' bk-cover-img' : ''}${badge ? ' bk-cover-badged' : ''}`} style={style} aria-hidden>
       {img ? (
         <img loading="lazy" src={coverUrl(book.id)} alt="" onError={() => setBroken(true)} />
       ) : (
@@ -557,7 +557,7 @@ function BookDetail({
           </Button>
         )}
         <span className="bk-d-del">
-          <ConfirmButton variant="ghost" confirmLabel="Delete for good" onConfirm={doDelete}>
+          <ConfirmButton confirmLabel="Delete for good" onConfirm={doDelete}>
             Delete…
           </ConfirmButton>
         </span>
