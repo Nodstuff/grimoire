@@ -5,7 +5,8 @@
 //
 //   /                       Home
 //   /doc/<uuid>[?block=<uuid>]   a doc (scrolled to a block)
-//   /library[/<workspace>]  the Library (all, `unsorted`, or a workspace id)
+//   /library[/<workspace>][?folder=<uuid>]  the Library (all, `unsorted`, or a
+//                           workspace id; a folder's page)
 //   /review                 the review queue
 //   /search[?q=…]           Search & Ask
 //   /books                  the EPUB library (SERVER mode)
@@ -24,7 +25,7 @@ import { parseDeepLink, tabTarget, type SettingsSection } from './deeplink'
 export type Route =
   | { kind: 'home' }
   | { kind: 'doc'; id: string; block?: string }
-  | { kind: 'library'; workspace: string | null }
+  | { kind: 'library'; workspace: string | null; folder?: string }
   | { kind: 'review' }
   | { kind: 'search'; q: string }
   | { kind: 'books' }
@@ -60,10 +61,14 @@ export function parseRoute(pathname: string, search = ''): Route {
         return block && UUID.test(block) ? { kind: 'doc', id: parts[1], block } : { kind: 'doc', id: parts[1] }
       }
       break
-    case 'library':
-      if (parts.length === 1) return { kind: 'library', workspace: null }
-      if (parts.length === 2) return { kind: 'library', workspace: parts[1] }
+    case 'library': {
+      // ?folder=<uuid>: that folder's page (canvas Library)
+      const folder = params.get('folder')
+      const f = folder && UUID.test(folder) ? { folder } : {}
+      if (parts.length === 1) return { kind: 'library', workspace: null, ...f }
+      if (parts.length === 2) return { kind: 'library', workspace: parts[1], ...f }
       break
+    }
     case 'review':
       if (parts.length === 1) return { kind: 'review' }
       break
@@ -98,7 +103,10 @@ export function routePath(r: Route): string {
     case 'doc':
       return `/doc/${r.id}${r.block ? `?block=${r.block}` : ''}`
     case 'library':
-      return r.workspace && r.workspace !== 'all' ? `/library/${encodeURIComponent(r.workspace)}` : '/library'
+      return (
+        (r.workspace && r.workspace !== 'all' ? `/library/${encodeURIComponent(r.workspace)}` : '/library') +
+        (r.folder ? `?folder=${r.folder}` : '')
+      )
     case 'review':
       return '/review'
     case 'search':

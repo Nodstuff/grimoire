@@ -5,6 +5,8 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { Chip, Icon } from '../lapis'
+import { errText, notify } from '../Notice'
+import { api } from '../types'
 import { canManageMembers, workspaceColor, workspaceSummary, type Workspace, type WorkspaceSel } from '../workspaces'
 
 export default function WorkspaceMenu({
@@ -13,14 +15,48 @@ export default function WorkspaceMenu({
   docCount,
   onChange,
   onMembers,
+  onCreated,
 }: {
   value: WorkspaceSel
   list: Workspace[]
   docCount: number
   onChange: (sel: WorkspaceSel) => void
   onMembers: (w: Workspace) => void
+  /** a workspace was made here (POST /api/workspaces): reload the list */
+  onCreated?: (id: string) => void
 }) {
   const [open, setOpen] = useState(false)
+  // "New workspace…": the row turns into a name field in place
+  const [naming, setNaming] = useState(false)
+  const [newName, setNewName] = useState('')
+  const [making, setMaking] = useState(false)
+  useEffect(() => {
+    if (!open) {
+      setNaming(false)
+      setNewName('')
+    }
+  }, [open])
+  const makeWorkspace = async () => {
+    const name = newName.trim()
+    if (!name || making) return
+    setMaking(true)
+    try {
+      const w = await api<{ id: string }>('/api/workspaces', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      // the list reloads; the new workspace is then one click away here
+      onCreated?.(w.id)
+      setNaming(false)
+      setNewName('')
+      notify(`made the workspace “${name}”`, 'ok')
+    } catch (e) {
+      notify(errText(e))
+    } finally {
+      setMaking(false)
+    }
+  }
   const box = useRef<HTMLDivElement>(null)
   const btn = useRef<HTMLButtonElement>(null)
 
@@ -115,9 +151,40 @@ export default function WorkspaceMenu({
               ) : undefined,
             ),
           )}
+          <div className="lp-wsmenu-sep" role="separator" />
+          {onCreated &&
+            (naming ? (
+              <form
+                className="lp-wsmenu-new"
+                onSubmit={(e) => {
+                  e.preventDefault()
+                  makeWorkspace()
+                }}
+              >
+                <Icon name="plus" size={15} />
+                <input
+                  autoFocus
+                  aria-label="New workspace name"
+                  placeholder="Name the workspace"
+                  value={newName}
+                  disabled={making}
+                  onChange={(e) => setNewName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') {
+                      e.stopPropagation()
+                      setNaming(false)
+                    }
+                  }}
+                />
+              </form>
+            ) : (
+              <button type="button" role="menuitem" onClick={() => setNaming(true)}>
+                <Icon name="plus" size={15} />
+                <span className="lp-wsmenu-name">New workspace…</span>
+              </button>
+            ))}
           {current && canManageMembers(current) && (
             <>
-              <div className="lp-wsmenu-sep" role="separator" />
               <button
                 type="button"
                 role="menuitem"
@@ -127,7 +194,7 @@ export default function WorkspaceMenu({
                 }}
               >
                 <Icon name="members" size={15} />
-                <span className="lp-wsmenu-name">Members of {current.display_name || current.name}…</span>
+                <span className="lp-wsmenu-name">Manage members of {current.display_name || current.name}…</span>
               </button>
             </>
           )}

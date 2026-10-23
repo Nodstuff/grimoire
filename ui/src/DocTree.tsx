@@ -72,6 +72,8 @@ export default function DocTree({
   wsColor,
   onNewDoc,
   focusFilter = 0,
+  pending,
+  selectedFolder = null,
 }: {
   docs: Doc[]
   selected: string | null
@@ -85,6 +87,10 @@ export default function DocTree({
   onNewDoc?: () => void
   /** bump to put the caret in the filter (⌘T opening the sidebar) */
   focusFilter?: number
+  /** doc id → changes waiting (a yellow dot) or parked (a red square) */
+  pending?: Map<string, { review: number; parked: number }>
+  /** the folder whose Library page is open (highlighted like the open doc) */
+  selectedFolder?: string | null
 }) {
   const docs = useMemo(() => docsInWorkspace(allDocs, workspace), [allDocs, workspace])
   const childrenOf = useMemo(() => childrenIndex(docs), [docs])
@@ -226,7 +232,7 @@ export default function DocTree({
     const isDir = kids.length > 0 || isEmptyFolder(d)
     const open = isDir && isOpen(d.id)
     const dropHere = drop?.id === d.id ? drop.mode : null
-    const isSel = selected === d.id
+    const isSel = selected === d.id || selectedFolder === d.id
     // root Folders/Pinned are alphabetical: before/after would not show, so
     // a drop there is always "into"
     const intoOnly = rootSection === 'folders' || rootSection === 'pinned'
@@ -304,6 +310,15 @@ export default function DocTree({
           <span className="tree-title">{d.title}</span>
           <span className="tree-badges">
             {d.is_tended && <span className="tend-dot" title="tended by agents" />}
+            {(() => {
+              const p = pending?.get(d.id)
+              if (!p) return null
+              if (p.parked > 0)
+                return <span className="tree-review-dot parked" role="img" aria-label={`${p.parked} parked change${p.parked === 1 ? '' : 's'}`} title={`${p.parked} parked change${p.parked === 1 ? '' : 's'}`} />
+              if (p.review > 0)
+                return <span className="tree-review-dot" role="img" aria-label={`${p.review} change${p.review === 1 ? '' : 's'} to review`} title={`${p.review} change${p.review === 1 ? '' : 's'} to review`} />
+              return null
+            })()}
             {isDir && !open && <span className="tree-count">{counts.get(d.id) ?? 0}</span>}
             <button
               type="button"

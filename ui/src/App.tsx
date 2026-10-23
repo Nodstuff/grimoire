@@ -24,7 +24,8 @@ import ShortcutHelp from './ShortcutHelp'
 import NewDocPalette from './NewDocPalette'
 import DocView, { type Panel } from './screens/DocView'
 import ReviewQueue from './screens/ReviewQueue'
-import Library from './screens/Library'
+import Library, { pendingByDoc } from './screens/Library'
+import { isEmptyFolder } from './tree'
 import SearchScreen from './screens/Search'
 import { buildCommands } from './commands'
 import { signOut, webSession } from './auth'
@@ -152,9 +153,19 @@ export default function App() {
     })
   }, [])
 
+  // the queue rows themselves feed the Library's "changes waiting" lines
+  // and the tree's review dots
+  const [queueRows, setQueueRows] = useState<QueueRow[]>([])
+  const pendingDocs = useMemo(() => pendingByDoc(queueRows), [queueRows])
   const refreshQueue = useCallback(() => {
     Promise.all([
-      api<QueueRow[]>('/api/queue').then((q) => q.length).catch(() => 0),
+      api<QueueRow[]>('/api/queue')
+        .then((q) => {
+          const rows = Array.isArray(q) ? q : []
+          setQueueRows(rows)
+          return rows.length
+        })
+        .catch(() => 0),
       api<{ block: { id: string } }[]>('/api/flags').then((f) => f.length).catch(() => 0),
     ]).then(([q, f]) => setQueueCount(q + f))
   }, [])
@@ -488,6 +499,32 @@ export default function App() {
         </>
       )
     }
+    if (route.kind === 'library' && route.folder) {
+      // a folder's page: Library / its ancestors / the folder
+      const chain: Doc[] = []
+      let cur = byId.get(route.folder)
+      let guard = 0
+      while (cur && guard++ < 32) {
+        chain.unshift(cur)
+        cur = cur.parent_id ? byId.get(cur.parent_id) : undefined
+      }
+      const wsr = route.workspace
+      return (
+        <>
+          <span className="lp-crumb-step">
+            <Link to={{ kind: 'library', workspace: wsr }}>Library</Link>
+            <span aria-hidden="true">/</span>
+          </span>
+          {chain.slice(0, -1).map((c) => (
+            <span key={c.id} className="lp-crumb-step">
+              <Link to={{ kind: 'library', workspace: wsr, folder: c.id }}>{c.title}</Link>
+              <span aria-hidden="true">/</span>
+            </span>
+          ))}
+          <span className="lp-crumb-here">{chain[chain.length - 1]?.title ?? 'Folder'}</span>
+        </>
+      )
+    }
     if (route.kind === 'library') {
       const { name } = workspaceSummary(route.workspace ?? 'all', workspaces, 0)
       return (
@@ -555,7 +592,18 @@ export default function App() {
       )
       break
     case 'library':
-      screen = <Library docs={docs} workspace={route.workspace ?? 'all'} workspaces={workspaces} onNewDoc={() => setPalette('newdoc')} />
+      screen = (
+        <Library
+          docs={docs}
+          workspace={route.workspace ?? 'all'}
+          folder={route.folder ?? null}
+          workspaces={workspaces}
+          queue={queueRows}
+          dataVersion={dataVersion}
+          userName={profile?.name ?? null}
+          onChanged={reloadDocs}
+        />
+      )
       break
     case 'review':
       screen = <ReviewQueue onChange={setQueueCount} onOpenDoc={openDoc} dataVersion={dataVersion} />
@@ -614,12 +662,20 @@ export default function App() {
       drawer={isPhone}
       primary={primaryNav({ server, counts, inboxDoc: side.inboxDoc, todoDoc: side.todoDoc })}
       secondary={secondaryNav(counts)}
-      workspaceMenu={<WorkspaceMenu value={ws} list={workspaces} docCount={docs.length} onChange={pickWorkspace} onMembers={setMembersOf} />}
+      workspaceMenu={<WorkspaceMenu value={ws} list={workspaces} docCount={docs.length} onChange={pickWorkspace} onMembers={setMembersOf} onCreated={loadWorkspaces} />}
       tree={
         <DocTreePanel
           docs={docs}
           selected={docId}
-          onSelect={(id) => openDoc(id)}
+          onSelect={(id) => {
+            // a folder never written in opens as its folder page (canvas
+            // Library); anything with its own text opens in the editor
+            const d = byId.get(id)
+            if (d && isEmptyFolder(d)) navigate({ kind: 'library', workspace: ws === 'all' ? null : ws, folder: id })
+            else openDoc(id)
+          }}
+          pending={pendingDocs}
+          selectedFolder={route.kind === 'library' ? (route.folder ?? null) : null}
           onChanged={reloadDocs}
           workspace={ws}
           wsColor={wsColor}

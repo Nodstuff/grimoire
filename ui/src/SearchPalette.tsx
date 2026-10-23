@@ -20,15 +20,12 @@ export default function SearchPalette({
   initial = '',
   onOpenDoc,
   onClose,
-  inline = false,
   onQuery,
 }: {
   /** prefilled query: `?` from ⌘/, or the text ⌘O handed over */
   initial?: string
   onOpenDoc: OpenDoc
   onClose: () => void
-  /** render in the page (the /search route) instead of as a palette */
-  inline?: boolean
   /** the query as typed (the /search route keeps ?q= in step) */
   onQuery?: (q: string) => void
 }) {
@@ -130,7 +127,7 @@ export default function SearchPalette({
         : null
 
   return (
-    <Frame inline={inline} onClose={onClose} locked={asking}>
+    <PaletteShell onClose={onClose} locked={asking}>
       <PaletteInput
         icon={live.ask ? 'ask' : 'search'}
         ref={inputRef}
@@ -196,17 +193,6 @@ export default function SearchPalette({
           ['esc', 'close'],
         ]}
       />
-    </Frame>
+    </PaletteShell>
   )
-}
-
-/** A palette, or (inline) the same body as a card in the page. */
-function Frame({ inline, onClose, locked, children }: { inline: boolean; onClose: () => void; locked: boolean; children: React.ReactNode }) {
-  if (!inline)
-    return (
-      <PaletteShell onClose={onClose} locked={locked}>
-        {children}
-      </PaletteShell>
-    )
-  return <div className="palette lp-palette-inline">{children}</div>
 }

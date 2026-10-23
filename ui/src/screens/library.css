@@ -1,0 +1,393 @@
+/* The Library (canvas Library.dc.html): a folder page, the filter row, the
+   table card (Title / Status / Tags / Last change / Updated) or cards. */
+
+.lp-lib {
+  max-width: 1160px;
+  gap: 22px;
+}
+.lp-lib-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+.lp-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--text-sm);
+  padding: 0 8px;
+  line-height: 22px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line2);
+  color: var(--ink2);
+  white-space: nowrap;
+}
+.lp-lib .lp-page-kicker .muted {
+  font-size: var(--text-md);
+}
+
+/* ---- more menu ---- */
+.lp-lib-more {
+  position: relative;
+}
+.lp-lib-more .lp-ib {
+  width: 30px;
+  height: 30px;
+}
+.lp-lib-moremenu {
+  left: auto;
+  right: 0;
+  min-width: 260px;
+}
+.lp-lib-moremenu .danger {
+  color: var(--red);
+}
+
+/* ---- new doc / folder ---- */
+.lp-lib-new {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 8px 14px;
+}
+.lp-lib-new > .lp-icon {
+  color: var(--accent);
+  flex: none;
+}
+.lp-lib-new input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: var(--text-lg);
+  color: var(--ink);
+  outline: none;
+  height: 32px;
+}
+
+/* ---- tools ---- */
+.lp-lib-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.lp-lib-filter {
+  height: 34px;
+  border-radius: var(--r-btn);
+  border: 1px solid var(--line);
+  background: var(--card);
+  padding: 0 12px;
+  font: inherit;
+  color: var(--ink);
+  width: 240px;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.lp-lib-filter::placeholder {
+  color: var(--ink3);
+}
+.lp-lib-filter:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.lp-lib-tools .lp-fchip {
+  height: 28px;
+  font-size: var(--text-sm);
+  padding: 0 9px;
+}
+.lp-lib-view {
+  margin-left: auto;
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: var(--r-btn);
+  overflow: hidden;
+  background: var(--card);
+}
+.lp-lib-view button {
+  height: 30px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: var(--text-md);
+  font-weight: 500;
+  border: 0;
+  background: transparent;
+  color: var(--ink2);
+  cursor: pointer;
+}
+.lp-lib-view button.on {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+.lp-lib-view button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+/* ---- the table ---- */
+.lp-lib-table {
+  overflow: hidden;
+}
+.lp-lib-row {
+  display: grid;
+  grid-template-columns: minmax(0, 2.4fr) minmax(0, 1fr) minmax(0, 1.3fr) minmax(0, 1.3fr) 90px;
+  gap: 14px;
+  align-items: center;
+  padding: 11px 18px;
+  border-top: 1px solid var(--line);
+  text-decoration: none;
+  color: var(--ink);
+}
+a.lp-lib-row,
+a.lp-lib-row:hover {
+  color: var(--ink);
+}
+a.lp-lib-row:hover {
+  background: var(--card2);
+}
+a.lp-lib-row:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+  background: var(--card2);
+}
+.lp-lib-rowh {
+  font-size: var(--text-sm);
+  color: var(--ink3);
+  font-weight: 500;
+  border-top: 0;
+  padding-top: 12px;
+  padding-bottom: 8px;
+}
+.lp-lib-title {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+.lp-lib-title > .lp-icon {
+  color: var(--ink3);
+  flex: none;
+}
+.lp-lib-titletext {
+  min-width: 0;
+}
+.lp-lib-titletext b {
+  font-weight: 600;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lp-lib-sub {
+  display: block;
+  font-size: var(--text-sm2);
+  color: var(--ink3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lp-lib-sub.yellow {
+  color: var(--yellow);
+}
+.lp-lib-sub.red {
+  color: var(--red);
+}
+.lp-st {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  padding: 0 8px;
+  line-height: 22px;
+  border-radius: var(--r-sm);
+  display: inline-block;
+  white-space: nowrap;
+}
+.lp-st-decided {
+  background: var(--green-soft);
+  color: var(--green);
+}
+.lp-st-in-review {
+  background: var(--yellow-soft);
+  color: var(--yellow);
+}
+.lp-st-draft,
+.lp-st-superseded {
+  background: var(--card2);
+  color: var(--ink2);
+  border: 1px solid var(--line);
+}
+.lp-st-superseded {
+  text-decoration: line-through;
+}
+.lp-lib-tags {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.lp-tag {
+  font-size: var(--text-sm);
+  color: var(--ink2);
+  background: var(--card2);
+  border: 1px solid var(--line);
+  padding: 0 7px;
+  line-height: 20px;
+  border-radius: var(--r-sm);
+  white-space: nowrap;
+}
+.lp-lib-c-who {
+  min-width: 0;
+  overflow: hidden;
+}
+.lp-lib-c-who .lp-who {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  max-width: 100%;
+}
+.lp-lib-c-who .lp-agent-name,
+.lp-lib-c-who .lp-person-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lp-lib-when {
+  text-align: right;
+  font-size: var(--text-md);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ---- cards ---- */
+.lp-lib-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 14px;
+}
+a.lp-lib-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  text-decoration: none;
+  color: var(--ink);
+  min-width: 0;
+}
+a.lp-lib-card:hover {
+  border-color: var(--line2);
+  color: var(--ink);
+}
+a.lp-lib-card:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.lp-lib-card-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink3);
+}
+.lp-lib-card-top .lp-lib-when {
+  margin-left: auto;
+}
+.lp-lib-card-title {
+  font-family: var(--font-serif);
+  font-size: 19px;
+  font-weight: 500;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+.lp-lib-card .lp-lib-sub {
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.lp-lib-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  justify-content: space-between;
+  margin-top: auto;
+  padding-top: 6px;
+}
+.lp-lib-card-foot .lp-lib-tags {
+  justify-content: flex-end;
+}
+
+.lp-lib-hints {
+  font-size: var(--text-sm2);
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.lp-lib-hints .lp-kbd + .lp-kbd {
+  margin-left: 2px;
+}
+
+/* ---- phone: title and updated; the rest rides under the title ---- */
+@media (max-width: 720px) {
+  .lp-lib-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding: 11px 14px;
+  }
+  .lp-lib-rowh,
+  .lp-lib-c-tags,
+  .lp-lib-c-who {
+    display: none;
+  }
+  .lp-lib-c-status {
+    display: none;
+  }
+  .lp-lib-filter {
+    width: 100%;
+  }
+  .lp-lib-view {
+    margin-left: 0;
+  }
+  .lp-lib-hints {
+    display: none;
+  }
+  .lp-lib-cards {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---- the sidebar tree's review dots (canvas Library): a yellow circle for
+   changes waiting, a red square for a parked one ---- */
+.tree-review-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--yellow-mark);
+  flex: none;
+}
+.tree-review-dot.parked {
+  border-radius: 2px;
+  background: var(--red);
+}
+
+/* ---- the workspace switcher's "New workspace…" field (canvas Library) ---- */
+.lp-wsmenu-new {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 10px;
+  border-radius: var(--r-md);
+  background: var(--card2);
+  color: var(--ink3);
+}
+.lp-wsmenu-new input {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: var(--ink);
+  outline: none;
+}
