@@ -1,0 +1,373 @@
+/* Review queue (canvas Review artboard). Every value is lifted from
+   project/Review.dc.html; colours come from the Lapis tokens. */
+
+.rv-page {
+  width: 100%;
+  max-width: 1196px; /* the artboard's 1260 main less its 32px sides */
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.rv-page > * {
+  flex-shrink: 0;
+}
+
+/* ---- head: serif title, verdict summary, the group-by switch ---- */
+.rv-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-end;
+}
+.rv-head-text {
+  flex: 1 1 380px;
+  min-width: 0;
+}
+.rv-title {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 40px;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+  line-height: 1.1;
+}
+.rv-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+  color: var(--ink2);
+}
+.rv-muted {
+  color: var(--ink3);
+}
+.rv-sm {
+  font-size: var(--text-md);
+}
+
+.rv-seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: var(--r-field);
+  background: var(--card);
+  padding: 3px;
+  gap: 2px;
+}
+.rv-seg button {
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: var(--text-md);
+  font-weight: 500;
+  color: var(--ink3);
+  padding: 5px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.rv-seg button:hover {
+  color: var(--ink);
+}
+.rv-seg button.on {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+/* ---- two columns: groups, then the By agent + Keys aside ---- */
+.rv-cols {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+  align-items: flex-start;
+}
+.rv-main {
+  flex: 999 1 560px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.rv-aside {
+  flex: 1 0 280px;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ---- a group card ---- */
+.lp-card.rv-grp {
+  padding: 0;
+  overflow: hidden;
+}
+.rv-gh {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.rv-gh h2 {
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.rv-gh h2.rv-gh-agent {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--agent);
+}
+.rv-loc {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.rv-gh-acts {
+  margin-left: auto;
+}
+
+/* ---- an item ---- */
+.rv-item {
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  cursor: default;
+}
+.rv-item:last-child {
+  border-bottom: 0;
+}
+.rv-item.sel {
+  background: var(--card2);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.rv-ih {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+}
+.rv-ih b {
+  font-weight: 600;
+}
+.rv-meta {
+  margin-left: auto;
+  font-size: var(--text-sm2);
+  color: var(--ink3);
+}
+
+.rv-diff {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
+  gap: 10px;
+}
+.rv-dside {
+  border: 1px solid var(--line);
+  border-radius: var(--r-field);
+  padding: 10px 12px;
+  background: var(--card);
+  min-width: 0;
+}
+.rv-lab {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--ink3);
+  margin-bottom: 4px;
+}
+.rv-dside p {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: var(--text-xl);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 18em;
+  overflow: auto;
+}
+.rv-dside del {
+  color: var(--red);
+  background: var(--red-soft);
+  text-decoration: line-through;
+  border-radius: 3px;
+}
+.rv-dside ins {
+  background: var(--green-soft);
+  text-decoration: underline;
+  text-decoration-color: var(--green);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+  border-radius: 3px;
+}
+
+/* rename / move: old struck, arrow, new (serif 18) */
+.rv-rename {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-family: var(--font-serif);
+  font-size: 18px;
+}
+.rv-rename s {
+  color: var(--ink3);
+}
+.rv-arrow {
+  fill: none;
+  stroke: var(--ink3);
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: none;
+}
+.rv-rename-note {
+  font-family: var(--font-ui);
+  font-size: var(--text-sm2);
+  color: var(--ink3);
+}
+
+/* a parked trash: dashed box */
+.rv-trash {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  border: 1px dashed var(--line2);
+  border-radius: var(--r-field);
+  padding: 12px 14px;
+  font-size: 13.5px;
+}
+.rv-trash > span {
+  flex: 1;
+  min-width: 200px;
+}
+.rv-trash b {
+  font-weight: 600;
+}
+
+.rv-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.rv-acts .lp-kbd {
+  margin-left: 2px;
+}
+.rv-btn-trash.lp-btn {
+  color: var(--red);
+  border-color: var(--red-soft);
+}
+.rv-note {
+  margin-left: auto;
+  font-size: var(--text-sm2);
+  color: var(--ink3);
+}
+
+/* audit flags */
+.rv-doclink {
+  text-decoration: none;
+  font-weight: 600;
+}
+.rv-flag-target {
+  font-size: var(--text-md);
+  color: var(--ink3);
+  border-left: 2px solid var(--line2);
+  padding-left: 10px;
+}
+.rv-flag-text {
+  font-size: var(--text-base);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ---- aside: By agent ---- */
+.lp-card.rv-agents {
+  padding: 6px 0;
+}
+.rv-agents h2,
+.rv-keys h2 {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: 600;
+}
+.rv-agents h2 {
+  padding: 12px 16px 8px;
+}
+.rv-agent-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+}
+.rv-agent-acts {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+}
+.rv-agent-acts .lp-btn-sm {
+  height: 26px;
+}
+.rv-agents-note {
+  margin: 0;
+  padding: 10px 16px;
+  font-size: var(--text-sm2);
+  color: var(--ink3);
+  border-top: 1px solid var(--line);
+}
+
+/* ---- aside: Keys ---- */
+.lp-card.rv-keys {
+  padding: 12px 16px 14px;
+}
+.rv-keys h2 {
+  margin-bottom: 8px;
+}
+.rv-keys-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  font-size: var(--text-md);
+  color: var(--ink2);
+}
+
+/* phones: no keyboard, no key hints; the note under a selected item wraps */
+@media (max-width: 720px) {
+  .rv-title {
+    font-size: var(--title-md);
+  }
+  .rv-keys,
+  .rv-acts .lp-kbd {
+    display: none;
+  }
+  .rv-meta,
+  .rv-note {
+    margin-left: 0;
+    flex-basis: 100%;
+  }
+  .rv-gh-acts {
+    margin-left: 0;
+    flex-basis: 100%;
+  }
+  .rv-item.sel {
+    box-shadow: none;
+    background: transparent;
+  }
+}
+
+/* the inline comment box under an item */
+.rv-comment {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
