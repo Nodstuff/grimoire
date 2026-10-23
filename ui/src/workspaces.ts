@@ -78,3 +78,8 @@ export function workspaceSummary(sel: WorkspaceSel, list: Workspace[], docCount:
   const n = w.doc_count ?? w.doc_ids.length
   return { name: w.display_name || w.name, sub: `${role}${w.shared ? ' · shared' : ''} · ${n} doc${n === 1 ? '' : 's'}` }
 }
+
+/** The workspace a doc lives in: by its resolved id, else by membership. */
+export function docWorkspace(workspaces: Workspace[], docId: string, workspaceId?: string | null): Workspace | null {
+  return workspaceId ? (workspaces.find((w) => w.id === workspaceId) ?? null) : (workspaces.find((w) => w.doc_ids?.includes(docId)) ?? null)
+}

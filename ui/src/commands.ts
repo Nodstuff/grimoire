@@ -9,7 +9,7 @@ import { backupFileName, inTauri, saveDialog } from './tauri'
 import { api } from './types'
 import { KEYS } from './shortcuts'
 import type { OmniCommand } from './omni'
-import { downloadEpub, sendLabel, setSending, type EreaderStatus } from './ereader'
+import { canSend, downloadEpub, sendLabel, setSending, type EreaderStatus } from './ereader'
 import { THEME_LABEL, getThemePref, nextThemePref, setThemePref } from './lapis/theme'
 
 export type CommandAction =
@@ -36,12 +36,14 @@ export interface CommandCtx {
   docTitle?: string | null
   /** the open doc has docs under it: it sends as a folder of chapters */
   docHasChildren?: boolean
+  /** the person only views the doc's workspace: no Send / Stop */
+  docReadOnly?: boolean
   /** the open doc's e-reader status; null = unknown or no e-reader routes */
   ereader?: EreaderStatus | null
   onAction: (a: CommandAction) => void
 }
 
-export function buildCommands({ signedIn, library, onSignOut, docId, docTitle, docHasChildren = false, ereader, onAction }: CommandCtx): OmniCommand[] {
+export function buildCommands({ signedIn, library, onSignOut, docId, docTitle, docHasChildren = false, docReadOnly = false, ereader, onAction }: CommandCtx): OmniCommand[] {
   const cmds: OmniCommand[] = []
   if (docId && signedIn) {
     cmds.push({ id: 'share-link', icon: 'link', scope: 'doc', label: 'Share link…', hint: 'a public, read-only snapshot of this doc', run: () => onAction('share') })
@@ -76,7 +78,7 @@ export function buildCommands({ signedIn, library, onSignOut, docId, docTitle, d
         },
       },
     )
-    cmds.push(...ereaderCommands(docId, docTitle ?? 'Untitled', docHasChildren, ereader ?? null, onAction))
+    cmds.push(...ereaderCommands(docId, docTitle ?? 'Untitled', docHasChildren, ereader ?? null, onAction, docReadOnly))
   }
   cmds.push(
     { id: 'newdoc', icon: 'plus', group: 'Create', label: 'New doc…', keys: KEYS.newdoc, keywords: 'create page note', run: () => onAction('newdoc') },
@@ -204,13 +206,15 @@ export function buildCommands({ signedIn, library, onSignOut, docId, docTitle, d
 }
 
 /** This doc as a book: Download EPUB always; Send / Stop sending once the
- * daemon has answered the doc's e-reader status. */
+ * daemon has answered the doc's e-reader status, to a person who can write
+ * the doc, unless another member's tag already sends it. */
 export function ereaderCommands(
   docId: string,
   title: string,
   hasChildren: boolean,
   status: EreaderStatus | null,
   onAction: (a: CommandAction) => void,
+  readOnly = false,
 ): OmniCommand[] {
   const cmds: OmniCommand[] = [
     {
@@ -227,7 +231,7 @@ export function ereaderCommands(
       },
     },
   ]
-  if (status) {
+  if (canSend(status, readOnly)) {
     const send = !status.sent
     cmds.push({
       id: 'ereader-send', icon: 'books',
@@ -238,7 +242,10 @@ export function ereaderCommands(
       run: () => {
         onAction('close')
         setSending(docId, send)
-          .then(() => notify(send ? `sent “${title}” to your e-readers` : `stopped sending “${title}”`, 'ok'))
+          .then((s) => {
+            // another member's tag (409): the status already says so, quietly
+            if (s.sent === send) notify(send ? `sent “${title}” to your e-readers` : `stopped sending “${title}”`, 'ok')
+          })
           .catch((e) => notify(errText(e)))
       },
     })

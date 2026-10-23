@@ -20,7 +20,7 @@ import { actionLabels, buildHighlightMap, targetBlockOf, toneOf } from '../revie
 import { api, Block, Doc, DocTree, HistoryRow, QueueRow, SearchHit } from '../types'
 import type { OpenDoc } from '../App'
 import { navigate } from '../router'
-import type { Workspace } from '../workspaces'
+import { docWorkspace, type Workspace } from '../workspaces'
 import { keyBetween } from '../editor/diff'
 import type { ReviewDetail, ReviewExtras } from '../editor/ReviewHighlight'
 import { backlinkSnippet, contributors, frontmatterTags, STATUSES, statusTone, withTag } from '../editor/docMeta'
@@ -601,10 +601,7 @@ export default function DocView({
   }, [tree, docId])
 
   // the workspace the doc lives in, and whether this person may write it
-  const ws = useMemo(() => {
-    const id = listed?.workspace_id ?? null
-    return id ? (workspaces.find((w) => w.id === id) ?? null) : (workspaces.find((w) => w.doc_ids?.includes(docId)) ?? null)
-  }, [workspaces, listed, docId])
+  const ws = useMemo(() => docWorkspace(workspaces, docId, listed?.workspace_id), [workspaces, listed, docId])
   const readOnly = ws?.role === 'viewer'
 
   const who = useCallback(
@@ -851,7 +848,7 @@ export default function DocView({
             ))}
             {!readOnly && <AddTag onAdd={addTag} />}
             <LivingChip docId={docId} dataVersion={dataVersion} />
-            <EreaderChip docId={docId} title={doc.title} status={ereader} onOpenDoc={(id) => onOpenDoc(id)} />
+            <EreaderChip docId={docId} title={doc.title} status={ereader} readOnly={readOnly} onOpenDoc={(id) => onOpenDoc(id)} />
             {doc.review_policy && (
               <span className="dv-pill dv-pill-quiet dv-pill-policy" title="who reviews changes to this doc">
                 <Icon name="review" size={13} />

@@ -11,7 +11,9 @@ import {
   PNG_WIDTH,
   SentBook,
   base64Bytes,
+  byOther,
   bytesToBase64,
+  canSend,
   canRasterize,
   chaptersLabel,
   downloadEpub,
@@ -27,6 +29,7 @@ import {
   resetDiagramSync,
   sendLabel,
   setSending,
+  svgTaints,
   syncDiagramImages,
   targetSize,
 } from './ereader'
@@ -158,6 +161,19 @@ describe('status calls', () => {
     await new Promise((r) => setTimeout(r, 0))
     expect(calls.map((c) => c.url)).toEqual(['/api/docs/d3/ereader'])
   })
+  it('409 (another member’s tag): setSending answers the fresh status, no error', async () => {
+    mockFetch({
+      '/api/docs/d4/ereader': (init) =>
+        init?.method === 'POST' ? json(409, { error: 'another member sends this doc', code: 'conflict' }) : json(200, status({ tagged: true, sent: false })),
+    })
+    const s = await setSending('d4', true)
+    expect(s).toMatchObject({ tagged: true, sent: false })
+    expect(ereaderStatusOf('d4')).toMatchObject({ tagged: true, sent: false })
+  })
+  it('any other refusal still throws', async () => {
+    mockFetch({ '/api/docs/d5/ereader': (init) => (init?.method === 'POST' ? json(403, { error: 'read only' }) : json(200, status())) })
+    await expect(setSending('d5', true)).rejects.toThrow('read only')
+  })
   it('listSentBooks reads docs', async () => {
     mockFetch({ '/api/ereader/sent': () => json(200, { docs: [sent({})] }) })
     expect((await listSentBooks()).map((b) => b.id)).toEqual(['s1'])
@@ -203,6 +219,27 @@ describe('syncDiagramImages', () => {
     warn.mockRestore()
     expect(r).toMatchObject({ rendered: 1, failed: 1 })
     expect(body(calls[0]).images.map((i: DiagramPng) => i.block_id)).toEqual(['b2'])
+  })
+  it('a render that throws or taints the canvas is skipped and the others are posted', async () => {
+    mockFetch({ '/api/docs/d1/epub-images': (init) => json(200, { stored: JSON.parse(String(init?.body)).images.length, ignored: 0 }) })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const r = await syncDiagramImages('d1', {
+      status: status({ diagrams: [diagram(1), diagram(2), diagram(3), diagram(4, { lang: 'vega-lite' }), diagram(5)] }),
+      render: (d) => {
+        if (d.block_id === 'b1') throw new DOMException('The canvas has been tainted by cross-origin data.', 'SecurityError')
+        if (d.block_id === 'b3') return Promise.reject(new DOMException('decode failed', 'EncodingError'))
+        if (d.lang === 'vega-lite') return Promise.resolve(null)
+        return fakePng(d)
+      },
+    })
+    warn.mockRestore()
+    expect(r).toEqual({ rendered: 2, failed: 2, stored: 2, ignored: 0 })
+    expect(body(calls[0]).images.map((i: DiagramPng) => i.block_id)).toEqual(['b2', 'b5'])
+  })
+  it('nothing escapes: a status without diagrams, a failing GET', async () => {
+    mockFetch({ '/api/docs/d9/ereader': () => json(500, { error: 'down' }) })
+    await expect(syncDiagramImages('d8', { status: { ...status(), diagrams: undefined as unknown as EreaderDiagram[] }, render: fakePng })).resolves.toMatchObject({ stored: 0 })
+    await expect(syncDiagramImages('d9', { render: fakePng })).resolves.toMatchObject({ stored: 0 })
   })
   it('tries a hash set once per page load; a changed source runs again', async () => {
     mockFetch({ '/api/docs/d1/epub-images': () => json(200, { stored: 1, ignored: 0 }) })
@@ -268,6 +305,20 @@ describe('pure helpers', () => {
     expect(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))).toEqual(bytes)
     expect(base64Bytes(btoa('ab'))).toBe(2)
   })
+  it('svgTaints: HTML labels and external content', () => {
+    expect(svgTaints('<svg><foreignObject><div>x</div></foreignObject></svg>')).toBe(true)
+    expect(svgTaints('<svg><image href="https://x/y.png"/></svg>')).toBe(true)
+    expect(svgTaints('<svg><style>@import url(x.css)</style></svg>')).toBe(true)
+    expect(svgTaints('<svg><image href="data:image/png;base64,AA"/><use href="#a"/><text>ok</text></svg>')).toBe(false)
+  })
+  it('canSend: known status, writable, not another member’s tag', () => {
+    expect(canSend(null, false)).toBe(false)
+    expect(canSend(status(), false)).toBe(true)
+    expect(canSend(status({ sent: true, tagged: true }), false)).toBe(true)
+    expect(canSend(status(), true)).toBe(false)
+    expect(canSend(status({ tagged: true }), false)).toBe(false)
+    expect(byOther(status({ tagged: true }))).toBe(true)
+  })
   it('labels', () => {
     expect(sendLabel({ sent: false }, false)).toBe('Send to e-readers')
     expect(sendLabel({ sent: false }, true)).toBe('Send folder to e-readers')
@@ -276,6 +327,7 @@ describe('pure helpers', () => {
     expect(ereaderChipText(status())).toBeNull()
     expect(ereaderChipText(status({ sent: true }))).toBe('On e-readers')
     expect(ereaderChipText(status({ in_sent_book: { id: 'f', title: 'Handbook' } }))).toBe('On e-readers · in Handbook')
+    expect(ereaderChipText(status({ tagged: true }))).toBe('Sent by another member')
     expect(chaptersLabel(1)).toBe('1 chapter')
     expect(chaptersLabel(12)).toBe('12 chapters')
   })
@@ -290,6 +342,12 @@ describe('ereaderCommands', () => {
     expect(labels(status())).toEqual(['Download EPUB', 'Send to e-readers'])
     expect(labels(status(), true)).toEqual(['Download EPUB', 'Send folder to e-readers'])
     expect(labels(status({ sent: true }))).toEqual(['Download EPUB', 'Stop sending to e-readers'])
+  })
+  it('a viewer, or another member’s tag: Download only', () => {
+    const ro = (s: EreaderStatus) => ereaderCommands('d1', 'Doc', false, s, () => {}, true).map((c) => c.label)
+    expect(ro(status())).toEqual(['Download EPUB'])
+    expect(ro(status({ sent: true, tagged: true }))).toEqual(['Download EPUB'])
+    expect(labels(status({ tagged: true }))).toEqual(['Download EPUB'])
   })
   it('the rows list under This doc', () => {
     expect(ereaderCommands('d1', 'Doc', false, status(), () => {}).every((c) => c.scope === 'doc')).toBe(true)
@@ -325,10 +383,16 @@ describe('From Taisce shelf', () => {
 })
 
 describe('EreaderChip', () => {
-  const render = (s: EreaderStatus | null) => renderToString(createElement(EreaderChip, { docId: 'd1', title: 'Doc', status: s, onOpenDoc: () => {} }))
-  it('renders only for a sent doc or a chapter of a sent book', () => {
+  const render = (s: EreaderStatus | null, readOnly = false) =>
+    renderToString(createElement(EreaderChip, { docId: 'd1', title: 'Doc', status: s, readOnly, onOpenDoc: () => {} }))
+  it('another member’s tag: a muted chip', () => {
+    const html = render(status({ tagged: true }))
+    expect(html).toContain('Sent by another member')
+    expect(html).toContain('lp-chip-neutral')
+  })
+  it('renders only for a sent doc, a chapter of a sent book, or another member’s tag', () => {
     expect(render(null)).toBe('')
-    expect(render(status({ tagged: true }))).toBe('')
+    expect(render(status())).toBe('')
     expect(render(status({ sent: true }))).toContain('On e-readers')
     expect(render(status({ in_sent_book: { id: 'f', title: 'Handbook' } }))).toContain('On e-readers · in Handbook')
   })

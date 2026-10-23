@@ -46,7 +46,7 @@ import { useShellCounts } from './shell/useShellCounts'
 import { loadSidebarOpen, storeSidebarOpen, loadWorkspaceSel, storeWorkspaceSel, PHONE_QUERY } from './shell/prefs'
 import { api, ApiError, Doc, QueueRow, Profile as ProfileRow } from './types'
 import type { Workspace, WorkspaceSel } from './workspaces'
-import { workspaceColor, workspaceSummary } from './workspaces'
+import { docWorkspace, workspaceColor, workspaceSummary } from './workspaces'
 
 type Stamp = { stamp: number; build?: number; version?: string }
 
@@ -409,6 +409,11 @@ export default function App() {
   const docId = route.kind === 'doc' ? route.id : null
   const ereader = useEreaderStatus(docId)
   const docHasChildren = useMemo(() => !!docId && docs.some((d) => d.parent_id === docId), [docId, docs])
+  // a viewer of the doc's workspace cannot send it (the server writes its tag)
+  const docReadOnly = useMemo(
+    () => !!docId && docWorkspace(workspaces, docId, docs.find((d) => d.id === docId)?.workspace_id)?.role === 'viewer',
+    [docId, docs, workspaces],
+  )
   const docTitle = useMemo(() => (docId ? (docs.find((d) => d.id === docId)?.title ?? null) : null), [docId, docs])
 
   // the ⌘K action list
@@ -424,6 +429,7 @@ export default function App() {
         docId,
         docTitle,
         docHasChildren,
+        docReadOnly,
         ereader,
         onAction: (a) => {
           switch (a) {
@@ -452,7 +458,7 @@ export default function App() {
           setPalette(null)
         },
       }),
-    [signedIn, server, docId, docTitle, docHasChildren, ereader, go, openSearch, toggleSidebar],
+    [signedIn, server, docId, docTitle, docHasChildren, docReadOnly, ereader, go, openSearch, toggleSidebar],
   )
 
   // the ⌘O places

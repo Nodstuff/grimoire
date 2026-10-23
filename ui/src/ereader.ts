@@ -190,9 +190,18 @@ export async function loadEreaderStatus(docId: string): Promise<EreaderStatus | 
 export const EREADER_EVENT = 'taisce:ereader'
 
 /** Send the doc to this person's e-readers (or stop). A sent book's diagrams
- * are drawn and uploaded in the background. */
+ * are drawn and uploaded in the background. When another member set the tag
+ * meanwhile (the server's 409), the fresh status comes back instead of an
+ * error: the caller compares `sent` with what it asked for. */
 export async function setSending(docId: string, send: boolean): Promise<EreaderStatus> {
-  const s = await postEreader(docId, send)
+  let s: EreaderStatus
+  try {
+    s = await postEreader(docId, send)
+  } catch (e) {
+    const now = await loadEreaderStatus(docId)
+    if (now && byOther(now)) return now
+    throw e
+  }
   put(docId, s)
   try {
     window.dispatchEvent(new CustomEvent(EREADER_EVENT, { detail: { docId } }))
@@ -205,17 +214,30 @@ export async function setSending(docId: string, send: boolean): Promise<EreaderS
 
 /* ---------- labels ---------- */
 
+/** The tag is there but another member set it: not this person's to send or stop. */
+export function byOther(status: Pick<EreaderStatus, 'sent' | 'tagged'>): boolean {
+  return status.tagged && !status.sent
+}
+
+/** Offer Send / Stop: the status is known, the person can write the doc,
+ * and the tag (if any) is theirs. */
+export function canSend(status: Pick<EreaderStatus, 'sent' | 'tagged'> | null, readOnly: boolean): status is EreaderStatus {
+  return !!status && !readOnly && !byOther(status)
+}
+
 /** The send / stop action's label for a doc. */
 export function sendLabel(status: Pick<EreaderStatus, 'sent'>, hasChildren: boolean): string {
   if (status.sent) return 'Stop sending to e-readers'
   return hasChildren ? 'Send folder to e-readers' : 'Send to e-readers'
 }
 
-/** The doc header chip: "On e-readers", "On e-readers · in <Folder>", or none. */
-export function ereaderChipText(status: Pick<EreaderStatus, 'sent' | 'in_sent_book'> | null): string | null {
+/** The doc header chip: "On e-readers", "On e-readers · in <Folder>",
+ * "Sent by another member", or none. */
+export function ereaderChipText(status: Pick<EreaderStatus, 'sent' | 'tagged' | 'in_sent_book'> | null): string | null {
   if (!status) return null
   if (status.sent) return 'On e-readers'
   if (status.in_sent_book) return `On e-readers · in ${status.in_sent_book.title}`
+  if (status.tagged) return 'Sent by another member'
   return null
 }
 
@@ -354,8 +376,16 @@ function sizedSvg(svg: string, width: number, height: number, natural: { width?:
   return new XMLSerializer().serializeToString(root)
 }
 
-/** SVG → PNG on a white canvas. */
+/** An SVG the canvas would refuse to export: a foreignObject (HTML labels)
+ * taints it, and so does an external image or stylesheet. */
+export function svgTaints(svg: string): boolean {
+  return /<foreignObject[\s>]/i.test(svg) || /<(?:image|use)\b[^>]*\bhref\s*=\s*["'](?!data:|#)/i.test(svg) || /@import\b/i.test(svg)
+}
+
+/** SVG → PNG on a white canvas. Throws (the diagram is skipped) on an SVG
+ * that would taint it, or when the browser refuses to export. */
 async function rasterize(svg: string): Promise<{ png: string; width: number; height: number }> {
+  if (svgTaints(svg)) throw new Error('the diagram would taint the canvas (HTML labels or external content)')
   const natural = svgSize(svg)
   const { width, height } = targetSize(natural.width, natural.height)
   const img = new Image()
@@ -371,7 +401,9 @@ async function rasterize(svg: string): Promise<{ png: string; width: number; hei
   ctx.fillStyle = '#ffffff'
   ctx.fillRect(0, 0, width, height)
   ctx.drawImage(img, 0, 0, width, height)
+  // a tainted canvas throws SecurityError here
   const url = canvas.toDataURL('image/png')
+  if (!url.startsWith('data:image/png')) throw new Error('the canvas gave no PNG')
   return { png: url.slice(url.indexOf(',') + 1), width, height }
 }
 
@@ -418,16 +450,29 @@ export function syncDiagramImages(docId: string, opts: { status?: EreaderStatus;
   const none: SyncResult = { rendered: 0, failed: 0, stored: 0, ignored: 0 }
   const render = opts.render ?? (canRasterize() ? renderDiagramPng : null)
   if (!render) return Promise.resolve(none)
+  const draw: RenderPng = render
   const cur = running.get(docId)
   if (cur) return cur
   const run = (async (): Promise<SyncResult> => {
     const res = { ...none }
+    try {
+      await syncInto(res)
+    } catch (e) {
+      // nothing escapes a background sync
+      console.warn('e-reader diagram sync failed', docId, e)
+    }
+    return res
+  })().finally(() => running.delete(docId))
+  running.set(docId, run)
+  return run
+
+  async function syncInto(res: SyncResult): Promise<void> {
     let status = opts.status
     if (!status) {
       try {
         status = await getEreaderStatus(docId)
       } catch {
-        return res
+        return
       }
     }
     const seen = new Set<string>()
@@ -437,15 +482,15 @@ export function syncDiagramImages(docId: string, opts: { status?: EreaderStatus;
       seen.add(k)
       return true
     })
-    if (missing.length === 0) return res
+    if (missing.length === 0) return
     const key = `${docId}\n${[...seen].sort().join('\n')}`
-    if (tried.has(key)) return res
+    if (tried.has(key)) return
     tried.add(key)
     const images: DiagramPng[] = []
     // one at a time: mermaid's config is global, and the page stays responsive
     for (const d of missing) {
       try {
-        const out = await render(d)
+        const out = await draw(d)
         if (!out) continue
         if (base64Bytes(out.png) > PNG_MAX_BYTES) {
           res.failed++
@@ -470,8 +515,5 @@ export function syncDiagramImages(docId: string, opts: { status?: EreaderStatus;
         console.warn('e-reader diagrams not uploaded', docId, e)
       }
     }
-    return res
-  })().finally(() => running.delete(docId))
-  running.set(docId, run)
-  return run
+  }
 }
