@@ -622,7 +622,7 @@ export default function App() {
       )
       break
     case 'runs':
-      screen = <Gardeners dataVersion={dataVersion} />
+      screen = <Gardeners dataVersion={dataVersion} server={server} />
       break
     case 'settings':
       screen = (

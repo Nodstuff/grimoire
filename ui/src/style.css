@@ -51,8 +51,6 @@
   background: var(--card);
   border-bottom: 1px solid var(--line2);
 }
-.gardeners-empty { padding: 12px 0; font-size: 13px; color: var(--ink3); line-height: 1.6; }
-.gardeners-empty a { color: var(--accent); }
 .home-hints { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px 24px; font-size: 13px; max-width: 640px; }
 .shortcut-help { padding: 18px 20px; max-height: 70vh; overflow-y: auto; }
 .shortcut-help-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; }
@@ -178,50 +176,6 @@ kbd {
 .actions .accept { background: var(--green); color: var(--on-accent); }
 .actions .decline { background: none; color: var(--red); border: 1px solid var(--red); }
 .actions button:disabled { opacity: 0.4; }
-
-/* ---------- runs ---------- */
-
-.runs { max-width: 860px; width: 100%; display: flex; flex-direction: column; gap: 12px; }
-/* tended-scope rows (Gardeners.tsx) still use the old card */
-.run { background: var(--card); border: 1px solid var(--line2); border-radius: 12px; padding: 12px 18px; }
-.run pre { white-space: pre-wrap; font: 12px/1.6 var(--font-mono); color: var(--ink3); margin: 8px 0 0; }
-.run-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
-.status { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
-.status.ok { color: var(--green); }
-.status.failed, .status.budget-killed { color: var(--red); }
-.status.running { color: var(--yellow); }
-
-/* the run log: one structured row per run, hairlines between, details behind
-   a disclosure instead of a raw <pre> per card */
-.run-list { display: flex; flex-direction: column; }
-.run-row { padding: 8px 6px; border-top: 1px solid var(--line2); display: flex; flex-direction: column; gap: 4px; }
-.run-row:last-child { border-bottom: 1px solid var(--line2); }
-.run-row.status-running { background: color-mix(in srgb, var(--yellow) 4%, transparent); }
-.run-row .run-head { align-items: center; }
-.run-spacer { flex: 1; }
-.run-when, .run-tokens { font-variant-numeric: tabular-nums; white-space: nowrap; }
-.run-details-btn {
-  background: none;
-  border: 1px solid var(--line2);
-  color: var(--ink3);
-  border-radius: 10px;
-  padding: 1px 8px;
-  font-size: 10px;
-  line-height: 1.5;
-  cursor: pointer;
-}
-.run-details-btn:hover, .run-row.open .run-details-btn { color: var(--ink); background: var(--card); }
-.run-log {
-  margin: 4px 0 2px;
-  padding: 8px 12px;
-  background: var(--bg);
-  border-radius: 8px;
-  font: 12px/1.6 var(--font-mono);
-  color: var(--ink3);
-  max-height: 320px;
-  overflow-y: auto;
-}
-.run-log-line { white-space: pre-wrap; overflow-wrap: anywhere; padding-left: 1.5em; text-indent: -1.5em; }
 
 /* ---------- tiptap editor: the doc IS the editor ---------- */
 
@@ -389,27 +343,6 @@ kbd {
   to { opacity: 1; transform: translate(-50%, calc(-100% - 8px)); }
 }
 
-/* ---------- graph view ---------- */
-
-.graph-wrap { position: fixed; inset: 0; }
-.graph-legend {
-  position: fixed;
-  top: 16px;
-  left: 20px;
-  z-index: 10;
-  display: flex;
-  gap: 16px;
-  font-size: 12px;
-  color: var(--ink3);
-}
-.graph-legend i {
-  display: inline-block;
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  margin-right: 5px;
-}
-
 /* ---------- diagram previews ---------- */
 
 .codeblock-view { position: relative; }
@@ -433,9 +366,7 @@ kbd {
 
 /* ---------- gardener management ---------- */
 
-.gardeners-head { display: flex; justify-content: space-between; align-items: baseline; }
 .runs-title { font-size: 15px; color: var(--ink3); margin: 24px 0 4px; font-weight: 600; }
-.gardener-card.disabled { opacity: 0.55; }
 .prompt-edit {
   width: 100%;
   background: var(--bg);
@@ -449,17 +380,6 @@ kbd {
   margin: 6px 0;
 }
 .prompt-edit:focus { border-color: var(--accent); }
-.gardener-row { display: flex; gap: 16px; align-items: flex-end; }
-.gardener-row label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--ink3); }
-.gardener-row input, .gardener-row select {
-  background: var(--bg);
-  border: 1px solid var(--line2);
-  border-radius: 6px;
-  color: var(--ink);
-  padding: 4px 8px;
-  font-size: 13px;
-  outline: none;
-}
 .gardener-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
 .gardener-actions .accept {
   background: var(--green);
@@ -472,17 +392,6 @@ kbd {
   cursor: pointer;
 }
 .toggle { display: flex; gap: 5px; align-items: center; font-size: 12px; color: var(--ink3); cursor: pointer; }
-
-.bindings-label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--ink3); margin: 4px 0 8px; }
-.bindings-input {
-  background: var(--bg);
-  border: 1px solid var(--line2);
-  border-radius: 6px;
-  color: var(--ink);
-  padding: 4px 8px;
-  font: 12px var(--font-mono);
-  outline: none;
-}
 
 .card.flag { border-left: 3px solid var(--accent); }
 .flag-text { font-size: 13px; margin: 6px 0; white-space: pre-wrap; }
@@ -770,8 +679,6 @@ kbd {
 .profile-name-row { display: flex; gap: 8px; align-items: center; }
 .profile-name { font-family: inherit; font-size: 14px; }
 .profile-kv { display: grid; grid-template-columns: 90px 1fr auto; gap: 10px; align-items: center; padding: 4px 0; font-size: 13px; }
-.trash-row { grid-template-columns: minmax(120px, 1fr) auto auto; }
-.trash-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---------- small meta tones ---------- */
 
