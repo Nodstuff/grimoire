@@ -365,7 +365,14 @@ pub trait BlockStore {
     /// Resolve one annotation. Invariant enforced here: proposer ≠ approver.
     /// - accept yellow: clear the annotation (the edit is already live)
     /// - decline yellow: revert via the op's pre-image, as a new green op by
-    ///   the reviewer (a receipt is returned)
+    ///   the reviewer (a receipt is returned). A decline never clobbers a
+    ///   LATER change to the same field (a doc's title / placement / status,
+    ///   a block's content / placement): if one landed since, the declined op
+    ///   is superseded — it is marked declined, nothing is reverted (the
+    ///   receipt's `op_ids` is empty), and the next open yellow on that field
+    ///   inherits its pre-image, so declining that one too lands where the
+    ///   field was before either. An insert whose block was edited or moved
+    ///   since is refused instead (deleting it would take the later edit).
     /// - accept red: apply the parked op now, at the current epoch (receipt)
     /// - decline red: park closed, never applied
     fn resolve(

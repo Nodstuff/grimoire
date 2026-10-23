@@ -705,3 +705,237 @@ graph TD
     .unwrap();
     assert_eq!(f.s.read_block(c.id).unwrap().block_type, BlockType::Comment);
 }
+
+// --- a decline never clobbers a later change to the same field ---------
+
+fn review_item(s: &SqliteStore, doc: Uuid, op_id: Uuid) -> ReviewItem {
+    s.review_queue(Some(doc))
+        .unwrap()
+        .into_iter()
+        .find(|r| r.op.id == op_id)
+        .expect("op still in the review queue")
+}
+
+fn doc_op(s: &mut SqliteStore, doc: Uuid, agent: Uuid, kind: OpKind) -> Uuid {
+    let out = s.propose_doc_op(doc, agent, kind, vec![]).unwrap();
+    assert_eq!(out.verdicts[0].verdict, Verdict::Yellow);
+    out.verdicts[0].op_id
+}
+
+fn move_kind(new_parent: Option<Uuid>, sort_key: Option<String>) -> OpKind {
+    OpKind::MoveDoc {
+        new_parent,
+        sort_key,
+        new_parent_title: None,
+        from_parent: None,
+        from_sort_key: None,
+        from_parent_title: None,
+    }
+}
+
+fn rename_kind(title: &str) -> OpKind {
+    OpKind::RenameDoc { title: title.into(), from_title: String::new() }
+}
+
+#[test]
+fn declining_an_older_reorder_keeps_a_later_move_under_its_new_parent() {
+    let f = fixture();
+    let mut s = f.s;
+    let a = s.create_doc("a", None, f.tom.id).unwrap();
+    let doc = s.create_doc("Note", None, f.tom.id).unwrap();
+    let roadmap = s.create_doc("Roadmap", None, f.tom.id).unwrap();
+    let original_key = s.get_doc(doc.id).unwrap().sort_key;
+    // 1. reorder among siblings: same (top-level) parent, before `a`
+    let before_a = order_key::between(None, a.sort_key.as_deref());
+    let reorder = doc_op(&mut s, doc.id, f.agent.id, move_kind(None, Some(before_a.clone())));
+    assert_eq!(s.get_doc(doc.id).unwrap().sort_key.as_deref(), Some(before_a.as_str()));
+    // 2. later: under Roadmap
+    let mv = doc_op(&mut s, doc.id, f.agent.id, move_kind(Some(roadmap.id), None));
+    assert_eq!(s.get_doc(doc.id).unwrap().parent_id, Some(roadmap.id));
+
+    // decline the OLDER reorder: moot, the doc stays under Roadmap
+    let ann = review_item(&s, doc.id, reorder).annotation.id;
+    let receipt = s.resolve(ann, f.tom.id, ReviewDecision::Decline).unwrap().unwrap();
+    assert!(receipt.op_ids.is_empty(), "superseded: nothing reverted");
+    assert_eq!(s.get_doc(doc.id).unwrap().parent_id, Some(roadmap.id), "the later move survives");
+    // the reorder's item is closed; the move's item is still open and true
+    assert!(s.review_queue(Some(doc.id)).unwrap().iter().all(|r| r.op.id != reorder));
+    let item = review_item(&s, doc.id, mv);
+    match &item.op.kind {
+        OpKind::MoveDoc { new_parent, from_parent, from_sort_key, .. } => {
+            assert_eq!(*new_parent, Some(roadmap.id));
+            assert_eq!(*from_parent, None, "still says: moved from the top level");
+            assert_eq!(*from_sort_key, original_key, "inherits the declined reorder's pre-image");
+        }
+        k => panic!("not a move: {k:?}"),
+    }
+    // declining the move too lands where the doc was before both
+    s.resolve(item.annotation.id, f.tom.id, ReviewDecision::Decline).unwrap();
+    let back = s.get_doc(doc.id).unwrap();
+    assert_eq!(back.parent_id, None);
+    assert_eq!(back.sort_key, original_key, "not the declined reorder's slot");
+}
+
+#[test]
+fn declining_the_newer_move_first_then_the_reorder_still_reverts_both() {
+    let f = fixture();
+    let mut s = f.s;
+    let a = s.create_doc("a", None, f.tom.id).unwrap();
+    let doc = s.create_doc("Note", None, f.tom.id).unwrap();
+    let roadmap = s.create_doc("Roadmap", None, f.tom.id).unwrap();
+    let original_key = s.get_doc(doc.id).unwrap().sort_key;
+    let before_a = order_key::between(None, a.sort_key.as_deref());
+    let reorder = doc_op(&mut s, doc.id, f.agent.id, move_kind(None, Some(before_a.clone())));
+    let mv = doc_op(&mut s, doc.id, f.agent.id, move_kind(Some(roadmap.id), None));
+    let ann = review_item(&s, doc.id, mv).annotation.id;
+    s.resolve(ann, f.tom.id, ReviewDecision::Decline).unwrap();
+    assert_eq!(s.get_doc(doc.id).unwrap().sort_key.as_deref(), Some(before_a.as_str()));
+    // the move and its inverse cancel: the reorder is its own again
+    let ann = review_item(&s, doc.id, reorder).annotation.id;
+    let receipt = s.resolve(ann, f.tom.id, ReviewDecision::Decline).unwrap().unwrap();
+    assert_eq!(receipt.op_ids.len(), 1, "a real revert");
+    let back = s.get_doc(doc.id).unwrap();
+    assert_eq!((back.parent_id, back.sort_key), (None, original_key));
+}
+
+#[test]
+fn declining_an_older_reorder_after_a_human_move_reverts_nothing() {
+    let f = fixture();
+    let mut s = f.s;
+    let a = s.create_doc("a", None, f.tom.id).unwrap();
+    let doc = s.create_doc("Note", None, f.tom.id).unwrap();
+    let folder = s.create_doc("Folder", None, f.tom.id).unwrap();
+    let before_a = order_key::between(None, a.sort_key.as_deref());
+    let reorder = doc_op(&mut s, doc.id, f.agent.id, move_kind(None, Some(before_a)));
+    // the app's drag: not ledgered, seen by value
+    s.move_doc(doc.id, Some(folder.id), None).unwrap();
+    let ann = review_item(&s, doc.id, reorder).annotation.id;
+    let receipt = s.resolve(ann, f.tom.id, ReviewDecision::Decline).unwrap().unwrap();
+    assert!(receipt.op_ids.is_empty());
+    assert_eq!(s.get_doc(doc.id).unwrap().parent_id, Some(folder.id));
+}
+
+#[test]
+fn rename_then_rename_declining_the_older_keeps_the_newer_title() {
+    let f = fixture();
+    let mut s = f.s;
+    let doc = s.create_doc("A", None, f.tom.id).unwrap();
+    let r1 = doc_op(&mut s, doc.id, f.agent.id, rename_kind("B"));
+    let r2 = doc_op(&mut s, doc.id, f.agent.id, rename_kind("C"));
+    let ann = review_item(&s, doc.id, r1).annotation.id;
+    let receipt = s.resolve(ann, f.tom.id, ReviewDecision::Decline).unwrap().unwrap();
+    assert!(receipt.op_ids.is_empty());
+    assert_eq!(s.get_doc(doc.id).unwrap().title, "C");
+    let item = review_item(&s, doc.id, r2);
+    assert!(matches!(&item.op.kind, OpKind::RenameDoc { title, from_title } if title == "C" && from_title == "A"));
+    // declining the newer one now goes back to A, never to the declined B
+    s.resolve(item.annotation.id, f.tom.id, ReviewDecision::Decline).unwrap();
+    assert_eq!(s.get_doc(doc.id).unwrap().title, "A");
+    assert!(s.review_queue(Some(doc.id)).unwrap().is_empty());
+}
+
+#[test]
+fn rename_back_to_the_same_title_by_a_later_op_still_counts_as_later() {
+    // A→B, B→C, C→B: the title equals the first op's post-image again, but
+    // it is the third op's now — declining the first must not rename to A
+    let f = fixture();
+    let mut s = f.s;
+    let doc = s.create_doc("A", None, f.tom.id).unwrap();
+    let r1 = doc_op(&mut s, doc.id, f.agent.id, rename_kind("B"));
+    doc_op(&mut s, doc.id, f.agent.id, rename_kind("C"));
+    doc_op(&mut s, doc.id, f.agent.id, rename_kind("B"));
+    let ann = review_item(&s, doc.id, r1).annotation.id;
+    s.resolve(ann, f.tom.id, ReviewDecision::Decline).unwrap();
+    assert_eq!(s.get_doc(doc.id).unwrap().title, "B");
+}
+
+#[test]
+fn status_then_status_declining_the_older_keeps_the_newer_status() {
+    let f = fixture();
+    let mut s = f.s;
+    let doc = s.create_doc("D", None, f.tom.id).unwrap();
+    let st = |status| OpKind::SetStatus { status: Some(status), from_status: None };
+    let s1 = doc_op(&mut s, doc.id, f.agent.id, st(DocStatus::Draft));
+    let s2 = doc_op(&mut s, doc.id, f.agent.id, st(DocStatus::Decided));
+    let ann = review_item(&s, doc.id, s1).annotation.id;
+    s.resolve(ann, f.tom.id, ReviewDecision::Decline).unwrap();
+    assert_eq!(s.get_doc(doc.id).unwrap().status, Some(DocStatus::Decided));
+    let item = review_item(&s, doc.id, s2);
+    assert!(matches!(&item.op.kind, OpKind::SetStatus { from_status: None, .. }));
+    s.resolve(item.annotation.id, f.tom.id, ReviewDecision::Decline).unwrap();
+    assert_eq!(s.get_doc(doc.id).unwrap().status, None);
+}
+
+#[test]
+fn replace_then_replace_declining_the_older_keeps_the_newer_content() {
+    let mut f = fixture();
+    let o1 = f.s.propose_reviewed(f.doc.id, 1, f.agent.id, vec![replace(f.para, "v2")]).unwrap();
+    assert_eq!(o1.verdicts[0].verdict, Verdict::Yellow);
+    let o2 = f.s.propose_reviewed(f.doc.id, 2, f.agent.id, vec![replace(f.para, "v3")]).unwrap();
+    let (op1, op2) = (o1.verdicts[0].op_id, o2.verdicts[0].op_id);
+    let ann = review_item(&f.s, f.doc.id, op1).annotation.id;
+    let epoch = f.s.get_doc(f.doc.id).unwrap().current_epoch;
+    let receipt = f.s.resolve(ann, f.tom.id, ReviewDecision::Decline).unwrap().unwrap();
+    assert!(receipt.op_ids.is_empty());
+    assert_eq!(f.s.read_block(f.para).unwrap().content, "v3", "the later edit survives");
+    assert_eq!(f.s.get_doc(f.doc.id).unwrap().current_epoch, epoch, "nothing applied");
+    let item = review_item(&f.s, f.doc.id, op2);
+    assert_eq!(item.op.prior.as_ref().unwrap().content, "original");
+    f.s.resolve(item.annotation.id, f.tom.id, ReviewDecision::Decline).unwrap();
+    assert_eq!(f.s.read_block(f.para).unwrap().content, "original");
+}
+
+#[test]
+fn replace_declined_after_a_human_edit_reverts_nothing() {
+    let mut f = fixture();
+    let o1 = f.s.propose_reviewed(f.doc.id, 1, f.agent.id, vec![replace(f.para, "agent")]).unwrap();
+    f.s.apply(f.doc.id, 2, f.tom.id, vec![replace(f.para, "tom")]).unwrap();
+    let ann = review_item(&f.s, f.doc.id, o1.verdicts[0].op_id).annotation.id;
+    f.s.resolve(ann, f.tom.id, ReviewDecision::Decline).unwrap();
+    assert_eq!(f.s.read_block(f.para).unwrap().content, "tom");
+}
+
+#[test]
+fn replace_declined_after_the_later_one_was_declined_reverts() {
+    let mut f = fixture();
+    let o1 = f.s.propose_reviewed(f.doc.id, 1, f.agent.id, vec![replace(f.para, "v2")]).unwrap();
+    let o2 = f.s.propose_reviewed(f.doc.id, 2, f.agent.id, vec![replace(f.para, "v3")]).unwrap();
+    let ann2 = review_item(&f.s, f.doc.id, o2.verdicts[0].op_id).annotation.id;
+    f.s.resolve(ann2, f.tom.id, ReviewDecision::Decline).unwrap();
+    assert_eq!(f.s.read_block(f.para).unwrap().content, "v2");
+    let ann1 = review_item(&f.s, f.doc.id, o1.verdicts[0].op_id).annotation.id;
+    let receipt = f.s.resolve(ann1, f.tom.id, ReviewDecision::Decline).unwrap().unwrap();
+    assert_eq!(receipt.op_ids.len(), 1);
+    assert_eq!(f.s.read_block(f.para).unwrap().content, "original");
+}
+
+#[test]
+fn insert_edited_since_refuses_decline() {
+    let mut f = fixture();
+    let b = Uuid::now_v7();
+    let o1 = f
+        .s
+        .propose_reviewed(
+            f.doc.id,
+            1,
+            f.agent.id,
+            vec![OpInput {
+                kind: OpKind::Insert {
+                    block_id: b,
+                    parent_id: None,
+                    order_key: "j".into(),
+                    block_type: BlockType::Paragraph,
+                    content: "new".into(),
+                    refers_to: None,
+                },
+                source_refs: vec![],
+            }],
+        )
+        .unwrap();
+    f.s.apply(f.doc.id, 2, f.tom.id, vec![replace(b, "tom built on it")]).unwrap();
+    let ann = review_item(&f.s, f.doc.id, o1.verdicts[0].op_id).annotation.id;
+    let err = f.s.resolve(ann, f.tom.id, ReviewDecision::Decline).unwrap_err();
+    assert!(err.to_string().contains("superseded"), "{err}");
+    assert_eq!(f.s.read_block(b).unwrap().content, "tom built on it");
+    assert!(f.s.review_queue(Some(f.doc.id)).unwrap().iter().any(|r| r.annotation.id == ann), "still open");
+}
