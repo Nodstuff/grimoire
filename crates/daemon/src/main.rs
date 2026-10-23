@@ -1172,3 +1172,51 @@ mod supervise_tests {
         assert_eq!(STARTS.load(Ordering::SeqCst), 2, "restarted exactly once, then kept running");
     }
 }
+
+#[cfg(test)]
+mod spa_fallback_tests {
+    use super::*;
+
+    async fn get(path: &str) -> (axum::http::StatusCode, String, Vec<u8>) {
+        let res = serve_embedded_ui(path.parse::<axum::http::Uri>().unwrap()).await;
+        let status = res.status();
+        let ctype = res
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec();
+        (status, ctype, body)
+    }
+
+    /// The web UI routes in the address bar (/doc/<id>, /review, /settings/…)
+    /// are client-side: a reload or a pasted link must get index.html, not a
+    /// 404, so the SPA boots and reads its own URL.
+    #[tokio::test]
+    async fn ui_paths_fall_back_to_index_html() {
+        let Some(index) = EmbeddedUi::get("index.html") else {
+            // built without a frontend: the fallback says so instead
+            let (status, _, _) = get("/review").await;
+            assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            return;
+        };
+        for path in [
+            "/",
+            "/doc/0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+            "/doc/0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d?block=11111111-2222-4333-8444-555555555555",
+            "/review",
+            "/books",
+            "/search?q=gate",
+            "/settings/ereaders",
+            "/trash",
+            "/library/unsorted",
+            "/gardeners",
+        ] {
+            let (status, ctype, body) = get(path).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{path}");
+            assert!(ctype.starts_with("text/html"), "{path}: {ctype}");
+            assert_eq!(body, index.data.as_ref(), "{path} serves index.html");
+        }
+    }
+}
