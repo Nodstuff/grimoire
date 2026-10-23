@@ -152,6 +152,10 @@ export function legacyRedirect(pathname: string, search: string): string | null 
 export interface NavState {
   anchor?: string
   review?: boolean
+  /** /search: arrived to ask the query (the palette's ⌘↵, ⌘/) */
+  ask?: boolean
+  /** /search: the answer doc this entry showed */
+  answer?: string
 }
 
 const NAV_EVENT = 'taisce:navigate'

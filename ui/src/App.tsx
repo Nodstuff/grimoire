@@ -561,7 +561,17 @@ export default function App() {
       screen = <ReviewQueue onChange={setQueueCount} onOpenDoc={openDoc} dataVersion={dataVersion} />
       break
     case 'search':
-      screen = <SearchScreen q={route.q} onOpenDoc={openDoc} />
+      screen = (
+        <SearchScreen
+          q={route.q}
+          onOpenDoc={openDoc}
+          docs={docs}
+          workspaces={workspaces}
+          dataVersion={dataVersion}
+          askIntent={!!navState.ask}
+          answerId={navState.answer ?? null}
+        />
+      )
       break
     case 'runs':
       screen = <Gardeners dataVersion={dataVersion} />

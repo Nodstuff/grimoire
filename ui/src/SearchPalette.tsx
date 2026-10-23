@@ -8,7 +8,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import PaletteShell, { PaletteFooter, PaletteInput, moveSelection } from './PaletteShell'
 import { Icon } from './lapis/icons'
-import { errText, notify } from './Notice'
+import { navigate } from './router'
 import { api, type SearchHit } from './types'
 import type { OpenDoc } from './App'
 import { buildSearchRows, parseSearch, stableSelection, type SearchRow } from './omni'
@@ -41,7 +41,7 @@ export default function SearchPalette({
   const [settled, setSettled] = useState(() => parseSearch(''))
   const [pending, setPending] = useState(false)
   const [sel, setSel] = useState(0)
-  const [asking, setAsking] = useState(false)
+  const asking = false
   const inputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -105,27 +105,13 @@ export default function SearchPalette({
   const live = parseSearch(raw)
   const contentPending = pending || (!live.ask && live.q.length >= MIN_CHARS && live.q !== q)
 
-  const ask = async (question: string) => {
+  // asking lands on the Search & Ask page, which shows the answer with its
+  // citations and receipts (canvas Search) and keeps it under Answers
+  const ask = (question: string) => {
     const qq = question.trim()
-    if (!qq || asking) return
-    setAsking(true)
-    try {
-      const a = await api<{ doc_id: string | null; title: string; sources: number; docs: number }>('/api/ask', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: qq }),
-      })
-      if (!a.doc_id) {
-        notify('nothing in your notes matches that yet', 'warn')
-        setAsking(false)
-        return
-      }
-      notify(`answered from ${a.sources} block${a.sources === 1 ? '' : 's'} across ${a.docs} doc${a.docs === 1 ? '' : 's'}`, 'ok')
-      onOpenDoc(a.doc_id)
-    } catch (e) {
-      notify(errText(e))
-      setAsking(false)
-    }
+    if (!qq) return
+    onClose()
+    navigate({ kind: 'search', q: qq }, { state: { ask: true } })
   }
 
   const run = (r: SearchRow | undefined) => {

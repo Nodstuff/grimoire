@@ -43,6 +43,7 @@
   --yellow: #8a5a00; /* text on yellow-soft */
   --yellow-mark: #e2ae2e; /* a bare mark: dots, icons on cards */
   --yellow-soft: #fff1c9;
+  --mark: #ffe7a3; /* a search match */
   --on-yellow: #1a1405;
   --red: #b8202f;
   --red-soft: #fbe0e3;
@@ -152,6 +153,7 @@
     --yellow: #f2c14e;
     --yellow-mark: #f2c14e;
     --yellow-soft: rgba(242, 193, 78, 0.13);
+    --mark: rgba(242, 193, 78, 0.28);
     --on-yellow: #1a1405;
     --red: #ff7a85;
     --red-soft: rgba(255, 122, 133, 0.12);
@@ -196,6 +198,7 @@
   --yellow: #f2c14e;
   --yellow-mark: #f2c14e;
   --yellow-soft: rgba(242, 193, 78, 0.13);
+  --mark: rgba(242, 193, 78, 0.28);
   --on-yellow: #1a1405;
   --red: #ff7a85;
   --red-soft: rgba(255, 122, 133, 0.12);
