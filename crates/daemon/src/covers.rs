@@ -1,0 +1,1084 @@
+//! Colour covers for the EPUB library. Books exported from a Kindle often
+//! carry a black-and-white cover; both e-readers are e-ink, so colour only
+//! matters where Taisce shows a cover (the web app, the Apple app, OPDS
+//! thumbnails). Taisce never rewrites a book's bytes: a colour cover is
+//! stored BESIDE the book (`library/<user>/<book id>.cover-color.<ext>`) and
+//! every cover route serves it while it is the book's chosen cover
+//! (`Book::shown_cover_key`).
+//!
+//! - Greyscale detection: [`analyse`] decodes the cover (bounded), shrinks
+//!   it, and measures Hasler and Süsstrunk's colourfulness; below
+//!   [`GREY_MAX`] the cover is greyscale. Ingest stores the verdict; the
+//!   cover review fills it in for books shelved before it existed.
+//! - Candidates come from Open Library only: the cover of each ISBN among
+//!   the OPF's identifiers, then a title and author search. The server
+//!   builds every URL itself, fetches only from Open Library's two hosts
+//!   (and the archive.org hosts their redirects lead to), validates each
+//!   image ([`validate_candidate`]) and caches the survivors in the store.
+//!   Clients see a candidate as an id the server minted, never a URL.
+//! - The person chooses (`POST /api/books/{id}/cover`): a candidate, or the
+//!   book's own cover. A library pass accepts with `unless_chosen`, so it
+//!   never overwrites a cover the person chose.
+//!
+//! Routes (a person's own app or web session: the library router refuses
+//! connector writes, and none of this is an MCP tool):
+//!
+//! - `GET /api/books/{id}/cover-candidates` → the cached candidates
+//! - `POST /api/books/{id}/cover-candidates` `{refresh?}` → asks Open
+//!   Library (unless a lookup from the last 30 days is cached) and caches
+//! - `GET /api/books/{id}/cover-candidates/{candidate}` → the image
+//! - `POST /api/books/{id}/cover` `{candidate} | {use: "embedded"}`,
+//!   `unless_chosen?` → the book
+//! - `GET /api/books/cover-review` → greyscale books with their best
+//!   cached candidate, and how many covers are not looked at yet
+//! - `POST /api/books/cover-review` → looks at the next batch of covers
+//!   shelved before greyscale detection, then answers like the GET
+
+use crate::library::{LibraryState, book_json, err, fail, not_found};
+use crate::store_ext::{blocking, with_store};
+use crate::viewer::Viewer;
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::collections::HashSet;
+
+use taisce_store::books::{Book, CoverCandidate, CoverChoice, CoverPick, NewCoverCandidate};
+use taisce_store::StoreError;
+use url::Url;
+use uuid::Uuid;
+
+/// Colourfulness below this is a greyscale cover. A true greyscale JPEG
+/// measures 0–2 (chroma noise), a faint cream or warm tint a few points;
+/// real colour covers measured 19 (Open Library's muted Horus Rising) and
+/// 32 (Foundation), and both measured 0.0 converted to grey.
+pub const GREY_MAX: f64 = 10.0;
+/// A candidate must measure at least this to be offered as a COLOUR cover.
+pub const COLOUR_MIN: f64 = 15.0;
+/// Open Library's -L covers are 500 px tall; anything under this is a
+/// thumbnail that would look worse than the greyscale original.
+const MIN_HEIGHT: u32 = 300;
+const MIN_WIDTH: u32 = 150;
+/// A cover is taller than wide; a candidate wider than tall, or more than
+/// twice as tall as wide, is a scan of something else.
+const MIN_ASPECT: f64 = 1.0;
+const MAX_ASPECT: f64 = 2.0;
+/// Bytes read of one Open Library answer (covers are ~40–150 KB).
+const MAX_FETCH_BYTES: usize = 4 * 1024 * 1024;
+/// Candidates offered per book.
+pub const MAX_CANDIDATES: usize = 4;
+/// Cover images fetched per lookup at most (some fail validation).
+const MAX_COVER_FETCHES: usize = 6;
+/// ISBNs tried per lookup.
+const MAX_ISBNS: usize = 2;
+/// A lookup is cached this long; a person's "Find again" refreshes it.
+const LOOKUP_TTL: i64 = 30 * 86_400;
+/// Covers the review looks at per POST (each is one S3 GET and a decode).
+const SCAN_BATCH: usize = 20;
+/// Cap on a stored cover the review reads back (ingest's cap).
+const MAX_STORED_COVER_BYTES: usize = 16 * 1024 * 1024;
+
+// ---- judging an image ----
+
+/// What [`analyse`] measured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Analysis {
+    pub width: u32,
+    pub height: u32,
+    /// Hasler and Süsstrunk's M: 0 for grey, ~15 slightly colourful, ~33
+    /// moderately, 45+ highly.
+    pub colorfulness: f64,
+}
+
+/// Decode an image (JPEG, PNG, WebP or GIF; bounded: at most 10 000 px a
+/// side and 128 MB of decode buffers) and measure it on a 128 px thumbnail.
+/// None when it does not decode — an SVG cover, a corrupt file.
+pub fn analyse(bytes: &[u8]) -> Option<Analysis> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(10_000);
+    limits.max_image_height = Some(10_000);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
+    let (width, height) = (img.width(), img.height());
+    let small = img.thumbnail(128, 128).to_rgb8();
+    Some(Analysis { width, height, colorfulness: colorfulness(&small) })
+}
+
+/// Hasler and Süsstrunk (2003): over the opponent channels rg = R − G and
+/// yb = (R + G)/2 − B, M = σ + 0.3·μ of their joint spread and mean.
+fn colorfulness(img: &image::RgbImage) -> f64 {
+    let n = (img.width() as f64) * (img.height() as f64);
+    if n == 0.0 {
+        return 0.0;
+    }
+    let (mut srg, mut syb, mut srg2, mut syb2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for p in img.pixels() {
+        let [r, g, b] = p.0.map(f64::from);
+        let rg = r - g;
+        let yb = 0.5 * (r + g) - b;
+        srg += rg;
+        syb += yb;
+        srg2 += rg * rg;
+        syb2 += yb * yb;
+    }
+    let (mrg, myb) = (srg / n, syb / n);
+    let vrg = (srg2 / n - mrg * mrg).max(0.0);
+    let vyb = (syb2 / n - myb * myb).max(0.0);
+    (vrg + vyb).sqrt() + 0.3 * (mrg * mrg + myb * myb).sqrt()
+}
+
+pub fn is_greyscale(a: &Analysis) -> bool {
+    a.colorfulness < GREY_MAX
+}
+
+/// The verdict ingest and the review store for a cover's bytes: greyscale
+/// or not. A cover that will not decode (an SVG) is judged "not
+/// greyscale": the pass never offers to replace what it cannot see, and
+/// the book's details still can.
+pub fn cover_verdict(bytes: &[u8]) -> bool {
+    analyse(bytes).is_some_and(|a| is_greyscale(&a))
+}
+
+/// The extension of an image's actual format (never the server's word).
+fn image_ext(bytes: &[u8]) -> Option<&'static str> {
+    match image::guess_format(bytes).ok()? {
+        image::ImageFormat::Jpeg => Some("jpg"),
+        image::ImageFormat::Png => Some("png"),
+        image::ImageFormat::WebP => Some("webp"),
+        image::ImageFormat::Gif => Some("gif"),
+        _ => None,
+    }
+}
+
+/// An Open Library image worth offering: it decodes, it is a cover-shaped
+/// image at least 300 px tall (never the 1×1 "no cover" placeholder), and
+/// it is actually colourful. The reason when not.
+pub fn validate_candidate(bytes: &[u8]) -> Result<(Analysis, &'static str), String> {
+    if bytes.len() > MAX_FETCH_BYTES {
+        return Err("over 4 MB".into());
+    }
+    let ext = image_ext(bytes).ok_or("not a JPEG, PNG, WebP or GIF")?;
+    let a = analyse(bytes).ok_or("does not decode")?;
+    if a.height < MIN_HEIGHT || a.width < MIN_WIDTH {
+        return Err(format!("{}×{} is too small", a.width, a.height));
+    }
+    let aspect = a.height as f64 / a.width as f64;
+    if !(MIN_ASPECT..=MAX_ASPECT).contains(&aspect) {
+        return Err(format!("{}×{} is not cover-shaped", a.width, a.height));
+    }
+    if a.colorfulness < COLOUR_MIN {
+        return Err(format!("not colourful ({:.1})", a.colorfulness));
+    }
+    Ok((a, ext))
+}
+
+// ---- ISBNs from the OPF ----
+
+/// The ISBNs among an OPF's `dc:identifier`s (`(scheme attribute, text)`),
+/// as ISBN-13, in order, deduplicated. An identifier counts when it says it
+/// is one — `opf:scheme="ISBN"`, a `urn:isbn:` / `isbn:` / `ISBN ` prefix —
+/// or is a bare 13-digit 978/979 number; either way its check digit must
+/// hold. ISBN-10s become their ISBN-13 (Open Library knows both).
+pub fn isbns_from_identifiers(ids: &[(Option<String>, String)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (scheme, text) in ids {
+        let said = scheme.as_deref().is_some_and(|s| s.trim().eq_ignore_ascii_case("isbn"));
+        let t = text.trim();
+        let lower = t.to_ascii_lowercase();
+        let (prefixed, rest) = ["urn:isbn:", "isbn:", "isbn-13:", "isbn-10:", "isbn13:", "isbn10:", "isbn "]
+            .iter()
+            .find_map(|p| lower.strip_prefix(p).map(|r| (true, r.to_string())))
+            .unwrap_or((false, lower.clone()));
+        let digits: String = rest.chars().filter(|c| !matches!(c, '-' | ' ')).collect();
+        let isbn = match digits.len() {
+            13 if isbn13_valid(&digits) => Some(digits),
+            10 if (said || prefixed) && isbn10_valid(&digits) => Some(isbn10_to_13(&digits)),
+            _ => None,
+        };
+        let Some(isbn) = isbn else { continue };
+        // a bare number counts only as an ISBN-13 (the 978/979 prefix and
+        // its check digit make a stray match vanishingly unlikely)
+        if (said || prefixed || isbn.starts_with("978") || isbn.starts_with("979")) && !out.contains(&isbn) {
+            out.push(isbn);
+        }
+    }
+    out
+}
+
+fn isbn13_valid(d: &str) -> bool {
+    if d.len() != 13 || !d.bytes().all(|b| b.is_ascii_digit()) || !(d.starts_with("978") || d.starts_with("979")) {
+        return false;
+    }
+    let sum: u32 = d.bytes().enumerate().map(|(i, b)| u32::from(b - b'0') * if i % 2 == 0 { 1 } else { 3 }).sum();
+    sum % 10 == 0
+}
+
+fn isbn10_valid(d: &str) -> bool {
+    let b = d.as_bytes();
+    if b.len() != 10 || !b[..9].iter().all(u8::is_ascii_digit) || !(b[9].is_ascii_digit() || b[9] == b'x') {
+        return false;
+    }
+    let sum: u32 = b
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (10 - i as u32) * if c == b'x' { 10 } else { u32::from(c - b'0') })
+        .sum();
+    sum % 11 == 0
+}
+
+fn isbn10_to_13(d: &str) -> String {
+    let core = format!("978{}", &d[..9]);
+    let sum: u32 = core.bytes().enumerate().map(|(i, b)| u32::from(b - b'0') * if i % 2 == 0 { 1 } else { 3 }).sum();
+    format!("{core}{}", (10 - sum % 10) % 10)
+}
+
+// ---- matching search results to the book ----
+
+/// A title for matching and searching: lowercased letters and digits, a
+/// series tag in brackets dropped ("Horus Rising (The Horus Heresy Book
+/// 1)"), a subtitle after ':' or a dash dropped (" - " too), a leading
+/// article dropped.
+fn norm_title(t: &str) -> String {
+    let t = t.split(" - ").next().unwrap_or(t);
+    let mut s = String::new();
+    let mut depth = 0usize;
+    for c in t.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            ':' | '–' | '—' if depth == 0 => break,
+            c if depth == 0 => s.push(c),
+            _ => {}
+        }
+    }
+    let words: Vec<String> = s
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let words = match words.first().map(String::as_str) {
+        Some("the" | "a" | "an") if words.len() > 1 => &words[1..],
+        _ => &words[..],
+    };
+    words.join(" ")
+}
+
+/// The title to search Open Library with: the book's, without its series
+/// tag or subtitle.
+fn search_title(t: &str) -> String {
+    let n = norm_title(t);
+    if n.is_empty() { t.trim().to_string() } else { n }
+}
+
+fn title_matches(book: &str, found: &str) -> bool {
+    // exact, after the normalising: a prefix would let "Foundation" take
+    // "Foundation and Empire"'s cover
+    let (a, b) = (norm_title(book), norm_title(found));
+    !a.is_empty() && a == b
+}
+
+/// The surname-ish last word of each name ("Abnett, Dan" and "Dan Abnett"
+/// both give "abnett" among their words).
+fn name_words(n: &str) -> HashSet<String> {
+    n.split(|c: char| !c.is_alphanumeric()).filter(|w| w.chars().count() > 1).map(str::to_lowercase).collect()
+}
+
+fn author_matches(book: &str, found: &[String]) -> bool {
+    let want = name_words(book);
+    want.is_empty() || found.iter().any(|f| !name_words(f).is_disjoint(&want))
+}
+
+// ---- Open Library ----
+
+/// Hosts a request may START at: Open Library's API and its covers.
+const OL_HOSTS: [&str; 2] = ["openlibrary.org", "covers.openlibrary.org"];
+
+/// Hosts a redirect may lead to: Open Library's own, and the Internet
+/// Archive's, where covers.openlibrary.org sends every image (archive.org,
+/// then a numbered `ia…us.archive.org` node).
+fn redirect_allowed(u: &Url) -> bool {
+    u.scheme() == "https"
+        && u.host_str().is_some_and(|h| {
+            OL_HOSTS.contains(&h) || h == "archive.org" || (h.ends_with(".us.archive.org") && h.starts_with("ia"))
+        })
+}
+
+fn start_allowed(u: &Url) -> bool {
+    u.scheme() == "https" && u.host_str().is_some_and(|h| OL_HOSTS.contains(&h)) && u.port().is_none()
+}
+
+/// Tests' stand-in Open Library: canned answers by exact URL (anything
+/// else is a 404, like the covers API with `default=false`), and the log of
+/// every URL asked for.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MockOpenLibrary {
+    pub answers: std::sync::Mutex<std::collections::HashMap<String, (u16, Vec<u8>)>>,
+    pub asked: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl MockOpenLibrary {
+    pub fn answer(&self, url: &str, status: u16, body: impl Into<Vec<u8>>) {
+        self.answers.lock().unwrap().insert(url.to_string(), (status, body.into()));
+    }
+}
+
+/// The Open Library client: one per daemon, at most two requests in flight
+/// across every lookup, a descriptive User-Agent with a contact.
+pub struct OpenLibrary {
+    http: reqwest::Client,
+    gate: tokio::sync::Semaphore,
+    #[cfg(test)]
+    pub(crate) mock: std::sync::Arc<MockOpenLibrary>,
+}
+
+/// What one lookup found.
+pub struct Lookup {
+    pub candidates: Vec<NewCoverCandidate>,
+    /// Open Library failed (unreachable, 5xx, a timeout) somewhere along
+    /// the way, so "nothing found" may be wrong: not cached.
+    pub unavailable: bool,
+}
+
+#[derive(Deserialize)]
+struct SearchResponse {
+    #[serde(default)]
+    docs: Vec<SearchDoc>,
+}
+
+#[derive(Deserialize)]
+struct SearchDoc {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    author_name: Vec<String>,
+    #[serde(default)]
+    cover_i: Option<i64>,
+}
+
+impl OpenLibrary {
+    /// `contact`: a URL the User-Agent names (the server's public URL),
+    /// as Open Library asks of API clients.
+    pub fn new(contact: &str) -> anyhow::Result<OpenLibrary> {
+        let policy = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.error("too many redirects")
+            } else if redirect_allowed(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        });
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(20))
+            .redirect(policy)
+            .user_agent(format!("Taisce/{} (+{contact}; colour covers)", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        Ok(OpenLibrary {
+            http,
+            gate: tokio::sync::Semaphore::new(2),
+            #[cfg(test)]
+            mock: Default::default(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> OpenLibrary {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        OpenLibrary::new("https://taisce.test").unwrap()
+    }
+
+    /// GET one URL the server built. `Ok(None)` = 404 (Open Library's "no
+    /// such cover"); `Err` = it failed, which a lookup reports as
+    /// unavailable. Never a URL from a client: [`start_allowed`] refuses
+    /// anything off Open Library's hosts before a byte is sent.
+    async fn get(&self, url: Url) -> Result<Option<Vec<u8>>, String> {
+        if !start_allowed(&url) {
+            return Err(format!("refused to fetch {url}: not Open Library"));
+        }
+        let _permit = self.gate.acquire().await.map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        {
+            self.mock.asked.lock().unwrap().push(url.to_string());
+            return match self.mock.answers.lock().unwrap().get(url.as_str()).cloned() {
+                None | Some((404, _)) => Ok(None),
+                Some((200, body)) => Ok(Some(body)),
+                Some((status, _)) => Err(format!("Open Library answered {status}")),
+            };
+        }
+        #[allow(unreachable_code)]
+        {
+            let mut res = self.http.get(url).send().await.map_err(|e| format!("Open Library: {e}"))?;
+            if res.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            if !res.status().is_success() {
+                return Err(format!("Open Library answered {}", res.status()));
+            }
+            let mut out = Vec::new();
+            while let Some(chunk) = res.chunk().await.map_err(|e| format!("Open Library: {e}"))? {
+                if out.len() + chunk.len() > MAX_FETCH_BYTES {
+                    return Err("Open Library sent more than 4 MB".into());
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Ok(Some(out))
+        }
+    }
+
+    /// `https://covers.openlibrary.org/b/isbn/<isbn>-L.jpg?default=false`
+    /// (404 when Open Library has none, not its placeholder).
+    pub fn isbn_cover_url(isbn: &str) -> Url {
+        let mut u = Url::parse("https://covers.openlibrary.org/b/isbn/").unwrap();
+        u.path_segments_mut().unwrap().pop_if_empty().push(&format!("{isbn}-L.jpg"));
+        u.set_query(Some("default=false"));
+        u
+    }
+
+    /// `https://covers.openlibrary.org/b/id/<cover id>-L.jpg?default=false`
+    pub fn id_cover_url(cover_i: i64) -> Url {
+        let mut u = Url::parse("https://covers.openlibrary.org/b/id/").unwrap();
+        u.path_segments_mut().unwrap().pop_if_empty().push(&format!("{cover_i}-L.jpg"));
+        u.set_query(Some("default=false"));
+        u
+    }
+
+    /// The search: title and author, five results, only the fields used.
+    pub fn search_url(title: &str, author: &str) -> Url {
+        let mut u = Url::parse("https://openlibrary.org/search.json").unwrap();
+        {
+            let mut q = u.query_pairs_mut();
+            q.append_pair("title", &search_title(title));
+            if !author.trim().is_empty() {
+                q.append_pair("author", author.trim());
+            }
+            q.append_pair("limit", "5");
+            q.append_pair("fields", "key,title,author_name,cover_i,isbn,first_publish_year");
+        }
+        u
+    }
+
+    /// Up to [`MAX_CANDIDATES`] validated colour covers for a book, best
+    /// first: each ISBN's own cover (that edition), then the search's
+    /// matching results in Open Library's order. Duplicates (the same
+    /// bytes by two routes) are offered once. Requests run one at a time
+    /// per lookup and two across the daemon.
+    pub async fn lookup(&self, title: &str, author: &str, isbns: &[String]) -> Lookup {
+        let mut out: Vec<NewCoverCandidate> = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let mut unavailable = false;
+        let mut fetches = 0usize;
+        let mut offer = |bytes: Vec<u8>, source: &str, source_ref: String, out: &mut Vec<NewCoverCandidate>| {
+            use sha2::Digest as _;
+            let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+            if !seen.insert(digest) {
+                return;
+            }
+            match validate_candidate(&bytes) {
+                Ok((a, ext)) => out.push(NewCoverCandidate {
+                    source: source.into(),
+                    source_ref,
+                    image: bytes,
+                    ext: ext.into(),
+                    width: a.width.into(),
+                    height: a.height.into(),
+                    colorfulness: a.colorfulness,
+                }),
+                Err(why) => tracing::debug!(source, "colour covers: candidate refused: {why}"),
+            }
+        };
+        for isbn in isbns.iter().take(MAX_ISBNS) {
+            if out.len() >= MAX_CANDIDATES || fetches >= MAX_COVER_FETCHES {
+                break;
+            }
+            fetches += 1;
+            match self.get(Self::isbn_cover_url(isbn)).await {
+                Ok(Some(bytes)) => offer(bytes, "isbn", isbn.clone(), &mut out),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::info!("colour covers: {e}");
+                    unavailable = true;
+                }
+            }
+        }
+        if out.len() < MAX_CANDIDATES {
+            let docs = match self.get(Self::search_url(title, author)).await {
+                Ok(Some(body)) => match serde_json::from_slice::<SearchResponse>(&body) {
+                    Ok(r) => r.docs,
+                    Err(e) => {
+                        tracing::info!("colour covers: an unreadable search answer: {e}");
+                        unavailable = true;
+                        Vec::new()
+                    }
+                },
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    tracing::info!("colour covers: {e}");
+                    unavailable = true;
+                    Vec::new()
+                }
+            };
+            let mut covers_seen: HashSet<i64> = HashSet::new();
+            for d in docs {
+                if out.len() >= MAX_CANDIDATES || fetches >= MAX_COVER_FETCHES {
+                    break;
+                }
+                let Some(cover_i) = d.cover_i.filter(|c| *c > 0) else { continue };
+                if !d.title.as_deref().is_some_and(|t| title_matches(title, t)) || !author_matches(author, &d.author_name) {
+                    continue;
+                }
+                if !covers_seen.insert(cover_i) {
+                    continue;
+                }
+                fetches += 1;
+                match self.get(Self::id_cover_url(cover_i)).await {
+                    Ok(Some(bytes)) => offer(bytes, "search", cover_i.to_string(), &mut out),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::info!("colour covers: {e}");
+                        unavailable = true;
+                    }
+                }
+            }
+        }
+        Lookup { candidates: out, unavailable }
+    }
+}
+
+// ---- routes ----
+
+fn candidate_json(book: Uuid, c: &CoverCandidate) -> Value {
+    json!({
+        "id": c.id,
+        "source": c.source.as_str(),
+        "width": c.width,
+        "height": c.height,
+        "colorfulness": (c.colorfulness * 10.0).round() / 10.0,
+        // the server's own route: a client never learns Open Library's URL
+        "url": format!("/api/books/{book}/cover-candidates/{}", c.id),
+    })
+}
+
+fn candidates_json(b: &Book, list: &[CoverCandidate], unavailable: bool) -> Value {
+    json!({
+        "book": book_json(b),
+        "looked_up_at": b.color_lookup_at.map(crate::kosync::rfc3339),
+        "candidates": list.iter().map(|c| candidate_json(b.id, c)).collect::<Vec<_>>(),
+        "unavailable": unavailable,
+    })
+}
+
+/// The person's library, or a 404 (LOCAL mode, no bucket).
+fn person(st: &LibraryState, v: &Viewer) -> Result<Uuid, Response> {
+    match (&st.s3, v.user) {
+        (Some(_), Some(u)) => Ok(u),
+        _ => Err(not_found()),
+    }
+}
+
+pub(crate) async fn candidates_get(State(st): State<LibraryState>, v: Viewer, Path(id): Path<Uuid>) -> Response {
+    if let Err(r) = person(&st, &v) {
+        return r;
+    }
+    let got = with_store(&st.store, v.scope, move |s| -> taisce_store::Result<_> {
+        let b = s.book_get(id)?;
+        let c = s.book_cover_candidates(id)?;
+        Ok((b, c))
+    })
+    .await;
+    match got {
+        Ok((b, c)) => Json(candidates_json(&b, &c, false)).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct FindReq {
+    /// ask Open Library again even when a recent lookup is cached
+    #[serde(default)]
+    refresh: bool,
+}
+
+pub(crate) async fn candidates_find(State(st): State<LibraryState>, v: Viewer, Path(id): Path<Uuid>, body: axum::body::Bytes) -> Response {
+    if let Err(r) = person(&st, &v) {
+        return r;
+    }
+    // an empty body is `{}`: the UI's plain "find" sends nothing
+    let req: FindReq = if body.iter().all(u8::is_ascii_whitespace) {
+        FindReq::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => return err(StatusCode::BAD_REQUEST, format!("bad body: {e}")),
+        }
+    };
+    let got = with_store(&st.store, v.scope, move |s| -> taisce_store::Result<_> {
+        let b = s.book_get(id)?;
+        let c = s.book_cover_candidates(id)?;
+        Ok((b, c))
+    })
+    .await;
+    let (book, cached) = match got {
+        Ok(x) => x,
+        Err(e) => return fail(e),
+    };
+    let now = crate::auth::now();
+    if !req.refresh && book.color_lookup_at.is_some_and(|at| now - at < LOOKUP_TTL) {
+        return Json(candidates_json(&book, &cached, false)).into_response();
+    }
+    let isbns = match &book.isbns {
+        Some(_) => book.isbn_list(),
+        None => read_isbns(&st, &v, &book).await,
+    };
+    let found = st.covers.lookup(&book.title, &book.author, &isbns).await;
+    if found.unavailable && found.candidates.is_empty() {
+        // quietly: what was cached stays, nothing is stamped, a later
+        // find asks again
+        return Json(candidates_json(&book, &cached, true)).into_response();
+    }
+    let unavailable = found.unavailable;
+    let stored = with_store(&st.store, v.scope, move |s| -> taisce_store::Result<_> {
+        let c = s.book_cover_candidates_replace(id, &found.candidates, now)?;
+        Ok((s.book_get(id)?, c))
+    })
+    .await;
+    match stored {
+        Ok((b, c)) => Json(candidates_json(&b, &c, unavailable)).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// A book shelved before ISBNs were kept: read them out of its EPUB (S3 →
+/// a spool file → the OPF; never unpacked, never whole in memory) and
+/// remember them, '' when it has none. Any failure is "no ISBNs" this time
+/// (and nothing remembered, so the next lookup tries again).
+async fn read_isbns(st: &LibraryState, v: &Viewer, book: &Book) -> Vec<String> {
+    let Some(s3) = st.s3.clone() else { return Vec::new() };
+    if tokio::fs::create_dir_all(&st.spool_dir).await.is_err() {
+        return Vec::new();
+    }
+    let spool = crate::library::Spool::path_in(&st.spool_dir);
+    match s3.get_to_file(&book.file_s3_key, &spool.path, crate::library::MAX_FILE_BYTES).await {
+        Ok(true) => {}
+        Ok(false) => return Vec::new(),
+        Err(e) => {
+            tracing::info!(book = %book.id, "colour covers: reading the EPUB for its ISBNs: {e:#}");
+            return Vec::new();
+        }
+    }
+    let path = spool.path.clone();
+    let Ok(isbns) = blocking(move || crate::library::read_isbns(&path)).await else {
+        return Vec::new();
+    };
+    let (id, grey, joined) = (book.id, book.cover_grey, isbns.join(","));
+    let _ = with_store(&st.store, v.scope, move |s| s.book_set_cover_facts(id, grey, Some(&joined))).await;
+    isbns
+}
+
+pub(crate) async fn candidate_image(State(st): State<LibraryState>, v: Viewer, Path((id, cid)): Path<(Uuid, Uuid)>) -> Response {
+    if let Err(r) = person(&st, &v) {
+        return r;
+    }
+    match with_store(&st.store, v.scope, move |s| s.book_cover_candidate(id, cid)).await {
+        Ok(c) => {
+            let mut r = c.image.into_response();
+            let h = r.headers_mut();
+            h.insert(header::CONTENT_TYPE, HeaderValue::from_static(crate::library::cover_content_type(&c.ext)));
+            // a candidate id names one image forever
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=86400, immutable"));
+            h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+            r
+        }
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ChooseReq {
+    /// a candidate id from this book's cover-candidates
+    #[serde(default)]
+    candidate: Option<Uuid>,
+    /// "embedded": the book's own cover, explicitly
+    #[serde(default, rename = "use")]
+    use_: Option<String>,
+    /// a library pass: refuse (409) when the person already chose
+    #[serde(default)]
+    unless_chosen: bool,
+}
+
+fn already_chosen(b: &Book) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "this book's cover was already chosen; a library pass never overwrites a choice",
+            "code": "cover_chosen",
+            "book": book_json(b),
+        })),
+    )
+        .into_response()
+}
+
+pub(crate) async fn choose_cover(
+    State(st): State<LibraryState>,
+    v: Viewer,
+    Path(id): Path<Uuid>,
+    body: Result<Json<ChooseReq>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let user = match person(&st, &v) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(s3) = st.s3.clone() else { return not_found() };
+    let req = match crate::library::json_or_400(body) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    let by = v.human.to_string();
+    let now = crate::auth::now();
+    let unless = req.unless_chosen;
+    match (req.candidate, req.use_.as_deref()) {
+        (None, Some("embedded")) => {
+            let done = with_store(&st.store, v.scope, move |s| s.book_choose_cover(id, CoverPick::Embedded, unless, &by, now)).await;
+            match done {
+                Ok((b, replaced)) => {
+                    if let Some(old) = replaced {
+                        crate::library::discard_objects(&s3, &[&old]).await;
+                    }
+                    Json(book_json(&b)).into_response()
+                }
+                Err(StoreError::Forbidden(_)) => conflict_now(&st, &v, id).await,
+                Err(e) => fail(e),
+            }
+        }
+        (Some(cid), None) => {
+            let got = with_store(&st.store, v.scope, move |s| -> taisce_store::Result<_> {
+                Ok((s.book_get(id)?, s.book_cover_candidate(id, cid)?))
+            })
+            .await;
+            let (book, c) = match got {
+                Ok(x) => x,
+                Err(e) => return fail(e),
+            };
+            if unless && book.cover_choice != CoverChoice::None {
+                return already_chosen(&book);
+            }
+            let key = format!("library/{user}/{id}.cover-color.{}", c.ext);
+            if let Err(e) = s3.put_bytes(&key, &c.image, crate::library::cover_content_type(&c.ext)).await {
+                return err(StatusCode::BAD_GATEWAY, format!("storing the cover: {e:#}"));
+            }
+            let k = key.clone();
+            let done = with_store(&st.store, v.scope, move |s| s.book_choose_cover(id, CoverPick::Color(&k), unless, &by, now)).await;
+            match done {
+                Ok((b, replaced)) => {
+                    if let Some(old) = replaced {
+                        crate::library::discard_objects(&s3, &[&old]).await;
+                    }
+                    Json(book_json(&b)).into_response()
+                }
+                Err(e) => {
+                    // the object at `key` is referenced only if it was already
+                    // the colour cover (a same-extension overwrite)
+                    if book.color_cover_s3_key.as_deref() != Some(key.as_str()) {
+                        crate::library::discard_objects(&s3, &[&key]).await;
+                    }
+                    match e {
+                        StoreError::Forbidden(_) => conflict_now(&st, &v, id).await,
+                        e => fail(e),
+                    }
+                }
+            }
+        }
+        _ => err(StatusCode::BAD_REQUEST, "send {\"candidate\": \"<id>\"} or {\"use\": \"embedded\"}"),
+    }
+}
+
+/// The 409 for a choice that landed between the check and the write.
+async fn conflict_now(st: &LibraryState, v: &Viewer, id: Uuid) -> Response {
+    match with_store(&st.store, v.scope, move |s| s.book_get(id)).await {
+        Ok(b) => already_chosen(&b),
+        Err(e) => fail(e),
+    }
+}
+
+/// The review list: every greyscale book nobody chose a cover for, oldest
+/// first, each with its best cached candidate (`looked_up` false = ask
+/// POST /cover-candidates), and how many covers are not looked at yet.
+async fn review_json(st: &LibraryState, v: &Viewer, user: Uuid, scanned: Option<usize>) -> Response {
+    let got = with_store(&st.store, v.scope, move |s| -> taisce_store::Result<_> {
+        let (grey, unscanned) = s.book_cover_review_counts(user)?;
+        let books = s.book_list_cover_review(user, false, 500)?;
+        let mut rows = Vec::with_capacity(books.len());
+        for b in books {
+            let best = s.book_cover_candidates(b.id)?.into_iter().next();
+            rows.push((b, best));
+        }
+        Ok((grey, unscanned, rows))
+    })
+    .await;
+    match got {
+        Ok((grey, unscanned, rows)) => {
+            let mut out = json!({
+                "greyscale": grey,
+                "unscanned": unscanned,
+                "books": rows.iter().map(|(b, best)| json!({
+                    "book": book_json(b),
+                    "looked_up": b.color_lookup_at.is_some(),
+                    "best": best.as_ref().map(|c| candidate_json(b.id, c)),
+                })).collect::<Vec<_>>(),
+            });
+            if let Some(n) = scanned {
+                out["scanned"] = json!(n);
+            }
+            Json(out).into_response()
+        }
+        Err(e) => fail(e),
+    }
+}
+
+pub(crate) async fn review_get(State(st): State<LibraryState>, v: Viewer) -> Response {
+    match person(&st, &v) {
+        Ok(user) => review_json(&st, &v, user, None).await,
+        Err(r) => r,
+    }
+}
+
+/// Look at the next [`SCAN_BATCH`] covers shelved before greyscale
+/// detection (one S3 GET and a small decode each, one at a time), then
+/// answer the review. The UI repeats until `unscanned` is 0.
+pub(crate) async fn review_scan(State(st): State<LibraryState>, v: Viewer) -> Response {
+    let user = match person(&st, &v) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(s3) = st.s3.clone() else { return not_found() };
+    let batch = match with_store(&st.store, v.scope, move |s| s.book_list_cover_review(user, true, SCAN_BATCH)).await {
+        Ok(b) => b,
+        Err(e) => return fail(e),
+    };
+    let mut scanned = 0usize;
+    for b in batch {
+        let Some(key) = b.cover_s3_key.clone() else { continue };
+        let verdict = match s3.get_bytes(&key, MAX_STORED_COVER_BYTES).await {
+            Ok(Some(bytes)) => blocking(move || cover_verdict(&bytes)).await,
+            // the object is gone: nothing to judge, never offered
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(book = %b.id, "colour covers: reading a stored cover: {e:#}");
+                if scanned == 0 {
+                    return err(StatusCode::BAD_GATEWAY, "object storage is unavailable");
+                }
+                break;
+            }
+        };
+        let id = b.id;
+        if let Err(e) = with_store(&st.store, v.scope, move |s| s.book_set_cover_facts(id, Some(verdict), None)).await {
+            // deleted meanwhile: skip it
+            if !matches!(e, StoreError::NotFound(_)) {
+                return fail(e);
+            }
+        }
+        scanned += 1;
+    }
+    review_json(&st, &v, user, Some(scanned)).await
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A JPEG of `w`×`h`: a colour gradient, or the same in grey.
+    pub(crate) fn jpeg(w: u32, h: u32, colour: bool) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(w, h, |x, y| {
+            let r = (x * 255 / w.max(1)) as u8;
+            let g = (y * 255 / h.max(1)) as u8;
+            let b = 255 - r / 2;
+            if colour {
+                image::Rgb([r, g, b])
+            } else {
+                let l = ((r as u32 * 3 + g as u32 * 6 + b as u32) / 10) as u8;
+                image::Rgb([l, l, l])
+            }
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Jpeg).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn a_grey_jpeg_is_greyscale_and_a_colour_one_is_not() {
+        let grey = analyse(&jpeg(320, 480, false)).unwrap();
+        let colour = analyse(&jpeg(320, 480, true)).unwrap();
+        assert_eq!((grey.width, grey.height), (320, 480));
+        assert!(grey.colorfulness < 3.0, "{grey:?}");
+        assert!(is_greyscale(&grey));
+        assert!(colour.colorfulness > COLOUR_MIN, "{colour:?}");
+        assert!(!is_greyscale(&colour));
+        assert!(cover_verdict(&jpeg(64, 96, false)));
+        assert!(!cover_verdict(&jpeg(64, 96, true)));
+        // a faint warm tint (an old scan, a cream page) is still greyscale
+        let tinted = image::RgbImage::from_fn(100, 150, |_, y| {
+            let l = (y * 255 / 150) as f64;
+            image::Rgb([l as u8, (l * 0.97) as u8, (l * 0.93) as u8])
+        });
+        let mut b = std::io::Cursor::new(Vec::new());
+        tinted.write_to(&mut b, image::ImageFormat::Png).unwrap();
+        assert!(cover_verdict(&b.into_inner()), "a faint tint counts as greyscale");
+        // an SVG (or junk) cannot be judged: never "greyscale"
+        assert!(analyse(b"<svg xmlns='http://www.w3.org/2000/svg'/>").is_none());
+        assert!(!cover_verdict(b"<svg/>"));
+    }
+
+    #[test]
+    fn candidates_must_decode_be_cover_shaped_tall_and_colourful() {
+        assert!(validate_candidate(&jpeg(330, 500, true)).is_ok());
+        assert_eq!(validate_candidate(&jpeg(330, 500, true)).unwrap().1, "jpg");
+        assert!(validate_candidate(&jpeg(330, 500, false)).unwrap_err().contains("not colourful"));
+        assert!(validate_candidate(&jpeg(1, 1, true)).unwrap_err().contains("too small"), "the 1×1 placeholder");
+        assert!(validate_candidate(&jpeg(180, 280, true)).unwrap_err().contains("too small"));
+        assert!(validate_candidate(&jpeg(600, 400, true)).unwrap_err().contains("cover-shaped"));
+        assert!(validate_candidate(b"GIF89a junk").is_err());
+        assert!(validate_candidate(b"<html>not an image</html>").is_err());
+    }
+
+    #[test]
+    fn isbns_come_from_identifiers_that_say_so_and_check_out() {
+        let ids = |v: &[(Option<&str>, &str)]| v.iter().map(|(s, t)| (s.map(String::from), t.to_string())).collect::<Vec<_>>();
+        let got = isbns_from_identifiers(&ids(&[
+            (Some("calibre"), "6f1c9a0e-1111-2222-3333-444455556666"),
+            (None, "urn:isbn:9781849706186"),
+            (Some("ISBN"), "1-84970-618-2"),
+            (None, "isbn:0441172717"),
+            (Some("MOBI-ASIN"), "B004XJRQUQ"),
+            (None, "9780307749710"),
+            (None, "urn:isbn:9781849706187"),
+            (None, "0441172717"),
+            (Some("ISBN"), "978-0-441-17271-9"),
+        ]));
+        assert_eq!(
+            got,
+            [
+                "9781849706186", // urn:isbn
+                // 1-84970-618-2 is the same book's ISBN-10: deduplicated
+                "9780441172719", // isbn: prefix, ISBN-10 → 13 (also the last row)
+                "9780307749710", // a bare ISBN-13
+            ],
+            "a bad check digit and a bare 10-digit number are not ISBNs"
+        );
+        assert_eq!(isbn10_to_13("184970618X".to_lowercase().as_str()).len(), 13);
+        assert!(isbn10_valid("080442957x"));
+        assert!(isbns_from_identifiers(&[]).is_empty());
+    }
+
+    #[test]
+    fn titles_match_through_series_tags_subtitles_and_articles() {
+        assert_eq!(norm_title("Horus Rising (The Horus Heresy Book 1)"), "horus rising");
+        assert_eq!(norm_title("The Hobbit: or There and Back Again"), "hobbit");
+        assert!(title_matches("Horus Rising (The Horus Heresy Book 1)", "Horus Rising"));
+        assert!(title_matches("Foundation", "Foundation"));
+        assert!(title_matches("Horus Rising - The Horus Heresy, Book 1", "Horus Rising"));
+        assert!(title_matches("the foundation", "Foundation"));
+        assert!(!title_matches("Foundation", "Second Foundation"));
+        assert!(!title_matches("Foundation", "Foundation and Empire"), "never a prefix");
+        assert!(author_matches("Dan Abnett", &["Abnett, Dan".into()]));
+        assert!(!author_matches("Dan Abnett", &["Graham McNeill".into()]));
+        assert!(author_matches("", &["Anyone".into()]), "no author to check");
+        assert_eq!(search_title("Horus Rising (The Horus Heresy Book 1)"), "horus rising");
+    }
+
+    #[test]
+    fn urls_are_built_by_the_server_and_only_open_library_is_fetched() {
+        assert_eq!(OpenLibrary::isbn_cover_url("9781849706186").as_str(), "https://covers.openlibrary.org/b/isbn/9781849706186-L.jpg?default=false");
+        assert_eq!(OpenLibrary::id_cover_url(894713).as_str(), "https://covers.openlibrary.org/b/id/894713-L.jpg?default=false");
+        assert_eq!(
+            OpenLibrary::search_url("Horus Rising (The Horus Heresy Book 1)", "Dan Abnett").as_str(),
+            "https://openlibrary.org/search.json?title=horus+rising&author=Dan+Abnett&limit=5&fields=key%2Ctitle%2Cauthor_name%2Ccover_i%2Cisbn%2Cfirst_publish_year"
+        );
+        // a title cannot smuggle a path or a host
+        let u = OpenLibrary::search_url("../../x?y=1#z", "a&b=c");
+        assert_eq!((u.host_str(), u.path()), (Some("openlibrary.org"), "/search.json"));
+        for ok in ["https://covers.openlibrary.org/b/id/1-L.jpg", "https://openlibrary.org/search.json"] {
+            assert!(start_allowed(&Url::parse(ok).unwrap()), "{ok}");
+        }
+        for bad in [
+            "http://covers.openlibrary.org/b/id/1-L.jpg",
+            "https://covers.openlibrary.org:8443/b/id/1-L.jpg",
+            "https://archive.org/download/x",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://openlibrary.org.evil.example/x",
+            "https://evil.example/?h=openlibrary.org",
+        ] {
+            assert!(!start_allowed(&Url::parse(bad).unwrap()), "{bad}");
+        }
+        // redirects: Open Library's, then the Internet Archive's nodes
+        for ok in [
+            "https://archive.org/download/olcovers89/olcovers89-L.zip/894713-L.jpg",
+            "https://ia800703.us.archive.org/view_archive.php?archive=/15/items/olcovers89/olcovers89-L.zip&file=894713-L.jpg",
+        ] {
+            assert!(redirect_allowed(&Url::parse(ok).unwrap()), "{ok}");
+        }
+        for bad in ["http://archive.org/x", "https://evil.us.archive.org.example/x", "https://localhost/x", "https://10.0.0.1/x", "https://x.archive.org/y"] {
+            assert!(!redirect_allowed(&Url::parse(bad).unwrap()), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_supplied_url_is_never_fetched() {
+        let ol = OpenLibrary::for_test();
+        let r = ol.get(Url::parse("https://169.254.169.254/latest/meta-data/").unwrap()).await;
+        assert!(r.unwrap_err().contains("not Open Library"));
+        assert!(ol.mock.asked.lock().unwrap().is_empty(), "nothing was sent");
+    }
+
+    /// The lookup: the ISBN's cover first, then matching search results;
+    /// the placeholder, a grey scan, a non-matching title and a duplicate
+    /// are dropped; at most MAX_CANDIDATES come back.
+    #[tokio::test]
+    async fn a_lookup_ranks_isbn_first_and_validates_every_image() {
+        let ol = OpenLibrary::for_test();
+        let m = ol.mock.clone();
+        let colour = jpeg(330, 500, true);
+        m.answer(OpenLibrary::isbn_cover_url("9781849706186").as_str(), 200, colour.clone());
+        m.answer(
+            OpenLibrary::search_url("Horus Rising (The Horus Heresy Book 1)", "Dan Abnett").as_str(),
+            200,
+            serde_json::to_vec(&json!({"docs": [
+                {"title": "Horus Rising", "author_name": ["Dan Abnett"], "cover_i": 1},
+                {"title": "Horus Rising", "author_name": ["Dan Abnett"], "cover_i": 2},
+                {"title": "Horus Rising", "author_name": ["Dan Abnett"], "cover_i": 3},
+                {"title": "False Gods", "author_name": ["Graham McNeill"], "cover_i": 4},
+                {"title": "Horus Rising", "author_name": ["Dan Abnett"], "cover_i": 5},
+                {"title": "Horus Rising", "author_name": ["Dan Abnett"]},
+            ]}))
+            .unwrap(),
+        );
+        m.answer(OpenLibrary::id_cover_url(1).as_str(), 200, colour.clone()); // the ISBN's again
+        m.answer(OpenLibrary::id_cover_url(2).as_str(), 200, jpeg(330, 500, false)); // a grey scan
+        m.answer(OpenLibrary::id_cover_url(3).as_str(), 200, jpeg(300, 480, true));
+        m.answer(OpenLibrary::id_cover_url(4).as_str(), 200, jpeg(310, 500, true));
+        m.answer(OpenLibrary::id_cover_url(5).as_str(), 200, jpeg(320, 500, true));
+        let got = ol.lookup("Horus Rising (The Horus Heresy Book 1)", "Dan Abnett", &["9781849706186".into()]).await;
+        assert!(!got.unavailable);
+        let refs: Vec<(&str, &str)> = got.candidates.iter().map(|c| (c.source.as_str(), c.source_ref.as_str())).collect();
+        assert_eq!(refs, [("isbn", "9781849706186"), ("search", "3"), ("search", "5")]);
+        let asked = m.asked.lock().unwrap().clone();
+        assert!(!asked.iter().any(|u| u.contains("/b/id/4-")), "another book's cover is never fetched: {asked:?}");
+        assert!(asked.iter().all(|u| u.starts_with("https://covers.openlibrary.org/") || u.starts_with("https://openlibrary.org/")));
+    }
+
+    #[tokio::test]
+    async fn a_failing_open_library_is_unavailable_not_empty() {
+        let ol = OpenLibrary::for_test();
+        ol.mock.answer(OpenLibrary::search_url("Foundation", "Isaac Asimov").as_str(), 503, "");
+        let got = ol.lookup("Foundation", "Isaac Asimov", &[]).await;
+        assert!(got.candidates.is_empty() && got.unavailable);
+        // nothing anywhere (every URL a 404) is a real "none found"
+        let got = ol.lookup("Nothing Like It", "Nobody", &["9780307749710".into()]).await;
+        assert!(got.candidates.is_empty() && !got.unavailable);
+    }
+}

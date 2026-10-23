@@ -200,6 +200,13 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/books/{id}/cover", "books_are_the_callers_alone"),
     ("/api/books/progress", "kosync_progress_is_the_callers_alone"),
     ("/api/books/currently-reading", "kosync_progress_is_the_callers_alone"),
+    // colour covers (covers.rs): the review, the candidates (fetched by the
+    // server from Open Library, cached per book) and their images are the
+    // book owner's alone; B's device never gets A's colour cover
+    ("/api/books/cover-review", "colour_covers_are_the_owners_alone"),
+    ("/api/books/{id}/cover-candidates", "colour_covers_are_the_owners_alone"),
+    ("/api/books/{id}/cover-candidates/{candidate}", "colour_covers_are_the_owners_alone"),
+    ("/api/books/{id}/cover", "colour_covers_are_the_owners_alone"),
     ("/kosync/users/create", "kosync_device_routes_serve_only_the_owner"),
     ("/kosync/users/auth", "kosync_device_routes_serve_only_the_owner"),
     ("/kosync/syncs/progress", "kosync_device_routes_serve_only_the_owner"),
@@ -287,6 +294,8 @@ struct Fx {
     b_pw: String,
     b_book: Uuid,
     s3: std::sync::Arc<crate::s3sign::S3Config>,
+    /// the stand-in Open Library the colour-cover routes fetch from
+    covers: std::sync::Arc<crate::covers::OpenLibrary>,
 }
 
 /// A's book as the store holds it (and its kosync digest, which only the
@@ -457,12 +466,14 @@ fn fixture() -> Fx {
     let dedupe = crate::mcp::new_dedupe();
     let dir = std::env::temp_dir().join(format!("taisce-isolation-{}", Uuid::now_v7()));
     let s3 = std::sync::Arc::new(crate::s3sign::S3Config::for_test());
+    let covers = std::sync::Arc::new(crate::covers::OpenLibrary::for_test());
     let library = crate::library::LibraryState {
         store: store.clone(),
         s3: Some(s3.clone()),
         server_mode: true,
         local_human: a_human,
         spool_dir: dir.join("book-spool"),
+        covers: covers.clone(),
     };
     let app = crate::mcp::router_with_hosts(store.clone(), agent, dedupe.clone(), None, Some(hosts))
         .merge(crate::api::router(crate::api::ApiState {
@@ -536,6 +547,7 @@ fn fixture() -> Fx {
         b_pw,
         b_book,
         s3,
+        covers,
     }
 }
 
@@ -1302,6 +1314,7 @@ fn every_route_and_tool_is_covered() {
         include_str!("auth/web.rs"),
         include_str!("shares.rs"),
         include_str!("library.rs"),
+        include_str!("covers.rs"),
         include_str!("opds.rs"),
         include_str!("kosync.rs"),
         include_str!("sentdocs.rs"),
@@ -3058,4 +3071,123 @@ async fn the_opds_docs_shelf_serves_only_the_owners_sent_docs() {
     assert_eq!(st, StatusCode::NOT_FOUND);
     let (_, root, _) = device_call(&fx, "GET", "/opds/", &[basic("Tom", &fx.a_pw)], None).await;
     assert!(!root.contains("urn:taisce:docs"), "{root}");
+}
+
+/// Colour covers: A's greyscale cover, her Open Library candidates, their
+/// images and the colour cover she picks are hers alone. B's every route —
+/// the review, a lookup, the cache, an image, a choice — answers as if the
+/// book did not exist and asks Open Library nothing; B's device never gets
+/// A's colour cover; a connector and a PAT cannot choose.
+#[tokio::test]
+async fn colour_covers_are_the_owners_alone() {
+    let fx = fixture();
+    let id = fx.a_book;
+    // A's cover in the bucket is black and white
+    let a_cover = format!("library/{}/zebrasecret.cover.jpg", fx.a);
+    fx.s3.memory.objects.lock().unwrap().insert(a_cover.clone(), crate::covers::tests::jpeg(200, 300, false));
+    let search = crate::covers::OpenLibrary::search_url(A_BOOK_TITLE, A_BOOK_AUTHOR);
+    fx.covers.mock.answer(
+        search.as_str(),
+        200,
+        serde_json::to_vec(&json!({"docs": [{"title": A_BOOK_TITLE, "author_name": [A_BOOK_AUTHOR], "cover_i": 77}]})).unwrap(),
+    );
+    fx.covers.mock.answer(crate::covers::OpenLibrary::id_cover_url(77).as_str(), 200, crate::covers::tests::jpeg(330, 500, true));
+
+    // B's review: nothing of A's, before and after a scan
+    for m in ["GET", "POST"] {
+        let (st, out) = fx.b(m, "/api/books/cover-review", None).await;
+        assert_eq!(st, StatusCode::OK, "{m}: {out}");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!((v["greyscale"].as_u64(), v["books"].as_array().map(Vec::len)), (Some(0), Some(0)), "{out}");
+        assert_eq!(v["unscanned"], 0, "A's unscanned cover is not B's to scan: {out}");
+        fx.no_leak_besides("/api/books/cover-review", &out, &[]);
+    }
+    assert_eq!(fx.store.lock(Scope::User(fx.a)).book_get(id).unwrap().cover_grey, None, "B's scan judged nothing of A's");
+    // A's scan finds her greyscale cover
+    let (st, out) = fx.call(&fx.a_app, "POST", "/api/books/cover-review", None).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!((v["scanned"].as_u64(), v["greyscale"].as_u64(), v["unscanned"].as_u64()), (Some(1), Some(1), Some(0)), "{out}");
+
+    // B cannot look A's book up, read its cache, or make the server fetch
+    for (m, path) in [("POST", format!("/api/books/{id}/cover-candidates")), ("GET", format!("/api/books/{id}/cover-candidates"))] {
+        let (st, out) = fx.b(m, &path, Some(json!({"refresh": true}))).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{m} {path}: {out}");
+        fx.no_leak_besides(&path, &out, &[id]);
+    }
+    assert!(fx.covers.mock.asked.lock().unwrap().is_empty(), "B's calls asked Open Library nothing");
+    // A's lookup: the server fetches, validates and caches one candidate
+    let (st, out) = fx.call(&fx.a_app, "POST", &format!("/api/books/{id}/cover-candidates"), None).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let cid: Uuid = v["candidates"][0]["id"].as_str().unwrap_or_else(|| panic!("{out}")).parse().unwrap();
+    assert!(!out.contains("openlibrary.org"), "a client never sees Open Library's URL: {out}");
+    let asked = fx.covers.mock.asked.lock().unwrap().len();
+
+    // the candidate image: A's, not B's — by A's book id or by B's own
+    let img = format!("/api/books/{id}/cover-candidates/{cid}");
+    let (st, _) = fx.call(&fx.a_app, "GET", &img, None).await;
+    assert_eq!(st, StatusCode::OK);
+    for path in [img.clone(), format!("/api/books/{}/cover-candidates/{cid}", fx.b_book)] {
+        let (st, out) = fx.b("GET", &path, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{path}: {out}");
+        fx.no_leak_besides(&path, &out, &[id, cid, fx.b_book]);
+    }
+    let (st, out) = fx.b("GET", &format!("/api/books/{}/cover-candidates", fx.b_book), None).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert!(!out.contains(&cid.to_string()), "{out}");
+
+    // B cannot choose for A's book, nor graft A's candidate onto her own
+    for (path, body) in [
+        (format!("/api/books/{id}/cover"), json!({"candidate": cid})),
+        (format!("/api/books/{id}/cover"), json!({"use": "embedded"})),
+        (format!("/api/books/{}/cover", fx.b_book), json!({"candidate": cid})),
+    ] {
+        let (st, out) = fx.b("POST", &path, Some(body)).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{path}: {out}");
+        fx.no_leak_besides(&path, &out, &[id, cid, fx.b_book]);
+    }
+    // choosing is a person's: a connector is refused, a PAT never opens /api
+    let (st, _) = fx.call(&fx.b_conn, "POST", &format!("/api/books/{}/cover", fx.b_book), Some(json!({"use": "embedded"}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = fx.call(&fx.b_conn, "POST", &format!("/api/books/{}/cover-candidates", fx.b_book), None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "a connector cannot make the server fetch");
+    let (st, _) = fx.call(&fx.b_pat, "POST", &format!("/api/books/{}/cover", fx.b_book), Some(json!({"use": "embedded"}))).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert_eq!(fx.covers.mock.asked.lock().unwrap().len(), asked, "none of that fetched anything");
+    let a = fx.store.lock(Scope::User(fx.a)).book_get(id).unwrap();
+    assert_eq!((a.cover_choice, a.color_cover_s3_key.as_deref()), (taisce_store::books::CoverChoice::None, None), "B changed nothing");
+
+    // A chooses: the colour cover lands beside the book, under A's prefix
+    let (st, out) = fx.call(&fx.a_app, "POST", &format!("/api/books/{id}/cover"), Some(json!({"candidate": cid}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let color_key = format!("library/{}/{id}.cover-color.jpg", fx.a);
+    assert!(fx.s3.memory.keys().contains(&color_key), "{:?}", fx.s3.memory.keys());
+    // A's app and A's device see it; the embedded one is still there
+    let (st, _, h) = device_call(&fx, "GET", &format!("/api/books/{id}/cover"), &[("authorization", format!("Bearer {}", fx.a_app))], None).await;
+    assert_eq!(st, StatusCode::FOUND);
+    assert!(h["location"].to_str().unwrap().contains("cover-color"), "{h:?}");
+    let (_, _, h) = device_call(&fx, "GET", &format!("/api/books/{id}/cover?which=embedded"), &[("authorization", format!("Bearer {}", fx.a_app))], None).await;
+    assert!(h["location"].to_str().unwrap().contains("zebrasecret.cover.jpg"), "{h:?}");
+    let (st, _, h) = device_call(&fx, "GET", &format!("/opds/book/{id}/cover"), &[basic("Tom", &fx.a_pw)], None).await;
+    assert_eq!(st, StatusCode::FOUND);
+    assert!(h["location"].to_str().unwrap().contains("cover-color"), "A's device gets the colour cover");
+    // B's device, by either auth form, never does; nor does B's app
+    for (path, headers) in [
+        (format!("/opds/book/{id}/cover"), vec![basic("Aoife", &fx.b_pw)]),
+        (format!("/opds/{}/book/{id}/cover", fx.b_pw), vec![]),
+    ] {
+        let (st, out, h) = device_call(&fx, "GET", &path, &headers, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{path}: {out}");
+        assert!(h.get("location").is_none());
+    }
+    for path in [format!("/api/books/{id}/cover"), format!("/api/books/{id}/cover?which=embedded")] {
+        let (st, out) = fx.b("GET", &path, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{path}: {out}");
+    }
+    // A's own book list says so; B's says nothing of it
+    let (_, out) = fx.call(&fx.a_app, "GET", "/api/books", None).await;
+    assert!(out.contains(r#""cover_choice":"color""#), "{out}");
+    let (_, out) = fx.b("GET", "/api/books", None).await;
+    assert!(!out.contains(r#""cover_choice":"color""#), "{out}");
 }

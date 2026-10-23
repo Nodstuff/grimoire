@@ -55,6 +55,9 @@ model2vec-rs = { version = "0.2.1", default-features = false, features = ["onig"
 zip = { version = "4", default-features = false, features = ["deflate"] }
 # OPF / container.xml parsing at ingest (library.rs)
 quick-xml = "0.41"
+# colour covers (covers.rs): decode a cover small enough to judge whether it
+# is greyscale, and validate Open Library's; the four formats covers come in
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 
 [build-dependencies]
 

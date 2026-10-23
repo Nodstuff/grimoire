@@ -11,6 +11,7 @@ mod backup;
 mod booknaming;
 mod changes;
 mod children;
+mod covers;
 mod docops;
 mod embed;
 mod epub;
@@ -1076,6 +1077,10 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                 // upload spools live beside the db: the box's one disk, in
                 // the daemon's own permission domain (swept on every upload)
                 spool_dir: db_dir.join("book-spool"),
+                // the User-Agent's contact: this server, else the project
+                covers: Arc::new(covers::OpenLibrary::new(
+                    auth_state.as_ref().map_or("https://github.com/Nodstuff/grimoire", |st| st.cfg.base.as_str()),
+                )?),
             };
             let opds_state = opds::OpdsState {
                 store: store.clone(),

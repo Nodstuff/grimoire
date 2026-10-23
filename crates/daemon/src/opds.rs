@@ -1141,6 +1141,13 @@ mod tests {
             added_at: 1_700_000_000,
             updated_at: 1_700_100_000,
             deleted_at: None,
+            cover_grey: None,
+            isbns: None,
+            color_cover_s3_key: None,
+            cover_choice: Default::default(),
+            cover_choice_by: None,
+            cover_choice_at: None,
+            color_lookup_at: None,
         }
     }
 
@@ -1195,6 +1202,7 @@ mod tests {
             server_mode: true,
             local_human: human,
             spool_dir: dir.path().join("spool"),
+            covers: std::sync::Arc::new(crate::covers::OpenLibrary::for_test()),
         };
         let app = router(OpdsState {
             store: store.clone(),
@@ -1391,6 +1399,7 @@ mod tests {
             server_mode: true,
             local_human: human,
             spool_dir: dir.path().join("spool"),
+            covers: std::sync::Arc::new(crate::covers::OpenLibrary::for_test()),
         };
         let app = router(OpdsState {
             store: store.clone(),

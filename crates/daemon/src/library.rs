@@ -22,6 +22,7 @@
 //! downloads either 302 to S3 or proxy it chunk-by-chunk. Nowhere is a
 //! whole book held in memory.
 
+use crate::covers;
 use crate::s3sign::{self, S3Config};
 use crate::store_ext::{blocking, with_store};
 use crate::viewer::Viewer;
@@ -44,7 +45,7 @@ use uuid::Uuid;
 
 /// Per-file cap on an uploaded EPUB, enforced while spooling: a bigger
 /// field stops writing here and answers `error` for that file.
-const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 /// Whole-request cap (every file plus multipart framing): one EPUB at the
 /// per-file cap plus framing. The web UI batches by bytes (≤ 20 MB a
 /// request, a bigger file alone), so a legitimate request never comes
@@ -77,6 +78,8 @@ pub struct LibraryState {
     /// Upload spools (beside the db): created on demand, each file removed
     /// as soon as its ingest finishes, stale ones swept hourly.
     pub spool_dir: PathBuf,
+    /// Colour covers' one Open Library client (covers.rs).
+    pub covers: Arc<crate::covers::OpenLibrary>,
 }
 
 impl FromRequestParts<LibraryState> for Viewer {
@@ -86,15 +89,15 @@ impl FromRequestParts<LibraryState> for Viewer {
     }
 }
 
-fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
+pub(crate) fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
     (status, Json(json!({"error": msg.to_string()}))).into_response()
 }
 
-fn not_found() -> Response {
+pub(crate) fn not_found() -> Response {
     err(StatusCode::NOT_FOUND, "not found")
 }
 
-fn fail(e: StoreError) -> Response {
+pub(crate) fn fail(e: StoreError) -> Response {
     let code = match &e {
         StoreError::NotFound(_) => StatusCode::NOT_FOUND,
         StoreError::Forbidden(_) => StatusCode::FORBIDDEN,
@@ -104,7 +107,7 @@ fn fail(e: StoreError) -> Response {
     err(code, e)
 }
 
-fn book_json(b: &Book) -> Value {
+pub(crate) fn book_json(b: &Book) -> Value {
     json!({
         "id": b.id,
         "title": b.title.as_str(),
@@ -114,7 +117,16 @@ fn book_json(b: &Book) -> Value {
         "book_identifier": b.book_identifier.as_deref(),
         "original_filename": b.original_filename.as_str(),
         "size": b.size,
-        "has_cover": b.cover_s3_key.is_some(),
+        // the cover the routes serve: the colour one while chosen, else
+        // the book's own (covers.rs)
+        "has_cover": b.shown_cover_key().is_some(),
+        "has_embedded_cover": b.cover_s3_key.is_some(),
+        "has_color_cover": b.color_cover_s3_key.is_some() && b.cover_choice == taisce_store::books::CoverChoice::Color,
+        // null = not looked at yet; true = a colour match is worth offering
+        "cover_greyscale": b.cover_grey,
+        "cover_choice": b.cover_choice.as_str(),
+        // changes whenever the shown cover does: the UI's cache-buster
+        "cover_version": b.cover_choice_at.unwrap_or(0),
         // RFC 3339, like every other instant the API sends (kosync's
         // reading rows included)
         "added_at": crate::kosync::rfc3339(b.added_at),
@@ -244,7 +256,7 @@ struct PatchReq {
     series_index: Option<Option<f64>>,
 }
 
-fn json_or_400<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, Response> {
+pub(crate) fn json_or_400<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, Response> {
     match body {
         Ok(Json(b)) => Ok(b),
         Err(JsonRejection::BytesRejection(e)) => Err(err(e.status(), e.body_text())),
@@ -353,7 +365,7 @@ async fn delete_book(State(st): State<LibraryState>, v: Viewer, Path(id): Path<U
     .await;
     match deleted {
         Ok(b) => {
-            for key in std::iter::once(&b.file_s3_key).chain(b.cover_s3_key.as_ref()) {
+            for key in std::iter::once(&b.file_s3_key).chain(b.cover_s3_key.as_ref()).chain(b.color_cover_s3_key.as_ref()) {
                 if let Err(e) = s3.delete_object(key).await {
                     tracing::error!(book = %b.id, key = %key, "library: deleting a deleted book's object failed: {e:#}");
                 }
@@ -366,7 +378,7 @@ async fn delete_book(State(st): State<LibraryState>, v: Viewer, Path(id): Path<U
 
 /// Best-effort removal of objects an ingest wrote but no row references (a
 /// failed cover after the EPUB landed, the loser of a concurrent upload).
-async fn discard_objects(s3: &S3Config, keys: &[&str]) {
+pub(crate) async fn discard_objects(s3: &S3Config, keys: &[&str]) {
     for key in keys {
         if let Err(e) = s3.delete_object(key).await {
             tracing::error!(key = %key, "library: removing an unreferenced object failed: {e:#}");
@@ -379,11 +391,17 @@ async fn discard_objects(s3: &S3Config, keys: &[&str]) {
 /// A spooled upload: the file is removed on drop, so every path out of an
 /// ingest — success, parse error, S3 failure, oversized — leaves nothing
 /// on the box's small disk.
-struct Spool {
-    path: PathBuf,
+pub(crate) struct Spool {
+    pub(crate) path: PathBuf,
 }
 
 impl Spool {
+    /// A spool path in `dir` with nothing at it yet (a download writes it);
+    /// removed on drop like any other.
+    pub(crate) fn path_in(dir: &FsPath) -> Spool {
+        Spool { path: dir.join(format!("taisce-book-{}.epub", Uuid::now_v7())) }
+    }
+
     async fn create(dir: &FsPath) -> std::io::Result<(Spool, tokio::fs::File)> {
         let path = dir.join(format!("taisce-book-{}.epub", Uuid::now_v7()));
         let file = tokio::fs::File::create(&path).await?;
@@ -568,6 +586,10 @@ struct Inspected {
     identifier: Option<String>,
     /// Cover bytes + extension, already read out of the zip (bounded).
     cover: Option<(Vec<u8>, &'static str)>,
+    /// The cover's greyscale verdict (covers.rs); None without a cover.
+    cover_grey: Option<bool>,
+    /// The ISBNs among the identifiers, as ISBN-13.
+    isbns: Vec<String>,
 }
 
 /// What the identity rules say about an incoming file.
@@ -718,6 +740,7 @@ async fn add_book(
     };
     let now = crate::auth::now();
     let sha = inspected.sha256.clone();
+    let (cover_grey, isbns) = (inspected.cover_grey, inspected.isbns.join(","));
     let new_book = NewBook {
         title: inspected.title,
         author: inspected.author,
@@ -737,7 +760,8 @@ async fn add_book(
         if let Some(b) = s.book_find_by_sha256(user, &sha)? {
             return Ok(Added::Existing(b));
         }
-        Ok(Added::New(s.book_insert(id, &new_book, now)?))
+        s.book_insert(id, &new_book, now)?;
+        Ok(Added::New(s.book_set_cover_facts(id, cover_grey, Some(&isbns))?))
     })
     .await;
     let ours: Vec<&str> = std::iter::once(file_key.as_str()).chain(cover_key.as_deref()).collect();
@@ -797,6 +821,9 @@ async fn update_book(
     let sha = inspected.sha256.clone();
     let size = inspected.size as i64;
     let original_filename = filename.to_string();
+    // a re-upload with no cover keeps the old cover, and its verdict
+    let cover_grey = if inspected.cover.is_some() { inspected.cover_grey } else { existing.cover_grey };
+    let isbns = inspected.isbns.join(",");
     // a cover under a new extension leaves the old object unreferenced
     let stale_cover = existing.cover_s3_key.clone().filter(|old| cover_key.as_ref().is_some_and(|k| k != old));
     let written = with_store(&st.store, Scope::User(user), move |s| -> taisce_store::Result<Book> {
@@ -806,7 +833,8 @@ async fn update_book(
             Some(k) => s.book_set_cover(b.id, k, now)?,
             None => b,
         };
-        Ok(b)
+        // a colour cover the person chose stays chosen: only the facts move
+        s.book_set_cover_facts(b.id, cover_grey, Some(&isbns))
     })
     .await;
     match written {
@@ -837,7 +865,7 @@ async fn upload_cover(
     Ok(Some(key))
 }
 
-fn cover_content_type(ext: &str) -> &'static str {
+pub(crate) fn cover_content_type(ext: &str) -> &'static str {
     match ext {
         "jpg" => "image/jpeg",
         "png" => "image/png",
@@ -933,6 +961,7 @@ fn inspect_spool(path: &FsPath) -> Result<Inspected, String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| "the OPF has no dc:title".to_string())?;
+    let cover_grey = cover.as_ref().map(|(bytes, _)| crate::covers::cover_verdict(bytes));
     Ok(Inspected {
         sha256,
         size,
@@ -945,7 +974,21 @@ fn inspect_spool(path: &FsPath) -> Result<Inspected, String> {
         series_index: meta.series_index,
         identifier: meta.identifier,
         cover,
+        cover_grey,
+        isbns: meta.isbns,
     })
+}
+
+/// The ISBNs of a stored EPUB (a book shelved before they were kept):
+/// container.xml → the OPF → its identifiers, read in place.
+pub(crate) fn read_isbns(path: &FsPath) -> Result<Vec<String>, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("reading the spool: {e}"))?;
+    let mut zip = zip::ZipArchive::new(f).map_err(|e| format!("not an EPUB ({e})"))?;
+    let container = read_entry(&mut zip, "META-INF/container.xml", MAX_CONTAINER_BYTES)?;
+    let opf_path = container_rootfile(&container)?;
+    let opf = read_entry(&mut zip, &opf_path, MAX_OPF_BYTES)?;
+    let opf = String::from_utf8(opf).map_err(|_| "the OPF is not UTF-8".to_string())?;
+    Ok(parse_opf(&opf)?.isbns)
 }
 
 fn attr(
@@ -1040,6 +1083,8 @@ struct OpfMeta {
     series: Option<String>,
     series_index: Option<f64>,
     cover: Option<CoverRef>,
+    /// every identifier that is an ISBN (covers.rs), as ISBN-13
+    isbns: Vec<String>,
 }
 
 /// The OPF: dc:title / dc:creator / dc:identifier, the series (EPUB3
@@ -1051,7 +1096,8 @@ fn parse_opf(xml: &str) -> Result<OpfMeta, String> {
     use quick_xml::events::Event;
     let mut r = quick_xml::Reader::from_str(xml);
     let mut unique_id: Option<String> = None;
-    let mut identifiers: Vec<(Option<String>, String)> = Vec::new();
+    // (the id attribute, the text, the scheme attribute)
+    let mut identifiers: Vec<(Option<String>, String, Option<String>)> = Vec::new();
     let mut items: Vec<ManifestItem> = Vec::new();
     let mut cover_id: Option<String> = None;
     let mut calibre_series: Option<String> = None;
@@ -1071,8 +1117,9 @@ fn parse_opf(xml: &str) -> Result<OpfMeta, String> {
                 b"creator" if creator.is_none() => creator = Some(element_text(&mut r, e.name())?),
                 b"identifier" => {
                     let id = attr(&e, r.decoder(), "id");
+                    let scheme = attr(&e, r.decoder(), "opf:scheme").or_else(|| attr(&e, r.decoder(), "scheme"));
                     let text = element_text(&mut r, e.name())?;
-                    identifiers.push((id, text));
+                    identifiers.push((id, text, scheme));
                 }
                 b"meta" => {
                     // meta carries its value in content= (EPUB2/calibre) or
@@ -1138,9 +1185,9 @@ fn parse_opf(xml: &str) -> Result<OpfMeta, String> {
     // at one; otherwise the first dc:identifier stands for the book
     let identifier = unique_id
         .as_deref()
-        .and_then(|u| identifiers.iter().find(|(id, _)| id.as_deref() == Some(u)))
+        .and_then(|u| identifiers.iter().find(|(id, _, _)| id.as_deref() == Some(u)))
         .or_else(|| identifiers.first())
-        .map(|(_, t)| t.trim().to_string())
+        .map(|(_, t, _)| t.trim().to_string())
         .filter(|t| !t.is_empty());
     let (series, series_index) = match (&collection, &calibre_series) {
         (Some((name, coll_id)), _) => {
@@ -1166,6 +1213,9 @@ fn parse_opf(xml: &str) -> Result<OpfMeta, String> {
             href: i.href.clone(),
             media_type: i.media_type.clone(),
         });
+    let isbns = crate::covers::isbns_from_identifiers(
+        &identifiers.iter().map(|(_, t, scheme)| (scheme.clone(), t.clone())).collect::<Vec<_>>(),
+    );
     Ok(OpfMeta {
         title,
         creator,
@@ -1173,6 +1223,7 @@ fn parse_opf(xml: &str) -> Result<OpfMeta, String> {
         series,
         series_index,
         cover,
+        isbns,
     })
 }
 
@@ -1356,7 +1407,8 @@ pub async fn book_cover(
         Ok(b) => b,
         Err(r) => return r,
     };
-    let Some(key) = book.cover_s3_key else {
+    // the colour cover while it is the chosen one (covers.rs)
+    let Some(key) = book.shown_cover_key().map(str::to_owned) else {
         return not_found();
     };
     let content_type = cover_content_type(key.rsplit('.').next().unwrap_or(""));
@@ -1389,10 +1441,19 @@ async fn resolve_book(
 /// person's Viewer scopes the book (someone else's is 404), then the same
 /// presigned 302 an ereader gets. No `stream_downloads` here — a browser
 /// follows the redirect like any image.
+#[derive(Deserialize, Default)]
+struct CoverQuery {
+    /// "embedded": the book's own cover even while a colour one is shown
+    /// (the details' side-by-side); anything else = the shown cover
+    #[serde(default)]
+    which: Option<String>,
+}
+
 async fn person_cover(
     State(st): State<LibraryState>,
     v: Viewer,
     Path(id): Path<Uuid>,
+    Query(q): Query<CoverQuery>,
     method: Method,
 ) -> Response {
     let Some(s3) = st.s3.clone() else {
@@ -1405,7 +1466,12 @@ async fn person_cover(
         Ok(b) => b,
         Err(e) => return fail(e),
     };
-    let Some(key) = book.cover_s3_key else {
+    let key = if q.which.as_deref() == Some("embedded") {
+        book.cover_s3_key.clone()
+    } else {
+        book.shown_cover_key().map(str::to_owned)
+    };
+    let Some(key) = key else {
         return not_found();
     };
     redirect_object(&s3, &key, &method, None).await
@@ -1526,7 +1592,11 @@ pub fn router(state: LibraryState) -> Router {
             post(upload_books).layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
         )
         .route("/api/books/{id}", patch(patch_book).delete(delete_book))
-        .route("/api/books/{id}/cover", get(person_cover))
+        .route("/api/books/{id}/cover", get(person_cover).post(covers::choose_cover))
+        // colour covers (covers.rs)
+        .route("/api/books/cover-review", get(covers::review_get).post(covers::review_scan))
+        .route("/api/books/{id}/cover-candidates", get(covers::candidates_get).post(covers::candidates_find))
+        .route("/api/books/{id}/cover-candidates/{candidate}", get(covers::candidate_image))
         // the library is a person's shelf, not a connector surface (ADR
         // 0004); this travels with the router wherever it is merged
         .layer(axum::middleware::from_fn(
@@ -1780,6 +1850,7 @@ mod tests {
         app: Router,
         store: SharedStore,
         s3: Arc<S3Config>,
+        covers: Arc<crate::covers::OpenLibrary>,
         user: Uuid,
         human: Uuid,
         _dir: tempfile::TempDir,
@@ -1793,14 +1864,16 @@ mod tests {
         let store = SharedStore::new(raw);
         let dir = tempfile::tempdir().unwrap();
         let s3 = Arc::new(S3Config::for_test());
+        let covers = Arc::new(crate::covers::OpenLibrary::for_test());
         let app = router(LibraryState {
             store: store.clone(),
             s3: Some(s3.clone()),
             server_mode: true,
             local_human: human,
             spool_dir: dir.path().join("spool"),
+            covers: covers.clone(),
         });
-        TestLib { app, store, s3, user, human, _dir: dir }
+        TestLib { app, store, s3, covers, user, human, _dir: dir }
     }
 
     impl TestLib {
@@ -1984,4 +2057,127 @@ mod tests {
         assert_eq!(clean_filename("C:\\books\\Dune.epub"), "Dune.epub");
         assert_eq!(clean_filename("  "), "book.epub");
     }
+
+    /// An EPUB whose cover is a real image (grey or colour) and whose OPF
+    /// carries a calibre uuid as THE identifier and an ISBN beside it.
+    fn epub_with_image_cover(title: &str, cover: &[u8], extra: &str) -> Vec<u8> {
+        let opf = format!(
+            r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" xmlns:opf="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{title}</dc:title><dc:creator>Dan Abnett</dc:creator><dc:identifier id="uid" opf:scheme="calibre">6f1c9a0e-1111-2222-3333-{extra}</dc:identifier><dc:identifier opf:scheme="ISBN">1-84970-618-2</dc:identifier><meta name="cover" content="c"/></metadata><manifest><item id="c" href="cover.jpg" media-type="image/jpeg"/></manifest></package>"#
+        );
+        build_epub(&[("META-INF/container.xml", ROOT_CONTAINER.as_bytes()), ("content.opf", opf.as_bytes()), ("cover.jpg", cover)])
+    }
+
+    /// Ingest judges the cover and keeps the ISBNs; a colour cover the
+    /// person chose survives a re-upload (only the facts move) and goes
+    /// with the book on delete; the EPUB bytes are never touched.
+    #[tokio::test]
+    async fn ingest_flags_a_greyscale_cover_and_a_chosen_colour_cover_survives_updates() {
+        let t = test_lib();
+        let grey = crate::covers::tests::jpeg(200, 300, false);
+        let epub = epub_with_image_cover("Horus Rising", &grey, "444455556666");
+        let v = t.upload(&[("horus.epub", epub.clone())]).await;
+        let b = &v["results"][0]["book"];
+        assert_eq!((b["cover_greyscale"].as_bool(), b["cover_choice"].as_str(), b["has_cover"].as_bool()), (Some(true), Some("none"), Some(true)), "{v}");
+        let id: Uuid = b["id"].as_str().unwrap().parse().unwrap();
+        let row = t.store.lock(Scope::User(t.user)).book_get(id).unwrap();
+        assert_eq!(row.isbn_list(), ["9781849706186"], "the ISBN beside the calibre uuid");
+        let epub_key = row.file_s3_key.clone();
+        assert_eq!(t.s3.memory.objects.lock().unwrap()[&epub_key], epub, "stored byte for byte");
+
+        // a lookup (mocked Open Library) and a choice
+        let ol = &t.covers.mock;
+        ol.answer(crate::covers::OpenLibrary::isbn_cover_url("9781849706186").as_str(), 200, crate::covers::tests::jpeg(330, 500, true));
+        let (st, c) = t.send("POST", &format!("/api/books/{id}/cover-candidates"), None, vec![]).await;
+        assert_eq!(st, StatusCode::OK, "{c}");
+        assert_eq!(c["candidates"].as_array().unwrap().len(), 1, "{c}");
+        assert_eq!(c["candidates"][0]["source"], "isbn");
+        // cached: a second find asks Open Library nothing
+        let asked = ol.asked.lock().unwrap().len();
+        let (_, c2) = t.send("POST", &format!("/api/books/{id}/cover-candidates"), None, vec![]).await;
+        assert_eq!((c2["candidates"][0]["id"].clone(), ol.asked.lock().unwrap().len()), (c["candidates"][0]["id"].clone(), asked));
+        let cid = c["candidates"][0]["id"].as_str().unwrap().to_string();
+        let (st, b) = t.send("POST", &format!("/api/books/{id}/cover"), Some("application/json"), format!(r#"{{"candidate":"{cid}"}}"#).into_bytes()).await;
+        assert_eq!((st, b["cover_choice"].as_str(), b["has_color_cover"].as_bool()), (StatusCode::OK, Some("color"), Some(true)), "{b}");
+        assert!(b["cover_version"].as_i64().unwrap() > 0);
+        let color_key = format!("library/{}/{id}.cover-color.jpg", t.user);
+        assert_eq!(t.s3.memory.objects.lock().unwrap()[&epub_key], epub, "the EPUB is untouched");
+        assert!(t.s3.memory.keys().contains(&color_key));
+
+        // a pass's accept on a chosen book: 409, nothing moves
+        let (st, b) = t.send("POST", &format!("/api/books/{id}/cover"), Some("application/json"), br#"{"use":"embedded","unless_chosen":true}"#.to_vec()).await;
+        assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("cover_chosen")), "{b}");
+        assert_eq!(t.store.lock(Scope::User(t.user)).book_get(id).unwrap().cover_choice, taisce_store::books::CoverChoice::Color);
+
+        // a re-upload (same identifier, new bytes, a colour cover inside)
+        let v = t.upload(&[("horus-v2.epub", epub_with_image_cover("Horus Rising", &crate::covers::tests::jpeg(200, 300, true), "444455556666"))]).await;
+        assert_eq!(v["results"][0]["status"], "updated", "{v}");
+        let b = &v["results"][0]["book"];
+        assert_eq!((b["cover_greyscale"].as_bool(), b["cover_choice"].as_str(), b["has_color_cover"].as_bool()), (Some(false), Some("color"), Some(true)), "the choice stays: {v}");
+
+        // revert: the colour object goes, the book's own shows
+        let (st, b) = t.send("POST", &format!("/api/books/{id}/cover"), Some("application/json"), br#"{"use":"embedded"}"#.to_vec()).await;
+        assert_eq!((st, b["cover_choice"].as_str(), b["has_color_cover"].as_bool()), (StatusCode::OK, Some("embedded"), Some(false)), "{b}");
+        assert!(!t.s3.memory.keys().contains(&color_key), "{:?}", t.s3.memory.keys());
+        // bad bodies
+        for bad in [r#"{}"#, r#"{"use":"colour"}"#, r#"{"candidate":"00000000-0000-0000-0000-000000000000","use":"embedded"}"#] {
+            let (st, _) = t.send("POST", &format!("/api/books/{id}/cover"), Some("application/json"), bad.as_bytes().to_vec()).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let (st, _) = t.send("POST", &format!("/api/books/{id}/cover"), Some("application/json"), format!(r#"{{"candidate":"{cid}"}}"#).into_bytes()).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "choosing drops the cache: the old candidate is gone");
+
+        // choose colour again, then delete: every object goes
+        let (_, c) = t.send("POST", &format!("/api/books/{id}/cover-candidates"), Some("application/json"), br#"{"refresh":true}"#.to_vec()).await;
+        let cid = c["candidates"][0]["id"].as_str().unwrap_or_else(|| panic!("{c}")).to_string();
+        let (st, _) = t.send("POST", &format!("/api/books/{id}/cover"), Some("application/json"), format!(r#"{{"candidate":"{cid}"}}"#).into_bytes()).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = t.send("DELETE", &format!("/api/books/{id}"), None, vec![]).await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        assert!(t.s3.memory.keys().is_empty(), "{:?}", t.s3.memory.keys());
+    }
+
+    /// The review: a book shelved before detection (no verdict) is judged
+    /// from its stored cover; Open Library failing is "unavailable", never
+    /// a cached "none found".
+    #[tokio::test]
+    async fn the_review_judges_old_covers_and_a_failed_lookup_is_not_cached() {
+        let t = test_lib();
+        let id = Uuid::now_v7();
+        let key = format!("library/{}/{id}.cover.jpg", t.user);
+        t.s3.memory.objects.lock().unwrap().insert(key.clone(), crate::covers::tests::jpeg(200, 300, false));
+        t.store.lock(Scope::User(t.user)).book_insert(id, &NewBook {
+            title: "Foundation".into(),
+            author: "Isaac Asimov".into(),
+            series: None,
+            series_index: None,
+            book_identifier: None,
+            original_filename: "f.epub".into(),
+            file_sha256: "sha".into(),
+            size: 1,
+            file_s3_key: format!("library/{}/{id}.epub", t.user),
+            cover_s3_key: Some(key),
+        }, 10).unwrap();
+        let (_, r) = t.send("GET", "/api/books/cover-review", None, vec![]).await;
+        assert_eq!((r["greyscale"].as_u64(), r["unscanned"].as_u64()), (Some(0), Some(1)), "{r}");
+        let (st, r) = t.send("POST", "/api/books/cover-review", None, vec![]).await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        assert_eq!((r["scanned"].as_u64(), r["greyscale"].as_u64(), r["unscanned"].as_u64()), (Some(1), Some(1), Some(0)), "{r}");
+        assert_eq!((r["books"][0]["looked_up"].as_bool(), r["books"][0]["best"].is_null()), (Some(false), true));
+        // Open Library down: unavailable, nothing stamped
+        t.covers.mock.answer(crate::covers::OpenLibrary::search_url("Foundation", "Isaac Asimov").as_str(), 503, "");
+        let (st, c) = t.send("POST", &format!("/api/books/{id}/cover-candidates"), None, vec![]).await;
+        assert_eq!((st, c["unavailable"].as_bool()), (StatusCode::OK, Some(true)), "{c}");
+        assert!(c["looked_up_at"].is_null(), "{c}");
+        // back up, with nothing to offer: a real, cached "none found"
+        t.covers.mock.answer(crate::covers::OpenLibrary::search_url("Foundation", "Isaac Asimov").as_str(), 200, r#"{"docs":[]}"#);
+        let (_, c) = t.send("POST", &format!("/api/books/{id}/cover-candidates"), None, vec![]).await;
+        assert_eq!((c["unavailable"].as_bool(), c["candidates"].as_array().map(Vec::len)), (Some(false), Some(0)), "{c}");
+        assert!(c["looked_up_at"].is_string());
+        let (_, r) = t.send("GET", "/api/books/cover-review", None, vec![]).await;
+        assert_eq!(r["books"][0]["looked_up"], true, "{r}");
+        // a GET never writes: the cache read leaves no stamp behind
+        let (st, _) = t.send("GET", &format!("/api/books/{id}/cover-candidates"), None, vec![]).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
 }

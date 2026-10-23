@@ -322,6 +322,88 @@ impl S3Config {
 }
 
 impl S3Config {
+    /// GET an object whole, refusing one over `cap` bytes (a cover: the
+    /// colour-cover review reads covers stored before it existed). `None`
+    /// when there is no such object.
+    pub async fn get_bytes(&self, key: &str, cap: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        #[cfg(test)]
+        {
+            let got = self.memory.objects.lock().unwrap().get(key).cloned();
+            if got.as_ref().is_some_and(|b| b.len() > cap) {
+                anyhow::bail!("S3 GET {key}: over the {cap}-byte cap");
+            }
+            return Ok(got);
+        }
+        #[allow(unreachable_code)]
+        let Some(mut res) = self.get_response(key).await? else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        while let Some(chunk) = res.chunk().await? {
+            if out.len() + chunk.len() > cap {
+                anyhow::bail!("S3 GET {key}: over the {cap}-byte cap");
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(Some(out))
+    }
+
+    /// GET an object into a file, streaming (an EPUB the colour-cover
+    /// lookup reads the ISBNs of: never whole in memory), refusing one over
+    /// `cap` bytes. False when there is no such object.
+    pub async fn get_to_file(&self, key: &str, path: &std::path::Path, cap: u64) -> anyhow::Result<bool> {
+        #[cfg(test)]
+        {
+            let got = self.memory.objects.lock().unwrap().get(key).cloned();
+            return match got {
+                None => Ok(false),
+                Some(b) if b.len() as u64 > cap => anyhow::bail!("S3 GET {key}: over the {cap}-byte cap"),
+                Some(b) => {
+                    tokio::fs::write(path, b).await?;
+                    Ok(true)
+                }
+            };
+        }
+        #[allow(unreachable_code)]
+        {
+            use tokio::io::AsyncWriteExt as _;
+            let Some(mut res) = self.get_response(key).await? else {
+                return Ok(false);
+            };
+            let mut file = tokio::fs::File::create(path).await?;
+            let mut written: u64 = 0;
+            while let Some(chunk) = res.chunk().await? {
+                written += chunk.len() as u64;
+                if written > cap {
+                    anyhow::bail!("S3 GET {key}: over the {cap}-byte cap");
+                }
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await?;
+            Ok(true)
+        }
+    }
+
+    /// A presigned GET's response: `None` on 404, an error on any other
+    /// refusal (S3's message excerpted).
+    #[cfg_attr(test, allow(dead_code))]
+    async fn get_response(&self, key: &str) -> anyhow::Result<Option<reqwest::Response>> {
+        let url = self.presign_get(key, Method::Get, None, PRESIGN_TTL).await?;
+        let res = self.http.get(url).send().await?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            let excerpt: String = body.chars().take(300).collect();
+            anyhow::bail!("S3 GET {key}: {status} {excerpt}");
+        }
+        Ok(Some(res))
+    }
+}
+
+impl S3Config {
     /// DELETE an object. On the versioned bucket this only adds a delete
     /// marker: the object becomes a noncurrent version, which the bucket's
     /// lifecycle expires after 30 days (the undo window). A key that does
