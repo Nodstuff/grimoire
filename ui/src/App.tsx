@@ -566,7 +566,7 @@ export default function App() {
       screen = <Library docs={docs} workspace={route.workspace ?? 'all'} workspaces={workspaces} onNewDoc={() => setPalette('newdoc')} />
       break
     case 'review':
-      screen = <ReviewQueue onChange={setQueueCount} onOpenDoc={openDoc} dataVersion={dataVersion} />
+      screen = <ReviewQueue onChange={setQueueCount} onOpenDoc={openDoc} dataVersion={dataVersion} docs={docs} workspaces={workspaces} />
       break
     case 'search':
       screen = <SearchScreen q={route.q} onOpenDoc={openDoc} />

@@ -480,18 +480,7 @@ kbd {
   outline: none;
 }
 
-.card.flag { border-left: 3px solid var(--accent); }
-.flag-text { font-size: 13px; margin: 6px 0; white-space: pre-wrap; }
 
-.bulk-bar {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  background: var(--card);
-  border: 1px solid var(--line2);
-  border-radius: 10px;
-  padding: 8px 14px;
-}
 .bulk-decline {
   background: none;
   color: var(--red);
