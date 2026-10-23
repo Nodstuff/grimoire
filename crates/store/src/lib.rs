@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod books;
+pub mod epub;
 pub mod export;
 pub mod gate;
 pub mod idempotency;

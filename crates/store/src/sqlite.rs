@@ -490,7 +490,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -551,6 +551,8 @@ fn backfill(conn: &Connection) -> Result<()> {
     // Created IF NOT EXISTS by init; nothing to backfill.
     // v12: book upload tokens (books.sql: upload_token). Created IF NOT
     // EXISTS by init; nothing to backfill.
+    // v13: diagram images for docs sent to e-readers (books.sql:
+    // epub_image). Created IF NOT EXISTS by init; nothing to backfill.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -707,7 +709,7 @@ fn wikilinks(content: &str) -> Vec<String> {
 }
 
 /// Tags from a frontmatter block: `tags:` followed by `- item` lines.
-fn frontmatter_tags(content: &str) -> Vec<String> {
+pub(crate) fn frontmatter_tags(content: &str) -> Vec<String> {
     if !content.starts_with("---") {
         return Vec::new();
     }
@@ -948,7 +950,7 @@ fn apply_in_tx(
 }
 
 /// Fetch a block by id, any doc, tombstoned ones included (unscoped).
-fn block_by_id_conn(conn: &Connection, id: Uuid) -> Result<Option<Block>> {
+pub(crate) fn block_by_id_conn(conn: &Connection, id: Uuid) -> Result<Option<Block>> {
     let mut stmt = conn.prepare_cached(&format!("SELECT {BLOCK_COLS} FROM blocks WHERE id = ?1"))?;
     stmt.query_row(params![id.to_string()], row_to_block).optional()?.map(build_block).transpose()
 }

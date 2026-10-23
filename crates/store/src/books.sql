@@ -96,3 +96,27 @@ CREATE TABLE IF NOT EXISTS kosync_progress (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (user_id, document)
 );
+
+-- Diagram images for docs sent to e-readers (schema v13, epub.rs): the web
+-- app rasterizes a doc's mermaid/d2/reladraw/vega fences to PNG (the
+-- server cannot draw them) and uploads them here, keyed by the block and a
+-- hash of the fence's source, so an edited diagram's old picture is never
+-- used (the EPUB falls back to the source). One copy per uploader
+-- (`owner_key` = the auth_users id, '' for LOCAL mode): a render for one
+-- person only ever uses pictures that person uploaded.
+CREATE TABLE IF NOT EXISTS epub_image (
+    owner_key   TEXT NOT NULL,
+    doc_id      TEXT NOT NULL,
+    block_id    TEXT NOT NULL,
+    -- SHA-256 (hex) of `lang + "\n" + normalized source` (epub.rs)
+    source_hash TEXT NOT NULL,
+    png         BLOB NOT NULL,
+    width       INTEGER NOT NULL,
+    height      INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (owner_key, block_id, source_hash)
+);
+CREATE INDEX IF NOT EXISTS epub_image_by_doc ON epub_image (owner_key, doc_id);
+CREATE TRIGGER IF NOT EXISTS epub_image_doc_purged AFTER DELETE ON docs BEGIN
+    DELETE FROM epub_image WHERE doc_id = OLD.id;
+END;
