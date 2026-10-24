@@ -13,8 +13,9 @@
 //!   `<Author> - <Title>.epub`, a doc's `Taisce - <Title>.epub`), or
 //!   `position: null`. `percentage` is the protocol's 0..1 fraction and
 //!   `timestamp` unix seconds, as a device would read them.
-//! - `PUT …/position {progress, percentage, device_id, base}` → the same
-//!   shape, written as device "Taisce web" with the server's clock, so
+//! - `PUT …/position {progress, percentage, device_id, base, device?}` → the
+//!   same shape, written as `device` (the Apple app's "Taisce on iPhone";
+//!   absent: "Taisce web", the browser's) with the server's clock, so
 //!   newest-wins against the devices holds as it does for them. One guard
 //!   on top: `base` is the timestamp of the row the reader last saw. When
 //!   the stored row came from ANOTHER device and is newer than `base`, the
@@ -192,6 +193,23 @@ struct PositionIn {
     /// The timestamp of the row the reader last saw (0: none).
     #[serde(default)]
     base: i64,
+    /// The name other devices show for this one ("Taisce on iPad"); absent
+    /// or blank: "Taisce web".
+    #[serde(default)]
+    device: Option<String>,
+}
+
+/// The device name a write carries: the client's own, trimmed (at most
+/// `MAX_LABEL` bytes, no control characters), else "Taisce web".
+pub(crate) fn device_name(given: Option<&str>) -> Result<String, String> {
+    let name = given.map(str::trim).unwrap_or("");
+    if name.is_empty() {
+        return Ok(DEVICE.to_string());
+    }
+    if name.len() > MAX_LABEL || name.chars().any(char::is_control) {
+        return Err(format!("device: 1-{MAX_LABEL} bytes, no control characters"));
+    }
+    Ok(name.to_string())
 }
 
 /// The write's outcome under one store lock: written, or refused because
@@ -209,6 +227,7 @@ pub(crate) fn put_position(
     document: &str,
     progress: &str,
     percentage: f64,
+    device: &str,
     device_id: &str,
     base: i64,
     now: i64,
@@ -219,7 +238,7 @@ pub(crate) fn put_position(
     {
         return Ok(Some(cur));
     }
-    s.kosync_upsert(user, document, progress, percentage, DEVICE, device_id, now)?;
+    s.kosync_upsert(user, document, progress, percentage, device, device_id, now)?;
     Ok(None)
 }
 
@@ -241,10 +260,14 @@ async fn put(st: ReaderState, v: Viewer, headers: HeaderMap, item: Item, body: R
     if req.device_id.trim().is_empty() || req.device_id.len() > MAX_LABEL {
         return err(StatusCode::BAD_REQUEST, format!("device_id: 1-{MAX_LABEL} chars"));
     }
+    let device = match device_name(req.device.as_deref()) {
+        Ok(d) => d,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
     let ts = crate::auth::now();
     let out = with_store(&st.store, v.scope, move |s| -> taisce_store::Result<Put> {
         let d = digest(s, item, user)?;
-        match put_position(s, user, &d, &req.progress, req.percentage, &req.device_id, req.base, ts)? {
+        match put_position(s, user, &d, &req.progress, req.percentage, &device, &req.device_id, req.base, ts)? {
             Some(newer) => Ok(Put::Newer(d, newer)),
             None => {
                 let row = s.kosync_get(user, &d)?.ok_or_else(|| StoreError::NotFound("position".into()))?;
@@ -321,11 +344,11 @@ mod tests {
     fn the_reader_writes_as_taisce_web_and_newest_wins() {
         let (store, user) = store();
         let mut s = store.lock(Scope::User(user));
-        assert!(put_position(&mut s, user, DOC, "/body/DocFragment[2]/body/p[1]/text()[1].0", 0.1, "web-1", 0, 100).unwrap().is_none());
+        assert!(put_position(&mut s, user, DOC, "/body/DocFragment[2]/body/p[1]/text()[1].0", 0.1, DEVICE, "web-1", 0, 100).unwrap().is_none());
         let row = s.kosync_get(user, DOC).unwrap().unwrap();
         assert_eq!((row.device.as_str(), row.device_id.as_str(), row.updated_at, row.percentage), (DEVICE, "web-1", 100, 0.1));
         // its own later write moves it, whatever base it carries
-        assert!(put_position(&mut s, user, DOC, "/x", 0.2, "web-1", 0, 110).unwrap().is_none());
+        assert!(put_position(&mut s, user, DOC, "/x", 0.2, DEVICE, "web-1", 0, 110).unwrap().is_none());
         assert_eq!(s.kosync_get(user, DOC).unwrap().unwrap().progress, "/x");
     }
 
@@ -336,15 +359,30 @@ mod tests {
         // the reader saw nothing; then the Kindle pushes at 200
         s.kosync_upsert(user, DOC, "/kindle", 0.57, "KindlePaperWhite6", "kpw6", 200).unwrap();
         // a write based on an older look is refused with the Kindle's row
-        let newer = put_position(&mut s, user, DOC, "/web", 0.1, "web-1", 150, 210).unwrap().unwrap();
+        let newer = put_position(&mut s, user, DOC, "/web", 0.1, DEVICE, "web-1", 150, 210).unwrap().unwrap();
         assert_eq!((newer.device.as_str(), newer.progress.as_str()), ("KindlePaperWhite6", "/kindle"));
         assert_eq!(s.kosync_get(user, DOC).unwrap().unwrap().progress, "/kindle", "unmoved");
         // once the reader has seen it (base = its stamp), the next turn wins
-        assert!(put_position(&mut s, user, DOC, "/web", 0.58, "web-1", 200, 220).unwrap().is_none());
+        assert!(put_position(&mut s, user, DOC, "/web", 0.58, DEVICE, "web-1", 200, 220).unwrap().is_none());
         let row = s.kosync_get(user, DOC).unwrap().unwrap();
         assert_eq!((row.progress.as_str(), row.device.as_str(), row.updated_at), ("/web", DEVICE, 220));
         // another browser is another device: the same guard applies
-        assert!(put_position(&mut s, user, DOC, "/other", 0.3, "web-2", 0, 230).unwrap().is_some());
+        assert!(put_position(&mut s, user, DOC, "/other", 0.3, DEVICE, "web-2", 0, 230).unwrap().is_some());
+    }
+
+    #[test]
+    fn the_app_names_itself_and_a_blank_name_is_the_browser() {
+        assert_eq!(device_name(None).unwrap(), DEVICE);
+        assert_eq!(device_name(Some("   ")).unwrap(), DEVICE);
+        assert_eq!(device_name(Some(" Taisce on iPad ")).unwrap(), "Taisce on iPad");
+        assert!(device_name(Some("a\nb")).is_err(), "no control characters");
+        assert!(device_name(Some(&"x".repeat(MAX_LABEL + 1))).is_err(), "bounded like the kosync labels");
+        // the row carries it, so a Kindle's sync prompt names the iPad
+        let (store, user) = store();
+        let mut s = store.lock(Scope::User(user));
+        assert!(put_position(&mut s, user, DOC, "/ipad", 0.4, "Taisce on iPad", "app-1", 0, 100).unwrap().is_none());
+        let row = s.kosync_get(user, DOC).unwrap().unwrap();
+        assert_eq!((row.device.as_str(), row.device_id.as_str()), ("Taisce on iPad", "app-1"));
     }
 
     #[test]
