@@ -185,7 +185,11 @@ final class BooksUITests: XCTestCase {
         shot(app, "reader-resumed")
 
         // the Kindle moves on while we're away: back in front, we go there
+        #if targetEnvironment(macCatalyst)
+        app.typeKey("h", modifierFlags: .command) // Hide: the app leaves the front
+        #else
         XCUIDevice.shared.press(.home)
+        #endif
         RunLoop.current.run(until: Date().addingTimeInterval(2))
         // an XPointer this copy can't resolve: the reader goes by the percentage
         let elsewhere = "/body/DocFragment[999]/body/p[1]/text()[1].0"

@@ -55,6 +55,37 @@ private let picker = WorkspacePicker(workspaces: [work, home], unsortedCount: 2,
         #expect(r.sidebarSelection == .todos)
     }
 
+    @Test func openActionsSidebarAndBooksCommands() {
+        let r = Router()
+        r.isPad = true
+        // ⌘O: Search with docs, the field focused
+        _ = r.perform(.open, picker: picker)
+        #expect(r.padItem == .search && r.searchScopeRequest == .docs)
+        // ⌘K: the palette
+        _ = r.perform(.actions, picker: picker)
+        #expect(r.showActions)
+        // ⌘\: the sidebar goes and comes back (split view only)
+        _ = r.perform(.toggleSidebar, picker: picker)
+        #expect(r.sidebarHidden)
+        _ = r.perform(.toggleSidebar, picker: picker)
+        #expect(!r.sidebarHidden)
+        #expect(!Router().canPerform(.toggleSidebar, signedIn: true, picker: picker), "a phone has no sidebar")
+        // ⌥⌘N: a child of the doc in front, only with one
+        #expect(!r.canPerform(.newDocHere, signedIn: true, picker: picker))
+        r.select(.doc("d1"))
+        #expect(r.canPerform(.newDocHere, signedIn: true, picker: picker))
+        _ = r.perform(.newDocHere, picker: picker)
+        #expect(r.showNewDoc && r.newDocParent == "d1")
+        // ⇧⌘I: Books, then the picker
+        let before = r.addBooksRequest
+        _ = r.perform(.addBooks, picker: picker)
+        #expect(r.padItem == .books && r.addBooksRequest == before + 1)
+        // the palette lists what applies, by words in any order
+        let names = ActionsPalette.matching("doc new") { _ in true }.map(\.title)
+        #expect(names.contains("New Doc") && names.contains("New Doc Inside This One") && !names.contains("Books"))
+        #expect(ActionsPalette.matching("") { $0 != .exportPDF }.allSatisfy { $0.command != .exportPDF })
+    }
+
     @Test func nothingRunsBeforeSignIn() {
         let r = Router()
         for c in [AppCommand.newDoc, .search, .refresh, .settings, .today, .todos, .workspace(1)] {
@@ -130,6 +161,10 @@ private let picker = WorkspacePicker(workspaces: [work, home], unsortedCount: 2,
         #expect(MacWindow.size(replacing: CGSize(width: 1024, height: 768)) == MacWindow.initial)
         #expect(MacWindow.size(replacing: CGSize(width: 1400, height: 900)) == nil)
         #expect(MacWindow.initial.width >= MacWindow.minimum.width && MacWindow.initial.height >= MacWindow.minimum.height)
+        // grown around the system's centre, never past the top-left corner
+        let placed = CGRect(x: 223, y: 72, width: 1024, height: 768)
+        #expect(MacWindow.grown(placed, to: MacWindow.initial) == CGRect(x: 95, y: 26, width: 1280, height: 860))
+        #expect(MacWindow.grown(CGRect(x: 10, y: 0, width: 1024, height: 768), to: MacWindow.initial).origin == .zero)
     }
 }
 #endif

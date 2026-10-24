@@ -32,7 +32,11 @@ struct TaisceCommands: Commands {
         #endif
         CommandGroup(replacing: .newItem) {
             item("New Doc", .newDoc).keyboardShortcut("n")
+            item("New Doc Inside This One", .newDocHere).keyboardShortcut("n", modifiers: [.command, .option])
             item("New Folder", .newFolder).keyboardShortcut("n", modifiers: [.command, .shift])
+            Divider()
+            item("Open Doc\u{2026}", .open).keyboardShortcut("o")
+            item("Add EPUBs\u{2026}", .addBooks).keyboardShortcut("i", modifiers: [.command, .shift])
         }
         // ⌥⌘E (⇧⌘E is inline code in the editor)
         CommandGroup(replacing: .importExport) {
@@ -50,10 +54,18 @@ struct TaisceCommands: Commands {
             Divider()
             item("Share Link\u{2026}", .shareLink)
         }
+        // the system's View › Toggle Sidebar keeps ⌃⌘S; ⌘\ is ours, as on the web
+        CommandGroup(after: .sidebar) {
+            item("Show or Hide Sidebar", .toggleSidebar).keyboardShortcut("\\")
+        }
         CommandMenu("Go") {
+            item("Actions\u{2026}", .actions).keyboardShortcut("k")
             item("Search", .search).keyboardShortcut("f", modifiers: [.command, .shift])
+            Divider()
             item("Today", .today)
             item("To-dos", .todos)
+            item("Review", .review)
+            item("Books", .books)
             if model.hasWorkspaces {
                 Divider()
                 let picker = model.workspacePicker
@@ -78,11 +90,7 @@ struct TaisceCommands: Commands {
 
     private func run(_ command: AppCommand) {
         guard let router else { return }
-        switch router.perform(command, picker: model.workspacePicker) {
-        case .none: break
-        case .refresh: Task { try? await model.sync?.catchUp() }
-        case .selectWorkspace(let scope): model.selectWorkspace(scope)
-        }
+        model.apply(router.perform(command, picker: model.workspacePicker))
     }
 }
 
@@ -98,6 +106,15 @@ enum MacWindow {
     static func size(replacing current: CGSize) -> CGSize? {
         current == catalystDefault ? initial : nil
     }
+
+    /// The bigger window around the same centre the system chose for the
+    /// default one (it placed that on screen; growing from its corner ran a
+    /// 1280 pt window off a MacBook Air's right edge).
+    static func grown(_ frame: CGRect, to size: CGSize) -> CGRect {
+        let x = max(0, frame.midX - size.width / 2)
+        let y = max(0, frame.midY - size.height / 2)
+        return CGRect(x: x, y: y, width: size.width, height: size.height)
+    }
 }
 
 /// Finds the window scene from inside SwiftUI and sizes it.
@@ -110,11 +127,14 @@ struct MacWindowSetup: UIViewRepresentable {
             super.didMoveToWindow()
             guard let scene = window?.windowScene else { return }
             scene.sizeRestrictions?.minimumSize = MacWindow.minimum
+            // the sidebar carries "◆ Taisce"; the bar shows the screen's own
+            // title (a doc's crumbs and save state), not the app's name again
+            scene.titlebar?.titleVisibility = .hidden
             // after the scene has finished connecting, or the request is dropped
             DispatchQueue.main.async {
                 let frame = scene.effectiveGeometry.systemFrame
                 guard let size = MacWindow.size(replacing: frame.size) else { return }
-                scene.requestGeometryUpdate(.Mac(systemFrame: CGRect(origin: frame.origin, size: size)))
+                scene.requestGeometryUpdate(.Mac(systemFrame: MacWindow.grown(frame, to: size)))
             }
         }
     }

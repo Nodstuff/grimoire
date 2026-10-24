@@ -85,10 +85,13 @@ struct RootView: View {
         .environment(\.coverImageLoader, model.books.coverLoader)
         .tint(Color.lapis.accent)
         .sheet(isPresented: $router.showSettings) { SettingsScreen() }
+        .sheet(isPresented: $router.showActions) { ActionsPalette().environment(model).environment(router) }
         .sheet(isPresented: $router.showNewDoc) {
             NewDocSheet(parent: router.newDocParent).environment(router)
         }
         .modifier(NewFolderPrompt(router: router, model: model))
+        // the cover's own hosting on the Mac doesn't inherit the window's model: hand it over
+        .fullScreenCover(item: $router.readingBook) { BookReaderScreen(bookID: $0.id).environment(model).environment(router) }
         #if DEBUG
         .modifier(SignInRelayAutoStart())
         #endif
@@ -305,7 +308,10 @@ struct PadRoot: View {
 
     var body: some View {
         @Bindable var router = router
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: Binding(
+            get: { router.sidebarHidden ? .detailOnly : .automatic },
+            set: { router.sidebarHidden = $0 == .detailOnly }
+        )) {
             PadSidebar().modifier(DocDeleteHost()).modifier(DocMoveHost())
         } detail: {
             NavigationStack(path: $router.padPath) {
@@ -580,7 +586,7 @@ private struct SidebarItem: View {
             }
         }
         .padding(.horizontal, 10)
-        .frame(maxWidth: .infinity, minHeight: Lapis.Layout.minTarget, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: Lapis.Layout.sidebarRow, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: Lapis.Radius.field, style: .continuous)
             .fill(selected ? Color.lapis.accentSoft : pointer ? Color.lapis.hover : .clear))
         .contentShape(.rect)

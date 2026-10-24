@@ -195,11 +195,12 @@ private func item(_ id: String, _ kind: ReviewQueueItem.Kind, by proposer: Strin
     @Test func continueReadingOpensTheReaderOverBooks() {
         let phone = Router()
         phone.readBook("b1")
-        #expect(phone.tab == .books && phone.booksPath == [.bookReader("b1")])
+        // the reader covers the window; Books is underneath for when it closes
+        #expect(phone.tab == .books && phone.booksPath.isEmpty && phone.readingBook?.id == "b1")
         let pad = Router()
         pad.isPad = true
         pad.readBook("b1")
-        #expect(pad.padItem == .books && pad.padPath == [.bookReader("b1")] && pad.sidebarSelection == .books)
+        #expect(pad.padItem == .books && pad.padPath.isEmpty && pad.sidebarSelection == .books && pad.readingBook?.id == "b1")
         pad.showBooks()
         #expect(pad.padPath.isEmpty && pad.sidebarSelection == .books)
     }

@@ -90,7 +90,7 @@ private struct BookSidebarRow: View {
         }
         .padding(.leading, 44)
         .padding(.trailing, 10)
-        .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: Lapis.Layout.sidebarRow - 6, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: Lapis.Radius.field, style: .continuous)
             .fill(selected ? Color.lapis.hover : pointer ? Color.lapis.hover.opacity(0.6) : .clear))
         .contentShape(.rect)

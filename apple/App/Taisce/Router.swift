@@ -17,6 +17,11 @@ enum Route: Hashable {
     case bookReader(String)
 }
 
+/// A book to open in the reader (`Router.readingBook`).
+struct ReadingTarget: Identifiable, Hashable {
+    let id: String
+}
+
 /// iPad and Mac sidebar selection.
 enum PadItem: Hashable {
     case today, todos, review, books, search
@@ -26,6 +31,17 @@ enum PadItem: Hashable {
 /// A menu-bar command (the Mac's menus, an iPad's hardware keyboard).
 enum AppCommand: Hashable {
     case newDoc, newFolder, search, refresh, settings, today, todos
+    /// ⌘O: open a doc by title (Search, docs, the field focused)
+    case open
+    /// ⌘K: the actions palette
+    case actions
+    /// ⌘\ (and ⌘T, the web's tree key): show or hide the sidebar (split view)
+    case toggleSidebar
+    /// ⌥⌘N: a new doc inside the doc in front
+    case newDocHere
+    /// ⇧⌘I: Books, then the EPUB picker
+    case addBooks
+    case books, review
     /// ⌘F: find in the doc in front (Decision 2: ⇧⌘F is Search)
     case findInDoc
     /// the doc in front: Share link… and Export as PDF… (SERVER mode)
@@ -95,6 +111,14 @@ final class Router {
     var docAction: DocAction?
     /// ⌘F on the split view: bumped to focus the sidebar's search field
     private(set) var searchFocusRequest = 0
+    /// ⌘O: Search should show docs (set with the focus request)
+    var searchScopeRequest: SearchScope?
+    /// ⌘K: the actions palette
+    var showActions = false
+    /// the split view's sidebar hidden (⌘\)
+    var sidebarHidden = false
+    /// ⇧⌘I: bumped for Books to open its EPUB picker
+    private(set) var addBooksRequest = 0
 
     func open(_ route: Route) {
         if isPad {
@@ -162,15 +186,20 @@ final class Router {
         if isPad { select(.books) } else { tab = .books }
     }
 
-    /// A book's reader (Today's Continue reading), over Books so Back lands there.
+    /// The book open in the reader, full screen over the window (iPad and
+    /// Mac included: a reader squeezed beside the sidebar cut its spread).
+    var readingBook: ReadingTarget?
+
+    /// A book's reader (Today's Continue reading): Books underneath, so
+    /// closing the reader lands there.
     func readBook(_ id: String) {
         if isPad {
             select(.books)
-            padPath = [.bookReader(id)]
         } else {
             tab = .books
-            booksPath = [.bookReader(id)]
+            booksPath = []
         }
+        readingBook = ReadingTarget(id: id)
     }
 
     /// The doc at the front of this window: the top of the visible stack.
@@ -204,7 +233,9 @@ final class Router {
         case .exportPDF:
             // reading is enough to print
             return shares && focusedDoc != nil
-        case .newDoc, .newFolder: return canCreate
+        case .newDoc, .newFolder, .addBooks: return canCreate
+        case .newDocHere: return canCreate && focusedDoc != nil
+        case .toggleSidebar: return isPad
         case .findInDoc: return focusedDoc != nil
         case .workspace(let n): return picker.shortcut(n) != nil
         default: return true
@@ -253,6 +284,23 @@ final class Router {
         case .search:
             showSearch()
             if isPad { searchFocusRequest += 1 }
+        case .open:
+            searchScopeRequest = .docs
+            showSearch()
+            searchFocusRequest += 1
+        case .actions:
+            showActions = true
+        case .toggleSidebar:
+            if isPad { sidebarHidden.toggle() }
+        case .newDocHere:
+            newDoc(in: focusedDoc)
+        case .addBooks:
+            showBooks()
+            addBooksRequest += 1
+        case .books:
+            showBooks()
+        case .review:
+            showReview()
         case .refresh:
             return .refresh
         case .findInDoc:

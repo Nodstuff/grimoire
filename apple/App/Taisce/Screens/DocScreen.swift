@@ -157,11 +157,21 @@ struct DocScreen: View {
     /// iPad and the Mac: the crumbs, then share, … and the inspector toggle.
     @ToolbarContentBuilder
     private func surfaceToolbar(_ surface: SurfaceModel) -> some ToolbarContent {
+        // the Mac's bar shows no principal item: the title leads there (Mac-Main)
+        #if targetEnvironment(macCatalyst)
+        ToolbarItem(placement: .navigation) {
+            DocBarTitle(title: title, crumbs: model.index.ancestors(of: docID).map(\.title),
+                        workspace: model.workspaceBadge(for: docID)?.name,
+                        save: saveState(surface), wide: sizeClass == .regular)
+        }
+        .sharedBackgroundVisibility(.hidden)
+        #else
         ToolbarItem(placement: .principal) {
             DocBarTitle(title: title, crumbs: model.index.ancestors(of: docID).map(\.title),
                         workspace: model.workspaceBadge(for: docID)?.name,
                         save: saveState(surface), wide: sizeClass == .regular)
         }
+        #endif
         if sizeClass == .regular {
             ToolbarItemGroup(placement: .primaryAction) {
                 if model.shareLinks.isAvailable, access.canEdit, page != nil {

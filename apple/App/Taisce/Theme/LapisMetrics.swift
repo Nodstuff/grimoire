@@ -43,6 +43,15 @@ extension Lapis {
         /// a visible button's height inside its 44 pt target
         static let buttonHeight: CGFloat = 36
         static let smallButtonHeight: CGFloat = 30
+        /// a sidebar destination row: a finger's 44 on iPad, a pointer's 30 on
+        /// the Mac (Mac-Main's sidebar)
+        static var sidebarRow: CGFloat {
+            #if targetEnvironment(macCatalyst)
+            30
+            #else
+            minTarget
+            #endif
+        }
     }
 
     enum Motion {

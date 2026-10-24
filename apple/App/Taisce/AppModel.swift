@@ -640,6 +640,15 @@ final class AppModel {
         WorkspaceFilter.todoDoc(in: docs, index: index, scope: currentWorkspace)
     }
 
+    /// The part of a command the router hands back.
+    func apply(_ effect: CommandEffect) {
+        switch effect {
+        case .none: break
+        case .refresh: Task { try? await sync?.catchUp() }
+        case .selectWorkspace(let scope): selectWorkspace(scope)
+        }
+    }
+
     /// Where this workspace's to-dos live, as the Library's breadcrumb reads
     /// it: the workspace (when there are several), the folders, the To-do doc
     /// ("Home › To-do"). Rows add the day they were written under.

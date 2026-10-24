@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 /// sit in a pane beside the grid, and EPUBs dropped anywhere are added.
 struct BooksScreen: View {
     @Environment(AppModel.self) private var model
+    @Environment(Router.self) private var router
     @Environment(\.horizontalSizeClass) private var sizeClass
     /// the shelf shown: the screen's own, or (iPad/Mac) the sidebar's Shelves
     /// and Series rows when the shell passes its binding
@@ -61,6 +62,8 @@ struct BooksScreen: View {
         .modifier(SearchIfRegular(regular: regular, query: $query))
         .refreshable { await store.load(force: true) }
         .task { await store.load() }
+        // ⇧⌘I from the menu bar or the actions palette
+        .onChange(of: router.addBooksRequest) { if store.availability != .unavailable { importing = true } }
         .environment(\.coverImageLoader, store.coverLoader)
         .lapisToast($toast)
         .fileImporter(isPresented: $importing, allowedContentTypes: [Self.epubType], allowsMultipleSelection: true) { result in
@@ -83,7 +86,7 @@ struct BooksScreen: View {
             .environment(\.coverImageLoader, store.coverLoader)
             .presentationDragIndicator(.visible)
         }
-        .fullScreenCover(item: $reading) { r in BookReaderScreen(bookID: r.id) }
+        .fullScreenCover(item: $reading) { r in BookReaderScreen(bookID: r.id).environment(model) }
         .sheet(item: $coverFor) { b in CoverFinder(book: b) }
         .confirmationDialog(removing.map { "Remove \u{201C}\($0.title)\u{201D} from your library?" } ?? "", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible, presenting: removing) { b in
             Button("Remove from Library", role: .destructive) { Task { await remove(b) } }
@@ -314,13 +317,20 @@ struct BooksScreen: View {
     // MARK: toolbar
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
-        ToolbarItem(placement: .principal) { Color.clear.frame(width: 1, height: 1).accessibilityHidden(true) }
-        ToolbarItemGroup(placement: .topBarTrailing) {
-            // iPhone-Books: + then the shelf menu; iPad and Mac: the menu, then "Add EPUBs" last
-            if regular {
-                shelfMenu
+        if regular {
+            // iPad-Books / Mac-Books: the shelf menu, then a prominent "+ Add EPUBs"
+            ToolbarItem(placement: .topBarTrailing) { shelfMenu }
+            ToolbarSpacer(.fixed, placement: .topBarTrailing)
+            ToolbarItem(placement: .topBarTrailing) {
                 addButton
-            } else {
+                    .buttonStyle(.glassProminent)
+                    .tint(Color.lapis.accent)
+            }
+        } else {
+            // the screen's own serif title stands in for the bar's
+            ToolbarItem(placement: .principal) { Color.clear.frame(width: 1, height: 1).accessibilityHidden(true) }
+            // iPhone-Books: + then the shelf menu
+            ToolbarItemGroup(placement: .topBarTrailing) {
                 addButton
                 shelfMenu
             }
@@ -354,7 +364,17 @@ struct BooksScreen: View {
 
     private var addButton: some View {
         Button { importing = true } label: {
-            if regular { Label("Add EPUBs", systemImage: "plus").labelStyle(.titleAndIcon) } else { Image(systemName: "plus") }
+            if regular {
+                // words and symbol: a toolbar Label would drop the words
+                HStack(spacing: 6) {
+                    Image(systemName: "plus")
+                    Text("Add EPUBs")
+                }
+                .fontWeight(.semibold)
+                .padding(.horizontal, 4)
+            } else {
+                Image(systemName: "plus")
+            }
         }
         .accessibilityLabel("Add EPUBs")
         .accessibilityIdentifier("books.add")

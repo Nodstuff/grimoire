@@ -37,7 +37,11 @@ struct SearchScreen: View {
         .searchable(text: $router.searchQuery, placement: .automatic, prompt: "Search docs, books, or ask")
         .searchFocused($focused)
         .onSubmit(of: .search) { if scope == .ask { runAsk() } }
-        .onChange(of: router.searchFocusRequest, initial: true) { _, n in if n > 0 { focused = true } }
+        .onChange(of: router.searchFocusRequest, initial: true) { _, n in
+            if n > 0 { focused = true }
+            // ⌘O: docs by title
+            if let s = router.searchScopeRequest { scope = s; router.searchScopeRequest = nil }
+        }
         .task(id: SearchKey(query: router.searchQuery, everywhere: everywhere, workspace: model.currentWorkspace)) {
             try? await Task.sleep(for: .milliseconds(250)) // debounce typing
             guard !Task.isCancelled else { return }
