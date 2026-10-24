@@ -57,7 +57,11 @@ struct BooksDevEntry: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .onChange(of: model.treeLoaded, initial: true) { _, loaded in
+            .onChange(of: model.needsSignIn, initial: true) { _, needs in
+                // the relay signs in by itself (no sheet to tap through)
+                if needs, SignInRelay.configured != nil { Task { await model.signIn() } }
+            }
+            .onChange(of: model.treeLoaded && !model.needsSignIn && !model.isCheckingAuth, initial: true) { _, loaded in
                 guard loaded, !shown else { return }
                 let args = ProcessInfo.processInfo.arguments
                 if let i = args.firstIndex(of: "-read"), i + 1 < args.count {

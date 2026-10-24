@@ -15,7 +15,8 @@ struct BookTile: View {
         VStack(alignment: .leading, spacing: 8) {
             BookCover(id: book.id, title: book.title, author: book.authorName, imageURL: coverURL)
                 .overlay(alignment: .topTrailing) {
-                    if isNew { NewBadge().padding(6) }
+                    // on the corner, clear of a cover's own title
+                    if isNew { NewBadge().offset(x: 6, y: -7) }
                 }
                 .overlay {
                     if selected {
@@ -66,9 +67,15 @@ struct ReadingCard: View {
     var selected = false
     let onContinue: () -> Void
     var onOpen: () -> Void = {}
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    /// accessibility sizes: the cover above the words, nothing cut short
+    private var big: Bool { typeSize.isAccessibilitySize }
 
     var body: some View {
-        HStack(alignment: .top, spacing: Lapis.Space.s4) {
+        let layout = big ? AnyLayout(VStackLayout(alignment: .leading, spacing: Lapis.Space.s3))
+            : AnyLayout(HStackLayout(alignment: .top, spacing: Lapis.Space.s4))
+        layout {
             BookCover(id: book.id, title: book.title, author: book.authorName, imageURL: coverURL)
                 .frame(width: compact ? 80 : 96)
             VStack(alignment: .leading, spacing: 4) {
@@ -82,25 +89,25 @@ struct ReadingCard: View {
                 Text(book.title)
                     .lapisFont(.docHeading3)
                     .foregroundStyle(Color.lapis.ink)
-                    .lineLimit(2)
+                    .lineLimit(big ? nil : 2)
                     .fixedSize(horizontal: false, vertical: true)
                 if let author = book.authorName {
-                    Text(author).font(.subheadline).foregroundStyle(Color.lapis.ink2).lineLimit(1)
+                    Text(author).font(.subheadline).foregroundStyle(Color.lapis.ink2).lineLimit(big ? nil : 1)
                 }
-                Spacer(minLength: 8)
+                Spacer(minLength: big ? 4 : 8)
                 ProgressBar(value: progress.percentage / 100)
-                HStack(spacing: 4) {
-                    Text(BookFormat.percent(progress.percentage)).fontWeight(.semibold).foregroundStyle(Color.lapis.ink)
-                    Text("· \(BookFormat.deviceLine(progress))").foregroundStyle(Color.lapis.ink3)
-                }
-                .font(.footnote)
-                .lineLimit(1)
-                .padding(.top, 2)
+                Text("\(Text(BookFormat.percent(progress.percentage)).fontWeight(.semibold).foregroundStyle(Color.lapis.ink)) · \(BookFormat.deviceLine(progress))")
+                    .foregroundStyle(Color.lapis.ink3)
+                    .font(.footnote)
+                    .lineLimit(big ? nil : 2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 2)
                 if compact {
                     Button(action: onContinue) {
                         Label("Continue", systemImage: "book")
                     }
-                    .buttonStyle(.lapis(.primary))
+                    .buttonStyle(.lapis(.primary, fullWidth: big))
+                    .labelStyle(AdaptiveLabelStyle(wordsOnly: big))
                     .accessibilityHint("Opens the book where you left off")
                 }
             }
@@ -116,7 +123,7 @@ struct ReadingCard: View {
         }
         .hoverWash()
         .contentShape(.rect(cornerRadius: Lapis.Radius.card))
-        .onTapGesture(perform: compact ? onContinue : onOpen)
+        .onTapGesture(perform: onOpen)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(book.title), \(BookFormat.percent(progress.percentage)) read, \(BookFormat.deviceLine(progress))")
         .accessibilityAction(named: "Continue reading", onContinue)

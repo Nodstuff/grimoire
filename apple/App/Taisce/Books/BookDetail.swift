@@ -25,6 +25,7 @@ struct BookDetail: View {
     @State private var findingCover = false
     @State private var confirmRemove = false
     @State private var toast: ToastMessage?
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     private var store: BookStore { model.books }
 
@@ -128,7 +129,7 @@ struct BookDetail: View {
     private func header(_ book: Book, coverURL: URL?) -> some View {
         VStack(spacing: Lapis.Space.s2) {
             BookCover(id: book.id, title: book.title, author: book.authorName, imageURL: coverURL)
-                .frame(width: style == .pane ? 150 : 172)
+                .frame(width: style == .pane ? 150 : 152)
                 .lapisShadow(.pop)
                 .padding(.top, style == .sheet ? 64 : Lapis.Space.s6)
                 .padding(.bottom, Lapis.Space.s4)
@@ -194,7 +195,8 @@ struct BookDetail: View {
             .buttonStyle(.lapis(.primary, fullWidth: true))
             .controlSize(.large)
             .accessibilityIdentifier("book.read")
-            HStack(spacing: Lapis.Space.s3) {
+            let pair = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: Lapis.Space.s3)) : AnyLayout(HStackLayout(spacing: Lapis.Space.s3))
+            pair {
                 Button { Task { await prepare(book, openIn: true) } } label: {
                     Label("Open in Books", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity)
                 }
@@ -208,13 +210,17 @@ struct BookDetail: View {
             .disabled(preparing)
             .overlay { if preparing { ProgressView() } }
         }
+        // accessibility sizes: the words, not the symbols (a Lapis button keeps one line)
+        .labelStyle(AdaptiveLabelStyle(wordsOnly: typeSize.isAccessibilitySize || style == .pane))
     }
 
     @ViewBuilder private func coverSection(_ book: Book) -> some View {
         VStack(alignment: .leading, spacing: Lapis.Space.s2) {
             SectionLabel("Cover")
             LapisCard {
-                HStack(alignment: .top, spacing: Lapis.Space.s4) {
+                let row = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(alignment: .leading, spacing: Lapis.Space.s3))
+                    : AnyLayout(HStackLayout(alignment: .top, spacing: Lapis.Space.s4))
+                row {
                     coverChoices(book)
                     VStack(alignment: .leading, spacing: Lapis.Space.s1) {
                         Text(coverHeadline(book)).font(.headline).foregroundStyle(Color.lapis.ink)
@@ -413,5 +419,18 @@ struct OpenInMenu: UIViewControllerRepresentable {
         init(done: @escaping () -> Void) { self.done = done }
         func documentInteractionControllerDidDismissOpenInMenu(_ c: UIDocumentInteractionController) { done() }
         func documentInteractionControllerDidDismissOptionsMenu(_ c: UIDocumentInteractionController) { done() }
+    }
+}
+
+/// Title and icon, or (accessibility sizes) the title alone.
+struct AdaptiveLabelStyle: LabelStyle {
+    let wordsOnly: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        if wordsOnly {
+            configuration.title
+        } else {
+            Label(configuration)
+        }
     }
 }

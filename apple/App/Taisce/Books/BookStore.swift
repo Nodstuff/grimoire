@@ -114,6 +114,14 @@ final class BookStore {
             default: break
             }
         }
+        if let e = error as? AuthError {
+            switch e {
+            case .signedOut: return "Sign in again to see your books."
+            case let .oauth(code, description): return "The server refused sign-in (\(description ?? code))."
+            case .rateLimited: return "Too many tries. Wait a minute, then try again."
+            default: return "Sign in again to see your books."
+            }
+        }
         if (error as? URLError) != nil { return "You're offline." }
         return error.localizedDescription
     }

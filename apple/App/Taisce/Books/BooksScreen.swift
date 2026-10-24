@@ -44,7 +44,8 @@ struct BooksScreen: View {
         .navigationTitle("Books")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbar }
-        .searchable(text: $query, placement: regular ? .toolbar : .navigationBarDrawer(displayMode: .automatic), prompt: "Title, author or series")
+        // iPhone: the Search tab finds books; the artboard's shelf has no field
+        .modifier(SearchIfRegular(regular: regular, query: $query))
         .refreshable { await store.load(force: true) }
         .task { await store.load() }
         .environment(\.coverImageLoader, store.coverLoader)
@@ -445,5 +446,19 @@ enum ShareSheetPresenter {
         vc.popoverPresentationController?.sourceView = top.view
         vc.popoverPresentationController?.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.midY, width: 1, height: 1)
         top.present(vc, animated: true)
+    }
+}
+
+/// The library's filter field on iPad and the Mac (the toolbar's search).
+private struct SearchIfRegular: ViewModifier {
+    let regular: Bool
+    @Binding var query: String
+
+    func body(content: Content) -> some View {
+        if regular {
+            content.searchable(text: $query, placement: .toolbar, prompt: "Title, author or series")
+        } else {
+            content
+        }
     }
 }

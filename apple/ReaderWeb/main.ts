@@ -246,6 +246,19 @@ async function open(opts: { url: string; start: Start; look: Look }) {
 
 window.addEventListener('keydown', onKey)
 
+// A tap in the page's margins (outside the section's iframe: wide screens
+// have room either side of the column) turns the page too; taps inside the
+// iframe are handled by its own listener and never reach here.
+document.getElementById('host')?.addEventListener('click', (ev) => {
+  const v = view
+  if (!v || ev.defaultPrevented) return
+  const w = window.innerWidth
+  const paged = v.renderer?.getAttribute('flow') !== 'scrolled'
+  if (paged && ev.clientX < w * 0.3) turn('left')
+  else if (paged && ev.clientX > w * 0.7) turn('right')
+  else post('toggleChrome')
+})
+
 window.taisce = {
   open,
   setLook(l: Look) {
