@@ -25,6 +25,7 @@ struct DocScreen: View {
     @State private var appeared = false
     @AppStorage(DocTextSize.key) private var textSize = DocTextSize.actual
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.colorScheme) private var colorScheme
     /// the inspector: a column on iPad and the Mac, a sheet on iPhone
     @State private var showInspector = false
     /// the doc's op ledger (newest first): the byline and the inspector's History
@@ -112,7 +113,6 @@ struct DocScreen: View {
     private func surfaceView(_ surface: SurfaceModel) -> some View {
         DocSurfaceContent(model: surface)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { surfaceToolbar(surface) }
             .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
             .onChange(of: chrome, initial: true) { _, c in
                 // the header and children list, reachable for VoiceOver from the text
@@ -137,7 +137,7 @@ struct DocScreen: View {
             .inspector(isPresented: $showInspector) {
                 DocInspector(
                     docID: docID, surface: surface, history: history, page: page,
-                    asSheet: sizeClass != .regular,
+                    asSheet: sizeClass != .regular, me: me,
                     menu: AnyView(moreMenuItems(surface)),
                     onClose: { showInspector = false }
                 )
@@ -145,6 +145,8 @@ struct DocScreen: View {
                 .environment(model)
                 .environment(router)
             }
+            // after .inspector: the items sit in the doc's own bar
+            .toolbar { surfaceToolbar(surface) }
     }
 
     /// The doc's bar. iPhone: the title and save state in the middle; while
@@ -205,7 +207,7 @@ struct DocScreen: View {
             } icon: {
                 // a yellow dot while changes wait (drawn into the symbol: the
                 // bar keeps only a label's image)
-                Image(uiImage: InspectorGlyph.image(dot: waiting > 0))
+                Image(uiImage: InspectorGlyph.image(dot: waiting > 0, dark: colorScheme == .dark))
             }
         }
         .tint(showInspector && sizeClass == .regular ? Color.lapis.accent : Color.lapis.ink)
@@ -420,19 +422,18 @@ struct DocScreen: View {
 
 /// The inspector's bar symbol, with a yellow dot when changes wait.
 enum InspectorGlyph {
-    @MainActor static func image(dot: Bool) -> UIImage {
+    @MainActor static func image(dot: Bool, dark: Bool) -> UIImage {
         let config = UIImage.SymbolConfiguration(textStyle: .body, scale: .large)
         guard let base = UIImage(systemName: "sidebar.right", withConfiguration: config) else { return UIImage() }
         guard dot else { return base.withRenderingMode(.alwaysTemplate) }
         let size = base.size
         let r = UIGraphicsImageRenderer(size: CGSize(width: size.width + 3, height: size.height + 3))
         let img = r.image { ctx in
-            base.withTintColor(.label).draw(at: CGPoint(x: 0, y: 3))
+            let traits = UITraitCollection(userInterfaceStyle: dark ? .dark : .light)
+            base.withTintColor(UIColor.lapis.ink.resolvedColor(with: traits)).draw(at: CGPoint(x: 0, y: 3))
             let d: CGFloat = 9
             let rect = CGRect(x: size.width + 3 - d, y: 0, width: d, height: d)
-            UIColor.lapis.bg.setFill()
-            ctx.cgContext.fillEllipse(in: rect.insetBy(dx: -1.5, dy: -1.5))
-            UIColor.lapis.yellowMark.setFill()
+            UIColor.lapis.yellowMark.resolvedColor(with: traits).setFill()
             ctx.cgContext.fillEllipse(in: rect)
         }
         return img.withRenderingMode(.alwaysOriginal)

@@ -126,6 +126,26 @@ struct InlineChangeCard: View {
     private var reject: String { rejectTitle ?? (verdict == .red ? "Discard" : "Revert") }
 
     var body: some View {
+        Group {
+            if compact, showsActions {
+                // wide: the buttons ride in the header row, when they fit
+                ViewThatFits(in: .horizontal) {
+                    layout(inlineActions: true)
+                    layout(inlineActions: false)
+                }
+            } else {
+                layout(inlineActions: false)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(verdict.soft, in: shape)
+        .overlay(shape.strokeBorder(verdict.mark, lineWidth: 1))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(verdict.spoken) change by \(author)")
+    }
+
+    private func layout(inlineActions: Bool) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
                 chip
@@ -136,12 +156,12 @@ struct InlineChangeCard: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .layoutPriority(1)
-                if compact, let when {
-                    Text("· \(when)").font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(1)
+                if inlineActions, let when {
+                    Text("· \(when)").font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(1).fixedSize()
                 }
                 Spacer(minLength: 4)
-                if compact, showsActions {
-                    actions(height: Lapis.Layout.buttonHeight)
+                if inlineActions {
+                    actions(height: Lapis.Layout.buttonHeight, fill: false).fixedSize()
                 } else if let when {
                     Text(when).font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(1)
                 }
@@ -154,16 +174,10 @@ struct InlineChangeCard: View {
             if let note, !note.isEmpty {
                 Text(note).font(.footnote).foregroundStyle(Color.lapis.ink3).fixedSize(horizontal: false, vertical: true)
             }
-            if !compact, showsActions {
-                actions(height: Lapis.Layout.minTarget)
+            if !inlineActions, showsActions {
+                actions(height: Lapis.Layout.minTarget, fill: true)
             }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(verdict.soft, in: shape)
-        .overlay(shape.strokeBorder(verdict.mark, lineWidth: 1))
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(verdict.spoken) change by \(author)")
     }
 
     private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: 20, style: .continuous) }
@@ -185,7 +199,7 @@ struct InlineChangeCard: View {
         .accessibilityLabel(verdict.spoken)
     }
 
-    @ViewBuilder private func actions(height: CGFloat) -> some View {
+    @ViewBuilder private func actions(height: CGFloat, fill: Bool) -> some View {
         HStack(spacing: 8) {
             Button {
                 if confirmAccept, !confirming {
@@ -199,7 +213,7 @@ struct InlineChangeCard: View {
             } label: {
                 Label(confirming ? "Confirm \(accept.lowercased())" : accept, systemImage: verdict == .red ? (confirmAccept ? "trash" : "checkmark") : "checkmark")
             }
-            .buttonStyle(CardActionStyle(kind: verdict == .yellow ? .keep : (confirmAccept ? .danger : .apply), height: height, fill: !compact))
+            .buttonStyle(CardActionStyle(kind: verdict == .yellow ? .keep : (confirmAccept ? .danger : .apply), height: height, fill: fill))
             .accessibilityIdentifier("change.accept")
             Button {
                 confirming = false
@@ -208,7 +222,7 @@ struct InlineChangeCard: View {
             } label: {
                 Label(reject, systemImage: verdict == .red ? "xmark" : "arrow.uturn.backward")
             }
-            .buttonStyle(CardActionStyle(kind: .outline, height: height, fill: !compact))
+            .buttonStyle(CardActionStyle(kind: .outline, height: height, fill: fill))
             .accessibilityIdentifier("change.reject")
         }
         .disabled(busy)

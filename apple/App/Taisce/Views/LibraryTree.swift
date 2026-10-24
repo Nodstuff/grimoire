@@ -427,6 +427,7 @@ private struct DocTreeRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(node.doc.title)
         .accessibilityValue(accessibilityValue)
+        .accessibilityHint(node.isFolder ? (node.children?.count).map { $0 == 1 ? "1 doc inside" : "\($0) docs inside" } ?? "Empty" : "")
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
         .accessibilityAction { onOpen() }
         .modifier(FolderAction(isFolder: node.isFolder, isOpen: line.isOpen, toggle: onToggle))
@@ -445,10 +446,7 @@ private struct DocTreeRow: View {
 
     private var accessibilityValue: String {
         var parts: [String] = []
-        if node.isFolder {
-            parts.append(line.isOpen ? "folder, open" : "folder, closed")
-            if let n = node.children?.count, n > 0 { parts.append(n == 1 ? "1 doc" : "\(n) docs") }
-        }
+        if node.isFolder { parts.append(line.isOpen ? "folder, open" : "folder, closed") }
         if flags > 0 { parts.append(flags == 1 ? "1 change to review" : "\(flags) changes to review") }
         if pinned { parts.append("pinned") }
         if !node.isFolder, let edited { parts.append(ShortWhen.spoken(edited)) }

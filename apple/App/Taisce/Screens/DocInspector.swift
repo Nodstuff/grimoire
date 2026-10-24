@@ -13,6 +13,8 @@ struct DocInspector: View {
     let page: DocPage?
     /// iPhone: a sheet with its own close button and title
     var asSheet = false
+    /// your name (your avatar's initial)
+    var me: String?
     /// the doc's … menu items
     var menu: AnyView = AnyView(EmptyView())
     var onClose: () -> Void = {}
@@ -28,6 +30,7 @@ struct DocInspector: View {
     @State private var comments: [InspectorComment] = []
     @State private var backlinks: [Backlink]?
     @State private var members: [WorkspaceMember] = []
+    @State private var detent: PresentationDetent = .large
 
     private var items: [DocReviewItem] { surface?.reviewItems ?? [] }
     private var title: String { model.index.byID[docID]?.title ?? "" }
@@ -35,7 +38,7 @@ struct DocInspector: View {
     var body: some View {
         VStack(spacing: 14) {
             if asSheet { sheetHeader }
-            TabStrip(tab: $tab, reviewCount: items.count, commentCount: comments.count)
+            TabStrip(tab: $tab, reviewCount: items.count, commentCount: comments.count, small: !asSheet)
                 .padding(.horizontal, asSheet ? 16 : 14)
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -54,7 +57,7 @@ struct DocInspector: View {
         }
         .padding(.top, asSheet ? 6 : 10)
         .background((asSheet ? Color.lapis.bg : Color.lapis.panel).ignoresSafeArea())
-        .presentationDetents([.medium, .large])
+        .presentationDetents([.medium, .large], selection: $detent)
         .presentationDragIndicator(.visible)
         .presentationBackground(Color.lapis.bg)
         .task(id: docID) { await loadComments() }
@@ -121,7 +124,7 @@ struct DocInspector: View {
         let recent = Array(HistoryGroup.make(history).filter(\.applied).prefix(4))
         if !recent.isEmpty {
             SectionLabel("Earlier").padding(.top, 8)
-            HistoryList(groups: recent)
+            HistoryList(groups: recent, me: me)
         }
     }
 
@@ -164,7 +167,7 @@ struct DocInspector: View {
         if groups.isEmpty {
             EmptyCard(icon: "clock", title: "No history yet", hint: model.isOnline ? "Edits to this doc show here." : "History shows when you're online.")
         } else {
-            HistoryList(groups: groups)
+            HistoryList(groups: groups, me: me)
         }
     }
 
@@ -323,6 +326,8 @@ private struct TabStrip: View {
     @Binding var tab: DocInspector.Tab
     let reviewCount: Int
     let commentCount: Int
+    /// the column (iPad, Mac): a size down
+    var small = false
     @Namespace private var selection
 
     var body: some View {
@@ -332,7 +337,7 @@ private struct TabStrip: View {
                     withAnimation(Lapis.Motion.standard) { tab = t }
                 } label: {
                     HStack(spacing: 5) {
-                        Text(t.rawValue).font(.subheadline.weight(tab == t ? .semibold : .medium)).lineLimit(1).minimumScaleFactor(0.75)
+                        Text(t.rawValue).font((small ? Font.footnote : .subheadline).weight(tab == t ? .semibold : .medium)).lineLimit(1).minimumScaleFactor(0.75)
                         if t == .review, reviewCount > 0 { CountPill(n: reviewCount, tone: .attention) }
                         if t == .comments, commentCount > 0 { CountPill(n: commentCount) }
                     }
@@ -383,7 +388,7 @@ struct ReviewItemCard: View {
                         .font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(1)
                 }
                 Spacer(minLength: 4)
-                VerdictChip(card.verdict, short: card.verdict == .red)
+                VerdictChip(card.verdict, short: true)
             }
             if item.opType != "delete", !(card.old.isEmpty && card.new.isEmpty) {
                 DiffText(old: card.old, new: card.new)
@@ -479,12 +484,13 @@ struct DiffText: View {
 /// History rows in a card: avatar, who and what, when, the verdict.
 struct HistoryList: View {
     let groups: [HistoryGroup]
+    var me: String?
 
     var body: some View {
         VStack(spacing: 0) {
             ForEach(Array(groups.enumerated()), id: \.element.id) { i, g in
                 HStack(spacing: 12) {
-                    LapisAvatar(name: g.who == "You" ? "You" : g.who, agent: g.isAgent, size: 32)
+                    LapisAvatar(name: g.who == "You" ? (me ?? "You") : g.who, agent: g.isAgent, size: 32)
                     VStack(alignment: .leading, spacing: 1) {
                         if g.isAgent {
                             Text(g.who).font(.lapisMono(.subheadline, weight: .medium)).foregroundStyle(Color.lapis.agent).lineLimit(1)
