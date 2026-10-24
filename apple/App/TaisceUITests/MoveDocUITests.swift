@@ -10,6 +10,11 @@ final class MoveDocUITests: XCTestCase {
 
     override func setUp() {
         continueAfterFailure = false
+        #if !targetEnvironment(macCatalyst)
+        // iPad: the tree is the sidebar's, which portrait hides; landscape
+        // keeps it beside the detail (iPhone: portrait, the Library tab)
+        XCUIDevice.shared.orientation = UIDevice.current.userInterfaceIdiom == .pad ? .landscapeLeft : .portrait
+        #endif
     }
 
     /// A screenshot in the result bundle (what the screen showed when a check failed).
@@ -98,6 +103,22 @@ final class MoveDocUITests: XCTestCase {
         e.click()
         #else
         e.tap()
+        #endif
+    }
+
+    /// Scroll the tree toward its top: the whole screen on iPhone (the
+    /// Library tab), the sidebar on iPad (a swipe in the middle would scroll
+    /// the detail).
+    func scrollTreeTowardTop(_ app: XCUIApplication) {
+        #if targetEnvironment(macCatalyst)
+        app.swipeDown()
+        #else
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            let from = app.coordinate(withNormalizedOffset: CGVector(dx: 0.12, dy: 0.35))
+            from.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.12, dy: 0.85)))
+        } else {
+            app.swipeDown()
+        }
         #endif
     }
 
@@ -426,7 +447,7 @@ final class MoveDocUITests: XCTestCase {
         XCTAssertEqual((placed as? [String: Any])?["ok"] as? Bool, true, "the folder placed under X: \(placed)")
         let settle = Date().addingTimeInterval(20)
         while Date() < settle, !(rowX.isHittable && folder.isHittable && folder.frame.minY > rowX.frame.minY) {
-            app.swipeDown()
+            scrollTreeTowardTop(app)
             RunLoop.current.run(until: Date().addingTimeInterval(0.5))
         }
         XCTAssertTrue(rowX.isHittable && folder.isHittable, "X and the folder are both on screen")

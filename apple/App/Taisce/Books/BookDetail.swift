@@ -192,19 +192,18 @@ struct BookDetail: View {
                 Label(started ? "Continue reading" : finished ? "Read again" : "Read", systemImage: "book")
                     .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.lapis(.primary, fullWidth: true))
-            .controlSize(.large)
+            .buttonStyle(.lapis(.primary, size: style == .pane ? .regular : .large, fullWidth: true))
             .accessibilityIdentifier("book.read")
             let pair = typeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: Lapis.Space.s3)) : AnyLayout(HStackLayout(spacing: Lapis.Space.s3))
             pair {
                 Button { Task { await prepare(book, openIn: true) } } label: {
                     Label("Open in Books", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.lapis(.secondary, fullWidth: true))
+                .buttonStyle(.lapis(.secondary, size: style == .pane ? .regular : .large, fullWidth: true))
                 Button { Task { await prepare(book, openIn: false) } } label: {
                     Label("Send to…", systemImage: "paperplane").frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.lapis(.secondary, fullWidth: true))
+                .buttonStyle(.lapis(.secondary, size: style == .pane ? .regular : .large, fullWidth: true))
                 .accessibilityHint("AirDrop, Mail, or Save to Files")
             }
             .disabled(preparing)
@@ -302,16 +301,21 @@ struct BookDetail: View {
         let n = store.shelf.ereaderCount
         if n > 0 || progress != nil {
             VStack(alignment: .leading, spacing: Lapis.Space.s2) {
-                SectionLabel("On your e-readers")
+                // the last place can be this app or the web, not only an e-reader
+                SectionLabel("Your devices")
                 LapisCard {
                     VStack(alignment: .leading, spacing: Lapis.Space.s2) {
                         if let progress, progress.status != .unread {
                             HStack {
                                 Image(systemName: "ipad.landscape").foregroundStyle(Color.lapis.ink3).accessibilityHidden(true)
                                 Text(progress.device.isEmpty ? "Another device" : progress.device).foregroundStyle(Color.lapis.ink)
-                                Spacer()
-                                Text("\(BookFormat.percent(progress.percentage)) · \(progress.updatedAt.map { BookFormat.ago($0) } ?? "")")
+                                    .lineLimit(2)
+                                Spacer(minLength: 6)
+                                // "12% · 20 min ago" stays one phrase
+                                Text([BookFormat.percent(progress.percentage), progress.updatedAt.map { BookFormat.ago($0) }].compactMap { $0 }.joined(separator: " \u{00B7} "))
                                     .foregroundStyle(Color.lapis.ink3)
+                                    .lineLimit(1)
+                                    .fixedSize()
                             }
                             .font(.subheadline)
                             .accessibilityElement(children: .combine)

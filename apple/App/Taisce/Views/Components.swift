@@ -63,6 +63,9 @@ struct TodoRow: View {
     var now: Date = .now
     var done = false
     var shortPill = false
+    /// short pills on a list without group headings (Today's Due): they say
+    /// the group too, "Overdue · Thu", "Today 15:00" (iPhone-Today)
+    var namesGroup = false
     /// the To-do doc's path ("Home › To-do"): the line under reads where the item lives
     var listPath: String?
     /// the ring as a button (tap to mark done / undo); nil = a plain ring
@@ -115,8 +118,8 @@ struct TodoRow: View {
         guard shortPill else { return DeadlinePill(label) }
         guard let text = DueLabel.short(entry, now: now) else { return nil }
         return switch label.tone {
-        case .overdue: DeadlinePill(.overdue, text)
-        case .today: DeadlinePill(.today, text)
+        case .overdue: DeadlinePill(.overdue, namesGroup ? "Overdue \u{00B7} \(text)" : text)
+        case .today: DeadlinePill(.today, namesGroup && text != "Today" ? "Today \(text)" : text)
         case .later: DeadlinePill(.upcoming, text)
         case .none: nil
         }

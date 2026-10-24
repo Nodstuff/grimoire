@@ -15,7 +15,8 @@ import SwiftUI
 /// long label stays whole. `.lapisButtonIcons(false)` shows words only.
 struct LapisButtonStyle: ButtonStyle {
     enum Kind: Hashable, Sendable, CaseIterable { case primary, secondary, ghost, destructive, keep, revert }
-    enum Size: Hashable, Sendable { case regular, small }
+    /// small 30, regular 36, large 50 (a sheet's main actions: iPhone-Book-Detail)
+    enum Size: Hashable, Sendable { case regular, small, large }
 
     var kind: Kind = .secondary
     var size: Size = .regular
@@ -43,10 +44,10 @@ private struct LapisButtonBody: View {
     @State private var hovering = false
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: Lapis.Radius.button, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: size == .large ? 25 : Lapis.Radius.button, style: .continuous)
         let big = typeSize.isAccessibilitySize
         configuration.label
-            .font(size == .small ? .footnote.weight(.semibold) : .subheadline.weight(.semibold))
+            .font(size == .small ? .footnote.weight(.semibold) : size == .large ? .headline : .subheadline.weight(.semibold))
             .labelStyle(LapisButtonLabelStyle(icon: icons && !big))
             .foregroundStyle(ink)
             .lineLimit(big ? 4 : 1)
@@ -54,8 +55,8 @@ private struct LapisButtonBody: View {
             .multilineTextAlignment(.center)
             .fixedSize(horizontal: false, vertical: big)
             .padding(.vertical, big ? 8 : 0)
-            .padding(.horizontal, kind == .ghost || kind == .destructive ? 10 : (size == .small ? 12 : 16))
-            .frame(minHeight: size == .small ? Lapis.Layout.smallButtonHeight : Lapis.Layout.buttonHeight)
+            .padding(.horizontal, kind == .ghost || kind == .destructive ? 10 : (size == .small ? 12 : size == .large ? 20 : 16))
+            .frame(minHeight: size == .small ? Lapis.Layout.smallButtonHeight : size == .large ? 50 : Lapis.Layout.buttonHeight)
             .frame(maxWidth: fullWidth ? .infinity : nil)
             .background(fill, in: shape)
             .overlay { if bordered { shape.strokeBorder(Color.lapis.line2, lineWidth: 1) } }

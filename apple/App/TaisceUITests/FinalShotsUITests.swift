@@ -20,7 +20,11 @@ final class FinalShotsUITests: XCTestCase {
         #else
         let pad = UIDevice.current.userInterfaceIdiom == .pad
         let device = pad ? "ipad" : "iphone"
-        if pad { XCUIDevice.shared.orientation = .landscapeLeft }
+        if pad {
+            XCUIDevice.shared.orientation = .landscapeLeft
+            // the simulator keeps it: the suites after this one expect portrait
+            addTeardownBlock { XCUIDevice.shared.orientation = .portrait }
+        }
         #endif
         let suffix = env["TAISCE_SHOTS_SUFFIX"] ?? "light"
         var front: XCUIApplication?

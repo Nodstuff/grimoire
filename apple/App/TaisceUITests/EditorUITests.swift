@@ -5,6 +5,13 @@ import XCTest
 /// surface: type, Return for a new block, Backspace-merge, `[[` and pick a
 /// suggestion — then read the doc's markdown back from the daemon (autosave).
 final class EditorUITests: XCTestCase {
+    override func setUp() {
+        #if !targetEnvironment(macCatalyst)
+        // the taps' places assume portrait (a shots run may have left the simulator on its side)
+        XCUIDevice.shared.orientation = .portrait
+        #endif
+    }
+
     var base: URL { URL(string: ProcessInfo.processInfo.environment["TAISCE_UI_URL"] ?? "http://127.0.0.1:7518")! }
 
     // MARK: the daemon's API (seeding and checking)
@@ -125,7 +132,9 @@ final class EditorUITests: XCTestCase {
         app.launch()
         let surface = app.textViews["surface.text"]
         XCTAssertTrue(surface.waitForExistence(timeout: 20))
-        columnPoint(surface, dx: 6, fraction: 0.55).tap()
+        // the middle of the text column: on iPad the column is inset in a
+        // wider surface, and a tap in its margin is a tap to write
+        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.55)).tap()
         XCTAssertTrue(app.staticTexts[target].waitForExistence(timeout: 10), "the link was followed")
         XCTAssertEqual(app.keyboards.count, 0, "no keyboard")
     }

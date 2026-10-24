@@ -160,12 +160,14 @@ struct SettingsContent: View {
             Section {
                 Picker(selection: $appearance) {
                     ForEach(LapisAppearance.allCases) { a in
-                        Label(a.title, systemImage: a.symbol).tag(a.rawValue)
+                        Text(a.title).tag(a.rawValue)
                     }
                 } label: {
                     Label { Text("Theme") } icon: { SettingsTile(symbol: "circle.lefthalf.filled", fill: Color.lapis.ink2) }
                 }
                 .pickerStyle(.menu)
+                // the value quiet, as the artboard ("System ⌃"), not an accent link
+                .tint(Color.lapis.ink3)
                 .accessibilityIdentifier("settings.appearance")
                 .sensoryFeedback(.selection, trigger: appearance)
                 #if targetEnvironment(macCatalyst)
@@ -275,6 +277,7 @@ struct SettingsContent: View {
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 Button("Done", systemImage: "checkmark", action: onDone)
+                    .tint(Color.lapis.accent)
                     .accessibilityIdentifier("settings.done")
             }
         }

@@ -307,7 +307,7 @@ struct TodayContent: View {
                     } else {
                         GroupedRows(items: Array(due.prefix(TodayDue.limit))) { entry in
                             // the ring is its own button; the rest of the row opens To-dos
-                            TodoRow(entry: entry, now: now, done: checked.contains(entry.id), shortPill: true, listPath: listPath, onToggle: onToggleDone.map { f in { f(entry) } })
+                            TodoRow(entry: entry, now: now, done: checked.contains(entry.id), shortPill: true, namesGroup: true, listPath: listPath, onToggle: onToggleDone.map { f in { f(entry) } })
                                 .onTapGesture(perform: onAllTodos)
                                 .accessibilityAction(named: "Open To-dos", onAllTodos)
                         }

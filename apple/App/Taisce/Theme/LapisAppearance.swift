@@ -86,7 +86,11 @@ private struct WindowStyleSetter: UIViewRepresentable {
         }
 
         func apply() {
-            guard let window, window.overrideUserInterfaceStyle != style else { return }
+            guard let window else { return }
+            // the window's tint: sheets' bar buttons (a confirming ✓ in glass)
+            // follow it, not the SwiftUI .tint of the view that presented them
+            if window.tintColor != UIColor.lapis.accent { window.tintColor = UIColor.lapis.accent }
+            guard window.overrideUserInterfaceStyle != style else { return }
             UIView.transition(with: window, duration: 0.2, options: [.transitionCrossDissolve, .allowUserInteraction]) {
                 window.overrideUserInterfaceStyle = self.style
             }
