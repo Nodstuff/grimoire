@@ -180,7 +180,19 @@ final class SurfaceLayoutDelegate: NSObject, NSTextLayoutManagerDelegate {
             f.checked = checked
             return f
         }
+        if let p = textElement as? NSTextParagraph, Self.hasCode(p.attributedString) {
+            return SurfaceLayoutFragment(textElement: textElement, range: textElement.elementRange)
+        }
         return NSTextLayoutFragment(textElement: textElement, range: textElement.elementRange)
+    }
+
+    /// Whether the line holds an inline code run.
+    static func hasCode(_ s: NSAttributedString) -> Bool {
+        var found = false
+        s.enumerateAttribute(Surface.marks, in: NSRange(location: 0, length: s.length)) { v, _, stop in
+            if InlineMarks(rawValue: (v as? Int) ?? 0).contains(.code) { found = true; stop.pointee = true }
+        }
+        return found
     }
 
     /// The line's box state, when it starts with a checkbox marker.
@@ -191,7 +203,56 @@ final class SurfaceLayoutDelegate: NSObject, NSTextLayoutManagerDelegate {
     }
 }
 
-final class CheckboxLayoutFragment: NSTextLayoutFragment {
+/// A surface line that draws its inline code runs as rounded, outlined
+/// pills under the text (the artboards' `code`: code fill, a hairline, 6 pt corners).
+class SurfaceLayoutFragment: NSTextLayoutFragment {
+    override var renderingSurfaceBounds: CGRect {
+        super.renderingSurfaceBounds.insetBy(dx: -Self.outset - 1, dy: -2)
+    }
+
+    static let outset: CGFloat = 3
+
+    override func draw(at point: CGPoint, in context: CGContext) {
+        drawCodePills(at: point, in: context)
+        super.draw(at: point, in: context)
+    }
+
+    func drawCodePills(at point: CGPoint, in context: CGContext) {
+        for line in textLineFragments where line.characterRange.length > 0 {
+            let attr = line.attributedString
+            let lb = line.typographicBounds
+            let baseline = point.y + lb.minY + line.glyphOrigin.y
+            attr.enumerateAttribute(Surface.marks, in: line.characterRange) { v, r, _ in
+                guard InlineMarks(rawValue: (v as? Int) ?? 0).contains(.code), r.length > 0 else { return }
+                // a trailing newline is not part of the pill
+                var run = r
+                while run.length > 0, let c = (attr.string as NSString).substring(with: NSRange(location: run.location + run.length - 1, length: 1)).first,
+                      c.isNewline {
+                    run.length -= 1
+                }
+                guard run.length > 0 else { return }
+                let font = (attr.attribute(.font, at: run.location, effectiveRange: nil) as? UIFont) ?? UIFont.monospacedSystemFont(ofSize: 15, weight: .regular)
+                let x0 = line.locationForCharacter(at: run.location).x
+                let x1 = line.locationForCharacter(at: run.location + run.length).x
+                guard x1 > x0 else { return }
+                let rect = CGRect(x: point.x + lb.minX + x0 - Self.outset, y: baseline - font.ascender - 2,
+                                  width: x1 - x0 + Self.outset * 2, height: font.ascender - font.descender + 4)
+                let path = UIBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), cornerRadius: 6)
+                context.saveGState()
+                context.setFillColor(UIColor.lapis.code.cgColor)
+                context.addPath(path.cgPath)
+                context.fillPath()
+                context.setStrokeColor(UIColor.lapis.line.cgColor)
+                context.setLineWidth(1)
+                context.addPath(path.cgPath)
+                context.strokePath()
+                context.restoreGState()
+            }
+        }
+    }
+}
+
+final class CheckboxLayoutFragment: SurfaceLayoutFragment {
     var checked = false
 
     /// The box for a font: a rounded square a little under the cap height

@@ -281,6 +281,8 @@ final class Router {
         if isPad {
             padItem = .doc(doc.id)
         } else {
+            // a doc lives in the Library (not on whichever tab launched)
+            if UserDefaults.standard.string(forKey: "tab") == nil { tab = .library }
             open(.doc(doc.id))
         }
         return true

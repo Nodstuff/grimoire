@@ -144,7 +144,7 @@ enum SurfaceLook {
             return out
         }
         if case .heading = style { out[.kern] = -0.3 }
-        if marks.contains(.code) { out[.backgroundColor] = UIColor.lapis.code }
+        // inline code: a rounded, outlined pill drawn by SurfaceLayoutFragment
         if marks.contains(.strike) || checked { out[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
         let link = a[Surface.link] as? String
         let wiki = a[Surface.wiki] as? String

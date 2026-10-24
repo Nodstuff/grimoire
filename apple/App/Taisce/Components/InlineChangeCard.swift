@@ -243,13 +243,12 @@ struct InlineChangeCard: View {
             case .same:
                 break
             case .removed:
-                part.strikethroughStyle = .single
-                part.strikethroughColor = UIColor.lapis.red
+                // SwiftUI's Text.LineStyle: Text ignores UIKit-scoped line attributes
+                part.strikethroughStyle = Text.LineStyle(pattern: .solid, color: Color.lapis.red)
                 part.foregroundColor = Color.lapis.red
                 part.backgroundColor = Color.lapis.redSoft
             case .added:
-                part.underlineStyle = .thick
-                part.underlineColor = UIColor.lapis.green
+                part.underlineStyle = Text.LineStyle(pattern: .solid, color: Color.lapis.green)
                 part.backgroundColor = Color.lapis.greenSoft
             }
             out += part

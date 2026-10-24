@@ -113,6 +113,9 @@ struct DocScreen: View {
     private func surfaceView(_ surface: SurfaceModel) -> some View {
         DocSurfaceContent(model: surface)
             .navigationBarTitleDisplayMode(.inline)
+            // iPhone while typing: the doc runs to the keyboard (the artboard);
+            // the glass keyboard would otherwise show the tab bar through it
+            .toolbarVisibility(surface.isEditingText && !router.isPad ? .hidden : .automatic, for: .tabBar)
             .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
             .onChange(of: chrome, initial: true) { _, c in
                 // the header and children list, reachable for VoiceOver from the text
