@@ -184,7 +184,7 @@ struct TodosContent: View {
                 Text(line.joined(separator: " · ")).font(.subheadline).foregroundStyle(Color.lapis.ink3)
             }
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 2)
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
@@ -250,6 +250,8 @@ struct TodosContent: View {
                 }
                 .font(.headline)
                 .textCase(nil)
+                // the artboard's headers sit just inside the cards' edge
+                .listRowInsets(EdgeInsets(top: 0, leading: 6, bottom: 8, trailing: 6))
                 .accessibilityElement(children: .combine)
                 .accessibilityAddTraits(.isHeader)
             }

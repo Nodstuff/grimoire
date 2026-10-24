@@ -180,7 +180,7 @@ struct SettingsContent: View {
                 .foregroundStyle(Color.lapis.ink2)
                 #endif
             } header: {
-                Text("Appearance")
+                SettingsHeader("Appearance")
             } footer: {
                 #if targetEnvironment(macCatalyst)
                 Text("System follows this Mac's light or dark setting. Text size is the doc's (\u{2318}+ and \u{2318}\u{2212}).")
@@ -209,7 +209,7 @@ struct SettingsContent: View {
                     }
                 }
             } header: {
-                Text("Notifications")
+                SettingsHeader("Notifications")
             } footer: {
                 Text("A nudge when a to-do's deadline arrives.")
             }
@@ -242,7 +242,7 @@ struct SettingsContent: View {
                 }
                 .accessibilityIdentifier("settings.dataSources")
             } header: {
-                Text("SQL blocks")
+                SettingsHeader("SQL blocks")
             } footer: {
                 Text("Databases ```sql db=<name>``` blocks run on, on this Mac only.")
             }
@@ -313,7 +313,7 @@ private struct ReaderSections: View {
                 .accessibilityIdentifier("settings.addEreader")
             }
         } header: {
-            Text("E-readers")
+            SettingsHeader("E-readers")
         } footer: {
             Text("Your books reach these over a catalog feed (OPDS); reading progress syncs back here.")
         }
@@ -333,7 +333,7 @@ private struct ReaderSections: View {
                 .disabled(readers.busy)
                 .accessibilityIdentifier("settings.addToken")
             } header: {
-                Text("Upload Tokens")
+                SettingsHeader("Upload Tokens")
             } footer: {
                 Text("Send EPUBs from a Shortcut or Calibre without signing in. A token can only add books.")
             }
@@ -424,18 +424,20 @@ struct AccountSettingsScreen: View {
                     Button("Connect to this server") { onSave(url) }
                 }
             } header: {
-                Text("Server")
+                SettingsHeader("Server")
             } footer: {
                 Text("HTTPS servers ask you to sign in with a passkey. Plain HTTP is for a daemon on this device or network (no sign-in).")
             }
             .listRowBackground(Color.lapis.card)
 
-            Section("Account") {
+            Section {
                 LabeledContent("Status", value: accountText)
                 if info.account == .signedIn {
                     Button("Sign out", role: .destructive, action: onSignOut)
                         .accessibilityIdentifier("settings.signOut")
                 }
+            } header: {
+                SettingsHeader("Account")
             }
             .listRowBackground(Color.lapis.card)
 
@@ -458,14 +460,14 @@ struct AccountSettingsScreen: View {
                     }
                 }
             } header: {
-                Text("Sync")
+                SettingsHeader("Sync")
             } footer: {
                 Text("Edits made offline wait in the outbox and send in order when the connection is back.")
             }
             .listRowBackground(Color.lapis.card)
 
             if let error = info.lastError {
-                Section("Last error") { Text(error).font(.footnote).foregroundStyle(Color.lapis.ink3) }
+                Section { Text(error).font(.footnote).foregroundStyle(Color.lapis.ink3) } header: { SettingsHeader("Last error") }
                     .listRowBackground(Color.lapis.card)
             }
         }
@@ -508,3 +510,18 @@ struct AccountSettingsScreen: View {
     .preferredColorScheme(.dark)
 }
 #endif
+
+/// A Settings section's title as the artboard sets it: small capitals in
+/// the quiet ink (VoiceOver reads the word as written).
+struct SettingsHeader: View {
+    let title: String
+    init(_ title: String) { self.title = title }
+
+    var body: some View {
+        Text(title.uppercased())
+            .lapisFont(.label)
+            .foregroundStyle(Color.lapis.ink3)
+            .accessibilityLabel(title)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
