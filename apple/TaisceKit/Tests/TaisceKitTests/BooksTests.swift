@@ -148,11 +148,12 @@ enum BookFixture {
     }
 
     @Test func redirectsToAnotherHostDropTheBearer() async throws {
-        var original = URLRequest(url: try #require(URL(string: "https://taisce.example/api/books/b1/cover")))
+        let coverURL = try #require(URL(string: "https://taisce.example/api/books/b1/cover"))
+        var original = URLRequest(url: coverURL)
         original.setValue("Bearer t", forHTTPHeaderField: "Authorization")
         let task = URLSession(configuration: .ephemeral).dataTask(with: original)
         let d = StripAuthOnRedirect()
-        let resp = try #require(HTTPURLResponse(url: try #require(original.url), statusCode: 302, httpVersion: nil, headerFields: nil))
+        let resp = try #require(HTTPURLResponse(url: coverURL, statusCode: 302, httpVersion: nil, headerFields: nil))
         var s3 = original
         s3.url = URL(string: "https://bucket.s3.eu-west-1.amazonaws.com/library/x.jpg?X-Amz-Signature=abc")
         let next = await d.urlSession(.shared, task: task, willPerformHTTPRedirection: resp, newRequest: s3)
@@ -169,7 +170,8 @@ enum BookFixture {
         let api = server.client()
         let found = try await api.findCoverCandidates("b1", refresh: false, title: "Red Tithe", author: " Robbie MacNiven ")
         #expect(found.candidates.first?.sourceLabel == "Title match")
-        let body = try #require(try JSONSerialization.jsonObject(with: server.requests[0].httpBody ?? Data()) as? [String: Any])
+        let parsed = try JSONSerialization.jsonObject(with: server.requests[0].httpBody ?? Data())
+        let body = try #require(parsed as? [String: Any])
         #expect(body["title"] as? String == "Red Tithe" && body["author"] as? String == "Robbie MacNiven" && body["refresh"] as? Bool == true)
         _ = try await api.findCoverCandidates("b1", refresh: false, title: nil, author: nil)
         #expect(String(data: server.requests[1].httpBody ?? Data(), encoding: .utf8) == #"{"refresh":false}"#)
