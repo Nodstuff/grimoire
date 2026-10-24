@@ -30,43 +30,47 @@ extension ScreenHeader where Trailing == EmptyView {
     }
 }
 
-/// The to-do status ring: rose overdue, amber due today, grey otherwise.
+/// The to-do ring: red when overdue, a quiet grey otherwise, a green tick
+/// when done. The shape (and the row's words) carry it, not colour alone.
 struct TodoRing: View {
     let tone: DueLabel.Tone
     var done = false
 
     var color: Color {
         if done { return Color.lapis.green }
-        return switch tone {
-        case .overdue: Color.lapis.red
-        case .today: Color.lapis.yellowMark
-        case .later, .none: Color.lapis.ink3
-        }
+        return tone == .overdue ? Color.lapis.red : Color.lapis.ink3
     }
 
     var body: some View {
         ZStack {
-            Circle().strokeBorder(color, lineWidth: 2)
             if done {
-                Image(systemName: "checkmark").font(.system(size: 11, weight: .bold)).foregroundStyle(color)
+                Circle().fill(color)
+                Image(systemName: "checkmark").font(.caption2.weight(.bold)).foregroundStyle(Color.lapis.onAccent)
+            } else {
+                Circle().strokeBorder(color, lineWidth: 1.75)
             }
         }
-        .frame(width: 20, height: 20)
+        .frame(width: 24, height: 24)
         .accessibilityHidden(true)
     }
 }
 
-/// One to-do row inside a card list.
+/// One to-do row: the ring, the text with where it came from, and when
+/// it's due as a pill. `shortPill` drops what the list's group already
+/// says ("Thu" under Overdue instead of "Overdue · Thu").
 struct TodoRow: View {
     let entry: TodoEntry
     var now: Date = .now
     var done = false
+    var shortPill = false
     /// the ring as a button (tap to mark done / undo); nil = a plain ring
     var onToggle: (() -> Void)?
+    /// accessibility text sizes: the pill goes under the text, not beside it
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         let label = DueLabel.make(entry, now: now)
-        HStack(alignment: .center, spacing: 14) {
+        HStack(alignment: .center, spacing: 12) {
             if let onToggle {
                 Button(action: onToggle) {
                     TodoRing(tone: label.tone, done: done)
@@ -74,41 +78,43 @@ struct TodoRow: View {
                         .contentShape(.rect)
                 }
                 .buttonStyle(.borderless)
-                .padding(.horizontal, -12)
-                .accessibilityLabel(done ? "Mark not done" : "Mark done")
+                .padding(.horizontal, -10)
+                .accessibilityLabel(done ? "Mark \(entry.text) not done" : "Complete \(entry.text)")
                 .sensoryFeedback(.success, trigger: done) { old, new in new && !old }
             } else {
                 TodoRing(tone: label.tone, done: done)
             }
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(InlineMarkdown.attributed(entry.text))
-                    .font(.subheadline)
+                    .font(.body)
                     .foregroundStyle(Color.lapis.ink)
                     .strikethrough(done, color: Color.lapis.ink3)
                     .opacity(done ? 0.55 : 1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                if let text = label.text {
-                    Text(text).font(.caption).foregroundStyle(subtitleColor(label.tone))
+                    .lineLimit(3)
+                if let source = entry.sourceLine(now: now) {
+                    Text(source).font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(2)
                 }
-                if let note = entry.note {
-                    Text(note).font(.caption).foregroundStyle(Color.lapis.ink3).lineLimit(2)
-                }
+                if typeSize.isAccessibilitySize, let pill = pill(label) { pill }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if !typeSize.isAccessibilitySize, let pill = pill(label) { pill.fixedSize() }
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .frame(minHeight: Lapis.Layout.minTarget)
+        .frame(minHeight: 52)
         .contentShape(.rect)
         .animation(.easeOut(duration: 0.25), value: done)
         .accessibilityElement(children: onToggle == nil ? .combine : .contain)
-        .accessibilityLabel([entry.text, label.text].compactMap { $0 }.joined(separator: ", "))
     }
 
-    func subtitleColor(_ tone: DueLabel.Tone) -> Color {
-        switch tone {
-        case .overdue: Color.lapis.red
-        case .today: Color.lapis.yellow
-        case .later, .none: Color.lapis.ink3
+    private func pill(_ label: DueLabel) -> DeadlinePill? {
+        guard shortPill else { return DeadlinePill(label) }
+        guard let text = DueLabel.short(entry, now: now) else { return nil }
+        return switch label.tone {
+        case .overdue: DeadlinePill(.overdue, text)
+        case .today: DeadlinePill(.today, text)
+        case .later: DeadlinePill(.upcoming, text)
+        case .none: nil
         }
     }
 }
@@ -126,6 +132,25 @@ struct CardList<Item: Identifiable, Row: View>: View {
             }
         }
         .card()
+    }
+}
+
+/// The phone's grouped list (iOS-style): rows in one flat card, hairlines
+/// inset past the leading ring or icon.
+struct GroupedRows<Item: Identifiable, Row: View>: View {
+    let items: [Item]
+    var separatorInset: CGFloat = 54
+    @ViewBuilder var row: (Item) -> Row
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(items.enumerated()), id: \.element.id) { i, item in
+                if i > 0 { Rectangle().fill(Color.lapis.line2).frame(height: 1).padding(.leading, separatorInset) }
+                row(item)
+            }
+        }
+        .background(Color.lapis.card, in: .rect(cornerRadius: Lapis.Radius.tab, style: .continuous))
+        .clipShape(.rect(cornerRadius: Lapis.Radius.tab, style: .continuous))
     }
 }
 

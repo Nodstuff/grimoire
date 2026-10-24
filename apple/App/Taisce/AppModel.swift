@@ -67,8 +67,10 @@ final class AppModel {
     /// the first catch-up (or a cached body from an earlier run) has
     /// landed: before it, empty to-do lists mean "loading", not "nothing"
     private(set) var hasSynced = false
-    /// overdue + due today, for the iPad sidebar's Today badge
+    /// overdue + due today
     private(set) var dueCount = 0
+    /// every open to-do on the To-dos screen: the sidebar's To-dos count
+    private(set) var openTodoCount = 0
 
     // workspaces (Workspaces.swift): Today, Library, Pinned, To-dos and
     // search show the current one; alerts span them all
@@ -133,6 +135,8 @@ final class AppModel {
     let shareLinks = ShareLinkStore()
     /// open review items per doc (the Library's flags; ReviewCounts in Presentation/DocReview.swift)
     let reviewCounts = ReviewCounts()
+    /// Today's review queue, book in progress and the person's name (HomeStore.swift)
+    let home = HomeStore()
     /// a comment push was tapped: the frontmost window opens that doc's link comments
     private(set) var linkCommentsRequest: LinkCommentsRequest?
 
@@ -154,6 +158,7 @@ final class AppModel {
         codeRuns.app = self
         shareLinks.app = self
         sqlRuns.app = self
+        home.app = self
     }
 
     var needsSignIn: Bool { authPhase == .signedOut }
@@ -314,6 +319,7 @@ final class AppModel {
         codeRuns.reset()
         sqlRuns.reset()
         shareLinks.reset()
+        home.reset()
         linkCommentsRequest = nil
         settledTodos = []
         pendingEditDoc = nil
@@ -470,6 +476,7 @@ final class AppModel {
             await loadCachedWorkspaces(cache) // workspaces
             editMeta = [:]
             shareLinks.reset()
+            home.reset()
             treeLoaded = false
             await sync.setAlwaysFetch(Set(pins))
             observeTask = Task { [weak self] in
@@ -783,6 +790,7 @@ final class AppModel {
         let visible = dated.filter { !settled.contains($0.id) }
         let board = TodoBoard.build(dated: visible, undated: undated.filter { !settled.contains($0.id) }, now: now)
         dueCount = board.due.count
+        openTodoCount = board.count
         return (board, offline)
     }
 
