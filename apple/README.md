@@ -935,7 +935,9 @@ The iPhone-Today, iPhone-Todos, iPhone-Search and iPhone-Settings artboards
   server's reading of `due …` as a pill), Overdue / Today / Upcoming with
   short pills ("Thu", "15:00"), swipe right Done, left Snooze or More, a
   context menu, and a filter menu.
-- Search: the system field (bottom on iPhone, toolbar on iPad/Mac),
+- Search: the system field (`.searchable` on the screen: the navigation
+  bar on iPhone, as iOS 27 places it even in the search tab; the toolbar on
+  iPad/Mac; the artboard's bottom field is not something the app can force),
   Docs / Books / Ask. Docs as before (offline FTS fallback, tag and
   workspace chips); Books searches `GET /api/books?search=` (SERVER mode);
   Ask posts `/api/ask`, reads the answer doc (`AskAnswerText`: the
@@ -948,7 +950,10 @@ The iPhone-Today, iPhone-Todos, iPhone-Search and iPhone-Settings artboards
   addresses, never stored), new password, remove or revoke with a
   confirmation; Appearance (theme; on the Mac the doc text size);
   Notifications; Shared links; Data sources (Mac); Sync.
-- Tests: `HomeTests` (app: review copy, continue reading, due rows, pills,
+- Large text: at accessibility sizes a to-do's pill and a review row's
+  chip, title and author stack under each other instead of widening the page.
+- Tests: `ShellShotsUITests` (landscape iPad shots of these screens, skipped
+  unless `TEST_RUNNER_TAISCE_SHOTS` names a directory), `HomeTests` (app: review copy, continue reading, due rows, pills,
   Ask parsing, routes), `HomeAPITests` (kit: queue, resolve, books, ask,
   e-readers, tokens).
 
