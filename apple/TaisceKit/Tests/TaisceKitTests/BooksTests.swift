@@ -398,3 +398,50 @@ enum BookFixture {
         #expect(cache.load() == nil)
     }
 }
+
+@Suite struct ReaderSettingsTests {
+    @Test func storedSettingsFallBackFieldByField() throws {
+        let raw = #"{"paper":"sepia","fontSize":133,"lineHeight":1.7,"margins":"vast","flow":"scrolled","face":"book"}"#
+        let s = try JSONDecoder().decode(ReaderSettings.self, from: Data(raw.utf8))
+        #expect(s.paper == .sepia && s.lineHeight == 1.7 && s.flow == .scrolled && s.face == .book)
+        // off the ladder / unknown: the default, not a broken reader
+        #expect(s.fontSize == 100 && s.margins == .normal)
+        let empty = try JSONDecoder().decode(ReaderSettings.self, from: Data("{}".utf8))
+        #expect(empty == .defaults)
+        let back = try JSONDecoder().decode(ReaderSettings.self, from: JSONEncoder().encode(s))
+        #expect(back == s)
+    }
+
+    @Test func laddersClamp() {
+        #expect(ReaderSettings.step(ReaderSettings.fontSizes, 100, 1) == 110)
+        #expect(ReaderSettings.step(ReaderSettings.fontSizes, 170, 1) == 170)
+        #expect(ReaderSettings.step(ReaderSettings.fontSizes, 80, -1) == 80)
+        var s = ReaderSettings.defaults
+        s.fontSize = 170
+        #expect(!s.canGrow && s.canShrink)
+    }
+
+    /// The page's look: Auto follows the app, papers are the web reader's
+    /// `--read-*` values, the margins the web's `layoutFor`.
+    @Test func looksMatchTheWebReader() {
+        var s = ReaderSettings.defaults
+        #expect(s.look(dark: true, phone: true, reduceMotion: false).paper == "#12161d")
+        #expect(s.look(dark: false, phone: true, reduceMotion: false).paper == "#ffffff")
+        s.paper = .sepia
+        let sepia = s.look(dark: true, phone: false, reduceMotion: true)
+        #expect(sepia.paper == "#f4ecd8" && sepia.ink == "#3b2f1f" && sepia.scheme == "light" && !sepia.animated)
+        #expect(sepia.gap == "7%" && sepia.margin == "64px" && sepia.maxInline == "720px")
+        s.margins = .wide
+        #expect(s.layout(phone: true).gap == "12%" && s.layout(phone: false).maxInline == "600px")
+        let rgb = ReaderPaperColours.rgb("#f4ecd8")
+        #expect(rgb.map { Int(($0.r * 255).rounded()) } == 0xF4)
+        #expect(ReaderPaperColours.rgb("nope") == nil)
+    }
+
+    @Test func progressLine() {
+        #expect(ReaderFormat.minutesLeft(12.4) == "12 min left in chapter")
+        #expect(ReaderFormat.minutesLeft(0.2) == "Less than a minute left in chapter")
+        #expect(ReaderFormat.minutesLeft(0) == nil && ReaderFormat.minutesLeft(nil) == nil && ReaderFormat.minutesLeft(.nan) == nil)
+        #expect(ReaderFormat.percent(0.256) == 26 && ReaderFormat.percent(1.4) == 100 && ReaderFormat.percent(nil) == 0)
+    }
+}

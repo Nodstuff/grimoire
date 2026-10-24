@@ -200,4 +200,33 @@ final class BooksUITests: XCTestCase {
         XCTAssertEqual(kept["device_id"] as? String, "dev-kindle", "our stale write did not drag the Kindle back")
         print("BOOKS-UITEST kept \(kept)")
     }
+
+    /// The reading settings: paper, then back to Auto (the next run starts clean).
+    func testReaderSettings() throws {
+        let id = try bookID(env["TAISCE_UI_READ_TITLE"] ?? "The Time Machine")
+        let app = launch(["-read", id])
+        XCTAssertTrue(app.descendants(matching: .any)["reader.progress"].firstMatch.waitForExistence(timeout: 40), "the book opened")
+        RunLoop.current.run(until: Date().addingTimeInterval(2.5)) // the bar steps aside
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        let settings = app.buttons["reader.settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 5), "the bar came back")
+        shot(app, "reader-chrome")
+        settings.tap()
+        let sepia = app.buttons["Sepia paper"]
+        XCTAssertTrue(sepia.waitForExistence(timeout: 5))
+        sepia.tap()
+        RunLoop.current.run(until: Date().addingTimeInterval(1))
+        shot(app, "reader-settings-sepia")
+        app.buttons["Done"].firstMatch.tap()
+        RunLoop.current.run(until: Date().addingTimeInterval(1.5))
+        shot(app, "reader-sepia")
+        settings.tap()
+        app.buttons["Dark paper"].tap()
+        app.buttons["Done"].firstMatch.tap()
+        RunLoop.current.run(until: Date().addingTimeInterval(1.5))
+        shot(app, "reader-dark")
+        settings.tap()
+        app.buttons["Auto paper"].tap()
+        app.buttons["Done"].firstMatch.tap()
+    }
 }

@@ -282,7 +282,7 @@ private struct ReaderSettingsSheet: View {
                     }
                     .buttonStyle(.borderless)
                     Picker("Line spacing", selection: $reader.settings.lineHeight) {
-                        ForEach(ReaderSettings.lineHeights, id: \.self) { Text(String(format: "%.2g", $0)).tag($0) }
+                        ForEach(ReaderSettings.lineHeights, id: \.self) { Text(String($0)).tag($0) }
                     }
                     Picker("Typeface", selection: $reader.settings.face) {
                         ForEach(ReaderSettings.Face.allCases) { Text($0.title).tag($0) }
