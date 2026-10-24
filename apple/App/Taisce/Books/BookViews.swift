@@ -185,24 +185,17 @@ struct CoverTintReader: ViewModifier {
     let book: Book
     let url: URL?
     @Binding var tint: Color?
-    @Environment(BookStoreBox.self) private var box
+    @Environment(\.coverImageLoader) private var loader
 
     func body(content: Content) -> some View {
         content.task(id: url) {
-            guard let url, let img = await box.store.coverLoader.load(url) else {
+            guard let url, let loader, let img = await loader.load(url) else {
                 tint = CoverTint.typographic(book.id)
                 return
             }
             tint = CoverTint.average(img) ?? CoverTint.typographic(book.id)
         }
     }
-}
-
-/// The store, in the environment for views that aren't handed it.
-@MainActor @Observable
-final class BookStoreBox {
-    let store: BookStore
-    init(_ store: BookStore) { self.store = store }
 }
 
 /// A transient UI file to hand the share sheet (Open in Books, AirDrop, Files).

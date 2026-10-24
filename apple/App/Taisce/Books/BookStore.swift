@@ -83,7 +83,7 @@ final class BookStore {
         do {
             let books = try await api.allBooks()
             async let reading = try? api.currentlyReading()
-            async let ereaders = try? api.ereaders()
+            async let ereaders = try? api.pairedEreaders()
             let progress = (try? await api.bookProgress(ids: books.map(\.id))) ?? shelf.progress
             let next = BookShelf(books: books, progress: progress, reading: await reading ?? [],
                                  ereaderCount: (await ereaders)?.filter(\.isActive).count ?? shelf.ereaderCount)
@@ -192,13 +192,41 @@ final class BookStore {
     /// The EPUB written to a temporary file named as the feed names it, to
     /// share (Open in Books, AirDrop, Save to Files).
     func exportFile(_ source: ReadingSource, name: String) async throws -> URL {
-        guard let api else { throw APIError.unauthorized }
-        let data = try await api.epub(source)
+        let cached = try await epubFile(source)
         let dir = FileManager.default.temporaryDirectory.appending(path: "epub-share/\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let file = dir.appending(path: name)
-        try data.write(to: file, options: .atomic)
+        try FileManager.default.copyItem(at: cached, to: file)
         return file
+    }
+
+    /// The book's EPUB on this device (Caches, per server), fetched when
+    /// missing or when the book changed on the server since; a doc renders
+    /// fresh each time. Offline, the last copy opens.
+    func epubFile(_ source: ReadingSource) async throws -> URL {
+        let dir = Self.directory.appending(path: "\(serverKey)/epubs", directoryHint: .isDirectory)
+        let stamp: String = switch source {
+        case let .book(id): book(id).map { "\($0.updated)|\($0.size)" } ?? ""
+        case .doc: ""
+        }
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for b in stamp.utf8 { h = (h ^ UInt64(b)) &* 0x100_0000_01b3 }
+        let file = dir.appending(path: "\(source.key)-\(String(h, radix: 16)).epub")
+        let fm = FileManager.default
+        if case .book = source, !stamp.isEmpty, fm.fileExists(atPath: file.path()) { return file }
+        let older = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.lastPathComponent.hasPrefix(source.key + "-") }
+        do {
+            guard let api else { throw APIError.unauthorized }
+            let data = try await api.epub(source)
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            try data.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            for f in older where f != file { try? fm.removeItem(at: f) }
+            return file
+        } catch let e as URLError {
+            if let last = older.first { return last }
+            throw e
+        }
     }
 
     // MARK: covers

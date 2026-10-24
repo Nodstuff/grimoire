@@ -253,7 +253,7 @@ final class AppModel {
             freshSignIn = true
             ownerChecked = false
             ownerSettled = false
-            try await auth.signIn(using: SystemWebAuthenticator())
+            try await auth.signIn(using: Self.webAuthenticator())
             // the state stream flips authPhase and starts sync
         } catch AuthError.cancelled {
             freshSignIn = false

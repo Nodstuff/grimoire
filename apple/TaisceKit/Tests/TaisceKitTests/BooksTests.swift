@@ -202,7 +202,7 @@ enum BookFixture {
 
     @Test func ereadersDecode() async throws {
         let server = MockServer { _ in .json(#"{"ereaders":[{"id":"e1","label":"Kindle","stream_downloads":false,"created_at":"2026-09-01T00:00:00Z","last_used_at":null,"revoked_at":null},{"id":"e2","label":"Old","stream_downloads":false,"created_at":"x","last_used_at":null,"revoked_at":"2026-09-02T00:00:00Z"}]}"#) }
-        let list = try await server.client().ereaders()
+        let list = try await server.client().pairedEreaders()
         #expect(list.filter(\.isActive).map(\.label) == ["Kindle"])
     }
 }
