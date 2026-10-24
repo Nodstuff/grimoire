@@ -80,7 +80,8 @@ struct WorkspaceSwitcher: View {
                 }
                 .padding(.horizontal, 12)
                 .frame(minHeight: 30)
-                .background(Color.lapis.card2, in: .capsule)
+                .background(Color.lapis.card, in: .capsule)
+                .overlay(Capsule().strokeBorder(Color.lapis.line2, lineWidth: 1))
                 .frame(minHeight: Lapis.Layout.minTarget)
                 .contentShape(.rect)
             }
@@ -446,7 +447,7 @@ struct WorkspaceChip: View {
         }
         .padding(.horizontal, 8)
         .frame(minHeight: 22)
-        .background(Color.lapis.card2, in: .capsule)
+        .overlay(Capsule().strokeBorder(Color.lapis.line2, lineWidth: 1))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Workspace: \(badge.accessibilityName)")
     }

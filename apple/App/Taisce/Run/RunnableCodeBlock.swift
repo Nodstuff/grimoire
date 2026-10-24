@@ -64,7 +64,7 @@ private struct RunnableCodeCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card(Color.lapis.card2)
+        .card(Color.lapis.code, radius: Lapis.Radius.field, elevated: false)
         .sheet(item: TrustFlow.presentation(store, s)) { p in
             TrustSheet(prompt: p, store: store, state: s)
         }
@@ -316,7 +316,7 @@ struct TrustSheet: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(minHeight: 120, maxHeight: 420)
-            .background(Color.lapis.card2, in: .rect(cornerRadius: 10, style: .continuous))
+            .background(Color.lapis.code, in: .rect(cornerRadius: Lapis.Radius.field, style: .continuous))
             Text("It runs \(prompt.request.cwd.map { "in \($0) " } ?? "")as you, with your login environment, including any tokens or keys in it.")
                 .font(.caption)
                 .foregroundStyle(Color.lapis.ink3)

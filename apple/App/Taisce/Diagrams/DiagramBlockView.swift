@@ -66,7 +66,7 @@ struct RenderedDiagramBlock: View {
     @ViewBuilder private var content: some View {
         switch phase {
         case .rendering:
-            Shimmer().frame(height: 180).accessibilityLabel("Diagram, rendering")
+            SkeletonBlock(height: 180).accessibilityLabel("Diagram, rendering")
         case let .image(image):
             Button { showsFull = true } label: {
                 Image(uiImage: image)
@@ -83,28 +83,6 @@ struct RenderedDiagramBlock: View {
         case let .failed(message):
             DiagramNoticeCard(icon: "exclamationmark.triangle", title: "\(kind == .reladraw ? "Reladraw" : "Mermaid") diagram couldn't render", detail: message, tint: Color.lapis.yellow)
         }
-    }
-}
-
-/// A placeholder that breathes while the diagram renders.
-struct Shimmer: View {
-    @State private var lit = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        RoundedRectangle(cornerRadius: Lapis.Radius.card, style: .continuous)
-            .fill(Color.lapis.card2)
-            .overlay {
-                LinearGradient(colors: [.clear, Color.lapis.line.opacity(0.9), .clear], startPoint: .leading, endPoint: .trailing)
-                    .offset(x: lit ? 260 : -260)
-                    .clipShape(RoundedRectangle(cornerRadius: Lapis.Radius.card, style: .continuous))
-                    .opacity(reduceMotion ? 0 : 1)
-            }
-            .overlay(RoundedRectangle(cornerRadius: Lapis.Radius.card, style: .continuous).strokeBorder(Color.lapis.line, lineWidth: 1))
-            .onAppear {
-                guard !reduceMotion else { return }
-                withAnimation(.linear(duration: 1.3).repeatForever(autoreverses: false)) { lit = true }
-            }
     }
 }
 

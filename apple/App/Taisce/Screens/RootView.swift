@@ -330,7 +330,8 @@ struct PadSidebar: View {
                     }
                     .padding(.horizontal, 10)
                     .frame(minHeight: 34)
-                    .background(Color.lapis.card2, in: .rect(cornerRadius: 10, style: .continuous))
+                    .background(Color.lapis.card, in: .rect(cornerRadius: Lapis.Radius.field, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: Lapis.Radius.field, style: .continuous).strokeBorder(Color.lapis.line2, lineWidth: 1))
                     .padding(.vertical, 6)
                     .onChange(of: router.searchQuery) { _, q in
                         if !q.isEmpty, router.padItem != .search { router.select(.search) }
@@ -507,7 +508,7 @@ private struct SidebarItem: View {
         .padding(.horizontal, 8)
         .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
-            .fill(selected ? Color.lapis.accent.opacity(0.16) : pointer ? Color.lapis.ink.opacity(0.06) : .clear))
+            .fill(selected ? Color.lapis.accentSoft : pointer ? Color.lapis.hover : .clear))
         .contentShape(.rect)
         .onHover { pointer = $0 }
         .onTapGesture(perform: action)

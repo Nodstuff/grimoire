@@ -1,32 +1,6 @@
 import SwiftUI
 import TaisceKit
 
-/// A small uppercase section label ("DUE", "PINNED").
-struct SectionLabel: View {
-    let title: String
-    var color: Color = Color.lapis.ink3
-    var trailing: AnyView?
-
-    init(_ title: String, color: Color = Color.lapis.ink3, trailing: AnyView? = nil) {
-        self.title = title
-        self.color = color
-        self.trailing = trailing
-    }
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(title.uppercased())
-                .font(.caption.weight(.semibold))
-                .tracking(1.4)
-                .foregroundStyle(color)
-                .accessibilityAddTraits(.isHeader)
-            Spacer()
-            trailing
-        }
-        .padding(.horizontal, 4)
-    }
-}
-
 /// The big serif screen title with an optional line above it.
 struct ScreenHeader<Trailing: View>: View {
     let title: String
@@ -65,7 +39,7 @@ struct TodoRing: View {
         if done { return Color.lapis.green }
         return switch tone {
         case .overdue: Color.lapis.red
-        case .today: Color.lapis.yellow
+        case .today: Color.lapis.yellowMark
         case .later, .none: Color.lapis.ink3
         }
     }
@@ -181,43 +155,6 @@ struct DocCard: View {
     }
 }
 
-/// `#design`
-struct TagChip: View {
-    let tag: String
-
-    var body: some View {
-        Text("#\(tag)")
-            .font(.caption2.weight(.medium))
-            .foregroundStyle(Color.lapis.ink3)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(Color.lapis.card2, in: .rect(cornerRadius: 6, style: .continuous))
-    }
-}
-
-/// A filter chip ("All", "#design") at touch-target height.
-struct FilterChip: View {
-    let title: String
-    let selected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Text(title)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(selected ? Color.lapis.onAccent : Color.lapis.ink)
-                .padding(.horizontal, 12)
-                .frame(minHeight: 28)
-                .background(selected ? Color.lapis.accent : Color.lapis.card2, in: .capsule)
-                .overlay(Capsule().strokeBorder(selected ? .clear : Color.lapis.line))
-                .frame(minHeight: Lapis.Layout.minTarget)
-                .contentShape(.rect)
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-}
-
 /// The sync dot / chip.
 struct SyncChip: View {
     let badge: SyncBadge
@@ -244,32 +181,6 @@ struct SyncChip: View {
     }
 }
 
-/// A deliberate empty state inside a card: an icon, a line, and a hint.
-struct EmptyCard: View {
-    let icon: String
-    let title: String
-    let hint: String
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 14) {
-            Image(systemName: icon)
-                .font(.body)
-                .foregroundStyle(Color.lapis.accent)
-                .frame(width: 28)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.subheadline.weight(.medium)).foregroundStyle(Color.lapis.ink)
-                Text(hint).font(.caption).foregroundStyle(Color.lapis.ink3)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .card()
-        .accessibilityElement(children: .combine)
-    }
-}
-
 /// A search field look-alike that opens Search when tapped.
 struct SearchFieldButton: View {
     let action: () -> Void
@@ -283,7 +194,8 @@ struct SearchFieldButton: View {
             }
             .padding(.horizontal, 12)
             .frame(minHeight: Lapis.Layout.minTarget)
-            .background(Color.lapis.card2, in: .rect(cornerRadius: 12, style: .continuous))
+            .background(Color.lapis.card, in: .rect(cornerRadius: Lapis.Radius.field, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: Lapis.Radius.field, style: .continuous).strokeBorder(Color.lapis.line2, lineWidth: 1))
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
@@ -305,7 +217,8 @@ struct CircleIconButton: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(filled ? Color.lapis.onAccent : Color.lapis.ink3)
                 .frame(width: 34, height: 34)
-                .background(filled ? Color.lapis.accent : Color.lapis.card2, in: .circle)
+                .background(filled ? Color.lapis.accent : Color.lapis.card, in: .circle)
+                .overlay(Circle().strokeBorder(filled ? .clear : Color.lapis.line2, lineWidth: 1))
                 .frame(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget)
                 .contentShape(.rect)
         }

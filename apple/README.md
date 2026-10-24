@@ -34,10 +34,56 @@ apple/
     Tests/TaisceKitTests/    Swift Testing + a URLProtocol mock server
   App/                         the iOS app (xcodegen)
     project.yml
-    Taisce/                    AppModel, Router, Theme (tokens), Presentation (pure view models),
-                               Views (components, block renderer), Screens
+    Taisce/                    AppModel, Router, Theme (Lapis tokens, type, appearance, haptics),
+                               Components (Lapis components), Presentation (pure view models),
+                               Views (app views, block renderer), Screens
     TaisceTests/               view-model tests (Swift Testing, hosted in the app)
 ```
+
+## Design: Lapis
+
+The app speaks Lapis, the design language the web shares
+(`ui/src/lapis/tokens.css`, canvas artboard Lapis-System). Screens never
+name a hex or a size; they use the foundation in `Taisce/Theme/` and
+`Taisce/Components/`:
+
+- Colour: `Color.lapis.*` / `.foregroundStyle(.lapis.ink2)` / `UIColor.lapis.*`
+  (`LapisColors.swift`): grounds and cards, three inks, lines, the lapis
+  accent, agent violet, verdict green/yellow/red with soft fills and
+  on-colours, workspace colours, shadows. Each is a dynamic `UIColor`
+  (system appearance, Settings › Appearance, Increase Contrast). Three
+  native-only fills (`greenFill`, `yellowFill`, `redFill`) carry white text
+  at AA (swipe actions).
+- Appearance: Settings › Appearance (System / Light / Dark), stored under
+  `UserSettings.appearanceKey` (a device preference: it survives sign-out),
+  applied as the window's `overrideUserInterfaceStyle` (`.lapisAppearance()`
+  on the root), so sheets, the editor and Mac Catalyst windows follow.
+- Type (`LapisType.swift`): docs, titles and covers in **Newsreader**; the
+  interface in SF Pro's semantic styles; agent names and code in SF Mono.
+  `.lapisFont(.docTitle)`, `.docBody`, `.docHeading1…3`, `.cardTitle`,
+  `.screenTitle`, `.display`, `.coverTitle`; serif styles scale with Dynamic
+  Type on iOS and with `docScale` on the Mac (Catalyst answers text styles at
+  `.large`). The editor uses the same scale (`SurfaceLook`).
+- Newsreader is bundled as two variable fonts (`Resources/Fonts/`,
+  `UIAppFonts` in both Info plists), `opsz` following the point size.
+  Provenance: `ofl/newsreader/` in google/fonts at `8b0a1d0f5983c89bc2b93f1b5fb55f9e252744b5`
+  (upstream productiontype/Newsreader), SIL OFL 1.1 (`Newsreader.OFL.txt`).
+  `Newsreader-VF.ttf` = `Newsreader[opsz,wght].ttf`, sha256
+  `8a08d13f8a6c0d51be379a60af84f945f65369a67e509ee3c3bdcc421254d7c1`;
+  `Newsreader-Italic-VF.ttf` = `Newsreader-Italic[opsz,wght].ttf`, sha256
+  `796668611f80b64d5adf182fde3b6f29ed83b4e7cbec7b96937e84ac01364792`.
+- Metrics: `Lapis.Space`, `Lapis.Radius`, `Lapis.Layout` (44 pt targets,
+  680 pt reading width), `Lapis.Motion`, `.lapisShadow()`, `.card()`.
+- Components (each with light and dark previews): `VerdictChip`,
+  `SaveStateDot`, `LapisAvatar` / `AgentBadge`, `StatusChip`, `TagChip`,
+  `FilterChip`, `CountPill`, `DeadlinePill`, `.buttonStyle(.lapis(…))`
+  (primary, secondary, ghost, destructive, keep, revert), `LapisSection`,
+  `LapisCard`, `EmptyState`, `EmptyCard`, `InlineChangeCard` (+ `WordDiff`),
+  `.lapisToast`, `LapisBanner`, `SkeletonBlock` / `SkeletonLines` /
+  `.shimmering()`, `ProgressBar`, `BookCover` (the web's typographic covers:
+  same 12 palettes, same FNV-1a hash). `Haptics` for imperative feedback.
+- Tests: `LapisTests` (tokens against the web, contrast, the font's axes and
+  scaling, word diff, cover hashes against the web's).
 
 ## Build and test
 
@@ -756,8 +802,8 @@ web view. `ChartSpec.parse` (TaisceKit `Charts/`, pure) maps the JSON to a
 - Anything else (transforms, facets, concat, other marks) is a "Chart type
   not supported on iPhone yet" card naming the mark; invalid JSON is a card
   with the error and the offending line.
-- Theme: the accent first, then green, amber, rose, teal, violet, tan, grey
-  (each a dark/light pair). A temporal or categorical x with more than 24
+- Theme: Lapis, the accent first, then green, yellow, red, teal, violet,
+  orange, grey (each token a light/dark pair). A temporal or categorical x with more than 24
   values scrolls horizontally (16 visible). Swift Charts supplies audio
   graphs; each mark carries a label and value, the chart a summary.
 

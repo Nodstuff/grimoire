@@ -183,7 +183,7 @@ struct CommentView: View {
                     .foregroundStyle(Color.lapis.ink)
                 if comment.isOwner {
                     Text("You").font(.caption2.weight(.semibold)).foregroundStyle(Color.lapis.accent)
-                        .padding(.horizontal, 5).background(Color.lapis.accent.opacity(0.15), in: Capsule())
+                        .padding(.horizontal, 5).background(Color.lapis.accentSoft, in: Capsule())
                 }
                 if let at = comment.createdAt {
                     Text(RelativeTime.string(at, now: now)).font(.caption2).foregroundStyle(Color.lapis.ink3)
@@ -202,7 +202,7 @@ struct CommentView: View {
                     .foregroundStyle(Color.lapis.ink3)
                     .lineLimit(4)
                     .padding(.leading, 8)
-                    .overlay(alignment: .leading) { Rectangle().fill(Color.lapis.accent.opacity(0.6)).frame(width: 2) }
+                    .overlay(alignment: .leading) { Rectangle().fill(Color.lapis.accentRing).frame(width: 2) }
             }
             Text(comment.body)
                 .font(.body)

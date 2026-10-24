@@ -38,7 +38,7 @@ struct SQLCodeCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card(Color.lapis.card2)
+        .card(Color.lapis.code, radius: Lapis.Radius.field, elevated: false)
         .sheet(item: SQLTrustFlow.presentation(store, s)) { p in
             SQLTrustSheet(prompt: p, store: store, state: s)
         }
@@ -392,7 +392,7 @@ struct SQLTrustSheet: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(minHeight: 100, maxHeight: 360)
-            .background(Color.lapis.card2, in: .rect(cornerRadius: 10, style: .continuous))
+            .background(Color.lapis.code, in: .rect(cornerRadius: Lapis.Radius.field, style: .continuous))
             Text("It runs on \(prompt.source.name) (\(prompt.source.kind.label), \(prompt.source.summary)) with the credentials saved on this Mac.")
                 .font(.caption)
                 .foregroundStyle(Color.lapis.ink3)

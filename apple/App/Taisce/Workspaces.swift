@@ -191,8 +191,9 @@ struct WorkspaceEmptyState: Hashable, Sendable {
     }
 }
 
-/// The six swatches a workspace can wear, stored as Theme token names so
-/// they follow light/dark mode. Any other value is read as `#rrggbb`.
+/// The six swatches a workspace can wear, stored as token names (the names
+/// predate Lapis; `Color(workspaceColor:)` maps them to Lapis workspace
+/// colours) so they follow light/dark mode. Any other value is `#rrggbb`.
 enum WorkspacePalette {
     static let colors = ["accent", "green", "amber", "rose", "accentActive", "secondary"]
 

@@ -117,7 +117,8 @@ struct SearchContent: View {
             .font(.subheadline)
             .padding(.leading, 12)
             .frame(minHeight: Lapis.Layout.minTarget)
-            .background(Color.lapis.card2, in: .rect(cornerRadius: 12, style: .continuous))
+            .background(Color.lapis.card, in: .rect(cornerRadius: Lapis.Radius.field, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: Lapis.Radius.field, style: .continuous).strokeBorder(Color.lapis.line2, lineWidth: 1))
         }
     }
 
@@ -166,7 +167,7 @@ struct SearchResultCard: View {
         var s = AttributedString(result.snippet)
         for r in SearchState.matches(in: result.snippet, query: query) {
             guard let lo = AttributedString.Index(r.lowerBound, within: s), let hi = AttributedString.Index(r.upperBound, within: s) else { continue }
-            s[lo..<hi].backgroundColor = Color.lapis.accent.opacity(0.30)
+            s[lo..<hi].backgroundColor = Color.lapis.mark
             s[lo..<hi].foregroundColor = Color.lapis.ink
         }
         return s

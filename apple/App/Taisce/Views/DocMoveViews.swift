@@ -182,7 +182,8 @@ private struct DocTopLevelDrop: ViewModifier {
                             .foregroundStyle(Color.lapis.accent)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
-                            .background(Color.lapis.card2, in: .capsule)
+                            .background(Color.lapis.accentSoft, in: .capsule)
+                            .background(Color.lapis.pal, in: .capsule)
                             .allowsHitTesting(false)
                     }
                 }

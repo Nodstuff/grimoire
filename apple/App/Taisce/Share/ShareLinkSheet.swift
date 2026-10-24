@@ -422,14 +422,7 @@ struct UnreadBadge: View {
     let count: Int
 
     var body: some View {
-        Text("\(count)")
-            .font(.caption2.weight(.bold))
-            .monospacedDigit()
-            .foregroundStyle(Color.lapis.onAccent)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 1)
-            .background(Color.lapis.accent, in: Capsule())
-            .accessibilityLabel("\(count) new")
+        CountPill(n: count, tone: .accent, label: "\(count) new")
     }
 }
 

@@ -334,7 +334,7 @@ struct DiagramNoticeCard: View {
             Spacer(minLength: 0)
         }
         .padding(14)
-        .card(Color.lapis.card2)
+        .card(Color.lapis.card, elevated: false)
         .accessibilityElement(children: .combine)
     }
 }

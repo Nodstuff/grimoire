@@ -154,7 +154,7 @@ private struct QuoteView: View {
             .foregroundStyle(Color.lapis.ink3)
             .padding(.leading, 14)
             .overlay(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 1.5).fill(Color.lapis.accent.opacity(0.5)).frame(width: 3)
+                RoundedRectangle(cornerRadius: 1.5).fill(Color.lapis.accentRing).frame(width: 3)
             }
     }
 }
@@ -210,7 +210,7 @@ struct CodeBlockView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card(Color.lapis.card2)
+        .card(Color.lapis.code, radius: Lapis.Radius.field, elevated: false)
         .accessibilityLabel("Code\(label.map { ", \($0)" } ?? ""): \(code)")
     }
 }

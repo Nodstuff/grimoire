@@ -198,7 +198,8 @@ struct LibraryTree<Menu: View>: View {
                                 .foregroundStyle(Color.lapis.accent)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 4)
-                                .background(Color.lapis.card2, in: .capsule)
+                                .background(Color.lapis.accentSoft, in: .capsule)
+                                .background(Color.lapis.pal, in: .capsule)
                                 .padding(.top, 6)
                                 .allowsHitTesting(false)
                         }
@@ -402,9 +403,9 @@ private struct DocTreeRow: View {
     }
 
     private var fill: Color {
-        if hover == .into { return Color.lapis.accent.opacity(0.22) }
-        if selected { return Color.lapis.accent.opacity(0.16) }
-        if pointer { return Color.lapis.ink.opacity(0.06) }
+        if hover == .into { return Color.lapis.accentRing }
+        if selected { return Color.lapis.accentSoft }
+        if pointer { return Color.lapis.hover }
         return .clear
     }
 
@@ -436,7 +437,7 @@ private struct EmptyFolderLine: View {
             .padding(.leading, CGFloat(depth) * style.indent + 4 + 16 + 6)
             .frame(maxWidth: .infinity, minHeight: style.rowHeight * 0.8, alignment: .leading)
             .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(targeted ? Color.lapis.accent.opacity(0.12) : .clear)
+                .fill(targeted ? Color.lapis.accentSoft : .clear)
                 .padding(.leading, CGFloat(depth) * style.indent))
             .contentShape(.rect)
             .modifier(EmptyFolderDrop(folder: folder, mover: mover, targeted: $targeted, onDropped: onDropped))

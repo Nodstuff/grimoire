@@ -240,7 +240,7 @@ struct SourceEditorSheet: View {
                 }
                 CodeTextEditor(text: $text)
                     .padding(.horizontal, 12)
-                    .background(Color.lapis.card2)
+                    .background(Color.lapis.code)
             }
             .navigationTitle("Block source")
             .navigationBarTitleDisplayMode(.inline)
@@ -274,6 +274,6 @@ struct SourceEditorSheet: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.lapis.yellow.opacity(0.12))
+        .background(Color.lapis.yellowSoft)
     }
 }

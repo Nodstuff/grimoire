@@ -96,7 +96,7 @@ private struct SurfaceNotes: View {
             .buttonStyle(.borderless)
             .padding(10)
             .frame(maxWidth: Lapis.Layout.readingWidth, alignment: .leading)
-            .background(Color.lapis.red.opacity(0.08), in: .rect(cornerRadius: 10, style: .continuous))
+            .background(Color.lapis.redSoft, in: .rect(cornerRadius: Lapis.Radius.field, style: .continuous))
             .padding(.horizontal, Lapis.Layout.gutter)
             .padding(.vertical, 6)
         }
@@ -147,7 +147,7 @@ private struct CompletionList: View {
                     }
                     .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
                     .padding(.horizontal, 12)
-                    .background(i == completion.selected ? Color.lapis.accent.opacity(0.18) : .clear)
+                    .background(i == completion.selected ? Color.lapis.accentSoft : .clear)
                     .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
