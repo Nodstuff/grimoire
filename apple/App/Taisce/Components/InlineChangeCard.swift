@@ -32,6 +32,23 @@ enum WordDiff {
 
     /// The diff of `old` → `new` by words (LCS; removals before additions
     /// at each change; neighbouring segments of one kind merged).
+    /// For drawing: `segments` with a space where a removal meets an addition.
+    static func display(old: String, new: String) -> [Segment] {
+        spaced(segments(old: old, new: new))
+    }
+
+    /// A removal right before an addition with no space between them reads
+    /// as one word ("mostly.An"): a space goes between, for the eye only.
+    static func spaced(_ segs: [Segment]) -> [Segment] {
+        var out = segs
+        for i in out.indices.dropLast() where out[i].kind == .removed && out[i + 1].kind == .added {
+            if let l = out[i].text.last, let f = out[i + 1].text.first, !l.isWhitespace, !f.isWhitespace {
+                out[i].text += " "
+            }
+        }
+        return out
+    }
+
     static func segments(old: String, new: String) -> [Segment] {
         let a = tokens(old), b = tokens(new)
         // too big for an O(n·m) table: show it as a whole replacement
@@ -202,7 +219,7 @@ struct InlineChangeCard: View {
         }
     }
 
-    private var segments: [WordDiff.Segment] { WordDiff.segments(old: old, new: new) }
+    private var segments: [WordDiff.Segment] { WordDiff.display(old: old, new: new) }
 
     private var diffText: AttributedString {
         var out = AttributedString()

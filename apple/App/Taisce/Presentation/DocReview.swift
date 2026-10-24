@@ -171,3 +171,56 @@ struct OutlineEntry: Identifiable, Hashable {
         }
     }
 }
+
+/// History rows as the inspector lists them: one person's run of edits in
+/// a row (within 15 minutes) is one line, "You · 3 edits".
+struct HistoryGroup: Identifiable, Hashable {
+    var id: String
+    var who: String
+    var isAgent: Bool
+    var count: Int
+    var applied: Bool
+    /// "Rewrote a paragraph", "3 edits"
+    var summary: String
+    var date: Date?
+
+    static func make(_ history: [DocHistoryEntry], gap: TimeInterval = 15 * 60) -> [HistoryGroup] {
+        var out: [HistoryGroup] = []
+        var rows: [DocHistoryEntry] = []
+        func flush() {
+            guard let first = rows.first else { return }
+            let mine = first.principalIsYours == true && first.principalKind == "human"
+            let who = mine ? "You" : (first.principalName.isEmpty ? "someone" : first.principalName)
+            let summary = rows.count == 1 ? describe(first) : "\(rows.count) edits"
+            out.append(HistoryGroup(id: first.opID, who: who, isAgent: first.principalKind != "human" || Principal.isAgent(first.principalName),
+                                    count: rows.count, applied: first.applied, summary: summary, date: first.date))
+            rows = []
+        }
+        for row in history {
+            if let last = rows.last {
+                let same = last.principalName == row.principalName && last.applied == row.applied
+                let near = (last.date ?? .distantPast).timeIntervalSince(row.date ?? .distantPast) < gap
+                if !(same && near) { flush() }
+            }
+            rows.append(row)
+        }
+        flush()
+        return out
+    }
+
+    /// One op in words.
+    static func describe(_ row: DocHistoryEntry) -> String {
+        let subject = DocReviewItem.subject(row.content ?? "")
+        switch row.opType {
+        case "insert": return "Added \(subject)"
+        case "replace": return "Rewrote \(subject)"
+        case "delete": return "Deleted a block"
+        case "move": return "Moved a block"
+        case "rename_doc": return "Renamed the doc"
+        case "move_doc": return "Moved the doc"
+        case "set_status": return "Changed the status"
+        case let t?: return t.replacingOccurrences(of: "_", with: " ").capitalized
+        case nil: return "Edited"
+        }
+    }
+}

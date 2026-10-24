@@ -87,7 +87,7 @@ public struct DocReviewItem: Decodable, Sendable, Hashable, Identifiable {
     }
 
     /// A heading by its words in quotes; anything else by what it is.
-    static func subject(_ markdown: String) -> String {
+    public static func subject(_ markdown: String) -> String {
         let t = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.hasPrefix("#") {
             let words = t.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces)
@@ -231,5 +231,35 @@ extension DocReviewItem {
         var out: [DocID: Int] = [:]
         for i in items where i.open { out[i.docID, default: 0] += 1 }
         return out
+    }
+}
+
+/// A person in a shared workspace (`GET /api/workspaces/{id}/members`).
+public struct WorkspaceMember: Decodable, Sendable, Hashable, Identifiable {
+    public var userID: String
+    public var name: String
+    /// owner | editor | viewer
+    public var role: String
+    public var id: String { userID }
+
+    public init(userID: String, name: String, role: String) {
+        self.userID = userID
+        self.name = name
+        self.role = role
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name, role
+        case userID = "user_id"
+    }
+}
+
+extension APIClient {
+    /// Who shares a workspace with you (a member's own view; LOCAL mode
+    /// and older daemons answer nothing useful: callers show nothing).
+    public func workspaceMembers(_ id: WorkspaceID) async throws -> [WorkspaceMember] {
+        struct Body: Decodable { var members: [WorkspaceMember] }
+        let b: Body = try await get("/api/workspaces/\(id)/members")
+        return b.members
     }
 }

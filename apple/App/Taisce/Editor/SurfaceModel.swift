@@ -1395,7 +1395,7 @@ final class SurfaceModel: NSObject {
         let before = (reviews, failedBlocks, outbox, openOps)
         if let s = try? await cache.outboxState(for: docID), s != outbox { outbox = s }
         if let f = try? await cache.failedBlocks(docID), f != failedBlocks { failedBlocks = f }
-        if let api, app?.isOnline == true, openOps == nil || Date().timeIntervalSince(lastReviewFetch) > 15 {
+        if let api, app?.isOnline == true || !reviewLoaded, openOps == nil || !reviewLoaded || Date().timeIntervalSince(lastReviewFetch) > 15 {
             lastReviewFetch = Date()
             // a failed or slow fetch keeps the last set the server gave us
             if let items = await Self.fetchReviewItems(api, docID) {

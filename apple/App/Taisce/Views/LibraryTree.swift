@@ -30,13 +30,36 @@ struct DocTreeHover: Equatable {
     var zone: DocDropZone
 }
 
-/// How the tree is drawn: compact sidebar rows (iPad, Mac) or the Library
-/// tab's taller rows with subtitles (iPhone).
+/// How the tree is drawn: sidebar rows (iPad 40 pt, the Mac 28 pt) or the
+/// Library tab's card rows (iPhone, 48 pt, with a hairline between).
 enum DocTreeStyle {
     case sidebar, library
 
-    var rowHeight: CGFloat { self == .sidebar ? 30 : Lapis.Layout.minTarget }
-    var indent: CGFloat { self == .sidebar ? 14 : 18 }
+    var rowHeight: CGFloat {
+        switch self {
+        case .library: 48
+        case .sidebar:
+            #if targetEnvironment(macCatalyst)
+            28
+            #else
+            40
+            #endif
+        }
+    }
+
+    var indent: CGFloat { self == .sidebar ? 16 : 22 }
+    /// the disclosure chevron's strip
+    var chevronWidth: CGFloat { self == .sidebar ? 16 : 28 }
+    /// where a row's content starts (before the indent)
+    var lead: CGFloat { self == .sidebar ? 4 : 6 }
+    /// selected rows: a solid accent bar (the Mac) or a soft wash
+    var solidSelection: Bool {
+        #if targetEnvironment(macCatalyst)
+        self == .sidebar
+        #else
+        false
+        #endif
+    }
 }
 
 /// Scrolls the tree's scroll view while a drag rests near its top or
@@ -143,11 +166,19 @@ struct LibraryTree<Menu: View>: View {
     var reveal: Set<DocID> = []
     var selected: DocID?
     var pins: Set<DocID> = []
+    /// open review items per doc: a flag pill (Library) or a dot (sidebar)
+    var flags: [DocID: Int] = [:]
+    /// when a doc was last edited, if known (the Library's trailing time)
+    var edited: (DocID) -> Date? = { _ in nil }
     var style: DocTreeStyle = .sidebar
     let onOpen: (DocID) -> Void
+    /// a row came on screen
+    var onRowAppear: (DocID) -> Void = { _ in }
     @ViewBuilder var menu: (LibraryNode) -> Menu
 
     @Environment(\.docMover) private var docMover
+    /// the flags come from here when none are passed (the sidebar)
+    @Environment(AppModel.self) private var model: AppModel?
     @State private var hover: DocTreeHover?
     @State private var bottomTargeted = false
     @FocusState private var focused: Bool
@@ -159,13 +190,16 @@ struct LibraryTree<Menu: View>: View {
     var body: some View {
         let lines = self.lines
         VStack(spacing: 0) {
-            ForEach(lines) { line in
+            ForEach(Array(lines.enumerated()), id: \.element.id) { i, line in
                 DocTreeRow(
                     line: line,
                     firstChild: line.isOpen ? line.node.children?.first?.id : nil,
                     style: style,
                     selected: selected == line.id,
                     pinned: pins.contains(line.id),
+                    flags: (flags.isEmpty ? model?.reviewCounts.counts[line.id] : flags[line.id]) ?? 0,
+                    edited: line.node.isFolder ? nil : edited(line.id),
+                    separator: style == .library && i > 0,
                     hover: hover?.id == line.id ? hover?.zone : nil,
                     mover: docMover,
                     onOpen: {
@@ -180,6 +214,7 @@ struct LibraryTree<Menu: View>: View {
                 )
                 .contextMenu { menu(line.node) }
                 .id(line.id)
+                .onAppear { if style == .library, !line.node.isFolder { onRowAppear(line.id) } }
                 if line.isOpen, line.node.children == nil {
                     EmptyFolderLine(folder: line.id, depth: line.depth + 1, style: style, mover: docMover) {
                         withAnimation(.snappy(duration: 0.2)) { _ = expanded.insert(line.id) }
@@ -189,7 +224,7 @@ struct LibraryTree<Menu: View>: View {
             // under the last row: the top level
             if let docMover {
                 Color.clear
-                    .frame(maxWidth: .infinity, minHeight: style.rowHeight * 2)
+                    .frame(maxWidth: .infinity, minHeight: style == .library ? 10 : style.rowHeight * 2)
                     .contentShape(.rect)
                     .overlay(alignment: .top) {
                         if bottomTargeted {
@@ -200,7 +235,7 @@ struct LibraryTree<Menu: View>: View {
                                 .padding(.vertical, 4)
                                 .background(Color.lapis.accentSoft, in: .capsule)
                                 .background(Color.lapis.pal, in: .capsule)
-                                .padding(.top, 6)
+                                .padding(.top, style == .library ? -10 : 6)
                                 .allowsHitTesting(false)
                         }
                     }
@@ -208,6 +243,8 @@ struct LibraryTree<Menu: View>: View {
                     .accessibilityHidden(true)
             }
         }
+        // the flags: open review items per doc (throttled in ReviewCounts)
+        .task(id: nodes.count) { await model?.reviewCounts.refresh(model?.api) }
         // a drag resting on a closed folder's middle opens it
         .task(id: hover) {
             // not an empty one: there is nothing inside to show, and opening
@@ -293,7 +330,8 @@ private struct TreeKeys: ViewModifier {
     }
 }
 
-/// A row: indent, chevron, icon, title; the drag source and a drop target.
+/// A row: indent, chevron, icon, title, flags, and what's in it or when it
+/// changed; the drag source and a drop target.
 private struct DocTreeRow: View {
     let line: DocTreeLine
     /// an open folder's first child: a drop on its bottom edge goes there
@@ -301,6 +339,12 @@ private struct DocTreeRow: View {
     let style: DocTreeStyle
     let selected: Bool
     let pinned: Bool
+    /// open review items on this doc
+    var flags = 0
+    /// when the doc was last edited (Library rows)
+    var edited: Date?
+    /// a hairline above (Library rows after the first)
+    var separator = false
     /// the zone a drag is over on this row (nil: none here)
     let hover: DocDropZone?
     let mover: DocMover?
@@ -318,33 +362,51 @@ private struct DocTreeRow: View {
 
     private var node: LibraryNode { line.node }
     private var lead: CGFloat { CGFloat(line.depth) * style.indent }
+    /// selected on the Mac: white on the accent
+    private var onAccent: Bool { selected && style.solidSelection }
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: style == .library ? 8 : 6) {
             chevron
-            Image(systemName: node.isFolder ? (line.isOpen ? "folder.fill" : "folder") : "doc.text")
-                .font(style == .sidebar ? .body : .subheadline)
-                .foregroundStyle(node.isFolder ? Color.lapis.accent : Color.lapis.ink3)
-                .frame(width: 22)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(node.doc.title)
-                    .font(style == .sidebar ? .body : .subheadline)
-                    .foregroundStyle(Color.lapis.ink)
-                    .lineLimit(style == .sidebar ? 1 : 2)
-                if style == .library, let sub = node.subtitle {
-                    Text(sub).font(.caption2).foregroundStyle(Color.lapis.ink3).lineLimit(1)
+            DocTreeIcon(isFolder: node.isFolder, isOpen: line.isOpen, size: style == .library ? .library : .sidebar, onAccent: onAccent)
+            Text(node.doc.title)
+                .font(style == .library ? .body : (style.solidSelection ? .body : .callout))
+                .fontWeight(node.isFolder && style == .library ? .semibold : (selected && !style.solidSelection ? .semibold : nil))
+                .foregroundStyle(onAccent ? Color.lapis.onAccent : Color.lapis.ink)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(1)
+            if flags > 0 {
+                if style == .library {
+                    FlagPill(count: flags)
+                } else {
+                    Circle().fill(Color.lapis.yellowMark).frame(width: 8, height: 8).accessibilityHidden(true)
                 }
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 4)
             if pinned {
-                Image(systemName: "pin.fill").font(.caption2).foregroundStyle(Color.lapis.accent).accessibilityHidden(true)
+                Image(systemName: "pin.fill").font(.caption2).foregroundStyle(onAccent ? Color.lapis.onAccent : Color.lapis.accent).accessibilityHidden(true)
+            }
+            if let meta {
+                Text(meta)
+                    .font(style == .library ? .subheadline : .footnote)
+                    .monospacedDigit()
+                    .foregroundStyle(onAccent ? Color.lapis.onAccent.opacity(0.85) : Color.lapis.ink3)
+                    .lineLimit(1)
+                    .accessibilityHidden(true)
             }
         }
-        .padding(.leading, lead + 4)
-        .padding(.trailing, 8)
+        .padding(.leading, lead + style.lead)
+        .padding(.trailing, style == .library ? 14 : 10)
         .frame(maxWidth: .infinity, minHeight: style.rowHeight, alignment: .leading)
         .background(background)
+        .overlay(alignment: .top) {
+            if separator {
+                Rectangle().fill(Color.lapis.line2).frame(height: 1)
+                    .padding(.leading, lead + style.lead + style.chevronWidth + 8 + 22 + 8)
+                    .allowsHitTesting(false)
+            }
+        }
         .overlay(alignment: .top) { if hover == .before { insertionLine } }
         .overlay(alignment: .bottom) { if hover == .after { insertionLine } }
         .contentShape(.rect)
@@ -357,7 +419,7 @@ private struct DocTreeRow: View {
         // folder, anywhere else opens the doc (a Button inside a draggable
         // row doesn't reliably get the click on the Mac)
         .gesture(SpatialTapGesture().onEnded { tap in
-            if node.isFolder, tap.location.x < lead + 4 + 16 + 6 { onToggle() } else { onOpen() }
+            if node.isFolder, tap.location.x < lead + style.lead + style.chevronWidth + 6 { onToggle() } else { onOpen() }
         })
         .modifier(DragSource(id: node.id, title: node.doc.title, isFolder: node.isFolder, mover: mover))
         .modifier(RowDrop(id: node.id, firstChild: firstChild, height: height, mover: mover, setHover: setHover, onDroppedInto: onDroppedInto,
@@ -371,40 +433,56 @@ private struct DocTreeRow: View {
         .accessibilityIdentifier("tree.\(node.doc.title)")
     }
 
+    /// A folder: how many docs are in it. A doc (Library): when it changed.
+    private var meta: String? {
+        if node.isFolder {
+            let n = node.children?.count ?? 0
+            return n > 0 ? "\(n)" : nil
+        }
+        guard style == .library, let edited else { return nil }
+        return ShortWhen.string(edited)
+    }
+
     private var accessibilityValue: String {
         var parts: [String] = []
-        if node.isFolder { parts.append(line.isOpen ? "folder, open" : "folder, closed") }
+        if node.isFolder {
+            parts.append(line.isOpen ? "folder, open" : "folder, closed")
+            if let n = node.children?.count, n > 0 { parts.append(n == 1 ? "1 doc" : "\(n) docs") }
+        }
+        if flags > 0 { parts.append(flags == 1 ? "1 change to review" : "\(flags) changes to review") }
         if pinned { parts.append("pinned") }
+        if !node.isFolder, let edited { parts.append(ShortWhen.spoken(edited)) }
         return parts.joined(separator: ", ")
     }
 
     @ViewBuilder private var chevron: some View {
         if node.isFolder {
             Image(systemName: "chevron.right")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(Color.lapis.ink3)
+                .font((style == .library ? Font.footnote : .caption).weight(.bold))
+                .foregroundStyle(onAccent ? Color.lapis.onAccent : Color.lapis.ink3)
                 .rotationEffect(.degrees(line.isOpen ? 90 : 0))
-                .frame(width: 16, height: style.rowHeight)
+                .animation(Lapis.Motion.fast, value: line.isOpen)
+                .frame(width: style.chevronWidth, height: style.rowHeight)
                 .accessibilityHidden(true)
         } else {
-            Color.clear.frame(width: 16, height: 1)
+            Color.clear.frame(width: style.chevronWidth, height: 1)
         }
     }
 
     private var background: some View {
-        RoundedRectangle(cornerRadius: 7, style: .continuous)
+        RoundedRectangle(cornerRadius: style == .library ? 0 : (style.solidSelection ? 7 : 12), style: .continuous)
             .fill(fill)
             .overlay {
                 if hover == .into {
-                    RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(Color.lapis.accent, lineWidth: 2)
+                    RoundedRectangle(cornerRadius: style == .library ? 12 : 7, style: .continuous).strokeBorder(Color.lapis.accent, lineWidth: 2)
                 }
             }
-            .padding(.leading, lead)
+            .padding(.leading, style == .library ? 0 : lead)
     }
 
     private var fill: Color {
         if hover == .into { return Color.lapis.accentRing }
-        if selected { return Color.lapis.accentSoft }
+        if selected { return style.solidSelection ? Color.lapis.accent : Color.lapis.accentSoft }
         if pointer { return Color.lapis.hover }
         return .clear
     }
@@ -415,9 +493,54 @@ private struct DocTreeRow: View {
             Circle().strokeBorder(Color.lapis.accent, lineWidth: 2).frame(width: 8, height: 8)
             Rectangle().fill(Color.lapis.accent).frame(height: 2)
         }
-        .padding(.leading, lead + 20)
+        .padding(.leading, lead + style.lead + style.chevronWidth)
         .offset(y: hover == .before ? -4 : 4)
         .allowsHitTesting(false)
+    }
+}
+
+/// A tree row's icon: an accent folder with a soft fill, or a doc page.
+struct DocTreeIcon: View {
+    enum Size { case library, sidebar }
+    let isFolder: Bool
+    let isOpen: Bool
+    var size: Size = .library
+    var onAccent = false
+
+    var body: some View {
+        Group {
+            if isFolder {
+                ZStack {
+                    Image(systemName: "folder.fill").foregroundStyle(onAccent ? Color.lapis.onAccent.opacity(0.25) : Color.lapis.accentSoft)
+                    Image(systemName: "folder").foregroundStyle(onAccent ? Color.lapis.onAccent : Color.lapis.accent)
+                }
+            } else {
+                Image(systemName: "doc.text").foregroundStyle(onAccent ? Color.lapis.onAccent : Color.lapis.ink3)
+            }
+        }
+        .font(size == .library ? .body : .callout)
+        .frame(width: 22)
+        .accessibilityHidden(true)
+    }
+}
+
+/// "⚑ 1": open review items on a doc (yellow, a flag and a number).
+struct FlagPill: View {
+    let count: Int
+
+    var body: some View {
+        if count > 0 {
+            HStack(spacing: 3) {
+                Image(systemName: "flag.fill").font(.system(size: 9, weight: .bold))
+                Text("\(count)").font(.caption.weight(.semibold)).monospacedDigit()
+            }
+            .foregroundStyle(Color.lapis.yellow)
+            .padding(.horizontal, 7)
+            .frame(minHeight: 20)
+            .background(Color.lapis.yellowSoft, in: .capsule)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(count == 1 ? "1 change to review" : "\(count) changes to review")
+        }
     }
 }
 
@@ -434,7 +557,7 @@ private struct EmptyFolderLine: View {
         Text(targeted ? "Drop it in here" : "Empty \u{2014} drag docs here")
             .font(.caption)
             .foregroundStyle(targeted ? Color.lapis.accent : Color.lapis.ink3)
-            .padding(.leading, CGFloat(depth) * style.indent + 4 + 16 + 6)
+            .padding(.leading, CGFloat(depth) * style.indent + style.lead + style.chevronWidth + 6)
             .frame(maxWidth: .infinity, minHeight: style.rowHeight * 0.8, alignment: .leading)
             .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
                 .fill(targeted ? Color.lapis.accentSoft : .clear)

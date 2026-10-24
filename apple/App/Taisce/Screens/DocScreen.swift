@@ -24,6 +24,13 @@ struct DocScreen: View {
     /// on screen (not under a pushed doc)
     @State private var appeared = false
     @AppStorage(DocTextSize.key) private var textSize = DocTextSize.actual
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    /// the inspector: a column on iPad and the Mac, a sheet on iPhone
+    @State private var showInspector = false
+    /// the doc's op ledger (newest first): the byline and the inspector's History
+    @State private var history: [DocHistoryEntry] = []
+    /// the signed-in person's name (their avatar's initial in the byline)
+    @State private var me: String?
 
     var body: some View {
         Group {
@@ -46,6 +53,8 @@ struct DocScreen: View {
         .task(id: docID) { await observe() }
         .task(id: docID) { await refresh(force: false) }
         .task(id: docID) { await checkEditable() }
+        // who wrote it (the byline, History): again when the doc moves on
+        .task(id: HistoryKey(doc: docID, epoch: model.index.byID[docID]?.currentEpoch ?? 0)) { await loadHistory() }
         // the surface opens once the body is cached and we know what it may be
         .task(id: OpenKey(doc: docID, loaded: page != nil, kindKnown: kind != nil)) { await openSurface() }
         // queued edits show while they wait (offline, a live session)
@@ -91,7 +100,7 @@ struct DocScreen: View {
             }
         }
         // Share link…, Export as PDF… and link comments (menus, the menu bar, a comment push)
-        .modifier(DocShareActions(docID: docID, canShare: access.canEdit, pageLoaded: page != nil))
+        .modifier(DocShareActions(docID: docID, canShare: access.canEdit, pageLoaded: page != nil, onFind: { surface?.presentFind() }))
     }
 
     /// ADR 0004: what you may change here (a viewer reads only; pins are local)
@@ -103,32 +112,13 @@ struct DocScreen: View {
     private func surfaceView(_ surface: SurfaceModel) -> some View {
         DocSurfaceContent(model: surface)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    HStack(spacing: 8) {
-                        Text(model.index.breadcrumb(of: docID) ?? title)
-                            .font(.footnote.weight(.medium))
-                            .foregroundStyle(Color.lapis.ink3)
-                            .lineLimit(1)
-                            .truncationMode(.head)
-                        if surface.editable {
-                            EditorChipView(chip: surface.chip) { Task { await surface.retryFailed() } }
-                        }
-                    }
-                }
-            }
-            .modifier(DocMenu(
-                pinned: model.isPinned(docID),
-                onTogglePin: { model.togglePin(docID) },
-                onMoveWorkspace: model.hasWorkspaces && access.canMove ? { movingWorkspace = true } : nil,
-                onShareLink: model.shareLinks.isAvailable && access.canEdit && page != nil ? { shareLink(surface) } : nil,
-                onExportPDF: model.shareLinks.isAvailable && page != nil ? { exportPDF(surface) } : nil
-            ))
+            .toolbar { surfaceToolbar(surface) }
             .sheet(isPresented: $movingWorkspace) { MoveToWorkspaceSheet(docIDs: [docID]) }
             .onChange(of: chrome, initial: true) { _, c in
                 // the header and children list, reachable for VoiceOver from the text
                 var actions: [(String, () -> Void)] = []
                 if c.linkComments != nil { actions.append(("Link comments", { router.request(.linkComments, on: docID) })) }
+                actions.append(("Inspector", { showInspector = true }))
                 for kid in c.children.cards { actions.append(("Open \(kid.title)", { router.open(.doc(kid.id)) })) }
                 surface.setAccessibilityChrome(title: c.title, actions: actions)
                 surface.setChrome(
@@ -144,6 +134,119 @@ struct DocScreen: View {
                 let kids = DocChildrenLayout.children(of: docID, index: model.index, meta: [:]).prefix(20)
                 for kid in kids { await model.loadEditMeta(kid.id) }
             }
+            .inspector(isPresented: $showInspector) {
+                DocInspector(
+                    docID: docID, surface: surface, history: history, page: page,
+                    asSheet: sizeClass != .regular,
+                    menu: AnyView(moreMenuItems(surface)),
+                    onClose: { showInspector = false }
+                )
+                .inspectorColumnWidth(min: 290, ideal: 330, max: 400)
+                .environment(model)
+                .environment(router)
+            }
+    }
+
+    /// The doc's bar. iPhone: the title and save state in the middle; while
+    /// typing Undo, the inspector and Done, otherwise the inspector and ….
+    /// iPad and the Mac: the crumbs, then share, … and the inspector toggle.
+    @ToolbarContentBuilder
+    private func surfaceToolbar(_ surface: SurfaceModel) -> some ToolbarContent {
+        ToolbarItem(placement: .principal) {
+            DocBarTitle(title: title, crumbs: model.index.ancestors(of: docID).map(\.title),
+                        workspace: model.workspaceBadge(for: docID)?.name,
+                        save: saveState(surface), wide: sizeClass == .regular)
+        }
+        if sizeClass == .regular {
+            ToolbarItemGroup(placement: .primaryAction) {
+                if model.shareLinks.isAvailable, access.canEdit, page != nil {
+                    Button { shareLink(surface) } label: { Label("Share link", systemImage: "square.and.arrow.up") }
+                        .help("Share link…")
+                }
+                Menu { moreMenuItems(surface) } label: { Label("More", systemImage: "ellipsis") }
+                    .accessibilityLabel("More")
+                inspectorButton(surface)
+            }
+        } else if surface.isEditingText {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button { surface.undo?.undo() } label: { Label("Undo", systemImage: "arrow.uturn.backward") }
+                    .disabled(!surface.canUndo)
+                    .accessibilityIdentifier("doc.undo")
+                inspectorButton(surface)
+            }
+            ToolbarSpacer(.fixed, placement: .primaryAction)
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    surface.textView.resignFirstResponder()
+                } label: {
+                    Label("Done editing", systemImage: "checkmark")
+                }
+                .buttonStyle(.glassProminent)
+                .tint(Color.lapis.accent)
+                .accessibilityIdentifier("doc.done")
+            }
+        } else {
+            ToolbarItemGroup(placement: .primaryAction) {
+                inspectorButton(surface)
+                Menu { moreMenuItems(surface) } label: { Label("More", systemImage: "ellipsis") }
+                    .accessibilityLabel("More")
+            }
+        }
+    }
+
+    /// The inspector toggle; a yellow dot while changes wait for a look.
+    private func inspectorButton(_ surface: SurfaceModel) -> some View {
+        let waiting = surface.reviewItems.count
+        return Button {
+            showInspector.toggle()
+        } label: {
+            Label("Inspector", systemImage: "sidebar.right")
+                .overlay(alignment: .topTrailing) {
+                    if waiting > 0 {
+                        Circle().fill(Color.lapis.yellowMark).frame(width: 8, height: 8)
+                            .offset(x: 3, y: -2)
+                            .accessibilityHidden(true)
+                    }
+                }
+        }
+        .tint(showInspector && sizeClass == .regular ? Color.lapis.accent : Color.lapis.ink)
+        .accessibilityLabel(waiting > 0 ? "Inspector: \(waiting == 1 ? "1 change" : "\(waiting) changes") to review" : "Inspector")
+        .accessibilityIdentifier("doc.inspector")
+        .help("Inspector")
+    }
+
+    /// The … menu: find, pin, move, share, export.
+    @ViewBuilder private func moreMenuItems(_ surface: SurfaceModel?) -> some View {
+        if let surface {
+            Button("Find in Doc", systemImage: "magnifyingglass") { surface.presentFind() }
+        }
+        Button(model.isPinned(docID) ? "Unpin from Today" : "Pin to Today",
+               systemImage: model.isPinned(docID) ? "pin.slash" : "pin") { model.togglePin(docID) }
+        if model.hasWorkspaces, access.canMove {
+            Button("Move to workspace\u{2026}", systemImage: "square.stack") { movingWorkspace = true }
+        }
+        if model.shareLinks.isAvailable, page != nil {
+            Divider()
+            if access.canEdit {
+                Button("Share link\u{2026}", systemImage: "link") { router.request(.shareLink, on: docID) }
+                    .accessibilityIdentifier("doc.shareLink")
+            }
+            Button("Export as PDF\u{2026}", systemImage: "doc.richtext") { router.request(.exportPDF, on: docID) }
+        }
+    }
+
+    /// The editor's chip as a save state: a mark and a word.
+    private func saveState(_ surface: SurfaceModel) -> (SaveState, String?) {
+        guard surface.editable else { return (.readonly, access.canEdit ? "Read only" : "View only") }
+        let chip = surface.chip
+        switch chip.tone {
+        case .saved: return (.saved, nil)
+        case .busy: return (.saving, nil)
+        case .offline: return (.unsaved, chip.text)
+        case .review: return (.waiting, nil)
+        case .conflict: return (.waiting, chip.text)
+        case .failed: return (.failed, chip.text)
+        }
     }
 
     /// (the snapshot preparation flushes the surface first)
@@ -171,6 +274,9 @@ struct DocScreen: View {
         return DocChrome(
             title: title,
             tags: page?.tags ?? [],
+            status: page?.status,
+            byline: history.isEmpty ? nil : DocByline.make(history: history, me: me, version: model.index.byID[docID]?.currentEpoch),
+            me: me,
             meta: model.editMeta[docID],
             accessNote: access.note,
             workspace: model.workspaceBadge(for: docID),
@@ -257,6 +363,12 @@ struct DocScreen: View {
         }
     }
 
+    private func loadHistory() async {
+        guard let api = model.api else { return }
+        if let rows = try? await api.docHistory(docID), rows != history { history = rows }
+        if me == nil, let name = try? await api.profile().name, !name.isEmpty { me = name }
+    }
+
     private func reloadPage() async {
         guard let cache = model.cache, page != nil, let records = try? await cache.blocks(of: docID) else { return }
         page = await model.page(for: docID, records: records)
@@ -324,6 +436,11 @@ private struct OpenKey: Hashable {
     var kindKnown: Bool
 }
 
+private struct HistoryKey: Hashable {
+    var doc: DocID
+    var epoch: Int
+}
+
 private struct MetaKey: Hashable {
     var doc: DocID
     var missing: Bool
@@ -333,6 +450,12 @@ private struct MetaKey: Hashable {
 struct DocChrome: Equatable {
     var title: String
     var tags: [String]
+    /// the frontmatter's status ("decided")
+    var status: String? = nil
+    /// who wrote it, the version, when (from the op ledger)
+    var byline: DocByline? = nil
+    /// your name, for your avatar's initial
+    var me: String? = nil
     var meta: EditMeta?
     var accessNote: String?
     var workspace: WorkspaceBadge?
@@ -340,8 +463,9 @@ struct DocChrome: Equatable {
     var children: DocChildrenLayout
 }
 
-/// The doc's title block: workspace chip or "View only", title, tags and
-/// "edited by", and the link-comments entry.
+/// The doc's title block (the Lapis doc artboards): status and tag pills,
+/// the serif title, then who wrote it ("You and keeper:API · v14 · edited
+/// 12:41"); "View only" where you may only read; the link-comments entry.
 struct DocHeader: View {
     let chrome: DocChrome
     var now: Date = .now
@@ -350,9 +474,10 @@ struct DocHeader: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 10) {
-                if chrome.workspace != nil || chrome.accessNote != nil {
-                    HStack(spacing: 8) {
-                        if let w = chrome.workspace { WorkspaceChip(badge: w) }
+                if chrome.status != nil || !chrome.tags.isEmpty || chrome.accessNote != nil {
+                    FlowRow(spacing: 6) {
+                        if let status = chrome.status { DocPill(text: status, dot: DocPill.statusColor(status)) }
+                        ForEach(chrome.tags, id: \.self) { DocPill(text: "#\($0)").accessibilityLabel("Tag \($0)") }
                         if let n = chrome.accessNote { ViewOnlyNote(text: n) }
                     }
                 }
@@ -361,17 +486,7 @@ struct DocHeader: View {
                     .foregroundStyle(Color.lapis.ink)
                     .accessibilityAddTraits(.isHeader)
                     .fixedSize(horizontal: false, vertical: true)
-                if !chrome.tags.isEmpty || chrome.meta != nil {
-                    // "#design #mobile · edited by claude 2 h ago"
-                    FlowRow(spacing: 6) {
-                        ForEach(chrome.tags, id: \.self) { TagChip(tag: $0) }
-                        if let meta = chrome.meta {
-                            Text("\(chrome.tags.isEmpty ? "" : "· ")edited by \(meta.author) \(RelativeTime.string(meta.date, now: now))")
-                                .font(.caption2)
-                                .foregroundStyle(Color.lapis.ink3)
-                        }
-                    }
-                }
+                byline
             }
             if let linkComments = chrome.linkComments {
                 Button(action: onOpenLinkComments) {
@@ -389,6 +504,124 @@ struct DocHeader: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.bottom, 4)
+    }
+
+    @ViewBuilder private var byline: some View {
+        if let b = chrome.byline, !b.authors.isEmpty {
+            HStack(spacing: 8) {
+                HStack(spacing: -6) {
+                    ForEach(Array(b.authors.prefix(3).enumerated()), id: \.offset) { _, name in
+                        LapisAvatar(name: name == "You" ? (chrome.me ?? name) : name, agent: Principal.isAgent(name), size: 24)
+                            .background(Circle().fill(Color.lapis.bg).padding(-2))
+                    }
+                }
+                .accessibilityHidden(true)
+                Text(bylineText(b))
+                    .font(.footnote)
+                    .foregroundStyle(Color.lapis.ink3)
+                    .lineLimit(2)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("doc.byline")
+        } else if let meta = chrome.meta {
+            Text("edited by \(meta.author) \(RelativeTime.string(meta.date, now: now))")
+                .font(.footnote)
+                .foregroundStyle(Color.lapis.ink3)
+        }
+    }
+
+    /// "You and **keeper:API** · v14 · edited 12:41", agents in mono violet.
+    private func bylineText(_ b: DocByline) -> AttributedString {
+        var out = AttributedString()
+        for (i, name) in b.authors.enumerated() {
+            if i > 0 { out += AttributedString(i == b.authors.count - 1 ? " and " : ", ") }
+            var part = AttributedString(name)
+            if Principal.isAgent(name) {
+                part.font = .lapisMono(.footnote, weight: .medium)
+                part.foregroundColor = Color.lapis.agent
+            } else {
+                part.foregroundColor = Color.lapis.ink2
+            }
+            out += part
+        }
+        if let v = b.version, v > 0 { out += AttributedString(" · v\(v)") }
+        if let d = b.edited { out += AttributedString(" · edited \(ShortWhen.string(d, now: now))") }
+        return out
+    }
+}
+
+/// A quiet pill over the title: a status with its dot, or a tag.
+struct DocPill: View {
+    let text: String
+    var dot: Color?
+
+    var body: some View {
+        HStack(spacing: 5) {
+            if let dot { Circle().fill(dot).frame(width: 7, height: 7).accessibilityHidden(true) }
+            Text(text).lineLimit(1)
+        }
+        .font(.footnote)
+        .foregroundStyle(Color.lapis.ink2)
+        .padding(.horizontal, 10)
+        .frame(minHeight: 26)
+        .background(Color.lapis.hover, in: .capsule)
+    }
+
+    /// decided / done: green; draft / proposed: yellow; anything else quiet.
+    static func statusColor(_ status: String) -> Color {
+        switch status.lowercased() {
+        case "decided", "done", "accepted", "final", "published": Color.lapis.green
+        case "draft", "proposed", "open", "review", "wip": Color.lapis.yellowMark
+        case "superseded", "rejected", "cut", "deprecated": Color.lapis.red
+        default: Color.lapis.ink3
+        }
+    }
+}
+
+/// The doc bar's middle. iPhone: the title over the save state. iPad and
+/// the Mac: the crumbs ("Work › Taisce › Architecture"), then the save state.
+struct DocBarTitle: View {
+    let title: String
+    let crumbs: [String]
+    var workspace: String?
+    let save: (SaveState, String?)
+    var wide = false
+
+    var body: some View {
+        if wide {
+            HStack(spacing: 10) {
+                Text(crumbText)
+                    .font(.subheadline)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                SaveStateDot(state: save.0, text: save.1)
+            }
+            .accessibilityElement(children: .combine)
+        } else {
+            VStack(spacing: 1) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Color.lapis.ink)
+                    .lineLimit(1)
+                SaveStateDot(state: save.0, text: save.1)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("editor.chip")
+        }
+    }
+
+    private var crumbText: AttributedString {
+        var out = AttributedString()
+        for c in ([workspace].compactMap { $0 } + crumbs) {
+            var part = AttributedString(c + DocIndex.separator)
+            part.foregroundColor = Color.lapis.ink3
+            out += part
+        }
+        var t = AttributedString(title)
+        t.foregroundColor = Color.lapis.ink
+        t.font = .subheadline.weight(.semibold)
+        out += t
+        return out
     }
 }
 

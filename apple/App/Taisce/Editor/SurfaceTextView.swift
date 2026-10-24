@@ -35,7 +35,13 @@ final class SurfaceTextView: UITextView {
     var readingWidth: CGFloat = 720
     /// inline change cards (flagged / parked review items), by the block
     /// each covers: subviews placed over the block's text
-    var cardViews: [BlockID: UIView] = [:]
+    /// (optional storage: `init(usingTextLayoutManager:)` is a factory, so
+    /// Swift's initial values may not have run; nil reads as empty)
+    var cardViews: [BlockID: UIView] {
+        get { cardStore ?? [:] }
+        set { cardStore = newValue }
+    }
+    private var cardStore: [BlockID: UIView]?
     /// the text or the review items changed: the cards are placed again
     var cardsDirty = false
     /// the text column's width (the reading width, or less)

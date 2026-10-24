@@ -12,6 +12,8 @@ struct DocBlock: Identifiable, Hashable, Sendable {
 /// leading H1 repeating the title is dropped (the view draws the title).
 struct DocPage: Hashable, Sendable {
     var tags: [String] = []
+    /// the frontmatter's `status:` ("decided", "draft"), if any
+    var status: String?
     var blocks: [DocBlock] = []
 
     var isEmpty: Bool { blocks.isEmpty }
@@ -24,12 +26,14 @@ struct DocPage: Hashable, Sendable {
             let trimmed = b.content.trimmingCharacters(in: .whitespacesAndNewlines)
             if page.blocks.isEmpty, trimmed.hasPrefix("---\n"), trimmed.hasSuffix("\n---") {
                 page.tags.append(contentsOf: frontmatterTags(trimmed))
+                page.status = page.status ?? frontmatterStatus(trimmed)
                 continue
             }
             var nodes = render(b)
             nodes.removeAll { node in
                 if case .frontmatter(let text) = node {
                     page.tags.append(contentsOf: frontmatterTags(text))
+                    page.status = page.status ?? frontmatterStatus(text)
                     return true
                 }
                 return false
@@ -43,6 +47,17 @@ struct DocPage: Hashable, Sendable {
         var seen: Set<String> = []
         page.tags = page.tags.filter { seen.insert($0).inserted }
         return page
+    }
+
+    /// `status: decided` in a `---` block (quotes dropped), lowercased.
+    static func frontmatterStatus(_ content: String) -> String? {
+        for line in content.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard t.lowercased().hasPrefix("status:") else { continue }
+            let v = t.dropFirst("status:".count).trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            return v.isEmpty ? nil : v.lowercased()
+        }
+        return nil
     }
 
     /// `tags:` list items in a `---` block, lowercased, as the store reads them
