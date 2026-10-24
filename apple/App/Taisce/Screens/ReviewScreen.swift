@@ -150,10 +150,17 @@ struct ReviewItemCard: View {
         let verdict = ReviewCopy.verdict(item.kind)
         let (accept, decline) = ReviewCopy.actions(item.kind)
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                AgentBadge(name: item.proposer)
-                Spacer(minLength: 8)
-                VerdictChip(verdict, short: true)
+            // the badge and the chip side by side, or stacked when that won't fit (large text)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    AgentBadge(name: item.proposer).fixedSize()
+                    Spacer(minLength: 8)
+                    VerdictChip(verdict, short: true)
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    AgentBadge(name: item.proposer)
+                    VerdictChip(verdict, short: true)
+                }
             }
             Button(action: onOpen) {
                 VStack(alignment: .leading, spacing: 4) {

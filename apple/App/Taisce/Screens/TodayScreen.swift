@@ -405,20 +405,26 @@ struct SyncDotLabel: View {
 /// A queued change on Today's card: verdict, doc, who.
 struct ReviewRowLabel: View {
     let item: ReviewQueueItem
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
-        HStack(spacing: 10) {
+        // accessibility text sizes: chip, title and who stacked, each whole
+        let layout = typeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 4))
+            : AnyLayout(HStackLayout(spacing: 10))
+        layout {
             VerdictChip(ReviewCopy.verdict(item.kind), short: true)
             Text(item.docTitle.isEmpty ? "Untitled" : item.docTitle)
                 .lapisFont(.cardTitle, weight: .medium)
                 .foregroundStyle(Color.lapis.ink)
-                .lineLimit(1)
+                .lineLimit(typeSize.isAccessibilitySize ? 3 : 1)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Text(item.proposer)
                 .font(.lapisMono(.caption))
                 .foregroundStyle(item.byAgent ? Color.lapis.agent : Color.lapis.ink3)
                 .lineLimit(1)
         }
+        .padding(.vertical, typeSize.isAccessibilitySize ? 8 : 0)
         .frame(minHeight: Lapis.Layout.minTarget)
         .contentShape(.rect)
         .accessibilityElement(children: .combine)

@@ -65,6 +65,8 @@ struct TodoRow: View {
     var shortPill = false
     /// the ring as a button (tap to mark done / undo); nil = a plain ring
     var onToggle: (() -> Void)?
+    /// accessibility text sizes: the pill goes under the text, not beside it
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         let label = DueLabel.make(entry, now: now)
@@ -92,9 +94,10 @@ struct TodoRow: View {
                 if let source = entry.sourceLine(now: now) {
                     Text(source).font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(2)
                 }
+                if typeSize.isAccessibilitySize, let pill = pill(label) { pill }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            if let pill = pill(label) { pill.fixedSize() }
+            if !typeSize.isAccessibilitySize, let pill = pill(label) { pill.fixedSize() }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
