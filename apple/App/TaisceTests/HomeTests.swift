@@ -67,7 +67,7 @@ private func item(_ id: String, _ kind: ReviewQueueItem.Kind, by proposer: Strin
 
     @Test func todoRowsSayWhereTheyLive() {
         let today = entry("a", nil, date: "2026-10-01")
-        #expect(today.sourcePath(list: "Home › To-do", now: noon, calendar: cal) == "Home › To-do › Today")
+        #expect(today.sourcePath(list: "Home › To-do", now: noon, calendar: cal) == "Home › To-do", "today's own items need no day")
         let older = entry("b", nil, date: "2026-09-30", note: "for the NCT")
         #expect(older.sourcePath(list: "To-do", now: noon, calendar: cal) == "To-do › Yesterday · for the NCT")
         let week = entry("c", nil, date: "2026-09-24")

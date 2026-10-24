@@ -10,6 +10,9 @@ import SwiftUI
 /// - revert: undo a flagged change (the secondary look)
 ///
 /// The visible button is 36 pt (30 small) and its hit target always 44.
+/// Labels keep one line at ordinary text sizes (shrinking a little before
+/// truncating); at accessibility sizes they drop their icon and wrap, so a
+/// long label stays whole. `.lapisButtonIcons(false)` shows words only.
 struct LapisButtonStyle: ButtonStyle {
     enum Kind: Hashable, Sendable, CaseIterable { case primary, secondary, ghost, destructive, keep, revert }
     enum Size: Hashable, Sendable { case regular, small }
@@ -35,15 +38,22 @@ private struct LapisButtonBody: View {
     let size: LapisButtonStyle.Size
     let fullWidth: Bool
     @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.lapisButtonIcons) private var icons
     @State private var hovering = false
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: Lapis.Radius.button, style: .continuous)
+        let big = typeSize.isAccessibilitySize
         configuration.label
             .font(size == .small ? .footnote.weight(.semibold) : .subheadline.weight(.semibold))
-            .labelStyle(LapisButtonLabelStyle())
+            .labelStyle(LapisButtonLabelStyle(icon: icons && !big))
             .foregroundStyle(ink)
-            .lineLimit(1)
+            .lineLimit(big ? 4 : 1)
+            .minimumScaleFactor(big ? 1 : 0.85)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: big)
+            .padding(.vertical, big ? 8 : 0)
             .padding(.horizontal, kind == .ghost || kind == .destructive ? 10 : (size == .small ? 12 : 16))
             .frame(minHeight: size == .small ? Lapis.Layout.smallButtonHeight : Lapis.Layout.buttonHeight)
             .frame(maxWidth: fullWidth ? .infinity : nil)
@@ -80,14 +90,30 @@ private struct LapisButtonBody: View {
     }
 }
 
-/// Icon and title close together, the icon a step smaller.
+/// Icon and title close together, the icon a step smaller; the title alone
+/// at accessibility sizes (or where icons are off).
 private struct LapisButtonLabelStyle: LabelStyle {
+    var icon = true
+
     func makeBody(configuration: Configuration) -> some View {
-        HStack(spacing: 6) {
-            configuration.icon.imageScale(.small)
+        if icon {
+            HStack(spacing: 6) {
+                configuration.icon.imageScale(.small)
+                configuration.title
+            }
+        } else {
             configuration.title
         }
     }
+}
+
+extension EnvironmentValues {
+    /// false: Lapis buttons show their words only (the iPad book pane)
+    @Entry var lapisButtonIcons = true
+}
+
+extension View {
+    func lapisButtonIcons(_ on: Bool) -> some View { environment(\.lapisButtonIcons, on) }
 }
 
 #Preview("Buttons · light") {
@@ -113,4 +139,7 @@ private struct LapisButtonLabelStyle: LabelStyle {
         Button("Disabled") {}.buttonStyle(.lapis(.primary)).disabled(true)
     }
     Button("Sign in with passkey", systemImage: "person.badge.key.fill") {}.buttonStyle(.lapis(.primary, fullWidth: true))
+    Button("Send to an e-reader or another app", systemImage: "paperplane") {}
+        .buttonStyle(.lapis(.secondary, fullWidth: true))
+        .dynamicTypeSize(.accessibility3)
 }

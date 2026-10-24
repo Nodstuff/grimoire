@@ -390,4 +390,21 @@ enum ReaderPlaces {
     static func forgetAll() {
         UserDefaults.standard.removeObject(forKey: placesKey)
     }
+
+    /// What other devices call this one: "Taisce on iPhone", "Taisce on
+    /// iPad", "Taisce on Mac" (a Kindle's sync prompt, Books' "… · 2 h ago").
+    static var deviceName: String { name(for: UIDevice.current.userInterfaceIdiom) }
+
+    static func name(for idiom: UIUserInterfaceIdiom) -> String {
+        #if targetEnvironment(macCatalyst)
+        return "Taisce on Mac"
+        #else
+        switch idiom {
+        case .pad: return "Taisce on iPad"
+        case .mac: return "Taisce on Mac"
+        case .vision: return "Taisce on Vision Pro"
+        default: return "Taisce on iPhone"
+        }
+        #endif
+    }
 }

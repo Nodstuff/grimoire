@@ -94,7 +94,9 @@ struct TodoRow: View {
                     .opacity(done ? 0.55 : 1)
                     .lineLimit(3)
                 if let source = entry.sourcePath(list: listPath, now: now) {
-                    Text(source).font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(2)
+                    Text(source).font(.footnote).foregroundStyle(Color.lapis.ink3)
+                        .lineLimit(typeSize.isAccessibilitySize ? 3 : 1)
+                        .truncationMode(.middle)
                 }
                 if typeSize.isAccessibilitySize, let pill = pill(label) { pill }
             }

@@ -26,10 +26,13 @@ struct BookTile: View {
                     }
                 }
             VStack(alignment: .leading, spacing: 2) {
+                // two lines, as the artboards ("A Tale of Two Cities" whole)
                 Text(book.title)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(Color.lapis.ink)
-                    .lineLimit(1)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(state)
                     .font(.footnote)
                     .foregroundStyle(Color.lapis.ink3)
@@ -40,6 +43,30 @@ struct BookTile: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel([book.title, book.authorName.map { "by \($0)" }, isNew ? "new" : nil, state].compactMap { $0 }.joined(separator: ", "))
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+}
+
+/// "64% · Kindle · 2 h ago" on one line when it fits; else "64% · Kindle"
+/// over "2 h ago", each phrase whole (never "2 / min ago").
+struct ProgressLine: View {
+    let progress: BookProgress
+    var big = false
+
+    var body: some View {
+        let pct = Text(BookFormat.percent(progress.percentage)).fontWeight(.semibold).foregroundStyle(Color.lapis.ink)
+        let device = progress.device.isEmpty ? "Another device" : progress.device
+        let when = progress.updatedAt.map { BookFormat.ago($0) }
+        ViewThatFits(in: .horizontal) {
+            Text("\(pct) \u{00B7} \(BookFormat.deviceLine(progress))").lineLimit(1)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("\(pct) \u{00B7} \(device)").lineLimit(big ? nil : 1)
+                if let when { Text(when).lineLimit(1) }
+            }
+        }
+        .foregroundStyle(Color.lapis.ink3)
+        .font(.footnote)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(BookFormat.percent(progress.percentage)) read, \(BookFormat.deviceLine(progress))")
     }
 }
 
@@ -96,18 +123,13 @@ struct ReadingCard: View {
                 }
                 Spacer(minLength: big ? 4 : 8)
                 ProgressBar(value: progress.percentage / 100)
-                Text("\(Text(BookFormat.percent(progress.percentage)).fontWeight(.semibold).foregroundStyle(Color.lapis.ink)) · \(BookFormat.deviceLine(progress))")
-                    .foregroundStyle(Color.lapis.ink3)
-                    .font(.footnote)
-                    .lineLimit(big ? nil : 2)
-                    .fixedSize(horizontal: false, vertical: true)
+                ProgressLine(progress: progress, big: big)
                     .padding(.top, 2)
                 if compact {
                     Button(action: onContinue) {
                         Label("Continue", systemImage: "book")
                     }
                     .buttonStyle(.lapis(.primary, fullWidth: big))
-                    .labelStyle(AdaptiveLabelStyle(wordsOnly: big))
                     .accessibilityHint("Opens the book where you left off")
                 }
             }

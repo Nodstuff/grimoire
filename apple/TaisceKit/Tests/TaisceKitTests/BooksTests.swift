@@ -120,7 +120,7 @@ enum BookFixture {
         let newer = await api.putPosition(.book("b1"), PositionWrite(progress: "/x", percentage: 0.2, deviceID: "me", base: 0))
         #expect(newer == .newer(try JSONDecoder().decode(ReaderPosition.self, from: Data(BookFixture.position(ts: 1_790_000_500).utf8))))
         #expect(await api.putPosition(.book("b1"), PositionWrite(progress: "/x", percentage: 0.2, deviceID: "me", base: 1)) == .failed)
-        guard case let .written(row) = await api.putPosition(.doc("d1"), PositionWrite(progress: "/x", percentage: 0.3, deviceID: "me", base: 5)) else {
+        guard case let .written(row) = await api.putPosition(.doc("d1"), PositionWrite(progress: "/x", percentage: 0.3, deviceID: "me", base: 5, device: "Taisce on iPad")) else {
             Issue.record("not written"); return
         }
         #expect(row.timestamp == 1_790_000_600)
@@ -128,6 +128,10 @@ enum BookFixture {
         #expect(sent.httpMethod == "PUT" && sent.path == "/api/docs/d1/position")
         let json = try #require(try JSONSerialization.jsonObject(with: sent.httpBody ?? Data()) as? [String: Any])
         #expect(json["device_id"] as? String == "me" && json["base"] as? Int == 5 && json["progress"] as? String == "/x")
+        // the app names itself; without a name the key stays out (the server says "Taisce web")
+        #expect(json["device"] as? String == "Taisce on iPad")
+        let unnamed = try JSONSerialization.jsonObject(with: JSONEncoder().encode(PositionWrite(progress: "/x", percentage: 0.1, deviceID: "me", base: 0))) as? [String: Any]
+        #expect(unnamed?["device"] == nil)
     }
 
     @Test func epubComesFromTheBookFileOrTheDocExport() async throws {

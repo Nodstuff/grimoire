@@ -316,36 +316,50 @@ struct BooksScreen: View {
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         ToolbarItem(placement: .principal) { Color.clear.frame(width: 1, height: 1).accessibilityHidden(true) }
         ToolbarItemGroup(placement: .topBarTrailing) {
-            Menu {
-                Picker("Shelf", selection: filterBinding) {
-                    Label("All books", systemImage: "books.vertical").tag(BookShelfFilter.all)
-                    ForEach(BookShelfFilter.shelves, id: \.self) { f in
-                        Text("\(f.title)  \(shelf.count(f))").tag(f)
-                    }
-                }
-                .pickerStyle(.inline)
-                if !shelf.series.isEmpty {
-                    Picker("Series", selection: filterBinding) {
-                        ForEach(shelf.series, id: \.name) { s in
-                            Text("\(s.name)  \(s.count)").tag(BookShelfFilter.series(s.name))
-                        }
-                    }
-                    .pickerStyle(.menu)
-                }
-            } label: {
-                Image(systemName: filter == .all ? "line.3.horizontal.decrease" : "line.3.horizontal.decrease.circle.fill")
+            // iPhone-Books: + then the shelf menu; iPad and Mac: the menu, then "Add EPUBs" last
+            if regular {
+                shelfMenu
+                addButton
+            } else {
+                addButton
+                shelfMenu
             }
-            .accessibilityLabel("Shelves")
-            .accessibilityValue(filter.title)
-            .accessibilityIdentifier("books.filter")
-            Button { importing = true } label: {
-                if regular { Label("Add EPUBs", systemImage: "plus").labelStyle(.titleAndIcon) } else { Image(systemName: "plus") }
-            }
-            .accessibilityLabel("Add EPUBs")
-            .accessibilityIdentifier("books.add")
-            .keyboardShortcut("i", modifiers: [.command, .shift])
-            .disabled(store.availability == .unavailable || uploading)
         }
+    }
+
+    private var shelfMenu: some View {
+        Menu {
+            Picker("Shelf", selection: filterBinding) {
+                Label("All books", systemImage: "books.vertical").tag(BookShelfFilter.all)
+                ForEach(BookShelfFilter.shelves, id: \.self) { f in
+                    Text("\(f.title)  \(shelf.count(f))").tag(f)
+                }
+            }
+            .pickerStyle(.inline)
+            if !shelf.series.isEmpty {
+                Picker("Series", selection: filterBinding) {
+                    ForEach(shelf.series, id: \.name) { s in
+                        Text("\(s.name)  \(s.count)").tag(BookShelfFilter.series(s.name))
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+        } label: {
+            Image(systemName: filter == .all ? "line.3.horizontal.decrease" : "line.3.horizontal.decrease.circle.fill")
+        }
+        .accessibilityLabel("Shelves")
+        .accessibilityValue(filter.title)
+        .accessibilityIdentifier("books.filter")
+    }
+
+    private var addButton: some View {
+        Button { importing = true } label: {
+            if regular { Label("Add EPUBs", systemImage: "plus").labelStyle(.titleAndIcon) } else { Image(systemName: "plus") }
+        }
+        .accessibilityLabel("Add EPUBs")
+        .accessibilityIdentifier("books.add")
+        .keyboardShortcut("i", modifiers: [.command, .shift])
+        .disabled(store.availability == .unavailable || uploading)
     }
 
     // MARK: actions

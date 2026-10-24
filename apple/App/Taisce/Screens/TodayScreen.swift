@@ -307,7 +307,7 @@ struct TodayContent: View {
                     } else {
                         GroupedRows(items: Array(due.prefix(TodayDue.limit))) { entry in
                             // the ring is its own button; the rest of the row opens To-dos
-                            TodoRow(entry: entry, now: now, done: checked.contains(entry.id), listPath: listPath, onToggle: onToggleDone.map { f in { f(entry) } })
+                            TodoRow(entry: entry, now: now, done: checked.contains(entry.id), shortPill: true, listPath: listPath, onToggle: onToggleDone.map { f in { f(entry) } })
                                 .onTapGesture(perform: onAllTodos)
                                 .accessibilityAction(named: "Open To-dos", onAllTodos)
                         }
@@ -435,8 +435,9 @@ struct ReviewRowLabel: View {
                 .foregroundStyle(Color.lapis.ink)
                 .lineLimit(typeSize.isAccessibilitySize ? 3 : 1)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            // agents in mono violet, people in the interface face
             Text(item.proposer)
-                .font(.lapisMono(.caption))
+                .font(item.byAgent ? .lapisMono(.caption) : .footnote)
                 .foregroundStyle(item.byAgent ? Color.lapis.agent : Color.lapis.ink3)
                 .lineLimit(1)
         }

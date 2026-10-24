@@ -61,16 +61,20 @@ public struct PositionWrite: Encodable, Sendable, Hashable {
     public var deviceID: String
     /// the timestamp of the row the reader last saw (0: none)
     public var base: Int64
+    /// what other devices call this one ("Taisce on iPad"); nil: the
+    /// server's "Taisce web" (servers before the field ignore it)
+    public var device: String?
 
-    public init(progress: String, percentage: Double, deviceID: String, base: Int64) {
+    public init(progress: String, percentage: Double, deviceID: String, base: Int64, device: String? = nil) {
         self.progress = progress
         self.percentage = percentage
         self.deviceID = deviceID
         self.base = base
+        self.device = device
     }
 
     enum CodingKeys: String, CodingKey {
-        case progress, percentage, base
+        case progress, percentage, base, device
         case deviceID = "device_id"
     }
 }
@@ -137,6 +141,8 @@ public actor PositionWriter {
     public typealias Put = @Sendable (PositionWrite) async -> PositionWriteResult
 
     private let device: String
+    /// the name the rows carry ("Taisce on iPhone")
+    private let name: String?
     private var seenStamp: Int64
     private let put: Put
     private let onNewer: @Sendable (ReaderPosition) async -> Void
@@ -152,13 +158,14 @@ public actor PositionWriter {
     private var inFlight: Task<PositionWriteResult, Never>?
     private var stopped = false
 
-    public init(device: String, seen: Int64, minInterval: Duration = .seconds(10),
+    public init(device: String, name: String? = nil, seen: Int64, minInterval: Duration = .seconds(10),
                 sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
                 now: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock.now },
                 put: @escaping Put,
                 onNewer: @escaping @Sendable (ReaderPosition) async -> Void,
                 onWritten: @escaping @Sendable (ReaderPosition) async -> Void = { _ in }) {
         self.device = device
+        self.name = name
         self.seenStamp = seen
         self.minInterval = minInterval
         self.sleep = sleep
@@ -212,7 +219,7 @@ public actor PositionWriter {
         pending = nil
         if here.progress == written { return }
         lastWrite = now()
-        let body = PositionWrite(progress: here.progress, percentage: here.percentage, deviceID: device, base: seenStamp)
+        let body = PositionWrite(progress: here.progress, percentage: here.percentage, deviceID: device, base: seenStamp, device: name)
         let put = self.put
         let task = Task { await put(body) }
         inFlight = task

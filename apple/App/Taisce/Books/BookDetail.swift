@@ -210,8 +210,8 @@ struct BookDetail: View {
             .disabled(preparing)
             .overlay { if preparing { ProgressView() } }
         }
-        // accessibility sizes: the words, not the symbols (a Lapis button keeps one line)
-        .labelStyle(AdaptiveLabelStyle(wordsOnly: typeSize.isAccessibilitySize || style == .pane))
+        // the iPad pane's buttons are words only (artboard); accessibility sizes are the button's own
+        .lapisButtonIcons(style != .pane)
     }
 
     @ViewBuilder private func coverSection(_ book: Book) -> some View {
@@ -422,15 +422,3 @@ struct OpenInMenu: UIViewControllerRepresentable {
     }
 }
 
-/// Title and icon, or (accessibility sizes) the title alone.
-struct AdaptiveLabelStyle: LabelStyle {
-    let wordsOnly: Bool
-
-    func makeBody(configuration: Configuration) -> some View {
-        if wordsOnly {
-            configuration.title
-        } else {
-            Label(configuration)
-        }
-    }
-}

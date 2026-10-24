@@ -119,7 +119,7 @@ final class ReaderModel {
         guard let api = store?.api else { return }
         let source = self.source
         writer = PositionWriter(
-            device: deviceID, seen: seen,
+            device: deviceID, name: ReaderPlaces.deviceName, seen: seen,
             put: { body in await api.putPosition(source, body) },
             onNewer: { [weak self] p in await self?.takeNewer(p) },
             onWritten: { [weak self] p in await self?.written(p) }
@@ -174,7 +174,7 @@ final class ReaderModel {
             ReaderPlaces.save(LocalPlace(cfi: p.cfi, fraction: p.fraction, timestamp: stamp), source, server: store.serverKey)
         }
         if case let .book(id) = source, armed {
-            store.noteProgress(id, fraction: p.fraction, device: "This device")
+            store.noteProgress(id, fraction: p.fraction, device: ReaderPlaces.deviceName)
         }
     }
 

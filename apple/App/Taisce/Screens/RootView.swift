@@ -245,34 +245,55 @@ struct PhoneRoot: View {
     var body: some View {
         @Bindable var router = router
         TabView(selection: $router.tab) {
-            Tab("Today", systemImage: "house", value: AppTab.today) {
+            Tab(value: AppTab.today) {
                 NavigationStack(path: $router.todayPath) {
                     TodayScreen().navigationDestination(for: Route.self) { RouteView(route: $0) }
                 }
-            }
+            } label: { TabLabel("Today", "house") }
             .badge(model.home.summary.total)
-            Tab("Library", systemImage: "folder", value: AppTab.library) {
+            Tab(value: AppTab.library) {
                 NavigationStack(path: $router.libraryPath) {
                     LibraryScreen().navigationDestination(for: Route.self) { RouteView(route: $0) }
                 }
-            }
-            Tab("Books", systemImage: "books.vertical", value: AppTab.books) {
+            } label: { TabLabel("Library", "folder") }
+            Tab(value: AppTab.books) {
                 NavigationStack(path: $router.booksPath) {
                     BooksScreen().navigationDestination(for: Route.self) { RouteView(route: $0) }
                 }
-            }
-            Tab("To-dos", systemImage: "checkmark.circle", value: AppTab.todos) {
+            } label: { TabLabel("Books", "books.vertical") }
+            Tab(value: AppTab.todos) {
                 NavigationStack(path: $router.todosPath) {
                     TodosScreen().navigationDestination(for: Route.self) { RouteView(route: $0) }
                 }
-            }
-            Tab("Search", systemImage: "magnifyingglass", value: AppTab.search, role: .search) {
+            } label: { TabLabel("To-dos", "checkmark.circle") }
+            Tab(value: AppTab.search, role: .search) {
                 NavigationStack(path: $router.searchPath) {
                     SearchScreen().navigationDestination(for: Route.self) { RouteView(route: $0) }
                 }
-            }
+            } label: { TabLabel("Search", "magnifyingglass") }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
+        // Today's badge counts the review queue whichever tab opens first
+        .task(id: model.cursor) {
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            await model.home.loadReview()
+        }
+    }
+}
+
+/// A tab's label with its outlined symbol (the artboards' tab bar; the
+/// system fills tab symbols by default).
+private struct TabLabel: View {
+    let title: String
+    let symbol: String
+    init(_ title: String, _ symbol: String) {
+        self.title = title
+        self.symbol = symbol
+    }
+
+    var body: some View {
+        Label { Text(title) } icon: { Image(systemName: symbol).environment(\.symbolVariants, .none) }
     }
 }
 

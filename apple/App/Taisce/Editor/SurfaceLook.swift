@@ -79,13 +79,14 @@ enum SurfaceLook {
         #endif
     }
 
-    /// A heading: SF Pro bold at the doc's heading sizes (scaled like the
-    /// text: Dynamic Type, and the Mac's docScale).
+    /// A heading: SF Pro at the web editor's and the doc artboards' sizes
+    /// (h1 26, h2 21, h3 17; h1/h2 bold, as `.prose h2` in iPhone-Doc), scaled
+    /// like the text: Dynamic Type, and the Mac's docScale.
     static func headingFont(_ level: Int, traits: UITraitCollection?) -> UIFont {
         let style: LapisTextStyle = level <= 1 ? .docHeading1 : level == 2 ? .docHeading2 : .docHeading3
-        // the serif sizes read large in SF: a step down keeps the artboard's 21 / 19 pt
-        let serifSize = style.uiFont(traits: traits).pointSize
-        let size = level <= 3 ? serifSize * 0.88 : serifSize * 0.8
+        let (serifBase, base): (CGFloat, CGFloat) = level <= 1 ? (27, 26) : level == 2 ? (23, 21) : level == 3 ? (20, 17) : (20, 15)
+        // the serif style carries the scaling (Dynamic Type, docScale)
+        let size = base * style.uiFont(traits: traits).pointSize / serifBase
         var d = UIFont.systemFont(ofSize: size, weight: level <= 2 ? .bold : .semibold).fontDescriptor
         if traits?.legibilityWeight == .bold, let b = d.withSymbolicTraits(.traitBold) { d = b }
         return UIFont(descriptor: d, size: size)
@@ -159,7 +160,8 @@ enum SurfaceLook {
             out[.foregroundColor] = style.prefix?.checkbox != nil ? UIColor.clear : UIColor.lapis.ink3
             return out
         }
-        if case .heading = style { out[.kern] = -0.3 }
+        // -0.02em, as the artboard's headings
+        if case .heading = style, let f = out[.font] as? UIFont { out[.kern] = -0.02 * f.pointSize }
         // inline code: a rounded, outlined pill drawn by SurfaceLayoutFragment
         if marks.contains(.strike) || checked { out[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
         let link = a[Surface.link] as? String

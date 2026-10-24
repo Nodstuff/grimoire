@@ -37,7 +37,7 @@ struct TodosScreen: View {
                 Task { await model.addTodo(text) }
             }
         )
-        .safeAreaInset(edge: .top, spacing: 0) { WorkspaceBar() } // workspaces
+        // workspaces switch in the Library (iPhone-Todos has no bar; each row names its list)
         .refreshable { await reload() }
         .task(id: model.todoRevision) { await reload() }
         .task { await model.dueAlerts.refresh() }
@@ -112,9 +112,11 @@ struct TodosContent: View {
     var body: some View {
         List {
             Section {
+                // the row starts at the cell's edge and the words 6 pt in: a list
+                // row clips, and Newsreader's display T overhangs its frame
                 header
                     .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
+                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 4))
                     .listRowSeparator(.hidden)
                 if !readOnly {
                     TodoComposer(draft: $draft, hint: hint, now: now, focused: $fieldFocused, onAdd: onAdd)
@@ -187,7 +189,10 @@ struct TodosContent: View {
                 Text(line.joined(separator: " · ")).font(.subheadline).foregroundStyle(Color.lapis.ink3)
             }
         }
-        .padding(.horizontal, 2)
+        .padding(.leading, 6)
+        .padding(.trailing, 2)
+        // clear of the bar above: under it, the bar's leading slot cut the T's serif
+        .padding(.top, 10)
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {

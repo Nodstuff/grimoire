@@ -22,6 +22,21 @@ import TaisceKit
         #expect(ReaderEvent(["fraction": 1]) == nil && ReaderEvent(["type": "whatever"]) == nil && ReaderEvent("text") == nil)
     }
 
+    @Test func theReaderNamesThisDevice() {
+        #if targetEnvironment(macCatalyst)
+        #expect(ReaderPlaces.deviceName == "Taisce on Mac")
+        #else
+        #expect(ReaderPlaces.name(for: .phone) == "Taisce on iPhone")
+        #expect(ReaderPlaces.name(for: .pad) == "Taisce on iPad")
+        #expect(ReaderPlaces.name(for: .mac) == "Taisce on Mac")
+        #endif
+        // the sidebar's e-reader times stay short
+        let now = Date(timeIntervalSince1970: 1_790_000_000)
+        #expect(BooksSidebarSections.since(now.addingTimeInterval(-7_200), now: now) == "2 h")
+        #expect(BooksSidebarSections.since(now.addingTimeInterval(-3 * 86_400), now: now) == "3 d")
+        #expect(BooksSidebarSections.since(now.addingTimeInterval(-20), now: now) == "now")
+    }
+
     func result(_ status: String, _ name: String = "a.epub", _ message: String? = nil) throws -> BookUploadResult {
         var o: [String: Any] = ["filename": name, "status": status]
         if let message { o["message"] = message }
