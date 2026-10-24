@@ -128,6 +128,16 @@ final class BooksUITests: XCTestCase {
         app.swipeUp()
         RunLoop.current.run(until: Date().addingTimeInterval(1))
         shot(app, "book-detail-lower")
+        // Send to…: the system share sheet over the EPUB (downloaded, named Author - Title.epub)
+        let send = app.buttons["Send to…"]
+        if send.waitForExistence(timeout: 3), send.isHittable {
+            send.tap()
+            let close = app.buttons["Close"].firstMatch
+            XCTAssertTrue(close.waitForExistence(timeout: 15), "the share sheet opened")
+            RunLoop.current.run(until: Date().addingTimeInterval(1))
+            shot(app, "share-sheet")
+            close.tap()
+        }
     }
 
     /// Open a book, turn pages, the position lands with an XPointer; reopen

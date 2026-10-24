@@ -9,7 +9,10 @@ import UniformTypeIdentifiers
 struct BooksScreen: View {
     @Environment(AppModel.self) private var model
     @Environment(\.horizontalSizeClass) private var sizeClass
-    @State private var filter: BookShelfFilter = .all
+    /// the shelf shown: the screen's own, or (iPad/Mac) the sidebar's Shelves
+    /// and Series rows when the shell passes its binding
+    private let externalFilter: Binding<BookShelfFilter>?
+    @State private var ownFilter: BookShelfFilter = .all
     @State private var query = ""
     @State private var width: CGFloat = 400
     /// the book in the pane (wide)
@@ -23,6 +26,16 @@ struct BooksScreen: View {
     @State private var toast: ToastMessage?
     @State private var removing: Book?
     @State private var coverFor: Book?
+
+    init(filter: Binding<BookShelfFilter>? = nil) {
+        externalFilter = filter
+    }
+
+    private var filterBinding: Binding<BookShelfFilter> { externalFilter ?? $ownFilter }
+    private var filter: BookShelfFilter {
+        get { filterBinding.wrappedValue }
+        nonmutating set { filterBinding.wrappedValue = newValue }
+    }
 
     private var store: BookStore { model.books }
     private var shelf: BookShelf { store.shelf }
@@ -304,7 +317,7 @@ struct BooksScreen: View {
         ToolbarItem(placement: .principal) { Color.clear.frame(width: 1, height: 1).accessibilityHidden(true) }
         ToolbarItemGroup(placement: .topBarTrailing) {
             Menu {
-                Picker("Shelf", selection: $filter) {
+                Picker("Shelf", selection: filterBinding) {
                     Label("All books", systemImage: "books.vertical").tag(BookShelfFilter.all)
                     ForEach(BookShelfFilter.shelves, id: \.self) { f in
                         Text("\(f.title)  \(shelf.count(f))").tag(f)
@@ -312,7 +325,7 @@ struct BooksScreen: View {
                 }
                 .pickerStyle(.inline)
                 if !shelf.series.isEmpty {
-                    Picker("Series", selection: $filter) {
+                    Picker("Series", selection: filterBinding) {
                         ForEach(shelf.series, id: \.name) { s in
                             Text("\(s.name)  \(s.count)").tag(BookShelfFilter.series(s.name))
                         }

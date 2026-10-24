@@ -905,6 +905,64 @@ Everything here is hidden for LOCAL daemons and signed-out accounts
   several A4 pages), and `ServerIntegrationTests.t3d_shareLinksEndToEnd`
   against a SERVER daemon (`apple/scripts/integration.sh`).
 
+## Books (SERVER mode with a library)
+
+The EPUB library is a signed-in person's surface (`library.rs`, `kosync.rs`,
+`reader.rs`): a LOCAL daemon, or a server without a bucket, answers 404 and
+Books says "Books live on your Taisce server".
+
+- **Screens** (`Taisce/Books/`): `BooksScreen` (iPhone-Books / iPad-Books /
+  Mac-Books: Continue reading, shelf and series chips, the grid by series then
+  title; iPhone opens a book's details as a sheet, a wide iPad or Mac shows
+  them in a pane beside the grid; Add EPUBs from Files, or drop them anywhere
+  on iPad/Mac; ⇧⌘I), `BookDetail(id:)` (iPhone-Book-Detail; `.sheet`, `.pane`,
+  `.page`), `CoverFinder` and `BookEditSheet`, `BookReaderScreen(bookID:)`.
+  The shell's `Route.book(id)` / `Route.bookReader(id)` show `BookDetail` /
+  `BookReaderScreen`.
+- **State**: `BookStore` on `AppModel.books`: the shelf, cached as one JSON
+  file per server (`BookShelfCache`) so Books opens at once and offline;
+  covers through the bearer (`CoverImageLoader` in the environment, memory +
+  disk); EPUBs cached per server for reading offline. Sign-out removes all of
+  it and the reader's local places. Pure logic is in TaisceKit `Books/`
+  (`BookShelf`, `BookPatch`, `ReaderSync`, `PositionWriter`, `ReaderSettings`).
+- **Reader**: the web reader's engine (foliate-js, vendored in
+  `ui/vendor/foliate-js`, and `ui/src/reader/xpointer.ts`) in a `WKWebView`,
+  for book and doc content only. The page (`Resources/reader/`, built from
+  `apple/ReaderWeb/main.ts` by `apple/scripts/build-reader.sh`; commit the
+  output and its SHA256SUMS) is served at `taisce-reader://bundle/` with the
+  app's Newsreader and the cached EPUB; it loads nothing from the network and
+  a book's own scripts never run. Native chrome: Contents, Reading settings
+  (paper Auto/Light/Sepia/Dark with the web reader's colours, size, spacing,
+  typeface, margins, pages or scroll; per device), progress and minutes left.
+  Taps: edges turn (side margins too), the middle shows the bar; swipe; ← →.
+- **Sync** (same rules as the web reader): open at another device's newer
+  place by its KOReader XPointer (else its percentage) with "Synced from
+  <device> · N%", else this device's own CFI; after a page turn, write at
+  most every 10 s (`PUT …/position` with the XPointer and `base`), and on
+  background/close; back in front, take a newer place; a 409 hands back the
+  newer row and the reader goes there instead of dragging the other device
+  back. The server stamps the app's rows as device "Taisce web".
+
+Testing Books locally needs a SERVER-mode daemon with a bucket. Never the real
+bucket: point the daemon at a local S3 stand-in with `TAISCE_BOOKS_ENDPOINT`
+(dev only, path-style; see `crates/daemon/src/s3sign.rs`) and fake keys:
+
+```sh
+env -i PATH="$PATH" HOME=$TMP/home TAISCE_BOOKS_BUCKET=dev-library TAISCE_BOOKS_REGION=us-east-1 \
+  TAISCE_BOOKS_ENDPOINT=http://127.0.0.1:7589 TAISCE_BOOKS_ACCESS_KEY=dev TAISCE_BOOKS_SECRET_KEY=dev \
+  target/release/taisce --db $TMP/ks.db --port 7586 --public-url http://localhost:7586 serve
+```
+
+A simulator can't play a passkey, so Debug UI-test runs sign in through a
+relay (`TAISCE_UI_TEST=1` + `TAISCE_UI_SIGNIN_RELAY=http://127.0.0.1:<port>/signin`,
+`Books/BooksDevHooks.swift`): the app posts its authorize URL there, a small
+script on the Mac mints an enrollment link with the daemon's CLI, plays the
+passkey with the `softpasskey` example and answers the redirect; the OAuth
+exchange is the app's own. `BooksUITests` documents its `TEST_RUNNER_…`
+variables (daemon, relay, a first-party token, a paired e-reader's KOReader
+login). Debug builds also take `-books` / `-read <id>` launch arguments until
+the shell's Books tab lands.
+
 ## Running the app against a scratch daemon
 
 Launch arguments (UserDefaults' argument domain) make screenshots and UI

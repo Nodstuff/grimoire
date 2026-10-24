@@ -34,7 +34,14 @@ final class SearchUITests: XCTestCase {
         let result = app.buttons.containing(NSPredicate(format: "label CONTAINS %@", word)).firstMatch
         XCTAssertTrue(result.waitForExistence(timeout: 20), "the search lists the seeded doc")
         result.tap()
-        XCTAssertTrue(app.staticTexts[heading].waitForExistence(timeout: 10), "the result opened")
+        // the doc is one editing surface (a text view): wait for its text
+        let body = app.textViews.firstMatch
+        XCTAssertTrue(body.waitForExistence(timeout: 10), "the result opened")
+        let end = Date().addingTimeInterval(10)
+        while !((body.value as? String) ?? "").contains(heading), Date() < end {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        }
+        XCTAssertTrue(((body.value as? String) ?? "").contains(heading), "the result opened at its doc")
     }
 
     func testOpensARootDocFromSearch() throws {
