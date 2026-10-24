@@ -359,6 +359,9 @@ private struct DocTreeRow: View {
     /// sight, so scrolling doesn't redraw every row
     @State private var place = RowPlace()
     @Environment(\.treeScroller) private var scroller
+    /// large text: the chevron's strip grows with the words (else it overlaps them)
+    @ScaledMetric(relativeTo: .body) private var typeScale: CGFloat = 1
+    private var chevronW: CGFloat { style.chevronWidth * max(1, typeScale) }
 
     private var node: LibraryNode { line.node }
     private var lead: CGFloat { CGFloat(line.depth) * style.indent }
@@ -373,7 +376,7 @@ private struct DocTreeRow: View {
                 .font(style == .library ? .body : (style.solidSelection ? .body : .callout))
                 .fontWeight(node.isFolder && style == .library ? .semibold : (selected && !style.solidSelection ? .semibold : nil))
                 .foregroundStyle(onAccent ? Color.lapis.onAccent : Color.lapis.ink)
-                .lineLimit(1)
+                .lineLimit(typeScale > 1.5 ? 3 : 1)
                 .truncationMode(.tail)
                 .layoutPriority(1)
             if flags > 0 {
@@ -393,6 +396,7 @@ private struct DocTreeRow: View {
                     .monospacedDigit()
                     .foregroundStyle(onAccent ? Color.lapis.onAccent.opacity(0.85) : Color.lapis.ink3)
                     .lineLimit(1)
+                    .fixedSize()
                     .accessibilityHidden(true)
             }
         }
@@ -403,7 +407,7 @@ private struct DocTreeRow: View {
         .overlay(alignment: .top) {
             if separator {
                 Rectangle().fill(Color.lapis.line2).frame(height: 1)
-                    .padding(.leading, lead + style.lead + style.chevronWidth + 8 + 22 + 8)
+                    .padding(.leading, lead + style.lead + chevronW + 8 + 22 * max(1, typeScale) + 8)
                     .allowsHitTesting(false)
             }
         }
@@ -419,7 +423,7 @@ private struct DocTreeRow: View {
         // folder, anywhere else opens the doc (a Button inside a draggable
         // row doesn't reliably get the click on the Mac)
         .gesture(SpatialTapGesture().onEnded { tap in
-            if node.isFolder, tap.location.x < lead + style.lead + style.chevronWidth + 6 { onToggle() } else { onOpen() }
+            if node.isFolder, tap.location.x < lead + style.lead + chevronW + 6 { onToggle() } else { onOpen() }
         })
         .modifier(DragSource(id: node.id, title: node.doc.title, isFolder: node.isFolder, mover: mover))
         .modifier(RowDrop(id: node.id, firstChild: firstChild, height: height, mover: mover, setHover: setHover, onDroppedInto: onDroppedInto,
@@ -460,10 +464,10 @@ private struct DocTreeRow: View {
                 .foregroundStyle(onAccent ? Color.lapis.onAccent : Color.lapis.ink3)
                 .rotationEffect(.degrees(line.isOpen ? 90 : 0))
                 .animation(Lapis.Motion.fast, value: line.isOpen)
-                .frame(width: style.chevronWidth, height: style.rowHeight)
+                .frame(width: chevronW, height: style.rowHeight)
                 .accessibilityHidden(true)
         } else {
-            Color.clear.frame(width: style.chevronWidth, height: 1)
+            Color.clear.frame(width: chevronW, height: 1)
         }
     }
 
@@ -504,6 +508,8 @@ struct DocTreeIcon: View {
     let isOpen: Bool
     var size: Size = .library
     var onAccent = false
+    /// grows with the text (large Dynamic Type)
+    @ScaledMetric(relativeTo: .body) private var width: CGFloat = 22
 
     var body: some View {
         Group {
@@ -517,7 +523,7 @@ struct DocTreeIcon: View {
             }
         }
         .font(size == .library ? .body : .callout)
-        .frame(width: 22)
+        .frame(width: width)
         .accessibilityHidden(true)
     }
 }

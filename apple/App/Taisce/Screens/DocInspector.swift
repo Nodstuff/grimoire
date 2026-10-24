@@ -329,19 +329,32 @@ private struct TabStrip: View {
     /// the column (iPad, Mac): a size down
     var small = false
     @Namespace private var selection
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
+        // accessibility sizes: the tabs keep their whole names and scroll sideways
+        if typeSize.isAccessibilitySize {
+            ScrollView(.horizontal) { tabs.fixedSize(horizontal: true, vertical: false) }
+                .scrollIndicators(.hidden)
+        } else {
+            tabs
+        }
+    }
+
+    private var tabs: some View {
         HStack(spacing: 0) {
             ForEach(DocInspector.Tab.allCases) { t in
                 Button {
                     withAnimation(Lapis.Motion.standard) { tab = t }
                 } label: {
                     HStack(spacing: 5) {
-                        Text(t.rawValue).font((small ? Font.footnote : .subheadline).weight(tab == t ? .semibold : .medium)).lineLimit(1).minimumScaleFactor(0.75)
+                        Text(t.rawValue).font((small ? Font.footnote : .subheadline).weight(tab == t ? .semibold : .medium)).lineLimit(1)
+                            .minimumScaleFactor(typeSize.isAccessibilitySize ? 1 : 0.75)
                         if t == .review, reviewCount > 0 { CountPill(n: reviewCount, tone: .attention) }
                         if t == .comments, commentCount > 0 { CountPill(n: commentCount) }
                     }
                     .foregroundStyle(Color.lapis.ink)
+                    .padding(.horizontal, typeSize.isAccessibilitySize ? 14 : 0)
                     .frame(maxWidth: .infinity, minHeight: 34)
                     .background {
                         if tab == t {
@@ -373,22 +386,26 @@ struct DocReviewItemCard: View {
     var onShow: (() -> Void)?
 
     @State private var confirming = false
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         let card = ChangeCardModel(item)
+        // accessibility sizes: who, what and the verdict stack, each whole
+        let big = typeSize.isAccessibilitySize
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                LapisAvatar(name: card.author, size: 32)
+                if !big { LapisAvatar(name: card.author, size: 32) }
                 VStack(alignment: .leading, spacing: 1) {
                     Text(card.author)
                         .font(item.byAgent ? .lapisMono(.subheadline, weight: .medium) : .subheadline.weight(.semibold))
                         .foregroundStyle(item.byAgent ? Color.lapis.agent : Color.lapis.ink)
-                        .lineLimit(1)
+                        .lineLimit(big ? 2 : 1)
                     Text([item.summary, card.date.map { ShortWhen.string($0) }].compactMap { $0 }.joined(separator: " · "))
-                        .font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(1)
+                        .font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(big ? nil : 1)
+                    if big { VerdictChip(card.verdict, short: true).padding(.top, 4) }
                 }
                 Spacer(minLength: 4)
-                VerdictChip(card.verdict, short: true)
+                if !big { VerdictChip(card.verdict, short: true) }
             }
             if item.opType != "delete", !(card.old.isEmpty && card.new.isEmpty) {
                 DiffText(old: card.old, new: card.new)
@@ -402,7 +419,8 @@ struct DocReviewItemCard: View {
                 Text(note).font(.subheadline).foregroundStyle(Color.lapis.ink2).fixedSize(horizontal: false, vertical: true)
             }
             if canDecide {
-                HStack(spacing: 8) {
+                let row = big ? AnyLayout(VStackLayout(alignment: .leading, spacing: 8)) : AnyLayout(HStackLayout(spacing: 8))
+                row {
                     let delete = item.kind == .parked && item.opType == "delete"
                     Button {
                         if delete, !confirming { Haptics.warning(); confirming = true; return }
