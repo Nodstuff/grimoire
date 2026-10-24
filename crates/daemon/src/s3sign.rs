@@ -15,6 +15,13 @@
 //!   `TAISCE_BOOKS_SECRET_KEY` (+ optional `TAISCE_BOOKS_SESSION_TOKEN`)
 //!   for dev, else the box's instance profile via IMDS, cached and
 //!   refreshed before it expires.
+//! - `TAISCE_BOOKS_ENDPOINT` (optional, local development and tests only):
+//!   an S3-compatible endpoint such as `http://127.0.0.1:7579`, addressed
+//!   path-style (`<endpoint>/<bucket>/<key>`) with the same SigV4 query
+//!   signing, so a scratch daemon can run the whole library against a
+//!   stand-in on the laptop. Unset (production), every URL is
+//!   virtual-hosted on the regional AWS endpoint, exactly as before. Never
+//!   set it on the box; the daemon logs a warning at boot when it is set.
 //!
 //! Downloads 302 to presigned URLs (the box never holds the bytes); an
 //! ereader that opted into `stream_downloads` is proxied chunk-by-chunk
@@ -79,6 +86,8 @@ enum Creds {
 pub struct S3Config {
     pub bucket: String,
     pub region: String,
+    /// `TAISCE_BOOKS_ENDPOINT`: None in production (AWS, virtual-hosted)
+    endpoint: Option<Endpoint>,
     creds: Creds,
     http: reqwest::Client,
     /// Tests: object writes and deletes land here instead of the network
@@ -164,6 +173,44 @@ impl ObjectBody {
     }
 }
 
+/// A development S3-compatible endpoint (`TAISCE_BOOKS_ENDPOINT`), addressed
+/// path-style: `<scheme>://<authority>/<bucket>/<key>`. Only a bare origin
+/// is accepted (no path, query, fragment or credentials), so the signed
+/// `host` and the URL can never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    scheme: String,
+    /// `host[:port]`, exactly as signed into the `host` header
+    authority: String,
+}
+
+impl Endpoint {
+    pub fn parse(raw: &str) -> anyhow::Result<Endpoint> {
+        let u = url::Url::parse(raw.trim())
+            .map_err(|e| anyhow::anyhow!("TAISCE_BOOKS_ENDPOINT {raw:?}: {e}"))?;
+        anyhow::ensure!(
+            matches!(u.scheme(), "http" | "https"),
+            "TAISCE_BOOKS_ENDPOINT {raw:?}: http or https only"
+        );
+        anyhow::ensure!(
+            (u.path() == "/" || u.path().is_empty())
+                && u.query().is_none()
+                && u.fragment().is_none()
+                && u.username().is_empty()
+                && u.password().is_none(),
+            "TAISCE_BOOKS_ENDPOINT {raw:?}: an origin only, like http://127.0.0.1:7579"
+        );
+        let host = u
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("TAISCE_BOOKS_ENDPOINT {raw:?}: no host"))?;
+        let authority = match u.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host.to_string(),
+        };
+        Ok(Endpoint { scheme: u.scheme().to_string(), authority })
+    }
+}
+
 fn env_non_empty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -188,6 +235,16 @@ impl S3Config {
         let region = env_non_empty("TAISCE_BOOKS_REGION").ok_or_else(|| {
             anyhow::anyhow!("TAISCE_BOOKS_BUCKET is set but TAISCE_BOOKS_REGION is not (e.g. eu-west-1)")
         })?;
+        let endpoint = env_non_empty("TAISCE_BOOKS_ENDPOINT")
+            .map(|e| Endpoint::parse(&e))
+            .transpose()?;
+        if let Some(e) = &endpoint {
+            tracing::warn!(
+                "EPUB library: TAISCE_BOOKS_ENDPOINT is set: object storage is {}://{} (path-style), not AWS; development only",
+                e.scheme,
+                e.authority
+            );
+        }
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             // no total timeout: book bodies stream at the reader's pace,
@@ -215,6 +272,7 @@ impl S3Config {
         Ok(Some(S3Config {
             bucket,
             region,
+            endpoint,
             creds,
             http,
             #[cfg(test)]
@@ -239,6 +297,7 @@ impl S3Config {
         S3Config {
             bucket: "test-library".into(),
             region: "us-east-1".into(),
+            endpoint: None,
             creds: Creds::Fixed(Credentials {
                 access_key: "AKIATEST".into(),
                 secret_key: "testsecret".into(),
@@ -293,6 +352,7 @@ impl S3Config {
             &creds,
             &self.bucket,
             &self.region,
+            self.endpoint.as_ref(),
             method,
             key,
             response_content_disposition,
@@ -308,6 +368,7 @@ impl S3Config {
             &creds,
             &self.bucket,
             &self.region,
+            self.endpoint.as_ref(),
             Method::Put,
             key,
             None,
@@ -510,7 +571,17 @@ impl S3Config {
         }
         #[allow(unreachable_code)]
         let creds = self.credentials().await?;
-        let url = presign(&creds, &self.bucket, &self.region, Method::Delete, key, None, PRESIGN_TTL, SystemTime::now());
+        let url = presign(
+            &creds,
+            &self.bucket,
+            &self.region,
+            self.endpoint.as_ref(),
+            Method::Delete,
+            key,
+            None,
+            PRESIGN_TTL,
+            SystemTime::now(),
+        );
         let res = self.http.delete(url).send().await?;
         if res.status().is_success() {
             return Ok(());
@@ -654,30 +725,43 @@ fn signing_key(secret: &str, date: &str, region: &str) -> [u8; 32] {
 }
 
 /// One presigned URL. Virtual-hosted–style bucket addressing on the
-/// regional endpoint; only `host` is signed (a presigned URL's other
-/// headers are the caller's business), the payload is UNSIGNED-PAYLOAD.
+/// regional endpoint (or, with a development `endpoint`, path-style on
+/// it); only `host` is signed (a presigned URL's other headers are the
+/// caller's business), the payload is UNSIGNED-PAYLOAD.
 #[allow(clippy::too_many_arguments)]
 fn presign(
     creds: &Credentials,
     bucket: &str,
     region: &str,
+    endpoint: Option<&Endpoint>,
     method: Method,
     key: &str,
     response_content_disposition: Option<&str>,
     ttl: Duration,
     now: SystemTime,
 ) -> String {
-    let host = format!("{bucket}.s3.{region}.amazonaws.com");
-    presign_at(creds, &host, region, method, key, response_content_disposition, ttl, now)
+    match endpoint {
+        None => {
+            let host = format!("{bucket}.s3.{region}.amazonaws.com");
+            presign_at(creds, "https", &host, "", region, method, key, response_content_disposition, ttl, now)
+        }
+        Some(e) => {
+            let prefix = format!("/{}", uri_encode(bucket, true));
+            presign_at(creds, &e.scheme, &e.authority, &prefix, region, method, key, response_content_disposition, ttl, now)
+        }
+    }
 }
 
-/// [`presign`] against an explicit virtual host. Production always signs
+/// [`presign`] against an explicit host, scheme and path prefix (empty for
+/// virtual-hosted, `/<bucket>` for path-style). Production always signs
 /// for the regional host; the test pins AWS's documented vector, which was
 /// published against the legacy global one (`examplebucket.s3.amazonaws.com`).
 #[allow(clippy::too_many_arguments)]
 fn presign_at(
     creds: &Credentials,
+    scheme: &str,
     host: &str,
+    path_prefix: &str,
     region: &str,
     method: Method,
     key: &str,
@@ -703,7 +787,7 @@ fn presign_at(
         params.push(("response-content-disposition", d.to_string()));
     }
     let query = canonical_query(params);
-    let uri = format!("/{}", uri_encode(key, false));
+    let uri = format!("{path_prefix}/{}", uri_encode(key, false));
     let canonical_request = format!(
         "{}\n{}\n{}\nhost:{}\n\nhost\nUNSIGNED-PAYLOAD",
         method.as_str(),
@@ -717,7 +801,7 @@ fn presign_at(
         &signing_key(&creds.secret_key, &date, region),
         string_to_sign.as_bytes(),
     ));
-    format!("https://{host}{uri}?{query}&X-Amz-Signature={signature}")
+    format!("{scheme}://{host}{uri}?{query}&X-Amz-Signature={signature}")
 }
 
 #[cfg(test)]
@@ -742,7 +826,9 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1369353600);
         let url = presign_at(
             &docs_creds(),
+            "https",
             "examplebucket.s3.amazonaws.com",
+            "",
             "us-east-1",
             Method::Get,
             "test.txt",
@@ -796,6 +882,7 @@ X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404
             &docs_creds(),
             "b",
             "us-east-1",
+            None,
             Method::Get,
             "k",
             None,
@@ -809,6 +896,7 @@ X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404
             },
             "b",
             "us-east-1",
+            None,
             Method::Get,
             "k",
             None,
@@ -821,6 +909,7 @@ X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404
             &docs_creds(),
             "b",
             "us-east-1",
+            None,
             Method::Get,
             "k",
             Some("attachment; filename=\"a.epub\""),
@@ -837,6 +926,7 @@ X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404
             &docs_creds(),
             "b",
             "us-east-1",
+            None,
             Method::Head,
             "k",
             None,
@@ -844,5 +934,33 @@ X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404
             now,
         );
         assert_ne!(plain, head);
+    }
+
+    /// Unset, production URLs are virtual-hosted on AWS (unchanged); a
+    /// development endpoint is path-style on that origin, signs that
+    /// authority as `host` (port included), and the signature differs only
+    /// because the canonical request does.
+    #[test]
+    fn a_development_endpoint_is_path_style_and_production_is_unchanged() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1369353600);
+        let aws = presign(&docs_creds(), "lib", "eu-west-1", None, Method::Get, "library/u/a b.epub", None, PRESIGN_TTL, now);
+        assert!(aws.starts_with("https://lib.s3.eu-west-1.amazonaws.com/library/u/a%20b.epub?X-Amz-Algorithm="), "{aws}");
+        let e = Endpoint::parse("http://127.0.0.1:7579").unwrap();
+        assert_eq!(e, Endpoint { scheme: "http".into(), authority: "127.0.0.1:7579".into() });
+        let dev = presign(&docs_creds(), "lib", "eu-west-1", Some(&e), Method::Get, "library/u/a b.epub", None, PRESIGN_TTL, now);
+        assert!(dev.starts_with("http://127.0.0.1:7579/lib/library/u/a%20b.epub?X-Amz-Algorithm="), "{dev}");
+        // the same query, signed over the path-style request
+        let q = |u: &str| u.split_once('?').unwrap().1.split("&X-Amz-Signature=").next().unwrap().to_string();
+        assert_eq!(q(&aws), q(&dev));
+        assert_ne!(aws.rsplit_once('=').unwrap().1, dev.rsplit_once('=').unwrap().1);
+        // the signature covers host = the endpoint's authority and the /bucket prefix
+        let manual = presign_at(&docs_creds(), "http", "127.0.0.1:7579", "/lib", "eu-west-1", Method::Get, "library/u/a b.epub", None, PRESIGN_TTL, now);
+        assert_eq!(dev, manual);
+        // https with the default port signs the bare host
+        assert_eq!(Endpoint::parse("https://minio.test/").unwrap().authority, "minio.test");
+        // anything but a bare origin is refused (the signed host must be the URL's)
+        for bad in ["ftp://x", "http://127.0.0.1:7579/bucket", "http://u:p@127.0.0.1", "http://127.0.0.1/?a=1", "not a url"] {
+            assert!(Endpoint::parse(bad).is_err(), "{bad}");
+        }
     }
 }

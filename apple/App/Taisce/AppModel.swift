@@ -137,6 +137,8 @@ final class AppModel {
     let reviewCounts = ReviewCounts()
     /// Today's review queue, book in progress and the person's name (HomeStore.swift)
     let home = HomeStore()
+    /// the EPUB library (Books/): shelf, covers, the reader's places
+    let books = BookStore()
     /// a comment push was tapped: the frontmost window opens that doc's link comments
     private(set) var linkCommentsRequest: LinkCommentsRequest?
 
@@ -157,6 +159,7 @@ final class AppModel {
         serverURL = stored.flatMap { ServerURLPolicy.accepts($0) ? $0 : nil } ?? Self.defaultServerURL
         codeRuns.app = self
         shareLinks.app = self
+        books.app = self
         sqlRuns.app = self
         home.app = self
     }
@@ -188,6 +191,7 @@ final class AppModel {
         await stopSync()
         await pushSessionEnding() // push
         serverURL = trimmed
+        books.serverChanged()
         UserDefaults.standard.set(trimmed, forKey: Self.serverURLKey)
         await connect()
         await startSync()
@@ -256,7 +260,7 @@ final class AppModel {
             freshSignIn = true
             ownerChecked = false
             ownerSettled = false
-            try await auth.signIn(using: SystemWebAuthenticator())
+            try await auth.signIn(using: Self.webAuthenticator())
             // the state stream flips authPhase and starts sync
         } catch AuthError.cancelled {
             freshSignIn = false
@@ -320,6 +324,7 @@ final class AppModel {
         sqlRuns.reset()
         shareLinks.reset()
         home.reset()
+        books.reset()
         linkCommentsRequest = nil
         settledTodos = []
         pendingEditDoc = nil

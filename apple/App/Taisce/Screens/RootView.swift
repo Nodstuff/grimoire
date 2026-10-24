@@ -87,6 +87,9 @@ struct RootView: View {
             NewDocSheet(parent: router.newDocParent).environment(router)
         }
         .modifier(NewFolderPrompt(router: router, model: model))
+        #if DEBUG
+        .modifier(BooksDevEntry()) // Books branch only: the shell's Books tab replaces it at merge
+        #endif
         .onChange(of: sizeClass, initial: true) { _, size in router.isPad = RootLayout.make(horizontal: size) == .split }
         // the menu bar's commands act on the window in front
         .focusedSceneValue(\.router, router)

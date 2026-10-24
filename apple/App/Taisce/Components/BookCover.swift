@@ -48,12 +48,18 @@ struct BookCover: View {
     let title: String
     var author: String?
     var imageURL: URL?
+    /// set by the Books screens: covers behind the server's bearer
+    @Environment(\.coverImageLoader) private var loader
 
     var body: some View {
         Color.clear
             .aspectRatio(2.0 / 3.0, contentMode: .fit)
             .overlay {
-                if let imageURL {
+                if let imageURL, let loader {
+                    LoadedCoverImage(url: imageURL, loader: loader) {
+                        TypographicCover(id: id, title: title, author: author)
+                    }
+                } else if let imageURL {
                     AsyncImage(url: imageURL, transaction: Transaction(animation: Lapis.Motion.standard)) { phase in
                         switch phase {
                         case let .success(image): image.resizable().scaledToFill()
@@ -71,6 +77,52 @@ struct BookCover: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(author.map { "\(title), by \($0)" } ?? title)
             .accessibilityAddTraits(.isImage)
+    }
+}
+
+/// Loads cover images the app has to ask for itself (the server's cover
+/// route wants the bearer, which `AsyncImage` can't send).
+struct CoverImageLoader: Sendable {
+    let load: @Sendable (URL) async -> UIImage?
+    /// what's already in memory, drawn at once (no shimmer flash)
+    var cached: @Sendable (URL) -> UIImage? = { _ in nil }
+}
+
+extension EnvironmentValues {
+    @Entry var coverImageLoader: CoverImageLoader?
+}
+
+/// A cover through `CoverImageLoader`: a shimmer while it loads, the
+/// fallback when there is none.
+struct LoadedCoverImage<Fallback: View>: View {
+    let url: URL
+    let loader: CoverImageLoader
+    @ViewBuilder var fallback: Fallback
+    @State private var phase: Phase = .loading
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    enum Phase: Equatable {
+        case loading, missing
+        case loaded(UIImage)
+    }
+
+    var body: some View {
+        Group {
+            switch phase {
+            case let .loaded(image): Image(uiImage: image).resizable().scaledToFill()
+            case .missing: fallback
+            case .loading:
+                if let image = loader.cached(url) {
+                    Image(uiImage: image).resizable().scaledToFill()
+                } else {
+                    Rectangle().fill(Color.lapis.hover).shimmering()
+                }
+            }
+        }
+        .task(id: url) {
+            let image = await loader.load(url)
+            withAnimation(reduceMotion ? nil : Lapis.Motion.standard) { phase = image.map { .loaded($0) } ?? .missing }
+        }
     }
 }
 

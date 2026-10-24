@@ -20,10 +20,15 @@ targets:
     deploymentTarget: "26.0"
     sources:
       - path: Taisce
-        excludes: ["Resources/reladraw/**"]
+        excludes: ["Resources/reladraw/**", "Resources/reader/**"]
       # reladraw is ES modules importing each other by relative path: a
       # folder reference keeps them together as reladraw/ in the bundle
       - path: Taisce/Resources/reladraw
+        type: folder
+        buildPhase: resources
+      # the in-app book reader's page (apple/scripts/build-reader.sh), served
+      # from reader/ in the bundle by ReaderSchemeHandler
+      - path: Taisce/Resources/reader
         type: folder
         buildPhase: resources
     dependencies:
