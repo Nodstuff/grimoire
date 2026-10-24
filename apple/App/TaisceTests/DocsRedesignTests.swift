@@ -143,8 +143,9 @@ import UIKit
         #expect(raw.filter { $0.kind != .added }.map(\.text).joined() == "a.")
         #expect(raw.filter { $0.kind != .removed }.map(\.text).joined() == "b.")
         #expect(WordDiff.display(old: "a.", new: "b.").first?.text == "a. ")
-        #expect(WordDiff.display(old: "one two", new: "one three").map(\.text) == WordDiff.segments(old: "one two", new: "one three").map(\.text),
-                "nothing added where a space already is")
+        #expect(WordDiff.display(old: "one two", new: "one three").map(\.text) == ["one ", "two ", "three"])
+        let spaced = WordDiff.spaced([.init(kind: .removed, text: "two "), .init(kind: .added, text: "three")])
+        #expect(spaced.map(\.text) == ["two ", "three"], "nothing added where a space already is")
     }
 
     @Test func formattingBarKnowsTheBlockKind() {
