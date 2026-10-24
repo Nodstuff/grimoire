@@ -531,6 +531,34 @@ the surface (type, Return, Backspace-merge, `[[` pick) and checks the daemon's
 markdown after autosave. `LaunchTests` needs a doc titled "Welcome" headed
 "Welcome to Taisce".
 
+## Docs screens (Lapis)
+
+- Library (iPhone): LIBRARY over the workspace name, which is the workspace
+  switcher (doc counts, who shares it), a count line (`38 docs · only you`,
+  `shared by Aoife · view only`), a title filter (every word; hits show
+  where they live), the tree in one card (48 pt rows, counts on folders,
+  short edited times on docs, flag dots). New folder / New doc in the bar.
+  iPad sidebar rows are 40 pt, the Mac's 28 pt.
+- Doc: status and tag pills from the frontmatter, the serif title, a byline
+  (newest three authors, `You` for you, version, edited). Body text is
+  Newsreader at 19 pt on iPhone and 20 pt on a regular-width iPad
+  (`SurfaceLook.bodyFactor`; the Mac follows `docScale`). Headings are SF
+  Pro bold, wikilinks the accent with a soft rule, inline code a rounded,
+  outlined pill and checkboxes one drawn box, ticked or not (both drawn by
+  `SurfaceLayoutFragment` / `CheckboxLayoutFragment`, TextKit 2).
+- Inline change cards: each open review item on the doc (flagged: Keep /
+  Revert; parked: Apply / Discard, a parked delete asks twice) covers its
+  block on the live surface. The covered block takes no typing until it is
+  decided; moves and blocks no longer in the doc are listed in the
+  inspector only. Old words struck in red, new ones underlined in green
+  (`WordDiff`). In a wide column the buttons sit in the card's header row
+  when they fit, else under the text.
+- Inspector (Review, Comments, History, About): a sheet on iPhone, a column
+  on iPad and the Mac (the doc's bar items sit after `.inspector`, so they
+  stay in the doc's own bar). History groups a run of edits by one author.
+- iPhone hides the tab bar while you type (the glass keyboard would show it
+  through). Find in Doc is ⌘F (find only); Search is ⇧⌘F.
+
 ## What's stubbed
 
 - Editing: no rich table editing (tables are raw source), no title rename,
@@ -910,7 +938,11 @@ Everything here is hidden for LOCAL daemons and signed-out accounts
 Launch arguments (UserDefaults' argument domain) make screenshots and UI
 runs reproducible: `-serverURL http://127.0.0.1:7517`, `-tab
 today|library|todos|search`, `-openDoc "<title>"`, `-searchQuery <text>`,
-`-showSettings YES`. For example
+`-showSettings YES`, and on a doc `-showInspector YES` / `-editDoc YES`
+(`-openDoc` on iPhone opens it in the Library tab). For example
 `xcrun simctl launch booted ie.null.taisce -serverURL http://127.0.0.1:7517 -openDoc "Roadmap"`.
 Start the daemon with `HOME=<tmp>` so it does not import this machine's
-Claude memory files. Tests: `xcodebuild -scheme Taisce -destination 'platform=iOS Simulator,name=iPhone 18 Pro' test`.
+Claude memory files. Landscape iPad screenshots for a design comparison:
+`TEST_RUNNER_TAISCE_SHOTS=<dir> TEST_RUNNER_TAISCE_SHOTS_SUFFIX=light|dark
+TEST_RUNNER_TAISCE_UI_URL=<daemon> xcodebuild … -only-testing:TaisceUITests/DocsShotsUITests`
+on an iPad simulator (skipped otherwise; it opens a doc titled Architecture). Tests: `xcodebuild -scheme Taisce -destination 'platform=iOS Simulator,name=iPhone 18 Pro' test`.

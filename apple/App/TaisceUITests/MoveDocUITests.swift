@@ -48,13 +48,18 @@ final class MoveDocUITests: XCTestCase {
         // stay put below), and within a test in creation order: "1" + the
         // time to a far-off moment (shrinks as tests go on, fixed width) +
         // a counter, ending in a non-zero digit
-        let left = 99_999_999_999_999 - testStamp
-        let pad = { (v: Int, w: Int) -> String in let t = String(v, radix: 36); return String(repeating: "0", count: max(0, w - t.count)) + t }
-        let key = "1" + pad(left, 10) + pad(nextKey, 3) + "i"
-        nextKey += 1
+        let key = nextTopKey()
         let moved = try call("/api/doc/\(id)/move", ["parent_id": NSNull(), "sort_key": key])
         XCTAssertEqual((moved as? [String: Any])?["ok"] as? Bool, true, "placed at the top: \(moved)")
         return id
+    }
+
+    /// The next of this test's top-of-the-tree order keys (see makeDoc).
+    func nextTopKey() -> String {
+        let left = 99_999_999_999_999 - testStamp
+        let pad = { (v: Int, w: Int) -> String in let t = String(v, radix: 36); return String(repeating: "0", count: max(0, w - t.count)) + t }
+        defer { nextKey += 1 }
+        return "1" + pad(left, 10) + pad(nextKey, 3) + "i"
     }
 
     /// The doc's parent on the daemon (nil at the top level).
@@ -394,6 +399,17 @@ final class MoveDocUITests: XCTestCase {
         XCTAssertEqual(made.epoch, 0, "nothing written in it")
         XCTAssertNil(made.parent, "at the top level")
         XCTAssertFalse(app.textViews.firstMatch.exists, "it didn't open as a doc")
+        // a new folder goes to the bottom of the top level, X to the top:
+        // with other suites' docs between them, both can't be on screen.
+        // Put the folder right under X, then back to the top of the tree.
+        let placed = try call("/api/doc/\(made.id)/move", ["parent_id": NSNull(), "sort_key": nextTopKey()])
+        XCTAssertEqual((placed as? [String: Any])?["ok"] as? Bool, true, "the folder placed under X: \(placed)")
+        let settle = Date().addingTimeInterval(20)
+        while Date() < settle, !(rowX.isHittable && folder.isHittable && folder.frame.minY > rowX.frame.minY) {
+            app.swipeDown()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        }
+        XCTAssertTrue(rowX.isHittable && folder.isHittable, "X and the folder are both on screen")
         // its chevron opens it (a click on the row opens its page, as for any doc)
         let chevron = folder.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: 10, dy: 0))
         #if targetEnvironment(macCatalyst)
@@ -404,7 +420,9 @@ final class MoveDocUITests: XCTestCase {
         let empty = app.descendants(matching: .any)["tree.empty"].firstMatch
         XCTAssertTrue(empty.waitForExistence(timeout: 5), "an open empty folder says so")
         XCTAssertEqual(folder.value as? String, "folder, open")
+        shot("before the drop")
         drag(rowX, onto: empty, at: 0.5)
+        shot("after the drop")
         try waitForParent(of: x, made.id)
     }
 
