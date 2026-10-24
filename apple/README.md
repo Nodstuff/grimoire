@@ -793,12 +793,20 @@ and duration, "compiled ✓" for a Go block that only compiles.
   (open count, the same number the To-dos screen lists), Review (the
   queue's count in yellow), Books and Search, then the workspace switcher
   and the Library tree; the doc on the right. Compact width (iPhone) keeps
-  the tab bar. Minimum window 820×560, first launch 1280×860; macOS
-  restores the size after that.
+  the tab bar. Minimum window 820×560, first launch 1280×860 grown around
+  the system's centre (so it stays on a MacBook Air's screen); macOS
+  restores the size after that. The bar leads with the doc's title, crumbs
+  and save state (Catalyst shows no principal item); the app's name is not
+  repeated there (the sidebar has it).
 - Menu bar (`TaisceCommands`, routed through the front window's `Router`):
-  ⌘N new doc, ⌘, Settings, Doc › Refresh ⌘R and Share Link…, Go › Search
-  ⌘F, Today, To-dos and the workspaces ⌘1…⌘9. Nothing is enabled before
-  sign-in. Docs are always live (no Edit / Done); inline code is ⇧⌘E. iPad
+  File › New Doc ⌘N, New Doc Inside This One ⌥⌘N, New Folder ⇧⌘N, Open Doc…
+  ⌘O (Search on docs, focused), Add EPUBs… ⇧⌘I, Export as PDF… ⌥⌘E; Edit ›
+  Find in Doc ⌘F; View › Show or Hide Sidebar ⌘\ (and the system's ⌃⌘S),
+  Bigger / Smaller Text; Doc › Refresh ⌘R, Share Link…; Go › Actions… ⌘K
+  (`ActionsPalette`: every command by name, Return runs the first), Search
+  ⇧⌘F, Today, To-dos, Review, Books and the workspaces ⌘1…⌘9; ⌘, Settings.
+  The reader turns pages with ← → and closes with ⌘W. Nothing is enabled
+  before sign-in. Docs are always live (no Edit / Done); inline code is ⇧⌘E. iPad
   hardware keyboards get the same commands.
 
 ```sh
@@ -942,32 +950,45 @@ The iPhone-Today, iPhone-Todos, iPhone-Search and iPhone-Settings artboards
 
 - Tabs (iPhone): Today, Library, Books, To-dos, and Search on its own (the
   iOS 26 search tab). Today's badge is the review queue's count; Review is a
-  card on Today, not a tab (`Route.review` pushes the list). Books is
-  `BooksPlaceholder` (Screens/BooksHooks.swift) until the Books screens land;
-  `Route.book(id)` / `Route.bookReader(id)` and `router.readBook(id)` are its hooks.
+  card on Today, not a tab (`Route.review` pushes the list). The Books tab is
+  `BooksScreen` (below); `Route.book(id)` pushes `BookDetail`, and
+  `router.readBook(id)` opens `BookReaderScreen` full screen over Books
+  (`Router.readingBook`, every device: in the iPad's detail column the
+  spread was cut beside the sidebar).
+- Sidebar (iPad, Mac): Today, To-dos, Review, Books (with its count) and
+  Search; with Books in front, SHELVES, SERIES and E-READERS under it
+  (`BooksSidebarSections`: a shelf row is `Router.bookShelf`, which
+  `BooksScreen(filter:)` shows; a second click goes back to every book), then
+  the workspace switcher and the Library tree. Rows are 44 pt on iPad, 30 on
+  the Mac (`Lapis.Layout.sidebarRow`).
 - Today: the date and sync state, the serif title; the Review card
   (`GET /api/queue`: "3 agent changes want a look", the first three with
   verdict, doc and proposer; tap the card for the list, a row for the doc);
-  Continue reading (`GET /api/books/currently-reading`, SERVER mode: the
-  newest started, unfinished book, its colour cover fetched with the app's
-  token, typographic otherwise; Read opens the reader over Books); Due
-  (overdue, today's dated items and the coming week, `DeadlinePill`s); Pinned
+  Continue reading (from `BookStore`'s shelf, so Today and Books never
+  disagree and it shows offline: the newest started, unfinished book, its
+  cover through the shared `coverImageLoader`; Read opens the reader); Due
+  (overdue, today's dated items and the coming week, short pills; each row
+  says where it lives: the To-do doc's Library path and, for an older item,
+  the day it was written under, "Work › Taisce › To-do › Mon 19 Oct"); Pinned
   (workspace colour, folder, serif title, last editor and time). The toolbar
   has New doc, Capture a to-do (a sheet with the live due pill) and, on a
-  phone, the account initial for Settings. `HomeStore` holds the queue, the
-  book and the profile name; it resets with the rest of the person's state.
+  phone, the account initial for Settings. Workspaces switch in the Library
+  (Today and To-dos carry no switcher, as the artboards). `HomeStore` holds
+  the queue and the profile name; it resets with the rest of the person's
+  state.
 - Review (`ReviewScreen`): flagged (Keep / Revert) and parked (Apply /
   Discard) through `POST /api/resolve` as the person; applying a parked doc
   delete asks first. A toast says what happened; the doc catches up.
 - To-dos: "N open · N overdue · N today", the add field at the top (the
   server's reading of `due …` as a pill), Overdue / Today / Upcoming with
-  short pills ("Thu", "15:00"), swipe right Done, left Snooze or More, a
-  context menu, and a filter menu.
+  short pills ("Thu", "15:00"), each row's list path as on Today, swipe right
+  Done, left Snooze or More, a context menu, and a filter menu.
 - Search: the system field (`.searchable` on the screen: the navigation
   bar on iPhone, as iOS 27 places it even in the search tab; the toolbar on
   iPad/Mac; the artboard's bottom field is not something the app can force),
   Docs / Books / Ask. Docs as before (offline FTS fallback, tag and
-  workspace chips); Books searches `GET /api/books?search=` (SERVER mode);
+  workspace chips); Books filters `BookStore`'s shelf on the device (title,
+  author or series; offline from the cached shelf) and opens `BookDetail`;
   Ask posts `/api/ask`, reads the answer doc (`AskAnswerText`: the
   synthesis, the docs it cites) and follows it while the synthesis is
   written; "Open the answer" opens the doc.
@@ -981,9 +1002,9 @@ The iPhone-Today, iPhone-Todos, iPhone-Search and iPhone-Settings artboards
 - Large text: at accessibility sizes a to-do's pill and a review row's
   chip, title and author stack under each other instead of widening the page.
 - Tests: `ShellShotsUITests` (landscape iPad shots of these screens, skipped
-  unless `TEST_RUNNER_TAISCE_SHOTS` names a directory), `HomeTests` (app: review copy, continue reading, due rows, pills,
-  Ask parsing, routes), `HomeAPITests` (kit: queue, resolve, books, ask,
-  e-readers, tokens).
+  unless `TEST_RUNNER_TAISCE_SHOTS` names a directory), `HomeTests` (app: review copy, continue reading, due rows and
+  their paths, pills, Ask parsing, routes), `HomeAPITests` (kit: queue and its
+  per-doc counts, resolve, ask, e-readers, tokens).
 
 ## Books (SERVER mode with a library)
 
@@ -1021,7 +1042,9 @@ Books says "Books live on your Taisce server".
   most every 10 s (`PUT …/position` with the XPointer and `base`), and on
   background/close; back in front, take a newer place; a 409 hands back the
   newer row and the reader goes there instead of dragging the other device
-  back. The server stamps the app's rows as device "Taisce web".
+  back. The app names itself on each write ("Taisce on iPhone" / "iPad" /
+  "Mac", `ReaderPlaces.deviceName`, the PUT's optional `device`); a server
+  older than that field stamps "Taisce web".
 
 Testing Books locally needs a SERVER-mode daemon with a bucket. Never the real
 bucket: point the daemon at a local S3 stand-in with `TAISCE_BOOKS_ENDPOINT`
@@ -1040,8 +1063,7 @@ script on the Mac mints an enrollment link with the daemon's CLI, plays the
 passkey with the `softpasskey` example and answers the redirect; the OAuth
 exchange is the app's own. `BooksUITests` documents its `TEST_RUNNER_…`
 variables (daemon, relay, a first-party token, a paired e-reader's KOReader
-login). Debug builds also take `-books` / `-read <id>` launch arguments until
-the shell's Books tab lands.
+login). `-tab books` opens Books and `-readBook <id>` a book's reader.
 
 ## Running the app against a scratch daemon
 
@@ -1055,4 +1077,11 @@ Start the daemon with `HOME=<tmp>` so it does not import this machine's
 Claude memory files. Landscape iPad screenshots for a design comparison:
 `TEST_RUNNER_TAISCE_SHOTS=<dir> TEST_RUNNER_TAISCE_SHOTS_SUFFIX=light|dark
 TEST_RUNNER_TAISCE_UI_URL=<daemon> xcodebuild … -only-testing:TaisceUITests/DocsShotsUITests`
-on an iPad simulator (skipped otherwise; it opens a doc titled Architecture). Tests: `xcodebuild -scheme Taisce -destination 'platform=iOS Simulator,name=iPhone 18 Pro' test`.
+on an iPad simulator (skipped otherwise; it opens a doc titled Architecture).
+`FinalShotsUITests` shoots every screen (iPhone portrait, iPad landscape, the
+Mac window cut from the screen; `TEST_RUNNER_TAISCE_SHOTS`, `…_UI_URL` a
+SERVER daemon with books and its sign-in relay, `…_UI_READ_ID`,
+`…_SHOTS_APPEARANCE light|dark` sets the app's own appearance, `…_SHOTS_ONLY`
+a comma list). On the Mac its runner is sandboxed: the shots ride the result
+bundle. Mac UI runs build with `TAISCE_BUNDLE_ID=ie.null.taisce.migtest`, never
+as the installed app. Tests: `xcodebuild -scheme Taisce -destination 'platform=iOS Simulator,name=iPhone 18 Pro' test`.
