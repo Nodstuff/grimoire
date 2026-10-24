@@ -761,9 +761,11 @@ and duration, "compiled ✓" for a Go block that only compiles.
   `eval "$(apple/scripts/sql-servers.sh)" && (cd apple/TaisceKit && swift test --filter ServerTests)`
   (Apple `container` or Docker; skipped without the variables).
 - Layout: regular width (every Mac window, iPad) is the split view
-  (`RootLayout`): sidebar with the workspace switcher, search, Today,
-  To-dos and the Library tree; the doc on the right. Compact width (iPhone)
-  keeps the tab bar. Minimum window 820×560, first launch 1280×860; macOS
+  (`RootLayout`): a sidebar on the Lapis `panel` ground with Today, To-dos
+  (open count, the same number the To-dos screen lists), Review (the
+  queue's count in yellow), Books and Search, then the workspace switcher
+  and the Library tree; the doc on the right. Compact width (iPhone) keeps
+  the tab bar. Minimum window 820×560, first launch 1280×860; macOS
   restores the size after that.
 - Menu bar (`TaisceCommands`, routed through the front window's `Router`):
   ⌘N new doc, ⌘, Settings, Doc › Refresh ⌘R and Share Link…, Go › Search
@@ -905,11 +907,56 @@ Everything here is hidden for LOCAL daemons and signed-out accounts
   several A4 pages), and `ServerIntegrationTests.t3d_shareLinksEndToEnd`
   against a SERVER daemon (`apple/scripts/integration.sh`).
 
+## Home screens and the shell
+
+The iPhone-Today, iPhone-Todos, iPhone-Search and iPhone-Settings artboards
+(Mac-Main / iPad-Library-Doc for the sidebar):
+
+- Tabs (iPhone): Today, Library, Books, To-dos, and Search on its own (the
+  iOS 26 search tab). Today's badge is the review queue's count; Review is a
+  card on Today, not a tab (`Route.review` pushes the list). Books is
+  `BooksPlaceholder` (Screens/BooksHooks.swift) until the Books screens land;
+  `Route.book(id)` / `Route.bookReader(id)` and `router.readBook(id)` are its hooks.
+- Today: the date and sync state, the serif title; the Review card
+  (`GET /api/queue`: "3 agent changes want a look", the first three with
+  verdict, doc and proposer; tap the card for the list, a row for the doc);
+  Continue reading (`GET /api/books/currently-reading`, SERVER mode: the
+  newest started, unfinished book, its colour cover fetched with the app's
+  token, typographic otherwise; Read opens the reader over Books); Due
+  (overdue, today's dated items and the coming week, `DeadlinePill`s); Pinned
+  (workspace colour, folder, serif title, last editor and time). The toolbar
+  has New doc, Capture a to-do (a sheet with the live due pill) and, on a
+  phone, the account initial for Settings. `HomeStore` holds the queue, the
+  book and the profile name; it resets with the rest of the person's state.
+- Review (`ReviewScreen`): flagged (Keep / Revert) and parked (Apply /
+  Discard) through `POST /api/resolve` as the person; applying a parked doc
+  delete asks first. A toast says what happened; the doc catches up.
+- To-dos: "N open · N overdue · N today", the add field at the top (the
+  server's reading of `due …` as a pill), Overdue / Today / Upcoming with
+  short pills ("Thu", "15:00"), swipe right Done, left Snooze or More, a
+  context menu, and a filter menu.
+- Search: the system field (bottom on iPhone, toolbar on iPad/Mac),
+  Docs / Books / Ask. Docs as before (offline FTS fallback, tag and
+  workspace chips); Books searches `GET /api/books?search=` (SERVER mode);
+  Ask posts `/api/ask`, reads the answer doc (`AskAnswerText`: the
+  synthesis, the docs it cites) and follows it while the synthesis is
+  written; "Open the answer" opens the doc.
+- Settings: the account card (name, server, how you signed in) opens
+  Account (server URL, sign out, sync details); E-readers and Upload Tokens
+  (SERVER mode, the person's own app): list with last use, add (the password
+  or token shown once with copy buttons and the OPDS / progress-sync
+  addresses, never stored), new password, remove or revoke with a
+  confirmation; Appearance (theme; on the Mac the doc text size);
+  Notifications; Shared links; Data sources (Mac); Sync.
+- Tests: `HomeTests` (app: review copy, continue reading, due rows, pills,
+  Ask parsing, routes), `HomeAPITests` (kit: queue, resolve, books, ask,
+  e-readers, tokens).
+
 ## Running the app against a scratch daemon
 
 Launch arguments (UserDefaults' argument domain) make screenshots and UI
 runs reproducible: `-serverURL http://127.0.0.1:7517`, `-tab
-today|library|todos|search`, `-openDoc "<title>"`, `-searchQuery <text>`,
+today|library|books|todos|search|review`, `-openDoc "<title>"`, `-searchQuery <text>`,
 `-showSettings YES`. For example
 `xcrun simctl launch booted ie.null.taisce -serverURL http://127.0.0.1:7517 -openDoc "Roadmap"`.
 Start the daemon with `HOME=<tmp>` so it does not import this machine's

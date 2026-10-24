@@ -174,3 +174,43 @@ enum Snooze: CaseIterable, Hashable, Sendable {
         return Due(year: y, month: m, day: d, hour: c.hour ?? Due.defaultAlertHour, minute: c.minute ?? 0)
     }
 }
+
+extension DueLabel {
+    /// The pill's words under a group that already says which group
+    /// (To-dos: "Overdue", "Today", "Upcoming"): "Thu", "15:00", "Mon",
+    /// "3 Nov". Nil without a deadline.
+    static func short(_ e: TodoEntry, now: Date = .now, calendar: Calendar = .current) -> String? {
+        guard let due = e.due else { return nil }
+        let time = due.hasTime ? String(format: "%02d:%02d", due.hour ?? 0, due.minute ?? 0) : nil
+        let today = Due.today(now: now, in: calendar.timeZone).dateString
+        let days = dayDistance(from: today, to: due.dateString, calendar: calendar)
+        switch days {
+        case 0: return time ?? "Today"
+        case 1: return "Tomorrow"
+        case -1: return "Yesterday"
+        case -6 ... -2, 2...6: return shortDate(due, calendar: calendar, weekday: true)
+        default: return dayMonth(due, calendar: calendar)
+        }
+    }
+
+    /// "3 Nov"
+    static func dayMonth(_ due: Due, calendar: Calendar) -> String {
+        guard let date = date(due.dateString, calendar) else { return due.dateString }
+        let f = DateFormatter()
+        f.calendar = calendar
+        f.timeZone = calendar.timeZone
+        f.setLocalizedDateFormatFromTemplate("d MMM")
+        return f.string(from: date)
+    }
+}
+
+extension TodoEntry {
+    /// The line under a to-do: its note, else the day it was written when
+    /// that isn't today ("From Thu 22 Oct"); nil for a plain item of today's.
+    func sourceLine(now: Date = .now, calendar: Calendar = .current) -> String? {
+        if let note, !note.isEmpty { return note }
+        let today = Due.today(now: now, in: calendar.timeZone).dateString
+        guard date != today, let day = Due(date) else { return nil }
+        return "From \(DueLabel.shortDate(day, calendar: calendar))"
+    }
+}

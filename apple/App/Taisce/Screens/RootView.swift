@@ -223,12 +223,19 @@ struct RouteView: View {
         switch route {
         case .doc(let id): DocScreen(docID: id).id(id)
         case .todos: TodosScreen()
+        case .review: ReviewScreen()
+        // BooksHooks.swift: the Books agent's screens replace these at merge
+        case .book(let id): BookPlaceholder(id: id).id(id)
+        case .bookReader(let id): BookReaderPlaceholder(id: id).id(id)
         }
     }
 }
 
-/// iPhone: the native floating tab bar (Liquid Glass on iOS 26).
+/// iPhone: the native floating tab bar (Liquid Glass on iOS 26): Today,
+/// Library, Books, To-dos, and Search on its own. Today's badge counts the
+/// changes waiting for review (its card opens the list).
 struct PhoneRoot: View {
+    @Environment(AppModel.self) private var model
     @Environment(Router.self) private var router
 
     var body: some View {
@@ -239,9 +246,16 @@ struct PhoneRoot: View {
                     TodayScreen().navigationDestination(for: Route.self) { RouteView(route: $0) }
                 }
             }
+            .badge(model.home.summary.total)
             Tab("Library", systemImage: "folder", value: AppTab.library) {
                 NavigationStack(path: $router.libraryPath) {
                     LibraryScreen().navigationDestination(for: Route.self) { RouteView(route: $0) }
+                }
+            }
+            Tab("Books", systemImage: "books.vertical", value: AppTab.books) {
+                NavigationStack(path: $router.booksPath) {
+                    // BooksHooks.swift: BooksScreen replaces this at merge
+                    BooksPlaceholder().navigationDestination(for: Route.self) { RouteView(route: $0) }
                 }
             }
             Tab("To-dos", systemImage: "checkmark.circle", value: AppTab.todos) {
@@ -283,7 +297,10 @@ struct PadRoot: View {
         switch router.padItem {
         case .today?, nil: TodayScreen()
         case .todos?: TodosScreen()
-        case .search?: SearchScreen(showsField: false)
+        case .review?: ReviewScreen()
+        // BooksHooks.swift: BooksScreen replaces this at merge
+        case .books?: BooksPlaceholder()
+        case .search?: SearchScreen()
         case .doc(let id)?: DocScreen(docID: id).id(id)
         }
     }
@@ -294,7 +311,6 @@ struct PadSidebar: View {
     @Environment(Router.self) private var router
     @Environment(\.docDeletion) private var docDeletion
     @Environment(\.docMover) private var docMover
-    @FocusState private var searchFocused: Bool
     /// folders opened by hand (the ones above the doc in front open by themselves)
     @State private var expanded: Set<DocID> = []
     @State private var scroller = TreeScroller()
@@ -309,42 +325,35 @@ struct PadSidebar: View {
     }
 
     var body: some View {
-        @Bindable var router = router
         let (shown, reveal) = front
         let selectedDoc: DocID? = if case .doc(let id)? = shown { id } else { nil }
         // Not a List: List rows never receive drops (iOS and the Mac), so
         // the Library is a LibraryTree in a plain scroll view.
         ScrollView {
                 VStack(alignment: .leading, spacing: 2) {
-                    if model.hasWorkspaces {
-                        SidebarWorkspaceRow().padding(.horizontal, 2)
+                    // Today · To-dos · Review · Books · Search (Mac-Main, iPad-Library-Doc).
+                    // To-dos counts what the To-dos screen lists; Review what waits for you.
+                    SidebarItem(title: "Today", systemImage: "house", selected: shown == .today) { router.select(.today) }
+                    SidebarItem(title: "To-dos", systemImage: "checkmark.circle", badge: model.openTodoCount,
+                                badgeLabel: "open", selected: shown == .todos) { router.select(.todos) }
+                    SidebarItem(title: "Review", systemImage: "flag", badge: model.home.summary.total, badgeTone: .attention,
+                                badgeLabel: "to review", selected: shown == .review) { router.select(.review) }
+                    SidebarItem(title: "Books", systemImage: "books.vertical", selected: shown == .books) { router.select(.books) }
+                    SidebarItem(title: "Search", systemImage: "magnifyingglass", shortcut: "\u{21E7}\u{2318}F", selected: shown == .search) {
+                        router.select(.search)
+                        router.focusSearch()
                     }
-                    HStack(spacing: 8) {
-                        Image(systemName: "magnifyingglass").foregroundStyle(Color.lapis.ink3).accessibilityHidden(true)
-                        TextField("Search", text: $router.searchQuery)
-                            .focused($searchFocused)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .submitLabel(.search)
-                            .onSubmit { router.select(.search) }
-                    }
-                    .padding(.horizontal, 10)
-                    .frame(minHeight: 34)
-                    .background(Color.lapis.card, in: .rect(cornerRadius: Lapis.Radius.field, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: Lapis.Radius.field, style: .continuous).strokeBorder(Color.lapis.line2, lineWidth: 1))
-                    .padding(.vertical, 6)
-                    .onChange(of: router.searchQuery) { _, q in
-                        if !q.isEmpty, router.padItem != .search { router.select(.search) }
-                    }
-                    .onChange(of: router.searchFocusRequest) { searchFocused = true }
-                    SidebarItem(title: "Today", systemImage: "house", badge: model.dueCount, selected: shown == .today) { router.select(.today) }
-                    SidebarItem(title: "To-dos", systemImage: "checkmark.circle", selected: shown == .todos) { router.select(.todos) }
                     // drop a dragged doc on the header: the top level
                     HStack {
-                        Text("Library")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(Color.lapis.ink3)
-                            .accessibilityAddTraits(.isHeader)
+                        if model.hasWorkspaces {
+                            SidebarWorkspaceRow()
+                        } else {
+                            Text("Library".uppercased())
+                                .lapisFont(.label)
+                                .foregroundStyle(Color.lapis.ink3)
+                                .accessibilityLabel("Library")
+                                .accessibilityAddTraits(.isHeader)
+                        }
                         Spacer()
                         if model.currentAccess.canCreate {
                             Button { router.newFolder(in: nil) } label: {
@@ -384,8 +393,20 @@ struct PadSidebar: View {
         // a folder just made: the folders above it open, the tree scrolls to it
         .onChange(of: model.docs.count) { revealIfReady() }
         .onChange(of: router.revealDoc) { revealIfReady() }
+        // the sidebar's own ground (Lapis panel), not the system material
+        .scrollContentBackground(.hidden)
+        .background(Color.lapis.panel.ignoresSafeArea())
+        // the review count and the sidebar's To-dos count stay current
+        .task(id: model.cursor) {
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            await model.home.loadReview()
+        }
+        .task(id: model.todoRevision) { _ = await model.loadTodos() }
         .navigationTitle("Taisce")
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) { SidebarBrand() }
+            ToolbarItem(placement: .principal) { Color.clear.frame(width: 1, height: 1).accessibilityHidden(true) }
             ToolbarItem(placement: .primaryAction) {
                 // ⌘N is the menu bar's (TaisceCommands)
                 Button { router.newDoc() } label: { Image(systemName: "square.and.pencil") }
@@ -413,7 +434,8 @@ struct PadSidebar: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 6)
             // the tree scrolls under it: a bar, not text over rows
-            .background(.bar)
+            .background(Color.lapis.panel)
+            .overlay(alignment: .top) { Rectangle().fill(Color.lapis.line).frame(height: 1) }
         }
         .refreshable { try? await model.sync?.catchUp() }
     }
@@ -487,35 +509,72 @@ struct NewFolderPrompt: ViewModifier {
     }
 }
 
-/// Today and To-dos in the sidebar: a row that selects its screen.
+/// A sidebar destination (Today, To-dos, Review, Books, Search): an icon,
+/// the name, and a count (Review's in the attention yellow) or, on a
+/// keyboard, its shortcut.
 private struct SidebarItem: View {
+    enum BadgeTone { case quiet, attention }
+
     let title: String
     let systemImage: String
     var badge = 0
+    var badgeTone: BadgeTone = .quiet
+    /// what the count counts, for VoiceOver ("6 open")
+    var badgeLabel: String?
+    /// shown with a pointer (Mac, iPad with a trackpad): "⇧⌘F"
+    var shortcut: String?
     let selected: Bool
     let action: () -> Void
     @State private var pointer = false
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: systemImage).foregroundStyle(Color.lapis.accent).frame(width: 22).accessibilityHidden(true)
+        HStack(spacing: 10) {
+            Image(systemName: systemImage)
+                .font(.body)
+                .foregroundStyle(selected ? Color.lapis.accent : Color.lapis.ink2)
+                .frame(width: 24)
+                .accessibilityHidden(true)
             Text(title).foregroundStyle(Color.lapis.ink)
             Spacer(minLength: 0)
             if badge > 0 {
-                Text("\(badge)").font(.caption.weight(.semibold)).foregroundStyle(Color.lapis.ink3)
+                Text("\(badge)")
+                    .font(.subheadline.weight(badgeTone == .attention ? .semibold : .regular))
+                    .monospacedDigit()
+                    .foregroundStyle(badgeTone == .attention ? Color.lapis.yellow : Color.lapis.ink3)
+            } else if let shortcut {
+                Text(shortcut).font(.caption).foregroundStyle(Color.lapis.ink3).accessibilityHidden(true)
             }
         }
-        .padding(.horizontal, 8)
-        .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, minHeight: Lapis.Layout.minTarget, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: Lapis.Radius.field, style: .continuous)
             .fill(selected ? Color.lapis.accentSoft : pointer ? Color.lapis.hover : .clear))
         .contentShape(.rect)
         .onHover { pointer = $0 }
         .onTapGesture(perform: action)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(badge > 0 ? "\(title), \(badge)" : title)
+        .accessibilityLabel(badge > 0 ? "\(title), \(badge)\(badgeLabel.map { " \($0)" } ?? "")" : title)
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
         .accessibilityAction { action() }
+        .accessibilityIdentifier("sidebar.\(title.lowercased())")
+    }
+}
+
+/// "◆ Taisce" at the top of the sidebar.
+private struct SidebarBrand: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "diamond.fill")
+                .font(.footnote.weight(.bold))
+                .foregroundStyle(Color.lapis.accent)
+                .accessibilityHidden(true)
+            Text("Taisce")
+                .lapisFont(.cardTitle, weight: .medium)
+                .foregroundStyle(Color.lapis.ink)
+        }
+        .fixedSize()
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
     }
 }
 

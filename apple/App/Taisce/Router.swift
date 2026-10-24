@@ -3,18 +3,23 @@ import Observation
 import TaisceKit
 
 enum AppTab: Hashable {
-    case today, library, todos, search
+    case today, library, books, todos, search
 }
 
 /// A pushed screen.
 enum Route: Hashable {
     case doc(DocID)
     case todos
+    /// the review queue (Today's Review card)
+    case review
+    /// a book's details, and its reader (BooksHooks.swift until the Books screens land)
+    case book(String)
+    case bookReader(String)
 }
 
 /// iPad and Mac sidebar selection.
 enum PadItem: Hashable {
-    case today, todos, search
+    case today, todos, review, books, search
     case doc(DocID)
 }
 
@@ -65,6 +70,7 @@ final class Router {
     var libraryPath: [Route] = []
     var todosPath: [Route] = []
     var searchPath: [Route] = []
+    var booksPath: [Route] = []
 
     var padItem: PadItem? = .today
     var padPath: [Route] = []
@@ -96,6 +102,7 @@ final class Router {
         case .library: libraryPath.append(route)
         case .todos: todosPath.append(route)
         case .search: searchPath.append(route)
+        case .books: booksPath.append(route)
         }
     }
 
@@ -113,6 +120,8 @@ final class Router {
         switch padPath.last {
         case .doc(let id)?: .doc(id)
         case .todos?: .todos
+        case .review?: .review
+        case .book?, .bookReader?: .books
         case nil: padItem
         }
     }
@@ -135,6 +144,31 @@ final class Router {
         if isPad { select(.search) } else { tab = .search }
     }
 
+    /// Put the cursor in Search's field (the split view's Search screen).
+    func focusSearch() {
+        searchFocusRequest += 1
+    }
+
+    /// The review queue: the sidebar's Review, or pushed over Today on a phone.
+    func showReview() {
+        if isPad { select(.review) } else { tab = .today; todayPath = [.review] }
+    }
+
+    func showBooks() {
+        if isPad { select(.books) } else { tab = .books }
+    }
+
+    /// A book's reader (Today's Continue reading), over Books so Back lands there.
+    func readBook(_ id: String) {
+        if isPad {
+            select(.books)
+            padPath = [.bookReader(id)]
+        } else {
+            tab = .books
+            booksPath = [.bookReader(id)]
+        }
+    }
+
     /// The doc at the front of this window: the top of the visible stack.
     var focusedDoc: DocID? {
         let path: [Route]
@@ -147,6 +181,7 @@ final class Router {
             case .library: path = libraryPath
             case .todos: path = todosPath
             case .search: path = searchPath
+            case .books: path = booksPath
             }
         }
         if case .doc(let id)? = path.last { return id }
@@ -184,6 +219,7 @@ final class Router {
         libraryPath = cut(libraryPath)
         todosPath = cut(todosPath)
         searchPath = cut(searchPath)
+        booksPath = cut(booksPath)
         padPath = cut(padPath)
         if case .doc(let id)? = padItem, docs.contains(id) {
             padItem = .today
@@ -195,7 +231,7 @@ final class Router {
     /// Every doc on a stack in this window, and the sidebar's.
     var visibleDocs: Set<DocID> {
         var out: Set<DocID> = []
-        for path in [todayPath, libraryPath, todosPath, searchPath, padPath] {
+        for path in [todayPath, libraryPath, todosPath, searchPath, booksPath, padPath] {
             for case .doc(let id) in path { out.insert(id) }
         }
         if case .doc(let id)? = padItem { out.insert(id) }
@@ -252,6 +288,8 @@ final class Router {
         case "library": tab = .library; padItem = .today
         case "todos": tab = .todos; padItem = .todos
         case "search": tab = .search; padItem = .search
+        case "books": tab = .books; padItem = .books
+        case "review": showReview()
         default: break
         }
         if let q = d.string(forKey: "searchQuery") { searchQuery = q }
