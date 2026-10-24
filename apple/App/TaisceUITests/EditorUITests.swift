@@ -75,8 +75,21 @@ final class EditorUITests: XCTestCase {
 
         // the caret at the end, then to the start of "Second line" (⌘←)
         surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9)).tap()
-        surface.typeKey(.leftArrow, modifierFlags: .command)
-        surface.typeText(XCUIKeyboardKey.delete.rawValue)
+        // to the line's start: ⌘← with a hardware keyboard; with the
+        // software keyboard up (key events then don't move the caret), the
+        // space bar's trackpad slid far left, as a person would
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        let space = app.keyboards.keys["space"]
+        if space.exists {
+            let at = space.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            at.press(forDuration: 1.0, thenDragTo: at.withOffset(CGVector(dx: -400, dy: 0)), withVelocity: .slow, thenHoldForDuration: 0.3)
+        } else {
+            app.typeKey(.leftArrow, modifierFlags: .command)
+        }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        // typed into the app, not the element: an element without keyboard
+        // focus is tapped first, which would put the caret back at the end
+        app.typeText(XCUIKeyboardKey.delete.rawValue)
         XCTAssertEqual(text(), "First lineSecond line\n")
 
         // the daemon, after the autosave: exactly that, under the first id

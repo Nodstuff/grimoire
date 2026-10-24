@@ -133,6 +133,26 @@ final class MoveDocUITests: XCTestCase {
         #endif
     }
 
+    /// Scroll the tree (a slow pan on the window, not a row press) until
+    /// `rows` sit in the middle of the screen: a row low on screen is in the
+    /// bottom auto-scroll band (it scrolls the tree away while a drag rests
+    /// there), one under the status bar takes a press as scroll-to-top.
+    func bringUp(_ rows: [XCUIElement], in app: XCUIApplication) {
+        #if !targetEnvironment(macCatalyst)
+        let h = app.windows.firstMatch.frame.height
+        for _ in 0..<5 {
+            let top = rows.map { $0.frame.minY }.min() ?? 0, bottom = rows.map { $0.frame.maxY }.max() ?? 0
+            var by: CGFloat = 0
+            if top < h * 0.22 { by = h * 0.3 - top }            // content down
+            else if bottom > h * 0.65 { by = -min(bottom - h * 0.55, top - h * 0.3) } // content up
+            guard abs(by) > 8 else { return }
+            let from = app.coordinate(withNormalizedOffset: CGVector(dx: 0.94, dy: by > 0 ? 0.35 : 0.7))
+            from.press(forDuration: 0.01, thenDragTo: from.withOffset(CGVector(dx: 0, dy: by)), withVelocity: .slow, thenHoldForDuration: 0.3)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.6))
+        }
+        #endif
+    }
+
     /// The sort keys of `ids` under one parent on the daemon, in their order.
     func order(_ ids: [String]) throws -> [String] {
         let keys = try ids.map { id -> (String, String) in
@@ -513,8 +533,19 @@ final class MoveDocUITests: XCTestCase {
             RunLoop.current.run(until: Date().addingTimeInterval(0.2))
         }
         RunLoop.current.run(until: Date().addingTimeInterval(2))
+        bringUp([rowA, rowF], in: app)
         drag(rowA, onto: rowF, at: 0.5)
         try waitForParent(of: a, f)
+        // the tree settles again: F open with A inside, nothing still moving
+        let open = Date().addingTimeInterval(10)
+        var last = rowB.frame
+        while Date() < open {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+            let now = rowB.frame
+            if rowA.exists, rowA.frame.minY > rowF.frame.minY, now == last { break }
+            last = now
+        }
+        bringUp([rowB, rowF], in: app)
         drag(rowB, onto: rowF, at: 0.5)
         try waitForParent(of: b, f)
         XCTAssertEqual(try parent(of: a), f, "A stayed where it was put")
