@@ -200,14 +200,13 @@ struct DocScreen: View {
         return Button {
             showInspector.toggle()
         } label: {
-            Label("Inspector", systemImage: "sidebar.right")
-                .overlay(alignment: .topTrailing) {
-                    if waiting > 0 {
-                        Circle().fill(Color.lapis.yellowMark).frame(width: 8, height: 8)
-                            .offset(x: 3, y: -2)
-                            .accessibilityHidden(true)
-                    }
-                }
+            Label {
+                Text("Inspector")
+            } icon: {
+                // a yellow dot while changes wait (drawn into the symbol: the
+                // bar keeps only a label's image)
+                Image(uiImage: InspectorGlyph.image(dot: waiting > 0))
+            }
         }
         .tint(showInspector && sizeClass == .regular ? Color.lapis.accent : Color.lapis.ink)
         .accessibilityLabel(waiting > 0 ? "Inspector: \(waiting == 1 ? "1 change" : "\(waiting) changes") to review" : "Inspector")
@@ -348,6 +347,11 @@ struct DocScreen: View {
         }
         surfaceFailed = false
         s.onOpenWiki = { target in openWiki(target) }
+        // development launch arguments (screenshots, UI runs): `-showInspector YES`, `-editDoc YES`
+        if UserDefaults.standard.bool(forKey: "showInspector") {
+            Task { try? await Task.sleep(for: .milliseconds(600)); showInspector = true }
+        }
+        if UserDefaults.standard.bool(forKey: "editDoc"), canWrite { model.pendingEditDoc = docID }
         s.chartTables = page?.chartTables ?? ChartTables()
         if docID == model.todoDocID {
             // the To-do doc's boxes are to-do items: they go through the to-do API
@@ -411,6 +415,27 @@ struct DocScreen: View {
                 model.lastError = error.localizedDescription
             }
         }
+    }
+}
+
+/// The inspector's bar symbol, with a yellow dot when changes wait.
+enum InspectorGlyph {
+    @MainActor static func image(dot: Bool) -> UIImage {
+        let config = UIImage.SymbolConfiguration(textStyle: .body, scale: .large)
+        guard let base = UIImage(systemName: "sidebar.right", withConfiguration: config) else { return UIImage() }
+        guard dot else { return base.withRenderingMode(.alwaysTemplate) }
+        let size = base.size
+        let r = UIGraphicsImageRenderer(size: CGSize(width: size.width + 3, height: size.height + 3))
+        let img = r.image { ctx in
+            base.withTintColor(.label).draw(at: CGPoint(x: 0, y: 3))
+            let d: CGFloat = 9
+            let rect = CGRect(x: size.width + 3 - d, y: 0, width: d, height: d)
+            UIColor.lapis.bg.setFill()
+            ctx.cgContext.fillEllipse(in: rect.insetBy(dx: -1.5, dy: -1.5))
+            UIColor.lapis.yellowMark.setFill()
+            ctx.cgContext.fillEllipse(in: rect)
+        }
+        return img.withRenderingMode(.alwaysOriginal)
     }
 }
 

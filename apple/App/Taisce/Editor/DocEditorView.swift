@@ -13,7 +13,12 @@ struct DocSurfaceContent: View {
             .groundBackground()
             .safeAreaInset(edge: .top, spacing: 0) {
                 VStack(spacing: 0) {
-                    if model.editable, EditorChrome.barIsInline { InlineFormattingBar(bar: model.formattingBar) }
+                    if model.editable, EditorChrome.barIsInline {
+                        InlineFormattingBar(bar: model.formattingBar)
+                            .frame(maxWidth: Lapis.Layout.readingWidth)
+                            .padding(.horizontal, Lapis.Layout.gutter)
+                            .padding(.vertical, 4)
+                    }
                     SurfaceNotes(model: model)
                 }
             }
@@ -56,7 +61,7 @@ private struct InlineFormattingBar: UIViewRepresentable {
     func makeUIView(context: Context) -> FormattingBar { bar }
     func updateUIView(_ view: FormattingBar, context: Context) {}
     func sizeThatFits(_ proposal: ProposedViewSize, uiView: FormattingBar, context: Context) -> CGSize? {
-        CGSize(width: proposal.width ?? 320, height: 44)
+        CGSize(width: proposal.width ?? 320, height: FormattingBar.height - 6)
     }
 }
 

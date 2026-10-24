@@ -115,20 +115,22 @@ extension SurfaceModel {
 
 /// The SwiftUI over a covered block: the review item as an inline change card.
 struct SurfaceChangeCard: View {
-    let model: SurfaceModel
+    /// weak: the card's view lives in the text view the model owns
+    weak var model: SurfaceModel?
     let item: DocReviewItem
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
         let card = ChangeCardModel(item)
+        let model = model
         InlineChangeCard(
             verdict: card.verdict, author: card.author, when: card.date.map { ShortWhen.string($0) },
             old: card.old, new: card.new, note: card.note,
-            onAccept: { Task { await model.decide(item, .accept) } },
-            onReject: { Task { await model.decide(item, .decline) } },
+            onAccept: { Task { await model?.decide(item, .accept) } },
+            onReject: { Task { await model?.decide(item, .decline) } },
             acceptTitle: card.acceptTitle, rejectTitle: card.rejectTitle,
             confirmAccept: item.kind == .parked && item.opType == "delete",
-            showsActions: model.editable, busy: model.deciding.contains(item.id),
+            showsActions: model?.editable ?? false, busy: model?.deciding.contains(item.id) ?? false,
             compact: sizeClass == .regular
         )
         // opaque: the block's own text sits under it

@@ -1002,6 +1002,43 @@ final class SurfaceModel: NSObject {
         perform(Surface.paste(s, NSRange(location: at, length: 0), markdown: markdown.contains("\n\n") || markdown.hasPrefix("```") ? markdown : markdown + "\n\n"))
     }
 
+    /// A new block after the caret's (in place of it when it is an empty
+    /// paragraph); a code block, table or diagram opens its source.
+    func insertBlock(_ markdown: String, openSource: Bool) {
+        guard editable else { return }
+        let s = textView.textStorage
+        let before = Set(Surface.blocks(s).map(\.id))
+        let loc = min(textView.selectedRange.location, max(0, s.length - 1))
+        guard let cur = Surface.block(at: loc, in: s) else { return }
+        var empty = false
+        if case let .paragraph(t) = cur.content, t.characters.isEmpty { empty = true }
+        let at = empty ? cur.range : NSRange(location: cur.range.location + cur.range.length, length: 0)
+        guard perform(Surface.paste(s, at, markdown: markdown + "\n\n")) else { return }
+        if openSource, let id = Surface.blocks(textView.textStorage).first(where: { !before.contains($0.id) && $0.content.isRaw })?.id {
+            editSource(id)
+        }
+    }
+
+    /// The bar's code block: an empty fence, its source open to type in.
+    func insertCodeBlock() {
+        insertBlock("```\n\n```", openSource: true)
+    }
+
+    /// The bar's due date: ` · due 2026-10-25` at the end of the caret's
+    /// line (the canonical deadline the to-do list reads).
+    func appendDue(_ date: Date) {
+        guard editable else { return }
+        let s = textView.textStorage
+        let loc = min(textView.selectedRange.location, max(0, s.length - 1))
+        guard let l = Surface.line(at: loc, in: s), l.style != .raw else { return }
+        let end = l.textRange.location + l.textRange.length
+        let text = " \u{00B7} due \(Due.today(now: date).dateString)"
+        var typing = Surface.typingAttributes(s, at: max(l.textRange.location, end - 1))
+        typing[Surface.wiki] = nil
+        typing[Surface.link] = nil
+        perform(Surface.replace(s, NSRange(location: end, length: 0), with: text, typing: typing))
+    }
+
     /// Tick a box inside a non-text block (a callout, a quote, a complex
     /// list): its markdown, rewritten; no sheet, no keyboard.
     func toggleRawCheckbox(_ id: BlockID, index: Int, checked: Bool) {
