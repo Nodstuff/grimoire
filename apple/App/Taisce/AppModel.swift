@@ -131,6 +131,8 @@ final class AppModel {
     let dataSources = DataSourceStore()
     /// share links and their comments (SERVER mode only)
     let shareLinks = ShareLinkStore()
+    /// the EPUB library (Books/): shelf, covers, the reader's places
+    let books = BookStore()
     /// a comment push was tapped: the frontmost window opens that doc's link comments
     private(set) var linkCommentsRequest: LinkCommentsRequest?
 
@@ -151,6 +153,7 @@ final class AppModel {
         serverURL = stored.flatMap { ServerURLPolicy.accepts($0) ? $0 : nil } ?? Self.defaultServerURL
         codeRuns.app = self
         shareLinks.app = self
+        books.app = self
         sqlRuns.app = self
     }
 
@@ -181,6 +184,7 @@ final class AppModel {
         await stopSync()
         await pushSessionEnding() // push
         serverURL = trimmed
+        books.serverChanged()
         UserDefaults.standard.set(trimmed, forKey: Self.serverURLKey)
         await connect()
         await startSync()
@@ -312,6 +316,7 @@ final class AppModel {
         codeRuns.reset()
         sqlRuns.reset()
         shareLinks.reset()
+        books.reset()
         linkCommentsRequest = nil
         settledTodos = []
         pendingEditDoc = nil
