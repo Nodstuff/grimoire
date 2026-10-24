@@ -35,6 +35,16 @@ final class DeleteDocUITests: XCTestCase {
         if tab.waitForExistence(timeout: 3) { tab.tap() }
         // a Library tree row (LibraryTree: one element per row)
         let row = app.descendants(matching: .any)["tree.\(title)"].firstMatch
+        #if targetEnvironment(macCatalyst)
+        // a row scrolled out of the Mac's sidebar isn't in the accessibility tree
+        if app.windows.firstMatch.waitForExistence(timeout: 10), !row.waitForExistence(timeout: 5) {
+            let sidebar = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.12, dy: 0.6))
+            for _ in 0..<25 where !row.exists {
+                sidebar.scroll(byDeltaX: 0, deltaY: -240)
+                RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+            }
+        }
+        #endif
         XCTAssertTrue(row.waitForExistence(timeout: 20), "the sidebar lists the seeded doc")
         #if targetEnvironment(macCatalyst)
         row.rightClick()
@@ -49,7 +59,14 @@ final class DeleteDocUITests: XCTestCase {
         #else
         menuItem.tap()
         #endif
+        #if targetEnvironment(macCatalyst)
+        // Catalyst shows the alert as a sheet on the window
+        let confirm = app.sheets.buttons["Delete"].firstMatch.exists ? app.sheets.buttons["Delete"].firstMatch
+            : app.dialogs.buttons["Delete"].firstMatch.exists ? app.dialogs.buttons["Delete"].firstMatch
+            : app.buttons.matching(NSPredicate(format: "label == 'Delete'")).firstMatch
+        #else
         let confirm = app.alerts.buttons["Delete"].firstMatch
+        #endif
         XCTAssertTrue(confirm.waitForExistence(timeout: 5), "it asks first")
         #if targetEnvironment(macCatalyst)
         confirm.click()

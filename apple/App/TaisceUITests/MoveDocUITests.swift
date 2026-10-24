@@ -111,7 +111,8 @@ final class MoveDocUITests: XCTestCase {
     /// the detail).
     func scrollTreeTowardTop(_ app: XCUIApplication) {
         #if targetEnvironment(macCatalyst)
-        app.swipeDown()
+        // no swipes on the Mac: a scroll wheel over the sidebar
+        app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.12, dy: 0.5)).scroll(byDeltaX: 0, deltaY: 300)
         #else
         if UIDevice.current.userInterfaceIdiom == .pad {
             let from = app.coordinate(withNormalizedOffset: CGVector(dx: 0.12, dy: 0.35))
@@ -122,10 +123,27 @@ final class MoveDocUITests: XCTestCase {
         #endif
     }
 
-    /// A tree row (LibraryTree: one accessibility element per row).
+    /// A tree row (LibraryTree: one accessibility element per row). On the
+    /// Mac a row scrolled out of the sidebar isn't in the accessibility
+    /// tree: scroll the sidebar until it is (a new doc lands at the bottom).
     func row(_ app: XCUIApplication, _ title: String) -> XCUIElement {
-        app.descendants(matching: .any)["tree.\(title)"].firstMatch
+        let r = app.descendants(matching: .any)["tree.\(title)"].firstMatch
+        #if targetEnvironment(macCatalyst)
+        revealInSidebar(app, r)
+        #endif
+        return r
     }
+
+    #if targetEnvironment(macCatalyst)
+    func revealInSidebar(_ app: XCUIApplication, _ r: XCUIElement) {
+        guard app.windows.firstMatch.waitForExistence(timeout: 10), !r.waitForExistence(timeout: 3) else { return }
+        let sidebar = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.12, dy: 0.6))
+        for _ in 0..<25 where !r.exists {
+            sidebar.scroll(byDeltaX: 0, deltaY: -240)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        }
+    }
+    #endif
 
     /// Drag `from` onto `to` at a fraction of its height (0.5 = the middle:
     /// inside; 0.1 = its top edge: before it; 0.9 = after it), at a hand's
@@ -375,7 +393,18 @@ final class MoveDocUITests: XCTestCase {
         #if !targetEnvironment(macCatalyst)
         throw XCTSkip("the sidebar switcher: the Mac and iPad")
         #else
-        _ = try call("/api/workspaces", ["name": "Ws \(Int.random(in: 1000...9999))"])
+        let made = try call("/api/workspaces", ["name": "Ws \(Int.random(in: 1000...9999))"]) as? [String: Any]
+        // the next suites' docs are Unsorted: an empty workspace left behind
+        // (and chosen in the switcher) would hide every one of them
+        if let id = made?["id"] as? String {
+            addTeardownBlock { [base] in
+                var r = URLRequest(url: base.appending(path: "/api/workspaces/\(id)"))
+                r.httpMethod = "DELETE"
+                let gone = DispatchSemaphore(value: 0)
+                URLSession.shared.dataTask(with: r) { _, _, _ in gone.signal() }.resume()
+                _ = gone.wait(timeout: .now() + 10)
+            }
+        }
         let app = launch()
         let switcher = app.buttons.matching(NSPredicate(format: "label CONTAINS 'Unsorted' OR label BEGINSWITH 'Ws '")).firstMatch
         XCTAssertTrue(switcher.waitForExistence(timeout: 20), "the switcher shows")
@@ -407,6 +436,14 @@ final class MoveDocUITests: XCTestCase {
 
     /// Name the folder in the New folder prompt and create it.
     func nameFolder(_ app: XCUIApplication, _ name: String) {
+        #if targetEnvironment(macCatalyst)
+        // Catalyst shows the alert as a sheet (its field loses the identifier)
+        let nameField = app.sheets["New folder"].textFields.firstMatch
+        XCTAssertTrue(nameField.waitForExistence(timeout: 5), "New folder asks for a name")
+        nameField.click()
+        nameField.typeText(name)
+        app.buttons["newfolder.create"].firstMatch.click()
+        #else
         let alert = app.alerts["New folder"].firstMatch
         if !alert.waitForExistence(timeout: 5) { shot("no New folder prompt") }
         XCTAssertTrue(alert.exists, "New folder asks for a name")
@@ -415,6 +452,7 @@ final class MoveDocUITests: XCTestCase {
         hit(field)
         field.typeText(name)
         hit(alert.buttons["Create"].firstMatch)
+        #endif
     }
 
     /// New folder at the top level: an empty folder (not opened as a doc),

@@ -308,10 +308,7 @@ struct PadRoot: View {
 
     var body: some View {
         @Bindable var router = router
-        NavigationSplitView(columnVisibility: Binding(
-            get: { router.sidebarHidden ? .detailOnly : .automatic },
-            set: { router.sidebarHidden = $0 == .detailOnly }
-        )) {
+        NavigationSplitView(columnVisibility: $router.columnVisibility) {
             PadSidebar().modifier(DocDeleteHost()).modifier(DocMoveHost())
         } detail: {
             NavigationStack(path: $router.padPath) {

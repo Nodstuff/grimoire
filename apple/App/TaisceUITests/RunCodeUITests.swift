@@ -29,7 +29,7 @@ import XCTest
         return try JSONSerialization.jsonObject(with: try XCTUnwrap(out, "no answer from \(path)"))
     }
 
-    func testRunAsksThenRunsFromTheSheet() throws {
+    func testOwnAgentsCodeRunsAndSaysWhoWroteIt() throws {
         #if !targetEnvironment(macCatalyst)
         throw XCTSkip("code runs on the Mac only")
         #else
@@ -50,34 +50,22 @@ import XCTest
         // a Mac window that isn't key takes the first click to activate:
         // make it key before pressing Run
         app.activate()
-        app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.85)).tap()
-        run.tap()
+        app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.85)).click()
+        run.click()
+        // LOCAL mode: every agent is your own and the workspace private, so
+        // the block runs without the trust sheet (RunTrust.decide: "your own
+        // agent in a private workspace runs without asking") and still says
+        // who wrote it; the sheet itself is covered by RunCodeTests
         let question = app.staticTexts["code.trust.question"]
-        if !question.waitForExistence(timeout: 15) {
-            let failShot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
-            failShot.name = "after-run"
-            failShot.lifetime = .keepAlways
-            add(failShot)
-            XCTFail("the trust sheet appears")
-            return
-        }
-        XCTAssertTrue(question.label.contains(agent), "it names the agent: \(question.label)")
-        let sheetRun = app.buttons["code.trust.run"]
-        XCTAssertTrue(sheetRun.exists)
-        sheetRun.tap()
-
         let output = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", "from-the-sheet-\(tag)")).firstMatch
         XCTAssertTrue(output.waitForExistence(timeout: 20), "the run's output arrives")
-        XCTAssertFalse(question.exists, "the sheet has gone")
+        XCTAssertFalse(question.exists, "no question for your own agent in a private workspace")
+        XCTAssertTrue(app.staticTexts["code.writtenBy"].firstMatch.label.contains(agent), "it names who wrote it")
         let status = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'exit 0'")).firstMatch
         XCTAssertTrue(status.waitForExistence(timeout: 5), "exit 0")
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.lifetime = .keepAlways
         add(shot)
-
-        // approved now: the next Run doesn't ask
-        run.tap()
-        XCTAssertFalse(question.waitForExistence(timeout: 3), "no second question")
         #endif
     }
 }

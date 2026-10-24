@@ -31,12 +31,25 @@ final class SearchUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-serverURL", base.absoluteString, "-tab", "search", "-searchQuery", word]
         app.launch()
+        #if targetEnvironment(macCatalyst)
+        // the Mac exposes a result row's words, not a button holding them; a click on them opens it
+        let result = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ AND NOT (label BEGINSWITH 'Search')", word)).firstMatch
+        XCTAssertTrue(result.waitForExistence(timeout: 20), "the search lists the seeded doc")
+        result.click()
+        #else
         let result = app.buttons.containing(NSPredicate(format: "label CONTAINS %@", word)).firstMatch
         XCTAssertTrue(result.waitForExistence(timeout: 20), "the search lists the seeded doc")
         result.tap()
+        #endif
         // the doc is one editing surface (a text view): wait for its text
         let body = app.textViews.firstMatch
-        XCTAssertTrue(body.waitForExistence(timeout: 10), "the result opened")
+        if !body.waitForExistence(timeout: 10) {
+            let a = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            a.name = "search-not-opened"
+            a.lifetime = .keepAlways
+            add(a)
+        }
+        XCTAssertTrue(body.exists, "the result opened")
         let end = Date().addingTimeInterval(10)
         while !((body.value as? String) ?? "").contains(heading), Date() < end {
             RunLoop.current.run(until: Date().addingTimeInterval(0.3))

@@ -6,9 +6,18 @@ import XCTest
 /// `TEST_RUNNER_TAISCE_UI_URL` is the daemon. Each shot is
 /// `ipad-<name>-<suffix>.png`, taken in the current appearance.
 final class ShellShotsUITests: XCTestCase {
+    /// iPad landscape shots: the Mac's runner reports the iPad idiom but has no orientation
+    static var onMac: Bool {
+        #if targetEnvironment(macCatalyst)
+        true
+        #else
+        false
+        #endif
+    }
+
     func testShellLandscapeShots() throws {
         let env = ProcessInfo.processInfo.environment
-        guard let dir = env["TAISCE_SHOTS"], UIDevice.current.userInterfaceIdiom == .pad else {
+        guard let dir = env["TAISCE_SHOTS"], UIDevice.current.userInterfaceIdiom == .pad, !Self.onMac else {
             throw XCTSkip("TEST_RUNNER_TAISCE_SHOTS not set, or not an iPad")
         }
         let url = env["TAISCE_UI_URL"] ?? "http://127.0.0.1:7515"

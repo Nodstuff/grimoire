@@ -21,6 +21,33 @@ final class BooksUITests: XCTestCase {
 
     // MARK: plumbing
 
+    /// What a whole-screen coordinate is taken from: the window on the Mac
+    /// (the application has no frame there), the app elsewhere.
+    func screen(_ app: XCUIApplication) -> XCUIElement {
+        #if targetEnvironment(macCatalyst)
+        app.windows.firstMatch
+        #else
+        app
+        #endif
+    }
+
+    /// A click on the Mac (a touch-style tap doesn't reach Catalyst controls), a tap elsewhere.
+    func hit(_ e: XCUIElement) {
+        #if targetEnvironment(macCatalyst)
+        e.click()
+        #else
+        e.tap()
+        #endif
+    }
+
+    func hit(at c: XCUICoordinate) {
+        #if targetEnvironment(macCatalyst)
+        c.click()
+        #else
+        c.tap()
+        #endif
+    }
+
     func launch(_ args: [String] = []) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = ["-serverURL", base] + args
@@ -28,7 +55,7 @@ final class BooksUITests: XCTestCase {
         if let relay = env["TAISCE_UI_SIGNIN_RELAY"] { app.launchEnvironment["TAISCE_UI_SIGNIN_RELAY"] = relay }
         app.launch()
         let signIn = app.buttons["Sign in with passkey"]
-        if signIn.waitForExistence(timeout: 6) { signIn.tap() }
+        if signIn.waitForExistence(timeout: 6) { hit(signIn) }
         return app
     }
 
@@ -103,7 +130,7 @@ final class BooksUITests: XCTestCase {
     }
 
     func turnPage(_ app: XCUIApplication) {
-        app.coordinate(withNormalizedOffset: CGVector(dx: 0.88, dy: 0.5)).tap()
+        hit(at: screen(app).coordinate(withNormalizedOffset: CGVector(dx: 0.88, dy: 0.5)))
         RunLoop.current.run(until: Date().addingTimeInterval(1.2))
     }
 
@@ -121,22 +148,38 @@ final class BooksUITests: XCTestCase {
         let first = try XCTUnwrap(try http("GET", "/api/books/currently-reading").1["books"] as? [[String: Any]]).first?["title"] as? String ?? ""
         let card = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH %@ AND label CONTAINS %@", first, "% read")).firstMatch
         XCTAssertTrue(card.waitForExistence(timeout: 10), "the \(first) Continue reading card")
-        card.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.3)).tap()
+        hit(at: card.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.3)))
         XCTAssertTrue(app.buttons["book.read"].waitForExistence(timeout: 10), "the details opened")
         RunLoop.current.run(until: Date().addingTimeInterval(1.5))
         shot(app, "book-detail")
+        #if targetEnvironment(macCatalyst)
+        // the Mac's pane: a scroll wheel, not a swipe
+        app.buttons["book.read"].coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).scroll(byDeltaX: 0, deltaY: -400)
+        #else
         app.swipeUp()
+        #endif
         RunLoop.current.run(until: Date().addingTimeInterval(1))
         shot(app, "book-detail-lower")
         // Send to…: the system share sheet over the EPUB (downloaded, named Author - Title.epub)
         let send = app.buttons["Send to…"]
         if send.waitForExistence(timeout: 3), send.isHittable {
-            send.tap()
+            hit(send)
+            #if targetEnvironment(macCatalyst)
+            // the Mac's share picker is a popover or menu of services
+            let picker = app.popovers.firstMatch
+            let menu = app.menus.firstMatch
+            let end = Date().addingTimeInterval(15)
+            while Date() < end, !picker.exists, !menu.exists { RunLoop.current.run(until: Date().addingTimeInterval(0.3)) }
+            XCTAssertTrue(picker.exists || menu.exists, "the share picker opened")
+            shot(app, "share-sheet")
+            app.typeKey(.escape, modifierFlags: [])
+            #else
             let close = app.buttons["Close"].firstMatch
             XCTAssertTrue(close.waitForExistence(timeout: 15), "the share sheet opened")
             RunLoop.current.run(until: Date().addingTimeInterval(1))
             shot(app, "share-sheet")
-            close.tap()
+            hit(close)
+            #endif
         }
     }
 
@@ -221,26 +264,26 @@ final class BooksUITests: XCTestCase {
         let app = launch(["-readBook", id])
         XCTAssertTrue(app.descendants(matching: .any)["reader.progress"].firstMatch.waitForExistence(timeout: 40), "the book opened")
         RunLoop.current.run(until: Date().addingTimeInterval(2.5)) // the bar steps aside
-        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        hit(at: screen(app).coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)))
         let settings = app.buttons["reader.settings"]
         XCTAssertTrue(settings.waitForExistence(timeout: 5), "the bar came back")
         shot(app, "reader-chrome")
-        settings.tap()
+        hit(settings)
         let sepia = app.buttons["Sepia paper"]
         XCTAssertTrue(sepia.waitForExistence(timeout: 5))
-        sepia.tap()
+        hit(sepia)
         RunLoop.current.run(until: Date().addingTimeInterval(1))
         shot(app, "reader-settings-sepia")
-        app.buttons["Done"].firstMatch.tap()
+        hit(app.buttons["Done"].firstMatch)
         RunLoop.current.run(until: Date().addingTimeInterval(1.5))
         shot(app, "reader-sepia")
-        settings.tap()
-        app.buttons["Dark paper"].tap()
-        app.buttons["Done"].firstMatch.tap()
+        hit(settings)
+        hit(app.buttons["Dark paper"])
+        hit(app.buttons["Done"].firstMatch)
         RunLoop.current.run(until: Date().addingTimeInterval(1.5))
         shot(app, "reader-dark")
-        settings.tap()
-        app.buttons["Auto paper"].tap()
-        app.buttons["Done"].firstMatch.tap()
+        hit(settings)
+        hit(app.buttons["Auto paper"])
+        hit(app.buttons["Done"].firstMatch)
     }
 }

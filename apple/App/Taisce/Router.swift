@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SwiftUI
 import TaisceKit
 
 enum AppTab: Hashable {
@@ -115,8 +116,10 @@ final class Router {
     var searchScopeRequest: SearchScope?
     /// ⌘K: the actions palette
     var showActions = false
-    /// the split view's sidebar hidden (⌘\)
-    var sidebarHidden = false
+    /// the split view's columns (⌘\\ hides or shows the sidebar); the split
+    /// view writes it too when the person drags the sidebar away
+    var columnVisibility: NavigationSplitViewVisibility = .automatic
+    var sidebarHidden: Bool { columnVisibility == .detailOnly }
     /// ⇧⌘I: bumped for Books to open its EPUB picker
     private(set) var addBooksRequest = 0
 
@@ -291,7 +294,7 @@ final class Router {
         case .actions:
             showActions = true
         case .toggleSidebar:
-            if isPad { sidebarHidden.toggle() }
+            if isPad { columnVisibility = sidebarHidden ? .all : .detailOnly }
         case .newDocHere:
             newDoc(in: focusedDoc)
         case .addBooks:

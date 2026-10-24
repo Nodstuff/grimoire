@@ -81,7 +81,7 @@ final class EditorUITests: XCTestCase {
         XCTAssertEqual(text(), "First line\nSecond line\n")
 
         // the caret at the end, then to the start of "Second line" (⌘←)
-        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9)).tap()
+        press(surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9)))
         // to the line's start: ⌘← with a hardware keyboard; with the
         // software keyboard up (key events then don't move the caret), the
         // space bar's trackpad slid far left, as a person would
@@ -114,6 +114,23 @@ final class EditorUITests: XCTestCase {
 
     /// A point in the text column, `fraction` of the way down the surface,
     /// `dx` points into the column (iPhone: the column starts 20 pt in).
+    /// A click on the Mac (a touch-style tap doesn't reach Catalyst text), a tap elsewhere.
+    func press(_ c: XCUICoordinate) {
+        #if targetEnvironment(macCatalyst)
+        c.click()
+        #else
+        c.tap()
+        #endif
+    }
+
+    func press(element e: XCUIElement) {
+        #if targetEnvironment(macCatalyst)
+        e.click()
+        #else
+        e.tap()
+        #endif
+    }
+
     func columnPoint(_ surface: XCUIElement, dx: CGFloat, fraction: CGFloat) -> XCUICoordinate {
         surface.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: fraction)).withOffset(CGVector(dx: 20 + dx, dy: 0))
     }
@@ -134,7 +151,7 @@ final class EditorUITests: XCTestCase {
         XCTAssertTrue(surface.waitForExistence(timeout: 20))
         // the middle of the text column: on iPad the column is inset in a
         // wider surface, and a tap in its margin is a tap to write
-        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.55)).tap()
+        press(surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.55)))
         XCTAssertTrue(app.staticTexts[target].waitForExistence(timeout: 10), "the link was followed")
         XCTAssertEqual(app.keyboards.count, 0, "no keyboard")
     }
@@ -151,7 +168,7 @@ final class EditorUITests: XCTestCase {
         let surface = app.textViews["surface.text"]
         XCTAssertTrue(surface.waitForExistence(timeout: 20))
         XCTAssertEqual(app.keyboards.count, 0, "no keyboard before")
-        columnPoint(surface, dx: 8, fraction: 0.55).tap()
+        press(columnPoint(surface, dx: 8, fraction: 0.55))
         XCTAssertTrue((surface.value as? String ?? "").contains("☑"), "a box was ticked")
         XCTAssertEqual(app.keyboards.count, 0, "no keyboard")
         var got = ""
@@ -182,7 +199,7 @@ final class EditorUITests: XCTestCase {
         XCTAssertEqual(text(), "Hello world\n")
 
         // a click below the text puts the caret at the end; type
-        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9)).tap()
+        press(surface.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9)))
         surface.typeText(" again")
         XCTAssertEqual(text(), "Hello world again\n")
 
@@ -198,7 +215,7 @@ final class EditorUITests: XCTestCase {
         surface.typeText(" [[\(tag)")
         let pick = app.buttons.matching(NSPredicate(format: "identifier == 'wiki.suggestion' AND label BEGINSWITH %@", target)).firstMatch
         XCTAssertTrue(pick.waitForExistence(timeout: 5), "the [[ popup offers the doc being typed")
-        pick.tap()
+        press(element: pick)
         surface.typeText("end")
         XCTAssertEqual(text(), "Hello world again \(target) end\n")
 
