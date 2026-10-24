@@ -405,7 +405,8 @@ struct PadSidebar: View {
         .task(id: model.todoRevision) { _ = await model.loadTodos() }
         .navigationTitle("Taisce")
         .toolbar {
-            ToolbarItem(placement: .topBarLeading) { SidebarBrand() }
+            // the logo on the panel, not in a glass capsule
+            ToolbarItem(placement: .topBarLeading) { SidebarBrand() }.sharedBackgroundVisibility(.hidden)
             ToolbarItem(placement: .principal) { Color.clear.frame(width: 1, height: 1).accessibilityHidden(true) }
             ToolbarItem(placement: .primaryAction) {
                 // ⌘N is the menu bar's (TaisceCommands)
@@ -531,7 +532,7 @@ private struct SidebarItem: View {
         HStack(spacing: 10) {
             Image(systemName: systemImage)
                 .font(.body)
-                .foregroundStyle(selected ? Color.lapis.accent : Color.lapis.ink2)
+                .foregroundStyle(badgeTone == .attention ? Color.lapis.yellow : Color.lapis.accent)
                 .frame(width: 24)
                 .accessibilityHidden(true)
             Text(title).foregroundStyle(Color.lapis.ink)
@@ -564,12 +565,12 @@ private struct SidebarItem: View {
 private struct SidebarBrand: View {
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: "diamond.fill")
-                .font(.footnote.weight(.bold))
+            Image(systemName: "diamond.inset.filled")
+                .font(.title3.weight(.semibold))
                 .foregroundStyle(Color.lapis.accent)
                 .accessibilityHidden(true)
             Text("Taisce")
-                .lapisFont(.cardTitle, weight: .medium)
+                .lapisFont(.docHeading2, weight: .medium)
                 .foregroundStyle(Color.lapis.ink)
         }
         .fixedSize()
