@@ -22,7 +22,7 @@ private func item(_ id: String, _ kind: ReviewQueueItem.Kind, by proposer: Strin
 }
 
 /// Today: the review card's words, the book to continue, the due rows.
-@Suite struct TodayTests {
+@Suite struct TodayHomeTests {
     @Test func reviewCardTitleCountsAgentChanges() {
         #expect(ReviewCopy.title([item("1", .flagged), item("2", .flagged), item("3", .parked)]) == "3 agent changes want a look")
         #expect(ReviewCopy.title([item("1", .flagged)]) == "1 agent change wants a look")

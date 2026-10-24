@@ -82,7 +82,7 @@ struct ReviewQueueRow: Decodable {
     init(from decoder: any Decoder) throws {
         let w = try Wire(from: decoder)
         let a = w.item.annotation
-        let kind: Kind = a.kind == "parked" ? .parked : .flagged
+        let kind: ReviewQueueItem.Kind = a.kind == "parked" ? .parked : .flagged
         let op = w.item.op.kind
         item = ReviewQueueItem(
             id: a.id, docID: a.doc_id, docTitle: w.doc_title ?? "", kind: kind, proposer: w.proposer ?? "",
