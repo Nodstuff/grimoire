@@ -39,7 +39,9 @@ extension SurfaceModel {
             // the block's text, from its line fragments (spacing excluded)
             var top = CGFloat.greatestFiniteMagnitude, bottom = -CGFloat.greatestFiniteMagnitude
             let end = b.range.location + b.range.length
-            tlm.ensureLayout(for: range)
+            // from the top: fragments above may still sit at estimated heights
+            // (a card above just grew its block's spacing), which moves this one
+            if let upTo = NSTextRange(location: docStart, end: range.endLocation) { tlm.ensureLayout(for: upTo) }
             tlm.enumerateTextLayoutFragments(from: range.location, options: [.ensuresLayout]) { frag in
                 let at = cm.offset(from: docStart, to: frag.rangeInElement.location)
                 guard at < end else { return false }

@@ -54,13 +54,29 @@ enum SurfaceLook {
         }
         let lapis = LapisTextStyle.docBody
         let base = lapis.serif.weight
+        let factor = bodyFactor(traits)
         if marks.contains(.code) {
-            let size = lapis.uiFont(traits: traits).pointSize * 0.85
+            let size = lapis.uiFont(traits: traits).pointSize * 0.85 * factor
             return UIFont.monospacedSystemFont(ofSize: size, weight: marks.contains(.bold) ? .semibold : .regular)
         }
         let weight: UIFont.Weight = marks.contains(.bold) ? .semibold : base
         if marks.contains(.italic) { italic.toggle() }
-        return lapis.uiFont(traits: traits, weight: weight, italic: italic)
+        let f = lapis.uiFont(traits: traits, weight: weight, italic: italic)
+        return factor == 1 ? f : f.withSize(f.pointSize * factor)
+    }
+
+    /// The doc artboards read a step above the foundation's 18 pt body:
+    /// 19 pt on iPhone, 20 pt on a regular-width iPad (the Mac scales by docScale).
+    static func bodyFactor(_ traits: UITraitCollection?) -> CGFloat {
+        #if targetEnvironment(macCatalyst)
+        return 1
+        #else
+        switch traits?.userInterfaceIdiom {
+        case .phone: return 19 / 18
+        case .pad: return traits?.horizontalSizeClass == .regular ? 20 / 18 : 19 / 18
+        default: return 1
+        }
+        #endif
     }
 
     /// A heading: SF Pro bold at the doc's heading sizes (scaled like the
