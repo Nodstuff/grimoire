@@ -78,7 +78,7 @@ struct MoveDocSheet: View {
             List {
                 if options.isEmpty {
                     Text(query.isEmpty ? "Nowhere else to put it in this workspace." : "No docs match.")
-                        .foregroundStyle(Theme.secondary)
+                        .foregroundStyle(Color.lapis.ink3)
                 }
                 ForEach(options) { option in
                     Button {
@@ -87,21 +87,21 @@ struct MoveDocSheet: View {
                     } label: {
                         HStack(spacing: 12) {
                             Image(systemName: option.parent == nil ? "tray.full" : "folder")
-                                .foregroundStyle(Theme.accent)
+                                .foregroundStyle(Color.lapis.accent)
                                 .frame(width: 24)
                                 .accessibilityHidden(true)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(option.title).font(.subheadline).foregroundStyle(Theme.text).lineLimit(2)
+                                Text(option.title).font(.subheadline).foregroundStyle(Color.lapis.ink).lineLimit(2)
                                 if let crumb = option.breadcrumb {
-                                    Text(crumb).font(.caption2).foregroundStyle(Theme.secondary).lineLimit(1)
+                                    Text(crumb).font(.caption2).foregroundStyle(Color.lapis.ink3).lineLimit(1)
                                 }
                             }
                             Spacer(minLength: 0)
                             if option.isCurrent {
-                                Image(systemName: "checkmark").foregroundStyle(Theme.accent).accessibilityLabel("Current place")
+                                Image(systemName: "checkmark").foregroundStyle(Color.lapis.accent).accessibilityLabel("Current place")
                             }
                         }
-                        .frame(minHeight: Theme.minTarget)
+                        .frame(minHeight: Lapis.Layout.minTarget)
                     }
                     .accessibilityHint(option.isCurrent ? "It's already here" : "Moves it here")
                 }
@@ -179,10 +179,10 @@ private struct DocTopLevelDrop: ViewModifier {
                     if targeted {
                         Text("Move to the top level")
                             .font(.caption.weight(.medium))
-                            .foregroundStyle(Theme.accent)
+                            .foregroundStyle(Color.lapis.accent)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
-                            .background(Theme.surface2, in: .capsule)
+                            .background(Color.lapis.card2, in: .capsule)
                             .allowsHitTesting(false)
                     }
                 }

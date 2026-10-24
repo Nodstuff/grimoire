@@ -4,10 +4,10 @@ import TaisceKit
 /// A small uppercase section label ("DUE", "PINNED").
 struct SectionLabel: View {
     let title: String
-    var color: Color = Theme.secondary
+    var color: Color = Color.lapis.ink3
     var trailing: AnyView?
 
-    init(_ title: String, color: Color = Theme.secondary, trailing: AnyView? = nil) {
+    init(_ title: String, color: Color = Color.lapis.ink3, trailing: AnyView? = nil) {
         self.title = title
         self.color = color
         self.trailing = trailing
@@ -37,11 +37,11 @@ struct ScreenHeader<Trailing: View>: View {
         HStack(alignment: .bottom) {
             VStack(alignment: .leading, spacing: 2) {
                 if let kicker {
-                    Text(kicker).font(.subheadline).foregroundStyle(Theme.secondary)
+                    Text(kicker).font(.subheadline).foregroundStyle(Color.lapis.ink3)
                 }
                 Text(title)
-                    .font(Theme.serif(.largeTitle))
-                    .foregroundStyle(Theme.text)
+                    .lapisFont(.screenTitle)
+                    .foregroundStyle(Color.lapis.ink)
                     .accessibilityAddTraits(.isHeader)
             }
             Spacer(minLength: 12)
@@ -62,11 +62,11 @@ struct TodoRing: View {
     var done = false
 
     var color: Color {
-        if done { return Theme.green }
+        if done { return Color.lapis.green }
         return switch tone {
-        case .overdue: Theme.rose
-        case .today: Theme.amber
-        case .later, .none: Theme.secondary
+        case .overdue: Color.lapis.red
+        case .today: Color.lapis.yellow
+        case .later, .none: Color.lapis.ink3
         }
     }
 
@@ -96,7 +96,7 @@ struct TodoRow: View {
             if let onToggle {
                 Button(action: onToggle) {
                     TodoRing(tone: label.tone, done: done)
-                        .frame(width: Theme.minTarget, height: Theme.minTarget)
+                        .frame(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget)
                         .contentShape(.rect)
                 }
                 .buttonStyle(.borderless)
@@ -109,21 +109,21 @@ struct TodoRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(InlineMarkdown.attributed(entry.text))
                     .font(.subheadline)
-                    .foregroundStyle(Theme.text)
-                    .strikethrough(done, color: Theme.secondary)
+                    .foregroundStyle(Color.lapis.ink)
+                    .strikethrough(done, color: Color.lapis.ink3)
                     .opacity(done ? 0.55 : 1)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if let text = label.text {
                     Text(text).font(.caption).foregroundStyle(subtitleColor(label.tone))
                 }
                 if let note = entry.note {
-                    Text(note).font(.caption).foregroundStyle(Theme.secondary).lineLimit(2)
+                    Text(note).font(.caption).foregroundStyle(Color.lapis.ink3).lineLimit(2)
                 }
             }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .frame(minHeight: Theme.minTarget)
+        .frame(minHeight: Lapis.Layout.minTarget)
         .contentShape(.rect)
         .animation(.easeOut(duration: 0.25), value: done)
         .accessibilityElement(children: onToggle == nil ? .combine : .contain)
@@ -132,9 +132,9 @@ struct TodoRow: View {
 
     func subtitleColor(_ tone: DueLabel.Tone) -> Color {
         switch tone {
-        case .overdue: Theme.rose
-        case .today: Theme.amber
-        case .later, .none: Theme.secondary
+        case .overdue: Color.lapis.red
+        case .today: Color.lapis.yellow
+        case .later, .none: Color.lapis.ink3
         }
     }
 }
@@ -147,7 +147,7 @@ struct CardList<Item: Identifiable, Row: View>: View {
     var body: some View {
         VStack(spacing: 0) {
             ForEach(Array(items.enumerated()), id: \.element.id) { i, item in
-                if i > 0 { Rectangle().fill(Theme.hairline).frame(height: 1).padding(.leading, 48) }
+                if i > 0 { Rectangle().fill(Color.lapis.line).frame(height: 1).padding(.leading, 48) }
                 row(item)
             }
         }
@@ -163,20 +163,20 @@ struct DocCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(doc.title)
-                .font(Theme.serif(.subheadline))
-                .foregroundStyle(Theme.text)
+                .lapisFont(.cardTitle)
+                .foregroundStyle(Color.lapis.ink)
                 .multilineTextAlignment(.leading)
                 .lineLimit(3)
             Spacer(minLength: 12)
             if let sub = doc.subtitle(now: now) {
-                Text(sub).font(.caption2).foregroundStyle(Theme.secondary).lineLimit(1)
+                Text(sub).font(.caption2).foregroundStyle(Color.lapis.ink3).lineLimit(1)
             }
         }
         .padding(12)
         .frame(maxWidth: .infinity, minHeight: 92, alignment: .topLeading)
         .card()
         .hoverWash()
-        .contentShape(.rect(cornerRadius: Theme.radius))
+        .contentShape(.rect(cornerRadius: Lapis.Radius.card))
         .accessibilityElement(children: .combine)
     }
 }
@@ -188,10 +188,10 @@ struct TagChip: View {
     var body: some View {
         Text("#\(tag)")
             .font(.caption2.weight(.medium))
-            .foregroundStyle(Theme.secondary)
+            .foregroundStyle(Color.lapis.ink3)
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
-            .background(Theme.surface2, in: .rect(cornerRadius: 6, style: .continuous))
+            .background(Color.lapis.card2, in: .rect(cornerRadius: 6, style: .continuous))
     }
 }
 
@@ -205,12 +205,12 @@ struct FilterChip: View {
         Button(action: action) {
             Text(title)
                 .font(.caption.weight(.medium))
-                .foregroundStyle(selected ? Theme.ground : Theme.text)
+                .foregroundStyle(selected ? Color.lapis.onAccent : Color.lapis.ink)
                 .padding(.horizontal, 12)
                 .frame(minHeight: 28)
-                .background(selected ? Theme.accent : Theme.surface2, in: .capsule)
-                .overlay(Capsule().strokeBorder(selected ? .clear : Theme.hairline))
-                .frame(minHeight: Theme.minTarget)
+                .background(selected ? Color.lapis.accent : Color.lapis.card2, in: .capsule)
+                .overlay(Capsule().strokeBorder(selected ? .clear : Color.lapis.line))
+                .frame(minHeight: Lapis.Layout.minTarget)
                 .contentShape(.rect)
         }
         .buttonStyle(.plain)
@@ -224,10 +224,10 @@ struct SyncChip: View {
 
     var color: Color {
         switch badge.tone {
-        case .saved: Theme.green
-        case .busy: Theme.accent
-        case .offline: Theme.amber
-        case .idle: Theme.secondary
+        case .saved: Color.lapis.green
+        case .busy: Color.lapis.accent
+        case .offline: Color.lapis.yellow
+        case .idle: Color.lapis.ink3
         }
     }
 
@@ -254,12 +254,12 @@ struct EmptyCard: View {
         HStack(alignment: .top, spacing: 14) {
             Image(systemName: icon)
                 .font(.body)
-                .foregroundStyle(Theme.accent)
+                .foregroundStyle(Color.lapis.accent)
                 .frame(width: 28)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.subheadline.weight(.medium)).foregroundStyle(Theme.text)
-                Text(hint).font(.caption).foregroundStyle(Theme.secondary)
+                Text(title).font(.subheadline.weight(.medium)).foregroundStyle(Color.lapis.ink)
+                Text(hint).font(.caption).foregroundStyle(Color.lapis.ink3)
             }
             Spacer(minLength: 0)
         }
@@ -277,13 +277,13 @@ struct SearchFieldButton: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").font(.subheadline).foregroundStyle(Theme.secondary)
-                Text("Search your library").font(.subheadline).foregroundStyle(Theme.secondary)
+                Image(systemName: "magnifyingglass").font(.subheadline).foregroundStyle(Color.lapis.ink3)
+                Text("Search your library").font(.subheadline).foregroundStyle(Color.lapis.ink3)
                 Spacer()
             }
             .padding(.horizontal, 12)
-            .frame(minHeight: Theme.minTarget)
-            .background(Theme.surface2, in: .rect(cornerRadius: 12, style: .continuous))
+            .frame(minHeight: Lapis.Layout.minTarget)
+            .background(Color.lapis.card2, in: .rect(cornerRadius: 12, style: .continuous))
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
@@ -303,10 +303,10 @@ struct CircleIconButton: View {
         Button(action: action) {
             Image(systemName: systemImage)
                 .font(.subheadline.weight(.semibold))
-                .foregroundStyle(filled ? Theme.ground : Theme.secondary)
+                .foregroundStyle(filled ? Color.lapis.onAccent : Color.lapis.ink3)
                 .frame(width: 34, height: 34)
-                .background(filled ? Theme.accent : Theme.surface2, in: .circle)
-                .frame(width: Theme.minTarget, height: Theme.minTarget)
+                .background(filled ? Color.lapis.accent : Color.lapis.card2, in: .circle)
+                .frame(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget)
                 .contentShape(.rect)
         }
         .buttonStyle(.plain)
@@ -323,13 +323,13 @@ struct PromptCard: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: icon).font(.subheadline).foregroundStyle(Theme.accent).accessibilityHidden(true)
-            Text(text).font(.subheadline).foregroundStyle(Theme.text).lineLimit(2)
+            Image(systemName: icon).font(.subheadline).foregroundStyle(Color.lapis.accent).accessibilityHidden(true)
+            Text(text).font(.subheadline).foregroundStyle(Color.lapis.ink).lineLimit(2)
             Spacer(minLength: 8)
             Button(action, action: onAction)
                 .font(.subheadline.weight(.semibold))
-                .foregroundStyle(Theme.accentActive)
-                .frame(minHeight: Theme.minTarget)
+                .foregroundStyle(Color.lapis.accent)
+                .frame(minHeight: Lapis.Layout.minTarget)
         }
         .padding(.horizontal, 14)
         .card()

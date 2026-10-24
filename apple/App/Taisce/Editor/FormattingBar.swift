@@ -18,7 +18,7 @@ final class FormattingBar: UIToolbar {
         self.model = model
         super.init(frame: CGRect(x: 0, y: 0, width: 320, height: 44))
         sizeToFit()
-        tintColor = UIColor(Theme.accentActive)
+        tintColor = UIColor.lapis.accent
         accessibilityIdentifier = "editor.bar"
 
         func item(_ symbol: String, _ label: String, _ id: String, _ action: @escaping () -> Void) -> UIBarButtonItem {

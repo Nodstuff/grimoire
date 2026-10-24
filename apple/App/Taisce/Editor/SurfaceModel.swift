@@ -177,8 +177,8 @@ final class SurfaceModel: NSObject {
         tv.dataDetectorTypes = []
         tv.isEditable = editable
         tv.isSelectable = true
-        tv.gutter = Theme.gutter
-        tv.readingWidth = Theme.readingWidth
+        tv.gutter = Lapis.Layout.gutter
+        tv.readingWidth = Lapis.Layout.readingWidth
         tv.accessibilityIdentifier = "surface.text"
         tv.textDragInteraction?.isEnabled = false
         // dropped text goes through Surface (block ids), not UIKit's insert
@@ -360,9 +360,9 @@ final class SurfaceModel: NSObject {
 
     var lookContext: SurfaceLook.Context {
         var tints: [BlockID: UIColor] = [:]
-        for (id, r) in reviews { tints[id] = UIColor(r.verdict == .red ? Theme.rose : Theme.amber).withAlphaComponent(0.16) }
-        for id in failedBlocks { tints[id] = UIColor(Theme.rose).withAlphaComponent(0.16) }
-        for (id, c) in conflicts where c.theirs != nil { tints[id] = UIColor(Theme.rose).withAlphaComponent(0.16) }
+        for (id, r) in reviews { tints[id] = r.verdict == .red ? UIColor.lapis.redSoft : UIColor.lapis.yellowSoft }
+        for id in failedBlocks { tints[id] = UIColor.lapis.redSoft }
+        for (id, c) in conflicts where c.theirs != nil { tints[id] = UIColor.lapis.redSoft }
         return SurfaceLook.Context(traits: traits, editable: editable, tints: tints) { [weak self] id, src in
             self?.attachment(id, source: src)
         }

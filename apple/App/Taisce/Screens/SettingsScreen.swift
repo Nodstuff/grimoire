@@ -94,6 +94,7 @@ struct SettingsContent: View {
     var onSignOut: () -> Void = {}
     var onDone: () -> Void = {}
     @State private var url = ""
+    @AppStorage(UserSettings.appearanceKey) private var appearance = LapisAppearance.system.rawValue
 
     var body: some View {
         Form {
@@ -113,7 +114,7 @@ struct SettingsContent: View {
             } footer: {
                 Text("HTTPS servers ask you to sign in with a passkey. Plain HTTP is for a daemon on this device or network (no sign-in).")
             }
-            .listRowBackground(Theme.surface)
+            .listRowBackground(Color.lapis.card)
 
             Section("Account") {
                 LabeledContent("Status", value: accountText)
@@ -121,7 +122,25 @@ struct SettingsContent: View {
                     Button("Sign out", role: .destructive, action: onSignOut)
                 }
             }
-            .listRowBackground(Theme.surface)
+            .listRowBackground(Color.lapis.card)
+
+            Section {
+                Picker("Appearance", selection: $appearance) {
+                    ForEach(LapisAppearance.allCases) { a in
+                        Label(a.title, systemImage: a.symbol).tag(a.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .accessibilityLabel("Appearance")
+                .accessibilityIdentifier("settings.appearance")
+                .sensoryFeedback(.selection, trigger: appearance)
+            } header: {
+                Text("Appearance")
+            } footer: {
+                Text("System follows this device's light or dark setting.")
+            }
+            .listRowBackground(Color.lapis.card)
 
             Section {
                 LabeledContent("Indicator") { SyncChip(badge: SyncBadge.make(status: info.status, pending: info.pending)) }
@@ -131,14 +150,14 @@ struct SettingsContent: View {
                 LabeledContent("Pending writes") { Text("\(info.pending)").monospacedDigit() }
                 if let error = info.syncError {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Sync error").foregroundStyle(Theme.rose)
-                        Text(error).font(.footnote).foregroundStyle(Theme.secondary)
+                        Text("Sync error").foregroundStyle(Color.lapis.red)
+                        Text(error).font(.footnote).foregroundStyle(Color.lapis.ink3)
                     }
                 }
                 ForEach(info.failedDocs, id: \.0) { title, why in
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Couldn't fetch \u{201C}\(title)\u{201D}").foregroundStyle(Theme.amber)
-                        Text(why).font(.footnote).foregroundStyle(Theme.secondary).lineLimit(3)
+                        Text("Couldn't fetch \u{201C}\(title)\u{201D}").foregroundStyle(Color.lapis.yellow)
+                        Text(why).font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(3)
                     }
                 }
             } header: {
@@ -146,7 +165,7 @@ struct SettingsContent: View {
             } footer: {
                 Text("Edits made offline wait in the outbox and send in order when the connection is back.")
             }
-            .listRowBackground(Theme.surface)
+            .listRowBackground(Color.lapis.card)
 
             if let unread = info.sharedLinks {
                 Section {
@@ -163,7 +182,7 @@ struct SettingsContent: View {
                 } footer: {
                     Text("Links you've made to docs, their views and comments.")
                 }
-                .listRowBackground(Theme.surface)
+                .listRowBackground(Color.lapis.card)
             }
 
             #if targetEnvironment(macCatalyst)
@@ -175,7 +194,7 @@ struct SettingsContent: View {
             } footer: {
                 Text("Databases ```sql db=<name>``` blocks run on, on this Mac only.")
             }
-            .listRowBackground(Theme.surface)
+            .listRowBackground(Color.lapis.card)
             #endif
 
             Section {
@@ -195,15 +214,15 @@ struct SettingsContent: View {
             } footer: {
                 Text("A nudge when a to-do's deadline arrives.")
             }
-            .listRowBackground(Theme.surface)
+            .listRowBackground(Color.lapis.card)
 
             if let error = info.lastError {
-                Section("Last error") { Text(error).font(.footnote).foregroundStyle(Theme.secondary) }
-                    .listRowBackground(Theme.surface)
+                Section("Last error") { Text(error).font(.footnote).foregroundStyle(Color.lapis.ink3) }
+                    .listRowBackground(Color.lapis.card)
             }
         }
         .groundBackground()
-        .tint(Theme.accent)
+        .tint(Color.lapis.accent)
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

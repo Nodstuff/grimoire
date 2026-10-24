@@ -108,9 +108,9 @@ struct TodosContent: View {
                             .listRowInsets(EdgeInsets())
                     }
                 }
-                section("Overdue", board.overdue, color: Theme.rose)
-                section("Today", board.today, color: Theme.secondary)
-                section("Upcoming", board.upcoming, color: Theme.secondary)
+                section("Overdue", board.overdue, color: Color.lapis.red)
+                section("Today", board.today, color: Color.lapis.ink3)
+                section("Upcoming", board.upcoming, color: Color.lapis.ink3)
             } else {
                 Section { HStack { Spacer(); ProgressView(); Spacer() }.frame(minHeight: 120).listRowBackground(Color.clear) }
             }
@@ -119,17 +119,17 @@ struct TodosContent: View {
         .listSectionSpacing(20)
         .contentMargins(.top, 0, for: .scrollContent)
         // reading width on iPad, centred on the ground
-        .frame(maxWidth: Theme.readingWidth)
+        .frame(maxWidth: Lapis.Layout.readingWidth)
         .frame(maxWidth: .infinity)
-        .background(Theme.ground.ignoresSafeArea())
+        .background(Color.lapis.bg.ignoresSafeArea())
         .groundBackground()
         .toolbarVisibility(.hidden, for: .navigationBar)
         .safeAreaInset(edge: .bottom) {
             if !readOnly {
                 NewTodoField(draft: $draft, hint: hint, now: now, focused: $fieldFocused, onAdd: onAdd)
-                    .padding(.horizontal, Theme.gutter)
+                    .padding(.horizontal, Lapis.Layout.gutter)
                     .padding(.bottom, 8)
-                    .frame(maxWidth: Theme.readingWidth)
+                    .frame(maxWidth: Lapis.Layout.readingWidth)
             }
         }
         .confirmationDialog("Snooze until", isPresented: Binding(get: { snoozing != nil }, set: { if !$0 { snoozing = nil } }), titleVisibility: .visible, presenting: snoozing) { entry in
@@ -146,16 +146,16 @@ struct TodosContent: View {
                     if readOnly {
                         TodoRow(entry: entry, now: now, done: false, onToggle: nil)
                             .listRowInsets(EdgeInsets())
-                            .listRowBackground(Theme.surface)
+                            .listRowBackground(Color.lapis.card)
                     } else {
                         TodoRow(entry: entry, now: now, done: checked.contains(entry.id), onToggle: onToggleDone.map { f in { f(entry) } })
                             .listRowInsets(EdgeInsets())
-                            .listRowBackground(Theme.surface)
+                            .listRowBackground(Color.lapis.card)
                             .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                                Button("Done", systemImage: "checkmark") { onDone(entry) }.tint(Theme.green)
+                                Button("Done", systemImage: "checkmark") { onDone(entry) }.tint(Color.lapis.green)
                             }
                             .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                Button("Snooze", systemImage: "clock") { snoozing = entry }.tint(Theme.amber)
+                                Button("Snooze", systemImage: "clock") { snoozing = entry }.tint(Color.lapis.yellow)
                             }
                             .accessibilityAction(named: "Done") { onDone(entry) }
                             .accessibilityAction(named: "Snooze") { snoozing = entry }
@@ -193,21 +193,21 @@ struct NewTodoField: View {
             if let hintText, !draft.isEmpty {
                 Label(hintText, systemImage: hint?.warning == nil ? "calendar" : "exclamationmark.triangle")
                     .font(.footnote)
-                    .foregroundStyle(hint?.warning == nil ? Theme.accentActive : Theme.amber)
+                    .foregroundStyle(hint?.warning == nil ? Color.lapis.accent : Color.lapis.yellow)
                     .padding(.horizontal, 6)
                     .transition(.opacity)
             }
             HStack(spacing: 10) {
-                Image(systemName: "plus.circle").foregroundStyle(Theme.accent).accessibilityHidden(true)
+                Image(systemName: "plus.circle").foregroundStyle(Color.lapis.accent).accessibilityHidden(true)
                 TextField("New to-do\u{2026} try \u{2018}due fri 3pm\u{2019}", text: $draft)
                     .focused(focused)
                     .submitLabel(.done)
                     .onSubmit(onAdd)
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                 if !draft.isEmpty {
                     Button(action: onAdd) {
-                        Image(systemName: "arrow.up.circle.fill").font(.title2).foregroundStyle(Theme.accent)
-                            .frame(width: Theme.minTarget, height: Theme.minTarget)
+                        Image(systemName: "arrow.up.circle.fill").font(.title2).foregroundStyle(Color.lapis.accent)
+                            .frame(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Add to-do")

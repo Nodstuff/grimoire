@@ -108,7 +108,7 @@ struct DocScreen: View {
                     HStack(spacing: 8) {
                         Text(model.index.breadcrumb(of: docID) ?? title)
                             .font(.footnote.weight(.medium))
-                            .foregroundStyle(Theme.secondary)
+                            .foregroundStyle(Color.lapis.ink3)
                             .lineLimit(1)
                             .truncationMode(.head)
                         if surface.editable {
@@ -357,8 +357,8 @@ struct DocHeader: View {
                     }
                 }
                 Text(chrome.title)
-                    .docFont(.largeTitle, design: .serif, weight: .semibold)
-                    .foregroundStyle(Theme.text)
+                    .lapisFont(.docTitle)
+                    .foregroundStyle(Color.lapis.ink)
                     .accessibilityAddTraits(.isHeader)
                     .fixedSize(horizontal: false, vertical: true)
                 if !chrome.tags.isEmpty || chrome.meta != nil {
@@ -368,7 +368,7 @@ struct DocHeader: View {
                         if let meta = chrome.meta {
                             Text("\(chrome.tags.isEmpty ? "" : "· ")edited by \(meta.author) \(RelativeTime.string(meta.date, now: now))")
                                 .font(.caption2)
-                                .foregroundStyle(Theme.secondary)
+                                .foregroundStyle(Color.lapis.ink3)
                         }
                     }
                 }
@@ -377,11 +377,11 @@ struct DocHeader: View {
                 Button(action: onOpenLinkComments) {
                     Label(linkComments, systemImage: "bubble.left.and.text.bubble.right")
                         .font(.footnote.weight(.medium))
-                        .foregroundStyle(Theme.accent)
+                        .foregroundStyle(Color.lapis.accent)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .card(Theme.surface)
+                        .card(Color.lapis.card)
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("doc.linkComments")
@@ -437,7 +437,7 @@ struct ViewOnlyNote: View {
     var body: some View {
         Label(text, systemImage: "eye")
             .font(.caption2.weight(.medium))
-            .foregroundStyle(Theme.secondary)
+            .foregroundStyle(Color.lapis.ink3)
             .accessibilityElement(children: .combine)
             .accessibilityLabel("\(text): you can read this workspace but not change it")
             .accessibilityIdentifier("doc.viewOnly")
@@ -484,10 +484,10 @@ struct DocContent: View {
                 )
                 content
             }
-            .padding(.horizontal, Theme.gutter)
+            .padding(.horizontal, Lapis.Layout.gutter)
             .padding(.top, 4)
             .padding(.bottom, 40)
-            .frame(maxWidth: Theme.readingWidth, alignment: .leading)
+            .frame(maxWidth: Lapis.Layout.readingWidth, alignment: .leading)
             .frame(maxWidth: .infinity)
         }
         .groundBackground()
@@ -496,7 +496,7 @@ struct DocContent: View {
             ToolbarItem(placement: .principal) {
                 Text(breadcrumb ?? title)
                     .font(.footnote.weight(.medium))
-                    .foregroundStyle(Theme.secondary)
+                    .foregroundStyle(Color.lapis.ink3)
                     .lineLimit(1)
                     .truncationMode(.head)
             }
@@ -517,7 +517,7 @@ struct DocContent: View {
         } else if let loadError {
             VStack(alignment: .leading, spacing: 12) {
                 EmptyCard(icon: "wifi.slash", title: "Couldn't load this doc", hint: loadError)
-                Button("Try again", action: onRetry).buttonStyle(.bordered).tint(Theme.accent)
+                Button("Try again", action: onRetry).buttonStyle(.bordered).tint(Color.lapis.accent)
             }
         } else if page == nil {
             ProgressView().frame(maxWidth: .infinity, minHeight: 160)

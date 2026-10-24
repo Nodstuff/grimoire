@@ -30,15 +30,15 @@ struct SQLCodeCard: View {
             codeArea(e)
             sourceNote(choice)
             if let err = e.saveError ?? s.saveError {
-                Text(err).font(.caption).foregroundStyle(Theme.rose).padding(.horizontal, 14).padding(.bottom, 8)
+                Text(err).font(.caption).foregroundStyle(Color.lapis.red).padding(.horizontal, 14).padding(.bottom, 8)
             }
             if s.hasOutput {
-                Rectangle().fill(Theme.hairline).frame(height: 1)
+                Rectangle().fill(Color.lapis.line).frame(height: 1)
                 SQLOutputView(state: s, saveDB: saveDBButton(s))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card(Theme.surface2)
+        .card(Color.lapis.card2)
         .sheet(item: SQLTrustFlow.presentation(store, s)) { p in
             SQLTrustSheet(prompt: p, store: store, state: s)
         }
@@ -57,18 +57,18 @@ struct SQLCodeCard: View {
         HStack(spacing: 10) {
             Text(language)
                 .docFont(.caption, weight: .medium)
-                .foregroundStyle(Theme.secondary)
+                .foregroundStyle(Color.lapis.ink3)
             if let db = attributes["db"], !db.isEmpty {
                 Text("on \(db)")
                     .docFont(.caption2)
-                    .foregroundStyle(Theme.secondary.opacity(0.8))
+                    .foregroundStyle(Color.lapis.ink3.opacity(0.8))
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
             if e.practice == nil, let who = edits.writtenBy(context) {
                 Text("written by \(who)")
                     .docFont(.caption2)
-                    .foregroundStyle(Theme.secondary.opacity(0.8))
+                    .foregroundStyle(Color.lapis.ink3.opacity(0.8))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help("The last change to this query was by \(who)")
@@ -106,7 +106,7 @@ struct SQLCodeCard: View {
             Button(role: .destructive) { store.stop(s) } label: {
                 Label("Stop", systemImage: "stop.fill")
             }
-            .tint(Theme.rose)
+            .tint(Color.lapis.red)
             .accessibilityIdentifier("sql.stop")
         } else {
             switch choice {
@@ -114,7 +114,7 @@ struct SQLCodeCard: View {
                 Button { run(s, e, source, picked: false) } label: {
                     Label("Run", systemImage: "play.fill")
                 }
-                .tint(Theme.accentActive)
+                .tint(Color.lapis.accent)
                 .keyboardShortcut(practiceFocused ? KeyboardShortcut(.return, modifiers: .command) : nil)
                 .help("Run on \(source.name) (\(source.kind.label)\(source.allowWrites ? ", writes allowed" : ", read-only"))")
                 .accessibilityIdentifier("sql.run")
@@ -130,12 +130,12 @@ struct SQLCodeCard: View {
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
-                .tint(Theme.accentActive)
+                .tint(Color.lapis.accent)
                 .help(sources.isEmpty ? "No data sources on this Mac yet" : "Choose a data source to run this on")
                 .accessibilityIdentifier("sql.pick")
             case .unknown, .wrongKind:
                 Label("Run", systemImage: "play.fill")
-                    .foregroundStyle(Theme.secondary.opacity(0.6))
+                    .foregroundStyle(Color.lapis.ink3.opacity(0.6))
                     .accessibilityIdentifier("sql.run.disabled")
             }
         }
@@ -146,7 +146,7 @@ struct SQLCodeCard: View {
         case .unknown(let name):
             HStack(spacing: 6) {
                 Text("No data source named \(name) on this Mac \u{2014}")
-                    .foregroundStyle(Theme.amber)
+                    .foregroundStyle(Color.lapis.yellow)
                 Button("Add\u{2026}") { adding = draft(name: name) }
                     .buttonStyle(.borderless)
                     .accessibilityIdentifier("sql.add")
@@ -157,7 +157,7 @@ struct SQLCodeCard: View {
         case .wrongKind(let s, let wanted):
             Text("\(s.name) is a \(s.kind.label) source; this block is \(wanted.label).")
                 .font(.caption)
-                .foregroundStyle(Theme.amber)
+                .foregroundStyle(Color.lapis.yellow)
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
         default:
@@ -169,7 +169,7 @@ struct SQLCodeCard: View {
         if e.practice != nil {
             TextEditor(text: Binding(get: { e.practice ?? code }, set: { e.practice = PlainTyping.straighten(old: e.practice ?? code, new: $0) }))
                 .docFont(.footnote, design: .monospaced)
-                .foregroundStyle(Theme.text)
+                .foregroundStyle(Color.lapis.ink)
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
                 .scrollContentBackground(.hidden)
@@ -182,7 +182,7 @@ struct SQLCodeCard: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(code)
                     .docFont(.footnote, design: .monospaced)
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                     .textSelection(.enabled)
                     .fixedSize()
                     .padding(14)
@@ -239,11 +239,11 @@ private struct SQLOutputView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(f.sql)
                             .docFont(.caption, design: .monospaced)
-                            .foregroundStyle(Theme.secondary)
+                            .foregroundStyle(Color.lapis.ink3)
                             .lineLimit(3)
                         Text(f.error)
                             .docFont(.footnote, design: .monospaced)
-                            .foregroundStyle(Theme.rose)
+                            .foregroundStyle(Color.lapis.red)
                             .textSelection(.enabled)
                     }
                     .accessibilityIdentifier("sql.error")
@@ -252,7 +252,7 @@ private struct SQLOutputView: View {
                     if set.isCapped {
                         Text("The first \(set.rows.count.formatted()) rows; there are more")
                             .docFont(.caption2)
-                            .foregroundStyle(Theme.amber)
+                            .foregroundStyle(Color.lapis.yellow)
                     }
                 }
             }
@@ -271,12 +271,12 @@ private struct SQLOutputView: View {
                 }
             }
             .docFont(.caption)
-            .foregroundStyle(Theme.secondary)
+            .foregroundStyle(Color.lapis.ink3)
         } else if let o = state.outcome {
             let line = SQLStatus.line(o)
             Text(line.text)
                 .docFont(.caption, weight: .medium)
-                .foregroundStyle(line.ok ? Theme.green : Theme.rose)
+                .foregroundStyle(line.ok ? Color.lapis.green : Color.lapis.red)
                 .monospacedDigit()
                 .accessibilityIdentifier("sql.status")
         }
@@ -316,7 +316,7 @@ struct SQLTable: View {
                                 let v = c < set.rows[r].count ? set.rows[r][c] : nil
                                 Text(v.map { $0.replacingOccurrences(of: "\n", with: "\u{21B5}") } ?? "NULL")
                                     .docFont(.footnote, design: .monospaced)
-                                    .foregroundStyle(v == nil ? Theme.secondary.opacity(0.55) : Theme.text)
+                                    .foregroundStyle(v == nil ? Color.lapis.ink3.opacity(0.55) : Color.lapis.ink)
                                     .italic(v == nil)
                                     .lineLimit(1)
                                     .truncationMode(.tail)
@@ -325,7 +325,7 @@ struct SQLTable: View {
                                     .frame(width: w[c], alignment: .leading)
                             }
                         }
-                        .background(r % 2 == 1 ? Theme.surface.opacity(0.45) : Color.clear)
+                        .background(r % 2 == 1 ? Color.lapis.card.opacity(0.45) : Color.clear)
                         .textSelection(.enabled)
                     }
                 } header: {
@@ -334,11 +334,11 @@ struct SQLTable: View {
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(set.columns[c].name)
                                     .docFont(.caption, weight: .semibold)
-                                    .foregroundStyle(Theme.text)
+                                    .foregroundStyle(Color.lapis.ink)
                                 if let t = set.columns[c].type, !t.isEmpty {
                                     Text(t)
                                         .docFont(.caption2, design: .monospaced)
-                                        .foregroundStyle(Theme.secondary)
+                                        .foregroundStyle(Color.lapis.ink3)
                                 }
                             }
                             .lineLimit(1)
@@ -347,14 +347,14 @@ struct SQLTable: View {
                             .frame(width: w[c], alignment: .leading)
                         }
                     }
-                    .background(Theme.surface2)
-                    .overlay(alignment: .bottom) { Rectangle().fill(Theme.hairline).frame(height: 1) }
+                    .background(Color.lapis.card2)
+                    .overlay(alignment: .bottom) { Rectangle().fill(Color.lapis.line).frame(height: 1) }
                 }
             }
         }
         .frame(maxHeight: 360)
         .fixedSize(horizontal: false, vertical: true)
-        .background(Theme.surface.opacity(0.4), in: .rect(cornerRadius: 8, style: .continuous))
+        .background(Color.lapis.card.opacity(0.4), in: .rect(cornerRadius: 8, style: .continuous))
         .accessibilityLabel("Result: \(set.columns.count) columns, \(SQLStatus.rows(set.rows.count))")
         .accessibilityIdentifier("sql.table")
     }
@@ -373,29 +373,29 @@ struct SQLTrustSheet: View {
             if let who = prompt.lastEditedBy {
                 Text("Last edited by \(who). Run it on this Mac?")
                     .font(.subheadline)
-                    .foregroundStyle(Theme.secondary)
+                    .foregroundStyle(Color.lapis.ink3)
                     .accessibilityIdentifier("sql.trust.question")
             }
             if prompt.writes {
                 Label("This source allows writes: \(prompt.source.name) can change data.", systemImage: "exclamationmark.triangle.fill")
                     .font(.subheadline)
-                    .foregroundStyle(Theme.amber)
+                    .foregroundStyle(Color.lapis.yellow)
                     .accessibilityIdentifier("sql.trust.writes")
             }
             ScrollView([.vertical, .horizontal]) {
                 Text(prompt.code)
                     .font(.system(.footnote, design: .monospaced))
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                     .textSelection(.enabled)
                     .fixedSize()
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(minHeight: 100, maxHeight: 360)
-            .background(Theme.surface2, in: .rect(cornerRadius: 10, style: .continuous))
+            .background(Color.lapis.card2, in: .rect(cornerRadius: 10, style: .continuous))
             Text("It runs on \(prompt.source.name) (\(prompt.source.kind.label), \(prompt.source.summary)) with the credentials saved on this Mac.")
                 .font(.caption)
-                .foregroundStyle(Theme.secondary)
+                .foregroundStyle(Color.lapis.ink3)
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) {
@@ -407,7 +407,7 @@ struct SQLTrustSheet: View {
                 Button("Run") { SQLTrustFlow.runPressed(store, state, prompt) { dismiss() } }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
-                    .tint(prompt.writes ? Theme.amber : Theme.accent)
+                    .tint(prompt.writes ? Color.lapis.yellow : Color.lapis.accent)
                     .accessibilityIdentifier("sql.trust.run")
             }
         }

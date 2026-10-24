@@ -56,15 +56,15 @@ private struct RunnableCodeCard: View {
             codeArea(s)
             if needsTryLine(s) { tryLine(s) }
             if let err = s.saveError {
-                Text(err).font(.caption).foregroundStyle(Theme.rose).padding(.horizontal, 14).padding(.bottom, 8)
+                Text(err).font(.caption).foregroundStyle(Color.lapis.red).padding(.horizontal, 14).padding(.bottom, 8)
             }
             if s.hasOutput {
-                Rectangle().fill(Theme.hairline).frame(height: 1)
+                Rectangle().fill(Color.lapis.line).frame(height: 1)
                 RunOutputView(state: s, compiledOnly: compiledOnly(s))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card(Theme.surface2)
+        .card(Color.lapis.card2)
         .sheet(item: TrustFlow.presentation(store, s)) { p in
             TrustSheet(prompt: p, store: store, state: s)
         }
@@ -82,11 +82,11 @@ private struct RunnableCodeCard: View {
         HStack(spacing: 10) {
             Text(language)
                 .docFont(.caption, weight: .medium)
-                .foregroundStyle(Theme.secondary)
+                .foregroundStyle(Color.lapis.ink3)
             if let cwd = attributes["cwd"], !cwd.isEmpty {
                 Text("in \(cwd)")
                     .docFont(.caption2)
-                    .foregroundStyle(Theme.secondary.opacity(0.8))
+                    .foregroundStyle(Color.lapis.ink3.opacity(0.8))
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
@@ -94,7 +94,7 @@ private struct RunnableCodeCard: View {
             if s.practice == nil, let who = store.writtenBy(context) {
                 Text("written by \(who)")
                     .docFont(.caption2)
-                    .foregroundStyle(Theme.secondary.opacity(0.8))
+                    .foregroundStyle(Color.lapis.ink3.opacity(0.8))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help("The last change to this code was by \(who)")
@@ -132,13 +132,13 @@ private struct RunnableCodeCard: View {
             Button(role: .destructive) { store.stop(s) } label: {
                 Label("Stop", systemImage: "stop.fill")
             }
-            .tint(Theme.rose)
+            .tint(Color.lapis.red)
             .accessibilityIdentifier("code.stop")
         } else {
             Button { run(s) } label: {
                 Label("Run", systemImage: "play.fill")
             }
-            .tint(Theme.accentActive)
+            .tint(Color.lapis.accent)
             // ⌘↩ runs the block whose try line or practice text has focus
             .keyboardShortcut(focus != nil ? KeyboardShortcut(.return, modifiers: .command) : nil)
             .help("Run on this Mac (⌘↩ while editing it)")
@@ -150,7 +150,7 @@ private struct RunnableCodeCard: View {
         if s.practice != nil {
             TextEditor(text: Binding(get: { s.practice ?? code }, set: { s.practice = PlainTyping.straighten(old: s.practice ?? code, new: $0) }))
                 .docFont(.footnote, design: .monospaced)
-                .foregroundStyle(Theme.text)
+                .foregroundStyle(Color.lapis.ink)
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
                 .scrollContentBackground(.hidden)
@@ -163,7 +163,7 @@ private struct RunnableCodeCard: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(code)
                     .docFont(.footnote, design: .monospaced)
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                     .textSelection(.enabled)
                     .fixedSize()
                     .padding(14)
@@ -176,7 +176,7 @@ private struct RunnableCodeCard: View {
         HStack(spacing: 6) {
             Text("try")
                 .docFont(.caption2, weight: .medium)
-                .foregroundStyle(Theme.secondary)
+                .foregroundStyle(Color.lapis.ink3)
             TextField(tryPlaceholder(s), text: Binding(get: { s.tryLine }, set: { s.tryLine = PlainTyping.straighten(old: s.tryLine, new: $0) }))
                 .docFont(.footnote, design: .monospaced)
                 .textFieldStyle(.plain)
@@ -188,7 +188,7 @@ private struct RunnableCodeCard: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(Theme.surface.opacity(0.6), in: .rect(cornerRadius: 8, style: .continuous))
+        .background(Color.lapis.card.opacity(0.6), in: .rect(cornerRadius: 8, style: .continuous))
         .padding(.horizontal, 14)
         .padding(.bottom, 12)
     }
@@ -238,7 +238,7 @@ private struct RunOutputView: View {
             if tail.dropped {
                 Text("\u{2026} earlier output not shown")
                     .docFont(.caption2)
-                    .foregroundStyle(Theme.secondary)
+                    .foregroundStyle(Color.lapis.ink3)
             }
             if !tail.chunks.isEmpty {
                 ScrollView(.vertical) {
@@ -253,7 +253,7 @@ private struct RunOutputView: View {
             if state.log.truncated {
                 Text(OutputLog.truncatedMarker)
                     .docFont(.caption2)
-                    .foregroundStyle(Theme.amber)
+                    .foregroundStyle(Color.lapis.yellow)
             }
         }
         .padding(14)
@@ -264,7 +264,7 @@ private struct RunOutputView: View {
         var out = AttributedString()
         for c in chunks {
             var a = AttributedString(c.text)
-            a.foregroundColor = c.stream == .stderr ? Theme.rose : Theme.text
+            a.foregroundColor = c.stream == .stderr ? Color.lapis.red : Color.lapis.ink
             out += a
         }
         return out
@@ -280,12 +280,12 @@ private struct RunOutputView: View {
                 }
             }
             .docFont(.caption)
-            .foregroundStyle(Theme.secondary)
+            .foregroundStyle(Color.lapis.ink3)
         } else if let r = state.result {
             let line = RunStatus.line(r, compiledOnly: compiledOnly)
             Text(line.text)
                 .docFont(.caption, weight: .medium)
-                .foregroundStyle(line.ok ? Theme.green : Theme.rose)
+                .foregroundStyle(line.ok ? Color.lapis.green : Color.lapis.red)
                 .monospacedDigit()
                 .accessibilityIdentifier("code.status")
         }
@@ -304,22 +304,22 @@ struct TrustSheet: View {
                 .font(.headline)
             Text("Last edited by \(prompt.lastEditedBy). Run it on this Mac?")
                 .font(.subheadline)
-                .foregroundStyle(Theme.secondary)
+                .foregroundStyle(Color.lapis.ink3)
                 .accessibilityIdentifier("code.trust.question")
             ScrollView([.vertical, .horizontal]) {
                 Text(prompt.code)
                     .font(.system(.footnote, design: .monospaced))
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                     .textSelection(.enabled)
                     .fixedSize()
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(minHeight: 120, maxHeight: 420)
-            .background(Theme.surface2, in: .rect(cornerRadius: 10, style: .continuous))
+            .background(Color.lapis.card2, in: .rect(cornerRadius: 10, style: .continuous))
             Text("It runs \(prompt.request.cwd.map { "in \($0) " } ?? "")as you, with your login environment, including any tokens or keys in it.")
                 .font(.caption)
-                .foregroundStyle(Theme.secondary)
+                .foregroundStyle(Color.lapis.ink3)
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) { TrustFlow.cancelPressed(store, state) { dismiss() } }
@@ -328,7 +328,7 @@ struct TrustSheet: View {
                 Button("Run") { TrustFlow.runPressed(store, state, prompt) { dismiss() } }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
-                    .tint(Theme.accent)
+                    .tint(Color.lapis.accent)
                     .accessibilityIdentifier("code.trust.run")
             }
         }

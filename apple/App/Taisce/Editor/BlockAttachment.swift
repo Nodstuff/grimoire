@@ -240,7 +240,7 @@ struct SourceEditorSheet: View {
                 }
                 CodeTextEditor(text: $text)
                     .padding(.horizontal, 12)
-                    .background(Theme.surface2)
+                    .background(Color.lapis.card2)
             }
             .navigationTitle("Block source")
             .navigationBarTitleDisplayMode(.inline)
@@ -264,7 +264,7 @@ struct SourceEditorSheet: View {
         }
         // a swipe down with changes doesn't drop them: Cancel asks
         .interactiveDismissDisabled(edited)
-        .tint(Theme.accent)
+        .tint(Color.lapis.accent)
     }
 
     private func note(_ text: String, @ViewBuilder actions: () -> some View) -> some View {
@@ -274,6 +274,6 @@ struct SourceEditorSheet: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.amber.opacity(0.12))
+        .background(Color.lapis.yellow.opacity(0.12))
     }
 }

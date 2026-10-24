@@ -61,14 +61,14 @@ struct TodayContent: View {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 6) {
-                        Text(dayLine).font(.caption).foregroundStyle(Theme.secondary)
+                        Text(dayLine).font(.caption).foregroundStyle(Color.lapis.ink3)
                         Spacer()
                         SyncChip(badge: badge)
                         CircleIconButton(systemImage: "gearshape", label: "Settings", action: onSettings)
                     }
                     Text("Today")
-                        .font(Theme.serif(.largeTitle))
-                        .foregroundStyle(Theme.text)
+                        .lapisFont(.display)
+                        .foregroundStyle(Color.lapis.ink)
                         .accessibilityAddTraits(.isHeader)
                         .padding(.bottom, 10)
                     SearchFieldButton(action: onSearch)
@@ -76,10 +76,10 @@ struct TodayContent: View {
                 dueSection
                 pinnedSection
             }
-            .padding(.horizontal, Theme.gutter)
+            .padding(.horizontal, Lapis.Layout.gutter)
             .padding(.top, 4)
             .padding(.bottom, 32)
-            .frame(maxWidth: Theme.readingWidth)
+            .frame(maxWidth: Lapis.Layout.readingWidth)
             .frame(maxWidth: .infinity)
         }
         .groundBackground()
@@ -92,8 +92,8 @@ struct TodayContent: View {
                 Button(action: onAllTodos) {
                     Text("All to-dos")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(Theme.accentActive)
-                    .frame(minHeight: Theme.minTarget)
+                    .foregroundStyle(Color.lapis.accent)
+                    .frame(minHeight: Lapis.Layout.minTarget)
                     .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
@@ -109,7 +109,7 @@ struct TodayContent: View {
                             .accessibilityAction(named: "Open To-dos", onAllTodos)
                     }
                     if due.count > Self.dueLimit {
-                        Text("\(due.count - Self.dueLimit) more in To-dos").font(.footnote).foregroundStyle(Theme.secondary).padding(.horizontal, 4)
+                        Text("\(due.count - Self.dueLimit) more in To-dos").font(.footnote).foregroundStyle(Color.lapis.ink3).padding(.horizontal, 4)
                     }
                 }
             } else {

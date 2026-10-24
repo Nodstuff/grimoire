@@ -14,7 +14,7 @@ struct DataSourcesScreen: View {
             Section {
                 if store.sources.isEmpty {
                     Text("None yet. Add one, then a ```sql db=<name>``` block runs on it.")
-                        .foregroundStyle(Theme.secondary)
+                        .foregroundStyle(Color.lapis.ink3)
                 }
                 ForEach(store.sources) { s in
                     Button {
@@ -23,10 +23,10 @@ struct DataSourcesScreen: View {
                     } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(s.name).font(.body.monospaced()).foregroundStyle(Theme.text)
+                                Text(s.name).font(.body.monospaced()).foregroundStyle(Color.lapis.ink)
                                 Text("\(s.kind.label) · \(s.summary)")
                                     .font(.caption)
-                                    .foregroundStyle(Theme.secondary)
+                                    .foregroundStyle(Color.lapis.ink3)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                             }
@@ -34,9 +34,9 @@ struct DataSourcesScreen: View {
                             if s.allowWrites {
                                 Text("writes allowed")
                                     .font(.caption2.weight(.medium))
-                                    .foregroundStyle(Theme.amber)
+                                    .foregroundStyle(Color.lapis.yellow)
                             }
-                            Image(systemName: "chevron.right").font(.caption).foregroundStyle(Theme.secondary)
+                            Image(systemName: "chevron.right").font(.caption).foregroundStyle(Color.lapis.ink3)
                         }
                         .contentShape(.rect)
                     }
@@ -51,10 +51,10 @@ struct DataSourcesScreen: View {
             } footer: {
                 Text("Kept on this Mac only: never synced or sent to your server. Passwords are in the Keychain. Without Allow writes, the database itself refuses changes.")
             }
-            .listRowBackground(Theme.surface)
+            .listRowBackground(Color.lapis.card)
             if let err = store.loadError {
-                Section { Text(err).font(.footnote).foregroundStyle(Theme.rose) }
-                    .listRowBackground(Theme.surface)
+                Section { Text(err).font(.footnote).foregroundStyle(Color.lapis.red) }
+                    .listRowBackground(Color.lapis.card)
             }
         }
         .groundBackground()
@@ -106,7 +106,7 @@ struct DataSourceEditor: View {
                 .pickerStyle(.segmented)
                 .accessibilityIdentifier("datasource.kind")
             }
-            .listRowBackground(Theme.surface)
+            .listRowBackground(Color.lapis.card)
 
             Section {
                 switch draft.kind {
@@ -141,11 +141,11 @@ struct DataSourceEditor: View {
             } footer: {
                 if let w = draft.transportWarning {
                     Label(w, systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(Theme.amber)
+                        .foregroundStyle(Color.lapis.yellow)
                         .accessibilityIdentifier("datasource.transportWarning")
                 }
             }
-            .listRowBackground(Theme.surface)
+            .listRowBackground(Color.lapis.card)
 
             Section {
                 Toggle("Allow writes", isOn: $draft.allowWrites)
@@ -153,7 +153,7 @@ struct DataSourceEditor: View {
             } footer: {
                 Text(writesFooter)
             }
-            .listRowBackground(Theme.surface)
+            .listRowBackground(Color.lapis.card)
 
             Section {
                 Button(testing ? "Testing\u{2026}" : "Test connection") { test() }
@@ -162,23 +162,23 @@ struct DataSourceEditor: View {
                 if let r = testResult {
                     Text(r.text)
                         .font(.footnote)
-                        .foregroundStyle(r.ok ? Theme.green : Theme.rose)
+                        .foregroundStyle(r.ok ? Color.lapis.green : Color.lapis.red)
                         .textSelection(.enabled)
                         .accessibilityIdentifier("datasource.testResult")
                 }
             }
-            .listRowBackground(Theme.surface)
+            .listRowBackground(Color.lapis.card)
 
             if let error {
-                Section { Text(error).font(.footnote).foregroundStyle(Theme.rose) }
-                    .listRowBackground(Theme.surface)
+                Section { Text(error).font(.footnote).foregroundStyle(Color.lapis.red) }
+                    .listRowBackground(Color.lapis.card)
             }
 
             if !isNew {
                 Section {
                     Button("Delete this data source", role: .destructive) { confirmDelete = true }
                 }
-                .listRowBackground(Theme.surface)
+                .listRowBackground(Color.lapis.card)
             }
         }
         .groundBackground()

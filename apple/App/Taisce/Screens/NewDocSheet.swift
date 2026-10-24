@@ -18,16 +18,16 @@ struct NewDocSheet: View {
             List {
                 Section {
                     TextField("Title", text: $title)
-                        .font(Theme.serif(.title3))
+                        .lapisFont(.docHeading2)
                         .focused($titleFocused)
                         .submitLabel(.done)
                         .onSubmit { Task { await create() } }
                         .accessibilityIdentifier("newdoc.title")
                     if let error {
-                        Text(error).font(.caption).foregroundStyle(Theme.rose)
+                        Text(error).font(.caption).foregroundStyle(Color.lapis.red)
                     }
                 }
-                .listRowBackground(Theme.surface)
+                .listRowBackground(Color.lapis.card)
                 Section {
                     if model.currentAccess.canCreate {
                         folderRow(nil, title: "Top level", crumb: nil)
@@ -38,7 +38,7 @@ struct NewDocSheet: View {
                 } header: {
                     Text("Put it in")
                 }
-                .listRowBackground(Theme.surface)
+                .listRowBackground(Color.lapis.card)
             }
             .listStyle(.insetGrouped)
             .groundBackground()
@@ -75,17 +75,17 @@ struct NewDocSheet: View {
     func folderRow(_ id: DocID?, title: String, crumb: String?) -> some View {
         Button { parent = id } label: {
             HStack(spacing: 12) {
-                Image(systemName: id == nil ? "tray" : "folder").foregroundStyle(Theme.accent).frame(width: 24).accessibilityHidden(true)
+                Image(systemName: id == nil ? "tray" : "folder").foregroundStyle(Color.lapis.accent).frame(width: 24).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(title).font(.subheadline).foregroundStyle(Theme.text)
-                    if let crumb { Text(crumb).font(.caption2).foregroundStyle(Theme.secondary).lineLimit(1) }
+                    Text(title).font(.subheadline).foregroundStyle(Color.lapis.ink)
+                    if let crumb { Text(crumb).font(.caption2).foregroundStyle(Color.lapis.ink3).lineLimit(1) }
                 }
                 Spacer()
                 if parent == id {
-                    Image(systemName: "checkmark").foregroundStyle(Theme.accent).accessibilityHidden(true)
+                    Image(systemName: "checkmark").foregroundStyle(Color.lapis.accent).accessibilityHidden(true)
                 }
             }
-            .frame(minHeight: Theme.minTarget)
+            .frame(minHeight: Lapis.Layout.minTarget)
             .contentShape(.rect)
         }
         .buttonStyle(.plain)

@@ -31,20 +31,41 @@ enum SurfaceLook {
         return UIFont(descriptor: d, size: scale == 1 ? 0 : d.pointSize * scale)
     }
 
+    /// A line's font before inline marks: Newsreader for text, headings
+    /// 1-3 and quotes (Lapis: docs read in Newsreader); SF for level 4+.
     static func baseFont(_ style: Surface.LineStyle, traits: UITraitCollection?) -> UIFont {
-        switch style {
-        case .paragraph, .item, .raw: return font(.body, traits: traits)
-        case let .heading(l):
-            switch l {
-            case 1: return font(.title2, serif: true, bold: true, traits: traits)
-            case 2: return font(.title3, serif: true, bold: true, traits: traits)
-            case 3: return font(.headline, serif: true, bold: true, traits: traits)
-            default: return font(.subheadline, bold: true, traits: traits)
-            }
-        case .quote: return font(.body, serif: true, traits: traits)
-        }
+        font(style, marks: [], traits: traits)
     }
 
+    /// A line's font with its inline marks applied.
+    static func font(_ style: Surface.LineStyle, marks: InlineMarks, traits: UITraitCollection?) -> UIFont {
+        let lapis: LapisTextStyle?
+        var italic = false
+        switch style {
+        case .paragraph, .item, .raw: lapis = .docBody
+        case .quote: lapis = .docBody; italic = true
+        case let .heading(l):
+            switch l {
+            case 1: lapis = .docHeading1
+            case 2: lapis = .docHeading2
+            case 3: lapis = .docHeading3
+            default: lapis = nil
+            }
+        }
+        guard let lapis else {
+            return font(font(.subheadline, bold: true, traits: traits), marks: marks)
+        }
+        let base = lapis.serif.weight
+        if marks.contains(.code) {
+            let size = lapis.uiFont(traits: traits).pointSize * 0.85
+            return UIFont.monospacedSystemFont(ofSize: size, weight: marks.contains(.bold) ? .semibold : .regular)
+        }
+        let weight: UIFont.Weight = marks.contains(.bold) ? (base.rawValue >= UIFont.Weight.semibold.rawValue ? .bold : .semibold) : base
+        if marks.contains(.italic) { italic.toggle() }
+        return lapis.uiFont(traits: traits, weight: weight, italic: italic)
+    }
+
+    /// Inline marks on a system font (headings past level 3).
     static func font(_ base: UIFont, marks: InlineMarks) -> UIFont {
         if marks.contains(.code) {
             return UIFont.monospacedSystemFont(ofSize: base.pointSize * 0.9, weight: marks.contains(.bold) ? .semibold : .regular)
@@ -58,7 +79,8 @@ enum SurfaceLook {
 
     static func paragraphStyle(_ style: Surface.LineStyle, first: Bool, last: Bool) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
-        p.lineSpacing = 3
+        // Newsreader reads at ~1.55 leading (the web's prose)
+        p.lineSpacing = 5
         p.baseWritingDirection = .natural
         switch style {
         case .paragraph:
@@ -98,28 +120,27 @@ enum SurfaceLook {
     /// Display attributes for a run with these model attributes.
     static func display(_ a: [NSAttributedString.Key: Any], style: Surface.LineStyle, ctx: Context) -> [NSAttributedString.Key: Any] {
         let marks = InlineMarks(rawValue: (a[Surface.marks] as? Int) ?? 0)
-        let base = baseFont(style, traits: ctx.traits)
         let checked = style.prefix?.checkbox == true
         var out: [NSAttributedString.Key: Any] = [
-            .font: font(base, marks: marks),
-            .foregroundColor: style == .quote || checked ? UIColor(Theme.secondary) : UIColor(Theme.text),
+            .font: font(style, marks: marks, traits: ctx.traits),
+            .foregroundColor: checked ? UIColor.lapis.ink3 : style == .quote ? UIColor.lapis.ink2 : UIColor.lapis.ink,
         ]
         if a[Surface.marker] != nil {
-            out[.font] = base
-            out[.foregroundColor] = UIColor(style.prefix?.checkbox == true ? Theme.green : Theme.secondary)
+            out[.font] = baseFont(style, traits: ctx.traits)
+            out[.foregroundColor] = style.prefix?.checkbox == true ? UIColor.lapis.green : UIColor.lapis.ink3
             return out
         }
-        if marks.contains(.code) { out[.backgroundColor] = UIColor(Theme.surface2) }
+        if marks.contains(.code) { out[.backgroundColor] = UIColor.lapis.code }
         if marks.contains(.strike) || checked { out[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
         let link = a[Surface.link] as? String
         let wiki = a[Surface.wiki] as? String
         if link != nil {
-            out[.foregroundColor] = UIColor(Theme.accentActive)
+            out[.foregroundColor] = UIColor.lapis.accent
             out[.underlineStyle] = NSUnderlineStyle.single.rawValue
         }
         if wiki != nil {
-            out[.foregroundColor] = UIColor(Theme.accentActive)
-            out[.backgroundColor] = UIColor(Theme.accent).withAlphaComponent(0.14)
+            out[.foregroundColor] = UIColor.lapis.accent
+            out[.backgroundColor] = UIColor.lapis.accentSoft
         }
         // read-only text follows links on a tap; the editable surface
         // places the caret (⌘-click and the edit menu follow them)

@@ -31,8 +31,8 @@ struct LinkCommentsScreen: View {
             } else if shares.isEmpty {
                 Text("No comments from shared links yet.")
                     .font(.footnote)
-                    .foregroundStyle(Theme.secondary)
-                    .listRowBackground(Theme.surface)
+                    .foregroundStyle(Color.lapis.ink3)
+                    .listRowBackground(Color.lapis.card)
             }
             ForEach(shares) { share in
                 Section {
@@ -42,14 +42,14 @@ struct LinkCommentsScreen: View {
                             onReply: { replyingTo = ReplyTarget(share: share, root: thread.root); replyFocused = true },
                             onDelete: { deleting = ($0, share) }
                         )
-                        .listRowBackground(Theme.surface)
+                        .listRowBackground(Color.lapis.card)
                     }
                 } header: {
                     Text(header(share))
                 }
             }
             if let error {
-                Text(error).font(.footnote).foregroundStyle(Theme.rose).listRowBackground(Theme.surface)
+                Text(error).font(.footnote).foregroundStyle(Color.lapis.red).listRowBackground(Color.lapis.card)
             }
         }
         .scrollContentBackground(.hidden)
@@ -84,7 +84,7 @@ struct LinkCommentsScreen: View {
     private func replyBar(_ target: ReplyTarget) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Replying to \(target.root.author)").font(.caption).foregroundStyle(Theme.secondary)
+                Text("Replying to \(target.root.author)").font(.caption).foregroundStyle(Color.lapis.ink3)
                 Spacer()
                 Button("Cancel") { replyingTo = nil; draft = "" }.font(.caption)
             }
@@ -104,7 +104,7 @@ struct LinkCommentsScreen: View {
             }
         }
         .padding(12)
-        .background(Theme.surface)
+        .background(Color.lapis.card)
     }
 
     private func load() async {
@@ -159,7 +159,7 @@ struct ThreadView: View {
             ForEach(thread.replies) { reply in
                 CommentView(comment: reply, onDelete: { onDelete(reply) })
                     .padding(.leading, 18)
-                    .overlay(alignment: .leading) { Rectangle().fill(Theme.hairline).frame(width: 2) }
+                    .overlay(alignment: .leading) { Rectangle().fill(Color.lapis.line).frame(width: 2) }
             }
             Button("Reply", systemImage: "arrowshape.turn.up.left", action: onReply)
                 .font(.caption)
@@ -180,33 +180,33 @@ struct CommentView: View {
             HStack(spacing: 6) {
                 Text(comment.author.isEmpty ? "Someone" : comment.author)
                     .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                 if comment.isOwner {
-                    Text("You").font(.caption2.weight(.semibold)).foregroundStyle(Theme.accent)
-                        .padding(.horizontal, 5).background(Theme.accent.opacity(0.15), in: Capsule())
+                    Text("You").font(.caption2.weight(.semibold)).foregroundStyle(Color.lapis.accent)
+                        .padding(.horizontal, 5).background(Color.lapis.accent.opacity(0.15), in: Capsule())
                 }
                 if let at = comment.createdAt {
-                    Text(RelativeTime.string(at, now: now)).font(.caption2).foregroundStyle(Theme.secondary)
+                    Text(RelativeTime.string(at, now: now)).font(.caption2).foregroundStyle(Color.lapis.ink3)
                 }
                 Spacer()
                 Menu {
                     Button("Delete\u{2026}", systemImage: "trash", role: .destructive, action: onDelete)
                 } label: {
-                    Image(systemName: "ellipsis").foregroundStyle(Theme.secondary).frame(width: 28, height: 28)
+                    Image(systemName: "ellipsis").foregroundStyle(Color.lapis.ink3).frame(width: 28, height: 28)
                 }
                 .accessibilityLabel("Comment actions")
             }
             if let quote = comment.anchor?.quote, !quote.isEmpty {
                 Text(quote)
                     .font(.footnote.italic())
-                    .foregroundStyle(Theme.secondary)
+                    .foregroundStyle(Color.lapis.ink3)
                     .lineLimit(4)
                     .padding(.leading, 8)
-                    .overlay(alignment: .leading) { Rectangle().fill(Theme.accent.opacity(0.6)).frame(width: 2) }
+                    .overlay(alignment: .leading) { Rectangle().fill(Color.lapis.accent.opacity(0.6)).frame(width: 2) }
             }
             Text(comment.body)
                 .font(.body)
-                .foregroundStyle(Theme.text)
+                .foregroundStyle(Color.lapis.ink)
                 .textSelection(.enabled)
         }
         .contextMenu {

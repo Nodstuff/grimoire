@@ -2,16 +2,17 @@ import SwiftUI
 import TaisceKit
 
 extension Color {
-    /// A workspace's stored colour: a Theme token (adapts to light/dark),
+    /// A workspace's stored colour: a token name mapped to a Lapis workspace
+    /// colour (adapts to light/dark),
     /// else a fixed `#rrggbb`; nil for anything else.
     init?(workspaceColor stored: String?) {
         switch WorkspacePalette.token(stored) {
-        case "accent": self = Theme.accent
-        case "green": self = Theme.green
-        case "amber": self = Theme.amber
-        case "rose": self = Theme.rose
-        case "accentActive": self = Theme.accentActive
-        case "secondary": self = Theme.secondary
+        case "accent": self = Lapis.Token.ws1.color
+        case "green": self = Lapis.Token.ws2.color
+        case "amber": self = Lapis.Token.ws3.color
+        case "rose": self = Lapis.Token.ws6.color
+        case "accentActive": self = Lapis.Token.ws5.color
+        case "secondary": self = Color.lapis.ink3
         default:
             guard let hex = stored, hex.hasPrefix("#"), hex.count == 7, let v = UInt32(hex.dropFirst(), radix: 16) else { return nil }
             self.init(red: Double((v >> 16) & 0xff) / 255, green: Double((v >> 8) & 0xff) / 255, blue: Double(v & 0xff) / 255)
@@ -25,7 +26,7 @@ struct WorkspaceDot: View {
 
     var body: some View {
         Circle()
-            .fill(Color(workspaceColor: color) ?? Theme.secondary)
+            .fill(Color(workspaceColor: color) ?? Color.lapis.ink3)
             .frame(width: size, height: size)
             .accessibilityHidden(true)
     }
@@ -38,7 +39,7 @@ struct WorkspaceSharedGlyph: View {
     var body: some View {
         Image(systemName: Self.symbol)
             .font(.caption2)
-            .foregroundStyle(Theme.secondary)
+            .foregroundStyle(Color.lapis.ink3)
             .accessibilityHidden(true)
     }
 }
@@ -73,14 +74,14 @@ struct WorkspaceSwitcher: View {
             } label: {
                 HStack(spacing: 6) {
                     WorkspaceDot(color: picker.color(current))
-                    Text(picker.name(current)).font(.caption.weight(.semibold)).foregroundStyle(Theme.text)
+                    Text(picker.name(current)).font(.caption.weight(.semibold)).foregroundStyle(Color.lapis.ink)
                     if picker.isShared(current) { WorkspaceSharedGlyph() }
-                    Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(Theme.secondary)
+                    Image(systemName: "chevron.down").font(.caption2.weight(.semibold)).foregroundStyle(Color.lapis.ink3)
                 }
                 .padding(.horizontal, 12)
                 .frame(minHeight: 30)
-                .background(Theme.surface2, in: .capsule)
-                .frame(minHeight: Theme.minTarget)
+                .background(Color.lapis.card2, in: .capsule)
+                .frame(minHeight: Lapis.Layout.minTarget)
                 .contentShape(.rect)
             }
             .accessibilityLabel("Workspace: \(picker.accessibilityName(current))")
@@ -136,14 +137,14 @@ struct WorkspaceBar: View {
                 if showsTriage {
                     Button("Select") { selecting = true }
                         .font(.caption.weight(.medium))
-                        .foregroundStyle(Theme.accentActive)
-                        .frame(minHeight: Theme.minTarget)
+                        .foregroundStyle(Color.lapis.accent)
+                        .frame(minHeight: Lapis.Layout.minTarget)
                 }
             }
-            .padding(.horizontal, Theme.gutter)
-            .frame(maxWidth: Theme.readingWidth)
+            .padding(.horizontal, Lapis.Layout.gutter)
+            .frame(maxWidth: Lapis.Layout.readingWidth)
             .frame(maxWidth: .infinity)
-            .background(Theme.ground)
+            .background(Color.lapis.bg)
             .sheet(isPresented: $creating) { NewWorkspaceSheet() }
             .sheet(isPresented: $selecting) { UnsortedTriageSheet() }
             .sheet(isPresented: $managing) { ManageWorkspacesSheet() }
@@ -169,7 +170,7 @@ struct NewWorkspaceSheet: View {
                         ForEach(WorkspacePalette.colors, id: \.self) { c in
                             Button { color = c } label: {
                                 WorkspaceDot(color: c, size: 26)
-                                    .overlay(Circle().stroke(Theme.text, lineWidth: color == c ? 2 : 0).padding(-3))
+                                    .overlay(Circle().stroke(Color.lapis.ink, lineWidth: color == c ? 2 : 0).padding(-3))
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel(WorkspacePalette.name(c))
@@ -179,7 +180,7 @@ struct NewWorkspaceSheet: View {
                     .padding(.vertical, 6)
                 }
                 if let error {
-                    Text(error).font(.footnote).foregroundStyle(Theme.rose)
+                    Text(error).font(.footnote).foregroundStyle(Color.lapis.red)
                 }
             }
             .navigationTitle("New workspace")
@@ -236,11 +237,11 @@ struct MoveToWorkspaceSheet: View {
         } label: {
             HStack(spacing: 10) {
                 WorkspaceDot(color: picker.color(scope), size: 10)
-                Text(picker.name(scope)).foregroundStyle(Theme.text)
+                Text(picker.name(scope)).foregroundStyle(Color.lapis.ink)
                 if picker.isShared(scope) { WorkspaceSharedGlyph() }
                 Spacer()
                 if docIDs.count == 1, model.index.byID[docIDs[0]].map({ WorkspaceScope($0.workspaceID) == scope }) ?? false {
-                    Image(systemName: "checkmark").foregroundStyle(Theme.accent)
+                    Image(systemName: "checkmark").foregroundStyle(Color.lapis.accent)
                 }
             }
         }
@@ -259,9 +260,9 @@ struct UnsortedTriageSheet: View {
         NavigationStack {
             List(model.unsortedDocs, selection: $selection) { doc in
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(doc.title).font(.subheadline).foregroundStyle(Theme.text)
+                    Text(doc.title).font(.subheadline).foregroundStyle(Color.lapis.ink)
                     if let crumb = model.index.breadcrumb(of: doc.id) {
-                        Text(crumb).font(.caption2).foregroundStyle(Theme.secondary).lineLimit(1)
+                        Text(crumb).font(.caption2).foregroundStyle(Color.lapis.ink3).lineLimit(1)
                     }
                 }
             }
@@ -297,7 +298,7 @@ struct ManageWorkspacesSheet: View {
         NavigationStack {
             List {
                 if let error {
-                    Text(error).font(.footnote).foregroundStyle(Theme.rose)
+                    Text(error).font(.footnote).foregroundStyle(Color.lapis.red)
                 }
                 if !sharedWithYou.isEmpty {
                     Section("Shared with you") {
@@ -359,8 +360,8 @@ struct SharedWorkspaceRow: View {
         HStack(spacing: 10) {
             WorkspaceDot(color: workspace.color, size: 12)
             VStack(alignment: .leading, spacing: 2) {
-                Text(workspace.label).foregroundStyle(Theme.text)
-                Text(subtitle).font(.caption).foregroundStyle(Theme.secondary)
+                Text(workspace.label).foregroundStyle(Color.lapis.ink)
+                Text(subtitle).font(.caption).foregroundStyle(Color.lapis.ink3)
             }
             Spacer()
             WorkspaceSharedGlyph()
@@ -390,16 +391,16 @@ struct ManageWorkspaceRow: View {
                         let t = name.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !t.isEmpty, t != workspace.name { onRename(t) } else { name = workspace.name }
                     }
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                 Text(workspace.docCount == 1 ? "1 doc" : "\(workspace.docCount) docs")
-                    .font(.caption).foregroundStyle(Theme.secondary)
+                    .font(.caption).foregroundStyle(Color.lapis.ink3)
             }
             HStack(spacing: 12) {
                 ForEach(WorkspacePalette.colors, id: \.self) { c in
                     Button { onColor(c) } label: {
                         WorkspaceDot(color: c, size: 22)
-                            .overlay(Circle().stroke(Theme.text, lineWidth: WorkspacePalette.token(workspace.color) == c ? 2 : 0).padding(-3))
-                            .frame(width: 32, height: Theme.minTarget)
+                            .overlay(Circle().stroke(Color.lapis.ink, lineWidth: WorkspacePalette.token(workspace.color) == c ? 2 : 0).padding(-3))
+                            .frame(width: 32, height: Lapis.Layout.minTarget)
                             .contentShape(.rect)
                     }
                     .buttonStyle(.borderless)
@@ -411,20 +412,20 @@ struct ManageWorkspaceRow: View {
                     Button("Delete", systemImage: "trash", role: .destructive, action: onAskDelete)
                         .labelStyle(.iconOnly)
                         .buttonStyle(.borderless)
-                        .frame(minWidth: Theme.minTarget, minHeight: Theme.minTarget)
+                        .frame(minWidth: Lapis.Layout.minTarget, minHeight: Lapis.Layout.minTarget)
                         .accessibilityLabel("Delete \(workspace.name)")
                 }
             }
             if confirming {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(WorkspaceManagement.deletePrompt(workspace)).font(.footnote).foregroundStyle(Theme.text)
+                    Text(WorkspaceManagement.deletePrompt(workspace)).font(.footnote).foregroundStyle(Color.lapis.ink)
                     HStack {
                         Button("Delete", role: .destructive, action: onDelete).buttonStyle(.bordered)
                         Button("Cancel", action: onCancelDelete).buttonStyle(.borderless)
                     }
                 }
                 .padding(10)
-                .background(Theme.surface2, in: .rect(cornerRadius: 10, style: .continuous))
+                .background(Color.lapis.card2, in: .rect(cornerRadius: 10, style: .continuous))
             }
         }
         .padding(.vertical, 4)
@@ -440,12 +441,12 @@ struct WorkspaceChip: View {
     var body: some View {
         HStack(spacing: 5) {
             WorkspaceDot(color: badge.color, size: 7)
-            Text(badge.name).font(.caption2.weight(.medium)).foregroundStyle(Theme.secondary)
+            Text(badge.name).font(.caption2.weight(.medium)).foregroundStyle(Color.lapis.ink3)
             if badge.shared { WorkspaceSharedGlyph() }
         }
         .padding(.horizontal, 8)
         .frame(minHeight: 22)
-        .background(Theme.surface2, in: .capsule)
+        .background(Color.lapis.card2, in: .capsule)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Workspace: \(badge.accessibilityName)")
     }
@@ -486,8 +487,8 @@ struct WorkspaceEmptyView: View {
                     ScreenHeader(title: "Library") { EmptyView() }
                     EmptyCard(icon: "folder", title: state.title, hint: state.hint)
                 }
-                .padding(.horizontal, Theme.gutter)
-                .frame(maxWidth: Theme.readingWidth)
+                .padding(.horizontal, Lapis.Layout.gutter)
+                .frame(maxWidth: Lapis.Layout.readingWidth)
                 .frame(maxWidth: .infinity)
             }
         }

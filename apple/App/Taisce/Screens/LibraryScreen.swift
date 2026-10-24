@@ -82,7 +82,7 @@ struct LibraryContent: View {
                         menu(node)
                     }
                     .padding(6)
-                    .background(Theme.surface, in: .rect(cornerRadius: 12, style: .continuous))
+                    .background(Color.lapis.card, in: .rect(cornerRadius: 12, style: .continuous))
                 }
             }
             .padding(.horizontal, 16)
@@ -91,10 +91,10 @@ struct LibraryContent: View {
         // drags near the top or bottom edge scroll it
         .treeScrolling(scroller)
         // reading width on iPad, centred on the ground
-        .frame(maxWidth: Theme.readingWidth)
+        .frame(maxWidth: Lapis.Layout.readingWidth)
         .frame(maxWidth: .infinity)
-        .background(Theme.ground.ignoresSafeArea())
-        .tint(Theme.accent)
+        .background(Color.lapis.bg.ignoresSafeArea())
+        .tint(Color.lapis.accent)
         .groundBackground()
         .toolbarVisibility(.hidden, for: .navigationBar)
         .onAppear {

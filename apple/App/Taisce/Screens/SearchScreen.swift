@@ -67,7 +67,7 @@ struct SearchContent: View {
                         chips(state)
                         Text(state.offline ? "Offline · searched the docs on this device" : "Matches by word · searched on the server")
                             .font(.caption2)
-                            .foregroundStyle(state.offline ? Theme.amber : Theme.secondary)
+                            .foregroundStyle(state.offline ? Color.lapis.yellow : Color.lapis.ink3)
                     }
                     LazyVStack(spacing: 10) {
                         ForEach(state.filtered(by: tag)) { r in
@@ -83,10 +83,10 @@ struct SearchContent: View {
                     EmptyCard(icon: "text.magnifyingglass", title: "Search your library", hint: "Titles and text across every doc. Works offline over the docs on this device.")
                 }
             }
-            .padding(.horizontal, Theme.gutter)
+            .padding(.horizontal, Lapis.Layout.gutter)
             .padding(.top, 8)
             .padding(.bottom, 32)
-            .frame(maxWidth: Theme.readingWidth)
+            .frame(maxWidth: Lapis.Layout.readingWidth)
             .frame(maxWidth: .infinity)
         }
         .scrollDismissesKeyboard(.interactively)
@@ -98,17 +98,17 @@ struct SearchContent: View {
     private var field: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(Theme.secondary).accessibilityHidden(true)
+                Image(systemName: "magnifyingglass").foregroundStyle(Color.lapis.ink3).accessibilityHidden(true)
                 TextField("Search your library", text: $query)
                     .focused($focused)
                     .submitLabel(.search)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                 if !query.isEmpty {
                     Button { query = "" } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(Theme.secondary)
-                            .frame(width: Theme.minTarget, height: Theme.minTarget)
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(Color.lapis.ink3)
+                            .frame(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Clear search")
@@ -116,8 +116,8 @@ struct SearchContent: View {
             }
             .font(.subheadline)
             .padding(.leading, 12)
-            .frame(minHeight: Theme.minTarget)
-            .background(Theme.surface2, in: .rect(cornerRadius: 12, style: .continuous))
+            .frame(minHeight: Lapis.Layout.minTarget)
+            .background(Color.lapis.card2, in: .rect(cornerRadius: 12, style: .continuous))
         }
     }
 
@@ -146,10 +146,10 @@ struct SearchResultCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             if let crumb = result.breadcrumb {
-                Text(crumb).font(.caption2).foregroundStyle(Theme.secondary).lineLimit(1)
+                Text(crumb).font(.caption2).foregroundStyle(Color.lapis.ink3).lineLimit(1)
             }
-            Text(result.title).font(Theme.serif(.headline)).foregroundStyle(Theme.text)
-            Text(highlighted).font(.footnote).foregroundStyle(Theme.secondary).lineLimit(3)
+            Text(result.title).lapisFont(.cardTitle).foregroundStyle(Color.lapis.ink)
+            Text(highlighted).font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(3)
             if !result.tags.isEmpty {
                 HStack(spacing: 6) { ForEach(result.tags.prefix(3), id: \.self) { TagChip(tag: $0) } }.padding(.top, 2)
             }
@@ -158,7 +158,7 @@ struct SearchResultCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .card()
         .hoverWash()
-        .contentShape(.rect(cornerRadius: Theme.radius))
+        .contentShape(.rect(cornerRadius: Lapis.Radius.card))
         .accessibilityElement(children: .combine)
     }
 
@@ -166,8 +166,8 @@ struct SearchResultCard: View {
         var s = AttributedString(result.snippet)
         for r in SearchState.matches(in: result.snippet, query: query) {
             guard let lo = AttributedString.Index(r.lowerBound, within: s), let hi = AttributedString.Index(r.upperBound, within: s) else { continue }
-            s[lo..<hi].backgroundColor = Theme.accent.opacity(0.30)
-            s[lo..<hi].foregroundColor = Theme.text
+            s[lo..<hi].backgroundColor = Color.lapis.accent.opacity(0.30)
+            s[lo..<hi].foregroundColor = Color.lapis.ink
         }
         return s
     }

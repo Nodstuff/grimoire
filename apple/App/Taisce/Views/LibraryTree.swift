@@ -35,7 +35,7 @@ struct DocTreeHover: Equatable {
 enum DocTreeStyle {
     case sidebar, library
 
-    var rowHeight: CGFloat { self == .sidebar ? 30 : Theme.minTarget }
+    var rowHeight: CGFloat { self == .sidebar ? 30 : Lapis.Layout.minTarget }
     var indent: CGFloat { self == .sidebar ? 14 : 18 }
 }
 
@@ -195,10 +195,10 @@ struct LibraryTree<Menu: View>: View {
                         if bottomTargeted {
                             Text("Move to the top level")
                                 .font(.caption.weight(.medium))
-                                .foregroundStyle(Theme.accent)
+                                .foregroundStyle(Color.lapis.accent)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 4)
-                                .background(Theme.surface2, in: .capsule)
+                                .background(Color.lapis.card2, in: .capsule)
                                 .padding(.top, 6)
                                 .allowsHitTesting(false)
                         }
@@ -323,21 +323,21 @@ private struct DocTreeRow: View {
             chevron
             Image(systemName: node.isFolder ? (line.isOpen ? "folder.fill" : "folder") : "doc.text")
                 .font(style == .sidebar ? .body : .subheadline)
-                .foregroundStyle(node.isFolder ? Theme.accent : Theme.secondary)
+                .foregroundStyle(node.isFolder ? Color.lapis.accent : Color.lapis.ink3)
                 .frame(width: 22)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 1) {
                 Text(node.doc.title)
                     .font(style == .sidebar ? .body : .subheadline)
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                     .lineLimit(style == .sidebar ? 1 : 2)
                 if style == .library, let sub = node.subtitle {
-                    Text(sub).font(.caption2).foregroundStyle(Theme.secondary).lineLimit(1)
+                    Text(sub).font(.caption2).foregroundStyle(Color.lapis.ink3).lineLimit(1)
                 }
             }
             Spacer(minLength: 0)
             if pinned {
-                Image(systemName: "pin.fill").font(.caption2).foregroundStyle(Theme.accent).accessibilityHidden(true)
+                Image(systemName: "pin.fill").font(.caption2).foregroundStyle(Color.lapis.accent).accessibilityHidden(true)
             }
         }
         .padding(.leading, lead + 4)
@@ -381,7 +381,7 @@ private struct DocTreeRow: View {
         if node.isFolder {
             Image(systemName: "chevron.right")
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(Theme.secondary)
+                .foregroundStyle(Color.lapis.ink3)
                 .rotationEffect(.degrees(line.isOpen ? 90 : 0))
                 .frame(width: 16, height: style.rowHeight)
                 .accessibilityHidden(true)
@@ -395,24 +395,24 @@ private struct DocTreeRow: View {
             .fill(fill)
             .overlay {
                 if hover == .into {
-                    RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(Theme.accent, lineWidth: 2)
+                    RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(Color.lapis.accent, lineWidth: 2)
                 }
             }
             .padding(.leading, lead)
     }
 
     private var fill: Color {
-        if hover == .into { return Theme.accent.opacity(0.22) }
-        if selected { return Theme.accent.opacity(0.16) }
-        if pointer { return Theme.text.opacity(0.06) }
+        if hover == .into { return Color.lapis.accent.opacity(0.22) }
+        if selected { return Color.lapis.accent.opacity(0.16) }
+        if pointer { return Color.lapis.ink.opacity(0.06) }
         return .clear
     }
 
     /// Where the doc will go beside this row: a line at its indent.
     private var insertionLine: some View {
         HStack(spacing: 0) {
-            Circle().strokeBorder(Theme.accent, lineWidth: 2).frame(width: 8, height: 8)
-            Rectangle().fill(Theme.accent).frame(height: 2)
+            Circle().strokeBorder(Color.lapis.accent, lineWidth: 2).frame(width: 8, height: 8)
+            Rectangle().fill(Color.lapis.accent).frame(height: 2)
         }
         .padding(.leading, lead + 20)
         .offset(y: hover == .before ? -4 : 4)
@@ -432,11 +432,11 @@ private struct EmptyFolderLine: View {
     var body: some View {
         Text(targeted ? "Drop it in here" : "Empty \u{2014} drag docs here")
             .font(.caption)
-            .foregroundStyle(targeted ? Theme.accent : Theme.secondary)
+            .foregroundStyle(targeted ? Color.lapis.accent : Color.lapis.ink3)
             .padding(.leading, CGFloat(depth) * style.indent + 4 + 16 + 6)
             .frame(maxWidth: .infinity, minHeight: style.rowHeight * 0.8, alignment: .leading)
             .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(targeted ? Theme.accent.opacity(0.12) : .clear)
+                .fill(targeted ? Color.lapis.accent.opacity(0.12) : .clear)
                 .padding(.leading, CGFloat(depth) * style.indent))
             .contentShape(.rect)
             .modifier(EmptyFolderDrop(folder: folder, mover: mover, targeted: $targeted, onDropped: onDropped))
@@ -497,10 +497,10 @@ private struct DragSource: ViewModifier {
             } preview: {
                 Label(title, systemImage: isFolder ? "folder" : "doc.text")
                     .font(.body)
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
-                    .background(Theme.surface, in: .rect(cornerRadius: 8, style: .continuous))
+                    .background(Color.lapis.card, in: .rect(cornerRadius: 8, style: .continuous))
             }
         } else {
             content

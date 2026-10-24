@@ -20,19 +20,19 @@ struct MigrationBlockedView: View {
         VStack(spacing: 16) {
             Image(systemName: "shippingbox")
                 .font(.system(size: 40))
-                .foregroundStyle(Theme.accent)
+                .foregroundStyle(Color.lapis.accent)
             Text("Moving your data")
                 .font(.title2.weight(.semibold))
-                .foregroundStyle(Theme.text)
+                .foregroundStyle(Color.lapis.ink)
             Text(reason)
                 .font(.body)
-                .foregroundStyle(Theme.secondary)
+                .foregroundStyle(Color.lapis.ink3)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 420)
             if !conflicts.isEmpty {
                 Text("This Mac already has a copy here, and the old one has \(unsent).")
                     .font(.callout)
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 420)
                 Button("Use the copy already here (the old one stays untouched)") { resolve(true) }
@@ -44,7 +44,7 @@ struct MigrationBlockedView: View {
             }
             Button("Quit Taisce") { exit(0) }
                 .buttonStyle(.borderedProminent)
-                .tint(Theme.accent)
+                .tint(Color.lapis.accent)
                 .accessibilityIdentifier("migration.quit")
         }
         .padding(40)
@@ -81,7 +81,7 @@ struct RootView: View {
             }
         }
         .environment(router)
-        .tint(Theme.accent)
+        .tint(Color.lapis.accent)
         .sheet(isPresented: $router.showSettings) { SettingsScreen() }
         .sheet(isPresented: $router.showNewDoc) {
             NewDocSheet(parent: router.newDocParent).environment(router)
@@ -193,9 +193,9 @@ struct AccessNoticeBanner: View {
         Button(action: onDismiss) {
             Label(text, systemImage: "person.2.slash")
                 .font(.footnote.weight(.medium))
-                .foregroundStyle(Theme.text)
+                .foregroundStyle(Color.lapis.ink)
                 .padding(.horizontal, 16)
-                .frame(minHeight: Theme.minTarget)
+                .frame(minHeight: Lapis.Layout.minTarget)
                 .glassEffect(.regular, in: .capsule)
         }
         .buttonStyle(.plain)
@@ -320,7 +320,7 @@ struct PadSidebar: View {
                         SidebarWorkspaceRow().padding(.horizontal, 2)
                     }
                     HStack(spacing: 8) {
-                        Image(systemName: "magnifyingglass").foregroundStyle(Theme.secondary).accessibilityHidden(true)
+                        Image(systemName: "magnifyingglass").foregroundStyle(Color.lapis.ink3).accessibilityHidden(true)
                         TextField("Search", text: $router.searchQuery)
                             .focused($searchFocused)
                             .textInputAutocapitalization(.never)
@@ -330,7 +330,7 @@ struct PadSidebar: View {
                     }
                     .padding(.horizontal, 10)
                     .frame(minHeight: 34)
-                    .background(Theme.surface2, in: .rect(cornerRadius: 10, style: .continuous))
+                    .background(Color.lapis.card2, in: .rect(cornerRadius: 10, style: .continuous))
                     .padding(.vertical, 6)
                     .onChange(of: router.searchQuery) { _, q in
                         if !q.isEmpty, router.padItem != .search { router.select(.search) }
@@ -342,12 +342,12 @@ struct PadSidebar: View {
                     HStack {
                         Text("Library")
                             .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(Theme.secondary)
+                            .foregroundStyle(Color.lapis.ink3)
                             .accessibilityAddTraits(.isHeader)
                         Spacer()
                         if model.currentAccess.canCreate {
                             Button { router.newFolder(in: nil) } label: {
-                                Image(systemName: "folder.badge.plus").foregroundStyle(Theme.secondary)
+                                Image(systemName: "folder.badge.plus").foregroundStyle(Color.lapis.ink3)
                                     .frame(width: 30, height: 30).contentShape(.rect)
                             }
                             .buttonStyle(.plain)
@@ -399,12 +399,12 @@ struct PadSidebar: View {
                 Spacer()
                 // no pull to refresh with a pointer
                 Button { Task { try? await model.sync?.catchUp() } } label: {
-                    Image(systemName: "arrow.clockwise").frame(width: Theme.minTarget, height: Theme.minTarget)
+                    Image(systemName: "arrow.clockwise").frame(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget)
                 }
                 .accessibilityLabel("Refresh")
                 .help("Refresh (⌘R)")
                 Button { router.showSettings = true } label: {
-                    Image(systemName: "gearshape").frame(width: Theme.minTarget, height: Theme.minTarget)
+                    Image(systemName: "gearshape").frame(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget)
                 }
                 .accessibilityLabel("Settings")
                 .help("Settings (⌘,)")
@@ -497,17 +497,17 @@ private struct SidebarItem: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: systemImage).foregroundStyle(Theme.accent).frame(width: 22).accessibilityHidden(true)
-            Text(title).foregroundStyle(Theme.text)
+            Image(systemName: systemImage).foregroundStyle(Color.lapis.accent).frame(width: 22).accessibilityHidden(true)
+            Text(title).foregroundStyle(Color.lapis.ink)
             Spacer(minLength: 0)
             if badge > 0 {
-                Text("\(badge)").font(.caption.weight(.semibold)).foregroundStyle(Theme.secondary)
+                Text("\(badge)").font(.caption.weight(.semibold)).foregroundStyle(Color.lapis.ink3)
             }
         }
         .padding(.horizontal, 8)
         .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
-            .fill(selected ? Theme.accent.opacity(0.16) : pointer ? Theme.text.opacity(0.06) : .clear))
+            .fill(selected ? Color.lapis.accent.opacity(0.16) : pointer ? Color.lapis.ink.opacity(0.06) : .clear))
         .contentShape(.rect)
         .onHover { pointer = $0 }
         .onTapGesture(perform: action)
@@ -523,12 +523,13 @@ struct LaunchView: View {
     var body: some View {
         VStack(spacing: 16) {
             Text("Taisce")
-                .font(.system(size: 40, weight: .semibold, design: .serif))
-                .foregroundStyle(Theme.text)
-            ProgressView().tint(Theme.secondary)
+                .font(.newsreader(40, weight: .medium))
+                .tracking(-0.8)
+                .foregroundStyle(Color.lapis.ink)
+            ProgressView().tint(Color.lapis.ink3)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.ground.ignoresSafeArea())
+        .background(Color.lapis.bg.ignoresSafeArea())
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Taisce, connecting")
     }

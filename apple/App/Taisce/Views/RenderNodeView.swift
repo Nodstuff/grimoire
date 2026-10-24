@@ -23,7 +23,7 @@ struct RenderNodeView: View {
         case let .heading(level, inline):
             Text(InlineMarkdown.attributed(inline))
                 .headingFont(level)
-                .foregroundStyle(Theme.text)
+                .foregroundStyle(Color.lapis.ink)
                 .padding(.top, level <= 2 ? 14 : 8)
                 .accessibilityAddTraits(.isHeader)
         case let .paragraph(inline):
@@ -45,29 +45,21 @@ struct RenderNodeView: View {
         case let .frontmatter(text):
             CodeBlockView(label: "properties", code: text)
         case .thematicBreak:
-            Rectangle().fill(Theme.hairline).frame(height: 1).padding(.vertical, 8)
+            Rectangle().fill(Color.lapis.line).frame(height: 1).padding(.vertical, 8)
         case let .html(raw):
-            Text(raw).docFont(.caption, design: .monospaced).foregroundStyle(Theme.secondary)
+            Text(raw).docFont(.caption, design: .monospaced).foregroundStyle(Color.lapis.ink3)
         }
     }
 
-    static func headingFont(_ level: Int) -> Font {
-        switch level {
-        case 1: Theme.serif(.title2)
-        case 2: Theme.serif(.title3)
-        case 3: Theme.serif(.headline)
-        default: .headline
-        }
-    }
 }
 
 extension View {
-    /// A heading's style at the doc's text size (`headingFont` at 1).
+    /// A heading's style at the doc's text size: Newsreader for 1-3.
     func headingFont(_ level: Int) -> some View {
         switch level {
-        case 1: AnyView(docFont(.title2, design: .serif, weight: .semibold))
-        case 2: AnyView(docFont(.title3, design: .serif, weight: .semibold))
-        case 3: AnyView(docFont(.headline, design: .serif, weight: .semibold))
+        case 1: AnyView(lapisFont(.docHeading1))
+        case 2: AnyView(lapisFont(.docHeading2))
+        case 3: AnyView(lapisFont(.docHeading3))
         default: AnyView(docFont(.headline, weight: .semibold))
         }
     }
@@ -93,10 +85,9 @@ private struct Paragraph: View {
 
     var body: some View {
         Text(InlineMarkdown.attributed(inline))
-            .docFont(.callout)
-            .lineSpacing(4)
-            .foregroundStyle(Theme.text)
-            .tint(Theme.accentActive)
+            .lapisFont(.docBody)
+            .foregroundStyle(Color.lapis.ink)
+            .tint(Color.lapis.accent)
             .frame(maxWidth: .infinity, alignment: .leading)
             .textSelection(.enabled)
     }
@@ -136,7 +127,7 @@ private struct ListBlock: View {
             } label: {
                 Image(systemName: checked ? "checkmark.square.fill" : "square")
                     .docFont(.body)
-                    .foregroundStyle(checked ? Theme.green : Theme.secondary)
+                    .foregroundStyle(checked ? Color.lapis.green : Color.lapis.ink3)
                     .frame(width: 28, height: 28)
                     .contentShape(.rect)
             }
@@ -146,9 +137,9 @@ private struct ListBlock: View {
             .accessibilityLabel(checked ? "Done" : "Not done")
             .accessibilityHint(toggle.action == nil ? "" : "Toggles this item")
         } else if ordered {
-            Text("\(start + i).").monospacedDigit().foregroundStyle(Theme.secondary).frame(minWidth: 20, alignment: .trailing)
+            Text("\(start + i).").monospacedDigit().foregroundStyle(Color.lapis.ink3).frame(minWidth: 20, alignment: .trailing)
         } else {
-            Circle().fill(Theme.secondary).frame(width: 5, height: 5).frame(width: 20).alignmentGuide(.firstTextBaseline) { $0[.bottom] + 5 }
+            Circle().fill(Color.lapis.ink3).frame(width: 5, height: 5).frame(width: 20).alignmentGuide(.firstTextBaseline) { $0[.bottom] + 5 }
         }
     }
 }
@@ -160,10 +151,10 @@ private struct QuoteView: View {
     var body: some View {
         NodeStack(nodes: children, checkboxBase: checkboxBase, spacing: 6)
             .italic()
-            .foregroundStyle(Theme.secondary)
+            .foregroundStyle(Color.lapis.ink3)
             .padding(.leading, 14)
             .overlay(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 1.5).fill(Theme.accent.opacity(0.5)).frame(width: 3)
+                RoundedRectangle(cornerRadius: 1.5).fill(Color.lapis.accent.opacity(0.5)).frame(width: 3)
             }
     }
 }
@@ -175,10 +166,10 @@ private struct CalloutView: View {
 
     var style: (icon: String, color: Color) {
         switch kind {
-        case "WARNING", "CAUTION", "DANGER": ("exclamationmark.triangle", Theme.rose)
-        case "TIP", "SUCCESS": ("lightbulb", Theme.green)
-        case "IMPORTANT", "TODO": ("exclamationmark.circle", Theme.amber)
-        default: ("info.circle", Theme.accent)
+        case "WARNING", "CAUTION", "DANGER": ("exclamationmark.triangle", Color.lapis.red)
+        case "TIP", "SUCCESS": ("lightbulb", Color.lapis.green)
+        case "IMPORTANT", "TODO": ("exclamationmark.circle", Color.lapis.yellow)
+        default: ("info.circle", Color.lapis.accent)
         }
     }
 
@@ -191,8 +182,8 @@ private struct CalloutView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(style.color.opacity(0.10), in: .rect(cornerRadius: Theme.radius, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous).strokeBorder(style.color.opacity(0.35)))
+        .background(style.color.opacity(0.10), in: .rect(cornerRadius: Lapis.Radius.card, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: Lapis.Radius.card, style: .continuous).strokeBorder(style.color.opacity(0.35)))
     }
 }
 
@@ -205,21 +196,21 @@ struct CodeBlockView: View {
             if let label, !label.isEmpty {
                 Text(label)
                     .docFont(.caption, weight: .medium)
-                    .foregroundStyle(Theme.secondary)
+                    .foregroundStyle(Color.lapis.ink3)
                     .padding(.horizontal, 14)
                     .padding(.top, 10)
             }
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(code)
                     .docFont(.footnote, design: .monospaced)
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                     .textSelection(.enabled)
                     .fixedSize()
                     .padding(14)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card(Theme.surface2)
+        .card(Color.lapis.card2)
         .accessibilityLabel("Code\(label.map { ", \($0)" } ?? ""): \(code)")
     }
 }
@@ -236,11 +227,11 @@ private struct TableBlock: View {
                     ForEach(0..<columns, id: \.self) { i in
                         cell(i < table.header.count ? table.header[i] : "", column: i)
                             .docFont(.subheadline, weight: .semibold)
-                            .background { Rectangle().fill(Theme.surface2) }
+                            .background { Rectangle().fill(Color.lapis.card2) }
                     }
                 }
                 ForEach(Array(table.rows.enumerated()), id: \.offset) { _, row in
-                    Rectangle().fill(Theme.hairline).frame(height: 1).gridCellUnsizedAxes(.horizontal)
+                    Rectangle().fill(Color.lapis.line).frame(height: 1).gridCellUnsizedAxes(.horizontal)
                     GridRow {
                         ForEach(0..<columns, id: \.self) { i in
                             cell(i < row.count ? row[i] : "", column: i).docFont(.subheadline)
@@ -249,14 +240,14 @@ private struct TableBlock: View {
                 }
             }
             .card()
-            .clipShape(.rect(cornerRadius: Theme.radius, style: .continuous))
+            .clipShape(.rect(cornerRadius: Lapis.Radius.card, style: .continuous))
         }
     }
 
     func cell(_ inline: String, column: Int) -> some View {
         Text(InlineMarkdown.attributed(inline))
-            .foregroundStyle(Theme.text)
-            .tint(Theme.accentActive)
+            .foregroundStyle(Color.lapis.ink)
+            .tint(Color.lapis.accent)
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
             .frame(maxWidth: .infinity, alignment: alignment(column))

@@ -74,7 +74,7 @@ private struct SurfaceNotes: View {
                     HStack(spacing: 12) {
                         Label(model.failedBlocks.count == 1 ? "1 block couldn't be saved" : "\(model.failedBlocks.count) blocks couldn't be saved",
                               systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(Theme.rose)
+                            .foregroundStyle(Color.lapis.red)
                         Spacer()
                         Button("Retry") { Task { await model.retryFailed() } }.accessibilityIdentifier("block.retry")
                         Button("Discard", role: .destructive) { Task { await model.discardFailed() } }.accessibilityIdentifier("block.discard")
@@ -82,8 +82,8 @@ private struct SurfaceNotes: View {
                 }
                 ForEach(conflicts, id: \.key) { id, c in
                     VStack(alignment: .leading, spacing: 4) {
-                        Label("Changed on another device while you edited", systemImage: "arrow.triangle.branch").foregroundStyle(Theme.rose)
-                        Text(c.theirs ?? "").foregroundStyle(Theme.secondary).lineLimit(2)
+                        Label("Changed on another device while you edited", systemImage: "arrow.triangle.branch").foregroundStyle(Color.lapis.red)
+                        Text(c.theirs ?? "").foregroundStyle(Color.lapis.ink3).lineLimit(2)
                             .accessibilityLabel("Their version: \(c.theirs ?? "")")
                         HStack(spacing: 16) {
                             Button("Keep mine") { Task { await model.keepMine(id) } }.accessibilityIdentifier("block.keepMine")
@@ -95,9 +95,9 @@ private struct SurfaceNotes: View {
             .font(.caption)
             .buttonStyle(.borderless)
             .padding(10)
-            .frame(maxWidth: Theme.readingWidth, alignment: .leading)
-            .background(Theme.rose.opacity(0.08), in: .rect(cornerRadius: 10, style: .continuous))
-            .padding(.horizontal, Theme.gutter)
+            .frame(maxWidth: Lapis.Layout.readingWidth, alignment: .leading)
+            .background(Color.lapis.red.opacity(0.08), in: .rect(cornerRadius: 10, style: .continuous))
+            .padding(.horizontal, Lapis.Layout.gutter)
             .padding(.vertical, 6)
         }
     }
@@ -134,20 +134,20 @@ private struct CompletionList: View {
             if completion.results.isEmpty {
                 Text("No doc matches “\(completion.query)”")
                     .font(.subheadline)
-                    .foregroundStyle(Theme.secondary)
+                    .foregroundStyle(Color.lapis.ink3)
                     .padding(12)
             }
             ForEach(Array(completion.results.prefix(5).enumerated()), id: \.element.id) { i, doc in
                 Button { onPick(doc) } label: {
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(doc.title).font(.subheadline.weight(.medium)).foregroundStyle(Theme.text).lineLimit(1)
+                        Text(doc.title).font(.subheadline.weight(.medium)).foregroundStyle(Color.lapis.ink).lineLimit(1)
                         if let crumb = doc.breadcrumb {
-                            Text(crumb).font(.caption2).foregroundStyle(Theme.secondary).lineLimit(1).truncationMode(.head)
+                            Text(crumb).font(.caption2).foregroundStyle(Color.lapis.ink3).lineLimit(1).truncationMode(.head)
                         }
                     }
                     .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
                     .padding(.horizontal, 12)
-                    .background(i == completion.selected ? Theme.accent.opacity(0.18) : .clear)
+                    .background(i == completion.selected ? Color.lapis.accent.opacity(0.18) : .clear)
                     .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
@@ -157,8 +157,8 @@ private struct CompletionList: View {
         }
         .padding(.vertical, 5)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(Theme.surface, in: .rect(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Theme.hairline))
+        .background(Color.lapis.card, in: .rect(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.lapis.line))
         .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Doc suggestions")
@@ -172,10 +172,10 @@ struct EditorChipView: View {
 
     var color: Color {
         switch chip.tone {
-        case .saved: Theme.green
-        case .busy: Theme.accent
-        case .offline, .review: Theme.amber
-        case .conflict, .failed: Theme.rose
+        case .saved: Color.lapis.green
+        case .busy: Color.lapis.accent
+        case .offline, .review: Color.lapis.yellow
+        case .conflict, .failed: Color.lapis.red
         }
     }
 

@@ -75,13 +75,13 @@ struct RenderedDiagramBlock: View {
                     .frame(maxWidth: image.size.width)
                     .padding(12)
                     .frame(maxWidth: .infinity)
-                    .card(Theme.surface)
+                    .card(Color.lapis.card)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Diagram")
             .accessibilityHint("Opens full screen")
         case let .failed(message):
-            DiagramNoticeCard(icon: "exclamationmark.triangle", title: "\(kind == .reladraw ? "Reladraw" : "Mermaid") diagram couldn't render", detail: message, tint: Theme.amber)
+            DiagramNoticeCard(icon: "exclamationmark.triangle", title: "\(kind == .reladraw ? "Reladraw" : "Mermaid") diagram couldn't render", detail: message, tint: Color.lapis.yellow)
         }
     }
 }
@@ -92,15 +92,15 @@ struct Shimmer: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
-            .fill(Theme.surface2)
+        RoundedRectangle(cornerRadius: Lapis.Radius.card, style: .continuous)
+            .fill(Color.lapis.card2)
             .overlay {
-                LinearGradient(colors: [.clear, Theme.hairline.opacity(0.9), .clear], startPoint: .leading, endPoint: .trailing)
+                LinearGradient(colors: [.clear, Color.lapis.line.opacity(0.9), .clear], startPoint: .leading, endPoint: .trailing)
                     .offset(x: lit ? 260 : -260)
-                    .clipShape(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: Lapis.Radius.card, style: .continuous))
                     .opacity(reduceMotion ? 0 : 1)
             }
-            .overlay(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous).strokeBorder(Theme.hairline, lineWidth: 1))
+            .overlay(RoundedRectangle(cornerRadius: Lapis.Radius.card, style: .continuous).strokeBorder(Color.lapis.line, lineWidth: 1))
             .onAppear {
                 guard !reduceMotion else { return }
                 withAnimation(.linear(duration: 1.3).repeatForever(autoreverses: false)) { lit = true }
@@ -117,7 +117,7 @@ struct DiagramFullScreen: View {
         NavigationStack {
             ZoomableImage(image: image)
                 .ignoresSafeArea(edges: .bottom)
-                .background(Theme.ground.ignoresSafeArea())
+                .background(Color.lapis.bg.ignoresSafeArea())
                 .navigationTitle("Diagram")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {

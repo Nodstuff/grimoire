@@ -18,6 +18,9 @@ struct UserSettings {
     var workspaceKey: String { "workspace-\(suffix)" }
     /// `LibraryContent`'s `@AppStorage` (doc ids; not per server)
     static let libraryExpandedKey = "library.expanded"
+    /// Settings › Appearance (`LapisAppearance`): the device's, not the
+    /// person's, so it is not in `keys` and survives sign-out
+    static let appearanceKey = "appearance"
 
     /// runnable code blocks: the docs you said yes to running on this device
     /// (go/shell and SQL apart)

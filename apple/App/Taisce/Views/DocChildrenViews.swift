@@ -43,22 +43,22 @@ struct ChildDocCard: View {
         HStack(spacing: 12) {
             Image(systemName: childCount > 0 ? "folder" : "doc.text")
                 .font(.subheadline)
-                .foregroundStyle(childCount > 0 ? Theme.accent : Theme.secondary)
+                .foregroundStyle(childCount > 0 ? Color.lapis.accent : Color.lapis.ink3)
                 .frame(width: 22)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
-                Text(doc.title).font(Theme.serif(.headline)).foregroundStyle(Theme.text).lineLimit(2)
+                Text(doc.title).lapisFont(.cardTitle).foregroundStyle(Color.lapis.ink).lineLimit(2)
                 if let sub = doc.subtitle(now: now) {
-                    Text(sub).font(.caption2).foregroundStyle(Theme.secondary).lineLimit(1)
+                    Text(sub).font(.caption2).foregroundStyle(Color.lapis.ink3).lineLimit(1)
                 }
             }
             Spacer(minLength: 0)
-            Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(Theme.secondary)
+            Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(Color.lapis.ink3)
                 .accessibilityHidden(true)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .frame(minHeight: Theme.minTarget)
+        .frame(minHeight: Lapis.Layout.minTarget)
         .contentShape(.rect)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)
@@ -85,8 +85,8 @@ struct DocChildrenList: View {
                     Button(action: onNewDocHere) {
                         Label("New doc here", systemImage: "plus")
                             .font(.subheadline.weight(.medium))
-                            .foregroundStyle(Theme.accentActive)
-                            .frame(minHeight: Theme.minTarget)
+                            .foregroundStyle(Color.lapis.accent)
+                            .frame(minHeight: Lapis.Layout.minTarget)
                     }
                     .buttonStyle(.plain)
                 }

@@ -113,13 +113,13 @@ private let c = Workspace(id: "wc", name: "Gamma", sortKey: "r", docCount: 0)
     }
 
     @Test func swatchesAreTokensThatFollowTheScheme() {
-        // stored as a token name, resolved to the Theme colour (light/dark pair)
+        // stored as a token name, resolved to a Lapis workspace colour (light/dark pair)
         #expect(WorkspacePalette.token("rose") == "rose")
-        #expect(Color(workspaceColor: "rose") == Theme.rose)
-        #expect(Color(workspaceColor: "accent") == Theme.accent)
+        #expect(Color(workspaceColor: "rose") == Lapis.Token.ws6.color)
+        #expect(Color(workspaceColor: "accent") == Lapis.Token.ws1.color)
         // an earlier build's dark-mode hex reads as its token, so it adapts too
         #expect(WorkspacePalette.token("#D98A94") == "rose")
-        #expect(Color(workspaceColor: "#d98a94") == Theme.rose)
+        #expect(Color(workspaceColor: "#d98a94") == Lapis.Token.ws6.color)
         // any other hex (another client) is a fixed colour; junk is nil
         #expect(WorkspacePalette.token("#123456") == nil && Color(workspaceColor: "#123456") != nil)
         #expect(Color(workspaceColor: "nope") == nil && Color(workspaceColor: nil) == nil)

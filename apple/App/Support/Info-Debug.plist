@@ -50,6 +50,11 @@
 	<array>
 		<string>remote-notification</string>
 	</array>
+	<key>UIAppFonts</key>
+	<array>
+		<string>Newsreader-VF.ttf</string>
+		<string>Newsreader-Italic-VF.ttf</string>
+	</array>
 	<key>TaisceAppLinkHosts</key>
 	<string>$(TAISCE_APP_LINK_HOST)</string>
 	<key>UTExportedTypeDeclarations</key>

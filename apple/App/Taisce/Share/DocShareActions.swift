@@ -76,7 +76,7 @@ struct DocShareActions: ViewModifier {
                     ToolbarItem(placement: .confirmationAction) { Button("Done") { showingLinkComments = false } }
                 }
         }
-        .tint(Theme.accent)
+        .tint(Color.lapis.accent)
     }
 
     /// Before a Share link or a PDF of the doc (its … menu, the Mac menu

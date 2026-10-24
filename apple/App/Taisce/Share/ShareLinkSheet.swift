@@ -18,7 +18,7 @@ struct ShareLinkSheet: View {
                     ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
                 }
         }
-        .tint(Theme.accent)
+        .tint(Color.lapis.accent)
     }
 }
 
@@ -53,14 +53,14 @@ struct ShareLinkForm: View {
         Form {
             if only == nil {
                 Section {
-                    Text(title).font(.headline).foregroundStyle(Theme.text)
+                    Text(title).font(.headline).foregroundStyle(Color.lapis.ink)
                 } footer: {
                     Text("Anyone with the link sees this doc as it is now: a snapshot, diagrams included. Later edits stay private until you update the link.")
                 }
-                .listRowBackground(Theme.surface)
+                .listRowBackground(Color.lapis.card)
             }
             if !loaded && shares.isEmpty {
-                Section { ProgressView().frame(maxWidth: .infinity) }.listRowBackground(Theme.surface)
+                Section { ProgressView().frame(maxWidth: .infinity) }.listRowBackground(Color.lapis.card)
             } else if only == nil && (live.isEmpty || newLink) {
                 createSection
             }
@@ -72,7 +72,7 @@ struct ShareLinkForm: View {
                     Button("New link\u{2026}", systemImage: "plus") { newLink = true }
                         .accessibilityIdentifier("share.newLink")
                 }
-                .listRowBackground(Theme.surface)
+                .listRowBackground(Color.lapis.card)
             }
             if !ended.isEmpty {
                 Section(only == nil ? "Revoked links" : "") {
@@ -84,26 +84,26 @@ struct ShareLinkForm: View {
                         }
                     }
                 }
-                .listRowBackground(Theme.surface)
+                .listRowBackground(Color.lapis.card)
             }
             if store.unsentEdits[docID] == true {
                 Section {
                     Label("Includes unsent edits: changes on this device that haven't reached the server yet.", systemImage: "arrow.up.circle")
                         .font(.footnote)
-                        .foregroundStyle(Theme.amber)
+                        .foregroundStyle(Color.lapis.yellow)
                         .accessibilityIdentifier("share.unsent")
                 }
-                .listRowBackground(Theme.surface)
+                .listRowBackground(Color.lapis.card)
             }
             if let problems = store.problems[docID], !problems.isEmpty {
                 Section("Not everything made it") {
-                    ForEach(problems, id: \.self) { Text($0).font(.footnote).foregroundStyle(Theme.amber) }
+                    ForEach(problems, id: \.self) { Text($0).font(.footnote).foregroundStyle(Color.lapis.yellow) }
                 }
-                .listRowBackground(Theme.surface)
+                .listRowBackground(Color.lapis.card)
             }
             if let error {
-                Section { Text(error).font(.footnote).foregroundStyle(Theme.rose) }
-                    .listRowBackground(Theme.surface)
+                Section { Text(error).font(.footnote).foregroundStyle(Color.lapis.red) }
+                    .listRowBackground(Color.lapis.card)
             }
         }
         .groundBackground()
@@ -157,7 +157,7 @@ struct ShareLinkForm: View {
         } footer: {
             Text("Diagrams and charts are drawn in your current appearance.")
         }
-        .listRowBackground(Theme.surface)
+        .listRowBackground(Color.lapis.card)
     }
 
     /// Linked images on other sites: ask before fetching any.
@@ -234,21 +234,21 @@ struct ShareLinkSection: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text(share.url)
                     .font(.footnote.monospaced())
-                    .foregroundStyle(Theme.text)
+                    .foregroundStyle(Color.lapis.ink)
                     .textSelection(.enabled)
                     .lineLimit(2)
                     .accessibilityIdentifier("share.url")
                 Text(ShareLinkText.state(share))
                     .font(.caption)
-                    .foregroundStyle(Theme.secondary)
+                    .foregroundStyle(Color.lapis.ink3)
                 Text(ShareLinkText.views(share))
                     .font(.caption)
-                    .foregroundStyle(Theme.secondary)
+                    .foregroundStyle(Color.lapis.ink3)
                     .accessibilityIdentifier("share.views")
                 if let updated = share.updatedAt ?? share.createdAt {
                     Text("Snapshot of \(updated.formatted(date: .abbreviated, time: .shortened))\(share.revision > 1 ? " · update \(share.revision - 1)" : "")")
                         .font(.caption)
-                        .foregroundStyle(Theme.secondary)
+                        .foregroundStyle(Color.lapis.ink3)
                 }
             }
             .padding(.vertical, 2)
@@ -302,7 +302,7 @@ struct ShareLinkSection: View {
             if share.state(now: now) == .expired {
                 Text("This link has expired: readers see that it's gone. Give it a new expiry to open it again.")
                     .font(.caption)
-                    .foregroundStyle(Theme.amber)
+                    .foregroundStyle(Color.lapis.yellow)
             }
             Button(role: .destructive) {
                 confirmRevoke = true
@@ -312,10 +312,10 @@ struct ShareLinkSection: View {
             .disabled(busy != nil)
             .accessibilityIdentifier("share.revoke")
             if let error {
-                Text(error).font(.footnote).foregroundStyle(Theme.rose)
+                Text(error).font(.footnote).foregroundStyle(Color.lapis.red)
             }
         }
-        .listRowBackground(Theme.surface)
+        .listRowBackground(Color.lapis.card)
         .onDisappear {
             current?.cancel()
             current = nil
@@ -378,10 +378,10 @@ struct EndedLinkRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(share.url).font(.caption.monospaced()).foregroundStyle(Theme.secondary).lineLimit(1).truncationMode(.middle)
+            Text(share.url).font(.caption.monospaced()).foregroundStyle(Color.lapis.ink3).lineLimit(1).truncationMode(.middle)
             Text("\(ShareLinkText.state(share)) · \(ShareLinkText.views(share))")
                 .font(.caption2)
-                .foregroundStyle(Theme.secondary)
+                .foregroundStyle(Color.lapis.ink3)
             if share.commentCount > 0 {
                 NavigationLink("Comments (\(share.commentCount))") { LinkCommentsScreen(docID: share.docID) }
                     .font(.caption)
@@ -412,7 +412,7 @@ struct UnreadText: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(text).foregroundStyle(Theme.secondary)
+            Text(text).foregroundStyle(Color.lapis.ink3)
             if unread > 0 { UnreadBadge(count: unread) }
         }
     }
@@ -425,10 +425,10 @@ struct UnreadBadge: View {
         Text("\(count)")
             .font(.caption2.weight(.bold))
             .monospacedDigit()
-            .foregroundStyle(Theme.ground)
+            .foregroundStyle(Color.lapis.onAccent)
             .padding(.horizontal, 6)
             .padding(.vertical, 1)
-            .background(Theme.accent, in: Capsule())
+            .background(Color.lapis.accent, in: Capsule())
             .accessibilityLabel("\(count) new")
     }
 }

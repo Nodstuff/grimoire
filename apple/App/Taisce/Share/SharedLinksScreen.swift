@@ -13,23 +13,23 @@ struct SharedLinksScreen: View {
         let ended = store.all.filter { $0.state() != .active }
         Form {
             if loading && store.all.isEmpty {
-                Section { ProgressView().frame(maxWidth: .infinity) }.listRowBackground(Theme.surface)
+                Section { ProgressView().frame(maxWidth: .infinity) }.listRowBackground(Color.lapis.card)
             } else if store.all.isEmpty {
                 Section {
                     Text("No shared links yet. Open a doc and choose Share link\u{2026} in its menu.")
                         .font(.footnote)
-                        .foregroundStyle(Theme.secondary)
+                        .foregroundStyle(Color.lapis.ink3)
                 }
-                .listRowBackground(Theme.surface)
+                .listRowBackground(Color.lapis.card)
             }
             if !live.isEmpty {
-                Section("Live") { ForEach(live) { row($0) } }.listRowBackground(Theme.surface)
+                Section("Live") { ForEach(live) { row($0) } }.listRowBackground(Color.lapis.card)
             }
             if !ended.isEmpty {
-                Section("Expired or revoked") { ForEach(ended) { row($0) } }.listRowBackground(Theme.surface)
+                Section("Expired or revoked") { ForEach(ended) { row($0) } }.listRowBackground(Color.lapis.card)
             }
             if let error {
-                Section { Text(error).font(.footnote).foregroundStyle(Theme.rose) }.listRowBackground(Theme.surface)
+                Section { Text(error).font(.footnote).foregroundStyle(Color.lapis.red) }.listRowBackground(Color.lapis.card)
             }
         }
         .groundBackground()
@@ -73,12 +73,12 @@ struct SharedLinkRow: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(title).foregroundStyle(Theme.text).lineLimit(1)
+                Text(title).foregroundStyle(Color.lapis.ink).lineLimit(1)
                 Text("\(ShareLinkText.state(share, now: now)) · \(ShareLinkText.views(share, now: now))")
                     .font(.caption)
-                    .foregroundStyle(share.state(now: now) == .active ? Theme.secondary : Theme.amber)
+                    .foregroundStyle(share.state(now: now) == .active ? Color.lapis.ink3 : Color.lapis.yellow)
                 if let c = ShareLinkText.comments(share) {
-                    Text(c).font(.caption).foregroundStyle(Theme.secondary)
+                    Text(c).font(.caption).foregroundStyle(Color.lapis.ink3)
                 }
             }
             Spacer()

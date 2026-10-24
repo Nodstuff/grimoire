@@ -92,7 +92,7 @@ final class AppShareVisualRenderer: ShareVisualRendering {
         let scheme: ColorScheme = v.theme == .dark ? .dark : .light
         let content = ChartModelView(model: model)
             .frame(width: CGFloat(width))
-            .background(Theme.ground)
+            .background(Color.lapis.bg)
             .environment(\.colorScheme, scheme)
         let renderer = ImageRenderer(content: content)
         renderer.scale = 2

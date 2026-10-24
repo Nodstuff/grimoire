@@ -29,32 +29,33 @@ struct SignInContent: View {
             Spacer()
             VStack(spacing: 12) {
                 Text("Taisce")
-                    .font(.system(size: 52, weight: .semibold, design: .serif))
-                    .foregroundStyle(Theme.text)
+                    .font(.newsreader(52, weight: .medium))
+                    .tracking(-1)
+                    .foregroundStyle(Color.lapis.ink)
                     .accessibilityAddTraits(.isHeader)
                 Text("Your library, on every device.")
                     .font(.title3)
-                    .foregroundStyle(Theme.secondary)
+                    .foregroundStyle(Color.lapis.ink3)
                     .multilineTextAlignment(.center)
             }
             Spacer()
             VStack(spacing: 16) {
                 if let error {
-                    Text(error).font(.footnote).foregroundStyle(Theme.rose).multilineTextAlignment(.center)
+                    Text(error).font(.footnote).foregroundStyle(Color.lapis.red).multilineTextAlignment(.center)
                 }
                 Button(action: onSignIn) {
                     HStack(spacing: 8) {
                         if signingIn {
-                            ProgressView().tint(Theme.ground)
+                            ProgressView().tint(Color.lapis.onAccent)
                         } else {
                             Image(systemName: "person.badge.key.fill")
                         }
                         Text("Sign in with passkey")
                     }
                     .font(.headline)
-                    .foregroundStyle(Theme.ground)
+                    .foregroundStyle(Color.lapis.onAccent)
                     .frame(maxWidth: .infinity, minHeight: 54)
-                    .background(Theme.accent, in: .rect(cornerRadius: Theme.radius, style: .continuous))
+                    .background(Color.lapis.accent, in: .rect(cornerRadius: Lapis.Radius.card, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .disabled(signingIn)
@@ -63,8 +64,8 @@ struct SignInContent: View {
                         Text(serverURL).font(.footnote.monospaced())
                         Image(systemName: "pencil").font(.footnote)
                     }
-                    .foregroundStyle(Theme.secondary)
-                    .frame(minHeight: Theme.minTarget)
+                    .foregroundStyle(Color.lapis.ink3)
+                    .frame(minHeight: Lapis.Layout.minTarget)
                     .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
@@ -72,10 +73,10 @@ struct SignInContent: View {
             }
             .frame(maxWidth: 420)
         }
-        .padding(.horizontal, Theme.gutter + 8)
+        .padding(.horizontal, Lapis.Layout.gutter + 8)
         .padding(.bottom, 24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.ground.ignoresSafeArea())
+        .background(Color.lapis.bg.ignoresSafeArea())
     }
 }
 

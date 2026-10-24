@@ -83,7 +83,7 @@ private struct FailingRenderer: DiagramRendering {
     }
 
     @Test func paletteStartsWithTheAccent() {
-        #expect(ChartPalette.colors(for: ["a", "b"]).first == Theme.accent)
+        #expect(ChartPalette.colors(for: ["a", "b"]).first == Color.lapis.accent)
         #expect(ChartPalette.colors(for: Array(repeating: "s", count: 10)).count == 10)
     }
 }

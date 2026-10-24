@@ -8,10 +8,16 @@ struct TaisceApp: App {
     private var model: AppModel { appDelegate.model }
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        LapisChrome.install()
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environment(model)
+                // Settings › Appearance (System / Light / Dark), per window
+                .lapisAppearance()
                 // a test host (hosted unit tests) never connects: tests make their own models
                 .task { if !AppPaths.isTestHost { await model.boot() } }
         }

@@ -96,6 +96,8 @@ targets:
         NSLocalNetworkUsageDescription: Taisce connects to your server on this network.
         # APNs: silent content-available pushes wake the app for one catch-up
         UIBackgroundModes: [remote-notification]
+        # Lapis type: Newsreader (OFL, Resources/Fonts), two variable fonts
+        UIAppFonts: [Newsreader-VF.ttf, Newsreader-Italic-VF.ttf]
         # a Library row being dragged (UTType.taisceDoc): not text, so a
         # drop on the editor or another app ignores it
         UTExportedTypeDeclarations:

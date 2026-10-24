@@ -14,15 +14,17 @@ extension DocPage {
 /// Series colors: the accent first, then hues that hold AA-ish contrast on
 /// the surface in both appearances (light values are the darker twins).
 enum ChartPalette {
+    /// Lapis: the accent first, then green, yellow, red, teal, violet,
+    /// orange, grey (each token a light/dark pair).
     static let colors: [Color] = [
-        Theme.accent,
-        Theme.green,
-        Theme.amber,
-        Theme.rose,
-        Color(dark: 0x7FC4C4, light: 0x2F7676),
-        Color(dark: 0xB79CD9, light: 0x6B4E9E),
-        Color(dark: 0xC9A27E, light: 0x7E5634),
-        Color(dark: 0xA3A3B0, light: 0x5E5E6C),
+        Color.lapis.accent,
+        Color.lapis.green,
+        Color.lapis.yellowMark,
+        Color.lapis.red,
+        Lapis.Token.ws5.color,
+        Color.lapis.agent,
+        Lapis.Token.ws3.color,
+        Color.lapis.ink3,
     ]
 
     static func colors(for series: [String]) -> [Color] {
@@ -51,7 +53,7 @@ struct ChartBlock: View {
             DiagramNoticeCard(
                 icon: "exclamationmark.triangle", title: "Chart spec isn't valid JSON",
                 detail: line.map { "Line \($0): \(message)" } ?? message,
-                code: excerpt, tint: Theme.amber
+                code: excerpt, tint: Color.lapis.yellow
             )
         }
     }
@@ -65,13 +67,13 @@ struct ChartModelView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let title = model.title {
-                Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(Theme.text)
+                Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(Color.lapis.ink)
             }
             chart
                 .frame(height: model.height)
         }
         .padding(14)
-        .card(Theme.surface)
+        .card(Color.lapis.card)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(model.summary)
     }
@@ -114,9 +116,9 @@ struct ChartModelView: View {
 
     @AxisContentBuilder func axis(_ which: Which) -> some AxisContent {
         AxisMarks { _ in
-            AxisGridLine().foregroundStyle(Theme.hairline)
-            AxisTick().foregroundStyle(Theme.hairline)
-            AxisValueLabel().foregroundStyle(Theme.secondary)
+            AxisGridLine().foregroundStyle(Color.lapis.line)
+            AxisTick().foregroundStyle(Color.lapis.line)
+            AxisValueLabel().foregroundStyle(Color.lapis.ink3)
         }
     }
 }
@@ -291,7 +293,7 @@ private extension ChartContent {
                 .accessibilityLabel([p.x?.text, s].compactMap { $0 }.joined(separator: ", "))
                 .accessibilityValue(p.y?.text ?? "")
         } else {
-            self.foregroundStyle(rule ? Theme.secondary : Theme.accent)
+            self.foregroundStyle(rule ? Color.lapis.ink3 : Color.lapis.accent)
                 .accessibilityLabel(p.x?.text ?? "")
                 .accessibilityValue(p.y?.text ?? "")
         }
@@ -312,7 +314,7 @@ struct DiagramNoticeCard: View {
     let title: String
     let detail: String
     var code: String?
-    var tint: Color = Theme.accent
+    var tint: Color = Color.lapis.accent
 
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
@@ -323,16 +325,16 @@ struct DiagramNoticeCard: View {
                 .background(tint.opacity(0.12), in: .rect(cornerRadius: 10, style: .continuous))
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.subheadline.weight(.medium)).foregroundStyle(Theme.text)
-                Text(detail).font(.footnote).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
+                Text(title).font(.subheadline.weight(.medium)).foregroundStyle(Color.lapis.ink)
+                Text(detail).font(.footnote).foregroundStyle(Color.lapis.ink3).fixedSize(horizontal: false, vertical: true)
                 if let code, !code.isEmpty {
-                    Text(code).font(Theme.mono).foregroundStyle(Theme.text).lineLimit(2).padding(.top, 2)
+                    Text(code).font(.lapisMono()).foregroundStyle(Color.lapis.ink).lineLimit(2).padding(.top, 2)
                 }
             }
             Spacer(minLength: 0)
         }
         .padding(14)
-        .card(Theme.surface2)
+        .card(Color.lapis.card2)
         .accessibilityElement(children: .combine)
     }
 }

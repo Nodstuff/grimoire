@@ -1,91 +1,54 @@
 import SwiftUI
 import UIKit
 
-/// The design tokens. Dark-first; the light values are the same roles
-/// inverted, and both follow the system appearance.
-enum Theme {
-    static let ground = Color(dark: 0x101014, light: 0xF6F6F8)
-    static let surface = Color(dark: 0x17171D, light: 0xFFFFFF)
-    static let surface2 = Color(dark: 0x1E1E26, light: 0xEDEDF2)
-    static let hairline = Color(dark: 0x26262F, light: 0xDCDCE3)
-    static let text = Color(dark: 0xD6D6DD, light: 0x1C1C22)
-    /// AA on `ground` in both appearances
-    static let secondary = Color(dark: 0x8F8F9E, light: 0x5E5E6C)
-    static let accent = Color(dark: 0x8B9DC3, light: 0x4A5E8E)
-    /// links and the active state
-    static let accentActive = Color(dark: 0xA9B7D6, light: 0x3A4E7C)
-    static let green = Color(dark: 0x95C99B, light: 0x3D7B47)
-    static let amber = Color(dark: 0xD9B47A, light: 0x96661C)
-    static let rose = Color(dark: 0xD98A94, light: 0xAE4757)
+// The surfaces every screen sits on. Tokens live in LapisColors.swift,
+// LapisType.swift and LapisMetrics.swift; the components in Components/.
 
-    static let radius: CGFloat = 14
-    static let gutter: CGFloat = 20
-    static let readingWidth: CGFloat = 680
-    static let minTarget: CGFloat = 44
-
-    /// New York for titles; everything else is SF Pro / SF Mono.
-    static func serif(_ style: Font.TextStyle, weight: Font.Weight = .semibold) -> Font {
-        .system(style, design: .serif).weight(weight)
-    }
-
-    static let mono = Font.system(.footnote, design: .monospaced)
-}
-
-extension Color {
-    init(dark: UInt32, light: UInt32) {
-        self.init(uiColor: UIColor { traits in
-            UIColor(rgb: traits.userInterfaceStyle == .light ? light : dark)
-        })
-    }
-}
-
-extension UIColor {
-    convenience init(rgb: UInt32) {
-        self.init(
-            red: CGFloat((rgb >> 16) & 0xFF) / 255,
-            green: CGFloat((rgb >> 8) & 0xFF) / 255,
-            blue: CGFloat(rgb & 0xFF) / 255,
-            alpha: 1
-        )
-    }
-}
-
-/// A rounded surface card with a hairline edge.
+/// A Lapis card: the card fill, a hairline edge, the soft card shadow.
 struct CardBackground: ViewModifier {
-    var fill: Color = Theme.surface
+    var fill: Color = Color.lapis.card
+    var radius: CGFloat = Lapis.Radius.card
+    var elevated = true
 
     func body(content: Content) -> some View {
         content
-            .background(fill, in: .rect(cornerRadius: Theme.radius, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: Theme.radius, style: .continuous).strokeBorder(Theme.hairline, lineWidth: 1))
+            .background {
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .fill(fill)
+                    .lapisShadow(elevated ? .card : .none)
+            }
+            .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(Color.lapis.line, lineWidth: 1))
     }
 }
 
 /// A faint wash under the pointer (Mac, iPad with a trackpad); touch never sees it.
 struct HoverWash: ViewModifier {
-    var radius: CGFloat = Theme.radius
+    var radius: CGFloat = Lapis.Radius.card
     @State private var hovering = false
 
     func body(content: Content) -> some View {
         content
             .overlay {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
-                    .fill(Theme.text.opacity(hovering ? 0.05 : 0))
+                    .fill(Color.lapis.ink.opacity(hovering ? 0.045 : 0))
                     .allowsHitTesting(false)
             }
             .onHover { hovering = $0 }
-            .animation(.easeOut(duration: 0.12), value: hovering)
+            .animation(Lapis.Motion.fast, value: hovering)
     }
 }
 
 extension View {
-    func card(_ fill: Color = Theme.surface) -> some View { modifier(CardBackground(fill: fill)) }
+    /// A Lapis card (`fill` defaults to `card`; pass `card2` for an inset one).
+    func card(_ fill: Color = Color.lapis.card, radius: CGFloat = Lapis.Radius.card, elevated: Bool = true) -> some View {
+        modifier(CardBackground(fill: fill, radius: radius, elevated: elevated))
+    }
 
-    func hoverWash(radius: CGFloat = Theme.radius) -> some View { modifier(HoverWash(radius: radius)) }
+    func hoverWash(radius: CGFloat = Lapis.Radius.card) -> some View { modifier(HoverWash(radius: radius)) }
 
     /// The screen ground behind scroll content and lists.
     func groundBackground() -> some View {
-        background(Theme.ground.ignoresSafeArea())
+        background(Color.lapis.bg.ignoresSafeArea())
             .scrollContentBackground(.hidden)
     }
 }
