@@ -91,58 +91,115 @@ struct InlineChangeCard: View {
     var note: String?
     var onAccept: () -> Void = {}
     var onReject: () -> Void = {}
+    /// the buttons' words (Keep / Revert, Apply / Discard, Apply delete / Dismiss)
+    var acceptTitle: String?
+    var rejectTitle: String?
+    /// accepting destroys text (a parked delete): the first press asks again
+    var confirmAccept = false
+    /// false for a viewer: the change shows, the decision isn't theirs
+    var showsActions = true
+    /// a decision is on its way: the buttons wait
+    var busy = false
+    /// wide layouts (iPad, Mac): the buttons ride in the header row
+    var compact = false
 
-    private var acceptTitle: String { verdict == .red ? "Apply" : "Keep" }
-    private var rejectTitle: String { verdict == .red ? "Discard" : "Revert" }
+    @State private var confirming = false
+
+    private var accept: String { acceptTitle ?? (verdict == .red ? "Apply" : "Keep") }
+    private var reject: String { rejectTitle ?? (verdict == .red ? "Discard" : "Revert") }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                VerdictChip(verdict)
-                AgentBadge(name: author, size: 18)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                chip
+                LapisAvatar(name: author, size: 22)
+                Text(author)
+                    .font(Principal.isAgent(author) ? .lapisMono(.footnote, weight: .medium) : .footnote.weight(.medium))
+                    .foregroundStyle(Principal.isAgent(author) ? Color.lapis.agent : Color.lapis.ink)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .layoutPriority(1)
+                if compact, let when {
+                    Text("· \(when)").font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(1)
+                }
                 Spacer(minLength: 4)
-                if let when {
-                    Text(when).font(.caption).foregroundStyle(Color.lapis.ink3).lineLimit(1)
+                if compact, showsActions {
+                    actions(height: Lapis.Layout.buttonHeight)
+                } else if let when {
+                    Text(when).font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(1)
                 }
             }
             Text(diffText)
                 .lapisFont(.docBody)
                 .foregroundStyle(Color.lapis.ink)
                 .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
                 .accessibilityLabel(spokenDiff)
             if let note, !note.isEmpty {
-                Text(note).font(.footnote).foregroundStyle(Color.lapis.ink2)
+                Text(note).font(.footnote).foregroundStyle(Color.lapis.ink3).fixedSize(horizontal: false, vertical: true)
             }
-            HStack(spacing: 8) {
-                Button {
-                    Haptics.success()
-                    onAccept()
-                } label: {
-                    Label(acceptTitle, systemImage: "checkmark")
-                }
-                .buttonStyle(.lapis(verdict == .red ? .primary : .keep, size: .small))
-                Button {
-                    Haptics.impact()
-                    onReject()
-                } label: {
-                    Label(rejectTitle, systemImage: verdict == .red ? "xmark" : "arrow.uturn.backward")
-                }
-                .buttonStyle(.lapis(verdict == .red ? .destructive : .revert, size: .small))
+            if !compact, showsActions {
+                actions(height: Lapis.Layout.minTarget)
             }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(verdict.soft, in: .rect(cornerRadius: Lapis.Radius.card, style: .continuous))
-        .overlay(alignment: .leading) {
-            UnevenRoundedRectangle(topLeadingRadius: Lapis.Radius.card, bottomLeadingRadius: Lapis.Radius.card, style: .continuous)
-                .fill(verdict.mark)
-                .frame(width: 4)
-                .accessibilityHidden(true)
-        }
-        .overlay(RoundedRectangle(cornerRadius: Lapis.Radius.card, style: .continuous).strokeBorder(verdict.mark.opacity(0.35), lineWidth: 1))
+        .background(verdict.soft, in: shape)
+        .overlay(shape.strokeBorder(verdict.mark, lineWidth: 1))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(verdict.spoken) change by \(author)")
+    }
+
+    private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: 20, style: .continuous) }
+
+    /// The verdict on a card-coloured pill (the soft fill is the card's own).
+    private var chip: some View {
+        HStack(spacing: 4) {
+            Image(systemName: verdict.symbol).imageScale(.small).fontWeight(.semibold)
+            Text(verdict.longWord).lineLimit(1)
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(verdict.ink)
+        .padding(.leading, 7)
+        .padding(.trailing, 9)
+        .padding(.vertical, 3)
+        .background(Color.lapis.card, in: .capsule)
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(verdict.spoken)
+    }
+
+    @ViewBuilder private func actions(height: CGFloat) -> some View {
+        HStack(spacing: 8) {
+            Button {
+                if confirmAccept, !confirming {
+                    Haptics.warning()
+                    confirming = true
+                    return
+                }
+                confirming = false
+                Haptics.success()
+                onAccept()
+            } label: {
+                Label(confirming ? "Confirm \(accept.lowercased())" : accept, systemImage: verdict == .red ? (confirmAccept ? "trash" : "checkmark") : "checkmark")
+            }
+            .buttonStyle(CardActionStyle(kind: verdict == .yellow ? .keep : (confirmAccept ? .danger : .apply), height: height, fill: !compact))
+            .accessibilityIdentifier("change.accept")
+            Button {
+                confirming = false
+                Haptics.impact()
+                onReject()
+            } label: {
+                Label(reject, systemImage: verdict == .red ? "xmark" : "arrow.uturn.backward")
+            }
+            .buttonStyle(CardActionStyle(kind: .outline, height: height, fill: !compact))
+            .accessibilityIdentifier("change.reject")
+        }
+        .disabled(busy)
+        .task(id: confirming) {
+            guard confirming else { return }
+            try? await Task.sleep(for: .seconds(4))
+            confirming = false
+        }
     }
 
     private var segments: [WordDiff.Segment] { WordDiff.segments(old: old, new: new) }
@@ -157,11 +214,12 @@ struct InlineChangeCard: View {
             case .removed:
                 part.strikethroughStyle = .single
                 part.strikethroughColor = UIColor.lapis.red
-                part.foregroundColor = Color.lapis.ink3
+                part.foregroundColor = Color.lapis.red
+                part.backgroundColor = Color.lapis.redSoft
             case .added:
-                part.underlineStyle = .single
-                part.underlineColor = verdict == .red ? UIColor.lapis.red : UIColor.lapis.yellowMark
-                part.backgroundColor = verdict == .red ? Color.lapis.redSoft : Color.lapis.mark
+                part.underlineStyle = .thick
+                part.underlineColor = UIColor.lapis.green
+                part.backgroundColor = Color.lapis.greenSoft
             }
             out += part
         }
@@ -173,6 +231,74 @@ struct InlineChangeCard: View {
         let added = segments.filter { $0.kind == .added }.map(\.text).joined(separator: " … ")
         return [removed.isEmpty ? nil : "Removed: \(removed)", added.isEmpty ? nil : "Added: \(added)", "Now reads: \(verdict == .red ? old : new)"]
             .compactMap { $0 }.joined(separator: ". ")
+    }
+}
+
+/// A decision button on a change card: a capsule (Keep is solid green with
+/// white words; Revert / Discard an outline; a destructive Apply is red
+/// words on a quiet fill).
+struct CardActionStyle: ButtonStyle {
+    enum Kind { case keep, apply, danger, outline }
+    let kind: Kind
+    var height: CGFloat = Lapis.Layout.minTarget
+    /// share the row's width
+    var fill = true
+
+    func makeBody(configuration: Configuration) -> some View {
+        CardActionBody(configuration: configuration, kind: kind, height: height, fill: fill)
+    }
+}
+
+private struct CardActionBody: View {
+    let configuration: ButtonStyleConfiguration
+    let kind: CardActionStyle.Kind
+    let height: CGFloat
+    let fill: Bool
+    @Environment(\.isEnabled) private var isEnabled
+
+    var body: some View {
+        configuration.label
+            .labelStyle(CardActionLabelStyle())
+            .font(height >= Lapis.Layout.minTarget ? .callout.weight(.semibold) : .subheadline.weight(.semibold))
+            .foregroundStyle(ink)
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+            .padding(.horizontal, 14)
+            .frame(maxWidth: fill ? .infinity : nil, minHeight: height)
+            .background(background, in: .capsule)
+            .overlay { if kind == .outline { Capsule().strokeBorder(Color.lapis.line2, lineWidth: 1) } }
+            .opacity(isEnabled ? (configuration.isPressed ? 0.75 : 1) : 0.5)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .frame(minHeight: Lapis.Layout.minTarget)
+            .contentShape(.rect)
+            .animation(Lapis.Motion.fast, value: configuration.isPressed)
+    }
+
+    private var ink: Color {
+        switch kind {
+        case .keep: .white
+        case .apply: Color.lapis.onAccent
+        case .danger: Color.lapis.red
+        case .outline: Color.lapis.ink
+        }
+    }
+
+    private var background: Color {
+        switch kind {
+        case .keep: Color.lapis.greenFill
+        case .apply: Color.lapis.accent
+        case .danger: Color.lapis.redSoft
+        case .outline: Color.lapis.card
+        }
+    }
+}
+
+private struct CardActionLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 6) {
+            configuration.icon.imageScale(.small).fontWeight(.bold)
+            configuration.title
+        }
     }
 }
 

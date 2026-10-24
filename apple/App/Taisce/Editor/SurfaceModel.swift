@@ -26,6 +26,29 @@ final class SurfaceModel: NSObject {
     private(set) var completion: Completion?
     private(set) var conflicts: [BlockID: SurfaceConflict] = [:]
     private(set) var reviews: [BlockID: BlockReview] = [:]
+    /// the doc's open review queue as the server last gave it (anyone's
+    /// flagged and parked ops): inline cards and the inspector's Review
+    private(set) var reviewItems: [DocReviewItem] = []
+    /// the queue has been fetched at least once
+    private(set) var reviewLoaded = false
+    /// review items being decided (their buttons wait)
+    private(set) var deciding: Set<String> = []
+    /// the keyboard is up in the doc (the bar shows Done and Undo)
+    private(set) var isEditingText = false
+    /// there is something to undo
+    private(set) var canUndo = false
+    /// the inline change cards' hosts, by block
+    @ObservationIgnored var cardHosts: [BlockID: UIHostingController<AnyView>] = [:]
+    /// room left under a covered block's text so the card fits
+    @ObservationIgnored var cardSpace: [BlockID: CGFloat] = [:]
+    /// an internal edit may touch a covered block (Take theirs, Discard)
+    @ObservationIgnored var editingCovered = false
+    /// where the caret was (to step over a covered block the way it moves)
+    @ObservationIgnored var lastCaret = 0
+    /// the find navigator (⌘F, the … menu): find only, never replace
+    @ObservationIgnored lazy var finder = SurfaceFinder(model: self)
+    /// draws list checkboxes as a matching pair (TextKit 2 layout fragments)
+    @ObservationIgnored let layoutDelegate = SurfaceLayoutDelegate()
     private(set) var failedBlocks: Set<BlockID> = []
     private(set) var outbox = DocOutboxState()
     /// a save waiting on the debounce
@@ -76,7 +99,7 @@ final class SurfaceModel: NSObject {
     @ObservationIgnored var pendingMarks: InlineMarks?
     @ObservationIgnored var reloading = false
     @ObservationIgnored private var attachments: [String: BlockAttachment] = [:]
-    @ObservationIgnored private var dynamicType: DynamicTypeSize = .large
+    @ObservationIgnored private(set) var dynamicType: DynamicTypeSize = .large
     @ObservationIgnored private var wantsFocus = false
     @ObservationIgnored private var pendingRemote: DocEditor?
     @ObservationIgnored lazy var formattingBar: FormattingBar = FormattingBar(model: self)
@@ -193,6 +216,9 @@ final class SurfaceModel: NSObject {
         tap.cancelsTouchesInView = false
         tv.addGestureRecognizer(tap)
         ownTap = tap
+        tv.textLayoutManager?.delegate = layoutDelegate
+        // ⌘F / Find in Doc: find only (a replace would bypass block ids)
+        tv.addInteraction(finder.interaction)
     }
 
     /// Blocks as the surface shows them: the editor's visible blocks; a
@@ -363,14 +389,21 @@ final class SurfaceModel: NSObject {
         for (id, r) in reviews { tints[id] = r.verdict == .red ? UIColor.lapis.redSoft : UIColor.lapis.yellowSoft }
         for id in failedBlocks { tints[id] = UIColor.lapis.redSoft }
         for (id, c) in conflicts where c.theirs != nil { tints[id] = UIColor.lapis.redSoft }
-        return SurfaceLook.Context(traits: traits, editable: editable, tints: tints) { [weak self] id, src in
+        var ctx = SurfaceLook.Context(traits: traits, editable: editable, tints: tints) { [weak self] id, src in
             self?.attachment(id, source: src)
         }
+        if !reviewItems.isEmpty {
+            let covered = Set(cardItems.keys)
+            ctx.covered = covered
+            ctx.cardSpace = cardSpace.filter { covered.contains($0.key) }
+        }
+        return ctx
     }
 
     /// Restyle lines touching `range` (everything when nil).
     func restyle(_ range: NSRange? = nil) {
         textView.footerPlacementDirty = true
+        if !reviewItems.isEmpty || !textView.cardViews.isEmpty { textView.cardsDirty = true }
         let storage = textView.textStorage
         let sel = textView.selectedRange
         let was = reloading
@@ -381,6 +414,7 @@ final class SurfaceModel: NSObject {
         if textView.selectedRange != sel, sel.location + sel.length <= storage.length { textView.selectedRange = sel }
         reloading = was
         updateTyping()
+        textView.setNeedsLayout()
     }
 
     private func attachment(_ id: BlockID, source: String) -> NSTextAttachment {
@@ -437,8 +471,19 @@ final class SurfaceModel: NSObject {
             textView.selectedRange = e.selection
             return true
         }
+        // a block under a change card waits for the decision
+        if !editingCovered, !quiet, e.range.length > 0 ? touchesCovered(e.range) : coveredRange(at: e.range.location) != nil {
+            refuseCoveredEdit()
+            return false
+        }
         apply(e, undoSelection: textView.selectedRange)
         return true
+    }
+
+    /// An edit that would change a block under a change card.
+    func refuseCoveredEdit() {
+        notice = "Keep or revert the change first"
+        Haptics.warning()
     }
 
     private func apply(_ e: Surface.Edit, undoSelection: NSRange) {
@@ -615,6 +660,7 @@ final class SurfaceModel: NSObject {
     func changed() {
         // the children list follows the text's new height
         textView.footerPlacementDirty = true
+        if !textView.cardViews.isEmpty { textView.cardsDirty = true }
         textView.setNeedsLayout()
         guard editable, !quiet else { return }
         unsaved = 1
@@ -678,6 +724,18 @@ final class SurfaceModel: NSObject {
         if m != activeMarks { activeMarks = m }
         textView.accessibilityHint = reviewHint(for: (a[Surface.block] as? String))
         formattingBar.update(for: currentBlock?.content ?? .paragraph(AttributedString()), marks: m)
+        updateUndoState()
+    }
+
+    /// Undo in the bar follows the stack.
+    func updateUndoState() {
+        let can = editable && (undo?.canUndo ?? false)
+        if can != canUndo { canUndo = can }
+    }
+
+    /// The keyboard went up or down in the doc.
+    func setEditingText(_ on: Bool) {
+        if on != isEditingText { isEditingText = on }
     }
 
     /// Whether the doc has any text or block (an empty doc is one empty line).
@@ -1340,10 +1398,21 @@ final class SurfaceModel: NSObject {
         if let api, app?.isOnline == true, openOps == nil || Date().timeIntervalSince(lastReviewFetch) > 15 {
             lastReviewFetch = Date()
             // a failed or slow fetch keeps the last set the server gave us
-            if let fetched = await Self.fetchReviewQueue(api, docID), fetched != openOps {
-                openOps = fetched
-                // a decision (or a new park) shows now, not at the next sync
-                await remoteChanged()
+            if let items = await Self.fetchReviewItems(api, docID) {
+                let fetched = Set(items.map(\.opID))
+                reviewLoaded = true
+                if items != reviewItems {
+                    reviewItems = items
+                    app?.reviewCounts.set(docID, items.count)
+                    restyle()
+                    textView.cardsDirty = true
+                    textView.setNeedsLayout()
+                }
+                if fetched != openOps {
+                    openOps = fetched
+                    // a decision (or a new park) shows now, not at the next sync
+                    await remoteChanged()
+                }
             }
         }
         if let r = try? await cache.reviews(for: docID, openOps: openOps), r != reviews { reviews = r }
@@ -1364,6 +1433,96 @@ final class SurfaceModel: NSObject {
             group.cancelAll()
             return first
         }
+    }
+
+    /// The doc's open review items, or nil after 10 s.
+    static func fetchReviewItems(_ api: APIClient, _ docID: DocID, timeout: Duration = .seconds(10)) async -> [DocReviewItem]? {
+        await withTaskGroup(of: [DocReviewItem]?.self) { group in
+            group.addTask { try? await api.docReview(docID) }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
+
+    /// Review items as if just fetched (tests).
+    func setReviewItems(_ items: [DocReviewItem]) {
+        reviewItems = items
+        reviewLoaded = true
+        restyle()
+        textView.cardsDirty = true
+        textView.setNeedsLayout()
+    }
+
+    /// Keep / Apply (accept) or Revert / Discard (decline) an item, as the
+    /// signed-in person. The doc then catches up with what the decision
+    /// wrote (a revert, the parked text applied). Nil on success, else why.
+    @discardableResult
+    func decide(_ item: DocReviewItem, _ decision: DocReviewDecision) async -> String? {
+        guard let api, !deciding.contains(item.id) else { return nil }
+        deciding.insert(item.id)
+        defer { deciding.remove(item.id) }
+        // what's typed goes first: a decline's revert lands on our latest text
+        await flush()
+        do {
+            try await api.resolveReview(item.id, decision)
+        } catch {
+            notice = "Couldn't decide: \(error.localizedDescription)"
+            return error.localizedDescription
+        }
+        reviewItems.removeAll { $0.id == item.id }
+        app?.reviewCounts.set(docID, reviewItems.count)
+        restyle()
+        textView.cardsDirty = true
+        textView.setNeedsLayout()
+        await app?.replayOutbox()
+        try? await app?.sync?.refresh(docID)
+        lastReviewFetch = .distantPast
+        await poll()
+        return nil
+    }
+
+    /// The review item an inline card shows on each block that is on the
+    /// surface (the newest when a block has more than one). Moves and doc
+    /// ops live in the inspector only.
+    var cardItems: [BlockID: DocReviewItem] {
+        guard !reviewItems.isEmpty else { return [:] }
+        let present = Set(Surface.blocks(textView.textStorage).map(\.id))
+        var out: [BlockID: DocReviewItem] = [:]
+        for item in reviewItems where item.opType != "move" {
+            guard let b = item.block, present.contains(b) else { continue }
+            if let have = out[b], (have.date ?? .distantPast) > (item.date ?? .distantPast) { continue }
+            out[b] = item
+        }
+        return out
+    }
+
+    /// The whole range of the covered block at `location`, if a card covers it.
+    func coveredRange(at location: Int) -> NSRange? {
+        let s = textView.textStorage
+        guard !textView.cardViews.isEmpty, location >= 0, location < s.length,
+              let id = s.attribute(Surface.block, at: location, effectiveRange: nil) as? String,
+              textView.cardViews[id] != nil else { return nil }
+        return Surface.blocks(s).first { $0.id == id }?.range
+    }
+
+    /// Whether an edit over `range` would touch a block a card covers
+    /// (decided first: Keep or Revert, Apply or Discard).
+    func touchesCovered(_ range: NSRange) -> Bool {
+        guard !textView.cardViews.isEmpty else { return false }
+        let s = textView.textStorage
+        guard s.length > 0 else { return false }
+        let start = min(max(0, range.location), s.length - 1)
+        let r = NSRange(location: start, length: max(1, min(range.length, s.length - start)))
+        var hit = false
+        s.enumerateAttribute(Surface.block, in: r) { v, _, stop in
+            if let id = v as? String, textView.cardViews[id] != nil { hit = true; stop.pointee = true }
+        }
+        return hit
     }
 
     /// What VoiceOver says about the caret's block beyond its text: the
@@ -1403,7 +1562,9 @@ final class SurfaceModel: NSObject {
         await queue?.value
         conflicts[id] = nil
         conflictWrites[id] = nil
+        editingCovered = true
         perform(Surface.replaceBlock(textView.textStorage, id: id, with: EditorBlockContent.parse(markdown: theirs), selection: textView.selectedRange))
+        editingCovered = false
         if let k = baseline.firstIndex(where: { $0.id == id }) { baseline[k].content = EditorBlockContent.parse(markdown: theirs).markdown }
         saver.cancelAll()
         unsaved = 0
@@ -1439,7 +1600,9 @@ final class SurfaceModel: NSObject {
             for id in ids {
                 if let k = baseline.firstIndex(where: { $0.id == id }) { baseline[k].content = Surface.blocks(textView.textStorage).first { $0.id == id }?.content.markdown ?? "" }
                 if let b = fresh.blocks[id] {
+                    editingCovered = true
                     perform(Surface.replaceBlock(textView.textStorage, id: id, with: EditorBlockContent.parse(b), selection: textView.selectedRange))
+                    editingCovered = false
                     if let k = baseline.firstIndex(where: { $0.id == id }) { baseline[k].content = Surface.baselineContent(b) }
                 }
             }

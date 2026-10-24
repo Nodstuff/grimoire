@@ -41,13 +41,17 @@ struct TaisceCommands: Commands {
         CommandGroup(replacing: .appSettings) {
             item("Settings\u{2026}", .settings).keyboardShortcut(",")
         }
+        // ⌘F finds in the doc in front (the system's Find items would claim ⌘F too)
+        CommandGroup(replacing: .textEditing) {
+            item("Find in Doc\u{2026}", .findInDoc).keyboardShortcut("f")
+        }
         CommandMenu("Doc") {
             item("Refresh", .refresh).keyboardShortcut("r")
             Divider()
             item("Share Link\u{2026}", .shareLink)
         }
         CommandMenu("Go") {
-            item("Search", .search).keyboardShortcut("f")
+            item("Search", .search).keyboardShortcut("f", modifiers: [.command, .shift])
             item("Today", .today)
             item("To-dos", .todos)
             if model.hasWorkspaces {

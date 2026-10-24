@@ -13,6 +13,10 @@ enum SurfaceLook {
         var tints: [BlockID: UIColor] = [:]
         /// the view for a non-text block
         var attachment: (BlockID, String) -> NSTextAttachment? = { _, _ in nil }
+        /// blocks under an inline change card: their text is the card's to show
+        var covered: Set<BlockID> = []
+        /// room left under a covered block's last line for its card
+        var cardSpace: [BlockID: CGFloat] = [:]
     }
 
     static let indentStep: CGFloat = 22
@@ -37,32 +41,38 @@ enum SurfaceLook {
         font(style, marks: [], traits: traits)
     }
 
-    /// A line's font with its inline marks applied.
+    /// A line's font with its inline marks applied. Text and quotes read in
+    /// Newsreader; headings are SF Pro bold (the Lapis doc artboards: the
+    /// structure in the interface face, the words in the reading face).
     static func font(_ style: Surface.LineStyle, marks: InlineMarks, traits: UITraitCollection?) -> UIFont {
-        let lapis: LapisTextStyle?
         var italic = false
         switch style {
-        case .paragraph, .item, .raw: lapis = .docBody
-        case .quote: lapis = .docBody; italic = true
+        case .paragraph, .item, .raw: break
+        case .quote: italic = true
         case let .heading(l):
-            switch l {
-            case 1: lapis = .docHeading1
-            case 2: lapis = .docHeading2
-            case 3: lapis = .docHeading3
-            default: lapis = nil
-            }
+            return font(headingFont(l, traits: traits), marks: marks)
         }
-        guard let lapis else {
-            return font(font(.subheadline, bold: true, traits: traits), marks: marks)
-        }
+        let lapis = LapisTextStyle.docBody
         let base = lapis.serif.weight
         if marks.contains(.code) {
             let size = lapis.uiFont(traits: traits).pointSize * 0.85
             return UIFont.monospacedSystemFont(ofSize: size, weight: marks.contains(.bold) ? .semibold : .regular)
         }
-        let weight: UIFont.Weight = marks.contains(.bold) ? (base.rawValue >= UIFont.Weight.semibold.rawValue ? .bold : .semibold) : base
+        let weight: UIFont.Weight = marks.contains(.bold) ? .semibold : base
         if marks.contains(.italic) { italic.toggle() }
         return lapis.uiFont(traits: traits, weight: weight, italic: italic)
+    }
+
+    /// A heading: SF Pro bold at the doc's heading sizes (scaled like the
+    /// text: Dynamic Type, and the Mac's docScale).
+    static func headingFont(_ level: Int, traits: UITraitCollection?) -> UIFont {
+        let style: LapisTextStyle = level <= 1 ? .docHeading1 : level == 2 ? .docHeading2 : .docHeading3
+        // the serif sizes read large in SF: a step down keeps the artboard's 21 / 19 pt
+        let serifSize = style.uiFont(traits: traits).pointSize
+        let size = level <= 3 ? serifSize * 0.88 : serifSize * 0.8
+        var d = UIFont.systemFont(ofSize: size, weight: level <= 2 ? .bold : .semibold).fontDescriptor
+        if traits?.legibilityWeight == .bold, let b = d.withSymbolicTraits(.traitBold) { d = b }
+        return UIFont(descriptor: d, size: size)
     }
 
     /// Inline marks on a system font (headings past level 3).
@@ -86,8 +96,9 @@ enum SurfaceLook {
         case .paragraph:
             p.paragraphSpacing = 10
         case let .heading(l):
-            p.paragraphSpacingBefore = l <= 2 ? 14 : 8
+            p.paragraphSpacingBefore = l <= 2 ? 16 : 10
             p.paragraphSpacing = 6
+            p.lineSpacing = 2
         case .quote:
             p.firstLineHeadIndent = 14
             p.headIndent = 14
@@ -127,9 +138,12 @@ enum SurfaceLook {
         ]
         if a[Surface.marker] != nil {
             out[.font] = baseFont(style, traits: ctx.traits)
-            out[.foregroundColor] = style.prefix?.checkbox == true ? UIColor.lapis.green : UIColor.lapis.ink3
+            // a checkbox's glyph is clipped out and its box drawn by
+            // CheckboxLayoutFragment (one shape, ticked or not)
+            out[.foregroundColor] = style.prefix?.checkbox != nil ? UIColor.clear : UIColor.lapis.ink3
             return out
         }
+        if case .heading = style { out[.kern] = -0.3 }
         if marks.contains(.code) { out[.backgroundColor] = UIColor.lapis.code }
         if marks.contains(.strike) || checked { out[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
         let link = a[Surface.link] as? String
@@ -139,8 +153,10 @@ enum SurfaceLook {
             out[.underlineStyle] = NSUnderlineStyle.single.rawValue
         }
         if wiki != nil {
+            // the accent with a soft rule under it (the doc artboards)
             out[.foregroundColor] = UIColor.lapis.accent
-            out[.backgroundColor] = UIColor.lapis.accentSoft
+            out[.underlineStyle] = NSUnderlineStyle.thick.rawValue
+            out[.underlineColor] = UIColor.lapis[.accentRing]
         }
         // read-only text follows links on a tap; the editable surface
         // places the caret (⌘-click and the edit menu follow them)
@@ -167,13 +183,27 @@ enum SurfaceLook {
             let l = ls[i]
             let following = i + 1 < ls.count ? ls[i + 1] : after
             let lastItem = following.map { $0.id != l.id || !$0.style.isItem } ?? true
-            let para = paragraphStyle(l.style, first: i == 0, last: lastItem)
-            let tint = l.id.flatMap { ctx.tints[$0] }
+            var para = paragraphStyle(l.style, first: i == 0, last: lastItem)
+            let covered = l.id.map { ctx.covered.contains($0) } ?? false
+            // a covered block's last line leaves room for its card
+            if covered, let id = l.id, let space = ctx.cardSpace[id], following.map({ $0.id != id }) ?? true {
+                let p = para.mutableCopy() as! NSMutableParagraphStyle
+                p.paragraphSpacing = max(p.paragraphSpacing, space)
+                para = p
+            }
+            let tint = covered ? nil : l.id.flatMap { ctx.tints[$0] }
             for k in displayKeys { s.removeAttribute(k, range: l.range) }
             s.addAttribute(.paragraphStyle, value: para, range: l.range)
             s.enumerateAttributes(in: l.range) { a, run, _ in
                 var d = display(a, style: l.style, ctx: ctx)
                 if let tint, d[.backgroundColor] == nil { d[.backgroundColor] = tint }
+                if covered {
+                    // the card shows the change; the text under it stays out of sight
+                    d[.foregroundColor] = UIColor.clear
+                    d[.backgroundColor] = nil
+                    d[.underlineStyle] = nil
+                    d[.strikethroughStyle] = nil
+                }
                 s.addAttributes(d, range: run)
             }
             if l.style == .raw, l.contentRange.length == 1, let src = s.attribute(Surface.raw, at: l.range.location, effectiveRange: nil) as? String,

@@ -54,13 +54,14 @@ struct RenderNodeView: View {
 }
 
 extension View {
-    /// A heading's style at the doc's text size: Newsreader for 1-3.
+    /// A heading's style at the doc's text size: SF Pro bold, as the
+    /// editor draws it (`SurfaceLook.headingFont`).
     func headingFont(_ level: Int) -> some View {
         switch level {
-        case 1: AnyView(lapisFont(.docHeading1))
-        case 2: AnyView(lapisFont(.docHeading2))
-        case 3: AnyView(lapisFont(.docHeading3))
-        default: AnyView(docFont(.headline, weight: .semibold))
+        case 1: AnyView(docFont(.title2, weight: .bold).tracking(-0.3))
+        case 2: AnyView(docFont(.title3, weight: .bold).tracking(-0.3))
+        case 3: AnyView(docFont(.headline, weight: .semibold))
+        default: AnyView(docFont(.subheadline, weight: .semibold))
         }
     }
 }

@@ -12,6 +12,11 @@ extension SurfaceModel: UITextViewDelegate, UIGestureRecognizerDelegate {
         pendingTyping = nil
         // mid-composition the input method owns the text
         if textView.markedTextRange != nil { return true }
+        // a block under a change card waits for the decision
+        if touchesCovered(range) {
+            refuseCoveredEdit()
+            return false
+        }
         let s = self.textView.textStorage
         if text == "\n" {
             // Return with a non-text block selected opens its source
@@ -117,12 +122,25 @@ extension SurfaceModel: UITextViewDelegate, UIGestureRecognizerDelegate {
                     let loc = sel.location
                     sel.location = loc - run.location < run.location + run.length - loc ? run.location : run.location + run.length
                 }
+                // nor in a block under a change card: over it, the way the caret moved
+                if let covered = coveredRange(at: sel.location) {
+                    let forward = sel.location >= lastCaret
+                    let after = covered.location + covered.length
+                    if forward, after < s.length {
+                        sel.location = after
+                    } else if covered.location > 0 {
+                        sel.location = covered.location - 1
+                    } else {
+                        sel.location = min(after, s.length - 1)
+                    }
+                }
             }
             if sel != textView.selectedRange {
                 reloading = true
                 textView.selectedRange = sel
                 reloading = false
             }
+            lastCaret = sel.location
         }
         pendingMarks = nil
         // the caret moved on its own (not by a keystroke): a new undo step
@@ -131,7 +149,12 @@ extension SurfaceModel: UITextViewDelegate, UIGestureRecognizerDelegate {
         updateCompletion()
     }
 
+    func textViewDidBeginEditing(_ textView: UITextView) {
+        setEditingText(true)
+    }
+
     func textViewDidEndEditing(_ textView: UITextView) {
+        setEditingText(false)
         if completion != nil { dismissCompletion() }
         Task { await flush() }
     }

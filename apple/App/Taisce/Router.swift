@@ -21,6 +21,8 @@ enum PadItem: Hashable {
 /// A menu-bar command (the Mac's menus, an iPad's hardware keyboard).
 enum AppCommand: Hashable {
     case newDoc, newFolder, search, refresh, settings, today, todos
+    /// ⌘F: find in the doc in front (Decision 2: ⇧⌘F is Search)
+    case findInDoc
     /// the doc in front: Share link… and Export as PDF… (SERVER mode)
     case shareLink, exportPDF
     /// ⌘1…⌘9: the nth workspace in the switcher's order (1-based)
@@ -36,7 +38,7 @@ enum CommandEffect: Equatable {
 /// Something the doc screen showing `doc` should open: the share sheet,
 /// a PDF export, or its link comments (a push tap).
 struct DocAction: Equatable {
-    enum Kind: Equatable { case shareLink, exportPDF, linkComments }
+    enum Kind: Equatable { case shareLink, exportPDF, linkComments, find }
     var doc: DocID
     var kind: Kind
     var serial: Int
@@ -166,6 +168,7 @@ final class Router {
             // reading is enough to print
             return shares && focusedDoc != nil
         case .newDoc, .newFolder: return canCreate
+        case .findInDoc: return focusedDoc != nil
         case .workspace(let n): return picker.shortcut(n) != nil
         default: return true
         }
@@ -214,6 +217,8 @@ final class Router {
             if isPad { searchFocusRequest += 1 }
         case .refresh:
             return .refresh
+        case .findInDoc:
+            findInDoc()
         case .shareLink:
             if let doc = focusedDoc { request(.shareLink, on: doc) }
         case .exportPDF:
@@ -228,6 +233,11 @@ final class Router {
             if let scope = picker.shortcut(n) { return .selectWorkspace(scope) }
         }
         return .none
+    }
+
+    /// Find in Doc: the doc in front opens its find bar (⌘F, the … menu).
+    func findInDoc() {
+        if let doc = focusedDoc { request(.find, on: doc) }
     }
 
     func request(_ kind: DocAction.Kind, on doc: DocID) {

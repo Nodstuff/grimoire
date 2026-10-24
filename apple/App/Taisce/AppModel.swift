@@ -131,6 +131,8 @@ final class AppModel {
     let dataSources = DataSourceStore()
     /// share links and their comments (SERVER mode only)
     let shareLinks = ShareLinkStore()
+    /// open review items per doc (the Library's flags; ReviewCounts in Presentation/DocReview.swift)
+    let reviewCounts = ReviewCounts()
     /// a comment push was tapped: the frontmost window opens that doc's link comments
     private(set) var linkCommentsRequest: LinkCommentsRequest?
 

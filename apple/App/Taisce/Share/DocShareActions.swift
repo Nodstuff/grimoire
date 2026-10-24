@@ -10,6 +10,8 @@ struct DocShareActions: ViewModifier {
     /// owner or editor (ADR 0004): viewers may print but not share
     let canShare: Bool
     let pageLoaded: Bool
+    /// Find in Doc (⌘F): the doc screen's find bar
+    var onFind: () -> Void = {}
 
     @Environment(AppModel.self) private var model
     @Environment(Router.self) private var router
@@ -104,6 +106,7 @@ struct DocShareActions: ViewModifier {
                 }
             }
         case .linkComments: showingLinkComments = true
+        case .find: onFind()
         }
     }
 

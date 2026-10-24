@@ -33,6 +33,14 @@ final class SurfaceTextView: UITextView {
     }
     var gutter: CGFloat = 20
     var readingWidth: CGFloat = 720
+    /// inline change cards (flagged / parked review items), by the block
+    /// each covers: subviews placed over the block's text
+    var cardViews: [BlockID: UIView] = [:]
+    /// the text or the review items changed: the cards are placed again
+    var cardsDirty = false
+    /// the text column's width (the reading width, or less)
+    private(set) var columnWidth: CGFloat = 0
+    private var lastCardWidth: CGFloat = 0
 
     /// the header or footer's content changed: measure them again
     var chromeDirty = true
@@ -54,6 +62,7 @@ final class SurfaceTextView: UITextView {
         guard w > 0 else { return }
         let column = max(100, min(w - gutter * 2, readingWidth))
         let side = floor((w - column) / 2)
+        columnWidth = column
         func measure(_ v: UIView, _ cached: CGSize?) -> CGSize {
             if let cached, cached.width == column, !chromeDirty { return cached }
             return CGSize(width: column, height: ceil(v.sizeThatFits(CGSize(width: column, height: .greatestFiniteMagnitude)).height))
@@ -92,6 +101,14 @@ final class SurfaceTextView: UITextView {
             textContainerInset = inset
             // the text stays put (at the very top, the header shows whole)
             if dy != 0, !atTop { contentOffset.y += dy }
+            cardsDirty = true
+        }
+        if !cardViews.isEmpty || cardsDirty {
+            if cardsDirty || lastCardWidth != column {
+                lastCardWidth = column
+                cardsDirty = false
+                model?.layoutCards()
+            }
         }
     }
 
@@ -102,6 +119,8 @@ final class SurfaceTextView: UITextView {
             let p = g.location(in: self)
             if let header, header.frame.contains(p) { return false }
             if let footer, footer.frame.contains(p) { return false }
+            // a change card's buttons and words are its own
+            if cardViews.values.contains(where: { $0.frame.contains(p) }) { return false }
             // a tap on a link or a checkbox is the surface's own (follow /
             // tick): the text view's taps don't place the caret or raise
             // the keyboard there. Long-press and the keys still edit it.
