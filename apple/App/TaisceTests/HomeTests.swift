@@ -48,15 +48,32 @@ private func item(_ id: String, _ kind: ReviewQueueItem.Kind, by proposer: Strin
     }
 
     @Test func continueReadingPicksTheNewestStartedUnfinishedBook() {
-        let done = TodayBook(id: "a", title: "Done", author: "", percentage: 100)
-        let fresh = TodayBook(id: "b", title: "Fresh", author: "", percentage: 0)
-        let reading = TodayBook(id: "c", title: "Reading", author: "Ann", seriesIndex: 2.5, percentage: 63.9, device: "Kindle", updatedAt: "2026-10-01T10:00:00Z")
-        #expect(ContinueReading.pick([done, fresh, reading])?.id == "c")
-        #expect(ContinueReading.pick([done, fresh]) == nil)
-        #expect(ContinueReading.percent(reading) == "63%")
-        #expect(ContinueReading.byline(reading) == "Ann · Book 2.5")
-        #expect(ContinueReading.whereAndWhen(reading, now: noon) == "Kindle · 2 h ago")
-        #expect(ContinueReading.whereAndWhen(TodayBook(id: "d", title: "", author: "", percentage: 5)) == nil)
+        func p(_ pct: Double, _ status: ProgressStatus, device: String = "", at: String = "") -> BookProgress {
+            BookProgress(percentage: pct, device: device, updated: at, status: status)
+        }
+        let done = ReadingBook(book: Book(id: "a", title: "Done"), progress: p(100, .finished))
+        let fresh = ReadingBook(book: Book(id: "b", title: "Fresh"), progress: p(0, .unread))
+        let reading = ReadingBook(book: Book(id: "c", title: "Reading", author: "Ann", seriesIndex: 2.5),
+                                  progress: p(63.9, .reading, device: "Kindle", at: "2026-10-01T10:00:00Z"))
+        // Today's card reads the Books shelf: the same book Books continues
+        let shelf = BookShelf(books: [done.book, fresh.book, reading.book], reading: [done, fresh, reading])
+        #expect(ContinueReading.pick(shelf)?.book.id == "c")
+        #expect(ContinueReading.pick(BookShelf(books: [done.book], reading: [done, fresh])) == nil)
+        #expect(ContinueReading.percent(reading.progress) == "63%")
+        #expect(ContinueReading.byline(reading.book) == "Ann · Book 2.5")
+        #expect(ContinueReading.whereAndWhen(reading.progress, now: noon) == "Kindle · 2 h ago")
+        #expect(ContinueReading.whereAndWhen(p(5, .reading)) == nil)
+    }
+
+    @Test func todoRowsSayWhereTheyLive() {
+        let today = entry("a", nil, date: "2026-10-01")
+        #expect(today.sourcePath(list: "Home › To-do", now: noon, calendar: cal) == "Home › To-do › Today")
+        let older = entry("b", nil, date: "2026-09-30", note: "for the NCT")
+        #expect(older.sourcePath(list: "To-do", now: noon, calendar: cal) == "To-do › Yesterday · for the NCT")
+        let week = entry("c", nil, date: "2026-09-24")
+        #expect(week.sourcePath(list: "To-do", now: noon, calendar: cal) == "To-do › Thu 24 Sept" || week.sourcePath(list: "To-do", now: noon, calendar: cal) == "To-do › Thu 24 Sep")
+        // no list known (offline before the tree): the old line
+        #expect(today.sourcePath(list: nil, now: noon, calendar: cal) == nil)
     }
 
     @Test func dueRowsAreOverdueTodayAndTheWeekAhead() {

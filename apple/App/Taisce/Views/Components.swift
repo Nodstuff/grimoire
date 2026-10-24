@@ -63,6 +63,8 @@ struct TodoRow: View {
     var now: Date = .now
     var done = false
     var shortPill = false
+    /// the To-do doc's path ("Home › To-do"): the line under reads where the item lives
+    var listPath: String?
     /// the ring as a button (tap to mark done / undo); nil = a plain ring
     var onToggle: (() -> Void)?
     /// accessibility text sizes: the pill goes under the text, not beside it
@@ -91,7 +93,7 @@ struct TodoRow: View {
                     .strikethrough(done, color: Color.lapis.ink3)
                     .opacity(done ? 0.55 : 1)
                     .lineLimit(3)
-                if let source = entry.sourceLine(now: now) {
+                if let source = entry.sourcePath(list: listPath, now: now) {
                     Text(source).font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(2)
                 }
                 if typeSize.isAccessibilitySize, let pill = pill(label) { pill }

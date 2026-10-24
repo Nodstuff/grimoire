@@ -112,7 +112,7 @@ struct DocInspector: View {
         if !items.isEmpty {
             SectionLabel("Wants a look")
             ForEach(items) { item in
-                ReviewItemCard(item: item, canDecide: surface?.editable ?? false, busy: surface?.deciding.contains(item.id) ?? false,
+                DocReviewItemCard(item: item, canDecide: surface?.editable ?? false, busy: surface?.deciding.contains(item.id) ?? false,
                                onDecide: { d in Task { await surface?.decide(item, d) } },
                                onShow: item.block.map { b in { show(b) } })
             }
@@ -365,7 +365,7 @@ private struct TabStrip: View {
 
 /// A flagged or parked change in the inspector: who, what, the change in
 /// words, why, and the decision.
-struct ReviewItemCard: View {
+struct DocReviewItemCard: View {
     let item: DocReviewItem
     let canDecide: Bool
     var busy = false

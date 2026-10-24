@@ -205,6 +205,25 @@ extension DueLabel {
 }
 
 extension TodoEntry {
+    /// The line under a to-do on Today and To-dos: where it lives, as the
+    /// Library's breadcrumb reads ("Home › To-do › Thu 22 Oct"), then its
+    /// note. `list` is the To-do doc's path; without it, `sourceLine`.
+    func sourcePath(list: String?, now: Date = .now, calendar: Calendar = .current) -> String? {
+        guard let list, !list.isEmpty else { return sourceLine(now: now, calendar: calendar) }
+        var s = "\(list)\(DocIndex.separator)\(Self.dayName(date, now: now, calendar: calendar))"
+        if let note, !note.isEmpty { s += " \u{00B7} \(note)" }
+        return s
+    }
+
+    /// "Today", "Yesterday", else "Thu 22 Oct": the day a to-do was written under.
+    static func dayName(_ date: String, now: Date = .now, calendar: Calendar = .current) -> String {
+        let today = Due.today(now: now, in: calendar.timeZone).dateString
+        if date == today { return "Today" }
+        guard let day = Due(date) else { return date }
+        if DueLabel.dayDistance(from: today, to: date, calendar: calendar) == -1 { return "Yesterday" }
+        return DueLabel.shortDate(day, calendar: calendar)
+    }
+
     /// The line under a to-do: its note, else the day it was written when
     /// that isn't today ("From Thu 22 Oct"); nil for a plain item of today's.
     func sourceLine(now: Date = .now, calendar: Calendar = .current) -> String? {

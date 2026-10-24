@@ -111,7 +111,7 @@ final class BooksUITests: XCTestCase {
 
     /// The shelf, a book's details, and the shelf's own screenshots.
     func testShelfAndDetails() throws {
-        let app = launch(["-books"])
+        let app = launch(["-tab", "books"])
         let summary = app.staticTexts["books.summary"]
         XCTAssertTrue(summary.waitForExistence(timeout: 30), "Books opened")
         XCTAssertTrue(summary.label.contains("books"), summary.label)
@@ -148,7 +148,7 @@ final class BooksUITests: XCTestCase {
         let id = try bookID(title)
         let before = (try position(id)?["timestamp"] as? Int) ?? 0
 
-        var app = launch(["-read", id])
+        var app = launch(["-readBook", id])
         let progress = app.descendants(matching: .any)["reader.progress"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 40), "the book opened")
         shot(app, "reader-open")
@@ -179,7 +179,7 @@ final class BooksUITests: XCTestCase {
 
         // reopen: resumes where we were
         app.terminate()
-        app = launch(["-read", id])
+        app = launch(["-readBook", id])
         XCTAssertTrue(app.descendants(matching: .any)["reader.progress"].firstMatch.waitForExistence(timeout: 40), "reopened")
         try waitFor(10, "resumed at \(here)%") { abs((percent(app) ?? -100) - here) <= 1 }
         shot(app, "reader-resumed")
@@ -214,7 +214,7 @@ final class BooksUITests: XCTestCase {
     /// The reading settings: paper, then back to Auto (the next run starts clean).
     func testReaderSettings() throws {
         let id = try bookID(env["TAISCE_UI_READ_TITLE"] ?? "The Time Machine")
-        let app = launch(["-read", id])
+        let app = launch(["-readBook", id])
         XCTAssertTrue(app.descendants(matching: .any)["reader.progress"].firstMatch.waitForExistence(timeout: 40), "the book opened")
         RunLoop.current.run(until: Date().addingTimeInterval(2.5)) // the bar steps aside
         app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()

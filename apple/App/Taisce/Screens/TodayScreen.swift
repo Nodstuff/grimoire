@@ -13,33 +13,35 @@ struct TodayScreen: View {
 
     var body: some View {
         let home = model.home
-        let reading = home.continueReading
+        let books = model.books
+        let reading = ContinueReading.pick(books.shelf)
         TodayContent(
             dayLine: RelativeTime.dayLine(),
             badge: SyncBadge.make(status: model.syncStatus, pending: model.pendingWrites),
             review: home.review,
             reading: reading,
-            readingCover: reading.flatMap { home.covers[$0.id] },
+            readingCover: reading.flatMap { books.coverURL($0.book) },
             due: TodoBoard.shown(board, hasSynced: model.hasSynced, status: model.syncStatus).map { TodayDue.rows($0) },
             pinned: pinnedCards,
             onReview: router.showReview,
             onOpen: { router.open(.doc($0)) },
-            onRead: { router.readBook($0.id) },
+            onRead: { router.readBook($0.book.id) },
             onBooks: router.showBooks,
             onAllTodos: router.showTodos,
             onUnpin: model.togglePin,
+            listPath: model.todoListPath,
             checked: taps.checked,
             // a viewer's list is read-only (ADR 0004)
             onToggleDone: model.currentAccess.canEdit ? { e in taps.tap(e) { await model.markDone($0) } } : nil
         )
-        .safeAreaInset(edge: .top, spacing: 0) { WorkspaceBar() } // workspaces
+        // workspaces switch in the Library (the artboard's Today has no bar)
         .toolbar { toolbar }
         .sheet(isPresented: $capturing) { CaptureTodoSheet() }
         .refreshable {
             try? await model.sync?.catchUp()
             await reload()
             await home.loadReview()
-            await home.loadReading()
+            await books.load(force: true)
         }
         .task(id: model.todoRevision) { await reload() }
         // the queue moves with every change the server journals
@@ -49,7 +51,7 @@ struct TodayScreen: View {
             await home.loadReview()
         }
         .task(id: model.authPhase) {
-            await home.loadReading()
+            await books.load()
             await home.loadProfile()
         }
         .task(id: model.pins) {
@@ -130,18 +132,21 @@ struct TodayContent: View {
     let badge: SyncBadge
     /// nil while the queue loads (the card waits rather than flashing empty)
     var review: [ReviewQueueItem]?
-    var reading: TodayBook?
-    var readingCover: UIImage?
+    var reading: ReadingBook?
+    /// the book's cover image (behind the server's bearer: `coverImageLoader`)
+    var readingCover: URL?
     /// nil while loading
     let due: [TodoEntry]?
     let pinned: [PinnedCard]
     var now: Date = .now
     var onReview: () -> Void = {}
     var onOpen: (DocID) -> Void = { _ in }
-    var onRead: (TodayBook) -> Void = { _ in }
+    var onRead: (ReadingBook) -> Void = { _ in }
     var onBooks: () -> Void = {}
     var onAllTodos: () -> Void = {}
     var onUnpin: (DocID) -> Void = { _ in }
+    /// the To-do doc's path ("Home › To-do"), under each due row with its day
+    var listPath: String?
     /// rows checked by a ring tap, fading out
     var checked: Set<String> = []
     var onToggleDone: ((TodoEntry) -> Void)?
@@ -236,23 +241,34 @@ struct TodayContent: View {
 
     // MARK: reading
 
-    private func readingSection(_ book: TodayBook) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+    private func readingSection(_ r: ReadingBook) -> some View {
+        let book = r.book, p = r.progress
+        return VStack(alignment: .leading, spacing: 0) {
             SectionHeading("Continue reading", link: "Books", action: onBooks)
-            Button { onRead(book) } label: {
+            Button { onRead(r) } label: {
                 HStack(spacing: 14) {
-                    TodayCover(book: book, image: readingCover).frame(width: 54)
+                    BookCover(id: book.id, title: book.title, author: book.authorName, imageURL: readingCover).frame(width: 54)
                     VStack(alignment: .leading, spacing: 3) {
                         Text(book.title).lapisFont(.cardTitle).foregroundStyle(Color.lapis.ink).lineLimit(2)
                         let byline = ContinueReading.byline(book)
                         if !byline.isEmpty {
                             Text(byline).font(.subheadline).foregroundStyle(Color.lapis.ink3).lineLimit(2)
                         }
-                        ProgressBar(value: book.percentage / 100, label: "Reading progress").padding(.top, 8)
-                        HStack(spacing: 0) {
-                            Text(ContinueReading.percent(book)).fontWeight(.semibold).foregroundStyle(Color.lapis.ink)
-                            if let w = ContinueReading.whereAndWhen(book, now: now) {
-                                Text(" · \(w)").foregroundStyle(Color.lapis.ink3)
+                        ProgressBar(value: p.percentage / 100, label: "Reading progress").padding(.top, 8)
+                        // the percent and "Kindle · 2 h ago" each stay whole
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 0) {
+                                Text(ContinueReading.percent(p)).fontWeight(.semibold).foregroundStyle(Color.lapis.ink)
+                                if let w = ContinueReading.whereAndWhen(p, now: now) {
+                                    Text(" \u{00B7} \(w)").foregroundStyle(Color.lapis.ink3)
+                                }
+                            }
+                            .lineLimit(1)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(ContinueReading.percent(p)).fontWeight(.semibold).foregroundStyle(Color.lapis.ink)
+                                if let w = ContinueReading.whereAndWhen(p, now: now) {
+                                    Text(w).foregroundStyle(Color.lapis.ink3)
+                                }
                             }
                         }
                         .font(.footnote)
@@ -272,7 +288,7 @@ struct TodayContent: View {
             }
             .buttonStyle(.plain)
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("Continue reading \(book.title), \(ContinueReading.percent(book))")
+            .accessibilityLabel("Continue reading \(book.title), \(ContinueReading.percent(p))")
             .accessibilityHint("Opens the reader")
             .accessibilityIdentifier("today.continueReading")
             .padding(.horizontal, 16)
@@ -291,7 +307,7 @@ struct TodayContent: View {
                     } else {
                         GroupedRows(items: Array(due.prefix(TodayDue.limit))) { entry in
                             // the ring is its own button; the rest of the row opens To-dos
-                            TodoRow(entry: entry, now: now, done: checked.contains(entry.id), onToggle: onToggleDone.map { f in { f(entry) } })
+                            TodoRow(entry: entry, now: now, done: checked.contains(entry.id), listPath: listPath, onToggle: onToggleDone.map { f in { f(entry) } })
                                 .onTapGesture(perform: onAllTodos)
                                 .accessibilityAction(named: "Open To-dos", onAllTodos)
                         }
@@ -468,26 +484,6 @@ struct PinnedCardView: View {
     }
 }
 
-/// The Continue reading cover: the server's colour cover when it loaded,
-/// else the typographic one (decision 3).
-struct TodayCover: View {
-    let book: TodayBook
-    var image: UIImage?
-
-    var body: some View {
-        if let image {
-            Color.clear
-                .aspectRatio(2.0 / 3.0, contentMode: .fit)
-                .overlay { Image(uiImage: image).resizable().scaledToFill() }
-                .clipShape(.rect(cornerRadius: 4, style: .continuous))
-                .shadow(color: Color.lapis.shadow, radius: 6, y: 4)
-                .accessibilityLabel("Cover of \(book.title)")
-        } else {
-            BookCover(id: book.id, title: book.title, author: book.author.isEmpty ? nil : book.author)
-        }
-    }
-}
-
 /// "Capture a to-do": one line onto today's list, with the server's
 /// reading of any `due …` phrase.
 struct CaptureTodoSheet: View {
@@ -545,7 +541,9 @@ extension PreviewData {
         ReviewQueueItem(id: "r3", docID: "home-garden", docTitle: "Garden plan", kind: .parked, proposer: "claude:home", summary: "Move \u{201C}Garden plan\u{201D} to the Trash"),
     ]
 
-    static let book = TodayBook(id: "b1", title: "The First Heretic", author: "Aaron Dembski-Bowden", series: "The Horus Heresy", seriesIndex: 14, percentage: 64, device: "Kindle", updatedAt: "2026-09-21T10:00:00Z")
+    static let book = ReadingBook(
+        book: Book(id: "b1", title: "The First Heretic", author: "Aaron Dembski-Bowden", series: "The Horus Heresy", seriesIndex: 14),
+        progress: BookProgress(percentage: 64, device: "Kindle", updated: "2026-09-21T10:00:00Z", status: .reading))
 
     static var pinnedCards: [PinnedCard] {
         cards.map { PinnedCard(doc: $0, crumb: index.breadcrumb(of: $0.id), color: "accent", author: "keeper:API") }

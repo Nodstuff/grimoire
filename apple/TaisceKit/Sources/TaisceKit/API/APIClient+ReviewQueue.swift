@@ -42,6 +42,13 @@ public struct ReviewQueueItem: Sendable, Hashable, Identifiable {
 
     /// A person resolves; an agent never does. Agents are named with a colon.
     public var byAgent: Bool { proposer.contains(":") }
+
+    /// Open items per doc (the Library's flag counts), from one `/api/queue` read.
+    public static func counts(_ items: [ReviewQueueItem]) -> [DocID: Int] {
+        var out: [DocID: Int] = [:]
+        for i in items { out[i.docID, default: 0] += 1 }
+        return out
+    }
 }
 
 /// One row of `/api/queue` as sent: the item, and whether it is still open.

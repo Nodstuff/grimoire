@@ -640,6 +640,16 @@ final class AppModel {
         WorkspaceFilter.todoDoc(in: docs, index: index, scope: currentWorkspace)
     }
 
+    /// Where this workspace's to-dos live, as the Library's breadcrumb reads
+    /// it: the workspace (when there are several), the folders, the To-do doc
+    /// ("Home › To-do"). Rows add the day they were written under.
+    var todoListPath: String? {
+        guard let id = todoDocID, let doc = index.byID[id] else { return nil }
+        var parts = index.ancestors(of: id).map(\.title) + [doc.title]
+        if hasWorkspaces, let ws = currentWorkspace { parts.insert(workspacePicker.name(ws), at: 0) }
+        return parts.joined(separator: DocIndex.separator)
+    }
+
     /// Switch workspace: remembered per server, and every screen re-reads.
     func selectWorkspace(_ scope: WorkspaceScope) {
         storedWorkspace = scope

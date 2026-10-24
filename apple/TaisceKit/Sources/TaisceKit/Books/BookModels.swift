@@ -151,29 +151,6 @@ public struct BookPage: Decodable, Sendable, Hashable {
     }
 }
 
-/// An e-reader (OPDS + KOReader sync) set up in Settings › E-readers.
-public struct Ereader: Codable, Sendable, Hashable, Identifiable {
-    public var id: String
-    public var label: String
-    public var lastUsed: String?
-    public var revoked: String?
-
-    public init(id: String, label: String, lastUsed: String? = nil, revoked: String? = nil) {
-        self.id = id
-        self.label = label
-        self.lastUsed = lastUsed
-        self.revoked = revoked
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case id, label
-        case lastUsed = "last_used_at"
-        case revoked = "revoked_at"
-    }
-
-    public var isActive: Bool { revoked == nil }
-}
-
 /// `PATCH /api/books/{id}`: absent fields stay, `""` / null clear.
 public struct BookPatch: Encodable, Sendable, Hashable {
     public var title: String?

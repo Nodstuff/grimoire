@@ -1,36 +1,32 @@
 import Foundation
 import TaisceKit
 
-/// Today's "Continue reading": the newest book in progress.
+/// Today's "Continue reading": the newest book in progress, from the
+/// Books shelf (`BookStore`), so Today and Books never disagree.
 enum ContinueReading {
     /// The first book that is started and not finished (the list is newest first).
-    static func pick(_ books: [TodayBook]) -> TodayBook? {
-        books.first { $0.percentage > 0 && $0.percentage < 100 }
+    static func pick(_ shelf: BookShelf) -> ReadingBook? {
+        shelf.continueReading
+            .first { $0.progress.percentage > 0 && $0.progress.percentage < 100 }
+            .map { ReadingBook(book: $0.book, progress: $0.progress) }
     }
 
     /// "64%", rounded down so 99.6 never reads as done.
-    static func percent(_ book: TodayBook) -> String {
-        "\(Int(book.percentage.rounded(.down)))%"
+    static func percent(_ p: BookProgress) -> String {
+        "\(Int(p.percentage.rounded(.down)))%"
     }
 
     /// "Aaron Dembski-Bowden · Book 14"
-    static func byline(_ book: TodayBook) -> String {
-        [book.author.isEmpty ? nil : book.author, book.seriesLabel].compactMap { $0 }.joined(separator: " · ")
+    static func byline(_ book: Book) -> String {
+        let n = book.seriesIndex.map { "Book \(BookFormat.number($0))" }
+        return [book.authorName, n].compactMap { $0 }.joined(separator: " · ")
     }
 
     /// "Kindle · 2 h ago" (either half omitted when unknown)
-    static func whereAndWhen(_ book: TodayBook, now: Date = .now) -> String? {
-        let when = book.updatedAt.flatMap(Self.date).map { RelativeTime.string($0, now: now) }
-        let parts = [book.device.flatMap { $0.isEmpty ? nil : $0 }, when].compactMap { $0 }
+    static func whereAndWhen(_ p: BookProgress, now: Date = .now) -> String? {
+        let when = p.updatedAt.map { RelativeTime.string($0, now: now) }
+        let parts = [p.device.isEmpty ? nil : p.device, when].compactMap { $0 }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
-    }
-
-    static func date(_ rfc3339: String) -> Date? {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f.date(from: rfc3339) { return d }
-        f.formatOptions = [.withInternetDateTime]
-        return f.date(from: rfc3339)
     }
 }
 

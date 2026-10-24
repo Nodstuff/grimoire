@@ -12,7 +12,7 @@ enum Route: Hashable {
     case todos
     /// the review queue (Today's Review card)
     case review
-    /// a book's details, and its reader (BooksHooks.swift until the Books screens land)
+    /// a book's details (`BookDetail`), and its reader (`BookReaderScreen`)
     case book(String)
     case bookReader(String)
 }
@@ -75,6 +75,8 @@ final class Router {
     var booksPath: [Route] = []
 
     var padItem: PadItem? = .today
+    /// the shelf Books shows on iPad and the Mac (the sidebar's Shelves and Series rows)
+    var bookShelf: BookShelfFilter = .all
     var padPath: [Route] = []
     var searchQuery = ""
     var showSettings = false
@@ -290,7 +292,7 @@ final class Router {
 
     /// Development launch arguments, for screenshots and UI runs:
     /// `-tab today|library|todos|search`, `-openDoc <title>`,
-    /// `-searchQuery <text>`, `-showSettings YES`. (`-serverURL <url>` is read
+    /// `-searchQuery <text>`, `-showSettings YES`, `-tab books`, `-readBook <id>`. (`-serverURL <url>` is read
     /// by `AppModel` straight from UserDefaults' argument domain.)
     func applyLaunchArguments(index: DocIndex) {
         let d = UserDefaults.standard
@@ -303,6 +305,7 @@ final class Router {
         default: break
         }
         if let q = d.string(forKey: "searchQuery") { searchQuery = q }
+        if let book = d.string(forKey: "readBook") { readBook(book) }
         _ = openLaunchDoc(index: index)
         if d.bool(forKey: "showSettings") { showSettings = true }
     }

@@ -33,6 +33,8 @@ import Testing
         #expect(items[1].prior == "Every change is a proposal." && items[1].docID == "d2")
         let s = ReviewQueueSummary(items)
         #expect(s.flagged == 1 && s.parked == 1 && s.total == 2)
+        // the Library's per-doc flag counts come from the same read
+        #expect(ReviewQueueItem.counts(items) == ["d1": 1, "d2": 1])
     }
 
     @Test func resolveSendsTheDecision() async throws {
@@ -49,34 +51,6 @@ import Testing
         await #expect(throws: APIError.server("proposer cannot approve own proposal")) {
             try await server.client().resolveQueued("a1", .accept)
         }
-    }
-
-    @Test func currentlyReadingDecodesTheCardSlice() async throws {
-        let server = MockServer { r in
-            #expect(r.path == "/api/books/currently-reading")
-            return .json("""
-            {"books":[{"id":"b1","title":"The First Heretic","author":"Aaron Dembski-Bowden","series":"The Horus Heresy","series_index":14,
-              "book_identifier":"","original_filename":"x.epub","size":1,"has_cover":true,"cover_version":7,"added_at":"2026-10-01T00:00:00Z",
-              "updated_at":"2026-10-24T08:00:00Z","percentage":64.2,"device":"Kindle","status":"reading"}]}
-            """)
-        }
-        let books = try await server.client().todayReading()
-        #expect(books.count == 1)
-        let b = books[0]
-        #expect(b.title == "The First Heretic" && b.seriesLabel == "Book 14" && b.percentage == 64.2)
-        #expect(b.coverPath == "/api/books/b1/cover?v=7" && b.device == "Kindle")
-    }
-
-    @Test func localDaemonHasNoBooks() async throws {
-        let server = MockServer { _ in MockServer.Reply(status: 404, chunks: []) }
-        await #expect(throws: APIError.self) { try await server.client().todayReading() }
-    }
-
-    @Test func searchBooksSendsTheQuery() async throws {
-        let server = MockServer { _ in .json(#"{"books":[{"id":"b2","title":"Dune","author":"Frank Herbert"}],"next_before":null}"#) }
-        let found = try await server.client().searchBooks("dune")
-        #expect(server.requests[0].query == ["search": "dune", "limit": "30"])
-        #expect(found.map(\.title) == ["Dune"] && found[0].percentage == 0 && found[0].seriesLabel == nil)
     }
 
     @Test func askDecodesTheAnswerAndNothing() async throws {

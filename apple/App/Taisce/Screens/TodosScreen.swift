@@ -29,6 +29,7 @@ struct TodosScreen: View {
             onToggleDone: { e in taps.tap(e) { await model.markDone($0) } },
             onSnooze: { e, s in Task { await model.snooze(e, s) } },
             onShowList: model.todoDocID.map { id in { router.open(.doc(id)) } },
+            listPath: model.todoListPath,
             onAdd: {
                 let text = draft
                 draft = ""
@@ -91,6 +92,8 @@ struct TodosContent: View {
     var onSnooze: (TodoEntry, Snooze) -> Void = { _, _ in }
     /// open the To-do doc itself (nil before it exists)
     var onShowList: (() -> Void)?
+    /// the To-do doc's path ("Home › To-do"), under each row with its day
+    var listPath: String?
     var onAdd: () -> Void = {}
 
     @State private var snoozing: TodoEntry?
@@ -216,12 +219,12 @@ struct TodosContent: View {
             Section {
                 ForEach(items) { entry in
                     if readOnly {
-                        TodoRow(entry: entry, now: now, done: false, shortPill: true, onToggle: nil)
+                        TodoRow(entry: entry, now: now, done: false, shortPill: true, listPath: listPath, onToggle: nil)
                             .listRowInsets(EdgeInsets())
                             .listRowBackground(Color.lapis.card)
                             .listRowSeparatorTint(Color.lapis.line2)
                     } else {
-                        TodoRow(entry: entry, now: now, done: checked.contains(entry.id), shortPill: true, onToggle: onToggleDone.map { f in { f(entry) } })
+                        TodoRow(entry: entry, now: now, done: checked.contains(entry.id), shortPill: true, listPath: listPath, onToggle: onToggleDone.map { f in { f(entry) } })
                             .listRowInsets(EdgeInsets())
                             .listRowBackground(Color.lapis.card)
                             .listRowSeparatorTint(Color.lapis.line2)

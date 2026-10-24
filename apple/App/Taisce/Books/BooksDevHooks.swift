@@ -44,45 +44,16 @@ struct SignInRelay: WebAuthenticator {
     }
 }
 
-/// This branch's way into Books until the shell's Books tab lands (merge:
-/// delete this modifier and its one line in RootView). A Debug launch with
-/// `-books` shows `BooksScreen` over the app; `-books <id>` opens that book's
-/// details, `-read <id>` its reader.
-struct BooksDevEntry: ViewModifier {
+/// A Debug UI-test run with the sign-in relay signs in by itself (no sheet
+/// to tap through). Books opens with `-tab books`, a reader with `-readBook <id>`
+/// (`Router.applyLaunchArguments`).
+struct SignInRelayAutoStart: ViewModifier {
     @Environment(AppModel.self) private var model
-    @State private var shown = false
-    @State private var target: Target?
-
-    enum Target: Hashable { case books, read(String) }
 
     func body(content: Content) -> some View {
-        content
-            .onChange(of: model.needsSignIn, initial: true) { _, needs in
-                // the relay signs in by itself (no sheet to tap through)
-                if needs, SignInRelay.configured != nil { Task { await model.signIn() } }
-            }
-            .onChange(of: model.treeLoaded && !model.needsSignIn && !model.isCheckingAuth, initial: true) { _, loaded in
-                guard loaded, !shown else { return }
-                let args = ProcessInfo.processInfo.arguments
-                if let i = args.firstIndex(of: "-read"), i + 1 < args.count {
-                    shown = true
-                    target = .read(args[i + 1])
-                } else if args.contains("-books") {
-                    shown = true
-                    target = .books
-                }
-            }
-            .fullScreenCover(item: Binding(get: { target.map(Wrap.init) }, set: { target = $0?.t })) { w in
-                switch w.t {
-                case .books: NavigationStack { BooksScreen() }
-                case let .read(id): BookReaderScreen(bookID: id)
-                }
-            }
-    }
-
-    struct Wrap: Identifiable {
-        let t: Target
-        var id: Target { t }
+        content.onChange(of: model.needsSignIn, initial: true) { _, needs in
+            if needs, SignInRelay.configured != nil { Task { await model.signIn() } }
+        }
     }
 }
 #endif

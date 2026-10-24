@@ -22,7 +22,7 @@ final class ReviewCounts {
         last = now
         // an older daemon without the route (or offline): keep what we had
         guard let items = try? await api.reviewQueue() else { return }
-        let fresh = DocReviewItem.counts(items)
+        let fresh = ReviewQueueItem.counts(items)
         if fresh != counts { counts = fresh }
     }
 

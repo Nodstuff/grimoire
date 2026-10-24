@@ -197,12 +197,6 @@ extension APIClient {
         return rows.filter(\.open)
     }
 
-    /// Every open review item the caller can see, across docs.
-    public func reviewQueue() async throws -> [DocReviewItem] {
-        let rows: [DocReviewItem] = try await get("/api/queue")
-        return rows.filter(\.open)
-    }
-
     /// Decide an item as the signed-in person (`POST /api/resolve`).
     public func resolveReview(_ annotationID: String, _ decision: DocReviewDecision) async throws {
         struct Req: Encodable { var annotation_id: String; var decision: DocReviewDecision }

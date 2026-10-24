@@ -7,7 +7,7 @@ public protocol BookService: Sendable {
     func books(search: String?, before: String?, limit: Int?) async throws -> BookPage
     func bookProgress(ids: [String]) async throws -> [String: BookProgress]
     func currentlyReading() async throws -> [ReadingBook]
-    func pairedEreaders() async throws -> [Ereader]
+    func ereaders() async throws -> [DevicePasswordReader]
     func updateBook(_ id: String, patch: BookPatch) async throws -> Book
     func deleteBook(_ id: String) async throws
     func epub(_ source: ReadingSource) async throws -> Data
@@ -63,13 +63,6 @@ extension APIClient: BookService {
         struct Answer: Decodable { var books: [ReadingBook] }
         let a: Answer = try await get("/api/books/currently-reading")
         return a.books
-    }
-
-    /// Named apart from Settings › E-readers' own `ereaders()` (the shell branch).
-    public func pairedEreaders() async throws -> [Ereader] {
-        struct Answer: Decodable { var ereaders: [Ereader] }
-        let a: Answer = try await get("/api/ereaders")
-        return a.ereaders
     }
 
     public func updateBook(_ id: String, patch: BookPatch) async throws -> Book {

@@ -31,6 +31,7 @@ struct SearchScreen: View {
             ask: ask,
             onOpen: { router.open(.doc($0)) },
             onOpenBook: { router.open(.book($0)) },
+            coverURL: { model.books.coverURL($0) },
             onAsk: runAsk
         )
         .searchable(text: $router.searchQuery, placement: .automatic, prompt: "Search docs, books, or ask")
@@ -56,7 +57,7 @@ struct SearchScreen: View {
             guard scope == .books else { return }
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled else { return }
-            books = await SearchBooks.load(router.searchQuery, api: model.api)
+            books = await SearchBooks.load(router.searchQuery, store: model.books)
         }
         // a new question forgets the old answer
         .onChange(of: router.searchQuery) { _, q in
@@ -106,25 +107,32 @@ enum SearchScope: String, CaseIterable, Hashable {
     }
 }
 
-/// Books matching the query (`GET /api/books?search=`, SERVER mode).
+/// Books whose title, author or series match: the Books shelf filtered on
+/// the device (`BookStore`, so it works offline from the cached shelf and
+/// agrees with the Books tab).
 enum SearchBooks: Equatable {
     case idle
     case loading
-    case found([TodayBook])
+    case found([Book])
     /// a server without books (LOCAL mode)
     case unavailable
     case failed(String)
 
-    static func load(_ query: String, api: APIClient?) async -> SearchBooks {
+    @MainActor static func load(_ query: String, store: BookStore) async -> SearchBooks {
         let q = query.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return .idle }
-        guard let api else { return .failed("Not connected.") }
-        do {
-            return .found(try await api.searchBooks(q))
-        } catch APIError.notFound {
-            return .unavailable
-        } catch {
-            return .failed(error.localizedDescription)
+        await store.load()
+        return found(q, in: store)
+    }
+
+    @MainActor static func found(_ q: String, in store: BookStore) -> SearchBooks {
+        switch store.availability {
+        case .unavailable: return .unavailable
+        case .unknown where store.shelf.books.isEmpty:
+            return .failed(store.loadError ?? "Not connected.")
+        default:
+            if store.shelf.books.isEmpty, let e = store.loadError { return .failed(e) }
+            return .found(store.shelf.shown(.all, query: q))
         }
     }
 }
@@ -180,6 +188,8 @@ struct SearchContent: View {
     var ask: AskState = .idle
     var onOpen: (DocID) -> Void = { _ in }
     var onOpenBook: (String) -> Void = { _ in }
+    /// a book's cover image (`BookStore.coverURL`)
+    var coverURL: (Book) -> URL? = { _ in nil }
     var onAsk: () -> Void = {}
 
     private var trimmed: String { query.trimmingCharacters(in: .whitespaces) }
@@ -301,7 +311,7 @@ struct SearchContent: View {
                     GroupedRows(items: list, separatorInset: 72) { b in
                         Button { onOpenBook(b.id) } label: {
                             HStack(spacing: 14) {
-                                BookCover(id: b.id, title: b.title, author: b.author.isEmpty ? nil : b.author).frame(width: 40)
+                                BookCover(id: b.id, title: b.title, author: b.authorName, imageURL: coverURL(b)).frame(width: 40)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(b.title).lapisFont(.cardTitle).foregroundStyle(Color.lapis.ink).lineLimit(2)
                                     let byline = ContinueReading.byline(b)

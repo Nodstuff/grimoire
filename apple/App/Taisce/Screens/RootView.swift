@@ -81,6 +81,8 @@ struct RootView: View {
             }
         }
         .environment(router)
+        // book covers sit behind the server's bearer (Today, Search, Books)
+        .environment(\.coverImageLoader, model.books.coverLoader)
         .tint(Color.lapis.accent)
         .sheet(isPresented: $router.showSettings) { SettingsScreen() }
         .sheet(isPresented: $router.showNewDoc) {
@@ -88,7 +90,7 @@ struct RootView: View {
         }
         .modifier(NewFolderPrompt(router: router, model: model))
         #if DEBUG
-        .modifier(BooksDevEntry()) // Books branch only: the shell's Books tab replaces it at merge
+        .modifier(SignInRelayAutoStart())
         #endif
         .onChange(of: sizeClass, initial: true) { _, size in router.isPad = RootLayout.make(horizontal: size) == .split }
         // the menu bar's commands act on the window in front
@@ -227,9 +229,8 @@ struct RouteView: View {
         case .doc(let id): DocScreen(docID: id).id(id)
         case .todos: TodosScreen()
         case .review: ReviewScreen()
-        // BooksHooks.swift: the Books agent's screens replace these at merge
-        case .book(let id): BookPlaceholder(id: id).id(id)
-        case .bookReader(let id): BookReaderPlaceholder(id: id).id(id)
+        case .book(let id): BookDetail(id: id).id(id)
+        case .bookReader(let id): BookReaderScreen(bookID: id).id(id)
         }
     }
 }
@@ -257,8 +258,7 @@ struct PhoneRoot: View {
             }
             Tab("Books", systemImage: "books.vertical", value: AppTab.books) {
                 NavigationStack(path: $router.booksPath) {
-                    // BooksHooks.swift: BooksScreen replaces this at merge
-                    BooksPlaceholder().navigationDestination(for: Route.self) { RouteView(route: $0) }
+                    BooksScreen().navigationDestination(for: Route.self) { RouteView(route: $0) }
                 }
             }
             Tab("To-dos", systemImage: "checkmark.circle", value: AppTab.todos) {
@@ -301,8 +301,7 @@ struct PadRoot: View {
         case .today?, nil: TodayScreen()
         case .todos?: TodosScreen()
         case .review?: ReviewScreen()
-        // BooksHooks.swift: BooksScreen replaces this at merge
-        case .books?: BooksPlaceholder()
+        case .books?: BooksScreen(filter: Bindable(router).bookShelf)
         case .search?: SearchScreen()
         case .doc(let id)?: DocScreen(docID: id).id(id)
         }
@@ -341,7 +340,14 @@ struct PadSidebar: View {
                                 badgeLabel: "open", selected: shown == .todos) { router.select(.todos) }
                     SidebarItem(title: "Review", systemImage: "flag", badge: model.home.summary.total, badgeTone: .attention,
                                 badgeLabel: "to review", selected: shown == .review) { router.select(.review) }
-                    SidebarItem(title: "Books", systemImage: "books.vertical", selected: shown == .books) { router.select(.books) }
+                    SidebarItem(title: "Books", systemImage: "books.vertical", badge: model.books.shelf.books.count,
+                                badgeLabel: "books", selected: shown == .books) {
+                        router.bookShelf = .all
+                        router.select(.books)
+                    }
+                    if shown == .books, model.books.availability == .available, !model.books.shelf.books.isEmpty {
+                        BooksSidebarSections()
+                    }
                     SidebarItem(title: "Search", systemImage: "magnifyingglass", shortcut: "\u{21E7}\u{2318}F", selected: shown == .search) {
                         router.select(.search)
                         router.focusSearch()
@@ -406,6 +412,9 @@ struct PadSidebar: View {
             await model.home.loadReview()
         }
         .task(id: model.todoRevision) { _ = await model.loadTodos() }
+        // the Books count (and the shelves under it) from the cached shelf, then the server's
+        .task(id: model.authPhase) { await model.books.load() }
+        .animation(Lapis.Motion.standard, value: shown == .books)
         .navigationTitle("Taisce")
         .toolbar {
             // the logo on the panel, not in a glass capsule

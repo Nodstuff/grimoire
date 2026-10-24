@@ -141,7 +141,7 @@ struct ReaderDeviceError: Error, Equatable {
 /// How a device or token's last use reads: "Last used 2 h ago", "Never used".
 enum LastUsed {
     static func text(_ rfc3339: String?, now: Date = .now) -> String {
-        guard let s = rfc3339, let d = ContinueReading.date(s) else { return "Never used" }
+        guard let s = rfc3339, let d = RFC3339.date(s) else { return "Never used" }
         return "Last used \(RelativeTime.string(d, now: now))"
     }
 }
@@ -309,7 +309,7 @@ struct EreaderDetailScreen: View {
                 LabeledContent("Name", value: ereader.label)
                 LabeledContent("Last used", value: LastUsed.text(ereader.lastUsedAt).replacingOccurrences(of: "Last used ", with: ""))
                 LabeledContent("Downloads", value: ereader.streamDownloads ? "Streamed through Taisce" : "Straight from storage")
-                if let added = ContinueReading.date(ereader.createdAt) {
+                if let added = RFC3339.date(ereader.createdAt) {
                     LabeledContent("Added", value: RelativeTime.string(added))
                 }
             }

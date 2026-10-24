@@ -27,6 +27,8 @@ final class BookStore {
     /// the last load's failure, when there is no shelf to fall back on (or a refresh failed)
     var loadError: String?
     private(set) var savedAt: Date?
+    /// the paired e-readers (the iPad/Mac sidebar's E-readers rows), active ones
+    private(set) var ereaders: [DevicePasswordReader] = []
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var cacheLoaded = false
     @ObservationIgnored let covers = CoverCache()
@@ -83,10 +85,12 @@ final class BookStore {
         do {
             let books = try await api.allBooks()
             async let reading = try? api.currentlyReading()
-            async let ereaders = try? api.pairedEreaders()
+            async let paired = try? api.ereaders()
             let progress = (try? await api.bookProgress(ids: books.map(\.id))) ?? shelf.progress
+            let active = (await paired)?.filter(\.isActive)
+            if let active { ereaders = active }
             let next = BookShelf(books: books, progress: progress, reading: await reading ?? [],
-                                 ereaderCount: (await ereaders)?.filter(\.isActive).count ?? shelf.ereaderCount)
+                                 ereaderCount: active?.count ?? shelf.ereaderCount)
             shelf = next
             availability = .available
             isStale = false
@@ -257,6 +261,7 @@ final class BookStore {
 
     /// Another server: its own shelf and covers (each server's stay on disk).
     func serverChanged() {
+        ereaders = []
         loadTask?.cancel()
         loadTask = nil
         shelf = BookShelf()
@@ -271,6 +276,7 @@ final class BookStore {
     /// Forget this person's books on this device: the shelf, its cache file,
     /// the covers, the reader's local places.
     func reset() {
+        ereaders = []
         loadTask?.cancel()
         loadTask = nil
         shelf = BookShelf()
