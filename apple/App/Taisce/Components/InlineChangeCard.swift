@@ -270,7 +270,8 @@ struct InlineChangeCard: View {
 struct CardActionStyle: ButtonStyle {
     enum Kind { case keep, apply, danger, outline }
     let kind: Kind
-    var height: CGFloat = Lapis.Layout.minTarget
+    /// a finger's 44 on iPhone and iPad, a pointer's 30 on the Mac (Mac-Main's Keep / Revert)
+    var height: CGFloat = Lapis.Layout.sidebarRow
     /// share the row's width
     var fill = true
 
@@ -299,7 +300,7 @@ private struct CardActionBody: View {
             .overlay { if kind == .outline { Capsule().strokeBorder(Color.lapis.line2, lineWidth: 1) } }
             .opacity(isEnabled ? (configuration.isPressed ? 0.75 : 1) : 0.5)
             .scaleEffect(configuration.isPressed ? 0.98 : 1)
-            .frame(minHeight: Lapis.Layout.minTarget)
+            .frame(minHeight: Lapis.Layout.sidebarRow)
             .contentShape(.rect)
             .animation(Lapis.Motion.fast, value: configuration.isPressed)
     }

@@ -33,7 +33,13 @@ private func item(_ id: String, _ kind: ReviewQueueItem.Kind, by proposer: Strin
     @Test func reviewCardSubtitleSaysWhatDecidingMeans() {
         #expect(ReviewCopy.subtitle(ReviewQueueSummary([item("1", .flagged)])) == "Already in your docs. Keep or revert.")
         #expect(ReviewCopy.subtitle(ReviewQueueSummary([item("1", .parked)])) == "Not applied yet. Apply or discard.")
-        #expect(ReviewCopy.subtitle(ReviewQueueSummary([item("1", .flagged), item("2", .parked), item("3", .parked)])) == "1 already in your docs, 2 waiting to apply.")
+        #expect(ReviewCopy.subtitle(ReviewQueueSummary([item("1", .flagged), item("2", .parked), item("3", .parked)])) == "1 in your docs · 2 to apply")
+        // Today's card: one row per doc, the parked verdict first, a count
+        let g = ReviewCopy.groups([item("1", .flagged), item("2", .parked), item("1b", .flagged)].map { var i = $0; if i.id == "1b" { i.docID = "d1" }; return i })
+        #expect(g.map(\.docID) == ["d1", "d2"])
+        #expect(g[0].count == 2 && g[0].kind == .flagged && g[0].proposer == "claude:docs")
+        #expect(ReviewCopy.groups([item("1", .flagged), item("2", .parked, by: "keeper:API")].map { var i = $0; i.docID = "dx"; return i })[0].kind == .parked)
+        #expect(ReviewCopy.groups([item("1", .flagged), item("2", .parked, by: "keeper:API")].map { var i = $0; i.docID = "dx"; return i })[0].proposer == "2 agents")
     }
 
     @Test func decisionsAreNamedByKindAndADocDeleteAsksFirst() {

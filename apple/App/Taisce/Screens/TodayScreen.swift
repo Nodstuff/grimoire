@@ -24,6 +24,7 @@ struct TodayScreen: View {
             due: TodoBoard.shown(board, hasSynced: model.hasSynced, status: model.syncStatus).map { TodayDue.rows($0) },
             pinned: pinnedCards,
             onReview: router.showReview,
+            reviewPath: model.reviewPath,
             onOpen: { router.open(.doc($0)) },
             onRead: { router.readBook($0.book.id) },
             onBooks: router.showBooks,
@@ -140,6 +141,8 @@ struct TodayContent: View {
     let pinned: [PinnedCard]
     var now: Date = .now
     var onReview: () -> Void = {}
+    /// where a doc lives, before its title on the review rows ("Family › Holidays 2027")
+    var reviewPath: (DocID) -> String? = { _ in nil }
     var onOpen: (DocID) -> Void = { _ in }
     var onRead: (ReadingBook) -> Void = { _ in }
     var onBooks: () -> Void = {}
@@ -216,15 +219,16 @@ struct TodayContent: View {
             .buttonStyle(.plain)
             .accessibilityHint("Opens the review list")
             .accessibilityIdentifier("today.review")
-            ForEach(items.prefix(Self.reviewRows)) { item in
+            let groups = ReviewCopy.groups(items)
+            ForEach(groups.prefix(Self.reviewRows)) { group in
                 Rectangle().fill(Color.lapis.line2).frame(height: 1)
-                Button { onOpen(item.docID) } label: { ReviewRowLabel(item: item) }
+                Button { onOpen(group.docID) } label: { ReviewRowLabel(group: group, path: reviewPath(group.docID)) }
                     .buttonStyle(.plain)
             }
-            if items.count > Self.reviewRows {
+            if groups.count > Self.reviewRows {
                 Rectangle().fill(Color.lapis.line2).frame(height: 1)
                 Button(action: onReview) {
-                    Text("\(items.count - Self.reviewRows) more").font(.subheadline.weight(.medium)).foregroundStyle(Color.lapis.accent)
+                    Text("\(groups.count - Self.reviewRows) more").font(.subheadline.weight(.medium)).foregroundStyle(Color.lapis.accent)
                         .frame(maxWidth: .infinity, minHeight: Lapis.Layout.minTarget, alignment: .leading)
                         .contentShape(.rect)
                 }
@@ -418,9 +422,11 @@ struct SyncDotLabel: View {
     }
 }
 
-/// A queued change on Today's card: verdict, doc, who.
+/// A doc's waiting changes on Today's card: verdict, where it lives and
+/// its title, how many, who.
 struct ReviewRowLabel: View {
-    let item: ReviewQueueItem
+    let group: ReviewDocGroup
+    var path: String?
     @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
@@ -429,16 +435,25 @@ struct ReviewRowLabel: View {
             ? AnyLayout(VStackLayout(alignment: .leading, spacing: 4))
             : AnyLayout(HStackLayout(spacing: 10))
         layout {
-            VerdictChip(ReviewCopy.verdict(item.kind), short: true)
-            Text(item.docTitle.isEmpty ? "Untitled" : item.docTitle)
+            VerdictChip(ReviewCopy.verdict(group.kind), short: true)
+            HStack(spacing: 6) {
+                // "Family › Holidays 2027" when it fits; else the title alone
+                // (a path cut to "F…" says nothing)
+                ViewThatFits(in: .horizontal) {
+                    if let path {
+                        Text(path + DocIndex.separator + group.docTitle).lineLimit(1).fixedSize()
+                    }
+                    Text(group.docTitle).lineLimit(typeSize.isAccessibilitySize ? 3 : 1)
+                }
                 .lapisFont(.cardTitle, weight: .medium)
                 .foregroundStyle(Color.lapis.ink)
-                .lineLimit(typeSize.isAccessibilitySize ? 3 : 1)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                if group.count > 1 { CountPill(n: group.count, label: "changes") }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             // agents in mono violet, people in the interface face
-            Text(item.proposer)
-                .font(item.byAgent ? .lapisMono(.caption) : .footnote)
-                .foregroundStyle(item.byAgent ? Color.lapis.agent : Color.lapis.ink3)
+            Text(group.proposer)
+                .font(group.byAgent ? .lapisMono(.caption) : .footnote)
+                .foregroundStyle(group.byAgent ? Color.lapis.agent : Color.lapis.ink3)
                 .lineLimit(1)
         }
         .padding(.vertical, typeSize.isAccessibilitySize ? 8 : 0)

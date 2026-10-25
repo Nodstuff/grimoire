@@ -157,21 +157,42 @@ struct DocScreen: View {
     /// iPad and the Mac: the crumbs, then share, … and the inspector toggle.
     @ToolbarContentBuilder
     private func surfaceToolbar(_ surface: SurfaceModel) -> some ToolbarContent {
-        // the Mac's bar shows no principal item: the title leads there (Mac-Main)
         #if targetEnvironment(macCatalyst)
+        // Mac-Main: ‹ › and the title leading; a "Search or ask" field, then
+        // New doc, Share, … and the inspector as plain icons (a tinted bar
+        // button turns into a filled circle on the Mac: the tint is cleared)
+        ToolbarItemGroup(placement: .navigation) {
+            Button { router.goBack() } label: { Label("Back", systemImage: "chevron.left") }
+                .disabled(!router.canGoBack).tint(nil).help("Back (⌘[)")
+            Button { router.goForward() } label: { Label("Forward", systemImage: "chevron.right") }
+                .disabled(!router.canGoForward).tint(nil).help("Forward (⌘])")
+        }
         ToolbarItem(placement: .navigation) {
             DocBarTitle(title: title, crumbs: model.index.ancestors(of: docID).map(\.title),
                         workspace: model.workspaceBadge(for: docID)?.name,
-                        save: saveState(surface), wide: sizeClass == .regular)
+                        save: saveState(surface), wide: sizeClass == .regular, stacked: true)
         }
         .sharedBackgroundVisibility(.hidden)
+        ToolbarItem(placement: .primaryAction) { ToolbarSearchField() }
+            .sharedBackgroundVisibility(.hidden)
+        ToolbarSpacer(.fixed, placement: .primaryAction)
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button { router.newDoc() } label: { Label("New doc", systemImage: "square.and.pencil") }
+                .disabled(!model.currentAccess.canCreate).tint(nil).help("New doc (⌘N)")
+            if model.shareLinks.isAvailable, access.canEdit, page != nil {
+                Button { shareLink(surface) } label: { Label("Share link", systemImage: "square.and.arrow.up") }
+                    .tint(nil).help("Share link…")
+            }
+            Menu { moreMenuItems(surface) } label: { Label("More", systemImage: "ellipsis") }
+                .accessibilityLabel("More")
+            inspectorButton(surface)
+        }
         #else
         ToolbarItem(placement: .principal) {
             DocBarTitle(title: title, crumbs: model.index.ancestors(of: docID).map(\.title),
                         workspace: model.workspaceBadge(for: docID)?.name,
                         save: saveState(surface), wide: sizeClass == .regular)
         }
-        #endif
         if sizeClass == .regular {
             ToolbarItemGroup(placement: .primaryAction) {
                 if model.shareLinks.isAvailable, access.canEdit, page != nil {
@@ -207,6 +228,7 @@ struct DocScreen: View {
                     .accessibilityLabel("More")
             }
         }
+        #endif
     }
 
     /// The inspector toggle; a yellow dot while changes wait for a look.
@@ -218,12 +240,22 @@ struct DocScreen: View {
             Label {
                 Text("Inspector")
             } icon: {
+                #if targetEnvironment(macCatalyst)
+                // the Mac's bar draws an original-colour image as a filled disc:
+                // the plain symbol (the count is in the inspector's Review tab)
+                Image(systemName: "sidebar.right")
+                #else
                 // a yellow dot while changes wait (drawn into the symbol: the
                 // bar keeps only a label's image)
                 Image(uiImage: InspectorGlyph.image(dot: waiting > 0, dark: colorScheme == .dark))
+                #endif
             }
         }
+        #if targetEnvironment(macCatalyst)
+        .tint(nil)
+        #else
         .tint(showInspector && sizeClass == .regular ? Color.lapis.accent : Color.lapis.ink)
+        #endif
         .accessibilityLabel(waiting > 0 ? "Inspector: \(waiting == 1 ? "1 change" : "\(waiting) changes") to review" : "Inspector")
         .accessibilityIdentifier("doc.inspector")
         .help("Inspector")
@@ -584,7 +616,7 @@ struct DocHeader: View {
             out += part
         }
         if let v = b.version, v > 0 { out += AttributedString(" · v\(v)") }
-        if let d = b.edited { out += AttributedString(" · edited \(ShortWhen.string(d, now: now))") }
+        if let d = b.edited { out += AttributedString(" · edited \(ShortWhen.inSentence(d, now: now))") }
         return out
     }
 }
@@ -625,9 +657,31 @@ struct DocBarTitle: View {
     var workspace: String?
     let save: (SaveState, String?)
     var wide = false
+    /// the Mac's bar (Mac-Main): the title over "Work › Taisce · Saved"
+    var stacked = false
 
     var body: some View {
-        if wide {
+        if stacked {
+            VStack(alignment: .leading, spacing: 0) {
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(Color.lapis.ink)
+                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    let path = ([workspace].compactMap { $0 } + crumbs).joined(separator: DocIndex.separator)
+                    if !path.isEmpty {
+                        Text(path + " \u{00B7}").lineLimit(1).truncationMode(.head)
+                    }
+                    Text(save.1 ?? save.0.word)
+                }
+                .font(.footnote)
+                .foregroundStyle(Color.lapis.ink3)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: 420, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("editor.chip")
+        } else if wide {
             HStack(spacing: 10) {
                 Text(crumbText)
                     .font(.subheadline)

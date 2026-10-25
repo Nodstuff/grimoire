@@ -31,6 +31,9 @@ struct DocInspector: View {
     @State private var backlinks: [Backlink]?
     @State private var members: [WorkspaceMember] = []
     @State private var detent: PresentationDetent = .large
+    @State private var draft = ""
+    @State private var posting = false
+    @State private var postError: String?
 
     private var items: [DocReviewItem] { surface?.reviewItems ?? [] }
     private var title: String { model.index.byID[docID]?.title ?? "" }
@@ -54,6 +57,7 @@ struct DocInspector: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .scrollBounceBehavior(.basedOnSize)
+            if tab == .comments, let surface, surface.editable { composer(surface) }
         }
         .padding(.top, asSheet ? 6 : 10)
         .background((asSheet ? Color.lapis.bg : Color.lapis.panel).ignoresSafeArea())
@@ -157,6 +161,47 @@ struct DocInspector: View {
                 .accessibilityElement(children: .combine)
                 .onTapGesture { if let b = c.refersTo { show(b) } }
             }
+        }
+    }
+
+    /// "Comment on selection" (Mac-Main): a comment on the block under the
+    /// caret; Return sends.
+    private func composer(_ surface: SurfaceModel) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SectionLabel("Comment on selection")
+            TextField("Add a comment", text: $draft, axis: .vertical)
+                .lineLimit(1...4)
+                .font(.subheadline)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(Color.lapis.card, in: .rect(cornerRadius: Lapis.Radius.field, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: Lapis.Radius.field, style: .continuous).strokeBorder(Color.lapis.line2, lineWidth: 1))
+                .disabled(posting)
+                .submitLabel(.send)
+                .onSubmit { Task { await post(surface) } }
+                .accessibilityIdentifier("inspector.comment")
+            Text(postError ?? "Return to send \u{00B7} on the paragraph your caret is in")
+                .font(.caption)
+                .foregroundStyle(postError == nil ? Color.lapis.ink3 : Color.lapis.red)
+        }
+        .padding(.horizontal, asSheet ? 16 : 14)
+        .padding(.bottom, 12)
+    }
+
+    private func post(_ surface: SurfaceModel) async {
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, let api = model.api else { return }
+        guard let block = surface.currentBlock?.id else { postError = "Put the caret in a paragraph first."; return }
+        posting = true
+        defer { posting = false }
+        do {
+            try await api.addComment(blockID: block, text: text)
+            draft = ""
+            postError = nil
+            try? await model.sync?.catchUp()
+            await loadComments()
+        } catch {
+            postError = ReviewCopy.failure(error)
         }
     }
 

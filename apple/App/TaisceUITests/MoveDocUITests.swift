@@ -387,8 +387,8 @@ final class MoveDocUITests: XCTestCase {
         #endif
     }
 
-    /// The sidebar's workspace switcher opens its sheets (they must have the
-    /// app model: Move to… crashed without it).
+    /// A workspace section's menu opens the workspace sheets (they must have
+    /// the app model: Move to… crashed without it).
     func testWorkspaceSheetsOpenFromTheSidebar() throws {
         #if !targetEnvironment(macCatalyst)
         throw XCTSkip("the sidebar switcher: the Mac and iPad")
@@ -406,10 +406,11 @@ final class MoveDocUITests: XCTestCase {
             }
         }
         let app = launch()
-        let switcher = app.buttons.matching(NSPredicate(format: "label CONTAINS 'Unsorted' OR label BEGINSWITH 'Ws '")).firstMatch
-        XCTAssertTrue(switcher.waitForExistence(timeout: 20), "the switcher shows")
+        // each workspace is a section of the sidebar; a header's menu has the sheets
+        let header = app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH 'sidebar.workspace.'")).firstMatch
+        XCTAssertTrue(header.waitForExistence(timeout: 20), "the workspace sections show")
         for item in ["New workspace\u{2026}", "Manage workspaces"] {
-            switcher.click()
+            header.rightClick()
             let menuItem = app.menuItems[item].firstMatch
             XCTAssertTrue(menuItem.waitForExistence(timeout: 5), "the switcher offers \(item)")
             menuItem.click()

@@ -115,6 +115,13 @@ enum ShortWhen {
         return f.string(from: date)
     }
 
+    /// Inside a sentence ("edited yesterday", "edited 12:41", "edited Tue"):
+    /// the list's "Yest." reads oddly in a byline.
+    static func inSentence(_ date: Date, now: Date = .now, calendar: Calendar = .current) -> String {
+        let s = string(date, now: now, calendar: calendar)
+        return s == "Yest." ? "yesterday" : s
+    }
+
     /// What VoiceOver says for it.
     static func spoken(_ date: Date, now: Date = .now) -> String {
         "edited \(RelativeTime.string(date, now: now))"

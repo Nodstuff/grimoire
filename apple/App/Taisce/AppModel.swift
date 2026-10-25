@@ -649,14 +649,21 @@ final class AppModel {
         }
     }
 
-    /// Where this workspace's to-dos live, as the Library's breadcrumb reads
-    /// it: the workspace (when there are several), the folders, the To-do doc
-    /// ("Home › To-do"). Rows add the day they were written under.
+    /// Where this workspace's to-dos live, short: the workspace's name (or,
+    /// without workspaces, the To-do doc's title). Rows add the day they
+    /// were written under ("Work › Mon 19 Oct").
     var todoListPath: String? {
+        if hasWorkspaces, let ws = currentWorkspace { return workspacePicker.name(ws) }
         guard let id = todoDocID, let doc = index.byID[id] else { return nil }
-        var parts = index.ancestors(of: id).map(\.title) + [doc.title]
-        if hasWorkspaces, let ws = currentWorkspace { parts.insert(workspacePicker.name(ws), at: 0) }
-        return parts.joined(separator: DocIndex.separator)
+        return doc.title
+    }
+
+    /// Where a doc lives, for Today's review rows: its workspace (when there
+    /// are several) and the folders above it ("Family", "Work › Taisce").
+    func reviewPath(_ id: DocID) -> String? {
+        var parts = index.ancestors(of: id).map(\.title)
+        if hasWorkspaces, let ws = index.byID[id]?.workspaceID { parts.insert(workspacePicker.name(.id(ws)), at: 0) }
+        return parts.isEmpty ? nil : parts.joined(separator: DocIndex.separator)
     }
 
     /// Switch workspace: remembered per server, and every screen re-reads.

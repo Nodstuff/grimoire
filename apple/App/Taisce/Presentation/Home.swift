@@ -45,8 +45,20 @@ enum ReviewCopy {
         switch (summary.flagged, summary.parked) {
         case (_, 0): "Already in your docs. Keep or revert."
         case (0, _): "Not applied yet. Apply or discard."
-        case let (f, p): "\(f) already in your docs, \(p) waiting to apply."
+        case let (f, p): "\(f) in your docs \u{00B7} \(p) to apply"
         }
+    }
+
+    /// One row per doc on Today's card (the web's queue groups the same way):
+    /// "Holidays 2027" with 2 changes is one row with a count, not two rows.
+    static func groups(_ items: [ReviewQueueItem]) -> [ReviewDocGroup] {
+        var order: [DocID] = []
+        var byDoc: [DocID: [ReviewQueueItem]] = [:]
+        for i in items {
+            if byDoc[i.docID] == nil { order.append(i.docID) }
+            byDoc[i.docID, default: []].append(i)
+        }
+        return order.compactMap { id in byDoc[id].map { ReviewDocGroup(items: $0) } }
     }
 
     static func verdict(_ kind: ReviewQueueItem.Kind) -> Verdict {
@@ -70,6 +82,27 @@ enum ReviewCopy {
         case let e as APIError where e.isForbidden: "You can't decide changes in this workspace."
         default: error.localizedDescription
         }
+    }
+}
+
+/// A doc's waiting changes, as one row: the most pressing verdict (parked
+/// before flagged), who proposed them, how many.
+struct ReviewDocGroup: Identifiable, Hashable {
+    let items: [ReviewQueueItem]
+
+    var id: DocID { items[0].docID }
+    var docID: DocID { items[0].docID }
+    var docTitle: String { items[0].docTitle.isEmpty ? "Untitled" : items[0].docTitle }
+    var count: Int { items.count }
+    var kind: ReviewQueueItem.Kind { items.contains { $0.kind == .parked } ? .parked : .flagged }
+    var byAgent: Bool { items.allSatisfy(\.byAgent) }
+
+    /// "claude:home", or "2 agents" / "2 people" when several proposed
+    var proposer: String {
+        var names: [String] = []
+        for i in items where !names.contains(i.proposer) { names.append(i.proposer) }
+        if names.count == 1 { return names[0] }
+        return byAgent ? "\(names.count) agents" : "\(names.count) people"
     }
 }
 

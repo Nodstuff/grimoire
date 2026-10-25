@@ -43,6 +43,8 @@ enum AppCommand: Hashable {
     /// ⇧⌘I: Books, then the EPUB picker
     case addBooks
     case books, review
+    /// ⌘[ / ⌘]: back and forward through what the split view showed
+    case back, forward
     /// ⌘F: find in the doc in front (Decision 2: ⇧⌘F is Search)
     case findInDoc
     /// the doc in front: Share link… and Export as PDF… (SERVER mode)
@@ -128,6 +130,7 @@ final class Router {
 
     func open(_ route: Route) {
         if isPad {
+            remember()
             padPath.append(route)
             return
         }
@@ -142,8 +145,46 @@ final class Router {
 
     /// A sidebar doc replaces the detail stack; a doc linked from a doc pushes.
     func select(_ item: PadItem) {
+        remember()
         padItem = item
         padPath = []
+    }
+
+    // MARK: back and forward (the split view: the Mac's and iPad's toolbar, ⌘[ ⌘])
+
+    struct Place: Equatable {
+        var item: PadItem?
+        var path: [Route]
+    }
+
+    private(set) var backPlaces: [Place] = []
+    private(set) var forwardPlaces: [Place] = []
+    var canGoBack: Bool { !backPlaces.isEmpty }
+    var canGoForward: Bool { !forwardPlaces.isEmpty }
+    private var here: Place { Place(item: padItem, path: padPath) }
+
+    /// Before the split view moves: where it was, for Back (a new move clears Forward).
+    private func remember() {
+        guard isPad else { return }
+        if backPlaces.last != here { backPlaces.append(here) }
+        if backPlaces.count > 50 { backPlaces.removeFirst() }
+        forwardPlaces = []
+    }
+
+    func goBack() {
+        // a stack's own Back (the system's) may already have left a place: skip those
+        while let last = backPlaces.last, last == here { backPlaces.removeLast() }
+        guard let place = backPlaces.popLast() else { return }
+        forwardPlaces.append(here)
+        padItem = place.item
+        padPath = place.path
+    }
+
+    func goForward() {
+        guard let place = forwardPlaces.popLast() else { return }
+        backPlaces.append(here)
+        padItem = place.item
+        padPath = place.path
     }
 
     /// What the sidebar highlights: the screen in front, not the item the
@@ -242,6 +283,8 @@ final class Router {
         case .newDoc, .newFolder, .addBooks: return canCreate
         case .newDocHere: return canCreate && focusedDoc != nil
         case .toggleSidebar: return isPad
+        case .back: return isPad && canGoBack
+        case .forward: return isPad && canGoForward
         case .findInDoc: return focusedDoc != nil
         case .workspace(let n): return picker.shortcut(n) != nil
         default: return true
@@ -307,6 +350,10 @@ final class Router {
             showBooks()
         case .review:
             showReview()
+        case .back:
+            goBack()
+        case .forward:
+            goForward()
         case .refresh:
             return .refresh
         case .findInDoc:

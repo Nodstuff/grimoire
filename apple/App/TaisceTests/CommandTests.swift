@@ -86,6 +86,29 @@ private let picker = WorkspacePicker(workspaces: [work, home], unsortedCount: 2,
         #expect(ActionsPalette.matching("") { $0 != .exportPDF }.allSatisfy { $0.command != .exportPDF })
     }
 
+    @Test func backAndForwardRetraceTheSplitView() {
+        let r = Router()
+        r.isPad = true
+        #expect(!r.canPerform(.back, signedIn: true, picker: picker))
+        r.select(.doc("a"))
+        r.open(.doc("b"))
+        r.select(.books)
+        #expect(r.canGoBack && !r.canGoForward)
+        _ = r.perform(.back, picker: picker)
+        #expect(r.padItem == .doc("a") && r.padPath == [.doc("b")])
+        _ = r.perform(.back, picker: picker)
+        #expect(r.padItem == .doc("a") && r.padPath.isEmpty)
+        _ = r.perform(.forward, picker: picker)
+        #expect(r.padPath == [.doc("b")] && r.canGoForward)
+        // a new move drops Forward
+        r.select(.todos)
+        #expect(!r.canGoForward && r.canGoBack)
+        // the phone has its own Back
+        let phone = Router()
+        phone.open(.doc("x"))
+        #expect(!phone.canGoBack)
+    }
+
     @Test func nothingRunsBeforeSignIn() {
         let r = Router()
         for c in [AppCommand.newDoc, .search, .refresh, .settings, .today, .todos, .workspace(1)] {

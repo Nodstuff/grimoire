@@ -59,6 +59,9 @@ struct TaisceCommands: Commands {
             item("Show or Hide Sidebar", .toggleSidebar).keyboardShortcut("\\")
         }
         CommandMenu("Go") {
+            item("Back", .back).keyboardShortcut("[")
+            item("Forward", .forward).keyboardShortcut("]")
+            Divider()
             item("Actions\u{2026}", .actions).keyboardShortcut("k")
             item("Search", .search).keyboardShortcut("f", modifiers: [.command, .shift])
             Divider()

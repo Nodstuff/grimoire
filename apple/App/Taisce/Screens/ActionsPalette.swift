@@ -98,3 +98,32 @@ struct ActionsPalette: View {
         }
     }
 }
+
+/// The Mac bar's "Search or ask ⇧⌘F" (Mac-Main): a real field (the Mac's
+/// bar draws a Button as its icon alone); typing opens Search on what you
+/// typed, Return asks.
+struct ToolbarSearchField: View {
+    @Environment(Router.self) private var router
+
+    var body: some View {
+        @Bindable var router = router
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass").foregroundStyle(Color.lapis.ink3).accessibilityHidden(true)
+            TextField("Search or ask", text: $router.searchQuery)
+                .textFieldStyle(.plain)
+                .onSubmit { router.showSearch() }
+                .onChange(of: router.searchQuery) { _, q in
+                    if !q.isEmpty, router.sidebarSelection != .search { router.showSearch() }
+                }
+            Text("\u{21E7}\u{2318}F").font(.caption).foregroundStyle(Color.lapis.ink3).accessibilityHidden(true)
+        }
+        .font(.subheadline)
+        .padding(.horizontal, 10)
+        .frame(width: 240, height: 28)
+        .background(Color.lapis.card, in: .capsule)
+        .overlay(Capsule().strokeBorder(Color.lapis.line2, lineWidth: 1))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Search or ask")
+        .accessibilityIdentifier("toolbar.search")
+    }
+}

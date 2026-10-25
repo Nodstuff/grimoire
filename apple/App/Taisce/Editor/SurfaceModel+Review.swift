@@ -188,6 +188,28 @@ final class SurfaceLayoutDelegate: NSObject, NSTextLayoutManagerDelegate {
         return NSTextLayoutFragment(textElement: textElement, range: textElement.elementRange)
     }
 
+    /// A short inline code span (`/mcp`, `taisce-store`) stays on one line:
+    /// broken at its "/" or "-" it drew as two half pills.
+    func textLayoutManager(_ textLayoutManager: NSTextLayoutManager, shouldBreakLineBefore location: any NSTextLocation,
+                           hyphenating: Bool) -> Bool {
+        guard let storage = textLayoutManager.textContentManager as? NSTextContentStorage,
+              let text = storage.textStorage else { return true }
+        let offset = storage.offset(from: storage.documentRange.location, to: location)
+        return !Self.isInsideShortCode(text, at: offset)
+    }
+
+    /// The longest code span kept whole; longer ones may wrap.
+    static let unbreakableCode = 28
+
+    /// `offset` falls strictly inside a code run no longer than `unbreakableCode`.
+    static func isInsideShortCode(_ s: NSAttributedString, at offset: Int) -> Bool {
+        guard offset > 0, offset < s.length else { return false }
+        var run = NSRange()
+        let v = s.attribute(Surface.marks, at: offset, longestEffectiveRange: &run, in: NSRange(location: 0, length: s.length))
+        guard InlineMarks(rawValue: (v as? Int) ?? 0).contains(.code) else { return false }
+        return offset > run.location && run.length <= unbreakableCode
+    }
+
     /// Whether the line holds an inline code run.
     static func hasCode(_ s: NSAttributedString) -> Bool {
         var found = false

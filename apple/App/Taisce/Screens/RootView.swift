@@ -342,6 +342,8 @@ struct PadSidebar: View {
     @State private var scroller = TreeScroller()
     /// the selection changed by a click in the tree (already in view: no scroll)
     @State private var fromTree = false
+    @State private var creatingWorkspace = false
+    @State private var managingWorkspaces = false
 
     /// The doc in front, and the folders above it (open, so its row shows).
     private var front: (selection: PadItem?, reveal: Set<DocID>) {
@@ -376,37 +378,54 @@ struct PadSidebar: View {
                         router.select(.search)
                         router.focusSearch()
                     }
-                    // drop a dragged doc on the header: the top level
-                    HStack {
-                        if model.hasWorkspaces {
-                            SidebarWorkspaceRow()
-                        } else {
+                    // every workspace its own section, the current one open with its
+                    // tree (Mac-Main, iPad-Library-Doc); a header switches to it (⌘1…⌘9)
+                    if model.hasWorkspaces {
+                        let picker = model.workspacePicker
+                        ForEach(Array(picker.options.enumerated()), id: \.element) { i, scope in
+                            let current = scope == picker.current
+                            WorkspaceSectionHeader(scope: scope, picker: picker, number: i + 1, current: current,
+                                                   canCreate: current && model.currentAccess.canCreate,
+                                                   onSelect: { model.selectWorkspace(scope) },
+                                                   onNewFolder: { router.newFolder(in: nil) },
+                                                   onNewWorkspace: { creatingWorkspace = true },
+                                                   onManage: { managingWorkspaces = true })
+                                .modifier(TopLevelDropIf(on: current, mover: docMover))
+                            if current {
+                        LibraryTree(nodes: model.library, expanded: $expanded, reveal: reveal, selected: selectedDoc,
+                                pins: Set(model.pins), style: .sidebar, onOpen: { fromTree = true; router.select(.doc($0)) }) { node in
+                            rowMenu(node)
+                        }
+                            }
+                        }
+                    } else {
+                        HStack {
                             Text("Library".uppercased())
                                 .lapisFont(.label)
                                 .foregroundStyle(Color.lapis.ink3)
                                 .accessibilityLabel("Library")
                                 .accessibilityAddTraits(.isHeader)
-                        }
-                        Spacer()
-                        if model.currentAccess.canCreate {
-                            Button { router.newFolder(in: nil) } label: {
-                                Image(systemName: "folder.badge.plus").foregroundStyle(Color.lapis.ink3)
-                                    .frame(width: 30, height: 30).contentShape(.rect)
+                            Spacer()
+                            if model.currentAccess.canCreate {
+                                Button { router.newFolder(in: nil) } label: {
+                                    Image(systemName: "folder.badge.plus").foregroundStyle(Color.lapis.ink3)
+                                        .frame(width: 30, height: 30).contentShape(.rect)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("New folder")
+                                .accessibilityIdentifier("tree.newFolder")
+                                .help("New folder (⇧⌘N)")
                             }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("New folder")
-                            .accessibilityIdentifier("tree.newFolder")
-                            .help("New folder (⇧⌘N)")
                         }
-                    }
-                    .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
-                    .padding(.top, 12)
-                    .padding(.leading, 6)
-                    .contentShape(.rect)
-                    .docTopLevelDrop(mover: docMover)
+                        .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+                        .padding(.top, 12)
+                        .padding(.leading, 6)
+                        .contentShape(.rect)
+                        .docTopLevelDrop(mover: docMover)
                     LibraryTree(nodes: model.library, expanded: $expanded, reveal: reveal, selected: selectedDoc,
                             pins: Set(model.pins), style: .sidebar, onOpen: { fromTree = true; router.select(.doc($0)) }) { node in
                         rowMenu(node)
+                    }
                     }
                 }
                 .padding(.horizontal, 10)
@@ -441,39 +460,25 @@ struct PadSidebar: View {
         .animation(Lapis.Motion.standard, value: shown == .books)
         .navigationTitle("Taisce")
         .toolbar {
-            // the logo on the panel, not in a glass capsule
+            #if !targetEnvironment(macCatalyst)
+            // iPad-Library-Doc: the logo on the panel; the Mac's sidebar starts
+            // with its traffic lights alone (Mac-Main)
             ToolbarItem(placement: .topBarLeading) { SidebarBrand() }.sharedBackgroundVisibility(.hidden)
+            #endif
             ToolbarItem(placement: .principal) { Color.clear.frame(width: 1, height: 1).accessibilityHidden(true) }
-            ToolbarItem(placement: .primaryAction) {
-                // ⌘N is the menu bar's (TaisceCommands)
-                Button { router.newDoc() } label: { Image(systemName: "square.and.pencil") }
-                    .accessibilityLabel("New doc")
-                    .help("New doc (⌘N)")
-                    .disabled(!model.currentAccess.canCreate)
-            }
         }
         .safeAreaInset(edge: .bottom) {
-            HStack {
-                SyncChip(badge: SyncBadge.make(status: model.syncStatus, pending: model.pendingWrites))
-                Spacer()
-                // no pull to refresh with a pointer
-                Button { Task { try? await model.sync?.catchUp() } } label: {
-                    Image(systemName: "arrow.clockwise").frame(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget)
-                }
-                .accessibilityLabel("Refresh")
-                .help("Refresh (⌘R)")
-                Button { router.showSettings = true } label: {
-                    Image(systemName: "gearshape").frame(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget)
-                }
-                .accessibilityLabel("Settings")
-                .help("Settings (⌘,)")
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 6)
-            // the tree scrolls under it: a bar, not text over rows
-            .background(Color.lapis.panel)
-            .overlay(alignment: .top) { Rectangle().fill(Color.lapis.line).frame(height: 1) }
+            // the avatar and the sync state (Mac-Main); Settings and Refresh in
+            // the avatar's menu, and on ⌘, / ⌘R
+            SidebarAccountFooter()
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                // the tree scrolls under it: a bar, not text over rows
+                .background(Color.lapis.panel)
+                .overlay(alignment: .top) { Rectangle().fill(Color.lapis.line).frame(height: 1).padding(.horizontal, 10) }
         }
+        .sheet(isPresented: $creatingWorkspace) { NewWorkspaceSheet().environment(model) }
+        .sheet(isPresented: $managingWorkspaces) { ManageWorkspacesSheet().environment(model) }
         .refreshable { try? await model.sync?.catchUp() }
     }
 
@@ -594,6 +599,122 @@ private struct SidebarItem: View {
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
         .accessibilityAction { action() }
         .accessibilityIdentifier("sidebar.\(title.lowercased())")
+    }
+}
+
+/// The current workspace's color, or the accent.
+private func sectionColor(_ picker: WorkspacePicker, _ scope: WorkspaceScope) -> Color {
+    Color(workspaceColor: picker.color(scope)) ?? Color.lapis.accent
+}
+
+/// A workspace's section header in the sidebar: "■ WORK  ⌘1" (the current
+/// one, its tree below), "HOME  ⌘2", "FAMILY · SHARED  ⌘3". A click
+/// switches; its menu adds a folder or a workspace, or manages them.
+struct WorkspaceSectionHeader: View {
+    let scope: WorkspaceScope
+    let picker: WorkspacePicker
+    let number: Int
+    let current: Bool
+    let canCreate: Bool
+    let onSelect: () -> Void
+    let onNewFolder: () -> Void
+    let onNewWorkspace: () -> Void
+    let onManage: () -> Void
+    @State private var pointer = false
+
+    private var title: String {
+        picker.name(scope).uppercased() + (picker.isShared(scope) ? " \u{00B7} SHARED" : "")
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if current {
+                RoundedRectangle(cornerRadius: 2.5, style: .continuous).fill(sectionColor(picker, scope))
+                    .frame(width: 9, height: 9).accessibilityHidden(true)
+            }
+            Text(title)
+                .lapisFont(.label)
+                .foregroundStyle(current ? Color.lapis.ink2 : Color.lapis.ink3)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            if current, canCreate, pointer {
+                Button(action: onNewFolder) {
+                    Image(systemName: "folder.badge.plus").font(.footnote).foregroundStyle(Color.lapis.ink3)
+                        .frame(width: 24, height: 24).contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("New folder")
+                .help("New folder (⇧⌘N)")
+            }
+            if number <= 9 {
+                Text("\u{2318}\(number)").font(.caption).foregroundStyle(Color.lapis.ink3).accessibilityHidden(true)
+            }
+        }
+        .padding(.leading, 10)
+        .padding(.trailing, 10)
+        .padding(.top, 14)
+        .frame(maxWidth: .infinity, minHeight: Lapis.Layout.sidebarRow, alignment: .leading)
+        .contentShape(.rect)
+        .onHover { pointer = $0 }
+        .onTapGesture(perform: onSelect)
+        .contextMenu {
+            if canCreate { Button("New folder", systemImage: "folder.badge.plus", action: onNewFolder) }
+            Button("New workspace\u{2026}", systemImage: "plus", action: onNewWorkspace)
+            Button("Manage workspaces", systemImage: "slider.horizontal.3", action: onManage)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(picker.accessibilityName(scope))
+        .accessibilityValue(current ? "current workspace" : "")
+        .accessibilityHint(current ? "" : "Switches to this workspace")
+        .accessibilityAddTraits(current ? [.isHeader, .isSelected, .isButton] : [.isHeader, .isButton])
+        .accessibilityAction { onSelect() }
+        .accessibilityAction(named: "New workspace", onNewWorkspace)
+        .accessibilityAction(named: "Manage workspaces", onManage)
+        .accessibilityIdentifier("sidebar.workspace.\(picker.name(scope))")
+    }
+}
+
+/// A doc dropped on the current workspace's header goes to its top level.
+struct TopLevelDropIf: ViewModifier {
+    let on: Bool
+    let mover: DocMover?
+
+    func body(content: Content) -> some View {
+        if on { content.docTopLevelDrop(mover: mover) } else { content }
+    }
+}
+
+/// The foot of the sidebar: your initial and the sync state with the server
+/// ("● Synced · taisce.null.ie"). A click opens the menu: Settings,
+/// Refresh, Manage workspaces.
+private struct SidebarAccountFooter: View {
+    @Environment(AppModel.self) private var model
+    @Environment(Router.self) private var router
+
+    private var badge: SyncBadge { SyncBadge.make(status: model.syncStatus, pending: model.pendingWrites) }
+    private var host: String { URL(string: model.serverURL)?.host() ?? model.serverURL }
+
+    var body: some View {
+        Menu {
+            Button("Settings\u{2026}", systemImage: "gearshape") { router.showSettings = true }
+            Button("Refresh", systemImage: "arrow.clockwise") { Task { try? await model.sync?.catchUp() } }
+        } label: {
+            HStack(spacing: 10) {
+                LapisAvatar(name: model.home.profileName ?? "Taisce", size: 26)
+                SyncDotLabel(badge: badge)
+                Text("\u{00B7} \(host)").font(.footnote).foregroundStyle(Color.lapis.ink3).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 0)
+            }
+            .frame(minHeight: Lapis.Layout.minTarget)
+            .contentShape(.rect)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .accessibilityLabel("Account, \(SyncDotLabel(badge: badge).text), \(host)")
+        .accessibilityHint("Settings and refresh")
+        .accessibilityIdentifier("sidebar.account")
+        .help("Settings (⌘,)")
+        .task { await model.home.loadProfile() }
     }
 }
 

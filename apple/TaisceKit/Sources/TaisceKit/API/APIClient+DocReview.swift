@@ -197,6 +197,15 @@ extension APIClient {
         return rows.filter(\.open)
     }
 
+    /// A comment on a block, as the signed-in person (`POST /api/comment`;
+    /// the daemon answers a refusal as `{"error": …}`).
+    public func addComment(blockID: BlockID, text: String, replyTo: BlockID? = nil) async throws {
+        struct Req: Encodable { var block_id: BlockID; var text: String; var reply_to: BlockID? }
+        struct Answer: Decodable { var error: String? }
+        let a: Answer = try await post("/api/comment", body: Req(block_id: blockID, text: text, reply_to: replyTo))
+        if let e = a.error { throw APIError.server(e) }
+    }
+
     /// Decide an item as the signed-in person (`POST /api/resolve`).
     public func resolveReview(_ annotationID: String, _ decision: DocReviewDecision) async throws {
         struct Req: Encodable { var annotation_id: String; var decision: DocReviewDecision }

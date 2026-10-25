@@ -11,17 +11,25 @@ struct DocSurfaceContent: View {
     var body: some View {
         DocSurfaceView(model: model, dynamicType: dynamicType)
             .groundBackground()
-            .safeAreaInset(edge: .top, spacing: 0) {
-                VStack(spacing: 0) {
-                    if model.editable, EditorChrome.barIsInline {
-                        InlineFormattingBar(bar: model.formattingBar)
-                            .frame(maxWidth: Lapis.Layout.readingWidth)
-                            .padding(.horizontal, Lapis.Layout.gutter)
-                            .padding(.vertical, 4)
-                    }
-                    SurfaceNotes(model: model)
+            .safeAreaInset(edge: .top, spacing: 0) { SurfaceNotes(model: model) }
+            // room under the last line for the floating bar (the caret stays clear of it)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if model.editable, EditorChrome.barIsInline, model.isEditingText { Color.clear.frame(height: 64) }
+            }
+            // the Mac: formatting floats over the foot of the page while you
+            // write, and is gone while you read (Mac-Main shows none); it
+            // never pushes the text down
+            .overlay(alignment: .bottom) {
+                if model.editable, EditorChrome.barIsInline, model.isEditingText {
+                    InlineFormattingBar(bar: model.formattingBar)
+                        .frame(maxWidth: 560)
+                        .padding(.horizontal, 6)
+                        .glassEffect(.regular, in: .capsule)
+                        .padding(.bottom, 16)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
+            .animation(Lapis.Motion.standard, value: model.isEditingText)
             .overlay { CompletionOverlay(model: model) }
             // a brief, non-blocking notice ("Images can't be pasted here yet")
             .overlay(alignment: .bottom) {

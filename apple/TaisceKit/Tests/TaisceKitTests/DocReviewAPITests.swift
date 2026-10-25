@@ -75,4 +75,17 @@ import Testing
         let links = try await server.client().backlinks("d1")
         #expect(links == [Backlink(docID: "d2", docTitle: "Agent Guide", blockID: "x1", content: "Read [[Architecture]] first.")])
     }
+
+    @Test func addCommentPostsTheBlockAndSaysWhenRefused() async throws {
+        let server = MockServer { r in
+            let body = (try? JSONSerialization.jsonObject(with: r.httpBody ?? Data())) as? [String: Any]
+            return body?["text"] as? String == "no" ? .json(#"{"error":"viewers cannot comment"}"#) : .json(#"{"id":"c1"}"#)
+        }
+        try await server.client().addComment(blockID: "b1", text: "Looks right")
+        let sent = try #require(server.requests.first)
+        #expect(sent.path == "/api/comment" && sent.httpMethod == "POST")
+        let json = try JSONSerialization.jsonObject(with: try #require(sent.httpBody)) as? [String: Any]
+        #expect(json?["block_id"] as? String == "b1" && json?["text"] as? String == "Looks right")
+        await #expect(throws: APIError.server("viewers cannot comment")) { try await server.client().addComment(blockID: "b1", text: "no") }
+    }
 }
