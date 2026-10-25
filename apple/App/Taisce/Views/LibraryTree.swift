@@ -223,8 +223,11 @@ struct LibraryTree<Menu: View>: View {
             }
             // under the last row: the top level
             if let docMover {
+                // a fixed strip: the other workspaces' sections follow straight
+                // after it in the sidebar (a greedy one pushed them to the foot)
                 Color.clear
-                    .frame(maxWidth: .infinity, minHeight: style == .library ? 10 : style.rowHeight * 2)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: style == .library ? 10 : 14)
                     .contentShape(.rect)
                     .overlay(alignment: .top) {
                         if bottomTargeted {

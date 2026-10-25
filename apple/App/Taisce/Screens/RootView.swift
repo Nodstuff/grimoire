@@ -675,8 +675,8 @@ struct WorkspaceSectionHeader: View {
         }
         .padding(.leading, 10)
         .padding(.trailing, 10)
-        .padding(.top, 14)
-        .frame(maxWidth: .infinity, minHeight: Lapis.Layout.sidebarRow, alignment: .leading)
+        .padding(.top, 8)
+        .frame(maxWidth: .infinity, minHeight: Lapis.Layout.sidebarRow - 6, alignment: .leading)
         .contentShape(.rect)
         .onHover { pointer = $0 }
         .onTapGesture(perform: onSelect)
