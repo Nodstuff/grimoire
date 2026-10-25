@@ -118,8 +118,11 @@ final class Router {
     var showActions = false
     /// the split view's columns (⌘\\ hides or shows the sidebar); the split
     /// view writes it too when the person drags the sidebar away
-    var columnVisibility: NavigationSplitViewVisibility = .automatic
-    var sidebarHidden: Bool { columnVisibility == .detailOnly }
+    var sidebarHidden = false
+    var columnVisibility: NavigationSplitViewVisibility {
+        get { sidebarHidden ? .detailOnly : .automatic }
+        set { sidebarHidden = newValue == .detailOnly }
+    }
     /// ⇧⌘I: bumped for Books to open its EPUB picker
     private(set) var addBooksRequest = 0
 
@@ -294,7 +297,7 @@ final class Router {
         case .actions:
             showActions = true
         case .toggleSidebar:
-            if isPad { columnVisibility = sidebarHidden ? .all : .detailOnly }
+            if isPad { sidebarHidden.toggle() }
         case .newDocHere:
             newDoc(in: focusedDoc)
         case .addBooks:
