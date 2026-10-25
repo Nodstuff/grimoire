@@ -21,6 +21,8 @@ struct BooksScreen: View {
     /// the book in the sheet (narrow)
     @State private var detail: ReadingID?
     @State private var reading: ReadingID?
+    /// the sheet's Read: the reader opens when the sheet is gone
+    @State private var readAfterDetail: String?
     @State private var importing = false
     @State private var uploading = false
     @State private var dropping = false
@@ -75,13 +77,18 @@ struct BooksScreen: View {
             Task { await upload(epubs) }
             return true
         } isTargeted: { dropping = $0 }
-        .sheet(item: $detail) { d in
+        // the reader opens once the sheet has gone: presented while it was
+        // still going away, the cover's content appeared twice and its first
+        // download was cancelled (it read as "offline")
+        .sheet(item: $detail, onDismiss: {
+            if let id = readAfterDetail {
+                readAfterDetail = nil
+                reading = ReadingID(id: id)
+            }
+        }) { d in
             BookDetail(id: d.id, style: .sheet) { id in
+                readAfterDetail = id
                 detail = nil
-                Task {
-                    try? await Task.sleep(for: .milliseconds(350))
-                    reading = ReadingID(id: id)
-                }
             }
             .environment(\.coverImageLoader, store.coverLoader)
             .presentationDragIndicator(.visible)

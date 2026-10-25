@@ -393,7 +393,8 @@ final class Router {
 
     /// Development launch arguments, for screenshots and UI runs:
     /// `-tab today|library|todos|search`, `-openDoc <title>`,
-    /// `-searchQuery <text>`, `-showSettings YES`, `-tab books`, `-readBook <id>`. (`-serverURL <url>` is read
+    /// `-searchQuery <text>`, `-showSettings YES`, `-tab books`, `-readBook <id>`, `-clearBookFiles YES`
+    /// (Debug UI runs: drop the downloaded EPUBs). (`-serverURL <url>` is read
     /// by `AppModel` straight from UserDefaults' argument domain.)
     func applyLaunchArguments(index: DocIndex) {
         let d = UserDefaults.standard
@@ -405,6 +406,12 @@ final class Router {
         case "review": showReview()
         default: break
         }
+        #if DEBUG
+        // a UI test's first open of a book downloads it (no EPUB from an earlier run)
+        if d.bool(forKey: "clearBookFiles"), SignInRelay.configured != nil, let dirs = try? FileManager.default.contentsOfDirectory(at: BookStore.directory, includingPropertiesForKeys: nil) {
+            for dir in dirs { try? FileManager.default.removeItem(at: dir.appending(path: "epubs", directoryHint: .isDirectory)) }
+        }
+        #endif
         if let q = d.string(forKey: "searchQuery") { searchQuery = q }
         if let book = d.string(forKey: "readBook") { readBook(book) }
         _ = openLaunchDoc(index: index)

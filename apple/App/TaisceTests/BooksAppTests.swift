@@ -53,4 +53,77 @@ import TaisceKit
         #expect(BookUploadSummary.line([]).text == "Nothing to add")
         #expect(BookUploadSummary.line([try result("already_here")]).tone == .neutral)
     }
+
+    // MARK: the reader opening
+
+    @MainActor @Test func onlyAMissingConnectionSaysOffline() {
+        let offline = "You're offline, and this book isn't on this device yet."
+        for code: URLError.Code in [.notConnectedToInternet, .networkConnectionLost, .timedOut, .cannotFindHost, .cannotConnectToHost, .dataNotAllowed] {
+            #expect(ReaderModel.describe(URLError(code)) == offline, "\(code)")
+        }
+        // a cancelled download is not "offline" (the bug: every URLError said so)
+        #expect(ReaderModel.describe(URLError(.cancelled)) == "Opening the book was interrupted.")
+        #expect(ReaderModel.describe(CancellationError()) == "Opening the book was interrupted.")
+        let other = ReaderModel.describe(URLError(.badServerResponse))
+        #expect(other != offline && other.hasPrefix("The book didn't download"))
+        #expect(ReaderModel.describe(APIError.notFound("book")) == "This book isn't on the server any more.")
+        #expect(ReaderModel.describe(CocoaError(.fileWriteOutOfSpace)) == "The book couldn't be saved on this device.")
+        // Try Again where it can help
+        #expect(ReaderModel.isRetryable(URLError(.cancelled)) && ReaderModel.isRetryable(URLError(.timedOut)))
+        #expect(!ReaderModel.isRetryable(APIError.notFound("book")))
+    }
+
+    /// Counts the reader's downloads and answers each from a script.
+    @MainActor final class ScriptedLoader {
+        var answers: [Result<URL, any Error>]
+        var calls = 0
+        init(_ answers: [Result<URL, any Error>]) { self.answers = answers }
+        var loader: ReaderModel.Loader {
+            ReaderModel.Loader(file: { [self] _ in
+                calls += 1
+                try await Task.sleep(for: .milliseconds(50))
+                return try answers.removeFirst().get()
+            }, position: { _ in .unavailable })
+        }
+    }
+
+    static let epub = URL(fileURLWithPath: "/tmp/taisce-test.epub")
+
+    @MainActor @Test func aCancelledStartDownloadsAgain() async {
+        let script = ScriptedLoader([.failure(URLError(.cancelled)), .success(Self.epub)])
+        let reader = ReaderModel(source: .book("b1"), title: "1984", store: nil)
+        reader.loader = script.loader
+        await reader.start()
+        #expect(reader.phase == .failed("Opening the book was interrupted.") && reader.canRetry)
+        // the next start (a view's .task run again) downloads again, not stuck failed
+        await reader.start()
+        #expect(script.calls == 2)
+        #expect(reader.phase == .loading && !reader.canRetry) // the page takes it from here
+    }
+
+    @MainActor @Test func theCallersCancellationDoesNotCancelTheDownload() async {
+        let script = ScriptedLoader([.success(Self.epub)])
+        let reader = ReaderModel(source: .book("b1"), title: "1984", store: nil)
+        reader.loader = script.loader
+        // the view's .task, cancelled as SwiftUI removes and re-adds the view
+        let first = Task { await reader.start() }
+        first.cancel()
+        await reader.start() // the second .task joins the same download
+        await first.value
+        #expect(script.calls == 1)
+        #expect(reader.phase == .loading) // downloaded and handed to the page, no failure
+    }
+
+    @MainActor @Test func aFailedStartWaitsForTryAgain() async {
+        let script = ScriptedLoader([.failure(URLError(.timedOut)), .success(Self.epub)])
+        let reader = ReaderModel(source: .book("b1"), title: "1984", store: nil)
+        reader.loader = script.loader
+        await reader.start()
+        #expect(reader.phase == .failed("You're offline, and this book isn't on this device yet.") && reader.canRetry)
+        await reader.start() // the same view again: no second download by itself
+        #expect(script.calls == 1)
+        reader.retry()
+        for _ in 0..<100 where script.calls < 2 || reader.phase != .loading { try? await Task.sleep(for: .milliseconds(20)) }
+        #expect(script.calls == 2 && reader.phase == .loading)
+    }
 }

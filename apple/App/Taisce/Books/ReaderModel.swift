@@ -78,26 +78,70 @@ final class ReaderModel {
 
     // MARK: open
 
+    /// Open the book (once: a second call waits for the first). The work
+    /// is the model's own task, not the caller's: SwiftUI can cancel a view's
+    /// `.task` and run it again (a cover presented while a sheet was still
+    /// going away did exactly that), and a cancelled download read as
+    /// "offline" for good. A start that ends cancelled anyway is forgotten,
+    /// so the next `start()` downloads again.
     func start() async {
-        guard !started else { return }
-        started = true
-        guard let store, let api = store.api else {
+        if opening == nil {
+            opening = Task { [weak self] in await self?.open() }
+        }
+        await opening?.value
+    }
+
+    /// The failed card's Try Again.
+    func retry() {
+        guard canRetry else { return }
+        opening = nil
+        Task { await start() }
+    }
+
+    /// How the file and the server's place arrive: the store's API, or a test's.
+    struct Loader: Sendable {
+        var file: @MainActor @Sendable (ReadingSource) async throws -> URL
+        var position: @Sendable (ReadingSource) async -> PositionRead
+    }
+
+    /// set by tests; nil = the store's
+    @ObservationIgnored var loader: Loader?
+    @ObservationIgnored private var opening: Task<Void, Never>?
+    /// the failed card offers Try Again
+    private(set) var canRetry = false
+
+    private var storeLoader: Loader? {
+        guard let store, let api = store.api else { return nil }
+        return Loader(file: { [weak store] source in
+            guard let store else { throw CancellationError() }
+            return try await store.epubFile(source)
+        }, position: { source in
+            (try? await api.position(source)) ?? .unavailable
+        })
+    }
+
+    private func open() async {
+        canRetry = false
+        guard let loader = loader ?? storeLoader else {
             phase = .failed("Sign in to read.")
             return
         }
         phase = .loading
         let source = self.source
-        async let fileTask = store.epubFile(source)
-        async let positionTask = try? api.position(source)
-        let remoteRead = await positionTask ?? .unavailable
+        async let fileTask = loader.file(source)
+        async let positionTask = loader.position(source)
+        let remoteRead = await positionTask
         let file: URL
         do {
             file = try await fileTask
         } catch {
+            if Self.isCancellation(error) { opening = nil }
+            canRetry = Self.isRetryable(error)
             phase = .failed(Self.describe(error))
             return
         }
-        let server = store.serverKey
+        started = true
+        let server = store?.serverKey ?? ""
         let local = ReaderPlaces.load(source, server: server)
         var remote: ReaderPosition?
         if case let .available(r) = remoteRead {
@@ -237,9 +281,30 @@ final class ReaderModel {
         page.goTo(fraction: fraction)
     }
 
+    /// Only a connection that isn't there says "offline"; anything else
+    /// says what happened.
+    static let offlineCodes: Set<URLError.Code> = [
+        .notConnectedToInternet, .networkConnectionLost, .timedOut, .cannotFindHost, .cannotConnectToHost, .dataNotAllowed,
+    ]
+
+    static func isCancellation(_ error: any Error) -> Bool {
+        error is CancellationError || (error as? URLError)?.code == .cancelled
+    }
+
+    /// Worth a Try Again (a book gone from the server isn't).
+    static func isRetryable(_ error: any Error) -> Bool {
+        if case APIError.notFound = error { return false }
+        return true
+    }
+
     static func describe(_ error: any Error) -> String {
         if case APIError.notFound = error { return "This book isn't on the server any more." }
-        if error is URLError { return "You're offline, and this book isn't on this device yet." }
+        if isCancellation(error) { return "Opening the book was interrupted." }
+        if let e = error as? URLError {
+            if offlineCodes.contains(e.code) { return "You're offline, and this book isn't on this device yet." }
+            return "The book didn't download (\(e.localizedDescription))."
+        }
+        if error is CocoaError { return "The book couldn't be saved on this device." }
         return BookStore.describe(error)
     }
 }

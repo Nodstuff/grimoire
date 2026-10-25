@@ -258,6 +258,55 @@ final class BooksUITests: XCTestCase {
         print("BOOKS-UITEST kept \(kept)")
     }
 
+    /// A book nobody has started, opened from its details' Read button (the
+    /// iPhone's sheet, the iPad/Mac pane), with this device's EPUB cache
+    /// cleared so the file comes over the network: the page shows the book's
+    /// text, not "You're offline". (Continue reading worked while this path
+    /// failed: the cover was presented while the sheet was still going away.)
+    /// Turning pages starts the book, so each run takes the next unstarted
+    /// one: no series, first by title (the top of the grid).
+    func testReadFromDetailsWithoutProgress() throws {
+        let (_, page) = try http("GET", "/api/books?limit=200")
+        let candidates = (page["books"] as? [[String: Any]] ?? [])
+            .filter { $0["series"] is NSNull || $0["series"] == nil }
+            .compactMap { b -> (String, String)? in
+                guard let id = b["id"] as? String, let title = b["title"] as? String else { return nil }
+                return (id, title)
+            }
+            .sorted { $0.1.localizedStandardCompare($1.1) == .orderedAscending }
+        let pick = try XCTUnwrap(try candidates.first { try position($0.0) == nil }, "a book nobody has started")
+        let (id, title) = pick
+        let app = launch(["-tab", "books", "-clearBookFiles", "YES"])
+        XCTAssertTrue(app.staticTexts["books.summary"].waitForExistence(timeout: 30), "Books opened")
+        let tile = app.buttons["book.\(id)"]
+        for _ in 0..<25 where !(tile.exists && tile.isHittable) {
+            #if targetEnvironment(macCatalyst)
+            app.staticTexts["books.summary"].coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).scroll(byDeltaX: 0, deltaY: -300)
+            #else
+            app.swipeUp(velocity: .slow)
+            #endif
+        }
+        XCTAssertTrue(tile.isHittable, "the \(title) tile")
+        hit(tile)
+        let read = app.buttons["book.read"]
+        XCTAssertTrue(read.waitForExistence(timeout: 10), "the details opened")
+        hit(read)
+        let progress = app.descendants(matching: .any)["reader.progress"].firstMatch
+        let failed = app.staticTexts["The book didn't open"]
+        let end = Date().addingTimeInterval(40)
+        while Date() < end, !progress.exists, !failed.exists { RunLoop.current.run(until: Date().addingTimeInterval(0.4)) }
+        shot(app, "reader-from-details")
+        XCTAssertFalse(failed.exists, "the reader failed: \(app.staticTexts.allElementsBoundByIndex.map { $0.label })")
+        XCTAssertTrue(progress.exists, "\(title) opened")
+        // past the cover and title pages: a sentence of the book's own on the page
+        RunLoop.current.run(until: Date().addingTimeInterval(2.5)) // the bar steps aside
+        let sentence = app.webViews.staticTexts.matching(NSPredicate(format: "label MATCHES %@", "(?s).{60,}")).firstMatch
+        for _ in 0..<8 where !sentence.exists { turnPage(app) }
+        XCTAssertTrue(sentence.waitForExistence(timeout: 5), "the page shows \(title)'s text")
+        shot(app, "reader-from-details-text")
+        print("BOOKS-UITEST \(title): \(sentence.label.prefix(80))")
+    }
+
     /// The reading settings: paper, then back to Auto (the next run starts clean).
     func testReaderSettings() throws {
         let id = try bookID(env["TAISCE_UI_READ_TITLE"] ?? "The Time Machine")

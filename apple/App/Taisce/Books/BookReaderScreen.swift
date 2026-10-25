@@ -108,7 +108,8 @@ private struct ReaderBody: View {
                 }
                 .accessibilityElement(children: .combine)
             case let .failed(message):
-                EmptyState(symbol: "book.closed", title: "The book didn't open", message: message, actionTitle: "Close", action: close)
+                EmptyState(symbol: "book.closed", title: "The book didn't open", message: message,
+                           actionTitle: reader.canRetry ? "Try Again" : "Close", action: reader.canRetry ? reader.retry : close)
                     .padding()
                     .background(Color.lapis.bg, in: .rect(cornerRadius: Lapis.Radius.card))
                     .padding()
