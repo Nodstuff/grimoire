@@ -622,28 +622,51 @@ struct WorkspaceSectionHeader: View {
     let onManage: () -> Void
     @State private var pointer = false
 
+    static var hoverOnly: Bool {
+        #if targetEnvironment(macCatalyst)
+        true
+        #else
+        false
+        #endif
+    }
+
     private var title: String {
         picker.name(scope).uppercased() + (picker.isShared(scope) ? " \u{00B7} SHARED" : "")
     }
 
     var body: some View {
         HStack(spacing: 8) {
-            if current {
-                RoundedRectangle(cornerRadius: 2.5, style: .continuous).fill(sectionColor(picker, scope))
-                    .frame(width: 9, height: 9).accessibilityHidden(true)
+            HStack(spacing: 8) {
+                if current {
+                    RoundedRectangle(cornerRadius: 2.5, style: .continuous).fill(sectionColor(picker, scope))
+                        .frame(width: 9, height: 9).accessibilityHidden(true)
+                }
+                Text(title)
+                    .lapisFont(.label)
+                    .foregroundStyle(current ? Color.lapis.ink2 : Color.lapis.ink3)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
             }
-            Text(title)
-                .lapisFont(.label)
-                .foregroundStyle(current ? Color.lapis.ink2 : Color.lapis.ink3)
-                .lineLimit(1)
-            Spacer(minLength: 4)
-            if current, canCreate, pointer {
+            .contentShape(.rect)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(picker.accessibilityName(scope))
+            .accessibilityValue(current ? "current workspace" : "")
+            .accessibilityHint(current ? "" : "Switches to this workspace")
+            .accessibilityAddTraits(current ? [.isHeader, .isSelected, .isButton] : [.isHeader, .isButton])
+            .accessibilityAction { onSelect() }
+            .accessibilityAction(named: "New workspace", onNewWorkspace)
+            .accessibilityAction(named: "Manage workspaces", onManage)
+            .accessibilityIdentifier("sidebar.workspace.\(picker.name(scope))")
+            // the Mac shows it under the pointer (Mac-Main's quiet header); a
+            // touch screen has no hover, so iPad always shows it
+            if current, canCreate, pointer || !Self.hoverOnly {
                 Button(action: onNewFolder) {
                     Image(systemName: "folder.badge.plus").font(.footnote).foregroundStyle(Color.lapis.ink3)
                         .frame(width: 24, height: 24).contentShape(.rect)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("New folder")
+                .accessibilityIdentifier("tree.newFolder")
                 .help("New folder (⇧⌘N)")
             }
             if number <= 9 {
@@ -662,15 +685,6 @@ struct WorkspaceSectionHeader: View {
             Button("New workspace\u{2026}", systemImage: "plus", action: onNewWorkspace)
             Button("Manage workspaces", systemImage: "slider.horizontal.3", action: onManage)
         }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(picker.accessibilityName(scope))
-        .accessibilityValue(current ? "current workspace" : "")
-        .accessibilityHint(current ? "" : "Switches to this workspace")
-        .accessibilityAddTraits(current ? [.isHeader, .isSelected, .isButton] : [.isHeader, .isButton])
-        .accessibilityAction { onSelect() }
-        .accessibilityAction(named: "New workspace", onNewWorkspace)
-        .accessibilityAction(named: "Manage workspaces", onManage)
-        .accessibilityIdentifier("sidebar.workspace.\(picker.name(scope))")
     }
 }
 

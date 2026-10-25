@@ -465,6 +465,9 @@ final class MoveDocUITests: XCTestCase {
         let rowX = row(app, "Loose X \(n)")
         XCTAssertTrue(rowX.waitForExistence(timeout: 20))
         #if targetEnvironment(macCatalyst)
+        // the current workspace's header shows New folder under the pointer
+        let header = app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH 'sidebar.workspace.'")).firstMatch
+        if header.waitForExistence(timeout: 5) { header.hover() }
         let button = app.buttons["tree.newFolder"].firstMatch
         #else
         let button = app.buttons["New folder"].firstMatch

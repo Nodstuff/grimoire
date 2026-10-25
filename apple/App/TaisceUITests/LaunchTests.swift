@@ -22,6 +22,13 @@ final class LaunchTests: XCTestCase {
         let library = app.tabBars.buttons["Library"]
         if library.waitForExistence(timeout: 10) { library.tap() }
         let doc = app.descendants(matching: .any)["tree.Welcome"].firstMatch
+        // other suites' docs may push it out of a lazy list: look further down
+        #if !targetEnvironment(macCatalyst)
+        if !doc.waitForExistence(timeout: 10) {
+            for _ in 0..<12 where !doc.exists { app.swipeUp(); RunLoop.current.run(until: Date().addingTimeInterval(0.4)) }
+        }
+        if doc.exists, !doc.isHittable { app.swipeDown() }
+        #endif
         XCTAssertTrue(doc.waitForExistence(timeout: 15), "the synced tree lists the seeded doc")
         #if targetEnvironment(macCatalyst)
         doc.click()

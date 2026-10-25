@@ -791,13 +791,18 @@ and duration, "compiled ✓" for a Go block that only compiles.
 - Layout: regular width (every Mac window, iPad) is the split view
   (`RootLayout`): a sidebar on the Lapis `panel` ground with Today, To-dos
   (open count, the same number the To-dos screen lists), Review (the
-  queue's count in yellow), Books and Search, then the workspace switcher
-  and the Library tree; the doc on the right. Compact width (iPhone) keeps
+  queue's count in yellow), Books and Search, then each workspace as a
+  section (the current one with its Library tree); the doc on the right. Compact width (iPhone) keeps
   the tab bar. Minimum window 820×560, first launch 1280×860 grown around
   the system's centre (so it stays on a MacBook Air's screen); macOS
-  restores the size after that. The bar leads with the doc's title, crumbs
-  and save state (Catalyst shows no principal item); the app's name is not
-  repeated there (the sidebar has it).
+  restores the size after that. The bar (Mac-Main): ‹ › through what the
+  window showed (`Router.goBack/goForward`, ⌘[ ⌘]), the doc's title over its
+  crumbs and save state, a "Search or ask ⇧⌘F" field that searches as you
+  type, then New doc, Share, … and the inspector as plain icons (a tinted bar
+  button draws as a filled circle on the Mac: their tint is cleared). The
+  formatting bar floats over the foot of the page only while you write. The
+  inspector's Comments tab ends in "Comment on selection" (the paragraph
+  under the caret; `POST /api/comment`).
 - Menu bar (`TaisceCommands`, routed through the front window's `Router`):
   File › New Doc ⌘N, New Doc Inside This One ⌥⌘N, New Folder ⇧⌘N, Open Doc…
   ⌘O (Search on docs, focused), Add EPUBs… ⇧⌘I, Export as PDF… ⌥⌘E; Edit ›
@@ -805,8 +810,8 @@ and duration, "compiled ✓" for a Go block that only compiles.
   Bigger / Smaller Text; Doc › Refresh ⌘R, Share Link…; Go › Actions… ⌘K
   (`ActionsPalette`: every command by name, Return runs the first), Search
   ⇧⌘F, Today, To-dos, Review, Books and the workspaces ⌘1…⌘9; ⌘, Settings.
-  The reader turns pages with ← → and closes with ⌘W. Nothing is enabled
-  before sign-in. Docs are always live (no Edit / Done); inline code is ⇧⌘E. iPad
+  Go › Back ⌘[ / Forward ⌘]. The reader turns pages with ← → and closes
+  with ⌘W. Nothing is enabled before sign-in. Docs are always live (no Edit / Done); inline code is ⇧⌘E. iPad
   hardware keyboards get the same commands.
 
 ```sh
@@ -958,18 +963,24 @@ The iPhone-Today, iPhone-Todos, iPhone-Search and iPhone-Settings artboards
 - Sidebar (iPad, Mac): Today, To-dos, Review, Books (with its count) and
   Search; with Books in front, SHELVES, SERIES and E-READERS under it
   (`BooksSidebarSections`: a shelf row is `Router.bookShelf`, which
-  `BooksScreen(filter:)` shows; a second click goes back to every book), then
-  the workspace switcher and the Library tree. Rows are 44 pt on iPad, 30 on
-  the Mac (`Lapis.Layout.sidebarRow`).
+  `BooksScreen(filter:)` shows; a second click goes back to every book). Then
+  every workspace is its own section (`WorkspaceSectionHeader`: "■ WORK ⌘1",
+  "HOME ⌘2", "FAMILY · SHARED ⌘3"), the current one open with its Library
+  tree; a header switches to it and its menu adds a folder or a workspace or
+  manages them. The foot is your avatar and "● Synced · host"
+  (`SidebarAccountFooter`; its menu: Settings, Refresh). Rows are 44 pt on
+  iPad, 30 on the Mac (`Lapis.Layout.sidebarRow`).
 - Today: the date and sync state, the serif title; the Review card
   (`GET /api/queue`: "3 agent changes want a look", the first three with
   verdict, doc and proposer; tap the card for the list, a row for the doc);
   Continue reading (from `BookStore`'s shelf, so Today and Books never
   disagree and it shows offline: the newest started, unfinished book, its
   cover through the shared `coverImageLoader`; Read opens the reader); Due
-  (overdue, today's dated items and the coming week, short pills; each row
-  says where it lives: the To-do doc's Library path and, for an older item,
-  the day it was written under, "Work › Taisce › To-do › Mon 19 Oct"); Pinned
+  (overdue, today's dated items and the coming week, pills that name their
+  group, "Overdue · Wed"; each row says where it lives: the workspace and,
+  for an older item, the day it was written under, "Work › Mon 19 Oct");
+  the Review card has one row per doc with a count and its path when it
+  fits ("Family › Holidays 2027  2"); Pinned
   (workspace colour, folder, serif title, last editor and time). The toolbar
   has New doc, Capture a to-do (a sheet with the live due pill) and, on a
   phone, the account initial for Settings. Workspaces switch in the Library
