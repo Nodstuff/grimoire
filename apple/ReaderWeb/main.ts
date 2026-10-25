@@ -114,6 +114,9 @@ function css(l: Look): string {
       text-size-adjust: none;
     }
     body { background: transparent !important; color: inherit !important; }
+    /* the paper's ink wins over a book's own colours (1984's CSS sets p { color: #000 },
+       black on the dark paper); links keep theirs below, images are untouched */
+    body *:not(a) { color: inherit !important; background-color: transparent !important; }
     a:link, a:visited { color: ${l.link} !important; }
     p, li, blockquote, dd {
       line-height: ${l.lineHeight} !important;
