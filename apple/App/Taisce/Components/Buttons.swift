@@ -144,3 +144,15 @@ extension View {
         .buttonStyle(.lapis(.secondary, fullWidth: true))
         .dynamicTypeSize(.accessibility3)
 }
+
+extension View {
+    /// A bar button on the Mac draws as a filled circle when it carries a
+    /// tint: cleared there, so it stays a quiet icon (Mac-Main's bar).
+    @ViewBuilder func plainOnMacToolbar() -> some View {
+        #if targetEnvironment(macCatalyst)
+        tint(nil)
+        #else
+        self
+        #endif
+    }
+}

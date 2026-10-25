@@ -85,9 +85,11 @@ struct TodayScreen: View {
                 Button { router.newDoc() } label: { Image(systemName: "square.and.pencil") }
                     .accessibilityLabel("New doc")
                     .help("New doc (⌘N)")
+                    .plainOnMacToolbar()
             }
             if model.currentAccess.canEdit {
                 Button { capturing = true } label: { Image(systemName: "plus.circle") }
+                    .plainOnMacToolbar()
                     .accessibilityLabel("Capture a to-do")
                     .accessibilityIdentifier("today.capture")
             }
