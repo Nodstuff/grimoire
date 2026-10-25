@@ -5,6 +5,13 @@ import XCTest
 /// the daemon put it in the Trash. iPad layout (the sidebar); on iPhone the
 /// Library tab's rows carry the same menu.
 final class DeleteDocUITests: XCTestCase {
+    override func setUp() {
+        #if !targetEnvironment(macCatalyst)
+        // iPad: the tree is the sidebar's, which portrait hides
+        if UIDevice.current.userInterfaceIdiom == .pad { XCUIDevice.shared.orientation = .landscapeLeft }
+        #endif
+    }
+
     var base: URL { URL(string: ProcessInfo.processInfo.environment["TAISCE_UI_URL"] ?? "http://127.0.0.1:7518")! }
 
     func call(_ path: String, _ body: [String: Any]? = nil) throws -> Any {

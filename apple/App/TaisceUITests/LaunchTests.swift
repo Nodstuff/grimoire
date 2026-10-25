@@ -5,6 +5,13 @@ import XCTest
 /// "Welcome to Taisce" (`TEST_RUNNER_TAISCE_UI_URL`, default 127.0.0.1:7515).
 /// The screenshot is an attachment: `xcrun xcresulttool export attachments`.
 final class LaunchTests: XCTestCase {
+    override func setUp() {
+        #if !targetEnvironment(macCatalyst)
+        // iPad: the tree is the sidebar's, which portrait hides
+        if UIDevice.current.userInterfaceIdiom == .pad { XCUIDevice.shared.orientation = .landscapeLeft }
+        #endif
+    }
+
     func testStartsSyncsAndRendersADoc() throws {
         let url = ProcessInfo.processInfo.environment["TAISCE_UI_URL"] ?? "http://127.0.0.1:7515"
         let app = XCUIApplication()
