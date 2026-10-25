@@ -1,8 +1,8 @@
 import SwiftUI
 import TaisceKit
 
-/// Today: what wants a look (the review queue), the book in progress,
-/// what's due and the pinned docs. Due items come from the server's
+/// Today: what's due, the book in progress, what wants a look (the review
+/// queue) and the pinned docs. Due items come from the server's
 /// read-only due list (the cache offline); pins are local.
 struct TodayScreen: View {
     @Environment(AppModel.self) private var model
@@ -162,9 +162,10 @@ struct TodayContent: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 header
-                if let review, !review.isEmpty { reviewCard(review) }
-                if let reading { readingSection(reading) }
+                // Tom's order: what's due first, then the book, then review, then pins
                 dueSection
+                if let reading { readingSection(reading) }
+                if let review, !review.isEmpty { reviewCard(review) }
                 pinnedSection
             }
             .padding(.top, 4)
