@@ -11,6 +11,7 @@
 //! 404.
 //!
 //! - `POST /api/shares {doc_id, snapshot, expires_at, comments_enabled}` → 201 Share
+//!   (`snapshot.pages`: the doc's sub-pages, published with it under one link)
 //! - `GET /api/shares[?doc_id=]` → `{shares}` (the caller's own)
 //! - `PATCH /api/shares/{id} {snapshot?, expires_at?, comments_enabled?}` → Share
 //! - `DELETE /api/shares/{id}` → 204 (revoked for good; the row stays)
@@ -24,11 +25,13 @@
 //! run in `Scope::Public` and read ONLY the share tables:
 //! - `GET /s/{token}` the page; `GET /s/{token}/a/{name}` an image;
 //!   `GET|POST /s/{token}/comments`. 404 unknown, 410 expired or revoked.
+//! - a link with sub-pages: `GET /s/{token}/p/{slug}` one of them, and
+//!   `GET|POST /s/{token}/p/{slug}/comments` (comments are per page).
 
 use crate::auth::ratelimit::{Class, Limiter};
 use crate::auth::{AuthConfig, hash_secret, now, random_token};
 use std::path::Path as FsPath;
-use crate::share_render::{AssetInfo, PageParts, gone_page, page};
+use crate::share_render::{AssetInfo, Nav, PageLinks, PageParts, gone_page, page};
 use crate::store_ext::with_store;
 use crate::viewer::Viewer;
 use axum::extract::rejection::JsonRejection;
@@ -43,7 +46,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use taisce_store::shares::{NewShareComment, Share, ShareAsset, ShareComment, SharePatch, ShareSnapshot};
+use taisce_store::shares::{NewShareComment, Share, ShareAsset, ShareComment, SharePage, SharePageMeta, SharePatch, ShareSnapshot};
 use taisce_store::{Scope, SharedStore, StoreError};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -52,8 +55,12 @@ use uuid::Uuid;
 
 pub const MAX_SNAPSHOT: usize = 10 * 1024 * 1024;
 pub const MAX_ASSET: usize = 2 * 1024 * 1024;
-pub const MAX_ASSETS: usize = 200;
+/// Images in a link, all its pages together (the 10 MB is the real bound).
+pub const MAX_ASSETS: usize = 1000;
+/// One page's markdown.
 pub const MAX_MARKDOWN: usize = 2 * 1024 * 1024;
+/// Sub-pages published with a doc.
+pub const MAX_PAGES: usize = 200;
 /// The request body: a 10 MB snapshot in base64 plus JSON framing.
 pub const MAX_BODY: usize = 16 * 1024 * 1024;
 pub const MAX_NAME: usize = 60;
@@ -201,6 +208,15 @@ impl ShareKey {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.mac(&[b"taisce-share-token\0", id.as_bytes()]).as_ref())
     }
 
+    /// A sub-page's name in its URL: 16 chars of b64url(HMAC(key, "page" ‖
+    /// link ‖ doc)). The same doc keeps its slug across snapshots of a link
+    /// (comments and bookmarks stay on their page); it differs per link and
+    /// says nothing about the doc's id.
+    pub fn page_slug(&self, share: Uuid, doc: Uuid) -> String {
+        let tag = self.mac(&[b"taisce-share-page\0", share.as_bytes(), b"|", doc.as_bytes()]);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&tag.as_ref()[..12])
+    }
+
     /// What the comment rate limit stores for a commenter: HMAC(key, link ‖ ip).
     pub fn ip_hash(&self, share: Uuid, ip: &str) -> String {
         hex::encode(self.mac(&[b"taisce-share-ip\0", share.as_bytes(), b"|", ip.as_bytes()]).as_ref())
@@ -305,6 +321,7 @@ fn share_json(base: &str, key: &ShareKey, s: &Share) -> Value {
         "unread_comments": s.unread_comments,
         "title": s.title,
         "theme": s.theme,
+        "pages": s.page_count,
     })
 }
 
@@ -318,7 +335,17 @@ fn comment_json(c: &ShareComment) -> Value {
         "anchor": c.anchor,
         "created_at": rfc3339(c.created_at),
         "revision": c.revision,
+        "page": c.page,
     })
+}
+
+/// A comment for the link's owner: also the title of the page it is on
+/// (null for the root page, and for a page a later snapshot dropped).
+fn owner_comment_json(c: &ShareComment, pages: &[SharePageMeta]) -> Value {
+    let mut v = comment_json(c);
+    let title = c.page.as_ref().and_then(|slug| pages.iter().find(|p| &p.slug == slug)).map(|p| p.title.clone());
+    v["page_title"] = json!(title);
+    v
 }
 
 // ---- the snapshot ----
@@ -343,6 +370,29 @@ pub struct SnapshotIn {
     assets: Vec<AssetIn>,
     #[serde(default)]
     theme: Option<String>,
+    /// the doc's sub-pages, a parent before its children
+    #[serde(default)]
+    pages: Vec<PageIn>,
+}
+
+#[derive(Deserialize)]
+pub struct PageIn {
+    doc_id: Uuid,
+    /// the page above it; absent, null or the link's own doc = directly
+    /// under the root
+    #[serde(default)]
+    parent_doc_id: Option<Uuid>,
+    #[serde(default)]
+    title: String,
+    markdown: String,
+}
+
+/// A validated sub-page: its slug comes once the link's id is known.
+struct CheckedPage {
+    doc_id: Uuid,
+    parent: Option<Uuid>,
+    title: String,
+    markdown: String,
 }
 
 /// A validated snapshot, not yet rendered.
@@ -351,6 +401,12 @@ struct Checked {
     markdown: String,
     theme: String,
     assets: Vec<ShareAsset>,
+    pages: Vec<CheckedPage>,
+}
+
+fn clean_title(t: &str) -> String {
+    let title: String = clean_label(t).chars().take(MAX_TITLE).collect();
+    if title.is_empty() { "Untitled".to_string() } else { title }
 }
 
 fn too_large(msg: impl std::fmt::Display) -> Response {
@@ -390,9 +446,28 @@ fn check_snapshot(s: SnapshotIn) -> Result<Checked, Response> {
         t @ ("light" | "dark" | "auto") => t.to_string(),
         t => return Err(err(StatusCode::BAD_REQUEST, format!("theme: light, dark or auto, got {t:?}"))),
     };
-    let title: String = clean_label(&s.title).chars().take(MAX_TITLE).collect();
-    let title = if title.is_empty() { "Untitled".to_string() } else { title };
+    if s.pages.len() > MAX_PAGES {
+        return Err(too_large(format!("{} sub-pages; the limit is {MAX_PAGES}", s.pages.len())));
+    }
+    let title = clean_title(&s.title);
     let mut total = s.markdown.len();
+    let mut pages: Vec<CheckedPage> = Vec::with_capacity(s.pages.len());
+    for p in s.pages {
+        if p.markdown.len() > MAX_MARKDOWN {
+            return Err(too_large(format!("page {:?}: markdown is {} bytes; the limit is 2 MB", clean_title(&p.title), p.markdown.len())));
+        }
+        total += p.markdown.len();
+        if total > MAX_SNAPSHOT {
+            return Err(too_large("the snapshot is over 10 MB"));
+        }
+        if pages.iter().any(|q| q.doc_id == p.doc_id) {
+            return Err(err(StatusCode::BAD_REQUEST, format!("page {} appears twice", p.doc_id)));
+        }
+        // tree order: a parent is an earlier page; anything else (the
+        // link's own doc, null) is the root, so no loop can be sent
+        let parent = p.parent_doc_id.filter(|d| pages.iter().any(|q| q.doc_id == *d));
+        pages.push(CheckedPage { doc_id: p.doc_id, parent, title: clean_title(&p.title), markdown: p.markdown });
+    }
     let mut assets = Vec::with_capacity(s.assets.len());
     let mut names = std::collections::HashSet::new();
     for a in s.assets {
@@ -426,12 +501,24 @@ fn check_snapshot(s: SnapshotIn) -> Result<Checked, Response> {
         let dim = |v: Option<i64>| v.filter(|v| (1..=100_000).contains(v));
         assets.push(ShareAsset { name: a.name, content_type: ct, data, width: dim(a.width), height: dim(a.height) });
     }
-    Ok(Checked { title, markdown: s.markdown, theme, assets })
+    Ok(Checked { title, markdown: s.markdown, theme, assets, pages })
 }
 
 impl Checked {
-    fn into_snapshot(self) -> ShareSnapshot {
-        ShareSnapshot { title: self.title, markdown: self.markdown, theme: self.theme, assets: self.assets }
+    /// The snapshot of link `share`: each sub-page under its slug there.
+    fn into_snapshot(self, key: &ShareKey, share: Uuid) -> ShareSnapshot {
+        let pages = self
+            .pages
+            .into_iter()
+            .map(|p| SharePage {
+                slug: key.page_slug(share, p.doc_id),
+                parent_slug: p.parent.map(|d| key.page_slug(share, d)),
+                doc_id: p.doc_id,
+                title: p.title,
+                markdown: p.markdown,
+            })
+            .collect();
+        ShareSnapshot { title: self.title, markdown: self.markdown, theme: self.theme, assets: self.assets, pages }
     }
 }
 
@@ -485,16 +572,22 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> Lru<K, V> {
     }
 }
 
-/// Rendered page bodies by (link, revision), so a busy link renders once
-/// per snapshot and the running renderer is always the one used.
+/// Rendered page bodies by (link, revision, sub-page), so a busy link
+/// renders each page once per snapshot and the running renderer is always
+/// the one used.
 pub const RENDER_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+/// A link's list of sub-pages by (link, revision): every page of it shows
+/// the tree.
+pub const PAGES_CACHE_BYTES: usize = 1024 * 1024;
 
 /// Images by (link, revision, name): served without touching the store
 /// (and its mutex) after the first request.
 pub const ASSET_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 pub struct Caches {
-    pub renders: std::sync::Mutex<Lru<(Uuid, i64), Arc<String>>>,
+    pub renders: std::sync::Mutex<Lru<(Uuid, i64, Option<String>), Arc<String>>>,
+    pub pages: std::sync::Mutex<Lru<(Uuid, i64), Arc<Vec<SharePageMeta>>>>,
     pub assets: std::sync::Mutex<Lru<(Uuid, i64, String), Arc<ShareAsset>>>,
 }
 
@@ -502,6 +595,7 @@ impl Default for Caches {
     fn default() -> Self {
         Self {
             renders: std::sync::Mutex::new(Lru::new(RENDER_CACHE_BYTES)),
+            pages: std::sync::Mutex::new(Lru::new(PAGES_CACHE_BYTES)),
             assets: std::sync::Mutex::new(Lru::new(ASSET_CACHE_BYTES)),
         }
     }
@@ -513,9 +607,13 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Render a body; `url` gives each asset's `src`. `lazy`: images load as
 /// they scroll in (the public page), else at once (the printed preview).
-fn render_with(markdown: &str, assets: impl Iterator<Item = (String, Option<i64>, Option<i64>, String)>, lazy: bool) -> String {
+fn render_with(markdown: &str, assets: impl Iterator<Item = (String, Option<i64>, Option<i64>, String)>, lazy: bool, pages: &PageLinks) -> String {
     let infos: HashMap<String, AssetInfo> = assets.map(|(name, width, height, url)| (name, AssetInfo { url, width, height })).collect();
-    crate::share_render::render_body_with(markdown, &infos, lazy)
+    crate::share_render::render_body_with(markdown, &infos, lazy, pages)
+}
+
+fn page_path(token: &str, slug: &str) -> String {
+    format!("/s/{token}/p/{slug}")
 }
 
 fn asset_path(token: &str, name: &str) -> String {
@@ -602,7 +700,7 @@ async fn create(State(st): State<SharesState>, v: Viewer, headers: HeaderMap, bo
     let id = Uuid::now_v7();
     let token = key.token(id);
     let hash = hash_secret(&token);
-    let snap = checked.into_snapshot();
+    let snap = checked.into_snapshot(&key, id);
     let (doc, on) = (req.doc_id, req.comments_enabled);
     let made = with_store(&st.store, v.scope, move |s| {
         // the doc first (an invisible doc is 404 whatever the caps say)
@@ -615,7 +713,7 @@ async fn create(State(st): State<SharesState>, v: Viewer, headers: HeaderMap, bo
     .await;
     match made {
         Ok(sh) => {
-            tracing::info!(target: crate::auth::AUDIT, event = "share.create", share = %sh.id, doc = %sh.doc_id, user = ?v.user);
+            tracing::info!(target: crate::auth::AUDIT, event = "share.create", share = %sh.id, doc = %sh.doc_id, pages = sh.page_count, user = ?v.user);
             (StatusCode::CREATED, Json(share_json(&base, &key, &sh))).into_response()
         }
         Err(r) => r,
@@ -684,7 +782,7 @@ async fn update(
                 Ok(c) => c,
                 Err(r) => return r,
             };
-            Some(checked.into_snapshot())
+            Some(checked.into_snapshot(&key, id))
         }
     };
     let p = SharePatch { snapshot, expires_at, comments_enabled: req.comments_enabled };
@@ -750,7 +848,8 @@ async fn preview(State(st): State<SharesState>, v: Viewer, headers: HeaderMap, b
         Err(r) => return r,
     };
     let html = tokio::task::spawn_blocking(move || {
-        let body = render_with(&checked.markdown, checked.assets.iter().map(|a| (a.name.clone(), a.width, a.height, data_url(a))), false);
+        // the root page alone: a PDF of a doc's sub-pages is not made here
+        let body = render_with(&checked.markdown, checked.assets.iter().map(|a| (a.name.clone(), a.width, a.height, data_url(a))), false, &PageLinks::default());
         page(&PageParts {
             title: &checked.title,
             body_html: &body,
@@ -758,6 +857,7 @@ async fn preview(State(st): State<SharesState>, v: Viewer, headers: HeaderMap, b
             snapshot_date: &chrono::Utc::now().format("%Y-%m-%d").to_string(),
             nonce: None,
             comments_enabled: false,
+            nav: None,
         })
     })
     .await;
@@ -771,8 +871,8 @@ async fn owner_comments(State(st): State<SharesState>, v: Viewer, headers: Heade
     if let Err(r) = owner_gate(&st, &v, &headers) {
         return r;
     }
-    match with_store(&st.store, v.scope, move |s| s.share_comments_for_owner(id)).await {
-        Ok(cs) => Json(json!({"comments": cs.iter().map(comment_json).collect::<Vec<_>>()})).into_response(),
+    match with_store(&st.store, v.scope, move |s| Ok::<_, StoreError>((s.share_comments_for_owner(id)?, s.share_pages(id)?))).await {
+        Ok((cs, pages)) => Json(json!({"comments": cs.iter().map(|c| owner_comment_json(c, &pages)).collect::<Vec<_>>()})).into_response(),
         Err(e) => fail(e),
     }
 }
@@ -816,9 +916,10 @@ async fn owner_reply(
         (Ok(b), Ok(a)) => (b, a),
         (Err(r), _) | (_, Err(r)) => return r,
     };
-    let c = NewShareComment { author: String::new(), body, parent_id: req.parent_id, anchor, ip_hash: None };
-    match with_store(&st.store, v.scope, move |s| s.share_owner_reply(id, c, now())).await {
-        Ok(c) => (StatusCode::CREATED, Json(comment_json(&c))).into_response(),
+    // a reply lands on its thread's page; a new thread of the owner's on the root
+    let c = NewShareComment { author: String::new(), body, parent_id: req.parent_id, anchor, ip_hash: None, page: None };
+    match with_store(&st.store, v.scope, move |s| Ok::<_, StoreError>((s.share_owner_reply(id, c, now())?, s.share_pages(id)?))).await {
+        Ok((c, pages)) => (StatusCode::CREATED, Json(owner_comment_json(&c, &pages))).into_response(),
         Err(e) => fail(e),
     }
 }
@@ -979,7 +1080,37 @@ async fn lookup(st: &SharesState, req_headers: &HeaderMap, ext: &axum::http::Ext
     })
 }
 
+/// A live link's sub-pages (none for a single-doc link), cached per snapshot.
+async fn link_pages(st: &SharesState, server: &ServerSide, sh: &Share) -> Result<Arc<Vec<SharePageMeta>>, Response> {
+    if sh.page_count == 0 {
+        return Ok(Arc::new(Vec::new()));
+    }
+    let key = (sh.id, sh.revision);
+    if let Some(p) = lock(&server.caches.pages).get(&key) {
+        return Ok(p);
+    }
+    let id = sh.id;
+    let pages = with_store(&st.store, Scope::Public, move |s| s.share_public_pages(id)).await.map_err(public_500)?;
+    let weight = pages.iter().map(|p| p.slug.len() + p.title.len() + 64).sum();
+    let pages = Arc::new(pages);
+    lock(&server.caches.pages).put(key, pages.clone(), weight);
+    Ok(pages)
+}
+
+fn nothing_here() -> Response {
+    html_response(StatusCode::NOT_FOUND, gone_page("There is nothing at this link."), None, "")
+}
+
 async fn public_page(State(st): State<SharesState>, Path(token): Path<String>, req: Request) -> Response {
+    serve_page(st, token, None, req).await
+}
+
+async fn public_subpage(State(st): State<SharesState>, Path((token, slug)): Path<(String, String)>, req: Request) -> Response {
+    serve_page(st, token, Some(slug), req).await
+}
+
+/// The link's root page (`slug` None) or one of its sub-pages.
+async fn serve_page(st: SharesState, token: String, slug: Option<String>, req: Request) -> Response {
     let (found, _) = match lookup(&st, req.headers(), req.extensions(), &token).await {
         Ok(f) => f,
         Err(r) => return r,
@@ -987,21 +1118,43 @@ async fn public_page(State(st): State<SharesState>, Path(token): Path<String>, r
     let sh = match found {
         Found::Live(sh) => sh,
         Found::Gone => return html_response(StatusCode::GONE, gone_page("This link has expired or was turned off."), None, ""),
-        Found::Unknown => return html_response(StatusCode::NOT_FOUND, gone_page("There is nothing at this link."), None, ""),
+        Found::Unknown => return nothing_here(),
     };
     let Some(server) = &st.server else { return not_found() };
+    let pages = match link_pages(&st, server, &sh).await {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    // a sub-page is one of this link's, by its slug: nothing else is looked up
+    let sub = match &slug {
+        None => None,
+        Some(s) => match pages.iter().find(|p| &p.slug == s) {
+            Some(p) => Some(p.clone()),
+            None => return nothing_here(),
+        },
+    };
     let origin = public_origin(&server.cfg.base);
     let (id, rev) = (sh.id, sh.revision);
-    let cached = lock(&server.caches.renders).get(&(id, rev));
+    let cache_key = (id, rev, slug.clone());
+    let cached = lock(&server.caches.renders).get(&cache_key);
     let body = match cached {
         Some(b) => b,
         None => {
-            let input = with_store(&st.store, Scope::Public, move |s| s.share_public_render_input(id)).await;
+            let which = slug.clone();
+            let input = with_store(&st.store, Scope::Public, move |s| s.share_public_render_input(id, which.as_deref())).await;
             let input = match input {
                 Ok(i) => i,
                 Err(e) => return public_500(e),
             };
             let t = token.clone();
+            // [[Title]] reaches the link's own pages (the root among them)
+            let links = if pages.is_empty() {
+                PageLinks::default()
+            } else {
+                PageLinks::new(
+                    std::iter::once((sh.title.clone(), format!("/s/{t}"))).chain(pages.iter().map(|p| (p.title.clone(), page_path(&t, &p.slug)))),
+                )
+            };
             let rendered = tokio::task::spawn_blocking(move || {
                 render_with(
                     &input.markdown,
@@ -1010,12 +1163,13 @@ async fn public_page(State(st): State<SharesState>, Path(token): Path<String>, r
                         (n, w, h, url)
                     }),
                     true,
+                    &links,
                 )
             })
             .await;
             let Ok(b) = rendered else { return public_500("render failed") };
             let b = Arc::new(b);
-            lock(&server.caches.renders).put((id, rev), b.clone(), b.len());
+            lock(&server.caches.renders).put(cache_key, b.clone(), b.len());
             b
         }
     };
@@ -1024,13 +1178,18 @@ async fn public_page(State(st): State<SharesState>, Path(token): Path<String>, r
     }
     let nonce = random_token();
     let date = chrono::DateTime::from_timestamp(sh.snapshot_at, 0).map(|d| d.format("%-d %B %Y").to_string()).unwrap_or_default();
+    let nav = (!pages.is_empty()).then(|| {
+        let rows: Vec<(String, Option<String>, String)> = pages.iter().map(|p| (p.slug.clone(), p.parent_slug.clone(), p.title.clone())).collect();
+        Nav::build(&sh.title, &format!("/s/{token}"), &rows, slug.as_deref())
+    });
     let html = page(&PageParts {
-        title: &sh.title,
+        title: sub.as_ref().map_or(&sh.title, |p| &p.title),
         body_html: &body,
         theme: &sh.theme,
         snapshot_date: &date,
         nonce: Some(&nonce),
         comments_enabled: sh.comments_enabled,
+        nav: nav.as_ref(),
     });
     html_response(StatusCode::OK, html, Some(&nonce), &origin)
 }
@@ -1084,6 +1243,27 @@ async fn public_asset(State(st): State<SharesState>, Path((token, name)): Path<(
 }
 
 async fn public_comments(State(st): State<SharesState>, Path(token): Path<String>, req: Request) -> Response {
+    list_comments(st, token, None, req).await
+}
+
+async fn public_subpage_comments(State(st): State<SharesState>, Path((token, slug)): Path<(String, String)>, req: Request) -> Response {
+    list_comments(st, token, Some(slug), req).await
+}
+
+/// `slug` names one of the link's sub-pages, or 404.
+async fn known_page(st: &SharesState, sh: &Share, slug: &Option<String>) -> Result<(), Response> {
+    let Some(slug) = slug else { return Ok(()) };
+    let Some(server) = &st.server else { return Err(not_found()) };
+    let pages = link_pages(st, server, sh).await?;
+    if pages.iter().any(|p| &p.slug == slug) {
+        Ok(())
+    } else {
+        Err(public_json(StatusCode::NOT_FOUND, json!({"error": "not found"})))
+    }
+}
+
+/// One page's comments: the root's (`slug` None) or a sub-page's.
+async fn list_comments(st: SharesState, token: String, slug: Option<String>, req: Request) -> Response {
     let (found, _) = match lookup(&st, req.headers(), req.extensions(), &token).await {
         Ok(f) => f,
         Err(r) => return r,
@@ -1093,11 +1273,14 @@ async fn public_comments(State(st): State<SharesState>, Path(token): Path<String
         Found::Gone => return public_json(StatusCode::GONE, json!({"error": "this link has expired or was turned off"})),
         Found::Unknown => return public_json(StatusCode::NOT_FOUND, json!({"error": "not found"})),
     };
+    if let Err(r) = known_page(&st, &sh, &slug).await {
+        return r;
+    }
     if !sh.comments_enabled {
         return public_json(StatusCode::OK, json!({"comments": [], "enabled": false}));
     }
     let id = sh.id;
-    match with_store(&st.store, Scope::Public, move |s| s.share_public_comments(id)).await {
+    match with_store(&st.store, Scope::Public, move |s| s.share_public_comments(id, slug.as_deref())).await {
         Ok(cs) => public_json(StatusCode::OK, json!({"comments": cs.iter().map(comment_json).collect::<Vec<_>>(), "enabled": true})),
         Err(e) => public_500(e),
     }
@@ -1119,6 +1302,15 @@ struct PublicCommentReq {
 }
 
 async fn public_comment(State(st): State<SharesState>, Path(token): Path<String>, req: Request) -> Response {
+    post_comment(st, token, None, req).await
+}
+
+async fn public_subpage_comment(State(st): State<SharesState>, Path((token, slug)): Path<(String, String)>, req: Request) -> Response {
+    post_comment(st, token, Some(slug), req).await
+}
+
+/// A reader's comment on the root page (`slug` None) or a sub-page.
+async fn post_comment(st: SharesState, token: String, slug: Option<String>, req: Request) -> Response {
     let (found, ip) = match lookup(&st, req.headers(), req.extensions(), &token).await {
         Ok(f) => f,
         Err(r) => return r,
@@ -1138,6 +1330,9 @@ async fn public_comment(State(st): State<SharesState>, Path(token): Path<String>
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"));
     if !json_body {
         return public_json(StatusCode::UNSUPPORTED_MEDIA_TYPE, json!({"error": "send the comment as application/json"}));
+    }
+    if let Err(r) = known_page(&st, &sh, &slug).await {
+        return r;
     }
     if !sh.comments_enabled {
         return public_json(StatusCode::FORBIDDEN, json!({"error": "comments are off for this link"}));
@@ -1161,7 +1356,7 @@ async fn public_comment(State(st): State<SharesState>, Path(token): Path<String>
     };
     let fake = |name: String, body: String, anchor: Option<Value>| {
         json!({"id": Uuid::now_v7(), "parent_id": b.parent_id, "author": name, "is_owner": false, "body": body,
-            "anchor": anchor, "created_at": rfc3339(now()), "revision": sh.revision})
+            "anchor": anchor, "created_at": rfc3339(now()), "revision": sh.revision, "page": slug})
     };
     if b.website.as_deref().is_some_and(|w| !w.trim().is_empty()) {
         // a bot: it hears success, nothing is stored or sent
@@ -1170,13 +1365,13 @@ async fn public_comment(State(st): State<SharesState>, Path(token): Path<String>
     }
     let Some(server) = &st.server else { return not_found() };
     let ip_hash = server.key.ip_hash(sh.id, &ip);
-    let (id, parent) = (sh.id, b.parent_id);
+    let (id, parent, page) = (sh.id, b.parent_id, slug.clone());
     let made = with_store(&st.store, Scope::Public, move |s| {
         let n = s.share_comment_counts(id, &ip_hash, now())?;
         if n.ip_hour >= PER_IP_HOUR || n.ip_day >= PER_IP_DAY || n.share_day >= PER_SHARE_DAY {
             return Ok(None);
         }
-        let c = NewShareComment { author: name, body, parent_id: parent, anchor, ip_hash: Some(ip_hash) };
+        let c = NewShareComment { author: name, body, parent_id: parent, anchor, ip_hash: Some(ip_hash), page };
         s.share_public_comment(id, c, now()).map(Some)
     })
     .await;
@@ -1226,6 +1421,14 @@ pub fn router(state: SharesState) -> Router {
             "/s/{token}/comments",
             get(public_comments)
                 .post(public_comment)
+                .options(comments_preflight)
+                .layer(axum::middleware::from_fn(cors_for_sandboxed_page)),
+        )
+        .route("/s/{token}/p/{slug}", get(public_subpage))
+        .route(
+            "/s/{token}/p/{slug}/comments",
+            get(public_subpage_comments)
+                .post(public_subpage_comment)
                 .options(comments_preflight)
                 .layer(axum::middleware::from_fn(cors_for_sandboxed_page)),
         )

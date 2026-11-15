@@ -23,6 +23,28 @@ pub struct ShareAsset {
     pub height: Option<i64>,
 }
 
+/// One sub-page of a snapshot: a descendant of the link's doc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharePage {
+    /// the doc it was taken from (the caller must be able to write it, and
+    /// it must sit under the link's doc)
+    pub doc_id: Uuid,
+    /// its name in the page's URL (the daemon derives it; never the doc id)
+    pub slug: String,
+    /// the page above it; None = directly under the link's root
+    pub parent_slug: Option<String>,
+    pub title: String,
+    pub markdown: String,
+}
+
+/// A sub-page as the page's navigation needs it (no markdown).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharePageMeta {
+    pub slug: String,
+    pub parent_slug: Option<String>,
+    pub title: String,
+}
+
 /// What the owner publishes, validated by the daemon. The page is rendered
 /// from `markdown` when it is served.
 #[derive(Debug, Clone)]
@@ -31,13 +53,20 @@ pub struct ShareSnapshot {
     pub markdown: String,
     /// light | dark | auto
     pub theme: String,
+    /// every page's images, in one namespace
     pub assets: Vec<ShareAsset>,
+    /// the doc's sub-pages, in tree order (a parent before its children);
+    /// empty = a single-doc link
+    pub pages: Vec<SharePage>,
 }
 
 impl ShareSnapshot {
-    /// What it costs against the owner's cap: markdown and image bytes.
+    /// What it costs against the owner's cap: markdown (every page's) and
+    /// image bytes.
     pub fn bytes(&self) -> i64 {
-        (self.markdown.len() + self.assets.iter().map(|a| a.data.len()).sum::<usize>()) as i64
+        (self.markdown.len()
+            + self.pages.iter().map(|p| p.markdown.len()).sum::<usize>()
+            + self.assets.iter().map(|a| a.data.len()).sum::<usize>()) as i64
     }
 }
 
@@ -77,6 +106,8 @@ pub struct Share {
     pub unread_comments: i64,
     /// the owner's display name (a reader cannot comment under it)
     pub owner_name: String,
+    /// sub-pages published with the doc (0 = a single-doc link)
+    pub page_count: i64,
 }
 
 impl Share {
@@ -105,6 +136,8 @@ pub struct ShareComment {
     pub anchor: Option<serde_json::Value>,
     pub created_at: i64,
     pub revision: i64,
+    /// the sub-page (its slug) the comment is on; None = the root page
+    pub page: Option<String>,
 }
 
 /// A new comment, validated by the daemon.
@@ -116,6 +149,9 @@ pub struct NewShareComment {
     pub anchor: Option<serde_json::Value>,
     /// SHA-256 of (share, client ip); None for the owner's replies
     pub ip_hash: Option<String>,
+    /// the sub-page (slug) it is on; None = the root page. A reply takes
+    /// its thread's page whatever this says.
+    pub page: Option<String>,
 }
 
 /// Recent public comments on a share, for the rate limit.
@@ -132,7 +168,8 @@ const SHARE_COLS: &str = "s.id, s.owner_id, s.doc_id, s.title, s.theme, s.revisi
     s.created_at, s.updated_at, s.snapshot_at, s.expires_at, s.revoked_at, s.views, s.last_viewed_at,
     (SELECT count(*) FROM share_link_comments c WHERE c.share_id = s.id),
     (SELECT count(*) FROM share_link_comments c WHERE c.share_id = s.id AND c.is_owner = 0 AND c.read_at IS NULL),
-    (SELECT u.name FROM auth_users u WHERE u.id = s.owner_id)";
+    (SELECT u.name FROM auth_users u WHERE u.id = s.owner_id),
+    (SELECT count(*) FROM share_link_pages p WHERE p.share_id = s.id)";
 
 fn uuid_at(r: &Row, i: usize) -> rusqlite::Result<Uuid> {
     let s: String = r.get(i)?;
@@ -158,10 +195,11 @@ fn share_row(r: &Row) -> rusqlite::Result<Share> {
         comment_count: r.get(14)?,
         unread_comments: r.get(15)?,
         owner_name: r.get::<_, Option<String>>(16)?.unwrap_or_default(),
+        page_count: r.get(17)?,
     })
 }
 
-const COMMENT_COLS: &str = "id, share_id, parent_id, author, is_owner, body, anchor, created_at, revision";
+const COMMENT_COLS: &str = "id, share_id, parent_id, author, is_owner, body, anchor, created_at, revision, page";
 
 fn comment_row(r: &Row) -> rusqlite::Result<ShareComment> {
     let parent: Option<String> = r.get(2)?;
@@ -176,6 +214,7 @@ fn comment_row(r: &Row) -> rusqlite::Result<ShareComment> {
         anchor: anchor.and_then(|a| serde_json::from_str(&a).ok()),
         created_at: r.get(7)?,
         revision: r.get(8)?,
+        page: r.get(9)?,
     })
 }
 
@@ -189,8 +228,18 @@ pub(crate) fn revoke_on_unshare(conn: &rusqlite::Connection, ws: Uuid, user: Uui
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let mut n = 0;
     for (id, doc) in links {
-        let Ok(doc) = Uuid::parse_str(&doc) else { continue };
-        if crate::tenancy::space_conn(conn, doc).ok() == Some(crate::tenancy::Space::Workspace(ws)) {
+        // the link's doc, and every sub-page's (a sub-page can carry a
+        // workspace label of its own)
+        let mut docs = vec![doc];
+        {
+            let mut st = conn.prepare_cached("SELECT doc_id FROM share_link_pages WHERE share_id = ?1")?;
+            let pages = st.query_map(params![id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            docs.extend(pages);
+        }
+        let in_ws = docs.iter().filter_map(|d| Uuid::parse_str(d).ok()).any(|d| {
+            crate::tenancy::space_conn(conn, d).ok() == Some(crate::tenancy::Space::Workspace(ws))
+        });
+        if in_ws {
             n += revoke_conn(conn, "id = ?1", &id, now)?;
         }
     }
@@ -203,11 +252,17 @@ pub const PURGE_AFTER: i64 = 30 * 86400;
 pub const IP_HASH_TTL: i64 = 86400;
 
 /// Revoke the links matching `pred` (one `?1` parameter): the snapshot's
-/// markdown and images go now, the row stays (410) until the purge.
+/// markdown, sub-pages and images go now, the row stays (410) until the purge.
 pub(crate) fn revoke_conn(conn: &rusqlite::Connection, pred: &str, arg: &str, now: i64) -> Result<usize> {
     conn.execute(
         &format!(
             "DELETE FROM share_link_assets WHERE share_id IN (SELECT id FROM share_links WHERE {pred} AND revoked_at IS NULL)"
+        ),
+        params![arg],
+    )?;
+    conn.execute(
+        &format!(
+            "DELETE FROM share_link_pages WHERE share_id IN (SELECT id FROM share_links WHERE {pred} AND revoked_at IS NULL)"
         ),
         params![arg],
     )?;
@@ -289,6 +344,38 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Every sub-page is a doc the caller may write, under the link's doc:
+    /// a link publishes nothing its maker could not have changed, and
+    /// nothing from outside the tree it names.
+    fn check_pages(&self, root: Uuid, pages: &[SharePage]) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let under: std::collections::HashSet<Uuid> = crate::workspaces::descendants_conn(&self.conn, root)?.into_iter().collect();
+        let (mut docs, mut slugs) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+        for p in pages {
+            self.may_write(p.doc_id)?;
+            if !under.contains(&p.doc_id) {
+                return Err(StoreError::InvalidOp(format!("page {}: not a sub-page of the shared doc", p.doc_id)));
+            }
+            if !docs.insert(p.doc_id) || !slugs.insert(p.slug.as_str()) {
+                return Err(StoreError::InvalidOp(format!("page {}: appears twice", p.doc_id)));
+            }
+        }
+        Ok(())
+    }
+
+    fn put_pages(tx: &rusqlite::Transaction, share: Uuid, pages: &[SharePage]) -> Result<()> {
+        tx.execute("DELETE FROM share_link_pages WHERE share_id = ?1", params![share.to_string()])?;
+        let mut ins = tx.prepare(
+            "INSERT INTO share_link_pages (share_id, slug, doc_id, parent_slug, position, title, markdown) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for (i, p) in pages.iter().enumerate() {
+            ins.execute(params![share.to_string(), p.slug, p.doc_id.to_string(), p.parent_slug, i as i64, p.title, p.markdown])?;
+        }
+        Ok(())
+    }
+
     /// Publish a snapshot of `doc` (which the caller must be able to see)
     /// as link `id`; `token_hash` is the SHA-256 of the token derived from
     /// `id` (the token itself is never stored).
@@ -307,6 +394,7 @@ impl SqliteStore {
         // owner or editor of the doc's workspace (Unsorted: its owner):
         // invisible is NotFound, read-only is Forbidden
         self.may_write(doc)?;
+        self.check_pages(doc, &snap.pages)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO share_links (id, owner_id, doc_id, token_hash, title, markdown, theme,
@@ -327,6 +415,7 @@ impl SqliteStore {
             ],
         )?;
         Self::put_assets(&tx, id, &snap.assets)?;
+        Self::put_pages(&tx, id, &snap.pages)?;
         tx.commit()?;
         self.share_get(id)
     }
@@ -341,6 +430,9 @@ impl SqliteStore {
         // still owner or editor of the doc: a link is not a way to keep
         // publishing a doc you can no longer change
         self.may_write(cur.doc_id)?;
+        if let Some(snap) = &patch.snapshot {
+            self.check_pages(cur.doc_id, &snap.pages)?;
+        }
         let tx = self.conn.unchecked_transaction()?;
         if let Some(snap) = &patch.snapshot {
             tx.execute(
@@ -349,6 +441,7 @@ impl SqliteStore {
                 params![id.to_string(), snap.title, snap.markdown, snap.theme, now, snap.bytes()],
             )?;
             Self::put_assets(&tx, id, &snap.assets)?;
+            Self::put_pages(&tx, id, &snap.pages)?;
         }
         if let Some(exp) = patch.expires_at {
             tx.execute("UPDATE share_links SET expires_at = ?2, updated_at = ?3 WHERE id = ?1", params![id.to_string(), exp, now])?;
@@ -400,6 +493,20 @@ impl SqliteStore {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    fn pages_of(&self, id: Uuid) -> Result<Vec<SharePageMeta>> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT slug, parent_slug, title FROM share_link_pages WHERE share_id = ?1 ORDER BY position, slug")?;
+        let rows = st.query_map(params![id.to_string()], |r| Ok(SharePageMeta { slug: r.get(0)?, parent_slug: r.get(1)?, title: r.get(2)? }))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The sub-pages of one of the caller's shares, in tree order.
+    pub fn share_pages(&self, id: Uuid) -> Result<Vec<SharePageMeta>> {
+        self.share_get(id)?;
+        self.pages_of(id)
+    }
+
     /// The comments on one of the caller's shares (a read: nothing changes).
     pub fn share_comments_for_owner(&self, id: Uuid) -> Result<Vec<ShareComment>> {
         self.share_get(id)?;
@@ -418,31 +525,48 @@ impl SqliteStore {
 
     /// A reply is threaded under its root: a parent that is itself a reply
     /// resolves to that reply's parent. Unknown parents are refused.
-    fn thread_root(&self, share: Uuid, parent: Option<Uuid>) -> Result<Option<Uuid>> {
+    /// Also the page the thread is on (a reply is on its thread's page).
+    fn thread_root(&self, share: Uuid, parent: Option<Uuid>) -> Result<Option<(Uuid, Option<String>)>> {
         let Some(p) = parent else { return Ok(None) };
-        let row: Option<Option<String>> = self
+        let row: Option<(Option<String>, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT parent_id FROM share_link_comments WHERE id = ?1 AND share_id = ?2",
+                "SELECT parent_id, page FROM share_link_comments WHERE id = ?1 AND share_id = ?2",
                 params![p.to_string(), share.to_string()],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
         match row {
             None => Err(StoreError::InvalidOp("parent_id: no such comment on this link".into())),
-            Some(Some(root)) => Ok(Uuid::parse_str(&root).ok().or(Some(p))),
-            Some(None) => Ok(Some(p)),
+            Some((Some(root), page)) => Ok(Some((Uuid::parse_str(&root).unwrap_or(p), page))),
+            Some((None, page)) => Ok(Some((p, page))),
         }
     }
 
     fn insert_comment(&mut self, share: &Share, c: &NewShareComment, is_owner: bool, now: i64) -> Result<ShareComment> {
-        let parent = self.thread_root(share.id, c.parent_id)?;
+        let (parent, page) = match self.thread_root(share.id, c.parent_id)? {
+            Some((root, page)) => (Some(root), page),
+            None => (None, c.page.clone()),
+        };
+        if let Some(slug) = &page {
+            // a new thread names a page the link has (a reply's thread may
+            // sit on a page a later snapshot dropped)
+            let known: bool = c.parent_id.is_some()
+                || self.conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM share_link_pages WHERE share_id = ?1 AND slug = ?2)",
+                    params![share.id.to_string(), slug],
+                    |r| r.get(0),
+                )?;
+            if !known {
+                return Err(StoreError::InvalidOp("page: no such page on this link".into()));
+            }
+        }
         let id = Uuid::now_v7();
         let anchor = c.anchor.as_ref().map(|a| a.to_string());
         let read_at = is_owner.then_some(now);
         self.conn.execute(
-            "INSERT INTO share_link_comments (id, share_id, parent_id, author, is_owner, body, anchor, created_at, revision, ip_hash, read_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO share_link_comments (id, share_id, parent_id, author, is_owner, body, anchor, created_at, revision, ip_hash, read_at, page)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 id.to_string(),
                 share.id.to_string(),
@@ -454,7 +578,8 @@ impl SqliteStore {
                 now,
                 share.revision,
                 c.ip_hash,
-                read_at
+                read_at,
+                page
             ],
         )?;
         Ok(ShareComment {
@@ -467,6 +592,7 @@ impl SqliteStore {
             anchor: c.anchor.clone(),
             created_at: now,
             revision: share.revision,
+            page,
         })
     }
 
@@ -510,14 +636,24 @@ impl SqliteStore {
             .optional()?)
     }
 
-    /// What the page is rendered from.
-    pub fn share_public_render_input(&self, id: Uuid) -> Result<RenderInput> {
+    /// A link's sub-pages (slug, parent, title), in tree order.
+    pub fn share_public_pages(&self, id: Uuid) -> Result<Vec<SharePageMeta>> {
         self.public_only()?;
-        let markdown: String = self
-            .conn
-            .query_row("SELECT markdown FROM share_links WHERE id = ?1", params![id.to_string()], |r| r.get(0))
-            .optional()?
-            .ok_or_else(|| not_found(id))?;
+        self.pages_of(id)
+    }
+
+    /// What a page is rendered from: the root's (`page` None) or a
+    /// sub-page's markdown, and the link's images.
+    pub fn share_public_render_input(&self, id: Uuid, page: Option<&str>) -> Result<RenderInput> {
+        self.public_only()?;
+        let markdown: Option<String> = match page {
+            None => self.conn.query_row("SELECT markdown FROM share_links WHERE id = ?1", params![id.to_string()], |r| r.get(0)).optional()?,
+            Some(slug) => self
+                .conn
+                .query_row("SELECT markdown FROM share_link_pages WHERE share_id = ?1 AND slug = ?2", params![id.to_string(), slug], |r| r.get(0))
+                .optional()?,
+        };
+        let markdown = markdown.ok_or_else(|| not_found(id))?;
         let mut st = self.conn.prepare("SELECT name, width, height FROM share_link_assets WHERE share_id = ?1")?;
         let assets = st
             .query_map(params![id.to_string()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -549,10 +685,15 @@ impl SqliteStore {
             .optional()?)
     }
 
-    /// Every comment on a share, oldest first.
-    pub fn share_public_comments(&self, id: Uuid) -> Result<Vec<ShareComment>> {
+    /// The comments on one page of a share (`page` None = the root page),
+    /// oldest first.
+    pub fn share_public_comments(&self, id: Uuid, page: Option<&str>) -> Result<Vec<ShareComment>> {
         self.public_only()?;
-        self.comments_of(id)
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COMMENT_COLS} FROM share_link_comments WHERE share_id = ?1 AND page IS ?2 ORDER BY created_at, id"
+        ))?;
+        let rows = st.query_map(params![id.to_string(), page], comment_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// How many public comments `ip_hash` (and everyone) left lately.
@@ -618,6 +759,7 @@ mod tests {
             markdown: "# hi".into(),
             theme: "auto".into(),
             assets: vec![ShareAsset { name: "d1.svg".into(), content_type: "image/svg+xml".into(), data: b"<svg/>".to_vec(), width: Some(10), height: None }],
+            pages: vec![],
         }
     }
 
@@ -650,7 +792,7 @@ mod tests {
             s.with_scope_for_test(Scope::User(a), |s| s.share_create(Uuid::now_v7(), doc, hash, &snap("D"), exp, true, 0).unwrap().id)
         };
         let (old, recent, expired, live) = (mk(&mut s, "h1", None), mk(&mut s, "h2", None), mk(&mut s, "h3", Some(1)), mk(&mut s, "h4", None));
-        let c = NewShareComment { author: "R".into(), body: "b".into(), parent_id: None, anchor: None, ip_hash: Some("ip".into()) };
+        let c = NewShareComment { author: "R".into(), body: "b".into(), parent_id: None, anchor: None, ip_hash: Some("ip".into()), page: None };
         s.with_scope_for_test(Scope::Public, |s| {
             s.share_public_comment(old, c.clone(), 5).unwrap();
             s.share_public_comment(live, c.clone(), 39 * day).unwrap();
@@ -663,8 +805,8 @@ mod tests {
         // revoked: no images, no markdown, the row (and its comments) kept
         s.with_scope_for_test(Scope::Public, |s| {
             assert!(s.share_public_asset(old, "d1.svg").unwrap().is_none());
-            assert_eq!(s.share_public_render_input(old).unwrap().markdown, "");
-            assert_eq!(s.share_public_comments(old).unwrap().len(), 1);
+            assert_eq!(s.share_public_render_input(old, None).unwrap().markdown, "");
+            assert_eq!(s.share_public_comments(old, None).unwrap().len(), 1);
         });
         assert!(s.with_scope_for_test(Scope::User(a), |s| s.share_maintenance(41 * day)).is_err(), "System only");
         let (purged, cleared) = s.share_maintenance(41 * day).unwrap();
@@ -676,6 +818,102 @@ mod tests {
         assert_eq!(cleared, 1, "only the hash older than a day");
         let hashes: i64 = s.conn.query_row("SELECT count(ip_hash) FROM share_link_comments", [], |r| r.get(0)).unwrap();
         assert_eq!(hashes, 1);
+    }
+
+    fn page(doc: Uuid, slug: &str, parent: Option<&str>, title: &str) -> SharePage {
+        SharePage { doc_id: doc, slug: slug.into(), parent_slug: parent.map(Into::into), title: title.into(), markdown: format!("text of {title}") }
+    }
+
+    /// A link to a doc and its sub-pages: only docs under it that the maker
+    /// may write; each page reads on its own; comments are per page; a new
+    /// snapshot replaces the pages; revoking drops them.
+    #[test]
+    fn a_link_carries_the_docs_sub_pages() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let a = s.auth_ensure_owner(p, "Tom", 1).unwrap().id;
+        let b = s.auth_add_user("Aoife", 1).unwrap().id;
+        let (root, kid, grandkid, other, hers) = s.with_scope_for_test(Scope::User(a), |s| {
+            let root = s.create_doc_with_ops("Root", None, p, vec![]).unwrap().0.id;
+            let kid = s.create_doc_with_ops("Kid", Some(root), p, vec![]).unwrap().0.id;
+            let grandkid = s.create_doc_with_ops("Grandkid", Some(kid), p, vec![]).unwrap().0.id;
+            let other = s.create_doc_with_ops("Elsewhere", None, p, vec![]).unwrap().0.id;
+            (root, kid, grandkid, other, ())
+        });
+        let _ = hers;
+        let b_doc = s.with_scope_for_test(Scope::User(b), |s| s.create_doc_with_ops("Hers", None, p, vec![]).unwrap().0.id);
+        let with = |pages: Vec<SharePage>| ShareSnapshot { pages, ..snap("Root") };
+        s.with_scope_for_test(Scope::User(a), |s| {
+            // not under the root, someone else's, the root itself, a repeat
+            for bad in [
+                vec![page(other, "s1", None, "Elsewhere")],
+                vec![page(root, "s1", None, "Root")],
+                vec![page(kid, "s1", None, "Kid"), page(kid, "s2", None, "Kid")],
+                vec![page(kid, "s1", None, "Kid"), page(grandkid, "s1", None, "Grandkid")],
+            ] {
+                let e = s.share_create(Uuid::now_v7(), root, "h-bad", &with(bad), None, true, 0);
+                assert!(matches!(e, Err(StoreError::InvalidOp(_))), "{e:?}");
+            }
+            let e = s.share_create(Uuid::now_v7(), root, "h-bad", &with(vec![page(b_doc, "s1", None, "Hers")]), None, true, 0);
+            assert!(matches!(e, Err(StoreError::NotFound(_))), "a doc she cannot see is not there: {e:?}");
+            assert!(s.shares_list(None).unwrap().is_empty(), "a refused link stores nothing");
+        });
+        let snap2 = with(vec![page(kid, "kid", None, "Kid"), page(grandkid, "grand", Some("kid"), "Grandkid")]);
+        let sh = s.with_scope_for_test(Scope::User(a), |s| s.share_create(Uuid::now_v7(), root, "hash", &snap2, None, true, 10).unwrap());
+        assert_eq!(sh.page_count, 2);
+        assert_eq!(snap2.bytes(), ("# hi".len() + "<svg/>".len() + "text of Kid".len() + "text of Grandkid".len()) as i64);
+        s.with_scope_for_test(Scope::User(b), |s| assert!(s.share_pages(sh.id).is_err(), "B sees none of A's pages"));
+        s.with_scope_for_test(Scope::Public, |s| {
+            let pages = s.share_public_pages(sh.id).unwrap();
+            assert_eq!(pages.iter().map(|p| (p.slug.as_str(), p.parent_slug.as_deref(), p.title.as_str())).collect::<Vec<_>>(), [
+                ("kid", None, "Kid"),
+                ("grand", Some("kid"), "Grandkid")
+            ]);
+            assert_eq!(s.share_public_render_input(sh.id, None).unwrap().markdown, "# hi");
+            assert_eq!(s.share_public_render_input(sh.id, Some("grand")).unwrap().markdown, "text of Grandkid");
+            assert!(s.share_public_render_input(sh.id, Some("nope")).is_err());
+            // a comment per page; a reply joins its thread's page
+            let c = |page: Option<&str>, parent| NewShareComment { author: "R".into(), body: "b".into(), parent_id: parent, anchor: None, ip_hash: None, page: page.map(Into::into) };
+            let on_kid = s.share_public_comment(sh.id, c(Some("kid"), None), 20).unwrap();
+            s.share_public_comment(sh.id, c(None, None), 21).unwrap();
+            let reply = s.share_public_comment(sh.id, c(None, Some(on_kid.id)), 22).unwrap();
+            assert_eq!(reply.page.as_deref(), Some("kid"));
+            assert!(matches!(s.share_public_comment(sh.id, c(Some("nope"), None), 23), Err(StoreError::InvalidOp(_))));
+            assert_eq!(s.share_public_comments(sh.id, Some("kid")).unwrap().len(), 2);
+            assert_eq!(s.share_public_comments(sh.id, None).unwrap().len(), 1);
+            assert!(s.share_public_comments(sh.id, Some("grand")).unwrap().is_empty());
+        });
+        s.with_scope_for_test(Scope::User(a), |s| {
+            assert_eq!(s.share_comments_for_owner(sh.id).unwrap().len(), 3, "the owner reads every page's");
+            // a new snapshot without the grandkid: the page is gone
+            let up = s.share_update(sh.id, SharePatch { snapshot: Some(with(vec![page(kid, "kid", None, "Kid 2")])), ..Default::default() }, 30).unwrap();
+            assert_eq!((up.page_count, up.revision), (1, 2));
+            assert_eq!(s.share_pages(sh.id).unwrap()[0].title, "Kid 2");
+            // a sub-page moved out from under the root is refused on the next snapshot
+            let e = s.share_update(sh.id, SharePatch { snapshot: Some(with(vec![page(other, "o", None, "Elsewhere")])), ..Default::default() }, 31);
+            assert!(matches!(e, Err(StoreError::InvalidOp(_))), "{e:?}");
+            s.share_revoke(sh.id, 40).unwrap();
+            assert_eq!(s.share_get(sh.id).unwrap().page_count, 0, "revoking drops the pages");
+        });
+    }
+
+    /// A sub-page's doc deleted for good leaves the link: the page goes, the
+    /// link stays at a new revision.
+    #[test]
+    fn a_purged_sub_page_leaves_the_link() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let p = s.create_principal(PrincipalKind::Human, "tom", None).unwrap().id;
+        let a = s.auth_ensure_owner(p, "Tom", 1).unwrap().id;
+        let root = s.create_doc_with_ops("Root", None, p, vec![]).unwrap().0.id;
+        let kid = s.create_doc_with_ops("Kid", Some(root), p, vec![]).unwrap().0.id;
+        let snap = ShareSnapshot { pages: vec![page(kid, "kid", None, "Kid")], ..snap("Root") };
+        let id = s.with_scope_for_test(Scope::User(a), |s| s.share_create(Uuid::now_v7(), root, "h", &snap, None, true, 0).unwrap().id);
+        s.conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        s.conn.execute("DELETE FROM docs WHERE id = ?1", [kid.to_string()]).unwrap();
+        let sh = s.share_get(id).unwrap();
+        assert_eq!((sh.page_count, sh.revision, sh.revoked_at), (0, 2, None));
+        let bytes: i64 = s.conn.query_row("SELECT snapshot_bytes FROM share_links WHERE id = ?1", [id.to_string()], |r| r.get(0)).unwrap();
+        assert_eq!(bytes, ("# hi".len() + "<svg/>".len()) as i64);
     }
 
     #[test]
@@ -705,7 +943,7 @@ mod tests {
             assert_eq!(got.id, sh.id);
             assert!(s.share_public_asset(sh.id, "d1.svg").unwrap().is_some());
             assert!(s.get_doc(doc).is_err(), "Scope::Public sees no doc");
-            let c = NewShareComment { author: "R".into(), body: "nice".into(), parent_id: None, anchor: None, ip_hash: Some("ip".into()) };
+            let c = NewShareComment { author: "R".into(), body: "nice".into(), parent_id: None, anchor: None, ip_hash: Some("ip".into()), page: None };
             s.share_public_comment(sh.id, c, 30).unwrap();
             assert_eq!(s.share_comment_counts(sh.id, "ip", 31).unwrap(), CommentCounts { ip_hour: 1, ip_day: 1, share_day: 1 });
         });

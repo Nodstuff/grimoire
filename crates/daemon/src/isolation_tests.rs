@@ -183,6 +183,11 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/s/{token}/comments", "a_reader_cannot_sign_as_the_owner"),
     ("/s/{token}/comments", "public_comment_content_type_and_preview_images"),
     ("/api/shares/preview", "share_link_preview_stores_nothing_and_limits_hold"),
+    // a link to a doc and its sub-pages: the same token, one page each
+    ("/api/shares", "a_link_with_sub_pages_serves_its_own_tree_and_nothing_else"),
+    ("/api/shares/{id}/comments", "a_link_with_sub_pages_serves_its_own_tree_and_nothing_else"),
+    ("/s/{token}/p/{slug}", "a_link_with_sub_pages_serves_its_own_tree_and_nothing_else"),
+    ("/s/{token}/p/{slug}/comments", "a_link_with_sub_pages_serves_its_own_tree_and_nothing_else"),
     // the EPUB library (opds.rs, kosync.rs, library.rs; ADR 0006): shelves,
     // devices and progress are the caller's alone; the device surfaces
     // resolve one person's ereader and answer only her rows
@@ -2007,6 +2012,190 @@ async fn a_share_link_serves_only_its_own_snapshot() {
     assert!(with_bearer.body.contains("snapshottext") && !with_bearer.body.contains("aoifesnapshot"));
 }
 
+/// A link to a doc and its sub-pages (ADR 0005 §6). Only docs under the
+/// link's doc that its maker may write are published; each sub-page is
+/// served under the link's own token by a slug that is not its doc id; a
+/// slug of one link opens nothing on another; comments are per page; a
+/// snapshot without the pages takes them down.
+#[tokio::test]
+async fn a_link_with_sub_pages_serves_its_own_tree_and_nothing_else() {
+    let fx = fixture();
+    let f = &fx;
+    let mk = |token: &'static str, title: &'static str, parent: Uuid| async move {
+        let token = if token == "a" { &f.a_app } else { &f.b_app };
+        let (st, out) = f.call(token, "POST", "/api/docs", Some(json!({"title": title, "parent_doc_id": parent}))).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        serde_json::from_str::<Value>(&out).unwrap()["id"].as_str().unwrap().parse::<Uuid>().unwrap()
+    };
+    let kid = mk("a", "Kid page", fx.a_secret).await;
+    let grandkid = mk("a", "Grandkid page", kid).await;
+    let b_kid = mk("b", "Her kid", fx.b_doc).await;
+    let with_pages = |root_text: &str, pages: Value| {
+        let mut s = snapshot("Tree root", root_text, "d1.svg");
+        s["markdown"] = json!(format!("{}\n\nsee [[Kid page]] and [[zebrasecret elsewhere]]\n", s["markdown"].as_str().unwrap()));
+        s["pages"] = pages;
+        s
+    };
+    let post = |token: &'static str, doc: Uuid, snap: Value| async move {
+        let token = if token == "a" { &f.a_app } else { &f.b_app };
+        f.raw(Some(token), "POST", "/api/shares", Some(json!({"doc_id": doc, "snapshot": snap, "expires_at": null, "comments_enabled": true}))).await
+    };
+    let page = |doc: Uuid, parent: Option<Uuid>, title: &str, text: &str| json!({"doc_id": doc, "parent_doc_id": parent, "title": title, "markdown": text});
+
+    // refused: a page outside the link's doc, the doc itself, a repeat, and
+    // someone else's doc (which reads exactly like one that never existed)
+    for (bad, why) in [
+        (json!([page(fx.a_loose, None, "Loose", "x")]), "not under the doc"),
+        (json!([page(fx.a_secret, None, "Self", "x")]), "the doc itself"),
+        (json!([page(kid, None, "Kid", "x"), page(kid, None, "Kid", "x")]), "twice"),
+    ] {
+        let r = post("a", fx.a_secret, with_pages("x", bad)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{why}: {}", r.body);
+    }
+    let hers = post("a", fx.a_secret, with_pages("x", json!([page(b_kid, None, "Hers", "x")]))).await;
+    let missing = post("a", fx.a_secret, with_pages("x", json!([page(Uuid::now_v7(), None, "Nope", "x")]))).await;
+    assert_eq!((hers.status, missing.status), (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND), "{} / {}", hers.body, missing.body);
+    // B cannot publish A's sub-page under a doc of her own
+    let stolen = post("b", fx.b_doc, with_pages("x", json!([page(kid, None, "Kid page", "x")]))).await;
+    let none = post("b", fx.b_doc, with_pages("x", json!([page(Uuid::now_v7(), None, "Kid page", "x")]))).await;
+    assert_eq!((stolen.status, none.status), (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND), "{} / {}", stolen.body, none.body);
+    let many: Vec<Value> = (0..=crate::shares::MAX_PAGES).map(|_| page(Uuid::now_v7(), None, "p", "x")).collect();
+    assert_eq!(post("a", fx.a_secret, with_pages("x", json!(many))).await.status, StatusCode::PAYLOAD_TOO_LARGE);
+    let (_, listed) = fx.call(&fx.a_app, "GET", "/api/shares", None).await;
+    assert_eq!(serde_json::from_str::<Value>(&listed).unwrap()["shares"], json!([]), "a refused link stores nothing");
+
+    // the link: the grandkid names its parent; the last page names a parent that is not a page (→ under the root)
+    let pages = json!([
+        page(kid, Some(fx.a_secret), "Kid page", "kidpagetext ![d](taisce-asset:d1.svg) back to [[Tree root]]"),
+        page(grandkid, Some(kid), "Grandkid <b>page</b>", "grandkidtext <script>alert(2)</script>"),
+    ]);
+    let made = post("a", fx.a_secret, with_pages("rootpagetext", pages.clone())).await;
+    assert_eq!(made.status, StatusCode::CREATED, "{}", made.body);
+    let share = made.json();
+    assert_eq!(share["pages"], 2);
+    let id = share["id"].as_str().unwrap().to_string();
+    let p = link_path(&share);
+    let root = fx.raw(None, "GET", &p, None).await;
+    assert_eq!(root.status, StatusCode::OK);
+    let slugs: Vec<String> = regex::Regex::new(&format!(r#"href="{}/p/([A-Za-z0-9_-]+)""#, regex::escape(&p)))
+        .unwrap()
+        .captures_iter(&root.body)
+        .map(|c| c[1].to_string())
+        .fold(Vec::new(), |mut v, s| {
+            if !v.contains(&s) {
+                v.push(s);
+            }
+            v
+        });
+    assert_eq!(slugs.len(), 2, "{}", root.body);
+    let (kid_p, grand_p) = (format!("{p}/p/{}", slugs[0]), format!("{p}/p/{}", slugs[1]));
+    // the tree is on the page; the root's wiki link reaches the kid, the
+    // one to a doc outside the link stays text; no doc id is on the page
+    assert!(root.body.contains("rootpagetext") && root.body.contains("class=\"pages pages-side\""), "{}", root.body);
+    assert!(root.body.contains(&format!("<a class=\"page-link\" href=\"{kid_p}\">Kid page</a>")), "{}", root.body);
+    assert!(root.body.contains("[[zebrasecret elsewhere]]") || !root.body.contains("zebrasecret elsewhere</a>"), "{}", root.body);
+    assert!(root.body.contains("Grandkid &lt;b&gt;page&lt;/b&gt;") && !root.body.contains("<b>page</b>"), "a page title is escaped");
+    for doc in [kid, grandkid, fx.a_secret] {
+        assert!(!root.body.contains(&doc.to_string()), "a doc id on the public page");
+        assert!(!slugs.iter().any(|s| doc.simple().to_string().contains(s.as_str())));
+    }
+    assert!(!root.body.contains("kidpagetext") && !root.body.contains("grandkidtext"), "a page holds its own text only");
+    // a sub-page: its own text, title and tab, the same safety as the root
+    let k = fx.raw(None, "GET", &kid_p, None).await;
+    assert_eq!(k.status, StatusCode::OK, "{}", k.body);
+    assert!(k.body.contains("kidpagetext") && !k.body.contains("rootpagetext") && !k.body.contains("grandkidtext"), "{}", k.body);
+    assert!(k.body.contains("<title>Kid page \u{00b7} Tree root</title>") && k.body.contains("<h1 class=\"doc-title\">Kid page</h1>"), "{}", k.body);
+    assert!(k.body.contains(&format!("<img src=\"{p}/a/d1.svg\"")), "the link's images serve every page: {}", k.body);
+    assert!(k.body.contains(&format!("<a class=\"page-link\" href=\"{p}\">Tree root</a>")), "{}", k.body);
+    assert!(k.body.contains(&format!("href=\"{kid_p}\" aria-current=\"page\"")), "{}", k.body);
+    let nonce = k.body.split("<script nonce=\"").nth(1).unwrap().split('"').next().unwrap();
+    assert_eq!(k.h("content-security-policy"), crate::shares::page_csp(nonce, BASE.trim_end_matches('/')));
+    for (h, v) in [("x-robots-tag", "noindex, nofollow"), ("referrer-policy", "no-referrer"), ("cache-control", "private, no-store"), ("x-content-type-options", "nosniff")] {
+        assert_eq!(k.h(h), v, "{h}");
+    }
+    let g = fx.raw(None, "GET", &grand_p, None).await;
+    assert!(g.status == StatusCode::OK && g.body.contains("grandkidtext") && !g.body.contains("<script>alert(2)"), "{}", g.body);
+    assert!(g.body.contains("<li class=\"d2\">"), "the grandkid sits under the kid: {}", g.body);
+
+    // a slug belongs to its link: unknown on this one, and on any other
+    let other = fx.make_share(&fx.b_app, fx.b_doc, "Hers", "aoifesnapshot", "d1.svg").await;
+    let po = link_path(&other);
+    let solo = fx.make_share(&fx.a_app, fx.a_loose, "Solo", "solotext", "d1.svg").await;
+    assert_eq!(solo["pages"], 0);
+    let ps = link_path(&solo);
+    for path in [
+        format!("{p}/p/{}", "x".repeat(16)),
+        format!("{p}/p/{kid}"),
+        format!("{po}/p/{}", slugs[0]),
+        format!("{ps}/p/{}", slugs[0]),
+        format!("{po}/p/{}/comments", slugs[0]),
+        format!("{p}/p/nope/comments"),
+        format!("/s/{}/p/{}", random_token(), slugs[0]),
+    ] {
+        let r = fx.raw(None, "GET", &path, None).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{path}: {}", r.body);
+        assert!(!r.body.contains("kidpagetext"), "{path}");
+        assert_eq!(r.h("x-robots-tag"), "noindex, nofollow", "{path}");
+    }
+    let r = fx.raw(None, "POST", &format!("{p}/p/nope/comments"), Some(json!({"name": "R", "body": "x"}))).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.body);
+    assert!(!fx.raw(None, "GET", &ps, None).await.body.contains("class=\"pages"), "a single-doc link has no tree");
+
+    // comments are per page; a reply joins its thread's page; the owner
+    // reads them all, each with its page's title
+    let c = fx.raw(None, "POST", &format!("{kid_p}/comments"), Some(json!({"name": "Niamh", "body": "onthekid"}))).await;
+    assert_eq!(c.status, StatusCode::CREATED, "{}", c.body);
+    assert_eq!(c.json()["page"], json!(slugs[0]));
+    let r = fx.raw(None, "POST", &format!("{p}/comments"), Some(json!({"name": "Niamh", "body": "ontheroot"}))).await;
+    assert_eq!((r.status, r.json()["page"].clone()), (StatusCode::CREATED, Value::Null), "{}", r.body);
+    let reply = fx.raw(None, "POST", &format!("{p}/comments"), Some(json!({"name": "Sean", "body": "replytokid", "parent_id": c.json()["id"]}))).await;
+    assert_eq!(reply.json()["page"], json!(slugs[0]), "{}", reply.body);
+    let on = |path: String| async move { f.raw(None, "GET", &format!("{path}/comments"), None).await.body };
+    let (root_c, kid_c, grand_c) = (on(p.clone()).await, on(kid_p.clone()).await, on(grand_p.clone()).await);
+    assert!(root_c.contains("ontheroot") && !root_c.contains("onthekid") && !root_c.contains("replytokid"), "{root_c}");
+    assert!(kid_c.contains("onthekid") && kid_c.contains("replytokid") && !kid_c.contains("ontheroot"), "{kid_c}");
+    assert_eq!(serde_json::from_str::<Value>(&grand_c).unwrap()["comments"], json!([]));
+    // the sandboxed page (Origin: null) reaches a sub-page's comment routes too
+    let pre = fx
+        .app
+        .clone()
+        .oneshot(Request::builder().method("OPTIONS").uri(format!("{kid_p}/comments")).header("host", "localhost:7513").header("origin", "null").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(pre.status(), StatusCode::NO_CONTENT);
+    let (st, out) = fx.call(&fx.a_app, "GET", &format!("/api/shares/{id}/comments"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let mine: Value = serde_json::from_str(&out).unwrap();
+    let titles: Vec<(String, Value)> = mine["comments"].as_array().unwrap().iter().map(|c| (c["body"].as_str().unwrap().to_string(), c["page_title"].clone())).collect();
+    assert_eq!(titles, [("onthekid".to_string(), json!("Kid page")), ("ontheroot".to_string(), Value::Null), ("replytokid".to_string(), json!("Kid page"))]);
+    let theirs = fx.b("GET", &format!("/api/shares/{id}/comments"), None).await;
+    let never = fx.b("GET", &format!("/api/shares/{}/comments", Uuid::now_v7()), None).await;
+    assert_eq!((theirs.0, never.0), (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND), "B reads none of A's tree link: {}", theirs.1);
+    fx.no_leak("B reads the comments of A's tree link", &theirs.1);
+
+    // a new snapshot keeps each doc's slug (bookmarks and comments stay put)…
+    let again = json!([page(grandkid, Some(kid), "Grandkid", "grandkidv2"), page(kid, None, "Kid page", "kidv2")]);
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"snapshot": with_pages("rootv2", again)}))).await;
+    assert_eq!((r.status, r.json()["pages"].clone(), r.json()["revision"].clone()), (StatusCode::OK, json!(2), json!(2)), "{}", r.body);
+    let k = fx.raw(None, "GET", &kid_p, None).await;
+    assert!(k.body.contains("kidv2") && !k.body.contains("kidpagetext"), "{}", k.body);
+    assert!(fx.raw(None, "GET", &grand_p, None).await.body.contains("grandkidv2"));
+    assert!(on(kid_p.clone()).await.contains("onthekid"));
+    // …and one without the pages takes them down: the sub-page URLs are
+    // 404, the owner still reads what was said on them
+    let r = fx.raw(Some(&fx.a_app), "PATCH", &format!("/api/shares/{id}"), Some(json!({"snapshot": snapshot("Tree root", "rootv3", "d1.svg")}))).await;
+    assert_eq!((r.status, r.json()["pages"].clone()), (StatusCode::OK, json!(0)), "{}", r.body);
+    for path in [kid_p.clone(), grand_p.clone(), format!("{kid_p}/comments")] {
+        assert_eq!(fx.raw(None, "GET", &path, None).await.status, StatusCode::NOT_FOUND, "{path}");
+    }
+    let root = fx.raw(None, "GET", &p, None).await;
+    assert!(root.body.contains("rootv3") && !root.body.contains("class=\"pages"), "{}", root.body);
+    let (_, out) = fx.call(&fx.a_app, "GET", &format!("/api/shares/{id}/comments"), None).await;
+    let mine: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(mine["comments"].as_array().unwrap().len(), 3, "{out}");
+    assert!(mine["comments"][0]["page"].is_string() && mine["comments"][0]["page_title"].is_null(), "a comment on a page since removed: {out}");
+}
+
 /// Every header the contract names, on the page, an image and a 404/410;
 /// views count; expiry and revoke answer 410 everywhere.
 #[tokio::test]
@@ -2208,7 +2397,7 @@ async fn share_link_preview_stores_nothing_and_limits_hold() {
     for (what, snap) in [
         ("an asset over 2 MB", json!({"title": "t", "markdown": "x", "assets": [{"name": "a.png", "content_type": "image/png", "data": b64(&one)}]})),
         ("markdown over 2 MB", json!({"title": "t", "markdown": "x".repeat(2 * 1024 * 1024 + 1)})),
-        ("201 assets", json!({"title": "t", "markdown": "x", "assets": (0..201).map(|i| json!({"name": format!("a{i}.svg"), "content_type": "image/svg+xml", "data": b64(b"<svg/>")})).collect::<Vec<_>>()})),
+        ("1001 assets", json!({"title": "t", "markdown": "x", "assets": (0..=crate::shares::MAX_ASSETS).map(|i| json!({"name": format!("a{i}.svg"), "content_type": "image/svg+xml", "data": b64(b"<svg/>")})).collect::<Vec<_>>()})),
     ] {
         let r = fx.raw(Some(&fx.a_app), "POST", "/api/shares", Some(json!({"doc_id": fx.a_secret, "snapshot": snap}))).await;
         assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "{what}: {}", r.body);
@@ -2437,7 +2626,7 @@ async fn share_link_caps_per_person_and_per_link() {
     // an expired link opened again by a new expiry is a new live link: at
     // 100 it is refused, after a revoke it is let through
     let expired = {
-        let snapshot = taisce_store::shares::ShareSnapshot { title: "t".into(), markdown: "x".into(), theme: "auto".into(), assets: vec![] };
+        let snapshot = taisce_store::shares::ShareSnapshot { title: "t".into(), markdown: "x".into(), theme: "auto".into(), assets: vec![], pages: vec![] };
         let mut s = fx.store.lock(Scope::User(fx.a));
         s.share_create(Uuid::now_v7(), fx.a_loose, "expired-hash", &snapshot, Some(1), true, 0).unwrap().id
     };

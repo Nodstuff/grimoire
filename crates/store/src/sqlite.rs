@@ -74,6 +74,8 @@ impl SqliteStore {
         ] {
             add_column_if_missing(&conn, "book", col, decl)?;
         }
+        // v15: a share link's sub-pages (shares.sql): which page a comment is on
+        add_column_if_missing(&conn, "share_link_comments", "page", "TEXT")?;
         backfill(&conn)?;
         Ok(Self { conn, scope: Scope::System })
     }
@@ -504,7 +506,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -571,6 +573,10 @@ fn backfill(conn: &Connection) -> Result<()> {
     // init when missing, and book_cover_candidate). Nothing to backfill:
     // a NULL cover_grey / isbns means "not looked at yet", which the
     // library's cover review fills in as the person runs it.
+    // v15: a share link's sub-pages (shares.sql: share_link_pages and its
+    // doc-purge trigger, created IF NOT EXISTS by init; the comments' `page`
+    // column, added by init when missing). Nothing to backfill: every
+    // existing link is a single-doc link and its comments are on the root.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())

@@ -9,6 +9,9 @@
 //!   other image is not loaded (the page's CSP allows only its own images):
 //!   it renders as a link to it.
 //! - Frontmatter is stripped. Each top-level block carries `data-b="<n>"`.
+//! - A link with sub-pages: `[[Title]]` / `[[Title|label]]` naming one of the
+//!   link's pages links to it; any other wiki link stays the text it was. The
+//!   page then carries the tree of pages (`Nav`) beside the doc.
 
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, LinkType, MetadataBlockKind, Options, Parser, Tag, TagEnd};
 use std::collections::HashMap;
@@ -96,17 +99,50 @@ fn image_html(dest: &str, alt: &str, title: &str, assets: &HashMap<String, Asset
 /// Render a snapshot's markdown to the page body (images load lazily).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn render_body(markdown: &str, assets: &HashMap<String, AssetInfo>) -> String {
-    render_body_with(markdown, assets, true)
+    render_body_with(markdown, assets, true, &PageLinks::default())
+}
+
+/// The pages of a link a `[[wiki link]]` may name: title → that page's URL.
+#[derive(Default)]
+pub struct PageLinks(HashMap<String, String>);
+
+impl PageLinks {
+    /// Titles compare trimmed and case-insensitively; the first page of a
+    /// title wins (tree order, the root first).
+    pub fn new(pages: impl IntoIterator<Item = (String, String)>) -> Self {
+        let mut m = HashMap::new();
+        for (title, url) in pages {
+            m.entry(Self::key(&title)).or_insert(url);
+        }
+        Self(m)
+    }
+
+    fn key(title: &str) -> String {
+        title.trim().to_lowercase()
+    }
+
+    /// `[[Title]]`, or `[[Title#Heading]]` (the heading is dropped: the
+    /// page's headings carry no ids).
+    fn get(&self, dest: &str) -> Option<&String> {
+        self.0.get(&Self::key(dest)).or_else(|| dest.split_once('#').and_then(|(t, _)| self.0.get(&Self::key(t))))
+    }
 }
 
 /// `lazy: false` for a page that is printed (the PDF preview): a printed
 /// page never scrolls, so a lazy image would never load.
-pub fn render_body_with(markdown: &str, assets: &HashMap<String, AssetInfo>, lazy: bool) -> String {
+pub fn render_body_with(markdown: &str, assets: &HashMap<String, AssetInfo>, lazy: bool, pages: &PageLinks) -> String {
     let md = strip_frontmatter(markdown);
-    let opts = Options::ENABLE_TABLES
+    let mut opts = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
+    // only a link with pages reads wiki links at all: a single doc's
+    // `[[x]]` stays exactly the text it has always been
+    if !pages.0.is_empty() {
+        opts |= Options::ENABLE_WIKILINKS;
+    }
+    // each open link: does its end close an <a>, or a wiki link left as text?
+    let mut links: Vec<bool> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
     let mut parser = Parser::new_ext(md, opts);
     let mut in_meta = false;
@@ -119,7 +155,19 @@ pub fn render_body_with(markdown: &str, assets: &HashMap<String, AssetInfo>, laz
             Event::Start(Tag::HtmlBlock) => events.push(Event::Start(Tag::CodeBlock(CodeBlockKind::Indented))),
             Event::End(TagEnd::HtmlBlock) => events.push(Event::End(TagEnd::CodeBlock)),
             Event::Html(s) | Event::InlineHtml(s) => events.push(Event::Text(s)),
+            Event::Start(Tag::Link { link_type: LinkType::WikiLink { has_pothole }, dest_url, .. }) => match pages.get(&dest_url) {
+                Some(url) => {
+                    links.push(true);
+                    events.push(Event::Html(CowStr::from(format!("<a class=\"page-link\" href=\"{}\">", esc(url)))));
+                }
+                // not one of this link's pages: the text as it was written
+                None => {
+                    links.push(false);
+                    events.push(Event::Text(CowStr::from(if has_pothole { format!("[[{dest_url}|") } else { "[[".to_string() })));
+                }
+            },
             Event::Start(Tag::Link { link_type, dest_url, title, .. }) => {
+                links.push(true);
                 // an email autolink (<a@b.c>) arrives without its scheme
                 let dest = match link_type {
                     LinkType::Email if !dest_url.contains(':') => format!("mailto:{dest_url}"),
@@ -134,7 +182,10 @@ pub fn render_body_with(markdown: &str, assets: &HashMap<String, AssetInfo>, laz
             }
             // the start became an Html event, so the end must too (block
             // numbering counts Start/End pairs)
-            Event::End(TagEnd::Link) => events.push(Event::Html(CowStr::Borrowed("</a>"))),
+            Event::End(TagEnd::Link) => events.push(match links.pop() {
+                Some(false) => Event::Text(CowStr::Borrowed("]]")),
+                _ => Event::Html(CowStr::Borrowed("</a>")),
+            }),
             Event::Start(Tag::Image { dest_url, title, .. }) => {
                 // the alt text is everything up to the matching end
                 let (mut alt, mut depth) = (String::new(), 1);
@@ -205,6 +256,100 @@ pub struct PageParts<'a> {
     pub snapshot_date: &'a str,
     pub nonce: Option<&'a str>,
     pub comments_enabled: bool,
+    /// the link's tree of pages, when it has sub-pages
+    pub nav: Option<&'a Nav>,
+}
+
+/// One page in a link's tree, as the navigation lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavItem {
+    pub title: String,
+    pub url: String,
+    /// 0 = the root, 1 = directly under it, …
+    pub depth: usize,
+}
+
+/// A link's pages in reading order (the root first), and which one this is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nav {
+    pub items: Vec<NavItem>,
+    pub current: usize,
+}
+
+impl Nav {
+    /// Tree order from (slug, parent slug, title) rows in their stored
+    /// order: each page under its parent, a page whose parent is not in
+    /// the link directly under the root. `current`: a slug, None = the root.
+    pub fn build(root_title: &str, root_url: &str, pages: &[(String, Option<String>, String)], current: Option<&str>) -> Self {
+        let known: std::collections::HashSet<&str> = pages.iter().map(|p| p.0.as_str()).collect();
+        let mut kids: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
+        for (i, (_, parent, _)) in pages.iter().enumerate() {
+            kids.entry(parent.as_deref().filter(|p| known.contains(p))).or_default().push(i);
+        }
+        let mut items = vec![NavItem { title: root_title.to_string(), url: root_url.to_string(), depth: 0 }];
+        let mut cur = 0;
+        // depth-first, without recursion (a cycle cannot arise: every page
+        // is visited from one parent, and unvisited ones are appended below)
+        let mut seen = vec![false; pages.len()];
+        let mut stack: Vec<(usize, usize)> = kids.get(&None).map(|v| v.iter().rev().map(|i| (*i, 1)).collect()).unwrap_or_default();
+        while let Some((i, depth)) = stack.pop() {
+            if std::mem::replace(&mut seen[i], true) {
+                continue;
+            }
+            let (slug, _, title) = &pages[i];
+            if current == Some(slug.as_str()) {
+                cur = items.len();
+            }
+            items.push(NavItem { title: title.clone(), url: format!("{root_url}/p/{slug}"), depth: depth.min(6) });
+            if let Some(v) = kids.get(&Some(slug.as_str())) {
+                stack.extend(v.iter().rev().map(|k| (*k, depth + 1)));
+            }
+        }
+        for (i, (slug, _, title)) in pages.iter().enumerate() {
+            if !seen[i] {
+                if current == Some(slug.as_str()) {
+                    cur = items.len();
+                }
+                items.push(NavItem { title: title.clone(), url: format!("{root_url}/p/{slug}"), depth: 1 });
+            }
+        }
+        Self { items, current: cur }
+    }
+
+    fn list(&self) -> String {
+        let mut out = String::from("<ul>");
+        for (i, it) in self.items.iter().enumerate() {
+            let here = if i == self.current { " aria-current=\"page\"" } else { "" };
+            out.push_str(&format!("<li class=\"d{}\"><a href=\"{}\"{here}>{}</a></li>", it.depth, esc(&it.url), esc(&it.title)));
+        }
+        out.push_str("</ul>");
+        out
+    }
+
+    /// The tree twice: a sidebar on a wide screen, a closed "Pages" fold
+    /// above the doc on a narrow one (CSS shows one of them).
+    fn html(&self) -> (String, String) {
+        let list = self.list();
+        (
+            format!("<nav class=\"pages pages-side\" aria-label=\"Pages\">{list}</nav>"),
+            format!(
+                "<details class=\"pages pages-fold\"><summary>Pages <span class=\"n\">{} of {}</span></summary><nav aria-label=\"Pages\">{list}</nav></details>",
+                self.current + 1,
+                self.items.len()
+            ),
+        )
+    }
+
+    /// Previous and next page, at the doc's foot.
+    fn pager(&self) -> String {
+        let link = |i: usize, rel: &str, label: &str| {
+            let it = &self.items[i];
+            format!("<a rel=\"{rel}\" class=\"{rel}\" href=\"{}\"><span>{label}</span>{}</a>", esc(&it.url), esc(&it.title))
+        };
+        let prev = self.current.checked_sub(1).map(|i| link(i, "prev", "Previous")).unwrap_or_else(|| "<span></span>".into());
+        let next = (self.current + 1 < self.items.len()).then(|| link(self.current + 1, "next", "Next")).unwrap_or_default();
+        format!("<nav class=\"pager\" aria-label=\"Previous and next page\">{prev}{next}</nav>")
+    }
 }
 
 pub const PAGE_CSS: &str = include_str!("share/page.css");
@@ -232,17 +377,30 @@ Comments<span id=\"comments-count\" class=\"count\"></span></button></div>",
     } else {
         ("", "")
     };
+    let (side, fold, pager) = match p.nav {
+        Some(n) if n.items.len() > 1 => {
+            let (side, fold) = n.html();
+            (side, fold, n.pager())
+        }
+        _ => Default::default(),
+    };
+    // a sub-page's tab reads "Page · Root"
+    let tab = match p.nav.and_then(|n| n.items.first().filter(|_| n.current > 0)) {
+        Some(root) => format!("{} \u{00b7} {}", esc(p.title), esc(&root.title)),
+        None => esc(p.title),
+    };
     format!(
         "<!doctype html>\n<html lang=\"en\" data-theme=\"{theme}\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
 <meta name=\"robots\" content=\"noindex, nofollow\"><meta name=\"referrer\" content=\"no-referrer\">\
 <meta name=\"color-scheme\" content=\"{scheme}\">\
-<title>{title}</title><style>{PAGE_CSS}</style></head>\
-<body class=\"{layout}\" data-comments=\"{on}\">{bar}<div class=\"wrap\"><main class=\"doc\"><header><h1 class=\"doc-title\">{title}</h1></header>\
-<article id=\"doc\">{body}</article>\
+<title>{tab}</title><style>{PAGE_CSS}</style></head>\
+<body class=\"{layout}{with_nav}\" data-comments=\"{on}\">{bar}<div class=\"wrap\">{side}<main class=\"doc\">{fold}<header><h1 class=\"doc-title\">{title}</h1></header>\
+<article id=\"doc\">{body}</article>{pager}\
 <footer class=\"foot\">Shared from Taisce · snapshot of {date}</footer></main>{drawer}</div>{script}</body></html>\n",
         scheme = if theme == "auto" { "light dark" } else { theme },
         title = esc(p.title),
+        with_nav = if side.is_empty() { "" } else { " with-nav" },
         layout = if comments { "with-comments" } else { "plain" },
         on = if comments { "on" } else { "off" },
         body = p.body_html,
@@ -317,7 +475,7 @@ mod tests {
     #[test]
     fn a_printed_page_loads_its_images_eagerly() {
         let lazy = render_body("![d](taisce-asset:d1.svg)", &assets());
-        let eager = render_body_with("![d](taisce-asset:d1.svg)", &assets(), false);
+        let eager = render_body_with("![d](taisce-asset:d1.svg)", &assets(), false, &PageLinks::default());
         assert!(lazy.contains("loading=\"lazy\""), "{lazy}");
         assert!(!eager.contains("loading=") && eager.contains("<img src=\"/s/T/a/d1.svg\""), "{eager}");
     }
@@ -342,6 +500,61 @@ mod tests {
     }
 
     #[test]
+    fn wiki_links_reach_the_links_own_pages_and_nothing_else() {
+        let pages = PageLinks::new([
+            ("Root".to_string(), "/s/T".to_string()),
+            ("Fleet Twin".to_string(), "/s/T/p/abc".to_string()),
+            ("fleet twin".to_string(), "/s/T/p/second".to_string()),
+        ]);
+        let md = "see [[Fleet Twin]], [[ fleet TWIN |the twin]], [[Fleet Twin#Costs]], [[Root]] and [[Secret Doc]] or [[Secret Doc|that]]\n\n`[[Fleet Twin]]`";
+        let out = render_body_with(md, &assets(), true, &pages);
+        assert_eq!(out.matches("<a class=\"page-link\" href=\"/s/T/p/abc\">").count(), 3, "{out}");
+        assert!(out.contains("<a class=\"page-link\" href=\"/s/T/p/abc\">the twin</a>"), "{out}");
+        assert!(out.contains("<a class=\"page-link\" href=\"/s/T\">Root</a>"), "{out}");
+        assert!(!out.contains("second"), "the first page of a title wins: {out}");
+        // not a page of this link: the text as written, no link at all
+        assert!(out.contains("[[Secret Doc]] or [[Secret Doc|that]]"), "{out}");
+        assert!(out.contains("<code>[[Fleet Twin]]</code>"), "code is left alone: {out}");
+        assert_eq!(out.matches("<a ").count(), 4, "{out}");
+        // a single-doc link reads no wiki links: byte for byte what it was
+        let plain = render_body("see [[Fleet Twin]] and [[a|b]]", &assets());
+        assert_eq!(plain.trim_end(), "<p data-b=\"0\">see [[Fleet Twin]] and [[a|b]]</p>");
+        // a page title cannot smuggle markup or a scheme into the href
+        let evil = PageLinks::new([("x".to_string(), "/s/T/p/\"><script>".to_string())]);
+        let out = render_body_with("[[x]]", &assets(), true, &evil);
+        assert!(!out.contains("<script>"), "{out}");
+    }
+
+    #[test]
+    fn the_nav_is_the_tree_in_reading_order() {
+        let row = |s: &str, p: Option<&str>, t: &str| (s.to_string(), p.map(str::to_string), t.to_string());
+        // stored order is not tree order; one parent is not in the link
+        let pages = [row("b", None, "B"), row("a1", Some("a"), "A one"), row("a", None, "A <i>"), row("lost", Some("gone"), "Lost")];
+        let nav = Nav::build("Root", "/s/T", &pages, Some("a1"));
+        assert_eq!(
+            nav.items.iter().map(|i| (i.title.as_str(), i.depth, i.url.as_str())).collect::<Vec<_>>(),
+            [("Root", 0, "/s/T"), ("B", 1, "/s/T/p/b"), ("A <i>", 1, "/s/T/p/a"), ("A one", 2, "/s/T/p/a1"), ("Lost", 1, "/s/T/p/lost")]
+        );
+        assert_eq!(nav.current, 3);
+        assert_eq!(Nav::build("Root", "/s/T", &pages, None).current, 0);
+        // a parent loop cannot hang or drop a page
+        let looped = [row("x", Some("y"), "X"), row("y", Some("x"), "Y")];
+        assert_eq!(Nav::build("R", "/s/T", &looped, None).items.len(), 3);
+        let p = page(&PageParts { title: "A one", body_html: "<p>x</p>", theme: "auto", snapshot_date: "d", nonce: None, comments_enabled: false, nav: Some(&nav) });
+        assert!(p.contains("<title>A one \u{00b7} Root</title>"), "{p}");
+        assert!(p.contains("<body class=\"plain with-nav\""), "{p}");
+        assert!(p.contains("<li class=\"d2\"><a href=\"/s/T/p/a1\" aria-current=\"page\">A one</a></li>"), "{p}");
+        assert!(p.contains("A &lt;i&gt;") && !p.contains("A <i>"), "titles are escaped: {p}");
+        assert_eq!(p.matches(" aria-current=\"page\">A one</a>").count(), 2, "the sidebar and the fold");
+        assert!(p.contains("<a rel=\"prev\" class=\"prev\" href=\"/s/T/p/a\">") && p.contains("<a rel=\"next\" class=\"next\" href=\"/s/T/p/lost\">"), "{p}");
+        assert!(p.contains("Pages <span class=\"n\">4 of 5</span>"), "{p}");
+        // a link with no sub-pages has no nav at all
+        let solo = Nav::build("Root", "/s/T", &[], None);
+        let p = page(&PageParts { title: "Root", body_html: "", theme: "auto", snapshot_date: "d", nonce: None, comments_enabled: false, nav: Some(&solo) });
+        assert!(!p.contains("class=\"pages") && p.contains("<body class=\"plain\"") && !p.contains("<nav"), "{p}");
+    }
+
+    #[test]
     fn the_page_escapes_its_title_and_carries_the_nonce() {
         let p = page(&PageParts {
             title: "<b>T</b>",
@@ -350,6 +563,7 @@ mod tests {
             snapshot_date: "2026-10-06",
             nonce: Some("abc"),
             comments_enabled: true,
+            nav: None,
         });
         assert!(p.contains("&lt;b&gt;T&lt;/b&gt;") && !p.contains("<b>T</b>"));
         assert!(p.contains("<script nonce=\"abc\">") && p.contains("data-theme=\"dark\""));
@@ -359,7 +573,7 @@ mod tests {
         let (bar, drawer, doc) = (p.find("id=\"topbar\"").unwrap(), p.find("id=\"comments\"").unwrap(), p.find("id=\"doc\"").unwrap());
         assert!(bar < doc && doc < drawer, "{p}");
         assert!(p.contains("aria-expanded=\"false\"") && p.contains("<body class=\"with-comments\""));
-        let p = page(&PageParts { title: "T", body_html: "", theme: "x", snapshot_date: "d", nonce: None, comments_enabled: true });
+        let p = page(&PageParts { title: "T", body_html: "", theme: "x", snapshot_date: "d", nonce: None, comments_enabled: true, nav: None });
         assert!(!p.contains("<script") && p.contains("data-theme=\"auto\"") && !p.contains("id=\"comments\"") && !p.contains("topbar\""));
     }
 }

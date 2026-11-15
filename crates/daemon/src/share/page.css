@@ -78,4 +78,32 @@ button { font: inherit; font-size: 0.9em; border-radius: 8px; border: 1px solid 
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
 button.link { border: none; background: none; color: var(--accent); padding: 4px 0; }
 #comment-btn { position: absolute; z-index: 10; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18); }
-@media print { .comments, .topbar, #comment-btn { display: none; } body.comments-open .wrap { margin-right: auto; } }
+/* a link with sub-pages: the tree beside the doc on a wide screen, a closed
+   "Pages" fold above it on a narrow one */
+.pages ul { list-style: none; margin: 0; padding: 0; }
+.pages li a { display: block; padding: 4px 10px; border-radius: 6px; color: var(--fg); text-decoration: none; font-size: 0.9rem; line-height: 1.4; overflow-wrap: anywhere; }
+.pages li a:hover { background: var(--panel); }
+.pages li a[aria-current="page"] { background: var(--panel); color: var(--accent); font-weight: 600; }
+.pages li.d0 a { font-family: var(--serif); font-weight: 600; font-size: 1rem; }
+.pages li.d2 a { padding-left: 24px; } .pages li.d3 a { padding-left: 38px; } .pages li.d4 a { padding-left: 52px; }
+.pages li.d5 a { padding-left: 66px; } .pages li.d6 a { padding-left: 80px; }
+.pages-side { display: none; }
+.pages-fold { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 24px; background: var(--panel); }
+.pages-fold summary { cursor: pointer; padding: 8px 12px; font-weight: 600; font-size: 0.9rem; }
+.pages-fold summary .n { color: var(--dim); font-weight: 400; margin-left: 6px; }
+.pages-fold nav { padding: 0 6px 8px; }
+.pages-fold li a:hover, .pages-fold li a[aria-current="page"] { background: var(--bg); }
+@media (min-width: 1000px) {
+  body.with-nav .wrap { max-width: 1060px; grid-template-columns: 230px minmax(0, 1fr); }
+  body.with-nav .doc { max-width: 720px; }
+  .pages-side { display: block; position: sticky; top: 56px; align-self: start; max-height: calc(100vh - 80px); overflow-y: auto; }
+  body.plain .pages-side { top: 32px; max-height: calc(100vh - 56px); }
+  .pages-fold { display: none; }
+}
+.pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 40px; }
+.pager a { display: block; max-width: 48%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; color: var(--fg); text-decoration: none; overflow-wrap: anywhere; }
+.pager a:hover { border-color: var(--accent); }
+.pager a span { display: block; color: var(--dim); font-size: 0.8em; }
+.pager a.next { text-align: right; margin-left: auto; }
+.pager + .foot { margin-top: 24px; }
+@media print { .comments, .topbar, #comment-btn, .pages, .pager { display: none; } body.comments-open .wrap { margin-right: auto; } }

@@ -72,6 +72,39 @@ CREATE TABLE IF NOT EXISTS share_link_comments (
     ip_hash    TEXT,
     -- when the owner read it (GET /api/shares/{id}/comments)
     read_at    INTEGER
+    -- (v15, added by init when missing) page TEXT: the sub-page's slug the
+    -- comment was made on; NULL = the link's root page
 );
 CREATE INDEX IF NOT EXISTS share_link_comments_by_share ON share_link_comments (share_id, created_at);
 CREATE INDEX IF NOT EXISTS share_link_comments_by_ip ON share_link_comments (share_id, ip_hash, created_at);
+
+-- A link to a doc AND its sub-pages (schema v15): one row per descendant
+-- doc the owner published with the root. The root's own title and markdown
+-- stay on share_links; a link with no rows here is a single-doc link.
+CREATE TABLE IF NOT EXISTS share_link_pages (
+    share_id    TEXT NOT NULL REFERENCES share_links (id) ON DELETE CASCADE,
+    -- the page's name in its URL (/s/<token>/p/<slug>): derived from the
+    -- link's key, the link and the doc, so it is stable across snapshots and
+    -- says nothing about the doc's id
+    slug        TEXT NOT NULL,
+    -- the doc it was taken from (never shown to a reader)
+    doc_id      TEXT NOT NULL,
+    -- the page above it; NULL = directly under the link's root
+    parent_slug TEXT,
+    -- its place in the tree, read top to bottom
+    position    INTEGER NOT NULL,
+    title       TEXT NOT NULL,
+    markdown    TEXT NOT NULL,
+    PRIMARY KEY (share_id, slug)
+);
+CREATE INDEX IF NOT EXISTS share_link_pages_by_doc ON share_link_pages (doc_id);
+
+-- A sub-page's doc deleted for good leaves its links: the page goes, the
+-- link (and its other pages) stays, at a new revision.
+CREATE TRIGGER IF NOT EXISTS share_link_pages_doc_purged AFTER DELETE ON docs BEGIN
+    UPDATE share_links SET revision = revision + 1,
+        snapshot_bytes = max(0, snapshot_bytes - (SELECT COALESCE(sum(length(CAST(p.markdown AS BLOB))), 0)
+            FROM share_link_pages p WHERE p.share_id = share_links.id AND p.doc_id = OLD.id))
+    WHERE id IN (SELECT share_id FROM share_link_pages WHERE doc_id = OLD.id);
+    DELETE FROM share_link_pages WHERE doc_id = OLD.id;
+END;
