@@ -694,6 +694,13 @@ button.dv-pill:hover {
   font-size: var(--text-md);
   color: var(--ink2);
 }
+.sh-pages {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--text-md);
+  color: var(--ink2);
+}
 .sh-new {
   display: flex;
   align-items: center;

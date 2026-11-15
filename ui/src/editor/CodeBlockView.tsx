@@ -52,6 +52,29 @@ function mermaidConfig(dark: boolean) {
 
 let mermaidSeq = 0
 
+/** A diagram fence drawn to SVG: mermaid and reladraw here, d2 by the
+ *  daemon. Throws what the renderer said. Also draws the diagrams of docs
+ *  that are not on screen (a share link's sub-pages, share.ts). */
+export async function drawDiagram(lang: string, code: string, dark: boolean): Promise<string> {
+  if (lang === 'mermaid') {
+    const mermaid = await loadMermaid()
+    mermaid.initialize(mermaidConfig(dark))
+    return (await mermaid.render(`mmd-${++mermaidSeq}`, code)).svg
+  }
+  if (lang === 'reladraw') {
+    const r = await renderReladraw(code, appTheme())
+    if ('err' in r) throw new Error(r.err)
+    return r.svg
+  }
+  return (
+    await api<{ svg: string }>('/api/render/d2', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: code }),
+    })
+  ).svg
+}
+
 function Preview({ lang, code, theme }: { lang: string; code: string; theme: string }) {
   const [svg, setSvg] = useState<string>('')
   const [err, setErr] = useState<string>('')
@@ -60,24 +83,7 @@ function Preview({ lang, code, theme }: { lang: string; code: string; theme: str
     const t = setTimeout(
       async () => {
         try {
-          let out = ''
-          if (lang === 'mermaid') {
-            const mermaid = await loadMermaid()
-            mermaid.initialize(mermaidConfig(theme === 'dark'))
-            out = (await mermaid.render(`mmd-${++mermaidSeq}`, code)).svg
-          } else if (lang === 'reladraw') {
-            const r = await renderReladraw(code, appTheme())
-            if ('err' in r) throw new Error(r.err)
-            out = r.svg
-          } else {
-            out = (
-              await api<{ svg: string }>('/api/render/d2', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ source: code }),
-              })
-            ).svg
-          }
+          const out = await drawDiagram(lang, code, theme === 'dark')
           if (stale) return
           setSvg(out)
           setErr('')
