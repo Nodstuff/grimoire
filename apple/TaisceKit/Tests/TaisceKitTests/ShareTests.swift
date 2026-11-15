@@ -174,6 +174,51 @@ private func json(_ r: URLRequest) -> [String: Any] {
         #expect(threads[0].replies.map(\.id) == ["a1", "a1x", "a2"])
     }
 
+    @Test func pagesAreSentOnlyWhenThereAreAny() throws {
+        func object(_ s: ShareSnapshot) throws -> [String: Any] {
+            try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(s)) as? [String: Any])
+        }
+        let single = try object(ShareSnapshot(title: "Plan", markdown: "hi", theme: .light))
+        #expect(Set(single.keys) == ["title", "markdown", "assets", "theme"], "a single-doc request is what it always was")
+        let tree = ShareSnapshot(title: "Plan", markdown: "hi", theme: .light, pages: [
+            SharePage(docID: "c1", parentDocID: "root", title: "Fleet Twin", markdown: "one"),
+            SharePage(docID: "g1", parentDocID: "c1", title: "Deep", markdown: "two"),
+            SharePage(docID: "c2", parentDocID: nil, title: "Last", markdown: "three"),
+        ])
+        let pages = try #require(try object(tree)["pages"] as? [[String: Any]])
+        #expect(pages.map { $0["doc_id"] as? String } == ["c1", "g1", "c2"], "in the order given")
+        #expect(Set(pages[0].keys) == ["doc_id", "parent_doc_id", "title", "markdown"])
+        #expect(pages[0]["parent_doc_id"] as? String == "root" && pages[1]["title"] as? String == "Deep" && pages[1]["markdown"] as? String == "two")
+        #expect(pages[2].keys.contains("parent_doc_id") && pages[2]["parent_doc_id"] is NSNull)
+        #expect(try JSONDecoder().decode(ShareSnapshot.self, from: JSONEncoder().encode(tree)) == tree)
+        let old = try JSONDecoder().decode(ShareSnapshot.self, from: Data(#"{"title":"t","markdown":"m","assets":[],"theme":"auto"}"#.utf8))
+        #expect(old.pages.isEmpty)
+        #expect(tree.approximateSize == "hi".utf8.count + "one".utf8.count + "two".utf8.count + "three".utf8.count)
+    }
+
+    @Test func aShareSaysHowManySubPagesItCarries() throws {
+        let single = try JSONDecoder().decode(Share.self, from: Data(shareJSON.utf8))
+        #expect(single.pageCount == 0, "absent = the doc alone")
+        let tree = try JSONDecoder().decode(Share.self, from: Data(shareJSON.replacingOccurrences(of: #""title":"Plan""#, with: #""title":"Plan","pages":8"#).utf8))
+        #expect(tree.pageCount == 8)
+        #expect(try JSONDecoder().decode(Share.self, from: JSONEncoder().encode(tree)).pageCount == 8)
+        #expect(Share(id: "s", docID: "d", url: "u").pageCount == 0)
+        #expect(ShareLimits.assets == 1000 && ShareLimits.pages == 200)
+    }
+
+    @Test func aCommentSaysWhichPageItIsOn() throws {
+        let list = try JSONDecoder().decode([ShareComment].self, from: Data(#"""
+        [{"id":"c1","author":"Aoife","body":"root","page":null,"page_title":null},
+         {"id":"c2","author":"Aoife","body":"sub","page":"fleet-twin","page_title":"Fleet Twin"},
+         {"id":"c3","author":"Aoife","body":"gone","page":"old-page","page_title":null},
+         {"id":"c4","author":"Aoife","body":"an older server"}]
+        """#.utf8))
+        #expect(list.map(\.page) == [nil, "fleet-twin", "old-page", nil])
+        #expect(list.map(\.pageTitle) == [nil, "Fleet Twin", nil, nil])
+        #expect(list.map(\.pageCaption) == [nil, "on Fleet Twin", "on a removed page", nil])
+        #expect(try JSONDecoder().decode(ShareComment.self, from: JSONEncoder().encode(list[1])) == list[1])
+    }
+
     @Test func assetNames() {
         #expect(ShareAsset.isValidName("d1.svg"))
         #expect(!ShareAsset.isValidName("../x"))
@@ -321,4 +366,92 @@ private func blocks(_ contents: [String], types: [BlockType]? = nil) -> [Block] 
         #expect(result.problems == ["Mermaid diagram left out: too large to share"])
     }
 
+    // MARK: sub-pages
+
+    private func page(_ id: String, parent: String? = "root", _ title: String, _ contents: [String]) -> SharePageSource {
+        SharePageSource(docID: id, parentDocID: parent, title: title, blocks: blocks(contents))
+    }
+
+    @Test func subPagesGoThroughTheSamePipelineWithTheirOwnAssetNames() async throws {
+        let r = FakeVisuals { _ in .svg }
+        let root = blocks(["# Plan", "Root", "```mermaid\nroot\n```", "![r](https://ok.example/r.jpg)"])
+        let pages = [
+            page("c1", "Fleet Twin", ["---\ntags: [a]\n---\n\n# Fleet Twin\n\nFirst", "```mermaid\none\n```", "```reladraw\ntwo\n```", "![a](https://ok.example/a.jpg)"]),
+            page("g1", parent: "c1", "Deep", ["# Plan", "```mermaid\nthree\n```"]),
+            page("c2", "Empty", []),
+        ]
+        let result = await ShareSnapshotBuilder(renderer: r, images: FakeImages()).build(title: "Plan", blocks: root, theme: .dark, pages: pages)
+        let s = result.snapshot
+        #expect(result.problems.isEmpty)
+        #expect(s.assets.map(\.name) == ["d1.svg", "i1.jpg", "p1-d1.svg", "p1-d2.svg", "p1-i1.jpg", "p2-d1.svg"])
+        #expect(Set(s.assets.map(\.name)).count == s.assets.count && s.assets.allSatisfy { ShareAsset.isValidName($0.name) })
+        #expect(s.markdown == "Root\n\n![Mermaid diagram](taisce-asset:d1.svg)\n\n![r](taisce-asset:i1.jpg)", "the root is what it was")
+        #expect(s.pages.map(\.docID) == ["c1", "g1", "c2"] && s.pages.map(\.parentDocID) == ["root", "c1", "root"])
+        #expect(s.pages.map(\.title) == ["Fleet Twin", "Deep", "Empty"])
+        #expect(s.pages[0].markdown == "First\n\n![Mermaid diagram](taisce-asset:p1-d1.svg)\n\n![Reladraw diagram](taisce-asset:p1-d2.svg)\n\n![a](taisce-asset:p1-i1.jpg)", "its own frontmatter and title heading go")
+        #expect(s.pages[1].markdown == "# Plan\n\n![Mermaid diagram](taisce-asset:p2-d1.svg)", "only a heading that repeats the page's own title goes")
+        #expect(s.pages[2].markdown == "")
+        #expect(String(decoding: s.assets[5].data, as: UTF8.self) == "<svg>three</svg>")
+        #expect(r.seen.withLock { $0.count == 4 && $0.allSatisfy { $0.theme == .dark } })
+        // without pages: byte for byte the single-doc build
+        let alone = await ShareSnapshotBuilder(renderer: r, images: FakeImages()).build(title: "Plan", blocks: root, theme: .dark)
+        #expect(alone.snapshot.pages.isEmpty && alone.snapshot.markdown == s.markdown && alone.snapshot.assets == Array(s.assets.prefix(2)))
+    }
+
+    @Test func aSubPagesProblemsNameThePage() async throws {
+        let r = FakeVisuals { $0.source.contains("bad") ? .fail("line 2: bad arrow") : .svg }
+        let root = blocks(["```mermaid\nbad root\n```"])
+        var canvas = blocks(["```mermaid\nbad\n```", "![x](https://down.example/b.png)", "scene"], types: [.code, .paragraph, .canvasScene])
+        canvas[0].docID = "c1"
+        let pages = [SharePageSource(docID: "c1", parentDocID: "root", title: "Fleet Twin", blocks: canvas), page("c2", " ", ["```mermaid\nbad\n```"])]
+        let result = await ShareSnapshotBuilder(renderer: r, images: FakeImages()).build(title: "Plan", blocks: root, theme: .light, pages: pages)
+        #expect(result.problems == [
+            "Mermaid diagram couldn't render: line 2: bad arrow",
+            "Fleet Twin: Canvases aren't shared",
+            "Fleet Twin: Mermaid diagram couldn't render: line 2: bad arrow",
+            "Fleet Twin: Image from down.example kept as a link: the server answered 503",
+            "Untitled: Mermaid diagram couldn't render: line 2: bad arrow",
+        ])
+        #expect(result.snapshot.assets.map(\.name) == ["d1-error.svg", "p1-d1-error.svg", "p2-d1-error.svg"])
+        #expect(result.snapshot.pages[0].markdown.contains("[x](https://down.example/b.png)"))
+    }
+
+    @Test func theImageBudgetIsSharedAcrossPages() async throws {
+        // 1.5 MB each (2 MB of base64): five fit in 10 MB, the sixth doesn't
+        struct Heavy: ShareVisualRendering {
+            func render(_ v: ShareVisual) async throws -> RenderedVisual {
+                RenderedVisual(data: Data(count: 1_500_000), contentType: "image/png")
+            }
+        }
+        let fence = "```mermaid\nx\n```"
+        let pages = (1...3).map { page("c\($0)", "Page \($0)", [fence, fence]) }
+        let result = await ShareSnapshotBuilder(renderer: Heavy()).build(title: "T", blocks: blocks([fence]), theme: .light, pages: pages)
+        #expect(result.snapshot.assets.map(\.name) == ["d1.png", "p1-d1.png", "p1-d2.png", "p2-d1.png", "p2-d2.png"])
+        #expect(result.problems == ["Page 3: Mermaid diagram left out: too large to share", "Page 3: Mermaid diagram left out: too large to share"])
+        #expect(result.snapshot.pages[2].markdown == "*(Mermaid diagram left out: too large to share)*\n\n*(Mermaid diagram left out: too large to share)*")
+        #expect(result.snapshot.approximateSize <= ShareLimits.snapshotBytes)
+        // a later page's markdown counts before the root's image is let in
+        let wordy = [page("c1", "Wordy", [String(repeating: "a", count: ShareLimits.snapshotBytes - 1_000_000)])]
+        let squeezed = await ShareSnapshotBuilder(renderer: Heavy()).build(title: "T", blocks: blocks([fence]), theme: .light, pages: wordy)
+        #expect(squeezed.snapshot.assets.isEmpty && squeezed.problems == ["Mermaid diagram left out: too large to share"])
+    }
+
+    @Test func theAssetCountIsSharedAcrossPages() async throws {
+        let r = FakeVisuals { _ in .svg }
+        let fences = Array(repeating: "```mermaid\nx\n```", count: 400)
+        let pages = [page("c1", "One", fences), page("c2", "Two", fences)]
+        let result = await ShareSnapshotBuilder(renderer: r).build(title: "T", blocks: blocks(fences), theme: .light, pages: pages)
+        #expect(result.snapshot.assets.count == ShareLimits.assets)
+        #expect(result.snapshot.assets.last?.name == "p2-d200.svg")
+        #expect(result.problems.count == 200 && result.problems.allSatisfy { $0 == "Two: Mermaid diagram left out: too large to share" })
+    }
+
+    @Test func linkedImagesCoverEveryPage() {
+        let root = blocks(["![r](https://a.example/r.png)"])
+        let pages = [page("c1", "One", ["![x](https://b.example/x.png) ![y](https://a.example/y.png)"]), page("c2", "Two", ["none", "![z](http://c.example/z.png)"])]
+        #expect(ShareSnapshotBuilder.linkedImages(title: "T", blocks: root).map(\.absoluteString) == ["https://a.example/r.png"])
+        #expect(ShareSnapshotBuilder.linkedImages(title: "T", blocks: root, pages: pages).map(\.absoluteString) == [
+            "https://a.example/r.png", "https://b.example/x.png", "https://a.example/y.png", "http://c.example/z.png",
+        ])
+    }
 }

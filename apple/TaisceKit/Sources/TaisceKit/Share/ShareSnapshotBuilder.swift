@@ -76,6 +76,22 @@ public protocol ShareImageLoading: Sendable {
     func load(_ url: URL) async throws -> RenderedVisual
 }
 
+/// A sub-page going into a build: a descendant of the shared doc and its blocks.
+public struct SharePageSource: Sendable, Hashable {
+    public var docID: DocID
+    /// the page's parent doc (the root's id for a direct child)
+    public var parentDocID: DocID?
+    public var title: String
+    public var blocks: [Block]
+
+    public init(docID: DocID, parentDocID: DocID? = nil, title: String, blocks: [Block]) {
+        self.docID = docID
+        self.parentDocID = parentDocID
+        self.title = title
+        self.blocks = blocks
+    }
+}
+
 /// What came out of a build, and what didn't make it.
 public struct ShareSnapshotResult: Sendable, Hashable {
     public var snapshot: ShareSnapshot
@@ -100,7 +116,8 @@ public struct ShareSnapshotResult: Sendable, Hashable {
 ///   replaced by `![alt](taisce-asset:dN.svg)`; every render waits at most
 ///   `timeout`, and a failure becomes a small SVG card saying so (never a gap);
 /// - `![alt](https://…)` images fetched by `images` (`SafeShareImageLoader`)
-///   when given and allowed, else kept as a plain link; within the server's limits.
+///   when given and allowed, else kept as a plain link; within the server's limits;
+/// - with `pages`, each sub-page the same way, into `snapshot.pages`.
 public struct ShareSnapshotBuilder: Sendable {
     public var renderer: any ShareVisualRendering
     /// nil: linked images stay links (the person chose not to fetch them)
@@ -121,24 +138,53 @@ public struct ShareSnapshotBuilder: Sendable {
         self.imageTimeout = imageTimeout
     }
 
-    /// The linked images a build would fetch (http and https), in order: the
-    /// share sheet asks about their hosts first.
-    public static func linkedImages(title: String, blocks: [Block]) -> [URL] {
-        prepare(title: title, blocks: blocks, theme: .light).pieces.compactMap {
-            if case let .image(_, url, _) = $0 { return url }
-            return nil
+    /// The linked images a build would fetch (http and https), in order,
+    /// the root's then each sub-page's: the share sheet asks about their
+    /// hosts first.
+    public static func linkedImages(title: String, blocks: [Block], pages: [SharePageSource] = []) -> [URL] {
+        ([(title, blocks)] + pages.map { ($0.title, $0.blocks) }).flatMap { title, blocks in
+            prepare(title: title, blocks: blocks, theme: .light).pieces.compactMap { piece -> URL? in
+                if case let .image(_, url, _) = piece { return url }
+                return nil
+            }
         }
     }
 
-    public func build(title: String, blocks: [Block], theme: ShareSnapshot.Theme) async -> ShareSnapshotResult {
+    /// The root doc, and with `pages` its sub-pages (in the order given:
+    /// tree order). Every page goes through the same pipeline; the images
+    /// share one list and one budget, a sub-page's under `p<k>-` (k = its
+    /// 1-based place in `pages`), and its problems name it.
+    public func build(title: String, blocks: [Block], theme: ShareSnapshot.Theme, pages: [SharePageSource] = []) async -> ShareSnapshotResult {
         let diagramTheme: DiagramTheme = theme == .dark ? .dark : .light
-        let prepared = Self.prepare(title: title, blocks: blocks, theme: diagramTheme)
-        var markdown = prepared.markdown
-        var problems = prepared.problems
+        let root = Self.prepare(title: title, blocks: blocks, theme: diagramTheme)
+        let prepared = pages.map { Self.prepare(title: $0.title, blocks: $0.blocks, theme: diagramTheme) }
+        // all the markdown counts before any image is let in
+        var budget = Budget(total: root.markdown.utf8.count + prepared.reduce(0) { $0 + $1.markdown.utf8.count })
+        var problems: [String] = []
+        let markdown = await fill(root, prefix: "", label: nil, theme: diagramTheme, budget: &budget, problems: &problems)
+        var out: [SharePage] = []
+        for (k, (page, prep)) in zip(pages, prepared).enumerated() {
+            let label = page.title.trimmingCharacters(in: .whitespaces).isEmpty ? "Untitled" : page.title
+            let md = await fill(prep, prefix: "p\(k + 1)-", label: label, theme: diagramTheme, budget: &budget, problems: &problems)
+            out.append(SharePage(docID: page.docID, parentDocID: page.parentDocID, title: page.title, markdown: md))
+        }
+        return ShareSnapshotResult(snapshot: ShareSnapshot(title: title, markdown: markdown, assets: budget.assets, theme: theme, pages: out), problems: problems)
+    }
 
-        // draw / fetch, one at a time, each bounded
+    /// The images admitted so far and the bytes they and the markdown take:
+    /// one per link, carried from page to page.
+    struct Budget {
         var assets: [ShareAsset] = []
-        var total = markdown.utf8.count
+        var total: Int
+    }
+
+    /// One page's markdown with its placeholders filled: each visual drawn,
+    /// each linked image fetched (or kept a link), one at a time, each
+    /// bounded. `label` (a sub-page's title) leads its problem lines.
+    func fill(_ prepared: Prepared, prefix: String, label: String?, theme diagramTheme: DiagramTheme, budget: inout Budget, problems: inout [String]) async -> String {
+        var markdown = prepared.markdown
+        func note(_ line: String) { problems.append(label.map { "\($0): \(line)" } ?? line) }
+        for line in prepared.problems { note(line) }
         var diagramN = 0, imageN = 0
         for (index, piece) in prepared.pieces.enumerated() {
             let replacement: String
@@ -146,24 +192,24 @@ public struct ShareSnapshotBuilder: Sendable {
             case let .visual(v):
                 diagramN += 1
                 let outcome = await draw(v)
-                let base = "d\(diagramN)"
+                let base = "\(prefix)d\(diagramN)"
                 switch outcome {
                 case let .success(r):
                     let alt = r.alt.map { "\(v.kind.label): \($0)" } ?? v.kind.label
-                    if let asset = Self.admit(r, name: "\(base).\(r.fileExtension)", assets: assets, total: total) {
-                        assets.append(asset)
-                        total += asset.data.count / 3 * 4
+                    if let asset = Self.admit(r, name: "\(base).\(r.fileExtension)", assets: budget.assets, total: budget.total) {
+                        budget.assets.append(asset)
+                        budget.total += asset.data.count / 3 * 4
                         replacement = "![\(Self.escapeAlt(alt))](taisce-asset:\(asset.name))"
                     } else {
-                        problems.append("\(alt) left out: too large to share")
+                        note("\(alt) left out: too large to share")
                         replacement = "*(\(Self.escapeText(alt)) left out: too large to share)*"
                     }
                 case let .failure(message):
-                    problems.append("\(v.kind.label) couldn't render: \(message)")
+                    note("\(v.kind.label) couldn't render: \(message)")
                     let card = Self.errorCard(title: "\(v.kind.label) couldn't render", detail: message, theme: diagramTheme)
-                    if let asset = Self.admit(card, name: "\(base)-error.svg", assets: assets, total: total) {
-                        assets.append(asset)
-                        total += asset.data.count / 3 * 4
+                    if let asset = Self.admit(card, name: "\(base)-error.svg", assets: budget.assets, total: budget.total) {
+                        budget.assets.append(asset)
+                        budget.total += asset.data.count / 3 * 4
                         replacement = "![\(Self.escapeAlt("\(v.kind.label) couldn't render: \(message)"))](taisce-asset:\(asset.name))"
                     } else {
                         replacement = "*(\(Self.escapeText(v.kind.label)) couldn't render: \(Self.escapeText(message)))*"
@@ -179,22 +225,22 @@ public struct ShareSnapshotBuilder: Sendable {
                 imageN += 1
                 switch await fetch(url) {
                 case let .success(r):
-                    if let asset = Self.admit(r, name: "i\(imageN).\(r.fileExtension)", assets: assets, total: total) {
-                        assets.append(asset)
-                        total += asset.data.count / 3 * 4
+                    if let asset = Self.admit(r, name: "\(prefix)i\(imageN).\(r.fileExtension)", assets: budget.assets, total: budget.total) {
+                        budget.assets.append(asset)
+                        budget.total += asset.data.count / 3 * 4
                         replacement = "![\(alt)](taisce-asset:\(asset.name))"
                     } else {
-                        problems.append("Image from \(url.host() ?? "?") kept as a link: too large to share")
+                        note("Image from \(url.host() ?? "?") kept as a link: too large to share")
                         replacement = link
                     }
                 case let .failure(why):
-                    problems.append("Image from \(url.host() ?? "?") kept as a link: \(why.message)")
+                    note("Image from \(url.host() ?? "?") kept as a link: \(why.message)")
                     replacement = link
                 }
             }
             markdown = markdown.replacingOccurrences(of: Self.token(index), with: replacement)
         }
-        return ShareSnapshotResult(snapshot: ShareSnapshot(title: title, markdown: markdown, assets: assets, theme: theme), problems: problems)
+        return markdown
     }
 
     struct Prepared {

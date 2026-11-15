@@ -59,6 +59,25 @@ struct DocIndex: Sendable {
         return out
     }
 
+    /// Every doc under `id`, in tree order: a parent before its children,
+    /// siblings as the sidebar has them (sort key, then title). Not the doc
+    /// itself; a parent cycle is walked once.
+    func descendants(of id: DocID) -> [DocInfo] {
+        var byParent: [DocID: [DocInfo]] = [:]
+        for d in docs { if let p = d.parentID { byParent[p, default: []].append(d) } }
+        var out: [DocInfo] = []
+        var seen: Set<DocID> = [id]
+        func walk(_ parent: DocID) {
+            let kids = (byParent[parent] ?? []).sorted { ($0.sortKey ?? "", $0.title) < ($1.sortKey ?? "", $1.title) }
+            for kid in kids where seen.insert(kid.id).inserted {
+                out.append(kid)
+                walk(kid.id)
+            }
+        }
+        walk(id)
+        return out
+    }
+
     /// "Grimoire › iOS app" — where the doc lives; nil at the root.
     func breadcrumb(of id: DocID) -> String? {
         let path = ancestors(of: id)

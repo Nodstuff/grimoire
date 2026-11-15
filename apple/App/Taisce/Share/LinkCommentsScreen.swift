@@ -155,6 +155,14 @@ struct ThreadView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            // which sub-page the thread is on; the root page says nothing
+            if let page = thread.root.pageCaption {
+                Label(page, systemImage: "doc.text")
+                    .font(.caption)
+                    .foregroundStyle(Color.lapis.ink3)
+                    .lineLimit(1)
+                    .accessibilityIdentifier("linkComments.page")
+            }
             CommentView(comment: thread.root, onDelete: { onDelete(thread.root) })
             ForEach(thread.replies) { reply in
                 CommentView(comment: reply, onDelete: { onDelete(reply) })

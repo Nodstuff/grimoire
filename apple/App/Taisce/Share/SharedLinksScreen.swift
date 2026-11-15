@@ -77,8 +77,9 @@ struct SharedLinkRow: View {
                 Text("\(ShareLinkText.state(share, now: now)) · \(ShareLinkText.views(share, now: now))")
                     .font(.caption)
                     .foregroundStyle(share.state(now: now) == .active ? Color.lapis.ink3 : Color.lapis.yellow)
-                if let c = ShareLinkText.comments(share) {
-                    Text(c).font(.caption).foregroundStyle(Color.lapis.ink3)
+                let details = [ShareLinkText.contents(share), ShareLinkText.comments(share)].compactMap { $0 }
+                if !details.isEmpty {
+                    Text(details.joined(separator: " · ")).font(.caption).foregroundStyle(Color.lapis.ink3)
                 }
             }
             Spacer()

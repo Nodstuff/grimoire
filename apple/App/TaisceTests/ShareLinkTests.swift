@@ -29,10 +29,11 @@ private final class FakeShares: ShareService, @unchecked Sendable {
     }
 
     func createShare(docID: DocID, snapshot: ShareSnapshot, expiresAt: Date?, commentsEnabled: Bool) async throws -> Share {
-        log("create \(docID) \(snapshot.markdown) \(expiresAt == nil ? "never" : "dated") comments=\(commentsEnabled) theme=\(snapshot.theme.rawValue)")
+        log("create \(docID) \(snapshot.markdown) \(expiresAt == nil ? "never" : "dated") comments=\(commentsEnabled) theme=\(snapshot.theme.rawValue)\(snapshot.pages.isEmpty ? "" : " pages=\(snapshot.pages.map(\.docID).joined(separator: ","))")")
         if let refusal { throw refusal }
         var s = Self.share("new", doc: docID, expires: expiresAt, created: 100)
         s.commentsEnabled = commentsEnabled
+        s.pageCount = snapshot.pages.count
         return s
     }
 
@@ -42,10 +43,13 @@ private final class FakeShares: ShareService, @unchecked Sendable {
     }
 
     func updateShare(_ id: String, snapshot: ShareSnapshot?, expiresAt: ShareExpiryChange, commentsEnabled: Bool?) async throws -> Share {
-        log("patch \(id) snapshot=\(snapshot != nil) expiry=\(expiresAt == .keep ? "keep" : "set") comments=\(commentsEnabled.map(String.init) ?? "-")")
+        log("patch \(id) snapshot=\(snapshot != nil)\(snapshot.map { $0.pages.isEmpty ? "" : " pages=\($0.pages.count)" } ?? "") expiry=\(expiresAt == .keep ? "keep" : "set") comments=\(commentsEnabled.map(String.init) ?? "-")")
         if let refusal { throw refusal }
         var s = existing.first { $0.id == id } ?? Self.share(id)
-        if snapshot != nil { s.revision += 1 }
+        if let snapshot {
+            s.revision += 1
+            s.pageCount = snapshot.pages.count
+        }
         if case let .set(d) = expiresAt { s.expiresAt = d }
         if let commentsEnabled { s.commentsEnabled = commentsEnabled }
         return s
@@ -76,8 +80,10 @@ private final class FakeShares: ShareService, @unchecked Sendable {
 private func store(_ fake: FakeShares) -> ShareLinkStore {
     let s = ShareLinkStore()
     s.serviceOverride = fake
-    s.snapshotOverride = { doc, theme, fetch in
-        ShareSnapshotResult(snapshot: ShareSnapshot(title: "Plan", markdown: "md-\(doc)\(fetch ? "+images" : "")", theme: theme), problems: ["Chart couldn't render: x"], includesUnsentEdits: doc == "dirty")
+    s.snapshotOverride = { doc, theme, fetch, subpages in
+        // with sub-pages: the two docs under it, as the tree has them now
+        let pages = subpages ? [SharePage(docID: "c1", parentDocID: doc, title: "Fleet Twin", markdown: "one"), SharePage(docID: "c2", parentDocID: doc, title: "Notes", markdown: "two")] : []
+        return ShareSnapshotResult(snapshot: ShareSnapshot(title: "Plan", markdown: "md-\(doc)\(fetch ? "+images" : "")", theme: theme, pages: pages), problems: ["Chart couldn't render: x"], includesUnsentEdits: doc == "dirty")
     }
     return s
 }
@@ -95,6 +101,45 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         #expect(s.unsentEdits["dirty"] == true)
         s.clearNotes(for: "d1")
         #expect(s.problems["d1"] == nil && s.problems["dirty"] != nil)
+    }
+
+    @Test func createWithSubPagesPublishesThemAndWithoutStaysSingle() async throws {
+        let fake = FakeShares()
+        let s = store(fake)
+        let tree = try await s.create(doc: "d1", expiry: .never, custom: nil, commentsEnabled: true, theme: .light, fetchImages: false, includeSubpages: true)
+        let single = try await s.create(doc: "d2", expiry: .never, custom: nil, commentsEnabled: true, theme: .light, fetchImages: false, includeSubpages: false)
+        _ = try await s.create(doc: "d3", expiry: .never, custom: nil, commentsEnabled: true, theme: .light, fetchImages: false)
+        #expect(fake.calls == [
+            "create d1 md-d1 never comments=true theme=light pages=c1,c2",
+            "create d2 md-d2 never comments=true theme=light",
+            "create d3 md-d3 never comments=true theme=light",
+        ])
+        #expect(tree.pageCount == 2 && single.pageCount == 0)
+        #expect(ShareLinkText.contents(tree) == "Doc and 2 sub-pages" && ShareLinkText.contents(single) == nil)
+    }
+
+    @Test func updateFollowsWhatTheLinkCarries() async throws {
+        var tree = FakeShares.share("tree", created: 2)
+        tree.pageCount = 8
+        let fake = FakeShares(existing: [tree, FakeShares.share("single", created: 1)])
+        let s = store(fake)
+        var asked: [Bool] = []
+        let inner = try #require(s.snapshotOverride)
+        s.snapshotOverride = { doc, theme, fetch, subpages in
+            asked.append(subpages)
+            return try await inner(doc, theme, fetch, subpages)
+        }
+        try await s.load(doc: "d1")
+        let links = s.shares(for: "d1")
+        #expect(links.map(\.id) == ["tree", "single"])
+        try await s.republish(links[0], theme: .light, fetchImages: false)
+        try await s.republish(links[1], theme: .light, fetchImages: true)
+        #expect(asked == [true, false], "a link with sub-pages is rebuilt with them; a single-doc link stays one")
+        #expect(Array(fake.calls.dropFirst()) == [
+            "patch tree snapshot=true pages=2 expiry=keep comments=-",
+            "patch single snapshot=true expiry=keep comments=-",
+        ])
+        #expect(s.shares(for: "d1").map(\.pageCount) == [2, 0], "the tree as it is now: 8 pages then, 2 now")
     }
 
     @Test func liveLinksSortFirst() async throws {
@@ -200,7 +245,7 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         let fake = FakeShares()
         let s = store(fake)
         let started = AsyncStream.makeStream(of: Void.self)
-        s.snapshotOverride = { doc, theme, _ in
+        s.snapshotOverride = { doc, theme, _, _ in
             started.continuation.yield()
             try? await Task.sleep(for: .milliseconds(300))
             return ShareSnapshotResult(snapshot: ShareSnapshot(title: "Plan", markdown: "md", theme: theme))
@@ -217,7 +262,7 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         let s = store(fake)
         // fine when picked, too close by the time the slow build finishes
         let custom = Date.now.addingTimeInterval(ShareExpiry.minimumLead + 0.2)
-        s.snapshotOverride = { _, theme, _ in
+        s.snapshotOverride = { _, theme, _, _ in
             try? await Task.sleep(for: .milliseconds(400))
             return ShareSnapshotResult(snapshot: ShareSnapshot(title: "Plan", markdown: "md", theme: theme))
         }
@@ -233,7 +278,7 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
     @Test func offlineRefusesALink() async throws {
         let fake = FakeShares()
         let s = store(fake)
-        s.snapshotOverride = { _, _, _ in throw ShareLinkError.offline }
+        s.snapshotOverride = { _, _, _, _ in throw ShareLinkError.offline }
         do {
             _ = try await s.create(doc: "d1", expiry: .week, custom: nil, commentsEnabled: true, theme: .light, fetchImages: false)
             Issue.record("expected a refusal")
@@ -288,6 +333,39 @@ private func store(_ fake: FakeShares) -> ShareLinkStore {
         var off = FakeShares.share("o")
         off.commentsEnabled = false
         #expect(ShareLinkText.comments(off) == "Comments off")
+    }
+
+    @Test func subPageWords() {
+        var s = FakeShares.share("s")
+        #expect(ShareLinkText.contents(s) == nil)
+        s.pageCount = 1
+        #expect(ShareLinkText.contents(s) == "Doc and 1 sub-page")
+        s.pageCount = 8
+        #expect(ShareLinkText.contents(s) == "Doc and 8 sub-pages")
+        #expect(ShareLinkText.subpages(1) == "1 page under this doc" && ShareLinkText.subpages(8) == "8 pages under this doc")
+        #expect(ShareLinkText.explanation() == "Anyone with the link sees this doc as it is now: a snapshot, diagrams included. Later edits stay private until you update the link.")
+        #expect(ShareLinkText.explanation(subpages: 8).hasPrefix("Anyone with the link sees this doc and its 8 sub-pages as they are now: a snapshot"))
+        #expect(ShareLinkText.explanation(subpages: 1).hasPrefix("Anyone with the link sees this doc and its 1 sub-page as they are now"))
+        #expect(ShareErrorText.message(ShareLinkError.tooManyPages(240)).hasPrefix("This doc has 240 sub-pages; a link carries at most 200."))
+    }
+
+    @Test func subPagesComeInSidebarOrderParentsFirst() {
+        let index = DocIndex([
+            DocInfo(id: "root", title: "Root"),
+            DocInfo(id: "b", parentID: "root", title: "B", sortKey: "b"),
+            DocInfo(id: "a", parentID: "root", title: "A", sortKey: "a"),
+            DocInfo(id: "a2", parentID: "a", title: "Zed"),
+            DocInfo(id: "a1", parentID: "a", title: "Alpha"),
+            DocInfo(id: "a1x", parentID: "a1", title: "Deep"),
+            DocInfo(id: "other", title: "Other"),
+            DocInfo(id: "o1", parentID: "other", title: "Not ours"),
+            // a cycle below the root is walked once
+            DocInfo(id: "loop1", parentID: "loop2", title: "L1"),
+            DocInfo(id: "loop2", parentID: "loop1", title: "L2"),
+        ])
+        #expect(index.descendants(of: "root").map(\.id) == ["a", "a1", "a1x", "a2", "b"])
+        #expect(index.descendants(of: "a1x").isEmpty && index.descendants(of: "missing").isEmpty)
+        #expect(index.descendants(of: "loop1").map(\.id) == ["loop2"])
     }
 
     @Test func changeExpiryStartsFromTheLinksOwn() {

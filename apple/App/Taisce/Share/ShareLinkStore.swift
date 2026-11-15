@@ -10,7 +10,8 @@ final class ShareLinkStore {
     @ObservationIgnored weak var app: AppModel?
     /// tests: a fake server and a fixed snapshot
     @ObservationIgnored var serviceOverride: (any ShareService)?
-    @ObservationIgnored var snapshotOverride: ((DocID, ShareSnapshot.Theme, Bool) async throws -> ShareSnapshotResult)?
+    /// (doc, theme, fetch linked images, include sub-pages)
+    @ObservationIgnored var snapshotOverride: ((DocID, ShareSnapshot.Theme, Bool, Bool) async throws -> ShareSnapshotResult)?
 
     private(set) var byDoc: [DocID: [Share]] = [:]
     private(set) var all: [Share] = []
@@ -75,9 +76,10 @@ final class ShareLinkStore {
     /// Build, then (unless cancelled meanwhile: the sheet closed) publish.
     /// The expiry is resolved after the build, just before the POST, so a
     /// slow build can't send a custom date that has come too close.
-    func create(doc: DocID, expiry: ShareExpiry, custom: Date?, commentsEnabled: Bool, theme: ShareSnapshot.Theme, fetchImages: Bool) async throws -> Share {
+    /// `includeSubpages`: the link carries every doc under this one too.
+    func create(doc: DocID, expiry: ShareExpiry, custom: Date?, commentsEnabled: Bool, theme: ShareSnapshot.Theme, fetchImages: Bool, includeSubpages: Bool = false) async throws -> Share {
         let service = try service
-        let built = try await snapshot(doc, theme, fetchImages)
+        let built = try await snapshot(doc, theme, fetchImages, includeSubpages)
         note(built, for: doc)
         try Task.checkCancellation()
         let expiresAt = try expiry.resolve(custom: custom)
@@ -86,14 +88,19 @@ final class ShareLinkStore {
         return share
     }
 
-    /// Update link: the doc as it is now, at the same URL.
+    /// Update link: the doc as it is now, at the same URL. A link that
+    /// carries sub-pages gets the tree as it is now (new children appear,
+    /// removed ones go); a single-doc link stays one.
     func republish(_ share: Share, theme: ShareSnapshot.Theme, fetchImages: Bool) async throws {
         let service = try service
-        let built = try await snapshot(share.docID, theme, fetchImages)
+        let built = try await snapshot(share.docID, theme, fetchImages, Self.carriesSubpages(share))
         note(built, for: share.docID)
         try Task.checkCancellation()
         apply(try await service.updateShare(share.id, snapshot: built.snapshot, expiresAt: .keep, commentsEnabled: nil))
     }
+
+    /// Whether an update rebuilds this link with the doc's sub-pages.
+    static func carriesSubpages(_ share: Share) -> Bool { share.pageCount > 0 }
 
     private func note(_ built: ShareSnapshotResult, for doc: DocID) {
         problems[doc] = built.problems.isEmpty ? nil : built.problems
@@ -157,10 +164,10 @@ final class ShareLinkStore {
 
     // MARK: plumbing
 
-    private func snapshot(_ doc: DocID, _ theme: ShareSnapshot.Theme, _ fetchImages: Bool) async throws -> ShareSnapshotResult {
-        if let snapshotOverride { return try await snapshotOverride(doc, theme, fetchImages) }
+    private func snapshot(_ doc: DocID, _ theme: ShareSnapshot.Theme, _ fetchImages: Bool, _ includeSubpages: Bool) async throws -> ShareSnapshotResult {
+        if let snapshotOverride { return try await snapshotOverride(doc, theme, fetchImages, includeSubpages) }
         guard let app else { throw ShareLinkError.notAvailable }
-        return try await app.shareSnapshot(doc, theme: theme, fetchImages: fetchImages, purpose: .link)
+        return try await app.shareSnapshot(doc, theme: theme, fetchImages: fetchImages, includeSubpages: includeSubpages, purpose: .link)
     }
 
     /// A share the server answered with (or changed here) replaces its row everywhere.
@@ -254,6 +261,24 @@ enum ShareLinkText {
         let v = share.views == 1 ? "1 view" : "\(share.views) views"
         guard let last = share.lastViewedAt else { return share.views == 0 ? "Not opened yet" : v }
         return "\(v) · last opened \(RelativeTime.string(last, now: now))"
+    }
+
+    /// "Doc and 8 sub-pages" on a link that carries them; nil on a single-doc link.
+    static func contents(_ share: Share) -> String? {
+        guard share.pageCount > 0 else { return nil }
+        return share.pageCount == 1 ? "Doc and 1 sub-page" : "Doc and \(share.pageCount) sub-pages"
+    }
+
+    /// "8 pages under this doc", beside the Include sub-pages toggle.
+    static func subpages(_ count: Int) -> String {
+        count == 1 ? "1 page under this doc" : "\(count) pages under this doc"
+    }
+
+    /// The sheet's footer: what a link shows, with `subpages` when the new
+    /// link will carry that many.
+    static func explanation(subpages: Int = 0) -> String {
+        let what = subpages <= 0 ? "this doc" : subpages == 1 ? "this doc and its 1 sub-page" : "this doc and its \(subpages) sub-pages"
+        return "Anyone with the link sees \(what) as \(subpages > 0 ? "they are" : "it is") now: a snapshot, diagrams included. Later edits stay private until you update the link."
     }
 
     static func comments(_ share: Share) -> String? {

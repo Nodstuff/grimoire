@@ -36,6 +36,7 @@ struct ShareLinkForm: View {
     @State private var expiry = ShareExpiry.default
     @State private var customDate = Date.now.addingTimeInterval(14 * 86400)
     @State private var commentsOn = true
+    @State private var includeSubpages = true
     /// the publish in flight: cancelled if the sheet closes
     @State private var publishTask: Task<Void, Never>?
     @State private var visible = false
@@ -50,19 +51,21 @@ struct ShareLinkForm: View {
         // an expired link can still be updated or given a new expiry; only a revoked one is over
         let manageable = shares.filter { $0.state() != .revoked }
         let ended = shares.filter { $0.state() == .revoked }
+        let creatingNew = only == nil && (loaded || !shares.isEmpty) && (live.isEmpty || newLink)
+        let subpages = only == nil ? model.subpageCount(docID) : 0
         Form {
             if only == nil {
                 Section {
                     Text(title).font(.headline).foregroundStyle(Color.lapis.ink)
                 } footer: {
-                    Text("Anyone with the link sees this doc as it is now: a snapshot, diagrams included. Later edits stay private until you update the link.")
+                    Text(ShareLinkText.explanation(subpages: creatingNew && includeSubpages ? subpages : 0))
                 }
                 .listRowBackground(Color.lapis.card)
             }
             if !loaded && shares.isEmpty {
                 Section { ProgressView().frame(maxWidth: .infinity) }.listRowBackground(Color.lapis.card)
-            } else if only == nil && (live.isEmpty || newLink) {
-                createSection
+            } else if creatingNew {
+                createSection(subpages: subpages)
             }
             ForEach(manageable) { share in
                 ShareLinkSection(share: share, theme: ShareSnapshot.Theme(scheme), showComments: only != nil)
@@ -117,8 +120,8 @@ struct ShareLinkForm: View {
             publishTask = nil
         }
         .confirmationDialog(imageQuestion?.title ?? "", isPresented: Binding(get: { imageQuestion != nil }, set: { if !$0 { imageQuestion = nil } }), titleVisibility: .visible) {
-            Button(ImageQuestion.include) { imageQuestion = nil; startCreate(fetchImages: true) }
-            Button(ImageQuestion.keepLinks) { imageQuestion = nil; startCreate(fetchImages: false) }
+            Button(ImageQuestion.include) { imageQuestion = nil; startCreate(fetchImages: true, subpages: subpages) }
+            Button(ImageQuestion.keepLinks) { imageQuestion = nil; startCreate(fetchImages: false, subpages: subpages) }
             Button("Cancel", role: .cancel) { imageQuestion = nil }
         } message: {
             Text(ImageQuestion.message)
@@ -134,13 +137,23 @@ struct ShareLinkForm: View {
         }
     }
 
-    private var createSection: some View {
+    private func createSection(subpages: Int) -> some View {
         Section {
+            if subpages > 0 {
+                Toggle(isOn: $includeSubpages) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Include sub-pages")
+                        Text(ShareLinkText.subpages(subpages)).font(.caption).foregroundStyle(Color.lapis.ink3)
+                    }
+                }
+                .disabled(creating)
+                .accessibilityIdentifier("share.subpages")
+            }
             ExpiryPicker(expiry: $expiry, customDate: $customDate)
             Toggle("Allow comments", isOn: $commentsOn)
                 .accessibilityIdentifier("share.comments")
             Button {
-                Task { await askThenCreate() }
+                Task { await askThenCreate(subpages: subpages) }
             } label: {
                 HStack {
                     Text(creating ? "Publishing\u{2026}" : "Create link")
@@ -160,26 +173,26 @@ struct ShareLinkForm: View {
         .listRowBackground(Color.lapis.card)
     }
 
-    /// Linked images on other sites: ask before fetching any.
-    private func askThenCreate() async {
+    /// Linked images on other sites (the sub-pages' too, when they're
+    /// going along): ask before fetching any.
+    private func askThenCreate(subpages: Int) async {
         guard !creating else { return }
-        let hosts = await model.linkedImageHosts(docID)
-        let count = await model.linkedImageCount(docID)
-        if count > 0 {
-            imageQuestion = ImageQuestion(count: count, hosts: hosts)
+        if let question = ImageQuestion(urls: await model.linkedImageURLs(docID, includeSubpages: subpages > 0 && includeSubpages)) {
+            imageQuestion = question
         } else {
-            startCreate(fetchImages: false)
+            startCreate(fetchImages: false, subpages: subpages)
         }
     }
 
-    private func startCreate(fetchImages: Bool) {
+    private func startCreate(fetchImages: Bool, subpages: Int) {
         publishTask?.cancel()
         creating = true
         let (expiry, custom, comments, theme) = (expiry, customDate, commentsOn, ShareSnapshot.Theme(scheme))
+        let withSubpages = subpages > 0 && includeSubpages
         publishTask = Task {
             defer { creating = false }
             do {
-                let share = try await store.create(doc: docID, expiry: expiry, custom: custom, commentsEnabled: comments, theme: theme, fetchImages: fetchImages)
+                let share = try await store.create(doc: docID, expiry: expiry, custom: custom, commentsEnabled: comments, theme: theme, fetchImages: fetchImages, includeSubpages: withSubpages)
                 // only into the clipboard if the person is still looking
                 if visible, !Task.isCancelled { UIPasteboard.general.string = share.url }
                 newLink = false
@@ -238,6 +251,12 @@ struct ShareLinkSection: View {
                     .textSelection(.enabled)
                     .lineLimit(2)
                     .accessibilityIdentifier("share.url")
+                if let contents = ShareLinkText.contents(share) {
+                    Text(contents)
+                        .font(.caption)
+                        .foregroundStyle(Color.lapis.ink3)
+                        .accessibilityIdentifier("share.contents")
+                }
                 Text(ShareLinkText.state(share))
                     .font(.caption)
                     .foregroundStyle(Color.lapis.ink3)
@@ -344,9 +363,9 @@ struct ShareLinkSection: View {
 
     private func askThenUpdate() async {
         guard busy == nil else { return }
-        let count = await model.linkedImageCount(share.docID)
-        if count > 0 {
-            imageQuestion = ImageQuestion(count: count, hosts: await model.linkedImageHosts(share.docID))
+        // a link with sub-pages is rebuilt with them: the question covers theirs too
+        if let question = ImageQuestion(urls: await model.linkedImageURLs(share.docID, includeSubpages: ShareLinkStore.carriesSubpages(share))) {
+            imageQuestion = question
         } else {
             update(fetchImages: false)
         }
@@ -379,7 +398,7 @@ struct EndedLinkRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(share.url).font(.caption.monospaced()).foregroundStyle(Color.lapis.ink3).lineLimit(1).truncationMode(.middle)
-            Text("\(ShareLinkText.state(share)) · \(ShareLinkText.views(share))")
+            Text(([ShareLinkText.contents(share)].compactMap { $0 } + [ShareLinkText.state(share), ShareLinkText.views(share)]).joined(separator: " · "))
                 .font(.caption2)
                 .foregroundStyle(Color.lapis.ink3)
             if share.commentCount > 0 {
@@ -398,6 +417,7 @@ struct EndedLinkSummary: View {
     var body: some View {
         LabeledContent("State", value: ShareLinkText.state(share))
         LabeledContent("Views", value: ShareLinkText.views(share))
+        if let contents = ShareLinkText.contents(share) { LabeledContent("Shares", value: contents) }
         LabeledContent("Link") { Text(share.url).font(.caption.monospaced()).textSelection(.enabled) }
         if share.commentCount > 0 {
             NavigationLink("Comments (\(share.commentCount))") { LinkCommentsScreen(docID: share.docID) }
