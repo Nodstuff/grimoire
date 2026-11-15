@@ -347,7 +347,7 @@ impl Nav {
             format!("<a rel=\"{rel}\" class=\"{rel}\" href=\"{}\"><span>{label}</span>{}</a>", esc(&it.url), esc(&it.title))
         };
         let prev = self.current.checked_sub(1).map(|i| link(i, "prev", "Previous")).unwrap_or_else(|| "<span></span>".into());
-        let next = (self.current + 1 < self.items.len()).then(|| link(self.current + 1, "next", "Next")).unwrap_or_default();
+        let next = if self.current + 1 < self.items.len() { link(self.current + 1, "next", "Next") } else { String::new() };
         format!("<nav class=\"pager\" aria-label=\"Previous and next page\">{prev}{next}</nav>")
     }
 }
