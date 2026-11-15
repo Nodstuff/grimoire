@@ -1,6 +1,6 @@
 # ADR 0005 — Share links: a public, read-only snapshot of a doc
 
-- **Status**: accepted (2026-10-06; revised the same day after the security review)
+- **Status**: accepted (2026-10-06; revised the same day after the security review; §6 sub-pages added 2026-11-15)
 - **Who/when**: Tom + Claude, 2026-10-06
 - **Scope**: SERVER mode only. In LOCAL mode every route below answers 404.
 - **Design**: the Taisce doc "Grimoire › Share links". The wire contract the server and the
@@ -88,7 +88,8 @@ so a rebuilt box keeps every link. The instance role may only read `/taisce/shar
   script in it is displayed, never run. Types are limited to SVG, PNG, JPEG and WebP and the
   bytes must match the type. They are cached in memory per (link, revision, name), 32 MB LRU.
 - Every public response, 500s included, carries the public headers; a 500 says nothing more.
-- Limits: 10 MB a snapshot, 2 MB an image or the markdown, 200 images (413 over).
+- Limits: 10 MB a snapshot, 2 MB an image or one page's markdown, 1000 images, 200 sub-pages
+  (413 over). The image limit was 200 until §6: the 10 MB is the real bound.
 - The preview (`POST /api/shares/preview`, for PDF) is the same page without the script, its
   images inline as data: URLs and loaded eagerly (a printed page never scrolls).
 
@@ -115,6 +116,43 @@ portus-dataplane in qork-pingora-proxy, both its pingora and rama paths) **appen
 peer address to any `X-Forwarded-For` the client sent and replaces the header with that one
 value, so the last hop is always the address portus saw: a client cannot choose it.
 
+### 6. A doc and its sub-pages under one link (2026-11-15)
+
+A doc that is a folder of docs is shared whole: `snapshot.pages` carries the doc's
+descendants, `[{doc_id, parent_doc_id, title, markdown}]`, a parent before its children. The
+root's title and markdown stay where they were, so a snapshot without `pages` is the
+single-doc link it always was. Images stay one namespace per link (`share_link_assets`); the
+clients name page k's `p<k>-…`.
+
+- **Still a snapshot, still client-built.** The app fetches and draws each sub-page as it
+  does the root. The server stores them in `share_link_pages` (schema v15) and the public
+  routes read only that: `Scope::Public` still sees no doc.
+- **What may be a page.** Each `doc_id` must be a live descendant of the link's doc (400
+  otherwise) that the caller may write (`may_write`: 404 invisible, 403 read-only), checked on
+  create and on every new snapshot. A link publishes nothing its maker could not have changed
+  and nothing from outside the tree it names. `parent_doc_id` is honoured only when it names
+  an earlier page; anything else means "under the root", so no loop can be stored.
+- **The page's URL** is `/s/{token}/p/{slug}`, slug = the first 12 bytes of
+  `HMAC(key, "taisce-share-page\0" ‖ link id ‖ "|" ‖ doc id)`, base64url (16 chars). The same
+  doc keeps its slug across snapshots of a link, so bookmarks and comments stay on their page;
+  it differs per link and is not the doc id (a v7 UUID carries a creation time). A slug is only
+  ever compared with the link's own stored pages: one link's slug opens nothing on another.
+- **The page** shows the link's tree (a sidebar when wide, a closed "Pages" fold when narrow;
+  no script needed) and previous/next. `[[Title]]` and `[[Title|label]]` naming one of the
+  link's pages become links to it; any other wiki link stays the text it was, and a
+  single-doc link parses no wiki links at all (its render is unchanged). Page titles are
+  escaped like the link's own.
+- **Comments are per page** (`share_link_comments.page`, the slug; NULL = the root): each
+  page has `/s/{token}/p/{slug}/comments` beside it, with the same CORS, honeypot and limits
+  (the limits stay per link). A reply joins its thread's page. The owner's list returns every
+  page's, each with `page` and `page_title` (null title = a page a later snapshot dropped).
+- **Ends with access, per page.** Revoking drops the pages with the rest of the snapshot.
+  Leaving a workspace revokes a link when its doc or any sub-page's doc is in it. A sub-page's
+  doc deleted for good leaves the link (a trigger; the link stays, at a new revision).
+- Limits: 200 sub-pages, 2 MB of markdown each, inside the snapshot's 10 MB. The per-person
+  caps count a link once whatever it carries, and its bytes in full.
+- The preview (PDF) renders the root page alone.
+
 ## Rejected
 
 - **Serving the live doc behind a token.** It would put an unauthenticated reader on the
@@ -126,3 +164,10 @@ value, so the last hop is always the address portus saw: a client cannot choose 
   every backup and replica. Deriving it from a key kept outside the database costs one HMAC.
 - **Storing the rendered HTML.** It carried the token (image URLs) and froze the renderer of
   the day.
+- **Sub-pages as one long page** (the children's markdown appended to the root's by the
+  client, no server change). A tree of ten docs reads as one endless scroll, comments lose
+  the page they are about, and a deep link to one page is impossible.
+- **The server collecting the sub-pages itself** from the live docs. It cannot draw their
+  diagrams, and it would publish text the person never looked at; §1 stands.
+- **The doc id as the page's slug.** It puts doc ids (and their creation times) on a public
+  page for nothing.

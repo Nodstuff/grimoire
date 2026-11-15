@@ -46,7 +46,9 @@ account may be flipped to the work account by other sessions — push with
 - **Share links are human-only too** (ADR 0005, `crates/daemon/src/shares.rs`): `/api/shares`
   answers only the person's own app or web session (connector 403, PAT 401), never MCP. The
   public `/s/{token}` routes run in `Scope::Public` (sees no doc) and read only the
-  `share_links*` tables, never docs or blocks: a link serves the snapshot the owner uploaded.
+  `share_links*` tables, never docs or blocks: a link serves the snapshot the owner uploaded
+  (the doc alone, or with its sub-pages: `snapshot.pages` → `share_link_pages`, served at
+  `/s/{token}/p/{slug}`; each page must be a descendant the maker `may_write`).
   `Scope::Public` has `user() == None` like System/Local: a new store path keyed on the user
   must deny it (`deny_public`). Tokens are HMACs under `<db dir>/share-links.key` (not in the
   db; losing it breaks every link URL). On the box its copy is the SSM SecureString
