@@ -55,10 +55,32 @@ account may be flipped to the work account by other sessions — push with
   `/taisce/share-links/key` (base64), written to the file before every start by
   `infra/deploy/share-key.sh`. Never name a table `shares` (an open drops it).
 
+## Agent Fabric (ADR 0007)
+- A **runtime** (Workbox on the Mac) dials out to the server over gRPC and reports its Claude
+  sessions; the server keeps each person's fleet and shows it to their own app. The contract is
+  `proto/taisce/runtime/v1/runtime.proto` (crate `taisce-runtime-proto`, compiled without
+  `protoc`); the service is `crates/daemon/src/fabric/`, the tables `crates/store/src/fabric.rs`.
+- gRPC is on the runtime leg only, on its own loopback port (`serve --runtime-grpc-port`, 7426 on
+  the box, SERVER mode only), apart from the axum app and `require_auth`. Everything else stays
+  HTTPS / SSE / APNs.
+- A runtime signs in with its own credential kind (`trt_…`, `taisce fabric runtime
+  add|list|revoke` on the box). It opens that service and nothing else, and no other token
+  opens the service. The fleet (`/api/fabric/*`) answers only the person's own app or web
+  session: connector 403, PAT 401, never MCP.
+- Two more `Scope::System` uses: resolving a runtime credential to its owner, and expiring
+  sessions after 7 days. Everything a stream writes runs in its owner's `Scope::User`.
+- The proxy forces two rules (both observed, 2026-11-20): the gRPC route in
+  `infra/deploy/portus.yaml` keeps its explicit `max_request_body_bytes` (unset means 10 MiB
+  over a stream's whole life), and neither side has more than 64 unacknowledged events in
+  flight (Portus closes a connection holding about 145 small DATA frames). New messages go
+  through the send window, never around it.
+- `cargo run -p taisce-runtime-proto --features client --example fake_runtime` drives a scratch
+  daemon; never a real server.
+
 ## Start here
 - **[[Roadmap]]** in Taisce (under the `[[Taisce]]` tree, renamed from Grimoire on 2026-10-14) is the outstanding list — read it first in any
   new session; the daily doc carries narrative, the roadmap carries the work.
-- Test with `cargo test -p taisce -p taisce-store` (the shell crate's build.rs needs the sidecar
+- Test with `cargo test -p taisce -p taisce-store -p taisce-runtime-proto` (the shell crate's build.rs needs the sidecar
   binary; a bare workspace `cargo test` fails in a fresh worktree). In a fresh worktree the daemon
   also needs `ui/dist/` to exist (rust-embed): `mkdir -p ui/dist && touch ui/dist/index.html` or
   copy the main checkout's `ui/dist` before `cargo test`. Then `cd ui && npx vitest run`.
