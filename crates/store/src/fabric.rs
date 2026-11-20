@@ -128,6 +128,10 @@ pub struct FabricSession {
     pub context_used_pct: Option<u8>,
     pub since: i64,
     pub updated_at: i64,
+    /// Snoozed by its person until then (no alert before it). Not the
+    /// runtime's to say: writing a session never changes it, only
+    /// [`SqliteStore::fabric_session_quiet`] does.
+    pub quiet_until: Option<i64>,
 }
 
 const RUNTIME_COLS: &str =
@@ -158,7 +162,7 @@ fn runtime_row(r: &Row) -> rusqlite::Result<FabricRuntime> {
 }
 
 const SESSION_COLS: &str = "runtime_id, id, user_id, address, fabric, project, worktree, branch, account, state, tool, \
-     note, last_line, context_used_pct, since, updated_at";
+     note, last_line, context_used_pct, since, updated_at, quiet_until";
 
 fn session_row(r: &Row) -> rusqlite::Result<FabricSession> {
     let state: String = r.get(9)?;
@@ -181,6 +185,7 @@ fn session_row(r: &Row) -> rusqlite::Result<FabricSession> {
         context_used_pct: pct.map(|p| p.clamp(0, 100) as u8),
         since: r.get(14)?,
         updated_at: r.get(15)?,
+        quiet_until: r.get(16)?,
     })
 }
 
@@ -328,6 +333,21 @@ impl SqliteStore {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Snooze one session of one of the scope's runtimes until `until`
+    /// (None = not snoozed), and hand back the row. A session of anyone
+    /// else's runtime, or one that is not there, is NotFound.
+    pub fn fabric_session_quiet(&mut self, runtime: Uuid, id: Uuid, until: Option<i64>) -> Result<FabricSession> {
+        self.fabric_runtime(runtime)?;
+        self.conn
+            .query_row(
+                &format!("UPDATE fabric_sessions SET quiet_until = ?3 WHERE runtime_id = ?1 AND id = ?2 RETURNING {SESSION_COLS}"),
+                params![runtime.to_string(), id.to_string(), until],
+                session_row,
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("session {id}")))
+    }
+
     /// Write sessions of one of the scope's runtimes, each whole (insert or
     /// replace). See [`SqliteStore::fabric_runtime_write`].
     pub fn fabric_sessions_put(&mut self, runtime: Uuid, sessions: &[FabricSession]) -> Result<()> {
@@ -338,6 +358,8 @@ impl SqliteStore {
     /// transaction: sessions to `delete` (it makes room for new ones by
     /// dropping the oldest exited), sessions to `put` (each whole, insert or
     /// replace) and, when given, what it knows of the runtime's connection.
+    /// A row's `quiet_until` is not written: a snooze is its person's
+    /// ([`SqliteStore::fabric_session_quiet`]) and a new row has none.
     /// Each row's `runtime_id` and `user_id` are ignored: rows are keyed to
     /// `runtime` and to its owner, so a caller can only ever write into a
     /// fleet it can see. A runtime left over [`MAX_SESSIONS_PER_RUNTIME`] is
@@ -472,6 +494,7 @@ mod tests {
             context_used_pct: Some(41),
             since: updated_at,
             updated_at,
+            quiet_until: None,
         }
     }
 
@@ -615,6 +638,42 @@ mod tests {
         assert_eq!(toms.len(), 1);
         assert_eq!((toms[0].address.as_str(), toms[0].state, toms[0].updated_at), ("taisce/main", SessionStatus::Working, 100));
         assert_eq!(s.fabric_runtime(r.id).unwrap().last_up_seq, 0);
+    }
+
+    #[test]
+    fn a_snooze_is_its_persons_and_a_report_never_changes_it() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let (tom, ann) = users(&mut s);
+        let r = s.fabric_runtime_create(tom, "mbp", "h1", 1).unwrap();
+        let sid = Uuid::now_v7();
+        s.fabric_sessions_put(r.id, &[session(sid, "taisce/main", SessionStatus::Working, 100)]).unwrap();
+        assert_eq!(s.fabric_sessions().unwrap()[0].quiet_until, None);
+        s.with_scope_for_test(Scope::User(tom), |s| {
+            assert_eq!(s.fabric_session_quiet(r.id, sid, Some(5000)).unwrap().quiet_until, Some(5000));
+            assert!(is_not_found(s.fabric_session_quiet(r.id, Uuid::now_v7(), Some(5000))), "no such session");
+        });
+        // the runtime reports it again, whatever its row says: still snoozed
+        let mut again = session(sid, "taisce/main", SessionStatus::NeedsYou, 200);
+        again.quiet_until = Some(1);
+        s.fabric_sessions_put(r.id, &[again]).unwrap();
+        let got = s.fabric_sessions().unwrap();
+        assert_eq!((got[0].state, got[0].quiet_until), (SessionStatus::NeedsYou, Some(5000)));
+        // nobody else can snooze it, wake it or see that it is snoozed
+        let ann_rt = s.fabric_runtime_create(ann, "air", "h2", 1).unwrap();
+        s.with_scope_for_test(Scope::User(ann), |s| {
+            assert!(is_not_found(s.fabric_session_quiet(r.id, sid, None)));
+            assert!(is_not_found(s.fabric_session_quiet(r.id, sid, Some(9))));
+            // naming her own runtime with Tom's session id reaches nothing
+            assert!(is_not_found(s.fabric_session_quiet(ann_rt.id, sid, Some(9))));
+            assert!(s.fabric_sessions().unwrap().is_empty());
+        });
+        for scope in [Scope::Local, Scope::Within { user: tom, workspace: Uuid::now_v7() }, Scope::Public] {
+            s.with_scope_for_test(scope, |s| assert!(is_not_found(s.fabric_session_quiet(r.id, sid, None)), "{scope:?}"));
+        }
+        assert_eq!(s.fabric_sessions().unwrap()[0].quiet_until, Some(5000));
+        s.with_scope_for_test(Scope::User(tom), |s| {
+            assert_eq!(s.fabric_session_quiet(r.id, sid, None).unwrap().quiet_until, None);
+        });
     }
 
     #[test]

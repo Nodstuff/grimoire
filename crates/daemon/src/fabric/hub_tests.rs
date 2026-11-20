@@ -47,6 +47,7 @@ fn session(t: &T, id: Uuid, address: &str, state: SessionStatus, now: i64) -> Fa
         context_used_pct: None,
         since: now,
         updated_at: now,
+        quiet_until: None,
     }
 }
 
@@ -447,4 +448,95 @@ async fn a_session_reported_unchanged_every_day_never_expires() {
     t.hub.apply(t.user, t.rt.id, c.conn, Incoming::Snapshot { replaces_seq: 1, sessions: vec![asks(&t)] }, 100 + 9 * day + 600).await.unwrap();
     assert_eq!(t.hub.fleet(t.user).await.unwrap().rev, rev);
     assert_eq!(t.hub.fleet(t.user).await.unwrap().sessions[0].updated_at, 100 + 9 * day);
+}
+
+/// A snoozed session is in the fleet as ever, marked, and announced to
+/// nobody until its time; no report changes the snooze; when it runs out
+/// the mark is lifted and said on the stream.
+#[tokio::test]
+async fn a_snoozed_session_stays_in_the_fleet_and_alerts_nobody_until_its_time() {
+    let t = setup();
+    let c = t.connect("launch-1", 100).await;
+    let (id, other) = (Uuid::now_v7(), Uuid::now_v7());
+    use SessionStatus::*;
+    t.state(&c, 1, session(&t, id, "taisce/main", Working, 100), 100).await.unwrap();
+    t.state(&c, 2, session(&t, other, "taisce/other", Working, 100), 100).await.unwrap();
+    let (_, mut events) = t.hub.watch(t.user).await.unwrap();
+
+    // snoozed until 1000: stored in the person's scope, announced on the stream
+    let view = t.hub.snooze(t.user, t.rt.id, id, Some(1000)).await.unwrap();
+    assert_eq!((view.id, view.quiet_until, view.state), (id, Some(1000), Working));
+    assert_eq!(t.stored(id).unwrap().quiet_until, Some(1000));
+    let e = events.try_recv().unwrap();
+    assert!(matches!(&e.change, Change::Session(s) if s.id == id && s.quiet_until == Some(1000)), "{e:?}");
+    // the same snooze again changes nothing and says nothing
+    t.hub.snooze(t.user, t.rt.id, id, Some(1000)).await.unwrap();
+    assert!(events.try_recv().is_err());
+
+    // it comes to need its person, stalls and finishes: nothing is sent,
+    // and each report leaves the snooze where it was
+    t.state(&c, 3, session(&t, id, "taisce/main", NeedsYou, 200), 200).await.unwrap();
+    t.state(&c, 4, session(&t, id, "taisce/main", Working, 300), 300).await.unwrap();
+    t.state(&c, 5, session(&t, id, "taisce/main", Stalled, 400), 400).await.unwrap();
+    t.state(&c, 6, session(&t, id, "taisce/main", Finished, 500), 500).await.unwrap();
+    assert!(t.alerted().is_empty(), "{:?}", t.alerted());
+    let fleet = t.hub.fleet(t.user).await.unwrap();
+    let mine = fleet.sessions.iter().find(|s| s.id == id).unwrap();
+    assert_eq!((mine.state, mine.quiet_until), (Finished, Some(1000)), "shown as ever, still snoozed");
+    t.hub.flush().await;
+    assert_eq!(t.stored(id).unwrap().quiet_until, Some(1000), "a write of the session keeps its snooze");
+    // a snapshot is a report too
+    let snap = vec![session(&t, id, "taisce/main", Working, 600), session(&t, other, "taisce/other", Working, 100)];
+    t.hub.apply(t.user, t.rt.id, c.conn, Incoming::Snapshot { replaces_seq: 6, sessions: snap }, 600).await.unwrap();
+    assert_eq!(t.hub.fleet(t.user).await.unwrap().sessions.iter().find(|s| s.id == id).unwrap().quiet_until, Some(1000));
+    // the other session is not snoozed
+    t.state(&c, 7, session(&t, other, "taisce/other", NeedsYou, 700), 700).await.unwrap();
+    assert_eq!(t.alerts.lock().unwrap().iter().map(|a| a.session_id).collect::<Vec<_>>(), vec![other]);
+
+    // before its time a wake lifts nothing
+    while events.try_recv().is_ok() {}
+    t.hub.wake(999).await;
+    assert!(events.try_recv().is_err());
+    // an alert goes by the time itself, whenever the wake comes round
+    t.state(&c, 8, session(&t, id, "taisce/main", NeedsYou, 1000), 1000).await.unwrap();
+    assert_eq!(t.alerts.lock().unwrap().iter().map(|a| a.session_id).collect::<Vec<_>>(), vec![other, id]);
+    while events.try_recv().is_ok() {}
+    // at its time the mark is lifted, in the fleet, on the stream and in the store
+    t.hub.wake(1000).await;
+    let e = events.try_recv().unwrap();
+    assert!(matches!(&e.change, Change::Session(s) if s.id == id && s.quiet_until.is_none()), "{e:?}");
+    assert!(events.try_recv().is_err(), "only the one that ran out");
+    assert_eq!(t.stored(id).unwrap().quiet_until, None);
+
+    // lifted by hand: the next change announces again
+    t.hub.snooze(t.user, t.rt.id, other, Some(5000)).await.unwrap();
+    assert_eq!(t.hub.snooze(t.user, t.rt.id, other, None).await.unwrap().quiet_until, None);
+    t.state(&c, 9, session(&t, other, "taisce/other", Working, 2000), 2000).await.unwrap();
+    t.state(&c, 10, session(&t, other, "taisce/other", Stalled, 2100), 2100).await.unwrap();
+    assert_eq!(t.alerted().last(), Some(&AlertKind::Stalled));
+
+    // a snooze survives the hub: a new one loads it from the store
+    t.hub.snooze(t.user, t.rt.id, id, Some(9000)).await.unwrap();
+    t.hub.flush().await;
+    let again = Hub::new(t.store.clone(), None);
+    assert_eq!(again.fleet(t.user).await.unwrap().sessions.iter().find(|s| s.id == id).unwrap().quiet_until, Some(9000));
+}
+
+/// A snooze reaches only the caller's own sessions: anyone else's, or one
+/// that is not there, does not exist.
+#[tokio::test]
+async fn nobody_snoozes_a_session_that_is_not_theirs() {
+    let t = setup();
+    let c = t.connect("launch-1", 100).await;
+    let id = Uuid::now_v7();
+    t.state(&c, 1, session(&t, id, "taisce/main", SessionStatus::Working, 100), 100).await.unwrap();
+    let ann = t.store.lock(Scope::System).auth_add_user("ann", 1).unwrap().id;
+    let ann_rt = t.store.lock(Scope::System).fabric_runtime_create(ann, "air", "h2", 1).unwrap();
+    let not_found = |r: Result<SessionView, taisce_store::StoreError>| matches!(r, Err(taisce_store::StoreError::NotFound(_)));
+    assert!(not_found(t.hub.snooze(ann, t.rt.id, id, Some(5000)).await), "Tom's runtime is not Ann's");
+    assert!(not_found(t.hub.snooze(ann, ann_rt.id, id, Some(5000)).await), "nor is his session under her own");
+    assert!(not_found(t.hub.snooze(t.user, t.rt.id, Uuid::now_v7(), Some(5000)).await), "no such session");
+    assert!(not_found(t.hub.snooze(t.user, Uuid::now_v7(), id, Some(5000)).await), "no such runtime");
+    assert_eq!(t.stored(id).unwrap().quiet_until, None);
+    assert_eq!(t.hub.fleet(t.user).await.unwrap().sessions[0].quiet_until, None);
 }

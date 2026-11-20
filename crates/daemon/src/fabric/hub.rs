@@ -18,6 +18,10 @@
 //!   ([`AlertKind::on`]), at most once per [`ALERT_FLOOR`] per session and
 //!   kind: APNs throttles a whole provider, so one flapping session must
 //!   not spend everyone's pushes.
+//! - A person can snooze a session ([`Hub::snooze`]): until the time they
+//!   gave, it raises no alert. It stays in the fleet, marked. The snooze is
+//!   theirs, not the runtime's: no report changes it, and it is lifted when
+//!   its time passes ([`Hub::wake`], on the flush tick).
 //! - Every store write of a runtime goes through [`Hub::write_runtime`],
 //!   one at a time per runtime, each taking the rows as they are at that
 //!   moment and writing them in one transaction: an older picture can
@@ -207,6 +211,7 @@ impl RuntimeState {
         let Some(slot) = self.sessions.get_mut(&next.id) else {
             // first sight
             next.updated_at = now;
+            next.quiet_until = None;
             let mut slot = Slot { row: next, dirty: true, alerted: [None; 3], urgent_at: None };
             if let Some(kind) = AlertKind::on(None, slot.row.state) {
                 slot.alerted[kind as usize] = Some(now);
@@ -219,6 +224,8 @@ impl RuntimeState {
         // the same report again, only later: nothing changed. It does say
         // the session still exists, which is recorded about once a day
         next.updated_at = slot.row.updated_at;
+        // a snooze is the person's: no report carries or changes it
+        next.quiet_until = slot.row.quiet_until;
         if slot.row == next {
             if now - slot.row.updated_at >= STILL_THERE_AFTER {
                 slot.row.updated_at = now;
@@ -233,6 +240,8 @@ impl RuntimeState {
             && let Some(kind) = AlertKind::on(Some(prev), next.state)
             // the same announcement again so soon is a session flapping
             && !slot.alerted[kind as usize].is_some_and(|at| (now - at).abs() < ALERT_FLOOR)
+            // snoozed: shown in the fleet as ever, announced to nobody
+            && !slot.row.quiet_until.is_some_and(|until| until > now)
         {
             slot.alerted[kind as usize] = Some(now);
             alerts.push(alert(&next, kind));
@@ -523,6 +532,62 @@ impl Hub {
         self.write_runtime(user, runtime).await;
     }
 
+    /// Snooze `session` of `user`'s `runtime` until `until`, or lift its
+    /// snooze (None). Stored in the person's own scope and announced on
+    /// their stream; a session that is not theirs, or not there, is
+    /// NotFound.
+    pub async fn snooze(&self, user: Uuid, runtime: Uuid, session: Uuid, until: Option<i64>) -> Result<SessionView, StoreError> {
+        let gone = || StoreError::NotFound(format!("session {session}"));
+        self.sync(user).await?;
+        let held = self.fleets().get(&user).and_then(|f| f.runtimes.get(&runtime)).is_some_and(|r| r.sessions.contains_key(&session));
+        if !held {
+            return Err(gone());
+        }
+        // a session just reported may not be in the store yet
+        self.write_runtime(user, runtime).await;
+        with_store(&self.0.store, Scope::User(user), move |s| s.fabric_session_quiet(runtime, session, until).map(|_| ())).await?;
+        let mut fleets = self.fleets();
+        let fleet = fleets.get_mut(&user).ok_or_else(gone)?;
+        let slot = fleet.runtimes.get_mut(&runtime).and_then(|r| r.sessions.get_mut(&session)).ok_or_else(gone)?;
+        let changed = slot.row.quiet_until != until;
+        slot.row.quiet_until = until;
+        let view = SessionView::from(&slot.row);
+        if changed {
+            Self::publish(fleet, vec![Change::Session(view.clone())]);
+        }
+        Ok(view)
+    }
+
+    /// Lift every snooze whose time has passed at `now`, and say so on its
+    /// person's stream. (Alerts go by the time itself, so one that has
+    /// passed already silences nothing: this keeps the fleet's mark honest.)
+    pub async fn wake(&self, now: i64) {
+        let woken: Vec<(Uuid, Uuid, Uuid)> = {
+            let mut fleets = self.fleets();
+            let mut woken = vec![];
+            for (user, fleet) in fleets.iter_mut() {
+                let mut changes = vec![];
+                for rt in fleet.runtimes.values_mut() {
+                    for slot in rt.sessions.values_mut().filter(|s| s.row.quiet_until.is_some_and(|until| until <= now)) {
+                        slot.row.quiet_until = None;
+                        changes.push(Change::Session(SessionView::from(&slot.row)));
+                        woken.push((*user, rt.row.id, slot.row.id));
+                    }
+                }
+                Self::publish(fleet, changes);
+            }
+            woken
+        };
+        for (user, runtime, session) in woken {
+            match with_store(&self.0.store, Scope::User(user), move |s| s.fabric_session_quiet(runtime, session, None).map(|_| ())).await {
+                // gone meanwhile (expired, or its runtime removed): nothing to lift
+                Ok(()) | Err(StoreError::NotFound(_)) => {}
+                // a time already passed silences nothing; the next load lifts it again
+                Err(e) => tracing::warn!("fabric: lifting the snooze of session {session} failed: {e}"),
+            }
+        }
+    }
+
     /// Is `runtime` still enrolled? When it is not, the hub forgets it.
     pub async fn still_enrolled(&self, user: Uuid, runtime: Uuid) -> bool {
         match with_store(&self.0.store, Scope::User(user), move |s| s.fabric_runtime(runtime).map(|_| ())).await {
@@ -673,15 +738,19 @@ impl Hub {
         }
     }
 
-    /// The hub's housekeeping: a flush every [`FLUSH_EVERY`], a sweep at
-    /// start and every [`SWEEP_EVERY`].
+    /// The hub's housekeeping: a flush every [`FLUSH_EVERY`] (and the
+    /// snoozes that ran out since the last one lifted), a sweep at start
+    /// and every [`SWEEP_EVERY`].
     pub async fn maintenance_loop(self) {
         let mut flush = tokio::time::interval(FLUSH_EVERY);
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut sweep = tokio::time::interval(SWEEP_EVERY);
         loop {
             tokio::select! {
-                _ = flush.tick() => self.flush().await,
+                _ = flush.tick() => {
+                    self.flush().await;
+                    self.wake(crate::auth::now()).await;
+                }
                 _ = sweep.tick() => self.sweep(crate::auth::now()).await,
             }
         }

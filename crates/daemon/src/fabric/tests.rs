@@ -12,7 +12,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use futures_util::StreamExt as _;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use taisce_runtime_proto::fake::{Fake, ScriptAccount, ScriptSession, Step};
@@ -140,6 +140,20 @@ impl T {
 
     async fn status(&self, path: &str, token: &str) -> StatusCode {
         self.app.clone().oneshot(self.request(path, token)).await.unwrap().status()
+    }
+
+    /// A request with (or without) a JSON body, as the person's app: its
+    /// status and JSON answer (null when the answer is not JSON).
+    async fn send(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+        let mut b = Request::builder().method(method).uri(path).header("host", "localhost:7513").header("authorization", format!("Bearer {}", self.token));
+        if body.is_some() {
+            b = b.header("content-type", "application/json");
+        }
+        let req = b.body(body.map(|v| Body::from(v.to_string())).unwrap_or_else(Body::empty)).unwrap();
+        let res = self.app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
     async fn sse(&self) -> Sse {
@@ -652,6 +666,78 @@ async fn local_mode_has_no_fleet() {
         let res = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
     }
+    let path = format!("/api/fabric/sessions/{}/{S1}/snooze", Uuid::now_v7());
+    let post = Request::post(&path).header("content-type", "application/json").body(Body::from(r#"{"until":4102444800}"#)).unwrap();
+    assert_eq!(app.clone().oneshot(post).await.unwrap().status(), StatusCode::NOT_FOUND);
+    let delete = Request::delete(&path).body(Body::empty()).unwrap();
+    assert_eq!(app.clone().oneshot(delete).await.unwrap().status(), StatusCode::NOT_FOUND);
+}
+
+/// Snooze, on the routes: the person snoozes a session and it says so in
+/// the fleet and on the stream; while snoozed it sends nothing; lifted, it
+/// does again. A time that is not ahead, or too far, is refused.
+#[tokio::test]
+async fn a_person_snoozes_a_session_and_lifts_it() {
+    let t = setup().await;
+    let (runtime, credential) = t.enrol("mbp");
+    let mut fake = Fake::connect(&t.url, &credential, "launch-1", 0).await.unwrap();
+    fake.snapshot(&[session(S1, "taisce/main", "working"), session(S2, "workbox/main", "working")]).await.unwrap();
+    let mut sse = t.sse().await;
+    loop {
+        // the snapshot is applied on the channel's task: wait for both
+        let (event, _, v) = sse.next().await;
+        if event == "fleet" && v["sessions"].as_array().unwrap().len() == 2 {
+            break;
+        }
+        sse = t.sse().await;
+    }
+    let path = format!("/api/fabric/sessions/{runtime}/{S1}/snooze");
+    let until = now() + 3600;
+
+    // refused: not ahead, too far ahead, no body, not this person's session
+    for bad in [now() - 1, now(), now() + super::routes::MAX_SNOOZE + 60] {
+        let (status, out) = t.send("POST", &path, Some(json!({"until": bad}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {out}");
+    }
+    assert!(t.send("POST", &path, None).await.0.is_client_error());
+    let elsewhere = format!("/api/fabric/sessions/{}/{S1}/snooze", Uuid::now_v7());
+    assert_eq!(t.send("POST", &elsewhere, Some(json!({"until": until}))).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(t.send("DELETE", &elsewhere, None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(t.stored(S1).quiet_until, None);
+
+    // snoozed: the answer, the stream, the fleet and the store agree
+    let (status, out) = t.send("POST", &path, Some(json!({"until": until}))).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!((out["id"].as_str(), out["quiet_until"].as_i64(), out["state"].as_str()), (Some(S1), Some(until), Some("working")));
+    let (event, _, v) = sse.next().await;
+    assert_eq!((event.as_str(), v["id"].as_str(), v["quiet_until"].as_i64()), ("session", Some(S1), Some(until)));
+    let fleet = t.get("/api/fabric/sessions").await;
+    let quiet: Vec<(&str, Option<i64>)> =
+        fleet["sessions"].as_array().unwrap().iter().map(|s| (s["id"].as_str().unwrap(), s["quiet_until"].as_i64())).collect();
+    assert!(quiet.contains(&(S1, Some(until))) && quiet.contains(&(S2, None)), "still listed, and only it: {quiet:?}");
+    assert_eq!(t.stored(S1).quiet_until, Some(until));
+
+    // it comes to need its person: shown, not sent. The other one is sent
+    fake.state(&session(S1, "taisce/main", "needs_you")).await.unwrap();
+    let (event, _, v) = sse.next().await;
+    assert_eq!((event.as_str(), v["state"].as_str(), v["quiet_until"].as_i64()), ("session", Some("needs_you"), Some(until)));
+    fake.state(&session(S2, "workbox/main", "needs_you")).await.unwrap();
+    let alerts = alerts_when(&t.alerts, 1).await;
+    assert_eq!(alerts.iter().map(|a| a.address.as_str()).collect::<Vec<_>>(), ["workbox/main"]);
+
+    // lifted: said on the stream, and the next change is sent
+    let (status, out) = t.send("DELETE", &path, None).await;
+    assert_eq!((status, out["quiet_until"].is_null()), (StatusCode::OK, true), "{out}");
+    loop {
+        let (event, _, v) = sse.next().await;
+        if event == "session" && v["id"] == S1 && v["quiet_until"].is_null() {
+            break;
+        }
+    }
+    fake.state(&session(S1, "taisce/main", "working")).await.unwrap();
+    fake.state(&session(S1, "taisce/main", "stalled")).await.unwrap();
+    let alerts = alerts_when(&t.alerts, 2).await;
+    assert_eq!((alerts[1].address.as_str(), alerts[1].kind), ("taisce/main", AlertKind::Stalled));
 }
 
 /// The script the `fake_runtime` example plays by default follows the

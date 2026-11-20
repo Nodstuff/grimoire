@@ -262,6 +262,9 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/fabric/runtimes", "a_fleet_is_its_owners_alone"),
     ("/api/fabric/stream", "a_fleet_is_its_owners_alone"),
     ("/api/fabric/sessions", "a_runtime_credential_writes_only_its_owners_fleet"),
+    // snooze: a person's own setting on their own session; anyone else's
+    // session does not exist, and no connector, PAT or MCP tool sets it
+    ("/api/fabric/sessions/{runtime_id}/{session_id}/snooze", "a_snooze_is_its_persons_alone"),
     ("grpc:taisce.runtime.v1.Runtime/Attach", "a_runtime_credential_writes_only_its_owners_fleet"),
 ];
 
@@ -3648,6 +3651,100 @@ async fn a_fleet_is_its_owners_alone() {
     // no MCP tool reads or changes a fleet
     for t in crate::mcp::KsMcp::tool_router().list_all() {
         for word in ["fabric", "fleet", "runtime", "session"] {
+            assert!(!t.name.contains(word), "MCP tool {} looks like an Agent Fabric surface", t.name);
+        }
+    }
+}
+
+/// Snooze: B cannot snooze or wake A's session, and never sees that A
+/// snoozed it; A's snooze silences A's alerts and nobody else's. Only a
+/// person's own app or web session snoozes: a connector is refused, a PAT
+/// is no token on `/api`, and no MCP tool does it.
+#[tokio::test]
+async fn a_snooze_is_its_persons_alone() {
+    use crate::fabric::tests::{Sse, serve_channel};
+    use taisce_runtime_proto::fake::{Fake, ScriptSession};
+    let fx = fixture();
+    let url = serve_channel(&fx.store, &fx.hub, Default::default()).await;
+    let (a_rt, a_cred) = fx.enrol_runtime(fx.a, "zebrasecret-mac");
+    let mut a_fake = Fake::connect(&url, &a_cred, "launch-a", 0).await.unwrap();
+    a_fake.snapshot(&[a_secret_session("working")]).await.unwrap();
+    fx.until(&fx.a_app, "/api/fabric/sessions", |o| o.contains(A_SESSION)).await;
+    // B's own Mac holds a session with the very same id (ids are a runtime's own)
+    let (b_rt, b_cred) = fx.enrol_runtime(fx.b, "air");
+    let mut b_fake = Fake::connect(&url, &b_cred, "launch-b", 0).await.unwrap();
+    let b_session = |state: &str| ScriptSession { since: Some(1_800_000_000), ..ScriptSession::new(A_SESSION, "aoifeown/main", state) };
+    b_fake.snapshot(&[b_session("working")]).await.unwrap();
+    fx.until(&fx.b_app, "/api/fabric/sessions", |o| o.contains("aoifeown/main")).await;
+
+    let a_path = format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/snooze");
+    let b_path = format!("/api/fabric/sessions/{b_rt}/{A_SESSION}/snooze");
+    let until = now() + 3600;
+    let a_quiet = || fx.store.lock(Scope::User(fx.a)).fabric_sessions().unwrap()[0].quiet_until;
+
+    // B at A's session: it does not exist, to snooze or to wake, and nothing changes
+    let (st, out) = fx.b("POST", &a_path, Some(json!({"until": until}))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{out}");
+    fx.no_leak("snooze", &out);
+    assert_eq!(a_quiet(), None);
+    // A snoozes her own
+    let (st, out) = fx.call(&fx.a_app, "POST", &a_path, Some(json!({"until": until}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["quiet_until"], json!(until));
+    assert_eq!(a_quiet(), Some(until));
+    let (st, out) = fx.b("DELETE", &a_path, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{out}");
+    fx.no_leak("unsnooze", &out);
+    assert_eq!(a_quiet(), Some(until), "B woke nothing");
+
+    // B sees no trace of A's snooze: her own session of the same id is not
+    // snoozed, on the routes or on her stream
+    let (_, hers) = fx.b("GET", "/api/fabric/sessions", None).await;
+    fx.no_leak("fleet", &hers);
+    let v: Value = serde_json::from_str(&hers).unwrap();
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 1, "{hers}");
+    assert!(v["sessions"][0]["quiet_until"].is_null() && !hers.contains(&until.to_string()), "{hers}");
+    let req = authed(Request::builder().method("GET").uri("/api/fabric/stream").header("host", "localhost:7513"), &fx.b_app, "GET");
+    let mut sse = Sse::open(&fx.app, req.body(Body::empty()).unwrap()).await;
+    let (event, _, fleet) = sse.next().await;
+    assert_eq!(event, "fleet");
+    assert!(fleet["sessions"][0]["quiet_until"].is_null(), "{fleet}");
+    // A lifts and sets it again (two events on A's stream): B's stream hears
+    // neither; the next thing on it is her own snooze
+    assert_eq!(fx.call(&fx.a_app, "DELETE", &a_path, None).await.0, StatusCode::OK);
+    assert_eq!(fx.call(&fx.a_app, "POST", &a_path, Some(json!({"until": until}))).await.0, StatusCode::OK);
+    let b_until = until + 60;
+    let (st, out) = fx.b("POST", &b_path, Some(json!({"until": b_until}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let (event, _, v) = sse.next().await;
+    fx.no_leak("stream event", &v.to_string());
+    assert_eq!((event.as_str(), v["runtime_id"].as_str(), v["quiet_until"].as_i64()), ("session", Some(b_rt.to_string().as_str()), Some(b_until)));
+    assert_eq!(a_quiet(), Some(until), "her snooze is on her own row");
+    assert_eq!(fx.b("DELETE", &b_path, None).await.0, StatusCode::OK);
+
+    // A's snooze silences A's session and nobody else's
+    a_fake.state(&a_secret_session("needs_you")).await.unwrap();
+    fx.until(&fx.a_app, "/api/fabric/sessions", |o| o.contains("\"needs_you\"")).await;
+    b_fake.state(&b_session("needs_you")).await.unwrap();
+    let alerts = crate::fabric::tests::alerts_when(&fx.fleet_alerts, 1).await;
+    assert_eq!(alerts.iter().map(|a| (a.user, a.address.as_str())).collect::<Vec<_>>(), [(fx.b, "aoifeown/main")]);
+
+    // a snooze is set by a person: a connector is refused (even on its own
+    // person's session), a PAT is no token on /api
+    for (method, body) in [("POST", Some(json!({"until": until}))), ("DELETE", None)] {
+        for path in [&a_path, &b_path] {
+            let (st, out) = fx.call(&fx.b_conn, method, path, body.clone()).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{method} {path}: {out}");
+            fx.no_leak(path, &out);
+            assert_eq!(fx.call(&fx.b_pat, method, path, body.clone()).await.0, StatusCode::UNAUTHORIZED, "{method} {path}");
+        }
+    }
+    assert_eq!(a_quiet(), Some(until));
+    let b_rows = fx.store.lock(Scope::User(fx.b)).fabric_sessions().unwrap();
+    assert_eq!(b_rows[0].quiet_until, None);
+    // and no MCP tool snoozes
+    for t in crate::mcp::KsMcp::tool_router().list_all() {
+        for word in ["snooze", "quiet", "fabric", "fleet"] {
             assert!(!t.name.contains(word), "MCP tool {} looks like an Agent Fabric surface", t.name);
         }
     }

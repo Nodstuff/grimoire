@@ -64,6 +64,10 @@ CREATE TABLE IF NOT EXISTS fabric_sessions (
     since            INTEGER NOT NULL,
     -- when the hub last heard this session exists
     updated_at       INTEGER NOT NULL,
+    -- snoozed by its person until this time: the hub sends no alert for it
+    -- before then. NULL = not snoozed. The person's, not the runtime's: a
+    -- runtime's report never writes it (`fabric_session_quiet` does)
+    quiet_until      INTEGER,
     PRIMARY KEY (runtime_id, id)
 );
 CREATE INDEX IF NOT EXISTS fabric_sessions_user ON fabric_sessions (user_id);

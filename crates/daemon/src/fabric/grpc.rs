@@ -480,6 +480,8 @@ fn session(m: &pb::SessionState, runtime: &FabricRuntime, now: i64) -> Result<Fa
         context_used_pct: percent("context_used_pct", m.context_used_pct)?,
         since: m.since,
         updated_at: now,
+        // the person's, never the runtime's: the hub keeps what it holds
+        quiet_until: None,
     })
 }
 

@@ -251,10 +251,12 @@ settings and stay until removed; removing one deletes its sessions.
 | `GET /api/fabric/sessions` | The fleet: runtimes (online, last seen, headroom) and sessions sorted by attention (needs_you, stalled, finished, waiting_on_peer, working, idle, asleep, exited). |
 | `GET /api/fabric/runtimes` | The enrolled runtimes alone. |
 | `GET /api/fabric/stream` | SSE: the whole fleet, then one event per change. |
+| `POST /api/fabric/sessions/{runtime_id}/{session_id}/snooze` | Body `{"until": <unix seconds>}`: no push for that session before then (§8a). Answers the session. |
+| `DELETE /api/fabric/sessions/{runtime_id}/{session_id}/snooze` | Lifts the snooze. Answers the session. |
 
-All three answer the person's own app or web session only. A fleet carries project names
+All of them answer the person's own app or web session only. A fleet carries project names
 and the last lines of terminal sessions, so a connector gets 403, as on the other human
-surfaces; a PAT never opens `/api` (401); no MCP tool reads a fleet. The stream has no
+surfaces; a PAT never opens `/api` (401); no MCP tool reads a fleet or snoozes. The stream has no
 cursor: every connection opens with the whole fleet, and a stream that falls behind is ended
 so the client reconnects for a fresh one.
 
@@ -272,6 +274,25 @@ replaces the earlier.
 The design allows a preview of the session's last line in notifications, with a per-project
 "Private notifications" switch. Neither is built in this slice: until the switch exists, the
 safer default is to send no text.
+
+### 8a. Snooze is honoured before the push is sent
+
+A person snoozes one session until a time they choose. An app cannot take back a visible
+push once APNs has it, so the hub holds it back: a snoozed session raises no alert.
+
+- `fabric_sessions.quiet_until` (unix seconds, NULL = not snoozed) is the person's own
+  setting on their own row, written only by `fabric_session_quiet` in their `Scope::User`.
+  A runtime's report never carries or changes it. Anyone else's session is `NotFound`.
+- The hub checks the time itself when a session changes state, so a snooze ends on time
+  whatever the housekeeping is doing. The flush tick lifts the mark of a snooze that has run
+  out and says so on the stream.
+- A snoozed session stays in the fleet, with its `quiet_until`. Nothing is hidden.
+- `until` must lie ahead of the server's clock and at most 7 days away (a session is history
+  after that). The app chooses the time, because "until tomorrow" is a time on the person's
+  own clock.
+
+Not built: snoozing a whole project or fabric, following a session, and quiet hours, which
+the design also names.
 
 ## Alternatives rejected
 

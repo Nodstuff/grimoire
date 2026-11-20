@@ -90,6 +90,9 @@ pub struct SessionView {
     pub context_used_pct: Option<u8>,
     pub since: i64,
     pub updated_at: i64,
+    /// Snoozed by its person until then: no alert is sent for it before
+    /// that. null = not snoozed.
+    pub quiet_until: Option<i64>,
 }
 
 impl From<&FabricSession> for SessionView {
@@ -110,6 +113,7 @@ impl From<&FabricSession> for SessionView {
             context_used_pct: s.context_used_pct,
             since: s.since,
             updated_at: s.updated_at,
+            quiet_until: s.quiet_until,
         }
     }
 }

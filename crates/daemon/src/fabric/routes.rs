@@ -21,23 +21,33 @@
 //!   that falls too far behind is ended; the client reconnects and is sent
 //!   the fleet again, so there is no cursor to resume from. A `: ping`
 //!   comment every 25s.
+//! - `POST /api/fabric/sessions/{runtime_id}/{session_id}/snooze` with
+//!   `{"until": <unix seconds>}` snoozes one session: the hub sends no
+//!   notification for it before then (a visible push cannot be taken back by
+//!   the app, so it is held back here). `until` must lie ahead, at most
+//!   [`MAX_SNOOZE`] away. `DELETE` on the same path lifts it. Both answer the
+//!   session, whole; the change is a `session` event on the stream, and so
+//!   is the snooze running out. A snoozed session stays in the fleet with
+//!   its `quiet_until`; nothing is hidden. A session that is not the
+//!   caller's is 404.
 //!
-//! Who may read: the person's own app or web session. A fleet carries
+//! Who may read or snooze: the person's own app or web session. A fleet carries
 //! project names and the last lines of terminal sessions, so a connector
 //! token is refused (403) like the other human surfaces; a personal access
-//! token never opens `/api` (401), and no MCP tool reads a fleet. Nothing
-//! here changes anything: enrolling and removing a runtime is the box CLI's
-//! (`taisce fabric runtime …`).
+//! token never opens `/api` (401), and no MCP tool reads a fleet. A snooze
+//! is the one thing these routes change, and it is the person's own
+//! setting: nothing here reaches a runtime or a session. Enrolling and
+//! removing a runtime is the box CLI's (`taisce fabric runtime …`).
 
 use super::hub::Hub;
 use super::view::{Change, FleetEvent, FleetView};
 use crate::viewer::Viewer;
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{FromRequestParts, Path, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt as _;
 use futures_util::stream::{self, Stream};
@@ -45,12 +55,16 @@ use serde_json::json;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
+use taisce_store::StoreError;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 const HEARTBEAT: Duration = Duration::from_secs(25);
 /// The reconnect delay sent once per stream (`retry:`).
 const RETRY: Duration = Duration::from_secs(3);
+/// The furthest ahead a snooze may reach: a session is history after this
+/// long anyway (`SESSION_RETENTION`).
+pub const MAX_SNOOZE: i64 = taisce_store::fabric::SESSION_RETENTION;
 
 #[derive(Clone)]
 pub struct FabricState {
@@ -82,7 +96,7 @@ impl IntoResponse for Refusal {
     fn into_response(self) -> Response {
         match self {
             Refusal::NoFleet => error(StatusCode::NOT_FOUND, "not found"),
-            Refusal::NotAPerson => crate::viewer::forbidden("a fleet is read from the Taisce app, not by a connector"),
+            Refusal::NotAPerson => crate::viewer::forbidden("a fleet is its person's, in the Taisce app: not a connector's"),
         }
     }
 }
@@ -122,6 +136,48 @@ async fn runtimes(State(st): State<FabricState>, v: Viewer, headers: HeaderMap) 
         Ok(fleet) => Json(json!({"runtimes": fleet.runtimes})).into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct SnoozeReq {
+    /// Unix seconds: no notification for the session before then.
+    until: i64,
+}
+
+/// A snooze set or lifted: the session as it now stands. One that is not
+/// the caller's does not exist.
+fn snoozed(result: Result<super::view::SessionView, StoreError>) -> Response {
+    match result {
+        Ok(session) => Json(session).into_response(),
+        Err(StoreError::NotFound(_)) => error(StatusCode::NOT_FOUND, "not found"),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn snooze(
+    State(st): State<FabricState>,
+    v: Viewer,
+    headers: HeaderMap,
+    Path((runtime, session)): Path<(Uuid, Uuid)>,
+    Json(req): Json<SnoozeReq>,
+) -> Response {
+    let (hub, user) = match gate(&st, &v, &headers) {
+        Ok(g) => g,
+        Err(r) => return r.into_response(),
+    };
+    let now = crate::auth::now();
+    if req.until <= now || req.until - now > MAX_SNOOZE {
+        return error(StatusCode::BAD_REQUEST, "until: a time ahead of now, at most 7 days away");
+    }
+    snoozed(hub.snooze(user, runtime, session, Some(req.until)).await)
+}
+
+async fn unsnooze(State(st): State<FabricState>, v: Viewer, headers: HeaderMap, Path((runtime, session)): Path<(Uuid, Uuid)>) -> Response {
+    let (hub, user) = match gate(&st, &v, &headers) {
+        Ok(g) => g,
+        Err(r) => return r.into_response(),
+    };
+    snoozed(hub.snooze(user, runtime, session, None).await)
 }
 
 fn sse(name: &str, rev: u64, data: &impl serde::Serialize) -> Event {
@@ -193,5 +249,6 @@ pub fn router(state: FabricState) -> Router {
         .route("/api/fabric/sessions", get(sessions))
         .route("/api/fabric/runtimes", get(runtimes))
         .route("/api/fabric/stream", get(fleet_events))
+        .route("/api/fabric/sessions/{runtime_id}/{session_id}/snooze", post(snooze).delete(unsnooze))
         .with_state(state)
 }
