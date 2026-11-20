@@ -1,0 +1,201 @@
+// The runtime channel: the connection between a runtime (a program that
+// hosts Claude sessions on a machine, such as Workbox on a Mac) and the hub
+// (the Taisce server). The runtime dials out and holds one stream open.
+//
+// This file is the source of truth for the wire contract; a runtime takes a
+// copy. docs/adr/0006-agent-fabric-runtime-channel.md records the server's
+// decisions.
+//
+// Slice 1 (Watch) is built: the runtime reports its sessions and the hub
+// answers with a Welcome. Field numbers a later slice will use are reserved
+// below, each with the name it will carry, so nothing is renumbered.
+//
+// Sign-in: every call carries `authorization: Bearer trt_…`, the runtime's
+// own credential. It opens this service and nothing else.
+//
+// Order of a stream:
+//   1. Up{hello}      within 10 seconds of opening the stream
+//   2. Down{welcome}
+//   3. Up{snapshot}   the first message after the Hello, always
+//   4. Up{state} / Up{accounts} / Up{heartbeat} as things happen
+//
+// Sequence numbers. Each direction numbers its EVENTS from 1, per instance,
+// never reusing a number. An event is a message the other side must not
+// miss: `state` and `accounts` going up today. Hello, Snapshot, Heartbeat
+// and Welcome are not events and carry seq 0: they describe the connection
+// or the present moment and are never replayed. After a reconnect each side
+// says the last event number it received (Hello.last_down_seq,
+// Welcome.last_up_seq) and the other replays the events after it. An event
+// whose seq is not above the last one received is a replay of something
+// already applied and is ignored.
+//
+// Limits. A message is at most 1 MiB. A runtime reports at most 200 sessions.
+// Strings are capped in bytes of UTF-8 as each field says. The hub ends the
+// stream with INVALID_ARGUMENT, naming the field, when a message breaks a
+// limit: a runtime trims its text before sending.
+//
+// How a stream ends:
+//   UNAUTHENTICATED      no credential, an unknown or a removed one
+//   INVALID_ARGUMENT     a message broke a limit or carried an unknown value
+//   FAILED_PRECONDITION  messages out of the order above
+//   DEADLINE_EXCEEDED    no Hello in time, or no message for three heartbeats
+//   ABORTED              a newer stream for the same runtime took over
+//   RESOURCE_EXHAUSTED   messages arrived faster than the hub accepts
+syntax = "proto3";
+
+package taisce.runtime.v1;
+
+service Runtime {
+  // The long-lived stream. First Up is Hello; first Down is Welcome.
+  rpc Connect(stream Up) returns (stream Down);
+
+  // Slice 4 adds `rpc Call(ToolCall) returns (ToolResult)`: one fabric tool
+  // call made by the runtime on a session's behalf. It is left out until
+  // then (adding an rpc is a compatible change, and its messages have no
+  // agreed shape yet); calling it today answers UNIMPLEMENTED.
+}
+
+message Up {
+  // The event number, or 0 for Hello, Snapshot and Heartbeat.
+  uint64 seq = 1;
+  oneof body {
+    Hello hello = 2;
+    Snapshot snapshot = 3;
+    SessionState state = 4;
+    Accounts accounts = 8;
+    Heartbeat heartbeat = 10;
+  }
+  // 5 turn (Turn: one turn finished), 6 attention (Attention: an approval
+  // or question raised or cleared, signed by the runtime), 7 result
+  // (Result: what happened to an order or a nudge), 9 pairing (Pairing: a
+  // device paired or was removed at the Mac).
+  reserved 5, 6, 7, 9;
+}
+
+message Down {
+  // The event number, or 0 for Welcome.
+  uint64 seq = 1;
+  oneof body {
+    Welcome welcome = 2;
+  }
+  // 3 order (Signed: anything that carries the owner's authority), 4 nudge
+  // (Nudge: "session X has mail", never the mail itself), 5 pairing
+  // (PairingOffer: a device's sealed public key, during pairing).
+  reserved 3, 4, 5;
+}
+
+// The first message of every stream.
+message Hello {
+  // The runtime's id, as enrolment printed it. May be empty: the credential
+  // already names the runtime. When set it must be that runtime's id.
+  string runtime_id = 1;
+  // A fresh id for each launch of the runtime (a UUID). A new instance
+  // restarts event numbering: the hub forgets the old instance's numbers
+  // instead of trusting ones that may repeat. 1–64 of [A-Za-z0-9-].
+  string instance_id = 2;
+  // The runtime's own version, for display. At most 64 bytes.
+  string version = 3;
+  // The last Down event this instance received; 0 for none.
+  uint64 last_down_seq = 4;
+}
+
+// The hub's answer to a Hello.
+message Welcome {
+  // The last Up event the hub received from this instance; 0 for a new
+  // instance, or when the hub has no record. The runtime replays the events
+  // after it.
+  uint64 last_up_seq = 1;
+  // The runtime's id, whatever the Hello said.
+  string runtime_id = 2;
+  // Send a Heartbeat this often when nothing else is being sent. The hub
+  // ends a stream that has been silent for three intervals and shows the
+  // runtime's sessions as offline.
+  uint32 heartbeat_secs = 3;
+}
+
+// Every session the runtime has, as of now. Replaces the hub's whole
+// picture of this runtime: a session the hub knows that is absent here is
+// shown as exited. At most 200 sessions.
+message Snapshot {
+  // The last Up event number the runtime had assigned when it took this
+  // snapshot. A `state` event numbered at or below it is older than the
+  // snapshot and is ignored when replayed, so it can never overwrite it.
+  uint64 replaces_seq = 1;
+  repeated SessionState sessions = 2;
+}
+
+// One session as it is now. Sent whole whenever anything in it changes.
+message SessionState {
+  // The session's identity: the terminal pane's UUID, which survives the
+  // things that change Claude's own session id. Unique within a runtime.
+  string session_id = 1;
+  // `project/worktree`, with `:2` for a second session in the same
+  // worktree. Assigned by the runtime; may be reused by a later session.
+  // 1–200 bytes.
+  string address = 2;
+  // The named group the session works in; the project when none was chosen.
+  // At most 200 bytes.
+  string fabric = 3;
+  // At most 200 bytes each.
+  string project = 4;
+  string worktree = 5;
+  string branch = 6;
+  // The Claude account the session runs on, as Accounts names it.
+  string account = 7;
+  Status state = 8;
+  // The tool running now, when working. At most 100 bytes.
+  string tool = 9;
+  // The one-line status shown on the fleet. At most 500 bytes.
+  string note = 10;
+  // The last paragraph of the session's latest reply, so the fleet can show
+  // a question without the full turn. At most 2000 bytes.
+  string last_line = 11;
+  // How full the context window is, 0–100. Unset when unknown.
+  optional uint32 context_used_pct = 12;
+  // When the session entered `state`, unix seconds.
+  int64 since = 13;
+}
+
+// What a session is doing. A runtime that is not connected has all its
+// sessions shown as offline; that is the hub's observation, not a state.
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  // A turn is running.
+  STATUS_WORKING = 1;
+  // A dialog is open, or the turn ended by asking the owner something.
+  STATUS_NEEDS_YOU = 2;
+  // The turn ended and the owner has not looked yet.
+  STATUS_FINISHED = 3;
+  // Working, with no sign of life for five minutes.
+  STATUS_STALLED = 4;
+  // Waiting for an answer from another session.
+  STATUS_WAITING_ON_PEER = 5;
+  // Seen by the owner; nothing running.
+  STATUS_IDLE = 6;
+  // Restored from an earlier launch with no process behind it yet.
+  STATUS_ASLEEP = 7;
+  // The process has gone.
+  STATUS_EXITED = 8;
+}
+
+// Headroom per Claude account, whole: replaces the previous report. At most
+// 32 accounts.
+message Accounts {
+  repeated Account accounts = 1;
+}
+
+message Account {
+  // The label SessionState.account uses. 1–200 bytes.
+  string name = 1;
+  // The share of the current usage window that is spent, 0–100. Unset when
+  // unknown.
+  optional uint32 session_used_pct = 2;
+  // When that window resets, unix seconds; 0 when unknown.
+  int64 session_resets_at = 3;
+  // The same for the weekly allowance.
+  optional uint32 week_used_pct = 4;
+  int64 week_resets_at = 5;
+}
+
+// "Still here." Sent when nothing else has been for Welcome.heartbeat_secs.
+message Heartbeat {}

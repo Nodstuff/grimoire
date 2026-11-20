@@ -1,0 +1,32 @@
+[package]
+name = "taisce-runtime-proto"
+version = "0.8.0"
+edition.workspace = true
+license.workspace = true
+description = "The runtime channel's wire contract (proto/taisce/runtime/v1), generated; and a fake runtime for tests"
+
+[features]
+# the service trait the daemon implements
+server = []
+# the client stub, and `fake`: a scripted runtime for tests and for driving a
+# scratch daemon by hand. Never part of the server build.
+client = ["tonic/channel", "dep:tokio", "dep:tokio-stream", "dep:serde", "dep:serde_json"]
+
+[dependencies]
+prost = "0.14.6"
+tonic = { version = "0.14.9", default-features = false, features = ["codegen"] }
+tonic-prost = "0.14.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"], optional = true }
+tokio-stream = { version = "0.1.19", optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[build-dependencies]
+# pure-Rust protobuf compiler: the build never needs `protoc` (the server is
+# cross-built with cargo zigbuild)
+protox = "0.10.0"
+tonic-prost-build = "0.14.9"
+
+[[example]]
+name = "fake_runtime"
+required-features = ["client"]
