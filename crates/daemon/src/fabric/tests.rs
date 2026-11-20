@@ -3,8 +3,9 @@
 //! viewer routes under `require_auth` as in SERVER mode. The two-tenant
 //! half is in `isolation_tests.rs`, which reuses the helpers here.
 
-use super::grpc::{self, RuntimeService};
-use super::hub::{Hub, SessionAlert};
+use super::grpc::{self, Pace, RuntimeService};
+use super::hub::Hub;
+use super::view::{AlertKind, Change, SessionAlert};
 use super::routes::FabricState;
 use crate::auth::{AuthConfig, AuthState, now, require_auth};
 use axum::Router;
@@ -24,11 +25,11 @@ use uuid::Uuid;
 const BASE: &str = "http://localhost:7513";
 
 /// Serve the runtime channel for `hub` on a free loopback port; its URL.
-pub(crate) async fn serve_channel(store: &SharedStore, hub: &Hub, heartbeat: Duration) -> String {
+pub(crate) async fn serve_channel(store: &SharedStore, hub: &Hub, pace: Pace) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let service =
-        RuntimeService { hub: hub.clone(), store: store.clone(), limiter: Default::default(), trusted_proxy: false, heartbeat };
+        RuntimeService { hub: hub.clone(), store: store.clone(), limiter: Default::default(), trusted_proxy: false, pace };
     tokio::spawn(async move {
         grpc::serve(listener, service, std::future::pending()).await.unwrap();
     });
@@ -103,7 +104,7 @@ struct T {
     url: String,
 }
 
-async fn setup_with(heartbeat: Duration) -> T {
+async fn setup_with(pace: Pace) -> T {
     let mut raw = SqliteStore::open_in_memory().unwrap();
     let human = raw.create_principal(PrincipalKind::Human, "Tom", None).unwrap().id;
     let user = raw.auth_ensure_owner(human, "Tom", now()).unwrap().id;
@@ -113,12 +114,12 @@ async fn setup_with(heartbeat: Duration) -> T {
     let st = AuthState::new(AuthConfig::from_public_url(BASE).unwrap(), store.clone()).unwrap();
     let app = super::router(FabricState { hub: Some(hub.clone()), local_human: human })
         .layer(axum::middleware::from_fn_with_state(st, require_auth));
-    let url = serve_channel(&store, &hub, heartbeat).await;
+    let url = serve_channel(&store, &hub, pace).await;
     T { app, store, hub, user, token, alerts, url }
 }
 
 async fn setup() -> T {
-    setup_with(grpc::HEARTBEAT).await
+    setup_with(Pace::default()).await
 }
 
 impl T {
@@ -228,7 +229,7 @@ async fn a_runtime_reports_its_sessions_and_the_viewer_watches_them() {
     // announced once, by address and state; and already in SQLite
     let alerts = alerts_when(&t.alerts, 1).await;
     assert_eq!(alerts.len(), 1);
-    assert_eq!((alerts[0].user, alerts[0].session_id.to_string().as_str(), alerts[0].address.as_str(), alerts[0].state), (t.user, S1, "taisce/main", SessionStatus::NeedsYou));
+    assert_eq!((alerts[0].user, alerts[0].session_id.to_string().as_str(), alerts[0].address.as_str(), alerts[0].kind), (t.user, S1, "taisce/main", AlertKind::NeedsYou));
     assert_eq!(t.stored(S1).state, SessionStatus::NeedsYou);
 
     // a change that is not a change of state reaches the stream at once and
@@ -243,7 +244,7 @@ async fn a_runtime_reports_its_sessions_and_the_viewer_watches_them() {
     // the other finishes its turn: announced too
     fake.state(&session(S2, "workbox/main", "finished")).await.unwrap();
     assert_eq!(sse.next().await.2["state"], "finished");
-    assert_eq!(alerts_when(&t.alerts, 2).await.iter().map(|a| a.state).collect::<Vec<_>>(), [SessionStatus::NeedsYou, SessionStatus::Finished]);
+    assert_eq!(alerts_when(&t.alerts, 2).await.iter().map(|a| a.kind).collect::<Vec<_>>(), [AlertKind::NeedsYou, AlertKind::Finished]);
 
     // the Mac sleeps: the stream ends, the runtime is offline, the fleet stays
     let sent = fake.seq();
@@ -272,7 +273,7 @@ async fn a_runtime_reports_its_sessions_and_the_viewer_watches_them() {
         body: Some(pb::up::Body::State(pb::SessionState {
             session_id: S1.into(),
             address: "taisce/main".into(),
-            state: pb::Status::Working as i32,
+            state: pb::SessionStatus::Working as i32,
             since: 1,
             ..Default::default()
         })),
@@ -320,13 +321,13 @@ async fn the_channel_takes_only_a_runtime_credential_and_the_credential_opens_on
     unauthenticated(Fake::connect(&t.url, &credential, "launch-1", 0).await.map(|_| ()));
 }
 
-/// More than 200 small updates sent as fast as the runtime can: the send
+/// 500 small updates sent as fast as the runtime can: the send
 /// window holds (never more than 64 unacknowledged), the hub acknowledges
 /// them all, and every one of them arrives, in order.
 #[tokio::test]
 async fn a_burst_of_small_updates_flows_through_the_window_and_nothing_is_lost() {
-    use taisce_runtime_proto::window::{ACK_EVERY, WINDOW};
-    const UPDATES: u64 = 300;
+    use taisce_runtime_proto::window::{ACK_EVERY, ACK_WITHIN, WINDOW};
+    const UPDATES: u64 = 500;
     let t = setup().await;
     let (runtime, credential) = t.enrol("mbp");
     let (_, mut changes) = t.hub.watch(t.user).await.unwrap();
@@ -345,7 +346,7 @@ async fn a_burst_of_small_updates_flows_through_the_window_and_nothing_is_lost()
     // every update was published once, in the order sent
     let mut notes = vec![];
     while let Ok(e) = changes.try_recv() {
-        if let super::hub::Change::Session(s) = &e.change
+        if let Change::Session(s) = &e.change
             && !s.note.is_empty()
         {
             notes.push(s.note.clone());
@@ -356,24 +357,187 @@ async fn a_burst_of_small_updates_flows_through_the_window_and_nothing_is_lost()
     let fleet = t.get("/api/fabric/sessions").await;
     let mut held: Vec<&str> = fleet["sessions"].as_array().unwrap().iter().map(|s| s["note"].as_str().unwrap()).collect();
     held.sort();
-    assert_eq!(held, ["update 298", "update 299", "update 300"]);
+    assert_eq!(held, ["update 498", "update 499", "update 500"]);
     t.hub.flush().await;
-    assert_eq!(t.store.lock(Scope::System).fabric_runtime(runtime).unwrap().last_up_seq, UPDATES);
-    assert_eq!(t.stored(ids[0]).note, "update 300");
+    assert_eq!(t.stored(ids[2]).note, "update 500");
 
-    // the stream drops mid-burst and the runtime resumes: the Welcome says
-    // where the hub got to, the snapshot restores the rest
+    // the stream drops and the runtime resumes: the Welcome says where the
+    // hub got to (stored when the stream ended), the snapshot restores the rest
     fake.disconnect();
+    let mut tries = 0;
+    while t.store.lock(Scope::System).fabric_runtime(runtime).unwrap().last_up_seq != UPDATES {
+        tries += 1;
+        assert!(tries < 500, "the last event number is stored when the stream ends");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let mut fake = Fake::connect(&t.url, &credential, "launch-1", UPDATES).await.unwrap();
     assert_eq!(fake.welcome.last_up_seq, UPDATES);
     let mut s = session(ids[0], "p/w", "working");
     s.note = "after the gap".into();
     fake.snapshot(&[s.clone(), session(ids[1], "p/w", "working"), session(ids[2], "p/w", "working")]).await.unwrap();
-    // a lone event is acknowledged within the quarter second, not after sixteen
-    s.note = "one more".into();
-    fake.state(&s).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), fake.drained()).await.expect("an ack within 250 ms").unwrap();
-    assert_eq!(fake.acked(), UPDATES + 1);
+    // a slow trickle: each lone event is acknowledged within the coalescing
+    // bound (250 ms, and scheduling), not held for fifteen more
+    for i in 1..=3 {
+        s.note = format!("trickle {i}");
+        fake.state(&s).await.unwrap();
+        let sent = std::time::Instant::now();
+        fake.drained().await.unwrap();
+        let took = sent.elapsed();
+        assert!(took < ACK_WITHIN + Duration::from_millis(500), "acknowledged after {took:?}");
+        assert_eq!(fake.acked(), UPDATES + i);
+    }
+}
+
+/// A hub that sends its Welcome and then never acknowledges anything: the
+/// stand-in for a stalled proxy or a broken hub.
+#[derive(Clone)]
+struct MuteHub;
+
+#[tonic::async_trait]
+impl taisce_runtime_proto::v1::runtime_server::Runtime for MuteHub {
+    type AttachStream = tokio_stream::wrappers::ReceiverStream<Result<pb::Down, tonic::Status>>;
+
+    async fn attach(&self, req: tonic::Request<tonic::Streaming<pb::Up>>) -> Result<tonic::Response<Self::AttachStream>, tonic::Status> {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut inbound = req.into_inner();
+        tokio::spawn(async move {
+            let welcome = pb::Welcome { last_up_seq: 0, runtime_id: Uuid::nil().to_string(), heartbeat_secs: 20 };
+            let _ = tx.send(Ok(pb::Down { seq: 0, body: Some(pb::down::Body::Welcome(welcome)) })).await;
+            // read everything, acknowledge nothing
+            while let Ok(Some(_)) = inbound.message().await {}
+        });
+        Ok(tonic::Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+}
+
+/// The window is the sender's to keep: against a hub that stops
+/// acknowledging, the runtime stalls at 64 events in flight instead of
+/// running on into the proxy's frame budget.
+#[tokio::test]
+async fn a_hub_that_stops_acknowledging_stalls_the_runtime_at_the_window() {
+    use taisce_runtime_proto::window::WINDOW;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(taisce_runtime_proto::v1::runtime_server::RuntimeServer::new(MuteHub))
+            .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener))
+            .await
+            .unwrap();
+    });
+    let mut fake = Fake::connect(&url, "trt_anything", "launch-1", 0).await.unwrap();
+    fake.snapshot(&[session(S1, "p/w", "working")]).await.unwrap();
+    let flood = async {
+        for i in 0..200 {
+            let mut s = session(S1, "p/w", "working");
+            s.note = format!("update {i}");
+            fake.state(&s).await.unwrap();
+        }
+    };
+    assert!(tokio::time::timeout(Duration::from_millis(700), flood).await.is_err(), "200 events went out with no ack");
+    assert_eq!((fake.seq(), fake.peak_in_flight(), fake.acked()), (WINDOW as u64, WINDOW, 0), "stalled exactly at the window");
+    // messages outside the window still go: a stalled runtime can still say it is alive
+    fake.heartbeat().await.unwrap();
+}
+
+/// THE BLOCKER'S TEST. Production's silence deadline (60 s) is not shorter
+/// than its recheck (60 s), so a deadline that any wake-up of the loop
+/// re-armed never fired: a Mac that slept without closing its connection
+/// stayed online for ever. Here the recheck ticks four times inside one
+/// silence deadline; the stream must still be ended.
+#[tokio::test]
+async fn silence_ends_a_stream_however_often_the_loop_wakes_for_something_else() {
+    let pace = Pace { heartbeat: Duration::from_millis(200), recheck: Duration::from_millis(150) };
+    let t = setup_with(pace).await;
+    let (_, credential) = t.enrol("mbp");
+    let mut fake = Fake::connect(&t.url, &credential, "launch-1", 0).await.unwrap();
+    fake.snapshot(&[session(S1, "taisce/main", "working")]).await.unwrap();
+    // one event, so the ack timer wakes the loop too (250 ms in)
+    fake.state(&session(S1, "taisce/main", "needs_you")).await.unwrap();
+    let started = std::time::Instant::now();
+    let ended = tokio::time::timeout(Duration::from_secs(5), fake.ended()).await.expect("the stream ends");
+    assert_eq!(ended.map(|s| s.code()), Some(tonic::Code::DeadlineExceeded));
+    let after = started.elapsed();
+    assert!(after >= Duration::from_millis(500) && after < Duration::from_millis(2000), "ended after {after:?}, not after 600 ms of silence");
+    let fleet = t.get("/api/fabric/sessions").await;
+    assert_eq!(fleet["runtimes"][0]["online"], false);
+}
+
+/// What a runtime must be able to tell apart: a stream that ends with a
+/// reason is not a clean close.
+#[tokio::test]
+async fn a_broken_message_ends_the_stream_with_a_status_never_a_clean_close() {
+    let t = setup().await;
+    let (runtime, credential) = t.enrol("mbp");
+    // over 1 MiB: tonic refuses to decode it; the runtime is told why
+    let mut fake = Fake::connect(&t.url, &credential, "launch-1", 0).await.unwrap();
+    fake.snapshot(&[]).await.unwrap();
+    let huge = pb::Up {
+        seq: 1,
+        body: Some(pb::up::Body::State(pb::SessionState {
+            session_id: S1.into(),
+            address: "taisce/main".into(),
+            last_line: "x".repeat(grpc::MAX_MESSAGE_BYTES + 1),
+            state: pb::SessionStatus::Working as i32,
+            since: 1,
+            ..Default::default()
+        })),
+    };
+    fake.send(huge).await.unwrap();
+    let ended = fake.ended().await.expect("a status, not a clean end");
+    assert_eq!(ended.code(), tonic::Code::InvalidArgument, "{ended:?}");
+    assert!(ended.message().contains("1048576"), "{}", ended.message());
+    // the same as the very first message
+    let (tx, mut down) = Fake::open(&t.url, Some(&credential)).await.unwrap();
+    tx.send(pb::Up {
+        seq: 0,
+        body: Some(pb::up::Body::Hello(pb::Hello { version: "v".repeat(grpc::MAX_MESSAGE_BYTES + 1), ..Default::default() })),
+    })
+    .await
+    .unwrap();
+    assert_eq!(down.message().await.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // a Hello naming this runtime in capitals, as Swift prints a UUID, is this runtime
+    let (tx, mut down) = Fake::open(&t.url, Some(&credential)).await.unwrap();
+    let hello = pb::Hello { runtime_id: runtime.to_string().to_uppercase(), instance_id: "launch-2".into(), version: "1".into(), last_down_seq: 0 };
+    tx.send(pb::Up { seq: 0, body: Some(pb::up::Body::Hello(hello)) }).await.unwrap();
+    assert!(matches!(down.message().await.unwrap().unwrap().body, Some(pb::down::Body::Welcome(_))));
+    drop(tx);
+
+    // a state the hub has no name for is shown as unknown, on every
+    // reconnect, and is never fatal
+    let mut fake = Fake::connect(&t.url, &credential, "launch-3", 0).await.unwrap();
+    let odd = |seq| pb::Up {
+        seq,
+        body: Some(pb::up::Body::State(pb::SessionState {
+            session_id: S2.into(),
+            address: "taisce/odd".into(),
+            state: 42,
+            since: 1,
+            ..Default::default()
+        })),
+    };
+    let snapshot = pb::Snapshot { replaces_seq: 0, sessions: vec![match odd(0).body { Some(pb::up::Body::State(s)) => s, _ => unreachable!() }] };
+    fake.send(pb::Up { seq: 0, body: Some(pb::up::Body::Snapshot(snapshot)) }).await.unwrap();
+    fake.heartbeat().await.unwrap();
+    let mut fleet = t.get("/api/fabric/sessions").await;
+    for _ in 0..500 {
+        if !fleet["sessions"].as_array().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        fleet = t.get("/api/fabric/sessions").await;
+    }
+    assert_eq!(fleet["sessions"][0]["state"], "unknown");
+    assert!(t.alerts.lock().unwrap().is_empty());
+
+    // messages outside the window are counted: a flood of them ends the stream
+    for _ in 0..40 {
+        if fake.heartbeat().await.is_err() {
+            break;
+        }
+    }
+    assert_eq!(fake.ended().await.map(|s| s.code()), Some(tonic::Code::ResourceExhausted));
 }
 
 /// The contract is enforced: order, limits, one live stream, liveness.
@@ -386,7 +550,7 @@ async fn a_stream_that_breaks_the_contract_is_ended_with_the_reason() {
         body: Some(pb::up::Body::State(pb::SessionState {
             session_id: id.into(),
             address: address.into(),
-            state: pb::Status::Working as i32,
+            state: pb::SessionStatus::Working as i32,
             since: 1,
             ..Default::default()
         })),
@@ -430,15 +594,8 @@ async fn a_stream_that_breaks_the_contract_is_ended_with_the_reason() {
     let ended = fake.ended().await.unwrap();
     assert_eq!(ended.code(), tonic::Code::InvalidArgument);
     assert!(ended.message().starts_with("address"), "{}", ended.message());
-    // an event without a number; a session id that is not a UUID; an
-    // unknown state
-    for bad in [state(0, S1, "taisce/main"), state(1, "pane-1", "taisce/main"), {
-        let mut up = state(1, S1, "taisce/main");
-        if let Some(pb::up::Body::State(s)) = &mut up.body {
-            s.state = 42;
-        }
-        up
-    }] {
+    // an event without a number; a session id that is not a UUID
+    for bad in [state(0, S1, "taisce/main"), state(1, "pane-1", "taisce/main")] {
         let mut fake = Fake::connect(&t.url, &credential, "launch-1", 0).await.unwrap();
         fake.snapshot(&[]).await.unwrap();
         fake.send(bad).await.unwrap();
@@ -467,7 +624,7 @@ async fn a_stream_that_breaks_the_contract_is_ended_with_the_reason() {
 /// heartbeats; one that keeps saying "still here" stays online.
 #[tokio::test]
 async fn a_silent_stream_goes_offline_and_a_heartbeat_keeps_it() {
-    let t = setup_with(Duration::from_millis(100)).await;
+    let t = setup_with(Pace { heartbeat: Duration::from_millis(100), ..Pace::default() }).await;
     let (_, credential) = t.enrol("mbp");
     let mut fake = Fake::connect(&t.url, &credential, "launch-1", 0).await.unwrap();
     assert_eq!(fake.welcome.heartbeat_secs, 1, "never told to beat every 0 seconds");
@@ -526,6 +683,6 @@ async fn the_demo_script_plays_against_the_real_channel() {
         fleet["sessions"].as_array().unwrap().iter().map(|s| (s["address"].as_str().unwrap(), s["state"].as_str().unwrap())).collect();
     assert_eq!(states, [("taisce/main", "needs_you"), ("workbox/main", "finished"), ("qompass/mcp-dx", "asleep")]);
     assert_eq!((fleet["runtimes"][0]["online"].as_bool(), fleet["runtimes"][0]["accounts"].as_array().unwrap().len()), (Some(true), 2));
-    assert_eq!(alerts_when(&t.alerts, 2).await.iter().map(|a| a.state).collect::<Vec<_>>(), [SessionStatus::NeedsYou, SessionStatus::Finished]);
+    assert_eq!(alerts_when(&t.alerts, 2).await.iter().map(|a| a.kind).collect::<Vec<_>>(), [AlertKind::NeedsYou, AlertKind::Finished]);
     assert_eq!(events, 4, "one headroom report and three changes");
 }

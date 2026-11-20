@@ -1188,7 +1188,7 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                     Arc::new(move |a: fabric::SessionAlert| {
                         let (store, sender) = (store.clone(), sender.clone());
                         tokio::spawn(push::notify_user(store, sender, a.user, fabric::alert_push(&a)));
-                    }) as fabric::hub::Alerter
+                    }) as fabric::Alerter
                 });
                 fabric::Hub::new(store.clone(), alerter)
             });
@@ -1207,16 +1207,14 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                         store: store.clone(),
                         limiter: st.limiter.clone(),
                         trusted_proxy: st.cfg.trusted_proxy,
-                        heartbeat: fabric::grpc::HEARTBEAT,
+                        pace: fabric::grpc::Pace::default(),
                     };
                     tracing::info!("Agent Fabric: runtime channel (gRPC, h2c) at http://{grpc_addr}");
-                    // no drain of its own: the process ends when the HTTP
-                    // server below has shut down, and the hub is closed there
-                    tokio::spawn(async move {
-                        if let Err(e) = fabric::grpc::serve(grpc_listener, service, std::future::pending()).await {
-                            tracing::error!("the runtime channel stopped: {e}");
-                        }
-                    });
+                    // supervised like every other long-lived task: a server
+                    // that stops is started again on the same socket. It has
+                    // no drain of its own: the hub is closed at shutdown, below
+                    let grpc_listener = Arc::new(grpc_listener.into_std().context("the runtime channel's listener")?);
+                    supervise("fabric.grpc", move || fabric::grpc::serve_supervised(grpc_listener.clone(), service.clone()));
                 }
                 (Some(_), _, _) => tracing::warn!("--runtime-grpc-port set but this is LOCAL mode: Agent Fabric needs --public-url"),
                 (None, _, _) => {}
@@ -1275,13 +1273,16 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                     // children first: a slow connection drain must never
                     // leave a `claude -p` running past the daemon
                     children::kill_all().await;
+                    // Agent Fabric: what the hub had not written yet, and
+                    // when each connected runtime was last seen. Here, not
+                    // after `serve` returns: the drain waits for every open
+                    // connection, and a client holding an SSE stream open
+                    // can outlast the service manager's patience
+                    if let Some(hub) = hub {
+                        hub.close(auth::now()).await;
+                    }
                 })
                 .await?;
-            // what the hub had not written yet, and when each connected
-            // runtime was last seen
-            if let Some(hub) = hub {
-                hub.close(auth::now()).await;
-            }
         }
     }
     Ok(())

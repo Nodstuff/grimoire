@@ -3569,7 +3569,7 @@ async fn a_fleet_is_its_owners_alone() {
     use crate::fabric::tests::{Sse, serve_channel};
     use taisce_runtime_proto::fake::{Fake, ScriptAccount, ScriptSession};
     let fx = fixture();
-    let url = serve_channel(&fx.store, &fx.hub, crate::fabric::grpc::HEARTBEAT).await;
+    let url = serve_channel(&fx.store, &fx.hub, Default::default()).await;
     // A's Mac reports a session that needs her, on an account named for a secret
     let (a_rt, a_cred) = fx.enrol_runtime(fx.a, "zebrasecret-mac");
     let mut a_fake = Fake::connect(&url, &a_cred, "launch-a", 0).await.unwrap();
@@ -3662,7 +3662,7 @@ async fn a_runtime_credential_writes_only_its_owners_fleet() {
     use taisce_runtime_proto::fake::{Fake, ScriptSession};
     use taisce_runtime_proto::v1 as pb;
     let fx = fixture();
-    let url = serve_channel(&fx.store, &fx.hub, crate::fabric::grpc::HEARTBEAT).await;
+    let url = serve_channel(&fx.store, &fx.hub, Default::default()).await;
     let (a_rt, a_cred) = fx.enrol_runtime(fx.a, "mbp");
     let mut a_fake = Fake::connect(&url, &a_cred, "launch-a", 0).await.unwrap();
     a_fake.snapshot(&[a_secret_session("working")]).await.unwrap();

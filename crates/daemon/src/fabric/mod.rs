@@ -20,15 +20,19 @@
 
 pub mod grpc;
 pub mod hub;
+#[cfg(test)]
+mod hub_tests;
 pub mod routes;
 #[cfg(test)]
 pub(crate) mod tests;
+pub mod view;
 
 use crate::auth::AUDIT;
 use taisce_store::SqliteStore;
 use taisce_store::fabric::FabricRuntime;
 
-pub use hub::{Hub, SessionAlert};
+pub use hub::Hub;
+pub use view::{AlertKind, Alerter, SessionAlert};
 pub use routes::{FabricState, router};
 pub use taisce_runtime_proto::CREDENTIAL_PREFIX;
 
@@ -82,9 +86,7 @@ pub fn revoke_runtime(store: &mut SqliteStore, key: &str, user: Option<&str>, no
     let [hit] = hits.as_slice() else {
         anyhow::bail!("no single live runtime matches {key:?} (give --user, or more of the id)");
     };
-    let r = store
-        .fabric_runtime_revoke(&hit.id.to_string(), now)?
-        .ok_or_else(|| anyhow::anyhow!("runtime {} is already removed", hit.id))?;
+    let r = store.fabric_runtime_revoke(hit.id, now)?;
     tracing::info!(target: AUDIT, event = "runtime.revoke", runtime = %r.id, name = r.name, user = %r.user_id);
     Ok(r)
 }
@@ -107,10 +109,5 @@ pub fn runtime_lines(store: &SqliteStore) -> anyhow::Result<Vec<String>> {
 /// What a session alert says on a lock screen: which session, and what it
 /// came to. Never the session's text (a last line can quote a file).
 pub fn alert_push(a: &SessionAlert) -> crate::push::Push {
-    crate::push::Push::FabricSession {
-        address: a.address.clone(),
-        state: a.state.as_str(),
-        session_id: a.session_id,
-        runtime_id: a.runtime_id,
-    }
+    crate::push::Push::FabricSession { address: a.address.clone(), kind: a.kind, session_id: a.session_id, runtime_id: a.runtime_id }
 }

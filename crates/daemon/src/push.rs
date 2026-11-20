@@ -199,17 +199,7 @@ pub enum Push {
     /// collapse id). Says which session and what it came to, never the
     /// session's text. The app routes a tap on `kind: fabric_session` to
     /// that session.
-    FabricSession { address: String, state: &'static str, session_id: uuid::Uuid, runtime_id: uuid::Uuid },
-}
-
-/// What a session's state reads as in a notification.
-fn fabric_state_words(state: &str) -> &'static str {
-    match state {
-        "needs_you" => "Needs you",
-        "stalled" => "Stalled",
-        "finished" => "Finished",
-        _ => "Changed",
-    }
+    FabricSession { address: String, kind: crate::fabric::AlertKind, session_id: uuid::Uuid, runtime_id: uuid::Uuid },
 }
 
 impl Push {
@@ -227,16 +217,16 @@ impl Push {
                 "share_id": share_id,
             })
             .to_string(),
-            Push::FabricSession { address, state, session_id, runtime_id } => json!({
+            Push::FabricSession { address, kind, session_id, runtime_id } => json!({
                 "aps": {
-                    "alert": {"title": address, "body": fabric_state_words(state)},
+                    "alert": {"title": address, "body": kind.words()},
                     "sound": "default",
                     "thread-id": format!("fabric:{session_id}"),
                 },
                 "kind": "fabric_session",
                 "session_id": session_id,
                 "runtime_id": runtime_id,
-                "state": state,
+                "state": kind,
             })
             .to_string(),
         }
@@ -859,8 +849,9 @@ mod tests {
     #[test]
     fn a_session_alert_is_one_notification_per_session() {
         let (session, runtime) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
-        let push = |state| Push::FabricSession { address: "taisce/main".into(), state, session_id: session, runtime_id: runtime };
-        let p = push("needs_you");
+        use crate::fabric::AlertKind;
+        let push = |kind| Push::FabricSession { address: "taisce/main".into(), kind, session_id: session, runtime_id: runtime };
+        let p = push(AlertKind::NeedsYou);
         let v: serde_json::Value = serde_json::from_str(&p.payload()).unwrap();
         assert_eq!(v["aps"]["alert"], json!({"title": "taisce/main", "body": "Needs you"}));
         assert_eq!(v["aps"]["sound"], "default");
@@ -875,11 +866,11 @@ mod tests {
         assert!(collapse.len() <= 64, "APNs caps the collapse id at 64 bytes");
         assert_eq!((p.push_type(), p.priority()), ("alert", "10"));
         // the same session's next alert carries the same ids
-        let later = push("finished");
+        let later = push(AlertKind::Finished);
         assert_eq!(later.collapse_id(), p.collapse_id());
         let v: serde_json::Value = serde_json::from_str(&later.payload()).unwrap();
         assert_eq!(v["aps"]["alert"]["body"], "Finished");
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&push("stalled").payload()).unwrap()["aps"]["alert"]["body"], "Stalled");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&push(AlertKind::Stalled).payload()).unwrap()["aps"]["alert"]["body"], "Stalled");
     }
 
     #[tokio::test]

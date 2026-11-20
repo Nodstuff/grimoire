@@ -21,9 +21,11 @@ listeners:
       # in the list does not matter.
       # - Set NO timeout: one deadline would cover the whole stream and cut it.
       # - max_request_body_bytes MUST be set, to the largest value (u64::MAX).
-      #   Unset (or 0) means portus's default of 10 MiB, counted over ALL the
-      #   bytes a client sends on one stream: a long-lived stream would be
-      #   killed with an HTTP/2 error (not a 413) once it had sent that much.
+      #   Portus counts a stream's total client-to-server bytes against this
+      #   limit for the life of the stream, and kills it with an HTTP/2 error
+      #   (not a 413) at the limit. Unset or 0 means the default of 10 MiB;
+      #   there is no "unlimited" value, and a large finite one only moves
+      #   the cliff. The real bound is the daemon's own 1 MiB per message.
       - hosts: [taisce.null.ie]
         paths: [{ path: /taisce.runtime.v1.Runtime/, type: Prefix }]
         protocol: GRPC

@@ -3,8 +3,9 @@
 //!
 //! - `GET /api/fabric/sessions` → `{rev, runtimes: [..], sessions: [..]}`:
 //!   the caller's fleet. Sessions are sorted by how much each needs its
-//!   person (needs_you, stalled, finished, waiting_on_peer, working, idle,
-//!   asleep, exited), the most recent change first within a state. Each
+//!   person (needs_you, stalled, finished, waiting_on_peer, working,
+//!   unknown, idle, asleep, exited; `unknown` is a state a newer runtime
+//!   reports that this server has no name for), the most recent change first within a state. Each
 //!   runtime says whether it is `online` (its stream is up now), when it
 //!   was last seen and its accounts' headroom; a session of a runtime that
 //!   is not online is shown as offline by the client.
@@ -14,7 +15,8 @@
 //!   3000` and one `fleet` event (the same body as the sessions route), then
 //!   one event per change: `session` (the session, whole), `session_gone`
 //!   `{runtime_id, id}`, `runtime` (the runtime, whole) and `runtime_gone`
-//!   `{id}`. Each event's `id:` is the fleet's `rev` after it (a counter
+//!   `{id}` (the runtime was removed, and every session of it with it: no
+//!   `session_gone` follows for each). Each event's `id:` is the fleet's `rev` after it (a counter
 //!   that starts again when the daemon does). A stream
 //!   that falls too far behind is ended; the client reconnects and is sent
 //!   the fleet again, so there is no cursor to resume from. A `: ping`
@@ -27,7 +29,8 @@
 //! here changes anything: enrolling and removing a runtime is the box CLI's
 //! (`taisce fabric runtime …`).
 
-use super::hub::{Change, FleetEvent, FleetView, Hub};
+use super::hub::Hub;
+use super::view::{Change, FleetEvent, FleetView};
 use crate::viewer::Viewer;
 use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
@@ -139,19 +142,18 @@ fn change_event(e: &FleetEvent) -> Event {
 }
 
 struct Watcher {
-    user: Uuid,
     /// The fleet's rev as the stream last told it.
     rev: u64,
+    /// This person's own channel (`Hub::watch`): nothing to filter.
     rx: broadcast::Receiver<Arc<FleetEvent>>,
 }
 
-/// The next change to this person's fleet. The channel carries everyone's:
-/// only `user`'s events pass. Ends when the stream fell behind (the client
-/// reconnects for a fresh fleet) or the hub is gone.
+/// The next change to the fleet. Ends when the stream fell behind (the
+/// client reconnects for a fresh fleet) or the hub is gone.
 async fn next_change(mut w: Watcher) -> Option<(Result<Event, Infallible>, Watcher)> {
     loop {
         match w.rx.recv().await {
-            Ok(e) if e.user == w.user && e.rev > w.rev => {
+            Ok(e) if e.rev > w.rev => {
                 w.rev = e.rev;
                 return Some((Ok(change_event(&e)), w));
             }
@@ -162,11 +164,10 @@ async fn next_change(mut w: Watcher) -> Option<(Result<Event, Infallible>, Watch
 }
 
 fn fleet_stream(
-    user: Uuid,
     fleet: FleetView,
     rx: broadcast::Receiver<Arc<FleetEvent>>,
 ) -> impl Stream<Item = Result<Event, Infallible>> + use<> {
-    let watcher = Watcher { user, rev: fleet.rev, rx };
+    let watcher = Watcher { rev: fleet.rev, rx };
     stream::once(async { Ok(Event::default().retry(RETRY)) })
         .chain(stream::once(async move { Ok(sse("fleet", fleet.rev, &fleet)) }))
         .chain(stream::unfold(watcher, next_change))
@@ -181,7 +182,7 @@ async fn fleet_events(State(st): State<FabricState>, v: Viewer, headers: HeaderM
     // empty stream
     match hub.watch(user).await {
         Ok((fleet, rx)) => {
-            Sse::new(fleet_stream(user, fleet, rx)).keep_alive(KeepAlive::new().interval(HEARTBEAT).text("ping")).into_response()
+            Sse::new(fleet_stream(fleet, rx)).keep_alive(KeepAlive::new().interval(HEARTBEAT).text("ping")).into_response()
         }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
     }

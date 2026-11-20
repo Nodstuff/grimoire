@@ -17,33 +17,29 @@ pub mod v1 {
 /// token (`tbu_`) or an OAuth token.
 pub const CREDENTIAL_PREFIX: &str = "trt_";
 
-/// The fully qualified service name, as the proxy routes it
-/// (`/taisce.runtime.v1.Runtime/`).
-pub const SERVICE: &str = "taisce.runtime.v1.Runtime";
-
 #[cfg(feature = "client")]
 pub mod fake;
 pub mod window;
 
-impl v1::Status {
+impl v1::SessionStatus {
     /// The state's name on the HTTP side and in scripts: `needs_you`.
-    /// None for `STATUS_UNSPECIFIED`.
+    /// None for `SESSION_STATUS_UNSPECIFIED`.
     pub fn name(self) -> Option<&'static str> {
         Some(match self {
-            v1::Status::Unspecified => return None,
-            v1::Status::Working => "working",
-            v1::Status::NeedsYou => "needs_you",
-            v1::Status::Finished => "finished",
-            v1::Status::Stalled => "stalled",
-            v1::Status::WaitingOnPeer => "waiting_on_peer",
-            v1::Status::Idle => "idle",
-            v1::Status::Asleep => "asleep",
-            v1::Status::Exited => "exited",
+            v1::SessionStatus::Unspecified => return None,
+            v1::SessionStatus::Working => "working",
+            v1::SessionStatus::NeedsYou => "needs_you",
+            v1::SessionStatus::Finished => "finished",
+            v1::SessionStatus::Stalled => "stalled",
+            v1::SessionStatus::WaitingOnPeer => "waiting_on_peer",
+            v1::SessionStatus::Idle => "idle",
+            v1::SessionStatus::Asleep => "asleep",
+            v1::SessionStatus::Exited => "exited",
         })
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
-        (1..=8).filter_map(|n| v1::Status::try_from(n).ok()).find(|s| s.name() == Some(name))
+        (1..=8).filter_map(|n| v1::SessionStatus::try_from(n).ok()).find(|s| s.name() == Some(name))
     }
 }
 
@@ -54,14 +50,14 @@ mod tests {
     #[test]
     fn status_names_round_trip_and_match_the_proto() {
         for n in 1..=8 {
-            let s = v1::Status::try_from(n).expect("eight states");
+            let s = v1::SessionStatus::try_from(n).expect("eight states");
             let name = s.name().unwrap();
-            assert_eq!(v1::Status::from_name(name), Some(s));
-            assert_eq!(s.as_str_name(), format!("STATUS_{}", name.to_ascii_uppercase()));
+            assert_eq!(v1::SessionStatus::from_name(name), Some(s));
+            assert_eq!(s.as_str_name(), format!("SESSION_STATUS_{}", name.to_ascii_uppercase()));
         }
-        assert!(v1::Status::try_from(9).is_err(), "a ninth state needs a name here");
-        assert_eq!(v1::Status::Unspecified.name(), None);
-        assert_eq!(v1::Status::from_name("offline"), None);
+        assert!(v1::SessionStatus::try_from(9).is_err(), "a ninth state needs a name here");
+        assert_eq!(v1::SessionStatus::Unspecified.name(), None);
+        assert_eq!(v1::SessionStatus::from_name("offline"), None);
     }
 
     /// The numbers later slices will use stay free: a message that carries

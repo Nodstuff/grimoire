@@ -7,73 +7,96 @@
 // decisions.
 //
 // Slice 1 (Watch) is built: the runtime reports its sessions and the hub
-// answers with a Welcome. Field numbers a later slice will use are reserved
-// below, each with the name it will carry, so nothing is renumbered.
+// answers with a Welcome and acknowledgements. Field numbers a later slice
+// will use are reserved below, each with the name it will carry, so nothing
+// is renumbered.
 //
-// Sign-in: every call carries `authorization: Bearer trt_…`, the runtime's
+// SIGN-IN. Every call carries `authorization: Bearer trt_…`, the runtime's
 // own credential. It opens this service and nothing else.
 //
-// Order of a stream:
+// ORDER OF A STREAM.
 //   1. Up{hello}      within 10 seconds of opening the stream
 //   2. Down{welcome}
 //   3. Up{snapshot}   the first message after the Hello, always
-//   4. Up{state} / Up{accounts} / Up{heartbeat} as things happen, and
-//      Ack in both directions (see "Flow control")
+//   4. Up{accounts}   the runtime's latest headroom report, again (the
+//                     hub does not insist, but shows stale headroom without)
+//   5. Up{state} / Up{accounts} / Up{heartbeat} as things happen, and
+//      Ack in both directions
 //
-// A stream is finite. The proxy in front of the hub is restarted now and
+// A STREAM IS FINITE. The proxy in front of the hub is restarted now and
 // then (every stream is cut after a 25 second drain), a laptop sleeps, a
-// network changes. Reconnecting and resuming by sequence number is the
-// normal path, not an error path.
+// network changes. Reconnecting is the normal path, not an error path.
 //
-// Sequence numbers. Each direction numbers its EVENTS from 1, per instance,
+// SEQUENCE NUMBERS. Each direction numbers its EVENTS from 1, per instance,
 // never reusing a number. An event is a message the other side must not
-// miss: `state` and `accounts` going up today. Hello, Snapshot, Heartbeat
-// and Welcome are not events and carry seq 0: they describe the connection
-// or the present moment and are never replayed. After a reconnect each side
-// says the last event number it received (Hello.last_down_seq,
-// Welcome.last_up_seq) and the other replays the events after it. An event
-// whose seq is not above the last one received is a replay of something
-// already applied and is ignored.
+// miss: `state` and `accounts` going up today. Hello, Welcome, Snapshot,
+// Heartbeat and Ack are not events and carry seq 0: they describe the
+// connection or the present moment. An event whose seq is not above the
+// last one received is a replay of something already applied and is
+// ignored (and still acknowledged).
 //
-// Flow control. Neither side may have more than 64 events in flight that
-// the other has not acknowledged. An Ack{seq} says "I have received every
-// event up to seq"; it is cumulative. Each side acknowledges promptly and
-// coalesced: once 16 events are unacknowledged or 250 ms after the oldest,
+// RECONNECTING, IN THIS SLICE. A runtime keeps no log of events. After a
+// reconnect the mandatory Snapshot restores every session and the Accounts
+// that follows it restores the headroom: between them they carry everything
+// an event of this slice could. Welcome.last_up_seq says the last event the
+// hub holds from this instance; the runtime continues its numbering above
+// its own last number, whatever the Welcome says. (A later slice whose
+// events a snapshot cannot restore, such as finished turns, will have the
+// runtime keep those until acknowledged and replay the ones after
+// Welcome.last_up_seq; the fields are here for that.)
+//
+// FLOW CONTROL. Neither side may have more than 64 events sent and not yet
+// acknowledged. Ack{seq} says "I have received every event up to seq"; it
+// is cumulative. Each side acknowledges promptly and coalesced: once 16
+// events are unacknowledged, or 250 ms after the first unacknowledged one,
 // whichever comes first. A sender at 64 waits for an Ack before sending
-// the next event. Hello, Welcome, Snapshot, Heartbeat and Ack are outside
-// the window (each is rare by construction). The cause: the proxy ends an
-// HTTP/2 connection, and every stream sharing it, once about 145 small
-// DATA frames are buffered on it in either direction; a burst of small
-// events is exactly that.
+// the next event; replayed events count like any other. The cause: the
+// proxy ends an HTTP/2 connection, and every stream sharing it, once about
+// 145 DATA frames under 256 bytes are buffered on it in either direction,
+// and a burst of small events is exactly that.
+//   Hello, Welcome, Snapshot, Heartbeat and Ack are outside the window,
+// which is safe because each is rare by construction: one Hello and one
+// Welcome a stream; a Heartbeat only after 20 silent seconds; an Ack at
+// most once per 16 events or 250 ms; a Snapshot when a stream opens (send
+// another only to resynchronise). The hub holds a runtime to that: a
+// stream may send a burst of 30 such messages and one a second after, and
+// is ended (RESOURCE_EXHAUSTED) beyond it.
+//   An Ack is flow control, not a promise of durability.
 //
-// An Ack is flow control, not durability: the hub writes what a snapshot
-// could not restore at once, and the rest within 5 seconds. The resume
-// point is Welcome.last_up_seq. For this slice's events that is enough: a
-// Snapshot restores every session, and a runtime sends its Accounts again
-// after the Snapshot that opens a stream. A runtime need not keep a state
-// or accounts event once it is acknowledged.
+// VERSIONS. What a side does not know, it tolerates. A hub ignores a
+// message whose body it does not know, and shows a session whose state it
+// does not know as `unknown` (never an error, never an alert). A runtime
+// does the same with a Down body it does not know.
 //
-// Versions. A hub ignores a message whose body it does not know (a newer
-// runtime talking to an older hub), and does not count it as received.
+// LIMITS. A message is at most 1 MiB. A runtime reports at most 200
+// sessions. Strings are capped in bytes of UTF-8 as each field says. The
+// hub ends the stream with INVALID_ARGUMENT, naming the field, when a
+// message breaks a limit: a runtime trims its text before sending. When a
+// runtime at its 200 sessions reports a new one, the hub drops the exited
+// session longest unchanged to make room, and refuses (RESOURCE_EXHAUSTED)
+// when none has exited.
+//   The hub announces a session that comes to need its person at most once
+// per 30 seconds per alerting state, and stores a session's change of
+// state at once at most once per 5 seconds (later changes within 5
+// seconds): a session that flaps is not a flood.
 //
-// Limits. A message is at most 1 MiB. A runtime reports at most 200 sessions.
-// Strings are capped in bytes of UTF-8 as each field says. The hub ends the
-// stream with INVALID_ARGUMENT, naming the field, when a message breaks a
-// limit: a runtime trims its text before sending. A stream may send a burst
-// of 400 messages and 50 a second after that. When a runtime at its 200
-// sessions reports a new one, the hub drops the exited session longest
-// unchanged to make room, and refuses (RESOURCE_EXHAUSTED) when none has
-// exited.
-//
-// How a stream ends:
-//   UNAUTHENTICATED      no credential, an unknown or a removed one
-//   INVALID_ARGUMENT     a message broke a limit or carried an unknown value
-//   FAILED_PRECONDITION  messages out of the order above
-//   DEADLINE_EXCEEDED    no Hello in time, or no message for three heartbeats
-//   ABORTED              a newer stream for the same runtime took over
-//   RESOURCE_EXHAUSTED   messages arrived faster than the hub accepts, or
-//                        a 201st live session
-//   UNAVAILABLE          the hub could not store something; reconnect
+// HOW A STREAM ENDS, AND WHAT THE RUNTIME DOES NEXT.
+//   Stop, and ask the person to enrol this runtime again:
+//     UNAUTHENTICATED      no credential, an unknown one, or the runtime
+//                          was removed
+//   Wait a long time (minutes) before trying again:
+//     ABORTED              a newer stream for the same runtime took over:
+//                          another machine or process holds this credential
+//   Do not retry; this is a bug in the runtime:
+//     INVALID_ARGUMENT     a message broke a limit or was malformed
+//     FAILED_PRECONDITION  messages out of the order above
+//   Reconnect with backoff (1 s doubling to 60 s, with jitter):
+//     DEADLINE_EXCEEDED    no Hello in time, or no message for three
+//                          heartbeats
+//     RESOURCE_EXHAUSTED   too many messages outside the window, a 201st
+//                          live session, or too many failed sign-ins
+//     UNAVAILABLE          the hub could not reach its store
+//     anything else, a clean end, or a broken connection
 syntax = "proto3";
 
 package taisce.runtime.v1;
@@ -123,7 +146,8 @@ message Down {
 // The first message of every stream.
 message Hello {
   // The runtime's id, as enrolment printed it. May be empty: the credential
-  // already names the runtime. When set it must be that runtime's id.
+  // already names the runtime. When set it must be that runtime's id (a
+  // UUID, in either case).
   string runtime_id = 1;
   // A fresh id for each launch of the runtime (a UUID). A new instance
   // restarts event numbering: the hub forgets the old instance's numbers
@@ -137,8 +161,9 @@ message Hello {
 
 // The hub's answer to a Hello.
 message Welcome {
-  // The last Up event the hub received from this instance; 0 for a new
-  // instance, or when the hub has no record. The runtime replays the events
+  // The last Up event the hub holds from this instance; 0 for a new
+  // instance, or when the hub has no record. See RECONNECTING: in this
+  // slice the runtime replays nothing. Later, it replays the events
   // after it.
   uint64 last_up_seq = 1;
   // The runtime's id, whatever the Hello said.
@@ -178,7 +203,8 @@ message SessionState {
   string branch = 6;
   // The Claude account the session runs on, as Accounts names it.
   string account = 7;
-  Status state = 8;
+  // A value the hub does not know (0 included) is shown as `unknown`.
+  SessionStatus state = 8;
   // The tool running now, when working. At most 100 bytes.
   string tool = 9;
   // The one-line status shown on the fleet. At most 500 bytes.
@@ -194,24 +220,26 @@ message SessionState {
 
 // What a session is doing. A runtime that is not connected has all its
 // sessions shown as offline; that is the hub's observation, not a state.
-enum Status {
-  STATUS_UNSPECIFIED = 0;
+// (Named SessionStatus, not Status: gRPC has a Status of its own in every
+// client language.)
+enum SessionStatus {
+  SESSION_STATUS_UNSPECIFIED = 0;
   // A turn is running.
-  STATUS_WORKING = 1;
+  SESSION_STATUS_WORKING = 1;
   // A dialog is open, or the turn ended by asking the owner something.
-  STATUS_NEEDS_YOU = 2;
+  SESSION_STATUS_NEEDS_YOU = 2;
   // The turn ended and the owner has not looked yet.
-  STATUS_FINISHED = 3;
+  SESSION_STATUS_FINISHED = 3;
   // Working, with no sign of life for five minutes.
-  STATUS_STALLED = 4;
+  SESSION_STATUS_STALLED = 4;
   // Waiting for an answer from another session.
-  STATUS_WAITING_ON_PEER = 5;
+  SESSION_STATUS_WAITING_ON_PEER = 5;
   // Seen by the owner; nothing running.
-  STATUS_IDLE = 6;
+  SESSION_STATUS_IDLE = 6;
   // Restored from an earlier launch with no process behind it yet.
-  STATUS_ASLEEP = 7;
+  SESSION_STATUS_ASLEEP = 7;
   // The process has gone.
-  STATUS_EXITED = 8;
+  SESSION_STATUS_EXITED = 8;
 }
 
 // Headroom per Claude account, whole: replaces the previous report. At most
@@ -223,21 +251,21 @@ message Accounts {
 message Account {
   // The label SessionState.account uses. 1–200 bytes.
   string name = 1;
-  // The share of the current usage window that is spent, 0–100. Unset when
-  // unknown.
+  // Every number below is unset when unknown.
+  // The share of the current usage window that is spent, 0–100.
   optional uint32 session_used_pct = 2;
-  // When that window resets, unix seconds; 0 when unknown.
-  int64 session_resets_at = 3;
+  // When that window resets, unix seconds.
+  optional int64 session_resets_at = 3;
   // The same for the weekly allowance.
   optional uint32 week_used_pct = 4;
-  int64 week_resets_at = 5;
+  optional int64 week_resets_at = 5;
 }
 
 // "Still here." Sent when nothing else has been for Welcome.heartbeat_secs.
 message Heartbeat {}
 
 // "I have received every event up to `seq`." Sent in both directions; see
-// "Flow control" at the top of this file.
+// FLOW CONTROL at the top of this file.
 message Ack {
   uint64 seq = 1;
 }

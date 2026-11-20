@@ -59,9 +59,13 @@ pub struct RuntimeLink<'a> {
     pub accounts_at: Option<i64>,
 }
 
-/// What a session is doing, as its runtime reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// What a session is doing, as its runtime reports it. `Unknown` is a state
+/// this build has no name for (a newer runtime's, or a row a newer build
+/// wrote): it is shown, sorts beside working, and never alerts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
+    Unknown,
     Working,
     NeedsYou,
     Finished,
@@ -73,7 +77,8 @@ pub enum SessionStatus {
 }
 
 impl SessionStatus {
-    pub const ALL: [SessionStatus; 8] = [
+    pub const ALL: [SessionStatus; 9] = [
+        SessionStatus::Unknown,
         SessionStatus::Working,
         SessionStatus::NeedsYou,
         SessionStatus::Finished,
@@ -86,6 +91,7 @@ impl SessionStatus {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            SessionStatus::Unknown => "unknown",
             SessionStatus::Working => "working",
             SessionStatus::NeedsYou => "needs_you",
             SessionStatus::Finished => "finished",
@@ -127,12 +133,18 @@ pub struct FabricSession {
 const RUNTIME_COLS: &str =
     "id, user_id, name, created_at, revoked_at, last_seen_at, instance_id, last_up_seq, version, accounts, accounts_at";
 
+/// A UUID column. A value that is not one is a corrupt row and an error,
+/// never the nil id.
+fn uuid_at(r: &Row, col: usize) -> rusqlite::Result<Uuid> {
+    let text: String = r.get(col)?;
+    Uuid::parse_str(&text).map_err(|e| rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, Box::new(e)))
+}
+
 fn runtime_row(r: &Row) -> rusqlite::Result<FabricRuntime> {
-    let (id, user): (String, String) = (r.get(0)?, r.get(1)?);
     let seq: i64 = r.get(7)?;
     Ok(FabricRuntime {
-        id: Uuid::parse_str(&id).unwrap_or_default(),
-        user_id: Uuid::parse_str(&user).unwrap_or_default(),
+        id: uuid_at(r, 0)?,
+        user_id: uuid_at(r, 1)?,
         name: r.get(2)?,
         created_at: r.get(3)?,
         revoked_at: r.get(4)?,
@@ -149,22 +161,20 @@ const SESSION_COLS: &str = "runtime_id, id, user_id, address, fabric, project, w
      note, last_line, context_used_pct, since, updated_at";
 
 fn session_row(r: &Row) -> rusqlite::Result<FabricSession> {
-    let (runtime, id, user): (String, String, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
     let state: String = r.get(9)?;
     let pct: Option<i64> = r.get(13)?;
     Ok(FabricSession {
-        runtime_id: Uuid::parse_str(&runtime).unwrap_or_default(),
-        id: Uuid::parse_str(&id).unwrap_or_default(),
-        user_id: Uuid::parse_str(&user).unwrap_or_default(),
+        runtime_id: uuid_at(r, 0)?,
+        id: uuid_at(r, 1)?,
+        user_id: uuid_at(r, 2)?,
         address: r.get(3)?,
         fabric: r.get(4)?,
         project: r.get(5)?,
         worktree: r.get(6)?,
         branch: r.get(7)?,
         account: r.get(8)?,
-        // a state this build does not know (a row from a newer one) reads as
-        // exited: it is history either way
-        state: SessionStatus::parse(&state).unwrap_or(SessionStatus::Exited),
+        // a state this build does not know (a row from a newer one)
+        state: SessionStatus::parse(&state).unwrap_or(SessionStatus::Unknown),
         tool: r.get(10)?,
         note: r.get(11)?,
         last_line: r.get(12)?,
@@ -230,19 +240,22 @@ impl SqliteStore {
         if live as usize >= MAX_RUNTIMES_PER_USER {
             return Err(StoreError::InvalidOp(format!("at most {MAX_RUNTIMES_PER_USER} runtimes; remove one first")));
         }
+        let exists = |sql: &str, p: &[&dyn rusqlite::ToSql]| self.conn.query_row(sql, p, |_| Ok(())).optional().map(|r| r.is_some());
+        if !exists("SELECT 1 FROM auth_users WHERE id = ?1", &[&user.to_string()])? {
+            return Err(StoreError::NotFound(format!("user {user}")));
+        }
+        if exists("SELECT 1 FROM fabric_runtimes WHERE user_id = ?1 AND name = ?2 AND revoked_at IS NULL", &[&user.to_string(), &name])? {
+            return Err(StoreError::InvalidOp(format!("a live runtime named {name:?} already exists")));
+        }
+        // a removed runtime's credential stays registered: it is never valid again
+        if exists("SELECT 1 FROM fabric_runtimes WHERE credential_hash = ?1", &[&credential_hash])? {
+            return Err(StoreError::InvalidOp("that credential is already registered (to a live or a removed runtime): mint a new one".into()));
+        }
         let id = Uuid::now_v7();
-        let r = self.conn.execute(
+        self.conn.execute(
             "INSERT INTO fabric_runtimes (id, user_id, name, credential_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id.to_string(), user.to_string(), name, credential_hash, now],
-        );
-        match r {
-            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
-                return Err(StoreError::InvalidOp(format!(
-                    "a runtime named {name:?} already exists (or the credential is already registered, or the user is unknown)"
-                )));
-            }
-            r => r?,
-        };
+        )?;
         self.fabric_runtime(id)
     }
 
@@ -291,50 +304,16 @@ impl SqliteStore {
             .ok_or_else(|| no_runtime(id))
     }
 
-    /// Remove one of the scope's live runtimes by name, id, or a unique id
-    /// prefix: its credential stops resolving and its sessions are deleted.
-    /// None when nothing (or more than one runtime) matches.
-    pub fn fabric_runtime_revoke(&mut self, key: &str, now: i64) -> Result<Option<FabricRuntime>> {
-        let key = key.trim();
-        if key.is_empty() {
-            return Ok(None);
-        }
-        let live = self.fabric_runtimes(false)?;
-        let by_name: Vec<&FabricRuntime> = live.iter().filter(|r| r.name == key).collect();
-        let hits: Vec<&FabricRuntime> =
-            if by_name.is_empty() { live.iter().filter(|r| r.id.to_string().starts_with(key)).collect() } else { by_name };
-        let [r] = hits.as_slice() else {
-            return Ok(None);
-        };
+    /// Remove one of the scope's live runtimes: its credential stops
+    /// resolving and its sessions are deleted. Anyone else's, or one already
+    /// removed, is NotFound. (Finding a runtime by name is the caller's job.)
+    pub fn fabric_runtime_revoke(&mut self, id: Uuid, now: i64) -> Result<FabricRuntime> {
+        let r = self.fabric_runtime(id)?;
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM fabric_sessions WHERE runtime_id = ?1", [r.id.to_string()])?;
-        tx.execute(
-            "UPDATE fabric_runtimes SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
-            params![r.id.to_string(), now],
-        )?;
+        tx.execute("DELETE FROM fabric_sessions WHERE runtime_id = ?1", [id.to_string()])?;
+        tx.execute("UPDATE fabric_runtimes SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL", params![id.to_string(), now])?;
         tx.commit()?;
-        Ok(Some(FabricRuntime { revoked_at: Some(now), ..(*r).clone() }))
-    }
-
-    /// Record what the hub knows about one of the scope's runtimes'
-    /// connection.
-    pub fn fabric_runtime_link(&mut self, id: Uuid, link: &RuntimeLink) -> Result<()> {
-        self.fabric_runtime(id)?;
-        self.conn.execute(
-            "UPDATE fabric_runtimes SET instance_id = ?2, last_up_seq = ?3, version = ?4, last_seen_at = ?5,
-                 accounts = ?6, accounts_at = ?7
-             WHERE id = ?1",
-            params![
-                id.to_string(),
-                link.instance_id,
-                i64::try_from(link.last_up_seq).unwrap_or(i64::MAX),
-                link.version,
-                link.last_seen_at,
-                link.accounts,
-                link.accounts_at
-            ],
-        )?;
-        Ok(())
+        Ok(FabricRuntime { revoked_at: Some(now), ..r })
     }
 
     // ---- sessions ----
@@ -350,14 +329,32 @@ impl SqliteStore {
     }
 
     /// Write sessions of one of the scope's runtimes, each whole (insert or
-    /// replace), in one transaction. Each row's `runtime_id` and `user_id`
-    /// are ignored: the rows are keyed to `runtime` and to its owner, so a
-    /// caller can only ever write into a fleet it can see. A runtime over
-    /// [`MAX_SESSIONS_PER_RUNTIME`] is refused and nothing is written.
+    /// replace). See [`SqliteStore::fabric_runtime_write`].
     pub fn fabric_sessions_put(&mut self, runtime: Uuid, sessions: &[FabricSession]) -> Result<()> {
+        self.fabric_runtime_write(runtime, &[], sessions, None)
+    }
+
+    /// Everything the hub writes about one of the scope's runtimes, in one
+    /// transaction: sessions to `delete` (it makes room for new ones by
+    /// dropping the oldest exited), sessions to `put` (each whole, insert or
+    /// replace) and, when given, what it knows of the runtime's connection.
+    /// Each row's `runtime_id` and `user_id` are ignored: rows are keyed to
+    /// `runtime` and to its owner, so a caller can only ever write into a
+    /// fleet it can see. A runtime left over [`MAX_SESSIONS_PER_RUNTIME`] is
+    /// refused and nothing is written.
+    pub fn fabric_runtime_write(
+        &mut self,
+        runtime: Uuid,
+        delete: &[Uuid],
+        put: &[FabricSession],
+        link: Option<&RuntimeLink>,
+    ) -> Result<()> {
         let owner = self.fabric_runtime(runtime)?.user_id;
         let tx = self.conn.transaction()?;
-        {
+        for id in delete {
+            tx.execute("DELETE FROM fabric_sessions WHERE runtime_id = ?1 AND id = ?2", params![runtime.to_string(), id.to_string()])?;
+        }
+        if !put.is_empty() {
             let mut st = tx.prepare(
                 "INSERT INTO fabric_sessions (runtime_id, id, user_id, address, fabric, project, worktree, branch,
                      account, state, tool, note, last_line, context_used_pct, since, updated_at)
@@ -368,7 +365,7 @@ impl SqliteStore {
                      last_line = excluded.last_line, context_used_pct = excluded.context_used_pct,
                      since = excluded.since, updated_at = excluded.updated_at",
             )?;
-            for s in sessions {
+            for s in put {
                 st.execute(params![
                     runtime.to_string(),
                     s.id.to_string(),
@@ -388,28 +385,32 @@ impl SqliteStore {
                     s.updated_at
                 ])?;
             }
+            drop(st);
+            let held: i64 =
+                tx.query_row("SELECT count(*) FROM fabric_sessions WHERE runtime_id = ?1", [runtime.to_string()], |r| r.get(0))?;
+            if held as usize > MAX_SESSIONS_PER_RUNTIME {
+                // dropping the transaction rolls everything back
+                return Err(StoreError::InvalidOp(format!("a runtime holds at most {MAX_SESSIONS_PER_RUNTIME} sessions")));
+            }
         }
-        let held: i64 =
-            tx.query_row("SELECT count(*) FROM fabric_sessions WHERE runtime_id = ?1", [runtime.to_string()], |r| r.get(0))?;
-        if held as usize > MAX_SESSIONS_PER_RUNTIME {
-            // dropping the transaction rolls the batch back
-            return Err(StoreError::InvalidOp(format!("a runtime holds at most {MAX_SESSIONS_PER_RUNTIME} sessions")));
+        if let Some(link) = link {
+            tx.execute(
+                "UPDATE fabric_runtimes SET instance_id = ?2, last_up_seq = ?3, version = ?4, last_seen_at = ?5,
+                     accounts = ?6, accounts_at = ?7
+                 WHERE id = ?1",
+                params![
+                    runtime.to_string(),
+                    link.instance_id,
+                    i64::try_from(link.last_up_seq).unwrap_or(i64::MAX),
+                    link.version,
+                    link.last_seen_at,
+                    link.accounts,
+                    link.accounts_at
+                ],
+            )?;
         }
         tx.commit()?;
         Ok(())
-    }
-
-    /// Delete sessions of one of the scope's runtimes by id (the hub makes
-    /// room for new sessions by dropping the oldest exited ones).
-    pub fn fabric_sessions_delete(&mut self, runtime: Uuid, ids: &[Uuid]) -> Result<usize> {
-        self.fabric_runtime(runtime)?;
-        let tx = self.conn.transaction()?;
-        let mut n = 0;
-        for id in ids {
-            n += tx.execute("DELETE FROM fabric_sessions WHERE runtime_id = ?1 AND id = ?2", params![runtime.to_string(), id.to_string()])?;
-        }
-        tx.commit()?;
-        Ok(n)
     }
 
     /// Say that the sessions of one of the scope's runtimes that have not
@@ -433,12 +434,11 @@ impl SqliteStore {
         let gone = {
             let mut st =
                 tx.prepare("DELETE FROM fabric_sessions WHERE updated_at < ?1 RETURNING user_id, runtime_id, id")?;
-            let rows = st.query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+            let rows = st.query_map([cutoff], |r| Ok((uuid_at(r, 0)?, uuid_at(r, 1)?, uuid_at(r, 2)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         tx.commit()?;
-        let id = |s: &str| Uuid::parse_str(s).unwrap_or_default();
-        Ok(gone.iter().map(|(u, r, s)| (id(u), id(r), id(s))).collect())
+        Ok(gone)
     }
 }
 
@@ -486,9 +486,14 @@ mod tests {
         let r = s.fabric_runtime_create(tom, "mbp", "h1", 10).unwrap();
         assert_eq!((r.name.as_str(), r.user_id, r.created_at, r.last_seen_at, r.last_up_seq), ("mbp", tom, 10, None, 0));
         assert_eq!(r.accounts, "[]");
-        // a live name is taken; so is a registered credential
-        assert!(matches!(s.fabric_runtime_create(tom, "mbp", "h2", 11), Err(StoreError::InvalidOp(_))));
-        assert!(matches!(s.fabric_runtime_create(tom, "other", "h1", 11), Err(StoreError::InvalidOp(_))));
+        // a live name is taken; so is a registered credential; each says which
+        let refused = |r: Result<FabricRuntime>| match r {
+            Err(StoreError::InvalidOp(m)) => m,
+            other => panic!("{other:?}"),
+        };
+        assert!(refused(s.fabric_runtime_create(tom, "mbp", "h2", 11)).contains("named \"mbp\""));
+        assert!(refused(s.fabric_runtime_create(tom, "other", "h1", 11)).contains("credential is already registered"));
+        assert!(is_not_found(s.fabric_runtime_create(Uuid::now_v7(), "ghost", "h9", 11)), "no such user");
         assert_eq!(s.fabric_runtime_by_credential("h1").unwrap().unwrap().id, r.id);
         assert!(s.fabric_runtime_by_credential("nope").unwrap().is_none());
         // the link is written whole and read back
@@ -500,24 +505,23 @@ mod tests {
             accounts: r#"[{"name":"personal"}]"#,
             accounts_at: Some(19),
         };
-        s.fabric_runtime_link(r.id, &link).unwrap();
+        s.fabric_runtime_write(r.id, &[], &[], Some(&link)).unwrap();
         let got = s.fabric_runtime(r.id).unwrap();
         assert_eq!((got.instance_id.as_deref(), got.last_up_seq, got.version.as_str()), (Some("launch-1"), 42, "1.4"));
         assert_eq!((got.last_seen_at, got.accounts.as_str(), got.accounts_at), (Some(20), r#"[{"name":"personal"}]"#, Some(19)));
         // revoking takes the sessions, stops the credential, frees the name
         s.fabric_sessions_put(r.id, &[session(Uuid::now_v7(), "taisce/main", SessionStatus::Working, 20)]).unwrap();
-        assert!(s.fabric_runtime_revoke("nobody", 30).unwrap().is_none());
-        assert_eq!(s.fabric_runtime_revoke("mbp", 30).unwrap().unwrap().revoked_at, Some(30));
+        assert!(is_not_found(s.fabric_runtime_revoke(Uuid::now_v7(), 30)));
+        assert_eq!(s.fabric_runtime_revoke(r.id, 30).unwrap().revoked_at, Some(30));
         assert!(s.fabric_runtime_by_credential("h1").unwrap().is_none());
         assert!(is_not_found(s.fabric_runtime(r.id)));
         assert!(s.fabric_sessions().unwrap().is_empty());
-        assert!(s.fabric_runtime_revoke("mbp", 31).unwrap().is_none(), "already removed");
+        assert!(is_not_found(s.fabric_runtime_revoke(r.id, 31)), "already removed");
         assert!(s.fabric_runtimes(false).unwrap().is_empty());
         assert_eq!(s.fabric_runtimes(true).unwrap().len(), 1);
-        let again = s.fabric_runtime_create(tom, "mbp", "h3", 40).unwrap();
-        // by a unique id prefix too
-        let prefix = &again.id.to_string()[..30];
-        assert_eq!(s.fabric_runtime_revoke(prefix, 50).unwrap().unwrap().id, again.id);
+        // the name is free again; the removed runtime's credential is not
+        assert!(refused(s.fabric_runtime_create(tom, "mbp", "h1", 40)).contains("credential is already registered"));
+        s.fabric_runtime_create(tom, "mbp", "h3", 40).unwrap();
     }
 
     #[test]
@@ -530,10 +534,9 @@ mod tests {
         assert!(matches!(s.fabric_runtime_create(tom, "one-more", "hx", 1), Err(StoreError::InvalidOp(_))));
         // the cap is per person, and removing one makes room
         s.fabric_runtime_create(ann, "mac-0", "ha", 1).unwrap();
-        // System sees both people's `mac-0`: an ambiguous name removes nothing
-        assert!(s.fabric_runtime_revoke("mac-0", 2).unwrap().is_none());
+        let first = s.fabric_runtimes(false).unwrap()[0].id;
         s.with_scope_for_test(Scope::User(tom), |s| {
-            assert_eq!(s.fabric_runtime_revoke("mac-0", 2).unwrap().unwrap().user_id, tom);
+            assert_eq!(s.fabric_runtime_revoke(first, 2).unwrap().user_id, tom);
             s.fabric_runtime_create(tom, "one-more", "hx", 3).unwrap();
         });
         assert_eq!(s.fabric_runtimes(false).unwrap().len(), MAX_RUNTIMES_PER_USER + 1);
@@ -568,8 +571,13 @@ mod tests {
         // deleting by id takes only what is named, and only in this runtime
         let c = Uuid::now_v7();
         s.fabric_sessions_put(r.id, &[session(c, "taisce/gone", SessionStatus::Exited, 400)]).unwrap();
-        assert_eq!(s.fabric_sessions_delete(r.id, &[c, Uuid::now_v7()]).unwrap(), 1);
+        s.fabric_runtime_write(r.id, &[c, Uuid::now_v7()], &[], None).unwrap();
         assert_eq!(s.fabric_sessions().unwrap().len(), 1);
+        // one transaction: a batch that ends over the cap undoes its deletes too
+        let many: Vec<FabricSession> =
+            (0..=MAX_SESSIONS_PER_RUNTIME).map(|i| session(Uuid::now_v7(), &format!("p/w:{i}"), SessionStatus::Idle, 400)).collect();
+        assert!(matches!(s.fabric_runtime_write(r.id, &[a], &many, None), Err(StoreError::InvalidOp(_))));
+        assert_eq!(s.fabric_sessions().unwrap().iter().map(|x| x.id).collect::<Vec<_>>(), vec![a]);
         // over the cap: refused whole, nothing of the batch lands
         let many: Vec<FabricSession> =
             (0..MAX_SESSIONS_PER_RUNTIME).map(|i| session(Uuid::now_v7(), &format!("p/w:{i}"), SessionStatus::Idle, 400)).collect();
@@ -594,11 +602,10 @@ mod tests {
             // every write at Tom's runtime is NotFound, and changes nothing
             assert!(is_not_found(s.fabric_sessions_put(r.id, &[session(sid, "ann/was-here", SessionStatus::Exited, 999)])));
             assert!(is_not_found(s.fabric_sessions_touch(r.id, 999)));
-            assert!(is_not_found(s.fabric_sessions_delete(r.id, &[sid])));
+            assert!(is_not_found(s.fabric_runtime_write(r.id, &[sid], &[], None)));
             let link = RuntimeLink { instance_id: None, last_up_seq: 9, version: "x", last_seen_at: None, accounts: "[]", accounts_at: None };
-            assert!(is_not_found(s.fabric_runtime_link(r.id, &link)));
-            assert!(s.fabric_runtime_revoke("mbp", 5).unwrap().is_none());
-            assert!(s.fabric_runtime_revoke(&r.id.to_string(), 5).unwrap().is_none());
+            assert!(is_not_found(s.fabric_runtime_write(r.id, &[], &[], Some(&link))));
+            assert!(is_not_found(s.fabric_runtime_revoke(r.id, 5)));
             assert!(is_not_found(s.fabric_runtime_create(tom, "planted", "h9", 5)));
             assert!(matches!(s.fabric_sessions_expire(i64::MAX), Err(StoreError::InvalidOp(_))));
             // the same session id under her own runtime is her own row
@@ -642,5 +649,19 @@ mod tests {
             assert_eq!(SessionStatus::parse(v.as_str()), Some(v));
         }
         assert_eq!(SessionStatus::parse("offline"), None);
+        assert_eq!(serde_json::to_string(&SessionStatus::WaitingOnPeer).unwrap(), "\"waiting_on_peer\"");
+    }
+
+    #[test]
+    fn a_corrupt_id_is_an_error_and_an_unknown_state_is_shown_as_unknown() {
+        let mut s = SqliteStore::open_in_memory().unwrap();
+        let (tom, _) = users(&mut s);
+        let r = s.fabric_runtime_create(tom, "mbp", "h1", 1).unwrap();
+        let id = Uuid::now_v7();
+        s.fabric_sessions_put(r.id, &[session(id, "taisce/main", SessionStatus::Working, 100)]).unwrap();
+        s.conn.execute("UPDATE fabric_sessions SET state = 'reticulating'", []).unwrap();
+        assert_eq!(s.fabric_sessions().unwrap()[0].state, SessionStatus::Unknown);
+        s.conn.execute("UPDATE fabric_sessions SET id = 'not-a-uuid'", []).unwrap();
+        assert!(matches!(s.fabric_sessions(), Err(StoreError::Sqlite(_))), "never the nil id");
     }
 }

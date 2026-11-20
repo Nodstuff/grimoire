@@ -1,7 +1,8 @@
 # ADR 0007 — Agent Fabric: the runtime channel and the fleet (Slice 1, Watch)
 
-- **Status**: accepted (2026-11-20; revised the same day after the transport spike: §5a, the
-  rpc's name, the proxy route). Covers Slice 1 only; later slices add to it.
+- **Status**: accepted (2026-11-20; revised the same day after the transport spike (§5a, the
+  rpc's name, the proxy route) and after an independent review (§5b, the silence deadline,
+  the status codes)). Covers Slice 1 only; later slices add to it.
 - **Who/when**: Tom + Claude, 2026-11-20
 - **Scope**: SERVER mode only. In LOCAL mode the viewer routes answer 404 and no runtime can
   connect.
@@ -73,6 +74,10 @@ A runtime signs in with a *runtime credential*: `trt_` + 256 random bits, sent a
 - Enrolling and removing a runtime is a human surface. Today that is the box CLI
   (`taisce fabric runtime add|list|revoke`). Over HTTP it is deferred; over MCP it is never
   allowed, and the isolation suite fails if an MCP tool's name looks like one.
+- The server restarts the service if it ever stops (it is under the same supervision as the
+  daemon's other long-lived tasks), and at shutdown the hub's pending writes are flushed
+  before the HTTP server drains its connections: an open SSE stream holds that drain open
+  until the service manager gives up (observed), so a flush after it would be lost.
 - A removed runtime's credential stops resolving at once. An open stream is ended within a
   minute (it is rechecked every 60 seconds, and at once when its owner next reads the fleet).
 
@@ -105,35 +110,75 @@ SQLite is replicated by litestream, so a chatty writer is a costly one.
 
 | What happened | When it is written |
 |---|---|
-| A session appears or changes state | At once. |
+| A session appears or changes state | At once, at most once per 5 seconds per session (§5b). |
 | Anything else about it changes (tool, note, last line, context) | Within 5 seconds. |
-| The same report again | Never. |
-| A headroom report, the last event number | With the next flush. |
-| A runtime connects or disconnects | At once. |
+| The same report again | Never, except once a day to say the session still exists (§6). |
+| A headroom report | With the next flush. |
+| A runtime connects or disconnects | At once, with the last event number taken. |
 
 Every write of a runtime's state takes one path, one writer at a time per runtime, and each
-writer takes the rows as they are when its turn comes. An older picture cannot land over a
-newer one. A crash loses at most 5 seconds of detail, never a change of state.
+writer takes the rows as they are when its turn comes and writes them in one transaction. An
+older picture cannot land over a newer one. A crash loses at most 5 seconds of detail.
+
+Each fleet publishes its changes on a channel of its own. A subscriber (an SSE stream) holds
+one person's events and nobody else's: isolation does not rest on a route remembering to
+filter, and one person's burst cannot make another's stream fall behind.
 
 - **Order.** Each side numbers its events per instance (a fresh id per launch of the
-  runtime). A reconnecting runtime is told the last event the hub took and replays what came
-  after; an event at or below it is ignored. The number is kept on the runtime's row, so it
-  survives a daemon restart.
+  runtime). An event at or below the last one taken is a replay and is ignored. A
+  reconnecting runtime is told the last event the hub holds.
+- **Reconnecting, in this slice.** A runtime keeps no log of events and replays nothing: the
+  mandatory snapshot restores every session and the accounts report that follows it restores
+  the headroom. So the last event number is not worth a write per event. It is kept in
+  memory and stored when a stream ends or the daemon stops; after a crash it is stale, which
+  costs nothing. A later slice whose events a snapshot cannot restore changes this.
+- **Unknown values are tolerated, on one rule.** A body the hub does not know is ignored. A
+  session state it does not know (0 included) is shown as `unknown`, sorted beside working,
+  and never alerts. Neither ends the stream, so a newer runtime does not loop on reconnect.
 - **Snapshots.** Every stream starts with a snapshot of all sessions, naming the event number
   it replaces. A state event at or below that number is older than the snapshot and is
   ignored. A session the hub knew that the snapshot lacks is shown as exited and kept.
 - **One stream per runtime.** A new stream supersedes the old, which ends with ABORTED.
-- **Liveness.** The runtime sends a heartbeat every 20 seconds when idle; three missed ends
-  the stream. HTTP/2 pings stop at the proxy, so the heartbeat is a message.
+- **Liveness.** The runtime sends a heartbeat every 20 seconds when idle; 60 seconds with no
+  message ends the stream. HTTP/2 pings stop at the proxy, and a frozen or vanished client is
+  not reliably signalled upstream, so the heartbeat is a message and the deadline is the
+  hub's own. The deadline moves only when a message arrives. (As first built, any wake-up of
+  the stream's loop re-armed it, and the 60 second recheck woke it every 60 seconds: a Mac
+  that slept without closing its connection would have stayed online for ever.)
+- **How a stream ends** is always a status that says why, and the `.proto` says what a
+  runtime does for each: stop and ask for re-enrolment, wait long, fix the bug, or reconnect
+  with backoff. Only the runtime closing its side is a clean end. A message that is too big
+  or does not decode is INVALID_ARGUMENT or the decoder's own status, never a silent close
+  that a client would answer by reconnecting in a loop. A store that cannot answer at
+  sign-in is UNAVAILABLE and is not counted as a failed guess.
 - **Flow control.** A send window of 64 unacknowledged events each way (§5a).
 - **Limits.** 1 MiB a message, 200 sessions a runtime, 16 runtimes a person, byte caps per
-  field, a burst of 400 messages then 50 a second. A breach ends the stream with a status
-  that names the reason. At 200 sessions the exited one longest unchanged makes room.
+  field. A breach ends the stream with a status that names the reason. At 200 sessions the
+  exited one longest unchanged makes room.
+- **Message rate.** Events are paced by the send window (§5a) and are not counted. Messages
+  outside the window (snapshot, heartbeat, ack) are held to a burst of 30 and one a second.
+  (The first build counted every message, 400 then 50 a second. The window made that
+  redundant for events and wrong for an honest burst of them.)
 
 ### 5a. Constraints the proxy puts on the channel
 
-A spike on 2026-11-20 ran a tonic server and a Swift client through the real proxy (Portus,
-on rama 0.4.0). It works, and it found three things the design has to hold to.
+On 2026-11-20 the channel was run locally through the real proxy: Portus 0.4.0 (on rama
+0.4.0), a tonic 0.14.9 server, a grpc-swift-2 2.4.4 client.
+
+| Observed | |
+|---|---|
+| The path route wins over the host-only catch-all | in either order in the file |
+| An idle stream stays open | 15 to 16 minutes with no keepalive |
+| A config hot-reload | leaves streams up |
+| A Portus restart | cuts every stream after a 25 second drain |
+| `authorization`, `x-forwarded-for`, `x-real-ip` | reach the backend |
+
+Not tested: networks other than loopback, the ACME listener, the Linux build of Portus, and
+whether Portus overwrites or appends to an `x-forwarded-for` the client sent. The hub keeps
+the rule the rest of the server uses (the last hop is the address the proxy saw; ADR 0005
+§5 records that Portus appends) and uses it only to rate-limit failed sign-ins.
+
+The run also found three things the design has to hold to.
 
 | What the proxy does | Cause | What the channel does about it |
 |---|---|---|
@@ -158,15 +203,45 @@ on rama 0.4.0). It works, and it found three things the design has to hold to.
   own connection. The hub's side of the bargain is to acknowledge promptly, and it does so
   for replayed events too.
 - Route order in `portus.yaml` does not matter: the longest path prefix wins.
-- The proxy forwards `authorization` intact and adds `x-forwarded-for` (which the failed
-  sign-in rate limit reads). It pings the backend every 30 seconds and drops every stream if
-  unanswered for 20; tonic answers HTTP/2 pings by default.
+- The proxy pings the backend every 30 seconds and drops every stream if unanswered for 20;
+  tonic answers HTTP/2 pings by default.
+- `max_request_body_bytes` has no "unlimited" value, and a large finite one only moves the
+  cliff: the largest value is used. The real bound on what a runtime can make the hub hold is
+  the hub's own 1 MiB per message.
+
+Two other answers to the frame budget were rejected. **Padding every message to 256 bytes**
+would step over the limit as it is measured today, and hide it: the next change to the
+budget, or to what counts as small, would bring the failure back with nothing in the
+protocol to bound it. **Relying on clients to batch their writes** leaves the limit to every
+write path in two codebases: one careless path kills the connection, and a bystander's
+stream with it.
+
+### 5b. A session that flaps is not a flood
+
+A runtime bug that flips a session between working and needing its person, as fast as the
+window lets it, must cost one person's fleet nothing much and other people nothing at all.
+APNs throttles a provider, not a device, so pushes are shared between everyone on the server.
+
+- **Alerts**: a session is announced in the same alerting state (needs you, stalled,
+  finished) at most once per 30 seconds. Entering a different alerting state is announced at
+  once; each state keeps its own clock, so alternating between two is held to the same rate.
+- **Writes**: a session's change of state is written at once at most once per 5 seconds; a
+  change inside that window rides the 5 second flush. (A session's first appearance is
+  written at once and does not start the window, so the first real change after it is
+  prompt.)
+- Nothing is lost by either: the fleet in memory and the live stream see every change.
 
 ### 6. Retention: 7 days
 
 Sessions are history. A row goes 7 days after its last update (swept at start and hourly).
-A session a connected runtime still reports is not history: the sweep first records that it
-exists, so a long-lived session is not expired under a Mac that never sleeps. Runtimes are
+A session its runtime still reports is not history, and two things keep it:
+
+- The sweep first records that every session of a connected runtime exists, so a long-lived
+  session is not expired under a Mac that never sleeps.
+- A report identical to what is held (every reconnect's snapshot is one) records that the
+  session exists once the row is a day old. So a laptop that is online daily but never
+  across a sweep keeps its week-idle session, which otherwise would be expired, reappear as
+  a first sight, and announce itself again. Runtimes are
 settings and stay until removed; removing one deletes its sessions.
 
 ### 7. What a person's devices read
@@ -199,6 +274,8 @@ The design allows a preview of the session's last line in notifications, with a 
 safer default is to send no text.
 
 ## Alternatives rejected
+
+- **Padding messages, or trusting clients to batch**, against the proxy's frame budget: §5a.
 
 - **WebSocket with JSON** for the runtime leg. The proxy carries it too. Rejected for the
   contract: two repositories built by two sessions agree more reliably on a `.proto` than on

@@ -7,7 +7,7 @@
 //! also break the contract on purpose.
 
 use crate::v1::runtime_client::RuntimeClient;
-use crate::v1::{Account, Accounts, Ack, Down, Heartbeat, Hello, SessionState, Snapshot, Status, Up, Welcome, down, up};
+use crate::v1::{Account, Accounts, Ack, Down, Heartbeat, Hello, SessionState, SessionStatus, Snapshot, Up, Welcome, down, up};
 use crate::window::SendWindow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -90,7 +90,7 @@ impl ScriptSession {
     }
 
     fn message(&self) -> Result<SessionState, Error> {
-        let state = Status::from_name(&self.state).ok_or_else(|| Error::Script(format!("unknown state {:?}", self.state)))?;
+        let state = SessionStatus::from_name(&self.state).ok_or_else(|| Error::Script(format!("unknown state {:?}", self.state)))?;
         Ok(SessionState {
             session_id: self.id.clone(),
             address: self.address.clone(),
@@ -114,9 +114,9 @@ impl ScriptSession {
 pub struct ScriptAccount {
     pub name: String,
     pub session_used_pct: Option<u32>,
-    pub session_resets_at: i64,
+    pub session_resets_at: Option<i64>,
     pub week_used_pct: Option<u32>,
-    pub week_resets_at: i64,
+    pub week_resets_at: Option<i64>,
 }
 
 impl ScriptAccount {
