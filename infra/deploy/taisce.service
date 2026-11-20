@@ -23,7 +23,7 @@ Environment=TAISCE_APNS_ENV=production
 # role's credentials via IMDS). The region is required with the bucket.
 Environment=TAISCE_BOOKS_BUCKET=taisce-backups-895102116452
 Environment=TAISCE_BOOKS_REGION=eu-west-1
-# Agent Fabric's runtime channel (ADR 0006): gRPC on its own loopback port;
+# Agent Fabric's runtime channel (ADR 0007): gRPC on its own loopback port;
 # portus routes /taisce.runtime.v1.Runtime/ to it (portus.yaml). Change the
 # two together.
 Environment=TAISCE_RUNTIME_GRPC_PORT=7426

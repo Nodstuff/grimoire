@@ -1,4 +1,4 @@
-//! The runtime channel's service (`taisce.runtime.v1.Runtime`, ADR 0006):
+//! The runtime channel's service (`taisce.runtime.v1.Runtime`, ADR 0007):
 //! what a runtime such as Workbox dials. It listens on its own loopback
 //! port (`--runtime-grpc-port`), cleartext HTTP/2 behind the proxy, apart
 //! from the axum app and its `require_auth` layer.

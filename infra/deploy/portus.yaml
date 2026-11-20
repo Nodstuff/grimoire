@@ -14,7 +14,7 @@ listeners:
       acme:
         domains: [taisce.null.ie]
     routes:
-      # Agent Fabric's runtime channel (ADR 0006): gRPC from a runtime (Workbox
+      # Agent Fabric's runtime channel (ADR 0007): gRPC from a runtime (Workbox
       # on a Mac) to the daemon's own loopback gRPC port (taisce.service,
       # TAISCE_RUNTIME_GRPC_PORT). `protocol: GRPC` makes portus speak HTTP/2
       # to the backend. The longest path prefix wins, so this route's place

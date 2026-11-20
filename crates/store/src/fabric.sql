@@ -1,4 +1,4 @@
--- Agent Fabric (schema v16, ADR 0006): a person's runtimes (programs that
+-- Agent Fabric (schema v16, ADR 0007): a person's runtimes (programs that
 -- host Claude sessions on a machine and report them over the runtime
 -- channel) and the sessions those runtimes last reported. A fleet belongs to
 -- one person and is never shared: workspace membership does not reach it.

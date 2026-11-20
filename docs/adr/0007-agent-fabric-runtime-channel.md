@@ -1,4 +1,4 @@
-# ADR 0006 — Agent Fabric: the runtime channel and the fleet (Slice 1, Watch)
+# ADR 0007 — Agent Fabric: the runtime channel and the fleet (Slice 1, Watch)
 
 - **Status**: accepted (2026-11-20; revised the same day after the transport spike: §5a, the
   rpc's name, the proxy route). Covers Slice 1 only; later slices add to it.
@@ -8,8 +8,10 @@
 - **Design**: the Taisce docs under "Agent Fabric" (How It Works, Runtime Channel, Trust and
   Safety, Build Plan). The wire contract is `proto/taisce/runtime/v1/runtime.proto`, which is
   the source of truth; this ADR records the server's decisions.
-- **Numbering**: some code comments cite "ADR 0006" for the EPUB library. No such file was
-  written; this is the only ADR 0006.
+- **Numbering**: 0007, not 0006. Code comments on `main` (`main.rs`, `isolation_tests.rs`,
+  since the EPUB library landed) cite "ADR 0006" for the EPUB library. No such file was ever
+  committed, on any branch, but the number is spoken for: a file here named 0006 would make
+  those citations point at the wrong document.
 
 ## Context
 

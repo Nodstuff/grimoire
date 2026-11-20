@@ -3,7 +3,7 @@
 // (the Taisce server). The runtime dials out and holds one stream open.
 //
 // This file is the source of truth for the wire contract; a runtime takes a
-// copy. docs/adr/0006-agent-fabric-runtime-channel.md records the server's
+// copy. docs/adr/0007-agent-fabric-runtime-channel.md records the server's
 // decisions.
 //
 // Slice 1 (Watch) is built: the runtime reports its sessions and the hub

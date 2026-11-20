@@ -1,4 +1,4 @@
-//! Agent Fabric (fabric.sql, ADR 0006): a person's runtimes and the sessions
+//! Agent Fabric (fabric.sql, ADR 0007): a person's runtimes and the sessions
 //! those runtimes last reported. Times are unix seconds, passed in by the
 //! caller; the store never sees a credential, only its SHA-256.
 //!

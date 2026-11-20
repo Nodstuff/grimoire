@@ -1,6 +1,6 @@
 //! The runtime channel's wire contract: the types and service generated from
 //! `proto/taisce/runtime/v1/runtime.proto`, which is the source of truth
-//! (ADR 0006). The daemon implements the service (`server`); a runtime such
+//! (ADR 0007). The daemon implements the service (`server`); a runtime such
 //! as Workbox takes its own copy of the `.proto`.
 //!
 //! `client` adds the client stub and [`fake`], a scripted stand-in for a

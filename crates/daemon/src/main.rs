@@ -260,7 +260,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: WorkspaceCmd,
     },
-    /// Agent Fabric (ADR 0006). Works on the db directly, on the server
+    /// Agent Fabric (ADR 0007). Works on the db directly, on the server
     /// box: enrolling a runtime is a human surface, never MCP.
     Fabric {
         #[command(subcommand)]
@@ -1179,7 +1179,7 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                 }),
                 local_human: tom,
             };
-            // Agent Fabric (ADR 0006): SERVER mode only. The hub holds every
+            // Agent Fabric (ADR 0007): SERVER mode only. The hub holds every
             // fleet; the viewer routes read it; the runtime channel (gRPC, on
             // its own loopback port, only when one is set) feeds it.
             let hub = auth_state.as_ref().map(|_| {

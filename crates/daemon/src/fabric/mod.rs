@@ -1,5 +1,5 @@
 //! Agent Fabric, Slice 1 (Watch): a person's runtimes report their Claude
-//! sessions here and the person's own devices watch them (ADR 0006). SERVER
+//! sessions here and the person's own devices watch them (ADR 0007). SERVER
 //! mode only.
 //!
 //! - `grpc`: the runtime channel's service, on its own loopback port. A

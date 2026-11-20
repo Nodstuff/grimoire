@@ -254,7 +254,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/opds/doc/{id}/file", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
     ("/opds/{secret}/docs", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
     ("/opds/{secret}/doc/{id}/file", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
-    // Agent Fabric (fabric/routes.rs, fabric/grpc.rs; ADR 0006): a fleet is
+    // Agent Fabric (fabric/routes.rs, fabric/grpc.rs; ADR 0007): a fleet is
     // its owner's alone on the viewer routes and their stream, and a runtime
     // credential writes only its own owner's fleet over the runtime channel
     // (gRPC, its own listener: not an axum route, so the scan cannot see it)
@@ -3516,7 +3516,7 @@ async fn web_reader_doc_positions_are_the_callers_alone() {
     assert_eq!(st, StatusCode::FORBIDDEN);
 }
 
-// ---- Agent Fabric (ADR 0006) ----
+// ---- Agent Fabric (ADR 0007) ----
 
 const A_SESSION: &str = "0196f3a0-0000-7000-8000-00000000000a";
 const B_SESSION: &str = "0196f3a0-0000-7000-8000-00000000000b";
