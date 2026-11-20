@@ -52,7 +52,7 @@ impl Error {
 #[serde(rename_all = "snake_case")]
 pub enum Step {
     Snapshot(Vec<ScriptSession>),
-    State(ScriptSession),
+    State(Box<ScriptSession>),
     Accounts(Vec<ScriptAccount>),
     Heartbeat,
     SleepMs(u64),

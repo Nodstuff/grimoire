@@ -59,9 +59,18 @@ quick-xml = "0.41"
 # is greyscale, and validate Open Library's; the four formats covers come in
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 
+# Agent Fabric's runtime channel (ADR 0006): gRPC on the runtime leg only.
+# The generated service comes from taisce-runtime-proto; tonic serves it on
+# its own loopback listener (cleartext HTTP/2, the proxy terminates TLS).
+taisce-runtime-proto = { path = "../runtime-proto", features = ["server"] }
+tonic = { version = "0.14.9", default-features = false, features = ["server", "router"] }
+tokio-stream = "0.1.19"
+
 [build-dependencies]
 
 [dev-dependencies]
 webauthn-authenticator-rs = { version = "0.5.5", default-features = false, features = ["softpasskey"] }
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
+# the fake runtime: the tests drive the real runtime channel with it
+taisce-runtime-proto = { path = "../runtime-proto", features = ["client"] }

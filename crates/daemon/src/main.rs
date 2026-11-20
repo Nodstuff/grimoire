@@ -15,6 +15,7 @@ mod covers;
 mod docops;
 mod embed;
 mod epub;
+mod fabric;
 mod filer;
 mod garden;
 mod home;
@@ -243,6 +244,9 @@ enum Cmd {
         /// SERVER mode: APNs push to the Taisce app (off unless configured).
         #[command(flatten)]
         apns: push::ApnsArgs,
+        /// SERVER mode: Agent Fabric's runtime channel (off unless configured).
+        #[command(flatten)]
+        fabric: fabric::FabricArgs,
     },
     /// SERVER mode sign-in: passkeys and OAuth grants (works on the db
     /// directly; run it on the server box).
@@ -255,6 +259,50 @@ enum Cmd {
     Workspace {
         #[command(subcommand)]
         cmd: WorkspaceCmd,
+    },
+    /// Agent Fabric (ADR 0006). Works on the db directly, on the server
+    /// box: enrolling a runtime is a human surface, never MCP.
+    Fabric {
+        #[command(subcommand)]
+        cmd: FabricCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum FabricCmd {
+    /// Runtimes: the programs (Workbox on a Mac) that report a person's
+    /// Claude sessions over the runtime channel.
+    Runtime {
+        #[command(subcommand)]
+        cmd: RuntimeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuntimeCmd {
+    /// Enrol a runtime and print its credential once (it is stored only as
+    /// a hash). The credential opens the runtime channel and nothing else.
+    Add {
+        #[arg(long)]
+        name: String,
+        /// The user it reports for, by id (or unique prefix); default the owner.
+        #[arg(long)]
+        user: Option<String>,
+        /// Register a credential minted elsewhere by its SHA-256 (lowercase
+        /// hex of the whole `trt_…` string): the secret never reaches this
+        /// box or its logs, and nothing is printed but the id.
+        #[arg(long)]
+        hash: Option<String>,
+    },
+    /// List runtimes (never their credentials).
+    List,
+    /// Remove a live runtime by name or id (or unique prefix): its
+    /// credential stops working and its sessions are deleted.
+    Revoke {
+        key: String,
+        /// The user whose runtime it is, when two people use the same name.
+        #[arg(long)]
+        user: Option<String>,
     },
 }
 
@@ -894,7 +942,37 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
             let mut store = store;
             workspace_cli(&mut store, cmd)?;
         }
-        Cmd::Serve { trusted_proxy, allow_redirect, apns } => {
+        Cmd::Fabric { cmd: FabricCmd::Runtime { cmd } } => {
+            let mut store = store;
+            let now = auth::now();
+            match cmd {
+                RuntimeCmd::Add { name, user, hash } => {
+                    if user.is_none() {
+                        // as `auth token create`: the owner exists before the box ever served
+                        let owner_name = human_name(&store);
+                        store.auth_ensure_owner(tom, &owner_name, now)?;
+                    }
+                    let (r, secret) = fabric::enrol_runtime(&mut store, user.as_deref(), &name, hash.as_deref(), now)?;
+                    match secret {
+                        Some(secret) => {
+                            println!("{secret}");
+                            eprintln!("(runtime {:?} {} — shown once; it opens the runtime channel only)", r.name, r.id);
+                        }
+                        None => println!("enrolled runtime {} {} (hash only; it opens the runtime channel only)", r.name, r.id),
+                    }
+                }
+                RuntimeCmd::List => {
+                    for line in fabric::runtime_lines(&store)? {
+                        println!("{line}");
+                    }
+                }
+                RuntimeCmd::Revoke { key, user } => {
+                    let r = fabric::revoke_runtime(&mut store, &key, user.as_deref(), now)?;
+                    println!("removed runtime {} {}", r.name, r.id);
+                }
+            }
+        }
+        Cmd::Serve { trusted_proxy, allow_redirect, apns, fabric: fabric_args } => {
             let port = cli.port;
             let mut store = store;
             // SERVER mode: OAuth + passkeys replace loopback trust entirely
@@ -1053,7 +1131,7 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                         Arc::new(move |a: shares::CommentAlert| {
                             let (store, sender) = (store.clone(), sender.clone());
                             let push = push::Push::ShareComment { title: a.title, author: a.author, doc_id: a.doc_id, share_id: a.share_id };
-                            tokio::spawn(push::notify_share_comment(store, sender, a.owner, push));
+                            tokio::spawn(push::notify_user(store, sender, a.owner, push));
                         }) as shares::Notifier
                     }),
                     }),
@@ -1101,6 +1179,48 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                 }),
                 local_human: tom,
             };
+            // Agent Fabric (ADR 0006): SERVER mode only. The hub holds every
+            // fleet; the viewer routes read it; the runtime channel (gRPC, on
+            // its own loopback port, only when one is set) feeds it.
+            let hub = auth_state.as_ref().map(|_| {
+                let alerter = apns_sender.clone().map(|sender| {
+                    let store = store.clone();
+                    Arc::new(move |a: fabric::SessionAlert| {
+                        let (store, sender) = (store.clone(), sender.clone());
+                        tokio::spawn(push::notify_user(store, sender, a.user, fabric::alert_push(&a)));
+                    }) as fabric::hub::Alerter
+                });
+                fabric::Hub::new(store.clone(), alerter)
+            });
+            if let Some(hub) = &hub {
+                let hub = hub.clone();
+                supervise("fabric.maintenance", move || hub.clone().maintenance_loop());
+            }
+            match (fabric_args.runtime_grpc_port, &hub, &auth_state) {
+                (Some(grpc_port), Some(hub), Some(st)) => {
+                    let grpc_addr = format!("127.0.0.1:{grpc_port}");
+                    let grpc_listener = tokio::net::TcpListener::bind(&grpc_addr)
+                        .await
+                        .with_context(|| format!("the runtime channel's port {grpc_port}"))?;
+                    let service = fabric::grpc::RuntimeService {
+                        hub: hub.clone(),
+                        store: store.clone(),
+                        limiter: st.limiter.clone(),
+                        trusted_proxy: st.cfg.trusted_proxy,
+                        heartbeat: fabric::grpc::HEARTBEAT,
+                    };
+                    tracing::info!("Agent Fabric: runtime channel (gRPC, h2c) at http://{grpc_addr}");
+                    // no drain of its own: the process ends when the HTTP
+                    // server below has shut down, and the hub is closed there
+                    tokio::spawn(async move {
+                        if let Err(e) = fabric::grpc::serve(grpc_listener, service, std::future::pending()).await {
+                            tracing::error!("the runtime channel stopped: {e}");
+                        }
+                    });
+                }
+                (Some(_), _, _) => tracing::warn!("--runtime-grpc-port set but this is LOCAL mode: Agent Fabric needs --public-url"),
+                (None, _, _) => {}
+            }
             let app = mcp::router_with_hosts(store.clone(), claude, dedupe.clone(), embedder.clone(), mcp_hosts)
                 .merge(admin::router(store.clone(), admin_token, server_mode))
                 .merge(push::router(push::DevicesState { store: store.clone(), default_env }))
@@ -1110,6 +1230,7 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                 .merge(opds::router(opds_state))
                 .merge(kosync::router(kosync_state))
                 .merge(sentdocs::router(sentdocs::SentState { store: store.clone(), server_mode, local_human: tom }))
+                .merge(fabric::router(fabric::FabricState { hub: hub.clone(), local_human: tom }))
                 .merge(api::router(api::ApiState {
                     changes: feed,
                     store,
@@ -1156,6 +1277,11 @@ async fn run(legacy_env: Vec<String>) -> anyhow::Result<()> {
                     children::kill_all().await;
                 })
                 .await?;
+            // what the hub had not written yet, and when each connected
+            // runtime was last seen
+            if let Some(hub) = hub {
+                hub.close(auth::now()).await;
+            }
         }
     }
     Ok(())

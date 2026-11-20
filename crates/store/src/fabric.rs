@@ -399,6 +399,19 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Delete sessions of one of the scope's runtimes by id (the hub makes
+    /// room for new sessions by dropping the oldest exited ones).
+    pub fn fabric_sessions_delete(&mut self, runtime: Uuid, ids: &[Uuid]) -> Result<usize> {
+        self.fabric_runtime(runtime)?;
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        for id in ids {
+            n += tx.execute("DELETE FROM fabric_sessions WHERE runtime_id = ?1 AND id = ?2", params![runtime.to_string(), id.to_string()])?;
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// Say that the sessions of one of the scope's runtimes that have not
     /// exited still exist at `now`, so a long-lived session is not expired
     /// while its runtime keeps reporting it.
@@ -552,6 +565,11 @@ mod tests {
         let gone = s.fabric_sessions_expire(250).unwrap();
         assert_eq!(gone, vec![(tom, r.id, b)]);
         assert_eq!(s.fabric_sessions().unwrap().len(), 1);
+        // deleting by id takes only what is named, and only in this runtime
+        let c = Uuid::now_v7();
+        s.fabric_sessions_put(r.id, &[session(c, "taisce/gone", SessionStatus::Exited, 400)]).unwrap();
+        assert_eq!(s.fabric_sessions_delete(r.id, &[c, Uuid::now_v7()]).unwrap(), 1);
+        assert_eq!(s.fabric_sessions().unwrap().len(), 1);
         // over the cap: refused whole, nothing of the batch lands
         let many: Vec<FabricSession> =
             (0..MAX_SESSIONS_PER_RUNTIME).map(|i| session(Uuid::now_v7(), &format!("p/w:{i}"), SessionStatus::Idle, 400)).collect();
@@ -576,6 +594,7 @@ mod tests {
             // every write at Tom's runtime is NotFound, and changes nothing
             assert!(is_not_found(s.fabric_sessions_put(r.id, &[session(sid, "ann/was-here", SessionStatus::Exited, 999)])));
             assert!(is_not_found(s.fabric_sessions_touch(r.id, 999)));
+            assert!(is_not_found(s.fabric_sessions_delete(r.id, &[sid])));
             let link = RuntimeLink { instance_id: None, last_up_seq: 9, version: "x", last_seen_at: None, accounts: "[]", accounts_at: None };
             assert!(is_not_found(s.fabric_runtime_link(r.id, &link)));
             assert!(s.fabric_runtime_revoke("mbp", 5).unwrap().is_none());

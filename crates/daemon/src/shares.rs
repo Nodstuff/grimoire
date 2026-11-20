@@ -239,7 +239,7 @@ pub fn ip_key(ip: &str) -> String {
     }
 }
 
-/// A new comment alert for the link's owner (`push::notify_share_comment`).
+/// A new comment alert for the link's owner (`push::notify_user`).
 #[derive(Debug, Clone)]
 pub struct CommentAlert {
     pub owner: Uuid,

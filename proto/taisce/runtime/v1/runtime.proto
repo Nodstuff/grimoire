@@ -29,10 +29,17 @@
 // whose seq is not above the last one received is a replay of something
 // already applied and is ignored.
 //
+// Versions. A hub ignores a message whose body it does not know (a newer
+// runtime talking to an older hub), and does not count it as received.
+//
 // Limits. A message is at most 1 MiB. A runtime reports at most 200 sessions.
 // Strings are capped in bytes of UTF-8 as each field says. The hub ends the
 // stream with INVALID_ARGUMENT, naming the field, when a message breaks a
-// limit: a runtime trims its text before sending.
+// limit: a runtime trims its text before sending. A stream may send a burst
+// of 400 messages and 50 a second after that. When a runtime at its 200
+// sessions reports a new one, the hub drops the exited session longest
+// unchanged to make room, and refuses (RESOURCE_EXHAUSTED) when none has
+// exited.
 //
 // How a stream ends:
 //   UNAUTHENTICATED      no credential, an unknown or a removed one
@@ -40,7 +47,9 @@
 //   FAILED_PRECONDITION  messages out of the order above
 //   DEADLINE_EXCEEDED    no Hello in time, or no message for three heartbeats
 //   ABORTED              a newer stream for the same runtime took over
-//   RESOURCE_EXHAUSTED   messages arrived faster than the hub accepts
+//   RESOURCE_EXHAUSTED   messages arrived faster than the hub accepts, or
+//                        a 201st live session
+//   UNAVAILABLE          the hub could not store something; reconnect
 syntax = "proto3";
 
 package taisce.runtime.v1;

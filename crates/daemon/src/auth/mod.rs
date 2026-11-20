@@ -532,6 +532,44 @@ pub fn valid_token_name(name: &str) -> anyhow::Result<&str> {
     Ok(name)
 }
 
+/// The user a box-CLI credential is minted for: the owner, or the one user
+/// whose id starts with `key`.
+pub fn user_by_key(store: &SqliteStore, key: Option<&str>) -> anyhow::Result<uuid::Uuid> {
+    match key.map(str::trim) {
+        None => Ok(store.auth_owner()?.ok_or_else(|| anyhow::anyhow!("no owner yet: serve once in server mode"))?.id),
+        Some(key) => {
+            let users: Vec<_> = store
+                .auth_users()?
+                .into_iter()
+                .filter(|u| !key.is_empty() && u.id.to_string().starts_with(key))
+                .collect();
+            match users.as_slice() {
+                [u] => Ok(u.id),
+                _ => anyhow::bail!("no single user matches {key:?}"),
+            }
+        }
+    }
+}
+
+/// How a static credential is registered: `(its stored hash, the secret to
+/// print once)`. With `hash` (the lowercase-hex SHA-256 of a `prefix…`
+/// secret minted elsewhere) nothing is minted and there is no secret;
+/// otherwise `mint` makes one here.
+pub fn secret_or_hash(hash: Option<&str>, prefix: &str, mint: impl FnOnce() -> String) -> anyhow::Result<(String, Option<String>)> {
+    match hash.map(str::trim) {
+        Some(h) => {
+            if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                anyhow::bail!("--hash: 64 lowercase hex chars (sha256 of the {prefix}… token)");
+            }
+            Ok((h.to_string(), None))
+        }
+        None => {
+            let secret = mint();
+            Ok((hash_secret(&secret), Some(secret)))
+        }
+    }
+}
+
 /// Mint a personal access token for `user` (or the owner). The secret is
 /// returned once and stored only as its hash; the audit line names the
 /// token, never its value. With `hash` (a token minted elsewhere, by its
@@ -544,32 +582,8 @@ pub fn create_api_token(
     now: i64,
 ) -> anyhow::Result<(taisce_store::auth::ApiToken, Option<String>)> {
     let name = valid_token_name(name)?;
-    let user_id = match user.map(str::trim) {
-        None => store.auth_owner()?.ok_or_else(|| anyhow::anyhow!("no owner yet: serve once in server mode"))?.id,
-        Some(key) => {
-            let users: Vec<_> = store
-                .auth_users()?
-                .into_iter()
-                .filter(|u| !key.is_empty() && u.id.to_string().starts_with(key))
-                .collect();
-            match users.as_slice() {
-                [u] => u.id,
-                _ => anyhow::bail!("no single user matches {key:?}"),
-            }
-        }
-    };
-    let (hash, secret) = match hash.map(str::trim) {
-        Some(h) => {
-            if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-                anyhow::bail!("--hash: 64 lowercase hex chars (sha256 of the tsk_… token)");
-            }
-            (h.to_string(), None)
-        }
-        None => {
-            let secret = new_api_token();
-            (hash_secret(&secret), Some(secret))
-        }
-    };
+    let user_id = user_by_key(store, user)?;
+    let (hash, secret) = secret_or_hash(hash, PAT_PREFIX, new_api_token)?;
     let t = store.auth_create_api_token(user_id, name, &hash, now)?;
     tracing::info!(target: AUDIT, event = "pat.create", token = %t.id, name = t.name, user = %t.user_id, minted_here = secret.is_some());
     Ok((t, secret))

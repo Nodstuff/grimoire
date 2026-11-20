@@ -20,8 +20,10 @@
 //!   every 20 minutes).
 //!
 //! Visible due alerts are not sent from here (the app schedules local
-//! notifications). The one visible push is `Push::ShareComment`: someone
-//! commented on one of the person's share links (`shares.rs`).
+//! notifications). The visible pushes are `Push::ShareComment` (someone
+//! commented on one of the person's share links, `shares.rs`) and
+//! `Push::FabricSession` (one of the person's Claude sessions came to need
+//! them, stalled or finished a turn; `fabric`), both sent by [`notify_user`].
 
 use crate::auth::Authenticated;
 use crate::changes::Feed;
@@ -183,8 +185,8 @@ impl TokenCache {
 
 // ---- what is sent, and what APNs said ----
 
-/// One push: a silent change nudge, or a visible alert that someone
-/// commented on one of the person's share links.
+/// One push: a silent change nudge, or a visible alert (someone commented
+/// on one of the person's share links; one of their sessions needs them).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Push {
     /// Silent: the journal head moved to `seq`.
@@ -192,6 +194,22 @@ pub enum Push {
     /// Visible: "<author> commented on <title>". The app routes a tap on
     /// `kind: share_comment` to that doc's link comments.
     ShareComment { title: String, author: String, doc_id: uuid::Uuid, share_id: uuid::Uuid },
+    /// Visible: "<address>" / "Needs you". One notification per session:
+    /// a later alert for the same session replaces it (same thread and
+    /// collapse id). Says which session and what it came to, never the
+    /// session's text. The app routes a tap on `kind: fabric_session` to
+    /// that session.
+    FabricSession { address: String, state: &'static str, session_id: uuid::Uuid, runtime_id: uuid::Uuid },
+}
+
+/// What a session's state reads as in a notification.
+fn fabric_state_words(state: &str) -> &'static str {
+    match state {
+        "needs_you" => "Needs you",
+        "stalled" => "Stalled",
+        "finished" => "Finished",
+        _ => "Changed",
+    }
 }
 
 impl Push {
@@ -209,32 +227,47 @@ impl Push {
                 "share_id": share_id,
             })
             .to_string(),
+            Push::FabricSession { address, state, session_id, runtime_id } => json!({
+                "aps": {
+                    "alert": {"title": address, "body": fabric_state_words(state)},
+                    "sound": "default",
+                    "thread-id": format!("fabric:{session_id}"),
+                },
+                "kind": "fabric_session",
+                "session_id": session_id,
+                "runtime_id": runtime_id,
+                "state": state,
+            })
+            .to_string(),
         }
     }
     pub fn push_type(&self) -> &'static str {
         match self {
             Push::Changes { .. } => "background",
-            Push::ShareComment { .. } => "alert",
+            Push::ShareComment { .. } | Push::FabricSession { .. } => "alert",
         }
     }
     pub fn priority(&self) -> &'static str {
         match self {
             Push::Changes { .. } => "5",
-            Push::ShareComment { .. } => "10",
+            Push::ShareComment { .. } | Push::FabricSession { .. } => "10",
         }
     }
-    /// Change nudges collapse into the newest; every comment alert shows.
-    pub fn collapse_id(&self) -> Option<&'static str> {
+    /// Change nudges collapse into the newest, and so do one session's
+    /// alerts; every comment alert shows.
+    pub fn collapse_id(&self) -> Option<String> {
         match self {
-            Push::Changes { .. } => Some("changes"),
+            Push::Changes { .. } => Some("changes".into()),
             Push::ShareComment { .. } => None,
+            // 43 bytes: APNs allows 64
+            Push::FabricSession { session_id, .. } => Some(format!("fabric:{session_id}")),
         }
     }
 }
 
-/// Send a share-comment alert to every active device of `owner`, recording
-/// each outcome as the change nudges do. Fire and forget (spawned).
-pub async fn notify_share_comment<S: Sender>(store: taisce_store::SharedStore, sender: Arc<S>, owner: uuid::Uuid, push: Push) {
+/// Send a visible push to every active device of `owner`, recording each
+/// outcome as the change nudges do. Fire and forget (spawned).
+pub async fn notify_user<S: Sender>(store: taisce_store::SharedStore, sender: Arc<S>, owner: uuid::Uuid, push: Push) {
     let devices = with_store(&store, Scope::System, move |s| s.push_devices_for_user(owner)).await;
     let devices = match devices {
         Ok(d) => d.into_iter().filter(|d| d.disabled_at.is_none()).collect::<Vec<_>>(),
@@ -645,7 +678,7 @@ mod tests {
         assert_eq!(classify(503, "junk"), Outcome::Failed("503".into()));
         let p = Push::Changes { seq: 42 };
         assert_eq!(serde_json::from_str::<Value>(&p.payload()).unwrap(), json!({"aps": {"content-available": 1}, "seq": 42}));
-        assert_eq!((p.push_type(), p.priority(), p.collapse_id()), ("background", "5", Some("changes")));
+        assert_eq!((p.push_type(), p.priority(), p.collapse_id().as_deref()), ("background", "5", Some("changes")));
     }
 
     #[test]
@@ -775,7 +808,7 @@ mod tests {
             // a share-comment alert records as seq -1
             let seq = match push {
                 Push::Changes { seq } => *seq,
-                Push::ShareComment { .. } => -1,
+                Push::ShareComment { .. } | Push::FabricSession { .. } => -1,
             };
             self.sent.lock().unwrap().push((env.to_string(), token.to_string(), seq));
             if token.starts_with("dead") {
@@ -817,8 +850,36 @@ mod tests {
         assert_eq!((v["kind"].as_str(), v["doc_id"].as_str(), v["share_id"].as_str()), (Some("share_comment"), Some(doc.to_string().as_str()), Some(share.to_string().as_str())));
         assert_eq!((push.push_type(), push.priority(), push.collapse_id()), ("alert", "10", None));
         let mock = Arc::new(Mock::default());
-        notify_share_comment(t.store.clone(), mock.clone(), t.tom, push).await;
+        notify_user(t.store.clone(), mock.clone(), t.tom, push).await;
         assert_eq!(*mock.sent.lock().unwrap(), vec![("sandbox".to_string(), mine, -1)]);
+    }
+
+    /// A session alert names the session and its state, nothing of its
+    /// text, and one session's alerts replace each other.
+    #[test]
+    fn a_session_alert_is_one_notification_per_session() {
+        let (session, runtime) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let push = |state| Push::FabricSession { address: "taisce/main".into(), state, session_id: session, runtime_id: runtime };
+        let p = push("needs_you");
+        let v: serde_json::Value = serde_json::from_str(&p.payload()).unwrap();
+        assert_eq!(v["aps"]["alert"], json!({"title": "taisce/main", "body": "Needs you"}));
+        assert_eq!(v["aps"]["sound"], "default");
+        assert_eq!(v["aps"]["thread-id"], format!("fabric:{session}"));
+        assert_eq!(
+            (v["kind"].as_str(), v["state"].as_str(), v["session_id"].as_str(), v["runtime_id"].as_str()),
+            (Some("fabric_session"), Some("needs_you"), Some(session.to_string().as_str()), Some(runtime.to_string().as_str()))
+        );
+        assert_eq!(v.as_object().unwrap().len(), 5, "nothing else rides along: {v}");
+        let collapse = p.collapse_id().unwrap();
+        assert_eq!(collapse, format!("fabric:{session}"));
+        assert!(collapse.len() <= 64, "APNs caps the collapse id at 64 bytes");
+        assert_eq!((p.push_type(), p.priority()), ("alert", "10"));
+        // the same session's next alert carries the same ids
+        let later = push("finished");
+        assert_eq!(later.collapse_id(), p.collapse_id());
+        let v: serde_json::Value = serde_json::from_str(&later.payload()).unwrap();
+        assert_eq!(v["aps"]["alert"]["body"], "Finished");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&push("stalled").payload()).unwrap()["aps"]["alert"]["body"], "Stalled");
     }
 
     #[tokio::test]

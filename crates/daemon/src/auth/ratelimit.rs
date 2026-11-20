@@ -31,6 +31,9 @@ pub enum Class {
     /// book upload token failures on POST /api/books, per IP: guessing
     /// `tbu_` tokens
     UploadAuth,
+    /// runtime credential failures on the runtime channel, per IP: guessing
+    /// `trt_` credentials
+    RuntimeAuth,
 }
 
 impl Class {
@@ -48,6 +51,7 @@ impl Class {
             Class::OpdsDevice => (300.0, 0.25),
             Class::OpdsAuth => (10.0, 6.0),
             Class::UploadAuth => (10.0, 6.0),
+            Class::RuntimeAuth => (10.0, 6.0),
         }
     }
 }

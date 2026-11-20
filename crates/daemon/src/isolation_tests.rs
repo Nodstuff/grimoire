@@ -254,6 +254,15 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/opds/doc/{id}/file", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
     ("/opds/{secret}/docs", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
     ("/opds/{secret}/doc/{id}/file", "the_opds_docs_shelf_serves_only_the_owners_sent_docs"),
+    // Agent Fabric (fabric/routes.rs, fabric/grpc.rs; ADR 0006): a fleet is
+    // its owner's alone on the viewer routes and their stream, and a runtime
+    // credential writes only its own owner's fleet over the runtime channel
+    // (gRPC, its own listener: not an axum route, so the scan cannot see it)
+    ("/api/fabric/sessions", "a_fleet_is_its_owners_alone"),
+    ("/api/fabric/runtimes", "a_fleet_is_its_owners_alone"),
+    ("/api/fabric/stream", "a_fleet_is_its_owners_alone"),
+    ("/api/fabric/sessions", "a_runtime_credential_writes_only_its_owners_fleet"),
+    ("grpc:taisce.runtime.v1.Runtime/Connect", "a_runtime_credential_writes_only_its_owners_fleet"),
 ];
 
 thread_local! {
@@ -305,6 +314,9 @@ struct Fx {
     s3: std::sync::Arc<crate::s3sign::S3Config>,
     /// the stand-in Open Library the colour-cover routes fetch from
     covers: std::sync::Arc<crate::covers::OpenLibrary>,
+    /// Agent Fabric's hub, and the session alerts it raised (APNs stand-in)
+    hub: crate::fabric::Hub,
+    fleet_alerts: std::sync::Arc<std::sync::Mutex<Vec<crate::fabric::SessionAlert>>>,
 }
 
 /// A's book as the store holds it (and its kosync digest, which only the
@@ -334,7 +346,7 @@ fn para(content: &str) -> (Uuid, OpInput) {
 
 /// An OAuth access token for `user`, minted straight into the store (the
 /// passkey ceremony is `auth::tests`' job). `app` = the person's own app.
-fn mint(s: &mut SqliteStore, user: Uuid, name: &str, app: bool) -> String {
+pub(crate) fn mint(s: &mut SqliteStore, user: Uuid, name: &str, app: bool) -> String {
     let redirect = if app { "ie.null.taisce:/cb".to_string() } else { "https://claude.ai/api/mcp/auth_callback".to_string() };
     let client_id = format!("dcr_{}", Uuid::now_v7().simple());
     s.oauth_upsert_client(&OAuthClient {
@@ -476,6 +488,7 @@ fn fixture() -> Fx {
     let dir = std::env::temp_dir().join(format!("taisce-isolation-{}", Uuid::now_v7()));
     let s3 = std::sync::Arc::new(crate::s3sign::S3Config::for_test());
     let covers = std::sync::Arc::new(crate::covers::OpenLibrary::for_test());
+    let (hub, fleet_alerts) = crate::fabric::tests::recording_hub(&store);
     let library = crate::library::LibraryState {
         store: store.clone(),
         s3: Some(s3.clone()),
@@ -520,6 +533,7 @@ fn fixture() -> Fx {
             library: library.clone(),
         }))
         .merge(crate::sentdocs::router(crate::sentdocs::SentState { store: store.clone(), server_mode: true, local_human: a_human }))
+        .merge(crate::fabric::router(crate::fabric::FabricState { hub: Some(hub.clone()), local_human: a_human }))
         .merge(crate::kosync::router(crate::kosync::KosyncState {
             store: store.clone(),
             server: Some(crate::kosync::ServerSide { cfg: st.cfg.clone(), limiter: st.limiter.clone() }),
@@ -558,6 +572,8 @@ fn fixture() -> Fx {
         b_book,
         s3,
         covers,
+        hub,
+        fleet_alerts,
     }
 }
 
@@ -1329,6 +1345,7 @@ fn every_route_and_tool_is_covered() {
         include_str!("kosync.rs"),
         include_str!("sentdocs.rs"),
         include_str!("reader.rs"),
+        include_str!("fabric/routes.rs"),
     ];
     let re = regex::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
     let covered: std::collections::HashSet<&str> = COVERAGE.iter().map(|(p, _)| *p).collect();
@@ -1732,6 +1749,7 @@ fn a_web_session_for_b_sees_none_of_as_data() {
     a_viewer_reading_a_shared_todo_creates_nothing();
     unlabel_into_a_hidden_parent_is_a_generic_refusal();
     a_pre_access_tombstone_is_gone_on_every_block_path();
+    a_fleet_is_its_owners_alone();
 }
 
 /// The members panel works from the web UI in SERVER mode (a session is a
@@ -3496,4 +3514,220 @@ async fn web_reader_doc_positions_are_the_callers_alone() {
     // a connector is refused
     let (st, _) = fx.call(&fx.b_conn, "GET", &format!("/api/docs/{doc}/position"), None).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
+}
+
+// ---- Agent Fabric (ADR 0006) ----
+
+const A_SESSION: &str = "0196f3a0-0000-7000-8000-00000000000a";
+const B_SESSION: &str = "0196f3a0-0000-7000-8000-00000000000b";
+
+/// A session of A's whose every text field is one of her secrets.
+fn a_secret_session(state: &str) -> taisce_runtime_proto::fake::ScriptSession {
+    let z = |what: &str| format!("zebrasecret {what}");
+    taisce_runtime_proto::fake::ScriptSession {
+        fabric: z("fabric"),
+        project: z("project"),
+        worktree: z("worktree"),
+        branch: z("branch"),
+        account: z("account"),
+        tool: z("tool"),
+        note: z("note"),
+        last_line: z("last line"),
+        since: Some(1_800_000_000),
+        ..taisce_runtime_proto::fake::ScriptSession::new(A_SESSION, "zebrasecret/main", state)
+    }
+}
+
+impl Fx {
+    /// Enrol a runtime for `user` as the box CLI does: `(id, credential)`.
+    fn enrol_runtime(&self, user: Uuid, name: &str) -> (Uuid, String) {
+        let (r, secret) =
+            crate::fabric::enrol_runtime(&mut self.store.lock(Scope::System), Some(&user.to_string()), name, None, now()).unwrap();
+        (r.id, secret.unwrap())
+    }
+
+    /// Poll a GET as `token` until its body satisfies `ready` (the runtime
+    /// channel is applied on another task).
+    async fn until(&self, token: &str, path: &str, ready: impl Fn(&str) -> bool) -> String {
+        for _ in 0..500 {
+            let (status, out) = self.call(token, "GET", path, None).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {out}");
+            if ready(&out) {
+                return out;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{path} never got there");
+    }
+}
+
+/// B sees nothing of A's runtimes or sessions: not on the fleet routes, not
+/// on the live stream, not in a notification. A connector is refused and a
+/// PAT never reaches `/api`.
+#[tokio::test]
+async fn a_fleet_is_its_owners_alone() {
+    use crate::fabric::tests::{Sse, serve_channel};
+    use taisce_runtime_proto::fake::{Fake, ScriptAccount, ScriptSession};
+    let fx = fixture();
+    let url = serve_channel(&fx.store, &fx.hub, crate::fabric::grpc::HEARTBEAT).await;
+    // A's Mac reports a session that needs her, on an account named for a secret
+    let (a_rt, a_cred) = fx.enrol_runtime(fx.a, "zebrasecret-mac");
+    let mut a_fake = Fake::connect(&url, &a_cred, "launch-a", 0).await.unwrap();
+    a_fake.snapshot(&[a_secret_session("needs_you")]).await.unwrap();
+    a_fake.accounts(&[ScriptAccount { name: "zebrasecret account".into(), session_used_pct: Some(90), ..Default::default() }]).await.unwrap();
+    let mine = fx.until(&fx.a_app, "/api/fabric/sessions", |o| o.contains("zebrasecret account") && o.contains(A_SESSION)).await;
+    assert!(mine.contains("zebrasecret last line") && mine.contains(&a_rt.to_string()), "{mine}");
+
+    // B, with no runtime of her own: empty, and nothing of A's
+    let hers = |what: &str, out: &str| {
+        fx.no_leak(what, out);
+        for s in [a_rt.to_string(), A_SESSION.to_string()] {
+            assert!(!out.contains(&s), "{what} names {s}: {out}");
+        }
+    };
+    let (st, out) = fx.b("GET", "/api/fabric/sessions", None).await;
+    assert_eq!(st, StatusCode::OK);
+    hers("fleet", &out);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!((v["runtimes"].as_array().unwrap().len(), v["sessions"].as_array().unwrap().len()), (0, 0), "{out}");
+    let (st, out) = fx.b("GET", "/api/fabric/runtimes", None).await;
+    assert_eq!((st, out.as_str()), (StatusCode::OK, r#"{"runtimes":[]}"#));
+
+    // B's own Mac: she sees hers, A sees only her own
+    let (b_rt, b_cred) = fx.enrol_runtime(fx.b, "air");
+    let mut b_fake = Fake::connect(&url, &b_cred, "launch-b", 0).await.unwrap();
+    let b_session = |state: &str| ScriptSession { since: Some(1_800_000_000), ..ScriptSession::new(B_SESSION, "aoifeown/main", state) };
+    b_fake.snapshot(&[b_session("working")]).await.unwrap();
+    let out = fx.until(&fx.b_app, "/api/fabric/sessions", |o| o.contains(B_SESSION)).await;
+    hers("fleet", &out);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!((v["runtimes"].as_array().unwrap().len(), v["sessions"].as_array().unwrap().len()), (1, 1), "{out}");
+    assert_eq!((v["runtimes"][0]["id"].as_str(), v["runtimes"][0]["online"].as_bool()), (Some(b_rt.to_string().as_str()), Some(true)));
+    let (_, out) = fx.b("GET", "/api/fabric/runtimes", None).await;
+    hers("runtimes", &out);
+    assert!(out.contains("\"air\""), "{out}");
+    let (_, toms) = fx.call(&fx.a_app, "GET", "/api/fabric/sessions", None).await;
+    assert!(!toms.contains("aoifeown") && !toms.contains(&b_rt.to_string()) && !toms.contains("\"air\""), "{toms}");
+
+    // the live stream: B's opens with her fleet; a change in A's never
+    // reaches it; her own next change is the very next event
+    let req = authed(Request::builder().method("GET").uri("/api/fabric/stream").header("host", "localhost:7513"), &fx.b_app, "GET");
+    let mut sse = Sse::open(&fx.app, req.body(Body::empty()).unwrap()).await;
+    let (event, _, fleet) = sse.next().await;
+    assert_eq!(event, "fleet");
+    hers("stream fleet", &fleet.to_string());
+    assert_eq!(fleet["sessions"][0]["id"], B_SESSION);
+    a_fake.state(&a_secret_session("working")).await.unwrap();
+    a_fake.state(&a_secret_session("finished")).await.unwrap();
+    fx.until(&fx.a_app, "/api/fabric/sessions", |o| o.contains("\"finished\"")).await;
+    drop(a_fake);
+    fx.until(&fx.a_app, "/api/fabric/runtimes", |o| o.contains("\"online\":false")).await;
+    b_fake.state(&b_session("finished")).await.unwrap();
+    let (event, _, v) = sse.next().await;
+    hers("stream event", &v.to_string());
+    assert_eq!((event.as_str(), v["id"].as_str(), v["state"].as_str()), ("session", Some(B_SESSION), Some("finished")));
+
+    // each person's alerts are their own
+    let alerts = crate::fabric::tests::alerts_when(&fx.fleet_alerts, 3).await;
+    let of = |user: Uuid| alerts.iter().filter(|a| a.user == user).map(|a| a.address.clone()).collect::<Vec<_>>();
+    assert_eq!(of(fx.a), ["zebrasecret/main", "zebrasecret/main"], "needs_you, then the end of a turn");
+    assert_eq!(of(fx.b), ["aoifeown/main"]);
+    // and what a notification carries is the address and the state, nothing else of the session
+    let push = crate::fabric::alert_push(&alerts[0]).payload();
+    for field in ["note", "last line", "branch", "project", "tool", "account", "fabric", "worktree"] {
+        assert!(!push.contains(&format!("zebrasecret {field}")), "{push}");
+    }
+
+    // a fleet is read by a person: her connector is refused, her PAT is no token on /api
+    for path in ["/api/fabric/sessions", "/api/fabric/runtimes", "/api/fabric/stream"] {
+        let (st, out) = fx.call(&fx.b_conn, "GET", path, None).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{path}: {out}");
+        hers(path, &out);
+        assert_eq!(fx.call(&fx.b_pat, "GET", path, None).await.0, StatusCode::UNAUTHORIZED, "{path}");
+    }
+    // no MCP tool reads or changes a fleet
+    for t in crate::mcp::KsMcp::tool_router().list_all() {
+        for word in ["fabric", "fleet", "runtime", "session"] {
+            assert!(!t.name.contains(word), "MCP tool {} looks like an Agent Fabric surface", t.name);
+        }
+    }
+}
+
+/// The runtime channel: B's credential reaches B's fleet and nothing else,
+/// whatever ids its messages carry; no other kind of token opens the
+/// channel, and a runtime credential opens nothing but the channel.
+#[tokio::test]
+async fn a_runtime_credential_writes_only_its_owners_fleet() {
+    use crate::fabric::tests::serve_channel;
+    use taisce_runtime_proto::fake::{Fake, ScriptSession};
+    use taisce_runtime_proto::v1 as pb;
+    let fx = fixture();
+    let url = serve_channel(&fx.store, &fx.hub, crate::fabric::grpc::HEARTBEAT).await;
+    let (a_rt, a_cred) = fx.enrol_runtime(fx.a, "mbp");
+    let mut a_fake = Fake::connect(&url, &a_cred, "launch-a", 0).await.unwrap();
+    a_fake.snapshot(&[a_secret_session("working")]).await.unwrap();
+    let before = fx.until(&fx.a_app, "/api/fabric/sessions", |o| o.contains(A_SESSION)).await;
+    let a_rows = || fx.store.lock(Scope::User(fx.a)).fabric_sessions().unwrap();
+    let a_before = a_rows();
+    assert_eq!(a_before.len(), 1);
+
+    // B's runtime may carry the same name: names are per person
+    let (b_rt, b_cred) = fx.enrol_runtime(fx.b, "mbp");
+    // B's credential naming A's runtime in its Hello: refused
+    let (tx, mut down) = Fake::open(&url, Some(&b_cred)).await.unwrap();
+    let hello = pb::Hello { runtime_id: a_rt.to_string(), instance_id: "launch-b".into(), version: "1".into(), last_down_seq: 0 };
+    tx.send(pb::Up { seq: 0, body: Some(pb::up::Body::Hello(hello)) }).await.unwrap();
+    assert_eq!(down.message().await.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    // B's stream sends a snapshot ("replaces everything") and then a state
+    // event, both carrying A's session id with content of B's choosing
+    let mut b_fake = Fake::connect(&url, &b_cred, "launch-b", 0).await.unwrap();
+    assert_eq!(b_fake.welcome.runtime_id, b_rt.to_string());
+    let planted = |state: &str| ScriptSession { note: "aoifeown planted".into(), since: Some(1), ..ScriptSession::new(A_SESSION, "aoifeown/planted", state) };
+    b_fake.snapshot(&[planted("exited")]).await.unwrap();
+    b_fake.state(&planted("needs_you")).await.unwrap();
+    let hers = fx.until(&fx.b_app, "/api/fabric/sessions", |o| o.contains("\"needs_you\"")).await;
+    fx.no_leak_besides("B's fleet", &hers, &[]);
+    assert!(hers.contains("aoifeown/planted") && !hers.contains(&a_rt.to_string()), "it landed in her own fleet: {hers}");
+    // an empty snapshot from B exits B's sessions, never A's
+    b_fake.snapshot(&[]).await.unwrap();
+    fx.until(&fx.b_app, "/api/fabric/sessions", |o| o.contains("\"exited\"")).await;
+    fx.hub.flush().await;
+
+    // A's fleet is exactly as it was: on the route, in the hub, in SQLite
+    let (_, after) = fx.call(&fx.a_app, "GET", "/api/fabric/sessions", None).await;
+    let strip = |s: &str| {
+        // last_seen_at of an online runtime is "now": compare without it
+        let mut v: Value = serde_json::from_str(s).unwrap();
+        v["runtimes"][0]["last_seen_at"] = Value::Null;
+        v
+    };
+    assert_eq!(strip(&after), strip(&before));
+    assert!(!after.contains("aoifeown"), "{after}");
+    assert_eq!(a_rows(), a_before);
+    let b_rows = fx.store.lock(Scope::User(fx.b)).fabric_sessions().unwrap();
+    assert_eq!(b_rows.iter().map(|s| (s.runtime_id, s.user_id, s.address.as_str())).collect::<Vec<_>>(), [(b_rt, fx.b, "aoifeown/planted")]);
+    // only B was alerted about the planted session
+    let alerts = crate::fabric::tests::alerts_when(&fx.fleet_alerts, 1).await;
+    assert_eq!(alerts.iter().map(|a| (a.user, a.address.as_str())).collect::<Vec<_>>(), [(fx.b, "aoifeown/planted")]);
+
+    // nothing but a runtime credential opens the channel
+    for (what, token) in [("app token", &fx.b_app), ("connector token", &fx.b_conn), ("PAT", &fx.b_pat)] {
+        // (as B's browser, `b_app` is a cookie value: no bearer at all, just as unknown)
+        let token = token.strip_prefix(COOKIE_TOKEN).unwrap_or(token);
+        match Fake::open(&url, Some(token)).await {
+            Err(e) => assert_eq!(e.code(), Some(tonic::Code::Unauthenticated), "{what}: {e}"),
+            Ok(_) => panic!("a {what} opened the runtime channel"),
+        }
+    }
+    // and a runtime credential opens nothing else: not /api, not /mcp, not as A
+    for path in ["/api/fabric/sessions", "/api/fabric/runtimes", "/api/fabric/stream", "/api/docs", "/api/changes", "/mcp"] {
+        for cred in [&a_cred, &b_cred] {
+            let (st, out) = fx.call(cred, "GET", path, None).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "{path}: {out}");
+            fx.no_leak(path, &out);
+        }
+    }
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "orient", "arguments": {}}});
+    assert_eq!(fx.call(&b_cred, "POST", "/mcp", Some(call)).await.0, StatusCode::UNAUTHORIZED, "no MCP tool call either");
 }
