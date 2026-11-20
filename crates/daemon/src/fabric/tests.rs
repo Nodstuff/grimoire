@@ -320,6 +320,62 @@ async fn the_channel_takes_only_a_runtime_credential_and_the_credential_opens_on
     unauthenticated(Fake::connect(&t.url, &credential, "launch-1", 0).await.map(|_| ()));
 }
 
+/// More than 200 small updates sent as fast as the runtime can: the send
+/// window holds (never more than 64 unacknowledged), the hub acknowledges
+/// them all, and every one of them arrives, in order.
+#[tokio::test]
+async fn a_burst_of_small_updates_flows_through_the_window_and_nothing_is_lost() {
+    use taisce_runtime_proto::window::{ACK_EVERY, WINDOW};
+    const UPDATES: u64 = 300;
+    let t = setup().await;
+    let (runtime, credential) = t.enrol("mbp");
+    let (_, mut changes) = t.hub.watch(t.user).await.unwrap();
+    let mut fake = Fake::connect(&t.url, &credential, "launch-1", 0).await.unwrap();
+    let ids = [S1, S2, "0196f3a0-0000-7000-8000-000000000003"];
+    fake.snapshot(&ids.map(|id| session(id, "p/w", "working"))).await.unwrap();
+    for i in 1..=UPDATES {
+        let mut s = session(ids[(i % 3) as usize], "p/w", "working");
+        s.note = format!("update {i}");
+        fake.state(&s).await.unwrap();
+    }
+    fake.drained().await.unwrap();
+    assert_eq!((fake.seq(), fake.acked()), (UPDATES, UPDATES), "every event acknowledged");
+    assert!(fake.peak_in_flight() <= WINDOW, "{} in flight", fake.peak_in_flight());
+    assert!(fake.peak_in_flight() > ACK_EVERY, "the burst did outrun the acks: the window was exercised");
+    // every update was published once, in the order sent
+    let mut notes = vec![];
+    while let Ok(e) = changes.try_recv() {
+        if let super::hub::Change::Session(s) = &e.change
+            && !s.note.is_empty()
+        {
+            notes.push(s.note.clone());
+        }
+    }
+    assert_eq!(notes, (1..=UPDATES).map(|i| format!("update {i}")).collect::<Vec<_>>());
+    // the fleet holds the last of each, and after the flush so does SQLite
+    let fleet = t.get("/api/fabric/sessions").await;
+    let mut held: Vec<&str> = fleet["sessions"].as_array().unwrap().iter().map(|s| s["note"].as_str().unwrap()).collect();
+    held.sort();
+    assert_eq!(held, ["update 298", "update 299", "update 300"]);
+    t.hub.flush().await;
+    assert_eq!(t.store.lock(Scope::System).fabric_runtime(runtime).unwrap().last_up_seq, UPDATES);
+    assert_eq!(t.stored(ids[0]).note, "update 300");
+
+    // the stream drops mid-burst and the runtime resumes: the Welcome says
+    // where the hub got to, the snapshot restores the rest
+    fake.disconnect();
+    let mut fake = Fake::connect(&t.url, &credential, "launch-1", UPDATES).await.unwrap();
+    assert_eq!(fake.welcome.last_up_seq, UPDATES);
+    let mut s = session(ids[0], "p/w", "working");
+    s.note = "after the gap".into();
+    fake.snapshot(&[s.clone(), session(ids[1], "p/w", "working"), session(ids[2], "p/w", "working")]).await.unwrap();
+    // a lone event is acknowledged within the quarter second, not after sixteen
+    s.note = "one more".into();
+    fake.state(&s).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), fake.drained()).await.expect("an ack within 250 ms").unwrap();
+    assert_eq!(fake.acked(), UPDATES + 1);
+}
+
 /// The contract is enforced: order, limits, one live stream, liveness.
 #[tokio::test]
 async fn a_stream_that_breaks_the_contract_is_ended_with_the_reason() {

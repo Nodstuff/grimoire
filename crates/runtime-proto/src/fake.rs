@@ -1,14 +1,17 @@
 //! A fake runtime: a small client that signs in to the runtime channel and
 //! plays a scripted sequence of events. It stands in for Workbox in the
 //! daemon's tests and when driving a scratch daemon by hand (the
-//! `fake_runtime` example). It follows the contract in `runtime.proto`; the
-//! raw senders ([`Fake::open`], [`Fake::send`]) exist so a test can also
-//! break it on purpose.
+//! `fake_runtime` example). It follows the contract in `runtime.proto`,
+//! the send window included: an event waits while 64 are unacknowledged.
+//! The raw senders ([`Fake::open`], [`Fake::send`]) exist so a test can
+//! also break the contract on purpose.
 
 use crate::v1::runtime_client::RuntimeClient;
-use crate::v1::{Account, Accounts, Down, Heartbeat, Hello, SessionState, Snapshot, Status, Up, Welcome, down, up};
+use crate::v1::{Account, Accounts, Ack, Down, Heartbeat, Hello, SessionState, Snapshot, Status, Up, Welcome, down, up};
+use crate::window::SendWindow;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Debug)]
@@ -137,12 +140,31 @@ fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// How a stream ended, once it has.
+#[derive(Debug, Clone)]
+enum End {
+    Open,
+    /// Ended by the hub: with a status, or cleanly (None).
+    Closed(Option<tonic::Status>),
+}
+
+/// What the reader task and the sender share.
+#[derive(Default)]
+struct Flow {
+    window: Mutex<SendWindow>,
+    /// The highest event number the hub has acknowledged.
+    acked: Mutex<u64>,
+    /// Poked on every Ack.
+    moved: Notify,
+}
+
 /// An open stream that has been welcomed.
 pub struct Fake {
     tx: mpsc::Sender<Up>,
-    down: tonic::Streaming<Down>,
     /// The last event number this instance assigned.
     seq: u64,
+    flow: Arc<Flow>,
+    end: watch::Receiver<End>,
     pub welcome: Welcome,
 }
 
@@ -161,7 +183,7 @@ impl Fake {
             let value = format!("Bearer {c}").parse().map_err(|_| Error::Transport("the credential is not a header value".into()))?;
             req.metadata_mut().insert("authorization", value);
         }
-        let down = RuntimeClient::new(channel).connect(req).await.map_err(Error::Status)?.into_inner();
+        let down = RuntimeClient::new(channel).attach(req).await.map_err(Error::Status)?.into_inner();
         Ok((tx, down))
     }
 
@@ -182,7 +204,10 @@ impl Fake {
             Some(other) => return Err(Error::Protocol(format!("expected a Welcome, got {other:?}"))),
             None => return Err(Error::Protocol("the stream ended before a Welcome".into())),
         };
-        Ok(Fake { tx, down, seq: resume_seq, welcome })
+        let flow = Arc::new(Flow::default());
+        let (ended, end) = watch::channel(End::Open);
+        tokio::spawn(read(down, flow.clone(), tx.downgrade(), ended));
+        Ok(Fake { tx, seq: resume_seq, flow, end, welcome })
     }
 
     /// The last event number assigned.
@@ -190,21 +215,65 @@ impl Fake {
         self.seq
     }
 
-    /// Send one message exactly as given. When the hub has already ended
-    /// the stream, the error is the status it ended with.
+    /// The highest event number the hub has acknowledged on this stream.
+    pub fn acked(&self) -> u64 {
+        *self.flow.acked.lock().unwrap()
+    }
+
+    /// The most events this stream ever had in flight at once.
+    pub fn peak_in_flight(&self) -> usize {
+        self.flow.window.lock().unwrap().peak()
+    }
+
+    /// Send one message exactly as given, outside the window. When the hub
+    /// has already ended the stream, the error is the status it ended with.
     pub async fn send(&mut self, up: Up) -> Result<(), Error> {
         if self.tx.send(up).await.is_ok() {
             return Ok(());
         }
-        Err(match self.ended().await {
-            Some(status) => Error::Status(status),
-            None => Error::Protocol("the stream closed".into()),
-        })
+        Err(self.closed().await)
     }
 
+    /// The error for a stream the hub has ended.
+    async fn closed(&mut self) -> Error {
+        match self.ended().await {
+            Some(status) => Error::Status(status),
+            None => Error::Protocol("the stream closed".into()),
+        }
+    }
+
+    /// Send the next event, waiting first while the window is full.
     async fn event(&mut self, body: up::Body) -> Result<(), Error> {
-        self.seq += 1;
-        self.send(Up { seq: self.seq, body: Some(body) }).await
+        let seq = self.seq + 1;
+        loop {
+            // registered before the check, so an Ack between the two still wakes
+            let moved = self.flow.moved.notified();
+            if self.flow.window.lock().unwrap().sent(seq) {
+                break;
+            }
+            let mut end = self.end.clone();
+            tokio::select! {
+                _ = moved => {}
+                _ = end.wait_for(|e| matches!(e, End::Closed(_))) => return Err(self.closed().await),
+            }
+        }
+        self.seq = seq;
+        self.send(Up { seq, body: Some(body) }).await
+    }
+
+    /// Wait until the hub has acknowledged every event sent.
+    pub async fn drained(&mut self) -> Result<(), Error> {
+        loop {
+            let moved = self.flow.moved.notified();
+            if self.flow.window.lock().unwrap().in_flight() == 0 {
+                return Ok(());
+            }
+            let mut end = self.end.clone();
+            tokio::select! {
+                _ = moved => {}
+                _ = end.wait_for(|e| matches!(e, End::Closed(_))) => return Err(self.closed().await),
+            }
+        }
     }
 
     /// Every session, as of the last event assigned.
@@ -244,15 +313,40 @@ impl Fake {
     /// Wait for the hub to end the stream and say how: the status it ended
     /// with, or None for a clean end.
     pub async fn ended(&mut self) -> Option<tonic::Status> {
-        loop {
-            match self.down.message().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => return None,
-                Err(status) => return Some(status),
-            }
+        match self.end.wait_for(|e| matches!(e, End::Closed(_))).await.map(|e| e.clone()) {
+            Ok(End::Closed(status)) => status,
+            // the reader is gone without a word: a clean end
+            _ => None,
         }
     }
 
     /// Hang up: the hub sees the stream end.
     pub fn disconnect(self) {}
+}
+
+/// Read everything the hub sends for as long as the stream lasts: an Ack
+/// opens the window; an event (none exist in this slice) is acknowledged at
+/// once. Holds only a weak sender, so dropping the [`Fake`] hangs up.
+async fn read(mut down: tonic::Streaming<Down>, flow: Arc<Flow>, tx: mpsc::WeakSender<Up>, ended: watch::Sender<End>) {
+    let end = loop {
+        match down.message().await {
+            Ok(Some(msg)) => {
+                if let Some(down::Body::Ack(Ack { seq })) = msg.body {
+                    flow.window.lock().unwrap().acked(seq);
+                    let mut acked = flow.acked.lock().unwrap();
+                    *acked = (*acked).max(seq);
+                    drop(acked);
+                    flow.moved.notify_waiters();
+                } else if msg.seq > 0
+                    && let Some(tx) = tx.upgrade()
+                {
+                    let _ = tx.send(Up { seq: 0, body: Some(up::Body::Ack(Ack { seq: msg.seq })) }).await;
+                }
+            }
+            Ok(None) => break None,
+            Err(status) => break Some(status),
+        }
+    };
+    let _ = ended.send(End::Closed(end));
+    flow.moved.notify_waiters();
 }

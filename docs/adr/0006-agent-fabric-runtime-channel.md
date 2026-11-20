@@ -1,6 +1,7 @@
 # ADR 0006 — Agent Fabric: the runtime channel and the fleet (Slice 1, Watch)
 
-- **Status**: accepted (2026-11-20). Covers Slice 1 only; later slices add to it.
+- **Status**: accepted (2026-11-20; revised the same day after the transport spike: §5a, the
+  rpc's name, the proxy route). Covers Slice 1 only; later slices add to it.
 - **Who/when**: Tom + Claude, 2026-11-20
 - **Scope**: SERVER mode only. In LOCAL mode the viewer routes answer 404 and no runtime can
   connect.
@@ -26,7 +27,7 @@ Hello, so nothing here can make a Mac do anything.
 ### 1. gRPC, on the runtime leg only
 
 The runtime and the hub speak gRPC: one bidirectional stream per runtime
-(`Runtime.Connect(stream Up) returns (stream Down)`). The runtime is a native Swift app built
+(`Runtime.Attach(stream Up) returns (stream Down)`). The runtime is a native Swift app built
 in another repository by another session, and a `.proto` file is a contract both sides
 generate from. Everything else keeps the transport it has: the phone and the web UI use
 `/api` over HTTPS with SSE, agents use `/mcp`, pushes go by APNs.
@@ -39,13 +40,15 @@ generate from. Everything else keeps the transport it has: the phone and the web
   Slice 4: adding an rpc is a compatible change, its messages have no agreed shape yet, and a
   call to it today already answers UNIMPLEMENTED.
 - A body the hub does not know is ignored, so a runtime one slice ahead still works.
+- The rpc is `Attach`, not `Connect`: tonic's generated client already has a `connect()`
+  constructor, and an rpc of that name does not compile beside it (E0592).
 
 ### 2. Its own listener
 
 The service listens on its own loopback port (`serve --runtime-grpc-port`, env
 `TAISCE_RUNTIME_GRPC_PORT`; off unless set), cleartext HTTP/2: the proxy terminates TLS and
-routes `/taisce.runtime.v1.Runtime/` to it (`infra/deploy/portus.yaml`, ahead of the
-catch-all, with no timeout and no body limit). The axum app, its router and its
+routes `/taisce.runtime.v1.Runtime/` to it (`infra/deploy/portus.yaml`; §5a says what that
+route must and must not set). The axum app, its router and its
 `require_auth` layering are untouched: no data route became reachable in a new way, and the
 service cannot be reached through a path `require_auth` guards differently.
 
@@ -120,9 +123,42 @@ newer one. A crash loses at most 5 seconds of detail, never a change of state.
 - **One stream per runtime.** A new stream supersedes the old, which ends with ABORTED.
 - **Liveness.** The runtime sends a heartbeat every 20 seconds when idle; three missed ends
   the stream. HTTP/2 pings stop at the proxy, so the heartbeat is a message.
+- **Flow control.** A send window of 64 unacknowledged events each way (§5a).
 - **Limits.** 1 MiB a message, 200 sessions a runtime, 16 runtimes a person, byte caps per
   field, a burst of 400 messages then 50 a second. A breach ends the stream with a status
   that names the reason. At 200 sessions the exited one longest unchanged makes room.
+
+### 5a. Constraints the proxy puts on the channel
+
+A spike on 2026-11-20 ran a tonic server and a Swift client through the real proxy (Portus,
+on rama 0.4.0). It works, and it found three things the design has to hold to.
+
+| What the proxy does | Cause | What the channel does about it |
+|---|---|---|
+| Ends an HTTP/2 connection once about 145 DATA frames under 256 bytes are buffered on it, in either direction (GOAWAY `too_many_data_frames`, or RST `ENHANCE_YOUR_CALM`). Any other stream sharing that pooled upstream connection dies with it. | A hard-coded budget in rama's HTTP/2 code. | **A send window with acknowledgements.** Neither side may have more than 64 events in flight that the other has not acknowledged. `Ack{seq}` (both directions, cumulative) is sent once 16 events are unacknowledged or 250 ms after the oldest. A full window and the acks it earns stay far below 145 frames. |
+| Caps the total bytes a client sends on one stream at 10 MiB when a route sets no `max_request_body_bytes` (0 also means the default), and kills the stream with an HTTP/2 error, not a 413. | The request-body limit is applied to a stream's running total. | The gRPC route sets `max_request_body_bytes: 18446744073709551615`. |
+| Cuts every stream, after a 25 second drain, each time it restarts. (A config hot-reload does not.) | A restart closes its connections. | **A stream is finite.** Resuming by sequence number is the normal path: see §5, Order and Snapshots. |
+
+- The window is in the protocol, not in tuning. `taisce_runtime_proto::window` holds both
+  halves (`SendWindow`, `Receipts`), shared by the hub and the fake runtime. Everything the
+  hub sends goes through one sender (`fabric::grpc::DownSender`) that holds the hub's own
+  events to the window. In this slice the hub sends only a Welcome and acks, both outside the
+  window, so the sender is there for orders and nudges to inherit.
+- Hello, Welcome, Snapshot, Heartbeat and Ack are outside the window. Each is rare by
+  construction: one per stream, one per 20 idle seconds, or one per 16 events.
+- **An Ack is flow control, not durability.** The hub writes a change of state at once and
+  the rest within 5 seconds, so a crash can lose acknowledged detail. The resume point is
+  the Welcome's `last_up_seq`. For this slice's events that is enough: a snapshot restores
+  every session, and a runtime sends its accounts again after the snapshot that opens a
+  stream. A later slice whose events a snapshot cannot restore (turns, results) must write
+  them before acknowledging them.
+- The hub cannot see whether a runtime obeys the window; a runtime that does not harms its
+  own connection. The hub's side of the bargain is to acknowledge promptly, and it does so
+  for replayed events too.
+- Route order in `portus.yaml` does not matter: the longest path prefix wins.
+- The proxy forwards `authorization` intact and adds `x-forwarded-for` (which the failed
+  sign-in rate limit reads). It pings the backend every 30 seconds and drops every stream if
+  unanswered for 20; tonic answers HTTP/2 pings by default.
 
 ### 6. Retention: 7 days
 
@@ -184,7 +220,11 @@ safer default is to send no text.
 ## Consequences
 
 - A second loopback port on the box (7426), a route in `portus.yaml` and a variable in
-  `taisce.service`. The route must carry no timeout.
+  `taisce.service`. The route must carry no timeout, and must carry the body limit of §5a.
+- Every restart of the proxy disconnects every runtime for a moment. Each reconnects and
+  resumes; the fleet shows them offline in between.
+- A runtime must implement the send window. One that floods small events takes down its own
+  proxy connection, and any stream sharing it.
 - The daemon gains tonic, prost and tokio-stream; the build gains protox and
   tonic-prost-build. axum, hyper and tower are the versions already in the tree.
 - The hub is in one process. A second daemon on the same database would not see its fleet;

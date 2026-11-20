@@ -12,8 +12,14 @@
 //! `Scope::User`, keyed to the runtime the credential named, so no message
 //! can reach another person's fleet whatever ids it carries.
 //!
-//! The order of a stream, its limits and how it ends are stated in
-//! `proto/taisce/runtime/v1/runtime.proto`; this file enforces them.
+//! The order of a stream, its limits, its flow control and how it ends are
+//! stated in `proto/taisce/runtime/v1/runtime.proto`; this file enforces
+//! them. Flow control is the part forced on the design: the proxy ends an
+//! HTTP/2 connection once about 145 small DATA frames are buffered on it,
+//! so neither side may have more than 64 unacknowledged events in flight.
+//! The hub acknowledges what it takes ([`Receipts`]: every 16 events or
+//! 250 ms) and everything it sends goes through [`DownSender`], which holds
+//! the same window for the hub's own events.
 
 use super::hub::{Connected, Hub, Incoming, Kill, Refused};
 use crate::auth::ratelimit::{Class, Limiter};
@@ -22,6 +28,7 @@ use std::time::Duration;
 use taisce_runtime_proto::CREDENTIAL_PREFIX;
 use taisce_runtime_proto::v1::runtime_server::{Runtime, RuntimeServer};
 use taisce_runtime_proto::v1::{self as pb, down, up};
+use taisce_runtime_proto::window::{Receipts, SendWindow};
 use taisce_store::fabric::{FabricRuntime, FabricSession, MAX_SESSIONS_PER_RUNTIME, SessionStatus};
 use taisce_store::{Scope, SharedStore};
 use tokio::sync::mpsc;
@@ -104,9 +111,9 @@ impl RuntimeService {
 
 #[tonic::async_trait]
 impl Runtime for RuntimeService {
-    type ConnectStream = ReceiverStream<Result<pb::Down, Status>>;
+    type AttachStream = ReceiverStream<Result<pb::Down, Status>>;
 
-    async fn connect(&self, req: Request<Streaming<pb::Up>>) -> Result<Response<Self::ConnectStream>, Status> {
+    async fn attach(&self, req: Request<Streaming<pb::Up>>) -> Result<Response<Self::AttachStream>, Status> {
         let runtime = self.authenticate(&req).await?;
         let ip = self.client_ip(&req);
         let (tx, rx) = mpsc::channel(8);
@@ -118,6 +125,61 @@ impl Runtime for RuntimeService {
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+/// Why something was not sent down a stream.
+#[derive(Debug)]
+pub enum Unsent {
+    /// 64 events are unacknowledged: the caller keeps the body and tries
+    /// again after the next Ack.
+    WindowFull,
+    /// The runtime has hung up.
+    Gone,
+}
+
+/// The one way anything is sent down a stream. Events are numbered and
+/// held to the send window; the Welcome and Acks are outside it.
+pub struct DownSender {
+    tx: mpsc::Sender<Result<pb::Down, Status>>,
+    window: SendWindow,
+    /// The last event number assigned on this stream.
+    seq: u64,
+}
+
+impl DownSender {
+    /// A sender whose events are numbered after `last_seq` (the last Down
+    /// event the runtime's Hello said it had received).
+    pub fn new(tx: mpsc::Sender<Result<pb::Down, Status>>, last_seq: u64) -> Self {
+        Self { tx, window: SendWindow::default(), seq: last_seq }
+    }
+
+    /// Send a message that is not an event (Welcome, Ack): unnumbered,
+    /// outside the window.
+    async fn control(&self, body: down::Body) -> Result<(), Unsent> {
+        self.tx.send(Ok(pb::Down { seq: 0, body: Some(body) })).await.map_err(|_| Unsent::Gone)
+    }
+
+    /// Send the next event, if the window has room. Nothing in Slice 1
+    /// sends one: orders and nudges will.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn event(&mut self, body: &down::Body) -> Result<u64, Unsent> {
+        let seq = self.seq + 1;
+        if !self.window.sent(seq) {
+            return Err(Unsent::WindowFull);
+        }
+        self.seq = seq;
+        self.tx.send(Ok(pb::Down { seq, body: Some(body.clone()) })).await.map_err(|_| Unsent::Gone)?;
+        Ok(seq)
+    }
+
+    /// The runtime has received every event up to `seq`.
+    fn acked(&mut self, seq: u64) {
+        self.window.acked(seq);
+    }
+
+    async fn ack(&self, receipts: &mut Receipts) -> Result<(), Unsent> {
+        self.control(down::Body::Ack(pb::Ack { seq: receipts.ack() })).await
     }
 }
 
@@ -153,8 +215,9 @@ async fn stream(
     tracing::info!(target: crate::auth::AUDIT, event = "runtime.connect", runtime = %runtime.id, name = runtime.name,
         user = %runtime.user_id, instance = hello.instance_id, version = hello.version, ip);
     let welcome = pb::Welcome { last_up_seq, runtime_id: runtime.id.to_string(), heartbeat_secs: heartbeat.as_secs().max(1) as u32 };
-    let ended = match tx.send(Ok(pb::Down { seq: 0, body: Some(down::Body::Welcome(welcome)) })).await {
-        Ok(()) => events(hub, runtime, conn, &mut inbound, &mut kill, heartbeat).await,
+    let mut down = DownSender::new(tx.clone(), hello.last_down_seq);
+    let ended = match down.control(down::Body::Welcome(welcome)).await {
+        Ok(()) => events(hub, runtime, conn, &mut inbound, &mut kill, heartbeat, &mut down, Receipts::starting_at(last_up_seq)).await,
         // the runtime hung up before its Welcome
         Err(_) => Ok(()),
     };
@@ -164,6 +227,7 @@ async fn stream(
 }
 
 /// Everything after the Welcome.
+#[allow(clippy::too_many_arguments)]
 async fn events(
     hub: &Hub,
     runtime: &FabricRuntime,
@@ -171,12 +235,15 @@ async fn events(
     inbound: &mut Streaming<pb::Up>,
     kill: &mut tokio::sync::oneshot::Receiver<Kill>,
     heartbeat: Duration,
+    down: &mut DownSender,
+    mut receipts: Receipts,
 ) -> Result<(), Status> {
     let (user, id) = (runtime.user_id, runtime.id);
     let mut budget = Budget::new(tokio::time::Instant::now());
     let mut recheck = tokio::time::interval_at(tokio::time::Instant::now() + RECHECK, RECHECK);
     let mut snapshot_seen = false;
     loop {
+        let ack_due = receipts.due_at().map(tokio::time::Instant::from_std);
         let up = tokio::select! {
             biased;
             why = &mut *kill => {
@@ -188,6 +255,13 @@ async fn events(
             _ = recheck.tick() => {
                 if !hub.still_enrolled(user, id).await {
                     return Err(Status::unauthenticated("this runtime was removed"));
+                }
+                continue;
+            }
+            // what has been taken is acknowledged within 250 ms
+            _ = tokio::time::sleep_until(ack_due.unwrap_or_else(tokio::time::Instant::now)), if ack_due.is_some() => {
+                if down.ack(&mut receipts).await.is_err() {
+                    return Ok(());
                 }
                 continue;
             }
@@ -204,6 +278,10 @@ async fn events(
         let now = crate::auth::now();
         let incoming = match up.body {
             Some(up::Body::Hello(_)) => return Err(Status::failed_precondition("a second Hello on one stream")),
+            Some(up::Body::Ack(a)) => {
+                down.acked(a.seq);
+                continue;
+            }
             Some(up::Body::Snapshot(s)) => {
                 snapshot_seen = true;
                 if s.sessions.len() > MAX_SESSIONS_PER_RUNTIME {
@@ -219,7 +297,20 @@ async fn events(
             // a body this build does not know (a newer runtime): ignored
             None => continue,
         };
+        // a Snapshot is not an event: it has no number to acknowledge
+        let seq = match &incoming {
+            Incoming::Snapshot { .. } => None,
+            Incoming::State { seq, .. } | Incoming::Accounts { seq, .. } => Some(*seq),
+        };
         hub.apply(user, id, conn, incoming, now).await.map_err(refused)?;
+        if let Some(seq) = seq {
+            let at = std::time::Instant::now();
+            receipts.received(seq, at);
+            // sixteen taken and unacknowledged: say so now
+            if receipts.is_due(at) && down.ack(&mut receipts).await.is_err() {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -458,6 +549,39 @@ mod tests {
         assert_eq!(accounts(&many).unwrap_err().code(), tonic::Code::InvalidArgument);
         let over = pb::Accounts { accounts: vec![pb::Account { name: "x".into(), week_used_pct: Some(101), ..Default::default() }] };
         assert!(accounts(&over).unwrap_err().message().starts_with("accounts.week_used_pct"));
+    }
+
+    /// The hub's own events obey the window the runtime's do. (Nothing in
+    /// Slice 1 sends one; an Ack body stands in for an order here.)
+    #[tokio::test]
+    async fn the_hub_holds_its_own_events_to_the_window() {
+        use taisce_runtime_proto::window::WINDOW;
+        let (tx, mut rx) = mpsc::channel(WINDOW * 2);
+        // the runtime's Hello said it had received Down event 10
+        let mut down = DownSender::new(tx, 10);
+        let body = down::Body::Ack(pb::Ack { seq: 0 });
+        for i in 1..=WINDOW as u64 {
+            assert_eq!(down.event(&body).await.unwrap(), 10 + i);
+        }
+        assert!(matches!(down.event(&body).await, Err(Unsent::WindowFull)), "the 65th waits for an Ack");
+        // a Welcome or an Ack is outside the window, and unnumbered
+        down.control(body.clone()).await.unwrap();
+        // the runtime acknowledges sixteen: sixteen more may go, numbered on
+        down.acked(26);
+        for i in 1..=16 {
+            assert_eq!(down.event(&body).await.unwrap(), 10 + WINDOW as u64 + i);
+        }
+        assert!(matches!(down.event(&body).await, Err(Unsent::WindowFull)));
+        let mut seqs = vec![];
+        while let Ok(Ok(m)) = rx.try_recv() {
+            seqs.push(m.seq);
+        }
+        assert_eq!(seqs.iter().filter(|s| **s == 0).count(), 1);
+        assert_eq!(seqs.iter().filter(|s| **s > 0).copied().collect::<Vec<_>>(), (11..=10 + WINDOW as u64 + 16).collect::<Vec<_>>());
+        // a runtime that has hung up
+        drop(rx);
+        down.acked(u64::MAX);
+        assert!(matches!(down.event(&body).await, Err(Unsent::Gone)));
     }
 
     #[test]

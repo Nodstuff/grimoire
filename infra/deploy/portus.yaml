@@ -16,14 +16,18 @@ listeners:
     routes:
       # Agent Fabric's runtime channel (ADR 0006): gRPC from a runtime (Workbox
       # on a Mac) to the daemon's own loopback gRPC port (taisce.service,
-      # TAISCE_RUNTIME_GRPC_PORT). Ahead of the catch-all: this path must not
-      # fall through to the HTTP port. `protocol: GRPC` makes portus speak
-      # HTTP/2 to the backend. Set NO timeout and NO body limit here: the
-      # stream stays open for as long as the runtime runs, and either would
-      # cut it.
+      # TAISCE_RUNTIME_GRPC_PORT). `protocol: GRPC` makes portus speak HTTP/2
+      # to the backend. The longest path prefix wins, so this route's place
+      # in the list does not matter.
+      # - Set NO timeout: one deadline would cover the whole stream and cut it.
+      # - max_request_body_bytes MUST be set, to the largest value (u64::MAX).
+      #   Unset (or 0) means portus's default of 10 MiB, counted over ALL the
+      #   bytes a client sends on one stream: a long-lived stream would be
+      #   killed with an HTTP/2 error (not a 413) once it had sent that much.
       - hosts: [taisce.null.ie]
         paths: [{ path: /taisce.runtime.v1.Runtime/, type: Prefix }]
         protocol: GRPC
+        max_request_body_bytes: 18446744073709551615
         backends:
           - address: "127.0.0.1:7426"
       - hosts: [taisce.null.ie]

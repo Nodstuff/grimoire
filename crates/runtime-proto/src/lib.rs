@@ -23,6 +23,7 @@ pub const SERVICE: &str = "taisce.runtime.v1.Runtime";
 
 #[cfg(feature = "client")]
 pub mod fake;
+pub mod window;
 
 impl v1::Status {
     /// The state's name on the HTTP side and in scripts: `needs_you`.

@@ -17,7 +17,13 @@
 //   1. Up{hello}      within 10 seconds of opening the stream
 //   2. Down{welcome}
 //   3. Up{snapshot}   the first message after the Hello, always
-//   4. Up{state} / Up{accounts} / Up{heartbeat} as things happen
+//   4. Up{state} / Up{accounts} / Up{heartbeat} as things happen, and
+//      Ack in both directions (see "Flow control")
+//
+// A stream is finite. The proxy in front of the hub is restarted now and
+// then (every stream is cut after a 25 second drain), a laptop sleeps, a
+// network changes. Reconnecting and resuming by sequence number is the
+// normal path, not an error path.
 //
 // Sequence numbers. Each direction numbers its EVENTS from 1, per instance,
 // never reusing a number. An event is a message the other side must not
@@ -28,6 +34,24 @@
 // Welcome.last_up_seq) and the other replays the events after it. An event
 // whose seq is not above the last one received is a replay of something
 // already applied and is ignored.
+//
+// Flow control. Neither side may have more than 64 events in flight that
+// the other has not acknowledged. An Ack{seq} says "I have received every
+// event up to seq"; it is cumulative. Each side acknowledges promptly and
+// coalesced: once 16 events are unacknowledged or 250 ms after the oldest,
+// whichever comes first. A sender at 64 waits for an Ack before sending
+// the next event. Hello, Welcome, Snapshot, Heartbeat and Ack are outside
+// the window (each is rare by construction). The cause: the proxy ends an
+// HTTP/2 connection, and every stream sharing it, once about 145 small
+// DATA frames are buffered on it in either direction; a burst of small
+// events is exactly that.
+//
+// An Ack is flow control, not durability: the hub writes what a snapshot
+// could not restore at once, and the rest within 5 seconds. The resume
+// point is Welcome.last_up_seq. For this slice's events that is enough: a
+// Snapshot restores every session, and a runtime sends its Accounts again
+// after the Snapshot that opens a stream. A runtime need not keep a state
+// or accounts event once it is acknowledged.
 //
 // Versions. A hub ignores a message whose body it does not know (a newer
 // runtime talking to an older hub), and does not count it as received.
@@ -56,7 +80,8 @@ package taisce.runtime.v1;
 
 service Runtime {
   // The long-lived stream. First Up is Hello; first Down is Welcome.
-  rpc Connect(stream Up) returns (stream Down);
+  // (Not `Connect`: generated clients already have a `connect`.)
+  rpc Attach(stream Up) returns (stream Down);
 
   // Slice 4 adds `rpc Call(ToolCall) returns (ToolResult)`: one fabric tool
   // call made by the runtime on a session's behalf. It is left out until
@@ -65,7 +90,7 @@ service Runtime {
 }
 
 message Up {
-  // The event number, or 0 for Hello, Snapshot and Heartbeat.
+  // The event number, or 0 for Hello, Snapshot, Heartbeat and Ack.
   uint64 seq = 1;
   oneof body {
     Hello hello = 2;
@@ -73,6 +98,7 @@ message Up {
     SessionState state = 4;
     Accounts accounts = 8;
     Heartbeat heartbeat = 10;
+    Ack ack = 11;
   }
   // 5 turn (Turn: one turn finished), 6 attention (Attention: an approval
   // or question raised or cleared, signed by the runtime), 7 result
@@ -82,10 +108,11 @@ message Up {
 }
 
 message Down {
-  // The event number, or 0 for Welcome.
+  // The event number, or 0 for Welcome and Ack.
   uint64 seq = 1;
   oneof body {
     Welcome welcome = 2;
+    Ack ack = 6;
   }
   // 3 order (Signed: anything that carries the owner's authority), 4 nudge
   // (Nudge: "session X has mail", never the mail itself), 5 pairing
@@ -208,3 +235,9 @@ message Account {
 
 // "Still here." Sent when nothing else has been for Welcome.heartbeat_secs.
 message Heartbeat {}
+
+// "I have received every event up to `seq`." Sent in both directions; see
+// "Flow control" at the top of this file.
+message Ack {
+  uint64 seq = 1;
+}

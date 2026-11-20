@@ -262,7 +262,7 @@ const COVERAGE: &[(&str, &str)] = &[
     ("/api/fabric/runtimes", "a_fleet_is_its_owners_alone"),
     ("/api/fabric/stream", "a_fleet_is_its_owners_alone"),
     ("/api/fabric/sessions", "a_runtime_credential_writes_only_its_owners_fleet"),
-    ("grpc:taisce.runtime.v1.Runtime/Connect", "a_runtime_credential_writes_only_its_owners_fleet"),
+    ("grpc:taisce.runtime.v1.Runtime/Attach", "a_runtime_credential_writes_only_its_owners_fleet"),
 ];
 
 thread_local! {
