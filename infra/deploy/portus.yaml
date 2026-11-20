@@ -14,6 +14,18 @@ listeners:
       acme:
         domains: [taisce.null.ie]
     routes:
+      # Agent Fabric's runtime channel (ADR 0006): gRPC from a runtime (Workbox
+      # on a Mac) to the daemon's own loopback gRPC port (taisce.service,
+      # TAISCE_RUNTIME_GRPC_PORT). Ahead of the catch-all: this path must not
+      # fall through to the HTTP port. `protocol: GRPC` makes portus speak
+      # HTTP/2 to the backend. Set NO timeout and NO body limit here: the
+      # stream stays open for as long as the runtime runs, and either would
+      # cut it.
+      - hosts: [taisce.null.ie]
+        paths: [{ path: /taisce.runtime.v1.Runtime/, type: Prefix }]
+        protocol: GRPC
+        backends:
+          - address: "127.0.0.1:7426"
       - hosts: [taisce.null.ie]
         backends:
           - address: "127.0.0.1:7425"
