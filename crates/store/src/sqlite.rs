@@ -11,6 +11,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 const WORKSPACES_SCHEMA: &str = include_str!("workspaces.sql");
 const SHARES_SCHEMA: &str = include_str!("shares.sql");
 const BOOKS_SCHEMA: &str = include_str!("books.sql");
+const FABRIC_SCHEMA: &str = include_str!("fabric.sql");
 
 pub struct SqliteStore {
     pub(crate) conn: Connection,
@@ -58,6 +59,7 @@ impl SqliteStore {
         conn.execute_batch(WORKSPACES_SCHEMA)?;
         conn.execute_batch(SHARES_SCHEMA)?;
         conn.execute_batch(BOOKS_SCHEMA)?;
+        conn.execute_batch(FABRIC_SCHEMA)?;
         // a pre-release books db (the column came after the table)
         add_column_if_missing(&conn, "ereader", "kosync_key_hash_alt", "TEXT NOT NULL DEFAULT ''")?;
         // v14: colour covers (books.sql documents each column)
@@ -506,7 +508,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -577,6 +579,8 @@ fn backfill(conn: &Connection) -> Result<()> {
     // doc-purge trigger, created IF NOT EXISTS by init; the comments' `page`
     // column, added by init when missing). Nothing to backfill: every
     // existing link is a single-doc link and its comments are on the root.
+    // v16: Agent Fabric (fabric.sql: fabric_runtimes, fabric_sessions).
+    // Created IF NOT EXISTS by init; nothing to backfill.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())

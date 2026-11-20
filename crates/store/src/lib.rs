@@ -7,6 +7,7 @@ pub mod auth;
 pub mod books;
 pub mod epub;
 pub mod export;
+pub mod fabric;
 pub mod gate;
 pub mod idempotency;
 pub mod import;
