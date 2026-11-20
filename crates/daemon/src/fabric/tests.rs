@@ -441,20 +441,35 @@ async fn local_mode_has_no_fleet() {
     }
 }
 
-/// The scripts the example plays parse, and name only real states.
-#[test]
-fn the_demo_script_parses() {
-    let steps = taisce_runtime_proto::fake::parse_script(include_str!("../../../runtime-proto/examples/demo-script.json")).unwrap();
+/// The script the `fake_runtime` example plays by default follows the
+/// contract: the hub takes all of it (its pauses skipped here).
+#[tokio::test]
+async fn the_demo_script_plays_against_the_real_channel() {
+    let t = setup().await;
+    let (_, credential) = t.enrol("demo");
+    let steps: Vec<Step> = taisce_runtime_proto::fake::parse_script(include_str!("../../../runtime-proto/examples/demo-script.json"))
+        .unwrap()
+        .into_iter()
+        .filter(|s| !matches!(s, Step::SleepMs(_)))
+        .collect();
     assert!(steps.len() >= 5);
-    for step in &steps {
-        let sessions: Vec<&ScriptSession> = match step {
-            Step::Snapshot(s) => s.iter().collect(),
-            Step::State(s) => vec![&**s],
-            _ => vec![],
-        };
-        for s in sessions {
-            assert!(SessionStatus::parse(&s.state).is_some(), "{}", s.state);
-            assert!(Uuid::parse_str(&s.id).is_ok(), "{}", s.id);
+    let mut fake = Fake::connect(&t.url, &credential, "launch-1", 0).await.unwrap();
+    assert!(!fake.play(&steps).await.unwrap(), "the demo stays connected");
+    // a heartbeat round trip proves the stream is still up after the last step
+    fake.heartbeat().await.unwrap();
+    let events = fake.seq();
+    let mut fleet = t.get("/api/fabric/sessions").await;
+    for _ in 0..500 {
+        if fleet["sessions"].as_array().unwrap().iter().any(|s| s["state"] == "finished") {
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        fleet = t.get("/api/fabric/sessions").await;
     }
+    let states: Vec<(&str, &str)> =
+        fleet["sessions"].as_array().unwrap().iter().map(|s| (s["address"].as_str().unwrap(), s["state"].as_str().unwrap())).collect();
+    assert_eq!(states, [("taisce/main", "needs_you"), ("workbox/main", "finished"), ("qompass/mcp-dx", "asleep")]);
+    assert_eq!((fleet["runtimes"][0]["online"].as_bool(), fleet["runtimes"][0]["accounts"].as_array().unwrap().len()), (Some(true), 2));
+    assert_eq!(alerts_when(&t.alerts, 2).await.iter().map(|a| a.state).collect::<Vec<_>>(), [SessionStatus::NeedsYou, SessionStatus::Finished]);
+    assert_eq!(events, 4, "one headroom report and three changes");
 }

@@ -1,8 +1,4 @@
 [
-  {"accounts": [
-    {"name": "personal", "session_used_pct": 38, "week_used_pct": 61},
-    {"name": "work", "session_used_pct": 92, "week_used_pct": 70}
-  ]},
   {"snapshot": [
     {"id": "0196f3a0-0000-7000-8000-000000000001", "address": "taisce/main", "state": "working",
      "fabric": "runtime-channel", "project": "taisce", "worktree": "main", "branch": "agent-fabric",
@@ -12,6 +8,10 @@
      "account": "work", "context_used_pct": 12},
     {"id": "0196f3a0-0000-7000-8000-000000000003", "address": "qompass/mcp-dx", "state": "asleep",
      "fabric": "qompass", "project": "qompass", "worktree": "mcp-dx", "branch": "mcp-dx", "account": "work"}
+  ]},
+  {"accounts": [
+    {"name": "personal", "session_used_pct": 38, "week_used_pct": 61},
+    {"name": "work", "session_used_pct": 92, "week_used_pct": 70}
   ]},
   {"sleep_ms": 3000},
   {"state": {"id": "0196f3a0-0000-7000-8000-000000000002", "address": "workbox/main", "state": "working",

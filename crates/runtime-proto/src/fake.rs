@@ -190,9 +190,16 @@ impl Fake {
         self.seq
     }
 
-    /// Send one message exactly as given.
+    /// Send one message exactly as given. When the hub has already ended
+    /// the stream, the error is the status it ended with.
     pub async fn send(&mut self, up: Up) -> Result<(), Error> {
-        self.tx.send(up).await.map_err(|_| Error::Protocol("the stream closed".into()))
+        if self.tx.send(up).await.is_ok() {
+            return Ok(());
+        }
+        Err(match self.ended().await {
+            Some(status) => Error::Status(status),
+            None => Error::Protocol("the stream closed".into()),
+        })
     }
 
     async fn event(&mut self, body: up::Body) -> Result<(), Error> {

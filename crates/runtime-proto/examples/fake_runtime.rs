@@ -32,7 +32,14 @@ fn arg(name: &str) -> Option<String> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("fake_runtime: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let url = arg("--url").unwrap_or_else(|| "http://127.0.0.1:7514".into());
     let token = arg("--token").or_else(|| std::env::var("TAISCE_RUNTIME_TOKEN").ok()).ok_or("--token or TAISCE_RUNTIME_TOKEN")?;
     let script = match arg("--script") {
