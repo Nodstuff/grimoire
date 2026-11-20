@@ -14,7 +14,8 @@
 //!   3000` and one `fleet` event (the same body as the sessions route), then
 //!   one event per change: `session` (the session, whole), `session_gone`
 //!   `{runtime_id, id}`, `runtime` (the runtime, whole) and `runtime_gone`
-//!   `{id}`. Each event's `id:` is the fleet's `rev` after it. A stream
+//!   `{id}`. Each event's `id:` is the fleet's `rev` after it (a counter
+//!   that starts again when the daemon does). A stream
 //!   that falls too far behind is ended; the client reconnects and is sent
 //!   the fleet again, so there is no cursor to resume from. A `: ping`
 //!   comment every 25s.

@@ -360,6 +360,11 @@ struct Inner {
     events: broadcast::Sender<Arc<FleetEvent>>,
     alerter: Option<Alerter>,
     next_conn: std::sync::atomic::AtomicU64,
+    /// One [`Hub::sync`] at a time: its read of the store and its merge
+    /// into the fleet must not interleave with another's, or a list read
+    /// before a runtime was enrolled could drop that runtime after a later
+    /// sync had added it.
+    syncing: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -368,7 +373,7 @@ pub struct Hub(Arc<Inner>);
 impl Hub {
     pub fn new(store: SharedStore, alerter: Option<Alerter>) -> Self {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
-        Hub(Arc::new(Inner { store, fleets: Mutex::default(), events, alerter, next_conn: 1.into() }))
+        Hub(Arc::new(Inner { store, fleets: Mutex::default(), events, alerter, next_conn: 1.into(), syncing: Default::default() }))
     }
 
     fn fleets(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, UserFleet>> {
@@ -389,6 +394,7 @@ impl Hub {
     /// first time, then pick up a runtime enrolled since and drop one
     /// removed since (the box CLI edits the db under a running daemon).
     async fn sync(&self, user: Uuid) -> Result<(), StoreError> {
+        let _one_at_a_time = self.0.syncing.lock().await;
         let loaded = self.fleets().contains_key(&user);
         let (runtimes, sessions) = with_store(&self.0.store, Scope::User(user), move |s| {
             Ok::<_, StoreError>((s.fabric_runtimes(false)?, if loaded { vec![] } else { s.fabric_sessions()? }))
