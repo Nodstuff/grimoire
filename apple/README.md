@@ -1105,24 +1105,42 @@ server" instead of erroring.
   count. Empty states: no fleet here, no runtime enrolled (`taisce fabric
   runtime add`), no sessions.
 - **Where**: the sidebar on iPad and the Mac (its count is the sessions that
-  need you), Go › Agents, the actions palette. On iPhone a card at the top of
-  Today pushes `Route.agents`: the tab bar holds five, and a sixth tab folds
-  Search into "More".
+  need you), Go › Agents, the actions palette; none of the three is offered
+  on a server known to have no fleet (a LOCAL daemon: `FleetStore.isOffered`).
+  On iPhone there is no Agents tab (the bar holds five, and a sixth folds
+  Search into "More"): a card on Today pushes `Route.agents`. The card is
+  iPhone only. It goes first on Today when a session needs you, and after
+  the pinned docs otherwise, so what's due keeps its place. Today's tab
+  badge is the changes to review plus the sessions that need you, so one
+  shows from any tab.
+- **Needs you**, wherever it is counted (the sidebar, Today's card and its
+  tab badge, the screen's summary line): sessions in needs-you or stalled,
+  on a runtime that is online, and not snoozed. A snoozed session stays in
+  the list with its mark; it has stopped asking.
 - **State**: `FleetStore` on `AppModel.fleet`, followed while the app is in
-  front (started and stopped with sync); nothing on disk; sign-out forgets it.
-- **Snooze**: swipe a row or its context menu: for an hour, or until 09:00
-  tomorrow. The server holds the notifications back (an app cannot take back
+  front (`AppModel.startSync` starts it and `stopSync` ends it; a refresh
+  only reads); nothing on disk; sign-out or a server switch forgets it, and
+  an answer still on its way for the last account is dropped. A token the
+  server refuses ends the following until the next start.
+- **Snooze**: swipe a row or its context menu: for an hour, or until
+  tomorrow (09:00 the next morning; before 05:00 that is this morning's, and
+  the button says "Until this morning"). The server holds the notifications back (an app cannot take back
   a visible push); the row stays, with "Snoozed until …". Unsnooze the same way.
 - **Push**: the server's alert push `{"kind":"fabric_session","session_id",
   "runtime_id","state"}`, title the address and body the state, grouped by the
   server's `thread-id`. A tap (`FabricSessionPush`) opens Agents with that
-  session in view and marked; while Agents is in front the notification is
-  not presented.
+  session in view and marked for three seconds (one the fleet has not
+  delivered yet is kept until it arrives); while an Agents screen is in
+  front of an active window the notification is not presented
+  (`FleetScreenPresence` counts the screen in and, when it goes, out).
 - Tests: `FleetTests` (kit: JSON and SSE recorded from a scratch daemon,
   `FleetFixture`), `FleetTests` (app: view models, the store against a fake
   service, routes, push), `FleetUITests` against `FleetStubServer`, a
   stand-in server inside the runner (no daemon to start; skipped on the Mac,
-  whose runner is sandboxed). `-tab agents` opens Agents.
+  whose runner is sandboxed). Its notification test needs pushes from the
+  Mac while it runs: `apple/scripts/push-fabric-session.sh <simulator udid> &`
+  and `TEST_RUNNER_TAISCE_UI_PUSHER=1` (skipped otherwise). `-tab agents`
+  opens Agents.
 
 ## Running the app against a scratch daemon
 

@@ -16,11 +16,11 @@ final class FleetUITests: XCTestCase {
         #endif
     }
 
-    func launch(_ fleet: [String: Any]?) throws -> XCUIApplication {
+    func launch(_ fleet: [String: Any]?, tab: String = "agents") throws -> XCUIApplication {
         let server = try FleetStubServer(fleet: fleet)
         self.server = server
         let app = XCUIApplication()
-        app.launchArguments = ["-serverURL", server.url, "-tab", "agents"]
+        app.launchArguments = ["-serverURL", server.url, "-tab", tab]
         app.launch()
         return app
     }
@@ -107,7 +107,8 @@ final class FleetUITests: XCTestCase {
         app.buttons["Snooze"].firstMatch.tap()
         let hour = app.buttons["For an hour"].firstMatch
         XCTAssertTrue(hour.waitForExistence(timeout: 5), "the two durations are offered")
-        XCTAssertTrue(app.buttons["Until tomorrow"].firstMatch.exists)
+        // "Until tomorrow", or "Until this morning" in the small hours
+        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Until t'")).firstMatch.exists)
         hour.tap()
         waitFor("the row says it is snoozed") { self.row(app, "taisce/main").label.contains("Snoozed until") }
         // still listed, still needing you
@@ -121,6 +122,123 @@ final class FleetUITests: XCTestCase {
         app.buttons["Unsnooze"].firstMatch.tap()
         waitFor("the mark is gone") { !self.row(app, "taisce/main").label.contains("Snoozed") }
         XCTAssertEqual(server?.fabricRequests.filter { $0.method == "DELETE" }.count, 1)
+    }
+
+    /// A session's notification while the app is open: not presented with
+    /// Agents in front, presented once Agents has been left (the screen
+    /// must stop counting itself when it goes), and a tap lands on that
+    /// session's row, marked. Needs notifications pushed from the Mac while
+    /// it runs (`apple/scripts/push-fabric-session.sh <udid>`, and
+    /// `TEST_RUNNER_TAISCE_UI_PUSHER=1` to say so); skipped otherwise. iPhone.
+    func testASessionNotificationShowsOnceAgentsIsLeftAndATapLandsOnItsRow() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["TAISCE_UI_PUSHER"] != "1", "nothing is pushing notifications to this simulator")
+        try XCTSkipIf(UIDevice.current.userInterfaceIdiom != .phone, "written for the phone's Today card")
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        // the last active row is the one the notification names, so it starts below the others
+        var sessions = StubFleet.sessions
+        sessions.swapAt(0, 3)
+        let app = try launch(StubFleet.fleet(sessions: sessions), tab: "todos")
+        // allow notifications (the To-dos card asks)
+        let turnOn = app.buttons["Turn on"].firstMatch
+        if turnOn.waitForExistence(timeout: 8) {
+            turnOn.tap()
+            let allow = springboard.buttons["Allow"].firstMatch
+            if allow.waitForExistence(timeout: 8) { allow.tap() }
+        }
+        let banner = springboard.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS 'taisce/main'")).firstMatch
+        func bannerShows(within seconds: TimeInterval) -> Bool {
+            let end = Date().addingTimeInterval(seconds)
+            while Date() < end {
+                if banner.exists && banner.isHittable { return true }
+                RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+            }
+            return false
+        }
+        // on another screen a notification shows
+        XCTAssertTrue(bannerShows(within: 20), "notifications are arriving and allowed")
+        // Agents, from Today's card
+        app.tabBars.buttons["Today"].tap()
+        let card = app.descendants(matching: .any).matching(identifier: "today.agents").firstMatch
+        XCTAssertTrue(card.waitForExistence(timeout: 15))
+        card.tap()
+        XCTAssertTrue(row(app, "taisce/main").waitForExistence(timeout: 15))
+        // one pushed as the screen arrived may still come up, and a banner already
+        // up goes by itself; after that, none comes while Agents is in front
+        RunLoop.current.run(until: Date().addingTimeInterval(4))
+        waitFor("the earlier banner has gone", timeout: 20) { !(banner.exists && banner.isHittable) }
+        // (one is pushed every 6 seconds)
+        XCTAssertFalse(bannerShows(within: 14), "what is on screen is not announced")
+        // leave Agents: the next one shows again
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(card.waitForExistence(timeout: 10), "back on Today")
+        XCTAssertTrue(bannerShows(within: 20), "a session notification shows once Agents has been left")
+        // a tap opens Agents on that session's row, marked
+        banner.tap()
+        let named = row(app, "taisce/main")
+        XCTAssertTrue(named.waitForExistence(timeout: 15), "Agents opened")
+        waitFor("the row is marked", timeout: 6) { named.isSelected }
+        XCTAssertFalse(row(app, "workbox/main").isSelected)
+        // (seen at all, it lasted: it used to be set and cleared in the same instant.) Then it goes
+        waitFor("the mark goes", timeout: 8) { !named.isSelected }
+    }
+
+    /// Where Agents sits. iPhone: no tab; a card on Today, after the pins
+    /// while nothing needs you and first when something does, with Today's
+    /// tab badge counting it; a snoozed session stops counting. iPad: the
+    /// sidebar, no card; and no sidebar entry on a server with no fleet.
+    func testAgentsOnTodayAndInTheSidebar() throws {
+        let quiet = [
+            StubFleet.session(4, "taisce/fabric", "working", tool: "Bash", note: "Building the app"),
+            StubFleet.session(5, "notes/main", "idle"),
+        ]
+        let app = try launch(StubFleet.fleet(sessions: quiet), tab: "today")
+        let card = app.descendants(matching: .any).matching(identifier: "today.agents").firstMatch
+        let sidebar = app.descendants(matching: .any).matching(identifier: "sidebar.agents").firstMatch
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            XCTAssertTrue(sidebar.waitForExistence(timeout: 20), "Agents is in the sidebar")
+            server?.update(session: StubFleet.id(4)) { $0["state"] = "needs_you" }
+            waitFor("the sidebar counts it") { sidebar.label.contains("1 need you") }
+            XCTAssertFalse(card.exists, "the card is the phone's way in")
+            shot(app, "today-sidebar-needs-you")
+            app.terminate()
+            // a server with no fleet (a LOCAL daemon): no dead entry
+            let local = try launch(nil, tab: "today")
+            XCTAssertTrue(local.descendants(matching: .any).matching(identifier: "sidebar.books").firstMatch.waitForExistence(timeout: 20))
+            let entry = local.descendants(matching: .any).matching(identifier: "sidebar.agents").firstMatch
+            waitFor("Agents is not offered") { !entry.exists }
+            shot(local, "sidebar-no-fleet")
+            return
+        }
+        XCTAssertTrue(card.waitForExistence(timeout: 20), "the card shows once the fleet has")
+        XCTAssertFalse(app.tabBars.buttons["Agents"].exists, "no sixth tab")
+        XCTAssertTrue(app.tabBars.buttons["Search"].exists, "Search keeps its place")
+        let due = app.staticTexts["Due"].firstMatch
+        let pinned = app.staticTexts["Pinned"].firstMatch
+        let today = app.tabBars.buttons["Today"]
+        func badge() -> String { today.value as? String ?? "" }
+        // nothing needs you: after the pins, and no badge
+        XCTAssertGreaterThan(card.frame.minY, pinned.frame.minY, "what's due keeps its place")
+        XCTAssertTrue(card.label.contains("1 working"), card.label)
+        XCTAssertFalse(badge().contains("1"), badge())
+        shot(app, "today-agents-quiet")
+        // a session comes to need you: first, and counted on the tab
+        server?.update(session: StubFleet.id(4)) { $0["state"] = "needs_you"; $0["last_line"] = "Which branch?" }
+        waitFor("the card moved to the top") { card.exists && card.frame.minY < due.frame.minY }
+        XCTAssertTrue(card.label.contains("1 needs you"), card.label)
+        waitFor("the tab counts it") { badge().contains("1") }
+        shot(app, "today-agents-needs-you")
+        // from another tab the badge still says so
+        app.tabBars.buttons["Library"].tap()
+        XCTAssertTrue(badge().contains("1"), badge())
+        today.tap()
+        // snoozed: it has stopped asking
+        server?.update(session: StubFleet.id(4)) { $0["quiet_until"] = Int(Date().timeIntervalSince1970) + 3600 }
+        waitFor("the card is back after the pins") { card.exists && card.frame.minY > pinned.frame.minY }
+        waitFor("and the badge has gone") { !badge().contains("1") }
+        // the card opens Agents, where it is still listed
+        card.tap()
+        XCTAssertTrue(row(app, "taisce/fabric").waitForExistence(timeout: 10))
+        XCTAssertTrue(row(app, "taisce/fabric").label.contains("Snoozed until"))
     }
 
     func testEmptyStatesSayWhatToDo() throws {
