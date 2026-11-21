@@ -29,6 +29,7 @@ struct ActionsPalette: View {
         Action(title: "To-dos", symbol: "checkmark.circle", command: .todos),
         Action(title: "Review", symbol: "flag", command: .review),
         Action(title: "Books", symbol: "books.vertical", command: .books),
+        Action(title: "Agents", symbol: "sparkle", command: .agents),
         Action(title: "Add EPUBs\u{2026}", symbol: "plus", command: .addBooks, keys: "\u{21E7}\u{2318}I"),
         Action(title: "Share Link\u{2026}", symbol: "link", command: .shareLink),
         Action(title: "Export as PDF\u{2026}", symbol: "doc.richtext", command: .exportPDF, keys: "\u{2325}\u{2318}E"),

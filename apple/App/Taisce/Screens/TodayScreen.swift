@@ -19,11 +19,13 @@ struct TodayScreen: View {
             dayLine: RelativeTime.dayLine(),
             badge: SyncBadge.make(status: model.syncStatus, pending: model.pendingWrites),
             review: home.review,
+            agents: FleetCard(model.fleet.fleet, available: model.fleet.isLoaded),
             reading: reading,
             readingCover: reading.flatMap { books.coverURL($0.book) },
             due: TodoBoard.shown(board, hasSynced: model.hasSynced, status: model.syncStatus).map { TodayDue.rows($0) },
             pinned: pinnedCards,
             onReview: router.showReview,
+            onAgents: { router.showAgents() },
             reviewPath: model.reviewPath,
             onOpen: { router.open(.doc($0)) },
             onRead: { router.readBook($0.book.id) },
@@ -135,6 +137,8 @@ struct TodayContent: View {
     let badge: SyncBadge
     /// nil while the queue loads (the card waits rather than flashing empty)
     var review: [ReviewQueueItem]?
+    /// the fleet of Claude sessions (nil: no fleet on this server, or no Mac enrolled)
+    var agents: FleetCard?
     var reading: ReadingBook?
     /// the book's cover image (behind the server's bearer: `coverImageLoader`)
     var readingCover: URL?
@@ -143,6 +147,7 @@ struct TodayContent: View {
     let pinned: [PinnedCard]
     var now: Date = .now
     var onReview: () -> Void = {}
+    var onAgents: () -> Void = {}
     /// where a doc lives, before its title on the review rows ("Family › Holidays 2027")
     var reviewPath: (DocID) -> String? = { _ in nil }
     var onOpen: (DocID) -> Void = { _ in }
@@ -162,6 +167,8 @@ struct TodayContent: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 header
+                // a session waiting on you comes before everything else
+                if let agents { agentsCard(agents) }
                 // Tom's order: what's due first, then the book, then review, then pins
                 dueSection
                 if let reading { readingSection(reading) }
@@ -244,6 +251,39 @@ struct TodayContent: View {
         .background(Color.lapis.card, in: .rect(cornerRadius: Lapis.Radius.tab, style: .continuous))
         .padding(.horizontal, 16)
         .transition(.opacity)
+    }
+
+    // MARK: agents
+
+    /// The way in to Agents (a phone's tab bar is full; iPad and the Mac
+    /// have it in the sidebar too).
+    private func agentsCard(_ card: FleetCard) -> some View {
+        Button(action: onAgents) {
+            HStack(spacing: 12) {
+                Image(systemName: "sparkle")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(card.attention ? Color.lapis.yellowMark : Color.lapis.accent)
+                    .frame(width: 34, height: 34)
+                    .background(card.attention ? Color.lapis.yellowSoft : Color.lapis.accentSoft, in: .rect(cornerRadius: Lapis.Radius.field, style: .continuous))
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Agents").font(.headline).foregroundStyle(Color.lapis.ink)
+                    Text(card.subtitle).font(.subheadline).foregroundStyle(Color.lapis.ink3)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(Color.lapis.ink3).accessibilityHidden(true)
+            }
+            .frame(minHeight: Lapis.Layout.minTarget)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Opens your Claude sessions")
+        .accessibilityIdentifier("today.agents")
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.lapis.card, in: .rect(cornerRadius: Lapis.Radius.tab, style: .continuous))
+        .padding(.horizontal, 16)
     }
 
     // MARK: reading

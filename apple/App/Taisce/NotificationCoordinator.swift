@@ -325,8 +325,12 @@ final class DueAlertDelegate: NSObject, UNUserNotificationCenterDelegate, Sendab
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
-        if let doc = ShareCommentPush.docID(from: notification.request.content.userInfo) {
+        let info = notification.request.content.userInfo
+        if let doc = ShareCommentPush.docID(from: info) {
             await MainActor.run { ShareCommentPush.arrived(doc) }
+        }
+        if FabricSessionPush.session(from: info) != nil {
+            return await MainActor.run { FabricSessionPush.presentation() }
         }
         return [.banner, .list, .sound]
     }
@@ -335,6 +339,10 @@ final class DueAlertDelegate: NSObject, UNUserNotificationCenterDelegate, Sendab
         let info = response.notification.request.content.userInfo
         if let doc = ShareCommentPush.docID(from: info) {
             await MainActor.run { ShareCommentPush.deliver(doc) }
+            return
+        }
+        if let session = FabricSessionPush.session(from: info) {
+            await MainActor.run { FabricSessionPush.deliver(session) }
             return
         }
         guard let action = DueAlertAction(rawValue: response.actionIdentifier),

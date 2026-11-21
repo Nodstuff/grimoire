@@ -16,6 +16,9 @@ enum Route: Hashable {
     /// a book's details (`BookDetail`), and its reader (`BookReaderScreen`)
     case book(String)
     case bookReader(String)
+    /// the fleet of Claude sessions (Today's Agents card on a phone, whose
+    /// tab bar is full; the sidebar's Agents elsewhere)
+    case agents
 }
 
 /// A book to open in the reader (`Router.readingBook`).
@@ -25,7 +28,7 @@ struct ReadingTarget: Identifiable, Hashable {
 
 /// iPad and Mac sidebar selection.
 enum PadItem: Hashable {
-    case today, todos, review, books, search
+    case today, todos, review, books, agents, search
     case doc(DocID)
 }
 
@@ -43,6 +46,8 @@ enum AppCommand: Hashable {
     /// ⇧⌘I: Books, then the EPUB picker
     case addBooks
     case books, review
+    /// the fleet of Claude sessions (Agent Fabric)
+    case agents
     /// ⌘[ / ⌘]: back and forward through what the split view showed
     case back, forward
     /// ⌘F: find in the doc in front (Decision 2: ⇧⌘F is Search)
@@ -92,6 +97,9 @@ final class Router {
     var todosPath: [Route] = []
     var searchPath: [Route] = []
     var booksPath: [Route] = []
+    /// a session Agents should bring into view (a tapped notification); the
+    /// screen clears it once shown
+    var agentsFocus: FleetSessionKey?
 
     var padItem: PadItem? = .today
     /// the shelf Books shows on iPad and the Mac (the sidebar's Shelves and Series rows)
@@ -197,6 +205,7 @@ final class Router {
         case .todos?: .todos
         case .review?: .review
         case .book?, .bookReader?: .books
+        case .agents?: .agents
         case nil: padItem
         }
     }
@@ -231,6 +240,19 @@ final class Router {
 
     func showBooks() {
         if isPad { select(.books) } else { tab = .books }
+    }
+
+    /// The fleet: the sidebar's Agents, or pushed over Today on a phone
+    /// (as Review is). `focus` is a session to bring into view (a tapped
+    /// notification's).
+    func showAgents(focus: FleetSessionKey? = nil) {
+        if isPad {
+            if sidebarSelection != .agents { select(.agents) }
+        } else {
+            tab = .today
+            todayPath = [.agents]
+        }
+        if let focus { agentsFocus = focus }
     }
 
     /// The book open in the reader, full screen over the window (iPad and
@@ -348,6 +370,8 @@ final class Router {
             addBooksRequest += 1
         case .books:
             showBooks()
+        case .agents:
+            showAgents()
         case .review:
             showReview()
         case .back:
@@ -392,7 +416,7 @@ final class Router {
     }
 
     /// Development launch arguments, for screenshots and UI runs:
-    /// `-tab today|library|todos|search`, `-openDoc <title>`,
+    /// `-tab today|library|todos|search|agents`, `-openDoc <title>`,
     /// `-searchQuery <text>`, `-showSettings YES`, `-tab books`, `-readBook <id>`, `-clearBookFiles YES`
     /// (Debug UI runs: drop the downloaded EPUBs). (`-serverURL <url>` is read
     /// by `AppModel` straight from UserDefaults' argument domain.)
@@ -403,6 +427,7 @@ final class Router {
         case "todos": tab = .todos; padItem = .todos
         case "search": tab = .search; padItem = .search
         case "books": tab = .books; padItem = .books
+        case "agents": showAgents()
         case "review": showReview()
         default: break
         }

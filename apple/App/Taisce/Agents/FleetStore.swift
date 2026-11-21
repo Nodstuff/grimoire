@@ -1,0 +1,181 @@
+import Foundation
+import Observation
+import TaisceKit
+
+/// A notification about a session was tapped: the frontmost window shows
+/// Agents with that session in view.
+struct FleetSessionRequest: Equatable {
+    var session: FleetSessionKey
+    var serial: Int
+}
+
+/// The person's fleet on this device (Agent Fabric, Slice 1: Watch): every
+/// Claude session their runtimes report, followed live while the app is in
+/// front. Watch only: the one thing it changes is a session's snooze. One
+/// per app (`AppModel.fleet`); nothing is kept on disk, and sign-out
+/// forgets it (`reset`).
+@MainActor @Observable
+final class FleetStore {
+    enum Availability: Equatable {
+        /// the server hasn't answered yet
+        case unknown
+        case available
+        /// the server has no fleet for us: a LOCAL daemon, or one without Agent Fabric (404)
+        case unavailable
+    }
+
+    @ObservationIgnored weak var app: AppModel?
+    /// tests: a fake server
+    @ObservationIgnored var serviceOverride: (any FleetService)?
+    /// tests: no waiting between connections
+    @ObservationIgnored var backoff = Backoff()
+
+    private(set) var fleet = Fleet()
+    private(set) var availability: Availability = .unknown
+    private(set) var link: FleetLink = .idle
+    /// why the fleet isn't loading (nil once it has)
+    private(set) var loadError: String?
+    /// a tapped notification's session, waiting for a window
+    private(set) var request: FleetSessionRequest?
+    /// Agents screens in front in an active window
+    private(set) var watching = 0
+
+    @ObservationIgnored private var followTask: Task<Void, Never>?
+
+    private var service: (any FleetService)? { serviceOverride ?? app?.api }
+
+    /// the fleet has arrived at least once
+    var isLoaded: Bool { availability == .available }
+    /// the Agents screen is on screen: what a notification would say is already in view
+    var isOnScreen: Bool { watching > 0 }
+
+    func reset() {
+        stop()
+        fleet = Fleet()
+        availability = .unknown
+        loadError = nil
+        request = nil
+    }
+
+    // MARK: following
+
+    /// Follow the fleet's stream (foreground only, like sync). Asked again
+    /// while following, it does nothing. A server with no fleet answers
+    /// once and the following ends.
+    func start() {
+        guard followTask == nil, let service else { return }
+        let follower = FleetFollower(service: service, backoff: backoff)
+        followTask = Task { [weak self] in
+            for await signal in follower.signals() {
+                guard !Task.isCancelled else { break }
+                self?.take(signal)
+            }
+        }
+    }
+
+    func stop() {
+        followTask?.cancel()
+        followTask = nil
+        link = .idle
+    }
+
+    private func take(_ signal: FleetSignal) {
+        switch signal {
+        case .change(let change, let rev):
+            fleet.apply(change, rev: rev)
+            if case .fleet = change {
+                availability = .available
+                loadError = nil
+            }
+        case .link(let next):
+            link = next
+            if next == .unavailable {
+                availability = .unavailable
+                fleet = Fleet()
+                loadError = nil
+                followTask = nil
+            }
+        case .failed(let why):
+            // a fleet already showing stays; the indicator says it is stale
+            if availability != .available { loadError = Self.describe(why) }
+        }
+    }
+
+    /// The fleet again, in the server's order (a pull to refresh, or coming
+    /// back to the screen: the list holds still in between). Also restarts
+    /// the following if it had ended.
+    func refresh() async {
+        guard let service else { return }
+        start()
+        do {
+            let fresh = try await service.fleet()
+            fleet.refresh(with: fresh)
+            availability = .available
+            loadError = nil
+        } catch APIError.notFound, APIError.notAPIRoute {
+            availability = .unavailable
+            fleet = Fleet()
+            loadError = nil
+        } catch is CancellationError {
+        } catch {
+            if availability != .available { loadError = Self.describe(error) }
+        }
+    }
+
+    // MARK: snooze
+
+    /// No notifications for this session until `option` ends. The server
+    /// holds them back; the row stays, marked. Nil, or why it failed.
+    func snooze(_ key: FleetSessionKey, _ option: FleetSnooze, now: Date = .now) async -> String? {
+        await change { try await $0.snoozeSession(key, until: option.until(now: now)) }
+    }
+
+    func unsnooze(_ key: FleetSessionKey) async -> String? {
+        await change { try await $0.unsnoozeSession(key) }
+    }
+
+    private func change(_ call: (any FleetService) async throws -> FleetSession) async -> String? {
+        guard let service else { return "Not connected." }
+        do {
+            let session = try await call(service)
+            // the stream says the same a moment later; show it now
+            if let i = fleet.sessions.firstIndex(where: { $0.key == session.key }) { fleet.sessions[i] = session }
+            return nil
+        } catch APIError.notFound {
+            return "That session is gone."
+        } catch {
+            return Self.describe(error)
+        }
+    }
+
+    static func describe(_ error: any Error) -> String {
+        if let e = error as? APIError {
+            switch e {
+            case let .server(m): return m
+            case .unauthorized: return "Sign in again to see your agents."
+            case let .http(status) where status >= 500: return "The server isn't answering right now."
+            default: break
+            }
+        }
+        if (error as? AuthError) != nil { return "Sign in again to see your agents." }
+        if (error as? URLError) != nil { return "You're offline." }
+        return error.localizedDescription
+    }
+
+    // MARK: the screen, and notifications
+
+    /// An Agents screen came to the front of an active window, or left it.
+    func screenAppeared() { watching += 1 }
+    func screenDisappeared() { watching = max(0, watching - 1) }
+
+    /// A tap on a session's notification.
+    func requestSession(_ key: FleetSessionKey) {
+        request = FleetSessionRequest(session: key, serial: (request?.serial ?? 0) + 1)
+    }
+
+    /// The frontmost window takes it, once.
+    func takeRequest() -> FleetSessionKey? {
+        defer { request = nil }
+        return request?.session
+    }
+}

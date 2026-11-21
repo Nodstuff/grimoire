@@ -1,6 +1,7 @@
 import Foundation
 import TaisceKit
 import UIKit
+import UserNotifications
 
 /// This build's APNs settings.
 enum PushConfig {
@@ -94,6 +95,42 @@ enum ShareCommentPush {
     @MainActor static func arrived(_ doc: DocID) {
         guard let model else { return }
         Task { await model.shareLinks.commentArrived(on: doc) }
+    }
+}
+
+/// The server's alert push when one of your Claude sessions comes to need
+/// you, stalls or finishes a turn (Agent Fabric):
+/// `{"aps":{"alert":{"title":<address>,"body":"Needs you"},"thread-id":"fabric:<session>"},
+/// "kind":"fabric_session","session_id":…,"runtime_id":…,"state":"needs_you"}`.
+/// The words are the server's; a tap opens Agents with that session in view.
+enum FabricSessionPush {
+    static let kind = "fabric_session"
+
+    static func session(from userInfo: [AnyHashable: Any]) -> FleetSessionKey? {
+        guard userInfo["kind"] as? String == kind,
+              let session = userInfo["session_id"] as? String, !session.isEmpty,
+              let runtime = userInfo["runtime_id"] as? String, !runtime.isEmpty
+        else { return nil }
+        return FleetSessionKey(runtimeID: runtime.lowercased(), id: session.lowercased())
+    }
+
+    /// The app's model (the delegate owns it), as `ShareCommentPush.model`.
+    @MainActor static weak var model: AppModel?
+
+    /// A tap on the notification: the frontmost window takes the request (`RootView`).
+    @MainActor static func deliver(_ session: FleetSessionKey) {
+        model?.fleet.requestSession(session)
+    }
+
+    /// How one arriving while the app is open is shown: not at all when the
+    /// Agents screen is in front (the row itself has just changed under the
+    /// person's eyes), like any other notification otherwise.
+    @MainActor static func presentation(agentsOnScreen: Bool) -> UNNotificationPresentationOptions {
+        agentsOnScreen ? [] : [.banner, .list, .sound]
+    }
+
+    @MainActor static func presentation() -> UNNotificationPresentationOptions {
+        presentation(agentsOnScreen: model?.fleet.isOnScreen ?? false)
     }
 }
 

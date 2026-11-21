@@ -69,6 +69,7 @@ struct TaisceCommands: Commands {
             item("To-dos", .todos)
             item("Review", .review)
             item("Books", .books)
+            item("Agents", .agents)
             if model.hasWorkspaces {
                 Divider()
                 let picker = model.workspacePicker

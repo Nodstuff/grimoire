@@ -114,6 +114,10 @@ struct RootView: View {
         .onChange(of: model.linkCommentsRequest, initial: true) { openLinkCommentsIfFront() }
         .onChange(of: scenePhase) { openLinkCommentsIfFront() }
         .onChange(of: model.treeLoaded) { openLinkCommentsIfFront() }
+        // a tap on a session's notification: the frontmost window shows Agents with it in view
+        .onChange(of: model.fleet.request, initial: true) { openFleetSessionIfFront() }
+        .onChange(of: scenePhase) { openFleetSessionIfFront() }
+        .onChange(of: model.authPhase) { openFleetSessionIfFront() }
         // sign-out or another account: nothing queued for the last one survives
         .onChange(of: model.authPhase) { router.docAction = nil }
         // ADR 0004: an unshared doc closes, with a gentle note
@@ -147,6 +151,18 @@ extension RootView {
         guard let doc = model.takeLinkCommentsRequest() else { return }
         router.openLinkComments(doc)
         Task { try? await model.shareLinks.load(doc: doc) }
+    }
+}
+
+extension RootView {
+    /// Takes a waiting session-notification request if this window is the
+    /// one in front and someone is signed in (Agents needs no tree).
+    func openFleetSessionIfFront() {
+        guard model.fleet.request != nil, !model.isCheckingAuth, !model.needsSignIn,
+              FrontWindow.isFront(window.window, scenePhase: scenePhase)
+        else { return }
+        guard let session = model.fleet.takeRequest() else { return }
+        router.showAgents(focus: session)
     }
 }
 
@@ -234,13 +250,16 @@ struct RouteView: View {
         case .review: ReviewScreen()
         case .book(let id): BookDetail(id: id).id(id)
         case .bookReader(let id): BookReaderScreen(bookID: id).id(id)
+        case .agents: AgentsScreen()
         }
     }
 }
 
 /// iPhone: the native floating tab bar (Liquid Glass on iOS 26): Today,
-/// Library, Books, To-dos, and Search on its own. Today's badge counts the
-/// changes waiting for review (its card opens the list).
+/// Library, Books, To-dos, and Search on its own (five is what the bar
+/// holds: a sixth folds Search into "More"). Today's badge counts the
+/// changes waiting for review (its card opens the list); Agents is a card
+/// on Today too (`Route.agents`).
 struct PhoneRoot: View {
     @Environment(AppModel.self) private var model
     @Environment(Router.self) private var router
@@ -326,6 +345,7 @@ struct PadRoot: View {
         case .todos?: TodosScreen()
         case .review?: ReviewScreen()
         case .books?: BooksScreen(filter: Bindable(router).bookShelf)
+        case .agents?: AgentsScreen()
         case .search?: SearchScreen()
         case .doc(let id)?: DocScreen(docID: id).id(id)
         }
@@ -359,7 +379,7 @@ struct PadSidebar: View {
         // the Library is a LibraryTree in a plain scroll view.
         ScrollView {
                 VStack(alignment: .leading, spacing: 2) {
-                    // Today · To-dos · Review · Books · Search (Mac-Main, iPad-Library-Doc).
+                    // Today · To-dos · Review · Books · Agents · Search (Mac-Main, iPad-Library-Doc).
                     // To-dos counts what the To-dos screen lists; Review what waits for you.
                     SidebarItem(title: "Today", systemImage: "house", selected: shown == .today) { router.select(.today) }
                     SidebarItem(title: "To-dos", systemImage: "checkmark.circle", badge: model.openTodoCount,
@@ -374,6 +394,10 @@ struct PadSidebar: View {
                     if shown == .books, model.books.availability == .available, !model.books.shelf.books.isEmpty {
                         BooksSidebarSections()
                     }
+                    // the fleet of Claude sessions; the count is the ones that need you
+                    SidebarItem(title: "Agents", systemImage: "sparkle", badge: model.fleet.fleet.attentionCount,
+                                badgeTone: model.fleet.fleet.attentionCount > 0 ? .attention : .quiet,
+                                badgeLabel: "need you", selected: shown == .agents) { router.select(.agents) }
                     SidebarItem(title: "Search", systemImage: "magnifyingglass", shortcut: "\u{21E7}\u{2318}F", selected: shown == .search) {
                         router.select(.search)
                         router.focusSearch()
@@ -551,7 +575,7 @@ struct NewFolderPrompt: ViewModifier {
     }
 }
 
-/// A sidebar destination (Today, To-dos, Review, Books, Search): an icon,
+/// A sidebar destination (Today, To-dos, Review, Books, Agents, Search): an icon,
 /// the name, and a count (Review's in the attention yellow) or, on a
 /// keyboard, its shortcut.
 private struct SidebarItem: View {

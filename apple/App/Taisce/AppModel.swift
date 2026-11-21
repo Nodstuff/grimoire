@@ -139,6 +139,8 @@ final class AppModel {
     let home = HomeStore()
     /// the EPUB library (Books/): shelf, covers, the reader's places
     let books = BookStore()
+    /// the fleet of Claude sessions (Agents/; Agent Fabric): followed while the app is in front
+    let fleet = FleetStore()
     /// a comment push was tapped: the frontmost window opens that doc's link comments
     private(set) var linkCommentsRequest: LinkCommentsRequest?
 
@@ -160,6 +162,7 @@ final class AppModel {
         codeRuns.app = self
         shareLinks.app = self
         books.app = self
+        fleet.app = self
         sqlRuns.app = self
         home.app = self
     }
@@ -192,6 +195,7 @@ final class AppModel {
         await pushSessionEnding() // push
         serverURL = trimmed
         books.serverChanged()
+        fleet.reset()
         UserDefaults.standard.set(trimmed, forKey: Self.serverURLKey)
         await connect()
         await startSync()
@@ -233,11 +237,13 @@ final class AppModel {
         Task { await dueAlerts.reconcile() }
         refreshWorkspaces() // workspaces
         pushSessionStarted() // push: fire-and-forget
+        fleet.start() // Agents: the stream is foreground-only too; a server with no fleet says so once
     }
 
     func stopSync() async {
         pollTask?.cancel()
         pollTask = nil
+        fleet.stop()
         await sync?.stop()
         syncStatus = .idle
     }
@@ -325,6 +331,7 @@ final class AppModel {
         shareLinks.reset()
         home.reset()
         books.reset()
+        fleet.reset()
         linkCommentsRequest = nil
         settledTodos = []
         pendingEditDoc = nil
