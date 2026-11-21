@@ -16,6 +16,10 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         var refuse: FabricError?
         var pairing: FabricPairingView?
         var turns: [FabricTurn] = []
+        /// a server from before `after=`: it answers the newest page, newest first
+        var ignoresAfter = false
+        /// every turns request fails
+        var turnsFail = false
         var attention: [FabricAttentionItem] = []
     }
 
@@ -34,7 +38,15 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
 
     func turns(_ session: FleetSessionKey, before: Int?, limit: Int) async throws -> FabricTurnPage {
         log("turns \(before.map(String.init) ?? "-")")
+        if state.withLock({ $0.turnsFail }) { throw APIError.http(status: 503) }
         let all = state.withLock { $0.turns }.filter { before == nil || $0.ended < before! }.sorted { $0.ended > $1.ended }
+        return FabricTurnPage(turns: Array(all.prefix(limit)), more: all.count > limit)
+    }
+    func turns(_ session: FleetSessionKey, after: Int, limit: Int) async throws -> FabricTurnPage {
+        if state.withLock({ $0.ignoresAfter }) { return try await turns(session, before: nil, limit: limit) }
+        log("turns after \(after)")
+        if state.withLock({ $0.turnsFail }) { throw APIError.http(status: 503) }
+        let all = state.withLock { $0.turns }.filter { $0.ended > after }.sorted { $0.ended < $1.ended }
         return FabricTurnPage(turns: Array(all.prefix(limit)), more: all.count > limit)
     }
     func turns(since: Int, limit: Int) async throws -> [FabricTurn] { [] }
@@ -429,6 +441,107 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         fuller.reply += " And one more line."
         feed.merge([fuller])
         #expect(feed.rows[29].reply.hasSuffix("one more line.") && feed.rows[28] == first[28])
+    }
+
+    // MARK: the turn cache
+
+    private static func turn(_ id: String, _ ended: Int, session: String = "s1", reply: String = "r", textOff: Bool = false) -> FabricTurn {
+        FabricTurn(runtimeID: "r1", sessionID: session, address: "taisce/main", turnID: id, prompt: "p \(id)", reply: reply,
+                   started: ended - 1, ended: ended, textOff: textOff)
+    }
+
+    @Test func aSessionOpensFromItsCacheThenFetchesOnlyWhatIsNewer() async throws {
+        let key = FleetSessionKey(runtimeID: "r1", id: "s1")
+        let cache = try Cache.inMemory()
+        let fake = FakeFabric(Self.fleet())
+        fake.state.withLock { $0.turns = (1...40).map { Self.turn("t\($0)", $0 * 10) } }
+        // first open: nothing cached, the newest page, which is kept
+        let first = SessionFeed(key: key)
+        await first.load(fake, cache: cache)
+        #expect(first.turns.count == 30 && first.more && !first.fromCache)
+        #expect(try await cache.fabricTurns(key).turns.map(\.turnID) == (11...40).map { "t\($0)" })
+        // five more end meanwhile; the server is down when the screen opens again
+        fake.state.withLock { $0.turns += (41...45).map { Self.turn("t\($0)", $0 * 10) }; $0.turnsFail = true }
+        let offline = SessionFeed(key: key)
+        await offline.load(fake, cache: cache)
+        #expect(offline.fromCache && offline.turns.count == 30 && offline.loadError == nil && offline.more, "the cache, before (and without) the network")
+        // up again: only what ended after the newest held, oldest first
+        fake.state.withLock { $0.turnsFail = false; $0.calls = [] }
+        let second = SessionFeed(key: key)
+        await second.load(fake, cache: cache)
+        #expect(fake.calls == ["turns after 399"], "from a second before the newest held: \(fake.calls)")
+        #expect(second.turns.map(\.turnID) == (11...45).map { "t\($0)" })
+        #expect(try await cache.fabricTurns(key).turns.count == 35)
+        // "Earlier turns" still pages older from the server, and keeps them
+        await second.loadOlder(fake, cache: cache)
+        #expect(second.turns.count == 45 && !second.more)
+        #expect(try await cache.fabricTurns(key).older == false)
+    }
+
+    @Test func topUpPagesUntilTheServerHasNoMore() async throws {
+        let key = FleetSessionKey(runtimeID: "r1", id: "s1")
+        let cache = try Cache.inMemory()
+        try await cache.cacheFabricTurns([Self.turn("t1", 10)], olderBeyond: false)
+        let fake = FakeFabric(Self.fleet())
+        fake.state.withLock { $0.turns = (1...150).map { Self.turn("t\($0)", $0 * 10) } }
+        let feed = SessionFeed(key: key)
+        await feed.load(fake, cache: cache)
+        #expect(feed.turns.count == 150 && feed.turns.last?.turnID == "t150")
+        #expect(fake.calls.filter { $0.hasPrefix("turns after") }.count == 3, "30, then 100, then the rest: \(fake.calls)")
+        let held = try await cache.fabricTurns(key)
+        #expect(held.turns.count == Cache.fabricTurnsKept && held.turns.first?.turnID == "t51" && held.older, "the newest 100, the rest on the server")
+    }
+
+    @Test func anOldServerThatIgnoresAfterFallsBackWithoutCorruptingTheCache() async throws {
+        let key = FleetSessionKey(runtimeID: "r1", id: "s1")
+        // it reaches back to what was held: merged, gap-free
+        let cache = try Cache.inMemory()
+        try await cache.cacheFabricTurns((1...10).map { Self.turn("t\($0)", $0 * 10) }, olderBeyond: false)
+        let fake = FakeFabric(Self.fleet())
+        fake.state.withLock { $0.turns = (1...20).map { Self.turn("t\($0)", $0 * 10) }; $0.ignoresAfter = true }
+        let feed = SessionFeed(key: key)
+        await feed.load(fake, cache: cache)
+        #expect(feed.turns.map(\.turnID) == (1...20).map { "t\($0)" } && !feed.more)
+        #expect(try await cache.fabricTurns(key).turns.count == 20)
+        // forty more ended since: its newest 30 do not reach back, so what lies
+        // between is unknown: the feed and the cache start again from that page
+        fake.state.withLock { $0.turns += (21...60).map { Self.turn("t\($0)", $0 * 10) } }
+        let later = SessionFeed(key: key)
+        await later.load(fake, cache: cache)
+        #expect(later.turns.map(\.turnID) == (31...60).map { "t\($0)" } && later.more, "today's behaviour: the newest 30, Earlier turns pages back")
+        let held = try await cache.fabricTurns(key)
+        #expect(held.turns.map(\.turnID) == (31...60).map { "t\($0)" } && held.older)
+        await later.loadOlder(fake, cache: cache)
+        #expect(later.turns.count == 60 && later.turns.first?.turnID == "t1")
+    }
+
+    @Test func theStreamsTurnsAreCachedAndTheCacheFollowsTheFleet() async throws {
+        let cache = try Cache.inMemory()
+        let fake = FakeFabric(Self.fleet())
+        let s = store(fake)
+        s.turnCacheOverride = cache
+        let s1 = FleetSessionKey(runtimeID: "r1", id: "s1"), s2 = FleetSessionKey(runtimeID: "r1", id: "s2")
+        s.take(.turn(Self.turn("live1", 100)))
+        s.take(.turn(Self.turn("live2", 110, session: "s2", reply: "secret words", textOff: true)))
+        try await waitUntil { try await cache.fabricTurnCount() == 2 }
+        #expect(try await cache.fabricTurns(s1).turns.map(\.turnID) == ["live1"])
+        let quiet = try await cache.fabricTurns(s2).turns
+        #expect(quiet.first?.reply == "" && quiet.first?.prompt == "", "Text off: the turn, never its words")
+        // s1 exits: its turns go; s2's runtime goes: so do its
+        var exited = Self.session("s1", "taisce/main", .exited)
+        exited.updatedAt += 1
+        s.take(.change(.session(exited), rev: 4))
+        try await waitUntil { try await cache.fabricTurns(s1).turns.isEmpty }
+        s.take(.change(.sessionGone(s2), rev: 5))
+        try await waitUntil { try await cache.fabricTurnCount() == 0 }
+    }
+
+    private func waitUntil(_ check: () async throws -> Bool) async throws {
+        for _ in 0..<200 {
+            if try await check() { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        Issue.record("timed out")
     }
 
     @Test func turnsAndRowsAreWorded() {

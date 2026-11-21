@@ -4,6 +4,10 @@ import Foundation
 /// in tests. Every route answers only the person's own app.
 public protocol FabricService: FleetService {
     func turns(_ session: FleetSessionKey, before: Int?, limit: Int) async throws -> FabricTurnPage
+    /// The session's turns ended after `after`, OLDEST first (`after=`). A
+    /// server from before `after=` ignores it and answers the newest page,
+    /// newest first: `FabricTurnPage.isAfterPage` tells them apart.
+    func turns(_ session: FleetSessionKey, after: Int, limit: Int) async throws -> FabricTurnPage
     func turns(since: Int, limit: Int) async throws -> [FabricTurn]
     func attention() async throws -> [FabricAttentionItem]
     func orders(session: FleetSessionKey?, limit: Int) async throws -> [FabricOrderView]
@@ -28,6 +32,11 @@ extension APIClient: FabricService {
     public func turns(_ session: FleetSessionKey, before: Int?, limit: Int = 30) async throws -> FabricTurnPage {
         var q = [URLQueryItem(name: "limit", value: String(limit))]
         if let before { q.append(URLQueryItem(name: "before", value: String(before))) }
+        return try await fabric("/api/fabric/sessions/\(session.runtimeID)/\(session.id)/turns", query: q)
+    }
+
+    public func turns(_ session: FleetSessionKey, after: Int, limit: Int = 30) async throws -> FabricTurnPage {
+        let q = [URLQueryItem(name: "after", value: String(after)), URLQueryItem(name: "limit", value: String(limit))]
         return try await fabric("/api/fabric/sessions/\(session.runtimeID)/\(session.id)/turns", query: q)
     }
 

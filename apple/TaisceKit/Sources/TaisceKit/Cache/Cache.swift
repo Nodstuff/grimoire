@@ -138,6 +138,8 @@ public final class Cache: Sendable {
                 t.column("value", .text).notNull()
             }
         }
+        // Agent Fabric turns per session (Cache+FabricTurns.swift)
+        registerFabricTurns(&m)
         return m
     }
 
@@ -186,12 +188,13 @@ public final class Cache: Sendable {
     /// Whether anything is cached at all (docs, workspaces or queued writes).
     public func isEmpty() async throws -> Bool {
         try await db.read { db in
-            try Int.fetchOne(db, sql: "SELECT (SELECT count(*) FROM docs) + (SELECT count(*) FROM workspaces) + (SELECT count(*) FROM outbox)") == 0
+            try Int.fetchOne(db, sql: "SELECT (SELECT count(*) FROM docs) + (SELECT count(*) FROM workspaces) + (SELECT count(*) FROM outbox) + (SELECT count(*) FROM fabric_turns)") == 0
         }
     }
 
     /// Forget everything: the tree, bodies (and with them the search
-    /// index), to-dos, workspaces, the cursor, queued writes and the owner.
+    /// index), to-dos, workspaces, the cursor, queued writes, Agent Fabric
+    /// turns and the owner.
     /// Freed pages are zeroed (`secure_delete`), the file is compacted and
     /// the WAL truncated, so a signed-out user's content doesn't linger on
     /// disk for the next person on this device.
@@ -206,6 +209,8 @@ public final class Cache: Sendable {
             try db.execute(sql: "DELETE FROM outbox")
             try db.execute(sql: "DELETE FROM sync_state")
             try db.execute(sql: "DELETE FROM cache_meta")
+            try db.execute(sql: "DELETE FROM fabric_turns")
+            try db.execute(sql: "DELETE FROM fabric_turn_sessions")
             // FTS5 shadow tables keep deleted terms until merged: rebuild from the (now empty) blocks
             try db.execute(sql: "INSERT INTO blocks_fts(blocks_fts) VALUES ('rebuild')")
         }

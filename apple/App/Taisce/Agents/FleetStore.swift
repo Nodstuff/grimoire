@@ -20,8 +20,9 @@ struct FabricOpenRequest: Equatable {
 /// app is in front. Commands (Slices 3–5) go through `command`, the agents'
 /// conversations through `talk`, settings and pairing through `config`:
 /// each takes the stream's events from here. One per app (`AppModel.fleet`);
-/// nothing is kept on disk but this device's key and the runtimes' keys,
-/// and sign-out forgets the rest (`reset`).
+/// on disk are this device's key, the runtimes' keys and each live
+/// session's newest turns (in the doc cache, `Cache+FabricTurns`, which
+/// sign-out and a change of person wipe); sign-out forgets the rest (`reset`).
 @MainActor @Observable
 final class FleetStore {
     enum Availability: Equatable {
@@ -37,6 +38,8 @@ final class FleetStore {
     @ObservationIgnored var serviceOverride: (any FleetService)?
     /// tests: no waiting between connections
     @ObservationIgnored var backoff = Backoff()
+    /// tests: a cache of their own
+    @ObservationIgnored var turnCacheOverride: Cache?
 
     private(set) var fleet = Fleet()
     private(set) var availability: Availability = .unknown
@@ -71,6 +74,9 @@ final class FleetStore {
         if let serviceOverride { return serviceOverride as? any FabricService }
         return app?.api
     }
+
+    /// where sessions' turns are kept between opens: the server's doc cache
+    var turnCache: Cache? { turnCacheOverride ?? app?.cache }
 
     init() {
         command.fleet = self
@@ -136,6 +142,7 @@ final class FleetStore {
                 availability = .available
                 loadError = nil
             }
+            pruneTurnCache(change)
         case .link(let next):
             link = next
             if next == .unavailable {
@@ -163,6 +170,14 @@ final class FleetStore {
             list.removeAll { $0.turnID == turn.turnID }
             list.append(turn)
             liveTurns[turn.session] = Array(list.suffix(50))
+            // kept for the next open too (a Text off turn without its words)
+            if let cache = turnCache {
+                let asked = generation
+                Task { [weak self] in
+                    guard self?.generation == asked else { return }
+                    try? await cache.cacheFabricTurns([turn])
+                }
+            }
         case .attention(let item):
             fleet.raise(item)
         case .attentionCleared(let cleared):
@@ -179,6 +194,39 @@ final class FleetStore {
             talk.take(message)
         case .conversation(let conversation):
             talk.take(conversation)
+        }
+    }
+
+    /// Cached turns follow the fleet: a session that exited or is gone (or
+    /// its runtime) takes its turns with it, and one whose project turned
+    /// Text off keeps its turns without their words.
+    func pruneTurnCache(_ change: FleetChange) {
+        guard let cache = turnCache else { return }
+        let asked = generation
+        let work: @Sendable () async throws -> Void
+        switch change {
+        case .fleet(let whole):
+            let live = Set(whole.sessions.filter { $0.state != .exited }.map(\.key))
+            let quiet = whole.sessions.filter { $0.textOff && $0.state != .exited }.map(\.key)
+            work = {
+                try await cache.dropFabricTurns(keeping: live)
+                try await cache.blankFabricTurns(quiet)
+            }
+        case .session(let s) where s.state == .exited:
+            work = { try await cache.dropFabricTurns([s.key]) }
+        case .session(let s) where s.textOff:
+            work = { try await cache.blankFabricTurns([s.key]) }
+        case .sessionGone(let key):
+            work = { try await cache.dropFabricTurns([key]) }
+        case .runtimeGone(let id):
+            let keep = Set(fleet.sessions.filter { $0.runtimeID != id && $0.state != .exited }.map(\.key))
+            work = { try await cache.dropFabricTurns(keeping: keep) }
+        default:
+            return
+        }
+        Task { [weak self] in
+            guard self?.generation == asked else { return }
+            try? await work()
         }
     }
 
@@ -210,6 +258,7 @@ final class FleetStore {
             fleet.refresh(with: fresh)
             availability = .available
             loadError = nil
+            pruneTurnCache(.fleet(fleet))
         } catch APIError.notFound, APIError.notAPIRoute {
             guard asked == generation else { return }
             availability = .unavailable

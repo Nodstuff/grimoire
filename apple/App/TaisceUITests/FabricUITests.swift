@@ -158,6 +158,29 @@ final class FabricUITests: XCTestCase {
 
     // MARK: tests
 
+    /// The turn cache: a session opened once opens again with its turns
+    /// after a relaunch, though the server now fails every turns request,
+    /// and the second open asked only for what ended after the newest held.
+    func testASessionOpenedOnceShowsItsTurnsAgainWhenTheServerFailsThem() throws {
+        let (app, stub) = try launch()
+        open(app, "taisce/main")
+        XCTAssertTrue(el(app, "turn.t3").waitForExistence(timeout: 10), "the turns load")
+        XCTAssertEqual(stub.turnsAfterSeen, [""], "nothing cached yet: the newest page")
+        // the cache is written off the main actor: give it a moment, then start again
+        RunLoop.current.run(until: Date().addingTimeInterval(1))
+        app.terminate()
+        stub.failTurns = true
+        app.launch()
+        open(app, "taisce/main")
+        XCTAssertTrue(el(app, "turn.t3").waitForExistence(timeout: 10), "the cached turns, though the server fails the request")
+        XCTAssertTrue(el(app, "turn.t1").exists)
+        waitFor("the reopen asked for what is newer only") { self.stub?.turnsAfterSeen.count == 2 }
+        let newest = (stub.turns[StubFleet.id(1)] ?? []).compactMap { $0["ended"] as? Int }.max() ?? 0
+        XCTAssertEqual(stub.turnsAfterSeen.last, String(newest - 1))
+        XCTAssertFalse(app.staticTexts.containing(NSPredicate(format: "label CONTAINS 'No turns yet'")).firstMatch.exists)
+        shot(app, "session-from-cache")
+    }
+
     func testPairingThenAReplyWaitsOutItsUndoAndGoesSigned() throws {
         let (app, stub) = try launch()
         XCTAssertTrue(row(app, "taisce/main").waitForExistence(timeout: 20))

@@ -183,8 +183,11 @@ enum QuickReplies {
     static let stock = ["Yes, go ahead", "Not yet", "Explain first", "Show me the diff"]
 }
 
-/// The feed of one session's turns: the newest page from the server,
-/// older pages on demand, and the stream's new turns as they finish.
+/// The feed of one session's turns: what this device cached when it last
+/// showed them (at once, before the network), then only the turns that
+/// ended since (`after=`), older pages on demand, and the stream's new
+/// turns as they finish. Turns never change once ended, so what is cached
+/// stays true; whatever this feed reads from the server is cached too.
 @MainActor @Observable
 final class SessionFeed {
     let key: FleetSessionKey
@@ -202,33 +205,81 @@ final class SessionFeed {
     private(set) var loadError: String?
     /// the newest turn's end the person had seen when the screen opened
     private(set) var seenUpTo: Int?
+    /// the feed opened from this device's cache (before the network answered)
+    private(set) var fromCache = false
 
     init(key: FleetSessionKey) {
         self.key = key
         seenUpTo = LastLooked.shared.seen(key)
     }
 
-    func load(_ service: (any FabricService)?) async {
+    func load(_ service: (any FabricService)?, cache: Cache? = nil) async {
+        if turns.isEmpty, let cache, let held = try? await cache.fabricTurns(key), !held.turns.isEmpty {
+            merge(held.turns)
+            more = held.older
+            fromCache = true
+        }
         guard let service else { return }
         loading = true
         defer { loading = false }
         do {
-            let page = try await service.turns(key, before: nil, limit: 30)
-            merge(page.turns)
-            more = page.more
+            if fromCache, let newest = turns.last?.ended {
+                try await topUp(service, cache: cache, from: newest)
+            } else {
+                let page = try await service.turns(key, before: nil, limit: 30)
+                merge(page.turns)
+                more = page.more
+                try? await cache?.cacheFabricTurns(page.turns, olderBeyond: page.more)
+            }
             loadError = nil
         } catch {
             if turns.isEmpty { loadError = FleetStore.describe(error) }
         }
     }
 
-    func loadOlder(_ service: (any FabricService)?) async {
+    /// The turns that ended since the newest one held, oldest first, page
+    /// by page until the server has no more. Asked from a second before it,
+    /// so a turn that ended in the same second is not missed (each is kept
+    /// once by id). A server from before `after=` answers its newest page
+    /// instead: that is merged as today, and if it does not reach back to
+    /// what was held, what lies between is unknown, so the feed (and the
+    /// cache) start again from that page.
+    private func topUp(_ service: any FabricService, cache: Cache?, from newest: Int) async throws {
+        var after = newest - 1
+        var limit = 30
+        for _ in 0..<50 {
+            let page = try await service.turns(key, after: after, limit: limit)
+            guard page.isAfterPage(after: after) else {
+                let reaches = page.turns.contains { $0.ended <= newest }
+                if !reaches {
+                    // keep only what the stream brought since (newer than the page)
+                    let top = page.turns.map(\.ended).max() ?? .max
+                    turns = turns.filter { $0.ended > top }
+                    try? await cache?.replaceFabricTurns(key, with: page.turns, older: page.more)
+                } else {
+                    try? await cache?.cacheFabricTurns(page.turns)
+                }
+                merge(page.turns)
+                if !reaches { more = page.more }
+                return
+            }
+            merge(page.turns)
+            try? await cache?.cacheFabricTurns(page.turns)
+            guard page.more, let last = page.turns.last?.ended else { return }
+            // never ask the same page twice (more than a page ending in one second)
+            after = max(last - 1, after + 1)
+            limit = 100
+        }
+    }
+
+    func loadOlder(_ service: (any FabricService)?, cache: Cache? = nil) async {
         guard let service, more, !loading, let oldest = turns.first else { return }
         loading = true
         defer { loading = false }
         if let page = try? await service.turns(key, before: oldest.ended, limit: 30) {
             merge(page.turns)
             more = page.more
+            try? await cache?.cacheFabricTurns(page.turns, olderBeyond: page.more)
         }
     }
 

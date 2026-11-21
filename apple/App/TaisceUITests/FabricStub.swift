@@ -27,6 +27,10 @@ final class FabricStub: @unchecked Sendable {
     /// signed requests by id, for checking a request hash
     private var signedRequests: [String: Data] = [:]
     var turns: [String: [[String: Any]]] = [:]
+    /// every `…/turns` request answers 503 (the server is unwell)
+    var failTurns = false
+    /// the `after=` each turns request carried ("" without), in order
+    private(set) var turnsAfter: [String] = []
     var conversations: [[String: Any]] = []
     var messages: [String: [[String: Any]]] = [:]
     var projects: [[String: Any]] = [["name": "taisce", "text_off": false, "private_notifications": false, "sessions": 2]]
@@ -54,6 +58,7 @@ final class FabricStub: @unchecked Sendable {
     var postedOrders: [FabricOrder] { lock.withLock { orders } }
     var settingsSaved: [FabricSettings] { lock.withLock { settingsPuts } }
     var calls: [(method: String, path: String)] { lock.withLock { requests } }
+    var turnsAfterSeen: [String] { lock.withLock { turnsAfter } }
 
     // MARK: building the fleet
 
@@ -111,7 +116,15 @@ final class FabricStub: @unchecked Sendable {
         func refuse(_ status: String, _ code: String) -> (String, String) { (status, json(["error": code, "code": code])) }
         switch (method, parts.count, parts.dropFirst(2).first ?? "") {
         case ("GET", 6, "sessions") where parts[5] == "turns":
-            let list = (turns[parts[4]] ?? []).sorted { ($0["ended"] as? Int ?? 0) > ($1["ended"] as? Int ?? 0) }
+            lock.withLock { turnsAfter.append(query["after"] ?? "") }
+            if failTurns { return refuse("503 Service Unavailable", "unavailable") }
+            let ended = { (t: [String: Any]) in t["ended"] as? Int ?? 0 }
+            // `after=`: the turns ended since, oldest first; else newest first
+            if let after = query["after"].flatMap(Int.init) {
+                let list = (turns[parts[4]] ?? []).filter { ended($0) > after }.sorted { ended($0) < ended($1) }
+                return ("200 OK", json(["turns": list, "more": false]))
+            }
+            let list = (turns[parts[4]] ?? []).sorted { ended($0) > ended($1) }
             return ("200 OK", json(["turns": list, "more": false]))
         case ("POST", 6, "sessions") where parts[5] == "follow", ("DELETE", 6, "sessions") where parts[5] == "follow":
             server.update(session: parts[4]) { $0["following"] = method == "POST" }

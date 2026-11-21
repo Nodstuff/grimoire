@@ -43,7 +43,8 @@ struct AgentSessionScreen: View {
         .toolbar { toolbar }
         .lapisToast($toast)
         .task {
-            await feed.load(store.fabricService)
+            // what this device last saw at once, then only what is newer
+            await feed.load(store.fabricService, cache: store.turnCache)
             await command.loadOrders(for: key)
         }
         // the stream's turns, as they finish
@@ -89,7 +90,7 @@ struct AgentSessionScreen: View {
                         headerCard(SessionHeader(s, runtime: runtime, now: context.date), s)
                     }
                     if feed.more {
-                        Button { Task { await feed.loadOlder(store.fabricService) } } label: {
+                        Button { Task { await feed.loadOlder(store.fabricService, cache: store.turnCache) } } label: {
                             Label(feed.loading ? "Loading\u{2026}" : "Earlier turns", systemImage: "arrow.up.circle")
                                 .frame(maxWidth: .infinity)
                         }

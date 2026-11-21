@@ -233,7 +233,7 @@ public struct FabricTurn: Sendable, Hashable, Codable, Identifiable {
     }
 }
 
-/// `GET …/turns`: newest first.
+/// `GET …/turns`: newest first; with `after=`, oldest first.
 public struct FabricTurnPage: Sendable, Hashable, Codable {
     public var turns: [FabricTurn]
     public var more: Bool
@@ -241,6 +241,14 @@ public struct FabricTurnPage: Sendable, Hashable, Codable {
     public init(turns: [FabricTurn], more: Bool) {
         self.turns = turns
         self.more = more
+    }
+
+    /// Whether this answers `after=`: every turn ended after it, oldest
+    /// first. A server from before `after=` ignores it and answers the
+    /// newest page newest first, which holds a turn at or before `after`
+    /// (it reaches back to what was asked from) or runs newest first.
+    public func isAfterPage(after: Int) -> Bool {
+        turns.allSatisfy { $0.ended > after } && zip(turns, turns.dropFirst()).allSatisfy { $0.ended <= $1.ended }
     }
 }
 
