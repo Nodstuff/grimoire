@@ -389,6 +389,19 @@ impl SqliteStore {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// One session's turns ended after `after`, OLDEST first: what a client
+    /// that already holds the turns up to `after` is missing. A runtime that
+    /// is not the scope's is NotFound.
+    pub fn fabric_turns_after(&self, runtime: Uuid, session: Uuid, after: i64, limit: usize) -> Result<Vec<FabricTurn>> {
+        self.fabric_runtime(runtime)?;
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {TURN_COLS} FROM fabric_turns WHERE runtime_id = ?1 AND session_id = ?2 AND ended > ?3
+             ORDER BY ended, created_at LIMIT ?4"
+        ))?;
+        let rows = st.query_map(params![runtime.to_string(), session.to_string(), after, limit as i64], turn_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Every turn of the scope's fleet ended after `since`, oldest first.
     pub fn fabric_turns_since(&self, since: i64, limit: usize) -> Result<Vec<FabricTurn>> {
         let Some(user) = self.fleet()?.filter() else { return Ok(vec![]) };

@@ -263,7 +263,7 @@ lowercase UUIDs. A resource that is not the caller's is 404.
 | Route | Answers |
 |---|---|
 | `GET /api/fabric/sessions` | As now. Each session gains `fabric_id`, `turn_id`, `queue`, `queue_paused`, `following`, `text_off`; each runtime gains `connection`, `held`, `held_since`, `settings_version`, `present`, `public_key`, `devices: [{device_id, fingerprint, name, public_key, paired_at, counter}]`; the body gains `attention` (the open items). `connection` is `online` (its stream is up), `idle` (its last stream ended because the runtime closed it: the Mac is awake with nothing to report, as Workbox does when its last session is gone) or `offline` (it dropped, went silent, the hub ended it, or it never connected). `online` stays, true only for `online`. None of the three alerts. |
-| `GET /api/fabric/sessions/{runtime_id}/{session_id}/turns?before=&limit=` | `{turns, more}`, newest first; `before` is a turn's `ended`; limit 1–100, default 30. |
+| `GET /api/fabric/sessions/{runtime_id}/{session_id}/turns?before=&after=&limit=` | `{turns, more}`, newest first; `before` is a turn's `ended`; limit 1–100, default 30. With `after=<ended>` instead: the turns ended after it, OLDEST first, `more` when there are further ones (a phone topping up the turns it caches; `before` and `after` together are a 400). |
 | `GET /api/fabric/turns?since=&limit=` | Every session's turns ended after `since`, oldest first, with `address`: "Since you last looked". Limit up to 200. |
 | `GET /api/fabric/attention` | `{items}`: open attention items, newest first. |
 | `GET /api/fabric/orders?runtime_id=&session_id=&before=&limit=` | `{orders}`: the audit trail, newest first, 7 days. |

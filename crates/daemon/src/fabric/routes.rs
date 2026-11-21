@@ -339,6 +339,7 @@ async fn unfollow(State(st): State<FabricState>, v: Viewer, headers: HeaderMap, 
 #[derive(serde::Deserialize)]
 struct Page {
     before: Option<i64>,
+    after: Option<i64>,
     since: Option<i64>,
     limit: Option<usize>,
     runtime_id: Option<Uuid>,
@@ -354,8 +355,17 @@ async fn session_turns(
 ) -> Response {
     let (hub, user) = gated!(st, v, headers);
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
-    let before = q.before;
-    match with_store(&hub.0.store, Scope::User(user), move |s| s.fabric_turns(runtime, session, before, limit + 1)).await {
+    let (before, after) = (q.before, q.after);
+    if before.is_some() && after.is_some() {
+        return error(StatusCode::BAD_REQUEST, "before or after, not both");
+    }
+    // `after`: the turns ended since, oldest first (a client topping up what
+    // it holds); otherwise the newest page, newest first
+    let read = move |s: &mut taisce_store::SqliteStore| match after {
+        Some(after) => s.fabric_turns_after(runtime, session, after, limit + 1),
+        None => s.fabric_turns(runtime, session, before, limit + 1),
+    };
+    match with_store(&hub.0.store, Scope::User(user), read).await {
         Ok(mut turns) => {
             let more = turns.len() > limit;
             turns.truncate(limit);

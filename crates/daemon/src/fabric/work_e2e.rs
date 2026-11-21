@@ -118,6 +118,37 @@ async fn turns_are_read_back_and_text_off_keeps_them_live_only() {
     assert_eq!(projects["projects"][0], json!({"name": "taisce", "text_off": true, "private_notifications": false, "sessions": 1}));
 }
 
+/// `after=`: what a phone holding the turns up to `after` is missing, oldest
+/// first, paged with `more`; `before` with it is refused.
+#[tokio::test]
+async fn turns_after_top_up_a_held_feed_oldest_first() {
+    let t = setup().await;
+    let (rt, mut f) = online(&t, "mbp", "l1", &[in_project(S1, "taisce/main", "idle", "taisce")], None).await;
+    for id in ["a1", "a2", "a3"] {
+        f.turn(&ScriptTurn { session: S1.into(), turn_id: Some(id.into()), prompt: format!("p {id}"), reply: "ok".into(), ..Default::default() }).await.unwrap();
+    }
+    let path = format!("/api/fabric/sessions/{rt}/{S1}/turns");
+    let newest = until(&t, &path, |v| v["turns"].as_array().is_some_and(|a| a.len() == 3)).await;
+    let ids = |v: &Value| v["turns"].as_array().unwrap().iter().map(|t| t["turn_id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let ended = |v: &Value| v["turns"].as_array().unwrap().iter().map(|t| t["ended"].as_i64().unwrap()).collect::<Vec<_>>();
+
+    // the three end in the same second here: oldest first is by `ended`, ties in any order
+    let all = t.get(&format!("{path}?after=0&limit=3")).await;
+    let (mut got, mut held) = (ids(&all), ids(&newest));
+    got.sort();
+    held.sort();
+    assert_eq!((got, all["more"].as_bool()), (held, Some(false)), "every turn: {all}");
+    assert!(ended(&all).windows(2).all(|w| w[0] <= w[1]), "oldest first: {all}");
+    let want = ids(&all);
+    let first = t.get(&format!("{path}?after=0&limit=2")).await;
+    assert_eq!((ids(&first), first["more"].as_bool()), (want[..2].to_vec(), Some(true)), "{first}");
+    let last = ended(&all)[2];
+    let none = t.get(&format!("{path}?after={last}")).await;
+    assert_eq!((none["turns"].as_array().map(Vec::len), none["more"].as_bool()), (Some(0), Some(false)), "{none}");
+    let (st, _) = t.send("GET", &format!("{path}?after=0&before=9999999999"), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn an_order_is_checked_kept_sent_and_answered() {
     let t = setup().await;

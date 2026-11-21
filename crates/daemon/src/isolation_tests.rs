@@ -3935,6 +3935,7 @@ async fn agent_fabric_work_is_its_owners_alone() {
     // A's things by id: not found, never forbidden
     for path in [
         format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns"),
+        format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns?after=0"),
         format!("/api/fabric/orders/{a_order}"),
         format!("/api/fabric/pairing/{a_pairing}"),
         format!("/api/fabric/conversations/{a_conv}"),

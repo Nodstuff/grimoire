@@ -138,6 +138,25 @@ fn turns_are_kept_once_and_read_newest_first() {
 }
 
 #[test]
+fn turns_after_are_one_sessions_oldest_first() {
+    let mut w = setup();
+    let (sid, other) = (Uuid::now_v7(), Uuid::now_v7());
+    w.s.with_scope_for_test(Scope::User(w.tom), |s| {
+        for (id, ended) in [("t3", 300), ("t1", 100), ("t2", 200), ("t4", 400)] {
+            assert!(s.fabric_turn_put(w.rt, &turn(sid, id, ended)).unwrap());
+        }
+        assert!(s.fabric_turn_put(w.rt, &turn(other, "elsewhere", 250)).unwrap());
+        let ids = |v: Vec<FabricTurn>| v.into_iter().map(|t| t.turn_id).collect::<Vec<_>>();
+        assert_eq!(ids(s.fabric_turns_after(w.rt, sid, 0, 10).unwrap()), ["t1", "t2", "t3", "t4"]);
+        assert_eq!(ids(s.fabric_turns_after(w.rt, sid, 200, 10).unwrap()), ["t3", "t4"], "strictly after, this session only");
+        assert_eq!(ids(s.fabric_turns_after(w.rt, sid, 100, 2).unwrap()), ["t2", "t3"], "the oldest of what is missing first");
+        assert!(s.fabric_turns_after(w.rt, sid, 400, 10).unwrap().is_empty());
+    });
+    w.s.with_scope_for_test(Scope::User(w.ann), |s| assert!(nf(s.fabric_turns_after(w.rt, sid, 0, 10))));
+    w.s.with_scope_for_test(Scope::Public, |s| assert!(nf(s.fabric_turns_after(w.rt, sid, 0, 10))));
+}
+
+#[test]
 fn attention_is_raised_once_trimmed_and_cleared() {
     let mut w = setup();
     let sid = Uuid::now_v7();
