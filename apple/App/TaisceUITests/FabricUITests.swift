@@ -196,7 +196,9 @@ final class FabricUITests: XCTestCase {
 
         // typed and sent: after the window, one signed order
         composer.tap()
-        composer.typeText(" and link the ticket")
+        // the caret may land anywhere in what came back: write it afresh
+        composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 30) + String(repeating: XCUIKeyboardKey.forwardDelete.rawValue, count: 30))
+        composer.typeText("Yes, go ahead and link the ticket")
         el(app, "session.send").tap()
         XCTAssertTrue(el(app, "session.pending").waitForExistence(timeout: 3))
         waitFor("posted after five seconds", timeout: 12) { !stub.postedOrders.isEmpty }

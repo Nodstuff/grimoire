@@ -1128,8 +1128,8 @@ server" instead of erroring.
   a visible push); the row stays, with "Snoozed until …". Unsnooze the same way.
 - **Push**: the server's alert push `{"kind":"fabric_session","session_id",
   "runtime_id","state"}`, title the address and body the state, grouped by the
-  server's `thread-id`. A tap (`FabricSessionPush`) opens Agents with that
-  session in view and marked for three seconds (one the fleet has not
+  server's `thread-id`. A tap (`FabricSessionPush`) opens that session's
+  screen, with Agents beneath it showing the session in view and marked for three seconds (one the fleet has not
   delivered yet is kept until it arrives); while an Agents screen is in
   front of an active window the notification is not presented
   (`FleetScreenPresence` counts the screen in and, when it goes, out).
@@ -1141,6 +1141,69 @@ server" instead of erroring.
   Mac while it runs: `apple/scripts/push-fabric-session.sh <simulator udid> &`
   and `TEST_RUNNER_TAISCE_UI_PUSHER=1` (skipped otherwise). `-tab agents`
   opens Agents.
+
+## Agents: read, command, ask, collaborate (Agent Fabric Slices 2–5)
+
+ADR 0008 is the contract; `proto/taisce/runtime/v1/runtime.proto` SIGNING is
+normative. Everything that carries the person's authority is a device-signed
+order or settings; nothing the server says is acted on until the Mac's own
+signature over it is checked.
+
+- **Signing** (`TaisceKit/Fabric/ProtoWire.swift`, `FabricMessages.swift`,
+  `FabricSigning.swift`): a hand-written canonical protobuf encoder for the
+  signed messages (Order, Command, Hold, Settings, AttentionRequest,
+  PairingClaim, PairingSeal) and strict decoders that refuse unknown fields.
+  Not SwiftProtobuf: four messages, the bytes must be the canonical ones, and
+  a generator would add a build step and a package for that.
+  `FabricSigningTests` reproduces every vector in
+  `testdata/signing-vectors.json` byte for byte, verifies both s values and
+  refuses every must_fail case. ECDSA P-256 over `CONTEXT || payload`.
+- **This device's key** (`FabricDeviceIdentity`): made on first use in the
+  Secure Enclave (`SecureEnclave.P256.Signing`, usable after first unlock so a
+  notification action can sign), its blob in the Keychain, this device only.
+  The simulator has no Enclave: a software key in the Keychain, said so in
+  Settings › Agents. The fingerprint is the device id's first 16 hex
+  characters in fours.
+- **Pairing** (Settings › Agents › Pair with a Mac, or the gear on Agents):
+  scan the `taisce-pair:` code the Mac shows (VisionKit) or paste it. The app
+  refuses a code naming another server, seals a signed claim (HKDF-SHA256 +
+  AES-256-GCM), posts it, shows this phone's fingerprint to compare at the
+  Mac, and trusts the runtime key from the code (`KeychainTrustStore`) once
+  the Mac confirms. That key, never the hub's copy, is what approvals and
+  questions are verified against.
+- **Orders** (`CommandCenter`): counters max(last + 1, unix ms, one above what
+  the runtime last took from this device); a reply lives an hour, an approval
+  no longer than its request. Text starting with `!` or `/` is never signed.
+  A reply is held five seconds (Undo); leaving the app sends what is held.
+  An order still at the server can be taken back (`DELETE`); a queued one at
+  the Mac is cancelled with a signed `cancel`. A refusal of one of this
+  phone's orders is said once, in words (`FabricWords`).
+- **Screens**: Agents rows open their session (`AgentSessionScreen`: header,
+  turns with "N new since you looked", running now, queued messages with edit
+  and cancel, the reply box that replies, queues or answers, Stop, Resume,
+  follow, move to fabric, compact, clear); `ApprovalSheet` (the verified
+  command, its countdown, Allow once with Face ID, Deny, Deny and tell it
+  why; an unverifiable request is not shown); questions with their choices;
+  `TalkScreen` and `ConversationScreen` (continue/stop a paused pair, wake or
+  resume to answer, let it wait); `FabricSettingsScreen` (paired Macs,
+  guardrail editor with a pattern tester, limits, fabrics, Text off and
+  private notifications per project). Hold all / Release on Agents' toolbar is
+  one signed order per Mac. The fabric chips filter the list.
+- **Notifications** (`FabricPush`): a category per kind with its actions.
+  Approving is never a background action (it must show the verified command
+  and ask for Face ID): Review opens the sheet. Deny, Answer…, wake, let it
+  wait, continue and stop work from the notification, each reading the item
+  back from the server and verifying it first. A question's choices become
+  buttons in the `TaisceNotifications` service extension, which registers a
+  category per question: the server's category is the same for every
+  question, so only an extension can give each its own buttons (it runs only
+  for a push marked `mutable-content`).
+- **Tests**: kit `FabricSigningTests`, `FabricAPITests`; app
+  `FabricAppTests`; UI `FabricUITests` against `FabricStub` (a stand-in hub and
+  runtime in the runner that opens the pairing seal, signs attention requests
+  and checks every posted order and settings as a runtime would). UI runs pass
+  `-fabricOwnerCheck pass` (Debug only) in place of Face ID; `-tab talk`
+  opens Talk.
 
 ## Running the app against a scratch daemon
 

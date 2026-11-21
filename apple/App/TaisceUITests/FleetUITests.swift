@@ -172,10 +172,12 @@ final class FleetUITests: XCTestCase {
         app.navigationBars.buttons.firstMatch.tap()
         XCTAssertTrue(card.waitForExistence(timeout: 10), "back on Today")
         XCTAssertTrue(bannerShows(within: 20), "a session notification shows once Agents has been left")
-        // a tap opens Agents on that session's row, marked
+        // a tap opens that session, with Agents beneath it on that session's row, marked
         banner.tap()
+        XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "session.header").firstMatch.waitForExistence(timeout: 15), "the session opened")
+        app.navigationBars.buttons.firstMatch.tap()
         let named = row(app, "taisce/main")
-        XCTAssertTrue(named.waitForExistence(timeout: 15), "Agents opened")
+        XCTAssertTrue(named.waitForExistence(timeout: 15), "Agents beneath")
         waitFor("the row is marked", timeout: 6) { named.isSelected }
         XCTAssertFalse(row(app, "workbox/main").isSelected)
         // (seen at all, it lasted: it used to be set and cleared in the same instant.) Then it goes

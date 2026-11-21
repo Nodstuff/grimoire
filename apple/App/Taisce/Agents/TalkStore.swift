@@ -76,7 +76,7 @@ final class TalkStore {
         await settle(id) { try await $0.continueConversation(id) }
     }
 
-    /// Held messages bounce; the pair stays paused until you next order either.
+    /// Held messages bounce to their sender ("your person stopped this exchange"); the count restarts.
     func stopPair(_ id: String) async -> String? {
         await settle(id) { try await $0.stopConversation(id) }
     }
