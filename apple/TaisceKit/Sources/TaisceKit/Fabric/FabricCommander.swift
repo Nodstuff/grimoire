@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Synchronization
 import Valet
@@ -201,5 +202,58 @@ public struct VerifiedAttention: Sendable, Hashable {
 
     public func answer(words: String) -> FabricCommand {
         FabricCommand(sessionID: request.sessionID, verb: .answer, text: words, requestID: request.requestID, requestHash: requestHash)
+    }
+}
+
+/// This device's signing key for Agent Fabric: made once, in the Secure
+/// Enclave where there is one, and kept for the life of the install (a
+/// Keychain item for this device only). A device with no Enclave (the
+/// simulator) keeps a software key in the Keychain instead, and says so.
+/// Everything a paired Mac obeys from this phone is signed with it.
+public final class FabricDeviceIdentity: Sendable {
+    public enum Kind: Sendable, Equatable { case secureEnclave, software }
+
+    private let state = Mutex<(key: (any FabricDeviceKey)?, kind: Kind)>((nil, .software))
+    private let valet: Valet
+    static let enclaveItem = "device-key"
+    static let softwareItem = "device-key-software"
+
+    public init(identifier: String = "ie.null.taisce.fabric") {
+        valet = .valet(with: Identifier(nonEmpty: identifier)!, accessibility: .afterFirstUnlockThisDeviceOnly)
+    }
+
+    public var kind: Kind { state.withLock { $0.kind } }
+
+    /// The key, made the first time it is asked for.
+    public func current() throws -> any FabricDeviceKey {
+        try state.withLock { s in
+            if let key = s.key { return key }
+            let made: (any FabricDeviceKey, Kind)
+            if SecureEnclaveDeviceKey.isAvailable {
+                if let blob = try? valet.object(forKey: Self.enclaveItem), let k = try? SecureEnclaveDeviceKey(dataRepresentation: blob) {
+                    made = (k, .secureEnclave)
+                } else {
+                    let k = try SecureEnclaveDeviceKey()
+                    try valet.setObject(k.dataRepresentation, forKey: Self.enclaveItem)
+                    made = (k, .secureEnclave)
+                }
+            } else if let raw = try? valet.object(forKey: Self.softwareItem), let k = try? P256.Signing.PrivateKey(rawRepresentation: raw) {
+                made = (SoftwareDeviceKey(k), .software)
+            } else {
+                let k = SoftwareDeviceKey()
+                try valet.setObject(k.key.rawRepresentation, forKey: Self.softwareItem)
+                made = (k, .software)
+            }
+            s = (made.0, made.1)
+            return made.0
+        }
+    }
+
+    /// The key if one has been made, without making one.
+    public func existing() -> (any FabricDeviceKey)? {
+        if let key = state.withLock({ $0.key }) { return key }
+        let item = SecureEnclaveDeviceKey.isAvailable ? Self.enclaveItem : Self.softwareItem
+        guard (try? valet.containsObject(forKey: item)) == true else { return nil }
+        return try? current()
     }
 }

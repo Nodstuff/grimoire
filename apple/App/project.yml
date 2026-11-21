@@ -141,6 +141,11 @@ targets:
           NSAllowsLocalNetworking: true
     dependencies:
       - target: Taisce
+      # the stand-in fabric server signs attention requests, opens pairing
+      # seals and reads orders with the kit's own encoder (a separate
+      # process from the app, so linking it here duplicates nothing)
+      - package: TaisceKit
+        product: TaisceKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ie.null.taisce.uitests

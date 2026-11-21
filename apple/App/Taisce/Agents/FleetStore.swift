@@ -9,11 +9,13 @@ struct FleetSessionRequest: Equatable {
     var serial: Int
 }
 
-/// The person's fleet on this device (Agent Fabric, Slice 1: Watch): every
-/// Claude session their runtimes report, followed live while the app is in
-/// front. Watch only: the one thing it changes is a session's snooze. One
-/// per app (`AppModel.fleet`); nothing is kept on disk, and sign-out
-/// forgets it (`reset`).
+/// The person's fleet on this device (Agent Fabric): every Claude session
+/// their runtimes report and what waits for them, followed live while the
+/// app is in front. Commands (Slices 3–5) go through `command`, the agents'
+/// conversations through `talk`, settings and pairing through `config`:
+/// each takes the stream's events from here. One per app (`AppModel.fleet`);
+/// nothing is kept on disk but this device's key and the runtimes' keys,
+/// and sign-out forgets the rest (`reset`).
 @MainActor @Observable
 final class FleetStore {
     enum Availability: Equatable {
@@ -39,6 +41,18 @@ final class FleetStore {
     private(set) var request: FleetSessionRequest?
     /// Agents screens in front in an active window
     private(set) var watching = 0
+    /// finished turns the stream has sent since the screens last read, per
+    /// session, oldest first (a session screen merges them into its feed)
+    private(set) var liveTurns: [FleetSessionKey: [FabricTurn]] = [:]
+    /// a session screen in front: its notifications are not presented
+    private(set) var openSession: FleetSessionKey?
+
+    /// orders, undo and approvals (Slice 3)
+    let command = CommandCenter()
+    /// agents talking (Slice 5)
+    let talk = TalkStore()
+    /// guardrails, limits, fabrics, projects, pairing
+    let config = FabricConfigStore()
 
     @ObservationIgnored private var followTask: Task<Void, Never>?
     /// bumped by `reset`: an answer that comes back for an earlier account
@@ -46,6 +60,17 @@ final class FleetStore {
     @ObservationIgnored private var generation = 0
 
     private var service: (any FleetService)? { serviceOverride ?? app?.api }
+    /// the Slice 2–5 routes (a test's fake may have only the fleet's)
+    var fabricService: (any FabricService)? {
+        if let serviceOverride { return serviceOverride as? any FabricService }
+        return app?.api
+    }
+
+    init() {
+        command.fleet = self
+        talk.fleet = self
+        config.fleet = self
+    }
 
     /// the fleet has arrived at least once
     var isLoaded: Bool { availability == .available }
@@ -63,6 +88,10 @@ final class FleetStore {
         availability = .unknown
         loadError = nil
         request = nil
+        liveTurns = [:]
+        command.reset()
+        talk.reset()
+        config.reset()
     }
 
     // MARK: following
@@ -111,7 +140,51 @@ final class FleetStore {
         case .failed(let why):
             // a fleet already showing stays; the indicator says it is stale
             if availability != .available { loadError = Self.describe(why) }
+        case .event(let event):
+            take(event)
         }
+    }
+
+    /// One of the stream's Slice 2–5 events.
+    func take(_ event: FabricStreamEvent) {
+        switch event {
+        case .turn(let turn):
+            var list = liveTurns[turn.session] ?? []
+            list.removeAll { $0.turnID == turn.turnID }
+            list.append(turn)
+            liveTurns[turn.session] = Array(list.suffix(50))
+        case .attention(let item):
+            fleet.raise(item)
+        case .attentionCleared(let cleared):
+            fleet.clear(attention: cleared.id)
+        case .order(let order):
+            command.take(order)
+        case .settings(let view):
+            config.take(view)
+        case .project(let project):
+            config.take(project)
+        case .pairing(let pairing):
+            config.take(pairing)
+        case .message(let message):
+            talk.take(message)
+        case .conversation(let conversation):
+            talk.take(conversation)
+        }
+    }
+
+    /// The fleet's open items again (the stream's are the same; this is
+    /// for a screen coming back after the app slept).
+    func refreshAttention() async {
+        guard let api = fabricService, let items = try? await api.attention() else { return }
+        fleet.attention = items
+    }
+
+    /// A session screen is in front (nil: none).
+    func sessionOnScreen(_ key: FleetSessionKey?) { openSession = key }
+
+    /// Replace one session as an answer gave it.
+    func replace(_ session: FleetSession) {
+        if let i = fleet.sessions.firstIndex(where: { $0.key == session.key }) { fleet.sessions[i] = session }
     }
 
     /// The fleet again, in the server's order (a pull to refresh, or coming
@@ -158,7 +231,7 @@ final class FleetStore {
             let session = try await call(service)
             guard asked == generation else { return nil }
             // the stream says the same a moment later; show it now
-            if let i = fleet.sessions.firstIndex(where: { $0.key == session.key }) { fleet.sessions[i] = session }
+            replace(session)
             return nil
         } catch APIError.notFound {
             return "That session is gone."
@@ -167,7 +240,24 @@ final class FleetStore {
         }
     }
 
+    /// Follow a session (every finished turn notifies) or stop.
+    func follow(_ key: FleetSessionKey, _ on: Bool) async -> String? {
+        guard let api = fabricService else { return "Not connected." }
+        let asked = generation
+        do {
+            let session = try await api.follow(key, on)
+            if asked == generation { replace(session) }
+            return nil
+        } catch {
+            return Self.describe(error)
+        }
+    }
+
+    var generationNow: Int { generation }
+
     static func describe(_ error: any Error) -> String {
+        if let e = error as? FabricError { return FabricWords.refusal(e) }
+        if let e = error as? FabricOrderProblem { return FabricWords.problem(e) }
         if let e = error as? APIError {
             switch e {
             case let .server(m): return m
