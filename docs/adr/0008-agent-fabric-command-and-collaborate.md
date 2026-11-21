@@ -1,6 +1,6 @@
 # ADR 0008 — Agent Fabric: read, command, ask, collaborate (Slices 2–5)
 
-- **Status**: proposed (2026-11-21). The contract half (Phase A): the wire messages, the
+- **Status**: accepted (2026-11-21). The contract half (Phase A): the wire messages, the
   signing rules and the viewer API. The server's implementation follows on the same branch
   and amends this ADR where building it teaches something.
 - **Who/when**: Tom + Claude, 2026-11-21
@@ -363,12 +363,20 @@ answered: …") through the review gate, attributed to `fabric`.
   wins" rule gives the same effect with one integer per device on the runtime.
 - **Approvals hashing only the command text**: §4; the request hash binds more for nothing.
 
+## Decided after review (2026-11-21)
+
+- **Text off still stores what must reach a sleeping Mac.** An order's signed payload and a
+  message's body are stored until delivered or read, because the Mac may be asleep when they
+  are sent; nothing of them stays after. Turns, attention text, `last_line` and `note` are not
+  written for a Text off project. Accepted, and said in Trust and Safety.
+- **Approvals hash the whole signed request**, not only the command text (§4). Accepted.
+- **Removing a lost device from the phone** would need a signed order to each runtime. Deferred:
+  in these slices a device is removed at the Mac.
+- **`TAMPER` items inform only**; a held session is released at the Mac. Accepted.
+- **Notification buttons for a question's choices** are the app's: categories registered at
+  run time where they can carry the labels, a Notification Service Extension only if needed.
+
 ## Open questions
 
 - Workbox to confirm: the `GitOutcome` fields, `TurnEnd`, and whether presence (`present`) is
   known reliably enough to suppress pushes.
-- The phone's notification actions for questions need choices in the push. A Notification
-  Service Extension can build per-question buttons; the app decides.
-- Removing a lost device from the phone (not only at the Mac) would need a signed order to
-  each runtime; not in these slices.
-- `TAMPER` items inform only; releasing a held session is done at the Mac.
