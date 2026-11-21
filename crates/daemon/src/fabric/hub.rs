@@ -535,16 +535,22 @@ impl Hub {
     /// Snooze `session` of `user`'s `runtime` until `until`, or lift its
     /// snooze (None). Stored in the person's own scope and announced on
     /// their stream; a session that is not theirs, or not there, is
-    /// NotFound.
+    /// NotFound. The store and the fleet are changed together under the
+    /// runtime's write lock, so two snoozes (or a snooze and [`Hub::wake`])
+    /// cannot leave them saying different things.
     pub async fn snooze(&self, user: Uuid, runtime: Uuid, session: Uuid, until: Option<i64>) -> Result<SessionView, StoreError> {
         let gone = || StoreError::NotFound(format!("session {session}"));
         self.sync(user).await?;
-        let held = self.fleets().get(&user).and_then(|f| f.runtimes.get(&runtime)).is_some_and(|r| r.sessions.contains_key(&session));
-        if !held {
-            return Err(gone());
-        }
+        let writing = self
+            .fleets()
+            .get(&user)
+            .and_then(|f| f.runtimes.get(&runtime))
+            .filter(|r| r.sessions.contains_key(&session))
+            .map(|r| r.writing.clone())
+            .ok_or_else(gone)?;
         // a session just reported may not be in the store yet
         self.write_runtime(user, runtime).await;
+        let _turn = writing.lock().await;
         with_store(&self.0.store, Scope::User(user), move |s| s.fabric_session_quiet(runtime, session, until).map(|_| ())).await?;
         let mut fleets = self.fleets();
         let fleet = fleets.get_mut(&user).ok_or_else(gone)?;
@@ -561,30 +567,33 @@ impl Hub {
     /// Lift every snooze whose time has passed at `now`, and say so on its
     /// person's stream. (Alerts go by the time itself, so one that has
     /// passed already silences nothing: this keeps the fleet's mark honest.)
+    /// Per runtime, under its write lock: the store lifts only what has run
+    /// out (`quiet_until <= now`), and so does the fleet, so a snooze set
+    /// while this ran stays in both.
     pub async fn wake(&self, now: i64) {
-        let woken: Vec<(Uuid, Uuid, Uuid)> = {
-            let mut fleets = self.fleets();
-            let mut woken = vec![];
-            for (user, fleet) in fleets.iter_mut() {
-                let mut changes = vec![];
-                for rt in fleet.runtimes.values_mut() {
-                    for slot in rt.sessions.values_mut().filter(|s| s.row.quiet_until.is_some_and(|until| until <= now)) {
-                        slot.row.quiet_until = None;
-                        changes.push(Change::Session(SessionView::from(&slot.row)));
-                        woken.push((*user, rt.row.id, slot.row.id));
-                    }
-                }
-                Self::publish(fleet, changes);
-            }
-            woken
-        };
-        for (user, runtime, session) in woken {
-            match with_store(&self.0.store, Scope::User(user), move |s| s.fabric_session_quiet(runtime, session, None).map(|_| ())).await {
-                // gone meanwhile (expired, or its runtime removed): nothing to lift
+        let ran_out = |s: &Slot| s.row.quiet_until.is_some_and(|until| until <= now);
+        let due: Vec<(Uuid, Uuid, Arc<tokio::sync::Mutex<()>>)> = self
+            .fleets()
+            .iter()
+            .flat_map(|(user, f)| f.runtimes.values().filter(|r| r.sessions.values().any(ran_out)).map(|r| (*user, r.row.id, r.writing.clone())))
+            .collect();
+        for (user, runtime, writing) in due {
+            let _turn = writing.lock().await;
+            match with_store(&self.0.store, Scope::User(user), move |s| s.fabric_sessions_wake(runtime, now).map(|_| ())).await {
+                // removed meanwhile: there is nothing to lift
                 Ok(()) | Err(StoreError::NotFound(_)) => {}
                 // a time already passed silences nothing; the next load lifts it again
-                Err(e) => tracing::warn!("fabric: lifting the snooze of session {session} failed: {e}"),
+                Err(e) => tracing::warn!("fabric: lifting the snoozes of runtime {runtime} failed: {e}"),
             }
+            let mut fleets = self.fleets();
+            let Some(fleet) = fleets.get_mut(&user) else { continue };
+            let Some(rt) = fleet.runtimes.get_mut(&runtime) else { continue };
+            let mut changes = vec![];
+            for slot in rt.sessions.values_mut().filter(|s| ran_out(s)) {
+                slot.row.quiet_until = None;
+                changes.push(Change::Session(SessionView::from(&slot.row)));
+            }
+            Self::publish(fleet, changes);
         }
     }
 

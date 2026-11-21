@@ -3739,6 +3739,9 @@ async fn a_snooze_is_its_persons_alone() {
             assert_eq!(fx.call(&fx.b_pat, method, path, body.clone()).await.0, StatusCode::UNAUTHORIZED, "{method} {path}");
         }
     }
+    // a connector is refused before its body is read: a bad one is still a 403
+    let (st, out) = fx.call(&fx.b_conn, "POST", &b_path, Some(json!({"until": "soon"}))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{out}");
     assert_eq!(a_quiet(), Some(until));
     let b_rows = fx.store.lock(Scope::User(fx.b)).fabric_sessions().unwrap();
     assert_eq!(b_rows[0].quiet_until, None);

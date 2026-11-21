@@ -348,6 +348,17 @@ impl SqliteStore {
             .ok_or_else(|| StoreError::NotFound(format!("session {id}")))
     }
 
+    /// Lift the snoozes of one of the scope's runtimes that have run out at
+    /// `now`, and only those: one set again meanwhile (to a time ahead) is
+    /// left alone. Says how many were lifted.
+    pub fn fabric_sessions_wake(&mut self, runtime: Uuid, now: i64) -> Result<usize> {
+        self.fabric_runtime(runtime)?;
+        Ok(self.conn.execute(
+            "UPDATE fabric_sessions SET quiet_until = NULL WHERE runtime_id = ?1 AND quiet_until <= ?2",
+            params![runtime.to_string(), now],
+        )?)
+    }
+
     /// Write sessions of one of the scope's runtimes, each whole (insert or
     /// replace). See [`SqliteStore::fabric_runtime_write`].
     pub fn fabric_sessions_put(&mut self, runtime: Uuid, sessions: &[FabricSession]) -> Result<()> {
@@ -671,6 +682,14 @@ mod tests {
             s.with_scope_for_test(scope, |s| assert!(is_not_found(s.fabric_session_quiet(r.id, sid, None)), "{scope:?}"));
         }
         assert_eq!(s.fabric_sessions().unwrap()[0].quiet_until, Some(5000));
+        // a wake lifts only what has run out, and only in the caller's own runtime
+        s.with_scope_for_test(Scope::User(ann), |s| assert!(is_not_found(s.fabric_sessions_wake(r.id, i64::MAX))));
+        s.with_scope_for_test(Scope::User(tom), |s| assert_eq!(s.fabric_sessions_wake(r.id, 4999).unwrap(), 0));
+        assert_eq!(s.fabric_sessions().unwrap()[0].quiet_until, Some(5000));
+        s.with_scope_for_test(Scope::User(tom), |s| {
+            assert_eq!(s.fabric_sessions_wake(r.id, 5000).unwrap(), 1);
+            assert_eq!(s.fabric_session_quiet(r.id, sid, Some(5000)).unwrap().quiet_until, Some(5000));
+        });
         s.with_scope_for_test(Scope::User(tom), |s| {
             assert_eq!(s.fabric_session_quiet(r.id, sid, None).unwrap().quiet_until, None);
         });

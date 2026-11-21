@@ -159,11 +159,16 @@ async fn snooze(
     v: Viewer,
     headers: HeaderMap,
     Path((runtime, session)): Path<(Uuid, Uuid)>,
-    Json(req): Json<SnoozeReq>,
+    body: axum::body::Bytes,
 ) -> Response {
     let (hub, user) = match gate(&st, &v, &headers) {
         Ok(g) => g,
         Err(r) => return r.into_response(),
+    };
+    // read after the gate: whoever may not snooze is told so (403, or 404
+    // in LOCAL mode) whatever they sent, never what was wrong with it
+    let Ok(req) = serde_json::from_slice::<SnoozeReq>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "until: unix seconds, as JSON {\"until\": <number>}");
     };
     let now = crate::auth::now();
     if req.until <= now || req.until - now > MAX_SNOOZE {

@@ -540,3 +540,37 @@ async fn nobody_snoozes_a_session_that_is_not_theirs() {
     assert_eq!(t.stored(id).unwrap().quiet_until, None);
     assert_eq!(t.hub.fleet(t.user).await.unwrap().sessions[0].quiet_until, None);
 }
+
+/// A snooze and the lifting of one that ran out, at the same moment and
+/// many times over: whichever goes first, the store and the fleet end up
+/// saying the same thing, and it is the new snooze.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snooze_racing_a_wake_leaves_the_store_and_the_fleet_agreeing() {
+    let t = setup();
+    let c = t.connect("launch-1", 100).await;
+    let id = Uuid::now_v7();
+    t.state(&c, 1, session(&t, id, "taisce/main", SessionStatus::Working, 100), 100).await.unwrap();
+    for round in 0..200i64 {
+        // an old snooze that has run out at 1000 is in both
+        t.hub.snooze(t.user, t.rt.id, id, Some(1000)).await.unwrap();
+        let next = 5000 + round;
+        let (wake, snooze) = (t.hub.clone(), t.hub.clone());
+        let (user, rt) = (t.user, t.rt.id);
+        let a = tokio::spawn(async move { wake.wake(1000).await });
+        let b = tokio::spawn(async move { snooze.snooze(user, rt, id, Some(next)).await.map(|v| v.quiet_until) });
+        a.await.unwrap();
+        assert_eq!(b.await.unwrap().unwrap(), Some(next));
+        let held = t.hub.fleet(t.user).await.unwrap().sessions[0].quiet_until;
+        assert_eq!((held, t.stored(id).unwrap().quiet_until), (Some(next), Some(next)), "round {round}");
+    }
+    // two devices at once: the fleet and the store agree on one of them
+    for round in 0..100i64 {
+        let (one, two) = (t.hub.clone(), t.hub.clone());
+        let (user, rt) = (t.user, t.rt.id);
+        let a = tokio::spawn(async move { one.snooze(user, rt, id, Some(7000 + round)).await.unwrap() });
+        let b = tokio::spawn(async move { two.snooze(user, rt, id, None).await.unwrap() });
+        let _ = (a.await.unwrap(), b.await.unwrap());
+        let held = t.hub.fleet(t.user).await.unwrap().sessions[0].quiet_until;
+        assert_eq!(held, t.stored(id).unwrap().quiet_until, "round {round}");
+    }
+}

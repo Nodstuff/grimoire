@@ -671,6 +671,11 @@ async fn local_mode_has_no_fleet() {
     assert_eq!(app.clone().oneshot(post).await.unwrap().status(), StatusCode::NOT_FOUND);
     let delete = Request::delete(&path).body(Body::empty()).unwrap();
     assert_eq!(app.clone().oneshot(delete).await.unwrap().status(), StatusCode::NOT_FOUND);
+    // whatever the body: there is no fleet to say anything about
+    for body in ["", "not json", r#"{"until":"soon"}"#] {
+        let post = Request::post(&path).body(Body::from(body)).unwrap();
+        assert_eq!(app.clone().oneshot(post).await.unwrap().status(), StatusCode::NOT_FOUND, "{body:?}");
+    }
 }
 
 /// Snooze, on the routes: the person snoozes a session and it says so in
@@ -699,7 +704,8 @@ async fn a_person_snoozes_a_session_and_lifts_it() {
         let (status, out) = t.send("POST", &path, Some(json!({"until": bad}))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {out}");
     }
-    assert!(t.send("POST", &path, None).await.0.is_client_error());
+    assert_eq!(t.send("POST", &path, None).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(t.send("POST", &path, Some(json!({"until": "soon"}))).await.0, StatusCode::BAD_REQUEST);
     let elsewhere = format!("/api/fabric/sessions/{}/{S1}/snooze", Uuid::now_v7());
     assert_eq!(t.send("POST", &elsewhere, Some(json!({"until": until}))).await.0, StatusCode::NOT_FOUND);
     assert_eq!(t.send("DELETE", &elsewhere, None).await.0, StatusCode::NOT_FOUND);
