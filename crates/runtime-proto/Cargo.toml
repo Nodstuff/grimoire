@@ -20,6 +20,15 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 tokio-stream = { version = "0.1.19", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+# SIGNING: ECDSA P-256 / SHA-256 (the phone's Secure Enclave key)
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
+sha2 = "0.11.1"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+# the pairing seal's test vector: HKDF-SHA256 and AES-256-GCM
+hkdf = "0.13.0"
+aes-gcm = "0.11.1"
 
 [build-dependencies]
 # pure-Rust protobuf compiler: the build never needs `protoc` (the server is

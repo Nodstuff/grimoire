@@ -19,6 +19,7 @@ pub const CREDENTIAL_PREFIX: &str = "trt_";
 
 #[cfg(feature = "client")]
 pub mod fake;
+pub mod signing;
 pub mod window;
 
 impl v1::SessionStatus {
@@ -60,16 +61,30 @@ mod tests {
         assert_eq!(v1::SessionStatus::from_name("offline"), None);
     }
 
-    /// The numbers later slices will use stay free: a message that carries
-    /// one decodes with no body instead of being misread as something else.
+    /// A body this build does not know (a newer peer's) decodes as no body,
+    /// never as something else: the VERSIONS rule rests on it.
     #[test]
-    fn reserved_numbers_decode_to_no_body() {
+    fn unknown_bodies_decode_to_no_body() {
         use prost::Message as _;
-        // field 5 (turn), wire type 2, empty; then seq = 7
-        let bytes = [0x2a, 0x00, 0x08, 0x07];
+        // field 13 (unassigned), wire type 2, empty; then seq = 7
+        let bytes = [0x6a, 0x00, 0x08, 0x07];
         let up = v1::Up::decode(&bytes[..]).unwrap();
         assert_eq!((up.seq, up.body), (7, None));
-        let down = v1::Down::decode(&[0x1a, 0x00][..]).unwrap();
+        // field 8 (unassigned)
+        let down = v1::Down::decode(&[0x42, 0x00][..]).unwrap();
         assert_eq!(down.body, None);
+    }
+
+    /// Slice 1's numbers did not move: a Slice 1 runtime's bytes still
+    /// mean what they meant.
+    #[test]
+    fn slice_one_numbers_are_unchanged() {
+        use prost::Message as _;
+        let up = v1::Up::decode(&[0x08, 0x03, 0x5a, 0x02, 0x08, 0x02][..]).unwrap();
+        assert_eq!((up.seq, up.body), (3, Some(v1::up::Body::Ack(v1::Ack { seq: 2 }))));
+        let up = v1::Up::decode(&[0x52, 0x00][..]).unwrap();
+        assert_eq!(up.body, Some(v1::up::Body::Heartbeat(v1::Heartbeat {})));
+        let down = v1::Down::decode(&[0x32, 0x02, 0x08, 0x05][..]).unwrap();
+        assert_eq!(down.body, Some(v1::down::Body::Ack(v1::Ack { seq: 5 })));
     }
 }

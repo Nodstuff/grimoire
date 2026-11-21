@@ -2,7 +2,8 @@
 
 - **Status**: accepted (2026-11-20; revised the same day after the transport spike (§5a, the
   rpc's name, the proxy route) and after an independent review (§5b, the silence deadline,
-  the status codes)). Covers Slice 1 only; later slices add to it.
+  the status codes)). Covers Slice 1 only; ADR 0008 adds Slices 2–5 (turns, signed orders,
+  settings, pairing, agent messages) and supersedes §8's "no text in notifications".
 - **Who/when**: Tom + Claude, 2026-11-20
 - **Scope**: SERVER mode only. In LOCAL mode the viewer routes answer 404 and no runtime can
   connect.

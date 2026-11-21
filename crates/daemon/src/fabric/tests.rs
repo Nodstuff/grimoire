@@ -422,6 +422,10 @@ impl taisce_runtime_proto::v1::runtime_server::Runtime for MuteHub {
         });
         Ok(tonic::Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
+
+    async fn call(&self, _: tonic::Request<pb::CallRequest>) -> Result<tonic::Response<pb::CallReply>, tonic::Status> {
+        Err(tonic::Status::unimplemented("mute"))
+    }
 }
 
 /// The window is the sender's to keep: against a hub that stops
@@ -531,7 +535,7 @@ async fn a_broken_message_ends_the_stream_with_a_status_never_a_clean_close() {
             ..Default::default()
         })),
     };
-    let snapshot = pb::Snapshot { replaces_seq: 0, sessions: vec![match odd(0).body { Some(pb::up::Body::State(s)) => s, _ => unreachable!() }] };
+    let snapshot = pb::Snapshot { replaces_seq: 0, sessions: vec![match odd(0).body { Some(pb::up::Body::State(s)) => s, _ => unreachable!() }], open_requests: vec![] };
     fake.send(pb::Up { seq: 0, body: Some(pb::up::Body::Snapshot(snapshot)) }).await.unwrap();
     fake.heartbeat().await.unwrap();
     let mut fleet = t.get("/api/fabric/sessions").await;

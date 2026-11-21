@@ -154,6 +154,12 @@ impl Runtime for RuntimeService {
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+
+    /// Fabric tool calls (Slice 5): declared in the contract, not served yet.
+    async fn call(&self, req: Request<pb::CallRequest>) -> Result<Response<pb::CallReply>, Status> {
+        self.authenticate(&req).await?;
+        Err(Status::unimplemented("fabric tool calls are not served yet"))
+    }
 }
 
 /// Why something was not sent down a stream.

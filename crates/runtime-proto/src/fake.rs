@@ -105,6 +105,7 @@ impl ScriptSession {
             last_line: self.last_line.clone(),
             context_used_pct: self.context_used_pct,
             since: self.since.unwrap_or_else(now),
+            ..Default::default()
         })
     }
 }
@@ -279,7 +280,7 @@ impl Fake {
     /// Every session, as of the last event assigned.
     pub async fn snapshot(&mut self, sessions: &[ScriptSession]) -> Result<(), Error> {
         let sessions = sessions.iter().map(ScriptSession::message).collect::<Result<Vec<_>, _>>()?;
-        self.send(Up { seq: 0, body: Some(up::Body::Snapshot(Snapshot { replaces_seq: self.seq, sessions })) }).await
+        self.send(Up { seq: 0, body: Some(up::Body::Snapshot(Snapshot { replaces_seq: self.seq, sessions, open_requests: vec![] })) }).await
     }
 
     pub async fn state(&mut self, session: &ScriptSession) -> Result<(), Error> {

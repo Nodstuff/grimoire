@@ -4,12 +4,10 @@
 //
 // This file is the source of truth for the wire contract; a runtime takes a
 // copy. docs/adr/0007-agent-fabric-runtime-channel.md records the server's
-// decisions.
-//
-// Slice 1 (Watch) is built: the runtime reports its sessions and the hub
-// answers with a Welcome and acknowledgements. Field numbers a later slice
-// will use are reserved below, each with the name it will carry, so nothing
-// is renumbered.
+// decisions for Slice 1 (Watch), docs/adr/0008-agent-fabric-command-and-
+// collaborate.md those for Slices 2-5 (Read, Command, Ask, Collaborate).
+// SIGNING below is normative; testdata/signing-vectors.json beside this file
+// holds test vectors for it.
 //
 // SIGN-IN. Every call carries `authorization: Bearer trt_…`, the runtime's
 // own credential. It opens this service and nothing else.
@@ -18,32 +16,51 @@
 //   1. Up{hello}      within 10 seconds of opening the stream
 //   2. Down{welcome}
 //   3. Up{snapshot}   the first message after the Hello, always
-//   4. Up{accounts}   the runtime's latest headroom report, again (the
-//                     hub does not insist, but shows stale headroom without)
-//   5. Up{state} / Up{accounts} / Up{heartbeat} as things happen, and
-//      Ack in both directions
+//   4. Up{accounts}, Up{runtime}
+//                     the latest headroom and the runtime's own status,
+//                     again, on every new stream
+//   5. the runtime's outbox: every durable Up event (below) numbered above
+//      Welcome.last_up_seq, in order, before any new event
+//   6. anything, as it happens, and Ack in both directions
+// The hub sends its Down events (orders, settings, pairing offers, nudges)
+// only after the Snapshot.
 //
 // A STREAM IS FINITE. The proxy in front of the hub is restarted now and
 // then (every stream is cut after a 25 second drain), a laptop sleeps, a
 // network changes. Reconnecting is the normal path, not an error path.
 //
-// SEQUENCE NUMBERS. Each direction numbers its EVENTS from 1, per instance,
-// never reusing a number. An event is a message the other side must not
-// miss: `state` and `accounts` going up today. Hello, Welcome, Snapshot,
-// Heartbeat and Ack are not events and carry seq 0: they describe the
-// connection or the present moment. An event whose seq is not above the
-// last one received is a replay of something already applied and is
-// ignored (and still acknowledged).
+// SEQUENCE NUMBERS. Each direction numbers its EVENTS from 1, per runtime
+// instance (Hello.instance_id), never reusing a number. An event is a
+// message the other side must not miss; Hello, Welcome, Snapshot, Heartbeat
+// and Ack are not events and carry seq 0. An event whose seq is not above
+// the last one received is a replay and is ignored (and still
+// acknowledged). On a new stream for the same instance the hub numbers its
+// Down events above both its own last number and Hello.last_down_seq.
 //
-// RECONNECTING, IN THIS SLICE. A runtime keeps no log of events. After a
-// reconnect the mandatory Snapshot restores every session and the Accounts
-// that follows it restores the headroom: between them they carry everything
-// an event of this slice could. Welcome.last_up_seq says the last event the
-// hub holds from this instance; the runtime continues its numbering above
-// its own last number, whatever the Welcome says. (A later slice whose
-// events a snapshot cannot restore, such as finished turns, will have the
-// runtime keep those until acknowledged and replay the ones after
-// Welcome.last_up_seq; the fields are here for that.)
+// UP EVENTS come in two kinds.
+//   Restorable: `state`, `accounts`, `runtime`. Each says the whole of
+//     something, and the Snapshot plus the `accounts` and `runtime` that
+//     follow it on every stream restore them. A runtime keeps no log of
+//     them.
+//   Durable: `turn`, `attention`, `result`, `pairing`. Nothing restores
+//     them, so the runtime keeps each on disk (its outbox) until the hub
+//     acknowledges it, and after a reconnect sends those numbered above
+//     Welcome.last_up_seq again, with their original numbers, before
+//     anything new. The hub writes a durable event to its store before it
+//     acknowledges it, and Welcome.last_up_seq never names an event the hub
+//     has not written.
+//
+// DOWN EVENTS are `order`, `settings`, `pairing` and `nudge`. The hub keeps
+// each until the runtime acknowledges it, and on every new stream sends
+// again, under fresh numbers, each one not yet acknowledged that is still
+// live (an order before its expiry, the newest settings, a pairing offer
+// before its expiry, a nudge for mail still unread). Hello.last_down_seq
+// acknowledges what this instance received before the cut. So a runtime
+// can receive the same thing twice, and recognises it by its identity, not
+// its seq: an order by (device, counter), settings by version, a pairing
+// offer by pairing_id, a nudge by message_id. A runtime acknowledges a
+// Down event only once it has handled it durably: an order's counter
+// recorded and its Result in the outbox.
 //
 // FLOW CONTROL. Neither side may have more than 64 events sent and not yet
 // acknowledged. Ack{seq} says "I have received every event up to seq"; it
@@ -61,24 +78,31 @@
 // another only to resynchronise). The hub holds a runtime to that: a
 // stream may send a burst of 30 such messages and one a second after, and
 // is ended (RESOURCE_EXHAUSTED) beyond it.
-//   An Ack is flow control, not a promise of durability.
+//   The `Call` rpc is outside the stream and its window: each call is its
+//   own short HTTP/2 stream. A runtime has at most 8 calls in flight.
 //
 // VERSIONS. What a side does not know, it tolerates. A hub ignores a
 // message whose body it does not know, and shows a session whose state it
 // does not know as `unknown` (never an error, never an alert). A runtime
-// does the same with a Down body it does not know.
+// does the same with a Down body it does not know. The one exception is a
+// SIGNED payload: a verifier refuses one that carries a field it does not
+// know (see SIGNING), because the signer meant something it cannot honour.
 //
 // LIMITS. A message is at most 1 MiB. A runtime reports at most 200
 // sessions. Strings are capped in bytes of UTF-8 as each field says. The
 // hub ends the stream with INVALID_ARGUMENT, naming the field, when a
-// message breaks a limit: a runtime trims its text before sending. When a
-// runtime at its 200 sessions reports a new one, the hub drops the exited
-// session longest unchanged to make room, and refuses (RESOURCE_EXHAUSTED)
-// when none has exited.
+// message breaks a limit: a runtime trims its text before sending (a Turn
+// says when it was trimmed). When a runtime at its 200 sessions reports a
+// new one, the hub drops the exited session longest unchanged to make room,
+// and refuses (RESOURCE_EXHAUSTED) when none has exited.
 //   The hub announces a session that comes to need its person at most once
 // per 30 seconds per alerting state, and stores a session's change of
 // state at once at most once per 5 seconds (later changes within 5
 // seconds): a session that flaps is not a flood.
+//
+// IDS. Every id this file calls a UUID is written in its canonical text
+// form, lowercase with hyphens (36 bytes). Swift's `UUID.uuidString` is
+// uppercase: lowercase it. Times are unix seconds.
 //
 // HOW A STREAM ENDS, AND WHAT THE RUNTIME DOES NEXT.
 //   Stop, and ask the person to enrol this runtime again:
@@ -97,6 +121,42 @@
 //                          live session, or too many failed sign-ins
 //     UNAVAILABLE          the hub could not reach its store
 //     anything else, a clean end, or a broken connection
+//
+// SIGNING. Four things carry a signature: an Order and a Settings (signed by
+// one of the person's paired devices, verified by the runtime and checked
+// by the hub before it queues them), an AttentionRequest (signed by the
+// runtime, verified by the phone before it shows it), and a PairingClaim
+// (signed by the device, proving it holds the key it is pairing).
+//   Algorithm: ECDSA over NIST P-256 with SHA-256 (CryptoKit
+//     `P256.Signing` / `SecureEnclave.P256.Signing`).
+//   Signed bytes: CONTEXT || payload, where payload is the serialized
+//     message exactly as carried in the `payload`/`request`/`claim` field
+//     and CONTEXT is the ASCII label for the kind, newline included:
+//       Order            "taisce/order/v1\n"
+//       Settings         "taisce/settings/v1\n"
+//       AttentionRequest "taisce/attention/v1\n"
+//       PairingClaim     "taisce/pairing/v1\n"
+//     The context keeps a signature for one kind from being passed off as
+//     another.
+//   Signature: 64 bytes, r || s, each a 32-byte big-endian integer
+//     (CryptoKit `rawRepresentation`). A verifier accepts either s (high
+//     or low); nothing keys on the signature's bytes.
+//   Public key: 65 bytes, 0x04 || X || Y (CryptoKit `x963Representation`).
+//   device_id: lowercase hex of SHA-256 over the 65-byte public key (64
+//     characters). Its first 16 characters, in groups of four, are the
+//     fingerprint people compare at pairing ("3f2a 9c1d 77e0 b415").
+//   A verifier checks the signature over the bytes it RECEIVED, and never
+//     re-encodes a message to check it.
+//   Canonical encoding: a signer serializes with fields in ascending field
+//     number, values equal to the proto3 default left out, a set oneof
+//     member or sub-message written even when it is empty or the default
+//     (`hold {on: false}` is `3a 00`), repeated strings and messages one
+//     field each, no unknown fields. SwiftProtobuf's
+//     `serializedData()` and prost both produce this for these messages,
+//     which have no maps. The hub refuses a payload that does not decode
+//     and re-encode to the same bytes; a runtime may check the same way and
+//     must at least refuse one with unknown fields.
+//   Payloads are at most 64 KiB.
 syntax = "proto3";
 
 package taisce.runtime.v1;
@@ -106,10 +166,22 @@ service Runtime {
   // (Not `Connect`: generated clients already have a `connect`.)
   rpc Attach(stream Up) returns (stream Down);
 
-  // Slice 4 adds `rpc Call(ToolCall) returns (ToolResult)`: one fabric tool
-  // call made by the runtime on a session's behalf. It is left out until
-  // then (adding an rpc is a compatible change, and its messages have no
-  // agreed shape yet); calling it today answers UNIMPLEMENTED.
+  // One fabric tool call made by the runtime on a session's behalf: `who`,
+  // `send`, `inbox` and `inbox_ack` (`ask_human` and `note` are the
+  // runtime's own: they become an Attention event and SessionState.note).
+  // A call is its own HTTP/2 stream, outside Attach and its window,
+  // because an agent is waiting on the answer and calls must not queue
+  // behind events. The same credential signs it in. Status codes:
+  //   NOT_FOUND           the session is not one this runtime has reported
+  //   INVALID_ARGUMENT    a field broke a limit or was malformed (a bug)
+  //   UNAVAILABLE         this runtime has no Attach stream open, or the
+  //                       hub could not reach its store: retry with the
+  //                       same call_id
+  //   RESOURCE_EXHAUSTED  more than 16 calls in flight for this runtime
+  //   UNAUTHENTICATED     as for Attach
+  // What an agent should hear (a paused pair, a bounced address) is a
+  // reply, not a status.
+  rpc Call(CallRequest) returns (CallReply);
 }
 
 message Up {
@@ -118,16 +190,19 @@ message Up {
   oneof body {
     Hello hello = 2;
     Snapshot snapshot = 3;
+    // restorable events
     SessionState state = 4;
     Accounts accounts = 8;
+    RuntimeStatus runtime = 12;
+    // durable events
+    Turn turn = 5;
+    Attention attention = 6;
+    Result result = 7;
+    Pairing pairing = 9;
+    // not events
     Heartbeat heartbeat = 10;
     Ack ack = 11;
   }
-  // 5 turn (Turn: one turn finished), 6 attention (Attention: an approval
-  // or question raised or cleared, signed by the runtime), 7 result
-  // (Result: what happened to an order or a nudge), 9 pairing (Pairing: a
-  // device paired or was removed at the Mac).
-  reserved 5, 6, 7, 9;
 }
 
 message Down {
@@ -135,12 +210,19 @@ message Down {
   uint64 seq = 1;
   oneof body {
     Welcome welcome = 2;
+    // A signed Order: anything that carries the owner's authority over
+    // one runtime. Verify, then act.
+    Signed order = 3;
+    // "Session X has mail", never the mail itself.
+    Nudge nudge = 4;
+    // A device's sealed public key, during pairing.
+    PairingOffer pairing = 5;
     Ack ack = 6;
+    // The owner's signed Settings (guardrails, limits, fabrics), the
+    // newest the hub holds. Sent when the runtime's RuntimeStatus reports
+    // an older version, and when a new version arrives.
+    Signed settings = 7;
   }
-  // 3 order (Signed: anything that carries the owner's authority), 4 nudge
-  // (Nudge: "session X has mail", never the mail itself), 5 pairing
-  // (PairingOffer: a device's sealed public key, during pairing).
-  reserved 3, 4, 5;
 }
 
 // The first message of every stream.
@@ -155,16 +237,19 @@ message Hello {
   string instance_id = 2;
   // The runtime's own version, for display. At most 64 bytes.
   string version = 3;
-  // The last Down event this instance received; 0 for none.
+  // The last Down event this instance received and handled durably; 0 for
+  // none. The hub counts every Down event of this instance up to it as
+  // acknowledged.
   uint64 last_down_seq = 4;
 }
 
 // The hub's answer to a Hello.
 message Welcome {
   // The last Up event the hub holds from this instance; 0 for a new
-  // instance, or when the hub has no record. See RECONNECTING: in this
-  // slice the runtime replays nothing. Later, it replays the events
-  // after it.
+  // instance, or when the hub has no record. The runtime sends its durable
+  // events numbered above it again (see UP EVENTS) and drops the rest of
+  // its outbox; it continues its numbering above its own last number,
+  // whatever the Welcome says.
   uint64 last_up_seq = 1;
   // The runtime's id, whatever the Hello said.
   string runtime_id = 2;
@@ -183,6 +268,11 @@ message Snapshot {
   // snapshot and is ignored when replayed, so it can never overwrite it.
   uint64 replaces_seq = 1;
   repeated SessionState sessions = 2;
+  // Every attention item of this runtime still open (request ids). The hub
+  // clears any other it holds open for this runtime, so an item cleared
+  // while the hub was not listening does not stay on the phone. At most
+  // 200.
+  repeated string open_requests = 3;
 }
 
 // One session as it is now. Sent whole whenever anything in it changes.
@@ -194,8 +284,8 @@ message SessionState {
   // worktree. Assigned by the runtime; may be reused by a later session.
   // 1–200 bytes.
   string address = 2;
-  // The named group the session works in; the project when none was chosen.
-  // At most 200 bytes.
+  // The name of the fabric the session works in: the project's name when
+  // none was chosen. At most 200 bytes.
   string fabric = 3;
   // At most 200 bytes each.
   string project = 4;
@@ -207,7 +297,9 @@ message SessionState {
   SessionStatus state = 8;
   // The tool running now, when working. At most 100 bytes.
   string tool = 9;
-  // The one-line status shown on the fleet. At most 500 bytes.
+  // The one-line status shown on the fleet: what the agent set with its
+  // `note` tool, or the last prompt once that note is older than the
+  // current turn. At most 500 bytes.
   string note = 10;
   // The last paragraph of the session's latest reply, so the fleet can show
   // a question without the full turn. At most 2000 bytes.
@@ -216,6 +308,20 @@ message SessionState {
   optional uint32 context_used_pct = 12;
   // When the session entered `state`, unix seconds.
   int64 since = 13;
+  // The id (Settings.fabrics) of the named fabric the session is in; empty
+  // when its fabric is its project.
+  string fabric_id = 14;
+  // The session's latest turn (Turn.turn_id), running or finished; empty
+  // before its first. What an order's `after_turn` is checked against.
+  string turn_id = 15;
+  // The prompts queued for this session (order ids), in the order they
+  // will be typed. At most 32.
+  repeated string queue = 16;
+  // Why the queue is paused (the turn before it ended in a question, an
+  // error or a denied guardrail, or the person typed at the Mac); empty
+  // when it is not. A paused queue waits for a `send` or `release_queue`.
+  // At most 200 bytes.
+  string queue_paused = 17;
 }
 
 // What a session is doing. A runtime that is not connected has all its
@@ -261,6 +367,285 @@ message Account {
   optional int64 week_resets_at = 5;
 }
 
+// The runtime's own state, whole: replaces the previous report. Sent after
+// the Snapshot on every stream, and whenever any of it changes.
+message RuntimeStatus {
+  // The runtime's own signing key (65 bytes, see SIGNING), which signs its
+  // AttentionRequests. For display and the hub's own checks only: the
+  // phone trusts the key it read from the pairing code, never this one.
+  bytes public_key = 1;
+  // Hold all is on: every command but `hold {on: false}` is refused, no
+  // queued prompt is typed and no nudge is acted on.
+  bool held = 2;
+  // When it went on; 0 when not held.
+  int64 held_since = 3;
+  // The Settings version in force (0: the runtime's built-in defaults,
+  // before any signed Settings arrived).
+  uint64 settings_version = 4;
+  // Every device paired with this runtime at the Mac. The hub accepts an
+  // order for this runtime only from one of these. At most 16.
+  repeated PairedDevice devices = 5;
+  // The person is at this Mac: the screen is unlocked and they have typed
+  // or moved the pointer in the last few minutes. While they are, the hub
+  // sends no visible push for this runtime's sessions except for a turn
+  // started from the phone and a session the person follows.
+  bool present = 6;
+}
+
+message PairedDevice {
+  // See SIGNING.
+  string device_id = 1;
+  // 65 bytes.
+  bytes public_key = 2;
+  // The name the device gave at pairing ("Tom's iPhone"). At most 100
+  // bytes.
+  string name = 3;
+  int64 paired_at = 4;
+  // The highest order counter the runtime has accepted from this device,
+  // so a device that lost its own count can start above it.
+  uint64 counter = 5;
+}
+
+// One turn of one session, finished: the prompt, the final reply and what
+// changed. Durable. Assembled by the runtime from the session's hooks
+// (UserPromptSubmit opens it, Stop closes it); the outcome is the runtime's
+// own reading of git.
+message Turn {
+  string session_id = 1;
+  // A UUID the runtime gives the turn when its prompt is submitted; the
+  // same id SessionState.turn_id carries while it runs.
+  string turn_id = 2;
+  // At most 32 KiB.
+  string prompt = 3;
+  // The session's final message. At most 64 KiB.
+  string reply = 4;
+  // Tools run during the turn.
+  uint32 tool_count = 5;
+  GitOutcome outcome = 6;
+  int64 started = 7;
+  int64 ended = 8;
+  // The prompt or the reply was cut to fit.
+  bool truncated = 9;
+  // Context fill when the turn ended, 0–100; unset when unknown.
+  optional uint32 context_used_pct = 10;
+  TurnEnd end = 11;
+  // Where the prompt came from.
+  PromptSource source = 12;
+  // The order whose text was the prompt (source ORDER or ANSWER); empty
+  // otherwise. A turn the person started from the phone tells the phone
+  // when it ends.
+  string order_id = 13;
+}
+
+enum TurnEnd {
+  TURN_END_UNSPECIFIED = 0;
+  // The turn ended normally.
+  TURN_END_CLEAN = 1;
+  // The reply ends by asking the owner something (the session is NEEDS_YOU).
+  TURN_END_QUESTION = 2;
+  // The turn ended on an error (a failed API call, a usage limit).
+  TURN_END_ERROR = 3;
+  // The owner, or an `interrupt` order, stopped it.
+  TURN_END_INTERRUPTED = 4;
+  // A guardrail was denied, or went unanswered, during it.
+  TURN_END_DENIED = 5;
+}
+
+enum PromptSource {
+  PROMPT_SOURCE_UNSPECIFIED = 0;
+  // Typed at the Mac.
+  PROMPT_SOURCE_MAC = 1;
+  // A `send` order (straight away, or from the queue).
+  PROMPT_SOURCE_ORDER = 2;
+  // An `answer` order to an ask_human question.
+  PROMPT_SOURCE_ANSWER = 3;
+  // The runtime's own fixed line, waking the session for mail.
+  PROMPT_SOURCE_WAKE = 4;
+}
+
+// What the turn changed, from git in the session's worktree. Every field is
+// left at zero or empty when unknown.
+message GitOutcome {
+  uint32 files_changed = 1;
+  uint32 lines_added = 2;
+  uint32 lines_removed = 3;
+  // New commits made during the turn.
+  uint32 commits = 4;
+  // The branch's open pull request, if any. At most 500 bytes.
+  string pull_request_url = 5;
+  uint32 pull_request_number = 6;
+}
+
+// An attention item raised or cleared. Durable.
+//   Raised: something waits for the owner. The runtime signs the request
+//   with its own key (context "taisce/attention/v1\n"), and the phone
+//   verifies it against the key it read from the pairing code before it
+//   shows anything. The hub decodes `request` to index and show it, and
+//   passes the payload and signature to the phone byte for byte.
+//   Cleared: it no longer waits (answered, denied, timed out, withdrawn).
+// At most 64 items open per runtime; the hub clears the oldest beyond.
+message Attention {
+  oneof change {
+    SignedRequest raised = 1;
+    AttentionCleared cleared = 2;
+  }
+}
+
+message SignedRequest {
+  // A serialized AttentionRequest, exactly as signed.
+  bytes request = 1;
+  // 64 bytes, r || s.
+  bytes signature = 2;
+}
+
+// What the runtime signs when it raises an attention item.
+message AttentionRequest {
+  // Refused by a phone paired with any other runtime.
+  string runtime_id = 1;
+  string session_id = 2;
+  // A UUID chosen by the runtime. `ask_human` returns it to the agent.
+  string request_id = 3;
+  AttentionKind kind = 4;
+  // APPROVAL: the exact tool input the guardrail matched (for Bash, the
+  // command). QUESTION: the question. DIALOG: what Claude Code is showing.
+  // TAMPER: what the runtime saw (the file that changed, the silence).
+  // 1 byte to 8 KiB.
+  string text = 5;
+  // QUESTION: up to 6 choices. The owner may also answer in words.
+  repeated Choice choices = 6;
+  // APPROVAL: the tool (Bash, Write, …). At most 100 bytes.
+  string tool = 7;
+  // APPROVAL: the guardrail that matched (Guardrail.id) and its label.
+  string guardrail_id = 8;
+  string guardrail_label = 9;
+  // The turn it arose in, if any.
+  string turn_id = 10;
+  int64 raised_at = 11;
+  // When the runtime will stop waiting (an approval: a minute before the
+  // hook's own time limit, then it denies). 0: no deadline.
+  int64 expires_at = 12;
+}
+
+enum AttentionKind {
+  ATTENTION_KIND_UNSPECIFIED = 0;
+  // A guardrail holds a tool call; answered by `approve` or `deny`.
+  ATTENTION_KIND_APPROVAL = 1;
+  // The agent called `ask_human`; answered by `answer`.
+  ATTENTION_KIND_QUESTION = 2;
+  // Claude Code shows a dialog that needs a person at the Mac. Informs
+  // only; nothing on the phone answers it.
+  ATTENTION_KIND_DIALOG = 3;
+  // The runtime saw a session switch off its hooks, or work without
+  // calling them, and holds it. Informs only; the person deals with it at
+  // the Mac.
+  ATTENTION_KIND_TAMPER = 4;
+}
+
+message Choice {
+  // Unique within the request. At most 64 bytes.
+  string id = 1;
+  // The button's words. At most 100 bytes.
+  string label = 2;
+}
+
+message AttentionCleared {
+  string session_id = 1;
+  string request_id = 2;
+  AttentionResolution resolution = 3;
+  int64 at = 4;
+}
+
+enum AttentionResolution {
+  ATTENTION_RESOLUTION_UNSPECIFIED = 0;
+  // By an order from a paired device.
+  ATTENTION_RESOLUTION_APPROVED = 1;
+  ATTENTION_RESOLUTION_DENIED = 2;
+  ATTENTION_RESOLUTION_ANSWERED = 3;
+  // Someone at the Mac dealt with it.
+  ATTENTION_RESOLUTION_AT_MAC = 4;
+  // Its deadline passed (an approval is then denied).
+  ATTENTION_RESOLUTION_TIMED_OUT = 5;
+  // The session moved on, ended, or the runtime dropped it.
+  ATTENTION_RESOLUTION_WITHDRAWN = 6;
+}
+
+// What happened to an order, a nudge or a Settings. Durable. An order can
+// have two: QUEUED, then DONE or REFUSED when its turn comes.
+message Result {
+  oneof subject {
+    // Order.order_id.
+    string order_id = 1;
+    // Nudge.message_id.
+    string message_id = 2;
+    // Settings.version.
+    uint64 settings_version = 3;
+  }
+  Outcome outcome = 4;
+  // REFUSED and FAILED: why, as one of the codes below. A runtime may send
+  // a code this list lacks; the hub shows it as given. At most 64 bytes.
+  //   bad_signature   the signature does not verify
+  //   unknown_device  the device is not paired with this runtime
+  //   unsupported     an unknown field, verb or rule kind
+  //   wrong_runtime   the order names another runtime
+  //   replayed        counter at or below one already accepted
+  //   expired         past the order's expires_at
+  //   held            Hold all is on
+  //   no_session      no such session
+  //   asleep          the session has no process (only `resume` works)
+  //   wrong_turn      `after_turn` is not the session's latest turn, or
+  //                   the question was already answered
+  //   unsafe_text     the text starts with `!` or `/`
+  //   stale_request   no such open request, or request_hash differs
+  //   stale_queue     `reorder`/`cancel` names prompts not in the queue
+  //   stale_settings  a Settings version not above the one in force
+  //   cancelled       a queued prompt dropped by `cancel`
+  //   busy            the person is typing in that pane at the Mac
+  //   For nudges:
+  //   exited          the receiver's process has gone; the hub bounces
+  //   cold            idle with a full context: the phone offers a wake
+  //   wake_limit      the wake limits are spent; told at its next turn
+  string reason = 5;
+  // Words a person can read, for display. At most 500 bytes.
+  string detail = 6;
+  int64 at = 7;
+}
+
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  // Carried out. A nudge: the session was told (woken, or at Stop).
+  OUTCOME_DONE = 1;
+  // Accepted, and will be carried out later. A `send`: in the queue. A
+  // nudge: the session will be told at its next turn.
+  OUTCOME_QUEUED = 2;
+  // Not carried out, and never will be; `reason` says why.
+  OUTCOME_REFUSED = 3;
+  // Tried, and it went wrong; `reason` says what.
+  OUTCOME_FAILED = 4;
+}
+
+// What happened to a pairing offer. Durable.
+message Pairing {
+  string pairing_id = 1;
+  PairingOutcome outcome = 2;
+  // PAIRED: the device now in RuntimeStatus.devices.
+  string device_id = 3;
+  // Words a person can read. At most 500 bytes.
+  string detail = 4;
+}
+
+enum PairingOutcome {
+  PAIRING_OUTCOME_UNSPECIFIED = 0;
+  // The person confirmed the fingerprint at the Mac.
+  PAIRING_OUTCOME_PAIRED = 1;
+  // The person said the fingerprint did not match, or cancelled.
+  PAIRING_OUTCOME_REJECTED = 2;
+  // No pairing with that id is waiting (expired, or never shown).
+  PAIRING_OUTCOME_EXPIRED = 3;
+  // The offer did not open or verify: wrong secret, bad signature, a claim
+  // naming another runtime or pairing.
+  PAIRING_OUTCOME_INVALID = 4;
+}
+
 // "Still here." Sent when nothing else has been for Welcome.heartbeat_secs.
 message Heartbeat {}
 
@@ -268,4 +653,434 @@ message Heartbeat {}
 // FLOW CONTROL at the top of this file.
 message Ack {
   uint64 seq = 1;
+}
+
+// ---------------------------------------------------------------------
+// What travels down
+// ---------------------------------------------------------------------
+
+// The only way the owner's authority travels. The hub cannot make one: it
+// checks the signature against the device keys the runtime reported, and
+// passes the envelope on byte for byte.
+message Signed {
+  // A serialized Order (Down.order) or Settings (Down.settings), exactly
+  // as signed. At most 64 KiB.
+  bytes payload = 1;
+  // The signing device (see SIGNING).
+  string device_id = 2;
+  // 64 bytes, r || s, over CONTEXT || payload.
+  bytes signature = 3;
+}
+
+// An order to one runtime. A runtime verifies, in this order, and refuses
+// with the first reason that applies: unknown_device, bad_signature,
+// unsupported (unknown fields), wrong_runtime, replayed, expired. Past those
+// six it records the counter, whatever happens next, so a refused order can
+// never be replayed into success. Then: held (unless it is a release),
+// and the command's own checks.
+message Order {
+  // The runtime it is for; every other runtime refuses it.
+  string runtime_id = 1;
+  // Per device, only ever rises. A device's suggested count is
+  // max(last + 1, unix milliseconds), so a reinstall that kept its key
+  // cannot fall below what it used before.
+  uint64 counter = 2;
+  // Chosen by the device; refused after. The hub takes at most 24 hours
+  // ahead. A reply sent from the phone: an hour is a sensible default.
+  int64 expires_at = 3;
+  oneof what {
+    Command command = 4;
+    Hold hold = 7;
+  }
+  // 5 message (the sketch's HumanMessage: you speak to a session through
+  // `send`), 6 policy and 8 fabric (both are Settings now, which travel
+  // in a Signed of their own: a standing configuration is versioned, not
+  // counted).
+  reserved 5, 6, 8;
+  // A UUID chosen by the device; the hub's and the Result's handle on it.
+  string order_id = 9;
+  // When the device signed it.
+  int64 issued_at = 10;
+}
+
+// Act on one session.
+message Command {
+  string session_id = 1;
+  Verb verb = 2;
+  // SEND, ANSWER: the words to type, 1 byte to 16 KiB, never starting with
+  //   `!` or `/` (unsafe_text). DENY: the reason the session is told.
+  //   SET_FABRIC: the fabric's id, or empty for the project's own.
+  string text = 3;
+  // SEND: the turn the person was reading (SessionState.turn_id when they
+  //   wrote it; empty if the session had none).
+  string after_turn = 4;
+  // SEND: what to do when `after_turn` is no longer the latest turn.
+  //   false: refuse (wrong_turn), so "Yes" never answers a question the
+  //   person did not see. true: queue it behind whatever is running.
+  bool queued = 5;
+  // APPROVE, DENY, ANSWER: the attention item (AttentionRequest.request_id).
+  string request_id = 6;
+  // APPROVE, DENY, ANSWER: SHA-256 of the AttentionRequest bytes the
+  //   person was shown (SignedRequest.request), 32 bytes. The runtime
+  //   compares it with the request it holds, so an approval binds the
+  //   exact command, session and tool.
+  bytes request_hash = 7;
+  // ANSWER: the choice tapped (Choice.id); empty when answered in words.
+  //   The runtime types `text`, which the phone fills with the choice's
+  //   label or the person's words.
+  string choice_id = 8;
+  // CANCEL: the queued prompts to drop. REORDER: the session's whole
+  //   queue in its new order (a permutation of SessionState.queue, or
+  //   stale_queue).
+  repeated string order_ids = 9;
+}
+
+enum Verb {
+  VERB_UNSPECIFIED = 0;
+  // Type `text` into the session, as a paste followed by Return:
+  //   - `after_turn` is the latest turn and the session is idle (no turn
+  //     running, no dialog, nobody typing, queue empty): type now. DONE.
+  //   - `after_turn` is the latest turn and it is still running, or the
+  //     queue is not empty: queue it. QUEUED, then DONE when typed.
+  //   - `after_turn` is not the latest turn: `queued` false refuses
+  //     (wrong_turn); `queued` true queues it.
+  //   A queued prompt is typed only after the turn before it ends cleanly;
+  //   any other end pauses the queue (SessionState.queue_paused). A `send`
+  //   to a session whose queue is paused is queued behind it and releases
+  //   it.
+  VERB_SEND = 1;
+  // Press Escape: stop the running turn. The queue pauses.
+  VERB_INTERRUPT = 2;
+  // Allow the tool call an APPROVAL holds.
+  VERB_APPROVE = 3;
+  // Refuse it; the session is told `text`.
+  VERB_DENY = 4;
+  // Start an asleep or exited session's process with `--resume`.
+  VERB_RESUME = 5;
+  // Reserved for Slice 6: start a new session.
+  VERB_SPAWN = 6;
+  // The person has looked: FINISHED becomes IDLE. Does nothing else.
+  VERB_SEEN = 7;
+  // Answer a QUESTION: `text` becomes the session's next prompt, if the
+  // question is still open (else wrong_turn).
+  VERB_ANSWER = 8;
+  // Drop the queued prompts named in `order_ids` (each gets REFUSED
+  // cancelled).
+  VERB_CANCEL = 9;
+  // Put the queue in the order `order_ids` gives.
+  VERB_REORDER = 10;
+  // Release a paused queue without adding to it.
+  VERB_RELEASE_QUEUE = 11;
+  // Type the runtime's fixed line ("You have mail; call inbox"), whatever
+  // the wake limits and the cold rule say: the person chose to.
+  VERB_WAKE = 12;
+  // Move the session into the fabric `text` names (Settings.fabrics), or
+  // back to its project's own when empty.
+  VERB_SET_FABRIC = 13;
+  // Run Claude Code's `/compact`, `/clear`: fixed commands, never free
+  // text. Only when idle (else REFUSED busy).
+  VERB_COMPACT = 14;
+  VERB_CLEAR = 15;
+}
+
+// Hold all, or release it, on the runtime the order names. Hold all across
+// several runtimes is one order to each.
+message Hold {
+  bool on = 1;
+}
+
+// The owner's standing configuration, whole: guardrails, limits and
+// fabrics. Versioned, not counted: a runtime puts in force a Settings whose
+// version is above the one it has (any device's, any counter, no expiry),
+// and refuses one at or below (stale_settings). Fleet-wide: it names no
+// runtime, and the hub sends it to every runtime of the person; one the
+// signing device is not paired with refuses it (unknown_device), so a
+// device that edits settings is paired with every runtime.
+// The hub keeps the newest and takes a new one only at exactly its version
+// plus one, so two devices editing at once cannot silently overwrite each
+// other.
+message Settings {
+  uint64 version = 1;
+  int64 issued_at = 2;
+  // At most 100.
+  repeated Guardrail guardrails = 3;
+  Limits limits = 4;
+  // At most 50.
+  repeated Fabric fabrics = 5;
+}
+
+// A kind of action that waits for the owner's approval. The runtime tests
+// every tool call against every enabled rule and holds a call any rule
+// matches. A rule it cannot run (a pattern that does not compile, a
+// builtin it does not know) makes it refuse the whole Settings
+// (unsupported) and keep the version it has: guardrails fail closed.
+message Guardrail {
+  // A UUID, or a short stable name for a built-in default. At most 64
+  // bytes.
+  string id = 1;
+  // What the owner reads: "Force push". At most 100 bytes.
+  string label = 2;
+  bool enabled = 3;
+  // The Claude Code tools it applies to ("Bash", "Write", "Edit", …);
+  // empty means ["Bash"]. "*" means every tool.
+  repeated string tools = 4;
+  // Matched against the tool call's subject: Bash's `command`; the
+  // `file_path` of Write, Edit, MultiEdit and NotebookEdit; for any other
+  // tool its input as compact JSON. An unanchored search, case-sensitive
+  // unless the pattern starts `(?i)`, in the syntax RE2, Rust's `regex`
+  // and NSRegularExpression share: no backreferences, no lookaround. Empty
+  // when `builtin` is set. At most 1000 bytes.
+  string pattern = 5;
+  // A check the runtime implements itself, instead of a pattern:
+  //   delete_outside_worktree  a delete (rm, git clean, …) of a path
+  //                            outside the session's worktree
+  string builtin = 6;
+}
+
+// What agents may spend without the owner. 0 means the default given.
+message Limits {
+  // Messages between one pair of sessions since the owner last sent an
+  // order to either; at the limit the pair pauses until the owner says
+  // continue or stop. Enforced by the hub, which routes every message.
+  // Default 12.
+  uint32 pair_messages = 1;
+  // Turns started by agents (wakes), across the runtime, per hour; beyond
+  // it a wake waits for the receiver's next turn. Default 20.
+  uint32 agent_turns_per_hour = 2;
+  // Wakes of one session per hour. Default 4.
+  uint32 wakes_per_session_per_hour = 3;
+  // An idle session with its context at or above this fill, untouched for
+  // `cold_idle_minutes`, is never woken automatically: the phone offers a
+  // wake instead. Default 80.
+  uint32 cold_context_pct = 4;
+  // Default 30.
+  uint32 cold_idle_minutes = 5;
+}
+
+// A named group of sessions working on one thing. A session not moved into
+// one is in its project's own fabric, which has no entry here.
+message Fabric {
+  // A UUID.
+  string id = 1;
+  // Unique among fabrics; no `/` or `:` (so it never reads as an address).
+  // 1–100 bytes.
+  string name = 2;
+  // One sentence. At most 500 bytes.
+  string purpose = 3;
+  // The Taisce doc that explains the work (a doc UUID), and its title for
+  // the brief. Either may be empty.
+  string doc_id = 4;
+  string doc_title = 5;
+}
+
+// "Session X has mail." Never the mail: the session reads it with `inbox`.
+// The runtime chooses the moment (at Stop if working; a wake if idle and
+// `may_wake`; at its next prompt otherwise) and answers with a Result.
+message Nudge {
+  string session_id = 1;
+  string message_id = 2;
+  // The sender's address, for the line the runtime types or returns.
+  string from_address = 3;
+  MessageKind kind = 4;
+  // An `ask` or a `reply` may start a turn in an idle session; a `note`
+  // never does. The runtime still applies Hold, the wake limits and the
+  // cold rule.
+  bool may_wake = 5;
+}
+
+// A device's public key, sealed so the hub can carry it but not read or
+// replace it. The runtime opens it with the secret from its pairing code,
+// shows the device's fingerprint, and asks the person at the Mac to
+// confirm. It answers with a Pairing event.
+//
+// THE PAIRING CODE the runtime shows is the URL
+//   taisce-pair:?v=1&r=<runtime_id>&p=<pairing_id>&k=<runtime key>&s=<secret>&h=<hub host>
+// where the key (65 bytes, see SIGNING) and the secret (32 random bytes)
+// are base64url without padding, and the pairing id is a fresh UUID. A code
+// lives 10 minutes.
+//
+// SEALING. key = HKDF-SHA256(ikm: secret, salt: the pairing id's 36 ASCII
+// bytes, info: "taisce/pairing/v1", 32 bytes); `sealed` = AES-256-GCM with
+// a random 12-byte nonce, additional data the runtime id's 36 ASCII bytes,
+// written nonce || ciphertext || 16-byte tag (CryptoKit's `combined`). The
+// plaintext is a serialized PairingSeal.
+message PairingOffer {
+  string pairing_id = 1;
+  bytes sealed = 2;
+}
+
+// What is sealed: the claim, and the device's signature over
+// "taisce/pairing/v1\n" || claim, which proves it holds the key.
+message PairingSeal {
+  bytes claim = 1;
+  bytes signature = 2;
+}
+
+// What a device says about itself when it pairs.
+message PairingClaim {
+  string runtime_id = 1;
+  string pairing_id = 2;
+  // 65 bytes; the device id is derived from it.
+  bytes public_key = 3;
+  // At most 100 bytes.
+  string device_name = 4;
+  int64 created_at = 5;
+}
+
+// ---------------------------------------------------------------------
+// Fabric tool calls (rpc Call)
+// ---------------------------------------------------------------------
+
+message CallRequest {
+  // A UUID. A retry after a lost answer sends the same id, and the hub
+  // returns the first answer instead of acting twice (it remembers ids for
+  // 10 minutes), so a retried `send` posts one message.
+  string call_id = 1;
+  // The calling session, as SessionState.session_id. The hub refuses a
+  // session this runtime has not reported (NOT_FOUND).
+  string session_id = 2;
+  oneof tool {
+    WhoRequest who = 3;
+    SendRequest send = 4;
+    InboxRequest inbox = 5;
+    InboxAckRequest inbox_ack = 6;
+  }
+}
+
+message CallReply {
+  oneof reply {
+    WhoReply who = 1;
+    SendReply send = 2;
+    InboxReply inbox = 3;
+    InboxAckReply inbox_ack = 4;
+  }
+}
+
+// `who`: the sessions in the caller's fabric, or the whole fleet.
+message WhoRequest {
+  bool all = 1;
+}
+
+message WhoReply {
+  // The caller's own fabric. For a project's own fabric: its name is the
+  // project and the rest is empty.
+  Fabric fabric = 1;
+  // The caller first, then by attention as on the fleet. Exited sessions
+  // are left out. A session whose project has Text off shows only its
+  // address, fabric and state.
+  repeated Peer peers = 2;
+}
+
+message Peer {
+  string address = 1;
+  string session_id = 2;
+  string fabric = 3;
+  string project = 4;
+  string branch = 5;
+  SessionStatus state = 6;
+  string note = 7;
+  // The runtime is not connected: the session cannot be woken now.
+  bool offline = 8;
+  bool me = 9;
+}
+
+// `send`: a message to one address, or a `note` to every member of a
+// fabric (`to` is then the fabric's name).
+message SendRequest {
+  // An address (`project/worktree[:n]`) or a fabric's name. 1–200 bytes.
+  string to = 1;
+  MessageKind kind = 2;
+  // At most 8,000 characters (Unicode scalar values). Point at a doc;
+  // do not paste the work.
+  string body = 3;
+  // A Taisce doc the message is about (a UUID or a title). At most 200
+  // bytes.
+  string doc = 4;
+  // REPLY: the message id of the ask it answers. The reply goes to that
+  // ask's sender, whatever `to` says.
+  string in_reply_to = 5;
+}
+
+enum MessageKind {
+  MESSAGE_KIND_UNSPECIFIED = 0;
+  // For information; never wakes anyone, never needs an answer.
+  MESSAGE_KIND_NOTE = 1;
+  // A question the sender needs answered to continue.
+  MESSAGE_KIND_ASK = 2;
+  // The answer to one ask.
+  MESSAGE_KIND_REPLY = 3;
+  // From the hub: a message of the sender's that could not be delivered.
+  // Its body says which and why; `in_reply_to` names it.
+  MESSAGE_KIND_BOUNCE = 4;
+}
+
+message SendReply {
+  // One per receiver (several for a note to a fabric; none when nobody
+  // was found).
+  repeated Sent sent = 1;
+}
+
+message Sent {
+  // Empty when nothing was stored (NO_SUCH_ADDRESS).
+  string message_id = 1;
+  string to_address = 2;
+  string to_session_id = 3;
+  Delivery delivery = 4;
+  // The receiver's state now, so the sender knows whether to wait.
+  SessionStatus receiver_state = 5;
+  bool receiver_offline = 6;
+  // Words the agent can act on ("paused: 12 messages between you without
+  // Tom; he has been asked").
+  string detail = 7;
+}
+
+enum Delivery {
+  DELIVERY_UNSPECIFIED = 0;
+  // Stored, and the receiver's runtime is nudged (or will be when it
+  // connects).
+  DELIVERY_QUEUED = 1;
+  // Stored, held: this pair has reached the pair limit and the owner has
+  // been asked. Delivered if they say continue, bounced if stop.
+  DELIVERY_PAUSED = 2;
+  // Not stored: no session has that address or fabric name.
+  DELIVERY_NO_SUCH_ADDRESS = 3;
+  // Not stored: the receiver has 100 unread messages.
+  DELIVERY_INBOX_FULL = 4;
+  // Not stored: `in_reply_to` names no ask sent to the caller.
+  DELIVERY_NO_SUCH_ASK = 5;
+}
+
+// `inbox`: the caller's unread messages, oldest first. Does not mark them
+// read: `inbox_ack` does, once the runtime has handed them to the session.
+message InboxRequest {
+  // Default 20, at most 50.
+  uint32 limit = 1;
+}
+
+message InboxReply {
+  repeated Mail messages = 1;
+  // Unread messages beyond these.
+  uint32 more = 2;
+}
+
+message Mail {
+  string message_id = 1;
+  string from_address = 2;
+  string from_session_id = 3;
+  MessageKind kind = 4;
+  string body = 5;
+  string doc = 6;
+  string in_reply_to = 7;
+  int64 sent_at = 8;
+}
+
+// `inbox_ack`: these messages reached the session. Their text is deleted at
+// the hub; who sent what kind to whom, and when, stays for 7 days.
+message InboxAckRequest {
+  // At most 50. Ids that are not the caller's unread mail are skipped.
+  repeated string message_ids = 1;
+}
+
+message InboxAckReply {
+  uint32 acknowledged = 1;
 }

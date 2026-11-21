@@ -76,6 +76,12 @@ account may be flipped to the work account by other sessions — push with
   through the send window, never around it.
 - `cargo run -p taisce-runtime-proto --features client --example fake_runtime` drives a scratch
   daemon; never a real server.
+- Slices 2–5 (ADR 0008): durable Up events (turn, attention, result, pairing) are written
+  before they are acknowledged; Down events (orders, settings, pairing offers, nudges) are
+  re-sent until acknowledged. Anything carrying the person's authority is a device-signed
+  `Order` or `Settings` (SIGNING in the `.proto`, `taisce_runtime_proto::signing`, vectors in
+  `proto/taisce/runtime/v1/testdata/`; regenerate with `make_vectors.py`, never by hand).
+  Agent tool calls use `rpc Call`, not the stream.
 
 ## Start here
 - **[[Roadmap]]** in Taisce (under the `[[Taisce]]` tree, renamed from Grimoire on 2026-10-14) is the outstanding list — read it first in any
