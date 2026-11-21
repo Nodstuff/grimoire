@@ -162,6 +162,17 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         #expect(s.command.pending.isEmpty)
     }
 
+    @Test func theKeyboardsTrailingSpaceIsNotSent() async throws {
+        // Claude Code trims it, so Workbox never found "Ok this is good " in
+        // the prompt and reported a delivered message as not delivered
+        let fake = FakeFabric(Self.fleet())
+        let s = store(fake)
+        s.command.send("Ok this is good \n", to: try #require(s.fleet.sessions.first), queued: false)
+        await until("posted after the window") { !fake.posted.isEmpty }
+        guard case .command(let c)? = fake.posted.first?.what else { Issue.record("sent"); return }
+        #expect(c.text == "Ok this is good")
+    }
+
     @Test func undoTakesItBackAndNothingIsSent() async throws {
         let fake = FakeFabric(Self.fleet())
         let s = store(fake)

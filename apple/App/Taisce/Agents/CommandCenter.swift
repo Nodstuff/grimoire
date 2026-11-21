@@ -111,6 +111,9 @@ final class CommandCenter {
     /// it cannot be sent at all.
     @discardableResult
     func send(_ text: String, to session: FleetSession, queued: Bool, now: Date = .now) -> String? {
+        // the keyboard's trailing space: Claude Code trims the prompt, and
+        // Workbox credits a delivery only when the prompt contains the text
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         do { try FabricCommander.check(text: text) } catch let p as FabricOrderProblem { return FabricWords.problem(p) } catch { return error.localizedDescription }
         let p = PendingSend(id: UUID().uuidString.lowercased(), session: session.key, address: session.address, text: text,
                             queued: queued, afterTurn: session.turnID, deadline: now.addingTimeInterval(undoWindow.seconds))
