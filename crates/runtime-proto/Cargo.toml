@@ -10,7 +10,7 @@ description = "The runtime channel's wire contract (proto/taisce/runtime/v1), ge
 server = []
 # the client stub, and `fake`: a scripted runtime for tests and for driving a
 # scratch daemon by hand. Never part of the server build.
-client = ["tonic/channel", "dep:tokio", "dep:tokio-stream", "dep:serde", "dep:serde_json"]
+client = ["tonic/channel", "dep:tokio", "dep:tokio-stream", "dep:serde", "dep:serde_json", "dep:hkdf", "dep:aes-gcm"]
 
 [dependencies]
 prost = "0.14.6"
@@ -23,6 +23,9 @@ serde_json = { workspace = true, optional = true }
 # SIGNING: ECDSA P-256 / SHA-256 (the phone's Secure Enclave key)
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
 sha2 = "0.11.1"
+# the fake runtime opens pairing seals (HKDF-SHA256, AES-256-GCM)
+hkdf = { version = "0.13.0", optional = true }
+aes-gcm = { version = "0.11.1", optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

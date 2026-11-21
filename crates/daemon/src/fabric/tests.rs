@@ -93,15 +93,15 @@ impl Sse {
     }
 }
 
-struct T {
-    app: Router,
-    store: SharedStore,
-    hub: Hub,
-    user: Uuid,
+pub(crate) struct T {
+    pub(crate) app: Router,
+    pub(crate) store: SharedStore,
+    pub(crate) hub: Hub,
+    pub(crate) user: Uuid,
     /// the person's own app
-    token: String,
-    alerts: Arc<Mutex<Vec<SessionAlert>>>,
-    url: String,
+    pub(crate) token: String,
+    pub(crate) alerts: Arc<Mutex<Vec<SessionAlert>>>,
+    pub(crate) url: String,
 }
 
 async fn setup_with(pace: Pace) -> T {
@@ -118,12 +118,12 @@ async fn setup_with(pace: Pace) -> T {
     T { app, store, hub, user, token, alerts, url }
 }
 
-async fn setup() -> T {
+pub(crate) async fn setup() -> T {
     setup_with(Pace::default()).await
 }
 
 impl T {
-    fn enrol(&self, name: &str) -> (Uuid, String) {
+    pub(crate) fn enrol(&self, name: &str) -> (Uuid, String) {
         let (r, secret) = super::enrol_runtime(&mut self.store.lock(Scope::System), None, name, None, now()).unwrap();
         (r.id, secret.unwrap())
     }
@@ -132,19 +132,19 @@ impl T {
         Request::get(path).header("host", "localhost:7513").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()
     }
 
-    async fn get(&self, path: &str) -> Value {
+    pub(crate) async fn get(&self, path: &str) -> Value {
         let res = self.app.clone().oneshot(self.request(path, &self.token)).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK, "{path}");
         serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap()
     }
 
-    async fn status(&self, path: &str, token: &str) -> StatusCode {
+    pub(crate) async fn status(&self, path: &str, token: &str) -> StatusCode {
         self.app.clone().oneshot(self.request(path, token)).await.unwrap().status()
     }
 
     /// A request with (or without) a JSON body, as the person's app: its
     /// status and JSON answer (null when the answer is not JSON).
-    async fn send(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+    pub(crate) async fn send(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
         let mut b = Request::builder().method(method).uri(path).header("host", "localhost:7513").header("authorization", format!("Bearer {}", self.token));
         if body.is_some() {
             b = b.header("content-type", "application/json");
@@ -156,22 +156,22 @@ impl T {
         (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
-    async fn sse(&self) -> Sse {
+    pub(crate) async fn sse(&self) -> Sse {
         Sse::open(&self.app, self.request("/api/fabric/stream", &self.token)).await
     }
 
-    fn stored(&self, id: &str) -> taisce_store::fabric::FabricSession {
+    pub(crate) fn stored(&self, id: &str) -> taisce_store::fabric::FabricSession {
         let id = Uuid::parse_str(id).unwrap();
         self.store.lock(Scope::System).fabric_sessions().unwrap().into_iter().find(|s| s.id == id).expect("a stored session")
     }
 }
 
-fn session(id: &str, address: &str, state: &str) -> ScriptSession {
+pub(crate) fn session(id: &str, address: &str, state: &str) -> ScriptSession {
     ScriptSession { since: Some(1_800_000_000), ..ScriptSession::new(id, address, state) }
 }
 
-const S1: &str = "0196f3a0-0000-7000-8000-000000000001";
-const S2: &str = "0196f3a0-0000-7000-8000-000000000002";
+pub(crate) const S1: &str = "0196f3a0-0000-7000-8000-000000000001";
+pub(crate) const S2: &str = "0196f3a0-0000-7000-8000-000000000002";
 
 /// Slice 1's "done when", on the server's side: a runtime connects and its
 /// sessions appear in the fleet sorted by attention; a change shows on the

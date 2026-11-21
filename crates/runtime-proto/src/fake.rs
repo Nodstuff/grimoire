@@ -5,9 +5,18 @@
 //! the send window included: an event waits while 64 are unacknowledged.
 //! The raw senders ([`Fake::open`], [`Fake::send`]) exist so a test can
 //! also break the contract on purpose.
+//!
+//! For Slices 2-5 ([`work`]) it also plays what a real runtime does with
+//! what comes down: it holds a signing key, pairs a device from a pairing
+//! code, verifies and answers signed orders as the contract says (and
+//! types nothing: a `send` is answered done and played back as a turn),
+//! takes settings, reads its mail when nudged, and makes fabric tool calls.
+
+pub mod work;
 
 use crate::v1::runtime_client::RuntimeClient;
 use crate::v1::{Account, Accounts, Ack, Down, Heartbeat, Hello, SessionState, SessionStatus, Snapshot, Up, Welcome, down, up};
+pub use work::{ScriptAttention, ScriptSend, ScriptStatus, ScriptTurn, Side};
 use crate::window::SendWindow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,7 +59,12 @@ impl Error {
 }
 
 /// One step of a script. As JSON: `{"snapshot": [..]}`, `{"state": {..}}`,
-/// `{"accounts": [..]}`, `"heartbeat"`, `{"sleep_ms": 500}`, `"disconnect"`.
+/// `{"accounts": [..]}`, `"heartbeat"`, `{"sleep_ms": 500}`, `"disconnect"`;
+/// and for Slices 2-5 `{"status": {..}}` (RuntimeStatus), `{"turn": {..}}`,
+/// `{"ask": {..}}` (an approval or a question, signed), `{"clear": {"session":
+/// .., "request_id": .., "resolution": "at_mac"}}`, `{"send": {..}}` (a fabric
+/// tool call), `"pairing_code"` (print a code a phone can pair with) and
+/// `{"serve_ms": 5000}` (answer what comes down for that long).
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Step {
@@ -60,6 +74,13 @@ pub enum Step {
     Heartbeat,
     SleepMs(u64),
     Disconnect,
+    Status(ScriptStatus),
+    Turn(Box<ScriptTurn>),
+    Ask(Box<ScriptAttention>),
+    Clear { session: String, request_id: String, resolution: String },
+    Send(Box<ScriptSend>),
+    PairingCode,
+    ServeMs(u64),
 }
 
 /// A session in a script: only `id`, `address` and `state` are needed.
@@ -82,6 +103,10 @@ pub struct ScriptSession {
     pub context_used_pct: Option<u32>,
     /// unix seconds; the moment the step is sent when absent
     pub since: Option<i64>,
+    /// the named fabric's id (empty: the project's own)
+    pub fabric_id: String,
+    /// the latest turn's id; the fake fills it in from the turns it plays
+    pub turn_id: String,
 }
 
 impl ScriptSession {
@@ -89,7 +114,7 @@ impl ScriptSession {
         Self { id: id.into(), address: address.into(), state: state.into(), ..Self::default() }
     }
 
-    fn message(&self) -> Result<SessionState, Error> {
+    pub(crate) fn message(&self) -> Result<SessionState, Error> {
         let state = SessionStatus::from_name(&self.state).ok_or_else(|| Error::Script(format!("unknown state {:?}", self.state)))?;
         Ok(SessionState {
             session_id: self.id.clone(),
@@ -105,6 +130,8 @@ impl ScriptSession {
             last_line: self.last_line.clone(),
             context_used_pct: self.context_used_pct,
             since: self.since.unwrap_or_else(now),
+            fabric_id: self.fabric_id.clone(),
+            turn_id: self.turn_id.clone(),
             ..Default::default()
         })
     }
@@ -137,7 +164,7 @@ pub fn parse_script(json: &str) -> Result<Vec<Step>, Error> {
     serde_json::from_str(json).map_err(|e| Error::Script(e.to_string()))
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
@@ -167,6 +194,18 @@ pub struct Fake {
     flow: Arc<Flow>,
     end: watch::Receiver<End>,
     pub welcome: Welcome,
+    /// Down events, in order, for [`Fake::next_down`]: acknowledged only
+    /// once handled.
+    downs: mpsc::Receiver<Down>,
+    /// For fabric tool calls (`rpc Call`).
+    client: RuntimeClient<tonic::transport::Channel>,
+    credential: String,
+    /// What a runtime keeps: its key, paired devices, counters, Hold,
+    /// settings, sessions, open requests. Carried from one stream to the
+    /// next by [`Fake::reconnect`].
+    pub side: Side,
+    /// The last Down event handled.
+    pub down_seq: u64,
 }
 
 impl Fake {
@@ -192,12 +231,18 @@ impl Fake {
     /// `resume_seq` is the last event number this instance had assigned
     /// before (0 for a fresh launch): numbering continues after it.
     pub async fn connect(url: &str, credential: &str, instance_id: &str, resume_seq: u64) -> Result<Fake, Error> {
+        Self::connect_as(url, credential, instance_id, resume_seq, 0, Side::new(instance_id)).await
+    }
+
+    /// [`Fake::connect`], saying the last Down event this instance handled
+    /// and keeping a runtime's state from an earlier stream.
+    pub async fn connect_as(url: &str, credential: &str, instance_id: &str, resume_seq: u64, last_down_seq: u64, side: Side) -> Result<Fake, Error> {
         let (tx, mut down) = Self::open(url, Some(credential)).await?;
         let hello = Hello {
             runtime_id: String::new(),
             instance_id: instance_id.to_string(),
             version: concat!("fake/", env!("CARGO_PKG_VERSION")).to_string(),
-            last_down_seq: 0,
+            last_down_seq,
         };
         tx.send(Up { seq: 0, body: Some(up::Body::Hello(hello)) }).await.map_err(|_| Error::Protocol("the stream closed".into()))?;
         let welcome = match down.message().await.map_err(Error::Status)? {
@@ -207,8 +252,27 @@ impl Fake {
         };
         let flow = Arc::new(Flow::default());
         let (ended, end) = watch::channel(End::Open);
-        tokio::spawn(read(down, flow.clone(), tx.downgrade(), ended));
-        Ok(Fake { tx, seq: resume_seq, flow, end, welcome })
+        let (down_tx, downs) = mpsc::channel(256);
+        tokio::spawn(read(down, flow.clone(), down_tx, ended));
+        let channel = tonic::transport::Endpoint::from_shared(url.to_string())
+            .map_err(|e| Error::Transport(e.to_string()))?
+            .connect()
+            .await
+            .map_err(|e| Error::Transport(format!("{e:?}")))?;
+        let mut side = side;
+        side.runtime_id = welcome.runtime_id.clone();
+        Ok(Fake {
+            tx,
+            seq: resume_seq,
+            flow,
+            end,
+            welcome,
+            downs,
+            client: RuntimeClient::new(channel),
+            credential: credential.to_string(),
+            side,
+            down_seq: last_down_seq,
+        })
     }
 
     /// The last event number assigned.
@@ -244,7 +308,7 @@ impl Fake {
     }
 
     /// Send the next event, waiting first while the window is full.
-    async fn event(&mut self, body: up::Body) -> Result<(), Error> {
+    pub(crate) async fn event(&mut self, body: up::Body) -> Result<(), Error> {
         let seq = self.seq + 1;
         loop {
             // registered before the check, so an Ack between the two still wakes
@@ -279,11 +343,16 @@ impl Fake {
 
     /// Every session, as of the last event assigned.
     pub async fn snapshot(&mut self, sessions: &[ScriptSession]) -> Result<(), Error> {
+        for s in sessions {
+            self.side.sessions.insert(s.id.clone(), s.clone());
+        }
         let sessions = sessions.iter().map(ScriptSession::message).collect::<Result<Vec<_>, _>>()?;
-        self.send(Up { seq: 0, body: Some(up::Body::Snapshot(Snapshot { replaces_seq: self.seq, sessions, open_requests: vec![] })) }).await
+        let open_requests = self.side.open.keys().cloned().collect();
+        self.send(Up { seq: 0, body: Some(up::Body::Snapshot(Snapshot { replaces_seq: self.seq, sessions, open_requests })) }).await
     }
 
     pub async fn state(&mut self, session: &ScriptSession) -> Result<(), Error> {
+        self.side.sessions.insert(session.id.clone(), session.clone());
         self.event(up::Body::State(session.message()?)).await
     }
 
@@ -306,6 +375,27 @@ impl Fake {
                 Step::Heartbeat => self.heartbeat().await?,
                 Step::SleepMs(ms) => tokio::time::sleep(Duration::from_millis(*ms)).await,
                 Step::Disconnect => return Ok(true),
+                Step::Status(st) => {
+                    self.side.present = st.present;
+                    if let Some(h) = st.held {
+                        self.side.held = h;
+                    }
+                    self.status().await?
+                }
+                Step::Turn(t) => self.turn(t).await?,
+                Step::Ask(a) => {
+                    self.ask(a).await?;
+                }
+                Step::Clear { session, request_id, resolution } => self.clear(session, request_id, resolution).await?,
+                Step::Send(m) => {
+                    let reply = self.send_mail(m).await?;
+                    eprintln!("fake: send from {} answered {reply:?}", m.from);
+                }
+                Step::PairingCode => {
+                    let code = self.pairing_code("taisce.example");
+                    eprintln!("fake: pair a phone with\n{code}");
+                }
+                Step::ServeMs(ms) => self.serve_for(Duration::from_millis(*ms)).await?,
             }
         }
         Ok(false)
@@ -326,9 +416,10 @@ impl Fake {
 }
 
 /// Read everything the hub sends for as long as the stream lasts: an Ack
-/// opens the window; an event (none exist in this slice) is acknowledged at
-/// once. Holds only a weak sender, so dropping the [`Fake`] hangs up.
-async fn read(mut down: tonic::Streaming<Down>, flow: Arc<Flow>, tx: mpsc::WeakSender<Up>, ended: watch::Sender<End>) {
+/// opens the window; an event goes to [`Fake::next_down`], to be handled
+/// and only then acknowledged. Holds no sender, so dropping the [`Fake`]
+/// hangs up.
+async fn read(mut down: tonic::Streaming<Down>, flow: Arc<Flow>, events: mpsc::Sender<Down>, ended: watch::Sender<End>) {
     let end = loop {
         match down.message().await {
             Ok(Some(msg)) => {
@@ -338,10 +429,9 @@ async fn read(mut down: tonic::Streaming<Down>, flow: Arc<Flow>, tx: mpsc::WeakS
                     *acked = (*acked).max(seq);
                     drop(acked);
                     flow.moved.notify_waiters();
-                } else if msg.seq > 0
-                    && let Some(tx) = tx.upgrade()
-                {
-                    let _ = tx.send(Up { seq: 0, body: Some(up::Body::Ack(Ack { seq: msg.seq })) }).await;
+                } else if msg.seq > 0 {
+                    // nobody reading (a test of Slice 1 alone) is not an error
+                    let _ = events.try_send(msg);
                 }
             }
             Ok(None) => break None,

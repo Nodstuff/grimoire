@@ -74,3 +74,7 @@ tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
 # the fake runtime: the tests drive the real runtime channel with it
 taisce-runtime-proto = { path = "../runtime-proto", features = ["client"] }
+# a phone in the tests: its signing key, and the pairing seal it sends
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
+hkdf = "0.13.0"
+aes-gcm = "0.11.1"

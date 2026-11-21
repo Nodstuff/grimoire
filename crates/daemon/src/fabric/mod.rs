@@ -28,6 +28,10 @@ pub mod record;
 pub mod routes;
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+pub(crate) mod phone;
+#[cfg(test)]
+mod work_e2e;
 pub mod view;
 
 use crate::auth::AUDIT;
