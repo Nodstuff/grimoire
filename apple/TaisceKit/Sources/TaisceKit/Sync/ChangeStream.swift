@@ -12,14 +12,21 @@ extension APIClient {
     /// stream finishes when the server closes and throws on network errors;
     /// reconnecting is the caller's job (see `SyncEngine`).
     public func changeStream(lastEventID: Int?) -> AsyncThrowingStream<SSEOutput, any Error> {
+        eventStream("/api/changes/stream", lastEventID: lastEventID.map(String.init))
+    }
+
+    /// One Server-Sent Events connection to `path`, as the parser's output
+    /// (events, the server's `retry:`, heartbeat comments). The plumbing
+    /// under `changeStream` and `fleetStream`.
+    func eventStream(_ path: String, lastEventID: String? = nil) -> AsyncThrowingStream<SSEOutput, any Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    var req = try await request("/api/changes/stream")
+                    var req = try await request(path)
                     req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                     req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
                     if let lastEventID {
-                        req.setValue(String(lastEventID), forHTTPHeaderField: "Last-Event-ID")
+                        req.setValue(lastEventID, forHTTPHeaderField: "Last-Event-ID")
                     }
                     req.timeoutInterval = Self.streamIdleTimeout
                     var (bytes, response) = try await session.bytes(for: req)
@@ -30,8 +37,8 @@ extension APIClient {
                     if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                         throw APIError.http(status: http.statusCode)
                     }
-                    if response.mimeType == "text/html" { throw APIError.notAPIRoute("/api/changes/stream") }
-                    var parser = SSEParser(lastEventID: lastEventID.map(String.init))
+                    if response.mimeType == "text/html" { throw APIError.notAPIRoute(path) }
+                    var parser = SSEParser(lastEventID: lastEventID)
                     var out: [SSEOutput] = []
                     for try await b in bytes {
                         parser.feed(byte: b, into: &out)

@@ -4,6 +4,12 @@ public struct SSEEvent: Sendable, Hashable {
     public var id: String?
     public var event: String
     public var data: String
+
+    public init(id: String? = nil, event: String, data: String) {
+        self.id = id
+        self.event = event
+        self.data = data
+    }
 }
 
 public enum SSEOutput: Sendable, Hashable {
