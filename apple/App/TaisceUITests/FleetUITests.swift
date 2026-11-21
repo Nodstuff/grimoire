@@ -94,6 +94,31 @@ final class FleetUITests: XCTestCase {
         XCTAssertTrue(row(app, "notes/main").label.contains("Idle"))
     }
 
+    /// A session idle under an hour (between a chat's turns) stays in the
+    /// list; a swipe pins it into its own section at the top.
+    func testARecentlyIdleSessionStaysListedAndASwipePinsIt() throws {
+        var sessions = StubFleet.sessions
+        sessions[4] = StubFleet.session(5, "notes/main", "idle", ago: 120)
+        let app = try launch(StubFleet.fleet(sessions: sessions))
+        XCTAssertTrue(row(app, "taisce/main").waitForExistence(timeout: 20), "the fleet shows")
+        reveal(app, "notes/main")
+        XCTAssertTrue(row(app, "notes/main").label.contains("Idle"), "listed without opening the fold")
+        let pinned = app.descendants(matching: .any).matching(identifier: "agents.pinned").firstMatch
+        XCTAssertFalse(pinned.exists)
+        row(app, "notes/main").swipeRight()
+        let pin = app.buttons["Pin"]
+        if pin.waitForExistence(timeout: 2) { pin.tap() }
+        XCTAssertTrue(pinned.waitForExistence(timeout: 5), "a Pinned section")
+        XCTAssertLessThan(row(app, "notes/main").frame.minY, row(app, "taisce/main").frame.minY, "pinned sits above the rest")
+        shot(app, "agents-pinned")
+        // unpinned from its menu, it goes back among the rest
+        row(app, "notes/main").press(forDuration: 1.0)
+        let unpin = app.buttons["Unpin"]
+        XCTAssertTrue(unpin.waitForExistence(timeout: 5))
+        unpin.tap()
+        waitFor("the Pinned section went") { !pinned.exists }
+    }
+
     func testAnOfflineRuntimeSaysMacAsleepAndItsSessionsAreLastKnown() throws {
         let app = try launch(StubFleet.fleet(online: false, seenAgo: 1740))
         let mac = app.descendants(matching: .any).matching(identifier: "agents.runtime.mbp").firstMatch

@@ -111,7 +111,7 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
         session("s2", "qompass/mcp-dx", .stalled, last: "Password:"),
         session("s3", "workbox/main", .finished, account: "work", last: "Done."),
         session("s4", "taisce/fabric", .working, tool: "Bash", note: "building the app", last: "ok", context: 91, ago: 7300),
-        session("s5", "notes/main", .idle),
+        session("s5", "notes/main", .idle, ago: 7300),
         session("s6", "old/main", .exited),
     ])
 
@@ -128,8 +128,44 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
         // a state this build has no name for is shown among the active ones, in place
         var odd = Self.fleet
         odd.sessions[4].state = .unknown
+        odd.sessions[4].since = Self.nowS - 300
         #expect(board(odd).rows.map(\.session.address).last == "notes/main")
         #expect(board(odd).rows.last?.status == "Unknown state \u{00B7} 5 min")
+    }
+
+    @Test func aSessionIdleUnderAnHourStaysInTheListAndAnOlderOneFolds() {
+        // between the turns of a chat a session is idle: it must not drop
+        // into the fold mid-conversation (Tom, 2026-11-21)
+        var fleet = Self.fleet
+        fleet.sessions[4].since = Self.nowS - 3599
+        #expect(board(fleet).rows.map(\.session.address).last == "notes/main")
+        #expect(board(fleet).resting.map(\.session.address) == ["old/main"])
+        fleet.sessions[4].since = Self.nowS - 3600
+        #expect(board(fleet).resting.map(\.session.address) == ["notes/main", "old/main"])
+        // asleep and exited fold however recent: there is no one to talk to
+        fleet.sessions[5].since = Self.nowS - 10
+        #expect(board(fleet).resting.map(\.session.address).contains("old/main"))
+    }
+
+    @Test func pinnedSessionsComeFirstWhateverTheirState() {
+        let pins: Set = [FleetSessionKey(runtimeID: "r1", id: "s6"), FleetSessionKey(runtimeID: "r1", id: "s2")]
+        let b = FleetBoard(Self.fleet, now: Self.now, pins: pins, calendar: Self.utc, locale: Self.en)
+        #expect(b.pinned.map(\.session.address) == ["qompass/mcp-dx", "old/main"], "the server's order")
+        #expect(!b.rows.contains { $0.session.address == "qompass/mcp-dx" })
+        #expect(b.resting.map(\.session.address) == ["notes/main"])
+        #expect(b.only("elsewhere").pinned.isEmpty, "the fabric filter applies to pins too")
+        // a pin of a session the fleet no longer has shows nothing
+        let gone = FleetBoard(Self.fleet, now: Self.now, pins: [FleetSessionKey(runtimeID: "r1", id: "zz")])
+        #expect(gone.pinned.isEmpty)
+    }
+
+    @Test func pinsRoundTripThroughTheirStoredForm() {
+        let a = FleetSessionKey(runtimeID: "r1", id: "s1"), b = FleetSessionKey(runtimeID: "r2", id: "s9")
+        var raw = FleetPins.set(a, pinned: true, in: "")
+        raw = FleetPins.set(b, pinned: true, in: raw)
+        #expect(FleetPins.decode(raw) == [a, b])
+        #expect(FleetPins.decode(FleetPins.set(a, pinned: false, in: raw)) == [b])
+        #expect(FleetPins.decode("junk\n\tx\nr\t") == [], "malformed lines are dropped")
     }
 
     @Test func aRowSaysItsStateInWordsWhatItWaitsOnAndWhatItRunsOn() {

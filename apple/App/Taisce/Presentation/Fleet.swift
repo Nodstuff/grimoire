@@ -273,13 +273,21 @@ struct FleetCard: Hashable {
     }
 }
 
-/// The Agents screen's content, from the fleet as held. The sessions keep
-/// the order they are held in (the server's, by how much each needs its
-/// person: needs you, stalled, finished, waiting on a peer, working); the
-/// ones doing nothing (idle, asleep, exited) fold away under a count.
+/// The Agents screen's content, from the fleet as held. Pinned sessions
+/// come first, whatever their state. The rest keep the order they are held
+/// in (the server's, by how much each needs its person: needs you, stalled,
+/// finished, waiting on a peer, working); the ones doing nothing (idle,
+/// asleep, exited) fold away under a count, except one idle for under an
+/// hour: between the turns of a conversation a session is idle, and it
+/// should not drop out of sight mid-chat (Tom, 2026-11-21).
 struct FleetBoard: Hashable {
+    /// An idle session this recent stays among the active ones.
+    static let recent: TimeInterval = 3600
+
     var runtimes: [FleetRuntimeNote] = []
     var headroom: [FleetHeadroom] = []
+    /// the sessions this phone pinned, in the server's order
+    var pinned: [FleetRow] = []
     var rows: [FleetRow] = []
     var resting: [FleetRow] = []
     /// the fabrics sessions are in, for the filter (named ones and projects' own)
@@ -289,19 +297,24 @@ struct FleetBoard: Hashable {
 
     /// no runtime is enrolled
     var hasNoRuntime: Bool { runtimes.isEmpty }
-    var hasNoSessions: Bool { rows.isEmpty && resting.isEmpty }
+    var hasNoSessions: Bool { pinned.isEmpty && rows.isEmpty && resting.isEmpty }
 
     init() {}
 
-    init(_ fleet: Fleet, now: Date, calendar: Calendar = .current, locale: Locale = .current) {
+    init(_ fleet: Fleet, now: Date, pins: Set<FleetSessionKey> = [], calendar: Calendar = .current, locale: Locale = .current) {
         runtimes = fleet.runtimes.map { FleetRuntimeNote($0, now: now, calendar: calendar, locale: locale) }
         let online = Set(fleet.runtimes.filter(\.online).map(\.id))
         let all = fleet.sessions.map { FleetRow($0, offline: !online.contains($0.runtimeID), now: now, calendar: calendar, locale: locale, attention: fleet.attention(for: $0.key)) }
         var seen = Set<String>()
         fabrics = fleet.sessions.map { $0.fabric.isEmpty ? $0.project : $0.fabric }.filter { !$0.isEmpty && seen.insert($0).inserted }
         held = fleet.runtimes.contains(where: \.held)
-        rows = all.filter { !$0.session.state.isResting }
-        resting = all.filter { $0.session.state.isResting }
+        let nowS = Int(now.timeIntervalSince1970)
+        let atRest: (FleetRow) -> Bool = { row in
+            row.session.state.isResting && !(row.session.state == .idle && nowS - row.session.since < Int(Self.recent))
+        }
+        pinned = all.filter { pins.contains($0.id) }
+        rows = all.filter { !pins.contains($0.id) && !atRest($0) }
+        resting = all.filter { !pins.contains($0.id) && atRest($0) }
         // an account "has running sessions" while one of an online runtime's is not at rest
         let running = Set(fleet.sessions.filter { !$0.state.isResting && online.contains($0.runtimeID) }.map(\.account))
         // one line per account name: two Macs on one account report the same
@@ -323,6 +336,7 @@ struct FleetBoard: Hashable {
         guard let fabric else { return self }
         var b = self
         let keep: (FleetRow) -> Bool = { ($0.session.fabric.isEmpty ? $0.session.project : $0.session.fabric) == fabric }
+        b.pinned = pinned.filter(keep)
         b.rows = rows.filter(keep)
         b.resting = resting.filter(keep)
         return b
@@ -338,5 +352,31 @@ struct FleetBoard: Hashable {
         if needs > 0 { parts.append(needs == 1 ? "1 needs you" : "\(needs) need you") }
         if working > 0 { parts.append("\(working) working") }
         return parts.isEmpty ? nil : parts.joined(separator: " \u{00B7} ")
+    }
+}
+
+/// The sessions this phone keeps pinned at the top of Agents. Per device,
+/// in its defaults: a pin is how this person reads the list, not something
+/// about the fleet. One "runtime\tsession" per line.
+enum FleetPins {
+    static let key = "agents.pinned"
+
+    static func decode(_ raw: String) -> Set<FleetSessionKey> {
+        Set(raw.split(separator: "\n").compactMap { line in
+            let parts = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return nil }
+            return FleetSessionKey(runtimeID: String(parts[0]), id: String(parts[1]))
+        })
+    }
+
+    static func encode(_ pins: Set<FleetSessionKey>) -> String {
+        pins.map { "\($0.runtimeID)\t\($0.id)" }.sorted().joined(separator: "\n")
+    }
+
+    /// `raw` with `key` pinned or not.
+    static func set(_ key: FleetSessionKey, pinned: Bool, in raw: String) -> String {
+        var pins = decode(raw)
+        if pinned { pins.insert(key) } else { pins.remove(key) }
+        return encode(pins)
     }
 }

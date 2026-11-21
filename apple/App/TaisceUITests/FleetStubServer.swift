@@ -236,7 +236,8 @@ enum StubFleet {
             session(2, "qompass/mcp-dx", "stalled", last: "Password:", account: "work", ago: 900),
             session(3, "workbox/main", "finished", last: "Done: the hook receiver checks Host, Origin and the token.", account: "work", context: 19),
             session(4, "taisce/fabric", "working", tool: "Bash", note: "Building the app", context: 61, ago: 7300),
-            session(5, "notes/main", "idle"),
+            // idle for two hours: an hour is "recent" and stays in the list
+            session(5, "notes/main", "idle", ago: 7300),
         ]
     }
 

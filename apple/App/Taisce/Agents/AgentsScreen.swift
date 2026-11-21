@@ -4,7 +4,8 @@ import TaisceKit
 /// Agents: the fleet of Claude sessions the person's runtimes report (Agent
 /// Fabric), by how much each needs them. A row opens its session; Talk
 /// shows the agents' conversations; Hold all stops every Mac taking
-/// anything but its release; a swipe snoozes a session's notifications.
+/// anything but its release; a swipe snoozes a session's notifications,
+/// one the other way pins it to the top.
 ///
 /// The list holds still while it is on screen: a change redraws a row where
 /// it stands. The server's order comes back on a pull to refresh and each
@@ -17,6 +18,7 @@ struct AgentsScreen: View {
     @State private var presence = FleetScreenPresence()
     @State private var toast: ToastMessage?
     @State private var confirmHold = false
+    @AppStorage(FleetPins.key) private var pins = ""
 
     private var store: FleetStore { model.fleet }
     private var inFront: Bool { appeared && scenePhase == .active }
@@ -27,12 +29,13 @@ struct AgentsScreen: View {
         TimelineView(.periodic(from: .now, by: 30)) { context in
             AgentsContent(
                 availability: store.availability,
-                board: FleetBoard(store.fleet, now: context.date),
+                board: FleetBoard(store.fleet, now: context.date, pins: FleetPins.decode(pins)),
                 reconnecting: store.isLoaded && store.link != .live,
                 loadError: store.loadError,
                 focus: $router.agentsFocus,
                 onSnooze: { key, option in act { await store.snooze(key, option) } },
                 onUnsnooze: { key in act { await store.unsnooze(key) } },
+                onPin: { key, on in withAnimation(Lapis.Motion.standard) { pins = FleetPins.set(key, pinned: on, in: pins) } },
                 onRetry: { Task { await store.refresh() } },
                 talkWaiting: store.talk.waiting,
                 onHold: { on in if on { confirmHold = true } else { act { await store.command.hold(false) } } },
@@ -85,6 +88,7 @@ struct AgentsContent: View {
     var focus: Binding<FleetSessionKey?> = .constant(nil)
     var onSnooze: (FleetSessionKey, FleetSnooze) -> Void = { _, _ in }
     var onUnsnooze: (FleetSessionKey) -> Void = { _ in }
+    var onPin: (FleetSessionKey, Bool) -> Void = { _, _ in }
     var onRetry: () -> Void = {}
     /// what Talk asks you to settle
     var talkWaiting = 0
@@ -209,7 +213,7 @@ struct AgentsContent: View {
 
     private func lists(_ key: FleetSessionKey?) -> Bool {
         guard let key else { return false }
-        return (board.rows + board.resting).contains { $0.id == key }
+        return (board.pinned + board.rows + board.resting).contains { $0.id == key }
     }
 
     /// Bring a notification's session into view and mark it for a moment.
@@ -321,6 +325,17 @@ struct AgentsContent: View {
 
     @ViewBuilder private var sessions: some View {
         let board = board.only(fabric)
+        if !board.pinned.isEmpty {
+            Section {
+                ForEach(board.pinned) { row in sessionRow(row, pinned: true) }
+            } header: {
+                Label("Pinned", systemImage: "pin.fill")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Color.lapis.ink3)
+                    .textCase(nil)
+                    .accessibilityIdentifier("agents.pinned")
+            }
+        }
         if !board.rows.isEmpty {
             Section {
                 ForEach(board.rows) { row in sessionRow(row) }
@@ -358,7 +373,7 @@ struct AgentsContent: View {
         }
     }
 
-    private func sessionRow(_ row: FleetRow) -> some View {
+    private func sessionRow(_ row: FleetRow, pinned: Bool = false) -> some View {
         NavigationLink(value: Route.agentSession(row.id)) {
             FleetRowView(row: row)
         }
@@ -366,6 +381,10 @@ struct AgentsContent: View {
             .listRowBackground(marked == row.id ? Color.lapis.accentSoft : Color.lapis.card)
             .listRowSeparatorTint(Color.lapis.line2)
             .id(row.id)
+            .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                Button(pinned ? "Unpin" : "Pin", systemImage: pinned ? "pin.slash" : "pin") { onPin(row.id, !pinned) }
+                    .tint(Color.lapis.accent)
+            }
             .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                 if row.snoozed == nil {
                     Button("Snooze", systemImage: "bell.slash") { snoozing = row }.tint(Color.lapis.yellowFill)
@@ -377,6 +396,7 @@ struct AgentsContent: View {
                 if let item = row.waitingItem, item.kind == .approval {
                     Button("Review approval", systemImage: "checkmark.shield") { onReview(item) }
                 }
+                Button(pinned ? "Unpin" : "Pin to top", systemImage: pinned ? "pin.slash" : "pin") { onPin(row.id, !pinned) }
                 if row.snoozed == nil {
                     Menu("Snooze notifications", systemImage: "bell.slash") {
                         ForEach(FleetSnooze.allCases, id: \.self) { option in Button(option.title()) { onSnooze(row.id, option) } }
@@ -388,6 +408,7 @@ struct AgentsContent: View {
             }
             // the row a notification pointed at
             .accessibilityAddTraits(marked == row.id ? .isSelected : [])
+            .accessibilityAction(named: pinned ? "Unpin" : "Pin to top") { onPin(row.id, !pinned) }
             .accessibilityAction(named: row.snoozed == nil ? "Snooze notifications" : "Unsnooze") {
                 if row.snoozed == nil { snoozing = row } else { onUnsnooze(row.id) }
             }
