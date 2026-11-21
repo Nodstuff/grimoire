@@ -87,12 +87,6 @@ struct AgentSessionScreen: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
                     headerCard(header, s)
-                    if let runtime, !command.isPaired(with: runtime) { pairNote(runtime) }
-                    if runtime?.held == true { heldBanner }
-                    if !s.queuePaused.isEmpty { pausedBanner(s) }
-                    ForEach(items.filter { $0.id != question?.id }) { item in
-                        AttentionCard(item: item, verifiedKind: command.verifiedKind(item), onOpen: { router.approval = AttentionRef(id: item.id) })
-                    }
                     if feed.more {
                         Button { Task { await feed.loadOlder(store.fabricService) } } label: {
                             Label(feed.loading ? "Loading\u{2026}" : "Earlier turns", systemImage: "arrow.up.circle")
@@ -112,8 +106,16 @@ struct AgentSessionScreen: View {
                         TurnView(row: TurnRow(turn, now: now)).id(turn.turnID)
                     }
                     if s.state == .working || s.state == .stalled { runningNow(s, now: now) }
+                    // everything that asks something of the person sits at the bottom,
+                    // where the feed opens and the reply box is, never above the turns
+                    ForEach(items.filter { $0.id != question?.id }) { item in
+                        AttentionCard(item: item, verifiedKind: command.verifiedKind(item), onOpen: { router.approval = AttentionRef(id: item.id) })
+                    }
                     if let question { QuestionCard(item: question, command: command, onDone: done) }
+                    if runtime?.held == true { heldBanner }
+                    // a paused queue says why, and is released, on the waiting message itself
                     ForEach(s.queue, id: \.self) { id in queuedCard(id, s) }
+                    if let runtime, !command.isPaired(with: runtime) { pairNote(runtime) }
                     ForEach(command.pending.filter { $0.session == key }) { p in UndoCard(pending: p) { draft = command.undo(p.id) ?? draft } }
                     Color.clear.frame(height: 1).id("bottom")
                 }
@@ -227,18 +229,6 @@ struct AgentSessionScreen: View {
 
     private var heldBanner: some View {
         LapisBanner(text: "Hold all is on for this Mac: nothing you send runs until you release it.", tone: .yellow, symbol: "hand.raised.fill")
-    }
-
-    private func pausedBanner(_ s: FleetSession) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: "pause.circle.fill").foregroundStyle(Color.lapis.yellowMark)
-            Text(FabricWords.queuePaused(s.queuePaused)).font(.subheadline).foregroundStyle(Color.lapis.ink)
-            Spacer(minLength: 0)
-            Button("Release") { act { await command.command(.releaseQueue, key) } }
-                .buttonStyle(.lapis(.secondary, size: .small))
-        }
-        .padding(12)
-        .background(Color.lapis.yellowSoft, in: .rect(cornerRadius: Lapis.Radius.card, style: .continuous))
     }
 
     // MARK: composer
