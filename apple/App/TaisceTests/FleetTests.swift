@@ -272,7 +272,8 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
         #expect(s.availability == .unknown && !s.isLoaded)
         s.start()
         s.start()
-        await until("the fleet arrives") { s.isLoaded }
+        // the fleet and the live link are two signals: wait for both
+        await until("the fleet arrives") { s.isLoaded && s.link == .live }
         #expect(s.fleet == Self.fleet && s.link == .live && s.loadError == nil)
         #expect(fake.calls == ["stream"], "asked to start twice, it follows once")
         // the last row comes to need you: it changes where it stands

@@ -69,7 +69,8 @@ struct AgentsScreen: View {
 
     private func act(_ change: @escaping @MainActor () async -> String?) {
         Task {
-            if let failure = await change() { toast = ToastMessage(text: failure, tone: .error) }
+            // "" is a Face ID the person cancelled: nothing to say
+            if let failure = await change(), !failure.isEmpty { toast = ToastMessage(text: failure, tone: .error) }
         }
     }
 }
@@ -449,13 +450,13 @@ struct FleetRowView: View {
     }
 }
 
-/// "Mac awake" / "Mac asleep since 12:41", and which runtime.
+/// "Mac awake" / "Mac awake · no sessions" / "Mac asleep since 12:41", and which runtime.
 struct FleetRuntimeLine: View {
     let note: FleetRuntimeNote
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: note.online ? "desktopcomputer" : "moon.zzz")
+            Image(systemName: note.awake ? "desktopcomputer" : "moon.zzz")
                 .font(.body)
                 .foregroundStyle(note.online ? Color.lapis.green : Color.lapis.ink3)
                 .frame(width: 24)

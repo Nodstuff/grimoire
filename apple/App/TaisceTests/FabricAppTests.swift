@@ -59,7 +59,7 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         let s = try FabricSettings.decode(body.payload)
         return state.withLock { st in
             st.settingsPuts.append(body)
-            st.settings = FabricSettingsView(version: s.version, defaults: false, settings: s)
+            st.settings = FabricSettingsView(version: s.version, defaults: false, settings: s, signed: body)
             return st.settings
         }
     }
@@ -133,6 +133,7 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         s.command.ownerCheck = Owner(answer: owner)
         s.command.undoWindow = .milliseconds(150)
         s.config.pairingPoll = .milliseconds(10)
+        s.config.secrets = MemorySecrets()
         // the fleet as the stream would have delivered it
         s.take(.change(.fleet(fake.state.withLock { $0.fleet }), rev: 3))
         return s
@@ -280,6 +281,15 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         #expect(await s.config.save(slash)?.contains("can't contain") == true)
         #expect(fake.state.withLock { $0.settingsPuts.count } == 1, "neither was signed")
 
+        // a Mac that doesn't know this phone: name it, and say pair first
+        fake.state.withLock { $0.refuse = FabricError(status: 422, code: "not_paired_everywhere", message: "pair this device with every runtime first; not with: studio") }
+        let unpaired = Fleet(rev: 4, runtimes: fake.state.withLock { $0.fleet }.runtimes + [FleetRuntime(id: "r2", name: "studio", online: true)])
+        s.take(.change(.fleet(unpaired), rev: 4))
+        #expect(s.config.unpairedMacs() == ["studio"])
+        let words = await s.config.save(s.config.settings)
+        #expect(words?.contains("Pair this phone with studio first") == true, "\(words ?? "")")
+        #expect(FabricWords.notPairedEverywhere([], server: "not with: mini").contains("not with: mini"), "the server's names when the fleet has none")
+
         // another device saved first: reload, and say so
         fake.state.withLock { $0.refuse = FabricError(status: 409, code: "stale_settings", message: "stale", version: 2) }
         #expect(await s.config.save(s.config.settings)?.contains("another device") == true)
@@ -294,9 +304,10 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         } else { Issue.record("another server's code is refused") }
         #expect(!fake.calls.contains { $0.hasPrefix("pair") })
         guard case .success(let id) = await s.config.pair(code: code, deviceName: "phone", serverHost: "taisce.example") else { Issue.record("pairs"); return }
-        #expect(s.command.trust.runtimeKey("0193a5b2-7c4d-7e8f-9a0b-1c2d3e4f5a6b") == nil, "not trusted before the Mac confirms")
-        s.take(.event(.pairing(FabricPairingView(pairingID: id, runtimeID: "0193a5b2-7c4d-7e8f-9a0b-1c2d3e4f5a6b", state: .paired))))
+        // read at the Mac: its key is kept as the code is used, not only once the Mac confirms
         #expect(s.command.trust.runtimeKey("0193a5b2-7c4d-7e8f-9a0b-1c2d3e4f5a6b") == (try PairingCode(code)).runtimeKey)
+        s.take(.event(.pairing(FabricPairingView(pairingID: id, runtimeID: "0193a5b2-7c4d-7e8f-9a0b-1c2d3e4f5a6b", state: .paired))))
+        #expect(s.config.pairings[id]?.state == .paired)
         #expect(FabricConfigStore.sameHost("127.0.0.1:7633", "127.0.0.1:7633") && FabricConfigStore.sameHost("taisce.null.ie", "https://taisce.null.ie"))
     }
 
@@ -331,6 +342,21 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         #expect(ComposerMode(Self.session("s", "a/b", .needsYou), runtime: FleetRuntime(id: "r1", name: "mbp", online: false)) == .offline)
         #expect(ComposerMode(Self.session("s", "a/b", .needsYou), runtime: FleetRuntime(id: "r1", name: "mbp", online: true, held: true)) == .held)
         #expect(ComposerMode.queue.queues && !ComposerMode.reply.queues && !ComposerMode.held.canType)
+        // the Mac closed its runtime cleanly: awake, the words wait at the server
+        let idle = FleetRuntime(id: "r1", name: "mbp", online: false, connection: .idle, lastSeenAt: Self.nowS - 600)
+        #expect(ComposerMode(Self.session("s", "a/b", .needsYou), runtime: idle) == .idle && ComposerMode.idle.canType)
+    }
+
+    @Test func anIdleMacIsAwakeWithNoSessionsNeverAsleep() {
+        let idle = FleetRuntime(id: "r1", name: "mbp", online: false, connection: .idle, lastSeenAt: Self.nowS - 600)
+        let note = FleetRuntimeNote(idle, now: Self.now)
+        #expect(note.title == "Mac awake \u{00B7} no sessions" && note.awake && !note.online)
+        #expect(!note.title.contains("asleep"))
+        let away = FleetRuntimeNote(FleetRuntime(id: "r1", name: "mbp", online: false, connection: .offline, lastSeenAt: Self.nowS - 600), now: Self.now)
+        #expect(away.title.hasPrefix("Mac asleep") && !away.awake)
+        #expect(FleetCard(Fleet(rev: 1, runtimes: [idle]), available: true)?.subtitle == "No sessions")
+        #expect(FleetCard(Fleet(rev: 1, runtimes: [idle]), available: true)?.attention == false, "idle never alerts")
+        #expect(SessionHeader(Self.session("s1", "taisce/main", .idle), runtime: idle, now: Self.now).place == "on mbp \u{00B7} mac awake \u{00B7} no sessions")
     }
 
     @Test func theFeedMergesPagesAndTheStreamAndCountsWhatIsNew() async {
@@ -376,6 +402,125 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         #expect(b2.fabrics == ["taisce", "qompass"] && b2.only("qompass").rows.map(\.session.sessionID) == ["s2"])
         #expect(FabricWords.countdown(to: Self.nowS + 892, now: Self.now) == "14:52")
         #expect(FabricWords.countdown(to: Self.nowS - 1, now: Self.now) == "Expired")
+    }
+
+    // MARK: the review of 2026-11-21
+
+    @Test func holdingIsOneTapAndReleasingAsksForFaceID() async throws {
+        let fake = FakeFabric(Self.fleet(held: true))
+        let refused = store(fake, owner: false)
+        #expect(await refused.command.hold(false) == "", "Face ID cancelled: said as nothing")
+        #expect(fake.posted.isEmpty, "no release signed without the owner")
+        #expect(await refused.command.hold(true) == nil)
+        #expect(fake.posted.last?.what == .hold(true), "holding needs no Face ID")
+        let owner = store(fake, owner: true)
+        #expect(await owner.command.hold(false) == nil)
+        #expect(fake.posted.last?.what == .hold(false))
+    }
+
+    static func question(serverSays kind: FabricAttentionKind = .question, labels: [String] = ["Fix the test", "Skip it"]) -> FabricAttentionItem {
+        let r = AttentionRequest(runtimeID: "r1", sessionID: "s1", requestID: "q1", kind: .question, text: "Fix it or skip it?",
+                                 choices: [FabricChoice(id: "fix", label: labels[0]), FabricChoice(id: "skip", label: labels[1])], raisedAt: Int64(nowS))
+        let bytes = r.encoded()
+        return FabricAttentionItem(id: "q1", source: .runtime, runtimeID: "r1", sessionID: "s1", address: "taisce/main", kind: kind,
+                                   text: "Fix it or skip it?", choices: r.choices, raisedAt: nowS,
+                                   signed: SignedAttention(request: bytes, signature: try! runtimeKey.sign(.attention, bytes)))
+    }
+
+    @Test func aNotificationButtonAnswersOnlyWithTheLabelItShowed() async throws {
+        let item = Self.question()
+        let fake = FakeFabric(Self.fleet(attention: [item]))
+        fake.state.withLock { $0.attention = [item] }
+        let s = store(fake)
+        let p = FabricPush.Pointer(kind: "fabric_attention", session: item.session, itemID: "q1", attentionKind: .question)
+        // the push titled the "skip" button "Fix the test": nothing is signed, the app opens on it
+        let lie = QuestionActions.identifier(choiceID: "skip", title: "Fix the test")
+        #expect(await FabricPush.perform(p, action: lie, in: s)?.contains("Nothing was sent") == true)
+        #expect(fake.posted.isEmpty)
+        #expect(s.openRequest != nil, "opened in the app instead")
+        // the button said what the Mac signed: answered with that label
+        #expect(await FabricPush.perform(p, action: QuestionActions.identifier(choiceID: "fix", title: "Fix the test"), in: s) == nil)
+        guard case .command(let c)? = fake.posted.last?.what else { Issue.record("an order"); return }
+        #expect(c.verb == .answer && c.text == "Fix the test" && c.choiceID == "fix")
+        // "Answer…" never signs words from the notification: it opens the app
+        _ = s.takeOpenRequest()
+        #expect(await FabricPush.perform(p, action: FabricPush.Action.answer, in: s) == nil)
+        #expect(fake.posted.count == 1 && s.openRequest != nil)
+        // a pointer naming another session than the item's
+        let elsewhere = FabricPush.Pointer(kind: "fabric_attention", session: FleetSessionKey(runtimeID: "r1", id: "s2"), itemID: "q1", attentionKind: .question)
+        #expect(await FabricPush.perform(elsewhere, action: QuestionActions.identifier(choiceID: "fix", title: "Fix the test"), in: s) != nil)
+        #expect(fake.posted.count == 1)
+    }
+
+    @Test func theVerbsFollowWhatTheMacSignedNotWhatTheServerSays() async throws {
+        // the server calls a question an approval
+        let item = Self.question(serverSays: .approval)
+        let fake = FakeFabric(Self.fleet(attention: [item]))
+        let s = store(fake)
+        #expect(s.command.verifiedKind(item) == .question)
+        guard case .success(let v) = s.command.verify(item) else { Issue.record("verifies"); return }
+        #expect(await s.command.approve(v) == FabricWords.problem(.wrongKind))
+        #expect(await s.command.deny(v) == FabricWords.problem(.wrongKind))
+        #expect(fake.posted.isEmpty, "nothing approved or denied")
+        // a push calling it an approval opens its session, not the approval sheet
+        let push = FabricPush.Pointer(kind: "fabric_attention", session: item.session, itemID: "q1", attentionKind: .approval)
+        #expect(!FabricPush.opensApproval(push, in: s))
+        let approval = Self.approval()
+        let withApproval = store(FakeFabric(Self.fleet(attention: [approval])))
+        #expect(FabricPush.opensApproval(FabricPush.Pointer(kind: "fabric_attention", session: approval.session, itemID: approval.id, attentionKind: .question), in: withApproval),
+                "the Mac signed an approval: the sheet opens whatever the push says")
+        // and a hub item is never taken for a runtime's
+        let hub = FabricAttentionItem(id: "h1", source: .hub, runtimeID: "r1", sessionID: "s1", address: "taisce/main", kind: .approval, text: "", raisedAt: 1)
+        #expect(s.command.verifiedKind(hub) == nil)
+    }
+
+    @Test func aSendTheAppWasAwayPastIsNeverSentLate() async throws {
+        let fake = FakeFabric(Self.fleet())
+        let s = store(fake)
+        s.command.undoWindow = .seconds(60)
+        let session = Self.fleet().sessions[0]
+        #expect(s.command.send("Yes, go ahead", to: session, queued: false) == nil)
+        let held = try #require(s.command.pending.first)
+        // the app was suspended through its deadline and comes back 31 s past it
+        await s.command.flush(now: held.deadline.addingTimeInterval(PendingSend.grace + 1))
+        #expect(fake.posted.isEmpty, "not sent hours later")
+        #expect(s.command.pending.first?.lapsed == true, "kept, shown as not sent")
+        // within the grace it would have gone; a lapsed one goes back to the box
+        #expect(s.command.undo(held.id) == "Yes, go ahead" && s.command.pending.isEmpty)
+        #expect(s.command.send("Yes, go ahead", to: session, queued: false) == nil)
+        await s.command.flush(now: try #require(s.command.pending.first).deadline.addingTimeInterval(5))
+        #expect(fake.posted.count == 1)
+    }
+
+    @Test func settingsAnotherDeviceSignedAreLookedAtBeforeBuiltOn() async throws {
+        let fake = FakeFabric(Self.fleet())
+        let s = store(fake)
+        let other = SoftwareDeviceKey()
+        var loosened = FabricDefaults.settings
+        loosened.guardrails[0].enabled = false
+        loosened.version = 4
+        let payload = loosened.encoded()
+        fake.state.withLock {
+            $0.settings = FabricSettingsView(version: 4, defaults: false, settings: FabricDefaults.settings,
+                                             signed: FabricSignedBody(payload: payload, deviceID: other.deviceID, signature: try! other.sign(.settings, payload)))
+        }
+        await s.config.load()
+        let review = try #require(s.config.review)
+        #expect(review.contains { $0.contains(loosened.guardrails[0].label) }, "\(review)")
+        #expect(s.config.settings.guardrails[0].enabled == false, "shown as signed, not as the server's JSON")
+        #expect(await s.config.save(s.config.settings)?.contains("another device") == true)
+        #expect(fake.state.withLock { $0.settingsPuts.isEmpty }, "nothing signed on top unseen")
+        s.config.confirmReview()
+        #expect(s.config.review == nil)
+        #expect(await s.config.save(s.config.settings) == nil)
+        let put = try #require(fake.state.withLock { $0.settingsPuts.first })
+        #expect(try FabricSettings.decode(put.payload).version == 5)
+        // the server's JSON alone (no signature) is never built on
+        fake.state.withLock { $0.settings = FabricSettingsView(version: 6, defaults: false, settings: FabricDefaults.settings) }
+        await s.config.load()
+        #expect(s.config.problem != nil)
+        let refusal = await s.config.save(FabricDefaults.settings)
+        #expect(refusal != nil, "nothing signed on top of unsigned settings")
     }
 
     // MARK: notifications

@@ -1168,13 +1168,22 @@ signature over it is checked.
   scan the `taisce-pair:` code the Mac shows (VisionKit) or paste it. The app
   refuses a code naming another server, seals a signed claim (HKDF-SHA256 +
   AES-256-GCM), posts it, shows this phone's fingerprint to compare at the
-  Mac, and trusts the runtime key from the code (`KeychainTrustStore`) once
-  the Mac confirms. That key, never the hub's copy, is what approvals and
-  questions are verified against.
+  Mac, and trusts the runtime key from the code (`KeychainTrustStore`) as the
+  code is used (it was read at the Mac itself). That key, never the hub's
+  copy, is what approvals and questions are verified against. A verified
+  request must name the item's own id and session, and what it is (approval,
+  question) is what the Mac signed, never the server's `kind`: only an
+  approval is approved or denied, only a question answered.
+- **The Keychain** (`FabricSecretStore`): only `errSecItemNotFound` reads as
+  "none". Any other failure throws: no key is minted over one that could not
+  be read, and the trust list is never rewritten from a failed read.
 - **Orders** (`CommandCenter`): counters max(last + 1, unix ms, one above what
   the runtime last took from this device); a reply lives an hour, an approval
   no longer than its request. Text starting with `!` or `/` is never signed.
-  A reply is held five seconds (Undo); leaving the app sends what is held.
+  A reply is held five seconds (Undo); leaving the app sends what is held
+  (`AppModel.enterBackground`, under a background task). One the app was
+  away past (over 30 s beyond its deadline) is never sent late: it stays,
+  "Not sent", for Edit.
   An order still at the server can be taken back (`DELETE`); a queued one at
   the Mac is cancelled with a signed `cancel`. A refusal of one of this
   phone's orders is said once, in words (`FabricWords`).
@@ -1188,22 +1197,52 @@ signature over it is checked.
   resume to answer, let it wait); `FabricSettingsScreen` (paired Macs,
   guardrail editor with a pattern tester, limits, fabrics, Text off and
   private notifications per project). Hold all / Release on Agents' toolbar is
-  one signed order per Mac. The fabric chips filter the list.
+  one signed order per Mac; holding is one tap, releasing asks for Face ID.
+  The fabric chips filter the list.
 - **Notifications** (`FabricPush`): a category per kind with its actions.
   Approving is never a background action (it must show the verified command
-  and ask for Face ID): Review opens the sheet. Deny, Answer…, wake, let it
-  wait, continue and stop work from the notification, each reading the item
-  back from the server and verifying it first. A question's choices become
-  buttons in the `TaisceNotifications` service extension, which registers a
-  category per question: the server's category is the same for every
-  question, so only an extension can give each its own buttons (it runs only
-  for a push marked `mutable-content`).
+  and ask for Face ID): Review opens the sheet. Answer… opens the app on the
+  question (the notification shows the server's text, not the Mac's). Deny,
+  a choice, wake, let it wait, continue and stop work from the notification,
+  each reading the item back from the server and verifying it first. A
+  question's choices become buttons in the `TaisceNotifications` service
+  extension, which registers a category per question (one registration at a
+  time; the app's own registration keeps them). The extension cannot verify,
+  so each button's identifier binds the title it shows
+  (`Shared/QuestionActions.swift`): the app answers only with the label the
+  Mac signed for that choice, and only if it is that title; otherwise it
+  signs nothing and opens the question.
+- **Settings are edited on top of what was signed** (`SignedSettings`): the
+  server's `signed` payload, opened and checked, never its JSON. This
+  phone's own are verified against its key; another device's are shown as
+  what changed since the version this phone last signed or confirmed (kept
+  in the Keychain), and nothing is signed on top until the person confirms.
+- **A Mac's connection** (`FleetRuntime.connection`): `online`, `idle` (its
+  runtime closed its stream cleanly, as Workbox does when its last session
+  ends: "Mac awake · no sessions", never "asleep"; orders wait at the server
+  until it connects) or `offline` ("Mac asleep since …"). None of them alerts.
+  A server that sends only `online` reads as online or offline.
+- **Settings need every Mac**: a PUT answered 422 `not_paired_everywhere`
+  names the Macs (as the fleet shows them unpaired) and says to pair this
+  phone with them first; 409 `stale_settings` reloads and says so.
 - **Tests**: kit `FabricSigningTests`, `FabricAPITests`; app
   `FabricAppTests`; UI `FabricUITests` against `FabricStub` (a stand-in hub and
   runtime in the runner that opens the pairing seal, signs attention requests
   and checks every posted order and settings as a runtime would). UI runs pass
   `-fabricOwnerCheck pass` (Debug only) in place of Face ID; `-tab talk`
   opens Talk.
+- **Live** (`FabricLiveUITests`, skipped without these): a scratch SERVER
+  daemon (`TEST_RUNNER_TAISCE_UI_URL`) with its sign-in relay
+  (`…_UI_SIGNIN_RELAY`), and the server's `fake_runtime --pair --hub-host
+  localhost` playing a work script whose snapshot adds a session
+  `taisce/fabric-ui` that keeps working; its printed code goes in
+  `…_FABRIC_PAIR_CODE`. It pairs, reads turns, approves, replies, queues and
+  Stops, answers, holds and releases, and opens Talk, shooting each step to
+  `…_UI_SHOTS`. `…_FABRIC_FACEID=<dir>` approves with the simulator's enrolled
+  face: enroll with `xcrun simctl spawn <udid> notifyutil -s
+  com.apple.BiometricKit.enrollmentChanged 1` and `-p` the same name; when
+  the test drops `<dir>/faceid-request`, play `notifyutil -p
+  com.apple.BiometricKit_Sim.pearl.match` and delete the file.
 
 ## Running the app against a scratch daemon
 

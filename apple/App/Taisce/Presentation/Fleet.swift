@@ -186,14 +186,16 @@ struct FleetRow: Identifiable, Hashable {
     }
 }
 
-/// A runtime's line at the top of the fleet: "Mac awake", or "Mac asleep
-/// since 12:41" (the design's words: a runtime whose stream is down is a
-/// Mac that is asleep, shut or off the network; its sessions are shown as
-/// last known).
+/// A runtime's line at the top of the fleet: "Mac awake", "Mac awake · no
+/// sessions" (its runtime closed its stream cleanly), or "Mac asleep since
+/// 12:41" (the design's words: a runtime whose stream dropped is a Mac that
+/// is asleep, shut or off the network; its sessions are shown as last known).
 struct FleetRuntimeNote: Identifiable, Hashable {
     var id: String
     var name: String
     var online: Bool
+    /// online or idle: the Mac is awake either way
+    var awake: Bool
     var title: String
     /// "mbp · its sessions are shown as last known"
     var detail: String
@@ -202,8 +204,13 @@ struct FleetRuntimeNote: Identifiable, Hashable {
         id = r.id
         name = r.name
         online = r.online
+        awake = r.online || r.connection == .idle
         if r.online {
             title = "Mac awake"
+            detail = r.name
+        } else if r.connection == .idle {
+            // its runtime closed cleanly: awake, nothing to report. Never "asleep".
+            title = "Mac awake \u{00B7} no sessions"
             detail = r.name
         } else if let seen = r.lastSeenAt {
             title = "Mac asleep since \(FleetTime.clock(seen, now: now, calendar: calendar, locale: locale))"
@@ -260,7 +267,7 @@ struct FleetCard: Hashable {
         guard available, !fleet.runtimes.isEmpty else { return nil }
         let board = FleetBoard(fleet, now: now)
         let count = fleet.sessions.count
-        let asleep = fleet.runtimes.allSatisfy { !$0.online }
+        let asleep = fleet.runtimes.allSatisfy { $0.connection == .offline }
         subtitle = board.summary ?? (asleep ? "Mac asleep" : count == 0 ? "No sessions" : count == 1 ? "1 session, none needs you" : "\(count) sessions, none needs you")
         attention = fleet.attentionCount(at: now) > 0
     }

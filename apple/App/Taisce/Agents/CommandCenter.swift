@@ -15,6 +15,13 @@ struct PendingSend: Identifiable, Equatable, Sendable {
     /// the turn the person was reading
     let afterTurn: String
     let deadline: Date
+    /// it could not go in time (the app was away past its deadline): kept,
+    /// never sent, for the person to take back into the box and send again
+    var lapsed = false
+
+    /// A held send this long past its deadline is not sent: the moment it
+    /// answered has gone.
+    static let grace: TimeInterval = 30
 }
 
 /// Something worth saying once, at the bottom of the screen.
@@ -117,24 +124,32 @@ final class CommandCenter {
         return nil
     }
 
-    /// Take a held send back before it goes. Its text, for the composer.
+    /// Take a held send back before it goes (or a lapsed one, to send
+    /// again). Its text, for the composer.
     func undo(_ id: String) -> String? {
         timers.removeValue(forKey: id)?.cancel()
         guard let i = pending.firstIndex(where: { $0.id == id }) else { return nil }
         return pending.remove(at: i).text
     }
 
-    /// Send every held reply now (the app is leaving the front).
-    func flush() async {
-        for p in pending {
+    /// Send every held reply now (the app is leaving the front: the app
+    /// model calls this as it goes, under a background task).
+    func flush(now: Date = .now) async {
+        for p in pending where !p.lapsed {
             timers.removeValue(forKey: p.id)?.cancel()
-            await post(p.id)
+            await post(p.id, now: now)
         }
     }
 
-    private func post(_ id: String) async {
+    /// Post a held send, unless it is past its deadline by more than the
+    /// grace (the app was suspended through it): then it stays, lapsed.
+    func post(_ id: String, now: Date = .now) async {
         timers[id] = nil
-        guard let i = pending.firstIndex(where: { $0.id == id }) else { return }
+        guard let i = pending.firstIndex(where: { $0.id == id }), !pending[i].lapsed else { return }
+        if now.timeIntervalSince(pending[i].deadline) > PendingSend.grace {
+            pending[i].lapsed = true
+            return
+        }
         let p = pending.remove(at: i)
         let command = FabricCommand(sessionID: p.session.id, verb: .send, text: p.text, afterTurn: p.afterTurn, queued: p.queued)
         if let failure = await order(.command(command), runtimeID: p.session.runtimeID, orderID: p.id) {
@@ -180,9 +195,12 @@ final class CommandCenter {
     }
 
     /// Hold all (or release it) on every runtime: one order to each.
-    /// Nil, or what went wrong where.
+    /// Holding is one tap; releasing hands your agents their hands back, so
+    /// it asks for Face ID first. Nil, or what went wrong where ("" when
+    /// the person cancelled Face ID).
     func hold(_ on: Bool) async -> String? {
         guard let runtimes = fleet?.fleet.runtimes, !runtimes.isEmpty else { return "No Mac is enrolled." }
+        if !on, !(await ownerCheck.confirm("Release Hold all on your Macs")) { return "" }
         var failures: [String] = []
         for r in runtimes {
             if let f = await order(.hold(on), runtimeID: r.id) { failures.append("\(r.name): \(f)") }
@@ -203,24 +221,42 @@ final class CommandCenter {
         }
     }
 
+    /// What the Mac signed this item as; nil when it is the hub's or does not verify.
+    func verifiedKind(_ item: FabricAttentionItem) -> AttentionKind? {
+        guard item.source == .runtime, case .success(let v) = verify(item) else { return nil }
+        return v.kind
+    }
+
     /// Allow the exact request shown, once, after Face ID. Nil, or why not
     /// ("" when the person cancelled Face ID).
     func approve(_ v: VerifiedAttention) async -> String? {
+        let command: FabricCommand
+        do { command = try v.approve() } catch { return Self.words(error) }
         guard await ownerCheck.confirm("Allow \(v.item.address) to run this once") else { return "" }
-        return await order(.command(v.approve()), runtimeID: v.item.runtimeID, lifetime: v.lifetime(now: .now))
+        return await order(.command(command), runtimeID: v.item.runtimeID, lifetime: v.lifetime(now: .now))
     }
 
     func deny(_ v: VerifiedAttention, because reason: String = "") async -> String? {
-        await order(.command(v.deny(because: reason)), runtimeID: v.item.runtimeID, lifetime: v.lifetime(now: .now))
+        do {
+            return await order(.command(try v.deny(because: reason)), runtimeID: v.item.runtimeID, lifetime: v.lifetime(now: .now))
+        } catch { return Self.words(error) }
     }
 
     func answer(_ v: VerifiedAttention, choice: FabricChoice) async -> String? {
-        await order(.command(v.answer(choice: choice)), runtimeID: v.item.runtimeID)
+        do {
+            return await order(.command(try v.answer(choice: choice)), runtimeID: v.item.runtimeID)
+        } catch { return Self.words(error) }
     }
 
     func answer(_ v: VerifiedAttention, words: String) async -> String? {
-        do { try FabricCommander.check(text: words) } catch let p as FabricOrderProblem { return FabricWords.problem(p) } catch { return error.localizedDescription }
-        return await order(.command(v.answer(words: words)), runtimeID: v.item.runtimeID)
+        do {
+            try FabricCommander.check(text: words)
+            return await order(.command(try v.answer(words: words)), runtimeID: v.item.runtimeID)
+        } catch { return Self.words(error) }
+    }
+
+    private static func words(_ error: any Error) -> String {
+        (error as? FabricOrderProblem).map(FabricWords.problem) ?? error.localizedDescription
     }
 }
 

@@ -28,10 +28,21 @@ enum FabricWords {
         case "busy": "Someone is typing in that pane at the Mac."
         case "already_sent": "Too late to take back: it's on its way."
         case "invalid": "Those settings aren't valid."
+        case "not_paired_everywhere": "Pair this phone with every Mac first: settings go to all of them."
         case "malformed", "non_canonical": "The order was malformed."
         case "exited": "That session has exited."
         default: code.replacingOccurrences(of: "_", with: " ").capitalizedFirst
         }
+    }
+
+    /// Settings refused because a Mac doesn't know this phone (`not_paired_everywhere`):
+    /// name the Macs the fleet shows unpaired, or else what the server named.
+    static func notPairedEverywhere(_ macs: [String], server: String) -> String {
+        guard !macs.isEmpty else {
+            return "Pair this phone with every Mac first: settings go to all of them. (\(server))"
+        }
+        let names = ListFormatter.localizedString(byJoining: macs)
+        return "Pair this phone with \(names) first in Settings \u{203A} Agents: settings go to every Mac, and \(macs.count == 1 ? "that one doesn't" : "those don't") know this phone yet."
     }
 
     static func refusal(_ e: FabricError) -> String {
@@ -47,6 +58,7 @@ enum FabricWords {
         case .tooLong: "That's too long to send (16 KB at most)."
         case .unverified(let why): "Not shown: \(why)"
         case .notPaired: "This phone isn't paired with that Mac, so it can't check the request. Pair it in Settings \u{203A} Agents."
+        case .wrongKind: "Your Mac didn't ask for that: what it signed is something else."
         }
     }
 

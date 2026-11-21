@@ -185,7 +185,7 @@ extension RootView {
             router.showTalk()
         default:
             if let s = p.session { router.showAgentSession(s) } else { router.showAgents() }
-            if p.attentionKind == .approval, let id = p.itemID { router.approval = AttentionRef(id: id) }
+            if FabricPush.opensApproval(p, in: model.fleet), let id = p.itemID { router.approval = AttentionRef(id: id) }
         }
     }
 }

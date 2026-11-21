@@ -15,6 +15,9 @@ public enum FabricOrderProblem: Error, Equatable, Sendable {
     case unverified(String)
     /// this phone is not paired with the session's Mac
     case notPaired
+    /// the verified request is not something this verb answers (an approval
+    /// is approved or denied, a question answered)
+    case wrongKind
 }
 
 /// Where this device keeps the highest order counter it has used.
@@ -99,13 +102,63 @@ public final class FabricCommander: Sendable {
     }
 }
 
+/// Where the fabric keeps its secrets: the Keychain (through Valet) in the
+/// app, a dictionary in tests. Only a missing item reads as nil; any other
+/// failure (a locked Keychain, a denied access) throws, so a key is never
+/// minted, nor a trust list overwritten, because a read failed.
+public protocol FabricSecretStore: Sendable {
+    func data(forKey key: String) throws -> Data?
+    func set(_ data: Data, forKey key: String) throws
+}
+
+/// The Keychain, this device only, readable after first unlock (a
+/// notification action can sign).
+public struct KeychainSecrets: FabricSecretStore, @unchecked Sendable {
+    let valet: Valet
+
+    public init(identifier: String = "ie.null.taisce.fabric") {
+        valet = .valet(with: Identifier(nonEmpty: identifier)!, accessibility: .afterFirstUnlockThisDeviceOnly)
+    }
+
+    public func data(forKey key: String) throws -> Data? {
+        do {
+            return try valet.object(forKey: key)
+        } catch KeychainError.itemNotFound {
+            return nil
+        }
+    }
+
+    public func set(_ data: Data, forKey key: String) throws { try valet.setObject(data, forKey: key) }
+}
+
+/// Secrets in memory (tests, previews). `failure` makes every read throw
+/// it, as a locked or denied Keychain does.
+public final class MemorySecrets: FabricSecretStore {
+    private let items = Mutex<[String: Data]>([:])
+    private let failing = Mutex<(any Error & Sendable)?>(nil)
+    public init(_ start: [String: Data] = [:]) { items.withLock { $0 = start } }
+    public func fail(with error: (any Error & Sendable)?) { failing.withLock { $0 = error } }
+    public func data(forKey key: String) throws -> Data? {
+        if let e = failing.withLock({ $0 }) { throw e }
+        return items.withLock { $0[key] }
+    }
+    public func set(_ data: Data, forKey key: String) throws {
+        if let e = failing.withLock({ $0 }) { throw e }
+        items.withLock { $0[key] = data }
+    }
+}
+
 /// The runtimes' own keys, as read from their pairing codes: what approval
 /// and question signatures are checked against. Never taken from the hub.
 public protocol FabricTrustStore: Sendable {
+    /// nil when none is trusted, or the list cannot be read (nothing then verifies)
     func runtimeKey(_ runtimeID: String) -> Data?
-    func trust(_ runtimeID: String, key: Data)
-    func forget(_ runtimeID: String)
+    /// throws, and changes nothing, when the list cannot be read
+    func trust(_ runtimeID: String, key: Data) throws
+    func forget(_ runtimeID: String) throws
     func trusted() -> [String: Data]
+    /// The whole list; throws when it cannot be read (said, never taken for "not paired")
+    func load() throws -> [String: Data]
 }
 
 public final class MemoryTrustStore: FabricTrustStore {
@@ -115,38 +168,39 @@ public final class MemoryTrustStore: FabricTrustStore {
     public func trust(_ runtimeID: String, key: Data) { keys.withLock { $0[runtimeID.lowercased()] = key } }
     public func forget(_ runtimeID: String) { _ = keys.withLock { $0.removeValue(forKey: runtimeID.lowercased()) } }
     public func trusted() -> [String: Data] { keys.withLock { $0 } }
+    public func load() -> [String: Data] { trusted() }
 }
 
 /// In the Keychain (integrity matters more than secrecy: a key put here is
 /// what an approval is believed against), this device only.
 public struct KeychainTrustStore: FabricTrustStore {
-    let valet: Valet
+    let secrets: any FabricSecretStore
     static let item = "runtime-keys"
 
-    public init(identifier: String = "ie.null.taisce.fabric") {
-        valet = .valet(with: Identifier(nonEmpty: identifier)!, accessibility: .afterFirstUnlockThisDeviceOnly)
+    public init(secrets: any FabricSecretStore = KeychainSecrets()) {
+        self.secrets = secrets
     }
 
-    public func trusted() -> [String: Data] {
-        guard let data = try? valet.object(forKey: Self.item),
-              let map = try? JSONDecoder().decode([String: Data].self, from: data) else { return [:] }
-        return map
+    /// The list; empty only when there is none yet.
+    public func load() throws -> [String: Data] {
+        guard let data = try secrets.data(forKey: Self.item) else { return [:] }
+        return try JSONDecoder().decode([String: Data].self, from: data)
     }
 
-    private func write(_ map: [String: Data]) {
-        if let data = try? JSONEncoder().encode(map) { try? valet.setObject(data, forKey: Self.item) }
-    }
+    public func trusted() -> [String: Data] { (try? load()) ?? [:] }
 
     public func runtimeKey(_ runtimeID: String) -> Data? { trusted()[runtimeID.lowercased()] }
-    public func trust(_ runtimeID: String, key: Data) {
-        var map = trusted()
+
+    public func trust(_ runtimeID: String, key: Data) throws {
+        var map = try load()
         map[runtimeID.lowercased()] = key
-        write(map)
+        try secrets.set(try JSONEncoder().encode(map), forKey: Self.item)
     }
-    public func forget(_ runtimeID: String) {
-        var map = trusted()
-        map.removeValue(forKey: runtimeID.lowercased())
-        write(map)
+
+    public func forget(_ runtimeID: String) throws {
+        var map = try load()
+        guard map.removeValue(forKey: runtimeID.lowercased()) != nil else { return }
+        try secrets.set(try JSONEncoder().encode(map), forKey: Self.item)
     }
 }
 
@@ -165,7 +219,13 @@ public struct VerifiedAttention: Sendable, Hashable {
     /// Verify `item` against the key read from `runtime`'s pairing code.
     public static func verify(_ item: FabricAttentionItem, trust: any FabricTrustStore) throws -> VerifiedAttention {
         guard let signed = item.signed else { throw FabricOrderProblem.unverified("The request carries no signature.") }
-        guard let key = trust.runtimeKey(item.runtimeID) else { throw FabricOrderProblem.notPaired }
+        let keys: [String: Data]
+        do {
+            keys = try trust.load()
+        } catch {
+            throw FabricOrderProblem.unverified("This phone's list of trusted Macs can't be read (\(error.localizedDescription)).")
+        }
+        guard let key = keys[item.runtimeID.lowercased()] else { throw FabricOrderProblem.notPaired }
         guard FabricSignature.verify(publicKey: key, context: .attention, payload: signed.request, signature: signed.signature) else {
             throw FabricOrderProblem.unverified("The request's signature does not match your Mac's key.")
         }
@@ -177,6 +237,7 @@ public struct VerifiedAttention: Sendable, Hashable {
         }
         guard request.runtimeID.lowercased() == item.runtimeID.lowercased() else { throw FabricOrderProblem.unverified("The request names another Mac.") }
         guard request.sessionID.lowercased() == item.sessionID.lowercased() else { throw FabricOrderProblem.unverified("The request names another session.") }
+        guard request.requestID.lowercased() == item.id.lowercased() else { throw FabricOrderProblem.unverified("The request is not the one named.") }
         return VerifiedAttention(item: item, request: request, bytes: signed.request)
     }
 
@@ -187,21 +248,34 @@ public struct VerifiedAttention: Sendable, Hashable {
         return max(30, min(FabricCommander.replyLifetime, Double(request.expiresAt) - now.timeIntervalSince1970))
     }
 
-    public func approve() -> FabricCommand {
-        FabricCommand(sessionID: request.sessionID, verb: .approve, requestID: request.requestID, requestHash: requestHash)
+    /// What the Mac signed it as, whatever the server's item says.
+    public var kind: AttentionKind { request.kind }
+
+    /// Only a verified approval is approved.
+    public func approve() throws -> FabricCommand {
+        guard kind == .approval else { throw FabricOrderProblem.wrongKind }
+        return FabricCommand(sessionID: request.sessionID, verb: .approve, requestID: request.requestID, requestHash: requestHash)
     }
 
-    public func deny(because reason: String = "") -> FabricCommand {
-        FabricCommand(sessionID: request.sessionID, verb: .deny, text: reason, requestID: request.requestID, requestHash: requestHash)
+    /// Only a verified approval is denied.
+    public func deny(because reason: String = "") throws -> FabricCommand {
+        guard kind == .approval else { throw FabricOrderProblem.wrongKind }
+        return FabricCommand(sessionID: request.sessionID, verb: .deny, text: reason, requestID: request.requestID, requestHash: requestHash)
     }
 
+    /// Only a verified question is answered, and only with a choice it signed.
     /// The choice's label is typed (the runtime types `text`).
-    public func answer(choice: FabricChoice) -> FabricCommand {
-        FabricCommand(sessionID: request.sessionID, verb: .answer, text: choice.label, requestID: request.requestID, requestHash: requestHash, choiceID: choice.id)
+    public func answer(choice: FabricChoice) throws -> FabricCommand {
+        guard kind == .question else { throw FabricOrderProblem.wrongKind }
+        guard let signed = request.choices.first(where: { $0.id == choice.id }), signed.label == choice.label else {
+            throw FabricOrderProblem.unverified("That choice isn't one it offered.")
+        }
+        return FabricCommand(sessionID: request.sessionID, verb: .answer, text: signed.label, requestID: request.requestID, requestHash: requestHash, choiceID: signed.id)
     }
 
-    public func answer(words: String) -> FabricCommand {
-        FabricCommand(sessionID: request.sessionID, verb: .answer, text: words, requestID: request.requestID, requestHash: requestHash)
+    public func answer(words: String) throws -> FabricCommand {
+        guard kind == .question else { throw FabricOrderProblem.wrongKind }
+        return FabricCommand(sessionID: request.sessionID, verb: .answer, text: words, requestID: request.requestID, requestHash: requestHash)
     }
 }
 
@@ -214,40 +288,46 @@ public final class FabricDeviceIdentity: Sendable {
     public enum Kind: Sendable, Equatable { case secureEnclave, software }
 
     private let state = Mutex<(key: (any FabricDeviceKey)?, kind: Kind)>((nil, .software))
-    private let valet: Valet
+    private let secrets: (any FabricSecretStore)?
+    private let enclave: Bool
     static let enclaveItem = "device-key"
     static let softwareItem = "device-key-software"
 
-    public init(identifier: String = "ie.null.taisce.fabric") {
-        valet = .valet(with: Identifier(nonEmpty: identifier)!, accessibility: .afterFirstUnlockThisDeviceOnly)
+    /// `enclave` nil: the Secure Enclave wherever there is one.
+    public init(secrets: any FabricSecretStore = KeychainSecrets(), enclave: Bool? = nil) {
+        self.secrets = secrets
+        self.enclave = enclave ?? SecureEnclaveDeviceKey.isAvailable
     }
 
     /// A key held in memory only (tests, previews): the Keychain is never touched.
     public init(key: any FabricDeviceKey) {
-        valet = .valet(with: Identifier(nonEmpty: "ie.null.taisce.fabric.memory")!, accessibility: .afterFirstUnlockThisDeviceOnly)
+        secrets = nil
+        enclave = false
         state.withLock { $0 = (key, .software) }
     }
 
     public var kind: Kind { state.withLock { $0.kind } }
 
-    /// The key, made the first time it is asked for.
+    /// The key, made the first time it is asked for. Made only when the
+    /// Keychain says there is none: a read that fails throws instead.
     public func current() throws -> any FabricDeviceKey {
         try state.withLock { s in
             if let key = s.key { return key }
+            guard let secrets else { throw KeychainError.itemNotFound }
             let made: (any FabricDeviceKey, Kind)
-            if SecureEnclaveDeviceKey.isAvailable {
-                if let blob = try? valet.object(forKey: Self.enclaveItem), let k = try? SecureEnclaveDeviceKey(dataRepresentation: blob) {
-                    made = (k, .secureEnclave)
+            if enclave {
+                if let blob = try secrets.data(forKey: Self.enclaveItem) {
+                    made = (try SecureEnclaveDeviceKey(dataRepresentation: blob), .secureEnclave)
                 } else {
                     let k = try SecureEnclaveDeviceKey()
-                    try valet.setObject(k.dataRepresentation, forKey: Self.enclaveItem)
+                    try secrets.set(k.dataRepresentation, forKey: Self.enclaveItem)
                     made = (k, .secureEnclave)
                 }
-            } else if let raw = try? valet.object(forKey: Self.softwareItem), let k = try? P256.Signing.PrivateKey(rawRepresentation: raw) {
-                made = (SoftwareDeviceKey(k), .software)
+            } else if let raw = try secrets.data(forKey: Self.softwareItem) {
+                made = (SoftwareDeviceKey(try P256.Signing.PrivateKey(rawRepresentation: raw)), .software)
             } else {
                 let k = SoftwareDeviceKey()
-                try valet.setObject(k.key.rawRepresentation, forKey: Self.softwareItem)
+                try secrets.set(k.key.rawRepresentation, forKey: Self.softwareItem)
                 made = (k, .software)
             }
             s = (made.0, made.1)
@@ -258,8 +338,7 @@ public final class FabricDeviceIdentity: Sendable {
     /// The key if one has been made, without making one.
     public func existing() -> (any FabricDeviceKey)? {
         if let key = state.withLock({ $0.key }) { return key }
-        let item = SecureEnclaveDeviceKey.isAvailable ? Self.enclaveItem : Self.softwareItem
-        guard (try? valet.containsObject(forKey: item)) == true else { return nil }
+        guard let secrets, (try? secrets.data(forKey: enclave ? Self.enclaveItem : Self.softwareItem)) != nil else { return nil }
         return try? current()
     }
 }

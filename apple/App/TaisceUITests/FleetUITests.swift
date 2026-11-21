@@ -47,12 +47,24 @@ final class FleetUITests: XCTestCase {
         }
     }
 
+    /// Scroll a row into view (a lazy list makes it only once it is near the screen).
+    func reveal(_ app: XCUIApplication, _ address: String) {
+        for _ in 0..<4 where !(row(app, address).exists && row(app, address).isHittable) {
+            app.swipeUp(velocity: .slow)
+        }
+        XCTAssertTrue(row(app, address).waitForExistence(timeout: 5), "\(address) in view")
+    }
+
     func testTheFleetRendersInTheServersAttentionOrderAndRowsHoldStill() throws {
         let app = try launch(StubFleet.fleet())
         let order = ["taisce/main", "qompass/mcp-dx", "workbox/main", "taisce/fabric"]
         XCTAssertTrue(row(app, order[0]).waitForExistence(timeout: 20), "the fleet shows")
-        let tops = order.map { row(app, $0).frame.minY }
-        XCTAssertEqual(tops, tops.sorted(), "needs you, stalled, finished, working: as the server sent them")
+        let top = order.prefix(3).map { row(app, $0).frame.minY }
+        XCTAssertEqual(top, top.sorted(), "needs you, stalled, finished: as the server sent them")
+        // on a phone the last row sits below Talk and the fabric filter
+        reveal(app, "taisce/fabric")
+        let tail = order.suffix(2).map { row(app, $0).frame.minY }
+        XCTAssertEqual(tail, tail.sorted(), "then working")
         XCTAssertTrue(row(app, "taisce/main").label.contains("Needs you"))
         XCTAssertTrue(row(app, "taisce/main").label.contains("Shall I open the pull request?"), "the question is on the row")
         XCTAssertTrue(row(app, "qompass/mcp-dx").label.contains("Stalled"))
@@ -70,7 +82,7 @@ final class FleetUITests: XCTestCase {
         // a change redraws the row where it stands: the last one comes to need you and stays last
         server?.update(session: StubFleet.id(4)) { $0["state"] = "needs_you"; $0["tool"] = ""; $0["last_line"] = "Which branch?" }
         waitFor("the row changed") { self.row(app, "taisce/fabric").label.contains("Needs you") }
-        let after = order.map { row(app, $0).frame.minY }
+        let after = order.suffix(2).map { row(app, $0).frame.minY }
         XCTAssertEqual(after, after.sorted(), "no row moved")
         // the fold opens
         let resting = app.descendants(matching: .any).matching(identifier: "agents.resting").firstMatch
@@ -88,14 +100,16 @@ final class FleetUITests: XCTestCase {
         XCTAssertTrue(mac.waitForExistence(timeout: 20))
         XCTAssertTrue(mac.label.contains("Mac asleep since"), mac.label)
         XCTAssertTrue(mac.label.contains("sessions shown as last known"), mac.label)
-        // still listed, as last known: no clock runs on a Mac that is away
-        XCTAssertTrue(row(app, "taisce/fabric").label.contains("Working \u{00B7} Bash \u{00B7} last known"), row(app, "taisce/fabric").label)
         XCTAssertTrue(row(app, "taisce/main").exists)
         shot(app, "agents-mac-asleep")
+        // still listed, as last known: no clock runs on a Mac that is away
+        reveal(app, "taisce/fabric")
+        XCTAssertTrue(row(app, "taisce/fabric").label.contains("Working \u{00B7} Bash \u{00B7} last known"), row(app, "taisce/fabric").label)
         // the Mac wakes: said at once
         server?.updateRuntime { $0["online"] = true; $0["last_seen_at"] = Int(Date().timeIntervalSince1970) }
+        waitFor("the row's clock runs again") { self.row(app, "taisce/fabric").label.contains("2 h") }
+        for _ in 0..<4 where !mac.isHittable { app.swipeDown(velocity: .slow) }
         waitFor("awake again") { mac.label.contains("Mac awake") }
-        XCTAssertTrue(row(app, "taisce/fabric").label.contains("2 h"))
     }
 
     func testSnoozeMarksTheRowAndUnsnoozeClearsIt() throws {

@@ -195,10 +195,9 @@ final class FabricUITests: XCTestCase {
         XCTAssertTrue(stub.postedOrders.isEmpty, "nothing was sent")
 
         // typed and sent: after the window, one signed order
-        composer.tap()
-        // the caret may land anywhere in what came back: write it afresh
-        composer.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 30) + String(repeating: XCUIKeyboardKey.forwardDelete.rawValue, count: 30))
-        composer.typeText("Yes, go ahead and link the ticket")
+        // the caret goes to the end of what came back (a tap on the box may land it anywhere)
+        composer.coordinate(withNormalizedOffset: CGVector(dx: 0.97, dy: 0.5)).tap()
+        composer.typeText(" and link the ticket")
         el(app, "session.send").tap()
         XCTAssertTrue(el(app, "session.pending").waitForExistence(timeout: 3))
         waitFor("posted after five seconds", timeout: 12) { !stub.postedOrders.isEmpty }
@@ -269,8 +268,9 @@ final class FabricUITests: XCTestCase {
         })
         pair(app, stub)
         open(app, "workbox/main")
-        el(app, "attention.review").tap()
-        XCTAssertTrue(el(app, "approval.unverified").waitForExistence(timeout: 10), "not signed by the Mac: not shown")
+        // not signed by the Mac: nothing to review, nothing to allow
+        XCTAssertTrue(el(app, "attention.unverified").waitForExistence(timeout: 10), "said as not verified")
+        XCTAssertFalse(el(app, "attention.review").exists)
         XCTAssertFalse(el(app, "approval.allow").exists)
         shot(app, "approval-forged")
     }

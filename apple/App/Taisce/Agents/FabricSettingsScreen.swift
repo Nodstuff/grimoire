@@ -25,6 +25,27 @@ struct FabricSettingsScreen: View {
         let working = draft ?? current
         Form {
             phoneSection
+            if let problem = config.problem {
+                Section {
+                    Label(problem, systemImage: "exclamationmark.octagon").foregroundStyle(Color.lapis.red)
+                        .accessibilityIdentifier("settings.fabric.problem")
+                } footer: {
+                    Text("Nothing is signed on top of settings this phone can't check.")
+                }
+            }
+            if let changes = config.review {
+                Section {
+                    ForEach(changes, id: \.self) { Text($0).font(.callout) }
+                    if changes.isEmpty { Text("Nothing differs from what this phone last saw.").font(.callout) }
+                    Button("I've looked: edit on top of these", systemImage: "checkmark.seal") { config.confirmReview() }
+                        .accessibilityIdentifier("settings.fabric.confirmReview")
+                } header: {
+                    Text("Changed on another device")
+                } footer: {
+                    Text("Your settings were last signed on another of your devices. Look over what changed since this phone last saw them before signing anything on top.")
+                }
+                .accessibilityIdentifier("settings.fabric.review")
+            }
             Section {
                 ForEach(Array(working.guardrails.enumerated()), id: \.element.id) { i, g in
                     Toggle(isOn: Binding(get: { working.guardrails[i].enabled }, set: { on in edit { $0.guardrails[i].enabled = on } })) {
@@ -94,7 +115,7 @@ struct FabricSettingsScreen: View {
                     Button("Discard") { self.draft = nil }.buttonStyle(.lapis(.secondary))
                     Button(saving ? "Signing\u{2026}" : "Sign and save") { save(draft) }
                         .buttonStyle(.lapis(.primary, fullWidth: true))
-                        .disabled(saving)
+                        .disabled(saving || config.review != nil || config.problem != nil)
                         .accessibilityIdentifier("settings.fabric.save")
                 }
                 .padding(.horizontal, Lapis.Layout.gutter)

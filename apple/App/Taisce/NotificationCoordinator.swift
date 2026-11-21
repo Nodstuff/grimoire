@@ -267,10 +267,17 @@ final class SystemDueAlertCenter: DueAlertCenter {
 
     func registerCategory() {
         let actions = DueAlertAction.allCases.map { UNNotificationAction(identifier: $0.rawValue, title: $0.title, options: []) }
-        // Agent Fabric's beside To-dos' (this call replaces every category the app has)
-        center.setNotificationCategories(Set([
+        let ours = Set([
             UNNotificationCategory(identifier: NotificationCoordinator.category, actions: actions, intentIdentifiers: [], options: []),
-        ] + FabricPush.categories))
+        ] + FabricPush.categories)
+        let center = center
+        // Agent Fabric's beside To-dos'. Setting replaces every category the
+        // app has, so the per-question ones the notification extension
+        // registered are read and kept, not wiped.
+        Task {
+            let kept = await center.notificationCategories().filter { $0.identifier.hasPrefix(FabricPush.Category.questionPrefix) }
+            center.setNotificationCategories(ours.union(kept))
+        }
     }
 
     func pending() async -> [PlannedAlert] {

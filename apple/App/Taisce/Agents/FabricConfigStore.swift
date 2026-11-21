@@ -10,35 +10,52 @@ final class FabricConfigStore {
     @ObservationIgnored weak var fleet: FleetStore?
     /// tests: no waiting between pairing polls
     @ObservationIgnored var pairingPoll: Duration = .seconds(2)
+    /// where the settings this phone last signed or confirmed are kept
+    @ObservationIgnored var secrets: any FabricSecretStore = KeychainSecrets()
 
     private(set) var view: FabricSettingsView?
+    /// the newest settings, opened and checked: what an edit starts from
+    private(set) var signed: SignedSettings = .defaults(FabricDefaults.settings)
     private(set) var projects: [FabricProject] = []
     private(set) var loadError: String?
     /// pairing offers this phone made, by pairing id
     private(set) var pairings: [String: FabricPairingView] = [:]
-    /// what a pairing code said, by pairing id (the runtime's key is trusted once paired)
+    /// what a pairing code said, by pairing id
     @ObservationIgnored private var codes: [String: PairingCode] = [:]
 
     private var service: (any FabricService)? { fleet?.fabricService }
 
     func reset() {
         view = nil
+        signed = .defaults(FabricDefaults.settings)
         projects = []
         loadError = nil
         pairings = [:]
         codes = [:]
     }
 
-    /// The settings in force, or the defaults when nothing is signed yet.
-    var settings: FabricSettings { view?.settings ?? FabricDefaults.settings }
+    /// The settings as their device signed them (the defaults when nothing
+    /// is signed yet); never the server's JSON of them.
+    var settings: FabricSettings { signed.shown ?? FabricDefaults.settings }
     var fabrics: [FabricDefinition] { settings.fabrics }
+    /// Changed on another device since this phone last knew: what changed,
+    /// to look over and confirm before signing on top of it.
+    var review: [String]? {
+        if case .unconfirmed(_, _, _, let changes) = signed { return changes }
+        return nil
+    }
+    /// The saved settings can't be used (unreadable, or a forged signature of this phone's).
+    var problem: String? {
+        if case .invalid(let why) = signed { return why }
+        return nil
+    }
 
     func load() async {
         guard let service else { return }
         do {
             async let s = service.settings()
             async let p = service.projects()
-            view = try await s
+            apply(try await s)
             projects = (try? await p) ?? projects
             loadError = nil
         } catch {
@@ -48,7 +65,33 @@ final class FabricConfigStore {
 
     func take(_ v: FabricSettingsView) {
         guard (view?.version ?? 0) <= v.version else { return }
+        apply(v)
+    }
+
+    private var knownKey: String { "settings-known-\(fleet?.command.deviceID ?? "none")" }
+
+    private func apply(_ v: FabricSettingsView) {
         view = v
+        guard let me = try? fleet?.command.identity.current() else {
+            signed = v.signed == nil && v.version == 0 ? .defaults(FabricDefaults.settings) : .invalid("This phone's key can't be read.")
+            return
+        }
+        do {
+            signed = SignedSettings.open(v, me: me, known: try secrets.data(forKey: knownKey))
+        } catch {
+            signed = .invalid("What this phone last saw of your settings can't be read.")
+        }
+    }
+
+    /// The person looked over what another device changed: edits may build on it.
+    func confirmReview() {
+        guard case .unconfirmed(_, let payload, _, _) = signed, let view else { return }
+        do {
+            try secrets.set(payload, forKey: knownKey)
+            apply(view)
+        } catch {
+            signed = .invalid("Couldn't keep what you confirmed: \(error.localizedDescription)")
+        }
     }
 
     func take(_ p: FabricProject) {
@@ -58,9 +101,6 @@ final class FabricConfigStore {
     func take(_ p: FabricPairingView) {
         guard pairings[p.pairingID] != nil || codes[p.pairingID] != nil else { return }
         pairings[p.pairingID] = p
-        if p.state == .paired, let code = codes[p.pairingID] {
-            fleet?.command.trust.trust(code.runtimeID, key: code.runtimeKey)
-        }
     }
 
     // MARK: settings
@@ -69,18 +109,34 @@ final class FabricConfigStore {
     /// why not; a version another device saved first reloads and says so.
     func save(_ next: FabricSettings) async -> String? {
         guard let service, let command = fleet?.command else { return "Not connected." }
+        switch signed {
+        case .unconfirmed: return "Your settings were changed on another device. Look over what changed and confirm it first."
+        case .invalid(let why): return why
+        case .defaults, .trusted: break
+        }
         if let bad = Self.invalidPattern(next) { return bad }
         let version = (view?.version ?? 0) + 1
         do {
             let (_, body) = try command.commander().settings(next, version: version)
-            view = try await service.putSettings(body)
+            let saved = try await service.putSettings(body)
+            try secrets.set(body.payload, forKey: knownKey)
+            apply(saved)
             return nil
         } catch let e as FabricError where e.code == "stale_settings" {
             await load()
             return FabricWords.reason(e.code)
+        } catch let e as FabricError where e.code == "not_paired_everywhere" {
+            return FabricWords.notPairedEverywhere(unpairedMacs(), server: e.message)
         } catch {
             return FleetStore.describe(error)
         }
+    }
+
+    /// The Macs this phone is not paired with, by name, as the fleet has them:
+    /// settings go to every Mac, so the server refuses them until each knows this phone.
+    func unpairedMacs() -> [String] {
+        guard let fleet else { return [] }
+        return fleet.fleet.runtimes.filter { !fleet.command.isPaired(with: $0) }.map(\.name)
     }
 
     /// A pattern NSRegularExpression cannot compile (the runtime would
@@ -124,6 +180,8 @@ final class FabricConfigStore {
         }
         do {
             let sealed = try code.seal(with: try command.identity.current(), deviceName: deviceName)
+            // the code was read at the Mac itself: its key is the Mac's, kept now
+            try command.trust.trust(code.runtimeID, key: code.runtimeKey)
             codes[code.pairingID] = code
             let view = try await service.pair(runtimeID: code.runtimeID, pairingID: code.pairingID, sealed: sealed)
             take(view)

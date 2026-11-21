@@ -72,9 +72,12 @@ public struct FleetFollower: Sendable {
                     case .comment:
                         break
                     case .event(let event):
-                        if let fabric = try FabricStreamEvent.decode(event) {
-                            healthy = true
-                            emit(.event(fabric))
+                        if FabricStreamEvent.names.contains(event.event) {
+                            // one fabric event this app cannot read is skipped; the stream goes on
+                            if let fabric = try? FabricStreamEvent.decode(event) {
+                                healthy = true
+                                emit(.event(fabric))
+                            }
                             continue
                         }
                         guard let (change, rev) = try FleetChange.decode(event) else { continue }

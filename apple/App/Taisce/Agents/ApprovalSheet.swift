@@ -53,8 +53,11 @@ struct ApprovalSheet: View {
                         .font(.subheadline).foregroundStyle(Color.lapis.ink3)
                 }
                 switch verified {
-                case .success(let v):
+                case .success(let v) where v.kind == .approval:
                     verifiedBody(v, session: session, now: now)
+                case .success:
+                    // the Mac signed something else (a question, say): what it signed rules
+                    unverified(.wrongKind)
                 case .failure(let p):
                     unverified(p)
                 }

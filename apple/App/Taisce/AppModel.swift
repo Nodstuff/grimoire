@@ -240,6 +240,17 @@ final class AppModel {
         fleet.start() // Agents: the stream is foreground-only too; a server with no fleet says so once
     }
 
+    /// The app is leaving the front: replies held in their undo window go
+    /// now, under a background task so a suspension cannot strand one, then
+    /// sync stops. (A send the app was away past is never sent late: see
+    /// `CommandCenter.post`.)
+    func enterBackground() async {
+        let end = await Self.backgroundTask("agent sends")
+        await fleet.command.flush()
+        await end()
+        await stopSync()
+    }
+
     func stopSync() async {
         pollTask?.cancel()
         pollTask = nil

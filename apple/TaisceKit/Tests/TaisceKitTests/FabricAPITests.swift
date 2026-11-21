@@ -52,6 +52,20 @@ import Testing
         #expect(fleet.attention[0].signed == item.signed, "the signed bytes travel base64, byte for byte")
     }
 
+    @Test func aRuntimesConnectionDecodesAndASlice1OneReadsFromOnline() throws {
+        func runtime(_ extra: String) throws -> FleetRuntime {
+            try JSONDecoder().decode(FleetRuntime.self, from: Data("{\"id\":\"r\",\"name\":\"mbp\",\(extra)}".utf8))
+        }
+        #expect(try runtime(#""online":false,"connection":"idle""#).connection == .idle)
+        #expect(try runtime(#""online":true,"connection":"online""#).connection == .online)
+        #expect(try runtime(#""online":false,"connection":"offline""#).connection == .offline)
+        #expect(try runtime(#""online":true"#).connection == .online, "a Slice 1 server sends only online")
+        #expect(try runtime(#""online":false"#).connection == .offline)
+        #expect(try runtime(#""online":false,"connection":"napping""#).connection == .offline, "an unknown value reads as online says")
+        let back = try JSONDecoder().decode(FleetRuntime.self, from: try JSONEncoder().encode(try runtime(#""online":false,"connection":"idle""#)))
+        #expect(back.connection == .idle)
+    }
+
     @Test func turnsOrdersAndMessagesDecode() throws {
         let turn = try JSONDecoder().decode(FabricTurn.self, from: Data("""
         {"runtime_id":"r","session_id":"s","address":"taisce/main","turn_id":"t1","prompt":"Fix the heartbeat","reply":"Done.","tool_count":7,
@@ -190,9 +204,9 @@ import Testing
         let item = try Self.item(Self.approvalRequest(), text: "the hub's copy says something else")
         let verified = try VerifiedAttention.verify(item, trust: trust)
         #expect(verified.request.text == "./release.sh --notarize", "what is shown comes from the signed bytes")
-        let approve = verified.approve()
+        let approve = try verified.approve()
         #expect(approve.verb == .approve && approve.requestHash == Data(SHA256.hash(data: item.signed!.request)) && approve.requestID == item.id)
-        #expect(verified.deny(because: "not today").text == "not today")
+        #expect(try verified.deny(because: "not today").text == "not today")
         #expect(verified.lifetime(now: Date(timeIntervalSince1970: 1_795_000_000)) == 540)
 
         // not paired with that Mac: nothing to check against

@@ -21,6 +21,8 @@ targets:
     sources:
       - path: Taisce
         excludes: ["Resources/reladraw/**", "Resources/reader/**"]
+      # shared with the notification service extension (question buttons)
+      - path: Shared
       # reladraw is ES modules importing each other by relative path: a
       # folder reference keeps them together as reladraw/ in the bundle
       - path: Taisce/Resources/reladraw
@@ -120,6 +122,7 @@ targets:
     deploymentTarget: "26.0"
     sources:
       - NotificationService
+      - Shared
     info:
       path: NotificationService/Info.plist
       properties:

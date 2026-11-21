@@ -558,7 +558,8 @@ public struct FabricOrderView: Sendable, Hashable, Codable, Identifiable {
 }
 
 /// `POST /api/fabric/orders` and `PUT /api/fabric/settings`: a signed payload.
-public struct FabricSignedBody: Sendable, Hashable, Encodable {
+/// `GET /api/fabric/settings` gives the newest settings back the same way.
+public struct FabricSignedBody: Sendable, Hashable, Codable {
     public var payload: Data
     public var deviceID: String
     public var signature: Data
@@ -580,6 +581,16 @@ public struct FabricSignedBody: Sendable, Hashable, Encodable {
         try c.encode(payload.base64EncodedString(), forKey: .payload)
         try c.encode(deviceID, forKey: .deviceID)
         try c.encode(signature.base64EncodedString(), forKey: .signature)
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        guard let payload = Data(base64Encoded: try c.decode(String.self, forKey: .payload)),
+              let signature = Data(base64Encoded: try c.decode(String.self, forKey: .signature))
+        else { throw DecodingError.dataCorruptedError(forKey: .payload, in: c, debugDescription: "not base64") }
+        self.payload = payload
+        self.signature = signature
+        deviceID = try c.decode(String.self, forKey: .deviceID)
     }
 }
 
@@ -606,22 +617,28 @@ public struct FabricSettingsView: Sendable, Hashable, Codable {
     public var issuedAt: Int
     /// nothing has been signed yet: `settings` are the built-in defaults
     public var defaults: Bool
+    /// the server's JSON of them: display only. An edit starts from `signed`,
+    /// opened and checked (`SignedSettings`), never from this.
     public var settings: FabricSettings
     /// the version each runtime has in force
     public var runtimes: [RuntimeVersion]
+    /// the newest settings exactly as their device signed them; nil while
+    /// nothing has been signed
+    public var signed: FabricSignedBody?
 
-    public init(version: UInt64, issuedAt: Int = 0, defaults: Bool, settings: FabricSettings, runtimes: [RuntimeVersion] = []) {
+    public init(version: UInt64, issuedAt: Int = 0, defaults: Bool, settings: FabricSettings, runtimes: [RuntimeVersion] = [], signed: FabricSignedBody? = nil) {
         self.version = version
         self.issuedAt = issuedAt
         self.defaults = defaults
         self.settings = settings
         self.runtimes = runtimes
+        self.signed = signed
     }
 
     enum CodingKeys: String, CodingKey {
         case version
         case issuedAt = "issued_at"
-        case defaults, settings, runtimes
+        case defaults, settings, runtimes, signed
     }
 
     public init(from decoder: any Decoder) throws {
@@ -631,6 +648,7 @@ public struct FabricSettingsView: Sendable, Hashable, Codable {
         defaults = try c.value(.defaults, version == 0)
         settings = try c.value(.settings, FabricDefaults.settings)
         runtimes = try c.value(.runtimes, [])
+        signed = try c.decodeIfPresent(FabricSignedBody.self, forKey: .signed)
     }
 }
 
@@ -924,6 +942,9 @@ public enum FabricStreamEvent: Sendable, Hashable {
     case conversation(FabricConversation)
     case pairing(FabricPairingView)
     case project(FabricProject)
+
+    /// The stream event names these are sent under.
+    public static let names: Set<String> = ["turn", "attention", "attention_cleared", "order", "settings", "message", "conversation", "pairing", "project"]
 
     /// Nil for an event that is not one of these (a fleet event, or one
     /// this build has no name for); throws when a known one cannot be read.

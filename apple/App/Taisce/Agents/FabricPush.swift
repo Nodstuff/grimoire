@@ -13,11 +13,14 @@ import UserNotifications
 ///
 /// Approving is never a notification action: it must show the verified
 /// command and ask for Face ID, so "Review" opens the approval sheet.
-/// Denying, answering and the hub's choices work from the notification
-/// (each needs the phone unlocked). A question's own choices become
-/// buttons in `TaisceNotifications` (the service extension), which
-/// registers a category per question; without it (a push the server did
-/// not mark mutable) "Answer…" still takes words.
+/// Answering in words is not one either: the notification shows the
+/// server's text, so "Answer…" opens the app on the question the Mac
+/// signed. Denying, a question's choices and the hub's choices work from
+/// the notification (each needs the phone unlocked). A question's choices
+/// become buttons in `TaisceNotifications` (the service extension), which
+/// registers a category per question; each button is bound to the title
+/// it shows (`QuestionActions`) and answers only if that is the label the
+/// Mac signed.
 enum FabricPush {
     static let attentionKind = "fabric_attention"
     static let orderKind = "fabric_order"
@@ -38,9 +41,9 @@ enum FabricPush {
     enum Action {
         static let review = "fabric.review"
         static let deny = "fabric.deny"
-        static let answer = "fabric.answer"
-        /// `fabric.choice.<choice id>`
-        static let choicePrefix = "fabric.choice."
+        static let answer = QuestionActions.answer
+        /// `fabric.choice.<title tag>.<choice id>` (`QuestionActions`)
+        static let choicePrefix = QuestionActions.choicePrefix
         static let wake = "fabric.wake"
         static let wait = "fabric.wait"
         static let resume = "fabric.resume"
@@ -51,9 +54,8 @@ enum FabricPush {
     /// Every fabric category, for `setNotificationCategories` (beside To-dos').
     static var categories: [UNNotificationCategory] {
         let unlocked: UNNotificationActionOptions = [.authenticationRequired]
-        let answer = UNTextInputNotificationAction(identifier: Action.answer, title: "Answer\u{2026}", options: unlocked,
-                                                   icon: UNNotificationActionIcon(systemImageName: "text.bubble"),
-                                                   textInputButtonTitle: "Send", textInputPlaceholder: "Your answer")
+        let answer = UNNotificationAction(identifier: Action.answer, title: "Answer\u{2026}", options: [.foreground],
+                                          icon: UNNotificationActionIcon(systemImageName: "text.bubble"))
         let review = UNNotificationAction(identifier: Action.review, title: "Review", options: [.foreground],
                                           icon: UNNotificationActionIcon(systemImageName: "checkmark.shield"))
         let deny = UNNotificationAction(identifier: Action.deny, title: "Deny", options: unlocked.union(.destructive),
@@ -109,33 +111,60 @@ enum FabricPush {
     /// wrong (shown as a local notification: there is no screen).
     @MainActor static func act(_ p: Pointer, action: String, text: String?) async -> String? {
         guard let model else { return "Taisce isn't ready." }
-        if action == Action.review {
+        if action == Action.review || action == Action.answer {
             model.fleet.requestOpen(p)
             return nil
         }
         await model.connectIfNeeded()
-        let fleet = model.fleet
+        return await perform(p, action: action, in: model.fleet)
+    }
+
+    /// Whether a tap on `p` opens the approval sheet: only for an item its
+    /// Mac signed as an approval, whatever the push calls it. An item not
+    /// in the fleet yet (a cold launch) goes by the push's word, because the
+    /// sheet verifies before it shows anything and offers nothing to act on
+    /// unless the Mac signed an approval.
+    @MainActor static func opensApproval(_ p: Pointer, in fleet: FleetStore) -> Bool {
+        guard let id = p.itemID else { return false }
+        if let item = fleet.fleet.attention.first(where: { $0.id == id }) {
+            if let s = p.session, item.session != s { return false }
+            return fleet.command.verifiedKind(item) == .approval
+        }
+        return p.attentionKind == .approval
+    }
+
+    /// An action carried out against what the server has now, for `fleet`.
+    @MainActor static func perform(_ p: Pointer, action: String, in fleet: FleetStore) async -> String? {
+        if action == Action.review || action == Action.answer {
+            // both show what the Mac signed before anything is signed
+            fleet.requestOpen(p)
+            return nil
+        }
         if fleet.fleet.runtimes.isEmpty { await fleet.refresh() }
         await fleet.refreshAttention()
         guard let id = p.itemID, let item = fleet.fleet.attention.first(where: { $0.id == id }) else {
             return "That has already been dealt with."
         }
+        // the push's pointer, the server's item and (below) the signed request must agree
+        if let s = p.session, item.session != s { return "That notification doesn't match what your Mac has waiting." }
         switch action {
-        case Action.deny, Action.answer:
+        case Action.deny:
             switch fleet.command.verify(item) {
-            case .failure(let problem):
-                return FabricWords.problem(problem)
-            case .success(let v):
-                if action == Action.deny { return await fleet.command.deny(v) }
-                return await fleet.command.answer(v, words: text ?? "")
+            case .failure(let problem): return FabricWords.problem(problem)
+            case .success(let v): return await fleet.command.deny(v)
             }
         case let a where a.hasPrefix(Action.choicePrefix):
-            let choiceID = String(a.dropFirst(Action.choicePrefix.count))
+            guard let parsed = QuestionActions.parse(a) else { return "That choice isn't one it offered." }
+            let (tag, choiceID) = parsed
             switch fleet.command.verify(item) {
             case .failure(let problem): return FabricWords.problem(problem)
             case .success(let v):
-                // only a choice the Mac signed
+                // only a choice the Mac signed, and only if its label is what the button said
                 guard let choice = v.request.choices.first(where: { $0.id == choiceID }) else { return "That choice isn't one it offered." }
+                guard QuestionActions.tag(choice.label) == tag else {
+                    fleet.requestOpen(p)
+                    return "The notification's button didn't say what your Mac asked. Nothing was sent; it's open in Taisce."
+                }
                 return await fleet.command.answer(v, choice: choice)
             }
         case Action.wake, Action.resume:

@@ -112,6 +112,9 @@ enum ComposerMode: Equatable {
     case asleep
     /// the Mac is away: it will get the words when it wakes
     case offline
+    /// the Mac is awake but its runtime closed its stream (no sessions):
+    /// the words wait at the server until it connects again
+    case idle
     /// Hold all is on
     case held
     /// exited
@@ -125,7 +128,7 @@ enum ComposerMode: Equatable {
         case .working, .stalled, .waitingOnPeer: self = .queue
         default: self = s.queue.isEmpty ? .reply : .queue
         }
-        if self == .reply || self == .queue, !(runtime?.online ?? false) { self = .offline }
+        if self == .reply || self == .queue, !(runtime?.online ?? false) { self = runtime?.connection == .idle ? .idle : .offline }
     }
 
     var placeholder: String {
@@ -134,12 +137,13 @@ enum ComposerMode: Equatable {
         case .queue: "Queue a message"
         case .asleep: "Resume it to reply"
         case .offline: "Your Mac is asleep: it gets this when it wakes"
+        case .idle: "Your Mac's runtime is closed: it gets this when it connects"
         case .held: "Hold all is on"
         case .gone: "This session has exited"
         }
     }
 
-    var canType: Bool { self == .reply || self == .queue || self == .offline }
+    var canType: Bool { self == .reply || self == .queue || self == .offline || self == .idle }
     /// a send queues behind whatever runs rather than being refused when the turn moved on
     var queues: Bool { self == .queue }
 }

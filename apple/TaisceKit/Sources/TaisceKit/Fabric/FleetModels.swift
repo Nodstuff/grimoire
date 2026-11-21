@@ -208,6 +208,17 @@ public struct FleetAccount: Sendable, Hashable, Codable {
     }
 }
 
+/// How a runtime's stream stands (ADR 0008 §11). None of the three alerts.
+public enum FleetConnection: String, Sendable, Hashable, Codable {
+    /// its stream is up
+    case online
+    /// its last stream ended because the runtime closed it: the Mac is awake
+    /// with nothing to report (Workbox closes when its last session is gone)
+    case idle
+    /// it dropped, went silent, the hub ended it, or it never connected
+    case offline
+}
+
 /// An enrolled runtime: a program hosting Claude sessions on a machine
 /// (Workbox on a Mac).
 public struct FleetRuntime: Sendable, Hashable, Codable, Identifiable {
@@ -216,6 +227,9 @@ public struct FleetRuntime: Sendable, Hashable, Codable, Identifiable {
     public var createdAt: Int
     /// its stream to the server is up right now
     public var online: Bool
+    /// online, idle (the Mac closed cleanly) or offline; a Slice 1 server
+    /// sends only `online`, read as online or offline
+    public var connection: FleetConnection
     /// when its stream was last up (now, while it is); nil = it has never connected
     public var lastSeenAt: Int?
     public var version: String
@@ -234,12 +248,13 @@ public struct FleetRuntime: Sendable, Hashable, Codable, Identifiable {
     /// the devices paired with it at the Mac
     public var devices: [FabricPairedDevice]
 
-    public init(id: String, name: String, createdAt: Int = 0, online: Bool, lastSeenAt: Int? = nil, version: String = "", accounts: [FleetAccount] = [], accountsAt: Int? = nil,
+    public init(id: String, name: String, createdAt: Int = 0, online: Bool, connection: FleetConnection? = nil, lastSeenAt: Int? = nil, version: String = "", accounts: [FleetAccount] = [], accountsAt: Int? = nil,
                 held: Bool = false, heldSince: Int? = nil, settingsVersion: UInt64 = 0, present: Bool = false, publicKey: Data? = nil, devices: [FabricPairedDevice] = []) {
         self.id = id
         self.name = name
         self.createdAt = createdAt
         self.online = online
+        self.connection = connection ?? (online ? .online : .offline)
         self.lastSeenAt = lastSeenAt
         self.version = version
         self.accounts = accounts
@@ -253,7 +268,7 @@ public struct FleetRuntime: Sendable, Hashable, Codable, Identifiable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, online, version, accounts
+        case id, name, online, connection, version, accounts
         case createdAt = "created_at"
         case lastSeenAt = "last_seen_at"
         case accountsAt = "accounts_at"
@@ -271,6 +286,8 @@ public struct FleetRuntime: Sendable, Hashable, Codable, Identifiable {
         name = try c.value(.name, "")
         createdAt = try c.value(.createdAt, 0)
         online = try c.value(.online, false)
+        // an unknown value from a newer server reads as `online` says
+        connection = try c.decodeIfPresent(String.self, forKey: .connection).flatMap(FleetConnection.init(rawValue:)) ?? (online ? .online : .offline)
         lastSeenAt = try c.decodeIfPresent(Int.self, forKey: .lastSeenAt)
         version = try c.value(.version, "")
         accounts = try c.value(.accounts, [])
@@ -311,7 +328,8 @@ public struct Fleet: Sendable, Hashable, Codable {
         rev = try c.value(.rev, 0)
         runtimes = try c.value(.runtimes, [])
         sessions = try c.value(.sessions, [])
-        attention = try c.value(.attention, [])
+        // one item this app cannot read is left out, never the fleet with it
+        attention = try c.decodeIfPresent(LossyList<FabricAttentionItem>.self, forKey: .attention)?.items ?? []
     }
 
     public func session(_ key: FleetSessionKey) -> FleetSession? { sessions.first { $0.key == key } }
@@ -425,5 +443,27 @@ extension FleetChange {
         if case .fleet(let fleet) = change { return (change, fleet.rev) }
         guard let rev = event.id.flatMap(Int.init) else { throw APIError.decoding("fleet event without a rev") }
         return (change, rev)
+    }
+}
+
+/// A JSON array read element by element: one that does not decode is
+/// skipped (a newer server's item, or one malformed), the rest kept.
+struct LossyList<Element: Decodable>: Decodable {
+    var items: [Element] = []
+
+    /// any value at all: read past, kept nowhere
+    private struct Skip: Decodable {
+        init(from decoder: any Decoder) throws {}
+    }
+
+    init(from decoder: any Decoder) throws {
+        var c = try decoder.unkeyedContainer()
+        while !c.isAtEnd {
+            if let item = try? c.decode(Element.self) {
+                items.append(item)
+            } else {
+                _ = try c.decode(Skip.self)
+            }
+        }
     }
 }

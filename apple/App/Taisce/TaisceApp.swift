@@ -28,7 +28,7 @@ struct TaisceApp: App {
                 guard !AppPaths.isTestHost else { return }
                 switch phase {
                 case .active: await model.startSync()
-                case .background: await model.stopSync()
+                case .background: await model.enterBackground()
                 default: break
                 }
             }

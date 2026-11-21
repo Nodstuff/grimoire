@@ -58,16 +58,14 @@ struct AgentSessionScreen: View {
             store.sessionOnScreen(nil)
             feed.looked()
         }
-        .onChange(of: scenePhase) { _, phase in
-            // leaving the app: what is held goes now rather than never
-            if phase == .background { Task { await command.flush() } }
-        }
-        .task(id: session?.state) {
-            // finished and looked at: tell the Mac (FINISHED becomes IDLE)
-            if session?.state == .finished, runtime?.online == true, command.isPaired(with: runtime!) {
-                try? await Task.sleep(for: .seconds(2))
-                await command.command(.seen, key)
-            }
+        .task(id: scenePhase) {
+            // the person opened it (or came back to it) and it had finished:
+            // tell the Mac it was seen (FINISHED becomes IDLE). Only on their
+            // looking, never because the server reported a state.
+            guard scenePhase == .active, session?.state == .finished, let runtime, runtime.online, command.isPaired(with: runtime) else { return }
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, scenePhase == .active, session?.state == .finished else { return }
+            await command.command(.seen, key)
         }
         .confirmationDialog("Clear the conversation?", isPresented: $confirmClear, titleVisibility: .visible) {
             Button("Clear", role: .destructive) { act { await command.command(.clear, key) } }
@@ -81,7 +79,8 @@ struct AgentSessionScreen: View {
     private func content(_ s: FleetSession, now: Date) -> some View {
         let header = SessionHeader(s, runtime: runtime, now: now)
         let items = store.fleet.attention(for: key)
-        let question = items.first { $0.kind == .question }
+        // what each item is comes from what the Mac signed, never the server's kind
+        let question = items.first { command.verifiedKind($0) == .question }
         let mode = ComposerMode(s, runtime: runtime)
         return ScrollViewReader { proxy in
             ScrollView {
@@ -90,8 +89,8 @@ struct AgentSessionScreen: View {
                     if let runtime, !command.isPaired(with: runtime) { pairNote(runtime) }
                     if runtime?.held == true { heldBanner }
                     if !s.queuePaused.isEmpty { pausedBanner(s) }
-                    ForEach(items.filter { $0.kind != .question }) { item in
-                        AttentionCard(item: item, onOpen: { router.approval = AttentionRef(id: item.id) })
+                    ForEach(items.filter { $0.id != question?.id }) { item in
+                        AttentionCard(item: item, verifiedKind: command.verifiedKind(item), onOpen: { router.approval = AttentionRef(id: item.id) })
                     }
                     if feed.more {
                         Button { Task { await feed.loadOlder(store.fabricService) } } label: {
@@ -431,6 +430,29 @@ struct UndoCard: View {
     let onUndo: () -> Void
 
     var body: some View {
+        if pending.lapsed { lapsed } else { counting }
+    }
+
+    /// The app was away past its moment: not sent; back into the box to send again.
+    private var lapsed: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Not sent: the app was away when it was due")
+                    .font(.caption.weight(.semibold)).foregroundStyle(Color.lapis.red)
+                Text(pending.text).font(.subheadline).foregroundStyle(Color.lapis.ink).lineLimit(2)
+            }
+            Spacer(minLength: 0)
+            Button("Edit", action: onUndo)
+                .buttonStyle(.lapis(.secondary, size: .small))
+                .accessibilityIdentifier("session.lapsed.edit")
+        }
+        .padding(12)
+        .background(Color.lapis.card, in: .rect(cornerRadius: Lapis.Radius.card, style: .continuous))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("session.lapsed")
+    }
+
+    private var counting: some View {
         TimelineView(.periodic(from: .now, by: 0.5)) { context in
             let left = max(0, Int(pending.deadline.timeIntervalSince(context.date).rounded(.up)))
             HStack(spacing: 10) {
@@ -457,6 +479,9 @@ struct UndoCard: View {
 /// a dialog or tamper says what to do at the Mac.
 struct AttentionCard: View {
     let item: FabricAttentionItem
+    /// what the Mac signed it as (nil: a hub item, or a runtime's that did
+    /// not verify); only a verified approval can be reviewed
+    var verifiedKind: AttentionKind?
     var onOpen: () -> Void = {}
 
     var body: some View {
@@ -467,16 +492,20 @@ struct AttentionCard: View {
             }
             if !item.text.isEmpty {
                 Text(item.text)
-                    .font(item.kind == .approval ? .system(.callout, design: .monospaced) : .body)
+                    .font(kind == .approval ? .system(.callout, design: .monospaced) : .body)
                     .foregroundStyle(Color.lapis.ink)
                     .lineLimit(4)
             }
-            if item.kind == .approval {
+            if verifiedKind == .approval {
                 Button("Review", systemImage: "checkmark.shield", action: onOpen)
                     .buttonStyle(.lapis(.primary, size: .small))
                     .accessibilityIdentifier("attention.review")
-            } else if item.kind == .dialog || item.kind == .tamper {
-                Text(item.kind == .dialog ? "Claude Code is showing a dialog that needs you at the Mac." : "Its hooks were switched off, so it is held. Deal with it at the Mac.")
+            } else if item.source == .runtime, verifiedKind == nil {
+                Text("Not verified against your Mac's key: nothing to act on here.")
+                    .font(.caption).foregroundStyle(Color.lapis.ink3)
+                    .accessibilityIdentifier("attention.unverified")
+            } else if kind == .dialog || kind == .tamper {
+                Text(kind == .dialog ? "Claude Code is showing a dialog that needs you at the Mac." : "Its hooks were switched off, so it is held. Deal with it at the Mac.")
                     .font(.caption).foregroundStyle(Color.lapis.ink3)
             }
         }
@@ -484,12 +513,24 @@ struct AttentionCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(tone.soft, in: .rect(cornerRadius: Lapis.Radius.card, style: .continuous))
         .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("attention.\(item.kind.rawValue)")
+        .accessibilityIdentifier("attention.\(kind.rawValue)")
     }
 
-    private var tone: LapisTone { item.kind == .tamper ? .red : .yellow }
+    /// A runtime's item is what its Mac signed it as; the hub's says itself.
+    private var kind: FabricAttentionKind {
+        guard item.source == .runtime else { return item.kind }
+        switch verifiedKind {
+        case .approval?: return .approval
+        case .question?: return .question
+        case .dialog?: return .dialog
+        case .tamper?: return .tamper
+        default: return .unknown
+        }
+    }
+
+    private var tone: LapisTone { kind == .tamper ? .red : .yellow }
     private var symbol: String {
-        switch item.kind {
+        switch kind {
         case .approval: "checkmark.shield"
         case .dialog: "macwindow"
         case .tamper: "exclamationmark.octagon"
@@ -497,7 +538,7 @@ struct AttentionCard: View {
         }
     }
     private var title: String {
-        switch item.kind {
+        switch kind {
         case .approval: "WANTS APPROVAL" + (item.guardrailLabel.isEmpty ? "" : " \u{00B7} \(item.guardrailLabel.uppercased())")
         case .dialog: "A DIALOG AT THE MAC"
         case .tamper: "HELD: HOOKS SWITCHED OFF"
