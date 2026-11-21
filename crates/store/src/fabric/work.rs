@@ -642,6 +642,7 @@ impl SqliteStore {
     /// `only_from`, only from one of those states (None when it was in
     /// another). `drop_text` forgets the text and the signed bytes (Text
     /// off, once the runtime has them or they are dead).
+    #[allow(clippy::too_many_arguments)] // one row's state, as the hub decides it
     pub fn fabric_order_set(
         &mut self,
         runtime: Uuid,

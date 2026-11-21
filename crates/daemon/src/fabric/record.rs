@@ -579,11 +579,10 @@ impl Hub {
                     }
                 }
             }
-            Some(pb::result::Subject::SettingsVersion(v)) => {
-                if outcome == pb::Outcome::Refused || outcome == pb::Outcome::Failed {
-                    tracing::warn!(runtime = %runtime, version = v, reason = r.reason, "fabric: a runtime refused the settings");
-                }
+            Some(pb::result::Subject::SettingsVersion(v)) if matches!(outcome, pb::Outcome::Refused | pb::Outcome::Failed) => {
+                tracing::warn!(runtime = %runtime, version = v, reason = r.reason, "fabric: a runtime refused the settings");
             }
+            Some(pb::result::Subject::SettingsVersion(_)) => {}
             None => {}
         }
         Ok(())
@@ -923,7 +922,7 @@ impl Hub {
     /// The newest signed settings, when a runtime holds an older version.
     pub(super) async fn settings_for(&self, user: Uuid, runtime_version: u64) -> Option<(u64, pb::Signed)> {
         let held = with_store(&self.0.store, Scope::User(user), |s| s.fabric_settings()).await.ok().flatten()?;
-        (held.version > runtime_version).then(|| (held.version, pb::Signed { payload: held.payload, device_id: held.device_id, signature: held.signature }))
+        (held.version > runtime_version).then_some((held.version, pb::Signed { payload: held.payload, device_id: held.device_id, signature: held.signature }))
     }
 
     /// A pairing offer from the person's phone, for one of their runtimes.
@@ -1182,7 +1181,7 @@ pub fn settings_json(s: &pb::Settings) -> Result<Value, Reject> {
         }
         fabrics.push(json!({"id": f.id, "name": f.name, "purpose": f.purpose, "doc_id": f.doc_id, "doc_title": f.doc_title}));
     }
-    let l = s.limits.clone().unwrap_or_default();
+    let l = s.limits.unwrap_or_default();
     let or = |v: u32, d: u32| if v == 0 { d } else { v };
     Ok(json!({
         "version": s.version,

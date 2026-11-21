@@ -322,14 +322,8 @@ macro_rules! gated {
 
 /// A JSON body, read after the gate: whoever may not use the route is told
 /// so whatever they sent.
-fn body<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T, Response> {
-    serde_json::from_slice(bytes).map_err(|e| {
-        let mut r = error(StatusCode::BAD_REQUEST, format!("{what}: {e}"));
-        if let Ok(v) = serde_json::to_value(json!({"error": format!("{what}: {e}"), "code": "malformed"})) {
-            r = (StatusCode::BAD_REQUEST, Json(v)).into_response();
-        }
-        r
-    })
+fn body<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T, Reject> {
+    serde_json::from_slice(bytes).map_err(|e| super::record::reject(400, "malformed", format!("{what}: {e}")))
 }
 
 async fn follow(State(st): State<FabricState>, v: Viewer, headers: HeaderMap, Path((runtime, session)): Path<(Uuid, Uuid)>) -> Response {
@@ -400,7 +394,7 @@ async fn submit_order(State(st): State<FabricState>, v: Viewer, headers: HeaderM
     let (hub, user) = gated!(st, v, headers);
     let signed: SignedJson = match body(&bytes, "body: {payload, device_id, signature}") {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => return rejected(r),
     };
     match hub.submit_order(user, signed, crate::auth::now()).await {
         Ok((order, true)) => (StatusCode::ACCEPTED, Json(json!({"order": order}))).into_response(),
@@ -446,7 +440,7 @@ async fn put_settings(State(st): State<FabricState>, v: Viewer, headers: HeaderM
     let (hub, user) = gated!(st, v, headers);
     let signed: SignedJson = match body(&bytes, "body: {payload, device_id, signature}") {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => return rejected(r),
     };
     match hub.put_settings(user, signed, crate::auth::now()).await {
         Ok(view) => Json(view).into_response(),
@@ -509,7 +503,7 @@ async fn put_project(State(st): State<FabricState>, v: Viewer, headers: HeaderMa
     let (hub, user) = gated!(st, v, headers);
     let req: ProjectReq = match body(&bytes, "body: {text_off?, private_notifications?}") {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => return rejected(r),
     };
     if name.is_empty() || name.len() > 200 {
         return error(StatusCode::BAD_REQUEST, "name: 1-200 bytes");
@@ -531,7 +525,7 @@ async fn offer_pairing(State(st): State<FabricState>, v: Viewer, headers: Header
     let (hub, user) = gated!(st, v, headers);
     let req: PairingReq = match body(&bytes, "body: {runtime_id, pairing_id, sealed}") {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => return rejected(r),
     };
     match hub.offer_pairing(user, req.runtime_id, &req.pairing_id, &req.sealed, crate::auth::now()).await {
         Ok(p) => (StatusCode::ACCEPTED, Json(p)).into_response(),
