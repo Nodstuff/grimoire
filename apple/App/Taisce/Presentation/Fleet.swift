@@ -128,13 +128,20 @@ struct FleetRow: Identifiable, Hashable {
     var contextNearlyFull: Bool
     /// "Snoozed until 09:00"
     var snoozed: String?
+    /// what waits on you from it: "Wants approval · Release and deploy scripts"
+    var waiting: String?
+    /// the open item behind `waiting` (an approval opens its sheet)
+    var waitingItem: FabricAttentionItem?
+    /// prompts queued for it
+    var queued: Int
 
     var id: FleetSessionKey { session.key }
     var tone: LapisTone { offline ? .neutral : session.state.tone }
 
-    init(_ s: FleetSession, offline: Bool, now: Date, calendar: Calendar = .current, locale: Locale = .current) {
+    init(_ s: FleetSession, offline: Bool, now: Date, calendar: Calendar = .current, locale: Locale = .current, attention: [FabricAttentionItem] = []) {
         session = s
         self.offline = offline
+        queued = s.queue.count
         var parts = [s.state.words]
         if s.state == .working, !s.tool.isEmpty { parts.append(s.tool) }
         // how long it has been so; of a Mac that is away, only what was last known
@@ -155,11 +162,27 @@ struct FleetRow: Identifiable, Hashable {
         meta = m.isEmpty ? nil : m.joined(separator: " \u{00B7} ")
         contextNearlyFull = (s.contextUsedPct ?? 0) >= Self.contextWarnAt
         snoozed = s.isSnoozed(at: now) ? s.quietUntil.map { "Snoozed until \(FleetTime.clock($0, now: now, calendar: calendar, locale: locale))" } : nil
+        // the runtime's items first (an approval outranks a question), newest first
+        let item = attention.first { $0.kind == .approval } ?? attention.first { $0.kind == .question } ?? attention.first
+        waitingItem = item
+        if let item {
+            switch item.kind {
+            case .approval: waiting = "Wants approval" + (item.guardrailLabel.isEmpty ? "" : " \u{00B7} \(item.guardrailLabel)")
+            case .question: waiting = "Asks you"
+            case .dialog: waiting = "A dialog at the Mac"
+            case .tamper: waiting = "Held: hooks switched off"
+            case .wakeOffer: waiting = "Mail waiting \u{00B7} wake it?"
+            case .askWaiting: waiting = "Asked while asleep"
+            case .pairPaused: waiting = "Paused talking"
+            case .unknown: waiting = nil
+            }
+            if !item.text.isEmpty { detail = item.text }
+        }
     }
 
     /// What VoiceOver reads for the row.
     var spoken: String {
-        [session.address, status, detail, meta, snoozed].compactMap { $0 }.joined(separator: ", ")
+        [session.address, status, waiting, detail, meta, snoozed, queued > 0 ? "\(queued) queued" : nil].compactMap { $0 }.joined(separator: ", ")
     }
 }
 
@@ -252,6 +275,10 @@ struct FleetBoard: Hashable {
     var headroom: [FleetHeadroom] = []
     var rows: [FleetRow] = []
     var resting: [FleetRow] = []
+    /// the fabrics sessions are in, for the filter (named ones and projects' own)
+    var fabrics: [String] = []
+    /// a Mac has Hold all on
+    var held = false
 
     /// no runtime is enrolled
     var hasNoRuntime: Bool { runtimes.isEmpty }
@@ -262,7 +289,10 @@ struct FleetBoard: Hashable {
     init(_ fleet: Fleet, now: Date, calendar: Calendar = .current, locale: Locale = .current) {
         runtimes = fleet.runtimes.map { FleetRuntimeNote($0, now: now, calendar: calendar, locale: locale) }
         let online = Set(fleet.runtimes.filter(\.online).map(\.id))
-        let all = fleet.sessions.map { FleetRow($0, offline: !online.contains($0.runtimeID), now: now, calendar: calendar, locale: locale) }
+        let all = fleet.sessions.map { FleetRow($0, offline: !online.contains($0.runtimeID), now: now, calendar: calendar, locale: locale, attention: fleet.attention(for: $0.key)) }
+        var seen = Set<String>()
+        fabrics = fleet.sessions.map { $0.fabric.isEmpty ? $0.project : $0.fabric }.filter { !$0.isEmpty && seen.insert($0).inserted }
+        held = fleet.runtimes.contains(where: \.held)
         rows = all.filter { !$0.session.state.isResting }
         resting = all.filter { $0.session.state.isResting }
         // an account "has running sessions" while one of an online runtime's is not at rest
@@ -279,6 +309,16 @@ struct FleetBoard: Hashable {
         }
         headroom = latest.values.sorted { $0.order < $1.order }
             .map { FleetHeadroom($0.account, running: running.contains($0.account.name), now: now, calendar: calendar, locale: locale) }
+    }
+
+    /// Only the sessions in `fabric` (nil: all).
+    func only(_ fabric: String?) -> FleetBoard {
+        guard let fabric else { return self }
+        var b = self
+        let keep: (FleetRow) -> Bool = { ($0.session.fabric.isEmpty ? $0.session.project : $0.session.fabric) == fabric }
+        b.rows = rows.filter(keep)
+        b.resting = resting.filter(keep)
+        return b
     }
 
     /// "2 need you · 3 working", for the header. A snoozed session is

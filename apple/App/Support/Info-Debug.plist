@@ -44,6 +44,10 @@
 			</dict>
 		</dict>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Taisce reads the pairing code your Mac shows, to pair this device with it.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Taisce asks for Face ID before it lets an agent run something your guardrails hold.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Taisce connects to your server on this network.</string>
 	<key>UIBackgroundModes</key>

@@ -119,7 +119,11 @@ struct RootView: View {
         .onChange(of: scenePhase) { openFleetSessionIfFront() }
         .onChange(of: model.authPhase) { openFleetSessionIfFront() }
         // sign-out or another account: nothing queued for the last one survives
-        .onChange(of: model.authPhase) { router.docAction = nil }
+        .onChange(of: model.authPhase) { router.docAction = nil; router.approval = nil }
+        // an agent's approval, over whatever is showing (a row, a session, a notification)
+        .sheet(item: Binding(get: { router.approval }, set: { router.approval = $0 })) { ref in
+            ApprovalSheet(itemID: ref.id).environment(model).environment(router)
+        }
         // ADR 0004: an unshared doc closes, with a gentle note
         .onChange(of: model.revocation) { _, r in
             guard let r, router.drop(r.docs) else { return }
@@ -251,6 +255,10 @@ struct RouteView: View {
         case .book(let id): BookDetail(id: id).id(id)
         case .bookReader(let id): BookReaderScreen(bookID: id).id(id)
         case .agents: AgentsScreen()
+        case .agentSession(let key): AgentSessionScreen(key: key).id(key)
+        case .talk: TalkScreen()
+        case .conversation(let id): ConversationScreen(id: id).id(id)
+        case .agentSettings: FabricSettingsScreen()
         }
     }
 }

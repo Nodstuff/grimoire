@@ -2,8 +2,9 @@ import SwiftUI
 import TaisceKit
 
 /// Agents: the fleet of Claude sessions the person's runtimes report (Agent
-/// Fabric, Slice 1: Watch), by how much each needs them. Nothing here
-/// commands a session; the one action is snoozing its notifications.
+/// Fabric), by how much each needs them. A row opens its session; Talk
+/// shows the agents' conversations; Hold all stops every Mac taking
+/// anything but its release; a swipe snoozes a session's notifications.
 ///
 /// The list holds still while it is on screen: a change redraws a row where
 /// it stands. The server's order comes back on a pull to refresh and each
@@ -15,6 +16,7 @@ struct AgentsScreen: View {
     @State private var appeared = false
     @State private var presence = FleetScreenPresence()
     @State private var toast: ToastMessage?
+    @State private var confirmHold = false
 
     private var store: FleetStore { model.fleet }
     private var inFront: Bool { appeared && scenePhase == .active }
@@ -31,8 +33,21 @@ struct AgentsScreen: View {
                 focus: $router.agentsFocus,
                 onSnooze: { key, option in act { await store.snooze(key, option) } },
                 onUnsnooze: { key in act { await store.unsnooze(key) } },
-                onRetry: { Task { await store.refresh() } }
+                onRetry: { Task { await store.refresh() } },
+                talkWaiting: store.talk.waiting,
+                onHold: { on in if on { confirmHold = true } else { act { await store.command.hold(false) } } },
+                onReview: { item in router.approval = AttentionRef(id: item.id) }
             )
+        }
+        .confirmationDialog("Hold all?", isPresented: $confirmHold, titleVisibility: .visible) {
+            Button("Hold all", role: .destructive) { act { await store.command.hold(true) } }
+        } message: {
+            Text("Every Mac stops taking commands and typing queued prompts until you release it. Running turns finish.")
+        }
+        .onChange(of: store.command.notice) { _, notice in
+            guard let notice else { return }
+            toast = ToastMessage(text: notice.text, tone: notice.isError ? .error : .neutral)
+            store.command.notice = nil
         }
         .refreshable { await store.refresh() }
         .lapisToast($toast)
@@ -70,8 +85,13 @@ struct AgentsContent: View {
     var onSnooze: (FleetSessionKey, FleetSnooze) -> Void = { _, _ in }
     var onUnsnooze: (FleetSessionKey) -> Void = { _ in }
     var onRetry: () -> Void = {}
+    /// what Talk asks you to settle
+    var talkWaiting = 0
+    var onHold: (Bool) -> Void = { _ in }
+    var onReview: (FabricAttentionItem) -> Void = { _ in }
 
     @State private var showResting = false
+    @State private var fabric: String?
     @State private var snoozing: FleetRow?
     @State private var marked: FleetSessionKey?
 
@@ -96,7 +116,21 @@ struct AgentsContent: View {
         .groundBackground()
         .navigationTitle("Agents")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar { ToolbarItem(placement: .principal) { Color.clear.frame(width: 1, height: 1).accessibilityHidden(true) } }
+        .toolbar {
+            ToolbarItem(placement: .principal) { Color.clear.frame(width: 1, height: 1).accessibilityHidden(true) }
+            if availability == .available, !board.hasNoRuntime {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(board.held ? "Release" : "Hold all", systemImage: board.held ? "play.circle" : "hand.raised") { onHold(!board.held) }
+                        .tint(board.held ? Color.lapis.accent : Color.lapis.red)
+                        .accessibilityIdentifier("agents.hold")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    NavigationLink(value: Route.agentSettings) { Image(systemName: "gearshape") }
+                        .accessibilityLabel("Agent settings")
+                        .accessibilityIdentifier("agents.settings")
+                }
+            }
+        }
     }
 
     private func list(loading: Bool) -> some View {
@@ -123,6 +157,8 @@ struct AgentsContent: View {
                             .accessibilityIdentifier("agents.empty.noRuntime")
                     }
                 } else {
+                    if board.held { heldBanner }
+                    talkAndFilter
                     status
                     if board.hasNoSessions {
                         Section {
@@ -211,6 +247,52 @@ struct AgentsContent: View {
         .padding(.top, 10)
     }
 
+    private var heldBanner: some View {
+        Section {
+            LapisBanner(text: "Hold all is on: your Macs take nothing but its release.", tone: .yellow, symbol: "hand.raised.fill",
+                        actionTitle: "Release", action: { onHold(false) })
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.clear)
+                .accessibilityIdentifier("agents.held")
+        }
+    }
+
+    /// Talk, with what it asks you to settle; the fabric filter.
+    @ViewBuilder private var talkAndFilter: some View {
+        Section {
+            NavigationLink(value: Route.talk) {
+                HStack(spacing: 12) {
+                    Image(systemName: "bubble.left.and.bubble.right")
+                        .foregroundStyle(Color.lapis.agent)
+                        .frame(width: 24)
+                    Text("Talk").font(.subheadline.weight(.semibold)).foregroundStyle(Color.lapis.ink)
+                    Text("agents asking each other").font(.caption).foregroundStyle(Color.lapis.ink3)
+                    Spacer(minLength: 0)
+                    CountPill(n: talkWaiting, tone: .attention, label: "\(talkWaiting) waiting for you")
+                }
+                .frame(minHeight: 44)
+            }
+            .listRowBackground(Color.lapis.card)
+            .accessibilityIdentifier("agents.talk")
+        }
+        if board.fabrics.count > 1 {
+            Section {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        FilterChip(title: "All", selected: fabric == nil) { fabric = nil }
+                        ForEach(board.fabrics, id: \.self) { f in
+                            FilterChip(title: f, selected: fabric == f) { fabric = fabric == f ? nil : f }
+                                .accessibilityIdentifier("agents.fabric.\(f)")
+                        }
+                    }
+                    .padding(.horizontal, 4)
+                }
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.clear)
+            }
+        }
+    }
+
     /// Which Mac is awake, and each account's headroom.
     @ViewBuilder private var status: some View {
         Section {
@@ -230,6 +312,7 @@ struct AgentsContent: View {
     }
 
     @ViewBuilder private var sessions: some View {
+        let board = board.only(fabric)
         if !board.rows.isEmpty {
             Section {
                 ForEach(board.rows) { row in sessionRow(row) }
@@ -268,8 +351,10 @@ struct AgentsContent: View {
     }
 
     private func sessionRow(_ row: FleetRow) -> some View {
-        FleetRowView(row: row)
-            .listRowInsets(EdgeInsets())
+        NavigationLink(value: Route.agentSession(row.id)) {
+            FleetRowView(row: row)
+        }
+            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 12))
             .listRowBackground(marked == row.id ? Color.lapis.accentSoft : Color.lapis.card)
             .listRowSeparatorTint(Color.lapis.line2)
             .id(row.id)
@@ -281,6 +366,9 @@ struct AgentsContent: View {
                 }
             }
             .contextMenu {
+                if let item = row.waitingItem, item.kind == .approval {
+                    Button("Review approval", systemImage: "checkmark.shield") { onReview(item) }
+                }
                 if row.snoozed == nil {
                     Menu("Snooze notifications", systemImage: "bell.slash") {
                         ForEach(FleetSnooze.allCases, id: \.self) { option in Button(option.title()) { onSnooze(row.id, option) } }
@@ -322,14 +410,20 @@ struct FleetRowView: View {
                 FlowRow(spacing: 6) {
                     StatusChip(text: row.status, tone: row.tone)
                         .accessibilityIdentifier("agents.state.\(row.session.address)")
+                    if let waiting = row.waiting {
+                        StatusChip(text: waiting, tone: row.waitingItem?.kind == .tamper ? .red : .yellow, symbol: "hand.raised")
+                    }
                     if let snoozed = row.snoozed {
                         StatusChip(text: snoozed, tone: .neutral, symbol: "bell.slash")
                             .accessibilityIdentifier("agents.snoozed.\(row.session.address)")
                     }
+                    if row.queued > 0 {
+                        StatusChip(text: "\(row.queued) queued", tone: .accent, symbol: "text.append")
+                    }
                 }
                 if let detail = row.detail {
                     Text(detail)
-                        .font(.subheadline)
+                        .font(row.waitingItem?.kind == .approval ? .system(.subheadline, design: .monospaced) : .subheadline)
                         .foregroundStyle(Color.lapis.ink2)
                         .lineLimit(typeSize.isAccessibilitySize ? 6 : 3)
                 }

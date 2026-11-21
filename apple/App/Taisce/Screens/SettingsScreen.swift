@@ -27,7 +27,8 @@ struct SettingsScreen: View {
                 },
                 onRotate: { e in Task { await readers.rotateAndShow(e, api: model.api, server: model.serverURL, username: model.home.profileName) } },
                 onRemove: { e in Task { await readers.removeReporting(e, api: model.api) } },
-                onRevoke: { t in Task { await readers.revokeReporting(t, api: model.api) } }
+                onRevoke: { t in Task { await readers.revokeReporting(t, api: model.api) } },
+                showsAgents: model.fleet.isLoaded
             )
             .task { await model.dueAlerts.refresh() }
             .task { if model.shareLinks.isAvailable { try? await model.shareLinks.loadAll() } }
@@ -131,6 +132,8 @@ struct SettingsContent: View {
     var onRotate: (DevicePasswordReader) -> Void = { _ in }
     var onRemove: (DevicePasswordReader) -> Void = { _ in }
     var onRevoke: (UploadTokenInfo) -> Void = { _ in }
+    /// the server has a fleet: Settings › Agents
+    var showsAgents = false
     @AppStorage(UserSettings.appearanceKey) private var appearance = LapisAppearance.system.rawValue
     @AppStorage(DocTextSize.key) private var textSize = DocTextSize.actual
 
@@ -155,6 +158,20 @@ struct SettingsContent: View {
 
             if let readers, readers.phase != .unavailable {
                 ReaderSections(readers: readers, now: now, onRotate: onRotate, onRemove: onRemove)
+            }
+
+            if showsAgents {
+                Section {
+                    NavigationLink {
+                        FabricSettingsScreen()
+                    } label: {
+                        Label { Text("Agents") } icon: { SettingsTile(symbol: "sparkle", fill: Color.lapis.agent) }
+                    }
+                    .accessibilityIdentifier("settings.agents")
+                } footer: {
+                    Text("Pair this phone with your Macs; guardrails, limits and fabrics; Text off per project.")
+                }
+                .listRowBackground(Color.lapis.card)
             }
 
             Section {

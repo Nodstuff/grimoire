@@ -19,6 +19,13 @@ enum Route: Hashable {
     /// the fleet of Claude sessions (Today's Agents card on a phone, whose
     /// tab bar is full; the sidebar's Agents elsewhere)
     case agents
+    /// one session: its turns, what waits, the reply box
+    case agentSession(FleetSessionKey)
+    /// agents talking to each other, and one conversation
+    case talk
+    case conversation(String)
+    /// Settings › Agents (pairing, guardrails, fabrics), reached from Agents too
+    case agentSettings
 }
 
 /// A book to open in the reader (`Router.readingBook`).
@@ -100,6 +107,8 @@ final class Router {
     /// a session Agents should bring into view (a tapped notification); the
     /// screen clears it once shown
     var agentsFocus: FleetSessionKey?
+    /// an approval to show over everything (a row, a session, a notification)
+    var approval: AttentionRef?
 
     var padItem: PadItem? = .today
     /// the shelf Books shows on iPad and the Mac (the sidebar's Shelves and Series rows)
@@ -205,7 +214,7 @@ final class Router {
         case .todos?: .todos
         case .review?: .review
         case .book?, .bookReader?: .books
-        case .agents?: .agents
+        case .agents?, .agentSession?, .talk?, .conversation?, .agentSettings?: .agents
         case nil: padItem
         }
     }
@@ -253,6 +262,30 @@ final class Router {
             todayPath = [.agents]
         }
         if let focus { agentsFocus = focus }
+    }
+
+    /// One session's screen, over Agents.
+    func showAgentSession(_ key: FleetSessionKey) {
+        if isPad {
+            if padPath.last != .agentSession(key) {
+                select(.agents)
+                padPath = [.agentSession(key)]
+            }
+        } else {
+            tab = .today
+            todayPath = [.agents, .agentSession(key)]
+        }
+    }
+
+    /// Talk, over Agents.
+    func showTalk() {
+        if isPad {
+            select(.agents)
+            padPath = [.talk]
+        } else {
+            tab = .today
+            todayPath = [.agents, .talk]
+        }
     }
 
     /// The book open in the reader, full screen over the window (iPad and
@@ -431,6 +464,7 @@ final class Router {
         case "search": tab = .search; padItem = .search
         case "books": tab = .books; padItem = .books
         case "agents": showAgents()
+        case "talk": showTalk()
         case "review": showReview()
         default: break
         }

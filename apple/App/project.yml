@@ -99,6 +99,9 @@ targets:
         # Debug builds use Support/Info-Debug.plist, this plus the
         # loopback exception for scratch daemons; keep the two in step.
         NSLocalNetworkUsageDescription: Taisce connects to your server on this network.
+        # Agents: scanning the pairing code a Mac shows
+        NSCameraUsageDescription: Taisce reads the pairing code your Mac shows, to pair this device with it.
+        NSFaceIDUsageDescription: Taisce asks for Face ID before it lets an agent run something your guardrails hold.
         # APNs: silent content-available pushes wake the app for one catch-up
         UIBackgroundModes: [remote-notification]
         # Lapis type: Newsreader (OFL, Resources/Fonts), two variable fonts
