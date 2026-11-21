@@ -26,7 +26,9 @@ public enum FleetSignal: Sendable {
 /// reconnects the way `SyncEngine` does (the server's `retry:` is the
 /// floor; a connection that delivered anything starts the backoff over).
 /// There is no cursor: a new connection's fleet replaces what was held. A
-/// 404 means there is no fleet here and ends the following.
+/// 404 means there is no fleet here and ends the following. So does a 401
+/// that renewing the token did not cure: the session is over, and whoever
+/// follows starts again after the next sign-in.
 public struct FleetFollower: Sendable {
     let service: any FleetService
     let backoff: Backoff
@@ -62,7 +64,6 @@ public struct FleetFollower: Sendable {
             var healthy = false
             do {
                 for try await output in service.fleetStream() {
-                    healthy = true
                     switch output {
                     case .retry(let ms):
                         serverRetry = .milliseconds(ms)
@@ -70,6 +71,9 @@ public struct FleetFollower: Sendable {
                         break
                     case .event(let event):
                         guard let (change, rev) = try FleetChange.decode(event) else { continue }
+                        // only what could be read counts: a stream that opens with
+                        // something unreadable backs off, it does not spin
+                        healthy = true
                         emit(.change(change, rev: rev))
                         if case .fleet = change { emit(.link(.live)) }
                     }
@@ -80,6 +84,10 @@ public struct FleetFollower: Sendable {
             } catch APIError.http(status: 404), APIError.notAPIRoute, APIError.notFound {
                 emit(.link(.unavailable))
                 return
+            } catch APIError.unauthorized {
+                // the token was renewed once and refused again: not ours to retry
+                emit(.failed(APIError.unauthorized))
+                break
             } catch {
                 if Task.isCancelled { break }
                 emit(.failed(error))

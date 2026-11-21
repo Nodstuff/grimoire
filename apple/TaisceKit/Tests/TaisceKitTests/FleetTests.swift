@@ -42,7 +42,7 @@ import Testing
             FleetAccount(name: "work", sessionUsedPct: 92, weekUsedPct: 70),
         ])
         #expect(mac.accounts[0].sessionResetsAt == nil && mac.accounts[0].weekResetsAt == nil)
-        #expect(fleet.attentionCount == 1)
+        #expect(fleet.attentionCount(at: .distantPast) == 1)
     }
 
     @Test func aRuntimeThatNeverConnectedAndOneThatWentAway() throws {
@@ -53,7 +53,7 @@ import Testing
         let away = try Self.decode(Fleet.self, FleetFixture.offline)
         #expect(away.runtimes[0].online == false && away.runtimes[0].lastSeenAt == 1_795_213_871)
         // its sessions are still listed, as last known; none of them counts as needing you now
-        #expect(away.sessions.count == 3 && away.attentionCount == 0)
+        #expect(away.sessions.count == 3 && away.attentionCount() == 0)
         let snoozed = away.sessions[2]
         #expect(snoozed.quietUntil == 1_795_217_471)
         #expect(snoozed.isSnoozed(at: Date(timeIntervalSince1970: 1_795_217_470)))
@@ -261,5 +261,33 @@ import Testing
         #expect(failures.count == 5)
         #expect(Self.changes(signals).count == 1)
         #expect(Self.links(signals).last == .idle)
+    }
+
+    @Test func aStreamThatOpensWithSomethingUnreadableBacksOff() async throws {
+        // a 200 whose first event cannot be read, every time: never "healthy", so the wait grows
+        let server = MockServer { _ in .sse("retry: 10\n\n", ": ping\n\n", "id: 1\nevent: fleet\ndata: {\"rev\":\"one\"}\n\n") }
+        let (signals, sleeps) = await Self.follow(server, stopAfter: 4)
+        #expect(sleeps == [.seconds(1), .seconds(2), .seconds(4), .seconds(8)])
+        #expect(Self.changes(signals).isEmpty && !Self.links(signals).contains(.live))
+    }
+
+    @Test func aSessionThatIsOverEndsTheFollowing() async throws {
+        // 401, with no token to renew: the following ends; it is not retried
+        let server = MockServer { _ in MockServer.Reply(status: 401, chunks: [Data(#"{"error":"invalid_token","code":"unauthorized"}"#.utf8)]) }
+        let (signals, sleeps) = await Self.follow(server, stopAfter: 5)
+        #expect(Self.links(signals) == [.connecting, .idle])
+        #expect(sleeps.isEmpty && server.requests.count == 1)
+        let failed = signals.contains { if case .failed(let e) = $0 { (e as? APIError) == .unauthorized } else { false } }
+        #expect(failed)
+    }
+
+    @Test func aSnoozedSessionDoesNotCountAsNeedingYou() throws {
+        var fleet = try Self.decode(Fleet.self, FleetFixture.live)
+        let now = Date(timeIntervalSince1970: 1_795_213_900)
+        #expect(fleet.attentionCount(at: now) == 1)
+        fleet.sessions[0].quietUntil = 1_795_217_471
+        #expect(fleet.attentionCount(at: now) == 0 && fleet.sessions.count == 3, "still listed, no longer counted")
+        // once its time has passed it counts again
+        #expect(fleet.attentionCount(at: Date(timeIntervalSince1970: 1_795_217_471)) == 1)
     }
 }

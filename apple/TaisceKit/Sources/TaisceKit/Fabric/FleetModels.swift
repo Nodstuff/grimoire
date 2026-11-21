@@ -204,11 +204,12 @@ public struct Fleet: Sendable, Hashable, Codable {
 
     public func runtime(_ id: String) -> FleetRuntime? { runtimes.first { $0.id == id } }
 
-    /// Sessions waiting on their person or stuck, on a runtime that is
-    /// online (an offline runtime's are only what was last known).
-    public var attentionCount: Int {
+    /// Sessions waiting on their person or stuck at `now`: on a runtime
+    /// that is online (an offline runtime's are only what was last known),
+    /// and not snoozed (a snooze says "I know; stop telling me").
+    public func attentionCount(at now: Date = .now) -> Int {
         let online = Set(runtimes.filter(\.online).map(\.id))
-        return sessions.count { $0.state.wantsAttention && online.contains($0.runtimeID) }
+        return sessions.count { $0.state.wantsAttention && online.contains($0.runtimeID) && !$0.isSnoozed(at: now) }
     }
 }
 
