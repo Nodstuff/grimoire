@@ -1076,11 +1076,59 @@ exchange is the app's own. `BooksUITests` documents its `TEST_RUNNER_…`
 variables (daemon, relay, a first-party token, a paired e-reader's KOReader
 login). `-tab books` opens Books and `-readBook <id>` a book's reader.
 
+## Agents (SERVER mode, Agent Fabric Slice 1: Watch)
+
+The fleet of Claude sessions a person's runtimes report (ADR 0007,
+`crates/daemon/src/fabric/`). Watch only: nothing here commands a session; the
+one write is a session's snooze. A LOCAL daemon (or a server without Agent
+Fabric) answers the routes 404, and Agents says "Agents live on your Taisce
+server" instead of erroring.
+
+- **Kit** (`TaisceKit/Fabric/`): `Fleet`, `FleetSession`, `FleetRuntime`,
+  `FleetAccount`, `SessionState` (a state this build has no name for decodes as
+  `.unknown`; percentages and reset times may be null). `APIClient` conforms to
+  `FleetService`: `GET /api/fabric/sessions`, `…/runtimes`, the SSE
+  `…/stream`, `POST` / `DELETE …/sessions/{runtime}/{session}/snooze`.
+  `FleetFollower` keeps the stream: each connection opens with the whole
+  fleet (no cursor), reconnects back off as `SyncEngine`'s do, a 404 ends it.
+- **Order**: the server sorts by attention (needs you, stalled, finished,
+  waiting on a peer, working, then idle, asleep, exited) and the app never
+  sorts. `Fleet.apply` replaces a changed session where it stands and puts a
+  new one last, so a row never moves under a thumb; the server's order comes
+  back on a pull to refresh and whenever the screen comes to the front.
+- **Screen** (`Taisce/Agents/`, view models in `Presentation/Fleet.swift`):
+  per runtime "Mac awake" or "Mac asleep since 12:41" (an offline runtime's
+  rows are dimmed and say "last known"); each account's headroom, warned at
+  90% used with sessions running on it; a row per session (address, state in
+  words and tone, tool and time in state, the question or last line, account,
+  branch, context, warned at 85%); idle, asleep and exited folded under a
+  count. Empty states: no fleet here, no runtime enrolled (`taisce fabric
+  runtime add`), no sessions.
+- **Where**: the sidebar on iPad and the Mac (its count is the sessions that
+  need you), Go › Agents, the actions palette. On iPhone a card at the top of
+  Today pushes `Route.agents`: the tab bar holds five, and a sixth tab folds
+  Search into "More".
+- **State**: `FleetStore` on `AppModel.fleet`, followed while the app is in
+  front (started and stopped with sync); nothing on disk; sign-out forgets it.
+- **Snooze**: swipe a row or its context menu: for an hour, or until 09:00
+  tomorrow. The server holds the notifications back (an app cannot take back
+  a visible push); the row stays, with "Snoozed until …". Unsnooze the same way.
+- **Push**: the server's alert push `{"kind":"fabric_session","session_id",
+  "runtime_id","state"}`, title the address and body the state, grouped by the
+  server's `thread-id`. A tap (`FabricSessionPush`) opens Agents with that
+  session in view and marked; while Agents is in front the notification is
+  not presented.
+- Tests: `FleetTests` (kit: JSON and SSE recorded from a scratch daemon,
+  `FleetFixture`), `FleetTests` (app: view models, the store against a fake
+  service, routes, push), `FleetUITests` against `FleetStubServer`, a
+  stand-in server inside the runner (no daemon to start; skipped on the Mac,
+  whose runner is sandboxed). `-tab agents` opens Agents.
+
 ## Running the app against a scratch daemon
 
 Launch arguments (UserDefaults' argument domain) make screenshots and UI
 runs reproducible: `-serverURL http://127.0.0.1:7517`, `-tab
-today|library|books|todos|search|review`, `-openDoc "<title>"`, `-searchQuery <text>`,
+today|library|books|todos|search|review|agents`, `-openDoc "<title>"`, `-searchQuery <text>`,
 `-showSettings YES`, and on a doc `-showInspector YES` / `-editDoc YES`
 (`-openDoc` on iPhone opens it in the Library tab). For example
 `xcrun simctl launch booted ie.null.taisce -serverURL http://127.0.0.1:7517 -openDoc "Roadmap"`.
