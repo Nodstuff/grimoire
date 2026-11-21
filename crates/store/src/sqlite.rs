@@ -78,6 +78,19 @@ impl SqliteStore {
         }
         // v15: a share link's sub-pages (shares.sql): which page a comment is on
         add_column_if_missing(&conn, "share_link_comments", "page", "TEXT")?;
+        // ADR 0008, on a v16 database from before Slices 2-5 (fabric.sql
+        // documents each column)
+        add_column_if_missing(&conn, "fabric_runtimes", "status", "TEXT NOT NULL DEFAULT '{}'")?;
+        add_column_if_missing(&conn, "fabric_runtimes", "ended_clean", "INTEGER NOT NULL DEFAULT 0")?;
+        for (col, decl) in [
+            ("following", "INTEGER NOT NULL DEFAULT 0"),
+            ("fabric_id", "TEXT NOT NULL DEFAULT ''"),
+            ("turn_id", "TEXT NOT NULL DEFAULT ''"),
+            ("queue", "TEXT NOT NULL DEFAULT '[]'"),
+            ("queue_paused", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            add_column_if_missing(&conn, "fabric_sessions", col, decl)?;
+        }
         backfill(&conn)?;
         Ok(Self { conn, scope: Scope::System })
     }
@@ -579,8 +592,10 @@ fn backfill(conn: &Connection) -> Result<()> {
     // doc-purge trigger, created IF NOT EXISTS by init; the comments' `page`
     // column, added by init when missing). Nothing to backfill: every
     // existing link is a single-doc link and its comments are on the root.
-    // v16: Agent Fabric (fabric.sql: fabric_runtimes, fabric_sessions).
-    // Created IF NOT EXISTS by init; nothing to backfill.
+    // v16: Agent Fabric (fabric.sql: fabric_runtimes, fabric_sessions, and
+    // for ADR 0008 the turns, attention, orders, settings, projects,
+    // pairings, conversations and messages tables). Created IF NOT EXISTS
+    // by init, the later columns added when missing; nothing to backfill.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())

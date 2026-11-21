@@ -16,11 +16,14 @@
 //   1. Up{hello}      within 10 seconds of opening the stream
 //   2. Down{welcome}
 //   3. Up{snapshot}   the first message after the Hello, always
-//   4. Up{accounts}, Up{runtime}
+//   4. the runtime's outbox: every durable Up event (below) numbered above
+//      Welcome.last_up_seq, in order, before any new event. It comes before
+//      step 5 because `accounts` and `runtime` are events too: one numbered
+//      above a replayed event and sent first would make the hub treat the
+//      replay as already seen and drop it.
+//   5. Up{accounts}, Up{runtime}
 //                     the latest headroom and the runtime's own status,
 //                     again, on every new stream
-//   5. the runtime's outbox: every durable Up event (below) numbered above
-//      Welcome.last_up_seq, in order, before any new event
 //   6. anything, as it happens, and Ack in both directions
 // The hub sends its Down events (orders, settings, pairing offers, nudges)
 // only after the Snapshot.
@@ -177,7 +180,8 @@ service Runtime {
   //   UNAVAILABLE         this runtime has no Attach stream open, or the
   //                       hub could not reach its store: retry with the
   //                       same call_id
-  //   RESOURCE_EXHAUSTED  more than 16 calls in flight for this runtime
+  //   RESOURCE_EXHAUSTED  more than 16 calls in flight for this runtime, or
+  //                       more than 60 at once then 10 a second: back off
   //   UNAUTHENTICATED     as for Attach
   // What an agent should hear (a paused pair, a bounced address) is a
   // reply, not a status.
@@ -933,8 +937,9 @@ message PairingClaim {
 
 message CallRequest {
   // A UUID. A retry after a lost answer sends the same id, and the hub
-  // returns the first answer instead of acting twice (it remembers ids for
-  // 10 minutes), so a retried `send` posts one message.
+  // returns the first answer instead of acting twice (it remembers `send`
+  // and `inbox_ack` ids for 10 minutes; `who` and `inbox` are answered
+  // fresh), so a retried `send` posts one message.
   string call_id = 1;
   // The calling session, as SessionState.session_id. The hub refuses a
   // session this runtime has not reported (NOT_FOUND).
@@ -982,12 +987,35 @@ message Peer {
   // The runtime is not connected: the session cannot be woken now.
   bool offline = 8;
   bool me = 9;
+  // The last paragraph of its latest reply (SessionState.last_line), so a
+  // sender can see it reached the session it meant. Empty under Text off.
+  string last_line = 10;
 }
 
-// `send`: a message to one address, or a `note` to every member of a
-// fabric (`to` is then the fabric's name).
+// `send`: a message to one session, or a `note` to every member of a
+// fabric.
+//
+// HOW A RECEIVER IS FOUND, never by guessing:
+//   1. `reply_to` set: the receiver is the session that sent that message,
+//      by its id. `to` is ignored. The message must have been sent to the
+//      caller (else NO_SUCH_MESSAGE).
+//   2. `to` containing `/`: an address, matched exactly (no prefix, no
+//      case folding, no fuzzy match) against the live sessions of the
+//      owner's fleet. One match: that session. Several (two runtimes
+//      reporting the same address): AMBIGUOUS. Only an exited session:
+//      RECEIVER_EXITED. None: NO_SUCH_ADDRESS. The last three store
+//      nothing and list `candidates`.
+//   3. Otherwise `to` is a fabric's name, matched exactly: a `note` to
+//      each member but the caller (any other kind is refused,
+//      NOT_A_NOTE). No such fabric: NO_SUCH_ADDRESS, with candidates.
+// Every receiver is a session of the same person's fleet. No address,
+// fabric or message id ever resolves to another person's session.
+// A message is bound to the receiver's session id from then on: if the
+// address is later reused by another session, the message does not follow
+// it.
 message SendRequest {
-  // An address (`project/worktree[:n]`) or a fabric's name. 1–200 bytes.
+  // An address (`project/worktree[:n]`) or a fabric's name; may be empty
+  // when `reply_to` is set. At most 200 bytes.
   string to = 1;
   MessageKind kind = 2;
   // At most 8,000 characters (Unicode scalar values). Point at a doc;
@@ -996,9 +1024,9 @@ message SendRequest {
   // A Taisce doc the message is about (a UUID or a title). At most 200
   // bytes.
   string doc = 4;
-  // REPLY: the message id of the ask it answers. The reply goes to that
-  // ask's sender, whatever `to` says.
-  string in_reply_to = 5;
+  // The message id this answers or follows up. Required for REPLY (and
+  // then it must name an ASK). Routes by id, as above.
+  string reply_to = 5;
 }
 
 enum MessageKind {
@@ -1010,44 +1038,58 @@ enum MessageKind {
   // The answer to one ask.
   MESSAGE_KIND_REPLY = 3;
   // From the hub: a message of the sender's that could not be delivered.
-  // Its body says which and why; `in_reply_to` names it.
+  // Its body says which and why; `reply_to` names it.
   MESSAGE_KIND_BOUNCE = 4;
 }
 
 message SendReply {
-  // One per receiver (several for a note to a fabric; none when nobody
-  // was found).
+  // One per receiver (several for a note to a fabric); one with no
+  // message id when nothing was stored.
   repeated Sent sent = 1;
+  // AMBIGUOUS, RECEIVER_EXITED, NO_SUCH_ADDRESS: the sessions the caller
+  // may have meant, so it can choose by exact address. Every live session
+  // matching the address's project/worktree without the `:n`, then every
+  // one in the same project; empty when none. At most 20.
+  repeated Peer candidates = 2;
 }
 
 message Sent {
-  // Empty when nothing was stored (NO_SUCH_ADDRESS).
+  // Empty when nothing was stored.
   string message_id = 1;
-  string to_address = 2;
-  string to_session_id = 3;
-  Delivery delivery = 4;
-  // The receiver's state now, so the sender knows whether to wait.
-  SessionStatus receiver_state = 5;
-  bool receiver_offline = 6;
+  // Where it landed, resolved: session id, address, project, branch,
+  // state and last line now, so the sender can see it reached the session
+  // it meant and whether to wait. Unset when nothing was stored.
+  Peer recipient = 2;
+  Delivery delivery = 3;
   // Words the agent can act on ("paused: 12 messages between you without
-  // Tom; he has been asked").
-  string detail = 7;
+  // Tom; he has been asked", "two sessions have that address: see
+  // candidates").
+  string detail = 4;
 }
 
 enum Delivery {
   DELIVERY_UNSPECIFIED = 0;
   // Stored, and the receiver's runtime is nudged (or will be when it
-  // connects).
+  // connects). An asleep receiver's mail waits; the sender sees its state.
   DELIVERY_QUEUED = 1;
   // Stored, held: this pair has reached the pair limit and the owner has
   // been asked. Delivered if they say continue, bounced if stop.
   DELIVERY_PAUSED = 2;
-  // Not stored: no session has that address or fabric name.
+  // Not stored: no live session has that address, and no fabric that
+  // name.
   DELIVERY_NO_SUCH_ADDRESS = 3;
   // Not stored: the receiver has 100 unread messages.
   DELIVERY_INBOX_FULL = 4;
-  // Not stored: `in_reply_to` names no ask sent to the caller.
-  DELIVERY_NO_SUCH_ASK = 5;
+  // Not stored: `reply_to` names no message sent to the caller, or a
+  // REPLY's `reply_to` is not an ask.
+  DELIVERY_NO_SUCH_MESSAGE = 5;
+  // Not stored: several live sessions have that address.
+  DELIVERY_AMBIGUOUS = 6;
+  // Not stored: the only session with that address has exited.
+  DELIVERY_RECEIVER_EXITED = 7;
+  // Not stored: an ask or a reply addressed to a fabric. Only a note goes
+  // to a whole fabric.
+  DELIVERY_NOT_A_NOTE = 8;
 }
 
 // `inbox`: the caller's unread messages, oldest first. Does not mark them
@@ -1063,15 +1105,27 @@ message InboxReply {
   uint32 more = 2;
 }
 
+// One message, as `inbox` returns it. The caller only ever gets mail whose
+// receiver is its own session id. The runtime hands a message to the
+// session only as this tool result, labelled with its sender: never typed
+// into a pane, never through a hook.
 message Mail {
   string message_id = 1;
+  // The sender, as it was when it sent: its address then and its session
+  // id, which a REPLY routes back to.
   string from_address = 2;
   string from_session_id = 3;
   MessageKind kind = 4;
   string body = 5;
   string doc = 6;
-  string in_reply_to = 7;
+  string reply_to = 7;
   int64 sent_at = 8;
+  // The receiver the hub resolved: the caller's own session id. The
+  // runtime checks it before handing the message over.
+  string to_session_id = 9;
+  // The address the sender wrote (`to`), or the fabric's name for a note
+  // to a fabric; empty for a reply routed by id.
+  string to = 10;
 }
 
 // `inbox_ack`: these messages reached the session. Their text is deleted at

@@ -11,10 +11,16 @@
 //!
 //! `--script <file>` plays a JSON script (an array of steps, see
 //! `taisce_runtime_proto::fake::Step`; the default is `demo-script.json`
-//! beside this file). `--instance <id>` names the launch (default: a new id
-//! each run). `--token` falls back to `TAISCE_RUNTIME_TOKEN`. Unless the
-//! script ends with `"disconnect"`, the runtime stays connected, sending
-//! heartbeats, until it is killed. Never point this at a real server.
+//! beside this file; `demo-work-script.json` plays Slices 2-5: turns, an
+//! approval, a question, agents messaging). `--instance <id>` names the
+//! launch (default: a new id each run); the same id keeps the same signing
+//! key. `--pair` prints a pairing code first (`--hub-host` goes in it).
+//! `--token` falls back to `TAISCE_RUNTIME_TOKEN`. Unless the script ends
+//! with `"disconnect"`, the runtime stays connected until it is killed,
+//! answering what comes down as a runtime does: orders checked and
+//! answered (a `send` played back as a turn), settings taken, pairing
+//! offers confirmed as if at the Mac, mail read when nudged. Never point
+//! this at a real server.
 
 use std::time::Duration;
 use taisce_runtime_proto::fake::{Fake, parse_script};
@@ -56,21 +62,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "connected as runtime {} (instance {instance}); the hub has events up to {}",
         fake.welcome.runtime_id, fake.welcome.last_up_seq
     );
+    if std::env::args().any(|a| a == "--pair") {
+        let host = arg("--hub-host").unwrap_or_else(|| "taisce.example".into());
+        eprintln!("pairing code (10 minutes):\n{}", fake.pairing_code(&host));
+    }
     if fake.play(&steps).await? {
         eprintln!("script disconnected after event {}", fake.seq());
         return Ok(());
     }
-    eprintln!("script played ({} events); staying connected — Ctrl-C to hang up", fake.seq());
-    let every = Duration::from_secs(u64::from(fake.welcome.heartbeat_secs.max(1)));
+    eprintln!("script played ({} events); staying connected, answering what comes down — Ctrl-C to hang up", fake.seq());
     loop {
-        tokio::select! {
-            ended = fake.ended() => {
-                match ended {
-                    Some(status) => return Err(format!("the hub ended the stream: {:?}: {}", status.code(), status.message()).into()),
-                    None => return Ok(()),
-                }
-            }
-            _ = tokio::time::sleep(every) => fake.heartbeat().await?,
+        if let Err(e) = fake.serve_for(Duration::from_secs(3600)).await {
+            return match fake.ended().await {
+                Some(status) => Err(format!("the hub ended the stream: {:?}: {}", status.code(), status.message()).into()),
+                None => Err(e.into()),
+            };
         }
     }
 }

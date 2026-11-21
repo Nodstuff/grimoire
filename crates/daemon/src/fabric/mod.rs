@@ -22,9 +22,16 @@ pub mod grpc;
 pub mod hub;
 #[cfg(test)]
 mod hub_tests;
+pub mod down;
+pub mod mail;
+pub mod record;
 pub mod routes;
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+pub(crate) mod phone;
+#[cfg(test)]
+mod work_e2e;
 pub mod view;
 
 use crate::auth::AUDIT;
@@ -106,8 +113,71 @@ pub fn runtime_lines(store: &SqliteStore) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
-/// What a session alert says on a lock screen: which session, and what it
-/// came to. Never the session's text (a last line can quote a file).
+/// A fabric alert as a push.
 pub fn alert_push(a: &SessionAlert) -> crate::push::Push {
-    crate::push::Push::FabricSession { address: a.address.clone(), kind: a.kind, session_id: a.session_id, runtime_id: a.runtime_id }
+    crate::push::Push::Fabric(Box::new(a.clone()))
+}
+
+/// APNs caps a collapse id at 64 bytes.
+fn collapse(id: String) -> String {
+    let mut id = id;
+    while id.len() > 64 {
+        id.pop();
+    }
+    id
+}
+
+/// One session's state alerts replace each other; a finished turn among
+/// several is the one "N finished" line; each attention item and each
+/// refused order is its own.
+pub fn alert_collapse_id(a: &SessionAlert) -> String {
+    match a.kind {
+        AlertKind::Finished if !a.finished.is_empty() => "fabric:finished".into(),
+        AlertKind::NeedsYou | AlertKind::Stalled | AlertKind::Finished => format!("fabric:{}", a.session_id),
+        AlertKind::OrderRefused => collapse(format!("fabric:order:{}", a.order_id.as_deref().unwrap_or_default())),
+        _ => collapse(format!("fabric:{}", a.request_id.clone().unwrap_or_else(|| a.session_id.to_string()))),
+    }
+}
+
+/// What an alert says (ADR 0008 §10). A preview only when the hub gave one
+/// (never under private notifications); the app fetches and verifies
+/// anything it acts on.
+pub fn alert_payload(a: &SessionAlert) -> serde_json::Value {
+    use serde_json::json;
+    let summary = a.kind == AlertKind::Finished && !a.finished.is_empty();
+    let (title, body) = if summary {
+        (format!("{} finished", a.finished.len()), a.finished.join(", "))
+    } else {
+        (a.address.clone(), a.preview.clone().unwrap_or_else(|| a.kind.words().to_string()))
+    };
+    let mut aps = json!({
+        "alert": {"title": title, "body": body},
+        "thread-id": format!("fabric:{}", a.session_id),
+        "category": a.kind.category(),
+    });
+    if summary {
+        aps["interruption-level"] = json!("passive");
+    } else {
+        aps["sound"] = json!("default");
+    }
+    let mut v = json!({"aps": aps, "session_id": a.session_id, "runtime_id": a.runtime_id});
+    match a.kind {
+        AlertKind::NeedsYou | AlertKind::Stalled | AlertKind::Finished => {
+            v["kind"] = json!("fabric_session");
+            v["state"] = json!(a.kind);
+        }
+        AlertKind::OrderRefused => {
+            v["kind"] = json!("fabric_order");
+            v["order_id"] = json!(a.order_id);
+        }
+        _ => {
+            v["kind"] = json!("fabric_attention");
+            v["attention_kind"] = json!(a.kind);
+            v["request_id"] = json!(a.request_id);
+            if a.kind == AlertKind::Question && a.choices.as_array().is_some_and(|c| !c.is_empty()) {
+                v["choices"] = a.choices.clone();
+            }
+        }
+    }
+    v
 }

@@ -30,25 +30,7 @@ fn setup() -> T {
 }
 
 fn session(t: &T, id: Uuid, address: &str, state: SessionStatus, now: i64) -> FabricSession {
-    FabricSession {
-        runtime_id: t.rt.id,
-        id,
-        user_id: t.user,
-        address: address.into(),
-        fabric: String::new(),
-        project: String::new(),
-        worktree: String::new(),
-        branch: String::new(),
-        account: String::new(),
-        state,
-        tool: String::new(),
-        note: String::new(),
-        last_line: String::new(),
-        context_used_pct: None,
-        since: now,
-        updated_at: now,
-        quiet_until: None,
-    }
+    FabricSession::blank(t.rt.id, id, t.user, address, state, now)
 }
 
 impl T {
@@ -102,7 +84,7 @@ async fn a_change_of_state_is_written_at_once_and_anything_else_waits_for_the_fl
     t.state(&c, 4, session(&t, id, "taisce/main", SessionStatus::NeedsYou, 110), 110).await.unwrap();
     let stored = t.stored(id).unwrap();
     assert_eq!((stored.state, stored.tool.as_str()), (SessionStatus::NeedsYou, ""));
-    t.hub.disconnect(t.user, t.rt.id, c.conn, 120).await;
+    t.hub.disconnect(t.user, t.rt.id, c.conn, 120, false).await;
     assert_eq!(t.stored_runtime().last_up_seq, 4);
 }
 
@@ -160,7 +142,7 @@ async fn a_snapshot_replaces_the_picture_and_outranks_older_events() {
     t.state(&c, 1, session(&t, a, "p/a", SessionStatus::Working, 100), 100).await.unwrap();
     t.state(&c, 2, session(&t, b, "p/b", SessionStatus::Working, 100), 100).await.unwrap();
     // the stream drops; the runtime reconnects as the same launch
-    t.hub.disconnect(t.user, t.rt.id, c.conn, 110).await;
+    t.hub.disconnect(t.user, t.rt.id, c.conn, 110, false).await;
     assert_eq!(t.stored_runtime().last_seen_at, Some(110));
     let c = t.hub.connect(&t.rt, "launch-1", "1.0", 120).await.unwrap();
     assert_eq!(c.last_up_seq, 2, "the same launch resumes after the last event taken");
@@ -178,7 +160,7 @@ async fn a_snapshot_replaces_the_picture_and_outranks_older_events() {
     t.state(&c, 6, session(&t, a, "p/a", SessionStatus::NeedsYou, 140), 140).await.unwrap();
     assert_eq!(t.stored(a).unwrap().state, SessionStatus::Idle);
     // a new launch numbers from 1 again
-    t.hub.disconnect(t.user, t.rt.id, c.conn, 150).await;
+    t.hub.disconnect(t.user, t.rt.id, c.conn, 150, false).await;
     let c = t.hub.connect(&t.rt, "launch-2", "1.1", 160).await.unwrap();
     assert_eq!(c.last_up_seq, 0);
     t.hub.apply(t.user, t.rt.id, c.conn, Incoming::Snapshot { replaces_seq: 0, sessions: vec![] }, 160).await.unwrap();
@@ -203,10 +185,10 @@ async fn the_newest_stream_is_the_live_one() {
     let id = Uuid::now_v7();
     // the old stream can no longer write, and its end changes nothing
     assert!(matches!(t.state(&old, 1, session(&t, id, "p/a", SessionStatus::Working, 1), 102).await, Err(Refused::NotLive)));
-    t.hub.disconnect(t.user, t.rt.id, old.conn, 103).await;
+    t.hub.disconnect(t.user, t.rt.id, old.conn, 103, false).await;
     assert!(t.hub.fleet(t.user).await.unwrap().runtimes[0].online);
     t.state(&new, 1, session(&t, id, "p/a", SessionStatus::Working, 1), 104).await.unwrap();
-    t.hub.disconnect(t.user, t.rt.id, new.conn, 105).await;
+    t.hub.disconnect(t.user, t.rt.id, new.conn, 105, false).await;
     let fleet = t.hub.fleet(t.user).await.unwrap();
     assert!(!fleet.runtimes[0].online);
     assert_eq!((fleet.runtimes[0].last_seen_at, fleet.sessions.len()), (Some(105), 1), "offline keeps its sessions");
@@ -287,7 +269,7 @@ async fn sessions_expire_after_seven_days_unless_their_runtime_still_reports_the
     assert!(t.stored(exited).is_none());
     assert_eq!(rx.recv().await.unwrap().change, Change::SessionGone { runtime_id: t.rt.id, id: exited });
     // once its runtime is offline it ages like any other
-    t.hub.disconnect(t.user, t.rt.id, c.conn, 100 + week + 20).await;
+    t.hub.disconnect(t.user, t.rt.id, c.conn, 100 + week + 20, false).await;
     t.hub.sweep(100 + week + 10 + week).await;
     assert_eq!(t.hub.fleet(t.user).await.unwrap().sessions.len(), 1, "seven days from when it was last known to exist");
     t.hub.sweep(100 + week + 10 + week + 1).await;
@@ -343,7 +325,7 @@ async fn every_change_is_published_once_in_order_and_only_changes_are() {
     let id = Uuid::now_v7();
     t.state(&c, 1, session(&t, id, "p/a", SessionStatus::Working, 100), 100).await.unwrap();
     t.state(&c, 2, session(&t, id, "p/a", SessionStatus::Working, 100), 101).await.unwrap();
-    t.hub.disconnect(t.user, t.rt.id, c.conn, 102).await;
+    t.hub.disconnect(t.user, t.rt.id, c.conn, 102, false).await;
     let mut got = vec![];
     while let Ok(e) = rx.try_recv() {
         got.push((e.rev, match &e.change {
@@ -412,7 +394,7 @@ async fn a_subscriber_holds_only_its_own_persons_events() {
     let (_, mut toms) = t.hub.watch(t.user).await.unwrap();
     let c = t.connect("launch-1", 100).await;
     t.state(&c, 1, session(&t, Uuid::now_v7(), "p/a", SessionStatus::NeedsYou, 100), 100).await.unwrap();
-    t.hub.disconnect(t.user, t.rt.id, c.conn, 101).await;
+    t.hub.disconnect(t.user, t.rt.id, c.conn, 101, false).await;
     assert_eq!(std::iter::from_fn(|| toms.try_recv().ok()).count(), 3);
     assert!(matches!(anns.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)), "nothing was ever sent her way");
 }
@@ -429,12 +411,12 @@ async fn a_session_reported_unchanged_every_day_never_expires() {
     let asks = |t: &T| session(t, id, "p/asks", SessionStatus::NeedsYou, 100);
     let c = t.connect("launch-1", 100).await;
     t.state(&c, 1, asks(&t), 100).await.unwrap();
-    t.hub.disconnect(t.user, t.rt.id, c.conn, 200).await;
+    t.hub.disconnect(t.user, t.rt.id, c.conn, 200, false).await;
     for n in 1..=9 {
         let now = 100 + n * day;
         let c = t.hub.connect(&t.rt, "launch-1", "1.0", now).await.unwrap();
         t.hub.apply(t.user, t.rt.id, c.conn, Incoming::Snapshot { replaces_seq: 1, sessions: vec![asks(&t)] }, now).await.unwrap();
-        t.hub.disconnect(t.user, t.rt.id, c.conn, now + 60).await;
+        t.hub.disconnect(t.user, t.rt.id, c.conn, now + 60, false).await;
         // the sweep runs while the laptop is away
         t.hub.sweep(now + 3600).await;
     }

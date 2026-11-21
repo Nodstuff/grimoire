@@ -30,12 +30,16 @@
 //!   session is "updated" whenever its runtime reports it changed, and at
 //!   least daily while its runtime keeps reporting it at all.
 
-use super::view::{AlertKind, Alerter, Change, FleetEvent, FleetView, RuntimeView, SessionAlert, SessionView, sort_sessions};
+use super::view::{
+    AlertKind, Alerter, Change, FleetEvent, FleetView, RuntimeInfo, RuntimeView, SessionAlert, SessionView, sort_sessions,
+};
 use crate::store_ext::with_store;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use taisce_store::fabric::{FabricRuntime, FabricSession, MAX_SESSIONS_PER_RUNTIME, RuntimeLink, SESSION_RETENTION, SessionStatus};
+use taisce_store::fabric::{
+    FabricProject, FabricRuntime, FabricSession, MAX_SESSIONS_PER_RUNTIME, RuntimeLink, SESSION_RETENTION, SessionStatus,
+};
 use taisce_store::{Scope, SharedStore, StoreError};
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
@@ -44,6 +48,8 @@ use uuid::Uuid;
 pub const FLUSH_EVERY: Duration = Duration::from_secs(5);
 /// How often old sessions are expired.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(3600);
+/// How often orders, offers and mail that ran out of time are dealt with.
+pub const EXPIRE_EVERY: Duration = Duration::from_secs(60);
 /// Events a slow stream may fall behind by before it is told to start over.
 const EVENT_BUFFER: usize = 1024;
 
@@ -55,6 +61,8 @@ pub const ALERT_FLOOR: i64 = 30;
 /// A session reported unchanged is said to still exist once it has gone
 /// this long without an update, so it never ages out while reported.
 const STILL_THERE_AFTER: i64 = 86400;
+/// Alerts one runtime may hold back while its person is at the Mac.
+pub const MAX_HELD_ALERTS: usize = 200;
 
 /// What a runtime sent, already validated.
 #[derive(Debug, Clone)]
@@ -64,6 +72,8 @@ pub enum Incoming {
     State { seq: u64, session: Box<FabricSession> },
     /// The headroom report, as the JSON the viewer routes serve.
     Accounts { seq: u64, accounts: serde_json::Value },
+    /// The runtime's own status (RuntimeStatus), whole.
+    Status { seq: u64, info: Box<RuntimeInfo> },
 }
 
 /// Why a stream is being ended from the hub's side.
@@ -73,6 +83,8 @@ pub enum Kill {
     Superseded,
     /// The runtime was removed.
     Removed,
+    /// The hub is shutting down (SIGTERM): reconnect with backoff.
+    Closing,
 }
 
 /// Why the hub refused something from a runtime.
@@ -85,6 +97,11 @@ pub enum Refused {
     TooManySessions,
     /// A snapshot naming one session twice.
     DuplicateSession(Uuid),
+    /// A message broke a limit or was malformed: the field, and what it
+    /// should have been.
+    Invalid(String),
+    /// The hub is shutting down.
+    Closing,
     Store(StoreError),
 }
 
@@ -97,15 +114,18 @@ pub struct Connected {
     pub kill: oneshot::Receiver<Kill>,
     /// The last event the hub holds from this instance.
     pub last_up_seq: u64,
+    /// Rung when something waits to go down this stream.
+    pub wake: Arc<tokio::sync::Notify>,
 }
 
-struct Conn {
-    id: u64,
+pub(super) struct Conn {
+    pub(super) id: u64,
     kill: oneshot::Sender<Kill>,
+    pub(super) wake: Arc<tokio::sync::Notify>,
 }
 
-struct Slot {
-    row: FabricSession,
+pub(super) struct Slot {
+    pub(super) row: FabricSession,
     /// Changed since its last write.
     dirty: bool,
     /// When each kind of alert was last raised for it.
@@ -121,48 +141,81 @@ impl Slot {
     }
 }
 
-struct RuntimeState {
-    row: FabricRuntime,
+pub(super) struct RuntimeState {
+    pub(super) row: FabricRuntime,
     /// The headroom report, parsed once.
     accounts: serde_json::Value,
-    conn: Option<Conn>,
+    /// What the runtime last said of itself (RuntimeStatus).
+    pub(super) info: RuntimeInfo,
+    pub(super) conn: Option<Conn>,
     /// The last snapshot's `replaces_seq`: a state event at or below it is
     /// older than the snapshot.
     state_floor: u64,
-    sessions: HashMap<Uuid, Slot>,
+    pub(super) sessions: HashMap<Uuid, Slot>,
     /// Sessions evicted to make room, not yet deleted from the store.
     evicted: Vec<Uuid>,
-    link_dirty: bool,
+    pub(super) link_dirty: bool,
+    /// Alerts held back while the person was at this Mac, sent when they
+    /// leave it if they still stand (oldest first, at most [`MAX_HELD_ALERTS`]).
+    pub(super) held_alerts: Vec<SessionAlert>,
     /// Serialises this runtime's store writes ([`Hub::write_runtime`]).
-    writing: Arc<tokio::sync::Mutex<()>>,
+    pub(super) writing: Arc<tokio::sync::Mutex<()>>,
+    /// The last Down event number taken on this runtime's instance, and
+    /// which instance: a new stream of the same launch numbers above it.
+    pub(super) down: (Option<String>, u64),
 }
 
 impl RuntimeState {
     fn new(row: FabricRuntime, sessions: Vec<FabricSession>) -> Self {
         let accounts = serde_json::from_str(&row.accounts).unwrap_or_else(|_| serde_json::json!([]));
+        let info = serde_json::from_str(&row.status).unwrap_or_default();
         Self {
             row,
             accounts,
+            info,
             conn: None,
             state_floor: 0,
             sessions: sessions.into_iter().map(|s| (s.id, Slot::stored(s))).collect(),
             evicted: vec![],
             link_dirty: false,
+            held_alerts: vec![],
             writing: Default::default(),
+            down: (None, 0),
         }
     }
 
-    fn view(&self, now: i64) -> RuntimeView {
+    pub(super) fn view(&self, now: i64) -> RuntimeView {
         let online = self.conn.is_some();
         RuntimeView {
             id: self.row.id,
             name: self.row.name.clone(),
             created_at: self.row.created_at,
             online,
+            connection: if online {
+                "online"
+            } else if self.row.ended_clean {
+                "idle"
+            } else {
+                "offline"
+            },
             last_seen_at: if online { Some(now) } else { self.row.last_seen_at },
             version: self.row.version.clone(),
             accounts: self.accounts.clone(),
             accounts_at: self.row.accounts_at,
+            held: self.info.held,
+            held_since: self.info.held_since,
+            settings_version: self.info.settings_version,
+            present: self.info.present,
+            public_key: (!self.info.public_key.is_empty()).then(|| self.info.public_key.clone()),
+            devices: self.info.devices.clone(),
+        }
+    }
+
+    /// Ring this runtime's live stream, if it has one: something waits to
+    /// go down.
+    pub(super) fn ring(&self) {
+        if let Some(c) = &self.conn {
+            c.wake.notify_one();
         }
     }
 
@@ -212,9 +265,12 @@ impl RuntimeState {
             // first sight
             next.updated_at = now;
             next.quiet_until = None;
+            next.following = false;
             let mut slot = Slot { row: next, dirty: true, alerted: [None; 3], urgent_at: None };
-            if let Some(kind) = AlertKind::on(None, slot.row.state) {
-                slot.alerted[kind as usize] = Some(now);
+            if let Some(kind) = AlertKind::on(None, slot.row.state)
+                && let Some(clock) = kind.clock()
+            {
+                slot.alerted[clock] = Some(now);
                 alerts.push(alert(&slot.row, kind));
             }
             changes.push(Change::Session(SessionView::from(&slot.row)));
@@ -224,8 +280,9 @@ impl RuntimeState {
         // the same report again, only later: nothing changed. It does say
         // the session still exists, which is recorded about once a day
         next.updated_at = slot.row.updated_at;
-        // a snooze is the person's: no report carries or changes it
+        // a snooze and a follow are the person's: no report carries or changes them
         next.quiet_until = slot.row.quiet_until;
+        next.following = slot.row.following;
         if slot.row == next {
             if now - slot.row.updated_at >= STILL_THERE_AFTER {
                 slot.row.updated_at = now;
@@ -238,12 +295,13 @@ impl RuntimeState {
         let moved = prev != next.state;
         if moved
             && let Some(kind) = AlertKind::on(Some(prev), next.state)
+            && let Some(clock) = kind.clock()
             // the same announcement again so soon is a session flapping
-            && !slot.alerted[kind as usize].is_some_and(|at| (now - at).abs() < ALERT_FLOOR)
+            && !slot.alerted[clock].is_some_and(|at| (now - at).abs() < ALERT_FLOOR)
             // snoozed: shown in the fleet as ever, announced to nobody
             && !slot.row.quiet_until.is_some_and(|until| until > now)
         {
-            slot.alerted[kind as usize] = Some(now);
+            slot.alerted[clock] = Some(now);
             alerts.push(alert(&next, kind));
         }
         changes.push(Change::Session(SessionView::from(&next)));
@@ -259,20 +317,25 @@ impl RuntimeState {
 }
 
 fn alert(s: &FabricSession, kind: AlertKind) -> SessionAlert {
-    SessionAlert { user: s.user_id, runtime_id: s.runtime_id, session_id: s.id, address: s.address.clone(), kind }
+    let mut a = SessionAlert::new(s.user_id, s.runtime_id, s.id, &s.address, kind);
+    a.preview = (!s.last_line.is_empty()).then(|| s.last_line.clone());
+    a.project = s.project.clone();
+    a
 }
 
-struct UserFleet {
-    runtimes: BTreeMap<Uuid, RuntimeState>,
+pub(super) struct UserFleet {
+    pub(super) runtimes: BTreeMap<Uuid, RuntimeState>,
     rev: u64,
     /// This person's changes, and nobody else's.
     events: broadcast::Sender<Arc<FleetEvent>>,
+    /// Their project switches (Text off, private notifications), by name.
+    pub(super) projects: HashMap<String, FabricProject>,
 }
 
 impl Default for UserFleet {
     fn default() -> Self {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
-        Self { runtimes: BTreeMap::new(), rev: 0, events }
+        Self { runtimes: BTreeMap::new(), rev: 0, events, projects: HashMap::new() }
     }
 }
 
@@ -280,42 +343,167 @@ impl UserFleet {
     fn view(&self, now: i64) -> FleetView {
         let mut runtimes: Vec<RuntimeView> = self.runtimes.values().map(|r| r.view(now)).collect();
         runtimes.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-        let mut sessions: Vec<SessionView> =
-            self.runtimes.values().flat_map(|r| r.sessions.values().map(|s| SessionView::from(&s.row))).collect();
+        let mut sessions: Vec<SessionView> = self
+            .runtimes
+            .values()
+            .flat_map(|r| r.sessions.values().map(|s| SessionView::of(&s.row, self.text_off(&s.row.project))))
+            .collect();
         sort_sessions(&mut sessions);
-        FleetView { rev: self.rev, runtimes, sessions }
+        FleetView { rev: self.rev, runtimes, sessions, attention: vec![] }
+    }
+
+    pub(super) fn text_off(&self, project: &str) -> bool {
+        self.projects.get(project).is_some_and(|p| p.text_off)
+    }
+
+    pub(super) fn private(&self, project: &str) -> bool {
+        self.projects.get(project).is_some_and(|p| p.private_notifications)
+    }
+
+    /// A session of this fleet, wherever it runs.
+    pub(super) fn session(&self, runtime: Uuid, id: Uuid) -> Option<&FabricSession> {
+        self.runtimes.get(&runtime).and_then(|r| r.sessions.get(&id)).map(|s| &s.row)
+    }
+
+    /// Make alerts fit to send: nothing while the person is at that Mac
+    /// (but a followed session's finish), no text when the project's
+    /// notifications are private, and a finished turn names every session
+    /// now finished (a followed one alerts alone).
+    pub(super) fn finish_alerts(&mut self, alerts: Vec<SessionAlert>, now: i64) -> Vec<SessionAlert> {
+        let mut held: Vec<SessionAlert> = vec![];
+        let out = self.gate_alerts(alerts, now, &mut held);
+        for a in held {
+            if let Some(rt) = self.runtimes.get_mut(&a.runtime_id) {
+                rt.held_alerts.push(a);
+                let over = rt.held_alerts.len().saturating_sub(MAX_HELD_ALERTS);
+                rt.held_alerts.drain(..over);
+            }
+        }
+        out
+    }
+
+    /// The person left `runtime`'s Mac: what was held back and still
+    /// stands (a state alert whose session is still in that state; any
+    /// other the caller checks against what is still open), newest per
+    /// notification.
+    pub(super) fn release_held(&mut self, runtime: Uuid) -> Vec<SessionAlert> {
+        let Some(rt) = self.runtimes.get_mut(&runtime) else { return vec![] };
+        let held = std::mem::take(&mut rt.held_alerts);
+        let mut latest: Vec<SessionAlert> = vec![];
+        for a in held.into_iter().rev() {
+            let key = super::alert_collapse_id(&a);
+            if latest.iter().any(|l| super::alert_collapse_id(l) == key) {
+                continue;
+            }
+            let stands = match a.kind {
+                AlertKind::NeedsYou => rt.sessions.get(&a.session_id).is_some_and(|s| s.row.state == SessionStatus::NeedsYou),
+                AlertKind::Stalled => rt.sessions.get(&a.session_id).is_some_and(|s| s.row.state == SessionStatus::Stalled),
+                AlertKind::Finished => rt.sessions.get(&a.session_id).is_some_and(|s| s.row.state == SessionStatus::Finished),
+                _ => true,
+            };
+            if stands {
+                latest.push(a);
+            }
+        }
+        latest.reverse();
+        latest
+    }
+
+    fn gate_alerts(&self, alerts: Vec<SessionAlert>, now: i64, held: &mut Vec<SessionAlert>) -> Vec<SessionAlert> {
+        let finished: Vec<String> = {
+            let mut f: Vec<&FabricSession> = self
+                .runtimes
+                .values()
+                .flat_map(|r| r.sessions.values().map(|s| &s.row))
+                .filter(|s| s.state == SessionStatus::Finished && !s.following)
+                .collect();
+            f.sort_by(|a, b| b.since.cmp(&a.since).then_with(|| a.address.cmp(&b.address)));
+            f.into_iter().map(|s| s.address.clone()).collect()
+        };
+        alerts
+            .into_iter()
+            .filter_map(|mut a| {
+                let rt = self.runtimes.get(&a.runtime_id);
+                let row = self.session(a.runtime_id, a.session_id);
+                let following = row.is_some_and(|s| s.following);
+                let snoozed = row.is_some_and(|s| s.quiet_until.is_some_and(|q| q > now));
+                // a refused order is the person's own doing: told wherever they are
+                let at_mac = rt.is_some_and(|r| r.info.present) && a.kind != AlertKind::OrderRefused && !a.from_phone;
+                if snoozed {
+                    return None;
+                }
+                if at_mac && !(following && a.kind == AlertKind::Finished) {
+                    // told when they leave the Mac, if it still stands
+                    held.push(a);
+                    return None;
+                }
+                // the alert's own project: the session may have left the fleet
+                let project = if a.project.is_empty() { row.map(|s| s.project.as_str()).unwrap_or("") } else { a.project.as_str() };
+                if self.private(project) || self.text_off(project) {
+                    a.preview = None;
+                    a.choices = serde_json::json!([]);
+                }
+                if a.kind == AlertKind::Finished && !following {
+                    a.finished = finished.clone();
+                }
+                Some(a)
+            })
+            .collect()
     }
 }
 
-struct Inner {
-    store: SharedStore,
+pub(super) struct Inner {
+    /// True once the hub is shutting down: no stream is taken, every open
+    /// one is ended, the channel's server stops.
+    closing: tokio::sync::watch::Sender<bool>,
+    /// Per runtime: its fabric tool calls in flight, and its call budget.
+    pub(super) call_load: Mutex<HashMap<Uuid, (usize, f64, std::time::Instant)>>,
+    pub(super) store: SharedStore,
     fleets: Mutex<HashMap<Uuid, UserFleet>>,
-    alerter: Option<Alerter>,
+    pub(super) alerter: Option<Alerter>,
     next_conn: std::sync::atomic::AtomicU64,
     /// One [`Hub::sync`] at a time: its read of the store and its merge
     /// into the fleet must not interleave with another's, or a list read
     /// before a runtime was enrolled could drop that runtime after a later
     /// sync had added it.
     syncing: tokio::sync::Mutex<()>,
+    /// Fabric tool calls answered lately, by (runtime, call id): a retry
+    /// gets the first answer.
+    /// One per call that changes something (`send`, `inbox_ack`): taken
+    /// before it runs, so the same id at once runs once.
+    pub(super) calls: Mutex<HashMap<(Uuid, String), (i64, Arc<tokio::sync::OnceCell<taisce_runtime_proto::v1::CallReply>>)>>,
 }
 
 #[derive(Clone)]
-pub struct Hub(Arc<Inner>);
+pub struct Hub(pub(super) Arc<Inner>);
 
 impl Hub {
     pub fn new(store: SharedStore, alerter: Option<Alerter>) -> Self {
-        Hub(Arc::new(Inner { store, fleets: Mutex::default(), alerter, next_conn: 1.into(), syncing: Default::default() }))
+        Hub(Arc::new(Inner {
+            closing: tokio::sync::watch::channel(false).0,
+            call_load: Mutex::default(),
+            store,
+            fleets: Mutex::default(),
+            alerter,
+            next_conn: 1.into(),
+            syncing: Default::default(),
+            calls: Mutex::default(),
+        }))
     }
 
-    fn fleets(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, UserFleet>> {
+    pub(super) fn fleets(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, UserFleet>> {
         self.0.fleets.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Apply `changes` to `fleet`'s rev and publish them on its own
     /// channel, in order. Called with the fleets lock held, so revs and
     /// events never disagree.
-    fn publish(fleet: &mut UserFleet, changes: Vec<Change>) {
-        for change in changes {
+    pub(super) fn publish(fleet: &mut UserFleet, changes: Vec<Change>) {
+        for mut change in changes {
+            // a session's view says whether its project has Text off
+            if let Change::Session(v) = &mut change {
+                v.text_off = fleet.text_off(&v.project);
+            }
             fleet.rev += 1;
             // no stream open is not an error
             let _ = fleet.events.send(Arc::new(FleetEvent { rev: fleet.rev, change }));
@@ -325,11 +513,15 @@ impl Hub {
     /// Bring `user`'s fleet in line with the store's runtimes: load it the
     /// first time, then pick up a runtime enrolled since and drop one
     /// removed since (the box CLI edits the db under a running daemon).
-    async fn sync(&self, user: Uuid) -> Result<(), StoreError> {
+    pub(super) async fn sync(&self, user: Uuid) -> Result<(), StoreError> {
         let _one_at_a_time = self.0.syncing.lock().await;
         let loaded = self.fleets().contains_key(&user);
-        let (runtimes, sessions) = with_store(&self.0.store, Scope::User(user), move |s| {
-            Ok::<_, StoreError>((s.fabric_runtimes(false)?, if loaded { vec![] } else { s.fabric_sessions()? }))
+        let (runtimes, sessions, projects) = with_store(&self.0.store, Scope::User(user), move |s| {
+            Ok::<_, StoreError>((
+                s.fabric_runtimes(false)?,
+                if loaded { vec![] } else { s.fabric_sessions()? },
+                if loaded { None } else { Some(s.fabric_projects()?) },
+            ))
         })
         .await?;
         let now = crate::auth::now();
@@ -337,6 +529,9 @@ impl Hub {
         // a fleet being loaded for the first time has no watchers to tell
         let watched = fleets.contains_key(&user);
         let fleet = fleets.entry(user).or_default();
+        if let Some(projects) = projects {
+            fleet.projects = projects.into_iter().map(|p| (p.name.clone(), p)).collect();
+        }
         let live: HashSet<Uuid> = runtimes.iter().map(|r| r.id).collect();
         let mut changes = vec![];
         let gone: Vec<Uuid> = fleet.runtimes.keys().filter(|id| !live.contains(id)).copied().collect();
@@ -370,7 +565,15 @@ impl Hub {
     pub async fn fleet(&self, user: Uuid) -> Result<FleetView, StoreError> {
         self.sync(user).await?;
         let now = crate::auth::now();
-        Ok(self.fleets().get(&user).map(|f| f.view(now)).unwrap_or_else(FleetView::empty))
+        let mut view = self.fleets().get(&user).map(|f| f.view(now)).unwrap_or_else(FleetView::empty);
+        view.attention = self.open_attention(user).await?;
+        Ok(view)
+    }
+
+    /// `user`'s open attention items, newest first.
+    pub async fn open_attention(&self, user: Uuid) -> Result<Vec<super::view::AttentionView>, StoreError> {
+        let open = with_store(&self.0.store, Scope::User(user), |s| s.fabric_attention_open()).await?;
+        Ok(open.iter().map(super::view::AttentionView::from).collect())
     }
 
     /// `user`'s fleet and every change to it from then on: the receiver is
@@ -379,10 +582,16 @@ impl Hub {
     pub async fn watch(&self, user: Uuid) -> Result<(FleetView, broadcast::Receiver<Arc<FleetEvent>>), StoreError> {
         self.sync(user).await?;
         let now = crate::auth::now();
-        let mut fleets = self.fleets();
-        let fleet = fleets.entry(user).or_default();
-        // subscribed under the lock: no change can fall between the two
-        Ok((fleet.view(now), fleet.events.subscribe()))
+        let (mut view, rx) = {
+            let mut fleets = self.fleets();
+            let fleet = fleets.entry(user).or_default();
+            // subscribed under the lock: no change can fall between the two
+            (fleet.view(now), fleet.events.subscribe())
+        };
+        // read after subscribing: an item raised meanwhile is in the list,
+        // or on the stream, or both (the client takes it by id)
+        view.attention = self.open_attention(user).await?;
+        Ok((view, rx))
     }
 
     /// A runtime's stream opened and said Hello. Any stream it already had
@@ -392,11 +601,15 @@ impl Hub {
         self.sync(user).await.map_err(Refused::Store)?;
         let conn = self.0.next_conn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (kill_tx, kill) = oneshot::channel();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        if self.is_closing() {
+            return Err(Refused::Closing);
+        }
         let last_up_seq = {
             let mut fleets = self.fleets();
             let fleet = fleets.get_mut(&user).ok_or(Refused::NotLive)?;
             let rt = fleet.runtimes.get_mut(&id).ok_or(Refused::NotLive)?;
-            if let Some(old) = rt.conn.replace(Conn { id: conn, kill: kill_tx }) {
+            if let Some(old) = rt.conn.replace(Conn { id: conn, kill: kill_tx, wake: wake.clone() }) {
                 let _ = old.kill.send(Kill::Superseded);
             }
             if rt.row.instance_id.as_deref() != Some(instance_id) {
@@ -405,6 +618,7 @@ impl Hub {
                 rt.row.last_up_seq = 0;
             }
             rt.state_floor = 0;
+            rt.row.ended_clean = false;
             rt.row.version = version.to_string();
             rt.row.last_seen_at = Some(now);
             rt.link_dirty = true;
@@ -413,12 +627,13 @@ impl Hub {
             seq
         };
         self.write_runtime(user, id).await;
-        Ok(Connected { conn, kill, last_up_seq })
+        Ok(Connected { conn, kill, last_up_seq, wake })
     }
 
     /// Take one message from the stream `conn` of `runtime`.
     pub async fn apply(&self, user: Uuid, runtime: Uuid, conn: u64, incoming: Incoming, now: i64) -> Result<(), Refused> {
         let mut alerts = vec![];
+        let mut left = vec![];
         let write_now = {
             let mut fleets = self.fleets();
             let fleet = fleets.get_mut(&user).ok_or(Refused::NotLive)?;
@@ -427,11 +642,29 @@ impl Hub {
                 return Err(Refused::NotLive);
             }
             let mut changes = vec![];
+            let was_present = rt.info.present;
             let applied = Self::apply_to(rt, incoming, now, &mut changes, &mut alerts);
+            let left_the_mac = was_present && !rt.info.present;
             // what was changed before a refusal is still a change
             Self::publish(fleet, changes);
+            alerts = fleet.finish_alerts(std::mem::take(&mut alerts), now);
+            if left_the_mac {
+                left = fleet.release_held(runtime);
+            }
             applied?
         };
+        if !left.is_empty() {
+            // an approval or a question dealt with at the Mac is not news
+            let open: HashSet<String> = with_store(&self.0.store, Scope::User(user), |s| s.fabric_attention_open())
+                .await
+                .map(|items| items.into_iter().map(|a| a.id).collect())
+                .unwrap_or_default();
+            left.retain(|a| a.request_id.as_ref().is_none_or(|id| open.contains(id)));
+            let mut fleets = self.fleets();
+            if let Some(fleet) = fleets.get_mut(&user) {
+                alerts.extend(fleet.finish_alerts(left, now));
+            }
+        }
         if write_now {
             self.write_runtime(user, runtime).await;
         }
@@ -500,6 +733,15 @@ impl Hub {
                 let moved = rt.put(*session, now, changes, alerts)?;
                 Ok(moved || !rt.evicted.is_empty())
             }
+            Incoming::Status { seq, info } => {
+                if fresh(rt, seq) && rt.info != *info {
+                    rt.link_dirty = true;
+                    rt.row.status = serde_json::to_string(&*info).unwrap_or_else(|_| "{}".into());
+                    rt.info = *info;
+                    changes.push(Change::Runtime(rt.view(now)));
+                }
+                Ok(false)
+            }
             Incoming::Accounts { seq, accounts } => {
                 if fresh(rt, seq) && rt.accounts != accounts {
                     rt.link_dirty = true;
@@ -515,7 +757,9 @@ impl Hub {
 
     /// The stream `conn` of `runtime` ended. A stream that was superseded
     /// changes nothing: the runtime is still online on its newer one.
-    pub async fn disconnect(&self, user: Uuid, runtime: Uuid, conn: u64, now: i64) {
+    /// `clean`: the runtime closed the stream itself (it has nothing to
+    /// report: idle), not dropped or silent (offline).
+    pub async fn disconnect(&self, user: Uuid, runtime: Uuid, conn: u64, now: i64, clean: bool) {
         {
             let mut fleets = self.fleets();
             let Some(fleet) = fleets.get_mut(&user) else { return };
@@ -525,6 +769,7 @@ impl Hub {
             }
             rt.conn = None;
             rt.row.last_seen_at = Some(now);
+            rt.row.ended_clean = clean;
             rt.link_dirty = true;
             let view = rt.view(now);
             Self::publish(fleet, vec![Change::Runtime(view)]);
@@ -628,11 +873,12 @@ impl Hub {
     /// link. The one path to the store for a runtime's state: writers queue
     /// on the runtime's own lock and each takes the rows as they are when
     /// its turn comes.
-    async fn write_runtime(&self, user: Uuid, runtime: Uuid) {
+    pub(super) async fn write_runtime(&self, user: Uuid, runtime: Uuid) {
         let Some(writing) = self.fleets().get(&user).and_then(|f| f.runtimes.get(&runtime)).map(|r| r.writing.clone()) else { return };
         let _turn = writing.lock().await;
         let (evicted, rows, link) = {
             let mut fleets = self.fleets();
+            let off: HashSet<String> = fleets.get(&user).map(|f| f.projects.values().filter(|p| p.text_off).map(|p| p.name.clone()).collect()).unwrap_or_default();
             let Some(rt) = fleets.get_mut(&user).and_then(|f| f.runtimes.get_mut(&runtime)) else { return };
             let rows: Vec<FabricSession> = rt
                 .sessions
@@ -640,7 +886,13 @@ impl Hub {
                 .filter(|s| s.dirty)
                 .map(|s| {
                     s.dirty = false;
-                    s.row.clone()
+                    let mut row = s.row.clone();
+                    // Text off: the hub shows it live, the store never holds it
+                    if off.contains(&row.project) {
+                        row.last_line.clear();
+                        row.note.clear();
+                    }
+                    row
                 })
                 .collect();
             let link = std::mem::take(&mut rt.link_dirty).then(|| rt.row.clone());
@@ -659,6 +911,8 @@ impl Hub {
                 last_seen_at: row.last_seen_at,
                 accounts: &row.accounts,
                 accounts_at: row.accounts_at,
+                status: &row.status,
+                ended_clean: row.ended_clean,
             });
             s.fabric_runtime_write(runtime, &evicted, &rows, link.as_ref())
         })
@@ -697,14 +951,33 @@ impl Hub {
 
     /// The daemon is stopping: every connected runtime was last seen now,
     /// and everything pending is written.
+    /// Every open stream is ended (UNAVAILABLE: reconnect with backoff), no
+    /// new one is taken, and the channel's server stops ([`Hub::closed`]).
     pub async fn close(&self, now: i64) {
+        self.0.closing.send_replace(true);
         for fleet in self.fleets().values_mut() {
-            for rt in fleet.runtimes.values_mut().filter(|r| r.conn.is_some()) {
-                rt.row.last_seen_at = Some(now);
-                rt.link_dirty = true;
+            for rt in fleet.runtimes.values_mut() {
+                if let Some(conn) = rt.conn.take() {
+                    let _ = conn.kill.send(Kill::Closing);
+                    rt.row.last_seen_at = Some(now);
+                    rt.row.ended_clean = false;
+                    rt.link_dirty = true;
+                }
             }
         }
         self.flush().await;
+    }
+
+    pub fn is_closing(&self) -> bool {
+        *self.0.closing.borrow()
+    }
+
+    /// Resolves once [`Hub::close`] has been called.
+    pub fn closed(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.0.closing.subscribe();
+        async move {
+            let _ = rx.wait_for(|c| *c).await;
+        }
     }
 
     /// Expire sessions last updated more than 7 days before `now`. A
@@ -749,11 +1022,13 @@ impl Hub {
 
     /// The hub's housekeeping: a flush every [`FLUSH_EVERY`] (and the
     /// snoozes that ran out since the last one lifted), a sweep at start
-    /// and every [`SWEEP_EVERY`].
+    /// and every [`SWEEP_EVERY`], expiry every [`EXPIRE_EVERY`].
     pub async fn maintenance_loop(self) {
         let mut flush = tokio::time::interval(FLUSH_EVERY);
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut sweep = tokio::time::interval(SWEEP_EVERY);
+        let mut expire = tokio::time::interval(EXPIRE_EVERY);
+        expire.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = flush.tick() => {
@@ -761,6 +1036,9 @@ impl Hub {
                     self.wake(crate::auth::now()).await;
                 }
                 _ = sweep.tick() => self.sweep(crate::auth::now()).await,
+                // orders that never reached a sleeping Mac in time, mail
+                // nobody read for a day, rows past retention
+                _ = expire.tick() => self.expire_work(crate::auth::now()).await,
             }
         }
     }

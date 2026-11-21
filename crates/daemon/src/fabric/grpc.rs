@@ -22,6 +22,7 @@
 //! the same window for the hub's own events.
 
 use super::hub::{Connected, Hub, Incoming, Kill, Refused};
+use super::record::{self, Durable};
 use crate::auth::ratelimit::{Class, Limiter};
 use crate::store_ext::with_store;
 use std::time::Duration;
@@ -50,6 +51,8 @@ const MAX_ACCOUNTS: usize = 32;
 /// Events are not counted: the window paces them.
 const CONTROL_BURST: f64 = 30.0;
 const CONTROL_PER_SEC: f64 = 1.0;
+/// Queued prompts one session may report.
+const MAX_QUEUE: usize = 32;
 /// The latest `since` taken (2100-01-01): a wild clock is refused.
 const MAX_SINCE: i64 = 4_102_444_800;
 
@@ -155,10 +158,12 @@ impl Runtime for RuntimeService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    /// Fabric tool calls (Slice 5): declared in the contract, not served yet.
+    /// One fabric tool call on a session's behalf (ADR 0008 §3): its own
+    /// short stream, outside Attach and its window.
     async fn call(&self, req: Request<pb::CallRequest>) -> Result<Response<pb::CallReply>, Status> {
-        self.authenticate(&req).await?;
-        Err(Status::unimplemented("fabric tool calls are not served yet"))
+        let runtime = self.authenticate(&req).await?;
+        let reply = self.hub.call(&runtime, req.into_inner(), crate::auth::now()).await?;
+        Ok(Response::new(reply))
     }
 }
 
@@ -194,9 +199,17 @@ impl DownSender {
         self.tx.send(Ok(pb::Down { seq: 0, body: Some(body) })).await.map_err(|_| Unsent::Gone)
     }
 
-    /// Send the next event, if the window has room. Nothing in Slice 1
-    /// sends one: orders and nudges will.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Room for one more event in the window.
+    pub fn has_room(&self) -> bool {
+        self.window.has_room()
+    }
+
+    /// The number the next event will carry.
+    pub fn next_seq(&self) -> u64 {
+        self.seq + 1
+    }
+
+    /// Send the next event, if the window has room.
     pub async fn event(&mut self, body: &down::Body) -> Result<u64, Unsent> {
         let seq = self.seq + 1;
         if !self.window.sent(seq) {
@@ -257,21 +270,41 @@ async fn stream(
         return Err(Status::invalid_argument("hello.instance_id: 1-64 of [A-Za-z0-9-]"));
     }
     text("hello.version", &hello.version, 0, 64)?;
-    let Connected { conn, mut kill, last_up_seq } =
+    let Connected { conn, mut kill, last_up_seq, wake } =
         hub.connect(runtime, &hello.instance_id, &hello.version, crate::auth::now()).await.map_err(refused)?;
+    // what this launch already has is acknowledged; this stream numbers on
+    let down_start = match hub.down_resume(runtime.user_id, runtime.id, &hello.instance_id, hello.last_down_seq, crate::auth::now()).await {
+        Ok(n) => n,
+        Err(r) => {
+            hub.disconnect(runtime.user_id, runtime.id, conn, crate::auth::now(), false).await;
+            return Err(refused(r));
+        }
+    };
     tracing::info!(target: crate::auth::AUDIT, event = "runtime.connect", runtime = %runtime.id, name = runtime.name,
         user = %runtime.user_id, instance = hello.instance_id, version = hello.version, ip);
     let welcome = pb::Welcome { last_up_seq, runtime_id: runtime.id.to_string(), heartbeat_secs: pace.heartbeat.as_secs().max(1) as u32 };
-    let mut down = DownSender::new(tx.clone(), hello.last_down_seq);
+    let mut down = DownSender::new(tx.clone(), down_start);
     let ended = match down.control(down::Body::Welcome(welcome)).await {
         Ok(()) => {
-            let mut open = Open { hub, runtime, conn, pace, down: &mut down, receipts: Receipts::starting_at(last_up_seq) };
+            let mut open = Open {
+                hub,
+                runtime,
+                conn,
+                pace,
+                down: &mut down,
+                receipts: Receipts::starting_at(last_up_seq),
+                instance: hello.instance_id.clone(),
+                wake,
+                sent: Default::default(),
+                snapshot_seen: false,
+            };
             open.run(&mut inbound, &mut kill).await
         }
         // the runtime hung up before its Welcome
-        Err(_) => Ok(()),
+        Err(_) => Ok(false),
     };
-    hub.disconnect(runtime.user_id, runtime.id, conn, crate::auth::now()).await;
+    hub.disconnect(runtime.user_id, runtime.id, conn, crate::auth::now(), matches!(ended, Ok(true))).await;
+    let ended = ended.map(|_| ());
     tracing::info!(target: crate::auth::AUDIT, event = "runtime.disconnect", runtime = %runtime.id, user = %runtime.user_id);
     ended
 }
@@ -284,10 +317,26 @@ struct Open<'a> {
     pace: Pace,
     down: &'a mut DownSender,
     receipts: Receipts,
+    /// The launch this stream is of (Hello.instance_id).
+    instance: String,
+    /// Rung by the hub when something waits to go down.
+    wake: std::sync::Arc<tokio::sync::Notify>,
+    /// What this stream has sent down (DownItem keys): never twice on one stream.
+    sent: std::collections::HashSet<String>,
+    /// The Snapshot has arrived: Down events may go.
+    snapshot_seen: bool,
+}
+
+/// What one message from the runtime asks the hub to do.
+enum Step {
+    Apply(Incoming),
+    Record(u64, Durable),
 }
 
 impl Open<'_> {
-    async fn run(&mut self, inbound: &mut Streaming<pb::Up>, kill: &mut tokio::sync::oneshot::Receiver<Kill>) -> Result<(), Status> {
+    /// Ok(true): the runtime closed the stream itself (idle); Ok(false):
+    /// it went away without a word.
+    async fn run(&mut self, inbound: &mut Streaming<pb::Up>, kill: &mut tokio::sync::oneshot::Receiver<Kill>) -> Result<bool, Status> {
         use tokio::time::Instant;
         let (user, id) = (self.runtime.user_id, self.runtime.id);
         let silence = self.pace.heartbeat * 3;
@@ -297,7 +346,6 @@ impl Open<'_> {
         // arriving: the recheck and the ack timer below wake this loop too,
         // and must not buy a sleeping Mac more time.
         let mut silent_at = Instant::now() + silence;
-        let mut snapshot_seen = false;
         loop {
             let ack_due = self.receipts.due_at().map(Instant::from_std);
             let up = tokio::select! {
@@ -305,6 +353,7 @@ impl Open<'_> {
                 why = &mut *kill => {
                     return Err(match why {
                         Ok(Kill::Superseded) => Status::aborted("a newer stream for this runtime took over"),
+                        Ok(Kill::Closing) => Status::unavailable("the hub is shutting down; reconnect with backoff"),
                         Ok(Kill::Removed) | Err(_) => Status::unauthenticated("this runtime was removed"),
                     });
                 }
@@ -317,28 +366,52 @@ impl Open<'_> {
                     }
                     continue;
                 }
+                // something waits to go down (an order, settings, a nudge)
+                _ = self.wake.notified(), if self.snapshot_seen => {
+                    if !self.pump().await? {
+                        return Ok(false);
+                    }
+                    continue;
+                }
                 // what has been taken is acknowledged within 250 ms
                 _ = tokio::time::sleep_until(ack_due.unwrap_or_else(Instant::now)), if ack_due.is_some() => {
                     if self.down.ack(&mut self.receipts).await.is_err() {
-                        return Ok(());
+                        return Ok(false);
                     }
                     continue;
                 }
                 got = inbound.message() => match got.map_err(read_failed)? {
                     Some(up) => up,
                     // the runtime hung up
-                    None => return Ok(()),
+                    None => return Ok(true),
                 },
             };
             silent_at = Instant::now() + silence;
             let now = crate::auth::now();
-            let incoming = match up.body {
-                Some(up::Body::State(_) | up::Body::Accounts(_)) if !snapshot_seen => {
+            let step = match up.body {
+                Some(
+                    up::Body::State(_)
+                    | up::Body::Accounts(_)
+                    | up::Body::Runtime(_)
+                    | up::Body::Turn(_)
+                    | up::Body::Attention(_)
+                    | up::Body::Result(_)
+                    | up::Body::Pairing(_),
+                ) if !self.snapshot_seen => {
                     return Err(Status::failed_precondition("the first message after the Hello must be a Snapshot"));
                 }
                 // events: paced by the send window, not by the budget
-                Some(up::Body::State(s)) => Incoming::State { seq: event_seq(up.seq)?, session: Box::new(session(&s, self.runtime, now)?) },
-                Some(up::Body::Accounts(a)) => Incoming::Accounts { seq: event_seq(up.seq)?, accounts: accounts(&a)? },
+                Some(up::Body::State(s)) => {
+                    Step::Apply(Incoming::State { seq: event_seq(up.seq)?, session: Box::new(session(&s, self.runtime, now)?) })
+                }
+                Some(up::Body::Accounts(a)) => Step::Apply(Incoming::Accounts { seq: event_seq(up.seq)?, accounts: accounts(&a)? }),
+                Some(up::Body::Runtime(r)) => {
+                    Step::Apply(Incoming::Status { seq: event_seq(up.seq)?, info: Box::new(record::runtime_info(&r).map_err(refused)?) })
+                }
+                Some(body @ (up::Body::Turn(_) | up::Body::Attention(_) | up::Body::Result(_) | up::Body::Pairing(_))) => {
+                    let seq = event_seq(up.seq)?;
+                    Step::Record(seq, record::durable(body, self.runtime.id).map_err(refused)?)
+                }
                 // everything else is outside the window, so it is counted
                 other => {
                     if !budget.take(Instant::now()) {
@@ -348,17 +421,32 @@ impl Open<'_> {
                         Some(up::Body::Hello(_)) => return Err(Status::failed_precondition("a second Hello on one stream")),
                         Some(up::Body::Ack(a)) => {
                             self.down.acked(a.seq);
+                            if !self.sent.is_empty() {
+                                self.hub.down_received(user, id, &self.instance, a.seq, now).await.map_err(refused)?;
+                            }
+                            // room in the window again: send what waited for it
+                            if !self.pump().await? {
+                                return Ok(false);
+                            }
                             continue;
                         }
                         Some(up::Body::Snapshot(s)) => {
-                            snapshot_seen = true;
                             if s.sessions.len() > MAX_SESSIONS_PER_RUNTIME {
                                 return Err(Status::invalid_argument(format!("snapshot.sessions: at most {MAX_SESSIONS_PER_RUNTIME}")));
                             }
+                            if s.open_requests.len() > MAX_SESSIONS_PER_RUNTIME || s.open_requests.iter().any(|r| r.is_empty() || r.len() > 64) {
+                                return Err(Status::invalid_argument("snapshot.open_requests: at most 200 ids of 1-64 bytes"));
+                            }
                             let sessions = s.sessions.iter().map(|m| session(m, self.runtime, now)).collect::<Result<Vec<_>, _>>()?;
-                            Incoming::Snapshot { replaces_seq: s.replaces_seq, sessions }
+                            self.hub.apply(user, id, self.conn, Incoming::Snapshot { replaces_seq: s.replaces_seq, sessions }, now).await.map_err(refused)?;
+                            self.hub.clear_stale_attention(user, id, s.open_requests, now).await.map_err(refused)?;
+                            self.snapshot_seen = true;
+                            if !self.pump().await? {
+                                return Ok(false);
+                            }
+                            continue;
                         }
-                        Some(_) if !snapshot_seen => {
+                        Some(_) if !self.snapshot_seen => {
                             return Err(Status::failed_precondition("the first message after the Hello must be a Snapshot"));
                         }
                         // a Heartbeat, or a body this build does not know
@@ -367,21 +455,66 @@ impl Open<'_> {
                     }
                 }
             };
-            // a Snapshot is not an event: it has no number to acknowledge
-            let seq = match &incoming {
-                Incoming::Snapshot { .. } => None,
-                Incoming::State { seq, .. } | Incoming::Accounts { seq, .. } => Some(*seq),
+            let (seq, status_report) = match step {
+                Step::Apply(incoming) => {
+                    let seq = match &incoming {
+                        Incoming::Snapshot { .. } => None,
+                        Incoming::State { seq, .. } | Incoming::Accounts { seq, .. } | Incoming::Status { seq, .. } => Some(*seq),
+                    };
+                    let status = matches!(incoming, Incoming::Status { .. });
+                    self.hub.apply(user, id, self.conn, incoming, now).await.map_err(refused)?;
+                    (seq, status)
+                }
+                // written before it is acknowledged
+                Step::Record(seq, event) => {
+                    self.hub.record(user, id, self.conn, seq, event, now).await.map_err(refused)?;
+                    (Some(seq), false)
+                }
             };
-            self.hub.apply(user, id, self.conn, incoming, now).await.map_err(refused)?;
             if let Some(seq) = seq {
                 let at = std::time::Instant::now();
                 self.receipts.received(seq, at);
                 // sixteen taken and unacknowledged: say so now
                 if self.receipts.is_due(at) && self.down.ack(&mut self.receipts).await.is_err() {
-                    return Ok(());
+                    return Ok(false);
                 }
             }
+            // the runtime may now hold an older settings version than the hub
+            if status_report && !self.pump().await? {
+                return Ok(false);
+            }
         }
+    }
+
+    /// Send what waits for this runtime, as far as the window allows. False
+    /// when the runtime has hung up.
+    async fn pump(&mut self) -> Result<bool, Status> {
+        if !self.snapshot_seen {
+            return Ok(true);
+        }
+        let (user, id) = (self.runtime.user_id, self.runtime.id);
+        let now = crate::auth::now();
+        let items = self.hub.down_pending(user, id, &self.sent, now).await.map_err(refused)?;
+        for item in items {
+            // the next Ack pumps again
+            if !self.down.has_room() {
+                break;
+            }
+            // claimed in the store under the number it will carry, before
+            // it goes: what was withdrawn meanwhile is not sent
+            let seq = self.down.next_seq();
+            let claimed = self.hub.down_sent(user, id, item.row, &self.instance, seq, now).await.map_err(refused)?;
+            self.sent.insert(item.key);
+            if !claimed {
+                continue;
+            }
+            match self.down.event(&item.body).await {
+                Ok(_) => {}
+                Err(Unsent::WindowFull) => break,
+                Err(Unsent::Gone) => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -390,6 +523,8 @@ fn refused(r: Refused) -> Status {
         Refused::NotLive => Status::aborted("this stream is no longer the runtime's live one"),
         Refused::TooManySessions => Status::resource_exhausted(format!("a runtime holds at most {MAX_SESSIONS_PER_RUNTIME} sessions")),
         Refused::DuplicateSession(id) => Status::invalid_argument(format!("snapshot.sessions: {id} appears twice")),
+        Refused::Invalid(m) => Status::invalid_argument(m),
+        Refused::Closing => Status::unavailable("the hub is shutting down; reconnect with backoff"),
         Refused::Store(e) => {
             tracing::warn!("fabric: store error on the runtime channel: {e}");
             Status::unavailable("the hub could not take that; reconnect and try again")
@@ -488,6 +623,16 @@ fn session(m: &pb::SessionState, runtime: &FabricRuntime, now: i64) -> Result<Fa
         updated_at: now,
         // the person's, never the runtime's: the hub keeps what it holds
         quiet_until: None,
+        following: false,
+        fabric_id: text("fabric_id", &m.fabric_id, 0, 64)?,
+        turn_id: text("turn_id", &m.turn_id, 0, 64)?,
+        queue: {
+            if m.queue.len() > MAX_QUEUE {
+                return Err(Status::invalid_argument(format!("queue: at most {MAX_QUEUE}")));
+            }
+            m.queue.iter().map(|q| text("queue", q, 1, 64)).collect::<Result<_, _>>()?
+        },
+        queue_paused: text("queue_paused", &m.queue_paused, 0, 200)?,
     })
 }
 
@@ -533,8 +678,13 @@ pub async fn serve(
 /// [`serve`] on a clone of `listener`, for `supervise`: when the server
 /// stops (it should not), the next start listens on the same socket.
 pub async fn serve_supervised(listener: std::sync::Arc<std::net::TcpListener>, service: RuntimeService) {
+    // shutting down: stopped for good, not restarted
+    if service.hub.is_closing() {
+        return std::future::pending().await;
+    }
+    let closed = service.hub.closed();
     let served = match listener.try_clone().and_then(tokio::net::TcpListener::from_std) {
-        Ok(l) => serve(l, service, std::future::pending()).await.map_err(|e| e.to_string()),
+        Ok(l) => serve(l, service, closed).await.map_err(|e| e.to_string()),
         Err(e) => Err(e.to_string()),
     };
     if let Err(e) = served {
@@ -559,6 +709,8 @@ mod tests {
             version: String::new(),
             accounts: "[]".into(),
             accounts_at: None,
+            status: "{}".into(),
+            ended_clean: false,
         }
     }
 

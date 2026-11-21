@@ -5666,6 +5666,7 @@ dependencies = [
 name = "taisce"
 version = "0.8.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "axum",
  "base64 0.23.1",
@@ -5674,11 +5675,13 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hex",
+ "hkdf",
  "image",
  "libc",
  "md5",
  "model2vec-rs",
  "openssl",
+ "p256",
  "pulldown-cmark",
  "quick-xml",
  "regex",

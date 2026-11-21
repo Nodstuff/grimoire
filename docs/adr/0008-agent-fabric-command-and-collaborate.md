@@ -1,6 +1,6 @@
 # ADR 0008 — Agent Fabric: read, command, ask, collaborate (Slices 2–5)
 
-- **Status**: proposed (2026-11-21). The contract half (Phase A): the wire messages, the
+- **Status**: accepted (2026-11-21). The contract half (Phase A): the wire messages, the
   signing rules and the viewer API. The server's implementation follows on the same branch
   and amends this ADR where building it teaches something.
 - **Who/when**: Tom + Claude, 2026-11-21
@@ -166,25 +166,42 @@ that limit, so a signature it checks itself would protect nothing.
 
 ### 7. Messages between agents
 
-- **Routing**: `to` containing `/` is an address; otherwise a fabric's name, which sends a
-  `note` to every member. An address resolves among the person's own sessions only, across
-  their runtimes, to the live session holding it. A message is bound to that session's
-  identity (runtime, session id), never to the address: if the address is later reused, the
-  message does not follow it.
+- **Routing never guesses** (asked for by Tom: how is an agent stopped from messaging the
+  wrong session?). In order:
+  1. `reply_to` set: the receiver is the sender of that message, by session id; any `to` is
+     ignored. A `reply` must carry it and it must name an ask sent to the caller.
+  2. `to` with a `/` is an address, matched exactly against the owner's live sessions. Several
+     matches (`DELIVERY_AMBIGUOUS`), only an exited one (`DELIVERY_RECEIVER_EXITED`) or none
+     (`DELIVERY_NO_SUCH_ADDRESS`) store nothing and answer with `candidates`: the sessions the
+     caller may have meant (address, session id, project, branch, state), never a pick.
+  3. Otherwise `to` is a fabric's exact name, and only a `note` may go to a fabric.
+- **The sender sees where it landed**: each `Sent` carries the resolved recipient (session
+  id, address, project, branch, state, last line), so a wrong guess shows at once.
+- **Bound to the session, end to end**: a message stores the receiver's (runtime, session id);
+  its nudge names that session id; `inbox` returns only mail whose receiver is the caller's
+  own session id, and each `Mail` carries `to_session_id` (which Workbox checks before
+  handing it over) and the sender's address and session id. If an address is later reused,
+  the message does not follow it.
+- **One person's fleet only**: every resolution (address, fabric, message id) runs in the
+  runtime owner's `Scope::User`. No path reaches another person's session, and the isolation
+  suite proves it for `send`, `who`, `inbox` and `inbox_ack`.
 - **Storage**: one row per receiver. The body is deleted when the receiver's runtime
   acknowledges it (`inbox_ack`), or after 24 hours unread, when it bounces. The envelope
   (who, to whom, kind, when, read, answered) stays 7 days, which is what the pair limit and
   the conversations view need.
-- **Bounces** arrive in the sender's inbox as `MESSAGE_KIND_BOUNCE` naming the message:
-  unread after 24 hours, the receiver removed from the fleet, the runtime reporting the
-  receiver exited, or the person saying stop to a paused pair.
+- **Bounces** arrive in the sender's inbox as `MESSAGE_KIND_BOUNCE`, `reply_to` naming the
+  message: unread after 24 hours, the receiver removed from the fleet, the runtime reporting
+  the receiver exited after the message was stored, or the person saying stop to a paused
+  pair. A refusal at send time (above) is an answer, not a bounce.
 - **Nudges**: one per message, re-sent on reconnect until a Result answers it. `may_wake` is
   true for ask and reply, false for note and bounce of a note. A `cold` result becomes a
   "wake to answer?" item on the phone; an ask to an asleep or exited session becomes an
   "ask waiting" item, since only the person can resume it.
 - **Limits**: 8,000 characters a body, 100 unread per receiver (`inbox_full`), the pair limit
   above. A paused pair holds new messages (`DELIVERY_PAUSED`) until continue (deliver) or
-  stop (bounce).
+  stop (bounce); either restarts the pair's count. The person ordering either session
+  (`send`, `answer`, `wake`) restarts the count of a pair that is not paused; a paused pair
+  waits for its own answer.
 - An agent's message never carries authority and never reaches a terminal: its text reaches
   a session only as the result of `inbox`.
 
@@ -206,10 +223,12 @@ phone checks approval and question signatures against.
 
 Per project, `text_off` and `private_notifications` are stored by the hub and set over HTTP
 by the person. They change only what the hub stores and pushes, never what a runtime does,
-so they are not signed. With `text_off`, turns, attention text, `last_line` and `note` are not
-written to the store (the live stream still carries them while the Mac is awake), and an
-order's payload or a message's body is kept only until delivered or read, which it must be to
-reach a sleeping Mac. Turning it on deletes the project's stored text at once.
+so they are not signed. With `text_off`, turns, `last_line` and `note` are not written to the
+store (the live stream still carries them while the Mac is awake). Three things are kept for
+as long as they must be and no longer: an order's payload until the runtime has it, a
+message's body until it is read, and an open attention item's text and signed request until
+it is cleared (the phone has to show and verify it to answer it). Turning Text off deletes
+the project's stored text at once, except those three while they are still needed.
 
 ### 10. Notifications
 
@@ -243,7 +262,7 @@ lowercase UUIDs. A resource that is not the caller's is 404.
 
 | Route | Answers |
 |---|---|
-| `GET /api/fabric/sessions` | As now. Each session gains `fabric_id`, `turn_id`, `queue`, `queue_paused`, `following`, `text_off`; each runtime gains `held`, `held_since`, `settings_version`, `present`, `public_key`, `devices: [{device_id, fingerprint, name, public_key, paired_at, counter}]`; the body gains `attention` (the open items). |
+| `GET /api/fabric/sessions` | As now. Each session gains `fabric_id`, `turn_id`, `queue`, `queue_paused`, `following`, `text_off`; each runtime gains `connection`, `held`, `held_since`, `settings_version`, `present`, `public_key`, `devices: [{device_id, fingerprint, name, public_key, paired_at, counter}]`; the body gains `attention` (the open items). `connection` is `online` (its stream is up), `idle` (its last stream ended because the runtime closed it: the Mac is awake with nothing to report, as Workbox does when its last session is gone) or `offline` (it dropped, went silent, the hub ended it, or it never connected). `online` stays, true only for `online`. None of the three alerts. |
 | `GET /api/fabric/sessions/{runtime_id}/{session_id}/turns?before=&limit=` | `{turns, more}`, newest first; `before` is a turn's `ended`; limit 1–100, default 30. |
 | `GET /api/fabric/turns?since=&limit=` | Every session's turns ended after `since`, oldest first, with `address`: "Since you last looked". Limit up to 200. |
 | `GET /api/fabric/attention` | `{items}`: open attention items, newest first. |
@@ -263,14 +282,14 @@ lowercase UUIDs. A resource that is not the caller's is 404.
 |---|---|---|
 | `POST /api/fabric/orders` | `{payload, device_id, signature}` | 202 `{order}`. The same order id with the same bytes again: 200, the same order. |
 | `DELETE /api/fabric/orders/{id}` | | 200 `{order}` withdrawn; 409 `already_sent`. |
-| `PUT /api/fabric/settings` | `{payload, device_id, signature}` | 200 the settings view; 409 `stale_settings` with `version`. |
+| `PUT /api/fabric/settings` | `{payload, device_id, signature}` | 200 the settings view; 409 `stale_settings` with `version`; 422 `not_paired_everywhere` naming the runtimes that do not know the device. |
 | `POST /api/fabric/pairing` | `{runtime_id, pairing_id, sealed}` | 202 the pairing view. |
 | `PUT /api/fabric/projects/{name}` | `{text_off?, private_notifications?}` | 200 the project. |
 | `POST`/`DELETE /api/fabric/sessions/{runtime_id}/{session_id}/follow` | | 200 the session. |
 | `POST`/`DELETE …/snooze` | as now | as now |
 | `DELETE /api/fabric/attention/{id}` | | 204: dismisses a hub item (wake offer, ask waiting); 409 for a runtime's item, which an order answers. |
 | `POST /api/fabric/conversations/{id}/continue` | | 200: the pair's count restarts and held messages go. |
-| `POST /api/fabric/conversations/{id}/stop` | | 200: held messages bounce; the pair stays paused until the person next orders either session. |
+| `POST /api/fabric/conversations/{id}/stop` | | 200: held messages bounce to their sender ("your person stopped this exchange"); the pair's count restarts. |
 
 **Order checks at the hub**, each with its code: 400 `malformed`, `non_canonical`; 404 the
 runtime or session is not the caller's; 409 `replayed` (counter at or below the highest the hub
@@ -303,7 +322,7 @@ compile, a duplicate fabric name, a name with `/` or `:`, over the counts).
   paused, unanswered_asks`.
 - *message*: `id, conversation_id, from {runtime_id, session_id, address}, to {…}, kind (note
   | ask | reply | bounce), body (null once read, expired, or under text off), doc,
-  in_reply_to, sent_at, read_at, state (unread | read | held | bounced), bounce_reason,
+  reply_to, sent_at, read_at, state (unread | read | held | bounced), bounce_reason,
   answered`.
 
 **New stream events**: `turn`, `attention`, `attention_cleared {id, runtime_id, session_id,
@@ -333,7 +352,63 @@ runtime's owner's fleet: an address never reaches another person's session.
 
 When an `answer` order to a question completes and the session's fabric is a named one with
 a doc, the hub appends the decision to that doc ("2026-11-21 · `taisce/main` asked: … —
-answered: …") through the review gate, attributed to `fabric`.
+answered: …") through the review gate, attributed to `fabric`. Not under Text off.
+
+### 13. Where it is built
+
+| Piece | Where |
+|---|---|
+| Tables, and every query in the person's scope | `crates/store/src/fabric.sql`, `crates/store/src/fabric/{work,mail}.rs` (tests in `work_tests.rs`) |
+| Durable events, orders, settings, pairing, projects, follow | `crates/daemon/src/fabric/record.rs` |
+| What goes down a stream, and its bookkeeping | `crates/daemon/src/fabric/down.rs`; the pump in `grpc.rs` |
+| Fabric tool calls, routing, the pair limit, bounces, conversations | `crates/daemon/src/fabric/mail.rs` |
+| Viewer routes and stream events | `crates/daemon/src/fabric/routes.rs` |
+| What a push says | `crates/daemon/src/fabric/mod.rs` (`alert_payload`), `hub.rs` (`finish_alerts`: presence, snooze, privacy) |
+| SIGNING | `crates/runtime-proto/src/signing.rs` |
+| The fake runtime (key, pairing, order checks, mail, calls) | `crates/runtime-proto/src/fake/work.rs`; `examples/demo-work-script.json` |
+| Tests | `crates/daemon/src/fabric/work_e2e.rs` (end to end), `isolation_tests.rs` (`agent_fabric_work_is_its_owners_alone`), `crates/runtime-proto/tests/signing_vectors.rs` |
+
+- Housekeeping runs every 60 seconds: orders that never reached their runtime before their
+  expiry become `expired` (their person is told), unread mail older than a day bounces, and
+  rows past retention go.
+- The hub's own attention items have ids `wake:<message>`, `ask:<message>` and
+  `pair:<conversation>:<time>`.
+- A runtime refusing a Settings (`Result.settings_version`, REFUSED) is logged; the phone sees
+  it as the runtime's `settings_version` staying behind (`GET /api/fabric/settings`).
+- A refused or failed order alerts its person wherever they are (it was their doing), except
+  `cancelled`.
+
+### 14. After the review of 2026-11-21
+
+- **An order goes down only if it can be claimed.** The pump claims a row in the store, under
+  the number it will carry, in the same statement that checks it may still go (an order not
+  withdrawn or expired, an offer not answered, mail not read). A withdraw (only from `pending`)
+  and a claim cannot both win. A Result never turns `withdrawn` or `expired` into anything else.
+- **An Ack covers only what its stream sent.** When a stream opens, every row an earlier stream
+  sent and the runtime never acknowledged loses its old number and goes again under a new one,
+  so a later stream's Ack cannot mark it received.
+- **Calls are bounded per runtime**: 16 in flight and a budget of 60 then 10 a second, beyond
+  either RESOURCE_EXHAUSTED. Only calls that change something (`send`, `inbox_ack`) are
+  remembered for retries; each is taken by its id before it runs, so the same id at once runs
+  once. At most 4096 are remembered. `who` and `inbox` are answered fresh. A message's id
+  is derived from the call and its receiver, so a retried fabric note reaches each member once.
+  Held mail counts toward the 100-message limit.
+- **Text off, every path**: an attention item's text goes when it is cleared, trimmed or
+  withdrawn by a snapshot, by its own project; an order's text and bytes go when the runtime
+  has them; a turn of a session the hub does not know is stored without text.
+- **Private notifications by the alert's own project**, so a session gone from the fleet stays
+  private.
+- **The same order posted twice at once is one order**: the existence check, the counter check
+  and the insert are one store turn, and the second post is answered with the order.
+- **Settings need a device every runtime knows.** Rejected: taking them and surfacing each
+  runtime's refusal later. Settings are fleet-wide; a runtime that cannot verify them keeps its
+  old guardrails without anyone seeing, which is worse than a phone told at once to pair first.
+- **Shutdown ends the channel**: closing the hub (SIGTERM) ends every Attach stream with
+  UNAVAILABLE (the runtime reconnects with backoff), takes no new one, and stops the gRPC
+  server for good.
+- **Pushes held while the person is at the Mac go when they leave it** (`present` turns
+  false), newest per notification, and only those that still stand: a state alert whose
+  session is still in that state, an approval or question still open. At most 200 a runtime.
 
 ## Alternatives rejected
 
@@ -348,12 +423,20 @@ answered: …") through the review gate, attributed to `fabric`.
   wins" rule gives the same effect with one integer per device on the runtime.
 - **Approvals hashing only the command text**: §4; the request hash binds more for nothing.
 
+## Decided after review (2026-11-21)
+
+- **Text off still stores what must reach a sleeping Mac.** An order's signed payload and a
+  message's body are stored until delivered or read, because the Mac may be asleep when they
+  are sent; nothing of them stays after. Turns, attention text, `last_line` and `note` are not
+  written for a Text off project. Accepted, and said in Trust and Safety.
+- **Approvals hash the whole signed request**, not only the command text (§4). Accepted.
+- **Removing a lost device from the phone** would need a signed order to each runtime. Deferred:
+  in these slices a device is removed at the Mac.
+- **`TAMPER` items inform only**; a held session is released at the Mac. Accepted.
+- **Notification buttons for a question's choices** are the app's: categories registered at
+  run time where they can carry the labels, a Notification Service Extension only if needed.
+
 ## Open questions
 
 - Workbox to confirm: the `GitOutcome` fields, `TurnEnd`, and whether presence (`present`) is
   known reliably enough to suppress pushes.
-- The phone's notification actions for questions need choices in the push. A Notification
-  Service Extension can build per-question buttons; the app decides.
-- Removing a lost device from the phone (not only at the Mac) would need a signed order to
-  each runtime; not in these slices.
-- `TAMPER` items inform only; releasing a held session is done at the Mac.

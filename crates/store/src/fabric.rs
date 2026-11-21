@@ -15,6 +15,17 @@
 //!   narrowed to one workspace has no business reading it.
 //! - `Scope::Public`: denied (`deny_public`).
 
+mod mail;
+#[cfg(test)]
+mod work_tests;
+mod work;
+
+pub use mail::{FabricConversation, FabricMessage, MAX_UNREAD, MESSAGE_TEXT_TTL, Party};
+pub use work::{
+    DownKind, FabricAttention, FabricOrder, FabricPairing, FabricProject, FabricSettings, FabricTurn, MAX_OPEN_ATTENTION,
+    ORDER_UNDELIVERED, PAIRING_ROW_RETENTION, WORK_RETENTION,
+};
+
 use crate::scope::Scope;
 use crate::sqlite::SqliteStore;
 use crate::{Result, StoreError};
@@ -46,6 +57,11 @@ pub struct FabricRuntime {
     /// The last headroom report: a JSON array.
     pub accounts: String,
     pub accounts_at: Option<i64>,
+    /// The last RuntimeStatus, as JSON (`{}` before the first).
+    pub status: String,
+    /// Its last stream ended because the runtime closed it (idle), not
+    /// because it dropped or went silent (offline).
+    pub ended_clean: bool,
 }
 
 /// What the hub knows about a runtime's connection, written whole.
@@ -57,6 +73,8 @@ pub struct RuntimeLink<'a> {
     pub last_seen_at: Option<i64>,
     pub accounts: &'a str,
     pub accounts_at: Option<i64>,
+    pub status: &'a str,
+    pub ended_clean: bool,
 }
 
 /// What a session is doing, as its runtime reports it. `Unknown` is a state
@@ -132,10 +150,52 @@ pub struct FabricSession {
     /// runtime's to say: writing a session never changes it, only
     /// [`SqliteStore::fabric_session_quiet`] does.
     pub quiet_until: Option<i64>,
+    /// Followed by its person: every finished turn alerts. Theirs, like
+    /// `quiet_until`: only [`SqliteStore::fabric_session_follow`] writes it.
+    pub following: bool,
+    /// The named fabric's id; empty for the project's own.
+    pub fabric_id: String,
+    /// The latest turn's id, running or finished.
+    pub turn_id: String,
+    /// The queued prompts (order ids), in the order they will be typed.
+    pub queue: Vec<String>,
+    /// Why the queue is paused; empty when it is not.
+    pub queue_paused: String,
+}
+
+impl FabricSession {
+    /// A session with nothing reported but its identity, for tests and
+    /// for building one field by field.
+    pub fn blank(runtime_id: Uuid, id: Uuid, user_id: Uuid, address: &str, state: SessionStatus, at: i64) -> Self {
+        FabricSession {
+            runtime_id,
+            id,
+            user_id,
+            address: address.into(),
+            fabric: String::new(),
+            project: String::new(),
+            worktree: String::new(),
+            branch: String::new(),
+            account: String::new(),
+            state,
+            tool: String::new(),
+            note: String::new(),
+            last_line: String::new(),
+            context_used_pct: None,
+            since: at,
+            updated_at: at,
+            quiet_until: None,
+            following: false,
+            fabric_id: String::new(),
+            turn_id: String::new(),
+            queue: vec![],
+            queue_paused: String::new(),
+        }
+    }
 }
 
 const RUNTIME_COLS: &str =
-    "id, user_id, name, created_at, revoked_at, last_seen_at, instance_id, last_up_seq, version, accounts, accounts_at";
+    "id, user_id, name, created_at, revoked_at, last_seen_at, instance_id, last_up_seq, version, accounts, accounts_at, status, ended_clean";
 
 /// A UUID column. A value that is not one is a corrupt row and an error,
 /// never the nil id.
@@ -158,11 +218,13 @@ fn runtime_row(r: &Row) -> rusqlite::Result<FabricRuntime> {
         version: r.get(8)?,
         accounts: r.get(9)?,
         accounts_at: r.get(10)?,
+        status: r.get(11)?,
+        ended_clean: r.get(12)?,
     })
 }
 
 const SESSION_COLS: &str = "runtime_id, id, user_id, address, fabric, project, worktree, branch, account, state, tool, \
-     note, last_line, context_used_pct, since, updated_at, quiet_until";
+     note, last_line, context_used_pct, since, updated_at, quiet_until, following, fabric_id, turn_id, queue, queue_paused";
 
 fn session_row(r: &Row) -> rusqlite::Result<FabricSession> {
     let state: String = r.get(9)?;
@@ -186,6 +248,12 @@ fn session_row(r: &Row) -> rusqlite::Result<FabricSession> {
         since: r.get(14)?,
         updated_at: r.get(15)?,
         quiet_until: r.get(16)?,
+        following: r.get(17)?,
+        fabric_id: r.get(18)?,
+        turn_id: r.get(19)?,
+        // a queue that does not parse is an empty one: it is the runtime's to restate
+        queue: serde_json::from_str(&r.get::<_, String>(20)?).unwrap_or_default(),
+        queue_paused: r.get(21)?,
     })
 }
 
@@ -348,6 +416,20 @@ impl SqliteStore {
             .ok_or_else(|| StoreError::NotFound(format!("session {id}")))
     }
 
+    /// Follow one session of one of the scope's runtimes (or stop), and hand
+    /// back the row. Anyone else's, or one not there, is NotFound.
+    pub fn fabric_session_follow(&mut self, runtime: Uuid, id: Uuid, following: bool) -> Result<FabricSession> {
+        self.fabric_runtime(runtime)?;
+        self.conn
+            .query_row(
+                &format!("UPDATE fabric_sessions SET following = ?3 WHERE runtime_id = ?1 AND id = ?2 RETURNING {SESSION_COLS}"),
+                params![runtime.to_string(), id.to_string(), following],
+                session_row,
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("session {id}")))
+    }
+
     /// Lift the snoozes of one of the scope's runtimes that have run out at
     /// `now`, and only those: one set again meanwhile (to a time ahead) is
     /// left alone. Says how many were lifted.
@@ -390,13 +472,15 @@ impl SqliteStore {
         if !put.is_empty() {
             let mut st = tx.prepare(
                 "INSERT INTO fabric_sessions (runtime_id, id, user_id, address, fabric, project, worktree, branch,
-                     account, state, tool, note, last_line, context_used_pct, since, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                     account, state, tool, note, last_line, context_used_pct, since, updated_at,
+                     fabric_id, turn_id, queue, queue_paused)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
                  ON CONFLICT (runtime_id, id) DO UPDATE SET address = excluded.address, fabric = excluded.fabric,
                      project = excluded.project, worktree = excluded.worktree, branch = excluded.branch,
                      account = excluded.account, state = excluded.state, tool = excluded.tool, note = excluded.note,
                      last_line = excluded.last_line, context_used_pct = excluded.context_used_pct,
-                     since = excluded.since, updated_at = excluded.updated_at",
+                     since = excluded.since, updated_at = excluded.updated_at, fabric_id = excluded.fabric_id,
+                     turn_id = excluded.turn_id, queue = excluded.queue, queue_paused = excluded.queue_paused",
             )?;
             for s in put {
                 st.execute(params![
@@ -415,7 +499,11 @@ impl SqliteStore {
                     s.last_line,
                     s.context_used_pct,
                     s.since,
-                    s.updated_at
+                    s.updated_at,
+                    s.fabric_id,
+                    s.turn_id,
+                    serde_json::to_string(&s.queue).unwrap_or_else(|_| "[]".into()),
+                    s.queue_paused
                 ])?;
             }
             drop(st);
@@ -429,7 +517,7 @@ impl SqliteStore {
         if let Some(link) = link {
             tx.execute(
                 "UPDATE fabric_runtimes SET instance_id = ?2, last_up_seq = ?3, version = ?4, last_seen_at = ?5,
-                     accounts = ?6, accounts_at = ?7
+                     accounts = ?6, accounts_at = ?7, status = ?8, ended_clean = ?9
                  WHERE id = ?1",
                 params![
                     runtime.to_string(),
@@ -438,7 +526,9 @@ impl SqliteStore {
                     link.version,
                     link.last_seen_at,
                     link.accounts,
-                    link.accounts_at
+                    link.accounts_at,
+                    link.status,
+                    link.ended_clean
                 ],
             )?;
         }
@@ -506,6 +596,11 @@ mod tests {
             since: updated_at,
             updated_at,
             quiet_until: None,
+            following: false,
+            fabric_id: String::new(),
+            turn_id: String::new(),
+            queue: vec![],
+            queue_paused: String::new(),
         }
     }
 
@@ -538,6 +633,8 @@ mod tests {
             last_seen_at: Some(20),
             accounts: r#"[{"name":"personal"}]"#,
             accounts_at: Some(19),
+            status: "{}",
+            ended_clean: false,
         };
         s.fabric_runtime_write(r.id, &[], &[], Some(&link)).unwrap();
         let got = s.fabric_runtime(r.id).unwrap();
@@ -637,7 +734,7 @@ mod tests {
             assert!(is_not_found(s.fabric_sessions_put(r.id, &[session(sid, "ann/was-here", SessionStatus::Exited, 999)])));
             assert!(is_not_found(s.fabric_sessions_touch(r.id, 999)));
             assert!(is_not_found(s.fabric_runtime_write(r.id, &[sid], &[], None)));
-            let link = RuntimeLink { instance_id: None, last_up_seq: 9, version: "x", last_seen_at: None, accounts: "[]", accounts_at: None };
+            let link = RuntimeLink { instance_id: None, last_up_seq: 9, version: "x", last_seen_at: None, accounts: "[]", accounts_at: None, status: "{}", ended_clean: false };
             assert!(is_not_found(s.fabric_runtime_write(r.id, &[], &[], Some(&link))));
             assert!(is_not_found(s.fabric_runtime_revoke(r.id, 5)));
             assert!(is_not_found(s.fabric_runtime_create(tom, "planted", "h9", 5)));
