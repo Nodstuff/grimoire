@@ -522,3 +522,52 @@ async fn a_pair_that_talks_too_long_pauses_until_its_person_says_so() {
     };
     assert!(inbox.iter().any(|m| m.kind == pb::MessageKind::Bounce as i32 && m.body.contains("stopped")), "{inbox:?}");
 }
+
+/// An answered question goes into the session's fabric's doc as a dated
+/// decision, through the review gate, as the `fabric` agent.
+#[tokio::test]
+async fn an_answered_question_is_written_into_the_fabrics_doc() {
+    use taisce_store::{BlockStore as _, Scope};
+    let t = setup().await;
+    let doc = t.store.lock(Scope::User(t.user)).create_doc("Runtime Channel", None, t.human).unwrap().id;
+    let mut phone = Phone::new("a");
+    let fabric = uuid::Uuid::now_v7().to_string();
+    let s1 = ScriptSession { fabric_id: fabric.clone(), ..in_project(S1, "taisce/main", "needs_you", "taisce") };
+    let (rt, mut f) = online(&t, "mbp", "l1", &[s1], Some(&phone)).await;
+    until(&t, "/api/fabric/runtimes", |v| v["runtimes"][0]["devices"].as_array().is_some_and(|d| d.len() == 1)).await;
+    let s = pb::Settings {
+        fabrics: vec![pb::Fabric { id: fabric, name: "runtime-channel".into(), doc_id: doc.to_string(), doc_title: "Runtime Channel".into(), ..Default::default() }],
+        ..Default::default()
+    };
+    assert_eq!(t.send("PUT", "/api/fabric/settings", Some(phone.settings(1, s))).await.0, StatusCode::OK);
+    assert_eq!(next(&mut f).await, Handled::Settings { version: 1, accepted: true });
+    let request_id = f
+        .ask(&ScriptAttention { session: S1.into(), kind: "question".into(), text: "Seq per instance, or per runtime?".into(), ..Default::default() })
+        .await
+        .unwrap();
+    let v = until(&t, "/api/fabric/attention", |v| v["items"].as_array().is_some_and(|a| a.len() == 1)).await;
+    let request = unb64(v["items"][0]["signed"]["request"].as_str().unwrap());
+    let (body, _) = phone.order(
+        &rt,
+        pb::order::What::Command(pb::Command {
+            session_id: S1.into(),
+            verb: pb::Verb::Answer as i32,
+            text: "Per instance".into(),
+            request_id,
+            request_hash: signing::request_hash(&request).to_vec(),
+            ..Default::default()
+        }),
+    );
+    assert_eq!(t.send("POST", "/api/fabric/orders", Some(body)).await.0, StatusCode::ACCEPTED);
+    assert!(matches!(next(&mut f).await, Handled::Order { outcome: pb::Outcome::Done, .. }));
+    for _ in 0..500 {
+        let tree = t.store.lock(Scope::User(t.user)).read_doc(doc).unwrap();
+        let (md, _) = taisce_store::locate::export_with_offsets(&tree.roots);
+        if md.contains("asked: Seq per instance, or per runtime? — answered: Per instance") {
+            assert!(md.contains("`taisce/main`"), "{md}");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the decision never reached the doc");
+}

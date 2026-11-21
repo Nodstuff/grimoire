@@ -98,6 +98,8 @@ pub(crate) struct T {
     pub(crate) store: SharedStore,
     pub(crate) hub: Hub,
     pub(crate) user: Uuid,
+    /// their human principal
+    pub(crate) human: Uuid,
     /// the person's own app
     pub(crate) token: String,
     pub(crate) alerts: Arc<Mutex<Vec<SessionAlert>>>,
@@ -115,7 +117,7 @@ async fn setup_with(pace: Pace) -> T {
     let app = super::router(FabricState { hub: Some(hub.clone()), local_human: human })
         .layer(axum::middleware::from_fn_with_state(st, require_auth));
     let url = serve_channel(&store, &hub, pace).await;
-    T { app, store, hub, user, token, alerts, url }
+    T { app, store, hub, user, human, token, alerts, url }
 }
 
 pub(crate) async fn setup() -> T {
