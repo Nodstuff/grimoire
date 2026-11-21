@@ -212,6 +212,7 @@ impl RuntimeState {
             // first sight
             next.updated_at = now;
             next.quiet_until = None;
+            next.following = false;
             let mut slot = Slot { row: next, dirty: true, alerted: [None; 3], urgent_at: None };
             if let Some(kind) = AlertKind::on(None, slot.row.state) {
                 slot.alerted[kind as usize] = Some(now);
@@ -224,8 +225,9 @@ impl RuntimeState {
         // the same report again, only later: nothing changed. It does say
         // the session still exists, which is recorded about once a day
         next.updated_at = slot.row.updated_at;
-        // a snooze is the person's: no report carries or changes it
+        // a snooze and a follow are the person's: no report carries or changes them
         next.quiet_until = slot.row.quiet_until;
+        next.following = slot.row.following;
         if slot.row == next {
             if now - slot.row.updated_at >= STILL_THERE_AFTER {
                 slot.row.updated_at = now;
@@ -659,6 +661,7 @@ impl Hub {
                 last_seen_at: row.last_seen_at,
                 accounts: &row.accounts,
                 accounts_at: row.accounts_at,
+                status: &row.status,
             });
             s.fabric_runtime_write(runtime, &evicted, &rows, link.as_ref())
         })

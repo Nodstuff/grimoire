@@ -50,6 +50,8 @@ const MAX_ACCOUNTS: usize = 32;
 /// Events are not counted: the window paces them.
 const CONTROL_BURST: f64 = 30.0;
 const CONTROL_PER_SEC: f64 = 1.0;
+/// Queued prompts one session may report.
+const MAX_QUEUE: usize = 32;
 /// The latest `since` taken (2100-01-01): a wild clock is refused.
 const MAX_SINCE: i64 = 4_102_444_800;
 
@@ -488,6 +490,16 @@ fn session(m: &pb::SessionState, runtime: &FabricRuntime, now: i64) -> Result<Fa
         updated_at: now,
         // the person's, never the runtime's: the hub keeps what it holds
         quiet_until: None,
+        following: false,
+        fabric_id: text("fabric_id", &m.fabric_id, 0, 64)?,
+        turn_id: text("turn_id", &m.turn_id, 0, 64)?,
+        queue: {
+            if m.queue.len() > MAX_QUEUE {
+                return Err(Status::invalid_argument(format!("queue: at most {MAX_QUEUE}")));
+            }
+            m.queue.iter().map(|q| text("queue", q, 1, 64)).collect::<Result<_, _>>()?
+        },
+        queue_paused: text("queue_paused", &m.queue_paused, 0, 200)?,
     })
 }
 
@@ -559,6 +571,7 @@ mod tests {
             version: String::new(),
             accounts: "[]".into(),
             accounts_at: None,
+            status: "{}".into(),
         }
     }
 

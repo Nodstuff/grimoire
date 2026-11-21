@@ -30,25 +30,7 @@ fn setup() -> T {
 }
 
 fn session(t: &T, id: Uuid, address: &str, state: SessionStatus, now: i64) -> FabricSession {
-    FabricSession {
-        runtime_id: t.rt.id,
-        id,
-        user_id: t.user,
-        address: address.into(),
-        fabric: String::new(),
-        project: String::new(),
-        worktree: String::new(),
-        branch: String::new(),
-        account: String::new(),
-        state,
-        tool: String::new(),
-        note: String::new(),
-        last_line: String::new(),
-        context_used_pct: None,
-        since: now,
-        updated_at: now,
-        quiet_until: None,
-    }
+    FabricSession::blank(t.rt.id, id, t.user, address, state, now)
 }
 
 impl T {
