@@ -147,6 +147,11 @@ enum FabricPush {
         }
         // the push's pointer, the server's item and (below) the signed request must agree
         if let s = p.session, item.session != s { return "That notification doesn't match what your Mac has waiting." }
+        // a signed answer or denial needs the push to name the session as well as the item
+        if action == Action.deny || action.hasPrefix(Action.choicePrefix), p.session == nil {
+            fleet.requestOpen(p)
+            return "That notification doesn't say which session it is about. Nothing was sent; it's open in Taisce."
+        }
         switch action {
         case Action.deny:
             switch fleet.command.verify(item) {

@@ -158,7 +158,6 @@ struct AgentsContent: View {
                             .accessibilityIdentifier("agents.empty.noRuntime")
                     }
                 } else {
-                    if board.held { heldBanner }
                     talkAndFilter
                     status
                     if board.hasNoSessions {
@@ -173,6 +172,12 @@ struct AgentsContent: View {
                 }
             }
             .listStyle(.insetGrouped)
+            // Hold all is pinned above the list, never a row of it: a list
+            // scrolled down to a session would keep it out of sight (and out
+            // of the view tree), while the toolbar alone said "Release"
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if board.held, !loading, !board.hasNoRuntime { heldBanner }
+            }
             .listSectionSpacing(18)
             .scrollContentBackground(.hidden)
             .contentMargins(.top, 0, for: .scrollContent)
@@ -249,13 +254,15 @@ struct AgentsContent: View {
     }
 
     private var heldBanner: some View {
-        Section {
-            LapisBanner(text: "Hold all is on: your Macs take nothing but its release.", tone: .yellow, symbol: "hand.raised.fill",
-                        actionTitle: "Release", action: { onHold(false) })
-                .listRowInsets(EdgeInsets())
-                .listRowBackground(Color.clear)
-                .accessibilityIdentifier("agents.held")
-        }
+        LapisBanner(text: "Hold all is on: your Macs take nothing but its release.", tone: .yellow, symbol: "hand.raised.fill",
+                    actionTitle: "Release", action: { onHold(false) })
+            .padding(.horizontal, Lapis.Layout.gutter)
+            .padding(.vertical, 8)
+            .frame(maxWidth: Lapis.Layout.readingWidth)
+            .frame(maxWidth: .infinity)
+            // one element holding the words and the Release button
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("agents.held")
     }
 
     /// Talk, with what it asks you to settle; the fabric filter.

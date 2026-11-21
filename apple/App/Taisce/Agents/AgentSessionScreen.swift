@@ -58,10 +58,11 @@ struct AgentSessionScreen: View {
             store.sessionOnScreen(nil)
             feed.looked()
         }
-        .task(id: scenePhase) {
-            // the person opened it (or came back to it) and it had finished:
-            // tell the Mac it was seen (FINISHED becomes IDLE). Only on their
-            // looking, never because the server reported a state.
+        .task(id: SeenWhile(phase: scenePhase, state: session?.state)) {
+            // the person has it on screen, in the front, and it has finished
+            // (they opened it, came back to it, or watched it finish): tell
+            // the Mac it was seen (FINISHED becomes IDLE). Only while they
+            // look: a state the server reports never signs SEEN by itself.
             guard scenePhase == .active, session?.state == .finished, let runtime, runtime.online, command.isPaired(with: runtime) else { return }
             try? await Task.sleep(for: .seconds(2))
             guard !Task.isCancelled, scenePhase == .active, session?.state == .finished else { return }
@@ -594,6 +595,13 @@ struct QuestionCard: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("attention.question")
     }
+}
+
+/// When SEEN is reconsidered: the app came to the front or left it, or the
+/// session on screen changed state.
+private struct SeenWhile: Hashable {
+    let phase: ScenePhase
+    let state: SessionState?
 }
 
 /// A sheet's handle on an attention item.

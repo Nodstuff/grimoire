@@ -373,16 +373,23 @@ final class FabricUITests: XCTestCase {
     }
 
     func testHoldAllIsOneSignedOrderPerMac() throws {
-        let (app, stub) = try launch()
+        // a list long enough to scroll its top away
+        let more = (6...9).map { Self.session($0, "scratch/s\($0)", "idle", fabric: "scratch") }
+        let (app, stub) = try launch(sessions: Self.sessions + more)
         pair(app, stub)
+        // scrolled down to the last sessions, as after coming back from one far down
+        for _ in 0..<3 { app.swipeUp(velocity: .fast) }
         el(app, "agents.hold").tap()
         let hold = app.buttons.matching(NSPredicate(format: "label == %@", "Hold all")).lastMatch
         XCTAssertTrue(hold.waitForExistence(timeout: 5))
         hold.tap()
         waitFor("a hold was posted") { stub.postedOrders.contains { $0.what == .hold(true) } }
         XCTAssertTrue(el(app, "agents.held").waitForExistence(timeout: 10), "the list says so")
+        let banner = el(app, "agents.held")
+        XCTAssertTrue(app.windows.firstMatch.frame.contains(banner.frame), "in sight however far the list is scrolled")
         shot(app, "agents-held")
-        el(app, "agents.hold").tap()
+        // released from the banner itself
+        banner.buttons["Release"].tap()
         waitFor("released") { stub.postedOrders.contains { $0.what == .hold(false) } }
         waitFor("the banner goes") { !self.el(app, "agents.held").exists }
     }

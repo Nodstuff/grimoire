@@ -450,6 +450,11 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         let elsewhere = FabricPush.Pointer(kind: "fabric_attention", session: FleetSessionKey(runtimeID: "r1", id: "s2"), itemID: "q1", attentionKind: .question)
         #expect(await FabricPush.perform(elsewhere, action: QuestionActions.identifier(choiceID: "fix", title: "Fix the test"), in: s) != nil)
         #expect(fake.posted.count == 1)
+        // a pointer naming no session at all signs nothing either
+        let nowhere = FabricPush.Pointer(kind: "fabric_attention", session: nil, itemID: "q1", attentionKind: .question)
+        #expect(await FabricPush.perform(nowhere, action: QuestionActions.identifier(choiceID: "fix", title: "Fix the test"), in: s) != nil)
+        #expect(await FabricPush.perform(nowhere, action: FabricPush.Action.deny, in: s) != nil)
+        #expect(fake.posted.count == 1)
     }
 
     @Test func theVerbsFollowWhatTheMacSignedNotWhatTheServerSays() async throws {

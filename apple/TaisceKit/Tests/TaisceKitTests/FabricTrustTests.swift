@@ -146,4 +146,26 @@ import Valet
         let fleet = try FleetTests.decode(Fleet.self, json)
         #expect(fleet.sessions.count == 3 && fleet.attention.map(\.id) == ["h1"])
     }
+
+    // MARK: a runtime's held state
+
+    /// A runtime event exactly as a scratch hub sent it for real Workbox
+    /// after Hold all (2026-11-21): six accounts with every figure unknown,
+    /// a paired device whose counter is a millisecond clock.
+    static let heldRuntime = #"""
+{"id": "01a1fde0-eab2-7072-8121-a101667bb93a", "name": "workbox-mac", "created_at": 1795260738, "online": true, "connection": "online", "last_seen_at": 1795269621, "version": "Workbox 0.0.1 (dev)", "accounts": [{"name": "default", "session_resets_at": null, "session_used_pct": null, "week_resets_at": null, "week_used_pct": null}, {"name": "eng2", "session_resets_at": null, "session_used_pct": null, "week_resets_at": null, "week_used_pct": null}, {"name": "eng3", "session_resets_at": null, "session_used_pct": null, "week_resets_at": null, "week_used_pct": null}, {"name": "eng4", "session_resets_at": null, "session_used_pct": null, "week_resets_at": null, "week_used_pct": null}, {"name": "eng5", "session_resets_at": null, "session_used_pct": null, "week_resets_at": null, "week_used_pct": null}, {"name": "eng6", "session_resets_at": null, "session_used_pct": null, "week_resets_at": null, "week_used_pct": null}], "accounts_at": 1795267487, "held": true, "held_since": 1795268883, "settings_version": 0, "present": false, "public_key": "BBsNcMWKtrY2j9pSODAG3xGhJbHbYTMrF41kxVzxZs7DFX9q7q5BhJ04G+QOpOsDnr55HMhV/u40WsXwu+m2xkc=", "devices": [{"device_id": "6c7a411a916efff433dd836115989ee39fec07562f95ce5fa5bb28e62f87a975", "fingerprint": "6c7a 411a 916e fff4", "name": "fabric3-iphone", "public_key": "BHS731254IsRO+U17DCKsLa3BxldmDoVWzX0GjcJTVSWMBM52p/0Z7yICarQiPETVnNryMPPPDlNCuqSE9lCijk=", "paired_at": 1795268815, "counter": 1795268883183}]}
+"""#
+
+    @Test func aHeldRuntimeAsTheHubSendsItShowsHeld() throws {
+        let decoded = try #require(try FleetChange.decode(SSEEvent(id: "319", event: "runtime", data: Self.heldRuntime)))
+        guard case .runtime(let r) = decoded.change else { Issue.record("a runtime change"); return }
+        #expect(r.held && r.heldSince == 1_795_268_883 && r.connection == .online)
+        var before = r
+        before.held = false
+        before.heldSince = nil
+        var fleet = Fleet(rev: 318, runtimes: [before])
+        let applied = fleet.apply(decoded.change, rev: decoded.rev)
+        #expect(applied)
+        #expect(fleet.runtimes.first?.held == true)
+    }
 }
