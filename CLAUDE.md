@@ -84,6 +84,16 @@ account may be flipped to the work account by other sessions — push with
   `Order` or `Settings` (SIGNING in the `.proto`, `taisce_runtime_proto::signing`, vectors in
   `proto/taisce/runtime/v1/testdata/`; regenerate with `make_vectors.py`, never by hand).
   Agent tool calls use `rpc Call`, not the stream.
+- The phone signs only what it verified: approval sheets, answer buttons (in the app and on a
+  notification) and allowed verbs come from the Mac-signed request, never from the server's item
+  or the push payload. Releasing Hold all needs Face ID; holding is one tap.
+- Live end to end: `apple/App/TaisceUITests/FabricWorkboxLiveUITests` drives the app against a
+  real Workbox (its Debug Preview, `WORKBOX_FABRIC=1`) and a scratch SERVER daemon
+  (`TEST_RUNNER_TAISCE_UI_URL`, `…_SIGNIN_RELAY`, `…_FABRIC_PAIR_CODE`, `…_FABRIC_SESSION`); the
+  pairing fingerprint must be confirmed at the Mac while it runs.
+- On the box (deployed 2026-11-21): enrol a runtime by hash only (`taisce fabric runtime add
+  --name <n> --hash <sha256 of trt_…>`), so the secret never crosses SSM. `revoke` is a soft
+  delete (`revoked_at`) that cascades the runtime's sessions, turns, orders and pairings.
 
 ## Start here
 - **[[Roadmap]]** in Taisce (under the `[[Taisce]]` tree, renamed from Grimoire on 2026-10-14) is the outstanding list — read it first in any
