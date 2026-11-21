@@ -47,6 +47,17 @@ async fn online(t: &T, name: &str, instance: &str, sessions: &[ScriptSession], p
     (rt.to_string(), f)
 }
 
+/// The first alert of `kind`, once it has been raised.
+async fn alert_of(t: &T, kind: AlertKind) -> super::view::SessionAlert {
+    for _ in 0..500 {
+        if let Some(a) = t.alerts.lock().unwrap().iter().find(|a| a.kind == kind) {
+            return a.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("never saw a {kind:?} alert: {:?}", t.alerts.lock().unwrap());
+}
+
 async fn next(f: &mut Fake) -> Handled {
     let d = f.next_down(WAIT).await.expect("a Down event within 5 seconds");
     f.handle(d).await.unwrap()
@@ -162,8 +173,7 @@ async fn an_order_is_checked_kept_sent_and_answered() {
     }
     let audit = until(&t, &format!("/api/fabric/orders?session_id={S1}"), |v| v["orders"][0]["state"] == "refused").await;
     assert_eq!(audit["orders"].as_array().unwrap().len(), 2);
-    let alerts = super::tests::alerts_when(&t.alerts, 1).await;
-    assert!(alerts.iter().any(|a| a.kind == AlertKind::OrderRefused), "{alerts:?}");
+    alert_of(&t, AlertKind::OrderRefused).await;
 }
 
 #[tokio::test]
@@ -244,8 +254,7 @@ async fn an_approval_binds_the_request_the_phone_verified() {
     let sig = unb64(item["signed"]["signature"].as_str().unwrap());
     signing::verify(signing::ATTENTION, &f.side.public_key(), &request, &sig).unwrap();
     assert_eq!(pb::AttentionRequest::decode(&request[..]).unwrap().text, "./release.sh --notarize");
-    let alerts = super::tests::alerts_when(&t.alerts, 1).await;
-    let a = alerts.iter().find(|a| a.kind == AlertKind::Approval).expect("an approval alert");
+    let a = alert_of(&t, AlertKind::Approval).await;
     assert_eq!(a.preview.as_deref(), Some("Wants to run: ./release.sh --notarize"));
     // the fleet carries it too
     assert_eq!(t.get("/api/fabric/sessions").await["attention"][0]["id"], request_id.as_str());
@@ -290,8 +299,7 @@ async fn a_question_is_answered_with_a_tap_and_hold_all_stops_everything() {
         .unwrap();
     let v = until(&t, "/api/fabric/attention", |v| v["items"].as_array().is_some_and(|a| a.len() == 1)).await;
     assert_eq!(v["items"][0]["choices"][0], json!({"id": "fix", "label": "Fix the test"}));
-    let alerts = super::tests::alerts_when(&t.alerts, 1).await;
-    let q = alerts.iter().find(|a| a.kind == AlertKind::Question).expect("a question alert");
+    let q = alert_of(&t, AlertKind::Question).await;
     assert_eq!(q.choices[1]["label"], "Skip it");
     let request = unb64(v["items"][0]["signed"]["request"].as_str().unwrap());
     let (body, _) = phone.order(
@@ -493,7 +501,7 @@ async fn a_pair_that_talks_too_long_pauses_until_its_person_says_so() {
     let v = until(&t, "/api/fabric/attention", |v| v["items"].as_array().is_some_and(|a| a.len() == 1)).await;
     assert_eq!(v["items"][0]["kind"], "pair_paused");
     let conv = v["items"][0]["conversation_id"].as_str().unwrap().to_string();
-    assert!(super::tests::alerts_when(&t.alerts, 1).await.iter().any(|a| a.kind == AlertKind::PairPaused));
+    alert_of(&t, AlertKind::PairPaused).await;
     assert_eq!(sent(&f.send_mail(&note(13)).await.unwrap()).0, pb::Delivery::Paused, "held while paused");
     // continue: the held two go, and the count starts again
     let (st, c) = t.send("POST", &format!("/api/fabric/conversations/{conv}/continue"), None).await;
