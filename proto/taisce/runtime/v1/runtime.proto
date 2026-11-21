@@ -16,11 +16,14 @@
 //   1. Up{hello}      within 10 seconds of opening the stream
 //   2. Down{welcome}
 //   3. Up{snapshot}   the first message after the Hello, always
-//   4. Up{accounts}, Up{runtime}
+//   4. the runtime's outbox: every durable Up event (below) numbered above
+//      Welcome.last_up_seq, in order, before any new event. It comes before
+//      step 5 because `accounts` and `runtime` are events too: one numbered
+//      above a replayed event and sent first would make the hub treat the
+//      replay as already seen and drop it.
+//   5. Up{accounts}, Up{runtime}
 //                     the latest headroom and the runtime's own status,
 //                     again, on every new stream
-//   5. the runtime's outbox: every durable Up event (below) numbered above
-//      Welcome.last_up_seq, in order, before any new event
 //   6. anything, as it happens, and Ack in both directions
 // The hub sends its Down events (orders, settings, pairing offers, nudges)
 // only after the Snapshot.
