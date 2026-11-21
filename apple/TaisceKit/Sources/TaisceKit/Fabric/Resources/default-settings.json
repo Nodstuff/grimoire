@@ -1,0 +1,42 @@
+{
+  "about": "Settings version 0: the guardrails and limits a runtime enforces before any signed Settings reaches it, and what the app's editor starts from. Proto field names (SwiftProtobuf's JSON decoding takes them). Limits are written out at their defaults. Every pattern compiles under Rust's regex and NSRegularExpression alike.",
+  "settings": {
+    "version": 0,
+    "guardrails": [
+      {"id": "force-push", "label": "Force push", "enabled": true, "tools": ["Bash"],
+       "pattern": "\\bgit\\s+push\\b.*(\\s--force(-with-lease)?\\b|\\s-f\\b|\\s\\+\\S)"},
+      {"id": "push-main", "label": "Push to main", "enabled": true, "tools": ["Bash"],
+       "pattern": "\\bgit\\s+push\\b.*[\\s:](main|master)(\\s|$)"},
+      {"id": "pr-merge", "label": "Merge a pull request", "enabled": true, "tools": ["Bash"],
+       "pattern": "\\bgh\\s+pr\\s+merge\\b"},
+      {"id": "infra-apply", "label": "tofu / terraform apply or destroy", "enabled": true, "tools": ["Bash"],
+       "pattern": "\\b(tofu|terraform)\\s+(apply|destroy)\\b"},
+      {"id": "kubectl-delete", "label": "kubectl delete", "enabled": true, "tools": ["Bash"],
+       "pattern": "\\bkubectl\\s+delete\\b"},
+      {"id": "release-deploy", "label": "Release and deploy scripts", "enabled": true, "tools": ["Bash"],
+       "pattern": "(^|[\\s;&|/])(release|deploy)\\.sh\\b"},
+      {"id": "delete-outside-worktree", "label": "Delete outside the worktree", "enabled": true, "tools": ["Bash"],
+       "builtin": "delete_outside_worktree"},
+      {"id": "claude-settings", "label": "Change a Claude settings file", "enabled": true,
+       "tools": ["Write", "Edit", "MultiEdit", "NotebookEdit"],
+       "pattern": "(^|/)\\.claude/settings[^/]*\\.json$"},
+      {"id": "claude-settings-shell", "label": "Change a Claude settings file (shell)", "enabled": true, "tools": ["Bash"],
+       "pattern": "\\.claude/settings[^/\\s]*\\.json"},
+      {"id": "ssh-keychain", "label": "~/.ssh or the Keychain", "enabled": true, "tools": ["Bash"],
+       "pattern": "/\\.ssh/|~/\\.ssh\\b|\\bsecurity\\s+(add|delete|set|import)-"},
+      {"id": "ssh-files", "label": "Write in ~/.ssh", "enabled": true,
+       "tools": ["Write", "Edit", "MultiEdit"],
+       "pattern": "/\\.ssh/"},
+      {"id": "stop-workbox", "label": "Stop Workbox", "enabled": true, "tools": ["Bash"],
+       "pattern": "\\b(pkill|killall)\\b.*\\b[Ww]orkbox\\b|\\blaunchctl\\s+(stop|kill|bootout|unload)\\b.*[Ww]orkbox"}
+    ],
+    "limits": {
+      "pair_messages": 12,
+      "agent_turns_per_hour": 20,
+      "wakes_per_session_per_hour": 4,
+      "cold_context_pct": 80,
+      "cold_idle_minutes": 30
+    },
+    "fabrics": []
+  }
+}

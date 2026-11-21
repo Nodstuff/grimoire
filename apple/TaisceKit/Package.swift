@@ -29,6 +29,9 @@ let package = Package(
                 .product(name: "Markdown", package: "swift-markdown"),
                 .product(name: "Valet", package: "Valet"),
             ],
+            // Agent Fabric's starting guardrails and limits: a copy of
+            // proto/taisce/runtime/v1/default-settings.json (FabricSigningTests pins them equal)
+            resources: [.copy("Fabric/Resources/default-settings.json")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
