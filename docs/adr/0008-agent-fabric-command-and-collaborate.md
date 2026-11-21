@@ -166,18 +166,33 @@ that limit, so a signature it checks itself would protect nothing.
 
 ### 7. Messages between agents
 
-- **Routing**: `to` containing `/` is an address; otherwise a fabric's name, which sends a
-  `note` to every member. An address resolves among the person's own sessions only, across
-  their runtimes, to the live session holding it. A message is bound to that session's
-  identity (runtime, session id), never to the address: if the address is later reused, the
-  message does not follow it.
+- **Routing never guesses** (asked for by Tom: how is an agent stopped from messaging the
+  wrong session?). In order:
+  1. `reply_to` set: the receiver is the sender of that message, by session id; any `to` is
+     ignored. A `reply` must carry it and it must name an ask sent to the caller.
+  2. `to` with a `/` is an address, matched exactly against the owner's live sessions. Several
+     matches (`DELIVERY_AMBIGUOUS`), only an exited one (`DELIVERY_RECEIVER_EXITED`) or none
+     (`DELIVERY_NO_SUCH_ADDRESS`) store nothing and answer with `candidates`: the sessions the
+     caller may have meant (address, session id, project, branch, state), never a pick.
+  3. Otherwise `to` is a fabric's exact name, and only a `note` may go to a fabric.
+- **The sender sees where it landed**: each `Sent` carries the resolved recipient (session
+  id, address, project, branch, state, last line), so a wrong guess shows at once.
+- **Bound to the session, end to end**: a message stores the receiver's (runtime, session id);
+  its nudge names that session id; `inbox` returns only mail whose receiver is the caller's
+  own session id, and each `Mail` carries `to_session_id` (which Workbox checks before
+  handing it over) and the sender's address and session id. If an address is later reused,
+  the message does not follow it.
+- **One person's fleet only**: every resolution (address, fabric, message id) runs in the
+  runtime owner's `Scope::User`. No path reaches another person's session, and the isolation
+  suite proves it for `send`, `who`, `inbox` and `inbox_ack`.
 - **Storage**: one row per receiver. The body is deleted when the receiver's runtime
   acknowledges it (`inbox_ack`), or after 24 hours unread, when it bounces. The envelope
   (who, to whom, kind, when, read, answered) stays 7 days, which is what the pair limit and
   the conversations view need.
-- **Bounces** arrive in the sender's inbox as `MESSAGE_KIND_BOUNCE` naming the message:
-  unread after 24 hours, the receiver removed from the fleet, the runtime reporting the
-  receiver exited, or the person saying stop to a paused pair.
+- **Bounces** arrive in the sender's inbox as `MESSAGE_KIND_BOUNCE`, `reply_to` naming the
+  message: unread after 24 hours, the receiver removed from the fleet, the runtime reporting
+  the receiver exited after the message was stored, or the person saying stop to a paused
+  pair. A refusal at send time (above) is an answer, not a bounce.
 - **Nudges**: one per message, re-sent on reconnect until a Result answers it. `may_wake` is
   true for ask and reply, false for note and bounce of a note. A `cold` result becomes a
   "wake to answer?" item on the phone; an ask to an asleep or exited session becomes an
@@ -303,7 +318,7 @@ compile, a duplicate fabric name, a name with `/` or `:`, over the counts).
   paused, unanswered_asks`.
 - *message*: `id, conversation_id, from {runtime_id, session_id, address}, to {…}, kind (note
   | ask | reply | bounce), body (null once read, expired, or under text off), doc,
-  in_reply_to, sent_at, read_at, state (unread | read | held | bounced), bounce_reason,
+  reply_to, sent_at, read_at, state (unread | read | held | bounced), bounce_reason,
   answered`.
 
 **New stream events**: `turn`, `attention`, `attention_cleared {id, runtime_id, session_id,
