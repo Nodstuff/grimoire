@@ -191,6 +191,13 @@ struct AgentSessionScreen: View {
             Text(order?.text ?? "A queued message")
                 .font(.body).foregroundStyle(Color.lapis.ink)
             HStack {
+                // a paused queue is released here, where the person is looking,
+                // not only from the banner at the top of the feed
+                if !s.queuePaused.isEmpty {
+                    Button("Send now", systemImage: "paperplane") { act { await command.command(.releaseQueue, key) } }
+                        .buttonStyle(.lapis(.primary, size: .small))
+                        .accessibilityIdentifier("session.queued.release")
+                }
                 if let text = order?.text {
                     Button("Edit", systemImage: "pencil") {
                         act {
