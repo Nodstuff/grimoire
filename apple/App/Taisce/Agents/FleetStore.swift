@@ -76,6 +76,10 @@ final class FleetStore {
         command.fleet = self
         talk.fleet = self
         config.fleet = self
+        #if DEBUG
+        // UI runs on a simulator with no enrolled face (`-fabricOwnerCheck pass`)
+        if UserDefaults.standard.string(forKey: "fabricOwnerCheck") == "pass" { command.ownerCheck = PassingOwnerCheck() }
+        #endif
     }
 
     /// the fleet has arrived at least once
@@ -124,7 +128,7 @@ final class FleetStore {
         link = .idle
     }
 
-    private func take(_ signal: FleetSignal) {
+    func take(_ signal: FleetSignal) {
         switch signal {
         case .change(let change, let rev):
             fleet.apply(change, rev: rev)
@@ -268,6 +272,7 @@ final class FleetStore {
             switch e {
             case let .server(m): return m
             case .unauthorized: return "Sign in again to see your agents."
+            case .notFound: return "Your server doesn't have that (it may be gone, or the server is older than this app)."
             case let .http(status) where status >= 500: return "The server isn't answering right now."
             default: break
             }

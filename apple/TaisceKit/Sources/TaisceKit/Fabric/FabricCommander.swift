@@ -222,6 +222,12 @@ public final class FabricDeviceIdentity: Sendable {
         valet = .valet(with: Identifier(nonEmpty: identifier)!, accessibility: .afterFirstUnlockThisDeviceOnly)
     }
 
+    /// A key held in memory only (tests, previews): the Keychain is never touched.
+    public init(key: any FabricDeviceKey) {
+        valet = .valet(with: Identifier(nonEmpty: "ie.null.taisce.fabric.memory")!, accessibility: .afterFirstUnlockThisDeviceOnly)
+        state.withLock { $0 = (key, .software) }
+    }
+
     public var kind: Kind { state.withLock { $0.kind } }
 
     /// The key, made the first time it is asked for.

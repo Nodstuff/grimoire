@@ -16,6 +16,9 @@ final class FleetStubServer: @unchecked Sendable {
     private var streams: [NWConnection] = []
     private var log: [(method: String, path: String, body: [String: Any])] = []
     let port: UInt16
+    /// Agent Fabric's Slice 2–5 routes (`FabricStub`): asked first for every
+    /// `/api/fabric/` request; nil falls through to the fleet's own.
+    var fabric: (@Sendable (_ method: String, _ path: String, _ query: [String: String], _ body: Data) -> (status: String, json: String)?)?
 
     /// `fleet`: the body of `GET /api/fabric/sessions`; nil = this server has no fleet (404, as LOCAL mode).
     init(fleet: [String: Any]?) throws {
@@ -80,14 +83,36 @@ final class FleetStubServer: @unchecked Sendable {
         open.forEach { $0.send(content: event, completion: .contentProcessed { _ in }) }
     }
 
+    /// Change the fleet's JSON (a runtime's devices, the attention list) without saying so.
+    func mutate(_ change: (inout [String: Any]) -> Void) {
+        lock.lock()
+        change(&fleet)
+        lock.unlock()
+    }
+
+    /// The fleet's JSON as it is.
+    var fleetJSON: [String: Any] {
+        lock.lock(); defer { lock.unlock() }
+        return fleet
+    }
+
+    /// Say something on every open stream (a turn, an attention item, an order…).
+    func broadcast(_ name: String, _ value: Any) {
+        lock.lock()
+        let event = bump(name, value)
+        let open = streams
+        lock.unlock()
+        open.forEach { $0.send(content: event, completion: .contentProcessed { _ in }) }
+    }
+
     /// Next rev, and the SSE event carrying it. Call with the lock held.
-    private func bump(_ name: String, _ value: [String: Any]) -> Data {
+    private func bump(_ name: String, _ value: Any) -> Data {
         let rev = (fleet["rev"] as? Int ?? 0) + 1
         fleet["rev"] = rev
         return Data("id: \(rev)\nevent: \(name)\ndata: \(Self.json(value))\n\n".utf8)
     }
 
-    private static func json(_ value: Any) -> String {
+    static func json(_ value: Any) -> String {
         String(decoding: (try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])) ?? Data("null".utf8), as: UTF8.self)
     }
 
@@ -128,8 +153,19 @@ final class FleetStubServer: @unchecked Sendable {
             lock.lock()
             log.append((method, path, (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:]))
             let has = hasFleet
+            let fabric = self.fabric
             lock.unlock()
             guard has else { return notFound() }
+            var query: [String: String] = [:]
+            if let q = target.split(separator: "?", maxSplits: 1).dropFirst().first {
+                for pair in q.split(separator: "&") {
+                    let kv = pair.split(separator: "=", maxSplits: 1).map { String($0).removingPercentEncoding ?? String($0) }
+                    if kv.count == 2 { query[kv[0]] = kv[1] }
+                }
+            }
+            if let answer = fabric?(method, path, query, body) {
+                return reply(answer.status, answer.json)
+            }
         }
         switch (method, path) {
         case ("GET", "/api/docs"):

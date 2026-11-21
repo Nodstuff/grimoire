@@ -551,3 +551,126 @@ public struct PairingSeal: Sendable, Hashable {
         return w.data
     }
 }
+
+// MARK: reading back what was signed (a runtime's view; tests and stand-ins)
+
+extension FabricGuardrail {
+    static func decode(_ data: Data) throws -> FabricGuardrail {
+        var r = ProtoReader(data)
+        var g = FabricGuardrail(id: "", label: "", enabled: false, tools: [])
+        while !r.isAtEnd {
+            let (f, w) = try r.next()
+            switch f {
+            case 1: g.id = try r.string(field: f, wire: w)
+            case 2: g.label = try r.string(field: f, wire: w)
+            case 3: g.enabled = try r.bool(field: f, wire: w)
+            case 4: g.tools.append(try r.string(field: f, wire: w))
+            case 5: g.pattern = try r.string(field: f, wire: w)
+            case 6: g.builtin = try r.string(field: f, wire: w)
+            default: throw ProtoError.unknownField(f)
+            }
+        }
+        return g
+    }
+}
+
+extension FabricLimits {
+    static func decode(_ data: Data) throws -> FabricLimits {
+        var r = ProtoReader(data)
+        var l = FabricLimits()
+        while !r.isAtEnd {
+            let (f, w) = try r.next()
+            let v = Int(try r.uint(field: f, wire: w))
+            switch f {
+            case 1: l.pairMessages = v
+            case 2: l.agentTurnsPerHour = v
+            case 3: l.wakesPerSessionPerHour = v
+            case 4: l.coldContextPct = v
+            case 5: l.coldIdleMinutes = v
+            default: throw ProtoError.unknownField(f)
+            }
+        }
+        return l
+    }
+}
+
+extension FabricDefinition {
+    static func decode(_ data: Data) throws -> FabricDefinition {
+        var r = ProtoReader(data)
+        var d = FabricDefinition(id: "", name: "")
+        while !r.isAtEnd {
+            let (f, w) = try r.next()
+            switch f {
+            case 1: d.id = try r.string(field: f, wire: w)
+            case 2: d.name = try r.string(field: f, wire: w)
+            case 3: d.purpose = try r.string(field: f, wire: w)
+            case 4: d.docID = try r.string(field: f, wire: w)
+            case 5: d.docTitle = try r.string(field: f, wire: w)
+            default: throw ProtoError.unknownField(f)
+            }
+        }
+        return d
+    }
+}
+
+extension FabricSettings {
+    /// Strict: an unknown field anywhere refuses the whole Settings.
+    public static func decode(_ data: Data) throws -> FabricSettings {
+        var r = ProtoReader(data)
+        var s = FabricSettings(version: 0)
+        while !r.isAtEnd {
+            let (f, w) = try r.next()
+            switch f {
+            case 1: s.version = try r.uint(field: f, wire: w)
+            case 2: s.issuedAt = try r.int(field: f, wire: w)
+            case 3: s.guardrails.append(try FabricGuardrail.decode(try r.lengthDelimited(field: f, wire: w)))
+            case 4: s.limits = try FabricLimits.decode(try r.lengthDelimited(field: f, wire: w))
+            case 5: s.fabrics.append(try FabricDefinition.decode(try r.lengthDelimited(field: f, wire: w)))
+            default: throw ProtoError.unknownField(f)
+            }
+        }
+        return s
+    }
+}
+
+extension PairingSeal {
+    public static func decode(_ data: Data) throws -> PairingSeal {
+        var r = ProtoReader(data)
+        var s = PairingSeal(claim: Data(), signature: Data())
+        while !r.isAtEnd {
+            let (f, w) = try r.next()
+            switch f {
+            case 1: s.claim = try r.lengthDelimited(field: f, wire: w)
+            case 2: s.signature = try r.lengthDelimited(field: f, wire: w)
+            default: throw ProtoError.unknownField(f)
+            }
+        }
+        return s
+    }
+}
+
+extension PairingClaim {
+    public static func decode(_ data: Data) throws -> PairingClaim {
+        var r = ProtoReader(data)
+        var c = PairingClaim(runtimeID: "", pairingID: "", publicKey: Data(), deviceName: "", createdAt: 0)
+        while !r.isAtEnd {
+            let (f, w) = try r.next()
+            switch f {
+            case 1: c.runtimeID = try r.string(field: f, wire: w)
+            case 2: c.pairingID = try r.string(field: f, wire: w)
+            case 3: c.publicKey = try r.lengthDelimited(field: f, wire: w)
+            case 4: c.deviceName = try r.string(field: f, wire: w)
+            case 5: c.createdAt = try r.int(field: f, wire: w)
+            default: throw ProtoError.unknownField(f)
+            }
+        }
+        return c
+    }
+}
+
+extension FabricSettings {
+    /// The bytes decode and re-encode to themselves (what the hub insists on).
+    public static func isCanonical(_ data: Data) -> Bool {
+        (try? decode(data).encoded()) == data
+    }
+}
