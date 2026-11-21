@@ -1,0 +1,37 @@
+[
+  {"snapshot": [
+    {"id": "0196f3a0-0000-7000-8000-000000000001", "address": "taisce/main", "state": "working",
+     "fabric": "taisce", "project": "taisce", "worktree": "main", "branch": "agent-fabric",
+     "account": "personal", "tool": "Bash", "context_used_pct": 41, "turn_id": "0196f3a0-0000-7000-8000-0000000000f1"},
+    {"id": "0196f3a0-0000-7000-8000-000000000002", "address": "workbox/main", "state": "idle",
+     "fabric": "workbox", "project": "workbox", "worktree": "main", "branch": "main",
+     "account": "work", "context_used_pct": 12},
+    {"id": "0196f3a0-0000-7000-8000-000000000003", "address": "qompass/mcp-dx", "state": "working",
+     "fabric": "qompass", "project": "qompass", "worktree": "mcp-dx", "branch": "mcp-dx", "account": "work", "tool": "Edit"}
+  ]},
+  {"accounts": [
+    {"name": "personal", "session_used_pct": 38, "week_used_pct": 61},
+    {"name": "work", "session_used_pct": 72, "week_used_pct": 70}
+  ]},
+  {"status": {"present": false}},
+  {"sleep_ms": 1500},
+  {"turn": {"session": "0196f3a0-0000-7000-8000-000000000001", "turn_id": "0196f3a0-0000-7000-8000-0000000000f2",
+            "prompt": "Write the isolation test for the turns route.",
+            "reply": "Added agent_fabric_work_is_its_owners_alone. 438 tests pass.\n\nShall I open the pull request?",
+            "tool_count": 23, "files_changed": 3, "lines_added": 84, "lines_removed": 12,
+            "pull_request_url": "https://github.example/taisce/pull/214", "pull_request_number": 214,
+            "end": "question", "context_used_pct": 44}},
+  {"sleep_ms": 1500},
+  {"ask": {"session": "0196f3a0-0000-7000-8000-000000000003", "kind": "question",
+           "text": "The retry test is flaky on CI. Fix the test, or skip it and file a ticket?",
+           "choices": [{"id": "fix", "label": "Fix the test"}, {"id": "skip", "label": "Skip it, file a ticket"}]}},
+  {"sleep_ms": 1500},
+  {"ask": {"session": "0196f3a0-0000-7000-8000-000000000001", "kind": "approval",
+           "text": "./release.sh --notarize", "tool": "Bash",
+           "guardrail_id": "release-deploy", "guardrail_label": "Release and deploy scripts", "expires_in": 540}},
+  {"sleep_ms": 1500},
+  {"send": {"from": "0196f3a0-0000-7000-8000-000000000002", "to": "taisce/main", "kind": "ask",
+            "body": "What does a state event look like? Point me at the doc."}},
+  {"serve_ms": 2000},
+  "pairing_code"
+]

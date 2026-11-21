@@ -571,3 +571,21 @@ async fn an_answered_question_is_written_into_the_fabrics_doc() {
     }
     panic!("the decision never reached the doc");
 }
+
+/// The fake runtime's demo scripts parse, and the Slices 2-5 one plays
+/// against a real hub: its turn, question, approval and message all land.
+#[tokio::test]
+async fn the_demo_scripts_play() {
+    use taisce_runtime_proto::fake::parse_script;
+    parse_script(include_str!("../../../runtime-proto/examples/demo-script.json")).unwrap();
+    let steps = parse_script(include_str!("../../../runtime-proto/examples/demo-work-script.json")).unwrap();
+    let t = setup().await;
+    let (_, cred) = t.enrol("mbp");
+    let mut f = Fake::connect(&t.url, &cred, "demo", 0).await.unwrap();
+    assert!(!f.play(&steps).await.unwrap());
+    until(&t, "/api/fabric/attention", |v| v["items"].as_array().is_some_and(|a| a.len() == 2)).await;
+    until(&t, "/api/fabric/turns?since=0", |v| v["turns"].as_array().is_some_and(|a| !a.is_empty())).await;
+    until(&t, "/api/fabric/conversations", |v| v["conversations"].as_array().is_some_and(|a| a.len() == 1)).await;
+    // the message to taisce/main was read when its nudge came down
+    assert!(f.side.log.iter().any(|l| l.contains("What does a state event look like?")), "{:?}", f.side.log);
+}
