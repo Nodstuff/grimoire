@@ -266,6 +266,27 @@ const COVERAGE: &[(&str, &str)] = &[
     // session does not exist, and no connector, PAT or MCP tool sets it
     ("/api/fabric/sessions/{runtime_id}/{session_id}/snooze", "a_snooze_is_its_persons_alone"),
     ("grpc:taisce.runtime.v1.Runtime/Attach", "a_runtime_credential_writes_only_its_owners_fleet"),
+    // Slices 2-5 (ADR 0008): turns, attention, orders, settings, fabrics,
+    // projects, pairing, follow and conversations are their person's alone;
+    // a runtime's fabric tool calls reach only its owner's fleet
+    ("/api/fabric/sessions/{runtime_id}/{session_id}/follow", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/sessions/{runtime_id}/{session_id}/turns", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/turns", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/attention", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/attention/{id}", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/orders", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/orders/{id}", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/settings", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/fabrics", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/projects", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/projects/{name}", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/pairing", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/pairing/{id}", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/conversations", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/conversations/{id}", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/conversations/{id}/continue", "agent_fabric_work_is_its_owners_alone"),
+    ("/api/fabric/conversations/{id}/stop", "agent_fabric_work_is_its_owners_alone"),
+    ("grpc:taisce.runtime.v1.Runtime/Call", "agent_fabric_work_is_its_owners_alone"),
 ];
 
 thread_local! {
@@ -3635,9 +3656,12 @@ async fn a_fleet_is_its_owners_alone() {
     let of = |user: Uuid| alerts.iter().filter(|a| a.user == user).map(|a| a.address.clone()).collect::<Vec<_>>();
     assert_eq!(of(fx.a), ["zebrasecret/main", "zebrasecret/main"], "needs_you, then the end of a turn");
     assert_eq!(of(fx.b), ["aoifeown/main"]);
-    // and what a notification carries is the address and the state, nothing else of the session
+    // and what a notification carries is the address, the state and (ADR
+    // 0008 §10: previews, unless the project's notifications are private)
+    // the last line, nothing else of the session; and it goes to A alone
     let push = crate::fabric::alert_push(&alerts[0]).payload();
-    for field in ["note", "last line", "branch", "project", "tool", "account", "fabric", "worktree"] {
+    assert!(push.contains("zebrasecret last line"), "{push}");
+    for field in ["note", "branch", "project", "tool", "account", "fabric", "worktree"] {
         assert!(!push.contains(&format!("zebrasecret {field}")), "{push}");
     }
 
@@ -3830,4 +3854,162 @@ async fn a_runtime_credential_writes_only_its_owners_fleet() {
     }
     let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "orient", "arguments": {}}});
     assert_eq!(fx.call(&b_cred, "POST", "/mcp", Some(call)).await.0, StatusCode::UNAUTHORIZED, "no MCP tool call either");
+}
+
+// ---- Agent Fabric, Slices 2-5 (ADR 0008) ----
+
+/// B sees nothing of A's turns, attention items, orders, settings, pairing
+/// offers, projects or conversations; cannot submit into A's fleet; and
+/// B's agents cannot reach A's sessions or mail by address, fabric or id.
+#[tokio::test]
+async fn agent_fabric_work_is_its_owners_alone() {
+    use crate::fabric::phone::Phone;
+    use crate::fabric::tests::serve_channel;
+    use taisce_runtime_proto::fake::{Fake, ScriptAttention, ScriptSend, ScriptSession, ScriptTurn};
+    use taisce_runtime_proto::v1 as pb;
+    let fx = fixture();
+    let url = serve_channel(&fx.store, &fx.hub, Default::default()).await;
+    // A: a Mac with two sessions, a paired phone, a turn, an approval, an
+    // order, settings, a pairing offer, a conversation, a project switch
+    let (a_rt, a_cred) = fx.enrol_runtime(fx.a, "zebrasecret-mac");
+    let mut a = Fake::connect(&url, &a_cred, "launch-a", 0).await.unwrap();
+    let other = "0196f3a0-0000-7000-8000-0000000000aa";
+    a.snapshot(&[a_secret_session("working"), ScriptSession { project: "zebrasecret project".into(), ..ScriptSession::new(other, "zebrasecret/other", "idle") }])
+        .await
+        .unwrap();
+    let mut phone = Phone::new("a's phone");
+    a.side.pair(&phone.public_key, "zebrasecret phone");
+    a.status().await.unwrap();
+    a.turn(&ScriptTurn { session: A_SESSION.into(), prompt: "zebrasecret prompt".into(), reply: "zebrasecret reply".into(), ..Default::default() }).await.unwrap();
+    a.ask(&ScriptAttention { session: A_SESSION.into(), kind: "approval".into(), text: "zebrasecret command".into(), ..Default::default() }).await.unwrap();
+    let sent = a
+        .send_mail(&ScriptSend { from: other.into(), to: "zebrasecret/main".into(), kind: "ask".into(), body: "zebrasecret question".into(), ..Default::default() })
+        .await
+        .unwrap();
+    let a_message = sent.sent[0].message_id.clone();
+    a.drained().await.unwrap();
+    let a_rt_s = a_rt.to_string();
+    fx.until(&fx.a_app, "/api/fabric/runtimes", |o| o.contains("zebrasecret phone")).await;
+    let (body, a_order) = phone.send(&a_rt_s, A_SESSION, "zebrasecret order text", "");
+    assert_eq!(fx.call(&fx.a_app, "POST", "/api/fabric/orders", Some(body)).await.0, StatusCode::ACCEPTED);
+    let rail = pb::Guardrail { id: "zebrasecret-rail".into(), label: "zebrasecret".into(), enabled: true, pattern: "zebrasecret".into(), ..Default::default() };
+    let (st, out) = fx.call(&fx.a_app, "PUT", "/api/fabric/settings", Some(phone.settings(1, pb::Settings { guardrails: vec![rail], ..Default::default() }))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let code = a.pairing_code("taisce.example");
+    let pairing = Phone::new("a's tablet").seal(&code, "zebrasecret tablet");
+    let a_pairing = pairing["pairing_id"].as_str().unwrap().to_string();
+    assert_eq!(fx.call(&fx.a_app, "POST", "/api/fabric/pairing", Some(pairing)).await.0, StatusCode::ACCEPTED);
+    assert_eq!(fx.call(&fx.a_app, "PUT", "/api/fabric/projects/zebrasecret%20project", Some(json!({"private_notifications": true}))).await.0, StatusCode::OK);
+    let mine = fx.until(&fx.a_app, "/api/fabric/conversations", |o| o.contains("zebrasecret/other")).await;
+    let a_conv = serde_json::from_str::<Value>(&mine).unwrap()["conversations"][0]["id"].as_str().unwrap().to_string();
+    let attn = fx.until(&fx.a_app, "/api/fabric/attention", |o| o.contains("zebrasecret command")).await;
+    let a_item = serde_json::from_str::<Value>(&attn).unwrap()["items"][0]["id"].as_str().unwrap().to_string();
+    fx.until(&fx.a_app, &format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns"), |o| o.contains("zebrasecret prompt")).await;
+
+    // B, with a Mac of her own: every list is hers alone
+    let (b_rt, b_cred) = fx.enrol_runtime(fx.b, "air");
+    let mut b = Fake::connect(&url, &b_cred, "launch-b", 0).await.unwrap();
+    b.snapshot(&[ScriptSession::new(B_SESSION, "aoifeown/main", "idle")]).await.unwrap();
+    b.drained().await.unwrap();
+    fx.until(&fx.b_app, "/api/fabric/sessions", |o| o.contains(B_SESSION)).await;
+    let blank = |what: &str, out: &str| {
+        fx.no_leak(what, out);
+        for s in [a_rt.to_string(), A_SESSION.to_string(), a_order.clone(), a_conv.clone(), a_pairing.clone(), a_item.clone(), a_message.clone()] {
+            assert!(!out.contains(&s), "{what} names {s}: {out}");
+        }
+    };
+    for path in [
+        "/api/fabric/sessions",
+        "/api/fabric/attention",
+        "/api/fabric/orders",
+        "/api/fabric/turns?since=0",
+        "/api/fabric/settings",
+        "/api/fabric/fabrics",
+        "/api/fabric/projects",
+        "/api/fabric/conversations",
+    ] {
+        let (st, out) = fx.b("GET", path, None).await;
+        assert_eq!(st, StatusCode::OK, "{path}: {out}");
+        blank(path, &out);
+    }
+    // A's things by id: not found, never forbidden
+    for path in [
+        format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/turns"),
+        format!("/api/fabric/orders/{a_order}"),
+        format!("/api/fabric/pairing/{a_pairing}"),
+        format!("/api/fabric/conversations/{a_conv}"),
+    ] {
+        let (st, out) = fx.b("GET", &path, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{path}: {out}");
+        blank(&path, &out);
+    }
+    for (method, path) in [
+        ("DELETE", format!("/api/fabric/orders/{a_order}")),
+        ("DELETE", format!("/api/fabric/attention/{a_item}")),
+        ("POST", format!("/api/fabric/conversations/{a_conv}/continue")),
+        ("POST", format!("/api/fabric/conversations/{a_conv}/stop")),
+        ("POST", format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/follow")),
+        ("DELETE", format!("/api/fabric/sessions/{a_rt}/{A_SESSION}/follow")),
+    ] {
+        let (st, out) = fx.b(method, &path, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{method} {path}: {out}");
+        blank(&path, &out);
+    }
+    // she cannot submit into A's fleet: A's runtime does not exist for her,
+    // and her own device is paired with nothing
+    let (body, _) = Phone::new("b's phone").send(&a_rt_s, A_SESSION, "aoife was here", "");
+    let (st, out) = fx.b("POST", "/api/fabric/orders", Some(body)).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{out}");
+    blank("an order at A's runtime", &out);
+    // A's phone's own signed order, replayed by B: still not her runtime
+    let (body, _) = phone.send(&a_rt_s, A_SESSION, "replayed by aoife", "");
+    let (st, out) = fx.b("POST", "/api/fabric/orders", Some(body)).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{out}");
+    let (st, out) = fx.b("PUT", "/api/fabric/settings", Some(Phone::new("b's phone").settings(1, Default::default()))).await;
+    assert_eq!((st, serde_json::from_str::<Value>(&out).unwrap()["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("unknown_device")));
+    let (st, out) = fx.b("POST", "/api/fabric/pairing", Some(json!({"runtime_id": a_rt, "pairing_id": uuid::Uuid::now_v7().to_string(), "sealed": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{out}");
+    let (st, out) = fx.b("PUT", "/api/fabric/projects/zebrasecret%20project", Some(json!({"text_off": true}))).await;
+    assert_eq!(st, StatusCode::OK, "her own switch for a name, not A's: {out}");
+    let a_projects = fx.call(&fx.a_app, "GET", "/api/fabric/projects", None).await.1;
+    assert!(a_projects.contains(r#""private_notifications":true"#) && !a_projects.contains(r#""text_off":true"#), "{a_projects}");
+
+    // B's agents: A's sessions and mail are out of reach by every route
+    let reply = |r: pb::CallReply| match r.reply {
+        Some(pb::call_reply::Reply::Send(s)) => s,
+        other => panic!("{other:?}"),
+    };
+    let send = |to: &str, kind: pb::MessageKind, reply_to: &str| {
+        pb::call_request::Tool::Send(pb::SendRequest { to: to.into(), kind: kind as i32, body: "aoife asks".into(), reply_to: reply_to.into(), ..Default::default() })
+    };
+    for to in ["zebrasecret/main", "zebrasecret/other", "zebrasecret project"] {
+        let r = reply(b.call(B_SESSION, send(to, pb::MessageKind::Note, "")).await.unwrap());
+        assert_eq!(r.sent[0].delivery, pb::Delivery::NoSuchAddress as i32, "{to}: {r:?}");
+        assert!(r.candidates.is_empty(), "{to}: {r:?}");
+        // the words echo the address she wrote; nothing else may name A's
+        assert!(r.sent[0].recipient.is_none() && r.sent[0].message_id.is_empty(), "{to}: {r:?}");
+    }
+    let r = reply(b.call(B_SESSION, send("", pb::MessageKind::Reply, &a_message)).await.unwrap());
+    assert_eq!(r.sent[0].delivery, pb::Delivery::NoSuchMessage as i32, "{r:?}");
+    let who = b.call(B_SESSION, pb::call_request::Tool::Who(pb::WhoRequest { all: true })).await.unwrap();
+    blank("who", &format!("{who:?}"));
+    let inbox = b.call(B_SESSION, pb::call_request::Tool::Inbox(pb::InboxRequest { limit: 50 })).await.unwrap();
+    blank("inbox", &format!("{inbox:?}"));
+    let acked = b.call(B_SESSION, pb::call_request::Tool::InboxAck(pb::InboxAckRequest { message_ids: vec![a_message.clone()] })).await.unwrap();
+    assert_eq!(acked.reply, Some(pb::call_reply::Reply::InboxAck(pb::InboxAckReply { acknowledged: 0 })));
+    // naming A's session as the caller: not one of her runtime's
+    let err = b.call(A_SESSION, pb::call_request::Tool::Inbox(pb::InboxRequest { limit: 50 })).await.unwrap_err();
+    assert_eq!(err.code(), Some(tonic::Code::NotFound));
+    // A's mail is still there, unread, for A
+    let (mail, _) = fx.store.lock(Scope::User(fx.a)).fabric_inbox(a_rt, uuid::Uuid::parse_str(A_SESSION).unwrap(), 10).unwrap();
+    assert_eq!(mail.len(), 1);
+    assert_eq!(b_rt.to_string().len(), 36);
+
+    // the human-only rule: a connector is refused, a PAT never reaches /api
+    for (method, path) in [("POST", "/api/fabric/orders"), ("PUT", "/api/fabric/settings"), ("POST", "/api/fabric/pairing"), ("GET", "/api/fabric/attention")] {
+        let (st, out) = fx.call(&fx.b_conn, method, path, Some(json!({}))).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "connector {method} {path}: {out}");
+        let (st, _) = fx.call(&fx.b_pat, method, path, Some(json!({}))).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "PAT {method} {path}");
+    }
 }
