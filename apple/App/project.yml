@@ -34,6 +34,8 @@ targets:
     dependencies:
       - package: TaisceKit
         product: TaisceKit
+      # Agent Fabric: a question's choices as notification buttons
+      - target: TaisceNotifications
       # SQL blocks' Postgres driver (PostgresNIO, SwiftNIO, NIOSSL): the Mac only
       - package: TaisceKit
         product: TaisceSQLPostgres
@@ -112,6 +114,30 @@ targets:
           - UTTypeIdentifier: ie.null.taisce.doc-reference
             UTTypeDescription: Taisce doc
             UTTypeConformsTo: [public.data]
+  TaisceNotifications:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - NotificationService
+    info:
+      path: NotificationService/Info.plist
+      properties:
+        CFBundleDisplayName: Taisce Notifications
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    settings:
+      base:
+        # the app's id with a suffix (UI runs on the Mac override TAISCE_BUNDLE_ID for both)
+        TAISCE_BUNDLE_ID: ie.null.taisce
+        PRODUCT_BUNDLE_IDENTIFIER: $(TAISCE_BUNDLE_ID).notifications
+        SUPPORTS_MACCATALYST: YES
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+        TARGETED_DEVICE_FAMILY: "1,2,6"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 6UP35L9425
+        ENABLE_HARDENED_RUNTIME: YES
   TaisceTests:
     type: bundle.unit-test
     platform: iOS

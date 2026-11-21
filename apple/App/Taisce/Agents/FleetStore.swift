@@ -9,6 +9,12 @@ struct FleetSessionRequest: Equatable {
     var serial: Int
 }
 
+/// A fabric notification was tapped: the frontmost window shows what it is about.
+struct FabricOpenRequest: Equatable {
+    var pointer: FabricPush.Pointer
+    var serial: Int
+}
+
 /// The person's fleet on this device (Agent Fabric): every Claude session
 /// their runtimes report and what waits for them, followed live while the
 /// app is in front. Commands (Slices 3–5) go through `command`, the agents'
@@ -287,6 +293,18 @@ final class FleetStore {
     func takeRequest() -> FleetSessionKey? {
         defer { request = nil }
         return request?.session
+    }
+
+    /// A tap on a fabric notification (or its Review): what it points at.
+    private(set) var openRequest: FabricOpenRequest?
+
+    func requestOpen(_ p: FabricPush.Pointer) {
+        openRequest = FabricOpenRequest(pointer: p, serial: (openRequest?.serial ?? 0) + 1)
+    }
+
+    func takeOpenRequest() -> FabricPush.Pointer? {
+        defer { openRequest = nil }
+        return openRequest?.pointer
     }
 }
 

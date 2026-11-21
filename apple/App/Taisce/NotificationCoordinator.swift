@@ -267,9 +267,10 @@ final class SystemDueAlertCenter: DueAlertCenter {
 
     func registerCategory() {
         let actions = DueAlertAction.allCases.map { UNNotificationAction(identifier: $0.rawValue, title: $0.title, options: []) }
-        center.setNotificationCategories([
+        // Agent Fabric's beside To-dos' (this call replaces every category the app has)
+        center.setNotificationCategories(Set([
             UNNotificationCategory(identifier: NotificationCoordinator.category, actions: actions, intentIdentifiers: [], options: []),
-        ])
+        ] + FabricPush.categories))
     }
 
     func pending() async -> [PlannedAlert] {
@@ -332,6 +333,9 @@ final class DueAlertDelegate: NSObject, UNUserNotificationCenterDelegate, Sendab
         if FabricSessionPush.session(from: info) != nil {
             return await MainActor.run { FabricSessionPush.presentation() }
         }
+        if let p = FabricPush.pointer(from: info) {
+            return await MainActor.run { FabricPush.presentation(p) }
+        }
         return [.banner, .list, .sound]
     }
 
@@ -343,6 +347,18 @@ final class DueAlertDelegate: NSObject, UNUserNotificationCenterDelegate, Sendab
         }
         if let session = FabricSessionPush.session(from: info) {
             await MainActor.run { FabricSessionPush.deliver(session) }
+            return
+        }
+        if let p = FabricPush.pointer(from: info) {
+            let action = response.actionIdentifier
+            if action == UNNotificationDefaultActionIdentifier {
+                await MainActor.run { FabricPush.open(p) }
+            } else if action != UNNotificationDismissActionIdentifier {
+                let text = (response as? UNTextInputNotificationResponse)?.userText
+                if let failure = await FabricPush.act(p, action: action, text: text), !failure.isEmpty {
+                    await FabricPush.report(failure, about: response.notification.request.content.title)
+                }
+            }
             return
         }
         guard let action = DueAlertAction(rawValue: response.actionIdentifier),

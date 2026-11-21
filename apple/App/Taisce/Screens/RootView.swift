@@ -118,6 +118,8 @@ struct RootView: View {
         .onChange(of: model.fleet.request, initial: true) { openFleetSessionIfFront() }
         .onChange(of: scenePhase) { openFleetSessionIfFront() }
         .onChange(of: model.authPhase) { openFleetSessionIfFront() }
+        .onChange(of: model.fleet.openRequest, initial: true) { openFabricPointerIfFront() }
+        .onChange(of: scenePhase) { openFabricPointerIfFront() }
         // sign-out or another account: nothing queued for the last one survives
         .onChange(of: model.authPhase) { router.docAction = nil; router.approval = nil }
         // an agent's approval, over whatever is showing (a row, a session, a notification)
@@ -166,7 +168,25 @@ extension RootView {
               FrontWindow.isFront(window.window, scenePhase: scenePhase)
         else { return }
         guard let session = model.fleet.takeRequest() else { return }
+        // the session itself, with Agents (and its row, marked) beneath
         router.showAgents(focus: session)
+        router.showAgentSession(session)
+    }
+
+    /// A fabric notification's target: an approval's sheet over its
+    /// session, a question's session, Talk for the hub's items.
+    func openFabricPointerIfFront() {
+        guard model.fleet.openRequest != nil, !model.isCheckingAuth, !model.needsSignIn,
+              FrontWindow.isFront(window.window, scenePhase: scenePhase)
+        else { return }
+        guard let p = model.fleet.takeOpenRequest() else { return }
+        switch p.attentionKind {
+        case .wakeOffer?, .pairPaused?, .askWaiting?:
+            router.showTalk()
+        default:
+            if let s = p.session { router.showAgentSession(s) } else { router.showAgents() }
+            if p.attentionKind == .approval, let id = p.itemID { router.approval = AttentionRef(id: id) }
+        }
     }
 }
 

@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         super.init()
         ShareCommentPush.model = model
         FabricSessionPush.model = model
+        FabricPush.model = model
     }
     /// why iOS gave no token (no network, no entitlement in a dev build)
     private(set) var registrationError: String?
