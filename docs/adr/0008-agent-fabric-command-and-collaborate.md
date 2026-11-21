@@ -199,7 +199,9 @@ that limit, so a signature it checks itself would protect nothing.
   "ask waiting" item, since only the person can resume it.
 - **Limits**: 8,000 characters a body, 100 unread per receiver (`inbox_full`), the pair limit
   above. A paused pair holds new messages (`DELIVERY_PAUSED`) until continue (deliver) or
-  stop (bounce).
+  stop (bounce); either restarts the pair's count. The person ordering either session
+  (`send`, `answer`, `wake`) restarts the count of a pair that is not paused; a paused pair
+  waits for its own answer.
 - An agent's message never carries authority and never reaches a terminal: its text reaches
   a session only as the result of `inbox`.
 
@@ -221,10 +223,12 @@ phone checks approval and question signatures against.
 
 Per project, `text_off` and `private_notifications` are stored by the hub and set over HTTP
 by the person. They change only what the hub stores and pushes, never what a runtime does,
-so they are not signed. With `text_off`, turns, attention text, `last_line` and `note` are not
-written to the store (the live stream still carries them while the Mac is awake), and an
-order's payload or a message's body is kept only until delivered or read, which it must be to
-reach a sleeping Mac. Turning it on deletes the project's stored text at once.
+so they are not signed. With `text_off`, turns, `last_line` and `note` are not written to the
+store (the live stream still carries them while the Mac is awake). Three things are kept for
+as long as they must be and no longer: an order's payload until the runtime has it, a
+message's body until it is read, and an open attention item's text and signed request until
+it is cleared (the phone has to show and verify it to answer it). Turning Text off deletes
+the project's stored text at once, except those three while they are still needed.
 
 ### 10. Notifications
 
@@ -285,7 +289,7 @@ lowercase UUIDs. A resource that is not the caller's is 404.
 | `POST`/`DELETE …/snooze` | as now | as now |
 | `DELETE /api/fabric/attention/{id}` | | 204: dismisses a hub item (wake offer, ask waiting); 409 for a runtime's item, which an order answers. |
 | `POST /api/fabric/conversations/{id}/continue` | | 200: the pair's count restarts and held messages go. |
-| `POST /api/fabric/conversations/{id}/stop` | | 200: held messages bounce; the pair stays paused until the person next orders either session. |
+| `POST /api/fabric/conversations/{id}/stop` | | 200: held messages bounce to their sender ("your person stopped this exchange"); the pair's count restarts. |
 
 **Order checks at the hub**, each with its code: 400 `malformed`, `non_canonical`; 404 the
 runtime or session is not the caller's; 409 `replayed` (counter at or below the highest the hub
@@ -348,7 +352,31 @@ runtime's owner's fleet: an address never reaches another person's session.
 
 When an `answer` order to a question completes and the session's fabric is a named one with
 a doc, the hub appends the decision to that doc ("2026-11-21 · `taisce/main` asked: … —
-answered: …") through the review gate, attributed to `fabric`.
+answered: …") through the review gate, attributed to `fabric`. Not under Text off.
+
+### 13. Where it is built
+
+| Piece | Where |
+|---|---|
+| Tables, and every query in the person's scope | `crates/store/src/fabric.sql`, `crates/store/src/fabric/{work,mail}.rs` (tests in `work_tests.rs`) |
+| Durable events, orders, settings, pairing, projects, follow | `crates/daemon/src/fabric/record.rs` |
+| What goes down a stream, and its bookkeeping | `crates/daemon/src/fabric/down.rs`; the pump in `grpc.rs` |
+| Fabric tool calls, routing, the pair limit, bounces, conversations | `crates/daemon/src/fabric/mail.rs` |
+| Viewer routes and stream events | `crates/daemon/src/fabric/routes.rs` |
+| What a push says | `crates/daemon/src/fabric/mod.rs` (`alert_payload`), `hub.rs` (`finish_alerts`: presence, snooze, privacy) |
+| SIGNING | `crates/runtime-proto/src/signing.rs` |
+| The fake runtime (key, pairing, order checks, mail, calls) | `crates/runtime-proto/src/fake/work.rs`; `examples/demo-work-script.json` |
+| Tests | `crates/daemon/src/fabric/work_e2e.rs` (end to end), `isolation_tests.rs` (`agent_fabric_work_is_its_owners_alone`), `crates/runtime-proto/tests/signing_vectors.rs` |
+
+- Housekeeping runs every 60 seconds: orders that never reached their runtime before their
+  expiry become `expired` (their person is told), unread mail older than a day bounces, and
+  rows past retention go.
+- The hub's own attention items have ids `wake:<message>`, `ask:<message>` and
+  `pair:<conversation>:<time>`.
+- A runtime refusing a Settings (`Result.settings_version`, REFUSED) is logged; the phone sees
+  it as the runtime's `settings_version` staying behind (`GET /api/fabric/settings`).
+- A refused or failed order alerts its person wherever they are (it was their doing), except
+  `cancelled`.
 
 ## Alternatives rejected
 

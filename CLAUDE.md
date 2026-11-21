@@ -75,7 +75,9 @@ account may be flipped to the work account by other sessions — push with
   flight (Portus closes a connection holding about 145 small DATA frames). New messages go
   through the send window, never around it.
 - `cargo run -p taisce-runtime-proto --features client --example fake_runtime` drives a scratch
-  daemon; never a real server.
+  daemon; never a real server. With `--script crates/runtime-proto/examples/demo-work-script.json
+  --pair` it plays Slices 2–5 and then answers what comes down (orders, settings, pairing, mail)
+  as a runtime does, so the app can be driven end to end without Workbox.
 - Slices 2–5 (ADR 0008): durable Up events (turn, attention, result, pairing) are written
   before they are acknowledged; Down events (orders, settings, pairing offers, nudges) are
   re-sent until acknowledged. Anything carrying the person's authority is a device-signed
