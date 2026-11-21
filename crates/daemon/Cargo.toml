@@ -11,7 +11,7 @@ rmcp = { version = "3.2", features = ["server", "transport-streamable-http-serve
 # multipart: the EPUB library's upload (library.rs)
 axum = { version = "0.8", features = ["multipart"] }
 tower-http = { version = "0.6", features = ["fs", "limit"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "sync", "time"] }
 uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true

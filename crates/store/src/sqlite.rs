@@ -81,6 +81,7 @@ impl SqliteStore {
         // ADR 0008, on a v16 database from before Slices 2-5 (fabric.sql
         // documents each column)
         add_column_if_missing(&conn, "fabric_runtimes", "status", "TEXT NOT NULL DEFAULT '{}'")?;
+        add_column_if_missing(&conn, "fabric_runtimes", "ended_clean", "INTEGER NOT NULL DEFAULT 0")?;
         for (col, decl) in [
             ("following", "INTEGER NOT NULL DEFAULT 0"),
             ("fabric_id", "TEXT NOT NULL DEFAULT ''"),

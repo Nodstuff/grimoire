@@ -262,7 +262,7 @@ lowercase UUIDs. A resource that is not the caller's is 404.
 
 | Route | Answers |
 |---|---|
-| `GET /api/fabric/sessions` | As now. Each session gains `fabric_id`, `turn_id`, `queue`, `queue_paused`, `following`, `text_off`; each runtime gains `held`, `held_since`, `settings_version`, `present`, `public_key`, `devices: [{device_id, fingerprint, name, public_key, paired_at, counter}]`; the body gains `attention` (the open items). |
+| `GET /api/fabric/sessions` | As now. Each session gains `fabric_id`, `turn_id`, `queue`, `queue_paused`, `following`, `text_off`; each runtime gains `connection`, `held`, `held_since`, `settings_version`, `present`, `public_key`, `devices: [{device_id, fingerprint, name, public_key, paired_at, counter}]`; the body gains `attention` (the open items). `connection` is `online` (its stream is up), `idle` (its last stream ended because the runtime closed it: the Mac is awake with nothing to report, as Workbox does when its last session is gone) or `offline` (it dropped, went silent, the hub ended it, or it never connected). `online` stays, true only for `online`. None of the three alerts. |
 | `GET /api/fabric/sessions/{runtime_id}/{session_id}/turns?before=&limit=` | `{turns, more}`, newest first; `before` is a turn's `ended`; limit 1–100, default 30. |
 | `GET /api/fabric/turns?since=&limit=` | Every session's turns ended after `since`, oldest first, with `address`: "Since you last looked". Limit up to 200. |
 | `GET /api/fabric/attention` | `{items}`: open attention items, newest first. |
@@ -282,7 +282,7 @@ lowercase UUIDs. A resource that is not the caller's is 404.
 |---|---|---|
 | `POST /api/fabric/orders` | `{payload, device_id, signature}` | 202 `{order}`. The same order id with the same bytes again: 200, the same order. |
 | `DELETE /api/fabric/orders/{id}` | | 200 `{order}` withdrawn; 409 `already_sent`. |
-| `PUT /api/fabric/settings` | `{payload, device_id, signature}` | 200 the settings view; 409 `stale_settings` with `version`. |
+| `PUT /api/fabric/settings` | `{payload, device_id, signature}` | 200 the settings view; 409 `stale_settings` with `version`; 422 `not_paired_everywhere` naming the runtimes that do not know the device. |
 | `POST /api/fabric/pairing` | `{runtime_id, pairing_id, sealed}` | 202 the pairing view. |
 | `PUT /api/fabric/projects/{name}` | `{text_off?, private_notifications?}` | 200 the project. |
 | `POST`/`DELETE /api/fabric/sessions/{runtime_id}/{session_id}/follow` | | 200 the session. |
@@ -377,6 +377,38 @@ answered: …") through the review gate, attributed to `fabric`. Not under Text 
   it as the runtime's `settings_version` staying behind (`GET /api/fabric/settings`).
 - A refused or failed order alerts its person wherever they are (it was their doing), except
   `cancelled`.
+
+### 14. After the review of 2026-11-21
+
+- **An order goes down only if it can be claimed.** The pump claims a row in the store, under
+  the number it will carry, in the same statement that checks it may still go (an order not
+  withdrawn or expired, an offer not answered, mail not read). A withdraw (only from `pending`)
+  and a claim cannot both win. A Result never turns `withdrawn` or `expired` into anything else.
+- **An Ack covers only what its stream sent.** When a stream opens, every row an earlier stream
+  sent and the runtime never acknowledged loses its old number and goes again under a new one,
+  so a later stream's Ack cannot mark it received.
+- **Calls are bounded per runtime**: 16 in flight and a budget of 60 then 10 a second, beyond
+  either RESOURCE_EXHAUSTED. Only calls that change something (`send`, `inbox_ack`) are
+  remembered for retries; each is taken by its id before it runs, so the same id at once runs
+  once. At most 4096 are remembered. `who` and `inbox` are answered fresh. A message's id
+  is derived from the call and its receiver, so a retried fabric note reaches each member once.
+  Held mail counts toward the 100-message limit.
+- **Text off, every path**: an attention item's text goes when it is cleared, trimmed or
+  withdrawn by a snapshot, by its own project; an order's text and bytes go when the runtime
+  has them; a turn of a session the hub does not know is stored without text.
+- **Private notifications by the alert's own project**, so a session gone from the fleet stays
+  private.
+- **The same order posted twice at once is one order**: the existence check, the counter check
+  and the insert are one store turn, and the second post is answered with the order.
+- **Settings need a device every runtime knows.** Rejected: taking them and surfacing each
+  runtime's refusal later. Settings are fleet-wide; a runtime that cannot verify them keeps its
+  old guardrails without anyone seeing, which is worse than a phone told at once to pair first.
+- **Shutdown ends the channel**: closing the hub (SIGTERM) ends every Attach stream with
+  UNAVAILABLE (the runtime reconnects with backoff), takes no new one, and stops the gRPC
+  server for good.
+- **Pushes held while the person is at the Mac go when they leave it** (`present` turns
+  false), newest per notification, and only those that still stand: a state alert whose
+  session is still in that state, an approval or question still open. At most 200 a runtime.
 
 ## Alternatives rejected
 

@@ -59,6 +59,9 @@ pub struct FabricRuntime {
     pub accounts_at: Option<i64>,
     /// The last RuntimeStatus, as JSON (`{}` before the first).
     pub status: String,
+    /// Its last stream ended because the runtime closed it (idle), not
+    /// because it dropped or went silent (offline).
+    pub ended_clean: bool,
 }
 
 /// What the hub knows about a runtime's connection, written whole.
@@ -71,6 +74,7 @@ pub struct RuntimeLink<'a> {
     pub accounts: &'a str,
     pub accounts_at: Option<i64>,
     pub status: &'a str,
+    pub ended_clean: bool,
 }
 
 /// What a session is doing, as its runtime reports it. `Unknown` is a state
@@ -191,7 +195,7 @@ impl FabricSession {
 }
 
 const RUNTIME_COLS: &str =
-    "id, user_id, name, created_at, revoked_at, last_seen_at, instance_id, last_up_seq, version, accounts, accounts_at, status";
+    "id, user_id, name, created_at, revoked_at, last_seen_at, instance_id, last_up_seq, version, accounts, accounts_at, status, ended_clean";
 
 /// A UUID column. A value that is not one is a corrupt row and an error,
 /// never the nil id.
@@ -215,6 +219,7 @@ fn runtime_row(r: &Row) -> rusqlite::Result<FabricRuntime> {
         accounts: r.get(9)?,
         accounts_at: r.get(10)?,
         status: r.get(11)?,
+        ended_clean: r.get(12)?,
     })
 }
 
@@ -512,7 +517,7 @@ impl SqliteStore {
         if let Some(link) = link {
             tx.execute(
                 "UPDATE fabric_runtimes SET instance_id = ?2, last_up_seq = ?3, version = ?4, last_seen_at = ?5,
-                     accounts = ?6, accounts_at = ?7, status = ?8
+                     accounts = ?6, accounts_at = ?7, status = ?8, ended_clean = ?9
                  WHERE id = ?1",
                 params![
                     runtime.to_string(),
@@ -522,7 +527,8 @@ impl SqliteStore {
                     link.last_seen_at,
                     link.accounts,
                     link.accounts_at,
-                    link.status
+                    link.status,
+                    link.ended_clean
                 ],
             )?;
         }
@@ -628,6 +634,7 @@ mod tests {
             accounts: r#"[{"name":"personal"}]"#,
             accounts_at: Some(19),
             status: "{}",
+            ended_clean: false,
         };
         s.fabric_runtime_write(r.id, &[], &[], Some(&link)).unwrap();
         let got = s.fabric_runtime(r.id).unwrap();
@@ -727,7 +734,7 @@ mod tests {
             assert!(is_not_found(s.fabric_sessions_put(r.id, &[session(sid, "ann/was-here", SessionStatus::Exited, 999)])));
             assert!(is_not_found(s.fabric_sessions_touch(r.id, 999)));
             assert!(is_not_found(s.fabric_runtime_write(r.id, &[sid], &[], None)));
-            let link = RuntimeLink { instance_id: None, last_up_seq: 9, version: "x", last_seen_at: None, accounts: "[]", accounts_at: None, status: "{}" };
+            let link = RuntimeLink { instance_id: None, last_up_seq: 9, version: "x", last_seen_at: None, accounts: "[]", accounts_at: None, status: "{}", ended_clean: false };
             assert!(is_not_found(s.fabric_runtime_write(r.id, &[], &[], Some(&link))));
             assert!(is_not_found(s.fabric_runtime_revoke(r.id, 5)));
             assert!(is_not_found(s.fabric_runtime_create(tom, "planted", "h9", 5)));

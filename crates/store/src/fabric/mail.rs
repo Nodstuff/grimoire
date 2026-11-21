@@ -259,7 +259,7 @@ impl SqliteStore {
     pub fn fabric_conversation_messages(&self, conversation: &str, limit: usize) -> Result<Vec<FabricMessage>> {
         let c = self.fabric_conversation(conversation)?;
         let mut st = self.conn.prepare(&format!(
-            "SELECT {MESSAGE_COLS} FROM fabric_messages WHERE conversation_id = ?1 AND user_id = ?2 ORDER BY sent_at DESC, id DESC LIMIT ?3"
+            "SELECT {MESSAGE_COLS} FROM fabric_messages WHERE conversation_id = ?1 AND user_id = ?2 ORDER BY sent_at DESC, rowid DESC LIMIT ?3"
         ))?;
         let rows = st.query_map(params![c.id, c.user_id.to_string(), limit as i64], message_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -276,7 +276,7 @@ impl SqliteStore {
         )?;
         let mut st = self.conn.prepare(&format!(
             "SELECT {MESSAGE_COLS} FROM fabric_messages WHERE user_id = ?1 AND to_runtime = ?2 AND to_session = ?3
-                 AND state = 'unread' ORDER BY sent_at, id LIMIT ?4"
+                 AND state = 'unread' ORDER BY sent_at, rowid LIMIT ?4"
         ))?;
         let rows = st.query_map(params![owner.to_string(), runtime.to_string(), session.to_string(), limit as i64], message_row)?;
         let got: Vec<FabricMessage> = rows.collect::<rusqlite::Result<_>>()?;
@@ -308,11 +308,12 @@ impl SqliteStore {
         Ok(out)
     }
 
-    /// Unread messages one session of one of the scope's runtimes holds.
+    /// Messages waiting for one session of one of the scope's runtimes:
+    /// unread, and held at a paused pair (they count toward the limit).
     pub fn fabric_unread_count(&self, runtime: Uuid, session: Uuid) -> Result<usize> {
         let owner = self.fabric_runtime(runtime)?.user_id;
         let n: i64 = self.conn.query_row(
-            "SELECT count(*) FROM fabric_messages WHERE user_id = ?1 AND to_runtime = ?2 AND to_session = ?3 AND state = 'unread'",
+            "SELECT count(*) FROM fabric_messages WHERE user_id = ?1 AND to_runtime = ?2 AND to_session = ?3 AND state IN ('unread', 'held')",
             params![owner.to_string(), runtime.to_string(), session.to_string()],
             |r| r.get(0),
         )?;
@@ -365,7 +366,7 @@ impl SqliteStore {
     pub fn fabric_conversation_held(&self, conversation: &str) -> Result<Vec<FabricMessage>> {
         let c = self.fabric_conversation(conversation)?;
         let mut st = self.conn.prepare(&format!(
-            "SELECT {MESSAGE_COLS} FROM fabric_messages WHERE conversation_id = ?1 AND user_id = ?2 AND state = 'held' ORDER BY sent_at, id"
+            "SELECT {MESSAGE_COLS} FROM fabric_messages WHERE conversation_id = ?1 AND user_id = ?2 AND state = 'held' ORDER BY sent_at, rowid"
         ))?;
         let rows = st.query_map(params![c.id, c.user_id.to_string()], message_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -377,7 +378,7 @@ impl SqliteStore {
         let owner = self.fabric_runtime(runtime)?.user_id;
         let mut st = self.conn.prepare(&format!(
             "SELECT {MESSAGE_COLS} FROM fabric_messages WHERE user_id = ?1 AND to_runtime = ?2 AND state = 'unread'
-                 AND received_at IS NULL ORDER BY sent_at, id"
+                 AND received_at IS NULL ORDER BY sent_at, rowid"
         ))?;
         let rows = st.query_map(params![owner.to_string(), runtime.to_string()], message_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -389,7 +390,7 @@ impl SqliteStore {
         let owner = self.fabric_runtime(runtime)?.user_id;
         let mut st = self.conn.prepare(&format!(
             "SELECT {MESSAGE_COLS} FROM fabric_messages WHERE user_id = ?1 AND to_runtime = ?2 AND to_session = ?3
-                 AND state IN ('unread', 'held') ORDER BY sent_at, id"
+                 AND state IN ('unread', 'held') ORDER BY sent_at, rowid"
         ))?;
         let rows = st.query_map(params![owner.to_string(), runtime.to_string(), session.to_string()], message_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -402,7 +403,7 @@ impl SqliteStore {
             return Err(StoreError::InvalidOp("finding stale messages is maintenance (System scope)".into()));
         }
         let mut st = self.conn.prepare(&format!(
-            "SELECT {MESSAGE_COLS} FROM fabric_messages WHERE state IN ('unread', 'held') AND sent_at < ?1 ORDER BY sent_at, id"
+            "SELECT {MESSAGE_COLS} FROM fabric_messages WHERE state IN ('unread', 'held') AND sent_at < ?1 ORDER BY sent_at, rowid"
         ))?;
         let rows = st.query_map([cutoff], message_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

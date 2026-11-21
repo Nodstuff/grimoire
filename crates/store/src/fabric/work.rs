@@ -447,7 +447,10 @@ impl SqliteStore {
         }
         let trimmed = {
             let mut st = tx.prepare(&format!(
-                "UPDATE fabric_attention SET cleared_at = ?2, resolution = 'withdrawn', updated_at = ?2
+                "UPDATE fabric_attention SET cleared_at = ?2, resolution = 'withdrawn', updated_at = ?2,
+                     text = CASE WHEN EXISTS (SELECT 1 FROM fabric_projects p WHERE p.user_id = fabric_attention.user_id AND p.name = fabric_attention.project AND p.text_off) THEN '' ELSE text END,
+                     request = CASE WHEN EXISTS (SELECT 1 FROM fabric_projects p WHERE p.user_id = fabric_attention.user_id AND p.name = fabric_attention.project AND p.text_off) THEN NULL ELSE request END,
+                     signature = CASE WHEN EXISTS (SELECT 1 FROM fabric_projects p WHERE p.user_id = fabric_attention.user_id AND p.name = fabric_attention.project AND p.text_off) THEN NULL ELSE signature END
                  WHERE runtime_id = ?1 AND cleared_at IS NULL AND id IN (
                      SELECT id FROM fabric_attention WHERE runtime_id = ?1 AND cleared_at IS NULL
                      ORDER BY raised_at DESC, rowid DESC LIMIT -1 OFFSET ?3)
@@ -467,8 +470,9 @@ impl SqliteStore {
 
     /// Clear an open item of one of the scope's runtimes. None when it is
     /// not open (cleared already, or never raised).
-    /// With `drop_text` (the project has Text off) its text and signed
-    /// request go too: they were kept only while the phone needed them.
+    /// Its text and signed request go too when `drop_text` says so or its
+    /// own project has Text off: they were kept only while the phone
+    /// needed them.
     pub fn fabric_attention_clear(&mut self, runtime: Uuid, id: &str, resolution: &str, at: i64, drop_text: bool) -> Result<Option<FabricAttention>> {
         self.fabric_runtime(runtime)?;
         Ok(self
@@ -476,9 +480,9 @@ impl SqliteStore {
             .query_row(
                 &format!(
                     "UPDATE fabric_attention SET cleared_at = ?3, resolution = ?4, updated_at = ?3,
-                         text = CASE WHEN ?5 THEN '' ELSE text END,
-                         request = CASE WHEN ?5 THEN NULL ELSE request END,
-                         signature = CASE WHEN ?5 THEN NULL ELSE signature END
+                         text = CASE WHEN ?5 OR EXISTS (SELECT 1 FROM fabric_projects p WHERE p.user_id = fabric_attention.user_id AND p.name = fabric_attention.project AND p.text_off) THEN '' ELSE text END,
+                         request = CASE WHEN ?5 OR EXISTS (SELECT 1 FROM fabric_projects p WHERE p.user_id = fabric_attention.user_id AND p.name = fabric_attention.project AND p.text_off) THEN NULL ELSE request END,
+                         signature = CASE WHEN ?5 OR EXISTS (SELECT 1 FROM fabric_projects p WHERE p.user_id = fabric_attention.user_id AND p.name = fabric_attention.project AND p.text_off) THEN NULL ELSE signature END
                      WHERE runtime_id = ?1 AND id = ?2 AND cleared_at IS NULL RETURNING {ATTENTION_COLS}"
                 ),
                 params![runtime.to_string(), id, at, resolution, drop_text],
@@ -682,23 +686,47 @@ impl SqliteStore {
 
     // ---- what went down a stream ----
 
-    /// A row went down `runtime`'s stream as event `seq` of `instance`.
-    pub fn fabric_down_sent(&mut self, runtime: Uuid, kind: DownKind, id: &str, instance: &str, seq: u64, now: i64) -> Result<()> {
+    /// Claim a row to go down `runtime`'s stream as event `seq` of
+    /// `instance`, before it is sent. False when it may no longer go (an
+    /// order withdrawn or expired, an offer answered, mail read or
+    /// bounced): the caller does not send it. One statement, so a withdraw
+    /// and a claim never both win.
+    pub fn fabric_down_sent(&mut self, runtime: Uuid, kind: DownKind, id: &str, instance: &str, seq: u64, now: i64) -> Result<bool> {
         self.fabric_runtime(runtime)?;
-        let state = match kind {
-            DownKind::Order => ", state = CASE WHEN state = 'pending' THEN 'sent' ELSE state END",
-            DownKind::Pairing => ", state = CASE WHEN state = 'pending' THEN 'sent' ELSE state END",
-            DownKind::Nudge => "",
+        let (state, still) = match kind {
+            DownKind::Order => (", state = 'sent'", "state IN ('pending', 'sent') AND expires_at > ?5"),
+            DownKind::Pairing => (", state = 'sent'", "state IN ('pending', 'sent') AND expires_at > ?5"),
+            DownKind::Nudge => ("", "state = 'unread'"),
         };
-        self.conn.execute(
+        let n = self.conn.execute(
             &format!(
-                "UPDATE {} SET down_instance = ?3, down_seq = ?4, updated_at = ?5{state} WHERE {} = ?1 AND id = ?2",
+                "UPDATE {} SET down_instance = ?3, down_seq = ?4, updated_at = ?5{state}
+                 WHERE {} = ?1 AND id = ?2 AND received_at IS NULL AND {still}",
                 kind.table(),
                 kind.runtime_col()
             ),
             params![runtime.to_string(), id, instance, i64_of(seq), now],
         )?;
-        Ok(())
+        Ok(n == 1)
+    }
+
+    /// A new stream of `runtime` begins: nothing it has not acknowledged
+    /// keeps the number it went down as on an earlier stream, so an Ack on
+    /// this one can only cover what this one sent. Say how many rows.
+    pub fn fabric_down_reset(&mut self, runtime: Uuid) -> Result<usize> {
+        self.fabric_runtime(runtime)?;
+        let mut n = 0;
+        for kind in [DownKind::Order, DownKind::Pairing, DownKind::Nudge] {
+            n += self.conn.execute(
+                &format!(
+                    "UPDATE {} SET down_instance = NULL, down_seq = NULL WHERE {} = ?1 AND received_at IS NULL AND down_seq IS NOT NULL",
+                    kind.table(),
+                    kind.runtime_col()
+                ),
+                [runtime.to_string()],
+            )?;
+        }
+        Ok(n)
     }
 
     /// The runtime has every Down event of `instance` up to `upto`: mark
@@ -708,7 +736,16 @@ impl SqliteStore {
         let mut got = vec![];
         for kind in [DownKind::Order, DownKind::Pairing, DownKind::Nudge] {
             let state = match kind {
-                DownKind::Order => ", state = CASE WHEN state = 'sent' THEN 'received' ELSE state END",
+                // the runtime has it: under Text off its text and bytes go now
+                DownKind::Order => {
+                    ", state = CASE WHEN state = 'sent' THEN 'received' ELSE state END,
+                     text = CASE WHEN EXISTS (SELECT 1 FROM fabric_projects p WHERE p.user_id = fabric_orders.user_id
+                         AND p.name = fabric_orders.project AND p.text_off) THEN NULL ELSE text END,
+                     payload = CASE WHEN EXISTS (SELECT 1 FROM fabric_projects p WHERE p.user_id = fabric_orders.user_id
+                         AND p.name = fabric_orders.project AND p.text_off) THEN NULL ELSE payload END,
+                     signature = CASE WHEN EXISTS (SELECT 1 FROM fabric_projects p WHERE p.user_id = fabric_orders.user_id
+                         AND p.name = fabric_orders.project AND p.text_off) THEN NULL ELSE signature END"
+                }
                 DownKind::Pairing | DownKind::Nudge => "",
             };
             let mut st = self.conn.prepare(&format!(

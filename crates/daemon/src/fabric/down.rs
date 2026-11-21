@@ -31,7 +31,12 @@ impl Hub {
         let inst = instance.to_string();
         let (got, max) = with_store(&self.0.store, Scope::User(user), move |s| -> Result<_, StoreError> {
             let got = if last_down_seq > 0 { s.fabric_down_received(runtime, &inst, last_down_seq, now)? } else { vec![] };
-            Ok((got, s.fabric_down_max_seq(runtime, &inst)?))
+            let max = s.fabric_down_max_seq(runtime, &inst)?;
+            // what an earlier stream sent and nobody acknowledged goes again
+            // under a number of this stream's, so only this stream's Acks
+            // can mark it received
+            s.fabric_down_reset(runtime)?;
+            Ok((got, max))
         })
         .await
         .map_err(Refused::Store)?;
@@ -157,6 +162,7 @@ impl Hub {
                 let mut a = SessionAlert::new(user, runtime, session, &address, AlertKind::OrderRefused);
                 a.order_id = Some(o.id.clone());
                 a.preview = Some("expired before its Mac was back".into());
+                a.project = o.project.clone();
                 alerts.push(a);
             }
             Self::publish(fleet, gone.iter().map(|o| Change::Order(OrderView::from(o))).collect());
@@ -165,26 +171,35 @@ impl Hub {
         self.alert_all(alerts);
     }
 
-    /// A row went down as event `seq` of `instance`.
-    pub async fn down_sent(&self, user: Uuid, runtime: Uuid, row: Option<(DownKind, String)>, instance: &str, seq: u64, now: i64) -> Result<(), Refused> {
-        {
-            let mut fleets = self.fleets();
-            if let Some(rt) = fleets.get_mut(&user).and_then(|f| f.runtimes.get_mut(&runtime)) {
-                rt.down = (Some(instance.to_string()), seq);
-            }
-        }
-        let Some((kind, id)) = row else { return Ok(()) };
+    /// Claim a row to go down as event `seq` of `instance`, before it is
+    /// sent. False: it may no longer go (withdrawn, expired, answered,
+    /// read), and the caller does not send it. Settings (no row) always go.
+    pub async fn down_sent(&self, user: Uuid, runtime: Uuid, row: Option<(DownKind, String)>, instance: &str, seq: u64, now: i64) -> Result<bool, Refused> {
+        let Some((kind, id)) = row else {
+            self.took_seq(user, runtime, instance, seq);
+            return Ok(true);
+        };
         let inst = instance.to_string();
-        let order = with_store(&self.0.store, Scope::User(user), move |s| -> Result<_, StoreError> {
-            s.fabric_down_sent(runtime, kind, &id, &inst, seq, now)?;
-            Ok(if kind == DownKind::Order { Some(s.fabric_order(runtime, &id)?) } else { None })
+        let (claimed, order) = with_store(&self.0.store, Scope::User(user), move |s| -> Result<_, StoreError> {
+            let claimed = s.fabric_down_sent(runtime, kind, &id, &inst, seq, now)?;
+            Ok((claimed, if claimed && kind == DownKind::Order { Some(s.fabric_order(runtime, &id)?) } else { None }))
         })
         .await
         .map_err(Refused::Store)?;
+        if claimed {
+            self.took_seq(user, runtime, instance, seq);
+        }
         if let Some(o) = order {
             self.publish_to(user, vec![Change::Order(OrderView::from(&o))]);
         }
-        Ok(())
+        Ok(claimed)
+    }
+
+    fn took_seq(&self, user: Uuid, runtime: Uuid, instance: &str, seq: u64) {
+        let mut fleets = self.fleets();
+        if let Some(rt) = fleets.get_mut(&user).and_then(|f| f.runtimes.get_mut(&runtime)) {
+            rt.down = (Some(instance.to_string()), seq);
+        }
     }
 
     /// The runtime acknowledged every Down event of `instance` up to `upto`.

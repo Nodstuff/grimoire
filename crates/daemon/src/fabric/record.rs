@@ -364,6 +364,9 @@ impl Hub {
             Durable::Turn(t) => {
                 let session = Uuid::parse_str(&t.session_id).map_err(|_| bad("turn.session_id", "a UUID"))?;
                 let (address, project, _, text_off) = self.who(user, runtime, session);
+                // a session the hub does not know may be in a Text off
+                // project: its text is not stored (addresses are never empty)
+                let text_off = text_off || address.is_empty();
                 let source = pb::PromptSource::try_from(t.source)
                     .ok()
                     .filter(|s| *s != pb::PromptSource::Unspecified)
@@ -412,6 +415,7 @@ impl Hub {
                         let mut a = SessionAlert::new(user, runtime, session, &address, AlertKind::Finished);
                         a.preview = t.reply.lines().rev().find(|l| !l.trim().is_empty()).map(|l| first_line(l, 180));
                         a.from_phone = true;
+                        a.project = project.clone();
                         after.alerts.push(a);
                     }
                 }
@@ -427,6 +431,7 @@ impl Hub {
                 }
                 let session = Uuid::parse_str(&decoded.session_id).map_err(|_| bad("attention.raised.request.session_id", "a UUID"))?;
                 let (address, project, _, _) = self.who(user, runtime, session);
+                let alert_project = project.clone();
                 let kind = attention_kind(decoded.kind);
                 let choices: Vec<Value> = decoded.choices.iter().map(|c| json!({"id": c.id, "label": c.label})).collect();
                 let row = FabricAttention {
@@ -471,6 +476,7 @@ impl Hub {
                     if let Some(k) = alert_kind {
                         let mut a = SessionAlert::new(user, runtime, session, &address, k);
                         a.request_id = Some(row.id.clone());
+                        a.project = alert_project.clone();
                         a.preview = Some(match k {
                             AlertKind::Approval => format!("Wants to run: {}", first_line(&row.text, 160)),
                             _ => first_line(&row.text, 240),
@@ -538,7 +544,8 @@ impl Hub {
                 // the first result wins: a repeat the runtime refused as
                 // replayed says nothing new about an order it already answered
                 let answered = matches!(order.state.as_str(), "queued" | "done" | "refused" | "failed");
-                let finished = matches!(order.state.as_str(), "done" | "refused" | "failed");
+                // withdrawn or expired at the hub: no result changes that
+                let finished = matches!(order.state.as_str(), "done" | "refused" | "failed" | "withdrawn" | "expired");
                 if finished || (answered && reason.as_deref() == Some("replayed")) {
                     return Ok(());
                 }
@@ -546,7 +553,16 @@ impl Hub {
                 let text_off = self.fleets().get(&user).is_some_and(|f| f.text_off(&order.project));
                 let (st, rs, dt) = (state.to_string(), reason.clone(), detail.clone());
                 let updated = with_store(&store, Scope::User(user), move |s| {
-                    s.fabric_order_set(runtime, &id, &st, rs.as_deref(), dt.as_deref(), None, final_state && text_off, now)
+                    s.fabric_order_set(
+                        runtime,
+                        &id,
+                        &st,
+                        rs.as_deref(),
+                        dt.as_deref(),
+                        Some(&["pending", "sent", "received", "queued"]),
+                        final_state && text_off,
+                        now,
+                    )
                 })
                 .await
                 .map_err(Refused::Store)?;
@@ -558,6 +574,7 @@ impl Hub {
                     let mut a = SessionAlert::new(user, runtime, session, &address, AlertKind::OrderRefused);
                     a.order_id = Some(o.id.clone());
                     a.preview = Some(detail.clone().or(reason.clone()).unwrap_or_else(|| state.to_string()));
+                    a.project = o.project.clone();
                     after.alerts.push(a);
                 }
                 if state == "done" && o.verb.as_deref() == Some("answer") {
@@ -601,6 +618,7 @@ impl Hub {
         if let Some((row, _)) = raised {
             after.changes.push(Change::Attention(AttentionView::from(&row)));
             let mut a = SessionAlert::new(user, runtime, m.to.session_id, &m.to.address, AlertKind::WakeOffer);
+            a.project = self.fleets().get(&user).and_then(|f| f.session(runtime, m.to.session_id)).map(|s| s.project.clone()).unwrap_or_default();
             a.request_id = Some(row.id.clone());
             a.preview = Some(format!("Mail from {}", m.from.address));
             after.alerts.push(a);
@@ -668,22 +686,6 @@ impl Hub {
         }
         if lower_uuid(&order.order_id).is_none() {
             return Err(reject(400, "malformed", "order_id: a lowercase UUID"));
-        }
-        // the same order again: what is held
-        let (oid, held) = (order.order_id.clone(), None::<FabricOrder>);
-        let existing = with_store(&self.0.store, Scope::User(user), move |s| match s.fabric_order(runtime, &oid) {
-            Ok(o) => Ok(Some(o)),
-            Err(StoreError::NotFound(_)) => Ok(held),
-            Err(e) => Err(e),
-        })
-        .await
-        .map_err(store_failed)?;
-        if let Some(o) = existing {
-            let same = o.device_id == signed.device_id && o.counter == order.counter && o.payload.as_ref().is_none_or(|p| *p == payload);
-            if same {
-                return Ok((OrderView::from(&o), false));
-            }
-            return Err(reject(409, "order_id_reused", "another order already has that id"));
         }
         if order.expires_at <= now {
             return Err(reject(422, "expired", "expires_at has passed"));
@@ -779,7 +781,17 @@ impl Hub {
         }
         let device_counter = info.device(&signed.device_id).map(|d| d.counter).unwrap_or(0);
         let device = signed.device_id.clone();
-        let stored = with_store(&self.0.store, Scope::User(user), move |s| -> Result<Result<FabricOrder, Reject>, StoreError> {
+        // one store turn: the same order posted twice at once is taken once,
+        // and the second post is answered with it
+        let stored = with_store(&self.0.store, Scope::User(user), move |s| -> Result<Result<(FabricOrder, bool), Reject>, StoreError> {
+            match s.fabric_order(runtime, &row.id) {
+                Ok(o) => {
+                    let same = o.device_id == row.device_id && o.counter == row.counter && o.payload.as_ref().is_none_or(|p| Some(p) == row.payload.as_ref());
+                    return Ok(if same { Ok((o, false)) } else { Err(reject(409, "order_id_reused", "another order already has that id")) });
+                }
+                Err(StoreError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
             let held = s.fabric_order_max_counter(runtime, &device)?.max(device_counter);
             if row.counter <= held {
                 return Ok(Err(reject(409, "replayed", format!("counter: above {held}"))));
@@ -787,10 +799,14 @@ impl Hub {
             if s.fabric_orders_undelivered(runtime)?.len() >= MAX_UNDELIVERED {
                 return Ok(Err(reject(429, "queue_full", "256 orders already wait for that runtime")));
             }
-            Ok(Ok(s.fabric_order_insert(&row)?))
+            Ok(Ok((s.fabric_order_insert(&row)?, true)))
         })
         .await
         .map_err(store_failed)??;
+        let (stored, fresh) = stored;
+        if !fresh {
+            return Ok((OrderView::from(&stored), false));
+        }
         tracing::info!(target: crate::auth::AUDIT, event = "fabric.order", user = %user, runtime = %runtime, order = stored.id,
             device = stored.device_id, kind = stored.kind, verb = ?stored.verb);
         let mut changes = vec![Change::Order(OrderView::from(&stored))];
@@ -844,6 +860,18 @@ impl Hub {
                 .find(|r| r.info.device(&signed.device_id).is_some())
                 .map(|r| r.info.clone())
                 .ok_or_else(|| reject(422, "unknown_device", "that device is not paired with any of your runtimes"))?;
+            // settings are fleet-wide: a runtime that does not know the
+            // device would refuse them and keep its old rules unseen, so
+            // they are taken only from a device every runtime knows
+            let missing: Vec<String> =
+                f.runtimes.values().filter(|r| r.info.device(&signed.device_id).is_none()).map(|r| r.row.name.clone()).collect();
+            if !missing.is_empty() {
+                return Err(reject(
+                    422,
+                    "not_paired_everywhere",
+                    format!("pair this device with every runtime first; not with: {}", missing.join(", ")),
+                ));
+            }
             device_key(&info, &signed.device_id)?
         };
         let settings: pb::Settings = signing::open(signing::SETTINGS, &key, &payload, &signature).map_err(opened)?;

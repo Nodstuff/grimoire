@@ -33,7 +33,10 @@ CREATE TABLE IF NOT EXISTS fabric_runtimes (
     accounts_at     INTEGER,
     -- the last RuntimeStatus, as JSON (key, Hold, settings version, devices,
     -- presence): what the hub checks a device's order against
-    status          TEXT NOT NULL DEFAULT '{}'
+    status          TEXT NOT NULL DEFAULT '{}',
+    -- its last stream ended because it closed it (idle), not because it
+    -- dropped or went silent (offline)
+    ended_clean     INTEGER NOT NULL DEFAULT 0
 );
 -- a name is unique among a person's live runtimes, so a removed name can be
 -- enrolled again

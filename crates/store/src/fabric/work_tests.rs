@@ -176,8 +176,8 @@ fn orders_keep_their_bytes_until_received_and_go_down_by_number() {
         assert_eq!(s.fabric_order_max_counter(w.rt, "dev").unwrap(), 7);
         assert_eq!(s.fabric_order_max_counter(w.rt, "other").unwrap(), 0);
         assert_eq!(s.fabric_orders_undelivered(w.rt).unwrap().len(), 2);
-        s.fabric_down_sent(w.rt, DownKind::Order, "o1", "inst", 3, 12).unwrap();
-        s.fabric_down_sent(w.rt, DownKind::Order, "o2", "inst", 4, 12).unwrap();
+        assert!(s.fabric_down_sent(w.rt, DownKind::Order, "o1", "inst", 3, 12).unwrap());
+        assert!(s.fabric_down_sent(w.rt, DownKind::Order, "o2", "inst", 4, 12).unwrap());
         assert_eq!(s.fabric_order(w.rt, "o1").unwrap().state, "sent");
         assert_eq!(s.fabric_down_max_seq(w.rt, "inst").unwrap(), 4);
         assert_eq!(s.fabric_down_received(w.rt, "inst", 3, 13).unwrap(), vec![(DownKind::Order, "o1".to_string())]);
@@ -365,4 +365,29 @@ fn expiry_is_maintenance_and_says_which_orders_never_arrived() {
     assert_eq!(pairings.len(), 1);
     w.s.fabric_work_expire(100 + WORK_RETENTION + 3601).unwrap();
     assert!(w.s.fabric_orders(None, None, None, 10).unwrap().is_empty());
+}
+
+/// Review 5: under Text off no attention text survives an item's end, by
+/// any path (cleared, trimmed, withdrawn by a snapshot), and an order's text
+/// goes once its runtime has it.
+#[test]
+fn review_5_text_off_text_goes_by_every_path() {
+    let mut w = setup();
+    let sid = Uuid::now_v7();
+    w.s.with_scope_for_test(Scope::User(w.tom), |s| {
+        s.fabric_project_put("taisce", Some(true), None, 1).unwrap();
+        for i in 0..=MAX_OPEN_ATTENTION {
+            s.fabric_attention_raise(w.rt, &attention(sid, &format!("x{i}"), 10 + i as i64)).unwrap();
+        }
+        let trimmed = s.fabric_attention_get("x0").unwrap();
+        assert_eq!((trimmed.resolution.as_deref(), trimmed.text.as_str(), trimmed.request.is_none()), (Some("withdrawn"), "", true), "trimmed");
+        s.fabric_attention_clear_others(w.rt, &[], 200).unwrap();
+        let gone = s.fabric_attention_get("x5").unwrap();
+        assert_eq!((gone.text.as_str(), gone.request.is_none()), ("", true), "withdrawn by a snapshot");
+        s.fabric_order_insert(&order(w.rt, "o1", 1, 1)).unwrap();
+        s.fabric_down_sent(w.rt, DownKind::Order, "o1", "i", 1, 2).unwrap();
+        s.fabric_down_received(w.rt, "i", 1, 3).unwrap();
+        let o = s.fabric_order(w.rt, "o1").unwrap();
+        assert_eq!((o.text, o.payload), (None, None), "the runtime has it");
+    });
 }

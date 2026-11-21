@@ -111,6 +111,9 @@ pub struct SessionAlert {
     /// A turn the person started from the phone: told even while they are
     /// at the Mac.
     pub from_phone: bool,
+    /// The session's project (for private notifications, whether or not
+    /// the fleet still holds the session).
+    pub project: String,
 }
 
 impl SessionAlert {
@@ -127,6 +130,7 @@ impl SessionAlert {
             order_id: None,
             finished: vec![],
             from_phone: false,
+            project: String::new(),
         }
     }
 }
@@ -142,6 +146,10 @@ pub struct RuntimeView {
     pub created_at: i64,
     /// Its stream is up right now.
     pub online: bool,
+    /// `online`; `idle`: its last stream ended because the runtime closed
+    /// it (the Mac is awake with nothing to report); `offline`: it dropped,
+    /// went silent, or never connected. Never an alert.
+    pub connection: &'static str,
     /// When its stream was last up: now, while it is.
     pub last_seen_at: Option<i64>,
     pub version: String,

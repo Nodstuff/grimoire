@@ -61,6 +61,8 @@ pub const ALERT_FLOOR: i64 = 30;
 /// A session reported unchanged is said to still exist once it has gone
 /// this long without an update, so it never ages out while reported.
 const STILL_THERE_AFTER: i64 = 86400;
+/// Alerts one runtime may hold back while its person is at the Mac.
+pub const MAX_HELD_ALERTS: usize = 200;
 
 /// What a runtime sent, already validated.
 #[derive(Debug, Clone)]
@@ -81,6 +83,8 @@ pub enum Kill {
     Superseded,
     /// The runtime was removed.
     Removed,
+    /// The hub is shutting down (SIGTERM): reconnect with backoff.
+    Closing,
 }
 
 /// Why the hub refused something from a runtime.
@@ -96,6 +100,8 @@ pub enum Refused {
     /// A message broke a limit or was malformed: the field, and what it
     /// should have been.
     Invalid(String),
+    /// The hub is shutting down.
+    Closing,
     Store(StoreError),
 }
 
@@ -149,6 +155,9 @@ pub(super) struct RuntimeState {
     /// Sessions evicted to make room, not yet deleted from the store.
     evicted: Vec<Uuid>,
     pub(super) link_dirty: bool,
+    /// Alerts held back while the person was at this Mac, sent when they
+    /// leave it if they still stand (oldest first, at most [`MAX_HELD_ALERTS`]).
+    pub(super) held_alerts: Vec<SessionAlert>,
     /// Serialises this runtime's store writes ([`Hub::write_runtime`]).
     pub(super) writing: Arc<tokio::sync::Mutex<()>>,
     /// The last Down event number taken on this runtime's instance, and
@@ -169,6 +178,7 @@ impl RuntimeState {
             sessions: sessions.into_iter().map(|s| (s.id, Slot::stored(s))).collect(),
             evicted: vec![],
             link_dirty: false,
+            held_alerts: vec![],
             writing: Default::default(),
             down: (None, 0),
         }
@@ -181,6 +191,13 @@ impl RuntimeState {
             name: self.row.name.clone(),
             created_at: self.row.created_at,
             online,
+            connection: if online {
+                "online"
+            } else if self.row.ended_clean {
+                "idle"
+            } else {
+                "offline"
+            },
             last_seen_at: if online { Some(now) } else { self.row.last_seen_at },
             version: self.row.version.clone(),
             accounts: self.accounts.clone(),
@@ -302,6 +319,7 @@ impl RuntimeState {
 fn alert(s: &FabricSession, kind: AlertKind) -> SessionAlert {
     let mut a = SessionAlert::new(s.user_id, s.runtime_id, s.id, &s.address, kind);
     a.preview = (!s.last_line.is_empty()).then(|| s.last_line.clone());
+    a.project = s.project.clone();
     a
 }
 
@@ -351,7 +369,47 @@ impl UserFleet {
     /// (but a followed session's finish), no text when the project's
     /// notifications are private, and a finished turn names every session
     /// now finished (a followed one alerts alone).
-    pub(super) fn finish_alerts(&self, alerts: Vec<SessionAlert>, now: i64) -> Vec<SessionAlert> {
+    pub(super) fn finish_alerts(&mut self, alerts: Vec<SessionAlert>, now: i64) -> Vec<SessionAlert> {
+        let mut held: Vec<SessionAlert> = vec![];
+        let out = self.gate_alerts(alerts, now, &mut held);
+        for a in held {
+            if let Some(rt) = self.runtimes.get_mut(&a.runtime_id) {
+                rt.held_alerts.push(a);
+                let over = rt.held_alerts.len().saturating_sub(MAX_HELD_ALERTS);
+                rt.held_alerts.drain(..over);
+            }
+        }
+        out
+    }
+
+    /// The person left `runtime`'s Mac: what was held back and still
+    /// stands (a state alert whose session is still in that state; any
+    /// other the caller checks against what is still open), newest per
+    /// notification.
+    pub(super) fn release_held(&mut self, runtime: Uuid) -> Vec<SessionAlert> {
+        let Some(rt) = self.runtimes.get_mut(&runtime) else { return vec![] };
+        let held = std::mem::take(&mut rt.held_alerts);
+        let mut latest: Vec<SessionAlert> = vec![];
+        for a in held.into_iter().rev() {
+            let key = super::alert_collapse_id(&a);
+            if latest.iter().any(|l| super::alert_collapse_id(l) == key) {
+                continue;
+            }
+            let stands = match a.kind {
+                AlertKind::NeedsYou => rt.sessions.get(&a.session_id).is_some_and(|s| s.row.state == SessionStatus::NeedsYou),
+                AlertKind::Stalled => rt.sessions.get(&a.session_id).is_some_and(|s| s.row.state == SessionStatus::Stalled),
+                AlertKind::Finished => rt.sessions.get(&a.session_id).is_some_and(|s| s.row.state == SessionStatus::Finished),
+                _ => true,
+            };
+            if stands {
+                latest.push(a);
+            }
+        }
+        latest.reverse();
+        latest
+    }
+
+    fn gate_alerts(&self, alerts: Vec<SessionAlert>, now: i64, held: &mut Vec<SessionAlert>) -> Vec<SessionAlert> {
         let finished: Vec<String> = {
             let mut f: Vec<&FabricSession> = self
                 .runtimes
@@ -371,10 +429,16 @@ impl UserFleet {
                 let snoozed = row.is_some_and(|s| s.quiet_until.is_some_and(|q| q > now));
                 // a refused order is the person's own doing: told wherever they are
                 let at_mac = rt.is_some_and(|r| r.info.present) && a.kind != AlertKind::OrderRefused && !a.from_phone;
-                if snoozed || (at_mac && !(following && a.kind == AlertKind::Finished)) {
+                if snoozed {
                     return None;
                 }
-                let project = row.map(|s| s.project.as_str()).unwrap_or("");
+                if at_mac && !(following && a.kind == AlertKind::Finished) {
+                    // told when they leave the Mac, if it still stands
+                    held.push(a);
+                    return None;
+                }
+                // the alert's own project: the session may have left the fleet
+                let project = if a.project.is_empty() { row.map(|s| s.project.as_str()).unwrap_or("") } else { a.project.as_str() };
                 if self.private(project) || self.text_off(project) {
                     a.preview = None;
                     a.choices = serde_json::json!([]);
@@ -389,6 +453,11 @@ impl UserFleet {
 }
 
 pub(super) struct Inner {
+    /// True once the hub is shutting down: no stream is taken, every open
+    /// one is ended, the channel's server stops.
+    closing: tokio::sync::watch::Sender<bool>,
+    /// Per runtime: its fabric tool calls in flight, and its call budget.
+    pub(super) call_load: Mutex<HashMap<Uuid, (usize, f64, std::time::Instant)>>,
     pub(super) store: SharedStore,
     fleets: Mutex<HashMap<Uuid, UserFleet>>,
     pub(super) alerter: Option<Alerter>,
@@ -400,7 +469,9 @@ pub(super) struct Inner {
     syncing: tokio::sync::Mutex<()>,
     /// Fabric tool calls answered lately, by (runtime, call id): a retry
     /// gets the first answer.
-    pub(super) calls: Mutex<HashMap<(Uuid, String), (i64, taisce_runtime_proto::v1::CallReply)>>,
+    /// One per call that changes something (`send`, `inbox_ack`): taken
+    /// before it runs, so the same id at once runs once.
+    pub(super) calls: Mutex<HashMap<(Uuid, String), (i64, Arc<tokio::sync::OnceCell<taisce_runtime_proto::v1::CallReply>>)>>,
 }
 
 #[derive(Clone)]
@@ -409,6 +480,8 @@ pub struct Hub(pub(super) Arc<Inner>);
 impl Hub {
     pub fn new(store: SharedStore, alerter: Option<Alerter>) -> Self {
         Hub(Arc::new(Inner {
+            closing: tokio::sync::watch::channel(false).0,
+            call_load: Mutex::default(),
             store,
             fleets: Mutex::default(),
             alerter,
@@ -529,6 +602,9 @@ impl Hub {
         let conn = self.0.next_conn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (kill_tx, kill) = oneshot::channel();
         let wake = Arc::new(tokio::sync::Notify::new());
+        if self.is_closing() {
+            return Err(Refused::Closing);
+        }
         let last_up_seq = {
             let mut fleets = self.fleets();
             let fleet = fleets.get_mut(&user).ok_or(Refused::NotLive)?;
@@ -542,6 +618,7 @@ impl Hub {
                 rt.row.last_up_seq = 0;
             }
             rt.state_floor = 0;
+            rt.row.ended_clean = false;
             rt.row.version = version.to_string();
             rt.row.last_seen_at = Some(now);
             rt.link_dirty = true;
@@ -556,6 +633,7 @@ impl Hub {
     /// Take one message from the stream `conn` of `runtime`.
     pub async fn apply(&self, user: Uuid, runtime: Uuid, conn: u64, incoming: Incoming, now: i64) -> Result<(), Refused> {
         let mut alerts = vec![];
+        let mut left = vec![];
         let write_now = {
             let mut fleets = self.fleets();
             let fleet = fleets.get_mut(&user).ok_or(Refused::NotLive)?;
@@ -564,12 +642,29 @@ impl Hub {
                 return Err(Refused::NotLive);
             }
             let mut changes = vec![];
+            let was_present = rt.info.present;
             let applied = Self::apply_to(rt, incoming, now, &mut changes, &mut alerts);
+            let left_the_mac = was_present && !rt.info.present;
             // what was changed before a refusal is still a change
             Self::publish(fleet, changes);
             alerts = fleet.finish_alerts(std::mem::take(&mut alerts), now);
+            if left_the_mac {
+                left = fleet.release_held(runtime);
+            }
             applied?
         };
+        if !left.is_empty() {
+            // an approval or a question dealt with at the Mac is not news
+            let open: HashSet<String> = with_store(&self.0.store, Scope::User(user), |s| s.fabric_attention_open())
+                .await
+                .map(|items| items.into_iter().map(|a| a.id).collect())
+                .unwrap_or_default();
+            left.retain(|a| a.request_id.as_ref().is_none_or(|id| open.contains(id)));
+            let mut fleets = self.fleets();
+            if let Some(fleet) = fleets.get_mut(&user) {
+                alerts.extend(fleet.finish_alerts(left, now));
+            }
+        }
         if write_now {
             self.write_runtime(user, runtime).await;
         }
@@ -662,7 +757,9 @@ impl Hub {
 
     /// The stream `conn` of `runtime` ended. A stream that was superseded
     /// changes nothing: the runtime is still online on its newer one.
-    pub async fn disconnect(&self, user: Uuid, runtime: Uuid, conn: u64, now: i64) {
+    /// `clean`: the runtime closed the stream itself (it has nothing to
+    /// report: idle), not dropped or silent (offline).
+    pub async fn disconnect(&self, user: Uuid, runtime: Uuid, conn: u64, now: i64, clean: bool) {
         {
             let mut fleets = self.fleets();
             let Some(fleet) = fleets.get_mut(&user) else { return };
@@ -672,6 +769,7 @@ impl Hub {
             }
             rt.conn = None;
             rt.row.last_seen_at = Some(now);
+            rt.row.ended_clean = clean;
             rt.link_dirty = true;
             let view = rt.view(now);
             Self::publish(fleet, vec![Change::Runtime(view)]);
@@ -814,6 +912,7 @@ impl Hub {
                 accounts: &row.accounts,
                 accounts_at: row.accounts_at,
                 status: &row.status,
+                ended_clean: row.ended_clean,
             });
             s.fabric_runtime_write(runtime, &evicted, &rows, link.as_ref())
         })
@@ -852,14 +951,33 @@ impl Hub {
 
     /// The daemon is stopping: every connected runtime was last seen now,
     /// and everything pending is written.
+    /// Every open stream is ended (UNAVAILABLE: reconnect with backoff), no
+    /// new one is taken, and the channel's server stops ([`Hub::closed`]).
     pub async fn close(&self, now: i64) {
+        self.0.closing.send_replace(true);
         for fleet in self.fleets().values_mut() {
-            for rt in fleet.runtimes.values_mut().filter(|r| r.conn.is_some()) {
-                rt.row.last_seen_at = Some(now);
-                rt.link_dirty = true;
+            for rt in fleet.runtimes.values_mut() {
+                if let Some(conn) = rt.conn.take() {
+                    let _ = conn.kill.send(Kill::Closing);
+                    rt.row.last_seen_at = Some(now);
+                    rt.row.ended_clean = false;
+                    rt.link_dirty = true;
+                }
             }
         }
         self.flush().await;
+    }
+
+    pub fn is_closing(&self) -> bool {
+        *self.0.closing.borrow()
+    }
+
+    /// Resolves once [`Hub::close`] has been called.
+    pub fn closed(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.0.closing.subscribe();
+        async move {
+            let _ = rx.wait_for(|c| *c).await;
+        }
     }
 
     /// Expire sessions last updated more than 7 days before `now`. A

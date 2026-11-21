@@ -177,7 +177,8 @@ service Runtime {
   //   UNAVAILABLE         this runtime has no Attach stream open, or the
   //                       hub could not reach its store: retry with the
   //                       same call_id
-  //   RESOURCE_EXHAUSTED  more than 16 calls in flight for this runtime
+  //   RESOURCE_EXHAUSTED  more than 16 calls in flight for this runtime, or
+  //                       more than 60 at once then 10 a second: back off
   //   UNAUTHENTICATED     as for Attach
   // What an agent should hear (a paused pair, a bounced address) is a
   // reply, not a status.
@@ -933,8 +934,9 @@ message PairingClaim {
 
 message CallRequest {
   // A UUID. A retry after a lost answer sends the same id, and the hub
-  // returns the first answer instead of acting twice (it remembers ids for
-  // 10 minutes), so a retried `send` posts one message.
+  // returns the first answer instead of acting twice (it remembers `send`
+  // and `inbox_ack` ids for 10 minutes; `who` and `inbox` are answered
+  // fresh), so a retried `send` posts one message.
   string call_id = 1;
   // The calling session, as SessionState.session_id. The hub refuses a
   // session this runtime has not reported (NOT_FOUND).

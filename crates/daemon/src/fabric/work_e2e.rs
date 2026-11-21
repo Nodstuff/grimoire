@@ -589,3 +589,294 @@ async fn the_demo_scripts_play() {
     // the message to taisce/main was read when its nudge came down
     assert!(f.side.log.iter().any(|l| l.contains("What does a state event look like?")), "{:?}", f.side.log);
 }
+
+// ---- the review of 2026-11-21 (each of these failed before its fix) ----
+
+fn runtime_row(t: &T, rt: &str) -> taisce_store::fabric::FabricRuntime {
+    t.store.lock(taisce_store::Scope::System).fabric_runtime(uuid::Uuid::parse_str(rt).unwrap()).unwrap()
+}
+
+/// Review 1: an order withdrawn after the pump read it is never sent, and a
+/// result for it never turns `withdrawn` into `done`.
+#[tokio::test]
+async fn review_1_a_withdrawn_order_is_never_sent_or_done() {
+    let t = setup().await;
+    let mut phone = Phone::new("a");
+    let (rt, cred) = t.enrol("mbp");
+    let rt = rt.to_string();
+    let mut f = Fake::connect(&t.url, &cred, "l1", 0).await.unwrap();
+    f.snapshot(&[session(S1, "taisce/main", "idle")]).await.unwrap();
+    f.side.pair(&phone.public_key, "p");
+    f.status().await.unwrap();
+    f.drained().await.unwrap();
+    let (seq, side) = (f.seq(), std::mem::replace(&mut f.side, Side::new("x")));
+    f.disconnect();
+    until(&t, "/api/fabric/runtimes", |v| v["runtimes"][0]["online"] == false).await;
+    let (body, id) = phone.send(&rt, S1, "hi", "");
+    assert_eq!(t.send("POST", "/api/fabric/orders", Some(body)).await.0, StatusCode::ACCEPTED);
+    let rid = uuid::Uuid::parse_str(&rt).unwrap();
+    let now = crate::auth::now();
+    // a pump reads it; the person withdraws it; the pump goes to send it
+    let items = t.hub.down_pending(t.user, rid, &Default::default(), now).await.unwrap();
+    let row = items.into_iter().find(|i| i.key == format!("o:{id}")).unwrap().row;
+    assert_eq!(t.send("DELETE", &format!("/api/fabric/orders/{id}"), None).await.0, StatusCode::OK);
+    let claimed = format!("{:?}", t.hub.down_sent(t.user, rid, row, "l2", 1, now).await);
+    assert!(claimed.contains("false"), "the pump must not claim a withdrawn order: {claimed}");
+    // a runtime result for it (it should never have one) changes nothing
+    let mut f = Fake::connect_as(&t.url, &cred, "l1", seq, 0, side).await.unwrap();
+    f.snapshot(&[session(S1, "taisce/main", "idle")]).await.unwrap();
+    let result = pb::Result { subject: Some(pb::result::Subject::OrderId(id.clone())), outcome: pb::Outcome::Done as i32, ..Default::default() };
+    f.send(pb::Up { seq: f.seq() + 1, body: Some(pb::up::Body::Result(result)) }).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(t.get(&format!("/api/fabric/orders/{id}")).await["order"]["state"], "withdrawn");
+}
+
+/// Review 2: an Ack on a later stream of the same launch never marks a row
+/// received that only went down on an earlier one.
+#[tokio::test]
+async fn review_2_an_ack_on_a_new_stream_covers_only_what_it_sent() {
+    let t = setup().await;
+    let mut phone = Phone::new("a");
+    let (rt, f) = online(&t, "mbp", "l1", &[session(S1, "taisce/main", "idle")], Some(&phone)).await;
+    f.disconnect();
+    until(&t, "/api/fabric/runtimes", |v| v["runtimes"][0]["online"] == false).await;
+    let (a, ida) = phone.send(&rt, S1, "one", "");
+    let (b, idb) = phone.send(&rt, S1, "two", "");
+    assert_eq!(t.send("POST", "/api/fabric/orders", Some(a)).await.0, StatusCode::ACCEPTED);
+    assert_eq!(t.send("POST", "/api/fabric/orders", Some(b)).await.0, StatusCode::ACCEPTED);
+    let rid = uuid::Uuid::parse_str(&rt).unwrap();
+    let now = crate::auth::now();
+    let row = |id: &str| Some((taisce_store::fabric::DownKind::Order, id.to_string()));
+    // stream 1 of launch l1 sends both, then is cut before any Ack
+    let _ = t.hub.down_sent(t.user, rid, row(&ida), "l1", 3, now).await;
+    let _ = t.hub.down_sent(t.user, rid, row(&idb), "l1", 4, now).await;
+    // stream 2 of l1: numbers on, sends only the first again (the window is
+    // full behind it), and is acknowledged past the second's old number
+    let start = t.hub.down_resume(t.user, rid, "l1", 0, now).await.unwrap();
+    let _ = t.hub.down_sent(t.user, rid, row(&ida), "l1", start + 1, now).await;
+    t.hub.down_received(t.user, rid, "l1", start + 1, now).await.unwrap();
+    assert_eq!(t.get(&format!("/api/fabric/orders/{ida}")).await["order"]["state"], "received");
+    let b = t.get(&format!("/api/fabric/orders/{idb}")).await;
+    assert_ne!(b["order"]["state"], "received", "never went down on this stream: {b}");
+}
+
+/// Review 3: a runtime's calls are rate limited; a read is never answered
+/// from the cache; held (paused) mail counts toward the unread limit.
+#[tokio::test]
+async fn review_3_calls_are_bounded() {
+    let t = setup().await;
+    let (_, mut f) = online(&t, "mbp", "l1", &[session(S1, "taisce/main", "idle"), session(S2, "workbox/main", "idle")], None).await;
+    let mut refused = 0;
+    for _ in 0..300 {
+        match f.call(S1, pb::call_request::Tool::Who(pb::WhoRequest { all: false })).await {
+            Ok(_) => {}
+            Err(e) if e.code() == Some(tonic::Code::ResourceExhausted) => refused += 1,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(refused > 0, "300 calls at once are not all answered");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let inbox = pb::call_request::Tool::Inbox(pb::InboxRequest { limit: 50 });
+    let first = f.call_as(S2, "inbox-1", inbox.clone()).await.unwrap();
+    f.send_mail(&ScriptSend { from: S1.into(), to: "workbox/main".into(), kind: "note".into(), body: "fresh".into(), ..Default::default() }).await.unwrap();
+    let again = f.call_as(S2, "inbox-1", inbox).await.unwrap();
+    assert_ne!(first, again, "a read is answered fresh");
+}
+
+#[tokio::test]
+async fn review_3_held_mail_counts_toward_the_unread_limit() {
+    let t = setup().await;
+    let (_, mut a) = online(&t, "mbp", "la", &[session(S1, "taisce/main", "working"), session(S2, "workbox/main", "working")], None).await;
+    let (_, mut b) = online(&t, "mini", "lb", &[session(S3, "qompass/main", "working")], None).await;
+    let note = |from: &str| ScriptSend { from: from.into(), to: "workbox/main".into(), kind: "note".into(), body: "n".into(), ..Default::default() };
+    let mut full = false;
+    for i in 0..57 {
+        for (f, from) in [(&mut a, S1), (&mut b, S3)] {
+            let r = f.send_mail(&note(from)).await.unwrap();
+            if sent(&r).0 == pb::Delivery::InboxFull {
+                full = true;
+            }
+        }
+        if full {
+            assert!(i >= 49, "full after {i} rounds");
+            break;
+        }
+    }
+    assert!(full, "114 messages to one session, 90 of them held: the 101st is refused");
+}
+
+/// Review 4: one call id sent twice at once runs once; a fabric note
+/// retried after its answer was lost reaches each member once.
+#[tokio::test]
+async fn review_4_a_call_id_runs_once() {
+    let t = setup().await;
+    let (rt, _f) = online(
+        &t,
+        "mbp",
+        "l1",
+        &[in_project(S1, "taisce/main", "idle", "taisce"), in_project(S2, "workbox/a", "idle", "workbox"), in_project(S3, "workbox/b", "idle", "workbox")],
+        None,
+    )
+    .await;
+    let runtime = runtime_row(&t, &rt);
+    let send = |to: &str, call: &str| pb::CallRequest {
+        call_id: call.into(),
+        session_id: S1.into(),
+        tool: Some(pb::call_request::Tool::Send(pb::SendRequest { to: to.into(), kind: pb::MessageKind::Note as i32, body: "x".into(), ..Default::default() })),
+    };
+    let now = crate::auth::now();
+    let (x, y) = tokio::join!(t.hub.call(&runtime, send("workbox/a", "dup"), now), t.hub.call(&runtime, send("workbox/a", "dup"), now));
+    assert_eq!(x.unwrap(), y.unwrap());
+    let c = t.get("/api/fabric/conversations").await;
+    assert_eq!(c["conversations"][0]["total"], 1, "{c}");
+    t.hub.call(&runtime, send("workbox", "fan"), now).await.unwrap();
+    t.hub.0.calls.lock().unwrap().clear();
+    t.hub.call(&runtime, send("workbox", "fan"), now).await.unwrap();
+    let c = t.get("/api/fabric/conversations").await;
+    let totals: Vec<u64> = c["conversations"].as_array().unwrap().iter().map(|c| c["total"].as_u64().unwrap()).collect();
+    assert_eq!(totals.iter().sum::<u64>(), 3, "one each to a and b, plus the first: {c}");
+}
+
+/// Review 5: a turn of a session the hub does not know is stored without
+/// its text (Text off cannot be ruled out).
+#[tokio::test]
+async fn review_5_a_turn_of_an_unknown_session_keeps_no_text() {
+    let t = setup().await;
+    let (rt, mut f) = online(&t, "mbp", "l1", &[session(S1, "taisce/main", "idle")], None).await;
+    f.turn(&ScriptTurn { session: S4.into(), turn_id: Some("t".into()), prompt: "zebra prompt".into(), reply: "zebra".into(), ..Default::default() }).await.unwrap();
+    let v = until(&t, &format!("/api/fabric/sessions/{rt}/{S4}/turns"), |v| v["turns"].as_array().is_some_and(|a| a.len() == 1)).await;
+    assert_eq!(v["turns"][0]["prompt"], "", "{v}");
+}
+
+/// Review 6: a project's notifications stay private for a session the
+/// fleet no longer holds.
+#[tokio::test]
+async fn review_6_private_notifications_hold_for_a_session_gone_from_the_fleet() {
+    let t = setup().await;
+    let mut phone = Phone::new("a");
+    let (rt, cred) = t.enrol("mbp");
+    let rt = rt.to_string();
+    let mut f = Fake::connect(&t.url, &cred, "l1", 0).await.unwrap();
+    f.snapshot(&[in_project(S1, "priv/main", "idle", "priv")]).await.unwrap();
+    f.side.pair(&phone.public_key, "p");
+    f.status().await.unwrap();
+    f.drained().await.unwrap();
+    assert_eq!(t.send("PUT", "/api/fabric/projects/priv", Some(json!({"private_notifications": true}))).await.0, StatusCode::OK);
+    let (seq, side) = (f.seq(), std::mem::replace(&mut f.side, Side::new("x")));
+    f.disconnect();
+    until(&t, "/api/fabric/runtimes", |v| v["runtimes"][0]["online"] == false).await;
+    let (body, _) = phone.order(
+        &rt,
+        pb::order::What::Command(pb::Command {
+            session_id: S1.into(),
+            verb: pb::Verb::Approve as i32,
+            request_id: "nothing-open".into(),
+            request_hash: vec![0; 32],
+            ..Default::default()
+        }),
+    );
+    assert_eq!(t.send("POST", "/api/fabric/orders", Some(body)).await.0, StatusCode::ACCEPTED);
+    t.hub.flush().await;
+    t.hub.sweep(crate::auth::now() + 8 * 86400).await;
+    let mut f = Fake::connect_as(&t.url, &cred, "l1", seq, 0, side).await.unwrap();
+    f.snapshot(&[]).await.unwrap();
+    assert!(matches!(next(&mut f).await, Handled::Order { outcome: pb::Outcome::Refused, .. }));
+    let a = alert_of(&t, AlertKind::OrderRefused).await;
+    assert_eq!(a.preview, None, "private: {a:?}");
+}
+
+/// Review 7: the same order posted twice at once is taken once, and both
+/// posts answer with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_7_the_same_order_twice_at_once_is_one_order() {
+    let t = setup().await;
+    let mut phone = Phone::new("a");
+    let (rt, _f) = online(&t, "mbp", "l1", &[session(S1, "taisce/main", "idle")], Some(&phone)).await;
+    until(&t, "/api/fabric/runtimes", |v| v["runtimes"][0]["devices"].as_array().is_some_and(|d| d.len() == 1)).await;
+    for _ in 0..30 {
+        let (body, id) = phone.send(&rt, S1, "once", "");
+        let signed = || serde_json::from_value::<super::record::SignedJson>(body.clone()).unwrap();
+        let (h1, h2) = (t.hub.clone(), t.hub.clone());
+        let (s1, s2, user) = (signed(), signed(), t.user);
+        let x = tokio::spawn(async move { h1.submit_order(user, s1, crate::auth::now()).await });
+        let y = tokio::spawn(async move { h2.submit_order(user, s2, crate::auth::now()).await });
+        for r in [x.await.unwrap(), y.await.unwrap()] {
+            let (o, _) = r.unwrap_or_else(|e| panic!("an identical retry is answered with the order: {e:?}"));
+            assert_eq!(o.id, id);
+        }
+    }
+}
+
+/// Review 8: settings from a device paired with only some of the person's
+/// runtimes are refused, naming the others.
+#[tokio::test]
+async fn review_8_settings_need_a_device_every_runtime_knows() {
+    let t = setup().await;
+    let phone = Phone::new("a");
+    let (_, _a) = online(&t, "mbp", "la", &[session(S1, "taisce/main", "idle")], Some(&phone)).await;
+    let (_, _b) = online(&t, "mini", "lb", &[session(S3, "other/main", "idle")], None).await;
+    until(&t, "/api/fabric/runtimes", |v| v["runtimes"].as_array().is_some_and(|r| r.iter().any(|r| r["devices"].as_array().is_some_and(|d| !d.is_empty())))).await;
+    let (st, v) = t.send("PUT", "/api/fabric/settings", Some(phone.settings(1, Default::default()))).await;
+    assert_eq!((st, v["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("not_paired_everywhere")), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("mini"), "{v}");
+}
+
+/// Item 9: closing the hub (SIGTERM) ends every runtime's stream, and the
+/// channel takes no new one.
+#[tokio::test]
+async fn item_9_closing_the_hub_ends_the_runtime_streams() {
+    let t = setup().await;
+    let (_, cred) = t.enrol("mbp");
+    let mut f = Fake::connect(&t.url, &cred, "l1", 0).await.unwrap();
+    f.snapshot(&[session(S1, "taisce/main", "idle")]).await.unwrap();
+    f.drained().await.unwrap();
+    t.hub.close(crate::auth::now()).await;
+    let ended = tokio::time::timeout(Duration::from_secs(3), f.ended()).await.expect("the stream ends");
+    assert_eq!(ended.map(|s| s.code()), Some(tonic::Code::Unavailable));
+    let again = tokio::time::timeout(Duration::from_secs(3), Fake::connect(&t.url, &cred, "l2", 0)).await;
+    assert!(!matches!(again, Ok(Ok(_))), "no new stream once closed");
+}
+
+/// Item 10: a runtime that closes its stream itself is idle, not offline;
+/// one that goes silent is offline. Neither alerts.
+#[tokio::test]
+async fn item_10_a_clean_close_is_idle_and_a_drop_is_offline() {
+    let t = super::tests::setup_with(super::grpc::Pace { heartbeat: Duration::from_secs(1), recheck: Duration::from_secs(60) }).await;
+    let (_, cred) = t.enrol("mbp");
+    let mut f = Fake::connect(&t.url, &cred, "l1", 0).await.unwrap();
+    f.snapshot(&[session(S1, "taisce/main", "idle")]).await.unwrap();
+    f.drained().await.unwrap();
+    until(&t, "/api/fabric/runtimes", |v| v["runtimes"][0]["connection"] == "online").await;
+    f.disconnect();
+    until(&t, "/api/fabric/runtimes", |v| v["runtimes"][0]["connection"] == "idle").await;
+    // silent: three missed heartbeats end it from the hub's side
+    let mut f = Fake::connect(&t.url, &cred, "l2", 0).await.unwrap();
+    f.snapshot(&[session(S1, "taisce/main", "idle")]).await.unwrap();
+    until(&t, "/api/fabric/runtimes", |v| v["runtimes"][0]["connection"] == "online").await;
+    let _ = f.ended().await;
+    until(&t, "/api/fabric/runtimes", |v| v["runtimes"][0]["connection"] == "offline").await;
+    assert!(t.alerts.lock().unwrap().is_empty(), "{:?}", t.alerts.lock().unwrap());
+}
+
+/// Item 11: what was held back while the person was at the Mac is sent when
+/// they leave it, if it still stands.
+#[tokio::test]
+async fn item_11_pushes_held_while_present_go_when_the_person_leaves() {
+    let t = setup().await;
+    let (_, mut f) = online(&t, "mbp", "l1", &[session(S1, "taisce/main", "working"), session(S2, "workbox/main", "working")], None).await;
+    f.side.present = true;
+    f.status().await.unwrap();
+    f.state(&session(S1, "taisce/main", "needs_you")).await.unwrap();
+    f.state(&session(S2, "workbox/main", "stalled")).await.unwrap();
+    f.drained().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(t.alerts.lock().unwrap().is_empty(), "nothing while present");
+    // dealt with at the Mac: S2 is working again, so its alert no longer stands
+    f.state(&session(S2, "workbox/main", "working")).await.unwrap();
+    f.side.present = false;
+    f.status().await.unwrap();
+    let a = alert_of(&t, AlertKind::NeedsYou).await;
+    assert_eq!(a.address, "taisce/main");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!t.alerts.lock().unwrap().iter().any(|a| a.kind == AlertKind::Stalled), "{:?}", t.alerts.lock().unwrap());
+}

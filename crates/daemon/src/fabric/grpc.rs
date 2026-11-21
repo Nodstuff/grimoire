@@ -199,6 +199,16 @@ impl DownSender {
         self.tx.send(Ok(pb::Down { seq: 0, body: Some(body) })).await.map_err(|_| Unsent::Gone)
     }
 
+    /// Room for one more event in the window.
+    pub fn has_room(&self) -> bool {
+        self.window.has_room()
+    }
+
+    /// The number the next event will carry.
+    pub fn next_seq(&self) -> u64 {
+        self.seq + 1
+    }
+
     /// Send the next event, if the window has room.
     pub async fn event(&mut self, body: &down::Body) -> Result<u64, Unsent> {
         let seq = self.seq + 1;
@@ -266,7 +276,7 @@ async fn stream(
     let down_start = match hub.down_resume(runtime.user_id, runtime.id, &hello.instance_id, hello.last_down_seq, crate::auth::now()).await {
         Ok(n) => n,
         Err(r) => {
-            hub.disconnect(runtime.user_id, runtime.id, conn, crate::auth::now()).await;
+            hub.disconnect(runtime.user_id, runtime.id, conn, crate::auth::now(), false).await;
             return Err(refused(r));
         }
     };
@@ -291,9 +301,10 @@ async fn stream(
             open.run(&mut inbound, &mut kill).await
         }
         // the runtime hung up before its Welcome
-        Err(_) => Ok(()),
+        Err(_) => Ok(false),
     };
-    hub.disconnect(runtime.user_id, runtime.id, conn, crate::auth::now()).await;
+    hub.disconnect(runtime.user_id, runtime.id, conn, crate::auth::now(), matches!(ended, Ok(true))).await;
+    let ended = ended.map(|_| ());
     tracing::info!(target: crate::auth::AUDIT, event = "runtime.disconnect", runtime = %runtime.id, user = %runtime.user_id);
     ended
 }
@@ -323,7 +334,9 @@ enum Step {
 }
 
 impl Open<'_> {
-    async fn run(&mut self, inbound: &mut Streaming<pb::Up>, kill: &mut tokio::sync::oneshot::Receiver<Kill>) -> Result<(), Status> {
+    /// Ok(true): the runtime closed the stream itself (idle); Ok(false):
+    /// it went away without a word.
+    async fn run(&mut self, inbound: &mut Streaming<pb::Up>, kill: &mut tokio::sync::oneshot::Receiver<Kill>) -> Result<bool, Status> {
         use tokio::time::Instant;
         let (user, id) = (self.runtime.user_id, self.runtime.id);
         let silence = self.pace.heartbeat * 3;
@@ -340,6 +353,7 @@ impl Open<'_> {
                 why = &mut *kill => {
                     return Err(match why {
                         Ok(Kill::Superseded) => Status::aborted("a newer stream for this runtime took over"),
+                        Ok(Kill::Closing) => Status::unavailable("the hub is shutting down; reconnect with backoff"),
                         Ok(Kill::Removed) | Err(_) => Status::unauthenticated("this runtime was removed"),
                     });
                 }
@@ -355,21 +369,21 @@ impl Open<'_> {
                 // something waits to go down (an order, settings, a nudge)
                 _ = self.wake.notified(), if self.snapshot_seen => {
                     if !self.pump().await? {
-                        return Ok(());
+                        return Ok(false);
                     }
                     continue;
                 }
                 // what has been taken is acknowledged within 250 ms
                 _ = tokio::time::sleep_until(ack_due.unwrap_or_else(Instant::now)), if ack_due.is_some() => {
                     if self.down.ack(&mut self.receipts).await.is_err() {
-                        return Ok(());
+                        return Ok(false);
                     }
                     continue;
                 }
                 got = inbound.message() => match got.map_err(read_failed)? {
                     Some(up) => up,
                     // the runtime hung up
-                    None => return Ok(()),
+                    None => return Ok(true),
                 },
             };
             silent_at = Instant::now() + silence;
@@ -412,7 +426,7 @@ impl Open<'_> {
                             }
                             // room in the window again: send what waited for it
                             if !self.pump().await? {
-                                return Ok(());
+                                return Ok(false);
                             }
                             continue;
                         }
@@ -428,7 +442,7 @@ impl Open<'_> {
                             self.hub.clear_stale_attention(user, id, s.open_requests, now).await.map_err(refused)?;
                             self.snapshot_seen = true;
                             if !self.pump().await? {
-                                return Ok(());
+                                return Ok(false);
                             }
                             continue;
                         }
@@ -462,12 +476,12 @@ impl Open<'_> {
                 self.receipts.received(seq, at);
                 // sixteen taken and unacknowledged: say so now
                 if self.receipts.is_due(at) && self.down.ack(&mut self.receipts).await.is_err() {
-                    return Ok(());
+                    return Ok(false);
                 }
             }
             // the runtime may now hold an older settings version than the hub
             if status_report && !self.pump().await? {
-                return Ok(());
+                return Ok(false);
             }
         }
     }
@@ -482,12 +496,20 @@ impl Open<'_> {
         let now = crate::auth::now();
         let items = self.hub.down_pending(user, id, &self.sent, now).await.map_err(refused)?;
         for item in items {
+            // the next Ack pumps again
+            if !self.down.has_room() {
+                break;
+            }
+            // claimed in the store under the number it will carry, before
+            // it goes: what was withdrawn meanwhile is not sent
+            let seq = self.down.next_seq();
+            let claimed = self.hub.down_sent(user, id, item.row, &self.instance, seq, now).await.map_err(refused)?;
+            self.sent.insert(item.key);
+            if !claimed {
+                continue;
+            }
             match self.down.event(&item.body).await {
-                Ok(seq) => {
-                    self.sent.insert(item.key);
-                    self.hub.down_sent(user, id, item.row, &self.instance, seq, now).await.map_err(refused)?;
-                }
-                // the next Ack pumps again
+                Ok(_) => {}
                 Err(Unsent::WindowFull) => break,
                 Err(Unsent::Gone) => return Ok(false),
             }
@@ -502,6 +524,7 @@ fn refused(r: Refused) -> Status {
         Refused::TooManySessions => Status::resource_exhausted(format!("a runtime holds at most {MAX_SESSIONS_PER_RUNTIME} sessions")),
         Refused::DuplicateSession(id) => Status::invalid_argument(format!("snapshot.sessions: {id} appears twice")),
         Refused::Invalid(m) => Status::invalid_argument(m),
+        Refused::Closing => Status::unavailable("the hub is shutting down; reconnect with backoff"),
         Refused::Store(e) => {
             tracing::warn!("fabric: store error on the runtime channel: {e}");
             Status::unavailable("the hub could not take that; reconnect and try again")
@@ -655,8 +678,13 @@ pub async fn serve(
 /// [`serve`] on a clone of `listener`, for `supervise`: when the server
 /// stops (it should not), the next start listens on the same socket.
 pub async fn serve_supervised(listener: std::sync::Arc<std::net::TcpListener>, service: RuntimeService) {
+    // shutting down: stopped for good, not restarted
+    if service.hub.is_closing() {
+        return std::future::pending().await;
+    }
+    let closed = service.hub.closed();
     let served = match listener.try_clone().and_then(tokio::net::TcpListener::from_std) {
-        Ok(l) => serve(l, service, std::future::pending()).await.map_err(|e| e.to_string()),
+        Ok(l) => serve(l, service, closed).await.map_err(|e| e.to_string()),
         Err(e) => Err(e.to_string()),
     };
     if let Err(e) = served {
@@ -682,6 +710,7 @@ mod tests {
             accounts: "[]".into(),
             accounts_at: None,
             status: "{}".into(),
+            ended_clean: false,
         }
     }
 

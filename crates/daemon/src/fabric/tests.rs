@@ -30,8 +30,10 @@ pub(crate) async fn serve_channel(store: &SharedStore, hub: &Hub, pace: Pace) ->
     let url = format!("http://{}", listener.local_addr().unwrap());
     let service =
         RuntimeService { hub: hub.clone(), store: store.clone(), limiter: Default::default(), trusted_proxy: false, pace };
+    // stops when the hub closes, as the daemon's does
+    let closed = hub.closed();
     tokio::spawn(async move {
-        grpc::serve(listener, service, std::future::pending()).await.unwrap();
+        grpc::serve(listener, service, closed).await.unwrap();
     });
     url
 }
@@ -106,7 +108,7 @@ pub(crate) struct T {
     pub(crate) url: String,
 }
 
-async fn setup_with(pace: Pace) -> T {
+pub(crate) async fn setup_with(pace: Pace) -> T {
     let mut raw = SqliteStore::open_in_memory().unwrap();
     let human = raw.create_principal(PrincipalKind::Human, "Tom", None).unwrap().id;
     let user = raw.auth_ensure_owner(human, "Tom", now()).unwrap().id;
