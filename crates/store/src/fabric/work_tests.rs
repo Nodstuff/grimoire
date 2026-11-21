@@ -150,8 +150,8 @@ fn attention_is_raised_once_trimmed_and_cleared() {
         }
         assert_eq!(s.fabric_attention_open().unwrap().len(), MAX_OPEN_ATTENTION);
         assert_eq!(s.fabric_attention_get("r1").unwrap().resolution.as_deref(), Some("withdrawn"), "the oldest made room");
-        assert_eq!(s.fabric_attention_clear(w.rt, "x0", "approved", 99).unwrap().unwrap().resolution.as_deref(), Some("approved"));
-        assert!(s.fabric_attention_clear(w.rt, "x0", "denied", 99).unwrap().is_none(), "already cleared");
+        assert_eq!(s.fabric_attention_clear(w.rt, "x0", "approved", 99, false).unwrap().unwrap().resolution.as_deref(), Some("approved"));
+        assert!(s.fabric_attention_clear(w.rt, "x0", "denied", 99, false).unwrap().is_none(), "already cleared");
         let keep: Vec<String> = vec!["x1".into()];
         let cleared = s.fabric_attention_clear_others(w.rt, &keep, 100).unwrap();
         assert_eq!(cleared.len(), MAX_OPEN_ATTENTION - 2);
@@ -160,7 +160,7 @@ fn attention_is_raised_once_trimmed_and_cleared() {
     w.s.with_scope_for_test(Scope::User(w.ann), |s| {
         assert!(s.fabric_attention_open().unwrap().is_empty());
         assert!(nf(s.fabric_attention_get("x1")));
-        assert!(nf(s.fabric_attention_clear(w.rt, "x1", "denied", 1)));
+        assert!(nf(s.fabric_attention_clear(w.rt, "x1", "denied", 1, false)));
         assert!(nf(s.fabric_attention_raise(w.rt, &attention(sid, "planted", 1))));
     });
 }

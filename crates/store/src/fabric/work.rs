@@ -467,16 +467,21 @@ impl SqliteStore {
 
     /// Clear an open item of one of the scope's runtimes. None when it is
     /// not open (cleared already, or never raised).
-    pub fn fabric_attention_clear(&mut self, runtime: Uuid, id: &str, resolution: &str, at: i64) -> Result<Option<FabricAttention>> {
+    /// With `drop_text` (the project has Text off) its text and signed
+    /// request go too: they were kept only while the phone needed them.
+    pub fn fabric_attention_clear(&mut self, runtime: Uuid, id: &str, resolution: &str, at: i64, drop_text: bool) -> Result<Option<FabricAttention>> {
         self.fabric_runtime(runtime)?;
         Ok(self
             .conn
             .query_row(
                 &format!(
-                    "UPDATE fabric_attention SET cleared_at = ?3, resolution = ?4, updated_at = ?3
+                    "UPDATE fabric_attention SET cleared_at = ?3, resolution = ?4, updated_at = ?3,
+                         text = CASE WHEN ?5 THEN '' ELSE text END,
+                         request = CASE WHEN ?5 THEN NULL ELSE request END,
+                         signature = CASE WHEN ?5 THEN NULL ELSE signature END
                      WHERE runtime_id = ?1 AND id = ?2 AND cleared_at IS NULL RETURNING {ATTENTION_COLS}"
                 ),
-                params![runtime.to_string(), id, at, resolution],
+                params![runtime.to_string(), id, at, resolution, drop_text],
                 attention_row,
             )
             .optional()?)
@@ -493,7 +498,7 @@ impl SqliteStore {
         };
         let mut cleared = vec![];
         for id in open.into_iter().filter(|id| !keep.contains(id)) {
-            if let Some(a) = self.fabric_attention_clear(runtime, &id, "withdrawn", at)? {
+            if let Some(a) = self.fabric_attention_clear(runtime, &id, "withdrawn", at, false)? {
                 cleared.push(a);
             }
         }

@@ -194,12 +194,15 @@ pub enum Push {
     /// Visible: "<author> commented on <title>". The app routes a tap on
     /// `kind: share_comment` to that doc's link comments.
     ShareComment { title: String, author: String, doc_id: uuid::Uuid, share_id: uuid::Uuid },
-    /// Visible: "<address>" / "Needs you". One notification per session:
-    /// a later alert for the same session replaces it (same thread and
-    /// collapse id). Says which session and what it came to, never the
-    /// session's text. The app routes a tap on `kind: fabric_session` to
-    /// that session.
-    FabricSession { address: String, kind: crate::fabric::AlertKind, session_id: uuid::Uuid, runtime_id: uuid::Uuid },
+    /// Agent Fabric (ADR 0008 §10). `kind: fabric_session` (a session needs
+    /// you, stalled, or finished: one notification per session, replacing
+    /// the last; a finished turn is one quiet notification naming every
+    /// finished session), `fabric_attention` (an approval, a question, a
+    /// wake offer, a paused pair, an ask waiting: one per item) or
+    /// `fabric_order` (an order refused). The text is a preview (the last
+    /// line, the command, the question) unless the project's notifications
+    /// are private; the app fetches and verifies anything it acts on.
+    Fabric(Box<crate::fabric::SessionAlert>),
 }
 
 impl Push {
@@ -217,30 +220,22 @@ impl Push {
                 "share_id": share_id,
             })
             .to_string(),
-            Push::FabricSession { address, kind, session_id, runtime_id } => json!({
-                "aps": {
-                    "alert": {"title": address, "body": kind.words()},
-                    "sound": "default",
-                    "thread-id": format!("fabric:{session_id}"),
-                },
-                "kind": "fabric_session",
-                "session_id": session_id,
-                "runtime_id": runtime_id,
-                "state": kind,
-            })
-            .to_string(),
+            Push::Fabric(a) => crate::fabric::alert_payload(a).to_string(),
         }
     }
     pub fn push_type(&self) -> &'static str {
         match self {
             Push::Changes { .. } => "background",
-            Push::ShareComment { .. } | Push::FabricSession { .. } => "alert",
+            Push::ShareComment { .. } | Push::Fabric(_) => "alert",
         }
     }
     pub fn priority(&self) -> &'static str {
         match self {
             Push::Changes { .. } => "5",
-            Push::ShareComment { .. } | Push::FabricSession { .. } => "10",
+            Push::ShareComment { .. } => "10",
+            // the quiet "N finished" need not wake the phone at once
+            Push::Fabric(a) if a.kind == crate::fabric::AlertKind::Finished && !a.finished.is_empty() => "5",
+            Push::Fabric(_) => "10",
         }
     }
     /// Change nudges collapse into the newest, and so do one session's
@@ -250,7 +245,7 @@ impl Push {
             Push::Changes { .. } => Some("changes".into()),
             Push::ShareComment { .. } => None,
             // 43 bytes: APNs allows 64
-            Push::FabricSession { session_id, .. } => Some(format!("fabric:{session_id}")),
+            Push::Fabric(a) => Some(crate::fabric::alert_collapse_id(a)),
         }
     }
 }
@@ -798,7 +793,7 @@ mod tests {
             // a share-comment alert records as seq -1
             let seq = match push {
                 Push::Changes { seq } => *seq,
-                Push::ShareComment { .. } | Push::FabricSession { .. } => -1,
+                Push::ShareComment { .. } | Push::Fabric(_) => -1,
             };
             self.sent.lock().unwrap().push((env.to_string(), token.to_string(), seq));
             if token.starts_with("dead") {
@@ -844,18 +839,19 @@ mod tests {
         assert_eq!(*mock.sent.lock().unwrap(), vec![("sandbox".to_string(), mine, -1)]);
     }
 
-    /// A session alert names the session and its state, nothing of its
-    /// text, and one session's alerts replace each other.
+    /// A session alert names the session and its state (its preview when
+    /// there is one), and one session's alerts replace each other.
     #[test]
     fn a_session_alert_is_one_notification_per_session() {
         let (session, runtime) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
-        use crate::fabric::AlertKind;
-        let push = |kind| Push::FabricSession { address: "taisce/main".into(), kind, session_id: session, runtime_id: runtime };
+        use crate::fabric::{AlertKind, SessionAlert};
+        let push = |kind| Push::Fabric(Box::new(SessionAlert::new(uuid::Uuid::nil(), runtime, session, "taisce/main", kind)));
         let p = push(AlertKind::NeedsYou);
         let v: serde_json::Value = serde_json::from_str(&p.payload()).unwrap();
         assert_eq!(v["aps"]["alert"], json!({"title": "taisce/main", "body": "Needs you"}));
         assert_eq!(v["aps"]["sound"], "default");
         assert_eq!(v["aps"]["thread-id"], format!("fabric:{session}"));
+        assert_eq!(v["aps"]["category"], "FABRIC_SESSION");
         assert_eq!(
             (v["kind"].as_str(), v["state"].as_str(), v["session_id"].as_str(), v["runtime_id"].as_str()),
             (Some("fabric_session"), Some("needs_you"), Some(session.to_string().as_str()), Some(runtime.to_string().as_str()))
@@ -871,6 +867,32 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&later.payload()).unwrap();
         assert_eq!(v["aps"]["alert"]["body"], "Finished");
         assert_eq!(serde_json::from_str::<serde_json::Value>(&push(AlertKind::Stalled).payload()).unwrap()["aps"]["alert"]["body"], "Stalled");
+    }
+
+    /// An approval or a question is one notification per item, with its
+    /// category and, for a question, its choices; a finished turn among
+    /// several is one quiet notification naming them all.
+    #[test]
+    fn attention_alerts_carry_their_item_and_finished_turns_are_one_quiet_line() {
+        use crate::fabric::{AlertKind, SessionAlert};
+        let (session, runtime) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let mut a = SessionAlert::new(uuid::Uuid::nil(), runtime, session, "taisce/deploy", AlertKind::Question);
+        a.request_id = Some("0193a5b3-0000-7000-8000-00000000a002".into());
+        a.preview = Some("Fix the test, or skip it?".into());
+        a.choices = json!([{"id": "fix", "label": "Fix the test"}]);
+        let p = Push::Fabric(Box::new(a));
+        let v: serde_json::Value = serde_json::from_str(&p.payload()).unwrap();
+        assert_eq!(v["aps"]["alert"], json!({"title": "taisce/deploy", "body": "Fix the test, or skip it?"}));
+        assert_eq!((v["kind"].as_str(), v["attention_kind"].as_str(), v["aps"]["category"].as_str()), (Some("fabric_attention"), Some("question"), Some("FABRIC_QUESTION")));
+        assert_eq!(v["choices"][0]["label"], "Fix the test");
+        assert_eq!(p.collapse_id().unwrap(), "fabric:0193a5b3-0000-7000-8000-00000000a002");
+        let mut f = SessionAlert::new(uuid::Uuid::nil(), runtime, session, "taisce/main", AlertKind::Finished);
+        f.finished = vec!["taisce/main".into(), "qompass/mcp-dx".into()];
+        let p = Push::Fabric(Box::new(f));
+        let v: serde_json::Value = serde_json::from_str(&p.payload()).unwrap();
+        assert_eq!(v["aps"]["alert"], json!({"title": "2 finished", "body": "taisce/main, qompass/mcp-dx"}));
+        assert_eq!(v["aps"]["interruption-level"], "passive");
+        assert_eq!((p.collapse_id().as_deref(), p.priority()), (Some("fabric:finished"), "5"));
     }
 
     #[tokio::test]

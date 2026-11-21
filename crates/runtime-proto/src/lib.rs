@@ -7,6 +7,10 @@
 //! runtime: the daemon's tests drive the real service with it, and the
 //! `fake_runtime` example drives a scratch daemon by hand.
 
+/// The protobuf runtime the generated types use (decode a signed payload
+/// with `prost::Message`).
+pub use prost;
+
 /// `taisce.runtime.v1`
 pub mod v1 {
     tonic::include_proto!("taisce.runtime.v1");
@@ -16,6 +20,10 @@ pub mod v1 {
 /// never be mistaken for a personal access token (`tsk_`), a book upload
 /// token (`tbu_`) or an OAuth token.
 pub const CREDENTIAL_PREFIX: &str = "trt_";
+
+/// Settings version 0: the guardrails and limits a runtime enforces before
+/// any signed Settings reaches it (`proto/taisce/runtime/v1/default-settings.json`).
+pub const DEFAULT_SETTINGS_JSON: &str = include_str!("../../../proto/taisce/runtime/v1/default-settings.json");
 
 #[cfg(feature = "client")]
 pub mod fake;
