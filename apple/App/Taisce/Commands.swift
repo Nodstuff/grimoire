@@ -69,7 +69,8 @@ struct TaisceCommands: Commands {
             item("To-dos", .todos)
             item("Review", .review)
             item("Books", .books)
-            item("Agents", .agents)
+            // not on a server known to have no fleet (a LOCAL daemon)
+            if model.fleet.isOffered { item("Agents", .agents) }
             if model.hasWorkspaces {
                 Divider()
                 let picker = model.workspacePicker
@@ -88,7 +89,7 @@ struct TaisceCommands: Commands {
             .disabled(!(router?.canPerform(
                 command, signedIn: signedIn, picker: model.workspacePicker,
                 canEdit: { model.access(for: $0).canEdit }, canCreate: model.currentAccess.canCreate,
-                shares: model.shareLinks.isAvailable
+                shares: model.shareLinks.isAvailable, agents: model.fleet.isOffered
             ) ?? false))
     }
 

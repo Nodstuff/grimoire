@@ -14,6 +14,10 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
         var streams: [[SSEOutput]?] = []
         var open: [AsyncThrowingStream<SSEOutput, any Error>.Continuation] = []
         var missing = false
+        /// `fleet()` waits here until released (a slow answer)
+        var held: [CheckedContinuation<Void, Never>] = []
+        var hold = false
+        var unauthorized = false
     }
 
     let state: Mutex<State>
@@ -29,8 +33,17 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
     /// Send on every open connection.
     func send(_ output: SSEOutput) { state.withLock { s in s.open.forEach { $0.yield(output) } } }
 
+    /// Let the held `fleet()` calls answer.
+    func release() {
+        let waiting = state.withLock { s in s.hold = false; defer { s.held = [] }; return s.held }
+        waiting.forEach { $0.resume() }
+    }
+
     func fleet() async throws -> Fleet {
-        try state.withLock { s in
+        if state.withLock({ $0.hold }) {
+            await withCheckedContinuation { c in state.withLock { $0.held.append(c) } }
+        }
+        return try state.withLock { s in
             s.calls.append("fleet")
             if s.missing { throw APIError.notFound("not found") }
             return s.fleet
@@ -46,6 +59,7 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
                 if next != nil { s.open.append(c) }
                 return next
             }
+            if state.withLock({ $0.unauthorized }) { return c.finish(throwing: APIError.unauthorized) }
             guard let script else { return c.finish(throwing: APIError.http(status: 404)) }
             script.forEach { c.yield($0) }
         }
@@ -145,7 +159,7 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
         #expect(b.runtimes[0].detail == "mbp \u{00B7} sessions shown as last known" && !b.runtimes[0].online)
         #expect(b.rows.allSatisfy(\.offline) && b.rows[0].tone == .neutral)
         #expect(b.rows[3].status == "Working \u{00B7} Bash \u{00B7} last known", "no clock runs on a Mac that is away")
-        #expect(b.summary == nil && away.attentionCount == 0)
+        #expect(b.summary == nil && away.attentionCount(at: Self.now) == 0)
         // a second Mac that is awake: only the first one's rows are dimmed
         away.runtimes.append(Self.runtime("r2", name: "studio"))
         away.sessions.append(Self.session("s9", "site/main", .working, runtime: "r2"))
@@ -193,22 +207,49 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
         #expect(FleetCard(Fleet(rev: 1, runtimes: [Self.runtime(online: false)]), available: true)?.subtitle == "Mac asleep")
     }
 
-    @Test func snoozeLastsAnHourOrUntilTomorrowMorningAndTheRowSaysUntilWhen() {
-        #expect(FleetSnooze.allCases.map(\.title) == ["For an hour", "Until tomorrow"])
+    @Test func snoozeLastsAnHourOrUntilTheNextMorningAndTheRowSaysUntilWhen() {
+        #expect(FleetSnooze.allCases.map { $0.title(now: Self.now, calendar: Self.utc) } == ["For an hour", "Until tomorrow"])
         #expect(FleetSnooze.oneHour.until(now: Self.now, calendar: Self.utc) == Self.now.addingTimeInterval(3600))
         // 09:00 the next day on this device's clock
-        let morning = FleetSnooze.tomorrowMorning.until(now: Self.now, calendar: Self.utc)
+        let morning = FleetSnooze.nextMorning.until(now: Self.now, calendar: Self.utc)
         #expect(Int(morning.timeIntervalSince1970) == 1_795_251_600)
+        // in the small hours the next morning is today's, and the label says so
+        let small = Self.now.addingTimeInterval(13 * 3600) // 01:10 on the 21st
+        #expect(FleetSnooze.nextMorning.title(now: small, calendar: Self.utc) == "Until this morning")
+        #expect(FleetSnooze.nextMorning.until(now: small, calendar: Self.utc) == morning, "under 8 hours away, not 32")
+        let five = Self.now.addingTimeInterval(17 * 3600) // 05:10: the day has begun
+        #expect(FleetSnooze.nextMorning.title(now: five, calendar: Self.utc) == "Until tomorrow")
+        #expect(FleetSnooze.nextMorning.until(now: five, calendar: Self.utc) == morning.addingTimeInterval(86400))
         var f = Self.fleet
         f.sessions[0].quietUntil = Self.nowS + 3600
         f.sessions[1].quietUntil = Int(morning.timeIntervalSince1970)
         f.sessions[2].quietUntil = Self.nowS - 1
-        let rows = board(f).rows
+        let b = board(f)
+        let rows = b.rows
         #expect(rows[0].snoozed == "Snoozed until 13:10" && rows[1].snoozed == "Snoozed until Sat 09:00")
         #expect(rows[2].snoozed == nil, "a snooze that has passed is over, whether or not the server has said so yet")
         // snoozing hides nothing
         #expect(rows.count == 4 && rows[0].status == "Needs you \u{00B7} 5 min")
         #expect(rows[0].spoken.hasSuffix("Snoozed until 13:10"))
+        // but a snoozed session is no longer counted as needing you: the summary, the badge, Today's card
+        #expect(b.summary == "1 working" && f.attentionCount(at: Self.now) == 0)
+        #expect(FleetCard(f, available: true, now: Self.now)?.attention == false)
+        #expect(FleetCard(Self.fleet, available: true, now: Self.now)?.attention == true && Self.fleet.attentionCount(at: Self.now) == 2)
+    }
+
+    @Test func timesAreWrittenAsTheLocaleWritesThem() {
+        let us = Locale(identifier: "en_US")
+        // a 12-hour clock keeps its AM/PM (11:41 alone could be either)
+        let morning = FleetTime.clock(Self.nowS - 1740, now: Self.now, calendar: Self.utc, locale: us)
+        #expect(morning.hasPrefix("11:41") && morning.hasSuffix("AM"), "\(morning)")
+        let evening = FleetTime.clock(Self.nowS + 6 * 3600, now: Self.now, calendar: Self.utc, locale: us)
+        #expect(evening.hasPrefix("6:10") && evening.hasSuffix("PM"), "\(evening)")
+        let other = FleetTime.clock(Self.nowS - 2 * 86400, now: Self.now, calendar: Self.utc, locale: us)
+        #expect(other.hasPrefix("Wed") && other.hasSuffix("PM"), "\(other)")
+        // a 24-hour one has none
+        #expect(FleetTime.clock(Self.nowS - 1740, now: Self.now, calendar: Self.utc, locale: Self.en) == "11:41")
+        #expect(FleetTime.clock(Self.nowS + 6 * 3600, now: Self.now, calendar: Self.utc, locale: Self.en) == "18:10")
+        #expect(FleetTime.clock(Self.nowS - 30 * 86400, now: Self.now, calendar: Self.utc, locale: Self.en) == "21 Oct")
     }
 
     // MARK: the store
@@ -240,11 +281,11 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
         fake.send(FakeFleet.event("session", rev: 6, asks))
         await until("the change lands") { s.fleet.rev == 6 }
         #expect(s.fleet.sessions.map(\.address) == Self.fleet.sessions.map(\.address))
-        #expect(s.fleet.sessions[3].state == .needsYou && s.fleet.attentionCount == 3)
+        #expect(s.fleet.sessions[3].state == .needsYou && s.fleet.attentionCount() == 3)
         // the Mac goes away: nothing needs you now, everything is still listed
         fake.send(FakeFleet.event("runtime", rev: 7, Self.runtime(online: false)))
         await until("offline") { s.fleet.rev == 7 }
-        #expect(s.fleet.attentionCount == 0 && s.fleet.sessions.count == 6)
+        #expect(s.fleet.attentionCount() == 0 && s.fleet.sessions.count == 6)
         // a refresh brings the server's order back
         fake.state.withLock { $0.fleet = Fleet(rev: 8, runtimes: [Self.runtime()], sessions: [asks] + Self.fleet.sessions.prefix(3)) }
         await s.refresh()
@@ -266,9 +307,10 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
         #expect(fake.calls == ["stream"], "asked once, not again and again")
         // the screen's own refresh reads the same answer the same way
         let other = store(fake)
-        fake.state.withLock { $0.streams = [nil] }
         await other.refresh()
         #expect(other.availability == .unavailable && other.loadError == nil)
+        #expect(fake.calls == ["stream", "fleet"], "a refresh reads; it never starts the following")
+        #expect(!other.isOffered && FleetStore().isOffered, "offered until the server is known to have none")
     }
 
     @Test func aDroppedStreamReconnectsAndAFailureBeforeAnyFleetIsSaid() async {
@@ -295,9 +337,45 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
         #expect(s.fleet.sessions.count == 6, "snoozed, not hidden")
         #expect(await s.unsnooze(key) == nil)
         #expect(s.fleet.sessions[0].quietUntil == nil && fake.calls.last == "unsnooze s1")
-        #expect(await s.snooze(FleetSessionKey(runtimeID: "r1", id: "gone"), .tomorrowMorning) == "That session is gone.")
+        #expect(await s.snooze(FleetSessionKey(runtimeID: "r1", id: "gone"), .nextMorning) == "That session is gone.")
         let none = FleetStore()
         #expect(await none.snooze(key, .oneHour) == "Not connected.")
+        s.stop()
+    }
+
+    @Test func anAnswerForTheAccountThatSignedOutIsDropped() async {
+        let fake = FakeFleet(Self.fleet)
+        let s = store(fake)
+        fake.state.withLock { $0.hold = true }
+        let refresh = Task { await s.refresh() }
+        await until("the refresh is asked") { fake.state.withLock { !$0.held.isEmpty } }
+        // sign-out (or another server) while the answer is on its way
+        s.reset()
+        fake.release()
+        await refresh.value
+        #expect(s.fleet == Fleet() && s.availability == .unknown && s.loadError == nil, "the last account's fleet did not come back")
+        #expect(fake.calls == ["fleet"], "and nothing started following")
+        // the same for a snooze answered late
+        await s.refresh()
+        #expect(s.isLoaded)
+        s.reset()
+        #expect(await s.snooze(Self.fleet.sessions[0].key, .oneHour) == nil)
+        #expect(s.fleet.sessions.isEmpty)
+    }
+
+    @Test func aRefusedTokenEndsTheFollowingUntilTheNextStart() async {
+        let fake = FakeFleet(Self.fleet)
+        fake.state.withLock { $0.unauthorized = true }
+        let s = store(fake)
+        s.start()
+        await until("the follower gave up") { s.loadError != nil && s.link == .idle }
+        #expect(s.loadError == "Sign in again to see your agents." && !s.isLoaded)
+        try? await Task.sleep(for: .milliseconds(40))
+        #expect(fake.calls == ["stream"], "not retried")
+        // signed in again: the app's next start follows afresh
+        fake.state.withLock { $0.unauthorized = false }
+        s.start()
+        await until("the fleet arrives") { s.isLoaded }
         s.stop()
     }
 
@@ -320,6 +398,12 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
         #expect(pad.backPlaces.count == places && pad.agentsFocus == key)
         #expect(pad.perform(.agents, picker: WorkspacePicker(workspaces: [], unsortedCount: 0, stored: nil)) == .none)
         #expect(ActionsPalette.all.contains { $0.command == .agents })
+        // a server known to have no fleet (a LOCAL daemon): not offered in the menu or the palette
+        let picker = WorkspacePicker(workspaces: [], unsortedCount: 0, stored: nil)
+        #expect(pad.canPerform(.agents, signedIn: true, picker: picker) && !pad.canPerform(.agents, signedIn: true, picker: picker, agents: false))
+        #expect(!pad.canPerform(.agents, signedIn: false, picker: picker))
+        #expect(!ActionsPalette.matching("agents") { pad.canPerform($0, signedIn: true, picker: picker, agents: false) }.contains { $0.command == .agents })
+        #expect(ActionsPalette.matching("agents") { pad.canPerform($0, signedIn: true, picker: picker) }.map(\.command) == [.agents])
     }
 
     @Test func aSessionNotificationIsReadAsTheServerSendsIt() {
@@ -338,17 +422,38 @@ private final class FakeFleet: FleetService, @unchecked Sendable {
         #expect(FabricSessionPush.presentation(agentsOnScreen: false) == [.banner, .list, .sound])
     }
 
-    @Test func aTappedNotificationWaitsForAWindowAndTheScreenCountsItself() {
+    @Test func aTappedNotificationWaitsForAWindow() {
         let s = FleetStore()
         let key = FleetSessionKey(runtimeID: "r1", id: "s1")
-        #expect(!s.isOnScreen)
-        s.screenAppeared()
-        #expect(s.isOnScreen)
-        s.screenDisappeared()
-        s.screenDisappeared()
-        #expect(!s.isOnScreen && s.watching == 0)
         s.requestSession(key)
         #expect(s.request == FleetSessionRequest(session: key, serial: 1))
         #expect(s.takeRequest() == key && s.request == nil && s.takeRequest() == nil)
+    }
+
+    /// The blocker from review: a screen that was removed (a sidebar switch,
+    /// a pop) stayed counted as "in front", and every later session
+    /// notification was swallowed.
+    @Test func aScreenThatHasGoneIsNoLongerCountedAsInFront() {
+        let s = FleetStore()
+        let screen = FleetScreenPresence()
+        #expect(!s.isOnScreen)
+        #expect(screen.update(inFront: true, in: s), "it came to the front")
+        #expect(s.isOnScreen && FabricSessionPush.presentation(agentsOnScreen: s.isOnScreen) == [])
+        // said twice (the view's change handler and its appearance): counted once
+        #expect(!screen.update(inFront: true, in: s))
+        #expect(s.watching == 1)
+        // the view is removed: its onDisappear says so, with no change of state to observe
+        screen.update(inFront: false, in: s)
+        screen.update(inFront: false, in: s)
+        #expect(!s.isOnScreen && s.watching == 0)
+        #expect(FabricSessionPush.presentation(agentsOnScreen: s.isOnScreen) == [.banner, .list, .sound])
+        // two windows: one leaving does not hide the other
+        let (one, two) = (FleetScreenPresence(), FleetScreenPresence())
+        one.update(inFront: true, in: s)
+        two.update(inFront: true, in: s)
+        one.update(inFront: false, in: s)
+        #expect(s.isOnScreen)
+        two.update(inFront: false, in: s)
+        #expect(!s.isOnScreen)
     }
 }

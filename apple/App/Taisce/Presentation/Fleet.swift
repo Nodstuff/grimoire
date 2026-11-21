@@ -5,25 +5,35 @@ import TaisceKit
 // screen draws what these say.
 
 /// How long a snooze lasts (the design: "for an hour or until tomorrow").
+/// "Tomorrow" is the next morning at 09:00 on this device's clock (the hour
+/// an all-day to-do alerts at). In the small hours, before 05:00, the next
+/// morning is today's: someone up at 01:00 means the morning that is
+/// coming, not the one 33 hours away, and the label says which.
 enum FleetSnooze: CaseIterable, Hashable, Sendable {
-    case oneHour, tomorrowMorning
+    case oneHour, nextMorning
 
-    var title: String {
+    /// Before this hour, "the morning" is still today's.
+    static let smallHours = 5
+
+    private func isSmallHours(_ now: Date, _ calendar: Calendar) -> Bool {
+        calendar.component(.hour, from: now) < Self.smallHours
+    }
+
+    func title(now: Date = .now, calendar: Calendar = .current) -> String {
         switch self {
         case .oneHour: "For an hour"
-        case .tomorrowMorning: "Until tomorrow"
+        case .nextMorning: isSmallHours(now, calendar) ? "Until this morning" : "Until tomorrow"
         }
     }
 
-    /// When the snooze ends: an hour on, or 09:00 tomorrow on this device's
-    /// clock (the hour an all-day to-do alerts at).
+    /// When the snooze ends.
     func until(now: Date = .now, calendar: Calendar = .current) -> Date {
         switch self {
         case .oneHour:
             return now.addingTimeInterval(3600)
-        case .tomorrowMorning:
-            let tomorrow = calendar.date(byAdding: .day, value: 1, to: now)
-            let morning = tomorrow.flatMap { calendar.date(bySettingHour: Due.defaultAlertHour, minute: 0, second: 0, of: $0) }
+        case .nextMorning:
+            let day = isSmallHours(now, calendar) ? now : calendar.date(byAdding: .day, value: 1, to: now)
+            let morning = day.flatMap { calendar.date(bySettingHour: Due.defaultAlertHour, minute: 0, second: 0, of: $0) }
             return morning ?? now.addingTimeInterval(86400)
         }
     }
@@ -84,14 +94,16 @@ enum FleetTime {
         }
     }
 
-    /// A moment: "12:41" today, "Thu 12:41" within a week either way, else "3 Nov".
+    /// A moment: "12:41" today, "Thu 12:41" within a week either way, else
+    /// "3 Nov"; the hour as the locale writes it ("12:41 PM" where the
+    /// clock is a 12-hour one).
     static func clock(_ unix: Int, now: Date, calendar: Calendar = .current, locale: Locale = .current) -> String {
         let date = Date(timeIntervalSince1970: TimeInterval(unix))
         var style = Date.FormatStyle(locale: locale, calendar: calendar, timeZone: calendar.timeZone)
         if calendar.isDate(date, inSameDayAs: now) {
-            style = style.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
+            style = style.hour().minute()
         } else if abs(date.timeIntervalSince(now)) < 7 * 86400 {
-            style = style.weekday(.abbreviated).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
+            style = style.weekday(.abbreviated).hour().minute()
         } else {
             style = style.day().month(.abbreviated)
         }
@@ -213,10 +225,11 @@ struct FleetHeadroom: Identifiable, Hashable {
     }
 }
 
-/// Today's way in to Agents: "Agents", "1 needs you · 2 working".
+/// Today's way in to Agents on a phone: "Agents", "1 needs you · 2 working".
 struct FleetCard: Hashable {
     var subtitle: String
-    /// a session is waiting on its person or stuck
+    /// a session is waiting on its person or stuck (and not snoozed): the
+    /// card then goes first on Today; otherwise it sits after the pins
     var attention: Bool
 
     /// Nil when there is nothing to show: no fleet here, or no runtime enrolled.
@@ -226,7 +239,7 @@ struct FleetCard: Hashable {
         let count = fleet.sessions.count
         let asleep = fleet.runtimes.allSatisfy { !$0.online }
         subtitle = board.summary ?? (asleep ? "Mac asleep" : count == 0 ? "No sessions" : count == 1 ? "1 session, none needs you" : "\(count) sessions, none needs you")
-        attention = fleet.attentionCount > 0
+        attention = fleet.attentionCount(at: now) > 0
     }
 }
 
@@ -268,10 +281,11 @@ struct FleetBoard: Hashable {
             .map { FleetHeadroom($0.account, running: running.contains($0.account.name), now: now, calendar: calendar, locale: locale) }
     }
 
-    /// "2 need you · 3 working", for the header.
+    /// "2 need you · 3 working", for the header. A snoozed session is
+    /// listed as ever and not counted as needing you.
     var summary: String? {
         let live = rows.filter { !$0.offline }
-        let needs = live.count { $0.session.state.wantsAttention }
+        let needs = live.count { $0.session.state.wantsAttention && $0.snoozed == nil }
         let working = live.count { $0.session.state == .working }
         var parts: [String] = []
         if needs > 0 { parts.append(needs == 1 ? "1 needs you" : "\(needs) need you") }

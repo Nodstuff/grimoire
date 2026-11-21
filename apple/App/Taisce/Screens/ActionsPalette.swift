@@ -48,7 +48,7 @@ struct ActionsPalette: View {
         Self.matching(query) { c in
             router.canPerform(c, signedIn: !model.needsSignIn, picker: model.workspacePicker,
                               canEdit: { model.access(for: $0).canEdit }, canCreate: model.currentAccess.canCreate,
-                              shares: model.shareLinks.isAvailable)
+                              shares: model.shareLinks.isAvailable, agents: model.fleet.isOffered)
         }
     }
 

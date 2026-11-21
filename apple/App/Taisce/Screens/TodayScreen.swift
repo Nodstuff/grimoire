@@ -19,7 +19,8 @@ struct TodayScreen: View {
             dayLine: RelativeTime.dayLine(),
             badge: SyncBadge.make(status: model.syncStatus, pending: model.pendingWrites),
             review: home.review,
-            agents: FleetCard(model.fleet.fleet, available: model.fleet.isLoaded),
+            // a phone's way in (iPad and the Mac have Agents in the sidebar)
+            agents: router.isPad ? nil : FleetCard(model.fleet.fleet, available: model.fleet.isLoaded),
             reading: reading,
             readingCover: reading.flatMap { books.coverURL($0.book) },
             due: TodoBoard.shown(board, hasSynced: model.hasSynced, status: model.syncStatus).map { TodayDue.rows($0) },
@@ -137,7 +138,9 @@ struct TodayContent: View {
     let badge: SyncBadge
     /// nil while the queue loads (the card waits rather than flashing empty)
     var review: [ReviewQueueItem]?
-    /// the fleet of Claude sessions (nil: no fleet on this server, or no Mac enrolled)
+    /// the fleet of Claude sessions, on a phone (nil: an iPad or Mac, no
+    /// fleet on this server, or no Mac enrolled). First when a session
+    /// needs you, after the pins otherwise
     var agents: FleetCard?
     var reading: ReadingBook?
     /// the book's cover image (behind the server's bearer: `coverImageLoader`)
@@ -168,12 +171,14 @@ struct TodayContent: View {
             VStack(alignment: .leading, spacing: 22) {
                 header
                 // a session waiting on you comes before everything else
-                if let agents { agentsCard(agents) }
+                if let agents, agents.attention { agentsCard(agents) }
                 // Tom's order: what's due first, then the book, then review, then pins
                 dueSection
                 if let reading { readingSection(reading) }
                 if let review, !review.isEmpty { reviewCard(review) }
                 pinnedSection
+                // nothing needs you: the way in to Agents waits at the end
+                if let agents, !agents.attention { agentsCard(agents) }
             }
             .padding(.top, 4)
             .padding(.bottom, 32)
@@ -255,8 +260,8 @@ struct TodayContent: View {
 
     // MARK: agents
 
-    /// The way in to Agents (a phone's tab bar is full; iPad and the Mac
-    /// have it in the sidebar too).
+    /// The way in to Agents on a phone, whose tab bar is full (iPad and the
+    /// Mac have it in the sidebar).
     private func agentsCard(_ card: FleetCard) -> some View {
         Button(action: onAgents) {
             HStack(spacing: 12) {

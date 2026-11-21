@@ -290,12 +290,15 @@ final class Router {
         return nil
     }
 
-    /// Whether a command applies now. Nothing works before sign-in; Share
+    /// Whether a command applies now. Nothing works before sign-in; Agents
+    /// needs a server that has (or may have) a fleet; Share
     /// link needs a doc in front that you may edit (ADR 0004: not a
     /// viewer's); ⌘N needs a workspace you may add to; ⌘n needs an nth workspace.
-    func canPerform(_ command: AppCommand, signedIn: Bool, picker: WorkspacePicker, canEdit: (DocID) -> Bool = { _ in true }, canCreate: Bool = true, shares: Bool = false) -> Bool {
+    func canPerform(_ command: AppCommand, signedIn: Bool, picker: WorkspacePicker, canEdit: (DocID) -> Bool = { _ in true }, canCreate: Bool = true, shares: Bool = false, agents: Bool = true) -> Bool {
         guard signedIn else { return false }
         switch command {
+        // not on a server known to have no fleet (a LOCAL daemon)
+        case .agents: return agents
         case .shareLink:
             // SERVER mode only, a doc in front you may edit (owner or editor)
             return shares && (focusedDoc.map(canEdit) ?? false)

@@ -257,9 +257,9 @@ struct RouteView: View {
 
 /// iPhone: the native floating tab bar (Liquid Glass on iOS 26): Today,
 /// Library, Books, To-dos, and Search on its own (five is what the bar
-/// holds: a sixth folds Search into "More"). Today's badge counts the
-/// changes waiting for review (its card opens the list); Agents is a card
-/// on Today too (`Route.agents`).
+/// holds: a sixth folds Search into "More"). Today's badge counts what
+/// waits for you: the changes to review (its card opens the list) and the
+/// sessions that need you (Agents is a card on Today too, `Route.agents`).
 struct PhoneRoot: View {
     @Environment(AppModel.self) private var model
     @Environment(Router.self) private var router
@@ -272,7 +272,8 @@ struct PhoneRoot: View {
                     TodayScreen().navigationDestination(for: Route.self) { RouteView(route: $0) }
                 }
             } label: { TabLabel("Today", "house") }
-            .badge(model.home.summary.total)
+            // what waits for you: changes to review, and sessions that need you (Today's Agents card)
+            .badge(model.home.summary.total + model.fleet.fleet.attentionCount())
             Tab(value: AppTab.library) {
                 NavigationStack(path: $router.libraryPath) {
                     LibraryScreen().navigationDestination(for: Route.self) { RouteView(route: $0) }
@@ -395,9 +396,12 @@ struct PadSidebar: View {
                         BooksSidebarSections()
                     }
                     // the fleet of Claude sessions; the count is the ones that need you
-                    SidebarItem(title: "Agents", systemImage: "sparkle", badge: model.fleet.fleet.attentionCount,
-                                badgeTone: model.fleet.fleet.attentionCount > 0 ? .attention : .quiet,
-                                badgeLabel: "need you", selected: shown == .agents) { router.select(.agents) }
+                    // (not the snoozed). Not shown on a server with no fleet (a LOCAL daemon)
+                    if model.fleet.isOffered {
+                        let needing = model.fleet.fleet.attentionCount()
+                        SidebarItem(title: "Agents", systemImage: "sparkle", badge: needing, badgeTone: needing > 0 ? .attention : .quiet,
+                                    badgeLabel: "need you", selected: shown == .agents) { router.select(.agents) }
+                    }
                     SidebarItem(title: "Search", systemImage: "magnifyingglass", shortcut: "\u{21E7}\u{2318}F", selected: shown == .search) {
                         router.select(.search)
                         router.focusSearch()

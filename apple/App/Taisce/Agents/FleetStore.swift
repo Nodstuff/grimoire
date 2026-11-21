@@ -41,16 +41,24 @@ final class FleetStore {
     private(set) var watching = 0
 
     @ObservationIgnored private var followTask: Task<Void, Never>?
+    /// bumped by `reset`: an answer that comes back for an earlier account
+    /// or server is dropped
+    @ObservationIgnored private var generation = 0
 
     private var service: (any FleetService)? { serviceOverride ?? app?.api }
 
     /// the fleet has arrived at least once
     var isLoaded: Bool { availability == .available }
+    /// Agents is offered (the sidebar, the Go menu, the palette) unless the
+    /// server is known to have no fleet: a LOCAL daemon, where it would be
+    /// a way in to nothing
+    var isOffered: Bool { availability != .unavailable }
     /// the Agents screen is on screen: what a notification would say is already in view
     var isOnScreen: Bool { watching > 0 }
 
     func reset() {
         stop()
+        generation += 1
         fleet = Fleet()
         availability = .unknown
         loadError = nil
@@ -59,9 +67,11 @@ final class FleetStore {
 
     // MARK: following
 
-    /// Follow the fleet's stream (foreground only, like sync). Asked again
-    /// while following, it does nothing. A server with no fleet answers
-    /// once and the following ends.
+    /// Follow the fleet's stream. `AppModel.startSync` calls this and
+    /// `stopSync` ends it: foreground only, and only while signed in (or on
+    /// a server that needs no sign-in), like sync. Asked again while
+    /// following, it does nothing. A server with no fleet answers once and
+    /// the following ends; so does one that refuses the token.
     func start() {
         guard followTask == nil, let service else { return }
         let follower = FleetFollower(service: service, backoff: backoff)
@@ -94,6 +104,9 @@ final class FleetStore {
                 fleet = Fleet()
                 loadError = nil
                 followTask = nil
+            } else if next == .idle {
+                // the follower gave up (the session is over): the next start follows afresh
+                followTask = nil
             }
         case .failed(let why):
             // a fleet already showing stays; the indicator says it is stale
@@ -102,22 +115,26 @@ final class FleetStore {
     }
 
     /// The fleet again, in the server's order (a pull to refresh, or coming
-    /// back to the screen: the list holds still in between). Also restarts
-    /// the following if it had ended.
+    /// back to the screen: the list holds still in between). It reads; it
+    /// never starts the following (that is the app's lifecycle's).
     func refresh() async {
         guard let service else { return }
-        start()
+        let asked = generation
         do {
             let fresh = try await service.fleet()
+            // signed out or another server meanwhile: not this account's answer
+            guard asked == generation else { return }
             fleet.refresh(with: fresh)
             availability = .available
             loadError = nil
         } catch APIError.notFound, APIError.notAPIRoute {
+            guard asked == generation else { return }
             availability = .unavailable
             fleet = Fleet()
             loadError = nil
         } catch is CancellationError {
         } catch {
+            guard asked == generation else { return }
             if availability != .available { loadError = Self.describe(error) }
         }
     }
@@ -136,8 +153,10 @@ final class FleetStore {
 
     private func change(_ call: (any FleetService) async throws -> FleetSession) async -> String? {
         guard let service else { return "Not connected." }
+        let asked = generation
         do {
             let session = try await call(service)
+            guard asked == generation else { return nil }
             // the stream says the same a moment later; show it now
             if let i = fleet.sessions.firstIndex(where: { $0.key == session.key }) { fleet.sessions[i] = session }
             return nil
@@ -164,7 +183,8 @@ final class FleetStore {
 
     // MARK: the screen, and notifications
 
-    /// An Agents screen came to the front of an active window, or left it.
+    /// An Agents screen came to the front of an active window, or left it
+    /// (screens count themselves through a `FleetScreenPresence`).
     func screenAppeared() { watching += 1 }
     func screenDisappeared() { watching = max(0, watching - 1) }
 
@@ -177,5 +197,23 @@ final class FleetStore {
     func takeRequest() -> FleetSessionKey? {
         defer { request = nil }
         return request?.session
+    }
+}
+
+/// One Agents screen's entry in `FleetStore.watching`: counted while the
+/// screen is in front of an active window, and not otherwise. The screen
+/// tells it each time that changes AND when it goes away for good (a
+/// sidebar switch or a pop removes the view without any change the view
+/// could observe), so a screen that is gone never stays counted.
+@MainActor final class FleetScreenPresence {
+    private(set) var counted = false
+
+    /// True when this call brought the screen to the front.
+    @discardableResult
+    func update(inFront: Bool, in store: FleetStore) -> Bool {
+        guard inFront != counted else { return false }
+        counted = inFront
+        if inFront { store.screenAppeared() } else { store.screenDisappeared() }
+        return inFront
     }
 }

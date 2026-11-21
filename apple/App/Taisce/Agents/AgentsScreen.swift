@@ -13,7 +13,7 @@ struct AgentsScreen: View {
     @Environment(Router.self) private var router
     @Environment(\.scenePhase) private var scenePhase
     @State private var appeared = false
-    @State private var counted = false
+    @State private var presence = FleetScreenPresence()
     @State private var toast: ToastMessage?
 
     private var store: FleetStore { model.fleet }
@@ -37,17 +37,18 @@ struct AgentsScreen: View {
         .refreshable { await store.refresh() }
         .lapisToast($toast)
         .onAppear { appeared = true }
-        .onDisappear { appeared = false }
+        .onDisappear {
+            appeared = false
+            // gone, not just covered: a removed view sees no change to react
+            // to, so it stops counting here (or every later notification
+            // would be taken for one about a screen in front)
+            presence.update(inFront: false, in: store)
+            // a notification's session that never showed is not kept for the next visit
+            router.agentsFocus = nil
+        }
         .onChange(of: inFront, initial: true) { _, front in
-            guard front != counted else { return }
-            counted = front
-            if front {
-                store.screenAppeared()
-                // back in front: the server's order again
-                Task { await store.refresh() }
-            } else {
-                store.screenDisappeared()
-            }
+            // back in front: the server's order again
+            if presence.update(inFront: front, in: store) { Task { await store.refresh() } }
         }
     }
 
@@ -144,33 +145,54 @@ struct AgentsContent: View {
             .frame(maxWidth: .infinity)
             .confirmationDialog("Snooze notifications", isPresented: Binding(get: { snoozing != nil }, set: { if !$0 { snoozing = nil } }), titleVisibility: .visible, presenting: snoozing) { row in
                 ForEach(FleetSnooze.allCases, id: \.self) { option in
-                    Button(option.title) { onSnooze(row.id, option) }
+                    Button(option.title()) { onSnooze(row.id, option) }
                 }
             } message: { row in
                 Text("\(row.session.address) stays in the list.")
             }
-            .task(id: FocusKey(key: focus.wrappedValue, loaded: !loading)) { await show(focus.wrappedValue, loaded: !loading, proxy) }
+            .task(id: FocusTrigger(key: focus.wrappedValue, listed: lists(focus.wrappedValue), loaded: !loading)) {
+                await show(focus.wrappedValue, proxy)
+            }
         }
     }
 
-    private struct FocusKey: Equatable {
+    /// What restarts the focus task: another session asked for, or the one
+    /// asked for arriving in the fleet. (Not the binding being cleared by
+    /// the task itself: that happens last.)
+    private struct FocusTrigger: Equatable {
         var key: FleetSessionKey?
+        var listed: Bool
         var loaded: Bool
     }
 
-    /// Bring a notification's session into view and mark it for a moment.
-    private func show(_ key: FleetSessionKey?, loaded: Bool, _ proxy: ScrollViewProxy) async {
-        guard let key, loaded else { return }
-        focus.wrappedValue = nil
-        guard (board.rows + board.resting).contains(where: { $0.id == key }) else { return }
-        if board.resting.contains(where: { $0.id == key }) { showResting = true }
-        // after the fold has opened
-        try? await Task.sleep(for: .milliseconds(150))
-        withAnimation { proxy.scrollTo(key, anchor: .center) }
-        marked = key
-        try? await Task.sleep(for: .seconds(3))
-        withAnimation(Lapis.Motion.standard) { if marked == key { marked = nil } }
+    private func lists(_ key: FleetSessionKey?) -> Bool {
+        guard let key else { return false }
+        return (board.rows + board.resting).contains { $0.id == key }
     }
+
+    /// Bring a notification's session into view and mark it for a moment.
+    /// One the fleet has not delivered yet stays asked for until it does
+    /// (or another is asked for, or the screen goes).
+    private func show(_ key: FleetSessionKey?, _ proxy: ScrollViewProxy) async {
+        guard let key, lists(key) else { return }
+        if board.resting.contains(where: { $0.id == key }) { showResting = true }
+        do {
+            // after the list (and the fold, if it opened) has laid out
+            try await Task.sleep(for: .milliseconds(250))
+            withAnimation { proxy.scrollTo(key, anchor: .center) }
+            marked = key
+            try await Task.sleep(for: Self.markTime)
+        } catch {
+            // another session was asked for: its own task takes over
+            if marked == key { marked = nil }
+            return
+        }
+        withAnimation(Lapis.Motion.standard) { if marked == key { marked = nil } }
+        if focus.wrappedValue == key { focus.wrappedValue = nil }
+    }
+
+    /// How long a notification's row stays marked.
+    static let markTime: Duration = .seconds(3)
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -261,13 +283,15 @@ struct AgentsContent: View {
             .contextMenu {
                 if row.snoozed == nil {
                     Menu("Snooze notifications", systemImage: "bell.slash") {
-                        ForEach(FleetSnooze.allCases, id: \.self) { option in Button(option.title) { onSnooze(row.id, option) } }
+                        ForEach(FleetSnooze.allCases, id: \.self) { option in Button(option.title()) { onSnooze(row.id, option) } }
                     }
                 } else {
                     Button("Unsnooze", systemImage: "bell") { onUnsnooze(row.id) }
                 }
                 Button("Copy address", systemImage: "doc.on.doc") { UIPasteboard.general.string = row.session.address }
             }
+            // the row a notification pointed at
+            .accessibilityAddTraits(marked == row.id ? .isSelected : [])
             .accessibilityAction(named: row.snoozed == nil ? "Snooze notifications" : "Unsnooze") {
                 if row.snoozed == nil { snoozing = row } else { onUnsnooze(row.id) }
             }
