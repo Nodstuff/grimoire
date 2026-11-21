@@ -73,8 +73,9 @@ final class FleetUITests: XCTestCase {
         let after = order.map { row(app, $0).frame.minY }
         XCTAssertEqual(after, after.sorted(), "no row moved")
         // the fold opens
-        app.swipeUp()
         let resting = app.descendants(matching: .any).matching(identifier: "agents.resting").firstMatch
+        // below the fold on a phone
+        if !(resting.exists && resting.isHittable) { row(app, order[2]).swipeUp() }
         XCTAssertTrue(resting.waitForExistence(timeout: 5))
         resting.tap()
         XCTAssertTrue(row(app, "notes/main").waitForExistence(timeout: 5))
