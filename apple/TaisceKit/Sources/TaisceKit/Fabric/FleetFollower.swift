@@ -16,6 +16,8 @@ public enum FleetLink: Sendable, Hashable {
 public enum FleetSignal: Sendable {
     /// a change, and the fleet's `rev` after it
     case change(FleetChange, rev: Int)
+    /// one of the Slice 2–5 events (a turn, an attention item, an order, …)
+    case event(FabricStreamEvent)
     case link(FleetLink)
     /// why the last connection ended (the follower is about to wait and retry)
     case failed(any Error)
@@ -70,6 +72,11 @@ public struct FleetFollower: Sendable {
                     case .comment:
                         break
                     case .event(let event):
+                        if let fabric = try FabricStreamEvent.decode(event) {
+                            healthy = true
+                            emit(.event(fabric))
+                            continue
+                        }
                         guard let (change, rev) = try FleetChange.decode(event) else { continue }
                         // only what could be read counts: a stream that opens with
                         // something unreadable backs off, it does not spin

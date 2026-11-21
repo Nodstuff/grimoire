@@ -82,6 +82,19 @@ public struct FleetSession: Sendable, Hashable, Codable, Identifiable {
     /// snoozed until then: the server sends no notification for it before
     /// that. nil = not snoozed (or a server without snooze)
     public var quietUntil: Int?
+    /// the named fabric it is in (`Settings.fabrics`); "" = its project's own
+    public var fabricID: String
+    /// its latest turn, running or finished ("" before its first): what a
+    /// reply's `after_turn` names
+    public var turnID: String
+    /// prompts queued for it (order ids), in the order they will be typed
+    public var queue: [String]
+    /// why its queue is paused ("" = not paused)
+    public var queuePaused: String
+    /// every finished turn of it notifies
+    public var following: Bool
+    /// its project has Text off: no turn text is stored
+    public var textOff: Bool
 
     public var key: FleetSessionKey { FleetSessionKey(runtimeID: runtimeID, id: sessionID) }
     public var id: FleetSessionKey { key }
@@ -89,7 +102,8 @@ public struct FleetSession: Sendable, Hashable, Codable, Identifiable {
     public init(
         sessionID: String, runtimeID: String, address: String, fabric: String = "", project: String = "", worktree: String = "",
         branch: String = "", account: String = "", state: SessionState, tool: String = "", note: String = "", lastLine: String = "",
-        contextUsedPct: Int? = nil, since: Int, updatedAt: Int, quietUntil: Int? = nil
+        contextUsedPct: Int? = nil, since: Int, updatedAt: Int, quietUntil: Int? = nil, fabricID: String = "", turnID: String = "",
+        queue: [String] = [], queuePaused: String = "", following: Bool = false, textOff: Bool = false
     ) {
         self.sessionID = sessionID
         self.runtimeID = runtimeID
@@ -107,6 +121,12 @@ public struct FleetSession: Sendable, Hashable, Codable, Identifiable {
         self.since = since
         self.updatedAt = updatedAt
         self.quietUntil = quietUntil
+        self.fabricID = fabricID
+        self.turnID = turnID
+        self.queue = queue
+        self.queuePaused = queuePaused
+        self.following = following
+        self.textOff = textOff
     }
 
     enum CodingKeys: String, CodingKey {
@@ -118,6 +138,39 @@ public struct FleetSession: Sendable, Hashable, Codable, Identifiable {
         case since
         case updatedAt = "updated_at"
         case quietUntil = "quiet_until"
+        case fabricID = "fabric_id"
+        case turnID = "turn_id"
+        case queue
+        case queuePaused = "queue_paused"
+        case following
+        case textOff = "text_off"
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try c.decode(String.self, forKey: .sessionID)
+        runtimeID = try c.decode(String.self, forKey: .runtimeID)
+        address = try c.decode(String.self, forKey: .address)
+        fabric = try c.value(.fabric, "")
+        project = try c.value(.project, "")
+        worktree = try c.value(.worktree, "")
+        branch = try c.value(.branch, "")
+        account = try c.value(.account, "")
+        state = try c.decode(SessionState.self, forKey: .state)
+        tool = try c.value(.tool, "")
+        note = try c.value(.note, "")
+        lastLine = try c.value(.lastLine, "")
+        contextUsedPct = try c.decodeIfPresent(Int.self, forKey: .contextUsedPct)
+        since = try c.decode(Int.self, forKey: .since)
+        updatedAt = try c.decode(Int.self, forKey: .updatedAt)
+        quietUntil = try c.decodeIfPresent(Int.self, forKey: .quietUntil)
+        // Slices 2–5; absent from a Slice 1 server
+        fabricID = try c.value(.fabricID, "")
+        turnID = try c.value(.turnID, "")
+        queue = try c.value(.queue, [])
+        queuePaused = try c.value(.queuePaused, "")
+        following = try c.value(.following, false)
+        textOff = try c.value(.textOff, false)
     }
 
     /// Snoozed at `now`: a `quietUntil` that has passed is no snooze (the
@@ -168,8 +221,21 @@ public struct FleetRuntime: Sendable, Hashable, Codable, Identifiable {
     public var version: String
     public var accounts: [FleetAccount]
     public var accountsAt: Int?
+    /// Hold all is on: it takes no command but its release
+    public var held: Bool
+    public var heldSince: Int?
+    /// the Settings version in force (0: its built-in defaults)
+    public var settingsVersion: UInt64
+    /// the person is at this Mac
+    public var present: Bool
+    /// its own signing key as it reports it (display only: the phone
+    /// trusts the key it read from the pairing code)
+    public var publicKey: Data?
+    /// the devices paired with it at the Mac
+    public var devices: [FabricPairedDevice]
 
-    public init(id: String, name: String, createdAt: Int = 0, online: Bool, lastSeenAt: Int? = nil, version: String = "", accounts: [FleetAccount] = [], accountsAt: Int? = nil) {
+    public init(id: String, name: String, createdAt: Int = 0, online: Bool, lastSeenAt: Int? = nil, version: String = "", accounts: [FleetAccount] = [], accountsAt: Int? = nil,
+                held: Bool = false, heldSince: Int? = nil, settingsVersion: UInt64 = 0, present: Bool = false, publicKey: Data? = nil, devices: [FabricPairedDevice] = []) {
         self.id = id
         self.name = name
         self.createdAt = createdAt
@@ -178,6 +244,12 @@ public struct FleetRuntime: Sendable, Hashable, Codable, Identifiable {
         self.version = version
         self.accounts = accounts
         self.accountsAt = accountsAt
+        self.held = held
+        self.heldSince = heldSince
+        self.settingsVersion = settingsVersion
+        self.present = present
+        self.publicKey = publicKey
+        self.devices = devices
     }
 
     enum CodingKeys: String, CodingKey {
@@ -185,7 +257,34 @@ public struct FleetRuntime: Sendable, Hashable, Codable, Identifiable {
         case createdAt = "created_at"
         case lastSeenAt = "last_seen_at"
         case accountsAt = "accounts_at"
+        case held
+        case heldSince = "held_since"
+        case settingsVersion = "settings_version"
+        case present
+        case publicKey = "public_key"
+        case devices
     }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.value(.name, "")
+        createdAt = try c.value(.createdAt, 0)
+        online = try c.value(.online, false)
+        lastSeenAt = try c.decodeIfPresent(Int.self, forKey: .lastSeenAt)
+        version = try c.value(.version, "")
+        accounts = try c.value(.accounts, [])
+        accountsAt = try c.decodeIfPresent(Int.self, forKey: .accountsAt)
+        held = try c.value(.held, false)
+        heldSince = try c.decodeIfPresent(Int.self, forKey: .heldSince).flatMap { $0 == 0 ? nil : $0 }
+        settingsVersion = try c.value(.settingsVersion, 0)
+        present = try c.value(.present, false)
+        publicKey = try c.base64(.publicKey)
+        devices = try c.value(.devices, [])
+    }
+
+    /// The device with this id is paired with it.
+    public func isPaired(_ deviceID: String) -> Bool { devices.contains { $0.deviceID == deviceID } }
 }
 
 /// One person's fleet (`GET /api/fabric/sessions`, and the stream's `fleet`
@@ -195,11 +294,41 @@ public struct Fleet: Sendable, Hashable, Codable {
     public var rev: Int
     public var runtimes: [FleetRuntime]
     public var sessions: [FleetSession]
+    /// the open attention items, newest first (Slices 2–5)
+    public var attention: [FabricAttentionItem]
 
-    public init(rev: Int = 0, runtimes: [FleetRuntime] = [], sessions: [FleetSession] = []) {
+    public init(rev: Int = 0, runtimes: [FleetRuntime] = [], sessions: [FleetSession] = [], attention: [FabricAttentionItem] = []) {
         self.rev = rev
         self.runtimes = runtimes
         self.sessions = sessions
+        self.attention = attention
+    }
+
+    enum CodingKeys: String, CodingKey { case rev, runtimes, sessions, attention }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        rev = try c.value(.rev, 0)
+        runtimes = try c.value(.runtimes, [])
+        sessions = try c.value(.sessions, [])
+        attention = try c.value(.attention, [])
+    }
+
+    public func session(_ key: FleetSessionKey) -> FleetSession? { sessions.first { $0.key == key } }
+
+    /// The open items of one session, newest first.
+    public func attention(for key: FleetSessionKey) -> [FabricAttentionItem] {
+        attention.filter { $0.session == key }
+    }
+
+    /// An item raised or changed: newest first, one per id.
+    public mutating func raise(_ item: FabricAttentionItem) {
+        attention.removeAll { $0.id == item.id }
+        attention.insert(item, at: 0)
+    }
+
+    public mutating func clear(attention id: String) {
+        attention.removeAll { $0.id == id }
     }
 
     public func runtime(_ id: String) -> FleetRuntime? { runtimes.first { $0.id == id } }
@@ -254,6 +383,7 @@ extension Fleet {
         case .runtimeGone(let id):
             runtimes.removeAll { $0.id == id }
             sessions.removeAll { $0.runtimeID == id }
+            attention.removeAll { $0.runtimeID == id }
         }
         return true
     }
