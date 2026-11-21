@@ -29,9 +29,9 @@ struct AgentSessionScreen: View {
     var body: some View {
         Group {
             if let session {
-                TimelineView(.periodic(from: .now, by: 30)) { context in
-                    content(session, now: context.date)
-                }
+                // only what says a relative time redraws on the 30 s tick
+                // (the header, the running-now line), never the turn list
+                content(session)
             } else {
                 EmptyState(symbol: "sparkle", title: "This session is gone", message: "Its Mac no longer reports it.")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -77,8 +77,7 @@ struct AgentSessionScreen: View {
 
     // MARK: content
 
-    private func content(_ s: FleetSession, now: Date) -> some View {
-        let header = SessionHeader(s, runtime: runtime, now: now)
+    private func content(_ s: FleetSession) -> some View {
         let items = store.fleet.attention(for: key)
         // what each item is comes from what the Mac signed, never the server's kind
         let question = items.first { command.verifiedKind($0) == .question }
@@ -86,7 +85,9 @@ struct AgentSessionScreen: View {
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
-                    headerCard(header, s)
+                    TimelineView(.periodic(from: .now, by: 30)) { context in
+                        headerCard(SessionHeader(s, runtime: runtime, now: context.date), s)
+                    }
                     if feed.more {
                         Button { Task { await feed.loadOlder(store.fabricService) } } label: {
                             Label(feed.loading ? "Loading\u{2026}" : "Earlier turns", systemImage: "arrow.up.circle")
@@ -95,17 +96,19 @@ struct AgentSessionScreen: View {
                         .buttonStyle(.lapis(.ghost))
                         .accessibilityIdentifier("session.earlier")
                     }
-                    if feed.turns.isEmpty, !feed.loading {
+                    if feed.rows.isEmpty, !feed.loading {
                         EmptyCard(icon: "text.bubble", title: feed.loadError ?? "No turns yet",
                                   hint: s.textOff ? "This project has Text off: turns are not kept." : "What it is asked and what it answers shows here, turn by turn.")
                     }
-                    ForEach(feed.turns) { turn in
-                        if turn.turnID == feed.firstNew, feed.newCount > 0 {
+                    ForEach(feed.rows) { row in
+                        if row.id == feed.firstNew, feed.newCount > 0 {
                             newDivider(feed.newCount)
                         }
-                        TurnView(row: TurnRow(turn, now: now)).id(turn.turnID)
+                        TurnView(row: row).equatable().id(row.id)
                     }
-                    if s.state == .working || s.state == .stalled { runningNow(s, now: now) }
+                    if s.state == .working || s.state == .stalled {
+                        TimelineView(.periodic(from: .now, by: 30)) { context in runningNow(s, now: context.date) }
+                    }
                     // everything that asks something of the person sits at the bottom,
                     // where the feed opens and the reply box is, never above the turns
                     ForEach(items.filter { $0.id != question?.id }) { item in
@@ -126,7 +129,7 @@ struct AgentSessionScreen: View {
             }
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
-            .onChange(of: feed.turns.count) { proxy.scrollTo("bottom", anchor: .bottom) }
+            .onChange(of: feed.rows.count) { proxy.scrollTo("bottom", anchor: .bottom) }
             .onChange(of: command.pending.count) { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
             .safeAreaInset(edge: .bottom) {
                 composer(s, mode: mode, question: question)
@@ -356,9 +359,12 @@ struct AgentSessionScreen: View {
 }
 
 /// One turn: the prompt as your bubble, what it did in one line, its reply.
-struct TurnView: View {
+/// Equatable on its row, so a redraw of the feed skips a turn that did not change.
+struct TurnView: View, Equatable {
     let row: TurnRow
     @State private var expanded = false
+
+    nonisolated static func == (a: TurnView, b: TurnView) -> Bool { a.row == b.row }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -394,8 +400,8 @@ struct TurnView: View {
                 .background(Color.lapis.card2, in: .capsule)
             }
             if !row.reply.isEmpty {
-                let long = row.reply.count > 900
-                Text(Self.markdown(long && !expanded ? String(row.reply.prefix(900)) + "\u{2026}" : row.reply))
+                let long = row.replyPreview != nil
+                Text(!expanded ? row.replyPreview ?? row.replyText : row.replyText)
                     .font(.body)
                     .foregroundStyle(Color.lapis.ink)
                     .textSelection(.enabled)
@@ -414,11 +420,6 @@ struct TurnView: View {
         .padding(.vertical, 4)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("turn.\(row.id)")
-    }
-
-    /// Inline Markdown (bold, code, links), as Claude writes it.
-    static func markdown(_ s: String) -> AttributedString {
-        (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s)
     }
 }
 

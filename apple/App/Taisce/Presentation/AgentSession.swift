@@ -62,8 +62,13 @@ struct SessionHeader: Hashable {
     }
 }
 
-/// One turn as the feed shows it.
+/// One turn as the feed shows it. Its reply's Markdown is parsed here, once
+/// per turn (the feed keeps its rows), never in a view's `body`: a long
+/// session re-parsed every reply on every redraw.
 struct TurnRow: Identifiable, Hashable {
+    /// a reply longer than this shows its first this-many characters until "Show all"
+    static let collapsedLength = 900
+
     var id: String
     var prompt: String
     var reply: String
@@ -78,6 +83,10 @@ struct TurnRow: Identifiable, Hashable {
     var pullRequest: URL?
     var textOff: Bool
     var truncated: Bool
+    /// the whole reply, as inline Markdown
+    let replyText: AttributedString
+    /// its first `collapsedLength` characters and an ellipsis; nil when it is not that long
+    let replyPreview: AttributedString?
 
     init(_ t: FabricTurn, now: Date) {
         id = t.turnID
@@ -99,6 +108,26 @@ struct TurnRow: Identifiable, Hashable {
         pullRequest = t.outcome.pullRequestURL.flatMap(URL.init(string:))
         textOff = t.textOff && t.prompt.isEmpty && t.reply.isEmpty
         truncated = t.truncated
+        replyText = t.reply.isEmpty ? AttributedString() : Self.markdown(t.reply)
+        replyPreview = t.reply.count > Self.collapsedLength ? Self.markdown(String(t.reply.prefix(Self.collapsedLength)) + "\u{2026}") : nil
+    }
+
+    /// Inline Markdown (bold, code, links), as Claude writes it.
+    static func markdown(_ s: String) -> AttributedString {
+        (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s)
+    }
+
+    // the parsed text follows from `reply`: comparing it again would only cost
+    static func == (a: TurnRow, b: TurnRow) -> Bool {
+        a.id == b.id && a.prompt == b.prompt && a.reply == b.reply && a.activity == b.activity && a.source == b.source
+            && a.ending == b.ending && a.endTone == b.endTone && a.when == b.when && a.pullRequest == b.pullRequest
+            && a.textOff == b.textOff && a.truncated == b.truncated
+    }
+
+    func hash(into h: inout Hasher) {
+        h.combine(id)
+        h.combine(reply.count)
+        h.combine(when)
     }
 }
 
@@ -160,7 +189,14 @@ enum QuickReplies {
 final class SessionFeed {
     let key: FleetSessionKey
     /// oldest first, as read
-    private(set) var turns: [FabricTurn] = []
+    private(set) var turns: [FabricTurn] = [] {
+        didSet { rows = Self.rows(for: turns, reusing: rows, now: now()) }
+    }
+    /// `turns` as the feed shows them, each built (its Markdown parsed) once
+    /// and kept while its turn and its day are unchanged
+    private(set) var rows: [TurnRow] = []
+    /// the clock rows are worded against (a test's fixed one)
+    @ObservationIgnored var now: () -> Date = Date.init
     private(set) var more = false
     private(set) var loading = false
     private(set) var loadError: String?
@@ -205,6 +241,21 @@ final class SessionFeed {
             byID[t.turnID] = t
         }
         turns = byID.values.sorted { ($0.ended, $0.started) < ($1.ended, $1.started) }
+    }
+
+    /// A row per turn, reusing the row already built for a turn whose words
+    /// and day are the same (a reply only grows, from the route's to the
+    /// live event's: its length says whether it changed).
+    static func rows(for turns: [FabricTurn], reusing old: [TurnRow], now: Date) -> [TurnRow] {
+        let held = Dictionary(old.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        return turns.map { t in
+            if let row = held[t.turnID], row.reply.utf8.count == t.reply.utf8.count, row.prompt.utf8.count == t.prompt.utf8.count,
+               row.textOff == (t.textOff && t.prompt.isEmpty && t.reply.isEmpty),
+               row.when == FleetTime.clock(t.ended, now: now) {
+                return row
+            }
+            return TurnRow(t, now: now)
+        }
     }
 
     /// Turns that finished after the person last looked.

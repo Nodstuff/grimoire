@@ -394,6 +394,43 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         #expect(LastLooked.shared.seen(key) == 36)
     }
 
+    /// The render fix: a feed of 30 long replies parses each reply's Markdown
+    /// once, when it arrives, and a redraw of the screen reuses the rows. Before,
+    /// `TurnView.body` parsed every reply on every redraw (and the 30 s tick
+    /// redrew them all). Prints what a redraw's worth of rows costs each way.
+    @Test func longRepliesAreParsedOnceNotOnEveryRedraw() {
+        let key = FleetSessionKey(runtimeID: "r1", id: "s1")
+        let para = "Here is **what changed** in `crates/store/src/fabric/work.rs`: the [route](https://example.org) now reads `after=` too. "
+        let turns = (1...30).map { i in
+            FabricTurn(runtimeID: "r1", sessionID: "s1", address: "taisce/main", turnID: "t\(i)", prompt: "Do step \(i)",
+                       reply: String(repeating: para, count: 40), started: i * 10 - 5, ended: i * 10)
+        }
+        let feed = SessionFeed(key: key)
+        feed.now = { Self.now }
+        feed.merge(turns)
+        #expect(feed.rows.count == 30 && feed.rows.allSatisfy { $0.replyPreview != nil && !$0.replyText.characters.isEmpty })
+        #expect(String(feed.rows[0].replyPreview!.characters).hasSuffix("\u{2026}"))
+        let clock = ContinuousClock()
+        let redraws = 10
+        // before: every redraw built every row (and parsed its reply) again
+        let before = clock.measure {
+            for _ in 0..<redraws { for t in turns { _ = TurnRow(t, now: Self.now) } }
+        }
+        // after: a redraw reads the feed's rows; a merge reuses unchanged ones
+        let first = feed.rows
+        let after = clock.measure {
+            for _ in 0..<redraws { feed.merge([turns[29]]) }
+        }
+        #expect(feed.rows == first)
+        print("TurnRender: 30 long replies x \(redraws) redraws: rebuilt every redraw \(before), kept rows \(after)")
+        #expect(after < before)
+        // a live event's fuller reply rebuilds that one row only
+        var fuller = turns[29]
+        fuller.reply += " And one more line."
+        feed.merge([fuller])
+        #expect(feed.rows[29].reply.hasSuffix("one more line.") && feed.rows[28] == first[28])
+    }
+
     @Test func turnsAndRowsAreWorded() {
         let t = FabricTurn(runtimeID: "r1", sessionID: "s1", address: "a", turnID: "t", prompt: "p", reply: "r", toolCount: 9,
                            outcome: GitOutcome(filesChanged: 1, linesAdded: 6, linesRemoved: 2, commits: 1, pullRequestNumber: 412),
