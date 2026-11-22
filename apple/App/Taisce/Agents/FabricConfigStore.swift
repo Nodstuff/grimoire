@@ -52,13 +52,19 @@ final class FabricConfigStore {
 
     func load() async {
         guard let service else { return }
+        // an answer after a sign-out or server switch is the last account's
+        let asked = fleet?.generationNow
         do {
             async let s = service.settings()
             async let p = service.projects()
-            apply(try await s)
-            projects = (try? await p) ?? projects
+            let settings = try await s
+            let fetched = try? await p
+            guard fleet?.generationNow == asked else { return }
+            apply(settings)
+            projects = fetched ?? projects
             loadError = nil
         } catch {
+            guard fleet?.generationNow == asked else { return }
             loadError = FleetStore.describe(error)
         }
     }

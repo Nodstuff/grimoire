@@ -21,7 +21,12 @@ final class HomeStore {
 
     var summary: ReviewQueueSummary { ReviewQueueSummary(review ?? []) }
 
+    /// bumped by `reset` (sign-out, a server switch): an answer that comes
+    /// back for the previous account is dropped
+    @ObservationIgnored private var generation = 0
+
     func reset() {
+        generation += 1
         review = nil
         reviewError = nil
         resolving = []
@@ -30,11 +35,15 @@ final class HomeStore {
 
     func loadReview() async {
         guard let api = app?.api else { return }
+        let asked = generation
         do {
-            review = try await api.reviewQueue()
+            let queue = try await api.reviewQueue()
+            guard generation == asked else { return }
+            review = queue
             reviewError = nil
         } catch is CancellationError {
         } catch {
+            guard generation == asked else { return }
             reviewError = error.localizedDescription
         }
     }
@@ -58,6 +67,7 @@ final class HomeStore {
 
     func loadProfile() async {
         guard profileName == nil, let api = app?.api else { return }
-        if let p = try? await api.profile(), !p.name.isEmpty { profileName = p.name }
+        let asked = generation
+        if let p = try? await api.profile(), !p.name.isEmpty, generation == asked { profileName = p.name }
     }
 }

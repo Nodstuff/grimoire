@@ -21,6 +21,10 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         /// every turns request fails
         var turnsFail = false
         var attention: [FabricAttentionItem] = []
+        var conversations: [FabricConversation] = []
+        var orders: [FabricOrderView] = []
+        /// answers to the reads below wait while this is set
+        var held = false
     }
 
     let state: Mutex<State>
@@ -30,6 +34,11 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
     var postedBodies: [FabricSignedBody] { state.withLock { $0.posted } }
 
     private func log(_ c: String) { state.withLock { $0.calls.append(c) } }
+    /// a read held on the way back (cancellable; gives up after 10 s)
+    private func waitHeld() async {
+        let end = Date.now.addingTimeInterval(10)
+        while state.withLock({ $0.held }), Date.now < end { try? await Task.sleep(for: .milliseconds(5)) }
+    }
 
     func fleet() async throws -> Fleet { log("fleet"); return state.withLock { $0.fleet } }
     func fleetStream() -> AsyncThrowingStream<SSEOutput, any Error> { AsyncThrowingStream { _ in } }
@@ -50,8 +59,8 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         return FabricTurnPage(turns: Array(all.prefix(limit)), more: all.count > limit)
     }
     func turns(since: Int, limit: Int) async throws -> [FabricTurn] { [] }
-    func attention() async throws -> [FabricAttentionItem] { log("attention"); return state.withLock { $0.attention } }
-    func orders(session: FleetSessionKey?, limit: Int) async throws -> [FabricOrderView] { log("orders"); return [] }
+    func attention() async throws -> [FabricAttentionItem] { log("attention"); await waitHeld(); return state.withLock { $0.attention } }
+    func orders(session: FleetSessionKey?, limit: Int) async throws -> [FabricOrderView] { log("orders"); await waitHeld(); return state.withLock { $0.orders } }
     func order(_ id: String) async throws -> FabricOrderView { throw APIError.notFound("") }
     func postOrder(_ body: FabricSignedBody) async throws -> FabricOrderView {
         log("post")
@@ -64,7 +73,7 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         log("withdraw \(id)")
         return FabricOrderView(id: id, runtimeID: "r1", sessionID: nil, verb: "send", state: .withdrawn)
     }
-    func settings() async throws -> FabricSettingsView { log("settings"); return state.withLock { $0.settings } }
+    func settings() async throws -> FabricSettingsView { log("settings"); await waitHeld(); return state.withLock { $0.settings } }
     func putSettings(_ body: FabricSignedBody) async throws -> FabricSettingsView {
         log("put settings")
         if let e = state.withLock({ s -> FabricError? in defer { s.refuse = nil }; return s.refuse }) { throw e }
@@ -92,9 +101,10 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         return s
     }
     func dismissAttention(_ id: String) async throws { log("dismiss \(id)") }
-    func conversations() async throws -> [FabricConversation] { [] }
+    func conversations() async throws -> [FabricConversation] { await waitHeld(); return state.withLock { $0.conversations } }
     func conversation(_ id: String, limit: Int) async throws -> FabricConversationPage {
-        FabricConversationPage(conversation: FabricConversation(id: id, a: FabricSessionRef(runtimeID: "r1", sessionID: "a", address: "a/x"),
+        await waitHeld()
+        return FabricConversationPage(conversation: FabricConversation(id: id, a: FabricSessionRef(runtimeID: "r1", sessionID: "a", address: "a/x"),
                                                                 b: FabricSessionRef(runtimeID: "r1", sessionID: "b", address: "b/x")), messages: [])
     }
     func continueConversation(_ id: String) async throws { log("continue \(id)") }
@@ -998,6 +1008,41 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         #expect(p == FabricPush.Pointer(kind: "fabric_attention", session: FleetSessionKey(runtimeID: "r1", id: "s1"), itemID: "a1", attentionKind: .approval))
         #expect(FabricPush.pointer(from: ["kind": "fabric_order", "order_id": "o1", "runtime_id": "r1", "session_id": "s1"])?.itemID == "o1")
         #expect(FabricPush.pointer(from: ["kind": "share_comment"]) == nil)
+    }
+
+    /// Review 2026-11-22 #4: Talk, the audit trail and the settings answer
+    /// after a sign-out or a server switch (`reset`): the previous
+    /// account's, dropped; asked again, they land.
+    @Test func answersForThePreviousAccountAreDropped() async throws {
+        let fake = FakeFabric(Self.fleet())
+        let ref = FabricSessionRef(runtimeID: "r1", sessionID: "a", address: "a/x")
+        let key = FleetSessionKey(runtimeID: "r1", id: "s1")
+        fake.state.withLock {
+            $0.conversations = [FabricConversation(id: "c1", a: ref, b: ref)]
+            $0.orders = [FabricOrderView(id: "o1", runtimeID: "r1", sessionID: "s1", deviceID: "", verb: "send", state: .pending)]
+            $0.held = true
+        }
+        let s = store(fake)
+        let reads = [
+            Task { await s.talk.load() },
+            Task { await s.talk.open("c2") },
+            Task { await s.command.loadOrders(for: key) },
+            Task { await s.config.load() },
+        ]
+        try await Task.sleep(for: .milliseconds(100))
+        s.reset() // sign-out, or a server switch
+        fake.state.withLock { $0.held = false }
+        for r in reads { await r.value }
+        #expect(s.talk.conversations.isEmpty && s.talk.messages.isEmpty && !s.talk.loaded)
+        #expect(s.command.orders(for: key).isEmpty)
+        #expect(s.config.projects.isEmpty && s.config.loadError == nil)
+        // the new account's answers
+        await s.talk.load()
+        await s.command.loadOrders(for: key)
+        await s.config.load()
+        #expect(s.talk.conversations.map(\.id) == ["c1"] && s.talk.loaded)
+        #expect(s.command.orders(for: key).map(\.id) == ["o1"])
+        #expect(s.config.projects.map(\.name) == ["taisce"])
     }
 
     @Test func aNotificationActionVerifiesBeforeItAnswers() async throws {

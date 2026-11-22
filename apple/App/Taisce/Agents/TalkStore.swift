@@ -33,20 +33,30 @@ final class TalkStore {
     /// The count Talk's entry carries.
     var waiting: Int { items.count }
 
+    /// The fleet's generation when a request went out: an answer that
+    /// lands after a sign-out or a server switch (`FleetStore.reset`) is
+    /// the previous account's, and is dropped.
+    private var generation: Int? { fleet?.generationNow }
+
     func load() async {
         guard let service else { return }
+        let asked = generation
         do {
-            conversations = try await service.conversations()
+            let list = try await service.conversations()
+            guard generation == asked else { return }
+            conversations = list
             loaded = true
             loadError = nil
         } catch {
+            guard generation == asked else { return }
             if !loaded { loadError = FleetStore.describe(error) }
         }
     }
 
     func open(_ id: String) async {
         guard let service else { return }
-        if let page = try? await service.conversation(id, limit: 100) {
+        let asked = generation
+        if let page = try? await service.conversation(id, limit: 100), generation == asked {
             messages[id] = page.messages
             upsert(page.conversation)
         }

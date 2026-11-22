@@ -124,7 +124,9 @@ final class CommandCenter {
 
     /// The audit trail of one session (its queued prompts' text among it).
     func loadOrders(for key: FleetSessionKey) async {
-        guard let service, let list = try? await service.orders(session: key, limit: 50) else { return }
+        // an answer after a sign-out or server switch is the last account's
+        let asked = fleet?.generationNow
+        guard let service, let list = try? await service.orders(session: key, limit: 50), fleet?.generationNow == asked else { return }
         for o in list { orders[o.id] = o }
     }
 
