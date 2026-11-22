@@ -473,22 +473,47 @@ export default function DocView({
   const phone = useMedia('(max-width: 760px)')
 
   // anchor the comment bubble just above the selected text
-  const onSelectionBlock = useCallback((blockId: string | null) => {
-    setSelBlock(blockId)
-    if (!blockId) {
+  const placeBubble = useCallback(() => {
+    const sel = window.getSelection()
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
       setSelRect(null)
       return
     }
-    requestAnimationFrame(() => {
-      const sel = window.getSelection()
-      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+    const r = sel.getRangeAt(0).getBoundingClientRect()
+    setSelRect({ x: r.left + r.width / 2, y: r.top })
+  }, [])
+  const onSelectionBlock = useCallback(
+    (blockId: string | null) => {
+      setSelBlock(blockId)
+      if (!blockId) {
         setSelRect(null)
         return
       }
-      const r = sel.getRangeAt(0).getBoundingClientRect()
-      setSelRect({ x: r.left + r.width / 2, y: r.top })
-    })
-  }, [])
+      requestAnimationFrame(placeBubble)
+    },
+    [placeBubble],
+  )
+  // the bubble is fixed to the viewport: follow the selection as anything
+  // scrolls (the page or an inner pane, hence capture) or the window resizes
+  const bubbleShown = !!selBlock && selRect != null
+  useEffect(() => {
+    if (!bubbleShown) return
+    let frame = 0
+    const follow = () => {
+      if (frame) return
+      frame = requestAnimationFrame(() => {
+        frame = 0
+        placeBubble()
+      })
+    }
+    window.addEventListener('scroll', follow, { capture: true, passive: true })
+    window.addEventListener('resize', follow)
+    return () => {
+      window.removeEventListener('scroll', follow, { capture: true })
+      window.removeEventListener('resize', follow)
+      if (frame) cancelAnimationFrame(frame)
+    }
+  }, [bubbleShown, placeBubble])
 
   /** A fetched tree, against what the editor shows (reloadVerdict): remount
    * the editor with it (unless the editor already shows exactly its blocks),
