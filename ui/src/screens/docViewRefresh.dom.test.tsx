@@ -165,3 +165,53 @@ describe('another doc in the same DocView', () => {
     await v.unmount()
   })
 })
+
+describe('the cursor across a remount', () => {
+  const textOf = (ed: Editor, id: string) => {
+    let t = ''
+    ed.state.doc.forEach((n) => {
+      if (n.attrs.blockId === id) t = n.textContent
+    })
+    return t
+  }
+  it('stays in its block when an agent lengthened and added blocks ABOVE it', async () => {
+    const server = fakeServer(makeTree(5, [['a', 'alpha'], ['b', 'beta'], ['c', 'gamma']]))
+    const v = await mountDocView()
+    await advance(10)
+    // the cursor after "ga" in gamma
+    await act(async () => {
+      const ed = v.editor()!
+      let at = -1
+      ed.state.doc.forEach((n, p) => {
+        if (n.attrs.blockId === 'c') at = p + 1 + 2
+      })
+      ed.commands.setTextSelection(at)
+    })
+    server.tree = makeTree(6, [['a', 'alpha, now a much longer paragraph'], ['n', 'a whole new block'], ['b', 'beta'], ['c', 'gamma']])
+    await v.render(1)
+    await advance(50)
+    expect(v.text()).toContain('a whole new block')
+    const ed = v.editor()!
+    await act(async () => {
+      ed.commands.insertContent('X')
+    })
+    expect(textOf(ed, 'c')).toBe('gaXmma')
+    expect(textOf(ed, 'a')).toBe('alpha, now a much longer paragraph')
+    await v.unmount()
+  })
+
+  it('is not restored when its block is gone', async () => {
+    const server = fakeServer(makeTree(5, [['a', 'alpha'], ['b', 'beta']]))
+    const v = await mountDocView()
+    await advance(10)
+    await act(async () => {
+      v.editor()!.commands.setTextSelection(1 + 'alpha'.length + 2 + 2)
+    })
+    server.tree = makeTree(6, [['a', 'alpha']])
+    await v.render(1)
+    await advance(50)
+    expect(v.text()).not.toContain('beta')
+    expect(v.editor()!.state.selection.anchor).toBe(1)
+    await v.unmount()
+  })
+})

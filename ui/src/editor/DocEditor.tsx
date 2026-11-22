@@ -95,9 +95,45 @@ export interface EditableDoc {
   hidden?: HiddenBlock[]
 }
 
-/** Where the cursor was when an editor unmounted, per doc: a remount of the
- * same doc (fresh content from the server) puts it back. */
-const selectionMemo = new Map<string, { anchor: number; head: number; focused: boolean }>()
+/** A place in the doc by block, not by absolute position: the `nth` node
+ * carrying `id` (a block can span nodes) and the offset inside it. Fresh
+ * content from the server moves absolute positions (an agent lengthened a
+ * block above), never this. */
+export interface BlockLoc {
+  id: string
+  nth: number
+  offset: number
+}
+
+/** Where `pos` is, by block; null between top-level nodes or in a node
+ * without an id. */
+export function locate(doc: PMNode, pos: number): BlockLoc | null {
+  if (pos < 0 || pos > doc.content.size) return null
+  const $pos = doc.resolve(pos)
+  if ($pos.depth < 1) return null
+  const id = $pos.node(1).attrs.blockId as string | null
+  if (!id) return null
+  const index = $pos.index(0)
+  let nth = 0
+  for (let i = 0; i < index; i++) if (doc.child(i).attrs.blockId === id) nth++
+  return { id, nth, offset: pos - $pos.before(1) }
+}
+
+/** The position `loc` names in `doc` (its offset clamped into the node), or
+ * null when that block is gone. */
+export function resolveLoc(doc: PMNode, loc: BlockLoc): number | null {
+  let seen = 0
+  let out: number | null = null
+  doc.forEach((node, start) => {
+    if (out != null || node.attrs.blockId !== loc.id) return
+    if (seen++ === loc.nth) out = Math.max(start + 1, Math.min(start + loc.offset, start + node.nodeSize - 1))
+  })
+  return out
+}
+
+/** Where the cursor was when an editor unmounted, per doc, by block: a
+ * remount of the same doc (fresh content from the server) puts it back. */
+const selectionMemo = new Map<string, { anchor: BlockLoc | null; head: BlockLoc | null; focused: boolean }>()
 
 /** True when a save's answer is the very next epoch after its base: nobody
  * else wrote in between, so the editor shows everything the doc holds. A
@@ -230,11 +266,14 @@ export default function DocEditor({
     if (!editor || editor.isDestroyed || !restoreSelection) return
     const m = selectionMemo.get(doc.docId)
     selectionMemo.delete(doc.docId)
-    if (!m) return
-    const size = editor.state.doc.content.size
-    const clamp = (n: number) => Math.max(0, Math.min(n, size))
+    if (!m?.head) return
+    // the block the cursor was in, wherever it is now; gone → no restore
+    // (and no focus): the next keystrokes must never land in another block
+    const head = resolveLoc(editor.state.doc, m.head)
+    if (head == null) return
+    const anchor = (m.anchor && resolveLoc(editor.state.doc, m.anchor)) ?? head
     try {
-      editor.commands.setTextSelection({ from: clamp(m.anchor), to: clamp(m.head) })
+      editor.commands.setTextSelection({ from: anchor, to: head })
       if (m.focused) editor.commands.focus(undefined, { scrollIntoView: false })
     } catch {
       // a position the new doc cannot hold: leave the cursor at the start
@@ -439,7 +478,8 @@ export default function DocEditor({
         const ed = editorRef.current
         if (ed) {
           const sel = ed.state.selection
-          selectionMemo.set(docIdRef.current, { anchor: sel.anchor, head: sel.head, focused: ed.isFocused })
+          const d = ed.state.doc
+          selectionMemo.set(docIdRef.current, { anchor: locate(d, sel.anchor), head: locate(d, sel.head), focused: ed.isFocused })
         }
       } catch {
         // the editor is already gone: nothing to remember
