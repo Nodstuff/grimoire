@@ -9,6 +9,16 @@ public protocol FabricService: FleetService {
     /// newest first: `FabricTurnPage.isAfterPage` tells them apart.
     func turns(_ session: FleetSessionKey, after: Int, limit: Int) async throws -> FabricTurnPage
     func turns(since: Int, limit: Int) async throws -> [FabricTurn]
+    /// Strictly older than the turn `beforeID`, which ended at `before`,
+    /// newest first (`before=` + `before_id=`: no turn ending in the same
+    /// second is skipped or repeated). A server without `before_id` gets
+    /// today's `before=` a second later (the caller keeps each turn once).
+    func turns(_ session: FleetSessionKey, before: Int, beforeID: String, limit: Int) async throws -> FabricTurnPage
+    /// The turns stored after `afterSeq` in the order the server stored
+    /// them (`after_seq=`, late replays included), with `more`. Nil from a
+    /// server that does not page by `seq` (it refuses the parameter, or
+    /// ignores it and answers turns without `seq`): ask by time instead.
+    func turns(_ session: FleetSessionKey, afterSeq: Int, limit: Int) async throws -> FabricTurnPage?
     func attention() async throws -> [FabricAttentionItem]
     func orders(session: FleetSessionKey?, limit: Int) async throws -> [FabricOrderView]
     func order(_ id: String) async throws -> FabricOrderView
@@ -28,6 +38,16 @@ public protocol FabricService: FleetService {
     func stopConversation(_ id: String) async throws
 }
 
+extension FabricService {
+    /// A service without tie-safe paging: the old `before=`, a second on.
+    public func turns(_ session: FleetSessionKey, before: Int, beforeID: String, limit: Int) async throws -> FabricTurnPage {
+        try await turns(session, before: before + 1, limit: limit)
+    }
+
+    /// A service without `seq`: never pages by it.
+    public func turns(_ session: FleetSessionKey, afterSeq: Int, limit: Int) async throws -> FabricTurnPage? { nil }
+}
+
 extension APIClient: FabricService {
     public func turns(_ session: FleetSessionKey, before: Int?, limit: Int = 30) async throws -> FabricTurnPage {
         var q = [URLQueryItem(name: "limit", value: String(limit))]
@@ -38,6 +58,39 @@ extension APIClient: FabricService {
     public func turns(_ session: FleetSessionKey, after: Int, limit: Int = 30) async throws -> FabricTurnPage {
         let q = [URLQueryItem(name: "after", value: String(after)), URLQueryItem(name: "limit", value: String(limit))]
         return try await fabric("/api/fabric/sessions/\(session.runtimeID)/\(session.id)/turns", query: q)
+    }
+
+    public func turns(_ session: FleetSessionKey, before: Int, beforeID: String, limit: Int = 30) async throws -> FabricTurnPage {
+        let q = [URLQueryItem(name: "before", value: String(before)), URLQueryItem(name: "before_id", value: beforeID),
+                 URLQueryItem(name: "limit", value: String(limit))]
+        do {
+            return try await fabric("/api/fabric/sessions/\(session.runtimeID)/\(session.id)/turns", query: q)
+        } catch let e where Self.refusesParameter(e) {
+            // a server that refuses before_id: today's request
+            return try await turns(session, before: before + 1, limit: limit)
+        }
+    }
+
+    public func turns(_ session: FleetSessionKey, afterSeq: Int, limit: Int = 100) async throws -> FabricTurnPage? {
+        let q = [URLQueryItem(name: "after_seq", value: String(afterSeq)), URLQueryItem(name: "limit", value: String(limit))]
+        let page: FabricTurnPage
+        do {
+            page = try await fabric("/api/fabric/sessions/\(session.runtimeID)/\(session.id)/turns", query: q)
+        } catch let e where Self.refusesParameter(e) {
+            return nil
+        }
+        // a server that ignored it answers its newest page, turns without seq
+        return page.isSeqPage(afterSeq: afterSeq) ? page : nil
+    }
+
+    /// A 400 (or the daemon's `{"error": …}` for a query it cannot read):
+    /// this server does not take the parameter.
+    static func refusesParameter(_ e: any Error) -> Bool {
+        if let f = e as? FabricError { return f.status == 400 }
+        switch e as? APIError {
+        case .http(status: 400)?, .server?: return true
+        default: return false
+        }
     }
 
     public func turns(since: Int, limit: Int = 200) async throws -> [FabricTurn] {

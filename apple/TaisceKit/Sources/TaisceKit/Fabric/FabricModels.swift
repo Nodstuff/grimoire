@@ -173,13 +173,17 @@ public struct FabricTurn: Sendable, Hashable, Codable, Identifiable {
     public var source: PromptSource
     public var orderID: String?
     public var textOff: Bool
+    /// the server's store order for the session's turns (`after_seq=`
+    /// pages by it; a late replay of an old turn gets a new one). Nil from
+    /// a server before tie-safe paging, which never sends it.
+    public var seq: Int?
 
     public var id: String { turnID }
     public var session: FleetSessionKey { FleetSessionKey(runtimeID: runtimeID, id: sessionID) }
 
     public init(runtimeID: String, sessionID: String, address: String, turnID: String, prompt: String, reply: String, toolCount: Int = 0,
                 outcome: GitOutcome = GitOutcome(), started: Int, ended: Int, truncated: Bool = false, contextUsedPct: Int? = nil,
-                end: TurnEnd = .clean, source: PromptSource = .mac, orderID: String? = nil, textOff: Bool = false) {
+                end: TurnEnd = .clean, source: PromptSource = .mac, orderID: String? = nil, textOff: Bool = false, seq: Int? = nil) {
         self.runtimeID = runtimeID
         self.sessionID = sessionID
         self.address = address
@@ -196,6 +200,7 @@ public struct FabricTurn: Sendable, Hashable, Codable, Identifiable {
         self.source = source
         self.orderID = orderID
         self.textOff = textOff
+        self.seq = seq
     }
 
     enum CodingKeys: String, CodingKey {
@@ -210,6 +215,7 @@ public struct FabricTurn: Sendable, Hashable, Codable, Identifiable {
         case end, source
         case orderID = "order_id"
         case textOff = "text_off"
+        case seq
     }
 
     public init(from decoder: any Decoder) throws {
@@ -230,6 +236,7 @@ public struct FabricTurn: Sendable, Hashable, Codable, Identifiable {
         source = try c.value(.source, .unknown)
         orderID = try c.decodeIfPresent(String.self, forKey: .orderID).flatMap { $0.isEmpty ? nil : $0 }
         textOff = try c.value(.textOff, false)
+        seq = try? c.decodeIfPresent(Int.self, forKey: .seq)
     }
 }
 
@@ -250,6 +257,18 @@ public struct FabricTurnPage: Sendable, Hashable, Codable {
     public func isAfterPage(after: Int) -> Bool {
         turns.allSatisfy { $0.ended > after } && zip(turns, turns.dropFirst()).allSatisfy { $0.ended <= $1.ended }
     }
+
+    /// Whether this answers `after_seq=`: every turn numbered, after it, in
+    /// store order. A server that ignored the parameter answers its newest
+    /// page, whose turns carry no `seq`.
+    public func isSeqPage(afterSeq: Int) -> Bool {
+        let seqs = turns.map(\.seq)
+        guard seqs.allSatisfy({ ($0 ?? .min) > afterSeq }) else { return false }
+        return zip(seqs, seqs.dropFirst()).allSatisfy { ($0 ?? 0) < ($1 ?? 0) }
+    }
+
+    /// The highest `seq` in the page (nil: none numbered).
+    public var topSeq: Int? { turns.compactMap(\.seq).max() }
 }
 
 // MARK: attention

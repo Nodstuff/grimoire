@@ -211,6 +211,13 @@ enum QuickReplies {
 /// server (`before=`) only when nothing older is held. Rows are built (their
 /// Markdown parsed) only for the turns drawn. Turns never change once ended,
 /// so what is cached stays true; whatever this feed reads is cached too.
+///
+/// Tie-safe paging: a server that numbers its turns (`seq`) is topped up
+/// with `after_seq=` from the highest `seq` a route read delivered (late
+/// replays included), and Earlier turns asks `before=` + `before_id=` (no
+/// same-second turn skipped or repeated). A server without `seq` (the
+/// production one until it is upgraded, or one rolled back) is paged as
+/// before: `after=` from the time watermark, `before=` a second on.
 @MainActor @Observable
 final class SessionFeed {
     /// turns drawn when a session opens, and shown more per "Earlier turns"
@@ -245,6 +252,10 @@ final class SessionFeed {
     private(set) var fromCache = false
     /// the newest end up to which `turns` is every turn the server has
     private(set) var synced: Int?
+    /// the highest `seq` a route read delivered (nil: none, or a server without `seq`)
+    private(set) var syncedSeq: Int?
+    /// the last route read carried `seq`: this server pages tie-safe
+    @ObservationIgnored private var seqPaging = false
     /// the oldest turn drawn (nil: all of them, while they fit the window)
     private(set) var floor: String?
     /// the first drawn turn the person has not seen (where "N new" sits), and how many are new
@@ -291,6 +302,7 @@ final class SessionFeed {
                 for r in rows { built[r.id] = r }
                 more = held.older
                 synced = held.synced
+                syncedSeq = held.syncedSeq
                 cachedOldest = held.turns.first?.ended
                 fromCache = true
                 // with whatever the stream brought meanwhile
@@ -307,7 +319,9 @@ final class SessionFeed {
         loading = true
         defer { loading = false }
         do {
-            if let from = synced ?? cachedOldest {
+            if let seq = syncedSeq, try await topUpBySeq(service, cache: cache, from: seq) {
+                // done by store order
+            } else if let from = synced ?? cachedOldest {
                 try await topUp(service, cache: cache, from: from)
             } else {
                 let page = try await service.turns(key, before: nil, limit: 30)
@@ -315,7 +329,8 @@ final class SessionFeed {
                 more = page.more
                 let top = page.turns.map(\.ended).max()
                 if let top { synced = max(synced ?? top, top) }
-                if stillCurrent() { try? await cache?.cacheFabricTurns(page.turns, olderBeyond: page.more, syncedThrough: top) }
+                let seqTop = noteSeq(page)
+                if stillCurrent() { try? await cache?.cacheFabricTurns(page.turns, olderBeyond: page.more, syncedThrough: top, syncedSeqThrough: seqTop) }
             }
             loadError = nil
         } catch is CancellationError {
@@ -360,12 +375,51 @@ final class SessionFeed {
             }
             merge(page.turns)
             if let top { synced = max(synced ?? top, top) }
-            if stillCurrent() { try? await cache?.cacheFabricTurns(page.turns, syncedThrough: top) }
+            let seqTop = noteSeq(page)
+            if stillCurrent() { try? await cache?.cacheFabricTurns(page.turns, syncedThrough: top, syncedSeqThrough: seqTop) }
             guard page.more, let last = page.turns.last?.ended else { return }
             // never ask the same page twice (more than a page ending in one second)
             after = max(last - 1, after + 1)
             limit = 100
         }
+    }
+
+    /// A route read's `seq`s: whether this server numbers its turns, and
+    /// the store-order watermark moved forward. Nil when none is numbered.
+    private func noteSeq(_ page: FabricTurnPage) -> Int? {
+        if !page.turns.isEmpty { seqPaging = page.turns.allSatisfy { $0.seq != nil } }
+        guard seqPaging, let top = page.topSeq else { return nil }
+        syncedSeq = max(syncedSeq ?? top, top)
+        return top
+    }
+
+    /// The turns stored after `from` (`after_seq=`), in store order, page
+    /// by page: a turn the stream missed and a late replay of an old one
+    /// both arrive. False when the server does not page by `seq`: the
+    /// caller asks by time. Once it has every stored turn, what is held is
+    /// gap-free up to the newest end held, so the time watermark moves too.
+    private func topUpBySeq(_ service: any FabricService, cache: Cache?, from: Int) async throws -> Bool {
+        var after = from
+        for round in 0..<50 {
+            guard let page = try await service.turns(key, afterSeq: after, limit: 100) else {
+                // not (or no longer) paged by seq: by time from now on in this feed
+                if round == 0 { seqPaging = false; syncedSeq = nil }
+                return round > 0
+            }
+            seqPaging = true
+            merge(page.turns)
+            let seqTop = page.topSeq
+            if let seqTop { syncedSeq = max(syncedSeq ?? seqTop, seqTop) }
+            var timeTop: Int?
+            if !page.more, let newest = turns.map(\.ended).max() {
+                timeTop = newest
+                synced = max(synced ?? newest, newest)
+            }
+            if stillCurrent() { try? await cache?.cacheFabricTurns(page.turns, syncedThrough: timeTop, syncedSeqThrough: seqTop) }
+            guard page.more, let seqTop, seqTop > after else { return true }
+            after = seqTop
+        }
+        return true
     }
 
     /// There is something older to show: held in memory, or on the server.
@@ -390,7 +444,13 @@ final class SessionFeed {
         loadingOlder = true
         defer { loadingOlder = false }
         do {
-            var page = try await service.turns(key, before: oldest.ended + 1, limit: 30)
+            var page: FabricTurnPage
+            if seqPaging, oldest.seq != nil {
+                // strictly older than that exact turn: nothing in its second skipped or repeated
+                page = try await service.turns(key, before: oldest.ended, beforeID: oldest.turnID, limit: 30)
+            } else {
+                page = try await service.turns(key, before: oldest.ended + 1, limit: 30)
+            }
             let held = Set(turns.map(\.turnID))
             if page.more, page.turns.allSatisfy({ held.contains($0.turnID) }) {
                 // a whole page ended in that one second: step past it

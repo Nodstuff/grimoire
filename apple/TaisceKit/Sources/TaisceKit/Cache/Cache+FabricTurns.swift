@@ -23,6 +23,13 @@ import GRDB
 /// left is fetched and filled, and the stream's turns above it are merged
 /// by id. A session cached before the watermark existed has none: the
 /// top-up starts from its oldest held turn, once.
+///
+/// A server with tie-safe paging also numbers each session's turns in the
+/// order it stored them (`seq`; a late replay of an old turn gets a new
+/// one). Beside `synced` each session then keeps `syncedSeq`, the highest
+/// `seq` a route read has delivered, moved by the same reads and never by
+/// a stream turn: a top-up asks `after_seq=` from it, which catches late
+/// replays the time watermark cannot. A server without `seq` leaves it nil.
 extension Cache {
     /// how many of a session's newest turns are kept
     public static let fabricTurnsKept = 100
@@ -35,6 +42,9 @@ extension Cache {
         /// what is held is every turn the server has up to this `ended`
         /// (nil: not known; a top-up starts from the oldest held)
         public var synced: Int?
+        /// the highest `seq` a route read delivered (nil: none, or a server
+        /// without `seq`; a top-up then asks by time)
+        public var syncedSeq: Int? = nil
     }
 
     static func registerFabricTurns(_ m: inout DatabaseMigrator) {
@@ -64,6 +74,11 @@ extension Cache {
             // what v5 wrote, which may hold a hole the stream left
             try db.alter(table: "fabric_turn_sessions") { t in t.add(column: "synced", .integer) }
         }
+        m.registerMigration("v7-fabric-synced-seq") { db in
+            // the store-order watermark (see the type's comment); NULL until
+            // a server that numbers its turns answers a route read
+            try db.alter(table: "fabric_turn_sessions") { t in t.add(column: "synced_seq", .integer) }
+        }
     }
 
     /// What is held for one session.
@@ -74,11 +89,12 @@ extension Cache {
                 """, arguments: [key.runtimeID, key.id])
             let decoder = JSONDecoder()
             let turns = bodies.compactMap { try? decoder.decode(FabricTurn.self, from: $0) }
-            let row = try Row.fetchOne(db, sql: "SELECT older, synced FROM fabric_turn_sessions WHERE runtime_id = ? AND session_id = ?",
+            let row = try Row.fetchOne(db, sql: "SELECT older, synced, synced_seq FROM fabric_turn_sessions WHERE runtime_id = ? AND session_id = ?",
                                        arguments: [key.runtimeID, key.id])
             let older: Bool = row?["older"] ?? true
             let synced: Int? = row?["synced"]
-            return CachedTurns(turns: turns, older: older, synced: turns.isEmpty ? nil : synced)
+            let syncedSeq: Int? = row?["synced_seq"]
+            return CachedTurns(turns: turns, older: older, synced: turns.isEmpty ? nil : synced, syncedSeq: turns.isEmpty ? nil : syncedSeq)
         }
     }
 
@@ -87,9 +103,10 @@ extension Cache {
     /// read newest-first (`before=`), recorded when that page reaches as far
     /// back as anything held. `syncedThrough`: these came from a route read
     /// that leaves what is held gap-free up to this `ended` (the watermark
-    /// only moves forward; the stream's turns never pass one). A session
+    /// only moves forward; the stream's turns never pass one).
+    /// `syncedSeqThrough`: the same for the store order (`seq`). A session
     /// past `keep` turns loses its oldest.
-    public func cacheFabricTurns(_ turns: [FabricTurn], olderBeyond: Bool? = nil, syncedThrough: Int? = nil,
+    public func cacheFabricTurns(_ turns: [FabricTurn], olderBeyond: Bool? = nil, syncedThrough: Int? = nil, syncedSeqThrough: Int? = nil,
                                  keep: Int = Cache.fabricTurnsKept) async throws {
         guard !turns.isEmpty else { return }
         let encoder = JSONEncoder()
@@ -114,6 +131,7 @@ extension Cache {
                     try Self.setOlder(db, key, olderBeyond)
                 }
                 if let syncedThrough { try Self.setSynced(db, key, syncedThrough) }
+                if let syncedSeqThrough { try Self.setSyncedSeq(db, key, syncedSeqThrough) }
                 try Self.trim(db, key, keep: keep)
             }
         }
@@ -121,12 +139,12 @@ extension Cache {
 
     /// Hold exactly these for one session (an old server's newest page that
     /// does not reach back to what was held: what lies between is unknown).
-    public func replaceFabricTurns(_ key: FleetSessionKey, with turns: [FabricTurn], older: Bool, syncedThrough: Int? = nil) async throws {
+    public func replaceFabricTurns(_ key: FleetSessionKey, with turns: [FabricTurn], older: Bool, syncedThrough: Int? = nil, syncedSeqThrough: Int? = nil) async throws {
         try await db.write { db in
             try db.execute(sql: "DELETE FROM fabric_turns WHERE runtime_id = ? AND session_id = ?", arguments: [key.runtimeID, key.id])
             try db.execute(sql: "DELETE FROM fabric_turn_sessions WHERE runtime_id = ? AND session_id = ?", arguments: [key.runtimeID, key.id])
         }
-        try await cacheFabricTurns(turns.filter { $0.session == key }, olderBeyond: older, syncedThrough: syncedThrough)
+        try await cacheFabricTurns(turns.filter { $0.session == key }, olderBeyond: older, syncedThrough: syncedThrough, syncedSeqThrough: syncedSeqThrough)
     }
 
     /// Forget these sessions' turns (exited, or gone from the fleet).
@@ -195,6 +213,14 @@ extension Cache {
         try db.execute(sql: """
             INSERT INTO fabric_turn_sessions(runtime_id, session_id, older, synced) VALUES (?, ?, 1, ?)
             ON CONFLICT(runtime_id, session_id) DO UPDATE SET synced = MAX(COALESCE(synced, excluded.synced), excluded.synced)
+            """, arguments: [k.runtimeID, k.id, through])
+    }
+
+    /// Move the store-order watermark forward (never back).
+    private static func setSyncedSeq(_ db: Database, _ k: FleetSessionKey, _ through: Int) throws {
+        try db.execute(sql: """
+            INSERT INTO fabric_turn_sessions(runtime_id, session_id, older, synced_seq) VALUES (?, ?, 1, ?)
+            ON CONFLICT(runtime_id, session_id) DO UPDATE SET synced_seq = MAX(COALESCE(synced_seq, excluded.synced_seq), excluded.synced_seq)
             """, arguments: [k.runtimeID, k.id, through])
     }
 

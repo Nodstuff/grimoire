@@ -25,6 +25,9 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         var orders: [FabricOrderView] = []
         /// answers to the reads below wait while this is set
         var held = false
+        /// a server with tie-safe paging (`after_seq`, `before_id`); off:
+        /// today's production server, which has neither
+        var seqServer = false
     }
 
     let state: Mutex<State>
@@ -48,7 +51,7 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
     func turns(_ session: FleetSessionKey, before: Int?, limit: Int) async throws -> FabricTurnPage {
         log("turns \(before.map(String.init) ?? "-")")
         if state.withLock({ $0.turnsFail }) { throw APIError.http(status: 503) }
-        let all = state.withLock { $0.turns }.filter { before == nil || $0.ended < before! }.sorted { $0.ended > $1.ended }
+        let all = state.withLock { $0.turns }.filter { before == nil || $0.ended < before! }.sorted { ($0.ended, $0.seq ?? 0) > ($1.ended, $1.seq ?? 0) }
         return FabricTurnPage(turns: Array(all.prefix(limit)), more: all.count > limit)
     }
     func turns(_ session: FleetSessionKey, after: Int, limit: Int) async throws -> FabricTurnPage {
@@ -59,6 +62,22 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         return FabricTurnPage(turns: Array(all.prefix(limit)), more: all.count > limit)
     }
     func turns(since: Int, limit: Int) async throws -> [FabricTurn] { [] }
+    func turns(_ session: FleetSessionKey, afterSeq: Int, limit: Int) async throws -> FabricTurnPage? {
+        guard state.withLock({ $0.seqServer }) else { return nil }
+        log("turns after_seq \(afterSeq)")
+        if state.withLock({ $0.turnsFail }) { throw APIError.http(status: 503) }
+        let all = state.withLock { $0.turns }.filter { ($0.seq ?? 0) > afterSeq }.sorted { ($0.seq ?? 0) < ($1.seq ?? 0) }
+        return FabricTurnPage(turns: Array(all.prefix(limit)), more: all.count > limit)
+    }
+    func turns(_ session: FleetSessionKey, before: Int, beforeID: String, limit: Int) async throws -> FabricTurnPage {
+        guard state.withLock({ $0.seqServer }) else { return try await turns(session, before: before + 1, limit: limit) }
+        log("turns before \(before) id \(beforeID)")
+        let all = state.withLock { $0.turns }
+        // strictly older than that exact turn, newest first (ended, then store order)
+        let cursor = all.first { $0.turnID == beforeID }.map { ($0.ended, $0.seq ?? 0) } ?? (before, Int.min)
+        let older = all.filter { ($0.ended, $0.seq ?? 0) < cursor }.sorted { ($0.ended, $0.seq ?? 0) > ($1.ended, $1.seq ?? 0) }
+        return FabricTurnPage(turns: Array(older.prefix(limit)), more: older.count > limit)
+    }
     func attention() async throws -> [FabricAttentionItem] { log("attention"); await waitHeld(); return state.withLock { $0.attention } }
     func orders(session: FleetSessionKey?, limit: Int) async throws -> [FabricOrderView] { log("orders"); await waitHeld(); return state.withLock { $0.orders } }
     func order(_ id: String) async throws -> FabricOrderView { throw APIError.notFound("") }
@@ -535,6 +554,84 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         #expect(held.turns.map(\.turnID) == (31...60).map { "t\($0)" } && held.older)
         await earliest(later, fake, cache)
         #expect(later.turns.count == 60 && later.turns.first?.turnID == "t1")
+    }
+
+    // MARK: tie-safe paging (review 2026-11-22 #14)
+
+    private static func numbered(_ id: String, _ ended: Int, seq: Int) -> FabricTurn {
+        var t = turn(id, ended)
+        t.seq = seq
+        return t
+    }
+
+    /// A new server: once a route read carried `seq`, the top-up asks
+    /// `after_seq` from the highest held, and a late replay of an old turn
+    /// (an old `ended`, a new `seq`) arrives; the time watermark's `after=`
+    /// would have missed it.
+    @Test func aNewServersTopUpAsksAfterSeqAndCatchesALateReplay() async throws {
+        let key = FleetSessionKey(runtimeID: "r1", id: "s1")
+        let cache = try Cache.inMemory()
+        let fake = FakeFabric(Self.fleet())
+        fake.state.withLock { $0.seqServer = true; $0.turns = (1...30).map { Self.numbered("t\($0)", $0 * 10, seq: $0) } }
+        let first = SessionFeed(key: key)
+        await first.load(fake, cache: cache)
+        #expect(fake.calls == ["turns -"], "the newest page first")
+        #expect(first.syncedSeq == 30)
+        #expect(try await cache.fabricTurns(key).syncedSeq == 30)
+        // one new turn, and a replay of one that ended long ago, stored after it
+        fake.state.withLock {
+            $0.turns.append(Self.numbered("t31", 310, seq: 31))
+            $0.turns.append(Self.numbered("replayed", 15, seq: 32))
+            $0.calls = []
+        }
+        let second = SessionFeed(key: key)
+        await second.load(fake, cache: cache)
+        #expect(fake.calls == ["turns after_seq 30"], "\(fake.calls)")
+        #expect(second.turns.contains { $0.turnID == "replayed" } && second.turns.last?.turnID == "t31")
+        #expect(Array(second.turns.map(\.turnID).prefix(3)) == ["t1", "replayed", "t2"], "kept in time order")
+        let held = try await cache.fabricTurns(key)
+        #expect(held.syncedSeq == 32 && held.synced == 310)
+        // nothing new: one request, nothing changes
+        fake.state.withLock { $0.calls = [] }
+        await second.refresh(fake, cache: cache)
+        #expect(fake.calls == ["turns after_seq 32"] && second.turns.count == 32)
+    }
+
+    /// A new server: Earlier turns asks before + before_id, so a run of
+    /// turns that ended in the same second across a page edge is neither
+    /// skipped nor repeated, in one request per page.
+    @Test func aNewServersEarlierTurnsAreTieSafe() async throws {
+        let key = FleetSessionKey(runtimeID: "r1", id: "s1")
+        let fake = FakeFabric(Self.fleet())
+        // 60 turns; t1...t40 all ended in the same second
+        fake.state.withLock { $0.seqServer = true; $0.turns = (1...60).map { Self.numbered("t\($0)", $0 <= 40 ? 100 : 100 + $0, seq: $0) } }
+        let feed = SessionFeed(key: key)
+        await feed.load(fake)
+        #expect(feed.turns.count == 30 && feed.more)
+        for _ in 0..<10 where feed.hasEarlier { await feed.showEarlier(fake) }
+        #expect(feed.turns.count == 60 && Set(feed.turns.map(\.turnID)).count == 60 && !feed.more)
+        let earlier = fake.calls.filter { $0.hasPrefix("turns before") }
+        #expect(earlier.count == 1 && earlier.first?.contains(" id ") == true, "\(fake.calls)")
+    }
+
+    /// A feed whose cache has a seq watermark against a server without
+    /// `seq` (rolled back, or today's production one): `after_seq` is not
+    /// taken, so it tops up by time as before, and Earlier turns uses the
+    /// old `before=` a second on.
+    @Test func anOldServerIsPagedAsBeforeEvenWithASeqWatermarkHeld() async throws {
+        let key = FleetSessionKey(runtimeID: "r1", id: "s1")
+        let cache = try Cache.inMemory()
+        try await cache.cacheFabricTurns((11...20).map { Self.numbered("t\($0)", $0 * 10, seq: $0) }, olderBeyond: true, syncedThrough: 200, syncedSeqThrough: 20)
+        let fake = FakeFabric(Self.fleet())
+        fake.state.withLock { $0.turns = (1...25).map { Self.turn("t\($0)", $0 * 10) } }
+        let feed = SessionFeed(key: key)
+        await feed.load(fake, cache: cache)
+        #expect(fake.calls == ["turns after 199"], "by time, as before: \(fake.calls)")
+        #expect(feed.turns.map(\.turnID) == (11...25).map { "t\($0)" } && feed.syncedSeq == nil)
+        fake.state.withLock { $0.calls = [] }
+        await feed.showEarlier(fake, cache: cache)
+        #expect(fake.calls == ["turns 111"], "today's before=oldest+1: \(fake.calls)")
+        #expect(feed.turns.count == 25)
     }
 
     @Test func theStreamsTurnsAreCachedAndTheCacheFollowsTheFleet() async throws {
