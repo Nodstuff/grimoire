@@ -73,6 +73,8 @@ final class FleetStore {
     /// bumped by `reset`: an answer that comes back for an earlier account
     /// or server is dropped
     @ObservationIgnored private var generation = 0
+    /// bumped by every change the stream makes to the open items
+    @ObservationIgnored private var attentionSerial = 0
 
     private var service: (any FleetService)? { serviceOverride ?? app?.api }
     /// the Slice 2–5 routes (a test's fake may have only the fleet's)
@@ -145,6 +147,8 @@ final class FleetStore {
     func take(_ signal: FleetSignal) {
         switch signal {
         case .change(let change, let rev):
+            // a whole fleet replaces the items, even at the same rev (a reconnect)
+            if case .fleet = change { attentionSerial += 1 }
             fleet.apply(change, rev: rev)
             if case .fleet = change {
                 availability = .available
@@ -192,8 +196,10 @@ final class FleetStore {
                 }
             }
         case .attention(let item):
+            attentionSerial += 1
             fleet.raise(item)
         case .attentionCleared(let cleared):
+            attentionSerial += 1
             fleet.clear(attention: cleared.id)
         case .order(let order):
             command.take(order)
@@ -245,8 +251,14 @@ final class FleetStore {
 
     /// The fleet's open items again (the stream's are the same; this is
     /// for a screen coming back after the app slept).
+    /// The stream outranks it: when the fleet moved while the request was
+    /// out (its `rev`, a whole fleet, an item raised or cleared), the answer
+    /// may be older than what is held and is dropped, or it would take away
+    /// an item the stream just raised. A sign-out (`reset`) drops it too.
     func refreshAttention() async {
-        guard let api = fabricService, let items = try? await api.attention() else { return }
+        guard let api = fabricService else { return }
+        let asked = (generation, fleet.rev, attentionSerial)
+        guard let items = try? await api.attention(), asked == (generation, fleet.rev, attentionSerial) else { return }
         fleet.attention = items
     }
 
@@ -302,7 +314,7 @@ final class FleetStore {
             let fresh = try await service.fleet()
             // signed out or another server meanwhile: not this account's answer
             guard asked == generation else { return }
-            fleet.refresh(with: fresh)
+            if fleet.refresh(with: fresh) { attentionSerial += 1 }
             availability = .available
             loadError = nil
             pruneTurnCache(.fleet(fleet))

@@ -1045,6 +1045,41 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         #expect(s.config.projects.map(\.name) == ["taisce"])
     }
 
+    /// Review 2026-11-22 #6: an item the stream raises while the
+    /// attention read is out stays; the read's older list is dropped. With
+    /// nothing moving meanwhile, the read's list is taken.
+    @Test func anAttentionReadNeverDropsWhatTheStreamJustRaised() async throws {
+        let raised = Self.approval()
+        let fake = FakeFabric(Self.fleet())
+        fake.state.withLock { $0.attention = []; $0.held = true }
+        let s = store(fake)
+        let read = Task { await s.refreshAttention() }
+        try await Task.sleep(for: .milliseconds(50))
+        s.take(.event(.attention(raised)))
+        fake.state.withLock { $0.held = false }
+        await read.value
+        #expect(s.fleet.attention.map(\.id) == ["a1"], "the stream's item stays")
+        // a session change moves the rev: same
+        fake.state.withLock { $0.held = true }
+        let again = Task { await s.refreshAttention() }
+        try await Task.sleep(for: .milliseconds(50))
+        s.take(.change(.session(Self.session("s1", "taisce/main", .working)), rev: 4))
+        fake.state.withLock { $0.held = false }
+        await again.value
+        #expect(s.fleet.attention.map(\.id) == ["a1"])
+        // nothing moved: the read wins (the item was settled elsewhere)
+        await s.refreshAttention()
+        #expect(s.fleet.attention.isEmpty)
+        // signed out meanwhile: dropped
+        fake.state.withLock { $0.attention = [raised]; $0.held = true }
+        let late = Task { await s.refreshAttention() }
+        try await Task.sleep(for: .milliseconds(50))
+        s.reset()
+        fake.state.withLock { $0.held = false }
+        await late.value
+        #expect(s.fleet.attention.isEmpty)
+    }
+
     @Test func aNotificationActionVerifiesBeforeItAnswers() async throws {
         let item = Self.approval()
         let fake = FakeFabric(Self.fleet(attention: [item]))
