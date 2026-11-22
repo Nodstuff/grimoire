@@ -231,4 +231,24 @@ final class HeldServer: URLProtocol {
         try await Task.sleep(for: .milliseconds(250))
         #expect(asked().count == 10)
     }
+
+    /// Review of 317728a (nit): a batch the reset cancelled loads nothing
+    /// and leaves the next batch's handle alone.
+    @Test func aCancelledBatchLeavesTheNextOneAlone() async throws {
+        URLProtocol.registerClass(HeldServer.self)
+        defer { URLProtocol.unregisterClass(HeldServer.self) }
+        HeldServer.reset()
+        defer { HeldServer.reset() }
+        let m = try await HeldServer.model()
+        m.metaBatchDelay = .milliseconds(300)
+        m.wantEditMeta("a")
+        m.resetEditMeta() // sign-out, another server
+        m.wantEditMeta("b")
+        let next = try #require(m.metaBatch)
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(m.metaBatch != nil, "the cancelled batch cleared the next one's handle")
+        next.cancel()
+        await next.value
+        #expect(!HeldServer.hits.withLock { $0 }.contains("/api/doc/a/history"))
+    }
 }

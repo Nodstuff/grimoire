@@ -95,7 +95,7 @@ final class AppModel {
     /// edit metadata being fetched, and rows waiting for the next batch
     @ObservationIgnored private var metaInFlight: Set<DocID> = []
     @ObservationIgnored private var metaWanted: [DocID] = []
-    @ObservationIgnored private var metaBatch: Task<Void, Never>?
+    @ObservationIgnored private(set) var metaBatch: Task<Void, Never>?
     /// bumped when the metadata is forgotten (sign-out, another server): a
     /// batch still out then lands nothing
     @ObservationIgnored private var metaGeneration = 0
@@ -782,7 +782,7 @@ final class AppModel {
         staleMeta.remove(id)
     }
 
-    private func resetEditMeta() {
+    func resetEditMeta() {
         metaGeneration += 1
         metaBatch?.cancel()
         metaBatch = nil
@@ -804,17 +804,20 @@ final class AppModel {
         guard needsEditMeta(id), !metaWanted.contains(id) else { return }
         metaWanted.append(id)
         guard metaBatch == nil else { return }
+        // the batch is this generation's: one the reset cancelled never
+        // loads, and never clears the handle of the batch after it
+        let generation = metaGeneration
         metaBatch = Task { [weak self] in
             guard let delay = self?.metaBatchDelay else { return }
             try? await Task.sleep(for: delay)
-            await self?.loadWantedMeta()
+            guard !Task.isCancelled else { return }
+            await self?.loadWantedMeta(generation)
         }
     }
 
-    private func loadWantedMeta() async {
-        let asked = metaGeneration
+    private func loadWantedMeta(_ asked: Int) async {
         defer { if asked == metaGeneration { metaBatch = nil } }
-        while !metaWanted.isEmpty, !Task.isCancelled {
+        while asked == metaGeneration, !metaWanted.isEmpty, !Task.isCancelled {
             let ids = metaWanted.filter(needsEditMeta)
             metaWanted = []
             guard let api, !ids.isEmpty else { return }
