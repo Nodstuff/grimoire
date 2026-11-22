@@ -523,7 +523,7 @@ fn widen_ops_op_type_check(conn: &Connection) -> Result<()> {
 /// Populate FTS and edges for rows that predate their triggers/extraction.
 /// Gated on user_version: count(*) on an external-content FTS table proxies
 /// the content table, so emptiness is unobservable — version it instead.
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 /// Every outstanding step and the version bump commit together: a crash
 /// mid-backfill re-runs the whole thing next open instead of leaving a
@@ -607,6 +607,9 @@ fn backfill(conn: &Connection) -> Result<()> {
              CREATE INDEX IF NOT EXISTS fabric_turns_seq ON fabric_turns (seq);",
         )?;
     }
+    // v19: per-doc update counters (schema.sql: doc_row_revs and its
+    // triggers, created IF NOT EXISTS by init). Nothing to backfill: a doc
+    // with no row counts 0 until its next update.
     if version < 18 {
         // v18: ops by target block. `block_readable` (behind `mask_anchor`,
         // on every comment read_doc returns) and the e-reader tagger look a
@@ -3989,7 +3992,8 @@ impl SqliteStore {
                               + (SELECT count(*) FROM annotations WHERE status != 'open' AND doc_id IN (SELECT id FROM v)) * 7919
                               + (SELECT COALESCE(sum(length(coalesce(sort_key,'')) + length(coalesce(parent_id,'')) + length(title)
                                                      + length(coalesce(status,''))), 0)
-                                 FROM docs WHERE deleted = 0 AND id IN (SELECT id FROM v))",
+                                 FROM docs WHERE deleted = 0 AND id IN (SELECT id FROM v))
+                              + (SELECT COALESCE(sum(rev), 0) FROM doc_row_revs WHERE doc_id IN (SELECT id FROM v)) * 1299709",
                     ),
                     [],
                     |r| r.get(0),

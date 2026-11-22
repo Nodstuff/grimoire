@@ -1109,3 +1109,33 @@ fn renaming_back_to_your_own_name_never_clashes_with_yourself() {
     let b = store.lock(Scope::System).auth_find_user("Aoife").unwrap().unwrap().id;
     assert!(store.lock(Scope::User(b)).rename_principal(b_human, "tom").is_err(), "never another person's");
 }
+
+/// Code review 2026-11-22, item 17: a person's change stamp moves on a
+/// same-length rename and on a review-policy change of a doc they can see,
+/// and still not on anything of another person's.
+#[test]
+fn the_user_stamp_sees_same_length_renames_and_policy_changes_but_not_others() {
+    let t = setup();
+    let stamp = |u: Uuid| t.store.lock(Scope::User(u)).change_stamp().unwrap();
+    let b0 = stamp(t.b);
+    let a0 = stamp(t.a);
+    let title = t.store.lock(Scope::User(t.b)).get_doc(t.b_doc).unwrap().title;
+    let same_len = "z".repeat(title.len());
+    assert_ne!(same_len, title);
+    t.store.lock(Scope::User(t.b)).rename_doc(t.b_doc, &same_len).unwrap();
+    let b1 = stamp(t.b);
+    assert_ne!(b0, b1, "a same-length rename moves the stamp");
+    t.store.lock(Scope::User(t.b)).set_review_policy(t.b_doc, Some(ReviewPolicy::Auto)).unwrap();
+    let b2 = stamp(t.b);
+    assert_ne!(b1, b2, "a policy change moves the stamp");
+    t.store.lock(Scope::User(t.b)).set_review_policy(t.b_doc, Some(ReviewPolicy::HumanReview)).unwrap();
+    t.store.lock(Scope::User(t.b)).set_review_policy(t.b_doc, Some(ReviewPolicy::AgentReview)).unwrap();
+    assert_ne!(b2, stamp(t.b), "same-length policies too");
+    assert_eq!(a0, stamp(t.a), "B's changes do not move A's stamp");
+    let b3 = stamp(t.b);
+    let a_title = t.store.lock(Scope::User(t.a)).get_doc(t.a_secret).unwrap().title;
+    let a_same = "z".repeat(a_title.len());
+    t.store.lock(Scope::User(t.a)).rename_doc(t.a_secret, &a_same).unwrap();
+    t.store.lock(Scope::User(t.a)).set_review_policy(t.a_secret, Some(ReviewPolicy::Auto)).unwrap();
+    assert_eq!(b3, stamp(t.b), "A's private changes do not move B's stamp");
+}
