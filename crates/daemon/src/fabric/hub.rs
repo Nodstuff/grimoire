@@ -462,11 +462,15 @@ pub(super) struct Inner {
     fleets: Mutex<HashMap<Uuid, UserFleet>>,
     pub(super) alerter: Option<Alerter>,
     next_conn: std::sync::atomic::AtomicU64,
-    /// One [`Hub::sync`] at a time: its read of the store and its merge
-    /// into the fleet must not interleave with another's, or a list read
-    /// before a runtime was enrolled could drop that runtime after a later
-    /// sync had added it.
-    syncing: tokio::sync::Mutex<()>,
+    /// One [`Hub::sync`] at a time PER PERSON: its read of the store and
+    /// its merge into the fleet must not interleave with another's for the
+    /// same fleet, or a list read before a runtime was enrolled could drop
+    /// that runtime after a later sync had added it. A sync reads and
+    /// writes only its own person's runtimes and fleet, so different people
+    /// never wait on each other (code review 2026-11-22, item 9: one global
+    /// lock serialized every fleet read on the server). One entry per
+    /// person who has synced.
+    syncing: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
     /// Fabric tool calls answered lately, by (runtime, call id): a retry
     /// gets the first answer.
     /// One per call that changes something (`send`, `inbox_ack`): taken
@@ -514,7 +518,8 @@ impl Hub {
     /// first time, then pick up a runtime enrolled since and drop one
     /// removed since (the box CLI edits the db under a running daemon).
     pub(super) async fn sync(&self, user: Uuid) -> Result<(), StoreError> {
-        let _one_at_a_time = self.0.syncing.lock().await;
+        let lock = self.sync_lock(user);
+        let _one_at_a_time = lock.lock().await;
         let loaded = self.fleets().contains_key(&user);
         let (runtimes, sessions, projects) = with_store(&self.0.store, Scope::User(user), move |s| {
             Ok::<_, StoreError>((
@@ -559,6 +564,11 @@ impl Hub {
         }
         Self::publish(fleet, changes);
         Ok(())
+    }
+
+    /// `user`'s own sync lock (see `Inner::syncing`).
+    pub(super) fn sync_lock(&self, user: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        self.0.syncing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(user).or_default().clone()
     }
 
     /// `user`'s fleet as it stands.
