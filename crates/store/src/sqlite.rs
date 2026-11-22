@@ -2967,6 +2967,24 @@ impl BlockStore for SqliteStore {
                 ));
             }
         }
+        // a red is parked until a PERSON accepts it (the gate's contract):
+        // no agent applies one, whoever proposed it. Comparing principals
+        // alone let an agent accept its own red by switching its `as` label
+        // between propose and resolve (code review 2026-11-22, item 1).
+        if kind == AnnotationKind::Parked && decision == ReviewDecision::Accept {
+            let reviewer_kind: Option<String> = tx
+                .query_row(
+                    "SELECT kind FROM principals WHERE id = ?1",
+                    params![reviewer.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if reviewer_kind.as_deref() != Some("human") {
+                return Err(StoreError::InvalidOp(
+                    "a parked (red) proposal waits for a person to accept it; an agent cannot accept it".into(),
+                ));
+            }
+        }
 
         let mut receipt = None;
         // a declined yellow reverts only what is still its own: if a later
@@ -3590,6 +3608,26 @@ fn parse_annotation_status(s: &str) -> Result<AnnotationStatus> {
 }
 
 impl SqliteStore {
+    /// An annotation the scope can see: its kind and the principal of the op
+    /// it flags (the proposer). Invisible = NotFound, like a missing one.
+    pub fn annotation_proposer(&self, annotation_id: Uuid) -> Result<(AnnotationKind, Uuid)> {
+        let raw: Option<(String, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT a.doc_id, a.kind, o.principal FROM annotations a JOIN ops o ON o.id = a.op_id WHERE a.id = ?1",
+                params![annotation_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let missing = || StoreError::NotFound(format!("annotation {annotation_id}"));
+        let (doc, kind, principal) = raw.ok_or_else(missing)?;
+        let doc = uuid_col(doc, "annotations.doc_id")?;
+        if tenancy::ensure_visible_conn(&self.conn, self.scope, doc).is_err() {
+            return Err(missing());
+        }
+        Ok((parse_annotation_kind(&kind)?, uuid_col(principal, "ops.principal")?))
+    }
+
     /// Blocks whose [[wikilinks]] point at this title (exact or path form),
     /// for rewrite-on-rename. Returns (block_id, doc_id, content).
     pub fn linking_blocks(&self, renamed: Uuid, title: &str) -> Result<Vec<(Uuid, Uuid, String)>> {

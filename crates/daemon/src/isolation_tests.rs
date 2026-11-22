@@ -4014,3 +4014,45 @@ async fn agent_fabric_work_is_its_owners_alone() {
         assert_eq!(st, StatusCode::UNAUTHORIZED, "PAT {method} {path}");
     }
 }
+
+/// Code review 2026-11-22, item 1: an agent cannot accept its own parked
+/// proposal by switching its `as` label between `doc_op` and `resolve`. The
+/// exact bypass: B's PAT trashes B's own doc as `claude:a` (red, parked),
+/// then accepts it as `claude:b` — refused, and the doc is still there. A
+/// yellow (a rename) is refused the same way: both labels are the token's.
+/// B's own app, a person, still accepts.
+#[tokio::test]
+async fn an_agent_cannot_accept_its_own_parked_delete_by_switching_labels() {
+    let fx = fixture();
+    let (is_err, out) = fx
+        .tool(&fx.b_pat, "doc_op", json!({"op": "delete", "doc_id": fx.b_doc.to_string(), "as": "claude:a"}))
+        .await;
+    assert!(!is_err && out.starts_with("parked"), "{out}");
+    let red = fx.store.lock(Scope::User(fx.b)).review_queue(Some(fx.b_doc)).unwrap().last().unwrap().annotation.id;
+    for token in [&fx.b_pat, &fx.b_conn] {
+        let (is_err, out) =
+            fx.tool(token, "resolve", json!({"annotation_id": red.to_string(), "decision": "accept", "as": "claude:b"})).await;
+        assert!(is_err, "an agent accepted a red: {out}");
+        assert!(!fx.store.lock(Scope::User(fx.b)).doc_is_tombstoned(fx.b_doc).unwrap(), "the doc must survive");
+    }
+    // a yellow by the token is not the token's to accept under another label
+    let (is_err, out) = fx
+        .tool(&fx.b_pat, "doc_op", json!({"op": "rename", "doc_id": fx.b_doc.to_string(), "title": "Renamed", "as": "claude:a"}))
+        .await;
+    assert!(!is_err && out.contains("yellow"), "{out}");
+    let yellow = fx.store.lock(Scope::User(fx.b)).review_queue(Some(fx.b_doc)).unwrap().into_iter()
+        .find(|e| e.annotation.kind == taisce_store::AnnotationKind::Review).unwrap().annotation.id;
+    let (is_err, out) =
+        fx.tool(&fx.b_pat, "resolve", json!({"annotation_id": yellow.to_string(), "decision": "accept", "as": "claude:b"})).await;
+    assert!(is_err && out.contains("own"), "{out}");
+    // a decline weakens nothing (it reverts the rename), so another label
+    // of the token may still withdraw it
+    let (is_err, out) =
+        fx.tool(&fx.b_pat, "resolve", json!({"annotation_id": yellow.to_string(), "decision": "decline", "as": "claude:b"})).await;
+    assert!(!is_err, "{out}");
+    assert_eq!(fx.store.lock(Scope::User(fx.b)).get_doc(fx.b_doc).unwrap().title, "Aoife work");
+    // a person accepts the red: the doc is trashed
+    let (st, out) = fx.b("POST", "/api/resolve", Some(json!({"annotation_id": red, "decision": "accept"}))).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    assert!(fx.store.lock(Scope::User(fx.b)).doc_is_tombstoned(fx.b_doc).unwrap());
+}

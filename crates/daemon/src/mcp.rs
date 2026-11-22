@@ -449,6 +449,29 @@ pub fn pinned_label(store: &SqliteStore, base: &str, label: &str) -> Result<Stri
     Ok(label.to_string())
 }
 
+/// Could a request pinned as `pinned` act as agent principal `id`? The
+/// test for "same base identity": an `as` label is free within a token's
+/// namespace, so every principal the token could pick is the token itself.
+/// - A connector or PAT (`Pinned::Client(base)`): its base, or any of the
+///   person's own `claude:<label>` agents `pinned_label` lets it name.
+/// - Unpinned (LOCAL, or a header/`?as=` hint): any of the scope's own
+///   agents, since `as` may name one by id.
+/// Humans and other people's agents: never.
+pub fn could_act_as(store: &SqliteStore, pinned: Option<&Pinned>, id: Uuid) -> bool {
+    match pinned {
+        Some(Pinned::Owner(_)) => false,
+        Some(Pinned::Client(base)) => {
+            if !store.agent_is_mine(id).unwrap_or(false) {
+                return false;
+            }
+            // agent_is_mine: the stored name, undecorated
+            let Ok(p) = store.get_principal(id) else { return false };
+            p.display_name == *base || pinned_label(store, base, &p.display_name).is_ok()
+        }
+        None => store.agent_is_mine(id).unwrap_or(false),
+    }
+}
+
 /// The `as` cache key: a name means a different principal per person.
 pub fn name_key(user: Option<Uuid>, name: &str) -> String {
     format!("{}|{}", user.map(|u| u.to_string()).unwrap_or_default(), name.trim())
@@ -2190,7 +2213,26 @@ impl KsMcp {
         };
         let verbose = p.verbose.unwrap_or(false);
         let principal = or_err!(self.acting(p.as_.as_deref(), &hint).await);
+        let pinned = hint.pinned.clone();
         with_store(&self.store, scope, move |store| {
+            // proposer ≠ approver at the token's base identity, not the label:
+            // an agent may not accept a proposal by any principal it could
+            // itself act as (code review 2026-11-22, item 1). Reds are refused
+            // to every agent by the store; this covers the applied yellows,
+            // whose accept would clear the flag on the agent's own change.
+            if decision == ReviewDecision::Accept && !matches!(pinned, Some(Pinned::Owner(_))) {
+                match store.annotation_proposer(id) {
+                    Ok((_, proposer)) if proposer != principal && could_act_as(store, pinned.as_ref(), proposer) => {
+                        return err(
+                            "proposer cannot resolve their own proposal: this token can act as the principal that proposed it, \
+                             so accepting it is a person's call (the web app's review queue)"
+                                .into(),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => return err(e.to_string()),
+                }
+            }
             match store.resolve(id, principal, decision) {
                 Ok(receipt) => {
                     if verbose {
