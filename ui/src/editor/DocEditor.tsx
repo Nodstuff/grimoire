@@ -21,6 +21,7 @@ import { BaselineBlock, Entry, HiddenBlock, Op, computeOps } from './diff'
 import { debounce } from '../timing'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
 import { AfterSave, PendingRequest, afterSave, requestFor } from './savePlan'
+import { registerEditor } from './registry'
 import './editor.css'
 
 /** transaction meta marking DocEditor's own post-save blockId stamping, so
@@ -93,6 +94,18 @@ export interface EditableDoc {
   hidden?: HiddenBlock[]
 }
 
+/** Where the cursor was when an editor unmounted, per doc: a remount of the
+ * same doc (fresh content from the server) puts it back. */
+const selectionMemo = new Map<string, { anchor: number; head: number; focused: boolean }>()
+
+/** True when a save's answer is the very next epoch after its base: nobody
+ * else wrote in between, so the editor shows everything the doc holds. A
+ * jump past base + 1 means the daemon rebased the save over someone else's
+ * edits (which this editor does not show); no jump means nothing applied. */
+export function isOwnEpoch(base: number, epoch: number): boolean {
+  return epoch === base + 1
+}
+
 type SaveState = 'clean' | 'dirty' | 'saving'
 /** What DocView's save indicator shows: `failed` = dirty after a save error. */
 export type EditorSaveState = SaveState | 'failed'
@@ -105,11 +118,14 @@ export default function DocEditor({
   reviewExtras,
   editable = true,
   onSaveState,
+  restoreSelection = false,
 }: {
   doc: EditableDoc
   /** `docId` names the doc the save landed on: the unmount flush can fire
-   * after the parent has moved to another doc, which must ignore it */
-  onSaved: (epoch: number, docId: string) => void
+   * after the parent has moved to another doc, which must ignore it. `own`
+   * is false when the save landed over someone else's edits (isOwnEpoch):
+   * the doc holds more than this editor shows */
+  onSaved: (epoch: number, docId: string, own: boolean) => void
   onSelectionBlock?: (blockId: string | null) => void
   /** blocks under review → tone; painted as node decorations, no remount */
   reviewMap?: ReviewMap
@@ -119,11 +135,24 @@ export default function DocEditor({
   editable?: boolean
   /** every save-state change, for the doc header's indicator */
   onSaveState?: (s: EditorSaveState) => void
+  /** a remount of the same doc: put the cursor back where it was */
+  restoreSelection?: boolean
 }) {
   const selCb = useRef(onSelectionBlock)
   selCb.current = onSelectionBlock
-  const [saveState, setSaveState] = useState<SaveState>('clean')
-  const [failed, setFailed] = useState(false)
+  const [saveState, setSaveStateRaw] = useState<SaveState>('clean')
+  const [failed, setFailedRaw] = useState(false)
+  // the same, readable synchronously (flush awaits a save and then asks)
+  const stateRef = useRef<SaveState>('clean')
+  const failedRef = useRef(false)
+  const setSaveState = (s: SaveState) => {
+    stateRef.current = s
+    setSaveStateRaw(s)
+  }
+  const setFailed = (f: boolean) => {
+    failedRef.current = f
+    setFailedRaw(f)
+  }
   /** a save the daemon refused for good: no retry clock until the next edit */
   const [stopped, setStopped] = useState(false)
   /** the request being retried, so a retry carries the same request_id */
@@ -133,6 +162,8 @@ export default function DocEditor({
   useEffect(() => {
     stateCb.current?.(saveState === 'dirty' && failed ? 'failed' : saveState)
   }, [saveState, failed])
+  const docIdRef = useRef(doc.docId)
+  docIdRef.current = doc.docId
   const editableRef = useRef(editable)
   editableRef.current = editable
   // autosave debounce, driven by the editor's update event: every keystroke
@@ -191,6 +222,25 @@ export default function DocEditor({
     [doc.docId],
   )
 
+  const editorRef = useRef(editor)
+  editorRef.current = editor
+  // a remount with fresh content keeps the cursor (clamped to the new doc)
+  useEffect(() => {
+    if (!editor || editor.isDestroyed || !restoreSelection) return
+    const m = selectionMemo.get(doc.docId)
+    selectionMemo.delete(doc.docId)
+    if (!m) return
+    const size = editor.state.doc.content.size
+    const clamp = (n: number) => Math.max(0, Math.min(n, size))
+    try {
+      editor.commands.setTextSelection({ from: clamp(m.anchor), to: clamp(m.head) })
+      if (m.focused) editor.commands.focus(undefined, { scrollIntoView: false })
+    } catch {
+      // a position the new doc cannot hold: leave the cursor at the start
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editor])
+
   // review marks follow the map from DocView; an empty map clears them
   useEffect(() => {
     if (!editor || editor.isDestroyed) return
@@ -227,6 +277,7 @@ export default function DocEditor({
       return
     }
     setSaveState('saving')
+    const base = epochRef.current
     const req = requestFor(pending.current, JSON.stringify({ doc_id: doc.docId, base_epoch: epochRef.current, ops }))
     pending.current = req
     try {
@@ -254,7 +305,7 @@ export default function DocEditor({
         // cleanup below — no debounce or retry clock survives the unmount
         if (plan === 'rearm') autosave.current.arm()
       }
-      onSaved(out.epoch, doc.docId)
+      onSaved(out.epoch, doc.docId, isOwnEpoch(base, out.epoch))
     } catch (e) {
       // the text is still in the editor and stays dirty; the retry clock
       // below keeps trying. Say so ONCE per distinct cause — a silent
@@ -289,6 +340,36 @@ export default function DocEditor({
 
   saveRef.current = save
 
+  /** Save now and wait: true once nothing is unsaved. Keystrokes typed while
+   * a save is in flight need one more, so it tries a few times. */
+  const flush = async (): Promise<boolean> => {
+    if (!editableRef.current) return true
+    for (let i = 0; i < 3; i++) {
+      autosave.current.cancel()
+      if (inFlight.current) await inFlight.current
+      await saveRef.current()
+      if (stateRef.current === 'clean') return true
+      if (failedRef.current) return false
+    }
+    return stateRef.current === 'clean'
+  }
+  const flushRef = useRef(flush)
+  flushRef.current = flush
+
+  useEffect(
+    () =>
+      registerEditor(doc.docId, {
+        flush: () => flushRef.current(),
+        catchUp: (blocks, epoch) => {
+          if (stateRef.current !== 'clean' || inFlight.current) return false
+          if (!sameBaseline(loadDoc({ docId: doc.docId, epoch, blocks }).baseline, baselineRef.current)) return false
+          epochRef.current = Math.max(epochRef.current, epoch)
+          return true
+        },
+      }),
+    [doc.docId],
+  )
+
   // a failed save leaves the doc dirty with no new keystrokes to re-arm the
   // debounce: retry on a slow clock until it lands (daemon back, …)
   useEffect(() => {
@@ -305,6 +386,15 @@ export default function DocEditor({
     const pending = autosave.current
     return () => {
       window.removeEventListener('keydown', onKey)
+      try {
+        const ed = editorRef.current
+        if (ed) {
+          const sel = ed.state.selection
+          selectionMemo.set(docIdRef.current, { anchor: sel.anchor, head: sel.head, focused: ed.isFocused })
+        }
+      } catch {
+        // the editor is already gone: nothing to remember
+      }
       // unmount/navigation: land whatever is pending now (the save reports
       // its own docId, so a parent that has moved on ignores the result)
       pending.cancel()
@@ -394,6 +484,14 @@ export function entriesOf(doc: PMNode, positions?: number[]): Entry[] {
   })
   flushRun()
   return entries
+}
+
+/** Two baselines hold the same blocks in the same places. */
+export function sameBaseline(a: BaselineBlock[], b: BaselineBlock[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((x, i) => x.id === b[i].id && x.content === b[i].content && x.parent === b[i].parent && x.order_key === b[i].order_key)
+  )
 }
 
 /** A new block's id and the node it belongs on: `pos` is where that node

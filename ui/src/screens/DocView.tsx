@@ -12,6 +12,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { createPortal } from 'react-dom'
 import DocEditor, { parser, type EditorSaveState } from '../editor/DocEditor'
 import { splitTree } from '../editor/splitTree'
+import { editorFor } from '../editor/registry'
 import LivingChip from '../LivingChip'
 import EreaderChip from '../EreaderChip'
 import { EREADER_EVENT, loadEreaderStatus, syncDiagramImages, useEreaderStatus } from '../ereader'
@@ -342,6 +343,27 @@ function InspectorSheet({ onClose, children }: { onClose: () => void; children: 
 
 /* ---------- the view ---------- */
 
+/** What a fetched tree means for the mounted editor:
+ * - `remount`: it holds something the editor does not show (an epoch past
+ *   what the editor was built from and what our own saves produced, or the
+ *   editor is `behind`), the editor is clean, and the tree is not older than
+ *   our latest save (it would drop our own text);
+ * - `defer`: it does, but the editor is dirty or the tree predates our latest
+ *   save: reload when the editor is next clean;
+ * - `none`: nothing new. */
+export function reloadVerdict(s: {
+  next: number
+  editorEpoch: number
+  ownEpoch: number
+  lastSaved: number
+  behind: boolean
+  clean: boolean
+}): 'remount' | 'defer' | 'none' {
+  const newer = s.next > Math.max(s.editorEpoch, s.ownEpoch) || s.behind
+  if (!newer) return 'none'
+  return s.clean && s.next >= s.lastSaved ? 'remount' : 'defer'
+}
+
 export default function DocView({
   docId,
   onOpenDoc,
@@ -410,12 +432,23 @@ export default function DocView({
     }
   }, [dataVersion])
 
+  const treeRef = useRef<DocTree | null>(null)
+  treeRef.current = tree
+
   const [selBlock, setSelBlock] = useState<string | null>(null)
   const [selRect, setSelRect] = useState<{ x: number; y: number } | null>(null)
   const [commentTarget, setCommentTarget] = useState<string | null>(null)
   const [focusThread, setFocusThread] = useState<string | null>(null)
   // epochs this editor produced itself — external changes are anything above
   const ownEpoch = useRef(0)
+  // the epoch of the tree the mounted editor was built from
+  const editorEpoch = useRef(0)
+  // the newest epoch any save of ours answered with: a tree older than it
+  // lacks our own text and must never replace the editor's content
+  const lastSaved = useRef(0)
+  // someone else's edit landed that the editor does not show (a save rebased
+  // over it, or a newer tree arrived while typing): reload once clean
+  const behind = useRef(false)
   const [editorGen, setEditorGen] = useState(0)
   const [saveState, setSaveState] = useState<EditorSaveState>('clean')
   const saveStateRef = useRef<EditorSaveState>('clean')
@@ -442,15 +475,51 @@ export default function DocView({
     })
   }, [])
 
+  /** A fetched tree, against what the editor shows (reloadVerdict): remount
+   * the editor with it (unless the editor already shows exactly its blocks),
+   * or remember to once the editor is clean. `always` sets the tree even
+   * when the editor keeps its content (title, comments, status). */
+  const adoptTree = useCallback(
+    (next: DocTree, always: boolean) => {
+      const cur = treeRef.current
+      if (!cur) {
+        editorEpoch.current = next.doc.current_epoch
+        setTree(next)
+        return
+      }
+      const verdict = reloadVerdict({
+        next: next.doc.current_epoch,
+        editorEpoch: editorEpoch.current,
+        ownEpoch: ownEpoch.current,
+        lastSaved: lastSaved.current,
+        behind: behind.current,
+        clean: saveStateRef.current === 'clean',
+      })
+      if (verdict === 'remount') {
+        editorEpoch.current = next.doc.current_epoch
+        behind.current = false
+        // a comment or another hidden-block change: the editor's text is the
+        // doc's already, so it keeps its undo history and cursor
+        const caughtUp = editorFor(docId)?.catchUp(splitTree(next.roots).blocks, next.doc.current_epoch) ?? false
+        setTree(next)
+        if (!caughtUp) setEditorGen((g) => g + 1)
+        return
+      }
+      if (verdict === 'defer') behind.current = true
+      if (always || next.doc.status !== cur.doc.status) setTree(next)
+    },
+    [docId],
+  )
+
   const loadTree = useCallback(() => {
     const g = gen.current
     api<DocTree>(`/api/doc/${docId}`)
-      .then((t) => fresh(g) && setTree(t))
+      .then((t) => fresh(g) && adoptTree(t, true))
       .catch(console.error)
     api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
       .then((b) => fresh(g) && setBacklinks(Array.isArray(b) ? b : []))
       .catch(() => fresh(g) && setBacklinks([]))
-  }, [docId, fresh])
+  }, [docId, fresh, adoptTree])
 
   useEffect(() => {
     setTree(null)
@@ -461,6 +530,9 @@ export default function DocView({
     setReviewItems([])
     setHistory([])
     ownEpoch.current = 0
+    editorEpoch.current = 0
+    lastSaved.current = 0
+    behind.current = false
     loadTree()
     loadReview()
     loadHistory()
@@ -481,8 +553,6 @@ export default function DocView({
 
   // after a resolve: content may have moved (yellow decline reverts, red
   // accept applies) — refetch, remount the editor if the epoch moved
-  const treeRef = useRef<DocTree | null>(null)
-  treeRef.current = tree
   const afterResolve = useCallback(() => {
     loadReview()
     loadHistory()
@@ -493,6 +563,8 @@ export default function DocView({
         const cur = treeRef.current
         if (!cur || next.doc.current_epoch !== cur.doc.current_epoch) {
           ownEpoch.current = Math.max(ownEpoch.current, next.doc.current_epoch)
+          editorEpoch.current = next.doc.current_epoch
+          behind.current = false
           setEditorGen((g) => g + 1)
         }
         setTree(next)
@@ -500,9 +572,10 @@ export default function DocView({
       .catch(() => {})
   }, [docId, loadReview, loadHistory, fresh])
 
-  // live refresh: when the store changed and this doc moved past what our own
-  // saves produced, reload it and remount the editor with the fresh content
-  // (skipped while dirty — the pending autosave lands first, next tick catches up)
+  // live refresh: when the store changed and this doc moved past what the
+  // editor shows (its own saves included), reload it and remount the editor
+  // with the fresh content. Skipped while dirty — the pending autosave lands
+  // first, and the editor going clean triggers it again (`behind`)
   const refreshFromStore = useCallback(() => {
     const cur = treeRef.current
     if (!cur) return
@@ -510,25 +583,23 @@ export default function DocView({
     api<DocTree>(`/api/doc/${docId}`)
       .then((next) => {
         if (!fresh(g)) return
-        const known = Math.max(cur.doc.current_epoch, ownEpoch.current)
-        const dirty = saveStateRef.current !== 'clean'
-        if (next.doc.current_epoch > known && !dirty) {
-          setTree(next)
-          setEditorGen((g) => g + 1)
-        } else if (next.doc.status !== cur.doc.status) {
-          setTree(next)
-        }
+        adoptTree(next, false)
         api<SearchHit[]>(`/api/doc/${docId}/backlinks`)
           .then((b) => fresh(g) && setBacklinks(Array.isArray(b) ? b : []))
           .catch(() => {})
       })
       .catch((e) => console.warn('doc refresh failed', docId, e))
-  }, [docId, fresh])
+  }, [docId, fresh, adoptTree])
   useEffect(() => {
     if (dataVersion === 0) return
     refreshFromStore()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dataVersion])
+  // the editor went clean while behind: now show what it missed
+  useEffect(() => {
+    if (saveState === 'clean' && behind.current) refreshFromStore()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [saveState])
 
   // e-readers: the doc's status (the chip, ⌘K's Send / Stop); a sent book's
   // diagrams are drawn and uploaded in the background (once per hash set)
@@ -889,10 +960,15 @@ export default function DocView({
               reviewExtras={reviewExtras}
               editable={!readOnly}
               onSaveState={setSaveState}
-              onSaved={(e, savedDocId) => {
+              restoreSelection={editorGen > 0}
+              onSaved={(e, savedDocId, own) => {
                 // the unmount flush of a PREVIOUS doc's editor reports its own id
                 if (savedDocId !== docId) return
-                ownEpoch.current = Math.max(ownEpoch.current, e)
+                lastSaved.current = Math.max(lastSaved.current, e)
+                // a save rebased over someone else's edit: that epoch is not
+                // ours alone, and the editor reloads once clean to show it
+                if (own) ownEpoch.current = Math.max(ownEpoch.current, e)
+                else behind.current = true
                 loadHistory()
               }}
               onSelectionBlock={onSelectionBlock}
