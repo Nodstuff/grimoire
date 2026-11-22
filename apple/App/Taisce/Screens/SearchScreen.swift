@@ -66,10 +66,11 @@ struct SearchScreen: View {
             guard !Task.isCancelled else { return }
             books = await SearchBooks.load(router.searchQuery, store: model.books)
         }
-        // a new question forgets the old answer
+        // a new question forgets the old answer. No cancel on disappear:
+        // pushing a result onto the stack disappears this screen too, and
+        // the answer would never arrive. The run ends with the runner,
+        // which lives as long as this screen's identity (@State).
         .onChange(of: router.searchQuery) { _, q in asker.queryChanged(q) }
-        // leaving Search stops following an answer
-        .onDisappear { asker.cancel() }
     }
 
     private func runAsk() {
@@ -83,8 +84,9 @@ struct SearchScreen: View {
 /// Ask's run: one question at a time. The answer doc's synthesis lands a
 /// few seconds after the doc, so a run follows it (every `every`, up to
 /// `tries` times). A new question cancels the run before it, and so does
-/// leaving the screen: two runs never race to set the answer, and no poll
-/// outlives the screen.
+/// the runner going away (Search torn down, not a result pushed over it):
+/// two runs never race to set the answer, and no poll outlives the screen.
+/// The run holds the runner only weakly, between its steps too.
 @MainActor @Observable
 final class AskRunner {
     private(set) var state: AskState = .idle
@@ -94,22 +96,33 @@ final class AskRunner {
     /// the words in the field now: a run follows its answer only while they are its question
     @ObservationIgnored private var query = ""
 
+    isolated deinit { task?.cancel() }
+
     func start(_ q: String, ask: @escaping @MainActor (String) async -> AskState, reload: @escaping @MainActor (AskResult) async -> AskResult?) {
         task?.cancel()
         query = q
         state = .asking(q)
         task = Task { [weak self] in
             let answer = await ask(q)
-            guard let self, !Task.isCancelled else { return }
-            state = answer
+            guard !Task.isCancelled else { return }
+            self?.state = answer
             var n = 0
-            while case .answer(let a) = state, a.pending, n < tries, query.trimmingCharacters(in: .whitespacesAndNewlines) == q {
+            // `self?.` only: a strong self held across the sleep would keep
+            // a torn-down screen's runner (and its poll) alive
+            while let (a, every) = self?.follow(q, after: n) {
                 try? await Task.sleep(for: every)
                 guard !Task.isCancelled else { return }
                 n += 1
-                if let next = await reload(a), !Task.isCancelled { state = .answer(next) }
+                if let next = await reload(a), !Task.isCancelled { self?.state = .answer(next) }
             }
         }
+    }
+
+    /// The pending answer to follow after `n` reloads, and how long to wait.
+    private func follow(_ q: String, after n: Int) -> (AskResult, Duration)? {
+        guard case .answer(let a) = state, a.pending, n < tries,
+              query.trimmingCharacters(in: .whitespacesAndNewlines) == q else { return nil }
+        return (a, every)
     }
 
     /// The words changed: an answer to other words goes, and its run stops.

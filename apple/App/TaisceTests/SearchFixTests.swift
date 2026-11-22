@@ -40,7 +40,7 @@ import TaisceKit
         #expect(firstReloads == 0, "the first run kept polling")
     }
 
-    /// #11: leaving the screen stops following a pending answer.
+    /// #11: cancel (a new question, new words) stops following a pending answer.
     @Test func cancelStopsThePoll() async throws {
         let r = AskRunner()
         r.every = .milliseconds(10)
@@ -61,6 +61,32 @@ import TaisceKit
         // new words forget an answer to other words
         r.queryChanged("other")
         #expect(r.state == .idle)
+    }
+
+    /// Review of 434e67b: the run follows its answer with nobody cancelling
+    /// it (a pushed result no longer cancels: the screen only disappeared),
+    /// and the runner going away (Search torn down) ends it.
+    @Test func theRunEndsWithTheRunnerNotWithAPush() async throws {
+        var r: AskRunner? = AskRunner()
+        r?.every = .milliseconds(10)
+        var reloads = 0
+        r?.queryChanged("q")
+        r?.start("q", ask: { q in .answer(Self.answer(q, pending: true)) }, reload: { a in
+            reloads += 1
+            return reloads == 3 ? Self.answer(a.question, pending: false, body: "done") : a
+        })
+        for _ in 0..<200 where reloads < 3 { try await Task.sleep(for: .milliseconds(5)) }
+        #expect(r?.state == .answer(Self.answer("q", pending: false, body: "done")), "the answer arrives")
+        // a pending run whose runner is released stops polling
+        reloads = 0
+        r?.start("q", ask: { q in .answer(Self.answer(q, pending: true)) }, reload: { a in reloads += 1; return a })
+        for _ in 0..<200 where reloads < 2 { try await Task.sleep(for: .milliseconds(5)) }
+        weak var gone = r
+        r = nil
+        #expect(gone == nil, "the run kept the runner alive")
+        let seen = reloads
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(reloads <= seen + 1, "polled on after Search went: \(seen) → \(reloads)")
     }
 
     /// #10: the New doc sheet sorts and walks the tree once; each keystroke
