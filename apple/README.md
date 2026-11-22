@@ -578,8 +578,12 @@ markdown after autosave. `LaunchTests` needs a doc titled "Welcome" headed
   (`POST /api/todo*`) carry the row's key as `request_id` too (added at send
   time; a server without it ignores the field). Every replay goes through
   `AppModel.replayOutbox` (single-flight, behind the owner gate); a row in
-  flight is never claimed by a second replay, and one a killed app left in
-  flight is put back once when the cache opens (`Cache.releaseInflight`).
+  flight is never claimed by a second replay. A row left in flight (a killed
+  app, or a replay cancelled when the app left the front) is put back when
+  the cache opens and at the start of every replay round
+  (`Cache.releaseInflight`; replay is single-flight, so any row in flight
+  then is an orphan), and a replay's settle writes land even when its task
+  was cancelled.
 - Agent turns page tie-safe on a server that numbers them (`seq`): top-ups
   ask `after_seq=` from the cache's `synced_seq` (late replays arrive),
   Earlier turns asks `before=` + `before_id=`. A server without `seq` is
