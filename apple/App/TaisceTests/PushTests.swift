@@ -96,6 +96,38 @@ import UIKit
     }
 }
 
+extension PushTests {
+    /// Review 2026-11-22 #5: a delete owed to a server the app has since
+    /// switched away from goes out at the next start with that server's
+    /// stored bearer; with none, it stays owed for a sign-in there.
+    @Test func aDeleteOwedToAnotherServerIsSentWithItsStoredBearer() async throws {
+        let store = UserDefaultsPushStore()
+        let before = store.loadOwedDelete()
+        defer { store.saveOwedDelete(before) }
+        store.saveOwedDelete(OwedPushDelete(server: "https://old.invalid", token: "aa"))
+        let m = AppModel()
+        let deletes = RecordingRegistry()
+        m.pushRegistry = { _ in nil }
+        m.settleOwedPushDeleteElsewhere()
+        await m.pushTask?.value
+        #expect(store.loadOwedDelete()?.server == "https://old.invalid", "no bearer for it: kept")
+        m.pushRegistry = { $0 == "https://old.invalid" ? deletes : nil }
+        m.settleOwedPushDeleteElsewhere()
+        await m.pushTask?.value
+        #expect(deletes.deleted == ["aa"])
+        #expect(store.loadOwedDelete() == nil)
+    }
+}
+
+/// Records deletes.
+final class RecordingRegistry: DeviceRegistry, @unchecked Sendable {
+    private let lock = NSLock()
+    private var log: [String] = []
+    var deleted: [String] { lock.withLock { log } }
+    func registerDevice(_ registration: DeviceRegistration) async throws {}
+    func unregisterDevice(token: String) async throws { lock.withLock { log.append(token) } }
+}
+
 /// A server that never answers (cancellable).
 struct HangingRegistry: DeviceRegistry {
     func registerDevice(_ registration: DeviceRegistration) async throws {

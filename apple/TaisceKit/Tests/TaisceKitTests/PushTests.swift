@@ -6,8 +6,11 @@ import Testing
 /// A `PushRegistrationStore` in memory.
 final class MemoryPushStore: PushRegistrationStore {
     private let value = Mutex<SentPushRegistration?>(nil)
+    private let owed = Mutex<OwedPushDelete?>(nil)
     func load() -> SentPushRegistration? { value.withLock { $0 } }
     func save(_ sent: SentPushRegistration?) { value.withLock { $0 = sent } }
+    func loadOwedDelete() -> OwedPushDelete? { owed.withLock { $0 } }
+    func saveOwedDelete(_ o: OwedPushDelete?) { owed.withLock { $0 = o } }
 }
 
 /// A settable clock.
@@ -172,6 +175,77 @@ final class TestClock: Sendable {
         await push.connect(server: "https://s", registry: server.client())
         #expect(await push.unregister() == .waiting)
         #expect(server.requests.isEmpty)
+    }
+
+    /// Review 2026-11-22 #5: a sign-out whose delete fails (offline) keeps
+    /// it owed, and the next connect to that server sends it before it
+    /// registers; the old account's pushes stop then.
+    @Test func anOfflineSignOutsDeleteIsSentAtTheNextConnect() async throws {
+        let down = MockServer { _ in MockServer.Reply(chunks: [], failAfter: true) }
+        let store = MemoryPushStore()
+        let push = registrar(store, TestClock(Self.t0))
+        let up = Self.server()
+        await push.didRegister(token: "aa01")
+        await push.connect(server: "https://s", registry: up.client())
+        await push.disconnect()
+        await push.connect(server: "https://s", registry: down.client())
+        guard case .failed = await push.unregister() else {
+            Issue.record("an offline delete fails")
+            return
+        }
+        #expect(store.loadOwedDelete() == OwedPushDelete(server: "https://s", token: "aa01"))
+        #expect(await push.owedDeleteServer == "https://s")
+        #expect(store.load() == nil, "the next sign-in sends afresh")
+        // signing in again (anyone): the delete goes first, then the registration
+        #expect(await push.connect(server: "https://s", registry: up.client()) == .sent)
+        let sent = up.requests.suffix(2).map { "\($0.httpMethod ?? "") \($0.path)" }
+        #expect(sent == ["DELETE /api/devices/aa01", "POST /api/devices"])
+        #expect(store.loadOwedDelete() == nil && store.load()?.registration.token == "aa01")
+    }
+
+    /// Owed to another server: nothing goes to this one, the record stays.
+    /// Someone else's bearer answers 404: gone for us, settled.
+    @Test func anOwedDeleteGoesOnlyToItsServer() async throws {
+        let a = Self.server()
+        let store = MemoryPushStore()
+        store.saveOwedDelete(OwedPushDelete(server: "https://a", token: "aa"))
+        let push = registrar(store, TestClock(Self.t0))
+        await push.didRegister(token: "aa")
+        #expect(await push.connect(server: "https://b", registry: a.client()) == .sent)
+        #expect(a.requests.map(\.httpMethod) == ["POST"], "b's registration only")
+        #expect(store.loadOwedDelete()?.server == "https://a")
+        let other = Self.server(deleteStatus: 404)
+        #expect(await push.settleOwedDelete(server: "https://a", registry: other.client()) == .sent)
+        #expect(store.loadOwedDelete() == nil)
+        #expect(await push.settleOwedDelete(server: "https://a", registry: other.client()) == .waiting)
+    }
+
+    /// A confirmed delete leaves nothing owed; a token re-registered while
+    /// an owed delete was out is sent again, not left deleted.
+    @Test func aConfirmedDeleteOwesNothing() async throws {
+        let up = Self.server()
+        let store = MemoryPushStore()
+        let push = registrar(store, TestClock(Self.t0))
+        await push.didRegister(token: "aa")
+        await push.connect(server: "https://s", registry: up.client())
+        #expect(await push.unregister() == .sent)
+        #expect(store.loadOwedDelete() == nil)
+        // a record that says this token was sent, with the same token owed
+        store.saveOwedDelete(OwedPushDelete(server: "https://s", token: "aa"))
+        store.save(SentPushRegistration(server: "https://s", registration: DeviceRegistration(token: "aa", env: .sandbox, appVersion: "0.1.0 (1)"), sentAt: Self.t0))
+        #expect(await push.connect(server: "https://s", registry: up.client()) == .sent, "registered again after its delete")
+    }
+
+    @Test func theOwedDeleteIsKeptInUserDefaults() throws {
+        let suite = "push-test-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsPushStore(defaults: defaults)
+        #expect(store.loadOwedDelete() == nil)
+        store.saveOwedDelete(OwedPushDelete(server: "https://s", token: "aa"))
+        #expect(UserDefaultsPushStore(defaults: defaults).loadOwedDelete() == OwedPushDelete(server: "https://s", token: "aa"))
+        store.saveOwedDelete(nil)
+        #expect(store.loadOwedDelete() == nil)
     }
 
     @Test func aServerSwitchSendsToTheNewServerAndOnlyItDeletes() async throws {

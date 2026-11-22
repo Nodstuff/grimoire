@@ -41,10 +41,26 @@ public struct SentPushRegistration: Codable, Sendable, Hashable {
     }
 }
 
+/// A device delete the server has not confirmed yet (sign-out or a server
+/// switch while offline, or cut off by its time limit): retried at the
+/// next connect to that server, before registering.
+public struct OwedPushDelete: Codable, Sendable, Hashable {
+    public var server: String
+    public var token: String
+
+    public init(server: String, token: String) {
+        self.server = server
+        self.token = token
+    }
+}
+
 /// Where the last sent registration is kept between launches.
 public protocol PushRegistrationStore: Sendable {
     func load() -> SentPushRegistration?
     func save(_ sent: SentPushRegistration?)
+    /// the delete still owed, if any (kept between launches)
+    func loadOwedDelete() -> OwedPushDelete?
+    func saveOwedDelete(_ owed: OwedPushDelete?)
 }
 
 /// `UserDefaults` (thread-safe; not marked `Sendable` in the SDK).
@@ -67,6 +83,20 @@ public struct UserDefaultsPushStore: PushRegistrationStore, @unchecked Sendable 
             defaults.set(data, forKey: key)
         } else {
             defaults.removeObject(forKey: key)
+        }
+    }
+
+    var owedKey: String { key + ".deleteOwed" }
+
+    public func loadOwedDelete() -> OwedPushDelete? {
+        defaults.data(forKey: owedKey).flatMap { try? JSONDecoder().decode(OwedPushDelete.self, from: $0) }
+    }
+
+    public func saveOwedDelete(_ owed: OwedPushDelete?) {
+        if let owed, let data = try? JSONEncoder().encode(owed) {
+            defaults.set(data, forKey: owedKey)
+        } else {
+            defaults.removeObject(forKey: owedKey)
         }
     }
 }
@@ -94,6 +124,9 @@ public actor PushRegistrar {
     private var token: String?
     private var server: String?
     private var registry: (any DeviceRegistry)?
+    /// an owed delete is going out: a registration waits for it, or the
+    /// delete could land after it and remove it
+    private var settling = false
 
     public init(store: any PushRegistrationStore, environment: PushEnvironment, appVersion: String, now: @escaping @Sendable () -> Date = { .now }) {
         self.store = store
@@ -114,12 +147,37 @@ public actor PushRegistrar {
         return await sendIfNeeded()
     }
 
-    /// A signed-in server (SERVER mode): registrations go to `registry`.
+    /// A signed-in server (SERVER mode): registrations go to `registry`,
+    /// after any delete still owed to it.
     @discardableResult
     public func connect(server: String, registry: any DeviceRegistry) async -> Outcome {
         self.server = server
         self.registry = registry
+        await settleOwedDelete(server: server, registry: registry)
         return await sendIfNeeded()
+    }
+
+    /// The server an unconfirmed device delete is owed to, if any.
+    public var owedDeleteServer: String? { store.loadOwedDelete()?.server }
+
+    /// Send the delete still owed to `server` (with a bearer for it). The
+    /// server deletes only the caller's own token (another person's bearer
+    /// answers 404, already gone for us: signing in there moves the token
+    /// to them anyway). Kept when it fails, for the next try.
+    @discardableResult
+    public func settleOwedDelete(server: String, registry: any DeviceRegistry) async -> Outcome {
+        guard let owed = store.loadOwedDelete(), owed.server == server, !settling else { return .waiting }
+        settling = true
+        defer { settling = false }
+        do {
+            try await registry.unregisterDevice(token: owed.token)
+        } catch {
+            return .failed(String(describing: error))
+        }
+        if store.loadOwedDelete() == owed { store.saveOwedDelete(nil) }
+        // a registration of this very token recorded meanwhile was deleted with it
+        if let last = store.load(), last.server == server, last.registration.token == owed.token { store.save(nil) }
+        return .sent
     }
 
     /// Stop sending (signed out, or a server without sign-in).
@@ -131,7 +189,7 @@ public actor PushRegistrar {
     /// Send the registration if the server lacks it or it is a day old.
     @discardableResult
     public func sendIfNeeded() async -> Outcome {
-        guard let token, let server, let registry else { return .waiting }
+        guard let token, let server, let registry, !settling else { return .waiting }
         let registration = DeviceRegistration(token: token, env: environment, appVersion: appVersion)
         let at = now()
         guard SentPushRegistration.shouldSend(registration, to: server, last: store.load(), now: at) else { return .upToDate }
@@ -150,21 +208,28 @@ public actor PushRegistrar {
 
     /// Sign-out: delete the registration on the server it was sent to
     /// (while the bearer is still good), then forget it locally either way,
-    /// so the next sign-in sends afresh. Best effort: a failed delete only
-    /// leaves the server pushing to a device that will ignore it.
+    /// so the next sign-in sends afresh. The delete is recorded as owed
+    /// before it goes and cleared only when the server confirms it: one
+    /// that fails (offline) or is cut off by the caller's time limit is
+    /// retried at the next connect to that server, before registering
+    /// (`settleOwedDelete`), so the old account's pushes stop then.
     @discardableResult
     public func unregister() async -> Outcome {
         let last = store.load()
         let (registry, server) = (registry, server)
         store.save(nil)
         disconnect()
+        guard let last else { return .waiting }
+        let owed = OwedPushDelete(server: last.server, token: last.registration.token)
+        store.saveOwedDelete(owed)
         // only the server it went to can delete it (another one's bearer won't)
-        guard let last, let registry, last.server == server else { return .waiting }
+        guard let registry, last.server == server else { return .waiting }
         do {
             try await registry.unregisterDevice(token: last.registration.token)
-            return .sent
         } catch {
             return .failed(String(describing: error))
         }
+        if store.loadOwedDelete() == owed { store.saveOwedDelete(nil) }
+        return .sent
     }
 }

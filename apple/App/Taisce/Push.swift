@@ -152,6 +152,7 @@ extension AppModel {
     /// mode (no bearer) registers nothing. Never awaited: launch must not
     /// wait on APNs or on the device POST.
     func pushSessionStarted() {
+        settleOwedPushDeleteElsewhere()
         guard authPhase == .signedIn, let api else {
             enqueuePush { await $0.disconnect() }
             return
@@ -159,6 +160,29 @@ extension AppModel {
         beginPushRegistration(server: serverURL, registry: api) {
             UIApplication.shared.registerForRemoteNotifications()
         }
+    }
+
+    /// A device delete owed to another server (a sign-out or a switch away
+    /// from it while offline): sent now if this device still holds a
+    /// bearer for that server, else kept for the next sign-in there. One
+    /// owed to the current server goes ahead of its registration
+    /// (`PushRegistrar.connect`). Queued like the rest, never awaited.
+    func settleOwedPushDeleteElsewhere() {
+        let current = serverURL
+        let registryFor = pushRegistry
+        enqueuePush { push in
+            guard let owed = await push.owedDeleteServer, owed != current, let registry = await registryFor(owed) else { return }
+            _ = await withTimeLimit(PushConfig.registerLimit) { await push.settleOwedDelete(server: owed, registry: registry) }
+        }
+    }
+
+    /// A registry for `server` from the tokens this device keeps for it
+    /// (the Keychain holds them per server), or nil when it has none.
+    static func storedRegistry(_ server: String) async -> (any DeviceRegistry)? {
+        guard let url = URL(string: server), let store = try? KeychainTokenStore() else { return nil }
+        let auth = AuthSession(oauth: OAuthClient(baseURL: url, appLinkHosts: AppLinks.hosts()), store: store, shield: backgroundTask)
+        guard await auth.state == .signedIn else { return nil }
+        return APIClient(config: ServerConfig(baseURL: url, tokenProvider: auth))
     }
 
     /// Queue the registrar's connect (bounded by `registerLimit`) and ask

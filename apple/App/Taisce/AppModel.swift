@@ -48,6 +48,8 @@ final class AppModel {
     let push = PushRegistrar(store: UserDefaultsPushStore(), environment: PushConfig.environment, appVersion: PushConfig.appVersion())
     /// push: the registrar's queued work (fire-and-forget, never awaited by boot)
     @ObservationIgnored var pushTask: Task<Void, Never>?
+    /// where a device delete owed to another server finds a bearer (tests swap it)
+    @ObservationIgnored var pushRegistry: @Sendable (String) async -> (any DeviceRegistry)? = { await AppModel.storedRegistry($0) }
     /// Server discovery (does it need sign-in?); tests swap in one with no network.
     @ObservationIgnored var discover: @MainActor (URL) async throws -> AuthSession? = { try await AppModel.authSession(for: $0) }
 
