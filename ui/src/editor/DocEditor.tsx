@@ -13,10 +13,12 @@ import { WikilinkDeco } from './WikilinkDeco'
 import { CodeHighlight } from './CodeHighlight'
 import { ReviewHighlight, ReviewMap, ReviewExtras, setReviewMap } from './ReviewHighlight'
 import type { Node as PMNode } from '@tiptap/pm/model'
+import { Mapping } from '@tiptap/pm/transform'
+import type { Transaction } from '@tiptap/pm/state'
 import { api, Block } from '../types'
 import { notify } from '../Notice'
 import { saveErrorText } from '../hints'
-import { BaselineBlock, Entry, HiddenBlock, computeOps } from './diff'
+import { BaselineBlock, Entry, HiddenBlock, Op, computeOps } from './diff'
 import { debounce } from '../timing'
 import { makeParser, makeSerializer, nodesToMarkdown } from './markdown'
 import { AfterSave, afterSave } from './savePlan'
@@ -142,6 +144,9 @@ export default function DocEditor({
    * must not re-arm timers that no longer exist */
   const mounted = useRef(true)
   const lastPlan = useRef<AfterSave>('clean')
+  /** the edits made since the in-flight save took its snapshot: the stamps
+   * of the ids it assigned are mapped through them onto the live doc */
+  const sinceSnapshot = useRef<Mapping | null>(null)
 
   // baseline: per block, the round-tripped markdown (comparison form) + structure
   const initial = useMemo(() => loadDoc(doc), [doc.docId])
@@ -162,7 +167,11 @@ export default function DocEditor({
         type: 'doc',
         content: initial.nodes.map((n) => n.toJSON()),
       },
-      onUpdate: ({ transaction }) => {
+      onUpdate: ({ transaction, appendedTransactions }) => {
+        if (sinceSnapshot.current) {
+          sinceSnapshot.current.appendMapping(transaction.mapping)
+          for (const t of appendedTransactions as Transaction[]) sinceSnapshot.current.appendMapping(t.mapping)
+        }
         // the post-save blockId stamp is our own bookkeeping, not an edit:
         // arming the debounce for it caused a spurious empty save 1.2s later
         if (transaction.getMeta(STAMP_META)) return
@@ -196,56 +205,40 @@ export default function DocEditor({
     if (editor.isEditable !== editable) editor.setEditable(editable, false)
   }, [editor, editable])
 
-  // extract entries (grouping consecutive nodes that share a blockId)
-  const extractEntries = (): Entry[] => (editor ? entriesOf(editor.state.doc) : [])
-
   const runSave = async () => {
     if (!editor || !editableRef.current) return
     autosave.current.cancel()
     // what this save writes; edits landing while the request is in flight
     // make the doc differ from it, and the editor must stay dirty for them
     const snapshot = editor.state.doc
-    const entries = extractEntries()
-    const assigned: string[] = []
-    const ops = computeOps(
-      baselineRef.current,
-      entries,
-      () => {
-        const id = crypto.randomUUID()
-        assigned.push(id)
-        return id
-      },
-      undefined,
-      doc.hidden ?? [],
-    )
+    // every new block gets its id here, before the diff: the insert carries
+    // it, and the node it came from is stamped with it by position (never by
+    // pairing inserts with id-less nodes in order — computeOps groups inserts
+    // by parent, so that pairing gave blocks each other's ids)
+    const { entries, ops, stamps } = planSave(snapshot, baselineRef.current, doc.hidden ?? [])
     if (ops.length === 0) {
       setSaveState('clean')
       return
     }
     setSaveState('saving')
+    const mapping = new Mapping()
+    sinceSnapshot.current = mapping
     try {
       const out = await api<{ epoch: number }>('/api/propose', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ doc_id: doc.docId, base_epoch: epochRef.current, ops }),
       })
+      sinceSnapshot.current = null
       const editedMeanwhile = !editor.state.doc.eq(snapshot)
-      // stamp fresh ids onto the inserted nodes so the next diff sees them
-      let cursor = 0
-      const inserted = ops
-        .filter((o) => o.kind.op === 'insert')
-        .map((o) => o.kind as unknown as { block_id: string; content: string })
-      if (editor && inserted.length) {
+      // stamp the assigned ids onto the inserted nodes so the next diff sees them
+      if (editor && !editor.isDestroyed && stamps.length) {
         const tr = editor.state.tr
-        editor.state.doc.forEach((node, pos) => {
-          if (!node.attrs.blockId && node.content.size > 0 && cursor < inserted.length) {
-            tr.setNodeAttribute(pos, 'blockId', inserted[cursor].block_id)
-            cursor++
-          }
-        })
-        tr.setMeta('addToHistory', false)
-        tr.setMeta(STAMP_META, true)
-        editor.view.dispatch(tr)
+        if (applyStamps(tr, stamps, mapping)) {
+          tr.setMeta('addToHistory', false)
+          tr.setMeta(STAMP_META, true)
+          editor.view.dispatch(tr)
+        }
       }
       // new baseline = what we just wrote
       baselineRef.current = rebuildBaseline(baselineRef.current, entries, ops)
@@ -265,6 +258,7 @@ export default function DocEditor({
       }
       onSaved(out.epoch, doc.docId)
     } catch (e) {
+      sinceSnapshot.current = null
       // the text is still in the editor and stays dirty; the retry clock
       // below keeps trying. Say so ONCE per distinct cause — a silent
       // failure here was how unsaved edits used to vanish.
@@ -364,7 +358,7 @@ export function loadDoc(doc: EditableDoc): { nodes: PMNode[]; baseline: Baseline
 
 /** The editor doc's top-level entries for the diff (consecutive nodes
  * sharing a blockId are one block; empty unsaved paragraphs are none). */
-export function entriesOf(doc: PMNode): Entry[] {
+export function entriesOf(doc: PMNode, positions?: number[]): Entry[] {
   const entries: Entry[] = []
   let run: { id: string; nodes: PMNode[] } | null = null
   const flushRun = () => {
@@ -377,7 +371,7 @@ export function entriesOf(doc: PMNode): Entry[] {
       run = null
     }
   }
-  doc.forEach((node) => {
+  doc.forEach((node, pos) => {
     if (node.type.name === 'paragraph' && node.content.size === 0 && !node.attrs.blockId) {
       return // empty unsaved paragraphs are not blocks
     }
@@ -387,6 +381,8 @@ export function entriesOf(doc: PMNode): Entry[] {
       return
     }
     flushRun()
+    // where the entry's first node sits (entries and positions stay parallel)
+    positions?.push(pos)
     if (id) run = { id, nodes: [node] }
     else
       entries.push({
@@ -399,6 +395,51 @@ export function entriesOf(doc: PMNode): Entry[] {
   return entries
 }
 
+/** A new block's id and the node it belongs on: `pos` is where that node
+ * started in the doc the save was planned from. */
+export interface Stamp {
+  pos: number
+  id: string
+  type: string
+}
+
+/** What one save writes: the entries (every new one already given its id),
+ * the ops, and the stamps that put those ids on their nodes once it lands. */
+export function planSave(
+  doc: PMNode,
+  baseline: BaselineBlock[],
+  hidden: HiddenBlock[],
+  newId: () => string = () => crypto.randomUUID(),
+): { entries: Entry[]; ops: Op[]; stamps: Stamp[] } {
+  const positions: number[] = []
+  const stamps: Stamp[] = []
+  const entries = entriesOf(doc, positions).map((e, i) => {
+    if (e.id) return e
+    const id = newId()
+    stamps.push({ pos: positions[i], id, type: doc.nodeAt(positions[i])!.type.name })
+    return { ...e, id }
+  })
+  const ops = computeOps(baseline, entries, newId, undefined, hidden)
+  return { entries, ops, stamps }
+}
+
+/** Put the saved ids on their nodes: each stamp's position is mapped through
+ * the edits made while the save was in flight. A node deleted meanwhile, or
+ * one that already carries an id, is left alone. True when anything was set. */
+export function applyStamps(tr: Transaction, stamps: Stamp[], mapping: Mapping): boolean {
+  let any = false
+  for (const s of stamps) {
+    const r = mapping.mapResult(s.pos, 1)
+    if (r.deleted || r.pos >= tr.doc.content.size) continue
+    if (tr.doc.resolve(r.pos).depth !== 0) continue
+    const node = tr.doc.nodeAt(r.pos)
+    if (!node || node.type.name !== s.type || node.attrs.blockId) continue
+    tr.setNodeAttribute(r.pos, 'blockId', s.id)
+    any = true
+  }
+  return any
+}
+
 /** After a successful save the written entries ARE the new baseline. */
 export function rebuildBaseline(
   old: BaselineBlock[],
@@ -407,6 +448,13 @@ export function rebuildBaseline(
 ): BaselineBlock[] {
   const oldById = new Map(old.map((b) => [b.id, b]))
   const inserts = ops.filter((o) => o.kind.op === 'insert')
+  type Ins = { block_id: string; parent_id: string | null; order_key: string }
+  // an entry that carries its insert's id takes that insert's place, whatever
+  // order computeOps emitted the inserts in (it groups them by parent)
+  const insertById = new Map(inserts.map((o) => [o.kind.block_id as string, o.kind as unknown as Ins]))
+  const claimed = new Set<string>()
+  for (const e of entries) if (e.id && insertById.has(e.id)) claimed.add(e.id)
+  const unclaimed = inserts.filter((o) => !claimed.has(o.kind.block_id as string))
   const moves = new Map(
     ops
       .filter((o) => o.kind.op === 'move')
@@ -415,7 +463,10 @@ export function rebuildBaseline(
   let insertCursor = 0
   const out: BaselineBlock[] = []
   for (const e of entries) {
-    if (e.id) {
+    const ins = e.id ? insertById.get(e.id) : undefined
+    if (ins && !oldById.has(e.id!)) {
+      out.push({ id: ins.block_id, content: e.content, parent: ins.parent_id, order_key: ins.order_key })
+    } else if (e.id) {
       const prev = oldById.get(e.id)
       const mv = moves.get(e.id)
       out.push({
@@ -425,9 +476,9 @@ export function rebuildBaseline(
         order_key: mv ? mv.new_order_key : (prev?.order_key ?? 'i'),
       })
     } else {
-      const ins = inserts[insertCursor++]?.kind as unknown as
-        | { block_id: string; parent_id: string | null; order_key: string }
-        | undefined
+      // id-less entries (callers that leave the ids to computeOps) pair with
+      // the remaining inserts in order: right only when those share a parent
+      const ins = unclaimed[insertCursor++]?.kind as unknown as Ins | undefined
       if (ins)
         out.push({ id: ins.block_id, content: e.content, parent: ins.parent_id, order_key: ins.order_key })
     }
