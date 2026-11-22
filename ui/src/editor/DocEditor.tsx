@@ -16,7 +16,7 @@ import { CodeHighlight } from './CodeHighlight'
 import { ReviewHighlight, ReviewMap, ReviewExtras, setReviewMap } from './ReviewHighlight'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import type { Transaction } from '@tiptap/pm/state'
-import { api, Block } from '../types'
+import { api, ApiError, Block } from '../types'
 import { withCsrf } from '../auth'
 import { notify } from '../Notice'
 import { isPermanentSaveError, permanentSaveErrorText, saveErrorText } from '../hints'
@@ -180,6 +180,10 @@ export function isOwnEpoch(base: number, epoch: number): boolean {
   return epoch === base + 1
 }
 
+/** A propose sent (or about to be) and what it writes, for adopting its
+ * answer whenever it comes. */
+type Unsent = PendingRequest & { entries: Entry[]; ops: Op[]; base: number }
+
 type SaveState = 'clean' | 'dirty' | 'saving'
 /** What DocView's save indicator shows: `failed` = dirty after a save error. */
 export type EditorSaveState = SaveState | 'failed'
@@ -232,8 +236,10 @@ export default function DocEditor({
   /** ids this editor stamped whose save has not landed yet (planSave keeps
    * them; any other id outside the baseline is not this doc's) */
   const ownStamped = useRef(new Set<string>())
-  /** the request being retried, so a retry carries the same request_id */
-  const pending = useRef<PendingRequest | null>(null)
+  /** the request sent whose answer has not come (failed, or the keepalive
+   * as the page went): a retry carries the same request_id, and a later,
+   * different save sends it first and adopts its answer */
+  const pending = useRef<Unsent | null>(null)
   const stateCb = useRef(onSaveState)
   stateCb.current = onSaveState
   useEffect(() => {
@@ -351,53 +357,86 @@ export default function DocEditor({
       editor.view.dispatch(tr)
     }
     const base = epochRef.current
-    if (ops.length === 0) return { entries, ops, base, req: null }
-    const req = requestFor(pending.current, JSON.stringify({ doc_id: doc.docId, base_epoch: base, ops }))
-    pending.current = req
-    return { entries, ops, base, req }
+    const body = ops.length ? JSON.stringify({ doc_id: doc.docId, base_epoch: base, ops }) : null
+    return { entries, ops, base, body }
+  }
+  /** `plan` as the request to send: the pending one when it is the same
+   * request (a retry keeps its request_id), else a new one */
+  const asRequest = (plan: { entries: Entry[]; ops: Op[]; base: number; body: string }): Unsent => {
+    const r = requestFor(pending.current, plan.body)
+    return r === pending.current ? pending.current : { ...r, entries: plan.entries, ops: plan.ops, base: plan.base }
+  }
+  const send = (r: Unsent) =>
+    api<{ epoch: number }>('/api/propose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...JSON.parse(r.body), request_id: r.id }),
+    })
+  /** a request's answer: what it wrote is the baseline now */
+  const adopt = (r: Unsent, epoch: number) => {
+    if (pending.current === r) pending.current = null
+    baselineRef.current = rebuildBaseline(baselineRef.current, r.entries, r.ops)
+    // landed: these ids are the baseline's now (one deleted later and
+    // brought back by undo must not pass as a pending one of ours)
+    for (const b of baselineRef.current) ownStamped.current.delete(b.id)
+    epochRef.current = epoch
   }
 
   const runSave = async () => {
     if (!editor || !editableRef.current) return
     autosave.current.cancel()
-    const { entries, ops, base, req } = prepare()!
-    // what this save writes; edits landing while the request is in flight
-    // make the doc differ from it, and the editor must stay dirty for them
-    const snapshot = editor.state.doc
-    if (!req) {
-      setSaveState('clean')
-      return
-    }
-    setSaveState('saving')
+    let plan = prepare()!
     try {
-      const out = await api<{ epoch: number }>('/api/propose', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...JSON.parse(req.body), request_id: req.id }),
-      })
-      pending.current = null
+      // an earlier request whose answer never came (a network failure, the
+      // page's keepalive before a bfcache return) may have landed: send it
+      // again under its own request_id first and adopt its answer, so what
+      // follows is planned on the right baseline and epoch (otherwise its
+      // inserts go out again on a stale base and park red)
+      const earlier = pending.current
+      if (earlier && earlier.body !== plan.body) {
+        setSaveState('saving')
+        try {
+          const out = await send(earlier)
+          adopt(earlier, out.epoch)
+          onSaved(out.epoch, doc.docId, isOwnEpoch(earlier.base, out.epoch))
+        } catch (e) {
+          // refused by the daemon: it never applied, and there is nothing to adopt
+          if (!(e instanceof ApiError && e.code)) throw e
+          if (pending.current === earlier) pending.current = null
+        }
+        plan = prepare()!
+      }
+      // what this save writes; edits landing while the request is in flight
+      // make the doc differ from it, and the editor must stay dirty for them
+      const snapshot = editor.state.doc
+      if (!plan.body) {
+        lastSaveError.current = null
+        setFailed(false)
+        setStopped(false)
+        setSaveState('clean')
+        return
+      }
+      const req = asRequest({ ...plan, body: plan.body })
+      pending.current = req
+      setSaveState('saving')
+      const out = await send(req)
       const editedMeanwhile = !editor.state.doc.eq(snapshot)
-      // new baseline = what we just wrote
-      baselineRef.current = rebuildBaseline(baselineRef.current, entries, ops)
-      // landed: these ids are the baseline's now (one deleted later and
-      // brought back by undo must not pass as a pending one of ours)
-      for (const b of baselineRef.current) ownStamped.current.delete(b.id)
-      epochRef.current = out.epoch
+      adopt(req, out.epoch)
       lastSaveError.current = null
       setFailed(false)
       setStopped(false)
       // typed during the request? those keystrokes are not in what landed
-      const plan = afterSave({ editedMeanwhile, mounted: mounted.current })
-      lastPlan.current = plan
-      if (plan === 'clean') {
+      const after = afterSave({ editedMeanwhile, mounted: mounted.current })
+      lastPlan.current = after
+      if (after === 'clean') {
         setSaveState('clean')
       } else {
         setSaveState('dirty')
         // 'save-now' (typed then switched doc) is driven by the unmount
         // cleanup below — no debounce or retry clock survives the unmount
-        if (plan === 'rearm') autosave.current.arm()
+        if (after === 'rearm') autosave.current.arm()
       }
-      onSaved(out.epoch, doc.docId, isOwnEpoch(base, out.epoch))
+      onSaved(out.epoch, doc.docId, isOwnEpoch(req.base, out.epoch))
     } catch (e) {
       // the text is still in the editor and stays dirty; the retry clock
       // below keeps trying. Say so ONCE per distinct cause — a silent
@@ -408,6 +447,10 @@ export default function DocEditor({
       // every 5 s forever only repeats the refusal
       const permanent = isPermanentSaveError(e)
       if (permanent) setStopped(true)
+      // the daemon answered with a refusal: nothing applied (only an applied
+      // answer is kept for its request_id), so there is no outcome to fetch.
+      // A network failure or a bare 5xx page is the unknown case: it stays
+      if (e instanceof ApiError && e.code) pending.current = null
       const msg = permanent ? permanentSaveErrorText(e) : saveErrorText(e)
       if (lastSaveError.current !== msg) {
         lastSaveError.current = msg
@@ -458,7 +501,12 @@ export default function DocEditor({
   keepaliveRef.current = () => {
     if (stateRef.current === 'clean' || inFlight.current || !editableRef.current || !editor) return
     const plan = prepare()
-    if (!plan?.req) return
+    if (!plan) return
+    // an earlier request with no answer goes as it was (same id): a page
+    // cannot sequence two keepalives, and that one may already have landed
+    const req = pending.current && pending.current.body !== plan.body ? pending.current : plan.body ? asRequest({ ...plan, body: plan.body }) : null
+    if (!req) return
+    pending.current = req
     try {
       void fetch(
         '/api/propose',
@@ -466,7 +514,7 @@ export default function DocEditor({
           method: 'POST',
           keepalive: true,
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...JSON.parse(plan.req.body), request_id: plan.req.id }),
+          body: JSON.stringify({ ...JSON.parse(req.body), request_id: req.id }),
         }),
       ).catch(() => {})
     } catch {
@@ -480,11 +528,19 @@ export default function DocEditor({
       e.returnValue = ''
     }
     const onPageHide = () => keepaliveRef.current()
+    // back from the bfcache: the keepalive's answer was never read. Ask
+    // again under its request_id (the daemon answers what it did) and adopt
+    // that before anything new is planned on a stale epoch
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (e.persisted && (pending.current || stateRef.current !== 'clean')) void saveRef.current()
+    }
     window.addEventListener('beforeunload', onBeforeUnload)
     window.addEventListener('pagehide', onPageHide)
+    window.addEventListener('pageshow', onPageShow)
     return () => {
       window.removeEventListener('beforeunload', onBeforeUnload)
       window.removeEventListener('pagehide', onPageHide)
+      window.removeEventListener('pageshow', onPageShow)
     }
   }, [])
 
