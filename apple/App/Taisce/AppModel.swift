@@ -105,6 +105,13 @@ final class AppModel {
     /// docs whose "edited by" is due again (a sync touched them): the old
     /// one shows until the new one arrives, so the header never jumps
     private(set) var staleMeta: Set<DocID> = []
+    /// when each doc was last marked stale (`metaMarks` then): a fetch
+    /// clears only marks made before it began, not one a newer change made
+    /// while it was out
+    @ObservationIgnored private var staleMark: [DocID: Int] = [:]
+    @ObservationIgnored private var metaMarks = 0
+    /// callers waiting for a doc's in-flight fetch to end
+    @ObservationIgnored private var metaWaiters: [DocID: [CheckedContinuation<Void, Never>]] = [:]
     /// to-dos marked done or snoozed here, hidden until the server's list catches up
     private(set) var settledTodos: Set<String> = []
     /// a doc just created here: its screen opens in edit mode
@@ -767,19 +774,53 @@ final class AppModel {
     }
 
     /// Who last edited the doc, from its ledger; cached until the doc changes.
-    /// One request per doc at a time: a doc already being fetched is left to
-    /// that fetch.
+    /// One request per doc at a time: a doc already being fetched (a Library
+    /// batch) is waited for, then fetched here only if that fetch failed or
+    /// the doc changed again while it was out.
     func loadEditMeta(_ id: DocID) async {
-        guard needsEditMeta(id), let api else { return }
-        metaInFlight.insert(id)
-        let asked = metaGeneration
-        let history = try? await api.docHistory(id)
-        guard asked == metaGeneration else { return }
-        metaInFlight.remove(id)
-        if let history, let meta = EditMeta(history: history) {
-            editMeta[id] = meta
+        var waits = 0
+        while true {
+            // another fetch has it (a batch, maybe going round again): wait it out
+            if metaInFlight.contains(id), waits < 3 {
+                waits += 1
+                await metaFetchEnded(id)
+                continue
+            }
+            guard needsEditMeta(id), let api else { return }
+            metaInFlight.insert(id)
+            let asked = metaGeneration
+            let since = metaMarks
+            let history = try? await api.docHistory(id)
+            guard asked == metaGeneration else { return }
+            endMetaFetch([id])
+            let meta = history.flatMap(EditMeta.init(history:))
+            if let meta { editMeta[id] = meta }
+            clearStale([id], markedBy: since)
+            // failed: the next change or visit asks again (no retry loop offline)
+            if meta == nil { return }
         }
-        staleMeta.remove(id)
+    }
+
+    /// Wait until the fetch of `id` in flight now has landed (or the
+    /// metadata was forgotten).
+    private func metaFetchEnded(_ id: DocID) async {
+        guard metaInFlight.contains(id) else { return }
+        await withCheckedContinuation { metaWaiters[id, default: []].append($0) }
+    }
+
+    private func endMetaFetch(_ ids: some Sequence<DocID>) {
+        for id in ids {
+            metaInFlight.remove(id)
+            metaWaiters.removeValue(forKey: id)?.forEach { $0.resume() }
+        }
+    }
+
+    /// Stale marks on `ids` made before a fetch that began at `since`.
+    private func clearStale(_ ids: some Sequence<DocID>, markedBy since: Int) {
+        let done = ids.filter { staleMark[$0].map { $0 <= since } ?? true }
+        guard !staleMeta.isDisjoint(with: done) else { return }
+        staleMeta.subtract(done)
+        for id in done { staleMark[id] = nil }
     }
 
     func resetEditMeta() {
@@ -788,6 +829,9 @@ final class AppModel {
         metaBatch = nil
         metaWanted = []
         metaInFlight = []
+        let waiters = metaWaiters
+        metaWaiters = [:]
+        waiters.values.joined().forEach { $0.resume() }
         editMeta = [:]
     }
 
@@ -822,6 +866,7 @@ final class AppModel {
             metaWanted = []
             guard let api, !ids.isEmpty else { return }
             metaInFlight.formUnion(ids)
+            let since = metaMarks
             let found = await withTaskGroup(of: (DocID, EditMeta?).self) { group in
                 var out: [(DocID, EditMeta?)] = []
                 var next = ids.makeIterator()
@@ -838,17 +883,23 @@ final class AppModel {
                 return out
             }
             guard asked == metaGeneration else { return }
-            metaInFlight.subtract(ids)
             var meta = editMeta
             for case let (id, m?) in found { meta[id] = m }
             if meta != editMeta { editMeta = meta }
-            if !staleMeta.isDisjoint(with: ids) { staleMeta.subtract(ids) }
+            clearStale(ids, markedBy: since)
+            // changed again while out: asked once more (a failed one is not)
+            let landed = Set(found.compactMap { $0.1 == nil ? nil : $0.0 })
+            for id in ids where landed.contains(id) && staleMeta.contains(id) && !metaWanted.contains(id) { metaWanted.append(id) }
+            // waiters (a doc's screen) after the batch's state is in place
+            endMetaFetch(ids)
         }
     }
 
     /// A sync touched these docs (our own save's echo included): their
     /// "edited by" is fetched again, the old one showing meanwhile.
     func metaChanged(_ ids: some Sequence<DocID>) {
+        metaMarks += 1
+        for id in ids { staleMark[id] = metaMarks }
         staleMeta.formUnion(ids)
     }
 

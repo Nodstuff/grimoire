@@ -13,6 +13,8 @@ final class HeldServer: URLProtocol {
     static let log = Mutex<[URLRequest]>([])
     static let held = Mutex<[String]>([])
     static let routes = Mutex<[String: String]>([:])
+    /// paths answered 404 the first time they are asked, as routed after
+    static let failOnce = Mutex<Set<String>>([])
     /// every path asked, in order
     static let hits = Mutex<[String]>([])
     static let todoDay = #"{"carried":0,"date":"2026-10-01","doc_id":"t","epoch":3,"items":[],"prev_date":null,"today":"2026-10-01"}"#
@@ -22,6 +24,7 @@ final class HeldServer: URLProtocol {
         held.withLock { $0 = [] }
         routes.withLock { $0 = [:] }
         hits.withLock { $0 = [] }
+        failOnce.withLock { $0 = [] }
     }
 
     override class func canInit(with request: URLRequest) -> Bool {
@@ -54,7 +57,9 @@ final class HeldServer: URLProtocol {
             DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(10)) { self.answer(path: path, deadline: deadline) }
             return
         }
-        let routed: String? = path.hasPrefix("/api/todo") && request.httpMethod == "POST" ? Self.todoDay : Self.routes.withLock { $0[path] }
+        let failing = Self.failOnce.withLock { $0.remove(path) != nil }
+        var routed: String? = path.hasPrefix("/api/todo") && request.httpMethod == "POST" ? Self.todoDay : Self.routes.withLock { $0[path] }
+        if failing { routed = nil }
         let status = routed == nil ? 404 : 200
         let body = routed ?? #"{"error":"not here"}"#
         let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
@@ -230,6 +235,64 @@ final class HeldServer: URLProtocol {
         m.wantEditMeta("lib1")
         try await Task.sleep(for: .milliseconds(250))
         #expect(asked().count == 10)
+    }
+
+    static let historyRow = #"[{"op":{"id":"0199a0b0-c0d0-7abc-8def-0123456789ab","doc_id":"x","epoch_applied":4},"principal_name":"Ann","principal_kind":"human"}]"#
+
+    /// Review of 317728a (nit): a doc's screen asking while a Library batch
+    /// has the doc in flight waits for it, and when that fetch fails asks
+    /// itself, so the header still gets its "edited by".
+    @Test func aDocScreenAsksAgainWhenTheBatchItWaitedOnFails() async throws {
+        URLProtocol.registerClass(HeldServer.self)
+        defer { URLProtocol.unregisterClass(HeldServer.self) }
+        HeldServer.reset()
+        defer { HeldServer.reset() }
+        let m = try await HeldServer.model()
+        m.metaBatchDelay = .milliseconds(1)
+        HeldServer.routes.withLock { $0["/api/doc/d1/history"] = Self.historyRow }
+        HeldServer.failOnce.withLock { $0 = ["/api/doc/d1/history"] }
+        HeldServer.held.withLock { $0 = ["/api/doc/"] }
+        func asked() -> Int { HeldServer.hits.withLock { $0 }.filter { $0 == "/api/doc/d1/history" }.count }
+        m.wantEditMeta("d1")
+        for _ in 0..<300 where asked() == 0 { try await Task.sleep(for: .milliseconds(10)) }
+        let screen = Task { await m.loadEditMeta("d1") }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(asked() == 1, "the screen waits for the batch's fetch")
+        HeldServer.held.withLock { $0 = [] }
+        await screen.value
+        #expect(asked() == 2, "asked again after the batch's fetch failed")
+        #expect(m.editMeta["d1"] != nil)
+    }
+
+    /// Review of 317728a (nit): a doc marked stale while its fetch is out
+    /// stays stale when that (older) answer lands, and is asked again: the
+    /// doc's screen and a Library batch alike.
+    @Test func aChangeDuringAFetchIsNotClearedByIt() async throws {
+        URLProtocol.registerClass(HeldServer.self)
+        defer { URLProtocol.unregisterClass(HeldServer.self) }
+        HeldServer.reset()
+        defer { HeldServer.reset() }
+        let m = try await HeldServer.model()
+        m.metaBatchDelay = .milliseconds(1)
+        HeldServer.routes.withLock { $0["/api/doc/d1/history"] = Self.historyRow; $0["/api/doc/d2/history"] = Self.historyRow }
+        func asked(_ id: String) -> Int { HeldServer.hits.withLock { $0 }.filter { $0 == "/api/doc/\(id)/history" }.count }
+        // the doc's screen
+        HeldServer.held.withLock { $0 = ["/api/doc/"] }
+        let screen = Task { await m.loadEditMeta("d1") }
+        for _ in 0..<300 where asked("d1") == 0 { try await Task.sleep(for: .milliseconds(10)) }
+        m.metaChanged(["d1"])
+        HeldServer.held.withLock { $0 = [] }
+        await screen.value
+        #expect(asked("d1") == 2, "the change made during the fetch is fetched")
+        #expect(!m.staleMeta.contains("d1") && m.editMeta["d1"] != nil)
+        // a Library batch
+        HeldServer.held.withLock { $0 = ["/api/doc/"] }
+        m.wantEditMeta("d2")
+        for _ in 0..<300 where asked("d2") == 0 { try await Task.sleep(for: .milliseconds(10)) }
+        m.metaChanged(["d2"])
+        HeldServer.held.withLock { $0 = [] }
+        for _ in 0..<300 where asked("d2") < 2 || m.staleMeta.contains("d2") { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(asked("d2") == 2 && !m.staleMeta.contains("d2"))
     }
 
     /// Review of 317728a (nit): a batch the reset cancelled loads nothing
