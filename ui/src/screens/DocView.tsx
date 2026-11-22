@@ -590,13 +590,14 @@ export default function DocView({
         removedCanvases: 0,
         frontmatter: [] as Block[],
       }
-    const { blocks, comments, allBlocks, hidden, removedCanvases } = splitTree(tree.roots)
+    const { blocks, comments, allBlocks, hidden, removedCanvases, frontmatter } = splitTree(tree.roots)
     return {
       editable: { docId, epoch: tree.doc.current_epoch, blocks, hidden },
       comments,
       allBlocks,
       removedCanvases,
-      frontmatter: allBlocks.filter((b) => b.block_type !== 'comment' && b.block_type !== 'canvas_scene' && b.content.startsWith('---')),
+      // only the first block, and only a closed YAML block: a rule is not it
+      frontmatter: frontmatter ? [frontmatter] : ([] as Block[]),
     }
   }, [tree, docId])
 
