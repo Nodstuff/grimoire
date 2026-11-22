@@ -445,16 +445,22 @@ impl SqliteStore {
                 .map(|r| r.map_err(StoreError::from).and_then(parse_id))
                 .collect::<Result<_>>()?
         };
+        // who is a member now: the workspace row's deletion cascades it away
+        let members: HashSet<Uuid> = {
+            let mut st = self.conn.prepare("SELECT user_id FROM workspace_members WHERE workspace_id = ?1")?;
+            st.query_map(params![id.to_string()], |r| r.get::<_, String>(0))?
+                .map(|r| r.map_err(StoreError::from).and_then(parse_id))
+                .collect::<Result<_>>()?
+        };
         let tx = self.conn.unchecked_transaction()?;
         let before = tenancy::access_snapshot(&tx)?;
         let labels = tx.execute("DELETE FROM doc_workspace WHERE workspace_id = ?1", params![id.to_string()])?;
         tx.execute("DELETE FROM workspaces WHERE id = ?1", params![id.to_string()])?;
         // every labelled root goes back to whoever put it there (ADR 0004):
         // its contributor (the doc's owner — the workspace owner, or a member
-        // who filed their own doc in). It stays where it now falls if they
-        // can write there; otherwise it comes to their own root, in their
-        // Unsorted. Ownership never changes hands as a side effect.
-        let _ = ws_owner;
+        // who filed their own doc in), if still a member. It stays where it
+        // now falls if they can write there; otherwise it comes to their own
+        // root, in their Unsorted.
         for d in labelled {
             let contributor: Option<String> = tx
                 .query_row(
@@ -465,6 +471,18 @@ impl SqliteStore {
                 .optional()?
                 .flatten();
             let Some(contributor) = contributor.and_then(|c| Uuid::parse_str(&c).ok()) else { continue };
+            // only a contributor who is still a member gets it back; one
+            // removed since (a database from before unshare re-homed their
+            // docs) must not receive content the workspace kept after they
+            // left: it goes to the workspace's owner (code review
+            // 2026-11-22, item 12)
+            let contributor = match (members.contains(&contributor), ws_owner) {
+                (false, Some(o)) => {
+                    tx.execute("UPDATE docs SET owner_id = ?1 WHERE id = ?2", params![o.to_string(), d.to_string()])?;
+                    o
+                }
+                _ => contributor,
+            };
             let Ok(lands) = tenancy::space_conn(&tx, d) else { continue };
             let can_write = tenancy::access_conn(&tx, Scope::User(contributor), lands)?.is_some_and(|r| r.can_write());
             if !can_write {
@@ -667,6 +685,25 @@ impl SqliteStore {
             "DELETE FROM workspace_members WHERE workspace_id = ?1 AND user_id = ?2 AND role != 'owner'",
             params![ws.to_string(), user.to_string()],
         )?;
+        // what they contributed stays in the workspace, so it stops being
+        // theirs: the workspace owner becomes its owner, and deleting the
+        // workspace later can never hand it back to someone who left (code
+        // review 2026-11-22, item 12)
+        if n > 0
+            && let Some(owner) = w.owner_id
+        {
+            let theirs: Vec<Uuid> = {
+                let mut st = tx.prepare("SELECT id FROM docs WHERE owner_id = ?1")?;
+                st.query_map(params![user.to_string()], |r| r.get::<_, String>(0))?
+                    .map(|r| r.map_err(StoreError::from).and_then(parse_id))
+                    .collect::<Result<_>>()?
+            };
+            for d in theirs {
+                if tenancy::space_conn(&tx, d)? == Space::Workspace(ws) {
+                    tx.execute("UPDATE docs SET owner_id = ?1 WHERE id = ?2", params![owner.to_string(), d.to_string()])?;
+                }
+            }
+        }
         tenancy::journal_access_diff(&tx, before)?;
         // their links to its docs die with their access
         let revoked = if n > 0 { crate::shares::revoke_on_unshare(&tx, ws, user)? } else { 0 };
@@ -689,6 +726,29 @@ mod tests {
 
     fn tree_rows_after(s: &SqliteStore, seq: i64) -> Vec<String> {
         s.changes_since(seq, 1000).unwrap().changes.into_iter().filter(|c| c.kind == "tree").map(|c| c.doc_id).collect()
+    }
+
+    /// A database from before unshare re-homed contributions: a labelled
+    /// root still owned by someone no longer a member goes to the
+    /// workspace's owner on delete (code review 2026-11-22, item 12).
+    #[test]
+    fn delete_hands_a_former_members_root_to_the_owner() {
+        let (mut s, h) = setup();
+        let a = s.auth_ensure_owner(h, "tom", 1).unwrap().id;
+        let b = s.auth_add_user("ann", 1).unwrap();
+        let (ws, d) = s.with_scope_for_test(Scope::User(a), |s| {
+            let ws = s.create_workspace("Family", None, None, None).unwrap().id;
+            let d = s.create_doc("Filed", None, h).unwrap().id;
+            s.set_doc_workspace(d, Some(ws), h).unwrap();
+            (ws, d)
+        });
+        // legacy: owned by B, who is not a member
+        s.conn.execute("UPDATE docs SET owner_id = ?1 WHERE id = ?2", params![b.id.to_string(), d.to_string()]).unwrap();
+        s.with_scope_for_test(Scope::User(a), |s| {
+            s.delete_workspace(ws).unwrap();
+            assert!(s.get_doc(d).is_ok(), "the owner keeps it");
+        });
+        s.with_scope_for_test(Scope::User(b.id), |s| assert!(matches!(s.get_doc(d), Err(StoreError::NotFound(_)))));
     }
 
     #[test]

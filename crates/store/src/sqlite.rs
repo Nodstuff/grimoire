@@ -2082,7 +2082,11 @@ impl BlockStore for SqliteStore {
             )?;
         }
         // a parent that is itself still in the trash would hide the restored
-        // doc again: surface it at the root instead
+        // doc again: surface it at the root instead, in the space it was in.
+        // Unlabelled at the root it would fall to its owner_id's Unsorted:
+        // out of a shared workspace, possibly to someone no longer a member
+        // (code review 2026-11-22, item 12). A doc that was in a workspace
+        // keeps it, at the workspace's top level.
         if let Some(p) = parent {
             let parent_deleted: i64 = tx.query_row(
                 "SELECT coalesce((SELECT deleted FROM docs WHERE id = ?1), 1)",
@@ -2090,10 +2094,20 @@ impl BlockStore for SqliteStore {
                 |r| r.get(0),
             )?;
             if parent_deleted == 1 {
+                let was = tenancy::space_conn(&tx, doc_id)?;
                 tx.execute(
                     "UPDATE docs SET parent_id = NULL WHERE id = ?1",
                     params![doc_id.to_string()],
                 )?;
+                if let tenancy::Space::Workspace(w) = was
+                    && crate::workspaces::label_conn(&tx, doc_id)?.is_none()
+                {
+                    tx.execute(
+                        "INSERT INTO doc_workspace (doc_id, workspace_id) VALUES (?1, ?2)",
+                        params![doc_id.to_string(), w.to_string()],
+                    )?;
+                }
+                debug_assert_eq!(tenancy::space_conn(&tx, doc_id).ok(), Some(was));
             }
         }
         tenancy::journal_access_diff(&tx, before)?;

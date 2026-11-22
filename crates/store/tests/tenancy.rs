@@ -1180,3 +1180,54 @@ fn declining_an_agent_move_does_not_move_a_doc_where_the_reviewer_cannot() {
     // A sees nothing of D
     not_found(t.store.lock(Scope::User(t.a)).get_doc(d));
 }
+
+/// Code review 2026-11-22, item 12 (Trash): B filed her own doc into A's
+/// Family and wrote under it; after B leaves, A restores a doc whose parent
+/// is still in the Trash. It surfaces at Family's top level, never in B's
+/// Unsorted (she is no longer a member) nor out of the workspace.
+#[test]
+fn a_restored_doc_stays_in_its_workspace_and_never_lands_with_a_former_member() {
+    let t = setup();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    let (rb, p, d) = {
+        let mut s = t.store.lock(Scope::User(t.b));
+        let rb = s.create_doc("B's own", None, t.b_human).unwrap().id;
+        s.set_doc_workspace(rb, Some(t.family), t.b_human).unwrap();
+        let p = s.create_doc("P", Some(rb), t.b_human).unwrap().id;
+        let (d, _) = s.create_doc_with_ops("D", Some(p), t.b_human, vec![para("family content")]).unwrap();
+        (rb, p, d.id)
+    };
+    {
+        let mut s = t.store.lock(Scope::User(t.a));
+        s.delete_doc(d).unwrap();
+        s.delete_doc(p).unwrap();
+        s.unshare_workspace(t.family, t.b).unwrap();
+        s.restore_doc(d).unwrap();
+        assert_eq!(s.get_doc(d).unwrap().parent_id, None, "its parent is still in the Trash");
+        assert_eq!(s.doc_workspace(d).unwrap(), Some(t.family), "still in Family");
+    }
+    not_found(t.store.lock(Scope::User(t.b)).get_doc(d));
+    let _ = rb;
+}
+
+/// Code review 2026-11-22, item 12 (delete): B's contribution to Family,
+/// left behind when she was removed, goes to Family's owner when the
+/// workspace is deleted, not back to B.
+#[test]
+fn deleting_a_workspace_never_hands_a_doc_to_a_former_member() {
+    let t = setup();
+    t.store.lock(Scope::User(t.a)).share_workspace(t.family, t.b, Role::Editor).unwrap();
+    let rb = {
+        let mut s = t.store.lock(Scope::User(t.b));
+        let (rb, _) = s.create_doc_with_ops("B's filed doc", None, t.b_human, vec![para("written together")]).unwrap();
+        s.set_doc_workspace(rb.id, Some(t.family), t.b_human).unwrap();
+        rb.id
+    };
+    {
+        let mut s = t.store.lock(Scope::User(t.a));
+        s.unshare_workspace(t.family, t.b).unwrap();
+        s.delete_workspace(t.family).unwrap();
+        assert!(s.get_doc(rb).is_ok(), "A keeps it");
+    }
+    not_found(t.store.lock(Scope::User(t.b)).get_doc(rb));
+}
