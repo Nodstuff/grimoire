@@ -289,6 +289,27 @@ final class TestClock: Sendable {
         #expect(store.loadOwedDeletes().isEmpty)
     }
 
+    /// Review of f12c5e0 (#3): a registration of the token an owed delete
+    /// names, on the same server, took the token over (the server upserts
+    /// on it): the delete is owed no more, so it can never later delete the
+    /// new account's own registration. One owed for another token stays.
+    @Test func registeringTheOwedTokenClearsItsDelete() async throws {
+        let store = MemoryPushStore()
+        store.saveOwedDeletes([OwedPushDelete(server: "https://s", token: "aa"), OwedPushDelete(server: "https://s", token: "old")])
+        let push = registrar(store, TestClock(Self.t0))
+        await push.didRegister(token: "aa")
+        // the settle fails (the delete endpoint unreachable), the registration goes
+        let flaky = MockServer { r in r.httpMethod == "DELETE" ? MockServer.Reply(chunks: [], failAfter: true) : .json(#"{"ok":true}"#) }
+        #expect(await push.connect(server: "https://s", registry: flaky.client()) == .sent)
+        #expect(flaky.requests.last?.httpMethod == "POST")
+        #expect(store.loadOwedDeletes() == [OwedPushDelete(server: "https://s", token: "old")], "aa's delete would remove our own registration")
+        // the next settle deletes only the other token
+        let up = Self.server()
+        #expect(await push.settleOwedDelete(server: "https://s", registry: up.client()) == .sent)
+        #expect(up.requests.map(\.path) == ["/api/devices/old"])
+        #expect(store.load()?.registration.token == "aa")
+    }
+
     @Test func aServerSwitchSendsToTheNewServerAndOnlyItDeletes() async throws {
         let a = Self.server()
         let b = Self.server()

@@ -232,6 +232,10 @@ public actor PushRegistrar {
         if self.token == token, self.server == server {
             store.save(SentPushRegistration(server: server, registration: registration, sentAt: at))
         }
+        // the server upserts on the token, so this registration took the
+        // token from whoever held it there: a delete still owed for it would
+        // now delete ours (the bearer's own token), so it is owed no more
+        forgetOwed(OwedPushDelete(server: server, token: token))
         return .sent
     }
 
