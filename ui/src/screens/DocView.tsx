@@ -464,7 +464,12 @@ export default function DocView({
   const behind = useRef(false)
   // the byline's version: our own saves move it without a tree refetch
   const [savedEpoch, setSavedEpoch] = useState(0)
-  const [editorGen, setEditorGen] = useState(0)
+  // remounts of THIS doc's editor (fresh content from the server): it counts
+  // per doc, so another doc opened in this instance starts at 0 and never
+  // restores (and focuses) a cursor from an earlier visit
+  const [gens, setGens] = useState<{ docId: string; n: number }>({ docId, n: 0 })
+  const editorGen = gens.docId === docId ? gens.n : 0
+  const remountEditor = useCallback(() => setGens((g) => ({ docId, n: (g.docId === docId ? g.n : 0) + 1 })), [docId])
   const [saveState, setSaveState] = useState<EditorSaveState>('clean')
   const saveStateRef = useRef<EditorSaveState>('clean')
   saveStateRef.current = saveState
@@ -542,13 +547,13 @@ export default function DocView({
         // doc's already, so it keeps its undo history and cursor
         const caughtUp = editorFor(docId)?.catchUp(splitTree(next.roots).blocks, next.doc.current_epoch) ?? false
         setTree(next)
-        if (!caughtUp) setEditorGen((g) => g + 1)
+        if (!caughtUp) remountEditor()
         return
       }
       if (verdict === 'defer') behind.current = true
       if (always || next.doc.status !== cur.doc.status) setTree(next)
     },
-    [docId],
+    [docId, remountEditor],
   )
 
   const loadTree = useCallback(() => {

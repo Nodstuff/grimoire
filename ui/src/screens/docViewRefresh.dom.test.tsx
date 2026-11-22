@@ -137,3 +137,31 @@ describe('reloadVerdict', () => {
     expect(reloadVerdict({ ...base, next: 7, lastSaved: 8, behind: true })).toBe('defer')
   })
 })
+
+describe('another doc in the same DocView', () => {
+  it('starts with no remount count: it never restores a cursor from an earlier visit', async () => {
+    const server = fakeServer(makeTree(5, [['a', 'alpha beta'], ['b', 'beta']]))
+    const e = makeTree(3, [['x', 'echo text']])
+    e.doc = { ...e.doc, id: 'e' }
+    server.others.e = e
+    const v = await mountDocView(0)
+    await v.render(0, 'e')
+    await advance(10)
+    await act(async () => {
+      v.editor()!.commands.setTextSelection(4)
+    })
+    // to d, whose editor then remounts once (an agent's edit)
+    await v.render(0, 'd')
+    await advance(10)
+    server.tree = makeTree(6, [['a', 'alpha beta'], ['b', 'beta by agent']])
+    await v.render(1, 'd')
+    await advance(50)
+    expect(v.text()).toContain('beta by agent')
+    // back to e: a fresh open, the cursor at the start
+    await v.render(1, 'e')
+    await advance(50)
+    expect(v.text()).toContain('echo text')
+    expect(v.editor()!.state.selection.anchor).toBe(1)
+    await v.unmount()
+  })
+})

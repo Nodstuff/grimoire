@@ -16,6 +16,8 @@ export interface FakeServer {
   /** answer to a POST /api/resolve (default: ok) */
   resolve: (body: Record<string, unknown>) => unknown
   review: QueueRow[]
+  /** other docs by id (GET /api/doc/<id>) */
+  others: Record<string, DocTree>
   calls: { path: string; method: string; body: Record<string, unknown> | null }[]
 }
 
@@ -33,6 +35,7 @@ export function fakeServer(tree: DocTree): FakeServer {
     propose: (body) => ({ doc_id: 'd', epoch: (body.base_epoch as number) + 1, verdicts: [] }),
     resolve: () => ({ ok: true }),
     review: [],
+    others: {},
     calls: [],
   }
   vi.stubGlobal(
@@ -42,7 +45,9 @@ export function fakeServer(tree: DocTree): FakeServer {
       const body = init.body ? JSON.parse(String(init.body)) : null
       server.calls.push({ path, method, body })
       let r: unknown = []
+      const other = /^\/api\/doc\/([^/]+)$/.exec(path)
       if (path === '/api/doc/d') r = server.tree
+      else if (other && server.others[other[1]]) r = server.others[other[1]]
       else if (path === '/api/propose') r = server.propose(body)
       else if (path === '/api/resolve') r = server.resolve(body)
       else if (path === '/api/doc/d/review') r = server.review
@@ -59,10 +64,10 @@ export async function mountDocView(dataVersion = 0, panel: Panel = 'closed') {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const root = createRoot(el)
-  const render = async (dv: number) =>
+  const render = async (dv: number, docId = 'd') =>
     act(async () => {
       root.render(
-        <DocView docId="d" onOpenDoc={() => {}} docs={[]} dataVersion={dv} panel={panel} setPanel={() => {}} />,
+        <DocView docId={docId} onOpenDoc={() => {}} docs={[]} dataVersion={dv} panel={panel} setPanel={() => {}} />,
       )
     })
   await render(dataVersion)
