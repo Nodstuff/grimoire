@@ -59,6 +59,32 @@ import Testing
         #expect(try await cache.fabricTurns(s1).older == false)
     }
 
+    /// The contiguity watermark: only a route read moves it, it never goes
+    /// back, and a stream turn held above it does not pass it (what ended in
+    /// between may be missing: the top-up asks from the watermark).
+    @Test func theWatermarkMovesOnlyForwardAndOnlyFromARouteRead() async throws {
+        let cache = try Cache.inMemory()
+        #expect(try await cache.fabricTurns(s1).synced == nil, "nothing held")
+        try await cache.cacheFabricTurns((1...3).map { turn("t\($0)", $0 * 10) }, olderBeyond: false, syncedThrough: 30)
+        #expect(try await cache.fabricTurns(s1).synced == 30)
+        // the stream's turn, after a hole (t4 ended while the app was away)
+        try await cache.cacheFabricTurns([turn("t5", 50)])
+        let held = try await cache.fabricTurns(s1)
+        #expect(held.turns.map(\.turnID) == ["t1", "t2", "t3", "t5"] && held.synced == 30, "a stream turn never moves it")
+        // an older page (`before=`) says nothing newer: an earlier mark is ignored
+        try await cache.cacheFabricTurns([turn("t0", 5)], olderBeyond: false, syncedThrough: 5)
+        #expect(try await cache.fabricTurns(s1).synced == 30)
+        try await cache.cacheFabricTurns([turn("t4", 40), turn("t5", 50)], syncedThrough: 50)
+        #expect(try await cache.fabricTurns(s1).synced == 50)
+        // replaced (an old server's page): the mark is the page's
+        try await cache.replaceFabricTurns(s1, with: [turn("t9", 90)], older: true, syncedThrough: 90)
+        #expect(try await cache.fabricTurns(s1).synced == 90)
+        // dropped and wiped with the turns
+        try await cache.dropFabricTurns([s1])
+        try await cache.cacheFabricTurns([turn("t10", 100)])
+        #expect(try await cache.fabricTurns(s1).synced == nil, "a session dropped starts again unknown")
+    }
+
     @Test func textOffTurnsAreKeptWithoutTheirWords() async throws {
         let cache = try Cache.inMemory()
         // the live event carries the words; what is written never does
