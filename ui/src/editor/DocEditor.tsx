@@ -13,7 +13,6 @@ import { WikilinkDeco } from './WikilinkDeco'
 import { CodeHighlight } from './CodeHighlight'
 import { ReviewHighlight, ReviewMap, ReviewExtras, setReviewMap } from './ReviewHighlight'
 import type { Node as PMNode } from '@tiptap/pm/model'
-import { Mapping } from '@tiptap/pm/transform'
 import type { Transaction } from '@tiptap/pm/state'
 import { api, Block } from '../types'
 import { notify } from '../Notice'
@@ -144,9 +143,6 @@ export default function DocEditor({
    * must not re-arm timers that no longer exist */
   const mounted = useRef(true)
   const lastPlan = useRef<AfterSave>('clean')
-  /** the edits made since the in-flight save took its snapshot: the stamps
-   * of the ids it assigned are mapped through them onto the live doc */
-  const sinceSnapshot = useRef<Mapping | null>(null)
 
   // baseline: per block, the round-tripped markdown (comparison form) + structure
   const initial = useMemo(() => loadDoc(doc), [doc.docId])
@@ -167,11 +163,7 @@ export default function DocEditor({
         type: 'doc',
         content: initial.nodes.map((n) => n.toJSON()),
       },
-      onUpdate: ({ transaction, appendedTransactions }) => {
-        if (sinceSnapshot.current) {
-          sinceSnapshot.current.appendMapping(transaction.mapping)
-          for (const t of appendedTransactions as Transaction[]) sinceSnapshot.current.appendMapping(t.mapping)
-        }
+      onUpdate: ({ transaction }) => {
         // the post-save blockId stamp is our own bookkeeping, not an edit:
         // arming the debounce for it caused a spurious empty save 1.2s later
         if (transaction.getMeta(STAMP_META)) return
@@ -208,38 +200,35 @@ export default function DocEditor({
   const runSave = async () => {
     if (!editor || !editableRef.current) return
     autosave.current.cancel()
+    // every new block gets its id here, before the diff, and the id goes on
+    // its node right away: the insert carries it, and an edit made while the
+    // request is in flight moves the node with its id (never pair inserts
+    // with id-less nodes in order — computeOps groups inserts by parent, so
+    // that pairing gave blocks each other's ids). A failed save keeps them,
+    // so its retry sends the same inserts.
+    const { entries, ops, stamps } = planSave(editor.state.doc, baselineRef.current, doc.hidden ?? [])
+    if (stamps.length && !editor.isDestroyed) {
+      const tr = editor.state.tr
+      applyStamps(tr, stamps)
+      tr.setMeta('addToHistory', false)
+      tr.setMeta(STAMP_META, true)
+      editor.view.dispatch(tr)
+    }
     // what this save writes; edits landing while the request is in flight
     // make the doc differ from it, and the editor must stay dirty for them
     const snapshot = editor.state.doc
-    // every new block gets its id here, before the diff: the insert carries
-    // it, and the node it came from is stamped with it by position (never by
-    // pairing inserts with id-less nodes in order — computeOps groups inserts
-    // by parent, so that pairing gave blocks each other's ids)
-    const { entries, ops, stamps } = planSave(snapshot, baselineRef.current, doc.hidden ?? [])
     if (ops.length === 0) {
       setSaveState('clean')
       return
     }
     setSaveState('saving')
-    const mapping = new Mapping()
-    sinceSnapshot.current = mapping
     try {
       const out = await api<{ epoch: number }>('/api/propose', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ doc_id: doc.docId, base_epoch: epochRef.current, ops }),
       })
-      sinceSnapshot.current = null
       const editedMeanwhile = !editor.state.doc.eq(snapshot)
-      // stamp the assigned ids onto the inserted nodes so the next diff sees them
-      if (editor && !editor.isDestroyed && stamps.length) {
-        const tr = editor.state.tr
-        if (applyStamps(tr, stamps, mapping)) {
-          tr.setMeta('addToHistory', false)
-          tr.setMeta(STAMP_META, true)
-          editor.view.dispatch(tr)
-        }
-      }
       // new baseline = what we just wrote
       baselineRef.current = rebuildBaseline(baselineRef.current, entries, ops)
       epochRef.current = out.epoch
@@ -258,7 +247,6 @@ export default function DocEditor({
       }
       onSaved(out.epoch, doc.docId)
     } catch (e) {
-      sinceSnapshot.current = null
       // the text is still in the editor and stays dirty; the retry clock
       // below keeps trying. Say so ONCE per distinct cause — a silent
       // failure here was how unsaved edits used to vanish.
@@ -423,18 +411,16 @@ export function planSave(
   return { entries, ops, stamps }
 }
 
-/** Put the saved ids on their nodes: each stamp's position is mapped through
- * the edits made while the save was in flight. A node deleted meanwhile, or
- * one that already carries an id, is left alone. True when anything was set. */
-export function applyStamps(tr: Transaction, stamps: Stamp[], mapping: Mapping): boolean {
+/** Put the new ids on their nodes, in the doc the save was planned from (a
+ * position that no longer holds an id-less top-level node of that type is
+ * left alone). True when anything was set. */
+export function applyStamps(tr: Transaction, stamps: Stamp[]): boolean {
   let any = false
   for (const s of stamps) {
-    const r = mapping.mapResult(s.pos, 1)
-    if (r.deleted || r.pos >= tr.doc.content.size) continue
-    if (tr.doc.resolve(r.pos).depth !== 0) continue
-    const node = tr.doc.nodeAt(r.pos)
+    if (s.pos >= tr.doc.content.size || tr.doc.resolve(s.pos).depth !== 0) continue
+    const node = tr.doc.nodeAt(s.pos)
     if (!node || node.type.name !== s.type || node.attrs.blockId) continue
-    tr.setNodeAttribute(r.pos, 'blockId', s.id)
+    tr.setNodeAttribute(s.pos, 'blockId', s.id)
     any = true
   }
   return any

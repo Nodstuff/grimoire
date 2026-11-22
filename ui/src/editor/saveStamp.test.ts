@@ -4,7 +4,6 @@
 // the next edit then overwrote the wrong block on the server.
 import { describe, expect, it } from 'vitest'
 import { EditorState } from '@tiptap/pm/state'
-import { Mapping } from '@tiptap/pm/transform'
 import type { Node as PMNode } from '@tiptap/pm/model'
 import type { Block } from '../types'
 import type { BaselineBlock, Op } from './diff'
@@ -32,7 +31,7 @@ const newId = () => `new-${++n}`
 function land(doc: PMNode, baseline: BaselineBlock[]) {
   const plan = planSave(doc, baseline, [], newId)
   const tr = EditorState.create({ schema, doc }).tr
-  applyStamps(tr, plan.stamps, new Mapping())
+  applyStamps(tr, plan.stamps)
   return { plan, doc: tr.doc, baseline: rebuildBaseline(baseline, plan.entries, plan.ops) }
 }
 
@@ -105,31 +104,38 @@ describe('stamping new block ids after a save', () => {
     expect(planSave(after, next, [], newId).ops).toEqual([])
   })
 
-  it('edits made while the save was in flight: the stamps follow their nodes', () => {
+  it('the ids go on before the request, so edits made while it is in flight keep them on their nodes', () => {
     const { doc, baseline } = docWith(blocks, md('more\n\n## B\n\nbody'))
     const plan = planSave(doc, baseline, [], newId)
-    // meanwhile: a paragraph typed at the very top, and "body" deleted
     let state = EditorState.create({ schema, doc })
-    const mapping = new Mapping()
-    const t1 = state.tr.insert(0, schema.nodes.paragraph.create(null, schema.text('typed meanwhile')))
-    mapping.appendMapping(t1.mapping)
-    state = state.apply(t1)
+    const stamp = state.tr
+    applyStamps(stamp, plan.stamps)
+    state = state.apply(stamp)
+    // meanwhile: a paragraph typed at the very top, and "body" deleted
+    state = state.apply(state.tr.insert(0, schema.nodes.paragraph.create(null, schema.text('typed meanwhile'))))
     let bodyPos = -1
     state.doc.forEach((node, p) => {
       if (node.textContent === 'body') bodyPos = p
     })
-    const t2 = state.tr.delete(bodyPos, bodyPos + state.doc.nodeAt(bodyPos)!.nodeSize)
-    mapping.appendMapping(t2.mapping)
-    state = state.apply(t2)
-    const tr = state.tr
-    applyStamps(tr, plan.stamps, mapping)
-    expect(idOfText(tr.doc, 'more')).toBe(insertFor(plan.ops, 'more').block_id)
-    expect(idOfText(tr.doc, 'B')).toBe(insertFor(plan.ops, '## B').block_id)
-    expect(idOfText(tr.doc, 'typed meanwhile')).toBeNull()
+    state = state.apply(state.tr.delete(bodyPos, bodyPos + state.doc.nodeAt(bodyPos)!.nodeSize))
+    expect(idOfText(state.doc, 'more')).toBe(insertFor(plan.ops, 'more').block_id)
+    expect(idOfText(state.doc, 'B')).toBe(insertFor(plan.ops, '## B').block_id)
+    expect(idOfText(state.doc, 'typed meanwhile')).toBeNull()
     // the next save inserts the new paragraph and deletes "body"
-    const nextOps = planSave(tr.doc, rebuildBaseline(baseline, plan.entries, plan.ops), [], newId).ops
+    const nextOps = planSave(state.doc, rebuildBaseline(baseline, plan.entries, plan.ops), [], newId).ops
     expect(nextOps.map((o) => o.kind.op).sort()).toEqual(['delete', 'insert'])
     expect(nextOps.find((o) => o.kind.op === 'delete')!.kind.target).toBe(insertFor(plan.ops, 'body').block_id)
+  })
+
+  it('a failed save keeps the ids: its retry sends the very same inserts', () => {
+    const { doc, baseline } = docWith(blocks, md('more\n\n## B'))
+    const plan = planSave(doc, baseline, [], newId)
+    const tr = EditorState.create({ schema, doc }).tr
+    applyStamps(tr, plan.stamps)
+    // the request failed: the baseline did not move
+    const retry = planSave(tr.doc, baseline, [], newId)
+    expect(retry.ops).toEqual(plan.ops)
+    expect(retry.stamps).toEqual([])
   })
 
   it('entriesOf reports where each entry starts', () => {
