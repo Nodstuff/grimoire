@@ -49,10 +49,16 @@ describe('horizontal rules', () => {
     expect(split.blocks.map((b) => b.id)).toEqual(['hr', 'p'])
   })
 
-  it('a YAML-shaped block further down is not the frontmatter (and stays hidden, as before)', () => {
-    const split = splitTree([node(block('p', 'para', 'i')), node(block('y', '---\ntags: [b]\n---', 'r', 'code'))])
-    expect(split.frontmatter).toBeNull()
+  it('the frontmatter is the first ROOT block that is YAML, as the server finds it (sentdocs.rs)', () => {
+    // after a rule and a paragraph: still the doc's frontmatter (the e-reader tag lands there)
+    const split = splitTree([node(block('hr', '---', 'g')), node(block('p', 'para', 'i')), node(block('y', '---\ntags: [b]\n---', 'r', 'code'))])
+    expect(split.frontmatter?.id).toBe('y')
     expect(split.hidden.map((h) => h.id)).toEqual(['y'])
+    // a comment before it is skipped; a YAML block nested under a heading is not a root
+    const c = { ...block('c', '---\ntags: [no]\n---', 'a'), block_type: 'comment' }
+    const nested = splitTree([node(c), node(block('h', '# H', 'i'), [node({ ...block('n', '---\ntags: [x]\n---', 'i', 'code'), parent_id: 'h' })])])
+    expect(nested.frontmatter).toBeNull()
+    expect(nested.hidden.map((h) => h.id)).toEqual(['c', 'n'])
   })
 
   it('a rule round-trips: loaded as a rule, an untouched doc sends nothing', () => {

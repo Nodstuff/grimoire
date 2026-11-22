@@ -5,8 +5,9 @@ import { isFrontmatter, type HiddenBlock } from './diff'
 /** Pre-order: the blocks the editor shows; comments; every block; the
  * blocks it doesn't show (comments, frontmatter, old canvases), each after
  * the visible block it follows, so a new first block goes after the
- * frontmatter; the doc's frontmatter (its first content block, when that
- * is a closed YAML block); and how many canvases the doc holds. A lone
+ * frontmatter; the doc's frontmatter (the first root block, comments
+ * skipped, that is a closed YAML block: where the server looks for it); and
+ * how many canvases the doc holds. A lone
  * `---` is a horizontal rule and stays in the editor. */
 export function splitTree(roots: BlockNode[]): {
   blocks: Block[]
@@ -22,8 +23,10 @@ export function splitTree(roots: BlockNode[]): {
   const hidden: HiddenBlock[] = []
   let lastVisible: string | null = null
   let removedCanvases = 0
-  let frontmatter: Block | null = null
-  let seenContent = false
+  // the doc's frontmatter as the server finds it (sentdocs.rs, the e-reader
+  // tag): the first ROOT block, comments skipped, that is a closed YAML block
+  const frontmatter: Block | null =
+    roots.map((n) => n.block).find((b) => b.block_type !== 'comment' && isFrontmatter(b.content)) ?? null
   const hide = (b: Block) =>
     hidden.push({ id: b.id, content: b.content, parent: b.parent_id, order_key: b.order_key, after: lastVisible })
   const walk = (nodes: BlockNode[]) => {
@@ -37,14 +40,8 @@ export function splitTree(roots: BlockNode[]): {
       else if (n.block.block_type === 'canvas_scene') {
         removedCanvases++
         hide(n.block)
-      } else if (isFrontmatter(n.block.content)) {
-        // only the first block is the doc's frontmatter; a YAML-shaped block
-        // further down stays hidden as it always was, but is not its tags
-        if (!seenContent) frontmatter = n.block
-        seenContent = true
-        hide(n.block)
-      } else {
-        seenContent = true
+      } else if (isFrontmatter(n.block.content)) hide(n.block)
+      else {
         blocks.push(n.block)
         lastVisible = n.block.id
       }
