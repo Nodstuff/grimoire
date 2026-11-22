@@ -413,7 +413,8 @@ pub fn acting_principal(
 
 /// The `as` a connector token may pass: a `claude:<label>` name in its own
 /// namespace. Refused: anything not `claude:`-prefixed (a human's name, a
-/// principal id, the shared `claude`) and another OAuth client's principal.
+/// principal id, the shared `claude`), another OAuth client's principal and
+/// the person's personal access tokens' principals.
 /// A human or remote principal that happens to carry a `claude:` name is
 /// refused later by `agent_principal_by_name`.
 pub fn pinned_label(store: &SqliteStore, base: &str, label: &str) -> Result<String, String> {
@@ -444,6 +445,14 @@ pub fn pinned_label(store: &SqliteStore, base: &str, label: &str) -> Result<Stri
         let name = store.oauth_client(&c).ok().flatten().map(|c| c.client_name).unwrap_or_default();
         if crate::auth::client_principal(&c, &name) == label {
             return refuse("is another OAuth client's principal");
+        }
+    }
+    // nor the person's personal access tokens' (`claude:<token name>`): a
+    // connector must not write as the PAT, nor one PAT as another
+    let tokens = store.auth_api_tokens().map_err(|e| e.to_string())?;
+    for t in tokens.into_iter().filter(|t| t.revoked_at.is_none() && me.is_none_or(|u| t.user_id == u)) {
+        if crate::auth::client_principal(&format!("pat:{}", t.name), &t.name) == label {
+            return refuse("is a personal access token's principal");
         }
     }
     Ok(label.to_string())

@@ -4056,3 +4056,20 @@ async fn an_agent_cannot_accept_its_own_parked_delete_by_switching_labels() {
     assert_eq!(st, StatusCode::OK, "{out}");
     assert!(fx.store.lock(Scope::User(fx.b)).doc_is_tombstoned(fx.b_doc).unwrap());
 }
+
+/// Code review 2026-11-22, item 7: a connector cannot write as the person's
+/// PAT principal (`claude:claude-code`), nor the PAT as the connector's
+/// (`claude:claude`). Each still writes as its own base and as a fresh label.
+#[tokio::test]
+async fn a_connector_cannot_write_as_a_pats_principal_nor_vice_versa() {
+    let fx = fixture();
+    let append = |label: &str| json!({"doc_id": fx.b_doc.to_string(), "markdown": "label probe", "as": label});
+    let (is_err, out) = fx.tool(&fx.b_conn, "append", append("claude:claude-code")).await;
+    assert!(is_err && out.contains("personal access token"), "{out}");
+    let (is_err, out) = fx.tool(&fx.b_pat, "append", append("claude:claude")).await;
+    assert!(is_err && out.contains("OAuth client"), "{out}");
+    for (token, label) in [(&fx.b_conn, "claude:claude"), (&fx.b_pat, "claude:claude-code"), (&fx.b_conn, "claude:fresh")] {
+        let (is_err, out) = fx.tool(token, "append", append(label)).await;
+        assert!(!is_err, "{label}: {out}");
+    }
+}
