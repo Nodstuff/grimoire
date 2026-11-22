@@ -81,11 +81,16 @@ export default function ReviewQueue({
   const openInDoc = (r: QueueRow) =>
     onOpenDoc(r.item.annotation.doc_id, { review: true, blockId: targetBlockOf(r) ?? undefined })
 
-  const load = useCallback(() => {
-    Promise.all([
+  // only the newest load lands: an older one answering late (a stamp tick's,
+  // started before a resolve) would bring a resolved row back
+  const loadSeq = useRef(0)
+  const load = useCallback((): Promise<void> => {
+    const seq = ++loadSeq.current
+    return Promise.all([
       api<QueueRow[]>('/api/queue').catch(() => [] as QueueRow[]),
       api<FlagRow[]>('/api/flags').catch(() => [] as FlagRow[]),
     ]).then(([q, f]) => {
+      if (seq !== loadSeq.current) return
       setRows(q)
       setFlags(f)
       setLoaded(true)
@@ -93,44 +98,77 @@ export default function ReviewQueue({
     })
   }, [onChange])
 
-  useEffect(load, [load, dataVersion])
+  useEffect(() => {
+    void load()
+  }, [load, dataVersion])
+
+  // one action at a time, checked synchronously: two key presses inside one
+  // render both saw `busy` null and resolved the same item twice
+  const busyRef = useRef<string | null>(null)
+  const begin = (id: string): boolean => {
+    if (busyRef.current) return false
+    busyRef.current = id
+    setBusy(id)
+    return true
+  }
+  /** a done action: its rows leave at once (so a key cannot hit them again),
+   * and the busy mark stays until the reload has answered */
+  const finish = async (drop: (() => void) | null) => {
+    if (drop) drop()
+    try {
+      await load()
+    } finally {
+      busyRef.current = null
+      setBusy(null)
+    }
+  }
 
   const resolve = async (annotationId: string, decision: 'accept' | 'decline') => {
-    setBusy(annotationId)
+    if (!begin(annotationId)) return
+    let ok = false
     try {
       await api('/api/resolve', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ annotation_id: annotationId, decision }),
       })
+      ok = true
     } catch (e) {
       notify(errText(e))
     }
-    setBusy(null)
-    load()
+    await finish(ok ? () => setRows((rs) => rs.filter((r) => idOf(r) !== annotationId)) : null)
   }
 
   const dismiss = async (commentId: string) => {
-    setBusy(commentId)
-    await api('/api/flags/dismiss', {
+    if (!begin(commentId)) return
+    const ok = await api('/api/flags/dismiss', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ comment_id: commentId }),
-    }).catch((e) => notify(String(e)))
-    setBusy(null)
-    load()
+    })
+      .then(() => true)
+      .catch((e) => {
+        notify(String(e))
+        return false
+      })
+    await finish(ok ? () => setFlags((fs) => fs.filter((f) => f.block.id !== commentId)) : null)
   }
 
   const bulk = async (ids: string[], decision: 'accept' | 'decline') => {
     if (ids.length === 0) return
-    setBusy('bulk')
-    await api('/api/resolve_bulk', {
+    if (!begin('bulk')) return
+    const ok = await api('/api/resolve_bulk', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ annotation_ids: ids, decision }),
-    }).catch((e) => notify(String(e)))
-    setBusy(null)
-    load()
+    })
+      .then(() => true)
+      .catch((e) => {
+        notify(String(e))
+        return false
+      })
+    const gone = new Set(ids)
+    await finish(ok ? () => setRows((rs) => rs.filter((r) => !gone.has(idOf(r)))) : null)
   }
 
   const postComment = async (blockId: string) => {
