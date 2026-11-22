@@ -233,9 +233,12 @@ export default function DocEditor({
   }
   /** a save the daemon refused for good: no retry clock until the next edit */
   const [stopped, setStopped] = useState(false)
-  /** ids this editor stamped whose save has not landed yet (planSave keeps
-   * them; any other id outside the baseline is not this doc's) */
+  /** ids this editor stamped whose save has not landed yet, and ids it saw
+   * leave the baseline (deleted, so the store revives them under the same
+   * id): planSave keeps both; any other id outside the baseline is not this
+   * doc's */
   const ownStamped = useRef(new Set<string>())
+  const seenDeleted = useRef(new Set<string>())
   /** the request sent whose answer has not come (failed, or the keepalive
    * as the page went): a retry carries the same request_id, and a later,
    * different save sends it first and adopts its answer */
@@ -347,7 +350,8 @@ export default function DocEditor({
    * inserts — under the same request_id. */
   const prepare = () => {
     if (!editor) return null
-    const { entries, ops, stamps } = planSave(editor.state.doc, baselineRef.current, doc.hidden ?? [], undefined, ownStamped.current)
+    const own = new Set([...ownStamped.current, ...seenDeleted.current])
+    const { entries, ops, stamps } = planSave(editor.state.doc, baselineRef.current, doc.hidden ?? [], undefined, own)
     for (const st of stamps) ownStamped.current.add(st.id)
     if (stamps.length && !editor.isDestroyed) {
       const tr = editor.state.tr
@@ -375,10 +379,17 @@ export default function DocEditor({
   /** a request's answer: what it wrote is the baseline now */
   const adopt = (r: Unsent, epoch: number) => {
     if (pending.current === r) pending.current = null
-    baselineRef.current = rebuildBaseline(baselineRef.current, r.entries, r.ops)
-    // landed: these ids are the baseline's now (one deleted later and
-    // brought back by undo must not pass as a pending one of ours)
-    for (const b of baselineRef.current) ownStamped.current.delete(b.id)
+    const before = baselineRef.current
+    baselineRef.current = rebuildBaseline(before, r.entries, r.ops)
+    const now = new Set(baselineRef.current.map((b) => b.id))
+    // a block this save deleted: an undo (or a paste of its cut) brings it
+    // back under its own id, which the store revives
+    for (const b of before) if (!now.has(b.id)) seenDeleted.current.add(b.id)
+    // landed: these ids are the baseline's now
+    for (const id of now) {
+      ownStamped.current.delete(id)
+      seenDeleted.current.delete(id)
+    }
     epochRef.current = epoch
   }
 
@@ -503,7 +514,7 @@ export default function DocEditor({
     const plan = prepare()
     if (!plan) return
     // an earlier request with no answer goes as it was (same id): a page
-    // cannot sequence two keepalives, and that one may already have landed
+    // cannot sequence two keepalives, and that one may already have landed.
     const req = pending.current && pending.current.body !== plan.body ? pending.current : plan.body ? asRequest({ ...plan, body: plan.body }) : null
     if (!req) return
     pending.current = req
@@ -696,11 +707,14 @@ export interface Stamp {
 
 /** What one save writes: the entries (every new one already given its id),
  * the ops, and the stamps that put those ids on their nodes once it lands.
- * An entry keeps its id only when the baseline holds it, or this editor
- * stamped it itself (`own`: a save not yet landed); any other id (a paste
- * from another doc, an undo bringing back a deleted block, a second run of
- * one id) is not this doc's block, and inserting under it is refused as
- * "already exists": it gets a fresh one. */
+ * An entry keeps its id when the baseline holds it, or when `own` does: ids
+ * this editor stamped for a save not yet landed, and ids it saw deleted from
+ * this doc (an undo of a saved delete, a cut then autosave then paste): the
+ * store revives a deleted block of the same doc under its id, links and
+ * comment anchors included. Any other id is not this doc's (a paste from
+ * another doc, where the insert is refused: "already exists", or "a
+ * tombstone in another doc"), nor is a second run of one id: those get a
+ * fresh one. */
 export function planSave(
   doc: PMNode,
   baseline: BaselineBlock[],

@@ -163,14 +163,15 @@ describe('ids that are not this doc\'s', () => {
     expect(planSave(tr.doc, rebuildBaseline(baseline, plan.entries, plan.ops), [], newId).ops).toEqual([])
   })
 
-  it('a block this editor saw deleted, brought back by undo, is a new insert, not a refused one', () => {
+  it('a block this editor saw deleted, brought back by undo, is inserted under its own id (the store revives it)', () => {
     const { doc, baseline } = docWith(blocks, [])
     // "x" was deleted and saved: the baseline no longer holds it; undo brings the node back
     const after = baseline.filter((b) => b.id !== 'x')
-    const ops = planSave(doc, after, [], newId).ops
+    const ops = planSave(doc, after, [], newId, new Set(['x'])).ops
     expect(ops).toHaveLength(1)
-    expect(ops[0].kind.op).toBe('insert')
-    expect(ops[0].kind.block_id).not.toBe('x')
+    expect(ops[0].kind).toMatchObject({ op: 'insert', block_id: 'x' })
+    // an id this editor never saw (e.g. after a remount) is a new block
+    expect(planSave(doc, after, [], newId).ops[0].kind.block_id).not.toBe('x')
   })
 
   it('a second run of one id becomes its own block', () => {
