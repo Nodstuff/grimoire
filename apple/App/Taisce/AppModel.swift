@@ -48,6 +48,8 @@ final class AppModel {
     let push = PushRegistrar(store: UserDefaultsPushStore(), environment: PushConfig.environment, appVersion: PushConfig.appVersion())
     /// push: the registrar's queued work (fire-and-forget, never awaited by boot)
     @ObservationIgnored var pushTask: Task<Void, Never>?
+    /// tests: runs in `treeChanged` after the tree is built, before it is shown
+    @ObservationIgnored var afterTreeBuilt: (@MainActor () async -> Void)?
     /// where a device delete owed to another server finds a bearer (tests swap it)
     @ObservationIgnored var pushRegistry: @Sendable (String) async -> (any DeviceRegistry)? = { await AppModel.storedRegistry($0) }
     /// Server discovery (does it need sign-in?); tests swap in one with no network.
@@ -532,9 +534,19 @@ final class AppModel {
     private func treeChanged(_ records: [DocRecord]) async {
         let docs = records.map(DocInfo.init)
         let unsorted = docs.count { $0.workspaceID == nil }
-        let scope = WorkspacePicker(workspaces: workspaces, unsortedCount: unsorted, stored: storedWorkspace, enabled: hasWorkspaces).current
+        var scope = WorkspacePicker(workspaces: workspaces, unsortedCount: unsorted, stored: storedWorkspace, enabled: hasWorkspaces).current
         // the outline is O(n log n) over the whole tree: build it off the main actor
-        let (index, library) = await Task.detached { (DocIndex(docs), LibraryNode.build(WorkspaceFilter.docs(docs, in: scope))) }.value
+        let (index, built) = await Task.detached { [scope] in (DocIndex(docs), LibraryNode.build(WorkspaceFilter.docs(docs, in: scope))) }.value
+        var library = built
+        await afterTreeBuilt?()
+        // the workspace switched while it was built: build it again for the
+        // one now current, or the Library shows the old workspace's tree
+        while true {
+            let now = WorkspacePicker(workspaces: workspaces, unsortedCount: unsorted, stored: storedWorkspace, enabled: hasWorkspaces).current
+            guard now != scope else { break }
+            scope = now
+            library = await Task.detached { [scope] in LibraryNode.build(WorkspaceFilter.docs(docs, in: scope)) }.value
+        }
         self.docs = docs
         self.index = index
         self.library = library

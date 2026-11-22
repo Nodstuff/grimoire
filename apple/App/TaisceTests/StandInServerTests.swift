@@ -139,4 +139,36 @@ final class HeldServer: URLProtocol {
         await m.home.loadProfile()
         #expect(m.home.review == [] && m.home.profileName == "Aoife")
     }
+
+    /// Review 2026-11-22 #7: a workspace switch while the tree is being
+    /// built (off the main actor) shows the new workspace's docs, not the
+    /// old one's when the build lands.
+    @Test func aWorkspaceSwitchDuringATreeBuildShowsTheNewWorkspace() async throws {
+        URLProtocol.registerClass(HeldServer.self)
+        defer { URLProtocol.unregisterClass(HeldServer.self) }
+        HeldServer.reset()
+        defer { HeldServer.reset() }
+        let m = try await HeldServer.model()
+        let cache = try #require(m.cache)
+        try await cache.replaceWorkspaces([Workspace(id: "w1", name: "Work"), Workspace(id: "w2", name: "Home")])
+        await m.loadCachedWorkspaces(cache)
+        m.selectWorkspace(.id("w1"))
+        defer { UserDefaults.standard.removeObject(forKey: m.workspaceKey) }
+        var switched = false
+        m.afterTreeBuilt = {
+            guard !switched else { return }
+            switched = true
+            m.selectWorkspace(.id("w2"))
+        }
+        try await cache.replaceTree([
+            DocSummary(id: "work-doc", parentID: nil, title: "Work doc", currentEpoch: 1, workspaceID: "w1"),
+            DocSummary(id: "home-doc", parentID: nil, title: "Home doc", currentEpoch: 1, workspaceID: "w2"),
+        ])
+        for _ in 0..<300 where !(switched && m.docs.count == 2) { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(switched)
+        #expect(m.currentWorkspace == .id("w2"))
+        #expect(m.library.map(\.doc.title) == ["Home doc"], "the old workspace's tree: \(m.library.map(\.doc.title))")
+        m.afterTreeBuilt = nil
+        try await cache.wipe()
+    }
 }
