@@ -62,4 +62,26 @@ import TaisceKit
         r.queryChanged("other")
         #expect(r.state == .idle)
     }
+
+    /// #10: the New doc sheet sorts and walks the tree once; each keystroke
+    /// only ranks. Same choices, same order as before.
+    @Test func newDocFoldersAreWorkedOutOnce() {
+        let docs = [
+            DocInfo(id: "b", title: "Beta"), DocInfo(id: "a", title: "Alpha"),
+            DocInfo(id: "k", parentID: "a", title: "Kid"), DocInfo(id: "v", title: "Viewed"),
+        ]
+        var crumbCalls = 0, accessCalls = 0
+        let f = NewDocFolders(docs, canCreate: { accessCalls += 1; return $0 != "v" },
+                              breadcrumb: { crumbCalls += 1; return $0 == "k" ? "Alpha" : nil })
+        let built = (crumbCalls, accessCalls)
+        #expect(f.all.map(\.id) == ["a", "b", "k"], "top level first by title, then by path")
+        #expect(f.crumbs["k"] == .some("Alpha"))
+        #expect(f.matching("").map(\.id) == ["a", "b", "k"])
+        #expect(f.matching("kid").map(\.id) == ["k"])
+        #expect(f.matching("alp").first?.id == "a")
+        #expect(f.matching("viewed").isEmpty, "a view-only doc takes nothing")
+        for q in ["a", "al", "alp", "alph"] { _ = f.matching(q) }
+        #expect(crumbCalls == built.0 && accessCalls == built.1, "typing walked the tree again")
+        #expect(built.0 == 3, "one path per doc, once")
+    }
 }
