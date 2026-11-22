@@ -63,6 +63,12 @@ final class FleetStore {
     /// guardrails, limits, fabrics, projects, pairing
     let config = FabricConfigStore()
 
+    /// session feeds kept between opens in this app run, newest use last:
+    /// reopening one draws at once, no cache read and no parsing
+    @ObservationIgnored private var feeds: [FleetSessionKey: SessionFeed] = [:]
+    @ObservationIgnored private var feedOrder: [FleetSessionKey] = []
+    static let feedsKept = 12
+
     @ObservationIgnored private var followTask: Task<Void, Never>?
     /// bumped by `reset`: an answer that comes back for an earlier account
     /// or server is dropped
@@ -105,6 +111,8 @@ final class FleetStore {
         loadError = nil
         request = nil
         liveTurns = [:]
+        feeds = [:]
+        feedOrder = []
         command.reset()
         talk.reset()
         config.reset()
@@ -170,7 +178,12 @@ final class FleetStore {
             list.removeAll { $0.turnID == turn.turnID }
             list.append(turn)
             liveTurns[turn.session] = Array(list.suffix(50))
-            // kept for the next open too (a Text off turn without its words)
+            // a feed kept for this session has it at once, shown or not
+            feeds[turn.session]?.merge([turn])
+            // kept for the next open too (a Text off turn without its words).
+            // It does not move the cache's watermark: a turn the stream missed
+            // before this one is fetched by the next open's top-up, which asks
+            // from the watermark, not from the newest held (`Cache+FabricTurns`)
             if let cache = turnCache {
                 let asked = generation
                 Task { [weak self] in
@@ -235,6 +248,40 @@ final class FleetStore {
     func refreshAttention() async {
         guard let api = fabricService, let items = try? await api.attention() else { return }
         fleet.attention = items
+    }
+
+    // MARK: session feeds
+
+    /// The feed for one session, kept across opens in this app run (the
+    /// last `feedsKept` used). Sign-out and another server (`reset`) forget
+    /// them all.
+    func feed(_ key: FleetSessionKey) -> SessionFeed {
+        if let f = feeds[key] {
+            if feedOrder.last != key {
+                feedOrder.removeAll { $0 == key }
+                feedOrder.append(key)
+            }
+            return f
+        }
+        let f = SessionFeed(key: key)
+        let asked = generation
+        f.stillCurrent = { [weak self] in self?.generation == asked }
+        feeds[key] = f
+        feedOrder.append(key)
+        // the least lately used goes, never the one on screen
+        while feedOrder.count > Self.feedsKept, let i = feedOrder.firstIndex(where: { $0 != openSession && $0 != key }) {
+            feeds[feedOrder.remove(at: i)] = nil
+        }
+        return f
+    }
+
+    /// Read a session's cached turns (and build the rows it opens with)
+    /// before it is tapped: a row of the list on screen calls this, so
+    /// the session opens drawn. Off the main actor; nothing from the network.
+    func warm(_ key: FleetSessionKey) {
+        let f = feed(key)
+        guard !f.opened, let cache = turnCache else { return }
+        Task { await f.open(cache) }
     }
 
     /// A session screen is in front (nil: none).

@@ -14,10 +14,14 @@ struct PendingSend: Identifiable, Equatable, Sendable {
     let queued: Bool
     /// the turn the person was reading
     let afterTurn: String
-    let deadline: Date
+    var deadline: Date
     /// it could not go in time (the app was away past its deadline): kept,
     /// never sent, for the person to take back into the box and send again
     var lapsed = false
+    /// it was posted and the post failed (offline, refused): kept with why,
+    /// so the words are never lost; Retry posts it again under the same
+    /// order id (the hub keeps one order per id), Edit takes it back
+    var failure: String?
 
     /// A held send this long past its deadline is not sent: the moment it
     /// answered has gone.
@@ -41,7 +45,7 @@ final class CommandCenter {
     /// tests: a key and stores of their own
     @ObservationIgnored var identity = FabricDeviceIdentity()
     @ObservationIgnored var counters: any FabricCounterStore = DefaultsCounterStore()
-    @ObservationIgnored var trust: any FabricTrustStore = KeychainTrustStore()
+    @ObservationIgnored var trust: any FabricTrustStore = KeychainTrustStore() { didSet { trustChanged() } }
     @ObservationIgnored var ownerCheck: any OwnerCheck = DeviceOwnerCheck()
     /// how long a send waits before it goes (tests: none)
     @ObservationIgnored var undoWindow: Duration = .seconds(5)
@@ -56,6 +60,22 @@ final class CommandCenter {
     private(set) var inFlight: Set<String> = []
 
     @ObservationIgnored private var timers: [String: Task<Void, Never>] = [:]
+    /// the trusted Macs' keys, read from the Keychain once (`trustChanged` forgets them)
+    @ObservationIgnored private var trustedKeys: [String: Data]?
+    /// what each item verified as, by its signed bytes: a screen asks on
+    /// every redraw (and a sheet every second), which was a Keychain read
+    /// and an ECDSA verify each time
+    @ObservationIgnored private var verified: [VerifyKey: Result<VerifiedAttention, FabricOrderProblem>] = [:]
+    /// how many verifications ran (tests: the memo holds)
+    @ObservationIgnored private(set) var verifications = 0
+
+    private struct VerifyKey: Hashable {
+        let id: String
+        let runtimeID: String
+        let sessionID: String
+        let request: Data
+        let signature: Data
+    }
 
     private var service: (any FabricService)? { fleet?.fabricService }
 
@@ -66,6 +86,13 @@ final class CommandCenter {
         orders = [:]
         notice = nil
         inFlight = []
+        trustChanged()
+    }
+
+    /// The trusted Macs changed (paired, forgotten, signed out): verify afresh.
+    func trustChanged() {
+        trustedKeys = nil
+        verified = [:]
     }
 
     /// This device's key, made on first use.
@@ -138,7 +165,7 @@ final class CommandCenter {
     /// Send every held reply now (the app is leaving the front: the app
     /// model calls this as it goes, under a background task).
     func flush(now: Date = .now) async {
-        for p in pending where !p.lapsed {
+        for p in pending where !p.lapsed && p.failure == nil {
             timers.removeValue(forKey: p.id)?.cancel()
             await post(p.id, now: now)
         }
@@ -148,16 +175,31 @@ final class CommandCenter {
     /// grace (the app was suspended through it): then it stays, lapsed.
     func post(_ id: String, now: Date = .now) async {
         timers[id] = nil
-        guard let i = pending.firstIndex(where: { $0.id == id }), !pending[i].lapsed else { return }
+        guard let i = pending.firstIndex(where: { $0.id == id }), !pending[i].lapsed, pending[i].failure == nil, !inFlight.contains(id) else { return }
         if now.timeIntervalSince(pending[i].deadline) > PendingSend.grace {
             pending[i].lapsed = true
             return
         }
-        let p = pending.remove(at: i)
+        let p = pending[i]
         let command = FabricCommand(sessionID: p.session.id, verb: .send, text: p.text, afterTurn: p.afterTurn, queued: p.queued)
-        if let failure = await order(.command(command), runtimeID: p.session.runtimeID, orderID: p.id) {
-            notice = FabricNotice(text: "\(p.address): \(failure)")
+        let failure = await order(.command(command), runtimeID: p.session.runtimeID, orderID: p.id)
+        guard let j = pending.firstIndex(where: { $0.id == id }) else { return }
+        if let failure {
+            // kept, with why: the composer was cleared when it was held
+            pending[j].failure = failure
+            notice = FabricNotice(text: "\(p.address): not sent. \(failure)")
+        } else {
+            pending.remove(at: j)
         }
+    }
+
+    /// Post a send that failed again, now, under its own order id.
+    func retry(_ id: String, now: Date = .now) async {
+        guard let i = pending.firstIndex(where: { $0.id == id }), pending[i].failure != nil, !inFlight.contains(id) else { return }
+        pending[i].failure = nil
+        pending[i].lapsed = false
+        pending[i].deadline = now
+        await post(id, now: now)
     }
 
     /// Withdraw an order still waiting at the server (no signature needed:
@@ -214,7 +256,25 @@ final class CommandCenter {
     // MARK: attention
 
     /// The item, verified against the key from the Mac's pairing code.
+    /// Memoised by the item's id and signed bytes (the same bytes verify
+    /// the same way against the same keys); the keys are read once and
+    /// forgotten when trust changes. A list that cannot be read is said,
+    /// and asked again next time, never remembered.
     func verify(_ item: FabricAttentionItem) -> Result<VerifiedAttention, FabricOrderProblem> {
+        let key = item.signed.map { VerifyKey(id: item.id, runtimeID: item.runtimeID, sessionID: item.sessionID, request: $0.request, signature: $0.signature) }
+        if let key, let hit = verified[key] { return hit }
+        if trustedKeys == nil { trustedKeys = try? trust.load() }
+        guard let keys = trustedKeys else { return Self.verifying(item, trust: trust) }
+        verifications += 1
+        let result = Self.verifying(item, trust: MemoryTrustStore(keys))
+        if let key {
+            if verified.count > 256 { verified = [:] }
+            verified[key] = result
+        }
+        return result
+    }
+
+    private static func verifying(_ item: FabricAttentionItem, trust: any FabricTrustStore) -> Result<VerifiedAttention, FabricOrderProblem> {
         do {
             return .success(try VerifiedAttention.verify(item, trust: trust))
         } catch let p as FabricOrderProblem {

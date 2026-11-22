@@ -394,8 +394,12 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         fake.state.withLock { $0.turns = (1...35).map { t("t\($0)", $0) } }
         await feed.load(fake)
         #expect(feed.turns.count == 30 && feed.more && feed.turns.first?.turnID == "t6" && feed.turns.last?.turnID == "t35")
-        await feed.loadOlder(fake)
-        #expect(feed.turns.count == 35 && !feed.more)
+        #expect(feed.rows.count == SessionFeed.window && feed.rows.first?.id == "t16", "the newest window drawn")
+        #expect(feed.firstNew == "t21" && feed.newCount == 15, "found once, among the drawn")
+        await feed.showEarlier(fake)
+        #expect(feed.rows.count == 30 && fake.calls.filter { $0.hasPrefix("turns") }.count == 1, "the held ones first, without the network")
+        await feed.showEarlier(fake)
+        #expect(feed.turns.count == 35 && !feed.more && feed.rows.count == 35)
         #expect(feed.newCount == 15 && feed.firstNew == "t21")
         // a live turn, and a Text off route's copy of one the stream carried in full
         feed.merge([t("t36", 36), t("t35", 35, reply: "")])
@@ -410,7 +414,7 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
     /// once, when it arrives, and a redraw of the screen reuses the rows. Before,
     /// `TurnView.body` parsed every reply on every redraw (and the 30 s tick
     /// redrew them all). Prints what a redraw's worth of rows costs each way.
-    @Test func longRepliesAreParsedOnceNotOnEveryRedraw() {
+    @Test func longRepliesAreParsedOnceNotOnEveryRedraw() throws {
         let key = FleetSessionKey(runtimeID: "r1", id: "s1")
         let para = "Here is **what changed** in `crates/store/src/fabric/work.rs`: the [route](https://example.org) now reads `after=` too. "
         let turns = (1...30).map { i in
@@ -420,8 +424,8 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         let feed = SessionFeed(key: key)
         feed.now = { Self.now }
         feed.merge(turns)
-        #expect(feed.rows.count == 30 && feed.rows.allSatisfy { $0.replyPreview != nil && !$0.replyText.characters.isEmpty })
-        #expect(String(feed.rows[0].replyPreview!.characters).hasSuffix("\u{2026}"))
+        #expect(feed.rows.count == SessionFeed.window, "only the window is built")
+        #expect(feed.rows.allSatisfy { $0.long && !$0.replyNodes.isEmpty })
         let clock = ContinuousClock()
         let redraws = 10
         // before: every redraw built every row (and parsed its reply) again
@@ -440,7 +444,14 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         var fuller = turns[29]
         fuller.reply += " And one more line."
         feed.merge([fuller])
-        #expect(feed.rows[29].reply.hasSuffix("one more line.") && feed.rows[28] == first[28])
+        #expect(feed.rows[19].reply.hasSuffix("one more line.") && feed.rows[18] == first[18])
+        // the whole reply is parsed only when asked for, once
+        #expect(feed.expanded.isEmpty)
+        feed.expand("t30", true)
+        let whole = try #require(feed.expanded["t30"])
+        #expect(whole.count > feed.rows[19].replyNodes.count || whole != feed.rows[19].replyNodes)
+        feed.expand("t30", false)
+        #expect(feed.expanded["t30"] == nil)
     }
 
     // MARK: the turn cache
@@ -473,7 +484,7 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         #expect(second.turns.map(\.turnID) == (11...45).map { "t\($0)" })
         #expect(try await cache.fabricTurns(key).turns.count == 35)
         // "Earlier turns" still pages older from the server, and keeps them
-        await second.loadOlder(fake, cache: cache)
+        await earliest(second, fake, cache)
         #expect(second.turns.count == 45 && !second.more)
         #expect(try await cache.fabricTurns(key).older == false)
     }
@@ -511,7 +522,7 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         #expect(later.turns.map(\.turnID) == (31...60).map { "t\($0)" } && later.more, "today's behaviour: the newest 30, Earlier turns pages back")
         let held = try await cache.fabricTurns(key)
         #expect(held.turns.map(\.turnID) == (31...60).map { "t\($0)" } && held.older)
-        await later.loadOlder(fake, cache: cache)
+        await earliest(later, fake, cache)
         #expect(later.turns.count == 60 && later.turns.first?.turnID == "t1")
     }
 
@@ -534,6 +545,11 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         try await waitUntil { try await cache.fabricTurns(s1).turns.isEmpty }
         s.take(.change(.sessionGone(s2), rev: 5))
         try await waitUntil { try await cache.fabricTurnCount() == 0 }
+    }
+
+    /// "Earlier turns" until nothing older is held or on the server.
+    private func earliest(_ feed: SessionFeed, _ fake: FakeFabric, _ cache: Cache?) async {
+        for _ in 0..<20 where feed.hasEarlier { await feed.showEarlier(fake, cache: cache) }
     }
 
     private func waitUntil(_ check: () async throws -> Bool) async throws {
@@ -563,6 +579,280 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         #expect(b2.fabrics == ["taisce", "qompass"] && b2.only("qompass").rows.map(\.session.sessionID) == ["s2"])
         #expect(FabricWords.countdown(to: Self.nowS + 892, now: Self.now) == "14:52")
         #expect(FabricWords.countdown(to: Self.nowS - 1, now: Self.now) == "Expired")
+    }
+
+    // MARK: the session screen's polish (2026-11-22)
+
+    /// A live turn from this app run no longer skips the cache: the feed
+    /// reads what is held first, merges the stream's, then asks only after
+    /// the watermark (before, any live turn meant a network page and a wait).
+    @Test func aSessionOpensFromItsCacheEvenWithLiveTurnsHeld() async throws {
+        let key = FleetSessionKey(runtimeID: "r1", id: "s1")
+        let cache = try Cache.inMemory()
+        try await cache.cacheFabricTurns((1...10).map { Self.turn("t\($0)", $0 * 10) }, olderBeyond: false, syncedThrough: 100)
+        let fake = FakeFabric(Self.fleet())
+        fake.state.withLock { $0.turns = (1...12).map { Self.turn("t\($0)", $0 * 10) }; $0.turnsFail = true }
+        let feed = SessionFeed(key: key)
+        // the stream's turn reached the store (and this feed) before the screen opened
+        feed.merge([Self.turn("t12", 120)])
+        await feed.load(fake, cache: cache, live: [Self.turn("t12", 120)])
+        #expect(feed.fromCache && feed.opened, "the cache was read though a live turn was held")
+        #expect(feed.turns.map(\.turnID) == (1...10).map { "t\($0)" } + ["t12"])
+        #expect(fake.calls == ["turns after 99"], "from the watermark, not the newest held: \(fake.calls)")
+        #expect(feed.loadError == nil && feed.problem != nil, "a failed top-up with turns showing is a toast, not an empty state")
+        fake.state.withLock { $0.turnsFail = false; $0.calls = [] }
+        await feed.refresh(fake, cache: cache)
+        #expect(feed.turns.map(\.turnID) == (1...12).map { "t\($0)" }, "t11, which the stream missed, is filled in")
+    }
+
+    /// The hole: turns that end while the app is away are never fetched by
+    /// the stream; a turn the stream did carry is cached above them. After a
+    /// relaunch the top-up asks from the watermark, so the hole fills and
+    /// does not persist (before, it asked after the newest held: never).
+    @Test func aHoleTheStreamLeftIsFilledAfterARelaunch() async throws {
+        let key = FleetSessionKey(runtimeID: "r1", id: "s1")
+        let cache = try Cache.inMemory()
+        let fake = FakeFabric(Self.fleet())
+        fake.state.withLock { $0.turns = (1...5).map { Self.turn("t\($0)", $0 * 10) } }
+        let s = store(fake)
+        s.turnCacheOverride = cache
+        let first = s.feed(key)
+        await first.load(fake, cache: cache)
+        #expect(try await cache.fabricTurns(key).synced == 50)
+        // away: t6 and t7 end unseen; the stream comes back in time for t8
+        fake.state.withLock { $0.turns += (6...8).map { Self.turn("t\($0)", $0 * 10) } }
+        s.take(.turn(Self.turn("t8", 80)))
+        try await waitUntil { try await cache.fabricTurns(key).turns.count == 6 }
+        let held = try await cache.fabricTurns(key)
+        #expect(held.turns.map(\.turnID) == ["t1", "t2", "t3", "t4", "t5", "t8"] && held.synced == 50, "the stream's turn does not pass the watermark")
+        // relaunch: a new feed from the cache
+        fake.state.withLock { $0.calls = [] }
+        let relaunched = SessionFeed(key: key)
+        await relaunched.load(fake, cache: cache)
+        #expect(fake.calls == ["turns after 49"], "\(fake.calls)")
+        #expect(relaunched.turns.map(\.turnID) == (1...8).map { "t\($0)" }, "t6 and t7 are there")
+        let after = try await cache.fabricTurns(key)
+        #expect(after.turns.count == 8 && after.synced == 80, "and kept, gap-free")
+    }
+
+    /// The window: a session with 100 cached turns draws its newest 20;
+    /// Earlier turns shows the next 20 from memory at once (no network),
+    /// and the network only once nothing older is held.
+    @Test func theWindowPagesFromWhatIsHeldBeforeTheNetwork() async throws {
+        let key = FleetSessionKey(runtimeID: "r1", id: "s1")
+        let cache = try Cache.inMemory()
+        try await cache.cacheFabricTurns((1...100).map { Self.turn("t\($0)", $0 * 10) }, olderBeyond: true, syncedThrough: 1000)
+        let fake = FakeFabric(Self.fleet())
+        fake.state.withLock { $0.turnsFail = true }
+        let feed = SessionFeed(key: key)
+        await feed.open(cache)
+        #expect(feed.rows.count == 20 && feed.rows.first?.id == "t81" && feed.rows.last?.id == "t100")
+        #expect(feed.hiddenCount == 80 && feed.hasEarlier)
+        for expected in [40, 60, 80, 100] {
+            await feed.showEarlier(fake, cache: cache)
+            #expect(feed.rows.count == expected)
+        }
+        #expect(fake.calls.isEmpty, "all of it from memory: \(fake.calls)")
+        #expect(feed.hiddenCount == 0 && feed.more, "the server still has older")
+        // reopened (kept by the store): the window starts again at the newest
+        await feed.open(cache)
+        #expect(feed.rows.count == 20 && feed.rows.last?.id == "t100")
+        // a live turn joins the drawn ones; the window does not slide past what was drawn
+        feed.merge([Self.turn("t101", 1010)])
+        #expect(feed.rows.count == 21 && feed.rows.first?.id == "t81")
+    }
+
+    /// `before` is exclusive on `ended`: Earlier turns asks from a second
+    /// after the oldest held, so a turn that ended in the same second as it
+    /// is not skipped.
+    @Test func earlierTurnsDoesNotSkipATurnThatEndedInTheSameSecond() async throws {
+        let key = FleetSessionKey(runtimeID: "r1", id: "s1")
+        let fake = FakeFabric(Self.fleet())
+        var twin = Self.turn("twin", 100)
+        twin.started = 98   // sorts before t10, which ended in the same second
+        fake.state.withLock { $0.turns = (1...10).map { Self.turn("t\($0)", $0 * 10) } + [twin] }
+        let feed = SessionFeed(key: key)
+        feed.merge([Self.turn("t10", 100)])
+        await feed.showEarlier(fake)   // nothing hidden, `more` unknown: a feed that knows of no more does nothing
+        #expect(fake.calls.isEmpty)
+        let cache = try Cache.inMemory()
+        try await cache.cacheFabricTurns([Self.turn("t10", 100)], olderBeyond: true, syncedThrough: 100)
+        let held = SessionFeed(key: key)
+        await held.open(cache)
+        await held.showEarlier(fake, cache: cache)
+        #expect(fake.calls == ["turns 101"], "\(fake.calls)")
+        #expect(held.turns.contains { $0.turnID == "twin" } && held.turns.count == 11 && !held.more)
+    }
+
+    @Test func aBackgroundTaskOrAWakeIsALineNotYourWords() {
+        let block = """
+        <task-notification>
+        <task-id>a1b2</task-id>
+        <status>completed</status>
+        <summary>Agent &quot;Review Apple UI views&quot; finished</summary>
+        <result>Found 3 issues: &lt;List&gt; reuse…</result>
+        </task-notification>
+        """
+        let only = PromptDisplay(prompt: block, source: .mac)
+        #expect(only.words.isEmpty && only.notes.map(\.text) == ["Background task: Agent \"Review Apple UI views\" finished"])
+        // two at once, and words of the person's after them
+        let two = PromptDisplay(prompt: block + "\n" + block.replacingOccurrences(of: "Review Apple UI views", with: "Tests") + "\nThen merge it", source: .mac)
+        #expect(two.notes.count == 2 && two.notes[1].text.contains("\"Tests\"") && two.words == "Then merge it")
+        // cut short (truncated to fit): the summary still reads, unclosed
+        let cut = PromptDisplay(prompt: "<task-notification>\n<task-id>x</task-id>\n<summary>Agent \"Deploy\" fini", source: .mac)
+        #expect(cut.words.isEmpty && cut.notes.map(\.text) == ["Background task: Agent \"Deploy\" fini"])
+        let bare = PromptDisplay(prompt: "<task-notification><status>failed</status></task-notification>", source: .mac)
+        #expect(bare.notes.map(\.text) == ["Background task failed"])
+        // the mail wake line, by its words or its source
+        let wake = PromptDisplay(prompt: PromptDisplay.wakeLine, source: .mac)
+        #expect(wake.words.isEmpty && wake.notes.first?.symbol == "envelope")
+        #expect(PromptDisplay(prompt: "anything", source: .wake).words.isEmpty)
+        // anything else is the person's, untouched
+        let plain = PromptDisplay(prompt: "Use <b> tags here", source: .order)
+        #expect(plain.words == "Use <b> tags here" && plain.notes.isEmpty)
+        // the row: no "woken for mail" under a bubble that is not there
+        let row = TurnRow(FabricTurn(runtimeID: "r1", sessionID: "s1", address: "a", turnID: "w", prompt: PromptDisplay.wakeLine, reply: "Read it.",
+                                     started: 1, ended: 2, source: .wake), now: Self.now)
+        #expect(row.source == nil && row.promptDisplay.notes.count == 1)
+    }
+
+    @Test func repliesRenderBlockMarkdown() {
+        let nodes = ReplyMarkdown.parse("""
+        ## What changed
+
+        The **deadline** moves. See `grpc.rs` and [the PR](https://example.org/1).
+
+        1. First
+        2. Second
+           - nested one
+           - nested two
+
+        - [x] done
+
+        ```swift
+        let x = 1
+        ```
+
+        > quoted
+
+        | a | b |
+        |---|--:|
+        | 1 | 2 |
+
+        ---
+        """)
+        guard nodes.count == 8 else { Issue.record("\(nodes.count) nodes: \(nodes)"); return }
+        guard case .heading(2, let h) = nodes[0] else { Issue.record("heading"); return }
+        #expect(String(h.characters) == "What changed")
+        guard case .paragraph(let p) = nodes[1] else { Issue.record("paragraph"); return }
+        #expect(String(p.characters) == "The deadline moves. See grpc.rs and the PR.", "inline marks are styles, not characters")
+        #expect(p.runs.contains { $0.link?.absoluteString == "https://example.org/1" })
+        #expect(p.runs.contains { $0.inlinePresentationIntent?.contains(.stronglyEmphasized) == true })
+        #expect(p.runs.contains { $0.inlinePresentationIntent?.contains(.code) == true })
+        guard case .list(true, 1, let items) = nodes[2], items.count == 2 else { Issue.record("ordered list"); return }
+        guard case .list(false, _, let nested) = items[1].children.last, nested.count == 2 else { Issue.record("nested list"); return }
+        guard case .list(false, _, let tasks) = nodes[3], tasks.first?.checked == true else { Issue.record("task list"); return }
+        guard case .code("swift", "let x = 1") = nodes[4] else { Issue.record("code: \(nodes[4])"); return }
+        guard case .quote(let q) = nodes[5], case .paragraph = q.first else { Issue.record("quote"); return }
+        guard case .table(let t) = nodes[6], t.header.count == 2, t.rows.count == 1, t.alignments.last == .trailing else { Issue.record("table"); return }
+        guard case .rule = nodes[7] else { Issue.record("rule"); return }
+    }
+
+    /// The collapsed start of a long reply is cut where a block ends: never
+    /// inside `**`, a code span or a fence.
+    @Test func aLongReplyIsCutAtABlockBoundary() {
+        let para = "This paragraph has **bold words** and `code` in it, and goes on for a while to fill the space. "
+        let reply = String(repeating: para, count: 4) + "\n\n" + String(repeating: para, count: 4) + "\n\n" + String(repeating: para, count: 8)
+        let start = try! #require(ReplyMarkdown.preview(reply, limit: 900))
+        #expect(start.count <= 900 && start.hasSuffix("fill the space."), "at the end of the second paragraph")
+        #expect(start.components(separatedBy: "**").count % 2 == 1 && start.components(separatedBy: "`").count % 2 == 1)
+        // the limit inside a fence: cut before the fence (it starts past a third of the way)
+        let fenced = String(repeating: para, count: 4) + "\n\n```go\n" + String(repeating: "fmt.Println(\"hello world\")\n", count: 60) + "```\n"
+        let beforeFence = try! #require(ReplyMarkdown.preview(fenced, limit: 900))
+        #expect(!beforeFence.contains("```"))
+        // a reply that is all one code block: its whole lines, the fence closed again
+        let code = "```go\n" + String(repeating: "fmt.Println(\"hello world\")\n", count: 60) + "```\n"
+        let codeStart = try! #require(ReplyMarkdown.preview(code, limit: 900))
+        #expect(codeStart.hasPrefix("```go\n") && codeStart.hasSuffix("\n```") && codeStart.components(separatedBy: "```").count == 3)
+        if case .code("go", let body)? = ReplyMarkdown.parse(codeStart).first { #expect(body.hasSuffix("fmt.Println(\"hello world\")")) } else { Issue.record("a code block") }
+        // one long paragraph: at a word, an open mark dropped, an ellipsis
+        let run = String(repeating: "word ", count: 170) + "**never closed " + String(repeating: "x ", count: 100)
+        let runStart = try! #require(ReplyMarkdown.preview(run, limit: 900))
+        #expect(runStart.hasSuffix("\u{2026}") && !runStart.contains("**"))
+        #expect(ReplyMarkdown.preview("short", limit: 900) == nil)
+    }
+
+    /// A second tap while the first is on its way does nothing: the action runs once.
+    @Test func aSecondTapWhileTheFirstIsOnItsWayDoesNothing() async {
+        let busy = InFlight()
+        var runs = 0
+        let gate = AsyncStream<Void>.makeStream()
+        let first = Task { @MainActor in
+            await busy.run("answer") {
+                runs += 1
+                for await _ in gate.stream { break }
+                return nil
+            }
+        }
+        await until("the first is running") { busy.isRunning("answer") }
+        let second = await busy.run("answer") { runs += 1; return nil }
+        #expect(second == .none, "not run")
+        #expect(await busy.run("stop") { "other" } == .some("other"), "another action is its own")
+        gate.continuation.yield()
+        _ = await first.value
+        #expect(runs == 1 && !busy.isRunning("answer"))
+        #expect(await busy.run("answer") { runs += 1; return nil } == .some(nil), "free again once done")
+        #expect(runs == 2)
+    }
+
+    /// A send whose post fails after the undo window keeps its words (the
+    /// composer was cleared when it was held): shown not sent, with Retry.
+    @Test func aFailedSendKeepsItsWordsAndRetries() async throws {
+        let fake = FakeFabric(Self.fleet())
+        let s = store(fake)
+        fake.state.withLock { $0.refuse = FabricError(status: 503, code: "unavailable", message: "down") }
+        let session = try #require(s.fleet.sessions.first)
+        #expect(s.command.send("Ship it after the tests", to: session, queued: false) == nil)
+        await until("the post failed") { s.command.pending.first?.failure != nil }
+        let failed = try #require(s.command.pending.first)
+        #expect(failed.text == "Ship it after the tests" && fake.posted.isEmpty)
+        #expect(s.command.notice?.text.contains("not sent") == true)
+        // flushing as the app leaves does not post it behind the person's back
+        await s.command.flush()
+        #expect(fake.posted.isEmpty)
+        await s.command.retry(failed.id)
+        #expect(s.command.pending.isEmpty && fake.posted.count == 1)
+        #expect(fake.posted.first?.orderID == failed.id, "the same order id: the hub keeps one order per id")
+        // Edit instead: the words come back
+        fake.state.withLock { $0.refuse = FabricError(status: 503, code: "unavailable", message: "down") }
+        s.command.send("Second thoughts", to: session, queued: false)
+        await until("failed again") { s.command.pending.first?.failure != nil }
+        #expect(s.command.undo(try #require(s.command.pending.first).id) == "Second thoughts" && s.command.pending.isEmpty)
+    }
+
+    /// Verification is memoised: a screen redrawing (and the approval sheet
+    /// ticking every second) reads the Keychain and verifies once per item,
+    /// until trust changes.
+    @Test func verificationIsMemoisedUntilTrustChanges() {
+        let s = store(FakeFabric(Self.fleet()))
+        let trust = CountingTrust(["r1": Self.runtimeKey.publicKey])
+        s.command.trust = trust
+        let item = Self.approval()
+        for _ in 0..<50 {
+            #expect(s.command.verifiedKind(item) == .approval)
+            guard case .success = s.command.verify(item) else { Issue.record("verifies"); return }
+        }
+        #expect(trust.loads == 1 && s.command.verifications == 1)
+        // another item (other bytes) verifies on its own
+        _ = s.command.verify(Self.approval(expiresIn: 300))
+        #expect(s.command.verifications == 2 && trust.loads == 1)
+        // trust changed (a pairing, a forgotten Mac): verified afresh
+        s.command.trustChanged()
+        _ = s.command.verify(item)
+        #expect(trust.loads == 2 && s.command.verifications == 3)
+        // a forged item never verifies, memoised or not
+        let forged = Self.approval(signer: SoftwareDeviceKey())
+        for _ in 0..<3 { guard case .failure = s.command.verify(forged) else { Issue.record("forged verified"); return } }
     }
 
     // MARK: the review of 2026-11-21
@@ -721,5 +1011,21 @@ private final class FakeFabric: FabricService, @unchecked Sendable {
         guard case .command(let c)? = fake.posted.last?.what else { Issue.record("an order"); return }
         #expect(c.verb == .deny && c.requestHash == FabricSignature.requestHash(item.signed!.request))
         #expect(pointer.itemID == item.id)
+    }
+}
+
+/// A trust list that counts its Keychain-like reads.
+private final class CountingTrust: FabricTrustStore, @unchecked Sendable {
+    private let inner: MemoryTrustStore
+    private let count = Mutex(0)
+    init(_ keys: [String: Data]) { inner = MemoryTrustStore(keys) }
+    var loads: Int { count.withLock { $0 } }
+    func runtimeKey(_ runtimeID: String) -> Data? { inner.runtimeKey(runtimeID) }
+    func trust(_ runtimeID: String, key: Data) throws { inner.trust(runtimeID, key: key) }
+    func forget(_ runtimeID: String) throws { try inner.forget(runtimeID) }
+    func trusted() -> [String: Data] { inner.trusted() }
+    func load() throws -> [String: Data] {
+        count.withLock { $0 += 1 }
+        return try inner.load()
     }
 }

@@ -62,15 +62,19 @@ struct SessionHeader: Hashable {
     }
 }
 
-/// One turn as the feed shows it. Its reply's Markdown is parsed here, once
-/// per turn (the feed keeps its rows), never in a view's `body`: a long
-/// session re-parsed every reply on every redraw.
-struct TurnRow: Identifiable, Hashable {
-    /// a reply longer than this shows its first this-many characters until "Show all"
+/// One turn as the feed shows it. Its Markdown is parsed here, once per
+/// turn (the feed keeps its rows), never in a view's `body`; and only as
+/// much as the collapsed turn shows: a long reply's whole text is parsed
+/// when the person asks for it (`SessionFeed.expand`). `Sendable`, so the
+/// feed builds rows off the main actor when a session opens.
+struct TurnRow: Identifiable, Hashable, Sendable {
+    /// a reply longer than this shows its start (cut at a block boundary) until "Show all"
     static let collapsedLength = 900
 
     var id: String
     var prompt: String
+    /// the prompt as shown: the person's words, or what the Mac started the turn with
+    var promptDisplay: PromptDisplay
     var reply: String
     /// "7 tools · 2 files · +6 −2 · 1 commit"
     var activity: String?
@@ -83,20 +87,22 @@ struct TurnRow: Identifiable, Hashable {
     var pullRequest: URL?
     var textOff: Bool
     var truncated: Bool
-    /// the whole reply, as inline Markdown
-    let replyText: AttributedString
-    /// its first `collapsedLength` characters and an ellipsis; nil when it is not that long
-    let replyPreview: AttributedString?
+    /// what the collapsed turn shows: the whole reply when it is short, else its start
+    let replyNodes: [ReplyNode]
+    /// the reply is longer than its collapsed start ("Show all")
+    let long: Bool
 
     init(_ t: FabricTurn, now: Date) {
         id = t.turnID
         prompt = t.prompt
+        promptDisplay = PromptDisplay(prompt: t.prompt, source: t.source)
         reply = t.reply
         var a: [String] = []
         if t.toolCount > 0 { a.append(t.toolCount == 1 ? "1 tool" : "\(t.toolCount) tools") }
         if let o = FabricWords.outcome(t.outcome) { a.append(o) }
         activity = a.isEmpty ? nil : a.joined(separator: " \u{00B7} ")
-        source = FabricWords.source(t.source)
+        // a turn the Mac started says so in its own line, not under a bubble
+        source = promptDisplay.words.isEmpty && !promptDisplay.notes.isEmpty ? nil : FabricWords.source(t.source)
         ending = FabricWords.turnEnd(t.end)
         endTone = switch t.end {
         case .question: .yellow
@@ -108,13 +114,20 @@ struct TurnRow: Identifiable, Hashable {
         pullRequest = t.outcome.pullRequestURL.flatMap(URL.init(string:))
         textOff = t.textOff && t.prompt.isEmpty && t.reply.isEmpty
         truncated = t.truncated
-        replyText = t.reply.isEmpty ? AttributedString() : Self.markdown(t.reply)
-        replyPreview = t.reply.count > Self.collapsedLength ? Self.markdown(String(t.reply.prefix(Self.collapsedLength)) + "\u{2026}") : nil
+        if let start = ReplyMarkdown.preview(t.reply, limit: Self.collapsedLength) {
+            replyNodes = ReplyMarkdown.parse(start)
+            long = true
+        } else {
+            replyNodes = ReplyMarkdown.parse(t.reply)
+            long = false
+        }
     }
 
-    /// Inline Markdown (bold, code, links), as Claude writes it.
-    static func markdown(_ s: String) -> AttributedString {
-        (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s)
+    /// Whether this row still says what `t` says on `now`'s day (a reply
+    /// only grows, from the route's to the live event's: its length tells).
+    func shows(_ t: FabricTurn, now: Date) -> Bool {
+        reply.utf8.count == t.reply.utf8.count && prompt.utf8.count == t.prompt.utf8.count
+            && textOff == (t.textOff && t.prompt.isEmpty && t.reply.isEmpty) && when == FleetTime.clock(t.ended, now: now)
     }
 
     // the parsed text follows from `reply`: comparing it again would only cost
@@ -183,88 +196,171 @@ enum QuickReplies {
     static let stock = ["Yes, go ahead", "Not yet", "Explain first", "Show me the diff"]
 }
 
-/// The feed of one session's turns: what this device cached when it last
-/// showed them (at once, before the network), then only the turns that
-/// ended since (`after=`), older pages on demand, and the stream's new
-/// turns as they finish. Turns never change once ended, so what is cached
-/// stays true; whatever this feed reads from the server is cached too.
+
+/// The feed of one session's turns.
+///
+/// Opening: what this device cached is read first, always (off the main
+/// actor, with the rows for the newest turns built there too), then the
+/// stream's turns from this app run are merged, then the server is asked
+/// only for what ended after the cache's watermark (`Cache.CachedTurns.synced`:
+/// the newest end up to which what is held is gap-free), page by page. A
+/// hole the stream left (the app was away) is so fetched, never skipped.
+///
+/// The window: only the newest `window` turns are drawn at first; "Earlier
+/// turns" shows the next `window` held in memory at once, and reads the
+/// server (`before=`) only when nothing older is held. Rows are built (their
+/// Markdown parsed) only for the turns drawn. Turns never change once ended,
+/// so what is cached stays true; whatever this feed reads is cached too.
 @MainActor @Observable
 final class SessionFeed {
+    /// turns drawn when a session opens, and shown more per "Earlier turns"
+    static let window = 20
+
     let key: FleetSessionKey
-    /// oldest first, as read
-    private(set) var turns: [FabricTurn] = [] {
-        didSet { rows = Self.rows(for: turns, reusing: rows, now: now()) }
-    }
-    /// `turns` as the feed shows them, each built (its Markdown parsed) once
-    /// and kept while its turn and its day are unchanged
+    /// every turn held, oldest first
+    private(set) var turns: [FabricTurn] = []
+    /// the drawn turns (the window), each built once and kept while its turn and its day are unchanged
     private(set) var rows: [TurnRow] = []
     /// the clock rows are worded against (a test's fixed one)
     @ObservationIgnored var now: () -> Date = Date.init
+    /// a result that comes back after sign-out (or another server) is not
+    /// this account's: nothing is cached from it (`FleetStore.feed` sets it)
+    @ObservationIgnored var stillCurrent: @MainActor () -> Bool = { true }
+    /// the server holds turns older than the oldest held
     private(set) var more = false
+    /// the cache has been read (or there is none): the screen draws from
+    /// here, never an empty state first
+    private(set) var opened = false
+    /// the newest turns are being asked for
     private(set) var loading = false
+    /// an older page is being read
+    private(set) var loadingOlder = false
+    /// why there is nothing to show (the first load failed with nothing held)
     private(set) var loadError: String?
+    /// something went wrong with turns already showing: said once (a toast)
+    private(set) var problem: FabricNotice?
     /// the newest turn's end the person had seen when the screen opened
     private(set) var seenUpTo: Int?
     /// the feed opened from this device's cache (before the network answered)
     private(set) var fromCache = false
+    /// the newest end up to which `turns` is every turn the server has
+    private(set) var synced: Int?
+    /// the oldest turn drawn (nil: all of them, while they fit the window)
+    private(set) var floor: String?
+    /// the first drawn turn the person has not seen (where "N new" sits), and how many are new
+    private(set) var firstNew: String?
+    private(set) var newCount = 0
+    /// long replies shown whole, by turn id: their whole text, parsed once
+    private(set) var expanded: [String: [ReplyNode]] = [:]
+    /// rows built for turns drawn now or lately (a window moved back keeps them)
+    @ObservationIgnored private var built: [String: TurnRow] = [:]
+    /// where a top-up starts when the cache had no watermark (its oldest turn)
+    @ObservationIgnored private var cachedOldest: Int?
 
     init(key: FleetSessionKey) {
         self.key = key
         seenUpTo = LastLooked.shared.seen(key)
     }
 
-    func load(_ service: (any FabricService)?, cache: Cache? = nil) async {
-        if turns.isEmpty, let cache, let held = try? await cache.fabricTurns(key), !held.turns.isEmpty {
-            merge(held.turns)
-            more = held.older
-            fromCache = true
+    /// Open from the cache (once), merge the stream's turns, then fetch what is newer.
+    func load(_ service: (any FabricService)?, cache: Cache? = nil, live: [FabricTurn] = []) async {
+        await open(cache)
+        merge(live)
+        await refresh(service, cache: cache)
+    }
+
+    /// Read what this device holds, once: the turns and the rows for the
+    /// window are made off the main actor, so the first frame waits on
+    /// neither the database nor Markdown. Already open (warmed from the
+    /// list, or opened before in this app run): the window starts again at
+    /// the newest turns.
+    func open(_ cache: Cache?) async {
+        guard !opened else {
+            resetWindow()
+            return
         }
-        guard let service else { return }
+        if let cache {
+            let key = key, now = now(), window = Self.window
+            let read = await Task.detached(priority: .userInitiated) { () -> (Cache.CachedTurns, [TurnRow])? in
+                guard let held = try? await cache.fabricTurns(key), !held.turns.isEmpty else { return nil }
+                return (held, held.turns.suffix(window).map { TurnRow($0, now: now) })
+            }.value
+            // opened meanwhile by another caller (a warm-up, then the screen)
+            guard !opened else { return }
+            if let (held, rows) = read {
+                for r in rows { built[r.id] = r }
+                more = held.older
+                synced = held.synced
+                cachedOldest = held.turns.first?.ended
+                fromCache = true
+                // with whatever the stream brought meanwhile
+                merge(held.turns, force: true)
+            }
+        }
+        opened = true
+    }
+
+    /// The turns that ended since the watermark (a pull to refresh, Try
+    /// again, coming back to the app). With nothing held, the newest page.
+    func refresh(_ service: (any FabricService)?, cache: Cache? = nil) async {
+        guard let service, !loading else { return }
         loading = true
         defer { loading = false }
         do {
-            if fromCache, let newest = turns.last?.ended {
-                try await topUp(service, cache: cache, from: newest)
+            if let from = synced ?? cachedOldest {
+                try await topUp(service, cache: cache, from: from)
             } else {
                 let page = try await service.turns(key, before: nil, limit: 30)
                 merge(page.turns)
                 more = page.more
-                try? await cache?.cacheFabricTurns(page.turns, olderBeyond: page.more)
+                let top = page.turns.map(\.ended).max()
+                if let top { synced = max(synced ?? top, top) }
+                if stillCurrent() { try? await cache?.cacheFabricTurns(page.turns, olderBeyond: page.more, syncedThrough: top) }
             }
             loadError = nil
+        } catch is CancellationError {
         } catch {
-            if turns.isEmpty { loadError = FleetStore.describe(error) }
+            if turns.isEmpty {
+                loadError = FleetStore.describe(error)
+            } else {
+                problem = FabricNotice(text: "Couldn't check for newer turns: \(FleetStore.describe(error))")
+            }
         }
     }
 
-    /// The turns that ended since the newest one held, oldest first, page
-    /// by page until the server has no more. Asked from a second before it,
-    /// so a turn that ended in the same second is not missed (each is kept
-    /// once by id). A server from before `after=` answers its newest page
-    /// instead: that is merged as today, and if it does not reach back to
-    /// what was held, what lies between is unknown, so the feed (and the
-    /// cache) start again from that page.
-    private func topUp(_ service: any FabricService, cache: Cache?, from newest: Int) async throws {
-        var after = newest - 1
+    /// The turns that ended since `from`, oldest first, page by page until
+    /// the server has no more. Asked from a second before it, so a turn that
+    /// ended in the same second is not missed (each is kept once by id).
+    /// Each page moves the watermark to its newest turn: pages read from the
+    /// watermark are gap-free by construction. A server from before
+    /// `after=` answers its newest page instead: that is merged as today,
+    /// and if it does not reach back to the watermark, what lies between is
+    /// unknown, so the feed (and the cache) start again from that page.
+    private func topUp(_ service: any FabricService, cache: Cache?, from: Int) async throws {
+        var after = from - 1
         var limit = 30
         for _ in 0..<50 {
             let page = try await service.turns(key, after: after, limit: limit)
+            let top = page.turns.map(\.ended).max()
             guard page.isAfterPage(after: after) else {
-                let reaches = page.turns.contains { $0.ended <= newest }
+                let reaches = page.turns.contains { $0.ended <= from }
                 if !reaches {
                     // keep only what the stream brought since (newer than the page)
-                    let top = page.turns.map(\.ended).max() ?? .max
-                    turns = turns.filter { $0.ended > top }
-                    try? await cache?.replaceFabricTurns(key, with: page.turns, older: page.more)
-                } else {
-                    try? await cache?.cacheFabricTurns(page.turns)
+                    let newest = top ?? .max
+                    turns = turns.filter { $0.ended > newest }
+                    floor = nil
+                    if stillCurrent() { try? await cache?.replaceFabricTurns(key, with: page.turns, older: page.more, syncedThrough: top) }
+                } else if stillCurrent() {
+                    try? await cache?.cacheFabricTurns(page.turns, syncedThrough: top)
                 }
-                merge(page.turns)
+                merge(page.turns, force: true)
                 if !reaches { more = page.more }
+                if let top { synced = reaches ? max(synced ?? top, top) : top }
                 return
             }
             merge(page.turns)
-            try? await cache?.cacheFabricTurns(page.turns)
+            if let top { synced = max(synced ?? top, top) }
+            if stillCurrent() { try? await cache?.cacheFabricTurns(page.turns, syncedThrough: top) }
             guard page.more, let last = page.turns.last?.ended else { return }
             // never ask the same page twice (more than a page ending in one second)
             after = max(last - 1, after + 1)
@@ -272,57 +368,152 @@ final class SessionFeed {
         }
     }
 
-    func loadOlder(_ service: (any FabricService)?, cache: Cache? = nil) async {
-        guard let service, more, !loading, let oldest = turns.first else { return }
-        loading = true
-        defer { loading = false }
-        if let page = try? await service.turns(key, before: oldest.ended, limit: 30) {
+    /// There is something older to show: held in memory, or on the server.
+    var hasEarlier: Bool { hiddenCount > 0 || more }
+
+    /// Turns held but not drawn (older than the window).
+    var hiddenCount: Int {
+        guard let floor, let i = turns.firstIndex(where: { $0.turnID == floor }) else { return 0 }
+        return i
+    }
+
+    /// "Earlier turns": the next `window` held turns at once; only when none
+    /// is held, a page from the server. Asked `before` a second after the
+    /// oldest held, so a turn that ended in the same second as it is not
+    /// skipped (`before` is exclusive; what is held already is kept once).
+    func showEarlier(_ service: (any FabricService)?, cache: Cache? = nil) async {
+        if hiddenCount > 0 {
+            moveFloor(back: Self.window)
+            return
+        }
+        guard let service, more, !loadingOlder, let oldest = turns.first else { return }
+        loadingOlder = true
+        defer { loadingOlder = false }
+        do {
+            var page = try await service.turns(key, before: oldest.ended + 1, limit: 30)
+            let held = Set(turns.map(\.turnID))
+            if page.more, page.turns.allSatisfy({ held.contains($0.turnID) }) {
+                // a whole page ended in that one second: step past it
+                page = try await service.turns(key, before: oldest.ended, limit: 30)
+            }
+            let before = turns.count
             merge(page.turns)
             more = page.more
-            try? await cache?.cacheFabricTurns(page.turns, olderBeyond: page.more)
+            // what came back is drawn up to a window's worth; the rest waits, held
+            moveFloor(back: min(Self.window, turns.count - before))
+            if stillCurrent() { try? await cache?.cacheFabricTurns(page.turns, olderBeyond: page.more) }
+        } catch is CancellationError {
+        } catch {
+            problem = FabricNotice(text: "Couldn't load earlier turns: \(FleetStore.describe(error))")
         }
     }
+
+    /// The toast has been shown.
+    func clearProblem() { problem = nil }
 
     /// Turns from anywhere, kept once each, oldest first.
-    func merge(_ new: [FabricTurn]) {
+    func merge(_ new: [FabricTurn], force: Bool = false) {
+        let mine = new.filter { $0.session == key }
+        guard force || !mine.isEmpty else { return }
         var byID = Dictionary(turns.map { ($0.turnID, $0) }, uniquingKeysWith: { a, _ in a })
-        for t in new where t.session == key {
-            // the live event carries text a Text off route leaves out: keep the fuller one
-            if let held = byID[t.turnID], held.reply.count > t.reply.count { continue }
-            byID[t.turnID] = t
-        }
-        turns = byID.values.sorted { ($0.ended, $0.started) < ($1.ended, $1.started) }
-    }
-
-    /// A row per turn, reusing the row already built for a turn whose words
-    /// and day are the same (a reply only grows, from the route's to the
-    /// live event's: its length says whether it changed).
-    static func rows(for turns: [FabricTurn], reusing old: [TurnRow], now: Date) -> [TurnRow] {
-        let held = Dictionary(old.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        return turns.map { t in
-            if let row = held[t.turnID], row.reply.utf8.count == t.reply.utf8.count, row.prompt.utf8.count == t.prompt.utf8.count,
-               row.textOff == (t.textOff && t.prompt.isEmpty && t.reply.isEmpty),
-               row.when == FleetTime.clock(t.ended, now: now) {
-                return row
+        var changed = force
+        for t in mine {
+            if let held = byID[t.turnID] {
+                // the live event carries text a Text off route leaves out: keep the fuller one
+                if held == t || held.reply.count > t.reply.count { continue }
             }
-            return TurnRow(t, now: now)
+            byID[t.turnID] = t
+            changed = true
+        }
+        guard changed else { return }
+        place(Array(byID.values))
+    }
+
+    /// A long reply shown whole (its whole text parsed now, once) or collapsed again.
+    func expand(_ id: String, _ on: Bool) {
+        if !on {
+            expanded[id] = nil
+        } else if expanded[id] == nil, let t = turns.first(where: { $0.turnID == id }) {
+            expanded[id] = ReplyMarkdown.parse(t.reply)
         }
     }
 
-    /// Turns that finished after the person last looked.
-    var newCount: Int {
-        guard let seenUpTo else { return 0 }
-        return turns.count { $0.ended > seenUpTo }
+    // MARK: the window
+
+    private func place(_ all: [FabricTurn]) {
+        turns = all.sorted { ($0.ended, $0.started, $0.turnID) < ($1.ended, $1.started, $1.turnID) }
+        if let f = floor, !turns.contains(where: { $0.turnID == f }) { floor = nil }
+        if floor == nil, turns.count > Self.window { floor = turns[turns.count - Self.window].turnID }
+        rebuild()
     }
 
-    /// The first turn the person has not seen (where "N new" sits).
-    var firstNew: String? {
-        guard let seenUpTo else { return nil }
-        return turns.first { $0.ended > seenUpTo }?.turnID
+    private func resetWindow() {
+        let target = turns.count > Self.window ? turns[turns.count - Self.window].turnID : nil
+        expanded = [:]
+        guard target != floor else { return }
+        floor = target
+        rebuild()
+    }
+
+    private func moveFloor(back n: Int) {
+        guard n > 0, !turns.isEmpty else { return }
+        let i = floor.flatMap { f in turns.firstIndex { $0.turnID == f } } ?? 0
+        // the oldest held, once reached, stays the floor: a later merge does not window again
+        floor = turns[max(0, i - n)].turnID
+        rebuild()
+    }
+
+    /// Rows for the drawn turns, reusing the row already built for a turn
+    /// whose words and day are the same; the "N new" divider found once
+    /// per change, not once per row.
+    private func rebuild() {
+        let start = floor.flatMap { f in turns.firstIndex { $0.turnID == f } } ?? 0
+        let drawn = turns[start...]
+        let now = now()
+        var next: [TurnRow] = []
+        next.reserveCapacity(drawn.count)
+        for t in drawn {
+            if let row = built[t.turnID], row.shows(t, now: now) {
+                next.append(row)
+            } else {
+                let row = TurnRow(t, now: now)
+                built[t.turnID] = row
+                next.append(row)
+            }
+        }
+        if built.count > next.count + Self.window * 2 {
+            let keep = Set(next.map(\.id))
+            built = built.filter { keep.contains($0.key) }
+        }
+        if next != rows { rows = next }
+        let first = seenUpTo.flatMap { seen in drawn.first { $0.ended > seen } }?.turnID
+        if firstNew != first { firstNew = first }
+        let count = seenUpTo.map { seen in turns.count { $0.ended > seen } } ?? 0
+        if newCount != count { newCount = count }
     }
 
     /// The person has looked: remember the newest turn.
     func looked() {
         if let last = turns.last { LastLooked.shared.look(key, upTo: last.ended) }
+    }
+}
+
+/// Actions in flight on a screen, by name: a second tap on a button whose
+/// first is still on its way does nothing (an order posted twice is two
+/// orders). Each button is disabled while its own name runs.
+@MainActor @Observable
+final class InFlight {
+    private(set) var running: Set<String> = []
+
+    func isRunning(_ name: String) -> Bool { running.contains(name) }
+
+    /// Run `change` unless `name` is already running: its answer (nil:
+    /// done), or nil-wrapped when it was not run at all.
+    @discardableResult
+    func run(_ name: String, _ change: @MainActor () async -> String?) async -> String?? {
+        guard !running.contains(name) else { return .none }
+        running.insert(name)
+        defer { running.remove(name) }
+        return .some(await change())
     }
 }

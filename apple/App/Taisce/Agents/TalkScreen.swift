@@ -103,6 +103,8 @@ struct TalkItemCard: View {
     let now: Date
     let act: (@escaping @MainActor () async -> String?) -> Void
     @Environment(AppModel.self) private var model
+    /// one answer at a time: each settles the item, and a second tap would post twice
+    @State private var busy = InFlight()
 
     var body: some View {
         let talk = model.fleet.talk
@@ -126,25 +128,32 @@ struct TalkItemCard: View {
             HStack {
                 switch item.kind {
                 case .pairPaused:
-                    Button("Let them continue") { act { await talk.continuePair(item.conversationID ?? "") } }
+                    Button("Let them continue") { go { await talk.continuePair(item.conversationID ?? "") } }
                         .buttonStyle(.lapis(.primary, size: .small))
                         .accessibilityIdentifier("talk.continue")
-                    Button("Stop them") { act { await talk.stopPair(item.conversationID ?? "") } }
+                    Button("Stop them") { go { await talk.stopPair(item.conversationID ?? "") } }
                         .buttonStyle(.lapis(.destructive, size: .small))
                         .accessibilityIdentifier("talk.stop")
                 default:
-                    Button(wakeWord) { act { await talk.wake(item) } }
+                    Button(wakeWord) { go { await talk.wake(item) } }
                         .buttonStyle(.lapis(.primary, size: .small))
                         .accessibilityIdentifier("talk.wake")
-                    Button("Let it wait") { act { await talk.dismiss(item) } }
+                    Button("Let it wait") { go { await talk.dismiss(item) } }
                         .buttonStyle(.lapis(.secondary, size: .small))
                         .accessibilityIdentifier("talk.wait")
                 }
+                if busy.isRunning("item") { ProgressView().controlSize(.small) }
             }
+            .disabled(busy.isRunning("item"))
         }
         .padding(14)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("talk.item.\(item.kind.rawValue)")
+    }
+
+    private func go(_ change: @escaping @MainActor () async -> String?) {
+        let busy = busy
+        act { (await busy.run("item", change)) ?? nil }
     }
 
     private var wakeWord: String {

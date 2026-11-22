@@ -37,6 +37,7 @@ struct AgentsScreen: View {
                 onUnsnooze: { key in act { await store.unsnooze(key) } },
                 onPin: { key, on in withAnimation(Lapis.Motion.standard) { pins = FleetPins.set(key, pinned: on, in: pins) } },
                 onRetry: { Task { await store.refresh() } },
+                onRowShown: { key in store.warm(key) },
                 talkWaiting: store.talk.waiting,
                 onHold: { on in if on { confirmHold = true } else { act { await store.command.hold(false) } } },
                 onReview: { item in router.approval = AttentionRef(id: item.id) }
@@ -90,6 +91,8 @@ struct AgentsContent: View {
     var onUnsnooze: (FleetSessionKey) -> Void = { _ in }
     var onPin: (FleetSessionKey, Bool) -> Void = { _, _ in }
     var onRetry: () -> Void = {}
+    /// a session's row is on screen: its cached turns are read ahead, so a tap opens it drawn
+    var onRowShown: (FleetSessionKey) -> Void = { _ in }
     /// what Talk asks you to settle
     var talkWaiting = 0
     var onHold: (Bool) -> Void = { _ in }
@@ -377,6 +380,7 @@ struct AgentsContent: View {
         NavigationLink(value: Route.agentSession(row.id)) {
             FleetRowView(row: row)
         }
+            .onAppear { onRowShown(row.id) }
             .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 12))
             .listRowBackground(marked == row.id ? Color.lapis.accentSoft : Color.lapis.card)
             .listRowSeparatorTint(Color.lapis.line2)

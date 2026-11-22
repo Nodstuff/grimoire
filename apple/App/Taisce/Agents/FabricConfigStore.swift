@@ -182,6 +182,7 @@ final class FabricConfigStore {
             let sealed = try code.seal(with: try command.identity.current(), deviceName: deviceName)
             // the code was read at the Mac itself: its key is the Mac's, kept now
             try command.trust.trust(code.runtimeID, key: code.runtimeKey)
+            command.trustChanged()
             codes[code.pairingID] = code
             let view = try await service.pair(runtimeID: code.runtimeID, pairingID: code.pairingID, sealed: sealed)
             take(view)

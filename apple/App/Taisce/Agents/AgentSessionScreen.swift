@@ -10,18 +10,24 @@ struct AgentSessionScreen: View {
     @Environment(AppModel.self) private var model
     @Environment(Router.self) private var router
     @Environment(\.scenePhase) private var scenePhase
-    @State private var feed: SessionFeed
     @State private var draft = ""
     @State private var toast: ToastMessage?
     @State private var confirmClear = false
+    /// what this screen has on its way (a second tap does nothing)
+    @State private var busy = InFlight()
+    /// where the feed is scrolled; it opens at the bottom
+    @State private var position = ScrollPosition(idType: String.self, edge: .bottom)
+    /// the person is at (or very near) the newest turn: a new one scrolls into view
+    @State private var nearBottom = true
     @FocusState private var composing: Bool
 
     init(key: FleetSessionKey) {
         self.key = key
-        _feed = State(initialValue: SessionFeed(key: key))
     }
 
     private var store: FleetStore { model.fleet }
+    /// kept by the store across opens: a session opened before draws at once
+    private var feed: SessionFeed { store.feed(key) }
     private var command: CommandCenter { store.command }
     private var session: FleetSession? { store.fleet.session(key) }
     private var runtime: FleetRuntime? { store.fleet.runtime(key.runtimeID) }
@@ -43,16 +49,25 @@ struct AgentSessionScreen: View {
         .toolbar { toolbar }
         .lapisToast($toast)
         .task {
-            // what this device last saw at once, then only what is newer
-            await feed.load(store.fabricService, cache: store.turnCache)
+            // what this device last saw at once, then the stream's turns from
+            // this run (the store merges later ones itself), then only what
+            // ended after the cache's watermark
+            await feed.load(store.fabricService, cache: store.turnCache, live: store.liveTurns[key] ?? [])
             await command.loadOrders(for: key)
         }
-        // the stream's turns, as they finish
-        .onChange(of: store.liveTurns[key] ?? [], initial: true) { _, turns in feed.merge(turns) }
+        .onChange(of: scenePhase) { _, phase in
+            // back from the background: what ended meanwhile (the stream was down)
+            if phase == .active, feed.opened { Task { await feed.refresh(store.fabricService, cache: store.turnCache) } }
+        }
         .onChange(of: command.notice) { _, notice in
             guard let notice else { return }
             toast = ToastMessage(text: notice.text, tone: notice.isError ? .error : .neutral)
             command.notice = nil
+        }
+        .onChange(of: feed.problem) { _, problem in
+            guard let problem else { return }
+            toast = ToastMessage(text: problem.text, tone: .error)
+            feed.clearProblem()
         }
         .onAppear { store.sessionOnScreen(key) }
         .onDisappear {
@@ -70,7 +85,7 @@ struct AgentSessionScreen: View {
             await command.command(.seen, key)
         }
         .confirmationDialog("Clear the conversation?", isPresented: $confirmClear, titleVisibility: .visible) {
-            Button("Clear", role: .destructive) { act { await command.command(.clear, key) } }
+            Button("Clear", role: .destructive) { act("clear") { await command.command(.clear, key) } }
         } message: {
             Text("Claude Code's /clear: the session starts again with an empty context.")
         }
@@ -81,61 +96,112 @@ struct AgentSessionScreen: View {
     private func content(_ s: FleetSession) -> some View {
         let items = store.fleet.attention(for: key)
         // what each item is comes from what the Mac signed, never the server's kind
+        // (memoised in the command center: no Keychain read or verify per redraw)
         let question = items.first { command.verifiedKind($0) == .question }
         let mode = ComposerMode(s, runtime: runtime)
-        return ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
-                    TimelineView(.periodic(from: .now, by: 30)) { context in
-                        headerCard(SessionHeader(s, runtime: runtime, now: context.date), s)
+        return Group {
+            if feed.opened {
+                feedScroll(s, items: items, question: question)
+            } else {
+                // the cache is being read (milliseconds): nothing, not an empty state
+                Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            composer(s, mode: mode, question: question)
+        }
+    }
+
+    private func feedScroll(_ s: FleetSession, items: [FabricAttentionItem], question: FabricAttentionItem?) -> some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 14) {
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    headerCard(SessionHeader(s, runtime: runtime, now: context.date), s)
+                }
+                if feed.hasEarlier {
+                    Button { Task { await feed.showEarlier(store.fabricService, cache: store.turnCache) } } label: {
+                        Label(feed.loadingOlder ? "Loading\u{2026}" : "Earlier turns", systemImage: "arrow.up.circle")
+                            .frame(maxWidth: .infinity)
                     }
-                    if feed.more {
-                        Button { Task { await feed.loadOlder(store.fabricService, cache: store.turnCache) } } label: {
-                            Label(feed.loading ? "Loading\u{2026}" : "Earlier turns", systemImage: "arrow.up.circle")
-                                .frame(maxWidth: .infinity)
+                    .buttonStyle(.lapis(.ghost))
+                    .disabled(feed.loadingOlder)
+                    .accessibilityIdentifier("session.earlier")
+                }
+                if feed.rows.isEmpty {
+                    if feed.loading {
+                        ProgressView().frame(maxWidth: .infinity).padding(.vertical, 24).accessibilityIdentifier("session.loading")
+                    } else if let error = feed.loadError {
+                        VStack(alignment: .leading, spacing: 10) {
+                            EmptyCard(icon: "wifi.exclamationmark", title: error, hint: "The turns couldn't be read. Pull down, or try again.")
+                            Button("Try again", systemImage: "arrow.clockwise") {
+                                Task { await feed.refresh(store.fabricService, cache: store.turnCache) }
+                            }
+                            .buttonStyle(.lapis(.secondary, size: .small))
+                            .accessibilityIdentifier("session.retry")
                         }
-                        .buttonStyle(.lapis(.ghost))
-                        .accessibilityIdentifier("session.earlier")
-                    }
-                    if feed.rows.isEmpty, !feed.loading {
-                        EmptyCard(icon: "text.bubble", title: feed.loadError ?? "No turns yet",
+                    } else {
+                        EmptyCard(icon: "text.bubble", title: "No turns yet",
                                   hint: s.textOff ? "This project has Text off: turns are not kept." : "What it is asked and what it answers shows here, turn by turn.")
                     }
-                    ForEach(feed.rows) { row in
+                }
+                ForEach(feed.rows) { row in
+                    VStack(alignment: .leading, spacing: 14) {
                         if row.id == feed.firstNew, feed.newCount > 0 {
                             newDivider(feed.newCount)
                         }
-                        TurnView(row: row).equatable().id(row.id)
+                        TurnView(row: row, whole: feed.expanded[row.id]) { feed.expand(row.id, $0) }.equatable()
                     }
-                    if s.state == .working || s.state == .stalled {
-                        TimelineView(.periodic(from: .now, by: 30)) { context in runningNow(s, now: context.date) }
-                    }
-                    // everything that asks something of the person sits at the bottom,
-                    // where the feed opens and the reply box is, never above the turns
-                    ForEach(items.filter { $0.id != question?.id }) { item in
-                        AttentionCard(item: item, verifiedKind: command.verifiedKind(item), onOpen: { router.approval = AttentionRef(id: item.id) })
-                    }
-                    if let question { QuestionCard(item: question, command: command, onDone: done) }
-                    if runtime?.held == true { heldBanner }
-                    // a paused queue says why, and is released, on the waiting message itself
-                    ForEach(s.queue, id: \.self) { id in queuedCard(id, s) }
-                    if let runtime, !command.isPaired(with: runtime) { pairNote(runtime) }
-                    ForEach(command.pending.filter { $0.session == key }) { p in UndoCard(pending: p) { draft = command.undo(p.id) ?? draft } }
-                    Color.clear.frame(height: 1).id("bottom")
+                    .id(row.id)
                 }
-                .padding(.horizontal, Lapis.Layout.gutter)
-                .padding(.vertical, 12)
-                .frame(maxWidth: Lapis.Layout.readingWidth)
-                .frame(maxWidth: .infinity)
+                if s.state == .working || s.state == .stalled {
+                    TimelineView(.periodic(from: .now, by: 30)) { context in runningNow(s, now: context.date) }
+                }
+                // everything that asks something of the person sits at the bottom,
+                // where the feed opens and the reply box is, never above the turns
+                ForEach(items.filter { $0.id != question?.id }) { item in
+                    AttentionCard(item: item, verifiedKind: command.verifiedKind(item), onOpen: { router.approval = AttentionRef(id: item.id) })
+                }
+                if let question { QuestionCard(item: question, command: command, onDone: done) }
+                if runtime?.held == true { heldBanner }
+                // a paused queue says why, and is released, on the waiting message itself
+                ForEach(s.queue, id: \.self) { id in queuedCard(id, s) }
+                if let runtime, !command.isPaired(with: runtime) { pairNote(runtime) }
+                ForEach(command.pending.filter { $0.session == key }) { p in
+                    UndoCard(pending: p, retrying: command.inFlight.contains(p.id),
+                             onUndo: { draft = command.undo(p.id) ?? draft },
+                             onRetry: { Task { await command.retry(p.id) } })
+                }
+                Color.clear.frame(height: 1).id("bottom")
             }
-            .scrollDismissesKeyboard(.interactively)
-            .defaultScrollAnchor(.bottom)
-            .onChange(of: feed.rows.count) { proxy.scrollTo("bottom", anchor: .bottom) }
-            .onChange(of: command.pending.count) { withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
-            .safeAreaInset(edge: .bottom) {
-                composer(s, mode: mode, question: question)
-            }
+            .padding(.horizontal, Lapis.Layout.gutter)
+            .padding(.vertical, 12)
+            .frame(maxWidth: Lapis.Layout.readingWidth)
+            .frame(maxWidth: .infinity)
+            .scrollTargetLayout()
         }
+        .scrollPosition($position)
+        .scrollDismissesKeyboard(.interactively)
+        // it opens at the newest turn, already drawn there: no jump to the bottom
+        .defaultScrollAnchor(.bottom, for: .initialOffset)
+        .onScrollGeometryChange(for: Bool.self) { g in
+            g.contentSize.height - g.visibleRect.maxY < 160
+        } action: { _, near in
+            nearBottom = near
+        }
+        // a new turn comes into view only when the person was at the bottom:
+        // not while they read older ones, and never when older ones load above
+        .onChange(of: feed.rows.last?.id) { old, new in
+            guard new != nil, nearBottom || old == nil else { return }
+            withAnimation(old == nil ? nil : .snappy) { position.scrollTo(edge: .bottom) }
+        }
+        // the person sent something: show it waiting
+        .onChange(of: command.pending.count) { old, new in
+            if new > old { withAnimation(.snappy) { position.scrollTo(edge: .bottom) } }
+        }
+        .onChange(of: composing) { _, on in
+            if on, nearBottom { withAnimation(.snappy) { position.scrollTo(edge: .bottom) } }
+        }
+        .refreshable { await feed.refresh(store.fabricService, cache: store.turnCache) }
     }
 
     private func headerCard(_ h: SessionHeader, _ s: FleetSession) -> some View {
@@ -200,22 +266,25 @@ struct AgentSessionScreen: View {
                 // a paused queue is released here, where the person is looking,
                 // not only from the banner at the top of the feed
                 if !s.queuePaused.isEmpty {
-                    Button("Send now", systemImage: "paperplane") { act { await command.command(.releaseQueue, key) } }
+                    Button("Send now", systemImage: "paperplane") { act("release") { await command.command(.releaseQueue, key) } }
                         .buttonStyle(.lapis(.primary, size: .small))
+                        .disabled(busy.isRunning("release"))
                         .accessibilityIdentifier("session.queued.release")
                 }
                 if let text = order?.text {
                     Button("Edit", systemImage: "pencil") {
-                        act {
+                        act("queued.\(id)") {
                             let failure = await command.command(.cancel, key, orderIDs: [id])
                             if failure == nil { draft = text; composing = true }
                             return failure
                         }
                     }
                     .buttonStyle(.lapis(.secondary, size: .small))
+                    .disabled(busy.isRunning("queued.\(id)"))
                 }
-                Button("Cancel", systemImage: "xmark") { act { await command.command(.cancel, key, orderIDs: [id]) } }
+                Button("Cancel", systemImage: "xmark") { act("queued.\(id)") { await command.command(.cancel, key, orderIDs: [id]) } }
                     .buttonStyle(.lapis(.destructive, size: .small))
+                    .disabled(busy.isRunning("queued.\(id)"))
                     .accessibilityIdentifier("session.queued.cancel")
             }
         }
@@ -252,10 +321,11 @@ struct AgentSessionScreen: View {
                 }
             }
             if mode == .asleep || mode == .gone {
-                Button { act { await command.command(.resume, key) } } label: {
+                Button { act("resume") { await command.command(.resume, key) } } label: {
                     Label("Resume \(s.address)", systemImage: "play.fill").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.lapis(.primary))
+                .disabled(busy.isRunning("resume"))
                 .padding(.horizontal, Lapis.Layout.gutter)
                 .accessibilityIdentifier("session.resume")
             } else {
@@ -272,17 +342,31 @@ struct AgentSessionScreen: View {
                     Button {
                         if let question { answer(question) } else { send(draft, s, mode) }
                     } label: {
-                        Image(systemName: mode.queues && question == nil ? "text.append" : "arrow.up")
-                            .font(.body.weight(.bold))
-                            .foregroundStyle(Color.lapis.onAccent)
-                            .frame(width: 38, height: 38)
-                            .background(Color.lapis.accent, in: .circle)
+                        Group {
+                            if busy.isRunning("answer") {
+                                ProgressView().tint(Color.lapis.onAccent)
+                            } else {
+                                Image(systemName: mode.queues && question == nil ? "text.append" : "arrow.up")
+                                    .font(.body.weight(.bold))
+                                    .foregroundStyle(Color.lapis.onAccent)
+                            }
+                        }
+                        .frame(width: 38, height: 38)
+                        .background(Color.lapis.accent, in: .circle)
+                        .opacity(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.45 : 1)
+                        // the circle is 38 pt; what takes the tap is 44
+                        .frame(width: Lapis.Layout.minTarget, height: Lapis.Layout.minTarget)
+                        .contentShape(.rect)
                     }
-                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .buttonStyle(.plain)
+                    // a hardware keyboard (iPad, the Mac): Command-Return sends
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy.isRunning("answer"))
                     .accessibilityLabel(question != nil ? "Answer" : mode.queues ? "Queue" : "Send")
                     .accessibilityIdentifier("session.send")
                 }
-                .padding(.horizontal, Lapis.Layout.gutter)
+                .padding(.leading, Lapis.Layout.gutter)
+                .padding(.trailing, Lapis.Layout.gutter - 3)
             }
         }
         .padding(.vertical, 10)
@@ -290,6 +374,8 @@ struct AgentSessionScreen: View {
     }
 
     private func send(_ text: String, _ s: FleetSession, _ mode: ComposerMode) {
+        // a second tap after the box was cleared: nothing to send, nothing to say
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         if let problem = command.send(text, to: s, queued: mode.queues) {
             toast = ToastMessage(text: problem, tone: .error)
             return
@@ -302,9 +388,10 @@ struct AgentSessionScreen: View {
         let words = draft
         switch command.verify(item) {
         case .success(let v):
-            act {
+            // disabled while it is on its way: a second tap would answer twice
+            act("answer") {
                 let failure = await command.answer(v, words: words)
-                if failure == nil { draft = "" }
+                if failure == nil, draft == words { draft = "" }
                 return failure
             }
         case .failure(let p):
@@ -322,27 +409,28 @@ struct AgentSessionScreen: View {
         if let s = session {
             if s.state == .working || s.state == .stalled {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Stop", systemImage: "stop.fill") { act { await command.command(.interrupt, key) } }
+                    Button("Stop", systemImage: "stop.fill") { act("stop") { await command.command(.interrupt, key) } }
                         .tint(Color.lapis.red)
+                        .disabled(busy.isRunning("stop"))
                         .accessibilityIdentifier("session.stop")
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Menu("More", systemImage: "ellipsis.circle") {
                     Button(s.following ? "Stop following" : "Follow every turn", systemImage: s.following ? "bell.slash" : "bell") {
-                        act { await store.follow(key, !s.following) }
+                        act("follow") { await store.follow(key, !s.following) }
                     }
                     Menu("Move to fabric", systemImage: "square.stack.3d.up") {
-                        Button("\(s.project.isEmpty ? "Its project" : s.project) (its own)") { act { await command.command(.setFabric, key, text: "") } }
+                        Button("\(s.project.isEmpty ? "Its project" : s.project) (its own)") { act("fabric") { await command.command(.setFabric, key, text: "") } }
                         ForEach(store.config.fabrics) { f in
-                            Button(f.name) { act { await command.command(.setFabric, key, text: f.id) } }
+                            Button(f.name) { act("fabric") { await command.command(.setFabric, key, text: f.id) } }
                         }
                     }
                     Divider()
                     if s.state == .asleep || s.state == .exited {
-                        Button("Resume", systemImage: "play") { act { await command.command(.resume, key) } }
+                        Button("Resume", systemImage: "play") { act("resume") { await command.command(.resume, key) } }
                     }
-                    Button("Compact context", systemImage: "arrow.down.right.and.arrow.up.left") { act { await command.command(.compact, key) } }
+                    Button("Compact context", systemImage: "arrow.down.right.and.arrow.up.left") { act("compact") { await command.command(.compact, key) } }
                     Button("Clear conversation\u{2026}", systemImage: "trash", role: .destructive) { confirmClear = true }
                     Divider()
                     Button("Copy address", systemImage: "doc.on.doc") { UIPasteboard.general.string = s.address }
@@ -352,38 +440,59 @@ struct AgentSessionScreen: View {
         }
     }
 
-    private func act(_ change: @escaping @MainActor () async -> String?) {
+    /// Run an action by name, once at a time: a tap while the same one is
+    /// on its way does nothing (its button is disabled meanwhile).
+    private func act(_ name: String, _ change: @escaping @MainActor () async -> String?) {
         Task {
-            if let failure = await change(), !failure.isEmpty { toast = ToastMessage(text: failure, tone: .error) }
+            if case .some(let failure?) = await busy.run(name, change), !failure.isEmpty {
+                toast = ToastMessage(text: failure, tone: .error)
+            }
         }
     }
 }
 
-/// One turn: the prompt as your bubble, what it did in one line, its reply.
-/// Equatable on its row, so a redraw of the feed skips a turn that did not change.
+/// One turn: what started it (your words as a bubble, or a muted line for
+/// what the Mac started it with), what it did in one line, its reply.
+/// Equatable on its row (and whether it is shown whole), so a redraw of
+/// the feed skips a turn that did not change.
 struct TurnView: View, Equatable {
     let row: TurnRow
-    @State private var expanded = false
+    /// the whole reply's blocks when the person asked for all of it
+    let whole: [ReplyNode]?
+    let onExpand: (Bool) -> Void
 
-    nonisolated static func == (a: TurnView, b: TurnView) -> Bool { a.row == b.row }
+    nonisolated static func == (a: TurnView, b: TurnView) -> Bool { a.row == b.row && (a.whole == nil) == (b.whole == nil) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if row.textOff {
                 Text("Text off: this turn's words are not kept.").font(.footnote).italic().foregroundStyle(Color.lapis.ink3)
-            } else if !row.prompt.isEmpty {
-                HStack {
-                    Spacer(minLength: 40)
-                    VStack(alignment: .trailing, spacing: 3) {
-                        Text(row.prompt)
-                            .font(.body)
-                            .foregroundStyle(Color.lapis.ink)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .background(Color.lapis.accentSoft, in: .rect(cornerRadius: 18, style: .continuous))
-                            .textSelection(.enabled)
-                        if let source = row.source {
-                            Text(source).font(.caption2).foregroundStyle(Color.lapis.ink3)
+            } else {
+                ForEach(row.promptDisplay.notes, id: \.self) { note in
+                    Label(note.text, systemImage: note.symbol)
+                        .font(.footnote)
+                        .foregroundStyle(Color.lapis.ink3)
+                        .lineLimit(2)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.lapis.card2, in: .capsule)
+                        .frame(maxWidth: .infinity)
+                        .accessibilityIdentifier("turn.note")
+                }
+                if !row.promptDisplay.words.isEmpty {
+                    HStack {
+                        Spacer(minLength: 40)
+                        VStack(alignment: .trailing, spacing: 3) {
+                            Text(row.promptDisplay.words)
+                                .font(.body)
+                                .foregroundStyle(Color.lapis.ink)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
+                                .background(Color.lapis.accentSoft, in: .rect(cornerRadius: 18, style: .continuous))
+                                .textSelection(.enabled)
+                            if let source = row.source {
+                                Text(source).font(.caption2).foregroundStyle(Color.lapis.ink3)
+                            }
                         }
                     }
                 }
@@ -401,15 +510,12 @@ struct TurnView: View, Equatable {
                 .background(Color.lapis.card2, in: .capsule)
             }
             if !row.reply.isEmpty {
-                let long = row.replyPreview != nil
-                Text(!expanded ? row.replyPreview ?? row.replyText : row.replyText)
-                    .font(.body)
-                    .foregroundStyle(Color.lapis.ink)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                if long {
-                    Button(expanded ? "Show less" : "Show all") { withAnimation { expanded.toggle() } }
+                ReplyView(nodes: whole ?? row.replyNodes)
+                    .accessibilityIdentifier("turn.reply")
+                if row.long {
+                    Button(whole == nil ? "Show all" : "Show less") { onExpand(whole == nil) }
                         .buttonStyle(.lapis(.ghost, size: .small))
+                        .accessibilityIdentifier("turn.showAll")
                 }
             }
             HStack(spacing: 6) {
@@ -427,10 +533,38 @@ struct TurnView: View, Equatable {
 /// A held send, going in a few seconds unless taken back.
 struct UndoCard: View {
     let pending: PendingSend
+    /// a retry is on its way
+    var retrying = false
     let onUndo: () -> Void
+    var onRetry: () -> Void = {}
 
     var body: some View {
-        if pending.lapsed { lapsed } else { counting }
+        if pending.failure != nil { failed } else if pending.lapsed { lapsed } else { counting }
+    }
+
+    /// Posted, and the post failed: the words are kept, to send again or take back.
+    private var failed: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Not sent: \(pending.failure ?? "")")
+                    .font(.caption.weight(.semibold)).foregroundStyle(Color.lapis.red).lineLimit(3)
+                Text(pending.text).font(.subheadline).foregroundStyle(Color.lapis.ink).lineLimit(2)
+            }
+            Spacer(minLength: 0)
+            Button("Edit", action: onUndo)
+                .buttonStyle(.lapis(.secondary, size: .small))
+                .disabled(retrying)
+                .accessibilityIdentifier("session.failed.edit")
+            Button(retrying ? "Sending\u{2026}" : "Retry", action: onRetry)
+                .buttonStyle(.lapis(.primary, size: .small))
+                .disabled(retrying)
+                .accessibilityIdentifier("session.failed.retry")
+        }
+        .padding(12)
+        .background(Color.lapis.card, in: .rect(cornerRadius: Lapis.Radius.card, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: Lapis.Radius.card, style: .continuous).strokeBorder(Color.lapis.red.opacity(0.4)))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("session.failed")
     }
 
     /// The app was away past its moment: not sent; back into the box to send again.
