@@ -162,8 +162,8 @@ extension AppModel {
         }
     }
 
-    /// A device delete owed to another server (a sign-out or a switch away
-    /// from it while offline): sent now if this device still holds a
+    /// Device deletes owed to other servers (a sign-out or a switch away
+    /// from one while offline): each sent now if this device still holds a
     /// bearer for that server, else kept for the next sign-in there. One
     /// owed to the current server goes ahead of its registration
     /// (`PushRegistrar.connect`). Queued like the rest, never awaited.
@@ -171,8 +171,10 @@ extension AppModel {
         let current = serverURL
         let registryFor = pushRegistry
         enqueuePush { push in
-            guard let owed = await push.owedDeleteServer, owed != current, let registry = await registryFor(owed) else { return }
-            _ = await withTimeLimit(PushConfig.registerLimit) { await push.settleOwedDelete(server: owed, registry: registry) }
+            for owed in await push.owedDeleteServers where owed != current {
+                guard let registry = await registryFor(owed) else { continue }
+                _ = await withTimeLimit(PushConfig.registerLimit) { await push.settleOwedDelete(server: owed, registry: registry) }
+            }
         }
     }
 

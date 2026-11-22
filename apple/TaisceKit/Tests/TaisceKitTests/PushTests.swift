@@ -6,11 +6,11 @@ import Testing
 /// A `PushRegistrationStore` in memory.
 final class MemoryPushStore: PushRegistrationStore {
     private let value = Mutex<SentPushRegistration?>(nil)
-    private let owed = Mutex<OwedPushDelete?>(nil)
+    private let owed = Mutex<[OwedPushDelete]>([])
     func load() -> SentPushRegistration? { value.withLock { $0 } }
     func save(_ sent: SentPushRegistration?) { value.withLock { $0 = sent } }
-    func loadOwedDelete() -> OwedPushDelete? { owed.withLock { $0 } }
-    func saveOwedDelete(_ o: OwedPushDelete?) { owed.withLock { $0 = o } }
+    func loadOwedDeletes() -> [OwedPushDelete] { owed.withLock { $0 } }
+    func saveOwedDeletes(_ o: [OwedPushDelete]) { owed.withLock { $0 = o } }
 }
 
 /// A settable clock.
@@ -193,14 +193,14 @@ final class TestClock: Sendable {
             Issue.record("an offline delete fails")
             return
         }
-        #expect(store.loadOwedDelete() == OwedPushDelete(server: "https://s", token: "aa01"))
-        #expect(await push.owedDeleteServer == "https://s")
+        #expect(store.loadOwedDeletes() == [OwedPushDelete(server: "https://s", token: "aa01")])
+        #expect(await push.owedDeleteServers == ["https://s"])
         #expect(store.load() == nil, "the next sign-in sends afresh")
         // signing in again (anyone): the delete goes first, then the registration
         #expect(await push.connect(server: "https://s", registry: up.client()) == .sent)
         let sent = up.requests.suffix(2).map { "\($0.httpMethod ?? "") \($0.path)" }
         #expect(sent == ["DELETE /api/devices/aa01", "POST /api/devices"])
-        #expect(store.loadOwedDelete() == nil && store.load()?.registration.token == "aa01")
+        #expect(store.loadOwedDeletes().isEmpty && store.load()?.registration.token == "aa01")
     }
 
     /// Owed to another server: nothing goes to this one, the record stays.
@@ -208,15 +208,15 @@ final class TestClock: Sendable {
     @Test func anOwedDeleteGoesOnlyToItsServer() async throws {
         let a = Self.server()
         let store = MemoryPushStore()
-        store.saveOwedDelete(OwedPushDelete(server: "https://a", token: "aa"))
+        store.saveOwedDeletes([OwedPushDelete(server: "https://a", token: "aa")])
         let push = registrar(store, TestClock(Self.t0))
         await push.didRegister(token: "aa")
         #expect(await push.connect(server: "https://b", registry: a.client()) == .sent)
         #expect(a.requests.map(\.httpMethod) == ["POST"], "b's registration only")
-        #expect(store.loadOwedDelete()?.server == "https://a")
+        #expect(store.loadOwedDeletes().map(\.server) == ["https://a"])
         let other = Self.server(deleteStatus: 404)
         #expect(await push.settleOwedDelete(server: "https://a", registry: other.client()) == .sent)
-        #expect(store.loadOwedDelete() == nil)
+        #expect(store.loadOwedDeletes().isEmpty)
         #expect(await push.settleOwedDelete(server: "https://a", registry: other.client()) == .waiting)
     }
 
@@ -229,9 +229,9 @@ final class TestClock: Sendable {
         await push.didRegister(token: "aa")
         await push.connect(server: "https://s", registry: up.client())
         #expect(await push.unregister() == .sent)
-        #expect(store.loadOwedDelete() == nil)
+        #expect(store.loadOwedDeletes().isEmpty)
         // a record that says this token was sent, with the same token owed
-        store.saveOwedDelete(OwedPushDelete(server: "https://s", token: "aa"))
+        store.saveOwedDeletes([OwedPushDelete(server: "https://s", token: "aa")])
         store.save(SentPushRegistration(server: "https://s", registration: DeviceRegistration(token: "aa", env: .sandbox, appVersion: "0.1.0 (1)"), sentAt: Self.t0))
         #expect(await push.connect(server: "https://s", registry: up.client()) == .sent, "registered again after its delete")
     }
@@ -241,11 +241,52 @@ final class TestClock: Sendable {
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let store = UserDefaultsPushStore(defaults: defaults)
-        #expect(store.loadOwedDelete() == nil)
-        store.saveOwedDelete(OwedPushDelete(server: "https://s", token: "aa"))
-        #expect(UserDefaultsPushStore(defaults: defaults).loadOwedDelete() == OwedPushDelete(server: "https://s", token: "aa"))
-        store.saveOwedDelete(nil)
-        #expect(store.loadOwedDelete() == nil)
+        #expect(store.loadOwedDeletes().isEmpty)
+        let a = OwedPushDelete(server: "https://s", token: "aa"), b = OwedPushDelete(server: "https://t", token: "bb")
+        store.saveOwedDeletes([a, b])
+        #expect(UserDefaultsPushStore(defaults: defaults).loadOwedDeletes() == [a, b])
+        store.saveOwedDeletes([])
+        #expect(store.loadOwedDeletes().isEmpty)
+    }
+
+    /// Review of f12c5e0 (#4): the single slot an older build kept is read
+    /// into the list once, ahead of anything owed since, and not again.
+    @Test func theOldSingleOwedDeleteIsMigratedIntoTheList() throws {
+        let suite = "push-test-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsPushStore(defaults: defaults)
+        let old = OwedPushDelete(server: "https://old", token: "aa")
+        defaults.set(try JSONEncoder().encode(old), forKey: store.legacyOwedKey)
+        #expect(store.loadOwedDeletes() == [old])
+        #expect(defaults.data(forKey: store.legacyOwedKey) == nil)
+        let new = OwedPushDelete(server: "https://new", token: "bb")
+        store.saveOwedDeletes(store.loadOwedDeletes() + [new])
+        #expect(UserDefaultsPushStore(defaults: defaults).loadOwedDeletes() == [old, new])
+    }
+
+    /// Review of f12c5e0 (#4): a second owed delete (another server) no
+    /// longer overwrites the first; each goes to its own server only.
+    @Test func deletesOwedToTwoServersAreBothKept() async throws {
+        let down = MockServer { _ in MockServer.Reply(chunks: [], failAfter: true) }
+        let store = MemoryPushStore()
+        let push = registrar(store, TestClock(Self.t0))
+        let up = Self.server()
+        await push.didRegister(token: "aa")
+        for server in ["https://a", "https://b"] {
+            await push.connect(server: server, registry: up.client())
+            await push.disconnect()
+            await push.connect(server: server, registry: down.client())
+            _ = await push.unregister()
+        }
+        #expect(store.loadOwedDeletes() == [OwedPushDelete(server: "https://a", token: "aa"), OwedPushDelete(server: "https://b", token: "aa")])
+        #expect(await push.owedDeleteServers == ["https://a", "https://b"])
+        let a = Self.server(), b = Self.server()
+        #expect(await push.settleOwedDelete(server: "https://b", registry: b.client()) == .sent)
+        #expect(b.requests.map { "\($0.httpMethod ?? "") \($0.path)" } == ["DELETE /api/devices/aa"])
+        #expect(store.loadOwedDeletes() == [OwedPushDelete(server: "https://a", token: "aa")], "a's is still owed")
+        #expect(await push.settleOwedDelete(server: "https://a", registry: a.client()) == .sent)
+        #expect(store.loadOwedDeletes().isEmpty)
     }
 
     @Test func aServerSwitchSendsToTheNewServerAndOnlyItDeletes() async throws {

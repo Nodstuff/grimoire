@@ -43,7 +43,8 @@ public struct SentPushRegistration: Codable, Sendable, Hashable {
 
 /// A device delete the server has not confirmed yet (sign-out or a server
 /// switch while offline, or cut off by its time limit): retried at the
-/// next connect to that server, before registering.
+/// next connect to that server, before registering. Several can be owed
+/// at once (one per server and token).
 public struct OwedPushDelete: Codable, Sendable, Hashable {
     public var server: String
     public var token: String
@@ -58,9 +59,9 @@ public struct OwedPushDelete: Codable, Sendable, Hashable {
 public protocol PushRegistrationStore: Sendable {
     func load() -> SentPushRegistration?
     func save(_ sent: SentPushRegistration?)
-    /// the delete still owed, if any (kept between launches)
-    func loadOwedDelete() -> OwedPushDelete?
-    func saveOwedDelete(_ owed: OwedPushDelete?)
+    /// the deletes still owed, oldest first (kept between launches)
+    func loadOwedDeletes() -> [OwedPushDelete]
+    func saveOwedDeletes(_ owed: [OwedPushDelete])
 }
 
 /// `UserDefaults` (thread-safe; not marked `Sendable` in the SDK).
@@ -86,14 +87,23 @@ public struct UserDefaultsPushStore: PushRegistrationStore, @unchecked Sendable 
         }
     }
 
-    var owedKey: String { key + ".deleteOwed" }
+    /// where the build before the list kept its one owed delete
+    var legacyOwedKey: String { key + ".deleteOwed" }
+    var owedKey: String { key + ".deletesOwed" }
 
-    public func loadOwedDelete() -> OwedPushDelete? {
-        defaults.data(forKey: owedKey).flatMap { try? JSONDecoder().decode(OwedPushDelete.self, from: $0) }
+    public func loadOwedDeletes() -> [OwedPushDelete] {
+        var list = defaults.data(forKey: owedKey).flatMap { try? JSONDecoder().decode([OwedPushDelete].self, from: $0) } ?? []
+        // the single slot an older build wrote: folded into the list once
+        if let data = defaults.data(forKey: legacyOwedKey) {
+            if let old = try? JSONDecoder().decode(OwedPushDelete.self, from: data), !list.contains(old) { list.insert(old, at: 0) }
+            saveOwedDeletes(list)
+            defaults.removeObject(forKey: legacyOwedKey)
+        }
+        return list
     }
 
-    public func saveOwedDelete(_ owed: OwedPushDelete?) {
-        if let owed, let data = try? JSONEncoder().encode(owed) {
+    public func saveOwedDeletes(_ owed: [OwedPushDelete]) {
+        if !owed.isEmpty, let data = try? JSONEncoder().encode(owed) {
             defaults.set(data, forKey: owedKey)
         } else {
             defaults.removeObject(forKey: owedKey)
@@ -157,27 +167,46 @@ public actor PushRegistrar {
         return await sendIfNeeded()
     }
 
-    /// The server an unconfirmed device delete is owed to, if any.
-    public var owedDeleteServer: String? { store.loadOwedDelete()?.server }
+    /// The servers unconfirmed device deletes are owed to, oldest first.
+    public var owedDeleteServers: [String] {
+        var seen = Set<String>()
+        return store.loadOwedDeletes().map(\.server).filter { seen.insert($0).inserted }
+    }
 
-    /// Send the delete still owed to `server` (with a bearer for it). The
+    /// Send the deletes still owed to `server` (with a bearer for it). The
     /// server deletes only the caller's own token (another person's bearer
     /// answers 404, already gone for us: signing in there moves the token
-    /// to them anyway). Kept when it fails, for the next try.
+    /// to them anyway). Each is kept when it fails, for the next try.
     @discardableResult
     public func settleOwedDelete(server: String, registry: any DeviceRegistry) async -> Outcome {
-        guard let owed = store.loadOwedDelete(), owed.server == server, !settling else { return .waiting }
+        let owed = store.loadOwedDeletes().filter { $0.server == server }
+        guard !owed.isEmpty, !settling else { return .waiting }
         settling = true
         defer { settling = false }
-        do {
-            try await registry.unregisterDevice(token: owed.token)
-        } catch {
-            return .failed(String(describing: error))
+        var failure: String?
+        for o in owed {
+            do {
+                try await registry.unregisterDevice(token: o.token)
+            } catch {
+                failure = failure ?? String(describing: error)
+                continue
+            }
+            forgetOwed(o)
+            // a registration of this very token recorded meanwhile was deleted with it
+            if let last = store.load(), last.server == server, last.registration.token == o.token { store.save(nil) }
         }
-        if store.loadOwedDelete() == owed { store.saveOwedDelete(nil) }
-        // a registration of this very token recorded meanwhile was deleted with it
-        if let last = store.load(), last.server == server, last.registration.token == owed.token { store.save(nil) }
-        return .sent
+        return failure.map { .failed($0) } ?? .sent
+    }
+
+    private func oweDelete(_ o: OwedPushDelete) {
+        var list = store.loadOwedDeletes()
+        if !list.contains(o) { list.append(o) }
+        store.saveOwedDeletes(list)
+    }
+
+    private func forgetOwed(_ o: OwedPushDelete) {
+        let list = store.loadOwedDeletes()
+        if list.contains(o) { store.saveOwedDeletes(list.filter { $0 != o }) }
     }
 
     /// Stop sending (signed out, or a server without sign-in).
@@ -221,7 +250,7 @@ public actor PushRegistrar {
         disconnect()
         guard let last else { return .waiting }
         let owed = OwedPushDelete(server: last.server, token: last.registration.token)
-        store.saveOwedDelete(owed)
+        oweDelete(owed)
         // only the server it went to can delete it (another one's bearer won't)
         guard let registry, last.server == server else { return .waiting }
         do {
@@ -229,7 +258,7 @@ public actor PushRegistrar {
         } catch {
             return .failed(String(describing: error))
         }
-        if store.loadOwedDelete() == owed { store.saveOwedDelete(nil) }
+        forgetOwed(owed)
         return .sent
     }
 }

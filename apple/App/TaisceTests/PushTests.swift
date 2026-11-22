@@ -102,20 +102,20 @@ extension PushTests {
     /// stored bearer; with none, it stays owed for a sign-in there.
     @Test func aDeleteOwedToAnotherServerIsSentWithItsStoredBearer() async throws {
         let store = UserDefaultsPushStore()
-        let before = store.loadOwedDelete()
-        defer { store.saveOwedDelete(before) }
-        store.saveOwedDelete(OwedPushDelete(server: "https://old.invalid", token: "aa"))
+        let before = store.loadOwedDeletes()
+        defer { store.saveOwedDeletes(before) }
+        store.saveOwedDeletes([OwedPushDelete(server: "https://old.invalid", token: "aa"), OwedPushDelete(server: "https://older.invalid", token: "bb")])
         let m = AppModel()
         let deletes = RecordingRegistry()
         m.pushRegistry = { _ in nil }
         m.settleOwedPushDeleteElsewhere()
         await m.pushTask?.value
-        #expect(store.loadOwedDelete()?.server == "https://old.invalid", "no bearer for it: kept")
-        m.pushRegistry = { $0 == "https://old.invalid" ? deletes : nil }
+        #expect(store.loadOwedDeletes().map(\.server) == ["https://old.invalid", "https://older.invalid"], "no bearer for them: kept")
+        m.pushRegistry = { $0.hasSuffix("old.invalid") || $0.hasSuffix("older.invalid") ? deletes : nil }
         m.settleOwedPushDeleteElsewhere()
         await m.pushTask?.value
-        #expect(deletes.deleted == ["aa"])
-        #expect(store.loadOwedDelete() == nil)
+        #expect(deletes.deleted == ["aa", "bb"], "each server's owed delete")
+        #expect(store.loadOwedDeletes().isEmpty)
     }
 }
 
